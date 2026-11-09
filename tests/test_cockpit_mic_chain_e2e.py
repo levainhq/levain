@@ -89,7 +89,7 @@ MIC = "document.querySelector('.rv-mic-stream')"
 SHOWN = f"!!{MIC} && !{MIC}.hidden"
 TA = "document.querySelector('.rv-input')"
 NOTE = "(document.querySelector('.rv-sendnote') || {}).textContent"
-SNAP = ("JSON.stringify({ta: " + TA + ".value, label: (" + MIC + " || {}).textContent, note: " + NOTE + ", shown: " + SHOWN
+SNAP = ("JSON.stringify({ta: " + TA + ".value, label: (" + MIC + " ? " + MIC + ".getAttribute('aria-label') : null), note: " + NOTE + ", shown: " + SHOWN
         + ", net: window.__net.map((n) => ({ url: n.url, method: n.method, status: n.status, text: n.text.length > 600 ? '' : n.text })),"
         " leak: [document.documentElement.outerHTML, JSON.stringify(Object.assign({}, localStorage)), JSON.stringify(window.__net), JSON.stringify(window.__sc.tracks)].map((x) => x.indexOf(" + json.dumps(VALUE) + ") >= 0),"
         " gum: window.__sc.gum, stopped: window.__sc.tracks.map((t) => t.stopped), ctxClosed: window.__sc.ctxClosed,"
@@ -201,7 +201,7 @@ def test_the_happy_path_end_to_end(tmp_path, rig) -> None:
         {"until": TA + ".value.indexOf('live words') >= 0", "ms": 30000},
         {"eval": SNAP},
         {"eval": MIC + ".click(); 1"},
-        {"until": TA + ".value === 'the final words' && " + MIC + ".textContent === 'Mic'", "ms": 30000},
+        {"until": TA + ".value === 'the final words' && " + MIC + ".getAttribute('aria-label') === 'Mic'", "ms": 30000},
         {"eval": SETTLE},
     ], "happy", before=None)
     mid, end = snap(vals[-4]), snap(vals[-1])

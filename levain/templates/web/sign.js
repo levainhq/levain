@@ -679,7 +679,14 @@
       b.dataset.choice = o.key;
       acts.appendChild(b);
     }
-    if (reasonBox) { acts.appendChild(reasonBox); if (reasonMic) acts.append(...reasonMic.buttons); }
+    // a box and its mic controls share one row, so the mic never drops under the box as a ragged line of its own
+    const inRow = (box, m) => {
+      if (!m || !m.buttons.length) { acts.appendChild(box); return; }
+      const row = el("div", "voice-in-row");
+      row.append(box, ...m.buttons);
+      acts.appendChild(row);
+    };
+    if (reasonBox) inRow(reasonBox, reasonMic);
     const wi = options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
     if (wi) {
       const box = el("input", "sheet-write-in");
@@ -690,7 +697,7 @@
       box.placeholder = "or write your own answer";
       controls.push(box);
       const wmic = withMic(box);
-      if (wmic) acts.append(box, ...wmic.buttons); else acts.appendChild(box);
+      inRow(box, wmic);
       acts.append(button("(" + String(wi.key) + ") Sign my words", "", () => {
         if (busy) return;
         if (micOpen(wmic)) return;

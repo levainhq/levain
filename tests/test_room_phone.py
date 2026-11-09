@@ -147,7 +147,7 @@ def test_a_late_result_after_send_does_not_bring_the_sent_line_back(tmp_path, w)
                  " document.querySelector('.rv-send').click(); __recs[0].emit('hello there again'); JSON.stringify({was, stops: __recs[0].stops})"},
         {"until": "document.querySelector('.rv-sendnote').textContent === 'Sent.'"},
         {"eval": "__recs[0].emit('late and unwanted'); JSON.stringify({v: document.querySelector('.rv-input').value,"
-                 " label: document.querySelector('.rv-mic:not(.rv-mic-stream)').textContent})"},
+                 " label: document.querySelector('.rv-mic:not(.rv-mic-stream)').getAttribute('aria-label')})"},
     ])
     assert json.loads(out["values"][1]) == {"was": "hello there", "stops": 1}
     assert json.loads(out["values"][3]) == {"v": "", "label": "Dictate"}
@@ -159,7 +159,7 @@ def test_a_recognizer_that_ignores_processlocally_never_starts(tmp_path, w):
     """F2: the property exists on the prototype but the setter does nothing, so reading it back is the only proof."""
     out, _w = _run(tmp_path, w, "Ignores", [
         {"eval": "document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); JSON.stringify({started: __started.length,"
-                 " note: document.querySelector('.rv-sendnote').textContent, label: document.querySelector('.rv-mic:not(.rv-mic-stream)').textContent})"},
+                 " note: document.querySelector('.rv-sendnote').textContent, label: document.querySelector('.rv-mic:not(.rv-mic-stream)').getAttribute('aria-label')})"},
     ])
     got = json.loads(out["values"][1])
     assert got["started"] == 0 and got["label"] == "Dictate" and "keep dictation on this device" in got["note"], got
@@ -188,7 +188,7 @@ def test_dictation_errors_read_by_code(tmp_path, w):
     for code, words in want.items():
         out, _w = _run(tmp_path, w, "Live", [
             {"eval": "window.__err = '%s'; document.querySelector('.rv-mic:not(.rv-mic-stream)').click();"
-                     " JSON.stringify({n: document.querySelector('.rv-sendnote').textContent, l: document.querySelector('.rv-mic:not(.rv-mic-stream)').textContent})" % code}])
+                     " JSON.stringify({n: document.querySelector('.rv-sendnote').textContent, l: document.querySelector('.rv-mic:not(.rv-mic-stream)').getAttribute('aria-label')})" % code}])
         got = json.loads(out["values"][1])
         assert words in got["n"] and got["l"] == "Dictate", (code, got)
 

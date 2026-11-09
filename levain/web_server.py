@@ -1294,6 +1294,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/devices_panel.js": ("devices_panel.js", "text/javascript; charset=utf-8"),
     # Reading the room aloud (voice V1-5): the player, the per-reply control and the settings store. Loaded by the Voice
     # block once /cockpit/voice.json answers; it calls POST /cockpit/voice/speak and no other route.
+    "/voice_icons.js": ("voice_icons.js", "text/javascript; charset=utf-8"),
     "/voice.js": ("voice.js", "text/javascript; charset=utf-8"),
     # A Needs-you card read aloud (voice V1-7): the card script (the NPCardVoice port) and the speaker on the card.
     "/card_voice.js": ("card_voice.js", "text/javascript; charset=utf-8"),

@@ -171,7 +171,7 @@ def test_autoplay_waits_for_the_setting_the_mount_the_page_and_a_tap(tmp_path, m
         {"eval": "(() => { Object.defineProperty(document, 'hidden', {configurable: true, get: () => true}); const r = LevainVoice.replyFinished({thread: 't1', gseq: 8, text: 'e'}); Object.defineProperty(document, 'hidden', {configurable: true, get: () => false}); return r; })()"},  # 8 hidden
         {"eval": "LevainVoice.replyFinished({thread: 't1', gseq: 9, text: 'nine'})"},                                       # 9 tap (locked)
         {"eval": "JSON.stringify([window.__spoken, %s.length])" % SPEAK_CALLS},                                          # 10 nothing read yet
-        {"eval": "(() => { const w = LevainVoice.button({thread: 't1', gseq: 9, text: 'nine'}); return w.querySelector('button').textContent; })()"},  # 11
+        {"eval": "(() => { const w = LevainVoice.button({thread: 't1', gseq: 9, text: 'nine'}); return w.querySelector('button').getAttribute('aria-label'); })()"},  # 11
         {"eval": "(async () => { LevainVoice.unlock(); await new Promise((r) => setTimeout(r, 100)); return LevainVoice.isUnlocked(); })()"},  # 12
         {"eval": "LevainVoice.replyFinished({thread: 't1', gseq: 10, text: 'ten'})"},                                    # 13 play
         {"eval": "JSON.stringify(window.__spoken)"},                                                                     # 14
@@ -230,16 +230,16 @@ def test_stop_interrupts_the_reading_and_the_control_follows(tmp_path, monkeypat
     v = _run(tmp_path, monkeypatch, [
         {"until": READY_BLOCK, "ms": 20000},
         {"eval": SET % json.dumps(PREMIUM) + " && 0"},
-        {"eval": "(() => { window.__w = LevainVoice.button(%s); document.body.appendChild(window.__w); window.__b = window.__w.querySelector('button'); return window.__b.textContent; })()" % R6},  # 2 Play
+        {"eval": "(() => { window.__w = LevainVoice.button(%s); document.body.appendChild(window.__w); window.__b = window.__w.querySelector('button'); return window.__b.getAttribute('aria-label'); })()" % R6},  # 2 Play
         {"eval": "(() => { window.__b.click(); return 1; })()"},
         {"until": "window.__plays.filter((p) => !p.muted).length >= 1", "ms": 5000},
-        {"eval": "window.__b.textContent"},                                                  # 5 Stop
-        {"eval": "(() => { window.__b.click(); return window.__b.textContent; })()"},       # 6 Play again after the second tap
+        {"eval": "window.__b.getAttribute('aria-label')"},                                                  # 5 Stop
+        {"eval": "(() => { window.__b.click(); return window.__b.getAttribute('aria-label'); })()"},       # 6 Play again after the second tap
         {"eval": "(async () => { window.__end(); await new Promise((r) => setTimeout(r, 300)); return window.__plays.filter((p) => !p.muted).length; })()"},  # 7 still one: the second chunk never played
         # the page hiding stops a reading too
         {"eval": "(() => { window.__b.click(); return 1; })()"},
-        {"until": "window.__plays.filter((p) => !p.muted).length >= 2 && window.__b.textContent === 'Stop'", "ms": 5000},
-        {"eval": "(() => { Object.defineProperty(document, 'hidden', {configurable: true, get: () => true}); document.dispatchEvent(new Event('visibilitychange')); Object.defineProperty(document, 'hidden', {configurable: true, get: () => false}); return window.__b.textContent; })()"},  # 10
+        {"until": "window.__plays.filter((p) => !p.muted).length >= 2 && window.__b.getAttribute('aria-label') === 'Stop'", "ms": 5000},
+        {"eval": "(() => { Object.defineProperty(document, 'hidden', {configurable: true, get: () => true}); document.dispatchEvent(new Event('visibilitychange')); Object.defineProperty(document, 'hidden', {configurable: true, get: () => false}); return window.__b.getAttribute('aria-label'); })()"},  # 10
     ], _fixture())
     assert v[2] == "Play" and v[5] == "Stop" and v[6] == "Play", v[2:7]
     assert v[7] == 1, v[7]
@@ -281,7 +281,7 @@ def test_a_stop_while_the_audio_is_still_being_fetched_plays_nothing_when_it_arr
         {"until": READY_BLOCK, "ms": 20000},
         {"eval": SET % json.dumps(PREMIUM) + " && 0"},
         {"eval": "(() => { window.__delay = 400; window.__w = LevainVoice.button(%s); document.body.appendChild(window.__w);"
-                 " const b = window.__w.querySelector('button'); b.click(); const mid = b.textContent; b.click(); return mid + '/' + b.textContent; })()" % R6},
+                 " const b = window.__w.querySelector('button'); b.click(); const mid = b.getAttribute('aria-label'); b.click(); return mid + '/' + b.getAttribute('aria-label'); })()" % R6},
         {"eval": "new Promise((r) => setTimeout(() => r(window.__plays.filter((p) => !p.muted).length), 900))"},
     ], _fixture())
     assert v[2] == "Stop/Play" and v[3] == 0, v[2:4]

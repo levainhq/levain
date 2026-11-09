@@ -343,6 +343,13 @@
     return Speech && Speech.prototype && "processLocally" in Speech.prototype ? Speech : null;
   }
 
+  // A control's state: the icon and its accessible name come from voice_icons.js; on a page without that file the words are the button.
+  var FACE_WORDS = { dictate: "Dictate", "dictate-stop": "Stop dictating", mic: "Mic", "mic-stop": "Stop mic" };
+  function face(b, kind) {
+    if (window.LevainVoiceIcons) { window.LevainVoiceIcons.set(b, kind); return; }
+    b.textContent = FACE_WORDS[kind]; b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", FACE_WORDS[kind]);
+  }
+
   var insts = [];                            // every attach() still in use: a capture started in one box ends the others'
   var TAIL_MS = 1500;                        // how long Stop dictating waits for the engine's last phrase
   var ORPHAN_MS = 5000;                      // a box never put on the page by then is let go (a draw that landed after its card closed)
@@ -376,9 +383,10 @@
     // the capture is over: the typed text and the final words, never the interim
     function restore() { show(fin ? base + fin : typed); }
     function begin() { typed = box.value; base = typed ? typed.replace(/\s*$/, " ") : ""; fin = ""; box.readOnly = true; }
-    function mk(label, extra) {
+    function mk(kind, extra) {
       var b = doc.createElement("button");
-      b.type = "button"; b.className = (cls ? cls + " " : "") + "card-mic " + extra; b.textContent = label; b.hidden = true;
+      b.type = "button"; b.className = (cls ? cls + " " : "") + "card-mic " + extra; b.hidden = true;
+      face(b, kind);
       buttons.push(b); return b;
     }
     // Dictate: finishDict drops the engine's handlers, puts the box back to its typed and final words and frees it; endDict first
@@ -386,17 +394,17 @@
     function finishDict() {
       var r = rec; if (dtimer) { clearTimeout(dtimer); dtimer = 0; }
       if (r) { r.onresult = null; r.onend = null; r.onerror = null; restore(); box.readOnly = false; }
-      rec = null; ending = false; if (db) db.textContent = "Dictate";
+      rec = null; ending = false; if (db) face(db, "dictate");
       sync();
     }
     function abortDict() { var r = rec; finishDict(); if (r) { try { r.stop(); } catch (e) { /* stopped */ } } }
     function endDict() {
       if (!rec || ending) return;
-      ending = true; if (db) db.textContent = "Dictate";
+      ending = true; if (db) face(db, "dictate");
       try { rec.stop(); } catch (e) { finishDict(); return; }
       dtimer = setTimeout(finishDict, TAIL_MS); sync();
     }
-    function stopCapture() { if (mine) { if (sb) sb.textContent = "Mic"; stop(); } endDict(); }
+    function stopCapture() { if (mine) { if (sb) face(sb, "mic"); stop(); } endDict(); }
     function haltOthers() { insts.forEach(function (i) { if (i !== api) i.stop(); }); }
     function off() {
       if (gone) return;
@@ -417,7 +425,7 @@
     insts.push(api);
     var SR = localSpeech(window.SpeechRecognition || window.webkitSpeechRecognition);
     if (SR) {                                           // on-device dictation, the room's rule: processLocally or off
-      db = mk("Dictate", "card-mic-dictate");
+      db = mk("dictate", "card-mic-dictate");
       var lang = doc.documentElement.lang || (window.navigator && window.navigator.language) || "en-US";
       // SpeechRecognition.available() is never asked: MEASURED 2026-11-04 (RM-G2) it froze the renderer of headless Chrome, so
       // the control shows on the prototype test alone and the click-time processLocally readback and onerror stay the guard.
@@ -441,7 +449,7 @@
         };
         r.onend = function () { if (rec === r) finishDict(); };
         r.onerror = function (ev) { if (rec === r) { finishDict(); say(ev && ev.error === "not-allowed" ? "Dictation needs permission to use the microphone." : "Dictation stopped."); } };
-        begin(); rec = r; ending = false; db.textContent = "Stop dictating";
+        begin(); rec = r; ending = false; face(db, "dictate-stop");
         try { r.start(); } catch (e) { finishDict(); }
       });
       var leave = function () { if (detached()) { off(); return; } if (doc.visibilityState === "hidden") abortDict(); };
@@ -449,24 +457,24 @@
       offs.push(function () { doc.removeEventListener("visibilitychange", leave); });
     }
     if (typeof probe === "function") {
-      sb = mk("Mic", "card-mic-stream");
+      sb = mk("mic", "card-mic-stream");
       var live = function () { return mine && !detached(); };
       offs.push(on("partial", function (t) { if (detached()) { off(); return; } if (mine) put(t); }));
       offs.push(on("committed", function (t) { if (mine) fin = t; }));
       offs.push(on("final", function (t) { if (detached()) { off(); return; } if (mine) { fin = t; put(t); } }));
       offs.push(on("note", function (s) { if (live()) say(s); }));
       // the session is over (closed, broken, revoked, timed out): the box keeps the typed text and the final words alone
-      offs.push(on("end", function () { if (!mine) return; restore(); mine = false; box.readOnly = false; sb.textContent = "Mic"; sync(); }));
+      offs.push(on("end", function () { if (!mine) return; restore(); mine = false; box.readOnly = false; face(sb, "mic"); sync(); }));
       Promise.resolve().then(probe).then(function (ok) { if (!gone && ok === true && available()) sb.hidden = false; }, function () {});
       sb.addEventListener("click", function () {
         if (gone) return;
-        if (mine) { sb.textContent = "Mic"; stop(); return; }        // the session closes; busy() holds until its end
+        if (mine) { face(sb, "mic"); stop(); return; }        // the session closes; busy() holds until its end
         haltOthers();
         if (S) { say("The microphone is still closing: tap Mic again in a moment."); return; }
         if (rec) abortDict();
-        begin(); mine = true; sb.textContent = "Stop mic";     // read-only while streaming: a partial redraws the whole box
+        begin(); mine = true; face(sb, "mic-stop");     // read-only while streaming: a partial redraws the whole box
         start();
-        if (!S) { mine = false; box.readOnly = false; sb.textContent = "Mic"; }
+        if (!S) { mine = false; box.readOnly = false; face(sb, "mic"); }
       });
     }
     watchOn();

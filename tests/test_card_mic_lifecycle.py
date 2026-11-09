@@ -140,10 +140,10 @@ def test_locking_the_controls_keeps_a_live_stop_button_enabled(tmp_path, w) -> N
         {"until": f"window.__sc.vj >= 1 && !!{_stream()} && !{_stream()}.hidden && 1", "ms": 20000},
         {"eval": f"{_stream()}.click(); 1"},
         {"until": "window.__sc.gum >= 1 && !!window.__sc.node", "ms": 20000},
-        {"eval": f"window.__m.a.lock(true); JSON.stringify([{_stream()}.disabled, {_stream()}.textContent])"},
+        {"eval": f"window.__m.a.lock(true); JSON.stringify([{_stream()}.disabled, {_stream()}.getAttribute('aria-label')])"},
         {"eval": f"{_stream()}.click(); 1"},
         {"until": "window.__sc.closes.length === 1 && !window.__m.a.busy() && 1", "ms": 20000},
-        {"eval": f"JSON.stringify([{_stream()}.disabled, {_stream()}.textContent])"},
+        {"eval": f"JSON.stringify([{_stream()}.disabled, {_stream()}.getAttribute('aria-label')])"},
     ])
     assert json.loads(out["values"][-4]) == [False, "Stop mic"], out["values"]
     assert json.loads(out["values"][-1]) == [True, "Mic"], out["values"]
@@ -172,7 +172,7 @@ def test_stop_dictating_ends_even_if_the_engine_never_ends(tmp_path, w) -> None:
         {"eval": f"{_dict()}.click(); 1"},
         {"eval": f"{_dict()}.click(); 1"},
         {"until": "!window.__m.a.busy() && 1", "ms": 8000},
-        {"eval": f"{_dict()}.textContent"},
+        {"eval": f"{_dict()}.getAttribute('aria-label')"},
     ])
     assert out["values"][-1] == "Dictate", out["values"]
 

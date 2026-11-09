@@ -5250,14 +5250,17 @@
     controls.push(words, sendWords);
     slot.__mics = wmic ? [wmic] : [];
     const micBtns = wmic ? wmic.buttons : [];
+    // the mic icons and send words share one row: the mic never drops under the box as a ragged line of its own
+    const sendRow = el("div", "voice-row");
+    sendRow.append(...micBtns, sendWords);
     if (card) {
       const bottom = el("div", "needs-actions needs-qa");
-      bottom.append(wrap, words, ...micBtns, sendWords, msg);
+      bottom.append(wrap, words, sendRow, msg);
       slot.replaceChildren(...parts);
       card.appendChild(bottom);
       return;
     }
-    parts.push(wrap, words, ...micBtns, sendWords, msg);
+    parts.push(wrap, words, sendRow, msg);
     slot.replaceChildren(...parts);
   }
   // iOS keyboards take a free-text box for a contact field when the card around it reads like mail (Phill 11-07, an
@@ -6248,7 +6251,11 @@
           run(String(wi.key), w);
         });
         buttons.push(b);
-        acts.append(box, ...(wmic ? wmic.buttons : []), b);
+        if (wmic && wmic.buttons.length) {      // the box and its mic icons share one row
+          const inRow = el("div", "voice-in-row");
+          inRow.append(box, ...wmic.buttons);
+          acts.append(inRow, b);
+        } else acts.append(box, b);
       }
       lock(false);
       sheetBtn = signSheetButton(r, say);

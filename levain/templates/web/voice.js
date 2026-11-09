@@ -392,7 +392,15 @@
 
   function arm(maxFinishedGseq) { baseline = maxFinishedGseq === null || maxFinishedGseq === undefined ? null : (Number(maxFinishedGseq) || 0); }
 
-  // The per-reply control: one button, Play / Stop / Tap to hear, and a line for a fixed sentence about that reply.
+  // A speaker control's state ("play", "stop" or "tap"): the icon and its accessible name (voice_icons.js); on a page without that
+  // file the words are the button. card_voice.js draws its button through this too.
+  function face(b, state, tapWords) {
+    const words = state === "stop" ? WORDS.stop : (state === "tap" ? (tapWords || WORDS.tap) : WORDS.play);
+    if (window.LevainVoiceIcons) { window.LevainVoiceIcons.set(b, state === "stop" ? "stop" : "play", words); return; }
+    b.textContent = words; b.setAttribute("aria-label", words); b.setAttribute("title", words);
+  }
+
+  // The per-reply control: one icon button, Play / Stop / Tap to hear, and a line for a fixed sentence about that reply.
   function button(reply) {
     const wrap = document.createElement("span");
     wrap.className = "voice-ctl";
@@ -404,7 +412,7 @@
     const k = key(reply);
     const paint = () => {
       const mine = playing && key(playing) === k;
-      b.textContent = mine ? WORDS.stop : (tapNeeded.has(k) ? WORDS.tap : WORDS.play);
+      face(b, mine ? "stop" : (tapNeeded.has(k) ? "tap" : "play"));
       b.setAttribute("aria-pressed", mine ? "true" : "false");
       const m = messages.get(k) || "";
       note.textContent = m; note.hidden = !m;
@@ -427,7 +435,7 @@
   window.LevainVoice = {
     SAMPLE, WORDS, DEFAULTS,
     settings: readSettings, saveSettings: writeSettings, effective, offer, blockedWords,
-    unlock, stop, play, arm, replyFinished, button,
+    unlock, stop, play, arm, replyFinished, button, face,
     isUnlocked: () => unlocked,
     noteFor: (reply) => messages.get(key(reply)) || "",
     held: () => liveUtt !== null,

@@ -471,11 +471,19 @@
     note.setAttribute("role", "status");
     actions.className = "rv-actions rv-slot";           // Send and Stop share this one slot (Stop while a reply runs and the draft is empty)
     actions.appendChild(stopB); actions.appendChild(sendB);
+    // the voice controls' state: the icon and its accessible name from voice_icons.js; without that file the words are the button
+    var DICT_TITLE = "On-device dictation where this browser provides it, and only while this page is open";
+    var STREAM_TITLE = "Streaming dictation through your speech provider, only while this page is open";
+    var FACE_WORDS = { dictate: "Dictate", "dictate-stop": "Stop dictating", mic: "Mic", "mic-stop": "Stop mic" };
+    function face(b, kind, title) {
+      if (root.LevainVoiceIcons) { root.LevainVoiceIcons.set(b, kind, null, title); return; }
+      b.textContent = FACE_WORDS[kind]; b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", title || FACE_WORDS[kind]);
+    }
     var micB = null, rec = null;
     if (Speech) {
-      micB = el(doc, "button", "rv-mic", "Dictate");
+      micB = el(doc, "button", "rv-mic", "");
       micB.setAttribute("type", "button");
-      micB.setAttribute("title", "On-device dictation where this browser provides it, and only while this page is open");
+      face(micB, "dictate", "On-device dictation where this browser provides it, and only while this page is open");
     }
     var rotB = null;
     if (opts.rotate !== false) {
@@ -488,9 +496,9 @@
     var LM = opts.mic === undefined ? (root.LevainMic || null) : opts.mic;
     var streamB = null, live = false, sbase = "", mOff = [];
     if (LM && typeof LM.probe === "function") {
-      streamB = el(doc, "button", "rv-mic rv-mic-stream", "Mic");
+      streamB = el(doc, "button", "rv-mic rv-mic-stream", "");
       streamB.setAttribute("type", "button"); streamB.hidden = true;
-      streamB.setAttribute("title", "Streaming dictation through your speech provider, only while this page is open");
+      face(streamB, "mic", "Streaming dictation through your speech provider, only while this page is open");
     }
     composer.appendChild(ta); if (micB) composer.appendChild(micB); if (streamB) composer.appendChild(streamB); composer.appendChild(actions);
     dock.appendChild(openB); dock.appendChild(note); dock.appendChild(composer);
@@ -645,7 +653,7 @@
     var dbase = "", heard = "", lastHeard = "";
     function endDictation() {
       var r = rec; rec = null;
-      if (micB) micB.textContent = "Dictate";
+      if (micB) face(micB, "dictate", DICT_TITLE);
       if (r) { r.onresult = null; r.onend = null; r.onerror = null; try { r.stop(); } catch (e) { /* already stopped */ } }
     }
     if (micB) {
@@ -696,7 +704,7 @@
             : c === "no-speech" ? "Heard nothing."
             : "Dictation stopped.";
         };
-        rec = r; micB.textContent = "Stop dictating";
+        rec = r; face(micB, "dictate-stop");
         try { r.start(); } catch (e) { endDictation(); }
       });
       // foreground only: leaving the page ends dictation
@@ -717,17 +725,17 @@
       mOff.push(LM.onPartial(drawStream));
       mOff.push(LM.onFinal(function (txt) { drawStream(txt); live = false; }));
       mOff.push(LM.onNote(function (s) { if (!stopped && live) note.textContent = s; }));
-      mOff.push(LM.onEnd(function () { live = false; ta.readOnly = false; streamB.textContent = "Mic"; }));
+      mOff.push(LM.onEnd(function () { live = false; ta.readOnly = false; face(streamB, "mic", STREAM_TITLE); }));
       Promise.resolve().then(function () { return LM.probe(); }).then(function (ok) { if (!stopped && ok === true && LM.available()) streamB.hidden = false; }, function () {});
       streamB.addEventListener("click", function () {
         voiceTap();
-        if (live) { streamB.textContent = "Mic"; endStream(); return; }
+        if (live) { face(streamB, "mic", STREAM_TITLE); endStream(); return; }
         if (LM.active()) return;                         // the last session is still closing
         endDictation();
         sbase = ta.value ? ta.value.replace(/\s*$/, " ") : "";
-        live = true; ta.readOnly = true; streamB.textContent = "Stop mic";     // locked while streaming: a partial redraws the whole box
+        live = true; ta.readOnly = true; face(streamB, "mic-stop");     // locked while streaming: a partial redraws the whole box
         LM.start();                                     // inside this tap: the permission and the audio context are asked for here
-        if (!LM.active()) { live = false; ta.readOnly = false; streamB.textContent = "Mic"; }
+        if (!LM.active()) { live = false; ta.readOnly = false; face(streamB, "mic", STREAM_TITLE); }
       });
     }
 

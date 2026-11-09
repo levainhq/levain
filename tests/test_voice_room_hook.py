@@ -53,7 +53,7 @@ HEAD = [
     {"until": "!window.__pre && document.querySelector('.rv-zone') && document.querySelector('[data-phone-jump=room]')"},
 ]
 SETTINGS = {"eval": "LevainVoice.saveSettings({tier: 'device', autoplay: true}) && 0"}
-BTNS = "[...document.querySelectorAll('.rv-room .voice-btn')].map((b) => b.textContent)"
+BTNS = "[...document.querySelectorAll('.rv-room .voice-btn')].map((b) => b.getAttribute('aria-label'))"
 
 
 def _item(g, kind, body="", source=None):
@@ -161,12 +161,12 @@ def test_send_stops_the_reading_and_a_new_conversation_stops_it_and_reads_nothin
         {"until": "document.querySelectorAll('.rv-room .voice-btn').length === 1"},
         SETTINGS,
         {"eval": "document.querySelector('.rv-room .voice-btn').click(); 1"},
-        {"until": "window.__spoken.length === 1 && document.querySelector('.rv-room .voice-btn').textContent === 'Stop'"},
+        {"until": "window.__spoken.length === 1 && document.querySelector('.rv-room .voice-btn').getAttribute('aria-label') === 'Stop'"},
         {"eval": "const ta = document.querySelector('.rv-input'); ta.value = 'interrupt'; ta.dispatchEvent(new Event('input')); window.__t0 = performance.now(); document.querySelector('.rv-send').click(); 1"},
-        {"until": "document.querySelector('.rv-room .voice-btn').textContent === 'Play'"},
+        {"until": "document.querySelector('.rv-room .voice-btn').getAttribute('aria-label') === 'Play'"},
         {"eval": "window.__t0 = performance.now() - window.__t0; 1"},
         {"eval": "document.querySelector('.rv-room .voice-btn').click(); 1"},          # play A again, then the conversation is replaced
-        {"until": "window.__spoken.length === 2 && document.querySelector('.rv-room .voice-btn').textContent === 'Stop'"},
+        {"until": "window.__spoken.length === 2 && document.querySelector('.rv-room .voice-btn').getAttribute('aria-label') === 'Stop'"},
         {"eval": "window.__before = window.__cancels; 1"},
         _set(new),
         {"until": "[...document.querySelectorAll('.rv-room .rv-text')].some((n) => n.textContent.includes('T2 old'))", "ms": 15000},

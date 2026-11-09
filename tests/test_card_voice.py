@@ -207,7 +207,7 @@ ACTIVE = "Object.defineProperty(navigator, 'userActivation', { configurable: tru
 IDLE = "Object.defineProperty(navigator, 'userActivation', { configurable: true, value: { isActive: false, hasBeenActive: false } });"
 CARD = "#levain-modal .card-voice"
 BTN = CARD + " .card-voice-btn"
-READ = ("JSON.stringify({ btn: (document.querySelector(%s) || {}).textContent || null, large: !!document.querySelector(%s),"
+READ = ("JSON.stringify({ btn: (document.querySelector(%s) || {getAttribute: () => null}).getAttribute('aria-label'), large: !!document.querySelector(%s),"
         " spoken: window.__spoken, modal: !!document.getElementById('levain-modal') })" % (json.dumps(BTN), json.dumps(CARD + ".card-voice-large")))
 SETTLE = {"eval": "new Promise((r) => setTimeout(() => r(1), 1500))"}
 

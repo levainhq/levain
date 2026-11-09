@@ -38,7 +38,7 @@ def test_a_write_in_gets_the_mic_when_the_server_offers_streaming(tmp_path: Path
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             DESKTOP, {"init": _fake()}, rig.authenticator(), *_open(rig),
             {"until": f"{SHOWN} && 1", "ms": 30000},
-            {"eval": f"JSON.stringify([{MIC}.textContent, [...{BOX}.parentNode.children].indexOf({MIC}) > [...{BOX}.parentNode.children].indexOf({BOX})])"},
+            {"eval": f"JSON.stringify([{MIC}.getAttribute('aria-label'), [...{BOX}.parentNode.children].indexOf({MIC}) > [...{BOX}.parentNode.children].indexOf({BOX})])"},
         ])
     assert json.loads(out["values"][-1]) == ["Mic", True], out["values"]
 
@@ -69,7 +69,7 @@ def test_a_partial_then_a_final_fill_the_write_in_and_the_words_are_signed_after
             {"eval": f"{BOX}.value = 'so '; {MIC}.click(); 1"},
             {"until": "window.__sc.gum >= 1 && !!window.__sc.node", "ms": 20000},
             FEED, {"until": _fill(BOX), "ms": 20000},
-            {"eval": f"JSON.stringify([{BOX}.value, {BOX}.readOnly, {MIC}.textContent])"},
+            {"eval": f"JSON.stringify([{BOX}.value, {BOX}.readOnly, {MIC}.getAttribute('aria-label')])"},
             {"eval": f"{MIC}.click(); 1"},
             {"until": f"{BOX}.value === 'so the final text' && !{BOX}.readOnly && 1", "ms": 20000},
             {"tap": WRITE_IN_BTN},

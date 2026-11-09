@@ -99,7 +99,8 @@
     const paint = () => {
       if (wrap.isConnected) attached = true;
       else if (attached) { gone(); return; }
-      b.textContent = mine ? WORDS.stop : (large ? WORDS.tap : WORDS.play);
+      const state = mine ? "stop" : (large ? "tap" : "play");
+      if (typeof V.face === "function") V.face(b, state, WORDS.tap); else b.textContent = WORDS[state];
       b.setAttribute("aria-pressed", mine ? "true" : "false");
       wrap.classList.toggle("card-voice-large", large && !mine);
       const m = V.noteFor(reply) || "";

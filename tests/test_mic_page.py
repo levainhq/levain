@@ -107,7 +107,7 @@ def _fake(flag="true", deny="false", open_status="200", worklet="true", real="fa
 MIC = "document.querySelector('.rv-mic-stream')"
 SHOWN = f"!!{MIC} && !{MIC}.hidden"
 TA = "document.querySelector('.rv-input')"
-STATE = "JSON.stringify({sc: window.__sc, ta: " + TA + ".value, label: (" + MIC + " || {}).textContent, note: (document.querySelector('.rv-sendnote') || {}).textContent})"
+STATE = "JSON.stringify({sc: window.__sc, ta: " + TA + ".value, label: (" + MIC + " ? " + MIC + ".getAttribute('aria-label') : null), note: (document.querySelector('.rv-sendnote') || {}).textContent})"
 
 
 def _go(tmp_path, qdir, steps, **kw):  # noqa: F811
@@ -198,7 +198,7 @@ def test_a_refused_microphone_says_the_fixed_sentence_opens_nothing_and_leaves_t
     v = _go(tmp_path, qdir, [
         {"until": SHOWN, "ms": 20000},
         {"do": MIC + ".click(); 1", "until": "window.__sc.gum === 1"},
-        {"until": "(" + MIC + ".textContent === 'Mic') && document.querySelector('.rv-sendnote').textContent.length > 0", "ms": 20000},
+        {"until": "(" + MIC + ".getAttribute('aria-label') === 'Mic') && document.querySelector('.rv-sendnote').textContent.length > 0", "ms": 20000},
         {"eval": STATE},
     ], deny="true")
     st = _state(v[-1])
@@ -212,7 +212,7 @@ def test_a_server_refused_open_releases_the_mic_and_says_the_same_sentence(tmp_p
     v = _go(tmp_path, qdir, [
         {"until": SHOWN, "ms": 20000},
         {"do": MIC + ".click(); 1", "until": "window.__sc.open.length === 1"},
-        {"until": "window.__sc.tracks.length === 1 && window.__sc.tracks[0].stopped === 1 && " + MIC + ".textContent === 'Mic'", "ms": 20000},
+        {"until": "window.__sc.tracks.length === 1 && window.__sc.tracks[0].stopped === 1 && " + MIC + ".getAttribute('aria-label') === 'Mic'", "ms": 20000},
         {"eval": STATE},
     ], open_status="503")
     st = _state(v[-1])
@@ -252,7 +252,7 @@ def test_a_permission_that_resolves_after_stop_stops_the_late_tracks_and_opens_n
         *LIVE, {"eval": "window.__sc.gumHold = true; 1"},
         {"do": MIC + ".click(); 1", "until": "window.__sc.gum === 1"},
         CLICK,
-        {"until": MIC + ".textContent === 'Mic' && !LevainMic.active()", "ms": 20000},
+        {"until": MIC + ".getAttribute('aria-label') === 'Mic' && !LevainMic.active()", "ms": 20000},
         {"eval": "window.__sc.gumResolve(); 1"},
         _wait(500),
     ])
@@ -267,7 +267,7 @@ def test_a_worklet_module_that_loads_after_stop_arms_no_timer_and_opens_no_serve
         *LIVE, {"eval": "window.__sc.modHold = true; 1"},
         {"do": MIC + ".click(); 1", "until": "window.__sc.mods.length === 1"},
         CLICK,
-        {"until": MIC + ".textContent === 'Mic' && !LevainMic.active()", "ms": 20000},
+        {"until": MIC + ".getAttribute('aria-label') === 'Mic' && !LevainMic.active()", "ms": 20000},
         {"eval": "window.__sc.modResolve(); 1"},
         _wait(500),
     ])
@@ -281,7 +281,7 @@ def test_an_open_that_never_resolves_ends_the_session_at_its_deadline_and_releas
     v = _go(tmp_path, qdir, [
         *LIVE, {"eval": "window.__sc.hang.open = true; LevainMic.deadlines.open = 300; 1"},
         CLICK,
-        {"until": "window.__sc.open.length === 1 && " + MIC + ".textContent === 'Mic' && !LevainMic.active()", "ms": 5000},
+        {"until": "window.__sc.open.length === 1 && " + MIC + ".getAttribute('aria-label') === 'Mic' && !LevainMic.active()", "ms": 5000},
         _wait(100),
     ])
     st = _state(v[-1])
@@ -296,7 +296,7 @@ def test_a_chunk_that_never_resolves_ends_the_session_with_exactly_one_close_and
         *LIVE, {"eval": "window.__sc.hang.chunk = true; window.__sc.hang.close = true; LevainMic.deadlines.chunk = 300; 1"},
         CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
         {"eval": "window.__feed(12000)"},
-        {"until": MIC + ".textContent === 'Mic' && !LevainMic.active()", "ms": 2500},
+        {"until": MIC + ".getAttribute('aria-label') === 'Mic' && !LevainMic.active()", "ms": 2500},
         _wait(200),
     ])
     st = _state(v[-1])
@@ -310,7 +310,7 @@ def test_a_failed_chunk_ends_without_waiting_for_the_close(tmp_path, qdir) -> No
         *LIVE, {"eval": "window.__sc.chunkStatus = 500; window.__sc.hang.close = true; 1"},
         CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
         {"eval": "window.__feed(12000)"},
-        {"until": MIC + ".textContent === 'Mic' && !LevainMic.active()", "ms": 2000},
+        {"until": MIC + ".getAttribute('aria-label') === 'Mic' && !LevainMic.active()", "ms": 2000},
         _wait(100),
     ])
     st = _state(v[-1])
@@ -325,7 +325,7 @@ def test_a_close_that_never_resolves_still_ends_the_session(tmp_path, qdir) -> N
         CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
         {"eval": "window.__feed(12000)"}, {"until": "window.__sc.chunks.length === 1"},
         CLICK,
-        {"until": MIC + ".textContent === 'Mic' && !LevainMic.active() && window.__sc.closes.length === 1", "ms": 3000},
+        {"until": MIC + ".getAttribute('aria-label') === 'Mic' && !LevainMic.active() && window.__sc.closes.length === 1", "ms": 3000},
         _wait(200),
     ])
     assert len(_state(v[-1])["sc"]["closes"]) == 1
@@ -348,13 +348,13 @@ def test_send_while_dictating_sends_the_final_text_not_the_partial(tmp_path, qdi
 @needs_browser
 def test_the_box_is_read_only_while_streaming_and_while_the_close_is_pending(tmp_path, qdir) -> None:
     """Revert: ta.readOnly in the stream click handler / its restore in onEnd (typing would be erased by the next partial)."""
-    ro = "JSON.stringify([" + TA + ".readOnly, " + MIC + ".textContent])"
+    ro = "JSON.stringify([" + TA + ".readOnly, " + MIC + ".getAttribute('aria-label')])"
     v = _go(tmp_path, qdir, [
         *LIVE, *ROOM, {"eval": "window.__sc.closeDelay = 500; 1"},
         {"eval": "JSON.stringify(" + TA + ".readOnly)"},
         CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
         {"eval": ro}, CLICK, {"eval": ro},
-        {"until": "window.__sc.closes.length === 1 && " + TA + ".value === 'the final text' && " + MIC + ".textContent === 'Mic'", "ms": 20000},
+        {"until": "window.__sc.closes.length === 1 && " + TA + ".value === 'the final text' && " + MIC + ".getAttribute('aria-label') === 'Mic'", "ms": 20000},
         {"eval": "JSON.stringify(" + TA + ".readOnly)"},
     ])
     assert [json.loads(x) for x in (v[-8], v[-5], v[-3], v[-1])] == [False, [True, "Stop mic"], [True, "Mic"], False], v
@@ -368,9 +368,9 @@ def test_mic_and_dictate_exclude_each_other_both_ways(tmp_path, qdir) -> None:
         *LIVE, *ROOM,
         {"eval": DICT + ".click(); 1"},
         CLICK, {"until": "window.__sc.open.length === 1"},
-        {"eval": "JSON.stringify([window.__sc.srStarts, " + DICT + ".textContent, " + MIC + ".textContent])"},
+        {"eval": "JSON.stringify([window.__sc.srStarts, " + DICT + ".getAttribute('aria-label'), " + MIC + ".getAttribute('aria-label')])"},
         {"eval": DICT + ".click(); 1"},
-        {"eval": "JSON.stringify([window.__sc.srStarts, " + DICT + ".textContent, " + MIC + ".textContent])"},
+        {"eval": "JSON.stringify([window.__sc.srStarts, " + DICT + ".getAttribute('aria-label'), " + MIC + ".getAttribute('aria-label')])"},
     ])
     assert json.loads(v[-3]) == [1, "Dictate", "Stop mic"], v[-3]       # Mic ended the dictation and took the box
     assert json.loads(v[-1]) == [1, "Dictate", "Stop mic"], v[-1]       # Dictate while streaming starts nothing
@@ -408,7 +408,7 @@ def test_a_resume_that_throws_or_rejects_ends_the_session_and_closes_the_context
         v = _go(sub, qdir, [
             *LIVE, {"eval": "window.__sc.resumeMode = '%s'; 1" % mode},
             CLICK,
-            {"until": MIC + ".textContent === 'Mic' && !LevainMic.active()", "ms": 5000},
+            {"until": MIC + ".getAttribute('aria-label') === 'Mic' && !LevainMic.active()", "ms": 5000},
             _wait(300),
         ])
         st = _state(v[-1])
@@ -438,7 +438,7 @@ def test_send_while_dictating_sends_nothing_when_the_close_fails(tmp_path, qdir)
     assert st["sc"]["sends"] == [] and "nothing was sent" in (st["note"] or ""), st
 
 WAV_OK = "window.__sc.tStatus = 200; "
-RECOVERED = "window.__sc.trs.length === 1 && !LevainMic.active() && " + MIC + ".textContent === 'Mic'"
+RECOVERED = "window.__sc.trs.length === 1 && !LevainMic.active() && " + MIC + ".getAttribute('aria-label') === 'Mic'"
 
 
 def _tr_ok(st, data_bytes=16000):
@@ -480,7 +480,7 @@ def test_a_revoked_chunk_is_a_final_stop_with_the_fixed_words_and_never_a_wav(tm
         *LIVE, {"eval": WAV_OK + "window.__sc.chunkStatus = 503; window.__sc.chunkRevoked = true; 1"},
         CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
         {"eval": "window.__feed(28800)"},
-        {"until": "!LevainMic.active() && " + MIC + ".textContent === 'Mic'", "ms": 5000},
+        {"until": "!LevainMic.active() && " + MIC + ".getAttribute('aria-label') === 'Mic'", "ms": 5000},
         _wait(300),
     ])
     st = _state(v[-1])
@@ -499,7 +499,7 @@ def test_a_revoke_exit_after_stop_leaves_close_failed_false(tmp_path, qdir) -> N
         CLICK, {"until": "window.__sc.open.length === 1 && window.__sc.node"},
         {"eval": "window.__feed(28800)"}, {"until": "window.__sc.chunks.length >= 1"},
         CLICK,
-        {"until": "!LevainMic.active() && " + MIC + ".textContent === 'Mic'", "ms": 5000},
+        {"until": "!LevainMic.active() && " + MIC + ".getAttribute('aria-label') === 'Mic'", "ms": 5000},
         _wait(300, "JSON.stringify({s: " + STATE + ", cf: LevainMic.closeFailed()})"),
     ])
     out = _state(v[-1]); st = _state(out["s"])

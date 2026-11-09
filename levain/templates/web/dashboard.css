@@ -2951,7 +2951,9 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-open { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-body)/1 var(--sans); }
 .rv .rv-open[hidden] { display: none; }
 .rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
-.rv .rv-mic { align-self: flex-end; border-color: transparent; color: var(--label); }
+.rv .rv-mic { align-self: flex-end; border-color: transparent; color: var(--label); display: inline-flex; align-items: center; justify-content: center; flex: none; min-width: var(--hit-min, 44px); padding: 0; }
+.rv .rv-mic[hidden] { display: none; }
+.rv .rv-mic[aria-pressed="true"] { color: var(--accent); }
 .rv .rv-rotate { min-width: var(--hit-min, 44px); margin-left: auto; }
 .rv button:disabled { opacity: .45; cursor: not-allowed; }
 .rv button:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 2px; }
@@ -3675,7 +3677,21 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 .vc-help { flex: 1 1 100%; margin: 0; }
 .vc-check { width: 24px; height: 24px; }
 .voice-ctl { display: inline-flex; align-items: center; gap: var(--sp-3); }
-.voice-btn { min-height: var(--hit-min, 44px); }
+/* The voice controls are icons (voice_icons.js): Play/Stop on a reply or card, Mic and Dictate on a reply box. Each is one touch target, its
+   words in aria-label and title. A box's controls sit in a row with the box (voice-in-row) or with its send button (voice-row), so they
+   never wrap under it as a ragged line of their own at phone width. */
+.voice-btn, body button.card-mic.card-mic { display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; min-width: var(--hit-min, 44px); min-height: var(--hit-min, 44px); padding: 0; margin-left: 0; border-radius: var(--r-pill); }
+.voice-btn { background: var(--card-2); color: var(--text); border: 1px solid var(--hair-2); cursor: pointer; }
+.voice-btn[hidden], .card-mic[hidden] { display: none; }
+.undo-btn.card-mic::before { content: none; }
+.voice-icon { flex: none; display: block; }
+.voice-btn[aria-pressed="true"], .card-mic[aria-pressed="true"] { color: var(--accent); border-color: var(--accent-line); }
+.card-voice-large .voice-btn { min-width: 64px; min-height: 64px; }
+.card-voice-large .voice-icon { width: 30px; height: 30px; }
+.voice-row { display: flex; flex-wrap: nowrap; align-items: center; justify-content: flex-end; gap: var(--sp-3); min-width: 0; }
+.voice-row > .question-send { flex: 0 1 auto; min-width: 0; margin-left: 0; }
+.voice-in-row { display: flex; flex-wrap: nowrap; align-items: flex-end; gap: var(--sp-2); flex: 1 1 100%; width: 100%; min-width: 0; }
+body .voice-in-row > :is(.sheet-write-in, .sign-write-in, textarea) { flex: 1 1 0; width: auto; min-width: 0; }
 /* LATER: one header (label + count, like Just answered), then a grid of number | day | headline; the row wrappers dissolve so the columns line up across rows */
 .needs-later { display: grid; grid-template-columns: max-content max-content minmax(0, 1fr); column-gap: var(--sp-3); row-gap: var(--sp-2); align-items: baseline; padding: 4px 2px; }
 .needs-later-head { grid-column: 1 / -1; display: flex; align-items: center; gap: var(--sp-2); }
