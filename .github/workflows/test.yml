@@ -85,9 +85,10 @@ jobs:
         run: echo "verified on $VERIFIED_REF run $VERIFIED_RUN"
 
   plan:
-    # Emits the shard list [0..TEST_SHARDS-1] the `test` matrix runs. It does not collect: each shard job collects
-    # under its own Python and picks its own files (see that job's last step), so a file one Python collects and
-    # another does not is still in that Python's shards.
+    # No longer feeds the `test` matrix: that matrix holds a static shard list so pytest starts at once instead of
+    # queueing behind this job. This job only FAILS when the static list no longer equals what the planner (tests/ci/shard.py)
+    # would emit for TEST_SHARDS. It keeps its name because the check name is read elsewhere. A new test file needs no list
+    # change: each shard job's `pick` fails on a collected file that no shard holds.
     name: plan test shards
     needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
@@ -96,8 +97,6 @@ jobs:
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    outputs:
-      shards: ${{ steps.plan.outputs.shards }}
     steps:
       - uses: actions/checkout@v6
 
@@ -106,17 +105,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Emit the shard list
-        id: plan
-        run: python tests/ci/shard.py shards --shards "$TEST_SHARDS"
+      - name: Check the static shard list against the planner
+        run: python tests/ci/shard.py check-static --workflow .github/workflows/test.yml
 
   test:
     name: pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
-    needs: plan
-    # `plan` is behind the gate, which is skipped on every non-main run; without always() the implicit success() sees that
-    # skipped ancestor and skips this matrix, so a seat/** or land/** run went green without the unit suite. Run when
-    # `plan` succeeded: a skipped plan (the gate said skip) or a failed one runs no shard.
-    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; without always() the
+    # implicit success() sees the skipped gate and skips this matrix (a seat/** or land/** run once went green without
+    # the unit suite). A failed, errored or cancelled gate runs the shards too (fail closed); only a gate that
+    # succeeded and said skip skips them. The shard list is static (below), so no planning job sits in front of them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     # History: the unsharded suite outgrew 40 min (10-21) and then 60 min (10-22; run 39881613545's 3.12 job was
@@ -125,8 +124,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
-        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+        # main, land/** and every other event run both Pythons. A seat/** push, or a workflow_dispatch on a seat/** branch,
+        # runs 3.12 only: the landing candidate on land/** still runs the full set.
+        python-version: ${{ fromJSON(startsWith(github.ref, 'refs/heads/seat/') && '["3.12"]' || '["3.12", "3.13"]') }}
+        # The static shard list: keep equal to TEST_SHARDS (the `plan` job fails when it is not). Re-cut both together.
+        shard: [0, 1, 2, 3, 4, 5]  # static shard list
     steps:
       - uses: actions/checkout@v6
 
@@ -169,13 +171,19 @@ jobs:
           LEVAIN_TEST_WAIT_SCALE: "2"
         run: |
           set -o pipefail
-          pytest --collect-only -q > "$RUNNER_TEMP/nodes.txt"
+          marker=()
+          if [ "${{ matrix.python-version }}" != "3.12" ]; then marker=(-m "not static_guard"); fi
+          pytest --collect-only -q "${marker[@]}" > "$RUNNER_TEMP/nodes.txt"
           python tests/ci/shard.py pick --shards "$TEST_SHARDS" --shard "${{ matrix.shard }}" < "$RUNNER_TEMP/nodes.txt" > "$RUNNER_TEMP/files.txt"
           mapfile -t files < "$RUNNER_TEMP/files.txt"
           test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
           # --durations=25 prints the 25 slowest tests into the log, a measurement the shard weights lack (the -q progress parse ignores it)
           # -n auto: one pytest-xdist worker per runner core; the collection above stays serial
-          pytest -n auto -q --durations=25 --basetemp=/tmp/levain-pt "${files[@]}"
+          # static_guard files read this checkout's source and AST, so 3.13 deselects them (the collection too, so the
+          # shard plan is made over what 3.13 runs); 3.12 runs them
+          marker=()
+          if [ "${{ matrix.python-version }}" != "3.12" ]; then marker=(-m "not static_guard"); fi
+          pytest -n auto -q --durations=25 --basetemp=/tmp/levain-pt "${marker[@]}" "${files[@]}"
 
       - name: Keep what the page showed at a failed wait
         # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
@@ -240,7 +248,7 @@ jobs:
           mapfile -t files < "$RUNNER_TEMP/root_tests.txt"
           test "${#files[@]}" -gt 0 || { echo "the closure selected no test files"; exit 1; }
           echo "${#files[@]} test files"
-          PYTHONPATH="$PWD" pytest -n auto --noconftest -q -p no:cacheprovider --rootdir="$PWD" "${files[@]}"
+          PYTHONPATH="$PWD" pytest -n auto --noconftest -q --durations=25 -p no:cacheprovider --rootdir="$PWD" "${files[@]}"
 
   linux-live:
     # The bwrap floor RUN, not read as data. GitHub's ubuntu runners refuse unprivileged user
@@ -305,7 +313,8 @@ jobs:
     # One job ran every file in series and was within a few minutes of its 40 minute limit (35m42s on 10-29, then
     # over it once the sign-attempt tests joined), so the files are dealt round-robin into three shards: each
     # shard keeps the same rules (selection by file, nothing collected fails, any skip fails).
-    name: cockpit browser tests (Python 3.13, shard ${{ matrix.shard }})
+    # Python 3.13 on main, land/** and every event but a seat/** push or a dispatch on a seat/** branch; those run 3.12 only.
+    name: cockpit browser tests (Python ${{ startsWith(github.ref, 'refs/heads/seat/') && '3.12' || '3.13' }}, shard ${{ matrix.shard }})
     needs: gate
     # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
     # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
@@ -323,7 +332,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: ${{ startsWith(github.ref, 'refs/heads/seat/') && '3.12' || '3.13' }}
           cache: pip
           cache-dependency-path: pyproject.toml
 
@@ -367,7 +376,7 @@ jobs:
           echo "$files"
           test -n "$files" || { echo "shard ${{ matrix.shard }} holds no test file"; exit 1; }
           set -o pipefail
-          pytest -n auto -q -rs --basetemp=/tmp/levain-pt $files 2>&1 | tee browser.log
+          pytest -n auto -q -rs --durations=25 --basetemp=/tmp/levain-pt $files 2>&1 | tee browser.log
           # ANY skip is a failure here, whatever its reason: the whole point of this job is that these tests run
           if grep -q -E "^SKIPPED|[0-9]+ skipped" browser.log; then
             echo "a test skipped in the browser job (reasons above, from -rs)"

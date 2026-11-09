@@ -4,6 +4,11 @@
     pytest --collect-only -q > nodes.txt
     python tests/ci/shard.py pick --shards N --shard K < nodes.txt > files.txt
 
+`check-static --workflow FILE` compares the static shard list the workflow's `test` matrix holds (the one line carrying
+the marker `# static shard list`) with what `shards` would write for the workflow's own TEST_SHARDS, and exits non-zero
+on a difference, so the matrix cannot go stale against the planner. (A new test file never needs the list: each shard
+job's `pick` fails on a collected file that no shard holds.)
+
 `shards` writes `shards=[0, .., N-1]` (the matrix list) to the file named by $GITHUB_OUTPUT, or to
 stdout when it is unset. `pick` reads node ids on stdin, the output of `pytest --collect-only -q` run
 in the SAME job and Python as the tests (so the repo's real config, under that interpreter, decides
@@ -272,6 +277,20 @@ def _weights_cli(args):
     return 0
 
 
+_STATIC_LIST = re.compile(r"^\s*shard:\s*(\[[0-9,\s]*\])\s*# static shard list\s*$", re.MULTILINE)
+_TEST_SHARDS = re.compile(r'^\s*TEST_SHARDS:\s*"?(\d+)"?\s*(?:#.*)?$', re.MULTILINE)
+
+
+def check_static(workflow_text):
+    """Raise ValueError unless the workflow's one static shard list equals the planner's list for its TEST_SHARDS."""
+    lists, counts = _STATIC_LIST.findall(workflow_text), _TEST_SHARDS.findall(workflow_text)
+    if len(lists) != 1 or len(counts) != 1:
+        raise ValueError(f"need exactly one static shard list and one TEST_SHARDS, found {len(lists)} and {len(counts)}")
+    want = list(range(_count(counts[0])))
+    if json.loads(lists[0]) != want:
+        raise ValueError(f"the static shard list {lists[0]} is stale: TEST_SHARDS={counts[0]} plans {want}")
+
+
 def main(argv, stdin=None, environ=None):
     environ = os.environ if environ is None else environ
     if len(argv) == 4 and argv[1:3] == ["shards", "--shards"]:
@@ -292,6 +311,13 @@ def main(argv, stdin=None, environ=None):
             print(f"shard.py pick: {e}", file=sys.stderr)
             return 1
         print("\n".join(shards[k]))
+        return 0
+    if len(argv) == 4 and argv[1] == "check-static" and argv[2] == "--workflow":
+        try:
+            check_static(Path(argv[3]).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"shard.py check-static: {e}", file=sys.stderr)
+            return 1
         return 0
     if len(argv) >= 2 and argv[1] == "weights":
         return _weights_cli(argv[2:])
