@@ -69,3 +69,21 @@ def test_the_result_line_is_one_json_line_after_the_marker():
     line = dep_drift.result_line("red", "suite", rows, pytest_exit=1)
     assert line.startswith("DEP_DRIFT ") and "\n" not in line
     assert json.loads(line.split(" ", 1)[1]) == {"result": "red", "stage": "suite", "changed": ["a 1 -> 2"], "pytest_exit": 1}
+
+
+def test_failed_tests_reads_pytest_short_summary_ids():
+    out = [
+        "....F.",
+        "=========================== short test summary info ============================",
+        "FAILED tests/test_a.py::test_one - AssertionError: x",
+        "ERROR tests/test_b.py::test_two",
+        "FAILED tests/test_c.py (collection) no node id",
+        "1 failed, 1 error, 3 passed in 1.0s",
+    ]
+    assert dep_drift.failed_tests(out) == ["tests/test_a.py::test_one", "tests/test_b.py::test_two"]
+
+
+def test_failed_tests_is_bounded():
+    out = [f"FAILED tests/t.py::t{i} - x" for i in range(50)]
+    assert len(dep_drift.failed_tests(out)) == 20
+    assert len(dep_drift.failed_tests(out, limit=3)) == 3
