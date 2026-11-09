@@ -1255,3 +1255,46 @@ def test_a_refusal_window_with_no_run_never_breaks_a_runs_close(tmp_path):
         return out
 
     assert asyncio.run(go()) == ({}, True)
+
+
+def test_a_run_whose_count_keeps_failing_is_never_dropped_and_is_noted_once(tmp_path, monkeypatch):
+    # codex K3x: a zero-row run the restart sweep cannot rebuild stays in `_finalizing` through any number of unnamed
+    # errors, retried on a backoff timer with no other trigger, and its failure is noted once
+    path = str(tmp_path / "ledger.jsonl")
+    notes: List[str] = []
+    real_note = K._note
+
+    def note(level, fmt, *args):
+        notes.append(fmt % args)
+        real_note(level, fmt, *args)
+
+    monkeypatch.setattr(K, "_note", note)
+
+    async def go():
+        led = keys_ledger(path)
+        k = K.Keys(ledger=led)
+        k._in_loop()
+        k.finalize_retry_first_s = 0.01
+        k.finalize_retry_max_s = 0.05
+        real_final = led.run_final
+        calls = []
+
+        def flaky(run_id):
+            calls.append(run_id)
+            if len(calls) <= 6:
+                raise RuntimeError("a transient fault")
+            return real_final(run_id)
+
+        led.run_final = flaky
+        k._run_join("s9", RID2)
+        k._run_leave("s9")                                       # a run that made no call: ready, zero rows
+        await until(lambda: led.run_finalized(RID2) and RID2 not in k._finalizing, 10, "the count was written")
+        out = (len(calls), set(k._finalizing), dict(k._finalize_errors))
+        await led.aclose(5)
+        return out
+
+    n, finalizing, errors = asyncio.run(go())
+    assert n == 7 and finalizing == set() and errors == {}
+    assert len([s for s in notes if "run-final was not written" in s]) == 1
+    finals = [o for o in file_lines(path) if o["kind"] == "run-final"]
+    assert len(finals) == 1 and finals[0]["meta"]["lineage"]["rows"] == 0

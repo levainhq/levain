@@ -296,9 +296,10 @@ LINEAGE_ENVELOPE_BYTES = 48 * 1024
 REFUSED_ROW_S = 60.0
 #: DECISION: the wait before an envelope CONTROL refused, or did not answer, is sent again (the attach backoff's cap)
 LINEAGE_RETRY_S = 5.0
-#: DECISION: the triggers a closed run's count may fail on with an error the ledger did not name before keys stops
-#: asking for it (noted); a run with rows comes back at the next start's sweep
-FINALIZE_TRIES = 3
+#: DECISION: the backoff before a closed run whose count failed with an error the ledger did not name is asked for
+#: again: the first wait, doubled after each failure up to the cap. The run is never given up for a failure count
+FINALIZE_RETRY_FIRST_S = 1.0
+FINALIZE_RETRY_MAX_S = 60.0
 
 
 def _stamp(t: float) -> str:
@@ -1134,9 +1135,14 @@ class Keys:
         self._session_runs: Dict[str, Set[str]] = {}
         self._finalizing: Set[str] = set()
         #: the closed runs whose run-final line is queued and not yet answered (they stay in `_finalizing` until it is
-        #: durable), and the count of unnamed errors each run's count has hit (`FINALIZE_TRIES`)
+        #: durable); the count of unnamed errors each run's count has hit and the loop time before which it is not
+        #: asked for again (the backoff); the one timer that asks again when the earliest backoff ends
         self._final_pending: Set[str] = set()
         self._finalize_errors: Dict[str, int] = {}
+        self._finalize_after: Dict[str, float] = {}
+        self._finalize_timer: Optional[asyncio.TimerHandle] = None
+        self.finalize_retry_first_s = FINALIZE_RETRY_FIRST_S
+        self.finalize_retry_max_s = FINALIZE_RETRY_MAX_S
         if ledger is not None:
             ledger.on_outbox = self._lineage_due
             ledger.on_runs = self._try_finalize
@@ -1296,6 +1302,9 @@ class Keys:
         (`begin_closing`), whose failure is noted and never stops the shutdown."""
         self._in_loop()
         self.closing = True
+        if self._finalize_timer is not None:
+            self._finalize_timer.cancel()
+            self._finalize_timer = None
         if self._closer is None:
             self._closer = asyncio.ensure_future(self._close())
             try:
@@ -1892,41 +1901,72 @@ class Keys:
         any other; the next ack frees room and calls back here), and a run that is not ready waits for the next
         trigger. A run already counted, or unknown to the ledger, leaves the set. A `LedgerUnavailable` keeps every
         run (the ledger writes nothing now: the next start's sweep finds a run with rows); any other error keeps the
-        run for the next trigger, `FINALIZE_TRIES` times, then lets it go, noted."""
+        run, always: it is not asked for again until its backoff ends (a timer asks then, so a run with no other
+        trigger is still counted), and its first such failure is noted, the rest only counted."""
         led = self.ledger
         if led is None or self.closing:
             return
-        for run_id in sorted(self._finalizing):
-            if run_id in self._run_sessions:
-                self._finalizing.discard(run_id)
-                continue
-            if run_id in self._final_pending:
-                continue
-            try:
-                if led.run_finalized(run_id) or not led.run_known(run_id):
-                    self._finalizing.discard(run_id)
-                    self._finalize_errors.pop(run_id, None)
-                elif led.run_ready(run_id) and led.outbox_committed < self.lineage_outbox_max:
-                    fut = led.run_final(run_id)
-                    self._final_pending.add(run_id)
-                    fut.add_done_callback(functools.partial(self._final_answered, run_id))
-            except ledger.LedgerUnavailable:
-                return
-            except Exception as e:
-                n = self._finalize_errors[run_id] = self._finalize_errors.get(run_id, 0) + 1
-                if n >= FINALIZE_TRIES:
-                    self._finalizing.discard(run_id)
-                    del self._finalize_errors[run_id]
-                _note(logging.WARNING, "levain gw-keys: a run-final was not written (%s)%s", type(e).__name__,
-                      "; given up" if n >= FINALIZE_TRIES else "; kept for the next trigger")
+        loop = asyncio.get_running_loop()
+        try:
+            for run_id in sorted(self._finalizing):
+                if run_id in self._run_sessions:
+                    self._finalize_forget(run_id)
+                    continue
+                if run_id in self._final_pending:
+                    continue
+                if self._finalize_after.get(run_id, 0.0) > loop.time():
+                    continue
+                try:
+                    if led.run_finalized(run_id) or not led.run_known(run_id):
+                        self._finalize_forget(run_id)
+                    elif led.run_ready(run_id) and led.outbox_committed < self.lineage_outbox_max:
+                        fut = led.run_final(run_id)
+                        self._final_pending.add(run_id)
+                        fut.add_done_callback(functools.partial(self._final_answered, run_id))
+                except ledger.LedgerUnavailable:
+                    return
+                except Exception as e:
+                    n = self._finalize_errors[run_id] = self._finalize_errors.get(run_id, 0) + 1
+                    wait = min(self.finalize_retry_first_s * (2 ** min(n - 1, 30)), self.finalize_retry_max_s)
+                    self._finalize_after[run_id] = loop.time() + wait
+                    if n == 1:
+                        _note(logging.WARNING, "levain gw-keys: a run-final was not written (%s); kept, asked for "
+                              "again after a backoff", type(e).__name__)
+        finally:
+            self._finalize_arm(loop)
+
+    def _finalize_forget(self, run_id: str) -> None:
+        """A run leaves the count's bookkeeping: counted, unknown to the ledger, or open again."""
+        self._finalizing.discard(run_id)
+        self._finalize_errors.pop(run_id, None)
+        self._finalize_after.pop(run_id, None)
+
+    def _finalize_arm(self, loop: asyncio.AbstractEventLoop) -> None:
+        """One timer, set for the earliest backoff of a run still waiting; none when no run is backing off."""
+        for run_id in [r for r in self._finalize_after if r not in self._finalizing]:
+            del self._finalize_after[run_id]
+        due = min(self._finalize_after.values(), default=None)
+        t = self._finalize_timer
+        if t is not None and (due is None or t.when() != due):
+            t.cancel()
+            self._finalize_timer = t = None
+        if due is not None and t is None and not self.closing:
+            self._finalize_timer = loop.call_at(due, self._finalize_due, due)
+
+    def _finalize_due(self, due: float) -> None:
+        """The timer: every backoff that ends by `due` is over (the loop may run a timer a clock tick early), then the
+        runs are asked for again."""
+        self._finalize_timer = None
+        for run_id in [r for r, t in self._finalize_after.items() if t <= due]:
+            del self._finalize_after[run_id]
+        self._try_finalize()
 
     def _final_answered(self, run_id: str, fut: "asyncio.Future") -> None:
         """A queued run-final line's answer: durable, the run is done; failed (the ledger faulted or closed first, and
         took its fence down), the run stays in `_finalizing` for the next start's sweep."""
         self._final_pending.discard(run_id)
         if not fut.cancelled() and fut.exception() is None:
-            self._finalizing.discard(run_id)
-            self._finalize_errors.pop(run_id, None)
+            self._finalize_forget(run_id)
         else:
             _note(logging.WARNING, "levain gw-keys: a run-final line did not become durable; the run is kept")
 
