@@ -16,7 +16,7 @@ import math
 import re
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypeVar
 
 from levain.broker import norm, policy
 from levain.broker.policy import Price
@@ -146,6 +146,18 @@ def _ceiling_value(field: str, v: Any) -> int:
 
 
 @dataclass(frozen=True)
+class Position:
+    """One row of a codec's content-position table: a place the provider's reference documents content blocks.
+    `path` is the `_strip_path` grammar and ends at the block (or at the list of them); `admit` is every block `type`
+    a dispatch route admits there; `images` are the admit types the estimate counts as an image there (a subset);
+    `opaque` are the admit types that carry content the estimate sees only as bytes (a subset)."""
+    path: Tuple[Any, ...]
+    admit: Tuple[str, ...]
+    images: Tuple[str, ...] = ()
+    opaque: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Checked:
     """`check`'s answer: the model, its price, and the unboundable content an interactive route admits as
     `"bound": "unproven"` (R4 §1.6). Empty `unproven` = a bounded call."""
@@ -157,11 +169,16 @@ class Checked:
 class Codec:
     """One `body_codec`. Subclasses name the codec and its shapes; the walk and the arithmetic are shared."""
     name = ""
-    #: the PATH table: every position the provider's reference documents as image-bearing, as (path, the `type`s that
-    #: are an image there). An image at one is counted at `image_tokens` with its data excluded (`_strip_images`).
-    image_paths: Tuple[Tuple[Tuple[Any, ...], Tuple[str, ...]], ...] = ()
-    #: the content-block `type`s the estimate cannot see (documents, provider-fetched files): unproven / refused.
+    #: the POSITION table: every place the provider's reference documents content blocks, with the block types a
+    #: dispatch route admits there and which of them are images. ONE table serves both readers: the dispatch walk
+    #: (`_refuse_blocks`) and the estimate's image count (`image_paths`, derived from it).
+    content_positions: Tuple[Position, ...] = ()
+    #: the content-block `type`s the estimate cannot see (documents, provider-fetched files): unproven / refused,
+    #: wherever they appear in the body.
     unbounded_blocks: Tuple[str, ...] = ()
+    #: block types judged unbounded (server-side history, server-expanded references) that only a position in
+    #: `content_positions` reads: they name the refusal `body-unbounded` instead of `body-unlisted`.
+    known_unbounded_blocks: Tuple[str, ...] = ()
     #: top-level fields that make the provider add content the estimate cannot see, unless `_DISABLED_BY` disables them.
     unbounded_fields: Tuple[str, ...] = ()
     #: tool types (version suffix removed) that run on the provider and feed results back.
@@ -213,8 +230,8 @@ class Codec:
               model_requested: Optional[str] = None) -> Checked:
         """The model has a price entry (else `model-not-allowed`); a ticketed run's `model` is its ticket's
         `model_requested` (else `model-not-allowed`); no `route`, and no `models` but exactly `[model]` (else
-        `model-not-allowed`); on a dispatch route, a top-level field or a tool type the codec has not judged is
-        `body-unlisted:<name>` (403); then the unboundable shapes: a dispatch route refuses them
+        `model-not-allowed`); on a dispatch route, a top-level field, a tool type or a content block the codec has
+        not judged is `body-unlisted:<name>` (403); then the unboundable shapes: a dispatch route refuses them
         `body-unbounded:<what>` (403), an interactive one returns them as `unproven`."""
         model = obj.get("model")
         if not isinstance(model, str) or not prices or model not in prices:
@@ -239,6 +256,8 @@ class Codec:
             raise norm.Refused("body-unbounded:" + _unbounded_what(found[0]),
                                "content the estimate cannot see (a server-side tool or option: turn it off in the "
                                "client, e.g. Codex's `web_search`; a dispatch route admits none)")
+        if dispatch:
+            self._refuse_blocks(obj)
         return Checked(model, price, found)
 
     def _refuse_unlisted(self, obj: Mapping[str, Any]) -> None:
@@ -271,6 +290,61 @@ class Codec:
         raise norm.Refused("body-unlisted:" + _wire_what(name, "tool"), "a tool type levain has not judged; "
                            "dispatch admits only judged tool types")
 
+    @property
+    def image_paths(self) -> Tuple[Tuple[Tuple[Any, ...], Tuple[str, ...]], ...]:
+        """The rows of `content_positions` that hold an image, as (path, the image `type`s there): the estimate's
+        image count reads this, so it can only name a position the allowlist names."""
+        return tuple((p.path, p.images) for p in self.content_positions if p.images)
+
+    def _refuse_blocks(self, obj: Mapping[str, Any]) -> None:
+        """The dispatch allowlist over content: the first block at a documented position that the table does not
+        admit there. A known cost is `body-unbounded:<type>`; any other is `body-unlisted:<type>`, with a fixed word
+        for a name outside the wire grammar or a block that is no object with a string `type`."""
+        for kind, what in self._block_findings(obj):
+            if kind == "unbounded":
+                raise norm.Refused("body-unbounded:" + _unbounded_what(what),
+                                   "content the estimate cannot see (a server-side tool or option: turn it off in the "
+                                   "client, e.g. Codex's `web_search`; a dispatch route admits none)")
+            raise norm.Refused("body-unlisted:" + _wire_what(what, "block"), "a content block levain has not judged; "
+                               "dispatch admits only judged blocks")
+
+    def _block_findings(self, obj: Mapping[str, Any]) -> Iterator[Tuple[str, str]]:
+        """Every block at a position of `content_positions` the table does not admit there, in body order, as
+        (`unbounded` or `unlisted`, the type). Only the table's positions are read: a block's own fields (a tool call's
+        input) are the client's JSON and are never entered."""
+        for p in self.content_positions:
+            ends_in_list = bool(p.path) and p.path[-1] == EACH
+            for b in _walk_path(obj, p.path):
+                if not isinstance(b, dict):
+                    if ends_in_list:
+                        yield "unlisted", ""
+                    continue
+                t = self._block_type(b, p)
+                if t is None:
+                    yield "unlisted", ""
+                    continue
+                fault = self._block_fault(t, b)
+                if fault is None and t in p.admit:
+                    continue
+                if fault == "unbounded" or t in self.unbounded_blocks or t in self.known_unbounded_blocks:
+                    yield "unbounded", t
+                else:
+                    yield "unlisted", t
+        yield from self._extra_findings(obj)
+
+    def _block_type(self, b: Mapping[str, Any], p: Position) -> Optional[str]:
+        """The `type` of a block at `p`, None when it has no string one."""
+        t = b.get("type")
+        return t if isinstance(t, str) else None
+
+    def _block_fault(self, t: str, b: Mapping[str, Any]) -> Optional[str]:
+        """A block of an admitted type that is not admitted in this form: `unbounded` or `unlisted`; None otherwise."""
+        return None
+
+    def _extra_findings(self, obj: Mapping[str, Any]) -> Iterator[Tuple[str, str]]:
+        """Findings outside the table's block positions (a reference carried by a field of a message)."""
+        return iter(())
+
     def _tool_lists(self, obj: Mapping[str, Any]) -> List[Any]:
         """Every tool list the body declares, each as the client sent it: top-level `tools` when present, then the
         codec's inline positions (`_inline_tool_lists`). The tool allowlist and the server-tool naming both read it."""
@@ -294,6 +368,10 @@ class Codec:
         for t in self._block_types(obj):
             if t in self.unbounded_blocks and t not in found:
                 found.append(t)
+        # the position walk's known costs (an unscoped denylist cannot name a type a client's own JSON may hold)
+        for kind, what in self._block_findings(obj):
+            if kind == "unbounded" and what not in found:
+                found.append(what)
         return tuple(found)
 
     def _unbounded_shapes(self, obj: Mapping[str, Any]) -> List[str]:
@@ -440,6 +518,28 @@ VALUES = "{}"
 @dataclass(frozen=True)
 class _Is:
     types: Tuple[str, ...]
+
+
+def _walk_path(v: Any, path: Tuple[Any, ...]) -> Iterator[Any]:
+    """Every value at the end of `path` (the `_strip_path` grammar), in body order. A step that does not match ends
+    that branch. The recursion is as deep as the path, never as deep as the body."""
+    if not path:
+        yield v
+        return
+    step, rest = path[0], path[1:]
+    if isinstance(step, _Is):
+        if isinstance(v, dict) and v.get("type") in step.types:
+            yield from _walk_path(v, rest)
+    elif step == EACH:
+        if isinstance(v, list):
+            for x in v:
+                yield from _walk_path(x, rest)
+    elif step == VALUES:
+        if isinstance(v, dict):
+            for x in v.values():
+                yield from _walk_path(x, rest)
+    elif isinstance(v, dict) and step in v:
+        yield from _walk_path(v[step], rest)
 
 
 def _strip_path(v: Any, path: Tuple[Any, ...], types: Tuple[str, ...],
@@ -772,13 +872,31 @@ class UsageReader:
 
 class AnthropicMessages(Codec):
     name = "anthropic-messages"
-    # `messages[].content[]`, and a `tool_result` block's own `content[]` inside it.
-    image_paths = (
-        (("messages", EACH, "content", EACH), ("image",)),
-        (("messages", EACH, "content", EACH, _Is(("tool_result",)), "content", EACH), ("image",)),
+    # The documented content positions of the SDK's request types, and the blocks a dispatch route admits at each: the
+    # system text blocks, a message's content, a `tool_result` block's own content, and a `search_result`'s. An image
+    # is counted at `image_tokens` whatever its source (base64, url or file). A block outside a position's list is
+    # refused there. `thinking` and `redacted_thinking` carry opaque encrypted content the estimate counts by bytes;
+    # that is UNMEASURED, so they are admitted and marked `opaque`.
+    _RESULT_BLOCKS = ("text", "image", "search_result", "tool_reference")
+    content_positions = (
+        Position(("system", EACH), ("text",)),
+        Position(("messages", EACH, "content", EACH),
+                 ("text", "image", "tool_use", "tool_result", "search_result", "tool_addition", "tool_removal",
+                  "thinking", "redacted_thinking"), ("image",), ("thinking", "redacted_thinking")),
+        Position(("messages", EACH, "content", EACH, _Is(("tool_result",)), "content", EACH),
+                 _RESULT_BLOCKS, ("image",)),
+        Position(("messages", EACH, "content", EACH, _Is(("tool_result",)), "content", EACH,
+                  _Is(("search_result",)), "content", EACH), ("text",)),
+        Position(("messages", EACH, "content", EACH, _Is(("search_result",)), "content", EACH), ("text",)),
     )
     # document blocks (PDF, text, URL-fetched) and files a container fetches are content the estimate cannot see.
     unbounded_blocks = ("document", "container_upload")
+    # history of a server tool or an MCP server, a server-side compaction and a server-side fallback hop: each is
+    # produced only by a feature a dispatch route refuses
+    known_unbounded_blocks = (
+        "compaction", "server_tool_use", "web_search_tool_result", "web_fetch_tool_result", "code_execution_tool_result",
+        "bash_code_execution_tool_result", "text_editor_code_execution_tool_result", "tool_search_tool_result",
+        "advisor_tool_result", "mcp_tool_use", "mcp_tool_result", "mcp_tool_listing", "fallback")
     # the MCP connector feeds remote tool results back; OpenRouter's Anthropic-style endpoint takes `plugins` (web,
     # web-fetch, file-parser: openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message.md); an
     # on-demand `compaction` call reports its billed tokens only in `usage.iterations` [read 2026-11-08].
@@ -825,6 +943,16 @@ class AnthropicMessages(Codec):
                 for e in edits):
             return ["context_management"]
         return []
+
+    def _block_fault(self, t: str, b: Mapping[str, Any]) -> Optional[str]:
+        """A `tool_addition` is admitted when it names a tool already declared (a reference) or defines one, which
+        `_refuse_unlisted` has already put through the tool-type allowlist; any other `tool` is unjudged."""
+        if t == "tool_addition":
+            tool = b.get("tool")
+            ok = isinstance(tool, dict) and tool.get("type") in (
+                "tool_reference", "mcp_tool_reference", "mcp_toolset_reference", "tool_definition")
+            return None if ok else "unlisted"
+        return None
 
     def _inline_tool_lists(self, obj: Mapping[str, Any]) -> List[Any]:
         """A tool declared mid-conversation: a `messages[].content[]` `tool_addition` block whose `tool` is a
@@ -915,8 +1043,11 @@ class OpenAIChat(_OpenAI):
     name = "openai-chat"
     checks_answered_model = True
     # `messages[].content[]`. A `tool` message's content is text parts only (openai-python
-    # `ChatCompletionToolMessageParam`), so a tool output holds no image position.
-    image_paths = ((("messages", EACH, "content", EACH), ("image_url",)),)
+    # `ChatCompletionToolMessageParam`), so a tool output holds no image position. A part outside this list (audio,
+    # file, a provider's video part) is refused on a dispatch route.
+    content_positions = (
+        Position(("messages", EACH, "content", EACH), ("text", "refusal", "image_url"), ("image_url",)),
+    )
     unbounded_blocks = ("file", "input_audio")
     # `web_search_options` (search models), OpenRouter's `plugins`, and `max_tool_calls` (server-side tool calls)
     # add content the estimate cannot see.
@@ -944,6 +1075,15 @@ class OpenAIChat(_OpenAI):
     # the ceiling plainly bounds; the rest are OpenRouter's debug, image and server-tool-loop controls
     unjudged_fields = ("audio", "modalities", "moderation", "prediction", "prompt_cache_options", "image_config",
                        "debug", "deferred_tools", "stop_server_tools_when")
+
+    def _extra_findings(self, obj: Mapping[str, Any]) -> Iterator[Tuple[str, str]]:
+        """An assistant message's `audio` with an `id` names a previous audio response the provider holds: the
+        server expands it into billed audio input the estimate cannot see."""
+        messages = obj.get("messages")
+        for m in messages if isinstance(messages, list) else ():
+            audio = m.get("audio") if isinstance(m, dict) else None
+            if isinstance(audio, dict) and "id" in audio:
+                yield "unbounded", "audio"
 
     def write_stream_usage(self, obj: Dict[str, Any]) -> bool:
         """A `stream: true` body with no `stream_options.include_usage` key gets `include_usage: true` written in
@@ -997,13 +1137,30 @@ class OpenAIResponses(_OpenAI):
     # `output[]` ("string or array of ResponseInputText or ResponseInputImage or ResponseInputFile"); a computer call
     # output's `output` (one `computer_screenshot`); a prompt variable's value ("map[string or ResponseInputText or
     # ResponseInputImage or ResponseInputFile]"). `instructions` is "string or null": no image position.
-    image_paths = (
-        (("input", EACH, "content", EACH), ("input_image",)),
-        (("input", EACH, _Is(("function_call_output", "custom_tool_call_output")), "output", EACH), ("input_image",)),
-        (("input", EACH, _Is(("computer_call_output",)), "output"), ("computer_screenshot",)),
-        (("prompt", "variables", VALUES), ("input_image",)),
+    # The same positions carry the dispatch allowlist: an `input[]` item (a typeless one with a `role` is a message,
+    # one without is a reference to a stored item), then each item's content or output. `reasoning` carries opaque
+    # encrypted content the estimate counts by bytes; that is UNMEASURED, so it is admitted and marked `opaque`.
+    content_positions = (
+        Position(("input", EACH),
+                 ("message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output",
+                  "local_shell_call", "local_shell_call_output", "shell_call", "shell_call_output",
+                  "apply_patch_call", "apply_patch_call_output", "configuration_update", "reasoning",
+                  "tool_search_call", "additional_tools", "tool_search_output"), (), ("reasoning",)),
+        Position(("input", EACH, "content", EACH),
+                 ("input_text", "output_text", "refusal", "reasoning_text", "input_image"), ("input_image",)),
+        Position(("input", EACH, _Is(("function_call_output", "custom_tool_call_output")), "output", EACH),
+                 ("input_text", "input_image"), ("input_image",)),
+        Position(("input", EACH, _Is(("computer_call_output",)), "output"), ("computer_screenshot",),
+                 ("computer_screenshot",)),
+        Position(("prompt", "variables", VALUES), ("input_text", "input_image"), ("input_image",)),
     )
     unbounded_blocks = ("input_file",)
+    # server tool history, a stored item the server expands, and the compaction items; none is produced by a
+    # client-run turn
+    known_unbounded_blocks = (
+        "item_reference", "compaction", "compaction_trigger", "web_search_call", "file_search_call",
+        "code_interpreter_call", "image_generation_call", "computer_call", "computer_call_output", "mcp_list_tools",
+        "mcp_approval_request", "mcp_approval_response", "mcp_call", "program", "program_output")
     # server-held state the estimate cannot see (prior turns, a stored prompt), OpenRouter's `plugins`, and
     # `max_tool_calls` (server-side tool calls).
     unbounded_fields = ("previous_response_id", "conversation", "prompt", "plugins", "max_tool_calls")
@@ -1037,6 +1194,18 @@ class OpenAIResponses(_OpenAI):
     # OpenAI access programs and image options, and OpenRouter's debug, image and server-tool-loop controls
     unjudged_fields = ("background", "context_management", "moderation", "modalities", "access_programs", "image",
                        "prompt_cache_options", "image_config", "debug", "deferred_tools", "stop_server_tools_when")
+
+    def _block_type(self, b: Mapping[str, Any], p: Position) -> Optional[str]:
+        """An `input[]` item with no `type` is classified by shape, as the provider's input union does."""
+        if "type" not in b and p.path == ("input", EACH):
+            return "message" if "role" in b else "item_reference"
+        return super()._block_type(b, p)
+
+    def _block_fault(self, t: str, b: Mapping[str, Any]) -> Optional[str]:
+        """A `tool_search_call` is client-run unless it says `server`, which is a provider-side tool run."""
+        if t == "tool_search_call" and b.get("execution") == "server":
+            return "unbounded"
+        return None
 
     def _inline_tool_lists(self, obj: Mapping[str, Any]) -> List[Any]:
         """A tool declared mid-input: the `tools` of an `additional_tools` or a `tool_search_output` item in `input[]`

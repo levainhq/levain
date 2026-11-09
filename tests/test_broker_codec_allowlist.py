@@ -2,7 +2,8 @@
 
 A dispatch route admits only the top-level fields and the client-run tool types a codec has judged
 (`dispatch_fields`, `dispatch_tool_types`); anything else is `body-unlisted:<name>` (403). An interactive route keeps
-its denylists (unproven marks) and is untouched. Block types stay a denylist.
+its denylists (unproven marks) and is untouched. Block types are an allowlist over the position table (see
+`test_broker_codec_blockwalk.py`).
 
 The admit fixtures are REAL client bodies, captured by pointing each client's base URL at a local listener that
 recorded the request and answered 400; the prose is replaced, every key is kept (`tests/fixtures/client_bodies/`).
