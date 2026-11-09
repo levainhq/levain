@@ -152,10 +152,12 @@ def test_an_eval_that_navigates_passes_and_any_other_eval_error_still_fails(tmp_
 
 @needs_browser
 def test_act_until_does_not_run_its_action_again_once_the_condition_came_true_between_polls(tmp_path: Path) -> None:
-    # the first run makes the condition true 20 ms later; the retry tick (every 700) must see that before it acts again. The gap is wide on
-    # purpose: a page timer on a loaded box can fire late, and a tick that beats it is a loaded timer, not an action run twice
-    do = "window.__n = (window.__n || 0) + 1; if (window.__n === 1) setTimeout(() => { window.__ok = 1; }, 20); 1"
-    r = _drive(tmp_path, [{"do": do, "until": "window.__ok", "ms": 10000, "every": 700}, {"eval": "new Promise(r => setTimeout(() => r(window.__n), 1400))"}])
+    # no page timer, so nothing here can run late. The condition counts its own reads and is true from the 2nd: the driver's loop is
+    # first run -> read 1 (false) -> 100 ms poll sleep, and the retry tick (every 50, below that sleep) is due before the 2nd poll, so the
+    # retry's own check-first read is read 2 (true) and the action never runs again. Without that guard the retry acts (__n == 2)
+    do = "window.__n = (window.__n || 0) + 1; 1"
+    until = "(window.__r = (window.__r || 0) + 1) >= 2"
+    r = _drive(tmp_path, [{"do": do, "until": until, "ms": 10000, "every": 50}, {"eval": "window.__n"}])
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["values"][-1] == 1, r.stdout
 
