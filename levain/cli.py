@@ -1673,6 +1673,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     _register_session(subparsers)
 
+    from levain.slot.slot_allow import register as _register_slot_allow
+
+    _register_slot_allow(subparsers)
+
     from levain.upgrade import register as _register_upgrade
 
     _register_upgrade(subparsers)

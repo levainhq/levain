@@ -1128,6 +1128,11 @@ class Seams:
     #: a login session's confirm prompt -> True (yes), False (no) or None (no answer); None = his terminal
     #: (:meth:`Supervisor._ask`)
     confirm: Optional[Callable[[str], Optional[bool]]] = None
+    #: row 165: the operator's consent directory, where ``slot-allow.json`` and the band rows for slot-offered rules
+    #: live; None = the feature is off (production names it in :func:`run_session`)
+    allow_dir: Optional[Path] = None
+    #: the bytes of the ended session's ``.claude/settings.local.json`` from root's retained tree (None = none read)
+    retained_allow: Optional[Callable[[str], Optional[bytes]]] = None
 
     def __post_init__(self) -> None:
         if self.helper is None:
@@ -1547,6 +1552,7 @@ class Supervisor:
             docs = worktree_layer_docs(top, ignored)
             check_repo_layer(docs)
             frozen = freeze_repo_settings(docs)
+            frozen = self._with_slot_allow(frozen)
             self.say("repo settings read from the checkout: " + (", ".join(sorted(docs)) or "none"))
             if ignored:
                 self.say("repo settings files not read (not the exact name): " + ", ".join(ignored))
@@ -1649,6 +1655,61 @@ class Supervisor:
         self.say(f"firewall self-probe: closed ({out['host']} {out['address']} not reachable as the slot; "
                  f"{out['addresses']} addresses)")
 
+    def _allow_file(self) -> Optional[Path]:
+        from levain.slot import slot_allow
+
+        return None if self.s.allow_dir is None else Path(self.s.allow_dir) / slot_allow.FILE_NAME
+
+    def _with_slot_allow(self, frozen: Any) -> Any:
+        """Row 165: the operator's signed slot rules join this launch's frozen ``permissions.allow`` and nothing
+        else. A row he has answered yes since the last run is carried first. Never reads or writes the checkout."""
+        path = self._allow_file()
+        if path is None:
+            return frozen
+        import dataclasses
+
+        from levain.slot import slot_allow
+
+        try:
+            slot_allow.apply_answered(Path(self.s.allow_dir), path)           # type: ignore[arg-type]
+            rules = slot_allow.rules_of(path)
+        except slot_allow.AllowRefused as e:
+            self.say(f"slot allow rules not read ({e}): this session asks for everything the repo does not allow")
+            return frozen
+        except Exception as e:   # noqa: BLE001 - the rules are a convenience: the launch goes on without them
+            self.say(f"slot allow rules not read ({type(e).__name__})")
+            return frozen
+        if rules:
+            self.say(f"slot allow rules read from {path} (slot sessions only): {len(rules)}")
+        return dataclasses.replace(frozen, settings=slot_allow.merge_into_frozen(frozen.settings, rules))
+
+    def _file_allow_rows(self, session: str) -> None:
+        """Row 165, at END: the rules the slot's dialog saved go on the band, one row per rule. Said, never raised:
+        teardown already finished."""
+        path = self._allow_file()
+        if path is None or self.s.retained_allow is None:
+            return
+        from levain.slot import slot_allow
+
+        try:
+            raw = self.s.retained_allow(session)
+            if raw is None:
+                return
+            kept, dropped = slot_allow.parse_local_allow(raw)
+            known = set(slot_allow.rules_of(path))
+            new = slot_allow.file_rows(Path(self.s.allow_dir), session, [r for r in kept if r not in known])  # type: ignore[arg-type]
+        except slot_allow.AllowRefused as e:
+            self.say(f"slot allow rules not read from session {session} ({e})")
+            return
+        except Exception as e:   # noqa: BLE001
+            self.say(f"slot allow rules not filed ({type(e).__name__})")
+            return
+        if new:
+            self.say(f"{len(new)} rule(s) the session asked to always allow are on your band (yes or no each); "
+                     "nothing changes until you answer")
+        if dropped:
+            self.say("slot allow rules not offered (not a shape the dialog writes): " + ", ".join(dropped))
+
     def _teardown(self, session: str) -> bool:
         try:
             out = self.helper("teardown", session, stoppable=False)
@@ -1659,6 +1720,7 @@ class Supervisor:
         if state == "RETAINED":
             where = self.s.store / "retained" / session / "tree"                         # type: ignore[operator]
             self.say(f"session {session} ended RETAINED: the work is kept at {where}")
+            self._file_allow_rows(session)
             return True
         live = self.s.store / "live" / session                                           # type: ignore[operator]
         self.say(f"session {session} ended {state}: a step did not prove, the slot stays leased and the work stays "
@@ -2185,6 +2247,10 @@ class Supervisor:
 
 
 def run_session(req: Request, seams: Optional[Seams] = None) -> int:
+    if seams is None:
+        from levain.consent.queue import default_queue_dir
+
+        seams = Seams(allow_dir=default_queue_dir())
     return Supervisor(req, seams).run()
 
 
