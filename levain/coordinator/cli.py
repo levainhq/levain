@@ -2278,8 +2278,8 @@ def _spawn_caps() -> tuple[int, int]:
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     from levain.coordinator import seam_handoffs as _seam_handoffs
 
-    qdir_help = ("The directory holding dispatch.db. Default: a coord verb that acts on a coordinator (its lease, "
-                 "launches, setting, seams or ready queue) opens the store that coordinator is in, the consent "
+    qdir_help = ("The directory holding dispatch.db. Default: a coord verb that acts on a desk (its lease, "
+                 "launches, setting, seams or ready queue) opens the store that desk is in, the consent "
                  "directory or <levain home>/board, and refuses when both hold one it cannot choose between; a bare "
                  "take on a home with neither makes the board's. The board's own verbs open the board; every other "
                  "verb opens the consent directory.")
@@ -2464,7 +2464,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         description="Each pass starts every pending launch nobody started (a drop from the phone or the cockpit), "
                     "ends a launch whose Claude Code session is no longer listed, beats the lease of the coordinator "
                     "whose session is listed, not done and writing as coordinator, and stops a session whose launch "
-                    "is over. Only sessions Levain started. A bare `coord watch` watches the store its coordinator is "
+                    "is over. Only sessions Levain started. A bare `coord watch` watches the store its desk is "
                     "in (see --queue-dir), chosen once as it starts; --queue-dir names the store to watch.")
     cwa.add_argument("--every", type=float, default=30.0, metavar="S", help="Seconds between passes (default 30).")
     cwa.add_argument("--once", action="store_true", help="One pass, then exit.")
@@ -2665,7 +2665,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         ready_leaves.append(rdw)
         door_ok(rdw)      # add, move and correct are the coordinator's write: refused without the live lease token
     cis = c_sub.add_parser(
-        "import-status", help="Read a status file's lane rows into the ready queue (the coordinator's write).",
+        "import-status", help="Read a status file's lane rows into the ready queue (the desk's write).",
         description="Adds new rows, corrects changed ones and leaves the rest; a second run of an unchanged file "
                     "writes nothing. Needs --token (the live lease's). Prints one line per bucket: added, corrected, "
                     "unchanged, absent (in the queue, not in the file) and unparsed (row numbers: the row shape did "
@@ -2679,7 +2679,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     door_ok(cis)
     car = c_sub.add_parser(
         "apply-reports", help="Apply the board's queued worker reports as the lease holder (facts only).",
-        description="While a coordinator holds the board lease the watch's service pass is skipped, so the holder "
+        description="While a desk holds the board lease the watch's service pass is skipped, so the holder "
                     "applies the queue itself: each queued report is judged by the validator the watch uses and is "
                     "applied, deferred or refused with a record. Needs --token (the live lease's); the lease is kept. "
                     "The store is <levain home>/board unless --queue-dir names one.")
