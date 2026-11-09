@@ -12,8 +12,9 @@ rule forward without ever widening what the operator's own sessions do:
 * :func:`apply_answered` is the one consumer of those records, run first by every entry point: it walks them once,
   each from one read of its question by id, and appends a rule to ``slot-allow.json`` only for a row whose ``yes``
   carries the operator's own signature over exactly this rule's question and answer (:func:`rule_evidence`), storing
-  that signature with it; any other answer drops the record, so "No: keep asking" and a refused yes are asked again
-  at the next save;
+  that signature with it; a yes it cannot judge because the authority log cannot be read keeps its record for the
+  next apply; any other answer drops the record, so "No: keep asking" and a refused yes are asked again at the next
+  save;
 * :func:`carried` re-verifies every stored rule's evidence against the authority log at each launch, so the file alone
   (an operator-uid file any session of his could write) carries nothing;
 * :func:`merge_into_frozen` adds the verified rules to a slot's frozen ``permissions.allow`` and nothing else.
@@ -403,21 +404,23 @@ def undo(path: Path, rule: str, store: Any = None, judge: Optional[Judge] = None
     authority log), only the revoke record is cleared. Otherwise, after answered rows are applied
     (:func:`apply_answered`), a row for it goes on the band unless one is still open (never the one answered before),
     whatever entry for it the file holds: the rule carries again only on a new signed yes to that row, as every slot
-    rule does. Restores nothing itself."""
+    rule does. When the file holds an entry for it (an applied yes restored it), the row is a renewal: a no to it ends
+    the rule. Restores nothing itself."""
     from levain.consent.questions import QuestionStore
 
     qdir = path.parent
     qs = store if store is not None else QuestionStore(qdir)
     with _locked(qdir):
-        if not [r for r in load(path)["revoked"] if r["rule"] == rule]:
+        hit = [r for r in load(path)["revoked"] if r["rule"] == rule]
+        if not hit:
             raise AllowRefused(f"{rule!r} has no revoke to undo")
         apply_answered(qdir, path, store=qs, judge=judge)
         doc = load(path)
-        hit = [r for r in doc["revoked"] if r["rule"] == rule]
         now_carried = rule in carried(path, judge, store_id_of(qs))[0]
         if not now_carried:
+            stored = any(r["rule"] == rule for r in doc["rules"])
             file_rows(qdir, str(hit[-1].get("session", "?")), [rule], store=qs,
-                      why={rule: "You revoked it, then undid the revoke"})
+                      why={rule: "You revoked it, then undid the revoke"}, renew=[rule] if stored else [])
         doc["revoked"] = [r for r in doc["revoked"] if r["rule"] != rule]
         _save(path, doc)
     if now_carried:
@@ -567,6 +570,10 @@ def store_id_of(store: Any) -> Optional[str]:
     return _store_id_of(store)
 
 
+class _LogUnreadable(Exception):
+    """The authority log could not be read: no verdict on the answer either way."""
+
+
 def rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[Optional[Dict[str, str]], str]:
     """``(evidence, "")`` when the answer to ``question`` is the operator's signed yes to exactly ``rule``, else
     ``(None, why)``. Direct: the band answer's own signature (a terminal or a desk click), fresh against the recorded
@@ -574,6 +581,15 @@ def rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[O
     read as countersigned. The lease is judged too (:func:`_lease_check`, at the judge's clock): an answer signed
     ahead of now, or one whose lease is already over, is refused here and so never reported added. The same checks
     run again at every launch (:func:`carried`)."""
+    try:
+        return _rule_evidence(store, question, rule, judge)
+    except _LogUnreadable as exc:
+        return None, str(exc)
+
+
+def _rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[Optional[Dict[str, str]], str]:
+    """:func:`rule_evidence`, raising :class:`_LogUnreadable` when the authority log cannot be read (or yields
+    nothing) instead of refusing: a log read failure is not a verdict on the answer."""
     from levain.band_view import answer_sign_of
     from levain.cockpit.consent import parse_stamp
     from levain.consent import answer_countersign as ac
@@ -606,7 +622,9 @@ def rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[O
     try:
         snapshot = judge.authority()
     except Exception as exc:  # noqa: BLE001
-        return None, f"the authority log cannot be read ({type(exc).__name__})"
+        raise _LogUnreadable(f"the authority log cannot be read ({type(exc).__name__})") from None
+    if snapshot is None:
+        raise _LogUnreadable("the authority log cannot be read (no replay)")
     why = verify_evidence(rule, ev, authority=snapshot, store_id=store_id_of(store), ctk=judge.ctk)
     if why:
         return None, why
@@ -697,7 +715,10 @@ def _save_pending(qdir: Path, doc: Mapping[str, Any]) -> None:
 
 
 def _question_of(qs: Any, rec: Mapping[str, Any]) -> Any:
-    """The question ``rec`` was filed as, read once by its id; ``None`` when it is gone or is not that rule's row."""
+    """The question ``rec`` was filed as, read once by its id; ``None`` when it is gone, is not that rule's row, or
+    has no row yet (its filing was cut short)."""
+    if rec.get("question_id") is None:
+        return None
     q = qs.get(rec["question_id"])
     if q is None or q.agent != AGENT or q.agent_session_id != rec["key"] or q.what != asked_text(rec["rule"]):
         return None
@@ -881,9 +902,10 @@ def remind(qdir: Path, allow_file: Path, store: Any = None, now: Optional[dateti
 
 def _resolve(qs: Any, rec: Mapping[str, Any], judge: Optional[Judge]) -> Tuple[str, Optional[Dict[str, str]], str]:
     """Where one pending record stands, from ONE read of its question: ``("open", None, "")`` while unanswered;
-    ``("yes", evidence, "")`` for the operator's signed yes to exactly this rule; ``("refused", None, why)`` for any
-    other yes; ``("no", None, why)`` for a no; ``("drop", None, why)`` for anything else (words, a row that is gone
-    or is not this rule's)."""
+    ``("yes", evidence, "")`` for the operator's signed yes to exactly this rule; ``("unreadable", None, why)`` for a
+    yes the authority log could not be read to judge (the record stays, as an open one does); ``("refused", None,
+    why)`` for any other yes; ``("no", None, why)`` for a no; ``("drop", None, why)`` for anything else (words, a row
+    that is gone or is not this rule's)."""
     from levain.consent.questions import ANSWER_CHANNELS
 
     if rec.get("question_id") is None:
@@ -902,7 +924,10 @@ def _resolve(qs: Any, rec: Mapping[str, Any], judge: Optional[Judge]) -> Tuple[s
         return "refused", None, f"answered on {a.channel!r}, not a person's channel"
     if judge is None:
         return "refused", None, "no authority named to check its signature against"
-    ev, why = rule_evidence(qs, q, rec["rule"], judge)
+    try:
+        ev, why = _rule_evidence(qs, q, rec["rule"], judge)
+    except _LogUnreadable as exc:
+        return "unreadable", None, str(exc)
     return ("yes", ev, "") if ev is not None else ("refused", None, why)
 
 
@@ -911,7 +936,7 @@ def apply_answered(qdir: Path, allow_file: Path, store: Any = None, now: Callabl
     """The ONE consumer of the pending records: the only step that deletes or replaces one. Walks them once, each
     resolved from one read of its question (:func:`_resolve`): the operator's signed yes to exactly the rule
     (:func:`rule_evidence`) carries it into ``allow_file`` with that answer stored beside it; a record still open (or
-    still being filed) is left; anything else (a no, an unsigned or otherwise refused yes, a row that is gone) drops
+    still being filed, or a yes the authority log could not be read to judge) is left; anything else (a no, an unsigned or otherwise refused yes, a row that is gone) drops
     the record, so the next time a slot saves the rule it is asked again. A no to a row filed for a stored rule
     (``renew``) also ends that rule (:func:`_decline`). A refused yes is kept as refused (with why) until a slot END
     files the rule's next row: ``list`` names it and :func:`remind` does not re-ask it. It is appended to ``refused``
@@ -930,7 +955,7 @@ def apply_answered(qdir: Path, allow_file: Path, store: Any = None, now: Callabl
         changed = False
         for rule, rec in sorted(doc["rows"].items()):
             state, ev, why = _resolve(qs, rec, judge)
-            if state == "open":
+            if state in ("open", "unreadable"):
                 continue
             del doc["rows"][rule]
             changed = True
@@ -987,6 +1012,8 @@ def not_carried(qdir: Path, store: Any = None, judge: Optional[Judge] = None) ->
         state, _ev, why = _resolve(qs, rec, judge)
         if state == "refused":
             out.append((rule, why))
+        elif state == "unreadable":
+            out.append((rule, f"{why}; the answer is kept for the next launch"))
     out += [(rule, why) for rule, why in sorted(doc["refused"].items()) if rule not in doc["rows"]]
     return out
 
