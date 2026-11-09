@@ -79,6 +79,7 @@ import re
 import threading
 import uuid
 import warnings
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -222,6 +223,7 @@ class WriteScope:
     install_root: Path | None = None
     context_json: Path | None = None
     state_episode: "Callable[[str, str, str], None] | None" = None
+    questions: Any = None  # the question store an open agenda's ring is looked up in; None = the user's default band
 
     @classmethod
     def from_install_root(cls, install_root: str | Path) -> "WriteScope":
@@ -1784,6 +1786,33 @@ def _spore_refusal(guard: "_VersionGuard | None", exc: Exception, store: Any = N
     return EditError("verb_failed", 422, str(exc))
 
 
+def _refuse_if_ringing(scope: WriteScope, store: Any, spore_id: str) -> None:
+    """The ONE guard every spore write entry point (the cockpit verbs and the TUI alike) calls: an open agenda whose stamp
+    names a band row that is STILL OPEN is that row's intention, moved from the band, not by a spore verb. A spore the store
+    cannot read says nothing (the write's own compare-and-set then refuses what is wrong)."""
+    from levain.spores import open_question_ids, ringing_ref
+
+    try:
+        spore = store.get(spore_id) or {}
+    except Exception:  # noqa: BLE001
+        return
+    stamp = spore.get("germinated")
+    if not isinstance(stamp, Mapping) or not stamp.get("ref"):
+        return
+    qs = scope.questions
+    if qs is None:
+        from levain.consent.queue import default_queue_dir
+        from levain.consent.questions import DB_NAME, QuestionStore
+
+        d = default_queue_dir()
+        qs = QuestionStore(d) if (d / DB_NAME).exists() else None
+    ref = ringing_ref(spore, open_question_ids(qs) if qs is not None else frozenset())
+    if ref:
+        raise EditError("rings_in_band", 409,
+                        f"{spore_id} rings in the band as {ref}: use the band row's edit / done / clear there; to defer it, "
+                        "snooze the agenda itself (its snooze moves the date and ends the ring)")
+
+
 def _apply_spore_verb(
     scope: WriteScope, req: dict[str, Any], now: str | None,
     verb: Literal["touch", "descend", "ascend"], guard: "_VersionGuard | None" = None,
@@ -1828,6 +1857,7 @@ def _apply_spore_verb(
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = guarded_spore_store(paths.spores_json)
+    _refuse_if_ringing(scope, store, spore_id)
     ascend_expect: str | None = None  # the raw disposition read for the ascend CAS (below)
     # The descend CAS uses the CLIENT render-time SNAPSHOT (spore-173) — validated + normalized up
     # front (a non-string raises bad_verb_arg BEFORE the store touch). Presence is the gate: an
@@ -2076,6 +2106,7 @@ def _apply_spore_set_disposition(
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = guarded_spore_store(paths.spores_json)
+    _refuse_if_ringing(scope, store, spore_id)
 
     # Read current state to (a) record the prior disposition in the audit, (b) gate the one
     # silent-loss direction, and (c) seed the optimistic CAS below. `is_loop` (the SAME
@@ -2211,6 +2242,7 @@ def _apply_spore_surface_at(
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = guarded_spore_store(paths.spores_json)
+    _refuse_if_ringing(scope, store, spore_id)
     try:
         store.update(spore_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
     except ValueError as exc:
@@ -2279,6 +2311,7 @@ def _apply_spore_update(
     if not paths.spores_json.is_file():
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = guarded_spore_store(paths.spores_json)
+    _refuse_if_ringing(scope, store, spore_id)
     current = store.get(spore_id)
     prior_raw = cast("str | None", current.get("disposition")) if current else None
     tier_snapshot = _client_snapshot(req, current, spore_id) if has_tier else _NO_CAS

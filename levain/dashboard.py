@@ -600,6 +600,9 @@ class OpenSpore:
     # elsewhere stales a card signed on the old one
     target: str | None = None
     attention: str | None = None
+    # the stamp germinate leaves (``{on, target, ref}``) as stored, a copy; None when absent. Versioned: a stamp landing
+    # between a write's guard and its write stales the write instead of passing under it
+    germinated: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -639,6 +642,7 @@ def open_spore_from(s: Mapping[str, Any]) -> "OpenSpore":
         created=str(s.get("created") or ""),
         target=(str(tg) if (tg := s.get("target")) is not None else None),
         attention=(str(at) if (at := s.get("attention")) is not None else None),
+        germinated=dict(gm) if isinstance(gm := s.get("germinated"), Mapping) else None,
     )
 
 

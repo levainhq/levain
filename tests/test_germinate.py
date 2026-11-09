@@ -84,7 +84,7 @@ def _make_board(qdir, tmp_path):
 
 
 # --- band -------------------------------------------------------------------------------------------------------
-def test_band_files_one_quiet_row_stamps_and_composts(tmp_path, qdir, pings):
+def test_band_files_one_quiet_row_and_stamps_and_the_spore_stays_open(tmp_path, qdir, pings):
     root = _install(tmp_path)
     s = _add(root, "renew the domain\nmore words")
     res = _run(root, qdir)
@@ -97,10 +97,11 @@ def test_band_files_one_quiet_row_stamps_and_composts(tmp_path, qdir, pings):
     assert q.agent_session_id == g.KEY_PREFIX + s["origin_key"]
     assert pings == []
     got = _spore(root, s["id"])
-    assert got["status"] != "open" and got["germinated"]["ref"] == q.id
+    assert got["status"] == "open" and got["germinated"]["ref"] == q.id
     assert got["germinated"] == {"on": "2026-11-07", "target": "band", "ref": q.id}
-    assert s["id"] not in _open_ids(root)
-    assert _run(root, qdir)["due"] == [] and len(_rows(qdir)) == 1
+    assert s["id"] in _open_ids(root)
+    assert _run(root, qdir)["due"] == [] and _run(root, qdir)["finish"] == [] and len(_rows(qdir)) == 1
+    assert s["id"] in _open_ids(root)
 
 
 # --- nudge ------------------------------------------------------------------------------------------------------
@@ -113,21 +114,19 @@ def test_nudge_pings_exactly_once_over_two_runs(tmp_path, qdir, pings):
     assert len(pings) == 1 and len(_rows(qdir)) == 1
 
 
-def test_nudge_after_a_crash_before_compost_does_not_ping_again(tmp_path, qdir, pings, monkeypatch):
+def test_nudge_stamps_and_never_composts_so_a_compost_crash_is_never_reached_and_nothing_pings_again(tmp_path, qdir, pings, monkeypatch):
     root = _install(tmp_path)
     s = _add(root, "call the clinic", target="nudge")
-    real = type(guarded_spore_store(_spores(root))).descend
 
     def boom(self, *a, **k):
         raise RuntimeError("crash")
 
     monkeypatch.setattr(type(guarded_spore_store(_spores(root))), "descend", boom)
-    assert "crash" in _run(root, qdir)["errors"][0]["error"]      # isolated: recorded, never raised
-    monkeypatch.setattr(type(guarded_spore_store(_spores(root))), "descend", real)
-    assert len(pings) == 1
-    res = _run(root, qdir)           # stamped but not composted: finished, nothing filed or pinged again
-    assert [o["spore_id"] for o in res["finish"]] == [s["id"]] and res["due"] == []
-    assert len(pings) == 1 and len(_rows(qdir)) == 1 and s["id"] not in _open_ids(root)
+    res = _run(root, qdir)
+    assert res["errors"] == [] and [o["spore_id"] for o in res["due"]] == [s["id"]] and res["due"][0]["done"]
+    res = _run(root, qdir)           # stamped and live: the finish loop leaves a question-ref stamp open
+    assert res["finish"] == [] and res["due"] == []
+    assert len(pings) == 1 and len(_rows(qdir)) == 1 and s["id"] in _open_ids(root)
 
 
 def test_nudge_crash_between_filing_and_stamp_reruns_into_one_row_and_pings_again(tmp_path, qdir, pings, monkeypatch):
@@ -185,7 +184,7 @@ def test_board_without_a_coordinator_falls_back_to_the_band(tmp_path, qdir):
     (q,) = _rows(qdir)
     assert "levain" in q.blocks and "no board" in q.blocks and q.id == o["ref"]
     assert not (qdir / "dispatch.db").exists()
-    assert s["id"] not in _open_ids(root)
+    assert s["id"] in _open_ids(root)
 
 
 # --- adoption ---------------------------------------------------------------------------------------------------
@@ -196,7 +195,7 @@ def test_an_open_question_named_in_the_text_is_adopted_and_nothing_is_filed(tmp_
     s = _add(root, f"follow up on {held.id} please")
     (o,) = _run(root, qdir)["due"]
     assert o["via"] == "adopted" and o["ref"] == held.id and not o["filed"] and o["done"]
-    assert len(_rows(qdir)) == 1 and s["id"] not in _open_ids(root)
+    assert len(_rows(qdir)) == 1 and s["id"] in _open_ids(root)
 
 
 def test_an_open_question_named_in_a_note_is_adopted(tmp_path, qdir):
@@ -242,7 +241,7 @@ def test_a_crash_between_filing_and_compost_gives_one_row(tmp_path, qdir, monkey
     monkeypatch.setattr(cls, "update", real)
     assert len(_rows(qdir)) == 1 and s["id"] in _open_ids(root)
     (o,) = _run(root, qdir)["due"]
-    assert not o["filed"] and o["done"] and len(_rows(qdir)) == 1 and s["id"] not in _open_ids(root)
+    assert not o["filed"] and o["done"] and len(_rows(qdir)) == 1 and s["id"] in _open_ids(root)
 
 
 # --- two installs, one LEVAIN_HOME ------------------------------------------------------------------------------
@@ -256,7 +255,7 @@ def test_two_installs_with_the_same_spore_id_both_due_give_two_rows(tmp_path, qd
     rows = _rows(qdir)
     assert len(rows) == 2 and {q.agent_session_id for q in rows} == {g.KEY_PREFIX + sa["origin_key"],
                                                                       g.KEY_PREFIX + sb["origin_key"]}
-    assert sa["id"] not in _open_ids(a) and sb["id"] not in _open_ids(b)
+    assert sa["id"] in _open_ids(a) and sb["id"] in _open_ids(b)
 
 
 # --- dry run ----------------------------------------------------------------------------------------------------
@@ -311,7 +310,7 @@ def test_a_failed_ping_is_surfaced_and_the_spore_stays_open_and_a_rerun_retries(
     assert s["id"] in _open_ids(root) and len(_rows(qdir)) == 1 and not _spore(root, s["id"]).get("germinated")
     ok["v"] = True                                   # the channel is back: the same row, pinged now, then composted
     rc = main(["spores", "germinate", "--path", str(root), "--queue-dir", str(qdir)])
-    assert rc == 0 and len(sent) == 2 and len(_rows(qdir)) == 1 and s["id"] not in _open_ids(root)
+    assert rc == 0 and len(sent) == 2 and len(_rows(qdir)) == 1 and s["id"] in _open_ids(root)
     main(["spores", "germinate", "--path", str(root), "--queue-dir", str(qdir)])
     assert len(sent) == 2
 
@@ -344,7 +343,7 @@ def test_one_bad_spore_does_not_stop_the_others_and_the_cli_prints_what_complete
     rc = main(["spores", "germinate", "--path", str(root), "--queue-dir", str(qdir)])
     cap = capsys.readouterr()
     assert rc == 1 and f"germinated {good['id']}" in cap.out and "store exploded" in cap.err and bad["id"] in cap.err
-    assert bad["id"] in _open_ids(root) and good["id"] not in _open_ids(root)
+    assert bad["id"] in _open_ids(root) and good["id"] in _open_ids(root)
 
 
 def test_a_spore_with_no_origin_key_is_reported_not_fatal(tmp_path, qdir, pings, monkeypatch):
@@ -372,7 +371,7 @@ def test_a_dispatch_only_database_is_not_a_board(tmp_path, qdir):
     JobStore(qdir).event_cursor()
     assert (qdir / "dispatch.db").exists() and not CoordStore(qdir).coordinator_present()
     (o,) = _run(root, qdir)["due"]
-    assert o["via"] == "band-fallback" and o["ref"].startswith("q-") and s["id"] not in _open_ids(root)
+    assert o["via"] == "band-fallback" and o["ref"].startswith("q-") and s["id"] in _open_ids(root)
     assert not _drops_table_exists(qdir)
 
 
