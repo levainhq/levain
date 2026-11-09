@@ -741,6 +741,7 @@ class Ledger:
         self._quarantined: Dict[Ref, str] = {}
         self._run_triples: Dict[str, set] = {}                      # run_id -> every durable payload triple it carries
         self._finals: Dict[str, int] = {}                           # run_id -> its run-final line's seq (from queueing)
+        self._known_runs: set = set()                               # runs keys named with `note_run` (memory only)
         #: called on the loop as `on_outbox(triple, payload)` when a payload line becomes durable (3c-6c's sender)
         self.on_outbox: Optional[Callable[[Ref, dict], None]] = None
         self._inflight_since = 0.0
@@ -1395,6 +1396,25 @@ class Ledger:
         self._check_read()
         return run_id in self._finals
 
+    def note_run(self, run_id: str) -> None:
+        """keys names a run it holds a registration for (its token resolved to that run). The note is memory only: it
+        is the record that lets a run with no hold and no row, one that made no model call, be finalized at zero. After
+        a restart only a run with a hold or a row is known."""
+        self._check_read()
+        if type(run_id) is not str or not _RUN_ID_RE.fullmatch(run_id):
+            raise LedgerMisuse("a malformed run_id")
+        self._known_runs.add(run_id)
+
+    def run_known(self, run_id: str) -> bool:
+        """True when the ledger holds a record of the run: a note, a hold of its scope, or a row carrying its id."""
+        self._check_read()
+        return run_id in self._known_runs or ("run", run_id) in self._acc or run_id in self._run_triples
+
+    def open_runs(self) -> List[str]:
+        """Every run the durable lines name that has no `run-final` yet (keys' restart sweep), sorted."""
+        self._check_read()
+        return sorted(r for r in self._run_triples if r not in self._finals)
+
     def run_ready(self, run_id: str) -> bool:
         """True when no hold of scope `("run", run_id)` is short of RESOLVED (a STRANDED one counts as outstanding) and
         no payload triple of the run is still in the outbox, durable or queued: every row of the run then has its ack
@@ -1416,7 +1436,9 @@ class Ledger:
     def run_final(self, run_id: str) -> "asyncio.Future":
         """Queues the run's one `run-final` line and returns a future that resolves when it is durable (or fails
         `LedgerUnavailable`). Raises `LedgerMisuse` unless the run is ready and not already finalized, and
-        `LedgerUnavailable` while the ledger is unhealthy or closing. The fence is up from this call on."""
+        `LedgerUnavailable` while the ledger is unhealthy or closing. A run the ledger holds no record of (no note,
+        hold or row: :meth:`run_known`) is refused too, so nothing settles an unknown run at zero. The fence is up
+        from this call on."""
         self._check_loop()
         if type(run_id) is not str or not _RUN_ID_RE.fullmatch(run_id):
             raise LedgerMisuse("a malformed run_id")
@@ -1424,6 +1446,8 @@ class Ledger:
             raise LedgerUnavailable("the ledger is %s" % ("closing" if self._healthy else "unhealthy"))
         if run_id in self._finals:
             raise LedgerMisuse("the run is already finalized")
+        if not self.run_known(run_id):
+            raise LedgerMisuse("the ledger has no record of the run")    # nothing settles an unknown run at zero
         if not self.run_ready(run_id):
             raise LedgerMisuse("the run is not ready")
         triples = self._run_triples.get(run_id, set())

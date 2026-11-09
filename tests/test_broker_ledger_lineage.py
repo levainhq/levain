@@ -797,3 +797,44 @@ def test_a_malformed_final_line_is_corrupt(tmp_path, bad):
         fields.update(bad)
     write_file(path, header(), opened(1), line("run-final", 2, **fields))
     assert _refusal(path).name == "ledger-corrupt:type:3"
+
+
+def test_a_final_for_a_run_the_ledger_never_saw_refuses(tmp_path):
+    path = ledger_path(tmp_path)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        assert not led.run_known(RID2) and led.open_runs() == []
+        with pytest.raises(L.LedgerMisuse):
+            led.run_final(RID2)                                     # no note, no hold, no row: nothing settles it at zero
+        assert not led.run_finalized(RID2)                          # the refusal left no fence
+        await led.aclose(5)
+
+    asyncio.run(go())
+    assert _finals(path) == []
+
+
+def test_a_noted_run_with_no_hold_finalizes_at_zero(tmp_path):
+    path = ledger_path(tmp_path)
+
+    async def go():
+        led = L.Ledger.open(path)
+        led.attach(asyncio.get_running_loop())
+        led.note_run(RID)
+        assert led.run_known(RID) and led.run_ready(RID)
+        await led.run_final(RID)
+        await led.aclose(5)
+
+    asyncio.run(go())
+    pay = _finals(path)[0]["meta"]["lineage"]
+    assert (pay["rows"], pay["quarantined"], pay["triples_digest"]) == (0, 0, L.triples_digest([]))
+
+
+def test_the_digest_is_the_compact_ascii_json_of_the_sorted_triples():
+    import hashlib
+    a, b = ("b" * 32, "c" * 32, 2), ("a" * 32, "c" * 32, 9)
+    raw = '[["%s","%s",9],["%s","%s",2]]' % ("a" * 32, "c" * 32, "b" * 32, "c" * 32)
+    want = "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert L.triples_digest([a, b]) == L.triples_digest([b, a]) == want
+    assert L.triples_digest([{"ledger": a[0], "epoch": a[1], "ref": a[2]}, list(b)]) == want
