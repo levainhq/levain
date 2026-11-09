@@ -455,16 +455,35 @@ def test_a_refused_or_malformed_read_is_said_and_files_nothing(qdir):
         assert "not read" in said[0] and QuestionStore(qdir).open_questions() == []
 
 
-def test_revoke_needs_confirm_and_undo_restores_with_its_evidence(rig, qdir):
+def test_revoke_needs_confirm_and_drops_the_signed_evidence(rig, qdir):
     allow = _carried_one(rig, qdir, "WebSearch")
     assert "re-run with --yes" in SA.revoke(allow, "WebSearch", confirm=False)
     assert SA.rules_of(allow) == ["WebSearch"]
     SA.revoke(allow, "WebSearch", confirm=True)
     assert SA.rules_of(allow) == [] and SA.carried(allow, rig.judge, rig.sid) == ([], [])
-    SA.undo(allow, "WebSearch")
-    assert SA.carried(allow, rig.judge, rig.sid)[0] == ["WebSearch"]      # the evidence came back with it
+    (gone,) = SA.load(allow)["revoked"]
+    assert gone["rule"] == "WebSearch" and not set(SA.EVIDENCE_KEYS) & set(gone)
     with pytest.raises(SA.AllowRefused):
         SA.revoke(allow, "WebFetch(domain:x.com)", confirm=True)
+
+
+def test_a_revoked_rule_moved_back_by_hand_does_not_carry_and_undo_asks_for_a_new_signed_yes(rig, qdir):
+    allow = _carried_one(rig, qdir, "WebSearch")
+    SA.revoke(allow, "WebSearch", confirm=True)
+    doc = json.loads(allow.read_text())
+    doc["rules"] = [{k: v for k, v in doc["revoked"][0].items() if k != "revoked_at"}]
+    allow.write_text(json.dumps(doc))
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == []
+    doc["rules"] = []
+    allow.write_text(json.dumps(doc))
+    said = SA.undo(allow, "WebSearch")
+    assert "re-offered on the band: answer yes to carry it again" in said
+    assert SA.carried(allow, rig.judge, rig.sid) == ([], [])
+    rows = [q for q in rig.qs.open_questions() if q.what == SA.asked_text("WebSearch")]
+    assert len(rows) == 1 and rows[0].answer is None
+    rig.yes(rows[0])
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["WebSearch"]
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == ["WebSearch"]
 
 
 def test_a_rule_cannot_be_stored_without_its_signed_answer(qdir):
@@ -498,7 +517,11 @@ def test_a_rule_is_a_30_day_lease_and_a_lapsed_one_does_not_reach_a_launch(rig, 
 
 def test_a_lapsed_rule_is_named_on_the_launch_and_the_list_shows_days_left(rig, qdir, capsys):
     _at_day(rig, 40)
-    allow = _carried_one(rig, qdir)
+    allow = qdir / SA.FILE_NAME
+    q = rig.file("Bash(npm test *)")[SA.asked_text("Bash(npm test *)")]
+    rig.yes(q)
+    then = SA.Judge(authority=rig.judge.authority, ctk=rig.judge.ctk, clock=rig.qs._clock)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=then) == ["Bash(npm test *)"]   # applied on its day
     seams = sup.Seams(host="linux", helper=("x",), client_factory=lambda p: None, control_socket=Path("/x"),
                       store=Path("/x"), base_map=Path("/x"), allow_dir=qdir, allow_judge=rig.judge)
     said = []
@@ -522,8 +545,8 @@ def test_a_lapsed_rule_is_named_on_the_launch_and_the_list_shows_days_left(rig, 
 def test_the_reminder_files_once_and_a_signed_renewal_resets_the_lease(rig, qdir):
     _at_day(rig, 28)
     allow = _carried_one(rig, qdir)
-    assert SA.remind(qdir, allow, store=rig.qs) == ["Bash(npm test *)"]          # 2 days left: one renewal row
-    assert SA.remind(qdir, allow, store=rig.qs) == []                            # filed once for this lease
+    assert SA.remind(qdir, allow, store=rig.qs, judge=rig.judge) == ["Bash(npm test *)"]          # 2 days left: one renewal row
+    assert SA.remind(qdir, allow, store=rig.qs, judge=rig.judge) == []                            # filed once for this lease
     young = rig.qs._clock
     _at_day(rig, 0)
     rows = [q for q in rig.qs.open_questions() if q.what == SA.asked_text("Bash(npm test *)")]
@@ -538,11 +561,182 @@ def test_the_reminder_files_once_and_a_signed_renewal_resets_the_lease(rig, qdir
     assert SA.carried(allow, rig.judge, rig.sid, now=now + timedelta(days=29))[0] == ["Bash(npm test *)"]
     assert SA.carried(allow, rig.judge, rig.sid, now=now + timedelta(days=31))[0] == []
     # the new lease is not due: no second reminder, and the old lease's row is not refiled
-    assert SA.remind(qdir, allow, store=rig.qs) == []
+    assert SA.remind(qdir, allow, store=rig.qs, judge=rig.judge) == []
     assert young is not None
 
 
 def test_a_rule_with_more_than_three_days_left_files_no_reminder(rig, qdir):
     _at_day(rig, 10)
     allow = _carried_one(rig, qdir)
-    assert SA.remind(qdir, allow, store=rig.qs) == []
+    assert SA.remind(qdir, allow, store=rig.qs, judge=rig.judge) == []
+
+
+def _b64(data):
+    import base64
+
+    return base64.b64encode(data).decode()
+
+
+def _rows(rig, rule):
+    return [q for q in rig.qs.open_questions() if q.what == SA.asked_text(rule)]
+
+
+def test_a_rule_whose_key_was_re_enrolled_is_offered_again_at_the_next_end(rig, qdir, capsys):
+    allow = _carried_one(rig, qdir, "WebSearch")
+    del rig.authority.keys[rig.laptop.fp]                 # the laptop key re-enrolled: the old one leaves the log
+    rig.laptop = rig.enrol("laptop2", LAPTOP)
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == []
+    s, said = _ending_supervisor(qdir, lambda *a, **k: {"present": True, "b64": _b64(local("WebSearch"))})
+    s.s = dataclasses.replace(s.s, allow_judge=rig.judge)
+    s._file_allow_rows("S2")
+    rows = _rows(rig, "WebSearch")
+    assert len(rows) == 1 and rows[0].answer is None
+    SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="list"))
+    out = capsys.readouterr().out
+    assert "WebSearch\t(NOT CARRIED" in out and "its row is open on the band: answer it again" in out
+    s._file_allow_rows("S3")                               # a second END files no second row
+    assert len(_rows(rig, "WebSearch")) == 1
+    rig.yes(rows[0])
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["WebSearch"]
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == ["WebSearch"]
+
+
+def test_a_rule_whose_signed_time_is_ahead_of_now_does_not_carry(rig, qdir):
+    allow = qdir / SA.FILE_NAME
+    q = rig.file("WebSearch")[SA.asked_text("WebSearch")]
+    ahead = datetime.now(timezone.utc) + timedelta(days=20)
+    msg = rig.message(q, at=ahead)
+    ev = {"question_id": q.id, "channel": "terminal", "signer_fp": rig.laptop.fp, "message": msg.decode(),
+          "sig": rig.sign(msg), "answered_at": utc_stamp(ahead)}
+    assert SA.verify_evidence("WebSearch", ev, authority=rig.authority, store_id=rig.sid, ctk=SA._no_live_check) is None
+    SA.append(allow, "WebSearch", "S1", ev)
+    ok, bad = SA.carried(allow, rig.judge, rig.sid)
+    assert ok == [] and "ahead of now" in bad[0][1]
+    # a signed time a little ahead of this clock (skew) is not refused
+    near = datetime.now(timezone.utc) + timedelta(minutes=3)
+    msg = rig.message(q, at=near)
+    SA.append(allow, "WebSearch", "S1", {**ev, "message": msg.decode(), "sig": rig.sign(msg)})
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == ["WebSearch"]
+
+
+def test_an_answer_whose_lease_lapsed_before_it_was_applied_is_refused_not_added(rig, qdir):
+    _at_day(rig, 31)
+    allow = qdir / SA.FILE_NAME
+    q = rig.file("WebSearch")[SA.asked_text("WebSearch")]
+    rig.yes(q)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == []
+    assert SA.rules_of(allow) == []
+    assert "lease lapsed" in dict(SA.not_carried(qdir, store=rig.qs, judge=rig.judge))["WebSearch"]
+
+
+def test_a_bash_rule_with_a_lookalike_letter_is_not_a_shape():
+    rule = "Bash(curl аpi.example *)"                # Cyrillic a, printable and not hidden
+    assert not SA.shape_ok(rule)
+    kept, dropped = SA.parse_local_allow(local("Bash(curl api.example *)", rule))
+    assert kept == ["Bash(curl api.example *)"] and dropped == [rule]
+
+
+def _move_at(allow, when):
+    doc = json.loads(allow.read_text())
+    e = doc["rules"][0]
+    e["message"] = "\n".join(f"at: {when}" if ln.startswith("at: ") else ln for ln in e["message"].split("\n"))
+    allow.write_text(json.dumps(doc))
+
+
+def test_an_old_entry_that_does_not_verify_does_not_silence_the_reminder(rig, qdir):
+    _at_day(rig, 28)
+    allow = _carried_one(rig, qdir)
+    _move_at(allow, "2030-01-01T00:00:00Z")                # an edit of the stored message to a far lease
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == []
+    assert SA.remind(qdir, allow, store=rig.qs, judge=rig.judge) == ["Bash(npm test *)"]
+    assert SA.remind(qdir, allow, store=rig.qs, judge=rig.judge) == []
+    _at_day(rig, 0)
+    (row,) = [q for q in _rows(rig, "Bash(npm test *)")]
+    rig.yes(row)
+    assert SA.apply_answered(qdir, allow, store=rig.qs, judge=rig.judge) == ["Bash(npm test *)"]
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == ["Bash(npm test *)"]
+
+
+def test_an_old_entry_that_does_not_verify_does_not_block_a_renewal(rig, qdir):
+    _at_day(rig, 28)
+    allow = _carried_one(rig, qdir)
+    q = rig.qs.get(SA.load(allow)["rules"][0]["question_id"])
+    _move_at(allow, "2030-01-01T00:00:00Z")
+    _at_day(rig, 0)
+    msg = rig.message(q)
+    ev = {"question_id": q.id, "channel": "terminal", "signer_fp": rig.laptop.fp, "message": msg.decode(),
+          "sig": rig.sign(msg), "answered_at": utc_stamp(datetime.now(timezone.utc))}
+    assert SA.append(allow, "Bash(npm test *)", "S2", ev) is True
+    assert SA.carried(allow, rig.judge, rig.sid)[0] == ["Bash(npm test *)"]
+
+
+def test_two_writers_at_once_lose_no_row_and_no_rule(rig, qdir, monkeypatch):
+    import threading
+
+    gate = threading.Barrier(2, timeout=1.0)
+    real_pending, real_load = SA._pending, SA.load
+
+    def slow(fn):
+        def wrapped(*a, **k):
+            got = fn(*a, **k)
+            try:
+                gate.wait()                                # both writers have read before either writes
+            except threading.BrokenBarrierError:
+                pass
+            return got
+        return wrapped
+
+    monkeypatch.setattr(SA, "_pending", slow(real_pending))
+    errs = []
+
+    def file(rule):
+        try:
+            SA.file_rows(qdir, "S1", [rule])
+        except Exception as e:   # noqa: BLE001
+            errs.append(e)
+
+    ts_ = [threading.Thread(target=file, args=(r,)) for r in ("WebSearch", "Bash(make *)")]
+    for t in ts_:
+        t.start()
+    for t in ts_:
+        t.join(10)
+    assert errs == []
+    assert sorted(v["rule"] for v in real_pending(qdir).values()) == ["Bash(make *)", "WebSearch"]
+    monkeypatch.setattr(SA, "_pending", real_pending)
+    # the same for slot-allow.json
+    allow = qdir / SA.FILE_NAME
+    evs = {}
+    for rule in ("Bash(ls *)", "Bash(cat *)"):
+        q = rig.file(rule)[SA.asked_text(rule)]
+        msg = rig.message(q)
+        evs[rule] = {"question_id": q.id, "channel": "terminal", "signer_fp": rig.laptop.fp, "message": msg.decode(),
+                     "sig": rig.sign(msg), "answered_at": utc_stamp(datetime.now(timezone.utc))}
+    gate.reset()
+    monkeypatch.setattr(SA, "load", slow(real_load))
+    ts_ = [threading.Thread(target=SA.append, args=(allow, r, "S1", evs[r])) for r in evs]
+    for t in ts_:
+        t.start()
+    for t in ts_:
+        t.join(10)
+    assert sorted(SA.rules_of(allow)) == ["Bash(cat *)", "Bash(ls *)"]
+
+
+def test_the_list_shows_the_signed_time_and_the_applied_time(rig, qdir, capsys):
+    _at_day(rig, 10)
+    allow = _carried_one(rig, qdir)
+    (entry,) = SA.load(allow)["rules"]
+    signed = utc_stamp(SA._signed_at(entry))
+    assert entry["applied_at"] != signed
+    SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="list"))
+    out = capsys.readouterr().out
+    assert f"signed {signed}" in out and f"applied {entry['applied_at']}" in out
+
+
+def test_the_list_shows_hours_under_a_day(rig, qdir, capsys):
+    import re
+
+    _at_day(rig, 29.8)
+    _carried_one(rig, qdir)
+    SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="list"))
+    out = capsys.readouterr().out
+    assert re.search(r"\b[45] hours left", out) and "0 days left" not in out
