@@ -6,20 +6,32 @@ name: test
 # The `test` job runs the suite in shards (tests/ci/shard.py computes the partition); the workflow stays
 # named `test` because the release gate reads a completed success of that workflow on the exact sha.
 
+# land/** is the land waiter's candidate ref: the push whose verdict decides a landing. seat/** stays until a real
+# landing has gone through land/**; then a seat's own push stops running the suite and workflow_dispatch asks for a run.
+# The schedule is the nightly rerun of main HEAD, the same-sha check that replaces the duplicate run a main push was.
 on:
   push:
-    branches: [main, "seat/**"]
+    branches: [main, "seat/**", "land/**"]
     tags: ["v*"]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "17 6 * * *"
   workflow_dispatch:
+
+# The nightly is found by its event (`schedule`) and named so a reader of the run list sees it; every other event keeps
+# the name GitHub would have given it (commit message, PR title, workflow name).
+run-name: ${{ github.event_name == 'schedule' && 'nightly full run of main' || github.event.head_commit.message || github.event.pull_request.title || github.workflow }}
 
 concurrency:
   # A workflow_dispatch run gets a group of its own (its run id), so it neither cancels the push run whose
   # verdict the release gate reads (3e2aef8d, 11-05) nor is cancelled by the next dispatch; a push or PR run still
-  # cancels the superseded run of the same ref.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'ci' }}
-  cancel-in-progress: true
+  # cancels the superseded run of the same ref. A scheduled run is grouped like a dispatch: a main push must not cancel
+  # the nightly (a cancelled nightly is a missing flake check), nor the nightly a main push.
+  # A push to main is grouped by its sha and never cancels: each main sha's run is a verdict the release gate may read,
+  # so a newer main push must not cancel it. land/** and seat/** pushes and PRs keep cancelling the superseded run of the ref.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || (github.event_name == 'push' && github.ref == 'refs/heads/main') && github.sha || 'ci' }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 env:
   # The one place the shard count is written. The `plan` job emits the matrix's shard list from it, and each
@@ -31,11 +43,56 @@ env:
   TEST_SHARDS: "6"
 
 jobs:
+  gate:
+    # A push to main lands a sha the land waiter already tested on its land/** candidate, so the heavy jobs skip when
+    # tests/ci/skip_lookup.py finds a green run of this sha on another ref. It fails closed (see that file): any doubt
+    # runs everything. Only a plain push to main can skip; tags, manual runs, the nightly and PRs always run.
+    name: look up a verifying run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # A gate only has a verdict to look up on a push to main; every other run has nothing to skip, so it does not queue.
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    # least privilege: read the run list, and check out the one script
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      skip: ${{ steps.lookup.outputs.skip }}
+      ref: ${{ steps.lookup.outputs.ref }}
+      run_id: ${{ steps.lookup.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Look for a green run of this sha on another ref
+        id: lookup
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 tests/ci/skip_lookup.py
+
+  verified:
+    # Present only when the heavy jobs were skipped. Its NAME carries the verdict ("verified on <ref> run <id>") so a
+    # reader of the job list, such as the land waiter's main follow, sees it without reading a log.
+    name: verified on ${{ needs.gate.outputs.ref }} run ${{ needs.gate.outputs.run_id }}
+    needs: gate
+    if: ${{ needs.gate.result == 'success' && needs.gate.outputs.skip == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          # a branch name is an API string: it reaches the shell as a variable, never spliced into the command text
+          VERIFIED_REF: ${{ needs.gate.outputs.ref }}
+          VERIFIED_RUN: ${{ needs.gate.outputs.run_id }}
+        run: echo "verified on $VERIFIED_REF run $VERIFIED_RUN"
+
   plan:
     # Emits the shard list [0..TEST_SHARDS-1] the `test` matrix runs. It does not collect: each shard job collects
     # under its own Python and picks its own files (see that job's last step), so a file one Python collects and
     # another does not is still in that Python's shards.
     name: plan test shards
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -56,6 +113,10 @@ jobs:
   test:
     name: pytest (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
     needs: plan
+    # `plan` is behind the gate, which is skipped on every non-main run; without always() the implicit success() sees that
+    # skipped ancestor and skips this matrix, so a seat/** or land/** run went green without the unit suite. Run when
+    # `plan` succeeded: a skipped plan (the gate said skip) or a failed one runs no shard.
+    if: ${{ always() && !cancelled() && needs.plan.result == 'success' }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     # History: the unsharded suite outgrew 40 min (10-21) and then 60 min (10-22; run 39881613545's 3.12 job was
@@ -73,6 +134,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Make the runner's container-daemon socket directory readable
         # The Linux floor refuses a crown jewel this user cannot stat (a hardlink could reach it;
@@ -133,6 +196,10 @@ jobs:
     # (ii) run the test files that import only that closure. The package is not installed (it needs a newer Python):
     # the files import from the checkout, and --noconftest keeps the repo conftest, which is written for 3.12+, out.
     name: root-run code (Python 3.9)
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     # The closure tests step took 14 min on green main and 13 min 7 s on the run the 15 min cap cancelled (run 41522235194):
@@ -145,6 +212,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.9"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install h11 at or above the floor root vendors
         # root_tree stages h11 beside the levain package, so the root tree imports it; the closure's import-check
@@ -179,6 +248,10 @@ jobs:
     # refusal names, and then requires the live tests to run (LEVAIN_REQUIRE_LINUX_LIVE=1 fails a
     # skip). It runs the floor test files only.
     name: bwrap floor live (Python 3.12)
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -189,6 +262,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install bubblewrap and allow it a user namespace
         run: |
@@ -230,6 +305,10 @@ jobs:
     # over it once the sign-attempt tests joined), so the files are dealt round-robin into three shards: each
     # shard keeps the same rules (selection by file, nothing collected fails, any skip fails).
     name: cockpit browser tests (Python 3.13, shard ${{ matrix.shard }})
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -244,6 +323,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Set up node
         uses: actions/setup-node@v6
@@ -309,6 +390,10 @@ jobs:
     # `levain setup-isolation` for real: create the hands user, check the uid gate, undo. Only on
     # throwaway runners (passwordless sudo); this is the only place the Linux setup is exercised.
     name: setup-isolation e2e (${{ matrix.os }})
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 20
@@ -323,6 +408,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Install package
         run: |
@@ -344,6 +431,10 @@ jobs:
     # Deselected, and not part of this gate: chat_egress_network (conftest skips it whenever CI is set) and
     # chat_egress_slow (the minutes-long git dumps, skipped in CI unless CHD2_SLOW=1).
     name: chat egress srt (${{ matrix.os }})
+    needs: gate
+    # The gate exists only on a main push, so on every other run it is skipped and these jobs run; a failed, errored or
+    # cancelled gate runs them too (fail closed: any doubt is a test). Only a gate that succeeded and said skip skips them.
+    if: ${{ always() && !cancelled() && !(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubuntu-24.04' || matrix.os }}
     timeout-minutes: 40
@@ -358,6 +449,8 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Set up node
         uses: actions/setup-node@v6

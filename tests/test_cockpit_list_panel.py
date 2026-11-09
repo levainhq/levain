@@ -53,7 +53,7 @@ class Rig:
         self.ids: dict[str, str] = {}
         if spores:
             self._spores()
-        self.qs = QuestionStore(self.qdir)
+        self.qs = QuestionStore(self.qdir, clock=lambda: NOW)   # the store files rows on the same pinned clock as the cockpit
         if band:
             self.q = self.qs.file(agent="claude_code", agent_session_id="sess-1", what="Ship the sweep fix tonight?",
                                   options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold",

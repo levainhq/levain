@@ -20,7 +20,7 @@ from levain.coordinator.store import CoordStore
 from levain.spores import guarded_spore_store
 
 TODAY = date(2026, 11, 7)
-PAST, FUTURE = "2026-11-05", "2026-11-09"
+PAST, FUTURE = "2026-11-05", "2099-01-01"      # FUTURE stays past any real clock: the CLI dry run reads today
 
 
 @pytest.fixture

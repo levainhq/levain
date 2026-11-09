@@ -676,7 +676,11 @@ def test_a_log_that_cannot_be_read_is_unreadable_never_a_key(ck, sec, tmp_path):
         custody.read_key("openai", "tts", authority=dead, store=KeychainStore(sec.path))
     assert e.value.code == "authority_unreadable"
     anchor = auth.anchor_path(ck.root)
-    anchor.write_text(anchor.read_text().replace("0", "1", 1))        # an anchor the log no longer matches
+    text = anchor.read_text()
+    at = next(i for i, c in enumerate(text) if c.isalnum())
+    # an anchor the log no longer matches: one character always changes (a replace of "0" was a no-op when the anchor held none)
+    anchor.write_text(text[:at] + ("1" if text[at] != "1" else "2") + text[at + 1:])
+    assert anchor.read_text() != text
     with pytest.raises(VoiceKeyUnavailable) as e2:
         read(ck, sec)
     assert e2.value.code == "authority_unreadable"
