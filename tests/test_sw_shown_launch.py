@@ -78,9 +78,18 @@ def test_a_show_that_rejects_removes_its_entry() -> None:
     assert got["shownAfterPush"] == [], got
 
 
+@functools.lru_cache(maxsize=1)
+def _shown_once() -> dict:
+    return _open_rig("shown")                   # one node run for every test that only reads its result
+
+
+def _shown() -> dict:
+    return _shown_once()
+
+
 @needs_node
 def test_a_bare_standalone_launch_with_the_notification_gone_goes_to_the_entry_url_and_consumes_it() -> None:
-    got = _open_rig("shown")
+    got = _shown()
     assert got["launch"]["assigned"] == [NC] and got["launch"]["kept"] is False, got["launch"]
     assert any(t["step"] == "shown-launch" and t["ping"] == 607 and t["url"] == "/?view=notifications" and t["candidates"] == 1
                for t in got["trace"]), got["trace"]
@@ -89,7 +98,7 @@ def test_a_bare_standalone_launch_with_the_notification_gone_goes_to_the_entry_u
 
 @needs_node
 def test_no_redirect_when_in_tray_or_not_bare_or_not_standalone_or_expired_or_unlistable_or_a_reload() -> None:
-    got = _open_rig("shown")
+    got = _shown()
     for name in ("inTray", "query", "fragment", "signPath", "notStandalone", "throws", "noApi", "crossOrigin", "noPing", "reload"):
         assert got[name]["assigned"] == [] and got[name]["kept"] is True, (name, got[name])   # untouched: a later bare launch may still use it
     assert got["otherPingInTray"]["assigned"] == [NC], got["otherPingInTray"]        # an older ping under the tag is not this one
@@ -101,7 +110,7 @@ def test_no_redirect_when_in_tray_or_not_bare_or_not_standalone_or_expired_or_un
 
 @needs_node
 def test_several_gone_entries_go_to_the_newest_and_a_showing_one_is_not_a_candidate() -> None:
-    got = _open_rig("shown")
+    got = _shown()
     assert got["severalGone"]["assigned"] == [NC9] and got["severalGone"]["kept"] is False, got["severalGone"]   # newest of 3; others consumed
     assert any(t["step"] == "shown-launch" and t["ping"] == 609 and t["candidates"] == 3 for t in got["trace"]), got["trace"]
     assert got["newestStillShowing"]["assigned"] == [NC8], got["newestStillShowing"]   # 609 still showing: 608 is the newest gone
@@ -114,14 +123,14 @@ def test_several_gone_entries_go_to_the_newest_and_a_showing_one_is_not_a_candid
 
 @needs_node
 def test_the_page_deletes_exactly_the_request_it_read_so_a_push_landing_meanwhile_survives() -> None:
-    got = _open_rig("shown")
+    got = _shown()
     assert got["pushDuringCheck"]["assigned"] == [NC], got["pushDuringCheck"]
     assert got["pushDuringKeys"] == ["shown-610-z"], got["pushDuringKeys"]            # 607's entry went, 610's (its own key) stayed
 
 
 @needs_node
 def test_a_new_entry_is_claimed_by_the_old_path_and_a_shown_entry_is_never_claimable_as_new() -> None:
-    got = _open_rig("shown")
+    got = _shown()
     assert got["newWins"]["assigned"] == ["https://box.example/sign/4"], got["newWins"]
     assert got["newWinsLeft"] == ["shown-607-sn"], got                                # the shown entry was not touched
 
@@ -148,7 +157,7 @@ def test_a_same_tag_re_ping_replaces_the_older_entry_in_the_worker() -> None:
 
 @needs_node
 def test_a_same_tag_older_entry_is_superseded_not_gone_when_the_newer_ping_is_in_the_tray() -> None:
-    got = _open_rig("shown")
+    got = _shown()
     assert got["sameTagShowing"]["assigned"] == [], got["sameTagShowing"]            # 43 showing: 42 must not redirect the page
     assert len(got["sameTagShowing"]["keys"]) == 2, got["sameTagShowing"]
     assert got["sameTagQueries"] >= 1 and got["sameTagQueries"] == 1, got["sameTagQueries"]   # one query for the tag
@@ -168,7 +177,7 @@ def test_a_late_cache_write_never_recreates_the_entry_of_a_rejected_show() -> No
 def test_the_legacy_singleton_key_is_swept_by_the_worker_and_by_the_page() -> None:
     got = _run("push", "ok+legacy")
     assert got["legacyLeft"] is False, got                                            # the push's best-effort prune deleted it
-    got = _open_rig("shown")
+    got = _shown()
     assert got["legacy"]["assigned"] == [] and got["legacyLeft"] is False, got["legacy"]   # the page's sweep: removed, never judged
 
 
