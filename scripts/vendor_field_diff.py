@@ -6,7 +6,7 @@ it prints the top-level request fields the vendor's schema lists that are on non
 `dispatch_fields` (judged bounded), `unbounded_fields` (judged unbounded, `body-unbounded` on dispatch) and
 `unjudged_fields` (seen, not yet measured, refused on dispatch). Each printed field is triaged before the release:
 bounded goes into `dispatch_fields`; unbounded goes into `unbounded_fields` with a `_DISABLED_BY` row; unknown goes
-into `unjudged_fields` and gets a measured call. The release checklist reads "the diff printed nothing untriaged".
+into `unjudged_fields` and gets a measured call. The intent: a release ships only once the diff prints nothing untriaged.
 
     python3 scripts/vendor_field_diff.py                 # fetch every source and diff
     python3 scripts/vendor_field_diff.py --snapshots D   # read D/<source>.<ext> instead of the network
