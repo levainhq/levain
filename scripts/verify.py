@@ -5,7 +5,11 @@ usage:
   verify.py run    --sha S [--leg mac|linux|both]   foreground
   verify.py start  --sha S [--leg ...]              detached: prints the run id and the log path, then exits
   verify.py status [--run ID]                       running / passed / red / killed, from the run's status file
-  verify.py sweep  [--state-dir D]                  reap earlier runs that died without cleaning up
+  verify.py sweep  [--state-dir D]                  clean earlier runs that died (logs and status kept for a TTL)
+  verify.py ledger attach-row --id LG --row ROW     the board row that owns an excused red (a red rides only with one)
+  verify.py reverdict --run ID                      recompute a finished run's verdict from the ledger's board rows
+
+A receipt is green only with BOTH legs (macos, linux) present and clean; one leg alone is "partial".
 
 Builds a clean environment at the exact sha (fresh git worktree, fresh uv venv from uv.lock via
 scripts/ci_install_locked.sh), runs the full suite, classifies every red deterministically (no model), appends the
@@ -23,10 +27,10 @@ Kill safety: SIGTERM and SIGINT stop the run's process groups, remove its worktr
 under the run dir and clear its working subdirectories, keeping only the logs and status file.  A run that dies without
 that (SIGKILL, power) is reaped by the next run's start-of-run sweep, which only touches run dirs no live run holds.
 
-CI environment decision: CI is NOT set.  Tests that read it turn host-provisioning skips into failures or switch on
-CI-only behaviour, and the laptop is not provisioned the way a cloud runner is, so setting it would manufacture reds
-that are about the host, not the commit.  Skips are instead recorded by reason (skips_by_reason) so the receipt
-consumer can see exactly what did not run.  GITHUB_ACTIONS is likewise unset.
+CI environment decision (reversed 11-09): the legs run with CI=1 and GITHUB_ACTIONS unset, because a test that reads CI
+turns a host-provisioning skip into a failure and the receipt must never read green where CI reads red.  What CI
+provisions for the tests (h11 for /usr/bin/python3) is provisioned inside the run dir, or the leg fails loud naming what
+is missing.  Skips are also recorded by reason (skips_by_reason) so the receipt consumer sees what did not run.
 """
 from __future__ import annotations
 
@@ -67,7 +71,11 @@ HAIKU_MODEL = "claude-haiku-5-5"
 DIAG_MAX_TOKENS = 1500
 DIAG_PROMPT_CAP = 24000
 STARTING_GRACE = 120.0          # seconds a freshly started run may have no lock yet
-FINAL_STATES = ("passed", "red")
+FINAL_STATES = ("passed", "red", "partial")
+REQUIRED_PLATFORMS = ("macos", "linux")
+KEPT_LOG_TTL = 14 * 86400       # seconds a dead run's logs and status file survive the sweep (its working subdirs go at once)
+BWRAP_PYTHON = "3.12"           # the CI bwrap job runs 3.12, whatever the linux leg's own interpreter is
+RUN_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}-[0-9a-f]{4}")
 BWRAP_TARGETS = [
     "tests/test_firing_confinement.py", "tests/test_jewel_recheck.py", "tests/test_nlink_floor.py",
     "tests/test_masks_last.py", "tests/test_floor_project_memory.py", "tests/test_floor_spellings.py",
@@ -169,19 +177,43 @@ class Ledger:
 
     def _append(self, rec: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as f:
+        with open(self.path, "a+b") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(json.dumps(rec, sort_keys=True) + "\n")
+            f.seek(0)
+            data = f.read()
+            if data and not data.endswith(b"\n"):
+                # a writer died mid-line: the torn tail was never acknowledged, so it is dropped (a complete
+                # record that only lost its newline is kept) before this record goes on the end
+                k = data.rfind(b"\n")
+                tail = data[k + 1:]
+                try:
+                    json.loads(tail)
+                    f.write(b"\n")
+                except ValueError:
+                    f.truncate(k + 1)
+                    print(f"verify: ledger {self.path}: dropped a torn last line ({len(tail)} bytes)", file=sys.stderr)
+            f.write((json.dumps(rec, sort_keys=True) + "\n").encode("utf-8"))
             f.flush()
             os.fsync(f.fileno())
 
     def lines(self) -> list[dict]:
+        """Every record.  A torn LAST line (the writer died mid-line) is skipped with a warning; any other line that
+        does not parse fails closed, because a ledger with a hole in the middle is not a ledger."""
         if not self.path.exists():
             return []
+        rows = [(i, ln) for i, ln in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1) if ln.strip()]
         out = []
-        for ln in self.path.read_text(encoding="utf-8").splitlines():
-            if ln.strip():
-                out.append(json.loads(ln))
+        for k, (i, ln) in enumerate(rows):
+            try:
+                rec = json.loads(ln)
+                if not isinstance(rec, dict) or "type" not in rec:
+                    raise ValueError("not a ledger record")
+            except ValueError as e:
+                if k == len(rows) - 1:
+                    print(f"verify: ledger {self.path}: skipping a torn last line (line {i})", file=sys.stderr)
+                    continue
+                raise RuntimeError(f"ledger {self.path} line {i} is unreadable ({e}): failing closed") from e
+            out.append(rec)
         return out
 
     def entries(self) -> dict[str, dict]:
@@ -193,7 +225,19 @@ class Ledger:
                 by_id[r["id"]]["sightings"].append(r)
             elif r["type"] == "status" and r["id"] in by_id:
                 by_id[r["id"]]["status"] = r["status"]
+            elif r["type"] == "board_row" and r["id"] in by_id:
+                by_id[r["id"]]["board_row"] = r["row"]
         return by_id
+
+    def board_row(self, lid: str) -> str | None:
+        return (self.entries().get(lid) or {}).get("board_row") or None
+
+    def attach_row(self, lid: str, row: str) -> None:
+        if lid not in self.entries():
+            raise KeyError(f"no ledger entry {lid}")
+        if not str(row).strip():
+            raise ValueError("an empty board row")
+        self._append({"type": "board_row", "id": lid, "row": str(row).strip(), "ts": now()})
 
     def open_entry_for(self, nodeid: str) -> dict | None:
         found = [e for e in self.entries().values() if e["nodeid"] == nodeid and e["status"] == "open"]
@@ -219,24 +263,46 @@ class Ledger:
 # ---------------------------------------------------------------- receipt
 
 def verdict_of(legs: list[dict]) -> tuple[str, list[str]]:
-    """Red when any leg ran nothing, any red is a regression or lacks a ledger_id, or a job's pytest died abnormally."""
+    """red: a leg ran nothing, a red is a regression or has no ledger entry or no board row, pytest died abnormally or
+    disagrees with its own junit, or a leg's integrity check failed.  partial: nothing is red but a required leg
+    is missing.  green only with both legs present and clean: a receipt never reads green where CI would read red."""
     why: list[str] = []
     for leg in legs:
+        for e in leg.get("integrity", []):
+            why.append(f"{leg['platform']}: {e}")
         for job in leg.get("jobs", []):
-            if job["counts"]["collected"] <= 0:
-                why.append(f"{leg['platform']}/{job['name']}: collected 0")
-            if job.get("rc") not in (0, 1):
-                why.append(f"{leg['platform']}/{job['name']}: pytest exit {job.get('rc')}")
+            tag = f"{leg['platform']}/{job['name']}"
+            c = job["counts"]
+            raw = c.get("failed", 0) + c.get("error", 0)
+            rc = job.get("rc")
+            if c["collected"] <= 0:
+                why.append(f"{tag}: collected 0")
+            if rc not in (0, 1):
+                why.append(f"{tag}: pytest exit {rc}")
+            elif rc == 0 and raw:
+                why.append(f"{tag}: pytest exit 0 but the junit holds {raw} failed or errored")
+            elif rc == 1 and raw == 0:
+                why.append(f"{tag}: pytest exit 1 but the junit holds no failed or errored test")
+            if raw and not job["reds"]:
+                why.append(f"{tag}: the junit holds {raw} failed or errored but no red is recorded")
             if job.get("setup_failed"):
-                why.append(f"{leg['platform']}/{job['name']}: setup failed: {job['setup_failed']}")
-            if job.get("required_run") and job["counts"]["skipped"] > 0:
-                why.append(f"{leg['platform']}/{job['name']}: {job['counts']['skipped']} skipped under a required-run job")
+                why.append(f"{tag}: setup failed: {job['setup_failed']}")
+            if job.get("required_run") and c["skipped"] > 0:
+                why.append(f"{tag}: {c['skipped']} skipped under a required-run job")
             for r in job["reds"]:
                 if r["class"] == "regression":
                     why.append(f"regression: {r['nodeid']}")
                 elif not r.get("ledger_id"):
                     why.append(f"red without ledger_id: {r['nodeid']}")
-    return ("red" if why else "green"), why
+                elif not r.get("board_row"):
+                    why.append(f"no board row for ledger entry {r['ledger_id']} ({r['nodeid']}): "
+                               f"verify.py ledger attach-row --id {r['ledger_id']} --row <board row>, then re-run or reverdict")
+    if why:
+        return "red", why
+    missing = [p for p in REQUIRED_PLATFORMS if p not in {leg.get("platform") for leg in legs}]
+    if missing:
+        return "partial", [f"missing leg: {p}" for p in missing]
+    return "green", why
 
 
 def build_receipt(sha: str, run_id: str, lock: dict, runner_blob: str | None, legs: list[dict],
@@ -247,7 +313,26 @@ def build_receipt(sha: str, run_id: str, lock: dict, runner_blob: str | None, le
     elif runner_matches_sha is False:
         verdict, why = "red", why + ["the running verify.py is not the blob committed at the sha"]
     return {"schema": SCHEMA, "sha": sha, "lock": lock, "runner_blob": runner_blob, "run_id": run_id,
-            "verdict": verdict, "verdict_why": why, "legs": legs}
+            "runner_matches_sha": runner_matches_sha, "verdict": verdict, "verdict_why": why, "legs": legs}
+
+
+def reverdict_receipt(receipt: dict, ledger: Ledger) -> dict:
+    """Re-read every excused red's board row from the ledger and recompute the verdict (what a re-run would conclude,
+    without re-running).  Classes, counts and junit hashes are the original run's; only the board rows move."""
+    if "runner_matches_sha" not in receipt:
+        raise ValueError("this receipt predates the runner_matches_sha field; re-run instead")
+    legs = receipt["legs"]
+    for leg in legs:
+        for job in leg.get("jobs", []):
+            for r in job["reds"]:
+                if r.get("ledger_id"):
+                    r["board_row"] = ledger.board_row(r["ledger_id"])
+    new = build_receipt(receipt["sha"], receipt["run_id"], receipt["lock"], receipt["runner_blob"], legs,
+                        receipt["runner_matches_sha"])
+    if receipt.get("diagnosis"):
+        new["diagnosis"] = receipt["diagnosis"]
+    new["reverdicts"] = [*receipt.get("reverdicts", []), {"ts": now(), "from": receipt["verdict"], "to": new["verdict"]}]
+    return new
 
 
 def write_receipt(receipt: dict, receipts_dir: Path) -> Path:
@@ -262,14 +347,16 @@ def write_receipt(receipt: dict, receipts_dir: Path) -> Path:
 # ---------------------------------------------------------------- environment
 
 def clean_env(run: Path) -> dict:
-    """env -i plus only PATH, LANG, the wait scale, and a private HOME / TMPDIR.  Nothing of the operator's ANTHROPIC_*,
-    OPENAI_*, LEVAIN_* passes through."""
-    return {"PATH": CLEAN_PATH, "LANG": "en_US.UTF-8", "LEVAIN_TEST_WAIT_SCALE": WAIT_SCALE,
+    """env -i plus only PATH, LANG, the wait scale, CI=1 (as on the cloud runner) and a private HOME / TMPDIR.  Nothing of
+    the operator's ANTHROPIC_*, OPENAI_*, LEVAIN_* passes through."""
+    return {"PATH": CLEAN_PATH, "LANG": "en_US.UTF-8", "LEVAIN_TEST_WAIT_SCALE": WAIT_SCALE, "CI": "1",
             "HOME": str(run / "home"), "TMPDIR": str(run / "tmp")}
 
 
 _CHILDREN: set = set()
-_CHILD_LOCK = threading.Lock()
+# re-entrant: the SIGTERM handler runs on the main thread, possibly while that same thread holds this lock in _spawn or
+# in _run's finally; a plain Lock would deadlock the handler against its own thread
+_CHILD_LOCK = threading.RLock()
 
 
 def _kill_group(p: subprocess.Popen, grace: float = 5.0) -> None:
@@ -518,9 +605,15 @@ def run_is_live(run: Path) -> bool:
     return False
 
 
+def _has_working_subdirs(d: Path) -> bool:
+    return any(c.is_dir() and not c.is_symlink() for c in d.iterdir())
+
+
 def sweep_runs(state: Path, repo: Path, tools: Tools, *, current: str | None = None, say=print) -> list[dict]:
-    """Reap every earlier run dir that no live run holds and that did not finish with a receipt.  A finished run
-    (passed or red) keeps its dir: its junit files are what the receipt's hashes point at."""
+    """Clean every earlier run dir that no live run holds and that did not finish with a receipt.  Only its working
+    subdirectories go (worktrees, venvs, basetemps, mounted images); its logs and status file stay for KEPT_LOG_TTL
+    seconds so a run that died is still diagnosable, then the whole dir goes.  A finished run (passed, red or partial)
+    keeps its dir: its junit files are what the receipt's hashes point at."""
     runs = state / "runs"
     done: list[dict] = []
     if not runs.is_dir():
@@ -532,10 +625,19 @@ def sweep_runs(state: Path, repo: Path, tools: Tools, *, current: str | None = N
         if st.get("state") in FINAL_STATES:
             continue
         sp = d / "status.json"
-        if st.get("state") == "starting" and sp.exists() and time.time() - sp.stat().st_mtime < STARTING_GRACE:
+        stamp = sp.stat().st_mtime if sp.exists() else d.stat().st_mtime
+        if st.get("state") == "starting" and time.time() - stamp < STARTING_GRACE:
             continue
-        say(f"verify: sweep: reaping earlier run {d.name} (state {st.get('state', 'unknown')})")
-        done.append(reap_run(d, repo, tools, say=say))
+        if time.time() - stamp > KEPT_LOG_TTL:
+            say(f"verify: sweep: removing {d.name} (state {st.get('state', 'unknown')}), its logs are past {KEPT_LOG_TTL // 86400} days")
+            done.append(reap_run(d, repo, tools, say=say))
+            continue
+        if st.get("state") in ("starting", "running"):
+            Status(d).update(state="killed", note="the runner is gone and holds no lock (found by a sweep)")
+        if not _has_working_subdirs(d):
+            continue        # swept already: the logs and the status file are all that is left
+        say(f"verify: sweep: cleaning earlier run {d.name} (state {st.get('state', 'unknown')}), keeping its logs")
+        done.append(reap_run(d, repo, tools, keep_files=True, say=say))
     return done
 
 
@@ -641,17 +743,38 @@ def pytest_cmd(py: Path, *args: str) -> list[str]:
     return [str(py), "-m", "pytest", "-p", "no:cacheprovider", *args]
 
 
+def failure_signature(text: str) -> tuple[str, str]:
+    """(exception type, first message line) of a junit failure text, with addresses and absolute paths blanked so two runs
+    of the same failure compare equal.  The type is empty when the first line names none (a bare assert)."""
+    lines = [ln for ln in (text or "").split("\n") if ln.strip()]
+    first = lines[0].strip() if lines else ""
+    first = re.sub(r"0x[0-9a-fA-F]+", "0x?", first)
+    first = re.sub(r"(?<![\w.])/[^\s'\"):,]+", "<path>", first)
+    m = re.match(r"^([A-Za-z_][\w.]*(?:Error|Exception|Exit|Warning|Failed|Interrupt))\b", first)
+    return (m.group(1) if m else ""), first
+
+
+def _baseline_result(b) -> tuple[str, tuple[str, str] | None]:
+    """A baseline answer is 'red'|'green'|'absent', or {'state': 'red', 'sig': (type, line)}."""
+    if isinstance(b, dict):
+        sig = b.get("sig")
+        return b.get("state", "absent"), (tuple(sig) if sig else None)
+    return b, None
+
+
 def classify(reds: list[dict], *, ledger: Ledger | None, run_id: str, sha: str, touched: set[str],
              rerun, baseline) -> list[dict]:
     """Deterministic classification, exactly the design page.  `rerun(nodeid) -> bool` is one serial run (True = pass);
-    `baseline(nodeids) -> dict[nodeid -> 'red'|'green'|'absent']` runs them on a fresh main checkout, serially.
+    `baseline(nodeids) -> dict[nodeid -> 'red'|'green'|'absent' | {'state': 'red', 'sig': (type, first line)}]` runs
+    them on a fresh checkout of the pinned land base, serially.  A red inherits only when the base fails the same way
+    (same exception type and first message line); a different failure on the sha is a regression.
     `ledger=None` (a remote leg: the laptop is the only ledger writer) classifies and files nothing; the laptop then
     runs `apply_ledger_to_leg` over the copied-back leg."""
     out: list[dict] = []
     pending: list[dict] = []
     for r in reds:
         nid = r["nodeid"]
-        rec = {"nodeid": nid, "class": None, "evidence": "", "ledger_id": None, "kind": r.get("kind"),
+        rec = {"nodeid": nid, "class": None, "evidence": "", "ledger_id": None, "board_row": None, "kind": r.get("kind"),
                "text": (r.get("text") or "")[:1500]}
         file_part = nid.split("::", 1)[0]
         if file_part in touched:
@@ -679,9 +802,18 @@ def classify(reds: list[dict], *, ledger: Ledger | None, run_id: str, sha: str, 
     if pending:
         base = baseline([p["nodeid"] for p in pending])
         for rec in pending:
-            b = base.get(rec["nodeid"], "absent")
+            b, bsig = _baseline_result(base.get(rec["nodeid"], "absent"))
             if b == "red":
-                rec.update({"class": "inherited", "evidence": rec["evidence"] + f"; also red on {MAIN_REF}"})
+                mine = failure_signature(rec["text"])
+                if bsig is None:
+                    rec.update({"class": "regression",
+                                "evidence": rec["evidence"] + f"; red on {MAIN_REF} but its failure was not recorded, so sameness is unproven"})
+                elif tuple(bsig) == mine:
+                    rec.update({"class": "inherited", "evidence": rec["evidence"] + f"; also red on {MAIN_REF}, the same failure ({mine[0] or 'assert'}: {mine[1][:80]})"})
+                else:
+                    rec.update({"class": "regression",
+                                "evidence": rec["evidence"] + f"; red on {MAIN_REF} but with a different failure "
+                                            f"(base {tuple(bsig)[1][:80]!r}, here {mine[1][:80]!r})"})
             elif b == "green":
                 rec.update({"class": "regression", "evidence": rec["evidence"] + f"; passes on {MAIN_REF}"})
             else:
@@ -691,13 +823,15 @@ def classify(reds: list[dict], *, ledger: Ledger | None, run_id: str, sha: str, 
             if rec["class"] in ("load", "flaky", "inherited"):
                 rec["ledger_id"], new = ledger.file(rec["nodeid"], rec["class"], run_id, sha, rec["evidence"])
                 rec["ledger_new"] = new
+                rec["board_row"] = ledger.board_row(rec["ledger_id"])
     return out
 
 
 def apply_ledger_to_leg(leg: dict, ledger: Ledger, run_id: str, sha: str) -> None:
     """The ledger half of classification for a leg that was classified elsewhere without a ledger: an inherited red
     that the ledger already holds as load/flaky and that failed every serial rerun is a regression (never excused);
-    every other excused red is filed (entry or sighting) and gets its ledger_id.  Mutates `leg` and its `_diag`."""
+    every other excused red is filed (entry or sighting) and gets its ledger_id and board row.  Mutates `leg` and its
+    `_diag`."""
     diag = {d["nodeid"]: d for d in leg.get("_diag", [])}
     for job in leg.get("jobs", []):
         for r in job["reds"]:
@@ -712,20 +846,48 @@ def apply_ledger_to_leg(leg: dict, ledger: Ledger, run_id: str, sha: str) -> Non
             if r["class"] in ("load", "flaky", "inherited"):
                 lid, new = ledger.file(r["nodeid"], r["class"], run_id, sha, r["evidence"])
                 r["ledger_id"] = lid
+                r["board_row"] = ledger.board_row(lid)
                 if r["nodeid"] in diag:
                     diag[r["nodeid"]]["ledger_new"] = new
 
 
 # ---------------------------------------------------------------- the mac leg
 
-def lock_host(state: Path):
+def _pid_dead(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def lock_host(state: Path, _retry: bool = True):
+    """One receipt run per host.  A lock still held after its recorded pid is gone (a leaked descriptor in a child that
+    outlived a killed run) is reclaimed: the stale file is unlinked and a fresh one taken.  A live or unreadable
+    holder is never reclaimed.  Two starters racing on the same stale file is the one edge this leaves open."""
     state.mkdir(parents=True, exist_ok=True)
-    f = open(state / "host.lock", "w")
+    path = state / "host.lock"
+    f = open(path, "a+")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        try:
+            f.seek(0)
+            pid = int(f.read().split()[0])
+        except (ValueError, IndexError, OSError):
+            pid = None
         f.close()
+        if _retry and pid is not None and pid != os.getpid() and _pid_dead(pid):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            return lock_host(state, _retry=False)
         return None
+    f.seek(0)
+    f.truncate()
     f.write(f"{os.getpid()} {now()}\n")
     f.flush()
     return f
@@ -755,8 +917,10 @@ class Ctx:
         self.names: list[str] = []
         self.src: Path | None = None
         self.python = ""
-        self._main: tuple[Path, Path] | None = None
+        self._main: dict[str, tuple[Path, Path]] = {}
         self.touched: set[str] = set()
+        self.base_sha = ""
+        self.h11_site: Path | None = None
 
     def progress(self, phase: str) -> None:
         if self.status is not None:
@@ -765,19 +929,24 @@ class Ctx:
     def prepare(self) -> None:
         for d in (self.run / "home", self.run / "tmp"):
             d.mkdir(parents=True, exist_ok=True)
-        self.touched = set(git(self.repo, "diff", "--name-only", f"{MAIN_REF}...{self.sha}", check=False).stdout.split())
+        # the land base is read once, here, as a sha: every classification and baseline of this leg uses this one value
+        self.base_sha = git(self.repo, "rev-parse", "--verify", f"{MAIN_REF}^{{commit}}", check=False).stdout.strip()
+        base = self.base_sha or MAIN_REF
+        self.touched = set(git(self.repo, "diff", "--name-only", f"{base}...{self.sha}", check=False).stdout.split())
 
     def make(self, name: str, sha: str, python: str, lock_src: Path | None = None) -> tuple[Path, Path]:
         self.names.append(name)
         return make_env(self.repo, sha, self.run, name, python, self.log, lock_src=lock_src)
 
-    def main_env(self) -> tuple[Path, Path]:
-        """The worktree + venv at the land base, built once and only when a red needs a baseline."""
-        if self._main is None:
-            msha = git(self.repo, "rev-parse", MAIN_REF).stdout.strip()
+    def main_env(self, python: str | None = None) -> tuple[Path, Path]:
+        """The worktree + venv at the land base, built once per interpreter and only when a red needs a baseline."""
+        python = python or self.python
+        if python not in self._main:
+            if not self.base_sha:
+                raise RuntimeError(f"{MAIN_REF} is not present: no baseline can be built")
             self.progress("building the main baseline")
-            self._main = self.make("src_at_main", msha, self.python, lock_src=self.src)
-        return self._main
+            self._main[python] = self.make(f"src_at_main{_minor(python)}", self.base_sha, python, lock_src=self.src)
+        return self._main[python]
 
     def teardown(self) -> None:
         for n in self.names:
@@ -786,11 +955,21 @@ class Ctx:
         git(self.repo, "worktree", "prune", check=False)
 
 
+def rerun_passed(junit: Path) -> bool:
+    """A serial rerun counts as a pass only when its own junit says the test PASSED: a skip, an xfail or no testcase is not."""
+    try:
+        c = parse_junit(junit)["counts"]
+    except (OSError, ET.ParseError):
+        return False
+    return c["passed"] >= 1 and not (c["failed"] or c["error"] or c["skipped"] or c["xfailed"])
+
+
 def run_job(ctx: Ctx, *, name: str, py: Path, cwd: Path, env: dict, targets: list[str], junit_name: str,
             workers: int | None, timeout: float, flags: tuple = (), rerun_flags: tuple = (), required_run: bool = False,
-            base_cfg=None) -> tuple[dict, list[dict]]:
+            base_cfg=None, base_python: str | None = None) -> tuple[dict, list[dict]]:
     """One pytest job: run it under xdist, classify its reds, return (job dict for the receipt, diagnosis records).
-    `base_cfg(bsrc, bpy) -> (python, env, flags)` adapts the baseline run to the job's interpreter and flags."""
+    `base_cfg(bsrc, bpy) -> (python, env, flags)` adapts the baseline run to the job's interpreter and flags;
+    `base_python` names the interpreter the baseline checkout is built with (default: the leg's)."""
     junit = ctx.run / junit_name
     xd = ["-n", str(workers), "--dist", "loadfile"] if workers else []
     ctx.progress(f"{name}: pytest")
@@ -800,32 +979,41 @@ def run_job(ctx: Ctx, *, name: str, py: Path, cwd: Path, env: dict, targets: lis
         raise RuntimeError(f"{name}: pytest produced no junit (exit {rc}); see {ctx.log}")
     parsed = parse_junit(junit, cwd)
     n_rerun = [0]
+    binfo: dict = {}
 
     def rerun(nid: str) -> bool:
         n_rerun[0] += 1
-        return _run(pytest_cmd(py, nid, *rerun_flags, f"--basetemp={ctx.run / ('pt-%s-r%d' % (name, n_rerun[0]))}"),
-                    cwd=cwd, env=env, log=ctx.log, timeout=900) == 0
+        rj = ctx.run / f"junit-rerun-{name}-{n_rerun[0]}.xml"
+        rc2 = _run(pytest_cmd(py, nid, *rerun_flags, f"--junitxml={rj}", f"--basetemp={ctx.run / ('pt-%s-r%d' % (name, n_rerun[0]))}"),
+                   cwd=cwd, env=env, log=ctx.log, timeout=900)
+        ok = rc2 == 0 and rerun_passed(rj)
+        rj.unlink(missing_ok=True)
+        return ok
 
     def baseline(nids: list[str]) -> dict:
-        bsrc, bpy = ctx.main_env()
+        bsrc, bpy = ctx.main_env(base_python)
         bj = ctx.run / f"junit-main-{name}.xml"
         if base_cfg:
             bp_py, benv, bflags = base_cfg(bsrc, bpy)
         else:
-            bp_py, benv, bflags = bpy, {**ctx.env, "PATH": f"{bpy.parent}:{CLEAN_PATH}"}, rerun_flags
+            bp_py, benv, bflags = bpy, {**env, "PATH": f"{bpy.parent}:{CLEAN_PATH}"}, rerun_flags
         _run(pytest_cmd(bp_py, *nids, *bflags, f"--junitxml={bj}", f"--basetemp={ctx.run / ('pt-main-' + name)}"),
              cwd=bsrc, env=benv, log=ctx.log, timeout=1800)
         if not bj.exists():
             return {}
-        red = {r["nodeid"] for r in parse_junit(bj, bsrc)["reds"]}
+        bparsed = parse_junit(bj, bsrc)
+        red = {r["nodeid"]: r for r in bparsed["reds"]}
         seen = {_nodeid(tc.get("classname", ""), tc.get("name", ""), bsrc) for tc in ET.parse(str(bj)).iter("testcase")}
-        return {n: ("red" if n in red else "green" if n in seen else "absent") for n in nids}
+        binfo.update(sha=ctx.base_sha, junit_sha256=sha256_file(bj), junit=str(bj))
+        return {n: ({"state": "red", "sig": list(failure_signature(red[n]["text"]))} if n in red
+                    else "green" if n in seen else "absent") for n in nids}
 
     ctx.progress(f"{name}: classifying {len(parsed['reds'])} reds")
     reds = classify(parsed["reds"], ledger=ctx.ledger, run_id=ctx.run_id, sha=ctx.sha, touched=ctx.touched,
                     rerun=rerun, baseline=baseline)
     job = {"name": name, "rc": rc, "required_run": required_run, "counts": parsed["counts"],
            "skips_by_reason": parsed["skips_by_reason"], "junit": {"path": str(junit), "sha256": sha256_file(junit)},
+           "baseline": dict(binfo) if binfo else None,
            "load_reds": sum(1 for r in reds if r["class"] == "load"),
            "reds": [{k: v for k, v in r.items() if k not in ("kind", "ledger_new", "text")} for r in reds]}
     diag = [{"nodeid": r["nodeid"], "class": r["class"], "evidence": r["evidence"], "text": r.get("text", ""),
@@ -839,6 +1027,73 @@ def failed_job(name: str, why: str) -> dict:
             "junit": None, "load_reds": 0, "reds": []}
 
 
+# ---------------------------------------------------------------- CI parity: what CI provisions for the tests
+
+SYSTEM_PYTHON = "/usr/bin/python3"
+
+
+def provision_h11(ctx: Ctx, py: Path, src: Path, env: dict) -> tuple[Path | None, str | None]:
+    """CI installs h11 (the floor root vendors) for the runner's /usr/bin/python3 so the root-py tests run instead of
+    skipping.  Here it goes INSIDE the run dir: h11 is pure Python, so one `pip install --target` from the leg's own venv
+    serves any interpreter, and the jobs' PYTHONPATH exposes it.  Nothing is written outside the run dir.  Returns
+    (site dir, None) or (None, why): a leg that cannot provision it fails loud, it never skips the root runs."""
+    site = ctx.run / "h11site"
+    rc, out = _capture([str(py), "tests/ci/root_closure.py", "h11-spec"], cwd=src, env=env, log=ctx.log)
+    spec = out.strip()
+    if rc or not spec:
+        return None, "h11 for /usr/bin/python3 not provisioned: tests/ci/root_closure.py h11-spec gave no requirement"
+    if _run([str(py), "-m", "pip", "install", "--no-deps", "--target", str(site), spec], cwd=src, env=env, log=ctx.log, timeout=900):
+        return None, f"h11 for /usr/bin/python3 not provisioned: pip install --target of {spec} failed (see log)"
+    probe = subprocess.run([SYSTEM_PYTHON, "-c", "import h11"], capture_output=True, text=True, timeout=60,
+                           env={**env, "PYTHONPATH": str(site)}) if os.path.exists(SYSTEM_PYTHON) else None
+    if probe is None:
+        return None, f"h11 for /usr/bin/python3 not provisioned: {SYSTEM_PYTHON} does not exist on this host"
+    if probe.returncode != 0:
+        return None, f"h11 for /usr/bin/python3 not provisioned: {SYSTEM_PYTHON} cannot import it from the run dir: {probe.stderr.strip()[-200:]}"
+    return site, None
+
+
+def host_probe(cmd: list[str], env: dict | None = None, timeout: float = 60) -> tuple[int, str]:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, str(e)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def preflight_linux(probe=host_probe, *, which=shutil.which, exists=os.path.exists, access=os.access,
+                    uid: int | None = None, user: str | None = None) -> list[str]:
+    """The host capabilities the CI linux-live job provisions before it runs the bwrap floor tests.  Returns what is
+    missing (empty = ready).  It only looks: it never changes a sysctl or installs anything; provisioning is the
+    host owner's call."""
+    uid = os.getuid() if uid is None else uid
+    if user is None:
+        try:
+            import pwd
+            user = pwd.getpwuid(uid).pw_name
+        except Exception:  # noqa: BLE001
+            user = str(uid)
+    missing: list[str] = []
+    if not which("bwrap"):
+        missing.append("bubblewrap (bwrap) is not installed")
+    else:
+        rc, _ = probe(["bwrap", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--unshare-pid", "/bin/true"])
+        if rc != 0:
+            missing.append("bwrap cannot make an unprivileged user namespace (kernel.apparmor_restrict_unprivileged_userns?)")
+    rc, out = probe(["loginctl", "show-user", user, "-p", "Linger"])
+    if rc != 0 or "Linger=yes" not in out:
+        missing.append(f"loginctl linger is not enabled for {user}")
+    rc, _ = probe(["systemd-run", "--user", "--scope", "--quiet", "--collect", "/bin/true"],
+                  env={**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{uid}"})
+    if rc != 0:
+        missing.append("systemd-run --user --scope does not work (no user manager or bus for this account)")
+    if exists("/run/podman") and not access("/run/podman", os.R_OK | os.X_OK):
+        missing.append(f"/run/podman is not readable by {user} (chmod o+rx /run/podman)")
+    return missing
+
+
+# ---------------------------------------------------------------- the legs' plans
+
 def plan_mac(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[list[dict], list[dict], str]:
     ctx.python = python
     ctx.prepare()
@@ -846,20 +1101,28 @@ def plan_mac(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[list[
     src, py = ctx.make("src_at_sha", ctx.sha, python)
     ctx.src = src
     env = {**ctx.env, "PATH": f"{py.parent}:{CLEAN_PATH}"}
+    site, why = provision_h11(ctx, py, src, env)
+    if why:
+        return [failed_job("ci-parity", why)], [], venv_version(py, env)
+    env["PYTHONPATH"] = str(site)
     job, diag = run_job(ctx, name=f"pytest-full-py{_minor(python)}", py=py, cwd=src, env=env, targets=["tests"],
                         junit_name="junit-mac.xml", workers=workers, timeout=timeout)
     return [job], diag, venv_version(py, env)
 
 
 def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[list[dict], list[dict], str]:
-    """Three jobs: the full suite without the static-guard files, the live floor tests where a skip fails, and the
-    root-run import closure on the oldest interpreter."""
+    """Three jobs, as CI runs them: the full suite without the static-guard files, the live floor tests on 3.12 where a
+    skip fails (after a host preflight), and the root-run import closure on the oldest interpreter."""
     ctx.python = python
     ctx.prepare()
     ctx.progress("building the environment")
     src, py = ctx.make("src_at_sha", ctx.sha, python)
     ctx.src = src
     env = {**ctx.env, "PATH": f"{py.parent}:{CLEAN_PATH}"}
+    site, why = provision_h11(ctx, py, src, env)
+    if why:
+        return [failed_job("ci-parity", why)], [], venv_version(py, env)
+    env["PYTHONPATH"] = str(site)
     m = _minor(python)
     not_static = ("-m", "not static_guard")
     jobs, diag = [], []
@@ -867,12 +1130,26 @@ def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[lis
                    workers=workers, timeout=timeout, flags=not_static, rerun_flags=not_static)
     jobs.append(j)
     diag += d
-    j, d = run_job(ctx, name=f"bwrap-floor-live-py{m}", py=py, cwd=src, env={**env, "LEVAIN_REQUIRE_LINUX_LIVE": "1"},
-                   targets=list(BWRAP_TARGETS), junit_name="junit-linux-floor.xml", workers=None, timeout=timeout,
-                   required_run=True, base_cfg=lambda bsrc, bpy: (bpy, {**ctx.env, "PATH": f"{bpy.parent}:{CLEAN_PATH}",
-                                                                          "LEVAIN_REQUIRE_LINUX_LIVE": "1"}, ()))
-    jobs.append(j)
-    diag += d
+
+    bw_name = f"bwrap-floor-live-py{_minor(BWRAP_PYTHON)}"
+    ctx.progress(f"{bw_name}: host preflight")
+    missing = preflight_linux()
+    if missing:
+        jobs.append(failed_job(bw_name, "host not provisioned: " + "; ".join(missing)))
+    else:
+        try:
+            bsrc, bpy = ctx.make("src_bwrap", ctx.sha, BWRAP_PYTHON)
+        except RuntimeError as e:
+            jobs.append(failed_job(bw_name, f"environment: {e}"))
+        else:
+            benv = {**ctx.env, "PATH": f"{bpy.parent}:{CLEAN_PATH}", "LEVAIN_REQUIRE_LINUX_LIVE": "1"}
+            j, d = run_job(ctx, name=bw_name, py=bpy, cwd=bsrc, env=benv, targets=list(BWRAP_TARGETS),
+                           junit_name="junit-linux-floor.xml", workers=None, timeout=timeout, required_run=True,
+                           base_python=BWRAP_PYTHON,
+                           base_cfg=lambda s2, p2: (p2, {**ctx.env, "PATH": f"{p2.parent}:{CLEAN_PATH}",
+                                                         "LEVAIN_REQUIRE_LINUX_LIVE": "1"}, ()))
+            jobs.append(j)
+            diag += d
 
     name39 = f"root-closure-py{_minor(CLOSURE_PYTHON)}"
     ctx.progress(f"{name39}: building the venv")
@@ -880,7 +1157,7 @@ def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[lis
             "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR") or str(Path.home() / ".cache" / "uv")}
     venv = ctx.run / "venv39"
     py39 = venv / "bin" / "python"
-    penv = {**ctx.env, "PATH": f"{venv}/bin:{CLEAN_PATH}", "PYTHONPATH": str(src)}
+    penv = {**ctx.env, "PATH": f"{venv}/bin:{CLEAN_PATH}", "PYTHONPATH": f"{src}{os.pathsep}{site}"}
     steps = [(["uv", "venv", "--seed", "--python", CLOSURE_PYTHON, str(venv)], uenv),
              ([str(py39), "-m", "pip", "install", "pip==25.3"], penv),
              ([str(py39), "-m", "pip", "install", "--require-hashes", "-r", str(src / "requirements-ci-py39.txt")], penv),
@@ -903,7 +1180,8 @@ def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[lis
     flags = ("--noconftest", "--rootdir", str(src))
     j, d = run_job(ctx, name=name39, py=py39, cwd=src, env=penv, targets=files, junit_name="junit-linux-closure.xml",
                    workers=workers, timeout=timeout, flags=flags, rerun_flags=flags,
-                   base_cfg=lambda bsrc, bpy: (py39, {**penv, "PYTHONPATH": str(bsrc)}, ("--noconftest", "--rootdir", str(bsrc))))
+                   base_cfg=lambda bsrc, bpy: (py39, {**penv, "PYTHONPATH": f"{bsrc}{os.pathsep}{site}"},
+                                               ("--noconftest", "--rootdir", str(bsrc))))
     jobs.append(j)
     diag += d
     return jobs, diag, venv_version(py, env)
@@ -922,7 +1200,8 @@ def run_leg_local(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger |
     finally:
         max_load = sampler.finish()
         ctx.teardown()
-    return {"platform": "macos" if leg == "mac" else "linux", "host": socket.gethostname(), "python": pyver,
+    return {"platform": "macos" if leg == "mac" else "linux", "sha": sha, "base_sha": ctx.base_sha,
+            "host": socket.gethostname(), "python": pyver,
             "host_fingerprint": host_fingerprint(), "started": started, "ended": now(),
             "duration_s": round(time.time() - t0, 1), "workers": workers, "max_load": max_load,
             "load_reds": sum(j.get("load_reds", 0) for j in jobs), "jobs": jobs, "_diag": diag}
@@ -937,10 +1216,56 @@ def default_sh(cmd: list[str], *, log: Path, stdin: Path | None = None, timeout:
     return _run(cmd, cwd=Path.cwd(), env=dict(os.environ), log=log, timeout=timeout, stdin=stdin)
 
 
+def remote_stop_cmd(host: str, run_id: str, remove_dir: bool) -> list[str]:
+    """The ssh command that stops a remote run: TERM its runner (whose own handler stops its process groups, removes its
+    worktrees and clears its working dirs), wait for it, KILL a runner that will not go, and optionally remove the run
+    dir.  The pid comes from the run's status file and is signalled only when its command line carries this run id."""
+    assert RUN_ID_RE.fullmatch(run_id), "unsafe run id"
+    q = shlex.quote
+    rrun = f"{REMOTE_STATE}/runs/{run_id}"
+    script = (f"pid=$(sed -n 's/.*\"pid\": *\\([0-9][0-9]*\\).*/\\1/p' {q(rrun)}/status.json 2>/dev/null | head -n 1); "
+              f"if [ -n \"$pid\" ] && tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -q -- '--run-id {run_id}'; then "
+              f"kill -TERM \"$pid\"; i=0; while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 120 ]; do sleep 0.5; i=$((i+1)); done; "
+              f"kill -0 \"$pid\" 2>/dev/null && kill -KILL \"$pid\"; fi; "
+              + (f"rm -rf {q(rrun)}; " if remove_dir else "") + "true")
+    return ["ssh", *SSH_OPTS, host, script]
+
+
+def rederive_leg(leg: dict, sha: str) -> list[str]:
+    """What the laptop can redo from the junit files it copied back, against what the remote leg JSON claims: the leg's
+    sha, every job's counts and skip reasons, and the set of red nodeids.  Any disagreement is a string; none = [].
+    The junit paths in `leg` must already point at the local copies."""
+    errs: list[str] = []
+    if leg.get("sha") != sha:
+        errs.append(f"the leg JSON records sha {leg.get('sha')!r}, the sha under test is {sha}")
+    for job in leg.get("jobs", []):
+        jr = job.get("junit")
+        if not jr:
+            if not job.get("setup_failed"):
+                errs.append(f"{job.get('name')}: no junit recorded")
+            continue
+        try:
+            parsed = parse_junit(Path(jr["path"]))
+        except (OSError, ET.ParseError) as e:
+            errs.append(f"{job.get('name')}: the copied junit does not parse ({e})")
+            continue
+        if parsed["counts"] != job["counts"]:
+            errs.append(f"{job['name']}: the leg JSON counts {job['counts']} but its junit holds {parsed['counts']}")
+        if parsed["skips_by_reason"] != job.get("skips_by_reason", {}):
+            errs.append(f"{job['name']}: the leg JSON skip reasons differ from its junit")
+        got = sorted(r["nodeid"] for r in parsed["reds"])
+        want = sorted(r["nodeid"] for r in job["reds"])
+        if got != want:
+            errs.append(f"{job['name']}: the red tests in the leg JSON differ from its junit (junit only: "
+                        f"{sorted(set(got) - set(want))[:3]}, leg JSON only: {sorted(set(want) - set(got))[:3]})")
+    return errs
+
+
 def run_leg_remote(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger, status: Status | None, *,
                    host: str = REMOTE_HOST, workers: int = WORKERS_LINUX, timeout: float = 4 * 3600,
                    sh=default_sh, script: Path | None = None) -> dict:
-    """Ship the sha as a bundle over ssh, run this same script there with --here, copy the leg JSON and junit back.
+    """Ship the sha as a bundle over ssh, run this same script there with --here, copy the leg JSON and junit back, and
+    re-derive the leg from the copied junit.  A failure after the runner started stops the remote run.
     `sh(cmd, log=, stdin=, timeout=) -> exit code` is the only way out of the process; tests substitute it."""
     script = script or Path(__file__).resolve()
     ldir = run / "linux"
@@ -948,7 +1273,7 @@ def run_leg_remote(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger,
     log = run / "linux.log"
     q = shlex.quote
     rrun = f"{REMOTE_STATE}/runs/{run_id}"
-    assert re.fullmatch(r"[0-9A-Za-z-]+", run_id) and re.fullmatch(r"[0-9a-f]{40}", sha), "unsafe run id or sha"
+    assert RUN_ID_RE.fullmatch(run_id) and re.fullmatch(r"[0-9a-f]{40}", sha), "unsafe run id or sha"
     ref = f"refs/verify/{sha[:12]}"
     main_ref = f"refs/remotes/{MAIN_REF}"
     bundle = ldir / "sha.bundle"
@@ -970,29 +1295,38 @@ def run_leg_remote(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger,
             raise RuntimeError(f"git bundle failed (is {MAIN_REF} present?): {b.stderr.strip()}")
     finally:
         git(repo, "update-ref", "-d", ref, check=False)
+    base = git(repo, "rev-parse", "--verify", f"{main_ref}^{{commit}}").stdout.strip()
 
-    step("shipping the bundle", ssh + [f"mkdir -p {q(rrun)}/xfer && cat > {q(rrun)}/xfer/sha.bundle"], stdin=bundle)
-    step("shipping the runner", ["scp", "-q", *SSH_OPTS, str(script), f"{host}:{rrun}/verify.py"])
-    remote = (f"cd {q(rrun)} && git init -q xfer/repo && "
-              f"git -C xfer/repo fetch -q ../sha.bundle +{ref}:{ref} +{main_ref}:{main_ref} && "
-              f"python3 verify.py run --here --leg linux --sha {sha} --repo xfer/repo --run-id {run_id} "
-              f"--workers {int(workers)} --leg-json leg-linux.json")
-    step("running the linux leg on " + host, ssh + [remote], timeout=timeout)
-    step("copying the leg JSON back", ["scp", "-q", *SSH_OPTS, f"{host}:{rrun}/leg-linux.json", str(ldir) + "/"])
-    leg = json.loads((ldir / "leg-linux.json").read_text(encoding="utf-8"))
-    for job in leg.get("jobs", []):
-        jr = job.get("junit")
-        if not jr:
-            continue
-        if not re.fullmatch(r"/[A-Za-z0-9_./-]+", jr["path"]):
-            raise RuntimeError(f"linux leg: unsafe junit path in the leg JSON: {jr['path']!r}")
-        base = os.path.basename(jr["path"])
-        step(f"copying {base} back", ["scp", "-q", *SSH_OPTS, f"{host}:{jr['path']}", str(ldir) + "/"])
-        local = ldir / base
-        got = sha256_file(local) if local.exists() else None
-        if got != jr["sha256"]:
-            raise RuntimeError(f"linux leg: {base} copied back with sha256 {got}, the leg recorded {jr['sha256']}")
-        jr["path"] = str(local)
+    try:
+        step("shipping the bundle", ssh + [f"mkdir -p {q(rrun)}/xfer && cat > {q(rrun)}/xfer/sha.bundle"], stdin=bundle)
+        step("shipping the runner", ["scp", "-q", *SSH_OPTS, str(script), f"{host}:{rrun}/verify.py"])
+        remote = (f"cd {q(rrun)} && git init -q xfer/repo && "
+                  f"git -C xfer/repo fetch -q ../sha.bundle +{ref}:{ref} +{main_ref}:{main_ref} && "
+                  f"python3 verify.py run --here --leg linux --sha {sha} --repo xfer/repo --run-id {run_id} "
+                  f"--workers {int(workers)} --leg-json leg-linux.json --base-sha {base}")
+        step("running the linux leg on " + host, ssh + [remote], timeout=timeout)
+        step("copying the leg JSON back", ["scp", "-q", *SSH_OPTS, f"{host}:{rrun}/leg-linux.json", str(ldir) + "/"])
+        leg = json.loads((ldir / "leg-linux.json").read_text(encoding="utf-8"))
+        for job in leg.get("jobs", []):
+            jr = job.get("junit")
+            if not jr:
+                continue
+            if not re.fullmatch(r"/[A-Za-z0-9_./-]+", jr["path"]):
+                raise RuntimeError(f"linux leg: unsafe junit path in the leg JSON: {jr['path']!r}")
+            base_name = os.path.basename(jr["path"])
+            step(f"copying {base_name} back", ["scp", "-q", *SSH_OPTS, f"{host}:{jr['path']}", str(ldir) + "/"])
+            local = ldir / base_name
+            got = sha256_file(local) if local.exists() else None
+            if got != jr["sha256"]:
+                raise RuntimeError(f"linux leg: {base_name} copied back with sha256 {got}, the leg recorded {jr['sha256']}")
+            jr["path"] = str(local)
+    except BaseException:
+        try:
+            sh(remote_stop_cmd(host, run_id, remove_dir=False), log=log, timeout=90)
+        except Exception:  # noqa: BLE001 - a failed cleanup must not hide the failure that caused it
+            pass
+        raise
+    leg["integrity"] = rederive_leg(leg, sha)
     leg["remote_run"] = f"{host}:{rrun}"
     apply_ledger_to_leg(leg, ledger, run_id, sha)
     leg["load_reds"] = sum(1 for j in leg.get("jobs", []) for r in j["reds"] if r["class"] == "load")
@@ -1114,12 +1448,37 @@ def _run_legs(a, top: Path, sha: str, run: Path, run_id: str, ledger: Ledger, st
         terminate_children()
         if t:
             t.join(30)
+            stop_remote_run(a.host, run_id)
         raise
     if t:
         t.join()
     if "linux_err" in out:
         raise out["linux_err"]
     return [out[k] for k in ("mac", "linux") if k in out]
+
+
+def stop_remote_run(host: str, run_id: str) -> None:
+    """Best effort, from the main thread and outside the tracked children (a kill is already tearing those down)."""
+    try:
+        subprocess.run(remote_stop_cmd(host, run_id, remove_dir=True), capture_output=True, timeout=180,
+                       stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError, AssertionError) as e:
+        print(f"verify: could not stop the remote run on {host}: {e}", file=sys.stderr)
+
+
+def fetch_base(top: Path) -> str:
+    """Bring the land base up to date before anything is classified, and return its sha.  With an `origin` remote the
+    fetch must succeed (a stale base would excuse a red that main has since fixed or broken); a checkout without one
+    uses the ref it has."""
+    ref = f"refs/remotes/{MAIN_REF}"
+    if git(top, "remote", "get-url", "origin", check=False).returncode == 0:
+        r = git(top, "fetch", "-q", "origin", f"+main:{ref}", check=False)
+        if r.returncode != 0:
+            raise RuntimeError(f"could not fetch origin main, so the baseline would be stale: {r.stderr.strip()}")
+    p = git(top, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False)
+    if p.returncode != 0:
+        raise RuntimeError(f"{MAIN_REF} is not present in {top}")
+    return p.stdout.strip()
 
 
 def _print_legs(legs: list[dict]) -> None:
@@ -1139,6 +1498,9 @@ def cmd_run(a) -> int:
         return 2
     if a.here and a.leg == "both":
         print("verify: --here runs one leg; name mac or linux", file=sys.stderr)
+        return 2
+    if a.run_id and not (RUN_ID_RE.fullmatch(a.run_id) and a.run_id.split("-")[1] == sha[:8]):
+        print(f"verify: --run-id {a.run_id!r} is not <UTC stamp>-<sha8>-<4 hex> for this sha", file=sys.stderr)
         return 2
     run_id = a.run_id or new_run_id(sha)
     run = state / "runs" / run_id
@@ -1160,6 +1522,10 @@ def cmd_run(a) -> int:
     try:
         sweep_runs(state, top, tools, current=run_id)
         if leg_here:
+            if a.base_sha:
+                have = git(top, "rev-parse", "--verify", f"refs/remotes/{MAIN_REF}^{{commit}}", check=False).stdout.strip()
+                if have != a.base_sha:
+                    raise RuntimeError(f"the baseline here is {have or 'absent'}, the orchestrating run pinned {a.base_sha}")
             leg_name = "mac" if a.leg == "mac" else "linux"
             leg = run_leg_local(top, sha, run, run_id, None, status, leg=leg_name,
                                 python=a.python or (MAC_PYTHON if leg_name == "mac" else LINUX_PYTHON),
@@ -1169,6 +1535,7 @@ def cmd_run(a) -> int:
             status.update(state="leg-done", leg_json=str(out), max_load=leg["max_load"], load_reds=leg["load_reds"])
             print(f"verify: leg written to {out}")
             return 0
+        status.update(base_sha=fetch_base(top))
         legs = _run_legs(a, top, sha, run, run_id, ledger, status)
         diag = [d for leg in legs for d in leg.pop("_diag", [])]
         receipt = assemble_receipt(top, sha, run_id, legs)
@@ -1177,7 +1544,7 @@ def cmd_run(a) -> int:
             if dp is not None:
                 receipt["diagnosis"] = str(dp)
         path = write_receipt(receipt, Path(a.receipts_dir) if a.receipts_dir else top / "project_memory" / "receipts")
-        status.update(state="passed" if receipt["verdict"] == "green" else "red", verdict=receipt["verdict"],
+        status.update(state={"green": "passed", "partial": "partial"}.get(receipt["verdict"], "red"), verdict=receipt["verdict"],
                       receipt=str(path), max_load=max(l["max_load"] for l in legs),
                       load_reds=sum(l.get("load_reds", 0) for l in legs))
         print(f"verify: {receipt['verdict'].upper()}  receipt {path}")
@@ -1264,8 +1631,42 @@ def cmd_sweep(a) -> int:
     repo = Path(a.repo or Path(__file__).resolve().parents[1]).resolve()
     top = Path(git(repo, "rev-parse", "--show-toplevel").stdout.strip())
     done = sweep_runs(Path(a.state_dir), top, Tools())
-    print(f"verify: sweep reaped {len(done)} run dir(s)")
+    print(f"verify: sweep cleaned {len(done)} run dir(s)")
     return 0
+
+
+def cmd_ledger(a) -> int:
+    led = Ledger(Path(a.ledger) if a.ledger else Path(a.state_dir) / "ledger.jsonl")
+    try:
+        led.attach_row(a.id, a.row)
+    except (KeyError, ValueError) as e:
+        print(f"verify: {e}", file=sys.stderr)
+        return 2
+    print(f"verify: ledger entry {a.id} now carries board row {a.row!r}")
+    return 0
+
+
+def cmd_reverdict(a) -> int:
+    """Recompute a finished run's verdict after board rows were attached, and rewrite its receipt."""
+    state = Path(a.state_dir)
+    st = read_status(state / "runs" / a.run)
+    if not st.get("receipt"):
+        print(f"verify: run {a.run} has no receipt to re-judge", file=sys.stderr)
+        return 2
+    rp = Path(st["receipt"])
+    led = Ledger(Path(a.ledger) if a.ledger else state / "ledger.jsonl")
+    try:
+        new = reverdict_receipt(json.loads(rp.read_text(encoding="utf-8")), led)
+    except (OSError, ValueError) as e:
+        print(f"verify: {e}", file=sys.stderr)
+        return 2
+    write_receipt(new, rp.parent)
+    Status(state / "runs" / a.run).update(state={"green": "passed", "partial": "partial"}.get(new["verdict"], "red"),
+                                          verdict=new["verdict"])
+    print(f"verify: {new['verdict'].upper()}  receipt {rp}")
+    for w in new["verdict_why"]:
+        print(f"verify: why {new['verdict']}: {w}")
+    return 0 if new["verdict"] == "green" else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1289,6 +1690,7 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--leg", choices=("mac", "linux", "both"), default="mac")
     rp.add_argument("--here", action="store_true", help="run the leg on THIS host and write its JSON (what the remote end runs)")
     rp.add_argument("--leg-json", default=None)
+    rp.add_argument("--base-sha", default=None, help=argparse.SUPPRESS)
     rp.add_argument("--run-id", default=None, help=argparse.SUPPRESS)
     common(rp)
     sp = sub.add_parser("start", help="launch a run detached; prints the run id and the log path")
@@ -1302,8 +1704,20 @@ def main(argv: list[str] | None = None) -> int:
     sw = sub.add_parser("sweep", help="reap earlier runs that died without cleaning up")
     sw.add_argument("--state-dir", default=str(DEFAULT_STATE))
     sw.add_argument("--repo", default=None)
+    lp = sub.add_parser("ledger", help="ledger operations")
+    lsub = lp.add_subparsers(dest="ledger_cmd", required=True)
+    ar = lsub.add_parser("attach-row", help="record the board row that owns an excused red; a re-run or reverdict then counts it")
+    ar.add_argument("--id", required=True, help="the ledger id (lg_...) the receipt printed")
+    ar.add_argument("--row", required=True, help="the board row")
+    ar.add_argument("--state-dir", default=str(DEFAULT_STATE))
+    ar.add_argument("--ledger", default=None)
+    rv = sub.add_parser("reverdict", help="recompute a finished run's verdict from the ledger's current board rows")
+    rv.add_argument("--run", required=True)
+    rv.add_argument("--state-dir", default=str(DEFAULT_STATE))
+    rv.add_argument("--ledger", default=None)
     a = ap.parse_args(argv)
-    return {"run": cmd_run, "start": cmd_start, "status": cmd_status, "sweep": cmd_sweep}[a.cmd](a)
+    return {"run": cmd_run, "start": cmd_start, "status": cmd_status, "sweep": cmd_sweep, "ledger": cmd_ledger,
+            "reverdict": cmd_reverdict}[a.cmd](a)
 
 
 if __name__ == "__main__":
