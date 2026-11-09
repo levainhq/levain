@@ -216,6 +216,47 @@ def test_r3b_an_active_launch_reporting_from_its_own_session_still_lands_and_a_p
     assert _rows(d, "SELECT landed_sha FROM ready_items WHERE id = 'levain:a' ORDER BY ver DESC LIMIT 1") == [(SHA,)]
 
 
+def _active_launch(store, token, sess="sess-L"):
+    ln = store.launch_request(token, harness="claude", role="coordinator", attach_item="levain:a")
+    assert store.launch_activate(ln.launch_id, harness_session_id=sess)[1] is None
+    return ln
+
+
+def test_r3b_rerule_a_final_landed_is_accepted_when_the_pass_ended_its_launch_first(board):
+    d, store, token = board
+    ln = _active_launch(store, token)
+    store.coord_release(token, by="coordinator")
+    with store._write() as (conn, now):
+        lease.end_launch(conn, now, ln.launch_id, "ended", "test")
+    _q(d, "r-land", worker=ln.launch_id, launch_id=ln.launch_id, event="landed", sha=SHA, branch="main",
+       harness_session_id="sess-L")
+    got = _apply(d, frozenset())
+    assert got.refused == [] and got.applied == ["r-land"]
+    assert _rows(d, "SELECT landed_sha FROM ready_items WHERE id = 'levain:a' ORDER BY ver DESC LIMIT 1") == [(SHA,)]
+
+
+def test_r3b_rerule_a_pending_launch_with_no_session_refuses_landed(board):
+    d, store, token = board
+    ln = store.launch_request(token, harness="claude", role="coordinator", attach_item="levain:a")
+    store.coord_release(token, by="coordinator")
+    _q(d, "r-land", worker=ln.launch_id, launch_id=ln.launch_id, event="landed", sha=SHA, branch="main",
+       harness_session_id="sess-X")
+    got = _apply(d, frozenset({"sess-X"}))
+    assert got.applied == [] and [rid for rid, _why in got.refused] == ["r-land"]
+
+
+def test_r3b_rerule_an_ended_launch_refuses_a_report_from_a_different_session(board):
+    d, store, token = board
+    ln = _active_launch(store, token)
+    store.coord_release(token, by="coordinator")
+    with store._write() as (conn, now):
+        lease.end_launch(conn, now, ln.launch_id, "ended", "test")
+    _q(d, "r-land", worker=ln.launch_id, launch_id=ln.launch_id, event="landed", sha=SHA, branch="main",
+       harness_session_id="sess-OTHER")
+    got = _apply(d, frozenset({"sess-OTHER"}))
+    assert got.applied == [] and [rid for rid, _why in got.refused] == ["r-land"]
+
+
 # ------------------------------------------------------------------------------------------------ R3-C
 def test_r3c_import_status_without_a_token_is_a_usage_error(tmp_path, capsys):
     status = tmp_path / "status.md"

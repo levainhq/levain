@@ -24,7 +24,7 @@ holds, never on the worker name a report carries:
   launch's: its ``worker`` must be the launch's recorded worker (the worker of the launch's attach, else the launch id),
   and, once the launch's ``active`` row records its session, the report must come from that session; else it is
   refused ``worker-mismatch``. It is recorded as that launch, kind ``launch``, whatever kind it names. An ``attach``
-  also needs the launch pending or active; every other event needs it active with its session recorded (L3 R3-B).
+  also needs the launch pending or active; every other event needs it to have recorded its session, in any state (L3 R3-B).
 * Any other report rests on its session (a flow seat). The FIRST accepted attach binds worker and session while that
   attach holds its item: a later report naming that worker from another session, or that session under another name,
   is refused ``worker-mismatch``. Its later events keep the kind its attach was recorded with (else ``kind-mismatch``),
@@ -530,13 +530,13 @@ def _evidence(conn: sqlite3.Connection, now: str, r: Mapping[str, Any], live: Co
             raise _Refused("worker-mismatch", f"launch {ln.launch_id} reports as {expect}, not as {r['worker']}")
         if r["event"] == "attach" and ln.state not in ("pending", "active"):
             raise _Refused("worker-not-a-launch", f"launch {ln.launch_id} is {ln.state}; an attach needs one that runs")
-        # every other event needs the launch running in a recorded session it came from (row 156 L3 R3-B): a launch
-        # that never activated has no session to check a report against
-        if r["event"] != "attach" and (ln.state != "active" or ln.harness_session_id is None):
-            raise _Refused("worker-not-a-launch", f"launch {ln.launch_id} is {ln.state} with "
-                                                  f"{'a' if ln.harness_session_id else 'no'} recorded session; a "
-                                                  f"{r['event']} report needs an active launch reporting from its "
-                                                  "own session")
+        # every other event needs a launch with a recorded session (row 156 L3 R3-B, re-ruled): in any state, because
+        # the pass ends launches before it applies the board, so a worker's last act can meet its launch already ended;
+        # the session check above then holds the report to that recorded session
+        if r["event"] != "attach" and ln.harness_session_id is None:
+            raise _Refused("worker-not-a-launch", f"launch {ln.launch_id} is {ln.state} with no recorded session; a "
+                                                  f"{r['event']} report needs a launch that recorded the session it "
+                                                  "reports from")
         return "real", ln
     if sid is None:
         raise _Refused("worker-not-a-launch", "the report names no launch of this store and no session")
