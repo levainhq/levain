@@ -554,7 +554,7 @@ def test_off_darwin_every_flush_is_fsync(tmp_path, monkeypatch):
 
 # ---- T17 ----------------------------------------------------------------------------------------------------------
 
-STDLIB = {"__future__", "asyncio", "datetime", "enum", "errno", "fcntl", "functools", "inspect", "json", "logging",
+STDLIB = {"__future__", "asyncio", "datetime", "enum", "errno", "fcntl", "functools", "hashlib", "inspect", "json", "logging",
           "os", "queue", "re", "secrets", "sys", "threading", "time", "typing"}
 #: `lineage` left this list at the `/3` bump (S1 3c-6a): C1_DESIGN's own 3c-6 row and R4 §3 put the `lineage-acked`
 #: kind, the payload and the outbox in this module; it still knows no record schema (the payload is keys' dict)

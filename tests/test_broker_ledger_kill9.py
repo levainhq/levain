@@ -335,3 +335,41 @@ def test_t23_a_blocked_flush_does_not_keep_the_process_alive_and_the_lock_is_fre
         check_i3(re.raw)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+# ---- the run-final record (W3-3b): kill -9 between the run's last ack line and its count --------------------------------
+
+RUN_ID = "r-0123456789abcdef"
+
+
+@pytest.mark.parametrize("mode, written", [("final-w1", False), ("final-w2", True)])
+def test_a_kill_between_the_last_ack_and_the_run_final_reopens_to_the_same_count(interpreter, mode, written):
+    d = tempfile.mkdtemp(prefix="b2f", dir="/tmp")
+    try:
+        run = Run(d, interpreter, mode)
+        run.kill_at_gate()
+        acked = [tuple(t) for e in run.events() if e["at"] == "acked" for t in e["triples"]]
+        assert len(acked) == 2
+        before = [o["kind"] for o in _lines(_complete(run.before))]
+        assert "lineage-acked" in before and ("run-final" in before) is written   # w2: written, never flushed
+
+        async def reopen() -> None:
+            led = L.Ledger.open(run.path)
+            led.attach(asyncio.get_running_loop())
+            try:
+                if written:
+                    assert led.run_finalized(RUN_ID) and led.open_runs() == []
+                else:
+                    assert led.open_runs() == [RUN_ID] and led.run_ready(RUN_ID)
+                    await led.run_final(RUN_ID)
+            finally:
+                await led.aclose(5.0)
+
+        asyncio.run(reopen())
+        with open(run.path, "rb") as f:
+            finals = [o for o in _lines(f.read()) if o["kind"] == "run-final"]
+        assert len(finals) == 1
+        pay = finals[0]["meta"]["lineage"]
+        assert (pay["rows"], pay["quarantined"], pay["triples_digest"]) == (2, 0, L.triples_digest(acked))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)

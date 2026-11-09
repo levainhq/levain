@@ -18,6 +18,7 @@ import pytest
 from levain.agents import session as S
 from levain.agents import session_launcher as L
 from levain.agents.accounting import ActionExposure, Usage
+from levain.broker.ledger import triples_digest
 from levain.slot import Refused
 from levain.slot import control as C
 from levain.slot import dispatch_usage as DU
@@ -260,11 +261,31 @@ def test_spend_is_read_only_after_end_is_proven(tmp_path):
 
 # --- the lineage spend reader ------------------------------------------------------------------------------------------
 
+_LEDGER, _EPOCH = "a" * 32, "b" * 32
+_NEXT_REF = [0]
+
+
 def _row(run, settled="yes", cost=100, hold=150, **kw):
+    _NEXT_REF[0] += 1
     r = {"format": DU._LINEAGE_FORMAT, "run_id": run, "settled": settled, "cost_microdollars": cost,
-         "hold_microdollars": hold, "seq": 1}
+         "hold_microdollars": hold, "seq": _NEXT_REF[0],
+         "source": {"ledger": _LEDGER, "epoch": _EPOCH, "ref": _NEXT_REF[0]}}
     r.update(kw)
     return r
+
+
+def _final(run, sink_rows, **kw):
+    """The run-final row keys writes for `rows`' run rows (its own `quarantined` is a COUNT)."""
+    mine = [r for r in sink_rows if r.get("run_id") == run and r.get("format") == DU._LINEAGE_FORMAT
+            and "quarantined" not in r]
+    f = {"format": DU._FINAL_FORMAT, "run_id": run, "rows": len(mine), "quarantined": 0,
+         "triples_digest": triples_digest([r["source"] or {"ledger": _LEDGER, "epoch": _EPOCH, "ref": 0} for r in mine]), "at": "2026-11-09T00:00:00Z", "seq": 9_000}
+    f.update(kw)
+    return f
+
+
+def _closed(rows, run=RUN, **kw):
+    return list(rows) + [_final(run, rows, **kw)]
 
 
 def _sink(tmp_path, rows, tail=b"\n"):
@@ -275,49 +296,49 @@ def _sink(tmp_path, rows, tail=b"\n"):
 
 def test_the_lineage_sum_is_the_runs_rows_only(tmp_path):
     other = "r-fedcba9876543210"
-    p = _sink(tmp_path, [_row(RUN, cost=100), _row(other, cost=9_999), _row(RUN, cost=250), _row(RUN, "no", None, 40),
-                         _row(RUN, "uncertain", None, 70), _row(RUN, "uncertain", 90, 60), _row(RUN, "yes", None, 11)])
+    rows = [_row(RUN, cost=100), _row(other, cost=9_999), _row(RUN, cost=250), _row(RUN, "no", None, 40),
+            _row(RUN, "uncertain", None, 70), _row(RUN, "uncertain", 90, 60), _row(RUN, "yes", None, 11)]
+    p = _sink(tmp_path, _closed(rows) + [_final(other, rows)])
     # 100 + 250 + 0 (released) + 70 (uncertain, hold) + 90 (uncertain, max(cost, hold)) + 11 (cost unsaid: the hold)
-    assert DU.lineage_spend(p, RUN, final_rows=6) == 521
-    assert DU.lineage_spend_reader(p, final_rows=lambda run_id: 1)(other) == 9_999
+    assert DU.lineage_spend(p, RUN) == 521
+    assert DU.lineage_spend_reader(p, wait_s=0)(other) == 9_999
 
 
 @pytest.mark.parametrize("why,rows,tail", [
-    ("no row for the run", [_row("r-fedcba9876543210")], b"\n"),
-    ("a torn tail", [_row(RUN), _row(RUN)], b""),
-    ("a quarantine row (it names no run)", [_row(RUN), {"format": DU._LINEAGE_FORMAT, "seq": 2, "quarantined": "record"}], b"\n"),
-    ("a foreign format", [_row(RUN), {"format": "x", "run_id": RUN}], b"\n"),
-    ("a figure that is no micro-dollar count", [_row(RUN, cost=-1)], b"\n"),
-    ("a bool figure", [_row(RUN, cost=True)], b"\n"),
-    ("an unknown settled word", [_row(RUN, settled="maybe")], b"\n"),
-    ("a missing hold", [_row(RUN, hold=None)], b"\n"),
+    ("no row and no final for the run", [_row("r-fedcba9876543210")], b"\n"),
+    ("a torn tail", _closed([_row(RUN), _row(RUN)]), b""),
+    ("a foreign format", _closed([_row(RUN)]) + [{"format": "x", "run_id": RUN}], b"\n"),
+    ("a figure that is no micro-dollar count", _closed([_row(RUN, cost=-1)]), b"\n"),
+    ("a bool figure", _closed([_row(RUN, cost=True)]), b"\n"),
+    ("an unknown settled word", _closed([_row(RUN, settled="maybe")]), b"\n"),
+    ("a missing hold", _closed([_row(RUN, hold=None)]), b"\n"),
+    ("a row with no source", _closed([_row(RUN, source=None)]), b"\n"),
 ])
 def test_a_sink_that_cannot_be_read_whole_is_none(tmp_path, why, rows, tail):
-    # the proof matches the run's rows in each case (one when none), so only the named fault makes it None
-    proof = sum(1 for r in rows if r.get("run_id") == RUN) or 1
-    assert DU.lineage_spend(_sink(tmp_path, rows, tail), RUN, final_rows=proof) is None, why
+    assert DU.lineage_spend(_sink(tmp_path, rows, tail), RUN) is None, why
 
 
 def test_a_sink_that_is_not_json_or_has_nan_or_is_missing_or_a_link_is_none(tmp_path):
     p = tmp_path / "l.jsonl"
     p.write_bytes(b"not json\n")
-    assert DU.lineage_spend(p, RUN, final_rows=1) is None
-    p.write_bytes(json.dumps(_row(RUN)).replace("100", "NaN").encode() + b"\n")
-    assert DU.lineage_spend(p, RUN, final_rows=1) is None
-    assert DU.lineage_spend(tmp_path / "absent", RUN, final_rows=1) is None
-    good = _sink(tmp_path, [_row(RUN)])
-    assert DU.lineage_spend(good, RUN, final_rows=1) == 100       # the control: the same sink reads with its proof
+    assert DU.lineage_spend(p, RUN) is None
+    r = _row(RUN)
+    p.write_bytes((json.dumps(r).replace("100", "NaN") + "\n" + json.dumps(_final(RUN, [r])) + "\n").encode())
+    assert DU.lineage_spend(p, RUN) is None
+    assert DU.lineage_spend(tmp_path / "absent", RUN) is None
+    good = _sink(tmp_path, _closed([_row(RUN)]))
+    assert DU.lineage_spend(good, RUN) == 100         # the control: the same sink reads with its final
     link = tmp_path / "link"
     os.symlink(good, link)
-    assert DU.lineage_spend(link, RUN, final_rows=1) is None      # REVERT: O_NOFOLLOW
-    assert DU.lineage_spend(good, "", final_rows=1) is None and DU.lineage_spend(good, None, final_rows=1) is None
-    assert DU.lineage_spend(7, RUN, final_rows=1) is None
+    assert DU.lineage_spend(link, RUN) is None        # REVERT: O_NOFOLLOW
+    assert DU.lineage_spend(good, "") is None and DU.lineage_spend(good, None) is None
+    assert DU.lineage_spend(7, RUN) is None
 
 
 def test_an_over_long_line_is_none(tmp_path):
     p = tmp_path / "l.jsonl"
     p.write_bytes(json.dumps(_row(RUN, pad="x" * DU._LINE_MAX)).encode() + b"\n")
-    assert DU.lineage_spend(p, RUN, final_rows=1) is None
+    assert DU.lineage_spend(p, RUN) is None
 
 
 # --- the real CONTROL: ROUTE-RESOLVE and the priced mint ------------------------------------------------------------
@@ -526,35 +547,190 @@ def test_a_mint_refused_keys_unavailable_is_transient_and_the_next_spawn_retakes
     assert ln.index.get(KEY)["state"] == "started" and len(runtime.starts) == 1
 
 
-# --- L3 wave3 r1: codex HIGH 3 + complement MED 2, no spend without a completeness proof ------------------------------
+# --- the run-final proof (W3-3b): the reader settles on the final row alone -----------------------------------------------
+
+OTHER = "r-fedcba9876543210"
+
+
+class _Wall:
+    """A fake clock whose sleep advances it: a wait of any length costs no time, and its ticks are countable."""
+
+    def __init__(self, on_sleep=None):
+        self.now, self.sleeps, self.on_sleep = 0.0, 0, on_sleep
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, s):
+        self.now += s
+        self.sleeps += 1
+        if self.on_sleep is not None:
+            self.on_sleep(self.sleeps)
+
 
 def test_a_partially_delivered_lineage_never_settles_low(tmp_path):
-    # the run made two calls (100 and 900); keys' sender has delivered only the first when END is proven
-    p = _sink(tmp_path, [_row(RUN, cost=100, hold=100)])
-    # REVERT: returning the sum without the completeness proof (it settles at 100 and releases 900 for good)
+    # the run made two calls (100 and 900); keys' sender has delivered only the first when END is proven: no final yet
+    first, second = _row(RUN, cost=100, hold=100), _row(RUN, cost=900, hold=900)
+    p = _sink(tmp_path, [first])
+    # REVERT: summing without the final row (it settles at 100 and releases 900 for good)
     assert DU.lineage_spend(p, RUN) is None
-    assert DU.lineage_spend_reader(p)(RUN) is None
-    assert DU.lineage_spend(p, RUN, final_rows=2) is None              # the proof says two; the sink holds one
-    ln, _, _ = bbuild(tmp_path / "ln", spend=DU.lineage_spend_reader(p))
+    assert DU.lineage_spend_reader(p, wait_s=0)(RUN) is None
+    ln, _, _ = bbuild(tmp_path / "ln", spend=DU.lineage_spend_reader(p, wait_s=0))
     _ended(ln)
     assert ln.usage(KEY).usd_micros is None                            # the whole reservation, never 100
-    p2 = _sink(tmp_path / "ln", [_row(RUN, cost=100, hold=100), _row(RUN, cost=900, hold=900)])
-    assert DU.lineage_spend(p2, RUN, final_rows=2) == 1_000
-    assert DU.lineage_spend_reader(p2, final_rows=lambda run_id: 2)(RUN) == 1_000
+    # a final that counts ONE row while the sink holds two (and the reverse) is no proof
+    assert DU.lineage_spend(_sink(tmp_path / "ln", [first, second, _final(RUN, [first])]), RUN) is None
+    assert DU.lineage_spend(_sink(tmp_path / "ln", [first, _final(RUN, [first, second], rows=2)]), RUN) is None
+    p2 = _sink(tmp_path / "ln", _closed([first, second]))
+    assert DU.lineage_spend(p2, RUN) == 1_000
+    assert DU.lineage_spend_reader(p2, wait_s=0)(RUN) == 1_000
 
 
-@pytest.mark.parametrize("proof", [None, -1, True, 1.5, "2", 3])
-def test_a_completeness_proof_that_is_absent_odd_or_does_not_match_is_none(tmp_path, proof):
-    p = _sink(tmp_path, [_row(RUN), _row(RUN)])
-    assert DU.lineage_spend(p, RUN, final_rows=proof) is None
+def test_a_digest_that_differs_is_none(tmp_path):
+    # the count agrees, one source triple is not the one the final hashed (a row swapped for another run's, a forged ref)
+    a, b = _row(RUN), _row(RUN)
+    forged = dict(b, source=dict(b["source"], ref=b["source"]["ref"] + 500))
+    assert DU.lineage_spend(_sink(tmp_path, _closed([a, b])), RUN) == 200          # the control
+    # REVERT: skipping the digest check (the count alone passes)
+    assert DU.lineage_spend(_sink(tmp_path, [a, forged, _final(RUN, [a, b])]), RUN) is None
+    assert DU.lineage_spend(_sink(tmp_path, _closed([a, b], triples_digest="sha256:" + "0" * 64)), RUN) is None
 
 
-def test_a_proof_of_no_rows_with_no_rows_is_zero_and_a_raising_proof_is_none(tmp_path):
-    p = _sink(tmp_path, [_row("r-fedcba9876543210")])
-    assert DU.lineage_spend(p, RUN, final_rows=0) == 0
-    assert DU.lineage_spend(p, RUN) is None
+def test_a_final_with_a_quarantine_count_is_none_and_its_quarantined_is_not_a_quarantine_row(tmp_path):
+    rows = [_row(RUN), _row(RUN)]
+    # REVERT: `"quarantined" in row` read on the final row (a clean final's 0 would be taken for a quarantine row)
+    assert DU.lineage_spend(_sink(tmp_path, _closed(rows)), RUN) == 200
+    assert DU.lineage_spend(_sink(tmp_path, _closed(rows, quarantined=1)), RUN) is None
 
-    def boom(run_id):
-        raise OSError("keys gone")
 
-    assert DU.lineage_spend_reader(p, final_rows=boom)(RUN) is None
+def test_a_quarantine_of_another_run_does_not_block_this_one(tmp_path):
+    rows = [_row(RUN), _row(OTHER, cost=7), _row(RUN, cost=50)]
+    quarantine = {"format": DU._LINEAGE_FORMAT, "seq": 5, "source": {"ledger": _LEDGER, "epoch": _EPOCH, "ref": 777},
+                  "quarantined": "record"}
+    sink = rows[:2] + [quarantine] + rows[2:]
+    # REVERT: a quarantine row anywhere returns None (the old rule: it may be this run's)
+    assert DU.lineage_spend(_sink(tmp_path, _closed(sink)), RUN) == 150
+    assert DU.lineage_spend(_sink(tmp_path, [_final(OTHER, rows, quarantined=1)] + _closed(sink)), RUN) == 150
+
+
+@pytest.mark.parametrize("why,extra", [("no final", None), ("two finals", "dup"), ("a final of another run only", "other")])
+def test_no_single_final_for_the_run_is_none(tmp_path, why, extra):
+    rows = [_row(RUN), _row(OTHER)]
+    if extra is None:
+        sink = rows
+    elif extra == "dup":
+        sink = _closed(rows) + [_final(RUN, rows)]
+    else:
+        sink = rows + [_final(OTHER, rows)]
+    assert DU.lineage_spend(_sink(tmp_path, sink), RUN) is None, why
+
+
+def test_the_reader_waits_for_the_final_and_answers_when_it_lands(tmp_path):
+    rows = [_row(RUN, cost=100, hold=100), _row(RUN, cost=900, hold=900)]
+    p = _sink(tmp_path, rows[:1])
+    final = json.dumps(_final(RUN, rows)).encode() + b"\n"
+    body = b"".join(json.dumps(r).encode() + b"\n" for r in rows)
+
+    def land(n):
+        if n == 3:
+            p.write_bytes(body[:-5])                 # the second row mid-append: a torn tail reads again
+        if n == 4:
+            p.write_bytes(body + final)
+
+    w = _Wall(land)
+    assert DU.lineage_spend_reader(p, wait_s=6.0, poll_s=0.2, clock=w.clock, sleep=w.sleep)(RUN) == 1_000
+    assert w.sleeps == 4                              # it answered at the poll the final landed, not at the deadline
+
+
+def test_the_wait_is_bounded_and_ends_in_none(tmp_path):
+    p = _sink(tmp_path, [_row(RUN)])
+    w = _Wall()
+    assert DU.lineage_spend_reader(p, wait_s=6.0, poll_s=0.2, clock=w.clock, sleep=w.sleep)(RUN) is None
+    assert 6.0 <= w.now < 6.5 and DU.FINAL_WAIT_S < 10.0       # under the client's ten-second USAGE request
+    # a torn tail that never completes is the same: None at the deadline, never a spin
+    p.write_bytes(p.read_bytes() + b'{"format": "x"')
+    w = _Wall()
+    assert DU.lineage_spend_reader(p, wait_s=1.0, poll_s=0.5, clock=w.clock, sleep=w.sleep)(RUN) is None
+    assert w.now < 2.0
+    assert DU.lineage_spend_reader(p, wait_s=0)("") is None
+
+
+def test_a_reader_that_breaks_is_none(tmp_path):
+    def boom(_):
+        raise OSError("clock gone")
+
+    assert DU.lineage_spend_reader(_sink(tmp_path, [_row(RUN)]), wait_s=1.0, sleep=boom)(RUN) is None
+
+
+@pytest.mark.parametrize("why,rows", [
+    ("a final that counts a quarantine", _closed([_row(RUN)], quarantined=1)),
+    ("a final whose row count differs", (lambda r: [r, _final(RUN, [r], rows=2)])(_row(RUN))),
+    ("a final whose digest differs", _closed([_row(RUN)], triples_digest="sha256:" + "0" * 64)),
+    ("two finals", _closed([_row(RUN)]) + [_final(RUN, [_row(RUN)])]),
+    ("a foreign format", [{"format": "x", "run_id": RUN}]),
+    ("a row with an unknown settled word", [_row(RUN, settled="maybe")]),
+])
+def test_a_permanently_bad_proof_answers_none_at_once_without_waiting(tmp_path, why, rows):
+    w = _Wall()
+    p = _sink(tmp_path, rows)
+    assert DU.lineage_spend_reader(p, wait_s=6.0, poll_s=0.2, clock=w.clock, sleep=w.sleep)(RUN) is None, why
+    assert w.sleeps == 0, why                         # a proof that cannot mend by waiting is not waited on
+
+
+def test_a_malformed_line_answers_none_at_once(tmp_path):
+    p = tmp_path / "l.jsonl"
+    p.write_bytes(b"not json\n")
+    w = _Wall()
+    assert DU.lineage_spend_reader(p, wait_s=6.0, poll_s=0.2, clock=w.clock, sleep=w.sleep)(RUN) is None
+    assert w.sleeps == 0
+
+
+def test_a_poll_resumes_where_the_last_one_stopped(tmp_path):
+    rows = [_row(RUN, cost=100, hold=100), _row(RUN, cost=900, hold=900)]
+    p = _sink(tmp_path, rows[:1])
+    src = DU._SinkRead(p, RUN, torn_is_final=False)
+    assert src.step() == (DU._RETRY, None)
+    first_end = p.stat().st_size
+    assert src._offset == first_end                   # the whole first row is behind it
+    with open(p, "ab") as fh:
+        fh.write(json.dumps(rows[1]).encode() + b"\n" + json.dumps(_final(RUN, rows)).encode() + b"\n")
+    assert src.step() == (DU._DONE, 1_000)            # the first row was not read twice (the rows count would not match)
+
+
+def test_a_waiting_read_sees_a_late_proof_that_arrives_whole(tmp_path):
+    rows = [_row(RUN, cost=100, hold=100)]
+    p = _sink(tmp_path, rows)
+    w = _Wall(lambda n: p.write_bytes(p.read_bytes() + json.dumps(_final(RUN, rows)).encode() + b"\n") if n == 2 else None)
+    assert DU.lineage_spend_reader(p, wait_s=6.0, poll_s=0.2, clock=w.clock, sleep=w.sleep)(RUN) == 100
+    assert w.sleeps == 2
+
+
+def test_waits_beyond_the_waiter_cap_take_one_look_and_no_wait(tmp_path, monkeypatch):
+    monkeypatch.setattr(DU, "MAX_WAITERS", 1)
+    p = _sink(tmp_path, [_row(RUN)])
+    w = _Wall()
+    seen = {"slept": 0, "inner": None, "inner_slept": 0, "inside": False}
+
+    def sleep(s):
+        seen["slept"] += 1
+        if seen["inside"]:
+            seen["inner_slept"] += 1
+        elif seen["inner"] is None:
+            seen["inside"] = True
+            seen["inner"] = read(RUN)                 # a second read while the first one waits
+            seen["inside"] = False
+        w.sleep(s)
+
+    read = DU.lineage_spend_reader(p, wait_s=3.0, poll_s=1.0, clock=w.clock, sleep=sleep)
+    assert read(RUN) is None and seen["inner"] is None
+    assert seen["inner_slept"] == 0 and seen["slept"] == 3     # the outer waited its three polls; the inner took one look
+
+
+def test_a_failing_fdopen_closes_the_descriptor_once_and_lineage_spend_stays_none(tmp_path, monkeypatch):
+    p = _sink(tmp_path, _closed([_row(RUN)]))
+    closed = []
+    real_close = os.close
+    monkeypatch.setattr(DU.os, "fdopen", lambda *a, **k: (_ for _ in ()).throw(MemoryError("no")))
+    monkeypatch.setattr(DU.os, "close", lambda fd: (closed.append(fd), real_close(fd))[1])
+    assert DU.lineage_spend(p, RUN) is None           # never raises
+    assert len(closed) == 1

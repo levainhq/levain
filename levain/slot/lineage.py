@@ -34,6 +34,10 @@ durable) and ``after_fsync`` (durable, membership not yet moved, nothing acked).
 point to stand for CONTROL dying there; the poison rule makes the sink behave as a dead CONTROL's would until a new
 :class:`LineageSink` starts on the same path.
 
+**The run-final record** (:data:`FINAL_FORMAT`): keys' count of one run's rows, sent in the same envelope and kept as a
+row like any other (membership, `seq`, a malformed one quarantined under the `/3` format naming its first bad field).
+Only keys' attachment can append it, so it adds no writer to the sink; CONTROL does not recount the run.
+
 Runs on the root interpreter (3.9)."""
 from __future__ import annotations
 
@@ -157,6 +161,30 @@ RECORD_CHECKS: Dict[str, Callable[[object], bool]] = {
 }
 #: a full record's keys as the sink holds it
 RECORD_KEYS = frozenset(RECORD_CHECKS) | {"seq", "source"}
+
+#: the run-final record (W3-3b): keys' completeness proof for one brokered run, riding the same envelope. CONTROL
+#: checks it by field name and type like a `/3` record and does NOT recount the run: the reader is the one verifier.
+FINAL_FORMAT = "levain-dispatch-run-final/1"
+FINAL_CHECKS: Dict[str, Callable[[object], bool]] = {
+    "format": lambda v: v == FINAL_FORMAT and type(v) is str,
+    "run_id": _str(T.RUN_ID_RE),
+    "rows": _uint(),
+    "quarantined": _uint(),
+    "triples_digest": _str(_DIGEST),
+    "at": _ts,
+}
+FINAL_KEYS = frozenset(FINAL_CHECKS) | {"seq", "source"}
+
+
+def checks_of(rec: Mapping[str, object]) -> Dict[str, Callable[[object], bool]]:
+    """The field checks a record is held to: the run-final's when its `format` names it, else the `/3` record's (so an
+    unknown format fails on `format`)."""
+    return FINAL_CHECKS if rec.get("format") == FINAL_FORMAT else RECORD_CHECKS
+
+
+def row_of(rec: Mapping[str, object]) -> Dict[str, object]:
+    """A checked record's sink row, without `seq` and `source` (those are the sink's)."""
+    return {k: rec[k] for k in checks_of(rec)}
 #: a quarantine row's keys (R4 §3 read through H6-20: no `session`, which no source carries)
 QUARANTINE_KEYS = frozenset({"format", "seq", "source", "quarantined"})
 
@@ -216,12 +244,15 @@ def check_record(rec: Mapping[str, object]) -> Optional[str]:
     """The first field of `rec` (one envelope element, its `source` already checked) that fails SCHEMAS §2.1 by name
     or type, or None for a well-formed record. A missing field is named; a key the schema does not hold (`seq`
     included: it is CONTROL's) is named when it reads as a field name, else ``record``."""
-    for name, ok in RECORD_CHECKS.items():
+    checks = checks_of(rec)
+    for name, ok in checks.items():
         if name not in rec:
             return name
         if not ok(rec[name]):
             return name
-    for k in sorted(set(rec) - set(RECORD_CHECKS) - {"source"}, key=str):
+    if checks is FINAL_CHECKS and rec["quarantined"] > rec["rows"]:   # type: ignore[operator]
+        return "quarantined"
+    for k in sorted(set(rec) - set(checks) - {"source"}, key=str):
         return k if type(k) is str and _FIELD_NAME.fullmatch(k) else "record"
     return None
 
@@ -229,10 +260,14 @@ def check_record(rec: Mapping[str, object]) -> Optional[str]:
 def _row_triple(obj: object) -> Optional[Tuple[Triple, Optional[str]]]:
     """A sink line read back: (its triple, its quarantined field or None), or None when it is not a row CONTROL
     writes (a full record of exactly :data:`RECORD_KEYS`, or a quarantine row of exactly :data:`QUARANTINE_KEYS`)."""
-    if not isinstance(obj, dict) or obj.get("format") != FORMAT:
+    if not isinstance(obj, dict) or obj.get("format") not in (FORMAT, FINAL_FORMAT):
         return None
     keys = set(obj)
-    if keys == QUARANTINE_KEYS:
+    if obj["format"] == FINAL_FORMAT:
+        if keys != FINAL_KEYS:
+            return None
+        field = None
+    elif keys == QUARANTINE_KEYS:
         field = obj["quarantined"]
         if type(field) is not str or not (field == "record" or _FIELD_NAME.fullmatch(field)):
             return None
@@ -360,7 +395,8 @@ class LineageSink:
                 obj = dict(row)
                 obj["seq"] = seq
                 obj["source"] = source_of(t)
-                field = obj.get("quarantined") if "quarantined" in obj else None
+                # a run-final's own `quarantined` is a COUNT, never the quarantine row's field name
+                field = obj["quarantined"] if obj.get("format") == FORMAT and "quarantined" in obj else None
                 lines.append(canon.canonical_bytes(obj) + b"\n")
                 fresh[t] = field             # type: ignore[assignment]
                 seq += 1
@@ -427,5 +463,6 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-__all__ = ["ENVELOPE_BYTES_MAX", "ENVELOPE_MAX", "FORMAT", "LineageSink", "QUARANTINE_KEYS", "RECORD_CHECKS", "RECORD_KEYS", "SINK",
-           "SINK_MODE", "Triple", "check_envelope", "check_record", "check_triple", "full_fsync", "source_of"]
+__all__ = ["ENVELOPE_BYTES_MAX", "ENVELOPE_MAX", "FINAL_CHECKS", "FINAL_FORMAT", "FINAL_KEYS", "FORMAT", "LineageSink",
+           "QUARANTINE_KEYS", "RECORD_CHECKS", "RECORD_KEYS", "SINK", "SINK_MODE", "Triple", "check_envelope",
+           "check_record", "check_triple", "checks_of", "full_fsync", "row_of", "source_of"]

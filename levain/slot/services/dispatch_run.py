@@ -13,8 +13,8 @@ uid's client (:mod:`levain.agents.session_client`, wire ``levain-run/1``) on a u
   (bounded, in order, base64) of the canonical snapshot manifest and the git bundle. After the authority check and
   before the pool check or any mint, the LAUNCH verifies the upload (hash identity: the server re-derives the commit and
   the object count from the manifest, ingests the bundle in a scratch clone, binds the repo-layer loosening check) and
-  refuses ``session_refused:workspace`` on any mismatch, with nothing staged (and a zero-usage ``refused`` record only
-  for a standing refusal of this connection's own upload for the key); the slot runtime later writes the verified bytes
+  refuses ``session_refused:workspace`` on any mismatch, with nothing staged and a zero-usage ``refused`` record (standing
+  for a standing refusal of this connection's own upload for the key, transient for any other); the slot runtime later writes the verified bytes
   to ``staging/repo.bundle``. One upload per connection (a WSBEGIN replaces the earlier one); the LAUNCH, whatever its
   outcome, and the connection ending drop whatever the stager did not take.
 * **RELEASE re-runs** :func:`verify_point_of_use` with the LAUNCH's proof and exposure: a link that expired, was revoked
@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import hashlib
 import logging
 import os
@@ -138,6 +139,12 @@ WAIT_MAX_S = 30.0
 MAX_CONNECTIONS = 64
 #: [judged] holder connections are capped BELOW the connection cap, so USAGE and END always find a permit
 MAX_HOLDERS = 48
+#: [judged] connections past the general cap that may each carry ONE END and nothing else: an END is the way a session
+#: stops, so USAGE or idle callers filling the general pool must never leave it unservable
+MAX_END_RESERVE = 8
+#: [judged] the absolute time an overflow connection has to deliver its whole first frame, counted from its permit
+#: and not per read or per byte: past it the connection is closed and the reserve permit freed
+END_RESERVE_FIRST_FRAME_S = 1.0
 #: [judged] how long a holder's own cleanup waits for its END job before its thread lets go (the job runs on)
 HOLDER_END_WAIT_S = 10.0
 #: [judged] how long a RELEASE refused at the point of use waits for its END job before it answers: under the client's
@@ -563,6 +570,21 @@ class HolderRegistry:
         return all(s._closing for s in self.servers)
 
 
+class _DeadlineSock:
+    """A read-only view of a socket whose every recv is bounded by what is left of ONE absolute deadline, so a peer that
+    drips bytes cannot stretch the time its first frame may take."""
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
+        self._sock, self._deadline = sock, deadline
+
+    def recv(self, n: int) -> bytes:
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("first-frame deadline")
+        self._sock.settimeout(left)
+        return self._sock.recv(n)
+
+
 class RunServer:
     """The protocol and the per-key END jobs; the socket loop is :func:`serve`. ``verify(proof, exposure)`` raises
     :class:`LauncherRefused` (production: :func:`verify_point_of_use` bound to this server's readers);
@@ -571,14 +593,14 @@ class RunServer:
     ``verify`` as :class:`FrameClaims`; without one the frames carry neither and ``verify`` gets ``None``. Servers that
     share a session index share a :class:`HolderRegistry` (``registry``); without one a server makes its own."""
 
-    #: PRE-W: the brokered server :func:`build_server` built beside this passthrough one (setting ON), else None
+    #: the brokered server :func:`build_server` built beside this passthrough one (setting not opted out), else None
     brokered: "Optional[RunServer]" = None
 
     def __init__(self, launcher: RealLauncher, *,
                  verify: Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], Any],
                  pool_free: Callable[[], bool], peer_ok: Callable[[socket.socket], bool],
                  holder_idle_s: float = HOLDER_IDLE_S, max_connections: int = MAX_CONNECTIONS,
-                 max_holders: int = MAX_HOLDERS, replica: Optional[AuthorityReplica] = None,
+                 max_holders: int = MAX_HOLDERS, max_end_reserve: int = MAX_END_RESERVE, replica: Optional[AuthorityReplica] = None,
                  uploads: Optional[WS.WorkspaceUploads] = None, registry: Optional[HolderRegistry] = None) -> None:
         if not 0 < max_holders < max_connections:
             raise ValueError("holders must be capped below the connection cap (USAGE and END need a permit)")
@@ -593,6 +615,7 @@ class RunServer:
         self._live = self._reg.live
         self._slots = threading.BoundedSemaphore(max_connections)
         self._holder_slots = threading.BoundedSemaphore(max_holders)
+        self._end_slots = threading.BoundedSemaphore(max(1, max_end_reserve))
         self._closing = False
         with self._mu:
             self._reg.servers.append(self)
@@ -609,9 +632,15 @@ class RunServer:
 
     def handle(self, sock: socket.socket) -> None:
         """Serve one connection to its end. Never raises."""
+        # The verb is in the first frame, so a connection that finds the general pool full cannot be judged by its
+        # verb at accept. It takes a permit from the small END reserve instead, is read under a short timeout, and is
+        # served only if that frame is an END (one frame, then closed); any other first frame is refused as busy.
+        end_only = False
         if not self._slots.acquire(blocking=False):
-            sock.close()
-            return
+            if not self._end_slots.acquire(blocking=False):
+                sock.close()
+                return
+            end_only = True
         mine: Optional[_Holder] = None
         owner = WS.UploadOwner()          # the workspace uploads this connection began (dropped if no LAUNCH took them)
         try:
@@ -621,18 +650,23 @@ class RunServer:
             except Exception:  # noqa: BLE001 - a peer that cannot be identified is refused
                 return
             sock.settimeout(self._idle)
+            first_frame_by = time.monotonic() + END_RESERVE_FIRST_FRAME_S if end_only else None
             while True:
                 try:
-                    req = C.read_run_frame(sock)
+                    req = C.read_run_frame(_DeadlineSock(sock, first_frame_by) if first_frame_by else sock)
                 except (C.WireError, OSError):
                     return
                 if req is None:
                     return
+                sock.settimeout(self._idle)          # the reserve deadline bounded the read, not the answer
                 try:
                     rid, op = C.check_run_request(req)
                 except C.WireError as exc:
                     self._send(sock, C.refused_answer(None, "protocol-mismatch" if str(exc) == "protocol-mismatch"
                                                        else "bad-request", str(exc)))
+                    return
+                if end_only and op != "END":
+                    self._send(sock, C.refused_answer(rid, "busy", "the connection pool is full", "transient"))
                     return
                 try:
                     ans, mine = self._op(op, req, rid, mine, owner)
@@ -644,7 +678,7 @@ class RunServer:
                 except Exception as exc:  # noqa: BLE001
                     _report_failure(op, exc)
                     ans = C.refused_answer(rid, "internal-error", _refusal_cause(exc), reason_class="transient")
-                if not self._send(sock, ans):
+                if not self._send(sock, ans) or end_only:
                     return
         finally:
             if self._uploads is not None:
@@ -655,7 +689,7 @@ class RunServer:
                 sock.close()
             except OSError:
                 pass
-            self._slots.release()
+            (self._end_slots if end_only else self._slots).release()
 
     @staticmethod
     def _send(sock: socket.socket, ans: dict) -> bool:
@@ -681,12 +715,29 @@ class RunServer:
             if mine is not None:
                 raise C.WireError("one launch per connection")
             try:
-                claims = self._claims(req, bar=True)
+                # the launch first (it reads neither claim), so every refusal after it names the key it refuses
                 launch, proof = C.launch_from_wire({k: v for k, v in req.items() if k not in ("ledger_head", "bar")})
-                grant = self._verify(proof, launch.exposure, claims)
-                launch = self._priced(launch, grant)
-                launch = self._workspace_of(launch, owner, proof, grant)
-                self._pool()
+                try:
+                    claims = self._claims(req, bar=True)
+                    grant = self._verify(proof, launch.exposure, claims)
+                    launch = self._priced(launch, grant)
+                    launch = self._workspace_of(launch, owner, proof, grant)
+                    self._pool()
+                except WS.WorkspaceRefused as exc:
+                    # standing only for a refusal of this connection's own upload (``exc.tombstone``); any other is
+                    # recorded transient, so the same occurrence retakes the key (L3 w3client r2 A2, deepseek)
+                    self._refuse_unspawned(launch, exc, reason_class=None if exc.tombstone else "transient")
+                    raise
+                except LauncherRefused as exc:
+                    self._refuse_unspawned(launch, exc)
+                    raise
+                except C.WireError as exc:      # the frame's claims off the wire: answered ``bad-request`` below
+                    self._refuse_unspawned(launch, LauncherRefused("bad-request", str(exc)))
+                    raise
+                except Exception as exc:  # noqa: BLE001 - answered ``internal-error``: nothing was spawned either
+                    self._refuse_unspawned(launch, LauncherRefused("internal-error", type(exc).__name__,
+                                                                   reason_class="transient"))
+                    raise
                 holder = self._spawn(launch, proof, claims)
             finally:
                 # every LAUNCH ends this connection's upload BEFORE its answer is sent: a held-for-spawn upload was
@@ -790,11 +841,12 @@ class RunServer:
     def _workspace_of(self, launch: Any, owner: Optional[WS.UploadOwner], proof: Any = None, grant: Any = None) -> Any:
         """The LAUNCH's workspace judgment, after the authority check and before the pool check or any mint: the launch
         itself when it names none and no upload exists; the launch with its member's ``manifest_digest`` filled by the
-        server's own derivation when the upload verifies; else ``session_refused:workspace``. Only a standing refusal of
-        the upload THIS connection holds for the key (``exc.tombstone``) is recorded as the zero-usage ``refused``
-        tombstone (:meth:`RealLauncher.refuse_key`), so the fire's usage read settles at nothing; a refusal for no
-        upload here, a foreign one, or a transient host failure writes nothing, as a pool refusal writes nothing, so
-        it never poisons another connection's upload or a retry (L3 w1srv r1, gemini HIGH 1, codex MED 2 and 4)."""
+        server's own derivation when the upload verifies; else ``session_refused:workspace``. The LAUNCH records every
+        such refusal as the zero-usage ``refused`` tombstone, so the fire's usage read settles at nothing. Only a
+        standing refusal of the upload THIS connection holds for the key (``exc.tombstone``) is recorded standing; a
+        refusal for no upload here, a foreign one, or a transient host failure is recorded transient, which the same
+        occurrence's retry retakes, so it never poisons another connection's upload or a retry (L3 w1srv r1, gemini
+        HIGH 1, codex MED 2 and 4; L3 w3client r2 A2, deepseek)."""
         try:
             if self._uploads is None:
                 if launch.workspace is None:
@@ -804,9 +856,6 @@ class RunServer:
                                       launch.workspace, signed_withhold=lambda: self._signed_withhold(proof, grant))
         except WS.WorkspaceRefused as exc:
             _log.warning("workspace refused for %s: %s", launch.session_key, exc.cause)
-            refuse = getattr(self.launcher, "refuse_key", None)
-            if exc.tombstone and refuse is not None:
-                refuse(launch.session_key, WS.WORKSPACE_REFUSAL, occurrence_id=launch.occurrence_id)
             raise
         return launch if ws is None else dataclasses.replace(launch, workspace=ws)
 
@@ -981,6 +1030,22 @@ class RunServer:
         if not free:
             raise LauncherRefused("no-free-slot", _NO_FREE_SLOT_DETAIL, reason_class="transient")
 
+    def _refuse_unspawned(self, launch: Any, exc: LauncherRefused, *, reason_class: Optional[str] = None) -> None:
+        """A LAUNCH refused before the launcher was asked to spawn started nothing: record its key as the zero-usage
+        ``refused`` tombstone (:meth:`RealLauncher.refuse_key`), so the fire's usage read settles at nothing instead
+        of at the caps (L3 w3client r1, codex HIGH 1). Not for a key a live holder holds (its spawn writes the record),
+        and only where the key holds no record. A transient refusal stays retakable by the same occurrence;
+        ``reason_class`` records the refusal under another class than its own (a workspace refusal that is not this
+        connection's to make standing)."""
+        refuse = getattr(self.launcher, "refuse_key", None)
+        if refuse is None:
+            return
+        with self._mu:
+            if launch.session_key in self._live:
+                return
+        refuse(launch.session_key, exc.name, occurrence_id=launch.occurrence_id,
+               reason_class=reason_class or exc.reason_class)
+
     # -- holders -----------------------------------------------------------------------------------------------------
 
     def _spawn(self, launch: Any, proof: C.LinkProof, claims: Optional[FrameClaims] = None) -> _Holder:
@@ -988,14 +1053,20 @@ class RunServer:
         ``_live`` BEFORE the blocking spawn, in the same critical section that reads ``_closing``, so a shutdown's
         snapshot holds every spawn that can still produce a session; refused transient while the server is stopping."""
         key = launch.session_key
+        unspawned: Optional[LauncherRefused] = None
         with self._mu:
-            if self._closing:
-                raise LauncherRefused("server-stopping", "the run server is stopping", reason_class="transient")
             if key in self._live:       # the registry's: a key held on the sibling socket is held here too
+                # never recorded as refused: the record is the holder's spawn's to write
                 raise LauncherRefused("session-key-already-used", "this server already holds a session under this key")
-            if not self._holder_slots.acquire(blocking=False):
-                raise LauncherRefused("no-holder-capacity", "every holder slot is taken", reason_class="transient")
-            holder = self._live[key] = _Holder(key, proof, launch.exposure, claims, owner=self)
+            if self._closing:
+                unspawned = LauncherRefused("server-stopping", "the run server is stopping", reason_class="transient")
+            elif not self._holder_slots.acquire(blocking=False):
+                unspawned = LauncherRefused("no-holder-capacity", "every holder slot is taken", reason_class="transient")
+            else:
+                holder = self._live[key] = _Holder(key, proof, launch.exposure, claims, owner=self)
+        if unspawned is not None:
+            self._refuse_unspawned(launch, unspawned)       # outside ``mu``: it writes the index
+            raise unspawned
         try:
             child = self.launcher.spawn(launch)
         except BaseException:
@@ -1179,15 +1250,38 @@ class RunServer:
 
 # --- the process --------------------------------------------------------------------------------------------------------
 
+#: accept errors a listener lives through (out of descriptors, a peer that went before its accept, a signal): the
+#: loop waits this long and accepts again
+_ACCEPT_RETRY = frozenset({errno.EMFILE, errno.ENFILE, errno.ECONNABORTED, errno.EINTR, errno.ENOBUFS, errno.ENOMEM})
+_ACCEPT_BACKOFF_S = 0.1
+#: a run of retried accept errors logs its first and then every this many (L3 w3client r2 L1, complement)
+_ACCEPT_LOG_EVERY = 100
+
+
 def serve(server: RunServer, listener: socket.socket, stop: threading.Event) -> None:
+    """Accept until ``stop``. A recoverable accept error is waited out; any other sets ``stop``, so the process (both
+    listeners) exits and the service manager starts it again, never one socket dead beside a live one (L3 w3client
+    r1, codex MED 3)."""
     listener.settimeout(0.5)
+    retried = 0                         # retried accept errors since the last accept that returned a connection
     while not stop.is_set():
         try:
             conn, _ = listener.accept()
         except socket.timeout:
             continue
-        except OSError:
+        except OSError as exc:
+            if exc.errno in _ACCEPT_RETRY:
+                retried += 1
+                if retried % _ACCEPT_LOG_EVERY == 1 or _ACCEPT_LOG_EVERY == 1:
+                    print(f"levain dispatch-run: accept failed ({type(exc).__name__}: {exc}); retrying "
+                          f"(retry {retried} of this run)", file=sys.stderr, flush=True)
+                stop.wait(_ACCEPT_BACKOFF_S)
+                continue
+            print(f"levain dispatch-run: accept failed ({type(exc).__name__}: {exc}); stopping for a restart",
+                  file=sys.stderr, flush=True)
+            stop.set()
             return
+        retried = 0
         threading.Thread(target=server.handle, args=(conn,), daemon=True).start()
 
 
@@ -1221,7 +1315,7 @@ def _parser(host: str) -> argparse.ArgumentParser:
     ap.add_argument("--operator-uid", type=int, default=None)
     from levain.slot.layout import policy_dispatch_auth_path
     ap.add_argument("--auth-setting", default=str(policy_dispatch_auth_path(host)),
-                    help="PRE-W: root's brokered setting (absent: OFF, the passthrough server only)")
+                    help="root's brokered setting (absent: ON, the brokered server serves beside the passthrough one; 'passthrough' opts out)")
     return ap
 
 
@@ -1246,7 +1340,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from levain.slot.layout import operator_record_path
         from levain.slot.services.control import _operator_uid
         op_uid = a.operator_uid if a.operator_uid is not None else _operator_uid(Path(a.operator_record or operator_record_path(host)))
-        # PRE-W, DEFAULT OFF: root's setting adds the brokered server on its own socket; OFF serves exactly as before
+        # the brokered server is ON unless root's setting opts out; it serves on its own socket beside run.sock
         auth, why = read_dispatch_auth(a.auth_setting)
         if why is not None:
             print(f"levain dispatch-run: brokered launcher off: {why}", file=sys.stderr, flush=True)
@@ -1317,18 +1411,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, *, brokered: bool = False) -> RunServer:
-    """The PASSTHROUGH server (L3 wave3 r1, codex HIGH 1). With ``brokered`` (PRE-W: root's setting ON,
-    :func:`read_dispatch_auth`; default OFF) it also builds, as the returned server's ``brokered``, a BROKERED server: a
+    """The PASSTHROUGH server (L3 wave3 r1, codex HIGH 1). With ``brokered`` (:func:`read_dispatch_auth`: ON unless
+    root's setting opts out; the parameter itself defaults False, so a caller that names none builds the one server) it
+    also builds, as the returned server's ``brokered``, a BROKERED server: a
     separately constructed ``RealLauncher(auth="brokered")`` whose usage is ``spend=lineage_spend_reader(L/lineage/
-    lineage.jsonl)`` with no completeness proof (none exists yet: every read is None, so every brokered run settles at
-    its WHOLE share, the fail-closed rule), behind its own ``replica_verifier(replica, billing="api_key")``, served by
+    lineage.jsonl)``, which waits (bounded) for keys' run-final row and settles on it alone (a run with no final settles
+    at its WHOLE share, the fail-closed rule), behind its own ``replica_verifier(replica, billing="api_key")``, served by
     :func:`main` on its own socket (:data:`BROKERED_SOCKET_NAME`). The two share the runtime, the usage sources, the
     session index (one record directory, keyed by attempt id), the ONE replica (two replica objects on one directory
     would contend on its append lock), the ONE uploads (a second sweep would delete the first's staging) and the ONE
     :class:`HolderRegistry` (a key is one session whichever socket launched it, so SYNC and END reach it from either). Both
     servers come from the one ``RunServer(`` call below with ``replica=replica`` (the claims=None ruling's pin). The
-    client's ``build_launcher`` handing an ``api_key`` occurrence a brokered client is NOT wired yet, so no real fire
-    reaches the brokered socket. Never mutate a shared launcher's ``auth`` per request: concurrent launches and later
+    client's ``build_launcher`` sends an ``api_key`` occurrence to the brokered socket and a subscription one to
+    ``run.sock``; only an END of a brokered session whose socket is gone is sent to ``run.sock``. Never mutate a shared launcher's ``auth`` per request: concurrent launches and later
     USAGE reads would race on it.
 
     The production wiring: the real ports behind :class:`RealLauncher`, and the authority REPLICA at
@@ -1367,23 +1462,28 @@ def build_server(host: str, store: Path, control_sock: Path, operator_uid: int, 
     return servers[0]
 
 
-#: PRE-W: the whole content of ``L/policy/dispatch_auth`` that turns the brokered launcher ON
+#: the whole content of ``L/policy/dispatch_auth`` that turns the brokered launcher ON (an install that opted in
+#: before the default flipped keeps it)
 DISPATCH_AUTH_ON = b"brokered\n"
-#: PRE-W: the brokered server's socket, beside the passthrough one (``run.sock``): the billing decision is which
-#: socket a fire reached, never a per-request change of a shared launcher
-BROKERED_SOCKET_NAME = "run-brokered.sock"
+#: the whole content of ``L/policy/dispatch_auth`` that opts OUT: the passthrough server serves alone
+DISPATCH_AUTH_OFF = b"passthrough\n"
+#: the brokered server's socket, beside the passthrough one (``run.sock``): the billing decision is which
+#: socket a fire reached, never a per-request change of a shared launcher. The client names it too, so it lives there.
+BROKERED_SOCKET_NAME = C.BROKERED_SOCKET_NAME
 
 
 def read_dispatch_auth(path: "Path | str", owner: int = 0) -> tuple[str, Optional[str]]:
-    """``(auth, why)`` of the run server's brokered setting (PRE-W, DEFAULT OFF): ``("brokered", None)`` only when
-    ``path`` is a regular file (not a link) owned by ``owner`` (root), writable by nobody else, whose whole content is
-    :data:`DISPATCH_AUTH_ON`. Absent is ``("passthrough", None)``, OFF. Anything else reads OFF too, with ``why`` the
-    reason (the doctor shows it): OFF is the passthrough server that runs without the setting. Never raises."""
+    """``(auth, why)`` of the run server's brokered setting. The brokered server is ON by default: ``("brokered",
+    None)`` when ``path`` is absent, or is a regular file (not a link) owned by ``owner`` (root), writable by nobody
+    else, whose whole content is :data:`DISPATCH_AUTH_ON`. ``("passthrough", None)`` is the explicit opt-out: the same
+    file, whose whole content is :data:`DISPATCH_AUTH_OFF`. Anything else (unreadable, another owner or mode, other
+    content) is ``("passthrough", why)``, OFF with the reason (the doctor shows it): a setting someone tried to write
+    and got wrong is not read as the default. Never raises."""
     import stat as _stat
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
-        return "passthrough", None
+        return "brokered", None
     except OSError as exc:
         return "passthrough", f"the setting cannot be read ({exc.strerror or type(exc).__name__})"
     try:
@@ -1392,14 +1492,16 @@ def read_dispatch_auth(path: "Path | str", owner: int = 0) -> tuple[str, Optiona
             return "passthrough", "the setting is not a regular file"
         if st.st_uid != owner or st.st_mode & 0o022:
             return "passthrough", "the setting is not root's alone (another account owns it or can write it)"
-        data = os.read(fd, len(DISPATCH_AUTH_ON) + 1)
+        data = os.read(fd, max(len(DISPATCH_AUTH_ON), len(DISPATCH_AUTH_OFF)) + 1)
     except OSError as exc:
         return "passthrough", f"the setting cannot be read ({exc.strerror or type(exc).__name__})"
     finally:
         os.close(fd)
-    if data != DISPATCH_AUTH_ON:
-        return "passthrough", "the setting's content is not exactly 'brokered'"
-    return "brokered", None
+    if data == DISPATCH_AUTH_ON:
+        return "brokered", None
+    if data == DISPATCH_AUTH_OFF:
+        return "passthrough", None
+    return "passthrough", "the setting's content is neither exactly 'brokered' nor exactly 'passthrough'"
 
 
 def service_row():
@@ -1412,7 +1514,7 @@ def service_row():
 
 
 __all__ = ["ACCOUNT", "NAME", "FrameClaims", "RunServer", "replica_verifier", "service_row", "agent_store_bar", "bound_usage_sources", "build_server", "main", "serve",
-           "verify_point_of_use", "BROKERED_SOCKET_NAME", "DISPATCH_AUTH_ON", "read_dispatch_auth"]
+           "verify_point_of_use", "BROKERED_SOCKET_NAME", "DISPATCH_AUTH_ON", "DISPATCH_AUTH_OFF", "read_dispatch_auth"]
 
 
 if __name__ == "__main__":

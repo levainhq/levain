@@ -516,3 +516,46 @@ def test_lineage_unreadable_to_slot_and_gw(host, tmp):
     assert stat.S_IMODE(st.st_mode) == LN.SINK_MODE == 0o640
     assert st.st_gid == os.stat(d).st_gid
     assert not st.st_mode & 0o007                            # nothing for other
+
+
+# --- the run-final record (W3-3b) ------------------------------------------------------------------------------------
+
+def final_record(ref: int, **over) -> dict:
+    rec = {"format": LN.FINAL_FORMAT, "source": triple(ref), "run_id": "r-0123456789abcdef", "rows": 2,
+           "quarantined": 0, "triples_digest": "sha256:" + "3" * 64, "at": "2026-10-24T12:00:04Z"}
+    rec.update(over)
+    return rec
+
+
+def test_lineage_run_final_is_checked_appended_and_read_back_at_start(w):
+    assert w.append(envelope(record(1), record(2), final_record(3))) == acked(1, 2, 3)
+    assert w.rows()[2] == dict(final_record(3), seq=3)          # the record plus CONTROL's seq, nothing else
+    w.restart()                                                 # the start reads it whole: a final row is a row
+    assert w.sink.members() == 3
+    assert w.append(envelope(final_record(3))) == acked(3)      # the resend is acked by membership
+    assert len(w.rows()) == 3
+
+
+@pytest.mark.parametrize("bad, field", [
+    ({"rows": -1}, "rows"),
+    ({"rows": "2"}, "rows"),
+    ({"quarantined": 3}, "quarantined"),                        # more quarantined than rows
+    ({"triples_digest": "sha256:xyz"}, "triples_digest"),
+    ({"run_id": "r-XYZ"}, "run_id"),
+    ({"at": None}, "at"),
+    ({"color": "red"}, "color"),
+    ({"seq": 4}, "seq"),
+])
+def test_lineage_malformed_run_final_is_quarantined(w, bad, field):
+    ans = w.append(envelope(record(1), final_record(2, **bad)))
+    assert ans == acked(1, 2, quarantined=[(2, field)]), ans
+    assert w.rows()[1] == {"format": LN.FORMAT, "seq": 2, "source": triple(2), "quarantined": field}
+    w.restart()
+    assert w.sink.members() == 2
+
+
+def test_lineage_run_final_missing_field_and_unknown_format_are_quarantined(w):
+    rec = final_record(1)
+    del rec["triples_digest"]
+    assert w.append(envelope(rec, final_record(2, format="levain-dispatch-run-final/2"))) == \
+        acked(1, 2, quarantined=[(1, "triples_digest"), (2, "format")])
