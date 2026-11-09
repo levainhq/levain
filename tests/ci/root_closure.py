@@ -477,6 +477,14 @@ LAZY_SITES = {
     'levain/slot/services/dispatch_run.py::build_server::from levain.qbroker.peercred import peer_uid': 'root',
     # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
     'levain/slot/services/dispatch_run.py::build_server::from levain.slot.dispatch_runtime import DispatchControlPort, HelperSlotRuntime': 'root',
+    # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry (PRE-W: the brokered launcher's spend reader, setting ON)
+    'levain/slot/services/dispatch_run.py::build_server::from levain.slot.dispatch_usage import lineage_spend_reader': 'root',
+    # root: ``build_server`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry (PRE-W: the lineage sink's name)
+    'levain/slot/services/dispatch_run.py::build_server::from levain.slot.lineage import SINK': 'root',
+    # root: ``supervisor_facts`` runs in the dispatch follower's own process (``follow_run.main``, ``_levain_dispatch``), which is a service entry (PRE-W)
+    'levain/dispatch/follow_run.py::supervisor_facts::from levain.slot.dispatch_runtime import DispatchControlPort': 'root',
+    # root: ``_parser`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry (PRE-W: the setting's path)
+    'levain/slot/services/dispatch_run.py::_parser::from levain.slot.layout import policy_dispatch_auth_path': 'root',
     # root: ``main`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
     'levain/slot/services/dispatch_run.py::main::from levain.slot.layout import operator_record_path': 'root',
     # root: ``main`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry
@@ -495,6 +503,8 @@ LAZY_SITES = {
     'levain/slot/supervisor.py::_git::from levain.slot.stage import STAGE_DEADLINE_S, _git_env as env': 'root',
     # root: ``check_repo_layer`` is the interactive supervisor's check AND the dispatch run server's on a workspace snapshot (``readset._layer_check`` <- ``workspace``, levain 34, W1); its target is already a closure member
     'levain/slot/supervisor.py::check_repo_layer::from levain.slot.render import repo_loosening_refusals': 'root',
+    # root: ``repo_layer_docs`` feeds ``check_repo_layer`` on the same two paths (``readset._layer_check`` runs it in the dispatch run server); its target is already a closure member
+    'levain/slot/supervisor.py::repo_layer_docs::from levain.slot.render import fold_name as _fold   # the one fold, imported where it is used': 'root',
     # operator: ``identity_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
     'levain/slot/supervisor.py::identity_answer::from levain.slot.records import _REASON_RE, OBSERVED_ID_RE': 'operator',
     # operator: ``prepare_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names

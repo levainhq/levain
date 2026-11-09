@@ -177,6 +177,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_slot_homes())
     core.extend(_check_slot_limits())
     core.extend(_check_slot_keys())
+    core.extend(_guarded(_BROKERED, lambda: _check_brokered_launcher(install)))
     core.extend(_check_slot_services())
     core.extend(_guarded("agent fence", lambda: _check_agent_fence(install=path)))
     for r in core:
@@ -1800,6 +1801,123 @@ def _guarded(name: str, build: Any) -> list[CheckResult]:
         return [CheckResult(name, False, f"could not be built ({type(exc).__name__}: {exc})",
                             "This is a defect in `levain doctor`; report it.")]
     return out if isinstance(out, list) else [out]
+
+
+_BROKERED = "brokered launcher"
+
+
+def _micro_usd(v: int) -> str:
+    return f"${v / 1_000_000:,.2f}"
+
+
+def brokered_launcher_rows(setting: tuple[str, str | None], links: Any, ceiling: Any,
+                           serving: Any = None) -> list[CheckResult]:
+    """PRE-W, design 1105-49 §4: the brokered launcher's rows. ``setting`` is
+    :func:`levain.slot.services.dispatch_run.read_dispatch_auth`'s ``(auth, why)``; ``links()`` the standing api_key
+    agent links as ``(link_id, per-run micro-dollars, model or None)``; ``ceiling()`` the root ceiling's
+    ``max_reserved_microdollars_per_run``; ``serving(model)`` the brokered route serving ``model`` or None (no route).
+    A reader that raises is "cannot tell" (a warning, never a pass). OFF is no row (a setting present but refused is a
+    warning) and never fails. ON, per
+    link: a share over the ceiling FAILS (every fire would refuse at mint), so does a model no brokered route serves;
+    a model this run could not read is a warning (``ROUTE-RESOLVE`` judges it at the first fire)."""
+    auth, why = setting
+    if auth != "brokered":
+        if why is not None:
+            return [CheckResult(_BROKERED, True, f"off: {why}",
+                                "The setting is L/policy/dispatch_auth: root's file whose whole content is "
+                                "'brokered'. Anything else is OFF.", warn=True)]
+        return []                     # OFF, the default: no row (most installs never turn it on)
+    try:
+        standing = list(links())
+    except Exception as exc:  # noqa: BLE001 - cannot tell is a warning, never a pass
+        return [CheckResult(_BROKERED, True, f"on, but the api_key agent links cannot be read ({type(exc).__name__}); "
+                            "their per-run figures are not checked", warn=True)]
+    if not standing:
+        return [CheckResult(_BROKERED, True, "on: the brokered server listens, but operator fires are not routed to it yet; no standing api_key agent link")]
+    try:
+        top = ceiling()
+        if type(top) is not int:
+            raise ValueError("no per-run maximum")
+    except Exception as exc:  # noqa: BLE001
+        top = None
+        top_why = f"the dispatch ceiling cannot be read ({type(exc).__name__}): every brokered mint refuses until it can"
+    rows = []
+    for link_id, share, model in standing:
+        name = f"{_BROKERED} ({link_id})"
+        if top is None:
+            rows.append(CheckResult(name, True, f"per-run {_micro_usd(share)}; {top_why}", warn=True))
+            continue
+        if share > top:
+            rows.append(CheckResult(name, False, f"per-run {_micro_usd(share)} is over the ceiling "
+                                    f"{_micro_usd(top)}: every fire of this agent refuses at mint",
+                                    "Re-sign the link at or under the ceiling, or raise the ceiling (install helper "
+                                    "set-ceiling)."))
+            continue
+        said = (f"per-run {_micro_usd(share)} within the ceiling {_micro_usd(top)} (the brokered server listens; operator fires are "
+                "not routed to it yet)")
+        if model is None or serving is None:
+            rows.append(CheckResult(name, True, f"{said}; the role's model is not read here, so its route is "
+                                    "judged at the first fire (ROUTE-RESOLVE)", warn=True))
+            continue
+        try:
+            route = serving(model)
+        except Exception as exc:  # noqa: BLE001
+            rows.append(CheckResult(name, True, f"{said}; the route for {model} cannot be told "
+                                    f"({type(exc).__name__})", warn=True))
+            continue
+        if route is None:
+            rows.append(CheckResult(name, False, f"no brokered route serves model {model}: every fire of this agent "
+                                    "refuses (no-brokered-route)", "Submit a dispatch route map with a brokered "
+                                    "route for that model."))
+            continue
+        rows.append(CheckResult(name, True, f"{said}; route {route} serves {model}"))
+    return rows
+
+
+def _api_key_links(install: Path) -> list[tuple[str, int, Any]]:
+    """The standing api_key agent links of ``install``'s cockpit authority (read-only, as
+    :func:`_check_cockpit_authority` reads it): ``(link_id, budget_run_usd_micros, None)``. The role's model is not
+    read here (it is pinned by the signed role, not the link)."""
+    from datetime import datetime, timezone
+
+    from levain import authority as _auth
+    from levain.authority import anchor_path
+    from levain.cockpit.authority import RequestAuthority
+    from levain.cockpit.firejournal import DB_NAME
+
+    root = install / ".levain" / "cockpit"
+    journal = root / DB_NAME
+    if not journal.is_file():
+        return []
+    now = datetime.now(timezone.utc)
+    conn = sqlite3.connect(f"file:{journal}?mode=ro", uri=True, timeout=2, isolation_level=None)
+    try:
+        conn.execute("BEGIN")
+        got = RequestAuthority.capture(conn, now=now, anchor=anchor_path(root), source=str(journal))
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    state = got.authority
+    if state is None:
+        if got.log_empty:
+            return []
+        raise RuntimeError(str(got.authority_error))
+    out = []
+    for gid, g in sorted(state.policy.grants.items()):
+        if _auth.agent_link(g) and _auth.agent_link_terms(g)[0] == "api_key" and _auth.agent_link_arms(state, gid, now=now):
+            out.append((gid, g["budget_run_usd_micros"], None))
+    return out
+
+
+def _check_brokered_launcher(install: Path, *, host: str | None = None) -> list[CheckResult]:
+    from levain.slot import layout
+    from levain.slot import tickets as T
+    from levain.slot.services.dispatch_run import read_dispatch_auth
+    host = host or ("darwin" if sys.platform == "darwin" else "linux")
+    setting = read_dispatch_auth(layout.policy_dispatch_auth_path(host))
+    return brokered_launcher_rows(
+        setting, lambda: _api_key_links(install),
+        lambda: T.read_ceiling(layout.policy_dispatch_ceiling_path(host)).max_reserved_microdollars_per_run)
 
 
 def _check_slot_keys(*, host: str | None = None, store: Path | None = None, running: Any = None,

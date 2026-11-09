@@ -540,9 +540,11 @@ def test_a_refresh_failing_mid_response_leaves_no_open_transport(env):
 
 @pytest.mark.parametrize("mode", ["big-token", "zero-expiry", "big-body", "fail"])
 def test_a_response_past_a_cap_or_refused_is_a_failure_and_the_old_file_stays(env, mode):
+    # no rotated refresh token in the answer: nothing of it is kept (3b-7's rotation case is its own test below)
     ep, d, store, cert, mp = env
     _write(d, _fields(int(time.time()) - 5))
     ep.mode = mode
+    ep.rotate = False
     before = (d / (NAME + ".json")).read_bytes()
 
     async def go():
@@ -1002,3 +1004,277 @@ def test_through_keys_a_token_expiring_during_the_body_read_is_refused_before_th
     assert b"".join(t for t, _ in frames) == b"AF", frames
     assert b"credential-unavailable" in frames[1][1]
     assert connects == [] and up.writes == []
+
+
+# --- prel3 L3 3b (1108-34-handoff/l3_prel3_3b.txt): each test is its finding's own failure --------------------------
+
+def test_3b6_a_stalled_token_endpoint_falls_through_to_the_unexpired_token(env, monkeypatch):
+    """3b-6: a token endpoint that never answers must not hold an exchange while the access token is still valid: the
+    exchange gets the old token at REFRESH_DEADLINE_S. The refresh itself is not cut there (L2-M1: the POST was sent);
+    it ends by upstream's head bound (a failure on the gate, no transport left open)."""
+    ep, d, store, cert, mp = env
+    _write(d, _fields(int(time.time()) + 30))   # inside the ahead window: a refresh is wanted, the token still valid
+    monkeypatch.setattr(C, "REFRESH_DEADLINE_S", 0.3, raising=False)
+    monkeypatch.setattr(upstream, "HEAD_TIMEOUT_S", 0.8)
+
+    async def go():
+        await _serve(ep, cert, mp)
+        ep.hold = asyncio.Event()   # never set while measured: the endpoint stalls
+        w, s = _writer(d), store()
+        await asyncio.sleep(0)
+        gc.collect()
+        base = count_open_fds()
+        try:
+            t0 = time.monotonic()
+            try:
+                c = await asyncio.wait_for(C.fresh(w, s, NAME), 3.0)
+            except asyncio.TimeoutError:
+                c = None
+            took = time.monotonic() - t0
+            try:
+                await asyncio.wait_for(_settle(w), 3.0)
+                ended = True
+            except asyncio.TimeoutError:
+                ended = False
+            await asyncio.sleep(0.05)
+            after = count_open_fds()
+            failures = w._gates[NAME].failures
+        finally:
+            ep.hold.set()
+            await _settle(w)
+            ep.server.close()
+            w.close()
+        return c, took, ended, base, after, failures
+    c, took, ended, base, after, failures = run(go())
+    assert c is not None and c.secret == "old-access", "fresh blocked on a stalled endpoint past any sane bound"
+    assert took < 2.0
+    assert ended and failures == 1
+    assert after == base
+
+
+def test_3b6_the_deadline_leaves_the_token_unexpired_inside_the_ahead_window():
+    # a want starts at the latest REFRESH_AHEAD_S before expiry; falling through at the deadline must still find it valid
+    assert 0 < C.REFRESH_DEADLINE_S < C.REFRESH_AHEAD_S
+
+
+def test_m1_a_rotated_token_answered_after_the_deadline_lands_and_the_spent_token_is_never_posted(env, monkeypatch):
+    """L2-M1: the POST was sent, so the endpoint may have rotated (and spent) the refresh token. `fresh` stops waiting
+    at REFRESH_DEADLINE_S and serves the old unexpired token, but the POST is not cancelled: its late answer commits,
+    and the next want finds a fresh token instead of POSTing the spent one (RFC 9700 reuse detection)."""
+    ep, d, store, cert, mp = env
+    clk = Clock()
+    _write(d, _fields(int(clk.wall()) + 30))   # inside the ahead window, still valid
+    monkeypatch.setattr(C, "REFRESH_DEADLINE_S", 0.3, raising=False)
+
+    async def go():
+        await _serve(ep, cert, mp)
+        ep.hold = asyncio.Event()
+        w, s = _writer(d, clk), store()
+        c1 = await asyncio.wait_for(C.fresh(w, s, NAME), 3.0)
+        await asyncio.sleep(0.3)   # past the deadline; the endpoint has the request and answers now
+        ep.hold.set()
+        await asyncio.wait_for(_settle(w), 5.0)
+        clk.t = C.GATE_MAX_S + 1   # past any backoff, and past the old token's expiry
+        try:
+            c2 = await asyncio.wait_for(C.fresh(w, s, NAME), 5.0)
+        except Refused:
+            c2 = None
+        await _settle(w)
+        ep.server.close()
+        w.close()
+        return c1, c2
+    c1, c2 = run(go())
+    assert c1.secret == "old-access"
+    sent = [b for b in ep.bodies if b"refresh_token=old-refresh" in b]
+    assert len(sent) == 1, "the spent refresh token was POSTed again"
+    assert ep.calls == 1
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-1"
+    assert c2 is not None and c2.secret == "new-access-1"
+
+
+def test_m1_a_second_waiter_on_a_stalled_refresh_waits_only_what_is_left_of_the_deadline(env, monkeypatch):
+    """L2-M1 consequence: the POST now outlives REFRESH_DEADLINE_S, so `fresh` bounds its wait from the refresh's
+    START: an exchange that joins a refresh already past its deadline is served at once, not held a fresh deadline."""
+    ep, d, store, cert, mp = env
+    _write(d, _fields(int(time.time()) + 30))
+    monkeypatch.setattr(C, "REFRESH_DEADLINE_S", 0.5, raising=False)
+
+    async def go():
+        await _serve(ep, cert, mp)
+        ep.hold = asyncio.Event()
+        w, s = _writer(d), store()
+        try:
+            await asyncio.wait_for(C.fresh(w, s, NAME), 3.0)
+            t0 = time.monotonic()
+            c = await asyncio.wait_for(C.fresh(w, s, NAME), 3.0)
+            took = time.monotonic() - t0
+        finally:
+            ep.hold.set()
+            await _settle(w)
+            ep.server.close()
+            w.close()
+        return c, took
+    c, took = run(go())
+    assert c.secret == "old-access"
+    assert took < 0.2, f"a joining exchange waited {took:.2f} s on a refresh already past its deadline"
+
+
+def _flaky_commit(w: C.CredWriter, broken):
+    """Replace `w.commit`: a call fails `CommitFailed` (nothing written) while `broken(n)` is true for its number n;
+    every call's (refresh_token, rev) is recorded."""
+    real = w.commit
+    calls = []
+
+    async def commit(name, fields, expect_rev=None, rev=None):
+        calls.append((fields["refresh"]["refresh_token"], rev))
+        if broken(len(calls)):
+            raise C.CommitFailed("credential-lock-timeout")
+        return await real(name, fields, expect_rev=expect_rev, rev=rev)
+    w.commit = commit
+    return calls
+
+
+def test_3b7_a_failed_first_commit_keeps_the_rotated_refresh_token(env):
+    """3b-7: the endpoint rotated the refresh token (the old one is dead upstream); the first commit fails. The commit
+    is retried with the same fields and rev, so the rotated token lands."""
+    ep, d, store, cert, mp = env
+    _write(d, _fields(int(time.time()) - 5))
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d), store()
+        calls = _flaky_commit(w, lambda n: n == 1)
+        try:
+            c = await C.fresh(w, s, NAME)
+        except Refused:
+            c = None
+        await _settle(w)
+        w.close()
+        return c, calls
+    c, calls = run(go())
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-1", "the rotated refresh token was lost"
+    assert ep.calls == 1
+    assert c is not None and c.secret == "new-access-1"
+    assert len(calls) == 2 and calls[0] == calls[1]
+
+
+@pytest.mark.parametrize("mode", ["big-token", "zero-expiry"])
+def test_3b7_an_unusable_access_token_still_lands_the_rotated_refresh_token(env, mode):
+    """3b-7: a 200 whose access token (or its expiry) is refused but whose rotated refresh token is valid: the refresh
+    token is kept (the access token and its expiry stay as they were) and the refresh still counts as a failure on the
+    gate."""
+    ep, d, store, cert, mp = env
+    exp = int(time.time()) - 5
+    _write(d, _fields(exp))
+    ep.mode = mode
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d), store()
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        failures = w._gates[NAME].failures
+        w.close()
+        return failures
+    failures = run(go())
+    f = _file(d)
+    assert f["refresh"]["refresh_token"] == "new-refresh-1", "the rotated refresh token was lost"
+    assert f["access"] == "old-access" and f["expires_at"] == exp
+    assert failures == 1
+
+
+def test_3b7_a_rotated_token_whose_commits_all_failed_lands_before_the_next_post(env):
+    """3b-7: every commit of a refresh fails; the rotated token is held, and the next attempt the gate admits commits
+    it instead of spending the dead old refresh token on a second POST."""
+    ep, d, store, cert, mp = env
+    clk = Clock()
+    _write(d, _fields(int(clk.wall()) - 5))
+    down = [True]
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d, clk), store()
+        _flaky_commit(w, lambda n: down[0])
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        down[0] = False
+        clk.t = C.GATE_MAX_S + 1   # past any backoff
+        c = await C.fresh(w, s, NAME)
+        await _settle(w)
+        w.close()
+        return c
+    c = run(go())
+    assert ep.calls == 1, "a second POST spent the old refresh token"
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-1"
+    assert c.secret == "new-access-1"
+
+
+def test_l2l2_a_held_fields_commit_does_not_reset_the_backoff(env):
+    """L2-L2/L1-F4: a refused answer (the access token unusable) whose rotated refresh token could not be committed is
+    held; when the next attempt lands the held fields, no POST has succeeded, so the gate's failure count and backoff
+    stay (only a successful POST resets them)."""
+    ep, d, store, cert, mp = env
+    clk = Clock()
+    _write(d, _fields(int(clk.wall()) - 5))
+    ep.mode = "big-token"
+    down = [True]
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d, clk), store()
+        _flaky_commit(w, lambda n: down[0])
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        before = w._gates[NAME].failures
+        down[0] = False
+        clk.t = C.GATE_MAX_S + 1
+        with pytest.raises(Refused):   # the held fields carry the old, expired access token
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        g = w._gates[NAME]
+        same_gate = g.rev == s.observe(NAME).rev
+        w.close()
+        return before, g.failures, same_gate
+    before, failures, same_gate = run(go())
+    assert same_gate, "the held commit's rev left its gate (the next want would open a fresh one)"
+    assert ep.calls == 1
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-1"
+    assert before == 1
+    assert failures == before, "a held-fields commit reset the failure backoff"
+
+
+def test_3b7_after_a_kept_rotation_a_failed_commit_is_still_held_on_the_same_gate(env):
+    """3b-7: the rotated token alone landed (the access token was refused); the next refresh rotates again and every
+    commit fails. That attempt's fields stay held on the credential's gate, so the attempt after commits them with no
+    third POST."""
+    ep, d, store, cert, mp = env
+    clk = Clock()
+    _write(d, _fields(int(clk.wall()) - 5))
+    ep.mode = "big-token"
+    down = [False]
+
+    async def go():
+        await _serve(ep, cert, mp)
+        w, s = _writer(d, clk), store()
+        _flaky_commit(w, lambda n: down[0])
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        ep.mode, down[0] = "ok", True
+        clk.t = C.GATE_MAX_S + 1
+        with pytest.raises(Refused):
+            await C.fresh(w, s, NAME)
+        await _settle(w)
+        down[0] = False
+        clk.t = 2 * (C.GATE_MAX_S + 1)
+        c = await C.fresh(w, s, NAME)
+        await _settle(w)
+        w.close()
+        return c
+    c = run(go())
+    assert ep.calls == 2, "a third POST spent a dead refresh token"
+    assert _file(d)["refresh"]["refresh_token"] == "new-refresh-2"
+    assert c.secret == "new-access-2"

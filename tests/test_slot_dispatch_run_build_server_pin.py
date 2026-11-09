@@ -272,3 +272,18 @@ def test_the_real_tree_has_one_constructor_and_it_passes_a_replica() -> None:
     assert not bad, "RunServer is constructed outside build_server: " + "; ".join(bad) + ". " + WHY
     bad = replica_violations(sources[SERVER_FILE])
     assert not bad, "; ".join(bad) + ". " + WHY
+
+
+def test_every_server_build_server_returns_carries_the_real_replica(tmp_path) -> None:
+    """PRE-W ruling 1 (levain 74): with the brokered setting ON, ``build_server`` returns TWO RunServers (the passthrough one
+    and its ``brokered`` sibling) from the one ``RunServer(`` call. The premise of the claims=None ruling is that EVERY server
+    has the real replica, so assert both, and that it is one object (two replicas on one directory would contend)."""
+    import os
+
+    from levain.slot.services import dispatch_run as DR
+    for brokered in (False, True):
+        srv = DR.build_server("linux", tmp_path / str(brokered), tmp_path / "c.sock", os.getuid(), brokered=brokered)
+        servers = [srv] + ([srv.brokered] if brokered else [])
+        assert len(servers) == (2 if brokered else 1) and (srv.brokered is not None) is brokered
+        assert all(s._replica is not None for s in servers), "a server build_server returns lacks the real replica. " + WHY
+        assert len({id(s._replica) for s in servers}) == 1

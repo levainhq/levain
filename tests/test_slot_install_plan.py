@@ -323,10 +323,9 @@ def test_slot_socket_group_inherited(host):
             row = by_path[R / sub / f"slot{n}"]
             assert (row.owner, row.group, row.mode) == (owner, f"_levain_s{n}", 0o2750)
             p = str(row.path)
-            idx = {k: i for i, s in enumerate(plan.steps) for k in ("chown", "chmod")
-                   if s.argv and s.argv[-1] == p and s.argv[0].endswith(k)}
-            assert idx["chown"] < idx["chmod"]          # mode (setgid) set after the chown
-            assert plan.steps[idx["chmod"]].argv[1] == "2750"
+            chown = next(i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("chown"))
+            mode = [i for i, s in enumerate(plan.steps) if s.why == f"set {p} to 2750"]
+            assert mode and chown < mode[0]             # mode (setgid) set after the chown
     # verifier class has no socket dirs
     assert not [p for p in by_path if p.parent in (R / "gw", R / "qb", R / "planner") and p.name not in ("slot0", "slot1", "slot2")]
 
@@ -366,9 +365,8 @@ def test_store_layout(host):
         assert rows[L / rel if rel else L] == want, rel
         p = str(L / rel if rel else L)
         mk = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("mkdir")]
-        chmod = [i for i, s in enumerate(plan.steps) if s.argv and s.argv[-1] == p and s.argv[0].endswith("chmod")
-                 and s.argv[1] != "-N"]                     # -N: the macOS ACL clear (tests/test_slot_layout_acl.py)
-        assert mk and chmod and mk[0] < chmod[0] and plan.steps[chmod[0]].argv[1] == f"{mode:04o}", rel
+        chmod = [i for i, s in enumerate(plan.steps) if s.why == f"set {p} to {mode:04o}"]   # Linux: a no-follow call
+        assert mk and chmod and mk[0] < chmod[0], rel
     # a verifier slot has no keep/ (§2.1: L/slots/e<n>/keep only)
     assert L / "slots/v0/keep" not in rows
     # the parent of a child row exists before the child

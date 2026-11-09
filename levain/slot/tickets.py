@@ -11,14 +11,17 @@ checked against the line's facts at the rebuild by :func:`check_resolved`), `bin
 session an `ATTACH` created, and, from 3c-7, to the slot lease that session holds: `slot` `{class, index}` + `lease_seq`, CONTRACT §3.5 BINDING), `unbind` (that
 `ATTACH`'s session record was never written, so the ticket is unbound again: L2 4a, 3c-5 fix 1), `release` (S1 3c-7: a
 `SLOT-SYNC` showed the bound lease over, §3.5 RELEASE), `cancel`, `expire` (an unbound ticket past V16), `tombstone`
-(`{attempt_id, ticket, request_digest, state, session?}`, written only by the
-compaction). A tombstone is authoritative over every other line of its attempt. One `attempt_id` naming two
+(`{attempt_id, ticket, request_digest, state, session?}`, written only by the compaction; a ran executor ticket's also
+carries its run key `job_id` + `run_index` and `closed_ms`, the time of the first compaction that found it closed, so
+the key outlives its facts and `RUN-TICKET-FACTS` still counts it toward `ticket-ambiguous`; a run key that differs
+from the attempt's mint line refuses the start). A tombstone is authoritative over every other line of its attempt. One `attempt_id` naming two
 tickets or two request digests, one ticket named by two attempts, or a whole line that does not parse, refuses the start
 (`journal-inconsistent`): CONTROL never serves a ticket journal it cannot read whole. A last line with no newline is a
 torn append (a crash inside the write) and is dropped; the compaction then rewrites the journal without it.
 
 The compaction runs only at the start, before any append is admitted: the open tickets' mints, the current UTC day's
-mints (the day count) and one tombstone per closed attempt, written to `tickets.jsonl.new`, fsynced, renamed over the
+mints (the day count), one tombstone per closed attempt and the mint line of each executor ticket that ran and closed
+less than `RAN_FACTS_MARGIN_S` ago (its run's facts, `RUN-TICKET-FACTS`), written to `tickets.jsonl.new`, fsynced, renamed over the
 journal (one atomic replace) and the directory fsynced. A leftover `.new` (a crash before the rename) is removed at the
 start, never adopted.
 
@@ -88,8 +91,17 @@ CEILING_FORMAT_2 = "levain-dispatch-ceiling/2"
 CEILING_KEYS_2 = CEILING_KEYS | {"max_calls_per_run", "max_tunnel_bytes_per_run", "max_deadline_s"}
 #: CONTRACT V16: an unbound ticket's lifetime.
 TICKET_UNUSED_S = 15 * 60
+#: DECISION: how long a ran executor ticket's mint line (its facts, ``RUN-TICKET-FACTS``) is kept past its CLOSE, the
+#: first start compaction that finds it released (no earlier than the release itself): the margin for a follower to
+#: reach the run's terminal event after the run ended. Counted from the close, never from the mint, since a brokered
+#: run carries no ``deadline_s`` and nothing in CONTROL bounds how long it stays bound (row 158 L3 r1, codex HIGH 1);
+#: a ticket still bound is kept whatever its age. Seven days is a decision, not a derivation: nothing bounds a
+#: follower's lag.
+RAN_FACTS_MARGIN_S = 7 * 86400
 #: DECISION: the largest journal CONTROL reads at its start (the compaction keeps it to the open tickets, one day's
-#: mints and one small tombstone per lifetime attempt); past it the start is refused, never half-read.
+#: mints, one small tombstone per lifetime attempt and the mint line of each executor ticket closed less than
+#: :data:`RAN_FACTS_MARGIN_S` ago, which `RUN-TICKET-FACTS` answers from); past it the start is refused, never
+#: half-read.
 JOURNAL_MAX = 64 * 1024 * 1024
 CEILING_MAX = 4096
 
@@ -416,6 +428,10 @@ class Ticket:
     slot: Optional[Tuple[str, int, int]] = None
     #: a verifier ticket's entry, resolved by CONTROL at mint (3c-8); None for every other kind
     resolved: Optional[Dict[str, object]] = None
+    #: a ran executor ticket's `(job_id, run_index)` as its tombstone carries it (the key once its facts aged out)
+    run_key: Optional[Tuple[str, int]] = None
+    #: a ran executor ticket's close: the first start compaction that found it closed (its tombstone's `closed_ms`)
+    closed_ms: Optional[int] = None
 
     def answer_facts(self) -> Dict[str, object]:
         """What ATTACH answers as `ticket_facts` (CONTRACT §3.3): the facts, and a verifier ticket's resolved entry as
@@ -675,11 +691,21 @@ class TicketStore:
                 if state not in CLOSED or not _DIGEST.fullmatch(obj["request_digest"]) \
                         or type(obj["ticket"]) is not str:
                     raise _inconsistent("a tombstone is malformed")
+                key, closed = None, None
+                if "job_id" in obj or "run_index" in obj or "closed_ms" in obj:
+                    # a ran executor ticket's: all three, and a session (a KeyError is a missing field)
+                    key = (_text(obj["job_id"], "job_id", _NAME), _uint(obj["run_index"], "run_index"))
+                    closed = _uint(obj["closed_ms"], "closed_ms")
+                    if session is None:
+                        raise _inconsistent("a tombstone carries a run key and no session")
                 t = claim(attempt, obj["ticket"], obj["request_digest"])
                 if t is None:
                     t = Ticket(obj["ticket"], attempt, obj["request_digest"], {}, 0, "")
                     by_attempt[attempt] = by_ticket[t.ticket] = t
-                t.state, t.session = state, session
+                elif key is not None and t.facts and (t.facts.get("kind") != "executor"
+                                          or (t.facts["job_id"], t.facts["run_index"]) != key):
+                    raise _inconsistent("a tombstone's run key is not its mint line's")
+                t.state, t.session, t.run_key, t.closed_ms = state, session, key, closed
         except (KeyError, TypeError):
             raise _inconsistent("a journal line lacks a field") from None
         except Refused as e:
@@ -690,6 +716,7 @@ class TicketStore:
 
     def _compacted(self) -> bytes:
         today = _day(self._clock())
+        now_ms = self._now_ms()
         out: List[bytes] = []
         for attempt in sorted(self._by_attempt):
             t = self._by_attempt[attempt]
@@ -698,12 +725,41 @@ class TicketStore:
                                            "request_digest": t.request_digest, "state": t.state}
                 if t.session is not None:
                     tomb["session"] = t.session
+                key = self._ran_key(t)
+                if key is not None:
+                    if t.closed_ms is None:
+                        t.closed_ms = now_ms          # the first compaction to find it closed: never before the close
+                    tomb.update(job_id=key[0], run_index=key[1], closed_ms=t.closed_ms)
                 out.append(canon.canonical_bytes(tomb))
-            if t.state in OPEN or (t.day == today and t.facts):
+            if t.state in OPEN or (t.day == today and t.facts) or self._facts_kept(t, now_ms):
                 out.append(canon.canonical_bytes(self._mint_line(t)))
             if t.state == BOUND:
                 out.append(canon.canonical_bytes(self._bind_line(t)))
         return b"".join(line + b"\n" for line in out)
+
+    @staticmethod
+    def _ran_key(t: Ticket) -> Optional[Tuple[str, int]]:
+        """``(job_id, run_index)`` of an executor ticket that was bound to a session (it ran): from its facts while its
+        mint line is kept, else from its tombstone (:attr:`Ticket.run_key`). None for any other ticket (a cancelled or
+        expired one never ran)."""
+        if t.session is None:
+            return None
+        if t.facts:
+            if t.facts.get("kind") != "executor":
+                return None
+            return str(t.facts["job_id"]), int(t.facts["run_index"])        # type: ignore[call-overload]
+        return t.run_key
+
+    @staticmethod
+    def _facts_kept(t: Ticket, now_ms: int) -> bool:
+        """A CLOSED ran executor ticket whose close is less than :data:`RAN_FACTS_MARGIN_S` old: the compaction keeps
+        its mint line beside its tombstone, so ``RUN-TICKET-FACTS`` answers for its run after any CONTROL restart
+        (CONTROL does not see when the run's job ends, and a follower may reach the run's terminal event days later:
+        PRE-W L3 r1, codex MED). Past the margin only the facts go: the tombstone keeps the replay guard and the run
+        key, so the ambiguity check still counts the run (row 158 L3 r1, codex HIGH 2). A ticket still OPEN is kept by
+        the compaction's first clause whatever its age. A clock that stepped back keeps the line longer."""
+        return t.state in CLOSED and t.closed_ms is not None and bool(t.facts) \
+            and now_ms - t.closed_ms < RAN_FACTS_MARGIN_S * 1000
 
     def _compact(self) -> None:
         data = self._compacted()
@@ -1022,6 +1078,25 @@ class TicketStore:
             if t.session is not None and state in (BOUND, RELEASED):
                 out["session"] = t.session
             return out
+
+    def executor_facts(self, job_id: str, run_index: int) -> Dict[str, object]:
+        """PRE-W (F9a's supervisor reader, ``RUN-TICKET-FACTS``): the facts, as minted and journaled, of the ONE
+        executor ticket for ``(job_id, run_index)`` that was bound to a session (a cancelled or expired ticket never
+        ran, so it is not counted). None is ``ticket-unknown``; more than one is ``ticket-ambiguous`` (refused, never
+        chosen). Read-only: nothing is appended. The start compaction keeps a ran ticket's facts until
+        :data:`RAN_FACTS_MARGIN_S` past its close (:meth:`_facts_kept`), so they outlive its mint's UTC day and any
+        restart; past it the run's key stays in its tombstone (:meth:`_ran_key`), so the run still counts toward
+        ``ticket-ambiguous``, and the one run of its key whose facts aged out answers ``ticket-unknown``."""
+        with self.lock:
+            self._live()
+            found = [t for t in self._by_ticket.values() if self._ran_key(t) == (job_id, run_index)]
+            if not found:
+                raise Refused("ticket-unknown", "no executor ticket of that job and run was bound to a session")
+            if len(found) > 1:
+                raise Refused("ticket-ambiguous", "more than one executor ticket of that job and run ran")
+            if not found[0].facts:
+                raise Refused("ticket-unknown", "the run's facts aged out past the retention margin")
+            return dict(found[0].facts)
 
     def counts(self) -> Dict[str, int]:
         """The rebuilt counts (doctor / tests): open tickets and the current UTC day's mints."""

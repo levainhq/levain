@@ -67,6 +67,7 @@ class Env:
         self.launcher = L.RealLauncher(self.control, self.runtime, FakeSources(), L.SessionIndex(tmp_path / "idx"))
         self.bar_of = bar or D.agent_store_bar(rig.store.path)
         self.verified = 0
+        self.billing = "subscription"        # the launcher's billing the point of use judges against
         self.pool, self.peer = pool, peer
         self.server = D.RunServer(self.launcher, verify=self._verify, pool_free=lambda: self.pool,
                                   peer_ok=lambda s: self.peer, holder_idle_s=20, **server_kw)
@@ -74,8 +75,8 @@ class Env:
 
     def _verify(self, proof, exposure, claims=None):
         self.verified += 1
-        return D.verify_point_of_use(proof, exposure, replay=self.rig.authority.replay, now=self.rig.now, bar_of=self.bar_of,
-                              billing="subscription")
+        return D.verify_point_of_use(proof, exposure, replay=self.rig.authority.replay, now=self.rig.now,
+                                     bar_of=self.bar_of, billing=self.billing)
 
     def connect(self):
         a, b = socket.socketpair()
@@ -103,9 +104,13 @@ def _proof(rig, oid):
 
 
 def _check(rig, proof, exposure=EXP, **kw):
-    D.verify_point_of_use(proof, exposure, replay=rig.authority.replay, now=kw.pop("now", rig.now),
-                          bar_of=kw.pop("bar_of", D.agent_store_bar(rig.store.path)),
-                          billing=kw.pop("billing", "subscription"), **kw)
+    _grant(rig, proof, exposure, **kw)
+
+
+def _grant(rig, proof, exposure=EXP, **kw):
+    return D.verify_point_of_use(proof, exposure, replay=rig.authority.replay, now=kw.pop("now", rig.now),
+                                 bar_of=kw.pop("bar_of", D.agent_store_bar(rig.store.path)),
+                                 billing=kw.pop("billing", "subscription"), **kw)
 
 
 # --- Q1: the one function ---------------------------------------------------------------------------------------------
@@ -234,8 +239,10 @@ def test_end_is_async_and_idempotent_two_ends_one_teardown(rig, tmp_path):
     oid, key = _session_row(rig)
     env.launcher.spawn(S.SessionLaunch(oid, key, "claude", "sonnet", "b", "passthrough", EXP))
     client = env.client()
-    first = client.end_session(key, 0.05)
-    second = client.end_session(key, 0.05)
+    # the server answers a little before the client's own deadline; the deadline must leave that margin real time
+    # to cross a loaded box, or the client times out first and reports the wire as down, not the END as in progress
+    first = client.end_session(key, 2.0)
+    second = client.end_session(key, 2.0)
     assert first.terminated is False and "in progress" in first.detail and second.terminated is False
     runtime.gate.set()
     third = client.end_session(key, 5)
@@ -1372,7 +1379,19 @@ def test_the_expected_log_is_the_path_the_unit_gives_launchd(monkeypatch):
 
 def test_an_api_key_link_passes_for_an_api_key_launcher_with_no_action_exposure(rig):
     oid = _occurrence(rig, billing="api_key")
-    assert _check(rig, _proof(rig, oid), None, billing="api_key") is None
+    proof = _proof(rig, oid)
+    figure = rig.authority.replay().policy.grants[proof.link_id]["budget_run_usd_micros"]
+    # dispatch wave 3: the check hands back the grant, and the share is read from it (his verified link)
+    grant = _grant(rig, proof, None, billing="api_key")
+    assert figure > 0 and D.signed_share(grant) == figure
+
+
+def test_a_subscription_grant_signs_no_share(rig):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    grant = _grant(rig, _proof(rig, oid))
+    # REVERT: the `billing != "api_key"` leg of signed_share
+    assert grant is not None and D.signed_share(grant) is None
+    assert D.signed_share(None) is None and D.signed_share({"billing": "api_key", "budget_run_usd_micros": 0}) is None
 
 
 @pytest.mark.parametrize("link_billing,launcher,exposure", [("api_key", "subscription", EXP), ("subscription", "api_key", None)])
@@ -1402,3 +1421,124 @@ def test_an_api_key_launcher_refuses_an_action_exposure_and_a_zero_dollar_link(r
         D.verify_point_of_use(proof, None, replay=lambda: Zeroed(), now=rig.now, bar_of=D.agent_store_bar(rig.store.path),
                               billing="api_key")
     assert caught.value.name == "link-run-budget-zero"
+
+
+# --- dispatch wave 3 (S-B2): the run server stamps the signed link's figure as a brokered launch's share ---------------------
+
+def test_a_brokered_launch_is_priced_at_the_links_signed_figure_and_nothing_the_fire_sent(rig, env):
+    oid = _occurrence(rig, billing="api_key")
+    proof = _proof(rig, oid)
+    figure = rig.authority.replay().policy.grants[proof.link_id]["budget_run_usd_micros"]
+    env.billing = "api_key"
+    env.launcher.auth = "brokered"
+    env.control.script["ROUTE-RESOLVE"] = lambda f: {"route": "glm", "routemap_generation": 1,
+                                                     "route_policy_digest": "sha256:" + "a" * 64}
+    # the fire's reserved dollars travel and are only COMPARED: a figure that is not the link's refuses (finding 1)
+    with pytest.raises(L.LauncherRefused) as exc:
+        env.client().spawn(S.SessionLaunch(oid, "s-00000000000000b0", "claude", "sonnet", "b", "brokered", None, None, 1))
+    assert exc.value.name == "dollars-not-the-links-share" and env.control.minted == {}
+    env.client().spawn(S.SessionLaunch(oid, "s-00000000000000b1", "claude", "sonnet", "b", "brokered", None, None,
+                                       figure))
+    mint = [f for op, f in env.control.calls if op == "RUN-TICKET-MINT"]
+    assert len(mint) == 1 and mint[0]["reserved_microdollars"] == figure
+    assert env.runtime.starts[0].auth == "brokered"
+
+
+def test_a_passthrough_server_never_stamps_a_share(rig, env):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    env.client().spawn(S.SessionLaunch(oid, "s-00000000000000b2", "claude", "sonnet", "b", "passthrough", EXP))
+    (mint,) = [f for op, f in env.control.calls if op == "RUN-TICKET-MINT"]
+    assert mint["reserved_microdollars"] == 0 and "route" not in mint
+
+
+def test_a_brokered_launcher_behind_a_verifier_that_answers_no_share_refuses(rig, env):
+    oid = _occurrence(rig, billing="api_key")
+    env.launcher.auth = "brokered"
+    env._verify = lambda proof, exposure, claims=None: None            # a verifier with no figure to hand back
+    env.server._verify = env._verify
+    # the fire sends a positive figure: the share is the verified link's (here none), never the fire's
+    with pytest.raises(L.LauncherRefused) as exc:
+        env.client().spawn(S.SessionLaunch(oid, "s-00000000000000b3", "claude", "sonnet", "b", "brokered", None, None,
+                                           1_000_000))
+    # REVERT: `if launch.usd_micros != share` back to `share is not None and ...` (the reason would read no-dollar-share,
+    # as if the fire sent none); dropping the test as well would mint the fire's figure
+    assert exc.value.name == "dollars-not-the-links-share" and env.control.minted == {}
+
+
+# --- finding 1 of the wave-3 RETURN: a brokered run's share is exactly what the fire's window was debited --------------------
+
+def _brokered(env):
+    env.billing = "api_key"
+    env.launcher.auth = "brokered"
+    env.control.script["ROUTE-RESOLVE"] = lambda f: {"route": "glm", "routemap_generation": 1,
+                                                     "route_policy_digest": "sha256:" + "a" * 64}
+    client = env.client()
+    client.auth = "brokered"            # the fire's side of a brokered route (PRE-W wires the real one)
+    return client
+
+
+def _mints(env):
+    return [f["reserved_microdollars"] for op, f in env.control.calls if op == "RUN-TICKET-MINT"]
+
+
+def test_a_fire_that_reserved_less_than_the_signed_figure_is_refused_before_any_mint(rig, env, caplog):
+    # S-B1 admits exposure <= the signed figure: this fire's window was debited 100_000 under a link signing 1_000_000.
+    # Before the fix the server minted the link's FULL figure, a keys cap ten times what the window holds.
+    oid = _occurrence(rig, billing="api_key", micros=100_000)
+    figure = rig.authority.replay().policy.grants[_proof(rig, oid).link_id]["budget_run_usd_micros"]
+    assert figure == 1_000_000
+    client = _brokered(env)
+    with caplog.at_level("WARNING", logger="levain.agents.session"):
+        _sup, report = _run(rig, oid, client, micros=100_000)
+    # REVERT: the `sent != share` refusal in RunServer._priced (the server mints `figure`)
+    assert _mints(env) == [] and env.control.minted == {} and env.runtime.starts == []
+    assert (report.outcome, report.state) == ("session_spawn_failed", "failed")
+    assert "dollars-not-the-links-share" in caplog.text
+
+
+def test_a_fire_that_reserved_exactly_the_signed_figure_mints_that_figure(rig, env):
+    oid = _occurrence(rig, billing="api_key", micros=1_000_000)
+    client = _brokered(env)
+    _sup, report = _run(rig, oid, client, micros=1_000_000)
+    # REVERT: the fire's `reserved.usd_micros` on its SessionLaunch (it sends none and is refused)
+    assert _mints(env) == [1_000_000], report
+    assert env.runtime.starts[0].auth == "brokered"
+    with rig.store.read() as c:
+        (held,) = c.execute("SELECT reserved_usd_micros FROM agent_reservations WHERE occurrence_id = ?",
+                            (oid,)).fetchone()
+    assert held == 1_000_000            # the keys cap is the window's debit, to the micro-dollar
+
+
+def test_a_brokered_launch_that_sends_no_dollars_is_refused(rig, env):
+    oid = _occurrence(rig, billing="api_key")
+    client = _brokered(env)
+    with pytest.raises(L.LauncherRefused) as exc:
+        client.spawn(S.SessionLaunch(oid, "s-00000000000000b4", "claude", "sonnet", "b", "brokered", None))
+    assert exc.value.name == "dollars-not-the-links-share" and env.control.minted == {}
+
+
+def test_a_passthrough_server_refuses_a_launch_that_carries_dollars(rig, env):
+    oid = _occurrence(rig, billing="subscription", exposure=EXP)
+    with pytest.raises(L.LauncherRefused) as exc:
+        env.client().spawn(S.SessionLaunch(oid, "s-00000000000000b5", "claude", "sonnet", "b", "passthrough", EXP,
+                                           None, 0))
+    # REVERT: the passthrough leg of RunServer._priced
+    assert exc.value.name == "dollars-on-a-passthrough-launch" and env.control.minted == {}
+
+
+def test_the_dollars_travel_on_a_brokered_launch_frame_only():
+    proof = C.LinkProof("oc-1", "h", "l", "s", C.LinkRow(1, "", "{}", "fp", "sig"), C.LinkRow(1, "", "{}", "fp", "sig"))
+    priced = S.SessionLaunch("oc-1", "s-00000000000000b6", "claude", "sonnet", "b", "brokered", None, None, 250_000)
+    plain = S.SessionLaunch("oc-1", "s-00000000000000b7", "claude", "sonnet", "b", "passthrough", EXP)
+    wire = C.launch_to_wire(priced, proof)
+    assert wire["launch"]["usd_micros"] == 250_000
+    assert C.launch_from_wire({"p": C.PROTOCOL, "op": "LAUNCH", "id": 1, **wire})[0].usd_micros == 250_000
+    # a launch with no dollars sends the frame it always sent: no key, so an older server reads it unchanged
+    assert "usd_micros" not in C.launch_to_wire(plain, proof)["launch"]
+    assert C.launch_from_wire({"p": C.PROTOCOL, "op": "LAUNCH", "id": 1,
+                               **C.launch_to_wire(plain, proof)})[0].usd_micros is None
+    for bad in (-1, True, 1.5, "1"):
+        w = C.launch_to_wire(priced, proof)
+        w["launch"]["usd_micros"] = bad
+        with pytest.raises(C.WireError):
+            C.launch_from_wire({"p": C.PROTOCOL, "op": "LAUNCH", "id": 1, **w})

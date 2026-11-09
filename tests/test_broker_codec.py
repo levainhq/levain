@@ -916,3 +916,101 @@ def test_codec_responses_call_names_read_the_requests_tools():
     r.feed(ev)
     assert r.result() == want
     assert _read("openai-responses", json.dumps(body).encode(), False).uses == (("file_search", 1), ("web_search", 1))
+
+
+# --- prel3 L3 3ca (1108-34-handoff/l3_prel3_3ca.txt): each test is its finding's own failure ------------------------
+
+
+@pytest.mark.parametrize("cname,body", [
+    # 3ca-2 (codex HIGH): OpenRouter runs `openrouter:*` server tools upstream and feeds their results back
+    ("openai-chat", '{"model":"m1","messages":[],"tools":[{"type":"openrouter:web_search"}]}'),
+    ("openai-responses", '{"model":"m1","input":"x","tools":[{"type":"openrouter:web_fetch"}]}'),
+    ("anthropic-messages", '{"model":"m1","max_tokens":10,"messages":[],"tools":[{"type":"openrouter:web_search"}]}'),
+])
+def test_3ca2_an_openrouter_server_tool_is_unbounded(cname, body):
+    tool = json.loads(body)["tools"][0]["type"]
+    assert _go(cname, body, EA if cname.startswith("anthropic") else EO, dispatch=True) == f"body-unbounded:{tool}"
+    got = _go(cname, body, EA if cname.startswith("anthropic") else EO)
+    assert got[1] == (tool,)
+
+
+@pytest.mark.parametrize("cname,body", [
+    # 3ca-2: `max_tool_calls` sets how many server-side tool calls a request may make
+    ("openai-chat", '{"model":"m1","messages":[],"max_tool_calls":30}'),
+    ("openai-responses", '{"model":"m1","input":"x","max_tool_calls":30}'),
+])
+def test_3ca2_max_tool_calls_is_unbounded(cname, body):
+    assert _go(cname, body, EO, dispatch=True) == "body-unbounded:max_tool_calls"
+
+
+def test_3ca2_max_tool_calls_null_is_disabled():
+    for cname, body in (("openai-chat", '{"model":"m1","messages":[],"max_tool_calls":null}'),
+                        ("openai-responses", '{"model":"m1","input":"x","max_tool_calls":null}')):
+        got = _go(cname, body, EO, dispatch=True)
+        assert not isinstance(got, str) and got[1] == ()
+
+
+def test_3ca1_a_stored_prompt_is_unbounded_and_null_disables_it():
+    # 3ca-1 (complement + codex): a stored prompt is a server-held template the estimate cannot see
+    assert _go("openai-responses", '{"model":"m1","input":"x","prompt":{"id":"p"}}', EO,
+               dispatch=True) == "body-unbounded:prompt"
+    got = _go("openai-responses", '{"model":"m1","input":"x","prompt":null}', EO, dispatch=True)
+    assert not isinstance(got, str) and got[1] == ()
+
+
+# --- prel3fix3 r1 (1108-39-handoff): L1-F1/F2 = L2-M2, each field read from the vendor page named ------------------
+
+_AM = '{"model":"m1","max_tokens":10,"messages":[]'
+
+
+@pytest.mark.parametrize("field,value", [
+    # OpenRouter's Anthropic-style endpoint takes `plugins` (web, web-fetch, file-parser):
+    # https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-a-message.md
+    ("plugins", '[{"id":"web"}]'),
+    # on-demand compaction: the summary call reports `input_tokens: 0, output_tokens: 0` at the top level, the billed
+    # tokens only in `usage.iterations`: https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand
+    ("compaction", '{}'),
+])
+def test_r1_anthropic_messages_unbounded_field(field, value):
+    body = _AM + f',"{field}":{value}}}'
+    assert _go("anthropic-messages", body, EA, dispatch=True) == f"body-unbounded:{field}"
+    got = _go("anthropic-messages", body, EA)
+    assert got[1] == (field,)
+
+
+@pytest.mark.parametrize("field,value", [("plugins", "[]"), ("compaction", "null")])
+def test_r1_anthropic_messages_disabled_spelling_is_bounded(field, value):
+    got = _go("anthropic-messages", _AM + f',"{field}":{value}}}', EA, dispatch=True)
+    assert not isinstance(got, str) and got[1] == ()
+
+
+def test_r1_a_compaction_edit_in_context_management_is_unbounded():
+    # threshold compaction "requires an additional sampling step, which contributes to rate limits and billing", and
+    # the top-level usage excludes it: https://platform.claude.com/docs/en/build-with-claude/compaction-threshold
+    body = _AM + ',"context_management":{"edits":[{"type":"clear_tool_uses_20250919"},{"type":"compact_20260112"}]}}'
+    assert _go("anthropic-messages", body, EA, dispatch=True) == "body-unbounded:context_management"
+    assert _go("anthropic-messages", body, EA)[1] == ("context_management",)
+
+
+@pytest.mark.parametrize("cm", ['null', '{"edits":[{"type":"clear_tool_uses_20250919"}]}', '{"edits":[]}'])
+def test_r1_context_management_with_no_compaction_edit_is_bounded(cm):
+    # context editing only removes content the estimate already priced; no sampling step is added
+    got = _go("anthropic-messages", _AM + f',"context_management":{cm}}}', EA, dispatch=True)
+    assert not isinstance(got, str) and got[1] == ()
+
+
+@pytest.mark.parametrize("cname,body", [
+    # `fallbacks`: "Fallback models to try if the primary model fails or refuses, in order." (OpenRouter's Anthropic-
+    # style endpoint, page above): another model may run and be billed at its price, the 3c-9 class
+    ("anthropic-messages", _AM + ',"fallbacks":["m2"]}'),
+    ("openai-chat", '{"model":"m1","messages":[],"fallbacks":["m2"]}'),
+    ("anthropic-messages", _AM + ',"fallbacks":"m2"}'),
+])
+def test_r1_a_fallback_model_list_is_model_not_allowed(cname, body):
+    assert _go(cname, body, EA, dispatch=False) == "model-not-allowed"
+
+
+@pytest.mark.parametrize("fb", ['null', '[]', '["m1"]'])
+def test_r1_fallbacks_naming_no_other_model_is_admitted(fb):
+    got = _go("anthropic-messages", _AM + f',"fallbacks":{fb}}}', EA, dispatch=True)
+    assert not isinstance(got, str) and got[1] == ()

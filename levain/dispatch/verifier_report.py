@@ -100,7 +100,11 @@ class ReportRefused(DispatchError):
 @dataclass(frozen=True)
 class VerifierRun:
     """What the supervisor minted for ONE verifier session of ONE run of a job: ``verifier`` is the resolved entry
-    (:data:`VERIFIER_KEYS`), ``steps`` the ticket's ``verifier_steps``. Not persisted here; the writer's argument."""
+    (:data:`VERIFIER_KEYS`), ``steps`` the ticket's ``verifier_steps``. ``ticket`` is the VERIFIER ticket, which
+    carries no route (``levain.slot.tickets.check_facts`` forbids one). The run's EXECUTOR ticket facts are not
+    here: whoever builds a VerifierRun (a follower's ``resolve``) could set them, so the run record's backend identity
+    reads them from the supervisor-owned ``ticket_for`` reader instead (F9a, :meth:`levain.dispatch.jobs.JobStore.
+    record_verification`). Not persisted here; the writer's argument."""
     job_id: str
     run: int
     session: str

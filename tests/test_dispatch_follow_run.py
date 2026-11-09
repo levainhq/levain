@@ -21,6 +21,7 @@ from levain.slot import control as C
 from levain.slot import control_client as CC
 from tests.test_dispatch_follow import (Dispatch, acked, artifact_follower, exported, published,  # noqa: F401
                                         served, setup_verifier)
+from tests import test_dispatch_verifier_report as tvr
 from tests.test_dispatch_jobs import at_state, base_tree, clock, model, repo, store  # noqa: F401 - fixtures
 from tests.test_routemaps import st  # noqa: F401 - the signed store fixture
 from tests.test_tickets import DISPATCH_UID
@@ -81,7 +82,8 @@ def test_control_down_backs_off_doubling_then_resumes_and_converges(store, repo,
             servers.append(server)
 
     waits = Waits(then=then)
-    f = F.EventFollower.at(store, path, d.resolve, read_deadline=0.5)
+    f = F.EventFollower.at(store, path, d.resolve, read_deadline=0.5, routemap=tvr.routemap,
+                           ticket_for=tvr.ticket_for)
     runner = FR.FollowRunner(f, first_s=1.0, max_s=8.0, lasting_s=100.0, wait=waits)
     t = in_thread(runner)
     try:

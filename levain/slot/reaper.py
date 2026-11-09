@@ -748,10 +748,14 @@ class Reaper:
     def _refill(self, store: H.Store) -> Optional[bool]:
         """Whether the reserve is full, or None when its lock is busy (a release is truncating it)."""
         reserve = E.Reserve(store.path / "reserve", self.tuning.reserve_bytes)
+        free = lambda: self.seams.free_bytes(store.fd)      # noqa: E731
+        if not os.path.lexists(reserve.path) and reserve.refill_headroom(free, floor=self.tuning.floor_bytes) <= 0:
+            return False          # taking the lock would create the file: nothing is created below the margin
+        # An existing reserve still goes through its lock, so a busy lock keeps answering None.
         with _reserve_lock(reserve.path) as held:
             if not held:
                 return None
-            return reserve.refill(lambda: self.seams.free_bytes(store.fd), floor=self.tuning.floor_bytes)
+            return reserve.refill(free, floor=self.tuning.floor_bytes)
 
     # -- step 7: pool health (§3.5) ------------------------------------------------------------------------------------
 
