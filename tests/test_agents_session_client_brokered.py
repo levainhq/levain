@@ -121,6 +121,38 @@ def test_usage_and_end_of_a_brokered_session_go_to_the_brokered_socket_also_from
     assert (got.usd_micros, got.source) == (4242, "session:brokered") and wire.opens == {"passthrough": 0, "brokered": 2}
 
 
+def test_a_policy_flip_to_passthrough_after_start_does_not_move_a_brokered_sessions_usage_and_end(lrig, pair, tmp_path,
+                                                                                                    monkeypatch):
+    import os
+    from levain.slot import layout
+    from levain.slot.services import dispatch_run as DR
+    policy = tmp_path / "dispatch_auth"
+    monkeypatch.setattr(layout, "policy_dispatch_auth_path", lambda host: policy)
+    oid = _occurrence(lrig, billing="api_key", micros=1_000_000)
+    client, _wire = client_of(lrig, pair)
+    launch, _figure = api_launch(lrig, oid, KEY_B)
+    record(lrig, oid, KEY_B)
+    child = client.spawn(launch)
+    child.release()
+    policy.write_bytes(DR.DISPATCH_AUTH_OFF)
+    policy.chmod(0o600)
+    assert DR.read_dispatch_auth(policy, owner=os.getuid()) == ("passthrough", None)       # the opt-out is now in force
+    rebuilt, wire = client_of(lrig, pair)
+    ended = rebuilt.end_session(KEY_B, 10)
+    got = rebuilt.usage(KEY_B)
+    assert (got.usd_micros, got.source) == (4242, "session:brokered")
+    assert ended.terminated is True and wire.opens == {"passthrough": 0, "brokered": 2}
+
+
+def test_a_reservation_with_no_billing_is_brokered_to_the_auth_reader(lrig):
+    oid = _occurrence(lrig, billing="api_key", micros=1_000_000)
+    record(lrig, oid, KEY_B)
+    auth_of = C.session_auth_of(lrig.store)
+    with lrig.store.write() as conn:
+        conn.execute("UPDATE agent_reservations SET billing = NULL WHERE occurrence_id = ?", (oid,))
+    assert auth_of(KEY_B) == "brokered"
+
+
 def test_a_subscription_sessions_usage_and_end_go_to_run_sock_only(lrig, pair):
     oid = _occurrence(lrig, billing="subscription", exposure=EXP)
     key = "s-00000000000000c3"
