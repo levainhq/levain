@@ -41,7 +41,7 @@ __all__ = [
     "host_dir", "cc_sandbox_block", "check_sandbox_types", "cc_hook_settings", "cc_mcp_config",
     "hook_pin", "check_or_record_pin", "repin", "agent_hook_pins", "check_agent_hook_pins",
     "repin_agent_hooks", "cc_sandbox_state", "check_managed_settings", "host_env",
-    "parse_cc_version", "CC_HOSTED_TOOLS", "CC_SEAT_TOOLS", "SEAT_SOURCE_ARGS", "CC_VERSION_FLOOR",
+    "parse_cc_version", "CC_HOSTED_TOOLS", "CC_SEAT_TOOLS", "SEAT_SOURCE_ARGS", "SETTING_SOURCES_MEASURED_VERSION", "CC_VERSION_FLOOR",
     "check_shared_code", "codex_initialize_params", "codex_config_overrides",
     "security_inputs_digest",
     "trust_managed", "load_managed_trust",
@@ -97,6 +97,11 @@ CC_SEAT_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep")
 # loaded, and an empty list loads nothing from the clone; `local` would admit settings.local.json.
 # This is the one place the spelling lives, so a different measured spelling is a one-line change.
 SEAT_SOURCE_ARGS = ("--setting-sources", "")
+
+# The one Claude Code version the empty list above was measured on (the flag value is not in the vendor's docs). A
+# different installed version makes doctor re-run `levain.setting_sources_canary` and report; after a passing re-run,
+# bump this to the version it passed on.
+SETTING_SOURCES_MEASURED_VERSION = (2, 1, 319)
 
 
 # `.codex`: r3a measured a sandboxed model Bash creating <ws>/.codex/config.toml in hosted CC
