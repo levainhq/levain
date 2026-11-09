@@ -795,8 +795,8 @@ def coordinator_apply(store: CoordStore, token: Any, *, sessions: Any = None,
     ``coordinator`` with its own live ``token``, through :func:`apply_reports`: the same judging, the same facts only,
     the same refusals with a record. The lease is neither taken nor released here. Every pass on a board with a queue
     file records the sessions its listing shows (``sessions_seen``), a report queued or not. Returns ``[]`` when no
-    report is queued, else one line. Raises :class:`CoordError` when ``token`` is not the live lease; a directory that is the
-    live consent store is never a board (one line, nothing applied)."""
+    report is queued, else one line. Raises :class:`CoordError` when ``token`` is not the live lease; a directory that
+    is the live consent store is never a board (one line, nothing applied)."""
     directory = Path(store.directory)
     if is_live_consent(directory):
         return [f"board reports: not applied, {directory} is the live consent store and never a board"]
