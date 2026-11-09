@@ -67,6 +67,38 @@ def test_a_symlinked_or_oversized_file_is_refused(tmp_path):
     assert SA.read_regular(real) == real.read_bytes()
 
 
+class SignedView:
+    """A store whose answers read as signed (the native store records no signature, so a test stands one in)."""
+
+    def __init__(self, qs, signed):
+        self.qs, self.signed = qs, signed
+
+    def __getattr__(self, name):
+        return getattr(self.qs, name)
+
+    def recent(self, n):
+        return [dataclasses.replace(q, answer=None if q.answer is None else dataclasses.replace(q.answer, signed=self.signed))
+                for q in self.qs.recent(n)]
+
+
+def test_an_unsigned_yes_never_reaches_the_allow_file(qdir, capsys):
+    from types import SimpleNamespace
+
+    allow = qdir / SA.FILE_NAME
+    qs = QuestionStore(qdir)
+    SA.file_rows(qdir, "S1", ["WebSearch"], store=qs)
+    qs.answer(qs.open_questions()[0].id, option="yes", channel="cli")
+    for view in (qs, SignedView(qs, None), SignedView(qs, False)):
+        assert SA.apply_answered(qdir, allow, store=view) == []
+        assert SA.rules_of(allow) == []
+        assert SA.unsigned_yes(qdir, store=view) == ["WebSearch"]
+    SA.run(SimpleNamespace(queue_dir=qdir, slot_allow_verb="list"))
+    assert "WebSearch\t(answered unsigned: sign it to carry it)" in capsys.readouterr().out
+    # signing it later carries it
+    assert SA.apply_answered(qdir, allow, store=SignedView(qs, True)) == ["WebSearch"]
+    assert SA.unsigned_yes(qdir, store=SignedView(qs, True)) == []
+
+
 def test_an_unsigned_rule_never_reaches_a_launch_and_a_yes_does(qdir, tmp_path):
     checkout = tmp_path / "checkout"
     (checkout / ".claude").mkdir(parents=True)
@@ -85,7 +117,7 @@ def test_an_unsigned_rule_never_reaches_a_launch_and_a_yes_does(qdir, tmp_path):
     no = next(q for q in qs.open_questions() if "WebSearch" in q.what)
     qs.answer(yes.id, option="yes", channel="cli")
     qs.answer(no.id, option="no", channel="cli")
-    assert SA.apply_answered(qdir, allow, store=qs) == ["Bash(npm test *)"]
+    assert SA.apply_answered(qdir, allow, store=SignedView(qs, True)) == ["Bash(npm test *)"]
     assert SA.rules_of(allow) == ["Bash(npm test *)"]
     assert SA.load(allow)["rules"][0]["session"] == "S1"
     # a no is not refiled while it stands, and the checkout is byte-identical
