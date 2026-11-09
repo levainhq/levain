@@ -1,4 +1,6 @@
 """The root-py39 job's closure (tests/ci/root_closure.py): its dynamic-execution table is a tripwire."""
+import ast
+import contextlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -13,6 +15,75 @@ _spec = importlib.util.spec_from_file_location("root_closure_under_test", _PATH)
 rc = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = rc
 _spec.loader.exec_module(rc)
+
+
+class _MemoAst:
+    """``ast`` as the closure module sees it, with ``parse`` and ``walk`` remembered: the walk of the real tree
+    parses and walks the same test files and helpers again and again, and a remembered result is the same nodes in
+    the same order, so no walk answers differently. Parses are keyed by source text, so a test that writes its own
+    tree to a scratch directory gets a fresh parse of whatever it wrote."""
+
+    def __init__(self):
+        self.__dict__.update(vars(ast))  # the node classes, read in the hot loops
+        self.parse, self.walk = self._parse, self._walk  # after the copy, which holds the plain ones
+        self._parsed, self._walked, self.imports = {}, {}, {}
+
+    def _parse(self, source, filename="<unknown>", *args, **kw):
+        if args or kw:
+            return ast.parse(source, filename, *args, **kw)
+        key = (source, filename)
+        if key not in self._parsed:
+            self._parsed[key] = ast.parse(source, filename)
+        return self._parsed[key]
+
+    #: the functions of the closure module whose every loop over a walk tests ``Import`` or ``ImportFrom`` and nothing
+    #: else, so the import nodes alone, in walk order, answer them exactly
+    _IMPORT_ONLY = frozenset({"_test_deps", "_levain_imports"})
+
+    def _walk(self, node):
+        only = sys._getframe(1).f_code.co_name in self._IMPORT_ONLY
+        key = (id(node), only)
+        entry = self._walked.get(key)
+        if entry is None or entry[0] is not node:
+            nodes = ast.walk(node)
+            if only:
+                nodes = [n for n in nodes if isinstance(n, (ast.Import, ast.ImportFrom))]
+            entry = self._walked[key] = (node, list(nodes))
+        return iter(entry[1])
+
+
+_MEMO = _MemoAst()
+
+
+@contextlib.contextmanager
+def _remembered():
+    """The closure module reading the real repo tree through the remembered ``ast`` (and a remembered import set
+    per parsed tree and root), for the tests that write nothing under it."""
+    plain_ast, plain_imports = rc.ast, rc._levain_imports
+
+    def imports(tree):
+        key = (id(tree), rc.ROOT)
+        if key not in _MEMO.imports:
+            _MEMO.imports[key] = (tree, plain_imports(tree))
+        return _MEMO.imports[key][1]
+
+    rc.ast, rc._levain_imports = _MEMO, imports
+    try:
+        yield rc
+    finally:
+        rc.ast, rc._levain_imports = plain_ast, plain_imports
+
+
+@pytest.fixture
+def real_tree_memo():
+    with _remembered():
+        yield rc
+
+
+@pytest.fixture(scope="module")
+def real_closure():
+    with _remembered():
+        return rc.closure()
 
 
 def test_every_dynamic_execution_site_is_classified():
@@ -77,7 +148,7 @@ DISPATCH = "levain.slot.services.dispatch"
 DISPATCH_RUN = "levain.slot.services.dispatch_run"
 
 
-def test_root_verifies_a_route_map_without_the_authority_store_or_the_autonomic_package():
+def test_root_verifies_a_route_map_without_the_authority_store_or_the_autonomic_package(real_tree_memo):
     """S1 3c-4: CONTROL and keys verify a route map's signature with ``levain.authority_sig``; the authority store
     (its replay reaches the cockpit) and ``levain.autonomic`` stay out of what root imports. The queue broker's
     service runs as ``_levain_qbroker``, never root, and verifies signed grants and counts limits with both, so it is
@@ -96,7 +167,7 @@ def test_root_verifies_a_route_map_without_the_authority_store_or_the_autonomic_
     assert "levain.authority" not in mods and not {m for m in mods if m.startswith("levain.autonomic")}
 
 
-def test_the_queue_broker_imports_neither_the_agent_hooks_nor_the_dispatch_cli():
+def test_the_queue_broker_imports_neither_the_agent_hooks_nor_the_dispatch_cli(real_tree_memo):
     """The queue broker's closure holds what its paths run, not the agent hooks or the operator's dispatch CLI: the
     rules it shares with the hooks live in the leaf ``levain.consent.adapters.rules``, the contract bound in
     ``levain.dispatch.contract``."""
@@ -115,10 +186,10 @@ def test_the_root_closure_never_holds_the_operator_side_effects_module():
         "root-run code does not import the operator-side effects module; import them from levain.intention_legacy")
 
 
-def test_every_excluded_test_file_exists_is_selected_without_the_table_and_holds_its_evidence():
+def test_every_excluded_test_file_exists_is_selected_without_the_table_and_holds_its_evidence(real_tree_memo, real_closure):
     """An entry of NOT_ROOT_TESTS cannot rot: its file exists, the import rule alone would still select it (so the
     entry still excludes something), and both evidence strings of its reason are where it says."""
-    mods = rc.closure()
+    mods = real_closure
     unfiltered = set(rc._test_files(mods, excluded={}))
     filtered = set(rc._test_files(mods))
     assert unfiltered - filtered == set(rc.NOT_ROOT_TESTS)
@@ -143,10 +214,10 @@ def test_a_test_with_an_unparseable_helper_is_not_selected(tmp_path, monkeypatch
     assert "skipped (3.10+ syntax): tests/test_a.py" in capsys.readouterr().err
 
 
-def test_every_function_local_import_in_the_closure_is_classified():
+def test_every_function_local_import_in_the_closure_is_classified(real_closure):
     """A new function-local ``levain`` import in a closure module fails here until it is a row of LAZY_SITES, ``"root"``
     or ``"operator"``, so a lazy import a root process can run cannot be missed by the import-graph walk."""
-    found, table = sorted(rc.lazy_sites(rc.closure())), sorted(rc.LAZY_SITES)
+    found, table = sorted(rc.lazy_sites(real_closure)), sorted(rc.LAZY_SITES)
     assert found == table, {"unclassified": sorted(set(found) - set(table)), "stale": sorted(set(table) - set(found))}
     assert set(rc.LAZY_SITES.values()) == {"root", "operator"}
 
