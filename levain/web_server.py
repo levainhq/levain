@@ -3167,7 +3167,7 @@ class _Handler(GuardedHandler):
             if raw and not (len(raw) <= 9 and raw.isascii() and raw.isdigit()):    # an over-long digit string never reaches int()
                 return {"ok": False, "error": "bad_request", "message": "limit is a whole number"}, 400
             doc = center.list_items(store, limit=int(raw) if raw else center.PAGE, before=q.get("before", [None])[0])
-            n = needs.open_needs_count(queue)
+            n = needs.open_needs_count(queue, getattr(self.server, "question_store", None))
             return (doc if n is None else {**doc, "needs_count": n}), 200
         except center.CenterError as exc:
             return {"ok": False, "error": exc.code, "message": str(exc)}, exc.status

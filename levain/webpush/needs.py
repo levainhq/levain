@@ -13,16 +13,18 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 __all__ = ["BADGE_MAX", "open_needs_count", "badge_value"]
 
 BADGE_MAX = 99      # payload room is tight and a badge past two digits says nothing more; the page shows the exact count
 
 
-def open_needs_count(queue_dir: "Path | str") -> "int | None":
+def open_needs_count(queue_dir: "Path | str", question_source: Any = None) -> "int | None":
     """Pending consent requests plus open questions in ``queue_dir`` as of now. Each store is read on its own so a failure in one
     does not stop the other, but either failing makes the answer None (unknown), never a lower-bound number.
-    Creates nothing (a queue with no ``questions.db`` has no open questions)."""
+    Creates nothing (a queue with no ``questions.db`` has no open questions). ``question_source``: the store the server serves
+    its questions from (anything with ``open_questions()``, as a host's store has); none reads the native store in ``queue_dir``."""
     total, failed = 0, False
     try:
         from levain.consent.listing import read_listing
@@ -35,7 +37,7 @@ def open_needs_count(queue_dir: "Path | str") -> "int | None":
         from levain.band_view import later_facets
         from levain.consent.questions import QuestionStore
 
-        store = QuestionStore(queue_dir)
+        store = question_source if question_source is not None else QuestionStore(queue_dir)
         # an open question snoozed past today is not counted, as on the strip (band_view.later_facets, the one LATER
         # predicate; a fault there is due, so the question still counts)
         # nor is a row the desk alone owes (section desk, not carried over to him): the strip's rule (dashboard_core needsItems)
@@ -47,7 +49,7 @@ def open_needs_count(queue_dir: "Path | str") -> "int | None":
     return None if failed else total
 
 
-def badge_value(queue_dir: "Path | str") -> "int | None":
+def badge_value(queue_dir: "Path | str", question_source: Any = None) -> "int | None":
     """The int a push carries as ``badge``: the open count clipped to :data:`BADGE_MAX`, None when unknown."""
-    n = open_needs_count(queue_dir)
+    n = open_needs_count(queue_dir, question_source)
     return None if n is None else min(max(n, 0), BADGE_MAX)

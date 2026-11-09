@@ -53,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
         title, body, ref, url = f["title"], f["body"], f.get("ref"), f.get("url") or "/"
         command, push, hold = f.get("command"), f.get("push", True), f.get("hold")
         data = f.get("data") if isinstance(f.get("data"), dict) else None   # extra fields: one off its shape is dropped, never the ping
+        badge = f.get("badge")
+        if type(badge) is not int or badge < 0:
+            badge = None     # a count off its shape is dropped, never the ping
         if (not all(isinstance(x, str) for x in (title, body, url)) or not (ref is None or isinstance(ref, str))
                 or not (command is None or isinstance(command, bool)) or not isinstance(push, bool)
                 or hold not in (None, "quiet", "sleep", "active", "lets")):   # "lets": a mute from his base lets-through setting (intent._decide)
@@ -62,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         sender.send(a.queue_dir, kind=a.kind, ref=ref, title=title, body=body, url=url, command=command, push=push, hold=hold,
-                    data=data)
+                    data=data, badge=badge)
         if push:   # a ping that reached the phone is also a moment when pings held earlier may be due
             from levain.webpush import held
 
