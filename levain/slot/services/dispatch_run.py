@@ -138,6 +138,11 @@ WAIT_MAX_S = 30.0
 MAX_CONNECTIONS = 64
 #: [judged] holder connections are capped BELOW the connection cap, so USAGE and END always find a permit
 MAX_HOLDERS = 48
+#: [judged] connections past the general cap that may each carry ONE END and nothing else: an END is the way a session
+#: stops, so USAGE or idle callers filling the general pool must never leave it unservable
+MAX_END_RESERVE = 8
+#: [judged] how long an overflow connection may take to send its one frame before it is dropped
+END_RESERVE_READ_S = 5.0
 #: [judged] how long a holder's own cleanup waits for its END job before its thread lets go (the job runs on)
 HOLDER_END_WAIT_S = 10.0
 #: [judged] how long a RELEASE refused at the point of use waits for its END job before it answers: under the client's
@@ -578,7 +583,7 @@ class RunServer:
                  verify: Callable[[C.LinkProof, Optional[ActionExposure], Optional[FrameClaims]], Any],
                  pool_free: Callable[[], bool], peer_ok: Callable[[socket.socket], bool],
                  holder_idle_s: float = HOLDER_IDLE_S, max_connections: int = MAX_CONNECTIONS,
-                 max_holders: int = MAX_HOLDERS, replica: Optional[AuthorityReplica] = None,
+                 max_holders: int = MAX_HOLDERS, max_end_reserve: int = MAX_END_RESERVE, replica: Optional[AuthorityReplica] = None,
                  uploads: Optional[WS.WorkspaceUploads] = None, registry: Optional[HolderRegistry] = None) -> None:
         if not 0 < max_holders < max_connections:
             raise ValueError("holders must be capped below the connection cap (USAGE and END need a permit)")
@@ -593,6 +598,7 @@ class RunServer:
         self._live = self._reg.live
         self._slots = threading.BoundedSemaphore(max_connections)
         self._holder_slots = threading.BoundedSemaphore(max_holders)
+        self._end_slots = threading.BoundedSemaphore(max(1, max_end_reserve))
         self._closing = False
         with self._mu:
             self._reg.servers.append(self)
@@ -609,9 +615,15 @@ class RunServer:
 
     def handle(self, sock: socket.socket) -> None:
         """Serve one connection to its end. Never raises."""
+        # The verb is in the first frame, so a connection that finds the general pool full cannot be judged by its
+        # verb at accept. It takes a permit from the small END reserve instead, is read under a short timeout, and is
+        # served only if that frame is an END (one frame, then closed); any other first frame is refused as busy.
+        end_only = False
         if not self._slots.acquire(blocking=False):
-            sock.close()
-            return
+            if not self._end_slots.acquire(blocking=False):
+                sock.close()
+                return
+            end_only = True
         mine: Optional[_Holder] = None
         owner = WS.UploadOwner()          # the workspace uploads this connection began (dropped if no LAUNCH took them)
         try:
@@ -620,7 +632,7 @@ class RunServer:
                     return
             except Exception:  # noqa: BLE001 - a peer that cannot be identified is refused
                 return
-            sock.settimeout(self._idle)
+            sock.settimeout(END_RESERVE_READ_S if end_only else self._idle)
             while True:
                 try:
                     req = C.read_run_frame(sock)
@@ -634,6 +646,9 @@ class RunServer:
                     self._send(sock, C.refused_answer(None, "protocol-mismatch" if str(exc) == "protocol-mismatch"
                                                        else "bad-request", str(exc)))
                     return
+                if end_only and op != "END":
+                    self._send(sock, C.refused_answer(rid, "busy", "the connection pool is full", "transient"))
+                    return
                 try:
                     ans, mine = self._op(op, req, rid, mine, owner)
                 except LauncherRefused as exc:
@@ -644,7 +659,7 @@ class RunServer:
                 except Exception as exc:  # noqa: BLE001
                     _report_failure(op, exc)
                     ans = C.refused_answer(rid, "internal-error", _refusal_cause(exc), reason_class="transient")
-                if not self._send(sock, ans):
+                if not self._send(sock, ans) or end_only:
                     return
         finally:
             if self._uploads is not None:
@@ -655,7 +670,7 @@ class RunServer:
                 sock.close()
             except OSError:
                 pass
-            self._slots.release()
+            (self._end_slots if end_only else self._slots).release()
 
     @staticmethod
     def _send(sock: socket.socket, ans: dict) -> bool:

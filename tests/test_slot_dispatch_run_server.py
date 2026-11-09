@@ -288,6 +288,32 @@ def test_holders_cannot_take_the_permits_usage_and_end_need(rig, tmp_path):
     env.drain()
 
 
+def test_an_end_is_served_while_idle_and_usage_callers_hold_every_general_permit(rig, tmp_path):
+    """R4x: callers that fill the general pool cannot leave an END refused at the permit; the first frame decides."""
+    env = Env(rig, tmp_path, max_connections=3, max_holders=2)
+    filler = []
+    for _ in range(3):
+        sock = env.connect()
+        sock.sendall(C.encode_run_frame({"p": C.PROTOCOL, "op": "USAGE", "id": 1, "session_key": "s-00000000000000ff"}))
+        assert C.read_run_frame(sock)["ok"] is True       # answered, and the connection (its permit) stays held
+        filler.append(sock)
+    sock = env.connect()
+    sock.sendall(C.encode_run_frame({"p": C.PROTOCOL, "op": "END", "id": 2, "session_key": "s-00000000000000ee",
+                                     "deadline_ms": 1000}))
+    ans = C.read_run_frame(sock)
+    assert ans is not None and ans.get("refused") is None and ans["id"] == 2
+    sock.close()
+    # a non-END first frame on an overflow connection is refused as busy, never served
+    sock = env.connect()
+    sock.sendall(C.encode_run_frame({"p": C.PROTOCOL, "op": "USAGE", "id": 3, "session_key": "s-00000000000000ff"}))
+    ans = C.read_run_frame(sock)
+    assert ans is not None and ans["refused"] == "busy"
+    sock.close()
+    for sock in filler:
+        sock.close()
+    env.drain()
+
+
 def test_a_proven_end_is_never_evicted_and_never_rerun(rig, tmp_path, monkeypatch):
     """codex MED r1 :397: a proven END answers every repeat, however many other keys were ENDed since."""
     monkeypatch.setattr(D, "_JOBS_KEEP", 4)
