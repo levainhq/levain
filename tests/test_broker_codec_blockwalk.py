@@ -43,6 +43,9 @@ def _oc_parts(*parts):
     (OR, _body(OR, input=[{"role": "user", "content": [{"type": "input_video", "video_url": "u"}]}]),
      "body-unlisted:input_video"),
     (OR, _or({"type": "tool_search_call", "execution": "server"}), "body-unbounded:tool_search_call"),
+    (OR, _or({"type": "tool_search_call"}), "body-unbounded:tool_search_call"),           # admitted only when it says client
+    (OR, _or({"type": "tool_search_call", "execution": "Server"}), "body-unbounded:tool_search_call"),
+    (OR, _or({"type": "tool_search_output", "execution": "server", "tools": []}), "body-unbounded:tool_search_output"),
     (AM, _am({"type": "advisor_tool_result", "tool_use_id": "a"}), "body-unbounded:advisor_tool_result"),
     (AM, _am({"type": "server_tool_use", "id": "s", "name": "n"}, role="assistant"), "body-unbounded:server_tool_use"),
     (AM, _am({"type": "web_search_tool_result", "tool_use_id": "s"}), "body-unbounded:web_search_tool_result"),
@@ -56,7 +59,8 @@ def _oc_parts(*parts):
     (OC, _body(OC, messages=[{"role": "assistant", "content": "x", "audio": {"id": "audio_1"}}]),
      "body-unbounded:audio"),
 ], ids=["resp-item-ref", "resp-typeless-ref", "resp-compaction-trigger", "resp-compaction", "resp-search-call",
-        "resp-video", "resp-search-call-server", "am-advisor", "am-server-tool-use", "am-ws-result", "am-compaction",
+        "resp-video", "resp-search-call-server", "resp-search-call-unsaid", "resp-search-call-case",
+        "resp-search-output-server", "am-advisor", "am-server-tool-use", "am-ws-result", "am-compaction",
         "am-unlisted", "am-browser-state", "am-doc-in-result", "chat-video", "chat-audio-ref"])
 def test_a_block_outside_the_allowlist_is_refused_on_dispatch(c, body, name):
     assert _check(c, body, dispatch=True) == name

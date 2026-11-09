@@ -1212,8 +1212,11 @@ class OpenAIResponses(_OpenAI):
         return super()._block_type(b, p)
 
     def _block_fault(self, t: str, b: Mapping[str, Any]) -> Optional[str]:
-        """A `tool_search_call` is client-run unless it says `server`, which is a provider-side tool run."""
-        if t == "tool_search_call" and b.get("execution") == "server":
+        """A tool search is admitted only when it says it ran on the client; a server run (or one that does not say) is a
+        provider-side tool run, and its output is that run's history."""
+        if t == "tool_search_call" and b.get("execution") != "client":
+            return "unbounded"
+        if t == "tool_search_output" and "execution" in b and b.get("execution") != "client":
             return "unbounded"
         return None
 
