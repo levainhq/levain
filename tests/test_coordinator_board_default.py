@@ -140,6 +140,21 @@ def test_a_store_a_drop_made_holds_no_coordinator(homes, capsys):
     assert CoordStore(consent).holds_coordinator() is False
 
 
+def test_a_dispatch_only_file_in_the_consent_dir_is_no_coordinator_store(homes, capsys):
+    """A dispatch.db the job store made (no coordinator tables) is not a coordinator store: with no board store, the
+    bare take still makes the board's coordinator."""
+    from levain.coordinator.store import CoordStore
+    from levain.dispatch.jobs import JobStore
+    consent, board = homes
+    with JobStore(consent)._connect():
+        pass
+    assert (consent / "dispatch.db").exists()
+    assert not CoordStore(consent).coordinator_present() and CoordStore(consent).holds_coordinator() is False
+    token = _json(capsys, "take")["token"]
+    assert (board / "dispatch.db").exists()
+    assert _json(capsys, "status")["lease"]["token"] == token
+
+
 def test_a_stale_token_in_both_stores_is_refused_by_name(homes, capsys):
     """A token both stores hold that neither current lease uses is the "in both" refusal, never a fall-through to
     whichever store is live."""

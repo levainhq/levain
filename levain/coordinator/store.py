@@ -773,8 +773,11 @@ class CoordStore:
         """Whether a coordinator was ever in this store, read as :meth:`coordinator_present` reads: a lease event, a
         coordinator setting, or a coordinator launch recorded. True when one is recorded; False when the tables that
         would hold one exist and hold none (a store a drop made); None when it cannot be told, because a table (or
-        the launches ``role`` column) predates this format. An unknown store is never read as an empty one."""
+        the launches ``role`` column) predates this format. An unknown store is never read as an empty one. A file with
+        no ``threads`` table is not a coordinator store at all (a dispatch-only file, an aborted init): False."""
         def held(conn: sqlite3.Connection, names: set[str]) -> bool | None:
+            if "threads" not in names:
+                return False
             unknown = False
             for table in ("lease_events", "coord_settings"):
                 if table not in names:
