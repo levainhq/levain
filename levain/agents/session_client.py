@@ -1179,8 +1179,13 @@ class DispatchSessionLauncher:
                     raise
                 # END only (L3 w3client r1, codex HIGH 2): the brokered server is gone (turned off, or its service
                 # down) and the session it launched must still be ended. The passthrough server shares its session
-                # index, so it can END the key; USAGE and LAUNCH never take this way.
-                sock = _open(self._connect, end - time.monotonic())
+                # index, so it can END the key; USAGE and LAUNCH never take this way. It gets what the ONE deadline
+                # has left, and none when the brokered connect spent it: the timeout a capped connect raises
+                # (L3 w3client r2 G1, gemini).
+                left = end - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("the deadline was spent on the brokered connect") from None
+                sock = _open(self._connect, left)
             conn = _Conn(sock)
             try:
                 left = end - time.monotonic()
