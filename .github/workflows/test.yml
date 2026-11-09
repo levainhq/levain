@@ -143,6 +143,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check that uv.lock agrees with pyproject.toml
+        run: |
+          python -m pip install "uv==0.13.5"
+          uv lock --check
+
       - name: Check the static shard list against the planner
         run: python tests/ci/shard.py check-static --workflow .github/workflows/test.yml
 
@@ -186,11 +191,10 @@ jobs:
         run: sudo chmod o+rx /run/podman || true
 
       - name: Install package with dev and openhands extras
-        # hatchling is a build dependency the packaging tests ask for directly; the openhands
+        # Installed from the committed uv.lock, hash-checked (scripts/ci_install_locked.sh); the openhands
         # extra is imported by the floor tests (tests/test_floor_project_memory.py).
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,openhands]" hatchling
+          scripts/ci_install_locked.sh dev openhands
 
       - name: Install h11 for the runner's /usr/bin/python3
         # tests/test_routemaps.py runs keys under /usr/bin/python3 too (the root-py param) and fails under CI when that
@@ -295,7 +299,7 @@ jobs:
       - name: Install h11 at or above the floor root vendors
         # root_tree stages h11 beside the levain package, so the root tree imports it; the closure's import-check
         # needs it as much as the tests do.
-        run: python -m pip install --upgrade pip pytest pytest-xdist "$(python tests/ci/root_closure.py h11-spec)"
+        run: python -m pip install --upgrade pip && python -m pip install --require-hashes -r requirements-ci-py39.txt
 
       - name: Install h11 for the runner's /usr/bin/python3
         # The keys process tests (tests/test_broker_keys_process.py, tests/test_control_keys_attach.py) also run keys
@@ -358,8 +362,7 @@ jobs:
 
       - name: Install package
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,openhands]" hatchling
+          scripts/ci_install_locked.sh dev openhands
 
       - name: Run the live floor tests
         env:
@@ -424,8 +427,7 @@ jobs:
 
       - name: Install package
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,openhands]" hatchling
+          scripts/ci_install_locked.sh dev openhands
 
       - name: Run the browser tests
         # basetemp outside $HOME, as in the pytest job above (tests/test_hermetic_home.py)
@@ -502,8 +504,7 @@ jobs:
 
       - name: Install package
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .
+          scripts/ci_install_locked.sh
 
       - name: Install the ACL tools (Linux)
         if: runner.os == 'Linux'
@@ -569,8 +570,7 @@ jobs:
 
       - name: Install package
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,openhands]" hatchling
+          scripts/ci_install_locked.sh dev openhands
 
       - name: Install uv
         # tests/chat_egress/composed/test_k1_corpus.py runs a real `uv` client through the egress rig; without uv the
