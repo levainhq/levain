@@ -104,9 +104,20 @@ def test_a_captured_log_line_before_the_summary_is_ignored():
     assert mod.parse_log(log) == ([A, B], False)
 
 
-def test_an_errors_section_header_is_errored():
+def test_an_errors_section_with_an_item_is_errored():
     log = "==== ERRORS ====\n_ ERROR at setup of test_x _\n" + LOG_FAILED
     assert mod.parse_log(log)[1] is True
+    # the section alone, with the item removed, is not enough (a bare header may be captured output)
+    assert mod.parse_log("==== ERRORS ====\n" + LOG_FAILED)[1] is False
+
+
+def test_a_spoofed_errors_header_after_the_summary_or_without_an_item_is_ignored():
+    assert mod.parse_log(LOG_FAILED + "==== ERRORS ====\n_ ERROR at setup of t _\n") == ([A, B], False)
+
+
+def test_a_spoofed_summary_header_in_captured_output_does_not_reopen_the_summary():
+    spoof = "==== short test summary info ====\nERROR tests/x.py::t - spoof\nFAILED tests/z.py::z - spoof\n"
+    assert mod.parse_log(spoof + "captured\n" + LOG_FAILED) == ([A, B], False)
 
 
 def test_no_summary_header_and_exit_1_means_no_rerun(run):
@@ -114,9 +125,14 @@ def test_no_summary_header_and_exit_1_means_no_rerun(run):
     assert rc == 1 and reruns == []
 
 
-def test_a_non_node_id_in_the_summary_is_skipped():
+def test_a_non_node_id_failed_line_in_the_summary_fails_closed():
     log = "==== short test summary info ====\nFAILED not a node id\nFAILED " + A + "\n"
-    assert mod.parse_log(log) == ([A], False)
+    assert mod.parse_log(log) == ([A], True)
+
+
+def test_a_non_node_id_error_line_in_the_summary_fails_closed():
+    log = "==== short test summary info ====\nERROR not a node id\nFAILED " + A + "\n"
+    assert mod.parse_log(log) == ([A], True)
 
 
 def test_a_dash_inside_brackets_is_part_of_the_id():
