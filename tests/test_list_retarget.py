@@ -11,7 +11,7 @@ import pytest
 from anneal_memory.spores import SporeStore
 
 from levain.cockpit.effects import canonical_effect
-from levain.cockpit.verbs import _date_tier
+from levain.cockpit.verbs import _date_tier, _date_escalates
 from levain.spores import executor_of, valid_retarget
 from tests.test_cockpit_k2a import TOKEN, _get, _post, _serve
 from tests.test_dashboard import _make_levain_install
@@ -113,7 +113,59 @@ def test_a_timed_snooze_round_trips_and_keeps_its_tier(tmp_path: Path) -> None:
                                                    "row_version": r["version"], "params": {"surface_at": "2031-02-03T25:99"}}, TOKEN)
         assert st >= 400, body
     assert SporeStore(root / ".levain" / "memory.spores.json").get(ids["seed"])["next"] == "2031-02-03T21:05"
-    held = {"facets": {"due": "2031-02-03T21:05"}}
-    assert _date_tier("2031-02-03T21:05", held, "verified", TODAY) == "C1"
-    assert _date_tier("2031-02-03T09:00", held, "unverified", TODAY) == "C1"               # a later minute on the same day is not sooner
+    # the List row carries the stored minute in `fires`
+    held = {"facets": {"due": "2031-02-03", "fires": "2031-02-03T21:05"}}
+    assert _date_tier("2031-02-03T09:00", held, "verified", TODAY) == "C1"
     assert _date_tier("2031-02-02T09:00", held, "unverified", TODAY) == "T2"               # an earlier day on an unverified held row is
+
+
+def test_an_earlier_minute_on_the_held_day_is_sooner() -> None:
+    """A row held until a minute wakes sooner when moved to an earlier minute of the same day: that is T2 on an unverified
+    row, as an earlier day is. A date-only value is the start of its day; a row whose minute is unknown (no ``fires``
+    facet) is held to the end of its day."""
+    timed = {"facets": {"due": "2031-02-03", "fires": "2031-02-03T21:05"}}
+    assert _date_tier("2031-02-03T09:00", timed, "unverified", TODAY) == "T2"
+    assert _date_tier("2031-02-03", timed, "unverified", TODAY) == "T2"
+    assert _date_tier("2031-02-03T21:05", timed, "unverified", TODAY) == "C1"
+    assert _date_tier("2031-02-03T22:00", timed, "unverified", TODAY) == "C1"
+    dated = {"facets": {"due": "2031-02-03", "fires": None}}
+    assert _date_tier("2031-02-03T09:00", dated, "unverified", TODAY) == "C1"
+    assert _date_tier("2031-02-03", dated, "unverified", TODAY) == "C1"
+    unknown = {"facets": {"due": "2031-02-03"}}
+    assert _date_tier("2031-02-03T09:00", unknown, "unverified", TODAY) == "T2"
+    assert _date_tier("2031-02-04", unknown, "unverified", TODAY) == "C1"
+    assert _date_escalates(timed, "unverified", TODAY, "surface_at")[0]["value"] == "2031-02-03T21:05"
+
+
+def test_a_timed_held_row_snoozed_earlier_the_same_day_is_signed(tmp_path: Path) -> None:
+    root, src, ids = _install(tmp_path)
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store.update(ids["seed"], next="2031-02-03T21:05", today=TODAY)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        r = _row(base, ids["seed"])
+        snooze = next(a for a in r["actions"] if a["verb"] == "spore_surface_at")
+        st, body = _post(f"{base}/cockpit/verb", {"verb": "spore_surface_at", "panel_id": "tray", "row_id": r["id"],
+                                                   "row_version": r["version"], "params": {"surface_at": "2031-02-03T09:00"},
+                                                   "intent": "reported", "tier_seen": "C1",
+                                                   "gesture_seen": snooze["gesture"]}, TOKEN)
+    assert st == 409 and body.get("tier") == "T2", body            # the page that saw C1 is told the tier moved
+    assert store.get(ids["seed"])["next"] == "2031-02-03T21:05"
+
+
+def test_spore_update_never_carries_a_target(tmp_path: Path) -> None:
+    """``target`` is in the apply allow-list only for spore_retarget's effect: the edit verb, its effect and the legacy write
+    each refuse it, so no edit sets a target at the edit's own tier."""
+    from levain.writes import EditError, apply_edit
+
+    pre = {"id": "spore-1", "origin_key": "k", "status": "open", "disposition": "seed", "text": "t", "type": "task"}
+    with pytest.raises(ValueError, match="changes one or more"):
+        canonical_effect("spore_update", {"target": "desk"}, pre, version_of=lambda row: "v")
+    root, src, ids = _install(tmp_path)
+    with pytest.raises(EditError):
+        apply_edit(src.write_scope, {"kind": "spore_update", "spore_id": ids["seed"], "target": "desk"})
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        r = _row(base, ids["seed"])
+        st, body = _post(f"{base}/cockpit/verb", {"verb": "spore_update", "panel_id": "tray", "row_id": r["id"],
+                                                   "row_version": r["version"], "params": {"target": "not-a-target"}}, TOKEN)
+    assert st == 400 and body["error"] == "field_not_allowed", (st, body)
+    assert "target" not in SporeStore(root / ".levain" / "memory.spores.json").get(ids["seed"])

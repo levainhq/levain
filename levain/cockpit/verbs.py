@@ -246,26 +246,47 @@ def _held_date(row: dict[str, Any] | None, today: date) -> date | None:
     return d if d is not None and d > today else None
 
 
+def _held_at(row: dict[str, Any] | None, today: date) -> datetime | None:
+    """The instant a held row next surfaces, at the minute it is stored: the List's ``fires`` facet carries a timed
+    ``next`` (None there means a date-only one, read as the start of its day). A row whose minute is not known (no
+    ``fires`` facet at all) is read as held to the end of its day, so a move within that day reads as sooner."""
+    from levain.spores import _parse_when
+
+    held = _held_date(row, today)
+    if held is None:
+        return None
+    facets = (row or {}).get("facets") or {}
+    if "fires" not in facets:
+        return datetime.combine(held, datetime.max.time()).replace(second=0, microsecond=0)
+    when = _parse_when(facets.get("fires"))
+    if when is not None and when.date() == held:
+        return when
+    return datetime.combine(held, datetime.min.time())
+
+
 def _date_tier(new: Any, row: dict[str, Any] | None, provenance: str, today: date) -> Tier:
     """A snooze is C1 on any row, except on an unverified row held to a future date: moving that
-    date earlier (to any date) or clearing it shows the row sooner to readers who were not seeing
-    it, so it is T2 (§4.2, RULED Q4 bounded below)."""
-    held = _held_date(row, today)
+    instant earlier (an earlier minute on the same day included) or clearing it shows the row sooner
+    to readers who were not seeing it, so it is T2 (§4.2, RULED Q4 bounded below). A date-only value
+    is the start of its day."""
+    from levain.spores import _parse_when
+
+    held = _held_at(row, today)
     if provenance == "verified" or held is None:
         return "C1"
     if new is None:
         return "T2"
-    d = parse_date(new)
-    if d is None or d < held:
+    when = _parse_when(new)
+    if when is None or when < held:
         return "T2"     # an unparseable date is refused by the handler; it never lowers a tier
     return "C1"
 
 
 def _date_escalates(row: dict[str, Any] | None, provenance: str, today: date, param: str) -> list[dict[str, Any]]:
-    held = _held_date(row, today)
+    held = _held_at(row, today)
     if provenance == "verified" or held is None:
         return []
-    return [{"param": param, "op": "before", "value": held.isoformat(), "tier": "T2"},
+    return [{"param": param, "op": "before", "value": held.strftime("%Y-%m-%dT%H:%M"), "tier": "T2"},
             {"param": param, "op": "clear", "tier": "T2"}]
 
 
