@@ -3592,8 +3592,8 @@
     picksBox.append(...picks);
     // an agenda (it holds a target) is undated never: flow refuses one, so "someday" is for a seed with no who chosen
     const agenda = rowTarget(s) !== "";
-    if (agenda || opts) clearBtn.hidden = true;
-    form.append(...(opts ? [] : [picksBox]), input, timeIn, zone, ...(back ? [back] : []), ...(who.node ? [who.node] : []), go, clearBtn, cancel, msg);
+    if (agenda) clearBtn.hidden = true;
+    form.append(...(opts ? [] : [picksBox]), input, timeIn, zone, ...(back ? [back] : []), ...(who.node ? [who.node] : []), go, ...(opts ? [] : [clearBtn]), cancel, msg);
     host.appendChild(form);
     // a touch screen's keyboard opens on a focused date input and covers the form: focus it only where a pointer, not a thumb, drives
     if (!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches)) input.focus();
