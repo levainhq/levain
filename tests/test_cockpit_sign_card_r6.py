@@ -13,10 +13,12 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_sign_card import FACET_NOTE, OPEN, OPTION_B, QRID, STRIP_FACET, TOK, _Rig, needs_ssh
 from tests.test_cockpit_sign_card_r5 import (AFTER, BUTTONS, NEVER_SENT, OTHER, RECORD, _card, _remember)
 
-# the first POST whose path ends with `tail` is answered to the page as lost at once, and reaches the server `ms` later
+# the first POST whose path ends with `tail` is answered to the page as lost at once, and reaches the server `ms` later;
+# window.__lateDone is set when the server has ANSWERED that late post, so a test waits for it instead of a fixed sleep
 LATE_COMMIT = ("(() => {{ const real = window.fetch; let armed = true; window.fetch = function (u, o) {{ "
                "if (armed && String(u).endsWith({tail})) {{ armed = false; const a = arguments; const self = this; "
-               "setTimeout(() => real.apply(self, a), {ms}); return Promise.reject(new TypeError('the reply was lost')); }} "
+               "setTimeout(() => {{ const done = () => {{ window.__lateDone = 1; }}; "
+               "real.apply(self, a).then(done, done); }}, {ms}); return Promise.reject(new TypeError('the reply was lost')); }} "
                "return real.apply(this, arguments); }}; return 1; }})()")
 # every passkey prompt is cancelled
 CANCEL_ALL = ("(() => { navigator.credentials.get = (o) => { window.__gets.push(((o.publicKey || {}).allowCredentials || []).length); "
@@ -36,8 +38,8 @@ def test_s1_an_answer_still_on_its_way_is_fenced_by_its_attempt_read_and_never_l
             *_card(rig),
             {"eval": LATE_COMMIT.format(tail=json.dumps("/answer"), ms=900)},
             {"tap": f"{OPTION_B}"},
-            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
-            {"eval": AFTER.format(ms=1500)},                  # past the late answer's arrival
+            {"until": f"!{OPTION_B}.disabled && /never reached the cockpit/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"until": "window.__lateDone === 1", "ms": 30000},    # the late answer has reached the server and been answered
             {"eval": BUTTONS},
             {"eval": FACET_NOTE},
         ])
@@ -57,8 +59,8 @@ def test_s1_s6_an_answer_that_never_left_comes_back_on_its_attempts_refusal_and_
             *_card(rig),
             {"eval": NEVER_SENT.format(tail=json.dumps("/answer"))},
             {"tap": f"{OPTION_B}"},
-            {"until": f"!{OPTION_B}.disabled && {FACET_NOTE}", "ms": 30000},
-            {"eval": AFTER.format(ms=2500)},
+            {"until": f"!{OPTION_B}.disabled && /never reached the cockpit/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000},
+            {"eval": AFTER.format(ms=2500)},                  # a negative wait: the card must stay un-redrawn for this long
             {"eval": "window.__reloads"},
         ])
     v = out["values"]

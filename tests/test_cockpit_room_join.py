@@ -585,9 +585,11 @@ def test_a_send_answered_after_an_app_switch_leaves_the_new_view_its_draft_and_i
                       " && document.querySelector('.rv-input').value === 'hello once'"},
             {"eval": "window.__release(); 1"},
             {"until": "window.__released === 1"},
-            {"eval": "new Promise(r => setTimeout(() => r(1), 300))"},
-            {"eval": "document.querySelector('.rv-send').click(); 1"},
-            {"until": "window.__ids.length === 2 && document.querySelector('.rv-input').value === ''"},
+            # the second Send is a click the page may drop (doSend returns silently while the first send's own .then has not yet
+            # cleared flight.send, or the dock is repainting), so it is retried together with its assertion instead of after a
+            # fixed sleep: a repeat is harmless (one id per draft text, and an in-flight send blocks it)
+            {"do": "document.querySelector('.rv-send').click(); 1",
+             "until": "window.__ids.length === 2 && document.querySelector('.rv-input').value === ''", "ms": 30000, "every": 1000},
             {"eval": "JSON.stringify(window.__ids)"},
         ])
         mine = [i["body"] for i in _get(base)[1]["stream"] if i["kind"] == "message"]
