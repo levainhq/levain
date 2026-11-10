@@ -218,6 +218,136 @@ class TestRun:
             w.stop()
 
 
+class _Tok:
+    """A change token the test moves by hand."""
+
+    def __init__(self, value: Any = 0) -> None:
+        self.value = value
+        self.reads = 0
+
+    def __call__(self) -> Any:
+        self.reads += 1
+        return self.value
+
+
+def _until(cond: Any, secs: float = 5.0) -> bool:
+    end = time.monotonic() + secs
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+class TestWatcherToken:
+    def test_an_unmoved_token_builds_no_manifest_and_a_moved_one_builds_once(self) -> None:
+        feed, tok = _Feed(a="1"), _Tok(0)
+        w = stream.Watcher(feed, epoch="E", watch_s=0.02, token=tok, token_s=0.01, backstop_s=3600)
+        sub = w.subscribe(None)
+        try:
+            base = feed.reads           # the baseline read
+            assert _until(lambda: tok.reads >= 20)
+            assert feed.reads == base   # twenty looks at an unmoved token, no build
+            feed.etags["a"] = "2"
+            tok.value = 1
+            assert _until(lambda: feed.reads == base + 1)
+            assert _until(lambda: not sub.q.empty())
+            (ev, data, _), = _drain(sub)
+            assert (ev, data) == ("panel-changed", {"id": "a", "etag": "2"})
+            time.sleep(0.2)
+            assert feed.reads == base + 1       # and settled: no further build
+        finally:
+            w.stop()
+
+    def test_the_backstop_builds_even_when_the_token_never_moves(self) -> None:
+        feed, tok = _Feed(a="1"), _Tok(0)
+        w = stream.Watcher(feed, epoch="E", watch_s=3600, token=tok, token_s=0.01, backstop_s=0.1)
+        sub = w.subscribe(None)
+        try:
+            base = feed.reads
+            feed.etags["a"] = "2"       # a change the token cannot see
+            assert _until(lambda: not sub.q.empty())
+            assert feed.reads > base
+        finally:
+            w.stop()
+
+    def test_no_token_or_an_unknown_one_keeps_the_slow_tick(self) -> None:
+        for token in (None, _Tok(None)):
+            feed = _Feed(a="1")
+            w = stream.Watcher(feed, epoch="E", watch_s=0.05, token=token, token_s=0.01, backstop_s=3600)
+            w.subscribe(None)
+            try:
+                base = feed.reads
+                assert _until(lambda: feed.reads >= base + 3)
+            finally:
+                w.stop()
+
+    def test_a_token_that_raises_is_an_unknown_one(self) -> None:
+        feed = _Feed(a="1")
+
+        def boom() -> Any:
+            raise OSError("gone")
+        w = stream.Watcher(feed, epoch="E", watch_s=0.05, token=boom, token_s=0.01, backstop_s=3600)
+        w.subscribe(None)
+        try:
+            base = feed.reads
+            assert _until(lambda: feed.reads >= base + 2)
+        finally:
+            w.stop()
+
+    def test_a_token_that_never_settles_cannot_build_faster_than_the_build_runs(self) -> None:
+        feed, tok = _Feed(a="1"), _Tok(0)
+
+        def slow() -> dict[str, Any]:
+            time.sleep(0.05)
+            tok.value += 1          # every look finds a new token
+            return feed()
+        w = stream.Watcher(slow, epoch="E", watch_s=3600, token=tok, token_s=0.005, backstop_s=3600)
+        w.subscribe(None)
+        try:
+            time.sleep(0.6)
+        finally:
+            w.stop()
+        assert feed.reads <= 8      # 0.6 s of 50 ms builds each followed by a 100 ms wait: about 4, never ~12
+
+
+class TestServerWatchToken:
+    def test_an_install_server_has_a_token_that_moves_with_its_stores_and_not_with_a_read(self, tmp_path: Path) -> None:
+        root, src = _install(tmp_path)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        try:
+            a = httpd._watch_token()
+            assert a is not None and httpd._watch_token() == a
+            httpd.get_cockpit().manifest({"class": "none", "device_class": None})      # a read moves nothing
+            assert httpd._watch_token() == a
+            (root / ".levain" / "memory.spores.json").write_text('{"spores": []}')
+            b = httpd._watch_token()
+            assert b != a
+            q = httpd.question_store
+            q.file(agent="claude_code", agent_session_id="s1", what="a question", options=[
+                {"key": "a", "label": "yes"}, {"key": "b", "label": "no"}], rec="a", blocks="x", cwd=str(root))
+            assert httpd._watch_token() != b
+        finally:
+            httpd.server_close()
+
+    def test_a_downstream_cockpit_has_no_token_until_it_names_what_it_reads(self, tmp_path: Path) -> None:
+        root, src = _install(tmp_path)
+        own = build_default_cockpit(src)
+        for kw, expect_token in (({}, False), ({"watch_paths": [root / ".levain" / "edits.jsonl"]}, True)):
+            httpd = make_server(src, host="127.0.0.1", port=0, cockpit=own, **kw)
+            try:
+                assert (httpd._watch_token() is not None) is expect_token
+            finally:
+                httpd.server_close()
+        httpd = make_server(src, host="127.0.0.1", port=0, cockpit=own, watch_paths=[root / ".levain" / "edits.jsonl"])
+        try:
+            a = httpd._watch_token()
+            (root / ".levain" / "edits.jsonl").write_text("x\n")
+            assert httpd._watch_token() != a
+        finally:
+            httpd.server_close()
+
+
 # ---- the real server ------------------------------------------------------------------------
 
 @contextmanager

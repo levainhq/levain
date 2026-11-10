@@ -81,6 +81,7 @@ import dataclasses
 import gzip
 import hashlib
 import hmac
+import os
 import re
 import urllib.parse
 import secrets
@@ -2080,7 +2081,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         self.stream_heartbeat_s = cockpit_stream.DEFAULT_HEARTBEAT_S
         self.stream_stop = threading.Event()
         self.room_waiter_gate = threading.BoundedSemaphore(cockpit_room.WAITERS_MAX)
-        self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4))
+        self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4),
+                                                     token=self._watch_token)
         # PAIR: the paired lookups' and the claim's own semaphores (RT-3, RP-4), and the in-process revocation epoch
         # a revoke bumps AFTER its transaction commits, which every open stream compares before each frame (RU-3)
         self.pair_verify_gate = threading.BoundedSemaphore(_PAIR_VERIFY_SLOTS)
@@ -2103,6 +2105,57 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         # etags it announces are class-none ones; a page reading under a token holds class-token etags and
         # records the one its own panel read returned, never the announced one
         return self.get_cockpit().manifest({"class": "none", "device_class": None})
+
+    # What the change token covers beyond the install's own stores: files or directories a downstream's panels read.
+    # A server given a cockpit or extra panels of its own has no token until it names them here, because the kernel
+    # cannot see what those panels read (no token: the watcher builds the manifest on every slow tick).
+    watch_paths: "tuple[Path, ...]" = ()
+    cockpit_downstream: bool = False
+
+    def _watch_token(self) -> "tuple | None":
+        """A cheap fingerprint of the stores the panels read (name, mtime and size of every file in each watched
+        directory, the names of its subdirectories, and each watched file), or None when the stores cannot all be
+        named. It is looked at often; a moved token makes the watcher build the manifest, so it only has to move
+        when a store does. What it cannot see (a file inside a subdirectory, the clock, in-memory state) reaches the
+        page on the watcher's backstop build."""
+        if (self.cockpit_downstream or self.extra_panels is not None) and not self.watch_paths:
+            return None
+        src = self.levain_source
+        roots: list[Path] = [src.anneal.episodic_db.parent]
+        if src.install_root is not None:
+            root = Path(src.install_root)
+            roots += [root, root / ".levain", root / "seed", root / "activation"]
+        if src.write_scope is not None:
+            roots.append(Path(src.write_scope.ledger_root))
+        reader = getattr(self, "consent_reader", None)
+        if reader is not None:
+            from levain.consent.queue import default_queue_dir
+
+            d = getattr(reader, "directory", None)
+            roots.append(Path(d if d is not None else default_queue_dir()))
+        if self.signer is not None:
+            roots.append(Path(self.signer.queue_dir))
+        roots += [Path(p) for p in self.watch_paths]
+        out: list[Any] = []
+        seen: set[str] = set()
+        for r in roots:
+            key = str(r)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not r.is_dir():
+                out.append((key, _stat_sig(r)))
+                continue
+            try:
+                with os.scandir(r) as it:
+                    for _, e in zip(range(_WATCH_ENTRIES_MAX), it):
+                        if e.name.endswith("-shm"):
+                            continue        # a reader's own shared-memory index: it moves on every read
+                        # a subdirectory is its name only: its own mtime moves with every temp file made in it
+                        out.append((key + "/" + e.name, None if e.is_dir() else _stat_sig(e.path)))
+            except OSError:
+                out.append((key, "unreadable"))
+        return tuple(out)
 
     _cockpit_lock = threading.Lock()
 
@@ -5609,6 +5662,18 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
                       httpd.verb_registry, httpd.get_cockpit(), verb, dict(params), dict(target)))
 
 
+_WATCH_ENTRIES_MAX = 2000   # entries read per watched directory by the change token
+
+
+def _stat_sig(path: Any) -> "tuple[int, int] | None":
+    """``(mtime_ns, size)`` of one path, None when it does not exist (its appearing moves the token)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
 def make_server(
     source: SubstrateSource,
     *,
@@ -5636,6 +5701,7 @@ def make_server(
     room_serve: "Any" = None,
     premium_stt: "bool | None" = None,
     threads: bool = True,
+    watch_paths: "Iterable[str | Path] | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -6042,6 +6108,8 @@ def make_server(
     # Its start() (refresher threads) is the caller's when it passes its own. Nothing is attached to it
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
+    httpd.cockpit_downstream = cockpit is not None
+    httpd.watch_paths = tuple(Path(p) for p in watch_paths or ())
     httpd.work_board = work_board
     httpd.threads = threads is not False
     httpd.chat_service = chat_service

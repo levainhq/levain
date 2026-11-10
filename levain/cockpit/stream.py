@@ -12,7 +12,15 @@ never reaches that diff, so reading what was announced cannot announce it again.
 
 The Watcher lives only while a stream is open. Each start is a new epoch, because nothing observed
 the interval it was off; a client that comes back from an older epoch is told to resync. Inside one
-epoch a reconnecting client is caught up from a bounded ring of recent events."""
+epoch a reconnecting client is caught up from a bounded ring of recent events.
+
+The full manifest build is the expensive step, so it does not run on every look. When the server gives the
+Watcher a change token (a cheap fingerprint of the stores the panels read), the Watcher looks at the token
+every ``token_s`` and builds the manifest only when the token moved, or when ``backstop_s`` has passed since the
+last build (what the token cannot see: the clock, an in-memory state, a store it does not name). A token of
+None means "not known": the build then runs every ``watch_s``, exactly as without a token. After a build the
+next token-driven build waits ``2 x`` how long that build took, so a token that never settles cannot run the
+build faster than it can finish."""
 
 from __future__ import annotations
 
@@ -29,6 +37,8 @@ log = logging.getLogger("levain.cockpit.stream")
 EVENTS_PATH = "/cockpit/events"
 CONTENT_TYPE = "text/event-stream; charset=utf-8"
 DEFAULT_WATCH_S = 5.0
+DEFAULT_TOKEN_S = 1.0       # how often the cheap change token is looked at
+DEFAULT_BACKSTOP_S = 30.0   # the longest the manifest goes unbuilt while a token is in use
 DEFAULT_HEARTBEAT_S = 15.0
 DEFAULT_MAX_STREAMS = 8
 DEFAULT_RING = 256
@@ -63,8 +73,13 @@ class Watcher:
     """Diffs the manifest's panel etags and id set on a tick and broadcasts what moved."""
 
     def __init__(self, read_manifest: Callable[[], dict[str, Any]], *, epoch: str,
-                 watch_s: float = DEFAULT_WATCH_S, ring: int = DEFAULT_RING) -> None:
+                 watch_s: float = DEFAULT_WATCH_S, ring: int = DEFAULT_RING,
+                 token: Callable[[], Any] | None = None, token_s: float = DEFAULT_TOKEN_S,
+                 backstop_s: float = DEFAULT_BACKSTOP_S) -> None:
         self._read_manifest = read_manifest
+        self._token = token
+        self.token_s = token_s
+        self.backstop_s = backstop_s
         self._base_epoch = epoch
         self.watch_s = watch_s
         self._ring_max = ring
@@ -92,6 +107,16 @@ class Watcher:
     def _read(self) -> dict[str, Any]:
         heads = self._read_manifest()["panels"]
         return {pid: head.get("etag") for pid, head in heads.items()}
+
+    def _token_now(self) -> Any:
+        """The change token, or None when there is none or it cannot be read (None = unknown: build on the slow tick)."""
+        if self._token is None:
+            return None
+        try:
+            return self._token()
+        except Exception:   # noqa: BLE001 - an unreadable token is an unknown one, never a missed change
+            log.exception("cockpit watcher: the change token could not be read")
+            return None
 
     # ---- subscribe / unsubscribe -------------------------------------------------
     def subscribe(self, last_event_id: str | None) -> Subscription:
@@ -137,6 +162,7 @@ class Watcher:
         self._epoch = f"{self._base_epoch}.{self._gen}"
         self._seq = 0
         self._ring.clear()
+        tok = self._token_now()     # before the baseline: a change landing between them is seen as one next look
         try:
             self._etags = self._read()
         except Exception:   # noqa: BLE001 - the first good tick adopts a baseline and asks pages to reload
@@ -144,7 +170,7 @@ class Watcher:
             self._etags = None
         stop = threading.Event()
         self._run_stop = stop
-        self._thread = threading.Thread(target=self._loop, args=(stop,), name="cockpit-watcher", daemon=True)
+        self._thread = threading.Thread(target=self._loop, args=(stop, tok), name="cockpit-watcher", daemon=True)
         self._thread.start()
 
     def _stop_locked(self) -> None:
@@ -153,9 +179,27 @@ class Watcher:
         self._run_stop = None
         self._thread = None
 
-    def _loop(self, stop: threading.Event) -> None:
-        while not stop.wait(self.watch_s):
+    def _loop(self, stop: threading.Event, tok: Any = None) -> None:
+        if self._token is None:
+            while not stop.wait(self.watch_s):
+                self.tick(stop)
+            return
+        last_build = time.monotonic()
+        gap = 0.0
+        while not stop.wait(self.token_s):
+            now_tok = self._token_now()
+            idle = time.monotonic() - last_build
+            if now_tok is None:
+                due = idle >= self.watch_s
+            else:
+                due = (now_tok != tok and idle >= gap) or idle >= self.backstop_s
+            if not due:
+                continue
+            tok = now_tok
+            began = time.monotonic()
             self.tick(stop)
+            last_build = time.monotonic()
+            gap = 2 * (last_build - began)
 
     def tick(self, run: threading.Event | None = None) -> None:
         """One observation. Any failure is this tick's alone: it is logged and the next tick tries again."""
