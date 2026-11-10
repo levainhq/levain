@@ -575,7 +575,7 @@ def test_a_reply_waiting_in_the_queue_when_the_page_hides_asks_for_a_tap(rig, tm
         {"eval": "(() => { window.__voices = [%s]; window.__speakHang = true; LevainVoice.saveSettings({tier: 'device', autoplay: true});"
                  " LevainVoice.arm(0); return JSON.stringify([LevainVoice.replyFinished(%s), LevainVoice.replyFinished(%s)]); })()" % (LOCAL, json.dumps(a), json.dumps(b))},
         {"eval": "(() => { window.dispatchEvent(new Event('pagehide')); const c = LevainVoice.button(%s);"
-                 " return JSON.stringify({text: c.querySelector('button').textContent, again: LevainVoice.replyFinished(%s)}); })()" % (json.dumps(b), json.dumps(b))},
+                 " return JSON.stringify({text: c.querySelector('button').getAttribute('aria-label'), again: LevainVoice.replyFinished(%s)}); })()" % (json.dumps(b), json.dumps(b))},
     ], key=False)
     assert json.loads(v[4]) == ["play", "queued"], v
     got = json.loads(v[5])
