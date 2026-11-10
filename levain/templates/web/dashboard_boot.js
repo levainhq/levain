@@ -182,12 +182,17 @@
       stop: function () { done = true; if (timer !== null) { clock.clearTimeout(timer); timer = null; } },
     };
   }
-  // One ACTUAL fetch attempt gets its own controller and its own PANEL_TIMEOUT_MS: the timer never runs while the page waits on a
-  // token prompt, and a retry after re-auth starts a fresh one. A hung read is aborted and says so.
+  // One ACTUAL attempt (the fetch AND the read of its whole body) gets its own controller and its own PANEL_TIMEOUT_MS: the timer
+  // stays armed until the body is in, so a server that sends headers and stalls is timed out too; it is never running while the
+  // page waits on a token prompt, and a retry after re-auth starts a fresh one. The answer is buffered, so what follows reads no socket.
   async function timedAttempt(fetchPanel, url, clock) {
     const ctl = typeof AbortController === "function" ? new AbortController() : null;
     const timer = ctl ? clock.setTimeout(() => ctl.abort(), PANEL_TIMEOUT_MS) : 0;
-    try { return await fetchPanel(url, ctl ? ctl.signal : undefined); }
+    try {
+      const res = await fetchPanel(url, ctl ? ctl.signal : undefined);
+      const text = await res.text();
+      return { status: res.status, ok: res.ok, text: text, clone: function () { return this; }, json: function () { return Promise.resolve().then(() => JSON.parse(text)); } };
+    }
     catch (e) { if (ctl && ctl.signal.aborted) throw new Error("no answer in " + PANEL_TIMEOUT_MS / 1000 + " s"); throw e; }
     finally { if (timer) clock.clearTimeout(timer); }
   }
