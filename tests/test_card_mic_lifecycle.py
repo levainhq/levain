@@ -407,6 +407,7 @@ DICTATE_WORDS = {
     "no-speech": "No speech was heard; tap Dictate and try again.",
     "aborted": "Dictation was interrupted.",
     "bad-grammar": "Dictation could not use its settings.",
+    "phrases-not-supported": "Dictation could not use its hint phrases in this browser.",
 }
 
 
