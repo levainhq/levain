@@ -90,7 +90,38 @@
   const PAIRED_MARK_KEY = "levain_paired_device";
   // The page's own cap on concurrent panel reads (see the batch in the board read below).
   const PANEL_READ_CONCURRENCY = 4;
-  const panelBodies = new Map();   // panel url -> { etag, text } of its last 200, for the conditional read in loadManifestView
+  // BEGIN conditional panel read
+  // A panel read is conditional: the page keeps each panel's last body with its ETag (module-level, so it outlives a
+  // load) and sends If-None-Match; a 304 answers with the held body, so an unchanged panel costs headers, not bytes.
+  // The ETag is per credential class on the server, so a changed credential reads a 200, never another's body.
+  // The server's panel ETag leaves out `as_of` (a refresher over unchanged rows still answers 304), so a held body
+  // takes its `as_of` from the manifest head read in the same load, which is what the page shows as "read ...".
+  const panelBodies = new Map();   // panel url -> { etag, text, type } of its last 200
+  const panelUrl = (id) => "/cockpit/panel/" + encodeURIComponent(id) + ".json?profile=full";
+  function pruneHeldPanels(ids) {
+    const live = new Set(ids.map(panelUrl));
+    for (const u of Array.from(panelBodies.keys())) if (!live.has(u)) panelBodies.delete(u);
+  }
+  async function fetchPanelConditional(url, head) {
+    const hit = panelBodies.get(url);
+    const headers = readHeaders();
+    if (hit) headers["If-None-Match"] = hit.etag;
+    const res = await fetch(url, { cache: "no-store", headers: headers });
+    if (res.status === 304 && hit) {
+      let text = hit.text;
+      if (head && typeof head.as_of === "string") {
+        try { const p = JSON.parse(text); p.as_of = head.as_of; text = JSON.stringify(p); } catch (_) { /* keep the held body */ }
+      }
+      return new Response(text, { status: 200, headers: { "Content-Type": hit.type, "ETag": hit.etag } });
+    }
+    const etag = res.ok ? res.headers.get("ETag") : null;
+    if (!etag) { panelBodies.delete(url); return res; }
+    const text = await res.text();
+    const type = res.headers.get("Content-Type") || "application/json";
+    panelBodies.set(url, { etag: etag, text: text, type: type });
+    return new Response(text, { status: 200, headers: { "Content-Type": type, "ETag": etag } });
+  }
+  // END conditional panel read
   let writeTokenRequired = false;
   // What a missing token is answered with, from the server: "pair" (this request cannot use the owner key: pair the device by a
   // short code) or "owner" (a loopback page: the owner's own token is typed, as before). "" until a 403 body or the manifest says.
@@ -925,31 +956,20 @@
     }
     const fetchedAt = Date.now();
     const ids = Object.keys(manifest.panels);
+    const panelHeads = Object.create(null);   // panel url -> the manifest's head for it, the source of the fields an ETag leaves out
+    for (const id of ids) panelHeads[panelUrl(id)] = manifest.panels[id];
     const panels = Object.create(null);
     // One shared re-auth for the batch: if the token rotated after the manifest read, every panel 403s
     // together, so the first one prompts (or drops the dead token) and the rest wait on that same answer.
     let reauth = null;
-    // A panel read is conditional: the page keeps each panel's last body with its ETag (module-level, so it outlives a
-    // load) and sends If-None-Match; a 304 answers with the held body, so an unchanged panel costs headers, not bytes.
-    // The ETag is per credential class on the server, so a changed credential reads a 200, never another's body.
-    const fetchPanel = async (url) => {
-      const hit = panelBodies.get(url);
-      const headers = readHeaders();
-      if (hit) headers["If-None-Match"] = hit.etag;
-      const res = await fetch(url, { cache: "no-store", headers: headers });
-      if (res.status === 304 && hit) return new Response(hit.text, { status: 200, headers: { "Content-Type": "application/json" } });
-      const etag = res.ok ? res.headers.get("ETag") : null;
-      if (!etag) { panelBodies.delete(url); return res; }
-      const text = await res.text();
-      panelBodies.set(url, { etag: etag, text: text });
-      return new Response(text, { status: 200, headers: { "Content-Type": "application/json" } });
-    };
+    const fetchPanel = (url) => fetchPanelConditional(url, panelHeads[url]);
+    pruneHeldPanels(ids);
     // At most PANEL_READ_CONCURRENCY panel reads are in flight, the rest queue in manifest order: one page
     // bursting ~28 reads at once, or two open pages, would otherwise meet the server's concurrency cap.
     // Every read settles (the worker catches its own failure) and so frees its slot.
     const queue = ids.slice();
     const readOne = async (id) => {
-      const url = "/cockpit/panel/" + encodeURIComponent(id) + ".json?profile=full";
+      const url = panelUrl(id);
       try {
         let res = await fetchPanel(url);
         if (res.status === 403 && await isTokenReject(res.clone())) {
