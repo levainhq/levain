@@ -394,3 +394,42 @@ def test_a_cockpit_ceremony_drops_dictates_tail_so_the_write_in_is_not_written_a
     assert out["values"][-3] == "hello", out["values"]
     value, stops = json.loads(out["values"][-1])
     assert value == "hello" and stops >= 1, (value, stops)
+
+
+# --- 11-10 (row 185): a Dictate error says its own reason on the card ----------------------------------------------
+
+DICTATE_WORDS = {
+    "not-allowed": "Dictation needs permission to use the microphone.",
+    "service-not-allowed": "This browser is not allowing dictation here (speech recognition is blocked or turned off for it).",
+    "language-not-supported": "This browser has no on-device dictation pack for this language yet, so Dictate cannot run; the keyboard dictation key works.",
+    "audio-capture": "No microphone was found, or it could not be opened.",
+    "network": "Dictation could not reach its speech service.",
+    "no-speech": "No speech was heard; tap Dictate and try again.",
+    "aborted": "Dictation was interrupted.",
+    "bad-grammar": "Dictation could not use its settings.",
+}
+
+
+@needs_browser
+def test_each_dictate_error_event_says_its_own_reason(tmp_path, w) -> None:
+    """Red with: onerror folding every error but not-allowed into "Dictation stopped." (language-not-supported hidden)."""
+    names = list(DICTATE_WORDS) + ["something-new"]
+    steps = [*_boxes("a")]
+    for i, n in enumerate(names):
+        steps.append({"eval": f"{_dict()}.click(); window.__srs[{i}].onerror({{ error: {json.dumps(n)} }}); JSON.stringify([window.__notes[window.__notes.length - 1], window.__m.a.busy()])"})
+    out = _page(tmp_path, w, steps)
+    got = [json.loads(v) for v in out["values"][-len(names):]]
+    for n, (note, busy) in zip(names, got):
+        assert busy is False, (n, got)
+        assert note == DICTATE_WORDS.get(n, "Dictation stopped (something-new)."), (n, note)
+
+
+@needs_browser
+def test_a_dictate_start_that_throws_says_so(tmp_path, w) -> None:
+    """Red with: the start() catch freeing the box with no note (the tap does nothing, silently)."""
+    thrower = RECOG + "\n(() => { const C = window.SpeechRecognition; window.SpeechRecognition = class extends C { start() { throw new DOMException('x', 'InvalidStateError'); } }; })();"
+    out = _page(tmp_path, w, [
+        *_boxes("a"),
+        {"eval": f"{_dict()}.click(); JSON.stringify([window.__notes[window.__notes.length - 1], window.__m.a.busy()])"},
+    ], init=thrower)
+    assert json.loads(out["values"][-1]) == ["Dictation could not start; tap Dictate again.", False], out["values"]
