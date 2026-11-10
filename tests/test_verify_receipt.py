@@ -432,6 +432,23 @@ def test_terminate_children_kills_the_whole_group(tmp_path):
         os.kill(gpid, 0)
 
 
+def test_a_leg_that_raises_keeps_its_traceback_in_status_and_stderr(repo, tmp_path, monkeypatch, capsys):
+    r, sha = repo
+    state = tmp_path / "state"
+    monkeypatch.setattr(verify, "Tools", FakeTools)
+
+    def the_raising_step(*a, **k):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(verify, "run_leg_local", the_raising_step)
+    assert verify.main(["run", "--sha", sha, "--leg", "linux", "--here", *_args(r, state)]) == 4
+    st = json.loads((_only_run(state) / "status.json").read_text())
+    assert st["state"] == "error"
+    assert "the_raising_step" in st["error_traceback"]
+    assert len(st["error_traceback"]) <= 6000
+    assert "the_raising_step" in capsys.readouterr().err
+
+
 def test_a_sigterm_inside_a_run_cleans_up_marks_killed_and_keeps_the_logs(repo, tmp_path, monkeypatch, capsys):
     r, sha = repo
     state = tmp_path / "state"
