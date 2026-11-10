@@ -101,12 +101,19 @@ out.gateOpen = [lib.runPartial(() => true, () => 7, (v) => { shown += v; }), sho
 out.mayDraw = [lib.mayDrawWhole(false, false, true), lib.mayDrawWhole(true, false, true), lib.mayDrawWhole(false, true, true), lib.mayDrawWhole(false, true, false)];
 
 // timeouts per ACTUAL fetch attempt (async, on the fake clock)
+const setTimeout0 = (f, ms) => clock.setTimeout(f, ms);
 const sleepTick = () => new Promise((r) => setImmediate(r));
 const mkFetch = (script) => (url, signal) => new Promise((res, rej) => {
   const step = script.shift();
   if (signal) signal.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" })));
   if (step.hang) return;
-  res({ status: step.status, ok: step.status === 200, clone() { return this; }, json: async () => step.body, signalAborted: signal ? signal.aborted : null, seenSignal: signal });
+  const body = new Promise((bres, brej) => {
+    if (signal) signal.addEventListener("abort", () => brej(Object.assign(new Error("aborted"), { name: "AbortError" })));
+    if (step.bodyHang) return;                      // headers sent, the body never completes
+    if (step.bodyAfter) { setTimeout0(() => bres(JSON.stringify(step.body)), step.bodyAfter); return; }
+    bres(JSON.stringify(step.body));
+  });
+  res({ status: step.status, ok: step.status === 200, text: () => body });
 });
 const seen = [];
 async function reauthScenario(waitMs) {
@@ -134,6 +141,19 @@ const hung = lib.readPanelBody("/h", { attempt: (u) => lib.timedAttempt(mkFetch(
   .then((v) => ({ v }), (e) => ({ err: e.message }));
 await sleepTick(); advance(lib.PANEL_TIMEOUT_MS - 1); await sleepTick(); out.hungEarly = timers.length;
 advance(1); out.hung = await hung; out.hungTimers = timers.length;
+// headers answered but the body stalls: timed out like any hung read (the failure of a timer cleared at the headers)
+for (const [name, step] of [["bodyHung", { status: 200, bodyHang: true }], ["bodyHung403", { status: 403, bodyHang: true }]]) {
+  t = 0; timers = [];
+  const pr = lib.readPanelBody("/b", { attempt: (u) => lib.timedAttempt(mkFetch([step]), u, clock), isReject: async (r) => (await r.json(), true), reauth: async () => false, token: () => "", drop: () => {} })
+    .then((v) => ({ v }), (e) => ({ err: e.message }));
+  await sleepTick(); advance(lib.PANEL_TIMEOUT_MS - 1); await sleepTick(); out[name + "Early"] = timers.length;
+  advance(1); out[name] = await pr; out[name + "Timers"] = timers.length;
+}
+// a slow body that finishes inside the window succeeds, and its timer is gone
+t = 0; timers = [];
+const slowBody = lib.readPanelBody("/s", { attempt: (u) => lib.timedAttempt(mkFetch([{ status: 200, bodyAfter: 20000, body: { slow: 1 } }]), u, clock), isReject: async () => false, reauth: async () => false, token: () => "", drop: () => {} })
+  .then((v) => ({ v }), (e) => ({ err: e.message }));
+await sleepTick(); advance(20000); await sleepTick(); out.slowBody = await slowBody; out.slowBodyTimers = timers.length;
 console.log(JSON.stringify(out));
 })();
 """
@@ -180,6 +200,10 @@ def test_the_first_board_reads_its_top_first_narrows_the_manifest_and_paces_its_
     # a hung read is aborted at the timeout and says so; the timer is gone after
     assert out["hungEarly"] == 1
     assert out["hung"] == {"err": "no answer in 30 s"} and out["hungTimers"] == 0
+    # headers answered, body stalled: the same timeout (200 and a 403 whose body is read for the token check); a slow body inside it succeeds
+    for k in ("bodyHung", "bodyHung403"):
+        assert out[k + "Early"] == 1 and out[k] == {"err": "no answer in 30 s"} and out[k + "Timers"] == 0
+    assert out["slowBody"] == {"v": {"slow": 1}} and out["slowBodyTimers"] == 0
 
 
 def test_the_cold_load_draws_partial_boards_and_a_panel_read_is_bounded() -> None:
