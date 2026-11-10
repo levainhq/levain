@@ -39,7 +39,7 @@ def expected(profile, src):
     out = [([TART, "exec", "vend-x", "sudo", "-n", "/bin/mkdir", "-p", d], None)]
     for n in guest_tools.GUEST_TOOLS:
         out.append(([TART, "exec", "-i", "vend-x", "sudo", "-n", "/usr/bin/tee", f"{d}/{n}"], (src / n).read_bytes()))
-    out.append(([TART, "exec", "vend-x", "sudo", "-n", "/bin/chmod", "-R", "u=rwX,go=rX", d], None))
+    out.append(([TART, "exec", "vend-x", "sudo", "-n", "/bin/chmod", "u=rwX,go=rX", *[f"{d}/{n}" for n in guest_tools.GUEST_TOOLS]], None))
     return out
 
 
@@ -80,3 +80,20 @@ def test_only_vend_clones_are_addressed(src):
     with pytest.raises(SystemExit, match="vend-"):
         guest_tools.copy_guest_tools("macos-base", DARWIN, src, run=run)
     assert run.calls == []
+
+
+def test_chmod_names_the_three_files_never_the_directory(src):
+    run = FakeRun()
+    guest_tools.copy_guest_tools("vend-x", DARWIN, src, run=run)
+    chmod = [argv for argv, _ in run.calls if "/bin/chmod" in argv][0]
+    assert "-R" not in chmod and DARWIN.tools_dir not in chmod
+
+
+def test_a_timeout_names_its_step(src):
+    import subprocess
+
+    def hang(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 120)
+
+    with pytest.raises(RuntimeError, match=r"timed out after 120s"):
+        guest_tools.copy_guest_tools("vend-x", DARWIN, src, run=hang)

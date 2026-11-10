@@ -13,7 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from scripts.vm_harness.host_profile import HostProfile, profile_named
+from scripts.vm_harness.host_profile import PROFILES, HostProfile, profile_named
 from scripts.vm_harness.vm_run import TART, _clone_guard, tart_exec_argv
 
 GUEST_TOOLS = ("guest_ops.py", "guest_dispatch.py", "host_profile.py")
@@ -36,7 +36,10 @@ def copy_guest_tools(vm: str, profile: HostProfile, src_dir: Path = SRC_DIR, *, 
         kw = {"capture_output": True, "timeout": 120}
         if stdin is not None:
             kw["input"] = stdin
-        r = run(full, **kw)
+        try:
+            r = run(full, **kw)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"guest tools copy: {label} timed out after {exc.timeout}s") from exc
         if r.returncode:
             err = r.stderr.decode(errors="replace").strip()[-300:] if isinstance(r.stderr, bytes) else str(r.stderr)[-300:]
             raise RuntimeError(f"guest tools copy: {label} failed rc={r.returncode}: {err}")
@@ -46,14 +49,15 @@ def copy_guest_tools(vm: str, profile: HostProfile, src_dir: Path = SRC_DIR, *, 
     for n in GUEST_TOOLS:
         step(f"write {d}/{n}", ["sudo", "-n", "/usr/bin/tee", f"{d}/{n}"], stdin=data[n])
         out.append(f"{d}/{n}")
-    step(f"chmod {d}", ["sudo", "-n", "/bin/chmod", "-R", "u=rwX,go=rX", d])
+    # the three installed files only: a recursive chmod would also widen whatever else a reused guest keeps in the dir
+    step(f"chmod {d}", ["sudo", "-n", "/bin/chmod", "u=rwX,go=rX", *out])
     return out
 
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("vm")
-    ap.add_argument("--profile", default="darwin")
+    ap.add_argument("--profile", default="darwin", choices=sorted(PROFILES))
     a = ap.parse_args(argv)
     for p in copy_guest_tools(a.vm, profile_named(a.profile)):
         print(p)
