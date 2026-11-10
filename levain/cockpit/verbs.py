@@ -359,7 +359,10 @@ def _spore_fire(kind: str) -> Callable[..., dict[str, Any]]:
         # recomputes inside its write transaction, so the row the tier was computed on is the row
         # the write lands on (a write between read_one and here is refused 409).
         row = target["row"]
-        req = {"kind": kind, **params, "spore_id": _spore_id(target),
+        sid = _spore_id(target)
+        if target.get("questions") is not None:       # the guard in the write looks the ring up in THIS cockpit's band
+            scope = dataclasses.replace(scope, questions=target["questions"])
+        req = {"kind": kind, **params, "spore_id": sid,
                "expect_disposition": _facet(row, "disposition")}
         if confirm:
             req["confirm"] = True

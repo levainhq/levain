@@ -161,7 +161,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-006",
-      "row_version": "b7648526792a336c"
+      "row_version": "e1c59b494abc5a5f"
      },
      "tier": "C1",
      "verb": "spore_touch"
@@ -179,7 +179,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-006",
-      "row_version": "b7648526792a336c"
+      "row_version": "e1c59b494abc5a5f"
      },
      "tier": "C1",
      "verb": "spore_descend"
@@ -202,7 +202,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-006",
-      "row_version": "b7648526792a336c"
+      "row_version": "e1c59b494abc5a5f"
      },
      "tier": "C1",
      "verb": "spore_surface_at"
@@ -235,7 +235,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-006",
-      "row_version": "b7648526792a336c"
+      "row_version": "e1c59b494abc5a5f"
      },
      "tier": "C1",
      "verb": "spore_update"
@@ -246,7 +246,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-006",
-      "row_version": "b7648526792a336c"
+      "row_version": "e1c59b494abc5a5f"
      },
      "tier": "T2",
      "verb": "spore_retarget"
@@ -274,7 +274,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-006",
-      "row_version": "b7648526792a336c"
+      "row_version": "e1c59b494abc5a5f"
      },
      "tier": "T2",
      "verb": "spore_ascend"
@@ -330,7 +330,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-007",
-      "row_version": "90ddc166f6974118"
+      "row_version": "2f3bc747d27b450c"
      },
      "tier": "C1",
      "verb": "spore_touch"
@@ -348,7 +348,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-007",
-      "row_version": "90ddc166f6974118"
+      "row_version": "2f3bc747d27b450c"
      },
      "tier": "C1",
      "verb": "spore_descend"
@@ -359,7 +359,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-007",
-      "row_version": "90ddc166f6974118"
+      "row_version": "2f3bc747d27b450c"
      },
      "tier": "C1",
      "verb": "spore_surface_at"
@@ -392,7 +392,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-007",
-      "row_version": "90ddc166f6974118"
+      "row_version": "2f3bc747d27b450c"
      },
      "tier": "C1",
      "verb": "spore_update"
@@ -403,7 +403,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-007",
-      "row_version": "90ddc166f6974118"
+      "row_version": "2f3bc747d27b450c"
      },
      "tier": "T2",
      "verb": "spore_retarget"
@@ -431,7 +431,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-007",
-      "row_version": "90ddc166f6974118"
+      "row_version": "2f3bc747d27b450c"
      },
      "tier": "T2",
      "verb": "spore_ascend"
@@ -488,7 +488,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-004",
-      "row_version": "7fe61390483a5b6e"
+      "row_version": "5dc423a44e9c2215"
      },
      "tier": "C1",
      "verb": "spore_touch"
@@ -506,7 +506,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-004",
-      "row_version": "7fe61390483a5b6e"
+      "row_version": "5dc423a44e9c2215"
      },
      "tier": "C1",
      "verb": "spore_descend"
@@ -517,7 +517,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-004",
-      "row_version": "7fe61390483a5b6e"
+      "row_version": "5dc423a44e9c2215"
      },
      "tier": "C1",
      "verb": "spore_surface_at"
@@ -550,7 +550,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-004",
-      "row_version": "7fe61390483a5b6e"
+      "row_version": "5dc423a44e9c2215"
      },
      "tier": "C1",
      "verb": "spore_update"
@@ -561,7 +561,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-004",
-      "row_version": "7fe61390483a5b6e"
+      "row_version": "5dc423a44e9c2215"
      },
      "tier": "T2",
      "verb": "spore_retarget"
@@ -589,7 +589,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-004",
-      "row_version": "7fe61390483a5b6e"
+      "row_version": "5dc423a44e9c2215"
      },
      "tier": "T2",
      "verb": "spore_ascend"
@@ -642,7 +642,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-005",
-      "row_version": "a762c4c419bf5373"
+      "row_version": "9fe894af9a4ee074"
      },
      "tier": "C1",
      "verb": "spore_touch"
@@ -660,7 +660,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-005",
-      "row_version": "a762c4c419bf5373"
+      "row_version": "9fe894af9a4ee074"
      },
      "tier": "C1",
      "verb": "spore_descend"
@@ -671,7 +671,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-005",
-      "row_version": "a762c4c419bf5373"
+      "row_version": "9fe894af9a4ee074"
      },
      "tier": "C1",
      "verb": "spore_surface_at"
@@ -704,7 +704,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-005",
-      "row_version": "a762c4c419bf5373"
+      "row_version": "9fe894af9a4ee074"
      },
      "tier": "C1",
      "verb": "spore_update"
@@ -715,7 +715,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-005",
-      "row_version": "a762c4c419bf5373"
+      "row_version": "9fe894af9a4ee074"
      },
      "tier": "T2",
      "verb": "spore_retarget"
@@ -743,7 +743,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-005",
-      "row_version": "a762c4c419bf5373"
+      "row_version": "9fe894af9a4ee074"
      },
      "tier": "T2",
      "verb": "spore_ascend"
@@ -840,7 +840,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-002",
-      "row_version": "c6f6e97c6b9eb12f"
+      "row_version": "26150bd4731b639a"
      },
      "tier": "C1",
      "verb": "spore_touch"
@@ -858,7 +858,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-002",
-      "row_version": "c6f6e97c6b9eb12f"
+      "row_version": "26150bd4731b639a"
      },
      "tier": "C1",
      "verb": "spore_descend"
@@ -869,7 +869,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-002",
-      "row_version": "c6f6e97c6b9eb12f"
+      "row_version": "26150bd4731b639a"
      },
      "tier": "C1",
      "verb": "spore_surface_at"
@@ -902,7 +902,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-002",
-      "row_version": "c6f6e97c6b9eb12f"
+      "row_version": "26150bd4731b639a"
      },
      "tier": "C1",
      "verb": "spore_update"
@@ -913,7 +913,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-002",
-      "row_version": "c6f6e97c6b9eb12f"
+      "row_version": "26150bd4731b639a"
      },
      "tier": "T2",
      "verb": "spore_retarget"
@@ -941,7 +941,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-002",
-      "row_version": "c6f6e97c6b9eb12f"
+      "row_version": "26150bd4731b639a"
      },
      "tier": "T2",
      "verb": "spore_ascend"
@@ -989,7 +989,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-003",
-      "row_version": "cc24659a4558cd3a"
+      "row_version": "f209b8ddc4ff360b"
      },
      "tier": "C1",
      "verb": "spore_touch"
@@ -1007,7 +1007,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-003",
-      "row_version": "cc24659a4558cd3a"
+      "row_version": "f209b8ddc4ff360b"
      },
      "tier": "C1",
      "verb": "spore_descend"
@@ -1018,7 +1018,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-003",
-      "row_version": "cc24659a4558cd3a"
+      "row_version": "f209b8ddc4ff360b"
      },
      "tier": "C1",
      "verb": "spore_surface_at"
@@ -1051,7 +1051,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-003",
-      "row_version": "cc24659a4558cd3a"
+      "row_version": "f209b8ddc4ff360b"
      },
      "tier": "C1",
      "verb": "spore_update"
@@ -1062,7 +1062,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-003",
-      "row_version": "cc24659a4558cd3a"
+      "row_version": "f209b8ddc4ff360b"
      },
      "tier": "T2",
      "verb": "spore_retarget"
@@ -1090,7 +1090,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-003",
-      "row_version": "cc24659a4558cd3a"
+      "row_version": "f209b8ddc4ff360b"
      },
      "tier": "T2",
      "verb": "spore_ascend"
@@ -1138,7 +1138,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-001",
-      "row_version": "692ea443c43e0f8c"
+      "row_version": "a6b5b1ce8c837458"
      },
      "tier": "C1",
      "verb": "spore_touch"
@@ -1156,7 +1156,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-001",
-      "row_version": "692ea443c43e0f8c"
+      "row_version": "a6b5b1ce8c837458"
      },
      "tier": "C1",
      "verb": "spore_descend"
@@ -1167,7 +1167,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-001",
-      "row_version": "692ea443c43e0f8c"
+      "row_version": "a6b5b1ce8c837458"
      },
      "tier": "C1",
      "verb": "spore_surface_at"
@@ -1200,7 +1200,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-001",
-      "row_version": "692ea443c43e0f8c"
+      "row_version": "a6b5b1ce8c837458"
      },
      "tier": "C1",
      "verb": "spore_update"
@@ -1211,7 +1211,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-001",
-      "row_version": "692ea443c43e0f8c"
+      "row_version": "a6b5b1ce8c837458"
      },
      "tier": "T2",
      "verb": "spore_retarget"
@@ -1239,7 +1239,7 @@
      "target": {
       "panel_id": "tray",
       "row_id": "spore:spore-001",
-      "row_version": "692ea443c43e0f8c"
+      "row_version": "a6b5b1ce8c837458"
      },
      "tier": "T2",
      "verb": "spore_ascend"

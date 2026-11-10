@@ -439,7 +439,7 @@ class TestRowVersions:
             "permanence": "x", "activation_mode": "m", "last_activated_on": "2026-01-01", "job_id": "j",
             "verb": "v", "status": "pending", "created_at": "c", "started_at": None, "finished_at": None,
             "result": None, "error": None, "kind": "k", "action": "a", "ts": "t", "origin_key": "ok-1",
-            "target": "desk", "attention": "talk",
+            "target": "desk", "attention": "talk", "germinated": {"on": "2026-10-01", "target": "desk", "ref": "r"},
         }
         checked = 0
         for pid, spec in self._specs(env).items():

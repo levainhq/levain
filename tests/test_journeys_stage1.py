@@ -112,7 +112,7 @@ def test_j1_a_band_answer_is_signed_in_the_sheet_with_a_passkey_and_the_cockpit_
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
-            {"until": f"{STRIP_Q} && 1", "ms": 30000},
+            {"until": f"{STRIP_Q} && {STRIP_Q}.innerText.includes('Ship the sweep fix tonight or hold it?') && 1", "ms": 30000},   # the words arrive by their own read after the card is drawn
             {"eval": f"{STRIP_Q}.innerText"},                                    # what he sees waiting: the question
             {"until": STRIP_FACET + " && 1", "ms": 30000},
             {"tap": OPEN_SHEET},
@@ -152,7 +152,7 @@ def test_j2_the_needs_band_at_phone_width_a_tap_on_an_option_answers_it(tmp_path
     with _serve(src, write_token=TOKEN, install_class="reported") as (base, _h):
         out = _drive(tmp_path, f"{base}/#write_token={TOKEN}", [
             PHONE,
-            {"until": "document.querySelectorAll('#ck-needs .needs-row.needs-question').length === 2 && 1", "ms": 30000},
+            {"until": "document.querySelectorAll('#ck-needs .needs-row.needs-question').length === 2 && /Which retry policy\\?/.test(document.querySelector('#ck-needs').innerText) && /Ship the sweep fix tonight\\?/.test(document.querySelector('#ck-needs').innerText) && 1", "ms": 30000},   # each card's words arrive by its own read after it is drawn
             {"eval": "JSON.stringify({w: innerWidth, h: innerHeight, over: document.documentElement.scrollWidth > innerWidth, "
                      "strip: document.querySelector('#ck-needs').innerText})"},
             {"eval": "document.querySelector('#ck-needs .needs-row.needs-question').click() || 1"},

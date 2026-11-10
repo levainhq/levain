@@ -356,6 +356,48 @@ def check_steering(disposition: Any, target: Any, attention: Any) -> str | None:
     return None
 
 
+def ringing_ref(spore: Mapping[str, Any], open_questions: Any) -> str | None:
+    """The band row an OPEN agenda rings in, or None. The one definition of "rings": the spore is an open agenda, its
+    ``germinated`` stamp names a ref that is not a coordinator drop (``dr-``), and that ref is one of ``open_questions``
+    (the ids of the questions still open): an answered, snoozed-away or missing question does not ring. Read from the
+    stored record, never a facet, so it holds whatever the List could or could not read."""
+    stamp = spore.get("germinated")
+    ref = stamp.get("ref") if isinstance(stamp, Mapping) else None
+    if (spore.get("disposition") == "agenda" and spore.get("status", "open") == "open"
+            and isinstance(ref, str) and ref and not ref.startswith("dr-") and ref in open_questions):
+        return ref
+    return None
+
+
+def answered_descend_kind(spore_type: Any) -> str:
+    """The descend kind that says an intention was answered, by the spore's type (anneal validates a kind against it)."""
+    return {"task": "done", "question": "answered", "thought": "explored"}.get(str(spore_type), "composted")
+
+
+def open_question_ids(questions: Any) -> frozenset[str]:
+    """The ids of the open questions in ``questions`` (a ``QuestionStore``); a store that cannot be read has none."""
+    try:
+        return frozenset(q.id for q in questions.open_questions())
+    except Exception:  # noqa: BLE001 - a guard that cannot read says nothing, it never blocks an unrelated act
+        return frozenset()
+
+
+def spore_ringing_question(spores_json: Any, ref: Any) -> str | None:
+    """The id of the open agenda whose stamp names the OPEN band row ``ref``, or None (no store, no such stamp, an unreadable
+    store: a guard that cannot read says nothing, it never blocks an unrelated act)."""
+    from pathlib import Path
+
+    try:
+        if not Path(spores_json).is_file():
+            return None
+        for item in list_open_readonly(spores_json):
+            if ringing_ref(item, (ref,)) == ref:
+                return str(item.get("id"))
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
+    return None
+
+
 def list_open_readonly(path: Any, *, today: Any = None) -> list[dict[str, Any]]:
     """anneal's ``list_open`` WITHOUT its write: ``list_open`` backfills a missing ``origin_key`` and saves the store
     (and takes a ``.lock`` file), which a diagnostic or a dry run must never do. This reads the document, ranks it
