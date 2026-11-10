@@ -33,7 +33,7 @@ NAME_WORDS = "--sign-host is the name as the browser address bar shows it: lower
 
 
 class _NoWatcher:
-    """``serve --write`` supervises the coordinator over the default queue; these tests do not."""
+    """``serve --write`` supervises the desk over the default queue; these tests do not."""
 
     def __init__(self, *_a: Any, **_k: Any) -> None:
         pass
@@ -47,7 +47,7 @@ class _NoWatcher:
 
 @pytest.fixture(autouse=True)
 def _quiet(monkeypatch: pytest.MonkeyPatch) -> None:
-    import levain.coordinator.supervise as supervise
+    import levain.desk.supervise as supervise
 
     monkeypatch.setattr(supervise, "Watcher", _NoWatcher)
     monkeypatch.setattr(supervise, "default_store", lambda directory=None: None)

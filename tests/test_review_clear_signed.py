@@ -1,4 +1,4 @@
-"""c4-mut session 2: the passkey-signed clear of a "yours to clear" coordinator review item (head rulings R1-R5,
+"""c4-mut session 2: the passkey-signed clear of a "yours to clear" desk review item (head rulings R1-R5,
 project_memory/1025-32/c4mut/RULINGS.md). An authority-relevant item is cleared only with the operator's passkey
 signature over the item's id, state and last event, verified at the door, and the store records it as signed."""
 from __future__ import annotations
@@ -101,7 +101,7 @@ def test_the_registry_names_the_reserved_namespace_and_its_grammar_matches_what_
     from levain.contracts.namespaces import REGISTRY
 
     assert REGISTRY[REVIEW_CLEAR_NAMESPACE][0] == "shipped"
-    from levain.coordinator import envelope, review as rv
+    from levain.desk import envelope, review as rv
 
     assert rv.SIGN_TIER == envelope.SIGN_TIER       # the comment on SIGN_TIER names this constant
     assert re.fullmatch(LEVAIN_SIGN_REQUESTS[REVIEW_CLEAR_NAMESPACE], MSG)
@@ -113,9 +113,9 @@ def test_the_registry_names_the_reserved_namespace_and_its_grammar_matches_what_
 import dataclasses  # noqa: E402
 import sqlite3  # noqa: E402
 
-from levain.coordinator import review  # noqa: E402
-from levain.coordinator.review import SignedClearRefused  # noqa: E402
-from levain.coordinator.store import CoordError, CoordStore  # noqa: E402
+from levain.desk import review  # noqa: E402
+from levain.desk.review import SignedClearRefused  # noqa: E402
+from levain.desk.store import CoordError, CoordStore  # noqa: E402
 
 ORIGIN = f"https://{RP}"
 
@@ -315,7 +315,7 @@ def test_a_signed_clear_lands_on_a_store_made_before_r4(tmp_path: Path, monkeypa
 
 # --- R1: the cockpit, through the real routes ----------------------------------------------------------------------
 
-from levain.cockpit.coordinator_panels import REVIEW_ID  # noqa: E402
+from levain.cockpit.desk_panels import REVIEW_ID  # noqa: E402
 from tests.test_cockpit_k2a import _install  # noqa: E402
 from tests.test_cockpit_pairing_http import PROXY, T, _call, _pair, _serve  # noqa: E402
 FC = "review-clear-surface-token-0123456789"      # a named surface: honoured proxied, where the owner key is not (W1b L-1)
@@ -324,7 +324,7 @@ from tests.test_cockpit_sign_origin import PINNED  # noqa: E402
 
 @pytest.fixture
 def cockpit(tmp_path: Path, monkeypatch):
-    """A real make_server with a Signer on the install's consent directory (which also holds the coordinator store),
+    """A real make_server with a Signer on the install's consent directory (which also holds the desk store),
     one plain item and one "yours to clear" item, and a flow-like compose_signer that must never be asked for a kernel
     verb: a dict of what the tests need."""
     home = tmp_path / "home"

@@ -275,7 +275,7 @@ UPGRADE_ORDER_LINE = (
     "egress keys and cockpit views each answer nothing and allow nothing (all refuse, none falls back to earlier "
     "authority); its graduation coverage drops to none; and it can sign no link at all, a revoke included. Every "
     "levain process on this machine that reads this cockpit must be the new build before you sign: stop each older "
-    "coordinator and daemon first.")
+    "desk and daemon first.")
 
 
 class CardRefused(ValueError):

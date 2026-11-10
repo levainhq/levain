@@ -68,7 +68,7 @@
     { what: "read", tagged: true, re: /^File is in a directory that is denied by your permission settings/ },
     { what: "tool", tagged: true, re: /^Permission to use [^\n]{1,100} has been denied/ },
     { what: "read", tagged: false, re: /^[^\n;]{1,1000} is outside [^\n;]{1,1000}; the permissions\.blockReadsOutsideWorkingDirectories setting blocks reads outside the working directories/ },
-    // the room's own read-guard hook (levain/coordinator/room_readguard.py ROOM_READ_REFUSAL): the vendor wraps a hook's deny
+    // the room's own read-guard hook (levain/desk/room_readguard.py ROOM_READ_REFUSAL): the vendor wraps a hook's deny
     // as "PreToolUse:<Tool> hook error: <reason>", untagged (recorded: tests/fixtures/claude_stream/room_hook_denied_read.jsonl).
     // The WHOLE sentence and the end of the text: another hook's reason that opens the same way is drawn as it is.
     { what: "read", tagged: false, re: /^PreToolUse:(?:Read|Grep|Glob) hook error: That is outside the folder this room can read, so nothing was read\. Tell the user so in plain words; do not suggest commands or ways to change what the room can read\.$/ }

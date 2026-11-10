@@ -17,7 +17,7 @@ from . import pack as P
 from . import roles as R
 from . import wire as W
 from .export import export_stream
-from levain.coordinator.door import door_ok, not_door
+from levain.desk.door import door_ok, not_door
 
 from .hook import decide
 from .ledger_api import LedgerTransport, open_ledger
@@ -527,8 +527,8 @@ def register(subparsers) -> None:
     sub = team_p.add_subparsers(dest="team_command", metavar="<team command>", required=True)
 
     def add(name, func, help_, *, door):
-        """One team command. ``door`` is required: True/False says whether the coordinator's door lets it run
-        (:mod:`levain.coordinator.door`), None marks a group that only holds subcommands."""
+        """One team command. ``door`` is required: True/False says whether the desk's door lets it run
+        (:mod:`levain.desk.door`), None marks a group that only holds subcommands."""
         p = sub.add_parser(name, help=help_, description=help_)
         p.add_argument("--repo", help="a path inside the project's git repository (default: cwd)")
         p.set_defaults(func=_guarded(func) if func else None)

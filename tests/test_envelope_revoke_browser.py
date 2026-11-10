@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives import serialization
 
 from levain.consent.grant_phone import GrantRefused
 from levain.consent.passkey import challenge
-from levain.coordinator.envelope_revoke import NAMESPACE, EnvelopeRevoke, revoke_message
+from levain.desk.envelope_revoke import NAMESPACE, EnvelopeRevoke, revoke_message
 from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install

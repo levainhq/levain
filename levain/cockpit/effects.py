@@ -737,12 +737,12 @@ def _seed_steering(params: Mapping[str, Any], disposition: str) -> dict[str, Any
 # --- THE LIST's one-line intake (task_surfaces_1107.md "intake grammar") ------------------------------------------
 # One panel verb, ``{line}``: the server reads the line with ``levain.intake.parse_intake`` (the browser holds no
 # grammar). A ``drop`` and a ``talk`` become a ``spore_seed`` effect (below) through the broker; a ``sort`` is a
-# coordinator drop (``verbs._intake_fire``), never a spore.
+# desk drop (``verbs._intake_fire``), never a spore.
 INTAKE_VERB = "list_intake"
 # the tier of each kind. A drop wakes the desk at its minute with the line's words as the operator's (germinate files
-# them as a coordinator drop from surface ``cli``), so it is signed. A talk seed is a spore agents read (the talk
+# them as a desk drop from surface ``cli``), so it is signed. A talk seed is a spore agents read (the talk
 # queue), the exposure every ``spore_seed`` is T2 for, so it is signed too: a
-# ``?`` prefix must not be a way around spore_seed's floor. A sort is the room composer's own write (a coordinator drop
+# ``?`` prefix must not be a way around spore_seed's floor. A sort is the room composer's own write (a desk drop
 # from the cockpit surface, "your words, kept verbatim, never authority"), C1 as that is. "Signed" is T2's gesture in a
 # governed install; a REPORTED install fires a token's T2 as reported (``gesture_for``), as it does every spore_seed,
 # which is that install class's declared trade. A standing raise of spore_seed governs a drop and a talk too

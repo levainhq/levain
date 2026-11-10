@@ -20,7 +20,7 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_room_join import _store
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
-from tests.test_coordinator_room_serve import fake_serve
+from tests.test_desk_room_serve import fake_serve
 
 INIT = """
 (() => {

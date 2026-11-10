@@ -10,7 +10,7 @@ THE BOUND, as arithmetic (a test pins it from these constants, never from a rest
   layer 2: ``os._exit``) fires at :data:`TICK_HARD_BOUND_S` whatever the main thread is doing;
 * ``TICK_HARD_BOUND_S >= STOP_BUDGET_S + STOP_DEADLINE_S``: a full stop phase fits inside one tick;
 * the renewals are the first thing a tick does after the store opens: before them run only the store open, the two
-  install-file reads that name the cockpit and the supervisor's construction (the coordinator directory, its
+  install-file reads that name the cockpit and the supervisor's construction (the desk directory, its
   ``dispatch.db`` and the claims all come AFTER the reaper). That phase is held to :data:`TICK_PRE_RENEW_BOUND_S`, and
   a tick that overran it says so on stderr (a gauge: the renewals still run). So the worst gap between two renewals of
   one non-withheld row is one interval, a tick that ran to its hard bound and the next tick's pre-renewal phase:
@@ -278,7 +278,7 @@ def _cockpit_root(store: AgentStore) -> Path:
 
 
 def _install_coord_dir(store: AgentStore, notes: list[str]) -> Path | None:
-    """The coordinator queue directory the dream install names (its dispatch.db feeds the slot-lease probes), else
+    """The desk queue directory the dream install names (its dispatch.db feeds the slot-lease probes), else
     None. No install file is a plain None; a file that exists but cannot be read (refused, corrupt, unreadable) is
     also None, and its cause goes in ``notes`` so the tick never reports it as merely absent."""
     from levain.dream import agent as _da
@@ -287,13 +287,13 @@ def _install_coord_dir(store: AgentStore, notes: list[str]) -> Path | None:
             return None
         return _da.read_install(store.directory).coord_dir
     except Exception as exc:  # noqa: BLE001 - named, never read as "no install"
-        notes.append(f"the dream install cannot be read for its coordinator directory ({type(exc).__name__}: {exc})")
+        notes.append(f"the dream install cannot be read for its desk directory ({type(exc).__name__}: {exc})")
         return None
 
 
 def _coord_dir_for(store: AgentStore, given: Path | str | None, notes: list[str] | None = None) -> Path | None:
-    """The coordinator directory for the probes: ``--coord-dir``, else the dream install's, else, for the DEFAULT
-    agent store only, the default consent queue (``<levain home>/consent``, where the coordinator keeps
+    """The desk directory for the probes: ``--coord-dir``, else the dream install's, else, for the DEFAULT
+    agent store only, the default consent queue (``<levain home>/consent``, where the desk keeps
     ``dispatch.db``) when a ``dispatch.db`` is there. None when none of these names one."""
     if given is not None:
         return Path(given)
@@ -314,7 +314,7 @@ def _coord_dir_for(store: AgentStore, given: Path | str | None, notes: list[str]
 
 def _lazy_probes(store: AgentStore, given: Path | str | None, notes: list[str]) -> tuple[Callable, Callable]:
     """``(session_alive, launch_over)`` for ``controller.tick``, resolved on their FIRST call (the claims phase, after the
-    reaper's renewals), never before. With no coordinator directory both answer None ("cannot tell": the expired
+    reaper's renewals), never before. With no desk directory both answer None ("cannot tell": the expired
     launch slot is kept, never freed on a guess) and the tick names that in ``notes``."""
     cell: list = []
 
@@ -322,7 +322,7 @@ def _lazy_probes(store: AgentStore, given: Path | str | None, notes: list[str]) 
         if not cell:
             where = _coord_dir_for(store, given, notes)
             if where is None:
-                notes.append("an expired coordinator launch slot cannot be probed: no coordinator directory (pass "
+                notes.append("an expired desk launch slot cannot be probed: no desk directory (pass "
                              "--coord-dir, or install the dream, which names one); the slot is kept")
                 cell.append(None)
             else:
@@ -388,9 +388,9 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
     The seams (``clock``, ``authority``, ``launcher_of``, ``dream_of``) are tests'; production passes none.
 
     Order (the renewal-gap arithmetic in the module docstring rests on it): open the store, name the cockpit, build the
-    supervisor, then the reaper (renewals first); the coordinator directory and its ``dispatch.db`` are read only by the
+    supervisor, then the reaper (renewals first); the desk directory and its ``dispatch.db`` are read only by the
     claims phase, lazily. Every line the pass has to say (an install refusal, a late renewal phase, session rows with
-    no launcher, probes with no coordinator directory) goes to stderr as ``levain agents tick: ...``."""
+    no launcher, probes with no desk directory) goes to stderr as ``levain agents tick: ...``."""
     from levain.agent_authority import AgentAuthority
     from levain.agents import session_wire as _wire
     from levain.dream import agent as _da

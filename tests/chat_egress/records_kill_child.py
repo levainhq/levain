@@ -13,7 +13,7 @@ import threading
 from levain.chat_egress import records as rec
 from levain.chat_egress import wire
 from levain.chat_egress.lifecycle import Effect, Event, RequestLifecycle
-from levain.coordinator.store import CoordStore
+from levain.desk.store import CoordStore
 
 ATTEMPT = rec.Attempt(host="example.com", method="POST", path="/upload", names=(), setup_record_id=None,
                       attach=rec.Attach.NONE, deciding_step="card", open_network=False)

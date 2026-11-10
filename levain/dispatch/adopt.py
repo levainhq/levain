@@ -6,7 +6,7 @@ needs). LAND (E1, "adopted"): one ``update-ref`` compare-and-swap moves a branch
 contract's ``base`` to a staged commit. A land is authorised by (A) the operator's signed authorise item over the
 run's ARTIFACT digest and the branch (:func:`authorise_payload`, its own namespace), or (B) a standing adoption rule
 whose typed criteria hold (:func:`levain.dispatch.registry.active_adoption_rules`), or (C) the envelope the job was
-bound to at filing (:class:`Envelope`, a protocol the coordinator implements; Python API only until S1 and the run
+bound to at filing (:class:`Envelope`, a protocol the desk implements; Python API only until S1 and the run
 supervisor). Every authority passes ONE floor (:func:`floor`, F11 §4), whose first failure decides. The run
 records a land judges are the job store's own (:meth:`levain.dispatch.jobs.JobStore.run_records`, as
 :meth:`~levain.dispatch.jobs.JobStore.record_verification` wrote them); :func:`land` takes none from its caller,
@@ -651,7 +651,7 @@ def criteria_failure(criteria: Iterable[tuple[str, Any]], changes: ChangeSet, *,
 
 @runtime_checkable
 class Envelope(Protocol):
-    """Authority (C): the coordinator's envelope object (C0 implements it; dispatch never imports the coordinator).
+    """Authority (C): the desk's envelope object (C0 implements it; dispatch never imports the desk).
     It is the ONE input every envelope write takes (L3 r1 codex 3): :meth:`JobStore.file_in_envelope`,
     :meth:`JobStore.take_slot` and :meth:`JobStore.authorise` read the binding from :meth:`evidence` inside their own
     transaction, compare it to the job's filing binding, and run THIS object's :meth:`precondition` on that
@@ -830,7 +830,7 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
           envelope: Envelope | None = None) -> Floor:
     """F11 §4 for (A) (``human`` is the signed payload), (B) (``rules`` returns the active adoption rules and
     their generation from one read, :func:`levain.dispatch.registry.adoption_rules_at`) or (C) (``envelope``, the
-    coordinator's :class:`Envelope` object; exactly one of the three). The first failure decides. For (C) step 5
+    desk's :class:`Envelope` object; exactly one of the three). The first failure decides. For (C) step 5
     (R0, contrast, entries) never runs and the tier is the object's to judge (F11 §12, C0 §5 C3); step 6 is the job's
     filing binding naming this envelope and :meth:`Envelope.refusal` passing, and a failure there is ``needs_sign``
     once step 7 passes (a target step 7 refuses is refused instead: a SIGN cannot fix it).
@@ -947,7 +947,7 @@ def floor(job: Job, records: Sequence[ArtifactRecord], *, onto: str | None,
     if tip != record.base:
         # under (C), land fails the job when the envelope is the job's own (``bound``), even one whose refusal()
         # refuses (dead, or past its criteria): the result was judged on a base the target no longer reads, so it
-        # is invalid under any authority, and holding it would keep its write files from the coordinator's re-file
+        # is invalid under any authority, and holding it would keep its write files from the desk's re-file
         return Floor(failure=f"MOVED BASE: {onto} is at {tip}, not the contract's base {record.base}", moved=True,
                      record=record, changes=changes, tier=tier, evidence=evidence, bound=bound)
     if unsigned is not None:
@@ -1201,14 +1201,14 @@ def land(store: JobStore, job_id: str, *,
     A refused signature is a ``refused`` landing; a verifier that cannot run
     (:class:`levain.authority.VerifierUnavailable`) and a git that cannot run (:class:`GitFault`) raise.
 
-    ``envelope`` is (C), the coordinator's :class:`Envelope` for this job (Python API only: no CLI, MCP or phone verb
+    ``envelope`` is (C), the desk's :class:`Envelope` for this job (Python API only: no CLI, MCP or phone verb
     passes one, F11 §12). Its intent is ``authority: "C"`` with the object's evidence under ``envelope``, cause
     ``envelope_rule``, and :meth:`Envelope.precondition` runs inside the authorise transaction; a missing (C)
     authority, at the floor or in that transaction, is a ``needs_sign`` landing, said only when the target passed
     (a target the floor refuses is ``refused``: a SIGN cannot fix it). The object itself, never a separate hook, is
     what :meth:`JobStore.authorise` judges. A MOVED BASE under the job's own envelope (its filing binding names it,
     whether or not :meth:`Envelope.refusal` passes: a dead bound envelope fails it too) FAILS the job, cause
-    ``base_moved``, releasing its write files (C0 §5: the coordinator then re-files); under an envelope that is not
+    ``base_moved``, releasing its write files (C0 §5: the desk then re-files); under an envelope that is not
     the job's own it is refused and the job kept, as under a rule."""
     job = store.get(job_id)
     if job is None:

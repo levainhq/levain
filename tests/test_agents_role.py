@@ -475,7 +475,7 @@ def test_a_malformed_withhold_is_refused_naming_the_field(bad, why):
 
 def test_withhold_never_reaches_the_envelope_narrowing():
     from levain.agents.role import envelope_ceiling
-    from levain.coordinator.envelopes import narrow_scope
+    from levain.desk.envelopes import narrow_scope
     r = copy.deepcopy(ROLE)
     r["ceiling"]["withhold"] = ["docs/**"]
     ceiling = instance_ceiling(r)

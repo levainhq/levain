@@ -78,9 +78,9 @@ class Scratch:
             conn.close()
 
     def cards(self, home: Path) -> None:
-        """Review cards on the scratch coordinator store: ``w-firing`` has one open and one cleared, ``w-paused`` one open."""
-        from levain.coordinator import review
-        from levain.coordinator.store import CoordStore
+        """Review cards on the scratch desk store: ``w-firing`` has one open and one cleared, ``w-paused`` one open."""
+        from levain.desk import review
+        from levain.desk.store import CoordStore
 
         (home / "consent").mkdir(mode=0o700, exist_ok=True)
         store = CoordStore(home / "consent")

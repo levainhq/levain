@@ -75,11 +75,11 @@ def test_the_keeper_stops_with_its_event(tmp_path: Path, monkeypatch) -> None:
 
 @serves
 def test_a_serve_that_cannot_start_leaves_no_needs_record(world, tmp_path, monkeypatch) -> None:
-    from levain.coordinator.room_serve import RoomServeError
+    from levain.desk.room_serve import RoomServeError
     from levain.web_server import make_server
     from tests.test_cockpit_k2a import TOKEN, _install
     from tests.test_cockpit_room_join import _store
-    from tests.test_coordinator_room_serve import scripted
+    from tests.test_desk_room_serve import scripted
 
     monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))
     _rs_store, rs, launcher = scripted(tmp_path, store=_store(world.qdir))

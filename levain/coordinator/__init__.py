@@ -1,6 +1,50 @@
-"""levain.coordinator — the coordinator's records: your drops, the threads they become, and the replies to them.
+"""levain.coordinator: the old import path of :mod:`levain.desk`, kept for the 1.x line.
 
-Design: levain project_memory ``1020-coordinator/C0_DESIGN.md`` (rev 6, read by Phill 10-20). This package holds C1, the
-drop and thread store (:mod:`levain.coordinator.store`) and its CLI (:mod:`levain.coordinator.cli`). Envelopes, launches
-and the lease are later sessions (C2, C3).
+``import levain.coordinator`` and ``from levain.coordinator.room_host import HostCommands`` keep working: this
+package re-exports ``levain.desk``, and a meta-path finder resolves ``levain.coordinator.<anything>`` to the very same
+module object as ``levain.desk.<anything>`` (so ``levain.coordinator.x.Y is levain.desk.x.Y``). One of the two files
+allowed to hold the old word as code (the other is ``levain/desk/legacy.py``).
 """
+from __future__ import annotations
+
+import importlib
+import importlib.abc
+import importlib.util
+import sys
+
+import levain.desk as _desk
+
+_OLD = __name__ + "."
+_NEW = "levain.desk."
+
+
+class _AliasLoader(importlib.abc.Loader):
+    def __init__(self, real: str) -> None:
+        self._real = real
+
+    def create_module(self, spec):
+        return importlib.import_module(self._real)
+
+    def exec_module(self, module) -> None:        # the real module is already executed
+        return None
+
+
+class _AliasFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if not fullname.startswith(_OLD):
+            return None
+        real = _NEW + fullname[len(_OLD):]
+        try:
+            if importlib.util.find_spec(real) is None:
+                return None
+        except (ImportError, ValueError):
+            return None
+        return importlib.util.spec_from_loader(fullname, _AliasLoader(real))
+
+
+if not any(isinstance(f, _AliasFinder) for f in sys.meta_path):
+    sys.meta_path.insert(0, _AliasFinder())
+
+
+def __getattr__(name: str):
+    return getattr(_desk, name)

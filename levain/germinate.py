@@ -11,8 +11,8 @@ is due from that minute; an agenda with no ``next`` is never due) it does, in or
    (``ping_failed`` in the result, non-zero exit); only a ping that went out is followed by the stamp. A crash between
    the ping and the stamp therefore pings again on the re-run (at-least-once: a lost nudge is the failure this exists
    to prevent), still into the ONE row;
-4. ``board:<repo>`` / ``desk``: a coordinator drop (``outbox_id`` derived from the spore, words always checked against
-   the spore as it is now), or, with no coordinator store that can take a drop (``coordinator_present``), the band
+4. ``board:<repo>`` / ``desk``: a desk drop (``outbox_id`` derived from the spore, words always checked against
+   the spore as it is now), or, with no desk store that can take a drop (``desk_present``), the band
    filing with the reason in ``blocks``. ``desk`` files the spore's words verbatim and uncut (a spore too long for a
    drop is an error for that spore, never a truncation);
 5. stamp ``germinated={on, target, ref}`` as a compare-and-set against the spore as it was read (its version and ``agenda``
@@ -20,7 +20,7 @@ is due from that minute; an agenda with no ``next`` is never due) it does, in or
    words on the next run. An agenda that filed or adopted a QUESTION (``adopted``, ``band``, ``nudge``, ``band-fallback``)
    is then LEFT OPEN while that question is open: its stamp names the row, the row rings in the band, and the operator's
    controls on that intention move the spore and the row together; once the question is ANSWERED the next run closes the
-   agenda (``done`` / ``answered`` / ``explored`` by its type). An agenda that handed a coordinator drop (``board``,
+   agenda (``done`` / ``answered`` / ``explored`` by its type). An agenda that handed a desk drop (``board``,
    ``desk``) is composted, as before, with a second compare-and-set.
 
 One bad spore never stops the others: its error is recorded under ``errors`` and the run goes on; the CLI prints every
@@ -95,7 +95,7 @@ class Outcome:
 
 
 def outbox_id_for(origin_key: str) -> str:
-    """The coordinator outbox id for a spore: the store's grammar is ``[A-Za-z0-9._-]`` (no colon, so the frame's
+    """The desk outbox id for a spore: the store's grammar is ``[A-Za-z0-9._-]`` (no colon, so the frame's
     ``germinate:<origin_key>`` cannot be one), so it is a hash of the origin key, still one id per origin key."""
     return "germinate-" + hashlib.sha256(origin_key.encode("utf-8")).hexdigest()[:40]
 
@@ -206,7 +206,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
 
     from levain.consent import band
     from levain.consent.questions import ANSWER_CHANNELS, DB_NAME, QuestionStore, later_date
-    from levain.coordinator.store import CoordStore
+    from levain.desk.store import CoordStore
     from levain.spores import answered_descend_kind, guarded_spore_store, ringing_ref
 
     now = now or datetime.now()
@@ -239,14 +239,14 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
             return False
         return q is not None and q.answer is not None
 
-    # a stamped agenda is finished when its stamp names a coordinator drop (handed off, not a live row) or a question that has
+    # a stamped agenda is finished when its stamp names a desk drop (handed off, not a live row) or a question that has
     # been ANSWERED (the intention is done); one whose question still rings stays open, and one whose question is missing waits
     finish = [s for s in open_items if _is_agenda(s) and s.get("germinated")
               and (_stamp_ref(s).startswith("dr-") or not _stamp_ref(s)
                    or (ringing_ref(s, open_ids) is None and _answered(_stamp_ref(s))))]
     coord = CoordStore(qdir)
     ping = ping or band._send_ping
-    has_board = coord.coordinator_present()
+    has_board = coord.desk_present()
     stamp_for = {"on": today.isoformat()}
 
     def _err(sid: Any, okey: Any, exc: BaseException | str, **extra: Any) -> None:
@@ -312,7 +312,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                     if repo:
                         blocks += f" (board {repo}: no board here, so it is on the band)"
                     elif target == TARGET_DESK:
-                        blocks += " (desk: no coordinator here, so it is on the band)"
+                        blocks += " (desk: no desk here, so it is on the band)"
                     q, filed = questions.file_once(
                         agent=agent, key=KEY_PREFIX + okey,
                         what=f"Due {(nxt or today).strftime('%m-%d')}: {title} ({sid})",
@@ -413,7 +413,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                                    "yet germinated) is filed once as the spore's target says, stamped, and composted. "
                                    "Deterministic; no model call. Safe to run again: a re-run files nothing twice.")
     g.add_argument("--path", type=Path, default=Path.cwd(), help="Install directory (default: cwd).")
-    g.add_argument("--queue-dir", type=Path, default=None, help="The band / coordinator directory (default: the "
+    g.add_argument("--queue-dir", type=Path, default=None, help="The band / desk directory (default: the "
                                                                 "levain home's consent dir).")
     g.add_argument("--agent", choices=("claude_code", "codex"), default="claude_code",
                    help="The band's name for this install's harness.")

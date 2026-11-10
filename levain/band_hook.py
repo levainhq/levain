@@ -471,7 +471,7 @@ def inside_wired_install(agent: str, cwd: str | None, env: Mapping[str, str]) ->
 
 def stands_down(session: str, env: Mapping[str, str]) -> bool:
     """Whether the user-level band stays silent for this session (its seat, not its directory). A session with a
-    Levain launch row is decided by the row (a coordinator gets the band, a worker does not). One without a row
+    Levain launch row is decided by the row (a desk gets the band, a worker does not). One without a row
     stands down when ``CLAUDE_CODE_ENTRYPOINT`` starts ``sdk-``: a headless run (``claude -p`` carries ``sdk-cli``;
     the SDKs ``sdk-ts`` and ``sdk-py``), another tool's or the operator's own script, where a band injected every
     prompt and a Stop that holds a turn would cost a model turn and change the output. An interactive session of any
@@ -537,7 +537,7 @@ def read_payload() -> dict[str, Any]:
 
 
 def codex_standalone(event: str, payload: dict[str, Any], env: Mapping[str, str] | None = None) -> None:
-    """What a Codex install hook does where its own cwd gate says no (a session outside the install: the coordinator's
+    """What a Codex install hook does where its own cwd gate says no (a session outside the install: the desk's
     workspace): the band alone, only when the operator ran ``levain band hooks install`` (the receipt), with the
     same stand-down rules. Never raises."""
     try:

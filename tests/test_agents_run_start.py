@@ -13,7 +13,7 @@ from levain.agents import controller as ctl
 from levain.agents import supervise
 from levain.autonomic.binding import BindingStore
 from levain.autonomic.journal import EffectStatus, RunJournal
-from levain.coordinator.store import CoordStore
+from levain.desk.store import CoordStore
 from levain.dream import agent as da
 from tests.test_agents_dispatch import _dream_rig
 from tests.test_agents_launch import BINDING, Rig

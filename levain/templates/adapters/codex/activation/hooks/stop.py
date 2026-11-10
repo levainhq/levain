@@ -51,7 +51,7 @@ def main() -> int:
             kind = "reply"
             try:
                 from levain.band_view import turn_log_kind
-                kind = turn_log_kind(payload, "reply", agent="codex")      # "wake_reply" for a coordinator wake
+                kind = turn_log_kind(payload, "reply", agent="codex")      # "wake_reply" for a desk wake
             except Exception:
                 pass
             hook.session_log(payload.get("session_id"), kind, message)

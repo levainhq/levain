@@ -626,7 +626,7 @@ def _renew_target_holds(wiring: Any, agent_id: str, version: int, store_id: str,
                                       "store: look at it again (nothing was signed)")
 
 
-# a coordinator review queue row (levain.cockpit.coordinator_panels): clear on an open item that is not "yours to clear",
+# a desk review queue row (levain.cockpit.desk_panels): clear on an open item that is not "yours to clear",
 # reopen on a cleared one
 _REVIEW_PREFIX = "review:"
 _CLEARABLE_REVIEW_ROW = lambda r: (str(r.get("id", "")).startswith(_REVIEW_PREFIX)   # noqa: E731
@@ -673,10 +673,10 @@ def _review_fire(op: str) -> Callable[..., dict[str, Any]]:
     clear and reopen behind the actor's back refuses it). The store refuses a "yours to clear" item on this path
     (``plain_only``): its clear is ruled signed-only. It authorises nothing and tells no agent anything, so it is C1."""
     def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
-        from levain.cockpit.coordinator_panels import review_version
+        from levain.cockpit.desk_panels import review_version
         from levain.cockpit.providers import _dispatch_dir
-        from levain.coordinator import review
-        from levain.coordinator.store import CoordError, CoordStore, StoreAbsent
+        from levain.desk import review
+        from levain.desk.store import CoordError, CoordStore, StoreAbsent
 
         if params:
             raise EditError("bad_request", 400, "a review clear or reopen takes no parameters")
@@ -689,7 +689,7 @@ def _review_fire(op: str) -> Callable[..., dict[str, Any]]:
             raise EditError("bad_request", 400, f"{rid[:60]!r} is not a review queue row")
         directory = target.get("dispatch_dir") or _dispatch_dir(target.get("consent_reader"))
         if directory is None:
-            raise EditError("not_built", 501, "this cockpit names no coordinator store")
+            raise EditError("not_built", 501, "this cockpit names no desk store")
         drawn = row["version"]
 
         def still(item: Any) -> None:
@@ -707,7 +707,7 @@ def _review_fire(op: str) -> Callable[..., dict[str, Any]]:
         except CoordError as exc:
             raise EditError("refused", 409, str(exc)) from None
         except (OSError, sqlite3.Error) as exc:
-            raise EditError("source_unavailable", 503, f"the coordinator store cannot be written now: {exc}") from None
+            raise EditError("source_unavailable", 503, f"the desk store cannot be written now: {exc}") from None
         # never a top-level "state": the page reads that key as a write's outcome (dashboard_boot.js resultWords)
         return {"item": item.item_id, "review_state": item.state}
     return fire
@@ -717,7 +717,7 @@ def _refuse_raised_review(verb: VerbSpec, tier: Tier, row: "dict[str, Any] | Non
     """A review verb a signed standing policy raised above C1 (head ruling 1025+32, fix r1 item 3): refused here, on
     every surface, with the paths that do clear it named. Above C1 a verb goes to the broker, and no broker effect
     applies a review write, so it would only ever be refused there, in words that name no way through."""
-    from levain.cockpit.coordinator_panels import REVIEW_VERBS
+    from levain.cockpit.desk_panels import REVIEW_VERBS
 
     if verb.name not in REVIEW_VERBS:
         return
@@ -730,7 +730,7 @@ def _refuse_raised_review(verb: VerbSpec, tier: Tier, row: "dict[str, Any] | Non
     raise _refuse("review_raised", 403,
                   f"{verb.name!r} is {tier} here (a signed standing policy raised it), and a review item is cleared "
                   f"or reopened from the cockpit only at C1, never as a pending: use {signed}the laptop's own "
-                  f"command, levain coord review {cmd} {item}{unsigned}")
+                  f"command, levain desk review {cmd} {item}{unsigned}")
 
 
 def refuse_raised_review(name: str, item_id: str, policy: "TierPolicy") -> None:
@@ -749,12 +749,12 @@ def _review_signed_fire(scope: "WriteScope", params: dict[str, Any], target: dic
                         confirm: bool) -> dict[str, Any]:
     """Clear one "yours to clear" review item on the operator's passkey signature (c4-mut R3, R4): the kernel already
     checked that ``sign_request`` names the request a compose filed for exactly ``{item}`` and that it is signed
-    (:func:`_require_sign_request`); the door (:func:`levain.coordinator.review.clear_signed`) verifies the signature
+    (:func:`_require_sign_request`); the door (:func:`levain.desk.review.clear_signed`) verifies the signature
     itself against the Signer's enrolled passkeys and the item as it is now. Any credential that reached the kernel may
     send it: the passkey signature names who cleared, which the shared surface token cannot (head ruling obs 2)."""
     from levain.cockpit.providers import _dispatch_dir
-    from levain.coordinator import review
-    from levain.coordinator.store import CoordError, CoordStore, StoreAbsent
+    from levain.desk import review
+    from levain.desk.store import CoordError, CoordStore, StoreAbsent
 
     item_id = str(target["row"]["id"])[len(_REVIEW_PREFIX):]
     if set(params) != {"item", SIGN_PARAM} or params["item"] != item_id:
@@ -762,7 +762,7 @@ def _review_signed_fire(scope: "WriteScope", params: dict[str, Any], target: dic
     signer = target.get("signer")
     directory = target.get("dispatch_dir") or _dispatch_dir(target.get("consent_reader"))
     if signer is None or directory is None:
-        raise EditError("not_built", 501, "this cockpit runs no passkey ceremony or names no coordinator store")
+        raise EditError("not_built", 501, "this cockpit runs no passkey ceremony or names no desk store")
     try:
         item = review.clear_signed(CoordStore(Path(directory)), item_id, queue_dir=signer.queue_dir,
                                    request_id=params[SIGN_PARAM], keys=signer.keys)
@@ -773,25 +773,25 @@ def _review_signed_fire(scope: "WriteScope", params: dict[str, Any], target: dic
     except CoordError as exc:
         raise EditError("refused", 409, str(exc)) from None
     except (OSError, sqlite3.Error) as exc:
-        raise EditError("source_unavailable", 503, f"the coordinator store cannot be written now: {exc}") from None
+        raise EditError("source_unavailable", 503, f"the desk store cannot be written now: {exc}") from None
     return {"item": item.item_id, "review_state": item.state, "mode": item.last[1] if item.last else None}
 
 
 def _review_compose(params: dict[str, Any], cockpit: "Cockpit", signer: Any) -> str:
     """Levain's own composer for ``review_clear_signed`` (c4-mut R1): file the sign request over the item as it is now
-    (:func:`levain.coordinator.review.file_clear_request`) and name it. ``ValueError`` (the compose route's 400) with
+    (:func:`levain.desk.review.file_clear_request`) and name it. ``ValueError`` (the compose route's 400) with
     the words the operator reads when there is nothing to sign."""
     from levain.cockpit.providers import _dispatch_dir
     from levain.consent.sign import SignRefused
-    from levain.coordinator import review
-    from levain.coordinator.store import CoordError, CoordStore
+    from levain.desk import review
+    from levain.desk.store import CoordError, CoordStore
 
     item = params.get("item")
     if set(params) != {"item"} or not isinstance(item, str):
         raise ValueError("a signed clear names one review item, as 'item'")
     directory = _dispatch_dir(getattr(cockpit, "consent_reader", None))
     if directory is None:
-        raise ValueError("this cockpit names no coordinator store")
+        raise ValueError("this cockpit names no desk store")
     try:
         return review.file_clear_request(CoordStore(Path(directory)), item, queue_dir=signer.queue_dir)
     except (CoordError, SignRefused, OSError, sqlite3.Error) as exc:
@@ -942,19 +942,19 @@ def _intake_policy_also(params: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _intake_outbox_id(credential: str, key: str) -> str:
-    """The coordinator outbox id a keyed sort writes under: one per (credential, key), in the store's id shape."""
+    """The desk outbox id a keyed sort writes under: one per (credential, key), in the store's id shape."""
     import hashlib
 
     return "li" + hashlib.sha256(f"{credential}\0{key}".encode("utf-8")).hexdigest()[:40]
 
 
 def _intake_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
-    """The C1 half of ``list_intake``: a plain line (``sort``) stored verbatim as a coordinator drop from the cockpit
+    """The C1 half of ``list_intake``: a plain line (``sort``) stored verbatim as a desk drop from the cockpit
     surface, the room composer's own write (``room.post_room_drop``), for the desk to sort. A drop or a talk never
     reaches here (T2: the broker). The receipt is ``levain.intake.receipt``'s three-line shape."""
     from levain import intake
     from levain.cockpit.providers import _dispatch_dir
-    from levain.coordinator.store import CoordError, CoordStore, DropConflict, StoreAbsent
+    from levain.desk.store import CoordError, CoordStore, DropConflict, StoreAbsent
     from levain.dispatch import DispatchError
 
     line = params.get("line")
@@ -968,7 +968,7 @@ def _intake_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, 
         raise EditError("bad_request", 400, f"a {parsed['kind']} intake is signed, never a direct write")
     directory = target.get("dispatch_dir") or _dispatch_dir(target.get("consent_reader"))
     if directory is None:
-        raise EditError("not_built", 501, "this cockpit names no coordinator store, so there is no desk to sort it")
+        raise EditError("not_built", 501, "this cockpit names no desk store, so there is no desk to sort it")
     key = target.get("idempotency_key")
     if not isinstance(key, str) or not key:
         # the room composer's contract too (a drop carries its outbox id): a resend after a lost reply must name
@@ -978,13 +978,13 @@ def _intake_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, 
     try:
         drop, created = CoordStore(Path(directory)).accept_drop(parsed["text"], surface="cockpit", outbox_id=outbox)
     except StoreAbsent as exc:
-        raise EditError("not_built", 501, f"the coordinator store is absent: {exc}") from None
+        raise EditError("not_built", 501, f"the desk store is absent: {exc}") from None
     except DropConflict as exc:
         raise EditError("idempotency_conflict", 409, f"this idempotency key sent other words: {exc}") from None
     except CoordError as exc:
         raise EditError("drop_refused", 409, str(exc)) from None
     except (OSError, sqlite3.Error, DispatchError) as exc:
-        raise EditError("source_unavailable", 503, f"the coordinator store cannot take a drop now: {exc}") from None
+        raise EditError("source_unavailable", 503, f"the desk store cannot take a drop now: {exc}") from None
     line_out, rec = intake.receipt(parsed)
     return {"ok": True, "state": "COMMITTED", "receipt": rec, "receipt_line": line_out, "drop_id": drop.drop_id,
             "replay": not created}
@@ -1044,7 +1044,7 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec(INTAKE_VERB, "add", "adds one line to the List: '@<when> words' schedules a drop that wakes the desk "
              "at that minute, '? words' queues a talk, anything else goes to the desk to sort", "create",
              fields=("line",), floor="T2", tier_fn=_intake_tier, fire=_intake_fire, device_ok=True,
-             # at-most-once: a sort's key names its coordinator drop's outbox id, so a resend after a lost reply
+             # at-most-once: a sort's key names its desk drop's outbox id, so a resend after a lost reply
              # writes nothing (a drop and a talk are broker pendings, keyed as every pending is)
              idempotent=True, policy_also=_intake_policy_also),
     VerbSpec("episode_tombstone", "tombstone", "deletes an episode (memory's graduation evidence)", "row",
@@ -1075,7 +1075,7 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("note_dismiss", "dismiss", "marks an agent's note read (it tells the agent nothing and authorises "
              "nothing)", "row", floor="C1", tier_fn=_const("C1"), reversible=False, fire=_note_fire,
              applies_to=_OPEN_NOTE_ROW),
-    VerbSpec("review_clear", "clear", "clears a coordinator review item as you (it authorises nothing)", "row",
+    VerbSpec("review_clear", "clear", "clears a desk review item as you (it authorises nothing)", "row",
              floor="C1", tier_fn=_const("C1"), fire=_review_fire("clear"), applies_to=_CLEARABLE_REVIEW_ROW),
     VerbSpec("review_reopen", "reopen", "puts a cleared review item back in the queue", "row", floor="C1",
              tier_fn=_const("C1"), fire=_review_fire("reopen"), applies_to=_REOPENABLE_REVIEW_ROW),
@@ -1419,7 +1419,7 @@ def dispatch(
 ) -> dict[str, Any]:
     """``paired``: a transport that authenticated the request as a paired device on its own store (the phone app,
     for the phone port) names the check here; the cockpit's server passes none and the kernel asks its broker's journal
-    (:func:`_broker_paired`). ``dispatch_dir``: the coordinator store's directory for a cockpit with no consent reader
+    (:func:`_broker_paired`). ``dispatch_dir``: the desk store's directory for a cockpit with no consent reader
     to name it (the phone app's)."""
     # the tier at issue governs, from a FRESH snapshot taken once for this request and bound for its
     # source reads (K2b-3b §0.1, §8d row 6)
@@ -1552,10 +1552,10 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
                               "questions": cockpit.question_store, "notes": getattr(cockpit, "note_store", None),
                               # the credential's name: the viewer a band answer binds to (``cockpit:<name>``)
                               "credential": str(credential.get("name") or ""),
-                              # an at-most-once kernel fire's key (the List's sort names its coordinator drop by it)
+                              # an at-most-once kernel fire's key (the List's sort names its desk drop by it)
                               "idempotency_key": req.get("idempotency_key"),
                               # whether the request came from a paired device, asked of that device's store (a review
-                              # verb writes only for one), and where the coordinator store is (the directory the review
+                              # verb writes only for one), and where the desk store is (the directory the review
                               # panel reads)
                               "paired": paired if paired is not None else _broker_paired(credential, broker),
                               "consent_reader": getattr(cockpit, "consent_reader", None),

@@ -1,6 +1,6 @@
-"""Phill 10-30 (17:0x): the coordinator drop is the HERO of the cockpit's home page, "front and center", not a card at the bottom of the
+"""Phill 10-30 (17:0x): the desk drop is the HERO of the cockpit's home page, "front and center", not a card at the bottom of the
 Decisions view. These drive the real page in headless Chrome over the narrow-layout rig (a cockpit with a Signer, hence the real
-CoordSheet and a real coordinator store): where the hero sits at 390 and 1280, that Send writes a drop through the one route the
+CoordSheet and a real desk store): where the hero sits at 390 and 1280, that Send writes a drop through the one route the
 /sign/drop sheet posts to, that "Add an envelope" hands its words to that sheet, the recent drops, that no drop row is left in the
 consent strip, and the one line the hero draws when the drop read does not work. ``MSGSLOT_SHOTS=<dir>`` keeps the screens."""
 from __future__ import annotations
@@ -139,16 +139,16 @@ def test_send_writes_the_drop_through_the_one_route_clears_the_box_and_says_what
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}",
                      [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, {"until": NEEDS, "ms": 30000}, {"until": READY, "ms": 30000},
-                      *_sent("tell the coordinator: land c-12", posts=1),
+                      *_sent("tell the desk: land c-12", posts=1),
                       {"until": RECEIPT_DONE + " && document.querySelectorAll('#ck-drop .drop-recent-row').length === 1", "ms": 20000},
                       {"eval": after}, _shot(tmp_path, "1280_sent")])
     a = _tagged(out)["after"]
     assert a["box"] == "" and a["focused"] is True, a
-    assert a["receipt"].startswith("Sent to the desk: “tell the coordinator: land c-12”"), a
-    assert len(a["rows"]) == 1 and "tell the coordinator: land c-12" in a["rows"][0] and "unsigned" in a["rows"][0], a   # read back from the store
+    assert a["receipt"].startswith("Sent to the desk: “tell the desk: land c-12”"), a
+    assert len(a["rows"]) == 1 and "tell the desk: land c-12" in a["rows"][0] and "unsigned" in a["rows"][0], a   # read back from the store
     assert len(out["posts"]) == 1 and out["posts"][0].startswith("/cockpit/coord/drop "), out["posts"]                   # the sheet's route, once
     sent = json.loads(out["posts"][0].split(" ", 1)[1])
-    assert set(sent) == {"words", "outbox_id", "sent_at", "store_id"} and sent["words"] == "tell the coordinator: land c-12", sent
+    assert set(sent) == {"words", "outbox_id", "sent_at", "store_id"} and sent["words"] == "tell the desk: land c-12", sent
     assert sent["outbox_id"].startswith("ph-") and sent["store_id"] is None, sent       # a fresh install has no store yet: the first drop makes it
 
 
@@ -270,7 +270,7 @@ def test_without_a_token_the_hero_still_draws_and_says_to_sign_in(tmp_path: Path
 
 
 @needs_browser
-def test_a_cockpit_with_no_coordinator_store_says_so_in_one_line(tmp_path: Path) -> None:
+def test_a_cockpit_with_no_desk_store_says_so_in_one_line(tmp_path: Path) -> None:
     _root, src, _ids = _install(tmp_path)
     with _serve(src, write_token=K2A_TOKEN) as (url, _httpd):         # no Signer: /cockpit/coord/drops.json is a 404
         out = _drive(tmp_path, f"{url}/#write_token={K2A_TOKEN}",
@@ -279,7 +279,7 @@ def test_a_cockpit_with_no_coordinator_store_says_so_in_one_line(tmp_path: Path)
                       {"eval": "JSON.stringify({t: 'line', note: document.querySelector('#ck-drop .drop-note').textContent, shown: document.getElementById('ck-drop').getClientRects().length > 0,"
                                " sendOff: document.querySelector('#ck-drop [data-coord-drop=send]').disabled})"}])
     got = _tagged(out)["line"]
-    assert got["note"].startswith("This cockpit has no coordinator store") and got["shown"] and got["sendOff"], got
+    assert got["note"].startswith("This cockpit has no desk store") and got["shown"] and got["sendOff"], got
 
 
 # ---- L3 r1 (1030-42): the retained retry, the read cache, storage that throws, a bad row, the prefill, the key --------------------------

@@ -3,7 +3,7 @@
 Two kinds of test, and neither is the device. The structure tests read the page's source for the few things that are
 structural (the fragment is read before the bar is cleaned, no text field of its own, the link's safe id). The render tests
 run the REAL sign.js in headless Chrome against a STUB cockpit (a canned server speaking the draft-* reply shapes of
-``levain.coordinator.draft_sign``; the real handlers are tested in tests/test_coordinator_draft_sign.py) with a virtual
+``levain.desk.draft_sign``; the real handlers are tested in tests/test_desk_draft_sign.py) with a virtual
 authenticator. The stub REFUSES a request whose key set is not the one the real server's ``_need`` accepts, so a page that
 sends a key the server would refuse fails here as it would live. They prove the order of the page's calls, that Sign mints
 the challenge at the tap, what the page draws and what it says when a reply is missing or wrong; they prove nothing about the
@@ -25,9 +25,9 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from levain.coordinator import draft_sign
+from levain.desk import draft_sign
 from tests.test_cockpit_flip_parity import _drive, needs_browser
-from tests.test_cockpit_coord_drop import _undeclared_assignments
+from tests.test_cockpit_desk_drop import _undeclared_assignments
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "levain" / "templates" / "web"
@@ -486,7 +486,7 @@ def test_a_503_at_accept_is_not_signed_and_the_same_sign_button_signs_again(tmp_
     """FINDINGS_h13b_r2 S1: every 503 the cockpit answers is before the write (phone.py: '503 a fault on this machine (nothing
     written)'), and the server keeps the review for a machine fault, so it is 'not signed', never 'not sure'."""
     stub = Stub([ENVELOPE])
-    stub.script["draft-accept"] = [_fail(503, message="the coordinator store cannot answer now (OSError: disk): nothing was signed")]
+    stub.script["draft-accept"] = [_fail(503, message="the desk store cannot answer now (OSError: disk): nothing was signed")]
     v = _run(tmp_path, stub, [*_review_then_sign(), _until("/^Not signed/.test(" + NOTE + ")"),
                               _tag("note", NOTE), _tag("unsure", UNSURE), _tag("sign", "!!document.getElementById('head-sign')"),
                               _click("head-sign"), _until("/^Signed/.test(" + NOTE + ")"), _tag("note2", NOTE)])

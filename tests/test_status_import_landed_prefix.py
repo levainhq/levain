@@ -1,5 +1,5 @@
 """Diogenes eb8a4744: a status row whose landed word leads the line OUTSIDE the bold title parses, and enters ``done``."""
-from levain.coordinator import status_import
+from levain.desk import status_import
 
 _TEXT = (
     "## LANE MENU\n"

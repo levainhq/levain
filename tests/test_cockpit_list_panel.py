@@ -24,11 +24,12 @@ from levain.cockpit.providers import build_default_cockpit
 from levain.cockpit.results import Absent, Read
 from levain.cockpit.verbs import VerbRegistry, VerbView, dispatch
 from levain.consent.questions import QuestionStore
-from levain.coordinator import ready
-from levain.coordinator.store import CoordStore
+from levain.desk import ready
+from levain.desk.store import CoordStore
 from levain.dashboard import SubstrateSource
 from levain.writes import EditError
 from tests.test_dashboard import _make_levain_install
+from levain.desk.legacy import ROLE_DESK
 
 FIXTURE = Path(__file__).parent / "fixtures" / "list_panel.json"
 CRED = {"class": "token", "name": "browser", "device_class": None}
@@ -42,7 +43,7 @@ def _local(delta_hours: float = 0.0) -> str:
 
 
 class Rig:
-    """An install with spores, a coordinator store and a question store; the cockpit's clock is NOW."""
+    """An install with spores, a desk store and a question store; the cockpit's clock is NOW."""
 
     def __init__(self, tmp_path: Path, *, spores: bool = True, band: bool = True, board: bool = True) -> None:
         self.root = _make_levain_install(tmp_path)
@@ -250,7 +251,7 @@ def test_an_unreadable_board_is_named_and_the_rest_still_shows(rig: Rig, monkeyp
     monkeypatch.setattr(ready, "snapshot", boom)
     p = rig.panel()
     assert p["status"] == "partial"
-    assert any("agents' board could not be fully read" in s["reason"] and "coordinator" in s["reason"] for s in p["skipped"])
+    assert any("agents' board could not be fully read" in s["reason"] and ROLE_DESK in s["reason"] for s in p["skipped"])
     assert not [r for r in p["rows"] if r["facets"]["surface"] == "board"]
     assert [r for r in p["rows"] if r["facets"]["surface"] == "band"]
 

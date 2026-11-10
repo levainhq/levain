@@ -14,16 +14,16 @@ from types import MappingProxyType
 
 import pytest
 
-from levain.coordinator import chat
-from levain.coordinator import chat_approvals as ca
-from levain.coordinator.chat import ChatStore, record_check, record_event
-from levain.coordinator.chat_approvals import (CANCEL_CAUSES, CancelRegistry, ChatLaunchContext, agent_config_tagged,
+from levain.desk import chat
+from levain.desk import chat_approvals as ca
+from levain.desk.chat import ChatStore, record_check, record_event
+from levain.desk.chat_approvals import (CANCEL_CAUSES, CancelRegistry, ChatLaunchContext, agent_config_tagged,
                                                ambiguous_stops, append_event, approval, arrive, cancel_launch_requests,
                                                claude_raw_key, codex_command_call, codex_file_change_call,
                                                codex_raw_key, durable_key, latch_not_live, quarantine_raw_key,
                                                record_abstain, record_cancelled, record_quarantine)
-from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import CoordError, Part
+from levain.desk.envelopes import EnvelopeStore
+from levain.desk.store import CoordError, Part
 
 T0 = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
 NONCE = "0123456789abcdef0123456789abcdef"
@@ -658,14 +658,14 @@ def _not_live(cs, launch):
 
 
 def _scripted_with(request_id, tool="Bash", tool_input=None):
-    from levain.coordinator.driver import ScriptedSession
+    from levain.desk.driver import ScriptedSession
     s = ScriptedSession()
     s.inbound(request_id, "can_use_tool", tool_name=tool, tool_input=tool_input or {"command": "ls"})
     return s
 
 
 def _answer_for(attempt, key=None):
-    from levain.coordinator.driver import ApprovalAnswer
+    from levain.desk.driver import ApprovalAnswer
     return ApprovalAnswer(attempt.op_id, attempt.vendor_request_key, attempt.raw_vendor_key if key is None else key,
                           attempt.reply)
 

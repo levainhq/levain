@@ -72,7 +72,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     rd.add_argument("--store-dir", required=True, help="A directory holding memory.db (or .levain/memory.db): a COPY.")
     rd.add_argument("--agent-dir", default=None, help="The directory holding the agent store (autonomic.db) with the "
                                                       "occurrence table; omitted means no occurrence history.")
-    rd.add_argument("--coord-dir", default=None, help="The coordinator queue directory (dispatch.db, awake.json); "
+    rd.add_argument("--coord-dir", default=None, help="The desk queue directory (dispatch.db, awake.json); "
                                                       "omitted means no launches and no work threads.")
     rd.add_argument("--agent-id", default="dream")
     rd.add_argument("--day", default=None, help="The dream-day YYYY-MM-DD (default: the one holding --now; with "
@@ -121,7 +121,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     help="The cockpit root the authority log is replayed from (default: the home's, "
                          "<levain home>/cockpit).")
     en.add_argument("--coord-dir", type=Path, default=None,
-                    help="The coordinator queue directory (default: <levain home>/coordinator).")
+                    help="The desk queue directory (default: <levain home>/desk).")
     en.add_argument("--shadow-flow-root", type=Path, default=None,
                     help="SHADOW install (the D1-3 recipe): flow's state/dream directory this install reads its input "
                          "from. --store-dir is then the SCRATCH directory re-seeded each night (never ~/.anneal-memory); "
@@ -249,13 +249,13 @@ def _install_kwargs(args: argparse.Namespace, zone: str, da: object) -> dict:
     seed, never here; write_install refuses a write destination inside ~/.anneal-memory or flow's root, a non-empty
     scratch directory with no shadow marker and a flow root without its ledger, then copies flow's instructions
     read-only beside the facts."""
-    from levain.coordinator.launch import default_coordinator_dir
+    from levain.desk.launch import default_desk_dir
 
     base = Path(args.store_dir).expanduser().resolve()
     home = os.environ.get("LEVAIN_HOME")
     levain_home = Path(home).expanduser() if home else Path.home() / ".levain"
     cockpit = Path(args.cockpit_root if args.cockpit_root is not None else levain_home / "cockpit").expanduser().resolve()
-    coord = Path(args.coord_dir if args.coord_dir is not None else default_coordinator_dir()).expanduser().resolve()
+    coord = Path(args.coord_dir if args.coord_dir is not None else default_desk_dir()).expanduser().resolve()
     if args.shadow_flow_root is not None:
         return dict(store_path=base / "memory.db", cockpit_root=cockpit, coord_dir=coord, zone=zone,
                     shadow_flow_root=Path(args.shadow_flow_root).expanduser().resolve(),

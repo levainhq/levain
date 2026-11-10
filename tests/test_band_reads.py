@@ -1,7 +1,7 @@
 """W2-A: the band server contract in band_view (the three reads, one identity). Each test is built from a failure
 reproduced first on the pre-W2 code (1030-34 w2a first spend): a version-less answer after the item moved elsewhere, two
 writers on one row, a ``band_payload`` that named the newest view of the credential instead of its own, a dedupe decided
-before the write lock, a coordinator SIGN that changed an item's identity."""
+before the write lock, a desk SIGN that changed an item's identity."""
 from __future__ import annotations
 
 import contextlib

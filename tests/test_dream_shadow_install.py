@@ -16,8 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from levain.coordinator import review
-from levain.coordinator.store import CoordStore
+from levain.desk import review
+from levain.desk.store import CoordStore
 from levain.dream import agent as da
 from levain.dream import card as cd
 from levain.dream import executor as ex

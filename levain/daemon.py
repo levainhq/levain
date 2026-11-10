@@ -408,12 +408,12 @@ def build_feeds_spec(
     max_seconds: int | None = DEFAULT_FEEDS_MAX_SECONDS,
     log_dir: Path | None = None,
 ) -> DaemonSpec:
-    """The periodic spec that runs ``levain coord review feeds`` and exits: no model, no keep-alive, not at login.
+    """The periodic spec that runs ``levain desk review feeds`` and exits: no model, no keep-alive, not at login.
 
     ``--max-seconds`` (whole seconds) is EMITTED into the argv when set, so a reader of the unit file sees the bound. ``queue_dir`` and
     ``levain_home`` are written down at install time because a login-launched unit carries neither the shell's
     ``$LEVAIN_HOME`` nor its cwd: without them the unit would read the default store while the operator's is elsewhere.
-    The run itself holds a lock (:func:`levain.coordinator.deliver.run_exclusive`), so a run that outlives the interval
+    The run itself holds a lock (:func:`levain.desk.deliver.run_exclusive`), so a run that outlives the interval
     or a manual one beside it is skipped, not doubled."""
     working_dir = working_dir.expanduser().resolve()
     invocation = _levain_invocation()

@@ -743,7 +743,7 @@ def test_17_a_vendor_capture_closes_every_fd_it_opened_once(tmp_path):
     assert not any(_fd_open(fd) for fd in fds)
 
 
-# --- coordinator additions from the S8a L3 ------------------------------------------------------------------------------
+# --- desk additions from the S8a L3 ------------------------------------------------------------------------------
 
 def test_18_a_brokered_executor_on_codex_is_refused_at_the_point_of_use():
     """D2: CONTROL cannot know a brokered executor's vendor at mint, so a brief on a brokered executor whose blob

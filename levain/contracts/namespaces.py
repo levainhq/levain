@@ -13,7 +13,7 @@ from __future__ import annotations
 
 # F9's device line signature (F12 verifies it in-process).
 TEAM_ENTRY_NAMESPACE = "levain-team-entry"
-# The operator's passkey clear of a "yours to clear" coordinator review item (c4-mut head ruling R2).
+# The operator's passkey clear of a "yours to clear" desk review item (c4-mut head ruling R2).
 REVIEW_CLEAR_NAMESPACE = "levain-review-clear"
 # The operator's phone passkey countersigning a band answer typed at a REMOTE terminal (board row 64, B2): evidence
 # beside an answer already recorded unsigned, never a gate on it.
@@ -53,13 +53,13 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
     "levain-dispatch-authorise": ("reserved", "levain/dispatch/adopt.py",
                                   "the operator's signed authorisation to land one verified dispatch run on one "
                                   "branch (F11 (A))"),
-    "levain-thread-envelope": ("reserved", "levain/coordinator/envelope.py",
-                               "the operator's signature over a coordinator thread envelope's digest (C0 §4.2)"),
+    "levain-thread-envelope": ("reserved", "levain/desk/envelope.py",
+                               "the operator's signature over a desk thread envelope's digest (C0 §4.2)"),
     "levain-allowed-signers": ("reserved", "levain/qbroker/signers.py",
                                "the dispatch trust root's signature over the answer-signer snapshot "
                                "(CONTRACT c6 §3.7)"),
-    REVIEW_CLEAR_NAMESPACE: ("shipped", "levain/coordinator/review.py",
-                             "the operator's passkey clear of a 'yours to clear' coordinator review item, over the "
+    REVIEW_CLEAR_NAMESPACE: ("shipped", "levain/desk/review.py",
+                             "the operator's passkey clear of a 'yours to clear' desk review item, over the "
                              "item's id, state and last event"),
     ANSWER_COUNTERSIGN_NAMESPACE: ("shipped", "levain/consent/answer_countersign.py",
                                    "the operator's phone passkey countersigning a band answer typed at a remote "
@@ -68,8 +68,8 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
                                "the operator's phone passkey approving one dispatch configuration item (by the "
                                "SHA-256 of its exact bytes) before the laptop trust-root key signs it; never a "
                                "configuration signature"),
-    "levain-envelope-revoke": ("shipped", "levain/coordinator/envelope_revoke.py",
-                               "the operator's phone passkey ending one coordinator envelope, over a message naming the "
+    "levain-envelope-revoke": ("shipped", "levain/desk/envelope_revoke.py",
+                               "the operator's phone passkey ending one desk envelope, over a message naming the "
                                "store, the envelope, the time and a nonce (levain-envelope-revoke/1); only narrows"),
     "levain-terminal-answer": ("shipped", "levain/consent/terminal_sign.py",
                                "the laptop Touch ID key's signature over a band answer typed at the terminal "

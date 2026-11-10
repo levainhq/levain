@@ -8,11 +8,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from levain.coordinator import chat
-from levain.coordinator.chat import ChatService, ChatStore, MessageThread, TurnRefused, record_check
-from levain.coordinator.driver import ScriptedSession
-from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import CoordError, Part
+from levain.desk import chat
+from levain.desk.chat import ChatService, ChatStore, MessageThread, TurnRefused, record_check
+from levain.desk.driver import ScriptedSession
+from levain.desk.envelopes import EnvelopeStore
+from levain.desk.store import CoordError, Part
 
 LIVE = {"probe": lambda _l, _e: chat.Verdict(True, "scripted probe: live"), "sleep": lambda _s: None}
 T0 = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
@@ -122,7 +122,7 @@ def test_claim_refused_while_the_turn_is_held(svc, world):
 
 def test_claim_refused_for_a_non_client_owner_and_an_unknown_launch(svc, world):
     with pytest.raises(TurnRefused):
-        svc.turn_claim(world["launch"], "coordinator:coord-1")
+        svc.turn_claim(world["launch"], "desk:coord-1")
     with pytest.raises(CoordError):
         svc.turn_claim("ln-" + "0" * 16, ME)
 

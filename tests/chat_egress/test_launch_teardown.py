@@ -17,7 +17,7 @@ import pytest
 
 from levain.chat_egress import decider as dm
 from levain.chat_egress import launch as lm
-from levain.coordinator.envelopes import EnvelopeStore
+from levain.desk.envelopes import EnvelopeStore
 
 from .test_launch import Origin, _node_children, _start, real_launch
 

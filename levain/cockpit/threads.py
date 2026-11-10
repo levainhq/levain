@@ -1,7 +1,7 @@
-"""The cockpit's thread view, read half (CH-U1a): the coordinator's threads and one thread's stream as JSON.
+"""The cockpit's thread view, read half (CH-U1a): the desk's threads and one thread's stream as JSON.
 
 Pure readers over ``<directory>/dispatch.db`` opened ``mode=ro``: this module never creates the file, a table or a
-trigger, and writes nothing. A thread's stream is :func:`levain.coordinator.chat.timeline`: the "before the chat
+trigger, and writes nothing. A thread's stream is :func:`levain.desk.chat.timeline`: the "before the chat
 record" block, then the merged stream in ``gseq`` order, the only order a thread view promises (no ordering by
 ``at`` across it). A tool call stays open until its own completion event. A driver without ``catch_up`` shows as a
 ``gap``. An approval event is an inert line: the record holds no correlation from a vendor control-request id to a
@@ -11,7 +11,7 @@ exists on the record. A store missing a table degrades only the part that table 
 ``serve_threads`` is the handler a server mount calls; it holds no HTTP of its own.
 
 The write half is one route: :func:`post_stop`, the operator's interrupt of a work thread's running turn, over a
-:class:`~levain.coordinator.chat.ChatService` the mount was given. It reads no owner, author or epoch from a request body
+:class:`~levain.desk.chat.ChatService` the mount was given. It reads no owner, author or epoch from a request body
 and acts on no launch the body names: the launch is the thread's latest worker launch, and the body's
 ``expected_launch_id`` (the launch the page drew) only fences it. A work thread carries no operator composer in 1.0:
 the operator talks in the room (:mod:`levain.cockpit.room`), and a work thread's steering is a drop."""
@@ -27,10 +27,10 @@ from pathlib import Path
 from typing import Any
 
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
-from levain.coordinator import chat
-from levain.coordinator import envelope as env
-from levain.coordinator.chat_approvals import APPROVAL_EVENT_KINDS
-from levain.coordinator.store import CoordError
+from levain.desk import chat
+from levain.desk import envelope as env
+from levain.desk.chat_approvals import APPROVAL_EVENT_KINDS
+from levain.desk.store import CoordError
 
 THREADS_LIST_PATH = "/cockpit/threads.json"
 THREAD_PREFIX = "/cockpit/thread/"
@@ -85,7 +85,7 @@ def _worker_launch(conn: sqlite3.Connection, thread_id: str) -> str | None:
 # ``stop_earlier`` narrowing, and a kill or a done thread (``envelope_attenuations``). The page draws ``line`` and
 # computes nothing. No bound envelope reads "no standing authority"; a record this reader cannot read says so and never
 # reads as "none". ``IN_FORCE`` is the one fact that is not a record: no envelope row grants anything until the
-# coordinator's S1 cutover (``EnvelopeStore.authority_refusal`` answers NOT_IN_FORCE for every effect), and a test pins
+# desk's S1 cutover (``EnvelopeStore.authority_refusal`` answers NOT_IN_FORCE for every effect), and a test pins
 # that so the day S1 lands this line is revisited.
 IN_FORCE = False
 _NOT_IN_FORCE_WORDS = "Not in force yet: every land, push and publish still asks you separately."

@@ -92,7 +92,7 @@ class Launch:
     def __init__(self, tmp: Path, origin_port: int, *, limits: dm.Limits, lookup: Lookup, mode: str = "gated",
                  resolver_timeout: float = 1.0, names: str = "pub.rb.test=127.0.0.1;slow.rb.test=127.0.0.1") -> None:
         from levain.chat_egress import records as rec
-        from levain.coordinator.store import CoordStore
+        from levain.desk.store import CoordStore
         self.dir = tmp
         self.store = CoordStore(tmp / "dispatch")
         self.records = rec.EgressRecords(self.store)

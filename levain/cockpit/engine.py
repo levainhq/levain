@@ -3376,8 +3376,8 @@ def _v_topology(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
     return v
 
 
-# The board kind (C12): the ready queue as six derived columns (levain.coordinator.ready.CATEGORIES, in column order; a test
-# pins the two equal, so this module need not import the coordinator). BOARD_CARDS_MAX bounds the whole value: a board is drawn
+# The board kind (C12): the ready queue as six derived columns (levain.desk.ready.CATEGORIES, in column order; a test
+# pins the two equal, so this module need not import the desk). BOARD_CARDS_MAX bounds the whole value: a board is drawn
 # whole on every poll, so a provider that sends more than this much is sending a bug, and the refusal names the count.
 BOARD_CATEGORIES = ("backlog", "ready", "running", "waiting", "needs-you", "done")
 BOARD_QUEUES = ("ok", "none", "unreadable")

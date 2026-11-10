@@ -14,11 +14,12 @@ import pytest
 
 from levain.cockpit import board
 from levain.consent.questions import QuestionStore
-from levain.coordinator import ready
-from levain.coordinator.store import CoordStore
+from levain.desk import ready
+from levain.desk.store import CoordStore
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_questions import OPTIONS, _file
 from tests.test_cockpit_questions import lh  # noqa: F401  (fixture)
+from levain.desk.legacy import ROLE_DESK
 
 ORDER = ["backlog", "ready", "running", "waiting", "needs-you", "done"]
 
@@ -86,7 +87,7 @@ def test_needs_you_is_the_bands_items_and_nothing_else(filled):
 def test_an_unreadable_store_is_reported_not_empty(qdir):
     (qdir / "dispatch.db").write_bytes(b"not a database at all, sixteen+ bytes")
     out = board.build(qdir, QuestionStore(qdir))
-    assert "coordinator" in out["unreadable"] and out["queue"] == "unreadable" and out["note"] != board.NO_QUEUE
+    assert ROLE_DESK in out["unreadable"] and out["queue"] == "unreadable" and out["note"] != board.NO_QUEUE
 
 
 def test_no_question_store_is_silent_not_unreadable(filled, tmp_path):
@@ -142,16 +143,16 @@ def test_the_cards_and_their_journal_lines_come_from_one_read_transaction(filled
 
 def test_a_live_launch_is_a_running_seat_card_with_no_journal_line_and_an_ended_one_is_not(filled):
     """SCHEMA section 5: one `running` projection per live seat (`seat:<token>`), read-only, never writable. A worker is
-    running while active; a coordinator with no live lease of its own is `waiting`, never `running`; no repo is guessed."""
+    running while active; a desk with no live lease of its own is `waiting`, never `running`; no repo is guessed."""
     st = CoordStore(filled)
     tok = st.coord_take()
-    from levain.coordinator.store import Part
+    from levain.desk.store import Part
 
     drop = st.accept_drop("fix the build", surface="cli")[0]
     thread = st.split(drop.drop_id, [Part("work", "fix the build")])[0]
     live = st.launch_request(tok, harness="claude", role="worker", threads=[thread.thread_id], cwd=str(filled / "levain-wt"))
     assert st.launch_activate(live.launch_id, harness_session_id="sess-live")[0]
-    stale = st.launch_request(tok, harness="claude", role="coordinator", cwd=str(filled))
+    stale = st.launch_request(tok, harness="claude", role=ROLE_DESK, cwd=str(filled))
     assert st.launch_activate(stale.launch_id, harness_session_id="sess-stale")[0]
     out = board.build(filled, QuestionStore(filled))
     col, card = _cards(out)[f"seat:{live.launch_id}"]
@@ -183,7 +184,7 @@ def test_an_unreadable_journal_is_named_and_the_cards_stay(filled, monkeypatch):
 
     monkeypatch.setattr(ready, "_lifecycle_present", flaky)
     out = board.build(filled, QuestionStore(filled))
-    assert out["queue"] == "ok" and "journal" in out["unreadable"] and "coordinator" not in out["unreadable"]
+    assert out["queue"] == "ok" and "journal" in out["unreadable"] and ROLE_DESK not in out["unreadable"]
     col, card = _cards(out)["levain:a"]
     assert col == "running" and card["journal"] is None
 
@@ -194,7 +195,7 @@ def test_a_damaged_journal_that_breaks_the_divergence_read_still_keeps_the_cards
 
     monkeypatch.setattr(ready, "_diverged", broken)
     out = board.build(filled, QuestionStore(filled))
-    assert out["queue"] == "ok" and "journal" in out["unreadable"] and "coordinator" not in out["unreadable"]
+    assert out["queue"] == "ok" and "journal" in out["unreadable"] and ROLE_DESK not in out["unreadable"]
     col, card = _cards(out)["levain:a"]
     assert col == "running" and card["journal"] is None
 
@@ -396,7 +397,7 @@ def test_the_panels_read_of_the_board_carries_no_clock_stamp_so_its_etag_moves_o
     assert sum(len(c["cards"]) for c in a["columns"]) == 3                    # and it still holds the work
 
 
-# --- the drop route and the board: one coordinator -----------------------------------------------------
+# --- the drop route and the board: one desk -----------------------------------------------------
 
 def test_drop_here_is_true_only_when_the_drop_route_files_to_the_directory_the_board_reads(filled, tmp_path):
     from levain.web_server import _board_value
@@ -460,7 +461,7 @@ def test_no_drop_button_is_drawn_when_the_board_says_the_drop_files_elsewhere():
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
 def test_a_1000_character_title_cannot_push_a_cards_drop_past_the_drop_routes_cap():
-    from levain.coordinator.store import WORDS_MAX, check_words
+    from levain.desk.store import WORDS_MAX, check_words
     words = _harness_run()["longTitleWords"]
     assert len(words) >= 1000 and len(words) <= 2 * board.TEXT_MAX + 100
     assert check_words(words) == words and len(words) < WORDS_MAX

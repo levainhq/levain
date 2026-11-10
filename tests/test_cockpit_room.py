@@ -12,18 +12,19 @@ import urllib.request
 import pytest
 
 from levain.cockpit import room as cockpit_room
-from levain.coordinator import chat, room
-from levain.coordinator.chat import ChatService, ChatStore
-from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import CoordError
+from levain.desk import chat, room
+from levain.desk.chat import ChatService, ChatStore
+from levain.desk.envelopes import EnvelopeStore
+from levain.desk.store import CoordError
 from tests.test_chat_room_send import LIVE, Clock, Counting, _attach, _open_room_thread, _room_launch, _thread
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
+from levain.desk.legacy import ROLE_DESK
 
 def scripted(*sends):
     """A room session reporting the room's own mode (dontAsk) whose sends follow ``sends`` (a session of any other mode
-    latches the room, as the coordinator's room tests pin)."""
+    latches the room, as the desk's room tests pin)."""
     s = Counting()
     s._sends = list(sends)
     return s
@@ -216,7 +217,7 @@ def test_a_room_line_names_no_mode_turn_epoch_or_launch(tmp_path, w, extra):
 
 def test_a_body_that_names_an_author_is_not_read_for_one(tmp_path, w):
     with _serve_room(tmp_path, w) as (base, _h):
-        status, _b = _call(base, "/cockpit/room/send", w.body("hi", author_kind="coordinator", author_surface="phone",
+        status, _b = _call(base, "/cockpit/room/send", w.body("hi", author_kind=ROLE_DESK, author_surface="phone",
                                                                 client_id="someone-else"))
     assert status == 200
     assert w.lines() == [("operator", "cockpit", "browser", "hi", "queue", None)]

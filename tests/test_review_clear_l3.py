@@ -12,9 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from levain.cockpit.coordinator_panels import review_version
-from levain.coordinator import review
-from levain.coordinator.store import CoordStore
+from levain.cockpit.desk_panels import review_version
+from levain.desk import review
+from levain.desk.store import CoordStore
 from tests.test_dispatch_phone import repo, world  # noqa: F401  (fixtures)
 from tests._phone_fixtures import _enrol
 from tests.test_review_clear_signed import _mine

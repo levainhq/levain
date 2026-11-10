@@ -4,7 +4,7 @@ A terminal seat works in ONE lane clone plus its RETURN directory. The sandbox b
 tools are confined to those two roots by ``--restricted`` and kept off every protected name by ``permissions.deny``; the seat loads no settings, hooks or MCP
 from its roots (the source list, :data:`levain.host_guard.SEAT_SOURCE_ARGS`), so a write that slips the deny lands
 in a file nothing reads. The D9 ruling about the file tools lives with ``CC_SEAT_TOOLS`` in ``levain.host_guard``
-and is not restated here. ``levain.coordinator.launch`` keeps its own ``project,local`` layers for the coordinator;
+and is not restated here. ``levain.desk.launch`` keeps its own ``project,local`` layers for the desk;
 this profile drops them on purpose, a different fact with its own home.
 
 Nothing here launches a seat or writes outside the roots it is handed. ``build_seat_profile`` is the ONE builder:

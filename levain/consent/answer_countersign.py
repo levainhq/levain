@@ -279,7 +279,7 @@ def _verdict(store: Any, question_id: str, sign_queue: Path | str | None, keys: 
     from levain.consent.cockpit_origin import read_origin
     from levain.consent.queue import class_covers
     from levain.consent.sign import SignRefused, passkey_key_source, read_request, sign_dir, state_of
-    from levain.coordinator.review import SIGN_TIER
+    from levain.desk.review import SIGN_TIER
 
     if sign_queue is None:
         return Verdict("no-card", "no sign queue is named")

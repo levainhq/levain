@@ -9,7 +9,7 @@ laptop input never ends it (Phill 11-02). This module
 keeps what the record shares with its callers:
 
 - the vocabulary the record is written with: the preset words (:data:`WORDS`), who may set which (:data:`SEAT_WORDS`,
-  :data:`COORDINATOR_WORDS`, :func:`check_setter`), durations (:func:`parse_duration`), the kind -> class map
+  :data:`DESK_WORDS`, :func:`check_setter`), durations (:func:`parse_duration`), the kind -> class map
   (:data:`KIND_CLASSES`), and the lock (:func:`_locked`), the log (:func:`log_line`, :func:`read_log`) and the setter checks
   every write goes through;
 - the remote-activity record (:func:`note_remote_activity`): input over ssh or mosh, or a turn in the Claude app's remote
@@ -21,8 +21,8 @@ keeps what the record shares with its callers:
 - the pre-1b readers the migration uses (:func:`read_legacy_word`, :func:`read_policy`), and the retired policy
   (:func:`policy_view`, :func:`set_policy`: the policy cells are replaced by the presets' ``lets_through``).
 
-A word may carry who set it. A seat the operator told ("heading out") may set only :data:`SEAT_WORDS`, and the coordinator only
-:data:`COORDINATOR_WORDS`; every other word, and a standing ``loud`` (no setter replaces it), stays his. A setter's write is
+A word may carry who set it. A seat the operator told ("heading out") may set only :data:`SEAT_WORDS`, and the desk only
+:data:`DESK_WORDS`; every other word, and a standing ``loud`` (no setter replaces it), stays his. A setter's write is
 refused unless it names an agent and quotes his words, and the record keeps the setter and the quote beside the overlay. The
 setter's role comes from the caller's session identity, which is a label under one uid and not a boundary.
 
@@ -46,10 +46,11 @@ from contextlib import contextmanager
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from levain.desk.legacy import ROLE_DESK
 
 __all__ = ["ACTIVE_WINDOW_SECS", "DEFAULT_SECS", "MAX_SECS", "URGENT_KINDS", "WORDS", "Decision", "KIND_CLASSES", "DEFAULT_CELLS", "kind_class",
            "read_policy", "set_policy", "reset_policy", "policy_sentences", "policy_view", "policy_is_default",
-           "REMOTE_SOURCES", "REMOTE_FAULT", "note_remote_activity", "read_remote_activity", "PresenceError", "PresenceBusy", "SEAT_WORDS", "COORDINATOR_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "read_legacy_word", "set_word", "should_push", "effective"]
+           "REMOTE_SOURCES", "REMOTE_FAULT", "note_remote_activity", "read_remote_activity", "PresenceError", "PresenceBusy", "SEAT_WORDS", "DESK_WORDS", "decide", "describe", "parse_duration", "is_expired", "log_line", "read_log", "read_word", "read_legacy_word", "set_word", "should_push", "effective"]
 
 
 ACTIVE_WINDOW_SECS = 5 * 60
@@ -60,8 +61,8 @@ WORDS = ("away", "back", "sleep", "quiet", "loud")
 TIMED = ("quiet", "loud")
 SEAT_WORDS = ("away",)
 DROPPED_WORDS = {"remote": "the `remote` word was dropped: set devices to `on` (or leave them on `follow`) to push pings to your phone"}
-COORDINATOR_WORDS = SEAT_WORDS + ("quiet", "sleep")
-ROLES = ("seat", "coordinator")
+DESK_WORDS = SEAT_WORDS + ("quiet", "sleep")
+ROLES = ("seat", ROLE_DESK)
 _SAID_MAX = 300
 _FIELD_MAX = 200
 _WHY_MAX = 300
@@ -71,7 +72,7 @@ LOG_MAX_BYTES = 1 << 20   # past this the log is rotated to ``LOG_NAME + ".1"``
 # THE one kind -> class map (never configurable). ``approval``: a ping about a request that holds an agent until the
 # operator answers: the hook's wait (``consent``, the default kind: the permission hook, the publish gate, the limits),
 # the push gate's wait (``push``) and the asking-again of a request still pending (``reping``). ``attention``: the rows
-# the coordinator raises to him (``attention``, C11 Q1 (c)) and a dated item (``dated``). ``other``: every other kind,
+# the desk raises to him (``attention``, C11 Q1 (c)) and a dated item (``dated``). ``other``: every other kind,
 # unknown ones included (``question``, ``ruling``, ``summary``, the self-test ping the senders file as ``test``, and the
 # kind ``describe`` probes the rule with, ``ping``). A posted notice (:mod:`levain.webpush.notify`) files as ``notify``
 # (``other``) or, from a token the operator marked urgent, ``notify_urgent``, which SHARES the ``attention`` cell: the
@@ -507,17 +508,17 @@ def effective(queue_dir: Path | str | None, now: float | None = None, *, idle: C
 
 def check_setter(word: str, by: dict | None, said: str | None) -> str:
     """The quote to record for a setter's write, or a raised :class:`PresenceError` saying why it is refused. ``by``
-    is ``{"agent", "session", "role"}`` with role ``seat`` or ``coordinator``. Pure: a refusal writes nothing."""
+    is ``{"agent", "session", "role"}`` with role ``seat`` or ``desk``. Pure: a refusal writes nothing."""
     if not isinstance(by, dict):
         raise PresenceError("the setter names no agent")
     role = by.get("role")
     if role not in ROLES:
-        raise PresenceError("the setter's role is neither seat nor coordinator")
+        raise PresenceError("the setter's role is neither seat nor desk")
     if not _clean(by.get("agent"), _FIELD_MAX):   # what `_provenance` requires on read, so a word written here is shown as set
         raise PresenceError("the setter names no agent")
-    allowed = COORDINATOR_WORDS if role == "coordinator" else SEAT_WORDS
+    allowed = DESK_WORDS if role == ROLE_DESK else SEAT_WORDS
     if word not in allowed:
-        who = "the coordinator" if role == "coordinator" else "a seat"
+        who = "the desk" if role == ROLE_DESK else "a seat"
         raise PresenceError(f"`{word}` is the operator's own word: {who} may set only {', '.join(f'`{w}`' for w in allowed)}"
                             " (the operator says it himself; from a terminal outside any agent session the operator sets any word)")
     raw = said if isinstance(said, str) else ""
@@ -568,7 +569,7 @@ def set_word(queue_dir: Path | str, word: str, *, duration: str | None = None, n
 
     if word in _ROUTE_ALIASES:
         if by is not None:
-            raise PresenceError(f"`{word}` is the operator's own word: a seat or the coordinator may not set it")
+            raise PresenceError(f"`{word}` is the operator's own word: a seat or the desk may not set it")
         if tap:
             if isinstance(duration, str) and duration.strip().lower() == "switch":
                 raise PresenceError(f"a tap's `{word}` sets a bounded while only, never your standing default")

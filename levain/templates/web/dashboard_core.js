@@ -105,7 +105,7 @@
   let answerBand = null;
   // Dismiss an agent's note (the manifest source only): `dismissNote(rowId) → Promise<{ok}|{ok:false,...}>`. It tells the agent nothing.
   let dismissNote = null;
-  // Clear or reopen a coordinator review item (the manifest source only): `reviewItem(rowId, verb) → Promise<{ok}|{ok:false,...}>`.
+  // Clear or reopen a desk review item (the manifest source only): `reviewItem(rowId, verb) → Promise<{ok}|{ok:false,...}>`.
   let reviewItem = null;
   let pollJob = null;
   // The episode-search READ transport (GET /recall.json), injected by the boot layer so the core
@@ -4532,7 +4532,7 @@
     if (rv.mine && rv.state === "open") {
       // drawn on the row itself, never in the hover-revealed verb group: it is words to read, not a control
       row.appendChild(el("div", "ext-meta review-mine", (rv.verb === "review_clear_signed" && reviewItem ? "or " : "not cleared here: ")
-        + "on the laptop, levain coord review clear " + rv.item));
+        + "on the laptop, levain desk review clear " + rv.item));
       if (rv.verb === "review_clear_signed" && reviewItem) appendReviewSigned(row, rv);
       return;
     }
@@ -8091,7 +8091,7 @@
     }).catch(() => { if (n === grantFillSeq) slot.dataset.filled = "1"; });
   }
   // Board row 153: the envelopes beside the grants, each live one ended with a passkey, the grant revoke's own ceremony
-  // (levain.coordinator.envelope_revoke.EnvelopeRevoke). /cockpit/envelope/list.json lists the envelopes and the passkeys
+  // (levain.desk.envelope_revoke.EnvelopeRevoke). /cockpit/envelope/list.json lists the envelopes and the passkeys
   // that may revoke (a 404 is a cockpit with no signing: no card), then /cockpit/envelope/<id>/revoke-challenge ->
   // navigator.credentials.get -> /revoke. The server builds and holds the message; the page recomputes the challenge from
   // the text it is sent, so what the prompt signs is the text shown. Without a usable passkey the button copies the
@@ -8313,7 +8313,7 @@
     if (typeof id !== "string" || !/^dj-[0-9a-f]{32}$/.test(id)) return null;
     return openSheet("/sign/dispatch/" + encodeURIComponent(id), version, choice, "dispatch job", undefined, { kind: "dispatch", id: id });
   }
-  // OS-2: the sheet over a coordinator drop (/sign/drop): words, and optionally an envelope the passkey signs there
+  // OS-2: the sheet over a desk drop (/sign/drop): words, and optionally an envelope the passkey signs there
   function openDropSheet(words) {
     // the typed words reach the sheet through this tab's session storage (same origin, no length limit, never in the address);
     // the sheet reads them once and removes them
@@ -8349,7 +8349,7 @@
     if (typeof ui.earlierLine === "function") ui.earlierLine();
   }
   function dropPrefillClear() { try { window.sessionStorage.removeItem(DROP_PREFILL_KEY); } catch (e) { /* nothing kept */ } }
-  // ---- the coordinator drop: a card on the home page (Phill 10-30), drawn under the Needs-you row, outside #ck-hero. An inline
+  // ---- the desk drop: a card on the home page (Phill 10-30), drawn under the Needs-you row, outside #ck-hero. An inline
   // composer, not a button that opens a sheet. Send posts through /cockpit/coord/drop, the route the /sign/drop sheet posts to,
   // with the same request (words, outbox_id, sent_at, store_id) and the same kept-before-posted rule; an envelope needs the
   // passkey, which signs on the sheet only, so "Add an envelope" opens the sheet with the words.
@@ -8407,7 +8407,7 @@
   // plain text in at the caret (or at `at`, a Range): never markup
   function dropInsertPlain(box, text, at) {
     const t = String(text || "").replace(/\r\n?/g, "\n");
-    if (!t || dropBoxIsOff(box)) return;      // a box that is off (a send in flight, no coordinator) takes nothing
+    if (!t || dropBoxIsOff(box)) return;      // a box that is off (a send in flight, no desk) takes nothing
     const sel = window.getSelection && window.getSelection();
     if (at && sel) { sel.removeAllRanges(); sel.addRange(at); }
     // the selection must sit wholly inside the box (both ends and their common ancestor), else the text goes at the box's end:
@@ -8504,7 +8504,7 @@
     crypto.getRandomValues(b);
     return "ph-" + Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
   };
-  // The panel id a provider registers to supply the coordinator's side of the conversation (its replies and receipts). The drop
+  // The panel id a provider registers to supply the desk's side of the conversation (its replies and receipts). The drop
   // card hosts that panel's rows in its own thread, so the page draws it nowhere else (and its compose box never mounts).
   const DROP_THREAD_PANEL = "desk-thread";
   const DROP_RECENT_SHOWN = 8;
@@ -8521,7 +8521,7 @@
     const failed = (g) => { if (dropRead === g) dropTtl = DROP_FAIL_TTL_MS; };
     const got = consentQueued(() => fetchBounded("/cockpit/coord/drops.json", { cache: "no-store", headers: headers },
       (res) => {
-        if (res.status === 404) return { why: "This cockpit has no coordinator store to send to (no signing is set up here)." };
+        if (res.status === 404) return { why: "This cockpit has no desk store to send to (no signing is set up here)." };
         if (res.status === 401 || res.status === 403) return { why: "Sign in to send: this cockpit refused this browser's token.", auth: true };
         if (!res.ok) return { why: "The desk could not be read (HTTP " + res.status + ")." };
         return res.json().then((b) => (b && Array.isArray(b.coord_drops) ? { body: b } : { why: "The desk's answer was not a drop list." }),
@@ -8782,7 +8782,7 @@
     return ui;
   }
   // one draw of the drop card from one read; the box and its words are never rebuilt under the reader
-  // The box is off while a send is in flight, and when the coordinator cannot be written to AND nobody is typing: a read that is
+  // The box is off while a send is in flight, and when the desk cannot be written to AND nobody is typing: a read that is
   // not clean (404, 401/403, 5xx, a network blip, a poll) must not take the keyboard from a box he is in or drop a draft he holds.
   // Send and the envelope button still follow `can`, so a blip never lets a send through.
   function dropWordsOff(words, working, can) {
@@ -8852,7 +8852,7 @@
       if (again) again.focus(); else if (!ui.more.hidden) ui.more.focus(); else if (!ui.filter.hidden) ui.filter.focus();
     }
   }
-  // A coordinator row not seen before (after the first draw that had the desk's panel) is announced once. Never a refresh with nothing
+  // A desk row not seen before (after the first draw that had the desk's panel) is announced once. Never a refresh with nothing
   // new, never his own rows.
   function announceDesk(ui, t) {
     if (!t.seen) return;
@@ -8919,7 +8919,7 @@
     }
     if (document.getElementById("levain-modal")) closeModal();      // a focus view stands over the box
     const box = ui.words;
-    ui.say.textContent = ui.note || ""; ui.say.classList.remove("bad");      // an earlier refusal's line is stale now; the coordinator's own note stays
+    ui.say.textContent = ui.note || ""; ui.say.classList.remove("bad");      // an earlier refusal's line is stale now; the desk's own note stays
     const have = dropBoxText(box);
     setDropBoxText(box, have.trim() ? have.replace(/\s+$/, "") + "\n\n" + words : words);
     dropPrefillClear();      // a handoff to the sheet left earlier is stale now that these words are in the box

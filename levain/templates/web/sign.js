@@ -40,7 +40,7 @@
 // it with a 409 when the job changed since, and the sheet then reads the job again and draws it afresh. Only the acts
 // DISPATCH_STEPS names are offered; any other key the row lists is not drawn and signs nothing.
 //
-// A coordinator drop (OS-2) is the same sheet at /sign/drop: its read is GET /cockpit/coord/drops.json (the coord_*
+// A desk drop (OS-2) is the same sheet at /sign/drop: its read is GET /cockpit/coord/drops.json (the coord_*
 // listing keys), and it composes the drop's words and, optionally, an envelope. A plain drop is POST /cockpit/coord/drop. An
 // envelope is POST /cockpit/coord/envelope-review (the server keeps the body it shows), then POST .../envelope-challenge (the
 // payload, signed_at now, and the WebAuthn challenge), navigator.credentials.get, and POST .../drop carrying the envelope
@@ -1322,7 +1322,7 @@
       const hmoved = () => { refuseOther(); hsay(MOVED, true); };
       // a refusal because the store answering is not the one this sheet was opened for: the sheet stops, it is never a stale card
       const hother = (r) => !!r && r.status === 409 && !!r.body && r.body.error === "other_store";
-      const hstop = () => moved || (!storeId ? "this Levain has no coordinator store to read a head card from yet" : "");
+      const hstop = () => moved || (!storeId ? "this Levain has no desk store to read a head card from yet" : "");
       const hbtn = (label, id, fn, primary) => {
         const b = el("button", primary ? "dev-btn dev-primary" : "dev-btn", label);
         b.type = "button";

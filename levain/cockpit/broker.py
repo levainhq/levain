@@ -63,7 +63,7 @@ from levain.cockpit.anneal_effects import (
     tombstone_effects,
 )
 from levain.cockpit.consent import ConsentError, build_record, encode, parse_stamp, utc_stamp, value_sha256
-from levain.cockpit.coord_effects import COORD_CANONICAL, COORD_DROP_VERB, COORDINATOR, drop_resource_key
+from levain.cockpit.desk_effects import COORD_CANONICAL, COORD_DROP_VERB, DESK, drop_resource_key
 from levain.cockpit.effects import (
     INTAKE_VERB,
     SPORE_AUTHORITY_FIELDS,
@@ -230,7 +230,7 @@ class _Unbuildable(Exception):
 
 # each store name the broker registers, and the verbs its canonical_effect builds (K2b §13)
 _STORE_CANONICAL: dict[str, Mapping[str, Any]] = {SPORES: SPORE_CANONICAL, EPISODES: EPISODE_CANONICAL,
-                                                   SECTIONS: SECTION_CANONICAL, COORDINATOR: COORD_CANONICAL}
+                                                   SECTIONS: SECTION_CANONICAL, DESK: COORD_CANONICAL}
 
 
 # --- the broker -------------------------------------------------------------------------------------
@@ -856,8 +856,8 @@ class Broker:
         is another minute). The reading is in the signed bytes twice: the target's ``intake`` and the effect's
         ``changes`` (``next``, ``target: desk``). A drop whose minute passed before the decision no longer builds (the
         op ends STALE): it is typed again, never fired late. A ``sort`` line plants no spore: from a device it is one
-        ``coordinator_drop`` create on the coordinator store (``coord_effects``), the words verbatim, written at the
-        decision; it has no minute, so no staleness check. With no coordinator store registered, or none named, it is
+        ``coordinator_drop`` create on the desk store (``desk_effects``), the words verbatim, written at the
+        decision; it has no minute, so no staleness check. With no desk store registered, or none named, it is
         a 501 at issue."""
         from levain import intake
         from levain.cockpit.effects import intake_seed_params
@@ -871,12 +871,12 @@ class Broker:
             except intake.IntakeRefused as exc:
                 raise BrokerError("intake_refused", 422, str(exc)) from None
             if parsed["kind"] == "sort":
-                cs = self.stores.get(COORDINATOR)
+                cs = self.stores.get(DESK)
                 # ``directory`` is not part of the EffectStore protocol: a store without it, or one that names none,
                 # is the same typed 501
                 directory = getattr(cs, "directory", None)
                 if cs is None or not callable(directory) or directory() is None:
-                    raise BrokerError("not_built", 501, "this cockpit names no coordinator store, so there is no "
+                    raise BrokerError("not_built", 501, "this cockpit names no desk store, so there is no "
                                                         "desk to sort it")
                 reading = {"kind": "sort", "text": parsed["text"]}
             else:
@@ -888,9 +888,9 @@ class Broker:
                 raise ValueError("the record's target carries no intake reading")
             reading = dict(reading)
         if reading["kind"] == "sort":
-            cs = self.stores.get(COORDINATOR)
+            cs = self.stores.get(DESK)
             if cs is None:
-                raise BrokerError("not_built", 501, "no coordinator store is registered with the broker")
+                raise BrokerError("not_built", 501, "no desk store is registered with the broker")
             ok = create_origin_key(pid, 0)
             # a locked store faults TransientApplyFault: issue() turns it into the 503 source_unavailable, as for any
             # source read (and a decision leaves the signed pending unspent)
@@ -926,11 +926,11 @@ class Broker:
             return {}
         sid = None
         if reading.get("kind") == "sort":
-            # a sort plants no spore: its receipt is the coordinator drop's (the drop id once the op committed)
+            # a sort plants no spore: its receipt is the desk drop's (the drop id once the op committed)
             drop_id = None
             if state == "COMMITTED":
                 try:
-                    cs = self.stores.get(COORDINATOR)
+                    cs = self.stores.get(DESK)
                     row = None if cs is None else cs.snapshot(drop_resource_key(create_origin_key(pid, 0))).row
                     drop_id = None if row is None else row.get("drop_id")
                 except (BrokerError, TransientApplyFault):

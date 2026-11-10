@@ -2491,8 +2491,8 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
 
 def _check_host_awake() -> list[CheckResult]:
     """Why this host will or will not sleep (C7, P6s): whether the idle-sleep assertion is held, and for which source: a
-    working work thread (coordinator store) or a live agent occurrence (agents store), each live occurrence with its
-    state and age so a stuck one is visible. Advisory: no row until a coordinator store, a live occurrence or an
+    working work thread (desk store) or a live agent occurrence (agents store), each live occurrence with its
+    state and age so a stuck one is visible. Advisory: no row until a desk store, a live occurrence or an
     ``awake.json`` record exists (all read only, never created here; a record whose holder is alive is described by its
     last-sync state even when nothing is live now), a warn row when one exists and cannot be read; never a failure,
     because sleeping with nothing working is the machine's own setting."""
@@ -2501,12 +2501,12 @@ def _check_host_awake() -> list[CheckResult]:
     name = "host sleep"
     qdir = _consent_queue_dir()
     try:
-        from levain.coordinator import awake
-        from levain.coordinator.door import readonly_store
+        from levain.desk import awake
+        from levain.desk.door import readonly_store
 
         store = readonly_store(qdir)          # a doctor reads: it never creates the store or its tables
         agent_unreadable = False
-        try:                                  # a separate read: an unreadable agents store must not hide the coordinator side
+        try:                                  # a separate read: an unreadable agents store must not hide the desk side
             occ = awake.live_occurrence_details()   # the agents' live occurrences hold the host too (P6s), read-only
         except Exception:      # noqa: BLE001
             occ, agent_unreadable = None, True
@@ -6027,7 +6027,7 @@ def _entries_for(entries: Any, install: Path, script: str) -> list:
 
 def _check_claude_code(install: Path, user_band: bool = True) -> list[CheckResult]:
     """Doctor's Claude Code rows for ``install``. ``user_band`` False leaves out the user-level band row (a
-    coordinator launch: the coordinator runs at an install whose own band it checks, so that row decides nothing
+    desk launch: the desk runs at an install whose own band it checks, so that row decides nothing
     there and its probe would only cost the launch time)."""
     results: list[CheckResult] = []
     results.append(CheckResult("CLAUDE.md", True, "present"))
@@ -6308,7 +6308,7 @@ def install_band_wiring(install: Path | str, project_dir: Path | str | None = No
     and ``stop.py``, and those scripts match the package (:func:`_hook_freshness`, the one freshness check). A Codex
     install's hooks do nothing for a session outside it unless its scope is global; ``codex_hooks_file`` names the
     ``hooks.json`` the install was found through when that is not ``$CODEX_HOME``'s. ``wired`` | ``stale`` (part of
-    it: ``levain update`` fixes it) | ``absent`` (none of it applies there). Doctor's band row, the coordinator
+    it: ``levain update`` fixes it) | ``absent`` (none of it applies there). Doctor's band row, the desk
     launch, the user-level band's stand-down and the gate's notice all ask this; none derives it again."""
     install = Path(install)
     project = Path(project_dir) if project_dir is not None else install
@@ -6397,7 +6397,7 @@ _PROBE_CACHE: contextvars.ContextVar[dict[tuple[Any, ...], str | None] | None] =
 
 @contextlib.contextmanager
 def band_probe_once():
-    """Within this block each distinct import probe runs once (a coordinator launch checks the band more than once).
+    """Within this block each distinct import probe runs once (a desk launch checks the band more than once).
     Nested inside another in the same context, it keeps the outer one's results; another thread has its own."""
     if _PROBE_CACHE.get() is not None:
         yield
@@ -6451,7 +6451,7 @@ def _check_band_hooks(install: Path, agent: str, codex_home: Path | None = None)
     """The band's hooks (Q17-ALL D5), per install: :func:`install_band_wiring` for a session started at the install,
     and the interpreter the UserPromptSubmit hook runs can import the band, started as that hook starts it. A FAIL
     otherwise: the hooks swallow a failed import, so a seat here would be shown no band and nothing would say so
-    (the coordinator launch refuses on this same row)."""
+    (the desk launch refuses on this same row)."""
     w = install_band_wiring(install, None, agent, codex_home)
     if w.state != "wired":
         return CheckResult(BAND_HOOKS_ROW, False,

@@ -1,4 +1,4 @@
-"""The drop card is the one conversation with the coordinator: its thread merges the operator's drops with the rows of the desk-thread
+"""The drop card is the one conversation with the desk: its thread merges the operator's drops with the rows of the desk-thread
 panel (a provider's side of the conversation), newest first, each row a one-line preview that opens to its whole text. The panel is
 drawn nowhere else. These drive the real page in headless Chrome over the narrow-layout rig, with the manifest, the desk panel and the
 drops read answered by an init script, so the real view mapper and the real renderer both run."""
@@ -244,7 +244,7 @@ def test_show_more_keeps_its_focus_and_a_row_folded_away_hands_its_focus_to_it(t
 
 @needs_browser
 @needs_ssh
-def test_a_new_coordinator_reply_is_announced_once_and_nothing_else_is(tmp_path: Path, monkeypatch) -> None:
+def test_a_new_desk_reply_is_announced_once_and_nothing_else_is(tmp_path: Path, monkeypatch) -> None:
     live = "JSON.stringify({t: 'thread', rows: [], live: document.querySelector('#ck-drop .drop-live').textContent, role: document.querySelector('#ck-drop .drop-live').getAttribute('aria-live')})"
     add = lambda rid, src: {"eval": ("window.__body.rows.push({id: %s, title: 'new', body: 'new', facets: {at: '2026-10-31T09:00:00Z', source: %s}}); window.__body.count += 1; 1" % (json.dumps(rid), json.dumps(src)))}
     steps = _boot(_init(DESK_ROWS), [{"eval": live}, REDRAW, SETTLE2, {"eval": live},               # a refresh with nothing new

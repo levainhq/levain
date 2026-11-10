@@ -524,7 +524,7 @@ def _authority(**expiries: timedelta) -> SimpleNamespace:
 
 @pytest.mark.chat_egress_srt
 def test_run_two_real_launches_on_one_service(tmp_path, monkeypatch):
-    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.desk.envelopes import EnvelopeStore
 
     from .decider_rig import Desk, Live, NoStore
     from .fixtures import env as envmod
@@ -580,8 +580,8 @@ def test_run_two_real_launches_on_one_service(tmp_path, monkeypatch):
 
 
 def _second_launch(store) -> str:
-    """A second launch in the same dispatch store, through the coordinator's own path."""
-    from levain.coordinator.store import Part
+    """A second launch in the same dispatch store, through the desk's own path."""
+    from levain.desk.store import Part
 
     token = store.coord_take()
     d = store.accept_drop("chat two", surface="cli")[0]

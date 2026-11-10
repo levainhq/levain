@@ -19,6 +19,7 @@ import levain
 from levain import band_hook, doctor
 from levain.cli import main
 from levain.consent.questions import QuestionStore
+from levain.desk.legacy import ROLE_DESK
 
 TEMPLATES = Path(levain.__file__).parent / "templates"
 SRC = Path(levain.__file__).resolve().parent.parent
@@ -382,18 +383,18 @@ def test_the_entry_is_silent_for_an_autonomous_seat_and_a_suppressed_spawn(rig):
     assert rig.run_entry("UserPromptSubmit", {"prompt": "hi"}, rig.outside, {"LEVAIN_SEAT": "attended"}) != ""
 
 
-def _coordinator_row(rig, sid):
-    from levain.coordinator.store import CoordStore
+def _desk_row(rig, sid):
+    from levain.desk.store import CoordStore
 
     store = CoordStore(rig.qdir)
     store.coord_set_agent("claude", model="haiku", cwd=str(rig.outside))
     d, _ = store.accept_drop("do a thing", surface="cli")
     store.launch_activate(store.woken_launch(d.drop_id), harness_session_id=sid)
-    assert store.launch_by_harness_session(sid).role == "coordinator"
+    assert store.launch_by_harness_session(sid).role == ROLE_DESK
 
 
 def _worker_row(rig, sid):
-    from levain.coordinator.store import CoordStore, Part
+    from levain.desk.store import CoordStore, Part
 
     store = CoordStore(rig.qdir)
     store.coord_set_agent("none")
@@ -432,7 +433,7 @@ def test_a_headless_session_without_a_launch_row_is_left_alone(rig):
     out = _three(rig, "h-2", {"CLAUDE_CODE_ENTRYPOINT": "cli"})  # interactive or --bg: the band
     assert "NEEDS YOU band" in ctx(out[0]) and ctx(out[1]).startswith("NEEDS YOU · 1 open")
     assert json.loads(out[2])["decision"] == "block"
-    _coordinator_row(rig, "c-1")                                  # a coordinator Levain launched headless: the band
+    _desk_row(rig, "c-1")                                  # a desk Levain launched headless: the band
     out = _three(rig, "c-1", {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"})
     assert "NEEDS YOU" in ctx(out[1])
     assert band_hook.stands_down("h-1", {**rig.env, "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}) is True
@@ -552,7 +553,7 @@ def test_an_ide_session_is_shown_the_band(rig):
 
 
 # --- Codex ---------------------------------------------------------------------------------------------------
-def test_the_codex_hook_shows_the_band_in_the_coordinator_workspace_only_after_install(rig):
+def test_the_codex_hook_shows_the_band_in_the_desk_workspace_only_after_install(rig):
     rig.ask()
     inst = rig.make_install("codex")
     ws = rig.tmp / "levain-home" / "codex-workspace"

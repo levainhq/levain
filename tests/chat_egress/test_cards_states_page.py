@@ -28,8 +28,8 @@ from levain.chat_egress import classify, parse, records as rec, strip, wire
 from levain.chat_egress.cards import card_input, file_card
 from levain.chat_egress.lifecycle import Verdict
 from levain.consent.queue import ConsentQueue
-from levain.coordinator.lease import _launch_event
-from levain.coordinator.store import CoordStore
+from levain.desk.lease import _launch_event
+from levain.desk.store import CoordStore
 from tests.chat_egress.test_classify import frame
 from tests.chat_egress.test_records import GET, make_launch
 from tests.test_cockpit_consent_rows import OPEN_DECISIONS

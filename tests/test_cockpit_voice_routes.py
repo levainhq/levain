@@ -37,7 +37,7 @@ from levain.cockpit import room as cockpit_room  # noqa: E402
 from levain.cockpit import voice as cockpit_voice  # noqa: E402
 from levain.cockpit.firejournal import CockpitDB  # noqa: E402
 from levain.consent.sign import Signer  # noqa: E402
-from levain.coordinator.chat import record_event  # noqa: E402
+from levain.desk.chat import record_event  # noqa: E402
 from levain.voice import custody  # noqa: E402
 from levain.voice import meter as voice_meter  # noqa: E402
 from levain.voice import providers as vprov  # noqa: E402

@@ -11,11 +11,12 @@ import sys
 
 import pytest
 
-from levain.coordinator import claude_session as cs
-from levain.coordinator import room, room_host, room_launch, room_mcp
-from levain.coordinator.room_host import HostCommandError, HostCommands
-from tests.test_coordinator_room_mcp import (NOLAUNCH, Clock, call, make_launch, make_thread, qdir, raw, refused, say,  # noqa: F401
+from levain.desk import claude_session as cs
+from levain.desk import room, room_host, room_launch, room_mcp
+from levain.desk.room_host import HostCommandError, HostCommands
+from tests.test_desk_room_mcp import (NOLAUNCH, Clock, call, make_launch, make_thread, qdir, raw, refused, say,  # noqa: F401
                                              store, world)
+from levain.desk.legacy import ROLE_DESK
 
 THREAD = "th-0abcdef-a1b2c3"
 FAKE = """\
@@ -238,7 +239,7 @@ def test_relay_takes_ids_only(host, world):
 
 
 def test_relay_quotes_only_his_own_messages_in_the_open_room(host, store, qdir, world):
-    coord = say(store, world["thread"], "the coordinator's words", n=7, author="coordinator")
+    coord = say(store, world["thread"], "the desk's words", n=7, author=ROLE_DESK)
     refused(hcall(world["launch"], host, {"quote_ids": [coord]}, "relay_to_desk"), text="not the operator's own")
     refused(hcall(world["launch"], host, {"quote_ids": ["cm-" + "0" * 32]}, "relay_to_desk"), text="no message")
     assert not host.rec.exists() and relays(qdir) == []
@@ -272,7 +273,7 @@ def test_replies_reads_only_a_thread_this_room_relayed_to(host, world):
 
 
 def test_replies_refuses_a_launch_that_is_not_live(host, store, world):
-    from levain.coordinator import lease
+    from levain.desk import lease
 
     refused(hcall(NOLAUNCH, host, {"thread": THREAD}, "desk_replies"), text="does not exist")
     hcall(world["launch"], host, {"quote_ids": [world["m1"]]}, "relay_to_desk")
@@ -474,7 +475,7 @@ def test_the_real_stdio_door_reads_the_hosts_commands_from_its_environment(host,
         tool(3, "desk_replies", {"thread": THREAD}),
         tool(4, "desk_replies", {"thread": "th-0abcdef-ffff00"}),
     )) + "\n"
-    out = subprocess.run([sys.executable, "-P", "-m", "levain.coordinator.room_mcp"],
+    out = subprocess.run([sys.executable, "-P", "-m", "levain.desk.room_mcp"],
                          input=msgs, capture_output=True, text=True, env=env, timeout=60)
     assert out.returncode == 0, out.stderr
     replies = [json.loads(x) for x in out.stdout.splitlines()]

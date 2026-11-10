@@ -10,14 +10,14 @@ import urllib.request
 
 import pytest
 
-from levain.coordinator.chat import ChatService, ChatStore
-from levain.coordinator.driver import ScriptedSession
-from levain.coordinator.envelopes import EnvelopeStore
+from levain.desk.chat import ChatService, ChatStore
+from levain.desk.driver import ScriptedSession
+from levain.desk.envelopes import EnvelopeStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_threads import clock  # noqa: F401  (fixture)
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the default consent directory the server reads)
-from tests.test_coordinator_chat_send import LIVE, PHONE, _world, check, ready
+from tests.test_desk_chat_send import LIVE, PHONE, _world, check, ready
 
 OWNER = "cockpit:browser"          # the owner the write token's credential names
 
@@ -65,7 +65,7 @@ def _msg(world, body="go", outbox="ob-00000001", **kw) -> dict:
 
 
 def _replace(cs: ChatStore, world) -> str:
-    """A second worker launch for the thread (the coordinator relaunched it): the thread's latest worker launch."""
+    """A second worker launch for the thread (the desk relaunched it): the thread's latest worker launch."""
     store = cs._opener
     ln = store.launch_request(store.coord_take(), harness="claude", role="worker", threads=[world["thread"]])
     return ln.launch_id

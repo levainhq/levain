@@ -10,7 +10,7 @@ that read first holds a snapshot and gets SQLite's busy error, which writes noth
 
 ``tick`` walks every registered, active agent's slots since its stored cursor, in the agent's stored zone, with an
 injected clock. Before the walk it ends every admitted occurrence the full cap has held past its grace
-(:func:`close_no_slot`); ``launch_over`` and ``session_alive`` are the coordinator-lease probes (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
+(:func:`close_no_slot`); ``launch_over`` and ``session_alive`` are the desk-lease probes (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
 binding_id | None``; ``None`` means the agent is not armed), because arming is derived from the authority log and a
 binding is minted by the launch slice, neither of which is this module's.
 """
@@ -53,7 +53,7 @@ CLAIMED = "claimed"
 DUPLICATE = "duplicate"
 OVERLAP = "skipped-overlap"
 
-LEASE_S = 900  # A0 r7 section 2.3 [judged]: the coordinator slot's lease
+LEASE_S = 900  # A0 r7 section 2.3 [judged]: the desk slot's lease
 
 CURSOR_PREFIX = "tick_cursor:"
 STREAK_PREFIX = "miss_streak:"
@@ -185,7 +185,7 @@ def close_no_slot(conn: sqlite3.Connection, now: datetime, over: Collection[str]
     """End as ``missed`` / ``no_slot`` every ``admitted`` occurrence past its grace while the cap is full (A0 §2.4:
     a named occurrence is retried each tick, and only the grace running out ends it). Returns ``(agent_id, key)``;
     each close reaches the miss streak in this same transaction.
-    It reclaims the expired coordinator leases in ``over`` (probed by the caller, :func:`slots.probe_over`) first, and
+    It reclaims the expired desk leases in ``over`` (probed by the caller, :func:`slots.probe_over`) first, and
     does nothing while a slot is free: an occurrence still admitted past grace with a slot free was not left by the
     cap, so ``no_slot`` would be a false reason. A cap nobody can read decides nothing here: the tick goes on for
     the other agents and the occurrences stay admitted. Runs in the caller's write transaction."""
@@ -1504,7 +1504,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     return fire(args.store, args.occurrence_id, run=run_agent, clock=lambda: datetime.now(timezone.utc))
 
 
-# --- the coordinator-lease probes over dispatch.db (levain.agents.slots.probe_over) -----------------------------------
+# --- the desk-lease probes over dispatch.db (levain.agents.slots.probe_over) -----------------------------------
 
 DISPATCH_TIMEOUT = 0.25   # [judged] seconds a probe waits on a locked dispatch.db; a timeout is "cannot tell"
 _OVER_KINDS = ("failed", "expired", "ended")
@@ -1515,9 +1515,9 @@ def dispatch_probes(directory: Path | str) -> tuple[Callable[[str], bool | None]
 
     ``launch_over``: True when the launch row is gone or its latest event is failed, expired or ended; False while it
     is pending or active; None when it has no event. "Gone" is safe to answer for both callers, :func:`slots.take`
-    (fed :func:`slots.expired_launches`) and the coordinator's sweep (fed EVERY held launch): the coordinator takes a
+    (fed :func:`slots.expired_launches`) and the desk's sweep (fed EVERY held launch): the desk takes a
     launch's slot only after it read the launch row, and launch rows are append-only, so a missing row is a launch of
-    another store, never one not yet committed. ``session_alive``: False only when the coordinator's watcher swept
+    another store, never one not yet committed. ``session_alive``: False only when the desk's watcher swept
     the launch (``launch_sweeps``: it saw the session not running); otherwise None, because the store holds no live
     process; a dead session of an active launch is the watcher's to end, which ``launch_over`` then reads. A file or
     table that cannot be read raises, which :func:`slots.probe_over` reads as "cannot tell" (the slot is kept)."""

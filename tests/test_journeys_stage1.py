@@ -336,7 +336,7 @@ def test_j4_consent_allow_from_the_needs_card_is_one_tap(tmp_path: Path, monkeyp
 def test_j5_a_drop_from_the_compose_shows_its_receipt_and_its_thread_row(tmp_path: Path, monkeypatch) -> None:
     rig = FullRig(tmp_path, monkeypatch)
     _scratch(tmp_path, rig.qdir)
-    words = "tell the coordinator: land c-12"
+    words = "tell the desk: land c-12"
     after = ("JSON.stringify({box: window.LevainDashboard.dropBoxText(document.getElementById('ck-drop-words')),"
              " receipt: document.querySelector('#ck-drop .drop-receipt').textContent,"
              " rows: [...document.querySelectorAll('#ck-drop .drop-recent-row')].map(r => r.textContent)})")

@@ -11,6 +11,7 @@ import pytest
 from levain.dispatch import snapshot as snap
 from levain.dispatch.policy import ProviderPolicy
 from levain.dispatch.snapshot import SnapshotRefused, build_snapshot, plan_snapshot, scan_blob, snapshot_commit
+from levain.desk.legacy import JSON_ROLE_DESK
 
 OLD_SECRET = "AKIA" + "ABCDEFGHIJKLMNOP"
 
@@ -306,7 +307,7 @@ def test_secret_assignment_later_keys_and_plurals_are_precise(text):
     "user=bob, token=abc, region=us-east-1-and-more\n",
     "a=1 token=x and then some long trailing prose words\n",
     'rows = _get(url, token="T")["rows"]\n',
-    'done = store.set_state(tid, by="coordinator", token=_lease(store))\n',
+    f'done = store.set_state(tid, by={JSON_ROLE_DESK}, token=_lease(store))\n',
     # (2) the first key follows the same rule as a later one, whatever precedes its name
     "docker run -e PASSWORD=actual-secret-123456\n",
     "echo TOKEN=actual-secret-123456\n",

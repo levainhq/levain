@@ -195,7 +195,7 @@ def main() -> int:
                 kind = "prompt"
                 try:
                     from levain.band_view import turn_log_kind
-                    kind = turn_log_kind(payload, "prompt")     # "wake" for a coordinator wake: not his words
+                    kind = turn_log_kind(payload, "prompt")     # "wake" for a desk wake: not his words
                 except Exception:
                     pass
                 hook.session_log(session_id, kind, prompt)

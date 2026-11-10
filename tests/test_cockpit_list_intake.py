@@ -1,7 +1,7 @@
 """THE LIST's intake write path (levain 64 L1; flow task_surfaces_1107.md THE LIST): the three create fields on
 ``spore_seed`` (a timed ``next``, the germinate ``target``, ``attention``), the ``list_intake`` verb's tier table, its
 broker build (one reading of the line, at issue), its receipt, and the C1 sort drop. Real anneal SporeStores and a
-real coordinator store in tmp dirs; nothing is mocked."""
+real desk store in tmp dirs; nothing is mocked."""
 
 from __future__ import annotations
 
@@ -140,7 +140,7 @@ def test_steering_is_refused_never_coerced(spores, name, extra, why):
 
 def test_the_intake_tier_table():
     """THE TIER TABLE (PLAN section 3, decided by L1): drop T2 (signed: it wakes the desk at its minute with his words),
-    talk T2 (a spore agents read, as every spore_seed), sort C1 (the room composer's own coordinator drop, which is
+    talk T2 (a spore agents read, as every spore_seed), sort C1 (the room composer's own desk drop, which is
     never authority). spore_seed stays T2 whatever it carries."""
     assert INTAKE_TIERS == {"drop": "T2", "talk": "T2", "sort": "C1"}
     reg = VerbRegistry()
@@ -242,18 +242,18 @@ def test_a_line_that_does_not_read_is_refused_with_its_reason_and_writes_nothing
     assert spores.read_bytes() == before
 
 
-def test_the_broker_builds_a_sort_as_one_coordinator_drop_and_refuses_a_malformed_body(broker, spores, home):
-    from levain.cockpit.coord_effects import COORDINATOR, CoordDropEffectStore
+def test_the_broker_builds_a_sort_as_one_desk_drop_and_refuses_a_malformed_body(broker, spores, home):
+    from levain.cockpit.desk_effects import DESK, CoordDropEffectStore
 
-    # no coordinator store registered: the sort keeps its 501
+    # no desk store registered: the sort keeps its 501
     with pytest.raises(BrokerError) as e:
         _issue(broker, "plain words", credential=DEVICE, tier="C1", intent="sign")
     assert e.value.status == 501
-    broker.stores[COORDINATOR] = CoordDropEffectStore(lambda: home / "dispatch")
+    broker.stores[DESK] = CoordDropEffectStore(lambda: home / "dispatch")
     out = _issue(broker, "plain words", credential=DEVICE, tier="C1", intent="sign")
     assert out["state"] == "WAITING"
     (eff,) = json.loads(out["record"])["effects"]
-    assert (eff["store"], eff["changes"]) == (COORDINATOR, {"text": "plain words"})
+    assert (eff["store"], eff["changes"]) == (DESK, {"text": "plain words"})
     with pytest.raises(BrokerError) as e:
         broker.issue(verb=INTAKE_VERB, params={"line": "@+1h x", "next": "2026-11-09T09:00"},
                      target={"kind": "create", "panel_id": "list"}, tier="T2", credential=BROWSER, intent="reported")
@@ -263,7 +263,7 @@ def test_the_broker_builds_a_sort_as_one_coordinator_drop_and_refuses_a_malforme
 # --- 4: the C1 sort -----------------------------------------------------------------------------------------------
 
 def test_a_plain_line_is_a_cockpit_drop_for_the_desk_to_sort(home):
-    from levain.coordinator.store import CoordStore
+    from levain.desk.store import CoordStore
 
     d = home / "dispatch"
     out = _intake_fire(None, {"line": "  look at the sticky note  "},  # type: ignore[arg-type]
@@ -277,7 +277,7 @@ def test_a_plain_line_is_a_cockpit_drop_for_the_desk_to_sort(home):
 def test_an_unkeyed_sort_is_refused_before_anything_is_written(home):
     """codex L3 r2: a retry of an unkeyed sort would write the drop twice, so the key is required (as the room's
     composer requires its outbox id)."""
-    from levain.coordinator.store import CoordStore
+    from levain.desk.store import CoordStore
 
     d = home / "dispatch"
     for tgt in ({"dispatch_dir": d}, {"dispatch_dir": d, "idempotency_key": ""}):
@@ -300,14 +300,14 @@ def test_the_sort_fire_refuses_everything_but_a_plain_line(home, params, code, s
     assert (e.value.code, e.value.http_status) == (code, status)
 
 
-def test_the_sort_fire_needs_a_coordinator_store():
+def test_the_sort_fire_needs_a_desk_store():
     with pytest.raises(EditError) as e:
         _intake_fire(None, {"line": "x"}, {}, False)  # type: ignore[arg-type]
     assert e.value.http_status == 501
 
 
 def test_a_keyed_sort_resent_after_a_lost_reply_writes_one_drop(home):
-    from levain.coordinator.store import CoordStore
+    from levain.desk.store import CoordStore
 
     d = home / "dispatch"
     tgt = {"dispatch_dir": d, "credential": "browser", "idempotency_key": "intake-1"}

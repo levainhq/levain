@@ -114,7 +114,7 @@ def main() -> int:
             hook.consent_observe("codex", "UserPromptSubmit", payload)
 
         if not hook.should_fire():
-            # Outside the install (the coordinator's workspace, any repo): the NEEDS YOU band alone, and only when the
+            # Outside the install (the desk's workspace, any repo): the NEEDS YOU band alone, and only when the
             # operator opted in with `levain band hooks install` (its receipt). Same stand-down rules; no posture,
             # spores or recall. A suppressed spawn stays silent.
             if not hook.suppressed():
@@ -231,7 +231,7 @@ def main() -> int:
                 kind = "prompt"
                 try:
                     from levain.band_view import turn_log_kind
-                    kind = turn_log_kind(payload, "prompt", agent="codex")     # "wake" for a coordinator wake: not his words
+                    kind = turn_log_kind(payload, "prompt", agent="codex")     # "wake" for a desk wake: not his words
                 except Exception:
                     pass
                 hook.session_log(session_id, kind, prompt)

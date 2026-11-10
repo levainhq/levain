@@ -982,13 +982,13 @@ def _run_lsof(timeout: float = FOREGROUND_BUDGET) -> str:
 
 
 def _lease_holds(queue_dir: Path | str, session: str) -> bool:
-    """Whether ``session`` is the harness session of the launch that holds the live coordinator lease. Raises when the
+    """Whether ``session`` is the harness session of the launch that holds the live desk lease. Raises when the
     store cannot be read; a store that is not there is no lease (False)."""
     from datetime import datetime, timezone
 
     from levain.cockpit.consent import utc_stamp
-    from levain.coordinator import lease
-    from levain.coordinator.store import CoordStore, StoreAbsent
+    from levain.desk import lease
+    from levain.desk.store import CoordStore, StoreAbsent
 
     try:
         conn = CoordStore(queue_dir).open_readonly(busy_s=0.25)
@@ -1061,8 +1061,8 @@ def _foreground_session(event_session: str, *, home: Path, queue_dir: Path | str
     """``(is_foreground, why)`` for the Claude Code session ``event_session``: whether the operator is looking at it
     now, so its own dialog is the right place to ask. The hook's event names the session and nothing about which client is
     attached (measured 11-07, desk reply to band 407), so the answer is read from two places, either of which says
-    foreground: (a) ``event_session`` is the harness session of the launch that holds the live coordinator lease
-    (``lease_reader``, default the coordinator store read-only); (b) the claude daemon's worker for that session
+    foreground: (a) ``event_session`` is the harness session of the launch that holds the live desk lease
+    (``lease_reader``, default the desk store read-only); (b) the claude daemon's worker for that session
     (``roster_reader`` reads ``roster.json``, matched on ``sessionId``) has a client attached to its ``ptySock``: one
     ``lsof -U`` (``lsof_runner``, default :func:`_run_lsof`, bounded by what is left of the budget) lists the worker's
     socket rows by address, and a live client is a row ``->`` one of those addresses from a process that is not the
@@ -1101,7 +1101,7 @@ def _foreground_session(event_session: str, *, home: Path, queue_dir: Path | str
     lease_note = ""
     try:
         if queue_dir is not None and (lease_reader or _lease_holds)(queue_dir, session):
-            return True, "the coordinator lease holder"
+            return True, "the desk lease holder"
     except Exception as e:  # noqa: BLE001 - an unreadable lease is unknown, and unknown holds
         lease_note = f"; lease unreadable ({type(e).__name__})"
     roster = (roster_reader or _read_roster)(Path(home))

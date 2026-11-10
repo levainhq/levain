@@ -313,7 +313,7 @@
           if (typeof r.id === "string" && /^session:[0-9a-f]{24}$/.test(r.id)) line.session = r.id.slice("session:".length);
         }
         if (typeof r.id === "string" && r.id) line.key = r.id;
-        // the coordinator thread the drop card hosts reads each row whole: its one-line title, its full text, its instant and its source
+        // the desk thread the drop card hosts reads each row whole: its one-line title, its full text, its instant and its source
         if (head.id === "desk-thread") line.thread = { title: r.title, body: r.body, at: (r.facets || {}).at, source: (r.facets || {}).source };
         if (grouped) line.grp = grp;
         if (head.id === "jobs") {
@@ -382,7 +382,7 @@
                             intention: typeof f.question_intention === "string" && f.question_intention ? f.question_intention : "",
                             intentionActions: (Array.isArray(r.actions) ? r.actions : []).filter((a) => a && typeof a.verb === "string" && a.verb.indexOf("intention_") === 0) };
         }
-        // a coordinator review item: its state, whether it is "yours to clear", and the one verb the kernel offers on it
+        // a desk review item: its state, whether it is "yours to clear", and the one verb the kernel offers on it
         // here (review_clear on a plain open item, review_reopen on a cleared one), drawn as a button on the row
         if (head.id === "review-queue" && typeof r.id === "string" && r.id.indexOf("review:") === 0) {
           const f = r.facets || {};

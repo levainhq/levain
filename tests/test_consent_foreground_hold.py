@@ -334,7 +334,7 @@ def test_a_non_foreground_request_is_held_pings_with_a_sign_sheet_and_withdraws_
 
 
 def test_the_foreground_session_keeps_todays_path_no_hold_no_ping(rig, monkeypatch):
-    out, seen = _run(rig, monkeypatch, foreground=lambda s: (True, "the coordinator lease holder"))
+    out, seen = _run(rig, monkeypatch, foreground=lambda s: (True, "the desk lease holder"))
     assert "wait" not in seen and seen["pings"] == []
 
 
@@ -416,7 +416,7 @@ def test_an_away_hold_for_a_non_foreground_session_loses_its_presence_recheck_an
 
 
 def test_an_away_hold_for_the_foreground_session_keeps_its_presence_recheck(rig, monkeypatch):
-    out, seen = _run(rig, monkeypatch, foreground=lambda s: (True, "the coordinator lease holder"), away=20.0)
+    out, seen = _run(rig, monkeypatch, foreground=lambda s: (True, "the desk lease holder"), away=20.0)
     assert seen["wait"] > 0 and seen["still_away"] is not None
 
 

@@ -22,8 +22,8 @@ def test_a_name_equal_to_a_kind_or_suffix_is_not_that_agents_card() -> None:
     assert _cards_of(_agent("ag-9", "w-paused"), _card_index([("k:w-paused:d3", False)])) == (1, 0)   # by name as subject
 
 
-def test_a_coordinator_file_without_tables_is_said_and_no_file_is_not(tmp_path: Path) -> None:
-    from levain.coordinator.store import CoordStore
+def test_a_desk_file_without_tables_is_said_and_no_file_is_not(tmp_path: Path) -> None:
+    from levain.desk.store import CoordStore
 
     w = AgentsWiring(dispatch_dir=lambda: tmp_path)
     assert _card_marks(w) == ([], None)                              # no store at all

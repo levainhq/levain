@@ -15,13 +15,14 @@ from levain.consent import auto_away
 from levain.consent.adapters import claude_code as cc
 from levain.consent.adapters import codex as cx
 from levain.consent.questions import QuestionStore
-from levain.coordinator import drop_reply, intake, morning, ready, seam_plan, work_delta
-from levain.coordinator import launch as cl
-from levain.coordinator.store import CoordStore
+from levain.desk import drop_reply, intake, morning, ready, seam_plan, work_delta
+from levain.desk import launch as cl
+from levain.desk.store import CoordStore
 from tests.test_consent_away import _cockpit
-from tests.test_coordinator_wake_silent import SID, Rig
+from tests.test_desk_wake_silent import SID, Rig
 from tests.test_seam_ingest import World
 from tests.test_seam_verbs import _body, _rewrite_writer, body_file
+from levain.desk.legacy import ROLE_DESK
 
 HEAD = work_delta.HEAD
 
@@ -40,7 +41,7 @@ def sql(store, text, *args):
 
 
 class Arrival:
-    """A coordinator store with an active launch, a signing cockpit, and the installed hook scripts to run its turns."""
+    """A desk store with an active launch, a signing cockpit, and the installed hook scripts to run its turns."""
 
     def __init__(self, tmp_path, monkeypatch, capsys):
         self.rig = Rig(tmp_path, "claude_code")
@@ -78,7 +79,7 @@ class Arrival:
         self.away(False)
 
     def open_and_ack(self):
-        """The coordinator's first act on a turn that carries his words: consume the leave, acknowledge the open."""
+        """The desk's first act on a turn that carries his words: consume the leave, acknowledge the open."""
         out = self.coord("open", "--light", "--token", str(self.token))
         open_id = int(out.split("--ack ")[1].split()[0])
         self.coord("open", "--ack", str(open_id), "--token", str(self.token))
@@ -92,7 +93,7 @@ class Arrival:
 
     def reply(self, ctx):
         """The model's reply: its status line, then the block exactly as given (what Stop checks)."""
-        return f"coordinator: ok; 0 escalated\n{ctx}"
+        return f"desk: ok; 0 escalated\n{ctx}"
 
     def stop(self, message):
         return self.rig.stop(message)
@@ -109,7 +110,7 @@ def arr(tmp_path, monkeypatch, capsys):
 
 
 CARD_LINES = ("back: operator open #1 (claude_code away off), acknowledged ",
-              "handoff #1 (operator, ", "next: land S4 then open the PR; in flight 1, if-then 1: levain coord handoff show")
+              "handoff #1 (operator, ", "next: land S4 then open the PR; in flight 1, if-then 1: levain desk handoff show")
 
 
 # 1 ------------------------------------------------------------------------------------------------------------------
@@ -151,7 +152,7 @@ def test_an_interrupted_turn_and_a_failed_reprint_record_nothing_and_the_card_sh
     assert arr.views() == []
     again = arr.ups("two")
     assert "back:" in again
-    retry = arr.stop("coordinator: fine, nothing reprinted")      # a reply that dropped the block
+    retry = arr.stop("desk: fine, nothing reprinted")      # a reply that dropped the block
     assert retry and "reprint" in retry.lower() and arr.views() == []
     assert "back:" in arr.ups("three")
 
@@ -213,7 +214,7 @@ def test_an_empty_delta_with_the_card_due_still_leads_with_the_head_and_a_failed
     arr.open_and_ack()
     block = arr.ups("plan?")
     assert block.splitlines()[0] == f"{HEAD}, 0 of 0):"
-    retry = arr.stop("coordinator: ok, nothing reprinted")
+    retry = arr.stop("desk: ok, nothing reprinted")
     reason = json.loads(retry)["reason"]
     assert f'the work lines, from the "{HEAD}" line' in reason       # the retry still names the work lines (band_view 2005)
     assert arr.views() == []
@@ -249,7 +250,7 @@ def test_a_handoff_that_is_not_an_operator_close_is_said_in_one_line():
 def test_a_cold_launch_over_a_handoff_already_carded_owes_no_second_card(arr):
     """Measured in the run (s5/RUN.md, scenario cold): the launch a drop wakes after he came back opens `operator` over the
     SAME handoff; it must not show that handoff's card a second time."""
-    from levain.coordinator import lease as _lease, seam_build, seam_open, seam_verbs
+    from levain.desk import lease as _lease, seam_build, seam_open, seam_verbs
     import os
 
     arr.leave_and_return()
@@ -257,7 +258,7 @@ def test_a_cold_launch_over_a_handoff_already_carded_owes_no_second_card(arr):
     arr.open_and_ack()
     arr.turn("plan?")                                    # the card is shown and recorded
     assert len(arr.views()) == 1
-    arr.coord("release", "--by", "coordinator", "--token", str(arr.token))
+    arr.coord("release", "--by", ROLE_DESK, "--token", str(arr.token))
     old = arr.store.launch_by_harness_session(SID)
     with arr.store._write() as (conn, now):
         _lease._launch_event(conn, now, old.launch_id, "ended", "session done")
@@ -276,11 +277,11 @@ def test_a_cold_launch_over_a_handoff_already_carded_owes_no_second_card(arr):
 
 
 def test_a_cold_launch_with_no_card_shown_for_its_handoff_owes_one(arr):
-    from levain.coordinator import lease as _lease, seam_build, seam_open, seam_verbs
+    from levain.desk import lease as _lease, seam_build, seam_open, seam_verbs
     import os
 
     arr.leave_and_return()                               # the leave is never consumed: no card has been shown
-    arr.coord("release", "--by", "coordinator", "--token", str(arr.token))
+    arr.coord("release", "--by", ROLE_DESK, "--token", str(arr.token))
     old = arr.store.launch_by_harness_session(SID)
     with arr.store._write() as (conn, now):
         _lease._launch_event(conn, now, old.launch_id, "ended", "session done")
@@ -396,7 +397,7 @@ def _arrival_section(text):
     return text.split("## When he arrives or leaves")[1].split("\n## ")[0]
 
 
-def test_the_brief_tells_the_coordinator_to_open_light_first_and_the_walk_order(pending):
+def test_the_brief_tells_the_desk_to_open_light_first_and_the_walk_order(pending):
     text = cl._brief_text(pending, pending.launch(pending.launch_id))
     sec = _arrival_section(text)
     assert "coord open --light --token N" in sec and "before you reply" in sec
@@ -427,10 +428,10 @@ def test_option_b_is_one_paragraph(pending, monkeypatch):
 # L3 round 1 fixes (project_memory/1103-20_L3_c15s5_r1.txt) -----------------------------------------------------------
 def _cold_launch_acked(arr):
     """A cold launch a drop woke after he came back: its `operator`/`launch` open, delivered and acknowledged."""
-    from levain.coordinator import lease as _lease, seam_build, seam_open, seam_verbs
+    from levain.desk import lease as _lease, seam_build, seam_open, seam_verbs
     import os
 
-    arr.coord("release", "--by", "coordinator", "--token", str(arr.token))
+    arr.coord("release", "--by", ROLE_DESK, "--token", str(arr.token))
     old = arr.store.launch_by_harness_session(SID)
     with arr.store._write() as (conn, now):
         _lease._launch_event(conn, now, old.launch_id, "ended", "session done")
@@ -528,7 +529,7 @@ def test_plan_counts_every_unanswered_drop_and_lists_the_closed_window_ones_apar
 
 def test_plan_names_the_ack_command_that_works_and_sorts_out_the_opens_that_cannot_be_acknowledged(tmp_path, capsys):
     """codex #4: a rotation open needs --read-back-file; an open never delivered to this launch cannot be acknowledged."""
-    from levain.coordinator import seam_build
+    from levain.desk import seam_build
 
     w = World(tmp_path, capsys)
     w.run("coord", "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path, _body())), "--request-id", "r1",
@@ -561,4 +562,4 @@ def test_plan_on_no_store_says_so(tmp_path, capsys):
     q = tmp_path / "empty"
     q.mkdir(mode=0o700)
     assert main(["coord", "close", "--plan", "--queue-dir", str(q)]) == 1
-    assert "there is no coordinator store here" in capsys.readouterr().err
+    assert "there is no desk store here" in capsys.readouterr().err

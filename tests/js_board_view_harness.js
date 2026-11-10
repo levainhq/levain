@@ -131,7 +131,7 @@ function emptyWords(V, extra) {
   const empties = (root) => walk(root).filter((n) => n.className === "bd-empty").map((n) => n.textContent);
   return { grouped: empties(g), cols: empties(c) };
 }
-out.emptyWords = { ok: emptyWords(V, {}), queue: emptyWords(V, { queue: "unreadable", unreadable: ["coordinator"] }), band: emptyWords(V, { unreadable: ["band"] }), seats: emptyWords(V, { unreadable: ["seats"] }), noKey: emptyWords(V, { unreadable: undefined, queue: "mystery" }) };
+out.emptyWords = { ok: emptyWords(V, {}), queue: emptyWords(V, { queue: "unreadable", unreadable: ["desk"] }), band: emptyWords(V, { unreadable: ["band"] }), seats: emptyWords(V, { unreadable: ["seats"] }), noKey: emptyWords(V, { unreadable: undefined, queue: "mystery" }) };
 // The needs-you column counts what the Needs strip counts: a band row the desk alone owes (section desk, not carried) is out; a
 // carried desk row, a "you" row and a row with no section are in. The column's cards are the same set the grouped list draws.
 (function () {

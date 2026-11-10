@@ -13,12 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from levain.coordinator import review
-from levain.coordinator import teamdrafts as T
-from levain.coordinator.seam_classes import SeamClassError, unsequenced
-from levain.coordinator.store import GSEQ_TABLES, CoordStore, Part
-from tests.test_coordinator_first_reader import Band
-from tests.test_coordinator_envelope import ctx, keys, repo, snapshot  # noqa: F401 - fixtures
+from levain.desk import review
+from levain.desk import teamdrafts as T
+from levain.desk.seam_classes import SeamClassError, unsequenced
+from levain.desk.store import GSEQ_TABLES, CoordStore, Part
+from tests.test_desk_first_reader import Band
+from tests.test_desk_envelope import ctx, keys, repo, snapshot  # noqa: F401 - fixtures
 from tests.test_review_clear_combined import _pre_r4_store, _strip_s0
 
 NEW_TABLES = tuple(t for t in GSEQ_TABLES if t != "replies")
@@ -181,7 +181,7 @@ def test_a_first_read_takes_a_gseq_after_its_reply_and_item(ctx, keys, repo, sna
     assert reply_g < item_g < read_g                                # the answer's own three rows, in write order
     assert _unsequenced(path) == {t: 0 for t in GSEQ_TABLES}
     q2 = band.ask("another one?")
-    from levain.coordinator import first_reader as fr
+    from levain.desk import first_reader as fr
 
     fr.escalate(band.store, q2.id, "his to decide", token=band.token)
     conn = sqlite3.connect(path)

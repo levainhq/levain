@@ -204,10 +204,10 @@ Shipped (15), each with its owner:
 - `levain-consent-answer` (levain/consent/record.py)
 - `levain-consent-ruling` (levain/consent/record.py)
 - `levain-consent-away` (levain/consent/record.py)
-- `levain-review-clear` (levain/coordinator/review.py)
+- `levain-review-clear` (levain/desk/review.py)
 - `levain-answer-countersign` (levain/consent/answer_countersign.py)
 - `levain-dispatch-config-approve` (levain/dispatch/phone_config.py)
-- `levain-envelope-revoke` (levain/coordinator/envelope_revoke.py)
+- `levain-envelope-revoke` (levain/desk/envelope_revoke.py)
 - `levain-terminal-answer` (levain/consent/terminal_sign.py)
 - `levain-desk-answer` (levain/consent/terminal_sign.py)
 
@@ -220,7 +220,7 @@ Reserved (9), each with its owner:
 - `levain-dispatch-cancel` (levain/dispatch/sign.py)
 - `levain-dispatch-config` (levain/dispatch/control.py)
 - `levain-dispatch-authorise` (levain/dispatch/adopt.py)
-- `levain-thread-envelope` (levain/coordinator/envelope.py)
+- `levain-thread-envelope` (levain/desk/envelope.py)
 - `levain-allowed-signers` (levain/qbroker/signers.py)
 
 Reserved family `levain-team-<kind>`: P1's signed-envelope kinds, levain-team-<kind>; kind 'entry' is F9's, so no envelope kind is named 'entry'.
@@ -323,11 +323,11 @@ a new tag. anneal reads `expect.levain` as the verdict and ignores `expect.upstr
 
 ## The thread envelope's `launches` grant
 
-A thread envelope (`levain-thread-envelope/2`) names what a coordinator may do: `where`, then the effect lists `lands`, `pushes`
+A thread envelope (`levain-thread-envelope/2`) names what a desk may do: `where`, then the effect lists `lands`, `pushes`
 and `publishes`. It may also carry one optional key, `launches`: a list of `{"repo": ..., "count": N}`, one entry per repo,
 that lets the flow desk start up to N seats in that repo without asking again, until the envelope's stop. The repo must be one of
 the envelope's `where` repos, `count` is a whole number from 1 to `LAUNCH_MAX` (the default offered is `LAUNCH_DEFAULT`; both in
-`levain/coordinator/envelope.py`), and a repo is named once.
+`levain/desk/envelope.py`), and a repo is named once.
 
 - **Absent means no grant.** The key is left out of the body unless it is named, so an envelope signed before it existed has the
   same bytes, digest and signature as it always did and still verifies. The format stays `/2`. An older levain refuses a body
@@ -350,7 +350,7 @@ the envelope's `where` repos, `count` is a whole number from 1 to `LAUNCH_MAX` (
   signature still verifies under a fresh authority snapshot (a revoked signing key ends the grant). An effective `launches`
   entry names the repo, and the desk's own launch log shows fewer than `count` launches for that envelope and repo.
   `EnvelopeStore.launch_allowance(envelope_id, thread_id, repo, authority=..., used=...)` makes that decision in one read and
-  answers 0 when any of it fails. `levain.coordinator.envelope.launch_allowance(envelope, repo, now, used)` is only its
+  answers 0 when any of it fails. `levain.desk.envelope.launch_allowance(envelope, repo, now, used)` is only its
   arithmetic over an effective body, with no liveness check. Levain keeps no counter, because the count is the desk's to log.
   The desk serialises its launches and reads `used` under its own lock, since neither function reserves anything.
 

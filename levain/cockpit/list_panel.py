@@ -4,7 +4,7 @@ The Tray becomes the List in every operator-facing word. The List is a VIEW over
 
 * **band**  the open needs-you items (``levain.cockpit.board`` reads them through ``band_view``), read-only, each labelled with
   where to answer it. The List never holds a second needs-you list: it points at Decisions.
-* **board** the coordinator's ``ready`` column (``board.build`` over ``ready.snapshot``), read-only.
+* **board** the desk's ``ready`` column (``board.build`` over ``ready.snapshot``), read-only.
 * **spore** the operator's seeds, agendas and talk seeds, through the same spore view the Tray read, with ``verbs`` unchanged.
 
 One panel, one ordering (``spore.list``), one row set. Every row carries a ``surface`` facet in {band, board, spore, talk,
@@ -273,7 +273,7 @@ def _band_row(card: dict[str, Any], today: date, now: datetime) -> RowIn:
 
 
 def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime) -> _Part:
-    """The band's open items and the coordinator's ready column, as read-only rows. ``board.build`` never raises; what it could
+    """The band's open items and the desk's ready column, as read-only rows. ``board.build`` never raises; what it could
     not read is named."""
     out = _Part()
     value = cockpit_board.build(store_dir, question_store)

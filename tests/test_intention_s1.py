@@ -129,7 +129,7 @@ def test_f2_one_predicate_a_drop_stamp_a_closed_row_and_a_missing_row_do_not_rin
     ag = {"disposition": "agenda", "status": "open", "germinated": {"ref": "q-1"}}
     assert ringing_ref(ag, {"q-1"}) == "q-1"
     assert ringing_ref(ag, {"q-2"}) is None                                   # its question is not open
-    assert ringing_ref({**ag, "germinated": {"ref": "dr-9"}}, {"dr-9"}) is None   # a coordinator drop is not a band row
+    assert ringing_ref({**ag, "germinated": {"ref": "dr-9"}}, {"dr-9"}) is None   # a desk drop is not a band row
     assert ringing_ref({**ag, "status": "resolved"}, {"q-1"}) is None
 
 

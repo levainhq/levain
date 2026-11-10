@@ -21,7 +21,7 @@ from levain.webpush import center, held, notify, presence, sender
 from levain.webpush.store import PushStore
 
 # the kinds a ping can carry: derived, so a kind added to the policy map is covered without editing this file
-BAND_DEFAULT_KIND = "question"      # levain.consent.band._send_ping's default; the coordinator's row is "attention"
+BAND_DEFAULT_KIND = "question"      # levain.consent.band._send_ping's default; the desk's row is "attention"
 TEST_PING_KIND = "test"             # levain.webpush.cli / web_server self-test pings
 ALL_KINDS = sorted(set(presence.KIND_CLASSES) | set(center._NOT_ITEMS) | {BAND_DEFAULT_KIND, TEST_PING_KIND})
 ITEM_KINDS = [k for k in ALL_KINDS if k not in center._NOT_ITEMS]     # a ping of these is a center item p<id>

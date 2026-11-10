@@ -267,6 +267,7 @@ from levain.firing import landlock as _landlock
 from levain.firing import ssh_agent as _ssh_agent
 from levain.firing.ssh_agent import RUN_DIR as AGENT_RUN_DIR
 from levain.slot import SUDO
+from levain.desk.legacy import DESK_HOME_NAME, LEGACY_HOME_NAME
 
 __all__ = [
     "SANDBOX_EXEC",
@@ -2219,7 +2220,7 @@ def _unhideable(d: Path, home: Path, entity_dir: Path, workspace: Path) -> bool:
 # is denied, so a directory missing here is still covered there. A test ties this tuple to every reader
 # of ``$LEVAIN_HOME`` in the package, so a new one fails until it is named here.
 LEVAIN_HOME_STATE_DIRS = (AUTONOMIC_STORE_DIR, COCKPIT_KEY_DIR, "consent", GRANTS_DIR, AGENT_RUN_DIR,
-                          _ssh_agent.HOST_KEYS_DIR, "coordinator", "chat-node", "observe")
+                          _ssh_agent.HOST_KEYS_DIR, LEGACY_HOME_NAME, DESK_HOME_NAME, "chat-node", "observe")
 
 
 def levain_home_base(home: Path, *, environ: Mapping[str, str]) -> Path:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from levain.coordinator.door import not_door
+from levain.desk.door import not_door
 
 from . import roles as R
 from . import signing as S

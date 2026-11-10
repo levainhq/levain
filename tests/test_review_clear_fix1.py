@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from levain.coordinator import review
-from levain.coordinator.store import CoordError, CoordStore, StoreAbsent
+from levain.desk import review
+from levain.desk.store import CoordError, CoordStore, StoreAbsent
 
 
 def _dir(tmp_path: Path) -> Path:
@@ -42,7 +42,7 @@ def test_a_transition_never_makes_a_store(tmp_path: Path) -> None:
     with pytest.raises(StoreAbsent):
         review.clear_item(store, "rv-" + "0" * 32, mode="manual")
     assert not (d / "dispatch.db").exists()
-    # the dispatch store's file alone (the job store shares it) holds no coordinator tables: still absent, none made
+    # the dispatch store's file alone (the job store shares it) holds no desk tables: still absent, none made
     from levain.dispatch.jobs import JobStore
 
     JobStore(d)._connect().close()
@@ -78,7 +78,7 @@ def test_still_runs_inside_the_write_on_the_item_as_it_is_then_and_a_raise_write
 
 def test_the_laptop_cli_clear_still_works_on_its_envelope_store(tmp_path: Path) -> None:
     """The CLI opens the store as the envelope store (a subclass with more tables): the non-creating writer takes it."""
-    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.desk.envelopes import EnvelopeStore
 
     d = _dir(tmp_path)
     store = EnvelopeStore(d)
@@ -91,7 +91,7 @@ def test_the_laptop_cli_clear_still_works_on_its_envelope_store(tmp_path: Path) 
 def test_an_item_whose_body_is_not_an_object_draws_its_row(tmp_path: Path) -> None:
     from datetime import datetime, timezone
 
-    from levain.cockpit.coordinator_panels import _review_rows
+    from levain.cockpit.desk_panels import _review_rows
 
     store = CoordStore(_dir(tmp_path))
     review.file_item(store, "seat", {"text": "fine"}, dedupe_key="a")
@@ -105,7 +105,7 @@ def test_an_item_whose_body_is_not_an_object_draws_its_row(tmp_path: Path) -> No
 def test_the_cleared_group_says_when_older_clears_exist(tmp_path: Path) -> None:
     from datetime import datetime, timezone
 
-    from levain.cockpit.coordinator_panels import CLEARED_SHOWN, _review_rows
+    from levain.cockpit.desk_panels import CLEARED_SHOWN, _review_rows
 
     store = CoordStore(_dir(tmp_path))
     ids = [review.file_item(store, "seat", {"text": f"s{n}"}, dedupe_key=f"k{n}")[0].item_id
@@ -116,11 +116,11 @@ def test_the_cleared_group_says_when_older_clears_exist(tmp_path: Path) -> None:
     assert "older ones" not in note                     # exactly CLEARED_SHOWN clears: all of them are listed
     review.clear_item(store, ids[-1])
     rows, note = _review_rows(store, datetime.now(timezone.utc))
-    assert len(rows) == CLEARED_SHOWN and "levain coord review list --all" in note, note
+    assert len(rows) == CLEARED_SHOWN and "levain desk review list --all" in note, note
 
 
 def test_review_version_is_the_version_the_panel_draws(tmp_path: Path) -> None:
-    from levain.cockpit.coordinator_panels import REVIEW_ID, coordinator_discoverer, review_version
+    from levain.cockpit.desk_panels import REVIEW_ID, desk_discoverer, review_version
     from levain.cockpit.engine import Cockpit
 
     d = _dir(tmp_path)
@@ -128,14 +128,14 @@ def test_review_version_is_the_version_the_panel_draws(tmp_path: Path) -> None:
     item, _ = review.file_item(store, "seat", {"text": "x"}, dedupe_key="a")
     review.clear_item(store, item.item_id)
     ck = Cockpit()
-    ck.discover(coordinator_discoverer(lambda: d), retire=True)
+    ck.discover(desk_discoverer(lambda: d), retire=True)
     row = next(r for r in ck.panel(REVIEW_ID, profile="full")["rows"] if r["id"] == f"review:{item.item_id}")
     assert row["version"] == review_version(review.get_item(store, item.item_id))
 
 
 # --- the cockpit: the version and the paired device are checked inside the write (F2, F3/F6) -----------------------
 
-from levain.cockpit.coordinator_panels import REVIEW_ID  # noqa: E402
+from levain.cockpit.desk_panels import REVIEW_ID  # noqa: E402
 from tests.test_cockpit_k2a import _install  # noqa: E402
 from tests.test_cockpit_pairing_http import PROXY, _call, _pair, _serve  # noqa: E402
 
@@ -169,7 +169,7 @@ def _fire(port: int, token: str, verb: str, row: dict) -> tuple[int, dict]:
 def _after_the_read(monkeypatch, act) -> None:
     """Run ``act`` once, right after the kernel's fresh read of the row and before the fire's write: the window the
     version check at the read cannot see."""
-    import levain.cockpit.coordinator_panels as cp
+    import levain.cockpit.desk_panels as cp
 
     real, done = cp._review_one, []
 

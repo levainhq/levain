@@ -825,7 +825,7 @@ def test_the_credential_name_lists_are_refused_by_the_repo_env_rule():
     through fails here."""
     from levain import sandbox_keys as sk
     from levain.consent import delivery as dv
-    from levain.coordinator import room_launch as rl
+    from levain.desk import room_launch as rl
     assert not hasattr(rd, "_REPO_BILLING_ENV") and not hasattr(sk, "CLAUDE_CREDENTIAL_ENV")
     names = set(dv._AGENT_AUTH) | {n for n in rl.ENV_KEEP if n.startswith("CLAUDE_")}
     for v in ("claude",):

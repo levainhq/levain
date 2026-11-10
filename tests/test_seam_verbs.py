@@ -1,5 +1,5 @@
 """C15 S3: ``coord close``, ``coord open`` (and ``--ack``), ``coord handoff show`` through the CLI entry, and the launch
-brief's embedded open. Every expectation was first read from a real run on a scratch store (an active coordinator launch
+brief's embedded open. Every expectation was first read from a real run on a scratch store (an active desk launch
 holding the lease), the round trip printed in full by the lane's run script."""
 from __future__ import annotations
 
@@ -13,9 +13,10 @@ import sys
 import pytest
 
 from levain.cli import main
-from levain.coordinator import launch as cl
-from levain.coordinator import seam_open
-from levain.coordinator.store import CoordStore
+from levain.desk import launch as cl
+from levain.desk import seam_open
+from levain.desk.store import CoordStore
+from levain.desk.legacy import JSON_ROLE_DESK, ROLE_DESK
 
 
 def _body(**over):
@@ -69,10 +70,10 @@ def body_file(tmp_path, body=None, name="body.json"):
 
 
 def lv():
-    """The spelling the launch brief gives a coordinator whose directory holds no allow rule of its own."""
-    from levain.install import coordinator_levain
+    """The spelling the launch brief gives a desk whose directory holds no allow rule of its own."""
+    from levain.install import desk_levain
 
-    return coordinator_levain(sys.executable)
+    return desk_levain(sys.executable)
 
 
 def unfenced(text):
@@ -102,9 +103,9 @@ def fenced(text):
 
 def bare(text):
     """Whether ``text`` names a levain command in any spelling other than :func:`lv`'s. The refusal header every
-    coord verb prints (``levain coord VERB: ...`` on stderr) names the program, not a command to run: it is skipped."""
-    text = re.sub(r"^levain coord [a-z]+: ", "", text, flags=re.M)
-    return "levain coord" in text.replace(f"{lv()} coord", "")
+    coord verb prints (``levain desk VERB: ...`` on stderr) names the program, not a command to run: it is skipped."""
+    text = re.sub(r"^levain desk [a-z]+: ", "", text, flags=re.M)
+    return "levain desk" in text.replace(f"{lv()} coord", "")
 
 
 def sql(store, query, *args):
@@ -131,7 +132,7 @@ def test_close_refusals_exit_one_on_stderr_and_write_nothing(world, qdir, tmp_pa
     bf = body_file(tmp_path)
     ok = ("close", "--kind", "rotation", "--body-file", str(bf), "--request-id", "r1")
     err = run(qdir, capsys, *ok, "--token", str(world.token + 99), rc=1).err
-    assert err.startswith("levain coord close:") and "not the live lease's" in err
+    assert err.startswith("levain desk close:") and "not the live lease's" in err
     err = run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(tmp_path / "nope.json"),
               "--request-id", "r1", "--token", str(world.token), rc=1).err
     assert "cannot read" in err
@@ -171,7 +172,7 @@ def _rewrite_writer(store, writer):
 
 
 def _rotation_close(world, qdir, tmp_path, capsys, writer="previous-session"):
-    """A rotation handoff written by an earlier coordinator session: a coordinator never acknowledges its own."""
+    """A rotation handoff written by an earlier desk session: a desk never acknowledges its own."""
     run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path)), "--request-id", "r1",
         "--token", str(world.token))
     if writer is not None:
@@ -184,22 +185,22 @@ def test_open_with_no_lease_prints_read_only_and_cannot_be_acked(world, qdir, tm
     assert "SEAM OPEN rotation" in out and "cannot be acknowledged (no --token was given)" in out
     assert "--prev-handoff-id 1" in out and "coord open --ack" not in out
     assert sql(world, "SELECT COUNT(*) FROM open_builds") == [(0,)] and sql(world, "SELECT COUNT(*) FROM open_deliveries") == [(0,)]
-    world.coord_release(world.token, by="coordinator")
+    world.coord_release(world.token, by=ROLE_DESK)
     op = world.coord_take()
     got = run(qdir, capsys, "open", "--token", str(op), rc=1)       # a token given and refused is a refusal
     assert "an operator token never acknowledges" in got.out and sql(world, "SELECT COUNT(*) FROM open_builds") == [(0,)]
-    assert got.err.startswith(f"levain coord open: --token {op} was refused: the lease is the operator's")
+    assert got.err.startswith(f"levain desk open: --token {op} was refused: the lease is the operator's")
     assert fenced(got.out)[0].startswith("SEAM OPEN rotation")      # the read-only open is still printed
     assert run(qdir, capsys, "open").err == ""                       # the operator's plain read is not one
 
 
 def test_a_stale_token_exits_one_with_the_reason(world, qdir, capsys):
     got = run(qdir, capsys, "open", "--token", str(world.token + 9), rc=1)
-    assert f"--token {world.token + 9} was refused: token {world.token + 9} is not a live coordinator lease's" in got.err
+    assert f"--token {world.token + 9} was refused: token {world.token + 9} is not a live desk lease's" in got.err
     assert "cannot be acknowledged" in got.out and "coord open --ack" not in got.out
 
 
-def test_open_for_the_coordinator_builds_delivers_and_names_the_ack_line(world, qdir, tmp_path, capsys):
+def test_open_for_the_desk_builds_delivers_and_names_the_ack_line(world, qdir, tmp_path, capsys):
     _rotation_close(world, qdir, tmp_path, capsys)
     out = run(qdir, capsys, "open", "--token", str(world.token)).out
     lines = out.strip().splitlines()
@@ -256,7 +257,7 @@ def test_a_light_ack_needs_no_read_back(world, qdir, capsys):
 
 def seam_open_light(world, qdir):
     """A light build delivered to the launch (S4 owns a light signal's builder; the build and delivery are S2's)."""
-    from levain.coordinator import seam_build
+    from levain.desk import seam_build
 
     b = seam_build.build(world, kind="light", signal_kind="silence", signal_key="d-1", queue_dir=qdir,
                          token=world.token)
@@ -346,7 +347,7 @@ def test_every_command_the_verbs_print_uses_the_brief_spelling(world, qdir, tmp_
 
 def test_the_spelling_check_fails_on_a_bare_spelling(world, qdir, tmp_path, capsys, monkeypatch):
     # the probe above can fail: with the rule's helper answering the bare name, every line it checks is bare
-    monkeypatch.setattr(cl, "coordinator_command", lambda install: "levain")
+    monkeypatch.setattr(cl, "desk_command", lambda install: "levain")
     assert all(bare(t) for t in _printed(world, qdir, tmp_path, capsys))
 
 
@@ -356,16 +357,16 @@ def test_an_install_whose_rule_names_bare_levain_gets_bare_levain(world, qdir, t
 
     work = tmp_path / "coord"
     (work / ".levain").mkdir(parents=True)
-    (work / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    (work / ".levain" / "config.json").write_text(f'{{"role": {JSON_ROLE_DESK}}}\n')
     (work / ".claude").mkdir()
     (work / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": [
-        f"Bash(levain {verb}:*)" for verb in inst.COORDINATOR_VERBS]}}))
-    assert cl.coordinator_command(work) == "levain" and cl.coordinator_command(tmp_path) == lv()
-    assert cl.coordinator_command(None) == lv()
+        f"Bash(levain {verb}:*)" for verb in inst.DESK_VERBS]}}))
+    assert cl.desk_command(work) == "levain" and cl.desk_command(tmp_path) == lv()
+    assert cl.desk_command(None) == lv()
 
 
 def test_verbose_adds_the_not_built_lines_outside_the_open(world, qdir, tmp_path, capsys):
-    from levain.coordinator import seam
+    from levain.desk import seam
 
     _rotation_close(world, qdir, tmp_path, capsys)
     plain = run(qdir, capsys, "open", "--token", str(world.token)).out
@@ -401,7 +402,7 @@ def test_the_brief_fences_the_open_and_no_stored_text_starts_a_line(pending):
 
 def test_a_rotation_brief_says_why_the_read_back_and_what_is_checked(world, qdir, tmp_path, capsys):
     _rotation_close(world, qdir, tmp_path, capsys)
-    world.coord_release(world.token, by="coordinator")
+    world.coord_release(world.token, by=ROLE_DESK)
     world.launch_end(world.launch.launch_id, "ended", "done")
     d, _ = world.accept_drop("next words", surface="cli")
     lid = world.woken_launch(d.drop_id)
@@ -461,7 +462,7 @@ def test_f2_an_unreadable_stored_body_is_a_refusal_not_a_traceback(world, qdir, 
         hid = _raw_handoff(world, body)
         for flags in ((), ("--md",), ("--json",)):
             err = run(qdir, capsys, "handoff", "show", str(hid), *flags, rc=1).err
-            assert err.startswith("levain coord handoff: ") and f"handoff {hid} body is unreadable: " in err, (
+            assert err.startswith("levain desk handoff: ") and f"handoff {hid} body is unreadable: " in err, (
                 body, err)
             assert "Traceback" not in err
 
@@ -472,12 +473,12 @@ def test_f3_close_with_a_body_that_is_not_an_object_exits_one(world, qdir, tmp_p
     p.write_text(text)
     err = run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(p), "--request-id", "r1",
               "--token", str(world.token), rc=1).err
-    assert err.startswith("levain coord close:") and "not one JSON object" in err
+    assert err.startswith("levain desk close:") and "not one JSON object" in err
     assert sql(world, "SELECT COUNT(*) FROM seam_handoffs") == [(0,)]
 
 
 def test_f4_cap_marks_before_it_collapses_whitespace():
-    from levain.coordinator import seam
+    from levain.desk import seam
 
     for sep, mark in (("\u2028", "\u27e8U+2028\u27e9"), ("\r", "\u27e8U+000D\u27e9"), ("\x85", "\u27e8U+0085\u27e9")):
         assert seam._cap(f"a{sep}b") == f"a{mark}b"
@@ -485,7 +486,7 @@ def test_f4_cap_marks_before_it_collapses_whitespace():
 
 
 def test_f4_detail_label_marks_before_strip_and_collapses_runs():
-    from levain.coordinator import seam
+    from levain.desk import seam
 
     got = seam._detail_label("t", 1, "who", "\u2028lead\x85 tail\u2029", None, True)
     assert got == "t  1  who  \u27e8U+2028\u27e9lead\u27e8U+0085\u27e9 tail\u27e8U+2029\u27e9"
@@ -495,7 +496,7 @@ def test_f4_detail_label_marks_before_strip_and_collapses_runs():
 
 
 def test_f5_verbose_json_carries_the_verbose_lines(world, qdir, tmp_path, capsys):
-    from levain.coordinator import seam
+    from levain.desk import seam
 
     _rotation_close(world, qdir, tmp_path, capsys)
     j = json.loads(run(qdir, capsys, "open", "--token", str(world.token), "--verbose", "--json").out)
@@ -505,12 +506,12 @@ def test_f5_verbose_json_carries_the_verbose_lines(world, qdir, tmp_path, capsys
     assert ro["verbose"] == seam.verbose_lines()
 
 
-def test_f6_a_coordinator_does_not_get_an_ack_for_its_own_handoff(world, qdir, tmp_path, capsys):
+def test_f6_a_desk_does_not_get_an_ack_for_its_own_handoff(world, qdir, tmp_path, capsys):
     _rotation_close(world, qdir, tmp_path, capsys, writer=None)
     assert sql(world, "SELECT writer FROM seam_handoffs") == [(world.launch.session_key,)]
     out = run(qdir, capsys, "open", "--token", str(world.token)).out
     assert "SEAM OPEN" in out and "coord open --ack" not in out
-    assert "a coordinator cannot acknowledge its own handoff" in out
+    assert "a desk cannot acknowledge its own handoff" in out
     assert sql(world, "SELECT COUNT(*) FROM open_builds") == [(0,)] and sql(world, "SELECT COUNT(*) FROM open_deliveries") == [(0,)]
     j = json.loads(run(qdir, capsys, "open", "--token", str(world.token), "--json").out)
     assert j["acknowledgeable"] is False and j["open_id"] is None
@@ -535,12 +536,12 @@ def _rotation_close_default(s, tmp_path, capsys):
 
 
 def test_f8_lv_falls_back_when_the_launch_directory_cannot_be_read(world, monkeypatch):
-    from levain.coordinator import seam_verbs
+    from levain.desk import seam_verbs
 
     def boom(install):
         raise PermissionError("unreadable")
 
-    monkeypatch.setattr(cl, "coordinator_command", lambda install: boom(install) if install else lv())
+    monkeypatch.setattr(cl, "desk_command", lambda install: boom(install) if install else lv())
     assert seam_verbs._lv(None) == lv()
     assert seam_verbs._lv(world.launch) == lv()
 
@@ -561,12 +562,12 @@ def test_g2_a_deeply_nested_close_body_is_a_refusal(world, qdir, tmp_path, capsy
     p.write_text("[" * 60000)
     err = run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(p), "--request-id", "r1",
               "--token", str(world.token), rc=1).err
-    assert err.startswith("levain coord close:") and "Traceback" not in err
+    assert err.startswith("levain desk close:") and "Traceback" not in err
     assert sql(world, "SELECT COUNT(*) FROM seam_handoffs") == [(0,)]
 
 
 def test_g3_a_cut_never_leaves_half_a_mark():
-    from levain.coordinator import seam
+    from levain.desk import seam
 
     mark = "⟨U+0001⟩"
     label = seam._detail_label("t", 1, "w", "a" * 58 + "\x01tail", None, True)
@@ -580,7 +581,7 @@ def test_g3_a_cut_never_leaves_half_a_mark():
 
 
 def test_g5_a_failure_after_the_commit_still_reports_the_close(world, qdir, tmp_path, capsys, monkeypatch):
-    from levain.coordinator import seam_verbs
+    from levain.desk import seam_verbs
 
     def boom(store, token):
         raise sqlite3.OperationalError("database is locked")
@@ -603,7 +604,7 @@ def test_g6_the_close_hint_names_the_store(tmp_path, capsys):
 
 
 def test_g7_an_ack_by_the_handoffs_own_writer_is_refused(world, qdir, tmp_path, capsys):
-    from levain.coordinator import seam_build
+    from levain.desk import seam_build
 
     _rotation_close(world, qdir, tmp_path, capsys, writer=None)       # written by this launch itself
     b = seam_build.build(world, kind="rotation", signal_kind="rotation", signal_key="1", queue_dir=qdir,
@@ -613,7 +614,7 @@ def test_g7_an_ack_by_the_handoffs_own_writer_is_refused(world, qdir, tmp_path, 
     rb.write_text("my own handoff")
     err = run(qdir, capsys, "open", "--ack", str(b.open_id), "--read-back-file", str(rb), "--token",
               str(world.token), rc=1).err
-    assert "a coordinator cannot acknowledge its own handoff" in err
+    assert "a desk cannot acknowledge its own handoff" in err
     assert sql(world, "SELECT COUNT(*) FROM open_acks") == [(0,)]
 
 
@@ -633,7 +634,7 @@ def test_g8_an_existing_launch_build_is_what_open_prints(pending, qdir, capsys):
 
 # --- review fixes (L3 r3) ---------------------------------------------------------------------------------------------
 def test_k1_a_light_open_is_acknowledged_by_the_writer_of_the_handoff_it_mentions(world, qdir, tmp_path, capsys):
-    from levain.coordinator import seam_build
+    from levain.desk import seam_build
 
     run(qdir, capsys, "close", "--kind", "operator", "--body-file", str(body_file(tmp_path)), "--request-id", "r1",
         "--token", str(world.token))
@@ -650,7 +651,7 @@ def test_k1_the_rotation_self_ack_stays_refused_at_both_places(world, qdir, tmp_
     assert seam_open.PREDECESSOR_HANDOFF_SEAMS == ("rotation", "dream")
     _rotation_close(world, qdir, tmp_path, capsys, writer=None)
     out = run(qdir, capsys, "open", "--token", str(world.token)).out                       # the open-time check
-    assert "a coordinator cannot acknowledge its own handoff" in out and "coord open --ack" not in out
+    assert "a desk cannot acknowledge its own handoff" in out and "coord open --ack" not in out
     test_g7_an_ack_by_the_handoffs_own_writer_is_refused(world, qdir, tmp_path, capsys)   # the ack-time check
 
 
@@ -667,7 +668,7 @@ def test_k2_a_handoff_body_nested_past_the_recursion_limit_is_unreadable_not_a_t
 
 def test_r5_a_body_deeper_than_the_bound_is_refused_in_every_format_and_the_writers_shape_fits(world, qdir, tmp_path,
                                                                                                 capsys):
-    from levain.coordinator import seam_verbs
+    from levain.desk import seam_verbs
 
     run(qdir, capsys, "close", "--kind", "rotation", "--body-file", str(body_file(tmp_path)), "--request-id", "r1",
         "--token", str(world.token))
@@ -691,7 +692,7 @@ def test_r5_a_body_deeper_than_the_bound_is_refused_in_every_format_and_the_writ
 
 
 def test_k3_a_literal_bracket_is_ordinary_text_to_the_cut():
-    from levain.coordinator import seam
+    from levain.desk import seam
 
     label = seam._detail_label("t", 1, "w", "\u27e8" + "x" * 80, None, True)
     assert label.count("x") > 40 and label.endswith("…")                      # the cut keeps the text to its limit

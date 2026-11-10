@@ -358,7 +358,7 @@ def check_steering(disposition: Any, target: Any, attention: Any) -> str | None:
 
 def ringing_ref(spore: Mapping[str, Any], open_questions: Any) -> str | None:
     """The band row an OPEN agenda rings in, or None. The one definition of "rings": the spore is an open agenda, its
-    ``germinated`` stamp names a ref that is not a coordinator drop (``dr-``), and that ref is one of ``open_questions``
+    ``germinated`` stamp names a ref that is not a desk drop (``dr-``), and that ref is one of ``open_questions``
     (the ids of the questions still open): an answered, snoozed-away or missing question does not ring. Read from the
     stored record, never a facet, so it holds whatever the List could or could not read."""
     stamp = spore.get("germinated")

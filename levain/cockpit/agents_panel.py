@@ -33,7 +33,7 @@ stored role through :mod:`levain.agents.role`'s own check, on the same snapshot 
 ``unreadable``, the row says so in its body, and it is never read as a kind or as no kind. The panel only labels: the
 split of rows into Jobs and Fleet is the view's (P9b), and the group above is unchanged by the kind.
 
-The "cleared or not" column: a row also says how many of its review cards (the coordinator's ``agent`` feed, P8a) are
+The "cleared or not" column: a row also says how many of its review cards (the desk's ``agent`` feed, P8a) are
 open and how many are cleared, read from the review queue of the dispatch directory the wiring names. A card belongs to
 the agent whose id or name is one of the colon-separated parts of its ``dedupe_key``. An agent with no card says nothing; a queue that cannot be read is said in the panel's
 note and no counts are drawn, so an unreadable queue is never read as "all cleared".
@@ -83,7 +83,7 @@ class AgentsWiring:
     """What the agents panel and its verbs reach: ``store_dir`` the autonomic store directory (None: this levain
     home's), ``cockpit_root`` the cockpit's data root (the authority log, and where a renew appends), ``signing`` a
     callable returning ``(signer_fp, sign)`` of a laptop-presence key (None: this cockpit holds none, so a renew is
-    refused and says so), ``clock`` the instant the panel judges arming at, ``dispatch_dir`` a callable naming the coordinator's directory (None:
+    refused and says so), ``clock`` the instant the panel judges arming at, ``dispatch_dir`` a callable naming the desk's directory (None:
     no review-card counts). A cockpit carries it as
     ``cockpit.agents_wiring``, the ONE place the panel (:func:`agents_discoverer`) and the verbs both read it: a
     cockpit that carries none draws no agents panel, and an agent verb on it refuses (never a default store)."""
@@ -235,12 +235,12 @@ _CARD_SQL = ("SELECT i.dedupe_key, e.op FROM review_items i LEFT JOIN review_eve
 
 def _card_marks(wiring: AgentsWiring) -> tuple[list[tuple[str, bool]], str | None]:
     """``([(dedupe_key, cleared)], why)`` of the ``agent`` review cards: every card with the state its latest event
-    gives it, or no cards and the reason the queue could not be read. No coordinator store is no cards, not a fault."""
+    gives it, or no cards and the reason the queue could not be read. No desk store is no cards, not a fault."""
     if wiring.dispatch_dir is None:
         return [], None
     try:
         from levain.autonomic.durable_sqlite import read_transaction
-        from levain.coordinator.store import CoordStore, StoreAbsent
+        from levain.desk.store import CoordStore, StoreAbsent
 
         directory = wiring.dispatch_dir()
         if directory is None:

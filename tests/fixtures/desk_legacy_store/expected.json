@@ -18,7 +18,7 @@
       "{store}"
     ],
     "exit": 0,
-    "stdout": "{\n  \"lease\": null,\n  \"wake\": \"wake\",\n  \"why\": \"no coordinator holds the lease; the next drop asks for one\",\n  \"setting\": {\n    \"agent\": \"claude\",\n    \"model\": \"sonnet\",\n    \"cwd\": \"/tmp/legacy-fixture\",\n    \"at\": \"<TS>\",\n    \"user_scope\": false\n  },\n  \"launches\": [\n    {\n      \"launch_id\": \"ln-7d3841eef53fad7b17b49d7b3b826a24\",\n      \"session_key\": \"s-0535a798ec2868f4\",\n      \"harness\": \"claude\",\n      \"role\": \"coordinator\",\n      \"threads\": [],\n      \"model\": null,\n      \"cwd\": \"/tmp/legacy-fixture\",\n      \"token\": 2,\n      \"placement\": \"operator-uid\",\n      \"state\": \"expired\",\n      \"until\": \"<TS>\",\n      \"harness_session_id\": null,\n      \"cause\": \"pending past until\",\n      \"at\": \"<TS>\",\n      \"pinned_envelope_id\": null,\n      \"user_scope\": false,\n      \"role_ref\": null,\n      \"spawn\": null\n    }\n  ],\n  \"install_upgrade_pending\": false,\n  \"install_settings_problem\": null\n}\n"
+    "stdout": "{\n  \"lease\": null,\n  \"wake\": \"wake\",\n  \"why\": \"no desk holds the lease; the next drop asks for one\",\n  \"setting\": {\n    \"agent\": \"claude\",\n    \"model\": \"sonnet\",\n    \"cwd\": \"/tmp/legacy-fixture\",\n    \"at\": \"<TS>\",\n    \"user_scope\": false\n  },\n  \"launches\": [\n    {\n      \"launch_id\": \"ln-7d3841eef53fad7b17b49d7b3b826a24\",\n      \"session_key\": \"s-0535a798ec2868f4\",\n      \"harness\": \"claude\",\n      \"role\": \"coordinator\",\n      \"threads\": [],\n      \"model\": null,\n      \"cwd\": \"/tmp/legacy-fixture\",\n      \"token\": 2,\n      \"placement\": \"operator-uid\",\n      \"state\": \"expired\",\n      \"until\": \"<TS>\",\n      \"harness_session_id\": null,\n      \"cause\": \"pending past until\",\n      \"at\": \"<TS>\",\n      \"pinned_envelope_id\": null,\n      \"user_scope\": false,\n      \"role_ref\": null,\n      \"spawn\": null\n    }\n  ],\n  \"install_upgrade_pending\": false,\n  \"install_settings_problem\": null\n}\n"
   },
   "review": {
     "argv": [
@@ -40,6 +40,6 @@
       "{store}"
     ],
     "exit": 0,
-    "stdout": "lease: nobody holds the coordinator role\nnext drop: wake (no coordinator holds the lease; the next drop asks for one)\nuser layer: off (project settings only)\n  ln-7d3841eef53fad7b17b49d7b3b826a24  coordinator  claude  expired (pending past until)  session s-0535a798ec2868f4  asked <TS>\n"
+    "stdout": "lease: nobody holds the desk role\nnext drop: wake (no desk holds the lease; the next drop asks for one)\nuser layer: off (project settings only)\n  ln-7d3841eef53fad7b17b49d7b3b826a24  coordinator  claude  expired (pending past until)  session s-0535a798ec2868f4  asked <TS>\n"
   }
 }

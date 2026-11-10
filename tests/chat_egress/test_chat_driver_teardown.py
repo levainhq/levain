@@ -389,7 +389,7 @@ def test_run_a_real_launch_whose_stop_egress_fails_once(tmp_path, monkeypatch):
     end() is incomplete, the retry stops the real egress and sends no signal to the reaped CLI leader."""
     from levain.chat_egress import classify, keys
     from levain.chat_egress import decider as dm
-    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.desk.envelopes import EnvelopeStore
 
     from .decider_rig import Desk, Live, NoStore
     from .fixtures import env as envmod

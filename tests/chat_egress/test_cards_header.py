@@ -18,7 +18,7 @@ from levain.chat_egress.cards import file_card
 from levain.chat_egress.lifecycle import Verdict
 from levain.cockpit import Cockpit
 from levain.consent.queue import ConsentQueue
-from levain.coordinator.store import CoordStore
+from levain.desk.store import CoordStore
 from levain.web_server import _ConsentReader
 from tests.chat_egress.test_cards_states_page import _card, _launch
 from tests.chat_egress.test_records import GET

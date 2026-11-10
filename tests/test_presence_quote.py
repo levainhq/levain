@@ -14,6 +14,7 @@ import pytest
 from levain.consent import band
 from levain.webpush import cli, intent, presence, quote
 from levain.webpush.presence import PresenceError, describe, read_log, read_word, set_word
+from levain.desk.legacy import ROLE_DESK
 
 NOW = time.time()
 SEAT = {"agent": "claude_code", "session": "abc12345-seat", "role": "seat"}
@@ -88,8 +89,8 @@ def test_codex_turns_are_read_in_both_rollout_formats_and_an_injected_user_item_
     assert not quote.match_transcript(tx, "gemini", "heading to dinner", now=NOW).verified
 
 
-@pytest.mark.parametrize("his_word,setter_word,role", [("quiet", "away", "seat"), ("away", "sleep", "coordinator"),
-                                                       ("sleep", "quiet", "coordinator")])
+@pytest.mark.parametrize("his_word,setter_word,role", [("quiet", "away", "seat"), ("away", "sleep", ROLE_DESK),
+                                                       ("sleep", "quiet", ROLE_DESK)])
 def test_an_invented_quote_never_replaces_a_word_he_set_himself(tmp_path, his_word, setter_word, role):
     set_word(tmp_path, his_word, now=NOW - 3000)
     on_file = (tmp_path / "webpush" / intent.FILE_NAME).read_text()
@@ -107,8 +108,8 @@ def test_a_real_quote_replaces_his_word_only_if_he_typed_it_after_that_word(tmp_
     monkeypatch.setattr(band, "agent_process", lambda: "claude_code")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID)
     monkeypatch.setattr(quote, "locate_transcript", lambda agent, session, roots: tx)
-    from levain.coordinator import first_reader
-    monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: False)
+    from levain.desk import first_reader
+    monkeypatch.setattr(first_reader, "is_desk_session", lambda directory, sess: False)
 
     def run(word="away", said="I am on the train"):
         return cli._word(argparse.Namespace(queue_dir=tmp_path, word=word, duration=None, said=said, drop=None))
@@ -135,7 +136,7 @@ def test_with_no_transcript_a_setter_is_unverified_but_sets_over_no_word_or_a_re
     assert set_word(tmp_path, "away", by={**SEAT, "session": "other-seat-1"}, said="heading out", now=NOW + 2)["word"] == "away"
 
 
-def test_a_coordinator_proves_its_quote_with_the_drop_it_names_and_a_seat_may_not(tmp_path, monkeypatch, capsys):
+def test_a_desk_proves_its_quote_with_the_drop_it_names_and_a_seat_may_not(tmp_path, monkeypatch, capsys):
     db = sqlite3.connect(tmp_path / "dispatch.db")
     db.execute("CREATE TABLE drops (drop_id TEXT PRIMARY KEY, words TEXT, received_at TEXT)")
     db.execute("INSERT INTO drops VALUES ('d-1', 'closing my eyes now, hold everything until morning', ?)", (_iso(NOW - 600),))
@@ -150,13 +151,13 @@ def test_a_coordinator_proves_its_quote_with_the_drop_it_names_and_a_seat_may_no
     monkeypatch.setattr(band, "agent_process", lambda: "claude_code")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "def67890-coord")
     monkeypatch.setattr(quote, "locate_transcript", lambda agent, session, roots: None)
-    from levain.coordinator import first_reader
-    monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: True)
+    from levain.desk import first_reader
+    monkeypatch.setattr(first_reader, "is_desk_session", lambda directory, sess: True)
     set_word(tmp_path, "sleep", now=NOW - 3000)   # his own
     ns = argparse.Namespace(queue_dir=tmp_path, word="quiet", duration=None, said="hold everything until morning", drop="d-1")
     assert cli._word(ns) == 0 and read_word(tmp_path)["verified"] is True
-    monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: False)
-    assert cli._word(ns) == 2 and "--drop is the coordinator's" in capsys.readouterr().out
+    monkeypatch.setattr(first_reader, "is_desk_session", lambda directory, sess: False)
+    assert cli._word(ns) == 2 and "--drop is the desk's" in capsys.readouterr().out
 
 
 def test_the_transcript_is_found_by_its_session_record_else_by_the_session_id(tmp_path, monkeypatch):
@@ -198,8 +199,8 @@ def test_a_lookup_that_fails_is_an_unverified_quote_never_a_traceback(tmp_path, 
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID)
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    from levain.coordinator import first_reader
-    monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: False)
+    from levain.desk import first_reader
+    monkeypatch.setattr(first_reader, "is_desk_session", lambda directory, sess: False)
     q = tmp_path / "q"
     q.mkdir()
     gone = tmp_path / "cwd-gone"

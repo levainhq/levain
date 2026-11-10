@@ -9,7 +9,7 @@ from pathlib import Path
 
 from levain.cockpit import room as cockpit_room
 from levain.cockpit import threads
-from levain.coordinator.chat import TimelineRow
+from levain.desk.chat import TimelineRow
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_room import _serve_room, w  # noqa: F401  (fixture)
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
@@ -378,7 +378,7 @@ def test_a_read_the_rooms_own_hook_refused_is_drawn_as_the_same_refusal_and_neve
     """1105-49: the vendor wraps a hook's deny as ``PreToolUse:<Tool> hook error: <reason>`` (the recorded run,
     ``tests/fixtures/claude_stream/room_hook_denied_read.jsonl``); the page reads it from its words and draws the plain
     sentence, as for the vendor's own refusals. A hook that said something else, or on another tool, is a failure."""
-    from levain.coordinator.claude_session import ROOM_READ_REFUSAL
+    from levain.desk.claude_session import ROOM_READ_REFUSAL
     bodies = [f"PreToolUse:{t} hook error: {ROOM_READ_REFUSAL}" for t in ("Read", "Grep", "Glob")]
     bodies += [f"PreToolUse:Bash hook error: {ROOM_READ_REFUSAL}", "PreToolUse:Read hook error: some other hook said no"]
     g = _lines(tmp_path, w, _results(*bodies), 5)
@@ -393,7 +393,7 @@ def test_another_hooks_reason_that_opens_like_the_rooms_sentence_is_drawn_as_it_
     """L3 r1 codex LOW: the page read only the sentence's first clause, unanchored, so another hook's deny that opened
     the same way was replaced by the room's refusal text and its own words were lost. Only the whole sentence, in the
     recorded wrapper and with nothing after it, is the room's refusal."""
-    from levain.coordinator.claude_session import ROOM_READ_REFUSAL
+    from levain.desk.claude_session import ROOM_READ_REFUSAL
     first = ROOM_READ_REFUSAL.split(". ")[0] + "."
     bodies = [f"PreToolUse:Read hook error: {first} Another hook's own, important detail.",
               f"PreToolUse:Read hook error: {ROOM_READ_REFUSAL}\nand a second line",

@@ -49,7 +49,7 @@ READ-ONLY READER: `EgressReader` is the cockpit card's view of one dispatch stor
 1025+6). Every read opens `dispatch.db` with sqlite `mode=ro`: it never creates the file, the table or its triggers,
 and never writes. It reads one request's rows as `settled` does, and whether that request is still IN FLIGHT.
 
-The schema lives here, not in `CHAT_SCHEMA` (plan ruling P-7): `CHAT_SCHEMA` (`levain/coordinator/chat.py`) is on the
+The schema lives here, not in `CHAT_SCHEMA` (plan ruling P-7): `CHAT_SCHEMA` (`levain/desk/chat.py`) is on the
 unmerged CH-D1a branch, not on this base. `EGRESS_SCHEMA` is one tuple so it folds into it whole.
 """
 
@@ -70,7 +70,7 @@ from levain.chat_egress import wire
 from levain.chat_egress.advert import CT_ABSENT, CT_ADVERTISEMENT, CT_OTHER
 from levain.chat_egress.lifecycle import Effect, Failure, Settled, Verdict, settle
 from levain.contracts.canon import canonical
-from levain.coordinator.store import _append_only, _in, next_gseq
+from levain.desk.store import _append_only, _in, next_gseq
 
 __all__ = ["ATTEMPT", "Attach", "Attempt", "CONTENT_TYPE_CLASSES", "CT_ABSENT", "CT_ADVERTISEMENT", "CT_OTHER",
            "EGRESS_SCHEMA", "ENDED", "EgressReader", "EgressRecordError", "EgressRecords", "EgressRow", "FAILED", "KINDS",
@@ -284,12 +284,12 @@ def _settled(got: Sequence[EgressRow]) -> Settled | None:
 
 
 _SELECT = f"SELECT {', '.join(_COLUMNS)} FROM chat_egress_events WHERE launch_id = ?"
-#: the launch states (`levain.coordinator.lease.LAUNCH_KINDS`) a launch is still running in
+#: the launch states (`levain.desk.lease.LAUNCH_KINDS`) a launch is still running in
 _LIVE_LAUNCH = ("pending", "active")
 
 
 class EgressRecords:
-    """`chat_egress_events` beside a coordinator store's tables, in its `dispatch.db`. `opener` is that store (any
+    """`chat_egress_events` beside a desk store's tables, in its `dispatch.db`. `opener` is that store (any
     object with its `_connect()` and `_stamp()`, a `CoordStore` in use): this class adds its table to the file the
     opener owns and never opens the file itself. Every write is one `BEGIN IMMEDIATE` with the clock read under it.
 

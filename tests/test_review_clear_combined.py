@@ -9,8 +9,9 @@ from pathlib import Path
 
 import pytest
 
-from levain.coordinator import review
-from levain.coordinator.store import CoordStore, StoreAbsent
+from levain.desk import review
+from levain.desk.store import CoordStore, StoreAbsent
+from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK
 
 
 def _dir(tmp_path: Path, name: str = "consent") -> Path:
@@ -22,8 +23,8 @@ def _dir(tmp_path: Path, name: str = "consent") -> Path:
 # review_events as session 1 (2338dd21, the last schema before R4) made it, verbatim
 _S1_EVENTS = ("CREATE TABLE IF NOT EXISTS review_events (item_id TEXT NOT NULL REFERENCES review_items(item_id), "
               "seq INTEGER NOT NULL, op TEXT NOT NULL CHECK (op IN ('cleared', 'reopened')), "
-              "mode TEXT NOT NULL CHECK (mode IN ('manual', 'fresh', 'coordinator')), "
-              "by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator')), "
+              f"mode TEXT NOT NULL CHECK (mode IN ('manual', 'fresh', {SQL_ROLE_DESK})), "
+              f"by TEXT NOT NULL CHECK (by IN ('operator', {SQL_ROLE_DESK})), "
               "at TEXT NOT NULL, PRIMARY KEY (item_id, seq))")
 
 
@@ -48,7 +49,7 @@ def _strip_s0(path: Path) -> None:
     """Make the file what a store made before C15's S0 holds: no ``gseq`` column, index or trigger on any table the S0
     migration reaches except ``replies`` (which had its own, CH-D1 §2.8), and no ``gseq_migration_bounds``. The helper
     below builds its "old" store with the current code, whose ensure path adds them; every row is kept as it was."""
-    from levain.coordinator.store import GSEQ_TABLES
+    from levain.desk.store import GSEQ_TABLES
 
     conn = sqlite3.connect(path, isolation_level=None)
     try:
@@ -64,9 +65,9 @@ def _strip_s0(path: Path) -> None:
 
 
 def _pre_r4_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, list[review.Item]]:
-    """A dispatch.db made with session 1's review schema, holding items and events (clears, a reopen, the coordinator's
+    """A dispatch.db made with session 1's review schema, holding items and events (clears, a reopen, the desk's
     own clear), then COPIED (SQLite's backup) to a fresh directory: what an operator upgrading from it holds."""
-    from levain.coordinator.lease import LEASE_SCHEMA  # noqa: F401  (the lease the coordinator clear is fenced by)
+    from levain.desk.lease import LEASE_SCHEMA  # noqa: F401  (the lease the desk clear is fenced by)
 
     s1 = tuple(_S1_EVENTS if s.startswith("CREATE TABLE IF NOT EXISTS review_events ") else s
                for s in review.REVIEW_SCHEMA)
@@ -78,16 +79,16 @@ def _pre_r4_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path
         a, _ = review.file_item(store, "seat", {"text": "a"}, dedupe_key="a")
         b, _ = review.file_item(store, "seat", {"text": "b"}, dedupe_key="b")
         c, _ = review.file_item(store, "doubt", {"text": "c"}, dedupe_key="c", authority_relevant=True)
-        # d is filed BY the coordinator (a doubt, with the lease token): the coordinator's mode now clears only an item
-        # the coordinator filed, so an old-schema store holding a coordinator clear needs d to be the coordinator's own.
+        # d is filed BY the desk (a doubt, with the lease token): the desk's mode now clears only an item
+        # the desk filed, so an old-schema store holding a desk clear needs d to be the desk's own.
         # The fixture's purpose is unchanged: an OLD-schema store with every kind of event row.
         tok = store.coord_take()
-        d, _ = review.file_item(store, "doubt", {"text": "d"}, dedupe_key="d", by="coordinator", token=tok)
+        d, _ = review.file_item(store, "doubt", {"text": "d"}, dedupe_key="d", by=ROLE_DESK, token=tok)
         review.clear_item(store, a.item_id)
         review.clear_item(store, b.item_id, mode="fresh")
         review.reopen_item(store, b.item_id)
         review.clear_item(store, c.item_id)
-        review.clear_item(store, d.item_id, mode="coordinator", token=tok)
+        review.clear_item(store, d.item_id, mode=ROLE_DESK, token=tok)
         _strip_s0(store.path)
         assert _snapshot(store.path)["columns"] == ["item_id", "seq", "op", "mode", "by", "at"]
     copy_dir = _dir(tmp_path, "upgraded")
@@ -140,7 +141,7 @@ def test_any_writer_opening_a_pre_r4_store_migrates_it_and_keeps_every_row(tmp_p
 
 def test_the_migration_is_one_transaction_with_the_rest_of_the_schema(tmp_path, monkeypatch) -> None:
     """A failure after the rebuild, inside the same ensure-schema transaction, leaves the store as it was."""
-    import levain.coordinator.store as store_mod
+    import levain.desk.store as store_mod
 
     d, _items = _pre_r4_store(tmp_path, monkeypatch)
     before = _snapshot(d / "dispatch.db")
@@ -167,7 +168,7 @@ def test_a_display_reads_a_pre_r4_store_before_any_writer_migrates_it(tmp_path, 
 def test_the_laptop_clear_brings_an_older_store_current_and_makes_none(tmp_path) -> None:
     """complement LOW (fix r1 verify): a store missing a table this levain adds (here review_marks, as a store from
     before it held) is brought current by the clear's own writer, not refused as absent."""
-    from levain.coordinator.envelopes import EnvelopeStore
+    from levain.desk.envelopes import EnvelopeStore
 
     d = _dir(tmp_path)
     item, _ = review.file_item(EnvelopeStore(d), "seat", {"text": "x"}, dedupe_key="a")
@@ -187,7 +188,7 @@ def test_the_laptop_clear_brings_an_older_store_current_and_makes_none(tmp_path)
 def test_the_migration_has_one_caller_the_stores_ensure_path() -> None:
     import inspect
 
-    import levain.coordinator.store as store_mod
+    import levain.desk.store as store_mod
 
     assert inspect.getsource(store_mod).count("migrate_events(") == 1
     assert inspect.getsource(store_mod.CoordStore._ensure).count("migrate_events(conn)") == 1
@@ -215,7 +216,7 @@ def test_a_signed_clear_or_its_request_makes_no_store(tmp_path) -> None:
 
 # --- fix-r1 ruling 3: a raised review verb is refused with the passkey path named -----------------------------------
 
-from levain.cockpit.coordinator_panels import REVIEW_ID  # noqa: E402
+from levain.cockpit.desk_panels import REVIEW_ID  # noqa: E402
 from tests.cockpit_authority_rig import link  # noqa: E402
 from tests.test_cockpit_k2a import _install  # noqa: E402
 from tests.test_cockpit_k2b_broker import Key  # noqa: E402
@@ -247,7 +248,7 @@ def test_a_review_verb_a_signed_policy_raises_is_refused_on_the_laptop_never_a_p
             st, out, _ = _call(port, "POST", "/cockpit/verb", {**req, "confirm": True, "idempotency_key": "k-1", **extra},
                                token=tok, headers=PROXY)
             assert (st, out.get("error")) == (403, "review_raised") and "pending_id" not in out, out
-            assert "T2" in out["message"] and f"levain coord review {verb.split('_')[1]}" in out["message"], out
+            assert "T2" in out["message"] and f"levain desk review {verb.split('_')[1]}" in out["message"], out
             if verb == "review_clear":
                 assert "passkey" in out["message"], out
     assert review.get_item(store, item.item_id).state == ("open" if verb == "review_clear" else "cleared")
@@ -258,7 +259,7 @@ def test_a_review_verb_a_signed_policy_raises_is_refused_on_the_laptop_never_a_p
 def test_the_phone_queue_draws_an_item_whose_body_is_not_an_object(tmp_path) -> None:
     from datetime import datetime, timezone
 
-    from levain.coordinator.phone import CoordPhone
+    from levain.desk.phone import CoordPhone
 
     store = CoordStore(_dir(tmp_path))
     review.file_item(store, "seat", {"text": "fine"}, dedupe_key="a")
@@ -276,7 +277,7 @@ def test_the_phone_queue_draws_an_item_whose_body_is_not_an_object(tmp_path) -> 
 def test_an_agent_card_has_its_text_on_the_phone_in_the_panels_order(tmp_path) -> None:
     from datetime import datetime, timezone
 
-    from levain.coordinator.phone import CoordPhone
+    from levain.desk.phone import CoordPhone
 
     store = CoordStore(_dir(tmp_path))
     review.file_item(store, "agent", {"reason": "why", "his": "his words"}, dedupe_key="a1")
@@ -293,8 +294,8 @@ def test_an_agent_card_has_its_text_on_the_phone_in_the_panels_order(tmp_path) -
 def test_the_panel_and_the_phone_take_an_items_fields_from_one_helper() -> None:
     import inspect
 
-    import levain.cockpit.coordinator_panels as cp
-    import levain.coordinator.phone as ph
+    import levain.cockpit.desk_panels as cp
+    import levain.desk.phone as ph
 
     for mod in (cp, ph):
         src = inspect.getsource(mod)
@@ -305,8 +306,8 @@ def test_the_panel_and_the_phone_take_an_items_fields_from_one_helper() -> None:
 def test_a_blank_text_and_a_his_only_body_read_the_same_in_the_panel_row_and_the_phone(tmp_path) -> None:
     from datetime import datetime, timezone
 
-    from levain.cockpit.coordinator_panels import _review_row
-    from levain.coordinator.phone import CoordPhone
+    from levain.cockpit.desk_panels import _review_row
+    from levain.desk.phone import CoordPhone
 
     store = CoordStore(_dir(tmp_path))
     review.file_item(store, "agent", {"text": "", "summary": "s"}, dedupe_key="b1")

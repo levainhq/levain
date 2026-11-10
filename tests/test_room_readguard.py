@@ -1,4 +1,4 @@
-"""The room's own read-guard hook (``levain.coordinator.room_readguard``, levain 44, key 1105-49): the sentence the room's
+"""The room's own read-guard hook (``levain.desk.room_readguard``, levain 44, key 1105-49): the sentence the room's
 model gets for a read outside its folder. The recorded real run (``fixtures/claude_stream/room_hook_denied_read.jsonl``, a
 claude 2.1.319 turn with the real hook through ``--settings`` under ``--setting-sources user``) fixed the wrapper text and
 the frames; a LIVE run of the same turn is gated by ``LEVAIN_LIVE_CLAUDE=1`` (one short subscription turn, never run by
@@ -20,12 +20,12 @@ from pathlib import Path
 
 import pytest
 
-from levain.coordinator import room_readguard
-from levain.coordinator.chat_tripwires import TripwireWindow
-from levain.coordinator.claude_session import ROOM_READ_REFUSAL, room_argv, room_hook_command, room_settings_json
-from levain.coordinator.room_launch import room_tripwire_context
-from levain.coordinator.room_readguard import EXEMPT_ENV, decide, main
-from tests.test_coordinator_claude_session import make
+from levain.desk import room_readguard
+from levain.desk.chat_tripwires import TripwireWindow
+from levain.desk.claude_session import ROOM_READ_REFUSAL, room_argv, room_hook_command, room_settings_json
+from levain.desk.room_launch import room_tripwire_context
+from levain.desk.room_readguard import EXEMPT_ENV, decide, main
+from tests.test_desk_claude_session import make
 
 FIXTURE = Path(__file__).with_name("fixtures") / "claude_stream" / "room_hook_denied_read.jsonl"
 ROOM_VIEW = Path(room_readguard.__file__).resolve().parents[1] / "templates" / "web" / "room_view.js"

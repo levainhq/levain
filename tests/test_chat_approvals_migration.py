@@ -14,10 +14,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from levain.coordinator import chat
-from levain.coordinator.chat import ChatStore
-from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import CoordError, Part
+from levain.desk import chat
+from levain.desk.chat import ChatStore
+from levain.desk.envelopes import EnvelopeStore
+from levain.desk.store import CoordError, Part
 
 from tests import _chat_schema_snapshots as snap
 
@@ -41,7 +41,7 @@ SHAPES = {"v0.11.25": snap.SCHEMA_V0_11_25, "main-f75acbc7": snap.SCHEMA_MAIN_F7
 
 
 def build_released_store(tmp_path, shape):
-    """A queue dir whose dispatch.db holds the coordinator tables of this checkout and the chat tables of ``shape``,
+    """A queue dir whose dispatch.db holds the desk tables of this checkout and the chat tables of ``shape``,
     with one row in each chat table, written by raw SQL (a released shape has no writer in this checkout)."""
     qdir = tmp_path / "consent"
     qdir.mkdir(mode=0o700)
@@ -132,7 +132,7 @@ def test_released_store_opens_keeps_rows_and_gains_the_approval_branch(tmp_path,
 
 @pytest.mark.parametrize("shape", list(SHAPES))
 def test_migrated_store_takes_approval_rows_and_shows_them(tmp_path, shape, capsys):
-    from levain.coordinator import chat_approvals as ca
+    from levain.desk import chat_approvals as ca
 
     qdir, thread, launch = build_released_store(tmp_path, shape)
     run_show(qdir, thread, capsys)
@@ -187,7 +187,7 @@ def test_read_only_opener_migrates_nothing_and_still_reads_an_older_store(tmp_pa
         assert hashlib.sha256(db.read_bytes()).hexdigest() == digest
         assert "chat_approvals" not in names(db)
         cs = ChatStore(EnvelopeStore(qdir, clock=Clock()))
-        from levain.coordinator.chat_approvals import ambiguous_stops
+        from levain.desk.chat_approvals import ambiguous_stops
 
         assert cs._read(lambda conn: ambiguous_stops(conn, _launch)) == []         # a missing table is "none", not a crash
     finally:

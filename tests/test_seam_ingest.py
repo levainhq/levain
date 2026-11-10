@@ -1,6 +1,6 @@
 """C15 S4: a verified away leave opens the operator's return, ``coord open --light`` and its gap rule, and the Missing
 close row. Every expectation was first read from a real run on a scratch store and a scratch cockpit (an active
-coordinator launch, a signed `consent away on` / `off`), printed in full by the lane's run script."""
+desk launch, a signed `consent away on` / `off`), printed in full by the lane's run script."""
 from __future__ import annotations
 
 import os
@@ -13,8 +13,8 @@ import pytest
 import levain.authority as auth
 from levain.authority import ReplayCache
 from levain.cli import main
-from levain.coordinator import seam, seam_arrival, seam_build, seam_open
-from levain.coordinator.store import CoordStore
+from levain.desk import seam, seam_arrival, seam_build, seam_open
+from levain.desk.store import CoordStore
 from tests.test_consent_away import _cockpit, _queue
 from tests.test_seam_verbs import _activate, _body, body_file
 
@@ -25,7 +25,7 @@ def _home(tmp_path, monkeypatch):
 
 
 class World:
-    """A coordinator store beside its consent queue and a real cockpit with one enrolled laptop key."""
+    """A desk store beside its consent queue and a real cockpit with one enrolled laptop key."""
 
     def __init__(self, tmp_path, capsys, starter=False):
         (tmp_path / "ck").mkdir()

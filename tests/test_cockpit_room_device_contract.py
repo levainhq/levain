@@ -26,6 +26,7 @@ from levain.web_server import make_server
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_room import World
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
+from levain.desk.legacy import ROLE_DESK
 
 OWNER_KEY = "room-contract-owner-key"          # the `browser` surface token: the owner key, honoured on the box only
 H = "X-Levain-Write-Token"
@@ -110,7 +111,7 @@ def test_the_owner_of_a_phone_line_is_phone_and_the_device_id_whatever_the_body_
     with _serve(tmp_path, w) as port:
         dev, tok = _pair(port)
         _other, _t2 = _pair(port, "ipad")
-        st, _b = _call(port, "POST", SEND, w.body("hello", author_kind="coordinator", author_surface="cockpit",
+        st, _b = _call(port, "POST", SEND, w.body("hello", author_kind=ROLE_DESK, author_surface="cockpit",
                                                   client_id="phone:someone-else", owner="phone:someone-else"), token=tok)
         assert st == 200      # main IGNORES an author field in the body (it is not read), it does not refuse the line
     # (author_kind, author_surface, client_id): surface `phone`, client the paired device, kind operator

@@ -1,4 +1,4 @@
-"""C8: the coordinator drafts team-ledger entries; only the operator's promote signs one.
+"""C8: the desk drafts team-ledger entries; only the operator's promote signs one.
 
 Each test replays a failure reproduced in project_memory 1021-18/coord/c8_probe_run.txt: a session Levain launched ran
 `levain team record` and the ledger took it as the human's."""
@@ -9,8 +9,9 @@ import subprocess
 import pytest
 
 from levain.cli import main as levain_main
-from levain.coordinator import teamdrafts as T
-from levain.coordinator.store import CoordError, CoordStore
+from levain.desk import teamdrafts as T
+from levain.desk.store import CoordError, CoordStore
+from levain.desk.legacy import JSON_ROLE_DESK, LEGACY_HOME_NAME, ROLE_DESK
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None or shutil.which("ssh-keygen") is None
                                 or os.name != "posix", reason="needs git + ssh-keygen + POSIX")
@@ -48,15 +49,15 @@ def world(tmp_path, monkeypatch):
 
 def test_a_draft_reaches_the_ledger_only_by_the_operators_promote(world, monkeypatch, capsys):
     ana, qdir, store, token = world
-    d = T.add_draft(store, "decision", words="use the queue", kind="practice", paths=["a.py"], by="coordinator",
+    d = T.add_draft(store, "decision", words="use the queue", kind="practice", paths=["a.py"], by=ROLE_DESK,
                     token=token)
-    assert d["state"] == "drafted" and d["drafted_by"] == "coordinator"
-    with pytest.raises(CoordError):          # the lease fences a coordinator's draft
-        T.add_draft(store, "decision", words="x", kind="practice", by="coordinator", token=token + 1)
+    assert d["state"] == "drafted" and d["drafted_by"] == ROLE_DESK
+    with pytest.raises(CoordError):          # the lease fences a desk's draft
+        T.add_draft(store, "decision", words="x", kind="practice", by=ROLE_DESK, token=token + 1)
     before = git("rev-parse", "levain-team-ledger", cwd=ana)
     args = ["team", "draft", "promote", d["draft_id"], "--yes", "--no-push", "--repo", str(ana), "--queue-dir", str(qdir)]
-    monkeypatch.chdir(_coordinator_workspace(ana.parent))       # inside the coordinator's workspace
-    assert levain_main(args) == 1                               # the coordinator's door refuses it
+    monkeypatch.chdir(_desk_workspace(ana.parent))       # inside the desk's workspace
+    assert levain_main(args) == 1                               # the desk's door refuses it
     assert git("rev-parse", "levain-team-ledger", cwd=ana) == before and T.get_draft(store, d["draft_id"])["state"] == "drafted"
     monkeypatch.chdir(ana.parent)                               # the operator's own terminal
     assert levain_main(args) == 0
@@ -69,11 +70,11 @@ def test_a_draft_reaches_the_ledger_only_by_the_operators_promote(world, monkeyp
         T.mark_promoted(store, d["draft_id"], "x-1", {"x-1": agent})
 
 
-def _coordinator_workspace(root):
-    """A directory the coordinator install rendered: its ``.levain/config.json`` records the role."""
-    ws = root / "coordinator"
+def _desk_workspace(root):
+    """A directory the desk install rendered: its ``.levain/config.json`` records the role."""
+    ws = root / LEGACY_HOME_NAME
     (ws / ".levain").mkdir(parents=True, exist_ok=True)
-    (ws / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    (ws / ".levain" / "config.json").write_text(f'{{"role": {JSON_ROLE_DESK}}}\n')
     return ws
 
 
@@ -121,17 +122,17 @@ def test_a_reserved_draft_is_signed_only_by_its_owner(world, tmp_path, monkeypat
 def test_a_launched_session_keeps_to_the_door_in_every_tree(world, tmp_path, monkeypatch, capsys):
     """Reproduced (door/door_probe_BEFORE.txt): a launched session's `team record` signed into the ledger as the
     human, and `coord take --queue-dir <empty dir>` took the role, because the door looked at three trees only and
-    only in the store the command named. Default-deny now, inside the coordinator's workspace."""
+    only in the store the command named. Default-deny now, inside the desk's workspace."""
     ana, qdir, store, token = world
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path))            # qdir is the default consent dir, as installed
-    monkeypatch.chdir(_coordinator_workspace(tmp_path))
+    monkeypatch.chdir(_desk_workspace(tmp_path))
     before = git("rev-parse", "levain-team-ledger", cwd=ana)
     for argv in (["team", "record", "decision", "--kind", "practice", "--words", "w", "--repo", str(ana), "--no-push"],
                  ["envelope", "list", "--thread", "th-x"],
                  ["coord", "take", "--queue-dir", str(tmp_path / "empty")],
                  ["team", "draft", "add", "finding", "--summary", "s", "--by", "operator"]):
         assert levain_main(argv) == 1, argv
-        assert "the coordinator's workspace" in capsys.readouterr().err, argv
+        assert "the desk's workspace" in capsys.readouterr().err, argv
     assert git("rev-parse", "levain-team-ledger", cwd=ana) == before
     assert levain_main(["thread", "list"]) == 0
     assert levain_main(["team", "draft", "add", "finding", "--summary", "s", "--token", str(token)]) == 0
@@ -169,9 +170,9 @@ def test_a_draft_holding_hidden_text_is_refused_and_an_older_one_shows_escaped(w
     assert T.get_draft(store, d["draft_id"])["state"] == "drafted"
 
 
-def test_no_coordinator_path_reaches_the_signer(world, tmp_path, monkeypatch, capsys):
+def test_no_desk_path_reaches_the_signer(world, tmp_path, monkeypatch, capsys):
     """C8's never-sign property, as an assertion: every signing entry of the ledger records a call and raises, and the
-    coordinator does everything its door lets it do about a draft. A draft path that ever grew a call to the signer
+    desk does everything its door lets it do about a draft. A draft path that ever grew a call to the signer
     fails here, not in a review. The calls list is the assertion (a broad except between the stub and the test cannot
     hide it); the operator-side control at the end proves the stubs fire when the signer is reached."""
     from levain.team.transport import GitLedger
@@ -182,14 +183,14 @@ def test_no_coordinator_path_reaches_the_signer(world, tmp_path, monkeypatch, ca
     def reached(name):
         def boom(*a, **k):
             calls.append(name)
-            raise AssertionError(f"a coordinator path reached the signer: GitLedger.{name}")
+            raise AssertionError(f"a desk path reached the signer: GitLedger.{name}")
         return boom
     for name in ("append", "write_canon", "update_counted", "init", "join"):
         monkeypatch.setattr(GitLedger, name, reached(name))
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path))
-    monkeypatch.chdir(_coordinator_workspace(tmp_path))
+    monkeypatch.chdir(_desk_workspace(tmp_path))
     before = git("rev-parse", "levain-team-ledger", cwd=ana)
-    d = T.add_draft(store, "decision", words="use the queue", kind="practice", paths=["a.py"], by="coordinator",
+    d = T.add_draft(store, "decision", words="use the queue", kind="practice", paths=["a.py"], by=ROLE_DESK,
                     token=token)
     assert T.get_draft(store, d["draft_id"])["state"] == "drafted" and T.list_drafts(store)
     assert levain_main(["team", "draft", "add", "finding", "--summary", "s", "--token", str(token)]) == 0
@@ -201,11 +202,11 @@ def test_no_coordinator_path_reaches_the_signer(world, tmp_path, monkeypatch, ca
                  ["team", "draft", "promote", d["draft_id"], "--resume", "--yes", "--repo", str(ana)],
                  ["team", "record", "decision", "--kind", "practice", "--words", "w", "--repo", str(ana)]):
         assert levain_main(argv) == 1, argv
-    T.withdraw_draft(store, d["draft_id"], by="coordinator", token=token)
+    T.withdraw_draft(store, d["draft_id"], by=ROLE_DESK, token=token)
     assert calls == []
     assert git("rev-parse", "levain-team-ledger", cwd=ana) == before
     assert "reached the signer" not in capsys.readouterr().err
-    # positive control: the operator's own promote, outside the coordinator workspace, reaches a stub
+    # positive control: the operator's own promote, outside the desk workspace, reaches a stub
     op = T.add_draft(store, "decision", words="operator draft", kind="practice", paths=["a.py"], by="operator")
     monkeypatch.chdir(ana.parent)
     try:
@@ -229,8 +230,8 @@ def test_the_draft_module_cannot_import_the_ledger_writer():
         if isinstance(n, ast.Import):
             named |= {a.name for a in n.names}
         elif isinstance(n, ast.ImportFrom):
-            if n.level:                      # relative: `..team`, `. import team` resolve against levain.coordinator
-                base = ["levain", "coordinator"][: max(0, 2 - (n.level - 1))]
+            if n.level:                      # relative: `..team`, `. import team` resolve against levain.desk
+                base = ["levain", ROLE_DESK][: max(0, 2 - (n.level - 1))]
                 mod = ".".join(base + ([n.module] if n.module else []))
             else:
                 mod = n.module or ""

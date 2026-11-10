@@ -8,12 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from levain.coordinator import envelope as env
-from levain.coordinator.phone import COCKPIT_DEVICE, CoordRefused
+from levain.desk import envelope as env
+from levain.desk.phone import COCKPIT_DEVICE, CoordRefused
 from levain.web_server import CoordSheet
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_pairing_http import T, _call, _pair, _serve
-from tests.test_coordinator_phone import coord_for, review
+from tests.test_desk_phone import coord_for, review
 from tests.test_dispatch_phone import ORIGIN, RP, phone_for, repo, world  # noqa: F401  (fixtures)
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
@@ -95,8 +95,8 @@ def test_bounds_and_a_repo_named_twice_from_the_cockpit_are_refusals_too(world):
 
 def test_the_cockpit_key_refusal_names_the_cockpit_and_lists_launches():
     """L3 r2 LOW: the refusal said "from the phone" and listed the phone's keys to a cockpit request."""
-    from levain.coordinator.phone import CoordPhone
-    from levain.coordinator.store import CoordError
+    from levain.desk.phone import CoordPhone
+    from levain.desk.store import CoordError
 
     with pytest.raises(CoordError) as e:
         CoordPhone._spec(None, {"where": [], "launches": [], "foo": 1}, COCKPIT_DEVICE)
@@ -122,8 +122,8 @@ def test_only_the_cockpit_pages_own_token_runs_as_the_cockpit(cred, device):
     fake = SimpleNamespace(_credential=lambda *, required=None: cred)
     assert web_server._Handler._coord_device(fake) == device
     if device is not None and device != COCKPIT_DEVICE:
-        from levain.coordinator.phone import CoordPhone
-        from levain.coordinator.store import CoordError
+        from levain.desk.phone import CoordPhone
+        from levain.desk.store import CoordError
 
         with pytest.raises(CoordError, match="sets only"):
             CoordPhone._spec(None, {"where": [], "launches": []}, device)

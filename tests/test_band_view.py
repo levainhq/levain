@@ -13,6 +13,7 @@ import pytest
 
 from levain import band_view
 from levain.consent.questions import QuestionStore
+from levain.desk.legacy import ROLE_DESK
 
 OPTS = [("fix", "fixed 30 s"), ("exp", "exponential"), ("none", "fail loud")]
 
@@ -240,15 +241,15 @@ def test_hook_with_a_locked_store_never_raises_and_stays_in_the_bound(qdir, stor
 
 
 def test_an_autonomous_seat_renders_nothing_and_a_human_seat_gets_the_contract(qdir, store, monkeypatch):
-    from levain.coordinator import lease
-    from levain.coordinator.store import CoordStore
+    from levain.desk import lease
+    from levain.desk.store import CoordStore
 
     ask(store)
     launches: dict[str, str] = {}
     monkeypatch.setattr(CoordStore, "open_readonly", lambda self, *_a, **_k: sqlite3.connect(":memory:"))
     monkeypatch.setattr(lease, "by_harness_session",
                         lambda conn, sid: SimpleNamespace(role=launches[sid]) if sid in launches else None)
-    launches.update({"w1": "worker", "c1": "coordinator"})
+    launches.update({"w1": "worker", "c1": ROLE_DESK})
     assert hp({"session_id": "w1"}, env(qdir)) == ""
     assert band_view.hook_contract({"session_id": "w1"}, env(qdir)) == ""
     assert hp({"session_id": "s1#agent:sub"}, env(qdir)) == ""        # a subagent
@@ -258,7 +259,7 @@ def test_an_autonomous_seat_renders_nothing_and_a_human_seat_gets_the_contract(q
     assert not band_view.is_autonomous("c1", qdir) and band_view.is_autonomous("w1", qdir)
 
 
-def test_no_coordinator_store_is_not_autonomous(qdir):
+def test_no_desk_store_is_not_autonomous(qdir):
     assert band_view.is_autonomous("anything", qdir) is False
 
 
@@ -366,12 +367,12 @@ def test_a_non_busy_operational_error_is_not_number_pending(store, monkeypatch):
     assert band_view.hook_prompt({"session_id": "s1"}, {"LEVAIN_HOME": str(store.directory.parent)})[0] == ""
 
 
-def test_a_real_launch_row_in_the_real_coordinator_store_classes_a_worker_autonomous(qdir, tmp_path, monkeypatch):
-    from levain.coordinator.store import CoordStore, Part
+def test_a_real_launch_row_in_the_real_desk_store_classes_a_worker_autonomous(qdir, tmp_path, monkeypatch):
+    from levain.desk.store import CoordStore, Part
 
     ask(store := QuestionStore(qdir))
     monkeypatch.setenv("LEVAIN_HOME", str(qdir.parent))
-    coord = CoordStore()                                          # no directory given: where the coordinator really lives
+    coord = CoordStore()                                          # no directory given: where the desk really lives
     assert coord.directory == qdir
     coord.coord_set_agent("none")
     token = coord.coord_take()

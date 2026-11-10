@@ -1,0 +1,2949 @@
+"""Starting a launch's session, and watching it (C3b; C0 §3.4, §7 L2 L8 L9). Built from what C3b's runs measured on
+Claude Code 2.1.305 (1020+50): the trust refusal, by realpath; the spawn, the first agents row with no pid and no
+status, stop; --bg ignoring --session-id. A fake ``claude`` on PATH replays those outputs; no test here ever spawns
+the real one."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import sqlite3
+import stat
+import sys
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from levain.desk import launch as cl
+from levain.desk import lease
+from levain.desk.store import CoordStore
+from levain.desk.legacy import CAUSE_CODEX_REMOVED, CODEX_RULE_NAME, JSON_ROLE_DESK, LEGACY_HOME_NAME, RECORD_NAME_WORKSPACES, ROLE_DESK, SESSION_PREFIX_DESK, SQL_ROLE_DESK
+
+HID = "2be178ea"
+SID = "2be178ea-7208-46be-8ef7-5b0e49a354e0"
+
+# the fake replays the measured outputs (Claude Code 2.1.305); its mode and its log sit next to it
+_FAKE = r'''#!{python}
+import json, os, sys, time
+from pathlib import Path
+here = Path(__file__).resolve().parent
+mode = (here / "mode").read_text().strip()
+state = here / "state.json"
+with open(here / "log.jsonl", "a") as fh:
+    fh.write(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}) + "\n")
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("2.1.305 (Claude Code)"); sys.exit(0)
+if args[:1] == ["--bg"]:
+    name = args[args.index("-n") + 1]
+    if mode == "trust":
+        print(f"Workspace not trusted. Run `claude` in {{os.path.realpath(os.getcwd())}} once and accept the trust "
+              "prompt, then retry.")
+        sys.exit(1)
+    if mode == "unknown":
+        print("error: the harness fell over\nsecond line"); sys.exit(2)
+    if mode == "slow":
+        time.sleep(0.5)
+    if mode != "never":
+        state.write_text(json.dumps({{"name": name, "cwd": os.getcwd(), "reads": 0}}))
+    print(f"backgrounded · {HID} · {{name}}")
+    print(f"  claude attach {HID}    open in this terminal")
+    sys.exit(0)
+if args == ["agents", "--json"]:
+    if (here / "agents_fail").exists():
+        print("error: could not reach the sessions", file=sys.stderr); sys.exit(1)
+    extra = json.loads((here / "others.json").read_text()) if (here / "others.json").exists() else []
+    if not state.exists():
+        print(json.dumps(extra)); sys.exit(0)
+    if (here / "miss_once").exists():             # one partial list: our row missing from this read only
+        (here / "miss_once").unlink()
+        print(json.dumps(extra)); sys.exit(0)
+    s = json.loads(state.read_text())
+    cwd = (here / "row_cwd").read_text() if (here / "row_cwd").exists() else s["cwd"]
+    row = {{"id": "{HID}", "cwd": cwd, "kind": "background", "startedAt": 1792552347854,
+           "sessionId": "{SID}", "name": s["name"], "state": "working"}}
+    if s["reads"]:
+        row.update(pid=54960, status="busy")      # the first row right after the spawn has neither
+    if (here / "done").exists():                  # a finished turn stays listed (run_c3b_first_b)
+        row.update(pid=54960, status="idle", state="done")
+    s["reads"] += 1
+    state.write_text(json.dumps(s))
+    print(json.dumps(extra + [row], indent=2)); sys.exit(0)
+if args[:1] == ["stop"]:
+    if (here / "stop_noop").exists():             # the stop is accepted, the row stays listed
+        print(f"stopped {{args[1]}}"); sys.exit(0)
+    if (here / "fail_after_stop").exists():       # the list cannot be read once the stop has run
+        (here / "agents_fail").write_text("")
+    state.unlink(missing_ok=True)
+    print(f"stopped {{args[1]}}"); sys.exit(0)
+print("unexpected", args); sys.exit(3)
+'''
+
+
+class Fake:
+    def __init__(self, d: Path) -> None:
+        self.dir = d
+
+    def mode(self, m: str) -> None:
+        (self.dir / "mode").write_text(m)
+
+    def calls(self) -> list[dict]:
+        p = self.dir / "log.jsonl"
+        return [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []
+
+    def spawns(self) -> list[list[str]]:
+        return [c["argv"] for c in self.calls() if c["argv"][:1] == ["--bg"]]
+
+    def stops(self) -> list[list[str]]:
+        return [c["argv"] for c in self.calls() if c["argv"][:1] == ["stop"]]
+
+    def others(self, rows: list[dict]) -> None:
+        (self.dir / "others.json").write_text(json.dumps(rows))
+
+    def flag(self, name: str, text: str = "") -> None:
+        (self.dir / name).write_text(text)
+
+    def gone(self) -> None:
+        (self.dir / "state.json").unlink()
+
+
+# a session of yours Levain did not start: the list is never empty unless a test empties it
+OTHER = {"id": "77aa0011", "sessionId": "77aa0011-0000-4000-8000-000000000000", "name": "my own session",
+         "cwd": "/elsewhere", "kind": "interactive", "state": "working", "status": "busy"}
+
+
+@pytest.fixture
+def fake(tmp_path, monkeypatch):
+    d = tmp_path / "fakebin"
+    d.mkdir()
+    exe = d / "claude"
+    exe.write_text(_FAKE.format(python=sys.executable, HID=HID, SID=SID))
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{d}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(cl, "READBACK_DELAY", 0.0)
+    monkeypatch.setattr(cl, "UNLISTED_RECHECK", 0.0)
+    f = Fake(d)
+    f.mode("ok")
+    f.others([OTHER])
+    return f
+
+
+@pytest.fixture
+def qdir(tmp_path):
+    d = tmp_path / "consent"
+    d.mkdir(mode=0o700)
+    return d
+
+
+@pytest.fixture(autouse=True)
+def _levain_home(tmp_path, monkeypatch):
+    """The desk record a launch reads and writes is this test's own."""
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain-home"))
+
+
+def _desk_dir(d):
+    """``d`` as `levain desk agent` leaves it: the role hint in its own config, and in the desk record."""
+    from levain.desk import door
+
+    (d / ".levain").mkdir(parents=True, exist_ok=True)
+    (d / ".levain" / "config.json").write_text(f'{{"role": {JSON_ROLE_DESK}}}\n')
+    door.record(d)
+    return d
+
+
+@pytest.fixture
+def workdir(tmp_path):
+    d = tmp_path / "coord-install"
+    d.mkdir()
+    return _desk_dir(d)
+
+
+@pytest.fixture
+def live_hook(monkeypatch):
+    """The hook check passes (the real check against a real install is test_coord_agent_sets_up_the_install)."""
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
+
+
+@pytest.fixture
+def store(qdir, workdir):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()))
+    return s
+
+
+def woken(store, words="fix the build"):
+    d, _ = store.accept_drop(words, surface="cli")
+    launch_id = store.woken_launch(d.drop_id)
+    assert launch_id is not None
+    return launch_id
+
+
+def rows(qdir, sql, *args):
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        return c.execute(sql, args).fetchall()
+    finally:
+        c.close()
+
+
+def outside_the_fence(text):
+    """The lines of ``text`` that are not inside an embedded open: every line from ``~~~ OPEN <hex>`` through the
+    matching ``~~~ END OPEN <hex>`` is dropped, and nothing else. An open fence never closed drops the rest."""
+    out, fence = [], None
+    for line in text.splitlines():
+        m = re.fullmatch(r"~~~ OPEN ([0-9a-f]{8})", line)
+        if fence is None and m:
+            fence = m.group(1)
+        elif fence is not None and line == f"~~~ END OPEN {fence}":
+            fence = None
+        elif fence is None:
+            out.append(line)
+    return out
+
+
+# --- run_c3b_first_b: the spawn, the read back by name, activation ---------------------------------------------
+def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_hook, qdir, workdir):
+    launch_id = woken(store, "please fix the flaky test")
+    got = cl.launch_session(store, launch_id)
+    assert got.started and got.attach == f"claude attach {HID}" and got.harness_session_id == SID, got
+    ln = store.launch(launch_id)
+    assert ln.state == "active" and ln.harness_session_id == SID
+    (argv,) = fake.spawns()
+    name = f"{SESSION_PREFIX_DESK}{launch_id.removeprefix('ln-')}"
+    brief = cl.brief_path(ln)
+    # inside the session's own trusted workspace (R2), never the drops in argv
+    assert brief == workdir.resolve() / ".levain" / "briefs" / f"{launch_id}.md"
+    assert stat.S_IMODE(brief.parent.stat().st_mode) == 0o700
+    assert not any("please fix the flaky test" in a for a in argv)
+    # exactly the measured argv, plus the model, plus the prompt naming the brief; never --session-id or a bypass
+    assert argv[:7] == ["--bg", "-n", name, "--permission-mode", "default", "--model", "haiku"]
+    # the default: the user layer stays out (project + local settings only, auto-memory off), flags before the prompt
+    assert argv[7:11] == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
+    assert len(argv) == 12 and str(brief) in argv[11]
+    assert not any(a in ("--session-id", "--bare", "--dangerously-skip-permissions") or "bypass" in a for a in argv)
+    spawn = next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])
+    assert spawn["cwd"] == str(workdir.resolve())
+    (sha,) = rows(qdir, "SELECT argv_sha256 FROM launch_events WHERE launch_id = ? AND kind = 'active'", launch_id)
+    assert sha[0].startswith("sha256:")
+    # the brief: 0600, the ids, how to claim, the drop quoted as data
+    assert stat.S_IMODE(brief.stat().st_mode) == 0o600
+    text = brief.read_text()
+    assert launch_id in text and ln.session_key in text and '"please fix the flaky test"' in text
+    from levain import install as inst
+    lv = inst.desk_levain(sys.executable)
+    assert f"`{lv} coord claim --launch {launch_id} --session {ln.session_key}" in text
+    assert "--by desk --token N" in text and "DATA" in text
+    # every levain command the brief gives is one the desk install's allow rules match as written (Claude Code
+    # matches a rule against the command's own spelling: a bare `levain` would be asked about, 1021+11's real launch)
+    prefixes = [r.removeprefix("Bash(").removesuffix(":*)") for r in inst.desk_allow(sys.executable)]
+    # the embedded open is stored data between its fence lines (the card's own lines name a verb in its bare
+    # spelling), not a command given: exactly those lines are skipped, and the fence itself is checked to be there
+    given = outside_the_fence(text)
+    assert len(given) < len(text.splitlines()) - 3
+    commands = [c for c in re.findall(r"`([^`]+)`", "\n".join(given)) if "-m levain" in c or c.startswith("levain")]
+    assert len(commands) >= 8 and "levain desk" not in "\n".join(given).replace(f"{lv} coord", "")
+    for command in commands:
+        assert any(command.startswith(p + " ") for p in prefixes), command
+    # the active session holds the bootstrap lease for a full TTL, and claims it as the brief says
+    assert store.coord_claim(launch_id, ln.session_key) == store.coord_status()["lease"]["token"]
+
+
+def test_the_first_agents_row_has_no_pid_and_is_enough(store, fake, live_hook):
+    got = cl.launch_session(store, woken(store))
+    assert got.started
+    agents = [c for c in fake.calls() if c["argv"] == ["agents", "--json"]]
+    assert len(agents) == 3          # the spawn gate's two reads, then the pid-less first row, taken: no wait for a pid
+
+
+# --- run_c3b_first_a: the trust refusal ------------------------------------------------------------------------
+def test_an_untrusted_directory_fails_with_its_realpath_and_the_remedy(qdir, tmp_path, fake, live_hook):
+    real = tmp_path / "real-dir"
+    real.mkdir()
+    _desk_dir(real)
+    link = tmp_path / "linked-dir"
+    link.symlink_to(real)
+    store = CoordStore(qdir)
+    store.coord_set_agent("claude", cwd=str(link))
+    fake.mode("trust")
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started
+    assert got.refusal == f"workspace not trusted: {os.path.realpath(real)}"
+    assert got.remedy == f"cd {os.path.realpath(real)} && claude"
+    ln = store.launch(launch_id)
+    assert ln.state == "failed" and ln.cause == got.refusal
+    assert fake.stops() == [] and store.coord_status()["lease"] is None          # the bootstrap claim is released
+
+
+def test_another_failure_records_the_exit_and_first_line(store, fake, live_hook):
+    fake.mode("unknown")
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and got.remedy is None
+    assert got.refusal == "claude --bg exited 2: error: the harness fell over"
+    assert store.launch(launch_id).state == "failed"
+
+
+def test_a_session_never_listed_fails(store, fake, live_hook):
+    fake.mode("never")
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "started no session listed" in got.refusal
+    # the gate's two reads, the read back's tries, then one more list to stop anything under its name (nothing was listed)
+    assert len([c for c in fake.calls() if c["argv"] == ["agents", "--json"]]) == 2 + cl.READBACK_TRIES + 1
+    assert "no session named" in got.refusal and fake.stops() == []
+    assert store.launch(launch_id).state == "failed"
+
+
+def test_three_failed_launches_stop_the_wakes(store, fake, live_hook, monkeypatch):
+    # a failed launch is a death (C3a): the backoff, then "until you look", hold for launches that do start a process
+    fake.mode("unknown")
+    t = [datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)]
+    monkeypatch.setattr(store, "_clock", lambda: t[0])
+    for i in range(lease.MAX_DEATHS):
+        assert not cl.launch_session(store, woken(store, f"drop {i}")).started
+        t[0] = t[0].replace(hour=t[0].hour + 1)
+    assert store.coord_status()["wake"] == "stopped"
+
+
+# --- the one-spawner rule and the lease ------------------------------------------------------------------------
+def test_two_racing_launch_calls_spawn_once(qdir, store, fake, live_hook):
+    fake.mode("slow")
+    launch_id = woken(store)
+    out: list = []
+    racers = [threading.Thread(target=lambda: out.append(cl.launch_session(CoordStore(qdir), launch_id)))
+              for _ in range(2)]
+    for r in racers:
+        r.start()
+    for r in racers:
+        r.join(timeout=60)
+    assert len(fake.spawns()) == 1
+    assert sorted(o.started for o in out) == [False, True]
+    loser = next(o for o in out if not o.started)
+    assert "already being started" in loser.refusal or "not pending" in loser.refusal
+    assert rows(qdir, "SELECT launch_id, pid FROM launch_spawns") == [(launch_id, os.getpid())]
+    assert store.launch(launch_id).state == "active"
+
+
+def test_a_spawn_row_is_never_replaced(qdir, store, fake, live_hook):
+    launch_id = woken(store)
+    assert cl.launch_session(store, launch_id).started
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        for sql in ("UPDATE launch_spawns SET pid = 1", "DELETE FROM launch_spawns",
+                    f"INSERT OR REPLACE INTO launch_spawns VALUES ('{launch_id}', 99999, 1, 'x')"):
+            with pytest.raises(sqlite3.DatabaseError):
+                c.execute(sql)
+    finally:
+        c.close()
+
+
+def test_the_lease_lost_between_spawn_and_activate_stops_the_session(store, fake, live_hook, monkeypatch):
+    launch_id = woken(store)
+    real = cl._read_back
+
+    def read_back_then_take(*a, **kw):
+        got = real(*a, **kw)
+        store.coord_take()          # you took the role while the session was starting
+        return got
+
+    monkeypatch.setattr(cl, "_read_back", read_back_then_take)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "not pending" in got.refusal and f"stopped {HID}" in got.refusal
+    assert fake.stops() == [["stop", HID]]
+    assert store.launch(launch_id).state == "failed"
+
+
+def test_a_launch_no_longer_pending_spawns_nothing(store, fake, live_hook):
+    launch_id = woken(store)
+    store.coord_take()                                   # voids every pending launch
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "not pending" in got.refusal
+    assert fake.spawns() == []
+
+
+def test_a_directory_whose_hook_is_not_live_refuses(qdir, tmp_path, fake, monkeypatch):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    _desk_dir(plain)
+    store = CoordStore(qdir)
+    store.coord_set_agent("claude", cwd=str(plain.resolve()))
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "the consent hook is not live" in got.refusal and "no CLAUDE.md" in got.refusal
+    # G7: checked before the spawn claim, so nothing is written: the launch stays pending, unclaimed
+    assert f"launch {launch_id} left pending" in got.refusal
+    assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
+    assert rows(qdir, "SELECT count(*) FROM launch_spawns") == [(0,)]
+    # fixed while it is still pending, the same launch starts
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (True, "wired to this install"))
+    assert cl.launch_session(store, launch_id).started
+
+
+def test_a_desk_is_never_launched_into_an_unmarked_reused_install(qdir, tmp_path, fake, live_hook):
+    """Reproduced (coordint/tests_new_on_merged.txt): a setting naming a live install with no desk record and
+    no role (written before `coord agent` refused one, or straight into the store) started a desk there, where
+    the door is open."""
+    own = tmp_path / "own-install"
+    own.mkdir()
+    store = CoordStore(qdir)
+    store.coord_set_agent("claude", cwd=str(own.resolve()))
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and got.refusal.startswith("review item: ") and "not a desk's workspace" in got.refusal
+    assert f"launch {launch_id} left pending" in got.refusal
+    assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
+    # a workspace rendered before the record (the role hint only) is recorded at its launch and starts
+    (own / ".levain").mkdir()
+    (own / ".levain" / "config.json").write_text(f'{{"role": {JSON_ROLE_DESK}}}\n')
+    assert cl.launch_session(store, launch_id).started
+    from levain.desk import door
+    assert str(own.resolve()) in door.recorded()
+
+
+# --- the setting -----------------------------------------------------------------------------------------------
+def test_with_no_setting_a_drop_only_queues(qdir, fake):
+    store = CoordStore(qdir)
+    d, _ = store.accept_drop("words for later", surface="cli")
+    assert store.woken_launch(d.drop_id) is None
+    st = store.coord_status()
+    assert st["wake"] == "unset" and st["launches"] == [] and st["lease"] is None
+    store.coord_set_agent("none")
+    store.accept_drop("more words", surface="cli")
+    assert store.coord_status()["wake"] == "unset" and store.coord_status()["launches"] == []
+    assert rows(qdir, "SELECT count(*) FROM launches") == [(0,)] and fake.calls() == []
+
+
+def test_the_setting_is_yours_and_append_only(qdir, workdir):
+    store = CoordStore(qdir)
+    with pytest.raises(lease.LeaseRefused, match="Codex desk was removed"):     # never written again
+        store.coord_set_agent("codex", cwd="relative")
+    with pytest.raises(lease.LeaseRefused, match="absolute path"):
+        store.coord_set_agent("claude", cwd="relative")
+    with pytest.raises(lease.LeaseRefused, match="no --model"):
+        store.coord_set_agent("none", model="haiku")
+    store.coord_set_agent("claude", model="haiku", cwd=str(workdir))
+    store.coord_set_agent("none")
+    assert store.coord_setting().agent == "none"
+    assert rows(qdir, "SELECT agent, by FROM coord_settings ORDER BY seq") == [("claude", "operator"),
+                                                                              ("none", "operator")]
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        for sql in ("UPDATE coord_settings SET agent = 'claude'", "DELETE FROM coord_settings",
+                    "INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) "
+                    f"VALUES (99999, 'claude', NULL, '/x', {SQL_ROLE_DESK}, 'x')"):
+            with pytest.raises(sqlite3.DatabaseError):
+                c.execute(sql)
+    finally:
+        c.close()
+
+
+def test_a_wake_asks_for_the_set_agent_model_and_directory(store, workdir):
+    launch_id = woken(store)
+    ln = store.launch(launch_id)
+    assert (ln.harness, ln.model, ln.cwd, ln.role) == ("claude", "haiku", str(workdir.resolve()), ROLE_DESK)
+
+
+# --- the CLI ---------------------------------------------------------------------------------------------------
+def _main(qdir, capsys, *argv, rc=0):
+    from levain.cli import main
+
+    got = main([*argv, "--queue-dir", str(qdir)])
+    out = capsys.readouterr()
+    assert got == rc, (argv, out.out, out.err)
+    return out
+
+
+def test_levain_drop_starts_the_desk_its_drop_woke(store, qdir, fake, live_hook, capsys):
+    out = _main(qdir, capsys, "drop", "--no-source", "hello", ROLE_DESK)
+    assert "drop receipt:" in out.out and f"started: claude attach {HID}" in out.err
+    # the next drop finds the lease held and starts nothing
+    out = _main(qdir, capsys, "drop", "--no-source", "a second drop")
+    assert "started" not in out.err and len(fake.spawns()) == 1
+
+
+def test_levain_drop_still_exits_0_when_the_launch_is_refused(store, qdir, fake, live_hook, capsys):
+    fake.mode("trust")
+    out = _main(qdir, capsys, "drop", "--no-source", "hello")
+    assert "not started: workspace not trusted" in out.err and "&& claude" in out.err
+
+
+def test_levain_coord_launch_starts_the_pending_desk(store, qdir, fake, live_hook, capsys):
+    store.accept_drop("queued, launch by hand", surface="cli")          # asked for, not started
+    out = _main(qdir, capsys, "coord", "launch")
+    assert out.out.strip() == f"claude attach {HID}"
+    out = _main(qdir, capsys, "coord", "launch", rc=1)
+    assert "no desk launch is pending" in out.err
+
+
+def test_levain_coord_launch_prints_the_refusal_and_remedy(store, qdir, fake, live_hook, capsys):
+    fake.mode("trust")
+    launch_id = woken(store)
+    out = _main(qdir, capsys, "coord", "launch", launch_id, rc=1)
+    assert "workspace not trusted" in out.out and "&& claude" in out.out
+
+
+@pytest.fixture
+def tmp_home(tmp_path, monkeypatch):
+    """A tmp HOME for `levain desk agent`'s install, as test_repin_on_install's make_install sets one up; claude's
+    version is never read from the real binary."""
+    from levain import host_guard as hg
+    from levain.consent import canary
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("LEVAIN_HOME", raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    monkeypatch.setattr(hg, "load_managed_settings", lambda platform=None: [])
+    monkeypatch.setattr(canary, "agent_version", lambda agent, **_: None)
+    return home
+
+
+def test_coord_agent_sets_up_the_install(tmp_home, qdir, fake, capsys):
+    from levain import doctor
+
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--model", "haiku")
+    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    assert (target / "CLAUDE.md").is_file()
+    (hook,) = [r for r in doctor._check_claude_code(target) if r.name == cl.HOOK_ROW]
+    assert hook.detail.startswith("wired to this install"), hook
+    # the last line is the trust remedy, literally
+    assert out.out.strip().splitlines()[-1] == f"cd {target} && claude"
+    s = CoordStore(qdir).coord_setting()
+    assert (s.agent, s.model, s.cwd) == ("claude", "haiku", str(target))
+    assert not (tmp_home / ".claude.json").exists()
+    # a second run finds the install live and only records the setting again
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert CoordStore(qdir).coord_setting().model is None
+    # and its sessions launch there, with doctor's real check
+    d, _ = CoordStore(qdir).accept_drop("first real-check drop", surface="cli")
+    got = cl.launch_session(CoordStore(qdir), CoordStore(qdir).pending_desk().launch_id)
+    assert got.started, got
+    assert next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])["cwd"] == str(target)
+
+
+def test_the_desk_install_pre_approves_its_own_three_verbs_and_a_reused_install_gets_none(
+        tmp_home, qdir, tmp_path, capsys):
+    # np-6843ca07 (a), signed: the desk's own install pre-approves only levain desk / drops / thread
+    from levain import install as inst
+    from levain.cli import main as levain_main
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    bash = [r for r in allow(target) if r.startswith("Bash(")]
+    lv = inst.desk_levain(sys.executable)
+    assert lv == f"{shlex.quote(sys.executable)} -P -m levain"
+    assert bash == [f"Bash({lv} coord:*)", f"Bash({lv} drops:*)", f"Bash({lv} thread:*)"]
+    # the brief reads the spelling back from the install itself (a launch from another interpreter tells the session
+    # what THIS install allows), and an install from before the interpreter was named keeps its bare levain
+    assert inst.installed_desk_levain(target, sys.executable) == lv
+    # np-be8ebe0a (a): Levain's own project MCP servers, and only those, are approved for the background session
+    settings = json.loads((target / ".claude" / "settings.json").read_text())
+    mcp = json.loads((target / ".mcp.json").read_text())["mcpServers"]
+    assert settings["enabledMcpjsonServers"] == list(inst.DESK_MCP_SERVERS) == sorted(mcp)
+    assert inst.persisted_role(target) == ROLE_DESK
+    assert levain_main(["update", "--path", str(target)]) == 0      # a re-render keeps them
+    assert [r for r in allow(target) if r.startswith("Bash(")] == bash
+    # a live install made by plain init and then named as the desk's is REFUSED, never marked (door r2 (a)):
+    # the door is open in an unmarked directory, and marking the operator's install would door his own sessions
+    plain = tmp_path / "plain"
+    answers = tmp_path / "answers.json"
+    answers.write_text(json.dumps(cl._install_answers()))
+    assert inst.run_init(plain, "claude-code", force=False, answers_file=answers, default_grants="no") == 0
+    before = CoordStore(qdir).coord_setting()
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(plain), rc=1)
+    assert "not a desk's own" in out.err and "leave out --cwd" in out.err
+    assert CoordStore(qdir).coord_setting() == before                  # nothing recorded
+    # the workspace that already has the role is reused as is
+    _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(target))
+    assert CoordStore(qdir).coord_setting().cwd == str(target)
+    assert not [r for r in allow(plain.resolve()) if r.startswith("Bash(")]
+    assert "enabledMcpjsonServers" not in json.loads((plain.resolve() / ".claude" / "settings.json").read_text())
+    assert inst.persisted_role(plain.resolve()) is None
+    assert inst.installed_desk_levain(plain.resolve(), sys.executable) is None
+    capsys.readouterr()
+    # a damaged or hand-edited record never reads as the role
+    config = target / ".levain" / "config.json"
+    for body in ("{not json", f'[{JSON_ROLE_DESK}]', '{"role": "Desk"}'):
+        config.write_text(body)
+        assert inst.persisted_role(target) is None, body
+
+
+def test_a_session_levain_launched_keeps_to_the_desks_door(store, qdir, workdir, capsys, monkeypatch):
+    # the pre-approved trees grant nothing only if a launched session cannot write as the operator (L3 r1 codex HIGH);
+    # the session runs in the launch's directory, the desk's workspace, and that is what the door reads
+    launch_id = woken(store)
+    _, why = store.launch_activate(launch_id, harness_session_id="sess-coord")
+    assert why is None
+    key = store.launch_by_harness_session("sess-coord").session_key
+    (workdir / ".levain").mkdir(exist_ok=True)
+    (workdir / ".levain" / "config.json").write_text(f'{{"role": {JSON_ROLE_DESK}}}\n')
+    monkeypatch.chdir(workdir)
+    tok = json.loads(_main(qdir, capsys, "coord", "claim", "--launch", launch_id, "--session", key, "--json").out)
+    _main(qdir, capsys, "thread", "list")
+    for argv in (("coord", "take"), ("coord", "wake"), ("coord", "agent", "none"),
+                 ("coord", "release", "--token", str(tok["token"]))):
+        out = _main(qdir, capsys, *argv, rc=1)
+        assert "the desk's workspace" in out.err, (argv, out.err)
+    _main(qdir, capsys, "coord", "release", "--by", ROLE_DESK, "--token", str(tok["token"]))
+    # the operator, outside that workspace: his take stands
+    monkeypatch.chdir(workdir.parent)
+    _main(qdir, capsys, "coord", "take")
+
+
+def test_coord_agent_never_installs_over_a_directory_with_files(tmp_home, qdir, tmp_path, capsys):
+    busy = tmp_path / "busy"
+    busy.mkdir()
+    (busy / "notes.txt").write_text("mine")
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--cwd", str(busy), rc=1)
+    assert "holds files" in out.err and CoordStore(qdir).coord_setting() is None
+    assert sorted(p.name for p in busy.iterdir()) == ["notes.txt"]
+
+
+def test_coord_agent_none_and_a_removed_codex_desk(qdir, capsys):
+    _main(qdir, capsys, "coord", "agent", "none")
+    assert CoordStore(qdir).coord_setting().agent == "none"
+    out = _main(qdir, capsys, "coord", "agent", "codex", rc=1)
+    assert "Codex desk was removed" in out.err
+    assert CoordStore(qdir).coord_setting().agent == "none"
+
+
+# --- the brief's directory (R2) --------------------------------------------------------------------------------
+def test_a_linked_briefs_directory_refuses_the_launch(store, fake, live_hook, workdir, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    (workdir / ".levain").mkdir(exist_ok=True)
+    (workdir / ".levain" / "briefs").symlink_to(elsewhere)
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "not a private directory" in got.refusal
+    assert fake.spawns() == [] and list(elsewhere.iterdir()) == []
+    assert store.launch(launch_id).state == "pending"           # G7: refused before the spawn claim
+
+
+# --- the watcher (levain desk watch) --------------------------------------------------------------------------
+@pytest.fixture
+def clock(store, monkeypatch):
+    t = [datetime.now(timezone.utc)]
+    monkeypatch.setattr(store, "_clock", lambda: t[0])
+    return t
+
+
+def started(store):
+    got = cl.launch_session(store, woken(store))
+    assert got.started, got
+    return store.launch(got.launch_id)
+
+
+def test_watch_starts_a_pending_launch_nobody_started(store, fake, live_hook):
+    # a drop from the phone or the cockpit writes the pending launch and starts nothing
+    store.accept_drop("from the phone", surface="cli")
+    (pending,) = store.launches_unspawned()
+    lines = cl.watch_once(store)
+    assert f"launch {pending.launch_id} started: claude attach {HID}" in lines
+    assert store.launch(pending.launch_id).state == "active"
+    # the next pass finds nothing to start, and the one-spawner row stands
+    cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and store.launches_unspawned() == []
+
+
+def test_watch_leaves_a_launch_another_process_is_starting(store, fake, live_hook, qdir):
+    launch_id = woken(store)
+    assert store.launch_claim_spawn(launch_id, 1)[1] is None        # someone else won the spawn
+    cl.watch_once(store)
+    assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
+
+
+def test_a_listed_working_holder_that_writes_keeps_the_lease(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    from levain.desk.store import Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    for i in range(4):                                  # 4 x 20 min: well past one LEASE_TTL with no beat of its own
+        clock[0] += timedelta(minutes=20)
+        d, _ = store.accept_drop(f"drop {i}", surface="cli")
+        store.split(d.drop_id, [Part("work", f"w{i}")], by=ROLE_DESK, token=token)    # a write, not a beat
+        lines = cl.watch_once(store)
+        assert any(line.startswith(f"lease {token} held by {ln.launch_id}: beat") for line in lines), lines
+    held = store.coord_status()["lease"]
+    assert held["token"] == token and held["live"] and held["holder"] == ln.session_key
+    assert store.launch(ln.launch_id).state == "active"
+
+
+def test_a_listed_done_holder_gets_no_beat_and_its_launch_ends(store, fake, live_hook, clock):
+    # run_c3b_first_b: a finished turn stays listed, status idle, state done
+    from datetime import timedelta
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=10)
+    lines = cl.watch_once(store)
+    assert any("its session is done, not beaten" in line for line in lines), lines
+    clock[0] += lease.LEASE_TTL
+    assert not store.coord_lease().live and store.coord_status()["lease"] is None      # lapsed, never beaten
+    # C3a's IDLE_GRACE path: the next drop past it ends the launch (it wrote, so no death) and asks for a fresh one
+    clock[0] += lease.IDLE_GRACE
+    store.accept_drop("a later drop", surface="cli")
+    got = store.launch(ln.launch_id)
+    assert got.state == "ended" and got.cause == "lost the lease"
+    assert store.coord_status()["wake"] == "launching" and token != store.coord_status()["lease"]["token"]
+    # and the watcher stops the done session it left (the fresh launch's spawn lists nothing here: the fake has one
+    # sessionId, which the fresh launch would otherwise take over)
+    fake.mode("never")
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {ln.launch_id} ended (lost the lease): claude stop {HID}") for line in lines)
+
+
+def test_a_listed_working_holder_silent_past_two_ttls_lapses(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)             # its last write
+    for _ in range(3):                                  # t+20, t+40, t+60: the claim is within 2 x TTL
+        clock[0] += timedelta(minutes=20)
+        assert any(line.startswith(f"lease {token} held by {ln.launch_id}: beat") for line in cl.watch_once(store))
+    clock[0] += timedelta(minutes=20)                   # t+80: silent 80 min, listed and working all along
+    lines = cl.watch_once(store)
+    assert any("it wrote nothing as desk in the last 60 min" in line for line in lines), lines
+    clock[0] += timedelta(minutes=20)                   # past the until the t+60 beat gave
+    assert not store.coord_lease().live
+    assert not any("beat to" in line for line in cl.watch_once(store))
+
+
+def test_a_launch_just_started_that_never_wrote_gets_no_beat(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert any(f"held by {ln.launch_id}: it wrote nothing" in line for line in lines), lines
+
+
+def test_a_holder_that_only_split_under_its_token_ends_gone_not_0_turns(store, fake, live_hook, clock):
+    # L2 MED-3: a fenced thread write counts as a turn, not only a lease row
+    from datetime import timedelta
+
+    from levain.desk.store import Part
+
+    ln = started(store)
+    token = store.coord_status()["lease"]["token"]      # the bootstrap token its brief names; it never claimed
+    d, _ = store.accept_drop("split me", surface="cli")
+    store.split(d.drop_id, [Part("work", "w")], by=ROLE_DESK, token=token)
+    fake.gone()
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    got = store.launch(ln.launch_id)
+    assert got.state == "ended" and got.cause == "gone"
+    assert store.coord_status()["wake"] == "wake"
+
+
+def test_a_refused_fenced_write_records_nothing(store, fake, live_hook, qdir):
+    from levain.desk.store import CoordError, Part
+
+    ln = started(store)
+    token = store.coord_status()["lease"]["token"]
+    d, _ = store.accept_drop("split me", surface="cli")
+    store.split(d.drop_id, [Part("work", "w")], by=ROLE_DESK, token=token)
+    before = rows(qdir, "SELECT count(*) FROM lease_events")
+    with pytest.raises(CoordError):                     # already split: the write rolls back, and its record with it
+        store.split(d.drop_id, [Part("work", "w2")], by=ROLE_DESK, token=token)
+    assert rows(qdir, "SELECT count(*) FROM lease_events") == before
+    assert rows(qdir, "SELECT kind, cause, by, holder FROM lease_events ORDER BY seq DESC LIMIT 1") == [
+        ("beat", "write", ROLE_DESK, ln.session_key)]
+
+
+def test_an_unlisted_holder_loses_the_lease_and_dies_at_0_turns(store, fake, live_hook, clock, qdir):
+    from datetime import timedelta
+
+    ln = started(store)
+    (fake.dir / "state.json").unlink()                  # the session went away (crashed, or stopped by hand)
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id} ended: 0 turns (its session is no longer listed)" in lines
+    got = store.launch(ln.launch_id)
+    assert got.state == "ended" and got.cause == "0 turns"
+    assert store.coord_status()["lease"] is None                       # released with its end
+    assert rows(qdir, "SELECT by, cause FROM lease_events ORDER BY seq DESC LIMIT 1") == [("service", "launch ended")]
+    # 0 turns is a death: the next drop waits out the backoff
+    assert store.coord_status()["wake"] == "backoff"
+
+
+def test_an_unlisted_holder_that_wrote_ends_gone(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_claim(ln.launch_id, ln.session_key)     # it did something as desk
+    (fake.dir / "state.json").unlink()
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    got = store.launch(ln.launch_id)
+    assert got.state == "ended" and got.cause == "gone"
+    assert store.coord_status()["wake"] == "wake"       # not a death
+
+
+def test_an_unreadable_list_ends_nothing(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    (fake.dir / "state.json").unlink()
+    (fake.dir / "agents_fail").write_text("")
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert "claude agents --json could not be read: no session observed" in lines
+    assert store.launch(ln.launch_id).state == "active" and fake.stops() == []
+
+
+def test_an_ended_launch_still_listed_is_stopped_and_no_other_session_is_touched(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    other = {"id": "9f00aa11", "sessionId": "9f00aa11-0000-4000-8000-000000000000", "name": f"{SESSION_PREFIX_DESK}x",
+             "cwd": "/elsewhere", "kind": "background", "state": "done", "status": "idle"}
+    (fake.dir / "others.json").write_text(json.dumps([other]))
+    ln = started(store)
+    store.coord_take()                                  # you took over: its launch is ended, its session still runs
+    assert store.launch(ln.launch_id).state == "ended"
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id} ended (takeover): claude stop {HID}: stopped {HID}" in lines
+    assert fake.stops() == [["stop", HID]]              # never the session Levain did not start
+    cl.watch_once(store)
+    assert fake.stops() == [["stop", HID]]              # gone from the list: nothing more to stop
+    assert store.coord_status()["lease"]["holder"] == "operator"
+
+
+def _over_with_successor(store, clock):
+    """An ended launch whose session still runs, and a successor wake waiting pending behind it."""
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_take()                                  # you took over: its launch is ended, its session still runs
+    store.coord_release()                               # and handed it back: the next drop wakes a successor
+    clock[0] += timedelta(minutes=1)
+    store.accept_drop("next", surface="cli")
+    (pending,) = store.launches_unspawned()
+    return ln, pending
+
+
+def test_a_stopped_session_still_listed_refuses_the_handover(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    fake.flag("stop_noop")
+    lines = cl.watch_once(store)
+    assert fake.stops() == [["stop", HID]]
+    assert any(f"launch {pending.launch_id} not started: the session of an ended launch is still listed" in x
+               for x in lines)
+    assert store.launch(pending.launch_id).state == "pending" and len(fake.spawns()) == 1
+
+
+def test_launch_session_itself_refuses_while_the_old_name_is_listed(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)             # not through the watcher: any caller hits the gate
+    got = cl.launch_session(store, pending.launch_id)
+    assert not got.started and f"still listed ({HID})" in got.refusal
+    assert store.launch(pending.launch_id).state == "pending" and len(fake.spawns()) == 1
+
+
+def test_a_session_that_clears_lets_the_handover_proceed(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    first = len(fake.spawns())
+    cl.watch_once(store)                                # stops it; the fake's stop clears the row
+    lines = cl.watch_once(store)
+    assert f"launch {pending.launch_id} started: claude attach {HID}" in lines
+    assert len(fake.spawns()) == first + 1 and store.launch(pending.launch_id).state == "active"
+
+
+def test_an_unreadable_list_refuses_the_handover(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    fake.flag("agents_fail")
+    got = cl.launch_session(store, pending.launch_id)
+    assert not got.started and "`claude agents` could not be read" in got.refusal
+    assert len(fake.spawns()) == 1 and store.launch(pending.launch_id).state == "pending"
+
+
+def test_one_partial_list_does_not_clear_a_stale_session(store, fake, live_hook, clock):
+    ln, pending = _over_with_successor(store, clock)
+    fake.flag("miss_once")                              # the first read omits the stale row, the second lists it
+    got = cl.launch_session(store, pending.launch_id)
+    assert not got.started and f"still listed ({HID})" in got.refusal
+    assert len(fake.spawns()) == 1 and store.launch(pending.launch_id).state == "pending"
+
+
+def test_a_codex_row_does_not_block_a_claude_launch(store, fake, live_hook, clock, monkeypatch):
+    from types import SimpleNamespace
+
+    ln, pending = _over_with_successor(store, clock)
+    monkeypatch.setattr(cl, "_ours", lambda st, row: SimpleNamespace(harness="codex", state="ended"))
+    got = cl.launch_session(store, pending.launch_id)
+    assert got.started, got
+
+
+def test_a_row_with_no_usable_id_never_blocks(store, fake, live_hook, clock, monkeypatch):
+    ln, pending = _over_with_successor(store, clock)
+    row = {"id": None, "sessionId": SID, "name": "x", "cwd": "/x"}
+    monkeypatch.setattr(cl, "_agents", lambda exe, **kw: [row])
+    assert cl._handover_blocked(store, "claude", {}) == ""
+
+
+def test_the_first_ever_spawn_with_an_empty_list_proceeds(store, fake, live_hook):
+    fake.others([])
+    got = cl.launch_session(store, woken(store))
+    assert got.started, got
+
+
+def test_watch_runs_its_passes(store, fake, live_hook, monkeypatch):
+    monkeypatch.setattr(cl.time, "sleep", lambda s: None)
+    store.accept_drop("later", surface="cli")
+    out: list[str] = []
+    cl.watch(store, every=5, emit=out.append, passes=2)
+    assert len(fake.spawns()) == 1 and any("started" in line for line in out)
+
+
+def test_levain_coord_watch_once_and_wake(store, qdir, fake, live_hook, capsys):
+    out = _main(qdir, capsys, "coord", "watch", "--once")
+    assert out.out.strip() == "nothing to do"
+    # a wake starts the launch it wrote (R1), as a drop does
+    out = _main(qdir, capsys, "coord", "wake")
+    assert "asked for desk launch" in out.out and f"started: claude attach {HID}" in out.out
+    assert len(fake.spawns()) == 1
+    out = _main(qdir, capsys, "coord", "watch", "--once")
+    assert "it wrote nothing as desk" in out.out and "beat to" not in out.out
+    ln = next(x for x in CoordStore(qdir).launches_active() if x.role == ROLE_DESK)
+    CoordStore(qdir).coord_claim(ln.launch_id, ln.session_key)
+    out = _main(qdir, capsys, "coord", "watch", "--once")
+    assert "beat to" in out.out
+
+
+def test_levain_coord_wake_exits_1_when_its_launch_is_refused(store, qdir, fake, live_hook, capsys):
+    fake.mode("trust")
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "not started: workspace not trusted" in out.out and "&& claude" in out.out
+
+
+# --- C3b fix 1: no session left running without a row; the list's evidence ------------------------------------
+def test_an_interrupt_after_the_spawn_stops_the_session_and_reraises(store, fake, live_hook, monkeypatch):
+    launch_id = woken(store)
+    real = cl._read_back
+
+    def read_back_then_ctrl_c(*a, **kw):
+        real(*a, **kw)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cl, "_read_back", read_back_then_ctrl_c)
+    with pytest.raises(KeyboardInterrupt):
+        cl.launch_session(store, launch_id)
+    assert fake.stops() == [["stop", HID]]
+    assert store.launch(launch_id).state == "pending"           # it expires at LAUNCH_TTL; nothing runs under it
+
+
+def test_a_fault_in_activation_stops_the_session(store, fake, live_hook, monkeypatch):
+    import sqlite3 as sq
+
+    launch_id = woken(store)
+
+    def boom(*a, **kw):
+        raise sq.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "launch_activate", boom)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "the launch faulted" in got.refusal and f"stopped {HID}" in got.refusal
+    assert fake.stops() == [["stop", HID]] and store.launch(launch_id).state == "failed"
+
+
+def test_a_row_without_a_usable_id_is_stopped_by_name(store, fake, live_hook, monkeypatch):
+    launch_id = woken(store)
+    real = cl._read_back
+    monkeypatch.setattr(cl, "_read_back", lambda *a, **kw: [dict(real(*a, **kw)[0], sessionId=None)])
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "without a usable id" in got.refusal
+    assert fake.stops() == [["stop", HID]] and store.launch(launch_id).state == "failed"
+
+
+def test_a_row_in_another_directory_fails_and_is_never_stopped(store, fake, live_hook, workdir):
+    # G4: a name is a string anyone can choose; a row elsewhere is not shown to be Levain's
+    fake.flag("row_cwd", "/somewhere/else")
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and f"not {os.path.realpath(workdir)}" in got.refusal
+    assert "not Levain's to stop" in got.refusal
+    assert fake.stops() == [] and store.launch(launch_id).state == "failed"
+
+
+def test_the_watcher_stops_a_session_a_failed_launch_left_by_name(store, fake, live_hook, clock, workdir):
+    from datetime import timedelta
+
+    fake.mode("never")                                   # listed only after the read back gave up
+    launch_id = woken(store)
+    assert not cl.launch_session(store, launch_id).started
+    name = f"{SESSION_PREFIX_DESK}{launch_id.removeprefix('ln-')}"
+    # G4: our name in ANOTHER directory is never stopped by name
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": "/x", "reads": 1}))
+    stranger = {"id": "5e5e5e5e", "sessionId": "5e5e5e5e-0000-4000-8000-000000000000",
+                "name": SESSION_PREFIX_DESK + "ab" * 16, "cwd": "/y", "state": "working"}  # another store's
+    fake.others([OTHER, stranger])
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert fake.stops() == []
+    # in the launch's own directory it is
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": str(workdir.resolve()), "reads": 1}))
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {launch_id} failed (") and f"stopped {HID}" in line for line in lines), lines
+    assert fake.stops() == [["stop", HID]]
+
+
+def test_the_watcher_never_stops_a_pending_launchs_session(store, fake, live_hook, clock, workdir):
+    launch_id = woken(store)
+    assert store.launch_claim_spawn(launch_id, 1)[1] is None   # another process is starting it right now
+    name = f"{SESSION_PREFIX_DESK}{launch_id.removeprefix('ln-')}"
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": str(workdir.resolve()), "reads": 1}))
+    cl.watch_once(store)
+    assert fake.stops() == [] and store.launch(launch_id).state == "pending"
+
+
+def test_a_starter_killed_outright_leaves_a_session_the_watcher_stops_after_launch_ttl(store, fake, live_hook, clock,
+                                                                                      workdir):
+    # SIGTERM / SIGKILL run no finally: the spawn row stands, the launch stays pending, its session runs
+    from datetime import timedelta
+
+    launch_id = woken(store)
+    assert store.launch_claim_spawn(launch_id, 1)[1] is None
+    name = f"{SESSION_PREFIX_DESK}{launch_id.removeprefix('ln-')}"
+    (fake.dir / "state.json").write_text(json.dumps({"name": name, "cwd": str(workdir.resolve()), "reads": 1}))
+    cl.watch_once(store)
+    assert fake.stops() == []                           # in flight: never stopped
+    clock[0] += lease.LAUNCH_TTL + timedelta(seconds=1)
+    lines = cl.watch_once(store)
+    assert store.launch(launch_id).state == "expired"
+    assert any(line.startswith(f"launch {launch_id} expired (") for line in lines), lines
+    assert fake.stops() == [["stop", HID]]
+
+
+def test_an_empty_list_is_a_listing_and_two_of_them_end_the_launch(store, fake, live_hook, clock):
+    # G2: a list read successfully with no row is valid (the desk may be the only session); the two reads
+    # UNLISTED_RECHECK apart are what guard a death, never the list's length
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.gone()
+    fake.others([])
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id} ended: 0 turns (its session is no longer listed)" in lines, lines
+    assert store.launch(ln.launch_id).state == "ended"
+    agents = [c for c in fake.calls() if c["argv"] == ["agents", "--json"]]
+    assert len(agents) == 5                  # the spawn gate's two reads, the read back, then the two reads of this pass
+
+
+def test_one_empty_read_then_a_listing_ends_nothing(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.others([])
+    fake.flag("miss_once")                               # the first read lists nothing at all, the second lists it
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active"
+
+
+def test_one_missed_read_ends_nothing(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("miss_once")                               # a partial first list; the second read lists it again
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active"
+    agents = [c for c in fake.calls() if c["argv"] == ["agents", "--json"]]
+    assert len(agents) == 5                  # the spawn gate's two reads, the read back, then the two reads of this pass
+
+
+def test_a_worker_launch_with_no_spawned_role_is_never_started(qdir, store, fake, live_hook):
+    from levain.desk.store import Part
+
+    d, _ = store.accept_drop("work for a worker", surface="cli")
+    token = store.coord_take()
+    (t,) = store.split(d.drop_id, [Part("work", "w")], by="operator")
+    ln = store.launch_request(token, harness="claude", threads=[t.thread_id])
+    got = cl.launch_session(store, ln.launch_id)
+    assert not got.started and "a worker with no spawned role has no brief" in got.refusal
+    lines = cl.watch_once(store)
+    assert any(f"launch {ln.launch_id}: a worker launch; a worker with no spawned role has no brief" in x
+               and x.endswith(", left pending") for x in lines)
+    assert fake.spawns() == [] and store.launch(ln.launch_id).state == "pending"
+    assert rows(qdir, "SELECT count(*) FROM launch_spawns") == [(0,)]
+
+
+def test_the_briefs_directory_is_gitignored(store, fake, live_hook, workdir):
+    (workdir / ".levain").mkdir(exist_ok=True)
+    (workdir / ".levain" / ".gitignore").write_text("answers.json\n")
+    assert cl.launch_session(store, woken(store)).started
+    lines = (workdir / ".levain" / ".gitignore").read_text().splitlines()
+    assert [x for x in lines if x] == ["answers.json", "briefs/"]          # the install's own helper wrote it
+
+
+def test_a_multi_line_cause_is_written_as_one_line(store, fake, live_hook, monkeypatch):
+    from levain.desk.store import CoordError
+
+    def boom(*a, **kw):
+        raise CoordError("first line\nsecond\tline ‮")
+
+    monkeypatch.setattr(cl, "_read_back", boom)
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    ln = store.launch(launch_id)
+    assert ln.state == "failed" and ln.cause == got.refusal and "\n" not in ln.cause
+    assert "first line second line" in ln.cause and "‮" not in ln.cause
+
+
+def test_claude_not_on_path_refuses_before_the_spawn_claim(store, fake, live_hook, monkeypatch, qdir):
+    # L3 r2: a local refusal like the hook's: nothing written, the launch left pending (an unspawned expiry is no death)
+    monkeypatch.setattr(cl.shutil, "which", lambda *a, **k: None)
+    launch_id = woken(store)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "claude is not on PATH" in got.refusal and "left pending" in got.refusal
+    assert store.launch(launch_id).state == "pending"
+    assert rows(qdir, "SELECT COUNT(*) FROM launch_spawns") == [(0,)]
+
+
+def test_a_session_found_gone_loses_its_brief_in_the_same_pass(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    brief = cl.brief_path(ln)
+    assert brief.is_file()
+    (fake.dir / "state.json").unlink()
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id} ended: 0 turns (its session is no longer listed)" in lines
+    assert not brief.exists()
+
+
+def test_a_refusal_before_the_spawn_claim_is_one_line_too(store, fake, monkeypatch):
+    monkeypatch.setattr(cl, "hook_live", lambda d, **kw: (False, "first line\nsecond\tline ‮"))
+    got = cl.launch_session(store, woken(store))
+    assert "\n" not in got.refusal and "first line second line" in got.refusal and "‮" not in got.refusal
+
+
+@pytest.mark.parametrize("model", ["--dangerously-skip-permissions", "-x", "haiku sonnet", "a;b", ""])
+def test_a_model_is_checked_where_the_setting_is_written(qdir, workdir, model):
+    with pytest.raises(lease.LeaseRefused, match="never starting with -"):
+        CoordStore(qdir).coord_set_agent("claude", model=model, cwd=str(workdir))
+
+
+def test_a_model_name_the_harness_takes_is_kept(qdir, workdir):
+    for model in ("haiku", "claude-opus-5-5", "claude-sonnet-5-5[1m]", "us.anthropic.x_1"):
+        assert CoordStore(qdir).coord_set_agent("claude", model=model, cwd=str(workdir)).model == model
+
+
+def test_coord_agent_refuses_a_bad_model_before_any_install(tmp_home, qdir, capsys):
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--model=--bad", rc=1)
+    assert "never starting with -" in out.err and not (tmp_home / ".levain" / LEGACY_HOME_NAME).exists()
+
+
+# --- C3b fix 2 (L3 r1) -----------------------------------------------------------------------------------------
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, fake, capsys, scope):
+    # G1: doctor's real check of a real install; the consent hook row still reads "wired", a later row says off
+    from levain import doctor
+
+    # a user-level file reaches the desk only with --user-scope on (the default no longer loads it)
+    _main(qdir, capsys, "coord", "agent", "claude", *(["--user-scope", "on"] if scope == "user" else []))
+    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    assert cl.hook_live(target, user_scope=True)[0]
+    f = tmp_home / ".claude" / "settings.json" if scope == "user" else target / ".claude" / "settings.local.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    data = json.loads(f.read_text()) if f.is_file() else {}
+    f.write_text(json.dumps({**data, "disableAllHooks": True}))
+    checked = doctor._check_claude_code(target)
+    (hook,) = [r for r in checked if r.name == cl.HOOK_ROW]
+    assert hook.detail.startswith("wired to this install")          # the trap: wired, and still not running
+    live, why = cl.hook_live(target, user_scope=True)
+    assert not live and "turned off by" in why and str(f) in why
+    store = CoordStore(qdir)
+    d, _ = store.accept_drop("hooks are off", surface="cli")
+    launch_id = store.woken_launch(d.drop_id)
+    got = cl.launch_session(store, launch_id)
+    assert not got.started and "turned off by" in got.refusal
+    assert fake.spawns() == [] and store.launch(launch_id).state == "pending"
+
+
+def test_agents_and_stop_run_in_the_store_directory_and_a_missing_launch_directory_blocks_no_stop(
+        store, fake, live_hook, clock, qdir, workdir):
+    # G3: only the spawn runs in the launch's directory
+    import shutil
+    from datetime import timedelta
+
+    ln = started(store)
+    spawn = next(c for c in fake.calls() if c["argv"][:1] == ["--bg"])
+    assert spawn["cwd"] == os.path.realpath(workdir)
+    store.coord_take()                                   # its launch is over, its session still listed
+    shutil.rmtree(workdir)                               # and its directory is gone
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {ln.launch_id} ended (takeover)") and f"stopped {HID}" in line
+               for line in lines), lines
+    assert fake.stops() == [["stop", HID]]
+    mgmt = [c["cwd"] for c in fake.calls() if c["argv"][:1] != ["--bg"]]
+    assert mgmt and set(mgmt) == {os.path.realpath(store.directory)}
+
+
+def test_a_watch_pass_that_raises_anything_is_reported_and_the_next_runs(store, monkeypatch):
+    # G5: a JobStoreError from the shared dispatch.db is no CoordError
+    from levain.dispatch.jobs import JobStoreError
+
+    monkeypatch.setattr(cl.time, "sleep", lambda s: None)
+    calls = []
+
+    def once(s, **_kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise JobStoreError("dispatch.db said no")
+        return ["fine"]
+
+    monkeypatch.setattr(cl, "watch_once", once)
+    out: list[str] = []
+    cl.watch(store, every=5, emit=out.append, passes=2)
+    assert len(calls) == 2 and out[-1] == "fine"
+    assert out[0].startswith("watch pass faulted (JobStoreError: dispatch.db said no)")
+
+    def interrupted(s, **_kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cl, "watch_once", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        cl.watch(store, every=5, emit=out.append, passes=2)
+
+
+def test_launches_that_expire_unspawned_are_no_deaths(store, clock):
+    # G6: nobody tried to start them (no watcher ran): three in a row neither stop the wakes nor back them off
+    from datetime import timedelta
+
+    gap = max(lease.LAUNCH_TTL, lease.LEASE_TTL) + timedelta(seconds=1)
+    ids = []
+    for i in range(lease.MAX_DEATHS):
+        ids.append(woken(store, f"drop {i}"))
+        clock[0] += gap
+        assert store.coord_status()["wake"] == "wake"
+    assert [store.launch(x).state for x in ids] == ["expired"] * lease.MAX_DEATHS
+
+
+def test_spawned_expiries_still_count_in_a_row_across_unspawned_ones(store, clock):
+    # [seat] an unspawned lapse is passed over, neither a death nor a run: it never resets the count either
+    from datetime import timedelta
+
+    gap = max(lease.LAUNCH_TTL, lease.LEASE_TTL) + timedelta(seconds=1)
+    for i in range(lease.MAX_DEATHS):
+        launch_id = woken(store, f"spawned {i}")
+        assert store.launch_claim_spawn(launch_id, 1)[1] is None      # a starter claimed it, then died
+        clock[0] += gap + timedelta(days=1)                           # it expires; any backoff passes
+        store.coord_status()
+        if i + 1 < lease.MAX_DEATHS:
+            woken(store, f"unspawned {i}")                            # asked for, nobody tried
+            clock[0] += gap
+    st = store.coord_status()
+    assert st["wake"] == "stopped" and f"{lease.MAX_DEATHS} desk launches in a row died" in st["why"]
+
+
+def test_the_woken_entry_is_read_once(store):
+    # G8
+    d, _ = store.accept_drop("once", surface="cli")
+    assert store.woken_launch(d.drop_id) is not None
+    assert store.woken_launch(d.drop_id) is None and store._woken == {}
+
+
+def test_the_watcher_removes_the_brief_once_its_launch_is_over(store, fake, live_hook, clock, workdir):
+    # G9: a brief quotes the drops verbatim; once its launch is over nothing reads it
+    from datetime import timedelta
+
+    ln = started(store)
+    brief = cl.brief_path(ln)
+    keep = brief.parent / "notes.md"
+    keep.write_text("not a brief")
+    cl.watch_once(store)
+    assert brief.is_file()                               # active: kept
+    store.coord_take()
+    clock[0] += timedelta(minutes=1)
+    lines = cl.watch_once(store)
+    assert f"launch {ln.launch_id} ended: its brief removed" in lines
+    assert not brief.exists() and keep.read_text() == "not a brief"
+    assert not any("brief removed" in line for line in cl.watch_once(store))
+
+
+# --- the pin (C0 §3.4) -----------------------------------------------------------------------------------------
+from tests.test_desk_envelope import _lease, ctx, keys, repo, snapshot, structured_thread  # noqa: E402,F401
+from tests.test_desk_first_reader import band  # noqa: E402,F401
+
+
+def test_a_one_thread_worker_is_pinned_to_its_threads_head_envelope(ctx, structured_thread):
+    _d, b, t = structured_thread
+    st = ctx.store
+    token = _lease(st)
+    _d2, t2 = ctx.plain_thread("a thread with no envelope")
+    from levain.desk.store import CoordError
+
+    one = st.launch_request(token, harness="claude", threads=[t.thread_id])
+    # several threads carry no envelope authority, so no budget could meter them: refused (C6 L3 r1 B1)
+    with pytest.raises(CoordError, match="a worker holds one thread"):
+        st.launch_request(token, harness="claude", threads=[t.thread_id, t2.thread_id])
+    bare = st.launch_request(token, harness="claude", threads=[t2.thread_id])
+    coord = st.launch_request(token, harness="claude", role=ROLE_DESK)
+    for i, ln in enumerate((one, bare, coord)):
+        got, refused = st.launch_activate(ln.launch_id, harness_session_id=f"sid-{i}")
+        assert refused is None and got.state == "active"
+    assert st.launch(one.launch_id).pinned_envelope_id == b["envelope_id"] == st.head(t.thread_id).envelope_id
+    # a thread with no envelope and the desk pin nothing
+    assert [st.launch(ln.launch_id).pinned_envelope_id for ln in (bare, coord)] == [None, None]
+    assert ctx.rows(f"SELECT kind, pinned_envelope_id FROM launch_events WHERE launch_id = '{one.launch_id}' "
+                    "ORDER BY seq") == [("pending", None), ("active", b["envelope_id"])]
+
+
+def test_a_store_without_envelopes_pins_nothing(qdir, tmp_path):
+    from levain.desk.store import Part
+
+    s = CoordStore(qdir)
+    d, _ = s.accept_drop("plain words", surface="cli")
+    token = s.coord_take()
+    (t,) = s.split(d.drop_id, [Part("work", "w")], by="operator")
+    ln = s.launch_request(token, harness="claude", threads=[t.thread_id])
+    got, refused = s.launch_activate(ln.launch_id, harness_session_id="sid-x")
+    assert refused is None and got.pinned_envelope_id is None
+
+
+def test_the_brief_spelling_is_looked_up_as_exact_rules_never_parsed(tmp_path):
+    # what the install allows, found as exact strings: this interpreter's rules, else an older install's bare ones;
+    # anything else (no role, another interpreter's rules, a look-alike) is None and the caller's commands ask
+    from levain import install as inst
+    here, other = "/venv-a/bin/python", "/venv b/bin/python"
+    d = tmp_path / "install"
+    (d / ".claude").mkdir(parents=True)
+
+    def rules(allow, role=ROLE_DESK):
+        (d / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": allow}}))
+        (d / ".levain").mkdir(exist_ok=True)
+        (d / ".levain" / "config.json").write_text(json.dumps({"role": role} if role else {}))
+        return inst.installed_desk_levain(d, here)
+
+    assert rules(list(inst.desk_allow(here))) == inst.desk_levain(here)
+    assert rules(["Bash(levain desk:*)", "Bash(levain drops:*)", "Bash(levain thread:*)"]) == "levain"
+    assert rules(list(inst.desk_allow(other))) is None          # another interpreter's install: asks
+    assert rules(list(inst.desk_allow(here)), role=None) is None  # a reused install: the operator's rules
+    for partial in (["Bash(make coord:*)", "Bash(make drops:*)", "Bash(make thread:*)"],
+                    list(inst.desk_allow(here))[:2]):
+        assert rules(partial) is None, partial
+
+
+def test_a_claude_desk_may_not_edit_its_own_record(tmp_path, monkeypatch):
+    # reproduced: the rendered desk settings carried allow rules only, so Claude's Write/Edit tools could
+    # rewrite the record that marks its workspace. Claude Code consults Edit(path) rules for every editing tool.
+    from levain import install as inst
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
+    doc = json.loads(inst._apply_role(json.dumps({"permissions": {"allow": []}}), ROLE_DESK, "/venv/bin/python"))
+    record = (tmp_path / "lh").resolve() / "consent" / RECORD_NAME_WORKSPACES
+    assert f"Edit(/{record})" in doc["permissions"]["deny"]
+    assert f"Edit(/{record}.lock)" in doc["permissions"]["deny"]
+    assert all(r.startswith("Edit(//") for r in doc["permissions"]["deny"])
+    assert "deny" not in json.loads(inst._apply_role(json.dumps({"permissions": {}}), None, "/venv/bin/python"))["permissions"]
+
+
+def test_every_levain_verb_the_brief_names_passes_the_desks_door(store, fake, live_hook, monkeypatch):
+    """C5 L3 r1 (codex HIGH): the brief told the desk to run `coord questions|answer|escalate`, and the door
+    refused all three inside its workspace. Every command path the brief names is read off the real CLI parser and
+    must be in the door: a brief that names a verb the door refuses fails here."""
+    from levain import install as inst
+    from levain.cli import build_parser, main
+    from levain.desk import door
+
+    launch_id = woken(store)
+    assert cl.launch_session(store, launch_id).started
+    text = cl.brief_path(store.launch(launch_id)).read_text()
+    # the real parser, caught at the door's own call (the refusal stops the command before it runs)
+    caught = []
+
+    def catch(parser, args):
+        caught.append(parser)
+        return "caught"
+
+    monkeypatch.setattr(door, "refusal", catch)
+    assert main(["coord", "status"]) == 1 and caught
+    parser = caught[0]
+
+    def path_of(words):
+        import argparse
+
+        level, path = parser, []
+        for word in words:
+            subs = [a for a in level._actions if isinstance(a, argparse._SubParsersAction)]
+            if not subs or word not in subs[0].choices:
+                break
+            nxt = subs[0].choices[word]
+            path.append(next(name for name, p in subs[0].choices.items() if p is nxt))
+            level = nxt
+        return tuple(path)
+
+    lv = inst.desk_levain(sys.executable)
+    commands = [c for c in re.findall(r"`([^`]+)`", text) if c.startswith(lv + " ")]
+    paths = set()
+    for command in commands:
+        words = command[len(lv) + 1:].split()
+        # `thread state|set|merge|detach|add ...`: each alternative is a verb the brief names
+        alts = next(((i, w.split("|")) for i, w in enumerate(words) if "|" in w), None)
+        for alt in (alts[1] if alts else [None]):
+            got = path_of(words if alts is None else [*words[:alts[0]], alt])
+            assert len(got) >= 2, command
+            paths.add(got)
+    assert {("coord", "questions"), ("coord", "answer"), ("coord", "escalate"), ("coord", "claim")} <= paths
+    refused = sorted(p for p in paths if p not in door.door_paths(build_parser()))
+    assert not refused, f"the brief names verbs the desk's door refuses: {refused}"
+
+
+# --- 1030-42: the desk spawns without your user layer unless --user-scope on -----------------------------
+def _spawn_argv_and_sha(store, fake, qdir):
+    launch_id = woken(store, "layers")
+    assert cl.launch_session(store, launch_id).started
+    argv = fake.spawns()[-1]
+    (sha,) = rows(qdir, "SELECT argv_sha256 FROM launch_events WHERE launch_id = ? AND kind = 'active'", launch_id)
+    return argv, sha[0]
+
+
+def test_user_scope_off_is_the_default_and_on_restores_the_old_argv(store, fake, live_hook, qdir, workdir):
+    assert store.coord_setting().user_scope is False
+    off_argv, off_sha = _spawn_argv_and_sha(store, fake, qdir)
+    assert off_argv.index("--setting-sources") < off_argv.index("--settings") < len(off_argv) - 1
+    assert off_argv[off_argv.index("--setting-sources") + 1] == "project,local"
+    assert off_argv[off_argv.index("--settings") + 1] == '{"autoMemoryEnabled":false}'
+    assert len(off_argv) == 12 and off_sha.startswith("sha256:")
+
+
+def test_user_scope_on_spawns_with_neither_flag(qdir, workdir, fake, live_hook):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    argv, _sha = _spawn_argv_and_sha(s, fake, qdir)
+    assert argv[:7] == ["--bg", "-n", argv[2], "--permission-mode", "default", "--model", "haiku"]
+    assert len(argv) == 8 and "--setting-sources" not in argv and "--settings" not in argv
+
+
+def test_the_recorded_argv_sha_differs_between_on_and_off(qdir, workdir, fake, live_hook, tmp_path):
+    shas = {}
+    for scope in (False, True):
+        q = tmp_path / f"q-{scope}"
+        q.mkdir(mode=0o700)
+        s = CoordStore(q)
+        s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=scope)
+        argv, sha = _spawn_argv_and_sha(s, fake, q)
+        shas[scope] = (argv, sha)
+    assert "--setting-sources" in shas[False][0] and "--settings" in shas[False][0]
+    assert "--setting-sources" not in shas[True][0] and "--settings" not in shas[True][0]
+    assert shas[False][1] != shas[True][1]
+
+
+def test_a_pre_existing_store_reads_as_off_and_keeps_its_row(tmp_path):
+    q = tmp_path / "old"
+    q.mkdir(mode=0o700)
+    s = CoordStore(q)
+    s.coord_setting()                                   # makes the store with the current schema
+    c = sqlite3.connect(q / "dispatch.db")
+    try:
+        # coord_settings as it was before user_scope: no column, one standing row (its triggers go with the table)
+        c.execute("DROP TABLE coord_settings")
+        # the production DDL minus only the new column, so the agent/cwd and by CHECKs are the real ones
+        (prod,) = [d for d in lease.LEASE_SCHEMA if "TABLE IF NOT EXISTS coord_settings" in d]
+        col = "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), "
+        assert col in prod
+        c.execute(prod.replace(col, "").replace("IF NOT EXISTS ", ""))
+        c.execute("INSERT INTO gseq (at) VALUES ('2026-01-01T00:00:00Z')")
+        c.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, by, at) VALUES (1, 'claude', 'haiku', '/x', "
+                  "'operator', '2026-01-01T00:00:00Z')")
+        c.commit()
+        row = lease.setting(c)                          # a reader on the old format, before any writer migrates it
+    finally:
+        c.close()
+    assert (row.agent, row.model, row.user_scope) == ("claude", "haiku", False)
+    fresh = CoordStore(q)                               # a writer's opener migrates, the old row reads off
+    got = fresh.coord_setting()
+    assert (got.agent, got.model, got.user_scope) == ("claude", "haiku", False)
+    assert fresh.coord_set_agent("claude", model="haiku", cwd="/x", user_scope=True).user_scope is True
+    assert fresh.coord_set_agent("claude", model="sonnet", cwd="/x").user_scope is True      # None keeps the choice
+    assert fresh.coord_set_agent("none").user_scope is False
+
+
+def test_coord_status_says_the_user_layer(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    text = _main(qdir, capsys, "coord", "status").out
+    assert "user layer: off (project settings only)" in text
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["setting"]["user_scope"] is False
+    out = _main(qdir, capsys, "coord", "agent", "claude", "--user-scope", "on").out
+    assert "user layer: on" in out and "auto-memory" not in out       # auto-memory was never measured under --bg
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["setting"]["user_scope"] is True
+    s = CoordStore(qdir).coord_setting()
+    # --user-scope alone keeps the agent, model and directory
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")
+    t = CoordStore(qdir).coord_setting()
+    assert (t.agent, t.model, t.cwd, t.user_scope) == (s.agent, s.model, s.cwd, False)
+    # a bad value, no agent and nothing, and --user-scope on none, are refused
+    with pytest.raises(SystemExit) as bad:
+        _main(qdir, capsys, "coord", "agent", "claude", "--user-scope", "maybe")
+    assert bad.value.code == 2
+    _main(qdir, capsys, "coord", "agent", rc=1)
+    _main(qdir, capsys, "coord", "agent", "none", "--user-scope", "on", rc=1)
+
+
+def test_a_user_level_disable_all_hooks_is_not_consulted_without_user_scope(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    user = tmp_home / ".claude"
+    user.mkdir(exist_ok=True)
+    (user / "settings.json").write_text('{"disableAllHooks": true}')
+    live, detail = cl.hook_live(target, user_scope=True)
+    assert not live and "turned off by" in detail
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert live, detail
+    assert "project,local only" in detail and "user-level disableAllHooks is not consulted" in detail
+    # a project-level file still refuses, with or without the user layer
+    (target / ".claude" / "settings.local.json").write_text('{"disableAllHooks": true}')
+    assert not cl.hook_live(target, user_scope=False)[0]
+
+
+# --- 1030-42 L3 r1 fixes ---------------------------------------------------------------------------------------
+def test_the_layer_flags_are_the_comma_form_as_one_argument():
+    # measured accepted by a real `claude --bg` on Claude Code 2.1.314 (1030-42 dietrun): one comma argument, inline JSON
+    assert cl._layer_args(False) == ["--setting-sources", "project,local", "--settings", '{"autoMemoryEnabled":false}']
+    assert cl._layer_args(True) == []
+
+
+@pytest.mark.parametrize("asked", [False, True])
+def test_a_pending_launch_spawns_with_the_layer_it_was_asked_under(qdir, workdir, fake, live_hook, asked):
+    # codex r1 HIGH: a drop wakes under one choice, the operator flips it before the watcher starts the launch
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=asked)
+    launch_id = woken(s, "race")
+    assert s.launch(launch_id).user_scope is asked
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=not asked)
+    assert cl.launch_session(s, launch_id).started
+    argv = fake.spawns()[-1]
+    assert ("--setting-sources" in argv) is (not asked) and ("--settings" in argv) is (not asked)
+
+
+def test_a_launch_asked_for_before_the_column_reads_as_off(qdir, workdir):
+    s = CoordStore(qdir)
+    s.coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    launch_id = woken(s, "old")
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        c.execute("ALTER TABLE launches DROP COLUMN user_scope")        # launches as it was before the column
+        c.commit()
+        assert lease.launch(c, launch_id).user_scope is False           # a reader before any writer migrates it
+    finally:
+        c.close()
+    fresh = CoordStore(qdir)                                            # a writer's opener adds it, 0 on the old row
+    assert fresh.launch(launch_id).user_scope is False
+    assert rows(qdir, "SELECT user_scope FROM launches WHERE launch_id = ?", launch_id) == [(0,)]
+
+
+def test_user_scope_never_sticks_to_a_non_claude_setting(qdir, workdir, capsys):
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    out = _main(qdir, capsys, "coord", "agent", "--user-scope", "on", rc=1)
+    assert "claude" in out.err and s.coord_setting().user_scope is False
+    # the store never writes a 1 on a non-claude row, so a later `coord agent claude` has nothing to inherit
+    s.coord_set_agent("none")
+    with pytest.raises(lease.LeaseRefused, match="no --model"):
+        s.coord_set_agent("none", cwd=str(workdir.resolve()), user_scope=True)
+    assert rows(qdir, "SELECT user_scope FROM coord_settings ORDER BY seq DESC LIMIT 1") == [(0,)]
+    assert s.coord_set_agent("claude", cwd=str(workdir.resolve())).user_scope is False
+    # a codex row that carries a 1 anyway (written before this fix) reads as off and is not inherited
+    c = sqlite3.connect(qdir / "dispatch.db")
+    try:
+        c.execute("INSERT INTO gseq (at) VALUES ('2026-01-01T00:00:00Z')")
+        g = c.execute("SELECT MAX(rowid) FROM gseq").fetchone()[0]
+        c.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) VALUES "
+                  "(?, 'codex', NULL, ?, 1, 'operator', '2026-01-01T00:00:00Z')", (g, str(workdir.resolve())))
+        c.commit()
+    finally:
+        c.close()
+    assert s.coord_setting().user_scope is False
+    assert s.coord_set_agent("claude", cwd=str(workdir.resolve())).user_scope is False
+
+
+def test_a_scope_only_change_never_undoes_a_concurrent_change(qdir, workdir, capsys, monkeypatch):
+    # codex r1 MED: the scope-only write read the row in one transaction and wrote its replacement in another
+    CoordStore(qdir).coord_set_agent("claude", model="haiku", cwd=str(workdir.resolve()), user_scope=True)
+    real, fired = lease.setting, []
+
+    def interleave(conn):
+        got = real(conn)
+        if not fired:
+            fired.append(threading.Thread(target=lambda: CoordStore(qdir).coord_set_agent("none")))
+            fired[0].start()
+            fired[0].join(1.0)          # finishes at once unless the scope change holds the write lock
+        return got
+
+    monkeypatch.setattr(lease, "setting", interleave)
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")
+    fired[0].join(30)
+    monkeypatch.setattr(lease, "setting", real)
+    # the later `agent none` stands (a stale scope-only copy would have re-enabled the claude desk)
+    assert rows(qdir, "SELECT agent, user_scope FROM coord_settings ORDER BY seq") == [
+        ("claude", 1), ("claude", 0), ("none", 0)]
+
+
+def test_turning_the_layer_on_refuses_when_a_user_level_file_turns_hooks_off(tmp_home, qdir, fake, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    out = _main(qdir, capsys, "coord", "agent", "--user-scope", "on", rc=1)
+    assert "turned off by" in out.err and CoordStore(qdir).coord_setting().user_scope is False
+    _main(qdir, capsys, "coord", "agent", "--user-scope", "off")      # turning it off checks nothing new
+
+
+def test_a_user_level_disable_all_hooks_through_a_symlinked_home_is_not_consulted(tmp_path, tmp_home, qdir, fake,
+                                                                                 capsys, monkeypatch):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    link = tmp_path / "home-link"
+    link.symlink_to(tmp_home)
+    monkeypatch.setenv("HOME", str(link))
+    target = (link / ".levain" / LEGACY_HOME_NAME).resolve()
+    (link / ".claude").mkdir(exist_ok=True)
+    (link / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert live, detail
+    assert not cl.hook_live(target, user_scope=True)[0]
+
+
+def test_a_missing_hooks_off_helper_fails_loud_not_as_a_refusal(tmp_path, tmp_home, qdir, fake, capsys, monkeypatch):
+    from levain import doctor
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+    assert cl.hook_live(target, user_scope=False)[0]                    # user-only file: not consulted
+    rows_now = doctor._check_claude_code(target)                         # doctor's own rows survive the rename
+    monkeypatch.setattr(doctor, "_check_claude_code", lambda _d, **_k: rows_now)
+    monkeypatch.delattr(doctor, "_hooks_off_files")                      # a rename in doctor
+    with pytest.raises(AttributeError):
+        cl.hook_live(target, user_scope=False)
+
+
+def test_the_desk_install_allows_a_bare_read_and_no_other_file_tool(tmp_home, qdir, tmp_path, capsys):
+    # 1030-42 (np-5396be49 "5b"): under --setting-sources project,local the user's own `Read` allow is gone and a Read
+    # outside the workspace stopped at a prompt nobody answers; the desk install's project settings carry it
+    from levain import install as inst
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    rules = allow(target)
+    assert rules.count("Read") == 1
+    assert not [r for r in rules if r.split("(")[0] in ("Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Bash")
+                and not r.startswith("Bash(")], rules
+    assert not [r for r in rules if r.startswith("Bash(") and not r.endswith(":*)")], rules
+    # a plain `levain init` never gains it
+    plain = tmp_path / "plain"
+    answers = tmp_path / "answers.json"
+    answers.write_text(json.dumps(cl._install_answers()))
+    assert inst.run_init(plain, "claude-code", force=False, answers_file=answers, default_grants="no") == 0
+    assert "Read" not in allow(plain.resolve())
+    assert inst.desk_read_rule_pending(plain.resolve()) is False       # not a desk: nothing pending
+    assert inst.desk_read_rule_pending(target) is False
+
+
+def test_an_older_desk_install_is_brought_to_the_read_rule_once(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    def allow(d):
+        return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
+
+    with monkeypatch.context() as m:
+        m.setattr(inst, "DESK_READ_ALLOW", ())                          # the install as an earlier release made it
+        _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    assert "Read" not in allow(target)
+    assert inst.desk_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "upgrade pending" in status and "levain update --path" in status
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["install_upgrade_pending"] is True
+    # an operator's own rule survives, and `coord agent claude` (the path a desk launch setup takes) adds Read once
+    doc = json.loads((target / ".claude" / "settings.json").read_text())
+    _main(qdir, capsys, "coord", "agent", "claude")
+    got = allow(target)
+    assert got.count("Read") == 1 and inst.desk_read_rule_pending(target) is False
+    assert all(r in got for r in doc["permissions"]["allow"])
+    assert "upgrade pending" not in _main(qdir, capsys, "coord", "status").out
+    again = (target / ".claude" / "settings.json").read_bytes()
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert (target / ".claude" / "settings.json").read_bytes() == again        # the second run changes nothing
+    assert allow(target).count("Read") == 1
+
+
+# --- 1030-47 L3 r1 fixes (the Read rule) ---------------------------------------------------------------------------
+def _older_desk(qdir, capsys, monkeypatch, tmp_home):
+    """A desk install as a release before the Read rule made it."""
+    from levain import install as inst
+
+    with monkeypatch.context() as m:
+        m.setattr(inst, "DESK_READ_ALLOW", ())
+        _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    assert "Read" not in (target / ".claude" / "settings.json").read_text()
+    return target
+
+
+def _only_inserted(old: str, new: str) -> str:
+    """What ``new`` adds to ``old`` when it is ``old`` with one span inserted (every other byte kept), else fail."""
+    i = 0
+    while i < len(old) and old[i] == new[i]:
+        i += 1
+    ins = new[:len(new) - (len(old) - i)][i:]
+    assert old[:i] + ins + old[i:] == new, (old, new)
+    return ins
+
+
+def test_an_edited_older_desk_install_gets_read_and_keeps_every_other_byte(tmp_home, qdir, monkeypatch, capsys):
+    # codex MED + complement MED: a hand-edited settings.json differs from the receipt, so the adapter refresh staged
+    # the package's version and the desk launched without Read; the launch now merges the one rule
+    from levain import install as inst
+
+    target = _older_desk(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    doc["permissions"]["allow"].append("Bash(make test:*)")              # the operator's own rule
+    doc["operatorKey"] = {"kept": 1.50, "as": "written"}
+    f.write_text(json.dumps(doc, indent=4) + "\n")                         # and his own formatting
+    old = f.read_text()
+    out =_main(qdir, capsys, "coord", "agent", "claude")
+    new = f.read_text()
+    assert _only_inserted(old, new).strip(" ,\n") == '"Read"'
+    assert json.loads(new)["permissions"]["allow"] == [*doc["permissions"]["allow"], "Read"]
+    assert not list((target / ".levain").glob("pending/**/settings.json"))  # nothing staged: no adapter refresh ran
+    assert out.out.count("Read allow rule") + out.err.count("Read allow rule") == 1      # said once
+    assert inst.desk_read_rule_pending(target) is False
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert f.read_text() == new                                            # the second run changes nothing
+
+
+def test_a_receipt_less_older_desk_install_gets_read(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    target = _older_desk(qdir, capsys, monkeypatch, tmp_home)
+    target.joinpath(*inst.ADAPTER_RECEIPT_REL).unlink()
+    _main(qdir, capsys, "coord", "agent", "claude")
+    assert json.loads((target / ".claude" / "settings.json").read_text())["permissions"]["allow"].count("Read") == 1
+    assert inst.desk_read_rule_pending(target) is False
+
+
+def test_levain_update_brings_an_edited_older_desk_install_to_read(tmp_home, qdir, monkeypatch, capsys):
+    # the remedy coord status names must clear it, an edited file included
+    from levain import install as inst
+
+    target = _older_desk(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    doc = json.loads(f.read_text())
+    doc["permissions"]["allow"].append("Bash(make test:*)")
+    f.write_text(json.dumps(doc, indent=2) + "\n")
+    with inst.install_lock(target, create=False):
+        inst.refresh_adapter(target, apply=True, emit=lambda _l: None, carrier=False)
+    got = json.loads(f.read_text())["permissions"]["allow"]
+    assert got.count("Read") == 1 and "Bash(make test:*)" in got
+    assert inst.desk_read_rule_pending(target) is False
+
+
+@pytest.mark.parametrize("text, merged", [
+    ('{"hooks": {}}\n', ["Read"]),                                        # no permissions key
+    ('{"permissions": {"deny": ["Edit(x)"]}}\n', ["Read"]),                 # no allow key
+    ('{}', ["Read"]),
+])
+def test_settings_with_no_allow_list_are_pending_and_the_merge_creates_it(tmp_home, qdir, monkeypatch, capsys, text,
+                                                                         merged):
+    # codex MED: a desk whose settings had no permissions/allow read as not pending
+    from levain import install as inst
+
+    target = _older_desk(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    assert inst.desk_read_rule_pending(target) is True
+    assert json.loads(_main(qdir, capsys, "coord", "status", "--json").out)["install_upgrade_pending"] is True
+    assert inst.add_desk_read_rule(target) is True
+    after = json.loads(f.read_text())
+    assert after["permissions"]["allow"] == merged
+    assert {k: v for k, v in after.items() if k != "permissions"} == {k: v for k, v in json.loads(text).items()
+                                                                       if k != "permissions"}
+    assert inst.desk_read_rule_pending(target) is False
+    assert inst.add_desk_read_rule(target) is False                 # nothing left to add
+
+
+@pytest.mark.parametrize("text, why", [
+    ("{not json", "not valid JSON"),
+    ("[1, 2]", "not a JSON object"),
+    ("[" * 200000 + "]" * 200000, "not valid JSON"),                      # deep nesting: RecursionError
+    ('{"permissions": {"allow": "Read"}}', "not a list"),
+    ('{"permissions": ["Read"]}', "not an object"),
+], ids=["bad-json", "array", "deep", "allow-string", "permissions-array"])
+def test_settings_that_cannot_be_merged_are_pending_reported_and_never_overwritten(tmp_home, qdir, monkeypatch,
+                                                                                  capsys, text, why):
+    from levain import install as inst
+
+    target = _older_desk(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    assert inst.desk_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "desk install: settings unreadable" in status and why in status, status
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True and why in js["install_settings_problem"]
+    with pytest.raises(inst.InitError):
+        inst.add_desk_read_rule(target)
+    assert f.read_text() == text                                           # never overwritten
+
+
+@pytest.mark.parametrize("text", [
+    '{"permissions":{"allow":["Bash(a:*)"]},"x":[1,{"y":"]}"}]}',                   # minified, brackets in strings
+    '{"permissions": {"allow": []}, "z": 1}',
+    '{"permissions": {"allow": ["old"]}, "permissions": {"allow": ["kept"]}}',     # json.loads keeps the last
+    '{\n\t"permissions": {\n\t\t"allow": [\n\t\t\t"a",\n\t\t\t"b"\n\t\t]\n\t}\n}\n',
+])
+def test_the_merge_inserts_one_entry_into_any_layout(tmp_home, qdir, monkeypatch, capsys, text):
+    from levain import install as inst
+
+    target = _older_desk(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_text(text)
+    before = json.loads(text)
+    assert inst.add_desk_read_rule(target) is True
+    new = f.read_text()
+    assert _only_inserted(text, new).strip(" ,\n\t") == '"Read"'
+    assert json.loads(new)["permissions"]["allow"] == [*before["permissions"]["allow"], "Read"]
+
+
+def test_a_non_utf8_settings_file_is_pending_reported_and_never_written(tmp_home, qdir, monkeypatch, capsys):
+    # L3 readrule r2 (complement + codex): a non-UTF-8 file raised UnicodeDecodeError out of the reader and crashed
+    # coord status, the launch setup and the update refresh
+    from levain import install as inst
+
+    target = _older_desk(qdir, capsys, monkeypatch, tmp_home)
+    f = target / ".claude" / "settings.json"
+    f.write_bytes(b"\xff\xfe")
+    assert inst.desk_read_rule_pending(target) is True
+    status = _main(qdir, capsys, "coord", "status").out
+    assert "desk install: settings unreadable" in status and "cannot be read" in status, status
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True and "cannot be read" in js["install_settings_problem"]
+    with pytest.raises(inst.InitError):
+        inst.add_desk_read_rule(target)
+    # the launch setup: doctor's hook check reads the same file first and refuses (no live hook), never a traceback
+    out = _main(qdir, capsys, "coord", "agent", "claude", rc=1)
+    assert "consent hook is not live" in out.err and "Traceback" not in out.err
+    from levain.desk.launch import _bring_read_rule
+    said: list[str] = []
+    _bring_read_rule(target, said.append)                                  # the merge step itself says, never raises
+    assert len(said) == 1 and "Read allow rule is still missing" in said[0] and "cannot be read" in said[0]
+    # the update refresh's Read-rule step. host_guard.agent_pin_status reads the same file first and raises
+    # UnicodeDecodeError there too (not this module's reader; routed), so it is stubbed to reach the step
+    from levain import host_guard
+    monkeypatch.setattr(host_guard, "agent_pin_status", lambda _root: None)
+    said = []
+    with inst.install_lock(target, create=False):
+        inst.refresh_adapter(target, apply=True, emit=said.append, carrier=False)
+    assert any("Read allow rule is still missing" in s for s in said), said
+    assert f.read_bytes() == b"\xff\xfe"                                   # never written
+
+
+def test_a_missing_settings_file_is_pending_and_never_created(tmp_home, qdir, monkeypatch, capsys):
+    from levain import install as inst
+
+    target = _older_desk(qdir, capsys, monkeypatch, tmp_home)
+    (target / ".claude" / "settings.json").unlink()
+    assert inst.desk_read_rule_pending(target) is True
+    assert "settings unreadable" in _main(qdir, capsys, "coord", "status").out
+    with pytest.raises(inst.InitError):
+        inst.add_desk_read_rule(target)
+    assert not (target / ".claude" / "settings.json").exists()
+
+
+def test_coord_status_checks_the_default_directory_when_no_cwd_is_stored(tmp_home, qdir, monkeypatch, capsys):
+    # complement LOW 4: a setting with no stored cwd launches into default_desk_dir()
+    # (coord_settings' CHECK refuses a claude row with no cwd, so this is defence only: the status is faked)
+    _older_desk(qdir, capsys, monkeypatch, tmp_home)
+    real = CoordStore.coord_status
+
+    def no_cwd(self):
+        st = real(self)
+        st["setting"] = {**st["setting"], "cwd": None}
+        return st
+
+    monkeypatch.setattr(CoordStore, "coord_status", no_cwd)
+    js = json.loads(_main(qdir, capsys, "coord", "status", "--json").out)
+    assert js["install_upgrade_pending"] is True
+
+
+def test_an_oserror_resolving_a_hooks_off_file_refuses_and_never_crashes(tmp_path, tmp_home, qdir, fake, capsys,
+                                                                         monkeypatch):
+    # complement LOW 6 / deepseek MED-2: a rename still fails loud (the test above), an I/O error does not
+    from levain import doctor
+
+    _main(qdir, capsys, "coord", "agent", "claude")
+    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    (tmp_home / ".claude").mkdir(exist_ok=True)
+    (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
+
+    class Broken:
+        def resolve(self):
+            raise OSError(40, "Too many levels of symbolic links")
+
+    monkeypatch.setattr(doctor, "_hooks_off_files", lambda *_a, **_k: [Broken()])
+    live, detail = cl.hook_live(target, user_scope=False)
+    assert not live and "turned off by" in detail                       # doctor's row stands: a refusal, not a pass
+
+# --- a drop that lands while a done desk idles (1030-42; the shadow day, 10-30 17:33) --------------------
+def _released_and_done(store, fake, clock):
+    """The measured case: a desk woke on drop 1, split it, released its lease and sits listed, state done."""
+    from datetime import timedelta
+
+    from levain.desk.store import Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d1, _ = store.accept_drop("first drop", surface="cli")
+    store.split(d1.drop_id, [Part("work", "w1")], by=ROLE_DESK, token=token)
+    store.coord_release(token, by=ROLE_DESK)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=3)
+    return ln
+
+
+def test_a_drop_after_a_done_desk_released_gets_a_fresh_desk_in_one_pass(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)
+    d2, _ = store.accept_drop("drop after the release", surface="cli")
+    assert store.coord_status()["wake"] == "idle" and store.coord_status()["lease"] is None     # the measured state
+    clock[0] += timedelta(seconds=30)
+    lines = cl.watch_once(store)
+    assert any(line.startswith(f"launch {ln.launch_id} ended: {lease.REPLACED}") for line in lines), lines
+    assert any(line.startswith(f"launch {ln.launch_id} ended ({lease.REPLACED}): claude stop {HID}") for line in lines)
+    assert len(fake.spawns()) == 2
+    fresh = [x for x in store.launches_active() if x.launch_id != ln.launch_id]
+    assert len(fresh) == 1 and store.launch(ln.launch_id).state == "ended"
+    brief = cl.brief_path(fresh[0]).read_text()
+    assert d2.drop_id in brief and "drop after the release" in brief          # its brief quotes the waiting drop
+    # the fresh one has not yet written and the drop is older than its activation: later passes leave it alone
+    for _ in range(2):
+        clock[0] += timedelta(seconds=30)
+        cl.watch_once(store)
+    assert len(fake.spawns()) == 2 and [x.launch_id for x in store.launches_active()] == [fresh[0].launch_id]
+
+
+def test_a_replaced_desk_that_wrote_is_no_death(store, fake, live_hook, clock):
+    from levain.desk import lease as lease_mod
+
+    ln = _released_and_done(store, fake, clock)
+    store.accept_drop("drop after the release", surface="cli")
+    cl.watch_once(store)
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease_mod.launch_death(conn, lease_mod.launch(conn, ln.launch_id)) is False
+    finally:
+        conn.close()
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_a_working_desk_without_the_lease_is_not_replaced(store, fake, live_hook, clock):
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    store.coord_release(token, by=ROLE_DESK)                        # the fake lists it working (no done flag)
+    store.accept_drop("a drop while it works", surface="cli")
+    lines = cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and fake.stops() == []
+    assert store.launch(ln.launch_id).state == "active" and not any(lease.REPLACED in x for x in lines)
+
+
+def test_a_done_desk_that_already_saw_every_drop_is_not_replaced(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)         # drop 1 was split before the release: nothing unseen waits
+    clock[0] += timedelta(minutes=1)
+    cl.watch_once(store)
+    assert len(fake.spawns()) == 1 and store.launch(ln.launch_id).state == "active"
+
+
+def test_a_drop_the_done_desk_never_saw_is_replaced_even_with_its_lease_live(store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    ln = started(store)
+    store.coord_claim(ln.launch_id, ln.session_key)      # it holds a live lease and went done without releasing
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop for the done holder", surface="cli")
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "ended" and len(fake.spawns()) == 2
+
+
+# --- L3 r1 (1030-42): the unseen rule, the replacement is no death, the uncapped in-transaction check -------------
+def test_a_desk_that_never_wrote_then_done_is_replaced_and_its_successor_starts(store, fake, live_hook, clock):
+    # codex HIGH 1's reproduction: active, never claimed or wrote, done, then a drop it never saw
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=2)
+    store.accept_drop("a drop for the silent desk", surface="cli")
+    lines = cl.watch_once(store)
+    assert store.launch(ln.launch_id).cause == lease.REPLACED, lines
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease.launch_death(conn, lease.launch(conn, ln.launch_id)) is False
+    finally:
+        conn.close()
+    fresh = [x for x in store.launches_active() if x.launch_id != ln.launch_id]
+    assert len(fresh) == 1 and len(fake.spawns()) == 2, lines
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_a_desk_writing_after_the_drop_without_reading_it_is_still_replaced(store, fake, live_hook, clock):
+    # codex HIGH 2 / complement MED 1: a later beat or release is no evidence the drop was seen
+    from datetime import timedelta
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    clock[0] += timedelta(seconds=10)
+    store.accept_drop("lands mid-turn", surface="cli")
+    clock[0] += timedelta(seconds=10)
+    store.coord_beat(token)
+    store.coord_release(token, by=ROLE_DESK)
+    fake.flag("done")
+    clock[0] += timedelta(seconds=10)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).cause == lease.REPLACED and len(fake.spawns()) == 2
+
+
+def test_one_replacement_per_drop_a_replacement_that_leaves_the_drop_unsplit_is_not_replaced(
+        store, fake, live_hook, clock):
+    from datetime import timedelta
+
+    a = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    d, _ = store.accept_drop("the drop after A", surface="cli")
+    cl.watch_once(store)
+    (b,) = [x for x in store.launches_active() if x.launch_id != a.launch_id]
+    assert store.launch(a.launch_id).cause == lease.REPLACED
+    # B went done too and never split d (the fake still lists the one session done): d is older than B's start
+    for _ in range(3):
+        clock[0] += timedelta(minutes=1)
+        lines = cl.watch_once(store)
+        assert not any(lease.REPLACED in x and "ended:" in x for x in lines), lines
+    assert store.launch(b.launch_id).state == "active" and len(fake.spawns()) == 2
+    assert not any(r.body.get("stage") == "split" for r in store.drop_receipts(d.drop_id))
+
+
+def test_the_unseen_check_is_uncapped_201_drops_the_oldest_unsplit(store, fake, live_hook, clock):
+    # codex MED 3: the newest 200 split by you, the oldest (after the desk's start) left unsplit
+    from datetime import timedelta
+
+    from levain.desk.store import Part
+
+    ln = started(store)
+    fake.flag("done")
+    drops = []
+    for i in range(201):
+        clock[0] += timedelta(milliseconds=5)
+        drops.append(store.accept_drop(f"drop {i}", surface="cli")[0])
+    for d in drops[1:]:
+        store.split(d.drop_id, [Part("note", "n")])
+    got = store.launch_replace_done(ln.launch_id)
+    assert got is not None and got[0].cause == lease.REPLACED
+
+
+def test_a_split_between_the_listing_and_the_transaction_ends_nothing(store, fake, live_hook, clock, monkeypatch):
+    from datetime import timedelta
+
+    from levain.desk.store import Part
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    d, _ = store.accept_drop("split by you at the last moment", surface="cli")
+    real = store.launch_replace_done
+
+    def split_first(launch_id, **kw):
+        store.split(d.drop_id, [Part("work", "w")])          # you split it after the watcher read the listing
+        return real(launch_id, **kw)
+
+    monkeypatch.setattr(store, "launch_replace_done", split_first)
+    cl.watch_once(store)
+    assert store.launch(ln.launch_id).state == "active" and len(fake.spawns()) == 1 and fake.stops() == []
+
+
+def test_replacing_stops_at_the_first_fresh_launch(monkeypatch):
+    # complement LOW 3: two done desks, one fresh launch: the second is never ended with none to follow it
+    from types import SimpleNamespace
+
+    a = SimpleNamespace(launch_id="ln-a", role=ROLE_DESK, harness_session_id="sa")
+    b = SimpleNamespace(launch_id="ln-b", role=ROLE_DESK, harness_session_id="sb")
+    asked: list[str] = []
+
+    def replace(launch_id, **kw):
+        asked.append(launch_id)
+        return SimpleNamespace(launch_id=launch_id, cause=lease.REPLACED), SimpleNamespace(launch_id="ln-new",
+                                                                                           harness="claude")
+
+    st = SimpleNamespace(launch_replace_done=replace)
+    lines: list[str] = []
+    fresh = cl._replace_done(st, [a, b], {"sa": {"state": "done"}, "sb": {"state": "done"}}, lines)
+    assert fresh == ["ln-new"] and asked == ["ln-a"]
+
+
+def test_a_fault_starting_the_fresh_desk_is_a_line_and_the_briefs_still_go(store, fake, live_hook, clock,
+                                                                                   monkeypatch):
+    # complement LOW 2
+    from datetime import timedelta
+
+    ln = started(store)
+    fake.flag("done")
+    clock[0] += timedelta(minutes=1)
+    store.accept_drop("a drop", surface="cli")
+    brief = cl.brief_path(ln)
+    assert brief.exists()
+
+    def boom(st, launch_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(cl, "launch_session", boom)
+    lines = cl.watch_once(store)
+    assert any("not started: the start faulted (OperationalError" in x for x in lines), lines
+    assert not brief.exists() and f"launch {ln.launch_id} ended: its brief removed" in lines
+
+
+# --- levain desk wake reaches an idle released desk (desk 1 / flow-shadow addendum) ----------------------
+def test_coord_wake_replaces_a_done_desk_running_without_the_lease(store, qdir, fake, live_hook, clock, capsys):
+    ln = _released_and_done(store, fake, clock)
+    assert store.coord_status()["wake"] == "idle"
+    out = _main(qdir, capsys, "coord", "wake")
+    assert f"launch {ln.launch_id} ended: {lease.REPLACED} (claude stop {HID}: stopped {HID})" in out.out, out.out
+    assert f"claude attach {HID}" in out.out
+    assert store.launch(ln.launch_id).cause == lease.REPLACED and len(fake.spawns()) == 2
+    assert [c for c in fake.stops()] == [["stop", HID]]
+    assert store.coord_status()["wake"] == "held"
+
+
+def test_coord_wake_leaves_a_working_desk_and_names_the_way_out(store, qdir, fake, live_hook, clock, capsys):
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    store.coord_release(token, by=ROLE_DESK)                 # the fake lists it working
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "no launch asked for:" in out.out and "not done" in out.out and "levain desk release" in out.out
+    assert store.launch(ln.launch_id).state == "active" and len(fake.spawns()) == 1 and fake.stops() == []
+
+
+def test_coord_wake_with_an_unreadable_listing_says_so(store, qdir, fake, live_hook, clock, capsys):
+    ln = _released_and_done(store, fake, clock)
+    fake.flag("agents_fail")
+    out = _main(qdir, capsys, "coord", "wake", rc=1)
+    assert "could not be read" in out.out and "levain desk release" in out.out
+    assert store.launch(ln.launch_id).state == "active"
+
+
+# --- the turn's last line, and a drop that needs nothing (1030-42 brief lane) ------------------------------------
+def test_the_written_brief_ends_the_turn_on_a_desk_status_line(store, fake, live_hook):
+    """Shadow 10-30: a desk that ended on "escalated questions #2-#5 ... each waits on you" sat in the agent
+    view as waiting for the operator. The brief carries the end-of-turn rule, quoted."""
+    got = cl.launch_session(store, woken(store))
+    text = cl.brief_path(store.launch(got.launch_id)).read_text()
+    assert "ONE status line beginning `desk:`" in text
+    assert "never a question, never \"waits on you\"" in text
+    assert "coord escalate" in text.split("## How your turn ends")[1].split("##")[0]
+    assert "release the lease" in text
+
+
+def test_a_noted_drop_is_not_unseen_not_requoted_and_shows_noted(store, qdir, fake, live_hook, clock, capsys):
+    from datetime import timedelta
+
+    ln = _released_and_done(store, fake, clock)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d2, _ = store.accept_drop("fyi: nothing to do here", surface="cli")
+    store.note(d2.drop_id, "an fyi, nothing to act on", token=token)
+    store.coord_release(token, by=ROLE_DESK)
+    conn = sqlite3.connect(store.path)
+    try:
+        assert lease.unseen_drop(conn, lease.launch(conn, ln.launch_id)) is None
+    finally:
+        conn.close()
+    clock[0] += timedelta(seconds=30)
+    lines = cl.watch_once(store)
+    assert not any(lease.REPLACED in line for line in lines) and len(fake.spawns()) == 1       # no replacement
+    assert d2.drop_id not in cl._brief_text(store, ln)                                          # not re-quoted
+    out = _main(qdir, capsys, "drops", "list")
+    assert f"{d2.drop_id}" in out.out and '[noted: "an fyi, nothing to act on"]' in out.out
+    out = _main(qdir, capsys, "drops", "show", d2.drop_id)
+    assert "noted" in out.out and "an fyi, nothing to act on" in out.out
+
+
+def test_only_the_lease_holder_notes_and_split_and_noted_exclude_each_other(store, qdir, fake, live_hook, clock, capsys):
+    from levain.desk.store import CoordError, Part
+
+    ln = started(store)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "why", token=token + 1)                      # not the live lease's token
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "why", token=None)
+    store.split(d2.drop_id, [Part("work", "w")], by=ROLE_DESK, token=token)
+    with pytest.raises(CoordError, match="already split"):
+        store.note(d2.drop_id, "why", token=token)                          # a split drop is not noted
+    store.note(d1.drop_id, "read it", token=token)
+    with pytest.raises(CoordError, match="already noted"):
+        store.note(d1.drop_id, "again", token=token)
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--why", "x", "--token", str(token), rc=1)
+    assert "already noted" in out.err
+    store.coord_release(token, by=ROLE_DESK)
+    with pytest.raises(CoordError):
+        store.note(d1.drop_id, "after release", token=token)               # a lapsed lease writes nothing
+
+
+def test_the_briefs_release_line_runs_as_the_desk_and_ends_the_lease(store, qdir, fake, live_hook, capsys):
+    """L3 r1: the end-of-turn rule named a bare `coord release` (defaults --by operator, no token, no --queue-dir)."""
+    got = cl.launch_session(store, woken(store))
+    ln = store.launch(got.launch_id)
+    text = cl.brief_path(ln).read_text()
+    section = text.split("## How your turn ends")[1].split("##")[0]
+    cmd = re.search(r"`([^`]*coord release[^`]*)`", section).group(1)
+    argv = shlex.split(cmd)
+    token = store.coord_claim(ln.launch_id, ln.session_key)
+    argv = [str(token) if a == "N" else a for a in argv]
+    from levain.cli import main
+
+    assert main(argv[argv.index("coord"):]) == 0, capsys.readouterr()
+    held = store.coord_status()["lease"]
+    assert held is None or not held["live"]
+
+
+def test_drops_list_is_one_snapshot_and_a_store_error_is_a_refusal(store, qdir, monkeypatch, capsys):
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    opens = []
+    real = store._connect
+    monkeypatch.setattr(store, "_connect", lambda *a, **k: (opens.append(1), real(*a, **k))[1])
+    pairs = store.drops_noted(limit=10)
+    assert len(opens) == 1 and [d.drop_id for d, _ in pairs] == [d2.drop_id, d1.drop_id]
+    from levain.desk.store import CoordStore as CS
+
+    def boom(self, limit=50):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(CS, "drops_noted", boom)
+    out = _main(qdir, capsys, "drops", "list", rc=1)
+    assert "levain drops list:" in out.err and "Traceback" not in out.err
+
+
+def test_drops_show_escapes_a_noted_why_and_survives_a_receipt_with_no_why(store, qdir, capsys):
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    with store._write() as (conn, now):
+        store._reply(conn, None, "drop_receipt", "drops", d1.drop_id,
+                     {"stage": "noted", "drop_id": d1.drop_id, "why": "x\x1b[2Jy"}, now)
+        store._reply(conn, None, "drop_receipt", "drops", d2.drop_id, {"stage": "noted", "drop_id": d2.drop_id}, now)
+    out = _main(qdir, capsys, "drops", "show", d1.drop_id)
+    assert "\x1b" not in out.out and "noted" in out.out
+    out = _main(qdir, capsys, "drops", "show", d2.drop_id)
+    assert "noted" in out.out
+
+
+# --- quoting-free desk verbs (1030-42 verbs; shadow 10-30: two of three real desks misfired) -----------
+HOSTILE = "it's \"quoted\" $HOME `date` \\ backslash; ünïcode ✓ 日本"
+
+
+def _held(store):
+    ln = started(store)
+    return store.coord_claim(ln.launch_id, ln.session_key)
+
+
+def test_a_hostile_note_why_goes_through_a_file_and_stdin_as_typed(store, qdir, fake, live_hook, capsys, tmp_path,
+                                                                    monkeypatch):
+    import io
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(f), "--by", ROLE_DESK, "--token", str(token))
+    assert [r.body["why"] for r in store.drop_receipts(d1.drop_id) if r.body.get("stage") == "noted"] == [HOSTILE]
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO((HOSTILE + "\n").encode("utf-8"))))
+    _main(qdir, capsys, "drops", "note", d2.drop_id, "--stdin", "--by", ROLE_DESK, "--token", str(token))
+    assert [r.body["why"] for r in store.drop_receipts(d2.drop_id) if r.body.get("stage") == "noted"] == [HOSTILE]
+
+
+def test_an_oversized_or_two_way_text_is_refused_by_the_same_limits(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    big = tmp_path / "big.txt"
+    big.write_text("x" * 201, encoding="utf-8")                                   # the --why limit is 200
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(big), "--token", str(token), rc=1)
+    assert "1 to 200 characters" in out.err
+    huge = tmp_path / "huge.txt"
+    huge.write_text("x" * 100_000, encoding="utf-8")                              # the read itself is bounded
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(huge), "--token", str(token), rc=1)
+    assert "holds more than" in out.err
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--why", "a", "--text-file", str(big), "--token", str(token),
+                rc=1)
+    assert "name the text once" in out.err
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--token", str(token), rc=1)
+    assert "say why" in out.err
+    bad = tmp_path / "bad.bin"
+    bad.write_bytes(b"\xff\xfe")
+    out = _main(qdir, capsys, "drops", "note", d1.drop_id, "--text-file", str(bad), "--token", str(token), rc=1)
+    assert "not UTF-8" in out.err
+
+
+def test_a_whole_split_is_one_json_document_with_hostile_titles(store, qdir, fake, live_hook, capsys, tmp_path,
+                                                                 monkeypatch):
+    """The 10-30 misfire: three splits in one shell line with the flags in a variable zsh did not split."""
+    import io
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    doc = tmp_path / "split.json"
+    doc.write_text(json.dumps({"drop_id": d1.drop_id,
+                               "threads": [{"kind": "work", "title": HOSTILE}, {"kind": "note", "title": "n", "about": "@1"}]}),
+                   encoding="utf-8")
+    out = _main(qdir, capsys, "drops", "split", "--json-file", str(doc), "--by", ROLE_DESK, "--token", str(token))
+    assert "split into 2 threads" in out.out
+    titles = {t.title for t in store.threads()}
+    assert HOSTILE in titles and "n" in titles
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(json.dumps(
+        {"threads": [{"kind": "note", "title": HOSTILE + " 2"}]}).encode("utf-8"))))
+    out = _main(qdir, capsys, "drops", "split", d2.drop_id, "--stdin", "--by", ROLE_DESK, "--token", str(token))
+    assert "split into 1 thread" in out.out and HOSTILE + " 2" in {t.title for t in store.threads()}
+
+
+def test_a_json_split_is_refused_by_the_same_checks_as_the_flags(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    doc = tmp_path / "split.json"
+    for body, why in ((json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "work", "title": "x" * 201}]}), "1 to 200"),
+                      (json.dumps({"drop_id": d1.drop_id, "threads": [{"kind": "bogus", "title": "x"}]}), "exactly one of"),
+                      ("{not json", "not JSON"),
+                      (json.dumps({"drop_id": d1.drop_id, "extra": 1}), "only"),
+                      (json.dumps({"threads": []}), "drop_id")):
+        doc.write_text(body, encoding="utf-8")
+        out = _main(qdir, capsys, "drops", "split", "--json-file", str(doc), "--by", ROLE_DESK, "--token", str(token),
+                    rc=1)
+        assert why in out.err, (body, out.err)
+    out = _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:t", "--json-file", str(doc),
+                "--by", ROLE_DESK, "--token", str(token), rc=1)
+    assert "carries every thread itself" in out.err
+    assert store.threads() == []                                                   # nothing was written
+
+
+def test_the_old_flags_still_work_unchanged(store, qdir, fake, live_hook, capsys):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:Shadow probe", "--by", ROLE_DESK,
+          "--token", str(token))
+    _main(qdir, capsys, "drops", "note", d2.drop_id, "--why", "fyi", "--by", ROLE_DESK, "--token", str(token))
+    t = store.threads()[0]
+    _main(qdir, capsys, "thread", "set", t.thread_id, "title", "renamed", "--by", ROLE_DESK, "--token", str(token))
+    _main(qdir, capsys, "thread", "state", t.thread_id, "done", "--cause", "done", "--by", ROLE_DESK,
+          "--token", str(token))
+    assert store.thread_view(t.thread_id)[0].title == "renamed"
+
+
+def test_thread_set_state_and_add_take_hostile_text_from_a_file(store, qdir, fake, live_hook, capsys, tmp_path):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    _main(qdir, capsys, "drops", "split", d1.drop_id, "--thread", "note:first", "--by", ROLE_DESK, "--token", str(token))
+    t = store.threads()[0]
+    f = tmp_path / "v.txt"
+    f.write_text(HOSTILE, encoding="utf-8")
+    _main(qdir, capsys, "thread", "set", t.thread_id, "title", "--text-file", str(f), "--by", ROLE_DESK,
+          "--token", str(token))
+    assert store.thread_view(t.thread_id)[0].title == HOSTILE
+    out = _main(qdir, capsys, "thread", "set", t.thread_id, "title", "--by", ROLE_DESK, "--token", str(token), rc=1)
+    assert "give the new value" in out.err
+    c = tmp_path / "c.txt"
+    c.write_text("because " + HOSTILE, encoding="utf-8")
+    _main(qdir, capsys, "thread", "state", t.thread_id, "done", "--cause-file", str(c), "--by", ROLE_DESK,
+          "--token", str(token))
+    f.write_text("note:" + HOSTILE + " added", encoding="utf-8")
+    _main(qdir, capsys, "thread", "add", d1.drop_id, "--text-file", str(f), "--by", ROLE_DESK, "--token", str(token))
+    assert HOSTILE + " added" in {x.title for x in store.threads()}
+
+
+def test_escalate_and_answer_take_their_text_from_a_file(store, qdir, tmp_path, monkeypatch):
+    import argparse
+
+    from levain.desk import cli as ccli
+
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    ns = argparse.Namespace(text_file=f, stdin=False)
+    assert ccli._text_input(ns, None, "--why") == HOSTILE and ccli._text_input(
+        argparse.Namespace(text_file=None, stdin=False), "inline", "--why") == "inline"
+    p = argparse.ArgumentParser()
+    ccli.add_parsers(p.add_subparsers(dest="command"))
+    for argv in (["coord", "escalate", "6", "--text-file", str(f), "--token", "1"],
+                 ["coord", "escalate", "6", "--stdin", "--token", "1"],
+                 ["coord", "answer", "6", "--text-file", str(f), "--token", "1"],
+                 ["coord", "answer", "6", "--stdin", "--token", "1"]):
+        got = p.parse_args(argv)
+        assert got.coord_cmd in ("escalate", "answer")
+
+
+def test_the_brief_leads_with_the_quoting_free_forms_and_one_unmistakable_release_rule(store, fake, live_hook):
+    got = cl.launch_session(store, woken(store))
+    text = cl.brief_path(store.launch(got.launch_id)).read_text()
+    assert "Prefer the forms that need no shell quoting" in text
+    assert "never keep flags in a shell variable (zsh does not split it)" in text
+    writes = text.split("## Your writes")[1].split("##")[0]
+    assert writes.index("--json-file PATH") < writes.index("the older quoted forms still work")
+    assert f"drops note DROP_ID --text-file PATH --by desk --token N --queue-dir " in writes
+    lease_part = text.split("## The lease")[1].split("## Your writes")[0]
+    assert "ONLY as the very last step and as its own command, after every split, note and escalate has returned" in lease_part
+
+
+# --- L3 r2 LOWs on the brief branch (1030-42 verbs) ---------------------------------------------------------------
+def test_a_drop_split_after_it_was_noted_no_longer_lists_as_noted(store, qdir, fake, live_hook, capsys):
+    from levain.desk.store import Part
+
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    d2, _ = store.accept_drop("two", surface="cli")
+    store.note(d1.drop_id, "read it", token=token)
+    store.note(d2.drop_id, "read it too", token=token)
+    store.split(d1.drop_id, [Part("work", "changed my mind")], by=ROLE_DESK, token=token)
+    whys = {d.drop_id: w for d, w in store.drops_noted(limit=10) if d.drop_id in (d1.drop_id, d2.drop_id)}
+    assert whys == {d1.drop_id: None, d2.drop_id: "read it too"}
+    out = _main(qdir, capsys, "drops", "list").out
+    assert f"{d2.drop_id}" in out and out.count("[noted:") == 1
+
+
+def test_note_returns_the_saved_why_and_the_cli_echoes_that(store, qdir, fake, live_hook, capsys):
+    token = _held(store)
+    d1, _ = store.accept_drop("one", surface="cli")
+    assert store.note(d1.drop_id, "  padded  ", token=token) == "  padded  "
+    saved = [r.body["why"] for r in store.drop_receipts(d1.drop_id) if r.body.get("stage") == "noted"]
+    assert saved == ["  padded  "]
+
+
+def test_a_noted_receipt_renders_as_noted_on_the_phone_not_as_zero_threads():
+    from levain.desk import phone as ph
+
+    r = type("R", (), {"body": {"stage": "noted", "why": "an fyi", "threads": []}, "at": "2026-10-30T10:00:00Z"})()
+    row = ph.CoordPhone._receipt(r) if hasattr(ph, "CoordPhone") else None
+    assert row is not None and row["stage"] == "noted" and row["why"] == "an fyi"
+
+
+# --- L3 r1 (1030-47) on the JSON split and the text files ------------------------------------------------------------
+def _split_refused(body, why):
+    from levain.desk import cli as ccli
+    from levain.desk.store import CoordError
+
+    with pytest.raises(CoordError, match=why):
+        ccli._split_doc(body, None)
+
+
+def test_a_json_split_refuses_a_key_named_twice_at_any_level():
+    _split_refused('{"drop_id": "D", "threads": [], "threads": []}', "twice")
+    _split_refused('{"drop_id": "D", "threads": [{"kind": "note", "title": "a", "title": "b"}]}', "'title' twice")
+
+
+def test_a_deeply_nested_json_split_is_a_refusal_not_a_traceback():
+    _split_refused("[" * 100_000, "nested too deeply")
+
+
+def test_a_json_split_row_kind_is_exactly_a_kind_and_a_colon_cannot_mangle_it():
+    _split_refused('{"drop_id": "D", "threads": [{"kind": "note:x", "title": "t"}]}', "exactly one of")
+    _split_refused('{"drop_id": "D", "attach": [{"kind": "note:x", "thread": "T"}]}', "exactly one of")
+    _split_refused('{"drop_id": "D", "attach": [{"kind": "note", "thread": "a:b"}]}', 'without ":"')
+    from levain.desk import cli as ccli
+
+    _, parts = ccli._split_doc('{"drop_id": "D", "threads": [{"kind": "note", "title": "a: b"}]}', None)
+    assert parts[0].title == "a: b"
+
+
+def test_a_json_split_with_no_parts_is_refused_by_name():
+    _split_refused('{"drop_id": "D"}', "names no threads")
+    _split_refused('{"drop_id": "D", "threads": []}', "names no threads")
+
+
+def test_a_json_split_names_the_field_with_a_wrong_type():
+    for row, why in (({"kind": "note", "title": 5}, '"title"'), ({"kind": "note", "title": ""}, '"title"'),
+                     ({"kind": "note", "title": "t", "about": 3}, '"about"'),
+                     ({"kind": "note", "title": "t", "about": ""}, '"about"')):
+        _split_refused(json.dumps({"drop_id": "D", "threads": [row]}), why)
+    _split_refused(json.dumps({"drop_id": "D", "attach": [{"kind": "note", "thread": 7}]}), '"thread"')
+
+
+def test_a_utf8_bom_in_an_input_file_is_dropped(tmp_path):
+    from levain.desk import cli as ccli
+
+    f = tmp_path / "bom.json"
+    f.write_bytes(b"\xef\xbb\xbf" + b'{"drop_id": "D", "threads": [{"kind": "note", "title": "t"}]}\n')
+    assert ccli._split_doc(ccli._read_input(f), None)[0] == "D"
+
+
+def test_escalate_with_a_hostile_text_file_stores_it_as_typed(band, monkeypatch, tmp_path, capsys):
+    from levain.cli import main
+    from levain.desk import cli as ccli
+
+    q = band.ask()
+    f = tmp_path / "why.txt"
+    f.write_text(HOSTILE + "\n", encoding="utf-8")
+    monkeypatch.setattr(ccli, "_store", lambda args: band.store)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-coord")
+    from levain.desk import door
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    door.record(ws)
+    monkeypatch.chdir(ws)
+    rc = main(["coord", "escalate", str(q.n), "--text-file", str(f), "--token", str(band.token),
+               "--queue-dir", str(band.store.directory)])
+    assert rc == 0, capsys.readouterr().err
+    bodies = [json.loads(r[0]) for r in band.c.rows("SELECT body FROM replies WHERE kind = 'answer'")]
+    assert [b["why"] for b in bodies] == [HOSTILE]
+
+
+# --- Q17-COLD: a desk whose NEEDS YOU band cannot render is not started ------------------------------------
+def _breakable_install(tmp_home, qdir, capsys):
+    _main(qdir, capsys, "coord", "agent", "claude")
+    return (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+
+
+def _launch_pending(qdir):
+    store = CoordStore(qdir)
+    store.accept_drop("band check", surface="cli")
+    return cl.launch_session(store, store.pending_desk().launch_id)
+
+
+def test_a_desk_whose_band_scripts_are_gone_is_refused_and_doctor_fails(tmp_home, qdir, fake, capsys):
+    from levain import doctor
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    (row,) = [r for r in doctor._check_claude_code(target) if r.name == doctor.BAND_HOOKS_ROW]
+    assert row.ok, row                                   # everything wired: doctor passes
+    assert cl.hook_live(target, user_scope=False)[0]     # ... and so does the launch's check
+    for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
+        (target / "activation" / "hooks" / n).unlink()
+    (row,) = [r for r in doctor._check_claude_code(target) if r.name == doctor.BAND_HOOKS_ROW]
+    assert not row.ok and not row.warn and row.detail.startswith("absent") and row.hint == "levain update"
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "NEEDS YOU band hooks" in why and f"levain update --path {target}" in why
+    got = _launch_pending(qdir)
+    assert not got.started and "NEEDS YOU band" in got.refusal
+    assert fake.spawns() == []                           # nothing was started
+
+
+def test_a_desk_whose_hook_interpreter_cannot_import_the_band_is_refused(tmp_home, qdir, fake, capsys):
+    from levain import doctor
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    # an interpreter with no levain on its path: it runs, and every band hook swallows the failed import
+    bare = tmp_home / "bare-python"
+    bare.write_text("#!/bin/sh\necho \"ModuleNotFoundError: No module named 'levain'\" >&2\nexit 1\n")
+    bare.chmod(0o755)
+    settings = target / ".claude" / "settings.json"
+    text = settings.read_text()
+    assert json.dumps(sys.executable)[1:-1] in text
+    settings.write_text(text.replace(json.dumps(sys.executable)[1:-1], str(bare)))
+    (row,) = [r for r in doctor._check_claude_code(target) if r.name == doctor.BAND_HOOKS_ROW]
+    assert not row.ok and "cannot import levain.band_view" in row.detail and str(bare) in row.detail
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "cannot import levain.band_view" in why and "Fix:" in why
+    got = _launch_pending(qdir)
+    assert not got.started and "NEEDS YOU band" in got.refusal and fake.spawns() == []
+    # the shown fix puts it right
+    settings.write_text(text)
+    assert cl.hook_live(target, user_scope=False)[0]
+
+
+def test_the_cockpit_panel_shows_one_line_when_the_band_cannot_render(tmp_home, qdir, fake, capsys, monkeypatch):
+    from levain.cockpit import desk_status as cs
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    setting = {"agent": "claude", "cwd": str(target)}
+    monkeypatch.setattr(cs, "_band_cache", {})
+    assert cs.band_row(setting) is None
+    (target / "activation" / "hooks" / "stop.py").write_text("pass\n")
+    monkeypatch.setattr(cs, "_band_cache", {})
+    row = cs.band_row(setting)
+    assert row is not None and "NEEDS YOU band cannot render" in str(row) and f"levain update --path {target}" in str(row)
+
+
+def test_band_problem_reads_doctors_row_for_codex_too(tmp_path):
+    # the Codex launch's hook check calls this same function with its rows; a workspace with no band scripts is refused
+    bad = cl.band_problem(None, tmp_path, "codex")
+    assert bad is not None and "absent" in bad and f"levain update --path {tmp_path}" in bad
+    hooks = tmp_path / "activation" / "hooks"
+    hooks.mkdir(parents=True)
+    for n in ("session_start.py", "user_prompt_submit.py", "stop.py"):
+        (hooks / n).write_text("from levain.band_view import x\n")
+    # scripts that name the band are not a band: nothing registers them (a fresh install passes: test_band_every_seat)
+    bad = cl.band_problem(None, tmp_path, "codex")
+    assert bad is not None and "absent" in bad
+
+
+def test_a_desk_whose_user_prompt_submit_registration_is_gone_is_refused_and_doctor_fails(
+        tmp_home, qdir, fake, capsys):
+    # codex #3: with the scripts on disk and the UserPromptSubmit registration gone, doctor once found no interpreter
+    # to probe and passed the row, and the launch did not read the settings row: a desk with no per-prompt band
+    from levain import doctor
+    from levain.host_guard import cc_levain_hooks_file
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    assert cl.hook_live(target, user_scope=False)[0]
+    f = cc_levain_hooks_file(target)
+    doc = json.loads(f.read_text())
+    doc["hooks"]["UserPromptSubmit"] = [g for g in doc["hooks"]["UserPromptSubmit"]
+                                        if "user_prompt_submit.py" not in json.dumps(g)]
+    f.write_text(json.dumps(doc, indent=2))
+    assert all((target / "activation" / "hooks" / n).is_file()
+               for n in ("session_start.py", "user_prompt_submit.py", "stop.py"))
+    (row,) = [r for r in doctor._check_claude_code(target) if r.name == doctor.BAND_HOOKS_ROW]
+    assert not row.ok and "UserPromptSubmit is not registered" in row.detail and row.hint == "levain update"
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "NEEDS YOU band hooks" in why and f"levain update --path {target}" in why
+    got = _launch_pending(qdir)
+    assert not got.started and "NEEDS YOU band" in got.refusal and fake.spawns() == []
+
+
+def test_a_launch_runs_each_band_import_probe_once(tmp_home, qdir, fake, capsys, monkeypatch):
+    # deepseek #5: the launch checked the band twice, each time spawning the hook's interpreter
+    from levain import doctor
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    runs = []
+    real = doctor._run_band_probe
+    monkeypatch.setattr(doctor, "_run_band_probe", lambda *a: runs.append(a) or real(*a))
+    assert cl.hook_live(target, user_scope=False)[0]
+    assert len(runs) == 1                                    # the install's band only: the user-level row is not run
+    runs.clear()
+    with doctor.band_probe_once():
+        for _ in range(3):
+            assert cl.hook_live(target, user_scope=False)[0]
+    assert len(runs) == 1
+    runs.clear()
+    _launch_pending(qdir)
+    assert len(runs) == 1
+
+
+def test_a_stale_band_install_is_refused_naming_levain_update_and_update_clears_it(tmp_home, qdir, fake, capsys):
+    # an install from a release whose stop.py did not call the band: unedited (the activation receipt says levain wrote
+    # it), so `levain update` refreshes it
+    import hashlib
+
+    from levain.install import activation_receipt_path
+    from levain.update import run_update
+
+    target = _breakable_install(tmp_home, qdir, capsys)
+    old = b"# an older release's stop hook\n"
+    (target / "activation" / "hooks" / "stop.py").write_bytes(old)
+    rp = activation_receipt_path(target)
+    data = json.loads(rp.read_text())
+    data["files"]["hooks/stop.py"]["installed"] = hashlib.sha256(old).hexdigest()
+    rp.write_text(json.dumps(data))
+    live, why = cl.hook_live(target, user_scope=False)
+    assert not live and "stale" in why and f"Fix: `levain update --path {target}`" in why
+    got = _launch_pending(qdir)
+    assert not got.started and f"levain update --path {target}" in got.refusal and fake.spawns() == []
+    lines: list[str] = []
+    run_update(target, no_pip=True, emit=lines.append)
+    assert (target / "activation" / "hooks" / "stop.py").read_bytes() != old
+    assert cl.band_problem(None, target, "claude_code") is None, lines
+    assert cl.hook_live(target, user_scope=False)[0]
+
+
+# --- an install still set to the removed Codex desk (L3 r1 of the deletion) -----------------------------------
+def _legacy_codex_setting(store, cwd):
+    """A ``coord_settings`` row ``agent=codex`` as v0.11.15's ``levain desk agent codex`` wrote it: the store no longer
+    writes one, an install upgraded from then still holds it."""
+    with store._write() as (conn, now):
+        conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) "
+                     "VALUES (?, 'codex', NULL, ?, 0, 'operator', ?)", (lease.next_gseq(conn, now), cwd, now))
+
+
+def _legacy_codex_launch(store, cwd, key="s-c0dec0dec0dec0de"):
+    """A pending Codex desk launch and its bootstrap claim, as a wake under that setting wrote them before the
+    upgrade (the same two rows :func:`levain.desk.lease.wake` writes)."""
+    with store._write() as (conn, now):
+        token = lease._event(conn, now, "claim", key, token=None, until=lease._plus(now, lease.LAUNCH_TTL),
+                             cause="bootstrap", by="service")
+        return lease._pending(conn, now, token=token, harness="codex", role=ROLE_DESK, threads=(), model=None,
+                              cwd=cwd, cause="wake", session_key=key).launch_id
+
+
+def test_a_standing_codex_setting_wakes_nothing_and_says_why(qdir, workdir, fake):
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    d, _ = s.accept_drop("fix the build", surface="cli")
+    assert s.woken_launch(d.drop_id) is None
+    st = s.coord_status()
+    assert st["wake"] == "unset" and "Codex desk was removed" in st["why"], st
+    assert "levain desk agent claude" in st["why"]
+    assert rows(qdir, "SELECT count(*) FROM launches") == [(0,)]
+
+
+def test_the_store_never_writes_a_codex_setting(qdir, workdir):
+    s = CoordStore(qdir)
+    with pytest.raises(lease.LeaseRefused, match="Codex desk was removed"):
+        s.coord_set_agent("codex", cwd=str(workdir.resolve()))
+    assert s.coord_setting() is None
+
+
+def test_user_scope_alone_on_a_codex_setting_names_the_removal(qdir, workdir, capsys):
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    for flag in ("on", "off"):
+        out = _main(qdir, capsys, "coord", "agent", "--user-scope", flag, rc=1)
+        assert "Codex desk was removed" in out.err and "levain desk agent claude" in out.err, out.err
+    assert s.coord_setting().agent == "codex"
+    assert rows(qdir, "SELECT count(*) FROM coord_settings") == [(1,)]
+
+
+def test_coord_agent_codex_names_the_removal_before_checking_the_model(qdir, capsys):
+    out = _main(qdir, capsys, "coord", "agent", "codex", "--model", "not a model!", rc=1)
+    assert "Codex desk was removed" in out.err, out.err
+
+
+def test_a_pending_codex_launch_is_retired_by_the_watcher_not_left_to_expire(qdir, workdir, fake):
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    launch_id = _legacy_codex_launch(s, str(workdir.resolve()))
+    assert s.coord_lease().live
+    lines = cl.watch_once(s)
+    got = s.launch(launch_id)
+    assert (got.state, got.cause) == ("failed", CAUSE_CODEX_REMOVED), lines
+    assert any(launch_id in line and CAUSE_CODEX_REMOVED in line for line in lines), lines
+    assert s.coord_lease() is None or not s.coord_lease().live           # its bootstrap claim went with it
+    with sqlite3.connect(qdir / "dispatch.db") as c:
+        assert lease.launch_death(c, lease.launch(c, launch_id)) is not True   # a retirement, never a death
+    assert s.coord_status()["wake"] == "unset" and fake.spawns() == []
+    assert not any(launch_id in line for line in cl.watch_once(s))      # idempotent: nothing left to retire
+
+
+def test_an_active_codex_desk_is_ended_and_fenced_by_the_watcher(qdir, workdir, fake):
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    launch_id = _legacy_codex_launch(s, str(workdir.resolve()))
+    assert s.launch_claim_spawn(launch_id, os.getpid())[1] is None
+    got, why = s.launch_activate(launch_id, harness_session_id="019a-codex-thread")
+    assert why is None and got.state == "active"
+    token = s.coord_lease().token
+    assert s.coord_beat(token).live                                       # the orphan thread's beat, before the pass
+    lines = cl.watch_once(s)
+    ended = s.launch(launch_id)
+    assert (ended.state, ended.cause) == ("ended", CAUSE_CODEX_REMOVED), lines
+    with pytest.raises(lease.LeaseRefused):
+        s.coord_beat(token)                                               # its next beat is refused
+    with pytest.raises(lease.LeaseRefused, match="only an active desk"):
+        s.coord_claim(launch_id, ended.session_key)                       # and it cannot claim again
+    with sqlite3.connect(qdir / "dispatch.db") as c:
+        assert lease.launch_death(c, lease.launch(c, launch_id)) is False
+    assert s.coord_status()["wake"] == "unset"
+    assert not any(launch_id in line and CAUSE_CODEX_REMOVED in line for line in cl.watch_once(s))
+
+
+def test_two_spawn_claimed_pending_codex_launches_both_retire_on_one_pass(qdir, workdir, fake):
+    # L3 r2 (codex MED, deepseek): the pass read the unspawned launches plus only the NEWEST pending desk, so of
+    # two whose spawns an older launcher had claimed the older stayed pending until its TTL, and then read as a death
+    s = CoordStore(qdir)
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    ids = [_legacy_codex_launch(s, str(workdir.resolve()), key=f"s-c0dec0dec0dec0d{i}") for i in (1, 2)]
+    with s._write() as (conn, now):
+        for i in ids:
+            conn.execute("INSERT INTO launch_spawns (launch_id, gseq, pid, at) VALUES (?, ?, ?, ?)",
+                         (i, lease.next_gseq(conn, now), os.getpid(), now))
+    assert s.launches_unspawned() == []
+    lines = cl.watch_once(s)
+    for i in ids:
+        got = s.launch(i)
+        assert (got.state, got.cause) == ("failed", CAUSE_CODEX_REMOVED), (i, lines)
+        with sqlite3.connect(qdir / "dispatch.db") as c:
+            assert lease.launch_death(c, lease.launch(c, i)) is not True
+    assert fake.spawns() == []
+
+
+# What `levain desk agent codex` (0.11.15 until its removal) wrote into the workspace for an interpreter at this path,
+# rendered by that release's own `install.codex_desk_rules` (a literal here, so the test does not read the
+# render it checks)
+_OLD_PY = "/opt/py 3/bin/python3"
+_OLD_RULE = (
+    "# Written by Levain for its desk (np-6843ca07 (a)). Codex runs exactly these commands without asking:\n"
+    "# '/opt/py 3/bin/python3' -P -m levain desk | drops | thread ...\n"
+    "# Every other command is decided as before. Codex loads this file only while you trust this directory.\n"
+    "prefix_rule(\n"
+    '    pattern = ["/opt/py 3/bin/python3", "-P", "-m", "levain", ["coord", "drops", "thread"]],\n'
+    '    decision = "allow",\n'
+    '    justification = "Levain desk verbs: they grant nothing (a signed envelope still does)",\n'
+    '    match = [["/opt/py 3/bin/python3", "-P", "-m", "levain", "coord", "status"], ["/opt/py 3/bin/python3", "-P", '
+    '"-m", "levain", "drops", "status"], ["/opt/py 3/bin/python3", "-P", "-m", "levain", "thread", "status"]],\n'
+    '    not_match = [["/opt/py 3/bin/python3", "-P", "-m", "levain", "team", "record"], ["/opt/py 3/bin/python3", '
+    f'"-P", "-m", "levain", {JSON_ROLE_DESK}], ["levain", "coord"]],\n'
+    ")\n"
+)
+
+
+def _rule_at(ws):
+    return ws / ".codex" / "rules" / CODEX_RULE_NAME
+
+
+def test_retirement_removes_only_the_exact_legacy_codex_rule_in_the_launch_workspace(qdir, tmp_path, fake):
+    # L3 r2 (codex + deepseek HIGH): the removed writer left a rule pre-approving `<py> -P -m levain desk ...` in the
+    # desk's workspace, so the orphan Codex thread could still run `coord take` / `coord release` unasked
+    s = CoordStore(qdir)
+    spaces = {name: tmp_path / f"ws-{name}" for name in ("exact", "changed", "none", "link", "other")}
+    for ws in spaces.values():
+        ws.mkdir()
+    for name in ("exact", "changed", "other"):
+        _rule_at(spaces[name]).parent.mkdir(parents=True)
+    _rule_at(spaces["exact"]).write_text(_OLD_RULE, encoding="utf-8")
+    _rule_at(spaces["changed"]).write_text(_OLD_RULE + "# mine\n", encoding="utf-8")
+    (spaces["other"] / ".codex" / "rules" / "mine.rules").write_text(_OLD_RULE, encoding="utf-8")
+    _rule_at(spaces["link"]).parent.mkdir(parents=True)
+    target = tmp_path / "elsewhere.rules"
+    target.write_text(_OLD_RULE, encoding="utf-8")
+    _rule_at(spaces["link"]).symlink_to(target)
+    outside = tmp_path / ".codex" / "rules"
+    outside.mkdir(parents=True)
+    (outside / CODEX_RULE_NAME).write_text(_OLD_RULE, encoding="utf-8")
+    _legacy_codex_setting(s, str(spaces["exact"].resolve()))
+    ids = {name: _legacy_codex_launch(s, str(ws.resolve()), key=f"s-c0dec0dec0de{n:04d}")
+           for n, (name, ws) in enumerate(spaces.items())}
+    lines = cl.watch_once(s)
+    assert all(s.launch(i).state == "failed" for i in ids.values()), lines
+    assert not os.path.lexists(_rule_at(spaces["exact"])), lines
+    assert any(str(_rule_at(spaces["exact"].resolve())) in line for line in lines), lines
+    assert _rule_at(spaces["changed"]).read_text(encoding="utf-8") == _OLD_RULE + "# mine\n"
+    assert (spaces["other"] / ".codex" / "rules" / "mine.rules").read_text(encoding="utf-8") == _OLD_RULE
+    assert os.path.islink(_rule_at(spaces["link"])) and target.read_text(encoding="utf-8") == _OLD_RULE
+    assert (outside / CODEX_RULE_NAME).exists()               # never outside a recorded workspace
+    assert not (spaces["none"] / ".codex").exists()
+    assert cl.watch_once(s) is not None                                  # a second pass: nothing to do, no raise
+
+
+_THEIRS = "# the operator's own rule, put here after the watcher's check\n"
+
+
+def _swap_at_the_destructive_step(monkeypatch, rule, then=None):
+    """The first rename, replace or unlink of ``rule`` finds it already replaced, atomically, by the operator's own
+    file (what another process can do between any check and the step that acts on it); ``then`` runs after that step."""
+    real = {name: getattr(os, name) for name in ("rename", "replace", "unlink")}
+    fired = []
+
+    def hooked(name):
+        def call(src, *args, **kwargs):
+            if fired or os.fspath(src) != os.fspath(rule):
+                return real[name](src, *args, **kwargs)
+            fired.append(name)
+            theirs = rule.with_name("theirs.tmp")
+            theirs.write_text(_THEIRS, encoding="utf-8")
+            real["replace"](theirs, rule)
+            got = real[name](src, *args, **kwargs)
+            if then is not None:
+                then()
+            return got
+        return call
+
+    for name in real:
+        monkeypatch.setattr(os, name, hooked(name))
+    return fired
+
+
+def _exact_rule(tmp_path):
+    ws = tmp_path / "ws"
+    _rule_at(ws).parent.mkdir(parents=True)
+    _rule_at(ws).write_text(_OLD_RULE, encoding="utf-8")
+    return ws, _rule_at(ws)
+
+
+def test_a_rule_replaced_after_the_check_is_never_the_one_removed(tmp_path, monkeypatch):
+    # L3 r3 (codex MED): the inode was compared, then the path unlinked, so a file put there in between was deleted
+    # unread; the file is now moved to a private name and only what is found under it is checked and removed
+    ws, rule = _exact_rule(tmp_path)
+    fired = _swap_at_the_destructive_step(monkeypatch, rule)
+    got = cl._remove_legacy_codex_rule(str(ws))
+    assert fired, "the removal never reached a rename or unlink of the rule"
+    assert rule.read_text(encoding="utf-8") == _THEIRS, got             # theirs, back under its own name
+    assert os.listdir(rule.parent) == [rule.name], got                   # and no private copy left behind
+
+
+def test_a_replaced_rule_whose_name_was_taken_again_stays_at_its_private_name(tmp_path, monkeypatch):
+    ws, rule = _exact_rule(tmp_path)
+    fired = _swap_at_the_destructive_step(monkeypatch, rule,
+                                          then=lambda: rule.write_text("# newer\n", encoding="utf-8"))
+    got = cl._remove_legacy_codex_rule(str(ws))
+    assert fired and rule.read_text(encoding="utf-8") == "# newer\n", got
+    kept = [n for n in os.listdir(rule.parent) if n != rule.name]
+    assert len(kept) == 1 and kept[0].startswith(f".{rule.name}.retiring-"), (kept, got)
+    assert (rule.parent / kept[0]).read_text(encoding="utf-8") == _THEIRS
+    assert got is not None and kept[0] in got                             # the one line names where it is
+
+
+def test_a_fifo_at_the_rule_path_never_blocks_the_pass(tmp_path):
+    # L3 r3 (complement MED): the path was opened read-only before its type was checked, and a FIFO blocks that open
+    ws = tmp_path / "ws"
+    rule = _rule_at(ws)
+    rule.parent.mkdir(parents=True)
+    os.mkfifo(rule)
+    out = []
+    worker = threading.Thread(target=lambda: out.append(cl._remove_legacy_codex_rule(str(ws))), daemon=True)
+    worker.start()
+    worker.join(5)
+    try:
+        assert not worker.is_alive(), "the removal blocked opening a FIFO"
+    finally:
+        if worker.is_alive():                                             # let the old code's open return
+            os.close(os.open(rule, os.O_WRONLY | os.O_NONBLOCK))
+            worker.join(5)
+    assert out == [None] and stat.S_ISFIFO(os.lstat(rule).st_mode)
+
+
+def test_the_rule_goes_even_when_the_launch_raced_to_its_end(qdir, tmp_path, monkeypatch):
+    # L3 r3 (complement MED): a launch_end that raised skipped the rule, and the launch, over, was never read again
+    s = CoordStore(qdir)
+    ws, rule = _exact_rule(tmp_path)
+    launch_id = _legacy_codex_launch(s, str(ws.resolve()))
+
+    def raced(*args, **kwargs):
+        raise lease.LeaseRefused("a launch moves pending -> active -> ended, or ends failed or expired")
+
+    monkeypatch.setattr(s, "launch_end", raced)
+    lines = []
+    cl._retire_removed(s, lines)
+    assert not os.path.lexists(rule), lines
+    assert any(launch_id in line and "not retired" in line for line in lines), lines
+    assert any(str(_rule_at(ws.resolve())) in line and "removed" in line for line in lines), lines
+
+
+def test_a_codex_launch_already_past_its_ttl_is_retired_never_expired_as_a_death(qdir, workdir, fake, monkeypatch):
+    # L3 r3 (complement, deepseek LOW): the expiries were written first, so a spawn-claimed Codex launch past
+    # LAUNCH_TTL on the first pass after the upgrade expired with the TTL cause and counted as a death
+    from datetime import timedelta
+
+    s = CoordStore(qdir)
+    t = [datetime.now(timezone.utc)]
+    monkeypatch.setattr(s, "_clock", lambda: t[0])
+    _legacy_codex_setting(s, str(workdir.resolve()))
+    launch_id = _legacy_codex_launch(s, str(workdir.resolve()))
+    assert s.launch_claim_spawn(launch_id, os.getpid())[1] is None
+    t[0] += lease.LAUNCH_TTL + timedelta(seconds=1)
+    lines = cl.watch_once(s)
+    got = s.launch(launch_id)
+    assert (got.state, got.cause) == ("failed", CAUSE_CODEX_REMOVED), lines
+    with sqlite3.connect(qdir / "dispatch.db") as c:
+        assert lease.launch_death(c, lease.launch(c, launch_id)) is not True
+    assert fake.spawns() == []

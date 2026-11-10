@@ -1,5 +1,5 @@
 """C15 S2b: the open's tables, ``open_brief`` and the two build paths. Every expectation was first read from a real run
-on a scratch store (an active coordinator launch holding the lease for the fenced path; a pending launch whose spawn
+on a scratch store (an active desk launch holding the lease for the fenced path; a pending launch whose spawn
 the starter claimed for the cold-start path)."""
 from __future__ import annotations
 
@@ -11,9 +11,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from levain.consent.questions import QuestionStore
-from levain.coordinator import seam, seam_build, seam_handoffs, seam_open
-from levain.coordinator.lease import LeaseRefused
-from levain.coordinator.store import CoordError, CoordStore
+from levain.desk import seam, seam_build, seam_handoffs, seam_open
+from levain.desk.lease import LeaseRefused
+from levain.desk.store import CoordError, CoordStore
+from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK
 
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
 HANDOFF = {"state_line": "main is green", "in_flight": [], "next": "open the queue", "contingencies": [], "notes": "",
@@ -44,7 +45,7 @@ def _raw(store, sql, args=()):
 
 @pytest.fixture
 def world(tmp_path):
-    """An active coordinator launch holds the lease (activation claims it)."""
+    """An active desk launch holds the lease (activation claims it)."""
     s = CoordStore(_dir(tmp_path), clock=lambda: NOW)
     s.coord_set_agent("claude", cwd=str(tmp_path))
     s.accept_drop("first words", surface="cli")
@@ -113,7 +114,7 @@ def test_an_empty_store(tmp_path):
 def test_no_store_at_all_is_absent_and_nothing_is_made(tmp_path):
     s = CoordStore(tmp_path / "nowhere")
     b = seam.open_brief(s, tmp_path / "q", "light", NOW)
-    assert "store: absent: there is no coordinator store here" in b.text and b.cursor_gseq == 0
+    assert "store: absent: there is no desk store here" in b.text and b.cursor_gseq == 0
     assert not (tmp_path / "nowhere").exists() and not (tmp_path / "q").exists()
 
 
@@ -138,8 +139,8 @@ def test_a_store_behind_head_counts_the_rows_since_the_cut(world):
 def test_an_opened_room_is_a_counted_row_in_since(world):
     """Diogenes 11-04 (MEDIUM): the room's tables were in no seam class, so a room opened after the cut took a gseq the
     brief then counted as nothing. The room's rows are counted through the same Since as every other."""
-    from levain.coordinator import room
-    from levain.coordinator.store import Part
+    from levain.desk import room
+    from levain.desk.store import Part
     drop = world.accept_drop("the room's thread", surface="cli")[0]
     tid = world.split(drop.drop_id, [Part("note", "the room")])[0].thread_id
     h = _close(world)                      # the cut sits AFTER the setup, so only the room's own row can move the cursor
@@ -327,7 +328,7 @@ def test_now_is_required_and_aware(world):
 def test_the_operators_lease_is_refused_by_every_fenced_write(tmp_path):
     s = CoordStore(_dir(tmp_path))
     tok = s.coord_take()                                                   # holder is literally "operator"
-    with pytest.raises(LeaseRefused, match="written by an active coordinator launch; the lease holder is the operator"):
+    with pytest.raises(LeaseRefused, match="written by an active desk launch; the lease holder is the operator"):
         seam_build.build(s, kind="light", signal_kind="silence", signal_key="k", queue_dir=tmp_path / "q", token=tok)
     with pytest.raises(LeaseRefused, match="the lease holder is the operator"):
         seam_open.acknowledge(s, 1, token=tok)
@@ -445,7 +446,7 @@ def test_a_launch_whose_lease_moved_is_refused(pending):
 # --- the records ----------------------------------------------------------------------------------------------------
 def test_an_arrival_signal_is_one_per_agent_and_mark_and_is_counted(world):
     def put(agent, mark):
-        with world._write("coordinator", _token(world)) as (conn, now):
+        with world._write(ROLE_DESK, _token(world)) as (conn, now):
             return seam_open.record_arrival(conn, now, agent=agent, mark_id=mark, queue_id="q-1")
 
     first = put("claude_code", 7)
@@ -454,7 +455,7 @@ def test_an_arrival_signal_is_one_per_agent_and_mark_and_is_counted(world):
     assert put("codex", 7)[1] is True
     assert "  arrival_signals: 2" in _brief(world).text.splitlines()
     with pytest.raises(CoordError, match="agent"):
-        with world._write("coordinator", _token(world)) as (conn, now):
+        with world._write(ROLE_DESK, _token(world)) as (conn, now):
             seam_open.record_arrival(conn, now, agent="", mark_id=1, queue_id="q")
 
 
@@ -462,7 +463,7 @@ def test_every_open_table_is_append_only_and_the_build_is_bounded(world):
     b = _build(world)
     _ack(world, b.open_id)
     seam_open.record_delivery(world, b.open_id, "light_verb", recipient=world.launch_id)
-    with world._write("coordinator", _token(world)) as (conn, now):
+    with world._write(ROLE_DESK, _token(world)) as (conn, now):
         seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
     for table, col in (("open_builds", "seam_kind"), ("open_deliveries", "surface"), ("open_acks", "reader_session"),
                        ("arrival_signals", "agent")):
@@ -574,10 +575,10 @@ class _MissFirstLookup:
 
 
 def test_an_arrival_whose_duplicate_the_lookup_missed_returns_the_stored_one(world):
-    with world._write("coordinator", _token(world)) as (conn, now):
+    with world._write(ROLE_DESK, _token(world)) as (conn, now):
         first = seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
     gseq = _sql(world, "SELECT COUNT(*) FROM gseq")
-    with world._write("coordinator", _token(world)) as (conn, now):
+    with world._write(ROLE_DESK, _token(world)) as (conn, now):
         again = seam_open.record_arrival(_MissFirstLookup(conn), now, agent="a", mark_id="1", queue_id="other-q")
     assert again == (first[0], False)
     assert _sql(world, "SELECT COUNT(*) FROM arrival_signals") == [(1,)]
@@ -628,8 +629,8 @@ def test_a_stored_build_of_another_kind_is_refused(world):
 
 
 def test_a_cold_start_runs_the_several_threads_check_and_writes_nothing(pending):
-    from levain.coordinator import lease
-    from levain.coordinator.store import Part
+    from levain.desk import lease
+    from levain.desk.store import Part
 
     d = pending.accept_drop("two pieces of work", surface="cli")[0]
     t1, t2 = pending.split(d.drop_id, [Part("work", "one"), Part("work", "two")])
@@ -644,7 +645,7 @@ def test_a_cold_start_runs_the_several_threads_check_and_writes_nothing(pending)
 
 
 def test_a_live_lease_held_by_an_active_worker_writes_no_open_record(world):
-    from levain.coordinator.store import Part
+    from levain.desk.store import Part
 
     d = world.accept_drop("work for a worker", surface="cli")[0]
     (t,) = world.split(d.drop_id, [Part("work", "w")])
@@ -658,14 +659,14 @@ def test_a_live_lease_held_by_an_active_worker_writes_no_open_record(world):
         with c:
             g = c.execute("INSERT INTO gseq (at) VALUES ('2026-10-31T12:00:00Z')").lastrowid
             tok = c.execute("INSERT INTO lease_events (gseq, kind, token, holder, until, cause, by, at) VALUES "
-                            "(?, 'claim', NULL, ?, '2099-01-01T00:00:00Z', 'probe', 'coordinator', "
+                            f"(?, 'claim', NULL, ?, '2099-01-01T00:00:00Z', 'probe', {SQL_ROLE_DESK}, "
                             "'2026-10-31T12:00:00Z')", (g, got.session_key)).lastrowid
     finally:
         c.close()
     before = _counts(world)
-    with pytest.raises(LeaseRefused, match="active coordinator launch"):
+    with pytest.raises(LeaseRefused, match="active desk launch"):
         seam_open.acknowledge(world, b.open_id, token=tok)
-    with pytest.raises(LeaseRefused, match="active coordinator launch"):
+    with pytest.raises(LeaseRefused, match="active desk launch"):
         seam_build.build(world, kind="light", signal_kind="silence", signal_key="w2", queue_dir=world.qdir, token=tok)
     assert _counts(world) == before
 
@@ -718,7 +719,7 @@ def test_a_band_or_card_failure_is_shown_and_the_brief_still_stores(world, tmp_p
     assert any(ln.startswith("Band: cannot-derive (") for ln in b.text.splitlines()) and b.degraded is None
 
 
-def test_a_coordinator_directory_open_to_others_is_a_degraded_brief_never_a_crash(world):
+def test_a_desk_directory_open_to_others_is_a_degraded_brief_never_a_crash(world):
     os.chmod(world.directory, 0o755)
     try:
         b = _brief(world)
@@ -746,10 +747,10 @@ def test_every_caller_text_is_checked_before_the_write_opens(world):
     with pytest.raises(CoordError, match="signal key"):
         _build(world, "a lone surrogate \ud800")
     with pytest.raises(CoordError, match="agent"):
-        with world._write("coordinator", _token(world)) as (conn, now):
+        with world._write(ROLE_DESK, _token(world)) as (conn, now):
             seam_open.record_arrival(conn, now, agent="\udfff", mark_id=1, queue_id="q")
     with pytest.raises(CoordError, match="queue_id"):
-        with world._write("coordinator", _token(world)) as (conn, now):
+        with world._write(ROLE_DESK, _token(world)) as (conn, now):
             seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q\ud800")
     assert _counts(world) == before                    # a refusal inside a write rolls its fence record back too
     for name, value in (("signal key", "\ud800"), ("read_back", "\ud800")):
@@ -787,7 +788,7 @@ def test_a_launch_signal_is_the_starters_alone(world):
 
 
 def _worker_launch(s):
-    from levain.coordinator.store import Part
+    from levain.desk.store import Part
 
     d = s.accept_drop("work for a worker", surface="cli")[0]
     (t,) = s.split(d.drop_id, [Part("work", "w")])
@@ -849,7 +850,7 @@ def test_a_body_over_the_callers_cap_is_never_stored(world, monkeypatch):
 
 
 def _counted_gseqs(s):
-    from levain.coordinator import seam_classes
+    from levain.desk import seam_classes
 
     c = sqlite3.connect(s.path)
     try:
@@ -871,7 +872,7 @@ def _shared(gseqs):
 def test_no_two_counted_rows_share_a_gseq_after_a_mixed_run(world):
     _close(world)
     world.accept_drop("a second drop", surface="cli")
-    with world._write("coordinator", _token(world)) as (conn, now):
+    with world._write(ROLE_DESK, _token(world)) as (conn, now):
         seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
     _worker_launch(world)
     b = _build(world, "mixed")
@@ -915,7 +916,7 @@ def test_an_arrival_on_a_store_without_the_open_tables_is_refused(world):
     with sqlite3.connect(world.path) as c:
         assert seam_open.open_tables_present(c) is False
     with pytest.raises(CoordError, match="open tables"):
-        with world._write("coordinator", _token(world)) as (conn, now):
+        with world._write(ROLE_DESK, _token(world)) as (conn, now):
             seam_open.record_arrival(conn, now, agent="a", mark_id=1, queue_id="q")
 
 
@@ -938,12 +939,12 @@ def test_a_nul_in_stored_text_is_marked_in_the_brief_and_the_brief_still_builds(
 
 # --- a detail row names its row; one stored field is one line; empty sections fold ----------------------------------
 def test_each_detail_row_names_its_row_oldest_first(world):
-    from levain.coordinator import ready
+    from levain.desk import ready
 
     d2, _ = world.accept_drop("ship the doc fix\nsecond line never shown", surface="cli")
     long, _ = world.accept_drop("x" * 80, surface="cli")
     ready.add(world, _token(world), "levain:doc-fix", repo="levain", title="Ship the doc fix", to="ready",
-              tier="sonnet", done_line="merged", who="coordinator", why="probe")
+              tier="sonnet", done_line="merged", who=ROLE_DESK, why="probe")
     detail = [ln for ln in _brief(world).text.splitlines() if ln.startswith("  gseq ")]
     gseqs = [int(ln.split()[1]) for ln in detail]
     assert gseqs == sorted(gseqs)                                            # oldest first: a contiguous prefix
@@ -952,7 +953,7 @@ def test_each_detail_row_names_its_row_oldest_first(world):
     assert by_id[long.drop_id].endswith("  cli  " + "x" * 59 + "…")         # at most 60 characters
     (receipt,) = [ln for ln in detail if f"re {d2.drop_id}" in ln]
     assert receipt.split("  ")[2] == "replies" and receipt.split("  ")[4] == "drop_receipt"
-    assert any(ln.endswith("  ready_journal  levain:doc-fix  coordinator  new -> ready") for ln in detail)
+    assert any(ln.endswith("  ready_journal  levain:doc-fix  desk  new -> ready") for ln in detail)
     assert any(ln.endswith("  coord_settings") for ln in detail)             # a table with no id is named alone
 
 

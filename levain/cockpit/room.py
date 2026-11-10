@@ -1,5 +1,5 @@
 """The cockpit's one Claude room (RM-F, DESIGN_ROOM sections 3, 4 and 6): the read of the open room and the operator's
-routes into it, as JSON. The coordinator half is landed code this module only calls (``levain.coordinator.room``,
+routes into it, as JSON. The desk half is landed code this module only calls (``levain.desk.room``,
 ``room_launch``, ``chat``); no authority, consent or containment rule lives here.
 
 Reads (``GET /cockpit/room.json``) open ``<directory>/dispatch.db`` ``mode=ro`` and write nothing: the open room thread,
@@ -20,10 +20,10 @@ Writes act through a :class:`RoomHost` the mount was given, for an authenticated
 * ``drop``: the composer's text, verbatim, as a drop from this surface. No model turn and no note.
 * ``proposal/<id>/commit`` and ``/dismiss``: his tap on a card. The drop's words are the bytes the card's field held
   (his adopted quote or his edit), the room's summary only ever rides as the labelled note
-  (:func:`levain.coordinator.room.commit`).
+  (:func:`levain.desk.room.commit`).
 
 **Live text (492 R3, ruling R-C).** Every read carries ``live``: ``{turn, text, seq}`` while the room's child is mid-reply
-(from :func:`levain.coordinator.room_live.snapshot` of ``launch_id``, an in-memory buffer), else ``null``. It is NEVER
+(from :func:`levain.desk.room_live.snapshot` of ``launch_id``, an in-memory buffer), else ``null``. It is NEVER
 stored and never counted in ``next``. A long-poll client sends ``live_seq=<n>`` (the ``seq`` it last drew, ``0`` when it
 shows no live text; absent = never wake on live changes, R2 behaviour) and the wait ends when live moved: text newer than
 ``n``, or live gone while ``n > 0`` (a turn end with no stored line). **Ordering edge:** when the whole assistant frame
@@ -52,13 +52,13 @@ from typing import Any
 
 from levain.cockpit import threads
 from levain.cockpit.consent import utc_stamp
-from levain.coordinator import chat
-from levain.coordinator import room as coordroom
-from levain.coordinator import room_live
-from levain.coordinator.chat_lease import check_owner
-from levain.coordinator.room_launch import RoomLaunchError
-from levain.coordinator.room_serve import RoomServeError
-from levain.coordinator.store import SURFACES, WORDS_MAX, CoordError, DropConflict
+from levain.desk import chat
+from levain.desk import room as coordroom
+from levain.desk import room_live
+from levain.desk.chat_lease import check_owner
+from levain.desk.room_launch import RoomLaunchError
+from levain.desk.room_serve import RoomServeError
+from levain.desk.store import SURFACES, WORDS_MAX, CoordError, DropConflict
 
 ROOM_PATH = "/cockpit/room.json"
 ROOM_PREFIX = "/cockpit/room/"
@@ -86,7 +86,7 @@ class RoomHost:
     rotation. Its return value is NOT read: the landed ``coordroom.rotate`` returns the OLD thread and another host may
     return the new one, so the route answers with the open room it re-reads.
 
-    A host built from a :class:`~levain.coordinator.room_serve.RoomServe` (:func:`host_from`) also carries ``send``
+    A host built from a :class:`~levain.desk.room_serve.RoomServe` (:func:`host_from`) also carries ``send``
     (``RoomServe.send``: ordered against recover, the open and the launch, called with ``room_thread=`` the page's),
     ``stop(launch_id)`` (``RoomServe.interrupt``), ``open()`` (the first-need open, ``RoomServe.ensure_room``) and
     ``view()`` (the pump's last error; :func:`host_from` gives ``RoomServe.status``, which takes no lock, so a page poll
@@ -103,7 +103,7 @@ class RoomHost:
 
 
 def host_from(rs: Any) -> RoomHost:
-    """The host a ``levain serve`` mounts over its :class:`~levain.coordinator.room_serve.RoomServe`: ONE ChatService
+    """The host a ``levain serve`` mounts over its :class:`~levain.desk.room_serve.RoomServe`: ONE ChatService
     (``rs.service``, the one ``make_server`` reads through), the store, and every verb the serve orders."""
     return RoomHost(rs.service, rs.store, rotate=rs.rotate, send=rs.send, stop=rs.interrupt, open=rs.ensure_room,
                     view=rs.status)
@@ -137,7 +137,7 @@ def _refusal(error: str, message: str, status: int, **extra: Any) -> tuple[int, 
 # --- reads ------------------------------------------------------------------------------------------------------------
 
 def _open_room(conn: sqlite3.Connection) -> str | None:
-    """The open room thread read from a read-only connection (the coordinator's own reader would create its tables)."""
+    """The open room thread read from a read-only connection (the desk's own reader would create its tables)."""
     if not threads._has(conn, "room_events"):
         return None
     row = conn.execute("SELECT room_thread, kind FROM room_events ORDER BY seq DESC LIMIT 1").fetchone()
@@ -166,7 +166,7 @@ def _composer(conn: sqlite3.Connection, launch: str | None, service: Any) -> dic
 
 
 def _proposals(conn: sqlite3.Connection, room_thread: str) -> list[dict[str, Any]]:
-    """The open room's drop proposals, each in the state the record holds. Read-only SQL, never the coordinator's
+    """The open room's drop proposals, each in the state the record holds. Read-only SQL, never the desk's
     ``get_proposal`` (it creates a missing room table, which a ``mode=ro`` connection cannot): a store missing a table
     degrades only this part. A committed card carries the words of the DROP it made (his bytes), never the proposal's."""
     if not (threads._has(conn, "drop_proposals") and threads._has(conn, "proposal_events")):
@@ -693,7 +693,7 @@ def post_proposal(host: RoomHost, owner: str | None, proposal_id: str, action: s
         return _refusal("forbidden", f"a {action} needs a named credential from the cockpit or the phone", 403)
     if action == "dismiss":
         try:
-            # the coordinator exposes no public write context for a dismiss: the store's own transaction, as its tests use
+            # the desk exposes no public write context for a dismiss: the store's own transaction, as its tests use
             with host.store._write() as (conn, now):
                 coordroom.dismiss(conn, proposal_id, now=now)
         except CoordError as exc:
@@ -715,7 +715,7 @@ def post_proposal(host: RoomHost, owner: str | None, proposal_id: str, action: s
 
 
 def _proposal_refusal(exc: CoordError) -> tuple[int, dict[str, Any]]:
-    """A named answer per case. The coordinator raises one error type for these, so the case is read from its sentence;
+    """A named answer per case. The desk raises one error type for these, so the case is read from its sentence;
     a sentence it does not know is a generic 409 ``proposal_refused``, never a wrong specific name."""
     text = str(exc)
     if text.startswith("no proposal"):

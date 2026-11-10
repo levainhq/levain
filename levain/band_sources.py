@@ -1,11 +1,11 @@
 """levain.band_sources — the band's AUTHORITY sources (Q17-ALL S3, design §4 D12 and §5 "Authority: the trust boundary").
 
 Beside the open questions the band lists, each as one numbered item: a consent request that is UNDECIDED, an open
-coordinator SIGN record, and an open budget-extend SIGN. An ANSWER record (the coordinator's escalation of a question)
+desk SIGN record, and an open budget-extend SIGN. An ANSWER record (the desk's escalation of a question)
 is never an item of its own: it rides its question's item (:attr:`Extras.escalations`). KNOW, RECEIPT, review items
 and notes are not read here.
 
-NOTHING HERE IS AUTHORITY (SIG-ONLY, D8). This module reads three stores read-only (``queue.db``, the coordinator's
+NOTHING HERE IS AUTHORITY (SIG-ONLY, D8). This module reads three stores read-only (``queue.db``, the desk's
 ``dispatch.db``) and builds display rows plus the TEXT of the existing signing ceremony each item is settled by
 (:func:`sheet_text`). It records nothing and rules nothing: a decision on one of these items exists only as the
 signature the existing path verifies (the phone ``question_rule`` sheet, ``levain consent rule``, a levain sign request
@@ -13,7 +13,7 @@ on the cockpit's sign sheet, ``levain envelope sign``). A sign request is named 
 stored its origin (:mod:`levain.consent.cockpit_origin`), carries its :func:`levain.consent.sign.deep_link`; with no
 stored origin it carries no link.
 
-Rec (D11, Q2 ruled (a)): an item shows the coordinator's rec when its record carries one, else the literal text
+Rec (D11, Q2 ruled (a)): an item shows the desk's rec when its record carries one, else the literal text
 :data:`NO_REC` (``rec: none (authority item)``) for a raw gate request.
 
 A command the operator copies (S3 fix round 1): every value in it that a record carries (a session id, an agent, a gap
@@ -29,7 +29,7 @@ S3 fix round 2:
   nothing and says why (:class:`NotOffered`). Deny goes to the request's own deny on its sheet; it is never a
   signature.
 - One band key per underlying request (:attr:`Extra.band_key`): a consent request is ``("consent", id)`` whether it is
-  shown as UNDECIDED or through a coordinator SIGN, so a SIGN filed later enriches the item and keeps its number.
+  shown as UNDECIDED or through a desk SIGN, so a SIGN filed later enriches the item and keeps its number.
 - One store, one snapshot, one deadline: ``queue.db``, ``questions.db`` and ``dispatch.db`` are each opened once per
   read, their lock wait capped to what is left of the caller's deadline; a store held past it is "not read".
 Stdlib plus levain's own readers.
@@ -46,7 +46,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from levain.coordinator.review import NO_REC, require_aware_now
+from levain.desk.review import NO_REC, require_aware_now
+from levain.desk.legacy import ROLE_DESK
 
 __all__ = ["Extra", "Extras", "NO_REC", "NotOffered", "TOKEN", "UnsafeValue", "consent_rule_command", "read_extras",
            "rec_letter_of", "sheet_text", "sign_request_menu", "SOURCES"]
@@ -70,7 +71,7 @@ class Extra:
     sign request, ``menu`` is one ``(action, option key)`` per displayed letter (S3 fix round 2), so a letter is
     mapped to the action the operator SAW beside it, never to a position in the request file. ``key`` is the band key
     (S3 fix round 2, codex 3): ONE per underlying request, so a consent request keeps its number whether it is shown
-    as UNDECIDED or through the coordinator's SIGN pointing at it; ``None`` is ``(source, ref)``."""
+    as UNDECIDED or through the desk's SIGN pointing at it; ``None`` is ``(source, ref)``."""
     source: str
     ref: str
     filed: str
@@ -94,8 +95,8 @@ class Extra:
 class Extras:
     """What the authority sources hold now. ``items``: open ones, oldest first. ``complete``: the band-key sources
     read in full (a numbered key of such a source that is absent from ``items`` has closed; a source not read in full
-    closes nothing). A ``consent`` key can be listed by the consent queue or by a coordinator SIGN, so ``consent`` is
-    complete only when BOTH were read. ``escalations``: question id -> ``(coordinator's text, rec)`` of an open ANSWER
+    closes nothing). A ``consent`` key can be listed by the consent queue or by a desk SIGN, so ``consent`` is
+    complete only when BOTH were read. ``escalations``: question id -> ``(desk's text, rec)`` of an open ANSWER
     record. ``failed``: one line per source that could not be read (the band says so, never drops it silently)."""
     items: list[Extra] = field(default_factory=list)
     complete: set[str] = field(default_factory=set)
@@ -166,7 +167,7 @@ def _gap_of(conn: sqlite3.Connection | None, request_id: str) -> int | None:
 
 
 def _consent(qdir: Path, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
-    from levain.coordinator import morning
+    from levain.desk import morning
 
     if conn is None:
         return []                                 # no queue.db: nothing is undecided
@@ -177,13 +178,13 @@ def _records(qdir: Path, clock: Any = None, *, deadline: float | None = None,
              coord_conn: sqlite3.Connection | None = None, queue_conn: sqlite3.Connection | None = None,
              questions_conn: sqlite3.Connection | None = None,
              now: Any = None) -> tuple[dict[str, Any], dict[str, str]]:
-    """``(waiting_on_you's answer, reply_id -> filed time)`` of the coordinator's store; empty when there is none.
-    ``coord_conn``: a coordinator snapshot the caller holds (the morning card's), else one of our own whose lock wait
+    """``(waiting_on_you's answer, reply_id -> filed time)`` of the desk's store; empty when there is none.
+    ``coord_conn``: a desk snapshot the caller holds (the morning card's), else one of our own whose lock wait
     is capped by ``deadline``. The queue and question stores are each read through the ONE snapshot passed in.
     ``now`` (an aware datetime, default ``None``): every expiry in the read is judged at it (see :func:`read_extras`)."""
     from levain.autonomic.durable_sqlite import read_transaction
-    from levain.coordinator import review
-    from levain.coordinator.store import CoordStore, StoreAbsent
+    from levain.desk import review
+    from levain.desk.store import CoordStore, StoreAbsent
 
     store = CoordStore(qdir, clock=clock) if clock is not None else CoordStore(qdir)
     sign_open = review.queue_request_open(qdir, clock=clock, conn=queue_conn, now=now) if queue_conn is not None \
@@ -227,7 +228,7 @@ def read_extras(queue_dir: Path | str, clock: Any = None, *, deadline: float | N
 
     ``deadline`` (``time.monotonic()``, the hook's ONE bound): every store is opened once, as one snapshot, its lock
     wait capped to what is left; a store still held past it lands in ``failed`` ("! not read"), never a stalled
-    prompt. ``coord_conn``: the coordinator snapshot a caller already holds (the morning card), read instead of a
+    prompt. ``coord_conn``: the desk snapshot a caller already holds (the morning card), read instead of a
     second one. ``now`` (an aware datetime; default ``None`` = today's behaviour: ``clock`` where it is read, the wall
     clock for a sign request's expiry): every expiry of the read (a consent request's hold, a budget SIGN's, a sign
     request's) is judged at ``now`` and no clock is read, so the result is a function of the stores and ``now``; it
@@ -276,7 +277,7 @@ def read_extras(queue_dir: Path | str, clock: Any = None, *, deadline: float | N
                     out.items.append(bad)
             sign_read = True                      # an unreadable request state is listed (unresolved), never dropped
         except Exception as exc:  # noqa: BLE001
-            out.failed.append(_why("coordinator SIGN records", exc))
+            out.failed.append(_why("desk SIGN records", exc))
     if sign_read:
         out.complete.update(("sign", "extend"))
     if consent_read and sign_read:
@@ -295,7 +296,7 @@ def read_extras(queue_dir: Path | str, clock: Any = None, *, deadline: float | N
 
 
 def _sign_key(rec: Mapping[str, Any]) -> tuple[str, str]:
-    """The band key of a coordinator SIGN record: its consent request (``("consent", request id)``, the key the
+    """The band key of a desk SIGN record: its consent request (``("consent", request id)``, the key the
     request has as UNDECIDED too), or for a record that names no request ``("sign", reply id)``."""
     ref_id = rec.get("ref_id")
     if isinstance(ref_id, str) and ref_id:
@@ -304,21 +305,21 @@ def _sign_key(rec: Mapping[str, Any]) -> tuple[str, str]:
 
 
 def _unreadable_sign(rec: Mapping[str, Any], at: Mapping[str, str], why: str) -> Extra:
-    from levain.coordinator import budget
+    from levain.desk import budget
 
     ref = str(rec.get("reply_id") or "?")
     extend = rec.get("ref_store") == budget.SIGN_REF
-    return Extra("extend" if extend else "sign", ref, at.get(ref) or "", "coordinator",
+    return Extra("extend" if extend else "sign", ref, at.get(ref) or "", ROLE_DESK,
                  f"UNREADABLE: SIGN {_line(ref, 80)} could not be read", (), NO_REC, None, "unknown",
-                 f"coordinator record {_line(ref, 80)}", why, {}, None if extend else _sign_key(rec))
+                 f"desk record {_line(ref, 80)}", why, {}, None if extend else _sign_key(rec))
 
 
 def _one_record(rec: dict[str, Any], unresolved: bool, threads: dict[str, str], at: dict[str, str],
                 undecided: dict[str, dict[str, Any]], qdir: Path, out: Extras, pointed: set[str],
                 queue_conn: sqlite3.Connection | None = None, now: Any = None) -> None:
-    """One coordinator record onto ``out``: an ANSWER rides its question, a SIGN or budget SIGN is an item. ``now``:
+    """One desk record onto ``out``: an ANSWER rides its question, a SIGN or budget SIGN is an item. ``now``:
     the instant a sign request's expiry is judged at (default ``None``: the wall clock)."""
-    from levain.coordinator import budget
+    from levain.desk import budget
 
     if rec["kind"] == "answer":
         if unresolved:
@@ -339,7 +340,7 @@ def _one_record(rec: dict[str, Any], unresolved: bool, threads: dict[str, str], 
     key: tuple[str, str] | None = None
     if extend:
         options: tuple[str, ...] = ("sign the extension", "leave it unsigned")
-        source, tag = "extend", "coordinator · budget"
+        source, tag = "extend", "desk · budget"
         data: dict[str, Any] = {"thread_id": rec["ref_id"].partition("/")[0],
                                 "envelope_id": rec["ref_id"].partition("/")[2]}
         head = "SIGN: extend a thread budget"
@@ -347,7 +348,7 @@ def _one_record(rec: dict[str, Any], unresolved: bool, threads: dict[str, str], 
         origin = f"budget SIGN {_line(rec['ref_id'], 120)}"
     else:
         options = ("sign (allow)", "deny")
-        source, tag = "sign", "coordinator"
+        source, tag = "sign", ROLE_DESK
         key = _sign_key(rec)
         if rec["ref_id"] in pointed:
             return                                # one item per request: a second SIGN on it adds no second item
@@ -564,7 +565,7 @@ def sheet_text(extra: Extra, letter: str, qdir: Path | str) -> str:
             return _no_command(bad.what, "extend the thread's budget from its card")
         return (f"{_command('levain', 'envelope', 'extend', thread, '--budget', 'K=N,...', '-o', 'FILE')}, then "
                 f"{_command('levain', 'envelope', 'sign', 'FILE')}")
-    # a coordinator SIGN on a consent request (no sign request file under its id): the consent rule, allow or deny
+    # a desk SIGN on a consent request (no sign request file under its id): the consent rule, allow or deny
     request_id = d.get("request_id")
     if extra.source == "sign" and sign_request_menu(qdir, request_id) is not None:
         raise NotOffered("it is a sign request whose own options the band did not show; ask for a fresh band")

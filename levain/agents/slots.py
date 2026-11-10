@@ -1,14 +1,14 @@
 """levain.agents.slots — the slot table (A0 r7 §2.4; BUILD_PLAN P6-3a).
 
-Coordinator launches and named fires share one cap through ``agent_slots``. The cap is the ``agent_settings`` row
+Desk launches and named fires share one cap through ``agent_slots``. The cap is the ``agent_settings`` row
 ``max_slots`` (default 2). Every write function runs inside the caller's write transaction, so a slot commits or rolls
 back with whatever else the caller writes (the launch transaction, P6-5a; the terminal transaction that releases it).
 
 An occurrence slot has no ``expires_at``: it is released by the transaction that writes the occurrence's terminal
-state, never by a clock. A coordinator slot is a lease (``owner_kind='launch'``, ``expires_at = taken + LEASE_S``)
+state, never by a clock. A desk slot is a lease (``owner_kind='launch'``, ``expires_at = taken + LEASE_S``)
 that its watcher renews; it is reclaimed only when it has expired AND its launch is over or its session is not alive.
 
-The launches live in the coordinator's store, a different file from the agent tables, so this module never reads
+The launches live in the desk's store, a different file from the agent tables, so this module never reads
 them. What it needs comes in as two injected callables, probed by :func:`probe_over` BEFORE the write transaction
 opens (a probe can be slow, and a write lock is not held across it): ``launch_over(launch_id)`` says whether the
 launch is gone or terminal, and ``session_alive(launch_id)`` whether its session still runs. ``None``, a missing
@@ -62,7 +62,7 @@ def held(conn: sqlite3.Connection) -> list[tuple[int, str, str, str | None]]:
 
 
 def expired_launches(conn: sqlite3.Connection, now: datetime) -> list[str]:
-    """The launch ids whose coordinator lease has expired at ``now``: what to probe before the write transaction."""
+    """The launch ids whose desk lease has expired at ``now``: what to probe before the write transaction."""
     return [r[0] for r in conn.execute("SELECT owner_id FROM agent_slots WHERE owner_kind = ? AND expires_at IS NOT NULL"
                                        " AND expires_at <= ? ORDER BY slot", (LAUNCH, _stamp(now))).fetchall()]
 
@@ -90,7 +90,7 @@ def probe_over(launch_ids: Iterable[str], launch_over: Callable[[str], bool | No
 
 
 def reclaim(conn: sqlite3.Connection, now: datetime, over: Collection[str] = ()) -> list[int]:
-    """Free every expired coordinator lease whose launch id is in ``over`` (A0 §2.4; see :func:`probe_over`);
+    """Free every expired desk lease whose launch id is in ``over`` (A0 §2.4; see :func:`probe_over`);
     returns the slots freed. The row is re-checked in this transaction: a lease renewed since the probe is no longer
     expired and stays. An occurrence slot is never reclaimed here, whatever ``over`` holds."""
     _need_txn(conn)
@@ -140,7 +140,7 @@ def release(conn: sqlite3.Connection, owner_id: str) -> bool:
 
 
 def renew(conn: sqlite3.Connection, launch_id: str, now: datetime) -> bool:
-    """The coordinator watcher's per-pass renewal: ``expires_at = now + LEASE_S``, never moving an expiry backward
+    """The desk watcher's per-pass renewal: ``expires_at = now + LEASE_S``, never moving an expiry backward
     (a late or replayed renewal cannot shorten a lease). False when the lease is gone (reclaimed meanwhile), so the
     watcher knows its launch no longer holds a slot."""
     _need_txn(conn)

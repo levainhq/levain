@@ -9,15 +9,15 @@ from pathlib import Path
 import pytest
 
 from levain.cockpit import threads
-from levain.coordinator.chat import ChatStore
-from levain.coordinator.driver import ScriptedSession, SessionMeta
-from levain.coordinator.envelopes import EnvelopeStore
+from levain.desk.chat import ChatStore
+from levain.desk.driver import ScriptedSession, SessionMeta
+from levain.desk.envelopes import EnvelopeStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_threads import clock  # noqa: F401  (fixture)
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 from tests.test_cockpit_threads_send import _PAGE, _call
-from tests.test_coordinator_chat_send import _world, ready, send
+from tests.test_desk_chat_send import _world, ready, send
 
 CSS = Path(threads.__file__).resolve().parents[1] / "templates" / "web" / "dashboard.css"
 

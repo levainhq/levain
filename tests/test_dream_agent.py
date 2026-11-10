@@ -2,7 +2,7 @@
 
 Real pieces throughout: the real RoleSpec/AgentSpec parsers and ``check_spec``, a real agent store, the real
 ``controller.claim`` and ``schedule`` for the fake-clock nights, a real anneal store consolidated by the real
-``consolidate_store`` (a fake in-process mind, nothing spent), a real coordinator review store, and the real
+``consolidate_store`` (a fake in-process mind, nothing spent), a real desk review store, and the real
 ``Supervisor`` for the fire body. The ``on_input`` hook POINT is not on main, so the nights drive it with a loop that
 stands in for it and is named so (``night``): it asks the dream's own input check and writes the skip the way the
 hook point will (the recorded reason of ``InputVerdict.recorded``). The ``agent`` feed is P8's, so cards are filed
@@ -20,8 +20,8 @@ import pytest
 
 from levain.agents import controller as ctl, refuse, role as role_mod, schedule, spec as spec_mod, store as agent_store
 from levain.autonomic.db import DB_NAME
-from levain.coordinator import review
-from levain.coordinator.store import CoordStore
+from levain.desk import review
+from levain.desk.store import CoordStore
 from levain.dream import agent as da
 from levain.dream import card as cd
 from levain.dream import executor as ex
@@ -240,7 +240,7 @@ class Night:
 
 
 def filed(store, **kw):
-    from levain.coordinator.store import StoreAbsent
+    from levain.desk.store import StoreAbsent
 
     try:
         return review.list_items(store, feed=FEED, **kw)

@@ -12,7 +12,7 @@ from levain.cockpit.consent import ConsentError
 from levain.consent import band
 from levain.consent.adapters import claude_code as cc
 from levain.consent.questions import QuestionStore
-from levain.coordinator import review
+from levain.desk import review
 from tests.test_questions_band import SESSION, _file, _run
 
 OPEN = dict(what="how should the importer treat a missing column?", options=[], rec="", blocks="the importer plan")
@@ -140,10 +140,10 @@ def test_the_ping_of_an_open_question_has_no_options_and_no_rec(tmp_path):
     assert "answer in your own words" in text and "--text" in text and text.endswith("Blocks: the importer plan.")
 
 
-def test_an_open_question_pings_at_once_even_with_a_coordinator_lease(tmp_path, monkeypatch):
+def test_an_open_question_pings_at_once_even_with_a_desk_lease(tmp_path, monkeypatch):
     sent = []
     monkeypatch.setattr(cc, "notify", lambda settings, text, cwd=None, **_kw: sent.append(text) or True)
-    monkeypatch.setattr(band, "_coordinator_session", lambda qdir, session: False)
+    monkeypatch.setattr(band, "_desk_session", lambda qdir, session: False)
     monkeypatch.setattr(band, "_hold", lambda qdir, qid: pytest.fail("an open question is never held"))
     code, _out = _run(["ask", "--what", "which way?", "--open", "--blocks", "the plan", "--queue-dir",
                        str(tmp_path / "consent")], monkeypatch, env={"CLAUDE_CODE_SESSION_ID": SESSION})
@@ -200,7 +200,7 @@ def test_the_mcp_ask_tool_takes_open_without_options(tmp_path, monkeypatch):
 
 
 def test_the_asker_rec_of_an_open_question_says_so(tmp_path):
-    from levain.coordinator import deliver
+    from levain.desk import deliver
 
     q = _open(QuestionStore(tmp_path / "consent"))
     rec = deliver._asker_rec(q)
@@ -361,7 +361,7 @@ def test_file_question_refuses_open_with_would_push_for_every_door(tmp_path, mon
 def test_the_first_reader_names_an_open_question_before_a_link():
     from types import SimpleNamespace
 
-    from levain.coordinator import first_reader
+    from levain.desk import first_reader
 
     q = SimpleNamespace(answer=None, link=SimpleNamespace(option="a", request_id="r-1"), open_ended=True)
     r = first_reader._verdict(None, None, "2026-10-30T10:00:00Z", q, None)

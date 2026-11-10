@@ -482,7 +482,7 @@ def test_the_selected_size_does_nothing_when_pressed_and_custom_numbers_are_whol
 
 
 def test_the_forms_client_side_bounds_are_the_servers() -> None:
-    from levain.coordinator.envelope import BUDGET_MAX
+    from levain.desk.envelope import BUDGET_MAX
 
     src = (WEB / "envelope_form.js").read_text()
     m = re.search(r"const BUDGET_MAX = \{([^}]*)\}", src)

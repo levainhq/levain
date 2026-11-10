@@ -1,5 +1,5 @@
 """TS-2: ``levain spores germinate``. Temp dirs only: no ~/.levain, no real questions.db, no live app.
-The ping seam is replaced; the band and the coordinator are the real stores in a temp consent dir."""
+The ping seam is replaced; the band and the desk are the real stores in a temp consent dir."""
 from __future__ import annotations
 
 import hashlib
@@ -16,7 +16,7 @@ from levain import germinate as g
 from levain.cli import main
 from levain.consent import band
 from levain.consent.questions import QuestionStore
-from levain.coordinator.store import CoordStore
+from levain.desk.store import CoordStore
 from levain.spores import guarded_spore_store
 
 TODAY = date(2026, 11, 7)
@@ -144,7 +144,7 @@ def test_nudge_crash_between_filing_and_stamp_reruns_into_one_row_and_pings_agai
 
 
 # --- board ------------------------------------------------------------------------------------------------------
-def test_board_with_a_coordinator_store_makes_one_drop_over_two_runs(tmp_path, qdir, pings):
+def test_board_with_a_desk_store_makes_one_drop_over_two_runs(tmp_path, qdir, pings):
     root = _install(tmp_path)
     s = _add(root, "write the release notes", target="board:levain")
     _make_board(qdir, tmp_path)
@@ -175,7 +175,7 @@ def test_board_crash_between_drop_and_compost_gives_one_drop(tmp_path, qdir, mon
     assert not o["filed"] and o["done"] and _drops(qdir) == before + 1
 
 
-def test_board_without_a_coordinator_falls_back_to_the_band(tmp_path, qdir):
+def test_board_without_a_desk_falls_back_to_the_band(tmp_path, qdir):
     root = _install(tmp_path)
     s = _add(root, "write the release notes", target="board:levain")
     assert not (qdir / "dispatch.db").exists()
@@ -369,7 +369,7 @@ def test_a_dispatch_only_database_is_not_a_board(tmp_path, qdir):
     root = _install(tmp_path)
     s = _add(root, "write the release notes", target="board:levain")
     JobStore(qdir).event_cursor()
-    assert (qdir / "dispatch.db").exists() and not CoordStore(qdir).coordinator_present()
+    assert (qdir / "dispatch.db").exists() and not CoordStore(qdir).desk_present()
     (o,) = _run(root, qdir)["due"]
     assert o["via"] == "band-fallback" and o["ref"].startswith("q-") and s["id"] in _open_ids(root)
     assert not _drops_table_exists(qdir)

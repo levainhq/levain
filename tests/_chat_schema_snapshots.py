@@ -2,17 +2,18 @@
 
 SCHEMA_V0_11_25 is ``CHAT_SCHEMA`` as tag v0.11.25 shipped it; SCHEMA_MAIN_F75ACBC7 is ``CHAT_SCHEMA`` and
 ``CHAT_ADDED_COLUMNS`` on main at f75acbc7, before the approval tables. Both were dumped by importing
-that revision's ``levain.coordinator.chat`` in a scratch checkout; nothing here is hand-edited."""
+that revision's ``levain.desk.chat`` in a scratch checkout; nothing here is hand-edited."""
 from __future__ import annotations
+from levain.desk.legacy import SQL_ROLE_DESK
 
 SCHEMA_V0_11_25: tuple[str, ...] = ('CREATE TABLE IF NOT EXISTS chat_messages (message_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, thread_id '
  'TEXT NOT NULL REFERENCES threads(thread_id), launch_id TEXT REFERENCES launches(launch_id), recipient TEXT NOT '
- "NULL CHECK (recipient IN ('coordinator', 'worker', 'thread')), author_kind TEXT NOT NULL CHECK (author_kind IN "
- "('operator', 'coordinator')), author_surface TEXT NOT NULL CHECK (author_surface IN ('cockpit', 'phone', 'cli', "
- "'coordinator')), client_id TEXT NOT NULL, outbox_id TEXT NOT NULL UNIQUE, mode TEXT NOT NULL CHECK (mode IN "
+ f"NULL CHECK (recipient IN ({SQL_ROLE_DESK}, 'worker', 'thread')), author_kind TEXT NOT NULL CHECK (author_kind IN "
+ f"('operator', {SQL_ROLE_DESK})), author_surface TEXT NOT NULL CHECK (author_surface IN ('cockpit', 'phone', 'cli', "
+ f"{SQL_ROLE_DESK})), client_id TEXT NOT NULL, outbox_id TEXT NOT NULL UNIQUE, mode TEXT NOT NULL CHECK (mode IN "
  "('queue', 'steer')), expected_turn_id TEXT, owner_epoch INTEGER, body TEXT NOT NULL, body_sha256 TEXT NOT NULL, "
  'body_norm_sha256 TEXT NOT NULL, attachments TEXT NOT NULL, draft_ref TEXT, at TEXT NOT NULL, CHECK ((recipient = '
- "'worker') = (launch_id IS NOT NULL)), CHECK ((author_kind = 'coordinator') = (author_surface = 'coordinator')), "
+ f"'worker') = (launch_id IS NOT NULL)), CHECK ((author_kind = {SQL_ROLE_DESK}) = (author_surface = {SQL_ROLE_DESK})), "
  "CHECK (author_kind = 'operator' OR (mode = 'queue' AND owner_epoch IS NULL)), CHECK ((mode = 'steer') = "
  "(expected_turn_id IS NOT NULL)), CHECK (mode = 'queue' OR recipient = 'worker'), CHECK (length(body) <= 20000))",
  "CREATE TRIGGER IF NOT EXISTS chat_messages_frozen BEFORE UPDATE ON chat_messages BEGIN SELECT RAISE(ABORT, 'a chat "
@@ -185,12 +186,12 @@ ADDED_V0_11_25: tuple[tuple[str, str, str], ...] = ()
 
 SCHEMA_MAIN_F75ACBC7: tuple[str, ...] = ('CREATE TABLE IF NOT EXISTS chat_messages (message_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, thread_id '
  'TEXT NOT NULL REFERENCES threads(thread_id), launch_id TEXT REFERENCES launches(launch_id), recipient TEXT NOT '
- "NULL CHECK (recipient IN ('coordinator', 'worker', 'thread')), author_kind TEXT NOT NULL CHECK (author_kind IN "
- "('operator', 'coordinator')), author_surface TEXT NOT NULL CHECK (author_surface IN ('cockpit', 'phone', 'cli', "
- "'coordinator')), client_id TEXT NOT NULL, outbox_id TEXT NOT NULL UNIQUE, mode TEXT NOT NULL CHECK (mode IN "
+ f"NULL CHECK (recipient IN ({SQL_ROLE_DESK}, 'worker', 'thread')), author_kind TEXT NOT NULL CHECK (author_kind IN "
+ f"('operator', {SQL_ROLE_DESK})), author_surface TEXT NOT NULL CHECK (author_surface IN ('cockpit', 'phone', 'cli', "
+ f"{SQL_ROLE_DESK})), client_id TEXT NOT NULL, outbox_id TEXT NOT NULL UNIQUE, mode TEXT NOT NULL CHECK (mode IN "
  "('queue', 'steer')), expected_turn_id TEXT, owner_epoch INTEGER, body TEXT NOT NULL, body_sha256 TEXT NOT NULL, "
  'body_norm_sha256 TEXT NOT NULL, attachments TEXT NOT NULL, draft_ref TEXT, at TEXT NOT NULL, CHECK ((recipient = '
- "'worker') = (launch_id IS NOT NULL)), CHECK ((author_kind = 'coordinator') = (author_surface = 'coordinator')), "
+ f"'worker') = (launch_id IS NOT NULL)), CHECK ((author_kind = {SQL_ROLE_DESK}) = (author_surface = {SQL_ROLE_DESK})), "
  "CHECK (author_kind = 'operator' OR (mode = 'queue' AND owner_epoch IS NULL)), CHECK ((mode = 'steer') = "
  "(expected_turn_id IS NOT NULL)), CHECK (mode = 'queue' OR recipient = 'worker'), CHECK (length(body) <= 20000))",
  "CREATE TRIGGER IF NOT EXISTS chat_messages_frozen BEFORE UPDATE ON chat_messages BEGIN SELECT RAISE(ABORT, 'a chat "

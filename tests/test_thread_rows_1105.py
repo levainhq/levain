@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from levain.cockpit import threads
-from levain.coordinator.chat import TimelineRow
+from levain.desk.chat import TimelineRow
 from tests.test_cockpit_flip_parity import NODE, _drive, needs_browser
 
 WEB = Path(threads.__file__).resolve().parents[1] / "templates" / "web"

@@ -1,6 +1,6 @@
 // levain board_view.js — the painters of the cockpit's board kind (C12).
 //
-// The audit window over the coordinator's work: six DERIVED columns (backlog, ready, running, waiting, needs-you, done) from a
+// The audit window over the desk's work: six DERIVED columns (backlog, ready, running, waiting, needs-you, done) from a
 // board value (levain's own, or a provider's of the same shape). The panel lists the cards grouped under those column headings;
 // the six columns side by side are drawn (by renderBoard) in the panel's ⤢ focus modal. Read-only: no drag, no edit, no rename.
 // Each card shows its journal line (who moved it, when, why). The one way to talk about a card is a drop: every card carries a
@@ -34,8 +34,8 @@
       queue: body.queue || "none",
       note: body.note || "",
       hint: body.band_hint || "levain band",
-      // false only when levain's own board says its drop route files to another coordinator than the one this board reads; a
-      // provider's board is the coordinator's own work and says nothing, which reads as true
+      // false only when levain's own board says its drop route files to another desk than the one this board reads; a
+      // provider's board is the desk's own work and says nothing, which reads as true
       dropHere: body.drop_here !== false,
       unreadable: Array.isArray(body.unreadable) ? body.unreadable.map(String) : [],
       columns: ORDER.map(function (name) {
@@ -122,24 +122,24 @@
     return b;
   }
   function drawDrop(doc, host, k, model) {
-    if (model && model.dropHere === false) return;      // the drop box would file to a coordinator that is not this board's
+    if (model && model.dropHere === false) return;      // the drop box would file to a desk that is not this board's
     var b = dropButton(doc, k);
     if (b) host.appendChild(b);
   }
 
   // What an empty column says. ONE rule: a column is "nothing" only when every source that feeds it was read. The sources, from the
-  // producer (cockpit/board.py, coordinator/ready.py): the store feeds every column but needs-you ("coordinator" in unreadable, or the
+  // producer (cockpit/board.py, desk/ready.py): the store feeds every column but needs-you ("desk" in unreadable, or the
   // queue state is anything but "ok"/"none": fail closed); the seat roster adds running and waiting ("seats"); the band is needs-you's
   // alone ("band"). The journal only annotates cards, so it never empties a column.
-  var COLUMN_SOURCES = { "needs-you": ["band"], running: ["coordinator", "seats"], waiting: ["coordinator", "seats"] };
+  var COLUMN_SOURCES = { "needs-you": ["band"], running: ["desk", "seats"], waiting: ["desk", "seats"] };
   function sourceMissing(model, src) {
     if (!Array.isArray(model.unreadable)) return true;      // the producer always sends the list: a payload without it cannot say what was read
     var un = model.unreadable;
-    if (src === "coordinator" && model.queue !== "ok" && model.queue !== "none") return true;
+    if (src === "desk" && model.queue !== "ok" && model.queue !== "none") return true;
     return un.indexOf(src) >= 0;
   }
   function emptyText(model, col) {
-    var bad = (COLUMN_SOURCES[col.category] || ["coordinator"]).some(function (s) { return sourceMissing(model, s); });
+    var bad = (COLUMN_SOURCES[col.category] || ["desk"]).some(function (s) { return sourceMissing(model, s); });
     return bad ? "unknown (could not read)" : "nothing";
   }
 

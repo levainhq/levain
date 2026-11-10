@@ -1,4 +1,4 @@
-"""PRESENCE-SEAT: a seat or the coordinator sets a presence word only on the operator's quoted words, only the words
+"""PRESENCE-SEAT: a seat or the desk sets a presence word only on the operator's quoted words, only the words
 its role allows, and the record shows who set it."""
 from __future__ import annotations
 
@@ -10,9 +10,10 @@ import pytest
 from levain.consent import band
 from levain.webpush import cli, intent, presence
 from levain.webpush.presence import PresenceError, describe, read_word, set_word
+from levain.desk.legacy import ROLE_DESK
 
 SEAT = {"agent": "claude_code", "session": "abc12345-seat", "role": "seat"}
-COORD = {"agent": "claude_code", "session": "def67890-coord", "role": "coordinator"}
+COORD = {"agent": "claude_code", "session": "def67890-coord", "role": ROLE_DESK}
 NOW = 1_000_000.0
 
 
@@ -71,10 +72,10 @@ def test_a_refusal_leaves_the_word_already_on_file_untouched(tmp_path):
     assert _file(tmp_path).read_text() == before
 
 
-def test_the_coordinator_may_also_set_quiet_and_sleep_but_not_back_or_loud(tmp_path):
+def test_the_desk_may_also_set_quiet_and_sleep_but_not_back_or_loud(tmp_path):
     q = set_word(tmp_path, "quiet", duration="2h", now=NOW, by=COORD, said="quiet till noon please")
-    assert q["by"]["role"] == "coordinator" and q["until"] == NOW + 7200
-    assert 'Set by the coordinator claude_code def67890-coord from your words: "quiet till noon please"' in describe(
+    assert q["by"]["role"] == ROLE_DESK and q["until"] == NOW + 7200
+    assert 'Set by the desk claude_code def67890-coord from your words: "quiet till noon please"' in describe(
         tmp_path, now=NOW + 1, idle=_idle)
     assert set_word(tmp_path, "sleep", now=NOW, by=COORD, said="going to bed")["word"] == "sleep"
     for word in ("back", "loud"):
@@ -117,12 +118,12 @@ def _args(tmp_path, word, said=None, duration=None):
     return argparse.Namespace(queue_dir=tmp_path, word=word, duration=duration, said=said)
 
 
-def _as_agent(monkeypatch, session="abc12345-seat", coordinator=False):
-    from levain.coordinator import first_reader
+def _as_agent(monkeypatch, session="abc12345-seat", desk=False):
+    from levain.desk import first_reader
 
     monkeypatch.setattr(band, "agent_process", lambda: "claude_code")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session)
-    monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: coordinator and sess == session)
+    monkeypatch.setattr(first_reader, "is_desk_session", lambda directory, sess: desk and sess == session)
 
 
 def _as_operator(monkeypatch):
@@ -152,8 +153,8 @@ def test_cli_a_seat_quiet_is_refused_with_the_reason(tmp_path, monkeypatch, caps
     assert not _file(tmp_path).exists()
 
 
-def test_cli_the_coordinator_session_may_set_quiet(tmp_path, monkeypatch):
-    _as_agent(monkeypatch, session="def67890-coord", coordinator=True)
+def test_cli_the_desk_session_may_set_quiet(tmp_path, monkeypatch):
+    _as_agent(monkeypatch, session="def67890-coord", desk=True)
     assert cli._word(_args(tmp_path, "quiet", said="quiet till noon", duration="1h")) == 0
     assert read_word(tmp_path)["by"] == COORD
 
@@ -193,26 +194,26 @@ def test_cli_a_detected_agent_whose_identity_cannot_be_named_is_refused_not_the_
     assert not _file(tmp_path).exists()
 
 
-def test_cli_a_codex_seat_under_a_coordinator_is_a_seat_not_the_coordinator(tmp_path, monkeypatch, capsys):
-    from levain.coordinator import first_reader
+def test_cli_a_codex_seat_under_a_desk_is_a_seat_not_the_desk(tmp_path, monkeypatch, capsys):
+    from levain.desk import first_reader
 
     monkeypatch.setattr(band, "agent_process", lambda: "codex")
     monkeypatch.setenv("CODEX_THREAD_ID", "codex-seat-1")
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "inherited-coord")   # the coordinator's, inherited, not this seat's
-    monkeypatch.setattr(first_reader, "is_coordinator_session", lambda directory, sess: sess == "inherited-coord")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "inherited-coord")   # the desk's, inherited, not this seat's
+    monkeypatch.setattr(first_reader, "is_desk_session", lambda directory, sess: sess == "inherited-coord")
     assert cli._word(_args(tmp_path, "quiet", said="quiet till noon", duration="1h")) == 2
     assert "operator's own word" in capsys.readouterr().out
     assert not _file(tmp_path).exists()
 
 
 def test_cli_the_role_check_failing_reads_as_a_seat(tmp_path, monkeypatch):
-    from levain.coordinator import first_reader
+    from levain.desk import first_reader
 
     def boom(directory, sess):
         raise OSError("store unreadable")
 
     _as_agent(monkeypatch)
-    monkeypatch.setattr(first_reader, "is_coordinator_session", boom)
+    monkeypatch.setattr(first_reader, "is_desk_session", boom)
     assert cli._word(_args(tmp_path, "quiet", said="x", duration="1h")) == 2
     assert cli._word(_args(tmp_path, "away", said="heading out")) == 0
     assert read_word(tmp_path)["by"]["role"] == "seat"
@@ -234,8 +235,8 @@ def test_a_setter_may_write_over_a_loud_that_has_ended_and_the_operator_over_a_l
     assert set_word(tmp_path, "quiet", duration="10m", now=NOW + 60)["word"] == "quiet"
 
 
-@pytest.mark.parametrize("by", [{"role": "coordinator"}, {"agent": " ", "session": "s", "role": "seat"},
-                                {"agent": 7, "role": "seat"}, "coordinator", ["seat"]])
+@pytest.mark.parametrize("by", [{"role": ROLE_DESK}, {"agent": " ", "session": "s", "role": "seat"},
+                                {"agent": 7, "role": "seat"}, ROLE_DESK, ["seat"]])
 def test_a_setter_that_names_no_agent_is_refused_and_nothing_is_written(tmp_path, by):
     with pytest.raises(PresenceError, match="names no agent"):
         set_word(tmp_path, "away", by=by, said="heading out")

@@ -18,7 +18,7 @@ temp dir and private to you, ``LEVAIN_HOME`` (if set) is inside ``S``, only the 
 every argument (the value of ``--opt=value`` included; a bare name counts) resolves, with ``~`` expanded and relative to
 ``S``, which becomes the working directory; single-dash options are refused. It also drops
 ``SSH_AUTH_SOCK`` so a software key cannot reach the operator's real agent. What it does NOT bound: the CLI's
-coordinator-door check may read one record file (``consent/coordinator_workspaces.json``) under the account's real
+desk-door check may read one record file (``consent/coordinator_workspaces.json``) under the account's real
 levain home; it decides by the working directory (now the scratch directory), reads nothing else there and writes
 nothing. No key, cockpit store or ledger of the real account is read or written. Single process, not thread-safe.
 

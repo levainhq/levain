@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from levain.coordinator.chat_tripwires import TripwireContext, TripwireWindow
-from levain.coordinator.driver import event
+from levain.desk.chat_tripwires import TripwireContext, TripwireWindow
+from levain.desk.driver import event
 
 ROOM_PAIRS = frozenset((t, s) for t in ("Read", "Grep", "Glob", "WebSearch", "mcp__levain_room__propose_drop")
                        for s in ("user_permanent", "config"))

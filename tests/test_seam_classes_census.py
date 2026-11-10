@@ -1,4 +1,4 @@
-"""C15 S0: the class ruling covers every table of a maximal coordinator database, and no schema name is defined twice.
+"""C15 S0: the class ruling covers every table of a maximal desk database, and no schema name is defined twice.
 
 The maximal database is built as the census built it (``project_memory/1030-62-c15/CENSUS.md``): ``EnvelopeStore``
 (which makes the base, lease, draft, review, first-reader, lifecycle, operator-view and seam tables and the dispatch
@@ -14,21 +14,21 @@ from pathlib import Path
 import pytest
 
 from levain.chat_egress.records import EGRESS_SCHEMA, EgressRecords
-from levain.coordinator import room
-from levain.coordinator import seam_classes as sc
-from levain.coordinator.chat import CHAT_SCHEMA, ChatStore
-from levain.coordinator.envelopes import ENVELOPE_SCHEMA, EnvelopeStore
-from levain.coordinator.first_reader import FIRST_READER_SCHEMA
-from levain.coordinator.intake import INTAKE_SCHEMA
-from levain.coordinator.lease import LAUNCH_KINDS, LEASE_KINDS, LEASE_SCHEMA
-from levain.coordinator.ready import LIFECYCLE_SCHEMA
-from levain.coordinator.review import FOREIGN_CLEAR_TRIGGER, REVIEW_SCHEMA
-from levain.coordinator.seam_handoffs import SEAM_HANDOFF_SCHEMA
-from levain.coordinator.seam_open import OPEN_SCHEMA
-from levain.coordinator.store import GSEQ_TABLES, SCHEMA, SEAM_SCHEMA
-from levain.coordinator.teamdrafts import DRAFT_SCHEMA
-from levain.coordinator.work_attach import WORK_SCHEMA
-from levain.coordinator.work_delta import OPERATOR_VIEWS_SCHEMA
+from levain.desk import room
+from levain.desk import seam_classes as sc
+from levain.desk.chat import CHAT_SCHEMA, ChatStore
+from levain.desk.envelopes import ENVELOPE_SCHEMA, EnvelopeStore
+from levain.desk.first_reader import FIRST_READER_SCHEMA
+from levain.desk.intake import INTAKE_SCHEMA
+from levain.desk.lease import LAUNCH_KINDS, LEASE_KINDS, LEASE_SCHEMA
+from levain.desk.ready import LIFECYCLE_SCHEMA
+from levain.desk.review import FOREIGN_CLEAR_TRIGGER, REVIEW_SCHEMA
+from levain.desk.seam_handoffs import SEAM_HANDOFF_SCHEMA
+from levain.desk.seam_open import OPEN_SCHEMA
+from levain.desk.store import GSEQ_TABLES, SCHEMA, SEAM_SCHEMA
+from levain.desk.teamdrafts import DRAFT_SCHEMA
+from levain.desk.work_attach import WORK_SCHEMA
+from levain.desk.work_delta import OPERATOR_VIEWS_SCHEMA
 from levain.dispatch.jobs import _SCHEMA as JOB_SCHEMA
 
 
@@ -215,7 +215,7 @@ def test_the_declared_names_are_the_names_the_database_holds(maximal: Path) -> N
     assert sorted(declared - held) == []
 
 
-_COORD_SRC = Path(__file__).resolve().parent.parent / "levain" / "coordinator"
+_COORD_SRC = Path(__file__).resolve().parent.parent / "levain" / "desk"
 
 
 def _insert_sites_without_gseq(text: str) -> list[tuple[str, str]]:
@@ -244,8 +244,8 @@ def test_every_insert_into_a_gseq_table_names_gseq() -> None:
     assert len(reported) == 1 and reported[0][0] in GSEQ_TABLES and "gseq" not in reported[0][1]
 
 
-def test_no_insert_into_a_gseq_table_hides_its_column_list_or_lives_outside_the_coordinator() -> None:
-    pkg = _COORD_SRC.parent                                      # the whole levain package, not only coordinator/
+def test_no_insert_into_a_gseq_table_hides_its_column_list_or_lives_outside_the_desk() -> None:
+    pkg = _COORD_SRC.parent                                      # the whole levain package, not only desk/
     bare = re.compile(r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+(?:" + "|".join(GSEQ_TABLES) + r")\s*(?!\s*\()(?=VALUES|SELECT|\s)", re.I)
     outside = []
     for path in sorted(pkg.rglob("*.py")):
@@ -260,7 +260,7 @@ def test_no_insert_into_a_gseq_table_hides_its_column_list_or_lives_outside_the_
 
 def test_a_locked_bounds_read_is_not_reported_as_never_migrated(tmp_path) -> None:
     import sqlite3
-    from levain.coordinator import seam_classes
+    from levain.desk import seam_classes
 
     class _Locked:
         def execute(self, *_a):

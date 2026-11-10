@@ -401,9 +401,9 @@ def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, db_path: Path | s
 
 def file_card(store: Any, card: Card, *, feed: str = FEED, thread_id: str | None = None) -> tuple[Any, bool]:
     """File ``card`` as a review item, once per ``dedupe_key`` (``(item, new)``). ``authority_relevant`` is the card's:
-    a card with a non-empty ``his`` cannot be cleared in ``coordinator`` mode. Whether the ``agent`` feed exists is
+    a card with a non-empty ``his`` cannot be cleared in ``desk`` mode. Whether the ``agent`` feed exists is
     ``review.FEEDS``'s to say (P8 adds it); a store that lacks it refuses here, and nothing is filed."""
-    from levain.coordinator import review
+    from levain.desk import review
 
     return review.file_item(store, feed, card.body, dedupe_key=card.dedupe_key, thread_id=thread_id,
                             authority_relevant=card.authority_relevant)

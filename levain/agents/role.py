@@ -14,7 +14,7 @@ required and ``kind`` optional:
                 workspace snapshot's withhold patterns (:func:`levain.dispatch.policy.match` grammar), a role can only
                 WITHHOLD more. It sits in the signed role, so the role_hash pins it and his signature on the agent
                 link covers it; a role without it hashes exactly as before (an absent key is not written). The
-                coordinator's envelope narrowing never sees it (:func:`envelope_ceiling`).
+                desk's envelope narrowing never sees it (:func:`envelope_ceiling`).
 - ``model``     str; non-empty for a session executor.
 - ``harness``   ``claude`` | ``codex`` for a session executor, ``""`` for any other executor (D1 R-D1).
 - ``executor``  ``session`` | ``dream``.
@@ -251,7 +251,7 @@ def instance_ceiling(role: dict[str, Any]) -> dict[str, Any]:
 
 
 def envelope_ceiling(ceiling: dict[str, Any]) -> dict[str, Any]:
-    """``ceiling`` without the keys that are not envelope vocabulary (``withhold``): what the coordinator's envelope
+    """``ceiling`` without the keys that are not envelope vocabulary (``withhold``): what the desk's envelope
     narrowing is handed. A new non-envelope ceiling key is dropped HERE, once, and never reaches ``narrow_scope``."""
     return {k: v for k, v in ceiling.items() if k != "withhold"}
 

@@ -787,7 +787,7 @@ def _edit_target(resource_key: str) -> str:
     if kind == "section" and ident:
         return f"the {ident} section"
     if kind == "drop" and ident:
-        return "sent to the desk to sort"       # a sort's coordinator drop (coord_effects)
+        return "sent to the desk to sort"       # a sort's desk drop (desk_effects)
     if kind == "token":
         return ident          # a surface token: "rotated the surface token browser"
     if kind == "pend":
@@ -1811,11 +1811,11 @@ def build_default_cockpit(
     # the Team zone: read-only, over the team ledger found from ``team_start`` or, failing that, from the source's
     # own install root; NEVER from the process's working directory (an unrelated repo's ledger is not this
     # source's). A source with neither draws no Team zone. The panel set follows the ledger's state.
-    # the coordinator panels (C4-b review queue, C6-b morning card): read-only, drawn only while the coordinator's
+    # the desk panels (C4-b review queue, C6-b morning card): read-only, drawn only while the desk's
     # store file exists, in the directory the consent reader names (the topology's dispatch directory)
-    from levain.cockpit.coordinator_panels import coordinator_discoverer
+    from levain.cockpit.desk_panels import desk_discoverer
 
-    ck.discover(coordinator_discoverer(lambda: _dispatch_dir(ck.consent_reader)), retire=True)
+    ck.discover(desk_discoverer(lambda: _dispatch_dir(ck.consent_reader)), retire=True)
     from levain.cockpit.agents_panel import wire_agents
 
     wire_agents(ck, source, dispatch_dir=lambda: _dispatch_dir(ck.consent_reader), clock=clock)   # the agents panel and the verbs read one wiring; no agent store, no panel

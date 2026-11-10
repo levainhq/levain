@@ -371,8 +371,8 @@ def test_stale_rows_are_not_starved_by_a_fresh_supervisor_each_tick(rig, monkeyp
     assert ever == {r["occurrence_id"] for r in rows}
 
 
-def test_the_renewals_run_before_the_coordinator_directory_is_read(rig, monkeypatch):  # noqa: F811
-    """codex HIGH :248 / deepseek HIGH 1, 2, MED 4: nothing the renewals do not need (the dream install's coordinator
+def test_the_renewals_run_before_the_desk_directory_is_read(rig, monkeypatch):  # noqa: F811
+    """codex HIGH :248 / deepseek HIGH 1, 2, MED 4: nothing the renewals do not need (the dream install's desk
     directory, dispatch.db) runs before them."""
     order: list = []
     real = supervise.Supervisor.reap
@@ -458,7 +458,7 @@ def test_binding_of_arms_nothing_when_the_cover_moves(rig):  # noqa: F811
     assert T.binding_of_factory(rig.store, Moving(), rig.now)(rig.agent, rig.spec_hash) is None
 
 
-def test_expired_launch_slots_with_no_coordinator_directory_are_named(rig, capsys):  # noqa: F811
+def test_expired_launch_slots_with_no_desk_directory_are_named(rig, capsys):  # noqa: F811
     """codex MED :257: a session-only store, no --coord-dir, no dream install: the expired launch slot is kept and the
     tick says why, instead of passing no probes silently."""
     from levain.agents import slots
@@ -466,12 +466,12 @@ def test_expired_launch_slots_with_no_coordinator_directory_are_named(rig, capsy
         c.execute("INSERT INTO agent_slots (slot, owner_kind, owner_id, taken_at, expires_at) VALUES (1, ?, 'ln-1', ?, ?)",
                   (slots.LAUNCH, "2026-01-01T00:00:00Z", "2026-01-01T00:15:00Z"))
     assert T.run_tick(rig.store, clock=rig.now, authority=rig.authority, launcher_of=lambda: None) == T.EXIT_OK
-    assert "no coordinator directory" in capsys.readouterr().err
+    assert "no desk directory" in capsys.readouterr().err
     with rig.store.read() as c:
         assert c.execute("SELECT owner_id FROM agent_slots").fetchall() == [("ln-1",)]
 
 
-def test_the_default_store_finds_the_default_coordinator_queue(rig, monkeypatch, tmp_path):  # noqa: F811
+def test_the_default_store_finds_the_default_desk_queue(rig, monkeypatch, tmp_path):  # noqa: F811
     from levain.autonomic import db
     from levain.consent import queue
     q = tmp_path / "consent"
@@ -538,7 +538,7 @@ def test_the_soft_bound_is_not_swallowed_by_the_refused_branch(rig, monkeypatch)
 
 def test_an_unreadable_dream_install_is_named_not_read_as_absent(rig, capsys):  # noqa: F811
     """deepseek MED 3 (r2): a dream install that exists but cannot be read is named as such when the probes need it,
-    instead of the tick saying only "no coordinator directory"."""
+    instead of the tick saying only "no desk directory"."""
     from levain.agents import slots
     from levain.dream import agent as DA
     (rig.store.directory / DA.INSTALL_FILE).write_text("{not json")

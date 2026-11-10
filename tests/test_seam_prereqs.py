@@ -11,8 +11,8 @@ import pytest
 from levain import band_view
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.consent.questions import QuestionStore
-from levain.coordinator import morning, ready
-from levain.coordinator.store import CoordError, CoordStore
+from levain.desk import morning, ready
+from levain.desk.store import CoordError, CoordStore
 
 OPTS = [("a", "A"), ("b", "B")]
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
@@ -177,7 +177,7 @@ def test_list_ready_with_conn_reads_the_callers_snapshot_not_a_later_write(world
 
 
 # ---------------------------------------------------------------------- 4. no wall clock reaches the output
-# the real world of a busy morning: an open question, an UNDECIDED consent request with a coordinator SIGN on it (and a
+# the real world of a busy morning: an open question, an UNDECIDED consent request with a desk SIGN on it (and a
 # levain sign request file of the same id, so the sign-menu expiry is judged), a budget-extension SIGN, a review item.
 import json
 import sys
@@ -186,11 +186,11 @@ from datetime import timedelta
 
 from levain.consent import sign
 from levain.contracts.namespaces import REVIEW_CLEAR_NAMESPACE
-from levain.coordinator import review
+from levain.desk import review
 from tests.test_band_authority import ask, human_terminal, night, qdir, undecided  # noqa: F401 - fixtures
 from tests.test_band_authority import cq  # noqa: F401
 from tests.test_consent_queue import keys  # noqa: F401 - fixtures
-from tests.test_coordinator_envelope import ctx, repo, snapshot  # noqa: F401 - fixtures
+from tests.test_desk_envelope import ctx, repo, snapshot  # noqa: F401 - fixtures
 
 
 class WallClockRead(BaseException):
@@ -241,7 +241,7 @@ def _clone_request(qdir, src, new_id):
 def busy(night, cq, qdir):  # noqa: F811
     qs = QuestionStore(qdir)                                  # the DEFAULT clock: the wall clock
     ask(qs, "rename helper?")
-    req = undecided(cq, night)                                # an UNDECIDED request with a coordinator SIGN on it
+    req = undecided(cq, night)                                # an UNDECIDED request with a desk SIGN on it
     review.push_sign(night.store, night.T, req.id, "land thread", rec="a: tests green")
     live = cq.file(agent="claude_code", agent_session_id="sess-live", tool_name="Bash",
                    tool_input={"command": "echo live"}, cwd=night.c.path, hold=timedelta(hours=3))   # a PENDING one
@@ -251,7 +251,7 @@ def busy(night, cq, qdir):  # noqa: F811
     review.push_sign(night.store, night.T, lv, "clear the item", rec="a: signed on the sheet")
     night.calls(7)                                            # past its budget: a budget-extension SIGN
     night.leg()
-    review.file_know(night.store, night.T, "the coordinator noticed a thing", by="service")
+    review.file_know(night.store, night.T, "the desk noticed a thing", by="service")
     return CoordStore(night.store.directory), qs, qdir        # a CoordStore on the DEFAULT clock too
 
 
@@ -289,14 +289,14 @@ def test_the_same_probe_fails_without_now(busy, monkeypatch):
 
 
 # ------------------------------------------------------------------ 2/3/6. the connection, the stamp, the edges
-def test_readonly_band_with_coord_conn_opens_no_second_coordinator_read(busy, monkeypatch):
+def test_readonly_band_with_coord_conn_opens_no_second_desk_read(busy, monkeypatch):
     st, qs, qdir = busy
     T = datetime(2026, 10, 20, 13, 0, tzinfo=timezone.utc)
     opens = []
     real = st.open_readonly
     monkeypatch.setattr(CoordStore, "open_readonly", lambda self, *a, **k: opens.append(1) or real(*a, **k))
     own = band_view.band_snapshot_readonly(qs, now=T)
-    assert opens                                            # the default path opens its own coordinator read
+    assert opens                                            # the default path opens its own desk read
     opens.clear()
     with read_transaction(st.open_readonly) as conn:
         n = len(opens)
@@ -374,7 +374,7 @@ def _naive():
                                    "queue_request_open", "waiting_on_you", "card"])
 def test_every_entry_that_takes_now_refuses_a_naive_one_before_any_read(world, entry):
     from levain import band_sources
-    from levain.coordinator import review
+    from levain.desk import review
 
     st, qs, qdir = world
     before = _bytes(qdir)

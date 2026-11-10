@@ -15,7 +15,7 @@ from levain.chat_egress import decider as dm
 from levain.chat_egress import keys, wire
 from levain.chat_egress import records as rec
 from levain.chat_egress.resolver import Resolver
-from levain.coordinator.store import CoordStore, next_gseq
+from levain.desk.store import CoordStore, next_gseq
 
 PUBLIC = "93.184.216.34"
 

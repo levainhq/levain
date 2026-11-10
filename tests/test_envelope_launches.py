@@ -18,14 +18,14 @@ import pytest
 from levain.cockpit import threads as cockpit_threads
 from levain.cockpit.consent import utc_stamp
 from levain.contracts.canon import canonical, canonical_bytes
-from levain.coordinator import cli as ccli
-from levain.coordinator import envelope as env
-from levain.coordinator import envelope_draft as ed
-from levain.coordinator import lease
-from levain.coordinator.envelopes import EnvelopeStore, narrow_scope
-from levain.coordinator.phone import COCKPIT_DEVICE
-from levain.coordinator.store import CoordError, Part
-from tests.test_coordinator_envelope import HOUR, NOW, ctx, keys, repo, snapshot  # noqa: F401  (fixtures)
+from levain.desk import cli as ccli
+from levain.desk import envelope as env
+from levain.desk import envelope_draft as ed
+from levain.desk import lease
+from levain.desk.envelopes import EnvelopeStore, narrow_scope
+from levain.desk.phone import COCKPIT_DEVICE
+from levain.desk.store import CoordError, Part
+from tests.test_desk_envelope import HOUR, NOW, ctx, keys, repo, snapshot  # noqa: F401  (fixtures)
 
 WEB = Path(env.__file__).resolve().parents[1] / "templates" / "web"
 REPO = "/work/alpha"
@@ -134,7 +134,7 @@ def test_a_draft_proposal_never_carries_launches_and_says_so():
 def test_a_spec_drop_naming_launches_is_refused_as_a_draft_rule_not_silently_dropped(ctx):
     """L3 r1 #3: spec_rule read the CLI's spec keys (launches included) but copied only the draft's editable fields, so a
     complete spec carrying a grant made a signable draft that had silently lost it. It is refused, in plain words."""
-    from levain.coordinator import envelope_drafts as drafts
+    from levain.desk import envelope_drafts as drafts
 
     _d, t = ctx.plain_thread("draft me")
     drafts.drop_rule(ctx.store, t.thread_id, by="operator")                 # the series a later spec drop revises

@@ -9,10 +9,10 @@ from datetime import datetime, timezone
 import pytest
 
 from levain.cockpit import threads
-from levain.coordinator.chat import ChatService, ChatStore
-from levain.coordinator.driver import ScriptedSession
-from levain.coordinator.envelopes import EnvelopeStore
-from tests.test_coordinator_chat_send import LIVE, ME, Clock, _world, check, ready, send
+from levain.desk.chat import ChatService, ChatStore
+from levain.desk.driver import ScriptedSession
+from levain.desk.envelopes import EnvelopeStore
+from tests.test_desk_chat_send import LIVE, ME, Clock, _world, check, ready, send
 
 
 @pytest.fixture
@@ -81,7 +81,7 @@ def test_a_driver_without_catch_up_shows_the_gap(qdir, clock):
     cs._connect().close()
     assert threads.thread_stream(qdir, world["thread"])["gap"] is False
     with cs._write() as (conn, now):
-        from levain.coordinator import chat
+        from levain.desk import chat
         chat.record_cursor(conn, now, launch_id=world["launch"], vendor_cursor=None, complete_through=None, gap=True)
     assert threads.thread_stream(qdir, world["thread"])["gap"] is True
 
@@ -125,7 +125,7 @@ def test_an_old_store_without_the_chat_view_lists_nothing(tmp_path):
 
 
 def _row(kind, ref, launch):
-    from levain.coordinator.chat import TimelineRow
+    from levain.desk.chat import TimelineRow
     return TimelineRow(1, kind, "vendor", ref, launch, None, "b", "t", None)
 
 
@@ -170,7 +170,7 @@ def test_any_failure_at_the_handler_boundary_is_the_fixed_sentence(seeded, monke
 
 
 def test_the_list_holds_only_threads_with_a_launch_or_a_chat_record_newest_activity_first(qdir, clock):
-    from levain.coordinator.store import Part
+    from levain.desk.store import Part
     store = EnvelopeStore(qdir, clock=clock)
     world = _world(store)                    # thread 1: a worker launch, no chat lines yet
     cs = ChatStore(store)
@@ -211,7 +211,7 @@ def test_a_chat_line_newer_than_the_launch_supplies_the_latest_activity(seeded):
 
 def test_an_approval_body_never_reaches_the_json_in_either_kind():
     # the last two are chat_timeline's own approval arms (APPROVAL_VIEW_ARMS), whose ref is the whole durable key
-    from levain.coordinator.chat_approvals import APPROVAL_EVENT_KINDS
+    from levain.desk.chat_approvals import APPROVAL_EVENT_KINDS
     for kind in ("vendor_approval_request", "vendor_approval_resolved", "approval",
                  *("approval_" + k for k in APPROVAL_EVENT_KINDS)):
         row = dataclasses.replace(_row(kind, "can_use_tool:req-77:toolu_SECRETID", "L-A"), body="Bash rm x req-77")

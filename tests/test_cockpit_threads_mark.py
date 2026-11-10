@@ -11,17 +11,17 @@ import pytest
 
 from levain.cockpit import threads
 from levain.cockpit.consent import utc_stamp
-from levain.coordinator.chat import ChatStore, next_gseq
-from levain.coordinator.driver import ScriptedSession
-from levain.coordinator.envelopes import NOT_IN_FORCE, EnvelopeStore
+from levain.desk.chat import ChatStore, next_gseq
+from levain.desk.driver import ScriptedSession
+from levain.desk.envelopes import NOT_IN_FORCE, EnvelopeStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_threads import clock  # noqa: F401  (fixture)
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 from tests.test_cockpit_threads_send import _PAGE, _call
-from levain.coordinator import envelope as env
-from levain.coordinator.store import Part
-from tests.test_coordinator_chat_send import T0, _world, ready, send
+from levain.desk import envelope as env
+from levain.desk.store import Part
+from tests.test_desk_chat_send import T0, _world, ready, send
 
 EID = "ev-" + "a" * 32
 S12, S1230, S13, S18 = (utc_stamp(T0 + timedelta(hours=h)) for h in (0, 0.5, 1, 6))

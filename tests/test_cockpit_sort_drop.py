@@ -1,4 +1,4 @@
-"""A phone's plain List line (a *sort*), signed, becomes one coordinator drop (levain 67, key 1108-18): the
+"""A phone's plain List line (a *sort*), signed, becomes one desk drop (levain 67, key 1108-18): the
 ``coordinator_drop`` effect on ``CoordDropEffectStore``, through a real Broker, a real passkey-signed device pending and
 a real ``CoordStore`` in a tmp dir. Nothing here touches an operator's live apps."""
 from __future__ import annotations
@@ -16,11 +16,11 @@ from anneal_memory.spores import SporeStore  # noqa: E402
 
 from levain import intake  # noqa: E402
 from levain.cockpit.broker import Broker, BrokerError  # noqa: E402
-from levain.cockpit.coord_effects import (  # noqa: E402
+from levain.cockpit.desk_effects import (  # noqa: E402
     COORD_CANONICAL,
-    COORDINATOR,
+    DESK,
     CoordDropEffectStore,
-    coordinator_drop_effect,
+    desk_drop_effect,
     drop_resource_key,
 )
 from levain.cockpit.effects import (  # noqa: E402
@@ -35,7 +35,7 @@ from levain.cockpit.effects import (  # noqa: E402
     registration_refusals,
     settle,
 )
-from levain.coordinator.store import CoordStore  # noqa: E402
+from levain.desk.store import CoordStore  # noqa: E402
 from tests.autonomic_confirm_keys import anchor_scratch  # noqa: E402
 from tests.cockpit_authority_rig import RealKey, enrol, enrol_any  # noqa: E402
 from tests.test_cockpit_k8a_phone_authority import SoftPasskey  # noqa: E402
@@ -62,7 +62,7 @@ def world(home: Path) -> Iterator[SimpleNamespace]:
     qdir.mkdir(mode=0o700)
     where: list[Path | None] = [qdir]
     b = Broker(home / "data", stores={"spores": SporeEffectStore(spores),
-                                      COORDINATOR: CoordDropEffectStore(lambda: where[0])},
+                                      DESK: CoordDropEffectStore(lambda: where[0])},
                store_paths=[spores], install_class="reported")
     b.start()
     keys = home / "keys"
@@ -92,21 +92,21 @@ def _drops(qdir: Path) -> list[Any]:
 
 def test_the_effect_is_one_create_of_the_words_and_refuses_anything_else():
     ok = create_origin_key(PID, 0)
-    eff = coordinator_drop_effect({"text": WORDS}, None, origin_key=ok)
-    assert (eff.store, eff.resource_key, eff.is_create) == (COORDINATOR, drop_resource_key(ok), True)
+    eff = desk_drop_effect({"text": WORDS}, None, origin_key=ok)
+    assert (eff.store, eff.resource_key, eff.is_create) == (DESK, drop_resource_key(ok), True)
     assert dict(eff.changes) == {"text": WORDS} and eff.writes == ("text",)
-    assert coordinator_drop_effect({"text": WORDS}, None, origin_key=ok) == eff       # pure
+    assert desk_drop_effect({"text": WORDS}, None, origin_key=ok) == eff       # pure
     for bad in ({}, {"text": ""}, {"text": 3}, {"text": "x", "when": "y"}):
         with pytest.raises(ValueError):
-            coordinator_drop_effect(bad, None, origin_key=ok)
+            desk_drop_effect(bad, None, origin_key=ok)
     with pytest.raises(ValueError):
-        coordinator_drop_effect({"text": "x"}, {"drop_id": "d"}, origin_key=ok)
+        desk_drop_effect({"text": "x"}, {"drop_id": "d"}, origin_key=ok)
     with pytest.raises(ValueError):
-        coordinator_drop_effect({"text": "x"}, None, origin_key=None)
+        desk_drop_effect({"text": "x"}, None, origin_key=None)
     assert registration_refusals(CoordDropEffectStore(lambda: None), COORD_CANONICAL) == []
 
 
-def test_the_create_origin_key_fits_the_coordinators_outbox_rule(home):
+def test_the_create_origin_key_fits_the_desks_outbox_rule(home):
     ok = create_origin_key(PID, 0)
     assert ok == "ck." + "ab" * 16 + ".0"
     drop, created = CoordStore(home / "d").accept_drop("words", surface="cockpit", outbox_id=ok)
@@ -115,8 +115,8 @@ def test_the_create_origin_key_fits_the_coordinators_outbox_rule(home):
 
 def test_applying_twice_is_one_drop_and_the_second_is_already(home):
     st = CoordDropEffectStore(lambda: home / "d")
-    eff = coordinator_drop_effect({"text": WORDS}, None, origin_key=create_origin_key(PID, 0))
-    unit = ApplyUnit(COORDINATOR, (0,), (eff,))
+    eff = desk_drop_effect({"text": WORDS}, None, origin_key=create_origin_key(PID, 0))
+    unit = ApplyUnit(DESK, (0,), (eff,))
     first, second = st.apply_unit(unit), st.apply_unit(unit)
     assert (first.outcome, second.outcome) == (ApplyOutcome.APPLIED, ApplyOutcome.ALREADY)
     assert first.members[0].native_id == second.members[0].native_id
@@ -130,19 +130,19 @@ def test_applying_twice_is_one_drop_and_the_second_is_already(home):
 def test_other_words_under_the_same_key_are_refused_not_retried(home):
     st = CoordDropEffectStore(lambda: home / "d")
     ok = create_origin_key(PID, 0)
-    st.apply_unit(ApplyUnit(COORDINATOR, (0,), (coordinator_drop_effect({"text": "one"}, None, origin_key=ok),)))
-    other = coordinator_drop_effect({"text": "two"}, None, origin_key=ok)
-    res = settle(ApplyUnit(COORDINATOR, (0,), (other,)), st, {})
+    st.apply_unit(ApplyUnit(DESK, (0,), (desk_drop_effect({"text": "one"}, None, origin_key=ok),)))
+    other = desk_drop_effect({"text": "two"}, None, origin_key=ok)
+    res = settle(ApplyUnit(DESK, (0,), (other,)), st, {})
     assert (res.status, res.reason) == (EffectStatus.UNAPPLIED, "refused")
     assert [d.words for d in _drops(home / "d")] == ["one"]
 
 
 def test_no_directory_is_store_gone_and_a_read_makes_nothing(home):
     st = CoordDropEffectStore(lambda: None)
-    eff = coordinator_drop_effect({"text": WORDS}, None, origin_key=create_origin_key(PID, 0))
+    eff = desk_drop_effect({"text": WORDS}, None, origin_key=create_origin_key(PID, 0))
     with pytest.raises(StoreGone):
-        st.apply_unit(ApplyUnit(COORDINATOR, (0,), (eff,)))
-    res = settle(ApplyUnit(COORDINATOR, (0,), (eff,)), st, {})
+        st.apply_unit(ApplyUnit(DESK, (0,), (eff,)))
+    res = settle(ApplyUnit(DESK, (0,), (eff,)), st, {})
     assert (res.status, res.reason) == (EffectStatus.UNAPPLIED, "store gone")
     absent = CoordDropEffectStore(lambda: home / "nowhere")
     assert absent.snapshot(eff.resource_key).row is None
@@ -161,7 +161,7 @@ def test_a_signed_sort_writes_exactly_one_drop_with_the_words_verbatim(world):
     assert out["state"] == "WAITING" and _drops(w.qdir) == []      # nothing before the signature
     rec = json.loads(out["record"])
     ok = create_origin_key(out["pending_id"], 0)
-    assert rec["effects"][0]["store"] == COORDINATOR and rec["effects"][0]["changes"] == {"text": WORDS}
+    assert rec["effects"][0]["store"] == DESK and rec["effects"][0]["changes"] == {"text": WORDS}
     assert rec["target"]["intake"] == {"kind": "sort", "text": WORDS}
     assert out["receipt_line"].endswith("awaiting your signature") and "desk to sort" in out["receipt_line"]
     done = w.b.submit(out["pending_id"], w.phone.sign(out["record"].encode()))
@@ -182,16 +182,16 @@ def test_a_signed_sort_writes_exactly_one_drop_with_the_words_verbatim(world):
     assert again["state"] == "COMMITTED" and len(_drops(w.qdir)) == 1
 
 
-def test_a_sort_with_no_coordinator_directory_is_a_501_at_issue_and_writes_nothing(world):
+def test_a_sort_with_no_desk_directory_is_a_501_at_issue_and_writes_nothing(world):
     w = world
     w.where[0] = None
     with pytest.raises(BrokerError) as e:
         _issue(w)
     assert (e.value.code, e.value.status) == ("not_built", 501)
-    assert "no coordinator store" in str(e.value) and _drops(w.qdir) == []
+    assert "no desk store" in str(e.value) and _drops(w.qdir) == []
 
 
-def test_a_sort_with_no_coordinator_store_registered_is_a_501(home):
+def test_a_sort_with_no_desk_store_registered_is_a_501(home):
     spores = home / "spores.json"
     SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
     b = Broker(home / "data", stores={"spores": SporeEffectStore(spores)}, store_paths=[spores],
@@ -269,7 +269,7 @@ def test_a_line_the_store_would_refuse_is_refused_at_issue_before_any_signature(
     assert (e.value.code, e.value.status) == ("refused", 409)
     assert _drops(w.qdir) == [] and _sql(w, "SELECT COUNT(*) FROM pendings") == [(0,)]
     with pytest.raises(ValueError):
-        coordinator_drop_effect({"text": line}, None, origin_key=create_origin_key(PID, 0))
+        desk_drop_effect({"text": line}, None, origin_key=create_origin_key(PID, 0))
 
 
 def test_a_line_at_the_limit_still_issues(world):
@@ -296,15 +296,15 @@ def test_recent_edits_read_a_sort_as_a_line_sent_to_the_desk():
         "added a line item spore-017, from the browser"
 
 
-def test_a_coordinator_directory_that_is_not_0700_is_refused_not_retried(home):
+def test_a_desk_directory_that_is_not_0700_is_refused_not_retried(home):
     from levain.cockpit.effects import PermanentApplyRefusal
 
     d = home / "open"
     d.mkdir(mode=0o700)
     d.chmod(0o755)
     st = CoordDropEffectStore(lambda: d)
-    eff = coordinator_drop_effect({"text": WORDS}, None, origin_key=create_origin_key(PID, 0))
-    unit = ApplyUnit(COORDINATOR, (0,), (eff,))
+    eff = desk_drop_effect({"text": WORDS}, None, origin_key=create_origin_key(PID, 0))
+    unit = ApplyUnit(DESK, (0,), (eff,))
     with pytest.raises(PermanentApplyRefusal):
         st.apply_unit(unit)
     res = settle(unit, st, {})
@@ -417,14 +417,14 @@ def test_the_server_built_broker_writes_a_signed_sort_into_the_consent_readers_d
 def test_a_registered_store_without_a_directory_is_the_same_typed_501(home):
     spores = home / "spores.json"
     SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
-    bare = SimpleNamespace(name=COORDINATOR)               # registered under "coordinator", no directory()
+    bare = SimpleNamespace(name=DESK)               # registered under "desk", no directory()
     b = Broker(home / "data", stores={"spores": SporeEffectStore(spores),
-                                      COORDINATOR: CoordDropEffectStore(lambda: None)},
+                                      DESK: CoordDropEffectStore(lambda: None)},
                store_paths=[spores], install_class="reported")      # registration needs a real adapter; swapped below
     b.start()
     try:
-        for cs in (bare, SimpleNamespace(name=COORDINATOR, directory=lambda: None)):
-            b.stores[COORDINATOR] = cs                      # type: ignore[assignment]
+        for cs in (bare, SimpleNamespace(name=DESK, directory=lambda: None)):
+            b.stores[DESK] = cs                      # type: ignore[assignment]
             with pytest.raises(BrokerError) as e:
                 b.issue(verb=INTAKE_VERB, params={"line": "plain words"}, target={"kind": "create", "panel_id": "tray"},
                         tier="C1", credential={"class": "device", "fingerprint": "SHA256:" + "B" * 43,
@@ -434,7 +434,7 @@ def test_a_registered_store_without_a_directory_is_the_same_typed_501(home):
         b.stop()
 
 
-def test_a_coordinator_store_that_cannot_be_read_at_issue_is_a_503_not_a_500(world, monkeypatch):
+def test_a_desk_store_that_cannot_be_read_at_issue_is_a_503_not_a_500(world, monkeypatch):
     from levain.cockpit.effects import TransientApplyFault
 
     w = world
@@ -450,7 +450,7 @@ def test_a_coordinator_store_that_cannot_be_read_at_issue_is_a_503_not_a_500(wor
 
 
 def test_a_fault_reading_the_drop_row_is_transient_like_the_open(home, monkeypatch):
-    from levain.coordinator.store import CoordError
+    from levain.desk.store import CoordError
     from levain.cockpit.effects import TransientApplyFault
 
     d = home / "d"
@@ -473,7 +473,7 @@ def test_a_non_string_edit_target_does_not_take_the_title_down():
 
 
 def test_the_store_assigned_fields_are_the_row_the_store_emits():
-    from levain.cockpit.coord_effects import DROP_FIELDS, DROP_STORE_ASSIGNED
+    from levain.cockpit.desk_effects import DROP_FIELDS, DROP_STORE_ASSIGNED
 
     drop = SimpleNamespace(words="w", drop_id="d", outbox_id="o", surface="cockpit", words_sha256="s")
     emitted = set(CoordDropEffectStore._row(drop)) - set(DROP_FIELDS)

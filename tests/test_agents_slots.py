@@ -14,7 +14,8 @@ from levain.agents import slots
 from levain.agents.role import role_hash
 from levain.agents.spec import parse_spec, register_spec
 from levain.agents.store import open_agent_store
-from levain.coordinator.lease import LEASE_SCHEMA
+from levain.desk.lease import LEASE_SCHEMA
+from levain.desk.legacy import SQL_ROLE_DESK
 
 FIX = Path(__file__).parent / "fixtures" / "agents_p2"
 SPECS = json.loads((FIX / "specs.json").read_text())
@@ -32,14 +33,14 @@ def _store(tmp_path, cron="*/20 * * * *"):
 
 
 def _dispatch(tmp_path, *launches):
-    """The coordinator's own file, apart from the agent tables' (`dispatch.db` beside `autonomic.db`): returns
+    """The desk's own file, apart from the agent tables' (`dispatch.db` beside `autonomic.db`): returns
     `(launch_over, session_alive)` reading it. Each launch is `(launch_id, session_key, *event kinds)`."""
     db = sqlite3.connect(tmp_path / "dispatch.db")
     for ddl in LEASE_SCHEMA:
         db.execute(ddl)
     for launch_id, session_key, *events in launches:
         db.execute("INSERT INTO launches (launch_id, gseq, session_key, harness, role, threads, token, placement, at)"
-                   " VALUES (?, ?, ?, 'claude', 'coordinator', '[]', 1, 'p', '2026-11-02T11:00:00Z')",
+                   f" VALUES (?, ?, ?, 'claude', {SQL_ROLE_DESK}, '[]', 1, 'p', '2026-11-02T11:00:00Z')",
                    (launch_id, abs(hash(launch_id)) % 10**6, session_key))
         for seq, kind in enumerate(events, 1):
             db.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) VALUES (?, ?, ?, ?, 'x', 't')",
@@ -83,7 +84,7 @@ def test_the_cap_is_shared_and_a_release_frees_it(tmp_path):
             slots.max_slots(c)
 
 
-def test_a_coordinator_lease_expires_at_900s_and_is_reclaimed_only_when_its_launch_is_over(tmp_path):
+def test_a_desk_lease_expires_at_900s_and_is_reclaimed_only_when_its_launch_is_over(tmp_path):
     store, _ = _store(tmp_path)
     over, alive_fn, alive = _dispatch(tmp_path, ("ln-live", "k-live", "pending", "active"),
                                       ("ln-dead", "k-dead", "pending", "active"))
@@ -119,7 +120,7 @@ def test_a_terminal_launch_frees_an_expired_lease_even_if_the_session_looks_aliv
 
 def test_a_launch_the_agent_store_cannot_see_is_never_freed_without_the_probe(tmp_path):
     """Planted: the slots in autonomic.db, the launches in dispatch.db. The old join met `no such table` and freed
-    a live coordinator's slot without asking whether its session ran."""
+    a live desk's slot without asking whether its session ran."""
     store, _ = _store(tmp_path)
     over, alive_fn, alive = _dispatch(tmp_path, ("ln-live", "k-live", "pending", "active"))
     alive["k-live"] = True
@@ -284,7 +285,7 @@ def test_a_free_slot_never_ends_an_occurrence_as_no_slot(tmp_path):
     assert r.no_slot == [] and _rows(store)[0] == ("2026-11-02T12:00:00Z", "admitted", None)
 
 
-def test_an_expired_coordinator_lease_frees_the_slot_the_tick_would_have_refused(tmp_path):
+def test_an_expired_desk_lease_frees_the_slot_the_tick_would_have_refused(tmp_path):
     store, ag = _store(tmp_path)
     armed = lambda a, h: "b1"  # noqa: E731
     over, alive_fn, alive = _dispatch(tmp_path)                              # no launch rows: ln-gone is absent

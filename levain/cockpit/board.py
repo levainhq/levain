@@ -1,4 +1,4 @@
-"""The cockpit's read-only board (C12): the ready queue as six DERIVED columns, the audit window over the coordinator's
+"""The cockpit's read-only board (C12): the ready queue as six DERIVED columns, the audit window over the desk's
 work. Nothing here writes, stores a column, or keeps a second needs-you list.
 
 Columns are READY_SCHEMA section 2's six categories in column order. Cards are C13's ``list(all=True)`` items, each with
@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.cockpit.display_safe import visible
-from levain.coordinator import ready
+from levain.desk import ready
 
 BOARD_PATH = "/cockpit/board.json"
 TEXT_MAX = 1000        # the kernel's board validator refuses a longer card field (engine.BOARD_TEXT_MAX; one test pins them equal)
@@ -118,7 +118,7 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
           drop_dir: Path | str | None = None) -> dict[str, Any]:
     """The board JSON: ``{schema, generated, queue, columns: [{category, cards, count}], unreadable, band_hint, note,
     journal_as_of_read}``. The items, the journal and the live-seat projections (``running`` cards, no journal line) come from
-    ONE read transaction (:func:`levain.coordinator.ready.snapshot`), so a card's journal line is never newer than its column;
+    ONE read transaction (:func:`levain.desk.ready.snapshot`), so a card's journal line is never newer than its column;
     ``journal_as_of_read`` stays and names that the line is the record as of this read. No CI projection: Levain keeps no CI-wait
     source (flow's ``state/land_waiter`` is flow's).
 
@@ -138,13 +138,13 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
             generated = out.get("generated") or generated
             if not (Path(store_dir) / "dispatch.db").exists():
                 queue = "none"
-            elif "coordinator" in unreadable:
+            elif "desk" in unreadable:
                 queue = "unreadable"
             else:
                 queue = "ok"
                 journal = _last_records(out.get("journal"))
         except Exception:  # noqa: BLE001 - never a 500: the store is named unreadable
-            unreadable.append("coordinator")
+            unreadable.append("desk")
             queue = "unreadable"
     by_cat: dict[str, list[dict[str, Any]]] = {c: [] for c in CATEGORIES}
     for item in items:

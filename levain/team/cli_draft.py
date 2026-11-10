@@ -1,8 +1,8 @@
-"""``levain team draft ...``: the coordinator drafts team-ledger entries, the operator signs (C8).
+"""``levain team draft ...``: the desk drafts team-ledger entries, the operator signs (C8).
 
-``add`` is the coordinator's (or yours); ``promote`` is the one step that signs, and it runs the ordinary record path
-under THIS clone's key after showing the whole draft. Run from inside the coordinator's workspace, only ``add`` (as the
-coordinator), ``list`` and ``show`` run, for the operator too: the coordinator's door (:mod:`levain.coordinator.door`)
+``add`` is the desk's (or yours); ``promote`` is the one step that signs, and it runs the ordinary record path
+under THIS clone's key after showing the whole draft. Run from inside the desk's workspace, only ``add`` (as the
+desk), ``list`` and ``show`` run, for the operator too: the desk's door (:mod:`levain.desk.door`)
 refuses the rest by WHERE the command runs, so promote from your own clone. That keeps the draft path honest; it is
 not a lock on the key, which any process of the same user can still use.
 
@@ -16,15 +16,16 @@ import sys
 from pathlib import Path
 
 from levain import unshowable
-from levain.coordinator.door import door_ok, not_door
+from levain.desk.door import door_ok, not_door
 
 from . import entry as E
 from .ledger_api import open_ledger
 from .transport import TeamError
+from levain.desk.legacy import ROLE_DESK
 
 
 def _store(args):
-    from levain.coordinator.store import CoordStore
+    from levain.desk.store import CoordStore
 
     return CoordStore(args.queue_dir.expanduser() if args.queue_dir is not None else None)
 
@@ -75,10 +76,10 @@ def _words(args) -> str | None:
 
 
 def cmd_draft(args) -> int:
-    from levain.coordinator import teamdrafts as T
+    from levain.desk import teamdrafts as T
     import sqlite3
 
-    from levain.coordinator.store import CoordError
+    from levain.desk.store import CoordError
     from levain.dispatch.jobs import JobStoreError
 
     from .cli import _prose
@@ -116,7 +117,7 @@ def cmd_draft(args) -> int:
 def _promote(args, store, v: dict) -> None:
     import os
 
-    from levain.coordinator import teamdrafts as T
+    from levain.desk import teamdrafts as T
 
     if v["state"] not in ("drafted", "promoting"):
         raise TeamError(f"draft {args.draft_id} is already {v['state']}")
@@ -124,7 +125,7 @@ def _promote(args, store, v: dict) -> None:
     print(_show(v))
     words = _words(args)
     if e.get("kind") == "ruling":
-        # a ruling is signed in the decider's own words: the coordinator's draft words are shown, never signed as his
+        # a ruling is signed in the decider's own words: the desk's draft words are shown, never signed as his
         if not (words or "").strip():
             raise TeamError("a ruling is signed in the decider's own words: pass them with --words or --words-file "
                             "(the draft's words above are the desk's and are not signed)")
@@ -213,8 +214,8 @@ def register(sub, add) -> None:
         q.set_defaults(func=_run, team_command="draft")
 
     def actor(q) -> None:
-        q.add_argument("--by", choices=("operator", "coordinator"), default="coordinator")
-        q.add_argument("--token", type=int, default=None, help="With --by coordinator: the lease token.")
+        q.add_argument("--by", choices=("operator", ROLE_DESK), default=ROLE_DESK)
+        q.add_argument("--token", type=int, default=None, help="With --by desk: the lease token.")
 
     a = dsub.add_parser("add", help="Draft an entry (nothing is signed).")
     a.add_argument("type", choices=("decision", "constraint", "finding", "question", "tension"))

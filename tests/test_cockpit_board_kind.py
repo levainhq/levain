@@ -55,8 +55,8 @@ def _refused(value: Any, *needles: str) -> None:
 
 # --- the kernel's vocabulary ---------------------------------------------------------------------
 
-def test_the_board_kind_is_in_the_vocabulary_and_its_categories_are_the_coordinators() -> None:
-    from levain.coordinator import ready
+def test_the_board_kind_is_in_the_vocabulary_and_its_categories_are_the_desks() -> None:
+    from levain.desk import ready
     assert "board" in KINDS
     assert BOARD_CATEGORIES == ("backlog", "ready", "running", "waiting", "needs-you", "done") == ready.CATEGORIES == board.CATEGORIES
 

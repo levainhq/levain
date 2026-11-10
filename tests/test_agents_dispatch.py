@@ -16,7 +16,7 @@ from levain.agents import controller as ctl
 from levain.agents import spec as spec_mod
 from levain.agents import supervise
 from levain.autonomic.journal import RunJournal
-from levain.coordinator.store import CoordStore
+from levain.desk.store import CoordStore
 from levain.dream import agent as da
 from levain.agents.role import add_role, parse_role
 from tests.test_agents_launch import ENV, ROLES, SPECS, Rig, _launched, rig  # noqa: F401

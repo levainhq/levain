@@ -15,6 +15,7 @@ import levain
 from levain import band_view
 from levain.consent.questions import QuestionStore
 from tests.test_repin_on_install import make_install  # noqa: F401  (fixture: a real install, levain init)
+from levain.desk.legacy import ROLE_DESK
 
 OPTS = [("fix", "fixed 30 s"), ("exp", "exponential")]
 TEMPLATES = pathlib.Path(levain.__file__).parent / "templates"
@@ -42,8 +43,8 @@ def env(qdir, **more):
 
 
 def launch_rows(monkeypatch, rows):
-    from levain.coordinator import lease
-    from levain.coordinator.store import CoordStore
+    from levain.desk import lease
+    from levain.desk.store import CoordStore
 
     monkeypatch.setattr(CoordStore, "open_readonly", lambda self, **_k: sqlite3.connect(":memory:"))
     monkeypatch.setattr(lease, "by_harness_session",
@@ -59,9 +60,9 @@ def deliver(store, sid="s1", agent="claude_code", e=None):
 
 # --- D4: the derivation --------------------------------------------------------------------------------------
 def test_launch_row_decides_before_the_env_marker(qdir, store, monkeypatch):
-    launch_rows(monkeypatch, {"c1": "coordinator", "w1": "worker"})
+    launch_rows(monkeypatch, {"c1": ROLE_DESK, "w1": "worker"})
     ask(store)
-    # a coordinator is attended even when its env says autonomous (e.g. inherited from an entity process)
+    # a desk is attended even when its env says autonomous (e.g. inherited from an entity process)
     assert band_view.is_autonomous("c1", qdir, {"LEVAIN_SEAT": "autonomous"}) is False
     assert band_view.is_autonomous("w1", qdir, {"LEVAIN_SEAT": "attended"}) is True
     assert deliver(store, "c1", e=env(qdir, LEVAIN_SEAT="autonomous")) != ""
@@ -79,8 +80,8 @@ def test_env_marker_when_there_is_no_launch_row(qdir, store, monkeypatch, value,
     assert (band_view.hook_contract({"session_id": "hand-opened"}, e) == "") is auto
 
 
-def test_neither_fact_is_non_autonomous_and_a_broken_coordinator_store_too(qdir, store, monkeypatch):
-    from levain.coordinator.store import CoordStore
+def test_neither_fact_is_non_autonomous_and_a_broken_desk_store_too(qdir, store, monkeypatch):
+    from levain.desk.store import CoordStore
 
     ask(store)
     monkeypatch.setattr(CoordStore, "open_readonly", lambda self, **_k: (_ for _ in ()).throw(OSError("unreadable")))
@@ -379,8 +380,8 @@ def test_a_fresh_install_of_each_agent_is_wired(tmp_path, make_install):
                                       tmp_path / "codex-home").state == "wired"
 
 
-def test_coordinator_brief_carries_the_band_line(tmp_path, monkeypatch):
-    from levain.coordinator import launch
+def test_desk_brief_carries_the_band_line(tmp_path, monkeypatch):
+    from levain.desk import launch
 
     src = pathlib.Path(launch.__file__).read_text()
     assert "## The band" in src and "NEEDS YOU band is shown to you on every turn" in src

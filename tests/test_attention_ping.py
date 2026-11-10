@@ -1,4 +1,4 @@
-"""C11 S5 (Q1 ruled (c), np-61747876): the `attention` ping kind. The coordinator's escalation, its stopped row and its own
+"""C11 S5 (Q1 ruled (c), np-61747876): the `attention` ping kind. The desk's escalation, its stopped row and its own
 question push as kind `attention`, which is urgent: it passes presence `quiet`, not `sleep`. Every other seat's question
 keeps kind `question` and stays muted under `quiet`. The pings run through the REAL claude_code `notify` and the REAL
 presence rule; only the phone's liveness, the sender and the idle reading are stood in for. Synthetic words."""
@@ -8,7 +8,7 @@ import pytest
 
 from levain.consent import band
 from levain.consent.adapters import claude_code as cc
-from levain.coordinator import first_reader as fr
+from levain.desk import first_reader as fr
 from levain.webpush import presence, sender
 import levain.webpush as webpush
 import levain.consent.auto_away as auto_away
@@ -48,7 +48,7 @@ def test_the_urgent_kinds_hold_attention():
 def test_an_escalated_question_pushes_as_attention_under_quiet(rig):
     """Reproduced first: on 528d60f4 this ping went out as kind `question` and was muted by `quiet`."""
     d, wire = rig
-    tok = d.coordinator()
+    tok = d.desk()
     q, _ = d.ask()
     _say(d, "quiet")
     fr.escalate(d.store, q.id, "outside its envelope", token=tok)
@@ -58,7 +58,7 @@ def test_an_escalated_question_pushes_as_attention_under_quiet(rig):
 
 def test_an_escalated_question_still_pushes_under_sleep(rig):   # Phill 10-25: in sleep a high-priority ping reaches him
     d, wire = rig
-    tok = d.coordinator()
+    tok = d.desk()
     q, _ = d.ask()
     _say(d, "sleep")
     fr.escalate(d.store, q.id, "outside its envelope", token=tok)
@@ -68,7 +68,7 @@ def test_an_escalated_question_still_pushes_under_sleep(rig):   # Phill 10-25: i
 
 def test_an_unread_release_stays_a_question_and_is_muted_under_quiet(rig):
     d, wire = rig
-    d.coordinator()
+    d.desk()
     d.ask()
     _say(d, "quiet")
     d.later(minutes=10)
@@ -76,7 +76,7 @@ def test_an_unread_release_stays_a_question_and_is_muted_under_quiet(rig):
     assert wire.spawned == [("question", False, "quiet")]
 
 
-def test_a_seats_question_with_no_coordinator_is_muted_under_quiet(rig):
+def test_a_seats_question_with_no_desk_is_muted_under_quiet(rig):
     d, wire = rig
     _say(d, "quiet")
     d.ask()
@@ -86,17 +86,17 @@ def test_a_seats_question_with_no_coordinator_is_muted_under_quiet(rig):
 def test_the_stopped_row_pushes_under_quiet_and_under_sleep(rig):
     d, wire = rig
     _say(d, "quiet")
-    assert band.file_coordinator_stopped(d.dir, "claude_code", "stopped after three deaths", "ep-1") is not None
+    assert band.file_desk_stopped(d.dir, "claude_code", "stopped after three deaths", "ep-1") is not None
     _say(d, "sleep")
-    assert band.file_coordinator_stopped(d.dir, "claude_code", "stopped after three deaths", "ep-2") is not None
+    assert band.file_desk_stopped(d.dir, "claude_code", "stopped after three deaths", "ep-2") is not None
     assert wire.spawned[0] == ("attention", True, None)
     assert wire.spawned[1] == ("attention", True, None)
 
 
-def test_the_coordinators_own_question_is_not_held_and_pings_as_attention(rig):
-    """S5's one check: `ask`'s held-ping rule held a coordinator's own question behind its own first read."""
+def test_the_desks_own_question_is_not_held_and_pings_as_attention(rig):
+    """S5's one check: `ask`'s held-ping rule held a desk's own question behind its own first read."""
     d, wire = rig
-    d.coordinator()
+    d.desk()
     _say(d, "quiet")
     q, text = band.file_question("claude_code", "sess-coord", "which of the two?", [("a", "one"), ("b", "two")], "a",
                                  "the pick", d.dir)
@@ -105,23 +105,23 @@ def test_the_coordinators_own_question_is_not_held_and_pings_as_attention(rig):
     assert d.rows("SELECT COUNT(*) FROM held_pings") == [(0,)]
 
 
-def test_another_seats_question_is_still_held_while_a_coordinator_holds_the_lease(rig):
+def test_another_seats_question_is_still_held_while_a_desk_holds_the_lease(rig):
     d, wire = rig
-    d.coordinator()
+    d.desk()
     q, text = d.ask()
     assert "not pinged yet" in text and wire.spawned == []
     assert d.rows("SELECT question_id FROM held_pings") == [(q.id,)]
 
 
-def test_a_faulted_coordinator_lookup_sends_at_once_as_a_plain_question_and_holds_nothing(rig, monkeypatch):
-    """L3 r1 (codex MED, deepseek MED): a lookup fault read False, so a coordinator's own ask sat in held_pings and later went
+def test_a_faulted_desk_lookup_sends_at_once_as_a_plain_question_and_holds_nothing(rig, monkeypatch):
+    """L3 r1 (codex MED, deepseek MED): a lookup fault read False, so a desk's own ask sat in held_pings and later went
     out muted. A fault is its own answer: no `attention` (nothing is proven) and no hold behind a first read."""
     d, wire = rig
-    d.coordinator()
+    d.desk()
 
     def boom(*_a, **_kw):
         raise RuntimeError("database is locked")
-    monkeypatch.setattr(fr, "is_coordinator_session", boom)
+    monkeypatch.setattr(fr, "is_desk_session", boom)
     _say(d, "quiet")
     q, text = band.file_question("claude_code", "sess-coord", "which of the two?", [("a", "one"), ("b", "two")], "a",
                                  "the pick", d.dir)

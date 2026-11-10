@@ -580,7 +580,7 @@
     }
   }
 
-  // Free-text fields (the Drop box, the question and coordinator boxes, the phone's words and state line) grow with what is
+  // Free-text fields (the Drop box, the question and desk boxes, the phone's words and state line) grow with what is
   // typed. CSS `field-sizing: content` does it where the browser has it; this is the fallback that works on iOS Safari
   // today: one delegated listener, height from scrollHeight on input. Safe to call from every surface (once per page).
   const FREE_TEXT = "textarea#drop-words, textarea.drop-words, textarea.words, textarea.question-words, .stateline textarea";

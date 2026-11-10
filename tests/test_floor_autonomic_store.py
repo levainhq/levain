@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from levain.desk.legacy import LEGACY_HOME_NAME
 from levain.firing.confinement import (
     AUTONOMIC_STORE_DIR,
     COCKPIT_KEY_DIR,
@@ -291,7 +292,7 @@ def test_every_levain_home_reader_is_named_for_the_fallback():
     from levain.chat_egress.srt_pin import default_prefix
     from levain.cockpit.custody import default_key_dir
     from levain.consent.queue import default_queue_dir
-    from levain.coordinator.launch import default_coordinator_dir
+    from levain.desk.launch import default_desk_dir
     from levain.firing import ssh_agent
     from levain.observe import OBSERVE_DIR
     from levain.firing.confinement import GRANTS_DIR, LEVAIN_HOME_STATE_DIRS
@@ -306,10 +307,10 @@ def test_every_levain_home_reader_is_named_for_the_fallback():
     # dream/cli.py: `dream enable` reads the home only to name the default cockpit root in the install-facts file it
     # writes into the agent store's directory; it builds nothing under the home, so it adds no name either.
     assert reads == {"autonomic/db.py": 1, "chat_egress/srt_pin.py": 1, "cli.py": 1, "cockpit/custody.py": 1,
-                     "consent/queue.py": 1, "coordinator/launch.py": 1, "dream/cli.py": 1, "firing/confinement.py": 2,
+                     "consent/queue.py": 1, "desk/legacy.py": 1, "dream/cli.py": 1, "firing/confinement.py": 2,
                      "firing/ssh_agent.py": 1, "observe.py": 1}, reads
     names = {default_store_dir().name, default_key_dir().name, default_queue_dir().name, GRANTS_DIR,
-             ssh_agent.RUN_DIR, ssh_agent.HOST_KEYS_DIR, default_coordinator_dir().name, default_prefix().name, OBSERVE_DIR}
+             ssh_agent.RUN_DIR, ssh_agent.HOST_KEYS_DIR, default_desk_dir().name, LEGACY_HOME_NAME, default_prefix().name, OBSERVE_DIR}
     assert names == set(LEVAIN_HOME_STATE_DIRS)
 
 

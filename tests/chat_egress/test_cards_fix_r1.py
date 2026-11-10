@@ -36,8 +36,8 @@ from levain.cockpit.consent import ConsentError
 from levain.consent.listing import ConsentEntry, entry_body, filed_input
 from levain.consent.queue import ConsentQueue, authority_source
 from levain.consent.record import DISPLAY_MAX
-from levain.coordinator.lease import LAUNCH_KINDS, _launch_event
-from levain.coordinator.store import CoordStore
+from levain.desk.lease import LAUNCH_KINDS, _launch_event
+from levain.desk.store import CoordStore
 from tests.chat_egress.test_classify import frame, route_for
 from tests.chat_egress.test_records import GET, make_launch
 from tests._h4 import h4_home

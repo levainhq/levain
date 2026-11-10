@@ -1,6 +1,6 @@
 """levain.webpush.quote — is the quote a setter gives for a presence word something the operator typed?
 
-A seat sets ``away`` (the coordinator also ``quiet`` and ``sleep``) on "his words" and
+A seat sets ``away`` (the desk also ``quiet`` and ``sleep``) on "his words" and
 quotes them (:func:`levain.webpush.presence.set_word`). This module reads the setter's own session transcript and finds
 the quote in one of the operator's turns there, so the record can say whether the quote is his and when he typed it
 (P2, ``project_memory/1030-2-presence/DESIGN.md`` section 4).
@@ -13,7 +13,7 @@ What counts as an operator turn:
   retelling of what he said is not him saying it.
 - Codex: an ``event_msg`` ``item_completed`` whose item is a ``UserMessage`` (the rollout format of October 2026), or an
   ``event_msg`` ``user_message`` (the format until about 10-10). Codex marks no origin, so every such turn counts.
-- The coordinator: the text of a drop it names (``--drop``), because a drop reaches the coordinator in its brief file
+- The desk: the text of a drop it names (``--drop``), because a drop reaches the desk in its brief file
   and never as a prompt. The drop's ``received_at`` is when he said it.
 
 The quote matches when, after case and whitespace are folded, it is at least :data:`MIN_CHARS` long and a substring of
@@ -198,7 +198,7 @@ def match_transcript(path: Path | str, agent: str, said: str, *, now: float) -> 
 
 
 def match_drop(directory: Path | str, drop_id: str, said: str, *, now: float) -> Match:
-    """Find ``said`` in the words of drop ``drop_id`` in the coordinator store under ``directory`` (read-only).
+    """Find ``said`` in the words of drop ``drop_id`` in the desk store under ``directory`` (read-only).
 
     Any row in ``drops`` is trusted as his words: a process under the same uid could write one. Like the rest of this
     module, the check records intent; it is not a boundary."""
@@ -209,7 +209,7 @@ def match_drop(directory: Path | str, drop_id: str, said: str, *, now: float) ->
     if not isinstance(drop_id, str) or _DROP_ID.fullmatch(drop_id) is None:
         return _no("the drop id is not a drop id")
     if not db.exists():
-        return _no("no coordinator store here")
+        return _no("no desk store here")
     try:
         conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2.0)
         try:
@@ -217,7 +217,7 @@ def match_drop(directory: Path | str, drop_id: str, said: str, *, now: float) ->
         finally:
             conn.close()
     except (sqlite3.Error, OSError) as e:
-        return _no(f"the coordinator store cannot be read ({type(e).__name__})")
+        return _no(f"the desk store cannot be read ({type(e).__name__})")
     if row is None:
         return _no(f"no drop {drop_id}")
     at = _stamp(row[1])
@@ -276,7 +276,7 @@ def locate_transcript(agent: str, session: str, roots: list[Path]) -> Path | Non
 
 def match(agent: str, session: str, said: str, *, now: float, roots: list[Path] | None = None,
           directory: Path | str | None = None, drop: str | None = None) -> Match:
-    """The strongest evidence for ``said`` from the setter's transcript and, for the coordinator, the named drop:
+    """The strongest evidence for ``said`` from the setter's transcript and, for the desk, the named drop:
     verified when either finds it (the newer ``said_at`` wins), else the transcript's reason."""
     try:
         path = locate_transcript(agent, session, roots or [])

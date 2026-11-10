@@ -6,6 +6,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from levain.desk.legacy import ROLE_DESK
 
 
 def register(subparsers) -> None:
@@ -72,7 +73,7 @@ def register(subparsers) -> None:
         w.add_argument("--said", default=None, metavar="WORDS",
                        help="Run inside an agent session: the words the operator told you, quoted (required there, "
                             "recorded beside the word). Which words an agent may set: presence.SEAT_WORDS and "
-                            "COORDINATOR_WORDS. (Use --said=\"-text\" if the quote starts with a dash.)")
+                            "DESK_WORDS. (Use --said=\"-text\" if the quote starts with a dash.)")
         w.add_argument("--drop", default=None, metavar="DROP_ID",
                        help="The desk only: the drop that holds the words quoted by --said (a drop reaches the "
                             "desk in its brief file, not as a prompt, so it is the evidence for the quote).")
@@ -153,7 +154,7 @@ def _qdir(args: argparse.Namespace) -> Path:
 
 def _setter(qdir: Path) -> dict | None:
     """Who is setting the word when an agent session is: ``{"agent", "session", "role"}`` (agent and session as
-    :func:`band._agent_and_session` names them, role ``coordinator`` for a session Levain started as one, else ``seat``), or ``None``
+    :func:`band._agent_and_session` names them, role ``desk`` for a session Levain started as one, else ``seat``), or ``None``
     for the operator's own shell. The role is a channel label under one uid, not a boundary: it records intent."""
     from levain.consent import band
     from levain.webpush import presence
@@ -169,17 +170,17 @@ def _setter(qdir: Path) -> dict | None:
     role = "seat"
     if session:   # the role comes from the selected session alone, never from another agent's inherited variable
         try:
-            from levain.coordinator.first_reader import is_coordinator_session
+            from levain.desk.first_reader import is_desk_session
 
-            if is_coordinator_session(qdir, session):
-                role = "coordinator"
+            if is_desk_session(qdir, session):
+                role = ROLE_DESK
         except Exception:  # noqa: BLE001 - a role that cannot be checked is the narrower one
             pass
     return {"agent": agent, "session": session, "role": role}
 
 
 def _evidence(by: dict, said: str | None, qdir: Path, drop: str | None):
-    """Whether ``said`` is in what the operator typed to the setter's session (or, for the coordinator, in the drop it
+    """Whether ``said`` is in what the operator typed to the setter's session (or, for the desk, in the drop it
     names): a :class:`levain.webpush.quote.Match`, never an error."""
     import os
     import time
@@ -193,7 +194,7 @@ def _evidence(by: dict, said: str | None, qdir: Path, drop: str | None):
     roots = [Path(p) for p in (os.environ.get("CLAUDE_PROJECT_DIR"), cwd) if p and os.path.isabs(p)]
     try:
         return quote.match(by["agent"], by["session"], said or "", now=time.time(), roots=roots, directory=qdir,
-                           drop=drop if by["role"] == "coordinator" else None)
+                           drop=drop if by["role"] == ROLE_DESK else None)
     except (OSError, RuntimeError, ValueError) as e:
         return quote.Match(False, None, f"transcript check failed ({type(e).__name__})")
 
@@ -216,8 +217,8 @@ def _word(args: argparse.Namespace) -> int:
     drop = getattr(args, "drop", None)
     try:
         by = _setter(qdir)
-        if drop and (by is None or by["role"] != "coordinator"):
-            raise presence.PresenceError("--drop is the coordinator's evidence for its quote; "
+        if drop and (by is None or by["role"] != ROLE_DESK):
+            raise presence.PresenceError("--drop is the desk's evidence for its quote; "
                                          "the operator's own word and a seat's need none")
         intent.apply_preset(qdir, args.word, duration=getattr(args, "duration", None), by=by,
                             said=getattr(args, "said", None),

@@ -61,7 +61,7 @@ def add_parsers(subparsers: argparse._SubParsersAction, common: object) -> None:
 UPGRADE_ORDER_LINE = (
     "  upgrade order: this is a levain-authority/5 link. Once one is signed, a levain older than this build refuses "
     "this whole authority log (its replay stops at that link, so it allows nothing and can append no link, a revoke "
-    "included). Every levain that reads this log, each coordinator and daemon, must be this build or newer before "
+    "included). Every levain that reads this log, each desk and daemon, must be this build or newer before "
     "you sign.")
 
 

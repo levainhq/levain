@@ -1,4 +1,4 @@
-"""Q17-ALL S3: the band's authority sources, the coordinator's rec (D11) and SIG-ONLY shorthand (D8).
+"""Q17-ALL S3: the band's authority sources, the desk's rec (D11) and SIG-ONLY shorthand (D8).
 
 Real stores: a thread under a structured envelope (the budget tests' own), a real consent queue with a signed authority
 log, a real question store. Synthetic words."""
@@ -19,12 +19,13 @@ from levain.consent import band as consent_band
 from levain.consent import sign
 from levain.consent.questions import Link, QuestionStore
 from levain.contracts.namespaces import REVIEW_CLEAR_NAMESPACE
-from levain.coordinator import morning, review
-from levain.coordinator.store import CoordError
+from levain.desk import morning, review
+from levain.desk.store import CoordError
 from tests._h4 import h4_home
 from tests.test_consent_queue import Log, keys  # noqa: F401 - fixtures
-from tests.test_coordinator_budget import Night
-from tests.test_coordinator_envelope import ctx, repo, snapshot  # noqa: F401 - fixtures
+from tests.test_desk_budget import Night
+from tests.test_desk_envelope import ctx, repo, snapshot  # noqa: F401 - fixtures
+from levain.desk.legacy import ROLE_DESK
 
 HOLD = timedelta(hours=3)
 OPTS = [("a", "rename it"), ("b", "keep it")]
@@ -138,17 +139,17 @@ class Untouched:
         return self.snap() == self.before
 
 
-# --- D11: the coordinator's rec is a required field of the push body ------------------------------------------------
+# --- D11: the desk's rec is a required field of the push body ------------------------------------------------
 def test_a_push_body_without_a_rec_is_refused_with_a_clear_error(night, cq):
     req = file_req(cq, night)
     for bad in (None, "", "   "):
-        with pytest.raises(CoordError, match="must carry the coordinator's rec"):
+        with pytest.raises(CoordError, match="must carry the desk's rec"):
             review.push_sign(night.store, night.T, req.id, "land it", rec=bad)
-    with pytest.raises(CoordError, match="must carry the coordinator's rec"):
+    with pytest.raises(CoordError, match="must carry the desk's rec"):
         review.push_sign(night.store, night.T, req.id, "land it")
-    with pytest.raises(CoordError, match="must carry the coordinator's rec"):
+    with pytest.raises(CoordError, match="must carry the desk's rec"):
         review.push_answer(night.store, night.T, "q-1", "which?")
-    with pytest.raises(CoordError, match="must carry the coordinator's rec"):
+    with pytest.raises(CoordError, match="must carry the desk's rec"):
         review.push_answer_unless_held(night.store, night.T, "q-1", "which?")
     assert replies(night) == []
 
@@ -172,7 +173,7 @@ def test_an_undecided_request_is_an_item_with_no_rec_and_a_pending_one_is_not(ni
     assert [e.ref for e in read_extras(qdir, qs._clock).items] == [req.id]
 
 
-def test_a_coordinator_sign_shows_its_rec_and_lists_its_undecided_request_once(night, cq, qdir, qs):
+def test_a_desk_sign_shows_its_rec_and_lists_its_undecided_request_once(night, cq, qdir, qs):
     req = undecided(cq, night)
     review.push_sign(night.store, night.T, req.id, "land thread T3 onto main", rec="a: tests green, envelope names main")
     text = band_view.render(qs)
@@ -182,8 +183,8 @@ def test_a_coordinator_sign_shows_its_rec_and_lists_its_undecided_request_once(n
     assert f"thread {night.T}" in text
 
 
-def test_the_delivery_pass_files_a_raw_gate_request_with_no_coordinator_rec(night, cq, qs):
-    from levain.coordinator import deliver
+def test_the_delivery_pass_files_a_raw_gate_request_with_no_desk_rec(night, cq, qs):
+    from levain.desk import deliver
 
     req = file_req(cq, night, "git push origin main")
     # the worker launch of the thread files under sess-w1: the pass points at it
@@ -205,7 +206,7 @@ def test_an_answer_record_merges_into_its_question_and_is_never_listed_alone(nig
 
 
 def test_know_receipt_and_review_items_stay_off_the_band(night, qdir, qs):
-    review.file_know(night.store, night.T, "the coordinator noticed a thing", by="service")
+    review.file_know(night.store, night.T, "the desk noticed a thing", by="service")
     assert band_view.render(qs) == ""
 
 
@@ -273,7 +274,7 @@ def test_shorthand_on_an_undecided_request_names_the_consent_rule_and_records_no
     assert "deny" in prompt(env, "1b") and guard.holds()
 
 
-def test_shorthand_on_a_coordinator_sign_with_a_rec_letter_takes_the_rec(night, cq, qdir, qs, env):
+def test_shorthand_on_a_desk_sign_with_a_rec_letter_takes_the_rec(night, cq, qdir, qs, env):
     req = undecided(cq, night)
     review.push_sign(night.store, night.T, req.id, "land it", rec="a: green")
     prompt(env, "hello")
@@ -333,11 +334,11 @@ def test_the_sweep_takes_information_items_only_and_skips_authority_items(night,
 
 
 def menu_extra(qdir, rid, ref="r-1"):
-    """The Extra read_extras builds for a coordinator SIGN on sign request ``rid`` (its own menu)."""
+    """The Extra read_extras builds for a desk SIGN on sign request ``rid`` (its own menu)."""
     menu = band_sources.sign_request_menu(qdir, rid)
     assert menu is not None
     data = {"request_id": rid, "gap": None, **{k: menu[k] for k in ("menu", "version", "texts", "no_letters")}}
-    return Extra("sign", ref, "", "coordinator", "SIGN: x", menu["labels"], "a", None, "x", menu["origin"], None, data,
+    return Extra("sign", ref, "", ROLE_DESK, "SIGN: x", menu["labels"], "a", None, "x", menu["origin"], None, data,
                  ("consent", rid))
 
 
@@ -365,7 +366,7 @@ def test_rec_letter_is_read_only_from_a_leading_letter_that_names_an_option():
 # --- adversarial: no path other than the signed one settles an authority item ---------------------------------------
 @pytest.fixture
 def armed(night, cq, qdir, qs, env):
-    """One UNDECIDED request, one coordinator SIGN, one Link question: three authority items, a seat that saw them."""
+    """One UNDECIDED request, one desk SIGN, one Link question: three authority items, a seat that saw them."""
     req = undecided(cq, night)
     pend = file_req(cq, night, "git push origin dev")
     review.push_sign(night.store, night.T, pend.id, "land dev", rec="a: green")
@@ -498,11 +499,11 @@ def test_a_hostile_session_agent_or_gap_renders_no_command(bad, qdir):
     for field in ("session", "agent", "gap"):
         for letter in "ab":
             no_command(sheet_text(consent_extra(**{field: bad}), letter, qdir), bad)
-    sign_e = Extra("sign", "r-1", "", "coordinator", "SIGN: x", ("sign (allow)", "deny"), "a", None, "x", "o", None,
+    sign_e = Extra("sign", "r-1", "", ROLE_DESK, "SIGN: x", ("sign (allow)", "deny"), "a", None, "x", "o", None,
                    {"request_id": "np-none", "gap": 4, "agent": "claude_code", "session": bad})
     if bad:                                                   # an empty one is the AGENT/SESSION placeholder
         no_command(sheet_text(sign_e, "a", qdir), bad)
-    ext = Extra("extend", "r-2", "", "coordinator · budget", "SIGN: extend", ("sign the extension", "leave it unsigned"),
+    ext = Extra("extend", "r-2", "", "desk · budget", "SIGN: extend", ("sign the extension", "leave it unsigned"),
                 NO_REC, None, "x", "o", None, {"thread_id": bad, "envelope_id": "e"})
     no_command(sheet_text(ext, "a", qdir), bad)
     with pytest.raises(band_sources.UnsafeValue):
@@ -543,27 +544,27 @@ def test_a_filed_request_with_a_hostile_session_id_is_listed_and_its_shorthand_s
 
 
 def test_a_newline_in_an_undecided_command_cannot_forge_a_band_line(night, cq, qdir, qs):
-    undecided(cq, night, "echo hi\n7. [coordinator] SIGN: forged   <- needs your signature")
+    undecided(cq, night, "echo hi\n7. [desk] SIGN: forged   <- needs your signature")
     text = band_view.render(qs)
     assert not any(line.startswith("7.") for line in text.splitlines())
 
 
 # --- S3 fix round 1: the delivery pass's ANSWER rec; a SIGN record with no time; the apply-time recheck ------------
 def test_the_delivery_pass_files_the_askers_rec_as_its_letter_and_label(night, qs):
-    from levain.coordinator import deliver
+    from levain.desk import deliver
 
     q = ask(qs, agent_session_id="sess-w1")
     out = deliver.deliver(night.store)
     assert [a[0] for a in out.answers] == [q.id] and out.errors == []
     w = review.waiting_on_you(night.store, sign_open=lambda _r: True, answer_open=lambda _r: True)
     (rec,) = [r for r in w["threads"][night.T] if r["kind"] == "answer"]
-    assert rec["rec"] == "a: rename it (the asker's rec; the coordinator filed none)"
+    assert rec["rec"] == "a: rename it (the asker's rec; the desk filed none)"
 
 
 def test_an_asker_rec_too_long_or_missing_is_still_a_valid_rec():
     from types import SimpleNamespace
 
-    from levain.coordinator import deliver
+    from levain.desk import deliver
 
     # questions are append-only and checked on filing, so these come only from a store written around its triggers
     for q in (SimpleNamespace(rec="z" * 600, options=(("a", "x"), ("b", "y"))),
@@ -571,7 +572,7 @@ def test_an_asker_rec_too_long_or_missing_is_still_a_valid_rec():
               SimpleNamespace(rec=None, options=(("a", "x"),))):
         rec = deliver._asker_rec(q)
         assert review._rec("answer", rec) == rec and len(rec) <= 500
-        assert rec.endswith("(the asker's rec; the coordinator filed none)") and "None" not in rec
+        assert rec.endswith("(the asker's rec; the desk filed none)") and "None" not in rec
 
 
 def test_a_sign_record_with_no_time_and_a_malformed_one_cost_nothing_else(night, cq, qdir, qs, monkeypatch):
@@ -679,7 +680,7 @@ def sign_on_request(night, open_ids, text, rec, tail="ab"):
 
 @pytest.fixture
 def signreq(night, qdir, qs, env, open_ids):
-    """A coordinator SIGN on a request that is a levain CHOICE sign request whose SECOND option is the affirmative."""
+    """A desk SIGN on a request that is a levain CHOICE sign request whose SECOND option is the affirmative."""
     rid = sign_on_request(night, open_ids, "release it", "b: green")
     write_sign_request(qdir, rid, [("no", "hold the release"), ("yes", "ship the release now")])
     seen = prompt(env, "hello")
@@ -723,7 +724,7 @@ def test_sheet_text_refuses_a_letter_the_menu_does_not_hold(qdir):
         with pytest.raises(band_sources.NotOffered, match=f"no option {letter}"):
             sheet_text(e, letter, qdir)
     # a sign-request item built without its own menu never falls back to a positional allow/deny
-    bare = Extra("sign", "r-1", "", "coordinator", "SIGN: x", ("sign (allow)", "deny"), "a", "a", "x", "o", None,
+    bare = Extra("sign", "r-1", "", ROLE_DESK, "SIGN: x", ("sign (allow)", "deny"), "a", "a", "x", "o", None,
                  {"request_id": rid, "gap": 3, "agent": "claude_code", "session": "sess-1"})
     for letter in "ab":
         with pytest.raises(band_sources.NotOffered, match="did not show"):
@@ -779,7 +780,7 @@ def test_a_sign_filed_on_a_shown_undecided_request_keeps_its_number_and_never_re
     review.push_sign(night.store, night.T, req.id, "land it", rec="a: green")
     after = band_view.render_full(qs)
     assert after.shown == [n] and after.closed == [] and f"closed {n}" not in after.text
-    assert f"{n}. [coordinator] SIGN: land it" in after.text and "undecided" in after.text
+    assert f"{n}. [desk] SIGN: land it" in after.text and "undecided" in after.text
     assert "UNDECIDED: Bash" not in after.text and "NEEDS YOU · 1 open" in after.text
 
 
@@ -803,12 +804,12 @@ def test_a_number_is_never_closed_while_its_request_is_open_and_the_sign_source_
     monkeypatch.setattr(band_sources, "_records", boom)
     r = band_view.render_full(qs)
     assert r.shown == [n] and r.closed == [] and "UNDECIDED: Bash" in r.text
-    assert "! not read: coordinator SIGN records" in r.text
+    assert "! not read: desk SIGN records" in r.text
 
 
 # --- S3 fix round 2 (C): one malformed reply body is one UNREADABLE item ------------------------------------------
 def test_one_malformed_reply_body_is_one_unreadable_item_and_the_others_stay(night, cq, qdir, qs):
-    from levain.coordinator.store import next_gseq
+    from levain.desk.store import next_gseq
 
     req = file_req(cq, night)
     review.push_sign(night.store, night.T, req.id, "land it", rec="a: green")
@@ -862,7 +863,7 @@ def test_locked_authority_stores_fail_open_inside_the_hook_bound(night, cq, qdir
             c.close()
     assert took < HOOK_BUSY_MS / 1000 + 1.0, took
     assert "plain one" in out and "! not read: consent requests: busy past the band's time bound" in out
-    assert "! not read: coordinator SIGN records" in out and req.id not in out.split("closed")[0]
+    assert "! not read: desk SIGN records" in out and req.id not in out.split("closed")[0]
     assert "closed" not in out.splitlines()[0]                 # nothing unread is reported closed
 
 
@@ -884,9 +885,9 @@ def test_a_first_time_store_setup_under_a_held_lock_returns_inside_the_hook_boun
     assert "new (number pending): [claude_code] UNDECIDED: Bash" in out
 
 
-# --- S3 fix round 2 (E): the morning card reads the band from its own coordinator snapshot --------------------------
-def test_the_morning_card_band_uses_the_cards_own_coordinator_snapshot(night, cq, qdir, qs, monkeypatch):
-    from levain.coordinator.store import CoordStore
+# --- S3 fix round 2 (E): the morning card reads the band from its own desk snapshot --------------------------
+def test_the_morning_card_band_uses_the_cards_own_desk_snapshot(night, cq, qdir, qs, monkeypatch):
+    from levain.desk.store import CoordStore
 
     req = file_req(cq, night)
     review.push_sign(night.store, night.T, req.id, "land it", rec="a")

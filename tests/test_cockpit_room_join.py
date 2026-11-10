@@ -15,14 +15,14 @@ import urllib.request
 import pytest
 
 from levain.cockpit import room as cockpit_room
-from levain.coordinator.chat import RoomRotated
-from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.room_launch import RoomLaunchError
-from levain.coordinator.room_serve import RoomServeError
+from levain.desk.chat import RoomRotated
+from levain.desk.envelopes import EnvelopeStore
+from levain.desk.room_launch import RoomLaunchError
+from levain.desk.room_serve import RoomServeError
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
-from tests.test_coordinator_room_serve import scripted, wait
+from tests.test_desk_room_serve import scripted, wait
 
 
 def _call(base, path, body=None, token=TOKEN, method="POST"):
@@ -479,7 +479,7 @@ def test_a_line_tried_before_an_app_switch_is_sent_again_under_the_same_outbox_i
 @needs_browser
 def test_an_edit_to_a_card_survives_an_app_switch(tmp_path, qdir):
     """roomfix1 R2: a card's edited words lived in the mount's closure and were lost when the page was hidden."""
-    from levain.coordinator import room as coordroom
+    from levain.desk import room as coordroom
     rs, launcher, src = _rig(tmp_path, qdir)
     with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
         thread = _call(base, "/cockpit/room/open", {})[1]["room_thread"]

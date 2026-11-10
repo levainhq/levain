@@ -109,7 +109,7 @@ def _add_tick_parsers(verbs: argparse._SubParsersAction) -> None:
                     "windows. One pass, bounded (graceful at 540 s, hard exit at 600 s). Runs as you. --print-unit prints "
                     "the launchd plist for the schedule and installs nothing. Give --store-dir before `tick`.")
     tick.add_argument("--coord-dir", dest="coord_dir", type=Path, default=None,
-                      help="The coordinator queue directory (its dispatch.db feeds the slot-lease probes).")
+                      help="The desk queue directory (its dispatch.db feeds the slot-lease probes).")
     tick.add_argument("--print-unit", dest="print_unit", action="store_true",
                       help="Print the launchd user-agent plist for this store and exit; installs and loads nothing.")
     tick.set_defaults(func=run_tick)

@@ -8,7 +8,7 @@ lowest check number names the verdict; every check is still in ``checks``.
 The predicate reads sources through zero-argument callables (:class:`Sources`), so a test (or the controller) injects
 exactly what it means each source to say: a callable that raises means that source was UNREADABLE. :func:`sources_for`
 builds the real ones from an install's directories. A directory that was not given is an ABSENT source (no occurrence
-history, no coordinator, no agent store), recorded as such in the check's detail, so the verb can run against a bare
+history, no desk, no agent store), recorded as such in the check's detail, so the verb can run against a bare
 store copy; the controller passes every directory it owns.
 
 The six checks, each mapped from flow's ``dream.py`` ``gate``:
@@ -18,7 +18,7 @@ The six checks, each mapped from flow's ``dream.py`` ``gate``:
 3. no wrap since the dream-day's start, apart from the one wrap each of this agent's ``done`` occurrences for OTHER
    dream-days made
 4. something to consolidate
-5. no live session: no live coordinator launch, no work thread in ``awake.json``, no other session in anneal's
+5. no live session: no live desk launch, no work thread in ``awake.json``, no other session in anneal's
    session registry (a hooked Claude Code session heartbeats there). Waived for a manual run
 6. the window's one scheduled attempt is not already spent (a launched run that failed or was stopped). Waived for a
    manual run: the catch-up is the remedy for exactly that failure, and check 1's ceiling bounds it
@@ -278,7 +278,7 @@ def _check5(src: Sources, manual: bool) -> Check:
         return Check(5, name, "waived", "a manual run waives the live-session check (flow's --now fallback)")
     found: list[str] = []
     bad: list[str] = []
-    for label, fn in (("coordinator launch", src.launches), ("awake.json work thread", src.awake_threads),
+    for label, fn in (("desk launch", src.launches), ("awake.json work thread", src.awake_threads),
                       ("hooked session", src.sessions)):
         try:
             ids = _guard(fn, label)
@@ -291,7 +291,7 @@ def _check5(src: Sources, manual: bool) -> Check:
         return Check(5, name, QUIET, "; ".join(found), "live-seat")
     if bad:
         return Check(5, name, UNREADABLE, "; ".join(bad))
-    return Check(5, name, "pass", "no live coordinator launch, work thread or hooked session"
+    return Check(5, name, "pass", "no live desk launch, work thread or hooked session"
                  + (f" ({'; '.join(src.absent)})" if src.absent else ""))
 
 
@@ -394,14 +394,14 @@ def sources_for(store_path: Path | str, *, agent_dir: Path | str | None = None, 
     if agent is None:
         absent.append("no agent store given: no occurrence history")
     if coord is None:
-        absent.append("no coordinator dir given: no launches or awake.json")
+        absent.append("no desk dir given: no launches or awake.json")
 
     def launches() -> list[str]:
         if coord is None:
             return []
         from levain.autonomic.durable_sqlite import read_transaction
-        from levain.coordinator import lease
-        from levain.coordinator.door import readonly_store
+        from levain.desk import lease
+        from levain.desk.door import readonly_store
 
         ro = readonly_store(coord)
         if ro is None:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_coordinator_claude_session import make
+from tests.test_desk_claude_session import make
 
 REAL = Path(__file__).with_name("fixtures") / "claude_stream" / "permission_denied_read.jsonl"
 

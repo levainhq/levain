@@ -1,14 +1,15 @@
 """C15 S1: ``seam_handoffs`` and its one fenced writer ``close``. Every expectation below was first read from a real run
-on a scratch store (an active coordinator launch holding the lease, as ``boot`` in test_coordinator_lease makes it)."""
+on a scratch store (an active desk launch holding the lease, as ``boot`` in test_desk_lease makes it)."""
 from __future__ import annotations
 
 import sqlite3
 
 import pytest
 
-from levain.coordinator import seam_handoffs as sh
-from levain.coordinator.lease import LeaseRefused
-from levain.coordinator.store import CoordError, CoordStore
+from levain.desk import seam_handoffs as sh
+from levain.desk.lease import LeaseRefused
+from levain.desk.store import CoordError, CoordStore
+from levain.desk.legacy import ROLE_DESK
 
 
 def _body(**over):
@@ -28,7 +29,7 @@ def store(tmp_path):
     s.accept_drop("first words", surface="cli")
     ln = s.coord_status()["launches"][0]
     got, why = s.launch_activate(ln["launch_id"], harness_session_id="probe-A")
-    assert why is None and got.state == "active"      # activation claims the lease for the coordinator launch
+    assert why is None and got.state == "active"      # activation claims the lease for the desk launch
     s.session_key = got.session_key
     return s
 
@@ -59,7 +60,7 @@ def _max_drop_gseq(store):
         c.close()
 
 
-def test_a_close_appends_one_handoff_written_by_the_active_coordinator_launch(store):
+def test_a_close_appends_one_handoff_written_by_the_active_desk_launch(store):
     h = _close(store)
     assert (h.handoff_id, h.seam_kind, h.close_key, h.prev_handoff_id) == (1, "rotation", "r1", None)
     assert h.writer == store.session_key                     # derived from the lease holder, never from the request
@@ -100,7 +101,7 @@ def test_a_late_close_behind_a_newer_handoff_is_refused(store):
     second = _close(store, "r2", prev=first.handoff_id)
     assert (second.handoff_id, second.prev_handoff_id) == (2, 1)
     with pytest.raises(CoordError, match="a newer handoff exists"):
-        _close(store, "r3", prev=first.handoff_id)            # the stale coordinator's late close
+        _close(store, "r3", prev=first.handoff_id)            # the stale desk's late close
     with pytest.raises(CoordError, match="a newer handoff exists"):
         _close(store, "r4", prev=None)
     assert _close(store, "r2", prev=first.handoff_id) == second    # the retry of the one that landed still answers
@@ -177,7 +178,7 @@ def test_a_retry_after_the_lease_lapsed_is_refused_by_the_fence(tmp_path):
     clock.now += timedelta(minutes=31)                          # past LEASE_TTL: the lease lapses
     with pytest.raises(LeaseRefused, match="past its until"):   # the fence runs before the stored row is looked up
         sh.close(s, kind="rotation", body=_body(), request_id="r1", prev_handoff_id=None, token=tok_a)
-    # a second coordinator: A ends, a drop launches B, B holds the lease and reuses A's request id with A's words
+    # a second desk: A ends, a drop launches B, B holds the lease and reuses A's request id with A's words
     s.launch_end(a["launch_id"], "ended", "rotated")
     s.accept_drop("second", surface="cli")
     b = [ln for ln in s.coord_status()["launches"] if ln["state"] == "pending"][0]
@@ -236,7 +237,7 @@ def test_a_missing_request_id_is_refused(store, request_id):
 
 
 def test_no_token_a_stale_token_or_the_operators_lease_is_refused(store):
-    with pytest.raises(CoordError, match="needs the coordinator's identity"):
+    with pytest.raises(CoordError, match="needs the desk's identity"):
         sh.close(store, kind="rotation", body=_body(), request_id="r1", prev_handoff_id=None, token=None)
     with pytest.raises(LeaseRefused, match="is not the live lease's"):
         _close(store, token=_token(store) + 1000)
@@ -244,14 +245,14 @@ def test_no_token_a_stale_token_or_the_operators_lease_is_refused(store):
     op = CoordStore(store.directory.parent / "op")             # a store where only the operator holds the lease
     op.directory.mkdir(mode=0o700, exist_ok=True)
     tok = op.coord_take()
-    with pytest.raises(LeaseRefused, match="written by an active coordinator launch; the lease holder is the operator"):
+    with pytest.raises(LeaseRefused, match="written by an active desk launch; the lease holder is the operator"):
         sh.close(op, kind="operator", body=_body(), request_id="r1", prev_handoff_id=None, token=tok)
     assert _count(op) == 0
 
 
-def test_no_live_coordinator_is_refused(store):
+def test_no_live_desk_is_refused(store):
     token = _token(store)
-    store.coord_release(token, by="coordinator")
+    store.coord_release(token, by=ROLE_DESK)
     with pytest.raises(LeaseRefused, match="is not the live lease's"):
         _close(store, token=token)
     assert _count(store) == 0
@@ -315,7 +316,7 @@ def test_a_store_from_before_this_slice_opens_and_takes_a_close(store):
 
 
 def test_seam_handoffs_is_exempt_with_a_reason():
-    from levain.coordinator import seam_classes as sc
+    from levain.desk import seam_classes as sc
 
     assert "seam_handoffs" in sc.EXEMPT and sc.EXEMPT["seam_handoffs"].strip()
     assert "seam_handoffs" not in sc.COUNTED and "seam_handoffs" not in sc.INFRASTRUCTURE

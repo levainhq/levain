@@ -3118,7 +3118,7 @@ body :is(#drop-words, .drop-words, .question-words, .sheet-write-in, .sign-write
 body :is(#drop-words, .drop-words, .question-words, .sheet-write-in, .sign-write-in):focus-visible { outline: 2px solid var(--text); outline-offset: 1px; border-color: var(--label); }   /* --text like the global :focus-visible rule; --accent-line is about 1.7:1 on the light base. #drop-words in the list makes this rule outrank class-only rules */
 body .state-input { font-size: 16px; }
 
-/* The coordinator drop: an inline composer (Phill 10-30: "front and center", "the whole idea is to make working from the cockpit
+/* The desk drop: an inline composer (Phill 10-30: "front and center", "the whole idea is to make working from the cockpit
    ... easy, and attractive"; placed under the Needs-you row, below). Neutral emphasis, no accent: the accent
    is spent on what waits on him. The box takes the one free-text rule above (.drop-words). */
 /* Placement (Phill 10-30, np-899dfb53 (b)): directly under the Needs-you row in every view, in the page's card (--card, a --hair line,

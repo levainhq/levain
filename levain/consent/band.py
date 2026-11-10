@@ -12,12 +12,12 @@ An answer authorises nothing (Phill's 26a): it is information for the agent, uns
 agent then makes still goes through the gate. The delivered text says so. ``levain ask`` is not a boundary either:
 it runs as the agent, and the agent, session and queue directory it names are the caller's word.
 
-The coordinator reads the band first (C5, :mod:`levain.coordinator.first_reader`). Its answer is a KNOW in its own
-store, never an answer here: the hook delivers it labelled as the coordinator's (:func:`know_line`, :data:`KNOW_TAIL`)
-while the question stays open, and ``levain question answer`` refuses a session Levain started as the coordinator.
-While a coordinator holds a live lease, ``levain ask`` holds its ping (C5-1, Phill's *"4a"*): the operator is pinged
-when the coordinator escalates the question or has not read it within 10 minutes (:func:`release_held_pings`, checked
-by the gate hook, ``levain coord watch``, ``levain ask`` and ``levain coord escalate``; the first reader's known
+The desk reads the band first (C5, :mod:`levain.desk.first_reader`). Its answer is a KNOW in its own
+store, never an answer here: the hook delivers it labelled as the desk's (:func:`know_line`, :data:`KNOW_TAIL`)
+while the question stays open, and ``levain question answer`` refuses a session Levain started as the desk.
+While a desk holds a live lease, ``levain ask`` holds its ping (C5-1, Phill's *"4a"*): the operator is pinged
+when the desk escalates the question or has not read it within 10 minutes (:func:`release_held_pings`, checked
+by the gate hook, ``levain desk watch``, ``levain ask`` and ``levain desk escalate``; the first reader's known
 edges say what that does not cover).
 
 The answer is claimed by the session's MAIN thread only (a hook session key with no ``#agent:`` part), keyed by the
@@ -76,6 +76,7 @@ from typing import Any
 from levain import unshowable
 from levain.cockpit.consent import ConsentError
 from levain.consent.questions import ANSWER_CHANNELS, Link, Question, QuestionStore, QuestionStoreError
+from levain.desk.legacy import BAND_KEY_DESK_STOPPED
 
 __all__ = ["AGENT_LINE", "ANSWER_TAIL", "KNOW_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parsers", "answer_line", "ask_resume_meta",
            "deliver_answer", "deliver_answers", "file_question", "know_line", "question_context", "release_held_pings",
@@ -97,8 +98,8 @@ AGENT_LINE = ("When you need the operator's judgement and can keep working on so
 # the line every delivered block of answers ends with (26a)
 ANSWER_TAIL = ("An answer is information, not a permission: a gated call still goes through levain's gate, and "
                "levain has checked nothing about who recorded it.")
-# after the coordinator's KNOW answers (C5, gap 7: "its answers are KNOWs labelled as its own")
-KNOW_TAIL = ("Each coordinator answer above is its own reading, filed for the operator's review: the question stays "
+# after the desk's KNOW answers (C5, gap 7: "its answers are KNOWs labelled as its own")
+KNOW_TAIL = ("Each desk answer above is its own reading, filed for the operator's review: the question stays "
              "open, and an answer the operator records later reaches you too and is the one that counts.")
 EXIT_OK, EXIT_REFUSED = 0, 2
 # the agents a question can name (the parser lists them without importing either adapter)
@@ -174,16 +175,16 @@ def question_context(directory: Path | str, agent: str, session: str | None) -> 
     if not store.path.exists():
         return None
     lines = [line for line in (answer_line(q) for q in store.claim_answers_for(agent, session)) if line]
-    knows = _coordinator_lines(directory, agent, session)
+    knows = _desk_lines(directory, agent, session)
     if knows:
         lines += [*knows, KNOW_TAIL]
     return "\n".join([*lines, ANSWER_TAIL]) if lines else None
 
 
 def know_line(question: Question, body: dict[str, Any]) -> str:
-    """The fixed text one coordinator KNOW is delivered as (C5): it names the COORDINATOR as the one who answered, on
+    """The fixed text one desk KNOW is delivered as (C5): it names the DESK as the one who answered, on
     its own reading, never the operator, and the value arrives quoted or escaped exactly as an answer's does."""
-    head = (f"levain: the coordinator, not the operator, answered question #{question.n} {_quoted(question.what)} "
+    head = (f"levain: the desk, not the operator, answered question #{question.n} {_quoted(question.what)} "
             "on its own reading")
     if body.get("kind") == "option":
         key = str(body.get("value", ""))
@@ -191,15 +192,15 @@ def know_line(question: Question, body: dict[str, Any]) -> str:
     return f"{head}, in its own words: {_escaped(str(body.get('value', '')))}"
 
 
-def _coordinator_caller(directory: Path) -> bool:
-    """True when this process runs inside a session Levain started as the coordinator (its harness session id, read
-    from the environment, is a coordinator launch's). A label check, like every actor before S1: it keeps the
-    coordinator's pick from being recorded as the operator's answer (C5's run: ``via cli``, and the operator locked
+def _desk_caller(directory: Path) -> bool:
+    """True when this process runs inside a session Levain started as the desk (its harness session id, read
+    from the environment, is a desk launch's). A label check, like every actor before S1: it keeps the
+    desk's pick from being recorded as the operator's answer (C5's run: ``via cli``, and the operator locked
     out), it does not stop a process that hides its environment."""
-    from levain.coordinator.first_reader import is_coordinator_session
+    from levain.desk.first_reader import is_desk_session
 
     env = os.environ
-    return any(is_coordinator_session(directory, env.get(name)) for name in ("CLAUDE_CODE_SESSION_ID",
+    return any(is_desk_session(directory, env.get(name)) for name in ("CLAUDE_CODE_SESSION_ID",
                                                                              "CODEX_THREAD_ID"))
 
 
@@ -227,8 +228,8 @@ def agent_session_caller() -> bool:
     """True when this process runs inside ANY agent session (a Claude Code or Codex Bash tool, a child of one with
     no marker variable, ...): :func:`agent_process` found an agent. Q17-ALL D9, Q1 ruled (a): an information answer
     is the operator's only through a human channel, so `levain question answer` and `levain band answer` refuse
-    here; inside a seat the human answers by typing in the seat. A label check, like :func:`_coordinator_caller`
-    (which it widens from the coordinator to every agent): it does not stop a process that hides its environment
+    here; inside a seat the human answers by typing in the seat. A label check, like :func:`_desk_caller`
+    (which it widens from the desk to every agent): it does not stop a process that hides its environment
     and its process tree, and what it keeps out is text the agent reads, never authority.
 
     It over-fences on purpose (fail-closed): a human's shell that inherited an agent's variables (a tmux server
@@ -242,21 +243,21 @@ AGENT_ANSWER_REFUSAL = ("this runs inside an agent session, and an agent's answe
                         "or the phone (the item stays open)")
 
 
-def _coordinator_lines(directory: Path | str, agent: str, session: str) -> list[str]:
-    """The coordinator's KNOW answers for this session (claimed once), or none. Never raises: a store that cannot be
+def _desk_lines(directory: Path | str, agent: str, session: str) -> list[str]:
+    """The desk's KNOW answers for this session (claimed once), or none. Never raises: a store that cannot be
     read now is read at the session's next hook."""
     try:
-        from levain.coordinator.first_reader import claim_knows
+        from levain.desk.first_reader import claim_knows
 
         # each line is formatted inside the claim, before its KNOW is marked delivered (never marked unseen)
         return claim_knows(directory, agent, session, know_line)
-    except Exception:  # noqa: BLE001 - the hook carries the operator's answers whatever the coordinator's store does
+    except Exception:  # noqa: BLE001 - the hook carries the operator's answers whatever the desk's store does
         return []
 
 
 def _send_ping(agent: str, q: Question, qdir: Path, extra: str = "", kind: str = "question") -> bool:
     """Ping the operator about question ``q`` through the agent's notify seam; False when nothing was sent. ``kind`` is
-    ``question`` for a seat's item and ``attention`` for a row the coordinator raises (it passes presence ``quiet``).
+    ``question`` for a seat's item and ``attention`` for a row the desk raises (it passes presence ``quiet``).
     Never raises: a ping is a ping."""
     try:
         adapter = _agents()[agent]
@@ -274,10 +275,10 @@ def _send_ping(agent: str, q: Question, qdir: Path, extra: str = "", kind: str =
 
 
 def release_held_pings(directory: Path | str) -> list[str]:
-    """Send every held ping now due (C5-1, :func:`levain.coordinator.first_reader.claim_held`), each once; one line per
+    """Send every held ping now due (C5-1, :func:`levain.desk.first_reader.claim_held`), each once; one line per
     release. Never raises: a store that cannot be read now is checked at the next call."""
     try:
-        from levain.coordinator.first_reader import UNREAD_AFTER, claim_held
+        from levain.desk.first_reader import UNREAD_AFTER, claim_held
 
         due = claim_held(directory)
     except Exception:  # noqa: BLE001 - see the docstring
@@ -287,7 +288,7 @@ def release_held_pings(directory: Path | str) -> list[str]:
     for q, cause in due:
         extra = ("\nThe desk escalated it to you." if cause == "escalated" else
                  f"\nThe desk has not read it in {minutes} minutes; it waits on you.")
-        # an escalation is the coordinator putting the row in front of him (attention); an unread release is not
+        # an escalation is the desk putting the row in front of him (attention); an unread release is not
         pinged = _send_ping(q.agent, q, Path(directory), extra, "attention" if cause == "escalated" else "question")
         lines.append(f"question #{q.n} ({cause}): the operator was {'pinged' if pinged else 'NOT pinged'}")
     return lines
@@ -441,20 +442,20 @@ def _ping_text(agent: str, q: Question, qdir: Path, band_n: int | None = None, e
     return f"{text}\nBlocks:{_FULL_TEXT}{extra}"
 
 
-def _coordinator_session(qdir: Path, session: str) -> bool | None:
-    """True when ``session`` is a harness session Levain started as the coordinator, False when it is not, None when
-    the lookup faulted (the caller neither grants the coordinator's `attention` nor holds the ping behind a first read)."""
+def _desk_session(qdir: Path, session: str) -> bool | None:
+    """True when ``session`` is a harness session Levain started as the desk, False when it is not, None when
+    the lookup faulted (the caller neither grants the desk's `attention` nor holds the ping behind a first read)."""
     try:
-        from levain.coordinator.first_reader import is_coordinator_session
+        from levain.desk.first_reader import is_desk_session
 
-        return is_coordinator_session(qdir, session)
+        return is_desk_session(qdir, session)
     except Exception:  # noqa: BLE001 - a fault is its own answer: sent at once as a plain question
         return None
 
 
 def _hold(qdir: Path, question_id: str) -> bool:
     try:
-        from levain.coordinator.first_reader import hold_ping
+        from levain.desk.first_reader import hold_ping
 
         return hold_ping(qdir, question_id)
     except Exception:  # noqa: BLE001 - a fault pings, as before C5-1
@@ -587,12 +588,12 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     state = None if link is None else _push_state(agent, qdir, link.request_id)
     tappable = link is not None and state in ("undecided", "unknown")
     _release_quietly(qdir)                       # earlier held pings now due go first (C5-1)
-    # C5-1: while a coordinator holds a live lease it reads first and the ping is held; a question tied to a consent
+    # C5-1: while a desk holds a live lease it reads first and the ping is held; a question tied to a consent
     # request is the operator's ruling alone and is never held
-    # a question the coordinator files about its own work is never held behind its own first read: it pings at once
+    # a question the desk files about its own work is never held behind its own first read: it pings at once
     # as `attention`
-    own = _coordinator_session(qdir, session)
-    # an open question is never held either: the coordinator can only escalate it, so a hold would only delay the ping
+    own = _desk_session(qdir, session)
+    # an open question is never held either: the desk can only escalate it, so a hold would only delay the ping
     held = link is None and own is False and not q.open_ended and _hold(qdir, q.id)
     pinged = False
     if not held:
@@ -604,7 +605,7 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     where = ("the answer arrives in your context at a later tool call" if session != NO_SESSION else
              "no session was found in your environment, so the answer will be recorded but not delivered to you "
              + no_session_hint)
-    ping = ("not pinged yet: a coordinator holds the live lease and reads it first; the operator is pinged if it "
+    ping = ("not pinged yet: a desk holds the live lease and reads it first; the operator is pinged if it "
             "escalates the question or has not read it within 10 minutes" if held else "pinged" if pinged else
             "NOT pinged (no notify command is configured and no phone has pings on; the question is listed in "
             "`levain question list`)")
@@ -631,20 +632,20 @@ def file_question(agent: str, session: str, what: str, options: list[tuple[str, 
     return q, text
 
 
-# the coordinator's own item. Its key is this base, a colon and the stop episode (the death that began the run that
+# the desk's own item. Its key is this base, a colon and the stop episode (the death that began the run that
 # stopped it), so one episode files one item: an item the operator acknowledged is not filed again while that
 # episode stands, and a later stop is a new item. Closing takes the base, so every episode's open item closes.
 # An answer here records only: the panel's Start, Stop and Hold are what act, so the one option is an acknowledgement
-COORDINATOR_STOPPED_KEY = "levain-coordinator-stopped"
+DESK_STOPPED_KEY = BAND_KEY_DESK_STOPPED
 _STOPPED_OPTIONS = (("seen", "Seen: I will press Stop or Hold on the cockpit's Desk panel"),)
 
 
-def file_coordinator_stopped(qdir: Path | str, agent: str, why: str, episode: str,
+def file_desk_stopped(qdir: Path | str, agent: str, why: str, episode: str,
                              still: Callable[[], bool] | None = None) -> Question | None:
-    """Put the coordinator's stop on the band: one item per stop episode, however many deaths follow the third and
+    """Put the desk's stop on the band: one item per stop episode, however many deaths follow the third and
     however often this runs, and none again for an episode the operator has answered. ``agent`` is the band's name
-    for the coordinator's harness, ``why`` the panel's own text for the state, ``episode`` what names the stop.
-    ``still``: asked once after the item is filed and before its ping; False (the coordinator left ``stopped`` while
+    for the desk's harness, ``why`` the panel's own text for the state, ``episode`` what names the stop.
+    ``still``: asked once after the item is filed and before its ping; False (the desk left ``stopped`` while
     this filed) sends no ping. The item then stays open: only a person's answer closes an item (no answer channel is
     Levain's own), so the operator's acknowledgement or the panel's next verb closes it. The item is numbered by the
     band when it is first shown, as every item is. Its ping goes out once, with the item. Returns the item when this
@@ -652,11 +653,11 @@ def file_coordinator_stopped(qdir: Path | str, agent: str, why: str, episode: st
     try:
         text = _plain_line(why)
         q, filed = QuestionStore(qdir).file_once(
-            agent=agent, key=f"{COORDINATOR_STOPPED_KEY}:{episode}",
+            agent=agent, key=f"{DESK_STOPPED_KEY}:{episode}",
             what="The desk stopped after three deaths in a row; nothing launches until you act on the "
                  "Desk panel.",
             options=list(_STOPPED_OPTIONS), rec="seen",
-            blocks=f"every new coordinator launch, until you press Stop or Hold on the cockpit's Desk "
+            blocks=f"every new desk launch, until you press Stop or Hold on the cockpit's Desk "
                    f"panel (an answer here only records). {text}"[:300],
             cwd=os.path.abspath(str(qdir)), held_by=ANSWER_CHANNELS)
         if not filed:
@@ -673,13 +674,13 @@ def _plain_line(text: str) -> str:
     return " ".join(str(text).split())[:600]
 
 
-def close_coordinator_stopped(qdir: Path | str, verb: str) -> list[Question]:
+def close_desk_stopped(qdir: Path | str, verb: str) -> list[Question]:
     """Close every open stop item as the operator's own act from the cockpit, through the band's answer write, with
     text naming the panel ``verb`` he pressed (the item's one option is an acknowledgement, not a verb). Returns the
-    items closed. Never raises: the verb that called it has already changed the coordinator."""
+    items closed. Never raises: the verb that called it has already changed the desk."""
     try:
         return QuestionStore(qdir).close_open(
-            COORDINATOR_STOPPED_KEY, text=f"{verb} pressed on the cockpit's Desk panel", channel="cockpit")
+            DESK_STOPPED_KEY, text=f"{verb} pressed on the cockpit's Desk panel", channel="cockpit")
     except Exception:  # noqa: BLE001 - see the docstring
         return []
 
@@ -859,10 +860,10 @@ def run_question(args: argparse.Namespace, out: Any = None) -> int:
             return EXIT_OK
         if (args.option is None) == (args.text is None):
             raise ValueError("answer with exactly one of --option KEY or --text TEXT")
-        if _coordinator_caller(store.directory):
-            raise ValueError("this session is the coordinator: its answer is its own, never the operator's, so it "
-                             "goes `levain coord answer` (a KNOW the operator reviews, the question left open) or "
-                             "`levain coord escalate`")
+        if _desk_caller(store.directory):
+            raise ValueError("this session is the desk: its answer is its own, never the operator's, so it "
+                             "goes `levain desk answer` (a KNOW the operator reviews, the question left open) or "
+                             "`levain desk escalate`")
         if agent_session_caller():
             raise ValueError(AGENT_ANSWER_REFUSAL)
         store.answer(q.id, option=args.option, text=args.text, channel="cli")

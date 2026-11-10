@@ -18,6 +18,7 @@ import pytest
 
 from levain.cli import main as levain_main
 import levain.team.tenure as tenure
+from levain.desk.legacy import ROLE_DESK
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None or shutil.which("ssh-keygen") is None
                                 or os.name != "posix", reason="needs git + ssh-keygen + POSIX")
@@ -586,13 +587,13 @@ def test_a_held_entry_naming_a_refused_one_waits_and_an_independent_one_replays(
     assert f"({o2['id']}): they supersede or refer to an entry that is not in the ledger here" in out.err + out.out
 
 
-def test_a_session_outside_the_coordinator_workspace_cannot_promote_a_draft_with_a_file_key(tmp_path, monkeypatch,
+def test_a_session_outside_the_desk_workspace_cannot_promote_a_draft_with_a_file_key(tmp_path, monkeypatch,
                                                                                             capsys) -> None:
-    # reproduced on land10b f5f28417 (1022-18/coord/c8_real_run.txt): the door fences only a cwd inside the coordinator's
+    # reproduced on land10b f5f28417 (1022-18/coord/c8_real_run.txt): the door fences only a cwd inside the desk's
     # workspace, so a launched session that `cd`s out promoted a draft as the human with the human's file key. Where the
     # team refuses file keys the signer itself refuses it, whatever the cwd: nothing is written, the draft stays drafted.
-    from levain.coordinator import teamdrafts as T
-    from levain.coordinator.store import CoordStore
+    from levain.desk import teamdrafts as T
+    from levain.desk.store import CoordStore
     monkeypatch.setattr(tenure, "_REQUIRE_PRESENCE", True)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(tmp_path / "k")],
@@ -608,10 +609,10 @@ def test_a_session_outside_the_coordinator_workspace_cannot_promote_a_draft_with
     ln = store.coord_status()["launches"][0]
     store.launch_activate(ln["launch_id"], harness_session_id="sess-1")
     token = store.coord_claim(ln["launch_id"], store.launch(ln["launch_id"]).session_key)
-    d = T.add_draft(store, "decision", words="drafted by the coordinator", kind="practice", paths=["a.py"],
-                    by="coordinator", token=token)
+    d = T.add_draft(store, "decision", words="drafted by the desk", kind="practice", paths=["a.py"],
+                    by=ROLE_DESK, token=token)
     before = git("rev-parse", "levain-team-ledger", cwd=ana)
-    monkeypatch.chdir(tmp_path)                    # out of any coordinator workspace: the door does not fire
+    monkeypatch.chdir(tmp_path)                    # out of any desk workspace: the door does not fire
     capsys.readouterr()
     assert levain_main(["team", "draft", "promote", d["draft_id"], "--yes", "--no-push", "--repo", str(ana),
                         "--queue-dir", str(qdir)]) != 0

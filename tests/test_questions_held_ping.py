@@ -1,4 +1,4 @@
-"""C5-1 (Phill 10-22, "4a"): hold ``levain ask``'s ping while a coordinator holds a LIVE lease; any question it has not
+"""C5-1 (Phill 10-22, "4a"): hold ``levain ask``'s ping while a desk holds a LIVE lease; any question it has not
 read within 10 minutes pings him and lands in what waits on him. The lane's run (project_memory 1022-19/c5/
 c5_1_run.txt) drove the real CLI with a real notify command; these pin it on a store clock the test moves. The ping
 is observed at the agent's notify seam. Synthetic words."""
@@ -12,10 +12,10 @@ import pytest
 from levain.consent import band
 from levain.consent.adapters import claude_code as cc
 from levain.consent.questions import QuestionStore
-from levain.coordinator import first_reader as fr
-from levain.coordinator import lease as lease_mod
-from levain.coordinator import review
-from levain.coordinator.store import CoordStore
+from levain.desk import first_reader as fr
+from levain.desk import lease as lease_mod
+from levain.desk import review
+from levain.desk.store import CoordStore
 
 NOW = datetime(2026, 10, 22, 21, 0, tzinfo=timezone.utc)
 SEAT = "sess-worker-1"
@@ -34,8 +34,8 @@ class Desk:
         monkeypatch.setattr(cc, "notify", lambda settings, text, cwd=None, **_kw: self.sent.append(text) or True)
         self.tmp = tmp_path
 
-    def coordinator(self) -> int:
-        """A coordinator launch, active, holding the lease (the real path: a drop wakes it, it activates, it claims)."""
+    def desk(self) -> int:
+        """A desk launch, active, holding the lease (the real path: a drop wakes it, it activates, it claims)."""
         ws = self.tmp / "coordws"
         ws.mkdir(exist_ok=True)
         self.store.coord_set_agent("claude", cwd=str(ws))
@@ -66,17 +66,17 @@ def desk(tmp_path, monkeypatch):
     return Desk(tmp_path, monkeypatch)
 
 
-def test_a_question_asked_while_a_coordinator_holds_the_live_lease_is_not_pinged(desk):
+def test_a_question_asked_while_a_desk_holds_the_live_lease_is_not_pinged(desk):
     """Before C5-1 ``levain ask`` pinged at filing whoever held the lease (red on 198f0b11: one ping sent)."""
-    desk.coordinator()
+    desk.desk()
     q, text = desk.ask()
-    assert desk.sent == [] and "not pinged yet: a coordinator holds the live lease" in text
+    assert desk.sent == [] and "not pinged yet: a desk holds the live lease" in text
     assert desk.rows("SELECT question_id FROM held_pings") == [(q.id,)]
 
 
-def test_an_expired_coordinator_lease_does_not_hold_the_ping(desk):
-    """A coordinator lease past its until (its holder silent) holds nothing: the ping goes at filing."""
-    desk.coordinator()
+def test_an_expired_desk_lease_does_not_hold_the_ping(desk):
+    """A desk lease past its until (its holder silent) holds nothing: the ping goes at filing."""
+    desk.desk()
     desk.later(minutes=lease_mod.LEASE_TTL.total_seconds() / 60 + 1)
     _q, text = desk.ask()
     assert len(desk.sent) == 1 and "the operator was pinged" in text
@@ -89,13 +89,13 @@ def test_a_lease_the_operator_holds_does_not_hold_the_ping(desk):
     assert len(desk.sent) == 1
 
 
-def test_with_no_coordinator_store_the_ping_goes_and_no_store_is_made(desk):
+def test_with_no_desk_store_the_ping_goes_and_no_store_is_made(desk):
     desk.ask()
     assert len(desk.sent) == 1 and not (desk.dir / "dispatch.db").exists()
 
 
 def test_an_unread_question_pings_after_ten_minutes_once_and_waits_on_you(desk):
-    desk.coordinator()
+    desk.desk()
     q, _ = desk.ask()
     desk.later(minutes=9, seconds=59)
     assert band.release_held_pings(desk.dir) == [] and desk.sent == []
@@ -112,7 +112,7 @@ def test_an_unread_question_pings_after_ten_minutes_once_and_waits_on_you(desk):
 
 def test_the_gate_hook_is_what_checks(desk):
     """No watcher needed: any session's hook in the directory releases a due ping."""
-    desk.coordinator()
+    desk.desk()
     desk.ask()
     desk.later(minutes=10)
     assert band.question_context(desk.dir, "claude_code", "sess-someone-else") is None
@@ -120,7 +120,7 @@ def test_the_gate_hook_is_what_checks(desk):
 
 
 def test_an_escalated_question_pings_at_once(desk):
-    tok = desk.coordinator()
+    tok = desk.desk()
     q, _ = desk.ask()
     fr.escalate(desk.store, q.id, "outside its envelope", token=tok)
     assert band.release_held_pings(desk.dir) == [f"question #{q.n} (escalated): the operator was pinged"]
@@ -130,8 +130,8 @@ def test_an_escalated_question_pings_at_once(desk):
 
 
 def test_a_know_holds_the_ping_for_good(desk):
-    """The coordinator answered it as a KNOW (the KNOW is the review item): no ping, not even after 10 minutes."""
-    desk.coordinator()
+    """The desk answered it as a KNOW (the KNOW is the review item): no ping, not even after 10 minutes."""
+    desk.desk()
     q, _ = desk.ask()
     with desk.store._write() as (conn, now):
         rid = desk.store._reply(conn, None, "know", "questions.db", q.id, {"text": "k"}, now)
@@ -142,7 +142,7 @@ def test_a_know_holds_the_ping_for_good(desk):
 
 
 def test_a_question_the_operator_answered_meanwhile_is_released_without_a_ping(desk):
-    desk.coordinator()
+    desk.desk()
     q, _ = desk.ask()
     QuestionStore(desk.dir).answer(q.id, option="b", channel="cli")
     desk.later(minutes=10)
@@ -152,7 +152,7 @@ def test_a_question_the_operator_answered_meanwhile_is_released_without_a_ping(d
 
 
 def test_a_store_fault_at_filing_pings_as_before(desk, monkeypatch):
-    desk.coordinator()
+    desk.desk()
 
     def broken(d):
         raise sqlite3.OperationalError("database is locked")
@@ -162,11 +162,11 @@ def test_a_store_fault_at_filing_pings_as_before(desk, monkeypatch):
     assert len(desk.sent) == 1
 
 
-def test_an_unread_release_is_the_first_read_and_the_coordinator_cannot_answer_it_after(desk):
+def test_an_unread_release_is_the_first_read_and_the_desk_cannot_answer_it_after(desk):
     """L3 r3 (codex MED): the 10-minute release filed the escalation's ANSWER record but no ``first_reads`` row, so a
     later ``coord answer`` passed ``_read`` and could file a KNOW contradicting the escalation (red on 3540ae0c: no
     row, and the refusal did not name the escalation)."""
-    tok = desk.coordinator()
+    tok = desk.desk()
     q, _ = desk.ask()
     desk.later(minutes=10)
     assert band.release_held_pings(desk.dir) == [f"question #{q.n} (unread): the operator was pinged"]
@@ -184,9 +184,9 @@ def test_an_unread_release_is_the_first_read_and_the_coordinator_cannot_answer_i
 def test_a_watch_pass_releases_a_due_ping_whatever_claude_reads(desk, monkeypatch, claude):
     """L3 r3 (codex MED): ``watch_once`` released held pings only at its bottom, after the returns for no ``claude``
     on PATH and an unreadable session list, so in a Codex-only install a due ping stayed silent (red on 3540ae0c)."""
-    from levain.coordinator import launch as cl
+    from levain.desk import launch as cl
 
-    desk.coordinator()
+    desk.desk()
     q, _ = desk.ask()
     desk.later(minutes=10)
     monkeypatch.setattr(cl, "_harness", lambda: (None, {}) if claude == "unavailable" else ("/x/claude", {}))

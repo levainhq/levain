@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from levain.coordinator import deliver, morning
+from levain.desk import deliver, morning
 from levain.webpush import presence
 from levain.webpush.presence import PresenceError, set_word
 from levain.webpush.quote import Match

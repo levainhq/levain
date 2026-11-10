@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from levain.coordinator import review
-from levain.coordinator.store import CoordError, CoordStore
+from levain.desk import review
+from levain.desk.store import CoordError, CoordStore
 
 
 def _dir(tmp_path: Path) -> Path:
@@ -25,7 +25,7 @@ def test_a_plain_clear_refuses_a_yours_to_clear_item_in_the_store(tmp_path: Path
     with pytest.raises(CoordError, match="yours to clear"):
         review.clear_item(store, mine.item_id, mode="manual", plain_only=True)
     assert review.get_item(store, mine.item_id).state == "open"
-    # the laptop's own `levain coord review clear` (no plain_only) is unchanged
+    # the laptop's own `levain desk review clear` (no plain_only) is unchanged
     assert review.clear_item(store, mine.item_id, mode="manual").state == "cleared"
 
 
@@ -50,7 +50,7 @@ def test_a_plain_reopen_of_a_yours_to_clear_item_is_allowed(tmp_path: Path) -> N
 
 # --- the cockpit: kernel row verbs review_clear / review_reopen, on a paired device's credential only ---------------
 
-from levain.cockpit.coordinator_panels import REVIEW_ID  # noqa: E402
+from levain.cockpit.desk_panels import REVIEW_ID  # noqa: E402
 from tests.test_cockpit_k2a import _install  # noqa: E402
 from tests.test_cockpit_pairing_http import PROXY, T, _call, _pair, _serve  # noqa: E402
 FC = "review-paths-surface-token-0123456789"      # a named surface (the shared token that never clears), honoured proxied (W1b L-1)
@@ -58,7 +58,7 @@ FC = "review-paths-surface-token-0123456789"      # a named surface (the shared 
 
 @pytest.fixture
 def served(tmp_path: Path, monkeypatch):
-    """A real make_server over a temp install whose consent directory (LEVAIN_HOME/consent) holds a coordinator store
+    """A real make_server over a temp install whose consent directory (LEVAIN_HOME/consent) holds a desk store
     with one plain item and one "yours to clear" item: (port, store, plain item, authority item)."""
     home = tmp_path / "home"
     (home / "consent").mkdir(parents=True, mode=0o700)
@@ -203,4 +203,4 @@ def test_the_cockpit_page_clears_from_a_paired_browser_and_says_why_on_the_share
         ])
     assert "paired device" in str(shared["values"][-2]), (shared["values"], shared["posts"])
     assert review.get_item(store, plain.item_id).last[:3] == ("cleared", "manual", "operator")
-    assert any("levain coord review clear" in t for t in paired["values"][-1]), paired["values"]
+    assert any("levain desk review clear" in t for t in paired["values"][-1]), paired["values"]

@@ -40,8 +40,9 @@ from collections.abc import Callable
 from pathlib import Path
 
 from levain.webpush import desk, presence
-from levain.webpush.presence import (ACTIVE_WINDOW_SECS, COORDINATOR_WORDS, MAX_SECS, MIN_SECS, SEAT_WORDS,
+from levain.webpush.presence import (ACTIVE_WINDOW_SECS, DESK_WORDS, MAX_SECS, MIN_SECS, SEAT_WORDS,
                                      TIMED, WORDS, Decision, PresenceError, kind_class, parse_duration)
+from levain.desk.legacy import ROLE_DESK
 
 __all__ = ["VERSION", "FILE_NAME", "BACKUP_DIR", "DEVICES", "LETS", "LETS_CLASSES", "lets_label", "lets_describe", "lets_options", "FOLLOW_DEFAULT", "FOLLOW_MIN",
            "FOLLOW_MAX", "PRESET_TABLE", "overlay_active", "overlay_ended", "devices_on_now", "decide", "read", "view",
@@ -505,7 +506,7 @@ def _who_text(ov: dict | None) -> str:
         return ""
     by = ov["by"]
     who = f"{by['agent']} {by['session']}".strip()
-    who = f"the coordinator {who}" if by["role"] == "coordinator" else f"seat {who}"
+    who = f"the desk {who}" if by["role"] == ROLE_DESK else f"seat {who}"
     flag = " (unverified)" if ov.get("verified") is not True else ""
     return f" Set by {who} from your words: \"{ov['said']}\"{flag}."
 
@@ -872,7 +873,7 @@ def apply_preset(queue_dir: Path | str, preset: str, *, duration: str | None = N
     ``timer`` ending takes ``duration`` (one hour by default), and the duration is never remembered.
 
     ``back`` clears the overlay and leaves the base (and a standing ``loud``); ``loud off`` clears a standing loud only. A seat
-    may set ``away`` only, the coordinator ``away``, ``quiet`` and ``sleep`` (:func:`levain.webpush.presence.check_setter`):
+    may set ``away`` only, the desk ``away``, ``quiet`` and ``sleep`` (:func:`levain.webpush.presence.check_setter`):
     ``by`` and ``said`` are checked before anything is read or written, a setter replaces an overlay the operator set only on a
     verified quote typed after it, and every call (a refusal included) leaves one row in the presence log. The whole call runs
     under the presence lock; ``wait`` bounds the lock wait (:class:`presence.PresenceBusy`); ``precheck`` runs once the lock is
@@ -995,7 +996,7 @@ def _plan(queue_dir, rec, word, duration, ts, by, said, ev, idle, ending=None) -
     if ending is not None:
         kind = ending
     elif by is not None:
-        kind = PRESET_TABLE[word]["until"]    # a seat or the coordinator never inherits the operator's remembered ending
+        kind = PRESET_TABLE[word]["until"]    # a seat or the desk never inherits the operator's remembered ending
     elif duration and word in TIMED:
         kind = "timer"                        # a duration the caller gave outranks the remembered type
     else:
@@ -1128,7 +1129,7 @@ def apply_settings(queue_dir: Path | str, *, devices: str | None = None, follow_
     settings with the changed fields."""
     word = _settings_word(devices, follow_after, lets_through, until)
     if by is not None:
-        who = "the coordinator" if isinstance(by, dict) and by.get("role") == "coordinator" else "a seat"
+        who = "the desk" if isinstance(by, dict) and by.get("role") == ROLE_DESK else "a seat"
         msg = (f"the presence settings are the operator's own: {who} may not change them "
                "(the operator sets them himself, from a terminal outside any agent session)")
         with presence._locked(queue_dir, strict=False):

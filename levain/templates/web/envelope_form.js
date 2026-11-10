@@ -49,10 +49,10 @@
     standard: { label: "Standard", stop: "8h",  hours: 3, tool_calls: 800,  tokens: 8000000 },
     long:     { label: "Long",     stop: "24h", hours: 8, tool_calls: 2500, tokens: 25000000 },
   };
-  // the launch grant's bounds (levain/coordinator/envelope.py's LAUNCH_DEFAULT and LAUNCH_MAX): a bigger count is refused there
+  // the launch grant's bounds (levain/desk/envelope.py's LAUNCH_DEFAULT and LAUNCH_MAX): a bigger count is refused there
   const LAUNCH_DEFAULT = 2, LAUNCH_MAX = 12;
   const STOPS = ["1h", "2h", "4h", "8h", "12h", "24h"];
-  // the server's bounds on each budget count (levain/coordinator/envelope.py's BUDGET_MAX): a bigger number is refused there, so it is not asked for here
+  // the server's bounds on each budget count (levain/desk/envelope.py's BUDGET_MAX): a bigger number is refused there, so it is not asked for here
   const BUDGET_MAX = { tool_calls: 100000, tokens: 1000000000, hours: 24 };
   for (const [k, p] of Object.entries(SIZES)) if (STOPS.indexOf(p.stop) < 0) throw new Error("the " + k + " size's stop " + p.stop + " is not one of the Custom stops");
   const el = (tag, cls, text) => {

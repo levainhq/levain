@@ -197,8 +197,8 @@ def dispatch_verdict(tmp: Path, custody: str, which: str = "sign", **sig) -> str
 
 
 def envelope_verdict(tmp: Path, custody: str, **sig) -> str | None:
-    """``None`` when the coordinator takes ``pk``'s envelope signature (``pk`` display-phone at ``custody``)."""
-    from levain.coordinator import envelope as env
+    """``None`` when the desk takes ``pk``'s envelope signature (``pk`` display-phone at ``custody``)."""
+    from levain.desk import envelope as env
     from tests.test_dispatch_contract import NOW
 
     pk = WebAuthnKey()

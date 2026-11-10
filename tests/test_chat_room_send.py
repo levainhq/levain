@@ -14,12 +14,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from levain.coordinator import chat, lease, room
-from levain.coordinator.chat import ChatService, ChatStore, record_check, record_cursor, record_event, record_message
-from levain.coordinator.chat_lease import TurnRefused
-from levain.coordinator.driver import CommandResult, ScriptedSession, SessionMeta
-from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import CoordError, Part
+from levain.desk import chat, lease, room
+from levain.desk.chat import ChatService, ChatStore, record_check, record_cursor, record_event, record_message
+from levain.desk.chat_lease import TurnRefused
+from levain.desk.driver import CommandResult, ScriptedSession, SessionMeta
+from levain.desk.envelopes import EnvelopeStore
+from levain.desk.store import CoordError, Part
+from levain.desk.legacy import ROLE_DESK
 
 LIVE = {"probe": lambda _l, _e: chat.Verdict(True, "scripted probe: live"), "sleep": lambda _s: None}
 T0 = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
@@ -217,9 +218,9 @@ def test_a_room_send_naming_an_epoch_is_refused(world):
     assert r.state == "refused" and "epoch" in r.cause and world["session"].sends == 0
 
 
-def test_the_coordinator_never_writes_into_a_room(world):
-    r = world["svc"].send(world["launch"], author_kind="coordinator", author_surface="coordinator",
-                          client_id="coord", outbox_id="ob-00000009", body="from the coordinator")
+def test_the_desk_never_writes_into_a_room(world):
+    r = world["svc"].send(world["launch"], author_kind=ROLE_DESK, author_surface=ROLE_DESK,
+                          client_id="coord", outbox_id="ob-00000009", body="from the desk")
     assert r.state == "refused" and "room" in r.cause and world["session"].sends == 0
 
 

@@ -336,7 +336,7 @@ class ProdGlueRun:
         from levain.chat_egress import classify, keys
         from levain.chat_egress import decider as dm
         from levain.chat_egress import launch as lm
-        from levain.coordinator.envelopes import EnvelopeStore
+        from levain.desk.envelopes import EnvelopeStore
 
         from ..decider_rig import Desk, Live, Lookup
         from ..test_launch import NO_GRANTS, real_launch

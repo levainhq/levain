@@ -1,21 +1,22 @@
-"""The coordinator's door is derived from the verbs, and every verb declares its side of it (1101-1, Diogenes
-5bfdf21a99fe: `coord ready add|move|correct` was documented as the coordinator's write but missing from a hand-kept list)."""
+"""The desk's door is derived from the verbs, and every verb declares its side of it (1101-1, Diogenes
+5bfdf21a99fe: `coord ready add|move|correct` was documented as the desk's write but missing from a hand-kept list)."""
 import argparse
 
 from levain.cli import build_parser, main
-from levain.coordinator import door
+from levain.desk import door
+from levain.desk.legacy import JSON_ROLE_DESK, LEGACY_HOME_NAME
 
-_TREES = ("coord", "drops", "thread", "team")
+_TREES = ("desk", "drops", "thread", "team")
 
 _EXPECTED = frozenset({
-    ("coord", "status"), ("coord", "claim"), ("coord", "beat"), ("coord", "release"),
-    ("coord", "questions"), ("coord", "answer"), ("coord", "escalate"),
-    ("coord", "away"), ("coord", "budget"), ("coord", "morning"),
-    ("coord", "reply"), ("coord", "spawn"),
-    ("coord", "report"), ("coord", "import-status"), ("coord", "apply-reports"), ("coord", "reports"),
-    ("coord", "handoff", "worker"), ("coord", "log"),
-    ("coord", "open"), ("coord", "close"), ("coord", "handoff", "show"),
-    ("coord", "ready", "show"), ("coord", "ready", "add"), ("coord", "ready", "move"), ("coord", "ready", "correct"),
+    ("desk", "status"), ("desk", "claim"), ("desk", "beat"), ("desk", "release"),
+    ("desk", "questions"), ("desk", "answer"), ("desk", "escalate"),
+    ("desk", "away"), ("desk", "budget"), ("desk", "morning"),
+    ("desk", "reply"), ("desk", "spawn"),
+    ("desk", "report"), ("desk", "import-status"), ("desk", "apply-reports"), ("desk", "reports"),
+    ("desk", "handoff", "worker"), ("desk", "log"),
+    ("desk", "open"), ("desk", "close"), ("desk", "handoff", "show"),
+    ("desk", "ready", "show"), ("desk", "ready", "add"), ("desk", "ready", "move"), ("desk", "ready", "correct"),
     ("drops", "list"), ("drops", "show"), ("drops", "split"), ("drops", "note"),
     ("thread", "list"), ("thread", "show"), ("thread", "state"), ("thread", "merge"), ("thread", "detach"),
     ("thread", "add"), ("thread", "set"),
@@ -24,13 +25,13 @@ _EXPECTED = frozenset({
 })
 
 
-def test_every_verb_of_the_coordinators_trees_declares_its_door():
+def test_every_verb_of_the_desks_trees_declares_its_door():
     undeclared = sorted(" ".join(p) for p, mark in door.declared_leaves(build_parser()).items()
                         if p[0] in _TREES and mark is None)
     assert not undeclared, f"declare door_ok(...) or not_door(...) where these are defined: {undeclared}"
 
 
-def test_no_verb_outside_the_coordinators_trees_is_open():
+def test_no_verb_outside_the_desks_trees_is_open():
     outside = sorted(" ".join(p) for p, mark in door.declared_leaves(build_parser()).items()
                      if p[0] not in _TREES and mark is True)
     assert not outside, f"a verb of another tree is marked door_ok: {outside}"
@@ -42,9 +43,9 @@ def test_the_derived_door_is_exactly_the_expected_set():
 
 def _workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "lh"))
-    ws = tmp_path / "coordinator"
+    ws = tmp_path / LEGACY_HOME_NAME
     (ws / ".levain").mkdir(parents=True)
-    (ws / ".levain" / "config.json").write_text('{"role": "coordinator"}\n')
+    (ws / ".levain" / "config.json").write_text(f'{{"role": {JSON_ROLE_DESK}}}\n')
     door.record(ws)
     q = tmp_path / "q"
     q.mkdir(mode=0o700)
@@ -57,9 +58,9 @@ def test_coord_ready_add_passes_the_door_and_a_not_door_verb_is_refused(tmp_path
     main(["coord", "ready", "add", "it-1", "--repo", "levain", "--title", "t", "--who", "c", "--why", "w",
           "--queue-dir", str(q)])                     # no --token: the lease fence refuses it, not the door
     err = capsys.readouterr().err
-    assert "is the operator's" not in err and "levain coord ready add:" in err, err
+    assert "is the operator's" not in err and "levain desk ready add:" in err, err
     assert main(["coord", "take", "--queue-dir", str(q)]) == 1
-    assert "is the operator's, and this is the coordinator's workspace" in capsys.readouterr().err
+    assert "is the operator's, and this is the desk's workspace" in capsys.readouterr().err
 
 
 def test_a_leaf_with_no_declaration_is_refused(tmp_path, monkeypatch):

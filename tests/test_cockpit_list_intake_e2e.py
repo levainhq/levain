@@ -1,5 +1,5 @@
 """THE LIST's intake, end to end (levain 64 integration of L1 + L2): ``list_intake`` posted through the cockpit's own
-``dispatch`` on the List panel (wire id ``tray``), with a real broker, a real spore store and a real coordinator store in
+``dispatch`` on the List panel (wire id ``tray``), with a real broker, a real spore store and a real desk store in
 tmp dirs. Nothing here touches an operator's live apps."""
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from levain.cockpit import list_panel
 from levain.cockpit.broker import Broker
 from levain.cockpit.effects import SporeEffectStore
 from levain.cockpit.verbs import dispatch
-from levain.coordinator.store import CoordStore
+from levain.desk.store import CoordStore
 from levain.cockpit.verbs import _intake_outbox_id
 from tests.test_cockpit_list_panel import CRED, INSTALL_CLASS, NOW, Rig
 

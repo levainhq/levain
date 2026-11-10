@@ -6,13 +6,14 @@ import time
 
 import pytest
 
-from levain.coordinator import morning
+from levain.desk import morning
 from levain.webpush import intent, presence
 from levain.webpush.presence import PresenceError, read_log, read_word, set_word
 from levain.webpush.quote import Match
+from levain.desk.legacy import ROLE_DESK
 
 SEAT = {"agent": "claude_code", "session": "s-1", "role": "seat"}
-COORD = {"agent": "claude_code", "session": "c-1", "role": "coordinator"}
+COORD = {"agent": "claude_code", "session": "c-1", "role": ROLE_DESK}
 T = time.time() - 1800.0   # inside the card's 24 h window
 
 
@@ -30,7 +31,7 @@ def test_each_word_a_setter_replaces_stays_on_record_and_the_card_names_the_sett
         ("quiet", "set", None), ("away", "set", "quiet"), ("sleep", "set", "away"), ("quiet", "set", "sleep")]
     assert rows[1]["by"] == SEAT and rows[1]["said"] == "anything at all" and "by" not in rows[0]
     assert rows[3]["by"] == COORD and rows[3]["prior"] == {"word": "sleep"}
-    card = morning._presence(tmp_path)   # the standing word is the coordinator's; the rows are old, so no refusals
+    card = morning._presence(tmp_path)   # the standing word is the desk's; the rows are old, so no refusals
     assert card["word"] == "quiet" and card["by"] == COORD and card["said"] == "I am on the train"
     set_word(tmp_path, "quiet", duration="1m", by=COORD, said="back soon", now=T)   # ran out 29 minutes ago
     assert morning._presence(tmp_path) is None
@@ -83,7 +84,7 @@ def test_a_setter_blocked_in_the_log_cannot_overwrite_a_loud_he_sets_meanwhile(t
     real = presence._log
 
     def paused(queue_dir, row):
-        if row.get("by", {}).get("role") == "coordinator":
+        if row.get("by", {}).get("role") == ROLE_DESK:
             inside.set()
             release.wait(5)
         real(queue_dir, row)
@@ -95,7 +96,7 @@ def test_a_setter_blocked_in_the_log_cannot_overwrite_a_loud_he_sets_meanwhile(t
     a.start()
     assert inside.wait(5)
     b.start()
-    time.sleep(0.3)   # his loud is now racing the coordinator's paused write
+    time.sleep(0.3)   # his loud is now racing the desk's paused write
     release.set()
     a.join(5)
     b.join(5)

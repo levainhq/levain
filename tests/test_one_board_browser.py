@@ -1,5 +1,5 @@
 """One Work board per cockpit, in real headless Chrome. The page has no standalone "Ready queue" zone and no tell box; with no
-board provider registered the cockpit draws its own Work board from the coordinator store (as an ordinary board-kind panel);
+board provider registered the cockpit draws its own Work board from the desk store (as an ordinary board-kind panel);
 with one registered only the provider's board draws; and every card's "Drop about this card" button opens the cockpit's drop box
 with the card's words in it, the cursor after them, posting nothing. `LEVAIN_BOARD_SHOTS=<dir>` keeps the screenshots there
 (the default is the test's tmp dir)."""
@@ -13,8 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from levain.consent.questions import QuestionStore
-from levain.coordinator import ready
-from levain.coordinator.store import CoordStore
+from levain.desk import ready
+from levain.desk.store import CoordStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_questions import _file
@@ -90,7 +90,7 @@ def test_the_page_has_no_ready_queue_zone_and_no_tell_box_and_draws_the_work_boa
     shots.mkdir(parents=True, exist_ok=True)
     _root, src, _ids = _install(tmp_path)
     page = ("JSON.stringify({zones: document.querySelectorAll('[data-zone=ready-board], .bd-zone, .bd-tell, .bd-tellhost').length, "
-            "ready: document.body.innerText.includes('Ready queue'), tell: document.body.innerText.includes('tell the coordinator'), "
+            "ready: document.body.innerText.includes('Ready queue'), tell: document.body.innerText.includes('tell the desk'), "
             "boards: [...document.querySelectorAll('[data-ck-panel]')].filter(p => p.querySelector('.bd-groups')).map(p => p.dataset.ckPanel)})")
     modal = (f"JSON.stringify({{cols: [...{MODAL}.querySelectorAll('.bd-col')].map(c => c.dataset.category), "
              f"cards: {MODAL}.querySelectorAll('.bd-card').length, title: {MODAL}.querySelector('h2').textContent}})")
@@ -234,7 +234,7 @@ def test_a_card_clicked_before_the_drop_box_has_read_is_not_lost(tmp_path: Path,
 
 
 @needs_browser
-def test_a_board_whose_drop_files_to_another_coordinator_draws_no_drop_button(tmp_path: Path, lh) -> None:  # noqa: F811
+def test_a_board_whose_drop_files_to_another_desk_draws_no_drop_button(tmp_path: Path, lh) -> None:  # noqa: F811
     lh.mkdir(parents=True, exist_ok=True, mode=0o700)
     _seed(lh)
     _root, src, _ids = _install(tmp_path)
@@ -275,7 +275,7 @@ def test_compose_drop_refuses_a_box_that_is_busy_or_off_and_clears_a_stale_hando
     assert json.loads(busy[1])[2] == "stale"                                   # a refusal leaves the handoff alone
     assert off[0] is False and json.loads(off[1])[1] == "The drop box is off: no store" and json.loads(off[1])[0] == ""
     assert ok[0] is True and json.loads(ok[1])[0] == "About: " and json.loads(ok[1])[2] is None   # the stale handoff is cleared
-    assert json.loads(ok[1])[1] == "queue is read-only"                    # a coordinator note is not hidden by a successful compose
+    assert json.loads(ok[1])[1] == "queue is read-only"                    # a desk note is not hidden by a successful compose
 
 
 @needs_browser

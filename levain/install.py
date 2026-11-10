@@ -75,6 +75,7 @@ from levain.packs import (
     seed_classes,
     verbatim_entries,
 )
+from levain.desk.legacy import ROLE_DESK
 
 if TYPE_CHECKING:
     from levain.interview import TemplateSpec
@@ -818,7 +819,7 @@ def _apply_init(
         _write_consent_hook_choice(install, consent_hook, emit)
     if role is not None and chosen in ROLE_ADAPTERS:
         # recorded BEFORE the render, as the consent hook choice is: every render reads the recorded role, and the
-        # record is the coordinator's door for either harness
+        # record is the desk's door for either harness
         _write_role(install, role, python_path, emit, adapter=chosen)
     review = _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
@@ -2757,44 +2758,44 @@ def persisted_consent_hook(install: Path) -> str:
     return config["consent_hook"] if config["consent_hook"] in CONSENT_HOOK_CHOICES else "off"
 
 
-# The coordinator's own install (np-6843ca07 (a), signed by the operator 2026-10-21): Claude Code runs its own
-# coordinator verbs without asking, and only those; they grant nothing (a signed envelope still does), and every
-# other command asks as in any install. The role is meant for an install `levain coord agent` made itself, never a
+# The desk's own install (np-6843ca07 (a), signed by the operator 2026-10-21): Claude Code runs its own
+# desk verbs without asking, and only those; they grant nothing (a signed envelope still does), and every
+# other command asks as in any install. The role is meant for an install `levain desk agent` made itself, never a
 # live install of the operator's: `coord agent` refuses one rather than marking it (marking it would door his own
-# sessions there). The record is also what marks the coordinator's workspace for its door, so it is written for a Codex
-# coordinator workspace as for a Claude Code one; only Claude Code's settings carry the pre-approved verbs.
-ROLE_CHOICES = ("coordinator",)
+# sessions there). The record is also what marks the desk's workspace for its door, so it is written for a Codex
+# desk workspace as for a Claude Code one; only Claude Code's settings carry the pre-approved verbs.
+ROLE_CHOICES = (ROLE_DESK,)
 ROLE_ADAPTERS = ("claude-code", "codex")
-COORDINATOR_VERBS = ("coord", "drops", "thread")
+DESK_VERBS = ("coord", "drops", "thread")
 # Levain's own project MCP servers, the names its .mcp.json render writes (BAND_SERVER and DISPATCH_SERVER are
-# defined with that render; the test pins this tuple against a real coordinator install's .mcp.json keys)
-COORDINATOR_MCP_SERVERS = ("anneal_memory", "levain_band", "levain_dispatch")
+# defined with that render; the test pins this tuple against a real desk install's .mcp.json keys)
+DESK_MCP_SERVERS = ("anneal_memory", "levain_band", "levain_dispatch")
 
 
-def coordinator_levain(python_path: str) -> str:
-    """The command a coordinator runs levain by: ``python_path -P -m levain``, quoted for the shell. The launch brief
+def desk_levain(python_path: str) -> str:
+    """The command a desk runs levain by: ``python_path -P -m levain``, quoted for the shell. The launch brief
     and the allow rules both take it from here, because Claude Code matches an allow rule against the command as
-    written (a bare ``levain coord status`` does not match a rule naming the interpreter, nor the reverse), and a
+    written (a bare ``levain desk status`` does not match a rule naming the interpreter, nor the reverse), and a
     background session's PATH comes from Claude Code's own supervisor, not from Levain, so a bare ``levain`` is not
     a name the session can be relied on to find. ``-P`` keeps the session's directory off ``sys.path``."""
     return f"{shlex.quote(python_path)} -P -m levain"
 
 
-def coordinator_allow(python_path: str) -> tuple[str, ...]:
-    """The coordinator's allow rules, one per verb, each naming :func:`coordinator_levain`."""
-    command = coordinator_levain(python_path)
-    return tuple(f"Bash({command} {verb}:*)" for verb in COORDINATOR_VERBS)
+def desk_allow(python_path: str) -> tuple[str, ...]:
+    """The desk's allow rules, one per verb, each naming :func:`desk_levain`."""
+    command = desk_levain(python_path)
+    return tuple(f"Bash({command} {verb}:*)" for verb in DESK_VERBS)
 
 
-# A bare `Read` (np-5396be49 "5b", 1030-42): the coordinator starts without the user layer, so the user's own `Read`
+# A bare `Read` (np-5396be49 "5b", 1030-42): the desk starts without the user layer, so the user's own `Read`
 # allow is not loaded and a Read outside the workspace stopped at a prompt nobody answers. Read only: Write, Edit,
-# WebFetch and Bash outside the three verbs above still ask. Held apart from coordinator_allow, which is the Bash
+# WebFetch and Bash outside the three verbs above still ask. Held apart from desk_allow, which is the Bash
 # rules the brief and the Codex rule file spell.
-COORDINATOR_READ_ALLOW = ("Read",)
+DESK_READ_ALLOW = ("Read",)
 
 
-def _coordinator_settings(install: Path) -> tuple[str, Any, str]:
-    """``(text, document, problem)`` of the coordinator install's ``.claude/settings.json``. ``problem`` is "" when
+def _desk_settings(install: Path) -> tuple[str, Any, str]:
+    """``(text, document, problem)`` of the desk install's ``.claude/settings.json``. ``problem`` is "" when
     the rules can be merged into it (a JSON object whose ``permissions``, if present, is an object and whose
     ``permissions.allow``, if present, is a list); otherwise it says why, and the file is never written."""
     path = install / ".claude" / "settings.json"
@@ -2818,25 +2819,25 @@ def _coordinator_settings(install: Path) -> tuple[str, Any, str]:
     return text, doc, ""
 
 
-def coordinator_read_rule_state(install: Path) -> tuple[bool, str]:
-    """``(pending, problem)`` for ``install``. ``pending`` is True when it is a Claude Code coordinator install whose
-    project settings do not carry every rule :data:`COORDINATOR_READ_ALLOW` names (an install an earlier release
+def desk_read_rule_state(install: Path) -> tuple[bool, str]:
+    """``(pending, problem)`` for ``install``. ``pending`` is True when it is a Claude Code desk install whose
+    project settings do not carry every rule :data:`DESK_READ_ALLOW` names (an install an earlier release
     made, a settings file with no ``permissions.allow``, or one that cannot be read). ``problem`` is non-empty when
-    the rule cannot be merged in (:func:`add_coordinator_read_rule` refuses): the file wants a hand fix. Any other
+    the rule cannot be merged in (:func:`add_desk_read_rule` refuses): the file wants a hand fix. Any other
     install is ``(False, "")``."""
-    if persisted_role(install) != "coordinator" or effective_adapter(install) != "claude-code":
+    if persisted_role(install) != ROLE_DESK or effective_adapter(install) != "claude-code":
         return False, ""
-    _, doc, problem = _coordinator_settings(install)
+    _, doc, problem = _desk_settings(install)
     if problem:
         return True, problem
     allow = doc.get("permissions", {}).get("allow", [])
-    return any(rule not in allow for rule in COORDINATOR_READ_ALLOW), ""
+    return any(rule not in allow for rule in DESK_READ_ALLOW), ""
 
 
-def coordinator_read_rule_pending(install: Path) -> bool:
-    """:func:`coordinator_read_rule_state`'s ``pending``: `levain update --path` or `levain coord agent claude`
+def desk_read_rule_pending(install: Path) -> bool:
+    """:func:`desk_read_rule_state`'s ``pending``: `levain update --path` or `levain desk agent claude`
     brings a mergeable one."""
-    return coordinator_read_rule_state(install)[0]
+    return desk_read_rule_state(install)[0]
 
 
 def _json_scan_ws(s: str, i: int) -> int:
@@ -2885,20 +2886,20 @@ def _json_member_value(s: str, start: int, key: str) -> int | None:
     return found[-1] if found else None
 
 
-def add_coordinator_read_rule(install: Path) -> bool:
-    """Merge the missing :data:`COORDINATOR_READ_ALLOW` rules into a coordinator install's ``.claude/settings.json``
+def add_desk_read_rule(install: Path) -> bool:
+    """Merge the missing :data:`DESK_READ_ALLOW` rules into a desk install's ``.claude/settings.json``
     ``permissions.allow`` (made when absent), under the install lock, with an atomic write that keeps every other
     byte of the file: an operator's own rules, keys and formatting stay. Nothing else of the install is touched, so a
     hand-edited or receipt-less settings file gets the rule too. Returns whether it wrote; a second run is a no-op.
     Raises :class:`InitError` (never writing) when the file cannot be read or merged, :class:`InstallLockError` when
     another levain process writes the install."""
     with install_lock(install, create=False):
-        text, doc, problem = _coordinator_settings(install)
+        text, doc, problem = _desk_settings(install)
         if problem:
-            raise InitError(f"{problem}; add {', '.join(COORDINATOR_READ_ALLOW)} to permissions.allow by hand")
+            raise InitError(f"{problem}; add {', '.join(DESK_READ_ALLOW)} to permissions.allow by hand")
         perms = doc.get("permissions")
         allow = perms.get("allow", []) if perms is not None else []
-        missing = [rule for rule in COORDINATOR_READ_ALLOW if rule not in allow]
+        missing = [rule for rule in DESK_READ_ALLOW if rule not in allow]
         if not missing:
             return False
         root = _json_scan_ws(text, 0)
@@ -2925,13 +2926,13 @@ def add_coordinator_read_rule(install: Path) -> bool:
         return True
 
 
-def coordinator_deny() -> tuple[str, ...]:
-    """The coordinator's Claude Code deny rules: no edit of its own record (the file that marks its workspace for
+def desk_deny() -> tuple[str, ...]:
+    """The desk's Claude Code deny rules: no edit of its own record (the file that marks its workspace for
     the door) or that file's lock, wherever the door reads one. Claude Code consults ``Edit(path)`` rules for every
     built-in file-editing tool (a ``Write(path)`` rule is accepted and never consulted; code.claude.com/docs/en/permissions,
     "Read and Edit"), and ``//path`` is the absolute-path spelling. A Bash command can still write the file: Claude
     has no OS sandbox here, so this closes the editing tools only."""
-    from levain.coordinator import door
+    from levain.desk import door
 
     files: list[str] = []
     for record in door._record_paths():
@@ -2939,13 +2940,13 @@ def coordinator_deny() -> tuple[str, ...]:
     return tuple(f"Edit(/{f})" for f in dict.fromkeys(files))
 
 
-def installed_coordinator_levain(install: Path, python_path: str) -> str | None:
-    """The spelling ``install``'s own allow rules pre-approve for a coordinator launched from ``python_path``, or None.
+def installed_desk_levain(install: Path, python_path: str) -> str | None:
+    """The spelling ``install``'s own allow rules pre-approve for a desk launched from ``python_path``, or None.
     Never parsed out of the file (Levain never parses a shell command): the rules this interpreter would render are
     looked for as exact strings, then the bare ``levain`` rules an install from before the interpreter was named
     carries. None (a reused install with no recorded role, rules another interpreter wrote, unreadable settings)
     leaves the caller its own spelling, whose commands are asked about, never let through (1021+11 L3 r1-r3)."""
-    if persisted_role(install) != "coordinator":
+    if persisted_role(install) != ROLE_DESK:
         return None              # a reused live install: its rules are the operator's, never read as Levain's
     try:
         allow = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))["permissions"]["allow"]
@@ -2953,8 +2954,8 @@ def installed_coordinator_levain(install: Path, python_path: str) -> str | None:
         return None
     if not isinstance(allow, list):
         return None
-    for command in (coordinator_levain(python_path), "levain"):
-        if all(f"Bash({command} {verb}:*)" in allow for verb in COORDINATOR_VERBS):
+    for command in (desk_levain(python_path), "levain"):
+        if all(f"Bash({command} {verb}:*)" in allow for verb in DESK_VERBS):
             return command
     return None
 
@@ -3005,37 +3006,37 @@ def _write_role(install: Path, role: str, python_path: str, emit: Callable[[str]
     except OSError as e:
         raise InitError(f"could not record the install role in .levain/config.json ({e}).") from e
     if adapter == "claude-code":
-        emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(coordinator_allow(python_path))} "
+        emit(f"  role: {role} → .levain/config.json (Claude Code runs {', '.join(desk_allow(python_path))} "
              "without asking)")
     else:
         emit(f"  role: {role} → .levain/config.json")
 
 
 def _apply_role(settings_text: str, role: str | None, python_path: str) -> str:
-    """``settings_text`` (a rendered Claude Code settings.json) with, when ``role`` is ``coordinator``, the
-    coordinator's allow rules for ``python_path`` appended to ``permissions.allow`` and Levain's own MCP servers
+    """``settings_text`` (a rendered Claude Code settings.json) with, when ``role`` is ``desk``, the
+    desk's allow rules for ``python_path`` appended to ``permissions.allow`` and Levain's own MCP servers
     named in ``enabledMcpjsonServers``; unchanged otherwise.
 
-    The servers (np-be8ebe0a (a), Phill 2026-10-21 "5a"): a coordinator starts in the background, where Claude Code's
+    The servers (np-be8ebe0a (a), Phill 2026-10-21 "5a"): a desk starts in the background, where Claude Code's
     "new MCP servers found" dialog has nobody to answer it, so the session hangs before its brief. Only Levain's own
     servers are named (an operator's server still asks), and Claude Code applies a project's approvals only after the
     directory is trusted, which stays the operator's step."""
-    if role != "coordinator":
+    if role != ROLE_DESK:
         return settings_text
     doc = json.loads(settings_text)
     perms = doc.setdefault("permissions", {})
     allow = perms.setdefault("allow", []) if isinstance(perms, dict) else None
     if not isinstance(allow, list):
         raise InitError("the rendered Claude Code settings carry a permissions.allow that is not a list")
-    allow.extend(rule for rule in (*coordinator_allow(python_path), *COORDINATOR_READ_ALLOW) if rule not in allow)
+    allow.extend(rule for rule in (*desk_allow(python_path), *DESK_READ_ALLOW) if rule not in allow)
     deny = perms.setdefault("deny", [])
     if not isinstance(deny, list):
         raise InitError("the rendered Claude Code settings carry a permissions.deny that is not a list")
-    deny.extend(rule for rule in coordinator_deny() if rule not in deny)
+    deny.extend(rule for rule in desk_deny() if rule not in deny)
     enabled = doc.setdefault("enabledMcpjsonServers", [])
     if not isinstance(enabled, list):
         raise InitError("the rendered Claude Code settings carry an enabledMcpjsonServers that is not a list")
-    enabled.extend(name for name in COORDINATOR_MCP_SERVERS if name not in enabled)
+    enabled.extend(name for name in DESK_MCP_SERVERS if name not in enabled)
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -3690,15 +3691,15 @@ def refresh_adapter(
     out = _refresh_adapter(install, apply=apply, emit=emit, carrier=carrier, messaging=messaging)
     if out.stopped_local:
         return out  # the local-file check stopped the refresh: no re-pin, no consent settings
-    if apply and coordinator_read_rule_pending(install.resolve()):
-        # a hand-edited or receipt-less coordinator settings file is staged above, never written: the one rule is
+    if apply and desk_read_rule_pending(install.resolve()):
+        # a hand-edited or receipt-less desk settings file is staged above, never written: the one rule is
         # merged into the live file instead (the pin covers its hooks and messaging, not permissions)
         try:
-            if add_coordinator_read_rule(install.resolve()):
-                emit(f"  added the {', '.join(COORDINATOR_READ_ALLOW)} allow rule to .claude/settings.json "
-                     "(coordinator)")
+            if add_desk_read_rule(install.resolve()):
+                emit(f"  added the {', '.join(DESK_READ_ALLOW)} allow rule to .claude/settings.json "
+                     "(desk)")
         except InitError as e:
-            emit(f"  the coordinator's Read allow rule is still missing: {e}")
+            emit(f"  the desk's Read allow rule is still missing: {e}")
     if pin_before is not None:
         host_guard.repin_after_levain_write(install.resolve(), pin_before)
     if apply:

@@ -54,7 +54,7 @@ def _positive_seconds(text: str) -> float:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The root parser of the whole CLI, every tree registered (``main`` parses with it; the coordinator door derives
+    """The root parser of the whole CLI, every tree registered (``main`` parses with it; the desk door derives
     its list from it)."""
     parser = argparse.ArgumentParser(
         prog="levain",
@@ -655,7 +655,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_limits_parser(subparsers)
     _add_band_parsers(subparsers)
     _add_dispatch_parsers(subparsers)
-    _add_coordinator_parsers(subparsers)
+    _add_desk_parsers(subparsers)
     _add_observe_parser(subparsers)
     from levain.agents.cli import add_parsers as _add_agents_parsers
     _add_agents_parsers(subparsers)
@@ -1278,7 +1278,7 @@ def build_parser() -> argparse.ArgumentParser:
         "install-feeds",
         help="Install the review-feed runner on a schedule (no model; manage it with its label).",
         description=(
-            "Run `levain coord review feeds` on a cadence: the mechanical feeds and the delivery pass that file the "
+            "Run `levain desk review feeds` on a cadence: the mechanical feeds and the delivery pass that file the "
             "review queue's items. A periodic unit, not kept alive, not started at install. Each run takes a lock, so "
             "a run that outlives the interval, or a manual one, is skipped rather than doubled; each run is "
             "wall-clock bounded. Manage it with the same label: `daemon status|restart|uninstall --label <label>`."
@@ -1477,7 +1477,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dry run only: the YYYY-MM-DD date handoffs are scheduled for with --handoff-to agenda.",
     )
     km_p.set_defaults(func=_cmd_spores_keep_migrate)
-    from levain.coordinator.door import not_door as _not_door
+    from levain.desk.door import not_door as _not_door
 
     _not_door(km_p)
 
@@ -1690,9 +1690,9 @@ def main(argv: list[str] | None = None) -> int:
         # that serves none, so it is refused before anything binds
         if (args.sign_queue_dir is None) != (args.sign_host is None):
             parser.error("--sign-queue-dir and --sign-host go together: pass both or neither")
-    # inside the coordinator's workspace the CLI keeps to the coordinator's door, in every tree
-    # (levain.coordinator.door): decided by where this runs, never by a session variable
-    from levain.coordinator.door import refusal
+    # inside the desk's workspace the CLI keeps to the desk's door, in every tree
+    # (levain.desk.door): decided by where this runs, never by a session variable
+    from levain.desk.door import refusal
 
     refused = refusal(parser, args)
     if refused is not None:
@@ -2991,10 +2991,10 @@ def _add_dispatch_parsers(subparsers: argparse._SubParsersAction) -> None:
     add_parsers(subparsers)
 
 
-def _add_coordinator_parsers(subparsers: argparse._SubParsersAction) -> None:
-    """``levain drop``, ``levain drops`` and ``levain thread``: the coordinator's drops and threads
-    (``levain.coordinator.cli``)."""
-    from levain.coordinator.cli import add_parsers
+def _add_desk_parsers(subparsers: argparse._SubParsersAction) -> None:
+    """``levain drop``, ``levain drops`` and ``levain thread``: the desk's drops and threads
+    (``levain.desk.cli``)."""
+    from levain.desk.cli import add_parsers
 
     add_parsers(subparsers)
 

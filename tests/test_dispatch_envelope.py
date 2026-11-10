@@ -1,6 +1,6 @@
 """F11-C, authority (C): a contract filed inside an envelope (cause ``envelope``, the binding read from the envelope
 object inside the filing transaction), its slot taken under that object, and its land through it
-(:class:`levain.dispatch.adopt.Envelope`, faked here: the coordinator implements it), plus each refusal. Every
+(:class:`levain.dispatch.adopt.Envelope`, faked here: the desk implements it), plus each refusal. Every
 envelope write takes ONE object: its evidence is the binding and its precondition the check (L3 r1 codex 3). A REAL
 tmp job store and a REAL git repository; the residue runs these cases come from are
 project_memory/1020-f11/f11c_run/RUN.txt and RUN_r2.txt."""
@@ -37,7 +37,7 @@ class Clock:
 
 
 class FakeEnvelope:
-    """The coordinator's envelope object, faked: live until killed, ``where`` one repo and paths, one thread, a
+    """The desk's envelope object, faked: live until killed, ``where`` one repo and paths, one thread, a
     refusal line when set, a signer-class ceiling."""
 
     def __init__(self, env_id, repo, *, thread="thread-1", paths=PATHS):
@@ -242,7 +242,7 @@ def test_a_contract_outside_the_envelopes_where_is_refused(store, repo, repo_nar
 
 def test_a_precondition_that_raises_writes_nothing(store, repo, env):
     def boom(conn, now, job):
-        raise RuntimeError("the coordinator store cannot be read")
+        raise RuntimeError("the desk store cannot be read")
     env.precondition = boom
     with pytest.raises(RuntimeError):
         file_env(store, repo, env)

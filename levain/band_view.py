@@ -24,7 +24,7 @@ at the head of the next band; ``levain band answer`` is the same path (refused i
 question with a Link is the one AUTHORITY kind S2 can see: shorthand records nothing on it (S3 routes it to its sheet).
 
 Known edges, none built against (later slices): ``closed N`` is shown once for the store, to the first hook that
-renders it (the viewer's own delta is separate); no source but questions; a question the coordinator holds as first
+renders it (the viewer's own delta is separate); no source but questions; a question the desk holds as first
 reader is shown as any other. ``levain band`` numbers what it shows (a first show) but consumes no ``closed``.
 A seat with no non-empty string ``session_id`` (``levain verify-hooks``) gets no band and consumes nothing.
 Also known: (1) Codex hooks (SessionStart, UserPromptSubmit, and the Stop verifier) are installed from S4. (2) Two hooks rendering at once may both show
@@ -58,10 +58,11 @@ from typing import Any, NamedTuple, Protocol
 
 from levain.band_shorthand import ItemInfo, Parse, Refusal, View, parse
 from levain.band_sources import Extra, Extras, NotOffered, read_extras, sheet_text
-from levain.coordinator.review import require_aware_now
+from levain.desk.review import require_aware_now
 from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.questions import (ANSWER_CHANNELS, HOOK_BUSY_MS, _TEXT_MAX, Answer, Question, QuestionStore, _answer_of, _now_utc,
                                      _select, later_date, local_today, open_ended_of, read_deadline)
+from levain.desk.legacy import FACT_DESK_WAKE, ROLE_DESK
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
            "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
@@ -495,7 +496,7 @@ def render_full(store: QuestionStore | None = None, *, deadline: float | None = 
     """:func:`render_with_closed` plus what the view row needs (:class:`Rendered`). ``deadline``
     (``time.monotonic()``; default now + HOOK_BUSY_MS) bounds EVERY wait of the render: the question snapshots, the
     authority sources' stores and a first-time setup of the question store; a store held past it is said ("! not
-    read") or leaves numbers pending, never a stalled prompt. ``coord_conn``: a coordinator snapshot the caller holds
+    read") or leaves numbers pending, never a stalled prompt. ``coord_conn``: a desk snapshot the caller holds
     (the morning card's), read instead of a second one. ``numbering=False``: a pure read: an item with no number yet is
     listed ``new (number pending):`` and nothing is written (the default numbers it, one bounded write). ``now`` (an
     aware datetime; default ``None`` = the wall clock): every expiry of the authority sources is judged at it and none
@@ -1541,8 +1542,8 @@ def band_snapshot_readonly(store: Any, deadline: float | None = None, *, now: da
     consent hold, a budget or sign request's) is judged at ``now`` and no wall clock is read, so the output is a
     function of the stores and ``now``. No wall-clock value reaches the output: ``time.time_ns()`` (the snapshot's
     ``gen``, not returned) and ``time.monotonic()`` (the lock-wait bound) are read and are not outputs.
-    ``coord_conn``: a coordinator read transaction the caller already holds, read instead of a second one (the
-    coordinator reads then share the caller's snapshot, as :func:`render_full`'s do). It may RAISE on a questions
+    ``coord_conn``: a desk read transaction the caller already holds, read instead of a second one (the
+    desk reads then share the caller's snapshot, as :func:`render_full`'s do). It may RAISE on a questions
     store it cannot read: ``QuestionStoreError`` (a store directory reachable by group or others) or
     ``sqlite3.OperationalError`` (a ``questions.db`` on a read-only file or directory: sqlite would write its WAL
     index); it does not degrade to an empty band. A caller that must not fail on it (``open_brief``) catches
@@ -2557,31 +2558,31 @@ class SeatFact(NamedTuple):
 def seat_fact(session_id: str, queue_dir: Path | str | None = None,
               environ: Mapping[str, str] | None = None, busy_s: float | None = None) -> SeatFact:
     """Whether no human turn can reach this seat (D4), with the launch row it was read from. The first fact found
-    decides: (1) the Levain launch row of the harness session (a coordinator is attended; a worker is not: the only
+    decides: (1) the Levain launch row of the harness session (a desk is attended; a worker is not: the only
     worker Levain launches is the dispatch executor, and the row carries no worker kind, so a ``session`` worker will
     need its kind read here when its brief lands); (2) the ``LEVAIN_SEAT=autonomous|attended`` marker Levain sets on
     the processes it starts (or the user on their own script); (3) neither: NOT autonomous (fail-safe: a band shown
     where nobody reads it costs tokens, a band missing from a human seat drops questions). Grants and posture never
-    decide it. ``busy_s`` (default HOOK_BUSY_MS) bounds the wait on a held coordinator store; past it there is no
+    decide it. ``busy_s`` (default HOOK_BUSY_MS) bounds the wait on a held desk store; past it there is no
     launch fact."""
     if "#agent:" in session_id:
         return SeatFact(True)                 # a subagent never renders: the band belongs to the session's main thread
     try:
-        from levain.coordinator import lease
-        from levain.coordinator.store import CoordStore
+        from levain.desk import lease
+        from levain.desk.store import CoordStore
         conn = CoordStore(queue_dir).open_readonly(busy_s=HOOK_BUSY_MS / 1000 if busy_s is None else busy_s)
         try:
             ln = lease.by_harness_session(conn, session_id)
         finally:
             conn.close()
-    except Exception:                         # no coordinator store, or not one to read: no launch fact
+    except Exception:                         # no desk store, or not one to read: no launch fact
         ln = None
     return _fact_of(ln, environ)
 
 
 def _fact_of(ln: Any, environ: Mapping[str, str] | None) -> SeatFact:
     """:func:`seat_fact`'s decision from a launch row already read (or ``None``)."""
-    if ln is not None and ln.role == "coordinator":
+    if ln is not None and ln.role == ROLE_DESK:
         return SeatFact(False, ln.role, getattr(ln, "launch_id", None))
     if ln is not None and ln.role == "worker":
         return SeatFact(True, ln.role, getattr(ln, "launch_id", None))
@@ -2596,7 +2597,7 @@ def is_autonomous(session_id: str, queue_dir: Path | str | None = None,
 
 
 def wake_marker(launch_id: str) -> str:
-    """The first line of a coordinator launch's first prompt (``launch._prompt``): it names the launch."""
+    """The first line of a desk launch's first prompt (``launch._prompt``): it names the launch."""
     return f"[levain wake {launch_id}]"
 
 
@@ -2605,14 +2606,14 @@ _WAKE_PREFIX = "[levain wake ln-"
 
 
 def turn_kind(prompt: Any, fact: SeatFact, environ: Mapping[str, str]) -> str:
-    """``coordinator-wake`` (the prompt's first line is exactly the marker of the launch row this session has, and
-    that row is a coordinator's), ``relay`` (:func:`_is_relay`: another Levain-written line, whatever the seat) or
+    """``FACT_DESK_WAKE`` (levain.desk.legacy) (the prompt's first line is exactly the marker of the launch row this session has, and
+    that row is a desk's), ``relay`` (:func:`_is_relay`: another Levain-written line, whatever the seat) or
     ``operator``. Provenance plus role, never a text prefix alone: the marker on any other session is the operator's."""
     if not isinstance(prompt, str):
         return "operator"
     first = prompt.lstrip().split("\n", 1)[0].strip()
-    if fact.role == "coordinator" and fact.launch_id and first == wake_marker(fact.launch_id):
-        return "coordinator-wake"
+    if fact.role == ROLE_DESK and fact.launch_id and first == wake_marker(fact.launch_id):
+        return FACT_DESK_WAKE
     return "relay" if _is_relay(prompt, environ) else "operator"
 
 
@@ -2640,9 +2641,9 @@ def hook_prompt(payload: Any, environ: Mapping[str, str] | None = None, agent: s
     empty band or ANY error before anything was recorded; it never raises (``commit`` neither). A render that fails
     AFTER an answer was recorded still returns the echo: what was recorded is said. The turn is classified ONCE
     (:func:`_turn_fact`) and that fact is the turn record the Stop hook and the transcript read (:func:`_write_turn`),
-    written as soon as the session is known, before the hook's other returns. A coordinator wake returns only :data:`WAKE_LINE` with a no-op commit. A
-    coordinator session's viewer is the role (:data:`COORDINATOR_VIEWER`), and its ``commit()`` only stages the view
-    for the Stop hook (:func:`_stop_coordinator`)."""
+    written as soon as the session is known, before the hook's other returns. A desk wake returns only :data:`WAKE_LINE` with a no-op commit. A
+    desk session's viewer is the role (:data:`DESK_VIEWER`), and its ``commit()`` only stages the view
+    for the Stop hook (:func:`_stop_desk`)."""
     t0 = time.monotonic()
     # ONE bound for the whole hook (S3 fix round 2, codex 4/5): the launch-row read, every snapshot (questions and
     # the authority sources), the answers' write, a first-time setup, the render's numbering, then the view row.
@@ -2670,7 +2671,7 @@ def _hook_prompt(payload: Any, environ: Mapping[str, str] | None, deadline: floa
     except Exception:
         return "", _no_commit
     viewer, coord = fact.viewer, fact.coord
-    if fact.kind == "coordinator-wake":
+    if fact.kind == FACT_DESK_WAKE:
         return WAKE_LINE, _no_commit                # silent: no parse, no render, no view, no `closed` notice
     if coord:
         _clear_staged(directory, session)        # a turn of this session that never reached Stop leaves no view to commit
@@ -2712,7 +2713,7 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
     if coord:
         # the work delta rides ahead of the band, inside the one block Stop verifies; its cursor commits with the view
         try:
-            from levain.coordinator import work_delta
+            from levain.desk import work_delta
 
             work = work_delta.read_block(directory, viewer, deadline - time.monotonic())
             work_text, work_through, work_store = work.text, work.through, work.store_id
@@ -2726,7 +2727,7 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
         text = echo + ("\n" + text if text else "")
 
     def commit() -> None:
-        if coord:                             # the coordinator's view is the Stop hook's to commit, after the reply verifies
+        if coord:                             # the desk's view is the Stop hook's to commit, after the reply verifies
             _stage_view(directory, session, r, block, work_through, work_store, intake_open, intake_lines)
             return
         try:
@@ -2741,12 +2742,12 @@ def _hook_render(store: QuestionStore, directory: Path | str, session: str, view
     return text, commit
 
 
-COORDINATOR_VIEWER = "coordinator"
+DESK_VIEWER = ROLE_DESK
 
 
 class TurnFact(NamedTuple):
     """One hook call's classification, from ONE launch-row read (:func:`_turn_fact`): the turn ``kind``
-    (:func:`turn_kind`), the band ``viewer``, whether that is the coordinator's role viewer (``coord``: its view is
+    (:func:`turn_kind`), the band ``viewer``, whether that is the desk's role viewer (``coord``: its view is
     staged at the prompt and committed at Stop) and whether the seat gets the band at all (``band``)."""
     kind: str
     viewer: str
@@ -2766,10 +2767,10 @@ def _marker_id(prompt: Any) -> str | None:
 
 def _turn_fact(session: str, prompt: Any, directory: Path | str, env: Mapping[str, str], agent: str,
                busy_s: float | None) -> TurnFact:
-    """The turn's one fact. ONE open of the coordinator store, waiting at most ``busy_s``: the session's launch row
+    """The turn's one fact. ONE open of the desk store, waiting at most ``busy_s``: the session's launch row
     and, for a prompt whose first line is a wake marker, the launch the marker names. The marker is the launch's
     provenance, because ``claude --bg`` (and Codex's ``turn/start``) submit the first prompt before
-    ``launch_activate`` binds the session to its launch: a wake is the marker of a COORDINATOR launch that is unbound
+    ``launch_activate`` binds the session to its launch: a wake is the marker of a DESK launch that is unbound
     or bound to this session, on a session bound to no other launch. Anything unreadable: no launch fact, so no wake
     and the per-session viewer (the turn gets today's band). Never raises for a store that cannot be read."""
     if "#agent:" in session:
@@ -2777,8 +2778,8 @@ def _turn_fact(session: str, prompt: Any, directory: Path | str, env: Mapping[st
     own = named = None
     want = _marker_id(prompt)
     try:
-        from levain.coordinator import lease
-        from levain.coordinator.store import CoordStore
+        from levain.desk import lease
+        from levain.desk.store import CoordStore
 
         conn = CoordStore(directory).open_readonly(busy_s=HOOK_BUSY_MS / 1000 if busy_s is None else busy_s)
         try:
@@ -2787,18 +2788,18 @@ def _turn_fact(session: str, prompt: Any, directory: Path | str, env: Mapping[st
                 named = lease.launch(conn, want)
         finally:
             conn.close()
-    except Exception:                         # no coordinator store, or not one to read: no launch fact
+    except Exception:                         # no desk store, or not one to read: no launch fact
         own = named = None
-    if (named is not None and named.role == "coordinator"
+    if (named is not None and named.role == ROLE_DESK
             and named.harness_session_id in (None, session)
             and (own is None or own.launch_id == named.launch_id)):
         kind = turn_kind(prompt, SeatFact(False, named.role, named.launch_id), env)
-        if kind == "coordinator-wake":
-            return TurnFact(kind, COORDINATOR_VIEWER, True, True)
+        if kind == FACT_DESK_WAKE:
+            return TurnFact(kind, DESK_VIEWER, True, True)
     fact = _fact_of(own, env)
     kind = turn_kind(prompt, SeatFact(fact.autonomous), env)   # no launch to wake: operator or relay
-    if fact.role == "coordinator":
-        return TurnFact(kind, COORDINATOR_VIEWER, True, True)
+    if fact.role == ROLE_DESK:
+        return TurnFact(kind, DESK_VIEWER, True, True)
     return TurnFact(kind, f"{agent}:{session}", False, not fact.autonomous)
 
 
@@ -2837,10 +2838,10 @@ def _remove_if(f: Path, expect: bytes | None) -> None:
 
 def _stage_view(directory: Path | str, session: str, r: "Rendered", block: str, work: int = 0,
                 store_id: str = "", intake_open: int = 0, intake_lines: tuple = ()) -> None:
-    """Keep the view a coordinator turn was just shown for its Stop hook to commit: one record per SESSION (two
-    coordinator sessions alive at once never share one), replaced atomically. ``work``: the work cursor
-    (:mod:`levain.coordinator.work_delta`) that commits with the view (0: it does not move), and ``store_id`` the
-    coordinator store it was read from (the advance refuses another). ``intake_open``: the operator open whose intake
+    """Keep the view a desk turn was just shown for its Stop hook to commit: one record per SESSION (two
+    desk sessions alive at once never share one), replaced atomically. ``work``: the work cursor
+    (:mod:`levain.desk.work_delta`) that commits with the view (0: it does not move), and ``store_id`` the
+    desk store it was read from (the advance refuses another). ``intake_open``: the operator open whose intake
     card the block carries, recorded with the cursor (0: none), and ``intake_lines`` the card's lines as they stand in the
     block (taken out of it if another delivery shows the card first). Never raises."""
     try:
@@ -2873,13 +2874,13 @@ def _read_staged(directory: Path | str, session: str) -> tuple[dict, bytes] | No
         return None
 
 
-def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, payload: dict, message: str,
+def _stop_desk(directory: Path | str, store: QuestionStore, viewer: str, payload: dict, message: str,
                       deadline: float | None = None) -> str | None:
-    """The coordinator viewer's Stop: the view this session's prompt hook staged commits only once the reply reprints
+    """The desk viewer's Stop: the view this session's prompt hook staged commits only once the reply reprints
     it (:func:`_reprint_check`), so a turn that never produced a verified reply leaves the cursor where it was and the
     next reply repeats the delta. A view with nothing open still verifies when it carries a block (``NEEDS YOU · 0
     open`` and its delta), and so does a block of work lines alone (the early return on an empty band never applied to
-    this viewer). The work delta (:mod:`levain.coordinator.work_delta`) is the front of the stored block, so the same
+    this viewer). The work delta (:mod:`levain.desk.work_delta`) is the front of the stored block, so the same
     check covers its lines, and the operator's work cursor advances in this commit and nowhere else. One block per view,
     as on every seat; the continuation that carries the reprint commits. The stage is removed by compare-and-delete:
     only the record this Stop read."""
@@ -2895,7 +2896,7 @@ def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, 
         ok = not missing and not altered
     if ok:
         if st["intake_open"] > 0:             # the card is shown once: recorded only now the block was reprinted
-            from levain.coordinator import intake
+            from levain.desk import intake
 
             left = HOOK_BUSY_MS / 1000 if deadline is None else deadline - time.monotonic()
             won = intake.record_outcome(directory, st["intake_open"], "terminal", session, left, st["store_id"])
@@ -2916,7 +2917,7 @@ def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, 
         except Exception:
             pass
         if st["work"] > 0:                    # the work cursor moves with the view, only now the block was reprinted
-            from levain.coordinator import work_delta
+            from levain.desk import work_delta
 
             left = HOOK_BUSY_MS / 1000 if deadline is None else deadline - time.monotonic()
             work_delta.advance(directory, viewer, st["work"], left, st["store_id"])
@@ -2924,7 +2925,7 @@ def _stop_coordinator(directory: Path | str, store: QuestionStore, viewer: str, 
         return None
     if payload.get("stop_hook_active") or not _claim_retry(directory, viewer, st["gen"]):
         return None
-    from levain.coordinator import work_delta
+    from levain.desk import work_delta
 
     # the check wants the work lines at the front of the block: a retry that named only the band would fail it again
     work = st["block"].startswith(work_delta.HEAD)
@@ -2940,7 +2941,7 @@ _STALE_CARD_REASON = ("[Levain NEEDS YOU band] The arrival card in the block you
 def _without_card(block: str, card: list[str]) -> str:
     """``block`` with the contiguous ``card`` lines taken out (``block`` unchanged when they are not found as given), and
     the work head with them when it is left over nothing (``0 of 0``, no line under it)."""
-    from levain.coordinator import work_delta
+    from levain.desk import work_delta
 
     lines = block.split("\n")
     n = len(card)
@@ -2967,14 +2968,14 @@ def _restage(directory: Path | str, session: str, st: dict, block: str) -> bool:
 
 
 def _reprint_reason(missing: list[int], *, work: bool = False, band: bool = True) -> str:
-    """The one retry's words, naming what :func:`_reprint_check` checks: the band, and with ``work`` the coordinator's
+    """The one retry's words, naming what :func:`_reprint_check` checks: the band, and with ``work`` the desk's
     work lines ahead of it (``band`` False: a block of work lines alone)."""
     what = ("the items " + ", ".join(str(n) for n in missing)) if missing else "the band as given (header line or items altered)"
     if not work:
         return (f"[Levain NEEDS YOU band] Your reply dropped {what} of the NEEDS YOU band you were given. Reprint the "
                 "whole band once, exactly as Levain gave it (the band@ line and every numbered item, unchanged), at "
                 "the end of your reply. Do not answer or renumber any item.")
-    from levain.coordinator import work_delta
+    from levain.desk import work_delta
 
     if not missing:
         what = "the block as given (its work lines" + (", the band's header line or items" if band else "") + " altered)"
@@ -2994,7 +2995,7 @@ def _prompt_sha(prompt: Any) -> str | None:
 def _write_turn(directory: Path | str, session: str, fact: TurnFact, prompt: Any) -> None:
     """The turn record (``{kind, viewer, coord, band, session, at, sha}``, one file per session, replaced atomically):
     this prompt's :class:`TurnFact`, which the Stop hook and the transcript read instead of deciding again. ``sha``
-    names the prompt it was written for. A record lives until its own session's Stop removes it (a live coordinator
+    names the prompt it was written for. A record lives until its own session's Stop removes it (a live desk
     launch keeps its record while another launch prompts); a record nobody removed is collected by age
     (:func:`_gc_turns`). Never raises."""
     try:
@@ -3035,10 +3036,10 @@ def _read_turn(directory: Path | str, session: str) -> tuple[dict, bytes] | None
 
 
 def _fresh_wake(directory: Path | str, session: str, rec: dict | None) -> bool:
-    """True only when ``rec`` (this session's turn record) says ``coordinator-wake`` and no view this session staged
+    """True only when ``rec`` (this session's turn record) says ``FACT_DESK_WAKE`` (levain.desk.legacy) and no view this session staged
     is as new as it (a later turn's render whose own record was never written makes the wake stale). Both clocks are
     ``time.time_ns()``: the record's ``at`` and a render's ``gen`` (:func:`render_full`)."""
-    if rec is None or rec["kind"] != "coordinator-wake":
+    if rec is None or rec["kind"] != FACT_DESK_WAKE:
         return False
     got = _read_staged(directory, session)
     return got is None or got[0]["gen"] < rec["at"]
@@ -3046,7 +3047,7 @@ def _fresh_wake(directory: Path | str, session: str, rec: dict | None) -> bool:
 
 def turn_log_kind(payload: Any, kind: str, environ: Mapping[str, str] | None = None, agent: str = "claude_code") -> str:
     """The transcript kind for this turn's line: ``wake`` for a prompt (``kind="prompt"``) or ``wake_reply`` for a
-    reply (``kind="reply"``) when the turn is a coordinator wake, else ``kind``. It reads the turn record only, never
+    reply (``kind="reply"``) when the turn is a desk wake, else ``kind``. It reads the turn record only, never
     a store: for a prompt, a wake record written for this very prompt (its ``sha``); for a reply, the Stop hook's own
     test (:func:`_fresh_wake`). Never raises."""
     try:
@@ -3059,7 +3060,7 @@ def turn_log_kind(payload: Any, kind: str, environ: Mapping[str, str] | None = N
         rec = got[0] if got is not None else None
         if kind == "prompt":
             sha = _prompt_sha(payload.get("prompt"))
-            return "wake" if rec is not None and rec["kind"] == "coordinator-wake" and sha and rec.get("sha") == sha else kind
+            return "wake" if rec is not None and rec["kind"] == FACT_DESK_WAKE and sha and rec.get("sha") == sha else kind
         return "wake_reply" if _fresh_wake(directory, session, rec) else kind
     except Exception:
         return kind
@@ -3174,8 +3175,8 @@ def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str
     unreadable (no view, a non-text reply, an autonomous seat, a busy or missing store). Which turn this was, and its
     viewer, come from the turn record its prompt hook wrote (:func:`_read_turn`), never decided again; a missing or
     unreadable record is decided by one launch-row read and VERIFIES. The one skip beyond those: a fresh
-    coordinator-wake record (:func:`_fresh_wake`). A coordinator session is checked against the view its prompt hook
-    staged, which commits here (:func:`_stop_coordinator`). Every store read and the view's write wait within ONE bound
+    desk-wake record (:func:`_fresh_wake`). A desk session is checked against the view its prompt hook
+    staged, which commits here (:func:`_stop_desk`). Every store read and the view's write wait within ONE bound
     (HOOK_BUSY_MS); the ``closed`` notices' write keeps its own (:func:`mark_closed_shown`). A turn that ends here
     removes its record (compare-and-delete). Never raises, never writes the operator's data beyond
     that commit."""
@@ -3216,10 +3217,10 @@ def _stop_turn(directory: Path | str, fact: TurnFact, rec: dict | None, payload:
     if not fact.band:
         return None
     if _fresh_wake(directory, payload["session_id"], rec):
-        return None                                      # a coordinator wake: nobody is waiting on this reply
+        return None                                      # a desk wake: nobody is waiting on this reply
     store = QuestionStore(directory)
     if fact.coord:
-        return _stop_coordinator(directory, store, fact.viewer, payload, message, deadline)
+        return _stop_desk(directory, store, fact.viewer, payload, message, deadline)
     if payload.get("stop_hook_active"):
         return None
     got = _view_row(store, fact.viewer)

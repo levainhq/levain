@@ -4,7 +4,7 @@ Q-D2 (a), decided 10-30: a card with a non-empty ``his`` (an unresolved contradi
 ``authority_relevant = 1``; a consolidated card with only ``own``, a did-not-consolidate card, a ``recovered:
 committed, not recorded`` card and a ``recovered: committed after stop`` card each file ``authority_relevant = 0``.
 
-Cards are filed into a scratch coordinator store. The ``agent`` feed is P8's (``review.FEEDS`` on main does not carry
+Cards are filed into a scratch desk store. The ``agent`` feed is P8's (``review.FEEDS`` on main does not carry
 it), so these tests file under ``digest``, an existing feed: the bit and the bound are the feed's to enforce alike.
 """
 from __future__ import annotations
@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 
 from levain.contracts.canon import canonical
-from levain.coordinator import review
-from levain.coordinator.store import CoordStore
+from levain.desk import review
+from levain.desk.store import CoordStore
 from levain.dream import card as cd
 from levain.dream import recover as rc
 from levain.dream import snapshot as sn

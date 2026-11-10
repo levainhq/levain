@@ -37,7 +37,7 @@ def test_a_desk_message_ends_away_and_sleep_never_quiet_or_loud_and_counts_as_in
     later = presence.should_push(q, "ping", now=NOW + 700, idle=HID_IDLE, suggest=False)
     assert later.push is True
     rows = [r for r in _log(q) if r.get("word") == "desk-message"]
-    assert rows and rows[-1]["via"] == "test-hook" and rows[-1]["by"]["role"] == "desk"      # a coordinator can wake on this row
+    assert rows and rows[-1]["via"] == "test-hook" and rows[-1]["by"]["role"] == "desk"      # a desk can wake on this row
     assert [r["why"] for r in rows if r.get("why")] == ["ended away", "ended sleep"]
 
 

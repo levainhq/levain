@@ -14,6 +14,7 @@ from levain.agents import session as S
 from levain.agents import session_wire as W
 from tests.test_agents_run_by_executor import _session_occurrence as _signed_occurrence
 from tests.test_agents_session_launch import Stub, rig  # noqa: F401
+from levain.desk.legacy import ROLE_DESK
 
 
 def _session_occurrence(rig, **kw):
@@ -72,7 +73,7 @@ def test_a_launcher_that_is_not_a_session_launcher_is_refused(rig, monkeypatch):
 
 def test_a_registered_launcher_off_the_dispatch_route_is_refused(rig, monkeypatch):
     oid = _session_occurrence(rig)
-    stub = Stub(route="coordinator")
+    stub = Stub(route=ROLE_DESK)
     W.register_launcher("odd", lambda store: stub)
     _install(rig, launcher="odd")
     assert _fire(rig, oid, monkeypatch) == 1

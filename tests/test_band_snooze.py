@@ -341,9 +341,9 @@ def test_a_held_ping_is_not_sent_before_the_snooze_ends_and_goes_on_its_day(tmp_
     from tests.test_questions_held_ping import Desk
 
     desk = Desk(tmp_path, monkeypatch)                                    # Thu 2026-10-22 17:00 in New York
-    desk.coordinator()
+    desk.desk()
     q, _ = desk.ask()
-    assert desk.sent == []                                                # held: a coordinator holds the live lease
+    assert desk.sent == []                                                # held: a desk holds the live lease
     QuestionStore(desk.dir, clock=lambda: desk.now[0]).snooze(q.id, until="2026-10-24", channel="cli", via="cli")
     desk.later(minutes=10)                                                # unread past 10 minutes: would ping now
     assert consent_band.release_held_pings(desk.dir) == [] and desk.sent == []
@@ -359,11 +359,11 @@ def test_a_snooze_that_lands_after_the_release_reads_the_question_still_holds_th
     """L3 (codex MED): the release worker read the question unsnoozed, the operator snoozed it, and the claim then
     released and pinged on that stale read. The decision is revalidated at the claim, under the question store's
     write lock, so the snooze (which takes that lock) lands wholly before it or wholly after."""
-    from levain.coordinator import first_reader
+    from levain.desk import first_reader
     from tests.test_questions_held_ping import Desk
 
     desk = Desk(tmp_path, monkeypatch)
-    desk.coordinator()
+    desk.desk()
     q, _ = desk.ask()
     desk.later(minutes=10)                                                # unread past 10 minutes: would ping now
     real = first_reader._questions
@@ -390,11 +390,11 @@ def test_a_snooze_that_lands_after_the_release_reads_the_question_still_holds_th
 def test_an_escalated_then_snoozed_question_pings_once_on_its_day(tmp_path, monkeypatch):
     """L3 (deepseek, not a defect): the escalation's release is the one release row, so a snooze defers it and the
     day's ping goes out once, never twice."""
-    from levain.coordinator import first_reader as fr
+    from levain.desk import first_reader as fr
     from tests.test_questions_held_ping import Desk
 
     desk = Desk(tmp_path, monkeypatch)
-    tok = desk.coordinator()
+    tok = desk.desk()
     q, _ = desk.ask()
     fr.escalate(desk.store, q.id, "outside its envelope", token=tok)
     QuestionStore(desk.dir, clock=lambda: desk.now[0]).snooze(q.id, until="2026-10-24", channel="cli", via="cli")
@@ -506,11 +506,11 @@ class _Date:
 
 
 def test_a_held_due_row_that_stays_held_takes_no_write_lock(tmp_path, monkeypatch):
-    from levain.coordinator import first_reader
+    from levain.desk import first_reader
     from tests.test_questions_held_ping import Desk
 
     desk = Desk(tmp_path, monkeypatch)
-    desk.coordinator()
+    desk.desk()
     q, _ = desk.ask()
     QuestionStore(desk.dir, clock=lambda: desk.now[0]).snooze(q.id, until="2026-10-24", channel="cli", via="cli")
     desk.later(minutes=10)                                                # due in the table, held by the snooze
@@ -520,18 +520,18 @@ def test_a_held_due_row_that_stays_held_takes_no_write_lock(tmp_path, monkeypatc
 
 # --- the claim's pre-read: a missing db, a failed read, a purged question ----------------------------------------------
 def test_the_due_pre_read_of_a_missing_db_is_nothing_due_not_a_crash(tmp_path):
-    from levain.coordinator import first_reader
+    from levain.desk import first_reader
 
     assert first_reader._read_due(tmp_path / "no-such-dispatch.db") == []
     assert first_reader.claim_held(tmp_path) == []                       # a fresh directory with no db either
 
 
 def test_a_failed_pre_read_falls_through_to_the_locked_path_and_drops_no_due_row(tmp_path, monkeypatch):
-    from levain.coordinator import first_reader
+    from levain.desk import first_reader
     from tests.test_questions_held_ping import Desk
 
     desk = Desk(tmp_path, monkeypatch)
-    desk.coordinator()
+    desk.desk()
     q, _ = desk.ask()
     desk.later(minutes=10)                                                # unread past 10 minutes: due
     monkeypatch.setattr(first_reader, "_read_due", lambda db: None)       # BUSY / corruption: a distinct failure
@@ -539,11 +539,11 @@ def test_a_failed_pre_read_falls_through_to_the_locked_path_and_drops_no_due_row
 
 
 def test_a_dispatch_row_whose_question_was_purged_is_released_answered_and_pings_nobody(tmp_path, monkeypatch):
-    from levain.coordinator import first_reader
+    from levain.desk import first_reader
     from tests.test_questions_held_ping import Desk
 
     desk = Desk(tmp_path, monkeypatch)
-    desk.coordinator()
+    desk.desk()
     q, _ = desk.ask()
     desk.later(minutes=10)
     # the questions table is append-only by trigger, so the purge is modelled where it is observed: the read

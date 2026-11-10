@@ -1,5 +1,5 @@
-"""Board row 153: the cockpit lists coordinator envelopes and ends one with a passkey-signed revoke
-(:class:`levain.coordinator.envelope_revoke.EnvelopeRevoke`), the grant revoke's own ceremony and gate over the store the
+"""Board row 153: the cockpit lists desk envelopes and ends one with a passkey-signed revoke
+(:class:`levain.desk.envelope_revoke.EnvelopeRevoke`), the grant revoke's own ceremony and gate over the store the
 Signer's queue names. Scratch stores only: envelopes are seeded straight into a store in tmp (the store's signature
 checks are not what is under test), and the passkey is the dispatch tests' software authenticator."""
 from __future__ import annotations
@@ -18,8 +18,8 @@ from levain import authority as auth
 from levain.consent.answering import passkey_keys
 from levain.consent.queue import authority_source
 from levain.consent.sign import Signer
-from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.envelope_revoke import NAMESPACE, EnvelopeRevoke
+from levain.desk.envelopes import EnvelopeStore
+from levain.desk.envelope_revoke import NAMESPACE, EnvelopeRevoke
 from tests.test_cockpit_sign_routes import _call, _serving
 from tests.test_grant_phone import RP, world  # noqa: F401  (world is a fixture)
 from tests.test_dispatch_phone import SoftPasskey
@@ -174,7 +174,7 @@ def test_killed_and_expired_envelopes_answer_a_plain_refusal(world, tmp_path) ->
 
 
 def test_the_store_comes_from_the_signers_queue_not_the_readers_directory(world, tmp_path) -> None:
-    """Flow's bridge swaps the consent reader for one with no ``directory`` (hide_coordinator_panels); the envelope routes
+    """Flow's bridge swaps the consent reader for one with no ``directory`` (hide_desk_panels); the envelope routes
     must not depend on it."""
     _seed(world.qdir)
 
@@ -293,7 +293,7 @@ def test_a_store_fault_in_the_ceremony_is_a_plain_refusal_not_a_500(world, tmp_p
 
 def test_the_signed_kill_leaves_its_proof_in_the_audit_line(world, tmp_path, caplog) -> None:
     _seed(world.qdir)
-    caplog.set_level(logging.INFO, logger="levain.coordinator.envelope_revoke")
+    caplog.set_level(logging.INFO, logger="levain.desk.envelope_revoke")
     with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
         row = _row(url)
         q = urllib.parse.quote(EID, safe="")
@@ -460,7 +460,7 @@ def test_threads_counts_distinct_threads_across_a_rebind(world, tmp_path) -> Non
 def test_an_envelope_that_ends_after_the_signature_says_so_and_logs_the_nonce(world, tmp_path, caplog) -> None:
     """deepseek LOW-5 / complement MED-LOW-1: after a verified signature the refusal never says nothing was signed."""
     store = _seed(world.qdir)
-    caplog.set_level(logging.INFO, logger="levain.coordinator.envelope_revoke")
+    caplog.set_level(logging.INFO, logger="levain.desk.envelope_revoke")
     with _serving(tmp_path / "inst", signer=_signer(world), extra_hosts=[RP]) as (url, _h):
         c = _challenged(url, world)
         nonce = c["line"].rstrip("\n").rsplit("nonce: ", 1)[1]
@@ -483,8 +483,8 @@ def test_the_no_signer_note_names_the_envelope_kill(world) -> None:
 
 
 def test_a_store_without_envelope_tables_answers_not_found(world, tmp_path) -> None:
-    """codex LOW-4 / complement LOW-2: a coordinator store never migrated for envelopes holds no envelope: 404."""
-    from levain.coordinator.store import CoordStore
+    """codex LOW-4 / complement LOW-2: a desk store never migrated for envelopes holds no envelope: 404."""
+    from levain.desk.store import CoordStore
 
     CoordStore(world.qdir).accept_drop("a drop", surface="phone")
     raw = sqlite3.connect(world.qdir / "dispatch.db")

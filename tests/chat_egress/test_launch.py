@@ -26,8 +26,8 @@ import pytest
 from levain.chat_egress import classify, keys
 from levain.chat_egress import decider as dm
 from levain.chat_egress import launch as lm
-from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import Part
+from levain.desk.envelopes import EnvelopeStore
+from levain.desk.store import Part
 
 from .decider_rig import Desk, Live, Lookup, NoStore, make_launch
 from .fixtures import env as envmod
@@ -42,7 +42,7 @@ NO_GRANTS = SimpleNamespace(policy=SimpleNamespace(grants={}))
 
 
 def real_launch(store: EnvelopeStore) -> str:
-    """A launch the coordinator's own path wrote (lease, drop, thread, request, activate): its id and events real."""
+    """A launch the desk's own path wrote (lease, drop, thread, request, activate): its id and events real."""
     store.coord_set_agent("none")
     token = store.coord_take()
     d = store.accept_drop("chat", surface="cli")[0]

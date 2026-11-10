@@ -9,9 +9,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from levain.coordinator import lease, room
-from levain.coordinator.envelopes import EnvelopeStore
-from levain.coordinator.store import Part, next_gseq
+from levain.desk import lease, room
+from levain.desk.envelopes import EnvelopeStore
+from levain.desk.store import Part, next_gseq
 
 T0 = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
 

@@ -7,7 +7,7 @@ Three records beside the presence word (all under ``<queue_dir>/webpush/``), plu
   written here, :mod:`levain.webpush.intent`), and ``follow`` reads it: devices stay off until the newest one is ``follow_after``
   old (sensed keyboard or mouse input does not count). A turn in the Claude app's remote control is NOT a desk message: the caller decides, and it reports
   that as :func:`~levain.webpush.presence.note_remote_activity`. Every desk message writes a row to the presence log
-  (``levain ping log``), which is the stream a coordinator wakes on.
+  (``levain ping log``), which is the stream a desk wakes on.
 - **Desk liveness** (:func:`publish_desk` / :func:`end_desk` / :func:`read_desk`, ``desk.json``): the desk's name and when it
   began, refreshed by whoever runs the desk. A record not refreshed for :data:`DESK_LIVE_TTL_SECS` reads ``stale``, never
   ``live``: a publisher that died must not leave "live" standing.
@@ -281,7 +281,7 @@ def _mins_text(secs: float) -> str:
 def observe(queue_dir: Path | str | None, now: float, reading: float | None, *, msg_at: float | None = None) -> str | None:
     """Write event rows for what sensing saw change, and nothing else (the intent record is never written here): one presence-log
     row when the measured reading crosses ``follow_after`` between ``here`` and ``away`` (``auto-away`` / ``auto-here``), and one
-    ``ended away`` / ``ended sleep`` / ``ended quiet`` the first time it sees an overlay on file has ended, so a coordinator can
+    ``ended away`` / ``ended sleep`` / ``ended quiet`` the first time it sees an overlay on file has ended, so a desk can
     wake on them. The first reading seen only seeds the state. An ``auto-away`` crossing, or an overlay just seen ended, starts
     the flush of held pings that are due. Best effort: a lock or file fault writes nothing and never raises. Returns the state
     read (``None`` for ``unknown``)."""

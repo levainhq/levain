@@ -11,7 +11,7 @@ from pathlib import Path
 
 from levain.consent.sign import Signer, read_request
 from levain.contracts.namespaces import REVIEW_CLEAR_NAMESPACE
-from levain.coordinator import review
+from levain.desk import review
 
 from tests.test_cockpit_sign_origin import RP, _Passkey
 from tests.test_review_clear_signed import ORIGIN, _compose, _events, _mine, _q, _send, cockpit  # noqa: F401

@@ -842,7 +842,7 @@
     return postVerb(action, {}, {});
   }
 
-  // clear or reopen a coordinator review item: the row's own offered review_clear / review_reopen (C1, no confirm, no
+  // clear or reopen a desk review item: the row's own offered review_clear / review_reopen (C1, no confirm, no
   // params). The kernel refuses it on a shared surface token (a paired device only) and 409s a row that changed. The
   // signed clear (review_clear_signed) carries {item, sign_request} and its draft's `signTxn`, which keys the send
   async function reviewItem(rowId, verb, params, signTxn) {
@@ -1105,7 +1105,7 @@
   load().finally(function () { if (storeEl) storeEl.removeAttribute("data-cold"); });
 })();
 
-// CH-U1a: the Build tab's Threads zone. The coordinator's threads and one thread's stream, read-only, drawn by
+// CH-U1a: the Build tab's Threads zone. The desk's threads and one thread's stream, read-only, drawn by
 // thread_view.js (LevainThreadView) over GET /cockpit/threads.json and /cockpit/thread/<id>.json. Those routes need the
 // page's write token on every bind, so the zone stays hidden on a page holding none. It polls only while the Build tab
 // is shown and the page is visible; leaving stops the poll, and coming back starts again at the thread list.

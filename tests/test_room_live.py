@@ -1,4 +1,4 @@
-"""492 R3: the room's streamed text is an EPHEMERAL live buffer (levain.coordinator.room_live), never the record.
+"""492 R3: the room's streamed text is an EPHEMERAL live buffer (levain.desk.room_live), never the record.
 
 Frame shape: Claude Code stream-json with ``--include-partial-messages`` wraps each Anthropic Messages-API streaming
 event as ``{"type": "stream_event", "event": {...}, "session_id", "parent_tool_use_id", "uuid"}`` (message_start,
@@ -11,9 +11,9 @@ import json
 
 import pytest
 
-from levain.coordinator import claude_session as cs
-from levain.coordinator import room_live
-from levain.coordinator.claude_session import ClaudeSession, room_argv
+from levain.desk import claude_session as cs
+from levain.desk import room_live
+from levain.desk.claude_session import ClaudeSession, room_argv
 
 SID = "11111111-1111-4111-8111-111111111111"
 LID = "launch-live-1"

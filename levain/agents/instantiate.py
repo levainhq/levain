@@ -1,16 +1,16 @@
 """levain.agents.instantiate — a role made into one spawned worker (BUILD_PLAN P3, the spawned half).
 
-A coordinator that wants a worker for a thread names a role, either a REGISTERED one (``@spawn/<name>``, P1's registry)
-or an INLINE one (a role mapping carried in the call and never registered). :func:`spawn_worker` (and ``levain coord
+A desk that wants a worker for a thread names a role, either a REGISTERED one (``@spawn/<name>``, P1's registry)
+or an INLINE one (a role mapping carried in the call and never registered). :func:`spawn_worker` (and ``levain desk
 spawn``, which calls it) turns that into one worker launch:
 
 1. the role is resolved and its hash checked (:func:`resolve_role`); the registry is always read, so an inline role may
    not borrow the name of a registered role with other content and ``@spawn/<name>`` always means one thing;
 2. the launch is asked for through the lease holder's token with a spawn DRAFT as its ``role_ref``
-   (:func:`levain.coordinator.lease.spawn_draft`): the role, its slot values, the DONE line and the parent launch.
-   The store completes it in the request's own transaction (:func:`levain.coordinator.lease.spawn_record`): the depth
+   (:func:`levain.desk.lease.spawn_draft`): the role, its slot values, the DONE line and the parent launch.
+   The store completes it in the request's own transaction (:func:`levain.desk.lease.spawn_record`): the depth
    from the ACTIVE parent's own record, the thread's drop, and the scope cut from ONE envelope head, key by key, to
-   the role's ceiling (:func:`levain.coordinator.envelopes.narrow_scope`; it only narrows, so an inline role, which
+   the role's ceiling (:func:`levain.desk.envelopes.narrow_scope`; it only narrows, so an inline role, which
    nobody reviewed, can never widen the envelope). The activation pins that same envelope, and the caps on depth and
    on concurrent spawns are checked in that transaction too;
 3. the worker's brief is built from the stored record alone (:func:`worker_context`): an EPHEMERAL AgentSpec
@@ -18,7 +18,7 @@ spawn``, which calls it) turns that into one worker launch:
    registered, never scheduled and never signed, with the stored scope.
 
 The narrowing is per LAUNCH: nothing here writes to the thread's envelope, so one worker's narrow role never narrows
-the thread for the coordinator or for the next worker.
+the thread for the desk or for the next worker.
 
 BEFORE S1 NOTHING HERE IS AUTHORITY. The scope is what the worker's brief states and what the first reader's verdict
 holds a spawned worker's question to; no code path reads it to allow an effect, and a test pins the callers of the
@@ -41,8 +41,9 @@ from levain import unshowable
 from levain.agents import role as role_mod
 from levain.agents import spec as spec_mod
 from levain.authority import _canonical
-from levain.coordinator import lease as lease_mod
-from levain.coordinator.store import CoordError
+from levain.desk import lease as lease_mod
+from levain.desk.store import CoordError
+from levain.desk.legacy import ROLE_DESK
 
 __all__ = ["BRIEF_DROPS_MAX", "MAX_SPAWN_DEPTH", "MAX_SPAWNS_LIVE", "WORKER_DROPS_MAX_BYTES", "SpawnRefused",
            "WorkerContext", "drops_file_text", "ephemeral_spec", "make_draft",
@@ -201,7 +202,7 @@ def ephemeral_spec(role: Mapping[str, Any], digest: str, *, drop_id: str, thread
                    done: str | None, scope: Mapping[str, Any], stop_s: int = DEFAULT_STOP_S,
                    more_drops: tuple[str, ...] = (), unbriefed: int = 0) -> dict[str, Any]:
     """The worker's AgentSpec, never registered: input = the drop (and ``more_drops``, the thread's other drops the
-    brief quotes, then how many more, ``unbriefed``, it does not), output = the handoff to the coordinator, win = the
+    brief quotes, then how many more, ``unbriefed``, it does not), output = the handoff to the desk, win = the
     ready item's ``DONE:`` line (the thread's title when the item names none). The three parts go through the registry
     spec's own parsers, so they are the shapes a registered spec would hold. ``stop_at`` is guidance the brief states;
     nothing ends the worker at that time."""
@@ -214,7 +215,7 @@ def ephemeral_spec(role: Mapping[str, Any], digest: str, *, drop_id: str, thread
         "input": spec_mod._input({"source": source,
                                   "liveness": "the drops are the operator's words as the thread holds them"}),
         "output": spec_mod._output({"class": "corpus", "destination": f"thread {thread_id}",
-                                    "reader": "coordinator", "moment": "when the worker ends"}),
+                                    "reader": ROLE_DESK, "moment": "when the worker ends"}),
         "win": spec_mod._win({"kind": "human", "check": win}),
         "stop_at": spec_mod._int(stop_s, "stop_at"),
         "scope": copy.deepcopy(dict(scope)),

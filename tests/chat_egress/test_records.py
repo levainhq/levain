@@ -25,7 +25,7 @@ import pytest
 from levain.chat_egress import records as rec
 from levain.chat_egress import wire
 from levain.chat_egress.lifecycle import Effect, Event, Failure, RequestLifecycle, Settled, State, Step, Verdict
-from levain.coordinator.store import CoordStore, next_gseq
+from levain.desk.store import CoordStore, next_gseq
 
 _CHILD = Path(__file__).with_name("records_kill_child.py")
 _WORKTREE = Path(__file__).resolve().parents[2]

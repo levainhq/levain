@@ -5,8 +5,8 @@ recorded ``backfill``, between the launch's hook rows and its first ``vendor_tur
 from __future__ import annotations
 
 from levain.cockpit import room as cockpit_room
-from levain.coordinator.chat import TimelineRow
-from levain.coordinator.room_launch import CANARY_PROMPT
+from levain.desk.chat import TimelineRow
+from levain.desk.room_launch import CANARY_PROMPT
 
 
 def _row(gseq, kind, launch, body="", source="vendor"):

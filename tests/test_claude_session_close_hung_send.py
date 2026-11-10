@@ -12,10 +12,10 @@ import time
 
 import pytest
 
-from levain.coordinator import claude_session as cs
-from levain.coordinator.chat import ChatService
-from levain.coordinator.claude_session import ClaudeSession, PipeTransport, TransportClosed
-from levain.coordinator.driver import NotSent, SendCommand
+from levain.desk import claude_session as cs
+from levain.desk.chat import ChatService
+from levain.desk.claude_session import ClaudeSession, PipeTransport, TransportClosed
+from levain.desk.driver import NotSent, SendCommand
 
 pytestmark = pytest.mark.skipif(not hasattr(os, "killpg"), reason="POSIX process groups")
 

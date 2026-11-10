@@ -1,6 +1,6 @@
 """The spawned half (P3): a role made into one worker launch. Registered and inline roles, the per-key narrowing of the
 thread's envelope by the role's ceiling (per LAUNCH, stored on it, never written to the thread), the ephemeral spec,
-the spawn caps and the lineage they read, the worker brief, ``levain coord spawn``, the end of a done worker, and the
+the spawn caps and the lineage they read, the worker brief, ``levain desk spawn``, the end of a done worker, and the
 inventory of who reads an envelope as authority. A fake ``claude`` replays the measured outputs (the launch tests'
 own); no test here ever spawns the real one."""
 from __future__ import annotations
@@ -16,17 +16,18 @@ import pytest
 from levain.agents import instantiate as inst
 from levain.agents import role as role_mod
 from levain.agents.store import open_agent_store
-from levain.coordinator import door
-from levain.coordinator import envelope as env
-from levain.coordinator import first_reader as fr
-from levain.coordinator import lease
-from levain.coordinator.envelopes import narrow_scope
-from levain.coordinator.store import CoordError, CoordStore, Part
-# the launch tests' fixtures: a fake claude on PATH, a scratch queue directory, a coordinator workspace, a live hook
-from tests.test_coordinator_launch import fake, live_hook, qdir, workdir, _levain_home  # noqa: F401
-from tests.test_coordinator_launch import OTHER, _main, cl, rows
+from levain.desk import door
+from levain.desk import envelope as env
+from levain.desk import first_reader as fr
+from levain.desk import lease
+from levain.desk.envelopes import narrow_scope
+from levain.desk.store import CoordError, CoordStore, Part
+# the launch tests' fixtures: a fake claude on PATH, a scratch queue directory, a desk workspace, a live hook
+from tests.test_desk_launch import fake, live_hook, qdir, workdir, _levain_home  # noqa: F401
+from tests.test_desk_launch import OTHER, _main, cl, rows
 # the envelope tests' fixtures: real keys, a real authority log, a scratch git repo, an EnvelopeStore
-from tests.test_coordinator_envelope import ctx, keys, repo, snapshot  # noqa: F401
+from tests.test_desk_envelope import ctx, keys, repo, snapshot  # noqa: F401
+from levain.desk.legacy import ROLE_DESK
 
 REPO = "/work/repo"
 
@@ -95,7 +96,7 @@ def test_an_inline_role_cannot_widen_the_envelope():
 
 
 def test_the_not_wider_check_refuses_a_widened_result():
-    from levain.coordinator.envelopes import _assert_not_wider
+    from levain.desk.envelopes import _assert_not_wider
 
     with pytest.raises(CoordError, match="beyond the envelope"):
         _assert_not_wider(scope(), {**scope(), "where": [{"repo": "/work/secret", "paths": ["."]}]})
@@ -198,7 +199,7 @@ def test_the_ephemeral_spec_is_input_drop_output_handoff_win_done_line(registry)
                                done="DONE: the readme says hello", scope=scope())
     assert spec["name"] == "@spawn/scribe" and spec["kind"] == "ephemeral"
     assert spec["input"]["source"] == "drop dr-" + "a" * 32
-    assert spec["output"]["class"] == "corpus" and spec["output"]["reader"] == "coordinator"
+    assert spec["output"]["class"] == "corpus" and spec["output"]["reader"] == ROLE_DESK
     assert spec["win"] == {"kind": "human", "check": "DONE: the readme says hello"}
     assert spec["role"] == {"name": "scribe", "role_hash": digest} and spec["stop_at"] == inst.DEFAULT_STOP_S
     # without a DONE line the thread's own title is the win
@@ -268,7 +269,7 @@ def test_the_watcher_starts_a_spawned_worker_and_status_lists_it(store, fake, li
     assert f"# Levain worker brief: launch {ln.launch_id}" in brief
     assert "Write the greeting up." in brief and "make the readme say hello" in brief
     assert 'done means: "DONE: README says hello"' in brief and "ONE line beginning `DONE:`" in brief
-    assert f"drop {d.drop_id}" in brief and "levain coord claim" not in brief
+    assert f"drop {d.drop_id}" in brief and "levain desk claim" not in brief
     assert "This role is INLINE" in brief
 
 
@@ -292,13 +293,13 @@ def test_a_slot_cannot_forge_a_brief_section(store, fake, live_hook, wdir, spawn
     assert not any(x.startswith("- may work in /") for x in brief.splitlines())
 
 
-def test_a_worker_does_not_start_in_a_coordinator_workspace(store, fake, live_hook, workdir, spawn):  # noqa: F811
+def test_a_worker_does_not_start_in_a_desk_workspace(store, fake, live_hook, workdir, spawn):  # noqa: F811
     _d, t = a_thread(store)
     for cwd in (workdir, workdir / "sub"):
         cwd.mkdir(exist_ok=True)
         ln = spawn(store, store.coord_take(), t.thread_id, cwd.resolve())
         got = cl.launch_session(store, ln.launch_id)
-        assert not got.started and "inside a coordinator's workspace" in got.refusal, got
+        assert not got.started and "inside a desk's workspace" in got.refusal, got
         assert store.launch(ln.launch_id).state == "failed"            # refused before start: no slot held
     assert fake.spawns() == []
 
@@ -333,7 +334,7 @@ def test_a_thread_that_is_not_open_work_gets_no_worker(store, wdir, spawn):
         spawn(store, store.coord_take(), t.thread_id, wdir)
     _d, w = a_thread(store, "done work")
     token = store.coord_take()
-    store.set_state(w.thread_id, "done", by="coordinator", token=token)
+    store.set_state(w.thread_id, "done", by=ROLE_DESK, token=token)
     with pytest.raises(inst.SpawnRefused, match="only open WORK"):
         spawn(store, token, w.thread_id, wdir)
 
@@ -486,7 +487,7 @@ def test_a_store_from_before_the_role_column_gains_it(qdir, workdir):
     s = CoordStore(qdir)                       # the opener migrates
     d, _ = s.accept_drop("hello", surface="cli")
     ln = s.launch(s.woken_launch(d.drop_id))
-    assert ln.role == "coordinator" and ln.role_ref is None
+    assert ln.role == ROLE_DESK and ln.role_ref is None
     assert "role_ref" in [r[1] for r in rows(qdir, "PRAGMA table_info(launches)")]
 
 
@@ -567,7 +568,7 @@ def test_the_first_reader_holds_a_spawned_worker_to_its_stored_scope(ctx, wdir, 
     assert got[readme.launch_id].may_answer, got[readme.launch_id].why
 
 
-# --- levain coord spawn ----------------------------------------------------------------------------------------------
+# --- levain desk spawn ----------------------------------------------------------------------------------------------
 def test_levain_coord_spawn_is_the_caller_drop_split_spawn_watch_status(store, qdir, fake, live_hook, wdir, registry,
                                                                         tmp_path, capsys):  # noqa: F811
     from levain.cli import build_parser
@@ -576,7 +577,7 @@ def test_levain_coord_spawn_is_the_caller_drop_split_spawn_watch_status(store, q
     role_mod.add_role(registry, role())
     token = store.coord_take()
     d, _ = store.accept_drop("make the readme say hello", surface="cli")
-    (t,) = store.split(d.drop_id, [Part("work", "say hello")], by="coordinator", token=token)
+    (t,) = store.split(d.drop_id, [Part("work", "say hello")], by=ROLE_DESK, token=token)
     out = _main(qdir, capsys, "coord", "spawn", "--thread", t.thread_id, "--role", "@spawn/scribe", "--cwd", str(wdir),
                 "--slot", "topic=the greeting", "--done", "DONE: README says hello", "--token", str(token),
                 "--agent-store-dir", str(tmp_path / "autonomic"), "--json")
@@ -601,13 +602,13 @@ def test_levain_coord_spawn_is_the_caller_drop_split_spawn_watch_status(store, q
 READERS = {"authority_refusal", "live_refusal", "ceiling_refusal", "chain_live_refusal",
            "_live_refusal", "_ceiling_refusal", "_chain_live_refusal"}
 # (file, enclosing function, reader): the callers on main. The status lines print what the chain says; the first
-# reader's chain check LABELS a question MAY ANSWER, which the coordinator's brief calls a label and not proof, and
-# which narrows what the coordinator may answer, never what any session may do. S1's cutover changes this list on
+# reader's chain check LABELS a question MAY ANSWER, which the desk's brief calls a label and not proof, and
+# which narrows what the desk may answer, never what any session may do. S1's cutover changes this list on
 # purpose, in review.
 EXPECTED = {
-    ("levain/coordinator/cli.py", "_live_for", "chain_live_refusal"),
-    ("levain/coordinator/cli.py", "_show_envelope", "authority_refusal"),
-    ("levain/coordinator/first_reader.py", "_verdict", "_chain_live_refusal"),
+    ("levain/desk/cli.py", "_live_for", "chain_live_refusal"),
+    ("levain/desk/cli.py", "_show_envelope", "authority_refusal"),
+    ("levain/desk/first_reader.py", "_verdict", "_chain_live_refusal"),
 }
 
 
@@ -646,7 +647,7 @@ def _callers() -> set[tuple[str, str, str]]:
     found: set[tuple[str, str, str]] = set()
     for path in sorted((root / "levain").rglob("*.py")):
         rel = str(path.relative_to(root))
-        if rel == "levain/coordinator/envelopes.py":
+        if rel == "levain/desk/envelopes.py":
             continue
         found |= _callers_in(rel, path.read_text(encoding="utf-8"))
     return found
@@ -661,7 +662,7 @@ def test_the_envelope_authority_callers_are_exactly_the_status_lines_and_the_lab
 
 
 @pytest.mark.parametrize("source", [
-    "from levain.coordinator.envelopes import live_refusal\ndef f(s):\n    return live_refusal(s)\n",
+    "from levain.desk.envelopes import live_refusal\ndef f(s):\n    return live_refusal(s)\n",
     "def f(store):\n    x = store.live_refusal\n    return x()\n",
     "def f(store):\n    return store.ceiling_refusal('e', 't')\n",
 ])
@@ -670,7 +671,7 @@ def test_the_inventory_sees_every_call_shape(source):
 
 
 def test_no_spawn_code_reads_the_envelope_authority_readers():
-    for rel in ("levain/agents/instantiate.py", "levain/coordinator/launch.py"):
+    for rel in ("levain/agents/instantiate.py", "levain/desk/launch.py"):
         text = (Path(__file__).resolve().parent.parent / rel).read_text(encoding="utf-8")
         assert not _callers_in(rel, text), rel
 
@@ -863,7 +864,7 @@ def _coord_error(*_a, **_k):
 
 
 def _record_unreadable(*_a, **_k):
-    raise door.RecordUnreadable("the coordinator record is half written")
+    raise door.RecordUnreadable("the desk record is half written")
 
 
 def _io_error(*_a, **_k):

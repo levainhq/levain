@@ -27,7 +27,8 @@ from levain.agents.accounting import StopResult, Usage
 from levain.agents.role import role_hash
 from levain.agents.spec import parse_spec, register_spec
 from levain.agents.store import open_agent_store
-from levain.coordinator.lease import LEASE_SCHEMA
+from levain.desk.lease import LEASE_SCHEMA
+from levain.desk.legacy import SQL_ROLE_DESK
 
 pytest.importorskip("cryptography")
 from tests.test_authority_agent_link import link as link_record, revoke_agent  # noqa: E402
@@ -343,9 +344,9 @@ def test_a_crash_between_the_key_and_the_spawn_is_ended_by_lapse_recovery(rig):
         assert fence_now(c) != fence
 
 
-# --- the coordinator-lease probes over dispatch.db ------------------------------------------------------------------
+# --- the desk-lease probes over dispatch.db ------------------------------------------------------------------
 
-def test_dispatch_probes_read_the_coordinator_store(tmp_path):
+def test_dispatch_probes_read_the_desk_store(tmp_path):
     # behaviour: launch_over is True for a gone or ended launch, False while pending or active, None with no event;
     # session_alive is False only for a swept launch; a missing dispatch.db raises (probe_over: cannot tell)
     db = sqlite3.connect(tmp_path / "dispatch.db")
@@ -355,7 +356,7 @@ def test_dispatch_probes_read_the_coordinator_store(tmp_path):
     for lid, kinds in (("ln-p", ["pending"]), ("ln-a", ["pending", "active"]), ("ln-e", ["pending", "active", "ended"]),
                        ("ln-f", ["pending", "failed"]), ("ln-x", ["pending", "expired"]), ("ln-0", [])):
         db.execute("INSERT INTO launches (launch_id, gseq, session_key, harness, role, threads, token, placement, at)"
-                   " VALUES (?, ?, ?, 'claude', 'coordinator', '[]', 1, 'p', 't')", (lid, next(g), "s-" + lid))
+                   f" VALUES (?, ?, ?, 'claude', {SQL_ROLE_DESK}, '[]', 1, 'p', 't')", (lid, next(g), "s-" + lid))
         for seq, kind in enumerate(kinds, 1):
             db.execute("INSERT INTO launch_events (launch_id, seq, gseq, kind, cause, at) VALUES (?, ?, ?, ?, 'x', 't')",
                        (lid, seq, next(g), kind))
@@ -513,10 +514,10 @@ def test_a_transaction_sqlite_already_rolled_back_raises_its_own_error_not_the_s
     assert rig.row(oid) == before and rig.taken(oid) == ([], [])
 
 
-def test_a_coordinator_slot_with_no_launch_row_is_probed_only_after_its_own_lease(rig, tmp_path):
+def test_a_desk_slot_with_no_launch_row_is_probed_only_after_its_own_lease(rig, tmp_path):
     # behaviour (complement MED r1 #6): launch_over answers True for a launch row that is gone, but only launch slots
     # whose own lease (slots.LEASE_S from the take, renewed by the watcher) has expired are probed at all
-    # (slots.expired_launches), so a coordinator that took a slot and has not committed its launches row yet keeps it
+    # (slots.expired_launches), so a desk that took a slot and has not committed its launches row yet keeps it
     db = sqlite3.connect(tmp_path / "dispatch.db")
     for ddl in LEASE_SCHEMA:
         db.execute(ddl)

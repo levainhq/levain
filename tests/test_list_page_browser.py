@@ -1,4 +1,4 @@
-"""THE LIST's page (levain 64 L3), in real headless Chrome against a served cockpit with a real broker, spore store and coordinator
+"""THE LIST's page (levain 64 L3), in real headless Chrome against a served cockpit with a real broker, spore store and desk
 store in the scratch home (the conftest isolates HOME: nothing here touches an operator's live apps or queue).
 
 Pinned: the intake box submits ONE line and prints the server's receipt sentence verbatim (a plain line, a ``?`` talk, an ``@`` drop
@@ -17,7 +17,7 @@ import pytest
 from anneal_memory.spores import SporeStore
 
 from levain.consent.queue import default_queue_dir
-from levain.coordinator.store import CoordStore
+from levain.desk.store import CoordStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 

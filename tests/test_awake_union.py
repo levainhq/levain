@@ -1,4 +1,4 @@
-"""P6s: ONE sleep reconciler over both sources (the coordinator's working threads and the agents' live occurrences).
+"""P6s: ONE sleep reconciler over both sources (the desk's working threads and the agents' live occurrences).
 
 Built from a two-process run (A0 §2.5: an occurrence is live while its state is ``admitted`` or ``launched``): process
 1 holds a live occurrence, process 2's last work thread ends and its sync runs; the holder STAYS. On the unmodified
@@ -15,7 +15,8 @@ import time
 import pytest
 
 from levain.autonomic.db import DB_NAME, AutonomicDB
-from levain.coordinator import awake
+from levain.desk import awake
+from levain.desk.legacy import JSON_ROLE_DESK, ROLE_DESK
 
 pytestmark = pytest.mark.skipif(os.name != "posix" or shutil.which("sleep") is None or shutil.which("ps") is None,
                                 reason="needs POSIX ps + sleep")
@@ -23,7 +24,7 @@ pytestmark = pytest.mark.skipif(os.name != "posix" or shutil.which("sleep") is N
 NOW = "2026-10-31T10:00:00Z"
 PRELUDE = f"""
 import shutil, sys
-from levain.coordinator import awake
+from levain.desk import awake
 awake._IN_TESTS = True
 awake.holder_command = lambda *a, **k: [shutil.which("sleep"), "90"]
 """
@@ -41,9 +42,9 @@ else:
               (sys.argv[5], oid))
 print(awake.sync(directory=q, agent_dir=a))
 """
-COORD = PRELUDE + """
+COORD = PRELUDE + f"""
 from pathlib import Path
-from levain.coordinator.store import CoordStore, Part
+from levain.desk.store import CoordStore, Part
 q, action = Path(sys.argv[1]), sys.argv[2]
 s = CoordStore(q)
 if action == "work":
@@ -52,8 +53,8 @@ if action == "work":
     ln = s.coord_status()["launches"][0]
     s.launch_activate(ln["launch_id"], harness_session_id="u1")
     tok = s.coord_claim(ln["launch_id"], s.launch(ln["launch_id"]).session_key)
-    t, _ = s.split(d.drop_id, [Part(kind="work", title="w"), Part(kind="note", title="n")], by="coordinator", token=tok)
-    s.set_state(t.thread_id, "working", by="coordinator", token=tok)
+    t, _ = s.split(d.drop_id, [Part(kind="work", title="w"), Part(kind="note", title="n")], by={JSON_ROLE_DESK}, token=tok)
+    s.set_state(t.thread_id, "working", by={JSON_ROLE_DESK}, token=tok)
     print(d.drop_id, t.thread_id)
 else:
     s.detach(sys.argv[3], sys.argv[4], by="operator")      # the last member out: the work thread closes; sync runs
@@ -93,7 +94,7 @@ def test_the_last_work_thread_ending_leaves_a_live_occurrence_holding_the_host(w
     assert first["source"] == "agent" and first["occurrences"] == ["occ-1"] and awake._ours(first)
     drop, thread = run(COORD, q, "work", tmp_path).split()                  # process 2: a work thread works
     both = rec(q)
-    assert both["source"] == "coordinator+agent" and both["threads"] == [thread] and awake._ours(both)
+    assert both["source"] == "desk+agent" and both["threads"] == [thread] and awake._ours(both)
     run(COORD, q, "end", thread, drop)                                      # its last work thread ends, sync runs
     kept = rec(q)
     assert awake._ours(kept), "the holder was released under a live occurrence"
@@ -107,18 +108,18 @@ def test_a_work_thread_alone_still_holds_and_nothing_at_all_releases(world, tmp_
     q, adir = world
     drop, thread = run(COORD, q, "work", tmp_path).split()
     held = rec(q)
-    assert held["source"] == "coordinator" and held["occurrences"] == [] and awake._ours(held)
+    assert held["source"] == ROLE_DESK and held["occurrences"] == [] and awake._ours(held)
     run(COORD, q, "end", thread, drop)
     assert not (q / "awake.json").exists() and not awake._ours(held)
 
 
-def test_sync_never_trusts_the_caller_the_agent_side_sees_the_coordinators_thread(world, tmp_path):
+def test_sync_never_trusts_the_caller_the_agent_side_sees_the_desks_thread(world, tmp_path):
     q, adir = world
     drop, thread = run(COORD, q, "work", tmp_path).split()
-    out = run(AGENT, q, adir, "occ-2", "start", NOW)           # the agent side re-reads the coordinator half itself
+    out = run(AGENT, q, adir, "occ-2", "start", NOW)           # the agent side re-reads the desk half itself
     assert f"'threads': ['{thread}']" in out and "'occurrences': ['occ-2']" in out
     run(AGENT, q, adir, "occ-2", "end", NOW)                   # an occurrence ending leaves the thread's hold
-    assert awake._ours(rec(q)) and rec(q)["source"] == "coordinator"
+    assert awake._ours(rec(q)) and rec(q)["source"] == ROLE_DESK
 
 
 def test_an_unreadable_agent_store_never_releases_the_holder(world, tmp_path):
@@ -267,33 +268,33 @@ def test_the_doctor_row_names_the_source_the_occurrence_its_state_and_age(world,
     assert row.ok and not row.warn, row
     assert "held by agent" in row.detail and "occ-1 (admitted, " in row.detail and "oldest live: " in row.detail, row.detail
     run(AGENT, q, adir, "occ-1", "end", NOW)
-    assert _check_host_awake() == []                                        # nothing live, no coordinator store: no row
+    assert _check_host_awake() == []                                        # nothing live, no desk store: no row
 
 
-def test_an_unreadable_agents_store_still_takes_the_coordinators_hold(world, tmp_path):
+def test_an_unreadable_agents_store_still_takes_the_desks_hold(world, tmp_path):
     q, adir = world
     (adir / DB_NAME).write_bytes(b"not a database" * 100)
-    drop, thread = run(COORD, q, "work", tmp_path).split()                  # the coordinator side has work, agents unknown
+    drop, thread = run(COORD, q, "work", tmp_path).split()                  # the desk side has work, agents unknown
     held = rec(q)
-    assert awake._ours(held) and held["source"] == "coordinator" and held["threads"] == [thread]
+    assert awake._ours(held) and held["source"] == ROLE_DESK and held["threads"] == [thread]
     assert held["unknown"] == ["agent"]
     out = run(COORD, q, "end", thread, drop)                                 # its work ends; the agents store is still unknown
     assert awake._ours(rec(q)) and rec(q)["pid"] == held["pid"], "the holder was released with a source unknown"
 
 
-def test_an_unreadable_coordinator_store_still_takes_the_agents_hold_and_both_unknown_holds_nothing_new(world):
+def test_an_unreadable_desk_store_still_takes_the_agents_hold_and_both_unknown_holds_nothing_new(world):
     q, adir = world
     (q / "dispatch.db").write_bytes(b"not a database" * 100)
     out = run(AGENT, q, adir, "occ-1", "start", NOW)
-    assert "'held': True" in out and "'unknown': ['coordinator']" in out, out
+    assert "'held': True" in out and "'unknown': ['desk']" in out, out
     held = rec(q)
-    assert awake._ours(held) and held["source"] == "agent" and held["unknown"] == ["coordinator"]
-    run(AGENT, q, adir, "occ-1", "end", NOW)                                 # the occurrence ends: coordinator still unknown
+    assert awake._ours(held) and held["source"] == "agent" and held["unknown"] == [ROLE_DESK]
+    run(AGENT, q, adir, "occ-1", "end", NOW)                                 # the occurrence ends: desk still unknown
     assert awake._ours(rec(q)) and rec(q)["pid"] == held["pid"]
     (adir / DB_NAME).write_bytes(b"not a database" * 100)                    # now both are unreadable
     out = run(PRELUDE + "from pathlib import Path\nprint(awake.sync(directory=Path(sys.argv[1]), agent_dir=Path(sys.argv[2])))",
               q, adir)
-    assert "could not sync" in out and "coordinator and agent" in out and awake._ours(rec(q))
+    assert "could not sync" in out and "desk and agent" in out and awake._ours(rec(q))
     assert rec(q)["pid"] == held["pid"]
 
 
@@ -365,12 +366,12 @@ def test_sync_without_a_store_or_a_directory_names_the_missing_directory_and_tou
     dq = default_queue_dir()
     dq.mkdir(parents=True, mode=0o700)          # it exists, so a silent fall back would take a lock here
     out = awake.sync(agent_dir=tmp_path)
-    assert out["held"] is False and "no coordinator queue directory was given" in out["why"], out
+    assert out["held"] is False and "no desk queue directory was given" in out["why"], out
     assert list(dq.iterdir()) == [], "the default queue directory was used"
     assert not list(tmp_path.glob("awake.*"))
 
 
-def test_the_doctor_row_describes_a_live_holder_with_nothing_left_and_no_coordinator_store(world, monkeypatch):
+def test_the_doctor_row_describes_a_live_holder_with_nothing_left_and_no_desk_store(world, monkeypatch):
     from levain import install
     from levain.doctor import _check_host_awake
 
@@ -385,7 +386,7 @@ def test_the_doctor_row_describes_a_live_holder_with_nothing_left_and_no_coordin
     assert row.ok and not row.warn and "holder alive with no current work seen" in row.detail, row.detail
 
 
-def test_the_doctor_row_keeps_the_coordinator_side_when_the_agent_store_is_unreadable(world, monkeypatch, tmp_path):
+def test_the_doctor_row_keeps_the_desk_side_when_the_agent_store_is_unreadable(world, monkeypatch, tmp_path):
     from levain import install
     from levain.doctor import _check_host_awake
 
@@ -401,6 +402,6 @@ def test_the_doctor_row_keeps_the_coordinator_side_when_the_agent_store_is_unrea
 def test_a_held_line_never_renders_an_empty_who(tmp_path, monkeypatch):
     monkeypatch.setattr(awake, "_ours", lambda r: True)
     (tmp_path / awake.FILE).write_text(json.dumps({"pid": 77, "until": time.time() + 99, "threads": [],
-                                                   "occurrences": [], "source": "coordinator"}))
+                                                   "occurrences": [], "source": ROLE_DESK}))
     ok, line = awake.describe(tmp_path, working_count=0, occurrence_count=0, occurrences=[])
     assert ok and "no live work seen now" in line and ": at its" not in line and ":  " not in line, line

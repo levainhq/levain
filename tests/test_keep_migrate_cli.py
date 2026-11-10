@@ -113,8 +113,8 @@ def test_apply_of_a_missing_plan_is_a_clean_error(install: Path, capsys):
     assert "cannot read plan" in capsys.readouterr().err
 
 
-def test_the_verb_is_the_operators_not_the_coordinators():
-    from levain.coordinator import door
+def test_the_verb_is_the_operators_not_the_desks():
+    from levain.desk import door
 
     leaves = door.declared_leaves(build_parser())
     assert leaves[("spores", "keep-migrate")] is False

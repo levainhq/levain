@@ -1,7 +1,7 @@
 """levain.dream.ready (D1-1c): the six day-ready checks, each from a condition made on a scratch entity.
 
 Every test builds its condition with the real pieces on a scratch dir under ``tmp_path``: a real anneal store, a real
-agent store (``agent_occurrences`` with its triggers, moved through its own state machine), a real coordinator store
+agent store (``agent_occurrences`` with its triggers, moved through its own state machine), a real desk store
 (a real pending or active launch) and a real ``awake.json`` shape. Nothing here reads ``~/.anneal-memory`` or starts a
 process. Check 5's "hooked session" is a STUB: a marker file in anneal's session registry. Whether a real Claude Code
 session leaves such a marker in a Levain install is not shown here (anneal's MCP server does not register one).
@@ -41,7 +41,7 @@ def utc(y, mo, d, h, mi=0) -> str:
 # ------------------------------------------------------------------------------------------------------- the entity
 
 class Entity:
-    """A scratch entity: store, agent dir and coordinator dir, plus helpers that make each condition."""
+    """A scratch entity: store, agent dir and desk dir, plus helpers that make each condition."""
 
     def __init__(self, root: Path, episodes: int = 3) -> None:
         self.root = root
@@ -92,12 +92,12 @@ class Entity:
              "occurrences": []}), encoding="utf-8")
 
     def pending_launch(self) -> str:
-        from levain.coordinator.store import CoordStore
+        from levain.desk.store import CoordStore
 
         cs = CoordStore(self.coord_dir)
         cs.coord_set_agent("claude", cwd=str(self.root))
         cs.accept_drop("fix the build", surface="cli")
-        return cs.pending_coordinator().launch_id
+        return cs.pending_desk().launch_id
 
     def evaluate(self, *, now: datetime = NOW, day: date = DAY, manual: bool = False, with_dirs: bool = True,
                  sources_patch=None) -> rd.Verdict:
@@ -295,14 +295,14 @@ def test_check4_a_quiet_for_a_known_fact_outranks_an_unreadable_source(ent):
 
 # --------------------------------------------------------------------------------------- check 5: no live session
 
-def test_check5_a_pending_coordinator_launch_is_a_live_seat(ent):
+def test_check5_a_pending_desk_launch_is_a_live_seat(ent):
     lid = ent.pending_launch()
     v = ent.evaluate()
     assert (v.verdict, v.check, v.kind) == (rd.QUIET, 5, "live-seat") and lid in v.reason
 
 
-def test_check5_an_active_coordinator_launch_is_a_live_seat(ent):
-    from levain.coordinator.store import CoordStore
+def test_check5_an_active_desk_launch_is_a_live_seat(ent):
+    from levain.desk.store import CoordStore
 
     lid = ent.pending_launch()
     cs = CoordStore(ent.coord_dir)
@@ -547,7 +547,7 @@ def test_check3_excludes_only_the_one_wrap_an_own_occurrence_made(ent):
 
 def test_check5_a_pending_launch_whose_spawn_is_claimed_is_still_a_live_seat(ent):
     """Reproduced: ``launches_unspawned`` drops a claimed spawn and ``launches_active`` does not hold it yet."""
-    from levain.coordinator.store import CoordStore
+    from levain.desk.store import CoordStore
 
     lid = ent.pending_launch()
     assert CoordStore(ent.coord_dir).launch_claim_spawn(lid, 4242)[1] is None

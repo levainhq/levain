@@ -123,8 +123,8 @@ from levain.cockpit import voice as cockpit_voice
 from levain.voice import custody as voice_custody
 from levain.voice import meter as voice_meter
 from levain.voice import providers as voice_providers
-from levain.coordinator import chat_lease
-from levain.coordinator.store import CoordError
+from levain.desk import chat_lease
+from levain.desk.store import CoordError
 from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb,
                                   record_served_verbs, retier)
 
@@ -142,7 +142,7 @@ from levain.writes import (
 )
 
 if TYPE_CHECKING:
-    from levain.coordinator.chat import ChatService
+    from levain.desk.chat import ChatService
     from levain.consent.grant_phone import GrantPhone
     from levain.consent.sign import Signer
 
@@ -298,8 +298,8 @@ _SIGN_ONE_SUFFIX = ".json"
 # beside a Signer: without one every path here is 404, and the page's revoke button copies the terminal line.
 _GRANT_LIST_PATH = "/cockpit/grant/list.json"
 _GRANT_PREFIX = "/cockpit/grant/"
-# The envelopes' passkey revoke (board row 153), the same ceremony over the coordinator store the Signer's queue names
-# (levain.coordinator.envelope_revoke.EnvelopeRevoke, built by make_server from the Signer, never from the consent
+# The envelopes' passkey revoke (board row 153), the same ceremony over the desk store the Signer's queue names
+# (levain.desk.envelope_revoke.EnvelopeRevoke, built by make_server from the Signer, never from the consent
 # reader's directory): GET /cockpit/envelope/list.json and POST /cockpit/envelope/<id>/{revoke-challenge,revoke}, behind
 # the grant routes' gate exactly, and served only beside a Signer.
 _ENVELOPE_LIST_PATH = "/cockpit/envelope/list.json"
@@ -873,18 +873,18 @@ class DispatchSheet:
         return self._row(rec, self.elsewhere())
 
 
-# ONESURFACE OS-2, the coordinator drop family: a drop (words, optionally with an envelope signed by a passkey) sent from the
-# cockpit, through the phone port's OWN class (levain.coordinator.phone.CoordPhone, the very object phone_server builds), over
+# ONESURFACE OS-2, the desk drop family: a drop (words, optionally with an envelope signed by a passkey) sent from the
+# cockpit, through the phone port's OWN class (levain.desk.phone.CoordPhone, the very object phone_server builds), over
 # the Signer's queue (the dispatch directory IS the consent directory), rpId, keys and pinned page. GET /cockpit/coord/drops.json
 # is the sheet's read (the phone's coord_* listing keys), POST /cockpit/coord/<action> (the drop and envelope actions, and the draft-* sign flow of
-# levain.coordinator.draft_sign) the phone's /coord/<action> by name, behind the sign routes' gate exactly, and GET /sign/drop the sheet's page, whose envelope
+# levain.desk.draft_sign) the phone's /coord/<action> by name, behind the sign routes' gate exactly, and GET /sign/drop the sheet's page, whose envelope
 # signing is the sign sheet's own passkey ceremony. Served beside a Signer only; else every path here is 404.
 _COORD_ACTIONS = ("drop", "envelope-review", "envelope-challenge", "draft-cards", "draft-rule", "draft-withdraw",
                   "draft-review", "draft-challenge", "draft-accept")
 _COORD_PREFIX = "/cockpit/coord/"
 _COORD_LIST = "/cockpit/coord/drops.json"
 _COORD_SHEET = "/sign/drop"
-# The phone's coordinator routes take a drop from a PAIRED DEVICE only (its token's device id is handed to CoordPhone.step,
+# The phone's desk routes take a drop from a PAIRED DEVICE only (its token's device id is handed to CoordPhone.step,
 # which binds a kept envelope review to it). The cockpit's gate takes a surface token OR a paired device's token, so the
 # device a step runs as is read from the request's AUTHENTICATED credential (_coord_device), never fixed: a paired device
 # runs as its own id ("d-" + hex, never the name below), and only the cockpit page's own surface token ("browser") runs as this
@@ -892,7 +892,7 @@ _COORD_SHEET = "/sign/drop"
 # run as the cockpit). Who may add a launch grant is _Handler._coord_may_launch: the cockpit page, and a paired device
 # whose pairing chain starts at the cockpit page or the laptop's `levain cockpit pair` (Phill 2026-11-08, row 460),
 # never another surface's token or its devices.
-_COORD_DEVICE = "cockpit"          # == levain.coordinator.phone.COCKPIT_DEVICE
+_COORD_DEVICE = "cockpit"          # == levain.desk.phone.COCKPIT_DEVICE
 # the pairing roots a launch-grant device may start from (row 460): the cockpit page and the laptop's `cockpit pair`
 _LAUNCH_ROOTS = frozenset({"browser", BOX_MINTER})
 
@@ -906,7 +906,7 @@ def _coord_route(route: str) -> "str | None":
 
 
 class CoordSheet:
-    """The coordinator drop family on the cockpit (OS-2): :class:`levain.coordinator.phone.CoordPhone` itself, built as
+    """The desk drop family on the cockpit (OS-2): :class:`levain.desk.phone.CoordPhone` itself, built as
     phone_server builds it over the Signer's own values (the dispatch directory is the Signer's queue, the keys the
     Signer's, the page origin the one the Signer is pinned to). A drop is delivered by the same store call ``levain drop``
     makes; an envelope signature passes the phone's checks (a passkey enrolled on ``rp_id`` whose class covers the
@@ -915,7 +915,7 @@ class CoordSheet:
     page the verification would refuse (as the dispatch family's is); a plain drop signs nothing and is never refused for it."""
 
     def __init__(self, queue_dir: Path, rp_id: str, page_origin: "str | None", signer: "Signer") -> None:
-        from levain.coordinator.phone import CoordPhone
+        from levain.desk.phone import CoordPhone
 
         self.queue_dir, self.rp_id, self.page_origin, self.signer = Path(queue_dir), rp_id, page_origin, signer
         self.phone = CoordPhone(self.queue_dir, rp_id, page_origin, signer.keys)
@@ -946,10 +946,10 @@ class CoordSheet:
     def step(self, action: str, req: Any, *, device: "str | None", may_launch: bool = False) -> "dict[str, Any]":
         """``POST /cockpit/coord/<action>``: :meth:`CoordPhone.step`'s reply (a challenge's also carries ``line``, the exact
         text signed). ``device`` is the authenticated device the request runs as (the handler's ``_coord_device``).
-        :class:`levain.coordinator.phone.CoordRefused` with the phone port's status, word and words."""
-        from levain.coordinator import envelope as env
-        from levain.coordinator.draft_sign import SIGNING
-        from levain.coordinator.phone import CoordRefused
+        :class:`levain.desk.phone.CoordRefused` with the phone port's status, word and words."""
+        from levain.desk import envelope as env
+        from levain.desk.draft_sign import SIGNING
+        from levain.desk.phone import CoordRefused
 
         signs = action in ("envelope-review", "envelope-challenge", *SIGNING) or (
             action == "drop" and isinstance(req, dict) and req.get("envelope") is not None)
@@ -1893,7 +1893,7 @@ def build_job_json(job_runtime: "JobRuntime | None", job_id: str) -> bytes:
 
 
 def _board_value(server: Any, *, stamped: bool = True) -> dict[str, Any]:
-    """The cockpit's own board value (:func:`levain.cockpit.board.build`) over this server's coordinator store directory and
+    """The cockpit's own board value (:func:`levain.cockpit.board.build`) over this server's desk store directory and
     question store: the one read behind both ``GET /cockpit/board.json`` and the built-in Work board panel, so the two cannot
     disagree. The panel reads it ``stamped=False``: the read's own clock stamp would change the panel's etag every second and
     announce a change on the stream when nothing moved (the manifest already says when a panel was read)."""
@@ -1909,7 +1909,7 @@ def _board_value(server: Any, *, stamped: bool = True) -> dict[str, Any]:
 
 
 def _drop_files_here(server: Any, directory: Any) -> bool:
-    """Whether "Drop about this card" files to the coordinator that reads THIS board's store: the drop route posts through the
+    """Whether "Drop about this card" files to the desk that reads THIS board's store: the drop route posts through the
     coord sheet's queue, the board reads the consent reader's, and the two can differ (see where the grant route is decided).
     No coord sheet, no board directory, or two different directories: False."""
     sheet = getattr(server, "coord_sheet", None)
@@ -2058,7 +2058,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # the dispatch family's sign, cancel and authorise (OS-2), built by make_server beside the Signer; None serves no
     # dispatch signing route
     dispatch_sheet: "DispatchSheet | None" = None
-    # the coordinator drop family's drop and envelope signing (OS-2), built beside the Signer; None serves no drop route
+    # the desk drop family's drop and envelope signing (OS-2), built beside the Signer; None serves no drop route
     coord_sheet: "CoordSheet | None" = None
     # the caller's compose_signer (DESIGN_SIGN D5): (verb, params) -> the id of the sign request it filed; None serves no
     # compose route
@@ -3633,7 +3633,7 @@ class _Handler(GuardedHandler):
             self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
                        "application/json; charset=utf-8", status=404, head=head, cache_control="private, no-store")
             return
-        if not self._sign_read_admitted(head=head, what="the coordinator drops"):
+        if not self._sign_read_admitted(head=head, what="the desk drops"):
             return
         try:
             payload: dict[str, Any] = sheet.listing()
@@ -3649,7 +3649,7 @@ class _Handler(GuardedHandler):
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
         except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection
-            status, payload = 500, _store_fault("coordinator drops", exc)
+            status, payload = 500, _store_fault("desk drops", exc)
         finally:
             self.server.request_gate.release()
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
@@ -3658,7 +3658,7 @@ class _Handler(GuardedHandler):
     def _coord_post(self, action: str, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/coord/<action>`` (OS-2): the coord sheet's reply and status, or its refusal as
         ``{error, message}`` with the phone port's status."""
-        from levain.coordinator.phone import CoordRefused
+        from levain.desk.phone import CoordRefused
 
         sheet = self.server.coord_sheet
         if sheet is None:      # the route is not served without one; an explicit check survives `python -O`
@@ -4371,7 +4371,7 @@ class _Handler(GuardedHandler):
                    "application/json; charset=utf-8", status=404, head=head, cache_control="private, no-store")
 
     def _serve_threads(self, path: str, *, head: bool) -> None:
-        """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the coordinator's threads and
+        """``GET /cockpit/threads.json`` and ``GET /cockpit/thread/<th-id>.json`` (CH-U1a): the desk's threads and
         one thread's stream, read-only (:func:`levain.cockpit.threads.serve_threads`). A thread carries the operator's
         lines and the agent's words and tool calls, so it rides the consent body's gate: reached only through
         ``_route``, then a surface token on every bind, before the store is opened. ``dispatch.db`` lives in the consent
@@ -4401,8 +4401,8 @@ class _Handler(GuardedHandler):
 
     def _serve_board(self, *, head: bool) -> None:
         """``GET /cockpit/board.json`` (C12): the ready queue's read-only board (:func:`levain.cockpit.board.build`), behind
-        the thread record's gate (a surface token on every bind). Read-only: the coordinator store is opened read-only and
-        no live coordinator is needed; a store never made is ``queue: "none"``, one that cannot be read is named in
+        the thread record's gate (a surface token on every bind). Read-only: the desk store is opened read-only and
+        no live desk is needed; a store never made is ``queue: "none"``, one that cannot be read is named in
         ``unreadable``. No POST reaches it (the write routes are a closed set)."""
         if not self._off_box_token_valid():
             self._gated_read_403("the board needs", head=head)
@@ -5149,7 +5149,7 @@ class _Handler(GuardedHandler):
         consent = _consent_sign_route(route) if self.server.consent_sheet is not None else None
         # and the dispatch family's sign, cancel and authorise (OS-2): the same ceremony class, the same gate
         dispatch = _dispatch_sign_route(route) if self.server.dispatch_sheet is not None else None
-        # and the coordinator drop family's drop and envelope review/challenge (OS-2): the same gate
+        # and the desk drop family's drop and envelope review/challenge (OS-2): the same gate
         coord = _coord_route(route) if self.server.coord_sheet is not None else None
         # and the key-line family's key line (OS-2): the same gate
         key_line = route == _KEY_LINE_ROUTE and self.server.signer is not None
@@ -5310,7 +5310,7 @@ class _Handler(GuardedHandler):
                 self._send_json(payload, status)
                 return
             if coord is not None:
-                # the phone's coordinator routes (the passkey's signature, verified by the coordinator store, is the
+                # the phone's desk routes (the passkey's signature, verified by the desk store, is the
                 # authority for an envelope): no read-only refusal applies to it
                 try:
                     payload, status = self._coord_post(coord, req)
@@ -5587,7 +5587,7 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
     if scope is None:
         return None
     spores, episodes = scope.anneal.spores_json, scope.anneal.episodic_db
-    from levain.cockpit.coord_effects import COORDINATOR, CoordDropEffectStore
+    from levain.cockpit.desk_effects import DESK, CoordDropEffectStore
     from levain.cockpit.providers import _dispatch_dir
 
     def coord_dir() -> Any:
@@ -5597,7 +5597,7 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
 
     return Broker(scope.ledger_root / "cockpit",
                   stores={SPORES: SporeEffectStore(spores), EPISODES: EpisodeEffectStore(episodes),
-                          COORDINATOR: CoordDropEffectStore(coord_dir),
+                          DESK: CoordDropEffectStore(coord_dir),
                           **({SECTIONS: SectionEffectStore(episodes)} if section_paths_agree(scope.anneal)
                              else {})},
                   install_class=install_class, store_paths=[spores, episodes], downstream=downstream,
@@ -5625,7 +5625,7 @@ def make_server(
     signer: "Signer | None" = None,
     extra_hosts: "Iterable[str] | None" = None,
     compose_signer: "Callable[[str, dict[str, Any]], str] | None" = None,
-    coordinator_verbs: bool = False,
+    desk_verbs: bool = False,
     work_board: bool = True,
     chat_service: "ChatService | None" = None,
     room_host: "cockpit_room.RoomHost | None" = None,
@@ -5682,7 +5682,7 @@ def make_server(
     ``threads=False`` offers no Threads zone: ``GET /cockpit/threads.json`` and ``/cockpit/thread/<id>.json`` answer 404 and
     the manifest's ``transport`` carries ``threads: false`` (absent by default), which the page reads to draw no zone.
 
-    ``coordinator_verbs`` says a coordinator watcher runs beside this server: only then, over a write scope, are the
+    ``desk_verbs`` says a desk watcher runs beside this server: only then, over a write scope, are the
     Desk panel's Start / Stop / Hold registered (a caller's verb or effect under one of their names is then a
     ``ValueError``). Without a watcher a Stop would end the launch's record while its session ran on.
 
@@ -5893,11 +5893,11 @@ def make_server(
         team_v, team_e = team_verbs(source.install_root)
         extra_verbs.update(team_v)
         extra_effects.update(team_e)
-    if coordinator_verbs and source.write_scope is not None:
+    if desk_verbs and source.write_scope is not None:
         # C10 S3: Start / Stop / Hold on the Desk panel, over the directory that panel reads, only beside the
         # watcher that stops a released session and retries a pending launch. The directory is read on each call (the
         # consent reader is attached below), and a caller's verb under one of these names is refused.
-        from levain.cockpit import coordinator_status
+        from levain.cockpit import desk_status
         from levain.cockpit.providers import _dispatch_dir
 
         def coord_dir() -> Any:
@@ -5908,7 +5908,7 @@ def make_server(
                 reader = None
             return _dispatch_dir(reader)
 
-        coord_v = coordinator_status.status_verbs(coord_dir)
+        coord_v = desk_status.status_verbs(coord_dir)
         clash = sorted(n for n in coord_v if n in extra_verbs or n in extra_effects)
         if clash:
             raise ValueError(f"refusing extra_verbs/extra_effects {clash}: those names are the Desk panel's verbs")
@@ -6184,7 +6184,7 @@ def make_server(
             httpd.coord_sheet = CoordSheet(sign_queue, signer.rp_id, signer.page_origin, signer)   # and the drop family
             # and the envelope revoke (row 153) over that same queue's store: where the drops' signed envelopes are
             # written, whatever the consent reader names (flow's bridge swaps the reader for one with no directory)
-            from levain.coordinator.envelope_revoke import EnvelopeRevoke
+            from levain.desk.envelope_revoke import EnvelopeRevoke
 
             httpd.envelope_revoke = EnvelopeRevoke(sign_queue, signer.rp_id, signer.page_origin, signer.keys)
             # only when the grant cards this page shows come from that same queue (/cockpit/consent/grants.json reads
@@ -6414,7 +6414,7 @@ def run_web_server(
     try:
         # the Desk panel's verbs exactly when the watcher below runs beside this server
         httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class,
-                            coordinator_verbs=write, **sign_kw)
+                            desk_verbs=write, **sign_kw)
     # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback — or
     # make_server's own refusal of the signer or its name
     except ValueError as exc:
@@ -6491,9 +6491,9 @@ def run_web_server(
     watcher = None
     try:
         if write:
-            # C10 S1: a writable serve supervises the coordinator, over the directory its Desk panel reads
+            # C10 S1: a writable serve supervises the desk, over the directory its Desk panel reads
             from levain.cockpit.providers import _dispatch_dir
-            from levain.coordinator.supervise import Watcher, default_store
+            from levain.desk.supervise import Watcher, default_store
 
             watcher = Watcher(lambda: default_store(_dispatch_dir(getattr(httpd, "consent_reader", None)))).start()
         httpd.serve_forever()
@@ -6511,15 +6511,15 @@ def run_web_server(
 
 
 def _build_room_serve(room: Path, host_commands: Any = None) -> Any:
-    """The :class:`~levain.coordinator.room_serve.RoomServe` ``levain serve --room DIR`` hands ``make_server``, over the
+    """The :class:`~levain.desk.room_serve.RoomServe` ``levain serve --room DIR`` hands ``make_server``, over the
     consent queue's ``dispatch.db`` (the file the cockpit's room reads). ``DIR`` is where the room's file tools see first:
     an existing directory. Built here, started by ``make_server`` after every refusal has passed. ``host_commands`` is
-    the host's :class:`~levain.coordinator.room_host.HostCommands` (flow's bridge passes its desk relay and replies
+    the host's :class:`~levain.desk.room_host.HostCommands` (flow's bridge passes its desk relay and replies
     commands; levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card."""
     from levain.consent.queue import default_queue_dir
-    from levain.coordinator.envelopes import EnvelopeStore
-    from levain.coordinator.room_launch import RoomSetting
-    from levain.coordinator.room_serve import RoomServe
+    from levain.desk.envelopes import EnvelopeStore
+    from levain.desk.room_launch import RoomSetting
+    from levain.desk.room_serve import RoomServe
 
     cwd = _canonical_path(Path(room).expanduser())
     if not cwd.is_dir():

@@ -1,5 +1,5 @@
 """THE LIST contract in Levain (task_surfaces_1107.md, np-7c5c8752 (a)): a timed ``next``, the ``desk`` target,
-``germinate --timed``, and talk seeds. Temp dirs only; the ping seam is replaced; the coordinator is the real store."""
+``germinate --timed``, and talk seeds. Temp dirs only; the ping seam is replaced; the desk is the real store."""
 from __future__ import annotations
 
 import json
@@ -15,7 +15,7 @@ from levain import spores as sp
 from levain.cli import main
 from levain.consent import band
 from levain.consent.questions import QuestionStore
-from levain.coordinator.store import WORDS_MAX, CoordStore
+from levain.desk.store import WORDS_MAX, CoordStore
 from levain.spores import guarded_spore_store
 
 TODAY = date(2026, 11, 7)
@@ -140,7 +140,7 @@ def test_valid_target_accepts_band_nudge_desk_and_board_repo():
         assert not sp.valid_target(bad)
 
 
-def test_desk_with_a_coordinator_files_his_words_verbatim_stamps_and_composts(tmp_path, qdir, pings):
+def test_desk_with_a_desk_files_his_words_verbatim_stamps_and_composts(tmp_path, qdir, pings):
     root = _install(tmp_path)
     words = "ask Jess about the fellowship\n\n  second paragraph, indented\tand tabbed\n" + "x" * 5000
     s = _add(root, words, target="desk")
@@ -159,14 +159,14 @@ def test_desk_with_a_coordinator_files_his_words_verbatim_stamps_and_composts(tm
     assert _drops(qdir) == before + 1
 
 
-def test_desk_without_a_coordinator_store_falls_back_to_a_band_row(tmp_path, qdir, pings):
+def test_desk_without_a_desk_store_falls_back_to_a_band_row(tmp_path, qdir, pings):
     root = _install(tmp_path)
     s = _add(root, "ask Jess", target="desk")
     assert not (qdir / "dispatch.db").exists()
     (o,) = _run(root, qdir, _at(9, 0))["due"]
     assert o["via"] == "band-fallback" and o["done"] and s["id"] in _open_ids(root)
     (q,) = _rows(qdir)
-    assert q.id == o["ref"] and "desk" in q.blocks and "no coordinator" in q.blocks
+    assert q.id == o["ref"] and "desk" in q.blocks and "no desk" in q.blocks
     assert not (qdir / "dispatch.db").exists() and pings == []
     assert SporeStore(_spores(root)).get(s["id"])["germinated"]["target"] == "desk"
 
@@ -285,7 +285,7 @@ def test_the_store_carries_a_talk_seed_and_it_is_recognised_and_never_germinated
 @pytest.mark.parametrize("target", ["band", "nudge", "desk", "board:levain"])
 def test_s1_an_agenda_that_filed_or_adopted_a_question_stays_open_and_a_finish_run_leaves_it(tmp_path, qdir, pings, target):
     root = _install(tmp_path)
-    s = _add(root, "ring me", target=target)           # no coordinator: desk / board fall back to the band
+    s = _add(root, "ring me", target=target)           # no desk: desk / board fall back to the band
     (o,) = _run(root, qdir, _at(9, 0))["due"]
     assert o["ref"].startswith("q-") and o["done"] and s["id"] in _open_ids(root)
     again = _run(root, qdir, _at(9, 0))
@@ -303,7 +303,7 @@ def test_s1_an_adopted_question_stays_live_too(tmp_path, qdir):
     assert _run(root, qdir, _at(9, 0))["finish"] == []
 
 
-def test_s1_a_coordinator_drop_spore_still_composts(tmp_path, qdir, pings):
+def test_s1_a_desk_drop_spore_still_composts(tmp_path, qdir, pings):
     root = _install(tmp_path)
     s = _add(root, "ask Jess", target="desk")
     _make_board(qdir, tmp_path)

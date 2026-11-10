@@ -91,7 +91,7 @@
   {
    "namespace": "levain-thread-envelope",
    "status": "reserved",
-   "owner": "levain/coordinator/envelope.py"
+   "owner": "levain/desk/envelope.py"
   },
   {
    "namespace": "levain-allowed-signers",
@@ -101,7 +101,7 @@
   {
    "namespace": "levain-review-clear",
    "status": "shipped",
-   "owner": "levain/coordinator/review.py"
+   "owner": "levain/desk/review.py"
   },
   {
    "namespace": "levain-answer-countersign",
@@ -116,7 +116,7 @@
   {
    "namespace": "levain-envelope-revoke",
    "status": "shipped",
-   "owner": "levain/coordinator/envelope_revoke.py"
+   "owner": "levain/desk/envelope_revoke.py"
   },
   {
    "namespace": "levain-terminal-answer",

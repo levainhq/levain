@@ -95,7 +95,7 @@ def dream_spec(role_hash: str, binding: str | None = None) -> dict[str, Any]:
         "role": {"name": NAME, "role_hash": role_hash},
         "input": {"source": LIVE_SOURCE if binding is None else SHADOW_SOURCE + binding, "liveness": LIVENESS},
         "output": {"class": "push",
-                   "destination": "the coordinator review queue, feed agent: one card per consolidating occurrence",
+                   "destination": "the desk review queue, feed agent: one card per consolidating occurrence",
                    "reader": "flow at /morning; Phill only for authority_relevant cards",
                    "moment": "/morning, cleared by 14:00 the next day"},
         "win": {"kind": "verifier", "check": WIN_CHECK},
@@ -178,7 +178,7 @@ def shadow_signing_card_text(zone: str, *, flow_root: Path | str, scratch: Path 
     return (f"Dream runs as a SHADOW of flow's dream, once a night between 22:00 and 05:00 ({zone}), and only for a "
             f"day flow's own dream has committed. Its input is flow's committed pre-dream snapshot under {flow_root}, "
             "read only, each file checked against the hash that snapshot's own manifest records, and copied into the "
-            f"scratch store {scratch}. It writes: that scratch store; one comparison card a night in the coordinator "
+            f"scratch store {scratch}. It writes: that scratch store; one comparison card a night in the desk "
             f"queue {coord_dir} (its composed text against flow's composed text, which is read as is); and its own "
             f"run state plus a read-only copy of flow's instructions file {flow_instructions} in its agent store "
             f"{agent_dir}. None of these may sit inside ~/.anneal-memory or {flow_root}; it never writes flow's memory "
@@ -282,7 +282,7 @@ def unwired_on_input(row: Mapping[str, Any]) -> InputVerdict:
 
 
 class InputUnreadable(RuntimeError):
-    """The day's input could not be read (a corrupt or locked store, an unreadable coordinator source). The controller
+    """The day's input could not be read (a corrupt or locked store, an unreadable desk source). The controller
     reads a raising hook as dead input: the row stays retryable within its grace and ends ``missed`` past it, never
     ``skipped-no-input``."""
 
@@ -353,8 +353,8 @@ def _item_by_dedupe(review_store: Any, feed: str, dedupe: str) -> Any | None:
     """The filed item with this ``dedupe_key`` in ``feed``, or None. ``review.Item`` does not carry the key, so it is
     read from the table."""
     from levain.autonomic.durable_sqlite import read_transaction
-    from levain.coordinator import review
-    from levain.coordinator.store import StoreAbsent
+    from levain.desk import review
+    from levain.desk.store import StoreAbsent
 
     try:
         with read_transaction(review_store.open_readonly) as conn:
@@ -428,8 +428,8 @@ def _class_of(reason: object) -> str:
 def _open_same_class(review_store: Any, feed: str, agent_id: str, cls: str) -> bool:
     """True when any open did-not-consolidate item of this agent, whatever its night, carries class ``cls``."""
     from levain.autonomic.durable_sqlite import read_transaction
-    from levain.coordinator import review
-    from levain.coordinator.store import StoreAbsent
+    from levain.desk import review
+    from levain.desk.store import StoreAbsent
 
     prefix = f"dream-night:{agent_id}:"
     try:
@@ -552,7 +552,7 @@ def renewal_check(link: Mapping[str, Any], *, now: datetime, review_store: Any,
         return RenewalResult("expired", left)
     if left > days_before:
         return RenewalResult("not-due", left)
-    from levain.coordinator import review
+    from levain.desk import review
 
     body = {"kind": "renewal-due", "link": link_id, "expires_at": str(link["expires_at"]),
             "reason": f"the dream's link {link_id} expires {link['expires_at']}; its renewal is his signature",
@@ -732,7 +732,7 @@ _INSTALL_KEYS = ("store_path", "cockpit_root", "coord_dir", "zone")
 @dataclass(frozen=True)
 class DreamInstall:
     """What a dream occurrence needs that the agent store does not hold: the install's anneal ``memory.db``, the cockpit
-    root its authority log is replayed from, the coordinator queue directory (the review store and the live-session
+    root its authority log is replayed from, the desk queue directory (the review store and the live-session
     reads), the install's zone, and the first-run facts file the Claude route's exposure check reads."""
     store_path: Path
     cockpit_root: Path
@@ -782,7 +782,7 @@ def _fact_path(doc: Mapping[str, Any], key: str, path: Path, *, kind: str, writi
 def shadow_store_refusal(store_path: Path | str, flow_root: Path | str | None = None, *,
                          coord_dir: Path | str | None = None, agent_dir: Path | str | None = None) -> str | None:
     """Why a shadow install may not write where its facts say, or None. Every directory a shadow writes is judged:
-    the scratch store and its directory (``store_path``), the coordinator queue its card is filed in (``coord_dir``)
+    the scratch store and its directory (``store_path``), the desk queue its card is filed in (``coord_dir``)
     and the agent store that holds its run state and instructions copy (``agent_dir``). Refused: a relative path, and
     any of them that RESOLVES (symlinks followed, a resolve that fails refusing) inside the operator's live store
     ``~/.anneal-memory`` (case-insensitive) or, given ``flow_root``, inside flow's ``state/dream`` root. The one check
@@ -1232,11 +1232,11 @@ def _shadow_check(inst: DreamInstall, agent_dir: Path | str) -> Callable[[Mappin
 def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str, Any]:
     """The keyword arguments of :func:`run_body` for a dream occurrence, built from the install facts in the agent
     store's directory: the supervisor over the install's authority log, the dream's executor, the consolidate with the
-    snapshot hooks bound, and the coordinator's review store. Nothing here runs the compose. A failure to build
+    snapshot hooks bound, and the desk's review store. Nothing here runs the compose. A failure to build
     raises, and :func:`make_run` reads that as a run that did not start."""
     from levain.agent_authority import AgentAuthority
     from levain.agents import supervise
-    from levain.coordinator.store import CoordStore
+    from levain.desk.store import CoordStore
     from levain.dream import executor as ex
 
     inst = read_install(store.directory)
