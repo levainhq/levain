@@ -248,11 +248,15 @@ class IntentionStale(ConsentError):
     stale = True
 
 
-def until_refusal(until: Any, today: str | None = None, now: datetime | None = None) -> str | None:
+def until_refusal(until: Any, today: str | None = None, *, now: datetime | None = None) -> str | None:
     """The one check of where a snooze sends an intention, in the words the operator reads: ``until`` is a real
     ``YYYY-MM-DD`` or ``YYYY-MM-DDTHH:MM``, and when ``today`` (local ``YYYY-MM-DD``) is given, a day after it. Given the
-    aware instant ``now`` instead, a date-only ``until`` must still be after the local day, while a timed one is judged to
-    the minute against the local wall minute: a later minute today passes. None = it may be set."""
+    aware instant ``now`` instead (keyword only; both is a ``ValueError``), a date-only ``until`` must still be after the
+    local day, while a timed one is judged to the minute against the local wall minute: a later minute today passes. The
+    wall minute carries no offset, so the repeated hour of a DST fall-back is treated as one minute (the refusing side).
+    None = it may be set."""
+    if now is not None and today is not None:
+        raise ValueError("until_refusal takes today or now, not both")
     ok = False
     if isinstance(until, str):
         if valid_date(until):
@@ -266,9 +270,10 @@ def until_refusal(until: Any, today: str | None = None, now: datetime | None = N
     if not ok:
         return "pick a day: that date could not be read"
     if now is not None:
-        today = local_today(now)
+        local = now.astimezone()          # ONE conversion gives both the day and the minute, so a zone change cannot split them
+        today = local.date().isoformat()
         if len(until) > 10 and until[:10] == today:
-            return "pick a time after now" if until <= local_minute(now) else None
+            return "pick a time after now" if until <= local.strftime("%Y-%m-%dT%H:%M") else None
     if today is not None and until[:10] <= today:
         return "pick a later day"
     return None
