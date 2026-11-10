@@ -330,3 +330,20 @@ def test_only_the_snoozes_own_refusal_sentences_reach_the_form(tmp_path: Path, l
     seen = _probe(out)
     assert seen["msg"] == "That request was not understood. Reload and try again." and "secret" not in seen["msg"], seen
     assert seen["live"] >= 2, seen
+
+
+@needs_browser
+def test_on_a_phone_a_focused_reminder_card_keeps_the_44px_verbs(tmp_path: Path, lh: Path) -> None:
+    """The focused Needs-you card's 38px desktop verbs must not undercut the phone touch floor."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    open_ring = ("(() => { if (document.querySelector('#levain-modal .needs-card .intention-actions button')) return 1;"
+                 " const r = [...document.querySelectorAll('#ck-needs .needs-row, #ck-needs .needs-card')].find(x => /renew the thing/.test(x.textContent));"
+                 " if (r) r.click(); return 1; })()")
+    probe = ("JSON.stringify({sizes: [...document.querySelectorAll('#levain-modal .needs-card .intention-actions button')].filter(b => b.offsetParent)"
+             ".map(b => b.getBoundingClientRect().height), probe: 1})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [PHONE,
+            {"do": open_ring, "until": "document.querySelectorAll('#levain-modal .needs-card .intention-actions button').length >= 4", "ms": 30000, "every": 2000},
+            {"eval": probe}])
+    sizes = _probe(out)["sizes"]
+    assert len(sizes) >= 4 and all(h >= 44 for h in sizes), sizes
