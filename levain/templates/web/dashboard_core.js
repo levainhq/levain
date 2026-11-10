@@ -7162,7 +7162,7 @@
       // V1-7: the speaker that reads the card aloud (card_voice.js); absent when the page has no player or the card has no words;
       // never on an answered card: a receipt has nothing left to read aloud
       const CV = window.LevainCardVoice, sp = CV && !b.error && !settled ? CV.speaker(String(q.id || ""), b) : null;
-      if (sp) { const head = card.querySelector(".needs-head"); if (head) head.appendChild(sp); else card.insertBefore(sp, slot); }   // Play shares the "asked" line
+      if (sp) { const head = card.querySelector(":scope > .needs-head"); if (head) head.appendChild(sp); else card.insertBefore(sp, slot); }   // Play shares the "asked" line
       if (!b.error && !settled) card.appendChild(needsDetails([copyLine("levain question show " + q.n, "show command")], ""));
     });
     return card;
