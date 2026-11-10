@@ -6,6 +6,7 @@ reading the boot source for the two calls that matter."""
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,7 +20,8 @@ const fs = require("fs");
 const src = fs.readFileSync(process.argv[2], "utf8");
 const a = src.indexOf("// BEGIN progressive draw"), b = src.indexOf("// END progressive draw");
 if (a < 0 || b < 0) { console.log(JSON.stringify({ missing: true })); process.exit(0); }
-const lib = new Function(src.slice(a, b) + "; return { drawOrder, manifestSubset, partialPacer, PARTIAL_GAP_MS };")();
+const lib = new Function(src.slice(a, b) + "; return { drawOrder, manifestSubset, partialPacer, PARTIAL_GAP_MS, timedAttempt, readPanelBody, runPartial, mayDrawWhole, PANEL_TIMEOUT_MS };")();
+(async () => {
 const out = {};
 const manifest = {
   panels: { activity: {}, state: {}, begin: {}, decisions: {}, loops: {}, tray: {}, crystals: {} },
@@ -72,7 +74,68 @@ t = 0; timers = []; const d3 = [];
 const q = lib.partialPacer([], 10, (n) => d3.push(n), clock);
 q.settled("a"); q.settled("b"); q.stop(); advance(5000);
 out.stopped = { draws: d3.length, timers: timers.length };
+
+// a draw that throws is swallowed, the pacing state stays sane and a later draw still happens
+t = 0; timers = []; const d4 = []; let boom = true;
+const w = lib.partialPacer([], 10, (n) => { d4.push(n); if (boom) { boom = false; throw new Error("draw failed"); } }, clock);
+const quiet = console.warn; console.warn = () => {};
+let threw = false;
+try { w.settled("a"); } catch (e) { threw = true; }
+w.settled("b"); advance(lib.PARTIAL_GAP_MS);
+console.warn = quiet;
+out.throwingDraw = { threw, draws: d4 };
+
+// a zone or card with no panels list, and a null one, do not break the narrowing
+const bad = { panels: { a: {} }, regions: { hero: ["a"], brief: [], widgets: [], zones: [null, { id: "z" }, { id: "y", panels: ["a"], cards: [null, { }, { panels: ["a"] }] }] } };
+const bs = lib.manifestSubset(bad, new Set(["a"]));
+out.malformed = bs.regions.zones.map((z) => [z.id, z.panels, z.cards.map((c) => c.panels)]);
+
+// runPartial: a superseded or editing page never maps (the mapper keeps state); a throwing build leaves the board
+let built = 0, shown = 0;
+out.gateShut = [lib.runPartial(() => false, () => { built++; return 1; }, () => { shown++; }), built, shown];
+console.warn = () => {};
+out.buildThrows = [lib.runPartial(() => true, () => { throw new Error("x"); }, () => { shown++; }), shown];
+out.showThrows = lib.runPartial(() => true, () => 1, () => { throw new Error("y"); });
+console.warn = quiet;
+out.gateOpen = [lib.runPartial(() => true, () => 7, (v) => { shown += v; }), shown];
+out.mayDraw = [lib.mayDrawWhole(false, false, true), lib.mayDrawWhole(true, false, true), lib.mayDrawWhole(false, true, true), lib.mayDrawWhole(false, true, false)];
+
+// timeouts per ACTUAL fetch attempt (async, on the fake clock)
+const sleepTick = () => new Promise((r) => setImmediate(r));
+const mkFetch = (script) => (url, signal) => new Promise((res, rej) => {
+  const step = script.shift();
+  if (signal) signal.addEventListener("abort", () => rej(Object.assign(new Error("aborted"), { name: "AbortError" })));
+  if (step.hang) return;
+  res({ status: step.status, ok: step.status === 200, clone() { return this; }, json: async () => step.body, signalAborted: signal ? signal.aborted : null, seenSignal: signal });
+});
+const seen = [];
+async function reauthScenario(waitMs) {
+  t = 0; timers = [];
+  const f = mkFetch([{ status: 403 }, { status: 200, body: { ok: 1 } }]);
+  let release;
+  const io = {
+    attempt: (u) => lib.timedAttempt((url, sig) => { seen.push(sig); return f(url, sig); }, u, clock),
+    isReject: async () => true, token: () => "t", drop: () => {},
+    reauth: () => new Promise((r) => { release = () => r(true); }),
+  };
+  seen.length = 0;
+  const pr = lib.readPanelBody("/p", io).then((v) => ({ v }), (e) => ({ err: e.message }));
+  await sleepTick();
+  advance(waitMs);                      // the token prompt stays open this long
+  await sleepTick(); release(); await sleepTick();
+  const r = await pr;
+  return { r, aborted: seen.map((s) => s.aborted), pending: timers.length };
+}
+out.reauthShort = await reauthScenario(5000);
+out.reauthLong = await reauthScenario(lib.PANEL_TIMEOUT_MS + 1000);
+// a hung read is aborted at the timeout, with its own words
+t = 0; timers = [];
+const hung = lib.readPanelBody("/h", { attempt: (u) => lib.timedAttempt(mkFetch([{ hang: true }]), u, clock), isReject: async () => false, reauth: async () => false, token: () => "", drop: () => {} })
+  .then((v) => ({ v }), (e) => ({ err: e.message }));
+await sleepTick(); advance(lib.PANEL_TIMEOUT_MS - 1); await sleepTick(); out.hungEarly = timers.length;
+advance(1); out.hung = await hung; out.hungTimers = timers.length;
 console.log(JSON.stringify(out));
+})();
 """
 
 
@@ -100,6 +163,23 @@ def test_the_first_board_reads_its_top_first_narrows_the_manifest_and_paces_its_
     assert out["lastNeverDraws"] == 2
     assert (out["slowEarly"], out["slowOnTime"]) == (1, 2)
     assert out["stopped"] == {"draws": 1, "timers": 0}
+    # a partial draw that throws never reaches the read that landed it, and the pacer keeps going
+    assert out["throwingDraw"] == {"threw": False, "draws": [1, 2]}
+    # a zone or card with no panels list, or a null one, narrows to nothing instead of throwing
+    assert out["malformed"] == [["y", ["a"], [["a"]]]]
+    # a superseded or editing page never runs the (stateful) mapping; a throwing mapping or draw leaves the board alone
+    assert out["gateShut"] == [False, 0, 0]
+    assert out["buildThrows"] == [False, 0]
+    assert out["showThrows"] is False
+    assert out["gateOpen"] == [True, 7]
+    # the whole board's draw defers to an open edit once a partial board was drawn, as a passive one always did
+    assert out["mayDraw"] == [True, False, False, True]
+    # the 30 s timer belongs to one fetch attempt: a token prompt held past it does not expire the retry
+    assert out["reauthShort"] == {"r": {"v": {"ok": 1}}, "aborted": [False, False], "pending": 0}
+    assert out["reauthLong"] == {"r": {"v": {"ok": 1}}, "aborted": [False, False], "pending": 0}
+    # a hung read is aborted at the timeout and says so; the timer is gone after
+    assert out["hungEarly"] == 1
+    assert out["hung"] == {"err": "no answer in 30 s"} and out["hungTimers"] == 0
 
 
 def test_the_cold_load_draws_partial_boards_and_a_panel_read_is_bounded() -> None:
@@ -108,6 +188,6 @@ def test_the_cold_load_draws_partial_boards_and_a_panel_read_is_bounded() -> Non
     assert "const onPartial = everDrawn ? null :" in boot
     assert "loadManifestView(passive, onPartial)" in boot
     # the cold placeholder goes with the first useful content, not after the last panel
-    assert 'storeEl.removeAttribute("data-cold");\n          drawnOnce();' in boot
+    assert re.search(r'removeAttribute\("data-cold"\);\s*drawnOnce\(\);', boot)
     # a panel that does not answer is its own failure state, and frees its read slot
-    assert "ctl.abort()" in boot and "PANEL_TIMEOUT_MS" in boot
+    assert "timedAttempt(fetchPanel, url, clock)" in boot and "mayDrawWhole(passive, partialDrawn" in boot
