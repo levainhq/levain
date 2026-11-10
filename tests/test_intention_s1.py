@@ -287,7 +287,7 @@ def test_r2g_an_empty_or_none_path_falls_back(tmp_path: Path, monkeypatch) -> No
     qdir.mkdir(mode=0o700)
     QuestionStore(qdir)
     for path in (None, ""):
-        ns = argparse.Namespace(queue_dir=qdir, number="1", until=LATER, path=path, note=None)
+        ns = argparse.Namespace(queue_dir=qdir, number="1", until=(date.today() + timedelta(days=1)).isoformat(), path=path, note=None)   # a bare store reads the real clock
         rc = band_view.run_band_snooze(ns)       # no row 1: a refusal, never a TypeError
         assert rc != 0
 

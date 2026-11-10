@@ -261,6 +261,7 @@ def test_b2_a_bound_revoke_asks_for_the_key_this_browser_remembers_and_draws_no_
         deadline = time.monotonic() + 30
         while len(rec.steps) < 2 and time.monotonic() < deadline:
             time.sleep(0.05)
+    assert len(rec.steps) == 2, rec.steps      # the server never recorded the second post, or recorded a stray third
     (_g1, a1, r1), (_g2, a2, _r2) = rec.steps
     assert (a1, a2) == ("revoke-challenge", "revoke")
     assert r1["signer_fp"] == newer.key.fingerprint, r1                 # it asked for the remembered key, no pick drawn
