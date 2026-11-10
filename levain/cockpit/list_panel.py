@@ -207,17 +207,23 @@ def _stored(rid: str, text: str, kind: str, domain: str, nxt: str | None, pointe
             "tier": tier}
 
 
-def _age_text(instant: Any, now: datetime) -> str | None:
-    """How long since ``instant`` as the terminal footer writes it: minutes under an hour, hours under a day, else days and hours.
-    None when the instant is unusable or still ahead."""
+def _aware_instant(instant: Any) -> datetime | None:
+    """``instant`` as an aware datetime: a tz-naive stamp is the host's local time. None when it is unusable."""
     if not isinstance(instant, str) or not instant or len(instant) > 40:
         return None
     try:
         t = datetime.fromisoformat(instant[:-1] + "+00:00" if instant.endswith("Z") else instant)
     except ValueError:
         return None
-    if t.tzinfo is None:
-        t = t.astimezone()
+    return t.astimezone() if t.tzinfo is None else t
+
+
+def _age_text(instant: Any, now: datetime) -> str | None:
+    """How long since ``instant`` as the terminal footer writes it: minutes under an hour, hours under a day, else days and hours.
+    None when the instant is unusable or still ahead."""
+    t = _aware_instant(instant)
+    if t is None:
+        return None
     secs = (now - t).total_seconds()
     if secs < 0:
         return None
@@ -247,7 +253,7 @@ def _band_row(card: dict[str, Any], today: date, now: datetime) -> RowIn:
     age = _age_text(clock, now)
     if age:
         facets["band_age"] = age      # the first-paint text; the page recomputes it from band_since
-        facets["band_since"] = clock  # the instant the age counts from: stable, so it is in the etag (band_age is not)
+        facets["band_since"] = _aware_instant(clock).isoformat()  # the instant the age counts from, with its offset so the page reads it as the server did; stable, so it is in the etag (band_age is not)
     later = card.get("later")
     if isinstance(later, str) and parse_date(later) and parse_date(later) > today:
         facets["held_until"] = later[:10]

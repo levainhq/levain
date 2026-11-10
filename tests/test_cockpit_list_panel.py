@@ -498,3 +498,15 @@ def test_lpr3_later_rows_sort_by_return_date_then_band_number_as_the_footer_does
     days[q2.id] = "2026-12-01"                                              # one date: the band number decides
     later = [r for r in rig.panel()["rows"] if r["group"] == "later" and r["id"].startswith("band:")]
     assert [r["id"] for r in later] == [f"band:{rig.q.id}", f"band:{q2.id}"]
+
+
+def test_listpanel_a_a_naive_instant_is_sent_with_its_offset_so_the_page_ticks_from_the_same_clock(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The age text reads a stamp with no offset as the host's local time; the page reads such a string as UTC. The row carries the
+    instant with its offset, so the page's tick starts from the instant the server's first-paint age counted from."""
+    naive = (NOW + timedelta(hours=-0.5)).astimezone().replace(tzinfo=None).isoformat()
+    _band_with(monkeypatch, rig, section="you", filed_at=naive, section_since="")
+    _tag, since, age = _band_tag_and_since(rig)
+    assert age == "30m"
+    assert since is not None and datetime.fromisoformat(since).utcoffset() is not None
+    assert datetime.fromisoformat(since) == (NOW + timedelta(hours=-0.5)).astimezone()
