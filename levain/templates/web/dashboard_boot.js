@@ -90,6 +90,7 @@
   const PAIRED_MARK_KEY = "levain_paired_device";
   // The page's own cap on concurrent panel reads (see the batch in the board read below).
   const PANEL_READ_CONCURRENCY = 4;
+  const panelBodies = new Map();   // panel url -> { etag, text } of its last 200, for the conditional read in loadManifestView
   let writeTokenRequired = false;
   // What a missing token is answered with, from the server: "pair" (this request cannot use the owner key: pair the device by a
   // short code) or "owner" (a loopback page: the owner's own token is typed, as before). "" until a 403 body or the manifest says.
@@ -928,7 +929,21 @@
     // One shared re-auth for the batch: if the token rotated after the manifest read, every panel 403s
     // together, so the first one prompts (or drops the dead token) and the rest wait on that same answer.
     let reauth = null;
-    const fetchPanel = (url) => fetch(url, { cache: "no-store", headers: readHeaders() });
+    // A panel read is conditional: the page keeps each panel's last body with its ETag (module-level, so it outlives a
+    // load) and sends If-None-Match; a 304 answers with the held body, so an unchanged panel costs headers, not bytes.
+    // The ETag is per credential class on the server, so a changed credential reads a 200, never another's body.
+    const fetchPanel = async (url) => {
+      const hit = panelBodies.get(url);
+      const headers = readHeaders();
+      if (hit) headers["If-None-Match"] = hit.etag;
+      const res = await fetch(url, { cache: "no-store", headers: headers });
+      if (res.status === 304 && hit) return new Response(hit.text, { status: 200, headers: { "Content-Type": "application/json" } });
+      const etag = res.ok ? res.headers.get("ETag") : null;
+      if (!etag) { panelBodies.delete(url); return res; }
+      const text = await res.text();
+      panelBodies.set(url, { etag: etag, text: text });
+      return new Response(text, { status: 200, headers: { "Content-Type": "application/json" } });
+    };
     // At most PANEL_READ_CONCURRENCY panel reads are in flight, the rest queue in manifest order: one page
     // bursting ~28 reads at once, or two open pages, would otherwise meet the server's concurrency cap.
     // Every read settles (the worker catches its own failure) and so frees its slot.
