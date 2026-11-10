@@ -379,6 +379,9 @@ class _Snap:
     # applied from these at render, from the request's snapshot
     label_keys: dict[str, LabelKey] | None = None
     value_label_key: LabelKey | None = None
+    # what a read with no ``q`` never reports (``Read.hidden_skipped`` / ``hidden_note``): merged in for a search only
+    hidden_skipped: list[dict[str, Any]] = field(default_factory=list)
+    hidden_note: str = ""
 
 
 @dataclass
@@ -1684,7 +1687,9 @@ class Cockpit:
                      res.note if isinstance(res.note, str) else spec.note, res.stale,
                      res.empty if isinstance(res.empty, str) else None,
                      value["value_version"] if spec.kind in VERSIONED_VALUE_KINDS else None, view_order,
-                     label_keys, value_key)
+                     label_keys, value_key,
+                     [{"count": c, "reason": r} for c, r in res.hidden_skipped if c],
+                     res.hidden_note if isinstance(res.hidden_note, str) else "")
 
     @staticmethod
     def _label_key(spec: ProviderSpec, stored: dict[str, Any]) -> LabelKey | None:
@@ -1854,8 +1859,19 @@ class Cockpit:
                         else {})})
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date,
-              auth: RequestAuthority, now: datetime | None = None) -> dict[str, Any]:
+              auth: RequestAuthority, now: datetime | None = None, *, with_hidden: bool = False) -> dict[str, Any]:
+        """``with_hidden``: the request carries a search ``q``, so the rows a read with no query omits
+        (``spec.hidden_unless_q``) are tallied and counted for the search head. Without it the head, its etag and its
+        skip list never see them: the snapshot is shared by every request, so what a query-less read hides it also never hashes."""
         labels = auth.labels
+        hidden = spec.hidden_unless_q
+        held = [r for r in snap.rows if r.get("group") in hidden] if (snap.rows is not None and hidden) else []
+        if held and not with_hidden:
+            snap = dataclasses.replace(snap, rows=[r for r in snap.rows if r.get("group") not in hidden])
+        elif with_hidden and (snap.hidden_skipped or snap.hidden_note):
+            snap = dataclasses.replace(snap, skipped=[*snap.skipped, *snap.hidden_skipped],
+                                       note=f"{snap.note} {snap.hidden_note}".strip() if snap.hidden_note else snap.note,
+                                       status="partial" if snap.status in ("ok", "empty") and snap.hidden_skipped else snap.status)
         listy = spec.kind in ROW_ENGINE_KINDS
         # only a panel whose rows (or value) carry labels renders the snapshot
         labelled = labels if spec.label_key is not None else None
@@ -1872,8 +1888,6 @@ class Cockpit:
         if listy and spec.order and ORDERINGS[spec.order].groups:
             tally: dict[str, int] = {}
             for r in snap.rows or []:
-                if r["group"] in spec.hidden_unless_q:
-                    continue            # sent only to a search: the head never counts what a read with no query omits
                 tally[r["group"]] = tally.get(r["group"], 0) + 1
             o = ORDERINGS[spec.order]
             groups = [{"id": gid, "title": t, "count": tally.get(gid, 0),
@@ -1883,9 +1897,8 @@ class Cockpit:
             title += " (unavailable)"
         elif count is not None:
             title += f" ({count})"
-        search_head = self._search_head(
-            spec, len([r for r in snap.rows if r["group"] not in spec.hidden_unless_q])
-            if listy and snap.rows is not None else count)
+        search_head = self._search_head(spec, len(snap.rows) if listy and snap.rows is not None else count,
+                                        memory=bool(held))
         etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose, search_head, auth=auth)
         if spec.kind == "roster" and now is not None and isinstance(snap.value, dict):
             # a roster's health is read against the clock, so a tone that turns with time is content
@@ -1919,7 +1932,7 @@ class Cockpit:
         }
 
     @staticmethod
-    def _search_head(spec: ProviderSpec, count: int | None) -> dict[str, Any]:
+    def _search_head(spec: ProviderSpec, count: int | None, *, memory: bool = False) -> dict[str, Any]:
         """The searchable property (contract v2): the kernel marks a row-shaped panel ``searchable`` when
         it holds more rows than SEARCH_THRESHOLD (every row it delivers, not only the counted ones: a decisions panel
         with two waiting and fifty outcomes is a long list), is windowed, or is drawn as a count (``face == "count"``)
@@ -1929,7 +1942,9 @@ class Cockpit:
             return {"search": None, "searchable": False, "window": None}
         # a panel drawn as a count opens into a focus modal that is its whole list (Decisions waiting, Sessions): it
         # carries the box from the first row, since the tile is where it is short and the modal is where it is read
-        searchable = (spec.window is not None or (count or 0) > SEARCH_THRESHOLD
+        # ``memory``: rows a search reaches that a read with no query omits (the List's kept memory): the box must be
+        # there before the first query, however few rows are shown
+        searchable = (spec.window is not None or (count or 0) > SEARCH_THRESHOLD or memory
                       or (spec.face == "count" and (count or 0) > 0))
         return {
             "search": {"fields": list(search_fields_of(spec)), "scope": spec.search_scope,
@@ -2287,8 +2302,11 @@ class Cockpit:
         if spec is None:
             return None
         snap = self._snap_for(spec, ctx)
-        head = self._head(spec, snap, credential_class, ctx.today, auth, ctx.now)
+        head = self._head(spec, snap, credential_class, ctx.today, auth, ctx.now, with_hidden=bool(q))
         snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
+        if snap_rows is not None and spec.hidden_unless_q and not q:
+            # rows a read with no query omits are not a row lookup's either: a ``row=`` of one is a RowNotFound, as any absent row
+            snap_rows = [r for r in snap_rows if r.get("group") not in spec.hidden_unless_q]
         if snap_rows is not None:
             snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
         if spec.label_key is not None and spec.kind in VERSIONED_VALUE_KINDS and isinstance(value, dict):
@@ -2306,8 +2324,6 @@ class Cockpit:
                     raise RowNotFound(row)
                 return out
             matched = None
-            if not q and spec is not None and spec.hidden_unless_q:
-                rows_all = [r for r in rows_all if r.get("group") not in spec.hidden_unless_q]
             if q and spec is not None:
                 fields = search_fields_of(spec)
                 held = len(rows_all)
@@ -2346,6 +2362,13 @@ class Cockpit:
                     out["next"] = f"/cockpit/panel/{panel_id}.json?profile=full"
             else:
                 out["rows"] = rows_all
+            if q and spec is not None and spec.hidden_unless_q and out.get("groups"):
+                # a search shows the hidden groups: each counts the rows the search matched, never the whole window
+                got_by = {}
+                for r in rows_all:
+                    got_by[r["group"]] = got_by.get(r["group"], 0) + 1
+                out["groups"] = [{**g, "count": got_by.get(g["id"], 0)} if g["id"] in spec.hidden_unless_q else g
+                                 for g in out["groups"]]
             if matched is not None:
                 out["matched"] = matched
             if spec is not None and spec.views and out["rows"] is not None and view_order is not None:

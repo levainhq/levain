@@ -486,7 +486,7 @@ def _list_key(row: RowIn, today: date) -> tuple:
     s = f.get("surface")
     if s == "kept":                         # newest first
         at = f.get("kept_at") if isinstance(f.get("kept_at"), str) else ""
-        return (tuple(-ord(c) for c in at), row.id)
+        return (0 if at else 1, tuple(-ord(c) for c in at), row.id)      # a missing time goes last, as ``time.desc`` does
     if f.get("time_state") == "done":       # newest first
         d = parse_date(f.get("done_on"))
         return (-(d.toordinal() if d else 0), row.id)
