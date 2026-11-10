@@ -3,7 +3,7 @@ draw ONE row for it, the generic spore verbs must not move it, and germinate / b
 behind the stamp's back. Temp dirs only."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -12,12 +12,14 @@ from anneal_memory import SporeStore
 from levain import germinate as g
 from levain.cockpit.verbs import dispatch
 from levain.consent import band
-from levain.consent.questions import ANSWER_CHANNELS, QuestionStore
+from levain.consent.questions import ANSWER_CHANNELS, QuestionStore, local_today
 from levain.spores import guarded_spore_store
 from levain.writes import EditError
 from tests.test_cockpit_list_panel import CRED, INSTALL_CLASS, NOW, Rig, TODAY
 
 GTODAY = date(2026, 11, 7)
+# a snooze end judged against the REAL clock (QuestionStore.snooze): tomorrow, so it stays a future date whatever day CI runs
+LATER = (date.fromisoformat(local_today(datetime.now(timezone.utc))) + timedelta(days=1)).isoformat()
 
 
 @pytest.fixture
@@ -109,12 +111,12 @@ def test_s1_a_band_snooze_of_a_question_an_open_agenda_rings_is_refused_naming_t
     from levain.cockpit.consent import ConsentError
 
     with pytest.raises(ConsentError) as exc:
-        qs.snooze(q.id, until="2026-11-10", channel="cli", via="cli")
+        qs.snooze(q.id, until=LATER, channel="cli", via="cli")
     assert sid in str(exc.value) and "spore_surface_at" not in str(exc.value)
     assert qs.snoozes(q.id) == []
-    qs.snooze(plain.id, until="2026-11-10", channel="cli", via="cli")           # a machine-filed row snoozes as before
+    qs.snooze(plain.id, until=LATER, channel="cli", via="cli")           # a machine-filed row snoozes as before
     sp.descend(sid, kind="composted")                                         # the agenda closed: its row is plain again
-    qs.snooze(q.id, until="2026-11-10", channel="cli", via="cli")
+    qs.snooze(q.id, until=LATER, channel="cli", via="cli")
 
 
 # --- L1 fix round -----------------------------------------------------------------------------------------------------
@@ -188,7 +190,7 @@ def test_f4_the_snooze_guard_reads_the_spore_store_it_is_given_not_the_questions
     sid = sp.add(type="task", text="x", disposition="agenda", next="2026-11-01")["id"]
     sp.update(sid, germinated={"on": "2026-11-07", "target": "band", "ref": q.id})
     with pytest.raises(ConsentError) as exc:
-        qs.snooze(q.id, until="2026-11-10", channel="cli", via="cli", spores_json=spores)
+        qs.snooze(q.id, until=LATER, channel="cli", via="cli", spores_json=spores)
     assert sid in str(exc.value)
 
 
@@ -219,7 +221,7 @@ def test_r2a_the_refusals_name_no_verb_the_guard_refuses(tmp_path: Path, rig: Ri
     sid = sp.add(type="task", text="x", disposition="agenda", next="2026-11-01")["id"]
     sp.update(sid, germinated={"on": "2026-11-07", "target": "band", "ref": q.id})
     with pytest.raises(ConsentError) as exc:
-        qs.snooze(q.id, until="2026-11-10", channel="cli", via="cli", spores_json=spores)
+        qs.snooze(q.id, until=LATER, channel="cli", via="cli", spores_json=spores)
     assert sid in str(exc.value) and "spore_surface_at" not in str(exc.value)
     from levain import writes
 
@@ -240,7 +242,7 @@ def test_r2b_germinate_does_not_adopt_a_snoozed_question(tmp_path: Path) -> None
     qs = QuestionStore(qdir)
     held, _ = qs.file_once(agent="claude_code", key="k-r2b", what="held", options=[("a", "A")], rec="a", blocks="b",
                            cwd=str(root))
-    qs.snooze(held.id, until="2026-11-10", channel="cli", via="cli")
+    qs.snooze(held.id, until=LATER, channel="cli", via="cli")
     sid = sp.add(type="thought", text=f"follow up on {held.id}", disposition="agenda", next="2026-11-01")["id"]
     res = g.germinate(spores, qdir, install=root, today=GTODAY)
     (o,) = res["due"]
@@ -250,7 +252,7 @@ def test_r2b_germinate_does_not_adopt_a_snoozed_question(tmp_path: Path) -> None
 
 def test_r2c_the_list_hides_a_spore_row_exactly_when_the_guard_refuses_it(rig: Rig, monkeypatch) -> None:
     monkeypatch.setattr("levain.consent.queue.default_queue_dir", lambda: rig.qdir)
-    rig.qs.snooze(rig.q.id, until="2026-11-10", channel="cli", via="cli")        # the ring is deferred, still open
+    rig.qs.snooze(rig.q.id, until=LATER, channel="cli", via="cli")        # the ring is deferred, still open
     sid = rig.sp.add(type="task", text="renew", disposition="agenda", next="2026-11-08", today=TODAY)["id"]
     rig.sp.update(sid, germinated={"on": "2026-11-08", "target": "band", "ref": rig.q.id}, today=TODAY)
     ids = set(rig.rows())
@@ -284,6 +286,6 @@ def test_r2g_an_empty_or_none_path_falls_back(tmp_path: Path, monkeypatch) -> No
     qdir.mkdir(mode=0o700)
     QuestionStore(qdir)
     for path in (None, ""):
-        ns = argparse.Namespace(queue_dir=qdir, number="1", until="2026-11-10", path=path, note=None)
+        ns = argparse.Namespace(queue_dir=qdir, number="1", until=LATER, path=path, note=None)
         rc = band_view.run_band_snooze(ns)       # no row 1: a refusal, never a TypeError
         assert rc != 0
