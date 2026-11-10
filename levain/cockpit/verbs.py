@@ -1007,8 +1007,10 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              "row", fields=("spore_kind",), floor="C1", tier_fn=_const("C1"), confirm_required=True,
              reversible=False, fire=_spore_fire("spore_descend"), legacy_kind="spore_descend", device_ok=True,
              applies_to=_SPORE_ROW, options=_resolve_kinds("descend")),
+    # confirm as spore_descend (the same irreversible compost). NOT device_ok: a device's C1 is a broker pending, and the broker
+    # builds only SPORE_CANONICAL verbs (a Keep is an episode write plus a compost, no single effect); a phone cannot fire it
     VerbSpec("spore_keep", "keep", "keeps the item's words as an anneal memory episode, then composts the item (recoverable in "
-             "anneal)", "row", fields=(), floor="C1", tier_fn=_const("C1"), reversible=False,
+             "anneal)", "row", fields=(), floor="C1", tier_fn=_const("C1"), confirm_required=True, reversible=False,
              fire=_spore_fire("spore_keep"), legacy_kind="spore_keep", applies_to=_SPORE_ROW),
     VerbSpec("spore_surface_at", "snooze", "sets the date the item next surfaces", "row",
              fields=("surface_at",), floor="C1", tier_fn=_surface_at_tier,
