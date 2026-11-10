@@ -1196,6 +1196,7 @@ def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_
             {"eval": f"(() => {{ const f = {_row_of('when row a')}.querySelector('.when-form'); const b = f.getBoundingClientRect();"
                      "const q = (s) => f.querySelector(s); return JSON.stringify({form: {picks: [...f.querySelectorAll('.when-pick')].map(x => x.dataset.pick),"
                      "date: q('.verb-date').type, time: q('.verb-time').type, timeVal: q('.verb-time').value, dt: !!f.querySelector('input[type=datetime-local]'),"
+                     "zone: (q('.when-zone') || {}).textContent || '',"
                      "pressed: [...f.querySelectorAll('.who-opt')].map(x => x.getAttribute('aria-pressed')), repoHidden: q('.who-repo').hidden,"
                      "noScroll: document.documentElement.scrollWidth <= window.innerWidth + 1, inside: b.right <= window.innerWidth + 1,"
                      "pickH: Math.min(...[...f.querySelectorAll('.when-pick')].map(x => x.getBoundingClientRect().height)),"
@@ -1227,7 +1228,8 @@ def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_
     vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
     form = vals["form"]
     assert {"later", "tomorrow", "monday", "now"} <= set(form["picks"]), form
-    assert (form["date"], form["time"], form["timeVal"], form["dt"]) == ("date", "time", "09:00", False), form
+    assert (form["date"], form["time"], form["timeVal"], form["dt"]) == ("date", "time", "", False), form   # a date-only row: no time
+    assert "host" in form["zone"], form                                                   # the times are the host's clock
     assert form["pressed"] == ["false", "false"] and form["repoHidden"] is True, form
     assert form["noScroll"] and form["inside"], form
     if mobile:
@@ -1332,3 +1334,29 @@ def test_when_form_focuses_the_day_on_a_pointer_device_and_not_on_a_touch_one(tm
         ])
     vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
     assert vals == {"pointer": True, "touch": False}, vals
+
+
+@needs_browser
+def test_when_form_keeps_a_date_only_row_date_only_and_prefills_a_timed_rows_minute(tmp_path: Path) -> None:
+    """Opening "when?" on a date-only row and pressing schedule writes the day alone (no time is invented); a timed row opens
+    on its own minute."""
+    root, src, _ids = _install(tmp_path)
+    ids = _seed_when(root)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {_row_of('when row a')} && {_row_of('who row drop')} && 1"},
+            {"eval": _open_when("who row drop")},
+            {"eval": f"JSON.stringify({{dropTime: {_row_of('who row drop')}.querySelector('.when-form .verb-time').value}})"},
+            {"eval": f"[...{_row_of('who row drop')}.querySelectorAll('.when-form .verb-cancel')].find(x => x.textContent === 'cancel').click(); 1"},
+            {"eval": _open_when("when row a")},
+            {"eval": f"(() => {{ const f = {_row_of('when row a')}.querySelector('.when-form'); const d = f.querySelector('.verb-date');"
+                     "const v = d.value; f.querySelector('.verb-confirm').click(); return JSON.stringify({day: v}); })()"},
+            {"until": f"(() => {{ const r = {_row_of('when row a')}; return (!r || !r.querySelector('.when-form')) && 1; }})()"},
+        ])
+    vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
+    assert vals == {"dropTime": "09:00", "day": "2020-01-01"}, vals
+    posts = [(p["verb"], p["params"]) for p in _posts(out)]
+    assert ("spore_surface_at", {"surface_at": "2020-01-01"}) in posts, posts
+    assert SporeStore(root / ".levain" / "memory.spores.json").get(ids["a"])["next"] == "2020-01-01"

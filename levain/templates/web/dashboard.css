@@ -796,6 +796,7 @@
   /* compact: the day and the time share a row (each takes half) so the confirm row sits higher */
   .when-form .verb-date, .when-form .verb-time { flex: 1 1 7rem; min-width: 0; }
   .when-form .who-ctl { flex: 1 1 100%; }
+  .when-zone { flex: 1 1 100%; }
   .who-ctl { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
   .who-opt[aria-pressed="true"] { color: var(--ink); border-color: var(--label); background: var(--card-2); }
   .who-repo { min-width: 0; width: 10rem; }

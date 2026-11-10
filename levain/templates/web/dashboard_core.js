@@ -3513,16 +3513,18 @@
     };
   }
 
-  // The local minute a picker writes: "YYYY-MM-DDTHH:MM", the browser's own clock and zone, no zone in the value.
+  // The local minute a picker writes: "YYYY-MM-DDTHH:MM", read from the browser's clock, no zone in the value. The host reads it
+  // in ITS zone (the page has no channel for the host's zone), so the form says the times are the host's.
   const pad2 = (n) => String(n).padStart(2, "0");
   const dayOf = (d) => d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
   const minuteOf = (d) => dayOf(d) + "T" + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
-  // the quick picks, from a clock: later today (+3 h, clamped to today), tonight 20:00 (offered only while it is still ahead), tomorrow 09:00, next Monday 09:00
+  // the quick picks, from a clock: later today (a few hours on, held inside today), tonight (offered only while it is still ahead),
+  // tomorrow morning, next Monday morning, now; each label names its own time
   function whenPicks(now) {
     const day = (n) => new Date(now.getFullYear(), now.getMonth(), now.getDate() + n);
     const at = (d, h) => minuteOf(new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0));
     const picks = [];
-    // later today is +3 h but never past 23:59 today (a pick under a "today" label never writes tomorrow), and gone once under an hour of today is left
+    // later today never runs past today's last minute (a pick under a "today" label never writes tomorrow), and it is gone in today's last hour
     if (now.getHours() < 23) {
       const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59);
       picks.push({ key: "later", label: "Later today", value: minuteOf(new Date(Math.min(now.getTime() + 3 * 3600000, endOfDay.getTime()))) });
@@ -3547,14 +3549,18 @@
     const form = el("span", "verb-form when-form");
     const picksBox = el("span", "when-picks");
     // the who control only where the cockpit offers spore_retarget (a seed or an agenda): a loop is nobody's to hand off
-    const canWho = !Array.isArray(s.actions) || s.actions.some((x) => x && x.verb === "spore_retarget");
+    // a row with no actions list (a legacy row) is offered none: the who control is drawn only on the kernel's offer
+    const canWho = Array.isArray(s.actions) && s.actions.some((x) => x && x.verb === "spore_retarget");
     const who = canWho ? whoControl(s) : { node: null, value: () => null };
     const input = el("input", "verb-date");
     input.type = "date";
     input.setAttribute("aria-label", "day");
     const timeIn = el("input", "verb-time");
-    timeIn.type = "time"; timeIn.step = 60; timeIn.value = "09:00";
-    timeIn.setAttribute("aria-label", "time");
+    // empty unless the row already holds a minute or the operator sets one: an empty time keeps a date-only write date-only
+    timeIn.type = "time"; timeIn.step = 60; timeIn.value = "";
+    timeIn.setAttribute("aria-label", "time, on the Levain host's clock");
+    timeIn.title = "on the Levain host's clock";
+    const zone = el("span", "muted when-zone", "times are the Levain host's clock");
     const m = /^(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?$/.exec(String(s.fires || s.next || ""));
     if (m) { input.value = m[1]; if (m[2]) timeIn.value = m[2]; }   // prefill an existing alarm
     const go = el("button", "verb-confirm", "schedule");
@@ -3575,7 +3581,7 @@
     // an agenda (it holds a target) is undated never: flow refuses one, so "someday" is for a seed with no who chosen
     const agenda = rowTarget(s) !== "";
     if (agenda) clearBtn.hidden = true;
-    form.append(picksBox, input, timeIn, ...(who.node ? [who.node] : []), go, clearBtn, cancel, msg);
+    form.append(picksBox, input, timeIn, zone, ...(who.node ? [who.node] : []), go, clearBtn, cancel, msg);
     host.appendChild(form);
     // a touch screen's keyboard opens on a focused date input and covers the form: focus it only where a pointer, not a thumb, drives
     if (!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches)) input.focus();
