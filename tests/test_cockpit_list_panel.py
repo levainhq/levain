@@ -436,6 +436,23 @@ def test_listpanel_r6_a_band_rows_age_reads_the_refile_clock_in_the_footers_form
     assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"] == "30m"
 
 
+def test_listpanel_a_band_rows_age_reading_alone_does_not_move_the_etag(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The age text is a clock reading: an idle store crosses a minute boundary and the row reads 31m instead of 30m. The etag
+    must not move for it (it announced a panel that had not changed, and the page reloaded the whole board); a real change must."""
+    def head_and_age() -> tuple[str, str]:
+        panel = rig.panel()
+        return panel["etag"], {r["id"]: r for r in panel["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"]
+
+    _band_with(monkeypatch, rig, section="you", filed_at=_iso(-0.5), section_since="")
+    tag_a, age_a = head_and_age()
+    _band_with(monkeypatch, rig, section="you", filed_at=_iso(-0.52), section_since="")
+    tag_b, age_b = head_and_age()
+    assert (age_a, age_b) == ("30m", "31m")
+    assert tag_a == tag_b
+    _band_with(monkeypatch, rig, section="desk", carried=False, filed_at=_iso(-0.52), section_since="")
+    assert head_and_age()[0] != tag_b
+
+
 # --- 531 round 7 (levain 76, lpr3): L3 r1 fixes --------------------------------------------------------------------------
 
 

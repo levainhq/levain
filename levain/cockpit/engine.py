@@ -156,6 +156,24 @@ def _sha(obj: Any) -> str:
     return hashlib.sha256(_canon(obj)).hexdigest()
 
 
+# Facets that are a wall-clock reading ("58m", "1h") of a row, not a change to it. They ride in the row a read returns but
+# stay out of the panel etag: otherwise an idle store moves the etag at every minute (then hour) boundary, the change
+# stream announces a panel that did not change, and a page that cannot redraw that panel in place reloads the whole board.
+_CLOCK_FACETS = ("band_age",)
+
+
+def _etag_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    if not rows:
+        return rows
+    out = []
+    for row in rows:
+        facets = row.get("facets") if isinstance(row, dict) else None
+        if isinstance(facets, dict) and any(k in facets for k in _CLOCK_FACETS):
+            row = {**row, "facets": {k: v for k, v in facets.items() if k not in _CLOCK_FACETS}}
+        out.append(row)
+    return out
+
+
 def value_version_of(stored: Any) -> str:
     """The version a value write binds to (§4.4), from the stored record a provider read
     (``Read.version_of``). The ONE computation: a renderer outside the manifest that offers a
@@ -1812,7 +1830,7 @@ class Cockpit:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
-        return _sha({"schema": SCHEMA, "status": snap.status, "rows": snap.rows, "value": snap.value,
+        return _sha({"schema": SCHEMA, "status": snap.status, "rows": _etag_rows(snap.rows), "value": snap.value,
                      "filtered": snap.filtered, "skipped": snap.skipped, "error": snap.error,
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
                      "verbs": self._verb_rev(auth),
