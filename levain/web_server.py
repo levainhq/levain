@@ -884,6 +884,9 @@ _COORD_ACTIONS = ("drop", "envelope-review", "envelope-challenge", "draft-cards"
 _COORD_PREFIX = "/cockpit/coord/"
 _COORD_LIST = "/cockpit/coord/drops.json"
 _COORD_SHEET = "/sign/drop"
+# the same family under the desk's own word, served by the same handlers; the older spelling above is kept for every client that has it
+_DESK_PREFIX = "/cockpit/desk/"
+_DESK_LIST = "/cockpit/desk/drops.json"
 # The phone's desk routes take a drop from a PAIRED DEVICE only (its token's device id is handed to CoordPhone.step,
 # which binds a kept envelope review to it). The cockpit's gate takes a surface token OR a paired device's token, so the
 # device a step runs as is read from the request's AUTHENTICATED credential (_coord_device), never fixed: a paired device
@@ -898,11 +901,12 @@ _LAUNCH_ROOTS = frozenset({"browser", BOX_MINTER})
 
 
 def _coord_route(route: str) -> "str | None":
-    """The action of ``POST /cockpit/coord/<action>``, else None."""
-    if not route.startswith(_COORD_PREFIX):
-        return None
-    action = route[len(_COORD_PREFIX):]
-    return action if action in _COORD_ACTIONS else None
+    """The action of ``POST /cockpit/coord/<action>`` or ``POST /cockpit/desk/<action>``, else None."""
+    for prefix in (_COORD_PREFIX, _DESK_PREFIX):
+        if route.startswith(prefix):
+            action = route[len(prefix):]
+            return action if action in _COORD_ACTIONS else None
+    return None
 
 
 class CoordSheet:
@@ -1485,7 +1489,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/edit",
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
-    _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, cockpit_room.ROOM_PATH, _COORD_LIST, _COORD_SHEET,
+    _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, cockpit_room.ROOM_PATH, _COORD_LIST, _DESK_LIST, _COORD_SHEET,
     cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE,
     cockpit_voice.VOICE_JSON, *cockpit_voice.VOICE_PATHS, *cockpit_voice.STREAM_PATHS,
     _PAIR_OFFER, _PAIR_REVOKE, _PAIR_REVOKE_PREVIEW, _PAIR_LIST, _PAIR_CLAIM,
@@ -1493,7 +1497,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
-                                       _GRANT_PREFIX, _SHEET_PREFIX, _COORD_PREFIX, _PUSH_PREFIX,
+                                       _GRANT_PREFIX, _SHEET_PREFIX, _COORD_PREFIX, _DESK_PREFIX, _PUSH_PREFIX,
                                        cockpit_threads.THREAD_PREFIX, cockpit_room.ROOM_PREFIX, _NOTE_BODY_PREFIX, _DISPATCH_PREFIX, _PENDING_PREFIX, _ENVELOPE_PREFIX)
 
 
@@ -4694,7 +4698,7 @@ class _Handler(GuardedHandler):
         if path == _COORD_SHEET:                    # the drop sheet's page (OS-2): the same shell
             self._serve_sheet(head=head, coord=True)
             return
-        if path == _COORD_LIST:                     # its read rides the sign listing's gate exactly
+        if path in (_COORD_LIST, _DESK_LIST):                     # its read rides the sign listing's gate exactly
             self._serve_coord_sheet(head=head)
             return
         dispatch_read = _dispatch_sheet_read(path)

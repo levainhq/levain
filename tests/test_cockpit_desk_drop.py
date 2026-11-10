@@ -321,3 +321,16 @@ def test_closing_the_server_refuses_new_drops_and_joins_the_wakes(world, tmp_pat
         assert all(not w.is_alive() for w in sheet.phone._wakes)
         status, again = _call(url, "/cockpit/coord/drop", _plain("ph-" + "da" * 16, "after close", got["store_id"]))
         assert status == 503 and again["error"] == "closing", again
+
+
+def test_the_desk_spelling_of_the_routes_reaches_the_same_handlers_as_the_older_one(world, tmp_path) -> None:
+    """``/cockpit/desk/...`` beside ``/cockpit/coord/...``: one handler, one store, the same gate."""
+    with _serve(world, tmp_path) as (url, _httpd):
+        old, new = (_call(url, f"/cockpit/{w}/drops.json") for w in ("coord", "desk"))
+        assert old[0] == new[0] == 200 and old[1] == new[1], (old, new)
+        assert _call(url, "/cockpit/desk/drops.json", token=None)[0] == 403              # the same gate
+        status, got = _call(url, "/cockpit/desk/drop", _plain("ph-" + "8" * 32))
+        assert status == 200 and got["created"] is True, got
+        status, again = _call(url, "/cockpit/coord/drop", _plain("ph-" + "8" * 32, store_id=got["store_id"]))
+        assert status == 200 and again["created"] is False and again["drop"]["drop_id"] == got["drop"]["drop_id"]
+        assert _call(url, "/cockpit/desk/nothing", _plain("ph-" + "9" * 32))[0] == 404
