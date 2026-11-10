@@ -6,9 +6,8 @@ Thanks for looking. This file points at where each thing is written down rather 
 
 - **What Levain is and how it is put together:** the [README](README.md). *Build on it* covers `levain.kernel`, the
   published seam for writing your own surface.
-- **A security problem:** report it privately, not in a public issue. [SECURITY.md](SECURITY.md) names the channel, the
-  GitHub [private vulnerability report form](https://github.com/levainhq/levain/security/advisories/new), and what is in
-  scope.
+- **A security problem:** report it privately, not in a public issue or discussion. [SECURITY.md](SECURITY.md) names the
+  channel and what is in scope.
 
 ## Setting up a clone
 
