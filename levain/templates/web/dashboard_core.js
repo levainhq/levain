@@ -5036,6 +5036,10 @@
   // question n -> the short handle of its words (needsName), learned when the words are read. It outlives a closed view on purpose
   // (the glance tile names the item after the dialog closes) and is a few words, bounded to the newest QUESTION_HANDLES_MAX.
   const questionHandles = new Map();
+  // question key -> the first line of its words, whole up to QUESTION_LINE_CHARS: a wide focus view titles itself with it (the handle
+  // is a strip row's few words; a desk's dialog has the room). Bounded with the handles.
+  const questionLines = new Map();
+  const QUESTION_LINE_CHARS = 140;
   const QUESTION_HANDLE_WORDS = 6, QUESTION_HANDLE_CHARS = 60, QUESTION_HANDLES_MAX = 200;
   // a refused send's words, by question id: a stale refusal empties the box so the owed re-read is not held off by it,
   // and a redraw that still shows the question open gives the words back
@@ -5057,12 +5061,17 @@
   // a handle is kept by the question's card id (flow's "question:<n>"), else its number: one string key either way, so a number
   // that arrives as a string and as a number is one question
   const questionKeyOf = (q) => (q && q.id ? String(q.id) : "n:" + String(q && q.n));
-  function rememberQuestionHandle(q, handle) {
+  function rememberQuestionHandle(q, handle, line) {
     const k = questionKeyOf(q);
     const changed = questionHandles.get(k) !== handle;
     questionHandles.delete(k);
     questionHandles.set(k, handle);
     if (questionHandles.size > QUESTION_HANDLES_MAX) questionHandles.delete(questionHandles.keys().next().value);
+    if (line) {
+      questionLines.delete(k);
+      questionLines.set(k, line.length > QUESTION_LINE_CHARS ? line.slice(0, QUESTION_LINE_CHARS - 1).replace(/\s+\S*$/, "") + "\u2026" : line);
+      if (questionLines.size > QUESTION_HANDLES_MAX) questionLines.delete(questionLines.keys().next().value);
+    }
     if (changed) repaintNeedsNames(k);
   }
   // The glance tile is drawn before a question's words are read, so a name learned later is painted into the tile that already
@@ -5092,7 +5101,7 @@
         else if (!b.error && typeof b.what === "string") {
           // the words were fetched with a token: a handle made from them is kept only while this page still holds one. A read that
           // lands after the token went is not cached either, so the read that follows the token's return learns the handle.
-          if (hasWriteToken()) { const h = questionHandle(b.what); if (h) rememberQuestionHandle(q, h); }
+          if (hasWriteToken()) { const h = questionHandle(b.what); if (h) rememberQuestionHandle(q, h, String(b.what || "").split(/\r?\n/).map((l) => l.trim()).find(Boolean) || ""); }
           else if (questionBodies.get(key) === got) questionBodies.delete(key);
         }
         return b;
@@ -6352,10 +6361,15 @@
       }
       if (signDecided.has(id)) signCardDead(wrap, signDecided.get(id));     // decided before this card's controls existed
       if (options.length) {
-        const lines = el("div", "sign-lines ext-meta", "an option signs the request's message with its line appended:");
+        // the protocol lines are the signer's reference, not the reader's: one tap away, closed, the text unchanged
+        const lines = el("div", "sign-lines ext-meta");
+        lines.appendChild(el("div", "", "an option signs the request's message with its line appended:"));
         for (const o of options) lines.appendChild(el("div", "sign-line", String(o.line)));
         if (wi) lines.appendChild(el("div", "sign-line", String(wi.line) + "<your words>"));
-        wrap.appendChild(lines);
+        const disc = el("details", "sign-lines-disc");
+        disc.appendChild(el("summary", "", "What each option signs"));
+        disc.appendChild(lines);
+        wrap.appendChild(disc);
       }
     });
     return wrap;
@@ -6888,10 +6902,13 @@
   // (they are fetched with the page's token, questionBody), so until they have been read the name is "<agent> · question" and the
   // band number when the last band read gave one. The question's long number (flow's card number) is the answer key, never a name:
   // it stays in q.n, which the answer path sends, and is not drawn here.
-  function needsName(it) {
+  // `whole`: the focus view's dialog title on a desk-wide page takes the question's first line whole instead of its few-word handle
+  const wideDialog = () => !!(window.matchMedia && window.matchMedia("(min-width: 761px)").matches);
+  function needsName(it, whole) {
     if (it.kind === "consent") return (it.c.tool || "request") + " · " + (it.c.agent || "agent");
     // the handle is the question's own words: it is shown only to a page that holds the token the words were read with
-    const handle = hasWriteToken() ? questionHandles.get(questionKeyOf(it.q)) : "";
+    const k = questionKeyOf(it.q);
+    const handle = hasWriteToken() ? (whole && wideDialog() && questionLines.get(k)) || questionHandles.get(k) : "";
     if (handle) return handle + " · " + (it.q.agent || "agent");
     const band = bandNumOf.get(Number(it.q.n));
     return (it.q.agent || "agent") + " · question" + (band === undefined ? "" : " · band " + band);
@@ -6937,7 +6954,7 @@
     const id = needsIdOf(it);
     modalCustom = {
       id,
-      title: needsName(it),
+      title: needsName(it, true),
       build: () => (it.kind === "consent" ? consentCard(it.c) : questionCard(it.q)),
     };
     modalGlance = false;
@@ -6950,7 +6967,7 @@
   }
   function retitleNeedsFocus(it, id) {
     if (!modalCustom || modalCustom.page || modalCustom.id !== id) return;
-    const title = needsName(it);
+    const title = needsName(it, true);
     if (title === modalCustom.title) return;
     modalCustom.title = title;
     const h = document.getElementById("levain-modal-title");

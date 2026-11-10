@@ -74,7 +74,9 @@ def test_the_dialog_title_is_the_questions_first_words_and_the_tile_uses_the_sam
     assert first["dlg1"] == "Ship the sweep fix? · claude_code", first
     assert "#" not in first["dlg1"] and first["aria"].startswith("Ship the sweep fix?"), first
     assert first["show"] == "levain question show 1", first            # the number is still the answer key, shown where it is a command
-    assert second["dlg2"] == "Should the cockpit title branch merge… · codex", second   # six words on a word boundary, then an ellipsis
+    # a desk-wide dialog (DESKTOP, 1280px) titles itself with the question's first line whole (board row 185); the short handle
+    # (six words on a word boundary, then an ellipsis) stays the strip row's, the tile's and a phone sheet's name
+    assert second["dlg2"] == LONG + " · codex", second
     assert page["page"] == "Ship the sweep fix? · claude_code", page   # the tile on the page, read after the words landed
     assert not any(t.startswith("question #") for t in page["rows"]), page
     assert direct["big"] == "claude_code · question", direct        # a question whose words were never read: number-free, agent first

@@ -3766,3 +3766,22 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
 }
 .vc-dict-val, .vc-spend-val { flex: 1 1 200px; min-width: 0; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); overflow-wrap: anywhere; }
 .vc-console { min-height: var(--hit-min, 44px); display: inline-flex; align-items: center; color: var(--accent); }
+
+/* The signed card at desk width (board row 185, slice 1; Phill 11-10: his desktop card was a mess beside the phone's icon-row system). The
+   action rows already share the phone's one system (icons for Play / Dictate / Mic, the box and its mic icons on one row, the buttons in a
+   two-column grid). What was left: the words flush to the box's edge, the signer's protocol lines drawn open under the actions, a
+   standing "Make a passkey" link 44px tall in the body colour, and a title cut to a few words with the room for the whole line. */
+body :is(.sign-write-in, .question-words, .sheet-write-in) { padding-inline: var(--sp-3); }
+.sign-enrol-standing { min-height: 0; line-height: 1.4; margin: var(--sp-2) 0 0; margin-left: 0; font-size: var(--fs-meta); color: var(--label); }
+.sign-lines-disc { margin: var(--sp-2) 0 0; }
+.sign-lines-disc > summary { cursor: pointer; display: flex; align-items: center; min-height: 32px; color: var(--label); font-size: var(--fs-meta); }
+.sign-lines-disc > summary:hover, .sign-lines-disc[open] > summary { color: var(--text); }
+.sign-lines-disc > summary:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+.sign-lines-disc > .sign-lines { padding: var(--sp-2) 0 var(--sp-1); }
+.modal-overlay.needs-detail .modal-head h2 { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-overlay.needs-detail .modal-head .modal-close { margin-left: 0; }
+.sign-lines-disc > summary { list-style: none; gap: var(--sp-3); justify-content: space-between; }
+.sign-lines-disc > summary::-webkit-details-marker { display: none; }
+.sign-lines-disc > summary::after { content: ""; flex: none; width: 7px; height: 7px; margin-right: var(--sp-2); border-right: 2px solid var(--label); border-bottom: 2px solid var(--label); transform: rotate(-45deg); }
+.sign-lines-disc[open] > summary::after { transform: rotate(45deg); }
+.sign-lines-disc > summary:hover::after, .sign-lines-disc[open] > summary::after { border-color: var(--text); }
