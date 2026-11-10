@@ -33,7 +33,7 @@ def run(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(cmd, fake_run.rc)
 
     fake_run.rc = 0
-    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(mod, "_run", fake_run)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     ledger = tmp_path / "ledger.txt"
     real_ledger_ids = mod.ledger_ids
@@ -97,3 +97,29 @@ def test_only_exit_1_reruns(run, code):
 def test_exit_1_with_no_failed_line_means_no_rerun(run):
     rc, reruns, _ = run(1, "1 failed in 0.1s\n", f"{A}\n")
     assert rc == 1 and reruns == []
+
+
+def test_a_captured_log_line_before_the_summary_is_ignored():
+    log = "ERROR    pkg:file.py:12 something logged\nFAILED tests/test_z.py::test_z - x\n" + LOG_FAILED
+    assert mod.parse_log(log) == ([A, B], False)
+
+
+def test_an_errors_section_header_is_errored():
+    log = "==== ERRORS ====\n_ ERROR at setup of test_x _\n" + LOG_FAILED
+    assert mod.parse_log(log)[1] is True
+
+
+def test_no_summary_header_and_exit_1_means_no_rerun(run):
+    rc, reruns, _ = run(1, f"FAILED {A} - boom\n", f"{A}\n")
+    assert rc == 1 and reruns == []
+
+
+def test_a_non_node_id_in_the_summary_is_skipped():
+    log = "==== short test summary info ====\nFAILED not a node id\nFAILED " + A + "\n"
+    assert mod.parse_log(log) == ([A], False)
+
+
+def test_a_dash_inside_brackets_is_part_of_the_id():
+    nid = "tests/test_a.py::test_p[a - b]"
+    log = f"==== short test summary info ====\nFAILED {nid} - AssertionError: x - y\n"
+    assert mod.parse_log(log) == ([nid], False)
