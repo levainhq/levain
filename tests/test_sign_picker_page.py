@@ -13,6 +13,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -255,6 +256,11 @@ def test_b2_a_bound_revoke_asks_for_the_key_this_browser_remembers_and_draws_no_
             {"posts": 2},
             {"eval": _GRANT_PICKS},
         ])
+        # the driver counts a post when the page SENDS it; the server records its step when it has handled it: wait for both
+        # (bounded) rather than unpack a list the slower handler has not filled yet
+        deadline = time.monotonic() + 30
+        while len(rec.steps) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
     (_g1, a1, r1), (_g2, a2, _r2) = rec.steps
     assert (a1, a2) == ("revoke-challenge", "revoke")
     assert r1["signer_fp"] == newer.key.fingerprint, r1                 # it asked for the remembered key, no pick drawn

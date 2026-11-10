@@ -263,8 +263,8 @@ def test_a_ceremony_that_throws_before_it_posts_signs_nothing_and_releases_the_w
             {"eval": f"(() => {{ const i = {WRITE_IN}; i.value = 'only after the backup'; "
                      "i.dispatchEvent(new Event('input')); return 1; })()"},
             {"tap": f"{WORDS_BTN}"},
-            {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "may_timeout": True},
-            {"until": f"!{WRITE_IN}.disabled && {WRITE_IN}.value", "may_timeout": True},
+            {"until": f"/nothing was signed/.test({FACET_NOTE}) && {FACET_NOTE}", "ms": 30000, "may_timeout": True},
+            {"until": f"!{WRITE_IN}.disabled && {WRITE_IN}.value", "ms": 30000, "may_timeout": True},
             {"eval": OPEN % QRID},
         ])
     v = out["values"]

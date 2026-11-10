@@ -3,7 +3,7 @@ draw ONE row for it, the generic spore verbs must not move it, and germinate / b
 behind the stamp's back. Temp dirs only."""
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -12,14 +12,15 @@ from anneal_memory import SporeStore
 from levain import germinate as g
 from levain.cockpit.verbs import dispatch
 from levain.consent import band
-from levain.consent.questions import ANSWER_CHANNELS, QuestionStore, local_today
+from levain.consent.questions import ANSWER_CHANNELS, QuestionStore
 from levain.spores import guarded_spore_store
 from levain.writes import EditError
 from tests.test_cockpit_list_panel import CRED, INSTALL_CLASS, NOW, Rig, TODAY
 
 GTODAY = date(2026, 11, 7)
-# a snooze end judged against the REAL clock (QuestionStore.snooze): tomorrow, so it stays a future date whatever day CI runs
-LATER = (date.fromisoformat(local_today(datetime.now(timezone.utc))) + timedelta(days=1)).isoformat()
+# a snooze end is judged against the store's own clock, which every store here is given (clock=lambda: NOW): the day after NOW,
+# so no wall-clock day (nor a midnight crossed mid-run) can make it a past or same-day date
+LATER = (NOW.date() + timedelta(days=1)).isoformat()
 
 
 @pytest.fixture
@@ -101,7 +102,7 @@ def test_s1_a_band_snooze_of_a_question_an_open_agenda_rings_is_refused_naming_t
     sp = guarded_spore_store(root / ".levain" / "memory.spores.json")
     qdir = tmp_path / "q"
     qdir.mkdir(mode=0o700)
-    qs = QuestionStore(qdir)
+    qs = QuestionStore(qdir, clock=lambda: NOW)
     q, _ = qs.file_once(agent="claude_code", key="k-ring", what="Due: x", options=[("done", "Done")], rec="done",
                         blocks="b", cwd=str(root), held_by=ANSWER_CHANNELS)
     plain = qs.file(agent="claude_code", agent_session_id="s", what="other", options=[("a", "A"), ("b", "B")], rec="a",
@@ -146,7 +147,7 @@ def test_f1b_germinate_closes_an_agenda_whose_question_was_answered(tmp_path: Pa
     sp = guarded_spore_store(spores)
     qdir = tmp_path / "q"
     qdir.mkdir(mode=0o700)
-    qs = QuestionStore(qdir)
+    qs = QuestionStore(qdir, clock=lambda: NOW)
     q, _ = qs.file_once(agent="claude_code", key="k-fin", what="Due: x", options=[("done", "Done")], rec="done",
                         blocks="b", cwd=str(root), held_by=ANSWER_CHANNELS)
     sid = sp.add(type="task", text="x", disposition="agenda", next="2026-11-01")["id"]
@@ -184,7 +185,7 @@ def test_f4_the_snooze_guard_reads_the_spore_store_it_is_given_not_the_questions
     sp = guarded_spore_store(spores)
     qdir = tmp_path / "q"
     qdir.mkdir(mode=0o700)
-    qs = QuestionStore(qdir)
+    qs = QuestionStore(qdir, clock=lambda: NOW)
     q, _ = qs.file_once(agent="claude_code", key="k-f4", what="Due: x", options=[("done", "Done")], rec="done",
                         blocks="b", cwd=str(tmp_path / "elsewhere"), held_by=ANSWER_CHANNELS)
     sid = sp.add(type="task", text="x", disposition="agenda", next="2026-11-01")["id"]
@@ -215,7 +216,7 @@ def test_r2a_the_refusals_name_no_verb_the_guard_refuses(tmp_path: Path, rig: Ri
     sp = guarded_spore_store(spores)
     qdir = tmp_path / "q2"
     qdir.mkdir(mode=0o700)
-    qs = QuestionStore(qdir)
+    qs = QuestionStore(qdir, clock=lambda: NOW)
     q, _ = qs.file_once(agent="claude_code", key="k-r2a", what="Due: x", options=[("done", "Done")], rec="done",
                         blocks="b", cwd=str(root), held_by=ANSWER_CHANNELS)
     sid = sp.add(type="task", text="x", disposition="agenda", next="2026-11-01")["id"]
@@ -239,7 +240,7 @@ def test_r2b_germinate_does_not_adopt_a_snoozed_question(tmp_path: Path) -> None
     sp = guarded_spore_store(spores)
     qdir = tmp_path / "q"
     qdir.mkdir(mode=0o700)
-    qs = QuestionStore(qdir)
+    qs = QuestionStore(qdir, clock=lambda: NOW)
     held, _ = qs.file_once(agent="claude_code", key="k-r2b", what="held", options=[("a", "A")], rec="a", blocks="b",
                            cwd=str(root))
     qs.snooze(held.id, until=LATER, channel="cli", via="cli")
