@@ -526,8 +526,8 @@ def _intention_words_digest(store: Any, q: Any) -> str:
     recompute, so an edit of the words moves the version and a stale Edit is refused."""
     from levain.consent.questions import intention_text_of
 
-    words = intention_text_of(store, q)
-    return hashlib.sha256((words or "").encode("utf-8")).hexdigest()[:12]
+    words = (intention_text_of(store, q) or "").replace("\r\n", "\n").replace("\r", "\n")   # a textarea hands back LF
+    return hashlib.sha256(words.encode("utf-8")).hexdigest()[:12]
 
 
 def _question_row_in(q: Any, later: tuple[str, str] | None = None, intention: str | None = None,

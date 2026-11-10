@@ -295,3 +295,15 @@ def test_a_decisions_edit_built_on_words_since_changed_is_stale(host_rig) -> Non
     with pytest.raises(EditError) as exc:
         _fire(rig, "decisions", first, "intention_edit", {"text": "B's words"})
     assert exc.value.http_status == 409 and not host.acts
+
+
+def test_the_words_digest_reads_a_textarea_line_ending_as_the_same_words(monkeypatch) -> None:
+    from levain.cockpit import engine
+    from levain.consent import questions
+
+    def digest(words: str) -> str:
+        monkeypatch.setattr(questions, "intention_text_of", lambda store, q: words)
+        return engine._intention_words_digest(None, None)
+
+    assert digest("a\r\nb") == digest("a\nb") == digest("a\rb")      # a browser textarea hands back LF
+    assert digest("a\nb") != digest("a\nc")
