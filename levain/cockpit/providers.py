@@ -69,7 +69,7 @@ SPORE_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "
 SPORE_VERSION_EXCLUDED = ("seen", "origin_key")
 SPORE_VERSION_FIELDS = tuple(f for f in SPORE_STORED if f not in SPORE_VERSION_EXCLUDED)
 SPORE_FACETS = frozenset({
-    "disposition", "domain", "tier", "salience", "spore_type", "due", "overdue_days",
+    "disposition", "domain", "tier", "salience", "spore_type", "due", "fires", "overdue_days",
     "handoff_expired", "last_seen", "age_days",
 })
 # the Tray's second view (2026-10-10, "yes to all": "Tray by Age" is a view of the Tray box, not
@@ -302,13 +302,24 @@ def next_date(value: Any) -> date | None:
     return parse_date(value)
 
 
+def next_minute(value: Any) -> str | None:
+    """The minute a timed ``next`` names (``YYYY-MM-DDTHH:MM``), or None for a date-only, absent or unreadable one: the row's
+    ``fires`` facet, which the snooze tier reads as the instant a held row wakes."""
+    from levain import spores
+
+    if not spores.is_timed(value):
+        return None
+    when = spores._parse_when(value)
+    return when.strftime("%Y-%m-%dT%H:%M") if when is not None else None
+
+
 def _spore_row(s: Any, today: date) -> RowIn:
     due = next_date(s.next)
     expired = _handoff_expired(s, today)
     facets: dict[str, Any] = {
         "disposition": s.disposition, "domain": s.domain, "tier": s.tier, "salience": s.salience,
         "spore_type": s.type, "handoff_expired": expired, "last_seen": s.seen or None,
-        "due": due.isoformat() if due else None,
+        "due": due.isoformat() if due else None, "fires": next_minute(s.next),
     }
     if due:
         facets["overdue_days"] = max(0, (today - due).days)

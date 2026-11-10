@@ -42,6 +42,7 @@ from levain.cockpit.providers import (
     _view,
     _view_fault,
     next_date,
+    next_minute,
     spore_empty,
 )
 from levain.cockpit.registry import DONE_DAYS, opened_day, parse_date
@@ -93,7 +94,7 @@ def _timing(value: Any, now: datetime, today: date) -> tuple[str | None, bool]:
         when = spores._parse_when(value)
         if when is None:
             return None, False
-        return when.strftime("%Y-%m-%dT%H:%M"), now >= when
+        return next_minute(value), now >= when
     d = parse_date(value)
     return None, bool(d and d < today)
 

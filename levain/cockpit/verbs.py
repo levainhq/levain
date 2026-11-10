@@ -247,7 +247,7 @@ def _held_date(row: dict[str, Any] | None, today: date) -> date | None:
 
 
 def _held_at(row: dict[str, Any] | None, today: date) -> datetime | None:
-    """The instant a held row next surfaces, at the minute it is stored: the List's ``fires`` facet carries a timed
+    """The instant a held row next surfaces, at the minute it is stored: a spore row's ``fires`` facet carries a timed
     ``next`` (None there means a date-only one, read as the start of its day). A row whose minute is not known (no
     ``fires`` facet at all) is read as held to the end of its day, so a move within that day reads as sooner."""
     from levain.spores import _parse_when

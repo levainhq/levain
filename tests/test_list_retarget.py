@@ -192,6 +192,23 @@ def test_a_timed_held_row_snoozed_earlier_the_same_day_is_signed(tmp_path: Path)
     assert store.get(ids["seed"])["next"] == "2031-02-03T21:05"
 
 
+def test_a_timed_held_row_on_open_loops_reads_its_stored_minute(tmp_path: Path) -> None:
+    """Open loops builds its rows with the provider's own spore row, not the List's: that row carries the stored minute too, so a
+    later minute on the held day stays C1 there and an earlier one is T2."""
+    root, src, ids = _install(tmp_path)
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store.update(ids["loop"], next="2031-02-03T21:05", today=TODAY)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        rows = _get(f"{base}/cockpit/panel/loops.json", TOKEN)["rows"]
+        r = next(x for x in rows if x["id"] == f"spore:{ids['loop']}")
+        later ={"verb": "spore_surface_at", "panel_id": "loops", "row_id": r["id"], "row_version": r["version"],
+                 "params": {"surface_at": "2031-02-03T22:00"}, "dry_run": True}
+        st, body = _post(f"{base}/cockpit/verb", later, TOKEN)
+        assert st == 200 and body.get("tier") == "C1", (st, body)
+        st, body = _post(f"{base}/cockpit/verb", {**later, "params": {"surface_at": "2031-02-03T09:00"}}, TOKEN)
+        assert body.get("tier") == "T2", (st, body)
+
+
 def test_spore_update_never_carries_a_target(tmp_path: Path) -> None:
     """``target`` is in the apply allow-list only for spore_retarget's effect: the edit verb, its effect and the legacy write
     each refuse it, so no edit sets a target at the edit's own tier."""
