@@ -165,6 +165,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_continuity_headroom(install))
     core.extend(_guarded("keep", lambda: _check_keep_migration(install)))
     core.extend(_guarded("overdue agenda", lambda: _check_overdue_agenda(install)))
+    core.extend(_guarded("desk home", _check_desk_home))
     core.extend(_check_compat_set(install))
     core.extend(_check_consent_hooks(install))
     core.extend(_guarded("consent ping reach", lambda: _check_consent_ping_reach(install)))
@@ -1791,6 +1792,20 @@ def _ceiling_row(store: Path, host: str, cred: str, name: str, fetch: Any, deadl
     return CheckResult(name, True, f"the provider-side ceiling for {host} is unknown: Levain cannot read it, and its "
                        "invoice is not bounded by Levain's authorized cap", "Set a spend limit in that provider's "
                        "console.", warn=True)
+
+
+def _check_desk_home(levain_home: Path | str | None = None) -> list[CheckResult]:
+    """The one row of the desk rename: a WARN while the desk home is still the old directory name and the new one does not
+    exist; no row otherwise. It reads the directory names only and makes nothing."""
+    from levain.desk.legacy import DESK_HOME_NAME, LEGACY_HOME_NAME, desk_home
+    from levain.desk.move_home import levain_home as _home
+
+    base = _home(levain_home)
+    if desk_home(base) == base / LEGACY_HOME_NAME and not (base / DESK_HOME_NAME).exists():
+        return [CheckResult("desk home", True, f"your desk home is the old name ({base / LEGACY_HOME_NAME})",
+                            "`levain desk move-home` renames it and rewrites the hook paths (`--dry-run` shows the change first)",
+                            warn=True)]
+    return []
 
 
 def _guarded(name: str, build: Any) -> list[CheckResult]:

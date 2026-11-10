@@ -41,6 +41,7 @@ from levain.desk.envelopes import EnvelopeStore, seen_past
 from levain.desk.store import (KINDS, STATES, WORDS_MAX, CoordError, Drop, Part, Source, Thread, check_source,
                                       check_words, words_sha256)
 from levain.dispatch.jobs import JobStoreError
+from levain.desk.move_home import run_move_home
 from levain.desk.legacy import CLI_ALIAS_LONG, CLI_ALIAS_SHORT, ROLE_DESK, by_word, role_word
 
 # what a store call can refuse with: the grammar's refusal, an untrustworthy store, a database it cannot use
@@ -2740,6 +2741,18 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     for p in ready_leaves:
         common(p)
         p.set_defaults(func=run_coord)
+    cmh = c_sub.add_parser(
+        "move-home", help="Rename an old install's desk home to the new name and rewrite the hook paths.",
+        description="Renames <levain home>/<old name> to <levain home>/desk, rewrites every Claude Code hook command in "
+                    "your settings.json that names the old path (the earlier file is kept as settings.json.pre-desk-move), "
+                    "and leaves the old path as a link for one release. Refuses, changing nothing, when the new "
+                    "directory already exists or settings.json is not valid JSON. Run it again: it says nothing to do.")
+    cmh.add_argument("--settings", type=Path, default=None, metavar="PATH",
+                     help="The Claude Code settings.json to rewrite (default: $LEVAIN_CLAUDE_SETTINGS, else ~/.claude/settings.json).")
+    cmh.add_argument("--home", type=Path, default=None, metavar="DIR", help="The levain home (default: $LEVAIN_HOME, else ~/.levain).")
+    cmh.add_argument("--dry-run", dest="dry_run", action="store_true", help="Print what would change and change nothing.")
+    cmh.set_defaults(func=run_move_home)
+    not_door(cmh)
     for p in (cs, ct, cr, cb, cc, cw, ca, cl, cwa, cq, can, ces, cmo, caw, csp, cbu, clg, crp, ccl, cop, chs, chw):
         common(p)
         p.set_defaults(func=run_coord)
