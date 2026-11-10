@@ -69,6 +69,7 @@ JOURNAL_SOURCES = ("move", "add", "correction", "operator-proposal")
 HANDOFF_RANK_BASE = 1000
 HEALTHY_AT = 3          # SCHEMA §4 rule 4 (ruled 10-28: "3+ per repo"); reported, never acted on here
 STORE_SOURCE = ROLE_DESK
+UNREADABLE_DESK = "desk"            # what ``unreadable`` names this store (a view-model word, never stored)
 
 _PROJECTION_PREFIXES = ("seat:", "ci:", "np-")
 _ITEM_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9+._:-]{0,199}")
@@ -581,9 +582,9 @@ def list_ready(store: CoordStore | Path | str, *, all: bool = False, repo: str |
         unreadable.extend(d.tag for d in diverged)      # shown at its state, and named: a write to it will refuse
     except StoreAbsent:
         if not _absent(st):
-            unreadable.append(STORE_SOURCE)
+            unreadable.append(UNREADABLE_DESK)
     except _READ_ERRORS:
-        unreadable.append(STORE_SOURCE)
+        unreadable.append(UNREADABLE_DESK)
     merged["store"] = [*rows, *(merged.get("store") or ())]
     stamp = generated or datetime.now().astimezone().isoformat(timespec="seconds")
     out = derive(merged, generated=stamp, unreadable=unreadable)
@@ -672,9 +673,9 @@ def snapshot(store: CoordStore | Path | str, *, sources: Mapping[str, Any] | Non
             seats = seat_rows
     except StoreAbsent:
         if not _absent(st):
-            unreadable.append(STORE_SOURCE)
+            unreadable.append(UNREADABLE_DESK)
     except _READ_ERRORS:
-        unreadable.append(STORE_SOURCE)
+        unreadable.append(UNREADABLE_DESK)
     merged["store"] = [*rows, *(merged.get("store") or ())]
     merged["seats"] = [*seats, *(merged.get("seats") or ())]
     stamp = generated or datetime.now().astimezone().isoformat(timespec="seconds")

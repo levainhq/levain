@@ -41,7 +41,7 @@ from levain.desk.envelopes import EnvelopeStore, seen_past
 from levain.desk.store import (KINDS, STATES, WORDS_MAX, CoordError, Drop, Part, Source, Thread, check_source,
                                       check_words, words_sha256)
 from levain.dispatch.jobs import JobStoreError
-from levain.desk.legacy import CLI_ALIAS_LONG, CLI_ALIAS_SHORT, ROLE_DESK
+from levain.desk.legacy import CLI_ALIAS_LONG, CLI_ALIAS_SHORT, ROLE_DESK, by_word
 
 # what a store call can refuse with: the grammar's refusal, an untrustworthy store, a database it cannot use
 _REFUSED = (CoordError, JobStoreError, sqlite3.Error, OSError)
@@ -2333,7 +2333,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     sp.add_argument("--about", default=None, metavar="THREAD",
                     help="The work thread each new ask/note/relay thread here concerns, or @N for this split's own "
                          "N-th --thread.")
-    sp.add_argument("--by", default="operator", choices=("operator", ROLE_DESK))
+    sp.add_argument("--by", default="operator", type=by_word, choices=("operator", ROLE_DESK))
     token(sp)
     common(sp)
     sp.set_defaults(func=run_split)
@@ -2342,7 +2342,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     nt.add_argument("drop_id")
     nt.add_argument("--why", default=None, metavar="ONE_LINE", help="Why it needs nothing; shown beside the drop.")
     _text_flags(nt)
-    nt.add_argument("--by", default=ROLE_DESK, choices=(ROLE_DESK,))
+    nt.add_argument("--by", default=ROLE_DESK, type=by_word, choices=(ROLE_DESK,))
     token(nt)
     common(nt)
     nt.set_defaults(func=run_note)
@@ -2369,7 +2369,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     tst = t_sub.add_parser("state", help=f"Move a thread ({' -> '.join(STATES)}; reopen to open).")
     tst.add_argument("thread_id")
     tst.add_argument("state", choices=STATES)
-    tst.add_argument("--by", default="operator", choices=("operator", ROLE_DESK))
+    tst.add_argument("--by", default="operator", type=by_word, choices=("operator", ROLE_DESK))
     token(tst)
     tst.add_argument("--cause", default="")
     tst.add_argument("--cause-file", dest="cause_file", type=Path, default=None, metavar="PATH",
@@ -2378,13 +2378,13 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     tm = t_sub.add_parser("merge", help="Fold OTHER into INTO (one intent the split cut in two).")
     tm.add_argument("into")
     tm.add_argument("other")
-    tm.add_argument("--by", default="operator", choices=("operator", ROLE_DESK))
+    tm.add_argument("--by", default="operator", type=by_word, choices=("operator", ROLE_DESK))
     token(tm)
     common(tm)
     td = t_sub.add_parser("detach", help="Take a drop out of a thread (it must stay in another).")
     td.add_argument("thread_id")
     td.add_argument("drop_id")
-    td.add_argument("--by", default="operator", choices=("operator", ROLE_DESK))
+    td.add_argument("--by", default="operator", type=by_word, choices=("operator", ROLE_DESK))
     token(td)
     common(td)
     ta = t_sub.add_parser("add", help="Put an already-split drop into one more thread.")
@@ -2394,7 +2394,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     g.add_argument("--attach", metavar="KIND:THREAD")
     _text_flags(g)
     ta.add_argument("--about", default=None, metavar="THREAD")
-    ta.add_argument("--by", default="operator", choices=("operator", ROLE_DESK))
+    ta.add_argument("--by", default="operator", type=by_word, choices=("operator", ROLE_DESK))
     token(ta)
     common(ta)
     tf = t_sub.add_parser("set", help="Re-kind, re-title or set the repo of a thread.")
@@ -2402,7 +2402,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     tf.add_argument("field", choices=("kind", "title", "repo"))
     tf.add_argument("value", nargs="?", default=None)
     _text_flags(tf)
-    tf.add_argument("--by", default="operator", choices=("operator", ROLE_DESK))
+    tf.add_argument("--by", default="operator", type=by_word, choices=("operator", ROLE_DESK))
     token(tf)
     tf.add_argument("--cause", default="")
     tf.add_argument("--cause-file", dest="cause_file", type=Path, default=None, metavar="PATH",
@@ -2436,7 +2436,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ct.add_argument("--for", dest="hold", default=None, metavar="DURATION",
                     help="How long you hold it (like 30m or 2h; default 30m).")
     cr = c_sub.add_parser("release", help="End the lease (yours, or a session's: you looking after it).")
-    cr.add_argument("--by", default="operator", choices=("operator", ROLE_DESK))
+    cr.add_argument("--by", default="operator", type=by_word, choices=("operator", ROLE_DESK))
     token(cr)
     cb = c_sub.add_parser("beat", help="The holder keeps the lease (moves its until on).")
     cb.add_argument("--token", type=int, required=True)

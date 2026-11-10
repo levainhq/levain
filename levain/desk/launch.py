@@ -109,7 +109,7 @@ from levain.contracts.canon import canonical_bytes
 from levain.desk import lease as lease_mod
 from levain.desk.lease import LEASE_TTL, LeaseRefused
 from levain.desk.store import CoordError, CoordStore
-from levain.desk.legacy import CLI_ALIAS_LONG, CODEX_RULE_NAME, ROLE_DESK, SESSION_ROLE_ALT, desk_home, role_word
+from levain.desk.legacy import CLI_ALIAS_LONG, CODEX_RULE_HEADER, CODEX_RULE_JUSTIFICATION, CODEX_RULE_NAME, ROLE_DESK, SESSION_ROLE_ALT, desk_home, role_word
 
 __all__ = ["BRIEF_DROPS", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "UNLISTED_RECHECK", "WORKER_KINDS", "Outcome",
            "brief_path", "default_desk_dir", "drops_path", "hook_live", "launch_session", "session_name", "setup_install",
@@ -1407,13 +1407,13 @@ def _legacy_codex_rule(python_path: str) -> str:
         return json.dumps(value, ensure_ascii=False)
 
     return (
-        "# Written by Levain for its desk (np-6843ca07 (a)). Codex runs exactly these commands without asking:\n"
+        f"{CODEX_RULE_HEADER}"
         f"# {shlex.quote(python_path)} -P -m levain {' | '.join(verbs)} ...\n"
         "# Every other command is decided as before. Codex loads this file only while you trust this directory.\n"
         "prefix_rule(\n"
         f"    pattern = {lit([*base, verbs])},\n"
         '    decision = "allow",\n'
-        '    justification = "Levain desk verbs: they grant nothing (a signed envelope still does)",\n'
+        f'    justification = "{CODEX_RULE_JUSTIFICATION}",\n'
         f"    match = {lit([[*base, verb, 'status'] for verb in verbs])},\n"
         f"    not_match = {lit([[*base, 'team', 'record'], [*base, CLI_ALIAS_LONG], ['levain', 'coord']])},\n"
         ")\n"

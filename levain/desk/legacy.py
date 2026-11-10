@@ -38,6 +38,17 @@ DRAFT_AGENT_PREFIX = "coordinator-draft:"      # the ledger entry's agent field 
 CAUSE_CODEX_REMOVED = "codex coordinator removed"   # a launch's persisted end cause (lease_events)
 
 
+# the text the REMOVED Codex-rule writer put into ``<cwd>/.codex/rules/levain-coordinator.rules``: a retired launch removes a
+# file only when it holds exactly this, so these two lines keep the old word byte for byte
+CODEX_RULE_HEADER = "# Written by Levain for its coordinator (np-6843ca07 (a)). Codex runs exactly these commands without asking:\n"
+CODEX_RULE_JUSTIFICATION = "Levain coordinator verbs: they grant nothing (a signed envelope still does)"
+
+
+def by_word(word: str) -> str:
+    """argparse ``type=`` for ``--by``: the desk's new name is accepted and mapped to the stored value; the old one passes."""
+    return ROLE_DESK if word == "desk" else word
+
+
 def role_word(role: str) -> str:
     """The word a message shows for a stored role value: the desk's stored spelling reads "desk"."""
     return "desk" if role == ROLE_DESK else role

@@ -28,6 +28,19 @@ class _AliasLoader(importlib.abc.Loader):
     def exec_module(self, module) -> None:        # the real module is already executed
         return None
 
+    def _real_loader(self):
+        spec = importlib.util.find_spec(self._real)
+        return spec.loader
+
+    def get_code(self, fullname):                 # runpy (``python -m levain.coordinator.x``) runs the real module's code
+        return self._real_loader().get_code(self._real)
+
+    def get_source(self, fullname):
+        return self._real_loader().get_source(self._real)
+
+    def is_package(self, fullname):
+        return importlib.util.find_spec(self._real).submodule_search_locations is not None
+
 
 class _AliasFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):

@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from levain.desk.ready import UNREADABLE_DESK
 from levain.cockpit.display_safe import visible
 from levain.desk import ready
 
@@ -138,13 +139,13 @@ def build(store_dir: Path | str | None, question_store: Any = None, *, generated
             generated = out.get("generated") or generated
             if not (Path(store_dir) / "dispatch.db").exists():
                 queue = "none"
-            elif "desk" in unreadable:
+            elif UNREADABLE_DESK in unreadable:
                 queue = "unreadable"
             else:
                 queue = "ok"
                 journal = _last_records(out.get("journal"))
         except Exception:  # noqa: BLE001 - never a 500: the store is named unreadable
-            unreadable.append("desk")
+            unreadable.append(UNREADABLE_DESK)
             queue = "unreadable"
     by_cat: dict[str, list[dict[str, Any]]] = {c: [] for c in CATEGORIES}
     for item in items:
