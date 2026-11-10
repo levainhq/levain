@@ -245,6 +245,9 @@ class ProviderSpec:
     search_scope: str = "rows"
     window: int | None = None
     search: Callable[[str, int], Any] | None = None
+    # row groups sent only to a request that carries a search ``q`` (the List's ``kept`` memory rows): read with the panel,
+    # dropped from a read with no query, so they never reach the page, a view or a count unasked
+    hidden_unless_q: tuple[str, ...] = ()
     # the levain.cockpit/1 name this spec was declared with, when it declared an alias. Derived from
     # ``kind`` alone: a caller cannot set it, so it can never disagree with the kind it normalised.
     legacy_kind: str = field(default="", init=False)
@@ -1869,6 +1872,8 @@ class Cockpit:
         if listy and spec.order and ORDERINGS[spec.order].groups:
             tally: dict[str, int] = {}
             for r in snap.rows or []:
+                if r["group"] in spec.hidden_unless_q:
+                    continue            # sent only to a search: the head never counts what a read with no query omits
                 tally[r["group"]] = tally.get(r["group"], 0) + 1
             o = ORDERINGS[spec.order]
             groups = [{"id": gid, "title": t, "count": tally.get(gid, 0),
@@ -1878,7 +1883,9 @@ class Cockpit:
             title += " (unavailable)"
         elif count is not None:
             title += f" ({count})"
-        search_head = self._search_head(spec, len(snap.rows) if listy and snap.rows is not None else count)
+        search_head = self._search_head(
+            spec, len([r for r in snap.rows if r["group"] not in spec.hidden_unless_q])
+            if listy and snap.rows is not None else count)
         etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose, search_head, auth=auth)
         if spec.kind == "roster" and now is not None and isinstance(snap.value, dict):
             # a roster's health is read against the clock, so a tone that turns with time is content
@@ -2299,6 +2306,8 @@ class Cockpit:
                     raise RowNotFound(row)
                 return out
             matched = None
+            if not q and spec is not None and spec.hidden_unless_q:
+                rows_all = [r for r in rows_all if r.get("group") not in spec.hidden_unless_q]
             if q and spec is not None:
                 fields = search_fields_of(spec)
                 held = len(rows_all)
