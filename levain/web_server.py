@@ -1612,7 +1612,11 @@ def _gzip_cockpit(status: int, body: bytes, hdrs: "list[tuple[str, str]]", accep
     vary = ", ".join([v for n, v in hdrs if n.lower() == "vary"] + ["Accept-Encoding"])
     out.append(("Vary", vary))
     if status == 200 and len(body) >= COCKPIT_GZIP_MIN_BYTES and _accepts_gzip(accept_encoding):
-        body = gzip.compress(body, compresslevel=COCKPIT_GZIP_LEVEL, mtime=0)
+        try:
+            gz = gzip.compress(body, compresslevel=COCKPIT_GZIP_LEVEL, mtime=0)
+        except Exception:  # noqa: BLE001 - a compression fault answers the identity body, never a dead connection
+            return body, out
+        body = gz
         out.append(("Content-Encoding", "gzip"))
     return body, out
 
@@ -4925,9 +4929,12 @@ class _Handler(GuardedHandler):
                 except Exception as exc:  # noqa: BLE001 - never 500 with a dead connection
                     status, hdrs = 500, [("Vary", COCKPIT_VARY)]
                     body = json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8")
+                    body, hdrs = _gzip_cockpit(status, body, hdrs, self.headers.get("Accept-Encoding"))
+                else:
+                    # compressed while the read slot is still held, so the gate counts the work it admitted
+                    body, hdrs = _gzip_cockpit(status, body, hdrs, self.headers.get("Accept-Encoding"))
                 finally:
                     self._release_read_slot()
-                body, hdrs = _gzip_cockpit(status, body, hdrs, self.headers.get("Accept-Encoding"))
                 try:
                     self._send(body, "application/json; charset=utf-8", status=status, head=head,
                                headers=hdrs, cache_control=COCKPIT_CACHE_CONTROL)
