@@ -105,13 +105,13 @@ const self_ = {
       if (!log.swallowed) { log.held = log.held.filter((n) => n.tag !== o.tag).concat([{ title, tag: o.tag, data: o.data }]); }
     },
     getNotifications: async (filter) => {
-      log.getNotificationsCalls.push(filter === undefined ? null : filter);
+      log.getNotificationsCalls.push(filter === undefined ? null : filter); log.getnLastAt = Date.now();
       if (log.getnThrows) throw new TypeError('getNotifications refused');
       const tag = filter && filter.tag;
       // 'getnall': a filter the UA ignores (an old WebKit returned every notification of the app whatever the tag)
       return log.held.filter((n) => log.getnAll || !tag || n.tag === tag).map((n) => ({ title: n.title, tag: n.tag, data: n.data }));
     },
-    pushManager: { getSubscription: async () => log.subscription },
+    pushManager: { getSubscription: async () => { if (log.subAt === undefined) log.subAt = Date.now(); return log.subscription; } },
   },
   clients: {
     claim: async () => { log.claimed = true; },
@@ -297,6 +297,7 @@ function fire(type, ev) {
     // 'nourl': no url in the payload; 'summary': the held-summary tag; 'crossurl': an off-origin url; 'second': a second push (ping 43) after the first;
     // 'clickping': the `then:...+click` carries ping 42 (as a real notification's data does), 'clickother': ping 99
     if (badgeZero0) data.badge = 0;
+    if (parts.includes('badgehuge')) data.badge = 5000000000;
     if (parts.includes('nourl')) delete data.url;
     if (parts.includes('summary')) data.tag = 'summary';
     if (parts.includes('crossurl')) data.url = 'https://evil.example/x';
@@ -317,6 +318,8 @@ function fire(type, ev) {
     log.shownAfterPush = pendings().filter((p) => p.for === 'shown');
     log.legacyLeft = (cacheStores.get('levain-open') || new Map()).has('/__levain_open/shown');
     log.elapsedMs = Date.now() - started;
+    log.subAfterMs = log.subAt === undefined ? null : log.subAt - started;   // when the worker first asked for the endpoint hash
+    log.getnLastAfterMs = log.getnLastAt === undefined ? null : log.getnLastAt - started;   // when it last asked what the UA holds
     log.showAfterMs = log.showTs ? log.showTs - started : null;
     log.afterFirst = { posts: log.posts.length, queued: [...(cacheStores.get('levain-receipts') || new Map()).keys()].sort() };
     log.firstPosts = log.posts;

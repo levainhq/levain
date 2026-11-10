@@ -601,7 +601,7 @@ function applyBadge(n) {
     const nav = self.navigator;
     if (!nav) return Promise.resolve('unsupported');
     const fail = (err) => 'error:' + String((err && err.name) || 'Error').replace(/[^A-Za-z]/g, '').slice(0, 32).padEnd(1, 'E');
-    if (n > 0) return typeof nav.setAppBadge === 'function' ? Promise.resolve(nav.setAppBadge(n)).then(() => 'set:' + n, fail) : Promise.resolve('unsupported');
+    if (n > 0) return typeof nav.setAppBadge === 'function' ? Promise.resolve(nav.setAppBadge(n)).then(() => 'set:' + Math.min(n, 999999999), fail) : Promise.resolve('unsupported');
     return typeof nav.clearAppBadge === 'function' ? Promise.resolve(nav.clearAppBadge()).then(() => 'cleared', fail) : Promise.resolve('unsupported');
   } catch (err) { return Promise.resolve('error:' + String((err && err.name) || 'Error').replace(/[^A-Za-z]/g, '').slice(0, 32).padEnd(1, 'E')); }
 }
@@ -662,8 +662,9 @@ self.addEventListener('push', (e) => {
     const db = receiptBudget(t0);
     const dbadged = badgeResult(applyBadge(d.badge));
     const dreceipts = boundedReceipts(db, async () => {
+      const dhashP = endpointHash(db);   // asked now: the hash does not wait on the badge call
       const dbadge = await dbadged;
-      const r = await sendReceipt(dping, 'received', t0, db, endpointHash(db), { badge: dbadge });
+      const r = await sendReceipt(dping, 'received', t0, db, dhashP, { badge: dbadge });
       if (r === true) await drainReceipts(db);
     });
     e.waitUntil(Promise.allSettled([dbadged, dreceipts]).finally(traceSettled));
@@ -708,8 +709,8 @@ self.addEventListener('push', (e) => {
   const receipts = boundedReceipts(b, async () => {
     const hashP = endpointHash(b);   // one hash for this event's reports, asked now
     const tag = d.tag || 'levain';
-    const badgeRes = await badgedB;   // settled in ms; bounded, so the report is never held
-    const r = await Promise.all([sendReceipt(ping, 'received', t0, b, hashP, { badge: badgeRes }),
+    // only the `received` body waits for the badge result (bounded by BADGE_WAIT_MS); the `shown` verification starts now
+    const r = await Promise.all([badgedB.then((badgeRes) => sendReceipt(ping, 'received', t0, b, hashP, { badge: badgeRes })),
                                  shown.then(() => heldByAgent(tag, ping, b), () => false)
                                    .then((held) => (held ? sendReceipt(ping, 'shown', Date.now(), b, hashP) : false))
                                    .catch(() => false)]);   // total: a throw in this arm would reject Promise.all, and the budget's end would abort `received` too
