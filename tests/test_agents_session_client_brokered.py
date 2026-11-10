@@ -298,7 +298,12 @@ def test_end_of_a_brokered_session_reaches_run_sock_after_the_brokered_server_is
     assert ended.terminated is True, ended
     assert wire.opens == {"passthrough": 1, "brokered": 0}
     assert pair.index.get(KEY_B)["state"] == "ended"
-    assert len(pair.runtime.ended) == 1                      # the slot's session was ended (the slot is released)
+    # The slot's session was ended (the slot is released). Held by identity, not by call count: the released first
+    # launch's holder runs its own END for the key when its connection closes, on the brokered server's job and
+    # asynchronously, and the restarted server's END is a separate job; each reads "not yet ended" before the other
+    # records it, so both may reach the runtime. A runtime END of an ended group is idempotent, so what is held is
+    # that only the slot's own session was ever ended, at least once.
+    assert pair.runtime.ended and set(pair.runtime.ended) == {"sess-1"}, pair.runtime.ended
 
 
 def test_usage_of_a_brokered_session_never_falls_back_to_run_sock(lrig, pair):
