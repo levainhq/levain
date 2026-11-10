@@ -395,7 +395,7 @@ class TestTierLadder:
                      intent="reported", tier_seen="T2", gesture_seen="direct-reported")
         rig.clock.advance(2)    # past every rejected date, still before the stored one
         held = f"spore:{rig.ids['held']}"
-        assert held not in rig.panel_ids("tray")
+        assert {r["id"]: r["group"] for r in rig.ck.panel("tray", credential_class="token")["rows"]}[held] == "later"   # still under Later
 
     def test_surface_at_on_a_legacy_note_keeps_it_in_the_tray(self, rig: Rig) -> None:
         """'surface_at on a legacy note (shown in the Tray since the Keep left) is accepted'"""
@@ -976,7 +976,7 @@ class TestSporeCas:
         rows = {r["id"]: r for pid in ("tray", "loops")
                 for r in (rig.ck.panel(pid, credential_class="token") or {}).get("rows") or []}
         stored = {sp["id"]: sp for sp in json.loads(p.read_text())["spores"]}
-        assert set(rows) == {f"spore:{i}" for i in stored} - {f"spore:{rig.ids['held']}"}   # held is out of view
+        assert set(rows) == {f"spore:{i}" for i in stored}   # a later row is in view too
         for rid, row in rows.items():
             assert spore_row_version(stored[rid[len("spore:"):]]) == row["version"], rid
 

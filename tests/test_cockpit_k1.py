@@ -547,7 +547,7 @@ class TestOrderingAndGroups:
         by_group = {r["id"]: r["group"] for r in p["rows"]}
         # spore-004 is the fixture's legacy note: shown in the Tray (the Keep is gone), undated -> "also"
         assert by_group == {"spore:spore-003": "today", "spore:spore-002": "overdue", "spore:spore-004": "also"}
-        assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also"]   # THE LIST's groups
+        assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also", "someday", "done"]   # THE LIST's groups
         assert [r["group"] for r in p["rows"]] == ["overdue", "today", "also"]  # group order leads
         assert all(r["band"] == "now" for r in p["rows"] if r["group"] != "also")
 
@@ -577,8 +577,8 @@ class TestOrderingAndGroups:
         root, _s, ck = env
         SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="later", disposition="seed", next="2999-01-01")
         p = ck.panel("tray")
-        assert p["status"] == "ok" and p["filtered"] == [{"count": 1, "reason": "surface date not reached"}]
-        assert p["count"] == 3
+        assert p["status"] == "ok" and p["filtered"] == []                      # a future date is the Later group, not a filtered row
+        assert p["count"] == 3 and [r["group"] for r in p["rows"]].count("later") == 1
 
 
 # --- the JobStore list -----------------------------------------------------------------------------
@@ -710,7 +710,7 @@ class TestL3R1Fixes:
             if s["text"] == "seed overdue":
                 s["next"] = "2999-01-01"
         path.write_text(json.dumps(data))
-        assert "spore:spore-002" not in [r["id"] for r in ck.panel("tray")["rows"]]   # held out of the list
+        assert {r["id"]: r["group"] for r in ck.panel("tray")["rows"]}["spore:spore-002"] == "later"   # listed under Later
         assert isinstance(ck.read_one("tray", "spore:spore-002"), Read)                # but a write finds it
 
     def test_malformed_provider_output_is_a_fault_not_a_crash(self) -> None:
@@ -856,7 +856,8 @@ class TestL3R2Fixes:
             sp.add(type="task", text=f"held {i}", disposition="seed", next="2999-01-01", tier="hot", salience=3)
         monkeypatch.setattr(prov, "SPORE_CAP", 2)
         got = build_default_cockpit(src).panel("tray")
-        assert got["filtered"][0]["count"] == 4 and got["count"] == 2    # the visible rows survive the cap
+        assert [r["group"] for r in got["rows"]].count("later") == 2 and got["count"] == 2   # the later rows are capped apart: the due rows survive
+        assert {"count": 2, "reason": "later rows over the display cap of 2"} in got["skipped"]
 
     def test_read_one_is_not_truncated_by_the_cap(self, env, monkeypatch) -> None:
         import levain.cockpit.providers as prov

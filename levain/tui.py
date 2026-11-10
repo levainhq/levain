@@ -125,7 +125,7 @@ _VERB_MEDIATED_KINDS = frozenset(
         "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone",
         # the Slice-3b operator-I/O kinds (capture / re-route / schedule / metadata
         # edit) — verb-mediated, anneal-owned reversibility, never file-undoable.
-        "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update",
+        "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update", "spore_retarget",
     }
 )
 

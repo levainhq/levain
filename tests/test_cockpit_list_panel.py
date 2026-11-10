@@ -119,9 +119,9 @@ def test_the_three_stores_are_one_panel_titled_list_and_each_row_names_its_surfa
     assert by_surface["band"] == [f"band:{rig.q.id}"]
     assert sorted(by_surface["board"]) == ["board:levain:a", "board:levain:b"]       # the ready column; backlog is not the List's
     assert sorted(by_surface["talk"]) == sorted(f"spore:{rig.ids[k]}" for k in ("talk_old", "talk_new"))
-    assert sorted(by_surface["drop"]) == sorted(f"spore:{rig.ids[k]}" for k in ("drop_late", "drop_soon"))
+    assert sorted(by_surface["drop"]) == sorted(f"spore:{rig.ids[k]}" for k in ("drop_late", "drop_soon", "drop_later"))
     assert f"spore:{rig.ids['loop']}" not in {r["id"] for r in p["rows"]}            # Open loops stays machine-side
-    assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also"]
+    assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also", "someday", "done"]
     assert p["note"] == list_panel.LIST_NOTE
 
 
@@ -134,7 +134,7 @@ def test_the_groups_put_band_first_then_what_is_late_then_today_then_ready_then_
     assert by[f"spore:{rig.ids['drop_late']}"] == "overdue" and by[f"spore:{rig.ids['agenda_old']}"] == "overdue"
     assert by[f"spore:{rig.ids['drop_soon']}"] == "today"
     assert by["board:levain:a"] == "board" and by[f"spore:{rig.ids['talk_old']}"] == "talk"
-    assert by[f"spore:{rig.ids['plain']}"] == "also"
+    assert by[f"spore:{rig.ids['plain']}"] == "someday" and by[f"spore:{rig.ids['drop_later']}"] == "later"
 
 
 def test_talk_seeds_are_listed_oldest_first_with_their_age(rig: Rig) -> None:
@@ -163,14 +163,13 @@ def test_a_timed_next_is_overdue_at_its_minute_and_a_later_one_is_not(rig: Rig) 
     assert flipped[f"spore:{rig.ids['drop_soon']}"]["facets"]["overdue"] is True
 
 
-def test_a_timed_next_on_a_future_day_is_held_exactly_as_a_dated_one_was(rig: Rig) -> None:
+def test_a_timed_next_on_a_future_day_is_later_exactly_as_a_dated_one_is(rig: Rig) -> None:
     p = rig.panel()
-    held = [r for r in p.get("held") or []]
-    assert [r["id"] for r in held] == [f"spore:{rig.ids['drop_later']}"]
-    assert held[0]["facets"]["held"] is True and held[0]["facets"]["due"] == "2026-11-10"
-    assert held[0]["facets"]["fires"] == "2026-11-10T09:00" and held[0]["facets"]["surface"] == "drop"
-    assert p["filtered"] == [{"count": 1, "reason": "surface date not reached"}]
-    assert f"spore:{rig.ids['drop_later']}" not in {r["id"] for r in p["rows"]}
+    later = [r for r in p["rows"] if r["group"] == "later"]
+    assert [r["id"] for r in later] == [f"spore:{rig.ids['drop_later']}"]
+    assert later[0]["facets"]["due"] == "2026-11-10" and later[0]["facets"]["time_state"] == "later"
+    assert later[0]["facets"]["fires"] == "2026-11-10T09:00" and later[0]["facets"]["surface"] == "drop"
+    assert "held" not in p and p["filtered"] == []
 
 
 def test_a_malformed_timed_next_is_never_read_as_a_date(tmp_path: Path) -> None:
@@ -407,13 +406,14 @@ def test_listpanel_r1_the_text_cockpit_draws_desk_owes_and_later_as_the_footer_d
                                                                                   fields: dict, heading: str) -> None:
     from levain.cockpit.text import render_lines, snapshot
 
-    def lines() -> str:
-        return "\n".join(t for _s, t in render_lines(snapshot(rig.ck), now=NOW))
+    def lines() -> list[str]:
+        return [t for _s, t in render_lines(snapshot(rig.ck), now=NOW)]
 
-    assert heading not in lines()
     _band_with(monkeypatch, rig, **fields)
     out = lines()
-    assert heading in out and "Ship the sweep fix tonight?" in out, out         # the row is not silently dropped
+    head = next(i for i, t in enumerate(out) if heading in t)                    # a dated drop is LATER too: look under THIS heading
+    title = next(i for i, t in enumerate(out) if "Ship the sweep fix tonight?" in t and i > head)
+    assert not any(t.startswith("  ") and not t.startswith("    ") for t in out[head + 1:title]), out   # the row is drawn under it, not silently dropped
 
 
 # --- 531 round 6 (levain 75, key 1108-41): the age is the clock flow's footer reads --------------------------------------
@@ -467,10 +467,10 @@ def test_lpr3_later_rows_sort_by_return_date_then_band_number_as_the_footer_does
 
     monkeypatch.setattr(band_view, "_read", read)
     p = rig.panel()
-    later = [r for r in p["rows"] if r["group"] == "later"]
+    later = [r for r in p["rows"] if r["group"] == "later" and r["id"].startswith("band:")]
     nums = {r["id"]: r["facets"].get("band_number") for r in later}
     assert [r["id"] for r in later] == [f"band:{q2.id}", f"band:{rig.q.id}"], (nums, [r["facets"].get("held_until") for r in later])
     assert nums[f"band:{rig.q.id}"] < nums[f"band:{q2.id}"], nums           # the band number alone would have said the opposite
     days[q2.id] = "2026-12-01"                                              # one date: the band number decides
-    later = [r for r in rig.panel()["rows"] if r["group"] == "later"]
+    later = [r for r in rig.panel()["rows"] if r["group"] == "later" and r["id"].startswith("band:")]
     assert [r["id"] for r in later] == [f"band:{rig.q.id}", f"band:{q2.id}"]

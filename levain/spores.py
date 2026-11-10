@@ -77,6 +77,8 @@ __all__ = [
     "is_timed",
     "valid_next",
     "valid_target",
+    "valid_retarget",
+    "executor_of",
 ]
 
 LOOP_DISPOSITION = "loop"
@@ -305,6 +307,25 @@ def valid_target(value: Any) -> bool:
     return value.startswith("board:") and bool(value[len("board:"):].strip())
 
 
+_FLOW_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def valid_retarget(value: Any) -> bool:
+    """A target the List's who control may WRITE: one the store's other reader (flow's germinate) also accepts. Flow takes a
+    ``board:`` repo only as a plain repo name, a stricter reading than :func:`valid_target`'s non-empty one."""
+    if not valid_target(value):
+        return False
+    return value in GERMINATE_TARGETS or _FLOW_REPO.fullmatch(value[len("board:"):]) is not None
+
+
+def executor_of(target: Any) -> str | None:
+    """Who acts once an agenda with this target wakes, derived and never stored: ``operator`` for a band row or a nudge (it
+    rings in the band), ``machine`` for the desk or a board item. None for no target, or one that is not a target."""
+    if not valid_target(target):
+        return None
+    return "operator" if target in ("band", "nudge") else "machine"
+
+
 def is_talk_seed(item: Mapping[str, Any]) -> bool:
     """An open ``seed`` that carries ``attention: talk``: a thing to talk through with the operator (the talk queue).
     Such a seed does not go stale silently. Levain's own spore code has no TTL expiry or resurface step of its own
@@ -351,6 +372,11 @@ def ringing_ref(spore: Mapping[str, Any], open_questions: Any) -> str | None:
 def answered_descend_kind(spore_type: Any) -> str:
     """The descend kind that says an intention was answered, by the spore's type (anneal validates a kind against it)."""
     return {"task": "done", "question": "answered", "thought": "explored"}.get(str(spore_type), "composted")
+
+
+def dropped_descend_kind(spore_type: Any) -> str:
+    """The descend kind that says an intention was dropped, by the spore's type."""
+    return {"task": "dropped", "question": "mooted", "thought": "dropped"}.get(str(spore_type), "composted")
 
 
 def open_question_ids(questions: Any) -> frozenset[str]:

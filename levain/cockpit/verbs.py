@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from levain.cockpit.authority import bound, current
 from levain.cockpit.effects import INTAKE_TIERS, INTAKE_VERB, intake_kind_of
-from levain.cockpit.engine import DECISIONS_ID, NOTE_VERB, QUESTION_VERB, VALUE_ABSENT
+from levain.cockpit.engine import DECISIONS_ID, INTENTION_VERBS, NOTE_VERB, QUESTION_VERB, VALUE_ABSENT
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import NOTE_ROW_PREFIX, QUESTION_ROW_PREFIX, parse_date
 from levain.cockpit.results import Absent, Fault, Read
@@ -246,26 +246,47 @@ def _held_date(row: dict[str, Any] | None, today: date) -> date | None:
     return d if d is not None and d > today else None
 
 
+def _held_at(row: dict[str, Any] | None, today: date) -> datetime | None:
+    """The instant a held row next surfaces, at the minute it is stored: a spore row's ``fires`` facet carries a timed
+    ``next`` (None there means a date-only one, read as the start of its day). A row whose minute is not known (no
+    ``fires`` facet at all) is read as held to the end of its day, so a move within that day reads as sooner."""
+    from levain.spores import _parse_when
+
+    held = _held_date(row, today)
+    if held is None:
+        return None
+    facets = (row or {}).get("facets") or {}
+    if "fires" not in facets:
+        return datetime.combine(held, datetime.max.time()).replace(second=0, microsecond=0)
+    when = _parse_when(facets.get("fires"))
+    if when is not None and when.date() == held:
+        return when
+    return datetime.combine(held, datetime.min.time())
+
+
 def _date_tier(new: Any, row: dict[str, Any] | None, provenance: str, today: date) -> Tier:
     """A snooze is C1 on any row, except on an unverified row held to a future date: moving that
-    date earlier (to any date) or clearing it shows the row sooner to readers who were not seeing
-    it, so it is T2 (§4.2, RULED Q4 bounded below)."""
-    held = _held_date(row, today)
+    instant earlier (an earlier minute on the same day included) or clearing it shows the row sooner
+    to readers who were not seeing it, so it is T2 (§4.2, RULED Q4 bounded below). A date-only value
+    is the start of its day."""
+    from levain.spores import _parse_when
+
+    held = _held_at(row, today)
     if provenance == "verified" or held is None:
         return "C1"
     if new is None:
         return "T2"
-    d = parse_date(new)
-    if d is None or d < held:
+    when = _parse_when(new)
+    if when is None or when < held:
         return "T2"     # an unparseable date is refused by the handler; it never lowers a tier
     return "C1"
 
 
 def _date_escalates(row: dict[str, Any] | None, provenance: str, today: date, param: str) -> list[dict[str, Any]]:
-    held = _held_date(row, today)
+    held = _held_at(row, today)
     if provenance == "verified" or held is None:
         return []
-    return [{"param": param, "op": "before", "value": held.isoformat(), "tier": "T2"},
+    return [{"param": param, "op": "before", "value": held.strftime("%Y-%m-%dT%H:%M"), "tier": "T2"},
             {"param": param, "op": "clear", "tier": "T2"}]
 
 
@@ -378,6 +399,14 @@ _OPEN_QUESTION_ROW = lambda r: (str(r.get("id", "")).startswith("question:")   #
                                 and _facet(r, "question_state") == "open")
 
 
+# a row that rings an open intention and whose host can act on it: a decisions question row carrying the kernel's
+# ``question_intention`` facet, or a List band row carrying ``intention`` (the facet is set only when the host offers
+# ``intention_act``, so an older host's rows never match)
+_INTENTION_ROW = lambda r: ((str(r.get("id", "")).startswith("question:")   # noqa: E731
+                             and _facet(r, "question_state") == "open" and _facet(r, "question_intention") is not None)
+                            or (str(r.get("id", "")).startswith("band:") and _facet(r, "intention") is not None))
+
+
 # the kernel's agent-text rows on the composed decisions panel: (row-id prefix, the facet only the kernel writes, the
 # one verb the row offers). Each pair binds BOTH ways: the row offers only its verb, and the verb fires only on it
 _KERNEL_ROW_VERBS = ((QUESTION_ROW_PREFIX, "question_n", QUESTION_VERB), (NOTE_ROW_PREFIX, "note_n", NOTE_VERB))
@@ -393,9 +422,12 @@ def _applies_to_row(verb: "VerbSpec", panel_id: str, row: dict[str, Any]) -> boo
     rid = str(row.get("id", ""))
     for prefix, facet, owner in _KERNEL_ROW_VERBS:
         kernel_row = panel_id == DECISIONS_ID and rid.startswith(prefix)
-        if kernel_row and verb.name != owner:
+        # a question row that rings an intention is offered the four intention verbs in place of the answer
+        owners = INTENTION_VERBS if (kernel_row and prefix == QUESTION_ROW_PREFIX
+                                     and _facet(row, "question_intention") is not None) else (owner,)
+        if kernel_row and verb.name not in owners:
             return False
-        if verb.name == owner and not (kernel_row and _facet(row, facet) is not None):
+        if verb.name == owner and not (kernel_row and owners == (owner,) and _facet(row, facet) is not None):
             return False
     return verb.applies_to is None or bool(verb.applies_to(row))
 
@@ -814,6 +846,51 @@ def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str
     return {"answered": n, "delivery": "started"}
 
 
+def _intention_fire(action: str) -> Callable[..., dict[str, Any]]:
+    """Act on the intention a band row rings (snooze, edit, done, clear) through the host's one ``intention_act``: the host
+    owns the spore, the row and its log, so this writes nothing itself and the host's own lock order holds. Channel
+    ``cockpit``. C1: it authorises nothing. The host is handed the spore id the row DISPLAYED (its version carries it, so a
+    row re-rung since is already stale here), never a row id it would resolve again. The host's refusal comes back in its
+    own words: stale when it says the row moved (an ``IntentionStale``, or any exception with a truthy ``stale``), else a bad
+    request. Known edge: the band shorthand answer on such a row closes a native reminder at the next germinate run, not at once."""
+    from levain.consent.questions import QuestionStoreError, until_refusal, valid_intention_id
+
+    def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+        store = target.get("questions")
+        act = getattr(store, "intention_act", None)
+        if not callable(act):
+            raise EditError("not_built", 501, "this cockpit's band cannot act on an intention")
+        allowed = {"snooze": {"until"}, "edit": {"text"}}.get(action, set())
+        if set(params) != allowed:
+            raise EditError("bad_request", 400, f"{action} takes exactly {sorted(allowed) or 'no parameters'}")
+        kwargs: dict[str, Any] = {}
+        if action == "snooze":
+            refused = until_refusal(params["until"])        # the host judges "after today" by its own clock
+            if refused:
+                raise EditError("bad_request", 400, refused)
+            kwargs["until"] = params["until"]
+        elif action == "edit":
+            text = params["text"]
+            if not isinstance(text, str) or not text.strip():
+                raise EditError("bad_request", 400, "the text cannot be empty")
+            kwargs["text"] = text
+        row = target["row"]
+        ref = _facet(row, "question_intention") if str(row.get("id", "")).startswith("question:") else _facet(row, "intention")
+        if not valid_intention_id(ref):
+            raise EditError("stale", 409, "this row rings no reminder now: reload")
+        try:
+            words = act(ref, action, channel="cockpit", **kwargs)
+        except EditError:
+            raise
+        except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+            raise EditError("source_unavailable", 503, f"the band cannot act now: {exc}") from None
+        except Exception as exc:  # noqa: BLE001 - the host's refusal, whatever its class (a ConsentError is the contract): its words
+            stale = bool(getattr(exc, "stale", False))
+            raise EditError("stale" if stale else "bad_request", 409 if stale else 400, str(exc)[:300]) from None
+        return {"intention": action, "ref": ref, "said": words if isinstance(words, str) else ""}
+    return fire
+
+
 def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
     """Answer the NEEDS YOU band by its shorthand (Q17-ALL S5a): ``{text, store_id, view_id}``, recorded once per
     item, unsigned, channel ``cockpit``, viewer ``cockpit:<credential>``, only while that view is still the viewer's
@@ -942,6 +1019,14 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              fields=("text", "domain", "tier", "type"), floor="C1", tier_fn=_update_tier,
              row_tier=_const("C1"), escalates=_update_escalates,
              fire=_spore_fire("spore_update"), legacy_kind="spore_update", device_ok=True, applies_to=_SPORE_ROW),
+    VerbSpec("spore_retarget", "who", "sets who acts when the item wakes: you (a band row) or the machine (the desk "
+             "or a board), a seed given one becomes a dated agenda", "row", fields=("target", "surface_at"), floor="T2",
+             tier_fn=_const("T2"),
+             # a target wakes an agent with these words, as a create that carries one does (spore_seed), so it is T2;
+             # it fires through the broker's effect, never a bearer-token write
+             fire=_unbuilt_fire("spore_retarget fires through the broker (a target wakes an agent: signed)"),
+             legacy_kind="spore_retarget", device_ok=True,
+             applies_to=lambda r: _SPORE_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() in ("seed", "agenda")),
     VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
              fire=_spore_fire("spore_set_disposition"), legacy_kind="spore_set_disposition", device_ok=True,
@@ -972,6 +1057,18 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("question_answer", "answer", "records your answer to an agent's question and sends it to the agent "
              "(it authorises nothing)", "row", fields=("option", "text"), floor="C1", tier_fn=_const("C1"),
              reversible=False, fire=_question_fire, applies_to=_OPEN_QUESTION_ROW),
+    VerbSpec("intention_snooze", "Snooze", "moves the reminder behind this row to a later day: the row leaves the band now and "
+             "comes back as a new row on that day", "row", fields=("until",), floor="C1", tier_fn=_const("C1"),
+             reversible=False, fire=_intention_fire("snooze"), applies_to=_INTENTION_ROW),
+    VerbSpec("intention_edit", "Edit", "changes the words of the reminder behind this row", "row", fields=("text",),
+             floor="C1", tier_fn=_const("C1"), reversible=False, fire=_intention_fire("edit"),
+             applies_to=_INTENTION_ROW),
+    VerbSpec("intention_done", "Done", "marks the reminder behind this row done: the row closes and the reminder is finished",
+             "row", floor="C1", tier_fn=_const("C1"), reversible=False, fire=_intention_fire("done"),
+             applies_to=_INTENTION_ROW),
+    VerbSpec("intention_clear", "Clear", "drops the reminder behind this row: the row closes and the reminder is dropped",
+             "row", floor="C1", tier_fn=_const("C1"), confirm_required=True, reversible=False,
+             fire=_intention_fire("clear"), applies_to=_INTENTION_ROW),
     VerbSpec("band_answer", "answer", "records your shorthand answers to the NEEDS YOU band and sends them to the "
              "agents (it authorises nothing)", "create", fields=("text", "store_id", "view_id"), floor="C1",
              tier_fn=_const("C1"), reversible=False, fire=_band_fire),
