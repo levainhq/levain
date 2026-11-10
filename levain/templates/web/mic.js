@@ -350,7 +350,21 @@
     b.textContent = FACE_WORDS[kind]; b.classList.add("voice-words"); b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", FACE_WORDS[kind]);
   }
 
-  var insts = [];                            // every attach() still in use: a capture started in one box ends the others'
+  // SpeechRecognition error names (the spec's list, plus "start" for a start() that threw) -> the plain reason shown on the card.
+  var DICTATE_REASONS = {
+    "not-allowed": "Dictation needs permission to use the microphone.",
+    "service-not-allowed": "This browser is not allowing dictation here (speech recognition is blocked or turned off for it).",
+    "language-not-supported": "This browser has no on-device dictation pack for this language yet, so Dictate cannot run; the keyboard dictation key works.",
+    "audio-capture": "No microphone was found, or it could not be opened.",
+    "network": "Dictation could not reach its speech service.",
+    "no-speech": "No speech was heard; tap Dictate and try again.",
+    "aborted": "Dictation was interrupted.",
+    "bad-grammar": "Dictation could not use its settings.",
+    "start": "Dictation could not start; tap Dictate again.",
+  };
+  function dictateReason(name) { return Object.prototype.hasOwnProperty.call(DICTATE_REASONS, name) ? DICTATE_REASONS[name] : "Dictation stopped" + (typeof name === "string" && /^[a-z-]{1,40}$/.test(name) ? " (" + name + ")." : "."); }
+
+  var insts = [];                          // every attach() still in use: a capture started in one box ends the others'
   var TAIL_MS = 1500;                        // how long Stop dictating waits for the engine's last phrase
   var ORPHAN_MS = 5000;                      // a box never put on the page by then is let go (a draw that landed after its card closed)
 
@@ -448,9 +462,9 @@
           fin = done; put(all);
         };
         r.onend = function () { if (rec === r) finishDict(); };
-        r.onerror = function (ev) { if (rec === r) { finishDict(); say(ev && ev.error === "not-allowed" ? "Dictation needs permission to use the microphone." : "Dictation stopped."); } };
+        r.onerror = function (ev) { if (rec === r) { finishDict(); say(dictateReason(ev && ev.error)); } };
         begin(); rec = r; ending = false; face(db, "dictate-stop");
-        try { r.start(); } catch (e) { finishDict(); }
+        try { r.start(); } catch (e) { finishDict(); say(dictateReason("start")); }
       });
       var leave = function () { if (detached()) { off(); return; } if (doc.visibilityState === "hidden") abortDict(); };
       doc.addEventListener("visibilitychange", leave);
