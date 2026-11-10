@@ -967,7 +967,7 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              # it fires through the broker's effect, never a bearer-token write
              fire=_unbuilt_fire("spore_retarget fires through the broker (a target wakes an agent: signed)"),
              legacy_kind="spore_retarget", device_ok=True,
-             applies_to=lambda r: _SPORE_ROW(r) and str(_facet(r, "disposition") or "") in ("seed", "agenda")),
+             applies_to=lambda r: _SPORE_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() in ("seed", "agenda")),
     VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
              fire=_spore_fire("spore_set_disposition"), legacy_kind="spore_set_disposition", device_ok=True,

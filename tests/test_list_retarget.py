@@ -112,6 +112,24 @@ def test_a_seed_given_who_and_when_becomes_a_dated_agenda_and_the_agenda_changes
     assert (drop["target"], drop["next"]) == ("board:levain", "2031-01-07T09:00")          # who changes, when does not
 
 
+def test_a_seed_stored_with_other_casing_is_still_offered_who(tmp_path: Path) -> None:
+    """The store keeps a disposition as it was written ("Seed"); the verb reads it as the effect does, case and spacing aside.
+    Today no panel renders such a row (the disposition facet is an enum, so the row is refused), so this pins the predicate."""
+    from levain.cockpit.verbs import KERNEL_VERBS
+
+    retarget = next(v for v in KERNEL_VERBS if v.name == "spore_retarget")
+    for d in ("Seed", " seed ", "AGENDA"):
+        assert retarget.applies_to({"id": "spore:spore-9", "facets": {"disposition": d}}), d
+    assert not retarget.applies_to({"id": "spore:spore-9", "facets": {"disposition": "loop"}})
+    root, src, _ids = _install(tmp_path)
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    sid = store.add(type="task", text="a capital seed", disposition="Seed", today=TODAY)["id"]
+    assert store.get(sid)["disposition"] == "Seed"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        shown = {r["id"] for p in ("tray", "loops") for r in _get(f"{base}/cockpit/panel/{p}.json", TOKEN)["rows"]}
+    assert f"spore:{sid}" not in shown
+
+
 def test_an_agenda_that_already_woke_is_not_retargeted(tmp_path: Path) -> None:
     """A ``germinated`` stamp means the agenda woke (a band row rings for it, or it was handed on): germinate never reads its
     target again, so a new one would change nothing but the record. The retarget refuses it, as the other spore verbs refuse
