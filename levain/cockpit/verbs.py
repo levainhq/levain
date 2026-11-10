@@ -1008,6 +1008,9 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              "row", fields=("intention_kind",), floor="C1", tier_fn=_const("C1"), confirm_required=True,
              reversible=False, fire=_plain_intention_fire("intention_close"), legacy_kind="intention_close", device_ok=True,
              applies_to=_PLAIN_INTENTION_ROW, options=_resolve_kinds("descend")),
+    VerbSpec("intention_keep", "keep", "keeps the item's words as an anneal memory episode, then composts the item (recoverable in "
+             "anneal)", "row", fields=(), floor="C1", tier_fn=_const("C1"), reversible=False,
+             fire=_plain_intention_fire("intention_keep"), legacy_kind="intention_keep", applies_to=_PLAIN_INTENTION_ROW),
     VerbSpec("intention_surface_at", "snooze", "sets the date the item next surfaces", "row",
              fields=("surface_at",), floor="C1", tier_fn=_surface_at_tier,
              row_tier=_const("C1"),
