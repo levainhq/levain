@@ -102,11 +102,11 @@
     const live = new Set(ids.map(panelUrl));
     for (const u of Array.from(panelBodies.keys())) if (!live.has(u)) panelBodies.delete(u);
   }
-  async function fetchPanelConditional(url, head) {
+  async function fetchPanelConditional(url, head, signal) {
     const hit = panelBodies.get(url);
     const headers = readHeaders();
     if (hit) headers["If-None-Match"] = hit.etag;
-    const res = await fetch(url, { cache: "no-store", headers: headers });
+    const res = await fetch(url, signal ? { cache: "no-store", headers: headers, signal: signal } : { cache: "no-store", headers: headers });
     if (res.status === 304 && hit) {
       let text = hit.text;
       if (head && typeof head.as_of === "string") {
@@ -122,6 +122,63 @@
     return new Response(text, { status: 200, headers: { "Content-Type": type, "ETag": etag } });
   }
   // END conditional panel read
+  // BEGIN progressive draw
+  // The first board is drawn as its panels land, never held for the whole set: the manifest, then the panels the page's
+  // top (the hero, the brief, the Needs strip's `decisions`) is made of, then the rest as each one answers. These are the
+  // pure parts: which ids are read first, the manifest narrowed to the panels in hand, and the pacing of the partial draws.
+  const PARTIAL_GAP_MS = 250;        // two partial draws are at least this far apart, and at least PARTIAL_IDLE x the last draw's own time (a slow phone renders slowly)
+  const PARTIAL_IDLE = 4;
+  const PANEL_TIMEOUT_MS = 30000;    // a panel that has not answered by then is drawn as its own failure, the rest of the board stays usable
+  function drawOrder(manifest, ids) {
+    const r = (manifest && manifest.regions) || {};
+    const core = [];
+    for (const id of [].concat(r.hero || [], r.brief || [], ["decisions"])) if (ids.indexOf(id) >= 0 && core.indexOf(id) < 0) core.push(id);
+    return { core: core, order: core.concat(ids.filter((id) => core.indexOf(id) < 0)) };
+  }
+  function manifestSubset(manifest, have) {
+    const keep = (a) => Array.isArray(a) ? a.filter((id) => have.has(id)) : a;
+    const m = Object.assign({}, manifest);
+    m.panels = {};
+    for (const id of Object.keys(manifest.panels || {})) if (have.has(id)) m.panels[id] = manifest.panels[id];
+    if (manifest.regions && typeof manifest.regions === "object") {
+      const r = Object.assign({}, manifest.regions);
+      for (const k of ["hero", "brief", "widgets", "header"]) if (Array.isArray(r[k])) r[k] = keep(r[k]);
+      if (Array.isArray(r.zones)) {
+        r.zones = r.zones.map((z) => {
+          const zz = Object.assign({}, z);
+          zz.panels = keep(z.panels);
+          if (Array.isArray(z.cards)) zz.cards = z.cards.map((c) => Object.assign({}, c, { panels: keep(c.panels) })).filter((c) => c.panels.length);
+          return zz;
+        }).filter((z) => z.panels.length);
+      }
+      m.regions = r;
+    }
+    return m;
+  }
+  // draw(settledCount) is called when the core panels are all in, then after each later panel at most once per PARTIAL_GAP_MS,
+  // and never for the last panel (the full draw is the caller's). `stop` cancels a pending one.
+  function partialPacer(core, total, draw, clock) {
+    const waiting = new Set(core);
+    let n = 0, last = -Infinity, gap = PARTIAL_GAP_MS, timer = null, done = false;
+    const fire = () => {
+      timer = null; if (done) return;
+      const t0 = clock.now();
+      draw(n);
+      last = clock.now();
+      gap = Math.max(PARTIAL_GAP_MS, PARTIAL_IDLE * (last - t0));
+    };
+    return {
+      settled: function (id) {
+        n++; waiting.delete(id);
+        if (done || waiting.size || n >= total) return;
+        if (timer !== null) return;
+        const wait = last + gap - clock.now();
+        if (wait <= 0) fire(); else timer = clock.setTimeout(fire, wait);
+      },
+      stop: function () { done = true; if (timer !== null) { clock.clearTimeout(timer); timer = null; } },
+    };
+  }
+  // END progressive draw
   let writeTokenRequired = false;
   // What a missing token is answered with, from the server: "pair" (this request cannot use the owner key: pair the device by a
   // short code) or "owner" (a loopback page: the owner's own token is typed, as before). "" until a 403 body or the manifest says.
@@ -934,7 +991,7 @@
     window.dispatchEvent(new Event("levain:threads-off"));   // the zone's sync listens on this one event
   }
 
-  async function loadManifestView(passive) {
+  async function loadManifestView(passive, onPartial) {
     const usedToken = storedToken();      // the credential this read goes out with: a decline drops that one, never a newer one
     let manifest;
     try { manifest = await authedReadJson("/cockpit/manifest.json"); }   // settles the token: panels do not re-prompt
@@ -962,16 +1019,24 @@
     // One shared re-auth for the batch: if the token rotated after the manifest read, every panel 403s
     // together, so the first one prompts (or drops the dead token) and the rest wait on that same answer.
     let reauth = null;
-    const fetchPanel = (url) => fetchPanelConditional(url, panelHeads[url]);
+    const fetchPanel = (url, signal) => fetchPanelConditional(url, panelHeads[url], signal);
     pruneHeldPanels(ids);
     // At most PANEL_READ_CONCURRENCY panel reads are in flight, the rest queue in manifest order: one page
     // bursting ~28 reads at once, or two open pages, would otherwise meet the server's concurrency cap.
     // Every read settles (the worker catches its own failure) and so frees its slot.
-    const queue = ids.slice();
+    const plan = drawOrder(manifest, ids);
+    const queue = plan.order.slice();
+    // a cold first board draws as its panels land (onPartial); a refresh keeps showing the last board until the new one is whole
+    const pacer = onPartial ? partialPacer(plan.core, ids.length, (n) => {
+      const have = new Set(Object.keys(panels));
+      onPartial(window.LevainCockpitView.fromManifest({ manifest: manifestSubset(manifest, have), panels: Object.assign(Object.create(null), panels) }, { elapsedMs: Date.now() - fetchedAt }), n, ids.length);
+    }, { now: Date.now, setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (t) => clearTimeout(t) }) : null;
     const readOne = async (id) => {
       const url = panelUrl(id);
+      const ctl = typeof AbortController === "function" ? new AbortController() : null;
+      const timer = ctl ? setTimeout(() => ctl.abort(), PANEL_TIMEOUT_MS) : 0;
       try {
-        let res = await fetchPanel(url);
+        let res = await fetchPanel(url, ctl ? ctl.signal : undefined);
         if (res.status === 403 && await isTokenReject(res.clone())) {
           // a passive refresh never steals focus with a prompt over an open editor (as the legacy path does)
           reauth = reauth || Promise.resolve().then(() => {
@@ -984,7 +1049,7 @@
           });
           if (await reauth) {
             const usedToken = storedToken();
-            res = await fetchPanel(url);
+            res = await fetchPanel(url, ctl ? ctl.signal : undefined);
             // the replacement token was rejected too: drop it so the next refresh asks again
             if (res.status === 403 && await isTokenReject(res.clone()) && storedToken() === usedToken) dropToken();   // not a newer token another tab stored
           }
@@ -993,11 +1058,13 @@
         panels[id] = await res.json();
       } catch (e) {
         // keep the reason: the mapper draws this panel as unavailable with it, never as an empty one
-        panels[id] = { error: e && e.message ? e.message : String(e) };
-      }
+        panels[id] = { error: ctl && ctl.signal.aborted ? "no answer in " + PANEL_TIMEOUT_MS / 1000 + " s" : (e && e.message ? e.message : String(e)) };
+      } finally { if (timer) clearTimeout(timer); }
+      if (pacer) pacer.settled(id);
     };
     const worker = async () => { while (queue.length) await readOne(queue.shift()); };
-    await Promise.all(Array.from({ length: Math.min(PANEL_READ_CONCURRENCY, ids.length) }, worker));
+    try { await Promise.all(Array.from({ length: Math.min(PANEL_READ_CONCURRENCY, ids.length) }, worker)); }
+    finally { if (pacer) pacer.stop(); }
     // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
     // resyncs over these ids, and the poll fallback compares the etags
     heldNext = Object.fromEntries(ids.map((id) => [id, { etag: (manifest.panels[id] || {}).etag || null }]));
@@ -1031,16 +1098,27 @@
     if (btn) btn.disabled = true;
     try {
       if (useManifest) {
-        const mview = await loadManifestView(passive);
+        // the first board draws as its panels land: the cold "connecting..." line goes with the first useful content
+        const drawView = (mview) => {
+          writeTokenRequired = mview.write_token_required === true;
+          const liveBefore = live;
+          live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };   // published before the draw: an open detail rebuilds inside render and must read THIS read's actions
+          try {
+            window.LevainDashboard.render(mview, mview.writable
+              ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
+          } catch (e) { live = liveBefore; throw e; }
+        };
+        const onPartial = everDrawn ? null : (pview, n, total) => {
+          if (myGen !== loadGen || editInProgress()) return;
+          try { drawView(pview); } catch (e) { return; }    // a partial board that cannot draw leaves the line as it was; the whole board's draw reports its own failure
+          if (storeEl) storeEl.removeAttribute("data-cold");
+          drawnOnce();
+          status("reading " + n + " of " + total + " panels...");
+        };
+        const mview = await loadManifestView(passive, onPartial);
         if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
         if (passive && editInProgress()) { notice = null; return refuseForEdit(); }
-        writeTokenRequired = mview.write_token_required === true;
-        const liveBefore = live;
-        live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };   // published before the draw: an open detail rebuilds inside render and must read THIS read's actions
-        try {
-          window.LevainDashboard.render(mview, mview.writable
-            ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
-        } catch (e) { live = liveBefore; throw e; }
+        drawView(mview);
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;
           document.dispatchEvent(new CustomEvent("levain:cockpit-held"));   // the change stream starts, or restarts, on this
