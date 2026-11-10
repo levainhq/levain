@@ -64,6 +64,7 @@ LIST_FACETS = INTENTION_FACETS | frozenset({
 })
 SURFACES = ("band", "board", "intention", "talk", "drop", "kept")
 KEPT_PREFIX = "kept:"             # a kept row's id (an episode id behind it): never an ``intention:`` id, so no intention verb applies
+KEPT_TITLE_CHARS = 120            # a kept row's title is its first line's head; the whole text is the body
 KEPT_SURFACE = "kept"             # the List's memory part: shown only to a search (the panel's ``hidden_unless_q``)
 GERMINATED_REF = "germinated into"   # a resolution ref germinate writes when an agenda woke into a band row
 DONE_PREFIX = "done:"             # a Done row's id: never a ``intention:`` id, so no intention verb applies to it
@@ -74,6 +75,7 @@ class _Part:
     rows: list[RowIn] = field(default_factory=list)
     later: list[RowIn] = field(default_factory=list)
     skipped: list[tuple[int, str]] = field(default_factory=list)
+    note: str = ""
     fault: str | None = None
     entity: Any = None
 
@@ -376,14 +378,18 @@ def _kept_part(source: SubstrateSource, ctx: ReadContext) -> _Part:
     if bad:
         out.skipped.append((1, f"kept memory could not be read ({bad.message})"))
         return out
+    if len(view.episodes) >= _prov.EPISODE_LIMIT:
+        # a search of memory reaches the newest episodes only, as the Episodes panel says (shown to a search, never a plain read)
+        out.note = f"a search of memory reaches the entity's newest {_prov.EPISODE_LIMIT} episodes."
     for e in view.episodes[:_prov.EPISODE_LIMIT]:
         rid = KEPT_PREFIX + e.id
         text = visible(e.content) or "(no text)"
+        title = text if len(text) <= KEPT_TITLE_CHARS else text[:KEPT_TITLE_CHARS - 1].rstrip() + "\u2026"
         line = (f"kept as memory: episode {e.id}" if e.source == KEEP_EPISODE_SOURCE
                 else f"memory: {e.type} episode {e.id}")
         facets: dict[str, Any] = {"surface": KEPT_SURFACE, "kept_line": line, "kept_at": _prov._utc_at(e.timestamp),
                                   "kept_type": visible(str(e.type)), "kept_source": visible(str(e.source))}
-        out.rows.append(RowIn(id=rid, title=text, body=text, facets=facets,
+        out.rows.append(RowIn(id=rid, title=title, body=text, facets=facets,
                               stored=_stored(rid, text, "kept", "", None, "")))
     return out
 
@@ -398,13 +404,15 @@ def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext],
         dn = _done_part(source, ctx) if not sp.fault else _Part()
         kp = _kept_part(source, ctx)
         rows = [*bd.rows, *sp.rows]
-        skipped = [*sp.skipped, *bd.skipped, *dn.skipped, *kp.skipped]
+        skipped = [*sp.skipped, *bd.skipped, *dn.skipped]
         if sp.fault:
             if not rows and not sp.later:
                 return Fault(sp.fault)           # nothing else to show: a fault, never an empty look
             skipped.append((1, sp.fault))
+        # the kept part's faults and window wording are the SEARCH's to report (``hidden_*``): a read with no query hides the part
         return Read(rows=tuple([*rows, *sp.later, *dn.rows, *kp.rows]), skipped=tuple(skipped), note=LIST_NOTE,
-                    empty=intention_empty("tray", sp.entity))
+                    empty=intention_empty("tray", sp.entity), hidden_skipped=tuple(kp.skipped),
+                    hidden_note=kp.note)
     return read
 
 

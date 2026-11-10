@@ -48,6 +48,10 @@ class Read:
     # the STORED record a line or prose value's ``value_version`` hashes, when what is displayed is a
     # projection of it (a hidden expired state line still has a stored value a write must bind to)
     version_of: Any = None
+    # ``skipped`` pairs for a part a read with no search never shows (``ProviderSpec.hidden_unless_q``): carried on the
+    # snapshot and reported only on a request that carries a ``q``, so a query-less read never reports what it hides
+    hidden_skipped: tuple[tuple[int, str], ...] = ()
+    hidden_note: str = ""        # a sentence for the note line of a search that reaches the hidden part
 
 
 @dataclass(frozen=True)
