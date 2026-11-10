@@ -82,6 +82,17 @@ def rewrite_text(text: str, base: Path) -> str:
     return _old_path_re(base).sub(sub, text)
 
 
+def rewrite_path(path: str, base: Path) -> str:
+    """A structured path (the stored directory, a door-record entry) with the old desk home rewritten to the new one: only
+    when it IS the old home or lies under ``old + os.sep``, never by the command-text matcher (which takes ``:`` as a
+    boundary, so ``<old>:archive/x`` is a different directory and is left alone)."""
+    for b in _bases(base):
+        old = f"{b}/{LEGACY_HOME_NAME}"
+        if path == old or path.startswith(old + os.sep):
+            return f"{b}/{DESK_HOME_NAME}" + path[len(old):]
+    return path
+
+
 def rewrite_settings(data: Any, base: Path) -> tuple[Any, list[tuple[str, str]]]:
     """``data`` with every string under a ``command`` key rewritten from the old home path to the new one; returns it and
     the (before, after) pairs changed. A path that only starts with the old name (the shadow directory) is not matched."""
@@ -142,7 +153,7 @@ def _read_stored_setting(db: Path) -> tuple[str, str | None, str | None, bool] |
     """The desk's latest stored setting ``(agent, model, cwd, user_scope)`` read-only, or None (no store, no row, unreadable)."""
     import sqlite3
 
-    if not db.is_file():
+    if not os.path.isfile(db):               # never create one: a store dir without a db stays without
         return None
     try:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
@@ -218,8 +229,10 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
     cwd_moves: list[tuple[Path, str, str]] = []
     for d in _store_dirs(base, store_dir):
         stored = _read_stored_setting(d / _db_name())
+        # agent none has no directory; a codex row is left as it is: lease.set_agent refuses to write one (the Codex desk
+        # was removed), so its directory cannot be re-appended, and the row launches nothing
         if stored is not None and stored[0] not in ("none", "codex") and stored[2]:
-            fixed = rewrite_text(stored[2], base)
+            fixed = rewrite_path(stored[2], base)
             if fixed != stored[2]:
                 cwd_moves.append((d, stored[2], fixed))
 
@@ -231,8 +244,14 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
     try:
         recorded = door.recorded()
     except door.RecordUnreadable as exc:
-        return refuse(door.unreadable(exc))
-    record_adds = sorted({rewrite_text(n, base) for n in recorded} - set(recorded))
+        # a desk never doored has no record file at all: skip the adds with a warning. An unreadable record that EXISTS
+        # fails closed, as the door does
+        if any(os.path.lexists(p) for p in door._record_paths()):
+            return refuse(door.unreadable(exc))
+        print(f"levain desk move-home: warning: the workspace record cannot be read ({str(exc)[:120]}) and no record "
+              "file exists; the record adds are skipped", file=err)
+        recorded = frozenset()
+    record_adds = sorted({rewrite_path(n, base) for n in recorded} - set(recorded))
 
     if neither:
         if changed:
@@ -240,10 +259,12 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
                           "set the desk up again, or edit the hook by hand")
         say(f"no desk home to move: neither {old} nor {new} exists")
         return 0
-    # an interrupted move converges: with desk/ in place and the old path absent (or a link to nothing), the link is
-    # made whether or not anything else still needs changing
+    # an interrupted move converges: with desk/ in place, the link is made when the old path is a link to nothing (repair)
+    # or something else still needs changing; an absent old path with nothing pending is a clean post-rename install
+    # (or an interrupted move that lost nothing), and gets no link
     broken_link = os.readlink(old) if old_is_link and not old.exists() else None
-    do_link = new_exists and not old.exists()
+    pending = bool(files or cwd_moves or record_adds)
+    do_link = new_exists and not old.exists() and (broken_link is not None or pending)
     if not do_rename and not do_link and not files and not cwd_moves and not record_adds:
         say(f"nothing to do: the desk home is {desk_home(base)}, and no hook command in {spath} or the desk home's own "
             f"settings names the old path")

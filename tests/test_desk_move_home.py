@@ -411,8 +411,7 @@ def test_a_concurrent_model_change_is_not_overwritten(tmp_path, monkeypatch):
 def test_a_moved_home_with_nothing_else_left_still_gets_its_link(tmp_path):
     home, settings = _setup(tmp_path)
     (home / LEGACY_HOME_NAME).rename(home / DESK_HOME_NAME)
-    settings.write_text("{}")                                          # the rewrite had already landed
-    rc, out, err = _run(home, settings)
+    rc, out, err = _run(home, settings)                                # the hook rewrite is still pending
     assert rc == 0, err
     old = home / LEGACY_HOME_NAME
     assert old.is_symlink() and old.resolve() == (home / DESK_HOME_NAME).resolve()
@@ -459,3 +458,102 @@ def test_levain_init_has_no_role_flag_to_normalise():
     with pytest.raises(SystemExit) as exc:
         cli.main(["init", "--role", "desk"])
     assert exc.value.code == 2
+
+
+# --- L3 round 3 -------------------------------------------------------------------------------------------------------
+def _db_files(d: Path) -> list[str]:
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def test_a_clean_post_rename_install_gets_no_link(tmp_path):
+    home, settings = _setup(tmp_path)
+    (home / LEGACY_HOME_NAME).rename(home / DESK_HOME_NAME)
+    settings.write_text("{}")
+    rc, out, err = _run(home, settings)
+    assert rc == 0, err
+    assert out.startswith("nothing to do")
+    assert not (home / LEGACY_HOME_NAME).exists() and not (home / LEGACY_HOME_NAME).is_symlink()
+
+
+def test_an_interrupted_move_with_a_hook_still_pending_gets_its_link(tmp_path):
+    home, settings = _setup(tmp_path)
+    (home / LEGACY_HOME_NAME).rename(home / DESK_HOME_NAME)
+    rc, out, err = _run(home, settings)                                # settings still name the old path
+    assert rc == 0, err
+    assert (home / LEGACY_HOME_NAME).is_symlink()
+
+
+def test_a_structured_path_is_not_migrated_by_the_command_text_matcher(tmp_path):
+    from levain.desk.move_home import rewrite_path
+
+    base = Path("/home/u/.levain")
+    assert rewrite_path("/home/u/.levain/coordinator:archive/project", base) == "/home/u/.levain/coordinator:archive/project"
+    assert rewrite_path("/home/u/.levain/coordinator/project", base) == "/home/u/.levain/desk/project"
+    assert rewrite_path("/home/u/.levain/coordinator", base) == "/home/u/.levain/desk"
+    assert rewrite_path("/home/u/.levain/coordinatorx", base) == "/home/u/.levain/coordinatorx"
+
+
+def test_a_stored_cwd_with_a_colon_sibling_is_left_alone(tmp_path):
+    home, settings = _setup(tmp_path)
+    sib = f"{home}/{LEGACY_HOME_NAME}:archive/project"
+    st = _store_with_cwd(tmp_path, sib)
+    rc, out, err = _run_store(home, settings, tmp_path / "queue")
+    assert rc == 0, err
+    assert st.coord_setting().cwd == sib
+
+
+def _run_store(home, settings, store):
+    out, err = io.StringIO(), io.StringIO()
+    rc = move_home(home=home, settings=settings, store_dir=store, out=out, err=err)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_a_codex_row_is_left_alone_because_set_agent_refuses_to_write_one(tmp_path):
+    # the guard has a real reason: lease.set_agent raises for agent codex (the Codex desk was removed), so a codex row's
+    # stored directory cannot be re-appended; the row launches nothing, so a dead directory in it harms nothing
+    import sqlite3
+    from levain.desk.move_home import _db_name
+
+    home, settings = _setup(tmp_path)
+    st = _store_with_cwd(tmp_path, f"{home}/{LEGACY_HOME_NAME}")
+    conn = sqlite3.connect(tmp_path / "queue" / _db_name())
+    conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) "
+                 "SELECT gseq + 1, 'codex', model, cwd, 0, by, at FROM coord_settings ORDER BY seq DESC LIMIT 1")
+    conn.commit()
+    conn.close()
+    rc, out, err = _run_store(home, settings, tmp_path / "queue")
+    assert rc == 0, err
+    assert st.coord_setting().cwd == f"{home}/{LEGACY_HOME_NAME}"
+
+
+def test_a_store_dir_without_a_db_stays_without_one(tmp_path):
+    home, settings = _setup(tmp_path)
+    for name in ("board", "consent"):
+        (home / name).mkdir()
+    before = {n: _db_files(home / n) for n in ("board", "consent")}
+    rc, out, err = _run(home, settings)
+    assert rc == 0, err
+    assert {n: _db_files(home / n) for n in ("board", "consent")} == before
+
+
+def test_an_unreadable_record_with_no_record_file_only_warns(tmp_path, monkeypatch):
+    from levain.desk import door
+
+    home, settings = _setup(tmp_path)
+    monkeypatch.setattr(door, "recorded", lambda: (_ for _ in ()).throw(door.RecordUnreadable("x", None, tmp_path)))
+    monkeypatch.setattr(door, "_record_paths", lambda: [tmp_path / "nowhere" / "ws.json"])
+    rc, out, err = _run(home, settings)
+    assert rc == 0, err
+    assert "workspace record" in err and (home / DESK_HOME_NAME).is_dir()
+
+
+def test_an_unreadable_existing_record_still_refuses(tmp_path, monkeypatch):
+    from levain.desk import door
+
+    home, settings = _setup(tmp_path)
+    rec = tmp_path / "ws.json"
+    rec.write_text("not json")
+    monkeypatch.setattr(door, "recorded", lambda: (_ for _ in ()).throw(door.RecordUnreadable("x", rec)))
+    monkeypatch.setattr(door, "_record_paths", lambda: [rec])
+    rc, out, err = _run(home, settings)
+    assert rc == 1 and (home / LEGACY_HOME_NAME).is_dir()
