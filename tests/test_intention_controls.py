@@ -11,7 +11,7 @@ import pytest
 
 from levain.cockpit.consent import ConsentError
 from levain.cockpit.verbs import dispatch
-from levain.consent.questions import Answer, Question
+from levain.consent.questions import Answer, IntentionStale, Question
 from levain.writes import EditError
 from tests.test_cockpit_list_panel import CRED, INSTALL_CLASS, Rig
 
@@ -31,6 +31,7 @@ class HostStore:
         self.rows = [_q(11, "np-ring0001", intention="spore-9"), _q(12, "np-plain002")]
         self.acts: list[tuple[str, str, dict[str, Any]]] = []
         self.refuse: str | None = None
+        self.refuse_stale = False
 
     def open_questions(self, agent=None):
         return [q for q in self.rows if q.answer is None]
@@ -47,13 +48,16 @@ class HostStore:
 
     def intention_act(self, ref, action, *, until=None, text=None, channel):
         if self.refuse:
-            raise ConsentError(self.refuse)
+            raise (IntentionStale if self.refuse_stale else ConsentError)(self.refuse)
         self.acts.append((ref, action, {"until": until, "text": text, "channel": channel}))
+        hit = lambda q: ref in (q.id, q.intention) and q.answer is None   # noqa: E731 - the spore id or the row id, as flow's
+        if not any(hit(q) for q in self.rows):
+            raise ConsentError(f"{ref} rings no open row")
         if action == "edit":
-            self.rows = [replace(q, what=text) if q.id == ref else q for q in self.rows]
+            self.rows = [replace(q, what=text) if hit(q) else q for q in self.rows]
         else:       # snooze, done and clear all close the row
             self.rows = [replace(q, answer=Answer(q.id, "text", action, channel, "2026-11-08T11:00:00Z"))
-                         if q.id == ref else q for q in self.rows]
+                         if hit(q) else q for q in self.rows]
         return f"{action} done"
 
 
@@ -136,8 +140,8 @@ def test_each_verb_calls_intention_act_once_with_the_right_action(tmp_path: Path
     rig.ck.attach_question_rows(host)
     row = _decision(rig, 11) if panel == "decisions" else rig.rows()["band:np-ring0001"]
     out = _fire(rig, panel, row, verb, params)
-    assert out["intention"] == want[0] and out["ref"] == "np-ring0001"
-    assert host.acts == [("np-ring0001", want[0], {**want[1], "channel": "cockpit"})]
+    assert out["intention"] == want[0] and out["ref"] == "spore-9"          # the reminder the row showed
+    assert host.acts == [("spore-9", want[0], {**want[1], "channel": "cockpit"})]
 
 
 @pytest.mark.parametrize("panel", ["decisions", "tray"])
@@ -162,11 +166,11 @@ def test_done_takes_no_confirm(host_rig) -> None:
 def test_the_hosts_refusal_comes_back_in_its_own_words(host_rig) -> None:
     rig, host = host_rig
     row = rig.rows()["band:np-ring0001"]
-    host.refuse = "spore-9 is already finished"
+    host.refuse, host.refuse_stale = "spore-9 is already finished", True
     with pytest.raises(EditError) as exc:
         _fire(rig, "tray", row, "intention_done", {})
     assert exc.value.http_status == 409 and "already finished" in str(exc.value)
-    host.refuse = "the date has passed"
+    host.refuse, host.refuse_stale = "the date has passed", False
     with pytest.raises(EditError) as exc2:
         _fire(rig, "tray", row, "intention_snooze", {"until": "2026-11-20"})
     assert exc2.value.http_status == 400 and "date has passed" in str(exc2.value)
@@ -229,3 +233,44 @@ def test_a_refusal_of_any_exception_class_comes_back_as_its_words_never_a_500(ho
     with pytest.raises(EditError) as exc:
         _fire(rig, "tray", rig.rows()["band:np-ring0001"], "intention_snooze", {"until": "2026-11-20"})
     assert exc.value.http_status == 400 and "not a snooze" in str(exc.value)
+
+
+# --- fix round 1 ---------------------------------------------------------------------------------------------------------
+
+
+def test_a_validation_refusal_is_a_400_whatever_its_words(host_rig) -> None:
+    """K3: the class decides stale, never the English: "already" in a date refusal must not wipe the operator's form."""
+    rig, host = host_rig
+    host.refuse = "that snooze date is already past"
+    with pytest.raises(EditError) as exc:
+        _fire(rig, "tray", rig.rows()["band:np-ring0001"], "intention_snooze", {"until": "2026-11-20"})
+    assert exc.value.http_status == 400
+
+
+def test_a_host_exception_marked_stale_is_a_409(host_rig, monkeypatch) -> None:
+    rig, host = host_rig
+
+    class IntentionError(Exception):
+        stale = True
+
+    def act(ref, action, *, until=None, text=None, channel):
+        raise IntentionError("spore-9 closed while it was being closed")
+
+    monkeypatch.setattr(host, "intention_act", act)
+    with pytest.raises(EditError) as exc:
+        _fire(rig, "tray", rig.rows()["band:np-ring0001"], "intention_done", {})
+    assert exc.value.http_status == 409 and "closed while" in str(exc.value)
+
+
+def test_the_act_names_the_reminder_the_page_showed(host_rig) -> None:
+    """C1: the host is handed the spore id the row displayed, never a row id it would re-resolve."""
+    rig, host = host_rig
+    _fire(rig, "decisions", _decision(rig, 11), "intention_done", {})
+    assert [a[0] for a in host.acts] == ["spore-9"]
+
+
+def test_a_malformed_snooze_reads_in_plain_words(host_rig) -> None:
+    rig, host = host_rig
+    with pytest.raises(EditError) as exc:
+        _fire(rig, "tray", rig.rows()["band:np-ring0001"], "intention_snooze", {"until": "2026-11-20T25:99"})
+    assert "pick a day" in str(exc.value) and "YYYY" not in str(exc.value) and not host.acts

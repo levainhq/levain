@@ -187,6 +187,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # of an answer box. Present only when the host can act on it
     "intention": ("spore id", lambda v: _is_intention_id(v)),
     "question_intention": ("spore id", lambda v: _is_intention_id(v)),
+    "intention_text": ("str", _is_str),          # that reminder's own words (a List row only: the List carries words)
     "board_rank": ("int|null", _opt(_is_int)),
     "board_tier": ("str|null", _opt(_is_str)),
 }

@@ -2748,6 +2748,11 @@ class _Handler(GuardedHandler):
                     full = getattr(q, "blocks_full", "")
                     if isinstance(full, str) and full:
                         payload["blocks_full"] = full      # the lines of `blocks`, for the card; absent when the store has none
+                    from levain.consent.questions import intention_text_of
+
+                    words = intention_text_of(store, q)
+                    if words is not None:     # the reminder this row rings, in its own words: the card's title and Edit field
+                        payload["intention_text"] = words
             except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                 raise
             except Exception as exc:  # noqa: BLE001 - a store that cannot be read is an answer, never a dead connection

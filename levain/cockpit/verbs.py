@@ -825,14 +825,14 @@ def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str
     return {"answered": n, "delivery": "started"}
 
 
-_REFUSED_AS_STALE = ("already", "gone", "not open", "closed", "resolved", "no longer", "moved")
-
-
 def _intention_fire(action: str) -> Callable[..., dict[str, Any]]:
     """Act on the intention a band row rings (snooze, edit, done, clear) through the host's one ``intention_act``: the host
     owns the spore, the row and its log, so this writes nothing itself and the host's own lock order holds. Channel
-    ``cockpit``. C1: it authorises nothing. The host's refusal comes back in its own words, 409 when the row has moved."""
-    from levain.consent.questions import QuestionStoreError
+    ``cockpit``. C1: it authorises nothing. The host is handed the spore id the row DISPLAYED (its version carries it, so a
+    row re-rung since is already stale here), never a row id it would resolve again. The host's refusal comes back in its
+    own words: stale when it says the row moved (an ``IntentionStale``, or any exception with a truthy ``stale``), else a bad
+    request. Known edge: the band shorthand answer on such a row closes a native reminder at the next germinate run, not at once."""
+    from levain.consent.questions import QuestionStoreError, until_refusal, valid_intention_id
 
     def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
         store = target.get("questions")
@@ -844,34 +844,27 @@ def _intention_fire(action: str) -> Callable[..., dict[str, Any]]:
             raise EditError("bad_request", 400, f"{action} takes exactly {sorted(allowed) or 'no parameters'}")
         kwargs: dict[str, Any] = {}
         if action == "snooze":
-            until = params["until"]
-            if not isinstance(until, str) or not until:
-                raise EditError("bad_request", 400, "snooze needs a date (YYYY-MM-DD or YYYY-MM-DDTHH:MM)")
-            from levain.writes import _validate_surface_at
-
-            kwargs["until"] = _validate_surface_at(until)
+            refused = until_refusal(params["until"])        # the host judges "after today" by its own clock
+            if refused:
+                raise EditError("bad_request", 400, refused)
+            kwargs["until"] = params["until"]
         elif action == "edit":
             text = params["text"]
             if not isinstance(text, str) or not text.strip():
                 raise EditError("bad_request", 400, "the text cannot be empty")
             kwargs["text"] = text
         row = target["row"]
-        rid = str(row.get("id", ""))
+        ref = _facet(row, "question_intention") if str(row.get("id", "")).startswith("question:") else _facet(row, "intention")
+        if not valid_intention_id(ref):
+            raise EditError("stale", 409, "this row rings no reminder now: reload")
         try:
-            if rid.startswith("band:"):
-                ref = rid[len("band:"):]
-            else:
-                q = store.get(_facet(row, "question_n"))
-                if q is None or q.answer is not None:     # the version check ran on the row; this is the race behind it
-                    raise EditError("stale", 409, f"question #{_facet(row, 'question_n')} was answered or is gone")
-                ref = q.id
             words = act(ref, action, channel="cockpit", **kwargs)
         except EditError:
             raise
         except (QuestionStoreError, OSError, sqlite3.Error) as exc:
             raise EditError("source_unavailable", 503, f"the band cannot act now: {exc}") from None
         except Exception as exc:  # noqa: BLE001 - the host's refusal, whatever its class (a ConsentError is the contract): its words
-            stale = any(w in str(exc) for w in _REFUSED_AS_STALE)
+            stale = bool(getattr(exc, "stale", False))
             raise EditError("stale" if stale else "bad_request", 409 if stale else 400, str(exc)[:300]) from None
         return {"intention": action, "ref": ref, "said": words if isinstance(words, str) else ""}
     return fire

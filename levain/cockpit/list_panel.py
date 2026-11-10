@@ -56,7 +56,7 @@ BAND_POINTER = "answer it in Decisions (levain band)"
 BOARD_POINTER = "the agents' ready queue (levain board)"
 LIST_FACETS = SPORE_FACETS | frozenset({
     "surface", "fires", "overdue", "target", "attention", "list_pointer", "band_number", "board_rank", "board_tier",
-    "source", "repo", "held_until", "intention", "band_section", "band_carried", "band_age", "band_later_words",
+    "source", "repo", "held_until", "intention", "intention_text", "band_section", "band_carried", "band_age", "band_later_words",
 })
 SURFACES = ("band", "board", "spore", "talk", "drop")
 
@@ -191,7 +191,10 @@ def _age_text(instant: Any, now: datetime) -> str | None:
 def _band_row(card: dict[str, Any], today: date, now: datetime) -> RowIn:
     """One needs-you card as a read-only band row."""
     ref = str(card.get("id", ""))
-    title = visible(str(card.get("title") or "")) or "(no text)"
+    ring = card.get("intention") if isinstance(card.get("intention"), str) else None
+    words = card.get("intention_text") if ring is not None else None
+    # a row that rings a reminder draws the reminder's own words (what Edit changes), not the words it was filed with
+    title = visible(words if isinstance(words, str) and words else str(card.get("title") or "")) or "(no text)"
     facets: dict[str, Any] = {"surface": "band", "list_pointer": BAND_POINTER,
                               "band_number": card.get("number") if isinstance(card.get("number"), int)
                               and not isinstance(card.get("number"), bool) else None}
@@ -209,19 +212,24 @@ def _band_row(card: dict[str, Any], today: date, now: datetime) -> RowIn:
     later = card.get("later")
     if isinstance(later, str) and parse_date(later):
         facets["held_until"] = later[:10]
-    if isinstance(card.get("intention"), str):
-        facets["intention"] = card["intention"]
+    if ring is not None:
+        facets["intention"] = ring
+        if isinstance(words, str) and words:
+            facets["intention_text"] = words        # the Edit field's start: the reminder's own words, exact
     if card.get("section") in ("you", "desk"):
         facets["band_section"] = card["section"]
     if isinstance(card.get("carried"), bool):
         facets["band_carried"] = card["carried"]
-    words = card.get("later_words")
-    if "held_until" in facets and isinstance(words, str) and words:
-        facets["band_later_words"] = words
+    later_words = card.get("later_words")
+    if "held_until" in facets and isinstance(later_words, str) and later_words:
+        facets["band_later_words"] = later_words
     blocks = card.get("blocks")
+    stored = _stored(ref, title, "band", facets.get("source", ""), facets.get("held_until"), BAND_POINTER)
+    if ring is not None:     # the reminder it rings is part of its version: a row re-rung since the page read it is stale
+        stored["germinated"] = {"intention": ring}
     return RowIn(
         id=ref, title=title, body=visible(blocks) if isinstance(blocks, str) and blocks else None, facets=facets,
-        stored=_stored(ref, title, "band", facets.get("source", ""), facets.get("held_until"), BAND_POINTER))
+        stored=stored)
 
 
 def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime) -> _Part:

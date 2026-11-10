@@ -141,7 +141,7 @@ KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "
                                     "question_n", "question_state", "question_options", "question_section", "question_carried", "question_later", "question_later_words", "question_intention", "note_n", "note_state",
                                     "note_open_total", "sign", "egress_state"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
-# the four verbs an intention-backed row is offered in place of QUESTION_VERB (verbs.py registers them)
+# the four verbs an intention-backed row is offered in place of QUESTION_VERB
 INTENTION_VERBS = ("intention_snooze", "intention_edit", "intention_done", "intention_clear")
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
 NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (verbs.py registers it)
@@ -552,7 +552,9 @@ def _question_row_in(q: Any, later: tuple[str, str] | None = None, intention: st
         facets["question_later"], facets["question_later_words"] = later
     _sign_facet(facets, q)
     return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
-                 stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open"})
+                 # the reminder it rings is part of its version: a row re-rung since the page read it is stale there
+                 stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open",
+                         **({"intention": facets["question_intention"]} if "question_intention" in facets else {})})
 
 
 def _sign_facet(facets: dict[str, Any], item: Any) -> None:

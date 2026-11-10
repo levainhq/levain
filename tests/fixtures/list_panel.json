@@ -44,6 +44,7 @@
   "held",
   "held_until",
   "intention",
+  "intention_text",
   "last_seen",
   "list_pointer",
   "overdue",
