@@ -48,6 +48,10 @@
   "intention",
   "intention_text",
   "intention_type",
+  "kept_at",
+  "kept_line",
+  "kept_source",
+  "kept_type",
   "last_seen",
   "list_pointer",
   "overdue",
@@ -116,6 +120,12 @@
    "count": 0,
    "id": "done",
    "title": "Done, last 7 days",
+   "uncounted": true
+  },
+  {
+   "count": 0,
+   "id": "kept",
+   "title": "Kept in memory",
    "uncounted": true
   }
  ],
@@ -282,6 +292,17 @@
      },
      "tier": "T2",
      "verb": "intention_promote"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "intention:intention-006",
+      "row_version": "4a79d475f7d8b840"
+     },
+     "tier": "C1",
+     "verb": "intention_keep"
     }
    ],
    "badges": [
@@ -439,6 +460,17 @@
      },
      "tier": "T2",
      "verb": "intention_promote"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "intention:intention-007",
+      "row_version": "284eb3ea11656c80"
+     },
+     "tier": "C1",
+     "verb": "intention_keep"
     }
    ],
    "badges": [
@@ -597,6 +629,17 @@
      },
      "tier": "T2",
      "verb": "intention_promote"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "intention:intention-004",
+      "row_version": "fa8372a07bb02c41"
+     },
+     "tier": "C1",
+     "verb": "intention_keep"
     }
    ],
    "badges": [
@@ -751,6 +794,17 @@
      },
      "tier": "T2",
      "verb": "intention_promote"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "intention:intention-005",
+      "row_version": "bdda42444c43a7a9"
+     },
+     "tier": "C1",
+     "verb": "intention_keep"
     }
    ],
    "badges": [
@@ -949,6 +1003,17 @@
      },
      "tier": "T2",
      "verb": "intention_promote"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "intention:intention-002",
+      "row_version": "9d62e4872f971cea"
+     },
+     "tier": "C1",
+     "verb": "intention_keep"
     }
    ],
    "badges": [
@@ -1098,6 +1163,17 @@
      },
      "tier": "T2",
      "verb": "intention_promote"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "intention:intention-003",
+      "row_version": "93f01ce191a0e4ac"
+     },
+     "tier": "C1",
+     "verb": "intention_keep"
     }
    ],
    "badges": [
@@ -1247,6 +1323,17 @@
      },
      "tier": "T2",
      "verb": "intention_promote"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "intention:intention-001",
+      "row_version": "b7fdfa7dc0865970"
+     },
+     "tier": "C1",
+     "verb": "intention_keep"
     }
    ],
    "badges": [

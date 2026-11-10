@@ -776,7 +776,7 @@ def _tomb_gate(store: Any, origin_key: str, effect_id: Any, episode_id: str) -> 
 # what a broker fire reads as in Recent edits: a past-tense phrase per verb, then the thing it touched, then where it came from
 _EDIT_PHRASES = {
     "intention_touch": "marked seen", "intention_close": "resolved", "intention_surface_at": "rescheduled", "intention_retarget": "retargeted", "intention_update": "edited",
-    "list_intake": "added a line", "intention_set_disposition": "moved", "intention_promote": "promoted", "intention_seed": "added", "episode_tombstone": "deleted episode",
+    "list_intake": "added a line", "intention_set_disposition": "moved", "intention_promote": "promoted", "intention_keep": "kept as memory", "intention_seed": "added", "episode_tombstone": "deleted episode",
     "operator_state": "set the state line", "section_edit": "edited", "config": "edited", "entity_name": "renamed the entity",
     "undo": "undid an edit", "pending_cancel": "cancelled a pending change", "token_rotate": "rotated the surface token"}
 
