@@ -335,6 +335,10 @@ LAZY_SITES = {
     'levain/dispatch/adopt.py::_human_refusal::from levain.consent.queue import AuthoritySource': 'operator',
     # operator: ``land`` is the operator's (``levain dispatch land``)
     'levain/dispatch/adopt.py::_human_refusal::from levain.dispatch.jobs import _replay': 'operator',
+    # operator: ``agent_config_paths`` <- ``dispatch/cli.py`` (the authorise view) and ``dispatch/phone.py`` (the card); the follower never calls it
+    'levain/dispatch/adopt.py::agent_config_paths::from levain.slot.render import REPO_DISCOVERY': 'operator',
+    # operator: same callers as the row above
+    'levain/dispatch/adopt.py::agent_config_paths::from levain.slot.render import fold_name as _fold': 'operator',
     # operator: ``authorise_refusal`` <- ``land`` (``dispatch/cli.py``) and ``JobStore.authorise``, neither run by the follower
     'levain/dispatch/adopt.py::authorise_refusal::from levain.consent.passkey import answer_signature_problem': 'operator',
     # operator: ``floor`` <- ``land`` <- ``dispatch/cli.py`` (``levain dispatch land``)
@@ -365,18 +369,23 @@ LAZY_SITES = {
     'levain/cockpit/engine.py::Cockpit._note_decision_one::from levain.consent.notes import NoteStoreError': 'operator',
     # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``, not in the closure
     'levain/cockpit/engine.py::Cockpit._question_decision_one::from levain.consent.questions import QuestionStoreError': 'operator',
+    'levain/cockpit/engine.py::Cockpit._question_decision_one::from levain.consent.questions import intention_of': 'operator',
     # operator: <- ``Cockpit._compose_decisions`` / ``Cockpit._consent_decision_one`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
     'levain/cockpit/engine.py::_consent_rows_in::from levain.consent.listing import egress_state_of': 'operator',
     'levain/cockpit/engine.py::_egress_lookup_of::from levain.consent.listing import egress_reading': 'operator',
+    'levain/cockpit/engine.py::_board_visible::from levain.cockpit import board': 'operator',
     # operator: <- ``Cockpit._compose_decisions`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
     'levain/cockpit/engine.py::_note_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
     # operator: the same function as the row below (``Cockpit._compose_decisions`` only)
     'levain/cockpit/engine.py::_question_rows_in::from levain.band_view import later_facets': 'operator',
+    'levain/cockpit/engine.py::_question_rows_in::from levain.consent.questions import intention_of': 'operator',
+    'levain/cockpit/engine.py::_intention_words_digest::from levain.consent.questions import intention_text_of': 'operator',
     'levain/cockpit/engine.py::_question_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
     # operator: <- ``CockpitDB._ensure_schema_txn`` <- ``_ensure_schema``; ``CockpitDB(`` is constructed in ``levain/cli.py`` and ``cockpit/{broker,keys,sign_client}.py`` only (``git grep -n 'CockpitDB(' -- levain``)
     'levain/cockpit/firejournal.py::_take_store_lock::from levain.cockpit.broker import LOCK_NAME': 'operator',
     # operator: a ``FACETS`` validator, run by ``validate_facets``, whose one caller is ``levain/cockpit/engine.py`` (the ``Cockpit``)
     'levain/cockpit/registry.py::_is_sign_facet::from levain.sign_request_id import request_id_ok': 'operator',
+    'levain/cockpit/registry.py::_is_intention_id::from levain.consent.questions import valid_intention_id': 'operator',
     # the queue broker (``levain.slot.services.qbroker``, ROOT_PYTHON as ``_levain_qbroker``): its GATE runs ``consent.limits.count_call`` -> ``_count``
     'levain/consent/limits.py::_count::from levain.cockpit.session_context import spend_step': 'root',
     # operator: the hook's limits path: ``consent.limits.check`` (called by the agent hooks ``consent/adapters/{claude_code,codex}.py`` only) -> ``_hold`` -> ``_resolve`` -> ``_filed_for`` / ``verified_allow``, ``release_if_extended``, and ``consent/limits_cli.py``; the queue broker runs ``count_call`` only

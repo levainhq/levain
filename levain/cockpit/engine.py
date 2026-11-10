@@ -138,9 +138,11 @@ _VERB_ROW_PREFIXES = (QUESTION_ROW_PREFIX, NOTE_ROW_PREFIX)
 KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
                                     "reason", "unapplied", "cancelled_by",
                                     "agent", "tool", "consent_state", "consent_tier", "decided_at",
-                                    "question_n", "question_state", "question_options", "question_section", "question_carried", "question_later", "question_later_words", "note_n", "note_state",
+                                    "question_n", "question_state", "question_options", "question_section", "question_carried", "question_later", "question_later_words", "question_intention", "note_n", "note_state",
                                     "note_open_total", "sign", "egress_state"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
+# the four verbs an intention-backed row is offered in place of QUESTION_VERB
+INTENTION_VERBS = ("intention_snooze", "intention_edit", "intention_done", "intention_clear")
 QUESTION_DONE_HOURS = 24                # an answered question stays listed this long, as a decided request does
 NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (verbs.py registers it)
 BAND_VERB = "band_answer"               # the cockpit verb that answers the NEEDS YOU band by its shorthand (verbs.py)
@@ -355,9 +357,6 @@ class _Snap:
     # applied from these at render, from the request's snapshot
     label_keys: dict[str, LabelKey] | None = None
     value_label_key: LabelKey | None = None
-    # rows the provider marked ``held`` (a Tray spore whose surface date has not come): listed apart so
-    # ``rows``, its counts, groups and orders stay what they were for every reader that does not know them
-    held: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -522,7 +521,17 @@ def _consent_rows_in(got: Any, egress_lookup: Callable[[str, str], tuple[Any, bo
     return rows, bad
 
 
-def _question_row_in(q: Any, later: tuple[str, str] | None = None) -> RowIn:
+def _intention_words_digest(store: Any, q: Any) -> str:
+    """A short digest of the CURRENT words of the intention ``q`` rings: one source for the stored row version and its
+    recompute, so an edit of the words moves the version and a stale Edit is refused."""
+    from levain.consent.questions import intention_text_of
+
+    words = (intention_text_of(store, q) or "").replace("\r\n", "\n").replace("\r", "\n")   # a textarea hands back LF
+    return hashlib.sha256(words.encode("utf-8")).hexdigest()[:12]
+
+
+def _question_row_in(q: Any, later: tuple[str, str] | None = None, intention: str | None = None,
+                     words_digest: str = "") -> RowIn:
     """One question (``levain.consent.questions.Question``) as a row: ``question:<n>``. A row carries who asked,
     when, how many options it offers and whether it is answered, and NOTHING the agent wrote (the question, the
     option labels, what it blocks): this panel is token-free on loopback, so those words are served only to a token
@@ -544,11 +553,16 @@ def _question_row_in(q: Any, later: tuple[str, str] | None = None) -> RowIn:
             facets["question_carried"] = carried
         else:
             del facets["question_section"]
+    if intention is not None and not answered:   # the host rings an open intention here and can act on it: four controls
+        facets["question_intention"] = intention
     if later is not None and not answered:     # snoozed past today (band_view.later_of): the strip draws it as LATER, not due
         facets["question_later"], facets["question_later_words"] = later
     _sign_facet(facets, q)
     return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
-                 stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open"})
+                 # the reminder it rings is part of its version: a row re-rung since the page read it is stale there
+                 stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open",
+                         **({"intention": facets["question_intention"], "words": words_digest}
+                            if "question_intention" in facets else {})})
 
 
 def _sign_facet(facets: dict[str, Any], item: Any) -> None:
@@ -575,7 +589,9 @@ def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     shown = {q.n: q for q in open_[:PENDING_CAP]}
     shown.update((q.n, q) for q in done)
     from levain.band_view import later_facets
-    return [_question_row_in(q, None if q.answer is not None else later_facets(store, q, now))
+    from levain.consent.questions import intention_of
+    return [_question_row_in(q, None if q.answer is not None else later_facets(store, q, now), intention_of(store, q),
+                             _intention_words_digest(store, q))
             for q in shown.values()], max(len(open_) - PENDING_CAP, 0)
 
 
@@ -882,7 +898,7 @@ class Cockpit:
             rowset=src.rowset if src else None, edit_class=src.edit_class if src else "",
             # question_answer applies to a question row only (VerbSpec.applies_to), so a downstream row never gets it
             verbs=tuple(dict.fromkeys((*(src.verbs if src else ()),
-                                       *((QUESTION_VERB, BAND_VERB) if self._dec.questions is not None else ()),
+                                       *((QUESTION_VERB, BAND_VERB, *INTENTION_VERBS) if self._dec.questions is not None else ()),
                                        *((NOTE_VERB,) if self._dec.notes is not None else ())))),
             label_key=src.label_key if src else None)
         old = self._dec.spec
@@ -1560,7 +1576,9 @@ class Cockpit:
             return Fault(f"agent questions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         if q is None or row_id != f"{QUESTION_ROW_PREFIX}{q.n}":
             return Absent(f"decision {row_id!r} is gone")
-        return Read(rows=(_question_row_in(q),))
+        from levain.consent.questions import intention_of
+
+        return Read(rows=(_question_row_in(q, None, intention_of(store, q), _intention_words_digest(store, q)),))
 
     def _note_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
         from levain.consent.notes import NoteStoreError
@@ -1622,10 +1640,6 @@ class Cockpit:
             if refused:
                 skipped.append({"count": refused, "reason": "row refused: a facet value of the wrong type"})
             label_ids = {r["id"] for r in rows}
-            held = sorted((r for r in rows if r["facets"].get("held") is True),
-                          key=lambda r: (r["facets"].get("due") or "", r["id"]))
-            if held:
-                rows = [r for r in rows if r["facets"].get("held") is not True]
             status = "partial" if skipped else ("empty" if not counted_rows(spec.order, rows) else "ok")
             value = None
             # the views' orders are computed here, in the read worker, like every other ordering: an
@@ -1634,7 +1648,6 @@ class Cockpit:
             label_keys = self._label_keys(spec, list(res.rows), label_ids)
             value_key = None
         else:
-            held = []
             view_order = None
             if res.value is None:
                 raise ValueError(f"a {spec.kind} Read carries a value")
@@ -1649,7 +1662,7 @@ class Cockpit:
                      res.note if isinstance(res.note, str) else spec.note, res.stale,
                      res.empty if isinstance(res.empty, str) else None,
                      value["value_version"] if spec.kind in VERSIONED_VALUE_KINDS else None, view_order,
-                     label_keys, value_key, held)
+                     label_keys, value_key)
 
     @staticmethod
     def _label_key(spec: ProviderSpec, stored: dict[str, Any]) -> LabelKey | None:
@@ -1802,8 +1815,6 @@ class Cockpit:
         return _sha({"schema": SCHEMA, "status": snap.status, "rows": snap.rows, "value": snap.value,
                      "filtered": snap.filtered, "skipped": snap.skipped, "error": snap.error,
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
-                     # a panel with no held rows hashes exactly as it did before they existed
-                     **({"held": snap.held} if snap.held else {}),
                      "verbs": self._verb_rev(auth),
                      # a panel's views shape view_rows: a kernel that adds or reorders one is not a 304
                      **({"views": [list(v) for v in views]} if views else {}),
@@ -2254,7 +2265,6 @@ class Cockpit:
         snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
         if snap_rows is not None:
             snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
-        held_rows = self._with_provenance(snap.held, snap.label_keys, auth.labels) if snap.held else []
         if spec.label_key is not None and spec.kind in VERSIONED_VALUE_KINDS and isinstance(value, dict):
             value = {**value, "provenance": auth.labels.provenance(snap.value_label_key)}
         out: dict[str, Any] = dict(head)
@@ -2264,7 +2274,7 @@ class Cockpit:
         if head["kind"] in ROW_ENGINE_KINDS:
             rows_all = snap_rows or []
             if row is not None:
-                hit = [r for r in rows_all + held_rows if r["id"] == row]
+                hit = [r for r in rows_all if r["id"] == row]
                 out["rows"] = self._with_actions(hit, panel_id, credential_class, ctx.today, auth)
                 if not hit:
                     raise RowNotFound(row)
@@ -2275,7 +2285,6 @@ class Cockpit:
                 held = len(rows_all)
                 if spec.search_scope == "store" and spec.search is not None:
                     got, total, err = self._store_search(spec, q, limit)
-                    held_rows = []  # a store search answers from the store alone, held rows included
                     if err is None:
                         try:
                             for x in got:
@@ -2297,7 +2306,6 @@ class Cockpit:
                         rows_all, matched = [], None
                 else:
                     keep = [r for r in rows_all if _terms_match([_field_text(r, f) for f in fields], q)]
-                    held_rows = [r for r in held_rows if _terms_match([_field_text(r, f) for f in fields], q)]
                     matched = len(keep)
                     rows_all = keep
                     out["match_label"] = (f"searches the newest {spec.window} only: {matched} of {held}"
@@ -2312,15 +2320,11 @@ class Cockpit:
                 out["rows"] = rows_all
             if matched is not None:
                 out["matched"] = matched
-            if held_rows and (profile != "compact" or q or head["priority"] == "gate"):
-                out["held"] = [{**r, "body": None} for r in held_rows] if profile == "compact" else held_rows
             if spec is not None and spec.views and out["rows"] is not None and view_order is not None:
                 sent = {r["id"] for r in rows_all}
                 out["view_rows"] = {v: [i for i in ids if i in sent] for v, ids in view_order.items()}
             if out["rows"] is not None:
                 out["rows"] = self._with_actions(out["rows"], panel_id, credential_class, ctx.today, auth)
-            if out.get("held"):
-                out["held"] = self._with_actions(out["held"], panel_id, credential_class, ctx.today, auth)
         else:
             if head["kind"] in VALUE_ROW_KINDS and isinstance(value, dict):
                 if q and spec is not None:
@@ -2402,13 +2406,11 @@ class Cockpit:
         that is empty today can still have store matches), and its validator covers what it returned,
         so a revalidation never 304s on results that changed or a search that recovered."""
         shown = out["rows"] if out["rows"] is not None else (out["value"] or {}).get("rows")
-        shown = shown or out.get("held")
         if out["status"] in ("ok", "empty") and "search_error" not in out:
             out["status"] = "ok" if shown else "empty"
         out["etag"] = _sha({"base": out["etag"], "status": out["status"], "rows": out["rows"], "value": out["value"],
                             "matched": out.get("matched"), "label": out.get("match_label"),
-                            "error": out.get("search_error"),
-                            **({"held": out["held"]} if out.get("held") else {})})
+                            "error": out.get("search_error")})
 
     def _store_search(self, spec: ProviderSpec, q: str, limit: int) -> tuple[list[Any], int | None, str | None]:
         """Run the provider's ``search(q, limit)`` hook, bounded by the panel's own timeout. Returns
@@ -3596,6 +3598,12 @@ def _terms_match(texts: list[str], q: str) -> bool:
     return all(t in hay for t in _fold(q).split())
 
 
+def _board_visible(cards: Any) -> list[Any]:
+    from levain.cockpit import board
+
+    return board.visible_cards(cards)
+
+
 def _compact_value(kind: str, value: Any) -> Any:
     if value is None:
         return None
@@ -3613,5 +3621,5 @@ def _compact_value(kind: str, value: Any) -> Any:
     if kind == "board":
         # the same reduction: per-column counts and the queue's own state (never the cards), the full value one link away
         return {"queue": value.get("queue"), "note": value.get("note"), "unreadable": list(value.get("unreadable") or []),
-                "columns": [{"category": c.get("category"), "count": len(c.get("cards") or [])} for c in value.get("columns") or []]}
+                "columns": [{"category": c.get("category"), "count": len(_board_visible(c.get("cards")))} for c in value.get("columns") or []]}
     return value

@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import site
 import sqlite3
@@ -31,7 +32,20 @@ TTL = "3600"
 # serialized-byte budgets for the fields around the body, so even a title of control characters (six bytes each
 # once JSON escapes them) leaves the body room inside ece.MAX_PLAINTEXT
 _TITLE_ROOM, _TAG_ROOM, _URL_ROOM = 600, 300, 800
+log = logging.getLogger(__name__)
+# a push whose caller did not say its badge: the count is read where it is known (levain.webpush.needs.resolved_badge). Never None:
+# None is the caller saying the count is unknown, and the push then carries no badge field at all
+OMITTED: Any = type("_Omitted", (), {"__repr__": lambda self: "OMITTED", "__bool__": lambda self: False})()
 _SPAWN_STDIN_MAX = 12000   # well under a pipe buffer, so the gate's write never blocks on the child
+
+
+def clean_badge(badge: Any) -> "int | None":
+    """A caller's count as the push carries it: a whole number from 0, clipped to 99; anything else (a bool, a negative, a
+    string, a float) is an unknown count, logged, never a number."""
+    if type(badge) is int and badge >= 0:
+        return min(badge, 99)
+    log.warning("push badge: %r is not a count (a whole number from 0); the push carries no badge", badge)
+    return None
 
 
 def _dumps(obj: dict) -> bytes:
@@ -268,8 +282,9 @@ def _post(req: urllib.request.Request) -> int:
 def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
          command: bool | None = None, push: bool = True, hold: str | None = None,
          device: str | None = None, data: dict[str, Any] | None = None,
-         extra: dict[str, Any] | None = None) -> list[tuple[int, int]]:
-    """``extra``: members merged into the pushed payload (the device test's marker and actions); never stored.
+         extra: dict[str, Any] | None = None, badge: Any = OMITTED) -> list[tuple[int, int]]:
+    """``badge``: the open-needs count the caller already holds (a host serving its own question store); left out, it is the count
+    the serving process recorded, else the native store's; ``None``, the count is unknown and the push carries no badge. ``extra``: members merged into the pushed payload (the device test's marker and actions); never stored.
     Record the ping (``command``: whether the notify command started for it, None when none is set), push it to each live subscription concurrently; returns (subscription id, HTTP status)
     pairs (status 0: no answer; :data:`UNKNOWN`: none within :data:`WALL_BUDGET`). 404 and 410 retire the subscription, and so does a refusal that names the key (:class:`_Dead`). Every
     store write happens in this thread; the workers only talk to the push services. ``push=False`` pushes nothing; with
@@ -282,7 +297,8 @@ def send(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body:
     ping_id = store.add_ping(kind, ref, title, body, command, hold=(url, hold) if hold and not push else None, data=data)
     if not push:   # the caller saw no live phone, or the presence rule held the push
         return []
-    return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url, device=device, extra=extra)
+    return deliver(qdir, store, ping_id, kind=kind, ref=ref, title=title, body=body, url=url, device=device, extra=extra,
+                   badge=badge)
 
 
 def _card_of(qdir: Path, store: PushStore, ping_id: int, kind: str, ref: "str | None", body: str) -> dict[str, Any]:
@@ -307,15 +323,17 @@ def _card_of(qdir: Path, store: PushStore, ping_id: int, kind: str, ref: "str | 
 
 
 def deliver(qdir: Path, store: PushStore, ping_id: int, *, kind: str, ref: str | None, title: str, body: str,
-            url: str, device: str | None = None, extra: dict[str, Any] | None = None) -> list[tuple[int, int]]:
+            url: str, device: str | None = None, extra: dict[str, Any] | None = None,
+            badge: Any = OMITTED) -> list[tuple[int, int]]:
     """Push the already recorded ping ``ping_id`` to each live subscription (``device``: that device's only) and
-    record each answer."""
+    record each answer. ``badge`` as :func:`send`."""
     from levain.webpush import center, needs
 
     subs = store.live_subscriptions(device=device)
     # the push opens the notification center on its own item (the item's id is the push's ``n``)
     data = build_payload(title, body, ref or kind, center.push_url(store, ping_id, kind, url, ref=ref), ping_id,
-                         needs.badge_value(qdir), **_card_of(qdir, store, ping_id, kind, ref, body))
+                         needs.resolved_badge(qdir) if badge is OMITTED else None if badge is None else clean_badge(badge),
+                         **_card_of(qdir, store, ping_id, kind, ref, body))
     if extra:
         merged = _dumps({**json.loads(data.decode("utf-8")), **extra})
         if len(merged) <= ece.MAX_PLAINTEXT:
@@ -381,8 +399,9 @@ def spawn_sign_request(queue_dir: Path | str, rid: str, *, title: str, body: str
 
 def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body: str, url: str = "/",
           command: bool | None = None, push: bool = True, hold: str | None = None,
-          data: dict[str, Any] | None = None) -> bool:
-    """Start :func:`send` detached, never waited on. ``push=False`` records the ping and pushes it to no phone: how a
+          data: dict[str, Any] | None = None, badge: Any = OMITTED) -> bool:
+    """Start :func:`send` (``badge``: the open-needs count the caller holds, passed to the child; left out, the child reads the
+    count the serving process recorded; ``None`` or a value off its shape, the child pushes no badge) detached, never waited on. ``push=False`` records the ping and pushes it to no phone: how a
     ping that only the notify command carried gets its row, decided by the caller's own read of the phones. The text goes to the child on its
     STDIN as JSON, so a body that begins with ``-`` is not an option and the consent text never sits in the process
     table. ``data`` is the sender's structured fields (a JSON object; flow's needs fields, levain.webpush.center.needs_data),
@@ -395,6 +414,8 @@ def spawn(queue_dir: Path | str, *, kind: str, ref: str | None, title: str, body
 
     fields = {"title": title[:300], "body": body[:4000], "ref": None if ref is None else ref[:200], "url": url[:500],
               "command": command, "push": push, "hold": hold}
+    if badge is not OMITTED:
+        fields["badge"] = None if badge is None else clean_badge(badge)
     kept = data_text(data)
     if kept is not None:
         fields["data"] = json.loads(kept)

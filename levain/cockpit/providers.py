@@ -60,17 +60,17 @@ EPISODE_LIMIT = 50
 HANDOFF_FRESH_DAYS = 7
 
 # the verbs a spore panel offers (design §4.2); anneal still refuses a verb the spore's type forbids
-SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update",
+SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update", "spore_retarget",
                    "spore_set_disposition", "spore_ascend")
 SPORE_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen",
-                "origin_key", "target", "attention")
+                "origin_key", "target", "attention", "germinated")
 # seen alone never stales a write (a touch that clears an elapsed next does); origin_key is store-assigned
 # once and names the label resource, so it is carried, not versioned
 SPORE_VERSION_EXCLUDED = ("seen", "origin_key")
 SPORE_VERSION_FIELDS = tuple(f for f in SPORE_STORED if f not in SPORE_VERSION_EXCLUDED)
 SPORE_FACETS = frozenset({
-    "disposition", "domain", "tier", "salience", "spore_type", "due", "overdue_days",
-    "handoff_expired", "last_seen", "age_days", "held",
+    "disposition", "domain", "tier", "salience", "spore_type", "due", "fires", "overdue_days",
+    "handoff_expired", "last_seen", "age_days",
 })
 # the Tray's second view (2026-10-10, "yes to all": "Tray by Age" is a view of the Tray box, not
 # a second box): the same rows, oldest first
@@ -302,17 +302,25 @@ def next_date(value: Any) -> date | None:
     return parse_date(value)
 
 
-def _spore_row(s: Any, today: date, *, held: bool = False) -> RowIn:
+def next_minute(value: Any) -> str | None:
+    """The minute a timed ``next`` names (``YYYY-MM-DDTHH:MM``), or None for a date-only, absent or unreadable one: the row's
+    ``fires`` facet, which the snooze tier reads as the instant a held row wakes."""
+    from levain import spores
+
+    if not spores.is_timed(value):
+        return None
+    when = spores._parse_when(value)
+    return when.strftime("%Y-%m-%dT%H:%M") if when is not None else None
+
+
+def _spore_row(s: Any, today: date) -> RowIn:
     due = next_date(s.next)
     expired = _handoff_expired(s, today)
     facets: dict[str, Any] = {
         "disposition": s.disposition, "domain": s.domain, "tier": s.tier, "salience": s.salience,
         "spore_type": s.type, "handoff_expired": expired, "last_seen": s.seen or None,
-        "due": due.isoformat() if due else None,
+        "due": due.isoformat() if due else None, "fires": next_minute(s.next),
     }
-    if held:
-        # a Tray row whose surface date has not come: the kernel lists it apart from the due rows
-        facets["held"] = True
     if due:
         facets["overdue_days"] = max(0, (today - due).days)
     created = opened_day(s.created)
@@ -474,29 +482,16 @@ def _spore_provider(
         if not path.exists():           # removed while the view was being built
             return Absent(f"no spore store at {path}")
         items = {"tray": view.tray, "loops": view.open_spores}[bucket]
-        filtered = 0
-        rows = []
-        held_rows = []
-        for s in items:
-            if apply_hold and bucket == "tray" and (d := next_date(s.next)) and d > ctx.today:
-                filtered += 1           # surface date not reached: held on purpose, not unreadable
-                held_rows.append(_spore_row(s, ctx.today, held=True))
-                continue
-            rows.append(_spore_row(s, ctx.today))
+        rows = [_spore_row(s, ctx.today) for s in items]
         view_full = len(items) >= VIEW_SPORE_LIMIT
         over = max(0, len(rows) - SPORE_CAP) if apply_hold else 0
-        over_held = max(0, len(held_rows) - SPORE_CAP)
         rows = rows[:SPORE_CAP] if apply_hold else rows
-        rows += held_rows[:SPORE_CAP]
         skipped = ()
         if over:
             skipped += ((over, f"over the display cap of {SPORE_CAP}"),)
-        if over_held:
-            skipped += ((over_held, f"held rows over the display cap of {SPORE_CAP}"),)
         if view_full:
             skipped += ((1, f"the substrate view stopped at {VIEW_SPORE_LIMIT} rows; at least this many more exist"),)
-        return Read(rows=tuple(rows), filtered=((filtered, "surface date not reached"),) if filtered else (),
-                    skipped=skipped, empty=spore_empty(bucket, view.entity_name))
+        return Read(rows=tuple(rows), skipped=skipped, empty=spore_empty(bucket, view.entity_name))
     return read
 
 
@@ -779,7 +774,7 @@ def _tomb_gate(store: Any, origin_key: str, effect_id: Any, episode_id: str) -> 
 
 # what a broker fire reads as in Recent edits: a past-tense phrase per verb, then the thing it touched, then where it came from
 _EDIT_PHRASES = {
-    "spore_touch": "marked seen", "spore_descend": "resolved", "spore_surface_at": "rescheduled", "spore_update": "edited",
+    "spore_touch": "marked seen", "spore_descend": "resolved", "spore_surface_at": "rescheduled", "spore_retarget": "retargeted", "spore_update": "edited",
     "list_intake": "added a line", "spore_set_disposition": "moved", "spore_ascend": "promoted", "spore_seed": "added", "episode_tombstone": "deleted episode",
     "operator_state": "set the state line", "section_edit": "edited", "config": "edited", "entity_name": "renamed the entity",
     "undo": "undid an edit", "pending_cancel": "cancelled a pending change", "token_rotate": "rotated the surface token"}

@@ -158,14 +158,12 @@
   // The List's surface filter ("" = all, else band | board | spore | talk | drop) and the intake box's kept state: the receipt
   // line under the box and an unsent line. A landed write re-reads the page and rebuilds the box, so both live here, not in the DOM.
   let listSurface = "";
+  // The List's time filter ("" = every time-state, else now | later | someday | done): it cuts across the type chips above.
+  let listTime = "";
+  // the List card's way to draw again from the state it shares with the focus view; closing that view calls it, so what the card
+  // says is what its control opens
+  let listCardRedraw = null;
   const intakeKept = { receipt: null, draft: "" };   // receipt: { text, cls } | null
-  // Whether the Tray lists the rows held until their surface date. Per viewer and per browser: it is a display
-  // choice, so it lives in localStorage (which may be absent or throw) and never on the server. Default hidden.
-  const HELD_KEY = "levain.tray.showHeld";
-  let trayHeldShown = false;
-  try { trayHeldShown = window.localStorage.getItem(HELD_KEY) === "1"; } catch (e) { trayHeldShown = false; }
-  const heldMounts = new Set();   // each mounted Tray's toggle and its redraw
-  const saveHeldShown = () => { try { window.localStorage.setItem(HELD_KEY, trayHeldShown ? "1" : "0"); } catch (e) { /* the choice then lasts this page only */ } };
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   // "2026-10-22" -> "Oct 22", from the digits alone (a Date would shift the day by the zone)
   const surfaceLabel = (due) => {
@@ -449,7 +447,7 @@
   function listApart(panel) {
     try {
       const a = JSON.parse(panel.dataset.listApart || "null");
-      return a && (a.desk > 0 || a.later > 0 || a.held > 0) ? a : null;
+      return a && (a.desk > 0 || a.later > 0 || a.done > 0) ? a : null;
     } catch (e) { return null; }
   }
   function listMore(panel, hidden, a) {
@@ -457,7 +455,7 @@
     if (hidden > 0) parts.push(hidden + " more");
     if (a.desk > 0) parts.push("desk owes " + a.desk);
     if (a.later > 0) parts.push("later " + a.later);
-    if (a.held > 0) parts.push(a.held + " held");
+    if (a.done > 0) parts.push("done " + a.done);
     const more = el("button", "more-foot", parts.join(" · "));
     more.type = "button";
     more.dataset.listMore = "1";
@@ -476,8 +474,7 @@
     const apartNow = listApart(panel);
     if (!(body.scrollHeight > body.clientHeight + 1)) return apartNow ? listMore(panel, 0, apartNow) : false;
     const top = body.getBoundingClientRect().top;
-    const heldLine = body.querySelector(":scope > .held-line, .held-line");
-    const limit = body.clientHeight - 34 - (heldLine ? heldLine.offsetHeight : 0);   // room kept for the link and the held-back line
+    const limit = body.clientHeight - 34;   // room kept for the link
     const isRow = (n) => n.matches(FOLD_ROW), isHead = (n) => n.matches(FOLD_HEAD);
     const items = Array.prototype.filter.call(body.querySelectorAll(FOLD_ROW + ", " + FOLD_HEAD), (n) => !n.parentElement.closest(FOLD_ROW));
     // where bands sit side by side (Morning's Tray: Overdue | Today) each column has its own fold, since a column that overflows says
@@ -2087,6 +2084,7 @@
     // fixed meta columns, and a drop row carries more than four small facts
     const host = s.surface ? el("span", "list-meta") : row;
     if (s.surface) row.dataset.surface = s.surface;
+    if (s.surface && s.time_state) row.dataset.timeState = s.time_state;
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
@@ -2118,38 +2116,49 @@
     if (foreign) {
       // read-only by construction: band rows point at the Decisions panel, board rows at the agents' queue; no verbs below
       if (s.support && !s.text_locked) host.appendChild(el("span", "muted list-support", s.support));
-      if (s.later_words && s.group === "later") host.appendChild(tagEl("muted", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
+      if (s.wake_line && s.group === "later") host.appendChild(tagEl("muted later-tag", s.wake_line));
+      else if (s.later_words && s.group === "later") host.appendChild(tagEl("muted later-tag", "back " + s.later_words));   // a carried desk row is due now (needs you), never "back Mon"
       // a desk row the desk has carried past its day is listed under Needs you, tagged as flow's footer tags it
       if (s.band_section === "desk" && s.carried) host.appendChild(tagEl("muted list-desk-owed", "desk-owed"));
-      if (s.list_pointer) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
+      // a band row that rings an intention is acted on right here (the four controls); any other points at Decisions
+      const intend = s.surface === "band" && s.intention && s.row_id && hasIntentionControls(s.actions);
+      if (s.list_pointer && !intend) host.appendChild(tagEl("muted list-pointer", s.list_pointer));
       if (s.surface === "board") {
         if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
       }
       if (s.band_age) host.appendChild(el("span", "muted", s.band_age));       // the footer's clock and form, never whole days from the add
       else if (s.surface !== "band" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
+      if (intend) appendRowVerbs(row, buildIntentionVerbs(s.row_id, s.actions, s.intention_text), ["Done", "Snooze"], 2);
       return row;
     }
-    if (s.surface && !s.held) {
+    if (s.surface && s.time_state === "done") {
+      // resolved in the last week: read-only, the day and how it closed
+      host.appendChild(tagEl("muted", (s.done_kind || "done") + " " + shortDate(s.done_on || "")));
+      return row;
+    }
+    if (s.surface) {
       // the kernel computed `overdue` and `fires`; this only says so
-      if (s.overdue) {
+      if (s.wake_line) {
+        const wk = tagEl("muted", s.wake_line);
+        wk.setAttribute("data-ck-tag-state", "later");
+        host.appendChild(wk);
+      } else if (s.overdue) {
         row.dataset.band = "overdue";
         const od = tagEl("muted", "overdue");
         od.setAttribute("data-ck-tag-state", "overdue");
         host.appendChild(od);
       }
-      if (s.next && !s.fires) host.appendChild(tagEl("muted", "due " + shortDate(s.next)));
+      if (!s.wake_line && s.next && !s.fires) host.appendChild(tagEl("muted", "due " + shortDate(s.next)));
+      // who does it, derived from the target; the cockpit never stores it
+      const exec = executorOf(rowTarget(s));
+      if (exec && s.disposition === "agenda") { const w = tagEl("muted list-who", exec); w.dataset.who = exec; w.title = "who does it, from its target"; host.appendChild(w); }
       if (s.surface === "talk" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(tagEl("muted", s.age_days + " d old"));
-      if (s.deliver_to && s.surface === "drop") host.appendChild(tagEl("muted", "to " + s.deliver_to));
+      if (s.deliver_to && s.surface === "drop" && !s.wake_line) host.appendChild(tagEl("muted", "to " + s.deliver_to));
       if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
-      if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
+      if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
       return row;
     }
-    if (s.held) {
-      row.dataset.held = "1";
-      const sf = tagEl("muted", "surfaces " + surfaceLabel(s.next));
-      sf.setAttribute("data-ck-tag-state", "held");
-      host.appendChild(sf);
-    } else if (s.next) {
+    if (s.next) {
       // a late row says how late ("overdue 4 d") and keeps its date ("due 10-17"); a row due today says so
       const late = daysLate(s.next, s.today);
       if (late > 0) {
@@ -2168,7 +2177,7 @@
     // the integer the kernel sends (the spore's own created date), never the badge words parsed back
     if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
     if (s.domain && !originDrawn) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
-    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "Snooze"] : null, panelKind === "tray" ? 2 : 0);
+    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
 
@@ -2204,7 +2213,7 @@
       if (rows.length === 0) {
         const note = el("p", "empty", q || !(opts && opts.empty) ? "no " + noun + " match “" + raw.trim() + "”" : opts.empty);
         const unlisted = q && opts && opts.unlisted ? opts.unlisted().filter(hit).length : 0;
-        if (unlisted && opts.hintShow) opts.hintShow(note, unlisted);
+        if (unlisted && opts.hintShow) opts.hintShow(note, unlisted, opts.unlisted().filter(hit));
         results.appendChild(note);
       } else drawRows(rows, results);
       status.textContent = q ? (rows.length + (rows.length === 1 ? " match" : " matches") + " · ⌫ to clear") : "";
@@ -2239,32 +2248,26 @@
     // Tray its own source, give each its own error key here. [complement L3 LOW]
     const err = tierErr(view, "open_spores");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
-    // the Tray's rows held until their surface date: listed only when the viewer asks, under the due rows
-    const held = entry.kind === "tray" && Array.isArray(view.tray_held) ? view.tray_held : [];
-    if ((!list || list.length === 0) && held.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
+    if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
     // the Tray's views: the kernel names each ordering and sends the row ids in it; this only picks one
     const views = entry.kind === "tray" && Array.isArray(view.tray_views) && view.tray_view_rows ? view.tray_views : [];
     const viewOf = () => (views.some((v) => v.id === trayView) ? trayView : "");
-    const heldLine = held.length && view.tray_held_line && typeof view.tray_held_line === "object" ? view.tray_held_line : null;
     // the List: rows that carry a `surface` get the surface filter (the kernel names the stores; the page only filters by them)
     const isList = entry.kind === "tray" && view.tray_is_list === true;   // the panel offers list_intake: a marker, never the rows' contents
     // The List's card holds what is due for the operator and what else fits; everything else it holds (the desk's rows, the rows
-    // that come back on a later day, the rows held until their date) is listed in the focus view, under its own heading, and the
-    // card names them in ONE control that opens it. So the card draws neither a held row nor a held toggle.
+    // that come back on a later day) is listed in the focus view, under its own heading, and the
+    // card names them in ONE control that opens it.
     const inCard = isList && !(ropts && ropts.modal);
-    const apart = (s) => s.group === "desk" || s.group === "later";
+    const apart = (s) => s.group === "desk" || s.group === "later" || s.group === "done";
     const cardHides = (s) => inCard && apart(s);
-    // read live: the plain Tray's toggle flips trayHeldShown and redraws without rebuilding this closure
-    const heldShownNow = () => (isList ? !inCard : trayHeldShown);
-    // what the card leaves to the focus view, counted as flow's footer counts it: DESK OWES is every desk row, a carried one too
-    // (it is also listed under Needs you); LATER the rows that come back on a later day
-    const apartCount = { desk: (list || []).filter((s) => s.band_section === "desk").length,
-                         later: (list || []).filter((s) => s.group === "later").length, held: heldLine ? heldLine.count : 0 };
-    const cardHasApart = inCard && (apartCount.desk > 0 || apartCount.later > 0 || apartCount.held > 0);
+    // what the card leaves to the focus view, counted the way the focus view draws it for the state now chosen (the type and time
+    // chosen carry over to it); a function of that state, read again on every rebuild
+    let apartCount = { desk: 0, later: 0, done: 0 };
+    const cardHasApart = inCard && (list || []).some(apart);
     // ONE rule for "all", in the card and the focus view: the rows in this view's own list (the card's without the desk's and the
-    // later ones it names in its control, the focus view's with them). Held rows are never in it, nor in a surface chip: they have
-    // their own "held" chip. So the header, the "all" chip and the control's numbers follow from each other.
+    // later ones it names in its control, the focus view's with them). So the header, the "all" chip and the control's numbers
+    // follow from each other.
     const listAll = () => (list || []).filter((s) => !cardHides(s));
     const withCarriedDesk = (rows) => {
       const copies = rows.filter((s) => s.group === "band" && s.band_section === "desk" && s.carried)
@@ -2273,57 +2276,103 @@
       const at = rows.findIndex((s) => s.group !== "band");     // Desk owes follows Needs you, ahead of the rows already in it
       return at < 0 ? rows.concat(copies) : rows.slice(0, at).concat(copies, rows.slice(at));
     };
-    const heldChosen = () => isList && !inCard && listSurface === "held" && !!heldLine;   // the card names its held rows in its control, never draws them
-    const listNow = () => (heldChosen() ? "held" : isList && listAll().some((s) => s.surface === listSurface) ? listSurface : "");
-    const inSurface = (s) => !listNow() || listNow() === "held" || s.surface === listNow();
-    if (isList && !inCard) p.dataset.listTotal = String(listAll().length);   // the focus view's header counts what its "all" chip counts
+    // the time-state a row is in, as the kernel computed it; the focus view's time chips filter by it, across the type chips
+    const timeOf = (s) => s.time_state || "now";
+    // the chosen named ordering: the ids the kernel sent for it, or null
+    const viewIds = () => { const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null; return Array.isArray(ids) ? ids : null; };
+    // THE rows of the List for a state, and the only place they are chosen: the projection (a carried desk row listed twice in the
+    // focus view, once in a chosen view, which is ungrouped), then the chosen view's order, then the type, then the time. The body
+    // draws rowsFor(state) and every chip's number is rowsFor(state with that chip).length, so a number is the rows its tap draws.
+    // focus: the rows of the focus view for that state, asked from the card (the card counts what its one control opens)
+    const rowsFor = (st, focus) => {
+      let rows = focus ? (list || []) : listAll();
+      if (isList && (focus || !inCard) && !st.view) rows = withCarriedDesk(rows);
+      if (st.view) {
+        const byId = new Map(rows.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
+        const named = new Set(st.view);
+        rows = st.view.filter((id) => byId.has(id)).map((id) => byId.get(id))
+          .concat(rows.filter((s) => !named.has(s.id)).map((s) => byId.get(s.id)));
+      }
+      if (st.surface) rows = rows.filter((s) => s.surface === st.surface && inSurfaceChip(s));
+      if (st.time) rows = rows.filter((s) => timeOf(s) === st.time);
+      return rows;
+    };
+    const timeNow = () => (isList && !inCard && LIST_TIMES.indexOf(listTime) >= 0 ? listTime : "");
+    // a type chosen earlier that the chosen time and view have no rows in is no choice at all
+    const listNow = () => (isList && rowsFor({ surface: listSurface, time: timeNow(), view: viewIds() }).length > 0 ? listSurface : "");
+    const stateNow = () => ({ surface: listNow(), time: timeNow(), view: viewIds() });
+    const countApart = () => {
+      const st = { surface: listSurface, time: LIST_TIMES.indexOf(listTime) >= 0 ? listTime : "", view: viewIds() };
+      let rows = rowsFor(st, true);
+      if (!rows.length && st.surface) rows = rowsFor(Object.assign({}, st, { surface: "" }), true);     // the focus view drops a type that has no rows
+      const n = (g) => rows.filter((s) => s.group === g).length;
+      apartCount = { desk: n("desk"), later: n("later"), done: n("done") };
+      if (inCard) p.dataset.listApart = JSON.stringify(apartCount);
+    };
+    countApart();
+    if (isList && !inCard) p.dataset.listTotal = String(rowsFor({ surface: "", time: "", view: null }).length);   // the focus view's header is the unfiltered List
+    let rebuildChips = null;   // a chosen view changes every chip's number: the chips are rebuilt with it
     let chipRow = null;     // the chips' row, drawn by controls(); the panel's own element is empty once the focus view moves its body
-    const opts = views.length || heldLine || isList ? {
-      // a card whose due rows are all done still holds the desk's, the later and the held ones: it says nothing is due, not that it is empty
+    const opts = views.length || isList ? {
+      // a card whose due rows are all done still holds the desk's and the later ones: it says nothing is due, not that it is empty
       empty: cardHasApart ? "Nothing due for you." : emptyMsg,
-      extra: () => (isList ? (heldChosen() ? held : []) : heldLine && heldShownNow() ? held.filter(inSurface) : []),
       // the card's search also reads what the card leaves to the focus view, so a match there is told, never "no items match"
-      unlisted: () => (inCard ? (list || []).filter(cardHides).concat(heldLine ? held : []).filter(inSurface)
-                              : (heldLine && !isList && !heldShownNow() ? held.filter(inSurface) : isList && heldLine && !heldChosen() ? held.filter(inSurface) : [])),
-      hintShow: (note, n) => {
-        note.appendChild(document.createTextNode(inCard ? " — " + n + (n === 1 ? " row matches in the full list — " : " rows match in the full list — ")
-                                                        : " — " + n + (n === 1 ? " held row matches — " : " held rows match — ")));
-        const go = el("button", "held-toggle");
+      unlisted: () => (inCard ? (list || []).filter(cardHides).filter((s) => !listNow() || s.surface === listNow()) : []),
+      hintShow: (note, n, hits) => {
+        note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " row matches in the full list — " : " rows match in the full list — ")));
+        const go = el("button", "list-open-match");
         go.type = "button";
-        go.dataset.heldShowMatches = "1";
-        go.textContent = inCard ? "open it" : "show";
+        go.dataset.listOpenMatches = "1";
+        go.textContent = "open it";
         go.addEventListener("click", () => {
-          if (inCard) { const m = p.querySelector("[data-list-more]"); if (m) m.click(); return; }
-          if (isList) { const c = chipRow && chipRow.querySelector('[data-surface="held"]'); if (c) c.click(); return; }
-          const t = p.querySelector("[data-held-toggle]"); if (t) t.click();
+          // the focus view opens on the time the matched rows live in (all times when they span several), so the match is drawn
+          const states = new Set((hits || []).map(timeOf));
+          listTime = states.size === 1 ? Array.from(states)[0] : "";
+          const m = p.querySelector("[data-list-more]");
+          if (m) m.click();
+          else { const x = p.querySelector(".pexpand"); if (x) x.click(); }     // a card with no footer still opens its focus view
         });
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
-        if (isList) bar.after(chipRow = buildSurfaceChips(listAll(), listNow, (v) => { listSurface = v; redraw(); }, heldLine && !inCard ? heldLine.count : 0));
-        if (heldLine && !isList) {
-          const line = el("div", "ext-note held-line");
-          // the earliest surface date among the held rows: "1 held back until Dec 3"
-          const nexts = held.map((h) => String(h.next || "")).filter((d) => /^\d{4}-\d{2}-\d{2}/.test(d)).sort();
-          line.appendChild(el("span", null, nexts.length ? heldLine.count + " held back until " + surfaceLabel(nexts[0]) + " "
-            : heldLine.count + " held back — " + heldLine.reason + " "));
-          const tog = el("button", "held-toggle");
-          tog.type = "button";
-          tog.dataset.heldToggle = "1";
-          const label = () => { tog.textContent = trayHeldShown ? "hide" : "show"; tog.setAttribute("aria-expanded", trayHeldShown ? "true" : "false"); };
-          label();
-          // one state, every mounted Tray (the board's and the focus modal's) redraws on a change
-          const mine = { tog, sync: () => { label(); redraw(); } };
-          heldMounts.add(mine);
-          // drop the mounts a re-render replaced; after this task, so a Tray built but not yet attached stays
-          setTimeout(() => { for (const m of [...heldMounts]) if (!m.tog.isConnected) heldMounts.delete(m); }, 0);
-          tog.addEventListener("click", () => {
-            trayHeldShown = !trayHeldShown; saveHeldShown();
-            heldMounts.add(mine);   // a Tray attached after the prune ran still redraws itself
-            for (const m of [...heldMounts]) { if (m.tog.isConnected) m.sync(); else heldMounts.delete(m); }
-          });
-          line.appendChild(tog);
-          p.appendChild(line);   // at the foot of the list, as the mock draws it
+        let orderSync = null;     // set once the ordering select exists
+        if (isList) {
+          // every number reads rowsFor, with the chip's own value in place of the one chosen
+          let timeRow = null;
+          // the shared choices the card last drew from: closing a view that left them unchanged redraws nothing
+          const listChoice = () => listSurface + "\u0000" + listTime + "\u0000" + trayView;
+          let drawnChoice = null;
+          const build = () => {
+            if (orderSync) orderSync();     // the ordering select shows the ordering chosen now, wherever it was chosen
+            if (inCard) drawnChoice = listChoice();
+            const was = document.activeElement;
+            const at = was && was.dataset && ((chipRow && was.closest(".list-surfaces") === chipRow) || (timeRow && was.closest(".list-times") === timeRow))
+              ? (was.dataset.surface !== undefined ? ["surface", was.dataset.surface] : was.dataset.time !== undefined ? ["time", was.dataset.time] : null) : null;
+            countApart();
+            const st = stateNow();
+            const fresh = buildSurfaceChips((k) => rowsFor({ surface: k, time: st.time, view: st.view }), listNow, chooseSurface, inCard ? "" : "Type");
+            if (chipRow) chipRow.replaceWith(fresh); else bar.after(fresh);
+            chipRow = fresh;
+            if (!inCard) {
+              const t = buildTimeChips((k) => rowsFor({ surface: st.surface, time: k, view: st.view }), timeNow, (v) => { listTime = v; build(); redraw(); });
+              if (timeRow) timeRow.replaceWith(t); else chipRow.before(t);
+              timeRow = t;
+            }
+            // the chips are rebuilt after a tap: the same chip, rebuilt, takes the keyboard focus back
+            if (at) {
+              const row = at[0] === "surface" ? chipRow : timeRow;
+              // a chip with no replacement (its count fell to none) hands the focus to the row's first chip
+              const again = row && (row.querySelector("[data-" + at[0] + "=\"" + at[1] + "\"]") || row.querySelector("button"));
+              if (again) again.focus();
+            }
+          };
+          const chooseSurface = (v) => { listSurface = v; build(); redraw(); };
+          rebuildChips = build;
+          if (inCard) listCardRedraw = () => { if (document.body.contains(p) && listChoice() !== drawnChoice) {
+            // a draw that fails leaves the card unconfirmed, so the next close tries again
+            try { build(); redraw(); } catch (e) { drawnChoice = null; throw e; }
+          } };
+          build();
         }
         if (!views.length) return;
         const sel = el("select", "tray-dump-type");
@@ -2332,40 +2381,34 @@
         sel.appendChild(Object.assign(el("option", null, orderWord), { value: "" }));
         for (const v of views) sel.appendChild(Object.assign(el("option", null, v.title), { value: v.id }));
         sel.value = viewOf();
-        sel.addEventListener("change", () => { trayView = sel.value; redraw(); });
+        orderSync = () => { sel.value = viewOf(); };
+        sel.addEventListener("change", () => { trayView = sel.value; if (rebuildChips) rebuildChips(); redraw(); });
         bar.appendChild(sel);
       },
-      pick: (rows) => {
-        const base = (listNow() === "held" ? [] : listNow() ? rows.filter((s) => s.surface === listNow() && inSurfaceChip(s)) : rows).filter((s) => !cardHides(s));
-        const ids = views.length && viewOf() ? view.tray_view_rows[viewOf()] : null;
-        // the focus view draws a carried desk row under Needs you AND under Desk owes, as flow's footer prints it, so the control's
-        // "desk owes N" is the number of rows a person can see under that heading (a chosen view is ungrouped: no copy there)
-        const all = isList && !inCard && !Array.isArray(ids) && !listNow() ? withCarriedDesk(base) : base;
-        if (!Array.isArray(ids)) return all;
-        const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
-        // a row the view did not name still shows, after the named ones
-        const named = new Set(ids);
-        return ids.filter((id) => byId.has(id)).map((id) => byId.get(id))
-          .concat(all.filter((s) => !named.has(s.id)).map((s) => byId.get(s.id)));
-      },
+      pick: () => rowsFor(stateNow()),
     } : undefined;
-    if (inCard) {
-      // what the card leaves to the focus view, for its one control (foldRowsAt words it)
-      p.dataset.listApart = JSON.stringify(apartCount);
-    }
     mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
-      let heldHead = false;
+      let lastBucket = null;
       let box = results;
       for (const s of rows) {
-        if (s.held && !heldHead) { heldHead = true; box = results; results.appendChild(headingEl("Held until their surface date")); }
         // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
         // a chosen view is ungrouped
         const g = s.group || null;
-        if (s.group_title && g !== lastGroup && !viewOf() && !s.held) {
+        if (s.group_title && g !== lastGroup && !viewOf()) {
           // each band is a column of its own where the page is wide (Morning's Tray: Overdue | Today); `display: contents` elsewhere
           box = entry.kind === "tray" ? results.appendChild(el("div", "grp-col")) : results;
           box.appendChild(headingEl(s.group_title));
+          lastBucket = null;
+        }
+        // LATER groups its rows by the day they wake (the kernel's bucket; its rows are already in wake order)
+        if (g === "later" && s.wake_bucket && s.wake_bucket !== lastBucket && !viewOf()) {
+          lastBucket = s.wake_bucket;
+          const sub = el("div", "grp-sub", WAKE_BUCKETS[s.wake_bucket] || s.wake_bucket);
+          sub.dataset.wakeBucket = s.wake_bucket;
+          sub.setAttribute("role", "heading");
+          sub.setAttribute("aria-level", "4");
+          box.appendChild(sub);
         }
         lastGroup = g;
         box.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
@@ -2450,31 +2493,52 @@
   // (`listSurface`); the rows and their order are the kernel's.
   const SURFACE_WORDS = { band: "band", board: "board", spore: "spores", talk: "talk", drop: "drops" };
   // ONE rule for which rows a surface chip stands for: the chip's count and the rows the focus view draws under it both use it, so
-  // a number on a chip is the number of rows its tap shows. The band's chip excludes the desk's rows and the later ones.
+  // a number on a chip is the number of rows its tap shows, and the type chips add up to "all" in every time-state.
   function inSurfaceChip(s) {
-    return !!(s && s.surface) && !(s.surface === "band" && (s.group === "desk" || s.group === "later"));
+    return !!(s && s.surface);
   }
-  function buildSurfaceChips(list, current, choose, heldCount) {
+  // The List's time chips: now / later / someday / done, each with its count; a second tap clears the choice. The type chips
+  // beside them keep cutting across the time-states.
+  const LIST_TIMES = ["now", "later", "someday", "done"];
+  const WAKE_BUCKETS = { tomorrow: "Tomorrow", week: "Next 7 days", later: "Later dates" };
+  // rowsFor(k) is the rows the tap on the chip k draws; a chip says how many.
+  function buildTimeChips(rowsFor, current, choose) {
+    const row = el("div", "list-times");
+    row.setAttribute("role", "group");
+    row.setAttribute("aria-label", "filter the List by when a row comes due");
+    row.appendChild(el("span", "list-chips-label", "When"));
+    const chips = [];
+    const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.time === now ? "true" : "false"); };
+    for (const k of LIST_TIMES) {
+      const n = rowsFor(k).length;
+      if (n === 0 && k !== current()) continue;
+      const c = el("button", "rc-chip list-time-chip", k.charAt(0).toUpperCase() + k.slice(1) + " " + n);
+      c.type = "button";
+      c.dataset.time = k;
+      c.addEventListener("click", () => choose(current() === k ? "" : k));
+      chips.push(c);
+      row.appendChild(c);
+    }
+    sync(current());
+    return row;
+  }
+  function buildSurfaceChips(rowsFor, current, choose, label) {
     const row = el("div", "list-surfaces");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "filter the List by where a row comes from");
-    const counts = new Map();
-    // the band chip counts the rows due for the operator, as the panel's header does: the desk's rows and the later ones sit
-    // under their own headings, outside it
-    for (const s of list) if (inSurfaceChip(s)) counts.set(s.surface, (counts.get(s.surface) || 0) + 1);
+    if (label) row.appendChild(el("span", "list-chips-label", label));
     const chips = [];
-    const mk = (value, label) => {
-      const c = el("button", "rc-chip list-surface-chip", label);
+    const mk = (value, word, n) => {
+      const c = el("button", "rc-chip list-surface-chip", word + " " + n);
       c.type = "button";
       c.dataset.surface = value;
-      c.addEventListener("click", () => { choose(value); sync(value); });
+      c.addEventListener("click", () => choose(value));
       chips.push(c);
       row.appendChild(c);
     };
     const sync = (now) => { for (const c of chips) c.setAttribute("aria-pressed", c.dataset.surface === now ? "true" : "false"); };
-    mk("", "all " + list.length);
-    for (const k of Object.keys(SURFACE_WORDS)) if (counts.has(k)) mk(k, SURFACE_WORDS[k] + " " + counts.get(k));
-    if (heldCount > 0) mk("held", "held " + heldCount);     // its own chip: held rows are never folded into "all" or a surface's number
+    mk("", "all", rowsFor("").length);
+    for (const k of Object.keys(SURFACE_WORDS)) { const n = rowsFor(k).length; if (n > 0) mk(k, SURFACE_WORDS[k], n); }
     sync(current());
     return row;
   }
@@ -3276,8 +3340,8 @@
   // The cockpit verb each spore button fires. On a manifest row (one that lists its `actions`) a button
   // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
-  const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", reclassify: "spore_update", park: "spore_update",
-    reactivate: "spore_update", schedule: "spore_surface_at", Snooze: "spore_surface_at", Resolve: "spore_descend", metabolize: "spore_set_disposition",
+  const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", park: "spore_update",
+    reactivate: "spore_update", "when?": "spore_surface_at", who: "spore_retarget", Resolve: "spore_descend", metabolize: "spore_set_disposition",
     dismiss: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
     tombstone: "episode_tombstone" };
 
@@ -3343,13 +3407,10 @@
   function buildSporeVerbs(s, panelKind) {
     const wrap = el("span", "verb-actions");
 
-    // A TRAY item (the forming workbench): edit + reclassify (plastic WHILE forming) are
+    // A TRAY item (the forming workbench): edit is
     // first-class — the item isn't ready for the lifecycle verbs yet. Then the route levers.
     if (panelKind === "tray") {
       wrap.appendChild(editBtn(wrap, s));
-      // a legacy note (the Keep is gone) is not forming: its type is fixed, so no reclassify
-      if (s.disposition !== "note") wrap.appendChild(verbBtn("reclassify", "change the type — it's still forming", () =>
-        openReclassify(wrap, s)));
       // metabolize — promote into cognition as a live loop (Tray->loop is never the
       // silent-loss direction, so no confirm); the type LOCKS at this boundary.
       wrap.appendChild(verbBtn("metabolize", "promote into cognition as a live loop", async (ev) => {
@@ -3360,7 +3421,9 @@
         b.disabled = false;
         verbErr(wrap, res);
       }));
-      wrap.appendChild(verbBtn("Snooze", "resurface on a future date", () => openSurfaceForm(wrap, s)));
+      wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
+      // an agenda holds a target, so it has a who to change (a seed is given one through when?)
+      if (rowTarget(s)) wrap.appendChild(verbBtn("who", "who does it: you or the machine", () => openWhoForm(wrap, s)));
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
         wrap.appendChild(verbBtn("Resolve", "resolve or compost this inbox item", () =>
           openResolveForm(wrap, "spore_descend", "dismiss", s, s.descend_kinds, false)));
@@ -3377,7 +3440,7 @@
       verbErr(wrap, res);
     }));
     wrap.appendChild(editBtn(wrap, s));
-    wrap.appendChild(verbBtn("schedule", "resurface on a future date", () => openSurfaceForm(wrap, s)));
+    wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
     // park — pin dormant: hide from active cognition but the loop stays OPEN (exempt from the
     // dormancy→compost prompt), resurfaceable, and shown HERE with a parked marker (the Keep panel is gone).
     // A parked row offers the inverse, "reactivate" (un-park, back to warm). A tier change
@@ -3416,25 +3479,136 @@
     return gateByActions(wrap, s.actions);
   }
 
-  // The schedule form: a date input + confirm -> spore_surface_at (clear = explicit empty).
+  // WHO acts when an agenda wakes is derived from its target and never stored: a band row or a nudge rings in the band (you),
+  // the desk and a board item are the machine's. Editing it sets `target` (spore_retarget), through the same words.
+  // the row's germinate target as the page holds it (the cockpit view names it deliver_to)
+  const rowTarget = (s) => (typeof s.deliver_to === "string" && s.deliver_to ? s.deliver_to : "");
+  function executorOf(target) {
+    if (target === "band" || target === "nudge") return "you";
+    if (target === "desk" || (typeof target === "string" && /^board:\S+$/.test(target))) return "the machine";
+    return "";
+  }
+  // a board target names a plain repo (the store's other reader takes nothing else)
+  const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+  // The who control: "you" / "the machine" (with "desk" or a repo name), preselected from the row's own target; a seed has none.
+  // value() is the target the control now names, null when nothing is chosen, or false when the machine's repo is not a name.
+  function whoControl(s) {
+    const cur = executorOf(rowTarget(s));
+    const box = el("span", "who-ctl");
+    const bYou = el("button", "verb-cancel who-opt", "you");
+    const bMachine = el("button", "verb-cancel who-opt", "the machine");
+    bYou.type = "button"; bMachine.type = "button";
+    bYou.dataset.who = "you"; bMachine.dataset.who = "the machine";
+    const repo = el("input", "verb-ref who-repo");
+    repo.type = "text"; repo.setAttribute("aria-label", "which: the desk, or a repo's board");
+    repo.placeholder = "desk, or a repo";
+    repo.value = typeof rowTarget(s) === "string" && rowTarget(s).startsWith("board:") ? rowTarget(s).slice(6) : (cur === "the machine" ? "desk" : "");
+    let chosen = cur;
+    const paint = () => {
+      for (const b of [bYou, bMachine]) b.setAttribute("aria-pressed", b.dataset.who === chosen ? "true" : "false");
+      repo.hidden = chosen !== "the machine";
+      if (chosen === "the machine" && !repo.value) repo.value = "desk";
+    };
+    bYou.addEventListener("click", () => { chosen = chosen === "you" ? "" : "you"; paint(); });
+    bMachine.addEventListener("click", () => { chosen = chosen === "the machine" ? "" : "the machine"; paint(); });
+    paint();
+    box.append(el("span", "muted who-label", "who does it"), bYou, bMachine, repo);
+    return {
+      node: box,
+      value: () => {
+        if (chosen === "you") return rowTarget(s) === "nudge" ? "nudge" : "band";   // a nudge is still the operator's, keep its ping
+        if (chosen !== "the machine") return null;
+        const r = repo.value.trim();
+        if (r === "desk") return "desk";
+        return REPO_NAME.test(r) ? "board:" + r : false;
+      },
+    };
+  }
+
+  // The local minute a picker writes: "YYYY-MM-DDTHH:MM", read from the browser's clock, no zone in the value. The host reads it
+  // in ITS zone (the page has no channel for the host's zone), so the form says the times are the host's.
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const dayOf = (d) => d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+  const minuteOf = (d) => dayOf(d) + "T" + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  // the quick picks, from a clock: later today (a few hours on, held inside today), tonight (offered only while it is still ahead),
+  // tomorrow morning, next Monday morning, now; each label names its own time
+  function whenPicks(now) {
+    const day = (n) => new Date(now.getFullYear(), now.getMonth(), now.getDate() + n);
+    const at = (d, h) => minuteOf(new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0));
+    const picks = [];
+    // later today never runs past today's last minute (a pick under a "today" label never writes tomorrow), and it is gone in today's last hour
+    if (now.getHours() < 23) {
+      const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59);
+      picks.push({ key: "later", label: "Later today", value: minuteOf(new Date(Math.min(now.getTime() + 3 * 3600000, endOfDay.getTime()))) });
+    }
+    if (now.getHours() < 20) picks.push({ key: "tonight", label: "Tonight 20:00", value: at(day(0), 20) });
+    picks.push({ key: "tomorrow", label: "Tomorrow 09:00", value: at(day(1), 9) });
+    picks.push({ key: "monday", label: "Next Mon 09:00", value: at(day(((8 - now.getDay()) % 7) || 7), 9) });
+    picks.push({ key: "now", label: "Now", value: minuteOf(now) });
+    return picks;
+  }
+
+  // The "when?" form on a spore row: quick picks (one tap writes), a date and a time input (two inputs, never datetime-local: a
+  // date-only pick stays one tap, and the phone's date and time wheels each open on their own), the who control, then
+  // schedule / clear / cancel. It writes `YYYY-MM-DDTHH:MM` through spore_surface_at; when the who control names a target the
+  // row does not hold, the same write goes through spore_retarget (a seed given a who becomes a dated agenda in that write).
   // Mirrors openResolveForm's hide-triggers / one-form-at-a-time / Escape-cancel shape.
-  function openSurfaceForm(host, s) {
+  // `opts` (the intention snooze): {label, post(value), min, back(value), done(value), stale}: the same date picker, a different
+  // button word, no "clear" (a snooze always names a day), the earliest day it takes (`min`, refused in plain words before
+  // anything is sent), a visible line naming when the row comes back, the row's words once it is sent, and the words a stale
+  // refusal reads as; the pick is posted through `post` instead of the spore write.
+  function openSurfaceForm(host, s, opts) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
     const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
     triggers.forEach((b) => (b.style.display = "none"));
-    const form = el("span", "verb-form");
+    const form = el("span", "verb-form when-form");
+    const picksBox = el("span", "when-picks");
+    // the who control only where the cockpit offers spore_retarget (a seed or an agenda): a loop is nobody's to hand off
+    // a row with no actions list (a legacy row) is offered none: the who control is drawn only on the kernel's offer
+    const canWho = Array.isArray(s.actions) && s.actions.some((x) => x && x.verb === "spore_retarget");
+    const who = canWho ? whoControl(s) : { node: null, value: () => null };
     const input = el("input", "verb-date");
     input.type = "date";
-    if (s.next) input.value = s.next;  // prefill an existing alarm
-    const go = el("button", "verb-confirm", "schedule");
-    const clearBtn = el("button", "verb-cancel", "clear");
+    input.setAttribute("aria-label", "day");
+    const timeIn = el("input", "verb-time");
+    // empty unless the row already holds a minute or the operator sets one: an empty time keeps a date-only write date-only
+    timeIn.type = "time"; timeIn.step = 60; timeIn.value = "";
+    timeIn.setAttribute("aria-label", "time, on the Levain host's clock");
+    timeIn.title = "on the Levain host's clock";
+    const zone = el("span", "muted when-zone", "times are the Levain host's clock");
+    const m = /^(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?$/.exec(String(s.fires || s.next || ""));
+    if (m && !opts) { input.value = m[1]; if (m[2]) timeIn.value = m[2]; }   // prefill an existing alarm
+    const go = el("button", "verb-confirm", opts && opts.label ? opts.label : "schedule");
+    const clearBtn = el("button", "verb-cancel", "someday");
     const cancel = el("button", "verb-cancel", "cancel");
     go.type = "button"; clearBtn.type = "button"; cancel.type = "button";
+    clearBtn.title = "no day: leave it undated";
     const msg = el("span", "edit-msg", "");
-    form.append(input, go, clearBtn, cancel, msg);
+    if (opts && (opts.minToday || opts.min)) input.min = opts.minToday || opts.min;   // a timed pick may be today: the host judges the minute
+    const back = opts && opts.back ? el("span", "muted intention-back", "") : null;
+    const showBack = () => { if (back) back.textContent = input.value ? opts.back(timeIn.value ? input.value + "T" + timeIn.value : input.value) : ""; };
+    if (back) { input.addEventListener("input", showBack); timeIn.addEventListener("input", showBack); }
+    const all = [go, clearBtn, cancel];
+    // the picks and the who control are the `when?` form's: a form a caller drives with its own post (a snooze) offers neither
+    const picks = opts ? [] : whenPicks(new Date()).map((p) => {
+      const b = el("button", "verb-cancel when-pick", p.label);
+      b.type = "button"; b.dataset.pick = p.key; b.dataset.value = p.value;
+      b.addEventListener("click", () => submit(p.value));
+      all.push(b);
+      return b;
+    });
+    picksBox.append(...picks);
+    // an agenda (it holds a target) is undated never: flow refuses one, so "someday" is for a seed with no who chosen
+    const agenda = rowTarget(s) !== "";
+    if (agenda) clearBtn.hidden = true;
+    form.append(...(opts ? [] : [picksBox]), input, timeIn, zone, ...(back ? [back] : []), ...(!opts && who.node ? [who.node] : []), go, ...(opts ? [] : [clearBtn]), cancel, msg);
     host.appendChild(form);
-    input.focus();
+    // a touch screen's keyboard opens on a focused date input and covers the form: focus it only where a pointer, not a thumb, drives
+    if (!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches)) input.focus();
+    // the card clips what overflows it: bring the confirm row into the card's view
+    go.scrollIntoView({ block: "nearest" });
     const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
     cancel.addEventListener("click", close);
     form.addEventListener("keydown", (ev) => {
@@ -3443,18 +3617,144 @@
       if (!go.disabled) close();
     });
     const submit = async (value) => {
-      go.disabled = true; clearBtn.disabled = true; cancel.disabled = true;
+      const t = who.value();
+      if (t === false) { msg.className = "edit-msg err"; msg.textContent = "the machine's repo is a plain name (letters, digits, . _ -), or desk"; return; }
+      const retarget = t !== null && t !== rowTarget(s);
+      if (retarget && value === "") { msg.className = "edit-msg err"; msg.textContent = "a task for you or the machine needs a day"; return; }
+      for (const b of all) b.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
-      const res = await commit({ kind: "spore_surface_at", spore_id: s.id, surface_at: value });
-      if (res && res.ok) return;  // re-rendered
+      const res = opts && opts.post ? await opts.post(value) : await commit(retarget
+        ? { kind: "spore_retarget", spore_id: s.id, target: t, surface_at: value }
+        : { kind: "spore_surface_at", spore_id: s.id, surface_at: value });
+      if (res && res.ok) {   // re-rendered; a row that stays (or a redraw still to come) reads what was done
+        if (opts && opts.done) { msg.className = "edit-msg"; msg.textContent = opts.done(value); }
+        return;
+      }
       showFail(msg, res, "failed");
-      go.disabled = false; clearBtn.disabled = false; cancel.disabled = false;
+      if (res && res.error === "stale") {   // the row moved under this form: keep the words, retire the form (as the Edit path does)
+        if (opts && opts.stale) msg.textContent = opts.stale;
+        retireStaleForm(form);
+        return;
+      }
+      for (const b of all) b.disabled = false;
     };
     go.addEventListener("click", () => {
-      if (!input.value) { msg.className = "edit-msg err"; msg.textContent = "pick a date (or clear)"; return; }
-      submit(input.value);
+      if (!input.value) { msg.className = "edit-msg err"; msg.textContent = opts ? "pick a day" : "pick a day (or someday)"; return; }
+      const floor = opts ? (timeIn.value ? opts.minToday || opts.min : opts.min) : null;   // date-only: after today; timed: today, the host judges the minute
+      if (floor && input.value < floor) { msg.className = "edit-msg err"; msg.textContent = "pick a later day"; return; }
+      submit(timeIn.value ? input.value + "T" + timeIn.value : input.value);
     });
     clearBtn.addEventListener("click", () => submit(""));  // explicit clear: key present, value ""
+  }
+
+  // The four controls of a row that rings an intention (a reminder the desk or a schedule filed into the band): the same labels on
+  // the Decisions card and on the List's band row. Each posts the row's own offered action through the page's one write
+  // transport; the row is re-read after, so a snoozed, done or cleared one leaves. Done asks nothing; Clear asks once.
+  const INTENTION_CONTROLS = [["Snooze", "intention_snooze", "move it to a later day"], ["Edit", "intention_edit", "change its words"],
+    ["Done", "intention_done", "mark it done"], ["Clear", "intention_clear", "drop it for good"]];
+  const INTENTION_STALE = "this reminder changed: reload";
+  // the page's local calendar day `offset` days from today, YYYY-MM-DD (the date input's own form)
+  function localDayIso(offset) {
+    const d = new Date(); d.setDate(d.getDate() + offset);
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  }
+  function dayWords(iso) {
+    const d = new Date(iso.slice(0, 10) + "T00:00");
+    if (!Number.isFinite(d.getTime())) return iso;
+    return d.toLocaleDateString([], { weekday: "short" }) + " " + d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+  function intentionPost(rowId, verb, confirm) {
+    return async (req) => {
+      const T = window.LevainCockpitTransport;
+      if (!T || typeof T.rowVerb !== "function") return { ok: false, message: "this page cannot send that" };
+      const res = await T.rowVerb(rowId, verb, req || {}, confirm === true);
+      // what the host said it did is the page's notice (an edit's row stays, drawn with the new words)
+      const said = res && res.ok && res.data && typeof res.data.said === "string" ? res.data.said : "";
+      if (said && typeof T.notice === "function") T.notice(said);
+      return res;
+    };
+  }
+  function hasIntentionControls(actions) {
+    // the page's one write predicate (every other write control is gated on it): a render with no `commit` is read-only and draws none
+    return !!commit && Array.isArray(actions) && actions.some((a) => a && INTENTION_CONTROLS.some((c) => c[1] === a.verb));
+  }
+  // `text`: the reminder's own words (never the row's filed words); "" when the host sent none, and Edit then starts empty
+  function buildIntentionVerbs(rowId, actions, text) {
+    const wrap = el("span", "verb-actions intention-actions");
+    const words = typeof text === "string" ? text : "";
+    for (const [label, verb, title] of INTENTION_CONTROLS) {
+      const btn = verbBtn(label, title, async (ev) => {
+        if (verb === "intention_snooze") {
+          openSurfaceForm(wrap, { next: null }, { label: "snooze", post: (v) => intentionPost(rowId, verb)({ until: v }),
+            min: localDayIso(1), minToday: localDayIso(0), back: (v) => "comes back " + dayWords(v), done: (v) => "snoozed to " + dayWords(v), stale: INTENTION_STALE });
+          return;
+        }
+        if (verb === "intention_edit") {
+          openRowForm(wrap, () => {
+            const ta = el("textarea", "verb-edit-ta");
+            ta.value = words;
+            ta.rows = Math.min(16, Math.max(3, ta.value.split("\n").length, Math.ceil(ta.value.length / 56)));
+            ta.dataset.orig = ta.value;
+            return { nodes: [ta], focus: ta, ta };
+          }, (f, msg) => {
+            if (!f.ta.value.trim()) { msg.className = "edit-msg err"; msg.textContent = "text can't be empty"; return null; }
+            // only what the operator changed is written: an untouched field sends nothing
+            if (f.ta.value === f.ta.dataset.orig) { msg.className = "edit-msg"; msg.textContent = "nothing changed"; return null; }
+            return { text: f.ta.value };
+          }, "save", false, intentionPost(rowId, verb), INTENTION_STALE);
+          return;
+        }
+        if (verb === "intention_clear") {
+          const ask = words ? "Drop \u201c" + words.slice(0, 120) + (words.length > 120 ? "\u2026" : "") + "\u201d for good?" : "Drop this reminder for good?";
+          openRowForm(wrap, () => ({ nodes: [el("span", "muted", ask)], focus: null }),
+            () => ({}), "Clear", true, intentionPost(rowId, verb, true), INTENTION_STALE);
+          return;
+        }
+        const b = ev.currentTarget; b.disabled = true;
+        const res = await intentionPost(rowId, verb)({});
+        if (res && res.ok) return;  // the page re-reads and redraws without this row
+        b.disabled = false;
+        verbErr(wrap, res);
+        if (res && res.error === "stale") { const m = wrap.querySelector(".edit-msg"); if (m) m.textContent = INTENTION_STALE; }
+      });
+      btn.dataset.verb = verb;
+      wrap.appendChild(btn);
+    }
+    return gateByActions(wrap, actions);
+  }
+
+  // The who form: a row that already holds a target changes hands without touching its day (spore_retarget{target}).
+  function openWhoForm(host, s) {
+    if (host.querySelector(".verb-form")) return;
+    const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
+    const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
+    triggers.forEach((b) => (b.style.display = "none"));
+    const form = el("span", "verb-form who-form");
+    const who = whoControl(s);
+    const go = el("button", "verb-confirm", "set");
+    const cancel = el("button", "verb-cancel", "cancel");
+    go.type = "button"; cancel.type = "button";
+    const msg = el("span", "edit-msg", "");
+    form.append(who.node, go, cancel, msg);
+    host.appendChild(form);
+    const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
+    cancel.addEventListener("click", close);
+    form.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault(); ev.stopPropagation();
+      if (!go.disabled) close();
+    });
+    go.addEventListener("click", async () => {
+      const t = who.value();
+      if (t === false) { msg.className = "edit-msg err"; msg.textContent = "the machine's repo is a plain name (letters, digits, . _ -), or desk"; return; }
+      if (t === null || t === rowTarget(s)) { msg.className = "edit-msg err"; msg.textContent = "pick who does it"; return; }
+      go.disabled = true; cancel.disabled = true;
+      msg.className = "edit-msg busy"; msg.textContent = "…";
+      const res = await commit({ kind: "spore_retarget", spore_id: s.id, target: t });
+      if (res && res.ok) return;  // re-rendered
+      showFail(msg, res, "failed");
+      go.disabled = false; cancel.disabled = false;
+    });
   }
 
   // Shared inline-form scaffold for the per-row verbs (edit / reclassify / remove): hide the
@@ -3472,7 +3772,8 @@
     document.dispatchEvent(new CustomEvent("levain:editor-closed"));
   }
 
-  function openRowForm(host, buildFields, onConfirm, confirmLabel, danger) {
+  // `post` (the intention verbs): sends the request instead of the legacy write; `staleWords`: what a stale refusal reads as
+  function openRowForm(host, buildFields, onConfirm, confirmLabel, danger, post, staleWords) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
     const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
@@ -3498,10 +3799,10 @@
       if (!req) return;  // onConfirm set a validation message
       go.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
-      const res = await commit(req);
+      const res = await (post || commit)(req);
       if (res && res.ok) return;  // re-rendered
       showFail(msg, res, "failed");
-      if (res && res.error === "stale") { retireStaleForm(form); return; }
+      if (res && res.error === "stale") { if (staleWords) msg.textContent = staleWords; retireStaleForm(form); return; }
       go.disabled = false; cancel.disabled = false;
     });
   }
@@ -3549,19 +3850,8 @@
     }, "save", false);
   }
 
-  // Inline reclassify — change a forming Tray item's type (spore_update{type}; the server
-  // gates it to forming items, locks at metabolize).
-  function openReclassify(host, s) {
-    openRowForm(host, () => {
-      const sel = el("select", "verb-kind");
-      for (const t of ["task", "question", "thought"]) { const o = el("option", null, t); o.value = t; sel.appendChild(o); }
-      if (s.type) sel.value = s.type;
-      return { nodes: [sel], focus: sel, sel };
-    }, (f) => ({ kind: "spore_update", spore_id: s.id, type: f.sel.value }), "reclassify", false);
-  }
-
   // A freeform capture box. `submit` builds the request from the typed text. Used by the
-  // Tray dump (with a type dropdown). No own label — it mounts right
+  // Tray dump (no type is asked for). No own label — it mounts right
   // under the panel's title (Tray (X)), like the content of every other panel;
   // the placeholder carries the purpose hint.
   function buildCaptureBox(placeholder, btnLabel, emptyMsg, withType, buildReq, sortEntity) {
@@ -3570,18 +3860,7 @@
     ta.placeholder = placeholder; ta.title = "⌘/Ctrl+Enter sends"; ta.rows = 2;
     box.appendChild(ta);
     const controls = el("div", "tray-dump-controls");
-    let sel = null;
-    if (withType) {
-      // "let <entity> sort" omits type → the server defaults (thought + AI routes it). The
-      // operator classifies only when they want to; the AI/default is the fallback. The
-      // entity name is install-specific (flow / Chip / …), so derive it — never hardcode.
-      sel = el("select", "tray-dump-type");
-      for (const [val, lbl] of [["", `let ${sortEntity} sort`], ["task", "task"],
-                                ["question", "question"], ["thought", "thought"]]) {
-        const o = el("option", null, lbl); o.value = val; sel.appendChild(o);
-      }
-      controls.appendChild(sel);
-    }
+    // no type is asked for: the server defaults it and the entity sorts the line (the dump is "let <entity> sort")
     const go = el("button", "tray-dump-btn", btnLabel);
     go.type = "button";
     const msg = el("span", "edit-msg", "");
@@ -3590,7 +3869,7 @@
       if (!text) { msg.className = "edit-msg err"; msg.textContent = emptyMsg; return; }
       go.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
-      const res = await commit(buildReq(text, sel && sel.value));
+      const res = await commit(buildReq(text));
       if (res && res.ok) return;  // re-rendered → fresh panel carrying the new item
       go.disabled = false;
       showFail(msg, res, "failed");
@@ -3606,16 +3885,12 @@
   }
 
   // The Tray DUMP — the operator's primary capture (a `seed` is born, held out of
-  // cognition until triaged). The type dropdown lets them classify; default = let flow sort.
+  // cognition until triaged). The entity sorts it: no type is asked for.
   function buildTrayDump(entity) {
     return buildCaptureBox(
       `Drop anything. ${entity} sorts it.`,
-      "drop", "nothing to drop", true,
-      (text, type) => {
-        const req = { kind: "spore_seed", text };
-        if (type) req.type = type;  // omit → server default (thought + AI routes)
-        return req;
-      }, entity);
+      "drop", "nothing to drop", false,
+      (text) => ({ kind: "spore_seed", text }), entity);
   }
 
   // The destructive resolve form: a kind <select> (+ a ref <input> for ascend) and a
@@ -4841,6 +5116,8 @@
     offSlotMics(slot);
     const sv = (x) => (typeof x === "string" ? x : "");
     const open = q.state === "open";
+    // an open row that rings a reminder reads as the reminder's own words (what its Edit changes), not the words it was filed with
+    if (open && q.intention && b && !b.error && sv(b.intention_text)) b = Object.assign({}, b, { what: b.intention_text });
     const cli = "levain question show " + q.n;   // the options are listed there; answer with: levain question answer N --option KEY
     if (receipt && card && (b.error || !(b.answer && typeof b.answer === "object"))) {
       // a settled card is a receipt whatever the read did: a failed read or a missing answer never brings back the options, the
@@ -4895,6 +5172,20 @@
     if (a) {
       parts.push(el("div", "consent-note ext-meta", answerLine(a, options)));
       slot.replaceChildren(...parts);
+      return;
+    }
+    if (open && q.intention && hasIntentionControls(q.intentionActions)) {
+      // a row that rings an intention is acted on by its four controls, in place of any answer box or signature
+      const wrap = buildIntentionVerbs(q.id, q.intentionActions, b ? sv(b.intention_text) : "");     // never the filed words
+      if (card) {
+        const bottom = el("div", "needs-actions needs-qa needs-intention");
+        bottom.appendChild(wrap);
+        slot.replaceChildren(...parts);
+        card.appendChild(bottom);
+      } else {
+        parts.push(wrap);
+        slot.replaceChildren(...parts);
+      }
       return;
     }
     if (open && q.sign) {
@@ -5095,7 +5386,10 @@
       if (typeof it.later === "string" && it.later) {     // snoozed (row 131): one collapsed LATER line, number kept, no answer controls
         const lrow = el("div", "row consent-row band-row band-later");
         lrow.setAttribute("data-band-row", String(it.n));
-        lrow.appendChild(el("span", "ext-meta", "LATER " + (typeof it.later_label === "string" && it.later_label ? it.later_label : String(it.n) + " " + it.later) + " · " + (typeof it.what === "string" ? it.what.slice(0, 80) : "")));
+        const lline = el("span", "ext-meta", "");      // the words wrap around the LATER tag; the tag itself stays on one line
+        lline.append(el("span", "later-tag", "LATER " + (typeof it.later_label === "string" && it.later_label ? it.later_label : String(it.n) + " " + it.later)),
+                     " · " + (typeof it.what === "string" ? it.what.slice(0, 80) : ""));
+        lrow.appendChild(lline);
         kids.push(lrow);
         continue;
       }
@@ -7041,7 +7335,7 @@
     if (host.dataset.sig === sig && !host.hidden) return;
     // the answered cards are drawn under a quiet label of their own; with nothing waiting that is all the strip holds
     // folded by default (Phill 11-02): a count under a label you click to open; the cards stay in the page, hidden, so the
-    // strip's signature and the settled-card tick are unchanged. Per viewer and per browser, like the Tray's held toggle.
+    // strip's signature and the settled-card tick are unchanged. Per viewer and per browser.
     const answeredSection = () => {
       const sec = el("div", "needs-answered");
       const toggle = el("button", "needs-answered-toggle");
@@ -9168,6 +9462,8 @@
     modalPending = null;
     modalAwaiting = false;
     modalGen++;
+    // after the view's own state is reset, so a card that fails to draw never leaves the modal half-closed
+    if (listCardRedraw) { try { listCardRedraw(); } catch (e) { console.error(e); } }
     let rf = modalReturnFocus;
     modalReturnFocus = null;
     // a re-render of the widgets replaces the tile that opened the view: its successor is found by the panel id
@@ -9310,6 +9606,35 @@
     return false;
   }
 
+  // A focused text field also holds a passive RE-READ off (never a reorder or a Reset-layout, which keep the dirty-edit meaning
+  // above): the draw empties every region listed here, and a node removed from the page takes the keyboard with it. Only a field
+  // inside one of those regions counts (the drop box, the chat and the devices sit outside and survive the draw), and only while
+  // it holds text or took a key within the idle window, so a box merely left focused never freezes the board.
+  const FOCUS_REBUILT = "#board, #levain-modal, #ck-hero, #ck-brief, #ck-widgets, #ck-needs, #ck-notes";
+  const FOCUS_IDLE_MS = 10000;
+  // recency is kept per element: typing in one field (the chat, an earlier box) says nothing about a different field focused later
+  const fieldInputAt = typeof WeakMap !== "undefined" ? new WeakMap() : null;
+  if (fieldInputAt && typeof document !== "undefined" && document.addEventListener) {
+    const stamp = (e) => { if (e && e.target && typeof e.target === "object") fieldInputAt.set(e.target, Date.now()); };
+    document.addEventListener("input", stamp, true);
+    document.addEventListener("keydown", stamp, true);
+    document.addEventListener("change", stamp, true);
+  }
+  function focusHoldsRefresh() {
+    const a = document.activeElement;
+    if (!a || a === document.body || !a.closest || !a.closest(FOCUS_REBUILT)) return false;
+    const tag = a.tagName;
+    let text = false;
+    if (tag === "TEXTAREA" || (tag === "INPUT" && !/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(a.type || ""))) text = true;
+    else if (a.isContentEditable) text = true;
+    else if (tag !== "SELECT") return false;
+    if (text && String(a.isContentEditable ? a.textContent : a.value || "").trim() !== "") return true;
+    const at = fieldInputAt ? fieldInputAt.get(a) : 0;
+    return !!at && Date.now() - at < FOCUS_IDLE_MS;
+  }
+  // what holds a passive re-read off: an unsaved edit, or a field the person is in
+  function editHoldsRefresh() { return hasUnsavedEdit() || focusHoldsRefresh(); }
+
   // Export the entry points onto a namespace the surface shim calls. `jobsActive` lets the boot
   // layer DEFER a board reload while an async job is polling (a reload would detach the live result
   // box) — flushed via the injected onJobsIdle when the last job finishes (L3 codex MED).
@@ -9332,10 +9657,59 @@
   }
   // A reload (the tab coming back, the refresh button, a stream reload) re-renders the whole board: emptying it
   // clamps the page's scroll to the top, so the reader's place is put back once the board is drawn again.
+  // A draw that is allowed while a text field in a redrawn region has focus (an idle field, an empty one) replaces that field:
+  // the keyboard would fall to <body>. So the field is known before the draw by the keys the page already finds rows by
+  // (the region id; data-ck-panel / data-panel-id, data-row-key / data-keep-key, data-question-n, data-id, data-drop-key; the field's own id),
+  // and its rebuilt twin takes the focus, the selection and the scroll back. A field with no twin is gone by design.
+  const FIELD_KEYS = ["data-ck-panel", "data-panel-id", "data-row-key", "data-keep-key", "data-question-n", "data-id", "data-drop-key"];
+  const isTextField = (a) => !!a && a.tagName && (a.tagName === "TEXTAREA" ||
+    (a.tagName === "INPUT" && !/^(button|submit|reset|checkbox|radio|file|image|range|color)$/i.test(a.type || "")));
+  const cssq = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/[^\w-]/g, "\\$&"));
+  let fieldWarned = false;
+  const fieldWarn = (e) => { if (!fieldWarned) { fieldWarned = true; try { console.warn("focus keep skipped:", e); } catch (x) { /* no console */ } } };
+  // a type with no selection (email, number, date...) throws on the read and on the write: neither may break a draw
+  const selOf = (a) => { try { return [a.selectionStart, a.selectionEnd]; } catch (e) { return [null, null]; } };
+  function captureField() {
+    try {
+      const a = document.activeElement;
+      if (!isTextField(a) || !a.closest) return null;
+      const region = a.closest(FOCUS_REBUILT);
+      if (!region || !region.id) return null;
+      const [ss, se] = selOf(a);
+      const base = { nth: 0, region: region.id, ss, se, st: a.scrollTop, el: a };
+      if (a.id) return Object.assign(base, { sel: "#" + cssq(a.id) });
+      const path = [];
+      for (let n = a.parentElement; n && n !== region; n = n.parentElement) {
+        for (const k of FIELD_KEYS) {
+          const v = n.getAttribute && n.getAttribute(k);
+          if (v !== null && v !== undefined && v !== "") { path.unshift("[" + k + "=\"" + String(v).replace(/["\\]/g, "\\$&") + "\"]"); break; }
+        }
+      }
+      const cls = (a.className && typeof a.className === "string" ? a.className.split(/\s+/).filter(Boolean) : []).map((c) => "." + cssq(c)).join("");
+      const tail = a.tagName.toLowerCase() + cls;
+      const scope = "#" + cssq(region.id) + (path.length ? " " + path.join(" ") : "");
+      const same = Array.from(region.querySelectorAll(path.length ? path.join(" ") + " " + tail : tail));
+      return Object.assign(base, { sel: scope + " " + tail, nth: same.indexOf(a) });
+    } catch (e) { fieldWarn(e); return null; }
+  }
+  // Focus, selection and scroll only: the value is never put back (a write that cleared the field must stay cleared).
+  function restoreField(f) {
+    try {
+      if (!f || document.activeElement === f.el && f.el.isConnected) return;
+      let t = null;
+      try { const all = document.querySelectorAll(f.sel); t = all[Math.max(0, f.nth)] || (f.nth < 0 ? all[0] : null) || null; } catch (e) { t = null; }
+      if (!t || !isTextField(t)) return;
+      t.focus({ preventScroll: true });
+      try { if (f.ss !== null && f.ss !== undefined) t.setSelectionRange(f.ss, f.se); } catch (e) { /* a type with no selection */ }
+      if (f.st) t.scrollTop = f.st;
+    } catch (e) { fieldWarn(e); }
+  }
   function renderKeepingPlace(view, opts) {
     const y = window.scrollY || 0;
+    const field = captureField();
     try { return render(view, opts); }
     finally {
+      restoreField(field);
       if (y > 0 && window.scrollY !== y) window.scrollTo(window.scrollX, y);
       ckScheduleRefresh();   // what the draw left on screen (the tab, the jobs) decides which moves are live
     }
@@ -10516,5 +10890,5 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

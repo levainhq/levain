@@ -775,8 +775,10 @@ def test_r3_u5_doctor_asks_claude_code_its_version_once_per_run(make_install, tm
     fake = tmp_path / "fakebin"
     fake.mkdir()
     count = tmp_path / "version-reads"
-    (fake / "claude").write_text(f"#!/bin/sh\necho x >> '{count}'\necho '2.1.300 (Claude Code)'\n",
-                                 encoding="utf-8")
+    # only a `--version` ask is counted: the setting-sources row launches the binary again (its own probe, not a read)
+    (fake / "claude").write_text(
+        f"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo x >> '{count}'; fi\necho '2.1.300 (Claude Code)'\n",
+        encoding="utf-8")
     (fake / "claude").chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ.get('PATH', '')}")
     doctor.run_doctor(cc)

@@ -12,6 +12,7 @@ _EXPECTED = frozenset({
     ("coord", "questions"), ("coord", "answer"), ("coord", "escalate"),
     ("coord", "away"), ("coord", "budget"), ("coord", "morning"),
     ("coord", "reply"), ("coord", "spawn"),
+    ("coord", "report"), ("coord", "import-status"), ("coord", "apply-reports"), ("coord", "reports"),
     ("coord", "handoff", "worker"), ("coord", "log"),
     ("coord", "open"), ("coord", "close"), ("coord", "handoff", "show"),
     ("coord", "ready", "show"), ("coord", "ready", "add"), ("coord", "ready", "move"), ("coord", "ready", "correct"),

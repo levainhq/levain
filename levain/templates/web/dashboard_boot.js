@@ -397,7 +397,9 @@
   // `headers` is the SAME read-header function the reads above use, so the change stream (a fetch read that
   // cannot go through res.json()) carries the same credential; `reload` is the board's one passive re-read and
   // resolves true only once a board was drawn (false: deferred by an edit or a load in flight, or it failed).
-  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }), rowActions, rowVerb };
+  // notice: a verb's own words for the status line, after its write has redrawn the page (the intention controls' "said")
+  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }), rowActions, rowVerb,
+    notice: (text) => status(String(text).slice(0, 200)) };
 
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
   // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
@@ -439,6 +441,14 @@
   // timeout runs the check after that handler)
   document.addEventListener("click", function () { setTimeout(flushIfIdle, 0); }, true);
   document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") setTimeout(flushIfIdle, 0); }, true);
+  // leaving a field lifts the focus block on a deferred read (the timeout lets focus settle on its next target first)
+  // (a pointer still down means the blur is the start of a click on something: that click's own flush runs after it, so the target
+  // is never torn out between the press and the release)
+  let pointerDown = false;
+  document.addEventListener("pointerdown", function () { pointerDown = true; }, true);
+  document.addEventListener("pointerup", function () { pointerDown = false; }, true);
+  document.addEventListener("pointercancel", function () { pointerDown = false; }, true);
+  document.addEventListener("focusout", function () { if (!pointerDown) setTimeout(flushIfIdle, 0); }, true);
   function flushIfIdle() { if (deferredReload && !inflight && !editInProgress()) flushDeferred(); }
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and
@@ -453,9 +463,22 @@
   // consult this, so a false "editing" merely defers a harmless re-read; it never blocks
   // save or the initial boot (both passive:false).
   function editInProgress() {
-    if (!window.LevainDashboard || typeof window.LevainDashboard.hasUnsavedEdit !== "function") return true;
-    return window.LevainDashboard.hasUnsavedEdit();
+    const d = window.LevainDashboard;
+    if (d && typeof d.editHoldsRefresh === "function") return d.editHoldsRefresh();
+    if (!d || typeof d.hasUnsavedEdit !== "function") return true;
+    return d.hasUnsavedEdit();
   }
+  // A passive read refused for an edit or a field in use stays OWED: the latch is set here, so every caller (the refresh button,
+  // the tab coming back, a stale re-read) is flushed by the same release, and a timer checks again once a focus-only hold has aged out.
+  let idleT = 0;
+  const IDLE_RECHECK_MS = 10250;
+  function refuseForEdit(msg) {
+    status(msg || "editing — refresh deferred");
+    deferredReload = true;
+    refuseArm();
+    return false;
+  }
+  function refuseArm() { if (!idleT) idleT = setTimeout(function () { idleT = 0; flushIfIdle(); if (deferredReload) refuseArm(); }, IDLE_RECHECK_MS); }
 
   // DATA SOURCE (cockpit design §7). The page draws from the kernel's cockpit manifest + panel routes
   // (cockpit_view.js maps them onto the same components) and writes through /cockpit/verb (postVerb
@@ -550,8 +573,8 @@
     WAITING: "Waiting for your signature.",
     applying: "Still saving."
   };
-  // The page never shows the server's own text for a refusal: it can carry a path or an OS error. A code not listed here
-  // says only its code.
+  // The page never shows the server's own text for a refusal: it can carry a path or an OS error (the one exception is
+  // SNOOZE_REFUSALS, below). A code not listed here says only its code.
   const FAULT_WORDS = {
     stale: "That changed somewhere else first. Reload to see the new version.",
     needs_intent: "This needs a fresh confirmation. Try again.",
@@ -587,6 +610,7 @@
     sign_required: "That is sent only after your passkey signs it; nothing was sent. Send it again.",
     credential_required: "Saving needs the write token for this page. Open the page from the link that carries it."
   };
+  const SNOOZE_REFUSALS = new Set(["pick a time after now", "pick a later day", "pick a day: that date could not be read"]);
   // Only a landed state is silent; a state this page does not know speaks too (never a quiet failure). Own-property lookups:
   // a state or code named "constructor" must not index into Object.prototype.
   function resultWords(state) {
@@ -597,7 +621,11 @@
   function fault(r, what) {
     const d = r.data || {};
     const code = d.error || "HTTP " + r.status;
-    const text = (Object.prototype.hasOwnProperty.call(FAULT_WORDS, code) && FAULT_WORDS[code]) || "That did not go through (" + code + ").";
+    let text = (Object.prototype.hasOwnProperty.call(FAULT_WORDS, code) && FAULT_WORDS[code]) || "That did not go through (" + code + ").";
+    // a snooze's own refusal of the day or minute the operator typed: the host's three plain sentences, shown as sent so the
+    // form says what to change. Only these exact sentences, only on that verb: any other bad_request keeps the fixed line.
+    if (code === "bad_request" && r.status === 400 && what && what.verb === "intention_snooze" && typeof d.message === "string"
+        && SNOOZE_REFUSALS.has(d.message)) text = d.message;
     if (REREAD.has(code) || r.status === 501) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
@@ -648,7 +676,7 @@
   }
 
   async function fire(base, head, label, action, fpKey, txn) {
-    const what = { row_id: base.row_id, label: label };
+    const what = { row_id: base.row_id, label: label, verb: base.verb };
     // A T2+ fire (or an idempotent or signed verb's) carries one key, minted for this request and kept with the whole
     // envelope until the kernel answers. A kept envelope is sent again BEFORE any new dry run: the write it
     // carries may have landed and moved the row, and only a replay under its own key gets that answer back.
@@ -959,7 +987,7 @@
       return false;
     }
     // Pre-fetch fast path: don't even fetch if we already know an edit is open.
-    if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
+    if (passive && editInProgress()) return refuseForEdit();
     inflight = true;
     inflightAt = Date.now();
     inflightPassive = passive;
@@ -970,7 +998,7 @@
       if (useManifest) {
         const mview = await loadManifestView(passive);
         if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
-        if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
+        if (passive && editInProgress()) { notice = null; return refuseForEdit(); }
         writeTokenRequired = mview.write_token_required === true;
         const liveBefore = live;
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };   // published before the draw: an open detail rebuilds inside render and must read THIS read's actions
@@ -999,7 +1027,7 @@
         // below, so a background token-403 can't steal focus from in-progress text (complement L3
         // FIND-1 / the spore-108 "passive never disrupts an edit" invariant). The next explicit
         // boot/save load (passive:false) re-prompts.
-        if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
+        if (passive && editInProgress()) return refuseForEdit();
         if (promptForToken()) res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
         if (res.status === 403) {
           // Still refused after the retry (wrong/rotated token, or the operator cancelled): drop the
@@ -1018,7 +1046,7 @@
       // Post-fetch race re-check (codex L3 HIGH): a passive load that STARTED clean, then
       // the operator opened/typed an editor WHILE this fetch was in flight — rebuilding
       // now would still discard it. The save path (passive:false) always applies.
-      if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
+      if (passive && editInProgress()) return refuseForEdit();
       // Track whether THIS surface demands the write token so commit()'s writeHeaders attaches it.
       // True on any writable surface (K2a), false on a read-only one.
       writeTokenRequired = view.write_token_required === true;

@@ -181,7 +181,7 @@
     return Object.assign({
       id: bare(row.id), age: ageOf(row), age_days: Number.isInteger(f.age_days) ? f.age_days : null, type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
       disposition: f.disposition, text: rowTextOf(row, f),
-      support: LIST_SURFACES.indexOf(f.surface) >= 0 && (f.surface === "band" || f.surface === "board") && row.title && row.body && row.title !== row.body ? row.body : null, next: f.due || null, held: f.held === true, today: typeof today === "string" ? today : null,
+      support: LIST_SURFACES.indexOf(f.surface) >= 0 && (f.surface === "band" || f.surface === "board") && row.title && row.body && row.title !== row.body ? row.body : null, next: f.due || null, today: typeof today === "string" ? today : null,
       descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
       // the List's facets (a panel that sends no `surface` is the old Tray and draws as before): which store the row comes from
@@ -195,22 +195,24 @@
       band_section: f.band_section === "desk" || f.band_section === "you" ? f.band_section : null,
       carried: f.band_carried === true,
       band_age: typeof f.band_age === "string" && f.band_age ? f.band_age : null,
+      intention: typeof f.intention === "string" && f.intention ? f.intention : null,
+      intention_text: typeof f.intention_text === "string" ? f.intention_text : "",
+      // the List's time-state, as the kernel computed it: the page draws these and derives none of them
+      time_state: ["now", "later", "someday", "done"].indexOf(f.time_state) >= 0 ? f.time_state : null,
+      wake_line: typeof f.wake_line === "string" && f.wake_line ? f.wake_line : null,
+      wake_bucket: ["tomorrow", "week", "later"].indexOf(f.wake_bucket) >= 0 ? f.wake_bucket : null,
+      done_on: typeof f.done_on === "string" && f.done_on ? f.done_on : null,
+      done_kind: typeof f.done_kind === "string" && f.done_kind ? f.done_kind : null,
       repo: typeof f.repo === "string" && f.repo ? f.repo : null, board_tier: typeof f.board_tier === "string" && f.board_tier ? f.board_tier : null,
     }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }
-
-  // the reason the Tray gives for a spore it holds until its surface date
-  const HELD_REASON = "surface date not reached";
 
   // a stale or partial panel keeps rendering its rows, under a banner saying so
   function bannerOf(head, panel, now) {
     const out = [];
     if (head.status === "stale") out.push({ tone: "stale", text: "STALE: last read " + (ageLabel(head.as_of, now, "") || "unknown") });
     if (head.status === "partial") for (const s of head.skipped || []) out.push({ tone: "stale", text: "PARTIAL: " + s.count + " unreadable — " + s.reason });
-    // a panel that lists its held rows draws that line itself, as the control that shows them
-    const held = Array.isArray(panel.held) && panel.held.length > 0;
     for (const f of head.filtered || []) {
-      if (held && f.reason === HELD_REASON) continue;
       out.push({ tone: "dim", text: f.count + " held back — " + f.reason });
     }
     // an optional source never seen says so once, in the panel's empty sentence: its "not configured: ..." note adds nothing over no rows
@@ -375,7 +377,10 @@
                             carried: f.question_carried === true,
                             later: typeof f.question_later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(f.question_later) ? f.question_later : "",
                             laterWords: typeof f.question_later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(f.question_later) && typeof f.question_later_words === "string" && f.question_later_words.length <= 40 ? f.question_later_words : "",
-                            sign: signOf(f) };
+                            sign: signOf(f),
+                            // the spore a row rings, and only the actions the kernel offered on it: the four controls draw from these
+                            intention: typeof f.question_intention === "string" && f.question_intention ? f.question_intention : "",
+                            intentionActions: (Array.isArray(r.actions) ? r.actions : []).filter((a) => a && typeof a.verb === "string" && a.verb.indexOf("intention_") === 0) };
         }
         // a coordinator review item: its state, whether it is "yours to clear", and the one verb the kernel offers on it
         // here (review_clear on a plain open item, review_reopen on a cleared one), drawn as a button on the row
@@ -470,10 +475,12 @@
       // (LevainBoardView.boardModel); the counts ride as one line for the jump box and a touch reader. Read-only: no verb, no write box.
       need(Array.isArray(v.columns) && v.columns.every((c) => isObj(c) && typeof c.category === "string" && Array.isArray(c.cards)
         && c.cards.every((k) => isObj(k) && typeof k.id === "string")), "board columns");
-      const total = v.columns.reduce((n, c) => n + c.cards.length, 0);
+      // the counts are of the cards the board draws (the board view's one visibility rule); a page without the view counts them all
+      const BV = root.LevainBoardView, seen = (c) => (BV && typeof BV.visibleCards === "function" ? BV.visibleCards(c.cards) : c.cards);
+      const total = v.columns.reduce((n, c) => n + seen(c).length, 0);
       out.board = v;
       out.typed = true;
-      out.lines = [{ meta: "board", text: total + " cards · " + v.columns.map((c) => c.category + " " + c.cards.length).join(" · ") }];
+      out.lines = [{ meta: "board", text: total + " cards · " + v.columns.map((c) => c.category + " " + seen(c).length).join(" · ") }];
     } else if (kind === "form") {
       need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
       out.form = { fields: v.fields, verb: typeof v.verb === "string" ? v.verb : "" };
@@ -661,7 +668,7 @@
     const hiddenRows = new Set();
     for (const key of Object.keys(raw.panels || {})) {
       const rp = raw.panels[key];
-      for (const r of (isObj(rp) ? (Array.isArray(rp.rows) ? rp.rows : []).concat(Array.isArray(rp.held) ? rp.held : []) : [])) {
+      for (const r of (isObj(rp) ? (Array.isArray(rp.rows) ? rp.rows : []) : [])) {
         if (!isObj(r) || typeof r.id !== "string") continue;
         if (r.text_hidden === true) hiddenRows.add(visible(r.id));
       }
@@ -787,26 +794,20 @@
       // what this panel lets the operator do: its own actions (a create, a value write, a downstream verb)
       // and the actions its rows carry. The page offers a verb only where the kernel offered one.
       const pActions = Array.isArray(panel.actions) ? panel.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
-      const heldRows = nat === "tray" && Array.isArray(panel.held) ? panel.held : [];
-      const rowsAct = rows.concat(heldRows).some((r) => r && Array.isArray(r.actions) && r.actions.length);
+      const rowsAct = rows.some((r) => r && Array.isArray(r.actions) && r.actions.length);
       // the List's stable marker: the panel itself offers the intake action (never inferred from what its rows carry)
       if (nat === "tray" && pActions.some((a) => a.verb === "list_intake")) view.tray_is_list = true;
       if (pActions.length) {
         const pv = isObj(panel.value) && typeof panel.value.value_version === "string" ? panel.value.value_version : null;
         view.targets.panels[pid] = { actions: pActions, panel_version: pv };
       }
-      for (const r of rows.concat(heldRows)) if (r && typeof r.id === "string" && Array.isArray(r.actions) && r.actions.length) {
+      for (const r of rows) if (r && typeof r.id === "string" && Array.isArray(r.actions) && r.actions.length) {
         view.targets.rows[r.id] = targetOf(pid, r);
       }
       if ((rowsAct || pActions.length) && (nat === "tray" || nat === "loops" || nat === "episodes")) entry.edit_class = "B";
       const lists = { tray: "tray", loops: "open_spores" };
       if ((nat === "tray" || nat === "loops") && (panel.kind === "triage-list" || panel.kind === "list")) {
         view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows, panel.today));
-        if (heldRows.length) {
-          view.tray_held = heldRows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows, panel.today));
-          const hf = (head.filtered || []).find((f) => f && f.reason === HELD_REASON);
-          view.tray_held_line = { count: hf && isNum(hf.count) ? hf.count : heldRows.length, reason: HELD_REASON };
-        }
         if (nat === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
           // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
           const named = head.views.filter((v) => isObj(v) && typeof v.id === "string" && Array.isArray(panel.view_rows[v.id]));
@@ -1907,7 +1908,8 @@
       for (const k of s.carry.open) kept.open.add(k);
       for (const [k, v] of s.carry.scroll) if (!kept.scroll.has(k)) kept.scroll.set(k, v);
     }
-    paint(s);
+    const field = core && core.captureField ? core.captureField() : null;   // a focused field in a repainted body keeps its place, as in a board draw
+    try { paint(s); } finally { if (core && core.restoreField) core.restoreField(field); }
     if (s.body.querySelector && s.body.querySelector(".row")) s.carry = null;
     if (core && core.settleKept) core.settleKept(host, kept);
     else if (core && core.measureClauses) core.measureClauses(host);   // a core without the keeper still re-measures its rows

@@ -613,3 +613,33 @@ def test_a_run_pins_its_staged_change_set(lwp) -> None:  # noqa: F811
                          "FROM run_records WHERE job_id = ? AND run = 0", (job.id,))
     finally:
         conn.close()
+
+
+def _message(world, tmp_path, monkeypatch, **extra) -> str:
+    job = file_job(world)
+    key = world["phone"]
+    with _serve(world, tmp_path) as (url, httpd):
+        _recommended(httpd, job, {**_card(_changes(2), signers=[key.fp]), **extra}, monkeypatch)
+        (row,) = _call(url, "/cockpit/dispatch.json")[1]["requests"]
+    return row["message"]
+
+
+def test_the_sheet_text_names_the_changed_agent_settings_before_the_authorise_line(world, tmp_path, monkeypatch) -> None:
+    msg = _message(world, tmp_path, monkeypatch, agent_config=[".claude/settings.json", "sub/CLAUDE.md"])
+    assert "AGENT SETTINGS CHANGED (2)" in msg and "\n  .claude/settings.json\n  sub/CLAUDE.md" in msg, msg
+    assert msg.index("AGENT SETTINGS CHANGED") < msg.index("Authorise run 1 onto main"), msg
+    assert "(and " not in msg
+
+
+def test_the_sheet_text_counts_the_agent_config_paths_past_the_cap(world, tmp_path, monkeypatch) -> None:
+    msg = _message(world, tmp_path, monkeypatch, agent_config=["a/CLAUDE.md"], agent_config_overflow=4)
+    assert "AGENT SETTINGS CHANGED (5)" in msg and "  (and 4 more)" in msg, msg
+
+
+def test_the_sheet_text_says_when_the_agent_settings_check_was_unavailable(world, tmp_path, monkeypatch) -> None:
+    msg = _message(world, tmp_path, monkeypatch, agent_config_problem="ImportError: gone")
+    assert "AGENT SETTINGS CHECK UNAVAILABLE" in msg and "AGENT SETTINGS CHANGED" not in msg, msg
+
+
+def test_the_sheet_text_has_no_agent_settings_item_for_an_ordinary_change(world, tmp_path, monkeypatch) -> None:
+    assert "AGENT SETTINGS" not in _message(world, tmp_path, monkeypatch)

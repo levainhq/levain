@@ -22,6 +22,7 @@ import levain.consent.sign as sign_mod
 import levain.web_server as ws
 from levain.cli import main
 from levain.consent.sign import Signer
+from levain.webpush import needs
 from tests.test_cockpit_k2a import _install
 
 HOST = "box.example"
@@ -288,16 +289,18 @@ def test_the_signing_line_says_sheets_off_for_another_queue(tmp_path: Path, monk
 # r1 finding 6: on the RUNNING server, not after the stop withdrew what it published
 
 
-def test_a_running_signing_server_has_published_only_its_origin_in_the_queue(tmp_path: Path,
+def test_a_running_signing_server_has_published_only_its_origin_and_its_needs_count_in_the_queue(tmp_path: Path,
                                                                             monkeypatch: pytest.MonkeyPatch) -> None:
     root = _install(tmp_path)[0]
     q = _queue(tmp_path)
     with _running(root, monkeypatch, write=True, sign_queue_dir=q, sign_host=HOST):
-        # while up: exactly the published origin (an empty queue has no orphaned attempt to settle)
-        assert sorted(p.name for p in q.rglob("*")) == ["cockpit-origin.json"]
+        # while up: exactly the published origin and the needs count the badge reads (an empty queue has no orphaned
+        # attempt to settle)
+        assert sorted(p.name for p in q.rglob("*")) == sorted(["cockpit-origin.json", needs.COUNT_FILE])
         assert json.loads((q / "cockpit-origin.json").read_text()) == {"cockpit_origin": f"https://{HOST}"}
-    # stopped: the stop withdrew its own origin and nothing else was ever made
-    assert sorted(p.name for p in q.rglob("*")) == []
+    # stopped: the stop withdrew its origin; the count record is never withdrawn (it ages out on its own freshness) and
+    # nothing else was ever made
+    assert sorted(p.name for p in q.rglob("*")) == [needs.COUNT_FILE]
 
 
 # --- r1 finding 2: the queue is validated, never created, before anything is built ---------------------------------

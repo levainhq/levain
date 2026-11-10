@@ -248,6 +248,13 @@ def later_of(store: Any, q: Any, n: int | None = None, now: datetime | None = No
     return _later_pair(q, n, today)
 
 
+def desk_owed(section: Any, carried: Any) -> bool:
+    """The one rule for a band row the desk alone owes: the host's section is ``desk`` and the row is not carried over to him.
+    The app badge, the board producer and the Board's JS filter (``board_view.js`` ``isDeskOwed``) all apply it; a row with no
+    section, or any other, is his."""
+    return section == "desk" and not carried
+
+
 def later_facets(store: Any, q: Any, now: datetime | None = None) -> tuple[str, str] | None:
     """``(day, words)`` for an open question snoozed past the store's local day (``words`` as :func:`later_words`), else
     ``None``. Runs :func:`later_of`, the one predicate; any fault is due, never hidden (the cockpit Needs strip's facets)."""
@@ -3443,7 +3450,10 @@ def run_band_snooze(args: argparse.Namespace) -> int:
     try:
         store = QuestionStore(args.queue_dir)
         qid = question_of_band_number(store, args.number)
-        got = store.snooze(qid, until=args.until, channel="cli", via="cli", note=getattr(args, "note", None))
+        install = getattr(args, "path", None)         # the install whose spore store the guard reads (default: this directory)
+        spores = Path(install).expanduser() / ".levain" / "memory.spores.json" if install else None
+        got = store.snooze(qid, until=args.until, channel="cli", via="cli", note=getattr(args, "note", None),
+                           spores_json=spores)
     except Exception as exc:
         print(f"levain band {verb}: refused: {exc}; nothing was recorded", file=sys.stderr)
         return EXIT_REFUSED
@@ -3477,6 +3487,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     sz.add_argument("--note", default=None, help="Your words, kept with the snooze.")
     sz.add_argument("--queue-dir", dest="queue_dir", type=Path, default=argparse.SUPPRESS,
                     help="The consent directory holding questions.db.")
+    sz.add_argument("--path", type=Path, default=Path.cwd(),
+                    help="The install whose spore store is checked: a row an open agenda there rings is snoozed by its spore.")
     sz.set_defaults(func=run_band_snooze)
     us = sub.add_parser("unsnooze", help="Bring a snoozed band row back now: it is due again.")
     us.add_argument("number", type=_band_number_arg, help="The band number, as the band shows it.")

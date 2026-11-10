@@ -10,9 +10,10 @@ modules and calls, and review beat each a new way (a parent-relative import, an 
 ``import_module``, ``pydoc.locate``), so the list now names what is allowed instead of what is not.
 Adding a stdlib module to the package means adding it here, on purpose, in review.
 
-Two modules outside the package are allowed, by name (``ALLOWED_OUTSIDE``): ``levain.trust_anchor``, the
-trust-anchor rule ``confirm`` uses, which root's route-map check runs without importing this package, and
-``levain.hands_live``, the hands user's liveness check and lock, which ws-git and the automation executor share.
+Modules outside the package are allowed by name (``ALLOWED_OUTSIDE``): ``levain.trust_anchor``, the
+trust-anchor rule ``confirm`` uses, which root's route-map check runs without importing this package;
+``levain.hands_live``, the hands user's liveness check and lock, which ws-git and the automation executor share;
+and ``levain.fsync_errnos``, the one set of errnos every ``F_FULLFSYNC`` flush falls back on (the journal reads it).
 Each is held to more than the package is: it may import ``ALLOWED_OUTSIDE_STDLIB`` roots and nothing of ``levain``.
 
 Also flagged: the builtin loader names (``__import__``, ``__builtins__``, ``exec``, ``eval``, a bare
@@ -47,7 +48,7 @@ ALLOWED_STDLIB = frozenset({
 # What the modules named in ALLOWED_OUTSIDE may import: kept apart so a stdlib module they need never
 # widens the closed package's own list above.
 ALLOWED_OUTSIDE_STDLIB = ALLOWED_STDLIB | frozenset({"shutil", "time"})
-ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor", "levain.hands_live"})
+ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor", "levain.hands_live", "levain.fsync_errnos"})
 _LOADER_NAMES = frozenset({"__import__", "__builtins__", "exec", "eval", "compile"})
 
 

@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from levain.dispatch import DispatchError
+from levain.fsync_errnos import FULLFSYNC_FALLBACK_ERRNOS
 
 __all__ = ["BUNDLE_ID_FORM", "HANDOFF_DIR", "HandoffDir", "HandoffRefused", "LOCK_NAME", "TEMP_DIR", "TEMP_GRACE_S",
            "CollectReport", "full_fsync", "is_bundle_id", "new_bundle_id"]
@@ -71,8 +72,6 @@ TEMP_DIR = ".tmp"
 TEMP_GRACE_S = 60
 _ACCESS_BY_OTHERS = 0o077
 _INSTALL_TRIES = 8
-_FALLBACK_ERRNOS = frozenset({errno.ENOTSUP, errno.EINVAL, errno.ENOTTY, errno.EOPNOTSUPP, errno.ENOSYS,
-                              errno.ENODEV})
 _fallback_logged = False
 
 
@@ -105,7 +104,8 @@ def _checked(bundle_id: object) -> str:
 def full_fsync(fd: int) -> str:
     """Flush ``fd`` to stable storage and name the call that did it: ``F_FULLFSYNC`` (which also flushes the drive's
     cache on macOS), or ``fsync`` where that call does not exist on this Python or this filesystem (logged once per
-    process). Every other error propagates: a failing disk is never reported as durable."""
+    process). Every other error propagates: a failing disk is never reported as durable (a filesystem that answers EIO
+    for an unsupported ``F_FULLFSYNC`` therefore fails the write, by intent)."""
     global _fallback_logged
     try:
         import fcntl
@@ -114,7 +114,7 @@ def full_fsync(fd: int) -> str:
     except AttributeError:
         why = "no F_FULLFSYNC on this Python"
     except OSError as exc:
-        if exc.errno not in _FALLBACK_ERRNOS:
+        if exc.errno not in FULLFSYNC_FALLBACK_ERRNOS:
             raise
         why = f"F_FULLFSYNC unsupported here ({errno.errorcode.get(exc.errno, exc.errno)})"
     if not _fallback_logged:

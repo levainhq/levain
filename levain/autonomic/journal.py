@@ -77,6 +77,7 @@ from typing import TYPE_CHECKING, Any
 
 from levain.autonomic.db import AutonomicDB
 from levain.autonomic.posture import Posture
+from levain.fsync_errnos import FULLFSYNC_FALLBACK_ERRNOS
 
 if TYPE_CHECKING:   # schema3 imports this module: its names are imported where they are used
     from levain.autonomic.schema3 import AutonomicStore3
@@ -290,21 +291,34 @@ def durable_fsync(fd: int) -> None:
         try:
             fcntl.fcntl(fd, full)
             return
-        except OSError:
-            pass   # a filesystem without it (some network mounts): fall back to fsync
+        except OSError as e:
+            # a filesystem without it (some network mounts) falls back to fsync; any other error (EIO) is a failed flush
+            if e.errno not in FULLFSYNC_FALLBACK_ERRNOS:
+                raise
     os.fsync(fd)
 
 
 def durable_replace(path: Path, text: str) -> None:
     """Atomically replace ``path`` with ``text`` so that, once this returns, a power loss cannot bring
     back the old contents: the temp file is flushed to disk before the rename and the directory after
-    it. The stores' at-most-once claims (a claimed pending, a claimed chain) rely on it."""
+    it. The stores' at-most-once claims (a claimed pending, a claimed chain) rely on it.
+
+    A failed flush of the temp file leaves ``path`` untouched and the temp removed. A failed flush of the
+    directory raises AFTER the rename: ``path`` then holds ``text`` (applied, not durable: a crash may
+    bring the old contents back), so an exception here does not mean the replace was not applied."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        durable_fsync(f.fileno())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            durable_fsync(f.fileno())
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     os.replace(tmp, path)
     dfd = os.open(path.parent, os.O_RDONLY)
     try:

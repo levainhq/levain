@@ -222,6 +222,36 @@ SEAM_SCHEMA: tuple[str, ...] = (
 )
 
 
+# The service role's writes (row 156 L2 F1): the fact tables, the item and journal rows a landed sha writes (the ready
+# triggers refuse a service row that changes anything else), its own lease rows and the store-wide sequence. Only
+# ``sessions_seen`` is ever updated (its last sighting moves forward) or deleted from (a long-unseen session pruned,
+# row 156 L3 C4). Everything else, and every other delete or schema change, is refused.
+_SERVICE_INSERTS = frozenset({"worker_attach", "report_refusals", "sessions_seen", "ready_items", "ready_journal",
+                              "lease_events", "gseq"})
+_SERVICE_UPDATES = frozenset({"sessions_seen"})
+_SERVICE_DELETES = frozenset({"sessions_seen"})
+_SERVICE_NEVER = frozenset(getattr(sqlite3, name) for name in (
+    "SQLITE_DELETE", "SQLITE_CREATE_INDEX", "SQLITE_CREATE_TABLE", "SQLITE_CREATE_TEMP_INDEX",
+    "SQLITE_CREATE_TEMP_TABLE", "SQLITE_CREATE_TEMP_TRIGGER", "SQLITE_CREATE_TEMP_VIEW", "SQLITE_CREATE_TRIGGER",
+    "SQLITE_CREATE_VIEW", "SQLITE_DROP_INDEX", "SQLITE_DROP_TABLE", "SQLITE_DROP_TEMP_INDEX", "SQLITE_DROP_TEMP_TABLE",
+    "SQLITE_DROP_TEMP_TRIGGER", "SQLITE_DROP_TEMP_VIEW", "SQLITE_DROP_TRIGGER", "SQLITE_DROP_VIEW", "SQLITE_ATTACH",
+    "SQLITE_DETACH", "SQLITE_ALTER_TABLE", "SQLITE_REINDEX", "SQLITE_CREATE_VTABLE", "SQLITE_DROP_VTABLE")
+    if hasattr(sqlite3, name))
+
+
+def _service_authorizer(action: int, arg1: str | None, _arg2: str | None, database: str | None,
+                        _source: str | None) -> int:
+    if action == sqlite3.SQLITE_INSERT:
+        ok = arg1 in _SERVICE_INSERTS and database == "main"
+    elif action == sqlite3.SQLITE_UPDATE:
+        ok = arg1 in _SERVICE_UPDATES and database == "main"
+    elif action == sqlite3.SQLITE_DELETE:
+        ok = arg1 in _SERVICE_DELETES and database == "main"
+    else:
+        ok = action not in _SERVICE_NEVER
+    return sqlite3.SQLITE_OK if ok else sqlite3.SQLITE_DENY
+
+
 def next_gseq(conn: sqlite3.Connection, now: str) -> int:
     """The next number of the store-wide sequence, taken inside the caller's writing transaction."""
     return conn.execute("INSERT INTO gseq (at) VALUES (?)", (now,)).lastrowid
@@ -493,7 +523,13 @@ class CoordStore:
     _SCHEMA: tuple[str, ...] = SCHEMA
 
     def __init__(self, directory: Path | str | None = None, *,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 role: str = "coordinator") -> None:
+        # ``role="service"`` (the board store's applier, :mod:`levain.coordinator.work_attach`) records facts only: every
+        # write that is not its own is refused in :meth:`_write`, the one door each of them goes through
+        if role not in ("coordinator", "service"):
+            raise CoordError(f"a store's role is coordinator or service, not {str(role)[:20]!r}")
+        self.role = role
         # the file, its format marker, its store_id and its directory rule are the dispatch store's: one owner
         self._jobs = JobStore(directory, clock=clock)
         self.directory = self._jobs.directory
@@ -518,13 +554,14 @@ class CoordStore:
         from levain.coordinator.seam_handoffs import SEAM_HANDOFF_SCHEMA
         from levain.coordinator.seam_open import OPEN_SCHEMA
         from levain.coordinator.teamdrafts import DRAFT_SCHEMA
+        from levain.coordinator.work_attach import WORK_SCHEMA
         from levain.coordinator.work_delta import OPERATOR_VIEWS_SCHEMA
 
         # the lease is checked by every opener's coordinator writes, so its tables are every opener's; C13's lifecycle
         # tables (ready items + their journal) are additive, IF NOT EXISTS, like every statement here
         return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA,
                 *((*LIFECYCLE_SCHEMA, *OPERATOR_VIEWS_SCHEMA, *SEAM_SCHEMA, *SEAM_HANDOFF_SCHEMA, *OPEN_SCHEMA,
-                  *INTAKE_SCHEMA, *MISSION_SCHEMA)
+                  *INTAKE_SCHEMA, *MISSION_SCHEMA, *WORK_SCHEMA)
                 if lifecycle else ()))
 
     def _connect(self, *, create: bool = True) -> sqlite3.Connection:
@@ -584,7 +621,11 @@ class CoordStore:
                 ensure_foreign_clear(conn)
                 _all_gseq(conn)
                 from levain.coordinator.lease import migrate_settings
+                from levain.coordinator.ready import migrate_item_facts
+                from levain.coordinator.work_attach import migrate_seen
                 migrate_settings(conn)
+                migrate_item_facts(conn)
+                migrate_seen(conn)
                 if rebuilt:
                     what = " and ".join(rebuilt)
                     broken = _dangling_after(conn, rebuilt)
@@ -694,11 +735,10 @@ class CoordStore:
             raise
         return conn
 
-    def coordinator_present(self) -> bool:
-        """Whether a coordinator store is here, read without making or migrating anything: the directory rule read
-        with ``lstat``, the file opened ``mode=ro`` and ``query_only``, True when it holds the coordinator's
-        ``threads`` table (an older format still counts: a writer brings it current). False for no directory, no file,
-        or a dispatch-only file; a directory that breaks the rule raises, as every opener's does."""
+    def _read_existing(self, sql_for) -> bool | None:
+        """The read-only look behind :meth:`coordinator_present` and :meth:`holds_coordinator`: False for no directory
+        or no file, else ``sql_for(names)`` run on a ``query_only`` connection (names: the tables in the file). The
+        directory rule is read with ``lstat``; one that breaks it raises, as every opener's does."""
         try:
             self._check_directory_readonly()
         except StoreAbsent:
@@ -718,9 +758,38 @@ class CoordStore:
             raise
         try:
             conn.execute("PRAGMA query_only = ON")
-            return "threads" in _names(conn)
+            return sql_for(conn, _names(conn))
         finally:
             conn.close()
+
+    def coordinator_present(self) -> bool:
+        """Whether a coordinator store is here, read without making or migrating anything: True when the file holds
+        the coordinator's ``threads`` table (an older format still counts: a writer brings it current). False for no
+        directory, no file, or a dispatch-only file. A drop makes that table too, so this says a store can take a
+        drop, not that a coordinator was ever in it (:meth:`holds_coordinator`)."""
+        return self._read_existing(lambda conn, names: "threads" in names)
+
+    def holds_coordinator(self) -> bool | None:
+        """Whether a coordinator was ever in this store, read as :meth:`coordinator_present` reads: a lease event, a
+        coordinator setting, or a coordinator launch recorded. True when one is recorded; False when the tables that
+        would hold one exist and hold none (a store a drop made); None when it cannot be told, because a table (or
+        the launches ``role`` column) predates this format. An unknown store is never read as an empty one. A file with
+        no ``threads`` table is not a coordinator store at all (a dispatch-only file, an aborted init): False."""
+        def held(conn: sqlite3.Connection, names: set[str]) -> bool | None:
+            if "threads" not in names:
+                return False
+            unknown = False
+            for table in ("lease_events", "coord_settings"):
+                if table not in names:
+                    unknown = True
+                elif conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    return True
+            if "launches" not in names or "role" not in {r[1] for r in conn.execute("PRAGMA table_info(launches)")}:
+                unknown = True
+            elif conn.execute("SELECT 1 FROM launches WHERE role = 'coordinator' LIMIT 1").fetchone() is not None:
+                return True
+            return None if unknown else False
+        return self._read_existing(held)
 
     def _schema_current(self, conn: sqlite3.Connection, *, base: bool = False) -> bool:
         """``base`` (every display's gate, and a non-creating write's): the lifecycle tables are ADDITIVE, so a store
@@ -753,6 +822,12 @@ class CoordStore:
         write moved (a thread's state, a detach, a beat of either kind). A write that rolls back reconciles nothing."""
         if by != "coordinator" and token is not None:
             raise CoordError("a lease token is the coordinator's; your own writes carry none")
+        # THE ROLE SPLIT (ruled 11-08): a service-role store records facts, never decides. Every decide-class write
+        # (a ready add/move/correct, a thread's state, a lease claim, a review clear) goes through here under its own
+        # ``by``, so the check is at the point of use, before the lease is looked at
+        if self.role == "service" and by != "service":
+            raise CoordError("the service records facts only: a write that decides (assign, move, close, claim) is "
+                             "the coordinator's, and no state was written")
         with write_transaction(lambda: self._connect(create=create)) as conn:
             if not create and not self._schema_current(conn, base=True):
                 raise StoreAbsent(f"{self.path} does not hold the coordinator's current tables")
@@ -762,7 +837,19 @@ class CoordStore:
 
                 # the write and its record commit together: a write that rolls back leaves no "it wrote" behind
                 record_write(conn, now, fence(conn, now, token))
-            yield conn, now
+            if self.role != "service":
+                yield conn, now
+            else:
+                # the role split keyed on WHAT a statement writes, not on the ``by`` it was called with (row 156 L2
+                # F1): SQLite asks before it prepares each statement, so any write but a fact's is refused
+                conn.set_authorizer(_service_authorizer)
+                try:
+                    yield conn, now
+                except sqlite3.DatabaseError as exc:
+                    if "not authorized" not in str(exc):
+                        raise
+                    raise CoordError("the service records facts only: that statement writes something a fact never "
+                                     "does, and no state was written") from exc
         self._keep_awake()
 
     def _keep_awake(self) -> None:
@@ -1170,12 +1257,19 @@ class CoordStore:
             return lease.claim_spawn(conn, now, launch_id, pid)
 
     def launch_request(self, token: int, *, harness: str, role: str = "worker", threads: Sequence[str] = (),
-                       model: str | None = None, cwd: str | None = None, role_ref: str | None = None) -> Any:
-        from levain.coordinator import lease
+                       model: str | None = None, cwd: str | None = None, role_ref: str | None = None,
+                       attach_item: str | None = None) -> Any:
+        """Ask for a launch under ``token``. ``attach_item`` also records the launch as the worker on that ready item
+        (:func:`levain.coordinator.work_attach.attach_launch`), in this same transaction: an item this store does not
+        hold refuses the whole request and leaves no launch."""
+        from levain.coordinator import lease, work_attach
 
         with self._write() as (conn, now):
-            return lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
-                                        cwd=cwd, role_ref=role_ref)
+            ln = lease.request_launch(conn, now, token, harness=harness, role=role, threads=threads, model=model,
+                                      cwd=cwd, role_ref=role_ref)
+            if attach_item is not None:
+                work_attach.attach_launch(conn, now, token, ln.launch_id, attach_item)
+            return ln
 
     def launch_activate(self, launch_id: str, *, harness_session_id: str, argv_sha256: str | None = None) -> Any:
         from levain.coordinator import lease

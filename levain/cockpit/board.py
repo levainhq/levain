@@ -24,6 +24,19 @@ NO_QUEUE = "no queue yet"
 _WHAT_MAX = 300
 
 
+def is_desk_owed(card: Mapping[str, Any]) -> bool:
+    """A band card the desk alone owes (the band's one rule, :func:`levain.band_view.desk_owed`): not the operator's. Only a band
+    card: any other card may carry a ``section`` of its own (the board validator keeps extra keys) and is never hidden by it."""
+    from levain import band_view
+
+    return card.get("band") is True and band_view.desk_owed(card.get("section"), card.get("carried"))
+
+
+def visible_cards(cards: Any) -> list[Any]:
+    """The cards a board draws and counts: every card but one the desk alone owes. A non-mapping card stays (never hidden)."""
+    return [k for k in cards or [] if not (isinstance(k, Mapping) and is_desk_owed(k))]
+
+
 def _last_records(records: Any) -> dict[str, Mapping[str, Any]]:
     """The newest journal record per item id (store order is the journal's order)."""
     out: dict[str, Mapping[str, Any]] = {}
@@ -86,6 +99,14 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
                 carried = getattr(q, "carried", None)
                 if isinstance(carried, bool):      # a real bool only, and only beside a section it qualifies
                     card["carried"] = carried
+            from levain.consent.questions import intention_of, intention_text_of
+
+            ring = intention_of(question_store, q)      # the spore id this row rings, only when the host can act on it
+            if ring is not None:
+                card["intention"] = ring
+                words = intention_text_of(question_store, q)
+                if words is not None:
+                    card["intention_text"] = words
             since = getattr(q, "section_since", "")
             if isinstance(since, str) and since:      # the host's own age clock for this row, when it sends one
                 card["since"] = since

@@ -72,7 +72,9 @@ def test_a_rename_with_no_store_shows_on_the_next_read(tmp_path: Path) -> None:
 
 @needs_browser
 def test_the_page_names_the_entity_in_the_empty_tray_and_loops(tmp_path: Path) -> None:
-    src = _install(tmp_path, store=True, config=False)
+    # no store at all: a store holding one done spore makes the List card say "Nothing due for you." instead (a done row is
+    # the focus view's, levain/templates/web/dashboard_core.js `apart`), which is that card's own text and not the entity-named empty
+    src = _install(tmp_path, store=False, config=True)
     texts = ("[...document.querySelectorAll('#board .panel')].filter(p => /^\\s*(List|Open loops)/.test("
              "(p.querySelector('h2')||{}).textContent||'')).map(p => (p.querySelector('.empty')||{}).textContent||'')")
     with _Served(src, surface_tokens={"browser": "T"}, install_class="reported") as url:

@@ -1482,10 +1482,13 @@ class TestListPagePins:
         assert 'st === "COMMITTED" || st === "done"' in box and 'st === "WAITING" || st === "applying"' in box
         assert "res.ok && (landed || pending)" in box and '"not written ("' in box
         assert "intakeKept.draft.trim() === line" in box and "intakeKept.draft === line" not in box
-        # support obeys text_locked like the primary text; held rows shown count for the chips and the filter
+        # support obeys text_locked like the primary text; the time chip narrows what the type chips count and the filter reads
         assert "s.support && !s.text_locked" in core
-        assert "const listAll = () =>" in core and "buildSurfaceChips(listAll()," in core
-        assert "listAll().some((s) => s.surface === listSurface)" in core
+        # ONE function chooses the List's rows: the body draws it and every chip's number is its length, so no other filter of the list exists
+        assert "const listAll = () =>" in core and "const rowsFor = (st, focus) =>" in core and "pick: () => rowsFor(stateNow())" in core
+        assert "buildSurfaceChips((k) => rowsFor({" in core and "buildTimeChips((k) => rowsFor({" in core
+        assert core.count("withCarriedDesk(") == 1 and "const drawn =" not in core and "inTime" not in core    # the projection is applied in rowsFor alone
+        assert core.count("listAll()") == 1 and "Map(" not in core[core.index("function buildTimeChips("):core.index("// The List's INTAKE box")]
 
     def test_a_refusals_reason_reaches_the_box_and_501_503_have_words(self) -> None:
         boot = self._js("dashboard_boot.js")
@@ -1497,7 +1500,12 @@ class TestListPagePins:
         row = self._fn(core, "  function sporeRow(", "  // The filter bar the spore panels share")
         foreign = row[row.index("if (foreign) {"):]
         foreign = foreign[:foreign.index("return row;")]
-        assert "buildSporeVerbs" not in foreign and "appendRowVerbs" not in foreign 
+        # no spore verb, ever; the one thing a band row may draw is the four intention controls, and only when the row carries
+        # an intention the kernel offered them on
+        assert "buildSporeVerbs" not in foreign
+        calls = [ln for ln in foreign.splitlines() if "appendRowVerbs(" in ln]
+        assert all("buildIntentionVerbs(" in ln and "if (intend)" in ln for ln in calls), calls
+        assert 'const intend = s.surface === "band" && s.intention && s.row_id && hasIntentionControls(s.actions);' in foreign
 
     def test_the_frozen_payload_offers_band_and_board_rows_no_verb_and_the_panel_offers_the_intake(self) -> None:
         import json
@@ -1529,14 +1537,6 @@ class TestListPagePinsRound2:
         view, core = self._js("cockpit_view.js"), self._js("dashboard_core.js")
         assert "row.title || row.body" in view and "support:" in view
         assert 'el("span", "muted list-support", s.support)' in core
-
-    def test_the_surface_filter_reaches_the_held_rows(self) -> None:
-        core = self._js("dashboard_core.js")
-        # three reach points: the card's extra rows, and the unlisted hint in both of its branches
-        assert core.count("held.filter(inSurface)") == 3
-        assert "heldShownNow() ? held.filter(inSurface) : []" in core
-        assert "!heldShownNow() ? held.filter(inSurface)" in core
-        assert "!heldChosen() ? held.filter(inSurface)" in core
 
     def test_a_write_in_flight_never_clobbers_the_draft_typed_since(self) -> None:
         core = self._js("dashboard_core.js")

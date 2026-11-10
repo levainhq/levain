@@ -77,6 +77,8 @@ __all__ = [
     "is_timed",
     "valid_next",
     "valid_target",
+    "valid_retarget",
+    "executor_of",
 ]
 
 LOOP_DISPOSITION = "loop"
@@ -305,6 +307,25 @@ def valid_target(value: Any) -> bool:
     return value.startswith("board:") and bool(value[len("board:"):].strip())
 
 
+_FLOW_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def valid_retarget(value: Any) -> bool:
+    """A target the List's who control may WRITE: one the store's other reader (flow's germinate) also accepts. Flow takes a
+    ``board:`` repo only as a plain repo name, a stricter reading than :func:`valid_target`'s non-empty one."""
+    if not valid_target(value):
+        return False
+    return value in GERMINATE_TARGETS or _FLOW_REPO.fullmatch(value[len("board:"):]) is not None
+
+
+def executor_of(target: Any) -> str | None:
+    """Who acts once an agenda with this target wakes, derived and never stored: ``operator`` for a band row or a nudge (it
+    rings in the band), ``machine`` for the desk or a board item. None for no target, or one that is not a target."""
+    if not valid_target(target):
+        return None
+    return "operator" if target in ("band", "nudge") else "machine"
+
+
 def is_talk_seed(item: Mapping[str, Any]) -> bool:
     """An open ``seed`` that carries ``attention: talk``: a thing to talk through with the operator (the talk queue).
     Such a seed does not go stale silently. Levain's own spore code has no TTL expiry or resurface step of its own
@@ -332,6 +353,53 @@ def check_steering(disposition: Any, target: Any, attention: Any) -> str | None:
         return "attention pings a band row, and a desk target files a drop, none; drop attention or use target band or nudge"
     if attention not in (None, "none") and isinstance(target, str) and target.startswith("board:"):
         return "attention pings a band row, and a board: target files none; drop attention or change the target"
+    return None
+
+
+def ringing_ref(spore: Mapping[str, Any], open_questions: Any) -> str | None:
+    """The band row an OPEN agenda rings in, or None. The one definition of "rings": the spore is an open agenda, its
+    ``germinated`` stamp names a ref that is not a coordinator drop (``dr-``), and that ref is one of ``open_questions``
+    (the ids of the questions still open): an answered, snoozed-away or missing question does not ring. Read from the
+    stored record, never a facet, so it holds whatever the List could or could not read."""
+    stamp = spore.get("germinated")
+    ref = stamp.get("ref") if isinstance(stamp, Mapping) else None
+    if (spore.get("disposition") == "agenda" and spore.get("status", "open") == "open"
+            and isinstance(ref, str) and ref and not ref.startswith("dr-") and ref in open_questions):
+        return ref
+    return None
+
+
+def answered_descend_kind(spore_type: Any) -> str:
+    """The descend kind that says an intention was answered, by the spore's type (anneal validates a kind against it)."""
+    return {"task": "done", "question": "answered", "thought": "explored"}.get(str(spore_type), "composted")
+
+
+def dropped_descend_kind(spore_type: Any) -> str:
+    """The descend kind that says an intention was dropped, by the spore's type."""
+    return {"task": "dropped", "question": "mooted", "thought": "dropped"}.get(str(spore_type), "composted")
+
+
+def open_question_ids(questions: Any) -> frozenset[str]:
+    """The ids of the open questions in ``questions`` (a ``QuestionStore``); a store that cannot be read has none."""
+    try:
+        return frozenset(q.id for q in questions.open_questions())
+    except Exception:  # noqa: BLE001 - a guard that cannot read says nothing, it never blocks an unrelated act
+        return frozenset()
+
+
+def spore_ringing_question(spores_json: Any, ref: Any) -> str | None:
+    """The id of the open agenda whose stamp names the OPEN band row ``ref``, or None (no store, no such stamp, an unreadable
+    store: a guard that cannot read says nothing, it never blocks an unrelated act)."""
+    from pathlib import Path
+
+    try:
+        if not Path(spores_json).is_file():
+            return None
+        for item in list_open_readonly(spores_json):
+            if ringing_ref(item, (ref,)) == ref:
+                return str(item.get("id"))
+    except Exception:  # noqa: BLE001 - see the docstring
+        return None
     return None
 
 

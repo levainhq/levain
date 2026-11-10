@@ -104,7 +104,7 @@ def test_a_timed_agenda_is_not_due_a_minute_early_and_due_on_the_minute(tmp_path
     assert _run(root, qdir, _at(9, 29), dry_run=True)["due"] == []
     assert _run(root, qdir, _at(9, 29))["due"] == [] and s["id"] in _open_ids(root)
     (o,) = _run(root, qdir, _at(9, 30))["due"]
-    assert o["spore_id"] == s["id"] and o["done"] and s["id"] not in _open_ids(root)
+    assert o["spore_id"] == s["id"] and o["done"] and s["id"] in _open_ids(root)
 
 
 def test_a_timed_agenda_dated_in_the_past_is_due_even_late_in_the_day_and_a_future_day_is_not(tmp_path, qdir, pings):
@@ -164,7 +164,7 @@ def test_desk_without_a_coordinator_store_falls_back_to_a_band_row(tmp_path, qdi
     s = _add(root, "ask Jess", target="desk")
     assert not (qdir / "dispatch.db").exists()
     (o,) = _run(root, qdir, _at(9, 0))["due"]
-    assert o["via"] == "band-fallback" and o["done"] and s["id"] not in _open_ids(root)
+    assert o["via"] == "band-fallback" and o["done"] and s["id"] in _open_ids(root)
     (q,) = _rows(qdir)
     assert q.id == o["ref"] and "desk" in q.blocks and "no coordinator" in q.blocks
     assert not (qdir / "dispatch.db").exists() and pings == []
@@ -191,7 +191,8 @@ def test_a_board_spore_too_long_for_a_drop_is_an_error_not_a_truncation(tmp_path
 
 def test_a_stamped_spore_edited_before_the_finish_compost_is_skipped_not_composted(tmp_path, qdir, monkeypatch):
     root = _install(tmp_path)
-    s = _add(root, "write the notes")
+    s = _add(root, "write the notes", target="desk")
+    _make_board(qdir, tmp_path)
     cls = type(guarded_spore_store(_spores(root)))
     real = cls.descend
     monkeypatch.setattr(cls, "descend", lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
@@ -278,3 +279,46 @@ def test_the_store_carries_a_talk_seed_and_it_is_recognised_and_never_germinated
     assert not sp.is_talk_seed({"disposition": "agenda", "attention": "talk"})
     assert not sp.is_talk_seed({"disposition": "seed", "attention": "none"})
     assert _run(root, qdir, _at(9, 0))["due"] == [] and s["id"] in _open_ids(root)
+
+
+# --- intention S1: a question-filing agenda stays live; a drop spore composts as before ---------------------------------
+@pytest.mark.parametrize("target", ["band", "nudge", "desk", "board:levain"])
+def test_s1_an_agenda_that_filed_or_adopted_a_question_stays_open_and_a_finish_run_leaves_it(tmp_path, qdir, pings, target):
+    root = _install(tmp_path)
+    s = _add(root, "ring me", target=target)           # no coordinator: desk / board fall back to the band
+    (o,) = _run(root, qdir, _at(9, 0))["due"]
+    assert o["ref"].startswith("q-") and o["done"] and s["id"] in _open_ids(root)
+    again = _run(root, qdir, _at(9, 0))
+    assert again["finish"] == [] and again["due"] == [] and s["id"] in _open_ids(root)
+    assert SporeStore(_spores(root)).get(s["id"])["germinated"]["ref"] == o["ref"]
+
+
+def test_s1_an_adopted_question_stays_live_too(tmp_path, qdir):
+    root = _install(tmp_path)
+    held, _ = QuestionStore(qdir).file_once(agent="claude_code", key="other", what="held", options=[("a", "A")],
+                                            rec="a", blocks="b", cwd=str(tmp_path.resolve()))
+    s = _add(root, f"follow up on {held.id}")
+    (o,) = _run(root, qdir, _at(9, 0))["due"]
+    assert o["via"] == "adopted" and s["id"] in _open_ids(root)
+    assert _run(root, qdir, _at(9, 0))["finish"] == []
+
+
+def test_s1_a_coordinator_drop_spore_still_composts(tmp_path, qdir, pings):
+    root = _install(tmp_path)
+    s = _add(root, "ask Jess", target="desk")
+    _make_board(qdir, tmp_path)
+    (o,) = _run(root, qdir, _at(9, 0))["due"]
+    assert o["via"] == "desk" and o["ref"].startswith("dr-") and s["id"] not in _open_ids(root)
+
+
+def test_s1_a_crash_stamped_drop_spore_is_still_finished(tmp_path, qdir, pings, monkeypatch):
+    root = _install(tmp_path)
+    s = _add(root, "ask Jess", target="desk")
+    _make_board(qdir, tmp_path)
+    cls = type(guarded_spore_store(_spores(root)))
+    real = cls.descend
+    monkeypatch.setattr(cls, "descend", lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+    assert _run(root, qdir, _at(9, 0))["errors"]
+    monkeypatch.setattr(cls, "descend", real)
+    res = _run(root, qdir, _at(9, 0))
+    assert [o["spore_id"] for o in res["finish"]] == [s["id"]] and s["id"] not in _open_ids(root)

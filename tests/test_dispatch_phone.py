@@ -596,3 +596,31 @@ def test_a_card_that_cannot_be_read_is_its_problem_never_the_listings(lwp, monke
     assert got["signers"] == [] and "git is gone" in got["problem"]
     err = refused(lwp.dp.step, job.id, "authorise-challenge", {"signer_fp": lwp.passkey.fp})
     assert (err.status, err.error) == (503, "unavailable") and "nothing was landed" in err.message
+
+
+def test_the_card_names_the_changed_agent_config_paths_and_nothing_else(lwp) -> None:
+    job = recommended(lwp, {"sub/CLAUDE.md": b"x\n", ".claude/settings.json": b"{}\n"}, onto="main")
+    got = card(lwp, job.id)
+    assert got["agent_config"] == [".claude/settings.json", "sub/CLAUDE.md"], got
+    assert got["agent_config_overflow"] == 0 and got["agent_config_problem"] is None
+
+
+def test_the_cards_agent_config_list_is_capped_like_its_siblings(lwp) -> None:
+    from levain.dispatch.adopt import AGENT_CONFIG_PATH_MAX, AGENT_CONFIG_SHOWN
+
+    long_dir = "d" * (AGENT_CONFIG_PATH_MAX + 20)
+    change = {f"p{i:02d}/CLAUDE.md": b"x\n" for i in range(AGENT_CONFIG_SHOWN + 3)}
+    change[f"{long_dir}/CLAUDE.md"] = b"x\n"
+    got = card(lwp, recommended(lwp, change, onto="main").id)
+    assert len(got["agent_config"]) == AGENT_CONFIG_SHOWN and got["agent_config_overflow"] == 4, got
+    assert all(len(p) <= AGENT_CONFIG_PATH_MAX + 1 for p in got["agent_config"])
+    assert any(p.endswith("…") for p in got["agent_config"]), got["agent_config"]
+
+
+def test_a_failed_agent_config_check_is_the_cards_problem_line_not_a_crash(lwp, monkeypatch) -> None:
+    from levain.dispatch import adopt
+
+    monkeypatch.setattr(adopt, "agent_config_paths", lambda paths: (_ for _ in ()).throw(ImportError("gone")))
+    got = card(lwp, recommended(lwp, {".claude/settings.json": b"{}\n"}, onto="main").id)
+    assert got["agent_config"] == [] and got["agent_config_problem"] == "ImportError: gone", got
+    assert got["problem"] is None and got["onto"] == "main"

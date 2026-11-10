@@ -112,6 +112,9 @@ ROUTE_TYPES = ("egress", "brokered", "subscription_passthrough")   # §4.1
 #: cannot get past the OS wall (DESIGN §1.3), but every fetch would then fail with no cause shown.
 PROXY_ENV = frozenset(n for b in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY") for n in (b, b.lower()))
 #: wfetch RULINGS Q3: Codex's server-side search mode until Phill rules (fail closed: the front cannot see it).
+#: Operator note: a Codex that sends its turns through a dispatch route must have web search off too, as this launch
+#: does (`-c web_search="disabled"`). Its default `web_search` tool is a server tool the estimate cannot see, so a
+#: dispatch route refuses the whole request `body-unbounded:web_search`.
 CODEX_WEB_SEARCH = "disabled"
 #: The Codex launch's ``-c`` overrides (``start.vendor_argv``), the layer above every config file, so ``web_search``
 #: holds even if the repo's own ``.codex/config.toml`` were loaded (``codex_config`` files the repo untrusted).
