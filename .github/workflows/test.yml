@@ -116,6 +116,10 @@ jobs:
           LEVAIN_TEST_WAIT_SCALE: "2"
         run: pytest -q -m invariant --basetemp=/tmp/levain-pt
 
+      - name: Check the invariant list against the tests
+        # a listed test renamed or dropped fails here, in stage 0, not later in a shard
+        run: pytest -q tests/test_ci_invariant_marker.py --basetemp=/tmp/levain-pt-marker
+
   plan:
     # Emits the shard list [0..TEST_SHARDS-1] the `test` matrix runs. It does not collect: each shard job collects
     # under its own Python and picks its own files (see that job's last step), so a file one Python collects and
@@ -207,10 +211,11 @@ jobs:
           mapfile -t files < "$RUNNER_TEMP/files.txt"
           test "${#files[@]}" -gt 0 || { echo "shard ${{ matrix.shard }} has no files"; exit 1; }
           # --durations=25 prints the 25 slowest tests into the log, a measurement the shard weights lack (the -q progress parse ignores it)
-          # -rf lists each failure as a `FAILED <node id>` line, which scripts/ci_flake_rerun.py reads.
+          # -rfE lists each failure as a `FAILED <node id>` line and each error as an `ERROR` line (an explicit -r replaces
+          # pytest's default, so E must be named), which scripts/ci_flake_rerun.py reads.
           # A first failure goes to that script: a test on the flake ledger earns ONE rerun, any other failure fails the job.
           set +e
-          pytest -q -rf --durations=25 --basetemp=/tmp/levain-pt "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          pytest -q -rfE --durations=25 --basetemp=/tmp/levain-pt "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/pytest.log"
           rc=${PIPESTATUS[0]}
           set -e
           test "$rc" -eq 0 || python scripts/ci_flake_rerun.py "$rc" "$RUNNER_TEMP/pytest.log" "$RUNNER_TEMP/flake-rerun" "shard ${{ matrix.shard }} py${{ matrix.python-version }}"

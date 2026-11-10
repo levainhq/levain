@@ -75,6 +75,30 @@ def test_stage0_runs_the_invariant_tests_alone_behind_the_gate():
     assert job["if"] == STAGE0_IF
     runs = " ".join(s.get("run", "") for s in job["steps"])
     assert "-m invariant" in runs
+    assert "tests/test_ci_invariant_marker.py" in runs
+
+
+def _shard_pytest_line():
+    runs = "\n".join(s.get("run", "") for s in JOBS["test"]["steps"])
+    lines = [ln for ln in runs.splitlines() if re.match(r"\s*pytest -q .*-r\w*\s.*tee", ln)]
+    assert len(lines) == 1, lines
+    return lines[0]
+
+
+def _reports_errors(line):
+    flags = re.findall(r"\s-r(\w+)", line)
+    return bool(flags) and "f" in flags[0] and ("E" in flags[0] or "a" in flags[0])
+
+
+def test_the_shard_pytest_reports_errors_as_well_as_failures():
+    # an explicit -r replaces pytest's default report chars, so without E an ERROR line is never emitted and a
+    # ledgered flaky failure plus a fixture error would go green after the rerun
+    assert _reports_errors(_shard_pytest_line())
+
+
+def test_the_report_flag_check_can_fail():
+    assert not _reports_errors("pytest -q -rf --durations=25 | tee x")
+    assert _reports_errors("pytest -q -rfE --durations=25 | tee x")
 
 
 @pytest.mark.parametrize("name", _heavy())
