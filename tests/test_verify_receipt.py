@@ -1621,3 +1621,35 @@ def test_r2_t4_the_remote_mkdir_runs_after_umask_022(repo, tmp_path):
                           sh=_stub_sh(r, sha, leg, jt, cmds), script=ROOT / "scripts" / "verify.py")
     mk = [x[0][-1] for x in cmds if "mkdir -p" in x[0][-1]]
     assert mk and all(c.startswith("umask 022 && mkdir -p") for c in mk)
+
+
+def _deep_tree(top: Path, depth: int) -> None:
+    """A chain of one-letter dirs `depth` levels down, built through dir fds so no path ever gets long."""
+    top.mkdir()
+    fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for _ in range(depth):
+            os.mkdir("d", dir_fd=fd)
+            nfd = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        with open("leaf", "w", opener=lambda p, f: os.open(p, f, 0o600, dir_fd=fd)) as f:
+            f.write("x")
+    finally:
+        os.close(fd)
+
+
+def test_remove_tree_has_no_depth_limit_and_never_follows_a_symlink(tmp_path):
+    depth = 1300
+    assert depth > sys.getrecursionlimit()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("k")
+    top = tmp_path / "deep"
+    _deep_tree(top, depth)
+    (top / "link").symlink_to(outside, target_is_directory=True)
+    (top / "d" / "flink").symlink_to(outside / "keep")
+    verify.remove_tree(top)
+    assert not top.exists()
+    assert (outside / "keep").read_text() == "k"
+    verify.remove_tree(tmp_path / "absent")

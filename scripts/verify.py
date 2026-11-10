@@ -428,6 +428,79 @@ def recorded_short_tmp(run: Path) -> Path | None:
     return Path(txt) if txt else None
 
 
+def remove_tree(path) -> None:
+    """Delete a directory tree with no recursion and no path-length limit, ignoring per-entry OSError (the behaviour of
+    shutil.rmtree(ignore_errors=True), minus its depth ceiling).  One directory fd is open at a time; symlinks are
+    unlinked, never followed.  An entry that cannot be removed is skipped, so the walk always ends."""
+    path = os.fspath(path)
+    try:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            os.unlink(path)
+            return
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    names: list[str] = []              # directory names from the top down to the current dir
+    stuck: list[set[str]] = [set()]    # per level: children that could not be removed
+    try:
+        while True:
+            child = None
+            try:
+                with os.scandir(fd) as it:
+                    entries = list(it)
+            except OSError:
+                entries = []
+            for e in entries:
+                if e.name in stuck[-1]:
+                    continue
+                try:
+                    is_dir = e.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_dir = False
+                if is_dir:
+                    if child is None:
+                        child = e.name
+                    continue
+                try:
+                    os.unlink(e.name, dir_fd=fd)
+                except OSError:
+                    stuck[-1].add(e.name)
+            if child is not None:
+                try:
+                    nfd = os.open(child, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError:
+                    stuck[-1].add(child)
+                    continue
+                os.close(fd)
+                fd = nfd
+                names.append(child)
+                stuck.append(set())
+                continue
+            if not names:
+                break
+            try:
+                pfd = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            except OSError:
+                return
+            os.close(fd)
+            fd = pfd
+            name = names.pop()
+            stuck.pop()
+            try:
+                os.rmdir(name, dir_fd=fd)
+            except OSError:
+                stuck[-1].add(name)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
 def remove_short_tmp(d: Path | None) -> bool:
     """Remove a recorded short tmp dir, but only if it is what we made: a real dir (not a symlink) directly under
     SHORT_TMP_ROOT, named lv-*, owned by this user.  Anything else is left alone."""
@@ -440,7 +513,7 @@ def remove_short_tmp(d: Path | None) -> bool:
     if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or not d.name.startswith("lv-")
             or d.parent != Path(SHORT_TMP_ROOT)):
         return False
-    shutil.rmtree(d, ignore_errors=True)
+    remove_tree(d)
     return True
 
 
@@ -642,9 +715,9 @@ def reap_run(run: Path, repo: Path, tools: Tools, *, keep_files: bool = False, g
         if keep_files:
             for child in run.iterdir():
                 if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child, ignore_errors=True)
+                    remove_tree(child)
         else:
-            shutil.rmtree(run, ignore_errors=True)
+            remove_tree(run)
             summary["removed"] = not run.exists()
     return summary
 
@@ -788,8 +861,8 @@ def remove_worktree(repo: Path, run: Path, name: str) -> None:
     src = run / name / "src"
     if src.exists():
         git(repo, "worktree", "remove", "--force", str(src), check=False)
-    shutil.rmtree(run / name / "venv", ignore_errors=True)
-    shutil.rmtree(run / name, ignore_errors=True)
+    remove_tree(run / name / "venv")
+    remove_tree(run / name)
 
 
 def host_fingerprint() -> dict:
@@ -1027,7 +1100,7 @@ class Ctx:
     def teardown(self) -> None:
         for n in self.names:
             remove_worktree(self.repo, self.run, n)
-        shutil.rmtree(self.run / "venv39", ignore_errors=True)
+        remove_tree(self.run / "venv39")
         remove_short_tmp(self.tmp)
         git(self.repo, "worktree", "prune", check=False)
 
