@@ -86,8 +86,9 @@ def _shard_pytest_line():
 
 
 def _reports_errors(line):
+    # pytest's -r may accumulate or the last may win depending on config, so EVERY -r token must report both
     flags = re.findall(r"\s-r(\w+)", line)
-    return bool(flags) and "f" in flags[0] and ("E" in flags[0] or "a" in flags[0])
+    return bool(flags) and all("f" in f and ("E" in f or "a" in f) for f in flags)
 
 
 def test_the_shard_pytest_reports_errors_as_well_as_failures():
@@ -99,6 +100,8 @@ def test_the_shard_pytest_reports_errors_as_well_as_failures():
 def test_the_report_flag_check_can_fail():
     assert not _reports_errors("pytest -q -rf --durations=25 | tee x")
     assert _reports_errors("pytest -q -rfE --durations=25 | tee x")
+    assert not _reports_errors("pytest -q -rfE --durations=25 -rf | tee x")
+    assert not _reports_errors("pytest -q -rf --durations=25 -rfE | tee x")
 
 
 @pytest.mark.parametrize("name", _heavy())
