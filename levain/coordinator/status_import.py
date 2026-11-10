@@ -20,7 +20,7 @@ Field mapping (the worker-attach design, section 5):
 Idempotent: a row whose imported fields already read so writes nothing; a changed row writes ONE correction. The
 importer owns the text fields only. It never moves an existing item between categories and never reorders it (a
 decision of the coordinator is not undone by a re-import); a new item enters ``ready``, or ``done`` when its title
-leads with a landed word. A row gone from the file is left in the store and named in the result. The importer's id
+leads with a landed word (inside the bold title or before it, as ``N. ON MAIN <sha> (...): **TITLE**``). A row gone from the file is left in the store and named in the result. The importer's id
 map is a parameter (``id_for``); the default is ``levain:row-<n>``. A row the store refuses (a blank title, a hidden
 character) goes into ``unparsed`` by its number and the rest still import.
 
@@ -50,7 +50,8 @@ TITLE_MAX = 120
 DONE_MAX = 1000
 HOLD_MAX = 1000
 REF_MAX = 300
-_ROW = re.compile(r"(\d+)\. \*\*(.+?)\*\*(.*)")
+# a row's landed word may lead the line OUTSIDE the bold title (the desk's `N. ON MAIN <sha> (...): **TITLE**` shape)
+_ROW = re.compile(r"(?P<n>\d+)\. (?:(?P<landed>(?:ON MAIN|LANDED|RELEASED|DONE)\b[^*]*?): )?\*\*(?P<title>.+?)\*\*(?P<rest>.*)")
 _SECTION = re.compile(r"## LANE MENU\b")
 _TIER = re.compile(r"\(tier: (\w+)")
 _TIER_NOTE = re.compile(r"^\s*\(tier:[^)]*\)\s*")
@@ -158,11 +159,11 @@ def parse_rows(text: str, *, id_for: Callable[[int], str] = default_id) -> tuple
         if m is None:
             unparsed.append(int(head.group(1)))
             continue
-        n = int(m.group(1))
+        n = int(m.group('n'))
         if n in seen:
             continue
         seen.add(n)
-        raw_title, rest = m.group(2), m.group(3)
+        raw_title, rest = m.group('title'), m.group('rest')
         title = _sentence(raw_title, TITLE_MAX)
         lead = _lead(rest)
         mark = _DONE_MARK.search(_outside_notes(rest))
@@ -175,7 +176,7 @@ def parse_rows(text: str, *, id_for: Callable[[int], str] = default_id) -> tuple
             tier=tier.group(1) if tier and tier.group(1) in ready.TIERS else None,
             hold=_hold(raw_title, _TIER_NOTE.sub("", lead)), residue=", ".join(ids)[:HOLD_MAX] if ids else None,
             ref=f"{REF_NAME}#{n}@{sha}"[:REF_MAX],
-            category="done" if _DONE_WORDS.match(raw_title) else "ready"))
+            category="done" if m.group("landed") or _DONE_WORDS.match(raw_title) else "ready"))
     return rows, unparsed
 
 

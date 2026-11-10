@@ -42,6 +42,10 @@ REPO_ENV_VENDOR_NAMES = frozenset({"NODE_OPTIONS", "NODE_EXTRA_CA_CERTS", "NODE_
 #: replace levain's), a hook-timing or hook-off mode, a removed safety prompt, the model a permission classifier
 #: runs on (``CLAUDE_CODE_AUTO_MODE_MODEL``, and ``ANTHROPIC_DEFAULT_SONNET_MODEL``, which the vendor names as
 #: choosing it too), and prompt text a repo would author for Claude to receive.
+#: Known edge (Diogenes a30696702, 11-10): ``ANTHROPIC_MODEL`` stays allowed, and with no ``--model`` on a slot launch it
+#: sets the SESSION model, which the vendor's classifier table names as the classifier's fallback when its default
+#: model is unavailable. Reached only where the provider or org policy excludes the default; refusing it would break an
+#: ordinary repo setting, so it is recorded here and not closed.
 REPO_ENV_ALLOW = frozenset({
     "ANTHROPIC_CUSTOM_MODEL_OPTION", "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_FABLE_MODEL",

@@ -141,7 +141,7 @@ WORK_SCHEMA: tuple[str, ...] = (
     "FROM worker_attach WHERE report_id = NEW.report_id) "
     "BEGIN SELECT RAISE(ABORT, 'an applied report is never refused'); END",
     # the sessions the service's listing showed, one row per session: when it was first and last seen live (L2 F6).
-    # Written only by the service's pass; its last sighting only moves forward, and a row is deleted only once it was
+    # Written by every pass that applies (the service's, or the coordinator's under its lease); its last sighting only moves forward, and a row is deleted only once it was
     # last seen more than SEEN_KEEP before the newest sighting the table holds (L3 C4: the pass prunes it)
     "CREATE TABLE IF NOT EXISTS sessions_seen (session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND "
     f"{_FIELD_MAX}), first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, CHECK (last_seen >= first_seen))",

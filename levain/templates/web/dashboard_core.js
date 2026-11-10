@@ -3650,7 +3650,7 @@
   // The four controls of a row that rings an intention (a reminder the desk or a schedule filed into the band): the same labels on
   // the Decisions card and on the List's band row. Each posts the row's own offered action through the page's one write
   // transport; the row is re-read after, so a snoozed, done or cleared one leaves. Done asks nothing; Clear asks once.
-  const INTENTION_CONTROLS = [["Snooze", "intention_snooze", "move it to a later day"], ["Edit", "intention_edit", "change its words"],
+  const INTENTION_CONTROLS = [["Snooze", "intention_snooze", "move it to a later day or time"], ["Edit", "intention_edit", "change its words"],
     ["Done", "intention_done", "mark it done"], ["Clear", "intention_clear", "drop it for good"]];
   const INTENTION_STALE = "this reminder changed: reload";
   // the page's local calendar day `offset` days from today, YYYY-MM-DD (the date input's own form)
@@ -3662,6 +3662,12 @@
     const d = new Date(iso.slice(0, 10) + "T00:00");
     if (!Number.isFinite(d.getTime())) return iso;
     return d.toLocaleDateString([], { weekday: "short" }) + " " + d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+  // a snooze value is a day (YYYY-MM-DD) or a timed same-day-or-later pick (YYYY-MM-DDTHH:MM): the words name the minute
+  // when the value carries one, so a timed pick never reads back as its date alone
+  function dayTimeWords(iso) {
+    const t = typeof iso === "string" && /^\d{4}-\d{2}-\d{2}T(\d{2}:\d{2})/.exec(iso);
+    return dayWords(iso) + (t ? " at " + t[1] : "");
   }
   function intentionPost(rowId, verb, confirm) {
     return async (req) => {
@@ -3686,7 +3692,7 @@
       const btn = verbBtn(label, title, async (ev) => {
         if (verb === "intention_snooze") {
           openSurfaceForm(wrap, { next: null }, { label: "snooze", post: (v) => intentionPost(rowId, verb)({ until: v }),
-            min: localDayIso(1), minToday: localDayIso(0), back: (v) => "comes back " + dayWords(v), done: (v) => "snoozed to " + dayWords(v), stale: INTENTION_STALE });
+            min: localDayIso(1), minToday: localDayIso(0), back: (v) => "comes back " + dayTimeWords(v), done: (v) => "snoozed to " + dayTimeWords(v), stale: INTENTION_STALE });
           return;
         }
         if (verb === "intention_edit") {
