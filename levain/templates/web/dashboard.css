@@ -1480,6 +1480,8 @@ body.ke .verb-btn {
   font: var(--fw-medium) var(--fs-meta)/1 var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;
   border: 0; border-radius: var(--r-sm); padding: 0 var(--sp-2); min-height: var(--ctl-row); min-width: var(--ctl-row); height: var(--ctl-row); white-space: nowrap; }
 body.ke .verb-btn.verb-more { padding: 0 var(--sp-2); letter-spacing: 0; }
+/* a reminder row's controls on a phone: each a full touch target (--hit-min); the shared verb look elsewhere is unchanged */
+@media (max-width: 720px) { body.ke .intention-actions .verb-btn { min-height: var(--hit-min); min-width: var(--hit-min); height: var(--hit-min); } }
 body.ke .row .verb-btn { text-transform: capitalize; }   /* the labels are lower-case data; the spec's verbs are sentence case (Edit, Schedule) */
 body.ke .undo-btn::before { content: none; }
 body.ke .undo-btn:hover { color: var(--text); background: none; border-color: var(--label); }

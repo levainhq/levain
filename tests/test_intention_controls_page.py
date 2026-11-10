@@ -87,3 +87,76 @@ def test_one_tap_of_done_resolves_the_agenda_and_closes_the_row(tmp_path: Path, 
         closed = _eventually(lambda: store.get(ring.id).answer is not None, True)
     assert any(p.startswith("/cockpit/verb ") and "intention_done" in p for p in out["posts"]), out["posts"]
     assert closed and sp.get(sid)["status"] != "open" and sp.get(sid)["resolution"]["kind"] == "done"
+
+
+# --- fix round 1 ---------------------------------------------------------------------------------------------------------
+
+RING = "document.querySelector('#levain-modal [data-question-row] .intention-actions')"
+CARD = "document.querySelector('#levain-modal [data-question-row]')"
+
+
+def _tap(verb: str) -> str:
+    return f"{RING}.querySelector('button[data-verb={verb}]').click(); 1"
+
+
+@needs_browser
+def test_edit_starts_from_the_reminders_words_and_an_untouched_save_writes_nothing(tmp_path: Path, lh: Path) -> None:
+    """H1 + K1: the card reads as the reminder's own words, Edit starts from them (never the "Due ...: ..." the row was filed
+    with), and Save on an untouched field sends nothing."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    probe = ("JSON.stringify({ta: (" + RING + ".querySelector('textarea') || {}).value, title: " + CARD + ".textContent,"
+             " msg: (" + RING + ".querySelector('.edit-msg') || {}).textContent, probe: 1})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(
+            DESKTOP, {"do": _tap("intention_edit"), "until": RING + ".querySelector('textarea') && 1", "ms": 10000},
+            {"do": RING + ".querySelector('.verb-confirm').click(); 1",
+             "until": "(" + RING + ".querySelector('.edit-msg') || {}).textContent === 'nothing changed' && 1", "ms": 10000},
+            {"eval": probe}))
+    seen = _probe(out)
+    assert seen["ta"] == "renew the thing", seen
+    assert "renew the thing" in seen["title"] and "Due 11-08" not in seen["title"], seen
+    assert not [p for p in out["posts"] if "intention_edit" in p], out["posts"]
+    assert sp.get(sid)["text"] == "renew the thing"
+
+
+@needs_browser
+def test_snooze_names_when_it_comes_back_refuses_today_and_clear_quotes_the_reminder(tmp_path: Path, lh: Path) -> None:
+    """U2, U3, U5: the snooze form says when the row comes back, takes no day before tomorrow (in plain words, nothing sent),
+    and Clear asks about the reminder by its words."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    set_date = (RING + ".querySelector('input[type=date]').value = {v}; " + RING
+                + ".querySelector('input[type=date]').dispatchEvent(new Event('input')); 1")
+    today = "(() => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); })()"
+    probe = ("JSON.stringify({min: " + RING + ".querySelector('input[type=date]').min, back: (" + RING
+             + ".querySelector('.intention-back') || {}).textContent, msg: (" + RING + ".querySelector('.edit-msg') || {}).textContent, probe: 1})")
+    ask = "JSON.stringify({ask: " + RING + ".querySelector('.verb-form').textContent, probe: 2})"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(
+            DESKTOP, {"do": _tap("intention_snooze"), "until": RING + ".querySelector('input[type=date]') && 1", "ms": 10000},
+            {"do": set_date.format(v="'2026-12-03'"), "until": "1", "ms": 1000},
+            {"eval": probe},
+            {"do": set_date.format(v=today) + " && " + RING + ".querySelector('.verb-confirm').click(); 1",
+             "until": "(" + RING + ".querySelector('.edit-msg') || {}).textContent.length > 0 && 1", "ms": 10000},
+            {"eval": probe},
+            {"do": RING + ".querySelector('.verb-form .verb-cancel').click(); 1", "until": "1", "ms": 500},
+            {"do": _tap("intention_clear"), "until": RING + ".querySelector('.verb-form') && 1", "ms": 10000},
+            {"eval": ask}))
+    vals = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"probe"' in v]
+    first, second, cleared = vals[0], vals[1], vals[2]
+    assert first["back"].startswith("comes back ") and "Dec" in first["back"] and first["min"] > "2026-01-01", first
+    assert second["msg"] == "pick a later day", second
+    assert "renew the thing" in cleared["ask"] and "for good" in cleared["ask"], cleared
+    assert not [p for p in out["posts"] if "intention_snooze" in p or "intention_clear" in p], out["posts"]
+    assert store.get(ring.id).answer is None
+
+
+@needs_browser
+def test_on_a_phone_each_reminder_control_is_a_44px_target(tmp_path: Path, lh: Path) -> None:
+    """U4: at phone width the reminder row's controls meet a 44px tap target; other verb buttons keep their look."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    probe = ("JSON.stringify({sizes: [...document.querySelectorAll('#levain-modal .intention-actions button')].filter(b => b.offsetParent)"
+             ".map(b => [b.getBoundingClientRect().height, b.getBoundingClientRect().width]), probe: 1})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(PHONE, {"eval": probe}))
+    sizes = _probe(out)["sizes"]
+    assert sizes and all(h >= 44 and w >= 44 for h, w in sizes), sizes

@@ -397,7 +397,9 @@
   // `headers` is the SAME read-header function the reads above use, so the change stream (a fetch read that
   // cannot go through res.json()) carries the same credential; `reload` is the board's one passive re-read and
   // resolves true only once a board was drawn (false: deferred by an edit or a load in flight, or it failed).
-  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }), rowActions, rowVerb };
+  // notice: a verb's own words for the status line, after its write has redrawn the page (the intention controls' "said")
+  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }), rowActions, rowVerb,
+    notice: (text) => status(String(text).slice(0, 200)) };
 
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
   // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed

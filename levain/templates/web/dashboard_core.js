@@ -2129,7 +2129,7 @@
       }
       if (s.band_age) host.appendChild(el("span", "muted", s.band_age));       // the footer's clock and form, never whole days from the add
       else if (s.surface !== "band" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
-      if (intend) appendRowVerbs(row, buildIntentionVerbs(s.row_id, s.actions, s.text), ["Done", "Snooze"], 2);
+      if (intend) appendRowVerbs(row, buildIntentionVerbs(s.row_id, s.actions, s.intention_text), ["Done", "Snooze"], 2);
       return row;
     }
     if (s.surface && !s.held) {
@@ -3421,8 +3421,10 @@
 
   // The schedule form: a date input + confirm -> spore_surface_at (clear = explicit empty).
   // Mirrors openResolveForm's hide-triggers / one-form-at-a-time / Escape-cancel shape.
-  // `opts` (the intention snooze): {label, post(value)}: the same date picker, a different button word, no "clear" (a snooze always
-  // names a day), and the pick is posted through `post` instead of the spore write.
+  // `opts` (the intention snooze): {label, post(value), min, back(value), done(value), stale}: the same date picker, a different
+  // button word, no "clear" (a snooze always names a day), the earliest day it takes (`min`, refused in plain words before
+  // anything is sent), a visible line naming when the row comes back, the row's words once it is sent, and the words a stale
+  // refusal reads as; the pick is posted through `post` instead of the spore write.
   function openSurfaceForm(host, s, opts) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
@@ -3437,7 +3439,10 @@
     const cancel = el("button", "verb-cancel", "cancel");
     go.type = "button"; clearBtn.type = "button"; cancel.type = "button";
     const msg = el("span", "edit-msg", "");
-    form.append(input, go, ...(opts ? [] : [clearBtn]), cancel, msg);
+    if (opts && opts.min) input.min = opts.min;
+    const back = opts && opts.back ? el("span", "muted intention-back", "") : null;
+    if (back) input.addEventListener("input", () => { back.textContent = input.value ? opts.back(input.value) : ""; });
+    form.append(input, ...(back ? [back] : []), go, ...(opts ? [] : [clearBtn]), cancel, msg);
     host.appendChild(form);
     input.focus();
     const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
@@ -3451,12 +3456,17 @@
       go.disabled = true; clearBtn.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = opts && opts.post ? await opts.post(value) : await commit({ kind: "spore_surface_at", spore_id: s.id, surface_at: value });
-      if (res && res.ok) return;  // re-rendered
+      if (res && res.ok) {   // re-rendered; a row that stays (or a redraw still to come) reads what was done
+        if (opts && opts.done) { msg.className = "edit-msg"; msg.textContent = opts.done(value); }
+        return;
+      }
       showFail(msg, res, "failed");
+      if (opts && opts.stale && res && res.error === "stale") msg.textContent = opts.stale;
       go.disabled = false; clearBtn.disabled = false; cancel.disabled = false;
     };
     go.addEventListener("click", () => {
       if (!input.value) { msg.className = "edit-msg err"; msg.textContent = opts ? "pick a day" : "pick a date (or clear)"; return; }
+      if (opts && opts.min && input.value < opts.min) { msg.className = "edit-msg err"; msg.textContent = "pick a later day"; return; }
       submit(input.value);
     });
     clearBtn.addEventListener("click", () => submit(""));  // explicit clear: key present, value ""
@@ -3467,37 +3477,61 @@
   // transport; the row is re-read after, so a snoozed, done or cleared one leaves. Done asks nothing; Clear asks once.
   const INTENTION_CONTROLS = [["Snooze", "intention_snooze", "move it to a later day"], ["Edit", "intention_edit", "change its words"],
     ["Done", "intention_done", "mark it done"], ["Clear", "intention_clear", "drop it for good"]];
+  const INTENTION_STALE = "this reminder changed: reload";
+  // the page's local calendar day `offset` days from today, YYYY-MM-DD (the date input's own form)
+  function localDayIso(offset) {
+    const d = new Date(); d.setDate(d.getDate() + offset);
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  }
+  function dayWords(iso) {
+    const d = new Date(iso.slice(0, 10) + "T00:00");
+    if (!Number.isFinite(d.getTime())) return iso;
+    return d.toLocaleDateString([], { weekday: "short" }) + " " + d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
   function intentionPost(rowId, verb, confirm) {
-    return (req) => {
+    return async (req) => {
       const T = window.LevainCockpitTransport;
-      if (!T || typeof T.rowVerb !== "function") return Promise.resolve({ ok: false, message: "this page cannot send that" });
-      return T.rowVerb(rowId, verb, req || {}, confirm === true);
+      if (!T || typeof T.rowVerb !== "function") return { ok: false, message: "this page cannot send that" };
+      const res = await T.rowVerb(rowId, verb, req || {}, confirm === true);
+      // what the host said it did is the page's notice (an edit's row stays, drawn with the new words)
+      const said = res && res.ok && res.data && typeof res.data.said === "string" ? res.data.said : "";
+      if (said && typeof T.notice === "function") T.notice(said);
+      return res;
     };
   }
   function hasIntentionControls(actions) {
     return Array.isArray(actions) && actions.some((a) => a && INTENTION_CONTROLS.some((c) => c[1] === a.verb));
   }
+  // `text`: the reminder's own words (never the row's filed words); "" when the host sent none, and Edit then starts empty
   function buildIntentionVerbs(rowId, actions, text) {
     const wrap = el("span", "verb-actions intention-actions");
+    const words = typeof text === "string" ? text : "";
     for (const [label, verb, title] of INTENTION_CONTROLS) {
       const btn = verbBtn(label, title, async (ev) => {
-        if (verb === "intention_snooze") { openSurfaceForm(wrap, { next: null }, { label: "snooze", post: (v) => intentionPost(rowId, verb)({ until: v }) }); return; }
+        if (verb === "intention_snooze") {
+          openSurfaceForm(wrap, { next: null }, { label: "snooze", post: (v) => intentionPost(rowId, verb)({ until: v }),
+            min: localDayIso(1), back: (v) => "comes back " + dayWords(v), done: (v) => "snoozed to " + dayWords(v), stale: INTENTION_STALE });
+          return;
+        }
         if (verb === "intention_edit") {
           openRowForm(wrap, () => {
             const ta = el("textarea", "verb-edit-ta");
-            ta.value = typeof text === "string" ? text : "";
+            ta.value = words;
             ta.rows = Math.min(16, Math.max(3, ta.value.split("\n").length, Math.ceil(ta.value.length / 56)));
             ta.dataset.orig = ta.value;
             return { nodes: [ta], focus: ta, ta };
           }, (f, msg) => {
             if (!f.ta.value.trim()) { msg.className = "edit-msg err"; msg.textContent = "text can't be empty"; return null; }
+            // only what the operator changed is written: an untouched field sends nothing
+            if (f.ta.value === f.ta.dataset.orig) { msg.className = "edit-msg"; msg.textContent = "nothing changed"; return null; }
             return { text: f.ta.value };
-          }, "save", false, intentionPost(rowId, verb));
+          }, "save", false, intentionPost(rowId, verb), INTENTION_STALE);
           return;
         }
         if (verb === "intention_clear") {
-          openRowForm(wrap, () => ({ nodes: [el("span", "muted", "Drop this reminder for good?")], focus: null }),
-            () => ({}), "Clear", true, intentionPost(rowId, verb, true));
+          const ask = words ? "Drop \u201c" + words.slice(0, 120) + (words.length > 120 ? "\u2026" : "") + "\u201d for good?" : "Drop this reminder for good?";
+          openRowForm(wrap, () => ({ nodes: [el("span", "muted", ask)], focus: null }),
+            () => ({}), "Clear", true, intentionPost(rowId, verb, true), INTENTION_STALE);
           return;
         }
         const b = ev.currentTarget; b.disabled = true;
@@ -3505,6 +3539,7 @@
         if (res && res.ok) return;  // the page re-reads and redraws without this row
         b.disabled = false;
         verbErr(wrap, res);
+        if (res && res.error === "stale") { const m = wrap.querySelector(".edit-msg"); if (m) m.textContent = INTENTION_STALE; }
       });
       btn.dataset.verb = verb;
       wrap.appendChild(btn);
@@ -3527,8 +3562,8 @@
     document.dispatchEvent(new CustomEvent("levain:editor-closed"));
   }
 
-  // `post` (the intention verbs): sends the request instead of the legacy write
-  function openRowForm(host, buildFields, onConfirm, confirmLabel, danger, post) {
+  // `post` (the intention verbs): sends the request instead of the legacy write; `staleWords`: what a stale refusal reads as
+  function openRowForm(host, buildFields, onConfirm, confirmLabel, danger, post, staleWords) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
     const triggers = Array.prototype.slice.call(host.querySelectorAll(".verb-btn"));
@@ -3557,7 +3592,7 @@
       const res = await (post || commit)(req);
       if (res && res.ok) return;  // re-rendered
       showFail(msg, res, "failed");
-      if (res && res.error === "stale") { retireStaleForm(form); return; }
+      if (res && res.error === "stale") { if (staleWords) msg.textContent = staleWords; retireStaleForm(form); return; }
       go.disabled = false; cancel.disabled = false;
     });
   }
@@ -4897,6 +4932,8 @@
     offSlotMics(slot);
     const sv = (x) => (typeof x === "string" ? x : "");
     const open = q.state === "open";
+    // an open row that rings a reminder reads as the reminder's own words (what its Edit changes), not the words it was filed with
+    if (open && q.intention && b && !b.error && sv(b.intention_text)) b = Object.assign({}, b, { what: b.intention_text });
     const cli = "levain question show " + q.n;   // the options are listed there; answer with: levain question answer N --option KEY
     if (receipt && card && (b.error || !(b.answer && typeof b.answer === "object"))) {
       // a settled card is a receipt whatever the read did: a failed read or a missing answer never brings back the options, the
@@ -4955,7 +4992,7 @@
     }
     if (open && q.intention && hasIntentionControls(q.intentionActions)) {
       // a row that rings an intention is acted on by its four controls, in place of any answer box or signature
-      const wrap = buildIntentionVerbs(q.id, q.intentionActions, sv(b.what));
+      const wrap = buildIntentionVerbs(q.id, q.intentionActions, sv(b.intention_text));     // never the filed words
       if (card) {
         const bottom = el("div", "needs-actions needs-qa needs-intention");
         bottom.appendChild(wrap);
