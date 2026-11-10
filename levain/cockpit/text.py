@@ -245,7 +245,7 @@ _VALUE_TEXT = {"line": _t_line, "status-dots": _t_status_dots, "ambient": _t_amb
                "log": _t_log}
 
 
-LIST_APART = frozenset({"desk", "later"})      # the List's groups the footer prints though the header does not count them
+LIST_APART = frozenset({"desk", "later", "done"})      # the List's groups the footer prints though the header does not count them
 
 
 def _rows(head: dict[str, Any], panel: dict[str, Any], width: int, top_n: int) -> list[tuple[str, str]]:

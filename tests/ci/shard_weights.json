@@ -422,7 +422,7 @@
   "tests/test_cockpit_threads_send.py": 8.4,
   "tests/test_cockpit_topology.py": 32.6,
   "tests/test_cockpit_topology_s5.py": 3.7,
-  "tests/test_cockpit_tray_held.py": 4.1,
+  "tests/test_cockpit_list_later.py": 4.1,
   "tests/test_cockpit_ts5a_no_keep.py": 1.7,
   "tests/test_cockpit_voice_routes.py": 68.0,
   "tests/test_cockpit_voice_stream_routes.py": 23.2,

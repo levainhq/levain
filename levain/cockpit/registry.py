@@ -90,7 +90,6 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "overdue_days": ("int", _is_int),
     "held_until": ("date|null", _opt(_is_date)),
     "handoff_expired": ("bool", _is_bool),
-    "held": ("bool", _is_bool),          # a Tray row whose surface date has not come: listed apart from the due rows
     "last_seen": ("timestamp|null", _opt(_is_str)),
     "source": ("str", _is_str),
     "for": ("str", _is_str),            # who an inbox message is addressed to (readers, comma-joined); absent = everyone
@@ -190,6 +189,14 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "intention_text": ("str", _is_str),          # that reminder's own words (a List row only: the List carries words)
     "board_rank": ("int|null", _opt(_is_int)),
     "board_tier": ("str|null", _opt(_is_str)),
+    # the List's time-state (levain.cockpit.list_panel): every row is now / later / someday / done; a LATER row names the day it
+    # wakes, the bucket that day falls in, and a line saying where it lands ("wakes Tue → band"); a DONE row the day and kind
+    "time_state": ("enum", _enum("now", "later", "someday", "done")),
+    "wake_day": ("YYYY-MM-DD calendar date", _is_iso_day),
+    "wake_bucket": ("enum", _enum("tomorrow", "week", "later")),
+    "wake_line": ("str", _is_str),
+    "done_on": ("YYYY-MM-DD calendar date", _is_iso_day),
+    "done_kind": ("str", _is_str),
 }
 
 
@@ -433,6 +440,9 @@ register_ordering(
 )
 
 
+DONE_DAYS = 7                     # a resolved or composted List row stays in Done this long
+
+
 # --- THE LIST: band, then what is late and due, then the agents' ready queue, then talks, then the rest -----------------
 
 
@@ -445,9 +455,16 @@ def _list_group(row: RowIn, today: date) -> str:
         # the page counts it under DESK OWES from `band_section`, which it keeps
         if row.facets.get("band_section") == "desk":
             return "band" if row.facets.get("band_carried") is True else "desk"
-        return "later" if row.facets.get("held_until") else "band"
+        return "later" if row.facets.get("time_state") == "later" else "band"
+    state = row.facets.get("time_state")
+    if state == "done":
+        return "done"
+    if state == "later":                # any source: a wake in the future is LATER
+        return "later"
     if s in ("board", "talk"):
         return s
+    if state == "someday":
+        return "someday"
     if row.facets.get("overdue") is True:
         return "overdue"
     return _tray_group(row, today)
@@ -460,10 +477,17 @@ def _int_or_big(v: Any) -> int:
 def _list_key(row: RowIn, today: date) -> tuple:
     f = row.facets
     s = f.get("surface")
+    if f.get("time_state") == "done":       # newest first
+        d = parse_date(f.get("done_on"))
+        return (-(d.toordinal() if d else 0), row.id)
+    if f.get("time_state") == "later" and not (s == "band" and f.get("band_section") == "desk"):
+        # a LATER row comes back on its date (the footer lists them by return day, then band number), whatever its source
+        back = parse_date(f.get("wake_day") or f.get("held_until"))
+        fires = f.get("fires") if isinstance(f.get("fires"), str) else ""
+        return (back.toordinal() if back else 0, fires, _int_or_big(f.get("band_number")), row.id)
     if s == "band":
-        # a LATER row comes back on its date: the footer lists them by return day, then band number
         back = parse_date(f.get("held_until")) if f.get("band_section") != "desk" else None
-        return (back.toordinal() if back else 0, _int_or_big(f.get("band_number")), row.id)
+        return (back.toordinal() if back else 0, "", _int_or_big(f.get("band_number")), row.id)
     if s == "board":
         return (_int_or_big(f.get("board_rank")), row.id)
     if s == "talk":                         # oldest first; a talk with no known age goes last
@@ -481,8 +505,9 @@ register_ordering(
         "spore.list", _list_key, _list_group,
         (("band", "Needs you (answer it in Decisions)"), ("desk", "Desk owes (the desk is on these; nothing for you)"),
          ("later", "Later"), ("overdue", "Overdue"), ("today", "Today"),
-         ("board", "Ready for agents"), ("talk", "To talk through"), ("also", "Also pending")),
-        frozenset({"today", "overdue"}), frozenset({"desk", "later"}),
+         ("board", "Ready for agents"), ("talk", "To talk through"), ("also", "Also pending"),
+         ("someday", "Someday"), ("done", f"Done, last {DONE_DAYS} days")),
+        frozenset({"today", "overdue"}), frozenset({"desk", "later", "done"}),
     ),
     builtin=True,
 )

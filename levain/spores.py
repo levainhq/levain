@@ -77,6 +77,8 @@ __all__ = [
     "is_timed",
     "valid_next",
     "valid_target",
+    "valid_retarget",
+    "executor_of",
 ]
 
 LOOP_DISPOSITION = "loop"
@@ -303,6 +305,25 @@ def valid_target(value: Any) -> bool:
     if value in GERMINATE_TARGETS:
         return True
     return value.startswith("board:") and bool(value[len("board:"):].strip())
+
+
+_FLOW_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def valid_retarget(value: Any) -> bool:
+    """A target the List's who control may WRITE: one the store's other reader (flow's germinate) also accepts. Flow takes a
+    ``board:`` repo only as a plain repo name, a stricter reading than :func:`valid_target`'s non-empty one."""
+    if not valid_target(value):
+        return False
+    return value in GERMINATE_TARGETS or _FLOW_REPO.fullmatch(value[len("board:"):]) is not None
+
+
+def executor_of(target: Any) -> str | None:
+    """Who acts once an agenda with this target wakes, derived and never stored: ``operator`` for a band row or a nudge (it
+    rings in the band), ``machine`` for the desk or a board item. None for no target, or one that is not a target."""
+    if not valid_target(target):
+        return None
+    return "operator" if target in ("band", "nudge") else "machine"
 
 
 def is_talk_seed(item: Mapping[str, Any]) -> bool:

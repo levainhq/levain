@@ -441,6 +441,14 @@
   // timeout runs the check after that handler)
   document.addEventListener("click", function () { setTimeout(flushIfIdle, 0); }, true);
   document.addEventListener("keydown", function (ev) { if (ev.key === "Escape") setTimeout(flushIfIdle, 0); }, true);
+  // leaving a field lifts the focus block on a deferred read (the timeout lets focus settle on its next target first)
+  // (a pointer still down means the blur is the start of a click on something: that click's own flush runs after it, so the target
+  // is never torn out between the press and the release)
+  let pointerDown = false;
+  document.addEventListener("pointerdown", function () { pointerDown = true; }, true);
+  document.addEventListener("pointerup", function () { pointerDown = false; }, true);
+  document.addEventListener("pointercancel", function () { pointerDown = false; }, true);
+  document.addEventListener("focusout", function () { if (!pointerDown) setTimeout(flushIfIdle, 0); }, true);
   function flushIfIdle() { if (deferredReload && !inflight && !editInProgress()) flushDeferred(); }
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and
@@ -455,9 +463,22 @@
   // consult this, so a false "editing" merely defers a harmless re-read; it never blocks
   // save or the initial boot (both passive:false).
   function editInProgress() {
-    if (!window.LevainDashboard || typeof window.LevainDashboard.hasUnsavedEdit !== "function") return true;
-    return window.LevainDashboard.hasUnsavedEdit();
+    const d = window.LevainDashboard;
+    if (d && typeof d.editHoldsRefresh === "function") return d.editHoldsRefresh();
+    if (!d || typeof d.hasUnsavedEdit !== "function") return true;
+    return d.hasUnsavedEdit();
   }
+  // A passive read refused for an edit or a field in use stays OWED: the latch is set here, so every caller (the refresh button,
+  // the tab coming back, a stale re-read) is flushed by the same release, and a timer checks again once a focus-only hold has aged out.
+  let idleT = 0;
+  const IDLE_RECHECK_MS = 10250;
+  function refuseForEdit(msg) {
+    status(msg || "editing — refresh deferred");
+    deferredReload = true;
+    refuseArm();
+    return false;
+  }
+  function refuseArm() { if (!idleT) idleT = setTimeout(function () { idleT = 0; flushIfIdle(); if (deferredReload) refuseArm(); }, IDLE_RECHECK_MS); }
 
   // DATA SOURCE (cockpit design §7). The page draws from the kernel's cockpit manifest + panel routes
   // (cockpit_view.js maps them onto the same components) and writes through /cockpit/verb (postVerb
@@ -961,7 +982,7 @@
       return false;
     }
     // Pre-fetch fast path: don't even fetch if we already know an edit is open.
-    if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
+    if (passive && editInProgress()) return refuseForEdit();
     inflight = true;
     inflightAt = Date.now();
     inflightPassive = passive;
@@ -972,7 +993,7 @@
       if (useManifest) {
         const mview = await loadManifestView(passive);
         if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
-        if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
+        if (passive && editInProgress()) { notice = null; return refuseForEdit(); }
         writeTokenRequired = mview.write_token_required === true;
         const liveBefore = live;
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };   // published before the draw: an open detail rebuilds inside render and must read THIS read's actions
@@ -1001,7 +1022,7 @@
         // below, so a background token-403 can't steal focus from in-progress text (complement L3
         // FIND-1 / the spore-108 "passive never disrupts an edit" invariant). The next explicit
         // boot/save load (passive:false) re-prompts.
-        if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
+        if (passive && editInProgress()) return refuseForEdit();
         if (promptForToken()) res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
         if (res.status === 403) {
           // Still refused after the retry (wrong/rotated token, or the operator cancelled): drop the
@@ -1020,7 +1041,7 @@
       // Post-fetch race re-check (codex L3 HIGH): a passive load that STARTED clean, then
       // the operator opened/typed an editor WHILE this fetch was in flight — rebuilding
       // now would still discard it. The save path (passive:false) always applies.
-      if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
+      if (passive && editInProgress()) return refuseForEdit();
       // Track whether THIS surface demands the write token so commit()'s writeHeaders attaches it.
       // True on any writable surface (K2a), false on a read-only one.
       writeTokenRequired = view.write_token_required === true;

@@ -377,12 +377,9 @@
      .clause/.row machinery, so per-item expand + line-clamp are inherited, not re-invented. */
   .ext-note { color: var(--dim); font-size: var(--fs-micro); margin: var(--sp-1) 0 var(--sp-3); }
   .ext-note.stale { color: var(--operate); }
-  .held-line { display: flex; align-items: baseline; gap: var(--sp-2); }
-  .held-toggle { cursor: pointer; background: none; border: 0; padding: 0; font: inherit; color: var(--label);
+  .list-open-match { cursor: pointer; background: none; border: 0; padding: 0; font: inherit; color: var(--label);
     text-decoration: underline; text-decoration-color: var(--hair-2); text-underline-offset: 3px; }
-  .held-toggle:hover { color: var(--text); }
-  /* the date a held row surfaces is the reason it is listed here: the meta line's ellipsis never cuts it */
-  body.ke .row[data-held] > [data-ck-tag-state="held"] { overflow: visible !important; text-overflow: clip !important; }
+  .list-open-match:hover { color: var(--text); }
   .grp-head { color: var(--faint); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase;
     margin: var(--sp-3) 0 var(--sp-1); padding-top: var(--sp-2); border-top: 1px solid var(--line); }
   .grp-head:first-child { border-top: 0; margin-top: 0; }
@@ -786,9 +783,24 @@
     font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--ink); background: var(--base);
     border: 1px solid var(--line-hot); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); outline: none;
   }
-  .verb-date:focus {
+  .verb-date:focus, .verb-time:focus {
     border-color: var(--label);
   }
+  .verb-time {
+    font: var(--fw-regular) var(--fs-meta)/var(--lh-list) var(--sans); color: var(--ink); background: var(--base);
+    border: 1px solid var(--line-hot); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); outline: none;
+  }
+  /* the "when?" form: quick picks on their own line, then the day and time, who does it, and the confirm row */
+  .when-form, .who-form { flex-direction: row; max-width: 100%; }
+  .when-picks { display: flex; flex-wrap: wrap; gap: var(--sp-2); flex: 1 1 100%; }
+  /* compact: the day and the time share a row (each takes half) so the confirm row sits higher */
+  .when-form .verb-date, .when-form .verb-time { flex: 1 1 7rem; min-width: 0; }
+  .when-form .who-ctl { flex: 1 1 100%; }
+  .when-zone { flex: 1 1 100%; }
+  .who-ctl { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+  .who-opt[aria-pressed="true"] { color: var(--ink); border-color: var(--label); background: var(--card-2); }
+  .who-repo { min-width: 0; width: 10rem; }
+  .who-repo[hidden] { display: none; }
 
   /* ── RESPONSIVE — the deck fits the hand ───────────────────────────────────
      The chassis was built mobile-first: the grid already reflows 1→2→3 columns
@@ -811,6 +823,8 @@
      max-width:1320px/auto-margin, so on a phone it's full-width minus this pad);
      the Unit name scales down once more. */
   @media (max-width: 760px) {
+    .when-pick, .who-opt, .verb-date, .verb-time, .who-repo { min-height: 44px; box-sizing: border-box; }
+    .verb-date, .verb-time, .who-repo { font-size: 16px; }
     body { padding: var(--sp-4) var(--sp-4) var(--sp-8); }
     .entity { font-size: var(--fs-lead); }
   }
@@ -837,6 +851,8 @@
     .undo-btn { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-micro); }
     .edit-btn, .name-edit, .state-edit { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-micro); }
     .verb-confirm, .verb-cancel { padding: var(--sp-3) var(--sp-4); }
+    .when-pick, .who-opt, .verb-date, .verb-time, .who-repo { min-height: 44px; box-sizing: border-box; }
+    .verb-date, .verb-time, .who-repo { font-size: 16px; }
     .scope-tb { padding: var(--sp-3) var(--sp-4); font-size: var(--fs-micro); }
     .scope-ch { padding: var(--sp-3) var(--sp-3); font-size: var(--fs-micro); }
     .tab { padding: var(--sp-4) var(--sp-5); }
@@ -2605,7 +2621,7 @@ body.ke .panel[data-ck-panel="loops"] .row[data-spore] { scroll-margin-top: calc
 
 /* ═══════════════════════════ BOARD WORK LISTS TO THE MOCK (K10 S4) ═══════════════════════════
    Open loops: a left stripe per heat (hot orange, warm violet, parked grey), the spore id, "open N d" and the repo, on Board as on Build.
-   Tray: what is late reads first, with a red stripe and "overdue N d" in red; Resolve and Snooze are always on the row, never hover-only. */
+   Tray: what is late reads first, with a red stripe and "overdue N d" in red; the row's verbs are always shown, never hover-only. */
 body.ke [data-ck-panel="loops"] .row[data-heat] { --heat: var(--meta); }
 body.ke [data-ck-panel="loops"] .row[data-heat="hot"] { --heat: var(--accent); }
 body.ke [data-ck-panel="loops"] .row[data-heat="warm"] { --heat: var(--violet); }
@@ -2624,10 +2640,8 @@ body.ke [data-ck-panel="tray"] .more-foot[data-list-more] { min-height: var(--hi
 /* the Crystallized panel's "Read all" starts where its content does */
 body.ke .ck-zgrid .ck-mem-crys > .more-foot { padding-inline: var(--sp-6); margin-bottom: var(--sp-4); }
 
-/* Board work lists: the repo chip sits in the meta line (the mock), its held-back line closes the list (every long panel keeps its filter box: Phill 10-11) */
+/* Board work lists: the repo chip sits in the meta line (the mock; every long panel keeps its filter box: Phill 10-11) */
 body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
-body.ke [data-ck-panel="tray"] .held-line { justify-content: center; padding: var(--sp-3) 0 var(--sp-4); font-size: var(--fs-meta); }
-body.ke [data-ck-panel="tray"] .held-toggle { text-decoration: underline; text-underline-offset: 3px; }
 /* the Board's work lists show their rows whole before they fold: room for a full Tray and Open loops */
 body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="loops"]) { max-height: 700px; }
 /* the taller Board stack's last card ends the two stacks together (dashboard_core.js balanceStacks sets the cap) */
@@ -3671,8 +3685,13 @@ a.nc-pick.is-rec:hover { border-color: var(--text); }
 .needs-later-line .needs-later-band[hidden] { display: block; visibility: hidden; }   /* an unnumbered row keeps its column, so the rest still line up */
 
 /* The List (the Tray's wire id `tray` stays): the surface chips, the one-line intake box and its receipt. */
-.list-surfaces { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
-.list-surfaces .rc-chip { min-height: var(--ctl-md); }
+.list-surfaces, .list-times { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
+.list-surfaces .rc-chip, .list-times .rc-chip { min-height: var(--ctl-md); }
+.list-chips-label { flex: none; align-self: center; min-width: 3.4em; color: var(--faint); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round);
+  letter-spacing: var(--track-caps); text-transform: uppercase; }
+/* the two rows read as two questions: when (squared chips) and what kind (pills) */
+.list-times .rc-chip { border-radius: var(--r-sm); }
+[data-ck-panel="tray"] .grp-sub { color: var(--faint); font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round); margin: var(--sp-3) 0 var(--sp-1); }
 .list-intake { gap: var(--sp-2); }
 .list-intake-row { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
 .list-intake-input {
@@ -3693,7 +3712,7 @@ body.ke .tray-dump.list-intake .edit-msg:empty { display: none; }
 [data-ck-panel="tray"] .row > .list-meta > .list-pointer { font-style: italic; }
 @media (max-width: 720px) {
   .list-intake-input { font-size: var(--fs-title); }   /* 16px+: iOS Safari does not zoom the page on focus */
-  .list-surfaces .rc-chip { min-height: var(--hit-min); padding-inline: var(--sp-4); }
+  .list-surfaces .rc-chip, .list-times .rc-chip { min-height: var(--hit-min); padding-inline: var(--sp-4); }
 }
 /* a List row's meta line is one cell that wraps: the row grid's four meta columns hold fewer facts than a drop row carries */
 body.ke .row:has(> .clause.clampable) > .list-meta:not(.clause):not(.clause-toggle):not(.ck-rowaddr):not(.verb-actions) {
@@ -3711,8 +3730,6 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
 .list-meta > .list-support { flex: 1 1 100%; white-space: normal; line-height: var(--lh-list); }
 .list-meta > .k7-repo { flex: none; }
 @media (max-width: 720px) {
-  body.ke [data-ck-panel="tray"] .held-line { justify-content: flex-start; flex-wrap: wrap; margin: var(--sp-4) 0 var(--sp-3); padding: var(--sp-3) 0 0;
-    border-top: 1px solid var(--hair); text-align: left; }
   body.ke [data-ck-panel="tray"] .panel > .more-foot, body.ke [data-ck-panel="tray"] > .more-foot { align-self: stretch; margin: 0 var(--sp-6) var(--sp-4);
     min-height: var(--hit-min); border: 1px solid var(--hair-2); border-radius: var(--r-md); text-decoration: none; }
 }
