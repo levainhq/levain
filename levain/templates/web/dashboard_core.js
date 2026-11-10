@@ -5018,18 +5018,27 @@
   // a handle is kept by the question's card id (flow's "question:<n>"), else its number: one string key either way, so a number
   // that arrives as a string and as a number is one question
   const questionKeyOf = (q) => (q && q.id ? String(q.id) : "n:" + String(q && q.n));
+  // cut by code points (never inside a surrogate pair); a trailing partial word goes only when the cut fell inside it
+  function cutQuestionLine(line) {
+    const cps = Array.from(line);
+    if (cps.length <= QUESTION_LINE_CHARS) return line;
+    let head = cps.slice(0, QUESTION_LINE_CHARS - 1).join("");
+    if (!/\s/.test(cps[QUESTION_LINE_CHARS - 1])) head = head.replace(/\s+\S*$/, "");
+    return head + "\u2026";
+  }
   function rememberQuestionHandle(q, handle, line) {
     const k = questionKeyOf(q);
+    const prevLine = questionLines.get(k);
     const changed = questionHandles.get(k) !== handle;
     questionHandles.delete(k);
     questionHandles.set(k, handle);
     if (questionHandles.size > QUESTION_HANDLES_MAX) questionHandles.delete(questionHandles.keys().next().value);
     if (line) {
       questionLines.delete(k);
-      questionLines.set(k, line.length > QUESTION_LINE_CHARS ? line.slice(0, QUESTION_LINE_CHARS - 1).replace(/\s+\S*$/, "") + "\u2026" : line);
+      questionLines.set(k, cutQuestionLine(line));
       if (questionLines.size > QUESTION_HANDLES_MAX) questionLines.delete(questionLines.keys().next().value);
     }
-    if (changed) repaintNeedsNames(k);
+    if (changed || (line && questionLines.get(k) !== prevLine)) repaintNeedsNames(k);
   }
   // The glance tile is drawn before a question's words are read, so a name learned later is painted into the tile that already
   // stands (cockpit_view.js glanceFace marks it with the item it names). Only a tile naming `key` is touched (all of them when
@@ -6918,9 +6927,22 @@
     modalKey = "needs:" + id;
     modalReturnFocus = opener || null;
     modalEpisodeQuery = "";
+    needsFocusNow = { it, id };
+    watchWideDialog();
     buildModal(null);
     // a question's handle comes from its words, which are fetched: the title is retaken when they land (the card reads the same fetch)
     if (it.kind === "question") Promise.resolve(questionBody(it.q, null)).then(() => retitleNeedsFocus(it, id), () => {});
+  }
+  // the desk/phone title form is read when the title is built: crossing the breakpoint with the dialog open retakes it
+  let needsFocusNow = null, wideWatched = false;
+  function watchWideDialog() {
+    if (wideWatched || !window.matchMedia) return;
+    wideWatched = true;
+    try {
+      const mq = window.matchMedia("(min-width: 761px)");
+      const on = () => { if (needsFocusNow && needsFocusNow.it.kind === "question") retitleNeedsFocus(needsFocusNow.it, needsFocusNow.id); };
+      if (mq.addEventListener) mq.addEventListener("change", on); else if (mq.addListener) mq.addListener(on);
+    } catch (e) { wideWatched = false; }
   }
   function retitleNeedsFocus(it, id) {
     if (!modalCustom || modalCustom.page || modalCustom.id !== id) return;
