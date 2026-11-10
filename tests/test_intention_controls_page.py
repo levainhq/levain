@@ -28,8 +28,14 @@ PROBE = ("JSON.stringify({sets: [...document.querySelectorAll('#levain-modal .in
          " listBand: document.querySelectorAll('[data-surface=band]').length,"
          " listSets: document.querySelectorAll('[data-surface=band] .intention-actions').length,"
          " fits: document.documentElement.scrollWidth <= window.innerWidth + 1, probe: 1})")
-READY = ("document.querySelectorAll('#levain-modal .intention-actions button').length >= 4 && "
-         "document.querySelectorAll('#levain-modal .question-option').length >= 2 && 1")
+# Ready is read PER ROW, never from modal-wide counts: the band strip at the head of the Decisions panel draws its own
+# `.question-option` buttons (three of them here), so a modal-wide ">= 2 options" holds before a row's body is drawn and a probe
+# then saw `[["2", 0, 0, 0]]` (CI run 42872732445). A row's body is drawn once its "open" button is gone and its slot no longer
+# reads "reading the question…"; the plain row must also hold its own option buttons and answer box.
+READY = ("(() => { const rows = " + ROWS + "; return rows.length === 2 && rows.every(r => !r.querySelector('.consent-details')"
+         " && r.querySelector('.consent-body') && !/reading the question/.test(r.querySelector('.consent-body').textContent))"
+         " && rows.some(r => r.querySelectorAll('.intention-actions button').length >= 4)"
+         " && rows.some(r => r.querySelectorAll('.question-option').length >= 2 && r.querySelector('.question-words')) && 1; })()")
 
 
 def _steps(width: dict, *more: dict) -> list[dict]:
@@ -76,6 +82,23 @@ def test_a_ringing_row_is_drawn_with_the_four_and_a_plain_row_keeps_its_options(
     assert seen["per"] == [["1", 0, 1, 0], ["2", 2, 0, 1]], json.dumps(seen)
     assert seen["listSets"] == 1, json.dumps(seen)
     assert seen["fits"], seen
+
+
+# a slow read of the plain row's question (the loaded-runner order, forced): the band strip's own option buttons are on the page
+# before that row's body is, and the probe must still wait for the row
+SLOW_ROW_READ = ("(() => { const f = window.fetch; window.fetch = (u, ...a) => /cockpit\\/question\\/2/.test(String(u)) ? "
+                 "new Promise(r => setTimeout(r, 4000)).then(() => f(u, ...a)) : f(u, ...a); })()")
+
+
+@needs_browser
+def test_the_probe_waits_for_a_row_whose_question_read_is_slow(tmp_path: Path, lh: Path) -> None:
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    steps = _steps(PHONE, {"eval": PROBE})
+    steps.insert(1, {"init": SLOW_ROW_READ})
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", steps)
+    seen = _probe(out)
+    assert seen["per"] == [["1", 0, 1, 0], ["2", 2, 0, 1]], json.dumps(seen)
 
 
 @needs_browser
