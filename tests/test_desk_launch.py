@@ -20,7 +20,7 @@ import pytest
 from levain.desk import launch as cl
 from levain.desk import lease
 from levain.desk.store import CoordStore
-from levain.desk.legacy import CAUSE_CODEX_REMOVED, CODEX_RULE_HEADER, CODEX_RULE_JUSTIFICATION, CODEX_RULE_NAME, JSON_ROLE_DESK, DESK_HOME_NAME, RECORD_NAME_WORKSPACES, ROLE_DESK, SESSION_PREFIX_DESK, SQL_ROLE_DESK
+from levain.desk.legacy import CAUSE_CODEX_REMOVED, cause_word, CODEX_RULE_HEADER, CODEX_RULE_JUSTIFICATION, CODEX_RULE_NAME, JSON_ROLE_DESK, DESK_HOME_NAME, RECORD_NAME_WORKSPACES, ROLE_DESK, SESSION_PREFIX_DESK, SQL_ROLE_DESK
 
 HID = "2be178ea"
 SID = "2be178ea-7208-46be-8ef7-5b0e49a354e0"
@@ -2727,7 +2727,8 @@ def test_a_pending_codex_launch_is_retired_by_the_watcher_not_left_to_expire(qdi
     lines = cl.watch_once(s)
     got = s.launch(launch_id)
     assert (got.state, got.cause) == ("failed", CAUSE_CODEX_REMOVED), lines
-    assert any(launch_id in line and CAUSE_CODEX_REMOVED in line for line in lines), lines
+    assert any(launch_id in line and "codex desk removed" in line for line in lines), lines     # the stored cause reads as desk
+    assert cause_word(CAUSE_CODEX_REMOVED) == "codex desk removed" and not any(CAUSE_CODEX_REMOVED in line for line in lines), lines
     assert s.coord_lease() is None or not s.coord_lease().live           # its bootstrap claim went with it
     with sqlite3.connect(qdir / "dispatch.db") as c:
         assert lease.launch_death(c, lease.launch(c, launch_id)) is not True   # a retirement, never a death

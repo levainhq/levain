@@ -42,7 +42,7 @@ from levain.desk.store import (KINDS, STATES, WORDS_MAX, CoordError, Drop, Part,
                                       check_words, words_sha256)
 from levain.dispatch.jobs import JobStoreError
 from levain.desk.move_home import run_move_home
-from levain.desk.legacy import CLI_ALIAS_LONG, CLI_ALIAS_SHORT, ROLE_DESK, by_word, role_word
+from levain.desk.legacy import CLI_ALIAS_LONG, CLI_ALIAS_SHORT, ROLE_DESK, by_word, cause_word, role_word
 
 # what a store call can refuse with: the grammar's refusal, an untrustworthy store, a database it cannot use
 _REFUSED = (CoordError, JobStoreError, sqlite3.Error, OSError)
@@ -1694,7 +1694,7 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                              f"workspace waits on a prompt); run: levain update --path {shlex.quote(str(cwd))}")
     for ln in st["launches"]:
         spawn = f"  {ln['spawn']}" if ln.get("spawn") else ""
-        lines.append(f"  {ln['launch_id']}  {role_word(ln['role'])}{spawn}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
+        lines.append(f"  {ln['launch_id']}  {role_word(ln['role'])}{spawn}  {ln['harness']}  {ln['state']} ({cause_word(ln['cause'])})  "
                      f"session {ln['session_key']}  asked {ln['at']}")
     _emit(out, args.json, st, "\n".join(lines))
     return 0

@@ -109,7 +109,7 @@ from levain.contracts.canon import canonical_bytes
 from levain.desk import lease as lease_mod
 from levain.desk.lease import LEASE_TTL, LeaseRefused
 from levain.desk.store import CoordError, CoordStore
-from levain.desk.legacy import CLI_ALIAS_LONG, CODEX_RULE_HEADER, CODEX_RULE_JUSTIFICATION, CODEX_RULE_NAME, ROLE_DESK, SESSION_ROLE_ALT, desk_home, role_word
+from levain.desk.legacy import CLI_ALIAS_LONG, cause_word, CODEX_RULE_HEADER, CODEX_RULE_JUSTIFICATION, CODEX_RULE_NAME, ROLE_DESK, SESSION_ROLE_ALT, desk_home, role_word
 
 __all__ = ["BRIEF_DROPS", "HOOK_ROW", "READBACK_DELAY", "READBACK_TRIES", "UNLISTED_RECHECK", "WORKER_KINDS", "Outcome",
            "brief_path", "default_desk_dir", "drops_path", "hook_live", "launch_session", "session_name", "setup_install",
@@ -217,7 +217,7 @@ def _refuse_worker(store: Any, ln: Any) -> str:
         return f"launch {ln.launch_id} could not be written failed ({exc}), left pending until {ln.until}"
     if got is None:
         return f"launch {ln.launch_id} moved on meanwhile, nothing written"
-    return f"launch {ln.launch_id} written failed: {got.cause}; it no longer counts against the live-spawn cap"
+    return f"launch {ln.launch_id} written failed: {cause_word(got.cause)}; it no longer counts against the live-spawn cap"
 
 
 def worker_kind(kind: str, requested: str | None = None) -> str | None:
@@ -1379,7 +1379,7 @@ def _retire_removed(store: CoordStore, lines: list[str]) -> None:
         except (LeaseRefused, CoordError, sqlite3.Error) as exc:
             lines.append(f"launch {ln.launch_id}: a {ln.harness} desk, not retired ({exc})")
         else:
-            lines.append(f"launch {ln.launch_id} {kind}: {lease_mod.CODEX_REMOVED} "
+            lines.append(f"launch {ln.launch_id} {kind}: {cause_word(lease_mod.CODEX_REMOVED)} "
                          "(its lease, if it held one, released)")
         # L3 r3: the rule goes whether or not this pass wrote the launch over (one that raced to its end elsewhere
         # is never read again, so its workspace would keep the pre-approval)
@@ -1561,7 +1561,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
             lines.append(f"launch {ln.launch_id}: its session is gone, and it could not be written ended ({exc})")
             continue
         if ended is not None:
-            lines.append(f"launch {ln.launch_id} ended: {ended.cause} (its session is no longer listed)")
+            lines.append(f"launch {ln.launch_id} ended: {cause_word(ended.cause)} (its session is no longer listed)")
     _end_done_workers(store, active, listed, lines, env)
     fresh = _replace_done(store, active, listed, lines)
     held = store.coord_lease()
@@ -1594,7 +1594,7 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
         if hid in stopped:
             continue
         stopped.add(hid)
-        lines.append(f"launch {ln.launch_id} {ln.state} ({ln.cause}): "
+        lines.append(f"launch {ln.launch_id} {ln.state} ({cause_word(ln.cause)}): "
                      f"{_stop(exe, hid, cwd=str(store.directory), env=env)}")
     # the fresh desks start after (d) stopped the done ones they replace; a fault starting one is a line, so
     # the briefs below are still removed
@@ -1787,7 +1787,7 @@ def _end_done_workers(store: CoordStore, active: list[Any], listed: dict[str, di
             lines.append(f"launch {ln.launch_id}: its worker is done, and it could not be written ended ({exc})")
             continue
         if ended is not None:
-            lines.append(f"launch {ln.launch_id} ended: {ended.cause} (its session is done; "
+            lines.append(f"launch {ln.launch_id} ended: {cause_word(ended.cause)} (its session is done; "
                          + ("its handoff is kept" if handoff is not None else "no final message")
                          + (f": {why})" if why else ")"))
     if after != before:
@@ -1874,7 +1874,7 @@ def _replace_done(store: CoordStore, active: list[Any], listed: dict[str, dict[s
         if got is None:
             continue
         ended, new = got
-        lines.append(f"launch {ended.launch_id} ended: {ended.cause} (its session is done and a drop it never saw "
+        lines.append(f"launch {ended.launch_id} ended: {cause_word(ended.cause)} (its session is done and a drop it never saw "
                      "waits)")
         if new is None:
             continue
@@ -1916,7 +1916,7 @@ def wake_idle(store: CoordStore) -> tuple[Outcome | None, str]:
     ended, new = got
     hid = _harness_id(row)
     stopped = "its session is listed without a usable id" if hid is None else _stop(exe, hid, cwd=mgmt, env=env)
-    line = f"launch {ended.launch_id} ended: {ended.cause} ({stopped})"
+    line = f"launch {ended.launch_id} ended: {cause_word(ended.cause)} ({stopped})"
     if new is None:
         return None, f"{line}; no fresh desk was asked for: {store.coord_status()['why']}"
     return launch_session(store, new.launch_id), f"{line}\nasked for desk launch {new.launch_id}"

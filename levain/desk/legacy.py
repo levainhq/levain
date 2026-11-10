@@ -12,6 +12,7 @@ in the import shim ``levain/coordinator/__init__.py`` and nowhere else. A test g
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 ROLE_DESK = "coordinator"                      # the persisted role / by / mode / author_kind value
@@ -52,6 +53,12 @@ def by_word(word: str) -> str:
 def role_word(role: str) -> str:
     """The word a message shows for a stored role value: the desk's stored spelling reads "desk"."""
     return "desk" if role == ROLE_DESK else role
+
+
+def cause_word(cause: str) -> str:
+    """A persisted end cause as a message shows it: the old word in a stored cause (``CAUSE_CODEX_REMOVED``) reads "desk".
+    The stored text is never changed; only what is printed."""
+    return re.sub(rf"\b{LEGACY_HOME_NAME}\b", "desk", cause)
 
 
 def desk_home(levain_home: Path | str | None = None, *, create: bool = False) -> Path:

@@ -75,7 +75,7 @@ from levain.packs import (
     seed_classes,
     verbatim_entries,
 )
-from levain.desk.legacy import ROLE_DESK
+from levain.desk.legacy import ROLE_DESK, role_word
 
 if TYPE_CHECKING:
     from levain.interview import TemplateSpec
@@ -297,7 +297,7 @@ def run_init(
     install = Path(str(path)).expanduser().resolve()
     if role is not None and (role not in ROLE_CHOICES or adapter not in ROLE_ADAPTERS):
         # refused before anything is written, so a bad role never leaves a half-made install behind
-        print(f"FAIL: install role {role!r} is one of {', '.join(ROLE_CHOICES)}, for the "
+        print(f"FAIL: install role {role_word(role)!r} is one of {', '.join(role_word(r) for r in ROLE_CHOICES)}, for the "
               f"{' or '.join(ROLE_ADAPTERS)} adapter only.")
         return 1
     # Pack-layers compose ON TOP of the base templates (base = pack #0). Resolved

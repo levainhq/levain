@@ -56,7 +56,7 @@ from levain import unshowable
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.desk.store import CoordError, _append_only, next_gseq
-from levain.desk.legacy import CAUSE_CODEX_REMOVED, ROLE_DESK, SQL_ROLE_DESK, role_word
+from levain.desk.legacy import CAUSE_CODEX_REMOVED, ROLE_DESK, SQL_ROLE_DESK, cause_word, role_word
 
 __all__ = [
     "BACKOFF", "CODEX_REMOVED", "CODEX_REMOVED_WHY", "HARNESSES", "MAX_SPAWNS_LIVE", "MAX_SPAWN_DEPTH", "SPAWN_PREFIX",
@@ -823,7 +823,7 @@ def worker_handoff(conn: sqlite3.Connection, launch_id: str) -> dict[str, Any]:
         raise _refused("this store holds no worker handoffs yet")
     r = conn.execute("SELECT handoff, why, at FROM launch_handoffs WHERE launch_id = ?", (launch_id,)).fetchone()
     if r is None:
-        raise _refused(f"worker launch {launch_id} is {ln.state} ({ln.cause}) and left no handoff; one is written "
+        raise _refused(f"worker launch {launch_id} is {ln.state} ({cause_word(ln.cause)}) and left no handoff; one is written "
                        "when its turn finishes")
     return {"launch_id": launch_id, "handoff": r[0], "why": r[1], "at": r[2]}
 

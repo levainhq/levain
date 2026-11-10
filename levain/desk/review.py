@@ -45,7 +45,7 @@ from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.desk.store import ACTORS, CoordError, CoordStore, _append_only, _in, next_gseq
-from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK, role_word
+from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK, cause_word, role_word
 
 __all__ = ["FEEDS", "FEED_LABELS", "FOREIGN_CLEAR_TRIGGER", "MODES", "NEAR_STOP", "NO_SPLIT_AFTER", "REVIEW_SCHEMA", "SIGNED", "SIGN_REQUEST_TTL",
            "SIGN_TIER", "CoordNotFound", "Item", "SignedClearRefused", "body_fields", "item_text", "items_need_rebuild", "clear_item", "clear_message",
@@ -996,7 +996,7 @@ def feed_dead_seats(store: CoordStore, *, errors: list[str] | None = None) -> li
             return file_item(store, "seat", {
                 "launch_id": ln.launch_id, "harness": _clip(ln.harness), "role": _clip(ln.role), "state": ln.state,
                 "cause": _clip(ln.cause), "at": ln.at, "threads": list(ln.threads),
-                "text": _clip(f"{role_word(ln.role)} launch {ln.launch_id} ({ln.harness}) {ln.state}: {ln.cause}")},
+                "text": _clip(f"{role_word(ln.role)} launch {ln.launch_id} ({ln.harness}) {ln.state}: {cause_word(ln.cause)}")},
                 dedupe_key=f"seat:{ln.launch_id}", thread_id=one,
                 authority_relevant=ln.pinned_envelope_id is not None)[0]
         except Exception:

@@ -13,7 +13,7 @@ keeps what the record shares with its callers:
   (:data:`KIND_CLASSES`), and the lock (:func:`_locked`), the log (:func:`log_line`, :func:`read_log`) and the setter checks
   every write goes through;
 - the remote-activity record (:func:`note_remote_activity`): input over ssh or mosh, or a turn in the Claude app's remote
-  control, reported BY A CALLER and kept as a high-water mark in ``remote_activity.json``. It is NOT desk presence (Phill
+  control, reported BY A CALLER and kept as a high-water mark in ``remote_activity.json``. It is NOT presence at the laptop (Phill
   11-01: *"don't we want device pings ON when remote desk is measured and NOT be counted at the physical desk?"*): while
   fresh (under :data:`ACTIVE_WINDOW_SECS`) it turns ``follow`` to devices on, and it never counts as laptop input;
 - the wrappers flow's installed half and older callers use for one release: :func:`should_push` (the one decider, signature
@@ -508,7 +508,8 @@ def effective(queue_dir: Path | str | None, now: float | None = None, *, idle: C
 
 def check_setter(word: str, by: dict | None, said: str | None) -> str:
     """The quote to record for a setter's write, or a raised :class:`PresenceError` saying why it is refused. ``by``
-    is ``{"agent", "session", "role"}`` with role ``seat`` or ``desk``. Pure: a refusal writes nothing."""
+    is ``{"agent", "session", "role"}`` with role ``seat`` or ``ROLE_DESK`` (the desk's stored spelling,
+    levain.desk.legacy; the messages here call it the desk). Pure: a refusal writes nothing."""
     if not isinstance(by, dict):
         raise PresenceError("the setter names no agent")
     role = by.get("role")

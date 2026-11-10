@@ -3175,7 +3175,7 @@ def hook_stop(payload: Any, environ: Mapping[str, str] | None = None, agent: str
     unreadable (no view, a non-text reply, an autonomous seat, a busy or missing store). Which turn this was, and its
     viewer, come from the turn record its prompt hook wrote (:func:`_read_turn`), never decided again; a missing or
     unreadable record is decided by one launch-row read and VERIFIES. The one skip beyond those: a fresh
-    desk-wake record (:func:`_fresh_wake`). A desk session is checked against the view its prompt hook
+    wake-turn record (:func:`_fresh_wake`). A desk session is checked against the view its prompt hook
     staged, which commits here (:func:`_stop_desk`). Every store read and the view's write wait within ONE bound
     (HOOK_BUSY_MS); the ``closed`` notices' write keeps its own (:func:`mark_closed_shown`). A turn that ends here
     removes its record (compare-and-delete). Never raises, never writes the operator's data beyond
