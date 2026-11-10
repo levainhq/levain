@@ -89,14 +89,16 @@ def test_s2_every_send_starts_at_once_and_an_unfinished_one_is_unknown_not_zero(
 
     def slow(req):
         started.append(threading.current_thread())
-        release.wait(5)
+        release.wait(30)
         return 201
 
     monkeypatch.setattr(sender, "_post", slow)
     t0 = time.monotonic()
     got = sender.send(tmp_path, kind="test", ref=None, title="t", body="b")
     took = time.monotonic() - t0
-    assert len(got) == 12 and len(started) == 12 and took < 3
+    # the budget is 0.6 s; a send that waited out the blocked posts would take 30 s. The bound sits far from both so a slow CI runner
+    # (this took 3.09 s there under xdist) never decides it
+    assert len(got) == 12 and len(started) == 12 and took < 15
     assert all(s == sender.UNKNOWN for _, s in got) and sender.UNKNOWN != 0
     assert all(t.daemon for t in started)
     release.set()
