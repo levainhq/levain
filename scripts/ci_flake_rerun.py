@@ -50,26 +50,34 @@ def _split_reason(rest):
     return rest.strip()
 
 
+_ERR_ITEM = re.compile(r"^_+ ERROR (at (setup|teardown) of|collecting) ")
+
+
 def parse_log(text):
-    """(failed node ids in order, whether anything errored). Only the region after the "short test summary info"
-    header is read, so a captured "ERROR ..." / "FAILED ..." output line cannot mislead it; a log with no such header
-    yields no failures (the caller then does not rerun). An "ERRORS" section header counts as errored."""
-    failed, errored, in_summary = [], False, False
-    for ln in text.splitlines():
+    """(failed node ids in order, whether anything errored). Only the region after the LAST "short test summary
+    info" header is read for FAILED / ERROR lines (the real summary is contiguous at the end, so a header spoofed by
+    captured output earlier cannot reopen it); a log with no such header yields no failures (the caller then does not
+    rerun). Fail closed: any "ERROR " line in the summary, and any unparseable "FAILED " line, counts as errored. An
+    "ERRORS" section header counts only when it precedes that summary and is followed by a pytest "ERROR at
+    setup/teardown of" (or "collecting") item line, so a bare header in captured output is ignored."""
+    lines = text.splitlines()
+    last = max((i for i, ln in enumerate(lines)
+                if (m := _HEADER.match(ln)) and m.group(1).strip() == "short test summary info"), default=None)
+    if last is None:
+        return [], False
+    failed, errored = [], False
+    for i, ln in enumerate(lines[:last]):
         m = _HEADER.match(ln)
-        if m:
-            title = m.group(1).strip()
-            if title == "ERRORS":
-                errored = True
-            in_summary = title == "short test summary info"
-            continue
-        if not in_summary:
-            continue
-        if ln.startswith("FAILED ") or ln.startswith("ERROR "):
+        if m and m.group(1).strip() == "ERRORS" and any(_ERR_ITEM.match(x) for x in lines[i + 1:last]):
+            errored = True
+    for ln in lines[last + 1:]:
+        if _HEADER.match(ln):
+            break
+        if ln.startswith("ERROR "):
+            errored = True
+        elif ln.startswith("FAILED "):
             nid = _split_reason(ln.split(" ", 1)[1])
             if not _NODE.match(nid):
-                continue
-            if ln.startswith("ERROR "):
                 errored = True
             elif nid not in failed:
                 failed.append(nid)
