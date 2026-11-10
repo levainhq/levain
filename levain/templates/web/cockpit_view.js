@@ -110,7 +110,23 @@
   const isCalm = () => typeof document !== "undefined" && !!document.documentElement && !!document.documentElement.classList && document.documentElement.classList.contains("calm");
   // Once armed, the one timer runs for the page's life: a tick that finds no age on the page costs one empty query, and the
   // next age drawn needs no re-arm. Detached nodes are skipped (querySelectorAll only returns attached ones, so they are never seen).
+  // a band row's age in the footer's form (minutes under an hour, hours under a day, else days and hours), from the instant it counts
+  // from; null when the instant is unreadable or still ahead, and the first-paint text stays
+  function bandAgeText(iso, nowMs) {
+    const t = parseIso(iso);
+    if (isNaN(t)) return null;
+    const secs = (nowMs - t) / 1000;
+    if (secs < 0) return null;
+    const h = Math.floor(secs / 3600);
+    return h >= 24 ? Math.floor(h / 24) + "d" + (h % 24) + "h" : h ? h + "h" : Math.floor(secs / 60) + "m";
+  }
+  function armAges() { if (!ageTimer) ageTimer = root.setInterval(tickAges, isCalm() ? CALM_AGE_TICK_MS : AGE_TICK_MS); }
   function tickAges() {
+    for (const n of (typeof document !== "undefined" && document.querySelectorAll ? Array.from(document.querySelectorAll("[data-band-since]")) : [])) {
+      if (!n.isConnected) continue;
+      const text = bandAgeText(n.dataset.bandSince, serverNow());
+      if (text !== null && n.textContent !== text) n.textContent = text;
+    }
     for (const n of (typeof document !== "undefined" && document.querySelectorAll ? Array.from(document.querySelectorAll("[data-age-at]")) : [])) {
       if (!n.isConnected) continue;
       const text = savedAge(n.dataset.ageAt, serverNow());
@@ -195,6 +211,7 @@
       band_section: f.band_section === "desk" || f.band_section === "you" ? f.band_section : null,
       carried: f.band_carried === true,
       band_age: typeof f.band_age === "string" && f.band_age ? f.band_age : null,
+      band_since: typeof f.band_since === "string" && f.band_since ? f.band_since : null,
       intention: typeof f.intention === "string" && f.intention ? f.intention : null,
       intention_text: typeof f.intention_text === "string" ? f.intention_text : "",
       // the List's time-state, as the kernel computed it: the page draws these and derives none of them
@@ -2750,7 +2767,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
+  Object.assign(K, { bandAgeText, armAges, paintHeaderLens, paintBuildSessions, paintBuildZone, paintLegend, skyCounts, skySize, fill, fitWidgets, mountClock, refetchPanel, pruneModal, tickAges, ageSpan, serverNow, AGE_TICK_MS, CALM_AGE_TICK_MS, isCalm, setCalm, ageTimerArmed: () => ageTimer !== 0, reset: () => { boardEpoch++; for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids, modesOf, TABS_OF_ID, TABS_OF_REGION, setTheme, chosenTheme, layoutOrder, layoutCollapsed, hasLayout, setLayoutOrder, setLayoutCollapsed, resetLayout, hashMode, revealTab });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

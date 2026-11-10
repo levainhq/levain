@@ -181,6 +181,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "band_section": ("enum", _enum("you", "desk")),
     "band_carried": ("bool", _is_bool),
     "band_age": ("str", _is_str),                # a band row's age in the footer's form ("1d6h"), from the host's refile clock
+    "band_since": ("str", _is_str),              # the instant that age counts from: the page ticks the age text from it
     "band_later_words": ("Mon..Sun, optionally followed by MM-DD", _is_later_words),
     # an open band row that rings an intention (the spore id): the row is then offered snooze, edit, done and clear in place
     # of an answer box. Present only when the host can act on it

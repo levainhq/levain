@@ -307,7 +307,7 @@ def test_the_panel_is_registered_where_the_tray_was_and_loops_is_untouched(rig: 
 def _normal(panel: dict[str, Any], rig: Rig) -> dict[str, Any]:
     """The panel with what varies per run made stable: the question id, the etag, the read time, the versions."""
     text = json.dumps(panel, sort_keys=True).replace(rig.q.id, "q-0001")
-    text = re.sub(r'"(version|etag|as_of|read_at)": "[^"]*"', lambda m: f'"{m.group(1)}": "<{m.group(1)}>"', text)
+    text = re.sub(r'"(version|etag|as_of|read_at|band_since)": "[^"]*"', lambda m: f'"{m.group(1)}": "<{m.group(1)}>"', text)
     return json.loads(text)
 
 
@@ -436,21 +436,28 @@ def test_listpanel_r6_a_band_rows_age_reads_the_refile_clock_in_the_footers_form
     assert {r["id"]: r for r in rig.panel()["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"] == "30m"
 
 
-def test_listpanel_a_band_rows_age_reading_alone_does_not_move_the_etag(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The age text is a clock reading: an idle store crosses a minute boundary and the row reads 31m instead of 30m. The etag
-    must not move for it (it announced a panel that had not changed, and the page reloaded the whole board); a real change must."""
-    def head_and_age() -> tuple[str, str]:
-        panel = rig.panel()
-        return panel["etag"], {r["id"]: r for r in panel["rows"]}[f"band:{rig.q.id}"]["facets"]["band_age"]
+def _band_tag_and_since(rig: Rig, q: str | None = None) -> tuple[str, str | None, str | None]:
+    panel = rig.ck.panel("tray", q=q, credential_class="token")
+    row = {r["id"]: r for r in panel["rows"]}[f"band:{rig.q.id}"]
+    return panel["etag"], row["facets"].get("band_since"), row["facets"].get("band_age")
 
+
+@pytest.mark.parametrize("q", [None, "sweep"])
+def test_listpanel_a_band_rows_age_text_alone_does_not_move_the_etag_but_its_instant_does(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch, q: str | None) -> None:
+    """The age text is a clock reading: an idle store crosses a minute boundary and the row reads 31m instead of 30m. The etag must
+    not move for it (it announced a panel that had not changed, and the page reloaded the whole board), a search answer included.
+    The instant the age counts from is in the row and in the etag, so a refile that only resets the age still moves it."""
     _band_with(monkeypatch, rig, section="you", filed_at=_iso(-0.5), section_since="")
-    tag_a, age_a = head_and_age()
-    _band_with(monkeypatch, rig, section="you", filed_at=_iso(-0.52), section_since="")
-    tag_b, age_b = head_and_age()
-    assert (age_a, age_b) == ("30m", "31m")
-    assert tag_a == tag_b
-    _band_with(monkeypatch, rig, section="desk", carried=False, filed_at=_iso(-0.52), section_since="")
-    assert head_and_age()[0] != tag_b
+    monkeypatch.setattr(list_panel, "_age_text", lambda *_a: "30m")
+    tag_a, since_a, age_a = _band_tag_and_since(rig, q)
+    assert since_a == _iso(-0.5) and age_a == "30m"          # the page ticks the age from this
+    monkeypatch.setattr(list_panel, "_age_text", lambda *_a: "31m")
+    tag_b, since_b, age_b = _band_tag_and_since(rig, q)
+    assert (since_b, age_b) == (since_a, "31m") and tag_b == tag_a
+    _band_with(monkeypatch, rig, section="you", filed_at=_iso(-0.5), section_since=_iso(-0.1))     # a refile: only the clock moved
+    tag_c, since_c, _age = _band_tag_and_since(rig, q)
+    assert since_c == _iso(-0.1) and tag_c != tag_b
 
 
 # --- 531 round 7 (levain 76, lpr3): L3 r1 fixes --------------------------------------------------------------------------

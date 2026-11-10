@@ -58,7 +58,7 @@ BAND_POINTER = "answer it in Decisions (levain band)"
 BOARD_POINTER = "the agents' ready queue (levain board)"
 LIST_FACETS = SPORE_FACETS | frozenset({
     "surface", "fires", "overdue", "target", "attention", "list_pointer", "band_number", "board_rank", "board_tier",
-    "source", "repo", "held_until", "intention", "intention_text", "band_section", "band_carried", "band_age", "band_later_words",
+    "source", "repo", "held_until", "intention", "intention_text", "band_section", "band_carried", "band_age", "band_since", "band_later_words",
     "time_state", "wake_day", "wake_bucket", "wake_line", "done_on", "done_kind",
 })
 SURFACES = ("band", "board", "spore", "talk", "drop")
@@ -243,9 +243,11 @@ def _band_row(card: dict[str, Any], today: date, now: datetime) -> RowIn:
         facets["age_days"] = (today - filed).days
     # the age a band row shows is the clock flow's footer reads (the row's refile instant when the host sends one, else its
     # add instant), in the footer's own form, never a whole-day count
-    age = _age_text(card.get("since") or card.get("filed_at"), now)
+    clock = card.get("since") or card.get("filed_at")
+    age = _age_text(clock, now)
     if age:
-        facets["band_age"] = age
+        facets["band_age"] = age      # the first-paint text; the page recomputes it from band_since
+        facets["band_since"] = clock  # the instant the age counts from: stable, so it is in the etag (band_age is not)
     later = card.get("later")
     if isinstance(later, str) and parse_date(later) and parse_date(later) > today:
         facets["held_until"] = later[:10]

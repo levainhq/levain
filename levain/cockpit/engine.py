@@ -2426,7 +2426,7 @@ class Cockpit:
         shown = out["rows"] if out["rows"] is not None else (out["value"] or {}).get("rows")
         if out["status"] in ("ok", "empty") and "search_error" not in out:
             out["status"] = "ok" if shown else "empty"
-        out["etag"] = _sha({"base": out["etag"], "status": out["status"], "rows": out["rows"], "value": out["value"],
+        out["etag"] = _sha({"base": out["etag"], "status": out["status"], "rows": _etag_rows(out["rows"]), "value": out["value"],
                             "matched": out.get("matched"), "label": out.get("match_label"),
                             "error": out.get("search_error")})
 

@@ -2126,7 +2126,12 @@
       if (s.surface === "board") {
         if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
       }
-      if (s.band_age) host.appendChild(el("span", "muted", s.band_age));       // the footer's clock and form, never whole days from the add
+      if (s.band_age) {
+        const ageEl = el("span", "muted", s.band_age);
+        const KK = window.LevainCockpitKinds;
+        if (s.band_since && KK && KK.armAges) { ageEl.dataset.bandSince = s.band_since; KK.armAges(); }   // ticks on the page's age timer, no read
+        host.appendChild(ageEl);
+      }       // the footer's clock and form, never whole days from the add
       else if (s.surface !== "band" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
       if (intend) appendRowVerbs(row, buildIntentionVerbs(s.row_id, s.actions, s.intention_text), ["Done", "Snooze"], 2);
       return row;
