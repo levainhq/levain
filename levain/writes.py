@@ -1959,10 +1959,15 @@ KEEP_EPISODE_TAG = "list-keep"
 
 
 def keep_origin_key(intention: Mapping[str, Any]) -> str:
-    """The episode key of a Keep of ``intention``: the intention's own ``origin_key`` (store-assigned once), else its id for a
-    legacy row that has none. One intention, one key, so a retry of the Keep lands one episode (Q2, Phill 11-10)."""
+    """The episode key of a Keep of ``intention``: ``keep:`` + the sha256 hex of the intention's own ``origin_key``
+    (store-assigned once), else of its id for a legacy row that has none. One intention, one key, so a retry of the Keep lands
+    one episode (Q2, Phill 11-10). Hashed because anneal's key grammar is ``[0-9A-Za-z._:-]{1,128}``: an intention key may hold
+    spaces, Unicode or run to 128 characters on its own, and a hash is always 69 characters of the grammar."""
+    import hashlib
+
     ok = intention.get("origin_key")
-    return "keep:" + (ok if isinstance(ok, str) and ok else f"id:{intention.get('id')}")
+    basis = ok if isinstance(ok, str) and ok else str(intention.get("id"))
+    return "keep:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
 def keep_episode_body(intention: Mapping[str, Any]) -> str:
@@ -1985,7 +1990,13 @@ def _apply_intention_keep(
     in a fixed order, tier C1: (1) an anneal ``observation`` episode, the intention's words verbatim plus a source tag, keyed
     on the intention's origin key so a retry lands exactly once; THEN (2) the intention is composted. A crash between them
     leaves the intention OPEN with its episode written, and the retry lands no second episode (the key). A refusal ahead of
-    act 1 (a stale row, a ringing agenda) writes nothing."""
+    act 1 (a stale row, a ringing agenda) writes nothing.
+
+    The retry guarantee holds while (a) the intention stays open and is not resolved by another route, (b) the episode is not
+    deleted from anneal (a key is never reused: that retry is refused as ``keep_key_retired`` and the intention is composted
+    by hand), and (c) the intention keeps its origin key. Whatever the intention's words are on the retry, an episode already
+    holding this key means the Keep happened, so the retry goes on to the compost and the receipt says the earlier words were
+    kept. The audit line lands after BOTH acts, so a crash between them leaves no line and the retry writes it."""
     from anneal_memory import AnnealMemoryError, Store
     from anneal_memory.spores import IntentionError
     from anneal_memory.store import OriginKeyConflict
@@ -2011,13 +2022,28 @@ def _apply_intention_keep(
         if guard.found != guard.expected:
             raise EditError("stale", 409, "the item changed since it was read; re-read it and retry")
     key = keep_origin_key(intention)
+    earlier = False
     try:
         with Store(str(paths.episodic_db), read_only=False) as st:
-            ep = st.record(
-                content=keep_episode_body(intention), episode_type="observation", source=KEEP_EPISODE_SOURCE,
-                metadata={"tags": [KEEP_EPISODE_TAG], "intention": intention_id}, origin_key=key)
-    except OriginKeyConflict as exc:   # an earlier, crashed Keep landed this item's episode under other words
-        raise EditError("keep_conflict", 409, f"this item was already kept once, under different words: {exc}") from exc
+            try:
+                ep = st.record(
+                    content=keep_episode_body(intention), episode_type="observation", source=KEEP_EPISODE_SOURCE,
+                    metadata={"tags": [KEEP_EPISODE_TAG], "intention": intention_id}, origin_key=key)
+            except OriginKeyConflict:
+                # a key we derive from this intention alone: an episode already holds it, so an earlier Keep landed under the
+                # words it had then. The Keep happened; do not write again (a refusal here would wedge every retry once the
+                # words were edited), go on to the compost.
+                ep = st.get_by_origin_key(key)
+                if ep is None:                   # not reachable (the conflict names a live episode); never compost blind
+                    raise
+                earlier = True
+    except ValueError as exc:          # a key anneal will not reuse (its episode was deleted), or one outside its grammar
+        if isinstance(exc, AnnealMemoryError):           # one of anneal's own refusals, not the key's
+            raise EditError("verb_failed", 422, f"the episode could not be written: {exc}") from exc
+        raise EditError(
+            "keep_key_retired", 409,
+            "this item was kept before and that memory was since deleted, and anneal never reuses a key: compost the "
+            f"item by hand instead of keeping it again ({exc})") from exc
     except AnnealMemoryError as exc:
         raise EditError("verb_failed", 422, f"the episode could not be written: {exc}") from exc
     except OSError as exc:
@@ -2032,8 +2058,9 @@ def _apply_intention_keep(
         scope.ledger_root, kind="intention_keep", action="keep", target=f"intention:{intention_id}", now=now,
         extra={"episode_id": ep.id, "origin_key": key},
     )
+    line = f"kept as memory: episode {ep.id}" + (" (kept earlier, under its earlier words)" if earlier else "")
     return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": "keep", "episode_id": ep.id,
-            "receipt_line": f"kept as memory: episode {ep.id}"}
+            "receipt_line": line, **({"earlier_words_kept": True} if earlier else {})}
 
 
 # --- Slice 3b: the Tray operator-I/O write kinds -----------------------------

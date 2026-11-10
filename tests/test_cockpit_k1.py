@@ -547,7 +547,7 @@ class TestOrderingAndGroups:
         by_group = {r["id"]: r["group"] for r in p["rows"]}
         # intention-004 is the fixture's legacy note: shown in the Tray (the Keep is gone), undated -> "also"
         assert by_group == {"intention:intention-003": "today", "intention:intention-002": "overdue", "intention:intention-004": "also"}
-        assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also", "someday", "done"]   # THE LIST's groups
+        assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also", "someday", "done", "kept"]   # THE LIST's groups
         assert [r["group"] for r in p["rows"]] == ["overdue", "today", "also"]  # group order leads
         assert all(r["band"] == "now" for r in p["rows"] if r["group"] != "also")
 
