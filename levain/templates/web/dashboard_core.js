@@ -2213,7 +2213,7 @@
       if (rows.length === 0) {
         const note = el("p", "empty", q || !(opts && opts.empty) ? "no " + noun + " match “" + raw.trim() + "”" : opts.empty);
         const unlisted = q && opts && opts.unlisted ? opts.unlisted().filter(hit).length : 0;
-        if (unlisted && opts.hintShow) opts.hintShow(note, unlisted);
+        if (unlisted && opts.hintShow) opts.hintShow(note, unlisted, opts.unlisted().filter(hit));
         results.appendChild(note);
       } else drawRows(rows, results);
       status.textContent = q ? (rows.length + (rows.length === 1 ? " match" : " matches") + " · ⌫ to clear") : "";
@@ -2318,16 +2318,24 @@
       empty: cardHasApart ? "Nothing due for you." : emptyMsg,
       // the card's search also reads what the card leaves to the focus view, so a match there is told, never "no items match"
       unlisted: () => (inCard ? (list || []).filter(cardHides).filter((s) => !listNow() || s.surface === listNow()) : []),
-      hintShow: (note, n) => {
+      hintShow: (note, n, hits) => {
         note.appendChild(document.createTextNode(" — " + n + (n === 1 ? " row matches in the full list — " : " rows match in the full list — ")));
         const go = el("button", "list-open-match");
         go.type = "button";
         go.dataset.listOpenMatches = "1";
         go.textContent = "open it";
-        go.addEventListener("click", () => { const m = p.querySelector("[data-list-more]"); if (m) m.click(); });
+        go.addEventListener("click", () => {
+          // the focus view opens on the time the matched rows live in (all times when they span several), so the match is drawn
+          const states = new Set((hits || []).map(timeOf));
+          listTime = states.size === 1 ? Array.from(states)[0] : "";
+          const m = p.querySelector("[data-list-more]");
+          if (m) m.click();
+          else { const x = p.querySelector(".pexpand"); if (x) x.click(); }     // a card with no footer still opens its focus view
+        });
         note.appendChild(go);
       },
       controls: (bar, redraw) => {
+        let orderSync = null;     // set once the ordering select exists
         if (isList) {
           // every number reads rowsFor, with the chip's own value in place of the one chosen
           let timeRow = null;
@@ -2335,6 +2343,7 @@
           const listChoice = () => listSurface + "\u0000" + listTime + "\u0000" + trayView;
           let drawnChoice = null;
           const build = () => {
+            if (orderSync) orderSync();     // the ordering select shows the ordering chosen now, wherever it was chosen
             if (inCard) drawnChoice = listChoice();
             const was = document.activeElement;
             const at = was && was.dataset && ((chipRow && was.closest(".list-surfaces") === chipRow) || (timeRow && was.closest(".list-times") === timeRow))
@@ -2372,6 +2381,7 @@
         sel.appendChild(Object.assign(el("option", null, orderWord), { value: "" }));
         for (const v of views) sel.appendChild(Object.assign(el("option", null, v.title), { value: v.id }));
         sel.value = viewOf();
+        orderSync = () => { sel.value = viewOf(); };
         sel.addEventListener("change", () => { trayView = sel.value; if (rebuildChips) rebuildChips(); redraw(); });
         bar.appendChild(sel);
       },
@@ -3665,7 +3675,8 @@
     };
   }
   function hasIntentionControls(actions) {
-    return Array.isArray(actions) && actions.some((a) => a && INTENTION_CONTROLS.some((c) => c[1] === a.verb));
+    // the page's one write predicate (every other write control is gated on it): a render with no `commit` is read-only and draws none
+    return !!commit && Array.isArray(actions) && actions.some((a) => a && INTENTION_CONTROLS.some((c) => c[1] === a.verb));
   }
   // `text`: the reminder's own words (never the row's filed words); "" when the host sent none, and Edit then starts empty
   function buildIntentionVerbs(rowId, actions, text) {
