@@ -3461,7 +3461,11 @@
         return;
       }
       showFail(msg, res, "failed");
-      if (opts && opts.stale && res && res.error === "stale") msg.textContent = opts.stale;
+      if (res && res.error === "stale") {   // the row moved under this form: keep the words, retire the form (as the Edit path does)
+        if (opts && opts.stale) msg.textContent = opts.stale;
+        retireStaleForm(form);
+        return;
+      }
       go.disabled = false; clearBtn.disabled = false; cancel.disabled = false;
     };
     go.addEventListener("click", () => {

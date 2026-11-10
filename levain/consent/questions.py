@@ -537,7 +537,7 @@ class QuestionStore:
         self._ready = False
         # the spore store whose open agendas ring this band's rows; None = the one under a question's own install
         self._spores_json = Path(spores_json) if spores_json is not None else None
-        self._rings_seen: tuple[Any, dict[str, str]] | None = None
+        self._rings_seen: tuple[Any, dict[str, tuple[str, str]]] | None = None
 
     # --- store ---------------------------------------------------------------------------------------
     def _check_directory(self) -> None:
@@ -1058,6 +1058,7 @@ class QuestionStore:
 
         from levain.spores import answered_descend_kind, dropped_descend_kind, guarded_spore_store
 
+        # Lock order, by intent: this store's question lock is taken first, then the spore store's own lock inside it.
         if action not in INTENTION_ACTIONS:
             raise ConsentError(f"unknown intention action {action!r}")
         if channel not in ANSWER_CHANNELS:

@@ -160,3 +160,28 @@ def test_on_a_phone_each_reminder_control_is_a_44px_target(tmp_path: Path, lh: P
         out = _drive(tmp_path, f"{url}/#write_token=T", _steps(PHONE, {"eval": probe}))
     sizes = _probe(out)["sizes"]
     assert sizes and all(h >= 44 and w >= 44 for h, w in sizes), sizes
+
+
+@needs_browser
+def test_a_stale_snooze_keeps_its_words_and_retires_the_form(tmp_path: Path, lh: Path) -> None:
+    """U6: a snooze refused as stale (the reminder moved under the open form) leaves the stale words showing and the form
+    dead, as the Edit path does: no button left to send the old request again."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    # the transport answers the next write as the host does for a moved reminder
+    make_stale = ("window.LevainCockpitTransport.rowVerb = async () => ({ ok: false, error: 'stale' }); 1")
+    set_date = (RING + ".querySelector('input[type=date]').value = '2030-01-05'; " + RING
+                + ".querySelector('input[type=date]').dispatchEvent(new Event('input')); " + RING
+                + ".querySelector('.verb-confirm').click(); 1")
+    probe = ("JSON.stringify({msg: (" + RING + ".querySelector('.edit-msg') || {}).textContent,"
+             " live: [...(" + RING + ".querySelector('.verb-form') || document.body).querySelectorAll('button')].filter(b => !b.disabled).length,"
+             " forms: " + RING + ".querySelectorAll('.verb-form').length, probe: 1})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(
+            DESKTOP, {"do": _tap("intention_snooze"), "until": RING + ".querySelector('input[type=date]') && 1", "ms": 10000},
+            {"eval": make_stale},
+            {"do": set_date, "until": "(" + RING + ".querySelector('.edit-msg') || {}).textContent.includes('changed') && 1", "ms": 10000},
+            {"eval": probe}))
+    seen = _probe(out)
+    assert seen["msg"] == "this reminder changed: reload", seen
+    assert seen["forms"] == 1 and seen["live"] == 0, seen
+    assert store.get(ring.id).answer is None
