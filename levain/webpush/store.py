@@ -53,6 +53,11 @@ MAX_RECEIPTS_PER_PING_KIND = 8       # a ping delivered to one device more than 
 RECEIPT_MIN_MS = 1_577_836_800_000   # 2020-01-01: a device clock before it is not a clock this record keeps
 RECEIPT_FUTURE_MS = 86_400_000       # and one a day ahead of this server's is not either
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+# what a device says about its own worker: the worker's code version, and the result of its app-badge call on a `received`
+# report (none: the push carried no badge number; unsupported: no badge API; set:N / cleared: applied; error:<Name>: the call
+# threw or rejected; timeout: it had not settled when the report went)
+SW_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}\Z")
+BADGE_RESULT_RE = re.compile(r"^(?:none|unsupported|cleared|timeout|set:[0-9]{1,9}|error:[A-Za-z]{1,32})\Z")
 NOTICES_KEEP = 500             # the newest notices kept, and no notice is kept past NOTICES_DAYS
 NOTICES_DAYS = 30
 HELD_LEASE_SECS = 300          # a held ping claimed for a push is another flush's to take again after this long
@@ -299,6 +304,14 @@ class PushStore:
             # levain.webpush.center.needs_data); NULL when none came (and on every ping recorded before the column existed)
             if "data" not in {r[1] for r in conn.execute("PRAGMA table_info(pings)")}:
                 conn.execute("ALTER TABLE pings ADD COLUMN data TEXT")
+            # ``sw`` / ``badge``: the worker's version and its badge call's result (levain.webpush.receipts); NULL on a row
+            # recorded before the columns existed or by a worker that did not send them
+            if "sw" not in {r[1] for r in conn.execute("PRAGMA table_info(receipts)")}:
+                conn.execute("ALTER TABLE receipts ADD COLUMN sw TEXT")
+            if "badge" not in {r[1] for r in conn.execute("PRAGMA table_info(receipts)")}:
+                conn.execute("ALTER TABLE receipts ADD COLUMN badge TEXT")
+            if "sw" not in {r[1] for r in conn.execute("PRAGMA table_info(taps)")}:
+                conn.execute("ALTER TABLE taps ADD COLUMN sw TEXT")
             if "claimed_at" not in {r[1] for r in conn.execute("PRAGMA table_info(held)")}:
                 conn.execute("ALTER TABLE held ADD COLUMN claimed_at TEXT")
             if "origin" not in {r[1] for r in conn.execute("PRAGMA table_info(notices)")}:
@@ -496,7 +509,7 @@ class PushStore:
             return True
 
     def add_receipt(self, endpoint_sha256: str, ping_id: int, kind: str, at_ms: int, target: str | None = None,
-                    how: str | None = None) -> str:
+                    how: str | None = None, sw: str | None = None, badge: str | None = None) -> str:
         """Append what a device reported about a push it got. The device is the one whose live subscription's endpoint
         hashes to ``endpoint_sha256`` (the endpoint is the secret only that device and this server hold). Answers
         ``recorded``, ``duplicate`` (the same report again, nothing written), or the refusal: ``unknown_device`` (no live
@@ -523,6 +536,11 @@ class PushStore:
         if how is not None and (kind != "opened" or how not in TAP_HOWS):
             return "bad_report"
         if kind == "opened" and how is None:
+            return "bad_report"
+        # sw (the worker's version) rides any report; badge (its app-badge call's result) only a `received`
+        if sw is not None and (not isinstance(sw, str) or SW_VERSION_RE.match(sw) is None):
+            return "bad_report"
+        if badge is not None and (kind != "received" or not isinstance(badge, str) or BADGE_RESULT_RE.match(badge) is None):
             return "bad_report"
         if not RECEIPT_MIN_MS <= at_ms <= int(time.time() * 1000) + RECEIPT_FUTURE_MS:
             return "bad_report"
@@ -552,11 +570,11 @@ class PushStore:
             if got is not None:
                 return got
             if tap:
-                c.execute("INSERT INTO taps (ping_id, device_id, kind, at, reported_at, target, how) VALUES (?,?,?,?,?,?,?)",
-                          (ping_id, device, kind, at, now_stamp(), target, how))
+                c.execute("INSERT INTO taps (ping_id, device_id, kind, at, reported_at, target, how, sw) VALUES (?,?,?,?,?,?,?,?)",
+                          (ping_id, device, kind, at, now_stamp(), target, how, sw))
             else:
-                c.execute("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at) VALUES (?,?,?,?,?)",
-                          (ping_id, device, kind, at, now_stamp()))
+                c.execute("INSERT INTO receipts (ping_id, device_id, kind, at, reported_at, sw, badge) VALUES (?,?,?,?,?,?,?)",
+                          (ping_id, device, kind, at, now_stamp(), sw, badge))
             return "recorded"
 
     def add_landing(self, device_id: str | None, target: str, how: str) -> str:
