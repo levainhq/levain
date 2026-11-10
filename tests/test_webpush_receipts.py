@@ -398,7 +398,8 @@ def test_a_push_posts_received_then_shown_with_the_endpoint_hash_and_ids_only() 
     assert r["url"] == "/webpush/receipt" and r["method"] == "POST" and r["contentType"] == "application/json"
     expect = hashlib.sha256(b"https://fcm.googleapis.com/fcm/send/dev1").hexdigest()
     for p in (r, s):
-        assert set(p["body"]) == {"ping", "kind", "at", "endpoint_sha256"} and p["body"]["ping"] == 42, p
+        assert set(p["body"]) == {"ping", "kind", "at", "endpoint_sha256", "sw"} | ({"badge"} if p is r else set()) \
+            and p["body"]["ping"] == 42, p
         assert p["body"]["endpoint_sha256"] == expect and isinstance(p["body"]["at"], int) and p["hasSignal"], p
     assert r["body"]["at"] <= s["body"]["at"]
     assert "secret body" not in json.dumps(got["posts"])
@@ -907,7 +908,7 @@ def test_the_command_prints_the_stable_json_shape(tmp_path: Path, capsys) -> Non
     assert list(got["pings"][0]["devices"][0]) == ["device", "push", "accepted", "statuses", "sent_at", "received_at", "shown_at",
                                                    "tapped_at", "clicked_at", "click_target", "opened_at", "opened_how",
                                                    "received_count", "duplicate", "sent_to_received_s",
-                                                   "received_to_shown_s", "outcome"]
+                                                   "received_to_shown_s", "outcome", "sw", "badge"]   # sw, badge: row 187, additive
     assert list(got["devices"][0]) == ["device", "sent", "accepted", "received", "shown", "tapped", "clicked", "duplicates",
                                        "silent", "median_sent_to_received_s"]
     assert "title" not in json.dumps(got) and "body" not in got["pings"][0]
@@ -919,3 +920,100 @@ def test_the_command_filters_by_ref_prints_text_and_refuses_a_bad_since(tmp_path
     assert rc == 0 and "np-1" in out and "np-2" not in out
     rc, out = _cli(tmp_path, "--since", "soon", capsys=capsys)
     assert rc == 2 and "--since" in out
+
+
+# --- row 187: the receipt carries the worker's version and the app-badge call's result ---------------------------------
+
+SW_NOW = "1110-13-r187-1"
+DEV1 = "https://fcm.googleapis.com/fcm/send/dev1"      # the endpoint the worker rig's getSubscription answers with
+
+
+def _received(got: dict) -> dict:
+    (r,) = [p["body"] for p in got["posts"] if p["body"]["kind"] == "received"]
+    return r
+
+
+@needs_node
+@pytest.mark.parametrize("mode,badge,calls", [
+    ("ok+p409+badgeset", "set:1", [["set", 1]]),            # the shape of ping 409: a badge of 1, the API present
+    ("ok+p409+badgezero+badgeset", "cleared", [["clear", None]]),   # a 0 count clears (row 186's case)
+    ("ok+p409+badgeerr", "error:NotAllowedError", [["set", 1]]),    # the API refuses (no permission): the word says so
+    ("ok+p409", "unsupported", None),                        # no badge API on this worker's navigator
+    ("ok", "none", None),                                    # a push whose payload carries no badge
+])
+def test_the_received_receipt_carries_the_worker_version_and_the_badge_result(mode: str, badge: str, calls) -> None:
+    got = _run(mode)
+    rec = _received(got)
+    assert rec["sw"] == SW_NOW and rec["badge"] == badge, rec
+    assert got.get("badgeCalls") == calls, got.get("badgeCalls")
+    shown = [p["body"] for p in got["posts"] if p["body"]["kind"] == "shown"]
+    assert all(b["sw"] == SW_NOW and "badge" not in b for b in shown)    # the badge result rides the received only
+
+
+@needs_node
+def test_a_badge_call_that_never_settles_reports_timeout_and_the_receipt_still_goes() -> None:
+    got = _run("ok+p409+badgehang")
+    assert _received(got)["badge"] == "timeout"
+
+
+@needs_node
+def test_a_declarative_push_reports_its_badge_result_too() -> None:
+    got = _run("ok+p409+declarative+badgeset")
+    rec = _received(got)
+    assert rec["sw"] == SW_NOW and rec["badge"] == "set:1", rec
+
+
+@needs_node
+def test_the_receipt_the_worker_posts_is_recorded_and_reported(tmp_path: Path) -> None:
+    """The reproduced shape end to end: the body the worker rig POSTED for ping 409, handed to the server's own receipt route."""
+    phone(tmp_path, DEV1)
+    s = PushStore(tmp_path)
+    ping = s.add_ping("consent", "np-409", "t", "b")
+    s.add_targets(ping, [_sub_id(s, DEV1)])
+    for body in [p["body"] for p in _run("ok+p409+badgeerr")["posts"]]:
+        body = {**body, "ping": ping, "at": _ms() + (1 if body["kind"] == "shown" else 0)}
+        assert routes.receipt(json.dumps(body).encode(), queue_dir=tmp_path)[0] == 200, body
+    with s.read() as c:
+        rows = {r["kind"]: (r["sw"], r["badge"]) for r in c.execute("SELECT kind, sw, badge FROM receipts")}
+    assert rows == {"received": (SW_NOW, "error:NotAllowedError"), "shown": (SW_NOW, None)}
+    (row,) = receipts.build(s)["pings"][0]["devices"]
+    assert (row["sw"], row["badge"]) == (SW_NOW, "error:NotAllowedError")
+    assert f"worker {SW_NOW}, badge error:NotAllowedError" in receipts.text(receipts.build(s))
+
+
+def test_the_server_refuses_a_malformed_sw_or_badge_and_a_badge_on_a_shown(store: PushStore) -> None:
+    ping = _ping(store)
+    at = _ms()
+    for kw in ({"sw": "x y"}, {"sw": "a" * 41}, {"sw": 7}, {"badge": "set:abc"}, {"badge": "applied"}, {"badge": "set:1; drop"}):
+        assert store.add_receipt(H, ping, "received", at, **kw) == "bad_report", kw
+    assert store.add_receipt(H, ping, "shown", at, badge="set:1") == "bad_report"
+    assert store.add_receipt(H, ping, "received", at, sw=SW_NOW, badge="error:NotAllowedError") == "recorded"
+    with store.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM receipts").fetchone()[0] == 1
+
+
+def test_a_store_that_predates_the_columns_gains_them_and_keeps_its_rows(tmp_path: Path) -> None:
+    phone(tmp_path, EP)
+    s = PushStore(tmp_path)
+    ping = _ping(s)
+    assert s.add_receipt(H, ping, "received", _ms()) == "recorded"          # an old-worker report: no sw, no badge
+    with s.write() as c:
+        for t in ("receipts_frozen", "receipts_kept"):
+            c.execute(f"DROP TRIGGER {t}")
+        c.execute("ALTER TABLE receipts DROP COLUMN sw")
+        c.execute("ALTER TABLE receipts DROP COLUMN badge")
+        c.execute("ALTER TABLE taps DROP COLUMN sw")
+    s2 = PushStore(tmp_path)
+    assert s2.add_receipt(H, ping, "received", _ms() + 9, sw=SW_NOW, badge="cleared") == "recorded"
+    with s2.read() as c:
+        got = [tuple(r) for r in c.execute("SELECT sw, badge FROM receipts ORDER BY id")]
+    assert got == [(None, None), (SW_NOW, "cleared")]
+
+
+def test_the_http_route_accepts_the_new_keys_and_nothing_else(tmp_path: Path) -> None:
+    phone(tmp_path, EP)
+    s = PushStore(tmp_path)
+    ping = _ping(s)
+    ok = {"ping": ping, "kind": "received", "at": _ms(), "endpoint_sha256": H, "sw": SW_NOW, "badge": "set:3"}
+    assert routes.receipt(json.dumps(ok).encode(), queue_dir=tmp_path)[0] == 200
+    assert routes.receipt(json.dumps({**ok, "at": ok["at"] + 1, "extra": 1}).encode(), queue_dir=tmp_path)[0] == 400
