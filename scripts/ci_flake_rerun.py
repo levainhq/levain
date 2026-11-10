@@ -3,7 +3,7 @@
 
 Usage: ci_flake_rerun.py <pytest exit code> <pytest log> <record dir> <label>
 
-The shard step runs pytest with -rf and tees the log. When pytest failed, this reads the `FAILED <node id>` lines and
+The shard step runs pytest with -rfE and tees the log. When pytest failed, this reads the `FAILED <node id>` lines and
 the ledger (tests/ci/flake_ledger.txt: one node id per line, `#` comments; a missing file is an empty ledger, so with no
 ledger nothing ever reruns). It exits 1, with no rerun, unless pytest exited 1 (tests failed; any other code is an
 interrupt, usage or collection error), every failure is a FAILED line (no ERROR line), and every failed node id is on
@@ -15,11 +15,13 @@ The rerun is printed, appended to $GITHUB_STEP_SUMMARY when that is set, and wri
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+_run = subprocess.run  # indirection so tests patch this, not the global subprocess.run
 LEDGER = Path(__file__).resolve().parent.parent / "tests" / "ci" / "flake_ledger.txt"
 
 
@@ -31,16 +33,46 @@ def ledger_ids(path=LEDGER):
     return {ln.strip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")}
 
 
+_HEADER = re.compile(r"^=+ (.+?) =+$")
+_NODE = re.compile(r"^\S+?\.py(::.*)?$")
+
+
+def _split_reason(rest):
+    """The node id: everything before the first " - " that is not inside a [...] parametrize id."""
+    depth = 0
+    for i, ch in enumerate(rest):
+        if ch == "[":
+            depth += 1
+        elif ch == "]" and depth:
+            depth -= 1
+        elif depth == 0 and rest.startswith(" - ", i):
+            return rest[:i].strip()
+    return rest.strip()
+
+
 def parse_log(text):
-    """(failed node ids in order, whether any ERROR line is present)."""
-    failed, errored = [], False
+    """(failed node ids in order, whether anything errored). Only the region after the "short test summary info"
+    header is read, so a captured "ERROR ..." / "FAILED ..." output line cannot mislead it; a log with no such header
+    yields no failures (the caller then does not rerun). An "ERRORS" section header counts as errored."""
+    failed, errored, in_summary = [], False, False
     for ln in text.splitlines():
-        if ln.startswith("FAILED "):
-            nid = ln[len("FAILED "):].split(" - ", 1)[0].strip()
-            if nid and nid not in failed:
+        m = _HEADER.match(ln)
+        if m:
+            title = m.group(1).strip()
+            if title == "ERRORS":
+                errored = True
+            in_summary = title == "short test summary info"
+            continue
+        if not in_summary:
+            continue
+        if ln.startswith("FAILED ") or ln.startswith("ERROR "):
+            nid = _split_reason(ln.split(" ", 1)[1])
+            if not _NODE.match(nid):
+                continue
+            if ln.startswith("ERROR "):
+                errored = True
+            elif nid not in failed:
                 failed.append(nid)
-        elif ln.startswith("ERROR "):
-            errored = True
     return failed, errored
 
 
@@ -63,7 +95,7 @@ def main(argv):
     print(f"rerunning once, all {len(failed)} failure(s) are on the flake ledger:")
     for n in failed:
         print(f"  {n}")
-    rerun = subprocess.run(["pytest", "-q", "-rf", "--basetemp=/tmp/levain-pt-rerun", *failed])
+    rerun = _run(["pytest", "-q", "-rf", "--basetemp=/tmp/levain-pt-rerun", *failed])
     passed = rerun.returncode == 0
     row = {"label": label, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tests": failed,
            "rerun_passed": passed, "sha": os.environ.get("GITHUB_SHA", ""), "run_id": os.environ.get("GITHUB_RUN_ID", "")}

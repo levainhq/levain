@@ -116,6 +116,10 @@ jobs:
           LEVAIN_TEST_WAIT_SCALE: "2"
         run: pytest -q -m invariant --basetemp=/tmp/levain-pt
 
+      - name: Check the invariant list against the tests
+        # a listed test renamed or dropped fails here, in stage 0, not later in a shard
+        run: pytest -q tests/test_ci_invariant_marker.py --basetemp=/tmp/levain-pt-marker
+
   plan:
     # No longer feeds the `test` matrix: that matrix holds a static shard list so pytest starts at once instead of
     # queueing behind this job. This job only FAILS when the static list no longer equals what the planner (tests/ci/shard.py)
@@ -216,10 +220,11 @@ jobs:
           # shard plan is made over what 3.13 runs); 3.12 runs them
           marker=()
           if [ "${{ matrix.python-version }}" != "3.12" ]; then marker=(-m "not static_guard"); fi
-          # -rf lists each failure as a `FAILED <node id>` line, which scripts/ci_flake_rerun.py reads.
+          # -rfE lists each failure as a `FAILED <node id>` line and each error as an `ERROR` line (an explicit -r replaces
+          # pytest's default, so E must be named), which scripts/ci_flake_rerun.py reads.
           # A first failure goes to that script: a test on the flake ledger earns ONE rerun, any other failure fails the job.
           set +e
-          pytest -n auto -q -rf --durations=25 --basetemp=/tmp/levain-pt "${marker[@]}" "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+          pytest -n auto -q -rfE --durations=25 --basetemp=/tmp/levain-pt "${marker[@]}" "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/pytest.log"
           rc=${PIPESTATUS[0]}
           set -e
           test "$rc" -eq 0 || python scripts/ci_flake_rerun.py "$rc" "$RUNNER_TEMP/pytest.log" "$RUNNER_TEMP/flake-rerun" "shard ${{ matrix.shard }} py${{ matrix.python-version }}"
