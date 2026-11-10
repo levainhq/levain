@@ -61,6 +61,14 @@ def test_a_timed_value_on_a_future_day_and_the_shape_only_call_pass_as_before() 
     assert "pick a day" in until_refusal("2026-11-20T25:99", now=now)
 
 
+def test_today_and_now_together_are_refused_and_now_is_keyword_only() -> None:
+    now = datetime.fromisoformat("2026-11-07T12:00:00+00:00")
+    with pytest.raises(ValueError):
+        until_refusal("2026-11-30T00:00", "2026-11-07", now=now)     # one judge of the day, never two
+    with pytest.raises(TypeError):
+        until_refusal("2026-11-30T00:00", "2026-11-07", now)          # a positional clock is a call-site mistake
+
+
 @pytest.fixture
 def _kiritimati(monkeypatch):
     monkeypatch.setenv("TZ", "Pacific/Kiritimati")                         # UTC+14: the local day is a day ahead of UTC's
