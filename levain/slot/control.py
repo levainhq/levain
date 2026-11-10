@@ -2916,7 +2916,9 @@ class Control:
 
         The envelope is also bounded by bytes (H6-19: at most 64 records AND at most
         :data:`~levain.slot.lineage.ENVELOPE_BYTES_MAX` encoded); over either it is refused ``lineage-record:envelope``
-        with nothing appended. A quarantine row is ``{format, seq, source, quarantined}`` (H6-20: no ``session``)."""
+        with nothing appended. A quarantine row is ``{format, seq, source, quarantined}`` (H6-20: no ``session``).
+        An element may also be a run-final record (:data:`~levain.slot.lineage.FINAL_FORMAT`): checked by field and
+        kept as a row, or quarantined, the same way."""
         self._require_attached(conn)
         envelope = args["envelope"]
         if self.lineage is None:   # r1 F6: before the envelope's check (no sink: nothing is a keys bug yet)
@@ -2926,7 +2928,7 @@ class Control:
         for t, rec in zip(triples, envelope["records"]):
             bad = LN.check_record(rec)
             if bad is None:
-                rows.append((t, {k: rec[k] for k in LN.RECORD_CHECKS}))
+                rows.append((t, LN.row_of(rec)))
             else:
                 rows.append((t, {"format": LN.FORMAT, "quarantined": bad}))
         acked: list[dict[str, object]] = []

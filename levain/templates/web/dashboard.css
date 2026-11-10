@@ -2991,6 +2991,7 @@ body.rv-on .ck-phonetabs button[data-phone-jump="room"] { color: var(--text); ba
 .bd-groups .grp-head:first-child { margin-top: 0; }
 .bd-row { padding: var(--sp-2) 0 var(--sp-2) var(--sp-3); overflow-wrap: anywhere; }
 .bd-later .bd-title, .band-later { font-weight: var(--fw-regular); color: var(--label); }
+.later-tag { white-space: nowrap; }
 .bd-row + .bd-row { border-top: 1px solid var(--hair-2); }
 .bd-groups .bd-empty { padding-left: var(--sp-3); margin: 0; }
 .bd-held, .bd-note { font: var(--fw-regular) var(--fs-micro)/1.5 var(--sans); color: var(--warn); }

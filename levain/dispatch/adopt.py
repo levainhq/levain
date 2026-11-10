@@ -74,7 +74,7 @@ __all__ = [
     "MAX_TOTAL_BYTES", "ArtifactRecord", "Change", "ChangeSet", "Envelope", "Floor", "GitFault", "Landing",
     "artifact_digest",
     "artifact_problem",
-    "authorise_message", "authorise_payload", "authorise_payload_for", "authorise_refusal", "branch_problem",
+    "agent_config_check", "agent_config_paths", "authorise_message", "authorise_payload", "authorise_payload_for", "authorise_refusal", "branch_problem",
     "change_set",
     "criteria_failure", "floor", "land", "revalidation_problem", "stage_commit", "staged_ref", "sweep_staged",
 ]
@@ -327,6 +327,44 @@ class ChangeSet:
     @property
     def staged_bytes(self) -> int:
         return sum(c.new_size for c in self.entries if c.status != "D")
+
+
+#: The instruction files an agent loads from a subdirectory as well as the root: Claude Code loads ``CLAUDE.md`` and
+#: ``CLAUDE.local.md`` from a subdirectory once it works there, and Codex reads ``AGENTS.override.md`` / ``AGENTS.md``
+#: in each directory from the project root down to where it runs. A ``.claude`` directory is matched at any depth too
+#: (nested rules, skills, commands, agents). The remaining discovery names are matched at the repo root only.
+_NESTED_INSTRUCTION_FILES = ("CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "AGENTS.override.md")
+AGENT_CONFIG_SHOWN = 10         # DECISION: the phone card and the sheet list at most this many agent-config paths
+AGENT_CONFIG_PATH_MAX = 160     # DECISION: a path longer than this is cut on the phone card, marked
+
+
+def agent_config_paths(paths: Iterable[str]) -> list[str]:
+    """The changed paths that set how an agent session behaves in the checkout. A path matches when it is a
+    :data:`_NESTED_INSTRUCTION_FILES` name at any depth, or has a ``.claude`` component at any depth, or its FIRST
+    component is another :data:`levain.slot.render.REPO_DISCOVERY` name (``.codex``, ``.agents``, ``.mcp.json``).
+    Every comparison folds as the slot's settings freeze folds (NFD + casefold). Sorted, no duplicates. Adopt shows
+    these as their own labelled item; it never blocks on them."""
+    from levain.slot.render import REPO_DISCOVERY
+    from levain.slot.render import fold_name as _fold
+
+    nested = {_fold(n) for n in _NESTED_INSTRUCTION_FILES}
+    anywhere = {_fold(".claude")}
+    roots = {_fold(n) for n in REPO_DISCOVERY} - nested - anywhere
+
+    def hit(path: str) -> bool:
+        parts = [_fold(x) for x in path.split("/") if x]
+        return bool(parts) and (parts[0] in roots or parts[-1] in nested or any(x in anywhere for x in parts))
+
+    return sorted({p for p in paths if hit(p)})
+
+
+def agent_config_check(paths: Iterable[str]) -> tuple[list[str], str | None]:
+    """``(paths, problem)``: :func:`agent_config_paths`, or ``([], why)`` when the check itself cannot run. An
+    authorise view names that the check is unavailable; it never fails for it."""
+    try:
+        return agent_config_paths(paths), None
+    except Exception as exc:  # DECISION: any import or fold failure degrades to a visible line, never a crash
+        return [], f"{type(exc).__name__}: {str(exc)[:120]}"
 
 
 def _absent(mode: str, sha: str) -> bool:

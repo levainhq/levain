@@ -38,6 +38,7 @@ from typing import Callable, Dict, List, Optional, Protocol, Set, Tuple
 from urllib.parse import urlencode
 
 from levain.broker import upstream
+from levain.fsync_errnos import FULLFSYNC_FALLBACK_ERRNOS
 from levain.broker.norm import Refused
 from levain.broker.redact import unsafe_with_marker
 from levain.broker.upstream import _note
@@ -387,14 +388,17 @@ class Outcome:
 
 
 def full_fsync(fd: int) -> None:
-    """`F_FULLFSYNC` on macOS (a plain fsync there does not reach the medium), and `os.fsync` if that raises (some
-    filesystems refuse it: SMB, NFS, some FUSE mounts); `os.fsync` elsewhere. One rule for a file and a directory."""
+    """`F_FULLFSYNC` on macOS (a plain fsync there does not reach the medium), and `os.fsync` only when that fcntl
+    answers one of `FULLFSYNC_FALLBACK_ERRNOS` (a filesystem without it: SMB, NFS, some FUSE mounts); any other
+    error, EIO included, propagates, so a failing disk never reads as a durable write. `os.fsync` elsewhere. One rule
+    for a file and a directory."""
     if sys.platform == "darwin":
         try:
             fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
             return
-        except OSError:
-            pass
+        except OSError as e:
+            if e.errno not in FULLFSYNC_FALLBACK_ERRNOS:
+                raise
     os.fsync(fd)
 
 

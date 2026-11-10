@@ -470,10 +470,12 @@
       // (LevainBoardView.boardModel); the counts ride as one line for the jump box and a touch reader. Read-only: no verb, no write box.
       need(Array.isArray(v.columns) && v.columns.every((c) => isObj(c) && typeof c.category === "string" && Array.isArray(c.cards)
         && c.cards.every((k) => isObj(k) && typeof k.id === "string")), "board columns");
-      const total = v.columns.reduce((n, c) => n + c.cards.length, 0);
+      // the counts are of the cards the board draws (the board view's one visibility rule); a page without the view counts them all
+      const BV = root.LevainBoardView, seen = (c) => (BV && typeof BV.visibleCards === "function" ? BV.visibleCards(c.cards) : c.cards);
+      const total = v.columns.reduce((n, c) => n + seen(c).length, 0);
       out.board = v;
       out.typed = true;
-      out.lines = [{ meta: "board", text: total + " cards · " + v.columns.map((c) => c.category + " " + c.cards.length).join(" · ") }];
+      out.lines = [{ meta: "board", text: total + " cards · " + v.columns.map((c) => c.category + " " + seen(c).length).join(" · ") }];
     } else if (kind === "form") {
       need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
       out.form = { fields: v.fields, verb: typeof v.verb === "string" ? v.verb : "" };

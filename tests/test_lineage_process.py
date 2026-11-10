@@ -109,9 +109,15 @@ async def sync_run(w: R6.World, n: int) -> str:
     return run.run_id
 
 
+def exchange_rows(w: R6.World) -> list:
+    """The sink's rows that are an exchange's, not a run's final count (W3-3b: keys writes one per closed run)."""
+    return [r for r in w.rows() if r.get("format") != "levain-dispatch-run-final/1"]
+
+
 def one_row_each(w: R6.World) -> dict:
     """Exactly one row at CONTROL for every ticketed exchange in keys' ledger, none quarantined (invariant 3)."""
-    by = w.rows_by_triple()
+    # a run-final row (W3-3b) is keys' count of a run, not an exchange's row: it is not one of the exchanges here
+    by = {t: v for t, v in w.rows_by_triple().items() if v[0].get("format") != "levain-dispatch-run-final/1"}
     tt = ticketed_triples(w.ledger())
     assert sorted(by) == sorted(tt), (sorted(by), tt)
     assert all(len(v) == 1 for v in by.values()), {k: len(v) for k, v in by.items()}
@@ -207,7 +213,8 @@ def test_lineage_crash_keys_after_the_ack_line_is_durable(py):
     (k_lines, k_recv), received, rows, rc = go(fn)
     r = ticketed_triples(k_lines)[0]
     assert acked_triples(k_lines) == [r] and k_recv == [r]
-    assert Counter(received)[r] == 1 and len(received) == 2 and rc == 0
+    # r once, the sync run's row, and the restart sweep's run-final for r's run (W3-3b): three triples, each once
+    assert Counter(received)[r] == 1 and len(received) == 3 and len(set(received)) == 3 and rc == 0
 
 
 @pytest.mark.parametrize("loss", ["sigkill", "power-cut"])
@@ -285,7 +292,7 @@ def test_keys_restart_keeps_ledger_lineage_invariant_3(py):
             await asyncio.gather(*held, return_exceptions=True)
             w.up.release.set()
             await w.start_keys()
-            await aio_until(lambda: len(w.rows()) == 3, 20, "three rows")
+            await aio_until(lambda: len(exchange_rows(w)) == 3, 20, "three exchange rows")
             await sync_run(w, 1)
             return before, open(w.ledger_path, "rb").read(), w.ledger(), list(w.received), one_row_each(w), \
                 w.stop_keys()
@@ -300,3 +307,62 @@ def test_keys_restart_keeps_ledger_lineage_invariant_3(py):
     assert [rows[t]["settled"] for t in first3].count("uncertain") == 2
     assert all(Counter(received)[t] == 1 for t in tt), received                   # each row sent once
     assert rc == 0
+
+
+# ---- W3-3b session 3: the reader settles on the run final the real keys + CONTROL produce --------------------------
+
+def test_the_reader_settles_on_the_exact_sum_when_the_final_arrives_inside_its_wait(py, tmp_path):
+    # a run with two resolutions; keys is killed with both rows in the sink and no final yet. The reader starts WAITING
+    # (no final: it must not answer), keys restarts, its restart sweep writes the run's final, and the reader answers
+    # the exact sum of the run's rows. The same real sink then reads None for each broken proof (no final, a changed
+    # source triple, a final counting a quarantine), and a quarantine row of ANOTHER run does not block this run.
+    from levain.slot import dispatch_usage as DU
+    from levain.slot import lineage as LN
+
+    def figure(r: dict) -> int:
+        return r["hold_microdollars"] if r["cost_microdollars"] is None else r["cost_microdollars"]
+
+    async def fn():
+        async with R6.World(py) as w:
+            await w.start_keys()
+            run, f = await w.run()
+            await exchange(f)
+            await exchange(f)
+            await aio_until(lambda: len(acked_triples(w.ledger())) == 2 and len(w.rows()) == 2, 20, "both rows acked")
+            w.keys.kill()
+            sink = w.lineage / LN.SINK
+            loop = asyncio.get_running_loop()
+            waiting = loop.run_in_executor(None, lambda: DU.lineage_spend_reader(sink, wait_s=25.0)(run.run_id))
+            await asyncio.sleep(1.5)
+            assert not waiting.done()                  # no final: the reader is still waiting, not answering
+            await w.start_keys()
+            got = await asyncio.wait_for(waiting, 30)
+            rows = w.rows()
+            raw = sink.read_bytes()
+            return run.run_id, got, rows, raw, w.stop_keys()
+
+    run_id, got, rows, raw, rc = go(fn)
+    data = [r for r in rows if r["format"] == LN.FORMAT and r["run_id"] == run_id]
+    (final,) = [r for r in rows if r["format"] == LN.FINAL_FORMAT and r["run_id"] == run_id]
+    assert len(data) == 2 and final["rows"] == 2 and final["quarantined"] == 0 and rc == 0
+    assert got == sum(figure(r) for r in data) and got > 0                           # the exact sum, from the final
+
+    import json
+    lines = raw.split(b"\n")[:-1]
+
+    def read(ls: list) -> object:
+        p = tmp_path / ("sink%d" % len(ls) + str(abs(hash(b"".join(ls))) % 10**6))
+        p.write_bytes(b"".join(x + b"\n" for x in ls))
+        return DU.lineage_spend(p, run_id)
+
+    parsed = [json.loads(x) for x in lines]
+    assert read(lines) == got                                                         # the control: the sink as written
+    assert read([x for x, o in zip(lines, parsed) if o["format"] != LN.FINAL_FORMAT]) is None      # no final
+    i = next(n for n, o in enumerate(parsed) if o["format"] == LN.FORMAT and o["run_id"] == run_id)
+    forged = dict(parsed[i], source=dict(parsed[i]["source"], ref=parsed[i]["source"]["ref"] + 1000))
+    assert read(lines[:i] + [json.dumps(forged).encode()] + lines[i + 1:]) is None     # digest mismatch
+    j = next(n for n, o in enumerate(parsed) if o["format"] == LN.FINAL_FORMAT)
+    assert read(lines[:j] + [json.dumps(dict(parsed[j], quarantined=1)).encode()] + lines[j + 1:]) is None
+    quarantine = {"format": LN.FORMAT, "seq": 99, "source": dict(parsed[0]["source"], ref=987654),
+                  "quarantined": "record"}
+    assert read(lines[:1] + [json.dumps(quarantine).encode()] + lines[1:]) == got      # another run's: no block

@@ -248,6 +248,13 @@ def later_of(store: Any, q: Any, n: int | None = None, now: datetime | None = No
     return _later_pair(q, n, today)
 
 
+def desk_owed(section: Any, carried: Any) -> bool:
+    """The one rule for a band row the desk alone owes: the host's section is ``desk`` and the row is not carried over to him.
+    The app badge, the board producer and the Board's JS filter (``board_view.js`` ``isDeskOwed``) all apply it; a row with no
+    section, or any other, is his."""
+    return section == "desk" and not carried
+
+
 def later_facets(store: Any, q: Any, now: datetime | None = None) -> tuple[str, str] | None:
     """``(day, words)`` for an open question snoozed past the store's local day (``words`` as :func:`later_words`), else
     ``None``. Runs :func:`later_of`, the one predicate; any fault is due, never hidden (the cockpit Needs strip's facets)."""

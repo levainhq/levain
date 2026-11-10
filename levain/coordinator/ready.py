@@ -33,6 +33,9 @@ a consistent snapshot and needs no coordinator. No UI and no CLI verb here: thos
 with provenance source ``plan`` (SCHEMA section 5: "the coordinator store once C13 exists"); a store item shadows a
 plan row or spore of the same id; ``status`` equals the category (v1) and the writer takes no separate status; a write
 that changes nothing is refused; an item's repo is fixed at ``add``. Stdlib only.
+
+Known edge (row 156 L3 C5): the current-state read looks up each item's prose hold with its own queries, so a list
+costs a query pair per item, which a board the size of one status file's lane menu bears.
 """
 from __future__ import annotations
 
@@ -48,13 +51,13 @@ from typing import Any
 
 from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp
-from levain.coordinator.store import CoordError, CoordStore, StoreAbsent, _append_only, next_gseq
+from levain.coordinator.store import _OID, CoordError, CoordStore, StoreAbsent, _append_only, next_gseq
 from levain.dispatch import DispatchError
 
 __all__ = [
     "CATEGORIES", "HANDOFF_RANK_BASE", "HEALTHY_AT", "JOURNAL_SOURCES", "LIFECYCLE_SCHEMA", "SCHEMA_VERSION", "TIERS",
     "JournalAhead", "WRITABLE_CATEGORIES", "add", "correct", "derive", "derive_items", "journal", "list", "list_ready", "move",
-    "ready_counts", "replay", "slug",
+    "FACT_COLS", "item_facts", "migrate_item_facts", "ready_counts", "record_landed", "replay", "slug",
 ]
 
 SCHEMA_VERSION = 1
@@ -74,6 +77,7 @@ _WHY_MAX = 1000
 _TITLE_MAX = 120        # the read side shows a title whole (``_one_line``'s limit): the writer takes no more
 _DONE_MAX = 1000
 _DEPENDS_MAX = 50
+_REF_MAX = 300
 
 # Plan-row dependency markers (flow's, unchanged). A numeric "after N" names a row; the others hold with their words.
 _AFTER_N_RE = re.compile(r"\bafter\s+(\d+)\s*(?:[.,;:)*`]|$)", re.I)
@@ -85,6 +89,14 @@ def _in(column: str, values: Sequence[str]) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ the store tables
+# the columns an item's state gained after the first release, one definition for a new table and for the additive
+# migration of an old one (:func:`migrate_item_facts`): NULL on every row written before them
+FACT_COLS = ("hold", "residue", "ref", "landed_sha", "branch")
+_FACT_DDL = {"hold": "hold TEXT", "residue": "residue TEXT", "ref": "ref TEXT",
+             "landed_sha": "landed_sha TEXT CHECK (landed_sha IS NULL OR length(landed_sha) IN (40, 64))",
+             "branch": "branch TEXT"}
+ITEM_FACTS_SQL = "".join(f", {_FACT_DDL[c]}" for c in FACT_COLS)
+
 LIFECYCLE_SCHEMA: tuple[str, ...] = (
     # SCHEMA §6, one row per transition; gseq places it in the store-wide order, lease_token names the writer's lease
     "CREATE TABLE IF NOT EXISTS ready_journal (id TEXT NOT NULL, ver INTEGER NOT NULL CHECK (ver >= 1), "
@@ -103,7 +115,8 @@ LIFECYCLE_SCHEMA: tuple[str, ...] = (
     "repo TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, "
     f"category TEXT NOT NULL CHECK ({_in('category', WRITABLE_CATEGORIES)}), "
     f"tier TEXT CHECK (tier IS NULL OR {_in('tier', TIERS)}), done_line TEXT, depends_on TEXT NOT NULL, "
-    "rank INTEGER NOT NULL CHECK (rank >= 0), set_by TEXT NOT NULL, set_at TEXT NOT NULL, PRIMARY KEY (id, ver))",
+    f"rank INTEGER NOT NULL CHECK (rank >= 0), set_by TEXT NOT NULL, set_at TEXT NOT NULL{ITEM_FACTS_SQL}, "
+    "PRIMARY KEY (id, ver))",
     *_append_only("ready_journal", "the ready journal"),
     *_append_only("ready_items", "a ready item state"),     # no quote: it goes into SQL
     # INSERT OR REPLACE deletes the old row without firing a delete trigger: refuse a new row reusing any key
@@ -127,6 +140,22 @@ LIFECYCLE_SCHEMA: tuple[str, ...] = (
     "ready_journal j WHERE j.id = NEW.id AND j.ver = NEW.ver AND j.to_category = NEW.category "
     "AND j.to_status = NEW.status AND j.repo = NEW.repo AND j.who = NEW.set_by) "
     "BEGIN SELECT RAISE(ABORT, 'a ready item state is written only with its journal record'); END",
+    # THE ROLE SPLIT at the schema (the ruling's condition 1; see work_attach): a row the service wrote may change an
+    # item in one way only, its landed sha and branch; it never adds an item, moves one, or changes any other field
+    "CREATE TRIGGER IF NOT EXISTS ready_journal_service_facts BEFORE INSERT ON ready_journal WHEN NEW.who = 'service' "
+    "AND (NEW.source != 'correction' OR NEW.ver = 1 OR NEW.from_category IS NOT NEW.to_category "
+    "OR NEW.from_status IS NOT NEW.to_status) "
+    "BEGIN SELECT RAISE(ABORT, 'the service records facts only: it never adds or moves an item (who service names the service alone; "
+    "a coordinator writes under another name)'); END",
+    "CREATE TRIGGER IF NOT EXISTS ready_items_service_facts BEFORE INSERT ON ready_items WHEN NEW.set_by = 'service' "
+    # a missing previous version (a gap) refuses too: there is nothing to compare the row with (row 156 L2 F2)
+    "AND (NEW.ver = 1 OR NOT EXISTS (SELECT 1 FROM ready_items p WHERE p.id = NEW.id AND p.ver = NEW.ver - 1) "
+    "OR EXISTS (SELECT 1 FROM ready_items p WHERE p.id = NEW.id AND p.ver = NEW.ver - 1 AND "
+    "(p.repo IS NOT NEW.repo OR p.title IS NOT NEW.title OR p.status IS NOT NEW.status OR p.category IS NOT "
+    "NEW.category OR p.tier IS NOT NEW.tier OR p.done_line IS NOT NEW.done_line OR p.depends_on IS NOT NEW.depends_on "
+    "OR p.rank IS NOT NEW.rank OR p.hold IS NOT NEW.hold OR p.residue IS NOT NEW.residue OR p.ref IS NOT NEW.ref))) "
+    "BEGIN SELECT RAISE(ABORT, 'the service records facts only: it changes the landed sha and branch of an item, "
+    "nothing else (who service names the service alone; a coordinator writes under another name)'); END",
 )
 
 
@@ -204,6 +233,7 @@ def _work_item(row: Mapping[str, Any], *, source: str, ref: str, default_repo: s
     it = _item(id=str(row["id"]), repo=str(row.get("repo") or default_repo), title=row.get("title"),
                declared=_category(raw), status=row.get("status") if raw in CATEGORIES else None,
                done_line=row.get("done_line"), tier=row.get("tier"), depends_on=row.get("depends_on"),
+               held_reason=row.get("hold") or None,
                rank=_int(row.get("rank")), source=source, ref=ref, set_by=row.get("set_by"),
                set_at=row.get("set_at"))
     it["unknown_category"] = raw if raw is not None and raw not in CATEGORIES else None
@@ -422,8 +452,77 @@ def _current(conn: sqlite3.Connection, item_id: str | None = None) -> builtins.l
     if not _lifecycle_present(conn):
         return []
     if item_id is None:
-        return [_row(r) for r in conn.execute(_CURRENT + " ORDER BY i.id")]
-    return [_row(r) for r in conn.execute(_CURRENT + " AND i.id = ?", (item_id,))]
+        rows = [_row(r) for r in conn.execute(_CURRENT + " ORDER BY i.id")]
+    else:
+        rows = [_row(r) for r in conn.execute(_CURRENT + " AND i.id = ?", (item_id,))]
+    for r in rows:      # the prose hold rides on the store row so a reader derives "held" from it
+        r["hold"] = _facts(conn, r["id"])["hold"]
+    return rows
+
+
+def migrate_item_facts(conn: sqlite3.Connection) -> None:
+    """The additive migration (run in the opener's schema transaction, as every other): ``ready_items`` gains
+    :data:`FACT_COLS`, NULL on every row written before them. A file with no ``ready_items`` (made before C13) is left
+    to the lifecycle tables' own creation, which already carries the columns."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(ready_items)")}
+    if not have:
+        return
+    for c in FACT_COLS:
+        if c not in have:
+            conn.execute(f"ALTER TABLE ready_items ADD COLUMN {_FACT_DDL[c]}")
+
+
+def _facts(conn: sqlite3.Connection, item_id: str) -> dict:
+    """The fact columns of ``item_id``'s current state (None for each on a store not yet migrated, or no such item)."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(ready_items)")}
+    if not set(FACT_COLS) <= have:
+        return dict.fromkeys(FACT_COLS)
+    row = conn.execute(f"SELECT {', '.join(FACT_COLS)} FROM ready_items WHERE id = ? ORDER BY ver DESC LIMIT 1",
+                       (item_id,)).fetchone()
+    return dict.fromkeys(FACT_COLS) if row is None else dict(zip(FACT_COLS, row))
+
+
+def item_facts(store: CoordStore | Path | str, item_id: str) -> dict:
+    """An item's fact columns (``hold``, ``residue``, ``ref``, ``landed_sha``, ``branch``), read on the read-only
+    connection. They are kept off :func:`list_ready`'s item shape (that shape is flow's schema, unchanged). Refuses an
+    id that is not in the store."""
+    st = _store_of(store)
+
+    def query(conn: sqlite3.Connection) -> dict:
+        if not _current(conn, item_id):
+            raise CoordError(f"{item_id} is not in the coordinator store")
+        return _facts(conn, item_id)
+    return _read(st, query)
+
+
+def record_landed(conn: sqlite3.Connection, now: str, token: int, item_id: str, sha: str, branch: str | None, *,
+                  by: str, why: str) -> int:
+    """A ``landed`` fact on an item: a new state version identical to the current one but for ``landed_sha`` and
+    ``branch``, with its journal record (same category, same status, source ``correction``, ``who`` = ``by``). Inside
+    the caller's write transaction. Never moves an item: for the service (``by == "service"``) a schema trigger
+    refuses any other change (:data:`levain.coordinator.work_attach.WORK_SCHEMA`). Returns the new version."""
+    if not isinstance(sha, str) or _OID.fullmatch(sha) is None:
+        raise CoordError("a landed sha is a full 40 or 64 hex object id")
+    if branch is not None:
+        branch = _line("branch", branch, 200)
+    diverged = _diverged(conn, item_id)
+    if diverged:
+        raise diverged[0]
+    found = _current(conn, item_id)
+    if not found:
+        raise CoordError(f"{item_id} is not in the coordinator store")
+    prior = found[0]
+    state = {**{k: prior[k] for k in ("repo", "title", "tier", "done_line", "depends_on", "rank")},
+             **_facts(conn, item_id), "category": prior["category"], "status": prior["status"],
+             "landed_sha": sha, "branch": branch}
+    ver = prior["ver"] + 1
+    ts, iso = _local_iso(now)
+    rec = {"ts": ts, "iso": iso, "id": item_id, "repo": state["repo"], "from_status": prior["status"],
+           "to_status": prior["status"], "from_category": prior["category"], "to_category": prior["category"],
+           "who": by, "why": _line("why", why, _WHY_MAX), "source": "correction", "applied_by": None}
+    _insert_journal(conn, rec, ver=ver, gseq=next_gseq(conn, now), at=now, token=token)
+    _insert_state(conn, state, item_id=item_id, ver=ver, who=by, at=now)
+    return ver
 
 
 def _store_of(store: CoordStore | Path | str) -> CoordStore:
@@ -658,7 +757,8 @@ def _check_id(item_id: Any) -> str:
 _UNSET = object()
 
 
-def _fields(item_id: str, *, title: Any, tier: Any, done_line: Any, depends_on: Any, rank: Any) -> dict:
+def _fields(item_id: str, *, title: Any, tier: Any, done_line: Any, depends_on: Any, rank: Any,
+            hold: Any = _UNSET, residue: Any = _UNSET, ref: Any = _UNSET) -> dict:
     """The optional state fields a caller set, checked; ``_UNSET`` ones are left out (kept from the current state)."""
     out: dict[str, Any] = {}
     if title is not _UNSET:
@@ -685,6 +785,9 @@ def _fields(item_id: str, *, title: Any, tier: Any, done_line: Any, depends_on: 
         if len(deps) > _DEPENDS_MAX:
             raise CoordError(f"at most {_DEPENDS_MAX} dependencies")
         out["depends_on"] = deps
+    for name, value, high in (("hold", hold, _WHY_MAX), ("residue", residue, _WHY_MAX), ("ref", ref, _REF_MAX)):
+        if value is not _UNSET:
+            out[name] = None if value is None else _line(name, value, high)
     if rank is not _UNSET and rank is not None:
         if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank <= 10**9:
             raise CoordError("rank is an integer from 0")
@@ -710,9 +813,10 @@ def _insert_state(conn: sqlite3.Connection, state: Mapping[str, Any], *, item_id
                   at: str) -> None:
     conn.execute(
         "INSERT INTO ready_items (id, ver, repo, title, status, category, tier, done_line, depends_on, rank, set_by, "
-        "set_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        f"set_at, {', '.join(FACT_COLS)}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {', '.join('?' * len(FACT_COLS))})",
         (item_id, ver, state["repo"], state["title"], state["status"], state["category"], state["tier"],
-         state["done_line"], json.dumps(state["depends_on"]), state["rank"], who, at))
+         state["done_line"], json.dumps(state["depends_on"]), state["rank"], who, at,
+         *(state.get(c) for c in FACT_COLS)))
 
 
 def _refuse_cycle(conn: sqlite3.Connection, item_id: str, deps: Sequence[str]) -> None:
@@ -768,6 +872,7 @@ def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: An
                 raise CoordError(f"{item_id} already exists ({prior['category']}); move or correct it")
             if not creating and prior is None:
                 raise CoordError(f"{item_id} is not in the coordinator store; add it first")
+            facts = _facts(conn, item_id) if prior is not None else dict.fromkeys(FACT_COLS)
             if prior is None:
                 rank = changes.get("rank")
                 if rank is None:
@@ -775,14 +880,16 @@ def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: An
                     rank = 1 if top is None else top + 1
                 state = {"repo": repo, "title": changes["title"], "tier": changes.get("tier"),
                          "done_line": changes.get("done_line"), "depends_on": changes.get("depends_on", []),
-                         "rank": rank}
+                         "rank": rank, **{c: changes[c] for c in FACT_COLS if c in changes}}
             else:
                 state = {k: prior[k] for k in ("repo", "title", "tier", "done_line", "depends_on", "rank")}
                 state.update(changes)
             if "depends_on" in changes:
                 _refuse_cycle(conn, item_id, state["depends_on"])
+            for c in FACT_COLS:         # a move carries every fact it was not asked to change
+                state.setdefault(c, facts[c])
             state["category"] = state["status"] = to        # v1: the status IS the category name (§3)
-            if prior is not None and all(state[k] == prior[k] for k in _STATE_FIELDS):
+            if prior is not None and all(state[k] == {**prior, **facts}[k] for k in (*_STATE_FIELDS, *FACT_COLS)):
                 raise CoordError(f"{item_id} already reads so; nothing to write")
             ver = 1 if prior is None else prior["ver"] + 1
             ts, iso = _local_iso(now)
@@ -799,22 +906,27 @@ def _transition(store: CoordStore, token: Any, item_id: Any, *, to: Any, who: An
 
 def add(store: CoordStore, token: Any, item_id: str, *, repo: str, title: str, who: str, why: str,
         to: str = "backlog", tier: Any = None, done_line: Any = None, depends_on: Any = (),
-        rank: Any = None) -> dict:
+        rank: Any = None, hold: Any = _UNSET, residue: Any = _UNSET, ref: Any = _UNSET) -> dict:
     """A new item, in ``to`` (default ``backlog``), with its ``add`` journal record. Refused if the id exists."""
     return _transition(store, token, item_id, to=to, who=who, why=why, source="add", creating=True, repo=repo,
                        title=title, tier=tier, done_line=done_line, depends_on=[*depends_on]
-                       if isinstance(depends_on, (builtins.list, tuple)) else depends_on, rank=rank)
+                       if isinstance(depends_on, (builtins.list, tuple)) else depends_on, rank=rank,
+                       hold=hold, residue=residue, ref=ref)
 
 
 def move(store: CoordStore, token: Any, item_id: str, *, to: str, who: str, why: str, title: Any = _UNSET,
-         tier: Any = _UNSET, done_line: Any = _UNSET, depends_on: Any = _UNSET, rank: Any = _UNSET) -> dict:
+         tier: Any = _UNSET, done_line: Any = _UNSET, depends_on: Any = _UNSET, rank: Any = _UNSET,
+         hold: Any = _UNSET, residue: Any = _UNSET, ref: Any = _UNSET) -> dict:
     """Move an existing item to ``to`` (and change any field given), with its ``move`` journal record."""
     return _transition(store, token, item_id, to=to, who=who, why=why, source="move", creating=False,
-                       title=title, tier=tier, done_line=done_line, depends_on=depends_on, rank=rank)
+                       title=title, tier=tier, done_line=done_line, depends_on=depends_on, rank=rank,
+                       hold=hold, residue=residue, ref=ref)
 
 
 def correct(store: CoordStore, token: Any, item_id: str, *, to: str, who: str, why: str, title: Any = _UNSET,
-            tier: Any = _UNSET, done_line: Any = _UNSET, depends_on: Any = _UNSET, rank: Any = _UNSET) -> dict:
+            tier: Any = _UNSET, done_line: Any = _UNSET, depends_on: Any = _UNSET, rank: Any = _UNSET,
+         hold: Any = _UNSET, residue: Any = _UNSET, ref: Any = _UNSET) -> dict:
     """Correct a wrong state: a NEW record with ``source: "correction"`` (§6), never an edit of an old one."""
     return _transition(store, token, item_id, to=to, who=who, why=why, source="correction", creating=False,
-                       title=title, tier=tier, done_line=done_line, depends_on=depends_on, rank=rank)
+                       title=title, tier=tier, done_line=done_line, depends_on=depends_on, rank=rank,
+                       hold=hold, residue=residue, ref=ref)

@@ -65,6 +65,7 @@ __all__ = [
     "lease", "launches", "LaunchThread", "mark_swept", "migrate_launch_roles", "open_room_launch", "over_unswept", "record_thread", "record_write", "release",
     "removed_coordinators", "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
     "wake_state", "HANDOFF_MAX", "refuse_unstarted_worker", "worker_handoff",
+    "SERVICE_HOLDER", "SERVICE_TTL", "service_claim", "service_release",
 ]
 
 LEASE_KINDS = ("claim", "beat", "release", "lapse", "takeover")
@@ -110,6 +111,10 @@ IDLE_GRACE = LEASE_TTL
 # ruled (C3b fix 1, 1020+50): the watcher's service beat goes only to a holder that wrote as coordinator (a lease row
 # of its own, or a thread or drop write under its token) this recently; a holder silent longer lapses
 SERVICE_BEAT_WINDOW = 2 * LEASE_TTL
+# ruled (row 156 L2 F8, levain 78): the service's claim for one apply pass. Short, so a pass killed between its claim
+# and its release holds the lease this long at most; and yieldable, so a coordinator's claim takes it (:func:`claim`)
+SERVICE_TTL = timedelta(seconds=120)
+SERVICE_HOLDER = "service"
 # a model name as the harness takes it: never a leading dash (argv would read it as a flag)
 _MODEL = re.compile(r"[A-Za-z0-9._\[\]][A-Za-z0-9._\[\]-]*")
 # causes the store writes itself; a caller's end_launch never takes one, so no caller can relabel a death
@@ -349,6 +354,11 @@ def claim(conn: sqlite3.Connection, now: str, launch_id: str, session_key: str) 
     if held is not None and held.holder == session_key:
         beat(conn, now, held.token, by="coordinator")
         return held.token
+    if held is not None and held.holder == SERVICE_HOLDER:
+        # the service's claim is for bookkeeping and always yields: its pass then fails its own check and applies
+        # nothing more (row 156 L2 F8)
+        _yield_service(conn, now, held, cause="service yields to a coordinator claim", by="coordinator")
+        held = None
     holder = None if held is None or held.holder == "operator" else _launch_by_key(conn, held.holder)
     if holder is not None and holder.state != "active":
         # a holder whose launch is not running holds nothing a claimant must wait out (wake reads it the same way)
@@ -411,6 +421,37 @@ def release(conn: sqlite3.Connection, now: str, token: int | None, *, by: str) -
     held = fence(conn, now, token)
     _event(conn, now, "release", held.holder, token=held.token, until=None, cause="holder release", by=by)
     return held
+
+
+def _yield_service(conn: sqlite3.Connection, now: str, held: Lease, *, cause: str, by: str) -> None:
+    """End the service's live claim so a coordinator can hold the lease: one ``release`` row naming the service."""
+    _event(conn, now, "release", SERVICE_HOLDER, token=held.token, until=None, cause=cause, by=by)
+
+
+def service_claim(conn: sqlite3.Connection, now: str, *, cause: str) -> tuple[int | None, Lease | None]:
+    """The service takes a free lease for one short job. Returns ``(token, None)`` once claimed (holder ``service``,
+    held for :data:`SERVICE_TTL`), or ``(None, held)`` when anyone else's claim stands, live or past its until: a lease
+    is never taken from its holder, and the lapse of someone else's is never the service's to record (recording it
+    also expires pending launches, a decision; the service skips the pass instead). A stale claim of the service's
+    own is recorded as lapsed, and nothing else is written for it. Runs in the caller's write transaction."""
+    held = lease(conn, now)
+    if held is not None and not held.live and held.holder == SERVICE_HOLDER:
+        _event(conn, now, "lapse", SERVICE_HOLDER, token=held.token, until=None, cause="past until", by="service")
+        held = None
+    if held is not None:
+        return None, held
+    return _event(conn, now, "claim", SERVICE_HOLDER, token=None, until=_plus(now, SERVICE_TTL), cause=cause,
+                  by="service"), None
+
+
+def service_release(conn: sqlite3.Connection, now: str, token: int, *, cause: str) -> bool:
+    """Give back the lease the service claimed with ``token``. Writes nothing and returns False unless the standing
+    lease is that claim, held by ``service``; a lease someone else holds is never released here."""
+    held = lease(conn, now)
+    if held is None or held.holder != "service" or held.token != token:
+        return False
+    _event(conn, now, "release", "service", token=token, until=None, cause=cause, by="service")
+    return True
 
 
 def take(conn: sqlite3.Connection, now: str, *, hold: timedelta = LEASE_TTL) -> int:
@@ -1491,7 +1532,7 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
     ``unset`` (no coordinator setting, agent none, or a codex setting written before the Codex coordinator's removal:
     a drop only queues), ``backoff``, ``stopped`` (you look), or ``wake``."""
     held = lease(conn, now)
-    if held is not None and held.live:
+    if held is not None and held.live and held.holder != SERVICE_HOLDER:   # the service's claim yields (F10)
         holder = None if held.holder == "operator" else _launch_by_key(conn, held.holder)
         if holder is not None and holder.state == "pending":
             # a bootstrap claim: its launch has not started yet
@@ -1538,6 +1579,9 @@ def wake(conn: sqlite3.Connection, now: str) -> Launch | None:
             _launch_event(conn, now, ln.launch_id, "ended", "lost the lease")
     if wake_state(conn, now)[0] != "wake":
         return None
+    held = lease(conn, now)
+    if held is not None and held.live and held.holder == SERVICE_HOLDER:
+        _yield_service(conn, now, held, cause="service yields to a wake", by="service")
     # the slot session_key is allocated first, so the claim can name its holder and the launch can carry the
     # claim's seq as the token it is activated against
     session_key = "s-" + secrets.token_hex(8)

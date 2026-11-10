@@ -132,6 +132,19 @@ function emptyWords(V, extra) {
   return { grouped: empties(g), cols: empties(c) };
 }
 out.emptyWords = { ok: emptyWords(V, {}), queue: emptyWords(V, { queue: "unreadable", unreadable: ["coordinator"] }), band: emptyWords(V, { unreadable: ["band"] }), seats: emptyWords(V, { unreadable: ["seats"] }), noKey: emptyWords(V, { unreadable: undefined, queue: "mystery" }) };
+// The needs-you column counts what the Needs strip counts: a band row the desk alone owes (section desk, not carried) is out; a
+// carried desk row, a "you" row and a row with no section are in. The column's cards are the same set the grouped list draws.
+(function () {
+  const band = (id, extra) => Object.assign({ id, title: id, band: true }, extra);
+  const m = V.boardModel({ queue: "ok", columns: [{ category: "needs-you", cards: [
+    band("band:fresh-desk", { section: "desk", carried: false }), band("band:old-desk", { section: "desk", carried: true }),
+    band("band:phill", { section: "you" }), band("band:plain"), band("band:desk-no-flag", { section: "desk" })] }] });
+  const g = node("div");
+  V.renderGrouped(doc, g, m);
+  out.deskOwed = { ids: m.columns.find((c) => c.category === "needs-you").cards.map((k) => k.id),
+    rows: walk(g).filter((n) => n.className === "bd-row").map((n) => n.dataset.id),
+    heads: walk(g).filter((n) => n.className === "grp-head").map((n) => n.textContent) };
+})();
 out.drop = dropButtons();
 out.dropHere = hereOut;
 out.laterCards = laterOut;

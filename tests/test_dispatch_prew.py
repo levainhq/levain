@@ -1,4 +1,4 @@
-"""PRE-W: the production wiring of F9a's supervisor readers and the default-off brokered setting.
+"""PRE-W: the production wiring of F9a's supervisor readers and the brokered setting (ON unless it opts out).
 
 * follow_run's ``ticket_for`` and ``routemap`` come from CONTROL's OWN records over its socket (``RUN-TICKET-FACTS``,
   ``ROUTEMAP-ACTIVE``, :class:`levain.dispatch.follow_run.SupervisorFacts`), never from anything ``resolve`` carries;
@@ -6,10 +6,13 @@
   cannot be reached is UNRESOLVED, never raised into the follower;
 * a PASSTHROUGH executor ticket's run records (``passthrough:<vendor>``) and the landing contrast escalates it, instead
   of failing every passthrough verifier run closed;
-* ``L/policy/dispatch_auth``: root's file, absent = OFF; only exactly ``brokered`` from root turns it ON."""
+* ``L/policy/dispatch_auth``: root's file. Absent, or exactly ``brokered``, is ON; exactly ``passthrough`` opts out;
+  anything else, or a file that is not root's alone, is OFF with its reason."""
 from __future__ import annotations
 
+import errno
 import os
+import socket
 import sqlite3
 
 import pytest
@@ -340,16 +343,26 @@ def test_follow_run_main_hands_the_follower_the_supervisor_readers_on_its_socket
     assert seen["ticket_for"] is mine and isinstance(seen["routemap"].__self__, FR.SupervisorFacts)
 
 
-# --- the default-off setting ----------------------------------------------------------------------------------------
+# --- the setting: ON unless it opts out ---------------------------------------------------------------------------------
 
 ME = os.getuid()
 
 
-def test_an_absent_setting_is_off(tmp_path):
-    assert DR.read_dispatch_auth(tmp_path / "dispatch_auth", owner=ME) == ("passthrough", None)
+def test_an_absent_setting_is_on(tmp_path):
+    assert DR.read_dispatch_auth(tmp_path / "dispatch_auth", owner=ME) == ("brokered", None)
 
 
-def test_only_exactly_brokered_from_the_owner_is_on(tmp_path):
+def test_exactly_passthrough_from_the_owner_is_the_opt_out_with_no_reason(tmp_path):
+    p = tmp_path / "dispatch_auth"
+    p.write_bytes(b"passthrough\n")
+    p.chmod(0o644)
+    assert DR.read_dispatch_auth(p, owner=ME) == ("passthrough", None)
+    assert DR.read_dispatch_auth(p, owner=ME + 1)[0] == "passthrough" and DR.read_dispatch_auth(p, owner=ME + 1)[1]
+    p.chmod(0o666)
+    assert DR.read_dispatch_auth(p, owner=ME)[1] is not None                   # others can write it: not the opt-out
+
+
+def test_only_exactly_brokered_or_passthrough_from_the_owner_is_read(tmp_path):
     p = tmp_path / "dispatch_auth"
     p.write_bytes(DR.DISPATCH_AUTH_ON)
     p.chmod(0o644)
@@ -358,7 +371,7 @@ def test_only_exactly_brokered_from_the_owner_is_on(tmp_path):
     p.chmod(0o666)
     assert DR.read_dispatch_auth(p, owner=ME)[0] == "passthrough"              # others can write it
     p.chmod(0o644)
-    for content in (b"brokered", b"BROKERED\n", b"brokered\n\n", b"passthrough\n", b""):
+    for content in (b"brokered", b"BROKERED\n", b"brokered\n\n", b"passthrough", b"passthrough\n\n", b""):
         p.write_bytes(content)
         auth, why = DR.read_dispatch_auth(p, owner=ME)
         assert auth == "passthrough" and why is not None, content
@@ -372,7 +385,7 @@ def test_only_exactly_brokered_from_the_owner_is_on(tmp_path):
 
 
 def test_off_builds_the_passthrough_server_alone(tmp_path):
-    """OFF (the default) is today's server: one passthrough launcher, no brokered sibling, no spend reader."""
+    """``brokered=False`` (what ``main`` passes for an opt-out) is one passthrough launcher, no brokered sibling, no spend reader."""
     srv = DR.build_server("linux", tmp_path, tmp_path / "c.sock", ME)
     assert srv.brokered is None and srv.launcher.auth == "passthrough" and srv.launcher.spend is None
     assert srv._replica is not None
@@ -409,7 +422,7 @@ class _MainRig:
         def close(self):
             self.closed = True
 
-    def __init__(self, tmp_path, monkeypatch, auth, bind_fail=None):
+    def __init__(self, tmp_path, monkeypatch, auth, bind_fail=None, *, real_read=False):
         import threading
         import types
         self.events, self.served, self.bound = [], [], []
@@ -439,14 +452,61 @@ class _MainRig:
         def serve(server, listener, stop):
             with self.lock:
                 self.served.append((server.name, listener.path.name))
-        monkeypatch.setattr(DR, "read_dispatch_auth", read)
+        if not real_read:
+            monkeypatch.setattr(DR, "read_dispatch_auth", read)
         monkeypatch.setattr(DR, "build_server", build)
         monkeypatch.setattr(DR, "_bind", bind)
         monkeypatch.setattr(DR, "serve", serve)
 
-    def run(self):
+    def run(self, setting="/nonexistent-setting"):
         return DR.main(["--socket", str(self.sock), "--operator-uid", str(ME), "--store-dir", "/nonexistent-store",
-                        "--auth-setting", "/nonexistent-setting"])
+                        "--auth-setting", str(setting)])
+
+
+def test_main_with_no_setting_file_serves_both_sockets(tmp_path, monkeypatch):
+    """The real reader, an absent setting: the brokered server is built and served on its own socket."""
+    rig = _MainRig(tmp_path, monkeypatch, "brokered", real_read=True)
+    assert rig.run(tmp_path / "no-such-setting") == 0
+    assert rig.events == ["build:True", "bind:run.sock", f"bind:{DR.BROKERED_SOCKET_NAME}"]
+    assert sorted(rig.served) == sorted([("passthrough", "run.sock"), ("brokered", DR.BROKERED_SOCKET_NAME)])
+
+
+_REAL_FSTAT = os.fstat
+
+
+def _fstat_owned_by_root(fd):
+    """The real fstat with the owner read as root. It is patched on the os module, so every reader in the process sees
+    it (a file read sizes its buffer from st_size): only st_uid is replaced, every other field is the real one."""
+    real = _REAL_FSTAT(fd)
+
+    class _Root:
+        st_uid = 0
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    return _Root()
+
+
+def test_main_with_the_opt_out_setting_serves_the_passthrough_socket_alone(tmp_path, monkeypatch):
+    rig = _MainRig(tmp_path, monkeypatch, "passthrough", real_read=True)
+    p = tmp_path / "dispatch_auth"
+    p.write_bytes(DR.DISPATCH_AUTH_OFF)
+    p.chmod(0o644)
+    monkeypatch.setattr(DR.os, "fstat", _fstat_owned_by_root)     # the file is root's for this read
+    assert rig.run(p) == 0
+    assert rig.events == ["build:False", "bind:run.sock"] and rig.served == [("passthrough", "run.sock")]
+
+
+def test_main_with_a_malformed_setting_serves_passthrough_alone_and_says_why(tmp_path, monkeypatch, capsys):
+    rig = _MainRig(tmp_path, monkeypatch, "passthrough", real_read=True)
+    p = tmp_path / "dispatch_auth"
+    p.write_bytes(b"on\n")
+    p.chmod(0o644)
+    monkeypatch.setattr(DR.os, "fstat", _fstat_owned_by_root)
+    assert rig.run(p) == 0
+    assert rig.events == ["build:False", "bind:run.sock"]
+    assert "brokered launcher off: the setting's content is neither" in capsys.readouterr().err
 
 
 def test_main_off_serves_the_passthrough_socket_alone(tmp_path, monkeypatch):
@@ -472,7 +532,7 @@ def test_main_on_serves_the_brokered_server_on_its_own_socket(tmp_path, monkeypa
 def test_main_on_whose_brokered_bind_fails_logs_it_and_still_serves_the_passthrough_socket(tmp_path, monkeypatch,
                                                                                             capsys):
     """L2 small obs 1: ON must never take OFF's server down. An OSError binding run-brokered.sock (not a Refused) is
-    one stderr line and the service serves run.sock alone, as OFF does."""
+    one stderr line and the service serves run.sock alone, as an opt-out does."""
     rig = _MainRig(tmp_path, monkeypatch, "brokered",
                    bind_fail={DR.BROKERED_SOCKET_NAME: OSError(48, "Address already in use")})
     assert rig.run() == 0
@@ -902,3 +962,51 @@ def test_main_on_shuts_both_servers_down_within_one_budget(tmp_path, monkeypatch
     assert all(0.5 * budget < b <= budget for b in rig.server.shut + rig.server.brokered.shut)
     # ... and the two ran at once
     assert took < 1.5 * budget, f"both shutdowns took {took:.2f}s against one budget of {budget}s"
+
+
+# --- w3client r1 C: an accept error never leaves one listener dead while the other lives -----------------------------
+
+class _ScriptedListener:
+    def __init__(self, script, stop):
+        self.script, self.stop, self.accepts = list(script), stop, 0
+
+    def settimeout(self, _t):
+        pass
+
+    def accept(self):
+        self.accepts += 1
+        step = self.script.pop(0) if self.script else None
+        if step is None:
+            self.stop.set()
+            raise socket.timeout()
+        raise step
+
+
+@pytest.mark.parametrize("err", [errno.EMFILE, errno.ENFILE, errno.ECONNABORTED, errno.EINTR])
+def test_serve_retries_a_recoverable_accept_error(err):
+    import threading
+    stop = threading.Event()
+    lst = _ScriptedListener([OSError(err, "recoverable")], stop)
+    DR.serve(object(), lst, stop)
+    assert lst.accepts == 2                     # it accepted again after the error, and left only on the stop
+
+
+def test_serve_logs_the_first_retried_accept_error_and_every_nth_after(monkeypatch, capsys):
+    # r2 L1 (complement): a persistent EMFILE kept the socket accepting nothing and said nothing
+    import threading
+    monkeypatch.setattr(DR, "_ACCEPT_BACKOFF_S", 0.0)
+    monkeypatch.setattr(DR, "_ACCEPT_LOG_EVERY", 3, raising=False)
+    stop = threading.Event()
+    lst = _ScriptedListener([OSError(errno.EMFILE, "too many")] * 5, stop)
+    DR.serve(object(), lst, stop)
+    lines = [ln for ln in capsys.readouterr().err.splitlines() if "accept" in ln]
+    assert lst.accepts == 6 and len(lines) == 2, lines      # the first retry and the Nth after it, nothing between
+    assert "EMFILE" in lines[0] or "too many" in lines[0]
+
+
+def test_serve_sets_the_shared_stop_on_an_unrecoverable_accept_error():
+    import threading
+    stop = threading.Event()
+    lst = _ScriptedListener([OSError(errno.EBADF, "bad listener")], stop)
+    DR.serve(object(), lst, stop)
+    assert lst.accepts == 1 and stop.is_set()   # the process exits, and the service manager starts it again

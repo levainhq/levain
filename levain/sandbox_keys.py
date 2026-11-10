@@ -40,7 +40,8 @@ REPO_ENV_VENDOR_NAMES = frozenset({"NODE_OPTIONS", "NODE_EXTRA_CA_CERTS", "NODE_
 #: display toggle, or a documented no-op. Not on it, though harmless-looking: a name Claude Code sets for its own
 #: subprocesses (the session's identity to a hook), a name levain renders into the slot's env (a repo's value would
 #: replace levain's), a hook-timing or hook-off mode, a removed safety prompt, the model a permission classifier
-#: runs on, and prompt text a repo would author for Claude to receive.
+#: runs on (``CLAUDE_CODE_AUTO_MODE_MODEL``, and ``ANTHROPIC_DEFAULT_SONNET_MODEL``, which the vendor names as
+#: choosing it too), and prompt text a repo would author for Claude to receive.
 REPO_ENV_ALLOW = frozenset({
     "ANTHROPIC_CUSTOM_MODEL_OPTION", "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
     "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_FABLE_MODEL",
@@ -49,7 +50,7 @@ REPO_ENV_ALLOW = frozenset({
     "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION", "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION", "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
     "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION", "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
     "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
     "API_FORCE_IDLE_TIMEOUT", "API_TIMEOUT_MS", "BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_OUTPUT_LENGTH",

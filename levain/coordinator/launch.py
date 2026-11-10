@@ -1239,7 +1239,7 @@ def migrate_setting(store: CoordStore) -> list[str]:
     return [] if why is None else [f"coordinator workspace {got.cwd} not recorded: {why}"]
 
 
-def watch_once(store: CoordStore) -> list[str]:
+def watch_once(store: CoordStore, *, every: float | None = None) -> list[str]:
     """One pass of ``levain coord watch``; the lines say what it did (the watch's first pass is preceded by
     :func:`migrate_setting`). In order:
 
@@ -1282,6 +1282,10 @@ def watch_once(store: CoordStore) -> list[str]:
           with no ``claude`` on PATH may have this pass as its only checker (L3 r3).
       (g) the launch slots (P6-3b, :func:`levain.coordinator.launch_slots.sweep`): the slot of every launch that is over
           is released and the lease of every other is renewed, on every pass, after (f).
+      (h) the board's queued worker reports are applied as the ``service`` (:func:`_apply_board_reports`), on every
+          pass, after (g): the home's board when THIS store is the live consent store, else THIS store's own
+          directory; never the live consent store, never another home's. ``every`` is the watch's
+          pass interval (the board judges a report's session against it).
 
     Any other row in the list is never read further. When the list cannot be read, (b)-(d) do nothing: an unread list
     is no evidence of anything. A list read with no row is a listing like any other (L3 r1 G2): an active launch
@@ -1302,6 +1306,7 @@ def watch_once(store: CoordStore) -> list[str]:
             _note_stopped(store)                                   # never raises
             lines.extend(release_held_pings(store.directory))      # never raises
             lines.extend(_sweep_slots(store))                      # never raises
+            lines.extend(_apply_board_reports(store, every))       # never raises
     return lines
 
 
@@ -1934,10 +1939,26 @@ def watch(store: CoordStore, *, every: float, emit: Callable[[str], None] = prin
         emit(f"the coordinator setting's workspace could not be checked ({type(exc).__name__}: {str(exc)[:300]})")
     while passes is None or done < passes:
         try:
-            for line in watch_once(store):
+            for line in watch_once(store, every=every):
                 emit(line)
         except Exception as exc:  # noqa: BLE001 - one bad pass never ends the watch (KeyboardInterrupt still does)
             emit(f"watch pass faulted ({type(exc).__name__}: {str(exc)[:300]}); next pass in {every:g}s")
         done += 1
         if passes is None or done < passes:
             time.sleep(every)
+
+
+def _apply_board_reports(store: CoordStore | None = None, every: float | None = None) -> list[str]:
+    """The watch's board pass (:func:`levain.coordinator.work_attach.watch_apply`): queued worker reports are applied as
+    the ``service``, facts only, in the board :func:`levain.coordinator.work_attach.watch_board` names for the watched
+    store's directory: ``<levain home>/board`` when that directory is the live consent store, else the directory the
+    watch was started with (``--queue-dir``). Never the live consent store, and never a directory beside the watched
+    one, so a watch never reaches a home it was not given (row 156 L2 F15, L3 R3-A). Silent, and a no-op, when that
+    board has no queue. Never raises."""
+    try:
+        from levain.coordinator import work_attach
+
+        board = None if store is None else work_attach.watch_board(store.directory)
+        return work_attach.watch_apply(board, every=work_attach.PASS_INTERVAL_S if every is None else every)
+    except Exception as exc:    # noqa: BLE001 - the watch's pass goes on whatever this does
+        return [f"board reports: not applied this pass ({exc})"]

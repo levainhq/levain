@@ -296,6 +296,15 @@ def test_the_tab_lists_cards_grouped_under_column_headings_and_the_modal_draws_t
     assert g["glossGrouped"] == [note] and g["glossBoard"] == [note]
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_needs_you_column_leaves_out_a_desk_owed_row_the_strip_leaves_out():
+    """The strip's rule (a desk row counts only when carried over to him) is the column's: the fresh desk row is out, a carried
+    one, his own and a row with no section stay. The python half of the same fixture is test_needs_count_desk_owed."""
+    got = _harness_run()["deskOwed"]
+    assert got["ids"] == ["band:old-desk", "band:phill", "band:plain"], got
+    assert got["rows"] == got["ids"] and "needs-you 3" in got["heads"], got
+
+
 def _harness_run():
     root = Path(__file__).resolve().parent.parent
     run = subprocess.run(["node", str(root / "tests" / "js_board_view_harness.js"),
