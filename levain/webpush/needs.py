@@ -11,6 +11,7 @@ for a caller with no page (the push sender, the unread-count route). A notice ne
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__all__ = ["BADGE_MAX", "COUNT_FILE", "COUNT_FRESH_S", "open_needs_count", "badge_value", "recorded_count", "resolved_badge", "keep_recorded", "KEEP_EVERY_S"]
+__all__ = ["BADGE_MAX", "COUNT_FILE", "COUNT_FRESH_S", "open_needs_count", "badge_value", "recorded_count", "resolved_badge", "keep_recorded", "KEEP_EVERY_S", "CONTEST_FILE", "LOCK_FILE"]
 
 log = logging.getLogger(__name__)
 # a store that could not be read: the answer is unknown. Anything else is a defect, logged loudly and still unknown (a push never fails on it)
@@ -30,6 +31,9 @@ _READ_FAULTS = (sqlite3.Error, OSError, ValueError)
 BADGE_MAX = 99      # payload room is tight and a badge past two digits says nothing more; the page shows the exact count
 COUNT_FILE = "needs-count.json"    # in the queue dir: the count the serving process last read from its own question store
 COUNT_FRESH_S = 120                # a recorded count older than this is not believed
+LOCK_FILE = "needs-count.lock"     # held exclusively (flock) for the life of the ONE process that records the count; it dies with it
+CONTEST_FILE = "needs-count.contested"   # a second serve on the same queue dir stamps this instead of recording: the count reads unknown
+_OWNED: "dict[str, int]" = {}      # queue dir -> the lock's open fd, in the owning process
 KEEP_EVERY_S = 45.0                # how often a serving process re-reads its store and re-records, well inside the freshness
 
 
@@ -74,19 +78,32 @@ def open_needs_count(queue_dir: "Path | str", question_source: Any = None) -> "i
     return result
 
 
-def _record(queue_dir: "Path | str", n: "int | None") -> None:
-    """Keep the host's count where a process without its store can read it (:func:`recorded_count`). An unknown count is kept too
-    (``n`` null): the file's presence is what marks a host install, so an old or unknown record means unknown, never the native
-    store's different number. Never raises: a count that cannot be kept leaves the other side to its own read."""
-    path = Path(queue_dir) / COUNT_FILE
+def _own(queue_dir: "Path | str") -> bool:
+    """True when this process is the one owner of the queue dir's record: it holds (or just took) the exclusive lock. A second
+    process cannot take it, so a preview serve with its own empty store never records its count over the real host's."""
+    key = str(Path(queue_dir))
+    if key in _OWNED:
+        return True
+    try:
+        fd = os.open(Path(queue_dir) / LOCK_FILE, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    _OWNED[key] = fd
+    return True
+
+
+def _write_json(path: Path, doc: dict) -> None:
     tmp = None
     try:
-        if not path.parent.is_dir():
-            return
         tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"n": n, "at": time.time(), "host": True}) + "\n")
+            fh.write(json.dumps(doc) + "\n")
         os.replace(tmp, path)
         tmp = None
     except OSError:
@@ -99,10 +116,46 @@ def _record(queue_dir: "Path | str", n: "int | None") -> None:
                 pass
 
 
+def _record(queue_dir: "Path | str", n: "int | None") -> None:
+    """Keep the host's count where a process without its store can read it (:func:`recorded_count`). Only the process that owns
+    the queue dir's lock writes it; any other stamps the contest marker, so the count reads unknown until the contest ages out
+    (a wrong 0 from a second serve with an empty store cleared the real app badge). An unknown count is kept too (``n`` null):
+    the file's presence is what marks a host install, so an old or unknown record means unknown, never the native store's
+    different number. Never raises: a count that cannot be kept leaves the other side to its own read."""
+    base = Path(queue_dir)
+    if not base.is_dir():
+        return
+    if _own(base):
+        _write_json(base / COUNT_FILE, {"n": n, "at": time.time(), "host": True})
+    else:
+        _write_json(base / CONTEST_FILE, {"at": time.time(), "pid": os.getpid()})
+
+
+def _contested(queue_dir: "Path | str", now: "float | None") -> bool:
+    """A second serve stamped the contest marker within the freshness window (or the marker is unreadable): the record is not
+    one process's word."""
+    path = Path(queue_dir) / CONTEST_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    try:
+        at = json.loads(raw)["at"]
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            return True
+        age = (time.time() if now is None else now) - at
+        return not (age > COUNT_FRESH_S)      # a stamp from the future is contested too
+    except (ValueError, KeyError, TypeError):
+        return True
+
+
 def _read_record(queue_dir: "Path | str", now: "float | None") -> "tuple[bool, int | None]":
     """(is a host install, its fresh count or None). A record file that exists marks a host install even when it is old, null or
     off its shape; one that cannot be read at all but exists is host-unknown, and no file is a plain install."""
     path = Path(queue_dir) / COUNT_FILE
+    contested = _contested(queue_dir, now)
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -117,7 +170,7 @@ def _read_record(queue_dir: "Path | str", now: "float | None") -> "tuple[bool, i
         if type(n) is not int or n < 0 or isinstance(at, bool) or not isinstance(at, (int, float)):
             return True, None
         age = (time.time() if now is None else now) - at
-        return True, (min(n, BADGE_MAX) if 0 <= age <= COUNT_FRESH_S else None)
+        return True, (min(n, BADGE_MAX) if 0 <= age <= COUNT_FRESH_S and not contested else None)
     except (ValueError, KeyError, TypeError):
         return True, None
 
