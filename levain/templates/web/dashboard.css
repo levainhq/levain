@@ -793,6 +793,9 @@
   /* the "when?" form: quick picks on their own line, then the day and time, who does it, and the confirm row */
   .when-form, .who-form { flex-direction: row; max-width: 100%; }
   .when-picks { display: flex; flex-wrap: wrap; gap: var(--sp-2); flex: 1 1 100%; }
+  /* compact: the day and the time share a row (each takes half) so the confirm row sits higher */
+  .when-form .verb-date, .when-form .verb-time { flex: 1 1 7rem; min-width: 0; }
+  .when-form .who-ctl { flex: 1 1 100%; }
   .who-ctl { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
   .who-opt[aria-pressed="true"] { color: var(--ink); border-color: var(--label); background: var(--card-2); }
   .who-repo { min-width: 0; width: 10rem; }
@@ -2615,7 +2618,7 @@ body.ke .panel[data-ck-panel="loops"] .row[data-spore] { scroll-margin-top: calc
 
 /* ═══════════════════════════ BOARD WORK LISTS TO THE MOCK (K10 S4) ═══════════════════════════
    Open loops: a left stripe per heat (hot orange, warm violet, parked grey), the spore id, "open N d" and the repo, on Board as on Build.
-   Tray: what is late reads first, with a red stripe and "overdue N d" in red; Resolve and Snooze are always on the row, never hover-only. */
+   Tray: what is late reads first, with a red stripe and "overdue N d" in red; the row's verbs are always shown, never hover-only. */
 body.ke [data-ck-panel="loops"] .row[data-heat] { --heat: var(--meta); }
 body.ke [data-ck-panel="loops"] .row[data-heat="hot"] { --heat: var(--accent); }
 body.ke [data-ck-panel="loops"] .row[data-heat="warm"] { --heat: var(--violet); }
