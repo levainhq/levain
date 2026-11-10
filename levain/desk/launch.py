@@ -240,7 +240,7 @@ def default_desk_dir() -> Path:
 
 
 def session_name(launch: Any) -> str:
-    return f"levain-{launch.role}-{launch.launch_id.removeprefix('ln-')}"
+    return f"levain-{role_word(launch.role)}-{launch.launch_id.removeprefix('ln-')}"
 
 
 def brief_path(launch: Any) -> Path:
@@ -866,7 +866,7 @@ def _ours(store: CoordStore, row: dict[str, Any]) -> Any:
     ln = store.launch_by_harness_session(row["sessionId"]) if isinstance(row.get("sessionId"), str) else None
     if ln is None and isinstance(row.get("name"), str) and (m := _OURS.fullmatch(row["name"])):
         ln = store.launch("ln-" + m.group(2))
-        ln = ln if ln is not None and ln.role == m.group(1) and ln.cwd \
+        ln = ln if ln is not None and role_word(ln.role) == role_word(m.group(1)) and ln.cwd \
             and row.get("cwd") == os.path.realpath(ln.cwd) else None
     return ln
 

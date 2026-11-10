@@ -212,7 +212,7 @@ def test_a_woken_launch_starts_and_reads_its_ids_back_by_name(store, fake, live_
     ln = store.launch(launch_id)
     assert ln.state == "active" and ln.harness_session_id == SID
     (argv,) = fake.spawns()
-    name = f"{SESSION_PREFIX_DESK}{launch_id.removeprefix('ln-')}"
+    name = f"levain-desk-{launch_id.removeprefix('ln-')}"
     brief = cl.brief_path(ln)
     # inside the session's own trusted workspace (R2), never the drops in argv
     assert brief == workdir.resolve() / ".levain" / "briefs" / f"{launch_id}.md"
@@ -2947,3 +2947,14 @@ def test_a_codex_launch_already_past_its_ttl_is_retired_never_expired_as_a_death
     with sqlite3.connect(qdir / "dispatch.db") as c:
         assert lease.launch_death(c, lease.launch(c, launch_id)) is not True
     assert fake.spawns() == []
+
+
+@pytest.mark.parametrize("prefix", ["levain-desk-", SESSION_PREFIX_DESK])
+def test_a_listed_session_is_ours_under_the_new_name_or_the_old(store, fake, live_hook, workdir, prefix):
+    launch_id = woken(store)
+    ln = store.launch(launch_id)
+    assert cl.session_name(ln) == f"levain-desk-{launch_id.removeprefix('ln-')}"          # new launches are written "desk"
+    row = {"id": "5e5e5e5e", "sessionId": "5e5e5e5e-0000-4000-8000-000000000000",
+           "name": prefix + launch_id.removeprefix("ln-"), "cwd": str(workdir.resolve()), "state": "working"}
+    assert cl._ours(store, row).launch_id == launch_id
+    assert cl._ours(store, {**row, "cwd": "/elsewhere"}) is None

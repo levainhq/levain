@@ -32,8 +32,8 @@ RECORD_NAME_WORKSPACES = "coordinator_workspaces.json"   # consent/<file>: the d
 RECORD_KEY_WORKSPACES = "coordinator_workspaces"
 BAND_KEY_DESK_STOPPED = "levain-coordinator-stopped"
 CODEX_RULE_NAME = "levain-coordinator.rules"   # <cwd>/.codex/rules/<file>
-SESSION_PREFIX_DESK = "levain-coordinator-"    # session_name() of a desk launch: levain-<role>-<id>
-SESSION_ROLE_ALT = "(coordinator|worker)"
+SESSION_PREFIX_DESK = "levain-coordinator-"    # the name an OLD desk launch's session carries (read, never written)
+SESSION_ROLE_ALT = "(desk|coordinator|worker)"   # a session name is read under either word, written as "desk"
 DRAFT_AGENT_PREFIX = "coordinator-draft:"      # the ledger entry's agent field for a promoted team draft
 CAUSE_CODEX_REMOVED = "codex coordinator removed"   # a launch's persisted end cause (lease_events)
 

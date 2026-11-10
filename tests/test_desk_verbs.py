@@ -142,7 +142,7 @@ def test_start_on_a_wake_store_writes_one_pending_launch_and_starts_it(store, qd
     assert _rows(qdir, "SELECT launch_id, role FROM launches") == [(out["launch_id"], ROLE_DESK)]
     assert _rows(qdir, "SELECT count(*) FROM launch_events WHERE kind = 'pending'") == [(1,)]
     (argv,) = fake.spawns()
-    assert argv[:3] == ["--bg", "-n", f"{SESSION_PREFIX_DESK}{out['launch_id'].removeprefix('ln-')}"]
+    assert argv[:3] == ["--bg", "-n", f"levain-desk-{out['launch_id'].removeprefix('ln-')}"]
     assert store.launch(out["launch_id"]).state == "active"
     assert lines == [f"launch {out['launch_id']} started: claude attach {HID}"]
 
