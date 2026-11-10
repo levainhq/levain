@@ -431,7 +431,8 @@ def recorded_short_tmp(run: Path) -> Path | None:
 def remove_tree(path) -> None:
     """Delete a directory tree with no recursion and no path-length limit, ignoring per-entry OSError (the behaviour of
     shutil.rmtree(ignore_errors=True), minus its depth ceiling).  One directory fd is open at a time; symlinks are
-    unlinked, never followed.  An entry that cannot be removed is skipped, so the walk always ends."""
+    unlinked, never followed.  It removes what it can and never leaves the tree: each level's (dev, ino) is recorded
+    on the way down and every ascent must land on the recorded parent, else the walk stops where it is."""
     path = os.fspath(path)
     try:
         if not stat.S_ISDIR(os.lstat(path).st_mode):
@@ -441,6 +442,12 @@ def remove_tree(path) -> None:
     except OSError:
         return
     names: list[str] = []              # directory names from the top down to the current dir
+    try:
+        st0 = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return
+    ids: list[tuple[int, int]] = [(st0.st_dev, st0.st_ino)]   # identity of each level, top down
     stuck: list[set[str]] = [set()]    # per level: children that could not be removed
     try:
         while True:
@@ -471,9 +478,16 @@ def remove_tree(path) -> None:
                 except OSError:
                     stuck[-1].add(child)
                     continue
+                try:
+                    nst = os.fstat(nfd)
+                except OSError:
+                    os.close(nfd)
+                    stuck[-1].add(child)
+                    continue
                 os.close(fd)
                 fd = nfd
                 names.append(child)
+                ids.append((nst.st_dev, nst.st_ino))
                 stuck.append(set())
                 continue
             if not names:
@@ -482,9 +496,18 @@ def remove_tree(path) -> None:
                 pfd = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
             except OSError:
                 return
+            try:
+                pst = os.fstat(pfd)
+                moved = (pst.st_dev, pst.st_ino) != ids[-2]
+            except OSError:
+                moved = True
+            if moved:
+                os.close(pfd)
+                return
             os.close(fd)
             fd = pfd
             name = names.pop()
+            ids.pop()
             stuck.pop()
             try:
                 os.rmdir(name, dir_fd=fd)

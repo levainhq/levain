@@ -1653,3 +1653,26 @@ def test_remove_tree_has_no_depth_limit_and_never_follows_a_symlink(tmp_path):
     assert not top.exists()
     assert (outside / "keep").read_text() == "k"
     verify.remove_tree(tmp_path / "absent")
+
+
+def test_remove_tree_stops_when_a_dir_is_renamed_out_mid_walk(tmp_path, monkeypatch):
+    top = tmp_path / "top"
+    (top / "a" / "b").mkdir(parents=True)
+    (top / "a" / "b" / "leaf").write_text("x")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "victim").write_text("v")
+    real_open = os.open
+    fired = []
+
+    def hooked(path, flags, *a, **kw):
+        if path == ".." and not fired:
+            fired.append(1)
+            os.rename(top / "a" / "b", elsewhere / "b")   # ".." from b is now `elsewhere`
+        return real_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(os, "open", hooked)
+    verify.remove_tree(top)
+    monkeypatch.undo()
+    assert fired
+    assert (elsewhere / "victim").read_text() == "v"
