@@ -521,7 +521,17 @@ def _consent_rows_in(got: Any, egress_lookup: Callable[[str, str], tuple[Any, bo
     return rows, bad
 
 
-def _question_row_in(q: Any, later: tuple[str, str] | None = None, intention: str | None = None) -> RowIn:
+def _intention_words_digest(store: Any, q: Any) -> str:
+    """A short digest of the CURRENT words of the intention ``q`` rings: one source for the stored row version and its
+    recompute, so an edit of the words moves the version and a stale Edit is refused."""
+    from levain.consent.questions import intention_text_of
+
+    words = intention_text_of(store, q)
+    return hashlib.sha256((words or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _question_row_in(q: Any, later: tuple[str, str] | None = None, intention: str | None = None,
+                     words_digest: str = "") -> RowIn:
     """One question (``levain.consent.questions.Question``) as a row: ``question:<n>``. A row carries who asked,
     when, how many options it offers and whether it is answered, and NOTHING the agent wrote (the question, the
     option labels, what it blocks): this panel is token-free on loopback, so those words are served only to a token
@@ -551,7 +561,8 @@ def _question_row_in(q: Any, later: tuple[str, str] | None = None, intention: st
     return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
                  # the reminder it rings is part of its version: a row re-rung since the page read it is stale there
                  stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open",
-                         **({"intention": facets["question_intention"]} if "question_intention" in facets else {})})
+                         **({"intention": facets["question_intention"], "words": words_digest}
+                            if "question_intention" in facets else {})})
 
 
 def _sign_facet(facets: dict[str, Any], item: Any) -> None:
@@ -579,7 +590,8 @@ def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     shown.update((q.n, q) for q in done)
     from levain.band_view import later_facets
     from levain.consent.questions import intention_of
-    return [_question_row_in(q, None if q.answer is not None else later_facets(store, q, now), intention_of(store, q))
+    return [_question_row_in(q, None if q.answer is not None else later_facets(store, q, now), intention_of(store, q),
+                             _intention_words_digest(store, q))
             for q in shown.values()], max(len(open_) - PENDING_CAP, 0)
 
 
@@ -1566,7 +1578,7 @@ class Cockpit:
             return Absent(f"decision {row_id!r} is gone")
         from levain.consent.questions import intention_of
 
-        return Read(rows=(_question_row_in(q, None, intention_of(store, q)),))
+        return Read(rows=(_question_row_in(q, None, intention_of(store, q), _intention_words_digest(store, q)),))
 
     def _note_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
         from levain.consent.notes import NoteStoreError

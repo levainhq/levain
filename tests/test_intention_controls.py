@@ -274,3 +274,24 @@ def test_a_malformed_snooze_reads_in_plain_words(host_rig) -> None:
     with pytest.raises(EditError) as exc:
         _fire(rig, "tray", rig.rows()["band:np-ring0001"], "intention_snooze", {"until": "2026-11-20T25:99"})
     assert "pick a day" in str(exc.value) and "YYYY" not in str(exc.value) and not host.acts
+
+
+# --- stack tip fixes -----------------------------------------------------------------------------------------------------
+
+
+def _reworded(host: HostStore, words: str) -> None:
+    host.rows = [replace(q, intention_text=words) if q.id == "np-ring0001" else q for q in host.rows]
+
+
+def test_a_decisions_edit_built_on_words_since_changed_is_stale(host_rig) -> None:
+    """Two clients open the same reminder; A rewords it; B's Edit, built on the old words, is refused as stale and the host is
+    not called. An unrelated re-read with the words unchanged keeps the version stable."""
+    rig, host = host_rig
+    _reworded(host, "renew the thing")
+    first = _decision(rig, 11)
+    assert _decision(rig, 11)["version"] == first["version"]
+    _reworded(host, "renew the OTHER thing")        # client A's edit landed
+    assert _decision(rig, 11)["version"] != first["version"]
+    with pytest.raises(EditError) as exc:
+        _fire(rig, "decisions", first, "intention_edit", {"text": "B's words"})
+    assert exc.value.http_status == 409 and not host.acts
