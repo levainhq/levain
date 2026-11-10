@@ -8,24 +8,29 @@ import yaml
 
 WF = yaml.safe_load((Path(__file__).resolve().parent.parent / ".github" / "workflows" / "test.yml").read_text())
 JOBS = WF["jobs"]
-HEAVY_IF = ("${{ always() && !cancelled() && "
-            "!(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true') }}")
+GATE_CLAUSE = "!(needs.gate.result == 'success' && needs.gate.outputs.skip == 'true')"
+# stage0 (the invariant tests) skips only where the gate skips everything.
+STAGE0_IF = "${{ always() && !cancelled() && " + GATE_CLAUSE + " }}"
+# The jobs that need both the gate and stage0 run only on a stage0 that SUCCEEDED, besides the gate clause.
+HEAVY_IF = "${{ always() && !cancelled() && needs.stage0.result == 'success' && " + GATE_CLAUSE + " }}"
 
 
-def evaluate(cond, gate_result, skip, cancelled=False):
+def evaluate(cond, gate_result, skip, cancelled=False, stage0="success"):
     """Evaluate a `${{ ... }}` condition of exactly the shape the heavy jobs use: the functions always() and
-    !cancelled(), string comparisons on needs.gate.result / needs.gate.outputs.skip, && || ! and parentheses.
-    Anything else raises, so a new shape cannot slip past this table unevaluated."""
+    !cancelled(), string comparisons on needs.gate.result / needs.gate.outputs.skip / needs.stage0.result, && || !
+    and parentheses. Anything else raises, so a new shape cannot slip past this table unevaluated."""
     m = re.fullmatch(r"\$\{\{ (.*) \}\}", cond)
     assert m, cond
     expr = m.group(1)
     expr = expr.replace("!cancelled()", "(not CANCELLED)").replace("always()", "True")
     expr = expr.replace("needs.gate.result", "RESULT").replace("needs.gate.outputs.skip", "SKIP")
+    expr = expr.replace("needs.stage0.result", "STAGE0")
     expr = expr.replace("&&", " and ").replace("||", " or ")
     expr = re.sub(r"!(?!=)", " not ", expr)
-    leftover = re.sub(r"\b(True|and|or|not|RESULT|SKIP|CANCELLED)\b|'[a-z]*'|==|!=|[()\s]", "", expr)
+    leftover = re.sub(r"\b(True|and|or|not|RESULT|SKIP|STAGE0|CANCELLED)\b|'[a-z]*'|==|!=|[()\s]", "", expr)
     assert leftover == "", (cond, leftover)
-    return bool(eval(expr, {"__builtins__": {}}, {"RESULT": gate_result, "SKIP": skip, "CANCELLED": cancelled}))
+    return bool(eval(expr, {"__builtins__": {}}, {"RESULT": gate_result, "SKIP": skip, "CANCELLED": cancelled,
+                                                  "STAGE0": stage0}))
 
 
 def test_the_gate_runs_only_for_a_main_push():
@@ -33,8 +38,14 @@ def test_the_gate_runs_only_for_a_main_push():
     assert "github.event_name == 'push'" in cond and "refs/heads/main" in cond
 
 
+def _needs(name, jobs=None):
+    needs = (jobs or JOBS)[name].get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
 def _heavy():
-    return [n for n, j in JOBS.items() if j.get("needs") == "gate" and n != "verified"]
+    """The jobs fed directly by the gate and stage0: every one must carry the stage0 dependency and guard."""
+    return [n for n, j in JOBS.items() if set(_needs(n)) == {"gate", "stage0"}]
 
 
 # (gate result, skip output, heavy job runs?). The skip output is "" when the gate did not run or failed before writing.
@@ -48,8 +59,22 @@ HEAVY_TABLE = [
 ]
 
 
+STAGE0_RESULTS = ("success", "failure", "cancelled", "skipped")
+
+
 def test_there_are_heavy_jobs():
     assert len(_heavy()) >= 6
+    # the jobs the move names; a heavy job that dropped its stage0 dependency falls out of _heavy(), so name them
+    for n in ("plan", "root-py39", "linux-live", "browser", "isolation", "chat-egress-srt"):
+        assert n in _heavy(), n
+
+
+def test_stage0_runs_the_invariant_tests_alone_behind_the_gate():
+    job = JOBS["stage0"]
+    assert _needs("stage0") == ["gate"]
+    assert job["if"] == STAGE0_IF
+    runs = " ".join(s.get("run", "") for s in job["steps"])
+    assert "-m invariant" in runs
 
 
 @pytest.mark.parametrize("name", _heavy())
@@ -63,6 +88,41 @@ def test_every_heavy_job_skips_only_when_the_gate_succeeded_and_said_skip(name):
         assert evaluate(cond, result, skip, cancelled=True) is False, (name, result, skip)
     # a cancelled gate while the workflow is still live is not a verdict: run
     assert evaluate(cond, "cancelled", "", cancelled=False) is True, name
+
+
+@pytest.mark.parametrize("name", _heavy() + ["test"])
+def test_a_heavy_job_runs_only_after_a_successful_stage0(name):
+    assert "stage0" in _needs(name), name
+    cond = JOBS[name]["if"]
+    assert "needs.stage0.result == 'success'" in cond, name
+    for stage0 in STAGE0_RESULTS:
+        for result, skip, _ in HEAVY_TABLE:
+            if name == "test":
+                continue  # `test` also needs plan; covered by the simulation below
+            assert evaluate(cond, result, skip, stage0=stage0) is (stage0 == "success" and evaluate(cond, result, skip)), \
+                (name, stage0, result, skip)
+
+
+@pytest.mark.parametrize("stage0", ["failure", "cancelled", "skipped"])
+@pytest.mark.parametrize("event,ref", [("push", "refs/heads/seat/x"), ("push", "refs/heads/main")])
+def test_a_stage0_that_did_not_succeed_stops_every_heavy_job(stage0, event, ref):
+    results = simulate(event, ref, "success", "false", stage0_outcome=stage0)
+    suite = [n for n in JOBS if n not in NO_TESTS and n != "stage0"]
+    assert [n for n in suite if results[n] != "skipped"] == [], (stage0, event, ref)
+
+
+def test_the_stage0_checks_can_fail():
+    # Controls: drop the stage0 guard from one job, or its dependency from another, and the checks above must go red.
+    saved = {n: (JOBS[n]["if"], JOBS[n]["needs"]) for n in ("root-py39", "isolation")}
+    try:
+        JOBS["root-py39"]["if"] = HEAVY_IF.replace("needs.stage0.result == 'success' && ", "")
+        assert simulate("push", "refs/heads/seat/x", stage0_outcome="failure")["root-py39"] == "success"
+        assert "needs.stage0.result == 'success'" not in JOBS["root-py39"]["if"]
+        JOBS["isolation"]["needs"] = "gate"
+        assert "isolation" not in _heavy() and "stage0" not in _needs("isolation")
+    finally:
+        for n, (i, nd) in saved.items():
+            JOBS[n]["if"], JOBS[n]["needs"] = i, nd
 
 
 def test_the_verified_job_needs_a_successful_gate_that_said_skip():
@@ -104,11 +164,6 @@ def evaluate_job_if(cond, results, outputs, event, ref, cancelled=False):
     return value
 
 
-def _needs(name, jobs=None):
-    needs = (jobs or JOBS)[name].get("needs") or []
-    return [needs] if isinstance(needs, str) else list(needs)
-
-
 def _ancestors(name, jobs=None):
     """Every job `name` depends on, directly or through other jobs' `needs`."""
     found, stack = set(), list(_needs(name, jobs))
@@ -136,7 +191,7 @@ def _topological(jobs=None):
     return order
 
 
-def simulate(event, ref, gate_outcome=None, skip="", cancelled=False, jobs=None):
+def simulate(event, ref, gate_outcome=None, skip="", cancelled=False, jobs=None, stage0_outcome="success"):
     """Propagate job results through `needs` in topological order. A job whose condition holds RUNS and succeeds (the
     suite is assumed green: this tests whether the job runs, not whether the code passes). The gate's outcome is only
     consulted when its own `if` lets it run. Returns {job: 'success' | 'skipped' | gate_outcome}.
@@ -156,6 +211,8 @@ def simulate(event, ref, gate_outcome=None, skip="", cancelled=False, jobs=None)
         elif n == "gate":
             results[n] = gate_outcome
             outputs[n] = skip
+        elif n == "stage0":
+            results[n] = stage0_outcome
         else:
             results[n] = "success"
     return results
