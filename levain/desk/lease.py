@@ -63,7 +63,7 @@ __all__ = [
     "LAUNCH_KINDS", "LAUNCH_TTL", "LEASE_KINDS", "LEASE_SCHEMA", "LEASE_TTL", "MAX_DEATHS",
     "ROLES", "SERVICE_BEAT_WINDOW", "SETTING_AGENTS", "Launch", "Lease", "LeaseRefused", "Setting", "activate", "activate_room", "beat",
     "check_model", "claim", "by_harness_session", "claim_spawn", "end_done_worker", "end_launch", "end_unlisted", "fence", "launch",
-    "lease", "launches", "LaunchThread", "mark_swept", "migrate_launch_roles", "open_room_launch", "over_unswept", "record_thread", "record_write", "release",
+    "lease", "launches", "LaunchThread", "mark_swept", "migrate_launch_roles", "move_cwd", "open_room_launch", "over_unswept", "record_thread", "record_write", "release",
     "removed_desks", "request_launch", "spawn_draft", "spawn_record", "spawn_thread_refusal", "service_beat", "set_agent", "set_user_scope", "setting", "status", "take", "thread_of", "unspawned", "wake",
     "wake_state", "HANDOFF_MAX", "refuse_unstarted_worker", "worker_handoff",
     "SERVICE_HOLDER", "SERVICE_TTL", "service_claim", "service_release",
@@ -1429,6 +1429,18 @@ def set_user_scope(conn: sqlite3.Connection, now: str, user_scope: bool, *, cwd:
     if cwd is not None and was.cwd != cwd:
         raise _refused(f"the desk's directory changed to {was.cwd} while this was checked; run it again")
     return set_agent(conn, now, "claude", model=was.model, cwd=was.cwd, user_scope=user_scope)
+
+
+def move_cwd(conn: sqlite3.Connection, now: str, frm: str, to: str) -> Setting | None:
+    """``levain desk move-home``'s directory change alone, in the caller's ONE write transaction: the latest setting is
+    read and, only when its directory is still ``frm``, a replacement with directory ``to`` (same agent, model and
+    user-layer choice, as read under the same lock) is appended. Returns the setting it replaced, or None when it changed
+    nothing (no setting, another directory, agent none, or a codex setting, which launches nothing)."""
+    was = setting(conn)
+    if was is None or was.cwd != frm or was.agent in ("none", "codex"):
+        return None
+    set_agent(conn, now, was.agent, model=was.model, cwd=to, user_scope=was.user_scope)
+    return was
 
 
 def claim_spawn(conn: sqlite3.Connection, now: str, launch_id: str, pid: int) -> tuple[Launch, str | None]:

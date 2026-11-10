@@ -289,6 +289,15 @@ def record(directory: Path) -> Path:
     return real
 
 
+def record_moved(real: str) -> None:
+    """Add the real path ``real`` to every desk record by its spelling alone (``levain desk move-home``): a renamed desk
+    home still matches its old entry by identity through the compat link, so :func:`record` would add nothing, and the
+    entry would miss once that link is gone. Add-only, as :func:`record`; raises as it does."""
+    recorded()
+    for path in _record_paths():
+        _add(path, Path(real), None)
+
+
 def _chain(here: Path) -> list[Path]:
     """``here`` and its parents, then its real path and the real path's parents (each directory once)."""
     out: list[Path] = []

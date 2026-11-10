@@ -313,3 +313,149 @@ def test_the_stored_desk_cwd_moves_with_the_home(tmp_path):
     rc = move_home(home=home, settings=settings, store_dir=tmp_path / "queue", out=out, err=err)
     assert rc == 0, err.getvalue()
     assert st.coord_setting().cwd == f"{home}/{DESK_HOME_NAME}"
+
+
+# --- L3 round 2 -------------------------------------------------------------------------------------------------------
+def test_the_stored_cwd_moves_in_the_board_store_and_the_consent_store(tmp_path):
+    # a desk can live in <home>/board as well as <home>/consent (levain.desk.cli._desk_dir): both are migrated
+    from levain.desk.store import CoordStore
+
+    home, settings = _setup(tmp_path)
+    old_cwd = f"{home}/{LEGACY_HOME_NAME}"
+    board, consent = CoordStore(home / "board"), CoordStore(home / "consent")
+    board.coord_set_agent("claude", cwd=old_cwd)
+    consent.coord_set_agent("claude", cwd="/somewhere/else")          # not the old path: left alone
+    rc, out, err = _run(home, settings)
+    assert rc == 0, err
+    assert board.coord_setting().cwd == f"{home}/{DESK_HOME_NAME}"
+    assert consent.coord_setting().cwd == "/somewhere/else"
+
+
+def test_the_door_still_finds_the_workspace_after_the_link_is_dropped(tmp_path, monkeypatch):
+    from levain.desk import door
+
+    home, settings = _setup(tmp_path)
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    door.record(home / LEGACY_HOME_NAME)                               # the record names the old path
+    rc, out, err = _run(home, settings)
+    assert rc == 0, err
+    assert _run(home, settings)[1].startswith("nothing to do")         # a second run does not add it again
+    (home / LEGACY_HOME_NAME).unlink()                                 # the compat link is dropped a release later
+    new = home / DESK_HOME_NAME
+    assert door.workspace(str(new)) is not None
+    assert door.admit(new)[0] is None
+
+
+def test_a_refused_cwd_update_changes_no_settings_file(tmp_path, monkeypatch):
+    from levain.desk.store import CoordError, CoordStore
+
+    home, settings = _setup(tmp_path)
+    ds = _desk_settings(home)
+    before, dbefore = settings.read_text(), ds.read_text()
+    CoordStore(home / "board").coord_set_agent("claude", cwd=f"{home}/{LEGACY_HOME_NAME}")
+
+    def refused(self, frm, to):
+        raise CoordError("refused")
+
+    monkeypatch.setattr(CoordStore, "coord_move_cwd", refused)
+    rc, _, err = _run(home, settings)
+    assert rc == 1 and "failed" in err
+    assert settings.read_text() == before and ds.read_text() == dbefore
+    assert not settings.with_name(BACKUP_NAME).exists()
+    assert (home / LEGACY_HOME_NAME).is_dir() and not (home / LEGACY_HOME_NAME).is_symlink()
+
+
+def test_a_later_failure_puts_the_stored_cwd_back(tmp_path, monkeypatch):
+    from levain.desk.store import CoordStore
+    from levain.desk import move_home as mh
+
+    home, settings = _setup(tmp_path)
+    old_cwd = f"{home}/{LEGACY_HOME_NAME}"
+    st = CoordStore(home / "board")
+    st.coord_set_agent("claude", model="opus", cwd=old_cwd, user_scope=True)
+
+    def boom(path, data, expected=None):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mh, "_write_atomic", boom)
+    rc, _, err = _run(home, settings)
+    assert rc == 1
+    s = st.coord_setting()
+    assert (s.agent, s.model, s.cwd, s.user_scope) == ("claude", "opus", old_cwd, True)
+    assert (home / LEGACY_HOME_NAME).is_dir() and not (home / DESK_HOME_NAME).exists()
+
+
+def test_a_concurrent_model_change_is_not_overwritten(tmp_path, monkeypatch):
+    from levain.desk.store import CoordStore
+    from levain.desk import move_home as mh
+
+    home, settings = _setup(tmp_path)
+    old_cwd = f"{home}/{LEGACY_HOME_NAME}"
+    st = CoordStore(home / "board")
+    st.coord_set_agent("claude", model="opus", cwd=old_cwd)
+    real = mh._read_stored_setting
+
+    def then_changed(db):
+        got = real(db)
+        if got is not None:
+            st.coord_set_agent("claude", model="sonnet", cwd=old_cwd)   # another writer, after the plan was read
+        return got
+
+    monkeypatch.setattr(mh, "_read_stored_setting", then_changed)
+    rc, _, err = _run(home, settings)
+    assert rc == 0, err
+    s = st.coord_setting()
+    assert (s.model, s.cwd) == ("sonnet", f"{home}/{DESK_HOME_NAME}")
+
+
+def test_a_moved_home_with_nothing_else_left_still_gets_its_link(tmp_path):
+    home, settings = _setup(tmp_path)
+    (home / LEGACY_HOME_NAME).rename(home / DESK_HOME_NAME)
+    settings.write_text("{}")                                          # the rewrite had already landed
+    rc, out, err = _run(home, settings)
+    assert rc == 0, err
+    old = home / LEGACY_HOME_NAME
+    assert old.is_symlink() and old.resolve() == (home / DESK_HOME_NAME).resolve()
+    assert _run(home, settings)[1].startswith("nothing to do")
+
+
+def test_a_broken_old_link_is_replaced(tmp_path):
+    home, settings = _setup(tmp_path)
+    (home / LEGACY_HOME_NAME).rename(home / DESK_HOME_NAME)
+    (home / LEGACY_HOME_NAME).symlink_to("gone")                       # a link to nothing
+    settings.write_text("{}")
+    rc, out, err = _run(home, settings)
+    assert rc == 0, err
+    old = home / LEGACY_HOME_NAME
+    assert old.is_symlink() and old.resolve() == (home / DESK_HOME_NAME).resolve()
+
+
+def test_settings_naming_the_desk_homes_own_file_is_rewritten_once(tmp_path):
+    home, _ = _setup(tmp_path)
+    ds = _desk_settings(home)
+    rc, out, err = _run(home, ds)                                      # --settings is the desk home's own file
+    assert rc == 0, err
+    assert _cmds(home / DESK_HOME_NAME / ".claude" / "settings.json") == [
+        f"python3 -m levain.hookrun {home}/{DESK_HOME_NAME}/activation/hooks/consent_claude_code.py"]
+
+
+def test_a_path_entry_after_a_colon_is_rewritten(tmp_path):
+    from levain.desk.move_home import rewrite_text
+
+    base = tmp_path / ".levain"
+    assert rewrite_text(f"PATH=x:{base}/{LEGACY_HOME_NAME}/bin:/usr/bin run", base) == \
+        f"PATH=x:{base}/{DESK_HOME_NAME}/bin:/usr/bin run"
+    assert rewrite_text(f"PATH=x:{base}/{LEGACY_HOME_NAME}:/usr/bin", base) == f"PATH=x:{base}/{DESK_HOME_NAME}:/usr/bin"
+
+
+def test_the_backup_constant_names_the_backup_written():
+    from levain.desk.move_home import BACKUP_SUFFIX
+
+    assert BACKUP_NAME == "settings.json" + BACKUP_SUFFIX
+
+
+def test_levain_init_has_no_role_flag_to_normalise():
+    # run_init's role is fed only by the desk launcher (levain.desk.launch); the operator's argv has no --role on init
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["init", "--role", "desk"])
+    assert exc.value.code == 2

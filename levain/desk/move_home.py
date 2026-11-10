@@ -4,13 +4,16 @@ An install made before the desk rename keeps its desk home under the old directo
 LEGACY_HOME_NAME`); :func:`levain.desk.legacy.desk_home` still finds it there. A Claude Code consent hook in the
 user's ``settings.json`` may name a file under that directory, and renaming the directory alone would leave that hook dead. This verb
 does both: it renames ``<levain home>/<old>`` to ``<levain home>/desk``, rewrites every hook command in ``settings.json``
-that names the old home path, and keeps the old path as a symlink to the new directory for one release.
+that names the old home path (and the desk home's own ``.claude`` settings), moves the desk's stored directory in each
+store a desk can live in (the consent directory and the board), adds the new path to the door's workspace record beside
+the old one, and keeps the old path as a symlink to the new directory for one release.
 
 Safe by construction: it refuses (changes nothing, exit 1) when the new directory already exists beside a real old one or
-when ``settings.json`` is not valid JSON; ``--dry-run`` prints the plan and changes nothing; ``settings.json`` is written
-through a temp file and ``os.replace`` after a ``settings.json.pre-desk-move`` copy is kept (an existing copy is the older
-original and is kept as it is); a failed settings write puts the directory back. A second run, with the move done and no
-hook left to rewrite, says there is nothing to do. The shadow directory (:data:`levain.desk.legacy.LEGACY_SHADOW_NAME`) is
+when a settings file is not valid JSON; ``--dry-run`` prints the plan and changes nothing; each settings file is written
+through a temp file and ``os.replace`` after a ``<name>.pre-desk-move`` copy is kept (an existing copy is the older
+original and is kept as it is); a failure puts back the directory, the link, the stored directory and every settings
+file (a record entry already added stays: it only doors one more directory). A second run, with the move done, the link
+in place and no hook left to rewrite, says there is nothing to do. The shadow directory (:data:`levain.desk.legacy.LEGACY_SHADOW_NAME`) is
 left alone.
 """
 from __future__ import annotations
@@ -27,7 +30,8 @@ from typing import Any
 from levain.desk.legacy import DESK_HOME_NAME, LEGACY_HOME_NAME, desk_home
 
 SETTINGS_ENV = "LEVAIN_CLAUDE_SETTINGS"
-BACKUP_NAME = "settings.json.pre-desk-move"
+BACKUP_SUFFIX = ".pre-desk-move"                  # every rewritten settings file keeps <its name><suffix> beside it
+BACKUP_NAME = "settings.json" + BACKUP_SUFFIX     # the user's settings.json's backup
 
 
 def levain_home(override: Path | str | None = None) -> Path:
@@ -62,10 +66,11 @@ def _bases(base: Path) -> list[str]:
 
 
 def _old_path_re(base: Path) -> "re.Pattern[str]":
-    """The old desk home path in a command: after the start, a quote, whitespace or ``=``; before a ``/``, the end, a quote,
-    whitespace or a shell separator (so the shadow directory and a longer name that merely starts with the old one are never matched)."""
+    """The old desk home path in a command: after the start, a quote, whitespace, ``=`` or ``:`` (a ``PATH`` entry); before
+    a ``/``, the end, a quote, whitespace or a shell separator (so the shadow directory and a longer name that merely starts
+    with the old one are never matched)."""
     alts = "|".join(re.escape(f"{b}/{LEGACY_HOME_NAME}") for b in _bases(base))
-    return re.compile(rf"""(?:(?<=^)|(?<=[\s"'=]))(?P<head>{alts})(?=/|$|[\s"'`;&|)])""")
+    return re.compile(rf"""(?:(?<=^)|(?<=[\s"'=:]))(?P<head>{alts})(?=/|$|[\s"'`;&|):])""")
 
 
 def rewrite_text(text: str, base: Path) -> str:
@@ -188,9 +193,16 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
     if not neither:
         for name in ("settings.json", "settings.local.json"):
             candidates.append((src_dir / ".claude" / name, new / ".claude" / name))
+    seen: set[str] = set()
     for read_from, write_to in candidates:
         if not read_from.exists():
             continue
+        # one physical file once: --settings may name (or link to) the desk home's own settings.json, and a second
+        # entry for it would see the first one's write as a concurrent change and roll the whole move back
+        key = os.path.realpath(read_from)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             raw = read_from.read_bytes()
             data = json.loads(raw.decode("utf-8"))
@@ -201,12 +213,26 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
             files.append({"read": read_from, "path": write_to, "raw": raw, "new": new_data, "n": len(ch)})
             changed.extend(ch)
 
-    stored = _read_stored_setting((Path(store_dir) if store_dir is not None else _default_store_dir()) / _db_name())
-    new_cwd = None
-    if stored is not None and stored[0] != "none" and stored[2]:
-        fixed = rewrite_text(stored[2], base)
-        if fixed != stored[2]:
-            new_cwd = fixed
+    # the desk's stored directory, in every store a desk can live in (the consent directory and the board, as
+    # levain.desk.cli._desk_dir finds them), each only where it still names the old path
+    cwd_moves: list[tuple[Path, str, str]] = []
+    for d in _store_dirs(base, store_dir):
+        stored = _read_stored_setting(d / _db_name())
+        if stored is not None and stored[0] not in ("none", "codex") and stored[2]:
+            fixed = rewrite_text(stored[2], base)
+            if fixed != stored[2]:
+                cwd_moves.append((d, stored[2], fixed))
+
+    # the door's workspace record (levain.desk.door): it names real paths, so an entry under the old home is looked up
+    # through the compat link today and misses once the link is gone. The new path is ADDED beside it through the door's
+    # own writer (locked, atomic, add-only); the old entry stays, as the record never takes one out
+    from levain.desk import door
+
+    try:
+        recorded = door.recorded()
+    except door.RecordUnreadable as exc:
+        return refuse(door.unreadable(exc))
+    record_adds = sorted({rewrite_text(n, base) for n in recorded} - set(recorded))
 
     if neither:
         if changed:
@@ -214,8 +240,11 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
                           "set the desk up again, or edit the hook by hand")
         say(f"no desk home to move: neither {old} nor {new} exists")
         return 0
-    do_link = new_exists and not old_is_link and not old.exists() and bool(files or new_cwd)
-    if not do_rename and not do_link and not files and new_cwd is None:
+    # an interrupted move converges: with desk/ in place and the old path absent (or a link to nothing), the link is
+    # made whether or not anything else still needs changing
+    broken_link = os.readlink(old) if old_is_link and not old.exists() else None
+    do_link = new_exists and not old.exists()
+    if not do_rename and not do_link and not files and not cwd_moves and not record_adds:
         say(f"nothing to do: the desk home is {desk_home(base)}, and no hook command in {spath} or the desk home's own "
             f"settings names the old path")
         return 0
@@ -224,50 +253,67 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
     if do_rename:
         say(f"{verb} rename {old} -> {new}, and keep {old} as a link to {DESK_HOME_NAME}")
     if do_link:
-        say(f"{verb} make {old} a link to {DESK_HOME_NAME}")
+        say(f"{verb} make {old} a link to {DESK_HOME_NAME}"
+            + (f" (replacing a link to {broken_link}, which leads nowhere)" if broken_link is not None else ""))
     for f in files:
         say(f"{verb} rewrite the hook commands in {f['path']}")
     for before, after in changed:
         say(f"{verb} rewrite a hook command:\n    {before}\n -> {after}")
     if not changed:
         say(f"no hook command in {spath} or the desk home's settings names the old path")
-    if new_cwd is not None:
-        say(f"{verb} move the desk's stored directory {stored[2]} -> {new_cwd}")  # type: ignore[index]
+    for d, was, to in cwd_moves:
+        say(f"{verb} move the desk's stored directory {was} -> {to} (in {d})")
+    for to in record_adds:
+        say(f"{verb} add {to} to the desk's workspace record beside the old path")
     if dry_run:
         say("dry run: nothing was changed")
         return 0
 
     renamed = linked = False
     written: list[tuple[Path, bytes]] = []
+    moved: list[tuple[Path, str, str]] = []           # (store dir, prior cwd, new cwd) actually appended
     try:
         if do_rename:
             os.rename(old, new)
             renamed = True
         if do_rename or do_link:
-            os.symlink(DESK_HOME_NAME, old)       # before any settings write: a failure here rolls back the rename alone
+            if broken_link is not None:
+                os.unlink(old)
+            os.symlink(DESK_HOME_NAME, old)       # before any other write: a failure here rolls back the rename alone
             linked = True
+        for to in record_adds:                    # add-only: a doored extra directory is the closed side, never undone
+            door.record_moved(to)
+        # the stored directory before the settings files, so a refusal here changes no file (L3 r2 C)
+        from levain.desk.store import CoordStore
+
+        for d, was, to in cwd_moves:
+            if CoordStore(d).coord_move_cwd(was, to) is not None:
+                moved.append((d, was, to))
         for f in files:
             path = f["path"]
-            backup = path.with_name(f"{path.name}.pre-desk-move")
+            backup = path.with_name(path.name + BACKUP_SUFFIX)
             if not backup.exists():
                 shutil.copy2(path, backup)
             _write_atomic(path, f["new"], f["raw"])
             written.append((path, f["raw"]))
-        if new_cwd is not None:
-            from levain.desk.store import CoordStore
-
-            agent, model, _cwd, scope = stored  # type: ignore[misc]
-            CoordStore(store_dir if store_dir is not None else _default_store_dir()).coord_set_agent(
-                agent, model=model, cwd=new_cwd, user_scope=scope)
     except Exception as exc:
         for path, raw in reversed(written):
             try:
                 _replace_bytes(path, raw)
             except OSError:
                 pass
+        for d, was, to in reversed(moved):
+            # back to the prior directory, only while the row this run appended is still the latest (a concurrent
+            # change since then is kept); its agent, model and user-layer choice were copied from the prior row
+            try:
+                CoordStore(d).coord_move_cwd(to, was)
+            except Exception:
+                pass
         if linked and old.is_symlink():
             try:
                 os.unlink(old)
+                if broken_link is not None:
+                    os.symlink(broken_link, old)
             except OSError:
                 pass
         if renamed and not old.exists() and not old.is_symlink():
@@ -276,16 +322,21 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
             except OSError:
                 pass
         print(f"levain desk move-home: failed ({type(exc).__name__}: {str(exc)[:160]}); everything this run changed was "
-              f"put back (the directory, the link and every settings file)", file=err)
+              f"put back (the directory, the link, the stored directory and every settings file)", file=err)
         return 1
     if do_rename:
         say(f"renamed {old} -> {new} (the old path is a link to it for one release)")
     elif do_link:
         say(f"made {old} a link to {new} for one release")
+    for to in record_adds:
+        say(f"added {to} to the desk's workspace record")
     for f in files:
-        say(f"rewrote {f['n']} hook command(s) in {f['path']} (the earlier file is kept as {f['path'].name}.pre-desk-move)")
-    if new_cwd is not None:
-        say(f"moved the desk's stored directory to {new_cwd}")
+        say(f"rewrote {f['n']} hook command(s) in {f['path']} (the earlier file is kept as {f['path'].name}{BACKUP_SUFFIX})")
+    for d, was, to in moved:
+        say(f"moved the desk's stored directory to {to} (in {d})")
+    for d, was, to in cwd_moves:
+        if (d, was, to) not in moved:
+            say(f"left the desk's stored directory in {d} as it is: it changed while this ran")
     # the doctor row again
     from levain.doctor import _check_desk_home, _emit
 
@@ -298,10 +349,19 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
     return 0
 
 
-def _default_store_dir() -> Path:
-    from levain.dispatch.jobs import default_dispatch_dir
+def _store_dirs(base: Path, store_dir: Path | str | None) -> list[Path]:
+    """``store_dir`` alone when given; else the directories a desk store can be in under ``base``: the consent
+    directory and the board (:func:`levain.desk.work_attach.live_consent_dir` / ``board_store_dir``), each once."""
+    if store_dir is not None:
+        return [Path(store_dir)]
+    from levain.desk.work_attach import board_store_dir, live_consent_dir
 
-    return default_dispatch_dir()
+    env = dict(os.environ, LEVAIN_HOME=str(base))
+    out: list[Path] = []
+    for d in (live_consent_dir(env), board_store_dir(env)):
+        if all(os.path.realpath(d) != os.path.realpath(o) for o in out):
+            out.append(d)
+    return out
 
 
 def _db_name() -> str:

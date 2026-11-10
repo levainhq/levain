@@ -1222,6 +1222,14 @@ class CoordStore:
         with self._write() as (conn, now):
             return lease.set_user_scope(conn, now, user_scope, cwd=cwd)
 
+    def coord_move_cwd(self, frm: str, to: str) -> Any:
+        """Only the standing setting's directory, ``frm`` -> ``to``, read and replaced in one transaction
+        (:func:`levain.desk.lease.move_cwd`); the setting it replaced, or None when it changed nothing."""
+        from levain.desk import lease
+
+        with self._write() as (conn, now):
+            return lease.move_cwd(conn, now, frm, to)
+
     def coord_setting(self) -> Any:
         from levain.desk import lease
 
