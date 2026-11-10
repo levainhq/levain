@@ -24,6 +24,7 @@ from levain.broker import keys as K
 from levain.broker import ledger as L
 from levain.broker import upstream as U
 from levain.broker.creds import CredStore
+from levain.broker import norm
 from levain.broker.norm import digest_of_token
 from levain.contracts import canon
 from levain.slot import control as C
@@ -469,6 +470,71 @@ def test_refused_window_closes_on_its_timer_and_interactive_refusals_write_none(
     got = [(o["reason"], o["count"], o["meta"]["lineage"]["refused"]) for o in lines if o["kind"] == "refused"]
     assert got == [("route-not-allowed", 3, "route-not-allowed"), ("route-not-allowed", 1, "route-not-allowed"),
                    ("body-unbounded", 1, "body-unbounded:document")], got
+
+
+def test_a_body_unlisted_refusal_writes_one_refused_line_through_the_window(monkeypatch):
+    # row 150: a dispatch request's unlisted field is one `refused` line, reason `body-unlisted` (the ledger's reason
+    # grammar is the name without its suffix), the row keeping the whole name; a field name outside the wire grammar
+    # is the fixed suffix `field`
+    async def go(d):
+        async with KeysWorld(d, monkeypatch, refused_row_s=0.5) as w:
+            w.k._note_refusal("s1", RUN, "body-unlisted:zz_new_vendor_field")
+            w.k._note_refusal("s1", RUN, "body-unlisted:field")
+            w.k.flush_refusals()
+            await until(lambda: len([o for o in w.lines() if o["kind"] == "refused"]) == 2, 5)
+            return w.lines()
+
+    lines = run_go(go)
+    got = sorted((o["reason"], o["meta"]["lineage"]["refused"]) for o in lines if o["kind"] == "refused")
+    assert got == [("body-unlisted", "body-unlisted:field"), ("body-unlisted", "body-unlisted:zz_new_vendor_field")], got
+
+
+def test_new_sessions_past_twice_the_window_cap_are_dropped_not_opened(monkeypatch):
+    # r2 codex F1: the fold key is per session, so each new session opened a folded window of its own past the cap.
+    # Past twice the cap, a refusal that needs a new window is counted as dropped; the open windows stay bounded.
+    async def go(d):
+        async with KeysWorld(d, monkeypatch, refused_row_s=3600.0, refusal_windows_max=2) as w:
+            for i in range(12):
+                w.k._note_refusal("s%d" % i, RUN, "body-unlisted:zz_%d" % i)
+            n, dropped = len(w.k._refusals), w.k.lineage_dropped
+            w.k.flush_refusals()
+            return n, dropped
+
+    n, dropped = run_go(go)
+    assert n == 4 and dropped == 8, (n, dropped)
+
+
+def test_client_chosen_refusal_names_past_the_window_cap_fold_into_the_bare_reason(monkeypatch):
+    # r1 F1 (bound): a ticketed client naming a new unknown field per request opened a window, and a timer, per name.
+    # Past `refusal_windows_max` a new name folds into the window keyed by its reason without the `:<what>`, so the
+    # windows stay at the cap plus the folded ones, and every refusal is still counted. An empty and a digit-led
+    # client name reach keys as the fixed suffix (`codec._wire_what`).
+    names = ["body-unlisted:zz_field_%d" % i for i in range(20)]
+    names += ["body-unlisted:" + codec._wire_what(n, "field") for n in ("", "9lead")]
+    names += ["body-unbounded:document", "body-unbounded:zz_other"]
+
+    async def go(d):
+        async with KeysWorld(d, monkeypatch, refused_row_s=3600.0, refusal_windows_max=4) as w:
+            for n in names:
+                w.k._note_refusal("s1", RUN, n)
+            w.k._note_refusal("s1", RUN, names[0])
+            keys = sorted(w.k._refusals)
+            timers = sum(1 for v in w.k._refusals.values() if v[3] is not None)
+            w.k.flush_refusals()
+            await until(lambda: len([o for o in w.lines() if o["kind"] == "refused"]) == len(keys), 5)
+            return keys, timers, w.lines()
+
+    keys, timers, lines = run_go(go)
+    assert keys == sorted([("s1", n) for n in names[:4]] + [("s1", "body-unlisted"), ("s1", "body-unbounded")]), keys
+    assert timers == len(keys)
+    refused = [o for o in lines if o["kind"] == "refused"]
+    assert sum(o["count"] for o in refused) == len(names) + 1
+    by_row = {o["meta"]["lineage"]["refused"]: o for o in refused}
+    assert by_row["body-unlisted"]["count"] == 18 and by_row["body-unbounded"]["count"] == 2
+    assert by_row[names[0]]["count"] == 2
+    for o in refused:
+        assert norm.is_name(o["meta"]["lineage"]["refused"]) and o["reason"] in ("body-unlisted", "body-unbounded")
+        assert _wire_ok(o["meta"]["lineage"]) in ((None,) if _h621_landed() else ("model_answered",))
 
 
 def test_lineage_outbox_full_refuses_ticketed(monkeypatch):

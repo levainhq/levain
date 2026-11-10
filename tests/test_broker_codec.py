@@ -224,9 +224,11 @@ def test_forwarded_body_is_the_compact_serialization():
 
 def test_refused_names_on_the_wire():
     from levain.broker import gwwire
-    for name in ("body-json", "body-unbounded:document", "body-unbounded:websocket"):
+    for name in ("body-json", "body-unbounded:document", "body-unbounded:websocket", "body-unlisted:field",
+                 "body-unlisted:compaction"):
         assert gwwire.decode(b"F", gwwire.encode(b"F", {"refused": name})[5:]) == {"refused": name}
-    for bad in ("body-unbounded:", "body-unbounded:Bad", "body-json:x", "model-not-allowed:x"):
+    for bad in ("body-unbounded:", "body-unbounded:Bad", "body-json:x", "model-not-allowed:x", "body-unlisted:",
+                "body-unlisted:X-Foo"):
         assert not norm.is_name(bad)
 
 
@@ -929,7 +931,7 @@ def test_codec_responses_call_names_read_the_requests_tools():
 ])
 def test_3ca2_an_openrouter_server_tool_is_unbounded(cname, body):
     tool = json.loads(body)["tools"][0]["type"]
-    assert _go(cname, body, EA if cname.startswith("anthropic") else EO, dispatch=True) == f"body-unbounded:{tool}"
+    assert _go(cname, body, EA if cname.startswith("anthropic") else EO, dispatch=True) == "body-unbounded:" + tool.replace(":", "_")   # a colon is not in the wire grammar
     got = _go(cname, body, EA if cname.startswith("anthropic") else EO)
     assert got[1] == (tool,)
 

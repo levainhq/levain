@@ -1,0 +1,161 @@
+openapi: 3.1.0
+info:
+  title: trimmed snapshot of openai-openapi openapi.yaml, 2026-11-09
+components:
+  schemas:
+    ChatBase:
+      type: object
+      properties:
+        audio:
+          type: string
+        function_call:
+          type: string
+        logit_bias:
+          type: string
+        max_completion_tokens:
+          type: string
+        messages:
+          type: string
+        modalities:
+          type: string
+        moderation:
+          type: string
+        parallel_tool_calls:
+          type: string
+        presence_penalty:
+          type: string
+        prompt_cache_options:
+          type: string
+        reasoning_effort:
+          type: string
+        safety_identifier:
+          type: string
+        service_tier:
+          type: string
+        store:
+          type: string
+        stream_options:
+          type: string
+        tool_choice:
+          type: string
+        top_logprobs:
+          type: string
+        user:
+          type: string
+        web_search_options:
+          type: string
+    CreateChatCompletionRequest:
+      allOf:
+      - $ref: '#/components/schemas/ChatBase'
+      - type: object
+        properties:
+          frequency_penalty:
+            type: string
+          functions:
+            type: string
+          logprobs:
+            type: string
+          max_tokens:
+            type: string
+          metadata:
+            type: string
+          model:
+            type: string
+          n:
+            type: string
+          prediction:
+            type: string
+          prompt_cache_key:
+            type: string
+          prompt_cache_retention:
+            type: string
+          response_format:
+            type: string
+          seed:
+            type: string
+          stop:
+            type: string
+          stream:
+            type: string
+          temperature:
+            type: string
+          tools:
+            type: string
+          top_p:
+            type: string
+          verbosity:
+            type: string
+    RespBase:
+      type: object
+      properties:
+        access_programs:
+          type: string
+        context_management:
+          type: string
+        image:
+          type: string
+        input:
+          type: string
+        max_output_tokens:
+          type: string
+        metadata:
+          type: string
+        moderation:
+          type: string
+        previous_response_id:
+          type: string
+        prompt_cache_key:
+          type: string
+        prompt_cache_retention:
+          type: string
+        safety_identifier:
+          type: string
+        store:
+          type: string
+        stream_options:
+          type: string
+        text:
+          type: string
+        tools:
+          type: string
+        top_p:
+          type: string
+        user:
+          type: string
+    CreateResponse:
+      allOf:
+      - $ref: '#/components/schemas/RespBase'
+      - type: object
+        properties:
+          background:
+            type: string
+          conversation:
+            type: string
+          include:
+            type: string
+          instructions:
+            type: string
+          max_tool_calls:
+            type: string
+          model:
+            type: string
+          parallel_tool_calls:
+            type: string
+          prompt:
+            type: string
+          prompt_cache_options:
+            type: string
+          reasoning:
+            type: string
+          service_tier:
+            type: string
+          stream:
+            type: string
+          temperature:
+            type: string
+          tool_choice:
+            type: string
+          top_logprobs:
+            type: string
+          truncation:
+            type: string

@@ -1,0 +1,370 @@
+{
+ "openapi": "3.1.0",
+ "info": {
+  "title": "trimmed snapshot of openrouter.ai/openapi.json, 2026-11-09"
+ },
+ "components": {
+  "schemas": {
+   "ChatRequest": {
+    "type": "object",
+    "properties": {
+     "cache_control": {
+      "type": "string"
+     },
+     "debug": {
+      "type": "string"
+     },
+     "deferred_tools": {
+      "type": "string"
+     },
+     "frequency_penalty": {
+      "type": "string"
+     },
+     "image_config": {
+      "type": "string"
+     },
+     "logit_bias": {
+      "type": "string"
+     },
+     "logprobs": {
+      "type": "string"
+     },
+     "max_completion_tokens": {
+      "type": "string"
+     },
+     "max_tokens": {
+      "type": "string"
+     },
+     "messages": {
+      "type": "string"
+     },
+     "metadata": {
+      "type": "string"
+     },
+     "min_p": {
+      "type": "string"
+     },
+     "modalities": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "models": {
+      "type": "string"
+     },
+     "parallel_tool_calls": {
+      "type": "string"
+     },
+     "plugins": {
+      "type": "string"
+     },
+     "prediction": {
+      "type": "string"
+     },
+     "presence_penalty": {
+      "type": "string"
+     },
+     "prompt_cache_key": {
+      "type": "string"
+     },
+     "prompt_cache_options": {
+      "type": "string"
+     },
+     "provider": {
+      "type": "string"
+     },
+     "reasoning": {
+      "type": "string"
+     },
+     "reasoning_effort": {
+      "type": "string"
+     },
+     "repetition_penalty": {
+      "type": "string"
+     },
+     "response_format": {
+      "type": "string"
+     },
+     "route": {
+      "type": "string"
+     },
+     "seed": {
+      "type": "string"
+     },
+     "service_tier": {
+      "type": "string"
+     },
+     "session_id": {
+      "type": "string"
+     },
+     "stop": {
+      "type": "string"
+     },
+     "stop_server_tools_when": {
+      "type": "string"
+     },
+     "stream": {
+      "type": "string"
+     },
+     "stream_options": {
+      "type": "string"
+     },
+     "temperature": {
+      "type": "string"
+     },
+     "tool_choice": {
+      "type": "string"
+     },
+     "tools": {
+      "type": "string"
+     },
+     "top_a": {
+      "type": "string"
+     },
+     "top_k": {
+      "type": "string"
+     },
+     "top_logprobs": {
+      "type": "string"
+     },
+     "top_p": {
+      "type": "string"
+     },
+     "trace": {
+      "type": "string"
+     },
+     "user": {
+      "type": "string"
+     }
+    }
+   },
+   "ResponsesRequest": {
+    "type": "object",
+    "properties": {
+     "access_programs": {
+      "type": "string"
+     },
+     "background": {
+      "type": "string"
+     },
+     "cache_control": {
+      "type": "string"
+     },
+     "debug": {
+      "type": "string"
+     },
+     "deferred_tools": {
+      "type": "string"
+     },
+     "frequency_penalty": {
+      "type": "string"
+     },
+     "image_config": {
+      "type": "string"
+     },
+     "include": {
+      "type": "string"
+     },
+     "input": {
+      "type": "string"
+     },
+     "instructions": {
+      "type": "string"
+     },
+     "max_output_tokens": {
+      "type": "string"
+     },
+     "max_tool_calls": {
+      "type": "string"
+     },
+     "metadata": {
+      "type": "string"
+     },
+     "modalities": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "models": {
+      "type": "string"
+     },
+     "parallel_tool_calls": {
+      "type": "string"
+     },
+     "plugins": {
+      "type": "string"
+     },
+     "presence_penalty": {
+      "type": "string"
+     },
+     "previous_response_id": {
+      "type": "string"
+     },
+     "prompt": {
+      "type": "string"
+     },
+     "prompt_cache_key": {
+      "type": "string"
+     },
+     "prompt_cache_options": {
+      "type": "string"
+     },
+     "provider": {
+      "type": "string"
+     },
+     "reasoning": {
+      "type": "string"
+     },
+     "route": {
+      "type": "string"
+     },
+     "safety_identifier": {
+      "type": "string"
+     },
+     "service_tier": {
+      "type": "string"
+     },
+     "session_id": {
+      "type": "string"
+     },
+     "stop": {
+      "type": "string"
+     },
+     "stop_server_tools_when": {
+      "type": "string"
+     },
+     "store": {
+      "type": "string"
+     },
+     "stream": {
+      "type": "string"
+     },
+     "temperature": {
+      "type": "string"
+     },
+     "text": {
+      "type": "string"
+     },
+     "tool_choice": {
+      "type": "string"
+     },
+     "tools": {
+      "type": "string"
+     },
+     "top_k": {
+      "type": "string"
+     },
+     "top_logprobs": {
+      "type": "string"
+     },
+     "top_p": {
+      "type": "string"
+     },
+     "trace": {
+      "type": "string"
+     },
+     "truncation": {
+      "type": "string"
+     },
+     "user": {
+      "type": "string"
+     }
+    }
+   },
+   "MessagesRequest": {
+    "type": "object",
+    "properties": {
+     "cache_control": {
+      "type": "string"
+     },
+     "context_management": {
+      "type": "string"
+     },
+     "deferred_tools": {
+      "type": "string"
+     },
+     "fallbacks": {
+      "type": "string"
+     },
+     "max_tokens": {
+      "type": "string"
+     },
+     "messages": {
+      "type": "string"
+     },
+     "metadata": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string"
+     },
+     "models": {
+      "type": "string"
+     },
+     "output_config": {
+      "type": "string"
+     },
+     "plugins": {
+      "type": "string"
+     },
+     "provider": {
+      "type": "string"
+     },
+     "route": {
+      "type": "string"
+     },
+     "safeguards": {
+      "type": "string"
+     },
+     "service_tier": {
+      "type": "string"
+     },
+     "session_id": {
+      "type": "string"
+     },
+     "speed": {
+      "type": "string"
+     },
+     "stop_sequences": {
+      "type": "string"
+     },
+     "stop_server_tools_when": {
+      "type": "string"
+     },
+     "stream": {
+      "type": "string"
+     },
+     "system": {
+      "type": "string"
+     },
+     "temperature": {
+      "type": "string"
+     },
+     "thinking": {
+      "type": "string"
+     },
+     "tool_choice": {
+      "type": "string"
+     },
+     "tools": {
+      "type": "string"
+     },
+     "top_k": {
+      "type": "string"
+     },
+     "top_p": {
+      "type": "string"
+     },
+     "trace": {
+      "type": "string"
+     },
+     "user": {
+      "type": "string"
+     }
+    }
+   }
+  }
+ }
+}
