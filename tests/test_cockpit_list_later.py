@@ -62,7 +62,10 @@ def test_a_later_row_carries_the_verbs_any_row_carries(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     p = _panel(rig)
     later = {r["id"]: r for r in p["rows"]}[f"spore:{rig.ids['held']}"]
-    due = next(r for r in p["rows"] if r["group"] != "later" and r["id"].startswith("spore:"))
+    # a seed's row, not the first spore row: spore_retarget applies only to a seed or agenda (verbs.py), so a note row
+    # lawfully lacks it and the comparison is between rows of the same kind, differing only in being due or later
+    due = next(r for r in p["rows"] if r["group"] != "later" and r["id"].startswith("spore:")
+               and r["facets"].get("disposition") in ("seed", "agenda"))
     assert {a["verb"] for a in later["actions"]} == {a["verb"] for a in due["actions"]}
     assert {"spore_surface_at", "spore_update"} <= {a["verb"] for a in later["actions"]}
 
