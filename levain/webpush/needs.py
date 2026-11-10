@@ -17,6 +17,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +34,10 @@ COUNT_FILE = "needs-count.json"    # in the queue dir: the count the serving pro
 COUNT_FRESH_S = 120                # a recorded count older than this is not believed
 LOCK_FILE = "needs-count.lock"     # held exclusively (flock) for the life of the ONE process that records the count; it dies with it
 CONTEST_FILE = "needs-count.contested"   # a second serve on the same queue dir stamps this instead of recording: the count reads unknown
-_OWNED: "dict[str, int]" = {}      # queue dir -> the lock's open fd, in the owning process
+_OWNED: "dict[str, tuple[int, int]]" = {}      # resolved queue dir -> (the lock's open fd, the owning pid)
+_OWN_LOCK = threading.Lock()       # a threaded server: the check-then-take in _own must not race itself into a self-contest
+# KNOWN EDGE, left as intent: when the real host is down, the next process to take the lock with an empty store records its
+# own count. Closing that needs a serve-role signal from web_server.py (routed to the head), not anything decidable here.
 KEEP_EVERY_S = 45.0                # how often a serving process re-reads its store and re-records, well inside the freshness
 
 
@@ -41,7 +45,13 @@ def open_needs_count(queue_dir: "Path | str", question_source: Any = None) -> "i
     """Pending consent requests plus open questions in ``queue_dir`` as of now. Each store is read on its own so a failure in one
     does not stop the other, but either failing makes the answer None (unknown), never a lower-bound number.
     Creates nothing (a queue with no ``questions.db`` has no open questions). ``question_source``: the store the server serves
-    its questions from (anything with ``open_questions()``, as a host's store has); none reads the native store in ``queue_dir``."""
+    its questions from (anything with ``open_questions()``, as a host's store has); none reads the native store in ``queue_dir``.
+    This is the LOCAL count (the page renders it); a push badge goes through :func:`badge_value`, which refuses a non-owner."""
+    return _count(queue_dir, question_source)[0]
+
+
+def _count(queue_dir: "Path | str", question_source: Any) -> "tuple[int | None, bool]":
+    """(the local count, whether this process may speak for the queue dir's record)."""
     total, failed = 0, False
     try:
         from levain.consent.listing import read_listing
@@ -72,29 +82,73 @@ def open_needs_count(queue_dir: "Path | str", question_source: Any = None) -> "i
         log.exception("needs count: the question store failed unexpectedly; the count is unknown")
         failed = True
     # a half that could not be read makes the count unknown, never a smaller number: a partial count could lower a real badge (6 -> 2)
-    result = None if failed else total
-    if question_source is not None:       # only the process holding the host's store knows its count: it says so for the others
-        _record(queue_dir, result)
-    return result
+    return (None if failed else total), _record_if_host(queue_dir, question_source, None if failed else total)
+
+
+def _record_if_host(queue_dir: "Path | str", question_source: Any, result: "int | None") -> bool:
+    """Record when the caller holds the host's store; True when this process may speak for the record (owner, or nothing to
+    record)."""
+    if question_source is None:
+        return True
+    return _record(queue_dir, result)
+
+
+def _key(queue_dir: "Path | str") -> str:
+    try:
+        return str(Path(queue_dir).resolve())
+    except (OSError, RuntimeError):
+        return str(Path(queue_dir))
+
+
+def _close_inherited() -> None:
+    """After a fork the child holds the parent's lock fd and ownership claim; it is not the owner. Close the fd (the parent's
+    flock lives on in its own open file description) and forget the claim."""
+    global _OWN_LOCK
+    _OWN_LOCK = threading.Lock()      # the forking thread may have been mid-_own: never inherit a held lock
+    for fd, _pid in list(_OWNED.values()):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _OWNED.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_close_inherited)
+
+
+def _reset_owned_for_tests() -> None:
+    """Test-only: close every held lock fd and forget ownership."""
+    with _OWN_LOCK:
+        for fd, _pid in list(_OWNED.values()):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        _OWNED.clear()
 
 
 def _own(queue_dir: "Path | str") -> bool:
     """True when this process is the one owner of the queue dir's record: it holds (or just took) the exclusive lock. A second
     process cannot take it, so a preview serve with its own empty store never records its count over the real host's."""
-    key = str(Path(queue_dir))
-    if key in _OWNED:
+    key = _key(queue_dir)
+    with _OWN_LOCK:
+        held = _OWNED.get(key)
+        if held is not None:
+            if held[1] == os.getpid():
+                return True
+            _OWNED.pop(key, None)        # a claim from another pid (a fork the hook missed) is not ours
+        try:
+            fd = os.open(Path(key) / LOCK_FILE, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        _OWNED[key] = (fd, os.getpid())
         return True
-    try:
-        fd = os.open(Path(queue_dir) / LOCK_FILE, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(fd)
-        return False
-    _OWNED[key] = fd
-    return True
 
 
 def _write_json(path: Path, doc: dict) -> None:
@@ -116,7 +170,7 @@ def _write_json(path: Path, doc: dict) -> None:
                 pass
 
 
-def _record(queue_dir: "Path | str", n: "int | None") -> None:
+def _record(queue_dir: "Path | str", n: "int | None") -> bool:
     """Keep the host's count where a process without its store can read it (:func:`recorded_count`). Only the process that owns
     the queue dir's lock writes it; any other stamps the contest marker, so the count reads unknown until the contest ages out
     (a wrong 0 from a second serve with an empty store cleared the real app badge). An unknown count is kept too (``n`` null):
@@ -124,11 +178,12 @@ def _record(queue_dir: "Path | str", n: "int | None") -> None:
     different number. Never raises: a count that cannot be kept leaves the other side to its own read."""
     base = Path(queue_dir)
     if not base.is_dir():
-        return
+        return True       # nothing to record or contest
     if _own(base):
         _write_json(base / COUNT_FILE, {"n": n, "at": time.time(), "host": True})
-    else:
-        _write_json(base / CONTEST_FILE, {"at": time.time(), "pid": os.getpid()})
+        return True
+    _write_json(base / CONTEST_FILE, {"at": time.time(), "pid": os.getpid()})
+    return False
 
 
 def _contested(queue_dir: "Path | str", now: "float | None") -> bool:
@@ -159,9 +214,9 @@ def _read_record(queue_dir: "Path | str", now: "float | None") -> "tuple[bool, i
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return False, None
+        return (True, None) if contested else (False, None)     # a fresh contest with no count file is still a host's, unknown
     except OSError:
-        return (True, None) if path.exists() else (False, None)
+        return (True, None) if path.exists() or contested else (False, None)
     except ValueError:       # bytes that are not text (UnicodeError is one): the file is there, so a host install, count unknown
         return True, None
     try:
@@ -203,5 +258,7 @@ def resolved_badge(queue_dir: "Path | str") -> "int | None":
 
 def badge_value(queue_dir: "Path | str", question_source: Any = None) -> "int | None":
     """The int a push carries as ``badge``: the open count clipped to :data:`BADGE_MAX`, None when unknown."""
-    n = open_needs_count(queue_dir, question_source)
+    n, owner = _count(queue_dir, question_source)
+    if not owner:        # a non-owner's local count (a preview's empty store) is not the host's: it must not clear the real badge
+        return None
     return None if n is None else min(max(n, 0), BADGE_MAX)
