@@ -72,3 +72,69 @@ def test_cockpit_visible_strings_say_laptop_for_presence():
                 if PHYSICAL.search(lit):
                     bad.append(f"{path.name}:{n}: {lit[:100]}")
     assert not bad, bad
+
+
+def test_the_wake_prompt_names_the_launches_own_role():
+    from types import SimpleNamespace
+    from pathlib import Path
+    from levain.desk import launch as ln
+    from levain.desk.legacy import ROLE_DESK
+
+    worker = ln._prompt(SimpleNamespace(launch_id="ln-w", role="worker"), Path("/b/brief.md"))
+    desk = ln._prompt(SimpleNamespace(launch_id="ln-d", role=ROLE_DESK), Path("/b/brief.md"))
+    assert "worker session" in worker and "desk session" not in worker
+    assert "desk session" in desk and "worker" not in desk
+
+
+def test_cause_word_maps_only_the_stored_cause_and_accepts_none():
+    from levain.desk.legacy import CAUSE_CODEX_REMOVED, cause_word
+
+    assert cause_word(None) == ""
+    assert cause_word(CAUSE_CODEX_REMOVED) == "codex desk removed"
+    for text in ("see /h/.levain/coordinator/x", "session levain-coordinator-ab12", "coordinator-draft: x",
+                 "the coordinator crashed"):
+        assert cause_word(text) == text
+
+
+def test_init_accepts_the_desk_role_word_and_names_the_bad_flag(capsys, tmp_path):
+    from levain import install as inst
+    from levain.desk.legacy import ROLE_DESK
+
+    assert inst.run_init(tmp_path / "a", "claude-code", force=False, role="bogus") == 1
+    out = capsys.readouterr().out
+    assert "--role 'bogus'" in out and "is not an install role" in out and "desk" in out
+    assert inst.run_init(tmp_path / "b", "gemini", force=False, role="desk") == 1
+    out = capsys.readouterr().out
+    assert "--role desk" in out and "adapter only" in out
+    assert inst.by_word("desk") == ROLE_DESK     # the normalisation run_init applies
+
+
+def test_a_refused_thread_transition_lists_the_desk_under_its_new_name(tmp_path):
+    import pytest as _pt
+    from levain.desk.legacy import ROLE_DESK
+    from levain.desk.store import CoordError, CoordStore, Part
+
+    st = CoordStore(tmp_path / "q")
+    tok = st.coord_take()
+    d, _ = st.accept_drop("w", surface="cli")
+    t = st.split(d.drop_id, [Part(kind="work", title="w")], by=ROLE_DESK, token=tok)[0]
+    with _pt.raises(CoordError) as e:
+        st.set_state(t.thread_id, "done", by="operator")          # only the desk takes open -> done
+    assert "(only desk)" in str(e.value) and ROLE_DESK not in str(e.value)
+
+
+def test_the_by_option_lists_desk_and_the_alias_shim_survives_a_runpy_run():
+    import subprocess, sys, argparse
+    from levain.desk.legacy import by_choices, by_word
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--by", type=by_word, choices=by_choices("operator", "coordinator"))
+    assert p.parse_args(["--by", "desk"]).by == "coordinator"
+    assert "desk" in p.format_help() and "coordinator" not in p.format_help()
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    code = (f"import sys; sys.path.insert(0, {str(root)!r}); import runpy, importlib.util, levain.coordinator.legacy as m; "
+            "runpy.run_module('levain.coordinator.legacy', run_name='x'); "
+            "print(m is importlib.import_module('levain.desk.legacy'))")
+    r = subprocess.run([sys.executable, "-c", code], cwd="/", capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.strip() == "True", r.stderr[-400:]

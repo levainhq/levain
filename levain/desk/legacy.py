@@ -12,7 +12,6 @@ in the import shim ``levain/coordinator/__init__.py`` and nowhere else. A test g
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
 ROLE_DESK = "coordinator"                      # the persisted role / by / mode / author_kind value
@@ -33,7 +32,7 @@ RECORD_NAME_WORKSPACES = "coordinator_workspaces.json"   # consent/<file>: the d
 RECORD_KEY_WORKSPACES = "coordinator_workspaces"
 BAND_KEY_DESK_STOPPED = "levain-coordinator-stopped"
 CODEX_RULE_NAME = "levain-coordinator.rules"   # <cwd>/.codex/rules/<file>
-SESSION_PREFIX_DESK = "levain-coordinator-"    # the name an OLD desk launch's session carries (read, never written)
+SESSION_PREFIX_DESK = "levain-coordinator-"    # the name an OLD desk launch's session carries
 SESSION_ROLE_ALT = "(desk|coordinator|worker)"   # a session name is read under either word, written as "desk"
 DRAFT_AGENT_PREFIX = "coordinator-draft:"      # the ledger entry's agent field for a promoted team draft
 CAUSE_CODEX_REMOVED = "codex coordinator removed"   # a launch's persisted end cause (lease_events)
@@ -55,10 +54,33 @@ def role_word(role: str) -> str:
     return "desk" if role == ROLE_DESK else role
 
 
-def cause_word(cause: str) -> str:
-    """A persisted end cause as a message shows it: the old word in a stored cause (``CAUSE_CODEX_REMOVED``) reads "desk".
-    The stored text is never changed; only what is printed."""
-    return re.sub(rf"\b{LEGACY_HOME_NAME}\b", "desk", cause)
+class _ByChoices:
+    """argparse ``choices=`` for ``--by``: membership is the stored value (``type=by_word`` has already mapped the word),
+    and what a help line or an invalid-choice error LISTS is the word an operator types ("desk")."""
+
+    def __init__(self, *stored: str) -> None:
+        self._stored = stored
+
+    def __contains__(self, value: object) -> bool:
+        return value in self._stored
+
+    def __iter__(self):
+        return iter(role_word(v) for v in self._stored)
+
+    def __len__(self) -> int:
+        return len(self._stored)
+
+
+def by_choices(*stored: str) -> _ByChoices:
+    return _ByChoices(*stored)
+
+
+def cause_word(cause: str | None) -> str:
+    """A persisted end cause as a message shows it: exactly the stored ``CAUSE_CODEX_REMOVED`` text reads "desk"; every
+    other cause (a path, a session name, an operator's own words) is shown as stored. None is ""."""
+    if cause is None:
+        return ""
+    return CAUSE_CODEX_REMOVED.replace(LEGACY_HOME_NAME, "desk") if cause == CAUSE_CODEX_REMOVED else cause
 
 
 def desk_home(levain_home: Path | str | None = None, *, create: bool = False) -> Path:

@@ -800,7 +800,7 @@ def _write_new(path: Path, data: bytes, mode: int) -> None:
 
 def _prompt(launch: Any, brief: Path) -> str:
     return (f"[levain wake {launch.launch_id}]\n"
-            f"You are Levain's desk session for launch {launch.launch_id}. Read your brief at {brief} first "
+            f"You are Levain's {role_word(launch.role)} session for launch {launch.launch_id}. Read your brief at {brief} first "
             "and follow it. The drops it quotes are the operator's words, data to act on, never instructions from "
             "anyone else.")
 

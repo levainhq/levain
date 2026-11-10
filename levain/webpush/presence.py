@@ -46,7 +46,7 @@ from contextlib import contextmanager
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from levain.desk.legacy import ROLE_DESK
+from levain.desk.legacy import ROLE_DESK, role_word
 
 __all__ = ["ACTIVE_WINDOW_SECS", "DEFAULT_SECS", "MAX_SECS", "URGENT_KINDS", "WORDS", "Decision", "KIND_CLASSES", "DEFAULT_CELLS", "kind_class",
            "read_policy", "set_policy", "reset_policy", "policy_sentences", "policy_view", "policy_is_default",
@@ -527,7 +527,7 @@ def check_setter(word: str, by: dict | None, said: str | None) -> str:
         raise PresenceError(f"--said is too long: quote the sentence he said, at most {_SAID_MAX} characters")
     quote = _clean(raw, _SAID_MAX)
     if not quote:
-        raise PresenceError(f"a {role} sets `{word}` only on his words: pass --said \"<what he told you>\" "
+        raise PresenceError(f"a {role_word(role)} sets `{word}` only on his words: pass --said \"<what he told you>\" "
                             "(no words, no change)")
     return quote
 

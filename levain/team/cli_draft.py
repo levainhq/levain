@@ -21,7 +21,7 @@ from levain.desk.door import door_ok, not_door
 from . import entry as E
 from .ledger_api import open_ledger
 from .transport import TeamError
-from levain.desk.legacy import ROLE_DESK, by_word
+from levain.desk.legacy import ROLE_DESK, by_choices, by_word
 
 
 def _store(args):
@@ -214,7 +214,7 @@ def register(sub, add) -> None:
         q.set_defaults(func=_run, team_command="draft")
 
     def actor(q) -> None:
-        q.add_argument("--by", type=by_word, choices=("operator", ROLE_DESK), default=ROLE_DESK)
+        q.add_argument("--by", type=by_word, choices=by_choices("operator", ROLE_DESK), default=ROLE_DESK)
         q.add_argument("--token", type=int, default=None, help="With --by desk: the lease token.")
 
     a = dsub.add_parser("add", help="Draft an entry (nothing is signed).")

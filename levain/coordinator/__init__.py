@@ -19,8 +19,9 @@ _NEW = "levain.desk."
 
 
 class _AliasLoader(importlib.abc.Loader):
-    def __init__(self, real: str) -> None:
+    def __init__(self, real: str, real_spec) -> None:
         self._real = real
+        self._real_spec = real_spec      # the real module's OWN spec, taken before an alias import overwrites its __spec__
 
     def create_module(self, spec):
         return importlib.import_module(self._real)
@@ -29,8 +30,7 @@ class _AliasLoader(importlib.abc.Loader):
         return None
 
     def _real_loader(self):
-        spec = importlib.util.find_spec(self._real)
-        return spec.loader
+        return self._real_spec.loader
 
     def get_code(self, fullname):                 # runpy (``python -m levain.coordinator.x``) runs the real module's code
         return self._real_loader().get_code(self._real)
@@ -39,7 +39,7 @@ class _AliasLoader(importlib.abc.Loader):
         return self._real_loader().get_source(self._real)
 
     def is_package(self, fullname):
-        return importlib.util.find_spec(self._real).submodule_search_locations is not None
+        return self._real_spec.submodule_search_locations is not None
 
 
 class _AliasFinder(importlib.abc.MetaPathFinder):
@@ -48,11 +48,14 @@ class _AliasFinder(importlib.abc.MetaPathFinder):
             return None
         real = _NEW + fullname[len(_OLD):]
         try:
-            if importlib.util.find_spec(real) is None:
-                return None
+            real_spec = importlib.util.find_spec(real)
         except (ImportError, ValueError):
             return None
-        return importlib.util.spec_from_loader(fullname, _AliasLoader(real))
+        if real_spec is None:
+            return None
+        if isinstance(real_spec.loader, _AliasLoader):      # the real module was already imported through its alias
+            real_spec = real_spec.loader._real_spec
+        return importlib.util.spec_from_loader(fullname, _AliasLoader(real, real_spec))
 
 
 if not any(isinstance(f, _AliasFinder) for f in sys.meta_path):
