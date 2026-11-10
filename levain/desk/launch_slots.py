@@ -9,7 +9,7 @@ launch is over, since the launch and the slot live in two files and no one trans
 The slot is taken and released in the agent store's own transactions. What this module adds is the wiring:
 
 * **The store.** The agent store of an install is ``<levain home>/autonomic``, the desk's is
-  ``<levain home>/desk``. Only the install's own desk directory is slotted (:func:`agent_dir`): a
+  the desk home (``<levain home>/desk`` for a new install, an old install's old-named directory). Only the install's own desk directory is slotted (:func:`agent_dir`): a
   desk store anywhere else (a test's, a copy's) has no agent store beside it and launches unslotted, so it never
   writes the operator's real ``autonomic.db``.
 * **The fallback.** The agent schema is checked per process per store (:func:`slot_state`, a read that writes and

@@ -30,6 +30,7 @@ from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.desk import chat
 from levain.desk import envelope as env
 from levain.desk.chat_approvals import APPROVAL_EVENT_KINDS
+from levain.desk.legacy import role_word
 from levain.desk.store import CoordError
 
 THREADS_LIST_PATH = "/cockpit/threads.json"
@@ -164,7 +165,7 @@ def authority_header(conn: sqlite3.Connection, thread_id: str, now: datetime | N
         for kind, _value, by, at in rows:
             if kind in ("kill", "thread_done"):
                 why = "killed" if kind == "kill" else "its thread is done"
-                return _authority("ended", f"No standing authority: envelope {short} ended ({why}, by {by}, "
+                return _authority("ended", f"No standing authority: envelope {short} ended ({why}, by {role_word(by)}, "
                                   f"{_clock_words(at)}).", envelope_id)
         stop = parse_stamp(stop_at)
         for kind, value, _by, _at in rows:

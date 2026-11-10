@@ -29,6 +29,7 @@ from levain.cockpit.consent import utc_stamp
 from levain.cockpit.engine import ReadContext
 from levain.cockpit.results import Read, Result, RowIn
 from levain.desk.work_delta import local_clock
+from levain.desk.legacy import role_word
 
 __all__ = ["COORD_STATUS_ID", "COORD_VERBS", "HOLD_VERB", "START_VERB", "STOP_VERB", "register_status_verbs",
            "status_reader", "status_verbs"]
@@ -138,7 +139,7 @@ def _setting_body(chosen: dict[str, Any] | None) -> str:
 
 
 def _launch_body(ln: dict[str, Any], now: str | None = None) -> str:
-    body = f"{ln['harness']} {ln['role']} · {ln['cause']} · {ln['at']}"
+    body = f"{ln['harness']} {role_word(ln['role'])} · {ln['cause']} · {ln['at']}"
     if ln["state"] == "pending" and ln.get("until"):
         if now is not None and now >= ln["until"]:
             body += f" · pending, past its until; not yet recorded as expired (until {ln['until']})"

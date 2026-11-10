@@ -20,7 +20,7 @@ import pytest
 from levain.desk import launch as cl
 from levain.desk import lease
 from levain.desk.store import CoordStore
-from levain.desk.legacy import CAUSE_CODEX_REMOVED, CODEX_RULE_NAME, JSON_ROLE_DESK, LEGACY_HOME_NAME, RECORD_NAME_WORKSPACES, ROLE_DESK, SESSION_PREFIX_DESK, SQL_ROLE_DESK
+from levain.desk.legacy import CAUSE_CODEX_REMOVED, CODEX_RULE_HEADER, CODEX_RULE_JUSTIFICATION, CODEX_RULE_NAME, JSON_ROLE_DESK, DESK_HOME_NAME, RECORD_NAME_WORKSPACES, ROLE_DESK, SESSION_PREFIX_DESK, SQL_ROLE_DESK
 
 HID = "2be178ea"
 SID = "2be178ea-7208-46be-8ef7-5b0e49a354e0"
@@ -507,7 +507,7 @@ def test_coord_agent_sets_up_the_install(tmp_home, qdir, fake, capsys):
     from levain import doctor
 
     out = _main(qdir, capsys, "coord", "agent", "claude", "--model", "haiku")
-    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
     assert (target / "CLAUDE.md").is_file()
     (hook,) = [r for r in doctor._check_claude_code(target) if r.name == cl.HOOK_ROW]
     assert hook.detail.startswith("wired to this install"), hook
@@ -536,7 +536,7 @@ def test_the_desk_install_pre_approves_its_own_three_verbs_and_a_reused_install_
         return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
 
     _main(qdir, capsys, "coord", "agent", "claude")
-    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
     bash = [r for r in allow(target) if r.startswith("Bash(")]
     lv = inst.desk_levain(sys.executable)
     assert lv == f"{shlex.quote(sys.executable)} -P -m levain"
@@ -1144,7 +1144,7 @@ def test_a_model_name_the_harness_takes_is_kept(qdir, workdir):
 
 def test_coord_agent_refuses_a_bad_model_before_any_install(tmp_home, qdir, capsys):
     out = _main(qdir, capsys, "coord", "agent", "claude", "--model=--bad", rc=1)
-    assert "never starting with -" in out.err and not (tmp_home / ".levain" / LEGACY_HOME_NAME).exists()
+    assert "never starting with -" in out.err and not (tmp_home / ".levain" / DESK_HOME_NAME).exists()
 
 
 # --- C3b fix 2 (L3 r1) -----------------------------------------------------------------------------------------
@@ -1155,7 +1155,7 @@ def test_hooks_turned_off_by_a_settings_file_refuse_the_launch(tmp_home, qdir, f
 
     # a user-level file reaches the desk only with --user-scope on (the default no longer loads it)
     _main(qdir, capsys, "coord", "agent", "claude", *(["--user-scope", "on"] if scope == "user" else []))
-    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
     assert cl.hook_live(target, user_scope=True)[0]
     f = tmp_home / ".claude" / "settings.json" if scope == "user" else target / ".claude" / "settings.local.json"
     f.parent.mkdir(parents=True, exist_ok=True)
@@ -1331,7 +1331,7 @@ def test_the_brief_spelling_is_looked_up_as_exact_rules_never_parsed(tmp_path):
         return inst.installed_desk_levain(d, here)
 
     assert rules(list(inst.desk_allow(here))) == inst.desk_levain(here)
-    assert rules(["Bash(levain desk:*)", "Bash(levain drops:*)", "Bash(levain thread:*)"]) == "levain"
+    assert rules(["Bash(levain coord:*)", "Bash(levain drops:*)", "Bash(levain thread:*)"]) == "levain"
     assert rules(list(inst.desk_allow(other))) is None          # another interpreter's install: asks
     assert rules(list(inst.desk_allow(here)), role=None) is None  # a reused install: the operator's rules
     for partial in (["Bash(make coord:*)", "Bash(make drops:*)", "Bash(make thread:*)"],
@@ -1398,7 +1398,7 @@ def test_every_levain_verb_the_brief_names_passes_the_desks_door(store, fake, li
             got = path_of(words if alts is None else [*words[:alts[0]], alt])
             assert len(got) >= 2, command
             paths.add(got)
-    assert {("coord", "questions"), ("coord", "answer"), ("coord", "escalate"), ("coord", "claim")} <= paths
+    assert {("desk", "questions"), ("desk", "answer"), ("desk", "escalate"), ("desk", "claim")} <= paths   # the parser names its verb "desk"; the brief spells the wire alias `coord`
     refused = sorted(p for p in paths if p not in door.door_paths(build_parser()))
     assert not refused, f"the brief names verbs the desk's door refuses: {refused}"
 
@@ -1497,7 +1497,7 @@ def test_coord_status_says_the_user_layer(tmp_home, qdir, fake, capsys):
 
 def test_a_user_level_disable_all_hooks_is_not_consulted_without_user_scope(tmp_home, qdir, fake, capsys):
     _main(qdir, capsys, "coord", "agent", "claude")
-    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
     user = tmp_home / ".claude"
     user.mkdir(exist_ok=True)
     (user / "settings.json").write_text('{"disableAllHooks": true}')
@@ -1609,7 +1609,7 @@ def test_a_user_level_disable_all_hooks_through_a_symlinked_home_is_not_consulte
     link = tmp_path / "home-link"
     link.symlink_to(tmp_home)
     monkeypatch.setenv("HOME", str(link))
-    target = (link / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (link / ".levain" / DESK_HOME_NAME).resolve()
     (link / ".claude").mkdir(exist_ok=True)
     (link / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
     live, detail = cl.hook_live(target, user_scope=False)
@@ -1621,7 +1621,7 @@ def test_a_missing_hooks_off_helper_fails_loud_not_as_a_refusal(tmp_path, tmp_ho
     from levain import doctor
 
     _main(qdir, capsys, "coord", "agent", "claude")
-    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
     (tmp_home / ".claude").mkdir(exist_ok=True)
     (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
     assert cl.hook_live(target, user_scope=False)[0]                    # user-only file: not consulted
@@ -1641,7 +1641,7 @@ def test_the_desk_install_allows_a_bare_read_and_no_other_file_tool(tmp_home, qd
         return json.loads((d / ".claude" / "settings.json").read_text())["permissions"]["allow"]
 
     _main(qdir, capsys, "coord", "agent", "claude")
-    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
     rules = allow(target)
     assert rules.count("Read") == 1
     assert not [r for r in rules if r.split("(")[0] in ("Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch", "Bash")
@@ -1666,7 +1666,7 @@ def test_an_older_desk_install_is_brought_to_the_read_rule_once(tmp_home, qdir, 
     with monkeypatch.context() as m:
         m.setattr(inst, "DESK_READ_ALLOW", ())                          # the install as an earlier release made it
         _main(qdir, capsys, "coord", "agent", "claude")
-    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
     assert "Read" not in allow(target)
     assert inst.desk_read_rule_pending(target) is True
     status = _main(qdir, capsys, "coord", "status").out
@@ -1693,7 +1693,7 @@ def _older_desk(qdir, capsys, monkeypatch, tmp_home):
     with monkeypatch.context() as m:
         m.setattr(inst, "DESK_READ_ALLOW", ())
         _main(qdir, capsys, "coord", "agent", "claude")
-    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
     assert "Read" not in (target / ".claude" / "settings.json").read_text()
     return target
 
@@ -1891,7 +1891,7 @@ def test_an_oserror_resolving_a_hooks_off_file_refuses_and_never_crashes(tmp_pat
     from levain import doctor
 
     _main(qdir, capsys, "coord", "agent", "claude")
-    target = (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    target = (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
     (tmp_home / ".claude").mkdir(exist_ok=True)
     (tmp_home / ".claude" / "settings.json").write_text('{"disableAllHooks": true}')
 
@@ -2521,7 +2521,7 @@ def test_escalate_with_a_hostile_text_file_stores_it_as_typed(band, monkeypatch,
 # --- Q17-COLD: a desk whose NEEDS YOU band cannot render is not started ------------------------------------
 def _breakable_install(tmp_home, qdir, capsys):
     _main(qdir, capsys, "coord", "agent", "claude")
-    return (tmp_home / ".levain" / LEGACY_HOME_NAME).resolve()
+    return (tmp_home / ".levain" / DESK_HOME_NAME).resolve()
 
 
 def _launch_pending(qdir):
@@ -2782,13 +2782,13 @@ def test_two_spawn_claimed_pending_codex_launches_both_retire_on_one_pass(qdir, 
 # render it checks)
 _OLD_PY = "/opt/py 3/bin/python3"
 _OLD_RULE = (
-    "# Written by Levain for its desk (np-6843ca07 (a)). Codex runs exactly these commands without asking:\n"
-    "# '/opt/py 3/bin/python3' -P -m levain desk | drops | thread ...\n"
+    f"{CODEX_RULE_HEADER}"
+    "# '/opt/py 3/bin/python3' -P -m levain coord | drops | thread ...\n"
     "# Every other command is decided as before. Codex loads this file only while you trust this directory.\n"
     "prefix_rule(\n"
     '    pattern = ["/opt/py 3/bin/python3", "-P", "-m", "levain", ["coord", "drops", "thread"]],\n'
     '    decision = "allow",\n'
-    '    justification = "Levain desk verbs: they grant nothing (a signed envelope still does)",\n'
+    f'    justification = "{CODEX_RULE_JUSTIFICATION}",\n'
     '    match = [["/opt/py 3/bin/python3", "-P", "-m", "levain", "coord", "status"], ["/opt/py 3/bin/python3", "-P", '
     '"-m", "levain", "drops", "status"], ["/opt/py 3/bin/python3", "-P", "-m", "levain", "thread", "status"]],\n'
     '    not_match = [["/opt/py 3/bin/python3", "-P", "-m", "levain", "team", "record"], ["/opt/py 3/bin/python3", '

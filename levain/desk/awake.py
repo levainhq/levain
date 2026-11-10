@@ -31,7 +31,7 @@ something else is never ours to stop.
 A host without ``fcntl`` file locks gets no assertion: :func:`sync` says so and :func:`describe` names it.
 """
 from __future__ import annotations
-from levain.desk.legacy import ROLE_DESK
+from levain.desk.legacy import ROLE_DESK, role_word
 
 try:
     import fcntl
@@ -271,7 +271,7 @@ def _reconcile(store: Any, directory: Path, agent_dir: Path | str | None) -> dic
     if not ids and not occ:
         if unknown:                # nothing known to hold for, and not known to be free: leave the holder as it is
             return {"held": bool(_ours(cur) and cur.get("until", 0) > time.time()), "unknown": unknown,
-                    "why": f"could not sync: the {' and '.join(unknown)} source could not be read ({'; '.join(errors)[:300]}), "
+                    "why": f"could not sync: the {' and '.join(role_word(u) for u in unknown)} source could not be read ({'; '.join(errors)[:300]}), "
                            "so the holder is left as it was"}
         if cur:
             _stop(cur)
@@ -281,7 +281,7 @@ def _reconcile(store: Any, directory: Path, agent_dir: Path | str | None) -> dic
     why = {ROLE_DESK: "a work thread is working", "agent": "an agent occurrence is live"}.get(
         source, "a work thread is working and an agent occurrence is live")
     if unknown:
-        why += f" (the {' and '.join(unknown)} source could not be read)"
+        why += f" (the {' and '.join(role_word(u) for u in unknown)} source could not be read)"
     extra = {"unknown": unknown} if unknown else {}
     argv = holder_command()
     if argv is None:
@@ -383,7 +383,7 @@ def _describe(directory: Path | str, working_count: int | None, occurrence_count
         who = (f"{n} work thread(s) working" if n else "") + (" and " if n and occ_text else "")
         if occ_text:
             who += f"agent occurrence(s) live: {occ_text}"
-        by = f"pid {pid}, held by {cur.get('source') or ROLE_DESK}"
+        by = f"pid {pid}, held by {role_word(str(cur.get('source') or ROLE_DESK))}"
         tail = f"it releases when none is left, and by itself within {HOLD_SECONDS // 60} minutes if Levain stops"
         if not who:                  # alive on a record whose work has since gone (a crash before the closing sync)
             return True, (f"idle sleep is held off ({by}): holder alive with no current work seen (no live work seen "

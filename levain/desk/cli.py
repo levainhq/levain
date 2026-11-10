@@ -41,7 +41,7 @@ from levain.desk.envelopes import EnvelopeStore, seen_past
 from levain.desk.store import (KINDS, STATES, WORDS_MAX, CoordError, Drop, Part, Source, Thread, check_source,
                                       check_words, words_sha256)
 from levain.dispatch.jobs import JobStoreError
-from levain.desk.legacy import CLI_ALIAS_LONG, CLI_ALIAS_SHORT, ROLE_DESK, by_word
+from levain.desk.legacy import CLI_ALIAS_LONG, CLI_ALIAS_SHORT, ROLE_DESK, by_word, role_word
 
 # what a store call can refuse with: the grammar's refusal, an untrustworthy store, a database it cannot use
 _REFUSED = (CoordError, JobStoreError, sqlite3.Error, OSError)
@@ -1693,7 +1693,7 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                              f"workspace waits on a prompt); run: levain update --path {shlex.quote(str(cwd))}")
     for ln in st["launches"]:
         spawn = f"  {ln['spawn']}" if ln.get("spawn") else ""
-        lines.append(f"  {ln['launch_id']}  {ln['role']}{spawn}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
+        lines.append(f"  {ln['launch_id']}  {role_word(ln['role'])}{spawn}  {ln['harness']}  {ln['state']} ({ln['cause']})  "
                      f"session {ln['session_key']}  asked {ln['at']}")
     _emit(out, args.json, st, "\n".join(lines))
     return 0
@@ -2449,7 +2449,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ca = c_sub.add_parser(
         "agent", help="Choose the desk a drop launches: claude (in its own workspace), or none.",
         description="claude: drops with no desk start a Claude Code session in DIR (default "
-                    "<levain home>/desk), which is made a Levain install for Claude Code first when it is not "
+                    "the desk home: <levain home>/desk for a new install, the existing old-named directory for an old one), which is made a Levain install for Claude Code first when it is not "
                     "one. The workspace is put in Levain's desk record, which the desk's "
                     "door reads. codex: removed (a Codex desk is no longer launched). none: drops only queue for you. Levain never edits a harness's trust list: run the "
                     "printed line once and trust the directory.")
@@ -2459,7 +2459,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                          "CLAUDE.md (default off: it loads the project and local layers only). Alone "
                          "(no agent) it changes only this and keeps the standing agent, model and directory.")
     ca.add_argument("--cwd", type=Path, default=None, metavar="DIR",
-                    help="The directory the desk runs in (default: <levain home>/desk): "
+                    help="The directory the desk runs in (default: the desk home, <levain home>/desk for a new install, the existing old-named directory for an old one): "
                          "a missing or empty one, which Levain sets up, or a desk "
                          "workspace Levain set up before. Your own Levain install is refused.")
     ca.add_argument("--model", default=None, help="The model the session runs (default: the harness's own).")

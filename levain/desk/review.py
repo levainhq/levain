@@ -8,7 +8,7 @@ What it holds, in the desk's own store (``dispatch.db``):
 - **Three review modes** (RULED, *"also on review modes"*): ``manual`` (you), ``fresh`` (a fresh session you asked,
   recorded as you) and ``desk`` (the actor reviewing itself). An item marked ``authority_relevant`` can never be
   cleared in ``desk`` mode, and the SQL refuses it, so no caller has to remember. The desk's mode also
-  clears only an item the desk filed (``by = 'desk'``, whatever the feed: its own KNOWs, and a doubt or
+  clears only an item the desk filed (its ``by`` is the stored role value, ``ROLE_DESK`` in legacy.py, whatever the feed: its own KNOWs, and a doubt or
   contradiction it files): a seat that died, a drop not split or an agent card (the dream's contradictions come on one)
   is the operator's to clear. That is a LABEL guard on the desk's mode, not a capability: a clear recorded in
   another mode writes ``by = 'operator'`` and this does not stop who picks it (S1's, a known edge). A fourth mode,
@@ -45,7 +45,7 @@ from levain.autonomic.durable_sqlite import read_transaction
 from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.contracts.canon import canonical
 from levain.desk.store import ACTORS, CoordError, CoordStore, _append_only, _in, next_gseq
-from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK
+from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK, role_word
 
 __all__ = ["FEEDS", "FEED_LABELS", "FOREIGN_CLEAR_TRIGGER", "MODES", "NEAR_STOP", "NO_SPLIT_AFTER", "REVIEW_SCHEMA", "SIGNED", "SIGN_REQUEST_TTL",
            "SIGN_TIER", "CoordNotFound", "Item", "SignedClearRefused", "body_fields", "item_text", "items_need_rebuild", "clear_item", "clear_message",
@@ -143,15 +143,16 @@ REVIEW_SCHEMA: tuple[str, ...] = (
     f"BEGIN SELECT RAISE(ABORT, 'an authority-relevant item is not cleared in {ROLE_DESK} mode'); END",
 )
 
-# B1(b), the D3 ruling: the desk's mode clears only an item the desk filed (``by = 'desk'``,
+# B1(b), the D3 ruling: the desk's mode clears only an item the desk filed (``by`` is the stored role value,
+# ``ROLE_DESK`` in legacy.py, the old word kept byte for byte so an old store's trigger text does not change;
 # whatever its feed: its own KNOWs, and a doubt or contradiction it files); a seat that died, a drop not split, an
 # agent card are the operator's to clear. The COALESCE is load-bearing: an item that is not there makes the subquery
-# NULL, and ``NULL != 'desk'`` is NULL, which never fires a WHEN, so without it a clear of a missing item would
+# NULL, and ``NULL != <the stored role value>`` is NULL, which never fires a WHEN, so without it a clear of a missing item would
 # pass this trigger. A LABEL guard, not a capability: a process that records its clear as ``fresh`` or ``manual``
 # writes ``by = 'operator'`` and is not held here (a named known edge, S1's). Final once shipped: CREATE TRIGGER IF NOT
 # EXISTS never replaces one. The WHEN is disjoint from review_events_mode and review_events_authority on purpose:
 # SQLite promises no order among BEFORE triggers (seen firing newest first), so a clear both refuse would surface this
-# message over theirs. ``mode = 'desk'`` leaves a mode/by mismatch to review_events_mode and the authority
+# message over theirs. ``mode = <the stored role value>`` leaves a mode/by mismatch to review_events_mode and the authority
 # subquery leaves an authority-relevant item to review_events_authority; both still abort, so no insert they refuse
 # passes here. Not in :data:`REVIEW_SCHEMA`, for the reason :func:`ensure_one_signature` gives: an object added after
 # a store exists is made by the writer's ensure path (:func:`ensure_foreign_clear`), and a store that lacks it is still
@@ -995,7 +996,7 @@ def feed_dead_seats(store: CoordStore, *, errors: list[str] | None = None) -> li
             return file_item(store, "seat", {
                 "launch_id": ln.launch_id, "harness": _clip(ln.harness), "role": _clip(ln.role), "state": ln.state,
                 "cause": _clip(ln.cause), "at": ln.at, "threads": list(ln.threads),
-                "text": _clip(f"{ln.role} launch {ln.launch_id} ({ln.harness}) {ln.state}: {ln.cause}")},
+                "text": _clip(f"{role_word(ln.role)} launch {ln.launch_id} ({ln.harness}) {ln.state}: {ln.cause}")},
                 dedupe_key=f"seat:{ln.launch_id}", thread_id=one,
                 authority_relevant=ln.pinned_envelope_id is not None)[0]
         except Exception:

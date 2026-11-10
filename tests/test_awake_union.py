@@ -94,7 +94,7 @@ def test_the_last_work_thread_ending_leaves_a_live_occurrence_holding_the_host(w
     assert first["source"] == "agent" and first["occurrences"] == ["occ-1"] and awake._ours(first)
     drop, thread = run(COORD, q, "work", tmp_path).split()                  # process 2: a work thread works
     both = rec(q)
-    assert both["source"] == "desk+agent" and both["threads"] == [thread] and awake._ours(both)
+    assert both["source"] == f"{ROLE_DESK}+agent" and both["threads"] == [thread] and awake._ours(both)
     run(COORD, q, "end", thread, drop)                                      # its last work thread ends, sync runs
     kept = rec(q)
     assert awake._ours(kept), "the holder was released under a live occurrence"
@@ -286,7 +286,7 @@ def test_an_unreadable_desk_store_still_takes_the_agents_hold_and_both_unknown_h
     q, adir = world
     (q / "dispatch.db").write_bytes(b"not a database" * 100)
     out = run(AGENT, q, adir, "occ-1", "start", NOW)
-    assert "'held': True" in out and "'unknown': ['desk']" in out, out
+    assert "'held': True" in out and f"'unknown': ['{ROLE_DESK}']" in out, out
     held = rec(q)
     assert awake._ours(held) and held["source"] == "agent" and held["unknown"] == [ROLE_DESK]
     run(AGENT, q, adir, "occ-1", "end", NOW)                                 # the occurrence ends: desk still unknown

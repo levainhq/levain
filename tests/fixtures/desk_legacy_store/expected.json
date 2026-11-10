@@ -40,6 +40,6 @@
       "{store}"
     ],
     "exit": 0,
-    "stdout": "lease: nobody holds the desk role\nnext drop: wake (no desk holds the lease; the next drop asks for one)\nuser layer: off (project settings only)\n  ln-7d3841eef53fad7b17b49d7b3b826a24  coordinator  claude  expired (pending past until)  session s-0535a798ec2868f4  asked <TS>\n"
+    "stdout": "lease: nobody holds the desk role\nnext drop: wake (no desk holds the lease; the next drop asks for one)\nuser layer: off (project settings only)\n  ln-7d3841eef53fad7b17b49d7b3b826a24  desk  claude  expired (pending past until)  session s-0535a798ec2868f4  asked <TS>\n"
   }
 }

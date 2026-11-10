@@ -412,7 +412,7 @@ class JournalAhead(CoordError):
     @property
     def tag(self) -> str:
         """Its entry in a list's ``unreadable``."""
-        return f"{STORE_SOURCE}:{self.item_id} (journal v{self.journal_ver}, state v{self.state_ver})"
+        return f"{UNREADABLE_DESK}:{self.item_id} (journal v{self.journal_ver}, state v{self.state_ver})"
 
 
 def _lifecycle_present(conn: sqlite3.Connection) -> bool:

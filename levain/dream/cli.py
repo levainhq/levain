@@ -121,7 +121,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     help="The cockpit root the authority log is replayed from (default: the home's, "
                          "<levain home>/cockpit).")
     en.add_argument("--coord-dir", type=Path, default=None,
-                    help="The desk queue directory (default: <levain home>/desk).")
+                    help="The desk queue directory (default: the desk home, <levain home>/desk for a new install, the existing old-named directory for an old one).")
     en.add_argument("--shadow-flow-root", type=Path, default=None,
                     help="SHADOW install (the D1-3 recipe): flow's state/dream directory this install reads its input "
                          "from. --store-dir is then the SCRATCH directory re-seeded each night (never ~/.anneal-memory); "

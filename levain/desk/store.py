@@ -54,7 +54,7 @@ from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.contracts.canon import canonical, canonical_bytes
 from levain.dispatch.jobs import JobStore
-from levain.desk.legacy import KIND_DESK_REPLY, ROLE_DESK, SQL_KIND_DESK_REPLY, SQL_ROLE_DESK
+from levain.desk.legacy import KIND_DESK_REPLY, ROLE_DESK, SQL_KIND_DESK_REPLY, SQL_ROLE_DESK, role_word
 
 __all__ = [
     "ACTORS", "KINDS", "REPLY_KINDS", "SCHEMA", "SOURCE_HOW", "STATES", "SURFACES", "CoordError", "CoordStore",
@@ -1104,7 +1104,7 @@ class CoordStore:
             if allowed is None:
                 raise CoordError(f"a thread cannot go from {t.state} to {state}")
             if by not in allowed:
-                raise CoordError(f"{by} cannot take a thread from {t.state} to {state} "
+                raise CoordError(f"{role_word(by)} cannot take a thread from {t.state} to {state} "
                                 f"(only {', '.join(sorted(allowed - {'service'}))})")
             if state == "open" and not t.members:
                 raise CoordError(f"thread {thread_id} holds no drops; it cannot be reopened")

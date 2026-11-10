@@ -98,7 +98,7 @@ from levain import pathid
 from levain.autonomic.durable_sqlite import read_transaction, write_transaction
 from levain.desk.review import _REF_STORE
 from levain.desk.store import CoordError, CoordStore, _append_only, next_gseq
-from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK
+from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK, role_word
 
 __all__ = ["FIRST_READER_SCHEMA", "UNREAD_AFTER", "Reading", "answer", "claim_held", "claim_knows", "escalate",
            "hold_ping", "is_desk_session", "read_band", "verdict"]
@@ -192,7 +192,7 @@ def _verdict(store: Any, conn: sqlite3.Connection, now: str, q: Any, authority: 
     if ln.state != "active":
         return no(f"launch {ln.launch_id} is {ln.state}, not active", **ids)
     if ln.role != "worker" or len(ln.threads) != 1:
-        return no(f"launch {ln.launch_id} holds no single thread (role {ln.role}, {len(ln.threads)} threads)", **ids)
+        return no(f"launch {ln.launch_id} holds no single thread (role {role_word(ln.role)}, {len(ln.threads)} threads)", **ids)
     ids["thread_id"] = ln.threads[0]
     if ln.pinned_envelope_id is None:
         return no(f"launch {ln.launch_id} was started with no envelope", **ids)

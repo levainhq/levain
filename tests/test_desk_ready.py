@@ -15,7 +15,6 @@ import pytest
 from levain.desk import ready, review
 from levain.desk.lease import LeaseRefused
 from levain.desk.store import CoordError, CoordStore
-from levain.desk.legacy import ROLE_DESK
 
 REPO = Path(__file__).resolve().parents[1]
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "ready_schema" / "ready_v1.json"
@@ -229,7 +228,7 @@ def test_list_with_no_store_is_empty_and_unreadable_store_is_named(tmp_path):
     d.mkdir(mode=0o700)
     (d / "dispatch.db").write_bytes(b"not a database at all, sixteen+ bytes")
     out = ready.list(d)
-    assert out["items"] == [] and out["unreadable"] == [ROLE_DESK]
+    assert out["items"] == [] and out["unreadable"] == ["desk"]
 
 
 @pytest.mark.parametrize("why", ["", "   ", None, "two\nlines"])
@@ -541,7 +540,7 @@ def test_one_lifecycle_table_without_the_other_is_unreadable(store, token):
     c.execute("DELETE FROM sqlite_master WHERE tbl_name = 'ready_journal'")
     c.commit()
     c.close()
-    assert ready.list(CoordStore(store.directory))["unreadable"] == [ROLE_DESK]
+    assert ready.list(CoordStore(store.directory))["unreadable"] == ["desk"]
 
 
 @pytest.mark.parametrize("text, named", [
@@ -564,7 +563,7 @@ def test_a_dangling_link_is_unreadable_never_nothing_waiting(tmp_path):
     d.mkdir(mode=0o700)
     (d / "dispatch.db").symlink_to(d / "gone.db")
     out = ready.list(d)
-    assert out["items"] == [] and out["unreadable"] == [ROLE_DESK]
+    assert out["items"] == [] and out["unreadable"] == ["desk"]
     with pytest.raises(CoordError):
         ready.journal(d)
 
@@ -584,7 +583,7 @@ def test_an_untraversable_directory_is_unreadable(tmp_path):
     CoordStore(d).coord_take()
     outer.chmod(0o000)
     try:
-        assert ready.list(d)["unreadable"] == [ROLE_DESK]
+        assert ready.list(d)["unreadable"] == ["desk"]
     finally:
         outer.chmod(0o700)
 
@@ -596,7 +595,7 @@ def test_an_insecure_directory_is_named_unreadable_not_raised(store, token):
         out = ready.list(CoordStore(store.directory))
     finally:
         store.directory.chmod(0o700)
-    assert out["items"] == [] and out["unreadable"] == [ROLE_DESK]
+    assert out["items"] == [] and out["unreadable"] == ["desk"]
 
 
 def _journal_only_v2(store):
@@ -637,7 +636,7 @@ def test_a_state_row_with_a_wrong_shaped_depends_on_is_unreadable(store, token):
     c.commit()
     c.close()
     out = ready.list(CoordStore(store.directory))
-    assert out["items"] == [] and out["unreadable"] == [ROLE_DESK]          # never "independently ready"
+    assert out["items"] == [] and out["unreadable"] == ["desk"]          # never "independently ready"
 
 
 def test_a_projection_dependency_and_a_cycle_are_refused(store, token):

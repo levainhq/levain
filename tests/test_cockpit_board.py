@@ -87,7 +87,7 @@ def test_needs_you_is_the_bands_items_and_nothing_else(filled):
 def test_an_unreadable_store_is_reported_not_empty(qdir):
     (qdir / "dispatch.db").write_bytes(b"not a database at all, sixteen+ bytes")
     out = board.build(qdir, QuestionStore(qdir))
-    assert ROLE_DESK in out["unreadable"] and out["queue"] == "unreadable" and out["note"] != board.NO_QUEUE
+    assert "desk" in out["unreadable"] and out["queue"] == "unreadable" and out["note"] != board.NO_QUEUE
 
 
 def test_no_question_store_is_silent_not_unreadable(filled, tmp_path):
@@ -184,7 +184,7 @@ def test_an_unreadable_journal_is_named_and_the_cards_stay(filled, monkeypatch):
 
     monkeypatch.setattr(ready, "_lifecycle_present", flaky)
     out = board.build(filled, QuestionStore(filled))
-    assert out["queue"] == "ok" and "journal" in out["unreadable"] and ROLE_DESK not in out["unreadable"]
+    assert out["queue"] == "ok" and "journal" in out["unreadable"] and "desk" not in out["unreadable"]
     col, card = _cards(out)["levain:a"]
     assert col == "running" and card["journal"] is None
 
@@ -195,7 +195,7 @@ def test_a_damaged_journal_that_breaks_the_divergence_read_still_keeps_the_cards
 
     monkeypatch.setattr(ready, "_diverged", broken)
     out = board.build(filled, QuestionStore(filled))
-    assert out["queue"] == "ok" and "journal" in out["unreadable"] and ROLE_DESK not in out["unreadable"]
+    assert out["queue"] == "ok" and "journal" in out["unreadable"] and "desk" not in out["unreadable"]
     col, card = _cards(out)["levain:a"]
     assert col == "running" and card["journal"] is None
 
