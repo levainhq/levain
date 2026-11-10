@@ -395,8 +395,10 @@ SPORE_KEY_PREFIX = "spore:"
 SPORE_AUTHORITY_FIELDS = ("text", "domain", "disposition")
 # anneal fills these at write; none sits in a spore effect's ``changes``
 SPORE_STORE_ASSIGNED = ("id", "seen", "created", "origin_key", "notes", "resolution.on", "resolution.at")
-# the fields an update-shaped spore effect may change (anneal's update args, ``add_note`` excluded)
-SPORE_UPDATE_FIELDS = ("type", "tier", "next", "text", "salience", "domain", "pointer", "disposition", "target")
+# the fields an update-shaped spore effect may change (anneal's update args, ``add_note`` excluded); ``target`` and
+# ``attention`` reach an effect only through spore_retarget's builder (the edit verb's builder refuses both)
+SPORE_UPDATE_FIELDS = ("type", "tier", "next", "text", "salience", "domain", "pointer", "disposition", "target",
+                       "attention")
 
 
 def create_origin_key(pending_id: str, idx: int) -> str:
@@ -804,12 +806,25 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
     disposition = str(pre.get("disposition") or "").strip().casefold()
     if disposition not in ("seed", "agenda"):
         raise ValueError("a target steers a seed or an agenda; this spore is neither")
+    stamp = pre.get("germinated")
+    if stamp:
+        # germinate never reads a stamped agenda's target again: a new one would change the record and nothing else
+        ref = stamp.get("ref") if isinstance(stamp, Mapping) else None
+        raise ValueError(f"{pre.get('id')} already woke{f' as {ref}' if ref else ''}: who acts on it is settled there, "
+                         "so its target is not changed here")
     changes: dict[str, Any] = {"target": target, "disposition": "agenda"}
-    if params.get("surface_at") not in (None, ""):
+    if "surface_at" in params:
+        if params["surface_at"] in (None, ""):
+            raise ValueError("an agenda needs a date: a target cannot clear it (leave surface_at out to keep the date)")
         changes["next"] = _norm_date(params["surface_at"])
     elif not valid_next(pre.get("next")):
         raise ValueError("an agenda needs a date: give surface_at with the target")
-    why = check_steering("agenda", target, pre.get("attention"))
+    attention = pre.get("attention")
+    if disposition == "seed" and attention == "talk":
+        # talk is a seed's steering (the talk queue reads seeds only): the seed that becomes an agenda leaves it behind
+        changes["attention"] = None
+        attention = None
+    why = check_steering("agenda", target, attention)
     if why is not None:
         raise ValueError(why)
     return _existing_effect(pre, changes, version_of)

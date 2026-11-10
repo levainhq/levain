@@ -70,6 +70,30 @@ def test_the_effect_refuses_what_it_may_not_write() -> None:
         canonical_effect("spore_retarget", {"target": "desk"}, held, version_of=ver)
     keep = canonical_effect("spore_retarget", {"target": "band"}, {**held, "attention": None}, version_of=ver)
     assert "next" not in keep.changes                                                      # the row keeps its date
+    for empty in ("", None):                                                               # a target never clears a date
+        with pytest.raises(ValueError, match="cannot clear"):
+            canonical_effect("spore_retarget", {"target": "band", "surface_at": empty}, {**held, "attention": None},
+                             version_of=ver)
+
+
+def test_a_talk_seed_given_a_who_leaves_the_talk_queue_whole(tmp_path: Path) -> None:
+    """``attention: talk`` steers a seed into the talk queue, which reads seeds only: the seed that becomes an agenda drops it,
+    so no agenda carries a talk mark nobody reads. Steering itself would let an agenda keep talk on a band target."""
+    from levain.spores import check_steering
+
+    assert check_steering("agenda", "band", "talk") is None
+    pre = {"id": "spore-1", "origin_key": "k", "status": "open", "disposition": "seed", "text": "t", "type": "task",
+           "attention": "talk"}
+    eff = canonical_effect("spore_retarget", {"target": "desk", "surface_at": "2031-02-03"}, pre, version_of=lambda row: "v")
+    assert eff.changes == {"target": "desk", "disposition": "agenda", "next": "2031-02-03", "attention": None}
+    root, src, ids = _install(tmp_path)
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store.update(ids["seed"], attention="talk", today=TODAY)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        st, body = _retarget(base, ids["seed"], {"target": "band", "surface_at": "2031-02-03"})
+    assert st == 200, body
+    got = store.get(ids["seed"])
+    assert (got["disposition"], got["target"], got.get("attention")) == ("agenda", "band", None)
 
 
 def test_a_seed_given_who_and_when_becomes_a_dated_agenda_and_the_agenda_changes_hands(tmp_path: Path) -> None:
@@ -86,6 +110,22 @@ def test_a_seed_given_who_and_when_becomes_a_dated_agenda_and_the_agenda_changes
     seed, drop = store.get(ids["seed"]), store.get(ids["drop"])
     assert (seed["disposition"], seed["target"], seed["next"]) == ("agenda", "band", "2031-02-03T09:30")
     assert (drop["target"], drop["next"]) == ("board:levain", "2031-01-07T09:00")          # who changes, when does not
+
+
+def test_an_agenda_that_already_woke_is_not_retargeted(tmp_path: Path) -> None:
+    """A ``germinated`` stamp means the agenda woke (a band row rings for it, or it was handed on): germinate never reads its
+    target again, so a new one would change nothing but the record. The retarget refuses it, as the other spore verbs refuse
+    a ringing agenda."""
+    root, src, ids = _install(tmp_path)
+    store = SporeStore(root / ".levain" / "memory.spores.json")
+    stamp = {"on": "2031-01-07", "target": "desk", "ref": "q-0001"}
+    store.update(ids["drop"], germinated=stamp, today=TODAY)
+    with pytest.raises(ValueError, match="already woke"):
+        canonical_effect("spore_retarget", {"target": "band"}, store.get(ids["drop"]), version_of=lambda row: "v")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        st, body = _retarget(base, ids["drop"], {"target": "band"})
+    assert st >= 400, body
+    assert store.get(ids["drop"])["target"] == "desk"
 
 
 def test_the_legacy_write_never_takes_a_target(tmp_path: Path) -> None:
