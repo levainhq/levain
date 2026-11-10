@@ -162,9 +162,11 @@ def receipt(body: bytes, *, queue_dir: Path | str) -> tuple[int, bytes, str]:
     digest = obj.get("endpoint_sha256") if obj else None
     if (ping is None or not isinstance(digest, str) or _SHA256.match(digest) is None
             or not {"ping", "kind", "at", "endpoint_sha256"} <= set(obj)
-            or not set(obj) <= {"ping", "kind", "at", "endpoint_sha256", "target", "how"}):
-        return _err(400, "bad_report", "send ping, kind, at and endpoint_sha256 (a tap adds target and how), and nothing else")
-    got = PushStore(queue_dir).add_receipt(digest, ping, obj["kind"], obj["at"], obj.get("target"), obj.get("how"))
+            or not set(obj) <= {"ping", "kind", "at", "endpoint_sha256", "target", "how", "sw", "badge"}):
+        return _err(400, "bad_report", "send ping, kind, at and endpoint_sha256 (a tap adds target and how; the worker adds sw, "
+                                       "and a received adds badge), and nothing else")
+    got = PushStore(queue_dir).add_receipt(digest, ping, obj["kind"], obj["at"], obj.get("target"), obj.get("how"),
+                                           obj.get("sw"), obj.get("badge"))
     if got in _RECEIPT_REFUSALS:
         status, code = _RECEIPT_REFUSALS[got]
         return _err(status, code, "this receipt was not recorded")
