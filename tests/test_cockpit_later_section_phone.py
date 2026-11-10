@@ -85,7 +85,7 @@ LIST_PROBE = """(() => { const mb = document.querySelector('#levain-modal .modal
   const h = Array.from(mb.querySelectorAll('.grp-head')).find(x => /^later/i.test(x.textContent.trim()));
   const lh = (e) => parseFloat(getComputedStyle(e).lineHeight) || parseFloat(getComputedStyle(e).fontSize) * 1.4;
   const rows = Array.from((h ? h.parentElement : mb).querySelectorAll('.row')).map(r => {
-    const tag = Array.from(r.querySelectorAll('[data-ck-tag]')).find(e => /^back /.test(e.textContent));
+    const tag = Array.from(r.querySelectorAll('[data-ck-tag]')).find(e => /^(wakes|back) /.test(e.textContent));
     const b = tag && tag.getBoundingClientRect();
     return { text: (r.querySelector('.clause') || r).textContent.slice(0, 30), tag: tag ? tag.textContent : null,
              tagLines: tag ? Math.round(b.height / lh(tag)) : null, ws: tag ? getComputedStyle(tag).whiteSpace : null }; });
