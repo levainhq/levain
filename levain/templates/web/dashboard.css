@@ -3764,10 +3764,10 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
    action rows already share the phone's one system (icons for Play / Dictate / Mic, the box and its mic icons on one row, the buttons in a
    two-column grid). What was left: the words flush to the box's edge, the signer's protocol lines drawn open under the actions, a
    standing "Make a passkey" link 44px tall in the body colour, and a title cut to a few words with the room for the whole line. */
-body :is(.sign-write-in, .question-words, .sheet-write-in) { padding-inline: var(--sp-3); }
-.sign-enrol-standing { min-height: 0; line-height: 1.4; margin: var(--sp-2) 0 0; margin-left: 0; font-size: var(--fs-meta); color: var(--label); }
+@media (min-width: 761px) { body :is(.sign-write-in, .question-words, .sheet-write-in) { padding-inline: var(--sp-3); } }   /* desk width only: the same breakpoint as the desk dialog title (wideDialog) */
+.sign-enrol-standing { display: inline-flex; align-items: center; min-height: var(--hit-min, 44px); line-height: 1.4; margin: 0; margin-left: 0; font-size: var(--fs-meta); color: var(--label); }
 .sign-lines-disc { margin: var(--sp-2) 0 0; }
-.sign-lines-disc > summary { cursor: pointer; display: flex; align-items: center; min-height: 32px; color: var(--label); font-size: var(--fs-meta); }
+.sign-lines-disc > summary { cursor: pointer; display: flex; align-items: center; min-height: var(--hit-min, 44px); color: var(--label); font-size: var(--fs-meta); }
 .sign-lines-disc > summary:hover, .sign-lines-disc[open] > summary { color: var(--text); }
 .sign-lines-disc > summary:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 .sign-lines-disc > .sign-lines { padding: var(--sp-2) 0 var(--sp-1); }
