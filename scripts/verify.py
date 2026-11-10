@@ -58,6 +58,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -1497,6 +1498,7 @@ def diagnose(run: Path, repo: Path, sha: str, diag: list[dict], *, call=haiku_ca
         return None
     except Exception as e:  # noqa: BLE001
         say(f"verify: diagnosis skipped: {type(e).__name__}: {e}")
+        print(traceback.format_exc()[-3000:], file=sys.stderr)
         return None
     p = run / "diagnosis.md"
     p.write_text(f"# Diagnosis for {sha[:12]} ({HAIKU_MODEL}; advice only, no class or verdict was changed)\n\n{text}\n",
@@ -1698,8 +1700,10 @@ def cmd_run(a) -> int:
         print(f"verify: killed by signal {int(k.signum)}; worktrees, venvs and mounted images cleaned", file=sys.stderr)
         return 128 + int(k.signum)
     except Exception as e:  # noqa: BLE001 - the failure is the report; no receipt is better than a half receipt
-        status.update(state="error", error=f"{type(e).__name__}: {e}")
+        tb = traceback.format_exc()
+        status.update(state="error", error=f"{type(e).__name__}: {e}", error_traceback=tb[-6000:])
         print(f"verify: FAILED before a receipt could be written: {e}", file=sys.stderr)
+        print(tb, file=sys.stderr)
         return 4
     finally:
         restore_signal_handlers(prev)
