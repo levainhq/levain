@@ -229,3 +229,59 @@ def test_a_timed_snooze_to_today_is_posted_and_the_host_judges_the_minute(tmp_pa
     sent = [x for x in out2["posts"] if "intention_snooze" in x]
     assert len(sent) == 1 and "T00:00" in sent[0], sent        # the timed pick to today went to the host; the host decides the minute
     assert store.get(ring.id).answer is None and sp.get(sid)["germinated"]      # 00:00 is never after now: the host refused it
+
+
+@needs_browser
+def test_a_past_minute_snooze_shows_the_hosts_words_and_the_form_comes_back_usable(tmp_path: Path, lh: Path) -> None:
+    """Row 184 fix 1: the host refuses a past minute today with "pick a time after now"; the form must show those words (not a
+    generic line), end its busy state with the buttons enabled and the typed day and time kept, and a later minute then goes."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    today = "(() => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); })()"
+    fill = (RING + ".querySelector('input[type=date]').value = " + today + "; " + RING
+            + ".querySelector('input[type=date]').dispatchEvent(new Event('input')); ")
+    set_time = lambda hhmm: (RING + ".querySelector('.verb-time').value = '" + hhmm + "'; " + RING
+                             + ".querySelector('.verb-time').dispatchEvent(new Event('input')); ")
+    click = RING + ".querySelector('.verb-confirm').click(); 1"
+    probe = ("JSON.stringify({msg: (" + RING + ".querySelector('.edit-msg') || {}).textContent, cls: (" + RING
+             + ".querySelector('.edit-msg') || {}).className, live: [...(" + RING + ".querySelector('.verb-form') || document.body)"
+             ".querySelectorAll('button')].filter(b => !b.disabled).length, day: " + RING + ".querySelector('input[type=date]').value,"
+             " time: " + RING + ".querySelector('.verb-time').value, probe: 1})")
+    wait = lambda ms: {"until": f"Date.now() - window.__t0 > {ms} && 1", "ms": ms + 5000, "every": 100}   # a real wait: `until` is polled
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(
+            DESKTOP, {"do": _tap("intention_snooze"), "until": RING + ".querySelector('input[type=date]') && 1", "ms": 10000},
+            {"do": "window.__t0 = Date.now(); " + fill + set_time("00:00") + click, "until": "1", "ms": 1000},
+            wait(1000), {"eval": probe}, wait(5000), {"eval": probe},
+            {"do": "window.__t0 = Date.now(); " + set_time("23:59") + click, "until": "1", "ms": 1000},   # one tap: a repeated action would re-set the busy mark
+            wait(3000)))
+    seen = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"probe"' in v]
+    at1, at5 = seen[-2], seen[-1]
+    for s in (at1, at5):
+        assert s["msg"] == "pick a time after now" and "busy" not in s["cls"], s
+        assert s["live"] >= 2 and s["time"] == "00:00", s          # the buttons are enabled again, the typed time kept
+    sent = [x for x in out["posts"] if "intention_snooze" in x]
+    assert len(sent) == 2 and "T00:00" in sent[0] and "T23:59" in sent[1], sent
+    assert store.get(ring.id).answer is not None and sp.get(sid)["next"].endswith("T23:59"), sp.get(sid)
+
+
+@needs_browser
+def test_only_the_snoozes_own_refusal_sentences_reach_the_form(tmp_path: Path, lh: Path) -> None:
+    """The fault() rule for row 184: a bad_request on a snooze shows the host's words only when they are one of its three plain
+    refusals; any other text from a bad_request (a path, an internal string) keeps the page's fixed line, and the form is usable."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    stub = ("(() => { const of = window.fetch; window.fetch = async (u, o) => (u === '/cockpit/verb' && o && /intention_snooze/.test(o.body || '')) "
+            "? new Response(JSON.stringify({error: 'bad_request', message: '/Users/x/.levain/secret.json: boom'}), {status: 400, headers: {'content-type': 'application/json'}})"
+            " : of(u, o); return 1; })()")
+    fill = (RING + ".querySelector('input[type=date]').value = '2030-01-05'; " + RING
+            + ".querySelector('input[type=date]').dispatchEvent(new Event('input')); " + RING + ".querySelector('.verb-confirm').click(); 1")
+    probe = ("JSON.stringify({msg: (" + RING + ".querySelector('.edit-msg') || {}).textContent, live: [...(" + RING
+             + ".querySelector('.verb-form') || document.body).querySelectorAll('button')].filter(b => !b.disabled).length, probe: 1})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(
+            DESKTOP, {"do": _tap("intention_snooze"), "until": RING + ".querySelector('input[type=date]') && 1", "ms": 10000},
+            {"eval": stub},
+            {"do": fill, "until": "(" + RING + ".querySelector('.edit-msg') || {}).textContent.includes('not understood') && 1", "ms": 10000},
+            {"eval": probe}))
+    seen = _probe(out)
+    assert seen["msg"] == "That request was not understood. Reload and try again." and "secret" not in seen["msg"], seen
+    assert seen["live"] >= 2, seen

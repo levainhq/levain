@@ -3576,7 +3576,7 @@
     go.type = "button"; clearBtn.type = "button"; cancel.type = "button";
     clearBtn.title = "no day: leave it undated";
     const msg = el("span", "edit-msg", "");
-    if (opts && (opts.minTimed || opts.min)) input.min = opts.minTimed || opts.min;   // a timed pick may be today: the host judges the minute
+    if (opts && (opts.minToday || opts.min)) input.min = opts.minToday || opts.min;   // a timed pick may be today: the host judges the minute
     const back = opts && opts.back ? el("span", "muted intention-back", "") : null;
     const showBack = () => { if (back) back.textContent = input.value ? opts.back(timeIn.value ? input.value + "T" + timeIn.value : input.value) : ""; };
     if (back) { input.addEventListener("input", showBack); timeIn.addEventListener("input", showBack); }
@@ -3630,7 +3630,7 @@
     };
     go.addEventListener("click", () => {
       if (!input.value) { msg.className = "edit-msg err"; msg.textContent = opts ? "pick a day" : "pick a day (or someday)"; return; }
-      const floor = opts ? (timeIn.value ? opts.minTimed || opts.min : opts.min) : null;   // date-only: after today; timed: today, the host judges the minute
+      const floor = opts ? (timeIn.value ? opts.minToday || opts.min : opts.min) : null;   // date-only: after today; timed: today, the host judges the minute
       if (floor && input.value < floor) { msg.className = "edit-msg err"; msg.textContent = "pick a later day"; return; }
       submit(timeIn.value ? input.value + "T" + timeIn.value : input.value);
     });
@@ -3675,7 +3675,7 @@
       const btn = verbBtn(label, title, async (ev) => {
         if (verb === "intention_snooze") {
           openSurfaceForm(wrap, { next: null }, { label: "snooze", post: (v) => intentionPost(rowId, verb)({ until: v }),
-            min: localDayIso(1), minTimed: localDayIso(0), back: (v) => "comes back " + dayWords(v), done: (v) => "snoozed to " + dayWords(v), stale: INTENTION_STALE });
+            min: localDayIso(1), minToday: localDayIso(0), back: (v) => "comes back " + dayWords(v), done: (v) => "snoozed to " + dayWords(v), stale: INTENTION_STALE });
           return;
         }
         if (verb === "intention_edit") {

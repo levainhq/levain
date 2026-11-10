@@ -573,8 +573,8 @@
     WAITING: "Waiting for your signature.",
     applying: "Still saving."
   };
-  // The page never shows the server's own text for a refusal: it can carry a path or an OS error. A code not listed here
-  // says only its code.
+  // The page never shows the server's own text for a refusal: it can carry a path or an OS error (the one exception is
+  // SNOOZE_REFUSALS, below). A code not listed here says only its code.
   const FAULT_WORDS = {
     stale: "That changed somewhere else first. Reload to see the new version.",
     needs_intent: "This needs a fresh confirmation. Try again.",
@@ -610,6 +610,7 @@
     sign_required: "That is sent only after your passkey signs it; nothing was sent. Send it again.",
     credential_required: "Saving needs the write token for this page. Open the page from the link that carries it."
   };
+  const SNOOZE_REFUSALS = new Set(["pick a time after now", "pick a later day", "pick a day: that date could not be read"]);
   // Only a landed state is silent; a state this page does not know speaks too (never a quiet failure). Own-property lookups:
   // a state or code named "constructor" must not index into Object.prototype.
   function resultWords(state) {
@@ -620,7 +621,11 @@
   function fault(r, what) {
     const d = r.data || {};
     const code = d.error || "HTTP " + r.status;
-    const text = (Object.prototype.hasOwnProperty.call(FAULT_WORDS, code) && FAULT_WORDS[code]) || "That did not go through (" + code + ").";
+    let text = (Object.prototype.hasOwnProperty.call(FAULT_WORDS, code) && FAULT_WORDS[code]) || "That did not go through (" + code + ").";
+    // a snooze's own refusal of the day or minute the operator typed: the host's three plain sentences, shown as sent so the
+    // form says what to change. Only these exact sentences, only on that verb: any other bad_request keeps the fixed line.
+    if (code === "bad_request" && r.status === 400 && what && what.verb === "intention_snooze" && typeof d.message === "string"
+        && SNOOZE_REFUSALS.has(d.message)) text = d.message;
     if (REREAD.has(code) || r.status === 501) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
@@ -671,7 +676,7 @@
   }
 
   async function fire(base, head, label, action, fpKey, txn) {
-    const what = { row_id: base.row_id, label: label };
+    const what = { row_id: base.row_id, label: label, verb: base.verb };
     // A T2+ fire (or an idempotent or signed verb's) carries one key, minted for this request and kept with the whole
     // envelope until the kernel answers. A kept envelope is sent again BEFORE any new dry run: the write it
     // carries may have landed and moved the row, and only a replay under its own key gets that answer back.
