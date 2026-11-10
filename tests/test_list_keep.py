@@ -83,8 +83,8 @@ def test_the_episode_key_is_a_hash_of_the_spores_origin_key_else_its_id_and_alwa
     import re
 
     h = lambda t: "keep:" + hashlib.sha256(t.encode()).hexdigest()   # noqa: E731
-    assert writes.keep_origin_key({"id": "spore-1", "origin_key": "ok-9"}) == h("ok-9")
-    assert writes.keep_origin_key({"id": "spore-1"}) == h("spore-1")
+    assert writes.keep_origin_key({"id": "spore-1", "origin_key": "ok-9"}) == h("origin:ok-9")
+    assert writes.keep_origin_key({"id": "spore-1"}) == h("id:spore-1")
     for ok in ("x" * 128, "a key with spaces", "k\u00e9y-\u65e5\u672c"):          # keys anneal's grammar would refuse with a prefix
         k = writes.keep_origin_key({"id": "spore-1", "origin_key": ok})
         assert re.fullmatch(r"[0-9A-Za-z._:-]{1,128}", k) and len(k) == 69
@@ -338,3 +338,29 @@ def test_kept_rows_sort_newest_first_a_missing_time_last_and_a_long_title_is_cap
     unknown = RowIn(id="kept:z", title="t", facets={"surface": "kept", "kept_at": ""})
     known = RowIn(id="kept:a", title="t", facets={"surface": "kept", "kept_at": "2026-11-10T00:00:00.000000Z"})
     assert sorted([unknown, known], key=lambda r: _list_key(r, None))[-1] is unknown      # type: ignore[arg-type]
+
+
+# --- fix round 2: the key's domain, and the ValueError label -----------------------------------------------------
+
+
+def test_an_origin_key_equal_to_another_spores_id_does_not_share_its_keep_key() -> None:
+    # the two bases live in separate domains: a spore keyed "X" and a legacy spore (no origin key) whose id is "X"
+    a = writes.keep_origin_key({"id": "spore-1", "origin_key": "spore-2"})
+    b = writes.keep_origin_key({"id": "spore-2"})
+    assert a != b
+
+
+def test_a_valueerror_that_is_not_a_retired_key_is_a_plain_refusal_that_names_its_reason(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = rig.ids["plain"]
+
+    def boom(self: Any, *a: Any, **k: Any) -> Any:
+        raise ValueError("content must not be empty")
+
+    monkeypatch.setattr(Store, "record", boom)
+    with pytest.raises(EditError) as ei:
+        _keep(rig, sid)
+    assert ei.value.code != "keep_key_retired" and "content must not be empty" in str(ei.value)
+    assert "compost the item by hand" not in str(ei.value)
+    assert sid in _open_ids(rig)
