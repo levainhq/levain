@@ -37,7 +37,8 @@ Known edge, not built against: ``/webpush/receipt`` takes no token, so two slow 
 its semaphore slots; that channel is measurement, not delivery, and has its own semaphore, so no push is affected.
 
 The TAP keys (``clicked_at``, ``click_target``, ``opened_at``, ``opened_how``, the per-device ``clicked`` and the top-level
-``landings``) are ADDITIVE to ``levain-ping-receipts/1`` and the version stays ``/1`` on purpose: every key the format had
+``landings``), and the per-device ``sw`` (the worker's version) and ``badge`` (the result of its app-badge call on the
+``received`` report, row 187) are ADDITIVE to ``levain-ping-receipts/1`` and the version stays ``/1`` on purpose: every key the format had
 is unchanged, and no consumer in this repo or in the flow scripts reads the report by an exact schema (a consumer that
 rejects unknown keys would be a new constraint, not one that exists). A click or an open also counts as ``shown`` (an
 ``opened`` row proves the click ran even when its own POST was lost), and a device whose only reports are worker tap rows
@@ -54,7 +55,8 @@ JSON form (``format`` ``levain-ping-receipts/1``, the keys the desk joins to the
                              "opened_how": str|null,
                              "received_count": int, "duplicate": bool,
                              "sent_to_received_s": float|null, "received_to_shown_s": float|null,
-                             "outcome": "shown"|"received"|"silent"|"no receipt yet"|"not accepted"|"devtest"}]}],
+                             "outcome": "shown"|"received"|"silent"|"no receipt yet"|"not accepted"|"devtest",
+                             "sw": str|null, "badge": str|null}]}],
      "devices": [{"device": str, "sent": int, "accepted": int, "received": int, "shown": int, "tapped": int,
                   "clicked": int, "duplicates": int, "silent": int, "median_sent_to_received_s": float|null}],
      "landings": [{"device": str, "at": stamp, "target": str, "how": str}]}   # newest 20 page landings (the TAP record)
@@ -128,7 +130,7 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
         if x is None:
             x = by[(ping, device)] = {"statuses": [], "sent": [], "received_n": 0, "received": None, "shown": None,
                                       "tapped": None, "clicked": None, "click_target": None, "opened": None,
-                                      "opened_how": None}
+                                      "opened_how": None, "sw": None, "badge": None}
             per_ping.setdefault(ping, []).append(device)
         return x
 
@@ -144,11 +146,17 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
         # every receipt stamp has the one form (whole stamp, milliseconds, Z), so MIN and MAX on the text are by time
         for r in c.execute("SELECT r.ping_id, r.device_id, SUM(r.kind = 'received') AS n, "
                            "MIN(CASE WHEN r.kind = 'received' THEN r.at END) AS received, "
-                           "MIN(CASE WHEN r.kind = 'shown' THEN r.at END) AS shown "
+                           "MIN(CASE WHEN r.kind = 'shown' THEN r.at END) AS shown, "
+                           # the newest report's worker version and the badge result of the first `received` (the push event's own)
+                           "(SELECT r2.sw FROM receipts r2 WHERE r2.ping_id = r.ping_id AND r2.device_id = r.device_id "
+                           "AND r2.sw IS NOT NULL ORDER BY r2.at DESC, r2.id DESC LIMIT 1) AS sw, "
+                           "(SELECT r3.badge FROM receipts r3 WHERE r3.ping_id = r.ping_id AND r3.device_id = r.device_id "
+                           "AND r3.badge IS NOT NULL ORDER BY r3.at, r3.id LIMIT 1) AS badge "
                            f"FROM receipts r JOIN pings p ON p.id = r.ping_id WHERE {_PINGS} "
                            "GROUP BY r.ping_id, r.device_id", args):
             x = cell(r["ping_id"], r["device_id"])
             x["received_n"], x["received"], x["shown"] = int(r["n"] or 0), r["received"], r["shown"]
+            x["sw"], x["badge"] = r["sw"], r["badge"]
         for o in c.execute("SELECT o.ping_id, o.device_id, MIN(o.at) AS at FROM opens o JOIN pings p ON p.id = o.ping_id "
                            f"WHERE {_PINGS} AND o.device_id IS NOT NULL GROUP BY o.ping_id, o.device_id", args):
             cell(o["ping_id"], o["device_id"])["tapped"] = o["at"]
@@ -204,7 +212,7 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
                    "duplicate": x["received_n"] > 1,
                    "sent_to_received_s": _gap(sent_at, recv),
                    "received_to_shown_s": _gap(recv, shown),
-                   "outcome": outcome}
+                   "outcome": outcome, "sw": x["sw"], "badge": x["badge"]}
             devices.append(row)
             r = roll.get(device)
             if r is None:
@@ -246,7 +254,8 @@ def text(report: dict[str, Any]) -> str:
             lines.append(f"    {d['device']}: {d['outcome']} (push service {push}; received {d['received_at'] or '-'}, "
                          f"shown {d['shown_at'] or '-'}, tapped {d['tapped_at'] or '-'}; click {d['clicked_at'] or '-'} "
                          f"-> {d['click_target'] or '-'}, opened {d['opened_how'] or '-'}; sent->received "
-                         f"{_s(d['sent_to_received_s'])}, received->shown {_s(d['received_to_shown_s'])}{dup})")
+                         f"{_s(d['sent_to_received_s'])}, received->shown {_s(d['received_to_shown_s'])}{dup}; "
+                         f"worker {d.get('sw') or '-'}, badge {d.get('badge') or '-'})")
     if report["devices"]:
         lines.append("")
         lines.append("per device: sent / accepted / received / shown / tapped / duplicates / silent / median sent->received")

@@ -248,6 +248,15 @@ function fire(type, ev) {
     log.getnThrows = parts.includes('getnthrows');
     log.getnAll = parts.includes('getnall');
     if (parts.includes('nogetn')) delete self_.registration.getNotifications;
+    // the app-badge API (row 187): 'badgeset' resolves, 'badgeerr' rejects with a NotAllowedError (iOS without the permission),
+    // 'badgehang' never settles; the calls are logged. No flag: no navigator, as the rig has always run.
+    if (parts.includes('badgeset') || parts.includes('badgeerr') || parts.includes('badgehang')) {
+      log.badgeCalls = [];
+      const call = (name) => (n) => { log.badgeCalls.push([name, n === undefined ? null : n]);
+        if (parts.includes('badgehang')) return new Promise(() => {});
+        return parts.includes('badgeerr') ? Promise.reject(Object.assign(new Error('x'), { name: 'NotAllowedError' })) : Promise.resolve(); };
+      self_.navigator = { setAppBadge: call('set'), clearAppBadge: call('clear') };
+    }
     if (parts.includes('othertag')) log.held = [{ title: 'other', tag: 'np-other' }];   // the UA holds another ping's notification
     // 'staleheld': the UA still holds an EARLIER ping's notification under this push's tag (a re-ping reuses the tag with
     // renotify); with 'swallowed' the new show leaves it as it was. 'foreigndata': held under the tag with no ping in its data
@@ -279,6 +288,7 @@ function fire(type, ev) {
     // stand-in of the recorded length class, not the recorded text
     const p409 = { title: 'levain', body: 'secret body ' + 'x'.repeat(180), tag: 'request:pend-2026-11-05T19:54:58.556594Z-2690252d9c8e0d77',
                    url: '/?view=notifications&n=p409', ping: 409, badge: 1 };
+    let badgeZero0 = parts.includes('badgezero');
     const data = parts.includes('noping') ? { title: 'T', body: 'secret body' }
       : parts.includes('p409') ? p409 : { title: 'T', body: 'secret body', ping: 42, url: '/', tag: 'x' };
     // 'taghostile': a tag whose length throws, so heldByAgent's own failure path throws too (nothing real sends one: the
@@ -286,6 +296,7 @@ function fire(type, ev) {
     if (parts.includes('taghostile')) data.tag = { get length() { if (!log.hostileTagDone) throw new TypeError('hostile tag'); return 7; }, toString: () => 'hostile' };
     // 'nourl': no url in the payload; 'summary': the held-summary tag; 'crossurl': an off-origin url; 'second': a second push (ping 43) after the first;
     // 'clickping': the `then:...+click` carries ping 42 (as a real notification's data does), 'clickother': ping 99
+    if (badgeZero0) data.badge = 0;
     if (parts.includes('nourl')) delete data.url;
     if (parts.includes('summary')) data.tag = 'summary';
     if (parts.includes('crossurl')) data.url = 'https://evil.example/x';

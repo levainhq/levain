@@ -151,7 +151,7 @@ async function sendReceipt(ping, kind, at, b, hashP, extra) {
     const hash = await hashP;
     if (hash === LATE || b.over) { trace('receipt', { kind, ping, result: 'late' }); return false; }
     if (!hash) { trace('receipt-no-sub', { kind, ping }); return false; }
-    const body = { ping, kind, at, endpoint_sha256: hash, ...(extra || {}) };   // extra: a tap report's target and how only
+    const body = { ping, kind, at, endpoint_sha256: hash, sw: SW_VERSION, ...(extra || {}) };   // extra: a tap report's target and how, or a received's badge result
     const key = receiptKey(body);
     receiptInFlight.add(key);
     try {
@@ -591,14 +591,23 @@ self.addEventListener('activate', (e) => e.waitUntil((async () => {
 // The app-icon badge: the push payload's `badge` is the open Needs-you count at send time (never a notice count), the only
 // source the worker has (it holds no credential). A plain int > 0 sets it, 0 clears it, anything else (absent, not an int)
 // leaves the icon as it is. Feature-detected and caught: a failing badge never touches the notification.
+// It resolves to the call's RESULT, a short word the server keeps beside the `received` receipt (row 187): `none` (the payload
+// carried no badge number), `unsupported` (no badge API here), `set:N`, `cleared`, or `error:<Name>`; never a rejection.
 function applyBadge(n) {
   try {
-    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) return Promise.resolve();
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) return Promise.resolve('none');
     const nav = self.navigator;
-    if (!nav) return Promise.resolve();
-    if (n > 0) return typeof nav.setAppBadge === 'function' ? Promise.resolve(nav.setAppBadge(n)).catch(() => {}) : Promise.resolve();
-    return typeof nav.clearAppBadge === 'function' ? Promise.resolve(nav.clearAppBadge()).catch(() => {}) : Promise.resolve();
-  } catch (_) { return Promise.resolve(); }
+    if (!nav) return Promise.resolve('unsupported');
+    const fail = (err) => 'error:' + String((err && err.name) || 'Error').replace(/[^A-Za-z]/g, '').slice(0, 32).padEnd(1, 'E');
+    if (n > 0) return typeof nav.setAppBadge === 'function' ? Promise.resolve(nav.setAppBadge(n)).then(() => 'set:' + n, fail) : Promise.resolve('unsupported');
+    return typeof nav.clearAppBadge === 'function' ? Promise.resolve(nav.clearAppBadge()).then(() => 'cleared', fail) : Promise.resolve('unsupported');
+  } catch (err) { return Promise.resolve('error:' + String((err && err.name) || 'Error').replace(/[^A-Za-z]/g, '').slice(0, 32).padEnd(1, 'E')); }
+}
+// The badge result for a receipt: the call's own result, or `timeout` when it has not settled in BADGE_WAIT_MS (a report is never held longer).
+const BADGE_WAIT_MS = 1500;
+function badgeResult(p) {
+  let t;
+  return Promise.race([p, new Promise((res) => { t = setTimeout(() => res('timeout'), BADGE_WAIT_MS); })]).finally(() => clearTimeout(t));
 }
 
 // Whether the user agent holds the notification just asked for: getNotifications({tag}) lists one with this exact tag
@@ -649,11 +658,13 @@ self.addEventListener('push', (e) => {
     trace('push-declarative', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
     const dping = typeof d.ping === 'number' ? d.ping : Number(d.ping);
     const db = receiptBudget(t0);
+    const dbadged = badgeResult(applyBadge(d.badge));
     const dreceipts = boundedReceipts(db, async () => {
-      const r = await sendReceipt(dping, 'received', t0, db, endpointHash(db));
+      const dbadge = await dbadged;
+      const r = await sendReceipt(dping, 'received', t0, db, endpointHash(db), { badge: dbadge });
       if (r === true) await drainReceipts(db);
     });
-    e.waitUntil(Promise.allSettled([applyBadge(d.badge), dreceipts]).finally(traceSettled));
+    e.waitUntil(Promise.allSettled([dbadged, dreceipts]).finally(traceSettled));
     return;
   }
   const title = d.title || 'Levain';
@@ -685,6 +696,7 @@ self.addEventListener('push', (e) => {
     () => waitBounded(pend.written.then((ok) => (ok ? pruneSuperseded(pend.tag, pend.ping) : false)), 2 * SHOWN_WRITE_WAIT_MS),
     () => waitBounded(pend.written.then(() => dropKey(pend.key)), 2 * SHOWN_WRITE_WAIT_MS)) : undefined;
   const badged = applyBadge(d.badge);   // after the notification is asked for; its failure is its own
+  const badgedB = badgeResult(badged);   // bounded: a badge call that never settles holds neither the receipt nor the event
   trace('sw-version', { version: SW_VERSION, on: 'push' });
   trace('push', { tag: traceScalar(d.tag || 'levain'), ping: traceScalar(d.ping) });
   const ping = typeof d.ping === 'number' ? d.ping : Number(d.ping);
@@ -694,13 +706,14 @@ self.addEventListener('push', (e) => {
   const receipts = boundedReceipts(b, async () => {
     const hashP = endpointHash(b);   // one hash for this event's reports, asked now
     const tag = d.tag || 'levain';
-    const r = await Promise.all([sendReceipt(ping, 'received', t0, b, hashP),
+    const badgeRes = await badgedB;   // settled in ms; bounded, so the report is never held
+    const r = await Promise.all([sendReceipt(ping, 'received', t0, b, hashP, { badge: badgeRes }),
                                  shown.then(() => heldByAgent(tag, ping, b), () => false)
                                    .then((held) => (held ? sendReceipt(ping, 'shown', Date.now(), b, hashP) : false))
                                    .catch(() => false)]);   // total: a throw in this arm would reject Promise.all, and the budget's end would abort `received` too
     if (r.some((x) => x === true)) await drainReceipts(b);
   });
-  e.waitUntil(Promise.allSettled([shown, badged, receipts, shownCleanup, pend && waitBounded(pend.pruned, 2 * SHOWN_WRITE_WAIT_MS)]).finally(traceSettled));
+  e.waitUntil(Promise.allSettled([shown, badgedB, receipts, shownCleanup, pend && waitBounded(pend.pruned, 2 * SHOWN_WRITE_WAIT_MS)]).finally(traceSettled));
   shown.catch((err) => trace('show-failed', { error: err && err.name || 'error' }));
 });
 
