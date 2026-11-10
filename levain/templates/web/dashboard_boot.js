@@ -144,10 +144,11 @@
       const r = Object.assign({}, manifest.regions);
       for (const k of ["hero", "brief", "widgets", "header"]) if (Array.isArray(r[k])) r[k] = keep(r[k]);
       if (Array.isArray(r.zones)) {
-        r.zones = r.zones.map((z) => {
+        const own = (a) => Array.isArray(a) ? a.filter((id) => have.has(id)) : [];
+        r.zones = r.zones.filter((z) => z && typeof z === "object").map((z) => {
           const zz = Object.assign({}, z);
-          zz.panels = keep(z.panels);
-          if (Array.isArray(z.cards)) zz.cards = z.cards.map((c) => Object.assign({}, c, { panels: keep(c.panels) })).filter((c) => c.panels.length);
+          zz.panels = own(z.panels);
+          if (Array.isArray(z.cards)) zz.cards = z.cards.filter((c) => c && typeof c === "object").map((c) => Object.assign({}, c, { panels: own(c.panels) })).filter((c) => c.panels.length);
           return zz;
         }).filter((z) => z.panels.length);
       }
@@ -163,9 +164,12 @@
     const fire = () => {
       timer = null; if (done) return;
       const t0 = clock.now();
-      draw(n);
-      last = clock.now();
-      gap = Math.max(PARTIAL_GAP_MS, PARTIAL_IDLE * (last - t0));
+      // a partial draw is best-effort: a throw here must never reach the panel read that landed it
+      try { draw(n); } catch (e) { if (typeof console !== "undefined") console.warn("levain: a partial board draw failed:", e); }
+      finally {
+        last = clock.now();
+        gap = Math.max(PARTIAL_GAP_MS, PARTIAL_IDLE * (last - t0));
+      }
     };
     return {
       settled: function (id) {
@@ -178,6 +182,38 @@
       stop: function () { done = true; if (timer !== null) { clock.clearTimeout(timer); timer = null; } },
     };
   }
+  // One ACTUAL fetch attempt gets its own controller and its own PANEL_TIMEOUT_MS: the timer never runs while the page waits on a
+  // token prompt, and a retry after re-auth starts a fresh one. A hung read is aborted and says so.
+  async function timedAttempt(fetchPanel, url, clock) {
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctl ? clock.setTimeout(() => ctl.abort(), PANEL_TIMEOUT_MS) : 0;
+    try { return await fetchPanel(url, ctl ? ctl.signal : undefined); }
+    catch (e) { if (ctl && ctl.signal.aborted) throw new Error("no answer in " + PANEL_TIMEOUT_MS / 1000 + " s"); throw e; }
+    finally { if (timer) clock.clearTimeout(timer); }
+  }
+  // io: attempt(url) -> Response, isReject(res) -> bool, reauth() -> Promise<bool>, token(), drop()
+  async function readPanelBody(url, io) {
+    let res = await io.attempt(url);
+    if (res.status === 403 && await io.isReject(res.clone())) {
+      if (await io.reauth()) {
+        const usedToken = io.token();
+        res = await io.attempt(url);
+        // the replacement token was rejected too: drop it so the next refresh asks again (not a newer token another tab stored)
+        if (res.status === 403 && await io.isReject(res.clone()) && io.token() === usedToken) io.drop();
+      }
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }
+  // A partial board is drawn only if its load is still the current one and nothing is being edited, and its mapping (which keeps
+  // state in the view mapper) runs only then; a throw anywhere in it leaves the board as it was.
+  function runPartial(gate, build, show) {
+    if (!gate()) return false;
+    try { show(build()); return true; }
+    catch (e) { if (typeof console !== "undefined") console.warn("levain: a partial board draw failed:", e); return false; }
+  }
+  // the whole board's draw: a load that drew a partial board (now interactive) is held to the same edit rule as a passive one
+  function mayDrawWhole(passive, partialDrawn, editing) { return !((passive || partialDrawn) && editing); }
   // END progressive draw
   let writeTokenRequired = false;
   // What a missing token is answered with, from the server: "pair" (this request cannot use the owner key: pair the device by a
@@ -1028,38 +1064,37 @@
     const queue = plan.order.slice();
     // a cold first board draws as its panels land (onPartial); a refresh keeps showing the last board until the new one is whole
     const pacer = onPartial ? partialPacer(plan.core, ids.length, (n) => {
-      const have = new Set(Object.keys(panels));
-      onPartial(window.LevainCockpitView.fromManifest({ manifest: manifestSubset(manifest, have), panels: Object.assign(Object.create(null), panels) }, { elapsedMs: Date.now() - fetchedAt }), n, ids.length);
+      const build = () => {
+        const have = new Set(Object.keys(panels));
+        return window.LevainCockpitView.fromManifest({ manifest: manifestSubset(manifest, have), panels: Object.assign(Object.create(null), panels) }, { elapsedMs: Date.now() - fetchedAt });
+      };
+      onPartial(build, n, ids.length);
     }, { now: Date.now, setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (t) => clearTimeout(t) }) : null;
+    const clock = { setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (t) => clearTimeout(t) };
+    const io = {
+      attempt: (url) => timedAttempt(fetchPanel, url, clock),
+      isReject: isTokenReject,
+      reauth: () => {
+        // a passive refresh never steals focus with a prompt over an open editor (as the legacy path does)
+        reauth = reauth || Promise.resolve().then(() => {
+          if (passive && editInProgress()) return false;
+          if (passive && tokenDeclined) return false;
+          if (promptForToken()) return true;
+          tokenDeclined = true;
+          dropToken();
+          return false;
+        });
+        return reauth;
+      },
+      token: storedToken, drop: dropToken,
+    };
     const readOne = async (id) => {
-      const url = panelUrl(id);
-      const ctl = typeof AbortController === "function" ? new AbortController() : null;
-      const timer = ctl ? setTimeout(() => ctl.abort(), PANEL_TIMEOUT_MS) : 0;
       try {
-        let res = await fetchPanel(url, ctl ? ctl.signal : undefined);
-        if (res.status === 403 && await isTokenReject(res.clone())) {
-          // a passive refresh never steals focus with a prompt over an open editor (as the legacy path does)
-          reauth = reauth || Promise.resolve().then(() => {
-            if (passive && editInProgress()) return false;
-            if (passive && tokenDeclined) return false;
-            if (promptForToken()) return true;
-            tokenDeclined = true;
-            dropToken();
-            return false;
-          });
-          if (await reauth) {
-            const usedToken = storedToken();
-            res = await fetchPanel(url, ctl ? ctl.signal : undefined);
-            // the replacement token was rejected too: drop it so the next refresh asks again
-            if (res.status === 403 && await isTokenReject(res.clone()) && storedToken() === usedToken) dropToken();   // not a newer token another tab stored
-          }
-        }
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        panels[id] = await res.json();
+        panels[id] = await readPanelBody(panelUrl(id), io);
       } catch (e) {
         // keep the reason: the mapper draws this panel as unavailable with it, never as an empty one
-        panels[id] = { error: ctl && ctl.signal.aborted ? "no answer in " + PANEL_TIMEOUT_MS / 1000 + " s" : (e && e.message ? e.message : String(e)) };
-      } finally { if (timer) clearTimeout(timer); }
+        panels[id] = { error: e && e.message ? e.message : String(e) };
+      }
       if (pacer) pacer.settled(id);
     };
     const worker = async () => { while (queue.length) await readOne(queue.shift()); };
@@ -1067,7 +1102,7 @@
     finally { if (pacer) pacer.stop(); }
     // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
     // resyncs over these ids, and the poll fallback compares the etags
-    heldNext = Object.fromEntries(ids.map((id) => [id, { etag: (manifest.panels[id] || {}).etag || null }]));
+    heldNext = Object.fromEntries(ids.map((id) => [id, { etag: panels[id] && panels[id].error !== undefined && panels[id].status === undefined ? null : (manifest.panels[id] || {}).etag || null }]));
     return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels }, { elapsedMs: Date.now() - fetchedAt });
   }
 
@@ -1108,16 +1143,19 @@
               ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, answerQuestion, bandRead, answerBand, dismissNote, reviewItem, onJobsIdle, recall } : { recall });
           } catch (e) { live = liveBefore; throw e; }
         };
-        const onPartial = everDrawn ? null : (pview, n, total) => {
-          if (myGen !== loadGen || editInProgress()) return;
-          try { drawView(pview); } catch (e) { return; }    // a partial board that cannot draw leaves the line as it was; the whole board's draw reports its own failure
-          if (storeEl) storeEl.removeAttribute("data-cold");
-          drawnOnce();
-          status("reading " + n + " of " + total + " panels...");
+        let partialDrawn = false;
+        const onPartial = everDrawn ? null : (build, n, total) => {
+          runPartial(() => myGen === loadGen && !editInProgress(), build, (pview) => {
+            drawView(pview);
+            partialDrawn = true;
+            if (storeEl) storeEl.removeAttribute("data-cold");
+            drawnOnce();
+            status("reading " + n + " of " + total + " panels...");
+          });
         };
         const mview = await loadManifestView(passive, onPartial);
         if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
-        if (passive && editInProgress()) { notice = null; return refuseForEdit(); }
+        if (!mayDrawWhole(passive, partialDrawn, editInProgress())) { notice = null; return refuseForEdit(); }
         drawView(mview);
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;
