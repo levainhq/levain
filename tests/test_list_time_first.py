@@ -83,7 +83,7 @@ def test_someday_holds_undated_seeds_only(rig: Rig) -> None:
     for key in ("talk_old", "drop_late", "drop_soon", "agenda_old", "drop_later"):   # a talk, a drop, a dated row is never Someday
         assert rows[_sp(rig, key)]["group"] != "someday", key
     assert rows["board:levain:a"]["group"] == "board"
-    assert [g["id"] for g in rig.panel()["groups"]][-2:] == ["someday", "done"]
+    assert [g["id"] for g in rig.panel()["groups"]][-3:] == ["someday", "done", "kept"]
     # an undated seed is counted as "Also pending" was (the card draws it); later and done are not
     assert rig.panel()["count"] == sum(1 for r in rig.panel()["rows"] if r["group"] not in ("desk", "later", "done"))
 
@@ -113,7 +113,8 @@ def test_every_row_kind_carries_its_type_tag(rig: Rig, monkeypatch: pytest.Monke
     _band_with(monkeypatch, rig, snoozed_until=(TODAY + timedelta(days=2)).isoformat())
     p = rig.panel()
     kinds = {r["facets"].get("surface") for r in p["rows"]}
-    assert kinds == set(list_panel.SURFACES), kinds                          # band, board, spore, talk, drop: all present, none untagged
+    # band, board, spore, talk, drop: all present, none untagged; kept rows come only with a search query
+    assert kinds == set(list_panel.SURFACES) - {list_panel.KEPT_SURFACE}, kinds
     assert {r["facets"]["time_state"] for r in p["rows"]} == {"now", "later", "someday", "done"}
     for r in p["rows"]:
         assert r["facets"].get("surface") in list_panel.SURFACES, r

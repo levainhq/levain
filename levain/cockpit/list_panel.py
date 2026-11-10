@@ -52,7 +52,7 @@ from levain.dashboard import SubstrateSource
 LIST_PANEL_ID = "tray"          # the wire id (a code name); the operator-facing title is "List"
 LIST_TITLE = "List"
 LIST_ROWSET = "spore:tray"
-LIST_VERBS = SPORE_ROW_VERBS + ("spore_seed", "list_intake", *INTENTION_VERBS)      # a verb the registry does not know yet is simply not offered
+LIST_VERBS = SPORE_ROW_VERBS + ("spore_keep", "spore_seed", "list_intake", *INTENTION_VERBS)      # a verb the registry does not know yet is simply not offered
 LIST_NOTE = "Band rows are what only you can answer: answer them in Decisions. Board rows are the agents' ready queue."
 BAND_POINTER = "answer it in Decisions (levain band)"
 BOARD_POINTER = "the agents' ready queue (levain board)"
@@ -60,8 +60,11 @@ LIST_FACETS = SPORE_FACETS | frozenset({
     "surface", "fires", "overdue", "target", "attention", "list_pointer", "band_number", "board_rank", "board_tier",
     "source", "repo", "held_until", "intention", "intention_text", "band_section", "band_carried", "band_age", "band_since", "band_later_words",
     "time_state", "wake_day", "wake_bucket", "wake_line", "done_on", "done_kind",
+    "kept_line", "kept_at", "kept_type", "kept_source",
 })
-SURFACES = ("band", "board", "spore", "talk", "drop")
+SURFACES = ("band", "board", "spore", "talk", "drop", "kept")
+KEPT_PREFIX = "kept:"             # a kept row's id (an episode id behind it): never a ``spore:`` id, so no spore verb applies
+KEPT_SURFACE = "kept"             # the List's memory part: shown only to a search (the panel's ``hidden_unless_q``)
 GERMINATED_REF = "germinated into"   # a resolution ref germinate writes when an agenda woke into a band row
 DONE_PREFIX = "done:"             # a Done row's id: never a ``spore:`` id, so no spore verb applies to it
 
@@ -361,6 +364,30 @@ def _done_part(source: SubstrateSource, ctx: ReadContext) -> _Part:
     return out
 
 
+def _kept_part(source: SubstrateSource, ctx: ReadContext) -> _Part:
+    """The entity's own episodes as read-only ``kept`` rows (Phill 11-10 Q4): what the List's search reaches in memory. The
+    newest ``EPISODE_LIMIT`` of them, as the episodes panel reads; the panel drops them unless a query is supplied
+    (``ProviderSpec.hidden_unless_q``), so with no query they cost the page nothing. A Keep's own episode names itself."""
+    from levain.writes import KEEP_EPISODE_SOURCE
+
+    out = _Part()
+    view = _view(source, ctx)
+    bad = _view_fault(view, "episodes")
+    if bad:
+        out.skipped.append((1, f"kept memory could not be read ({bad.message})"))
+        return out
+    for e in view.episodes[:_prov.EPISODE_LIMIT]:
+        rid = KEPT_PREFIX + e.id
+        text = visible(e.content) or "(no text)"
+        line = (f"kept as memory: episode {e.id}" if e.source == KEEP_EPISODE_SOURCE
+                else f"memory: {e.type} episode {e.id}")
+        facets: dict[str, Any] = {"surface": KEPT_SURFACE, "kept_line": line, "kept_at": _prov._utc_at(e.timestamp),
+                                  "kept_type": visible(str(e.type)), "kept_source": visible(str(e.source))}
+        out.rows.append(RowIn(id=rid, title=text, body=text, facets=facets,
+                              stored=_stored(rid, text, "kept", "", None, "")))
+    return out
+
+
 def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext], Result]:
     seen = [False]       # the spore store has existed on a read: a later absence is named, never silent
 
@@ -369,13 +396,14 @@ def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext],
         ringing = frozenset(r.id[len("band:"):] for r in bd.rows if r.id.startswith("band:"))
         sp = _spore_part(source, ctx, seen, ringing=ringing)
         dn = _done_part(source, ctx) if not sp.fault else _Part()
+        kp = _kept_part(source, ctx)
         rows = [*bd.rows, *sp.rows]
-        skipped = [*sp.skipped, *bd.skipped, *dn.skipped]
+        skipped = [*sp.skipped, *bd.skipped, *dn.skipped, *kp.skipped]
         if sp.fault:
             if not rows and not sp.later:
                 return Fault(sp.fault)           # nothing else to show: a fault, never an empty look
             skipped.append((1, sp.fault))
-        return Read(rows=tuple([*rows, *sp.later, *dn.rows]), skipped=tuple(skipped), note=LIST_NOTE,
+        return Read(rows=tuple([*rows, *sp.later, *dn.rows, *kp.rows]), skipped=tuple(skipped), note=LIST_NOTE,
                     empty=spore_empty("tray", sp.entity))
     return read
 
@@ -418,4 +446,4 @@ def register_list(ck: Cockpit, source: SubstrateSource, spore_common: dict[str, 
         label_key=lambda stored: _prov.spore_label_key(stored),   # looked up at call time: a test (or a downstream) may replace it
         note=LIST_NOTE,
         empty=spore_empty("tray", _configured_entity_name(source)), absent_is_empty=True,
-        verbs=LIST_VERBS, facets=LIST_FACETS, **common))
+        verbs=LIST_VERBS, facets=LIST_FACETS, hidden_unless_q=("kept",), **common))

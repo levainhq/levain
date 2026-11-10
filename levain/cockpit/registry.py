@@ -170,7 +170,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
     # THE LIST (levain.cockpit.list_panel): one view over band + board + spores, each row labelled with its surface
-    "surface": ("enum", _enum("band", "board", "spore", "talk", "drop")),
+    "surface": ("enum", _enum("band", "board", "spore", "talk", "drop", "kept")),
     "fires": ("timed|null", _opt(_is_str)),      # a timed `next` (YYYY-MM-DDTHH:MM, local); null for a date-only or no `next`
     "overdue": ("bool", _is_bool),               # a timed next whose minute has passed, or a date-only next before today
     "target": ("str|null", _opt(_is_str)),       # an agenda's germinate target (desk, band, nudge, board:<repo>)
@@ -198,6 +198,10 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "wake_line": ("str", _is_str),
     "done_on": ("YYYY-MM-DD calendar date", _is_iso_day),
     "done_kind": ("str", _is_str),
+    "kept_line": ("str", _is_str),
+    "kept_at": ("str", _is_str),
+    "kept_type": ("str", _is_str),
+    "kept_source": ("str", _is_str),
 }
 
 
@@ -449,6 +453,8 @@ DONE_DAYS = 7                     # a resolved or composted List row stays in Do
 
 def _list_group(row: RowIn, today: date) -> str:
     s = row.facets.get("surface")
+    if s == "kept":                     # memory the search reached: below every List row, never a count
+        return "kept"
     if s == "band":
         # the desk's own rows are the desk's whether or not they carry a date (flow's footer files them under DESK OWES); a row of
         # the operator's that comes back on a later day is LATER; the rest is needs-you. A desk row the desk has carried past
@@ -478,6 +484,9 @@ def _int_or_big(v: Any) -> int:
 def _list_key(row: RowIn, today: date) -> tuple:
     f = row.facets
     s = f.get("surface")
+    if s == "kept":                         # newest first
+        at = f.get("kept_at") if isinstance(f.get("kept_at"), str) else ""
+        return (tuple(-ord(c) for c in at), row.id)
     if f.get("time_state") == "done":       # newest first
         d = parse_date(f.get("done_on"))
         return (-(d.toordinal() if d else 0), row.id)
@@ -507,8 +516,8 @@ register_ordering(
         (("band", "Needs you (answer it in Decisions)"), ("desk", "Desk owes (the desk is on these; nothing for you)"),
          ("later", "Later"), ("overdue", "Overdue"), ("today", "Today"),
          ("board", "Ready for agents"), ("talk", "To talk through"), ("also", "Also pending"),
-         ("someday", "Someday"), ("done", f"Done, last {DONE_DAYS} days")),
-        frozenset({"today", "overdue"}), frozenset({"desk", "later", "done"}),
+         ("someday", "Someday"), ("done", f"Done, last {DONE_DAYS} days"), ("kept", "Kept in memory")),
+        frozenset({"today", "overdue"}), frozenset({"desk", "later", "done", "kept"}),
     ),
     builtin=True,
 )

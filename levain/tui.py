@@ -122,7 +122,7 @@ _LIST_KINDS = frozenset({"spores", "tray", "episodes", "edits"})
 # drift would make the edits panel offer [u]ndo on a row the server would 400).
 _VERB_MEDIATED_KINDS = frozenset(
     {
-        "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone",
+        "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone", "spore_keep",
         # the Slice-3b operator-I/O kinds (capture / re-route / schedule / metadata
         # edit) — verb-mediated, anneal-owned reversibility, never file-undoable.
         "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update", "spore_retarget",

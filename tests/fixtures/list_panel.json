@@ -47,6 +47,10 @@
   "held_until",
   "intention",
   "intention_text",
+  "kept_at",
+  "kept_line",
+  "kept_source",
+  "kept_type",
   "last_seen",
   "list_pointer",
   "overdue",
@@ -116,6 +120,12 @@
    "count": 0,
    "id": "done",
    "title": "Done, last 7 days",
+   "uncounted": true
+  },
+  {
+   "count": 0,
+   "id": "kept",
+   "title": "Kept in memory",
    "uncounted": true
   }
  ],
@@ -282,6 +292,17 @@
      },
      "tier": "T2",
      "verb": "spore_ascend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-006",
+      "row_version": "e1c59b494abc5a5f"
+     },
+     "tier": "C1",
+     "verb": "spore_keep"
     }
    ],
    "badges": [
@@ -439,6 +460,17 @@
      },
      "tier": "T2",
      "verb": "spore_ascend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-007",
+      "row_version": "2f3bc747d27b450c"
+     },
+     "tier": "C1",
+     "verb": "spore_keep"
     }
    ],
    "badges": [
@@ -597,6 +629,17 @@
      },
      "tier": "T2",
      "verb": "spore_ascend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-004",
+      "row_version": "5dc423a44e9c2215"
+     },
+     "tier": "C1",
+     "verb": "spore_keep"
     }
    ],
    "badges": [
@@ -751,6 +794,17 @@
      },
      "tier": "T2",
      "verb": "spore_ascend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-005",
+      "row_version": "9fe894af9a4ee074"
+     },
+     "tier": "C1",
+     "verb": "spore_keep"
     }
    ],
    "badges": [
@@ -949,6 +1003,17 @@
      },
      "tier": "T2",
      "verb": "spore_ascend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-002",
+      "row_version": "26150bd4731b639a"
+     },
+     "tier": "C1",
+     "verb": "spore_keep"
     }
    ],
    "badges": [
@@ -1098,6 +1163,17 @@
      },
      "tier": "T2",
      "verb": "spore_ascend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-003",
+      "row_version": "f209b8ddc4ff360b"
+     },
+     "tier": "C1",
+     "verb": "spore_keep"
     }
    ],
    "badges": [
@@ -1247,6 +1323,17 @@
      },
      "tier": "T2",
      "verb": "spore_ascend"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-001",
+      "row_version": "a6b5b1ce8c837458"
+     },
+     "tier": "C1",
+     "verb": "spore_keep"
     }
    ],
    "badges": [

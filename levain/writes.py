@@ -728,6 +728,8 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_spore_verb(scope, req, now, "descend", guard)
         if kind == "spore_ascend":
             return _apply_spore_verb(scope, req, now, "ascend", guard)
+        if kind == "spore_keep":
+            return _apply_spore_keep(scope, req, now, guard)
         if kind == "spore_seed":
             if expected_version is not None:
                 raise EditError("bad_request", 400, "a new spore has no version to bind")
@@ -1596,7 +1598,7 @@ def _apply_entity_name(scope: WriteScope, req: dict[str, Any], now: str | None) 
 # spore fields — so undo routes through anneal/the verb, never a file restore).
 _VERB_KINDS = frozenset(
     {
-        "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone",
+        "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone", "spore_keep",
         # Slice 3b — the operator-I/O write kinds (capture + disposition + schedule +
         # the forming-workbench metadata edit: text / reclassify-type / re-tier):
         "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update", "spore_retarget",
@@ -1944,6 +1946,89 @@ def _apply_spore_verb(
         target=f"spore:{spore_id}", now=now, extra=extra,
     )
     return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}", "action": verb}
+
+
+# the episode a Keep writes: its source label (never caller-chosen) and its tag
+KEEP_EPISODE_SOURCE = "levain-list-keep"
+KEEP_EPISODE_TAG = "list-keep"
+
+
+def keep_origin_key(spore: Mapping[str, Any]) -> str:
+    """The episode key of a Keep of ``spore``: the spore's own ``origin_key`` (store-assigned once), else its id for a
+    legacy row that has none. One spore, one key, so a retry of the Keep lands one episode (Q2, Phill 11-10)."""
+    ok = spore.get("origin_key")
+    return "keep:" + (ok if isinstance(ok, str) and ok else f"id:{spore.get('id')}")
+
+
+def keep_episode_body(spore: Mapping[str, Any]) -> str:
+    """The spore's words verbatim, then a source tag naming the spore (Q2)."""
+    return f"{spore.get('text')}\n\n[kept from the List: {spore.get('id')}]"
+
+
+def _keep_compost(store: Any, spore_id: str, expect: Any, guard: "_VersionGuard | None") -> None:
+    """The second act of a Keep: compost the spore. Its own seam so a test can fail it after the episode landed."""
+    kwargs: dict[str, Any] = {"kind": "composted"}
+    if expect is not _NO_CAS:
+        kwargs["expect_disposition"] = expect
+    store.descend(spore_id, **kwargs, **_guard_kwargs(guard))
+
+
+def _apply_spore_keep(
+    scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None,
+) -> dict[str, Any]:
+    """``spore_keep`` (THE LIST's Keep, Phill 11-10 row 182): a thing to REMEMBER moves from the List to memory. Two acts in
+    a fixed order, tier C1: (1) an anneal ``observation`` episode, the spore's words verbatim plus a source tag, keyed on the
+    spore's origin key so a retry lands exactly once; THEN (2) the spore is composted. A crash between them leaves the spore
+    OPEN with its episode written, and the retry lands no second episode (the key). A refusal ahead of act 1 (a stale row,
+    a ringing agenda) writes nothing."""
+    from anneal_memory import AnnealMemoryError, Store
+    from anneal_memory.spores import SporeError
+    from anneal_memory.store import OriginKeyConflict
+
+    spore_id = _require_str(req, "spore_id")
+    paths = scope.anneal
+    if not paths.spores_json.is_file():
+        raise EditError("not_found", 404, "no spore store yet: the entity has no open loops")
+    store = guarded_spore_store(paths.spores_json)
+    _refuse_if_ringing(scope, store, spore_id)
+    spore = store.get(spore_id)
+    if not isinstance(spore, dict) or spore.get("status") == "resolved":
+        raise EditError("stale", 409, "the item was resolved or removed since it was read")
+    text = spore.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise EditError("bad_verb_arg", 422, "a Keep needs the item's words: this one has none")
+    expect = _client_snapshot(req, spore, spore_id)          # a moved row is stale, ahead of any write
+    if guard is not None and guard.expected is not None:     # the version the operator saw, checked before act 1
+        try:
+            guard.version_of(spore)
+        except SporeError as exc:
+            raise _spore_refusal(guard, exc, store, spore_id) from exc
+        if guard.found != guard.expected:
+            raise EditError("stale", 409, "the item changed since it was read; re-read it and retry")
+    key = keep_origin_key(spore)
+    try:
+        with Store(str(paths.episodic_db), read_only=False) as st:
+            ep = st.record(
+                content=keep_episode_body(spore), episode_type="observation", source=KEEP_EPISODE_SOURCE,
+                metadata={"tags": [KEEP_EPISODE_TAG], "spore": spore_id}, origin_key=key)
+    except OriginKeyConflict as exc:   # an earlier, crashed Keep landed this item's episode under other words
+        raise EditError("keep_conflict", 409, f"this item was already kept once, under different words: {exc}") from exc
+    except AnnealMemoryError as exc:
+        raise EditError("verb_failed", 422, f"the episode could not be written: {exc}") from exc
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"episodic store unavailable: {exc}") from exc
+    try:
+        _keep_compost(store, spore_id, expect, guard)
+    except SporeError as exc:
+        raise _spore_refusal(guard, exc, store, spore_id, expect) from exc
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+    edit_id = _audit_verb(
+        scope.ledger_root, kind="spore_keep", action="keep", target=f"spore:{spore_id}", now=now,
+        extra={"episode_id": ep.id, "origin_key": key},
+    )
+    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}", "action": "keep", "episode_id": ep.id,
+            "receipt_line": f"kept as memory: episode {ep.id}"}
 
 
 # --- Slice 3b: the Tray operator-I/O write kinds -----------------------------

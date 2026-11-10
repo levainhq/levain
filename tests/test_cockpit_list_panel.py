@@ -121,7 +121,7 @@ def test_the_three_stores_are_one_panel_titled_list_and_each_row_names_its_surfa
     assert sorted(by_surface["talk"]) == sorted(f"spore:{rig.ids[k]}" for k in ("talk_old", "talk_new"))
     assert sorted(by_surface["drop"]) == sorted(f"spore:{rig.ids[k]}" for k in ("drop_late", "drop_soon", "drop_later"))
     assert f"spore:{rig.ids['loop']}" not in {r["id"] for r in p["rows"]}            # Open loops stays machine-side
-    assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also", "someday", "done"]
+    assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also", "someday", "done", "kept"]
     assert p["note"] == list_panel.LIST_NOTE
 
 
