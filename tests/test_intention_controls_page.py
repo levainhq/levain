@@ -199,3 +199,33 @@ def test_a_snooze_form_carries_no_who_control(tmp_path: Path, lh: Path) -> None:
             {"eval": probe}))
     seen = _probe(out)
     assert seen["form"] and seen["who"] == 0, seen
+
+
+@needs_browser
+def test_a_timed_snooze_to_today_is_posted_and_the_host_judges_the_minute(tmp_path: Path, lh: Path) -> None:
+    """Row 184: a date-only snooze to today is refused in the page (nothing sent); the same day with a time is sent to the host,
+    which judges the minute (00:00 is never after now, so it refuses and the row stays open)."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    today = "(() => { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); })()"
+    fill = (RING + ".querySelector('input[type=date]').value = " + today + "; " + RING
+            + ".querySelector('input[type=date]').dispatchEvent(new Event('input')); ")
+    set_time = (RING + ".querySelector('.verb-time').value = '00:00'; " + RING
+                + ".querySelector('.verb-time').dispatchEvent(new Event('input')); ")
+    click = RING + ".querySelector('.verb-confirm').click(); 1"
+    msg = "(" + RING + ".querySelector('.edit-msg') || {}).textContent"
+    probe = "JSON.stringify({msg: " + msg + ", form: " + RING + ".parentElement.textContent, probe: 1})"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(
+            DESKTOP, {"do": _tap("intention_snooze"), "until": RING + ".querySelector('input[type=date]') && 1", "ms": 10000},
+            {"do": fill + click, "until": msg + ".length > 0 && 1", "ms": 10000},
+            {"eval": probe}))
+        first_posts = [p for p in out["posts"] if "intention_snooze" in p]
+        out2 = _drive(tmp_path, f"{url}/#write_token=T", _steps(
+            DESKTOP, {"do": _tap("intention_snooze"), "until": RING + ".querySelector('input[type=date]') && 1", "ms": 10000},
+            {"do": fill + set_time + click, "until": "1", "ms": 1000},          # one tap: a repeated action would re-set the busy mark
+            {"ms": 3000, "until": "1"},
+            {"eval": probe}))
+    assert _probe(out)["msg"] == "pick a later day" and not first_posts, (out["values"], out["posts"])
+    sent = [x for x in out2["posts"] if "intention_snooze" in x]
+    assert len(sent) == 1 and "T00:00" in sent[0], sent        # the timed pick to today went to the host; the host decides the minute
+    assert store.get(ring.id).answer is None and sp.get(sid)["germinated"]      # 00:00 is never after now: the host refused it

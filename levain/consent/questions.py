@@ -248,10 +248,11 @@ class IntentionStale(ConsentError):
     stale = True
 
 
-def until_refusal(until: Any, today: str | None = None) -> str | None:
+def until_refusal(until: Any, today: str | None = None, now: datetime | None = None) -> str | None:
     """The one check of where a snooze sends an intention, in the words the operator reads: ``until`` is a real
-    ``YYYY-MM-DD`` or ``YYYY-MM-DDTHH:MM``, and when ``today`` (local ``YYYY-MM-DD``) is given, a day after it. None = it
-    may be set."""
+    ``YYYY-MM-DD`` or ``YYYY-MM-DDTHH:MM``, and when ``today`` (local ``YYYY-MM-DD``) is given, a day after it. Given the
+    aware instant ``now`` instead, a date-only ``until`` must still be after the local day, while a timed one is judged to
+    the minute against the local wall minute: a later minute today passes. None = it may be set."""
     ok = False
     if isinstance(until, str):
         if valid_date(until):
@@ -264,6 +265,10 @@ def until_refusal(until: Any, today: str | None = None) -> str | None:
                 ok = False
     if not ok:
         return "pick a day: that date could not be read"
+    if now is not None:
+        today = local_today(now)
+        if len(until) > 10 and until[:10] == today:
+            return "pick a time after now" if until <= local_minute(now) else None
     if today is not None and until[:10] <= today:
         return "pick a later day"
     return None
@@ -416,6 +421,11 @@ def local_today(now: datetime) -> str:
     """The operator's LOCAL date of the aware instant ``now``, ``YYYY-MM-DD``: the day a snooze and the band's LATER
     line are judged against (flow's footer: ``date.fromtimestamp(ts)``, the machine's local date)."""
     return now.astimezone().date().isoformat()
+
+
+def local_minute(now: datetime) -> str:
+    """The operator's LOCAL wall minute of the aware instant ``now``, ``YYYY-MM-DDTHH:MM``: what a timed snooze is judged against."""
+    return now.astimezone().strftime("%Y-%m-%dT%H:%M")
 
 
 def later_date(row: Any, today: str) -> str | None:
@@ -1078,7 +1088,7 @@ class QuestionStore:
         if sid is None or path is None:
             raise IntentionStale(f"question #{q.n} rings no open intention now: answer it as before")
         if action == "snooze":
-            refused = until_refusal(until, local_today(_now_utc(self._clock)))
+            refused = until_refusal(until, now=_now_utc(self._clock))
             if refused:
                 raise ConsentError(refused)
         elif action == "edit" and not (isinstance(text, str) and text.strip()):
