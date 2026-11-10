@@ -1791,6 +1791,18 @@ body.ke .needs-rec { font-size: var(--fs-meta); color: var(--text); overflow-wra
 body.ke .needs-rec-tag { font: var(--fw-bold) var(--fs-micro)/1 var(--mono); letter-spacing: .08em; color: var(--accent); margin-right: var(--sp-1); }
 body.ke .needs-card .question-words { max-width: none; }
 body.ke .needs-card .question-send { align-self: flex-start; }
+/* the card's action rows are one system at every width (row 185): a bright bordered text button is 38 px tall like the choices, and
+   "send words" sits with the 44 px voice icons at their height; Play shares the "asked" line instead of owning a row of its own */
+body.ke .needs-card .question-send { min-height: var(--hit-min); padding: 0 var(--sp-5); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); color: var(--text); border-color: var(--label); background: none; }
+body.ke .needs-card .question-send:hover:not(:disabled) { border-color: var(--text); background: var(--card-2); }
+body.ke .needs-card .sign-sheet-open { min-height: 38px; font: var(--fw-semibold) var(--fs-meta)/1.3 var(--sans); color: var(--text); border-color: var(--label); padding: var(--sp-2) var(--sp-4); }
+body.ke .needs-card .sign-sheet-open:hover { border-color: var(--text); background: var(--card-2); }
+body.ke .needs-card .intention-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)); gap: var(--sp-2); width: 100%; margin-left: 0; }
+body.ke .needs-card .intention-actions .verb-btn { min-height: 38px; height: auto; font-weight: var(--fw-semibold); color: var(--text); border: 1px solid var(--label); padding: var(--sp-2) var(--sp-4); text-align: center; }
+body.ke .needs-card .intention-actions .verb-btn:hover { border-color: var(--text); background: var(--card-2); }
+body.ke .needs-card .intention-actions > :not(.verb-btn) { grid-column: 1 / -1; margin-left: 0; }   /* a snooze/edit form or its result takes the whole row, left-aligned */
+body.ke .needs-head > .card-voice { display: flex; align-items: center; gap: var(--sp-3); margin-left: auto; }
+body.ke .needs-head > .card-voice .voice-say { order: -1; }
 body.ke .needs-phone { font-size: var(--fs-meta); }
 body.ke .needs-card.is-full { gap: var(--sp-4); border: 0; box-shadow: none; padding: var(--sp-6) var(--sp-6) var(--sp-6); background: none; max-width: none; }
 body.ke .needs-card.is-full .needs-head { justify-content: space-between; }
