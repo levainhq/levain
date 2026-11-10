@@ -308,7 +308,7 @@ class TestWatcherToken:
             time.sleep(0.6)
         finally:
             w.stop()
-        assert feed.reads <= 8      # 0.6 s of 50 ms builds each followed by a 100 ms wait: about 4, never ~12
+        assert 2 <= feed.reads <= 10    # 0.6 s of 50 ms builds each followed by a 100 ms wait: about 4, never ~12
 
 
 class TestServerWatchToken:
@@ -316,9 +316,10 @@ class TestServerWatchToken:
         root, src = _install(tmp_path)
         httpd = make_server(src, host="127.0.0.1", port=0)
         try:
+            httpd.get_cockpit().manifest({"class": "none", "device_class": None})      # the first read makes its files
             a = httpd._watch_token()
             assert a is not None and httpd._watch_token() == a
-            httpd.get_cockpit().manifest({"class": "none", "device_class": None})      # a read moves nothing
+            httpd.get_cockpit().manifest({"class": "none", "device_class": None})      # a read after that moves nothing
             assert httpd._watch_token() == a
             (root / ".levain" / "memory.spores.json").write_text('{"spores": []}')
             b = httpd._watch_token()
@@ -731,3 +732,107 @@ class TestHttp:
         finally:
             a.server_close()
             b.server_close()
+
+
+class TestWatchTokenSettles:
+    def test_the_token_settles_after_a_build_reads_stores_that_hold_data(self, tmp_path: Path) -> None:
+        root, src = _install(tmp_path)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        try:
+            import sqlite3
+            for i in range(3):
+                httpd.question_store.file(agent="claude_code", agent_session_id=f"s{i}", what=f"q{i}", options=[
+                    {"key": "a", "label": "yes"}, {"key": "b", "label": "no"}], rec="a", blocks="x", cwd=str(root))
+            db = sqlite3.connect(str(src.anneal.episodic_db))
+            db.execute("create table if not exists t(x)")
+            db.execute("insert into t values (1)")
+            db.commit()
+            db.close()
+            seen = []
+            for _ in range(4):
+                httpd.get_cockpit().manifest({"class": "none", "device_class": None})
+                seen.append(httpd._watch_token())
+            assert seen[1] == seen[2] == seen[3], "the token keeps moving on the watcher's own reads"
+        finally:
+            httpd.server_close()
+
+    def test_a_token_that_raises_logs_once_per_run(self, caplog: Any) -> None:
+        feed = _Feed(a="1")
+
+        def boom() -> Any:
+            raise OSError("gone")
+        w = stream.Watcher(feed, epoch="E", watch_s=0.02, token=boom, token_s=0.005, backstop_s=3600)
+        with caplog.at_level("ERROR", logger="levain.cockpit.stream"):
+            w.subscribe(None)
+            try:
+                base = feed.reads
+                assert _until(lambda: feed.reads >= base + 3)
+            finally:
+                w.stop()
+        assert len([r for r in caplog.records if "change token" in r.getMessage()]) == 1
+
+
+class TestServerTokenInputs:
+    def test_a_store_outside_the_anneal_dir_and_the_context_file_move_the_token(self, tmp_path: Path) -> None:
+        import dataclasses
+        root, src = _install(tmp_path)
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        ctx = tmp_path / "ctx" / "context.json"
+        ctx.parent.mkdir()
+        ctx.write_text("{}")
+        src2 = dataclasses.replace(src, anneal=dataclasses.replace(src.anneal, spores_json=other / "s.json"),
+                                   context_json=ctx)
+        (other / "s.json").write_text("[]")
+        httpd = make_server(src2, host="127.0.0.1", port=0)
+        try:
+            a = httpd._watch_token()
+            (other / "s.json").write_text('["moved"]')
+            b = httpd._watch_token()
+            assert b != a
+            ctx.write_text('{"state": "moved"}')
+            assert httpd._watch_token() != b
+        finally:
+            httpd.server_close()
+
+    def test_a_directory_past_the_cap_makes_the_token_unknown_and_shm_files_do_not_count(self, tmp_path: Path) -> None:
+        from levain import web_server
+        root, src = _install(tmp_path)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        d = root / ".levain"
+        try:
+            for i in range(web_server._WATCH_ENTRIES_MAX + 5):
+                (d / f"x{i}.db-shm").write_text("")
+            assert httpd._watch_token() is not None     # shm files do not use the cap
+            for i in range(web_server._WATCH_ENTRIES_MAX + 5):
+                (d / f"y{i}.txt").write_text("")
+            assert httpd._watch_token() is None         # never a partial token
+        finally:
+            httpd.server_close()
+
+    def test_an_install_root_working_tree_is_not_scanned_and_a_missing_dir_is_one_stable_entry(self, tmp_path: Path) -> None:
+        root, src = _install(tmp_path)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        try:
+            a = httpd._watch_token()
+            (root / "unrelated.txt").write_text("x")        # a repo file no panel reads
+            assert httpd._watch_token() == a
+            assert a is not None        # seed/ and activation/ may be absent: still a token
+        finally:
+            httpd.server_close()
+
+    def test_an_invalid_watch_path_refuses_before_the_port_is_bound(self, tmp_path: Path) -> None:
+        import socket
+        _root, src = _install(tmp_path)
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        try:
+            make_server(src, host="127.0.0.1", port=port, watch_paths=[object()])      # type: ignore[list-item]
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("an invalid watch path was accepted")
+        httpd = make_server(src, host="127.0.0.1", port=port)       # the port was never taken
+        httpd.server_close()

@@ -78,6 +78,7 @@ class Watcher:
                  backstop_s: float = DEFAULT_BACKSTOP_S) -> None:
         self._read_manifest = read_manifest
         self._token = token
+        self._token_failed = False
         self.token_s = token_s
         self.backstop_s = backstop_s
         self._base_epoch = epoch
@@ -115,7 +116,9 @@ class Watcher:
         try:
             return self._token()
         except Exception:   # noqa: BLE001 - an unreadable token is an unknown one, never a missed change
-            log.exception("cockpit watcher: the change token could not be read")
+            if not self._token_failed:      # once per run, not once per look
+                self._token_failed = True
+                log.exception("cockpit watcher: the change token could not be read (the slow tick builds instead)")
             return None
 
     # ---- subscribe / unsubscribe -------------------------------------------------
@@ -162,6 +165,7 @@ class Watcher:
         self._epoch = f"{self._base_epoch}.{self._gen}"
         self._seq = 0
         self._ring.clear()
+        self._token_failed = False
         tok = self._token_now()     # before the baseline: a change landing between them is seen as one next look
         try:
             self._etags = self._read()

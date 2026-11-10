@@ -2110,51 +2110,69 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # A server given a cockpit or extra panels of its own has no token until it names them here, because the kernel
     # cannot see what those panels read (no token: the watcher builds the manifest on every slow tick).
     watch_paths: "tuple[Path, ...]" = ()
-    cockpit_downstream: bool = False
+    default_cockpit: "Cockpit | None" = None      # the cockpit this server built itself; any other one is a downstream's
 
     def _watch_token(self) -> "tuple | None":
-        """A cheap fingerprint of the stores the panels read (name, mtime and size of every file in each watched
-        directory, the names of its subdirectories, and each watched file), or None when the stores cannot all be
-        named. It is looked at often; a moved token makes the watcher build the manifest, so it only has to move
-        when a store does. What it cannot see (a file inside a subdirectory, the clock, in-memory state) reaches the
-        page on the watcher's backstop build."""
-        if (self.cockpit_downstream or self.extra_panels is not None) and not self.watch_paths:
+        """A cheap fingerprint of the stores the panels read, or None when it cannot be taken whole (the watcher then
+        builds on its slow tick). Each named store file contributes ``(mtime_ns, size)``; each watched directory
+        contributes its files the same way and its subdirectories by name. SQLite's ``-shm`` and ``-journal`` files are
+        left out (they move on a read), and a ``-wal`` file by size only. Cost per call: one stat per named file, plus
+        one scandir per watched directory (the install's ``.levain``, ``seed``, ``activation``, the ledger, consent and
+        sign queue dirs, and any ``watch_paths`` directory), each capped at ``_WATCH_ENTRIES_MAX`` entries: a directory
+        past the cap makes the whole token unknown. A file inside a subdirectory, the clock and in-memory state reach
+        the page on the watcher's backstop build."""
+        downstream = self.cockpit is not None and self.cockpit is not self.default_cockpit
+        if (downstream or self.extra_panels is not None) and not self.watch_paths:
             return None
         src = self.levain_source
-        roots: list[Path] = [src.anneal.episodic_db.parent]
+        a = src.anneal
+        files: list[Path] = [a.episodic_db, a.continuity_md, a.crystal_json, a.spores_json]
+        if src.context_json is not None:
+            files.append(Path(src.context_json))
+        dirs: list[Path] = []
         if src.install_root is not None:
             root = Path(src.install_root)
-            roots += [root, root / ".levain", root / "seed", root / "activation"]
+            dirs += [root / ".levain", root / "seed", root / "activation"]
         if src.write_scope is not None:
-            roots.append(Path(src.write_scope.ledger_root))
+            dirs.append(Path(src.write_scope.ledger_root))
         reader = getattr(self, "consent_reader", None)
         if reader is not None:
             from levain.consent.queue import default_queue_dir
 
             d = getattr(reader, "directory", None)
-            roots.append(Path(d if d is not None else default_queue_dir()))
+            dirs.append(Path(d if d is not None else default_queue_dir()))
         if self.signer is not None:
-            roots.append(Path(self.signer.queue_dir))
-        roots += [Path(p) for p in self.watch_paths]
+            dirs.append(Path(self.signer.queue_dir))
+        for w in self.watch_paths:
+            (dirs if w.is_dir() else files).append(w)
         out: list[Any] = []
         seen: set[str] = set()
-        for r in roots:
+        for f in files:
+            if str(f) not in seen:
+                seen.add(str(f))
+                out.append((str(f), _stat_sig(f)))
+                out.append((str(f) + "-wal", _stat_sig(Path(str(f) + "-wal"), size_only=True)))
+        for r in dirs:
             key = str(r)
             if key in seen:
                 continue
             seen.add(key)
-            if not r.is_dir():
-                out.append((key, _stat_sig(r)))
-                continue
             try:
+                n = 0
                 with os.scandir(r) as it:
-                    for _, e in zip(range(_WATCH_ENTRIES_MAX), it):
-                        if e.name.endswith("-shm"):
-                            continue        # a reader's own shared-memory index: it moves on every read
-                        # a subdirectory is its name only: its own mtime moves with every temp file made in it
-                        out.append((key + "/" + e.name, None if e.is_dir() else _stat_sig(e.path)))
+                    for e in it:
+                        if e.name.endswith(("-shm", "-journal")):
+                            continue        # not counted against the cap: a reader's own files
+                        n += 1
+                        if n > _WATCH_ENTRIES_MAX:
+                            return None
+                        if e.name.endswith("-wal"):
+                            out.append((key + "/" + e.name, _stat_sig(e.path, size_only=True)))
+                        else:
+                            # a subdirectory is its name only: its own mtime moves with every temp file made in it
+                            out.append((key + "/" + e.name, None if e.is_dir() else _stat_sig(e.path)))
             except OSError:
-                out.append((key, "unreadable"))
+                out.append((key, "unreadable"))     # a missing or unreadable directory is one stable entry
         return tuple(out)
 
     _cockpit_lock = threading.Lock()
@@ -2187,6 +2205,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 except BaseException:
                     built.stop()    # a half-started cockpit must not leave refreshers running
                     raise
+                self.default_cockpit = built
                 self.cockpit = built   # published only once started: a failed start retries next request
             cockpit = self.cockpit
             # identical concurrent reads share one compute: on the kernel's own cockpit AND on one a downstream passed
@@ -5662,16 +5681,17 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
                       httpd.verb_registry, httpd.get_cockpit(), verb, dict(params), dict(target)))
 
 
-_WATCH_ENTRIES_MAX = 2000   # entries read per watched directory by the change token
+_WATCH_ENTRIES_MAX = 500    # entries read per watched directory by the change token; past it the token is unknown
 
 
-def _stat_sig(path: Any) -> "tuple[int, int] | None":
-    """``(mtime_ns, size)`` of one path, None when it does not exist (its appearing moves the token)."""
+def _stat_sig(path: Any, size_only: bool = False) -> "tuple[int, int] | None":
+    """``(mtime_ns, size)`` of one path (the size alone when ``size_only``), None when it does not exist (its
+    appearing moves the token)."""
     try:
         st = os.stat(path)
     except OSError:
         return None
-    return st.st_mtime_ns, st.st_size
+    return (0 if size_only else st.st_mtime_ns), st.st_size
 
 
 def make_server(
@@ -6080,6 +6100,7 @@ def make_server(
         from levain.cockpit.room import host_from
 
         chat_service, room_host = room_serve.service, host_from(room_serve)
+    watch_tuple = tuple(Path(p) for p in watch_paths or ())     # validated before the socket is bound
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     assets[_SHEET_PAGE] = load_web_asset(_SHEET_PAGE).encode("utf-8")
     # The one derivation point of the shell asset versions: digests of the bytes just loaded (the bytes served), written
@@ -6090,6 +6111,7 @@ def make_server(
     _assert_shell_versioned(_shell_page, _shell_digests)
     assets[_shell_file] = _shell_page.encode("utf-8")
     httpd = _LevainHTTPServer((host, port), _Handler)
+    httpd.watch_paths = watch_tuple
     httpd.levain_source = source
     httpd.levain_assets = assets
     httpd.levain_shell_digests = _shell_digests
@@ -6108,8 +6130,6 @@ def make_server(
     # Its start() (refresher threads) is the caller's when it passes its own. Nothing is attached to it
     # until every refusal below has passed and the Signer is pinned.
     httpd.cockpit = cockpit
-    httpd.cockpit_downstream = cockpit is not None
-    httpd.watch_paths = tuple(Path(p) for p in watch_paths or ())
     httpd.work_board = work_board
     httpd.threads = threads is not False
     httpd.chat_service = chat_service
