@@ -360,6 +360,7 @@
     "no-speech": "No speech was heard; tap Dictate and try again.",
     "aborted": "Dictation was interrupted.",
     "bad-grammar": "Dictation could not use its settings.",
+    "phrases-not-supported": "Dictation could not use its hint phrases in this browser.",
     "start": "Dictation could not start; tap Dictate again.",
   };
   function dictateReason(name) { return Object.prototype.hasOwnProperty.call(DICTATE_REASONS, name) ? DICTATE_REASONS[name] : "Dictation stopped" + (typeof name === "string" && /^[a-z-]{1,40}$/.test(name) ? " (" + name + ")." : "."); }
@@ -464,7 +465,7 @@
         r.onend = function () { if (rec === r) finishDict(); };
         r.onerror = function (ev) { if (rec === r) { finishDict(); say(dictateReason(ev && ev.error)); } };
         begin(); rec = r; ending = false; face(db, "dictate-stop");
-        try { r.start(); } catch (e) { finishDict(); say(dictateReason("start")); }
+        try { r.start(); } catch (e) { try { r.abort(); } catch (_) {} finishDict(); say(dictateReason("start")); }
       });
       var leave = function () { if (detached()) { off(); return; } if (doc.visibilityState === "hidden") abortDict(); };
       doc.addEventListener("visibilitychange", leave);
