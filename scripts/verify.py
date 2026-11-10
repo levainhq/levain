@@ -431,8 +431,10 @@ def recorded_short_tmp(run: Path) -> Path | None:
 def remove_tree(path) -> None:
     """Delete a directory tree with no recursion and no path-length limit, ignoring per-entry OSError (the behaviour of
     shutil.rmtree(ignore_errors=True), minus its depth ceiling).  One directory fd is open at a time; symlinks are
-    unlinked, never followed.  It removes what it can and never leaves the tree: each level's (dev, ino) is recorded
-    on the way down and every ascent must land on the recorded parent, else the walk stops where it is."""
+    unlinked, never followed.  It removes what it can: each level's (dev, ino) is recorded on the way down and every
+    ascent must land on the recorded parent, else the walk stops where it is.  Known edge: the check holds against a
+    rename mid-walk, not against a writer who also recycles an inode number (a tree this helper is given is one only
+    this run writes to)."""
     path = os.fspath(path)
     try:
         if not stat.S_ISDIR(os.lstat(path).st_mode):
