@@ -151,6 +151,28 @@ def test_snooze_names_when_it_comes_back_refuses_today_and_clear_quotes_the_remi
 
 
 @needs_browser
+def test_a_timed_snooze_reads_back_its_minute_not_the_date_alone(tmp_path: Path, lh: Path) -> None:
+    """Diogenes c4e1124a: a timed pick (a date plus the time field) names the minute in the read-back; a date-only pick
+    does not. The day is far ahead so the test never meets the wall clock."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    q = RING + ".querySelector('input[type=date]')"
+    set_day = q + ".value = '2030-01-05'; " + q + ".dispatchEvent(new Event('input')); 1"
+    t = RING + ".querySelector('input[type=time]')"
+    set_time = t + ".value = '09:30'; " + t + ".dispatchEvent(new Event('input')); 1"
+    probe = "JSON.stringify({back: (" + RING + ".querySelector('.intention-back') || {}).textContent, probe: 1})"
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(
+            DESKTOP, {"do": _tap("intention_snooze"), "until": q + " && 1", "ms": 10000},
+            {"do": set_day, "until": "(" + RING + ".querySelector('.intention-back') || {}).textContent.length > 0 && 1", "ms": 10000},
+            {"eval": probe},
+            {"do": set_time, "until": "/ at 09:30$/.test((" + RING + ".querySelector('.intention-back') || {}).textContent || '') && 1", "ms": 10000},
+            {"eval": probe}))
+    vals = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"probe"' in v]
+    assert vals[0]["back"].startswith("comes back ") and " at " not in vals[0]["back"] and "2030" not in vals[0]["back"], vals[0]
+    assert vals[1]["back"].endswith(" at 09:30"), vals[1]
+
+
+@needs_browser
 def test_on_a_phone_each_reminder_control_is_a_44px_target(tmp_path: Path, lh: Path) -> None:
     """U4: at phone width the reminder row's controls meet a 44px tap target; other verb buttons keep their look."""
     src, store, sp, sid, ring = _rig(tmp_path, lh)
