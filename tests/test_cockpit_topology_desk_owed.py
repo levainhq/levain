@@ -33,3 +33,16 @@ def test_graph_waiting_count_equals_needs_count(tmp_path) -> None:
     assert needs == 4
     assert len(tasks) == needs
     assert sorted(t["card"] for t in tasks) == ["question:1", "question:2", "question:20", "question:3"]
+
+
+class _PastStore(_Store):
+    def recent(self, limit):
+        return self.qs
+
+
+def test_the_past_read_never_hides_a_row_by_its_current_desk_flag() -> None:
+    """The section/carried flag carries no stamp of when it was set, so a replay at T fails open: a row the desk owes NOW
+    was filed and unanswered at T and still shows waiting."""
+    store = _PastStore([_q(1, "you", False), _q(2, "desk", False)])
+    at = datetime(2026, 11, 10, 13, 0, tzinfo=timezone.utc)
+    assert [q.n for q in T._questions_at(store, at)] == [1, 2]
