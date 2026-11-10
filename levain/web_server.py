@@ -1595,6 +1595,28 @@ def _static_entry(body: bytes) -> tuple[str, str, bytes]:
     return etag, gz_etag, gz
 
 
+# A cockpit JSON read (manifest, panel) is compressed per response when the client accepts gzip and the body is big
+# enough to repay it; a smaller body, an error and a 304 go out as they are. Level 5 keeps a 670 KB panel in the
+# tens of milliseconds, since this runs on every read and not once per server life like the static assets.
+COCKPIT_GZIP_MIN_BYTES = 1024
+COCKPIT_GZIP_LEVEL = 5
+
+
+def _gzip_cockpit(status: int, body: bytes, hdrs: "list[tuple[str, str]]", accept_encoding: str | None,
+                  ) -> "tuple[bytes, list[tuple[str, str]]]":
+    """``(body, headers)`` for a cockpit JSON answer: gzip with ``Content-Encoding`` when a 200 body is at least
+    ``COCKPIT_GZIP_MIN_BYTES`` and the client accepts gzip. Every answer names ``Accept-Encoding`` in ``Vary`` (the
+    representation depends on it), appended to the credential header the route already varies on. Content-Length is
+    set by ``_send`` from the body returned here."""
+    out = [(n, v) for n, v in hdrs if n.lower() != "vary"]
+    vary = ", ".join([v for n, v in hdrs if n.lower() == "vary"] + ["Accept-Encoding"])
+    out.append(("Vary", vary))
+    if status == 200 and len(body) >= COCKPIT_GZIP_MIN_BYTES and _accepts_gzip(accept_encoding):
+        body = gzip.compress(body, compresslevel=COCKPIT_GZIP_LEVEL, mtime=0)
+        out.append(("Content-Encoding", "gzip"))
+    return body, out
+
+
 def _etag_matches(if_none_match: str | None, *etags: str) -> bool:
     if not if_none_match:
         return False
@@ -4905,6 +4927,7 @@ class _Handler(GuardedHandler):
                     body = json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8")
                 finally:
                     self._release_read_slot()
+                body, hdrs = _gzip_cockpit(status, body, hdrs, self.headers.get("Accept-Encoding"))
                 try:
                     self._send(body, "application/json; charset=utf-8", status=status, head=head,
                                headers=hdrs, cache_control=COCKPIT_CACHE_CONTROL)
