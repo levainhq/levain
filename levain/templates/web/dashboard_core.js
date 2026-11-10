@@ -3517,11 +3517,16 @@
   const pad2 = (n) => String(n).padStart(2, "0");
   const dayOf = (d) => d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
   const minuteOf = (d) => dayOf(d) + "T" + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
-  // the quick picks, from a clock: later today (+3 h), tonight 20:00 (offered only while it is still ahead), tomorrow 09:00, next Monday 09:00
+  // the quick picks, from a clock: later today (+3 h, clamped to today), tonight 20:00 (offered only while it is still ahead), tomorrow 09:00, next Monday 09:00
   function whenPicks(now) {
     const day = (n) => new Date(now.getFullYear(), now.getMonth(), now.getDate() + n);
     const at = (d, h) => minuteOf(new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, 0));
-    const picks = [{ key: "later", label: "Later today", value: minuteOf(new Date(now.getTime() + 3 * 3600000)) }];
+    const picks = [];
+    // later today is +3 h but never past 23:59 today (a pick under a "today" label never writes tomorrow), and gone once under an hour of today is left
+    if (now.getHours() < 23) {
+      const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59);
+      picks.push({ key: "later", label: "Later today", value: minuteOf(new Date(Math.min(now.getTime() + 3 * 3600000, endOfDay.getTime()))) });
+    }
     if (now.getHours() < 20) picks.push({ key: "tonight", label: "Tonight 20:00", value: at(day(0), 20) });
     picks.push({ key: "tomorrow", label: "Tomorrow 09:00", value: at(day(1), 9) });
     picks.push({ key: "monday", label: "Next Mon 09:00", value: at(day(((8 - now.getDay()) % 7) || 7), 9) });
@@ -3572,7 +3577,10 @@
     if (agenda) clearBtn.hidden = true;
     form.append(picksBox, input, timeIn, ...(who.node ? [who.node] : []), go, clearBtn, cancel, msg);
     host.appendChild(form);
-    input.focus();
+    // a touch screen's keyboard opens on a focused date input and covers the form: focus it only where a pointer, not a thumb, drives
+    if (!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches)) input.focus();
+    // the card clips what overflows it: bring the confirm row into the card's view
+    go.scrollIntoView({ block: "nearest" });
     const close = () => { form.remove(); triggers.forEach((b) => (b.style.display = "")); };
     cancel.addEventListener("click", close);
     form.addEventListener("keydown", (ev) => {

@@ -1243,3 +1243,92 @@ def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_
     posts = [(p["verb"], p["params"]) for p in _posts(out)]
     assert ("spore_retarget", {"target": "desk", "surface_at": monday.isoformat() + "T09:00"}) in posts, posts
     assert ("spore_retarget", {"target": "band"}) in posts, posts
+
+
+_CONFIRM_REACH = (
+    "(() => { const f = %s.querySelector('.when-form'); const c = f.querySelector('.verb-confirm'); const r = c.getBoundingClientRect();"
+    "const card = c.closest('.panel'); const body = c.closest('.pbody') || card; const v = body.getBoundingClientRect(); const cr = card.getBoundingClientRect();"
+    "const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);"
+    "return JSON.stringify({reach: {inBody: r.top >= v.top - 0.5 && r.bottom <= v.bottom + 0.5, inCard: r.top >= cr.top - 0.5 && r.bottom <= cr.bottom + 0.5,"
+    "inView: r.top >= 0 && r.bottom <= window.innerHeight, topmost: top === c, topTag: top ? top.className : null,"
+    "rows: [...f.querySelectorAll('.verb-confirm, .verb-cancel:not(.when-pick)')].map(x => Math.round(x.getBoundingClientRect().top)), formH: Math.round(f.getBoundingClientRect().height)}}); })()"
+)
+
+
+@needs_browser
+def test_when_form_confirm_row_is_reachable_on_a_390_phone(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_when(root)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}},
+            *_reload(),
+            {"until": f"{TRAY} && {_row_of('when row a')} && 1"},
+            {"eval": _open_when("when row a")},
+            {"until": f"{_row_of('when row a')}.querySelector('.when-form .verb-confirm') && 1"},
+            {"eval": _CONFIRM_REACH % _row_of("when row a")},
+            {"shot": str(Path(os.environ.get("LEVAIN_LIST_SHOTS") or tmp_path) / "when_form_reach_390.png")},
+        ])
+    reach = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}["reach"]
+    assert reach["inBody"] and reach["inCard"] and reach["inView"] and reach["topmost"], reach
+
+
+_FAKE_CLOCK = (
+    "(() => { const Real = Date; const at = %d; const hh = %d, mm = %d; const now = new Real(2031, 4, 14, hh, mm, 0).getTime();"
+    "window.Date = class extends Real { constructor(...a) { if (a.length) super(...a); else super(now); } static now() { return now; } };"
+    "return 1; })()"
+)
+
+
+@needs_browser
+def test_later_today_never_writes_tomorrow_and_is_gone_with_under_an_hour_of_today_left(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_when(root)
+    later = "(() => { const b = %s.querySelector('.when-form .when-pick[data-pick=\"later\"]'); return JSON.stringify({later: b ? b.dataset.value : null}); })()"
+    close = f"[...{_row_of('when row a')}.querySelectorAll('.when-form .verb-cancel')].find(x => x.textContent === 'cancel').click(); 1"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {_row_of('when row a')} && 1"},
+            {"eval": _FAKE_CLOCK % (0, 22, 0)},
+            {"eval": _open_when("when row a")},
+            {"eval": later % _row_of("when row a")},
+            {"eval": f"[...{_row_of('when row a')}.querySelectorAll('.when-form .verb-cancel')].find(x => x.textContent === 'cancel').click(); 1"},
+            {"eval": _FAKE_CLOCK % (0, 14, 10)},
+            {"eval": _open_when("when row a")},
+            {"eval": later.replace("later:", "early:") % _row_of("when row a")},
+            {"eval": close},
+            {"eval": _FAKE_CLOCK % (0, 23, 30)},
+            {"eval": _open_when("when row a")},
+            {"eval": later.replace("later:", "last:") % _row_of("when row a")},
+        ])
+    vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
+    assert vals["later"] == "2031-05-14T23:59", vals       # 22:00 + 3 h is clamped to today's last minute
+    assert vals["early"] == "2031-05-14T17:10", vals       # an early clock keeps +3 h
+    assert vals["last"] is None, vals                      # 23:30: under an hour left, no pick
+
+
+@needs_browser
+def test_when_form_focuses_the_day_on_a_pointer_device_and_not_on_a_touch_one(tmp_path: Path) -> None:
+    root, src, _ids = _install(tmp_path)
+    _seed_when(root)
+    stub = ("(() => { const o = window.matchMedia.bind(window); window.matchMedia = (q) => /pointer:\\s*coarse/.test(q)"
+            " ? {matches: %s, media: q, addEventListener() {}, removeEventListener() {}} : o(q); return 1; })()")
+    active = f"(() => {{ const a = document.activeElement; return JSON.stringify({{%s: !!a && a.classList.contains('verb-date') && {_row_of('when row a')}.contains(a)}}); }})()"
+    close = f"[...{_row_of('when row a')}.querySelectorAll('.when-form .verb-cancel')].find(x => x.textContent === 'cancel').click(); 1"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {_row_of('when row a')} && 1"},
+            {"eval": stub % "false"},
+            {"eval": _open_when("when row a")},
+            {"eval": active % "pointer"},
+            {"eval": close},
+            {"eval": stub % "true"},
+            {"eval": _open_when("when row a")},
+            {"eval": active % "touch"},
+        ])
+    vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
+    assert vals == {"pointer": True, "touch": False}, vals
