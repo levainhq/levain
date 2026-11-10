@@ -468,15 +468,18 @@ def _dispatch_label(job: Any) -> str:
 
 
 def _questions_at(store: Any, at: datetime | None, now: datetime | None = None) -> list[Any]:
-    """The questions an agent waits on. Live: the store's open questions, less those snoozed past today
-    (band_view.later_facets, the one LATER predicate; a fault there is due, so the question stays). At a past instant T: every question filed
+    """The questions an agent waits on: the rows the Needs strip and the app badge count, no others. Live: the store's open
+    questions, less those snoozed past today (band_view.later_facets, the one LATER predicate; a fault there is due, so the
+    question stays) and less those the desk alone owes (band_view.desk_owed, the one rule; webpush.needs applies the same two).
+    At a past instant T: every question filed
     at or before T and not answered by T (the store keeps both stamps and never deletes), oldest first; raises
     ``LookupError`` when the store cannot answer for T (no ``recent`` read, or more than ``QUESTIONS_SCAN`` questions,
     so an older one answered after T would not be seen). Known edge (reachability line): the past read keeps a question
     snoozed at T, since a snooze carries no stamp of when it was set; it fails open (shown waiting), never hidden."""
+    from levain.band_view import desk_owed, later_facets
     if at is None:
-        from levain.band_view import later_facets
-        return [q for q in store.open_questions() if later_facets(store, q, now) is None]
+        return [q for q in store.open_questions() if later_facets(store, q, now) is None
+                and not desk_owed(getattr(q, "section", ""), getattr(q, "carried", False))]
     recent = getattr(store, "recent", None)
     if recent is None:
         raise LookupError("this question store lists no answered questions")
@@ -488,6 +491,8 @@ def _questions_at(store: Any, at: datetime | None, now: datetime | None = None) 
         filed = act._parse(q.filed_at)
         if filed is None or filed > at:
             continue
+        if desk_owed(getattr(q, "section", ""), getattr(q, "carried", False)):
+            continue                          # a desk-owed row is not his at T either (the section is the row's own, never stamped by time)
         answered = act._parse(q.answer.answered_at) if q.answer is not None else None
         if answered is None or answered > at:
             out.append(q)
