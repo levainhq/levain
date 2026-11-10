@@ -3593,7 +3593,7 @@
     // an agenda (it holds a target) is undated never: flow refuses one, so "someday" is for a seed with no who chosen
     const agenda = rowTarget(s) !== "";
     if (agenda) clearBtn.hidden = true;
-    form.append(...(opts ? [] : [picksBox]), input, timeIn, zone, ...(back ? [back] : []), ...(who.node ? [who.node] : []), go, ...(opts ? [] : [clearBtn]), cancel, msg);
+    form.append(...(opts ? [] : [picksBox]), input, timeIn, zone, ...(back ? [back] : []), ...(!opts && who.node ? [who.node] : []), go, ...(opts ? [] : [clearBtn]), cancel, msg);
     host.appendChild(form);
     // a touch screen's keyboard opens on a focused date input and covers the form: focus it only where a pointer, not a thumb, drives
     if (!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches)) input.focus();
@@ -5164,7 +5164,7 @@
     }
     if (open && q.intention && hasIntentionControls(q.intentionActions)) {
       // a row that rings an intention is acted on by its four controls, in place of any answer box or signature
-      const wrap = buildIntentionVerbs(q.id, q.intentionActions, sv(b.intention_text));     // never the filed words
+      const wrap = buildIntentionVerbs(q.id, q.intentionActions, b ? sv(b.intention_text) : "");     // never the filed words
       if (card) {
         const bottom = el("div", "needs-actions needs-qa needs-intention");
         bottom.appendChild(wrap);

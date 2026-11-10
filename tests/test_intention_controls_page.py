@@ -185,3 +185,17 @@ def test_a_stale_snooze_keeps_its_words_and_retires_the_form(tmp_path: Path, lh:
     assert seen["msg"] == "this reminder changed: reload", seen
     assert seen["forms"] == 1 and seen["live"] == 0, seen
     assert store.get(ring.id).answer is None
+
+
+@needs_browser
+def test_a_snooze_form_carries_no_who_control(tmp_path: Path, lh: Path) -> None:
+    """The snooze form is the date form only: a who control is never drawn into it."""
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    probe = ("JSON.stringify({form: !!" + RING + ".querySelector('.verb-form input[type=date]'),"
+             " who: " + RING + ".querySelectorAll('.who-ctl, .who-opt').length, probe: 1})")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(
+            DESKTOP, {"do": _tap("intention_snooze"), "until": RING + ".querySelector('input[type=date]') && 1", "ms": 10000},
+            {"eval": probe}))
+    seen = _probe(out)
+    assert seen["form"] and seen["who"] == 0, seen
