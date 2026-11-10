@@ -177,12 +177,12 @@ _SCHEMA: tuple[str, ...] = (
     # ``reported_at`` this server's; the unique key makes a retried report a no-op
     "CREATE TABLE IF NOT EXISTS receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER NOT NULL "
     "REFERENCES pings(id), device_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('received','shown')), "
-    "at TEXT NOT NULL, reported_at TEXT NOT NULL, UNIQUE (ping_id, device_id, kind, at))",
+    "at TEXT NOT NULL, reported_at TEXT NOT NULL, sw TEXT, badge TEXT, UNIQUE (ping_id, device_id, kind, at))",
     # what a device said about a TAP (TAP_KINDS): the worker's click and how it opened, the page's landing. `ping_id` is NULL
     # for a landing that names no ping. `at` is the device clock (stamp plus ms), `reported_at` this server's.
     "CREATE TABLE IF NOT EXISTS taps (id INTEGER PRIMARY KEY AUTOINCREMENT, ping_id INTEGER REFERENCES pings(id), "
     "device_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('clicked','opened','landed')), at TEXT NOT NULL, "
-    "reported_at TEXT NOT NULL, target TEXT, how TEXT)",
+    "reported_at TEXT NOT NULL, target TEXT, how TEXT, sw TEXT)",
     "CREATE INDEX IF NOT EXISTS taps_device_reported ON taps (device_id, reported_at)",
     "CREATE TABLE IF NOT EXISTS held (ping_id INTEGER PRIMARY KEY REFERENCES pings(id), url TEXT NOT NULL, "
     "reason TEXT NOT NULL, held_at TEXT NOT NULL, released_at TEXT, claimed_at TEXT)",
@@ -269,7 +269,8 @@ class PushStore:
         if row is None or row[0] != STORE_FORMAT:
             return False
         for table, column in (("subscriptions", "subscribed"), ("subscriptions", "journal"), ("pings", "command"),
-                              ("pings", "data"), ("held", "claimed_at"), ("notices", "origin")):
+                              ("pings", "data"), ("held", "claimed_at"), ("notices", "origin"), ("receipts", "sw"), ("receipts", "badge"),
+                              ("taps", "sw")):
             if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
                 return False
         if conn.execute("SELECT COUNT(*) FROM meta WHERE key IN ('center_floor_ping', 'center_floor_notice')"
@@ -538,10 +539,11 @@ class PushStore:
         if kind == "opened" and how is None:
             return "bad_report"
         # sw (the worker's version) rides any report; badge (its app-badge call's result) only a `received`
-        if sw is not None and (not isinstance(sw, str) or SW_VERSION_RE.match(sw) is None):
-            return "bad_report"
-        if badge is not None and (kind != "received" or not isinstance(badge, str) or BADGE_RESULT_RE.match(badge) is None):
-            return "bad_report"
+        # a malformed one is a detail this record does not keep: it is stored NULL and the delivery receipt is still recorded
+        if not isinstance(sw, str) or SW_VERSION_RE.match(sw) is None:
+            sw = None
+        if kind != "received" or not isinstance(badge, str) or BADGE_RESULT_RE.match(badge) is None:
+            badge = None
         if not RECEIPT_MIN_MS <= at_ms <= int(time.time() * 1000) + RECEIPT_FUTURE_MS:
             return "bad_report"
         if not isinstance(endpoint_sha256, str) or _SHA256_HEX.match(endpoint_sha256) is None:
