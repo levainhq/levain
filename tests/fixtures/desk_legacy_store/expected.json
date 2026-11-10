@@ -1,0 +1,45 @@
+{
+  "drops": {
+    "argv": [
+      "drops",
+      "list",
+      "--queue-dir",
+      "{store}"
+    ],
+    "exit": 0,
+    "stdout": "dr-3cd0ee91d3cc54a033dd5b5661f2b0d1  <TS>  \"legacy store fixture: one drop written before the rename\"\n"
+  },
+  "lease": {
+    "argv": [
+      "coord",
+      "status",
+      "--json",
+      "--queue-dir",
+      "{store}"
+    ],
+    "exit": 0,
+    "stdout": "{\n  \"lease\": null,\n  \"wake\": \"wake\",\n  \"why\": \"no coordinator holds the lease; the next drop asks for one\",\n  \"setting\": {\n    \"agent\": \"claude\",\n    \"model\": \"sonnet\",\n    \"cwd\": \"/tmp/legacy-fixture\",\n    \"at\": \"<TS>\",\n    \"user_scope\": false\n  },\n  \"launches\": [\n    {\n      \"launch_id\": \"ln-7d3841eef53fad7b17b49d7b3b826a24\",\n      \"session_key\": \"s-0535a798ec2868f4\",\n      \"harness\": \"claude\",\n      \"role\": \"coordinator\",\n      \"threads\": [],\n      \"model\": null,\n      \"cwd\": \"/tmp/legacy-fixture\",\n      \"token\": 2,\n      \"placement\": \"operator-uid\",\n      \"state\": \"expired\",\n      \"until\": \"<TS>\",\n      \"harness_session_id\": null,\n      \"cause\": \"pending past until\",\n      \"at\": \"<TS>\",\n      \"pinned_envelope_id\": null,\n      \"user_scope\": false,\n      \"role_ref\": null,\n      \"spawn\": null\n    }\n  ],\n  \"install_upgrade_pending\": false,\n  \"install_settings_problem\": null\n}\n"
+  },
+  "review": {
+    "argv": [
+      "coord",
+      "review",
+      "list",
+      "--all",
+      "--queue-dir",
+      "{store}"
+    ],
+    "exit": 0,
+    "stdout": "review queue: 2 item(s)\n  rv-<ID>  know: legacy fixture review item\n  rv-<ID>  receipt: drop dr-3cd0ee91d3cc54a033dd5b5661f2b0d1 was stored at <TS> and has no split receipt\nwaiting on you: 0\n"
+  },
+  "status": {
+    "argv": [
+      "coord",
+      "status",
+      "--queue-dir",
+      "{store}"
+    ],
+    "exit": 0,
+    "stdout": "lease: nobody holds the coordinator role\nnext drop: wake (no coordinator holds the lease; the next drop asks for one)\nuser layer: off (project settings only)\n  ln-7d3841eef53fad7b17b49d7b3b826a24  coordinator  claude  expired (pending past until)  session s-0535a798ec2868f4  asked <TS>\n"
+  }
+}

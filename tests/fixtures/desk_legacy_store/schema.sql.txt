@@ -1,0 +1,568 @@
+index drops_gseq
+CREATE UNIQUE INDEX drops_gseq ON drops (gseq);
+index first_reads_gseq
+CREATE UNIQUE INDEX first_reads_gseq ON first_reads (gseq);
+index job_envelopes_envelope
+CREATE INDEX job_envelopes_envelope ON job_envelopes (envelope_id);
+index jobs_repo
+CREATE INDEX jobs_repo ON jobs (repo);
+index replies_gseq
+CREATE UNIQUE INDEX replies_gseq ON replies (gseq);
+index replies_ref
+CREATE INDEX replies_ref ON replies (ref_store, ref_id);
+index review_events_gseq
+CREATE UNIQUE INDEX review_events_gseq ON review_events (gseq);
+index review_events_one_signature
+CREATE UNIQUE INDEX review_events_one_signature ON review_events (sign_request_id) WHERE sign_request_id IS NOT NULL;
+index review_items_gseq
+CREATE UNIQUE INDEX review_items_gseq ON review_items (gseq);
+index team_draft_events_gseq
+CREATE UNIQUE INDEX team_draft_events_gseq ON team_draft_events (gseq);
+index team_drafts_gseq
+CREATE UNIQUE INDEX team_drafts_gseq ON team_drafts (gseq);
+index thread_events_gseq
+CREATE UNIQUE INDEX thread_events_gseq ON thread_events (gseq);
+index thread_revisions_gseq
+CREATE UNIQUE INDEX thread_revisions_gseq ON thread_revisions (gseq);
+index threads_gseq
+CREATE UNIQUE INDEX threads_gseq ON threads (gseq);
+table arrival_signals
+CREATE TABLE arrival_signals (signal_id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT NOT NULL CHECK (length(agent) > 0), mark_id TEXT NOT NULL CHECK (length(mark_id) > 0), queue_id TEXT NOT NULL, ingested_at TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, UNIQUE (agent, mark_id));
+table artifact_take_failures
+CREATE TABLE artifact_take_failures (session TEXT NOT NULL, ticket TEXT NOT NULL, failures INTEGER NOT NULL CHECK (failures >= 1), reason TEXT NOT NULL, parked INTEGER NOT NULL CHECK (parked IN (0, 1)), at TEXT NOT NULL, PRIMARY KEY (session, ticket));
+table artifact_takes
+CREATE TABLE artifact_takes (session TEXT NOT NULL, ticket TEXT NOT NULL, manifest_digest TEXT NOT NULL, bundle_digest TEXT, path TEXT, files INTEGER NOT NULL, bytes INTEGER NOT NULL, at TEXT NOT NULL, PRIMARY KEY (session, ticket), CHECK ((bundle_digest IS NULL) = (path IS NULL)));
+table authorise_signatures
+CREATE TABLE authorise_signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL, signature TEXT NOT NULL, signer_fp TEXT NOT NULL, at TEXT NOT NULL);
+table cancel_signatures
+CREATE TABLE cancel_signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL, signature TEXT NOT NULL, signer_fp TEXT NOT NULL, at TEXT NOT NULL);
+table coord_settings
+CREATE TABLE coord_settings (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, agent TEXT NOT NULL CHECK (agent IN ('claude', 'codex', 'none')), model TEXT, cwd TEXT, user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), by TEXT NOT NULL CHECK (by = 'operator'), at TEXT NOT NULL, CHECK ((agent = 'none' AND model IS NULL AND cwd IS NULL) OR (agent != 'none' AND cwd IS NOT NULL)));
+table drops
+CREATE TABLE drops (drop_id TEXT PRIMARY KEY, surface TEXT NOT NULL CHECK (surface IN ('cli', 'phone', 'cockpit')), outbox_id TEXT NOT NULL UNIQUE, words TEXT NOT NULL, words_sha256 TEXT NOT NULL, sent_at TEXT NOT NULL, received_at TEXT NOT NULL, source_repo TEXT, source_ref TEXT, source_head TEXT, source_how TEXT NOT NULL CHECK (source_how IN ('none', 'cwd', 'picker')), envelope_id TEXT, prior_envelope_id TEXT, gseq INTEGER);
+table envelope_attenuations
+CREATE TABLE envelope_attenuations (envelope_id TEXT NOT NULL REFERENCES envelopes(envelope_id), thread_id TEXT REFERENCES threads(thread_id), kind TEXT NOT NULL CHECK (kind IN ('kill', 'stop_earlier', 'drop_effect', 'thread_done')), value TEXT NOT NULL, by TEXT NOT NULL CHECK (by IN ('operator', 'service')), gseq INTEGER NOT NULL UNIQUE, at TEXT NOT NULL, PRIMARY KEY (envelope_id, gseq));
+table envelope_binds
+CREATE TABLE envelope_binds (envelope_id TEXT NOT NULL REFERENCES envelopes(envelope_id), thread_id TEXT NOT NULL REFERENCES threads(thread_id), rev INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, at TEXT NOT NULL, PRIMARY KEY (envelope_id, thread_id));
+table envelope_draft_withdrawals
+CREATE TABLE envelope_draft_withdrawals (draft_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, by TEXT NOT NULL CHECK (by = 'operator'), at TEXT NOT NULL, FOREIGN KEY (draft_id, revision) REFERENCES envelope_drafts(draft_id, revision));
+table envelope_drafts
+CREATE TABLE envelope_drafts (draft_id TEXT NOT NULL, revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 256), thread_id TEXT NOT NULL REFERENCES threads(thread_id), gseq INTEGER NOT NULL UNIQUE, parent TEXT, proposal TEXT NOT NULL, cites TEXT NOT NULL, digest TEXT NOT NULL UNIQUE, by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator')), at TEXT NOT NULL, PRIMARY KEY (draft_id, revision), CHECK ((revision = 1) = (parent IS NULL)));
+table envelopes
+CREATE TABLE envelopes (envelope_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, origin TEXT NOT NULL CHECK (origin IN ('structured', 'worded')), drop_id TEXT NOT NULL REFERENCES drops(drop_id), body TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL, signature TEXT NOT NULL, signer_fp TEXT NOT NULL, signer_class TEXT NOT NULL, supersedes TEXT, stop_at TEXT NOT NULL, accepted_at TEXT NOT NULL);
+table event_cursor
+CREATE TABLE event_cursor (one INTEGER PRIMARY KEY CHECK (one = 1), journal_id TEXT NOT NULL, seq INTEGER NOT NULL CHECK (seq >= 0));
+table first_reads
+CREATE TABLE first_reads (question_id TEXT PRIMARY KEY, outcome TEXT NOT NULL CHECK (outcome IN ('know', 'escalated')), reply_id TEXT NOT NULL REFERENCES replies(reply_id), at TEXT NOT NULL, gseq INTEGER);
+table gseq
+CREATE TABLE gseq (gseq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL);
+table gseq_migration_bounds
+CREATE TABLE gseq_migration_bounds (table_name TEXT PRIMARY KEY, baseline_rowid INTEGER NOT NULL);
+table handoffs
+CREATE TABLE handoffs (job_id TEXT PRIMARY KEY REFERENCES jobs(id), bundle_id TEXT NOT NULL UNIQUE, size INTEGER NOT NULL, at TEXT NOT NULL);
+table held_ping_releases
+CREATE TABLE held_ping_releases (question_id TEXT PRIMARY KEY REFERENCES held_pings(question_id), cause TEXT NOT NULL CHECK (cause IN ('unread', 'escalated', 'answered')), at TEXT NOT NULL);
+table held_pings
+CREATE TABLE held_pings (question_id TEXT PRIMARY KEY, lease_token INTEGER NOT NULL, at TEXT NOT NULL);
+table intake_views
+CREATE TABLE intake_views (open_id INTEGER PRIMARY KEY REFERENCES open_builds(open_id), via TEXT NOT NULL CHECK (via IN ('terminal', 'drop_reply')), ref TEXT NOT NULL CHECK (length(ref) > 0), at TEXT NOT NULL);
+table job_envelopes
+CREATE TABLE job_envelopes (job_id TEXT PRIMARY KEY REFERENCES jobs(id), envelope_id TEXT NOT NULL, thread_id TEXT NOT NULL, bound_at TEXT NOT NULL);
+table job_filers
+CREATE TABLE job_filers (job_id TEXT PRIMARY KEY REFERENCES jobs(id), agent TEXT NOT NULL);
+table job_threads
+CREATE TABLE job_threads (job_id TEXT PRIMARY KEY REFERENCES jobs(id), thread_id TEXT NOT NULL);
+table jobs
+CREATE TABLE jobs (id TEXT PRIMARY KEY, digest TEXT NOT NULL, contract TEXT NOT NULL, filed_at TEXT NOT NULL, filer_session TEXT NOT NULL, capability_sha256 TEXT NOT NULL, idem_key TEXT, repo TEXT NOT NULL, expires_at TEXT NOT NULL, unsigned_until TEXT NOT NULL, writer_format TEXT, UNIQUE (filer_session, idem_key));
+table know_deliveries
+CREATE TABLE know_deliveries (reply_id TEXT PRIMARY KEY REFERENCES replies(reply_id), agent_session_id TEXT NOT NULL, at TEXT NOT NULL);
+table launch_events
+CREATE TABLE launch_events (launch_id TEXT NOT NULL REFERENCES launches(launch_id), seq INTEGER NOT NULL, gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK (kind IN ('pending', 'active', 'failed', 'expired', 'ended')), until TEXT, harness_session_id TEXT, argv_sha256 TEXT, pinned_envelope_id TEXT, cause TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (launch_id, seq));
+table launch_handoffs
+CREATE TABLE launch_handoffs (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), gseq INTEGER NOT NULL UNIQUE, handoff TEXT, why TEXT, at TEXT NOT NULL, CHECK (handoff IS NOT NULL OR why IS NOT NULL));
+table launch_spawns
+CREATE TABLE launch_spawns (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), gseq INTEGER NOT NULL UNIQUE, pid INTEGER NOT NULL, at TEXT NOT NULL);
+table launch_sweeps
+CREATE TABLE launch_sweeps (launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), gseq INTEGER NOT NULL UNIQUE, cause TEXT NOT NULL, at TEXT NOT NULL);
+table launch_threads
+CREATE TABLE launch_threads (seq INTEGER PRIMARY KEY AUTOINCREMENT, launch_id TEXT NOT NULL REFERENCES launches(launch_id), gseq INTEGER NOT NULL UNIQUE, thread_id TEXT NOT NULL, turn_id TEXT, codex_home TEXT NOT NULL, socket TEXT NOT NULL, at TEXT NOT NULL);
+table launches
+CREATE TABLE launches (launch_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, session_key TEXT NOT NULL UNIQUE, harness TEXT NOT NULL CHECK (harness IN ('claude', 'codex')), role TEXT NOT NULL CHECK (role IN ('coordinator', 'worker', 'room')), threads TEXT NOT NULL, model TEXT, cwd TEXT, token INTEGER NOT NULL, placement TEXT NOT NULL, at TEXT NOT NULL, user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), role_ref TEXT);
+table lease_events
+CREATE TABLE lease_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK (kind IN ('claim', 'beat', 'release', 'lapse', 'takeover')), token INTEGER, holder TEXT NOT NULL, until TEXT, cause TEXT NOT NULL, by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator', 'service')), at TEXT NOT NULL);
+table meta
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+table mission_acceptances
+CREATE TABLE mission_acceptances (acceptance_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL REFERENCES missions(mission_id), mission_revision INTEGER NOT NULL, snapshot TEXT NOT NULL, snapshot_sha256 TEXT NOT NULL, sign_request_id TEXT NOT NULL UNIQUE, signature_sha256 TEXT NOT NULL UNIQUE, signer_fp TEXT NOT NULL, at TEXT NOT NULL);
+table mission_revisions
+CREATE TABLE mission_revisions (mission_id TEXT NOT NULL REFERENCES missions(mission_id), rev INTEGER NOT NULL, children TEXT NOT NULL, children_sha256 TEXT NOT NULL, cause TEXT NOT NULL CHECK (cause IN ('create', 'attach', 'detach')), by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator')), at TEXT NOT NULL, PRIMARY KEY (mission_id, rev));
+table missions
+CREATE TABLE missions (mission_id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+table open_acks
+CREATE TABLE open_acks (open_id INTEGER NOT NULL REFERENCES open_builds(open_id), reader_session TEXT NOT NULL CHECK (length(reader_session) > 0), read_back TEXT NOT NULL CHECK (length(CAST(read_back AS BLOB)) <= 8192), acknowledged_at TEXT NOT NULL, PRIMARY KEY (open_id, reader_session));
+table open_builds
+CREATE TABLE open_builds (open_id INTEGER PRIMARY KEY AUTOINCREMENT, seam_kind TEXT NOT NULL CHECK (seam_kind IN ('rotation', 'operator', 'dream', 'light')), signal_kind TEXT NOT NULL CHECK (signal_kind IN ('launch', 'away_off', 'silence', 'rotation', 'dream')), signal_key TEXT NOT NULL CHECK (length(signal_key) > 0), cursor_gseq INTEGER NOT NULL CHECK (cursor_gseq >= 0), shown_through_gseq INTEGER NOT NULL CHECK (shown_through_gseq >= 0 AND shown_through_gseq <= cursor_gseq), handoff_id INTEGER, requires_ack INTEGER NOT NULL CHECK (requires_ack = 1), body TEXT NOT NULL CHECK (length(CAST(body AS BLOB)) <= 65536), body_sha256 TEXT NOT NULL, built_at TEXT NOT NULL, UNIQUE (signal_kind, signal_key));
+table open_deliveries
+CREATE TABLE open_deliveries (open_id INTEGER NOT NULL REFERENCES open_builds(open_id), surface TEXT NOT NULL CHECK (surface IN ('launch_brief', 'light_verb')), recipient_launch_id TEXT NOT NULL CHECK (length(recipient_launch_id) > 0), delivered_at TEXT NOT NULL, PRIMARY KEY (open_id, surface, recipient_launch_id));
+table open_unsequenced_cuts
+CREATE TABLE open_unsequenced_cuts (open_id INTEGER NOT NULL REFERENCES open_builds(open_id), table_name TEXT NOT NULL CHECK (table_name IN ('replies', 'drops', 'threads', 'thread_revisions', 'thread_events', 'review_items', 'review_events', 'first_reads', 'team_drafts', 'team_draft_events')), max_rowid INTEGER NOT NULL CHECK (max_rowid > 0), PRIMARY KEY (open_id, table_name));
+table operator_views
+CREATE TABLE operator_views (viewer TEXT NOT NULL CHECK (length(viewer) > 0), gseq INTEGER NOT NULL CHECK (gseq >= 0), at TEXT NOT NULL);
+table ready_items
+CREATE TABLE ready_items (id TEXT NOT NULL, ver INTEGER NOT NULL CHECK (ver >= 1), repo TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, category TEXT NOT NULL CHECK (category IN ('backlog', 'ready', 'running', 'waiting', 'done')), tier TEXT CHECK (tier IS NULL OR tier IN ('sonnet', 'opus', 'haiku')), done_line TEXT, depends_on TEXT NOT NULL, rank INTEGER NOT NULL CHECK (rank >= 0), set_by TEXT NOT NULL, set_at TEXT NOT NULL, hold TEXT, residue TEXT, ref TEXT, landed_sha TEXT CHECK (landed_sha IS NULL OR length(landed_sha) IN (40, 64)), branch TEXT, PRIMARY KEY (id, ver));
+table ready_journal
+CREATE TABLE ready_journal (id TEXT NOT NULL, ver INTEGER NOT NULL CHECK (ver >= 1), gseq INTEGER NOT NULL UNIQUE, ts REAL NOT NULL, iso TEXT NOT NULL, at TEXT NOT NULL, repo TEXT NOT NULL CHECK (length(repo) > 0), from_status TEXT, to_status TEXT NOT NULL, from_category TEXT CHECK (from_category IS NULL OR from_category IN ('backlog', 'ready', 'running', 'waiting', 'done')), to_category TEXT NOT NULL CHECK (to_category IN ('backlog', 'ready', 'running', 'waiting', 'done')), who TEXT NOT NULL CHECK (length(trim(who)) > 0), why TEXT NOT NULL CHECK (length(trim(why)) > 0), source TEXT NOT NULL CHECK (source IN ('move', 'add', 'correction', 'operator-proposal')), applied_by TEXT, lease_token INTEGER NOT NULL, CHECK ((source = 'operator-proposal' AND applied_by = 'coordinator') OR (source != 'operator-proposal' AND applied_by IS NULL)), CHECK ((ver = 1) = (from_category IS NULL)), PRIMARY KEY (id, ver));
+table replies
+CREATE TABLE replies (reply_id TEXT PRIMARY KEY, thread_id TEXT REFERENCES threads(thread_id), kind TEXT NOT NULL CHECK (kind IN ('drop_receipt', 'sign', 'answer', 'know', 'coordinator_reply')), ref_store TEXT NOT NULL, ref_id TEXT NOT NULL, body TEXT NOT NULL, at TEXT NOT NULL, gseq INTEGER);
+table report_refusals
+CREATE TABLE report_refusals (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, report_id TEXT NOT NULL UNIQUE CHECK (length(report_id) BETWEEN 1 AND 100), item_id TEXT, worker TEXT, reason TEXT NOT NULL CHECK (reason IN ('unknown-item', 'worker-not-a-launch', 'malformed-report', 'no-open-attach', 'already-attached', 'item-refused', 'held-by-other', 'worker-mismatch', 'no-evidence-timeout', 'kind-mismatch')), detail TEXT NOT NULL CHECK (length(detail) <= 500), at TEXT NOT NULL, by TEXT NOT NULL CHECK (by IN ('coordinator', 'service')));
+table review_events
+CREATE TABLE review_events (item_id TEXT NOT NULL REFERENCES review_items(item_id), seq INTEGER NOT NULL, op TEXT NOT NULL CHECK (op IN ('cleared', 'reopened')), mode TEXT NOT NULL CHECK (mode IN ('manual', 'fresh', 'coordinator', 'signed')), by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator')), at TEXT NOT NULL, sign_request_id TEXT, gseq INTEGER, PRIMARY KEY (item_id, seq), CHECK ((mode = 'signed') = (sign_request_id IS NOT NULL)), CHECK (mode != 'signed' OR op = 'cleared'));
+table review_items
+CREATE TABLE review_items (item_id TEXT PRIMARY KEY, thread_id TEXT REFERENCES threads(thread_id), feed TEXT NOT NULL CHECK (feed IN ('receipt', 'seat', 'envelope', 'end', 'digest', 'know', 'doubt', 'contradiction', 'agent')), dedupe_key TEXT NOT NULL UNIQUE, body TEXT NOT NULL, authority_relevant INTEGER NOT NULL CHECK (authority_relevant IN (0, 1)), by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator', 'service')), at TEXT NOT NULL, gseq INTEGER);
+table review_marks
+CREATE TABLE review_marks (feed TEXT NOT NULL, seq INTEGER NOT NULL, value INTEGER NOT NULL, at TEXT NOT NULL, PRIMARY KEY (feed, seq));
+table run_records
+CREATE TABLE run_records (job_id TEXT NOT NULL REFERENCES jobs(id), run INTEGER NOT NULL, record TEXT NOT NULL, digest TEXT NOT NULL, envelope_digest TEXT NOT NULL, at TEXT NOT NULL, ticket TEXT, PRIMARY KEY (job_id, run));
+table seam_handoffs
+CREATE TABLE seam_handoffs (handoff_id INTEGER PRIMARY KEY AUTOINCREMENT, close_key TEXT NOT NULL UNIQUE, seam_kind TEXT NOT NULL, written_at TEXT NOT NULL, writer TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, covers_gseq INTEGER NOT NULL CHECK (covers_gseq >= 0), prev_handoff_id INTEGER, request_digest TEXT NOT NULL, body TEXT NOT NULL);
+table sessions_seen
+CREATE TABLE sessions_seen (session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 200), first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, CHECK (last_seen >= first_seen));
+table signatures
+CREATE TABLE signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL, signature TEXT NOT NULL, signer_fp TEXT NOT NULL, at TEXT NOT NULL);
+table sqlite_sequence
+CREATE TABLE sqlite_sequence(name,seq);
+table team_draft_events
+CREATE TABLE team_draft_events (draft_id TEXT NOT NULL REFERENCES team_drafts(draft_id), seq INTEGER NOT NULL, event TEXT NOT NULL CHECK (event IN ('drafted', 'promoting', 'withdrawn', 'promoted')), ledger_id TEXT, by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator', 'service')), at TEXT NOT NULL, owner TEXT CHECK ((owner IS NOT NULL) = (event = 'promoting')), gseq INTEGER, PRIMARY KEY (draft_id, seq));
+table team_drafts
+CREATE TABLE team_drafts (draft_id TEXT PRIMARY KEY, type TEXT NOT NULL CHECK (type IN ('decision', 'constraint', 'finding', 'question', 'tension')), body TEXT NOT NULL, body_sha256 TEXT NOT NULL, thread_id TEXT, at TEXT NOT NULL, gseq INTEGER);
+table thread_events
+CREATE TABLE thread_events (thread_id TEXT NOT NULL REFERENCES threads(thread_id), seq INTEGER NOT NULL, field TEXT NOT NULL CHECK (field IN ('state', 'kind', 'title', 'repo')), value TEXT NOT NULL, cause TEXT NOT NULL, by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator', 'service')), at TEXT NOT NULL, gseq INTEGER, PRIMARY KEY (thread_id, seq));
+table thread_revisions
+CREATE TABLE thread_revisions (thread_id TEXT NOT NULL REFERENCES threads(thread_id), rev INTEGER NOT NULL, members TEXT NOT NULL, members_sha256 TEXT NOT NULL, cause TEXT NOT NULL CHECK (cause IN ('split', 'attach', 'resplit', 'rescope')), at TEXT NOT NULL, gseq INTEGER, PRIMARY KEY (thread_id, rev));
+table threads
+CREATE TABLE threads (thread_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, about TEXT REFERENCES threads(thread_id), gseq INTEGER);
+table transitions
+CREATE TABLE transitions (job_id TEXT NOT NULL REFERENCES jobs(id), seq INTEGER NOT NULL, to_state TEXT NOT NULL, cause TEXT NOT NULL, at TEXT NOT NULL, evidence TEXT NOT NULL, PRIMARY KEY (job_id, seq));
+table verifier_refusals
+CREATE TABLE verifier_refusals (job_id TEXT PRIMARY KEY REFERENCES jobs(id), run INTEGER NOT NULL, ticket TEXT NOT NULL, event_refused TEXT, event_digest TEXT, at TEXT NOT NULL, CHECK ((event_refused IS NULL) != (event_digest IS NULL)));
+table worker_attach
+CREATE TABLE worker_attach (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, attach_id TEXT NOT NULL, item_id TEXT NOT NULL, item_ver INTEGER NOT NULL CHECK (item_ver >= 1), kind TEXT NOT NULL CHECK (kind IN ('attach', 'progress', 'blocked', 'landed', 'ended')), worker TEXT NOT NULL CHECK (length(trim(worker)) > 0), worker_kind TEXT NOT NULL CHECK (worker_kind IN ('seat', 'lane', 'launch')), launch_id TEXT, harness_session_id TEXT, report_id TEXT UNIQUE, why TEXT CHECK (why IS NULL OR length(why) <= 1000), at TEXT NOT NULL, applied_at TEXT NOT NULL, lease_token INTEGER NOT NULL, by TEXT NOT NULL CHECK (by IN ('coordinator', 'service')));
+trigger arrival_signals_frozen
+CREATE TRIGGER arrival_signals_frozen BEFORE UPDATE ON arrival_signals BEGIN SELECT RAISE(ABORT, 'an arrival signal is append-only'); END;
+trigger arrival_signals_kept
+CREATE TRIGGER arrival_signals_kept BEFORE DELETE ON arrival_signals BEGIN SELECT RAISE(ABORT, 'an arrival signal is append-only'); END;
+trigger arrival_signals_no_replace
+CREATE TRIGGER arrival_signals_no_replace BEFORE INSERT ON arrival_signals WHEN EXISTS (SELECT 1 FROM arrival_signals WHERE signal_id = NEW.signal_id OR gseq = NEW.gseq OR (agent = NEW.agent AND mark_id = NEW.mark_id)) BEGIN SELECT RAISE(ABORT, 'an arrival signal is never replaced'); END;
+trigger artifact_takes_frozen
+CREATE TRIGGER artifact_takes_frozen BEFORE UPDATE ON artifact_takes BEGIN SELECT RAISE(ABORT, 'a taken artifact is recorded once'); END;
+trigger artifact_takes_kept
+CREATE TRIGGER artifact_takes_kept BEFORE DELETE ON artifact_takes BEGIN SELECT RAISE(ABORT, 'a taken artifact is recorded once'); END;
+trigger artifact_takes_no_replace
+CREATE TRIGGER artifact_takes_no_replace BEFORE INSERT ON artifact_takes WHEN EXISTS (SELECT 1 FROM artifact_takes WHERE (session = NEW.session AND ticket = NEW.ticket) OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a taken artifact is never replaced'); END;
+trigger authorise_signatures_frozen
+CREATE TRIGGER authorise_signatures_frozen BEFORE UPDATE ON authorise_signatures BEGIN SELECT RAISE(ABORT, 'an authorisation is written once'); END;
+trigger authorise_signatures_kept
+CREATE TRIGGER authorise_signatures_kept BEFORE DELETE ON authorise_signatures BEGIN SELECT RAISE(ABORT, 'an authorisation is written once'); END;
+trigger authorise_signatures_no_replace
+CREATE TRIGGER authorise_signatures_no_replace BEFORE INSERT ON authorise_signatures WHEN EXISTS (SELECT 1 FROM authorise_signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'an authorisation is never replaced'); END;
+trigger cancel_signatures_frozen
+CREATE TRIGGER cancel_signatures_frozen BEFORE UPDATE ON cancel_signatures BEGIN SELECT RAISE(ABORT, 'a cancel is written once'); END;
+trigger cancel_signatures_kept
+CREATE TRIGGER cancel_signatures_kept BEFORE DELETE ON cancel_signatures BEGIN SELECT RAISE(ABORT, 'a cancel is written once'); END;
+trigger cancel_signatures_no_replace
+CREATE TRIGGER cancel_signatures_no_replace BEFORE INSERT ON cancel_signatures WHEN EXISTS (SELECT 1 FROM cancel_signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a cancel is never replaced'); END;
+trigger coord_settings_frozen
+CREATE TRIGGER coord_settings_frozen BEFORE UPDATE ON coord_settings BEGIN SELECT RAISE(ABORT, 'a coordinator setting is append-only'); END;
+trigger coord_settings_kept
+CREATE TRIGGER coord_settings_kept BEFORE DELETE ON coord_settings BEGIN SELECT RAISE(ABORT, 'a coordinator setting is append-only'); END;
+trigger coord_settings_no_replace
+CREATE TRIGGER coord_settings_no_replace BEFORE INSERT ON coord_settings WHEN EXISTS (SELECT 1 FROM coord_settings WHERE seq = NEW.seq OR gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a coordinator setting is never replaced'); END;
+trigger drops_frozen
+CREATE TRIGGER drops_frozen BEFORE UPDATE ON drops BEGIN SELECT RAISE(ABORT, 'a drop is append-only'); END;
+trigger drops_gseq_no_replace
+CREATE TRIGGER drops_gseq_no_replace BEFORE INSERT ON drops WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM drops WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a drop is never replaced'); END;
+trigger drops_kept
+CREATE TRIGGER drops_kept BEFORE DELETE ON drops BEGIN SELECT RAISE(ABORT, 'a drop is append-only'); END;
+trigger drops_no_replace
+CREATE TRIGGER drops_no_replace BEFORE INSERT ON drops WHEN EXISTS (SELECT 1 FROM drops WHERE drop_id = NEW.drop_id OR outbox_id = NEW.outbox_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a drop is never replaced'); END;
+trigger envelope_attenuations_frozen
+CREATE TRIGGER envelope_attenuations_frozen BEFORE UPDATE ON envelope_attenuations BEGIN SELECT RAISE(ABORT, 'an attenuation is append-only'); END;
+trigger envelope_attenuations_kept
+CREATE TRIGGER envelope_attenuations_kept BEFORE DELETE ON envelope_attenuations BEGIN SELECT RAISE(ABORT, 'an attenuation is append-only'); END;
+trigger envelope_attenuations_no_replace
+CREATE TRIGGER envelope_attenuations_no_replace BEFORE INSERT ON envelope_attenuations WHEN EXISTS (SELECT 1 FROM envelope_attenuations WHERE gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'an attenuation is never replaced'); END;
+trigger envelope_binds_frozen
+CREATE TRIGGER envelope_binds_frozen BEFORE UPDATE ON envelope_binds BEGIN SELECT RAISE(ABORT, 'an envelope bind is append-only'); END;
+trigger envelope_binds_kept
+CREATE TRIGGER envelope_binds_kept BEFORE DELETE ON envelope_binds BEGIN SELECT RAISE(ABORT, 'an envelope bind is append-only'); END;
+trigger envelope_binds_no_replace
+CREATE TRIGGER envelope_binds_no_replace BEFORE INSERT ON envelope_binds WHEN EXISTS (SELECT 1 FROM envelope_binds WHERE (envelope_id = NEW.envelope_id AND thread_id = NEW.thread_id) OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a bind is never replaced'); END;
+trigger envelope_draft_withdrawals_frozen
+CREATE TRIGGER envelope_draft_withdrawals_frozen BEFORE UPDATE ON envelope_draft_withdrawals BEGIN SELECT RAISE(ABORT, 'a draft withdrawal is append-only'); END;
+trigger envelope_draft_withdrawals_kept
+CREATE TRIGGER envelope_draft_withdrawals_kept BEFORE DELETE ON envelope_draft_withdrawals BEGIN SELECT RAISE(ABORT, 'a draft withdrawal is append-only'); END;
+trigger envelope_draft_withdrawals_no_replace
+CREATE TRIGGER envelope_draft_withdrawals_no_replace BEFORE INSERT ON envelope_draft_withdrawals WHEN EXISTS (SELECT 1 FROM envelope_draft_withdrawals WHERE draft_id = NEW.draft_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a draft withdrawal is never replaced'); END;
+trigger envelope_draft_withdrawals_open
+CREATE TRIGGER envelope_draft_withdrawals_open BEFORE INSERT ON envelope_draft_withdrawals WHEN NEW.revision IS NOT (SELECT MAX(revision) FROM envelope_drafts WHERE draft_id = NEW.draft_id) OR EXISTS (SELECT 1 FROM envelopes WHERE json_extract(body, '$.draft.draft_id') = NEW.draft_id) BEGIN SELECT RAISE(ABORT, 'only the latest revision of an unsigned draft is withdrawn'); END;
+trigger envelope_drafts_closed
+CREATE TRIGGER envelope_drafts_closed BEFORE INSERT ON envelope_drafts WHEN EXISTS (SELECT 1 FROM envelope_draft_withdrawals WHERE draft_id = NEW.draft_id) OR EXISTS (SELECT 1 FROM envelopes WHERE json_extract(body, '$.draft.draft_id') = NEW.draft_id) BEGIN SELECT RAISE(ABORT, 'a signed or withdrawn draft takes no revision'); END;
+trigger envelope_drafts_frozen
+CREATE TRIGGER envelope_drafts_frozen BEFORE UPDATE ON envelope_drafts BEGIN SELECT RAISE(ABORT, 'a draft revision is append-only'); END;
+trigger envelope_drafts_kept
+CREATE TRIGGER envelope_drafts_kept BEFORE DELETE ON envelope_drafts BEGIN SELECT RAISE(ABORT, 'a draft revision is append-only'); END;
+trigger envelope_drafts_next
+CREATE TRIGGER envelope_drafts_next BEFORE INSERT ON envelope_drafts WHEN NEW.revision != COALESCE((SELECT MAX(revision) FROM envelope_drafts WHERE draft_id = NEW.draft_id), 0) + 1 OR (NEW.revision > 1 AND (NEW.parent IS NOT (SELECT digest FROM envelope_drafts WHERE draft_id = NEW.draft_id AND revision = NEW.revision - 1) OR NEW.thread_id IS NOT (SELECT thread_id FROM envelope_drafts WHERE draft_id = NEW.draft_id AND revision = 1))) BEGIN SELECT RAISE(ABORT, 'the draft moved: a revision follows its latest parent'); END;
+trigger envelope_drafts_no_replace
+CREATE TRIGGER envelope_drafts_no_replace BEFORE INSERT ON envelope_drafts WHEN EXISTS (SELECT 1 FROM envelope_drafts WHERE (draft_id = NEW.draft_id AND revision = NEW.revision) OR gseq = NEW.gseq OR digest = NEW.digest OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a draft revision is never replaced'); END;
+trigger envelope_drafts_one_unclosed
+CREATE TRIGGER envelope_drafts_one_unclosed BEFORE INSERT ON envelope_drafts WHEN NEW.revision = 1 AND EXISTS (SELECT 1 FROM envelope_drafts d WHERE d.thread_id = NEW.thread_id AND d.revision = 1 AND d.draft_id <> NEW.draft_id AND NOT EXISTS (SELECT 1 FROM envelope_draft_withdrawals w WHERE w.draft_id = d.draft_id) AND NOT EXISTS (SELECT 1 FROM envelopes e WHERE json_extract(e.body, '$.draft.draft_id') = d.draft_id)) BEGIN SELECT RAISE(ABORT, 'a thread holds one unclosed draft series: revise it or withdraw it'); END;
+trigger envelopes_frozen
+CREATE TRIGGER envelopes_frozen BEFORE UPDATE ON envelopes BEGIN SELECT RAISE(ABORT, 'an envelope is append-only'); END;
+trigger envelopes_kept
+CREATE TRIGGER envelopes_kept BEFORE DELETE ON envelopes BEGIN SELECT RAISE(ABORT, 'an envelope is append-only'); END;
+trigger envelopes_no_replace
+CREATE TRIGGER envelopes_no_replace BEFORE INSERT ON envelopes WHEN EXISTS (SELECT 1 FROM envelopes WHERE envelope_id = NEW.envelope_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'an envelope is never replaced'); END;
+trigger first_reads_frozen
+CREATE TRIGGER first_reads_frozen BEFORE UPDATE ON first_reads BEGIN SELECT RAISE(ABORT, 'a first read is written once is append-only'); END;
+trigger first_reads_gseq_no_replace
+CREATE TRIGGER first_reads_gseq_no_replace BEFORE INSERT ON first_reads WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM first_reads WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a first read is never replaced'); END;
+trigger first_reads_kept
+CREATE TRIGGER first_reads_kept BEFORE DELETE ON first_reads BEGIN SELECT RAISE(ABORT, 'a first read is written once is append-only'); END;
+trigger first_reads_no_replace
+CREATE TRIGGER first_reads_no_replace BEFORE INSERT ON first_reads WHEN EXISTS (SELECT 1 FROM first_reads WHERE question_id = NEW.question_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a question is read first once'); END;
+trigger gseq_frozen
+CREATE TRIGGER gseq_frozen BEFORE UPDATE ON gseq BEGIN SELECT RAISE(ABORT, 'the sequence is append-only'); END;
+trigger gseq_kept
+CREATE TRIGGER gseq_kept BEFORE DELETE ON gseq BEGIN SELECT RAISE(ABORT, 'the sequence is append-only'); END;
+trigger gseq_migration_bounds_frozen
+CREATE TRIGGER gseq_migration_bounds_frozen BEFORE UPDATE ON gseq_migration_bounds BEGIN SELECT RAISE(ABORT, 'a migration bound is append-only'); END;
+trigger gseq_migration_bounds_kept
+CREATE TRIGGER gseq_migration_bounds_kept BEFORE DELETE ON gseq_migration_bounds BEGIN SELECT RAISE(ABORT, 'a migration bound is append-only'); END;
+trigger gseq_migration_bounds_no_replace
+CREATE TRIGGER gseq_migration_bounds_no_replace BEFORE INSERT ON gseq_migration_bounds WHEN EXISTS (SELECT 1 FROM gseq_migration_bounds WHERE table_name = NEW.table_name) BEGIN SELECT RAISE(ABORT, 'a migration bound is never replaced'); END;
+trigger gseq_no_replace
+CREATE TRIGGER gseq_no_replace BEFORE INSERT ON gseq WHEN EXISTS (SELECT 1 FROM gseq WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'the sequence is never replaced'); END;
+trigger handoffs_frozen
+CREATE TRIGGER handoffs_frozen BEFORE UPDATE ON handoffs BEGIN SELECT RAISE(ABORT, 'a handoff row is written once'); END;
+trigger handoffs_kept
+CREATE TRIGGER handoffs_kept BEFORE DELETE ON handoffs BEGIN SELECT RAISE(ABORT, 'a handoff row is written once'); END;
+trigger handoffs_no_replace
+CREATE TRIGGER handoffs_no_replace BEFORE INSERT ON handoffs WHEN EXISTS (SELECT 1 FROM handoffs WHERE job_id = NEW.job_id OR bundle_id = NEW.bundle_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a handoff row is never replaced'); END;
+trigger held_ping_releases_frozen
+CREATE TRIGGER held_ping_releases_frozen BEFORE UPDATE ON held_ping_releases BEGIN SELECT RAISE(ABORT, 'a held ping is released once is append-only'); END;
+trigger held_ping_releases_kept
+CREATE TRIGGER held_ping_releases_kept BEFORE DELETE ON held_ping_releases BEGIN SELECT RAISE(ABORT, 'a held ping is released once is append-only'); END;
+trigger held_ping_releases_no_replace
+CREATE TRIGGER held_ping_releases_no_replace BEFORE INSERT ON held_ping_releases WHEN EXISTS (SELECT 1 FROM held_ping_releases WHERE question_id = NEW.question_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a held ping is released once'); END;
+trigger held_pings_frozen
+CREATE TRIGGER held_pings_frozen BEFORE UPDATE ON held_pings BEGIN SELECT RAISE(ABORT, 'a held ping is written once is append-only'); END;
+trigger held_pings_kept
+CREATE TRIGGER held_pings_kept BEFORE DELETE ON held_pings BEGIN SELECT RAISE(ABORT, 'a held ping is written once is append-only'); END;
+trigger held_pings_no_replace
+CREATE TRIGGER held_pings_no_replace BEFORE INSERT ON held_pings WHEN EXISTS (SELECT 1 FROM held_pings WHERE question_id = NEW.question_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a ping is held once'); END;
+trigger intake_views_frozen
+CREATE TRIGGER intake_views_frozen BEFORE UPDATE ON intake_views BEGIN SELECT RAISE(ABORT, 'an intake view is append-only'); END;
+trigger intake_views_kept
+CREATE TRIGGER intake_views_kept BEFORE DELETE ON intake_views BEGIN SELECT RAISE(ABORT, 'an intake view is append-only'); END;
+trigger intake_views_no_replace
+CREATE TRIGGER intake_views_no_replace BEFORE INSERT ON intake_views WHEN EXISTS (SELECT 1 FROM intake_views WHERE open_id = NEW.open_id) BEGIN SELECT RAISE(ABORT, 'an intake view is never replaced'); END;
+trigger job_envelopes_frozen
+CREATE TRIGGER job_envelopes_frozen BEFORE UPDATE ON job_envelopes BEGIN SELECT RAISE(ABORT, 'a job envelope is bound once'); END;
+trigger job_envelopes_kept
+CREATE TRIGGER job_envelopes_kept BEFORE DELETE ON job_envelopes BEGIN SELECT RAISE(ABORT, 'a job envelope is bound once'); END;
+trigger job_envelopes_no_replace
+CREATE TRIGGER job_envelopes_no_replace BEFORE INSERT ON job_envelopes WHEN EXISTS (SELECT 1 FROM job_envelopes WHERE job_id = NEW.job_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a job envelope is never replaced'); END;
+trigger job_filers_frozen
+CREATE TRIGGER job_filers_frozen BEFORE UPDATE ON job_filers BEGIN SELECT RAISE(ABORT, 'a job filer is written once'); END;
+trigger job_filers_kept
+CREATE TRIGGER job_filers_kept BEFORE DELETE ON job_filers BEGIN SELECT RAISE(ABORT, 'a job filer is written once'); END;
+trigger job_filers_no_replace
+CREATE TRIGGER job_filers_no_replace BEFORE INSERT ON job_filers WHEN EXISTS (SELECT 1 FROM job_filers WHERE job_id = NEW.job_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a job filer is never replaced'); END;
+trigger job_threads_frozen
+CREATE TRIGGER job_threads_frozen BEFORE UPDATE ON job_threads BEGIN SELECT RAISE(ABORT, 'a job thread is recorded once'); END;
+trigger job_threads_kept
+CREATE TRIGGER job_threads_kept BEFORE DELETE ON job_threads BEGIN SELECT RAISE(ABORT, 'a job thread is recorded once'); END;
+trigger job_threads_no_replace
+CREATE TRIGGER job_threads_no_replace BEFORE INSERT ON job_threads WHEN EXISTS (SELECT 1 FROM job_threads WHERE job_id = NEW.job_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a job thread is never replaced'); END;
+trigger jobs_frozen
+CREATE TRIGGER jobs_frozen BEFORE UPDATE ON jobs BEGIN SELECT RAISE(ABORT, 'a job is written once'); END;
+trigger jobs_kept
+CREATE TRIGGER jobs_kept BEFORE DELETE ON jobs BEGIN SELECT RAISE(ABORT, 'a job is written once'); END;
+trigger jobs_no_replace
+CREATE TRIGGER jobs_no_replace BEFORE INSERT ON jobs WHEN EXISTS (SELECT 1 FROM jobs WHERE id = NEW.id OR rowid = NEW.rowid OR (NEW.idem_key IS NOT NULL AND filer_session = NEW.filer_session AND idem_key = NEW.idem_key)) BEGIN SELECT RAISE(ABORT, 'a job is never replaced'); END;
+trigger jobs_writer_format
+CREATE TRIGGER jobs_writer_format BEFORE INSERT ON jobs WHEN NEW.writer_format IS NOT (SELECT value FROM meta WHERE key = 'format') BEGIN SELECT RAISE(ABORT, 'store-format: another Levain moved this dispatch store to a newer format after this process opened it; nothing was filed (restart this process on the current Levain)'); END;
+trigger know_deliveries_frozen
+CREATE TRIGGER know_deliveries_frozen BEFORE UPDATE ON know_deliveries BEGIN SELECT RAISE(ABORT, 'a KNOW is delivered once is append-only'); END;
+trigger know_deliveries_kept
+CREATE TRIGGER know_deliveries_kept BEFORE DELETE ON know_deliveries BEGIN SELECT RAISE(ABORT, 'a KNOW is delivered once is append-only'); END;
+trigger know_deliveries_no_replace
+CREATE TRIGGER know_deliveries_no_replace BEFORE INSERT ON know_deliveries WHEN EXISTS (SELECT 1 FROM know_deliveries WHERE reply_id = NEW.reply_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a KNOW is delivered once'); END;
+trigger launch_events_edges
+CREATE TRIGGER launch_events_edges BEFORE INSERT ON launch_events WHEN (SELECT kind FROM launch_events WHERE launch_id = NEW.launch_id ORDER BY seq DESC LIMIT 1) IN ('failed', 'expired', 'ended') OR (NEW.kind = 'pending' AND EXISTS (SELECT 1 FROM launch_events WHERE launch_id = NEW.launch_id)) OR (NEW.kind != 'pending' AND NOT EXISTS (SELECT 1 FROM launch_events WHERE launch_id = NEW.launch_id)) OR (NEW.kind IN ('failed', 'expired') AND (SELECT kind FROM launch_events WHERE launch_id = NEW.launch_id ORDER BY seq DESC LIMIT 1) IS NOT 'pending') OR (NEW.kind = 'active' AND (SELECT kind FROM launch_events WHERE launch_id = NEW.launch_id ORDER BY seq DESC LIMIT 1) IS NOT 'pending') OR (NEW.kind = 'ended' AND (SELECT kind FROM launch_events WHERE launch_id = NEW.launch_id ORDER BY seq DESC LIMIT 1) IS NOT 'active') BEGIN SELECT RAISE(ABORT, 'a launch moves pending -> active -> ended, or ends failed or expired'); END;
+trigger launch_events_frozen
+CREATE TRIGGER launch_events_frozen BEFORE UPDATE ON launch_events BEGIN SELECT RAISE(ABORT, 'a launch event is append-only'); END;
+trigger launch_events_kept
+CREATE TRIGGER launch_events_kept BEFORE DELETE ON launch_events BEGIN SELECT RAISE(ABORT, 'a launch event is append-only'); END;
+trigger launch_events_next
+CREATE TRIGGER launch_events_next BEFORE INSERT ON launch_events WHEN NEW.seq != COALESCE((SELECT MAX(seq) FROM launch_events WHERE launch_id = NEW.launch_id), 0) + 1 OR EXISTS (SELECT 1 FROM launch_events WHERE rowid = NEW.rowid OR gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a launch event is the next seq of its launch'); END;
+trigger launch_handoffs_frozen
+CREATE TRIGGER launch_handoffs_frozen BEFORE UPDATE ON launch_handoffs BEGIN SELECT RAISE(ABORT, 'a worker handoff is append-only'); END;
+trigger launch_handoffs_kept
+CREATE TRIGGER launch_handoffs_kept BEFORE DELETE ON launch_handoffs BEGIN SELECT RAISE(ABORT, 'a worker handoff is append-only'); END;
+trigger launch_handoffs_no_replace
+CREATE TRIGGER launch_handoffs_no_replace BEFORE INSERT ON launch_handoffs WHEN EXISTS (SELECT 1 FROM launch_handoffs WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a worker handoff is written once'); END;
+trigger launch_spawns_frozen
+CREATE TRIGGER launch_spawns_frozen BEFORE UPDATE ON launch_spawns BEGIN SELECT RAISE(ABORT, 'a launch spawn is append-only'); END;
+trigger launch_spawns_kept
+CREATE TRIGGER launch_spawns_kept BEFORE DELETE ON launch_spawns BEGIN SELECT RAISE(ABORT, 'a launch spawn is append-only'); END;
+trigger launch_spawns_no_replace
+CREATE TRIGGER launch_spawns_no_replace BEFORE INSERT ON launch_spawns WHEN EXISTS (SELECT 1 FROM launch_spawns WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a launch is spawned once'); END;
+trigger launch_sweeps_frozen
+CREATE TRIGGER launch_sweeps_frozen BEFORE UPDATE ON launch_sweeps BEGIN SELECT RAISE(ABORT, 'a launch sweep is append-only'); END;
+trigger launch_sweeps_kept
+CREATE TRIGGER launch_sweeps_kept BEFORE DELETE ON launch_sweeps BEGIN SELECT RAISE(ABORT, 'a launch sweep is append-only'); END;
+trigger launch_sweeps_no_replace
+CREATE TRIGGER launch_sweeps_no_replace BEFORE INSERT ON launch_sweeps WHEN EXISTS (SELECT 1 FROM launch_sweeps WHERE launch_id = NEW.launch_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a launch is swept once'); END;
+trigger launch_threads_frozen
+CREATE TRIGGER launch_threads_frozen BEFORE UPDATE ON launch_threads BEGIN SELECT RAISE(ABORT, 'a launch thread is append-only'); END;
+trigger launch_threads_kept
+CREATE TRIGGER launch_threads_kept BEFORE DELETE ON launch_threads BEGIN SELECT RAISE(ABORT, 'a launch thread is append-only'); END;
+trigger launch_threads_no_replace
+CREATE TRIGGER launch_threads_no_replace BEFORE INSERT ON launch_threads WHEN EXISTS (SELECT 1 FROM launch_threads WHERE seq = NEW.seq OR gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a launch thread is never replaced'); END;
+trigger launches_frozen
+CREATE TRIGGER launches_frozen BEFORE UPDATE ON launches BEGIN SELECT RAISE(ABORT, 'a launch is append-only'); END;
+trigger launches_kept
+CREATE TRIGGER launches_kept BEFORE DELETE ON launches BEGIN SELECT RAISE(ABORT, 'a launch is append-only'); END;
+trigger launches_no_replace
+CREATE TRIGGER launches_no_replace BEFORE INSERT ON launches WHEN EXISTS (SELECT 1 FROM launches WHERE launch_id = NEW.launch_id OR session_key = NEW.session_key OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a launch is never replaced'); END;
+trigger lease_events_frozen
+CREATE TRIGGER lease_events_frozen BEFORE UPDATE ON lease_events BEGIN SELECT RAISE(ABORT, 'a lease event is append-only'); END;
+trigger lease_events_kept
+CREATE TRIGGER lease_events_kept BEFORE DELETE ON lease_events BEGIN SELECT RAISE(ABORT, 'a lease event is append-only'); END;
+trigger lease_events_no_replace
+CREATE TRIGGER lease_events_no_replace BEFORE INSERT ON lease_events WHEN EXISTS (SELECT 1 FROM lease_events WHERE seq = NEW.seq OR gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a lease event is never replaced'); END;
+trigger meta_frozen
+CREATE TRIGGER meta_frozen BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'store metadata is written once'); END;
+trigger meta_kept
+CREATE TRIGGER meta_kept BEFORE DELETE ON meta BEGIN SELECT RAISE(ABORT, 'store metadata is written once'); END;
+trigger meta_no_replace
+CREATE TRIGGER meta_no_replace BEFORE INSERT ON meta WHEN EXISTS (SELECT 1 FROM meta WHERE key = NEW.key OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'store metadata is written once'); END;
+trigger mission_acceptances_frozen
+CREATE TRIGGER mission_acceptances_frozen BEFORE UPDATE ON mission_acceptances BEGIN SELECT RAISE(ABORT, 'a mission acceptance is append-only'); END;
+trigger mission_acceptances_kept
+CREATE TRIGGER mission_acceptances_kept BEFORE DELETE ON mission_acceptances BEGIN SELECT RAISE(ABORT, 'a mission acceptance is append-only'); END;
+trigger mission_acceptances_no_replace
+CREATE TRIGGER mission_acceptances_no_replace BEFORE INSERT ON mission_acceptances WHEN EXISTS (SELECT 1 FROM mission_acceptances WHERE acceptance_id = NEW.acceptance_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a mission acceptance is never replaced'); END;
+trigger mission_revisions_frozen
+CREATE TRIGGER mission_revisions_frozen BEFORE UPDATE ON mission_revisions BEGIN SELECT RAISE(ABORT, 'a mission revision is append-only'); END;
+trigger mission_revisions_kept
+CREATE TRIGGER mission_revisions_kept BEFORE DELETE ON mission_revisions BEGIN SELECT RAISE(ABORT, 'a mission revision is append-only'); END;
+trigger mission_revisions_next
+CREATE TRIGGER mission_revisions_next BEFORE INSERT ON mission_revisions WHEN NEW.rev != COALESCE((SELECT MAX(rev) FROM mission_revisions WHERE mission_id = NEW.mission_id), 0) + 1 OR EXISTS (SELECT 1 FROM mission_revisions WHERE rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a revision is the next rev of its mission'); END;
+trigger missions_frozen
+CREATE TRIGGER missions_frozen BEFORE UPDATE ON missions BEGIN SELECT RAISE(ABORT, 'a mission is append-only'); END;
+trigger missions_kept
+CREATE TRIGGER missions_kept BEFORE DELETE ON missions BEGIN SELECT RAISE(ABORT, 'a mission is append-only'); END;
+trigger missions_no_replace
+CREATE TRIGGER missions_no_replace BEFORE INSERT ON missions WHEN EXISTS (SELECT 1 FROM missions WHERE mission_id = NEW.mission_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a mission is never replaced'); END;
+trigger open_acks_frozen
+CREATE TRIGGER open_acks_frozen BEFORE UPDATE ON open_acks BEGIN SELECT RAISE(ABORT, 'an open acknowledgement is append-only'); END;
+trigger open_acks_kept
+CREATE TRIGGER open_acks_kept BEFORE DELETE ON open_acks BEGIN SELECT RAISE(ABORT, 'an open acknowledgement is append-only'); END;
+trigger open_acks_no_replace
+CREATE TRIGGER open_acks_no_replace BEFORE INSERT ON open_acks WHEN EXISTS (SELECT 1 FROM open_acks WHERE open_id = NEW.open_id AND reader_session = NEW.reader_session) BEGIN SELECT RAISE(ABORT, 'an open acknowledgement is never replaced'); END;
+trigger open_acks_read_back
+CREATE TRIGGER open_acks_read_back BEFORE INSERT ON open_acks WHEN (SELECT seam_kind FROM open_builds WHERE open_id = NEW.open_id) IN ('rotation', 'dream') AND length(trim(NEW.read_back, ' ' || char(9, 10, 11, 12, 13))) = 0 BEGIN SELECT RAISE(ABORT, 'a rotation or dream open is acknowledged with a read-back'); END;
+trigger open_builds_frozen
+CREATE TRIGGER open_builds_frozen BEFORE UPDATE ON open_builds BEGIN SELECT RAISE(ABORT, 'an open build is append-only'); END;
+trigger open_builds_kept
+CREATE TRIGGER open_builds_kept BEFORE DELETE ON open_builds BEGIN SELECT RAISE(ABORT, 'an open build is append-only'); END;
+trigger open_builds_no_replace
+CREATE TRIGGER open_builds_no_replace BEFORE INSERT ON open_builds WHEN EXISTS (SELECT 1 FROM open_builds WHERE open_id = NEW.open_id OR (signal_kind = NEW.signal_kind AND signal_key = NEW.signal_key)) BEGIN SELECT RAISE(ABORT, 'an open build is never replaced'); END;
+trigger open_deliveries_frozen
+CREATE TRIGGER open_deliveries_frozen BEFORE UPDATE ON open_deliveries BEGIN SELECT RAISE(ABORT, 'an open delivery is append-only'); END;
+trigger open_deliveries_kept
+CREATE TRIGGER open_deliveries_kept BEFORE DELETE ON open_deliveries BEGIN SELECT RAISE(ABORT, 'an open delivery is append-only'); END;
+trigger open_deliveries_no_replace
+CREATE TRIGGER open_deliveries_no_replace BEFORE INSERT ON open_deliveries WHEN EXISTS (SELECT 1 FROM open_deliveries WHERE open_id = NEW.open_id AND surface = NEW.surface AND recipient_launch_id = NEW.recipient_launch_id) BEGIN SELECT RAISE(ABORT, 'an open delivery is never replaced'); END;
+trigger open_unsequenced_cuts_frozen
+CREATE TRIGGER open_unsequenced_cuts_frozen BEFORE UPDATE ON open_unsequenced_cuts BEGIN SELECT RAISE(ABORT, 'an unsequenced cut is append-only'); END;
+trigger open_unsequenced_cuts_kept
+CREATE TRIGGER open_unsequenced_cuts_kept BEFORE DELETE ON open_unsequenced_cuts BEGIN SELECT RAISE(ABORT, 'an unsequenced cut is append-only'); END;
+trigger open_unsequenced_cuts_no_replace
+CREATE TRIGGER open_unsequenced_cuts_no_replace BEFORE INSERT ON open_unsequenced_cuts WHEN EXISTS (SELECT 1 FROM open_unsequenced_cuts WHERE open_id = NEW.open_id AND table_name = NEW.table_name) BEGIN SELECT RAISE(ABORT, 'an unsequenced cut is never replaced'); END;
+trigger operator_views_forward
+CREATE TRIGGER operator_views_forward BEFORE INSERT ON operator_views WHEN NEW.gseq <= COALESCE((SELECT MAX(gseq) FROM operator_views WHERE viewer = NEW.viewer), -1) BEGIN SELECT RAISE(ABORT, 'the operator work cursor only moves forward'); END;
+trigger operator_views_frozen
+CREATE TRIGGER operator_views_frozen BEFORE UPDATE ON operator_views BEGIN SELECT RAISE(ABORT, 'an operator view is append-only'); END;
+trigger operator_views_kept
+CREATE TRIGGER operator_views_kept BEFORE DELETE ON operator_views BEGIN SELECT RAISE(ABORT, 'an operator view is append-only'); END;
+trigger ready_items_frozen
+CREATE TRIGGER ready_items_frozen BEFORE UPDATE ON ready_items BEGIN SELECT RAISE(ABORT, 'a ready item state is append-only'); END;
+trigger ready_items_journaled
+CREATE TRIGGER ready_items_journaled BEFORE INSERT ON ready_items WHEN NOT EXISTS (SELECT 1 FROM ready_journal j WHERE j.id = NEW.id AND j.ver = NEW.ver AND j.to_category = NEW.category AND j.to_status = NEW.status AND j.repo = NEW.repo AND j.who = NEW.set_by) BEGIN SELECT RAISE(ABORT, 'a ready item state is written only with its journal record'); END;
+trigger ready_items_kept
+CREATE TRIGGER ready_items_kept BEFORE DELETE ON ready_items BEGIN SELECT RAISE(ABORT, 'a ready item state is append-only'); END;
+trigger ready_items_no_replace
+CREATE TRIGGER ready_items_no_replace BEFORE INSERT ON ready_items WHEN EXISTS (SELECT 1 FROM ready_items WHERE (id = NEW.id AND ver = NEW.ver) OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a ready item state is never replaced'); END;
+trigger ready_items_service_facts
+CREATE TRIGGER ready_items_service_facts BEFORE INSERT ON ready_items WHEN NEW.set_by = 'service' AND (NEW.ver = 1 OR NOT EXISTS (SELECT 1 FROM ready_items p WHERE p.id = NEW.id AND p.ver = NEW.ver - 1) OR EXISTS (SELECT 1 FROM ready_items p WHERE p.id = NEW.id AND p.ver = NEW.ver - 1 AND (p.repo IS NOT NEW.repo OR p.title IS NOT NEW.title OR p.status IS NOT NEW.status OR p.category IS NOT NEW.category OR p.tier IS NOT NEW.tier OR p.done_line IS NOT NEW.done_line OR p.depends_on IS NOT NEW.depends_on OR p.rank IS NOT NEW.rank OR p.hold IS NOT NEW.hold OR p.residue IS NOT NEW.residue OR p.ref IS NOT NEW.ref))) BEGIN SELECT RAISE(ABORT, 'the service records facts only: it changes the landed sha and branch of an item, nothing else (who service names the service alone; a coordinator writes under another name)'); END;
+trigger ready_journal_frozen
+CREATE TRIGGER ready_journal_frozen BEFORE UPDATE ON ready_journal BEGIN SELECT RAISE(ABORT, 'the ready journal is append-only'); END;
+trigger ready_journal_kept
+CREATE TRIGGER ready_journal_kept BEFORE DELETE ON ready_journal BEGIN SELECT RAISE(ABORT, 'the ready journal is append-only'); END;
+trigger ready_journal_next
+CREATE TRIGGER ready_journal_next BEFORE INSERT ON ready_journal WHEN NEW.ver != COALESCE((SELECT MAX(ver) FROM ready_journal WHERE id = NEW.id), 0) + 1 OR NEW.ver != COALESCE((SELECT MAX(ver) FROM ready_items WHERE id = NEW.id), 0) + 1 OR NEW.from_category IS NOT (SELECT category FROM ready_items WHERE id = NEW.id ORDER BY ver DESC LIMIT 1) OR NEW.from_status IS NOT (SELECT status FROM ready_items WHERE id = NEW.id ORDER BY ver DESC LIMIT 1) OR NEW.repo != COALESCE((SELECT repo FROM ready_items WHERE id = NEW.id ORDER BY ver LIMIT 1), NEW.repo) BEGIN SELECT RAISE(ABORT, 'a journal record is the next transition of its item'); END;
+trigger ready_journal_no_replace
+CREATE TRIGGER ready_journal_no_replace BEFORE INSERT ON ready_journal WHEN EXISTS (SELECT 1 FROM ready_journal WHERE (id = NEW.id AND ver = NEW.ver) OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a journal record is never replaced'); END;
+trigger ready_journal_service_facts
+CREATE TRIGGER ready_journal_service_facts BEFORE INSERT ON ready_journal WHEN NEW.who = 'service' AND (NEW.source != 'correction' OR NEW.ver = 1 OR NEW.from_category IS NOT NEW.to_category OR NEW.from_status IS NOT NEW.to_status) BEGIN SELECT RAISE(ABORT, 'the service records facts only: it never adds or moves an item (who service names the service alone; a coordinator writes under another name)'); END;
+trigger replies_bound_drop
+CREATE TRIGGER replies_bound_drop BEFORE INSERT ON replies WHEN NEW.kind = 'coordinator_reply' AND (NEW.ref_store != 'drops' OR NOT EXISTS (SELECT 1 FROM drops WHERE drop_id = NEW.ref_id)) BEGIN SELECT RAISE(ABORT, 'a coordinator reply names a drop that exists'); END;
+trigger replies_bound_once
+CREATE TRIGGER replies_bound_once BEFORE INSERT ON replies WHEN NEW.kind = 'coordinator_reply' AND (EXISTS (SELECT 1 FROM replies WHERE kind = 'coordinator_reply' AND ref_store = NEW.ref_store AND ref_id = NEW.ref_id)) BEGIN SELECT RAISE(ABORT, 'a drop has one coordinator reply'); END;
+trigger replies_bound_window
+CREATE TRIGGER replies_bound_window BEFORE INSERT ON replies WHEN NEW.kind = 'coordinator_reply' AND (EXISTS (SELECT 1 FROM drops WHERE drop_id = NEW.ref_id) AND (julianday(NEW.at) IS NULL OR (SELECT julianday(received_at) FROM drops WHERE drop_id = NEW.ref_id) IS NULL OR (julianday(NEW.at) - (SELECT julianday(received_at) FROM drops WHERE drop_id = NEW.ref_id)) * 24 NOT BETWEEN 0 AND 24)) BEGIN SELECT RAISE(ABORT, 'a coordinator reply comes within the window of its drop'); END;
+trigger replies_frozen
+CREATE TRIGGER replies_frozen BEFORE UPDATE ON replies BEGIN SELECT RAISE(ABORT, 'a reply is append-only'); END;
+trigger replies_gseq_no_replace
+CREATE TRIGGER replies_gseq_no_replace BEFORE INSERT ON replies WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM replies WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a reply is never replaced'); END;
+trigger replies_kept
+CREATE TRIGGER replies_kept BEFORE DELETE ON replies BEGIN SELECT RAISE(ABORT, 'a reply is append-only'); END;
+trigger replies_no_replace
+CREATE TRIGGER replies_no_replace BEFORE INSERT ON replies WHEN EXISTS (SELECT 1 FROM replies WHERE reply_id = NEW.reply_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a reply is never replaced'); END;
+trigger report_refusals_frozen
+CREATE TRIGGER report_refusals_frozen BEFORE UPDATE ON report_refusals BEGIN SELECT RAISE(ABORT, 'a report refusal is append-only'); END;
+trigger report_refusals_kept
+CREATE TRIGGER report_refusals_kept BEFORE DELETE ON report_refusals BEGIN SELECT RAISE(ABORT, 'a report refusal is append-only'); END;
+trigger report_refusals_no_replace
+CREATE TRIGGER report_refusals_no_replace BEFORE INSERT ON report_refusals WHEN EXISTS (SELECT 1 FROM report_refusals WHERE seq = NEW.seq OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a report refusal is never replaced'); END;
+trigger report_refusals_not_applied
+CREATE TRIGGER report_refusals_not_applied BEFORE INSERT ON report_refusals WHEN EXISTS (SELECT 1 FROM worker_attach WHERE report_id = NEW.report_id) BEGIN SELECT RAISE(ABORT, 'an applied report is never refused'); END;
+trigger review_events_alternate
+CREATE TRIGGER review_events_alternate BEFORE INSERT ON review_events WHEN NEW.op = COALESCE((SELECT op FROM review_events WHERE item_id = NEW.item_id ORDER BY seq DESC LIMIT 1), 'reopened') BEGIN SELECT RAISE(ABORT, 'a review item alternates cleared and reopened'); END;
+trigger review_events_authority
+CREATE TRIGGER review_events_authority BEFORE INSERT ON review_events WHEN NEW.op = 'cleared' AND NEW.by = 'coordinator' AND (SELECT authority_relevant FROM review_items WHERE item_id = NEW.item_id) = 1 BEGIN SELECT RAISE(ABORT, 'an authority-relevant item is not cleared in coordinator mode'); END;
+trigger review_events_foreign
+CREATE TRIGGER review_events_foreign BEFORE INSERT ON review_events WHEN NEW.op = 'cleared' AND NEW.by = 'coordinator' AND NEW.mode = 'coordinator' AND COALESCE((SELECT authority_relevant FROM review_items WHERE item_id = NEW.item_id), 0) = 0 AND COALESCE((SELECT by FROM review_items WHERE item_id = NEW.item_id), '') != 'coordinator' BEGIN SELECT RAISE(ABORT, 'the coordinator''s mode clears only an item the coordinator filed'); END;
+trigger review_events_frozen
+CREATE TRIGGER review_events_frozen BEFORE UPDATE ON review_events BEGIN SELECT RAISE(ABORT, 'a review event is append-only'); END;
+trigger review_events_gseq_no_replace
+CREATE TRIGGER review_events_gseq_no_replace BEFORE INSERT ON review_events WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM review_events WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a review event is never replaced'); END;
+trigger review_events_kept
+CREATE TRIGGER review_events_kept BEFORE DELETE ON review_events BEGIN SELECT RAISE(ABORT, 'a review event is append-only'); END;
+trigger review_events_mode
+CREATE TRIGGER review_events_mode BEFORE INSERT ON review_events WHEN (NEW.mode = 'coordinator') != (NEW.by = 'coordinator') BEGIN SELECT RAISE(ABORT, 'the coordinator mode is the coordinator''s and nobody else''s'); END;
+trigger review_events_next
+CREATE TRIGGER review_events_next BEFORE INSERT ON review_events WHEN NEW.seq != COALESCE((SELECT MAX(seq) FROM review_events WHERE item_id = NEW.item_id), 0) + 1 OR EXISTS (SELECT 1 FROM review_events WHERE rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a review event is the next seq of its item'); END;
+trigger review_items_frozen
+CREATE TRIGGER review_items_frozen BEFORE UPDATE ON review_items BEGIN SELECT RAISE(ABORT, 'a review item is append-only'); END;
+trigger review_items_gseq_no_replace
+CREATE TRIGGER review_items_gseq_no_replace BEFORE INSERT ON review_items WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM review_items WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a review item is never replaced'); END;
+trigger review_items_kept
+CREATE TRIGGER review_items_kept BEFORE DELETE ON review_items BEGIN SELECT RAISE(ABORT, 'a review item is append-only'); END;
+trigger review_items_no_replace
+CREATE TRIGGER review_items_no_replace BEFORE INSERT ON review_items WHEN EXISTS (SELECT 1 FROM review_items WHERE item_id = NEW.item_id OR dedupe_key = NEW.dedupe_key OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a review item is never replaced'); END;
+trigger review_marks_forward
+CREATE TRIGGER review_marks_forward BEFORE INSERT ON review_marks WHEN NEW.seq != COALESCE((SELECT MAX(seq) FROM review_marks WHERE feed = NEW.feed), 0) + 1 OR NEW.value < COALESCE((SELECT MAX(value) FROM review_marks WHERE feed = NEW.feed), 0) BEGIN SELECT RAISE(ABORT, 'a review mark is the next one and moves forward'); END;
+trigger review_marks_frozen
+CREATE TRIGGER review_marks_frozen BEFORE UPDATE ON review_marks BEGIN SELECT RAISE(ABORT, 'a review mark is append-only'); END;
+trigger review_marks_kept
+CREATE TRIGGER review_marks_kept BEFORE DELETE ON review_marks BEGIN SELECT RAISE(ABORT, 'a review mark is append-only'); END;
+trigger run_records_frozen
+CREATE TRIGGER run_records_frozen BEFORE UPDATE ON run_records BEGIN SELECT RAISE(ABORT, 'a run record is written once'); END;
+trigger run_records_kept
+CREATE TRIGGER run_records_kept BEFORE DELETE ON run_records BEGIN SELECT RAISE(ABORT, 'a run record is written once'); END;
+trigger run_records_no_replace
+CREATE TRIGGER run_records_no_replace BEFORE INSERT ON run_records WHEN EXISTS (SELECT 1 FROM run_records WHERE (job_id = NEW.job_id AND run = NEW.run) OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a run record is never replaced'); END;
+trigger seam_handoffs_frozen
+CREATE TRIGGER seam_handoffs_frozen BEFORE UPDATE ON seam_handoffs BEGIN SELECT RAISE(ABORT, 'a seam handoff is append-only'); END;
+trigger seam_handoffs_kept
+CREATE TRIGGER seam_handoffs_kept BEFORE DELETE ON seam_handoffs BEGIN SELECT RAISE(ABORT, 'a seam handoff is append-only'); END;
+trigger seam_handoffs_kind
+CREATE TRIGGER seam_handoffs_kind BEFORE INSERT ON seam_handoffs WHEN NEW.seam_kind NOT IN ('rotation', 'operator', 'dream') BEGIN SELECT RAISE(ABORT, 'a seam handoff is of kind rotation, operator or dream'); END;
+trigger seam_handoffs_no_replace
+CREATE TRIGGER seam_handoffs_no_replace BEFORE INSERT ON seam_handoffs WHEN EXISTS (SELECT 1 FROM seam_handoffs WHERE close_key = NEW.close_key OR gseq = NEW.gseq OR handoff_id = NEW.handoff_id) BEGIN SELECT RAISE(ABORT, 'a seam handoff is never replaced'); END;
+trigger seam_handoffs_prev
+CREATE TRIGGER seam_handoffs_prev BEFORE INSERT ON seam_handoffs WHEN NEW.prev_handoff_id IS NOT (SELECT MAX(handoff_id) FROM seam_handoffs) BEGIN SELECT RAISE(ABORT, 'a newer handoff exists'); END;
+trigger seam_handoffs_size
+CREATE TRIGGER seam_handoffs_size BEFORE INSERT ON seam_handoffs WHEN length(CAST(NEW.body AS BLOB)) > 16384 OR CASE WHEN json_valid(NEW.body) THEN COALESCE(json_array_length(NEW.body, '$.in_flight'), 0) > 50 OR COALESCE(json_array_length(NEW.body, '$.contingencies'), 0) > 50 ELSE 0 END BEGIN SELECT RAISE(ABORT, 'a seam handoff body is over its size cap'); END;
+trigger seam_handoffs_state_line
+CREATE TRIGGER seam_handoffs_state_line BEFORE INSERT ON seam_handoffs WHEN CASE WHEN json_valid(NEW.body) THEN COALESCE(json_type(NEW.body, '$.state_line'), '') != 'text' OR length(trim(json_extract(NEW.body, '$.state_line'), ' ' || char(9, 10, 11, 12, 13))) = 0 ELSE 1 END BEGIN SELECT RAISE(ABORT, 'a seam handoff needs a state_line'); END;
+trigger sessions_seen_forward
+CREATE TRIGGER sessions_seen_forward BEFORE UPDATE ON sessions_seen WHEN NEW.session_id IS NOT OLD.session_id OR NEW.first_seen IS NOT OLD.first_seen OR NEW.last_seen < OLD.last_seen BEGIN SELECT RAISE(ABORT, 'a seen session only moves its last sighting forward'); END;
+trigger sessions_seen_kept_recent
+CREATE TRIGGER sessions_seen_kept_recent BEFORE DELETE ON sessions_seen WHEN julianday(OLD.last_seen) > julianday((SELECT MAX(last_seen) FROM sessions_seen)) - 0.041666666666666664 BEGIN SELECT RAISE(ABORT, 'a seen session is deleted only once it is long unseen'); END;
+trigger signatures_frozen
+CREATE TRIGGER signatures_frozen BEFORE UPDATE ON signatures BEGIN SELECT RAISE(ABORT, 'a signature is written once'); END;
+trigger signatures_kept
+CREATE TRIGGER signatures_kept BEFORE DELETE ON signatures BEGIN SELECT RAISE(ABORT, 'a signature is written once'); END;
+trigger signatures_no_replace
+CREATE TRIGGER signatures_no_replace BEFORE INSERT ON signatures WHEN EXISTS (SELECT 1 FROM signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a signature is never replaced'); END;
+trigger team_draft_events_final
+CREATE TRIGGER team_draft_events_final BEFORE INSERT ON team_draft_events WHEN EXISTS (SELECT 1 FROM team_draft_events WHERE draft_id = NEW.draft_id AND event IN ('withdrawn', 'promoted')) BEGIN SELECT RAISE(ABORT, 'a withdrawn or promoted draft is final'); END;
+trigger team_draft_events_frozen
+CREATE TRIGGER team_draft_events_frozen BEFORE UPDATE ON team_draft_events BEGIN SELECT RAISE(ABORT, 'a team draft event is append-only'); END;
+trigger team_draft_events_gseq_no_replace
+CREATE TRIGGER team_draft_events_gseq_no_replace BEFORE INSERT ON team_draft_events WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM team_draft_events WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a team draft event is never replaced'); END;
+trigger team_draft_events_kept
+CREATE TRIGGER team_draft_events_kept BEFORE DELETE ON team_draft_events BEGIN SELECT RAISE(ABORT, 'a team draft event is append-only'); END;
+trigger team_draft_events_next
+CREATE TRIGGER team_draft_events_next BEFORE INSERT ON team_draft_events WHEN NEW.seq != COALESCE((SELECT MAX(seq) FROM team_draft_events WHERE draft_id = NEW.draft_id), 0) + 1 OR EXISTS (SELECT 1 FROM team_draft_events WHERE rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'an event is the next seq of its draft'); END;
+trigger team_drafts_frozen
+CREATE TRIGGER team_drafts_frozen BEFORE UPDATE ON team_drafts BEGIN SELECT RAISE(ABORT, 'a team draft is append-only'); END;
+trigger team_drafts_gseq_no_replace
+CREATE TRIGGER team_drafts_gseq_no_replace BEFORE INSERT ON team_drafts WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM team_drafts WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a team draft is never replaced'); END;
+trigger team_drafts_kept
+CREATE TRIGGER team_drafts_kept BEFORE DELETE ON team_drafts BEGIN SELECT RAISE(ABORT, 'a team draft is append-only'); END;
+trigger team_drafts_no_replace
+CREATE TRIGGER team_drafts_no_replace BEFORE INSERT ON team_drafts WHEN EXISTS (SELECT 1 FROM team_drafts WHERE draft_id = NEW.draft_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a team draft is never replaced'); END;
+trigger thread_events_frozen
+CREATE TRIGGER thread_events_frozen BEFORE UPDATE ON thread_events BEGIN SELECT RAISE(ABORT, 'a thread event is append-only'); END;
+trigger thread_events_gseq_no_replace
+CREATE TRIGGER thread_events_gseq_no_replace BEFORE INSERT ON thread_events WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM thread_events WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a thread event is never replaced'); END;
+trigger thread_events_kept
+CREATE TRIGGER thread_events_kept BEFORE DELETE ON thread_events BEGIN SELECT RAISE(ABORT, 'a thread event is append-only'); END;
+trigger thread_events_next
+CREATE TRIGGER thread_events_next BEFORE INSERT ON thread_events WHEN NEW.seq != COALESCE((SELECT MAX(seq) FROM thread_events WHERE thread_id = NEW.thread_id), 0) + 1 OR EXISTS (SELECT 1 FROM thread_events WHERE rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'an event is the next seq of its thread'); END;
+trigger thread_revisions_frozen
+CREATE TRIGGER thread_revisions_frozen BEFORE UPDATE ON thread_revisions BEGIN SELECT RAISE(ABORT, 'a thread revision is append-only'); END;
+trigger thread_revisions_gseq_no_replace
+CREATE TRIGGER thread_revisions_gseq_no_replace BEFORE INSERT ON thread_revisions WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM thread_revisions WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a thread revision is never replaced'); END;
+trigger thread_revisions_kept
+CREATE TRIGGER thread_revisions_kept BEFORE DELETE ON thread_revisions BEGIN SELECT RAISE(ABORT, 'a thread revision is append-only'); END;
+trigger thread_revisions_next
+CREATE TRIGGER thread_revisions_next BEFORE INSERT ON thread_revisions WHEN NEW.rev != COALESCE((SELECT MAX(rev) FROM thread_revisions WHERE thread_id = NEW.thread_id), 0) + 1 OR EXISTS (SELECT 1 FROM thread_revisions WHERE rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a revision is the next rev of its thread'); END;
+trigger threads_frozen
+CREATE TRIGGER threads_frozen BEFORE UPDATE ON threads BEGIN SELECT RAISE(ABORT, 'a thread is append-only'); END;
+trigger threads_gseq_no_replace
+CREATE TRIGGER threads_gseq_no_replace BEFORE INSERT ON threads WHEN NEW.gseq IS NOT NULL AND EXISTS (SELECT 1 FROM threads WHERE gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a thread is never replaced'); END;
+trigger threads_kept
+CREATE TRIGGER threads_kept BEFORE DELETE ON threads BEGIN SELECT RAISE(ABORT, 'a thread is append-only'); END;
+trigger threads_no_replace
+CREATE TRIGGER threads_no_replace BEFORE INSERT ON threads WHEN EXISTS (SELECT 1 FROM threads WHERE thread_id = NEW.thread_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a thread is never replaced'); END;
+trigger transitions_frozen
+CREATE TRIGGER transitions_frozen BEFORE UPDATE ON transitions BEGIN SELECT RAISE(ABORT, 'transitions are append-only'); END;
+trigger transitions_kept
+CREATE TRIGGER transitions_kept BEFORE DELETE ON transitions BEGIN SELECT RAISE(ABORT, 'transitions are append-only'); END;
+trigger transitions_next
+CREATE TRIGGER transitions_next BEFORE INSERT ON transitions WHEN NEW.seq != COALESCE((SELECT MAX(seq) FROM transitions WHERE job_id = NEW.job_id), 0) + 1 OR EXISTS (SELECT 1 FROM transitions WHERE rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a transition is the next seq of its job'); END;
+trigger verifier_refusals_frozen
+CREATE TRIGGER verifier_refusals_frozen BEFORE UPDATE ON verifier_refusals BEGIN SELECT RAISE(ABORT, 'a verifier refusal is recorded once'); END;
+trigger verifier_refusals_kept
+CREATE TRIGGER verifier_refusals_kept BEFORE DELETE ON verifier_refusals BEGIN SELECT RAISE(ABORT, 'a verifier refusal is recorded once'); END;
+trigger verifier_refusals_no_replace
+CREATE TRIGGER verifier_refusals_no_replace BEFORE INSERT ON verifier_refusals WHEN EXISTS (SELECT 1 FROM verifier_refusals WHERE job_id = NEW.job_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a verifier refusal is never replaced'); END;
+trigger worker_attach_frozen
+CREATE TRIGGER worker_attach_frozen BEFORE UPDATE ON worker_attach BEGIN SELECT RAISE(ABORT, 'a worker-attach row is append-only'); END;
+trigger worker_attach_kept
+CREATE TRIGGER worker_attach_kept BEFORE DELETE ON worker_attach BEGIN SELECT RAISE(ABORT, 'a worker-attach row is append-only'); END;
+trigger worker_attach_no_replace
+CREATE TRIGGER worker_attach_no_replace BEFORE INSERT ON worker_attach WHEN EXISTS (SELECT 1 FROM worker_attach WHERE seq = NEW.seq OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a worker-attach row is never replaced'); END;
+trigger worker_attach_not_refused
+CREATE TRIGGER worker_attach_not_refused BEFORE INSERT ON worker_attach WHEN NEW.report_id IS NOT NULL AND EXISTS (SELECT 1 FROM report_refusals WHERE report_id = NEW.report_id) BEGIN SELECT RAISE(ABORT, 'a refused report is never applied'); END;
+trigger worker_attach_order
+CREATE TRIGGER worker_attach_order BEFORE INSERT ON worker_attach WHEN (NEW.kind = 'attach' AND (NOT EXISTS (SELECT 1 FROM ready_items WHERE id = NEW.item_id) OR EXISTS (SELECT 1 FROM worker_attach WHERE attach_id = NEW.attach_id))) OR (NEW.kind != 'attach' AND (NOT EXISTS (SELECT 1 FROM worker_attach WHERE attach_id = NEW.attach_id AND kind = 'attach' AND item_id = NEW.item_id AND worker = NEW.worker) OR EXISTS (SELECT 1 FROM worker_attach WHERE attach_id = NEW.attach_id AND kind = 'ended'))) BEGIN SELECT RAISE(ABORT, 'a worker-attach row follows its attach, and nothing follows ended'); END;
