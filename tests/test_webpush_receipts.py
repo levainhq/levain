@@ -957,6 +957,27 @@ def test_a_badge_call_that_never_settles_reports_timeout_and_the_receipt_still_g
 
 
 @needs_node
+def test_a_badge_count_past_what_the_server_keeps_is_capped_on_the_worker() -> None:
+    got = _run("ok+p409+badgehuge+badgeset")
+    assert _received(got)["badge"] == "set:999999999"
+    assert got["badgeCalls"] == [["set", 5000000000]]       # the device still gets the true count
+
+
+@needs_node
+def test_a_hanging_badge_call_does_not_hold_the_endpoint_hash_of_a_declarative_push() -> None:
+    got = _run("ok+p409+declarative+badgehang")
+    assert _received(got)["badge"] == "timeout"
+    assert got["subAfterMs"] is not None and got["subAfterMs"] < 700, got["subAfterMs"]    # serial: >= 1500
+
+
+@needs_node
+def test_a_hanging_badge_call_does_not_hold_the_shown_verification() -> None:
+    got = _run("ok+p409+badgehang")
+    assert any(p["body"]["kind"] == "shown" for p in got["posts"]), got["posts"]
+    assert got["getnLastAfterMs"] is not None and got["getnLastAfterMs"] < 700, got["getnLastAfterMs"]    # serial: >= 1500
+
+
+@needs_node
 def test_a_declarative_push_reports_its_badge_result_too() -> None:
     got = _run("ok+p409+declarative+badgeset")
     rec = _received(got)
@@ -981,33 +1002,86 @@ def test_the_receipt_the_worker_posts_is_recorded_and_reported(tmp_path: Path) -
     assert f"worker {SW_NOW}, badge error:NotAllowedError" in receipts.text(receipts.build(s))
 
 
-def test_the_server_refuses_a_malformed_sw_or_badge_and_a_badge_on_a_shown(store: PushStore) -> None:
+def test_a_malformed_sw_or_badge_is_stored_null_and_the_receipt_is_still_recorded(store: PushStore) -> None:
     ping = _ping(store)
     at = _ms()
-    for kw in ({"sw": "x y"}, {"sw": "a" * 41}, {"sw": 7}, {"badge": "set:abc"}, {"badge": "applied"}, {"badge": "set:1; drop"}):
-        assert store.add_receipt(H, ping, "received", at, **kw) == "bad_report", kw
-    assert store.add_receipt(H, ping, "shown", at, badge="set:1") == "bad_report"
-    assert store.add_receipt(H, ping, "received", at, sw=SW_NOW, badge="error:NotAllowedError") == "recorded"
+    bad = ({"sw": "x y"}, {"sw": "a" * 41}, {"sw": 7}, {"badge": "set:abc"}, {"badge": "applied"}, {"badge": "set:1; drop"},
+           {"badge": "set:1234567890"}, {"badge": 5})
+    for i, kw in enumerate(bad):
+        assert store.add_receipt(H, ping, "received", at + i, **kw) == "recorded", kw     # the delivery fact is kept
+    # a badge on a shown is not a thing this record keeps: the shown is recorded, the badge dropped
+    assert store.add_receipt(H, ping, "shown", at + 50, sw=SW_NOW, badge="set:1") == "recorded"
+    ping2 = _ping(store)
+    assert store.add_receipt(H, ping2, "received", at + 60, sw=SW_NOW, badge="set:999999999") == "recorded"
     with store.read() as c:
-        assert c.execute("SELECT COUNT(*) FROM receipts").fetchone()[0] == 1
+        rows = [tuple(r) for r in c.execute("SELECT kind, sw, badge FROM receipts ORDER BY id")]
+    assert rows == [("received", None, None)] * len(bad) + [("shown", SW_NOW, None), ("received", SW_NOW, "set:999999999")]
 
 
-def test_a_store_that_predates_the_columns_gains_them_and_keeps_its_rows(tmp_path: Path) -> None:
+def _old_store(tmp_path: Path) -> tuple[PushStore, int]:
+    """A store in the schema before row 187: the three columns gone, every trigger and index still in place (an intact old DB)."""
     phone(tmp_path, EP)
     s = PushStore(tmp_path)
     ping = _ping(s)
     assert s.add_receipt(H, ping, "received", _ms()) == "recorded"          # an old-worker report: no sw, no badge
-    with s.write() as c:
-        for t in ("receipts_frozen", "receipts_kept"):
-            c.execute(f"DROP TRIGGER {t}")
-        c.execute("ALTER TABLE receipts DROP COLUMN sw")
-        c.execute("ALTER TABLE receipts DROP COLUMN badge")
-        c.execute("ALTER TABLE taps DROP COLUMN sw")
+    import sqlite3
+    conn = sqlite3.connect(s.path, isolation_level=None)
+    try:
+        # SQLite will not drop a column while a trigger names its table's schema in a way it must reparse: take the triggers
+        # out for the drop, then put the SAME definitions back, so what the next open meets is an old table WITH its triggers
+        trig = conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name IN ('receipts','taps')").fetchall()
+        for name, _ in trig:
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute("ALTER TABLE receipts DROP COLUMN sw")
+        conn.execute("ALTER TABLE receipts DROP COLUMN badge")
+        conn.execute("ALTER TABLE taps DROP COLUMN sw")
+        for _, sql in trig:
+            conn.execute(sql)
+        assert {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")} >= {"receipts_frozen", "taps_kept"}
+    finally:
+        conn.close()
+    return s, ping
+
+
+def test_a_store_that_predates_the_columns_gains_them_and_keeps_its_rows(tmp_path: Path) -> None:
+    _, ping = _old_store(tmp_path)
     s2 = PushStore(tmp_path)
     assert s2.add_receipt(H, ping, "received", _ms() + 9, sw=SW_NOW, badge="cleared") == "recorded"
+    assert s2.add_receipt(H, ping, "clicked", _ms() + 20, sw=SW_NOW, target="/") == "recorded"
     with s2.read() as c:
         got = [tuple(r) for r in c.execute("SELECT sw, badge FROM receipts ORDER BY id")]
+        assert {r[1] for r in c.execute("PRAGMA table_info(taps)")} >= {"sw"}
     assert got == [(None, None), (SW_NOW, "cleared")]
+    assert receipts.build(s2)["pings"][0]["devices"][0]["sw"] == SW_NOW      # and the report reads the new columns
+
+
+def test_the_schema_check_sees_each_of_the_three_columns_missing(tmp_path: Path) -> None:
+    _old_store(tmp_path)
+    import sqlite3
+    conn = sqlite3.connect(PushStore(tmp_path).path)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert PushStore._schema_current(conn) is False        # an intact old schema is NOT current: the ALTERs must run
+    finally:
+        conn.close()
+    PushStore(tmp_path).add_receipt(H, 1, "shown", _ms())    # the open migrates (any answer)
+    conn = sqlite3.connect(PushStore(tmp_path).path)
+    conn.row_factory = sqlite3.Row
+    try:
+        assert PushStore._schema_current(conn) is True
+    finally:
+        conn.close()
+
+
+def test_the_worker_version_is_the_newest_report_across_receipts_and_taps(tmp_path: Path) -> None:
+    phone(tmp_path, EP)
+    s = PushStore(tmp_path)
+    ping = _ping(s)
+    t = _ms()
+    assert s.add_receipt(H, ping, "received", t, sw="old-1") == "recorded"
+    assert s.add_receipt(H, ping, "clicked", t + 500, sw="new-2") == "recorded"      # the latest report is a tap
+    (row,) = receipts.build(s)["pings"][0]["devices"]
+    assert row["sw"] == "new-2", row
 
 
 def test_the_http_route_accepts_the_new_keys_and_nothing_else(tmp_path: Path) -> None:
