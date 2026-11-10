@@ -1960,13 +1960,15 @@ KEEP_EPISODE_TAG = "list-keep"
 
 def keep_origin_key(intention: Mapping[str, Any]) -> str:
     """The episode key of a Keep of ``intention``: ``keep:`` + the sha256 hex of the intention's own ``origin_key``
-    (store-assigned once), else of its id for a legacy row that has none. One intention, one key, so a retry of the Keep lands
-    one episode (Q2, Phill 11-10). Hashed because anneal's key grammar is ``[0-9A-Za-z._:-]{1,128}``: an intention key may hold
-    spaces, Unicode or run to 128 characters on its own, and a hash is always 69 characters of the grammar."""
+    (store-assigned once), else of its id for a legacy row that has none (each under its own tag, ``origin:`` or ``id:``). One
+    intention, one key, so a retry of the Keep lands one episode (Q2, Phill 11-10). Hashed because anneal's key grammar is
+    ``[0-9A-Za-z._:-]{1,128}``: an intention key may hold spaces, Unicode or run to 128 characters on its own, and a hash is
+    always 69 characters of the grammar."""
     import hashlib
 
     ok = intention.get("origin_key")
-    basis = ok if isinstance(ok, str) and ok else str(intention.get("id"))
+    # a domain tag, so an intention whose origin key is X and a legacy one whose id is X never derive one key
+    basis = f"origin:{ok}" if isinstance(ok, str) and ok else f"id:{intention.get('id')}"
     return "keep:" + hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
@@ -2040,10 +2042,12 @@ def _apply_intention_keep(
     except ValueError as exc:          # a key anneal will not reuse (its episode was deleted), or one outside its grammar
         if isinstance(exc, AnnealMemoryError):           # one of anneal's own refusals, not the key's
             raise EditError("verb_failed", 422, f"the episode could not be written: {exc}") from exc
-        raise EditError(
-            "keep_key_retired", 409,
-            "this item was kept before and that memory was since deleted, and anneal never reuses a key: compost the "
-            f"item by hand instead of keeping it again ({exc})") from exc
+        if "belonged to a deleted episode" in str(exc):  # anneal's own text for a retired key (store.record), no typed error
+            raise EditError(
+                "keep_key_retired", 409,
+                "this item was kept before and that memory was since deleted, and anneal never reuses a key: compost "
+                f"the item by hand instead of keeping it again ({exc})") from exc
+        raise EditError("verb_failed", 422, f"the episode could not be written: {exc}") from exc
     except AnnealMemoryError as exc:
         raise EditError("verb_failed", 422, f"the episode could not be written: {exc}") from exc
     except OSError as exc:
