@@ -147,16 +147,23 @@ def build(store: PushStore, *, since: timedelta | None = None, ref: str | None =
         for r in c.execute("SELECT r.ping_id, r.device_id, SUM(r.kind = 'received') AS n, "
                            "MIN(CASE WHEN r.kind = 'received' THEN r.at END) AS received, "
                            "MIN(CASE WHEN r.kind = 'shown' THEN r.at END) AS shown, "
-                           # the newest report's worker version and the badge result of the first `received` (the push event's own)
-                           "(SELECT r2.sw FROM receipts r2 WHERE r2.ping_id = r.ping_id AND r2.device_id = r.device_id "
-                           "AND r2.sw IS NOT NULL ORDER BY r2.at DESC, r2.id DESC LIMIT 1) AS sw, "
+                           # the badge result of the first `received` (the push event's own)
                            "(SELECT r3.badge FROM receipts r3 WHERE r3.ping_id = r.ping_id AND r3.device_id = r.device_id "
                            "AND r3.badge IS NOT NULL ORDER BY r3.at, r3.id LIMIT 1) AS badge "
                            f"FROM receipts r JOIN pings p ON p.id = r.ping_id WHERE {_PINGS} "
                            "GROUP BY r.ping_id, r.device_id", args):
             x = cell(r["ping_id"], r["device_id"])
             x["received_n"], x["received"], x["shown"] = int(r["n"] or 0), r["received"], r["shown"]
-            x["sw"], x["badge"] = r["sw"], r["badge"]
+            x["badge"] = r["badge"]
+        # the worker version: the newest non-null report across receipts AND taps, ordered (at, source, id) so a tie is stable
+        for r in c.execute("SELECT ping_id, device_id, sw FROM ("
+                           "SELECT r.ping_id, r.device_id, r.at, 0 AS src, r.id, r.sw FROM receipts r "
+                           "JOIN pings p ON p.id = r.ping_id WHERE r.sw IS NOT NULL AND " + _PINGS + " "
+                           "UNION ALL "
+                           "SELECT t.ping_id, t.device_id, t.at, 1 AS src, t.id, t.sw FROM taps t "
+                           "JOIN pings p ON p.id = t.ping_id WHERE t.sw IS NOT NULL AND " + _PINGS + ") "
+                           "ORDER BY at, src, id", args + args):
+            cell(r["ping_id"], r["device_id"])["sw"] = r["sw"]
         for o in c.execute("SELECT o.ping_id, o.device_id, MIN(o.at) AS at FROM opens o JOIN pings p ON p.id = o.ping_id "
                            f"WHERE {_PINGS} AND o.device_id IS NOT NULL GROUP BY o.ping_id, o.device_id", args):
             cell(o["ping_id"], o["device_id"])["tapped"] = o["at"]
