@@ -18,7 +18,7 @@ VIEWS = {"390": {"emulate": {"w": 390, "h": 844, "dpr": 1, "mobile": True}}, "12
 
 def _measure(sel: str) -> str:
     return (f"(() => {{ const e = document.querySelector({json.dumps(sel)}); if (!e) return null; const r = e.getBoundingClientRect(); "
-            f"const p = e.parentElement.getBoundingClientRect(); return {{w: r.width, pw: p.width, h: r.height, "
+            f"const p = e.parentElement.getBoundingClientRect(); const sib = [...e.parentElement.children].filter(c => c !== e && c.offsetParent).map(c => c.getBoundingClientRect()).filter(c => c.top < r.bottom && c.bottom > r.top).reduce((a, c) => a + c.width, 0); return {{w: r.width, pw: p.width, sib: sib, h: r.height, "
             f"font: parseFloat(getComputedStyle(e).fontSize), over: document.documentElement.scrollWidth > window.innerWidth}}; }})()")
 
 
@@ -31,7 +31,8 @@ def _shot(tmp_path: Path, name: str) -> dict:
 def _wide(m: dict, rows: bool) -> None:
     assert m and not m["over"], m
     assert m["font"] >= 16, m                                  # iOS Safari zooms a focused field under 16px
-    assert m["w"] >= 0.9 * m["pw"] - 2, m                      # the full width of its sheet or card
+    # the full width of its sheet or card; controls that share the field's row (the voice icons, voice icons row) take their own width
+    assert m["w"] + m.get("sib", 0) >= 0.9 * m["pw"] - 2, m
     assert m["h"] >= (150 if rows else 40), m                  # ~8 rows for a message box; a tap target for a one-line answer
 
 
