@@ -2370,6 +2370,11 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-stat.warn, .tv-stat.warn b { color: var(--warn); }
 .tv-stat.bad, .tv-stat.bad b { color: var(--bad); }
 .tv-stat.dim { color: var(--meta); }
+/* the "waiting on you" figure when something waits and a card names where to go: a button, drawn as the figure it is (the .hot rule above colours it) */
+.tv-jump { appearance: none; background: none; border: 0; padding: 0; margin: 0; font: inherit; cursor: pointer; }
+.tv-jump:hover { text-decoration: underline; text-underline-offset: 3px; }
+.tv-jump:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
+@media (pointer: coarse) { .tv-jump { display: inline-flex; align-items: center; min-height: var(--hit-min); } }
 .tv-right { margin-left: auto; }
 .tv-conf { margin: 0 0 var(--sp-4); font-size: var(--fs-meta); color: var(--warn); }
 .tv-conf summary { cursor: pointer; }
@@ -2398,20 +2403,15 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-heat.cold { background: var(--meta); }
 .tv-heat.parked { background: none; border: 1px dashed var(--meta); }
 .tv-age { color: var(--meta); font-size: var(--fs-meta); font-variant-numeric: tabular-nums; white-space: nowrap; }
-/* the Work lens: records | tasks | outcomes. Wide, one grid: the records are a cell spanning every task row, a task and its
-   outcomes share a row (--tv-r, --tv-c set by the renderer). Narrow, the same children stack in DOM order. */
+/* the Work lens: tasks | outcomes. Wide, one grid: a task and its outcomes share a row (--tv-r, --tv-c set by the renderer). Narrow, the
+   same children stack in DOM order. What waits on you is the Needs strip's to list: the strip's "waiting on you" figure is a button that goes there. */
 .tv-work { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--sp-3); align-items: start; }
 .tv-work [hidden] { display: none; }
 .tv-links { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
 .tv-link { fill: none; stroke: var(--hair-2); stroke-width: 1.5; }
-.tv-link.waiting { stroke: var(--accent-line); }
 .tv-link.bad { stroke: var(--bad); stroke-dasharray: 3 3; }
 .tv-colh { font: var(--fw-semibold) var(--fs-micro)/1.4 var(--sans); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); margin-top: var(--sp-3); }
 .tv-colh2 { display: none; }
-.tv-wl { display: flex; flex-direction: column; gap: var(--sp-3); min-width: 0; }
-.tv-rec { display: flex; flex-direction: column; gap: var(--sp-1); min-width: 0; padding: var(--sp-3) var(--sp-4); border: 1px solid var(--accent-line); border-radius: var(--r-md); background: var(--accent-soft); }
-.tv-rec-t { font: var(--fw-bold) var(--fs-meta) var(--round); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tv-rec-m { font: var(--fw-regular) var(--fs-micro) var(--mono); color: var(--label); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tv-task { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; padding: var(--sp-3) var(--sp-4);
   background: var(--card-2); border: 1px solid var(--hair-2); border-radius: var(--r-md); }
 .tv-task.waiting { border-color: var(--accent-line); }
@@ -2446,16 +2446,14 @@ body.ke .panel[data-ck-panel="loops"] .row[data-intention] { scroll-margin-top: 
 .tv-leg { display: inline-flex; align-items: center; gap: var(--sp-2); }
 .tv-legdef { color: var(--meta); }
 @container (min-width: 780px) {      /* the card shares the row with Lost if closed from 1440, so its body is ~830 px there */
-  .tv-work { grid-template-columns: minmax(180px, 230px) minmax(0, 1fr) minmax(200px, 280px); column-gap: var(--sp-8, 40px); row-gap: var(--sp-3); }
-  .tv-work.tv-noouts { grid-template-columns: minmax(180px, 230px) minmax(0, 1fr); }
-  .tv-colh0 { grid-column: 1; grid-row: 1; }
-  .tv-colh1 { grid-column: 2; grid-row: 1; }
-  .tv-colh2 { display: block; grid-column: 3; grid-row: 1; }
+  .tv-work { grid-template-columns: minmax(0, 1fr) minmax(200px, 280px); column-gap: var(--sp-8, 40px); row-gap: var(--sp-3); }
+  .tv-work.tv-noouts { grid-template-columns: minmax(0, 1fr); }
+  .tv-colh1 { grid-column: 1; grid-row: 1; }
+  .tv-colh2 { display: block; grid-column: 2; grid-row: 1; }
   .tv-colh2[hidden] { display: none; }
-  .tv-wl { grid-column: 1; }
   .tv-task, .tv-outs, .tv-more { grid-column: var(--tv-c); grid-row: var(--tv-r); }
   .tv-more { justify-self: start; }
-  .tv-no-tasks { grid-column: 2; grid-row: 2; }
+  .tv-no-tasks { grid-column: 1; grid-row: 2; }
 }
 /* the Agents lens: the graph as the F12 mock draws it. The SVG carries every node, ring, edge and face; a canvas under it carries only the particle streams. */
 .tv-agents { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
@@ -2604,7 +2602,7 @@ body.ke .panel[data-ck-panel="loops"] .row[data-intention] { scroll-margin-top: 
 .lc-ok, .lc-unread { margin-left: auto; white-space: nowrap; color: var(--ok); }
 .lc-unread { color: var(--meta); }
 .lc-foot { margin: var(--sp-4) 0 0; padding-top: var(--sp-4); border-top: 1px solid var(--hair); font-size: var(--fs-micro); color: var(--meta); }
-@media (prefers-reduced-motion: no-preference) { .tv-task.waiting, .tv-rec { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; } .tv-needring:not(.calm) { animation: tv-needflash 1.4s ease-in-out 8; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
+@media (prefers-reduced-motion: no-preference) { .tv-task.waiting { animation: tv-breathe 3.2s ease-in-out 3; } .tv-pulse { animation: tv-ring 2.6s ease-in-out 4; } .tv-needring:not(.calm) { animation: tv-needflash 1.4s ease-in-out 8; }   /* finite, like traceBreathe: an infinite animation keeps the page compositing every frame (10-15) */ }
 @keyframes tv-breathe { 50% { box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 22%, transparent); } }
 @keyframes tv-needflash { 50% { opacity: .2; } }
 /* the open decision mark breathes: slow, small, no blink; only the badge and the leader line, never the ring. FINITE (8 cycles), like the rest of this block, played once per new open decision (the script arms the class only for it). Measured 10-25 in headless Chrome, 30 s per run, 3 runs per case,
@@ -2615,7 +2613,7 @@ body.ke .panel[data-ck-panel="loops"] .row[data-intention] { scroll-margin-top: 
 @keyframes tv-needlead { 50% { opacity: .35; } }   /* the leader line only fades: scaling a line would walk its ends off the pill */
 .tv-replaying .tv-needpulse { animation: none; }
 @keyframes tv-ring { 50% { transform: scale(0.82); opacity: .3; } }
-.tv-replaying .tv-task.waiting, .tv-replaying .tv-rec, .tv-replaying .tv-pulse, .tv-replaying .tv-needring, .tv-replaying .tv-hubmark *, .tv-replaying .tv-bezel.sweep .tv-bz-tick { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
+.tv-replaying .tv-task.waiting, .tv-replaying .tv-pulse, .tv-replaying .tv-needring, .tv-replaying .tv-hubmark *, .tv-replaying .tv-bezel.sweep .tv-bz-tick { animation: none; }       /* a frame from the ledger is still: nothing breathes or pulses */
 @container (max-width: 520px) { .tv-right { margin-left: 0; } .tv-bar { align-items: flex-start; } .tv-task-h { flex-wrap: wrap; } }
 .tv-more { align-self: flex-start; border: 1px solid var(--hair-2); background: none; color: var(--label); border-radius: var(--r-md); padding: var(--sp-1) var(--sp-4); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; }
 .tv-more:hover { background: var(--card-2); color: var(--text); }
