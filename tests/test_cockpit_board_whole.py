@@ -3,8 +3,9 @@
 The first board is drawn in parts and the whole draw then REPLACES every node, so anything a reader (or a test) did on a part was lost
 under them (the decisions tile that lost its focus, a /?view=needs jump that landed 495 px off, consent rows tapped on a part). Two earlier
 fixes marked the PARTIAL board with a flag that something had to clear, and each review found a new way for it to stay set or clear early.
-The frame is the other way round: ready is a POSITIVE whole-board signal, `html[data-board-whole]`, set only by the code that has just drawn
-the whole board (or a terminal failure), and the partial board is drawn inert (`#board[inert]`, dimmed) so nothing can be done on it.
+The frame is the other way round: ready is a POSITIVE whole-board signal, `html[data-board-whole]`, set when the whole
+board is drawn or when no whole draw is coming (a failed or refused read), never on a partial draw, and the partial board is drawn inert
+(the regions the draw replaces carry `inert`, dimmed) so nothing can be done on it.
 
 The partial window is made long by delaying every panel read after the first four (the core: activity, state, begin, decisions) to a fixed
 moment after the page started, so each state can be read in it. Steps in that window say `"partial": true` (the driver otherwise waits for
@@ -34,8 +35,9 @@ DELAY = """(() => { const f = window.fetch; const seen = new Set(); const t0 = D
 })();""".replace("HOLD", str(HOLD_MS))
 
 # the regions the draw replaces (dashboard_boot.js BOARD_REGIONS): #board holds the zones, and its siblings hold the hero, the Needs strip, the
-# drop, the notes, the brief and the widgets (the tiles), where a reader first acts. The masthead and the nav are not among them.
-REGIONS = ["ck-hero", "ck-needs", "ck-drop", "ck-notes", "ck-brief", "ck-widgets", "state", "board"]
+# notes, the brief and the widgets (the tiles), where a reader first acts. The masthead and the nav are not among them, and neither is the
+# drop (#ck-drop): its card is built once and refreshed in place, never replaced, so an inert drop would only stop the Drop tab's focus.
+REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-brief", "ck-widgets", "state", "board"]
 # the board is a part: the regions are inert, a tile is drawn in the widgets region, and the signal is not there
 PART_UP = ("(() => { const w = document.getElementById('ck-widgets'); return !!w && w.hasAttribute('inert') && !!w.querySelector('.ck-card') && "
            "!document.documentElement.hasAttribute('data-board-whole') && 1; })()")
@@ -46,7 +48,12 @@ STATE = """JSON.stringify((() => { const h = document.documentElement; const ids
   if (focusable) { if (!focusable.hasAttribute('tabindex')) focusable.setAttribute('tabindex', '-1'); focusable.focus(); focused = document.activeElement === focusable; }
   const live = (sel) => { const n = document.querySelector(sel); return !!n && !n.closest('[inert]'); };
   const w = document.getElementById('ck-widgets');
-  return { inert: present.filter((id) => document.getElementById(id).hasAttribute('inert')), present: present, whole: h.hasAttribute('data-board-whole'),
+  // the state line is inert and sits inside the hero (the now band's slot): it is dimmed through the hero, once, never twice
+  const st = document.getElementById('state'); let stateEff = null;
+  if (st && !st.hidden) { stateEff = 1; for (let n = st; n; n = n.parentElement) stateEff *= parseFloat(getComputedStyle(n).opacity); }
+  const dropEl = document.getElementById('ck-drop');
+  return { stateEff: stateEff, heroOpacity: getComputedStyle(document.getElementById('ck-hero')).opacity, stateInHero: !!st && !!st.closest('#ck-hero'),
+    dropInert: !!dropEl && !!dropEl.closest('[inert]'), dropPresent: !!dropEl, inert: present.filter((id) => document.getElementById(id).hasAttribute('inert')), present: present, whole: h.hasAttribute('data-board-whole'),
     tiles: w.querySelectorAll('.ck-card').length, opacity: getComputedStyle(w).opacity, focusableFound: !!focusable, focused: focused,
     live: { sync: live('#refresh'), nav: live('[data-phone-jump]'), theme: live('[data-theme-set]'), tab: live('[data-mode-tab]'), masthead: live('.masthead') },
     inertElsewhere: [...document.querySelectorAll('[inert]')].filter((n) => ids.indexOf(n.id) < 0).length }; })())""".replace("REGIONS", json.dumps(REGIONS))
@@ -92,6 +99,8 @@ def test_a_partial_board_is_inert_and_not_whole_and_the_whole_draw_is_live_and_s
     assert float(part["opacity"]) < 1, part                                   # inert has no look of its own: the part is dimmed
     assert part["focusableFound"] and part["focused"] is False, part          # nothing on the part takes focus
     assert all(part["live"].values()) and part["inertElsewhere"] == 0, part   # the masthead, the nav, Sync and the theme switch stay live
+    assert part["dropPresent"] and part["dropInert"] is False, part          # the drop is never replaced by the whole draw: it stays live (its tab focuses the box)
+    assert part["stateInHero"] and (part["stateEff"] is None or abs(part["stateEff"] - float(part["heroOpacity"])) < 0.01), part   # dimmed once, through the hero
     assert hits_part and all(h["inTile"] is False for h in hits_part), hits_part   # the press went to the page behind, never into the tile
     assert whole["inert"] == [] and whole["whole"] is True and float(whole["opacity"]) == 1, whole
     assert whole["focused"] is True, whole                                    # control: the same focus attempt lands on the live tile
