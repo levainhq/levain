@@ -264,6 +264,18 @@
   }
 
   // ---------------------------------------------------------------- render ----
+  // A redraw replaces the tile the reader had focused (or is about to get back from a closed focus view) before its successor is openable
+  // (a count tile gets its button role when its body has been fitted, a moment after the draw): the ask waits for that tile and gives
+  // focus to it then, only while focus is still on the page body, so it never takes focus from where the reader went in the meantime.
+  let focusAsk = null;
+  // the ask names a DOM dataset value (always a string) and the tile model names its panel by e.id (a string or a number): both sides compare as strings
+  function askTileFocus(id) { focusAsk = id ? { id: String(id), until: Date.now() + 3000 } : null; }
+  function giveTileFocus(node, id) {
+    if (!focusAsk || focusAsk.id !== String(id)) return;
+    if (Date.now() > focusAsk.until || (document.activeElement && document.activeElement !== document.body)) { focusAsk = null; return; }
+    focusAsk = null;
+    if (typeof node.focus === "function") node.focus({ preventScroll: true });
+  }
   function render(view, opts) {
     // The surface injects its write transport here; a port that provides none (the
     // parked MCP-App) renders read-only — no edit affordances, zero other change.
@@ -289,6 +301,8 @@
     // the typed panels about to be dropped end their timers and mounts first
     if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     const kept = captureKept(board);   // the rows the reader holds open, restored below once the board is drawn again
+    { const ae = document.activeElement;   // a focused open tile is replaced by this draw: its successor takes the focus
+      if (ae && ae !== document.body && ae.dataset && ae.dataset.ckPanel && ae.classList.contains("w-open")) askTileFocus(ae.dataset.ckPanel); }
     buildKept = kept;                  // a typed panel filled during this draw may owe the reader a later repaint of it
     board.replaceChildren();
 
@@ -861,6 +875,7 @@
           node.setAttribute("aria-haspopup", "dialog");
           // the entry as the page holds it now: a refetch since this tile was drawn may have changed its rows and its title
           node.setAttribute("aria-label", "Open " + String(e.title).replace(/\s*\(\d+\)\s*$/, "") + " in a focus view");
+          giveTileFocus(node, e.id);
         } else { node.removeAttribute("tabindex"); node.removeAttribute("role"); node.removeAttribute("aria-haspopup"); node.removeAttribute("aria-label"); }
       };
       node.addEventListener("click", (ev) => {
@@ -9507,7 +9522,9 @@
     modalReturnFocus = null;
     // a re-render of the widgets replaces the tile that opened the view: its successor is found by the panel id
     if (rf && !document.body.contains(rf) && rf.dataset && rf.dataset.ckPanel && rf.classList.contains("w-open")) {
-      rf = Array.prototype.find.call(document.querySelectorAll(".ck-card.w.w-open"), (n) => n.dataset.ckPanel === rf.dataset.ckPanel) || null;
+      const was = rf;
+      rf = Array.prototype.find.call(document.querySelectorAll(".ck-card.w.w-open"), (n) => n.dataset.ckPanel === was.dataset.ckPanel) || null;
+      if (!rf) askTileFocus(was.dataset.ckPanel);   // its successor is not openable yet: it takes focus when it is
     }
     // a repaint of the Work lens replaces the chip that opened the agent page: its successor is found by the node it names
     // (the node AND its task's card: one worker on two tasks has a chip on each, and only the one that opened the page is its successor)
