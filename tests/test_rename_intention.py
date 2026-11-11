@@ -18,6 +18,17 @@ sys.modules["rename_intention"] = ri
 _spec.loader.exec_module(ri)
 
 
+_REAL_RULES = list(ri.STORED_TOKEN_RULES)
+
+
+@pytest.fixture(autouse=True)
+def _small_rule_table(monkeypatch, request):
+    """The synthetic trees below run on the id-resolver rule alone; the real table is graded by its own test at the end
+    (its hand-listed site rules would, on a tree without those sites, drift by design)."""
+    if not request.node.name.startswith("test_the_real_rule_table"):
+        monkeypatch.setattr(ri, "STORED_TOKEN_RULES", _REAL_RULES[:1])
+
+
 # --- helpers ----------------------------------------------------------------------------------------------------
 
 def _write_tree(root: Path, files: dict[str, str]) -> None:
@@ -360,13 +371,13 @@ def test_crlf_line_endings_survive(tmp_path):
 # --- the refusals on a tree -----------------------------------------------------------------------------------------
 
 def test_an_identifier_that_already_exists_in_the_tree_refuses_and_lists_both(tmp_path, capsys):
-    _repo(tmp_path, {"levain/a.py": "def _spore_fire():\n    pass\n", "levain/b.py": "def _intention_fire():\n    pass\n",
+    _repo(tmp_path, {"levain/a.py": "def _spore_gate():\n    pass\n", "levain/b.py": "def _intention_gate():\n    pass\n",
                      "levain/c.py": "x = spore_ok\n"})
     before = _snapshot(tmp_path)
     assert ri.main(["--root", str(tmp_path), "--apply"]) == 2
     assert _snapshot(tmp_path) == before
     out = capsys.readouterr().out
-    assert "REFUSED" in out and "_spore_fire -> _intention_fire" in out and "### collision (1)" in out
+    assert "REFUSED" in out and "_spore_gate -> _intention_gate" in out and "### collision (1)" in out
     assert "spore_ok" not in out.split("## R8 refusals")[1].split("## NEEDS-RULE")[0]
 
 
@@ -454,8 +465,8 @@ def test_a_plain_directory_dry_runs_but_does_not_apply(tmp_path, capsys):
 def test_the_report_lists_counts_moves_refusals_needs_rule_and_the_seam(tmp_path):
     files = dict(_tree())
     files["levain/wire.py"] = 'KIND = "spore_touch"\n'
-    files["levain/a.py"] = "def _spore_fire():\n    pass\n"
-    files["levain/b.py"] = "def _intention_fire():\n    pass\n"
+    files["levain/a.py"] = "def _spore_gate():\n    pass\n"
+    files["levain/b.py"] = "def _intention_gate():\n    pass\n"
     _repo(tmp_path, files)
     report = tmp_path.parent / (tmp_path.name + "_report.md")
     assert ri.main(["--root", str(tmp_path), "--report", str(report)]) == 2
@@ -466,3 +477,72 @@ def test_the_report_lists_counts_moves_refusals_needs_rule_and_the_seam(tmp_path
                    "suggest pattern:", "## R5 anneal seam lines (2)", "REFUSED"):
         assert needle in text, needle
     assert "- rule 0" not in text      # the default INTENTION_ID rule did not fire in this tree
+
+
+# --- the lane that fills the rule table: collision resolutions, hand-listed sites, citations, the legacy constant ----
+
+def test_a_collision_resolution_gives_the_plain_row_variant_a_distinct_name(tmp_path):
+    _repo(tmp_path, {"levain/a.py": "def _spore_fire():\n    pass\n\n\n_SPORE_ROW = 1\n",
+                     "levain/b.py": "def _intention_fire():\n    pass\n\n\n_INTENTION_ROW = 2\nz = _spore_fire() + _SPORE_ROW\n"})
+    assert ri.main(["--root", str(tmp_path), "--apply"]) == 0
+    a = (tmp_path / "levain/a.py").read_text()
+    b = (tmp_path / "levain/b.py").read_text()
+    assert "def _plain_intention_fire" in a and "_PLAIN_INTENTION_ROW = 1" in a
+    assert "def _intention_fire" in b and "_INTENTION_ROW = 2" in b
+    assert "z = _plain_intention_fire() + _PLAIN_INTENTION_ROW" in b
+    assert ri.main(["--root", str(tmp_path), "--apply"]) == 0      # idempotent
+
+
+def test_a_resolution_target_that_already_exists_refuses_unless_the_old_name_is_a_merge(tmp_path, capsys):
+    _repo(tmp_path, {"levain/a.py": "def _spore_fire():\n    pass\n", "levain/b.py": "def _plain_intention_fire():\n    pass\n"})
+    assert ri.main(["--root", str(tmp_path)]) == 2
+    assert "the resolution target already exists" in capsys.readouterr().out
+    assert set(ri.MERGES) <= set(ri.COLLISION_RESOLUTIONS)      # a merge is a resolution too
+
+
+def test_a_merge_is_accepted_where_the_new_name_already_exists(tmp_path):
+    _repo(tmp_path, {"docs/a.md": "a `spore_*` verb\n", "docs/b.md": "an `intention_*` verb\n"})
+    assert ri.main(["--root", str(tmp_path), "--apply"]) == 0
+    assert (tmp_path / "docs/a.md").read_text() == "a `intention_*` verb\n"
+
+
+def test_a_context_rule_acts_only_where_the_line_matches_and_expect_counts_its_firings(tmp_path, capsys):
+    rule = ri.Rule(r"spore_id", "keep-as-legacy-constant", "persisted key", paths=("levain/*",), context=r"plan\[", expect=1)
+    out = _tx("levain/a.py", 'k = plan["spore_id"]\nv = {"spore_id": 1}\n', rules=[rule, ri.Rule(r"spore_", "rewrite", "rest")])
+    assert out.text == 'k = plan["spore_id"]\nv = {"intention_id": 1}\n'
+    files = {"levain/a.py": 'k = plan["spore_id"]\n', "levain/b.py": "x = 'spore_x'\n"}
+    _repo(tmp_path, files)
+    miss = ri.Rule(r"spore_gone", "rewrite", "a site that moved", paths=("levain/*",), always=True, expect=1, replacement="intention_gone")
+    plan = ri.build_plan(tmp_path, [rule, miss, ri.Rule(r"spore_", "rewrite", "rest")])
+    assert [m for c, m in plan.refusals if c == "rule drift"] == ["rule 1 (a site that moved) fired 0 times, expected 1"]
+
+
+def test_a_printed_id_citation_is_kept_by_a_path_rule_and_a_test_datum_is_not():
+    rule = ri.Rule(r"spore-\d+", "keep-as-legacy-constant", "history", paths=("levain/*",))
+    rest = ri.Rule(r"spore-\d", "rewrite", "test datum", paths=("tests/*",))
+    kept = _tx("levain/a.py", 'msg = "see spore-755 for why"\n# a comment on spore-755\n', rules=[rule, rest])
+    assert kept.text == 'msg = "see spore-755 for why"\n# a comment on intention-755\n' and not kept.needs
+    assert _tx("tests/test_a.py", 'ID = "spore-017"\n', rules=[rule, rest]).text == 'ID = "intention-017"\n'
+    assert [n.kind for n in _tx("levain/a.py", 'msg = "spore-9"\n', rules=[]).needs] == ["id-citation"]
+
+
+def test_the_store_file_name_becomes_the_legacy_constant_in_code_and_stays_bytes_in_a_template(tmp_path):
+    keep_t = ri.Rule(r"memory\.spores\.json", "keep-as-legacy-constant", "template", paths=("levain/templates/*",))
+    const = ri.Rule(r"memory\.spores\.json", "keep-as-legacy-constant", "the store name", paths=("levain/*",), const="STORE_FILE_NAME")
+    body = 'p = root / ".levain" / "memory.spores.json"\n'
+    out = _tx("levain/a.py", "import os\n" + body, rules=[keep_t, const])
+    assert out.text == "import os\nfrom levain.intention_legacy import STORE_FILE_NAME\np = root / \".levain\" / STORE_FILE_NAME\n"
+    assert _tx("levain/templates/h.py", body, rules=[keep_t, const]).text == body
+
+
+def test_the_real_rule_table_resolves_the_inventory_collisions_and_names_every_legacy_constant():
+    assert {"_SPORE_ROW", "_spore_fire", "buildSporeVerbs", "spore_edit", "SporeError", "spore_"} == set(ri.COLLISION_RESOLUTIONS)
+    legacy = (ROOT / "levain" / "intention_legacy.py").read_text()
+    for rule in ri.STORED_TOKEN_RULES:
+        if rule.const:
+            assert f"\n{rule.const} = " in legacy
+    ns: dict = {}
+    exec(compile(legacy, "legacy", "exec"), ns)
+    assert set(ns["OLD_VERB_TO_NEW"]) == {"spore_" + w for w in
+                                          ("touch", "descend", "surface_at", "update", "retarget", "set_disposition", "ascend", "seed")}
+    assert ns["OLD_VERB_TO_NEW"]["spore_descend"] == "intention_close" and ns["OLD_VERB_TO_NEW"]["spore_ascend"] == "intention_promote"
