@@ -2607,7 +2607,12 @@ def _cmd_cockpit_anchor_reset(args: argparse.Namespace) -> int:
 
 def _cmd_cockpit_policy_raise(args: argparse.Namespace) -> int:
     from levain.cockpit.keys import policy_raise, ssh_signer
+    from levain.intention_legacy import OLD_VERB_TO_NEW
 
+    if args.verb in OLD_VERB_TO_NEW:       # a retired id as a NEW raise: refused before any key is read
+        print(f"raise refused: {args.verb!r} is retired; raise {OLD_VERB_TO_NEW[args.verb]!r} instead",
+              file=sys.stderr)
+        return 2
     try:
         signer_fp, sign = ssh_signer(args.signing_key)
         tier, seq, warning = policy_raise(_cockpit_root(args), args.verb, args.tier, signer_fp=signer_fp,
