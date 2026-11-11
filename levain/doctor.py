@@ -4229,12 +4229,14 @@ def _check_keep_migration(install: Path) -> list[CheckResult]:
 
 def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]:
     """``intentions: overdue-agenda`` (TS-3): an open agenda whose ``next`` day is before today and that was never
-    germinated is a defect (the session-start, 06:10 and minute runs all missed it). Report only, no gate: a warning
-    row, never a failure. Silent with no intentions file, no agenda or none overdue."""
+    germinated is a defect (the session-start, 06:10 and minute runs all missed it). So is an agenda that waits on an event
+    (a split's second part) whose first part has finished, or whose check-by day has come, and that was never germinated. Report
+    only, no gate: a warning row, never a failure. Silent with no intentions file, no agenda or none overdue."""
     from datetime import date as _date
 
-    from levain.germinate import _is_agenda
-    from levain.intentions import _parse_when, list_open_readonly
+    from levain.germinate import _check_by_day, _is_agenda
+    from levain.intentions import (_parse_when, event_anchor, finished_by_completion, guarded_intention_store,
+                                   is_event_agenda, list_open_readonly)
 
     intentions = install / ".levain" / STORE_FILE_NAME
     if not intentions.is_file():
@@ -4249,6 +4251,13 @@ def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]
     late = []
     for s in items:
         try:   # one malformed intention is skipped, never the row (known edge, closed: a stamped-but-uncomposed agenda is the 06:10 run's)
+            if is_event_agenda(s):
+                due_by = _check_by_day(s)
+                anchor = event_anchor(s)
+                if (due_by is not None and due_by <= day) or (
+                        anchor is not None and finished_by_completion(guarded_intention_store(intentions).get(anchor))):
+                    late.append(s)
+                continue
             if not _is_agenda(s) or s.get("germinated"):
                 continue
             when = _parse_when(s.get("next"))
@@ -4258,9 +4267,11 @@ def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]
             continue
     if not late:
         return []
-    ids = ", ".join(f"{s.get('id', '?')} (next {s.get('next')})" for s in late[:5]) + (" ..." if len(late) > 5 else "")
-    return [CheckResult(name, True, f"{len(late)} agenda{'s' if len(late) != 1 else ''} past its date and not germinated: {ids}",
-                        "Run `levain intentions germinate --path <install>`; if it was already run, read its errors.", warn=True)]
+    ids = ", ".join(f"{s.get('id', '?')} ({'waits on ' + str(s['on_event']) if s.get('on_event') else 'next ' + str(s.get('next'))})"
+                    for s in late[:5]) + (" ..." if len(late) > 5 else "")
+    return [CheckResult(name, True, f"{len(late)} agenda{'s' if len(late) != 1 else ''} past its date or its event and not germinated: {ids}",
+                        "Run `levain intentions germinate --path <install>`; if it was already run, read its errors "
+                        "(a part past its check-by also waits on the band question that run files).", warn=True)]
 
 
 def _check_compat_set(install: Path) -> list[CheckResult]:

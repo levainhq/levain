@@ -3824,7 +3824,12 @@
       const text = f.nodes[0].value.trim();
       if (!text) { msg.className = "edit-msg err"; msg.textContent = "say what you do next"; return null; }
       return { kind: "intention_then", intention_id: s.id, text, expect_disposition: s.disposition };
-    }, "file it");
+    }, "file it", false, async (req) => {
+      // the page re-draws on success and this form goes with it: the server's sentence is kept in the List's receipt line
+      const res = await commit(req);
+      if (res && res.ok && res.data && typeof res.data.note === "string") { intakeKept.receipt = { text: res.data.note, cls: "ok" }; paintIntakeReceipts(); }
+      return res;
+    });
   }
 
   // Shared inline-form scaffold for the per-row verbs (edit / reclassify / remove): hide the

@@ -87,6 +87,7 @@ __all__ = [
     "DEFAULT_CHECK_BY_DAYS",
     "COMPLETION_KINDS",
     "done_event",
+    "norm_event",
     "event_anchor",
     "valid_check_by",
     "is_event_agenda",
@@ -356,13 +357,20 @@ DEFAULT_CHECK_BY_DAYS = 7
 # the descend kinds that mean the work FINISHED (anneal's per-type kinds); composted and dropped mean it did not, so
 # they never wake a part that waits on completion
 COMPLETION_KINDS = ("done", "answered", "explored")
-_EVENT_DONE = re.compile(rf"done:((?:{re.escape(OLD_ID_PREFIX)}|intention-)[0-9A-Za-z_-]{{1,56}})")   # old ids live in existing stores
+_EVENT_DONE = re.compile(r"done:((?:" + OLD_ID_PREFIX.rstrip("-") + r"|intention)-[0-9A-Za-z_-]{1,56})")   # `spore-N` ids live in existing stores; the hooks pin this pattern
 _CHECK_BY = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def done_event(intention_id: str) -> str:
     """The event key that names ``intention_id`` finishing."""
     return EVENT_DONE_PREFIX + intention_id
+
+
+def norm_event(key: Any) -> str:
+    """``key`` with a ``done:`` id in one spelling (``spore-N`` and ``intention-N`` name the same intention), so two keys that
+    name the same first part compare equal whichever spelling a writer used; anything else comes back as it is."""
+    m = _EVENT_DONE.fullmatch(key) if isinstance(key, str) else None
+    return f"{EVENT_DONE_PREFIX}intention-{m.group(1).partition('-')[2]}" if m else str(key or "")
 
 
 def event_anchor(item: Mapping[str, Any]) -> str | None:
