@@ -125,7 +125,7 @@ _VERB_MEDIATED_KINDS = frozenset(
         "intention_touch", "intention_close", "intention_promote", "episode_tombstone", "intention_keep",
         # the Slice-3b operator-I/O kinds (capture / re-route / schedule / metadata
         # edit) — verb-mediated, anneal-owned reversibility, never file-undoable.
-        "intention_seed", "intention_set_disposition", "intention_surface_at", "intention_update", "intention_retarget",
+        "intention_seed", "intention_set_disposition", "intention_surface_at", "intention_update", "intention_retarget", "intention_then",
     }
 )
 
