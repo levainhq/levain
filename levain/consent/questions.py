@@ -1152,7 +1152,8 @@ class QuestionStore:
             woke = split.wake_after(path, sid, queue_dir=self.directory)
         except Exception as exc:  # noqa: BLE001 - the reminder is done; a wake that failed is reported, never raised
             _log.warning("waking what waits on %s failed: %s", sid, exc)
-            return f"; waking what waits on it failed: {_safe_words(exc)}"
+            done = list(getattr(exc, "woke", None) or [])      # parts that woke before the error are named beside it
+            return (f"; woke {', '.join(done)}" if done else "") + f"; waking what waits on it failed: {_safe_words(exc)}"
         return f"; woke {', '.join(woke)}" if woke else ""
 
     def snoozes(self, ref: Any) -> list[Snooze]:

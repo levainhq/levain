@@ -71,7 +71,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from levain.spores import (DEFAULT_CHECK_BY_DAYS, _parse_when, event_anchor, finished_by_completion, is_event_agenda,
-                           is_timed, norm_event, valid_check_by)
+                           is_timed, norm_event, parse_target, valid_check_by)
 
 __all__ = ["GerminateRefused", "KEY_PREFIX", "Outcome", "add_parsers", "germinate", "is_due", "outbox_id_for",
            "run_germinate"]
@@ -142,18 +142,12 @@ def is_due(item: dict[str, Any], today: date, now: datetime | None = None) -> bo
 
 def _target_of(item: dict[str, Any]) -> tuple[str, str | None]:
     """``(target, repo)``: ``band`` (default and the fallback for an unknown value), ``nudge``, ``desk``,
-    ``board:<repo>``. The keyword is matched without regard to case; the repo keeps its own."""
-    raw = item.get("target")
-    t = raw.strip() if isinstance(raw, str) else ""
-    low = t.casefold()
-    if low == TARGET_NUDGE:
-        return TARGET_NUDGE, None
-    if low == TARGET_DESK:
-        return TARGET_DESK, None
-    if low.startswith(TARGET_BOARD + ":") and t[len(TARGET_BOARD) + 1:].strip():
-        repo = t[len(TARGET_BOARD) + 1:].strip()
-        return f"{TARGET_BOARD}:{repo}", repo
-    return TARGET_BAND, None
+    ``board:<repo>``. The keyword is matched without regard to case; the repo keeps its own. Read through
+    :func:`levain.spores.parse_target`, the one reading ``executor_of`` shares, so "who acts" never disagrees with what a wake does."""
+    parsed = parse_target(item.get("target"))
+    if parsed is None or parsed[0] == TARGET_BAND:
+        return TARGET_BAND, None
+    return parsed
 
 
 def _line(text: str, limit: int) -> str:
@@ -319,6 +313,11 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
         try:
             if not isinstance(sid, str) or not isinstance(okey, str) or not okey:
                 raise ValueError("the spore has no id or no origin_key; it cannot be keyed, so it is skipped")
+            if anchor_id and not dry_run:
+                # BEFORE anything is committed: the stamp below is the wake's one commit point. A ring that cannot be closed
+                # raises here, the part is left exactly as it was (the link intact) and the next run wakes it; closing is
+                # idempotent (an already-closed ring is not open), so that retry never closes or files twice
+                _close_stale_rings(questions, agent, okey, sid, f"done:{anchor_id}", result)
             target, repo = _target_of(item)
             nxt = _day(item.get("next"))
             title = _title(item, sid)
@@ -390,8 +389,6 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                     result["skipped"].append({"spore_id": sid, "origin_key": okey, "ref": ref,
                                               "reason": f"changed while germinating ({exc}); left open"})
                     continue
-                if anchor_id:
-                    _close_stale_rings(questions, agent, okey, sid, f"done:{anchor_id}", result)
             result["due"].append(Outcome(sid, okey, target, via, ref, filed, pinged, done,
                                          f"done:{anchor_id}" if anchor_id else "").as_dict())
         except Exception as exc:  # noqa: BLE001 - one bad spore never stops the others
@@ -403,13 +400,14 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
 
 def _close_stale_rings(questions: Any, agent: str, okey: str, sid: str, event: str, result: dict[str, Any]) -> None:
     """A check-by ring filed before the event fired is the machine's own row and is now answered by the event: close it (a text
-    answer on the cli channel) and say so in the result, so it is never left open beside the wake's row."""
+    answer on the cli channel) and say so in the result, so it is never left open beside the wake's row. Runs BEFORE the wake
+    commits (the stamp); a failure raises, so the part is left unwoken with its link and the next run retries."""
     try:
         closed = questions.close_open(f"{KEY_PREFIX}checkby:{okey}", text=f"{event} happened; this question is closed",
                                       channel="cli")
-    except Exception as exc:  # noqa: BLE001 - the wake stands; a ring left open is reported, never lost
-        result["errors"].append({"spore_id": sid, "origin_key": okey, "error": f"the check-by ring could not be closed: {exc}"})
-        return
+    except Exception as exc:  # noqa: BLE001 - re-raised with what it means for the wake
+        raise RuntimeError(f"the check-by question could not be closed, so {sid} is not woken yet and the next run retries: "
+                           f"{exc}") from exc
     for q in closed:
         result.setdefault("checkby", []).append({"spore_id": sid, "origin_key": okey, "event": event, "check_by": "",
                                                  "via": "superseded", "ref": q.id})

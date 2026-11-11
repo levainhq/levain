@@ -82,7 +82,7 @@ import warnings
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast
 
@@ -632,6 +632,18 @@ def _append_audit(ledger_root: Path, record: dict[str, Any]) -> None:
 
 def _now_iso(now: str | None) -> str:
     return now if now is not None else datetime.now(timezone.utc).isoformat()
+
+
+def _today_of(now: str | None) -> date | None:
+    """The local calendar day of a write's ``now`` (an ISO instant), as the dispatch reads its own clock; None when ``now`` is
+    absent or does not read, so the caller falls back to the host's day."""
+    if not isinstance(now, str):
+        return None
+    try:
+        at = datetime.fromisoformat(now)
+    except ValueError:
+        return None
+    return (at.astimezone() if at.tzinfo is not None else at).date()
 
 
 def recent_edits(ledger_root: Path, limit: int = 20) -> list[dict[str, Any]]:
@@ -1965,7 +1977,9 @@ def _wake_after_resolve(scope: WriteScope, spore_id: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - the resolve stands; the next germinate run converges
         warnings.warn(f"waking what waits on {spore_id} failed ({exc}); the resolve stands and the next germinate run "
                       "wakes the same rows", RuntimeWarning, stacklevel=2)
-        return {"wake_error": f"{type(exc).__name__}: {exc}"}
+        # the parts that DID wake before the error are reported beside it (their stamps are committed)
+        done = list(getattr(exc, "woke", None) or [])
+        return {"wake_error": f"{type(exc).__name__}: {exc}", **({"woke": done} if done else {})}
     return {"woke": woke} if woke else {}
 
 
@@ -2003,7 +2017,8 @@ def _apply_spore_then(
     if check_by is not None and not isinstance(check_by, str):
         raise EditError("bad_verb_arg", 422, "check_by must be a day, YYYY-MM-DD")
     try:
-        made = split.create_then(paths.spores_json, spore_id, text if isinstance(text, str) else "", check_by=check_by)
+        made = split.create_then(paths.spores_json, spore_id, text if isinstance(text, str) else "", check_by=check_by,
+                                 today=_today_of(now))
     except split.ThenRefused as exc:
         raise EditError(exc.code, exc.status, str(exc)) from exc
     except OSError as exc:
@@ -2194,6 +2209,8 @@ def _apply_spore_set_disposition(
         raise EditError("not_found", 404, f"no spore {spore_id!r}")   # a missing row is 404, ahead of the retirement 422
     _refuse_retired_disposition(disposition, prior_raw)   # TS-1: refuse a CHANGE into a retired value
     snapshot = _client_snapshot(req, current, spore_id)   # a moved row is stale, ahead of the confirm gate
+    if set_next and next_value:
+        _refuse_date_on_event_agenda(current)             # a part waits on an event or a date, never both
     prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit
     # The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a Keep note CAN now be re-routed OUT —
     # note→loop (activate) / note→Tray (promote) — the mirror of the Tray's seed→loop
@@ -2266,6 +2283,17 @@ def _apply_spore_set_disposition(
             "action": "set_disposition"}
 
 
+def _refuse_date_on_event_agenda(spore: Any) -> None:
+    """A part waits on an event or a date, never both: refuse (422) a write that would set a date on ``spore`` (as stored) while it
+    waits on an event. The one rule (``levain.spores.date_on_event_agenda_refusal``) every write that sets ``next`` asks; the
+    planned effects (``levain.cockpit.effects``) ask the same function."""
+    from levain.spores import date_on_event_agenda_refusal
+
+    why = date_on_event_agenda_refusal(spore)
+    if why is not None:
+        raise EditError("bad_verb_arg", 422, why)
+
+
 def _validate_surface_at(value: Any) -> str | None:
     """Validate a surface_at date value → the normalized result (a ``YYYY-MM-DD`` or ``YYYY-MM-DDTHH:MM`` string, or
     ``None`` for a clear). Shared by ``spore_surface_at`` AND the optional schedule carried on a
@@ -2317,16 +2345,14 @@ def _apply_spore_surface_at(
     store = guarded_spore_store(paths.spores_json)
     _refuse_if_ringing(scope, store, spore_id)
     if surface_at:
-        from levain.spores import is_event_agenda
-
+        # a read that fails is a refusal, never "not an event agenda": the date must not land on a row that may be one
         try:
             waiting = store.get(spore_id)
-        except Exception:  # noqa: BLE001 - the write's own compare-and-set then refuses what is wrong
-            waiting = None
-        if isinstance(waiting, dict) and is_event_agenda(waiting):
-            raise EditError("bad_verb_arg", 422,
-                            f"{spore_id} waits on {waiting.get('on_event')}, not on a date: a part waits on an event or a "
-                            "date, never both. It is asked about on its check-by day if the event has not come")
+        except SporeError as exc:
+            raise _spore_refusal(guard, exc, store, spore_id) from exc
+        except OSError as exc:
+            raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+        _refuse_date_on_event_agenda(waiting)
     try:
         store.update(spore_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
     except ValueError as exc:

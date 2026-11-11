@@ -772,9 +772,23 @@ def intake_seed_params(parsed: Mapping[str, Any]) -> dict[str, Any]:
     raise ValueError(f"a {kind!r} intake plants no spore")
 
 
+def _no_date_on_event_agenda(pre: Mapping[str, Any], when: Any) -> None:
+    """A part waits on an event or a date, never both: refuse a write that sets a (non-empty) date on a row that waits on an
+    event. The same rule (``levain.spores.date_on_event_agenda_refusal``) the legacy writes ask, so no door is a way around it."""
+    from levain.spores import date_on_event_agenda_refusal
+
+    if when in (None, ""):
+        return
+    why = date_on_event_agenda_refusal(pre)
+    if why is not None:
+        raise ValueError(why)
+
+
 def _ce_update(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
                version_of: Callable[..., str]) -> Effect:
     pre = _require_open(pre)
+    if "next" in params:
+        _no_date_on_event_agenda(pre, params["next"])
     allowed = ("text", "domain", "type", "tier", "next")
     stray = sorted(set(params) - set(allowed))
     if stray or not params:
@@ -816,6 +830,7 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
     if "surface_at" in params:
         if params["surface_at"] in (None, ""):
             raise ValueError("an agenda needs a date: a target cannot clear it (leave surface_at out to keep the date)")
+        _no_date_on_event_agenda(pre, params["surface_at"])
         changes["next"] = _norm_date(params["surface_at"])
     elif not valid_next(pre.get("next")):
         raise ValueError("an agenda needs a date: give surface_at with the target")
@@ -838,6 +853,7 @@ def _ce_set_disposition(params: Mapping[str, Any], pre: Mapping[str, Any] | None
     surface_at = _norm_date(params.get("surface_at")) if "surface_at" in params else None
     # a move into the Keep is refused above (``_norm_disposition``): the Keep is retired
     if "surface_at" in params:
+        _no_date_on_event_agenda(pre, surface_at)
         changes["next"] = surface_at
     return _existing_effect(pre, changes, version_of)
 
@@ -847,6 +863,7 @@ def _ce_surface_at(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, 
     pre = _require_open(pre)
     if "surface_at" not in params:
         raise ValueError("surface_at is required (null clears it)")
+    _no_date_on_event_agenda(pre, params["surface_at"])
     return _existing_effect(pre, {"next": _norm_date(params["surface_at"])}, version_of)
 
 
