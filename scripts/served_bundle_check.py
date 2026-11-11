@@ -245,6 +245,11 @@ def tree_bytes(path: Path) -> bytes:
         raise OSError(f"{path}: not valid UTF-8 ({e.reason} at byte {e.start})") from e
 
 
+def _no_version(sw: bytes) -> bytes:
+    """``sw`` with the value of its ``const SW_VERSION = '...'`` line blanked (the one line the server derives)."""
+    return _SW_VERSION.sub(lambda m: "const SW_VERSION = ''", sw.decode("utf-8", "replace")).encode("utf-8")
+
+
 def _sw_version(sw: bytes) -> str:
     m = _SW_VERSION.search(sw.decode("utf-8", "replace"))
     return m.group(1) if m else "?"
@@ -356,7 +361,10 @@ def check_tree(base: str, pkg: Path, page: str, versioned: dict[str, str], sw: b
         out.append(Result(False, "tree /sw.js", "the origin served an empty or no worker (see worker /sw.js), so nothing to compare"))
     else:
         tb = tree_bytes(t_sw)
-        same = tb == sw
+        # The tree keeps a PLACEHOLDER where the server writes the version it derives from the shell (1111-20): compared
+        # with the version line normalised on both sides, and the served version must be a derived hex label, never the
+        # placeholder (a worker the server did not render).
+        same = _no_version(tb) == _no_version(sw) and re.fullmatch(r"[0-9a-f]{12}", _sw_version(sw)) is not None
         out.append(Result(same, "tree /sw.js", f"SW_VERSION {_sw_version(sw)}" if same else
                           f"served SW_VERSION {_sw_version(sw)} ({digest(sw)}), tree SW_VERSION {_sw_version(tb)} ({digest(tb)})"))
     return out

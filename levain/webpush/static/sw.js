@@ -5,8 +5,11 @@
 // window message {type: 'levain-opened'}. The page opens the same database with the same version and upgrade, so
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
-// A short id of this worker's code, recorded in the trace so a device's trace says which worker ran.
-const SW_VERSION = '1107-56-decl-1';
+// A short id of this worker's shell, recorded in the trace so a device's trace says which worker ran. The literal below is a
+// PLACEHOLDER: the server writes a digest of the cockpit page it serves (the page names every precached asset by its own
+// content digest) and of this file's text into it when it starts (levain/web_server.py make_server), so a changed shell
+// always changes this file's bytes. Never hand-edit it; a server that cannot replace it refuses to start.
+const SW_VERSION = '__LEVAIN_SHELL_VERSION__';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
 // best effort, serialized on one chain, never awaited by the tap, and carry only urls without fragments, counts and step
