@@ -149,12 +149,27 @@ NOTE_VERB = "note_dismiss"              # the cockpit verb a note row offers (ve
 BAND_VERB = "band_answer"               # the cockpit verb that answers the NEEDS YOU band by its shorthand (verbs.py)
 
 
+def _canon_text(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
 def _canon(obj: Any) -> bytes:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode()
+    return _canon_text(obj).encode()
 
 
 def _sha(obj: Any) -> str:
     return hashlib.sha256(_canon(obj)).hexdigest()
+
+
+def _sha_with_frags(light: dict[str, Any], frags: dict[str, str]) -> str:
+    """``_sha`` of the dict ``{**light, <each frags key>: <the value frags[key] was serialised from>}``, byte for byte:
+    ``frags`` holds the canonical text of the heavy values already (``_canon_text``), so only ``light`` is serialised
+    here. The canonical form is one object with its keys sorted and the same separators, so joining each key's
+    canonical text in sorted key order is the text ``_canon`` would have produced over the whole dict."""
+    parts = {k: _canon_text(v) for k, v in light.items()}
+    parts.update(frags)
+    body = ",".join(json.dumps(k, ensure_ascii=False) + ":" + parts[k] for k in sorted(parts))
+    return hashlib.sha256(("{" + body + "}").encode()).hexdigest()
 
 
 # Facets that are a wall-clock reading ("58m", "1h") of a row, not a change to it. They ride in the row a read returns but
@@ -376,6 +391,19 @@ class _Snap:
     # applied from these at render, from the request's snapshot
     label_keys: dict[str, LabelKey] | None = None
     value_label_key: LabelKey | None = None
+    # the canonical text of the four heavy parts the panel etag covers (rows with the clock facets taken out, value,
+    # filtered, skipped), built on the first etag and kept: a snapshot is built once by ``_read_snap`` and never
+    # written after (every later stage copies a row, none mutates it), so a read over an unchanged snapshot does not
+    # serialise its rows again. Not an init field: a copy made with ``dataclasses.replace`` carries it by hand.
+    _etag_frags: dict[str, str] | None = field(default=None, init=False, repr=False, compare=False)
+
+    def etag_frags(self) -> dict[str, str]:
+        frags = self._etag_frags
+        if frags is None:
+            frags = self._etag_frags = {
+                "rows": _canon_text(_etag_rows(self.rows)), "value": _canon_text(self.value),
+                "filtered": _canon_text(self.filtered), "skipped": _canon_text(self.skipped)}
+        return frags
 
 
 @dataclass
@@ -1426,7 +1454,9 @@ class Cockpit:
         # a cached snapshot ages: re-evaluate its freshness against THIS request's clock
         if snap.status in ("ok", "empty", "partial") and snap.as_of and \
                 (ctx.now - _parse_iso(snap.as_of)) > timedelta(seconds=spec.stale_after_s):
-            return dataclasses.replace(snap, status="stale")    # every other field, the read's empty included
+            stale = dataclasses.replace(snap, status="stale")   # every other field, the read's empty included
+            stale._etag_frags = snap.etag_frags()               # the same rows and value: one serialisation, not one per read
+            return stale
         return snap
 
     # --- result -> snapshot ----------------------------------------------------------
@@ -1831,8 +1861,10 @@ class Cockpit:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
-        return _sha({"schema": SCHEMA, "status": snap.status, "rows": _etag_rows(snap.rows), "value": snap.value,
-                     "filtered": snap.filtered, "skipped": snap.skipped, "error": snap.error,
+        # rows, value, filtered and skipped enter as the snapshot's kept canonical text (``_Snap.etag_frags``); the
+        # etag is byte for byte what ``_sha`` over the whole dict gave
+        return _sha_with_frags({"schema": SCHEMA, "status": snap.status,
+                     "error": snap.error,
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
                      "verbs": self._verb_rev(auth),
                      # a panel's views shape view_rows: a kernel that adds or reorders one is not a 304
@@ -1848,7 +1880,7 @@ class Cockpit:
                      # snapshot's error) is content; with no labeller there is neither
                      **({"labels": [list(labels.revision) if labels.revision is not None else None, labels.error]}
                         if labels is not None and (labels.revision is not None or labels.error is not None)
-                        else {})})
+                        else {})}, snap.etag_frags())
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date,
               auth: RequestAuthority, now: datetime | None = None) -> dict[str, Any]:
