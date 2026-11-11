@@ -99,6 +99,23 @@ def test_a_worker_that_is_not_the_row_35_shape_fails_the_shape_and_the_tree_comp
     assert sorted(_failed(no_cache)) == ["tree /sw.js", "worker shape"]
 
 
+def test_a_served_worker_version_must_be_a_derived_hex_label(tmp_path: Path) -> None:
+    """1111-25: the tree compare blanks the version line on both sides, so without the hex requirement a served
+    placeholder or a hand-set label would pass. A derived 12-hex label passes (the first test of this file)."""
+    def with_version(v: bytes):
+        return _with_sw(lambda b: re.sub(rb"const SW_VERSION = '[^']*';", b"const SW_VERSION = '" + v + b"';", b))
+
+    with _up(tmp_path) as base:
+        derived = sbc.run(base, REPO, with_version(b"0123456789ab"))
+        placeholder = sbc.run(base, REPO, with_version(b"__LEVAIN_SHELL_VERSION__"))
+        hand_set = sbc.run(base, REPO, with_version(b"1107-56-decl-1"))
+        short_hex = sbc.run(base, REPO, with_version(b"0123456789a"))
+    assert _failed(derived) == [], [r.line() for r in derived if not r.ok]
+    assert _failed(placeholder) == ["tree /sw.js"]
+    assert _failed(hand_set) == ["tree /sw.js"]
+    assert _failed(short_hex) == ["tree /sw.js"]
+
+
 def test_an_origin_that_predates_the_digests_and_a_page_naming_a_wrong_digest_both_fail(tmp_path: Path) -> None:
     with _up(tmp_path) as base:
         def strip(url: str):
