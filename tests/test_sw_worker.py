@@ -548,7 +548,7 @@ def test_no_notification_in_the_worker_carries_an_actions_key() -> None:
 @needs_node
 def test_activation_carries_the_last_good_shell_forward_when_the_new_install_cached_none() -> None:
     got = _run("carry")
-    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v1107-56-decl-1"], got   # the old shell cache is gone
+    assert [c for c in got["caches"] if c.startswith("levain-shell")] == ["levain-shell-v__LEVAIN_SHELL_VERSION__"], got   # the old shell cache is gone
     assert got["shells"][0][1] == [["/", "<html>old shell</html>"]], got          # its page was carried first
 
 
@@ -706,7 +706,10 @@ def test_a_tap_with_no_ping_posts_nothing() -> None:
 
 @needs_node
 def test_the_worker_version_names_this_build() -> None:
-    assert "const SW_VERSION = '1107-56-decl-1';" in SW.read_text()
+    # 1111-20: the version is DERIVED by the server from the shell (tests/test_cockpit_reload_bar_n.py), never hand-edited:
+    # the source carries one placeholder line and no other literal version
+    assert SW.read_text().count("const SW_VERSION = '__LEVAIN_SHELL_VERSION__';") == 1
+    assert len(re.findall(r"const SW_VERSION\s*=", SW.read_text())) == 1
 
 
 # --- L3 round 1 fixes (1106-53, tapcard3) -----------------------------------------------------------------------------
