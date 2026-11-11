@@ -28,10 +28,13 @@ if try_install "$@"; then
 fi
 
 echo "apt_install.sh: the runner's mirror did not answer; retrying on archive.ubuntu.com" >&2
-# deb822 sources (Ubuntu 24.04) and the classic list, whichever the runner has
+# The runner's sources name the mirror through a mirror list file (`URIs: mirror+file:/etc/apt/apt-mirrors.txt`, the
+# "Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist" line in the failing log), and the list holds azure.archive.ubuntu.com;
+# a classic sources.list may name the host directly. Rewrite both spellings, in whichever file the runner has.
 for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
   if [ -f "$f" ]; then
-    sudo sed -i -e 's#https\?://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+    sudo sed -i -E -e 's#mirror\+file:/etc/apt/apt-mirrors\.txt#http://archive.ubuntu.com/ubuntu/#g' \
+                   -e 's#https?://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
   fi
 done
 
