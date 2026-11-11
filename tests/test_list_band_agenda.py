@@ -745,3 +745,115 @@ def test_an_unreadable_listing_blocks_a_foreign_row(tmp_path: Path, monkeypatch:
     with pytest.raises(EditError) as ei:
         _defer(rig, host, "np-plain002")
     assert ei.value.code == "source_unavailable" and _keyed(rig, "np-plain002") is None
+
+
+# --- fix round 3 (L3 r2): exact words, a deletion between the compensation's reads, every fault returned in words -------
+
+
+def test_a_racing_answer_padded_with_whitespace_is_not_this_calls_deferral(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The native store keeps answer text verbatim, so " " + the deferral is a different recorded answer (codex F1)."""
+    class Padded(AnsweringHost):
+        def answer(self, ref, *, option=None, text=None, channel):
+            return super().answer(ref, option=option, text=f" {text} ", channel=channel)
+
+    host = Padded()
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    delivered: list[str] = []
+    monkeypatch.setattr(band, "deliver_answer", lambda store, ref, **kw: delivered.append(ref))
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    assert ei.value.code == "stale" and "answered otherwise" in str(ei.value) and "nothing remains planted" in str(ei.value)
+    assert _agendas(rig) == [] and delivered == []
+    assert [line["outcome"] for line in _audit(rig)] == ["aborted"]
+
+
+def test_an_agenda_deleted_between_the_compensations_reads_is_named_deleted_not_a_crash(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Another writer deletes the agenda right after the compensation's ownership read (codex MED, fix-introduced)."""
+    from anneal_memory.spores import intention_version
+
+    host = AnsweringHost()
+    host.answer_refuses = "needs a signed answer"
+    rig = _host_rig(tmp_path, monkeypatch, host)
+
+    class DeletesAfterFirstRead:
+        def __init__(self, store: Any) -> None:
+            self._s, self.reads = store, 0
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._s, name)
+
+        def get_by_origin_key(self, key: str) -> Any:
+            cur = self._s.get_by_origin_key(key)
+            self.reads += 1
+            if self.reads == 1 and cur is not None:
+                rig.sp.delete(cur["id"], expected_version=intention_version(cur))
+            return cur
+
+    orig = band_agenda._compensate
+    monkeypatch.setattr(band_agenda, "_compensate", lambda store, *a, **k: orig(DeletesAfterFirstRead(store), *a, **k))
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    words = str(ei.value)
+    assert ei.value.code == "answer_refused" and "needs a signed answer" in words and "deleted meanwhile" in words
+    assert _keyed(rig, "np-plain002") is None
+
+
+def test_a_failed_success_audit_still_returns_the_receipt_and_names_the_lost_line(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from levain import writes
+
+    host = AnsweringHost()
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    delivered: list[str] = []
+    monkeypatch.setattr(band, "deliver_answer", lambda store, ref, **kw: delivered.append(ref))
+
+    def broken(*_a: Any, **_k: Any) -> str:
+        raise RuntimeWarning("edit-log append failed")
+
+    monkeypatch.setattr(writes, "_audit_verb", broken)
+    out = _defer(rig, host, "np-plain002")
+    [agenda] = _agendas(rig)
+    assert out["ok"] and out["agenda"] == agenda["id"] and host.get("np-plain002").answer is not None
+    assert "audit line could not be written" in out["warning"] and "edit-log append failed" in out["warning"]
+
+
+def test_a_host_that_records_then_raises_says_delivery_was_started(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    host = AnsweringHost()
+    host.raise_after_closing = True
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    out = _defer(rig, host, "np-plain002")
+    assert "desk was NOT woken" in out["warning"] and "delivery" in out["warning"] and "started" in out["warning"]
+
+
+def test_an_unexpected_compensation_fault_still_refuses_in_words_with_the_audit_line(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    host = AnsweringHost()
+    host.answer_refuses = "needs a signed answer"
+    rig = _host_rig(tmp_path, monkeypatch, host)
+
+    def malformed(*_a: Any, **_k: Any) -> Any:
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    monkeypatch.setattr(band_agenda, "_compensate", malformed)
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    words = str(ei.value)
+    assert ei.value.code == "answer_refused" and "needs a signed answer" in words
+    assert "could not be composted" in words and "not subscriptable" in words and "compost it" in words
+    assert [line["outcome"] for line in _audit(rig)] == ["aborted"]
+
+
+def test_a_foreign_row_its_listing_omits_is_not_offered_and_plants_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """get returns the row but open_questions does not list it: its signing facts are unknown, so it fails closed."""
+    class Unlisted(AnsweringHost):
+        def open_questions(self, agent=None):
+            return [q for q in super().open_questions(agent) if q.id != "np-plain002"]
+
+    host = Unlisted()
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    assert band_agenda.offer_block(host, "np-plain002") == band_agenda.BLOCK_UNREADABLE
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    assert ei.value.code == "source_unavailable" and ei.value.http_status == 503
+    assert _keyed(rig, "np-plain002") is None and host.get("np-plain002").answer is None
