@@ -10116,8 +10116,8 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   // scroll to the card and open its focus view; an id that is not among the waiting items falls back to the plain Needs view with a
   // one-line notice. Without a read by the deadline it falls back the same way.
   // The first board draws in parts (S4) and the whole draw then replaces every node: a jump made on a part would land where the rest of the
-  // page pushes it from. The boot sets html[data-board-whole] when (and only when) the whole board is drawn, so a jump waits for that, and at
-  // its deadline falls back to the target as the page has it (a slow board still gets its jump, a dead link is worse than a mispositioned one).
+  // page pushes it from. The boot sets html[data-board-whole] when the whole board is drawn, or when no whole draw is coming (a failed or refused
+  // read), and never on a partial draw, so a jump waits for that, and at its deadline falls back to the target as the page has it (a slow board still gets its jump, a dead link is worse than a mispositioned one).
   function boardWhole() { return !!document.documentElement && typeof document.documentElement.hasAttribute === "function" && document.documentElement.hasAttribute("data-board-whole"); }
   function needsItemJump(item, run, deadline) {
     if (run !== phoneJumpRun) return;

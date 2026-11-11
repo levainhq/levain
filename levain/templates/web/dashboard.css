@@ -3602,8 +3602,10 @@ body.ke .ck-zgrid .panel .nc-pbody { padding: 0 var(--sp-2) var(--sp-3) var(--sp
 @media (prefers-reduced-motion: reduce) { #store[data-cold]::before, #store[data-cold]::after { animation: none; } }
 /* the first board draws in parts (dashboard_boot.js): while only a part is drawn the regions the draw replaces are inert (nothing in them can be
    focused, clicked or opened, so the whole draw that replaces them takes nothing from the reader), and inert has no look of its own: the part is
-   dimmed, and the dimming goes at once with the `inert` the whole draw drops. */
-:is(#board, #ck-hero, #ck-needs, #ck-drop, #ck-notes, #ck-brief, #ck-widgets)[inert] { opacity: .45; }
+   dimmed, and the dimming goes at once with the `inert` the whole draw drops. #state is inert too but is not listed here: on the cockpit page
+   renderBriefRegion moves it into the hero's slot (#ck-state-slot, inside #ck-hero), so it is dimmed through its ancestor, and listing it
+   would dim it twice (.45 of .45). The drop (#ck-drop) is neither inert nor dimmed: the whole draw never replaces it. */
+:is(#board, #ck-hero, #ck-needs, #ck-notes, #ck-brief, #ck-widgets)[inert] { opacity: .45; }
 .nf-form { display: flex; gap: var(--sp-3); margin-top: var(--sp-5); flex-wrap: wrap; }
 .nf-checks { display: flex; flex-wrap: wrap; gap: var(--sp-3); flex: 1 1 100%; font: var(--fw-regular) var(--fs-meta) var(--sans); color: var(--text); }
 .nf-new .dev-url { width: 100%; margin: var(--sp-3) 0; }

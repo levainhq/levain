@@ -206,6 +206,160 @@ def test_the_first_board_reads_its_top_first_narrows_the_manifest_and_paces_its_
     assert out["slowBody"] == {"v": {"slow": 1}} and out["slowBodyTimers"] == 0
 
 
+# The WHOLE boot under node, with the real view mapper, a fake server and a fake page: a read that fails AFTER a partial board was drawn.
+# (L1 finding 1: the failure released the part and set the "whole" signal but queued no retry, because the first partial draw had already
+# latched `everDrawn`; the reader saw a live-looking board with "read failed" in the line until they pressed Sync.) Only the retry timers
+# (the boot's own 2/4/8/15 s backoff) are faked: the test fires them by hand and records their delays.
+_PAGE = r"""
+const fs = require("fs");
+const View = require(process.argv[2]);
+const bootSrc = fs.readFileSync(process.argv[3], "utf8");
+const REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-brief", "ck-widgets", "state", "board"];
+const real = { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout };
+const sleep = (ms) => new Promise((r) => real.setTimeout(r, ms));
+const settle = () => sleep(80);
+const RETRY = new Set([2000, 4000, 8000, 15000]);
+
+function head(id, kind) { return { id, kind, title: id, status: "ok", as_of: "2026-10-11T12:00:00+00:00" }; }
+function fixture() {
+  const manifest = { schema: "levain.cockpit/1", entity: { name: "t", governance: "reported", brand: {} }, generated_at: "2026-10-11T12:00:00+00:00",
+    regions: { header: ["state"], zones: [{ id: "operate", title: "Operate", panels: ["loops", "decisions"] }] },
+    panels: { state: head("state", "line"), loops: head("loops", "triage-list"), decisions: head("decisions", "triage-list") },
+    verbs: {}, errors: [], transport: { writable: true, write_token_required: false } };
+  const panels = {
+    state: Object.assign(head("state", "line"), { value: { lines: [{ label: "state", text: "hi", at: "2026-10-11T11:00:00.000Z", source: "web" }], value_version: "sv1" }, actions: [] }),
+    loops: Object.assign(head("loops", "triage-list"), { rows: [], actions: [] }),
+    decisions: Object.assign(head("decisions", "triage-list"), { groups: [], rows: [], actions: [] }),
+  };
+  return { manifest, panels };
+}
+
+// opts: holdLoops (the first read of the `loops` panel answers only when release() is called), failManifest (that many manifest reads answer 500),
+// throwOnRender (the render call numbers, 1-based, that throw once each)
+function makeEnv(opts) {
+  opts = opts || {};
+  const fx = fixture();
+  const renders = [], marks = [], timers = [], listeners = {};
+  let loopsReads = 0, failManifest = opts.failManifest || 0, release = null;
+  const held = new Promise((r) => { release = r; });
+  const resp = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body, text: async () => JSON.stringify(body), headers: { get: () => null }, clone() { return this; } });
+  async function fetchFn(url) {
+    if (url.indexOf("/cockpit/manifest.json") >= 0) { if (failManifest > 0) { failManifest--; return resp(500, {}); } return resp(200, fx.manifest); }
+    const m = /\/cockpit\/panel\/([^/.]+)\.json/.exec(url);
+    if (m && fx.panels[m[1]]) {
+      if (m[1] === "loops" && opts.holdLoops && loopsReads++ === 0) await held;
+      return resp(200, fx.panels[m[1]]);
+    }
+    return resp(404, {});
+  }
+  const attrs = {};
+  const node = (id) => { const n = { id, textContent: "", hidden: false, dataset: {}, a: {}, setAttribute(k, v) { this.a[k] = String(v); }, removeAttribute(k) { delete this.a[k]; }, hasAttribute(k) { return k in this.a; } }; return n; };
+  const store = node("store"), stamp = node("stamp"), regions = {};
+  for (const id of REGIONS) regions[id] = node(id);
+  const html = node("html");
+  const ls = { levain_write_token: "tok" };
+  const localStorage = { getItem: (k) => (k in ls ? ls[k] : null), setItem: (k, v) => { ls[k] = String(v); }, removeItem: (k) => { delete ls[k]; } };
+  const sessionStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+  let renderN = 0;
+  const win = { LevainCockpitView: View, localStorage, sessionStorage, location: { search: "?source=manifest", hash: "", pathname: "/" },
+    crypto: { randomUUID: () => "k" }, prompt: () => "",
+    LevainDashboard: { render: (view, o) => { renderN++; if ((opts.throwOnRender || []).indexOf(renderN) >= 0) throw new Error("render " + renderN + " threw"); renders.push(view); }, hasUnsavedEdit: () => false, jobsActive: () => false },
+    dispatchEvent() {} };
+  const doc = { getElementById: (id) => (id === "store" ? store : id === "stamp" ? stamp : regions[id] || null), documentElement: html, dispatchEvent() {},
+    addEventListener(t, f) { (listeners[t] = listeners[t] || []).push(f); }, querySelectorAll: () => [], createElement: () => ({ className: "", textContent: "" }),
+    visibilityState: "visible", body: { dataset: {} } };
+  const fakeSet = (f, ms) => { if (RETRY.has(ms)) { const h = { fake: true, f, ms }; timers.push(h); return h; } return real.setTimeout(f, ms); };
+  const fakeClear = (h) => { if (h && h.fake) { const i = timers.indexOf(h); if (i >= 0) timers.splice(i, 1); } else real.clearTimeout(h); };
+  const env = { renders, timers, listeners, store, stamp, regions, html, release, fx, armFail: (n) => { failManifest = n; } };
+  env.start = async () => {
+    new Function("window", "document", "location", "history", "fetch", "console", "setTimeout", "clearTimeout", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console, fakeSet, fakeClear);
+    await settle();
+    return env;
+  };
+  env.whole = () => html.hasAttribute("data-board-whole");
+  env.inert = () => REGIONS.filter((id) => regions[id].hasAttribute("inert")).length;
+  env.fire = async () => { const h = timers.shift(); if (h) h.f(); await settle(); return h ? h.ms : null; };
+  env.snap = () => ({ renders: renders.length, whole: env.whole(), inert: env.inert(), timers: timers.map((t) => t.ms), store: store.textContent, stamp: stamp.textContent });
+  return env;
+}
+
+(async () => {
+  const out = {};
+  const quiet = console.warn; console.warn = () => {};
+
+  // control: a read that fails nowhere draws a part, then the whole board, and queues no retry at all
+  { const e = await makeEnv({ holdLoops: true }).start();
+    out.controlPart = e.snap(); e.release(); await settle(); out.controlWhole = e.snap(); }
+
+  // A: a part is drawn (the rest of the panels still out), the page is foregrounded (that read is superseded) and the NEW read's manifest
+  // fails once. Then the retry timer fires: it must draw the whole board, once, and the chain must end there.
+  { const e = await makeEnv({ holdLoops: true }).start();
+    out.aPart = e.snap();
+    e.armFail(1);
+    e.listeners["levain:resume"][0]({ detail: { hiddenAt: Date.now() + 5000 } });
+    await settle();
+    out.aFailed = e.snap();
+    out.aRetryDelay = await e.fire();
+    out.aRetried = e.snap();
+    e.release(); await settle();                 // the superseded read's late panel answers into a dead generation
+    out.aLate = e.snap(); }
+
+  // B: a part is drawn, the whole board's draw throws ONCE (the second render call), then the retry draws it
+  { const e = await makeEnv({ holdLoops: true, throwOnRender: [2] }).start();
+    out.bPart = e.snap();
+    e.release(); await settle();
+    out.bFailed = e.snap();
+    out.bRetryDelay = await e.fire();
+    out.bRetried = e.snap(); }
+
+  // C: what paces the chain. A server that keeps failing: the delays back off 2, 4, 8, 15 s and then hold at 30 s (the table's last entry, which
+  // is also the panel timeout, so it is a real timer here and shows as no fake one); only a whole draw (or a refusal) ends it
+  { const e = await makeEnv({ holdLoops: true }).start();
+    e.armFail(99);
+    e.listeners["levain:resume"][0]({ detail: { hiddenAt: Date.now() + 5000 } });
+    await settle();
+    out.cDelays = [];
+    for (let i = 0; i < 4; i++) { out.cDelays.push(e.timers.map((t) => t.ms)[0]); await e.fire(); }
+    out.cAfter = e.snap(); }
+  console.warn = quiet;
+  console.log(JSON.stringify(out));
+  process.exit(0);
+})();
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_is_drawn(tmp_path: Path) -> None:
+    """L1 finding 1. The failure releases the part and sets the signal (a page left inert forever on a failing server is worse), but the
+    retry chain must still run: no WHOLE board has been drawn, so the reader is looking at a part under a live-looking page."""
+    driver = tmp_path / "page.js"
+    driver.write_text(_PAGE, encoding="utf-8")
+    run = subprocess.run([shutil.which("node"), str(driver), str(WEB / "cockpit_view.js"), str(WEB / "dashboard_boot.js")],
+                         capture_output=True, text=True, timeout=60, check=True)
+    out = json.loads(run.stdout)
+    # control: nothing fails, so a part is drawn inert and unsigned, then the whole board is drawn live and signed, with no retry ever queued
+    cp = out["controlPart"]
+    assert (cp["renders"], cp["whole"], cp["inert"], cp["timers"]) == (1, False, 7, []), cp
+    assert (out["controlWhole"]["renders"], out["controlWhole"]["whole"], out["controlWhole"]["inert"], out["controlWhole"]["timers"]) == (2, True, 0, []), out["controlWhole"]
+    # A: supersede + a failed manifest read after a part: released and signed (kept), AND a retry is queued
+    assert (out["aPart"]["renders"], out["aPart"]["whole"], out["aPart"]["inert"]) == (1, False, 7), out["aPart"]
+    assert out["aFailed"]["whole"] is True and out["aFailed"]["inert"] == 0 and out["aFailed"]["renders"] == 1, out["aFailed"]
+    assert out["aFailed"]["timers"] == [2000], out["aFailed"]               # RED before the fix: [] (everDrawn latched by the part)
+    assert "can't reach the cockpit yet" in out["aFailed"]["store"], out["aFailed"]
+    # the retry draws the whole board once, the line is clean, nothing else is queued, and the superseded read's late panel changes nothing
+    assert out["aRetryDelay"] == 2000
+    assert (out["aRetried"]["renders"], out["aRetried"]["whole"], out["aRetried"]["inert"], out["aRetried"]["timers"], out["aRetried"]["store"]) == (2, True, 0, [], ""), out["aRetried"]
+    assert out["aLate"]["renders"] == 2 and out["aLate"]["timers"] == [], out["aLate"]
+    # B: the whole board's draw throws once after a part: released, signed, retried, and the retry lands
+    assert (out["bPart"]["renders"], out["bPart"]["whole"]) == (1, False), out["bPart"]
+    assert out["bFailed"]["whole"] is True and out["bFailed"]["inert"] == 0 and out["bFailed"]["timers"] == [2000], out["bFailed"]
+    assert out["bRetryDelay"] == 2000
+    assert (out["bRetried"]["renders"], out["bRetried"]["whole"], out["bRetried"]["timers"], out["bRetried"]["store"]) == (2, True, [], ""), out["bRetried"]
+    # C: a server that keeps failing is retried on the boot's own backoff (2, 4, 8, 15 s, then 30 s), never in a tight loop, and the page is left live
+    assert out["cDelays"] == [2000, 4000, 8000, 15000], out["cDelays"]
+    assert out["cAfter"]["whole"] is True and out["cAfter"]["inert"] == 0, out["cAfter"]
+
+
 def test_the_cold_load_draws_partial_boards_and_a_panel_read_is_bounded() -> None:
     boot = (WEB / "dashboard_boot.js").read_text(encoding="utf-8")
     # only a page that has drawn nothing yet draws partial boards; a refresh keeps its board until the new one is whole
