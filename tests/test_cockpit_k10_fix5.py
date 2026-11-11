@@ -92,7 +92,7 @@ def test_an_absurd_rate_draws_at_the_cap_and_never_loops(tmp_path, monkeypatch):
 STILL = ("JSON.stringify({still: !!%s.classList.contains('tv-replaying'), streams: %s.querySelector('.tv-stage') && %s.querySelector('.tv-stage').dataset.streams, "
          "particles: %s.querySelector('.tv-stage') && %s.querySelector('.tv-stage').dataset.particles, iv: window.__iv, "
          "pulse: (%s.querySelector('.tv-pulse') && getComputedStyle(%s.querySelector('.tv-pulse')).animationName) || null, "
-         "breathe: (%s.querySelector('.tv-task.waiting, .tv-rec') && getComputedStyle(%s.querySelector('.tv-task.waiting, .tv-rec')).animationName) || null})") % ((TV,) * 9)
+         "breathe: (%s.querySelector('.tv-task.waiting') && getComputedStyle(%s.querySelector('.tv-task.waiting')).animationName) || null})") % ((TV,) * 9)
 SPYI = "(() => { window.__iv = 0; const s = window.setInterval.bind(window); window.setInterval = (f, ms, ...a) => { if (ms === 20000) window.__iv++; return s(f, ms, ...a); }; return 1; })()"
 
 
