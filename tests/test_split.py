@@ -738,3 +738,61 @@ def test_the_event_wake_closes_a_day_suffixed_check_by_ring_by_prefix(tmp_path, 
     assert q.agent_session_id == f"{g.KEY_PREFIX}checkby:{f['origin_key']}:2026-11-11"
     closed = QuestionStore(qdir).close_open(f"{g.KEY_PREFIX}checkby:{f['origin_key']}", text="done happened", channel="cli")
     assert [c.id for c in closed] == [q.id]
+
+
+# --- L3 round 2 fix (row 178 build 2, fix lane 3) ----------------------------------------------------------------------
+def test_the_legacy_spore_update_never_writes_a_date_on_an_event_agenda(tmp_path, qdir):
+    """Round 2 deepseek F-A (refuted): the legacy ``spore_update`` has no ``next`` field (a date moves only through ``when?``,
+    which is guarded), so there is no unguarded door: a lone ``next`` is refused and one riding with text is not written."""
+    root = _install(tmp_path)
+    a = _anchor(root)
+    f = _follower(root, a["id"])
+    scope = _scope(root, qdir)
+    with pytest.raises(EditError):
+        apply_edit(scope, {"kind": "spore_update", "spore_id": f["id"], "next": "2026-11-20", "expect_disposition": "agenda"})
+    apply_edit(scope, {"kind": "spore_update", "spore_id": f["id"], "text": "send the invoice now", "next": "2026-11-20",
+                       "expect_disposition": "agenda"})
+    kept = _spore(root, f["id"])
+    assert kept.get("next") is None and kept["on_event"] == f"done:{a['id']}" and kept["text"] == "send the invoice now"
+
+
+def test_the_list_finds_the_first_part_whichever_spelling_the_link_uses(tmp_path):
+    """Round 2 LOW (codex, deepseek): the List looked the first part up by the link's raw spelling; a hand-written
+    ``done:spore-N`` over a stored ``intention-N`` showed no first-part words. Exact spelling first, then the other."""
+    from tests.test_cockpit_list_panel import Rig, TODAY as LIST_TODAY
+
+    r = Rig(tmp_path, band=False, board=False)
+    a = r.ids["agenda_old"]
+    f = r.sp.add(type="task", text="send the invoice then", disposition="agenda", target="band",
+                 on_event=f"done:{_other_spelling(a)}", check_by=LIST_TODAY.replace(day=LIST_TODAY.day + 5).isoformat(),
+                 today=LIST_TODAY)
+    facets = _list_rows(r.panel())[f"spore:{f['id']}"]["facets"]
+    assert facets["after_text"] == "an agenda from last week"
+
+
+def test_who_on_a_waiting_part_hands_it_off_by_target_alone_and_it_still_wakes_on_its_event(tmp_path, qdir, pings):
+    """Round 2 MED (all three lineages): the dashboard's who form sends a target and no date, and a waiting part has no date to
+    keep, so ``_ce_retarget`` refused it ("an agenda needs a date") while a date is refused by the event-or-date rule: ``who``
+    could never succeed. A waiting part keeps waiting on its event whoever acts when it wakes, so a target alone is the right
+    request; a date on it stays refused in words. Driven through the real HTTP dispatch, then through the real wake."""
+    from tests.test_cockpit_k2a import TOKEN, _serve
+    from tests.test_list_retarget import _install as _levain_install
+    from tests.test_list_retarget import _retarget, _row
+
+    root, src, _ids = _levain_install(tmp_path)
+    a = _anchor(root)
+    f = _follower(root, a["id"])
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        row = _row(base, f["id"])
+        assert any(x["verb"] == "spore_retarget" for x in row["actions"])                  # offered on a waiting part
+        st, body = _retarget(base, f["id"], {"target": "band", "surface_at": "2031-02-03"})
+        assert st >= 400 and "waits on" in str(body) and "not on a date" in str(body), body    # a date: still refused, in words
+        assert "an agenda needs a date" not in str(body)
+        st, body = _retarget(base, f["id"], {"target": "desk"})
+        assert st == 200, body
+    kept = _spore(root, f["id"])
+    assert kept["target"] == "desk" and kept["on_event"] == f"done:{a['id']}" and kept.get("next") is None
+    assert kept.get("germinated") is None                                                  # it still waits on its event
+    _done(root, a["id"])
+    res = _run(root, qdir)
+    assert [o["spore_id"] for o in res["due"]] == [f["id"]] and not res["errors"]          # and the event wakes it as the desk's

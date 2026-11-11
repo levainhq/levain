@@ -137,6 +137,12 @@ def _wake_facets(day: date, today: date, surface: str, target: Any, disposition:
             "wake_line": f"wakes {band_view.later_words(wake_day, today.isoformat())} \u2192 {_lands(surface, target, disposition)}"}
 
 
+def _other_spelling(sid: str) -> str:
+    """``sid`` with the other id prefix (``spore-7`` <-> ``intention-7``); an id of neither shape comes back unchanged."""
+    prefix, _, num = sid.partition("-")
+    return f"{'intention' if prefix == 'spore' else 'spore'}-{num}" if prefix in ("spore", "intention") and num else sid
+
+
 def _event_facets(raw: dict[str, Any], today: date, steer: dict[str, dict[str, Any]], surface: str, target: Any,
                   disposition: str) -> tuple[dict[str, Any], bool]:
     """``(facets, is_later)`` for an open agenda that waits on an event (the second part of a split): what it waits on, the
@@ -144,7 +150,8 @@ def _event_facets(raw: dict[str, Any], today: date, steer: dict[str, dict[str, A
     check-by day, and is NOW from then on."""
     anchor = spores.event_anchor(raw)
     cb = parse_date(raw.get("check_by")) if spores.valid_check_by(raw.get("check_by")) else None
-    first = steer.get(anchor or "", {})
+    # exact spelling first, then the other (``spore-N`` and ``intention-N`` name one intention, as anneal's own lookup reads them)
+    first = steer.get(anchor or "") or steer.get(_other_spelling(anchor or "")) or {}
     words = " ".join(str(first.get("text") or "").split())[:80] if first else ""
     facets: dict[str, Any] = {"on_event": raw.get("on_event"), "check_by": cb.isoformat() if cb else None,
                               "after": anchor, "after_text": words or None}
