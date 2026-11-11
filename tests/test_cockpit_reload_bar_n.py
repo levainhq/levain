@@ -119,3 +119,38 @@ def test_a_shell_page_naming_no_versioned_asset_refuses_to_start() -> None:
     import pytest
     with pytest.raises(ValueError, match="no \\?v="):
         web_server._shell_version(b"<html></html>", b"worker", {})
+
+
+# --- 1111-25 L3 round 1 -------------------------------------------------------------------------------------------------
+
+def test_the_worker_version_length_is_defined_once_and_render_worker_requires_exactly_it() -> None:
+    """The label length is shell_version.SHELL_VERSION_LEN: the derivation produces it and render_worker accepts only it
+    (a 13-hex or 11-hex label is refused, not served and then failed by the bundle checker)."""
+    import pytest
+
+    from levain import shell_version
+    from levain.webpush import routes
+
+    n = shell_version.SHELL_VERSION_LEN
+    assert n == 12 and len(web_server._shell_version(b'<script src="/a.js?v=' + b"0" * n + b'">', b"w", {})) == n
+    routes.render_worker(routes.worker_template(), "a" * n)
+    for bad in ("a" * (n + 1), "a" * (n - 1), "A" * n, ""):
+        with pytest.raises(ValueError, match="hex label"):
+            routes.render_worker(routes.worker_template(), bad)
+
+
+def test_a_non_canonical_worker_path_is_404_never_a_crash_and_the_raw_source_is_never_served(tmp_path: Path) -> None:
+    """``push_routes.handle`` returns None for /sw.js (the server renders the worker); a spelling that is not exactly
+    /sw.js never reaches it (the router matches the path exactly) and gets the router's 404."""
+    from levain.webpush import routes
+
+    assert routes.handle("GET", "/sw.js", {}, b"", queue_dir=Path("."), authorized=False, device_id=None) is None
+    with _up(tmp_path) as base:
+        for spelling in ("/sw.js/", "/SW.js", "/sw.js%00"):
+            try:
+                urllib.request.urlopen(base + spelling, timeout=5)  # noqa: S310 - loopback only
+            except urllib.error.HTTPError as e:
+                assert e.code == 404, (spelling, e.code)
+            else:
+                raise AssertionError(f"{spelling} was served")
+        assert b"__LEVAIN_SHELL_VERSION__" not in _get(base + "/sw.js")
