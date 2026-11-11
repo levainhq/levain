@@ -18,14 +18,14 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from levain.cockpit.broker import Broker
-from levain.cockpit.effects import IntentionEffectStore
+from levain.cockpit.effects import INTENTIONS, IntentionEffectStore
 from levain.cockpit.anneal_effects import EPISODES, SECTIONS, EpisodeEffectStore, SectionEffectStore
 
 
 def main() -> int:
     cfg = json.loads(sys.argv[1])
-    stores: dict = {"spores": IntentionEffectStore(cfg["spores"])}
-    paths = [cfg["spores"]]
+    stores: dict = {INTENTIONS: IntentionEffectStore(cfg["intentions"])}
+    paths = [cfg["intentions"]]
     if cfg.get("db"):
         stores.update({EPISODES: EpisodeEffectStore(cfg["db"]), SECTIONS: SectionEffectStore(cfg["db"])})
         paths.append(cfg["db"])

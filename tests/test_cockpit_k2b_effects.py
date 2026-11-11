@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from anneal_memory.spores import IntentionStore
+from anneal_memory.spores import IntentionError, IntentionStore
 
 from levain.cockpit.effects import (
     ApplyUnit,
@@ -61,7 +61,7 @@ def _settle(es: IntentionEffectStore, eff: Effect, idx: int = 0, prior: dict | N
 # every intention kind of the §13 row, with the stored check of its applied state
 KINDS = [
     ("seed", "intention_seed", {"text": "  new capture  ", "type": "task"}, None,
-     lambda r: r["text"] == "new capture" and r["disposition"] == "seed" and r["status"] == "open"),
+     lambda r: r["text"] == "new capture" and r["disposition"] == "someday" and r["status"] == "open"),
     ("text", "intention_update", {"text": "edited\r\n"}, "k.loop", lambda r: r["text"] == "edited"),
     ("domain", "intention_update", {"domain": "levain"}, "k.loop", lambda r: r["domain"] == "levain"),
     ("type", "intention_update", {"type": "question"}, "k.seed", lambda r: r["type"] == "question"),
@@ -270,7 +270,7 @@ def test_corrupt_store_is_transient_then_applies_after_repair(path):
     path.write_text("{ not json")
     with pytest.raises(TransientApplyFault) as fault:
         _settle(es, eff)
-    assert fault.value.fault_class == "IntentionError"
+    assert fault.value.fault_class == IntentionError.__name__   # the class name is anneal-owned (an alias of its older name)
     path.write_bytes(good)
     assert _settle(es, eff).status is EffectStatus.APPLIED
     assert _row(path, "k.loop")["text"] == "survives"

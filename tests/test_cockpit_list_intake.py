@@ -96,11 +96,11 @@ def test_a_drop_seed_stores_its_timed_next_whole_and_its_desk_target(intentions)
 
 def test_a_talk_seed_carries_attention_talk_and_no_target(intentions):
     es = IntentionEffectStore(intentions)
-    eff = _seed(es, {"text": "flow's future", "disposition": "seed", "attention": "talk"})
+    eff = _seed(es, {"text": "flow's future", "disposition": "someday", "attention": "talk"})
     (unit,) = es.units([(0, eff)])
     assert settle(unit, es, {}).status is EffectStatus.APPLIED
     row = _row(intentions, create_origin_key(PENDING, 0))
-    assert (row["disposition"], row.get("attention"), row.get("target")) == ("seed", "talk", None)
+    assert (row["disposition"], row.get("attention"), row.get("target")) == ("someday", "talk", None)
 
 
 def test_the_new_fields_are_signed_in_changes_but_labelled_only_on_the_authority_fields(intentions):
@@ -114,12 +114,12 @@ def test_the_new_fields_are_signed_in_changes_but_labelled_only_on_the_authority
 
 
 REFUSALS = [
-    ("desk on a seed", {"disposition": "seed", "target": "desk"}, "AGENDA"),
+    ("desk on a someday", {"disposition": "someday", "target": "desk"}, "AGENDA"),
     ("talk on an agenda bound for the desk", {"disposition": "agenda", "target": "desk", "attention": "talk"},
      "desk target files a drop"),
     ("an unknown target", {"disposition": "agenda", "target": "moon"}, "target must be"),
     ("an empty board", {"disposition": "agenda", "target": "board:"}, "target must be"),
-    ("attention other than talk on a seed", {"disposition": "seed", "attention": "none"}, "AGENDA"),
+    ("attention other than talk on a someday", {"disposition": "someday", "attention": "none"}, "AGENDA"),
     ("an unknown attention", {"disposition": "agenda", "attention": "loud"}, "attention must be"),
     ("a spaced timed next", {"disposition": "agenda", "next": "2026-11-09 09:00"}, "next must be"),
     ("a next with seconds", {"disposition": "agenda", "next": "2026-11-09T09:00:00"}, "next must be"),
@@ -162,7 +162,7 @@ def test_intake_kind_and_seed_params():
     assert intake_seed_params({"kind": "drop", "when": "2026-11-09T09:00", "text": "call X"}) == {
         "type": "task", "text": "call X", "disposition": "agenda", "target": "desk", "next": "2026-11-09T09:00"}
     assert intake_seed_params({"kind": "talk", "text": "y"}) == {
-        "type": "thought", "text": "y", "disposition": "seed", "attention": "talk"}
+        "type": "thought", "text": "y", "disposition": "someday", "attention": "talk"}
     with pytest.raises(ValueError):
         intake_seed_params({"kind": "sort", "text": "z"})
 
@@ -190,7 +190,7 @@ def test_a_talk_line_plants_a_talk_seed(broker, intentions):
     out = _issue(broker, "?  flow's future, with Som out of it ")
     row = _row(intentions, "ck." + out["pending_id"][2:] + ".0")
     assert (row["disposition"], row.get("attention"), row.get("target"), row["text"]) == \
-        ("seed", "talk", None, "flow's future, with Som out of it")
+        ("someday", "talk", None, "flow's future, with Som out of it")
     assert out["receipt"] == {"kind": "talk", "id": row["id"], "fires": None, "text": row["text"]}
     assert out["receipt_line"] == f"talk {row['id']}"
 
