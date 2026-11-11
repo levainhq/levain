@@ -7574,7 +7574,8 @@
   // A record that names a card (the Work lens's waiting items) goes to the strip's card with that id: scrolled to and lit by an
   // animation that ends on its own (needs-lit), any earlier light cleared first. Where the strip is the bar (Build, Memory) the matching
   // chip is lit instead. False when no card or chip carries the id, so the caller can open the history.
-  function needsGo(id, instant) {
+  // `focus`: the keyboard's place moves to the lit card too (it is a button, so it takes focus as it is), so Tab goes on from there; the Work lens's jump asks for it
+  function needsGo(id, instant, focus) {
     const host = document.getElementById("ck-needs");
     if (!host || host.hidden || !id) return false;
     for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
@@ -7587,6 +7588,7 @@
     if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: instant ? "auto" : "smooth" });
     void node.offsetWidth;   // restart the animation if the same node is lit twice
     node.classList.add("needs-lit");
+    if (focus && typeof node.focus === "function") { if (node.tabIndex < 0 && !node.hasAttribute("tabindex")) node.setAttribute("tabindex", "-1"); node.focus({ preventScroll: true }); }   // the scroll above is the jump's own
     const off = () => node.classList.remove("needs-lit");
     node.addEventListener("animationend", off, { once: true });
     window.setTimeout(off, 3000);   // a page that plays no animation (reduced motion) still ends the light
