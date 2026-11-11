@@ -2749,15 +2749,16 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "<name>.pre-desk-move), moves the desk's stored directory in its store (the consent directory and "
                     "the board, or --queue-dir), and adds the new path to the door's workspace record beside the old "
                     "one. Refuses, changing nothing, when the old directory is a real directory and the new one "
-                    "exists too, when the old path is a link and the new directory is missing, or when a settings "
-                    "file is not valid JSON; with the move already done it finishes whatever is left. --dry-run prints "
-                    "the plan first. Run it again: it says nothing to do.")
+                    "exists too, when the old path is a link and the new directory is missing, when a settings file "
+                    "is not valid JSON, when the workspace record exists but cannot be read, or when neither home "
+                    "exists yet a hook still names the old path; with the move already done it finishes whatever is "
+                    "left. --dry-run prints the plan first. Run it again: it says nothing to do.")
     cmh.add_argument("--settings", type=Path, default=None, metavar="PATH",
                      help="The Claude Code settings.json to rewrite (default: $LEVAIN_CLAUDE_SETTINGS, else ~/.claude/settings.json).")
     cmh.add_argument("--home", type=Path, default=None, metavar="DIR", help="The levain home (default: $LEVAIN_HOME, else ~/.levain).")
     cmh.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, metavar="DIR",
-                     help="The desk store whose stored directory to move, when it is not the consent directory or the "
-                          "board under the levain home (it is then the only store looked at).")
+                     help="The directory holding the desk store's dispatch.db, when it is not the consent directory or "
+                          "the board under the levain home (it is then the only store looked at).")
     cmh.add_argument("--dry-run", dest="dry_run", action="store_true", help="Print what would change and change nothing.")
     cmh.set_defaults(func=run_move_home)
     not_door(cmh)

@@ -738,7 +738,7 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
     longer in the store, is never resurrected. An item revert cannot finish goes ``revert_blocked``
     (never ``reverted``) and is retried next time. Held under the plan lock throughout."""
     from anneal_memory.spores import SporeError, SporeStore, spore_version
-    from levain.spores import guarded_spore_store
+    from levain.spores import NEW_ID_PREFIX, guarded_spore_store
 
     pp = Path(plan_path).resolve()
     with _plan_lock(pp):
@@ -755,7 +755,7 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
                 db = None
         else:
             db = None
-        plain = SporeStore(spores_json)         # ONLY for restoring a retired disposition (see module doc)
+        plain = SporeStore(spores_json, id_prefix=NEW_ID_PREFIX)         # ONLY for restoring a retired disposition (see module doc)
         guarded = guarded_spore_store(spores_json)
         rep = Report(pp)
 

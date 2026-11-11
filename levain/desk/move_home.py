@@ -8,8 +8,9 @@ that names the old home path (and the desk home's own ``.claude`` settings), mov
 store a desk can live in (the consent directory and the board), adds the new path to the door's workspace record beside
 the old one, and keeps the old path as a symlink to the new directory for one release.
 
-Safe by construction: it refuses (changes nothing, exit 1) when the new directory already exists beside a real old one or
-when a settings file is not valid JSON; ``--dry-run`` prints the plan and changes nothing; each settings file is written
+Safe by construction: it refuses (changes nothing, exit 1) when the new directory already exists beside a real old one, when
+the old path is a link and the new directory is missing, when a settings file is not valid JSON, when the workspace record
+exists but cannot be read, or when neither home exists yet a hook names the old path; ``--dry-run`` prints the plan and changes nothing; each settings file is written
 through a temp file and ``os.replace`` after a ``<name>.pre-desk-move`` copy is kept (an existing copy is the older
 original and is kept as it is); a failure puts back the directory, the link, the stored directory and every settings
 file (a record entry already added stays: it only doors one more directory). A second run, with the move done, the link
@@ -227,6 +228,10 @@ def move_home(*, home: Path | str | None = None, settings: Path | str | None = N
     # the desk's stored directory, in every store a desk can live in (the consent directory and the board, as
     # levain.desk.cli._desk_dir finds them), each only where it still names the old path
     cwd_moves: list[tuple[Path, str, str]] = []
+    if store_dir is not None and not os.path.isfile(Path(store_dir) / _db_name()):
+        # an explicit --queue-dir that holds no desk store would read as "nothing to do": say so (a typo, or the wrong directory)
+        print(f"levain desk move-home: warning: {store_dir} holds no {_db_name()}, so no stored directory is moved there",
+              file=err)
     for d in _store_dirs(base, store_dir):
         stored = _read_stored_setting(d / _db_name())
         # agent none has no directory; a codex row is left as it is: lease.set_agent refuses to write one (the Codex desk

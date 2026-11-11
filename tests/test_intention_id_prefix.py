@@ -38,3 +38,14 @@ def test_the_id_check_reads_both_prefixes(value):
 @pytest.mark.parametrize("value", ["task-12", "intention", "intention-", "spore-", "", None, "spore-12 x", "xintention-1"])
 def test_the_id_check_refuses_anything_else(value):
     assert not valid_intention_id(value)
+
+
+def test_an_anneal_without_id_prefix_gets_a_clear_error_not_a_bare_type_error(tmp_path, monkeypatch):
+    import levain.spores as sp
+
+    def old_anneal(path, **kw):
+        raise TypeError("SporeStore.__init__() got an unexpected keyword argument 'id_prefix'")
+
+    monkeypatch.setattr(sp, "_GUARDED", old_anneal)
+    with pytest.raises(RuntimeError, match=r"anneal-memory>=1\.0\.7"):
+        sp.guarded_spore_store(tmp_path / "memory.spores.json")

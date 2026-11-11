@@ -144,7 +144,7 @@ def receipt(parsed, id=None):
 
     dict is ``{kind, id, fires, text}`` (``id`` is the spore id the caller planted, or None;
     ``fires`` is the ISO minute for a drop, else None). line is the one-line form:
-    ``scheduled drop spore-N fires Mon 11-09 09:00`` · ``talk spore-N`` · ``sent to the desk to sort``.
+    ``scheduled drop <id> fires Mon 11-09 09:00`` · ``talk <id>`` (``<id>`` is ``intention-N``, or ``spore-N`` on a row made before anneal 1.0.7) · ``sent to the desk to sort``.
     """
     kind = parsed["kind"]
     if kind == "drop":
