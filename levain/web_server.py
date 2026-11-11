@@ -1633,17 +1633,21 @@ def _asset_digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:12]
 
 
-def _shell_version(versioned_page: bytes, worker_template: bytes) -> str:
-    """The service worker's version label: a digest of the cockpit page AS SERVED (every script and stylesheet the worker
-    precaches is named in it by its own content digest, so the page bytes cover the page and every asset beside it) and of
-    the worker's own source. Content only (no clock, no path, no order): the same shell and worker give the same label, a
-    one-byte change to any precached asset, the page or the worker gives another. Raises ValueError when the page names no
-    versioned shell asset (nothing would be covered by the digest)."""
+def _shell_version(versioned_page: bytes, worker_template: bytes, digests: Mapping[str, str]) -> str:
+    """The service worker's version label: a digest of the cockpit page AS SERVED (every script and stylesheet it names is
+    named by its own content digest, so the page bytes cover the page and every asset it names), of ``digests`` (path ->
+    content digest of every other asset the server serves, so an asset the page loads without naming it, the mic worklet
+    via ``audioWorklet.addModule``, moves the label too), and of the worker's own source. Content only (no clock, no
+    path-dependent order: ``digests`` is sorted): the same bytes give the same label, a one-byte change to the page, any
+    served asset or the worker gives another. Raises ValueError when the page names no versioned shell asset (nothing
+    would be covered by the digest)."""
     if not re.search(rb"\?v=[0-9a-f]{12}[\"']", versioned_page):
         raise ValueError("refusing to start: the cockpit page names no ?v=<digest> shell asset, so the worker's version "
                          "would cover nothing")
+    served = "\n".join(f"{p}\t{d}" for p, d in sorted(digests.items())).encode("utf-8")
     return hashlib.sha256(
-        b"levain-shell\0" + hashlib.sha256(versioned_page).digest() + hashlib.sha256(worker_template).digest()
+        b"levain-shell\0" + hashlib.sha256(versioned_page).digest() + hashlib.sha256(served).digest()
+        + hashlib.sha256(worker_template).digest()
     ).hexdigest()[:12]
 
 
@@ -3035,8 +3039,10 @@ class _Handler(GuardedHandler):
         from levain.webpush import routes as push_routes
 
         if not read and path == push_routes.WORKER_PATH:
-            # the worker is rendered once at make_server (its version derives from the shell); ``no-cache`` so the browser
-            # re-checks it by bytes on every update check, which is what makes a changed shell raise the reload bar
+            # the worker is rendered once at make_server (its version derives from the shell). What raises the reload bar is
+            # the bytes changing (spore-1682 was unchanged bytes). The browser already bypasses the HTTP cache for the worker
+            # script on update checks (W3C Service Workers, Update algorithm; default updateViaCache 'imports'); ``no-cache``
+            # keeps an intermediary from serving a stale worker.
             self._send(self.server.levain_worker, "text/javascript; charset=utf-8", status=200, head=head,
                        cache_control="no-cache")
             return
@@ -6162,11 +6168,13 @@ def make_server(
     _shell_page = _version_shell_page(assets[_shell_file].decode("utf-8"), _shell_digests)
     _assert_shell_versioned(_shell_page, _shell_digests)
     assets[_shell_file] = _shell_page.encode("utf-8")
-    # The worker's version is derived here, once, from the same bytes: a changed shell cannot ship an unchanged /sw.js.
+    # The worker's version is derived here, once, from the same bytes: it changes whenever the page, any asset the server
+    # serves (the page-named ones through its ?v= digests, the rest through _shell_digests) or the worker source changes.
     from levain.webpush import routes as _push_routes
 
     _worker_template = _push_routes.worker_template()
-    _worker = _push_routes.render_worker(_worker_template, _shell_version(assets[_shell_file], _worker_template))
+    _worker = _push_routes.render_worker(
+        _worker_template, _shell_version(assets[_shell_file], _worker_template, _shell_digests))
     httpd = _LevainHTTPServer((host, port), _Handler)
     httpd.levain_worker = _worker
     httpd.watch_paths = watch_tuple
