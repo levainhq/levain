@@ -183,6 +183,8 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "band_age": ("str", _is_str),                # a band row's age in the footer's form ("1d6h"), from the host's refile clock
     "band_since": ("str", _is_str),              # the instant that age counts from: the page ticks the age text from it
     "band_later_words": ("Mon..Sun, optionally followed by MM-DD", _is_later_words),
+    # why a band row that rings nothing is still not offered band_agenda
+    "agenda_blocked": ("enum", _enum("signs", "rings", "unreadable", "no_answer")),
     # an open band row that rings an intention (the intention id): the row is then offered snooze, edit, done and clear in place
     # of an answer box. Present only when the host can act on it
     "intention": ("intention id", lambda v: _is_intention_id(v)),
