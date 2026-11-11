@@ -1,5 +1,5 @@
 """TS-1: handoff and the Keep note are RETIRED vocabulary. A new one is refused at every write seam; a
-legacy row still reads, descends and re-dispositions to seed or agenda."""
+legacy row still reads, descends and re-dispositions to someday or agenda."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -15,9 +15,9 @@ from tests.test_writes import _add_intention, _legacy_seed, _scope, _intention_s
 def test_retired_message_texts() -> None:
     assert RETIRED_HANDOFF_MSG == (
         "handoff is retired: ask the operator now with `levain ask`, "
-        "or record a seed, or an agenda with a date, in the Tray")
+        "or record a someday, or an agenda with a date, in the Tray")
     assert RETIRED_KEEP_NOTE_MSG == (
-        "the Keep is retired: a fact or command goes to memory (Durable Facts), an intention is a seed")
+        "the Keep is retired: a fact or command goes to memory (Durable Facts), an intention is a someday")
     assert "Keep" in RETIRED_KEEP_NOTE_MSG
 
 
@@ -30,15 +30,15 @@ def test_seed_refuses_retired(install: Path, disp: str, msg: str) -> None:
 
 @pytest.mark.parametrize("disp,msg", [("handoff", RETIRED_HANDOFF_MSG), ("note", RETIRED_KEEP_NOTE_MSG)])
 def test_set_disposition_refuses_retired(install: Path, disp: str, msg: str) -> None:
-    sid = _add_intention(install, disposition="seed")
+    sid = _add_intention(install, disposition="someday")
     with pytest.raises(EditError) as ei:
         apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid, "disposition": disp})
     assert ei.value.http_status == 422 and msg in str(ei.value)
-    assert _intention_store(install).get(sid)["disposition"] == "seed"   # nothing written
+    assert _intention_store(install).get(sid)["disposition"] == "someday"   # nothing written
 
 
-def test_seed_still_takes_seed_and_agenda(install: Path) -> None:
-    for d in ("seed", "agenda"):
+def test_capture_still_takes_someday_and_agenda(install: Path) -> None:
+    for d in ("someday", "agenda"):
         res = apply_edit(_scope(install), {"kind": "intention_seed", "text": f"t-{d}", "disposition": d})
         assert _intention_store(install).get(res["intention_id"])["disposition"] == d
 
@@ -49,8 +49,8 @@ def test_legacy_row_reads_descends_and_redispositions(install: Path, disp: str) 
     row = _intention_store(install).get(sid)
     assert not is_loop(row) and disp in NON_COGNITION_DISPOSITIONS
     assert bucket_of(row) == BUCKET_TRAY   # TS-5a: no Keep bucket; a legacy note renders in the Tray
-    # re-disposition to seed / agenda works
-    for target in ("agenda", "seed"):
+    # re-disposition to someday / agenda works
+    for target in ("agenda", "someday"):
         tsid = _legacy_seed(install, f"old row {target}", disp)
         apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": tsid, "disposition": target})
         assert _intention_store(install).get(tsid)["disposition"] == target
@@ -71,7 +71,7 @@ def test_is_loop_still_false_for_legacy_note() -> None:
 def test_cockpit_effects_refuse_retired() -> None:
     from levain.cockpit.effects import _ce_set_disposition
 
-    pre = {"id": "intention-001", "origin_key": "ok-1", "status": "open", "disposition": "seed", "text": "x", "type": "thought"}
+    pre = {"id": "intention-001", "origin_key": "ok-1", "status": "open", "disposition": "someday", "text": "x", "type": "thought"}
     for d, msg in (("note", RETIRED_KEEP_NOTE_MSG), ("handoff", RETIRED_HANDOFF_MSG)):
         with pytest.raises(ValueError) as ei:
             _ce_set_disposition({"disposition": d}, pre, origin_key=None, version_of=lambda *a, **k: "v")
@@ -87,7 +87,7 @@ def test_legacy_echo_passes_cockpit_update_and_new_retired_change_refused() -> N
     with pytest.raises(ValueError):
         _norm_update_field("disposition", "handoff", pre)                   # a CHANGE into a retired value
     with pytest.raises(ValueError):
-        _norm_update_field("disposition", "note", {"disposition": "seed"})
+        _norm_update_field("disposition", "note", {"disposition": "someday"})
 
 
 def test_store_refuses_retired_on_every_writer(tmp_path: Path) -> None:
@@ -99,7 +99,7 @@ def test_store_refuses_retired_on_every_writer(tmp_path: Path) -> None:
     for d in ("handoff", "note"):
         with pytest.raises(RetiredDisposition):
             store.add(type="thought", text="x", disposition=d)
-    row = store.add(type="thought", text="live", disposition="seed")
+    row = store.add(type="thought", text="live", disposition="someday")
     with pytest.raises(RetiredDisposition):
         store.update(row["id"], disposition="note")
     # a legacy row: written through the unguarded base class, as an old install left it
@@ -115,7 +115,7 @@ def test_store_refuses_retired_on_every_writer(tmp_path: Path) -> None:
                      expected_version=intention_version(store.get(row["id"])))
     with pytest.raises(ApplyRefused, match="Keep is retired"):
         store.apply(eff)
-    assert store.get(row["id"])["disposition"] == "seed"
+    assert store.get(row["id"])["disposition"] == "someday"
     # known edge: a replay of a pre-upgrade create that carries a retired value is refused, even if it landed
     add = IntentionApply(op="add", origin_key=old["origin_key"], args={"type": "thought", "text": "old", "disposition": "handoff"},
                      postcondition={"type": "thought", "text": "old", "disposition": "handoff"})
@@ -127,7 +127,7 @@ def test_norm_disposition_missing_or_corrupt_still_invalid() -> None:
     """N2: only an ECHO of a retired value is exempt from 'must be one of'."""
     from levain.cockpit.effects import _norm_disposition
 
-    for bad, cur in ((None, None), ("garbage", "garbage"), ("garbage", "seed"), (None, "seed")):
+    for bad, cur in ((None, None), ("garbage", "garbage"), ("garbage", "someday"), (None, "someday")):
         with pytest.raises(ValueError, match="must be one of"):
             _norm_disposition(bad, cur)
     assert _norm_disposition("note", "note") == "note"          # a retired echo still passes (the effect drops it)
@@ -146,7 +146,7 @@ def test_undo_edit_restoring_retired_value_is_refused() -> None:
     """Known edge: an undo back into a legacy handoff/note is a CHANGE into a retired value."""
     from levain.cockpit.effects import _ce_undo_edit
 
-    pre = {"id": "intention-001", "origin_key": "ok-1", "status": "open", "disposition": "seed", "text": "x", "type": "thought"}
+    pre = {"id": "intention-001", "origin_key": "ok-1", "status": "open", "disposition": "someday", "text": "x", "type": "thought"}
     for old in ("handoff", "note"):
         with pytest.raises(ValueError, match="retired"):
             _ce_undo_edit({"restore": {"disposition": old}}, pre, origin_key=None, version_of=lambda r: "v")
@@ -157,11 +157,11 @@ def test_retired_disposition_from_store_is_422_not_500(install: Path, monkeypatc
     from levain import writes
     from levain.intentions import RetiredDisposition
 
-    sid = _add_intention(install, disposition="seed")
+    sid = _add_intention(install, disposition="someday")
 
     class Boom:
         def get(self, *_a, **_k):
-            return {"id": sid, "status": "open", "disposition": "seed", "type": "thought", "text": "x"}
+            return {"id": sid, "status": "open", "disposition": "someday", "type": "thought", "text": "x"}
 
         def __getattr__(self, name):
             def raiser(*_a, **_k):
@@ -193,7 +193,7 @@ def test_store_refuses_a_retired_value_even_as_an_echo_under_a_cas(tmp_path: Pat
 
     old = IntentionStore(tmp_path / "s.json", id_prefix="intention").add(type="thought", text="old", disposition="note")
     store = guarded_intention_store(tmp_path / "s.json")
-    for cas in ("note", "seed", None):
+    for cas in ("note", "someday", None):
         with pytest.raises(RetiredDisposition):
             store.update(old["id"], disposition="note", expect_disposition=cas)
     with pytest.raises(RetiredDisposition):
@@ -227,7 +227,7 @@ def test_store_refuses_every_variant_on_add_update_apply(tmp_path: Path, variant
     store = guarded_intention_store(tmp_path / "s.json")
     with pytest.raises(RetiredDisposition):
         store.add(type="thought", text="x", disposition=variant)
-    row = store.add(type="thought", text="live", disposition="seed")
+    row = store.add(type="thought", text="live", disposition="someday")
     with pytest.raises(RetiredDisposition):
         store.update(row["id"], disposition=variant)
     upd = IntentionApply(op="update", origin_key=row["origin_key"], args={"disposition": variant},
@@ -238,17 +238,17 @@ def test_store_refuses_every_variant_on_add_update_apply(tmp_path: Path, variant
                      postcondition={"type": "thought", "text": "y", "disposition": variant})
     with pytest.raises(ApplyRefused):
         store.apply(add)
-    assert store.get(row["id"])["disposition"] == "seed"
+    assert store.get(row["id"])["disposition"] == "someday"
     assert store.get_by_origin_key("k.new") is None
-    assert [r.get("disposition") for r in store.list_open()] == ["seed"]   # nothing else landed
+    assert [r.get("disposition") for r in store.list_open()] == ["someday"]   # nothing else landed
 
 
 def test_store_still_takes_the_write_set_and_a_clear(tmp_path: Path) -> None:
     from levain.intentions import guarded_intention_store
 
     store = guarded_intention_store(tmp_path / "s.json")
-    row = store.add(type="thought", text="x", disposition="seed ")       # persisted 'seed': in the write set
-    assert row["disposition"] == "seed"
+    row = store.add(type="thought", text="x", disposition="someday ")       # persisted 'someday': in the write set
+    assert row["disposition"] == "someday"
     store.update(row["id"], disposition="agenda")
     store.update(row["id"], disposition=None)                              # a clear is a key-free loop
     assert "disposition" not in store.get(row["id"])
@@ -265,7 +265,7 @@ def test_legacy_row_other_fields_edit_with_disposition_omitted_and_a_normal_cas(
     store = guarded_intention_store(tmp_path / "s.json")
     store.update(old["id"], expect_disposition="note", text="edited")
     assert store.get(old["id"])["disposition"] == "note" and store.get(old["id"])["text"] == "edited"
-    IntentionStore(tmp_path / "s.json", id_prefix="intention").update(old["id"], disposition="seed")
+    IntentionStore(tmp_path / "s.json", id_prefix="intention").update(old["id"], disposition="someday")
     with pytest.raises(IntentionError):
         store.update(old["id"], expect_disposition="note", text="again")   # anneal's lock sees seed
     assert store.get(old["id"])["text"] == "edited"
@@ -382,8 +382,8 @@ def test_cockpit_echo_on_a_legacy_row_omits_the_disposition(tmp_path: Path) -> N
     row = es.snapshot(intention_resource_key("k.note")).row
     assert row["disposition"] == "note" and row["text"] == "refined"
     # a real change away from the retired value still names it
-    move = canonical_effect("intention_set_disposition", {"disposition": "seed"}, row)
-    assert dict(es.intention_apply(move).args) == {"disposition": "seed"}
+    move = canonical_effect("intention_set_disposition", {"disposition": "someday"}, row)
+    assert dict(es.intention_apply(move).args) == {"disposition": "someday"}
     assert run(move) is ApplyOutcome.APPLIED
 
 
@@ -492,6 +492,6 @@ def test_disposition_sets_read_vs_write() -> None:
     new write may set. The retired names are in the first and never in the second."""
     from levain.intentions import RETIRED_DISPOSITIONS, VALID_DISPOSITIONS, WRITE_DISPOSITIONS
 
-    assert VALID_DISPOSITIONS == ("loop", "seed", "handoff", "agenda", "note")
-    assert WRITE_DISPOSITIONS == ("loop", "seed", "agenda")
+    assert VALID_DISPOSITIONS == ("loop", "someday", "seed", "handoff", "agenda", "note")
+    assert WRITE_DISPOSITIONS == ("loop", "someday", "agenda")
     assert set(RETIRED_DISPOSITIONS) <= set(VALID_DISPOSITIONS) and not set(RETIRED_DISPOSITIONS) & set(WRITE_DISPOSITIONS)

@@ -955,7 +955,7 @@ class TestTrayWriteKinds:
         sid = res["intention_id"]
         intention = _intention_store(install).get(sid)
         assert intention is not None
-        assert intention["disposition"] == "seed"  # a Tray item, NOT a key-free loop
+        assert intention["disposition"] == "someday"  # a Tray item, NOT a key-free loop
         assert intention["type"] == "thought"  # the catch-all openness of an un-sorted dump
         assert intention["text"] == "call the dentist"
         rec = recent_edits(install / ".levain")[0]
@@ -1075,7 +1075,7 @@ class TestTrayWriteKinds:
         sid = _add_intention(install, tier="hot", salience=3)  # a live, high-salience loop
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
             })
         assert ei.value.code == "confirm_required" and ei.value.http_status == 409
         # refused → the loop is untouched (still a key-free cognition loop)
@@ -1084,13 +1084,13 @@ class TestTrayWriteKinds:
     def test_set_disposition_demote_live_loop_with_confirm(self, install: Path) -> None:
         sid = _add_intention(install, tier="hot")
         res = apply_edit(_scope(install), {
-            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
             "confirm": True,
         })
         assert res["ok"]
-        assert _intention_store(install).get(sid)["disposition"] == "seed"
+        assert _intention_store(install).get(sid)["disposition"] == "someday"
         rec = recent_edits(install / ".levain")[0]
-        assert rec["prior_disposition"] == "loop" and rec["disposition"] == "seed"
+        assert rec["prior_disposition"] == "loop" and rec["disposition"] == "someday"
 
     def test_set_disposition_parked_loop_to_tray_now_requires_confirm(self, install: Path) -> None:
         # C (codex L3 MED, reproduced `warm seed`): the confirm gate previously EXEMPTED
@@ -1102,12 +1102,12 @@ class TestTrayWriteKinds:
         sid = _add_intention(install, tier="parked")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
             })
         assert ei.value.code == "confirm_required" and ei.value.http_status == 409
         # with confirm it goes through
         res = apply_edit(_scope(install), {
-            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
             "confirm": True,
         })
         assert res["ok"]
@@ -1132,9 +1132,9 @@ class TestTrayWriteKinds:
         # OUT is a gain / lateral move, never the silent-loss demote of a LIVE loop.
         sid = self._seed_note(install)
         res = apply_edit(_scope(install), {
-            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed"})
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday"})
         assert res["ok"] and res["action"] == "set_disposition"
-        assert _intention_store(install).get(sid)["disposition"] == "seed"
+        assert _intention_store(install).get(sid)["disposition"] == "someday"
 
     def test_note_promote_then_ascend_is_the_deliberate_two_step(self, install: Path) -> None:
         # The note-ascend lock MOVED, it wasn't lost. A DIRECT ascend of a note stays refused;
@@ -1172,16 +1172,16 @@ class TestTrayWriteKinds:
         sid = self._seed_note(install)
         res = apply_edit(_scope(install), {
             "kind": "intention_set_disposition", "intention_id": sid,
-            "disposition": "seed", "surface_at": "2026-07-01"})
+            "disposition": "someday", "surface_at": "2026-07-01"})
         assert res["ok"]
         sp = _intention_store(install).get(sid)
-        assert sp["disposition"] == "seed" and sp["next"] == "2026-07-01"
+        assert sp["disposition"] == "someday" and sp["next"] == "2026-07-01"
         assert recent_edits(install / ".levain")[0]["surface_at"] == "2026-07-01"
 
     def test_set_disposition_absent_surface_at_leaves_next_untouched(self, install: Path) -> None:
         # ABSENT key ≠ clear: a plain reroute must not wipe an existing alarm (the same
         # presence-not-value rule intention_surface_at enforces, here as "leave next alone").
-        sid = _add_intention(install, disposition="seed", next="2026-07-01")
+        sid = _add_intention(install, disposition="someday", next="2026-07-01")
         apply_edit(_scope(install), {
             "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda"})
         assert _intention_store(install).get(sid)["next"] == "2026-07-01"  # alarm preserved
@@ -1216,7 +1216,7 @@ class TestTrayWriteKinds:
 
     def test_set_disposition_surface_at_empty_clears_the_alarm(self, install: Path) -> None:
         # surface_at:"" clears next WHILE re-routing — symmetric with intention_surface_at's clear.
-        sid = _add_intention(install, disposition="seed", next="2026-07-01")
+        sid = _add_intention(install, disposition="someday", next="2026-07-01")
         apply_edit(_scope(install), {
             "kind": "intention_set_disposition", "intention_id": sid,
             "disposition": "agenda", "surface_at": ""})
@@ -1229,7 +1229,7 @@ class TestTrayWriteKinds:
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "intention_set_disposition", "intention_id": sid,
-                "disposition": "seed", "surface_at": "2026-13-45"})
+                "disposition": "someday", "surface_at": "2026-13-45"})
         assert ei.value.code == "bad_verb_arg" and "surface_at" in str(ei.value)
         assert _intention_store(install).get(sid)["disposition"] == "note"  # fail-closed: unchanged
 
@@ -1239,7 +1239,7 @@ class TestTrayWriteKinds:
             "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda",
         })
         rec = recent_edits(install / ".levain")[0]
-        assert rec["prior_disposition"] == "seed" and rec["disposition"] == "agenda"
+        assert rec["prior_disposition"] == "someday" and rec["disposition"] == "agenda"
 
     def test_set_disposition_demote_unknown_disposition_also_gated(self, install: Path) -> None:
         # H1 (codex L3): is_loop treats an UNKNOWN disposition as in-cognition (fail-open),
@@ -1247,7 +1247,7 @@ class TestTrayWriteKinds:
         sid = _add_intention(install, disposition="bogus", tier="hot")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
             })
         assert ei.value.code == "confirm_required" and ei.value.http_status == 409
 
@@ -1260,9 +1260,9 @@ class TestTrayWriteKinds:
         sid = _legacy_seed(install, "x", "handoff")
         real_get = IntentionStore.get
 
-        def stale_get(self, sid_):  # returns disposition="seed" though the store has "handoff"
+        def stale_get(self, sid_):  # returns disposition="someday" though the store has "handoff"
             d = real_get(self, sid_)
-            return {**d, "disposition": "seed"} if d else d
+            return {**d, "disposition": "someday"} if d else d
 
         monkeypatch.setattr(IntentionStore, "get", stale_get)
         with pytest.raises(EditError) as ei:
@@ -1287,14 +1287,14 @@ class TestTrayWriteKinds:
         _add_intention(install)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "intention_set_disposition", "intention_id": "intention-999", "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": "intention-999", "disposition": "someday",
             })
         assert ei.value.code == "verb_failed" and ei.value.http_status == 422
 
     def test_set_disposition_no_store_yet(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "intention_set_disposition", "intention_id": "intention-001", "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": "intention-001", "disposition": "someday",
             })
         assert ei.value.code == "not_found" and ei.value.http_status == 404
 
@@ -1426,7 +1426,7 @@ class TestIntentionUpdate:
     def test_ascend_with_a_stale_snapshot_does_not_resolve_a_loop_that_left_cognition(self, install: Path) -> None:
         # the r1 HIGH: rendered as a loop, re-routed to the Tray; the server's own fresh read used to pass.
         sid = _add_intention(install)
-        _intention_store(install).update(sid, disposition="seed")
+        _intention_store(install).update(sid, disposition="someday")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "intention_promote", "intention_id": sid, "intention_kind": "pattern",
@@ -1474,21 +1474,21 @@ class TestIntentionUpdate:
         apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid,
-                                         "disposition": "seed", "expect_disposition": "note"})
+                                         "disposition": "someday", "expect_disposition": "note"})
         assert ei.value.code == "stale" and ei.value.http_status == 409
         assert "disposition" not in _intention_store(install).get(sid)
 
     def test_set_disposition_stale_snapshot_between_two_tray_values_does_not_overwrite(self, install: Path) -> None:
-        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "t", "disposition": "seed"})["intention_id"]
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "t", "disposition": "someday"})["intention_id"]
         _intention_store(install).update(sid, disposition="handoff")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid,
-                                         "disposition": "loop", "expect_disposition": "seed"})
+                                         "disposition": "loop", "expect_disposition": "someday"})
         assert ei.value.code == "stale"
         assert _intention_store(install).get(sid)["disposition"] == "handoff"
 
     def test_set_disposition_without_a_snapshot_is_unchanged(self, install: Path) -> None:
-        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "t", "disposition": "seed"})["intention_id"]
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "t", "disposition": "someday"})["intention_id"]
         _intention_store(install).update(sid, disposition="handoff")
         assert apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid,
                                             "disposition": "loop"})["ok"]
@@ -1530,7 +1530,7 @@ class TestIntentionUpdate:
 
         def stale_get(self, sid_):  # returns the STALE forming (seed) view
             d = real_get(self, sid_)
-            return {**d, "disposition": "seed"} if d else d
+            return {**d, "disposition": "someday"} if d else d
 
         monkeypatch.setattr(IntentionStore, "get", stale_get)
         with pytest.raises(EditError) as ei:
@@ -1597,7 +1597,7 @@ class TestIntentionUpdate:
         sid = _legacy_seed(install, "x", "handoff")
         res = apply_edit(_scope(install), {
             "kind": "intention_update", "intention_id": sid, "text": "edited",
-            "expect_disposition": "seed"})  # mismatched, but text-only → ignored, no CAS
+            "expect_disposition": "someday"})  # mismatched, but text-only → ignored, no CAS
         assert res["ok"] and _intention_store(install).get(sid)["text"] == "edited"
 
     def test_combined_type_tier_edit_consistency_guard(self, install: Path) -> None:
@@ -1605,22 +1605,22 @@ class TestIntentionUpdate:
         # gate CASes the server-read disposition; a client tier-snapshot that DISAGREES means a
         # re-route already happened → fail closed (don't silently leave the tier route unguarded).
         sid = apply_edit(_scope(install), {  # a forming seed (is_tray → type is reclassifiable)
-            "kind": "intention_seed", "text": "x", "disposition": "seed"})["intention_id"]
+            "kind": "intention_seed", "text": "x", "disposition": "someday"})["intention_id"]
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "intention_update", "intention_id": sid, "type": "task", "tier": "warm",
-                "expect_disposition": "loop"})  # snapshot disagrees with the server-read "seed"
+                "expect_disposition": "loop"})  # snapshot disagrees with the server-read "someday"
         assert ei.value.code == "stale" and "changed since read" in str(ei.value)
         rec = _intention_store(install).get(sid)
-        assert rec["type"] == "thought" and rec["disposition"] == "seed"  # fail-closed: untouched
+        assert rec["type"] == "thought" and rec["disposition"] == "someday"  # fail-closed: untouched
 
     def test_combined_type_tier_edit_matching_snapshot_applies(self, install: Path) -> None:
         # the agreeing combined case: snapshot == server-read → one CAS covers both fields, applies.
         sid = apply_edit(_scope(install), {
-            "kind": "intention_seed", "text": "x", "disposition": "seed"})["intention_id"]
+            "kind": "intention_seed", "text": "x", "disposition": "someday"})["intention_id"]
         res = apply_edit(_scope(install), {
             "kind": "intention_update", "intention_id": sid, "type": "task", "tier": "hot",
-            "expect_disposition": "seed"})
+            "expect_disposition": "someday"})
         assert res["ok"]
         rec = _intention_store(install).get(sid)
         assert rec["type"] == "task" and rec["tier"] == "hot"
@@ -1643,7 +1643,7 @@ class TestIntentionUpdate:
 
         def stale_get(self, sid_):  # stale seed view; real is handoff
             d = real_get(self, sid_)
-            return {**d, "disposition": "seed"} if d else d
+            return {**d, "disposition": "someday"} if d else d
 
         monkeypatch.setattr(IntentionStore, "get", stale_get)
         res = apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "text": "edited"})
