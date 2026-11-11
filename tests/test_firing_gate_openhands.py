@@ -1,4 +1,4 @@
-"""The EFFERENT GATE mounted on the OpenHands runtime — K3, spore-295.
+"""The EFFERENT GATE mounted on the OpenHands runtime — K3, intention-295.
 
 Gated on the extra (the pure classifier's own tests are base-lane in ``test_firing_gate.py``).
 These exercise the half that can only be wrong in contact with the SDK: the risk-channel

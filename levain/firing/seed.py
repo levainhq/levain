@@ -1,4 +1,4 @@
-"""levain.firing.seed — the entity-seed PresenceSource + the seed reader (spore-294, step 4).
+"""levain.firing.seed — the entity-seed PresenceSource + the seed reader (intention-294, step 4).
 
 The step that makes "the condenser IS the config surface" real. An OpenHands entity has NO
 ``CLAUDE.md`` and NO ``activation/`` hook tree (it is a HOOKLESS adapter — ``levain.install``:
@@ -20,7 +20,7 @@ it into the two seams that carry IDENTITY:
   - the **re-anchor** (``SeedPresence`` — presence kind ``"entity_seed"``) → the ``LevainCondenser``
     injects it at recency on the post-compaction recovery turn (the third CC presence hook). Unlike
     the constitution, this rebuilds from its serializable KIND on fork/reload — with the entity the
-    condenser serializes beside it (spore-438; with none it has no seed) — and resolves the
+    condenser serializes beside it (intention-438; with none it has no seed) — and resolves the
     seed dir PER re-anchor (never a frozen path), exactly as
     :class:`~levain.firing.anneal.AnnealEntityFiring` does for the store.
 

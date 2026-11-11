@@ -1,4 +1,4 @@
-"""spore-451: the memory wrap procedure (seed/memory_workflow.md) loads eagerly or on demand, per install and per
+"""intention-451: the memory wrap procedure (seed/memory_workflow.md) loads eagerly or on demand, per install and per
 agent. Eager is the default; on-demand moves the file behind the carrier's pointer block with a retention summary."""
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ def _roster(*names: str):
     return [packs.SeedEntry(name=n, path=SEED / n, mode="verbatim") for n in names]
 
 
-ALL = ("origin.md", "partnership.md", "world.md", "memory.md", WORKFLOW, "spore_instructions.md",
+ALL = ("origin.md", "partnership.md", "world.md", "memory.md", WORKFLOW, "intention_instructions.md",
        "continuity.md", "README.md")
 
 
@@ -78,7 +78,7 @@ def test_the_resolver_gives_each_mode_its_import_order_and_on_demand_set():
     assert WORKFLOW not in on_demand
     order, on_demand = packs.seed_classes("on-demand")
     assert WORKFLOW not in order and order == ("origin.md", "partnership.md", "world.md", "memory.md")
-    assert on_demand == ("spore_instructions.md", WORKFLOW)
+    assert on_demand == ("intention_instructions.md", WORKFLOW)
     with pytest.raises(ValueError):
         packs.seed_classes("lazy")
 
@@ -93,9 +93,9 @@ def test_the_classes_stay_disjoint_in_both_modes(mode):
 def test_the_roster_selectors_follow_the_mode():
     roster = _roster(*ALL)
     assert packs.import_names(roster, "eager") == ["origin.md", "partnership.md", "world.md", "memory.md", WORKFLOW]
-    assert packs.on_demand_names(roster, "eager") == ["spore_instructions.md"]
+    assert packs.on_demand_names(roster, "eager") == ["intention_instructions.md"]
     assert packs.import_names(roster, "on-demand") == ["origin.md", "partnership.md", "world.md", "memory.md"]
-    assert packs.on_demand_names(roster, "on-demand") == ["spore_instructions.md", WORKFLOW]
+    assert packs.on_demand_names(roster, "on-demand") == ["intention_instructions.md", WORKFLOW]
     # no argument is eager: every pre-existing caller keeps its behaviour
     assert packs.import_names(roster) == packs.import_names(roster, "eager")
 

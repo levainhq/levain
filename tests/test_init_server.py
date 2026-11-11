@@ -877,7 +877,7 @@ class TestOversizeWithALyingContentLength:
 
 
 def test_the_pack_docs_refresh_runs_inside_the_install_lock(tmp_path: Path) -> None:
-    """spore-1250 (2): the web handler refreshed `.levain/docs` (a wipe and copy) AFTER apply_init
+    """intention-1250 (2): the web handler refreshed `.levain/docs` (a wipe and copy) AFTER apply_init
     had returned and released the per-install lock, so a CLI `init`/`update` could take the lock and
     interleave its own wipe-and-copy. `run_init` holds the lock across both; the web path must too.
     Run from the window itself: another thread tries the lock while the refresh is in progress."""
@@ -911,7 +911,7 @@ def test_the_pack_docs_refresh_runs_inside_the_install_lock(tmp_path: Path) -> N
 
 
 def test_a_busy_install_is_refused_before_any_write_not_reported_partial(tmp_path: Path) -> None:
-    """spore-1250 (1), and the shape the handler's own lock must keep: another writer holds the
+    """intention-1250 (1), and the shape the handler's own lock must keep: another writer holds the
     install lock, so the POST is refused with 409 and `partial: false`, and nothing is written."""
     from levain.install import install_lock
 

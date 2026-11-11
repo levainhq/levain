@@ -96,7 +96,7 @@
     renderHealth(view);
     renderGraph(view);
     renderCrystals(view);
-    renderSpores(view);
+    renderIntentions(view);
     renderSections(view);
     renderErrors(view);
   }
@@ -242,12 +242,12 @@
     board.appendChild(p);
   }
 
-  // NOTE (Slice 3, 2026-06-18): this PARKED MCP-App variant renders only `open_spores`
+  // NOTE (Slice 3, 2026-06-18): this PARKED MCP-App variant renders only `open_intentions`
   // (now loops-only). The Tray projection (view.tray) is NOT ported
   // here — the live surface is web/dashboard_core.js. When this app un-parks, port the
   // Tray panel from there (renderTray) so it doesn't silently hide them.
-  function renderSpores(view) {
-    const list = view.open_spores || [];
+  function renderIntentions(view) {
+    const list = view.open_intentions || [];
     const p = panel(`Open loops (${list.length})`);
     if (list.length === 0) { p.appendChild(el("p", "empty", "no open prospective loops")); board.appendChild(p); return; }
     for (const s of list) {

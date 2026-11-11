@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain import authority as auth
 from levain import cli
@@ -43,7 +43,7 @@ def home() -> Iterator[Path]:
 @pytest.fixture
 def served(home: Path) -> Iterator[dict[str, Any]]:
     """A reported cockpit served over a real install: a laptop-presence and a display-phone key enrolled,
-    ``spore_seed`` raised to T3, so every seed is a ``sign`` pending only a laptop-presence key decides."""
+    ``intention_seed`` raised to T3, so every seed is a ``sign`` pending only a laptop-presence key decides."""
     root, src, _ids = _install(home)
     data_root = src.write_scope.ledger_root / "cockpit"
     with _serve(src, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
@@ -52,15 +52,15 @@ def served(home: Path) -> Iterator[dict[str, Any]]:
         laptop, phone = RealKey(home, "laptop"), RealKey(home, "phone")
         enrol(db, laptop, "laptop-presence")
         enrol(db, phone, "display-phone", by=laptop)
-        cockpit_keys.policy_raise(data_root, "spore_seed", "T3", signer_fp=laptop.fingerprint,
+        cockpit_keys.policy_raise(data_root, "intention_seed", "T3", signer_fp=laptop.fingerprint,
                                   sign=laptop.sign_link, clock=lambda: datetime.now(timezone.utc))
         yield {"url": url, "data_root": data_root, "laptop": laptop, "phone": phone,
-               "spores": root / ".levain" / "memory.spores.json"}
+               "intentions": root / ".levain" / "memory.spores.json"}
 
 
 def _issue(url: str, text: str) -> str:
     status, out = _post(f"{url}/cockpit/verb", {
-        "verb": "spore_seed", "panel_id": "tray", "params": {"text": text, "type": "thought", "disposition": "seed"},
+        "verb": "intention_seed", "panel_id": "tray", "params": {"text": text, "type": "thought", "disposition": "seed"},
         "intent": "sign", "idempotency_key": text, "tier_seen": "T3", "gesture_seen": "laptop-only"}, token=TOKEN)
     assert (status, out.get("state"), out.get("tier")) == (200, "WAITING", "T3"), out
     return out["pending_id"]
@@ -140,9 +140,9 @@ def test_a_default_namespace_signature_is_refused_and_the_cli_signs_the_same_pen
     rc, captured = _sign(s, pid, s["laptop"]), capsys.readouterr()
     assert rc == 0, captured
     out = captured.out
-    assert f"signing {pid}: spore_seed (sign, T3)" in out and "COMMITTED: decision ALLOWED" in out, out
+    assert f"signing {pid}: intention_seed (sign, T3)" in out and "COMMITTED: decision ALLOWED" in out, out
     assert _state(s, pid) == "COMMITTED"
-    assert SporeStore(s["spores"]).get_by_origin_key(f"ck.{pid[2:]}.0")["text"] == "signed from the terminal"
+    assert IntentionStore(s["spores"], id_prefix="intention").get_by_origin_key(f"ck.{pid[2:]}.0")["text"] == "signed from the terminal"
 
 
 def test_a_key_whose_class_does_not_cover_the_tier_is_refused_before_signing(served, monkeypatch, capsys):

@@ -123,7 +123,7 @@ def test_a_passkey_revokes_a_grant_from_the_phone_and_signs_no_other_link(world)
                                                     "tools": ["Write"], "workspace": str(world.ws),
                                                     "postures": ["default"],
                                                     "expires_at": auth._stamp(_now() + timedelta(days=1))}},
-                   {"op": "raise", "verb": "spore_touch", "tier": "T3"}):
+                   {"op": "raise", "verb": "intention_touch", "tier": "T3"}):
             with pytest.raises(auth.AuthorityError, match="a passkey key signs consent answers and grant revokes "
                                                           "only, never another authority link"):
                 auth.prepare(conn, op, signer_fp=phone.fp, now=_now(), cache=auth.ReplayCache())

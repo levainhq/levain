@@ -7,7 +7,7 @@ run the REAL sign.js in headless Chrome against a STUB cockpit (a canned server 
 authenticator. The stub REFUSES a request whose key set is not the one the real server's ``_need`` accepts, so a page that
 sends a key the server would refuse fails here as it would live. They prove the order of the page's calls, that Sign mints
 the challenge at the tap, what the page draws and what it says when a reply is missing or wrong; they prove nothing about the
-real cards' wording on glass, or Phill's passkey on his own device (spore-1066)."""
+real cards' wording on glass, or Phill's passkey on his own device (intention-1066)."""
 from __future__ import annotations
 
 import base64

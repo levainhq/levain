@@ -1,4 +1,4 @@
-"""HANDOFF OPEN #5 (carried from K2a L2 #5): a spore that moved after render must read ``stale``, not
+"""HANDOFF OPEN #5 (carried from K2a L2 #5): an intention that moved after render must read ``stale``, not
 ``not_ascendable`` / ``type_locked`` from a lock-free pre-check. Reproduced on 11d579a (1011+40): every
 route below already answered ``stale``, because the row binding (cockpit route: the row left its
 panel; ``/edit``: the rendered list) and the broker's version compare run before any pre-check.
@@ -31,10 +31,10 @@ def _rendered(rig: Any, verb: str, panel: str, key: str, params: dict[str, Any],
             "row_version": r["version"], "idempotency_key": idem, **REPORTED}
 
 
-def test_a_spore_moved_after_render_reads_stale_on_every_route(rig_broker) -> None:
+def test_a_intention_moved_after_render_reads_stale_on_every_route(rig_broker) -> None:
     rig, b, _db = rig_broker
-    ascend = _rendered(rig, "spore_ascend", "loops", "loop", {"spore_kind": "project", "ref": "x"}, "o5-1")
-    retype = _rendered(rig, "spore_update", "tray", "seed", {"type": "question"}, "o5-2")
+    ascend = _rendered(rig, "intention_promote", "loops", "loop", {"intention_kind": "project", "ref": "x"}, "o5-1")
+    retype = _rendered(rig, "intention_update", "tray", "seed", {"type": "question"}, "o5-2")
     rig.store.update(rig.ids["loop"], disposition="note")      # the loop became a Keep note
     rig.store.update(rig.ids["seed"], disposition=None)        # the seed left the Tray
     assert _code(rig, b, ascend, "cockpit") == "stale"
@@ -42,7 +42,7 @@ def test_a_spore_moved_after_render_reads_stale_on_every_route(rig_broker) -> No
 
     rig.store.update(rig.ids["parked"], disposition="note")
     rig.store.update(rig.ids["held"], disposition=None)
-    assert _code(rig, b, {"kind": "spore_ascend", "spore_id": rig.ids["parked"], "spore_kind": "project",
+    assert _code(rig, b, {"kind": "intention_promote", "intention_id": rig.ids["parked"], "intention_kind": "project",
                           "ref": "x", "confirm": True, "expect_disposition": None}, "edit") == "stale"
-    assert _code(rig, b, {"kind": "spore_update", "spore_id": rig.ids["held"], "type": "question",
+    assert _code(rig, b, {"kind": "intention_update", "intention_id": rig.ids["held"], "type": "question",
                           "expect_disposition": "seed"}, "edit") == "stale"

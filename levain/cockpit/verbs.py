@@ -185,7 +185,7 @@ class VerbSpec:
     sign: bool = False
     # the other verbs whose standing policy also governs these params (``params -> names``): a verb that writes another
     # verb's effect answers to that verb's raise too, so a raise is never stepped around by a second door. ``list_intake``
-    # names ``spore_seed`` for a drop or a talk (both plant a spore_seed effect); None for every other verb
+    # names ``intention_seed`` for a drop or a talk (both plant an intention_seed effect); None for every other verb
     policy_also: Callable[[dict[str, Any]], tuple[str, ...]] | None = None
 
     # ``policy`` is the request's standing policy (``RequestAuthority.policy``, trust-tiering DESIGN
@@ -247,10 +247,10 @@ def _held_date(row: dict[str, Any] | None, today: date) -> date | None:
 
 
 def _held_at(row: dict[str, Any] | None, today: date) -> datetime | None:
-    """The instant a held row next surfaces, at the minute it is stored: a spore row's ``fires`` facet carries a timed
+    """The instant a held row next surfaces, at the minute it is stored: an intention row's ``fires`` facet carries a timed
     ``next`` (None there means a date-only one, read as the start of its day). A row whose minute is not known (no
     ``fires`` facet at all) is read as held to the end of its day, so a move within that day reads as sooner."""
-    from levain.spores import _parse_when
+    from levain.intentions import _parse_when
 
     held = _held_date(row, today)
     if held is None:
@@ -269,7 +269,7 @@ def _date_tier(new: Any, row: dict[str, Any] | None, provenance: str, today: dat
     instant earlier (an earlier minute on the same day included) or clearing it shows the row sooner
     to readers who were not seeing it, so it is T2 (§4.2, RULED Q4 bounded below). A date-only value
     is the start of its day."""
-    from levain.spores import _parse_when
+    from levain.intentions import _parse_when
 
     held = _held_at(row, today)
     if provenance == "verified" or held is None:
@@ -295,7 +295,7 @@ def _surface_at_tier(params: dict[str, Any], row: dict[str, Any] | None, prov: s
 
 
 def _update_tier(params: dict[str, Any], row: dict[str, Any] | None, prov: str, today: date) -> Tier:
-    """A ``spore_update`` carrying fields of several tiers takes the highest (§4.2)."""
+    """A ``intention_update`` carrying fields of several tiers takes the highest (§4.2)."""
     tiers: list[Tier] = []
     if "text" in params or "domain" in params:
         tiers.append("T2")
@@ -345,24 +345,24 @@ def _undo_tier(params: dict[str, Any], row: dict[str, Any] | None, prov: str, to
 # --- firing a kernel verb through its legacy write -----------------------------------------------
 
 
-def _spore_id(target: dict[str, Any]) -> str:
+def _intention_id(target: dict[str, Any]) -> str:
     row_id = str(target["row_id"])
-    if not row_id.startswith("spore:"):
-        raise EditError("bad_target", 400, f"{row_id!r} is not a spore row")
-    return row_id[len("spore:"):]
+    if not row_id.startswith("intention:"):
+        raise EditError("bad_target", 400, f"{row_id!r} is not an intention row")
+    return row_id[len("intention:"):]
 
 
-def _spore_fire(kind: str) -> Callable[..., dict[str, Any]]:
+def _plain_intention_fire(kind: str) -> Callable[..., dict[str, Any]]:
     def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
         # The CAS keys come from the row as read from the source, never from the client (§4.4:
         # "the cockpit always sends the key"): its disposition, and its version, which anneal
         # recomputes inside its write transaction, so the row the tier was computed on is the row
         # the write lands on (a write between read_one and here is refused 409).
         row = target["row"]
-        sid = _spore_id(target)
+        sid = _intention_id(target)
         if target.get("questions") is not None:       # the guard in the write looks the ring up in THIS cockpit's band
             scope = dataclasses.replace(scope, questions=target["questions"])
-        req = {"kind": kind, **params, "spore_id": sid,
+        req = {"kind": kind, **params, "intention_id": sid,
                "expect_disposition": _facet(row, "disposition")}
         if confirm:
             req["confirm"] = True
@@ -393,7 +393,7 @@ def _unbuilt_fire(why: str) -> Callable[..., dict[str, Any]]:
     return fire
 
 
-_SPORE_ROW = lambda r: str(r.get("id", "")).startswith("spore:")   # noqa: E731
+_PLAIN_INTENTION_ROW = lambda r: str(r.get("id", "")).startswith("intention:")   # noqa: E731
 # an OPEN question row only: an answered one is a 409 (the row it was rendered on is no longer offered the verb)
 _OPEN_QUESTION_ROW = lambda r: (str(r.get("id", "")).startswith("question:")   # noqa: E731
                                 and _facet(r, "question_state") == "open")
@@ -848,8 +848,8 @@ def _question_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str
 
 def _intention_fire(action: str) -> Callable[..., dict[str, Any]]:
     """Act on the intention a band row rings (snooze, edit, done, clear) through the host's one ``intention_act``: the host
-    owns the spore, the row and its log, so this writes nothing itself and the host's own lock order holds. Channel
-    ``cockpit``. C1: it authorises nothing. The host is handed the spore id the row DISPLAYED (its version carries it, so a
+    owns the intention, the row and its log, so this writes nothing itself and the host's own lock order holds. Channel
+    ``cockpit``. C1: it authorises nothing. The host is handed the intention id the row DISPLAYED (its version carries it, so a
     row re-rung since is already stale here), never a row id it would resolve again. The host's refusal comes back in its
     own words: stale when it says the row moved (an ``IntentionStale``, or any exception with a truthy ``stale``), else a bad
     request. Known edge: the band shorthand answer on such a row closes a native reminder at the next germinate run, not at once."""
@@ -936,9 +936,9 @@ def _intake_tier(params: dict[str, Any], row: dict[str, Any] | None, prov: str, 
 
 
 def _intake_policy_also(params: dict[str, Any]) -> tuple[str, ...]:
-    """A drop or a talk plants a ``spore_seed`` effect, so a standing raise of ``spore_seed`` governs it too; a sort
+    """A drop or a talk plants a ``intention_seed`` effect, so a standing raise of ``intention_seed`` governs it too; a sort
     plants none. With no line (the rendered tier, the manifest head) the answer is the one that governs most."""
-    return () if intake_kind_of(params.get("line")) == "sort" else ("spore_seed",)
+    return () if intake_kind_of(params.get("line")) == "sort" else ("intention_seed",)
 
 
 def _intake_outbox_id(credential: str, key: str) -> str:
@@ -991,55 +991,55 @@ def _intake_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, 
 
 
 def _resolve_kinds(direction: str) -> Callable[[dict[str, Any]], dict[str, list[Any]]]:
-    """The ``spore_kind`` values anneal takes for this row's type, so a renderer offers only those."""
+    """The ``intention_kind`` values anneal takes for this row's type, so a renderer offers only those."""
     def options(row: dict[str, Any]) -> dict[str, list[Any]]:
         from anneal_memory.spores import ASCEND_BY_TYPE, DESCEND_BY_TYPE
 
         by_type = ASCEND_BY_TYPE if direction == "ascend" else DESCEND_BY_TYPE
-        return {"spore_kind": sorted(by_type.get(str(_facet(row, "spore_type")), ()))}
+        return {"intention_kind": sorted(by_type.get(str(_facet(row, "intention_type")), ()))}
     return options
 
 KERNEL_VERBS: tuple[VerbSpec, ...] = (
-    VerbSpec("spore_touch", "touch", "marks the item seen now (moves its seen-recency)", "row",
-             floor="C1", tier_fn=_const("C1"), fire=_spore_fire("spore_touch"), legacy_kind="spore_touch",
-             applies_to=_SPORE_ROW),
-    VerbSpec("spore_descend", "resolve", "resolves the item (it leaves the open set; recoverable in anneal)",
-             "row", fields=("spore_kind",), floor="C1", tier_fn=_const("C1"), confirm_required=True,
-             reversible=False, fire=_spore_fire("spore_descend"), legacy_kind="spore_descend", device_ok=True,
-             applies_to=_SPORE_ROW, options=_resolve_kinds("descend")),
-    VerbSpec("spore_surface_at", "snooze", "sets the date the item next surfaces", "row",
+    VerbSpec("intention_touch", "touch", "marks the item seen now (moves its seen-recency)", "row",
+             floor="C1", tier_fn=_const("C1"), fire=_plain_intention_fire("intention_touch"), legacy_kind="intention_touch",
+             applies_to=_PLAIN_INTENTION_ROW),
+    VerbSpec("intention_close", "resolve", "resolves the item (it leaves the open set; recoverable in anneal)",
+             "row", fields=("intention_kind",), floor="C1", tier_fn=_const("C1"), confirm_required=True,
+             reversible=False, fire=_plain_intention_fire("intention_close"), legacy_kind="intention_close", device_ok=True,
+             applies_to=_PLAIN_INTENTION_ROW, options=_resolve_kinds("descend")),
+    VerbSpec("intention_surface_at", "snooze", "sets the date the item next surfaces", "row",
              fields=("surface_at",), floor="C1", tier_fn=_surface_at_tier,
              row_tier=_const("C1"),
              escalates=lambda row, prov, today: _date_escalates(row, prov, today, "surface_at"),
-             fire=_spore_fire("spore_surface_at"), legacy_kind="spore_surface_at", device_ok=True, applies_to=_SPORE_ROW),
-    VerbSpec("spore_update", "edit", "changes the item's text, domain, tier or type", "row",
-             # design §4.2 also allowlists next; here a date moves only through spore_surface_at. domain
+             fire=_plain_intention_fire("intention_surface_at"), legacy_kind="intention_surface_at", device_ok=True, applies_to=_PLAIN_INTENTION_ROW),
+    VerbSpec("intention_update", "edit", "changes the item's text, domain, tier or type", "row",
+             # design §4.2 also allowlists next; here a date moves only through intention_surface_at. domain
              # is always T2 (_update_tier), so it lands through the broker's effect and never reaches the
              # legacy write, which refuses it rather than drop it
              fields=("text", "domain", "tier", "type"), floor="C1", tier_fn=_update_tier,
              row_tier=_const("C1"), escalates=_update_escalates,
-             fire=_spore_fire("spore_update"), legacy_kind="spore_update", device_ok=True, applies_to=_SPORE_ROW),
-    VerbSpec("spore_retarget", "who", "sets who acts when the item wakes: you (a band row) or the machine (the desk "
+             fire=_plain_intention_fire("intention_update"), legacy_kind="intention_update", device_ok=True, applies_to=_PLAIN_INTENTION_ROW),
+    VerbSpec("intention_retarget", "who", "sets who acts when the item wakes: you (a band row) or the machine (the desk "
              "or a board), a seed given one becomes a dated agenda", "row", fields=("target", "surface_at"), floor="T2",
              tier_fn=_const("T2"),
-             # a target wakes an agent with these words, as a create that carries one does (spore_seed), so it is T2;
+             # a target wakes an agent with these words, as a create that carries one does (intention_seed), so it is T2;
              # it fires through the broker's effect, never a bearer-token write
-             fire=_unbuilt_fire("spore_retarget fires through the broker (a target wakes an agent: signed)"),
-             legacy_kind="spore_retarget", device_ok=True,
-             applies_to=lambda r: _SPORE_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() in ("seed", "agenda")),
-    VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
+             fire=_unbuilt_fire("intention_retarget fires through the broker (a target wakes an agent: signed)"),
+             legacy_kind="intention_retarget", device_ok=True,
+             applies_to=lambda r: _PLAIN_INTENTION_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() in ("someday", "seed", "agenda")),
+    VerbSpec("intention_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
-             fire=_spore_fire("spore_set_disposition"), legacy_kind="spore_set_disposition", device_ok=True,
-             applies_to=_SPORE_ROW),
-    VerbSpec("spore_ascend", "promote", "resolves the loop into what it became, with a reference", "row",
-             fields=("spore_kind", "ref"), floor="T2", tier_fn=_const("T2"), confirm_required=True,
-             reversible=False, fire=_spore_fire("spore_ascend"), legacy_kind="spore_ascend", device_ok=True,
-             applies_to=_SPORE_ROW, options=_resolve_kinds("ascend")),
-    VerbSpec("spore_seed", "capture", "adds a new item that agents will read", "create",
+             fire=_plain_intention_fire("intention_set_disposition"), legacy_kind="intention_set_disposition", device_ok=True,
+             applies_to=_PLAIN_INTENTION_ROW),
+    VerbSpec("intention_promote", "promote", "resolves the loop into what it became, with a reference", "row",
+             fields=("intention_kind", "ref"), floor="T2", tier_fn=_const("T2"), confirm_required=True,
+             reversible=False, fire=_plain_intention_fire("intention_promote"), legacy_kind="intention_promote", device_ok=True,
+             applies_to=_PLAIN_INTENTION_ROW, options=_resolve_kinds("ascend")),
+    VerbSpec("intention_seed", "capture", "adds a new item that agents will read", "create",
              # next/target/attention: THE LIST's scheduled drop and talk seed (task_surfaces_1107.md); a target
              # wakes an agent with these words, so a create stays T2 whatever it carries
              fields=("text", "type", "disposition", "next", "target", "attention"), floor="T2", tier_fn=_const("T2"),
-             fire=_unbuilt_fire("spore_seed fires through the broker (K2b)"), legacy_kind="spore_seed",
+             fire=_unbuilt_fire("intention_seed fires through the broker (K2b)"), legacy_kind="intention_seed",
              device_ok=True),
     VerbSpec(INTAKE_VERB, "add", "adds one line to the List: '@<when> words' schedules a drop that wakes the desk "
              "at that minute, '? words' queues a talk, anything else goes to the desk to sort", "create",
@@ -1115,7 +1115,7 @@ LEGACY_KINDS: dict[str, str] = {v.legacy_kind: v.name for v in KERNEL_VERBS if v
 # K8: the kernel verbs a device credential (a phone passkey) may fire, each as a signed broker pending; the broker
 # adds ``pending_cancel`` (a device cancels only through a signed pending). Not here, by B5's review: section_edit
 # (the dream's single-writer surface), episode_tombstone (irreversible), undo, question_answer (the phone answers on
-# its consent path), operator_state (until Phill asks), spore_touch (no broker effect), every T3 verb, and any panel
+# its consent path), operator_state (until Phill asks), intention_touch (no broker effect), every T3 verb, and any panel
 # verb registered later (``device_ok`` defaults off)
 DEVICE_VERBS: frozenset[str] = frozenset(v.name for v in KERNEL_VERBS if v.device_ok)
 
@@ -1742,7 +1742,7 @@ def _require_confirm(verb: VerbSpec, req: dict[str, Any]) -> None:
         raise _refuse("confirm_required", 409, f"{verb.name!r} requires confirm:true")
 
 
-_ROW_KEYS = {"spore_id": ("spore:", ("tray", "loops")), "edit_id": ("edit:", ("edits",)),
+_ROW_KEYS = {"intention_id": ("intention:", ("tray", "loops")), "edit_id": ("edit:", ("edits",)),
              "episode_id": ("episode:", ("episodes",))}
 
 
@@ -1776,7 +1776,7 @@ def _legacy_target(cockpit: "Cockpit", verb: VerbSpec, req: dict[str, Any]) -> t
 _LEGACY_VALUE_PANEL = {"operator_state": "state"}
 # Legacy verbs that act on what the client rendered and cannot be undone: the body must name the
 # disposition it rendered, so a confirm given on an old render never lands on a row that changed list.
-_LEGACY_NEEDS_SNAPSHOT = frozenset({"spore_descend"})
+_LEGACY_NEEDS_SNAPSHOT = frozenset({"intention_close"})
 
 
 def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope", req: dict[str, Any],

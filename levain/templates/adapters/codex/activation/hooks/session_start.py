@@ -11,10 +11,10 @@ per hooks.json). Injects, at primacy position:
   2. Operator-local date and time — models have no clock.
   3. On a genuinely fresh session (source ∈ {"startup", "clear"}) only: a
      wrap-check flag if the previous session left episodes unwrapped, AND the
-     time-based prospective surface — open spores that have gone dormant or
+     time-based prospective surface — open intentions that have gone dormant or
      whose `next` date has arrived, surfaced once so nothing rots silently.
      `resume` and `compact` carry ongoing work, not a fresh start — they get
-     posture re-injection but skip the wrap-check and the due-spore surface.
+     posture re-injection but skip the wrap-check and the due-intention surface.
 
 Codex SessionStart `source` vocabulary per Codex 0.133 schema: `startup`,
 `resume`, `clear`, `compact`. (`clear` and `compact` mirror Claude Code's
@@ -74,7 +74,7 @@ def main() -> int:
         if not hook.should_fire():
             # Outside the install (the desk's workspace, any repo): the NEEDS YOU band alone, and only when the
             # operator opted in with `levain band hooks install` (its receipt). Same stand-down rules; no posture,
-            # spores or recall. A suppressed spawn stays silent.
+            # intentions or recall. A suppressed spawn stays silent.
             if not hook.suppressed():
                 try:
                     from levain.band_hook import codex_standalone
@@ -169,20 +169,20 @@ def main() -> int:
                 pass
 
             try:
-                # Time-based spore germination — open loops that have gone dormant
+                # Time-based intention germination — open loops that have gone dormant
                 # or whose `next` date has arrived, surfaced once on a fresh session
                 # so nothing rots silently. Growing/resting/parked stay out of the
                 # way. Fires only on a fresh session (with the wrap-check), not on
                 # resume/compact mid-flow.
-                due = hook.due_dormant_spores(hook.open_spores())
+                due = hook.due_dormant_intentions(hook.open_intentions())
                 if due:
-                    sections.append(hook.format_due_spores(due))
+                    sections.append(hook.format_due_intentions(due))
             except Exception:
                 pass
 
             try:
                 # Agenda germination (TS-3): a dated agenda that has come due is put in front of him by a detached,
-                # fail-soft `levain spores germinate`; spawned ONLY when one is due, one spawn per session start.
+                # fail-soft `levain intentions germinate`; spawned ONLY when one is due, one spawn per session start.
                 n = len(hook.due_agendas(hook.open_agendas()))
                 if n:
                     st = hook.start_germinate('codex')
@@ -190,7 +190,7 @@ def main() -> int:
                     if st == 'started':
                         sections.append(f"[germinate] {n} agenda{plural} came due; germination started")
                     elif st == 'failed':
-                        sections.append(f"[germinate] {n} agenda{plural} came due but germination did not start: run `levain spores germinate`")
+                        sections.append(f"[germinate] {n} agenda{plural} came due but germination did not start: run `levain intentions germinate`")
                     elif st == 'busy':
                         sections.append(f"[germinate] {n} agenda{plural} came due; germination was already started within the last minute")
             except Exception:

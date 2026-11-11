@@ -1,5 +1,5 @@
 """levain.firing.crystallization — AN UNATTENDED CONSOLIDATE MAY METABOLIZE, BUT MAY NEVER
-CRYSTALLIZE (K4a [6], ``spore-373`` [6]; the ``spore-325`` slice).
+CRYSTALLIZE (K4a [6], ``intention-373`` [6]; the ``intention-325`` slice).
 
 **Two different things are called "graduation" around this code, and blocking the wrong one would
 break the feature this module exists to enable. The distinction is the first thing to get right:**
@@ -19,7 +19,7 @@ K3 built one of the membrane's two efferent edges: action-on-**world** fans in t
 other edge is action-on-**self** — memory mutation — and it has been ungated only because nothing
 autonomous ever called it. K4a [6] is the moment that stops being true: a scheduled seat that
 consolidates itself is an unsupervised write path into its own cognitive substrate, which is exactly
-``spore-325``'s memory-poisoning surface (MPBench ASR 50.46%). Stated plainly: **anything that can
+``intention-325``'s memory-poisoning surface (MPBench ASR 50.46%). Stated plainly: **anything that can
 get text into an episode can, one wrap later, be speaking in the entity's constitution** — with no
 human anywhere in that path.
 

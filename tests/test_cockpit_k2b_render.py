@@ -43,14 +43,14 @@ class FakeLabels:
         return p["label"] if p else "unverified"
 
 
-def _fake_spore_key(stored: Mapping[str, Any]) -> LabelKey:
-    # keyed on the id with one field, to test render apart from the spore key function
-    return LabelKey(f"spore:{stored['id']}", {"text": stored["text"]})
+def _fake_intention_key(stored: Mapping[str, Any]) -> LabelKey:
+    # keyed on the id with one field, to test render apart from the intention key function
+    return LabelKey(f"intention:{stored['id']}", {"text": stored["text"]})
 
 
 @pytest.fixture
 def rig(tmp_path: Path, monkeypatch) -> Rig:
-    monkeypatch.setattr(providers, "spore_label_key", _fake_spore_key)
+    monkeypatch.setattr(providers, "intention_label_key", _fake_intention_key)
     return Rig(tmp_path)
 
 
@@ -90,7 +90,7 @@ def test_a_section_edit_labels_the_canonical_body_read_section_returns(tmp_path:
 
 
 def test_a_labelled_row_carries_its_provenance_and_the_etag_moves(rig: Rig) -> None:
-    seed = f"spore:{rig.ids['seed']}"
+    seed = f"intention:{rig.ids['seed']}"
     before = rig.ck.panel("tray", credential_class="token")
     assert all(r["provenance"] is None for r in before["rows"])
     snap = _attach(rig, FakeLabels({seed: "verified"}))
@@ -126,31 +126,31 @@ def test_a_failing_labeller_is_an_error_snapshot_never_a_failed_panel(rig: Rig) 
 def test_a_verified_held_row_snoozes_earlier_as_c1_at_render_and_issue(rig: Rig) -> None:
     """``_date_tier``: on an UNVERIFIED held row an earlier date or a clear is T2 (K2a); on a verified
     one it is C1. The label must reach tier_fn at issue (dispatch's fresh snapshot) and at render."""
-    held = f"spore:{rig.ids['held']}"
-    assert rig.tier("spore_surface_at", "tray", "held", {"surface_at": None}) == "T2"
+    held = f"intention:{rig.ids['held']}"
+    assert rig.tier("intention_surface_at", "tray", "held", {"surface_at": None}) == "T2"
     snap = _attach(rig, FakeLabels({held: "verified"}))
     snap.calls.clear()
-    assert rig.tier("spore_surface_at", "tray", "held", {"surface_at": None}) == "C1"
+    assert rig.tier("intention_surface_at", "tray", "held", {"surface_at": None}) == "C1"
     # Rig.tier reads the row once itself (one snapshot) and dispatch takes its own fresh one
     assert len(snap.calls) == 2
     row = rig.ck.read_one("tray", held).value
     assert row["provenance"]["label"] == "verified"
     acts = {a["verb"]: a for a in row_actions(rig.reg, rig.ck, "tray", row, "token", INSTALL_CLASS, rig.ck.today(),
                                                     policy=rig.ck.authority().policy)}
-    assert acts["spore_surface_at"]["escalates"] == []
+    assert acts["intention_surface_at"]["escalates"] == []
     snap.labelled = {}
     row = rig.ck.read_one("tray", held).value
     acts = {a["verb"]: a for a in row_actions(rig.reg, rig.ck, "tray", row, "token", INSTALL_CLASS, rig.ck.today(),
                                                     policy=rig.ck.authority().policy)}
-    assert acts["spore_surface_at"]["escalates"]
+    assert acts["intention_surface_at"]["escalates"]
 
 
 def test_retier_waits_on_an_unreadable_journal_only_in_a_governed_install(rig: Rig) -> None:
-    held = f"spore:{rig.ids['held']}"
+    held = f"intention:{rig.ids['held']}"
     target = {"kind": "row", "panel_id": "tray", "row_id": held}
     _attach(rig, FakeLabels({held: "verified"}))
-    assert retier(rig.reg, rig.ck, "spore_surface_at", {"surface_at": None}, target) == "C1"
+    assert retier(rig.reg, rig.ck, "intention_surface_at", {"surface_at": None}, target) == "C1"
     _attach(rig, FakeLabels({held: "verified"}, revision=None, error="provenance unavailable: busy"))
-    assert retier(rig.reg, rig.ck, "spore_surface_at", {"surface_at": None}, target) == "T2"   # reported
+    assert retier(rig.reg, rig.ck, "intention_surface_at", {"surface_at": None}, target) == "T2"   # reported
     rig.ck.attach_verbs(VerbView(rig.reg, rig.ck, "governed"))
-    assert retier(rig.reg, rig.ck, "spore_surface_at", {"surface_at": None}, target) is None
+    assert retier(rig.reg, rig.ck, "intention_surface_at", {"surface_at": None}, target) is None

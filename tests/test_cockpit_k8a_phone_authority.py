@@ -22,12 +22,12 @@ import pytest
 
 ec = pytest.importorskip("cryptography.hazmat.primitives.asymmetric.ec")
 from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from anneal_memory.spores import SporeStore  # noqa: E402
+from anneal_memory.spores import IntentionStore  # noqa: E402
 
 import levain.consent.passkey as P  # noqa: E402
 from levain.autonomic.confirm import COCKPIT_NAMESPACE, COCKPIT_PHONE_NAMESPACE  # noqa: E402
 from levain.cockpit.broker import Broker, BrokerError  # noqa: E402
-from levain.cockpit.effects import SporeEffectStore  # noqa: E402
+from levain.cockpit.effects import IntentionEffectStore  # noqa: E402
 from levain.cockpit.firejournal import PENDING_CAP, CockpitDB  # noqa: E402
 from levain.cockpit.keys import fingerprint_of  # noqa: E402
 from levain.cockpit.verbs import DEVICE_VERBS, KERNEL_VERBS, gesture_for  # noqa: E402
@@ -86,7 +86,7 @@ class SoftPasskey:
                       + P._string("sha512") + P._string(sig))
 
 
-# --- the broker, against real anneal spores and real keys ---------------------------------------------------------
+# --- the broker, against real anneal intentions and real keys ---------------------------------------------------------
 
 @pytest.fixture
 def home() -> Iterator[Path]:
@@ -98,17 +98,17 @@ def home() -> Iterator[Path]:
 
 
 @pytest.fixture
-def spores(home: Path) -> Path:
+def intentions(home: Path) -> Path:
     p = home / "spores.json"
-    st = SporeStore(p)
+    st = IntentionStore(p, id_prefix="intention")
     for i in range(PENDING_CAP + 3):
         st.add(type="thought", text=f"seed {i}", disposition="seed", origin_key=f"k.s{i}")
     return p
 
 
 @pytest.fixture
-def world(home: Path, spores: Path) -> Iterator[SimpleNamespace]:
-    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores)}, store_paths=[spores],
+def world(home: Path, intentions: Path) -> Iterator[SimpleNamespace]:
+    b = Broker(home / "data", stores={"intentions": IntentionEffectStore(intentions)}, store_paths=[intentions],
                install_class="reported")
     b.start()
     keys = home / "keys"
@@ -119,27 +119,27 @@ def world(home: Path, spores: Path) -> Iterator[SimpleNamespace]:
     phone = SoftPasskey()
     enrol(b.db, phone, "display-phone", by=laptop, custody="passkey")    # type: ignore[arg-type]
     try:
-        yield SimpleNamespace(b=b, laptop=laptop, phone=phone, keys=keys, spores=spores,
+        yield SimpleNamespace(b=b, laptop=laptop, phone=phone, keys=keys, intentions=intentions,
                               dev={"class": "device", "fingerprint": phone.fingerprint, "transport": "paired-a"})
     finally:
         b.stop()
 
 
-def _target(spores: Path, i: int) -> dict[str, Any]:
-    row = SporeStore(spores).get_by_origin_key(f"k.s{i}")
+def _target(intentions: Path, i: int) -> dict[str, Any]:
+    row = IntentionStore(intentions, id_prefix="intention").get_by_origin_key(f"k.s{i}")
     assert row is not None
-    version = SporeEffectStore(spores).snapshot(f"spore:k.s{i}").version
-    return {"kind": "row", "panel_id": "tray", "row_id": f"spore:{row['id']}", "row_version": version}
+    version = IntentionEffectStore(intentions).snapshot(f"intention:k.s{i}").version
+    return {"kind": "row", "panel_id": "tray", "row_id": f"intention:{row['id']}", "row_version": version}
 
 
-def _text(spores: Path, i: int) -> str:
-    row = SporeStore(spores).get_by_origin_key(f"k.s{i}")
+def _text(intentions: Path, i: int) -> str:
+    row = IntentionStore(intentions, id_prefix="intention").get_by_origin_key(f"k.s{i}")
     assert row is not None
     return str(row.get("text"))
 
 
 def _edit(w: SimpleNamespace, i: int = 0, *, cred: dict | None = None, tier: str = "C1", text: str = "edited") -> dict:
-    return w.b.issue(verb="spore_update", params={"text": text}, target=_target(w.spores, i), tier=tier,
+    return w.b.issue(verb="intention_update", params={"text": text}, target=_target(w.intentions, i), tier=tier,
                      credential=cred or w.dev)
 
 
@@ -157,10 +157,10 @@ def _state(w: SimpleNamespace, pid: str) -> str:
 def test_a_device_c1_is_a_pending_that_applies_only_once_its_passkey_signs(world):
     w = world
     out = _edit(w)
-    assert out["state"] == "WAITING" and _text(w.spores, 0) == "seed 0"      # nothing on the bearer token alone
+    assert out["state"] == "WAITING" and _text(w.intentions, 0) == "seed 0"      # nothing on the bearer token alone
     done = w.b.submit(out["pending_id"], w.phone.sign(out["record"].encode()))
     assert (done["state"], done["decision_kind"]) == ("COMMITTED", "ALLOWED")
-    assert _text(w.spores, 0) == "edited"
+    assert _text(w.intentions, 0) == "edited"
     assert w.b.db is not None and w.b.db.load(out["pending_id"]).signer_fp == w.phone.fingerprint
     # a token's C1 is still never a broker write; the gesture for a device's C1 is sign, never direct
     _refused("bad_request", _edit, w, 1, cred=BROWSER)
@@ -174,7 +174,7 @@ def test_a_passkey_signature_in_the_laptop_or_consent_namespace_does_not_verify(
     rec = out["record"].encode()
     for ns in (COCKPIT_NAMESPACE, "levain-consent-answer", "levain-authority"):
         _refused("bad_signature", w.b.submit, out["pending_id"], w.phone.sign(rec, ns))
-        assert _state(w, out["pending_id"]) == "WAITING" and _text(w.spores, 0) == "seed 0"
+        assert _state(w, out["pending_id"]) == "WAITING" and _text(w.intentions, 0) == "seed 0"
     # the passkey's signature over other bytes does not verify either
     _refused("bad_signature", w.b.submit, out["pending_id"], w.phone.sign(rec + b" "))
     assert "levain-cockpit-phone" in REGISTRY
@@ -185,7 +185,7 @@ def test_a_laptop_key_signs_as_before_and_never_in_the_phone_namespace(world):
     # a laptop key signs a token's T2 pending as before
     t2 = _edit(w, 1, cred=BROWSER, tier="T2", text="by the laptop")
     assert w.b.submit(t2["pending_id"], w.laptop.sign(t2["record"].encode()))["state"] == "COMMITTED"
-    assert _text(w.spores, 1) == "by the laptop"
+    assert _text(w.intentions, 1) == "by the laptop"
     # a laptop key's signature in the phone namespace does not verify; in its own it signs a phone's pending
     out = _edit(w, 2, text="phone filed, laptop signed")
     _refused("bad_signature", w.b.submit, out["pending_id"], w.laptop.sign(out["record"].encode(),
@@ -208,10 +208,10 @@ def test_a_passkey_never_signs_a_t3_a_laptop_pending_another_phones_or_a_non_pho
     key = w.b.capture().authority.key(w.phone.fingerprint)
     view = SimpleNamespace(principal=f"device:{w.phone.fingerprint}@run", record={"verb": "section_edit", "tier": "T2"})
     assert "not a phone verb" in str(w.b._passkey_refusal(key, "x", view))
-    assert DEVICE_VERBS == {"spore_descend", "spore_surface_at", "spore_update", "spore_set_disposition",
-                            "spore_ascend", "spore_seed", "list_intake", "spore_retarget"}
+    assert DEVICE_VERBS == {"intention_close", "intention_surface_at", "intention_update", "intention_set_disposition",
+                            "intention_promote", "intention_seed", "list_intake", "intention_retarget"}
     assert not {"section_edit", "episode_tombstone", "undo", "question_answer", "operator_state", "config",
-                "entity_name", "spore_touch"} & DEVICE_VERBS
+                "entity_name", "intention_touch"} & DEVICE_VERBS
     assert all(v.floor != "T3" for v in KERNEL_VERBS if v.device_ok)
 
 
@@ -259,7 +259,7 @@ def test_a_paired_device_whose_key_is_not_enrolled_cannot_write(world):
     out = _edit(w, cred={"class": "device", "fingerprint": loose.fingerprint, "transport": "paired-b"})
     _refused("bad_signature", w.b.submit, out["pending_id"], loose.sign(out["record"].encode()))
     _refused("bad_signature", w.b.submit, out["pending_id"], "not a signature")
-    assert _state(w, out["pending_id"]) == "WAITING" and _text(w.spores, 0) == "seed 0"
+    assert _state(w, out["pending_id"]) == "WAITING" and _text(w.intentions, 0) == "seed 0"
 
 
 def test_a_c1_record_parses_only_as_a_signed_pending():
@@ -269,7 +269,7 @@ def test_a_c1_record_parses_only_as_a_signed_pending():
     from levain.cockpit.firejournal import _parse_record, new_pending_id, record_sha256
 
     pid = new_pending_id()
-    rec = {"operation_id": pid, "verb": "spore_update", "intent": "sign", "tier": "C1",
+    rec = {"operation_id": pid, "verb": "intention_update", "intent": "sign", "tier": "C1",
            "issued_at": "2026-10-10T20:00:00.000000Z", "expires_at": "2026-10-10T20:15:00.000000Z", "effects": []}
     _parse_record(pid, encode(rec), record_sha256(encode(rec)))
     rec["intent"] = "reported"
@@ -315,7 +315,7 @@ def install(home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
     inst = home / "inst"
     assert main(["init", "--path", str(inst), "--adapter", "claude-code", "--answers", str(home / "answers.json"),
                  "--consent-hook", "on", "--force"]) in (0, None)
-    store = SporeStore(inst / ".levain" / "memory.spores.json")
+    store = IntentionStore(inst / ".levain" / "memory.spores.json", id_prefix="intention")
     store.add(type="task", text="tray one", disposition="seed")
     root = inst / ".levain" / "cockpit"
     root.mkdir(parents=True, exist_ok=True)
@@ -384,7 +384,7 @@ def test_a_key_whose_material_is_a_passkey_never_signs_as_a_laptop_key(world):
     auth.PROCESS_CACHE.clear()
     t2 = _edit(w, 1, cred=BROWSER, tier="T2")
     e = _refused("bad_signature", w.b.submit, t2["pending_id"], mis.sign(t2["record"].encode(), COCKPIT_NAMESPACE))
-    assert "quarantined" in str(e) and _state(w, t2["pending_id"]) == "WAITING" and _text(w.spores, 1) == "seed 1"
+    assert "quarantined" in str(e) and _state(w, t2["pending_id"]) == "WAITING" and _text(w.intentions, 1) == "seed 1"
 
 
 def test_a_device_at_its_pending_cap_can_still_cancel_its_own_pending_once(world):
@@ -422,7 +422,7 @@ def test_a_device_c1_marked_reported_is_refused_on_the_broker(world):
     # L-3 (glm): a device write with intent reported. The broker's reported refusal already holds it (complement);
     # these two tests pin that, on the broker and over the phone port, with nothing stored
     w = world
-    e = _refused("refused", w.b.issue, verb="spore_update", params={"text": "x"}, target=_target(w.spores, 0),
+    e = _refused("refused", w.b.issue, verb="intention_update", params={"text": "x"}, target=_target(w.intentions, 0),
                  tier="C1", credential=w.dev, intent="reported")
     assert "device signs" in str(e)
     assert w.b.db is not None

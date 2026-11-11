@@ -1,10 +1,10 @@
-"""The CONFINED executor-tool bundle (spore-277 step 6 → spore-311 slice 2) — the entity's fenced HANDS.
+"""The CONFINED executor-tool bundle (intention-277 step 6 → intention-311 slice 2) — the entity's fenced HANDS.
 
 The moat: BOTH hands are fenced to the shared crown-jewels FLOOR (slice 2 relaxes the step-6
 ``<entity>/workspace/`` jail). These prove:
   - the floored FILE EDITOR refuses every crown jewel on EVERY command (``view`` included — a view of
     the flow store is an isolation leak), while allowing broad NON-jewel reach (the relaxation);
-  - the BASH tool drives spore-311's ``SandboxedShell`` (a real ``sandbox-exec`` sandbox on macOS),
+  - the BASH tool drives intention-311's ``SandboxedShell`` (a real ``sandbox-exec`` sandbox on macOS),
     refuses crown jewels, keeps state across commands, and refuses interactive input;
   - both keep the LLM-FAMILIAR names (``file_editor`` / ``terminal``) while the REGISTRY keys stay
     distinct (one ``levain_hands`` spec) so the unconfined stock tools are unreachable.
@@ -75,7 +75,7 @@ class _FakeWorkspace:
 
 class _FakeConvState:
     """The conv_state surface the stock tools' ``create`` reads (workspace + agent.llm). It carries
-    NO binding: since spore-438 the floor reaches the hands as data, never from the state."""
+    NO binding: since intention-438 the floor reaches the hands as data, never from the state."""
 
     def __init__(self, wd: Path) -> None:
         self.workspace = _FakeWorkspace(wd)
@@ -112,7 +112,7 @@ def _floor(ws: Path, **kw) -> _SharedFloor:
 
 
 def test_build_entity_tools_bundle_is_one_hands_spec_carrying_the_binding(tmp_path: Path):
-    """spore-438: BOTH hands are ONE spec, so ONE ``create`` builds one floor for both. The binding
+    """intention-438: BOTH hands are ONE spec, so ONE ``create`` builds one floor for both. The binding
     rides the spec's params as data; ``with_bash`` decides the second hand."""
     ent, ws = _entity(tmp_path)
     b = _binding(ws)
@@ -147,7 +147,7 @@ def test_levain_hands_builds_both_hands_on_ONE_floor_from_the_binding(tmp_path: 
 def test_two_conversations_never_share_a_floor(tmp_path) -> None:
     """Each ``create`` (one per conversation's agent init — a resume is a new init) builds its own
     floor, so no conversation can inherit another's evolved or permissive floor, and no id() can
-    alias one: there is no registry for an id to index (spore-438)."""
+    alias one: there is no registry for an id to index (intention-438)."""
     ent, ws = _entity(tmp_path)
     params = _binding(ws).to_params()
     first = LevainHands.create(_FakeConvState(ws), binding=params)
@@ -189,7 +189,7 @@ def test_the_binding_serves_the_entity_it_was_created_for_and_ignores_process_en
     other = tmp_path / "other"
     (other / ".levain").mkdir(parents=True)
     assert _policy(ws, mode="interactive", entity=other.resolve()).entity_dir == other.resolve()
-    # the retired process channel names nothing (spore-438)
+    # the retired process channel names nothing (intention-438)
     third = tmp_path / "third"
     (third / ".levain").mkdir(parents=True)
     monkeypatch.setenv("LEVAIN_ENTITY_DIR", str(third))
@@ -216,7 +216,7 @@ def test_the_binding_threads_deny_standard_creds(tmp_path: Path, monkeypatch):
 
 
 def test_the_binding_wires_deny_localhost_outbound_both_modes(tmp_path: Path, monkeypatch):
-    """spore-755. The binding turns the connect-to-self deny ON by default in BOTH
+    """intention-755. The binding turns the connect-to-self deny ON by default in BOTH
     ssh_modes (Phill 2026-09-13, 0.4.6 = A+B; codex L3 HIGH#1 reproduced the raw-mode variant — the
     entity's own key is readable there but the OTHER jewels stay denied and a local sshd reads them
     just the same), and OFF only when the operator opts out with allow_localhost_outbound. A dropped
@@ -564,7 +564,7 @@ def test_file_editor_refuses_case_variant_of_a_crown_jewel(tmp_path: Path, monke
     assert "flow identity" not in obs.text
 
 
-# --- spore-768 / glm L3: the two hands must not diverge as the floor evolves -----------------
+# --- intention-768 / glm L3: the two hands must not diverge as the floor evolves -----------------
 
 def test_both_hands_share_one_evolving_floor(tmp_path) -> None:
     """Both executors read THROUGH the floor, so a merge made by one is seen by the other."""

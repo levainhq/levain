@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
-from anneal_memory import SporeStore
+from anneal_memory import IntentionStore
 
 from levain.consent.questions import ANSWER_CHANNELS, QuestionStore
 from tests.test_cockpit_flip_parity import _drive, _eventually, needs_browser
@@ -54,12 +54,12 @@ def lh(tmp_path, monkeypatch):
 def _rig(tmp_path: Path, lh: Path):
     root, src, _ids = _install(tmp_path)
     store = QuestionStore(lh)
-    ring, _ = store.file_once(agent="claude_code", key="levain-germinate:k1", what="Due 11-08: renew the thing (spore)",
+    ring, _ = store.file_once(agent="claude_code", key="levain-germinate:k1", what="Due 11-08: renew the thing (intention)",
                               options=[("done", "Done")], rec="done", blocks="the agenda came due", cwd=str(root),
                               held_by=ANSWER_CHANNELS)
     store.file(agent="claude_code", agent_session_id="s2", what="Ship the sweep fix tonight?",
                options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the sweep", cwd=str(root))
-    sp = SporeStore(root / ".levain" / "memory.spores.json")
+    sp = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     sid = sp.add(type="task", text="renew the thing", disposition="agenda", next=TODAY_ISO)["id"]
     sp.update(sid, germinated={"on": TODAY_ISO, "target": "band", "ref": ring.id})
     return src, store, sp, sid, ring

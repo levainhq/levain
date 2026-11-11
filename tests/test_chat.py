@@ -814,7 +814,7 @@ def home(tmp_path, monkeypatch):
 
 
 def test_two_entities_open_concurrently_and_each_session_holds_its_own_floor(tmp_path, home):
-    """The spore-438 property, through the chat host: two sessions on two entities, opened at the
+    """The intention-438 property, through the chat host: two sessions on two entities, opened at the
     same time on the host's workers, each with hands enforcing ITS OWN entity's floor."""
     pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
     from openhands.tools.file_editor.definition import FileEditorAction
@@ -1393,7 +1393,7 @@ def test_a_stop_request_that_raises_does_not_end_the_bound(tmp_path):
     assert made[0].stops >= 2 and st["status"] == "done"
 
 
-# --- spore-1310 (rec B): the per-launch chat token ------------------------------------------------
+# --- intention-1310 (rec B): the per-launch chat token ------------------------------------------------
 
 
 @pytest.mark.parametrize("token", [None, "wrong-token", ""])

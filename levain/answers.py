@@ -332,7 +332,7 @@ def field_guide(fields: Iterable[_Field]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# adopt-answers (spore-423): a hand-edited seed becomes the record.
+# adopt-answers (intention-423): a hand-edited seed becomes the record.
 # ---------------------------------------------------------------------------
 
 class AdoptRefused(AnswersError):
@@ -423,7 +423,7 @@ def extract_answers(
     max_combinations: int = 4096,
 ) -> dict[str, str]:
     """The ONE answer set that ``render`` turns into ``text``, or raise
-    :class:`AdoptRefused`. ALL-OR-REFUSE (spore-423): a partial record is worse than
+    :class:`AdoptRefused`. ALL-OR-REFUSE (intention-423): a partial record is worse than
     none, because doctor then goes green over it and the next re-render blank-fills
     the gaps.
 

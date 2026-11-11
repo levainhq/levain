@@ -12,7 +12,7 @@ operator's partnership working directory — and the hooks, the MCP server, and
 the memory store are all wired relative to it. It never touches the operator's
 global Claude Code configuration, with one exception that is the operator's own
 choice: `levain band hooks install` writes three **band-only** hooks (the NEEDS
-YOU band, nothing else: no posture, spores, recall or consent) into your
+YOU band, nothing else: no posture, intentions, recall or consent) into your
 user-level Claude Code settings so the band shows in every session, not only
 inside an install. It is opt-in and keeps a receipt under the Levain home. The
 hooks stand down where an install's own band hooks run for the session (the

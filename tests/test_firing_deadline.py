@@ -1,6 +1,6 @@
-"""The WALL-CLOCK BOUND on a turn (K4a ⑥, ``spore-434``).
+"""The WALL-CLOCK BOUND on a turn (K4a ⑥, ``intention-434``).
 
-**Every test here is a FALSIFICATION PAIR, not an assertion that the timeout fired.** The spore is
+**Every test here is a FALSIFICATION PAIR, not an assertion that the timeout fired.** The intention is
 explicit about why: K3's glm L3 HIGH was a test that stipulated its own success — it asserted the
 rejection path worked by arranging for it to work. So the shape throughout is *same code, same
 call, the BOUND is the only variable*: the short-work run must complete and the long-work run must

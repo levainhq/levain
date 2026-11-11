@@ -400,7 +400,7 @@ def _wrapper_bounds_s(script):
     import re
     text = script.read_text()
     return sum(float(re.search(rf"^{name} = ([0-9.]+)", text, re.M).group(1))
-               for name in ("WRAP_CHECK_TIMEOUT", "SPORE_CHECK_TIMEOUT", "CRYSTAL_CHECK_TIMEOUT"))
+               for name in ("WRAP_CHECK_TIMEOUT", "INTENTION_CHECK_TIMEOUT", "CRYSTAL_CHECK_TIMEOUT"))
 
 
 def test_every_installed_prompt_hook_outlasts_the_whole_signing_turn(tmp_path):

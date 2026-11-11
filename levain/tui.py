@@ -72,7 +72,7 @@ __all__ = [
     "select_panel",
     "move_in_panel",
     "with_view",
-    "current_spore",
+    "current_intention",
     "current_row",
     "current_episode",
     "current_edit_record",
@@ -84,7 +84,7 @@ __all__ = [
     "build_seed_req",
     "build_set_disposition_req",
     "build_surface_at_req",
-    "build_spore_update_req",
+    "build_intention_update_req",
     "build_config_edit_req",
     "build_state_edit_req",
     "edit_error_status",
@@ -95,7 +95,7 @@ __all__ = [
 def _oneline(s: str) -> str:
     """Collapse newlines so a value stays on ONE rendered line. The verb-list
     renderers emit exactly one line per item, and the driver's cursor highlight +
-    auto-scroll map item-index 1:1 to line-index — a stray ``\\n`` in spore text or
+    auto-scroll map item-index 1:1 to line-index — a stray ``\\n`` in intention text or
     episode content would wrap and desync the highlight (complement L3 MED-1)."""
     return s.replace("\n", " ").replace("\r", " ")
 
@@ -114,7 +114,7 @@ ZONES: tuple[tuple[str, str], ...] = (
 # body (no verb, so no cursor needed). Tray + Keep joined the list when their
 # Class-B operator-I/O verbs landed (the curses peer of the web's Slice-3b verbs).
 # There is no Keep list: a parked loop is an Open loops row, a legacy note a Tray row.
-_LIST_KINDS = frozenset({"spores", "tray", "episodes", "edits"})
+_LIST_KINDS = frozenset({"intentions", "tray", "episodes", "edits"})
 
 # Audit-record kinds that are NOT file-undoable — verb-mediated lifecycle ops
 # whose reversibility is anneal's, not this layer's. Mirrors writes._VERB_KINDS
@@ -122,10 +122,10 @@ _LIST_KINDS = frozenset({"spores", "tray", "episodes", "edits"})
 # drift would make the edits panel offer [u]ndo on a row the server would 400).
 _VERB_MEDIATED_KINDS = frozenset(
     {
-        "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone",
+        "intention_touch", "intention_close", "intention_promote", "episode_tombstone",
         # the Slice-3b operator-I/O kinds (capture / re-route / schedule / metadata
         # edit) — verb-mediated, anneal-owned reversibility, never file-undoable.
-        "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update", "spore_retarget",
+        "intention_seed", "intention_set_disposition", "intention_surface_at", "intention_update", "intention_retarget",
     }
 )
 
@@ -182,11 +182,11 @@ def panels_for_zone(view: SubstrateView, zone: str) -> list[dict[str, Any]]:
 
 def panel_item_count(view: SubstrateView, panel: dict[str, Any]) -> int:
     """How many SELECTABLE rows a panel has — only the verb-navigable list panels
-    (spores/episodes/edits); 0 for a text/scroll panel (incl. crystals/wraps, which
+    (intentions/episodes/edits); 0 for a text/scroll panel (incl. crystals/wraps, which
     render rich and scroll but carry no per-item verb)."""
     kind = panel.get("kind")
-    if kind == "spores":
-        return len(view.open_spores)
+    if kind == "intentions":
+        return len(view.open_intentions)
     if kind == "tray":
         return len(view.tray)
     if kind == "episodes":
@@ -230,7 +230,7 @@ class Verb:
     ``key`` is the bound character; ``label`` the footer hint; ``kind`` the
     ``apply_edit`` request kind (or a pseudo-kind the driver interprets — ``edit``
     for the $EDITOR Class-A flow, ``undo`` for the audit-log restore). ``destructive``
-    drives the confirm gate; ``needs_kind`` flags a spore resolve verb that must
+    drives the confirm gate; ``needs_kind`` flags an intention resolve verb that must
     choose an anneal-validated kind first. ``row_scoped`` is True for a verb that
     acts on the selected row (touch/edit/descend/…) and False for a PANEL-level verb
     (the Tray freeform capture) — the panel-level verb is still offered on an
@@ -249,7 +249,7 @@ def panel_verbs(panel: dict[str, Any] | None, *, read_only: bool = False) -> lis
     web's Slice-3b verb affordances. A Class-C panel offers none (glass). Class-A
     config/section panels offer ``[e]dit``. The Class-B operator-I/O panels:
 
-    - **Open Loops** (spores): touch / edit-text / schedule / park / descend / ascend.
+    - **Open Loops** (intentions): touch / edit-text / schedule / park / descend / ascend.
     - **Tray** (operator inbox): new-dump (panel-level) / edit / reclassify / metabolize
       (→ loop) / schedule / dismiss.
     There is no Keep panel (TS-5a): a parked loop is an Open Loops row whose ``[p]ark``
@@ -276,23 +276,23 @@ def panel_verbs(panel: dict[str, Any] | None, *, read_only: bool = False) -> lis
     # that mistagged a panel can't leak a mutation key — codex/kimi L3).
     if edit_class == CLASS_A and kind in {"config", "section"}:
         return [Verb("e", "[e]dit", "edit")]
-    if kind == "spores" and edit_class == CLASS_B:  # the entity's live cognition loops
+    if kind == "intentions" and edit_class == CLASS_B:  # the entity's live cognition loops
         return [
-            Verb("t", "[t]ouch", "spore_touch"),
-            Verb("e", "[e]dit", "spore_edit"),
-            Verb("s", "[s]chedule", "spore_schedule"),
-            Verb("p", "[p]ark", "spore_park"),
-            Verb("d", "[d]escend", "spore_descend", destructive=True, needs_kind=True),
-            Verb("a", "[a]scend", "spore_ascend", destructive=True, needs_kind=True),
+            Verb("t", "[t]ouch", "intention_touch"),
+            Verb("e", "[e]dit", "plain_intention_edit"),
+            Verb("s", "[s]chedule", "intention_schedule"),
+            Verb("p", "[p]ark", "intention_park"),
+            Verb("d", "[d]escend", "intention_close", destructive=True, needs_kind=True),
+            Verb("a", "[a]scend", "intention_promote", destructive=True, needs_kind=True),
         ]
     if kind == "tray" and edit_class == CLASS_B:  # the operator session-I/O inbox
         return [
-            Verb("n", "[n]ew", "spore_capture", row_scoped=False),
-            Verb("e", "[e]dit", "spore_edit"),
-            Verb("c", "re[c]lassify", "spore_reclassify"),
-            Verb("m", "[m]etabolize", "spore_metabolize"),
-            Verb("s", "[s]chedule", "spore_schedule"),
-            Verb("d", "[d]ismiss", "spore_descend", destructive=True, needs_kind=True),
+            Verb("n", "[n]ew", "intention_capture", row_scoped=False),
+            Verb("e", "[e]dit", "plain_intention_edit"),
+            Verb("c", "re[c]lassify", "intention_reclassify"),
+            Verb("m", "[m]etabolize", "intention_metabolize"),
+            Verb("s", "[s]chedule", "intention_schedule"),
+            Verb("d", "[d]ismiss", "intention_close", destructive=True, needs_kind=True),
         ]
     if kind == "episodes" and edit_class == CLASS_B:
         return [Verb("x", "[x] tombstone", "episode_tombstone", destructive=True)]
@@ -308,21 +308,21 @@ def panel_verbs(panel: dict[str, Any] | None, *, read_only: bool = False) -> lis
 # section body for `expected_body` + the $EDITOR result for `new_body`.)
 # ---------------------------------------------------------------------------
 
-def build_touch_req(spore_id: str) -> dict[str, Any]:
-    return {"kind": "spore_touch", "spore_id": spore_id}
+def build_touch_req(intention_id: str) -> dict[str, Any]:
+    return {"kind": "intention_touch", "intention_id": intention_id}
 
 
 def build_descend_req(
-    spore_id: str, spore_kind: str, *, expect_disposition: Any = _UNSET
+    intention_id: str, intention_kind: str, *, expect_disposition: Any = _UNSET
 ) -> dict[str, Any]:
-    """Compost/dismiss/remove a spore. ``expect_disposition`` (when supplied) carries the
+    """Compost/dismiss/remove an intention. ``expect_disposition`` (when supplied) carries the
     rendered row's SNAPSHOT disposition — the resolve FACE was chosen against it, so the
-    server CASes it and a concurrent re-route in the confirm window fails closed (spore-173).
+    server CASes it and a concurrent re-route in the confirm window fails closed (intention-173).
     OMITTED ⇒ no CAS (the server's anneal default)."""
     req: dict[str, Any] = {
-        "kind": "spore_descend",
-        "spore_id": spore_id,
-        "spore_kind": spore_kind,
+        "kind": "intention_close",
+        "intention_id": intention_id,
+        "intention_kind": intention_kind,
         "confirm": True,
     }
     if expect_disposition is not _UNSET:
@@ -331,14 +331,14 @@ def build_descend_req(
 
 
 def build_ascend_req(
-    spore_id: str, spore_kind: str, ref: str, *, expect_disposition: Any = _UNSET
+    intention_id: str, intention_kind: str, ref: str, *, expect_disposition: Any = _UNSET
 ) -> dict[str, Any]:
     """Promote a loop. ``expect_disposition`` (when supplied) is the rendered row's snapshot;
     the server compares it before any other gate, so a row that moved answers ``stale``."""
     req: dict[str, Any] = {
-        "kind": "spore_ascend",
-        "spore_id": spore_id,
-        "spore_kind": spore_kind,
+        "kind": "intention_promote",
+        "intention_id": intention_id,
+        "intention_kind": intention_kind,
         "ref": ref,
         "confirm": True,
     }
@@ -359,21 +359,21 @@ def build_undo_req(edit_id: str) -> dict[str, Any]:
 
 def build_seed_req(text: str, disposition: str) -> dict[str, Any]:
     """A freeform DUMP → a Tray ``seed`` (or a Keep ``note``). The "human dumps, AI
-    sorts" capture: the server (``_apply_spore_seed``) requires a NON_COGNITION
+    sorts" capture: the server (``_apply_intention_seed``) requires a NON_COGNITION
     disposition so a raw dump is born cognition-excluded — never pollutes salience."""
-    return {"kind": "spore_seed", "text": text, "disposition": disposition}
+    return {"kind": "intention_seed", "text": text, "disposition": disposition}
 
 
 def build_set_disposition_req(
-    spore_id: str, disposition: str, *, surface_at: Any = _UNSET,
+    intention_id: str, disposition: str, *, surface_at: Any = _UNSET,
     expect_disposition: Any = _UNSET,
 ) -> dict[str, Any]:
-    """Re-route a spore's disposition (metabolize Tray→loop, promote a Keep note
+    """Re-route an intention's disposition (metabolize Tray→loop, promote a Keep note
     →loop/→tray). ``surface_at`` is OMITTED unless supplied — present (a ``YYYY-MM-DD``)
     rides the re-route atomically (the keep-note "remind me": note→seed + schedule in
     one CAS); ``None`` would mean an explicit clear. Absent ⇒ leave ``next`` untouched."""
     req: dict[str, Any] = {
-        "kind": "spore_set_disposition", "spore_id": spore_id, "disposition": disposition,
+        "kind": "intention_set_disposition", "intention_id": intention_id, "disposition": disposition,
     }
     if surface_at is not _UNSET:
         req["surface_at"] = surface_at
@@ -382,35 +382,35 @@ def build_set_disposition_req(
     return req
 
 
-def build_surface_at_req(spore_id: str, surface_at: str | None) -> dict[str, Any]:
+def build_surface_at_req(intention_id: str, surface_at: str | None) -> dict[str, Any]:
     """Schedule a loop/Tray item to resurface at a future session-open. ``None``/``''``
     clears the alarm; a ``YYYY-MM-DD`` sets it (the server re-validates the date)."""
-    return {"kind": "spore_surface_at", "spore_id": spore_id, "surface_at": surface_at}
+    return {"kind": "intention_surface_at", "intention_id": intention_id, "surface_at": surface_at}
 
 
-def build_spore_update_req(
-    spore_id: str, *, text: str | None = None,
-    spore_type: str | None = None, tier: str | None = None,
+def build_intention_update_req(
+    intention_id: str, *, text: str | None = None,
+    intention_type: str | None = None, tier: str | None = None,
     expect_disposition: Any = _UNSET, expected_version: str | None = None,
 ) -> dict[str, Any]:
     """The forming-workbench metadata edit: refine ``text``, reclassify ``type`` (only
     while a Tray item is forming — locked once it metabolizes), or re-``tier`` (park a
     loop → ``parked``, un-park a parked loop → ``warm``). At least one field; all
     non-destructive (reversible by re-edit) → no confirm. ``type`` is sent under the
-    wire key ``type`` (named ``spore_type`` here to avoid shadowing the builtin).
+    wire key ``type`` (named ``intention_type`` here to avoid shadowing the builtin).
 
     ``expect_disposition`` (when supplied) carries the rendered row's SNAPSHOT disposition
     for a TIER edit — park/un-park's route was chosen against it, so the server CASes it and
-    a concurrent re-route in the render→submit window fails closed (spore-173). OMITTED ⇒ no
+    a concurrent re-route in the render→submit window fails closed (intention-173). OMITTED ⇒ no
     CAS (a text-only refine is disposition-independent; the type path CASes server-side).
 
     ``expected_version`` (a tier edit) is the rendered row's version: park/un-park overwrite the tier, so a tier
     changed elsewhere since the render must refuse (stale), not be silently replaced (TS-5a L3)."""
-    req: dict[str, Any] = {"kind": "spore_update", "spore_id": spore_id}
+    req: dict[str, Any] = {"kind": "intention_update", "intention_id": intention_id}
     if text is not None:
         req["text"] = text
-    if spore_type is not None:
-        req["type"] = spore_type
+    if intention_type is not None:
+        req["type"] = intention_type
     if tier is not None:
         req["tier"] = tier
     if expect_disposition is not _UNSET:
@@ -479,8 +479,8 @@ def render_panel_lines(view: SubstrateView, panel: dict[str, Any]) -> list[str]:
         return _render_config(view, panel)
     if kind == "section":
         return _render_section(view, panel)
-    if kind == "spores":
-        return _render_spores(view)
+    if kind == "intentions":
+        return _render_intentions(view)
     if kind == "tray":
         return _render_tray(view)
     if kind == "episodes":
@@ -520,30 +520,30 @@ def _render_section(view: SubstrateView, panel: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _render_spores(view: SubstrateView) -> list[str]:
+def _render_intentions(view: SubstrateView) -> list[str]:
     """ONE line per loop (the item cursor maps 1:1 to a line). The resolve-kinds
     surface in the descend/ascend picker at verb time, not the scan view."""
-    # Honesty floor (no_data != no_event): a spore-store fault is recorded under the
-    # single "open_spores" key (the ONE read fills all three projections). Surface it
+    # Honesty floor (no_data != no_event): an intention-store fault is recorded under the
+    # single "open_intentions" key (the ONE read fills all three projections). Surface it
     # as DEGRADED — never a false "(no open loops)" over an unreadable store [the web
     # path already does this via tierErr; the TUI must match].
-    err = view.errors.get("open_spores")
+    err = view.errors.get("open_intentions")
     if err:
         return [f"(unavailable — {err})"]
-    if not view.open_spores:
+    if not view.open_intentions:
         return ["(no open loops)"]
     return [
         f"[{s.tier}·{s.salience}] {_oneline(s.text)}"
         + (f" → {_oneline(s.next)}" if s.next else "")
         + f"  · {s.id}"
-        for s in view.open_spores
+        for s in view.open_intentions
     ]
 
 
 def _render_tray(view: SubstrateView) -> list[str]:
     """ONE line per Tray item — the operator session-I/O inbox, badged by disposition
     (seed/handoff/agenda). Read-only display in 3a (the governed dump/sort verbs are 3b)."""
-    err = view.errors.get("open_spores")  # all three projections share the spore-read fault key
+    err = view.errors.get("open_intentions")  # all three projections share the intention-read fault key
     if err:
         return [f"(unavailable — {err})"]
     if not view.tray:
@@ -711,23 +711,23 @@ def with_view(model: TuiModel, view: SubstrateView, status: str = "") -> TuiMode
     return replace(new, item_idx=item_idx)
 
 
-def current_spore(model: TuiModel) -> Any | None:
-    """The selected OPEN-LOOP row specifically (the spores panel only). The driver uses
-    the broader ``current_row`` (which spans Open Loops / Tray); ``current_spore``
-    remains the narrower public accessor for a spores-panel-only consumer."""
+def current_intention(model: TuiModel) -> Any | None:
+    """The selected OPEN-LOOP row specifically (the intentions panel only). The driver uses
+    the broader ``current_row`` (which spans Open Loops / Tray); ``current_intention``
+    remains the narrower public accessor for an intentions-panel-only consumer."""
     panel = model.current_panel()
-    if panel is None or panel.get("kind") != "spores":
+    if panel is None or panel.get("kind") != "intentions":
         return None
-    if model.item_idx >= len(model.view.open_spores):
+    if model.item_idx >= len(model.view.open_intentions):
         return None
-    return model.view.open_spores[model.item_idx]
+    return model.view.open_intentions[model.item_idx]
 
 
 def current_row(model: TuiModel) -> Any | None:
-    """The selected spore-like item for whichever of the TWO spore projections is
-    active — Open Loops (``view.open_spores``) or Tray (``view.tray``). Each maps the item
+    """The selected intention-like item for whichever of the TWO intention projections is
+    active — Open Loops (``view.open_intentions``) or Tray (``view.tray``). Each maps the item
     cursor 1:1 onto its own list, so the shared lifecycle verbs (touch/edit/descend/…) act
-    on the right row across both. Returns ``None`` off a spore panel or past the list end."""
+    on the right row across both. Returns ``None`` off an intention panel or past the list end."""
     panel = model.current_panel()
     if panel is None:
         return None
@@ -735,7 +735,7 @@ def current_row(model: TuiModel) -> Any | None:
     if not isinstance(kind, str):
         return None
     src = {
-        "spores": model.view.open_spores,
+        "intentions": model.view.open_intentions,
         "tray": model.view.tray,
     }.get(kind)
     if src is None or model.item_idx >= len(src):

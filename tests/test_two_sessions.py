@@ -1,8 +1,8 @@
-"""spore-438: two ``EntitySession``s in ONE process — the K1-part-2 prerequisite.
+"""intention-438: two ``EntitySession``s in ONE process — the K1-part-2 prerequisite.
 
 The first three tests are the reproductions that ran against 62e16b2 (before any conversation
 binding), turned into assertions; on that tree all three FAILED as described in their docstrings.
-The rest pin the review-found classes of the earlier registry design (seat/1002-spore438) as
+The rest pin the review-found classes of the earlier registry design (seat/1002-intention438) as
 unrepresentable in this one.
 
 openhands-gated. Real sessions, real ``Conversation`` objects, and the real lazy tool build (the

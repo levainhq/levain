@@ -1,4 +1,4 @@
-"""The List's Later rows: spores (and band rows, drops and talks) whose wake date has not come. They are rows of the
+"""The List's Later rows: intentions (and band rows, drops and talks) whose wake date has not come. They are rows of the
 panel's `later` group, in wake order, each saying where it lands when it wakes; the card names them in one control and the
 focus view lists them under the Later time chip. (This file held the Tray's `held` list; that wire key is gone: the word is
 Later and it is a group like every other, so a text surface and every reader see the rows.)"""
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 import levain.cockpit.providers as providers
 from levain.cockpit import text as cktext
@@ -43,7 +43,7 @@ def test_the_later_rows_are_rows_in_wake_order(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     extra = _two_later(rig)
     p = _panel(rig)
-    assert [r["id"] for r in _later(p)] == [f"spore:{extra['soon']}", f"spore:{rig.ids['held']}"]
+    assert [r["id"] for r in _later(p)] == [f"intention:{extra['soon']}", f"intention:{rig.ids['held']}"]
     assert all(r["facets"]["time_state"] == "later" for r in _later(p))
     assert [r["facets"]["due"] for r in _later(p)] == sorted(r["facets"]["due"] for r in _later(p))
     assert "held" not in p and not any("held" in r["facets"] for r in p["rows"])
@@ -61,13 +61,13 @@ def test_the_count_is_what_is_due_and_later_is_not_counted(tmp_path: Path) -> No
 def test_a_later_row_carries_the_verbs_any_row_carries(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     p = _panel(rig)
-    later = {r["id"]: r for r in p["rows"]}[f"spore:{rig.ids['held']}"]
-    # a seed's row, not the first spore row: spore_retarget applies only to a seed or agenda (verbs.py), so a note row
+    later = {r["id"]: r for r in p["rows"]}[f"intention:{rig.ids['held']}"]
+    # a seed's row, not the first intention row: intention_retarget applies only to a seed or agenda (verbs.py), so a note row
     # lawfully lacks it and the comparison is between rows of the same kind, differing only in being due or later
-    due = next(r for r in p["rows"] if r["group"] != "later" and r["id"].startswith("spore:")
+    due = next(r for r in p["rows"] if r["group"] != "later" and r["id"].startswith("intention:")
                and r["facets"].get("disposition") in ("seed", "agenda"))
     assert {a["verb"] for a in later["actions"]} == {a["verb"] for a in due["actions"]}
-    assert {"spore_surface_at", "spore_update"} <= {a["verb"] for a in later["actions"]}
+    assert {"intention_surface_at", "intention_update"} <= {a["verb"] for a in later["actions"]}
 
 
 def test_the_held_key_is_on_no_panel(tmp_path: Path) -> None:
@@ -79,36 +79,36 @@ def test_the_held_key_is_on_no_panel(tmp_path: Path) -> None:
 def test_the_etag_covers_the_later_rows(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     before = _panel(rig)["etag"]
-    assert rig.post("spore_update", "tray", "held", {"tier": "cold"}).get("ok") is True
+    assert rig.post("intention_update", "tray", "held", {"tier": "cold"}).get("ok") is True
     assert _panel(rig)["etag"] != before
 
 
 def test_the_write_path_still_finds_a_later_row(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     got = rig.row("tray", "held")
-    assert got["id"] == f"spore:{rig.ids['held']}"
+    assert got["id"] == f"intention:{rig.ids['held']}"
 
 
 def test_a_reschedule_of_a_later_row_to_a_later_date_lands_and_it_stays_later(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
     later = (TODAY + timedelta(days=30)).isoformat()
-    assert rig.post("spore_surface_at", "tray", "held", {"surface_at": later}).get("ok") is True
-    row = {r["id"]: r for r in _panel(rig)["rows"]}[f"spore:{rig.ids['held']}"]
+    assert rig.post("intention_surface_at", "tray", "held", {"surface_at": later}).get("ok") is True
+    row = {r["id"]: r for r in _panel(rig)["rows"]}[f"intention:{rig.ids['held']}"]
     assert row["facets"]["due"] == later and row["group"] == "later" and row["facets"]["wake_bucket"] == "later"
 
 
 def test_a_snooze_moves_a_due_row_to_later_on_the_very_next_read(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
-    rid = f"spore:{rig.ids['seed']}"
+    rid = f"intention:{rig.ids['seed']}"
     assert {r["id"]: r for r in _panel(rig)["rows"]}[rid]["group"] != "later"
-    assert rig.post("spore_surface_at", "tray", "seed", {"surface_at": (TODAY + timedelta(days=3)).isoformat()}).get("ok") is True
+    assert rig.post("intention_surface_at", "tray", "seed", {"surface_at": (TODAY + timedelta(days=3)).isoformat()}).get("ok") is True
     row = {r["id"]: r for r in _panel(rig)["rows"]}[rid]
     assert row["group"] == "later" and row["facets"]["wake_line"].endswith("\u2192 list"), row
 
 
 def test_a_later_row_reaching_its_date_moves_to_the_due_rows(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
-    rid = f"spore:{rig.ids['held']}"
+    rid = f"intention:{rig.ids['held']}"
     assert rid in [r["id"] for r in _later(_panel(rig))]
     rig.clock.advance(6)
     p = _panel(rig)
@@ -124,7 +124,7 @@ def test_a_search_filters_the_later_rows_with_the_rest(tmp_path: Path) -> None:
 
 def test_a_single_row_read_finds_a_later_row(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
-    rid = f"spore:{rig.ids['held']}"
+    rid = f"intention:{rig.ids['held']}"
     p = _panel(rig, row=rid)
     assert [r["id"] for r in p["rows"]] == [rid]
 
@@ -132,7 +132,7 @@ def test_a_single_row_read_finds_a_later_row(tmp_path: Path) -> None:
 def test_later_rows_have_their_own_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     rig = Rig(tmp_path)
     _two_later(rig)
-    monkeypatch.setattr(providers, "SPORE_CAP", 1)
+    monkeypatch.setattr(providers, "INTENTION_CAP", 1)
     p = _panel(rig)
     assert len(_later(p)) == 1 and len([r for r in p["rows"] if r["group"] == "someday"]) == 1
 
@@ -163,7 +163,7 @@ def _served(tmp_path: Path, *, keep_seed: bool = True):
     """A served install on the real clock: the page reads today from the server, so the later dates are
     relative to it (the rig's fixed day would put them in the past)."""
     _root, src, ids = _install(tmp_path)
-    store = SporeStore(_root / ".levain" / "memory.spores.json")
+    store = IntentionStore(_root / ".levain" / "memory.spores.json", id_prefix="intention")
     real = date.today()
     store.update(ids["note"], disposition="loop")    # the fixture's legacy note would show in the Tray (the Keep is gone)
     later_ids = [

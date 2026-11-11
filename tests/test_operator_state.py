@@ -81,7 +81,7 @@ def test_hook_text_and_dashboard_agree(tmp_path, monkeypatch):
     p = _ctx(tmp_path, state="sharp, go deep", state_set_at=stamp, state_source="cli")
     monkeypatch.setattr(hook, "install_root", lambda: tmp_path)
     note = hook.state_notice()
-    view = SubstrateView(paths=AnnealPaths(episodic_db=tmp_path / "memory.db", continuity_md=tmp_path / "c.md", crystal_json=tmp_path / "x.json", spores_json=tmp_path / "s.json"))
+    view = SubstrateView(paths=AnnealPaths(episodic_db=tmp_path / "memory.db", continuity_md=tmp_path / "c.md", crystal_json=tmp_path / "x.json", intentions_json=tmp_path / "s.json"))
     view.state = _read_state(p, now)
     rendered = render_text(view)
     assert hook._STATE_MAX_TEXT_LEN == 500 and hook._STATE_CLOCK_SKEW_SECONDS == 300

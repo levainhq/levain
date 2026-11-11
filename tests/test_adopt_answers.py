@@ -1,4 +1,4 @@
-"""`levain adopt-answers` (spore-423): a hand-edited seed becomes the record.
+"""`levain adopt-answers` (intention-423): a hand-edited seed becomes the record.
 
 Reproduced through the CLI first: an operator's edit to LOCATION in seed/world.md was
 silently reverted by `levain init --force --answers .levain/answers.json`, with no

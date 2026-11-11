@@ -511,7 +511,7 @@ def test_a_host_with_no_rotation_serves_none(tmp_path, w):
     assert status == 404 and body["error"] == "not_found"
 
 
-# --- the page (structural only: headless Chrome clamps width, spore-1066; the glass is Phill's) ------------------------
+# --- the page (structural only: headless Chrome clamps width, intention-1066; the glass is Phill's) ------------------------
 
 _PAGE = ('<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/dashboard.css"><div id="host"></div>'
          '<script src="/room_view.js"></script><script src="/rvc.js"></script>')

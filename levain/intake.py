@@ -1,6 +1,6 @@
 """levain.intake — THE LIST's one-line intake grammar (pure, deterministic, no model).
 
-Ported from flow's ``spores.parse_intake`` (task_surfaces_1107.md, THE LIST). Parity
+Ported from flow's ``intentions.parse_intake`` (task_surfaces_1107.md, THE LIST). Parity
 contract: ``tests/vectors/list_intake_vectors.json``.
 
   ``@<when> <words>`` -> ``{"kind": "drop", "when": "YYYY-MM-DDTHH:MM", "text": words}``
@@ -142,9 +142,9 @@ def parse_intake(line, now):
 def receipt(parsed, id=None):
     """The intake receipt for a parsed line: ``(line, dict)``.
 
-    dict is ``{kind, id, fires, text}`` (``id`` is the spore id the caller planted, or None;
+    dict is ``{kind, id, fires, text}`` (``id`` is the intention id the caller planted, or None;
     ``fires`` is the ISO minute for a drop, else None). line is the one-line form:
-    ``scheduled drop <id> fires Mon 11-09 09:00`` · ``talk <id>`` (``<id>`` is ``intention-N``, or ``spore-N`` on a row made before anneal 1.0.7) · ``sent to the desk to sort``.
+    ``scheduled drop <id> fires Mon 11-09 09:00`` · ``talk <id>`` (``<id>`` is ``intention-N``, or ``intention-N`` on a row made before anneal 1.0.7) · ``sent to the desk to sort``.
     """
     kind = parsed["kind"]
     if kind == "drop":

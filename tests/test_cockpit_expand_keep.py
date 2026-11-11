@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from anneal_memory import Store
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TODAY, _install
 from tests.test_cockpit_scroll_keep_page import _Served, _serve_plain
@@ -122,10 +122,10 @@ def test_refresh_keeps_an_expanded_row(tmp_path: Path) -> None:
 @needs_browser
 def test_a_store_write_keeps_an_expanded_row(tmp_path: Path) -> None:
     root, src = _install_long(tmp_path)
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     stop = threading.Event()
 
-    def writer() -> None:    # a seat writing spores while the page is open: each write moves the panels' etags
+    def writer() -> None:    # a seat writing intentions while the page is open: each write moves the panels' etags
         n = 0
         while not stop.wait(1.5):
             n += 1

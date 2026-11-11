@@ -155,7 +155,7 @@ def test_doctor_compat_unknown_is_not_green(tmp_path, monkeypatch):
 
 # --------------------------------------------------------------------------
 # install: apply_init writes the lock + acks a fresh install to the reconciled
-# templates version (advance-only, capped at installed) — spore-216
+# templates version (advance-only, capped at installed) — intention-216
 # --------------------------------------------------------------------------
 
 def test_record_compat_lock_writes_lock(tmp_path, monkeypatch):
@@ -168,7 +168,7 @@ def test_record_compat_lock_writes_lock(tmp_path, monkeypatch):
 
 def test_record_compat_lock_acks_fresh_install_to_reconciled(tmp_path, monkeypatch):
     # A fresh install (marker None) acks UP to the templates-reconciled version
-    # (capped at installed) so a current adopter sees a clean doctor (spore-216).
+    # (capped at installed) so a current adopter sees a clean doctor (intention-216).
     store = _store(tmp_path)
     monkeypatch.setattr(manifest, "discover_installed_set",
                         lambda *a, **k: _inst(migrate_acked=None))
@@ -302,7 +302,7 @@ def test_record_compat_lock_skips_write_on_unknown(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# spore-216/spore-218: templates reconciled through 0.9.6 -> a fresh install's
+# intention-216/intention-218: templates reconciled through 0.9.6 -> a fresh install's
 # pending drift drops to exactly the entries ABOVE the cap (uncovered, honestly
 # surfaced)
 # --------------------------------------------------------------------------
@@ -354,9 +354,9 @@ def test_template_ack_target_caps_and_skips():
 # guarded` is the one entry that has both halves today, and it is the shape to copy.
 _COVERAGE_SENTINELS = {
     # feature: (owning seed file, sentinel text)
-    "AM-SPORES-BOUNDARY": ("spore_instructions.md", "spore_add"),      # prospective-layer tools
+    "AM-INTENTIONS-BOUNDARY": ("intention_instructions.md", "intention_add"),      # prospective-layer tools
     "AM-MIGRATE-NOTIFY": ("memory.md", "levain update"),               # the upgrade habit
-    "AM-CRYSTAL": ("memory_workflow.md", "crystallization candidates"),  # crystallize-OUT routing (moved with the wrap procedure, spore-451)
+    "AM-CRYSTAL": ("memory_workflow.md", "crystallization candidates"),  # crystallize-OUT routing (moved with the wrap procedure, intention-451)
     "AM-MCP-CRYSTAL": ("memory.md", "crystal_recall"),                 # the MCP read surface
     "AM-LINKGATE": ("memory.md", "[evidence: <id1>, <id2>"),           # the honest multi-episode example
     "AM-HOP-RETIRED": ("memory.md", "recall follows the episodes a pattern's evidence cites"),
@@ -371,7 +371,7 @@ _COVERAGE_SENTINELS = {
 #   memory.md's wrap guidance is already INLINE and points at `prepare_wrap` as the
 #   source of truth ("follow what it emits ... the package carries the authoritative
 #   contract") — exactly the inline-methodology end-state the entry asks for, so there
-#   is nothing to archive and no text to add. Reviewed no-edit (spore-218). UNLIKE the
+#   is nothing to archive and no text to add. Reviewed no-edit (intention-218). UNLIKE the
 #   textless engine fix above, this entry HAS a checkable end-state, so it is NOT left
 #   to manual review: `test_am_wrap_generated_inline_end_state_is_structurally_guarded`
 #   enforces it every run (positive prepare_wrap pointer + negative no-companion-file),
@@ -392,7 +392,7 @@ _NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH", "AM-WRAP-GENERATED", "KL-19-OPERAT
 
 
 def test_seed_templates_carry_the_reconciled_guidance():
-    # Manifest-DRIVEN coverage (spore-216 L1 finding): TEMPLATES_RECONCILED_ANNEAL
+    # Manifest-DRIVEN coverage (intention-216 L1 finding): TEMPLATES_RECONCILED_ANNEAL
     # asserts the seed templates incorporate the migration-manifest guidance through
     # that version. Iterate the MANIFEST ITSELF — for every entry at/below the
     # reconciled cap, assert a per-entry coverage sentinel (or an explicit no-edit
@@ -434,7 +434,7 @@ def test_seed_templates_carry_the_reconciled_guidance():
             f"this proposal."
         )
         checked += 1
-    # Non-vacuous: at the cap in `manifest.TEMPLATES_RECONCILED_ANNEAL` we exercise spores +
+    # Non-vacuous: at the cap in `manifest.TEMPLATES_RECONCILED_ANNEAL` we exercise intentions +
     # migrate-notify + crystal + mcp-crystal + linkgate via sentinels (0.4.8
     # AM-PRESERVE-BARE-PATH and 0.9.6 AM-WRAP-GENERATED are allowlisted no-edit, so they don't
     # add to the count).
@@ -474,10 +474,10 @@ def test_am_wrap_generated_inline_end_state_is_structurally_guarded():
     # of the entry's suggested_edit). This guard enforces that end-state every run, so a
     # future seed edit that froze the wrap mechanics into a companion file — or
     # de-inlined memory.md and dropped the prepare_wrap pointer — fails CI instead of
-    # silently making the init-ack dishonest (L1 MED-1, spore-218).
+    # silently making the init-ack dishonest (L1 MED-1, intention-218).
     templates_root = Path(install.__file__).parent / "templates"
     memory_md = (templates_root / "seed" / "memory.md").read_text(encoding="utf-8")
-    # spore-451: the wrap procedure MOVED from memory.md into the base seed memory_workflow.md.
+    # intention-451: the wrap procedure MOVED from memory.md into the base seed memory_workflow.md.
     # The guarantee holds in two halves: memory.md still names the procedure and its file, and the
     # file that now holds the procedure carries the prepare_wrap-is-authoritative sentence.
     workflow_md = (templates_root / "seed" / "memory_workflow.md").read_text(encoding="utf-8")
@@ -551,7 +551,7 @@ def test_fresh_install_acks_the_covered_entries(tmp_path):
     # installed 0.9.6 nothing is above it, so this asserts 0; the moment anneal ships
     # an entry above 0.9.6 it asserts 1 without a code change. (A bare `== 0` was the
     # off-by-one — it only held while the installed manifest topped out at the cap;
-    # codex/L3 + L1 caught it. spore-218 raised the cap to 0.9.6 ONLY after the seed
+    # codex/L3 + L1 caught it. intention-218 raised the cap to 0.9.6 ONLY after the seed
     # reconciled AM-WRAP-GENERATED — a no-edit disposition entry — never to silence a
     # pending count.)
     store = tmp_path / ".levain" / "memory.db"

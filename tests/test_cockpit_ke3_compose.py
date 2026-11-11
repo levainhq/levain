@@ -163,7 +163,7 @@ def test_cx3_a_compose_verb_the_registry_does_not_hold_is_refused() -> None:
 
 def test_cx3_a_row_bound_verb_is_not_a_compose_verb() -> None:
     with pytest.raises(CockpitRegistrationError, match="row"):
-        _attached().register(_spec(verbs=("spore_touch",), compose={**COMPOSE, "verb": "spore_touch"}))
+        _attached().register(_spec(verbs=("intention_touch",), compose={**COMPOSE, "verb": "intention_touch"}))
 
 
 def test_cx4_a_job_verb_is_refused_in_a_compose() -> None:

@@ -115,7 +115,7 @@ def render_turn(events) -> str | None:
             role = getattr(e.llm_message, "role", None)
             text = message_event_text(e)
             if text:
-                if role != "user":  # spore-297: capture the reply, not a finish/think-as-JSON blob
+                if role != "user":  # intention-297: capture the reply, not a finish/think-as-JSON blob
                     text = humanize_finish_json(text)
                 lines.append(f"[{role}] {text}")
             continue

@@ -296,7 +296,7 @@ def _run_prompt_hook(monkeypatch, qdir, emit):
     monkeypatch.setattr(h, "read_blocks", lambda *_a, **_k: [])
     monkeypatch.setattr(h, "consent_observe", lambda *_a, **_k: None, raising=False)
     monkeypatch.setattr(h, "state_line_pending", lambda _s: (None, None), raising=False)
-    monkeypatch.setattr(h, "open_spores", lambda **_k: [])
+    monkeypatch.setattr(h, "open_intentions", lambda **_k: [])
     monkeypatch.setattr(h, "crystal_recall", lambda *_a, **_k: [])
     monkeypatch.setattr(h, "wrap_state", lambda **_k: None, raising=False)
     monkeypatch.setattr(h, "session_touch", lambda *_a, **_k: None)

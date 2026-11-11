@@ -31,7 +31,7 @@ __all__ = [
     "capture_completed_turn",
     "render_turn",
     "wrap_nudge",
-    # the isolated-entity agent chokepoint (spore-277)
+    # the isolated-entity agent chokepoint (intention-277)
     "build_entity_agent",
     "guard_entity",
     "EntityBinding",

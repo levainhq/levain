@@ -468,7 +468,7 @@ def test_seat_spec_iteration_bound_is_opt_outable(tmp_path) -> None:
 
 
 def test_seat_spec_bounds_WALL_CLOCK_by_default(tmp_path) -> None:
-    """K4a ⑥, `spore-434`. The step bound above cannot bound a turn hung inside ONE step, and
+    """K4a ⑥, `intention-434`. The step bound above cannot bound a turn hung inside ONE step, and
     because launchd COALESCES per label the seat then never runs again — behind a unit still
     reporting installed + loaded. So this bound is not redundant with the step bound; it is the only
     one of the two that makes K4a's "restartable" true.
@@ -813,7 +813,7 @@ def test_systemd_install_writes_both_units_and_enables_the_timer(systemd, tmp_pa
 
 
 def test_systemd_install_requests_lingering_and_reports_a_refusal(systemd, tmp_path, monkeypatch) -> None:
-    """⚠ WITHOUT LINGERING A USER UNIT DIES AT LOGOUT — spore-418's "always-on agent that dies when
+    """⚠ WITHOUT LINGERING A USER UNIT DIES AT LOGOUT — intention-418's "always-on agent that dies when
     the laptop lid closes", reappearing as a session lifetime. A refusal must be SURFACED, never
     swallowed into a green install line."""
     fake = _FakeSystemctl(rc_for={"loginctl": 1},

@@ -35,7 +35,7 @@ def _run(coro):
 
 def _store_with_data(tmp_path: Path) -> AnnealPaths:
     from anneal_memory import Store
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
 
     db = tmp_path / "memory.db"
     with Store(db) as store:
@@ -43,7 +43,7 @@ def _store_with_data(tmp_path: Path) -> AnnealPaths:
         b = store.record("noticed Z", "observation")
         store.wrap_started(token="w1", episode_ids=[a.id, b.id])
         store.wrap_completed(2, 20, wrap_token="w1", episode_ids=[a.id, b.id])
-    SporeStore(tmp_path / "memory.spores.json").add(
+    IntentionStore(tmp_path / "memory.spores.json", id_prefix="intention").add(
         type="task", text="an open loop", tier="hot", salience=2
     )
     (tmp_path / "memory.continuity.md").write_text(
@@ -198,11 +198,11 @@ class TestBuildApp:
         # structuredContent = the full SubstrateView (UI render-prop)
         sc = result.structuredContent
         assert sc is not None
-        for key in ("paths", "health", "graph", "crystal_index", "open_spores",
+        for key in ("paths", "health", "graph", "crystal_index", "open_intentions",
                     "sections", "errors"):
             assert key in sc
         assert sc["health"]["total_episodes"] == 2
-        assert len(sc["open_spores"]) == 1
+        assert len(sc["open_intentions"]) == 1
 
         # _meta points the host at the resource for hydration — both wire forms
         assert result.meta is not None

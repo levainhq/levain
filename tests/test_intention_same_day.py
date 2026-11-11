@@ -23,7 +23,7 @@ def _minute(dt: datetime) -> str:
 
 def test_a_timed_snooze_to_a_later_minute_today_is_accepted(tmp_path: Path) -> None:
     """THE REPRODUCED REFUSAL: on the unfixed code this raised 'pick a later day' for any timed value on today."""
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     until = _minute(_local_now(qs) + timedelta(minutes=1))
     said = qs.intention_act(q.id, "snooze", until=until, channel="cockpit")
     assert f"snoozed to {until}" in said
@@ -33,7 +33,7 @@ def test_a_timed_snooze_to_a_later_minute_today_is_accepted(tmp_path: Path) -> N
 
 
 def test_the_same_minute_or_an_earlier_one_today_is_refused_in_plain_words(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     now = _local_now(qs)
     for until in (_minute(now), _minute(now - timedelta(minutes=1))):
         with pytest.raises(ConsentError) as exc:
@@ -43,7 +43,7 @@ def test_the_same_minute_or_an_earlier_one_today_is_refused_in_plain_words(tmp_p
 
 
 def test_a_date_only_today_and_a_timed_past_day_keep_pick_a_later_day(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     today = _local_now(qs).date()
     for until in (today.isoformat(), _minute(_local_now(qs) - timedelta(days=1))):
         with pytest.raises(ConsentError) as exc:
@@ -79,7 +79,7 @@ def _kiritimati(monkeypatch):
 
 
 def test_the_minute_is_judged_in_the_hosts_local_zone(tmp_path: Path, _kiritimati) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     now = _local_now(qs)
     assert local_minute(qs._clock()) == _minute(now) and now.utcoffset() == timedelta(hours=14)
     assert now.date().isoformat() == "2026-11-08"                          # UTC says 11-07: a UTC judgement would differ

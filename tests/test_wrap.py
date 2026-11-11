@@ -219,7 +219,7 @@ def test_wrap_success_writes_the_neocortex_into_the_entity_tree(tmp_path, capsys
     assert wrap_entity(ent) == 0
     out = capsys.readouterr().out
     assert "consolidated." in out
-    # spore-359: a fresh `levain run` now boots on the neocortex (State/Context), not only
+    # intention-359: a fresh `levain run` now boots on the neocortex (State/Context), not only
     # crystallized patterns — so the success line names memory consolidation, not "identity compounded".
     assert "memory consolidated" in out
     assert "boots on this State/Context" in out

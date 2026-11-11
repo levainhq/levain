@@ -64,8 +64,8 @@
   // job finishes — so the sibling write's saved state still lands, just after the job.
   let deferredReload = false;
 
-  // The write token (spore-129, then K2a). A writable server REQUIRES the X-Levain-Write-Token
-  // header on every write, on loopback too (K2a); off-box it also gates the reads (spore-220).
+  // The write token (intention-129, then K2a). A writable server REQUIRES the X-Levain-Write-Token
+  // header on every write, on loopback too (K2a); off-box it also gates the reads (intention-220).
   // The server signals it via `view.write_token_required` (set in load()); we hold the token in
   // localStorage and attach it. The server prints the token at start, with a link carrying it
   // in the fragment, which the page takes on load. (This localStorage entry is the
@@ -153,7 +153,7 @@
   }
   // Prompt for + persist the write token; returns the entered token ("" if cancelled). The
   // desktop-browser STOPGAP entry point (a native app shell injects the same header from
-  // the keychain). One token gates BOTH the reads (spore-220) and the writes (spore-129).
+  // the keychain). One token gates BOTH the reads (intention-220) and the writes (intention-129).
   let tokenDeclined = false;   // this page load: the operator declined the prompt; passive refreshes stay quiet
   function pairedDevice() {
     try { return window.localStorage.getItem(PAIRED_MARK_KEY) === "1"; } catch (_) { return false; }
@@ -281,7 +281,7 @@
   }
   // Headers for a READ (GET): attach the stored off-box token OPPORTUNISTICALLY if we hold one.
   // Harmless on a loopback / read-only surface (the server skips the read gate there); REQUIRED on
-  // an off-box writable surface (spore-220 gates the substrate reads). No Content-Type — GET has no body.
+  // an off-box writable surface (intention-220 gates the substrate reads). No Content-Type — GET has no body.
   function readHeaders() {
     const h = {};
     const tok = storedToken();
@@ -343,7 +343,7 @@
         await reread();
         return { ok: true, data: data };
       }
-      // A stale refusal means this page's picture of the row is old (spore-174): re-read it, after the row has shown
+      // A stale refusal means this page's picture of the row is old (intention-174): re-read it, after the row has shown
       // the refusal for a moment, so the next click acts on the current row instead of re-firing the old one. The
       // re-read is PASSIVE, so an editor the operator opened meanwhile is never rebuilt away; one timer at a time.
       if (res.status === 409 && data.error === "stale" && !staleReread) {
@@ -433,7 +433,7 @@
   window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }), rowActions, rowVerb,
     notice: (text) => status(String(text).slice(0, 200)) };
 
-  // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
+  // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (intention-220 gates
   // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
   // 500 a corrupt job store returns); the in-box poll loop retries a few times, then surfaces it.
   async function pollJob(jobId) {
@@ -484,7 +484,7 @@
   function flushIfIdle() { if (deferredReload && !inflight && !editInProgress()) flushDeferred(); }
 
   // An involuntary re-read rebuilds the whole board (+ modal) via replaceChildren and
-  // would discard an in-progress edit/capture textarea (spore-108). The PASSIVE triggers
+  // would discard an in-progress edit/capture textarea (intention-108). The PASSIVE triggers
   // (refresh-button, visibilitychange) defer while the operator is mid-edit — never the
   // save's own commit→load reload (passive:false), which MUST rebuild to close the editor
   // and show saved state. Deferring loses nothing: the substrate only changes on a wrap,
@@ -765,15 +765,15 @@
 
   // The legacy request kinds the render core still speaks, translated onto cockpit verbs. Only the verb
   // name, the params and the target are read from the request; everything else the kernel decides.
-  const ROW_KEY = { spore_id: "spore:", episode_id: "episode:", edit_id: "edit:" };
-  const NOT_PARAMS = new Set(["kind", "spore_id", "episode_id", "edit_id", "expect_disposition", "confirm",
+  const ROW_KEY = { intention_id: "intention:", episode_id: "episode:", edit_id: "edit:" };
+  const NOT_PARAMS = new Set(["kind", "intention_id", "episode_id", "edit_id", "expect_disposition", "confirm",
     "panel_version", "source", "heading", "expected_body"]);
   const VERB_OF_KIND = { state: "section_edit" };
 
   function panelActionFor(verb, req) {
     // every capture, a note included, is the Tray's create; the disposition rides in params
-    // the List's panel keeps its wire id `tray`; its create (spore_seed) and its intake box (list_intake) are both offered there
-    const want = verb === "spore_seed" || verb === "list_intake" ? "tray" : null;
+    // the List's panel keeps its wire id `tray`; its create (intention_seed) and its intake box (list_intake) are both offered there
+    const want = verb === "intention_seed" || verb === "list_intake" ? "tray" : null;
     for (const pid of Object.keys(live.panels)) {
       if (want && pid !== want) continue;
       const a = live.panels[pid].actions.find((x) => x && x.verb === verb);
@@ -1051,7 +1051,7 @@
         return true;
       }
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
-      // OFF-BOX BOOTSTRAP (spore-220): an off-box writable surface gates the substrate READS. On the
+      // OFF-BOX BOOTSTRAP (intention-220): an off-box writable surface gates the substrate READS. On the
       // first load we hold no token yet (and don't yet know one is required — that flag rides INSIDE
       // substrate.json, the chicken-and-egg). A token-class 403 means "off-box surface, token needed":
       // prompt once, store, retry. A read-only mesh surface never 403s here (its reads are token-free),
@@ -1060,7 +1060,7 @@
         // Don't pop a BLOCKING prompt over an edit the operator opened DURING this fetch on a PASSIVE
         // re-read (visibilitychange / refresh): re-check here, mirroring the post-fetch render guard
         // below, so a background token-403 can't steal focus from in-progress text (complement L3
-        // FIND-1 / the spore-108 "passive never disrupts an edit" invariant). The next explicit
+        // FIND-1 / the intention-108 "passive never disrupts an edit" invariant). The next explicit
         // boot/save load (passive:false) re-prompts.
         if (passive && editInProgress()) return refuseForEdit();
         if (promptForToken()) res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });

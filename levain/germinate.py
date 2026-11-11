@@ -1,51 +1,51 @@
-"""``levain spores germinate``: an agenda spore that has come due is put in front of the operator (TS-2).
+"""``levain intentions germinate``: an agenda intention that has come due is put in front of the operator (TS-2).
 
 Deterministic, no model call. For each DUE agenda (open, disposition ``agenda``, no ``germinated`` stamp, and ``next``
 due: a date-only ``next`` is due on or before the install's local day; a TIMED ``next`` (``YYYY-MM-DDTHH:MM``, local)
 is due from that minute; an agenda with no ``next`` is never due) it does, in order:
 
-1. adopt an open question whose ``q-…`` id the spore's text or notes name (file nothing; ref = that id);
+1. adopt an open question whose ``q-…`` id the intention's text or notes name (file nothing; ref = that id);
 2. ``band``: file ONE band row through ``QuestionStore.file_once``, no ping;
-3. ``nudge``: the same filing, then one ping. The ping is made whenever the row is still open and the spore is not yet
-   stamped, so a ping that failed (returned False or raised) leaves the spore open and due and the next run retries it
+3. ``nudge``: the same filing, then one ping. The ping is made whenever the row is still open and the intention is not yet
+   stamped, so a ping that failed (returned False or raised) leaves the intention open and due and the next run retries it
    (``ping_failed`` in the result, non-zero exit); only a ping that went out is followed by the stamp. A crash between
    the ping and the stamp therefore pings again on the re-run (at-least-once: a lost nudge is the failure this exists
    to prevent), still into the ONE row;
-4. ``board:<repo>`` / ``desk``: a desk drop (``outbox_id`` derived from the spore, words always checked against
-   the spore as it is now), or, with no desk store that can take a drop (``desk_present``), the band
-   filing with the reason in ``blocks``. ``desk`` files the spore's words verbatim and uncut (a spore too long for a
-   drop is an error for that spore, never a truncation);
-5. stamp ``germinated={on, target, ref}`` as a compare-and-set against the spore as it was read (its version and ``agenda``
-   disposition), so a spore edited while this ran is left open, reported under ``skipped``, and filed again from its new
+4. ``board:<repo>`` / ``desk``: a desk drop (``outbox_id`` derived from the intention, words always checked against
+   the intention as it is now), or, with no desk store that can take a drop (``desk_present``), the band
+   filing with the reason in ``blocks``. ``desk`` files the intention's words verbatim and uncut (an intention too long for a
+   drop is an error for that intention, never a truncation);
+5. stamp ``germinated={on, target, ref}`` as a compare-and-set against the intention as it was read (its version and ``agenda``
+   disposition), so an intention edited while this ran is left open, reported under ``skipped``, and filed again from its new
    words on the next run. An agenda that filed or adopted a QUESTION (``adopted``, ``band``, ``nudge``, ``band-fallback``)
    is then LEFT OPEN while that question is open: its stamp names the row, the row rings in the band, and the operator's
-   controls on that intention move the spore and the row together; once the question is ANSWERED the next run closes the
+   controls on that intention move the intention and the row together; once the question is ANSWERED the next run closes the
    agenda (``done`` / ``answered`` / ``explored`` by its type). An agenda that handed a desk drop (``board``,
    ``desk``) is composted, as before, with a second compare-and-set.
 
-One bad spore never stops the others: its error is recorded under ``errors`` and the run goes on; the CLI prints every
-outcome that did complete and exits non-zero when any spore errored. A missing ``.levain/memory.spores.json`` is
+One bad intention never stops the others: its error is recorded under ``errors`` and the run goes on; the CLI prints every
+outcome that did complete and exits non-zero when any intention errored. A missing ``.levain/memory.spores.json`` is
 refused with a reason (exit 2), never reported as "nothing due". A run holds a per-install lock (``--dry-run`` does
 not), so two overlapping runs (cron plus a hand run, the 06:10 run plus a minute ``--timed`` run) take turns.
 
-The dedupe key is the spore's immutable ``origin_key``, never its id: the question store is per USER while ``spore-NNN``
-ids are per INSTALL, so an id key would let install B's due ``spore-004`` adopt install A's held row and compost with no
+The dedupe key is the intention's immutable ``origin_key``, never its id: the question store is per USER while ``intention-NNN``
+ids are per INSTALL, so an id key would let install B's due ``intention-004`` adopt install A's held row and compost with no
 row of its own. Filing is idempotent (``file_once`` / the outbox id), so a crash between any two steps re-runs into the
-same one row; a drop spore stamped but not yet composted is finished on the next run (a stamp naming a question is finished
+same one row; a drop intention stamped but not yet composted is finished on the next run (a stamp naming a question is finished
 only once that question is answered).
 
 Known edges (closed under the reachability line, TS-2 L3): ``board:<repo>`` does not carry the repo into the drop: a
 drop's ``Source`` takes only an absolute repo path, a ``refs/heads/`` ref and a full commit id, none of which a repo
-NAME determines, and the words stay his verbatim; the repo is recorded in the spore's ``germinated`` stamp (target)
-only. A drop has no field for the spore's ``created`` or ``next`` either (``sent_at`` is the sender's clock stamp, not an
-authorship date, and a bare date is not a moment), so neither is carried. A board/desk spore edited AFTER its drop was
+NAME determines, and the words stay his verbatim; the repo is recorded in the intention's ``germinated`` stamp (target)
+only. A drop has no field for the intention's ``created`` or ``next`` either (``sent_at`` is the sender's clock stamp, not an
+authorship date, and a bare date is not a moment), so neither is carried. A board/desk intention edited AFTER its drop was
 filed raises ``DropConflict`` on every run (his new words are never silently dropped, and the old drop is never
-re-labelled), until he resolves it by hand. A band row already filed keeps its first ``what`` text if the spore is
+re-labelled), until he resolves it by hand. A band row already filed keeps its first ``what`` text if the intention is
 edited before the stamp. A nudge whose ping can never succeed (no channel) stays open and errors each run; the band row
-is still there. Two due spores naming the same open ``q-…`` both adopt it. ``--dry-run`` reads the spore store through
-``levain.spores.list_open_readonly``, which does not backfill a missing ``origin_key`` (a keyless row gets a temporary
+is still there. Two due intentions naming the same open ``q-…`` both adopt it. ``--dry-run`` reads the intention store through
+``levain.intentions.list_open_readonly``, which does not backfill a missing ``origin_key`` (a keyless row gets a temporary
 in-memory key). The default ``--agent`` is
-``claude_code`` (a Codex install passes ``--agent codex``). An empty-text spore cannot exist (anneal refuses it). The
+``claude_code`` (a Codex install passes ``--agent codex``). An empty-text intention cannot exist (anneal refuses it). The
 band row's ``Due MM-DD`` carries no year.
 
 Also a known edge: the per-install run lock uses ``fcntl`` (macOS/Linux only; levain does not target Windows).
@@ -63,7 +63,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from levain.spores import _parse_when, is_timed
+from levain.intentions import _parse_when, is_timed
+from levain.intention_legacy import STORE_FILE_NAME
 
 __all__ = ["GerminateRefused", "KEY_PREFIX", "Outcome", "add_parsers", "germinate", "is_due", "outbox_id_for",
            "run_germinate"]
@@ -75,14 +76,14 @@ _TITLE_MAX = 160
 
 
 class GerminateRefused(RuntimeError):
-    """The run cannot start (no spores file): said with a reason, never reported as 'nothing due'."""
+    """The run cannot start (no intentions file): said with a reason, never reported as 'nothing due'."""
 
 
 @dataclass(frozen=True)
 class Outcome:
-    spore_id: str
+    intention_id: str
     origin_key: str
-    target: str          # band | nudge | desk | board:<repo> as the spore asked
+    target: str          # band | nudge | desk | board:<repo> as the intention asked
     via: str             # what actually happened: adopted | band | nudge | board | desk | band-fallback | finished
     ref: str             # the q-… id or the drop id
     filed: bool          # this run created the row or drop
@@ -90,12 +91,12 @@ class Outcome:
     done: bool           # stamped and composted (False on a dry run)
 
     def as_dict(self) -> dict[str, Any]:
-        return {"spore_id": self.spore_id, "origin_key": self.origin_key, "target": self.target, "via": self.via,
+        return {"intention_id": self.intention_id, "origin_key": self.origin_key, "target": self.target, "via": self.via,
                 "ref": self.ref, "filed": self.filed, "pinged": self.pinged, "done": self.done}
 
 
 def outbox_id_for(origin_key: str) -> str:
-    """The desk outbox id for a spore: the store's grammar is ``[A-Za-z0-9._-]`` (no colon, so the frame's
+    """The desk outbox id for an intention: the store's grammar is ``[A-Za-z0-9._-]`` (no colon, so the frame's
     ``germinate:<origin_key>`` cannot be one), so it is a hash of the origin key, still one id per origin key."""
     return "germinate-" + hashlib.sha256(origin_key.encode("utf-8")).hexdigest()[:40]
 
@@ -116,7 +117,7 @@ def _is_agenda(item: dict[str, Any]) -> bool:
 
 
 def is_due(item: dict[str, Any], today: date, now: datetime | None = None) -> bool:
-    """SD-4: agenda, open (the caller lists open spores), no ``germinated``, and ``next`` due: a TIMED ``next`` from that
+    """SD-4: agenda, open (the caller lists open intentions), no ``germinated``, and ``next`` due: a TIMED ``next`` from that
     minute (a malformed timed value is never due and never read as a date), a date-only ``next`` on or before today."""
     if not _is_agenda(item) or item.get("germinated"):
         return False
@@ -149,7 +150,7 @@ def _line(text: str, limit: int) -> str:
 
 
 def _title(item: dict[str, Any], sid: str) -> str:
-    """The first non-empty line of the spore's text, else its id."""
+    """The first non-empty line of the intention's text, else its id."""
     lines = [ln for ln in (item.get("text") or "").splitlines() if ln.strip()]
     return _line(lines[0], _TITLE_MAX) if lines else sid
 
@@ -164,7 +165,7 @@ def _adopt(item: dict[str, Any], open_ids: set[str]) -> str | None:
 
 
 @contextmanager
-def _run_lock(spores_json: Path, dry_run: bool) -> Iterator[None]:
+def _run_lock(intentions_json: Path, dry_run: bool) -> Iterator[None]:
     """One germinate run at a time per install (blocking); a dry run reads only and takes none. No ``fcntl`` (Windows):
     no lock, as anneal's own guarded writes then refuse a stale one."""
     if dry_run:
@@ -175,7 +176,7 @@ def _run_lock(spores_json: Path, dry_run: bool) -> Iterator[None]:
     except ImportError:  # pragma: no cover
         yield
         return
-    path = spores_json.with_name(spores_json.name + ".germinate.lock")
+    path = intentions_json.with_name(intentions_json.name + ".germinate.lock")
     with open(path, "a") as fh:
         fcntl.flock(fh, fcntl.LOCK_EX)
         try:
@@ -184,38 +185,38 @@ def _run_lock(spores_json: Path, dry_run: bool) -> Iterator[None]:
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def germinate(spores_json: Path | str, queue_dir: Path | str, *, install: Path | str, agent: str = "claude_code",
+def germinate(intentions_json: Path | str, queue_dir: Path | str, *, install: Path | str, agent: str = "claude_code",
               today: date | None = None, now: datetime | None = None, dry_run: bool = False, timed_only: bool = False,
               ping: Callable[..., bool] | None = None) -> dict[str, Any]:
-    """Germinate every due agenda in ``spores_json`` (``timed_only``: only those whose ``next`` carries a time).
+    """Germinate every due agenda in ``intentions_json`` (``timed_only``: only those whose ``next`` carries a time).
     Returns ``{"today", "due": [...], "finish": [...], "errors": [...], "skipped": [...]}``; ``due`` and ``finish``
     hold :class:`Outcome` dicts. ``dry_run`` writes nothing (it files nothing, pings nothing, and creates no store).
     ``now`` is the local naive clock for a timed ``next`` (default: the host's). ``ping`` is the notify seam (default
-    :func:`levain.consent.band._send_ping`, read at call time). Raises :class:`GerminateRefused` with no spores file."""
-    spores_json = Path(spores_json)
-    if not spores_json.is_file():
-        raise GerminateRefused(f"{spores_json} does not exist: this is not a Levain install with a spore store "
+    :func:`levain.consent.band._send_ping`, read at call time). Raises :class:`GerminateRefused` with no intentions file."""
+    intentions_json = Path(intentions_json)
+    if not intentions_json.is_file():
+        raise GerminateRefused(f"{intentions_json} does not exist: this is not a Levain install with an intention store "
                                "(check --path); nothing was read or written")
-    with _run_lock(spores_json, dry_run):
-        return _germinate(spores_json, Path(queue_dir), Path(install), agent, today, now, dry_run, timed_only, ping)
+    with _run_lock(intentions_json, dry_run):
+        return _germinate(intentions_json, Path(queue_dir), Path(install), agent, today, now, dry_run, timed_only, ping)
 
 
-def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: date | None, now: datetime | None,
+def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, today: date | None, now: datetime | None,
                dry_run: bool, timed_only: bool, ping: Callable[..., bool] | None) -> dict[str, Any]:
-    from anneal_memory.spores import SporeError, spore_version
+    from anneal_memory.spores import IntentionError, intention_version
 
     from levain.consent import band
     from levain.consent.questions import ANSWER_CHANNELS, DB_NAME, QuestionStore, later_date
     from levain.desk.store import CoordStore
-    from levain.spores import answered_descend_kind, guarded_spore_store, ringing_ref
+    from levain.intentions import answered_descend_kind, guarded_intention_store, ringing_ref
 
     now = now or datetime.now()
     today = today or now.date()
     result: dict[str, Any] = {"today": today.isoformat(), "due": [], "finish": [], "errors": [], "skipped": []}
-    store = guarded_spore_store(spores_json)
+    store = guarded_intention_store(intentions_json)
     if dry_run:     # a dry run writes nothing: no origin_key backfill, no lock file (a keyless row gets a temporary key)
-        from levain.spores import list_open_readonly
-        open_items = list_open_readonly(spores_json, today=today)
+        from levain.intentions import list_open_readonly
+        open_items = list_open_readonly(intentions_json, today=today)
     else:
         open_items = store.list_open(today=today)
     due = [s for s in open_items if is_due(s, today, now) and (not timed_only or is_timed(s.get("next")))]
@@ -251,7 +252,7 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
 
     def _err(sid: Any, okey: Any, exc: BaseException | str, **extra: Any) -> None:
         text = exc if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"
-        result["errors"].append({"spore_id": sid, "origin_key": okey, "error": text, **extra})
+        result["errors"].append({"intention_id": sid, "origin_key": okey, "error": text, **extra})
 
     for item in finish:
         sid, okey = item.get("id"), item.get("origin_key")
@@ -265,23 +266,23 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                     kind = "composted" if str(stamp.get("ref") or "").startswith("dr-") or not stamp.get("ref") \
                         else answered_descend_kind(item.get("type"))
                     store.descend(sid, kind=kind, expect_disposition="agenda",
-                                  expected_version=spore_version(item), today=today)
-                except SporeError as exc:
+                                  expected_version=intention_version(item), today=today)
+                except IntentionError as exc:
                     if "changed since read" not in str(exc) and "disposition changed" not in str(exc):
                         raise
-                    result["skipped"].append({"spore_id": sid, "origin_key": okey, "ref": str(stamp.get("ref") or ""),
+                    result["skipped"].append({"intention_id": sid, "origin_key": okey, "ref": str(stamp.get("ref") or ""),
                                               "reason": f"changed while finishing ({exc}); left open"})
                     continue
                 out = Outcome(**{**out.__dict__, "done": True})
             result["finish"].append(out.as_dict())
-        except Exception as exc:  # noqa: BLE001 - one bad spore never stops the others
+        except Exception as exc:  # noqa: BLE001 - one bad intention never stops the others
             _err(sid, okey, exc)
 
     for item in due:
         sid, okey = item.get("id"), item.get("origin_key")
         try:
             if not isinstance(sid, str) or not isinstance(okey, str) or not okey:
-                raise ValueError("the spore has no id or no origin_key; it cannot be keyed, so it is skipped")
+                raise ValueError("the intention has no id or no origin_key; it cannot be keyed, so it is skipped")
             target, repo = _target_of(item)
             nxt = _day(item.get("next"))
             title = _title(item, sid)
@@ -297,10 +298,10 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                 if dry_run:
                     ref = ""
                 else:
-                    # always sent with the spore's CURRENT words: a stored drop under this id holding other words raises
+                    # always sent with the intention's CURRENT words: a stored drop under this id holding other words raises
                     # DropConflict (his new words are never lost to an old drop's ref)
                     text = item.get("text") or ""
-                    words = text  # verbatim and uncut: too long for a drop is an error for this spore, never a truncation
+                    words = text  # verbatim and uncut: too long for a drop is an error for this intention, never a truncation
                     drop, filed = coord.accept_drop(words, surface="cli", outbox_id=outbox)
                     ref = drop.drop_id
             else:
@@ -327,28 +328,28 @@ def _germinate(spores_json: Path, qdir: Path, install: Path, agent: str, today: 
                         except Exception as exc:  # noqa: BLE001 - a ping is a ping; it must not be lost silently
                             ping_failed = f"the ping failed: {type(exc).__name__}: {exc}"
             if ping_failed:
-                # the row is filed; the spore stays open and due so the next run pings again
-                _err(sid, okey, f"ping_failed: {ping_failed}; the spore is left open and the next run retries",
+                # the row is filed; the intention stays open and due so the next run pings again
+                _err(sid, okey, f"ping_failed: {ping_failed}; the intention is left open and the next run retries",
                      ping_failed=True, ref=ref, target=target)
                 continue
             done = False
             if not dry_run:
                 try:
                     updated = store.update(sid, germinated={**stamp_for, "target": target, "ref": ref},
-                                           expect_disposition="agenda", expected_version=spore_version(item),
+                                           expect_disposition="agenda", expected_version=intention_version(item),
                                            today=today)
                     if via not in ("adopted", "band", "nudge", "band-fallback"):
                         store.descend(sid, kind="composted", expect_disposition="agenda",
-                                      expected_version=spore_version(updated), today=today)
+                                      expected_version=intention_version(updated), today=today)
                     done = True
-                except SporeError as exc:
+                except IntentionError as exc:
                     if "changed since read" not in str(exc) and "disposition changed" not in str(exc):
                         raise
-                    result["skipped"].append({"spore_id": sid, "origin_key": okey, "ref": ref,
+                    result["skipped"].append({"intention_id": sid, "origin_key": okey, "ref": ref,
                                               "reason": f"changed while germinating ({exc}); left open"})
                     continue
             result["due"].append(Outcome(sid, okey, target, via, ref, filed, pinged, done).as_dict())
-        except Exception as exc:  # noqa: BLE001 - one bad spore never stops the others
+        except Exception as exc:  # noqa: BLE001 - one bad intention never stops the others
             _err(sid, okey, exc)
     return result
 
@@ -357,60 +358,60 @@ def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     from levain.consent.queue import default_queue_dir
 
     install = Path(args.path).expanduser().resolve()
-    spores = install / ".levain" / "memory.spores.json"
+    intentions = install / ".levain" / STORE_FILE_NAME
     qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
-    return install, spores, qdir
+    return install, intentions, qdir
 
 
 def run_germinate(args: argparse.Namespace, out: Any = None) -> int:
     out = out if out is not None else sys.stdout
     try:
-        install, spores, qdir = _paths(args)
-        res = germinate(spores, qdir, install=install, agent=args.agent, dry_run=args.dry_run,
+        install, intentions, qdir = _paths(args)
+        res = germinate(intentions, qdir, install=install, agent=args.agent, dry_run=args.dry_run,
                         timed_only=getattr(args, "timed", False))
     except GerminateRefused as exc:
-        print(f"levain: spores germinate refused: {exc}", file=sys.stderr)
+        print(f"levain: intentions germinate refused: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:  # noqa: BLE001 - a CLI verb says why and exits non-zero
-        print(f"levain: spores germinate failed: {exc}", file=sys.stderr)
+        print(f"levain: intentions germinate failed: {exc}", file=sys.stderr)
         return 1
     rc = 1 if res["errors"] else 0
     for e in res["errors"]:
-        print(f"levain: spores germinate: {e['spore_id']}: {e['error']}", file=sys.stderr)
+        print(f"levain: intentions germinate: {e['intention_id']}: {e['error']}", file=sys.stderr)
     if args.as_json:
         print(json.dumps(res, indent=2, sort_keys=True), file=out)
         return rc
     verb = "would germinate" if args.dry_run else "germinated"
     for o in res["due"]:
         live = " (stamped, live)" if o["done"] and o["via"] in ("adopted", "band", "nudge", "band-fallback") else ""
-        print(f"{verb} {o['spore_id']} ({o['target']}) via {o['via']}" + (f" -> {o['ref']}" if o["ref"] else "") + live, file=out)
+        print(f"{verb} {o['intention_id']} ({o['target']}) via {o['via']}" + (f" -> {o['ref']}" if o["ref"] else "") + live, file=out)
     for o in res["finish"]:
-        print(f"{'would finish' if args.dry_run else 'finished'} {o['spore_id']} (stamped, now closed)", file=out)
+        print(f"{'would finish' if args.dry_run else 'finished'} {o['intention_id']} (stamped, now closed)", file=out)
     for s in res["skipped"]:
-        print(f"skipped {s['spore_id']}: {s['reason']}", file=out)
+        print(f"skipped {s['intention_id']}: {s['reason']}", file=out)
     if not res["due"] and not res["finish"] and not res["errors"] and not res["skipped"]:
         print("no agenda is due", file=out)
     return rc
 
 
-def spores_verbs(subparsers: argparse._SubParsersAction) -> argparse._SubParsersAction:
-    """The one ``levain spores`` parser's verb table, created on first use. Germinate and keep-migrate both live
-    under ``spores``; whichever registers first makes the parser, the other adds its verb to it."""
-    p = subparsers.choices.get("spores")
+def intentions_verbs(subparsers: argparse._SubParsersAction) -> argparse._SubParsersAction:
+    """The one ``levain intentions`` parser's verb table, created on first use. Germinate and keep-migrate both live
+    under ``intentions``; whichever registers first makes the parser, the other adds its verb to it."""
+    p = subparsers.choices.get("intentions")
     if p is None:
-        p = subparsers.add_parser("spores", help="Spore verbs for an install (germinate, keep-migrate).",
-                                  description="Verbs for the install's spore store.", allow_abbrev=False)
+        p = subparsers.add_parser("intentions", help="Intention verbs for an install (germinate, keep-migrate).",
+                                  description="Verbs for the install's intention store.", allow_abbrev=False)
         p.set_defaults(func=lambda a: (p.print_help(), 2)[1])
-        p._levain_verbs = p.add_subparsers(dest="spores_cmd", metavar="<verb>", required=True)
+        p._levain_verbs = p.add_subparsers(dest="intentions_cmd", metavar="<verb>", required=True)
     return p._levain_verbs
 
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
-    sub = spores_verbs(subparsers)
+    sub = intentions_verbs(subparsers)
     g = sub.add_parser("germinate", allow_abbrev=False,
                        help="Put every due agenda in front of the operator (band row, nudge, desk or board drop).",
-                       description="Each open agenda spore whose date (or, for a timed next, minute) has come (and not "
-                                   "yet germinated) is filed once as the spore's target says, stamped, and composted. "
+                       description="Each open agenda intention whose date (or, for a timed next, minute) has come (and not "
+                                   "yet germinated) is filed once as the intention's target says, stamped, and composted. "
                                    "Deterministic; no model call. Safe to run again: a re-run files nothing twice.")
     g.add_argument("--path", type=Path, default=Path.cwd(), help="Install directory (default: cwd).")
     g.add_argument("--queue-dir", type=Path, default=None, help="The band / desk directory (default: the "

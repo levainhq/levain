@@ -166,7 +166,7 @@ DECISIONS = "\n".join([
     "  a continuation line that belongs to the same decision",
     "",
     "[forwarded] **DREAMING BECOMES THE DEFAULT** -> `state/x.md`",
-    "[carried] THE BATON (`spore-1322`): every consolidate holds it",
+    "[carried] THE BATON (`intention-1322`): every consolidate holds it",
     "",
     "[rejected, 10-17] Z was turned down",
     "Some preface prose that matches nothing.",

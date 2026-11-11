@@ -44,8 +44,8 @@ BASE_RENDER = ["world.md", "origin.md"]  # ordered = the interview sequence
 BASE_VERBATIM = {
     "partnership.md",
     "memory.md",
-    "memory_workflow.md",  # spore-451: the wrap procedure split out of memory.md
-    "spore_instructions.md",
+    "memory_workflow.md",  # intention-451: the wrap procedure split out of memory.md
+    "intention_instructions.md",
     "continuity.md",
     "README.md",
 }
@@ -339,14 +339,14 @@ _BASE_ROSTER = [
     _entry("memory.md"),
     _entry("partnership.md"),
     _entry("README.md"),
-    _entry("spore_instructions.md"),
+    _entry("intention_instructions.md"),
 ]
 
-# The EAGER curriculum. `spore_instructions.md` is deliberately absent — it is
+# The EAGER curriculum. `intention_instructions.md` is deliberately absent — it is
 # ON_DEMAND_SEED as of 2026-08-01 (installed, pointed at from the carrier, not
 # eagerly loaded), and `_ON_DEMAND` below pins that half.
 _CURRICULUM = ["origin.md", "partnership.md", "world.md", "memory.md"]
-_ON_DEMAND = ["spore_instructions.md"]
+_ON_DEMAND = ["intention_instructions.md"]
 
 
 def test_import_entries_curriculum_order_excludes_continuity_and_readme():
@@ -360,7 +360,7 @@ def test_import_entries_curriculum_order_excludes_continuity_and_readme():
     # ON_DEMAND_SEED is context too, just not EAGER context — so its absence here
     # must be paired with its presence there, or the file reaches the entity by no
     # path at all. Asserting only the exclusion would pass for a DELETED file.
-    assert "spore_instructions.md" not in names
+    assert "intention_instructions.md" not in names
     assert on_demand_names(_BASE_ROSTER) == _ON_DEMAND
 
 
@@ -421,7 +421,7 @@ def test_seed_classes_partition_the_roster_exactly():
 
 def test_every_on_demand_seed_has_a_retention_summary():
     """A bare filename pointer would silently kill the layer it points at — the
-    spore TOOLS stay in context but the DISCIPLINE that makes them fire lives only
+    intention TOOLS stay in context but the DISCIPLINE that makes them fire lives only
     in the file. So adding to ON_DEMAND_SEED without writing its summary must FAIL
     here rather than quietly emit a pointer with no retained content."""
     for name in ON_DEMAND_SEED:
@@ -441,7 +441,7 @@ def test_base_seed_reachable_covers_eager_and_on_demand():
     """The install-time honesty floor checks REACHABILITY, not the eager list.
 
     This is the guard that would have silently stopped covering
-    spore_instructions.md the moment it moved classes — armed, reporting healthy,
+    intention_instructions.md the moment it moved classes — armed, reporting healthy,
     and no longer defending the file it was written for."""
     assert set(BASE_SEED_REACHABLE) == set(BASE_IMPORT_ORDER) | set(ON_DEMAND_SEED)
     for name in ON_DEMAND_SEED:
@@ -471,12 +471,12 @@ def test_the_real_seed_constants_are_disjoint():
 def test_on_demand_entries_resolve_to_the_winning_layer():
     """A pack overriding an on-demand file's CONTENT keeps its on-demand position
     and resolves to the winner — same rule every other selector follows."""
-    pack_spores = _entry("spore_instructions.md", path=Path("/pack/spore_instructions.md"))
-    roster = [e for e in _BASE_ROSTER if e.name != "spore_instructions.md"]
-    roster.append(pack_spores)
+    pack_intentions = _entry("intention_instructions.md", path=Path("/pack/intention_instructions.md"))
+    roster = [e for e in _BASE_ROSTER if e.name != "intention_instructions.md"]
+    roster.append(pack_intentions)
     result = on_demand_entries(roster)
     assert [e.name for e in result] == _ON_DEMAND
-    assert result[0].path == Path("/pack/spore_instructions.md")
+    assert result[0].path == Path("/pack/intention_instructions.md")
 
 
 # ---------- order_activation_roots: the activation peer of seed layering ----------
@@ -737,12 +737,12 @@ def test_budget_guard_rejects_the_pre_f2_composition():
     this pins that the guard actually fires on the composition Alex reported."""
     import scripts.check_seed_budget as budget
 
-    # the pre-F2 eager set: spore_instructions.md loaded rather than pointed at
+    # the pre-F2 eager set: intention_instructions.md loaded rather than pointed at
     seed_root = budget.REPO / "levain" / "templates" / "seed"
-    # spore-451 split memory.md's wrap procedure into memory_workflow.md; the pre-F2 composition
+    # intention-451 split memory.md's wrap procedure into memory_workflow.md; the pre-F2 composition
     # loaded that procedure inside memory.md, so both files count here, in the same eager set.
     pre_f2 = ("origin.md", "partnership.md", "world.md", "memory.md", "memory_workflow.md",
-              "spore_instructions.md")
+              "intention_instructions.md")
     total = sum((seed_root / n).stat().st_size for n in pre_f2)
     mechanism = sum(
         (seed_root / n).stat().st_size

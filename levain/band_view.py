@@ -63,6 +63,7 @@ from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.questions import (ANSWER_CHANNELS, HOOK_BUSY_MS, _TEXT_MAX, Answer, Question, QuestionStore, _answer_of, _now_utc,
                                      _select, later_date, local_today, open_ended_of, read_deadline)
 from levain.desk.legacy import FACT_DESK_WAKE, ROLE_DESK
+from levain.intention_legacy import STORE_FILE_NAME
 
 __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo", "hook_contract", "hook_prompt",
            "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
@@ -3451,10 +3452,10 @@ def run_band_snooze(args: argparse.Namespace) -> int:
     try:
         store = QuestionStore(args.queue_dir)
         qid = question_of_band_number(store, args.number)
-        install = getattr(args, "path", None)         # the install whose spore store the guard reads (default: this directory)
-        spores = Path(install).expanduser() / ".levain" / "memory.spores.json" if install else None
+        install = getattr(args, "path", None)         # the install whose intention store the guard reads (default: this directory)
+        intentions = Path(install).expanduser() / ".levain" / STORE_FILE_NAME if install else None
         got = store.snooze(qid, until=args.until, channel="cli", via="cli", note=getattr(args, "note", None),
-                           spores_json=spores)
+                           intentions_json=intentions)
     except Exception as exc:
         print(f"levain band {verb}: refused: {exc}; nothing was recorded", file=sys.stderr)
         return EXIT_REFUSED
@@ -3489,7 +3490,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     sz.add_argument("--queue-dir", dest="queue_dir", type=Path, default=argparse.SUPPRESS,
                     help="The consent directory holding questions.db.")
     sz.add_argument("--path", type=Path, default=Path.cwd(),
-                    help="The install whose spore store is checked: a row an open agenda there rings is snoozed by its spore.")
+                    help="The install whose intention store is checked: a row an open agenda there rings is snoozed by its intention.")
     sz.set_defaults(func=run_band_snooze)
     us = sub.add_parser("unsnooze", help="Bring a snoozed band row back now: it is due again.")
     us.add_argument("number", type=_band_number_arg, help="The band number, as the band shows it.")

@@ -1,4 +1,4 @@
-"""levain.firing.deadline — the WALL-CLOCK BOUND on one turn (K4a ⑥, ``spore-434``).
+"""levain.firing.deadline — the WALL-CLOCK BOUND on one turn (K4a ⑥, ``intention-434``).
 
 **The defect this closes.** ``--max-iterations`` bounds agent STEPS, not time. A turn that hangs
 inside ONE step — a stalled model call to a cloud endpoint, a socket with no read timeout — never
@@ -52,7 +52,7 @@ process exit belongs to whoever OWNS the process, so :class:`TurnDeadline` is ar
 driver (:func:`levain.run.run_task`), never by :meth:`levain.session.EntitySession.run_turn` on
 every caller's behalf. ``EntitySession`` is the SHARED long-lived API — K1 part 2's ``/turn`` route
 will hold many sessions in ONE process, and a session object that can kill the interpreter because
-one of N turns stalled is exactly the process-global footgun ``spore-438`` exists to name. A
+one of N turns stalled is exactly the process-global footgun ``intention-438`` exists to name. A
 threaded server bounds a turn by cancelling that conversation, not by taking the process down; the
 session's only job here is to CLASSIFY a timeout correctly when one reaches it.
 

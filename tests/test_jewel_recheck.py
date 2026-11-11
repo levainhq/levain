@@ -1,5 +1,5 @@
 """Linux: before every command the confined shell checks that the disk still matches the mounts it was
-started with, and closes if not (spore-1312 rec C, ruled by Phill 2026-10-03, widened by its L3)."""
+started with, and closes if not (intention-1312 rec C, ruled by Phill 2026-10-03, widened by its L3)."""
 
 from __future__ import annotations
 

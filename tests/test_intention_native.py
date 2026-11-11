@@ -1,4 +1,4 @@
-"""Intention controls, S5: a native QuestionStore projects the intention a band row rings from its own spore store and acts on
+"""Intention controls, S5: a native QuestionStore projects the intention a band row rings from its own intention store and acts on
 it through the same ``intention_act`` a host offers. Temp dirs only."""
 from __future__ import annotations
 
@@ -8,15 +8,15 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
-from anneal_memory import SporeStore
-from anneal_memory.spores import spore_version
+from anneal_memory import IntentionStore
+from anneal_memory.spores import intention_version
 
 from levain import germinate as g
 from levain.cockpit.consent import ConsentError
 from levain.cockpit.verbs import dispatch
 from levain.consent import questions as questions_mod
 from levain.consent.questions import ANSWER_CHANNELS, INTENTION_CLOSE, QuestionStore
-from levain.spores import guarded_spore_store
+from levain.intentions import guarded_intention_store
 from levain.writes import EditError
 from tests.test_cockpit_list_panel import CRED, INSTALL_CLASS, NOW, Rig, TODAY
 
@@ -41,34 +41,34 @@ def _wall_clock_far_away(monkeypatch):
 def _install(tmp_path: Path):
     root = tmp_path / "inst"
     (root / ".levain").mkdir(parents=True)
-    spores = root / ".levain" / "memory.spores.json"
+    intentions = root / ".levain" / "memory.spores.json"
     qdir = tmp_path / "q"
     qdir.mkdir(mode=0o700)
-    return root, spores, qdir
+    return root, intentions, qdir
 
 
 def _ringing(tmp_path: Path, *, today: date = date(2026, 11, 7), text: str = "renew the thing", typ: str = "task"):
     """An install whose agenda has fired into a band row: germinate ran, so the row is open and the agenda is stamped."""
-    root, spores, qdir = _install(tmp_path)
-    sp = guarded_spore_store(spores)
+    root, intentions, qdir = _install(tmp_path)
+    sp = guarded_intention_store(intentions)
     sid = sp.add(type=typ, text=text, disposition="agenda", next="2026-11-06")["id"]
-    res = g.germinate(spores, qdir, install=root, today=today)
+    res = g.germinate(intentions, qdir, install=root, today=today)
     assert not res["errors"], res
     qs = QuestionStore(qdir, clock=lambda: datetime(today.year, today.month, today.day, 12, 0, tzinfo=timezone.utc))
     (q,) = qs.open_questions()
-    return root, spores, qdir, sp, sid, qs, q
+    return root, intentions, qdir, sp, sid, qs, q
 
 
-def test_the_projection_names_the_spore_a_stamped_open_agenda_rings(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+def test_the_projection_names_the_intention_a_stamped_open_agenda_rings(tmp_path: Path) -> None:
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     assert qs.intention_for(q) == sid
     plain = qs.file(agent="claude_code", agent_session_id="s", what="other", options=[("a", "A"), ("b", "B")], rec="a",
                     blocks="b", cwd=str(root))
     assert qs.intention_for(plain) is None
 
 
-def test_snooze_moves_the_spore_closes_the_row_and_the_wake_files_a_new_one(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+def test_snooze_moves_the_intention_closes_the_row_and_the_wake_files_a_new_one(tmp_path: Path) -> None:
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     said = qs.intention_act(q.id, "snooze", until="2026-11-12", channel="cockpit")
     assert "snoozed to 2026-11-12" in said
     got = sp.get(sid)
@@ -76,24 +76,24 @@ def test_snooze_moves_the_spore_closes_the_row_and_the_wake_files_a_new_one(tmp_
     closed = qs.get(q.id)
     assert closed.answer is not None and closed.answer.value == INTENTION_CLOSE + "snoozed to 2026-11-12"
     assert closed.answer.channel == "cockpit" and qs.open_questions() == []
-    assert g.germinate(spores, qdir, install=root, today=date(2026, 11, 8))["due"] == []        # not yet
-    res = g.germinate(spores, qdir, install=root, today=date(2026, 11, 12))
-    assert not res["errors"] and [o["spore_id"] for o in res["due"]] == [sid]
+    assert g.germinate(intentions, qdir, install=root, today=date(2026, 11, 8))["due"] == []        # not yet
+    res = g.germinate(intentions, qdir, install=root, today=date(2026, 11, 12))
+    assert not res["errors"] and [o["intention_id"] for o in res["due"]] == [sid]
     (again,) = qs.open_questions()
     assert again.id != q.id and qs.intention_for(again) == sid
 
 
 def test_an_ordinary_answer_still_holds_the_agendas_key(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     qs.answer(q.id, text="did it", channel="cli")
-    res = g.germinate(spores, qdir, install=root, today=date(2026, 11, 9))
+    res = g.germinate(intentions, qdir, install=root, today=date(2026, 11, 9))
     assert res["errors"] == [] and qs.open_questions() == []                # finished, not filed again
     assert sp.get(sid)["status"] != "open"
 
 
 @pytest.mark.parametrize("action,kind,words", [("done", "done", "done"), ("clear", "dropped", "dropped")])
-def test_done_and_clear_resolve_the_spore_and_close_the_row(tmp_path: Path, action, kind, words) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+def test_done_and_clear_resolve_the_intention_and_close_the_row(tmp_path: Path, action, kind, words) -> None:
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     qs.intention_act(q.id, action, channel="cockpit")
     got = sp.get(sid)
     assert got["status"] != "open" and got["resolution"]["kind"] == kind
@@ -101,20 +101,20 @@ def test_done_and_clear_resolve_the_spore_and_close_the_row(tmp_path: Path, acti
 
 
 def test_a_question_typed_intention_is_answered_or_mooted(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path, typ="question", text="what about the thing?")
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path, typ="question", text="what about the thing?")
     qs.intention_act(q.id, "clear", channel="cockpit")
     assert sp.get(sid)["resolution"]["kind"] == "mooted"
 
 
-def test_edit_changes_the_spore_text_and_leaves_the_row_open(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
-    qs.intention_act(sid, "edit", text="renew it on Friday", channel="cockpit")        # the spore id names it too
+def test_edit_changes_the_intention_text_and_leaves_the_row_open(tmp_path: Path) -> None:
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    qs.intention_act(sid, "edit", text="renew it on Friday", channel="cockpit")        # the intention id names it too
     assert sp.get(sid)["text"] == "renew it on Friday" and sp.get(sid)["germinated"]
     assert qs.get(q.id).answer is None
 
 
 def test_refusals_change_nothing(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     plain = qs.file(agent="claude_code", agent_session_id="s", what="other", options=[("a", "A"), ("b", "B")], rec="a",
                     blocks="b", cwd=str(root))
     for call in (lambda: qs.intention_act(q.id, "snooze", until="2026-11-06", channel="cockpit"),
@@ -135,16 +135,16 @@ def test_refusals_change_nothing(tmp_path: Path) -> None:
 
 
 def test_an_agenda_edited_elsewhere_still_snoozes_from_a_fresh_read(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     sp.update(sid, text="someone edited it")
-    qs.intention_act(q.id, "snooze", until="2026-11-12", channel="cockpit")       # a fresh read of the spore: lands
+    qs.intention_act(q.id, "snooze", until="2026-11-12", channel="cockpit")       # a fresh read of the intention: lands
     assert sp.get(sid)["next"] == "2026-11-12"
 
 
 def _rig_with_native(tmp_path: Path):
     rig = Rig(tmp_path, band=False, board=False)
-    spores = rig.root / ".levain" / "memory.spores.json"
-    qs = QuestionStore(rig.qdir, clock=lambda: NOW, spores_json=spores)
+    intentions = rig.root / ".levain" / "memory.spores.json"
+    qs = QuestionStore(rig.qdir, clock=lambda: NOW, intentions_json=intentions)
     q, _ = qs.file_once(agent="claude_code", key="levain-germinate:k1", what="Due 11-08: renew the thing (sid)",
                         options=[("done", "Done")], rec="done", blocks="b", cwd=str(rig.root), held_by=ANSWER_CHANNELS)
     plain = qs.file(agent="claude_code", agent_session_id="s", what="Ship it?", options=[("a", "A"), ("b", "B")], rec="a",
@@ -169,7 +169,7 @@ def test_the_cockpit_offers_a_native_ringing_row_the_four_and_a_plain_row_its_an
     assert {a["verb"] for a in dec[f"question:{plain.n}"]["actions"]} == {"question_answer"}
     lst = rig.rows()
     assert {a["verb"] for a in lst[f"band:{q.id}"]["actions"]} == FOUR
-    assert f"spore:{sid}" not in lst                                            # one row for the intention
+    assert f"intention:{sid}" not in lst                                            # one row for the intention
 
 
 def test_a_native_snooze_from_the_list_leaves_the_band_and_shows_the_agenda_with_its_wake(tmp_path: Path) -> None:
@@ -194,32 +194,32 @@ def test_a_native_clear_from_decisions_needs_its_confirm(tmp_path: Path) -> None
 # --- fix round 1 ---------------------------------------------------------------------------------------------------------
 
 
-def test_the_store_offers_the_spores_own_words_for_the_edit_field(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path, text="renew the thing")
+def test_the_store_offers_the_intentions_own_words_for_the_edit_field(tmp_path: Path) -> None:
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path, text="renew the thing")
     assert q.what != "renew the thing"                            # the row reads as the band filed it ("Due ...: ...")
     assert questions_mod.intention_text_of(qs, q) == "renew the thing"
 
 
 def test_an_unchanged_edit_writes_nothing(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path, text="renew the thing")
-    before = spore_version(sp.get(sid))
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path, text="renew the thing")
+    before = intention_version(sp.get(sid))
     qs.intention_act(q.id, "edit", text="renew the thing", channel="cockpit")
-    assert spore_version(sp.get(sid)) == before and sp.get(sid)["text"] == "renew the thing"
+    assert intention_version(sp.get(sid)) == before and sp.get(sid)["text"] == "renew the thing"
 
 
 def test_an_edit_is_read_back_at_once_whatever_the_file_clock_says(tmp_path: Path) -> None:
     """A filesystem whose clock is coarser than two writes (G1, D3): the store's own write forgets what it had read."""
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path, text="renew the thing")
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path, text="renew the thing")
     assert questions_mod.intention_text_of(qs, q) == "renew the thing"     # read, and kept while the file looks unchanged
-    st = spores.stat()
+    st = intentions.stat()
     qs.intention_act(q.id, "edit", text="RENEW the thing", channel="cockpit")    # same length
-    os.utime(spores, ns=(st.st_atime_ns, st.st_mtime_ns))
-    assert spores.stat().st_size == st.st_size
+    os.utime(intentions, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert intentions.stat().st_size == st.st_size
     assert questions_mod.intention_text_of(qs, q) == "RENEW the thing"
 
 
 def test_a_snooze_to_today_or_a_malformed_time_reads_in_plain_words(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     with pytest.raises(ConsentError) as exc:
         qs.intention_act(q.id, "snooze", until="2026-11-07", channel="cockpit")
     assert str(exc.value) == "pick a later day"
@@ -230,7 +230,7 @@ def test_a_snooze_to_today_or_a_malformed_time_reads_in_plain_words(tmp_path: Pa
 
 
 def test_a_moved_intention_is_refused_as_stale_and_a_bad_date_is_not(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     with pytest.raises(ConsentError) as bad:
         qs.intention_act(q.id, "snooze", until="2026-11-01", channel="cockpit")
     assert not getattr(bad.value, "stale", False)
@@ -239,13 +239,13 @@ def test_a_moved_intention_is_refused_as_stale_and_a_bad_date_is_not(tmp_path: P
         qs.intention_act(q.id, "done", channel="cockpit")
     assert getattr(gone.value, "stale", False) is True
     with pytest.raises(ConsentError) as gone2:
-        qs.intention_act(sid, "clear", channel="cockpit")             # by the spore id: it rings no open row now
+        qs.intention_act(sid, "clear", channel="cockpit")             # by the intention id: it rings no open row now
     assert getattr(gone2.value, "stale", False) is True
 
 
 @pytest.mark.parametrize("action", ["snooze", "done", "clear"])
 def test_a_row_that_cannot_be_closed_after_the_reminder_moved_reports_the_act(tmp_path: Path, monkeypatch, action) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     real = QuestionStore._record
 
     def failing(conn, qq, kind, value, channel, stamp):
@@ -261,7 +261,7 @@ def test_a_row_that_cannot_be_closed_after_the_reminder_moved_reports_the_act(tm
 
 
 def test_an_answer_landing_first_leaves_the_reminder_untouched(tmp_path: Path) -> None:
-    root, spores, qdir, sp, sid, qs, q = _ringing(tmp_path)
+    root, intentions, qdir, sp, sid, qs, q = _ringing(tmp_path)
     QuestionStore(qdir, clock=lambda: RUN_DAY).answer(q.id, text="did it", channel="phone")   # the phone, a moment before
     with pytest.raises(ConsentError) as exc:
         qs.intention_act(q.id, "clear", channel="cockpit")

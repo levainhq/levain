@@ -16,7 +16,7 @@
   // The kernel's own built-in panel ids and the native component each feeds. A panel with any other
   // id (or kind) is a downstream's and takes the generic path. A Map: ids come from the wire, and an
   // id like "constructor" or "__proto__" must never reach an object's prototype.
-  const NATIVE = new Map([["tray", "tray"], ["loops", "spores"], ["episodes", "episodes"],
+  const NATIVE = new Map([["tray", "tray"], ["loops", "intentions"], ["episodes", "episodes"],
     ["edits", "edits"], ["health", "health"], ["graph", "graph"], ["crystals", "crystals"], ["wraps", "wraps"]]);
   // The /1 kind names the kernel normalises to the /2 ones; a payload from an older kernel may still carry them.
   const ALIAS = { "triage-list": "list", metric: "status-dots", visual: "ambient", prose: "brief" };
@@ -157,7 +157,7 @@
     return f ? f(b.value) : b.kind + " " + b.value;
   }
 
-  // "spore:spore-12" -> "spore-12": the source-scoped row id back to the id the components show
+  // "intention:intention-12" -> "intention-12": the source-scoped row id back to the id the components show
   function bare(id) { const i = String(id).indexOf(":"); return i < 0 ? String(id) : String(id).slice(i + 1); }
 
   // a row's age as its kernel badge words it ("12d old"), else empty
@@ -176,29 +176,29 @@
   // row does not offer the action
   function kindsOf(actions, verb) {
     for (const a of actions) {
-      if (a && a.verb === verb && isObj(a.options) && Array.isArray(a.options.spore_kind)) {
-        return a.options.spore_kind.filter((k) => typeof k === "string");
+      if (a && a.verb === verb && isObj(a.options) && Array.isArray(a.options.intention_kind)) {
+        return a.options.intention_kind.filter((k) => typeof k === "string");
       }
     }
     return [];
   }
 
   // the stores a List row can come from (the `surface` facet): the kernel names them, the page only labels and filters by them
-  const LIST_SURFACES = ["band", "board", "spore", "talk", "drop"];
+  const LIST_SURFACES = ["band", "board", "intention", "talk", "drop"];
   const HIDDEN_TEXT = "contains hidden characters; edit with the CLI";
   // a band or board row keeps its title as the primary clause (the body is what it blocks / its state, shown beside it); every other row reads body-first
   function rowTextOf(row, f) {
     const foreign = f.surface === "band" || f.surface === "board";
     return foreign ? (row.title || row.body) : (row.body || row.title);
   }
-  function sporeOf(pid, row, groupTitles, hidden, today) {
+  function intentionOf(pid, row, groupTitles, hidden, today) {
     const f = row.facets || {};
     const t = targetOf(pid, row);
     return Object.assign({
-      id: bare(row.id), age: ageOf(row), age_days: Number.isInteger(f.age_days) ? f.age_days : null, type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
+      id: bare(row.id), age: ageOf(row), age_days: Number.isInteger(f.age_days) ? f.age_days : null, type: f.intention_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
       disposition: f.disposition, text: rowTextOf(row, f),
       support: LIST_SURFACES.indexOf(f.surface) >= 0 && (f.surface === "band" || f.surface === "board") && row.title && row.body && row.title !== row.body ? row.body : null, next: f.due || null, today: typeof today === "string" ? today : null,
-      descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
+      descend_kinds: kindsOf(t.actions, "intention_close"), ascend_kinds: kindsOf(t.actions, "intention_promote"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
       // the List's facets (a panel that sends no `surface` is the old Tray and draws as before): which store the row comes from
       // and what the kernel computed about it. The page reads these, never derives them (no date maths on `fires`, no grammar).
@@ -395,7 +395,7 @@
                             later: typeof f.question_later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(f.question_later) ? f.question_later : "",
                             laterWords: typeof f.question_later === "string" && /^\d{4}-\d{2}-\d{2}$/.test(f.question_later) && typeof f.question_later_words === "string" && f.question_later_words.length <= 40 ? f.question_later_words : "",
                             sign: signOf(f),
-                            // the spore a row rings, and only the actions the kernel offered on it: the four controls draw from these
+                            // the intention a row rings, and only the actions the kernel offered on it: the four controls draw from these
                             intention: typeof f.question_intention === "string" && f.question_intention ? f.question_intention : "",
                             intentionActions: (Array.isArray(r.actions) ? r.actions : []).filter((a) => a && typeof a.verb === "string" && a.verb.indexOf("intention_") === 0) };
         }
@@ -718,7 +718,7 @@
       // the store line is the kernel's home-relative label, never an absolute path; no label, no line
       paths: ent.store ? { episodic_db: ent.store } : { omitted: true }, scope: ent.governance, entity_name: ent.name,
       brand_wordmark: ent.wordmark, brand_model: ent.model,
-      health: null, graph: null, crystal_index: [], open_spores: [], tray: [], episodes: [],
+      health: null, graph: null, crystal_index: [], open_intentions: [], tray: [], episodes: [],
       sections: [], config_docs: [], wraps: [], recent_edits: [], state: null, jar: ent.jar,
       layout: [], errors: view_errors, extra_panels: Object.create(null), writable: false, write_token_required: false,
       // the write surface: the transport's own flags, the verb heads, and every target a write names. A
@@ -822,9 +822,9 @@
         view.targets.rows[r.id] = targetOf(pid, r);
       }
       if ((rowsAct || pActions.length) && (nat === "tray" || nat === "loops" || nat === "episodes")) entry.edit_class = "B";
-      const lists = { tray: "tray", loops: "open_spores" };
+      const lists = { tray: "tray", loops: "open_intentions" };
       if ((nat === "tray" || nat === "loops") && (panel.kind === "triage-list" || panel.kind === "list")) {
-        view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows, panel.today));
+        view[lists[pid]] = rows.map((r) => intentionOf(pid, r, groupTitles, hiddenRows, panel.today));
         if (nat === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
           // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
           const named = head.views.filter((v) => isObj(v) && typeof v.id === "string" && Array.isArray(panel.view_rows[v.id]));
@@ -2375,14 +2375,14 @@
   }
   // The Work lens's open loop: its row in the Open loops panel (on the tab that shows that panel), scrolled to and lit.
   // Finds the row first: with no such row on the page nothing moves and the caller says so (false); null when an unsaved edit would not let it unfold; "hidden" for any other failure.
-  function openLoop(sporeId) {
+  function openLoop(intentionId) {
     const L = root.LevainLoops;
     if (!L) return false;
-    const row = L.find(sporeId);
+    const row = L.find(intentionId);
     if (!row) return false;
     const panel = row.closest(".panel");
     if (panel) revealTab(panel);
-    if (L.go(sporeId)) return true;
+    if (L.go(intentionId)) return true;
     // null = an unsaved edit refused the unfold; "hidden" = the row is there but could not be shown; false = not in the panel
     const why = typeof L.why === "function" ? L.why() : "";
     return why === "edit" ? null : why === "absent" ? false : "hidden";

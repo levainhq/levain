@@ -1,4 +1,4 @@
-"""levain.firing.binding — the ONE per-conversation binding (spore-438).
+"""levain.firing.binding — the ONE per-conversation binding (intention-438).
 
 A conversation serves one entity, is driven in one mode, and is fenced by one crown-jewels floor.
 :class:`ConversationBinding` holds all three, is created ONCE (when the session opens, before its agent
@@ -11,7 +11,7 @@ Why data and not a lookup: the SDK resolves a tool as ``create(conv_state=..., *
 (``openhands/sdk/tool/registry.py``, ``_resolver_from_subclass``), so a spec's ``params`` is a
 per-AGENT channel into the factory; ``test_confined_file_tool_lands_on_the_built_agent`` fails if an
 SDK bump stops delivering it.
-An earlier design (``seat/1002-spore438``) treated ``conv_state`` as the only channel and so kept
+An earlier design (``seat/1002-intention438``) treated ``conv_state`` as the only channel and so kept
 process-global registries keyed by it; three review rounds found new defects in that machinery each
 time, so the machinery was deleted rather than guarded again.
 
@@ -235,11 +235,11 @@ class ConversationBinding:
             deny_files=cfg.deny_files,
             extra_deny_read_write=cfg.deny_subtrees,
             deny_standard_creds=deny_creds,
-            # spore-725. NOT drive-resolved: a reachable container daemon is a total bypass in every
+            # intention-725. NOT drive-resolved: a reachable container daemon is a total bypass in every
             # drive mode, so a watching operator is no mitigation.
             allow_container_sockets=cfg.allow_container_sockets,
-            # spore-755. Both ssh modes; the only switch is the operator opt-out. The residuals this
-            # does not close are documented on levain.firing.confinement (spore-1005).
+            # intention-755. Both ssh modes; the only switch is the operator opt-out. The residuals this
+            # does not close are documented on levain.firing.confinement (intention-1005).
             deny_localhost_outbound=(not cfg.allow_localhost_outbound),
         )
         if hands is not None and Path(workspace).expanduser().resolve() != hands.workspace:

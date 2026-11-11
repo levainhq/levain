@@ -17,13 +17,13 @@ harness's own consent surfaces are the driver's. A driver returns each outcome a
 OPERATOR registered at startup, and it sends message text. Everything that shapes the agent comes
 from the operator's command line and from :meth:`EntitySession.open`, which builds the agent itself
 through ``build_entity_agent``. This is the K1-part-2 requirement of the approved binding design
-(``spore-438``, 2026-10-02): the crown-jewels floor lives in the hands' tool-spec params, so a
+(``intention-438``, 2026-10-02): the crown-jewels floor lives in the hands' tool-spec params, so a
 client-supplied spec would be a client writing its own floor. There is no code path here that
 accepts one, which is a stronger claim than a validator that refuses one.
 
 **The drive mode is ``headless``, decided by the server, and a chat token does not change that.**
 The binding design (section 7.1) gives ``interactive`` to an *authenticated human at a chat client*.
-The routes take a per-launch chat token (``spore-1310``), but a token authenticates a holder, not a
+The routes take a per-launch chat token (``intention-1310``), but a token authenticates a holder, not a
 person: whatever read it from the server's output (a script, a supervisor, a log reader) can drive a
 session, and activity is pull-only, so nothing guarantees a human reads it. The precondition is not
 met, so the server does not claim it, and a client that presents the token does not earn

@@ -4,7 +4,7 @@ band-only hook entry those hooks run (``python -m levain.band_hook <Event>``).
 The band belongs to the operator, not to one install: a session in any directory should show what waits on him.
 An install's hooks wire it only inside that install, so an opt-in step writes THREE band-only hooks (SessionStart,
 UserPromptSubmit, Stop) into the user-level Claude Code settings (``$CLAUDE_CONFIG_DIR`` or ``~/.claude``). They carry
-no posture, spores, crystal recall or consent: only :func:`levain.band_view.hook_contract`, ``hook_prompt`` and
+no posture, intentions, crystal recall or consent: only :func:`levain.band_view.hook_contract`, ``hook_prompt`` and
 ``hook_stop`` (the one renderer). The hooks STAND DOWN, printing nothing and taking no view, when the install whose
 hooks the session loads has its band wired for that session (:func:`inside_wired_install`: that install's own hooks
 show it, one band, never two), for an autonomous seat, and for a headless session Levain did not launch
@@ -284,7 +284,7 @@ def install(env: Mapping[str, str] | None = None, python: str | None = None,
         return 1, (f"levain band hooks install: refused: the receipt {rp} could not be written ({exc}); {path} was "
                    f"put back as it was")
     return 0, (f"levain band hooks install: wrote SessionStart, UserPromptSubmit and Stop to {path}\n"
-               f"  band only (no posture, spores, crystal recall or consent). They stand down where an install's own "
+               f"  band only (no posture, intentions, crystal recall or consent). They stand down where an install's own "
                f"band hooks are wired for the session, for autonomous seats, and in a headless session (`claude -p`) "
                f"Levain did not launch. The Stop hook may hold a turn once to have the band reprinted.\n"
                f"  interpreter: {python} (recorded; `levain update` re-writes it after an upgrade)\n"

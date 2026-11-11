@@ -7,13 +7,13 @@ MCP App — a sandboxed HTML view the operator reads without leaving the chat.
 
 It is a thin port ON PURPOSE. The compounding value is the governed cargo
 underneath (anneal's developmental memory — health, associations, crystals,
-spores); the MCP-Apps rails are commodity and disposable, so this wrapper stays
+intentions); the MCP-Apps rails are commodity and disposable, so this wrapper stays
 minimal and the data layer (the already-built ``SubstrateView``) does the work.
 
 Three properties carry over from the CLI slice unchanged:
 - **read-only is STRUCTURAL** — the server declares ONLY read tools and ZERO
   write tools. The host iframe can call only declared tools, so a steering verb
-  (``:clear`` a spore, ascend a pattern) is *physically uncallable*, not merely
+  (``:clear`` an intention, ascend a pattern) is *physically uncallable*, not merely
   disciplined-against. This is the ``govern_the_seam`` shape at the protocol
   layer: the lintel, not the hallway. Slice 2 adds write verbs ONLY behind an
   explicit approval boundary; until then the surface cannot mutate anything.
@@ -181,7 +181,7 @@ def build_app(paths: AnnealPaths, *, name: str = "Levain substrate") -> "FastMCP
             "Render this partnership entity's whole anneal substrate — memory "
             "health (has the store committed a wrap, and when was the last?), the "
             "association graph, the crystallized-pattern index, open prospective "
-            "loops (spores), and the State / Active-Threads narrative — as an "
+            "loops (intentions), and the State / Active-Threads narrative — as an "
             "in-host dashboard. Read-only: it inspects, it never changes anything."
         ),
         meta=_ui_resource_meta(),

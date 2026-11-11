@@ -300,7 +300,7 @@ def test_waiting_and_stalled_are_two_states_and_unattached_work_is_never_a_guess
     assert all(t["cost"] == {"usd": None, "tokens": None, "source": None} for t in v["tasks"])
     assert v["conflicts"] == [] and v["counts"]["tokens_today"] is None and v["counts"]["tokens_read"] == 0   # no transcript on this install: unknown, named
     # the open loop from the install is a task
-    assert any(t["kind"] == "spore" and t["label"] == "a loop" for t in v["tasks"])
+    assert any(t["kind"] == "intention" and t["label"] == "a loop" for t in v["tasks"])
     assert {g["label"] for g in v["groups"] if g["id"].startswith("dir:")} >= {"wait", "stall"}
     wire = json.dumps(v)
     assert "SECRET-WORDS" not in wire and "rm -rf" not in wire and "SECRET-LOG-WORDS" not in wire
@@ -698,15 +698,15 @@ def test_an_open_loop_is_running_only_with_a_worker_never_by_recent_touch():
     from types import SimpleNamespace
 
     today = datetime.now(timezone.utc).date()
-    fresh = SimpleNamespace(id="spore-1", text="touched today", seen=today.isoformat(), created=today.isoformat())
-    old = SimpleNamespace(id="spore-2", text="touched long ago", seen="2020-01-01", created="2020-01-01")
-    undated = SimpleNamespace(id="spore-3", text="never dated", seen=None, created=None)
-    tasks = topo._spore_tasks([fresh, old, undated])
-    # a spore links no session, so no worker is ever on it: a loop nobody is on is OPEN (an age and a heat), never STUCK (a live worker gone silent)
+    fresh = SimpleNamespace(id="intention-1", text="touched today", seen=today.isoformat(), created=today.isoformat())
+    old = SimpleNamespace(id="intention-2", text="touched long ago", seen="2020-01-01", created="2020-01-01")
+    undated = SimpleNamespace(id="intention-3", text="never dated", seen=None, created=None)
+    tasks = topo._intention_tasks([fresh, old, undated])
+    # an intention links no session, so no worker is ever on it: a loop nobody is on is OPEN (an age and a heat), never STUCK (a live worker gone silent)
     assert [t["state"] for t in tasks] == ["open", "open", "open"]
     assert all(t["workers"] == [] for t in tasks)
     # the recent-touch heuristic is gone, not renamed
-    assert not hasattr(topo, "SPORE_QUIET_DAYS")
+    assert not hasattr(topo, "INTENTION_QUIET_DAYS")
 
 
 # --- F12a fix 2, lane B: one wire normaliser, empty-but-blind, workers, unattached, group ids, rate ---------------

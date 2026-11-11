@@ -119,7 +119,7 @@ def test_an_attached_source_shows_as_open_with_its_own_versions_beside_broker_ro
     assert any("broker prefix" in s["reason"] and s["count"] == 1 for s in p["skipped"])
     assert p["count"] == p["actionable_count"] == 2
     # a pending: titled from its record, versioned over (state, expires_at), cancel at its own tier
-    assert rows[pend]["title"] == "spore_update on spore-1"
+    assert rows[pend]["title"] == "intention_update on intention-1"
     assert rows[pend]["facets"]["pending_tier"] == "T2" and rows[pend]["facets"]["principal"] == PHONE
     (act,) = rows[pend]["actions"]
     assert act["verb"] == "pending_cancel" and act["tier"] == "T2" and act["gesture"] == "direct-reported"
@@ -133,7 +133,7 @@ def test_an_attached_source_shows_as_open_with_its_own_versions_beside_broker_ro
     assert isinstance(ck.read_one("decisions", "pend:planted"), Absent)
     # the text surface draws the queue, never the history
     lines = "\n".join(t for _s, t in text.render_lines(text.snapshot(ck), now=NOW))
-    assert "Waiting on a signature (1)" in lines and "spore_update on spore-1" in lines
+    assert "Waiting on a signature (1)" in lines and "intention_update on intention-1" in lines
     assert "Outcomes" not in lines and "EXPIRED" not in lines
 
 
@@ -187,7 +187,7 @@ def test_edits_with_no_ledger_shows_the_journal_fire(tmp_path):
     assert p["status"] == "ok", p
     (row,) = p["rows"]
     assert row["id"] == f"fire:{pid}:0"
-    assert row["facets"] == {"edit_kind": "spore_update", "at": "2026-10-10T12:01:00.000000Z", "undoable": False}
+    assert row["facets"] == {"edit_kind": "intention_update", "at": "2026-10-10T12:01:00.000000Z", "undoable": False}
     assert row["provenance"] is None               # a fire: row is history; only tomb: rows carry a label (L2 F2)
     # who made the edit, in words (the surface's name), never the audit string "token:phone:1"
     assert row["title"].startswith("edited ") and row["title"].endswith(", from the phone") and "token:" not in row["title"]
@@ -220,7 +220,7 @@ def test_a_journal_fault_keeps_the_ledger_rows_partial_and_both_failing_is_a_fau
     assert p["status"] == "error" and "broker edits unreadable: RuntimeError: journal busy" in p["error"]
     ledger = rig.src.write_scope.ledger_root / "edits.jsonl"
     ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_text('{"id": "e1", "kind": "spore", "action": "touch", "ts": "2026-10-10T11:00:00+00:00"}\n')
+    ledger.write_text('{"id": "e1", "kind": "intention", "action": "touch", "ts": "2026-10-10T11:00:00+00:00"}\n')
     p = rig.ck.panel("edits", credential_class="token")
     assert p["status"] == "partial" and [r["id"] for r in p["rows"]] == ["edit:e1"]
     assert [s["reason"] for s in p["skipped"]] == ["broker edits unreadable: RuntimeError: journal busy"]

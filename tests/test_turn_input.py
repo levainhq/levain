@@ -1,4 +1,4 @@
-"""levain.turn_input — the TURN BOUNDARY (spore-373 blocker [1]).
+"""levain.turn_input — the TURN BOUNDARY (intention-373 blocker [1]).
 
 The defect under test is not cosmetic: reading one LINE as one TURN made an entity read its
 own 11-line specification as an 11-turn DIALOGUE, apologize for corrections that were never

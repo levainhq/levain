@@ -1,4 +1,4 @@
-"""The operator's PROJECT memory is in the universal floor (spore-1308, ruled by Phill 2026-10-03).
+"""The operator's PROJECT memory is in the universal floor (intention-1308, ruled by Phill 2026-10-03).
 
 ``~/.anneal-projects`` (project stores + flow's derive-trust file) is denied read+write like
 ``~/.anneal-memory``; ``$ANNEAL_MEMORY_DERIVE_TRUST``, when set at policy build, has its file

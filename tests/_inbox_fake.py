@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from anneal_memory.spores import normalize_spore_field
+from anneal_memory.spores import normalize_intention_field
 
 from levain.cockpit.effects import (
     ApplyOutcome,
@@ -112,9 +112,9 @@ class FakeInbox:
 
 def send_inbox_effect(params: Mapping[str, Any], *, origin_key: str) -> Effect:
     body, to = params.get("body"), params.get("for", "cli")
-    if not isinstance(body, str) or not normalize_spore_field(body):
+    if not isinstance(body, str) or not normalize_intention_field(body):
         raise ValueError("a note needs a body")
-    changes = {"body": normalize_spore_field(body), "for": to}
+    changes = {"body": normalize_intention_field(body), "for": to}
     return Effect(PREFIX + origin_key, INBOX, {"absent": True}, changes, dict(changes), FIELDS, ())
 
 

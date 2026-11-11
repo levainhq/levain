@@ -1,4 +1,4 @@
-"""spore-900 (the activation install receipt) and spore-840 (doctor's distinct exit code
+"""intention-900 (the activation install receipt) and intention-840 (doctor's distinct exit code
 for a post-upgrade step still pending), both ruled by Phill 2026-09-13.
 
 Each test names the mutation it exists to kill.
@@ -46,11 +46,11 @@ def _layer(root: Path) -> Path:
     return root
 
 
-# ---------- spore-900: the receipt ----------
+# ---------- intention-900: the receipt ----------
 
 
 def test_the_receipt_records_INSTALLED_and_SOURCE_hashes_per_file(tmp_path: Path):
-    """Both maps (Diogenes 2026-08-12 HIGH against spore-492): the installed hash answers
+    """Both maps (Diogenes 2026-08-12 HIGH against intention-492): the installed hash answers
     "changed since install"; the source hash is what a package-moved question needs.
 
     MUTATION: hash the source into `installed` (or vice versa) -> the hook assertions fail,
@@ -96,7 +96,7 @@ def test_the_receipt_is_NOT_written_for_a_swap_that_failed(tmp_path: Path, monke
     '{"schema": 1, "files": {}}',
 ])
 def test_a_damaged_or_empty_receipt_is_UNKNOWN_never_pristine(tmp_path: Path, damage: str):
-    """⛔ Absent / corrupt / empty is never OK (spore-492 HIGH; ruling B's "unproven").
+    """⛔ Absent / corrupt / empty is never OK (intention-492 HIGH; ruling B's "unproven").
 
     MUTATION: have the reader return a partial map, or `{}` as ok -> a pristine-looking
     hook is copied silently instead of named as unknown."""
@@ -156,7 +156,7 @@ def test_a_FAILED_receipt_write_removes_the_previous_receipt(tmp_path: Path, mon
     assert [m for m in said if "could not record the activation install receipt" in m], said
 
 
-# ---------- spore-840: exit code precedence ----------
+# ---------- intention-840: exit code precedence ----------
 
 
 def _stub_doctor(monkeypatch, tmp_path: Path, results: list[CheckResult]) -> Path:
@@ -189,7 +189,7 @@ def test_doctor_exit_precedence_is_broken_over_pending_over_healthy(
 ):
     """MUTATION: return EXIT_UPGRADE_PENDING whenever any failure is pending -> the mixed
     case exits 6 and a broken install reads as routine. MUTATION: drop the pending branch
-    -> the pending case exits 1 as before spore-840."""
+    -> the pending case exits 1 as before intention-840."""
     install = _stub_doctor(monkeypatch, tmp_path, results)
     assert doctor.run_doctor(install) == expected
     out = capsys.readouterr().out
@@ -214,7 +214,7 @@ def test_the_pending_code_does_not_collide_with_levain_run_codes():
     assert EXIT_BROKEN == 1 and EXIT_HEALTHY == 0
 
 
-# ---------- spore-840: which checks are pending ----------
+# ---------- intention-840: which checks are pending ----------
 
 
 def test_mcp_command_OK_only_for_this_interpreter_in_module_form(tmp_path: Path):
@@ -224,7 +224,7 @@ def test_mcp_command_OK_only_for_this_interpreter_in_module_form(tmp_path: Path)
 
 
 def test_a_pre_751_mcp_registration_is_PENDING_not_broken(tmp_path: Path):
-    """The shape every install written before spore-751 carries: an anneal-memory script.
+    """The shape every install written before intention-751 carries: an anneal-memory script.
 
     MUTATION: drop `upgrade_pending=True` -> every existing install exits 1 on upgrade."""
     script = tmp_path / "anneal-memory"
@@ -521,7 +521,7 @@ def test_a_non_anneal_script_command_is_BROKEN_not_pending(tmp_path: Path):
     assert not r.ok and not r.upgrade_pending
 
 
-# ---------- spore-861 ruling B: receipt-gated pruning ----------
+# ---------- intention-861 ruling B: receipt-gated pruning ----------
 
 
 def _trees(install: Path) -> list[Path]:
@@ -839,7 +839,7 @@ def test_EDITED_and_UNPROVEN_stale_hooks_are_both_named(tmp_path: Path):
 
 
 def test_receipt_json_is_a_stable_shape(tmp_path: Path):
-    """The receipt is read at prune time by spore-861 (ruling B); pin its top level."""
+    """The receipt is read at prune time by intention-861 (ruling B); pin its top level."""
     base = _layer(tmp_path / "base")
     install = tmp_path / "install"
     _copy_activation_tree([base], install / "activation", base_activation=base)

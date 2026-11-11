@@ -123,7 +123,7 @@ def _make_install(tmp_path: Path) -> Path:
     (seed / "origin.md").write_text(ORIGIN, encoding="utf-8")
     (seed / "partnership.md").write_text(CONSTITUTION, encoding="utf-8")
     (seed / "memory.md").write_text(CONSTITUTION, encoding="utf-8")
-    (seed / "spore_instructions.md").write_text(CONSTITUTION, encoding="utf-8")
+    (seed / "intention_instructions.md").write_text(CONSTITUTION, encoding="utf-8")
     (activation / "posture.md").write_text(POSTURE, encoding="utf-8")
     (activation / "recency_directives.md").write_text(RECENCY, encoding="utf-8")
     return root
@@ -750,7 +750,7 @@ class TestContinuityLockWiring:
         assert len(calls) == 1 and calls[0].endswith("memory.continuity.md")
 
     def test_state_edit_fails_closed_on_lockless_fs(self, install: Path, monkeypatch) -> None:
-        # spore-091 #2: require=True → 503 (not a silent best-effort write) when the
+        # intention-091 #2: require=True → 503 (not a silent best-effort write) when the
         # cross-process lock can't be acquired (fcntl None simulates non-POSIX / lock-less).
         import anneal_memory.store as store_module
 
@@ -787,25 +787,25 @@ class TestContinuityLockWiring:
         assert calls == []
 
 
-# --- Class-B lifecycle verbs (Slice 2b-ii): spores + episode tombstone -------
+# --- Class-B lifecycle verbs (Slice 2b-ii): intentions + episode tombstone -------
 
-def _add_spore(install: Path, *, stype: str = "task", text: str = "ship 2b-ii", **kw) -> str:
-    from anneal_memory.spores import SporeStore
+def _add_intention(install: Path, *, stype: str = "task", text: str = "ship 2b-ii", **kw) -> str:
+    from anneal_memory.spores import IntentionStore
 
-    s = SporeStore(install / ".levain" / "memory.spores.json").add(type=stype, text=text, **kw)
+    s = IntentionStore(install / ".levain" / "memory.spores.json", id_prefix="intention").add(type=stype, text=text, **kw)
     return str(s["id"])
 
 
 def _legacy_seed(install: Path, text: str, disposition: str) -> str:
     """A pre-TS-1 row: a retired handoff / Keep note can no longer be WRITTEN through the seam, so a
     legacy row is planted straight in the store (what an install carries from before the retirement)."""
-    return _add_spore(install, stype="thought", text=text, disposition=disposition)
+    return _add_intention(install, stype="thought", text=text, disposition=disposition)
 
 
-def _spore_store(install: Path):
-    from anneal_memory.spores import SporeStore
+def _intention_store(install: Path):
+    from anneal_memory.spores import IntentionStore
 
-    return SporeStore(install / ".levain" / "memory.spores.json")
+    return IntentionStore(install / ".levain" / "memory.spores.json", id_prefix="intention")
 
 
 def _add_episode(install: Path, *, content: str = "built the writable handle") -> str:
@@ -816,47 +816,47 @@ def _add_episode(install: Path, *, content: str = "built the writable handle") -
     return ep.id
 
 
-class TestSporeVerbs:
+class TestIntentionVerbs:
     def test_touch_is_non_destructive_and_updates_seen(self, install: Path) -> None:
-        sid = _add_spore(install)
-        res = apply_edit(_scope(install), {"kind": "spore_touch", "spore_id": sid})
+        sid = _add_intention(install)
+        res = apply_edit(_scope(install), {"kind": "intention_touch", "intention_id": sid})
         assert res["ok"] and res["action"] == "touch"
         # still open (touch never resolves) and recorded in the audit trail
-        assert any(s["id"] == sid for s in _spore_store(install).list_open())
+        assert any(s["id"] == sid for s in _intention_store(install).list_open())
         rec = recent_edits(install / ".levain")[0]
-        assert rec["kind"] == "spore_touch" and rec["source"] == f"spore:{sid}"
+        assert rec["kind"] == "intention_touch" and rec["source"] == f"intention:{sid}"
         assert rec["undoable"] is False
 
     def test_descend_requires_confirm(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_descend", "spore_id": sid, "spore_kind": "done"})
+            apply_edit(_scope(install), {"kind": "intention_close", "intention_id": sid, "intention_kind": "done"})
         assert ei.value.code == "confirm_required" and ei.value.http_status == 409
-        # refused → the spore is untouched (still open)
-        assert any(s["id"] == sid for s in _spore_store(install).list_open())
+        # refused → the intention is untouched (still open)
+        assert any(s["id"] == sid for s in _intention_store(install).list_open())
 
     def test_descend_with_confirm_composts(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         res = apply_edit(_scope(install), {
-            "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+            "kind": "intention_close", "intention_id": sid, "intention_kind": "done", "confirm": True,
         })
         assert res["ok"]
-        store = _spore_store(install)
+        store = _intention_store(install)
         assert not any(s["id"] == sid for s in store.list_open()), "composted → gone from open"
         rec = recent_edits(install / ".levain")[0]
-        assert rec["kind"] == "spore_descend" and rec["verb_kind"] == "done"
+        assert rec["kind"] == "intention_close" and rec["verb_kind"] == "done"
 
     def test_descend_bad_kind_for_type(self, install: Path) -> None:
-        sid = _add_spore(install, stype="task")  # task descend kinds = done/dropped/composted
+        sid = _add_intention(install, stype="task")  # task descend kinds = done/dropped/composted
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_descend", "spore_id": sid, "spore_kind": "answered",  # question-only
+                "kind": "intention_close", "intention_id": sid, "intention_kind": "answered",  # question-only
                 "confirm": True,
             })
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
-        assert any(s["id"] == sid for s in _spore_store(install).list_open()), "rejected → still open"
+        assert any(s["id"] == sid for s in _intention_store(install).list_open()), "rejected → still open"
 
-    # -- descend expect_disposition CAS (spore-173): the resolve FACE (compost/dismiss/remove) is
+    # -- descend expect_disposition CAS (intention-173): the resolve FACE (compost/dismiss/remove) is
     # -- chosen CLIENT-side off the rendered SNAPSHOT, so the snapshot rides the request; a mismatch
     # -- fails closed. Unlike ascend (which reads the disposition server-side for its is_note gate),
     # -- descend has NO server gate, so the client snapshot is the only guard — a direct mismatch
@@ -864,82 +864,82 @@ class TestSporeVerbs:
     def test_descend_expect_disposition_match_composts(self, install: Path) -> None:
         nid = _legacy_seed(install, "ref", "note")
         res = apply_edit(_scope(install), {
-            "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted",
+            "kind": "intention_close", "intention_id": nid, "intention_kind": "composted",
             "confirm": True, "expect_disposition": "note"})  # snapshot matches → removes
         assert res["ok"]
-        assert not any(s["id"] == nid for s in _spore_store(install).list_open())
+        assert not any(s["id"] == nid for s in _intention_store(install).list_open())
 
     def test_descend_expect_disposition_mismatch_fails_closed(self, install: Path) -> None:
         # the operator rendered this as a Keep note + chose "remove" (expect "note"), but it is a
         # live loop now — the CAS must refuse so a live cognition loop isn't composted as a note.
-        sid = _add_spore(install)  # a plain key-free loop (no disposition)
+        sid = _add_intention(install)  # a plain key-free loop (no disposition)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_descend", "spore_id": sid, "spore_kind": "composted",
+                "kind": "intention_close", "intention_id": sid, "intention_kind": "composted",
                 "confirm": True, "expect_disposition": "note"})  # stale snapshot
-        assert ei.value.code == "stale" and ei.value.http_status == 409   # spore-174: both surfaces re-read on stale
+        assert ei.value.code == "stale" and ei.value.http_status == 409   # intention-174: both surfaces re-read on stale
         assert "changed since read" in str(ei.value)
-        assert any(s["id"] == sid for s in _spore_store(install).list_open())  # NOT composted
+        assert any(s["id"] == sid for s in _intention_store(install).list_open())  # NOT composted
 
     def test_descend_loop_snapshot_normalizes_to_key_absent(self, install: Path) -> None:
         # a plain loop RENDERS as 'loop' but is stored key-absent — the server maps 'loop'→None so
         # a real loop's snapshot matches (no spurious CAS failure on the common compost path).
-        sid = _add_spore(install)  # key-free loop
+        sid = _add_intention(install)  # key-free loop
         res = apply_edit(_scope(install), {
-            "kind": "spore_descend", "spore_id": sid, "spore_kind": "composted",
+            "kind": "intention_close", "intention_id": sid, "intention_kind": "composted",
             "confirm": True, "expect_disposition": "loop"})
         assert res["ok"]
-        assert not any(s["id"] == sid for s in _spore_store(install).list_open())
+        assert not any(s["id"] == sid for s in _intention_store(install).list_open())
 
     def test_descend_without_expect_disposition_skips_cas(self, install: Path) -> None:
         # back-compat: a caller that doesn't render-snapshot (omits the key) gets no CAS — the flow
         # CLI, which is already single-flock-atomic, descends through anneal without the param.
         nid = _legacy_seed(install, "ref", "note")
         res = apply_edit(_scope(install), {
-            "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted", "confirm": True})
+            "kind": "intention_close", "intention_id": nid, "intention_kind": "composted", "confirm": True})
         assert res["ok"]
-        assert not any(s["id"] == nid for s in _spore_store(install).list_open())
+        assert not any(s["id"] == nid for s in _intention_store(install).list_open())
 
     def test_descend_expect_disposition_non_string_rejected(self, install: Path) -> None:
         # a non-string/null snapshot is a client bug → reject loud BEFORE the store, fail-closed.
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_descend", "spore_id": sid, "spore_kind": "composted",
+                "kind": "intention_close", "intention_id": sid, "intention_kind": "composted",
                 "confirm": True, "expect_disposition": 42})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
-        assert any(s["id"] == sid for s in _spore_store(install).list_open())  # untouched
+        assert any(s["id"] == sid for s in _intention_store(install).list_open())  # untouched
 
     def test_ascend_requires_ref(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project", "confirm": True,
+                "kind": "intention_promote", "intention_id": sid, "intention_kind": "project", "confirm": True,
             })
         assert ei.value.http_status == 400  # _require_str("ref") missing
 
     def test_ascend_with_ref_and_confirm(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         res = apply_edit(_scope(install), {
-            "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+            "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
             "ref": "projects/levain", "confirm": True,
         })
         assert res["ok"]
-        assert not any(s["id"] == sid for s in _spore_store(install).list_open())
+        assert not any(s["id"] == sid for s in _intention_store(install).list_open())
         rec = recent_edits(install / ".levain")[0]
-        assert rec["kind"] == "spore_ascend" and rec["ref"] == "projects/levain"
+        assert rec["kind"] == "intention_promote" and rec["ref"] == "projects/levain"
 
-    def test_unknown_spore_id(self, install: Path) -> None:
-        _add_spore(install)  # store exists, id doesn't
+    def test_unknown_intention_id(self, install: Path) -> None:
+        _add_intention(install)  # store exists, id doesn't
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_descend", "spore_id": "spore-999", "spore_kind": "done", "confirm": True,
+                "kind": "intention_close", "intention_id": "intention-999", "intention_kind": "done", "confirm": True,
             })
         assert ei.value.code == "verb_failed" and ei.value.http_status == 422
 
-    def test_no_spore_store_yet(self, install: Path) -> None:
+    def test_no_intention_store_yet(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_touch", "spore_id": "spore-001"})
+            apply_edit(_scope(install), {"kind": "intention_touch", "intention_id": "intention-001"})
         assert ei.value.code == "not_found" and ei.value.http_status == 404
 
 
@@ -948,18 +948,18 @@ class TestTrayWriteKinds:
     (set_disposition), schedule (surface_at). anneal stays blind to the taxonomy; these
     persist/clear the opaque disposition tag through the governed seam."""
 
-    # -- spore_seed (the freeform dump→seed) ----------------------------------
+    # -- intention_seed (the freeform dump→seed) ----------------------------------
     def test_seed_creates_a_tray_seed_held_out_of_cognition(self, install: Path) -> None:
-        res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "call the dentist"})
+        res = apply_edit(_scope(install), {"kind": "intention_seed", "text": "call the dentist"})
         assert res["ok"] and res["action"] == "seed"
-        sid = res["spore_id"]
-        spore = _spore_store(install).get(sid)
-        assert spore is not None
-        assert spore["disposition"] == "seed"  # a Tray item, NOT a key-free loop
-        assert spore["type"] == "thought"  # the catch-all openness of an un-sorted dump
-        assert spore["text"] == "call the dentist"
+        sid = res["intention_id"]
+        intention = _intention_store(install).get(sid)
+        assert intention is not None
+        assert intention["disposition"] == "seed"  # a Tray item, NOT a key-free loop
+        assert intention["type"] == "thought"  # the catch-all openness of an un-sorted dump
+        assert intention["text"] == "call the dentist"
         rec = recent_edits(install / ".levain")[0]
-        assert rec["kind"] == "spore_seed" and rec["source"] == f"spore:{sid}"
+        assert rec["kind"] == "intention_seed" and rec["source"] == f"intention:{sid}"
         assert rec["undoable"] is False  # verb-mediated, not file-undoable
 
     @pytest.mark.parametrize("extra", [{"target": "desk", "disposition": "agenda"}, {"next": "2026-11-09T09:00"},
@@ -967,128 +967,128 @@ class TestTrayWriteKinds:
     def test_seed_here_refuses_the_list_fields(self, install: Path, extra: dict) -> None:
         # THE LIST's create fields are the cockpit's, signed through the broker; this legacy write takes none
         with pytest.raises(EditError) as e:
-            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x", **extra})
+            apply_edit(_scope(install), {"kind": "intention_seed", "text": "x", **extra})
         assert e.value.code == "bad_verb_arg"
         assert not (install / ".levain" / "memory.spores.json").is_file()
 
     def test_seed_is_non_destructive_no_confirm_needed(self, install: Path) -> None:
         # creation never asks for confirm (unlike descend/ascend/tombstone)
-        res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})
+        res = apply_edit(_scope(install), {"kind": "intention_seed", "text": "x"})
         assert res["ok"]
 
     def test_seed_creates_the_store_when_absent(self, install: Path) -> None:
         # a fresh entity with no open loops yet: seeding plants the first one
         assert not (install / ".levain" / "memory.spores.json").is_file()
-        res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "first dump"})
+        res = apply_edit(_scope(install), {"kind": "intention_seed", "text": "first dump"})
         assert res["ok"]
         assert (install / ".levain" / "memory.spores.json").is_file()
 
     def test_seed_rejects_empty_text(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_seed", "text": "   "})
+            apply_edit(_scope(install), {"kind": "intention_seed", "text": "   "})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
 
     def test_seed_rejects_missing_text(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_seed"})
+            apply_edit(_scope(install), {"kind": "intention_seed"})
         assert ei.value.http_status == 400  # _require_str
 
     def test_seed_allows_an_explicit_tray_disposition(self, install: Path) -> None:
         res = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "pick up the modal work next session",
+            "kind": "intention_seed", "text": "pick up the modal work next session",
             "disposition": "agenda",
         })
-        assert _spore_store(install).get(res["spore_id"])["disposition"] == "agenda"
+        assert _intention_store(install).get(res["intention_id"])["disposition"] == "agenda"
 
     def test_seed_refuses_a_loop_disposition(self, install: Path) -> None:
         # you don't 'dump' a cognition loop — that's the normal add path, not the Tray
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x", "disposition": "loop"})
+            apply_edit(_scope(install), {"kind": "intention_seed", "text": "x", "disposition": "loop"})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
 
     def test_seed_refuses_unknown_disposition(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x", "disposition": "bogus"})
+            apply_edit(_scope(install), {"kind": "intention_seed", "text": "x", "disposition": "bogus"})
         assert ei.value.http_status == 422
 
     def test_seed_rejects_oversized_text(self, install: Path) -> None:
-        from levain.writes import MAX_SPORE_TEXT_BYTES
+        from levain.writes import MAX_INTENTION_TEXT_BYTES
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x" * (MAX_SPORE_TEXT_BYTES + 1)})
+            apply_edit(_scope(install), {"kind": "intention_seed", "text": "x" * (MAX_INTENTION_TEXT_BYTES + 1)})
         assert ei.value.code == "too_large" and ei.value.http_status == 413
 
     def test_seed_defaults_to_thought_type(self, install: Path) -> None:
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "untyped dump"})["spore_id"]
-        assert _spore_store(install).get(sid)["type"] == "thought"
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "untyped dump"})["intention_id"]
+        assert _intention_store(install).get(sid)["type"] == "thought"
 
     def test_seed_accepts_an_explicit_type_so_a_todo_can_be_done(self, install: Path) -> None:
         # H1: a dumped TASK must be able to descend 'done' — which a 'thought' cannot.
         # A typed capture → metabolize to a loop → the task lifecycle is intact.
         sid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "call the dentist", "type": "task",
-        })["spore_id"]
-        assert _spore_store(install).get(sid)["type"] == "task"
+            "kind": "intention_seed", "text": "call the dentist", "type": "task",
+        })["intention_id"]
+        assert _intention_store(install).get(sid)["type"] == "task"
         # metabolize the task-seed into a cognition loop, then mark it done
         apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop",
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop",
         })
         res = apply_edit(_scope(install), {
-            "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+            "kind": "intention_close", "intention_id": sid, "intention_kind": "done", "confirm": True,
         })
         assert res["ok"]  # 'done' is valid for a task — the H1 mis-type is gone
 
     def test_seed_rejects_bad_type(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_seed", "text": "x", "type": "bogus"})
+            apply_edit(_scope(install), {"kind": "intention_seed", "text": "x", "type": "bogus"})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
 
-    # -- spore_set_disposition (the AI's triage re-route) ---------------------
+    # -- intention_set_disposition (the AI's triage re-route) ---------------------
     def test_set_disposition_reroutes_within_the_tray(self, install: Path) -> None:
-        sid = res_sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
+        sid = res_sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "x"})["intention_id"]
         apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda",
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda",
         })
-        assert _spore_store(install).get(res_sid)["disposition"] == "agenda"
+        assert _intention_store(install).get(res_sid)["disposition"] == "agenda"
         rec = recent_edits(install / ".levain")[0]
-        assert rec["kind"] == "spore_set_disposition" and rec["disposition"] == "agenda"
+        assert rec["kind"] == "intention_set_disposition" and rec["disposition"] == "agenda"
 
     def test_set_disposition_loop_metabolizes_to_a_keyfree_loop(self, install: Path) -> None:
         # the triage that pulls a Tray seed INTO cognition: disposition cleared entirely
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "real loop"})["spore_id"]
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "real loop"})["intention_id"]
         apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop",
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop",
         })
-        spore = _spore_store(install).get(sid)
-        assert "disposition" not in spore  # key-free → back in cognition
+        intention = _intention_store(install).get(sid)
+        assert "disposition" not in intention  # key-free → back in cognition
 
     def test_set_disposition_reroute_within_tray_needs_no_confirm(self, install: Path) -> None:
         # seed → agenda is inbox shuffling, not a cognition demotion → no confirm
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "x"})["intention_id"]
         res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda",
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda",
         })
         assert res["ok"]
-        assert any(s["id"] == sid for s in _spore_store(install).list_open())
+        assert any(s["id"] == sid for s in _intention_store(install).list_open())
 
     # -- M1: demoting a LIVE cognition loop into the Tray is the guarded direction --
     def test_set_disposition_demote_live_loop_requires_confirm(self, install: Path) -> None:
-        sid = _add_spore(install, tier="hot", salience=3)  # a live, high-salience loop
+        sid = _add_intention(install, tier="hot", salience=3)  # a live, high-salience loop
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
             })
         assert ei.value.code == "confirm_required" and ei.value.http_status == 409
         # refused → the loop is untouched (still a key-free cognition loop)
-        assert "disposition" not in _spore_store(install).get(sid)
+        assert "disposition" not in _intention_store(install).get(sid)
 
     def test_set_disposition_demote_live_loop_with_confirm(self, install: Path) -> None:
-        sid = _add_spore(install, tier="hot")
+        sid = _add_intention(install, tier="hot")
         res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
             "confirm": True,
         })
         assert res["ok"]
-        assert _spore_store(install).get(sid)["disposition"] == "seed"
+        assert _intention_store(install).get(sid)["disposition"] == "seed"
         rec = recent_edits(install / ".levain")[0]
         assert rec["prior_disposition"] == "loop" and rec["disposition"] == "seed"
 
@@ -1099,15 +1099,15 @@ class TestTrayWriteKinds:
         # concurrent writer before the write landed, demoting a live loop with no confirm. The
         # gate now reads only CAS-/transaction-guarded fields (disposition + status); a parked
         # loop demotion is rare and confirming it costs nothing.
-        sid = _add_spore(install, tier="parked")
+        sid = _add_intention(install, tier="parked")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
             })
         assert ei.value.code == "confirm_required" and ei.value.http_status == 409
         # with confirm it goes through
         res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
             "confirm": True,
         })
         assert res["ok"]
@@ -1118,13 +1118,13 @@ class TestTrayWriteKinds:
 
     def test_set_disposition_note_to_loop_promotes(self, install: Path) -> None:
         # note→loop ACTIVATES a note into a key-free cognition loop (was refused as note-terminal
-        # pre-2026-06-23). Lineage preserved — same spore id, the tag cleared (metabolized).
+        # pre-2026-06-23). Lineage preserved — same intention id, the tag cleared (metabolized).
         sid = self._seed_note(install)
         res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
         assert res["ok"]
-        sp = _spore_store(install).get(sid)
-        assert sp["id"] == sid  # lineage: same spore, not delete+recreate
+        sp = _intention_store(install).get(sid)
+        assert sp["id"] == sid  # lineage: same intention, not delete+recreate
         assert sp.get("disposition") in (None, "loop")  # key-free loop
 
     def test_set_disposition_note_to_tray_promotes(self, install: Path) -> None:
@@ -1132,9 +1132,9 @@ class TestTrayWriteKinds:
         # OUT is a gain / lateral move, never the silent-loss demote of a LIVE loop.
         sid = self._seed_note(install)
         res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed"})
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed"})
         assert res["ok"] and res["action"] == "set_disposition"
-        assert _spore_store(install).get(sid)["disposition"] == "seed"
+        assert _intention_store(install).get(sid)["disposition"] == "seed"
 
     def test_note_promote_then_ascend_is_the_deliberate_two_step(self, install: Path) -> None:
         # The note-ascend lock MOVED, it wasn't lost. A DIRECT ascend of a note stays refused;
@@ -1145,14 +1145,14 @@ class TestTrayWriteKinds:
         # (1) a direct ascend of the note is STILL refused (the H2 guard stays)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+                "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
                 "ref": "x", "confirm": True})
         assert ei.value.code == "not_ascendable"
         # (2) activate it to a loop, THEN ascend the loop — now sanctioned, the deliberate step
         apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
         res = apply_edit(_scope(install), {
-            "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+            "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
             "ref": "projects/x", "confirm": True})
         assert res["ok"]
 
@@ -1161,7 +1161,7 @@ class TestTrayWriteKinds:
         # loop (is_loop False), so promoting it OUT lands WITHOUT a confirm (no EditError raised).
         sid = self._seed_note(install)
         res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
         assert res["ok"]
 
     # -- A': "remind me" — promote + schedule the resurface ATOMICALLY (optional surface_at) --
@@ -1171,20 +1171,20 @@ class TestTrayWriteKinds:
         # a Tray seed hidden until the date; the schedule is audited alongside the re-route.
         sid = self._seed_note(install)
         res = apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid,
+            "kind": "intention_set_disposition", "intention_id": sid,
             "disposition": "seed", "surface_at": "2026-07-01"})
         assert res["ok"]
-        sp = _spore_store(install).get(sid)
+        sp = _intention_store(install).get(sid)
         assert sp["disposition"] == "seed" and sp["next"] == "2026-07-01"
         assert recent_edits(install / ".levain")[0]["surface_at"] == "2026-07-01"
 
     def test_set_disposition_absent_surface_at_leaves_next_untouched(self, install: Path) -> None:
         # ABSENT key ≠ clear: a plain reroute must not wipe an existing alarm (the same
-        # presence-not-value rule spore_surface_at enforces, here as "leave next alone").
-        sid = _add_spore(install, disposition="seed", next="2026-07-01")
+        # presence-not-value rule intention_surface_at enforces, here as "leave next alone").
+        sid = _add_intention(install, disposition="seed", next="2026-07-01")
         apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda"})
-        assert _spore_store(install).get(sid)["next"] == "2026-07-01"  # alarm preserved
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda"})
+        assert _intention_store(install).get(sid)["next"] == "2026-07-01"  # alarm preserved
 
     def test_ascend_toctou_concurrent_flip_to_note_fails_closed(self, install: Path, monkeypatch) -> None:
         # codex L3 HIGH 2026-06-23 CLOSED: the note-ascend guard reads the disposition in a SEPARATE
@@ -1192,9 +1192,9 @@ class TestTrayWriteKinds:
         # guard's `get` to see a key-free LOOP (so it passes + reads expect=None) while the REAL
         # store holds a note. The expect_disposition CAS inside store.ascend must then REFUSE,
         # leaving the note unresolved (no reference transmuted into a false lineage).
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import IntentionStore
         sid = self._seed_note(install)  # a real note in the store
-        real_get = SporeStore.get
+        real_get = IntentionStore.get
 
         def loop_looking_get(self, sid_):  # the guard's read sees a LOOP (disposition stripped)
             d = real_get(self, sid_)
@@ -1204,39 +1204,39 @@ class TestTrayWriteKinds:
             d.pop("disposition", None)  # looks key-free → is_note False → guard passes, expect=None
             return d
 
-        monkeypatch.setattr(SporeStore, "get", loop_looking_get)
+        monkeypatch.setattr(IntentionStore, "get", loop_looking_get)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "pattern",
+                "kind": "intention_promote", "intention_id": sid, "intention_kind": "pattern",
                 "ref": "projects/x", "confirm": True})
         assert ei.value.code == "verb_failed" and "changed since read" in str(ei.value)
         monkeypatch.undo()  # read the REAL store: the note was NOT ascended
-        again = _spore_store(install).get(sid)
+        again = _intention_store(install).get(sid)
         assert again is not None and again["disposition"] == "note"  # still open, still a note
 
     def test_set_disposition_surface_at_empty_clears_the_alarm(self, install: Path) -> None:
-        # surface_at:"" clears next WHILE re-routing — symmetric with spore_surface_at's clear.
-        sid = _add_spore(install, disposition="seed", next="2026-07-01")
+        # surface_at:"" clears next WHILE re-routing — symmetric with intention_surface_at's clear.
+        sid = _add_intention(install, disposition="seed", next="2026-07-01")
         apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid,
+            "kind": "intention_set_disposition", "intention_id": sid,
             "disposition": "agenda", "surface_at": ""})
-        assert _spore_store(install).get(sid)["next"] is None
+        assert _intention_store(install).get(sid)["next"] is None
 
     def test_set_disposition_surface_at_rejects_bad_date_fail_closed(self, install: Path) -> None:
-        # the optional schedule rides the SAME validator as spore_surface_at — a bad date is
-        # rejected (user-facing "surface_at" name) BEFORE any write, so the spore is untouched.
+        # the optional schedule rides the SAME validator as intention_surface_at — a bad date is
+        # rejected (user-facing "surface_at" name) BEFORE any write, so the intention is untouched.
         sid = self._seed_note(install)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid,
+                "kind": "intention_set_disposition", "intention_id": sid,
                 "disposition": "seed", "surface_at": "2026-13-45"})
         assert ei.value.code == "bad_verb_arg" and "surface_at" in str(ei.value)
-        assert _spore_store(install).get(sid)["disposition"] == "note"  # fail-closed: unchanged
+        assert _intention_store(install).get(sid)["disposition"] == "note"  # fail-closed: unchanged
 
     def test_set_disposition_records_prior_disposition_in_audit(self, install: Path) -> None:
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "x"})["intention_id"]
         apply_edit(_scope(install), {
-            "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda",
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda",
         })
         rec = recent_edits(install / ".levain")[0]
         assert rec["prior_disposition"] == "seed" and rec["disposition"] == "agenda"
@@ -1244,10 +1244,10 @@ class TestTrayWriteKinds:
     def test_set_disposition_demote_unknown_disposition_also_gated(self, install: Path) -> None:
         # H1 (codex L3): is_loop treats an UNKNOWN disposition as in-cognition (fail-open),
         # so the demote guard must fire for it too — not only for the literal "loop".
-        sid = _add_spore(install, disposition="bogus", tier="hot")
+        sid = _add_intention(install, disposition="bogus", tier="hot")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "seed",
             })
         assert ei.value.code == "confirm_required" and ei.value.http_status == 409
 
@@ -1255,149 +1255,149 @@ class TestTrayWriteKinds:
         # H2 (codex L3): the get→update window. Force get() to return a STALE disposition
         # (what we read) while the real stored value differs (a concurrent writer changed
         # it) — the CAS in anneal's update must reject, so no write lands on stale state.
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import IntentionStore
 
         sid = _legacy_seed(install, "x", "handoff")
-        real_get = SporeStore.get
+        real_get = IntentionStore.get
 
         def stale_get(self, sid_):  # returns disposition="seed" though the store has "handoff"
             d = real_get(self, sid_)
             return {**d, "disposition": "seed"} if d else d
 
-        monkeypatch.setattr(SporeStore, "get", stale_get)
+        monkeypatch.setattr(IntentionStore, "get", stale_get)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "agenda",
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda",
             })
         assert ei.value.code == "verb_failed" and ei.value.http_status == 422
         assert "changed since read" in str(ei.value)
         # undo the stale-get patch so the assertion reads the REAL store: nothing was written
         monkeypatch.undo()
-        assert _spore_store(install).get(sid)["disposition"] == "handoff"
+        assert _intention_store(install).get(sid)["disposition"] == "handoff"
 
     def test_set_disposition_rejects_unknown_value(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": sid, "disposition": "bogus",
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "bogus",
             })
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
 
     def test_set_disposition_unknown_id(self, install: Path) -> None:
-        _add_spore(install)
+        _add_intention(install)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": "spore-999", "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": "intention-999", "disposition": "seed",
             })
         assert ei.value.code == "verb_failed" and ei.value.http_status == 422
 
     def test_set_disposition_no_store_yet(self, install: Path) -> None:
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_set_disposition", "spore_id": "spore-001", "disposition": "seed",
+                "kind": "intention_set_disposition", "intention_id": "intention-001", "disposition": "seed",
             })
         assert ei.value.code == "not_found" and ei.value.http_status == 404
 
-    # -- spore_surface_at (schedule the re-surfacing) -------------------------
+    # -- intention_surface_at (schedule the re-surfacing) -------------------------
     def test_surface_at_sets_the_next_alarm(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         res = apply_edit(_scope(install), {
-            "kind": "spore_surface_at", "spore_id": sid, "surface_at": "2026-07-01",
+            "kind": "intention_surface_at", "intention_id": sid, "surface_at": "2026-07-01",
         })
         assert res["ok"] and res["action"] == "surface_at"
-        assert _spore_store(install).get(sid)["next"] == "2026-07-01"
+        assert _intention_store(install).get(sid)["next"] == "2026-07-01"
         rec = recent_edits(install / ".levain")[0]
-        assert rec["kind"] == "spore_surface_at" and rec["surface_at"] == "2026-07-01"
+        assert rec["kind"] == "intention_surface_at" and rec["surface_at"] == "2026-07-01"
 
     def test_surface_at_clears_with_null(self, install: Path) -> None:
-        sid = _add_spore(install, next="2026-07-01")
-        apply_edit(_scope(install), {"kind": "spore_surface_at", "spore_id": sid, "surface_at": None})
-        assert _spore_store(install).get(sid)["next"] is None
+        sid = _add_intention(install, next="2026-07-01")
+        apply_edit(_scope(install), {"kind": "intention_surface_at", "intention_id": sid, "surface_at": None})
+        assert _intention_store(install).get(sid)["next"] is None
 
     def test_surface_at_clears_with_empty_string(self, install: Path) -> None:
-        sid = _add_spore(install, next="2026-07-01")
-        apply_edit(_scope(install), {"kind": "spore_surface_at", "spore_id": sid, "surface_at": ""})
-        assert _spore_store(install).get(sid)["next"] is None
+        sid = _add_intention(install, next="2026-07-01")
+        apply_edit(_scope(install), {"kind": "intention_surface_at", "intention_id": sid, "surface_at": ""})
+        assert _intention_store(install).get(sid)["next"] is None
 
     def test_surface_at_requires_the_key_present(self, install: Path) -> None:
         # complement L3 LOW: a MISSING key must not silently clear the alarm (client bug);
         # clearing is explicit (null/''). Presence is required.
-        sid = _add_spore(install, next="2026-07-01")
+        sid = _add_intention(install, next="2026-07-01")
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_surface_at", "spore_id": sid})
+            apply_edit(_scope(install), {"kind": "intention_surface_at", "intention_id": sid})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
         assert "required" in str(ei.value)
         # the alarm is untouched (NOT cleared)
-        assert _spore_store(install).get(sid)["next"] == "2026-07-01"
+        assert _intention_store(install).get(sid)["next"] == "2026-07-01"
 
     def test_surface_at_rejects_bad_date(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         # the space-padded "2026-06- 1" and zero-pad "2026-7-1" are the strict-regex cases:
         # both must be rejected with the user-facing "surface_at" message, NOT anneal's "next".
         for bad in ("2026-13-45", "07/01/2026", "tomorrow", "2026-7-1", "2026-06- 1"):
             with pytest.raises(EditError) as ei:
                 apply_edit(_scope(install), {
-                    "kind": "spore_surface_at", "spore_id": sid, "surface_at": bad,
+                    "kind": "intention_surface_at", "intention_id": sid, "surface_at": bad,
                 })
             assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422, bad
             assert "surface_at" in str(ei.value) and "next" not in str(ei.value), bad
 
     def test_surface_at_unknown_id(self, install: Path) -> None:
-        _add_spore(install)
+        _add_intention(install)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_surface_at", "spore_id": "spore-999", "surface_at": "2026-07-01",
+                "kind": "intention_surface_at", "intention_id": "intention-999", "surface_at": "2026-07-01",
             })
         assert ei.value.code == "verb_failed" and ei.value.http_status == 422
 
     # -- undo refuses every Tray kind (verb-mediated, not file-undoable) ------
     def test_undo_refuses_a_tray_kind(self, install: Path) -> None:
-        res = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})
+        res = apply_edit(_scope(install), {"kind": "intention_seed", "text": "x"})
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         assert ei.value.code == "not_undoable" and ei.value.http_status == 400
 
 
-class TestSporeUpdate:
+class TestIntentionUpdate:
     """Slice 3b: the forming-workbench metadata edit — edit text / reclassify type (only
     while forming) / re-tier (un-park). Non-destructive; reclassify gated at the cognition
     boundary; CAS guards the reclassify read→write window."""
 
     def test_edit_text(self, install: Path) -> None:
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "draft"})["spore_id"]
-        res = apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "text": "refined"})
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "draft"})["intention_id"]
+        res = apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "text": "refined"})
         assert res["ok"] and res["action"] == "update"
-        assert _spore_store(install).get(sid)["text"] == "refined"
+        assert _intention_store(install).get(sid)["text"] == "refined"
         rec = recent_edits(install / ".levain")[0]
-        assert rec["kind"] == "spore_update" and rec["undoable"] is False
+        assert rec["kind"] == "intention_update" and rec["undoable"] is False
 
     def test_edit_text_rejects_empty(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "text": "   "})
+            apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "text": "   "})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
 
     def test_no_fields_rejected(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid})
+            apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
 
     def test_reclassify_a_forming_tray_item(self, install: Path) -> None:
         # a dumped (thought) seed is still forming → reclassify to a task is allowed
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "call dentist"})["spore_id"]
-        apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
-        assert _spore_store(install).get(sid)["type"] == "task"
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "call dentist"})["intention_id"]
+        apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "task"})
+        assert _intention_store(install).get(sid)["type"] == "task"
 
     def test_reclassify_then_metabolize_grants_the_new_terminal_kinds(self, install: Path) -> None:
         # M2(b): the reclassify→terminal-kind contract, end-to-end through the seam. A dump
         # defaults to `thought` (can't descend 'done'); reclassify→task WHILE forming, then
         # metabolize → the loop now descends 'done' (the task lifecycle the dump needed).
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "ship the thing"})["spore_id"]
-        apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
-        apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "ship the thing"})["intention_id"]
+        apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "task"})
+        apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
         res = apply_edit(_scope(install), {
-            "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True})
+            "kind": "intention_close", "intention_id": sid, "intention_kind": "done", "confirm": True})
         assert res["ok"]  # 'done' valid because the retype-while-forming took
 
     def test_note_cannot_ascend(self, install: Path) -> None:
@@ -1406,64 +1406,64 @@ class TestSporeUpdate:
         nid = _legacy_seed(install, "ref", "note")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_ascend", "spore_id": nid, "spore_kind": "pattern",
+                "kind": "intention_promote", "intention_id": nid, "intention_kind": "pattern",
                 "ref": "some-pattern", "confirm": True})
         assert ei.value.code == "not_ascendable" and ei.value.http_status == 409
-        assert any(s["id"] == nid for s in _spore_store(install).list_open())  # untouched
+        assert any(s["id"] == nid for s in _intention_store(install).list_open())  # untouched
 
     def test_ascend_with_a_stale_snapshot_beats_the_note_gate_and_writes_nothing(self, install: Path) -> None:
-        # spore-174: rendered as a loop, re-routed to a Keep note before the click. The snapshot is the
+        # intention-174: rendered as a loop, re-routed to a Keep note before the click. The snapshot is the
         # client's: the answer is stale (re-read), not not_ascendable (which would leave the old row up).
-        sid = _add_spore(install)
-        _spore_store(install).update(sid, disposition="note")   # a legacy note (the seam no longer writes one)
+        sid = _add_intention(install)
+        _intention_store(install).update(sid, disposition="note")   # a legacy note (the seam no longer writes one)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "pattern",
+                "kind": "intention_promote", "intention_id": sid, "intention_kind": "pattern",
                 "ref": "p", "confirm": True, "expect_disposition": "loop"})
         assert ei.value.code == "stale" and ei.value.http_status == 409
-        assert _spore_store(install).get(sid)["disposition"] == "note"
+        assert _intention_store(install).get(sid)["disposition"] == "note"
 
     def test_ascend_with_a_stale_snapshot_does_not_resolve_a_loop_that_left_cognition(self, install: Path) -> None:
         # the r1 HIGH: rendered as a loop, re-routed to the Tray; the server's own fresh read used to pass.
-        sid = _add_spore(install)
-        _spore_store(install).update(sid, disposition="seed")
+        sid = _add_intention(install)
+        _intention_store(install).update(sid, disposition="seed")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "pattern",
+                "kind": "intention_promote", "intention_id": sid, "intention_kind": "pattern",
                 "ref": "p", "confirm": True, "expect_disposition": "loop"})
         assert ei.value.code == "stale"
-        assert any(r["id"] == sid for r in _spore_store(install).list_open())
+        assert any(r["id"] == sid for r in _intention_store(install).list_open())
 
     def test_a_loop_stored_as_an_empty_disposition_takes_a_loop_snapshot(self, install: Path) -> None:
         # L3 r2 LOW: a stored "" renders as a loop; its snapshot must match and the write must land, not
         # answer stale on every re-read
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         # anneal clears "" itself, so only a hand-edited store holds one: write it as a hand would
-        path = _scope(install).anneal.spores_json
+        path = _scope(install).anneal.intentions_json
         data = json.loads(path.read_text(encoding="utf-8"))
         rows = data["spores"] if isinstance(data, dict) else data
         next(r for r in rows if r["id"] == sid)["disposition"] = ""
         path.write_text(json.dumps(data), encoding="utf-8")
-        assert _spore_store(install).get(sid).get("disposition") == ""
+        assert _intention_store(install).get(sid).get("disposition") == ""
         res = apply_edit(_scope(install), {
-            "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+            "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
             "ref": "p", "confirm": True, "expect_disposition": "loop"})
         assert res["ok"]
 
     def test_ascend_with_a_matching_snapshot_and_without_one_both_land(self, install: Path) -> None:
-        a, b = _add_spore(install), _add_spore(install)
+        a, b = _add_intention(install), _add_intention(install)
         for sid, extra in ((a, {"expect_disposition": "loop"}), (b, {})):
             res = apply_edit(_scope(install), {
-                "kind": "spore_ascend", "spore_id": sid, "spore_kind": "project",
+                "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
                 "ref": "p", "confirm": True, **extra})
             assert res["ok"]
-        assert not any(r["id"] in (a, b) for r in _spore_store(install).list_open())
+        assert not any(r["id"] in (a, b) for r in _intention_store(install).list_open())
 
     def test_note_rendered_as_a_note_still_answers_not_ascendable_with_a_snapshot(self, install: Path) -> None:
         nid = _legacy_seed(install, "ref", "note")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_ascend", "spore_id": nid, "spore_kind": "pattern",
+                "kind": "intention_promote", "intention_id": nid, "intention_kind": "pattern",
                 "ref": "p", "confirm": True, "expect_disposition": "note"})
         assert ei.value.code == "not_ascendable"
 
@@ -1471,158 +1471,158 @@ class TestSporeUpdate:
         # rendered as a Keep note, activated to a loop elsewhere: "-> tray" used to answer confirm_required
         # (never a re-read). It is stale, and nothing is written.
         sid = _legacy_seed(install, "n", "note")
-        apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid, "disposition": "loop"})
+        apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid,
+            apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid,
                                          "disposition": "seed", "expect_disposition": "note"})
         assert ei.value.code == "stale" and ei.value.http_status == 409
-        assert "disposition" not in _spore_store(install).get(sid)
+        assert "disposition" not in _intention_store(install).get(sid)
 
     def test_set_disposition_stale_snapshot_between_two_tray_values_does_not_overwrite(self, install: Path) -> None:
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "t", "disposition": "seed"})["spore_id"]
-        _spore_store(install).update(sid, disposition="handoff")
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "t", "disposition": "seed"})["intention_id"]
+        _intention_store(install).update(sid, disposition="handoff")
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid,
+            apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid,
                                          "disposition": "loop", "expect_disposition": "seed"})
         assert ei.value.code == "stale"
-        assert _spore_store(install).get(sid)["disposition"] == "handoff"
+        assert _intention_store(install).get(sid)["disposition"] == "handoff"
 
     def test_set_disposition_without_a_snapshot_is_unchanged(self, install: Path) -> None:
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "t", "disposition": "seed"})["spore_id"]
-        _spore_store(install).update(sid, disposition="handoff")
-        assert apply_edit(_scope(install), {"kind": "spore_set_disposition", "spore_id": sid,
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "t", "disposition": "seed"})["intention_id"]
+        _intention_store(install).update(sid, disposition="handoff")
+        assert apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid,
                                             "disposition": "loop"})["ok"]
 
     def test_note_can_be_removed_via_descend(self, install: Path) -> None:
         # the legitimate resolution for reference: remove = descend composted.
         nid = _legacy_seed(install, "ref", "note")
         res = apply_edit(_scope(install), {
-            "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted", "confirm": True})
+            "kind": "intention_close", "intention_id": nid, "intention_kind": "composted", "confirm": True})
         assert res["ok"]
-        assert not any(s["id"] == nid for s in _spore_store(install).list_open())
+        assert not any(s["id"] == nid for s in _intention_store(install).list_open())
 
     def test_reclassify_locked_on_a_committed_loop(self, install: Path) -> None:
-        sid = _add_spore(install, stype="thought")  # a loop (no disposition) = committed
+        sid = _add_intention(install, stype="thought")  # a loop (no disposition) = committed
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
+            apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "task"})
         assert ei.value.code == "type_locked" and ei.value.http_status == 409
-        assert _spore_store(install).get(sid)["type"] == "thought"  # untouched
+        assert _intention_store(install).get(sid)["type"] == "thought"  # untouched
 
     def test_reclassify_locked_on_a_note(self, install: Path) -> None:
         sid = _legacy_seed(install, "ref", "note")
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
+            apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "task"})
         assert ei.value.code == "type_locked" and ei.value.http_status == 409
 
     def test_reclassify_rejects_bad_type(self, install: Path) -> None:
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "x"})["intention_id"]
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "bogus"})
+            apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "bogus"})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
 
     def test_reclassify_cas_rejects_concurrent_metabolize(self, install: Path, monkeypatch) -> None:
         # the gate read sees a forming Tray item; a concurrent writer metabolizes it to a
         # loop; the CAS must reject so a now-committed loop isn't retyped on stale state.
-        from anneal_memory.spores import SporeStore
-        sid = apply_edit(_scope(install), {"kind": "spore_seed", "text": "x"})["spore_id"]
-        _spore_store(install).update(sid, disposition=None)  # real: metabolized to a loop
-        real_get = SporeStore.get
+        from anneal_memory.spores import IntentionStore
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "x"})["intention_id"]
+        _intention_store(install).update(sid, disposition=None)  # real: metabolized to a loop
+        real_get = IntentionStore.get
 
         def stale_get(self, sid_):  # returns the STALE forming (seed) view
             d = real_get(self, sid_)
             return {**d, "disposition": "seed"} if d else d
 
-        monkeypatch.setattr(SporeStore, "get", stale_get)
+        monkeypatch.setattr(IntentionStore, "get", stale_get)
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "type": "task"})
+            apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "task"})
         assert ei.value.code == "verb_failed" and ei.value.http_status == 422
         assert "changed since read" in str(ei.value)
         monkeypatch.undo()
-        assert _spore_store(install).get(sid)["type"] == "thought"  # not retyped
+        assert _intention_store(install).get(sid)["type"] == "thought"  # not retyped
 
     def test_retier_unparks_a_keep_loop(self, install: Path) -> None:
-        sid = _add_spore(install, tier="parked")
-        apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "warm"})
-        assert _spore_store(install).get(sid)["tier"] == "warm"
+        sid = _add_intention(install, tier="parked")
+        apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "tier": "warm"})
+        assert _intention_store(install).get(sid)["tier"] == "warm"
 
     def test_park_pins_an_open_loop_without_resolving(self, install: Path) -> None:
-        # The "park" verb = spore_update{tier:parked} (the mirror of un-park). The loop must
+        # The "park" verb = intention_update{tier:parked} (the mirror of un-park). The loop must
         # stay OPEN — park is pause-not-resolve (that's why it is NOT a compost/descend kind);
         # bucket_of keeps the parked-tier OPEN loop in Open loops, marked parked [TS-5a].
-        sid = _add_spore(install, tier="warm")
-        apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "parked"})
-        rec = _spore_store(install).get(sid)
+        sid = _add_intention(install, tier="warm")
+        apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "tier": "parked"})
+        rec = _intention_store(install).get(sid)
         assert rec["tier"] == "parked"
         assert rec.get("status", "open") == "open"  # NOT resolved — still a live (hidden) loop
 
     def test_retier_rejects_bad_value(self, install: Path) -> None:
-        sid = _add_spore(install)
+        sid = _add_intention(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "bogus"})
+            apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "tier": "bogus"})
         assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422
 
-    # -- tier expect_disposition CAS (spore-173): park/un-park's ROUTE is chosen CLIENT-side off the
+    # -- tier expect_disposition CAS (intention-173): park/un-park's ROUTE is chosen CLIENT-side off the
     # -- rendered snapshot (note→loop via set_disposition vs parked-loop→un-park via tier=warm), so
     # -- a tier edit threads the snapshot; a mismatch fails closed instead of tier-warming a note.
     def test_retier_expect_disposition_match_unparks(self, install: Path) -> None:
-        sid = _add_spore(install, tier="parked")  # a parked plain loop → snapshot 'loop'
+        sid = _add_intention(install, tier="parked")  # a parked plain loop → snapshot 'loop'
         res = apply_edit(_scope(install), {
-            "kind": "spore_update", "spore_id": sid, "tier": "warm", "expect_disposition": "loop"})
-        assert res["ok"] and _spore_store(install).get(sid)["tier"] == "warm"
+            "kind": "intention_update", "intention_id": sid, "tier": "warm", "expect_disposition": "loop"})
+        assert res["ok"] and _intention_store(install).get(sid)["tier"] == "warm"
 
     def test_retier_expect_disposition_mismatch_fails_closed(self, install: Path) -> None:
         # the operator saw a parked LOOP + clicked "reactivate" (expect 'loop'), but it's a NOTE
         # now — without the CAS, tier=warm lands on the note + falsely reports "reactivated". The
         # note carries a DISTINCTIVE tier ('cold') so the no-write is provable (a seeded note would
         # default to 'warm', masking the failure).
-        nid = _add_spore(install, disposition="note", tier="cold")
+        nid = _add_intention(install, disposition="note", tier="cold")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_update", "spore_id": nid, "tier": "warm",
+                "kind": "intention_update", "intention_id": nid, "tier": "warm",
                 "expect_disposition": "loop"})  # stale snapshot
-        assert ei.value.code == "stale" and ei.value.http_status == 409   # spore-174
+        assert ei.value.code == "stale" and ei.value.http_status == 409   # intention-174
         assert "changed since read" in str(ei.value)
-        rec = _spore_store(install).get(nid)
+        rec = _intention_store(install).get(nid)
         assert rec["disposition"] == "note" and rec["tier"] == "cold"  # untouched, still a cold note
 
     def test_retier_without_expect_disposition_skips_cas(self, install: Path) -> None:
         # back-compat: a tier edit with no snapshot gets no CAS (the original park/un-park path).
-        sid = _add_spore(install, tier="parked")
-        res = apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "tier": "warm"})
-        assert res["ok"] and _spore_store(install).get(sid)["tier"] == "warm"
+        sid = _add_intention(install, tier="parked")
+        res = apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "tier": "warm"})
+        assert res["ok"] and _intention_store(install).get(sid)["tier"] == "warm"
 
     def test_text_only_ignores_a_mismatched_expect_disposition(self, install: Path) -> None:
         # a text edit is disposition-INDEPENDENT → even a mismatched snapshot must NOT CAS-reject;
         # only the tier path threads the snapshot (the type path CASes its own server-read value).
         sid = _legacy_seed(install, "x", "handoff")
         res = apply_edit(_scope(install), {
-            "kind": "spore_update", "spore_id": sid, "text": "edited",
+            "kind": "intention_update", "intention_id": sid, "text": "edited",
             "expect_disposition": "seed"})  # mismatched, but text-only → ignored, no CAS
-        assert res["ok"] and _spore_store(install).get(sid)["text"] == "edited"
+        assert res["ok"] and _intention_store(install).get(sid)["text"] == "edited"
 
     def test_combined_type_tier_edit_consistency_guard(self, install: Path) -> None:
         # L1/L2 #4: no surface emits a combined type+tier edit, but the seam must be sound. The type
         # gate CASes the server-read disposition; a client tier-snapshot that DISAGREES means a
         # re-route already happened → fail closed (don't silently leave the tier route unguarded).
         sid = apply_edit(_scope(install), {  # a forming seed (is_tray → type is reclassifiable)
-            "kind": "spore_seed", "text": "x", "disposition": "seed"})["spore_id"]
+            "kind": "intention_seed", "text": "x", "disposition": "seed"})["intention_id"]
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
-                "kind": "spore_update", "spore_id": sid, "type": "task", "tier": "warm",
+                "kind": "intention_update", "intention_id": sid, "type": "task", "tier": "warm",
                 "expect_disposition": "loop"})  # snapshot disagrees with the server-read "seed"
         assert ei.value.code == "stale" and "changed since read" in str(ei.value)
-        rec = _spore_store(install).get(sid)
+        rec = _intention_store(install).get(sid)
         assert rec["type"] == "thought" and rec["disposition"] == "seed"  # fail-closed: untouched
 
     def test_combined_type_tier_edit_matching_snapshot_applies(self, install: Path) -> None:
         # the agreeing combined case: snapshot == server-read → one CAS covers both fields, applies.
         sid = apply_edit(_scope(install), {
-            "kind": "spore_seed", "text": "x", "disposition": "seed"})["spore_id"]
+            "kind": "intention_seed", "text": "x", "disposition": "seed"})["intention_id"]
         res = apply_edit(_scope(install), {
-            "kind": "spore_update", "spore_id": sid, "type": "task", "tier": "hot",
+            "kind": "intention_update", "intention_id": sid, "type": "task", "tier": "hot",
             "expect_disposition": "seed"})
         assert res["ok"]
-        rec = _spore_store(install).get(sid)
+        rec = _intention_store(install).get(sid)
         assert rec["type"] == "task" and rec["tier"] == "hot"
 
     def test_descend_audit_records_resolved_disposition(self, install: Path) -> None:
@@ -1630,36 +1630,36 @@ class TestSporeUpdate:
         # None→'loop'), mirroring set_disposition's prior_disposition.
         nid = _legacy_seed(install, "ref", "note")
         apply_edit(_scope(install), {
-            "kind": "spore_descend", "spore_id": nid, "spore_kind": "composted",
+            "kind": "intention_close", "intention_id": nid, "intention_kind": "composted",
             "confirm": True, "expect_disposition": "note"})
         assert recent_edits(install / ".levain")[0]["prior_disposition"] == "note"
 
     def test_text_only_edit_not_cas_rejected_by_concurrent_reroute(self, install: Path, monkeypatch) -> None:
         # a text-only edit is disposition-independent → it must NOT be CAS-rejected when the
         # disposition changed concurrently (only the reclassify gate carries the CAS).
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import IntentionStore
         sid = _legacy_seed(install, "x", "handoff")
-        real_get = SporeStore.get
+        real_get = IntentionStore.get
 
         def stale_get(self, sid_):  # stale seed view; real is handoff
             d = real_get(self, sid_)
             return {**d, "disposition": "seed"} if d else d
 
-        monkeypatch.setattr(SporeStore, "get", stale_get)
-        res = apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "text": "edited"})
+        monkeypatch.setattr(IntentionStore, "get", stale_get)
+        res = apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "text": "edited"})
         assert res["ok"]
         monkeypatch.undo()
-        assert _spore_store(install).get(sid)["text"] == "edited"
+        assert _intention_store(install).get(sid)["text"] == "edited"
 
     def test_unknown_id(self, install: Path) -> None:
-        _add_spore(install)
+        _add_intention(install)
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_update", "spore_id": "spore-999", "text": "x"})
+            apply_edit(_scope(install), {"kind": "intention_update", "intention_id": "intention-999", "text": "x"})
         assert ei.value.code == "verb_failed" and ei.value.http_status == 422
 
-    def test_undo_refuses_spore_update(self, install: Path) -> None:
-        sid = _add_spore(install)
-        res = apply_edit(_scope(install), {"kind": "spore_update", "spore_id": sid, "text": "x"})
+    def test_undo_refuses_intention_update(self, install: Path) -> None:
+        sid = _add_intention(install)
+        res = apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "text": "x"})
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         assert ei.value.code == "not_undoable" and ei.value.http_status == 400
@@ -1692,8 +1692,8 @@ class TestEpisodeTombstone:
 
 class TestClassBGovernance:
     def test_undo_refuses_a_verb_record(self, install: Path) -> None:
-        sid = _add_spore(install)
-        res = apply_edit(_scope(install), {"kind": "spore_touch", "spore_id": sid})
+        sid = _add_intention(install)
+        res = apply_edit(_scope(install), {"kind": "intention_touch", "intention_id": sid})
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "undo", "edit_id": res["id"]})
         assert ei.value.code == "not_undoable" and ei.value.http_status == 400
@@ -1715,7 +1715,7 @@ class TestClassBRobustness:
 
         import levain.writes as W
 
-        sid = _add_spore(install)
+        sid = _add_intention(install)
 
         def boom(*a, **k):
             raise OSError("disk full")
@@ -1724,24 +1724,24 @@ class TestClassBRobustness:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             res = apply_edit(_scope(install), {
-                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+                "kind": "intention_close", "intention_id": sid, "intention_kind": "done", "confirm": True,
             })
         # committed op reports SUCCESS (not a 500) even though the edit-log line failed;
-        # no audit id is returned, and the spore is genuinely composted (canonical in anneal).
+        # no audit id is returned, and the intention is genuinely composted (canonical in anneal).
         assert res["ok"] is True and res["id"] == ""
-        assert not any(s["id"] == sid for s in _spore_store(install).list_open())
+        assert not any(s["id"] == sid for s in _intention_store(install).list_open())
 
-    def test_spore_verb_oserror_maps_to_503(self, install: Path, monkeypatch) -> None:
-        from anneal_memory.spores import SporeStore
+    def test_intention_verb_oserror_maps_to_503(self, install: Path, monkeypatch) -> None:
+        from anneal_memory.spores import IntentionStore
 
-        sid = _add_spore(install)
+        sid = _add_intention(install)
 
         def boom(*a, **k):
             raise OSError("no locks available")
 
-        monkeypatch.setattr(SporeStore, "touch", boom)
+        monkeypatch.setattr(IntentionStore, "touch", boom)
         with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "spore_touch", "spore_id": sid})
+            apply_edit(_scope(install), {"kind": "intention_touch", "intention_id": sid})
         assert ei.value.code == "store_unavailable" and ei.value.http_status == 503
 
     def test_tombstone_oserror_maps_to_503(self, install: Path, monkeypatch) -> None:
@@ -1763,18 +1763,18 @@ class TestClassBRobustness:
 class TestExplicitPathsScope:
     """The capability the Bridge write-enable rests on: a NON-install substrate —
     ``install_root=None``, explicit anneal paths, a ledger NOT under any install —
-    exactly flow's own store (anneal at ~/.anneal-memory, spores in the repo, no
+    exactly flow's own store (anneal at ~/.anneal-memory, intentions in the repo, no
     ``.levain/``). The governed write seam runs off the explicit paths, the ledger lands
     where the scope says, and the seed/config kinds (which need an install) refuse cleanly.
     The pre-WriteScope code re-derived every target from ``install_root/.levain`` — so
     none of this was reachable; these tests lock the decoupling."""
 
     @staticmethod
-    def _make(tmp_path: Path, *, continuity: bool = False, spores: bool = False):
+    def _make(tmp_path: Path, *, continuity: bool = False, intentions: bool = False):
         """A WriteScope mirroring flow's N-of-1 layout: the anneal store in one dir, the
-        spores file in a SEPARATE 'repo' tree, the ledger under the repo's state dir —
-        and NO install_root. Returns ``(scope, spore_id|None)``."""
-        from anneal_memory.spores import SporeStore
+        intentions file in a SEPARATE 'repo' tree, the ledger under the repo's state dir —
+        and NO install_root. Returns ``(scope, intention_id|None)``."""
+        from anneal_memory.spores import IntentionStore
 
         from levain.dashboard import AnnealPaths
 
@@ -1786,13 +1786,13 @@ class TestExplicitPathsScope:
             episodic_db=anneal_dir / "memory.db",
             continuity_md=anneal_dir / "memory.continuity.md",
             crystal_json=anneal_dir / "memory.crystal.json",
-            spores_json=repo_state / "spores.json",  # the N-of-1 split (spores in the repo)
+            intentions_json=repo_state / "spores.json",  # the N-of-1 split (intentions in the repo)
         )
         if continuity:
             paths.continuity_md.write_text(CONTINUITY, encoding="utf-8")
         sid = None
-        if spores:
-            sid = str(SporeStore(paths.spores_json).add(type="task", text="ship slice 1")["id"])
+        if intentions:
+            sid = str(IntentionStore(paths.intentions_json, id_prefix="intention").add(type="task", text="ship slice 1")["id"])
         ledger = repo_state / "bridge"  # flow's chosen ledger home (state/bridge/)
         return WriteScope(anneal=paths, ledger_root=ledger, install_root=None), sid
 
@@ -1809,12 +1809,12 @@ class TestExplicitPathsScope:
         assert (scope.ledger_root / "edits.jsonl").is_file()
         assert (scope.ledger_root / rec["backup"]).is_file()
 
-    def test_spore_touch_targets_explicit_spores_json(self, tmp_path: Path) -> None:
-        scope, sid = self._make(tmp_path, spores=True)
-        res = apply_edit(scope, {"kind": "spore_touch", "spore_id": sid})
-        assert res["ok"] and res["source"] == f"spore:{sid}"
+    def test_intention_touch_targets_explicit_intentions_json(self, tmp_path: Path) -> None:
+        scope, sid = self._make(tmp_path, intentions=True)
+        res = apply_edit(scope, {"kind": "intention_touch", "intention_id": sid})
+        assert res["ok"] and res["source"] == f"intention:{sid}"
         rec = recent_edits(scope.ledger_root)[0]
-        assert rec["kind"] == "spore_touch" and rec["source"] == f"spore:{sid}"
+        assert rec["kind"] == "intention_touch" and rec["source"] == f"intention:{sid}"
 
     def test_config_edit_refused_without_install_root(self, tmp_path: Path) -> None:
         scope, _ = self._make(tmp_path)

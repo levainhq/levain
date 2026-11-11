@@ -244,7 +244,7 @@ def test_unusual_shape_stays_a_warning_and_never_rejects_a_file():
 
 
 # ---------------------------------------------------------------------------
-# extract_answers (spore-423): read the interview answers back out of a render.
+# extract_answers (intention-423): read the interview answers back out of a render.
 # ---------------------------------------------------------------------------
 import random as _random  # noqa: E402
 

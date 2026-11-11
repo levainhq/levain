@@ -1,6 +1,6 @@
 """THE LIST's intake write path (levain 64 L1; flow task_surfaces_1107.md THE LIST): the three create fields on
-``spore_seed`` (a timed ``next``, the germinate ``target``, ``attention``), the ``list_intake`` verb's tier table, its
-broker build (one reading of the line, at issue), its receipt, and the C1 sort drop. Real anneal SporeStores and a
+``intention_seed`` (a timed ``next``, the germinate ``target``, ``attention``), the ``list_intake`` verb's tier table, its
+broker build (one reading of the line, at issue), its receipt, and the C1 sort drop. Real anneal IntentionStores and a
 real desk store in tmp dirs; nothing is mocked."""
 
 from __future__ import annotations
@@ -12,22 +12,22 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain import intake
 from levain.cockpit.broker import Broker, BrokerError
 from levain.cockpit.effects import (
     INTAKE_TIERS,
     INTAKE_VERB,
-    SPORE_AUTHORITY_FIELDS,
+    INTENTION_AUTHORITY_FIELDS,
     EffectStatus,
-    SporeEffectStore,
+    IntentionEffectStore,
     canonical_effect,
     create_origin_key,
     intake_kind_of,
     intake_seed_params,
     settle,
-    spore_resource_key,
+    intention_resource_key,
 )
 from levain.cockpit.verbs import DEVICE_VERBS, KERNEL_VERBS, VerbRegistry, _intake_fire
 from levain.writes import EditError
@@ -51,16 +51,16 @@ def home() -> Iterator[Path]:
 
 
 @pytest.fixture
-def spores(home: Path) -> Path:
+def intentions(home: Path) -> Path:
     p = home / "spores.json"
-    SporeStore(p).add(type="task", text="a loop", origin_key="k.loop")
+    IntentionStore(p, id_prefix="intention").add(type="task", text="a loop", origin_key="k.loop")
     return p
 
 
 @pytest.fixture
-def broker(home: Path, spores: Path) -> Iterator[Broker]:
+def broker(home: Path, intentions: Path) -> Iterator[Broker]:
     now = [NOW_UTC]
-    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores)}, store_paths=[spores],
+    b = Broker(home / "data", stores={"intentions": IntentionEffectStore(intentions)}, store_paths=[intentions],
                install_class="reported", clock=lambda: now[0])
     b.start()
     b._test_now = now  # type: ignore[attr-defined]
@@ -70,46 +70,46 @@ def broker(home: Path, spores: Path) -> Iterator[Broker]:
         b.stop()
 
 
-def _seed(es: SporeEffectStore, params: dict[str, Any]):
+def _seed(es: IntentionEffectStore, params: dict[str, Any]):
     ok = create_origin_key(PENDING, 0)
-    return canonical_effect("spore_seed", params, es.snapshot(spore_resource_key(ok)).row, origin_key=ok)
+    return canonical_effect("intention_seed", params, es.snapshot(intention_resource_key(ok)).row, origin_key=ok)
 
 
 def _row(path: Path, key: str) -> dict | None:
-    return SporeStore(path).get_by_origin_key(key)
+    return IntentionStore(path, id_prefix="intention").get_by_origin_key(key)
 
 
-# --- 1: spore_seed's three new fields, applied and refused ---------------------------------------------------------
+# --- 1: intention_seed's three new fields, applied and refused ---------------------------------------------------------
 
-def test_a_drop_seed_stores_its_timed_next_whole_and_its_desk_target(spores):
-    es = SporeEffectStore(spores)
+def test_a_drop_seed_stores_its_timed_next_whole_and_its_desk_target(intentions):
+    es = IntentionEffectStore(intentions)
     eff = _seed(es, {"text": "call X", "type": "task", "disposition": "agenda", "target": "desk",
                      "next": "2026-11-09T09:00"})
     assert eff.changes["next"] == "2026-11-09T09:00" and eff.changes["target"] == "desk"
     (unit,) = es.units([(0, eff)])
     assert settle(unit, es, {}).status is EffectStatus.APPLIED
-    row = _row(spores, create_origin_key(PENDING, 0))
+    row = _row(intentions, create_origin_key(PENDING, 0))
     # the minute is stored as given: never cut to its date anywhere on the write path
     assert (row["disposition"], row["target"], row["next"]) == ("agenda", "desk", "2026-11-09T09:00")
     assert "attention" not in row or row["attention"] is None
 
 
-def test_a_talk_seed_carries_attention_talk_and_no_target(spores):
-    es = SporeEffectStore(spores)
+def test_a_talk_seed_carries_attention_talk_and_no_target(intentions):
+    es = IntentionEffectStore(intentions)
     eff = _seed(es, {"text": "flow's future", "disposition": "seed", "attention": "talk"})
     (unit,) = es.units([(0, eff)])
     assert settle(unit, es, {}).status is EffectStatus.APPLIED
-    row = _row(spores, create_origin_key(PENDING, 0))
+    row = _row(intentions, create_origin_key(PENDING, 0))
     assert (row["disposition"], row.get("attention"), row.get("target")) == ("seed", "talk", None)
 
 
-def test_the_new_fields_are_signed_in_changes_but_labelled_only_on_the_authority_fields(spores):
-    """Authority-field decision (PLAN 1a): target/next/attention are not in SPORE_AUTHORITY_FIELDS. They are in the
+def test_the_new_fields_are_signed_in_changes_but_labelled_only_on_the_authority_fields(intentions):
+    """Authority-field decision (PLAN 1a): target/next/attention are not in INTENTION_AUTHORITY_FIELDS. They are in the
     effect's changes, so in the signed record bytes; the label projection stays text/domain/disposition."""
-    eff = _seed(SporeEffectStore(spores), {"text": "x", "disposition": "agenda", "target": "desk",
+    eff = _seed(IntentionEffectStore(intentions), {"text": "x", "disposition": "agenda", "target": "desk",
                                            "next": "2026-11-09T09:00"})
-    assert SPORE_AUTHORITY_FIELDS == ("text", "domain", "disposition")
-    assert set(eff.projection) == set(SPORE_AUTHORITY_FIELDS)
+    assert INTENTION_AUTHORITY_FIELDS == ("text", "domain", "disposition")
+    assert set(eff.projection) == set(INTENTION_AUTHORITY_FIELDS)
     assert {"target", "next"} <= set(eff.changes)
 
 
@@ -130,9 +130,9 @@ REFUSALS = [
 
 
 @pytest.mark.parametrize("name,extra,why", REFUSALS, ids=[r[0] for r in REFUSALS])
-def test_steering_is_refused_never_coerced(spores, name, extra, why):
+def test_steering_is_refused_never_coerced(intentions, name, extra, why):
     with pytest.raises(ValueError) as e:
-        _seed(SporeEffectStore(spores), {"text": "words", **extra})
+        _seed(IntentionEffectStore(intentions), {"text": "words", **extra})
     assert why in str(e.value)
 
 
@@ -140,8 +140,8 @@ def test_steering_is_refused_never_coerced(spores, name, extra, why):
 
 def test_the_intake_tier_table():
     """THE TIER TABLE (PLAN section 3, decided by L1): drop T2 (signed: it wakes the desk at its minute with his words),
-    talk T2 (a spore agents read, as every spore_seed), sort C1 (the room composer's own desk drop, which is
-    never authority). spore_seed stays T2 whatever it carries."""
+    talk T2 (an intention agents read, as every intention_seed), sort C1 (the room composer's own desk drop, which is
+    never authority). intention_seed stays T2 whatever it carries."""
     assert INTAKE_TIERS == {"drop": "T2", "talk": "T2", "sort": "C1"}
     reg = VerbRegistry()
     spec = reg.get(INTAKE_VERB)
@@ -151,10 +151,10 @@ def test_the_intake_tier_table():
     tier = lambda line: spec.tier_fn({"line": line}, None, "unverified", today)  # noqa: E731
     assert [tier(l) for l in ("@mon 9am call X", "  @+2h x", "? talk about y", "plain words", "", 7)] == \
         ["T2", "T2", "T2", "C1", "C1", "T2"]
-    seed = reg.get("spore_seed")
+    seed = reg.get("intention_seed")
     assert seed.fields == ("text", "type", "disposition", "next", "target", "attention")
     assert seed.tier_fn({"text": "x", "disposition": "agenda", "target": "desk"}, None, "verified", today) == "T2"
-    assert {v.name for v in KERNEL_VERBS}.issuperset({"spore_seed", INTAKE_VERB})
+    assert {v.name for v in KERNEL_VERBS}.issuperset({"intention_seed", INTAKE_VERB})
 
 
 def test_intake_kind_and_seed_params():
@@ -174,11 +174,11 @@ def _issue(b: Broker, line: Any, *, intent: str = "reported", credential: dict =
                    tier=tier, credential=credential, intent=intent)
 
 
-def test_a_scheduled_drop_plants_an_agenda_for_the_desk_at_the_resolved_minute(broker, spores):
+def test_a_scheduled_drop_plants_an_agenda_for_the_desk_at_the_resolved_minute(broker, intentions):
     out = _issue(broker, "@+2h call the dentist")
     want = (NOW_LOCAL + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M")
     assert out["state"] == "COMMITTED"
-    row = _row(spores, "ck." + out["pending_id"][2:] + ".0")
+    row = _row(intentions, "ck." + out["pending_id"][2:] + ".0")
     assert (row["text"], row["disposition"], row["target"], row["next"]) == \
         ("call the dentist", "agenda", "desk", want)
     assert out["receipt"] == {"kind": "drop", "id": row["id"], "fires": want, "text": "call the dentist"}
@@ -186,20 +186,20 @@ def test_a_scheduled_drop_plants_an_agenda_for_the_desk_at_the_resolved_minute(b
     assert out["receipt_line"].startswith(f"scheduled drop {row['id']} fires ")
 
 
-def test_a_talk_line_plants_a_talk_seed(broker, spores):
+def test_a_talk_line_plants_a_talk_seed(broker, intentions):
     out = _issue(broker, "?  flow's future, with Som out of it ")
-    row = _row(spores, "ck." + out["pending_id"][2:] + ".0")
+    row = _row(intentions, "ck." + out["pending_id"][2:] + ".0")
     assert (row["disposition"], row.get("attention"), row.get("target"), row["text"]) == \
         ("seed", "talk", None, "flow's future, with Som out of it")
     assert out["receipt"] == {"kind": "talk", "id": row["id"], "fires": None, "text": row["text"]}
     assert out["receipt_line"] == f"talk {row['id']}"
 
 
-def test_a_signed_drop_waits_and_its_receipt_claims_no_fire(broker, spores):
+def test_a_signed_drop_waits_and_its_receipt_claims_no_fire(broker, intentions):
     out = _issue(broker, "@mon 9am call X", intent="sign")
     assert out["state"] == "WAITING"
     assert out["receipt"]["id"] is None and out["receipt"]["kind"] == "drop"
-    assert out["receipt_line"].endswith(", awaiting your signature") and "spore-" not in out["receipt_line"]
+    assert out["receipt_line"].endswith(", awaiting your signature") and "intention-" not in out["receipt_line"]
     rec = json.loads(out["record"])
     # the signed bytes carry the reading twice: the target's intake and the effect's changes
     assert rec["target"]["intake"]["when"] == out["receipt"]["fires"]
@@ -208,7 +208,7 @@ def test_a_signed_drop_waits_and_its_receipt_claims_no_fire(broker, spores):
     assert out["receipt"]["fires"].endswith("T09:00")
 
 
-def test_the_decision_rebuilds_from_the_recorded_reading_never_the_line_again(broker, spores):
+def test_the_decision_rebuilds_from_the_recorded_reading_never_the_line_again(broker, intentions):
     out = _issue(broker, "@+30m x", intent="sign")
     target = json.loads(out["record"])["target"]
     # a minute later "+30m" reads another minute: the rebuild ignores the line and keeps the signed one
@@ -234,15 +234,15 @@ INTAKE_REFUSALS = [
 
 
 @pytest.mark.parametrize("name,line,why", INTAKE_REFUSALS, ids=[r[0] for r in INTAKE_REFUSALS])
-def test_a_line_that_does_not_read_is_refused_with_its_reason_and_writes_nothing(broker, spores, name, line, why):
-    before = spores.read_bytes()
+def test_a_line_that_does_not_read_is_refused_with_its_reason_and_writes_nothing(broker, intentions, name, line, why):
+    before = intentions.read_bytes()
     with pytest.raises(BrokerError) as e:
         _issue(broker, line)
     assert (e.value.code, e.value.status) == ("intake_refused", 422) and why in str(e.value)
-    assert spores.read_bytes() == before
+    assert intentions.read_bytes() == before
 
 
-def test_the_broker_builds_a_sort_as_one_desk_drop_and_refuses_a_malformed_body(broker, spores, home):
+def test_the_broker_builds_a_sort_as_one_desk_drop_and_refuses_a_malformed_body(broker, intentions, home):
     from levain.cockpit.desk_effects import DESK, CoordDropEffectStore
 
     # no desk store registered: the sort keeps its 501
@@ -333,11 +333,11 @@ class _Raise:
         return self.floors.get(verb, tier)
 
 
-def test_a_raise_of_spore_seed_governs_a_drop_and_a_talk_never_a_sort():
-    """codex L3 r1 HIGH: list_intake plants spore_seed's effect, so spore_seed's standing raise is not stepped around."""
+def test_a_raise_of_intention_seed_governs_a_drop_and_a_talk_never_a_sort():
+    """codex L3 r1 HIGH: list_intake plants intention_seed's effect, so intention_seed's standing raise is not stepped around."""
     spec = VerbRegistry().get(INTAKE_VERB)
     today = NOW_LOCAL.date()
-    pol = _Raise(spore_seed="T3")
+    pol = _Raise(intention_seed="T3")
     assert [spec.tier({"line": l}, None, "verified", today, policy=pol) for l in ("@+1h x", "? y", "z")] == \
         ["T3", "T3", "C1"]
     assert spec.rendered_tier(None, "verified", today, policy=pol) == "T3"

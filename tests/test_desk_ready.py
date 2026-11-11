@@ -52,8 +52,8 @@ def test_every_item_carries_exactly_the_schema_fields():
 def test_unknown_category_is_reported():
     (case,) = [c for c in CASES if "unknown category" in c["name"]]
     by = {i["id"]: i for i in ready.derive_items(case["input"])}
-    assert by["spore-1005"]["unknown_category"] == "frozen"
-    assert by["spore-1006"]["unknown_category"] is None
+    assert by["intention-1005"]["unknown_category"] == "frozen"
+    assert by["intention-1006"]["unknown_category"] is None
 
 
 def test_derive_is_pure_and_does_not_mutate_its_input():
@@ -117,7 +117,7 @@ def test_ready_counts_count_only_well_formed_ready():
 
 
 def test_handoff_pointer_is_pure():
-    s = {"id": "spore-9", "status": "open", "disposition": "handoff", "pointer": "projects/flow/x.md", "text": "t"}
+    s = {"id": "intention-9", "status": "open", "disposition": "handoff", "pointer": "projects/flow/x.md", "text": "t"}
     assert ready.derive_items({"spores": [s]})[0]["repo"] == "projects"
     assert ready.derive_items({"spores": [s], "repos": ["levain"]})[0]["repo"] == "flow"
     s2 = dict(s, pointer="/h/Briefcase/.levain-1028-15/x.md")

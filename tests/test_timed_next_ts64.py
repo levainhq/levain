@@ -1,4 +1,4 @@
-"""TS-64: a spore's ``next`` may be a date or anneal 1.0.4's timed ``YYYY-MM-DDTHH:MM`` (local, no zone,
+"""TS-64: an intention's ``next`` may be a date or anneal 1.0.4's timed ``YYYY-MM-DDTHH:MM`` (local, no zone,
 minute precision). Both write-path validators pass either through verbatim and still refuse garbage."""
 from __future__ import annotations
 

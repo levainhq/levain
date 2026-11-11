@@ -10,7 +10,7 @@ Wired to Claude Code's UserPromptSubmit event. Injects, at recency position
   1. One directive selected at random from activation/recency_directives.md —
      the within-session-durability layer. Selecting across differently-framed
      directives fights attention habituation.
-  2. Open spores (prospective layer) whose content COLLIDES with this prompt —
+  2. Open intentions (prospective layer) whose content COLLIDES with this prompt —
      the event-based germination surface: an open loop surfaces when the current
      work touches it. Precision-biased and capped, so an unrelated prompt
      injects nothing (the effortful full-list poll stays opt-in, per the seed).
@@ -48,12 +48,12 @@ except Exception:
 # substantial session, before the upper bound, without nagging a short one.
 WRAP_NUDGE_THRESHOLD = 12
 
-# Per-attempt timeout for the anneal-memory queries (wrap-count + open spores).
+# Per-attempt timeout for the anneal-memory queries (wrap-count + open intentions).
 # Tight because this hook runs before EVERY prompt — a slow or hung
 # anneal-memory must not stall the turn. (session_start.py uses the 5s default:
 # it fires once per session and is not latency-sensitive.)
 WRAP_CHECK_TIMEOUT = 2.0
-SPORE_CHECK_TIMEOUT = 2.0
+INTENTION_CHECK_TIMEOUT = 2.0
 CRYSTAL_CHECK_TIMEOUT = 2.0
 
 
@@ -118,22 +118,22 @@ def main() -> int:
         except Exception:
             pending_sig = None
 
-        # Event-based spore germination — open loops whose content collides with
+        # Event-based intention germination — open loops whose content collides with
         # this prompt surface on their own (the intelligent prospective surface;
         # the effortful full-list poll stays opt-in, per the seed). Precision-
         # biased + capped, so an irrelevant prompt injects nothing.
         prompt = payload.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
-            hits = hook.spores_colliding(
-                prompt, hook.open_spores(timeout=SPORE_CHECK_TIMEOUT)
+            hits = hook.intentions_colliding(
+                prompt, hook.open_intentions(timeout=INTENTION_CHECK_TIMEOUT)
             )
             if hits:
-                sections.append(hook.format_spore_collisions(hits))
+                sections.append(hook.format_intention_collisions(hits))
 
         # Crystallized-pattern recall — the on-demand graduated-wisdom tier.
         # A Proven pattern crystallized OUT of the always-loaded working set is
         # recalled here the moment this prompt touches its domain (the read-side
-        # twin of wrap-time crystallization routing). Independent of the spore
+        # twin of wrap-time crystallization routing). Independent of the intention
         # surface above; fail-silent on an empty/absent crystal store. Same tight
         # per-prompt timeout.
         if isinstance(prompt, str) and prompt.strip():

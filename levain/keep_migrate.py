@@ -1,4 +1,4 @@
-"""The Keep and legacy migration (task surfaces TS-4): ``levain spores keep-migrate``.
+"""The Keep and legacy migration (task surfaces TS-4): ``levain intentions keep-migrate``.
 
 The Keep is retired (TS-1): a new ``note`` or ``handoff`` is refused at every write seam, but legacy
 rows still sit in a store, and so do undated agendas (which can never germinate). This module moves
@@ -15,9 +15,9 @@ every one of them to its home, in three separate acts that never share a write:
   ``plan id + origin key``, so it lands once).
 * :func:`revert` (``--revert <plan>``): per item, re-add the original FIRST (same text, notes,
   disposition, created, seen) and only then remove the destination (an episode is tombstoned through
-  anneal's ``delete``; a spore destination is composted). Re-adding a retired disposition cannot go
+  anneal's ``delete``; an intention destination is composted). Re-adding a retired disposition cannot go
   through the guarded store (that is the point of the guard), so revert alone uses anneal's plain
-  ``SporeStore``; the plan file is the operator's act of restoring his own rows.
+  ``IntentionStore``; the plan file is the operator's act of restoring his own rows.
 
 Nothing is silently lost: a note the classifier cannot place becomes an ``observation`` episode
 (T3 (b) as the default for anything unclassified). The classifier is deterministic and conservative
@@ -25,7 +25,7 @@ Nothing is silently lost: a note the classifier cannot place becomes an ``observ
 overrides a destination, before he approves it once.
 
 Frame names (FRAME.md TS-4) against this tree: ``descend(kind="composted")``, ``origin_key`` and the
-disposition vocab match anneal 1.0.3 / ``levain.spores`` exactly. There is no existing "write an
+disposition vocab match anneal 1.0.3 / ``levain.intentions`` exactly. There is no existing "write an
 observation episode" helper to reuse beyond the raw ``anneal_memory.Store.record`` used by
 ``levain.dashboard._record_state_episode``; that is what this module calls.
 
@@ -34,7 +34,7 @@ Safety rules (L3 1107-63):
 * ``apply`` and ``revert`` hold an exclusive ``flock`` on ``<plan>.lock`` for the whole run and load
   the plan under it, so two runs on one plan cannot interleave (a second is refused, nothing written).
   A plan name is reserved with ``O_CREAT|O_EXCL``, so a planner never replaces an earlier plan.
-* Staleness compares the WHOLE row (anneal's ``spore_version``: every field but ``seen`` and
+* Staleness compares the WHOLE row (anneal's ``intention_version``: every field but ``seen`` and
   ``origin_key``, so ``next``, ``target``, tier, ... all count), with this plan's own marker note set
   aside so a resumed apply still matches. The marker update and the compost are compare-and-set on
   that version (``expected_version``) inside anneal's lock: an edit landing after the compare makes
@@ -45,7 +45,7 @@ Safety rules (L3 1107-63):
   original is left exactly as it is (never resurrected).
 * ``revert`` re-adds an original under a revert key and records its id before touching the
   destination; a re-run finds the key and never re-adds or re-writes it.
-* Every keyed spore this module plants (a destination seed / agenda, a restored original) is created
+* Every keyed intention this module plants (a destination seed / agenda, a restored original) is created
   WITH its verbatim notes / created / seen in one store transaction (:func:`_add_verbatim`), so no
   keyed row ever exists half-made, and a keyed row found on a retry is left exactly as found (an
   edit made to it after a crash is never re-written; apply names it in ``Report.kept``).
@@ -59,7 +59,7 @@ Known edges (the reachability line: no real caller reaches these, or they cost n
 * ``_INTENT`` reads the first line only: an intention on a later line classifies as an observation,
   which loses nothing.
 * :func:`resolve_destination` needs ``episodic_db`` passed to resolve an episode (a test/report helper).
-* ``plan`` does not infer ``episodic_db`` from the spores path; ``apply`` refuses cleanly without it.
+* ``plan`` does not infer ``episodic_db`` from the intentions path; ``apply`` refuses cleanly without it.
 * A planner killed between reserving the name and writing leaves an empty ``keep-<ts>.json`` that
   ``load_plan`` refuses by name; delete it.
 * A compare-and-set that refuses after the marker note landed leaves that note on the (still open)
@@ -132,9 +132,9 @@ STATE_REVERT_BLOCKED = "revert_blocked"     # revert could not finish it (destin
 #                                             gone): never `reverted`, `revert_from` keeps its prior state, retried
 
 DEST_EPISODE = "episode"
-DEST_SPORE = "spore"
+DEST_INTENTION = "spore"
 EPISODE_TYPES = ("observation", "decision")
-SPORE_DISPOSITIONS = ("seed", "agenda")
+INTENTION_DISPOSITIONS = ("seed", "agenda")
 
 Fault = Callable[[str, Mapping[str, Any]], None]
 
@@ -145,17 +145,17 @@ class KeepMigrateError(RuntimeError):
 
 # ---------------------------------------------------------------- reading the store, read-only
 
-def _read_doc(spores_json: Path) -> dict[str, Any]:
-    """The spores document, parsed and NEVER written (anneal's own keyed read saves; this must not)."""
+def _read_doc(intentions_json: Path) -> dict[str, Any]:
+    """The intentions document, parsed and NEVER written (anneal's own keyed read saves; this must not)."""
     try:
-        with open(spores_json, "r", encoding="utf-8") as f:
+        with open(intentions_json, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
         return {"spores": [], "resolved": []}
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise KeepMigrateError(f"{spores_json} is unreadable ({exc}); inspect it by hand") from exc
+        raise KeepMigrateError(f"{intentions_json} is unreadable ({exc}); inspect it by hand") from exc
     if not isinstance(data, dict) or not isinstance(data.get("spores", []), list):
-        raise KeepMigrateError(f"{spores_json} is not a spores document; inspect it by hand")
+        raise KeepMigrateError(f"{intentions_json} is not an intentions document; inspect it by hand")
     data.setdefault("spores", [])
     data.setdefault("resolved", [])
     return data
@@ -178,12 +178,12 @@ def _notes(row: Mapping[str, Any]) -> list[str]:
     return [x for x in n if isinstance(x, str)] if isinstance(n, list) else []
 
 
-def pending_counts(spores_json: Path | str) -> dict[str, int]:
+def pending_counts(intentions_json: Path | str) -> dict[str, int]:
     """What awaits migration, for ``levain doctor`` and the one-line ``levain update`` print:
     ``{"notes": N, "handoffs": M, "agendas": K}`` (K = undated agendas, which migrate to seeds).
     Read-only; a missing store counts zero."""
     out = {"notes": 0, "handoffs": 0, "agendas": 0}
-    for row in _read_doc(Path(spores_json))["spores"]:
+    for row in _read_doc(Path(intentions_json))["spores"]:
         if not isinstance(row, dict) or not _is_candidate(row):
             continue
         d = _disp(row)
@@ -191,11 +191,11 @@ def pending_counts(spores_json: Path | str) -> dict[str, int]:
     return out
 
 
-def doctor_line(spores_json: Path | str) -> str | None:
+def doctor_line(intentions_json: Path | str) -> str | None:
     """The doctor string (``keep: N notes / M handoffs await migration``), or None when nothing waits.
     Undated agendas ride in the handoffs count's sentence only when present, so the frame's string is
     exact when there are none."""
-    c = pending_counts(spores_json)
+    c = pending_counts(intentions_json)
     if not (c["notes"] or c["handoffs"] or c["agendas"]):
         return None
     line = f"keep: {c['notes']} notes / {c['handoffs']} handoffs await migration"
@@ -270,15 +270,15 @@ def _propose(row: Mapping[str, Any], *, handoff_to: str, agenda_date: str | None
     if d == "note":
         kind, why = classify_note(text)
         if kind == "seed":
-            return {"kind": DEST_SPORE, "disposition": "seed", "next": None}, why
+            return {"kind": DEST_INTENTION, "disposition": "seed", "next": None}, why
         return {"kind": DEST_EPISODE, "episode_type": kind}, why
     if d == "handoff":
         if handoff_to == "agenda":
-            return ({"kind": DEST_SPORE, "disposition": "agenda", "next": agenda_date},
+            return ({"kind": DEST_INTENTION, "disposition": "agenda", "next": agenda_date},
                     f"legacy handoff to a dated agenda ({agenda_date}), so it reaches him once as a band row (T10b)")
-        return ({"kind": DEST_SPORE, "disposition": "seed", "next": None},
+        return ({"kind": DEST_INTENTION, "disposition": "seed", "next": None},
                 "legacy handoff to a seed: the agent sees it in the Tray at session start (T10a)")
-    return ({"kind": DEST_SPORE, "disposition": "seed", "next": None},
+    return ({"kind": DEST_INTENTION, "disposition": "seed", "next": None},
             "undated agenda never germinates: becomes a seed (SD-15, decided)")
 
 
@@ -330,16 +330,16 @@ def load_plan(plan_path: Path | str) -> dict[str, Any]:
     return doc
 
 
-def plan(spores_json: Path | str, *, migrations_dir: Path | str, episodic_db: Path | str | None = None,
+def plan(intentions_json: Path | str, *, migrations_dir: Path | str, episodic_db: Path | str | None = None,
          handoff_to: str = "seed", agenda_date: str | None = None,
          overrides: Mapping[str, Mapping[str, Any]] | None = None,
          now: datetime | None = None) -> Path:
-    """The DRY RUN. Writes the plan file and returns its path; ``spores_json`` is read, never written.
+    """The DRY RUN. Writes the plan file and returns its path; ``intentions_json`` is read, never written.
 
-    ``overrides`` maps an item's origin key (or spore id) to a destination dict, for a model pass or a
+    ``overrides`` maps an item's origin key (or intention id) to a destination dict, for a model pass or a
     test (T3 (a)); the operator can equally edit the file. ``handoff_to="agenda"`` needs ``agenda_date``
     (``YYYY-MM-DD``; the upgrade day), else handoffs become seeds."""
-    spores_json = Path(spores_json)
+    intentions_json = Path(intentions_json)
     if handoff_to not in ("seed", "agenda"):
         raise KeepMigrateError("handoff_to must be 'seed' or 'agenda'")
     if handoff_to == "agenda":
@@ -347,7 +347,7 @@ def plan(spores_json: Path | str, *, migrations_dir: Path | str, episodic_db: Pa
             date.fromisoformat(agenda_date or "")
         except ValueError as exc:
             raise KeepMigrateError("handoff_to='agenda' needs agenda_date as YYYY-MM-DD") from exc
-    doc = _read_doc(spores_json)
+    doc = _read_doc(intentions_json)
     stamp = _utc_stamp(now)
     items: list[dict[str, Any]] = []
     for row in doc["spores"]:
@@ -391,7 +391,7 @@ def plan(spores_json: Path | str, *, migrations_dir: Path | str, episodic_db: Pa
     _atomic_write(out, {
         "kind": PLAN_KIND, "schema": PLAN_SCHEMA, "plan_id": out.stem,
         "created": (now or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
-        "spores_json": str(spores_json),
+        "spores_json": str(intentions_json),
         "episodic_db": str(episodic_db) if episodic_db is not None else None,
         "options": {"handoff_to": handoff_to, "agenda_date": agenda_date},
         "counts": counts,
@@ -458,7 +458,7 @@ def _revert_key(plan_id: str, item: Mapping[str, Any]) -> str:
 
 
 def _find_row(store: Any, item: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The spore (open or resolved) this item was planned from, by origin key, else id."""
+    """The intention (open or resolved) this item was planned from, by origin key, else id."""
     key = item.get("origin_key")
     if key:
         try:
@@ -473,7 +473,7 @@ def _find_row(store: Any, item: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _add_verbatim(store: Any, *, origin_key: str, row: Mapping[str, Any], text: str,
                   disposition: str, next_: str | None, guard: bool) -> tuple[dict[str, Any], bool]:
-    """``(spore, created)``: plant ``row``'s content under ``origin_key`` WITH its notes / created /
+    """``(intention, created)``: plant ``row``'s content under ``origin_key`` WITH its notes / created /
     seen verbatim, in ONE locked transaction (anneal's ``add`` mints fresh notes and dates, and a note
     added through ``update`` is re-stamped). There is no moment a keyed row exists without its
     verbatim fields, so a keyed row found on a retry is always complete, and it is returned untouched
@@ -484,7 +484,7 @@ def _add_verbatim(store: Any, *, origin_key: str, row: Mapping[str, Any], text: 
     retired-disposition guard the guarded store's ``add`` would (revert alone restores a retired
     one, through anneal's plain store)."""
     if guard:
-        from levain.spores import _refuse_unwritable
+        from levain.intentions import _refuse_unwritable
 
         _refuse_unwritable(disposition)
     fields = store._prepare_add(                  # noqa: SLF001 - see the docstring
@@ -527,9 +527,9 @@ def _validate_dest(item: Mapping[str, Any]) -> None:
         if d.get("episode_type") not in EPISODE_TYPES or not str(d.get("body") or "").strip():
             raise KeepMigrateError(f"item {item.get('index')}: an episode destination needs episode_type "
                                    f"{EPISODE_TYPES} and a body")
-    elif k == DEST_SPORE:
-        if d.get("disposition") not in SPORE_DISPOSITIONS:
-            raise KeepMigrateError(f"item {item.get('index')}: a spore destination must be one of {SPORE_DISPOSITIONS}")
+    elif k == DEST_INTENTION:
+        if d.get("disposition") not in INTENTION_DISPOSITIONS:
+            raise KeepMigrateError(f"item {item.get('index')}: an intention destination must be one of {INTENTION_DISPOSITIONS}")
         if d["disposition"] == "agenda":
             try:
                 date.fromisoformat(str(d.get("next") or ""))
@@ -539,9 +539,9 @@ def _validate_dest(item: Mapping[str, Any]) -> None:
         raise KeepMigrateError(f"item {item.get('index')}: unknown destination kind {k!r}")
 
 
-def _write_destination(item: dict[str, Any], plan_id: str, spores: Any, db: Path | None
+def _write_destination(item: dict[str, Any], plan_id: str, intentions: Any, db: Path | None
                        ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """``(result, found)``: the destination's record, and the keyed spore a crashed run had already
+    """``(result, found)``: the destination's record, and the keyed intention a crashed run had already
     written (None when this call made it, and for an episode)."""
     d = item["destination"]
     key = _dest_key(plan_id, item)
@@ -556,9 +556,9 @@ def _write_destination(item: dict[str, Any], plan_id: str, spores: Any, db: Path
                           "spore": item.get("spore_id")},
                 origin_key=key)
         return {"kind": DEST_EPISODE, "id": ep.id, "origin_key": key}, None
-    made, created = _add_verbatim(spores, origin_key=key, row=item["row"], text=item["text"],
+    made, created = _add_verbatim(intentions, origin_key=key, row=item["row"], text=item["text"],
                                   disposition=d["disposition"], next_=d.get("next") or None, guard=True)
-    return {"kind": DEST_SPORE, "id": made["id"], "origin_key": key}, (None if created else made)
+    return {"kind": DEST_INTENTION, "id": made["id"], "origin_key": key}, (None if created else made)
 
 
 def _marker_notes_out(row: Mapping[str, Any], plan_id: str) -> dict[str, Any]:
@@ -576,9 +576,9 @@ def _marker_notes_out(row: Mapping[str, Any], plan_id: str) -> dict[str, Any]:
 def _content_version(row: Mapping[str, Any], plan_id: str) -> str:
     """anneal's whole-row version (every field the destination depends on, ``next`` included; ``seen``
     and ``origin_key`` excluded by anneal), this plan's marker note set aside."""
-    from anneal_memory.spores import spore_version
+    from anneal_memory.spores import intention_version
 
-    return spore_version(_marker_notes_out(row, plan_id))     # type: ignore[arg-type]
+    return intention_version(_marker_notes_out(row, plan_id))     # type: ignore[arg-type]
 
 
 def _marked(row: Mapping[str, Any], plan_id: str) -> bool:
@@ -591,7 +591,7 @@ def _composted_by_us(row: Mapping[str, Any], plan_id: str) -> bool:
             and _marked(row, plan_id))
 
 
-def _locate_destination(item: Mapping[str, Any], plan_id: str, spores: Any, db: Path | None
+def _locate_destination(item: Mapping[str, Any], plan_id: str, intentions: Any, db: Path | None
                         ) -> dict[str, Any] | None:
     """The destination this item wrote: the recorded result, else a lookup by its deterministic key
     (a crash after the write, before the record). None when none was written (or it is unreadable
@@ -608,15 +608,15 @@ def _locate_destination(item: Mapping[str, Any], plan_id: str, spores: Any, db: 
         with Store(str(db)) as st:
             ep = st.get_by_origin_key(key)
         return {"kind": DEST_EPISODE, "id": ep.id, "origin_key": key} if ep is not None else None
-    if kind == DEST_SPORE:
-        sp = spores.get_by_origin_key(key)
-        return {"kind": DEST_SPORE, "id": sp["id"], "origin_key": key} if sp is not None else None
+    if kind == DEST_INTENTION:
+        sp = intentions.get_by_origin_key(key)
+        return {"kind": DEST_INTENTION, "id": sp["id"], "origin_key": key} if sp is not None else None
     return None
 
 
-def resolve_destination(result: Mapping[str, Any] | None, *, spores_json: Path | str,
+def resolve_destination(result: Mapping[str, Any] | None, *, intentions_json: Path | str,
                         episodic_db: Path | str | None = None) -> bool:
-    """True iff a recorded destination id resolves in the live stores (an episode by its id, a spore by
+    """True iff a recorded destination id resolves in the live stores (an episode by its id, an intention by
     its id, open or resolved)."""
     if not result or not result.get("id"):
         return False
@@ -627,9 +627,9 @@ def resolve_destination(result: Mapping[str, Any] | None, *, spores_json: Path |
 
         with Store(str(episodic_db)) as st:
             return st.get(result["id"]) is not None
-    from levain.spores import guarded_spore_store
+    from levain.intentions import guarded_intention_store
 
-    return guarded_spore_store(spores_json).get(result["id"]) is not None
+    return guarded_intention_store(intentions_json).get(result["id"]) is not None
 
 
 @dataclass
@@ -651,13 +651,13 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
     Held under the plan lock throughout (a second run on the same plan is refused). An item whose
     original changed since the plan is left alone: ``stale`` if nothing was written for it,
     ``conflict`` (destination kept on record for ``revert``) if its destination already exists."""
-    from anneal_memory.spores import SporeError, spore_version
-    from levain.spores import guarded_spore_store
+    from anneal_memory.spores import IntentionError, intention_version
+    from levain.intentions import guarded_intention_store
 
     pp = Path(plan_path).resolve()
     with _plan_lock(pp):
         doc = load_plan(pp)                    # read under the lock: never a copy another run is rewriting
-        spores_json = Path(doc["spores_json"])
+        intentions_json = Path(doc["spores_json"])
         plan_id = doc["plan_id"]
         rep = Report(pp)
         live = (STATE_PENDING, STATE_DEST, STATE_STALE)
@@ -665,10 +665,10 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
             if it["state"] in live:
                 _validate_dest(it)             # every item judged before the first write
         db = _episode_store(doc, episodic_db) if _needs_episodes(doc, live) else None
-        spores = guarded_spore_store(spores_json)
+        intentions = guarded_intention_store(intentions_json)
 
         def leave(it: dict[str, Any], why: str) -> None:
-            found = _locate_destination(it, plan_id, spores, db)
+            found = _locate_destination(it, plan_id, intentions, db)
             if found is not None:
                 it["result"] = found
                 it["state"] = STATE_CONFLICT
@@ -683,7 +683,7 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
             idx = it["index"]
             if it["state"] not in live:
                 continue
-            row = _find_row(spores, it)
+            row = _find_row(intentions, it)
             if row is None:
                 leave(it, "the item is no longer in the store")
                 continue
@@ -698,9 +698,9 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
             if _content_version(row, plan_id) != _content_version(it["row"], plan_id):
                 leave(it, "edited since the plan was made; re-run the dry run")
                 continue
-            result, found = _write_destination(it, plan_id, spores, db)
+            result, found = _write_destination(it, plan_id, intentions, db)
             if found is not None and (_notes(found) != _notes(it["row"]) or found.get("status") != "open"):
-                rep.kept.append((idx, f"destination spore {found['id']} was changed after a crashed run "
+                rep.kept.append((idx, f"destination intention {found['id']} was changed after a crashed run "
                                       "wrote it; left exactly as found"))
             if fault:
                 fault("after_destination", it)
@@ -713,11 +713,11 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
             try:                               # compare-and-set on the version just compared
                 cur = row
                 if not _marked(row, plan_id):
-                    cur = spores.update(row["id"], add_note=f"migrated out of the Keep by {marker}",
-                                        expected_version=spore_version(row), today=today)
-                spores.descend(row["id"], kind="composted", expect_disposition=it["disposition"],
-                               expected_version=spore_version(cur), today=today)
-            except SporeError:
+                    cur = intentions.update(row["id"], add_note=f"migrated out of the Keep by {marker}",
+                                        expected_version=intention_version(row), today=today)
+                intentions.descend(row["id"], kind="composted", expect_disposition=it["disposition"],
+                               expected_version=intention_version(cur), today=today)
+            except IntentionError:
                 leave(it, "changed while being applied; the original is left as it now is")
                 continue
             it["state"] = STATE_APPLIED
@@ -737,14 +737,14 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
     their original left exactly as it is. An original resolved by someone other than this plan, or no
     longer in the store, is never resurrected. An item revert cannot finish goes ``revert_blocked``
     (never ``reverted``) and is retried next time. Held under the plan lock throughout."""
-    from anneal_memory.spores import SporeError, SporeStore, spore_version
-    from levain.spores import NEW_ID_PREFIX, guarded_spore_store
+    from anneal_memory.spores import IntentionError, IntentionStore, intention_version
+    from levain.intentions import NEW_ID_PREFIX, guarded_intention_store
 
     pp = Path(plan_path).resolve()
     with _plan_lock(pp):
         doc = load_plan(pp)
         plan_id = doc["plan_id"]
-        spores_json = Path(doc["spores_json"])
+        intentions_json = Path(doc["spores_json"])
         restore_states = (STATE_APPLIED, STATE_DEST)
         if _needs_episodes(doc, restore_states + (STATE_CONFLICT, STATE_REVERT_BLOCKED)):
             db: Path | None = _episode_store(doc, episodic_db)
@@ -755,8 +755,8 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
                 db = None
         else:
             db = None
-        guarded = guarded_spore_store(spores_json)       # first: an anneal below the floor gets its clear error here
-        plain = SporeStore(spores_json, id_prefix=NEW_ID_PREFIX)         # ONLY for restoring a retired disposition (see module doc)
+        guarded = guarded_intention_store(intentions_json)       # first: an anneal below the floor gets its clear error here
+        plain = IntentionStore(intentions_json, id_prefix=NEW_ID_PREFIX)         # ONLY for restoring a retired disposition (see module doc)
         rep = Report(pp)
 
         def block(it: dict[str, Any], base: str, why: str) -> None:
@@ -807,15 +807,15 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
                 with Store(str(db)) as st:
                     if st.get(res["id"]) is not None:
                         st.delete(res["id"])
-            elif res is not None and res.get("kind") == DEST_SPORE:
+            elif res is not None and res.get("kind") == DEST_INTENTION:
                 dest = guarded.get(res["id"])
                 if dest is not None and dest.get("status") == "open":
                     try:                       # compare-and-set: an edit landing mid-revert is not composted
                         cur = guarded.update(dest["id"], add_note=f"reverted by {NOTE_MARK}{pp}",
-                                             expected_version=spore_version(dest), today=today)
+                                             expected_version=intention_version(dest), today=today)
                         guarded.descend(dest["id"], kind="composted",
-                                        expected_version=spore_version(cur), today=today)
-                    except SporeError:
+                                        expected_version=intention_version(cur), today=today)
+                    except IntentionError:
                         block(it, base, f"destination {dest['id']} changed during the revert; left open")
                         continue
             it["state"] = STATE_REVERTED

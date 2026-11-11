@@ -439,7 +439,7 @@ def test_every_other_passkey_act_is_refused(world):
     bundled["grants"][GP2] = grad(world, GP2)
     bundled["grants"][OPT] = opt_in(world, "pk")
     for op in ({"op": "loosen", "policy": bundled},
-               {"op": "raise", "verb": "spore_touch", "tier": "T3"},
+               {"op": "raise", "verb": "intention_touch", "tier": "T3"},
                {"op": "timeouts", "timeouts": {"x": 1}},
                {"op": "revoke_key", "fingerprint": world.fp("pk2")}):
         assert "one graduation act per link" in world.refused(op, "pk")
@@ -469,7 +469,7 @@ def test_a_v1_inert_path_loosen_of_a_graduation_policy_is_refused_by_this_replay
     snap = world.link({"op": "create_grant", "grant": grad(world)})
     policy = snap.policy.as_dict()
     policy["grants"][GP]["actions"] = {"doc.append": dict(LOW), "deliver": dict(LOW)}
-    policy["raise_to"] = {"spore_touch": "T3"}
+    policy["raise_to"] = {"intention_touch": "T3"}
     assert "a graduation policy's terms are fixed" in world.replay_verdict(world.plant({"op": "loosen",
                                                                                        "policy": policy}))
 
@@ -524,7 +524,7 @@ def test_the_older_levain_takes_the_planted_inert_loosen_this_replay_refuses(wor
     snap = world.state()
     policy = snap.policy.as_dict()
     policy["grants"][GP]["actions"] = {"doc.append": dict(LOW), "deliver": dict(LOW)}
-    policy["raise_to"] = {"spore_touch": "T3"}
+    policy["raise_to"] = {"intention_touch": "T3"}
     db = world.plant({"op": "loosen", "policy": policy})
     assert older_replay(world.tmp, db)["seq"] == snap.seq + 1
     assert "a graduation policy's terms are fixed" in world.replay_verdict(db)

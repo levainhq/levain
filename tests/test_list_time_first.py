@@ -1,7 +1,7 @@
 """THE LIST GOES TIME-FIRST (plan 1109 "the List goes time-first", item 1).
 
 The List's primary partition is time: NOW (due, overdue, live) / LATER (any row whose wake is in the future, from any source) /
-SOMEDAY (undated seeds) / DONE (resolved or composted in the last 7 days). The type (band, spore, talk, drop, board) is a tag on
+SOMEDAY (undated seeds) / DONE (resolved or composted in the last 7 days). The type (band, intention, talk, drop, board) is a tag on
 every row and a filter across the time-states. Pinned here, on the kernel's own panel: a future-dated row of ANY source lands
 in Later and says where it lands when it wakes; Someday holds undated seeds only; Done shows the last seven days of resolutions
 and offers no verb; every row kind carries its type tag."""
@@ -26,7 +26,7 @@ def _rows(r: Rig) -> dict[str, dict[str, Any]]:
 
 
 def _sp(r: Rig, key: str) -> str:
-    return f"spore:{r.ids[key]}"
+    return f"intention:{r.ids[key]}"
 
 
 def test_a_future_dated_row_from_any_source_lands_in_later_and_says_where_it_wakes(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -40,8 +40,8 @@ def test_a_future_dated_row_from_any_source_lands_in_later_and_says_where_it_wak
     rows = _rows(rig)
     band = rows[f"band:{rig.q.id}"]
     got = {
-        "band": band, "desk": rows[_sp(rig, "drop_later")], "board": rows[f"spore:{board_drop}"],
-        "talk": rows[f"spore:{talk}"], "seed": rows[f"spore:{seed}"],
+        "band": band, "desk": rows[_sp(rig, "drop_later")], "board": rows[f"intention:{board_drop}"],
+        "talk": rows[f"intention:{talk}"], "seed": rows[f"intention:{seed}"],
     }
     for name, row in got.items():
         assert row["group"] == "later", (name, row["group"])
@@ -66,9 +66,9 @@ def test_later_buckets_are_tomorrow_this_week_and_later_dates(rig: Rig) -> None:
                   next=(TODAY + timedelta(days=d)).isoformat(), today=TODAY)["id"]
            for n, d in (("tomorrow", 1), ("week", 6), ("far", 30))}
     rows = _rows(rig)
-    assert rows[f"spore:{ids['tomorrow']}"]["facets"]["wake_bucket"] == "tomorrow"
-    assert rows[f"spore:{ids['week']}"]["facets"]["wake_bucket"] == "week"
-    assert rows[f"spore:{ids['far']}"]["facets"]["wake_bucket"] == "later"
+    assert rows[f"intention:{ids['tomorrow']}"]["facets"]["wake_bucket"] == "tomorrow"
+    assert rows[f"intention:{ids['week']}"]["facets"]["wake_bucket"] == "week"
+    assert rows[f"intention:{ids['far']}"]["facets"]["wake_bucket"] == "later"
 
 
 def test_someday_holds_undated_seeds_only(rig: Rig) -> None:
@@ -77,7 +77,7 @@ def test_someday_holds_undated_seeds_only(rig: Rig) -> None:
     assert someday, "the rig holds an undated seed"
     for r in someday:
         f = r["facets"]
-        assert f["time_state"] == "someday" and f["surface"] == "spore" and f["disposition"] == "seed", f
+        assert f["time_state"] == "someday" and f["surface"] == "intention" and f["disposition"] == "seed", f
         assert not f.get("due"), f                                         # undated
     assert _sp(rig, "plain") in {r["id"] for r in someday}
     for key in ("talk_old", "drop_late", "drop_soon", "agenda_old", "drop_later"):   # a talk, a drop, a dated row is never Someday
@@ -102,9 +102,9 @@ def test_done_shows_the_last_seven_days_of_resolutions_and_offers_no_verb(rig: R
     for r in done:
         assert r["facets"]["time_state"] == "done" and r["facets"]["done_kind"] == "done", r["facets"]
         assert r["actions"] == [], r["actions"]                              # read-only: no verb on a closed row
-    assert {r["id"]: r["facets"]["surface"] for r in done} == {f"done:{talk}": "talk", f"done:{recent}": "spore"}
-    # a resolved spore is not an open row too
-    assert f"spore:{recent}" not in {r["id"] for r in p["rows"]}
+    assert {r["id"]: r["facets"]["surface"] for r in done} == {f"done:{talk}": "talk", f"done:{recent}": "intention"}
+    # a resolved intention is not an open row too
+    assert f"intention:{recent}" not in {r["id"] for r in p["rows"]}
 
 
 def test_every_row_kind_carries_its_type_tag(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -113,7 +113,7 @@ def test_every_row_kind_carries_its_type_tag(rig: Rig, monkeypatch: pytest.Monke
     _band_with(monkeypatch, rig, snoozed_until=(TODAY + timedelta(days=2)).isoformat())
     p = rig.panel()
     kinds = {r["facets"].get("surface") for r in p["rows"]}
-    assert kinds == set(list_panel.SURFACES), kinds                          # band, board, spore, talk, drop: all present, none untagged
+    assert kinds == set(list_panel.SURFACES), kinds                          # band, board, intention, talk, drop: all present, none untagged
     assert {r["facets"]["time_state"] for r in p["rows"]} == {"now", "later", "someday", "done"}
     for r in p["rows"]:
         assert r["facets"].get("surface") in list_panel.SURFACES, r
@@ -121,9 +121,9 @@ def test_every_row_kind_carries_its_type_tag(rig: Rig, monkeypatch: pytest.Monke
 
 def test_a_surface_date_moved_to_the_future_moves_the_row_to_later_on_the_next_read(rig: Rig) -> None:
     sid = rig.ids["drop_soon"]
-    assert rig.rows()[f"spore:{sid}"]["group"] == "today"
+    assert rig.rows()[f"intention:{sid}"]["group"] == "today"
     rig.sp.update(sid, next=(TODAY + timedelta(days=4)).isoformat())
-    row = rig.rows()[f"spore:{sid}"]
+    row = rig.rows()[f"intention:{sid}"]
     assert row["group"] == "later" and row["facets"]["time_state"] == "later", row
 
 
@@ -141,15 +141,15 @@ def test_an_agenda_with_no_valid_target_wakes_into_the_band_never_the_list(rig: 
               next=_day(3), today=TODAY)["id"]
     seed = add(type="task", text="a dated seed", disposition="seed", next=_day(3), today=TODAY)["id"]
     rows = _rows(rig)
-    assert rows[f"spore:{bare}"]["facets"]["wake_line"].endswith("→ band"), rows[f"spore:{bare}"]["facets"]
-    assert rows[f"spore:{odd}"]["facets"]["wake_line"].endswith("→ band"), rows[f"spore:{odd}"]["facets"]
-    assert rows[f"spore:{seed}"]["facets"]["wake_line"].endswith("→ list")
+    assert rows[f"intention:{bare}"]["facets"]["wake_line"].endswith("→ band"), rows[f"intention:{bare}"]["facets"]
+    assert rows[f"intention:{odd}"]["facets"]["wake_line"].endswith("→ band"), rows[f"intention:{odd}"]["facets"]
+    assert rows[f"intention:{seed}"]["facets"]["wake_line"].endswith("→ list")
 
 
 def test_an_undated_agenda_is_someday_and_an_undated_talk_stays_now(rig: Rig) -> None:
     agenda = rig.sp.add(type="task", text="an agenda with no date", disposition="agenda", target="desk", today=TODAY)["id"]
     rows = _rows(rig)
-    assert rows[f"spore:{agenda}"]["facets"]["time_state"] == "someday" and rows[f"spore:{agenda}"]["group"] == "someday"
+    assert rows[f"intention:{agenda}"]["facets"]["time_state"] == "someday" and rows[f"intention:{agenda}"]["group"] == "someday"
     talk = rows[_sp(rig, "talk_new")]
     assert talk["facets"]["time_state"] == "now" and talk["group"] == "talk"
 
@@ -189,7 +189,7 @@ def test_done_is_a_window_with_an_edge_and_a_cap_that_says_what_it_hides(rig: Ri
     descend(outside, kind="done", today=TODAY, now=NOW - timedelta(days=list_panel.DONE_DAYS) - timedelta(minutes=1))
     assert _done_ids(rig) == [f"done:{inside}"]
     from levain.cockpit import providers
-    monkeypatch.setattr(providers, "SPORE_CAP", 1)
+    monkeypatch.setattr(providers, "INTENTION_CAP", 1)
     more = add(type="task", text="a newer one", disposition="seed", today=TODAY)["id"]
     descend(more, kind="done", today=TODAY, now=NOW - timedelta(hours=1))
     p = rig.panel()
@@ -236,7 +236,7 @@ def test_a_missing_or_non_list_resolved_is_no_done_rows_and_not_a_fault(rig: Rig
 
 
 def test_an_empty_store_has_no_done_rows(tmp_path: Path) -> None:
-    empty = Rig(tmp_path, spores=False, band=False, board=False)
+    empty = Rig(tmp_path, intentions=False, band=False, board=False)
     p = empty.panel()
     assert [r for r in p["rows"] if r["group"] == "done"] == []
 
@@ -252,7 +252,7 @@ def test_a_seed_with_a_malformed_next_is_read_as_undated(rig: Rig) -> None:
     sid = rig.sp.add(type="task", text="a seed with a bad date", disposition="seed", today=TODAY)["id"]
     _edit_store(rig, lambda d: [s.update(next="soonish") for s in d["spores"] if s["id"] == sid] if "spores" in d else
                 [s.update(next="soonish") for s in d["open"] if s["id"] == sid])
-    row = _rows(rig)[f"spore:{sid}"]
+    row = _rows(rig)[f"intention:{sid}"]
     assert row["facets"]["time_state"] == "someday" and not row["facets"].get("due"), row["facets"]
 
 
@@ -263,5 +263,5 @@ def test_wake_bucket_edges(days: int, bucket: str) -> None:
 
 def test_the_done_group_title_is_derived_from_the_window() -> None:
     from levain.cockpit import registry
-    titles = dict(registry.ORDERINGS["spore.list"].groups)
+    titles = dict(registry.ORDERINGS["intention.list"].groups)
     assert titles.get("done") == f"Done, last {list_panel.DONE_DAYS} days", titles

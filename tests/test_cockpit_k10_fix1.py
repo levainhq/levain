@@ -58,7 +58,7 @@ def test_a_typed_question_answer_survives_a_new_consent_arriving(tmp_path: Path,
 
 # --- items 3+4: the server decides the calendar day, the page draws it ---------------------------------------------------
 
-def test_a_spore_task_carries_the_server_s_age_in_calendar_days():
+def test_a_intention_task_carries_the_server_s_age_in_calendar_days():
     from datetime import date, datetime, timezone
     from types import SimpleNamespace
 
@@ -66,13 +66,13 @@ def test_a_spore_task_carries_the_server_s_age_in_calendar_days():
 
     now = datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc)
     today = now.astimezone().date()
-    dated = SimpleNamespace(id="spore-1", text="a", tier="hot", created="2026-10-18")
-    stamped = SimpleNamespace(id="spore-2", text="b", tier="hot", created="2026-10-01T09:30:00+00:00")
-    undated = SimpleNamespace(id="spore-3", text="c", tier="hot", created="")
-    tasks = {t["id"]: t for t in topo._spore_tasks([dated, stamped, undated], now)}
-    assert tasks["spore:spore-1"]["age_days"] == (today - date(2026, 10, 18)).days
-    assert tasks["spore:spore-2"]["age_days"] == (today - datetime(2026, 10, 1, 9, 30, tzinfo=timezone.utc).astimezone().date()).days
-    assert tasks["spore:spore-3"]["age_days"] is None                    # unknown is null, never a guess
+    dated = SimpleNamespace(id="intention-1", text="a", tier="hot", created="2026-10-18")
+    stamped = SimpleNamespace(id="intention-2", text="b", tier="hot", created="2026-10-01T09:30:00+00:00")
+    undated = SimpleNamespace(id="intention-3", text="c", tier="hot", created="")
+    tasks = {t["id"]: t for t in topo._intention_tasks([dated, stamped, undated], now)}
+    assert tasks["intention:intention-1"]["age_days"] == (today - date(2026, 10, 18)).days
+    assert tasks["intention:intention-2"]["age_days"] == (today - datetime(2026, 10, 1, 9, 30, tzinfo=timezone.utc).astimezone().date()).days
+    assert tasks["intention:intention-3"]["age_days"] is None                    # unknown is null, never a guess
 
 
 def _node(js: str) -> str:
@@ -95,7 +95,7 @@ def _value_for_signature() -> dict:
             "lost_if_closed": [], "errors": [], "unreadable": [],
             "nodes": [{"id": "n1", "group": None, "parent": None, "label": "a", "agent": "claude_code", "model": None, "state": "running", "tool": None,
                        "tokens": 1200, "started": "2026-10-20T11:00:00Z", "last_event": "2026-10-20T11:59:00Z", "rate": 3.1, "card": None}],
-            "tasks": [{"id": "spore:a", "kind": "spore", "label": "a loop", "state": "open", "waits_on": [], "card": None, "outcomes": [],
+            "tasks": [{"id": "intention:a", "kind": "intention", "label": "a loop", "state": "open", "waits_on": [], "card": None, "outcomes": [],
                        "cost": {"usd": None, "tokens": None, "source": None}, "workers": [], "heat": "hot", "opened": "2026-10-18T00:00:00+00:00", "age_days": 2}]}
 
 
@@ -125,7 +125,7 @@ _DAY_JS = r"""
 const row = (id, due) => ({ id, title: id, body: id, facets: due ? { due } : {}, group: null, badges: [], actions: [] });
 const tm = {
   manifest: Object.assign(manifest({ hero: [], brief: [], widgets: [], header: [], zones: [{ id: "operate", title: "Work", grid: 3, panels: ["tray"], cards: [{ panels: ["tray"], size: "tall", span: 1, tabs: null }] }] }), {}),
-  panels: { tray: head("tray", "list", "Tray", { today: "2026-03-05", rows: [Object.assign(row("spore:spore-1", "2026-03-04"), { facets: { due: "2026-03-04", disposition: "seed" } })], actions: [] }) } };
+  panels: { tray: head("tray", "list", "Tray", { today: "2026-03-05", rows: [Object.assign(row("intention:intention-1", "2026-03-04"), { facets: { due: "2026-03-04", disposition: "seed" } })], actions: [] }) } };
 tm.manifest.panels = { tray: head("tray", "list", "Tray", {}) };
 const tv = V.fromManifest(tm);
 out.tray = (tv.tray || []).map((s) => [s.next, s.today]);
@@ -283,10 +283,10 @@ def test_where_to_begin_does_not_lead_with_an_expired_undated_handoff():
     today = date(2026, 10, 20)
     sp = lambda i, text, seen, **o: SimpleNamespace(id=i, text=text, disposition="handoff", next=o.get("next", ""), seen=seen,  # noqa: E731
                                                     tier="warm", type="task", domain="", salience=1, created="")
-    old = sp("spore-1", "a handoff nobody has touched for 26 days", "2026-09-24")
-    fresh = sp("spore-2", "a handoff touched yesterday", "2026-10-19")
-    edge = sp("spore-3", "a handoff on the last fresh day", (today - timedelta(days=HANDOFF_FRESH_DAYS)).isoformat())
-    view = SimpleNamespace(tray=[old, fresh, edge], open_spores=[], errors={})
+    old = sp("intention-1", "a handoff nobody has touched for 26 days", "2026-09-24")
+    fresh = sp("intention-2", "a handoff touched yesterday", "2026-10-19")
+    edge = sp("intention-3", "a handoff on the last fresh day", (today - timedelta(days=HANDOFF_FRESH_DAYS)).isoformat())
+    view = SimpleNamespace(tray=[old, fresh, edge], open_intentions=[], errors={})
     ctx = SimpleNamespace(today=today, memo=lambda k, f: view)
     source = SimpleNamespace(build=lambda **kw: view)
     got = _where_to_begin(source)(ctx).value
@@ -345,7 +345,7 @@ def test_the_decisions_tile_draws_the_glance_lines_and_not_a_generic_first_line_
     assert [c for c, _t in subs] == ["sub glance-top", "sub glance-sum"], subs
 
 
-def test_the_two_server_views_count_a_spores_age_from_the_same_local_day(monkeypatch) -> None:
+def test_the_two_server_views_count_a_intentions_age_from_the_same_local_day(monkeypatch) -> None:
     """L3 r2 (codex): `2026-10-20T00:30:00Z` is 10-19 in New York; topology and the Open loops row must both say 1 day old."""
     import os
     from datetime import date, datetime, timezone
@@ -358,11 +358,11 @@ def test_the_two_server_views_count_a_spores_age_from_the_same_local_day(monkeyp
     monkeypatch.setenv("TZ", "America/New_York")
     time.tzset()
     try:
-        s = SimpleNamespace(id="spore-9", text="t", tier="hot", created="2026-10-20T00:30:00Z", disposition="loop", domain="d",
+        s = SimpleNamespace(id="intention-9", text="t", tier="hot", created="2026-10-20T00:30:00Z", disposition="loop", domain="d",
                             salience=1, type="x", seen="", next=None, pointer=None, origin_key="")
         now = datetime(2026, 10, 20, 16, 0, tzinfo=timezone.utc)      # 12:00 in New York
-        row = prov._spore_row(s, date(2026, 10, 20))
-        task = topo._spore_tasks([s], now)[0]
+        row = prov._intention_row(s, date(2026, 10, 20))
+        task = topo._intention_tasks([s], now)[0]
         assert row.facets["age_days"] == task["age_days"] == 1, (row.facets["age_days"], task["age_days"])
     finally:
         if old is None:

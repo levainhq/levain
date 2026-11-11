@@ -33,12 +33,12 @@ from levain.writes import WriteScope
 
 def _store_with_data(tmp_path: Path) -> SubstrateSource:
     """A populated substrate: a graduated association (live write-path), one open
-    spore, and a two-section continuity. Mirrors the app_server fixture so the two
+    intention, and a two-section continuity. Mirrors the app_server fixture so the two
     surfaces are tested against the same shape. Returned as a ``SubstrateSource``
     (no install root — these temp stores aren't a full ``.levain`` install, so the
     seed/config tier is simply absent)."""
     from anneal_memory import Store
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
 
     db = tmp_path / "memory.db"
     with Store(db) as store:
@@ -46,7 +46,7 @@ def _store_with_data(tmp_path: Path) -> SubstrateSource:
         b = store.record("noticed Z", "observation")
         store.wrap_started(token="w1", episode_ids=[a.id, b.id])
         store.wrap_completed(2, 20, wrap_token="w1", episode_ids=[a.id, b.id])
-    SporeStore(tmp_path / "memory.spores.json").add(
+    IntentionStore(tmp_path / "memory.spores.json", id_prefix="intention").add(
         type="task", text="an open loop", tier="hot", salience=2
     )
     (tmp_path / "memory.continuity.md").write_text(
@@ -101,7 +101,7 @@ def _request(url: str, *, method: str = "GET", headers: dict | None = None):
 
 def _get_h(url: str, *, headers: dict | None = None, method: str = "GET"):
     """GET/HEAD → (status, body_bytes), carrying request headers (the off-box token) and TOLERATING a
-    403 (returns its code + body) — the read-gate harness (spore-220); plain ``_get`` raises. Python's
+    403 (returns its code + body) — the read-gate harness (intention-220); plain ``_get`` raises. Python's
     http.client knows a HEAD response carries no body regardless of Content-Length, so HEAD won't hang."""
     req = urllib.request.Request(url, headers=headers or {}, method=method)
     try:
@@ -123,12 +123,12 @@ def _state_pv(src) -> str:
 class TestSubstrateJson:
     def test_build_substrate_json_shape(self, tmp_path: Path) -> None:
         data = json.loads(build_substrate_json(_store_with_data(tmp_path)))
-        for key in ("paths", "health", "graph", "crystal_index", "open_spores",
+        for key in ("paths", "health", "graph", "crystal_index", "open_intentions",
                     "sections", "errors"):
             assert key in data
         assert data["health"]["total_episodes"] == 2
         assert data["health"]["write_path_live"] is True
-        assert len(data["open_spores"]) == 1
+        assert len(data["open_intentions"]) == 1
         assert data["sections"][0]["heading"] == "State"
 
     def test_extra_panels_merge_into_layout_and_data(self, tmp_path: Path) -> None:
@@ -386,7 +386,7 @@ class TestSubstrateJson:
         assert headers["Content-Type"] == "application/json; charset=utf-8"
         data = json.loads(body)
         assert data["health"]["total_episodes"] == 2
-        assert len(data["open_spores"]) == 1
+        assert len(data["open_intentions"]) == 1
 
     def test_endpoint_ignores_query_string(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):
@@ -405,7 +405,7 @@ class TestSubstrateJson:
 
     def test_handle_error_swallows_client_disconnects(self, tmp_path: Path, capsys) -> None:
         """A kept-alive client RESET (HTTP/1.1 + a browser connection pool on a mesh
-        bind — spore-178) raises ConnectionResetError up through socketserver; the
+        bind — intention-178) raises ConnectionResetError up through socketserver; the
         ``_LevainHTTPServer.handle_error`` override swallows that family silently, while
         a genuine error still delegates to the base so real bugs surface."""
         httpd = make_server(_store_with_data(tmp_path), host="127.0.0.1", port=0)
@@ -498,7 +498,7 @@ class TestAssets:
             assert token in core, f"dashboard_core.js missing {token!r} (action seam)"
 
     def test_async_job_seam_wired(self) -> None:
-        """The async-job (consult) seam (spore-206) is wired end-to-end across BOTH JS layers:
+        """The async-job (consult) seam (intention-206) is wired end-to-end across BOTH JS layers:
         boot exposes commitJob (POST /action, NO board reload) + pollJob (GET /job.json) + injects
         them into render; core stores them from opts, branches on spec.job in buildActionBox, runs
         the in-box poll loop, and renders the result via textContent (CSP-safe)."""
@@ -517,19 +517,19 @@ class TestAssets:
         # a board-reloading write defers while a job polls (L3 codex MED — no detached result box)
         assert "deferredReload" in boot and "jobsActive()" in boot
 
-    def test_every_rendered_row_spore_route_write_carries_its_snapshot_and_a_stale_refresh_latches(self) -> None:
-        """spore-174: the page sends the disposition it rendered on every route-dependent spore write, and a
+    def test_every_rendered_row_intention_route_write_carries_its_snapshot_and_a_stale_refresh_latches(self) -> None:
+        """intention-174: the page sends the disposition it rendered on every route-dependent intention write, and a
         stale refresh stays owed until a load renders (a blocked passive load latches, and the latch flushes
         when an editor closes or an in-flight load lands)."""
         import re
         core = load_web_asset("dashboard_core.js")
         boot = load_web_asset("dashboard_boot.js")
-        for m in re.finditer(r'kind: "spore_set_disposition"[^}]*\}', core):
+        for m in re.finditer(r'kind: "intention_set_disposition"[^}]*\}', core):
             assert "expect_disposition: s.disposition" in m.group(0), m.group(0)
         # one route-dependent write is left (metabolize); the Keep's to-tray / activate / remind-me went with the panel (TS-5a)
-        assert len(re.findall(r'kind: "spore_set_disposition"', core)) == 1
+        assert len(re.findall(r'kind: "intention_set_disposition"', core)) == 1
         assert "req.expect_disposition = s.disposition;" in core
-        assert 'if (kind === "spore_descend") req.expect_disposition' not in core
+        assert 'if (kind === "intention_close") req.expect_disposition' not in core
         assert "retireStaleForm(form)" in core and "levain:editor-closed" in core
         assert "function rereadLatched" in boot and "deferredReload = true" in boot
         assert boot.count("rereadLatched()") >= 2            # the legacy timer and the manifest fault path
@@ -633,7 +633,7 @@ console.log("OK");
         # park = pin an OPEN loop to Keep via a tier change (mirror of reactivate) — NOT a
         # compost/descend kind (park is pause-not-resolve) [Phill 2026-06-19].
         assert '"park"' in core and 'tier: "parked"' in core, "Open-Loops 'park' verb missing"
-        # Open-Loops client-side filter (text OR spore-id), persisted across re-renders
+        # Open-Loops client-side filter (text OR intention-id), persisted across re-renders
         assert "openLoopsQuery" in core, "Open-Loops filter (openLoopsQuery) missing"
         assert "ta.value = s.text" in core, "openTextEdit must seed the editor from the full s.text"
         assert "-webkit-line-clamp" in css, "dashboard.css missing the clause line-clamp"
@@ -983,7 +983,7 @@ class TestHandlerFaultPath:
 
         def boom(_paths, _extra_panels=None, *, write_token_required=False, extra_verbs=None, threads=True):
             # mirror build_substrate_json's real signature (gained extra_panels, then the
-            # keyword-only write_token_required for spore-129, then extra_verbs for the
+            # keyword-only write_token_required for intention-129, then extra_verbs for the
             # action-seam) so the stub is CALLED, not TypeError'd on an unexpected kwarg —
             # the fault under test is the RuntimeError.
             raise RuntimeError("kaboom")
@@ -1129,7 +1129,7 @@ def _make_full_install(tmp_path: Path) -> SubstrateSource:
     (root / "seed" / "origin.md").write_text(_W_ORIGIN, encoding="utf-8")
     (root / "seed" / "partnership.md").write_text(_W_CONST, encoding="utf-8")
     (root / "seed" / "memory.md").write_text(_W_CONST, encoding="utf-8")
-    (root / "seed" / "spore_instructions.md").write_text(_W_CONST, encoding="utf-8")
+    (root / "seed" / "intention_instructions.md").write_text(_W_CONST, encoding="utf-8")
     (root / "activation" / "posture.md").write_text("Slow is fast.\n", encoding="utf-8")
     (root / "activation" / "recency_directives.md").write_text("No gatekeeping.\n", encoding="utf-8")
     return SubstrateSource.local(root)
@@ -1340,57 +1340,57 @@ class TestWriteBoundary:
         assert status == 503
 
 
-# --- Slice 2b-ii: the Class-B verb route (spores + episode tombstone) --------
+# --- Slice 2b-ii: the Class-B verb route (intentions + episode tombstone) --------
 
 def _seed_anneal(src: SubstrateSource) -> tuple[str, str]:
-    """Plant an open spore + an episode in the install's `.levain/` anneal store so
+    """Plant an open intention + an episode in the install's `.levain/` anneal store so
     the Class-B verb route has real lifecycle data to act on."""
     from anneal_memory import Store
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
 
     root = src.install_root
-    s = SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="ship 2b-ii")
+    s = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="ship 2b-ii")
     with Store(str(root / ".levain" / "memory.db")) as store:
         ep = store.record("built the writable handle", "observation")
     return str(s["id"]), ep.id
 
 
 class TestClassBRoute:
-    def test_spore_descend_confirm_flow(self, tmp_path: Path) -> None:
+    def test_intention_descend_confirm_flow(self, tmp_path: Path) -> None:
         # the destructive verb is refused without confirm, then succeeds with it —
         # the per-write confirm gate enforced end-to-end through the HTTP boundary.
         src = _make_full_install(tmp_path)
         sid, _eid = _seed_anneal(src)
         with _serving(src) as (base, _httpd):
             s1, b1 = _post(base + "/edit", {
-                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "expect_disposition": None,
+                "kind": "intention_close", "intention_id": sid, "intention_kind": "done", "expect_disposition": None,
             })
             s2, b2 = _post(base + "/edit", {
-                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+                "kind": "intention_close", "intention_id": sid, "intention_kind": "done", "confirm": True,
                 "expect_disposition": None,     # K2a: a legacy descend names the list it rendered
             })
         assert s1 == 409 and b1["error"] == "confirm_required"
         assert s2 == 200 and b2["ok"] is True
 
-    def test_a_descend_against_a_moved_spore_answers_stale_so_the_page_rereads(self, tmp_path: Path) -> None:
-        # spore-174: the page rendered this spore as a Keep note and chose "remove"; it is a live loop now. The CAS
+    def test_a_descend_against_a_moved_intention_answers_stale_so_the_page_rereads(self, tmp_path: Path) -> None:
+        # intention-174: the page rendered this intention as a Keep note and chose "remove"; it is a live loop now. The CAS
         # refuses (nothing composted) and answers "stale", the one refusal the page and the TUI re-read on.
         src = _make_full_install(tmp_path)
         sid, _eid = _seed_anneal(src)
         with _serving(src) as (base, _httpd):
             status, body = _post(base + "/edit", {
-                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+                "kind": "intention_close", "intention_id": sid, "intention_kind": "done", "confirm": True,
                 "expect_disposition": "note",
             })
         assert status == 409 and body["error"] == "stale"   # the kernel refuses the moved row before the write
-        from anneal_memory.spores import SporeStore
-        assert any(s["id"] == sid for s in SporeStore(src.install_root / ".levain" / "memory.spores.json").list_open())
+        from anneal_memory.spores import IntentionStore
+        assert any(s["id"] == sid for s in IntentionStore(src.install_root / ".levain" / "memory.spores.json", id_prefix="intention").list_open())
 
-    def test_spore_touch_fires_and_episode_tombstone_is_refused_needs_broker(self, tmp_path: Path) -> None:
+    def test_intention_touch_fires_and_episode_tombstone_is_refused_needs_broker(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         sid, eid = _seed_anneal(src)
         with _serving(src) as (base, _httpd):
-            st, bt = _post(base + "/edit", {"kind": "spore_touch", "spore_id": sid})
+            st, bt = _post(base + "/edit", {"kind": "intention_touch", "intention_id": sid})
             se, be = _post(base + "/edit", {
                 "kind": "episode_tombstone", "episode_id": eid, "confirm": True,
             })
@@ -1404,7 +1404,7 @@ class TestClassBRoute:
 
 
 class TestRecallJson:
-    """/recall.json — the read-only episode keyword-search route (spore-107)."""
+    """/recall.json — the read-only episode keyword-search route (intention-107)."""
 
     def test_recall_matches_and_carries_no_writable_bit(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _httpd):
@@ -1672,7 +1672,7 @@ class TestExtraRoutes:
         assert "TypeError" in json.loads(body)["errors"]["server"]
 
 
-# --- spore-129: the OFF-BOX write-token (Tailscale-write) boundary ----------
+# --- intention-129: the OFF-BOX write-token (Tailscale-write) boundary ----------
 
 class TestOffBoxWriteToken:
     """A WRITABLE source MAY bind off-loopback ONLY with a ``write_token`` (the off-box
@@ -1714,7 +1714,7 @@ class TestOffBoxWriteToken:
     def test_install_bearing_offloopback_token_does_not_relax(self, tmp_path: Path) -> None:
         import pytest
         # A token MUST NOT relax the install-bearing loopback-only rule — its seed/config is
-        # operator-private, a DIFFERENT concern than spore-129. Refused even WITH a token.
+        # operator-private, a DIFFERENT concern than intention-129. Refused even WITH a token.
         src = _store_with_data(tmp_path)
         install_writable = SubstrateSource(
             anneal=src.anneal, install_root=tmp_path,
@@ -1727,9 +1727,9 @@ class TestOffBoxWriteToken:
         # K2a (design §4.3): a loopback writable bind NO LONGER trusts the address. A write with no
         # token is 403 credential_required and writes nothing; with the launch's token a C1 write
         # lands. Reads on loopback stay token-free; the substrate signal write_token_required now says "attach it".
-        from anneal_memory.spores import SporeStore
-        src = self._writable_noinstall(tmp_path)          # plants the open spore in tmp_path
-        store = SporeStore(tmp_path / "memory.spores.json")
+        from anneal_memory.spores import IntentionStore
+        src = self._writable_noinstall(tmp_path)          # plants the open intention in tmp_path
+        store = IntentionStore(tmp_path / "memory.spores.json", id_prefix="intention")
         sid = str(store.list_open()[0]["id"])
         from levain.writes import recent_edits
         ledger = tmp_path / "ledger"
@@ -1742,16 +1742,16 @@ class TestOffBoxWriteToken:
             assert v["writable"] is True
             assert v["write_token_required"] is True    # K2a: the signal now means "attach the credential"
             for bad in (None, "wrong"):
-                st, resp = _post(base + "/edit", {"kind": "spore_touch", "spore_id": sid}, token=bad)
+                st, resp = _post(base + "/edit", {"kind": "intention_touch", "intention_id": sid}, token=bad)
                 assert st == 403 and resp["error"] == "credential_required"
             assert recent_edits(ledger) == []                           # nothing written
-            st, resp = _post(base + "/edit", {"kind": "spore_touch", "spore_id": sid}, token=tok)
+            st, resp = _post(base + "/edit", {"kind": "intention_touch", "intention_id": sid}, token=tok)
             assert st == 200 and resp["action"] == "touch"            # with the token a C1 write lands
-            assert [r["kind"] for r in recent_edits(ledger)] == ["spore_touch"]
+            assert [r["kind"] for r in recent_edits(ledger)] == ["intention_touch"]
 
     def test_offbox_substrate_json_requires_token(self, tmp_path: Path) -> None:
-        # spore-220: an off-box WRITABLE bind gates the substrate-bearing READS too — the exact
-        # read-exposure the spore closes (any tailnet node could read the full store token-free).
+        # intention-220: an off-box WRITABLE bind gates the substrate-bearing READS too — the exact
+        # read-exposure the intention closes (any tailnet node could read the full store token-free).
         # Tokenless / wrong token → 403; correct token → 200 carrying write_token_required:True (the
         # frontend keeps attaching it). The predicate + compare mirror do_POST via the shared helpers.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
@@ -1764,7 +1764,7 @@ class TestOffBoxWriteToken:
             assert json.loads(body)["write_token_required"] is True
 
     def test_offbox_head_request_is_gated(self, tmp_path: Path) -> None:
-        # spore-220: HEAD rides the SAME _route gate as GET (do_HEAD → _route). A tokenless off-box
+        # intention-220: HEAD rides the SAME _route gate as GET (do_HEAD → _route). A tokenless off-box
         # HEAD → 403 (no substrate framing leaked); WITH the token it reaches the route → 200.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
@@ -1774,7 +1774,7 @@ class TestOffBoxWriteToken:
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
 
     def test_offbox_recall_json_requires_token(self, tmp_path: Path) -> None:
-        # spore-220: /recall.json (episode keyword search = substrate content) is gated identically.
+        # intention-220: /recall.json (episode keyword search = substrate content) is gated identically.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
             _set_offbox_token(httpd, "s3cret")
@@ -1783,7 +1783,7 @@ class TestOffBoxWriteToken:
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
 
     def test_offbox_job_json_requires_token(self, tmp_path: Path) -> None:
-        # spore-220: /job.json (async action-verb results) is gated the same. The gate fires BEFORE
+        # intention-220: /job.json (async action-verb results) is gated the same. The gate fires BEFORE
         # the handler, so it 403s regardless of a job runtime; WITH the token it reaches the handler
         # (no runtime → 'unknown', still 200).
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
@@ -1827,7 +1827,7 @@ class TestOffBoxWriteToken:
             assert json.loads(body)["message"] == "missing or invalid write token"
 
     def test_readonly_offbox_reads_stay_token_free(self, tmp_path: Path) -> None:
-        # spore-220 CARVE-OUT (the iPad-viewing property, L4's second half): a READ-ONLY mesh bind
+        # intention-220 CARVE-OUT (the iPad-viewing property, L4's second half): a READ-ONLY mesh bind
         # (write_scope None) serves reads token-free — _write_token_required() is False, so the gate
         # is skipped. Breaking this would break open iPad/iPhone viewing, the whole point of a
         # read-only mesh serve.
@@ -1838,7 +1838,7 @@ class TestOffBoxWriteToken:
             assert _get_h(base + "/recall.json?keyword=x")[0] == 200
 
     def test_offbox_extra_json_gated_but_extra_asset_free(self, tmp_path: Path) -> None:
-        # spore-220: a downstream extra_json view (the Bridge's /fleet.json = flow's fleet topology)
+        # intention-220: a downstream extra_json view (the Bridge's /fleet.json = flow's fleet topology)
         # rides the SAME off-box gate — the kernel owns the security envelope for EVERY read route it
         # serves, so a registered read can't be a token-free hole. A downstream STATIC extra_asset
         # (the /fleet app shell) stays token-free like the built-in assets (bootstrap, no data).
@@ -2050,7 +2050,7 @@ class TestContentLengthGuardMatchesWhatIntAccepts:
     but RFC 7230 defines Content-Length as ASCII DIGIT, so 411 is the spec-correct answer for a
     non-conformant client. Pinned here so a future reader does not "fix" it back.
 
-    Both servers used to carry the identical line; since spore-1013 the one guard is
+    Both servers used to carry the identical line; since intention-1013 the one guard is
     `GuardedHandler._declared_length`, which every server inherits (tests/test_http_guards.py pins
     that no server keeps a copy), so the predicate tested here is the shared one itself.
     """

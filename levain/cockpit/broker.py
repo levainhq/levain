@@ -66,9 +66,9 @@ from levain.cockpit.consent import ConsentError, build_record, encode, parse_sta
 from levain.cockpit.desk_effects import COORD_CANONICAL, COORD_DROP_VERB, DESK, drop_resource_key
 from levain.cockpit.effects import (
     INTAKE_VERB,
-    SPORE_AUTHORITY_FIELDS,
-    SPORE_CANONICAL,
-    SPORES,
+    INTENTION_AUTHORITY_FIELDS,
+    INTENTION_CANONICAL,
+    INTENTIONS,
     ApplyOutcome,
     ApplyUnit,
     DownstreamEffect,
@@ -88,7 +88,7 @@ from levain.cockpit.effects import (
     registration_refusals,
     resolve_effect,
     settle,
-    spore_resource_key,
+    intention_resource_key,
 )
 from levain.cockpit.firejournal import (
     CockpitDB,
@@ -229,7 +229,7 @@ class _Unbuildable(Exception):
 
 
 # each store name the broker registers, and the verbs its canonical_effect builds (K2b §13)
-_STORE_CANONICAL: dict[str, Mapping[str, Any]] = {SPORES: SPORE_CANONICAL, EPISODES: EPISODE_CANONICAL,
+_STORE_CANONICAL: dict[str, Mapping[str, Any]] = {INTENTIONS: INTENTION_CANONICAL, EPISODES: EPISODE_CANONICAL,
                                                    SECTIONS: SECTION_CANONICAL, DESK: COORD_CANONICAL}
 
 
@@ -304,7 +304,7 @@ class Broker:
         for verb, d in downstream.items():
             if not isinstance(d, DownstreamEffect):
                 raise ValueError(f"downstream effect {verb!r} must be a DownstreamEffect")
-            if verb in SPORE_CANONICAL or verb in (TOMBSTONE_VERB, SECTION_VERB, *INTERNAL_VERBS) \
+            if verb in INTENTION_CANONICAL or verb in (TOMBSTONE_VERB, SECTION_VERB, *INTERNAL_VERBS) \
                     or verb in {v.name for v in KERNEL_VERBS}:
                 raise ValueError(f"{verb!r} is a kernel verb; its effect is the kernel's")
             refusals = registration_refusals(d.store, {verb: d.canonical} if callable(d.canonical) else None)
@@ -777,8 +777,8 @@ class Broker:
         try:
             if verb in self.downstream:
                 return self._build_downstream(verb, params, target, pid)
-            if verb in SPORE_CANONICAL:
-                return self._build_spore(verb, params, target, pid, at_issue=at_issue)
+            if verb in INTENTION_CANONICAL:
+                return self._build_intention(verb, params, target, pid, at_issue=at_issue)
             if verb == INTAKE_VERB:
                 return self._build_intake(params, target, pid, at_issue=at_issue)
             if verb == TOMBSTONE_VERB:
@@ -798,7 +798,7 @@ class Broker:
 
     def _build_downstream(self, verb: str, params: Mapping[str, Any], target: Mapping[str, Any],
                           pid: str) -> _Built:
-        """A downstream verb's one create, keyed by the pending as a spore seed is. The store is a
+        """A downstream verb's one create, keyed by the pending as an intention seed is. The store is a
         client of another process, so any failure of its read is transient (a non-JSON body is a
         ``ValueError`` too); ``canonical`` refuses params by ``ValueError`` or ``ConsentError`` and any
         other failure of it is transient."""
@@ -822,40 +822,40 @@ class Broker:
             raise ValueError("a create's origin_key is already in use")
         return _Built({"kind": target.get("kind"), "panel_id": target.get("panel_id")}, [eff], [None])
 
-    def _spores(self) -> Any:
-        store = self.stores.get(SPORES)
+    def _intentions(self) -> Any:
+        store = self.stores.get(INTENTIONS)
         if store is None:
-            raise BrokerError("not_built", 501, "no spore store is registered with the broker")
+            raise BrokerError("not_built", 501, "no intention store is registered with the broker")
         return store
 
-    def _build_spore(self, verb: str, params: Mapping[str, Any], target: Mapping[str, Any], pid: str,
+    def _build_intention(self, verb: str, params: Mapping[str, Any], target: Mapping[str, Any], pid: str,
                      *, at_issue: bool) -> _Built:
-        es = self._spores()
-        if verb == "spore_seed":
+        es = self._intentions()
+        if verb == "intention_seed":
             ok = create_origin_key(pid, 0)
-            snap = es.snapshot(spore_resource_key(ok))
+            snap = es.snapshot(intention_resource_key(ok))
             eff = canonical_effect(verb, params, snap.row, origin_key=ok, version_of=es.version_of)
             return _Built({"kind": "create", "panel_id": target.get("panel_id")}, [eff], [None])
         if at_issue:
             ok = self._origin_key_of_row(es, target)
         else:
             ok = target.get("origin_key")
-        snap = es.snapshot(spore_resource_key(ok))
+        snap = es.snapshot(intention_resource_key(ok))
         if at_issue and target.get("row_version") is not None and snap.version != target["row_version"]:
             raise BrokerError("stale", 409, f"row {target.get('row_id')!r} changed since it was rendered")
         eff = canonical_effect(verb, params, snap.row, version_of=es.version_of)
-        pre = None if snap.row is None else {f: _stored_authority(snap.row, f) for f in SPORE_AUTHORITY_FIELDS}
+        pre = None if snap.row is None else {f: _stored_authority(snap.row, f) for f in INTENTION_AUTHORITY_FIELDS}
         return _Built({"kind": "row", "panel_id": target.get("panel_id"), "row_id": target.get("row_id"),
                        "origin_key": ok}, [eff], [pre])
 
     def _build_intake(self, params: Mapping[str, Any], target: Mapping[str, Any], pid: str,
                       *, at_issue: bool) -> _Built:
-        """THE LIST's intake line as one spore create (``effects.intake_seed_params``). The line is read ONCE, at
+        """THE LIST's intake line as one intention create (``effects.intake_seed_params``). The line is read ONCE, at
         issue, on the broker's clock (local time), and the reading rides in the recorded target (``intake``), so the
         decision rebuilds the same effect from it, never from a second read of the line (a ``+2h`` read a minute later
         is another minute). The reading is in the signed bytes twice: the target's ``intake`` and the effect's
         ``changes`` (``next``, ``target: desk``). A drop whose minute passed before the decision no longer builds (the
-        op ends STALE): it is typed again, never fired late. A ``sort`` line plants no spore: from a device it is one
+        op ends STALE): it is typed again, never fired late. A ``sort`` line plants no intention: from a device it is one
         ``coordinator_drop`` create on the desk store (``desk_effects``), the words verbatim, written at the
         decision; it has no minute, so no staleness check. With no desk store registered, or none named, it is
         a 501 at issue."""
@@ -898,7 +898,7 @@ class Broker:
                                                    origin_key=ok)
             return _Built({"kind": "create", "panel_id": target.get("panel_id"), "intake": {
                 "kind": "sort", "text": reading["text"]}}, [eff], [None])
-        es = self._spores()
+        es = self._intentions()
         if not at_issue:
             if reading["kind"] == "drop":
                 when = reading.get("when")
@@ -911,13 +911,13 @@ class Broker:
                     raise ValueError(f"the drop's minute ({when}) passed before it was signed")
         seed = intake_seed_params(reading)
         ok = create_origin_key(pid, 0)
-        snap = es.snapshot(spore_resource_key(ok))
-        eff = canonical_effect("spore_seed", seed, snap.row, origin_key=ok, version_of=es.version_of)
+        snap = es.snapshot(intention_resource_key(ok))
+        eff = canonical_effect("intention_seed", seed, snap.row, origin_key=ok, version_of=es.version_of)
         return _Built({"kind": "create", "panel_id": target.get("panel_id"), "intake": reading}, [eff], [None])
 
     def _intake_receipt(self, rec: Mapping[str, Any], pid: str, state: str) -> dict[str, Any]:
         """The receipt a ``list_intake`` result carries (``levain.intake.receipt``'s shape, ``{kind, id, fires,
-        text}``) and its one line. ``id`` is the planted spore's, known only once the op committed; before that the
+        text}``) and its one line. ``id`` is the planted intention's, known only once the op committed; before that the
         line says what is still owed (the signature, the write) and claims no fire."""
         from levain import intake
 
@@ -926,7 +926,7 @@ class Broker:
             return {}
         sid = None
         if reading.get("kind") == "sort":
-            # a sort plants no spore: its receipt is the desk drop's (the drop id once the op committed)
+            # a sort plants no intention: its receipt is the desk drop's (the drop id once the op committed)
             drop_id = None
             if state == "COMMITTED":
                 try:
@@ -945,7 +945,7 @@ class Broker:
             return {"receipt": out, "receipt_line": line, **({"drop_id": drop_id} if drop_id else {})}
         if state == "COMMITTED":
             try:
-                row = self._spores().snapshot(spore_resource_key(create_origin_key(pid, 0))).row
+                row = self._intentions().snapshot(intention_resource_key(create_origin_key(pid, 0))).row
                 sid = None if row is None else row.get("id")
             except (BrokerError, TransientApplyFault):
                 sid = None
@@ -1065,16 +1065,16 @@ class Broker:
 
     @staticmethod
     def _origin_key_of_row(es: Any, target: Mapping[str, Any]) -> str:
-        """The spore's ``origin_key``, read by its id. A row read with none is REFUSED: no label
+        """The intention's ``origin_key``, read by its id. A row read with none is REFUSED: no label
         resource can name it, and none is invented (§2)."""
-        from anneal_memory.spores import SporeError, SporeStore
+        from anneal_memory.spores import IntentionError, IntentionStore
 
         row_id = str(target.get("row_id") or "")
-        if not row_id.startswith("spore:"):
-            raise BrokerError("bad_target", 400, f"{row_id!r} is not a spore row")
+        if not row_id.startswith("intention:"):
+            raise BrokerError("bad_target", 400, f"{row_id!r} is not an intention row")
         try:
-            row = SporeStore(es.path).get(row_id[len("spore:"):])
-        except (SporeError, OSError, ValueError) as exc:
+            row = IntentionStore(es.path, id_prefix="intention").get(row_id[len("intention:"):])
+        except (IntentionError, OSError, ValueError) as exc:
             raise TransientApplyFault.of(exc) from exc
         if row is None:
             raise BrokerError("stale", 409, f"row {row_id!r} is gone")

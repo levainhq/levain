@@ -50,8 +50,8 @@ supported in v1.
     ├── recency_directives.md     <- operator-editable; the recency directive set
     └── hooks/
         ├── _levain_hook.py        <- shared helpers
-        ├── session_start.py       <- SessionStart hook (Layer A + Layer D start-catch + due-spore surface)
-        └── user_prompt_submit.py  <- UserPromptSubmit hook (Layer B + open spores that match the prompt + Layer D nudge)
+        ├── session_start.py       <- SessionStart hook (Layer A + Layer D start-catch + due-intention surface)
+        └── user_prompt_submit.py  <- UserPromptSubmit hook (Layer B + open intentions that match the prompt + Layer D nudge)
 
 ~/.codex/
 ├── hooks.json                    <- from hooks.json.template; wires the hooks globally
@@ -93,13 +93,13 @@ described below.
   Codex 0.133 source vocabulary). On a genuinely fresh session
   (`source ∈ {"startup", "clear"}`) it also runs the **Layer D start-catch**
   — if the previous session left episodes unwrapped, it flags it — and the
-  **time-based prospective surface**: open spores gone dormant (or whose
+  **time-based prospective surface**: open intentions gone dormant (or whose
   `next` date has arrived) are surfaced once so nothing rots silently.
   `resume` and `compact` are treated as ongoing work and skip both.
 - **`user_prompt_submit.py`** → `UserPromptSubmit` (Layer B + the event-based
   prospective surface). Injects, at recency position before each prompt: one
   directive selected at random from `activation/recency_directives.md`, plus
-  any open spores whose content **collides** with the prompt — the
+  any open intentions whose content **collides** with the prompt — the
   event-based germination surface (precision-biased and capped; an unrelated
   prompt injects nothing). Once episodes-since-last-wrap pass a threshold
   (default 12) it also appends the **Layer D ambient nudge**.

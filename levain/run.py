@@ -258,10 +258,10 @@ def run_task(
       - ``2`` a usage / environment / startup error, before any turn ran;
       - ``3`` the turn raised;
       - ``4`` the turn HALTED AT THE EFFERENT GATE — the entity proposed action on the world and
-        the harness stopped it pending a human decision (K3, ``spore-295``). **Not a failure**:
+        the harness stopped it pending a human decision (K3, ``intention-295``). **Not a failure**:
         it is the governor working. A supervisor should surface ``4`` for a human, never retry it
         blindly — a retry re-proposes the same action into the same gate.
-      - ``5`` the turn EXCEEDED ITS WALL-CLOCK BOUND and was terminated (K4a ⑥, ``spore-434``).
+      - ``5`` the turn EXCEEDED ITS WALL-CLOCK BOUND and was terminated (K4a ⑥, ``intention-434``).
         An ENVIRONMENT stall, not a broken task — retry on the cadence; if it repeats, the model
         endpoint is sick.
       - ``7`` the turn completed, but its reply is the model's raw tool-call syntax: the call
@@ -274,7 +274,7 @@ def run_task(
 
     A code derived from the agent's own account of its success would be the false-all-clear
     class Levain's trust pitch says cannot happen — a confined entity once reported "25 failed,
-    1617 passed" for a suite that was 1702/0 outside its sandbox (``spore-373`` [5]). **If you
+    1617 passed" for a suite that was 1702/0 outside its sandbox (``intention-373`` [5]). **If you
     need task-level success, verify the WORLD** (run the tests, read the diff), never ask the
     agent how it did. See :mod:`levain.session`.
 
@@ -283,7 +283,7 @@ def run_task(
     steps, so an unattended run cannot spend forever on one message.
 
     ``max_seconds`` bounds the turn in WALL-CLOCK time, which is a different guarantee and the one
-    a supervisor actually needs (K4a ⑥, ``spore-434``): ``max_iterations`` counts STEPS, so a turn
+    a supervisor actually needs (K4a ⑥, ``intention-434``): ``max_iterations`` counts STEPS, so a turn
     that hangs inside ONE step — a stalled model call — is unbounded by it. Left ``None`` nothing is
     armed, preserving the existing behaviour for an operator running a task by hand; a scheduled
     seat always sets it (see :func:`levain.daemon.build_seat_spec`).
@@ -843,7 +843,7 @@ def _print_banner(
         else:
             print(f"             ⚠ standard cred stores {cred_floor_label()}")
             print("               are READABLE by this entity (deny_standard_creds is off)")
-        # CONTAINER SOCKETS (spore-725). Stated in BOTH directions, like the cred-store line
+        # CONTAINER SOCKETS (intention-725). Stated in BOTH directions, like the cred-store line
         # above, and NEVER as "containers are fenced" — the deny is a NAMED ENUMERATION and an
         # enumeration is always incomplete, so an unqualified claim would be worse than the hole
         # it papers over. What is listed is what is covered, and the gaps are named too.

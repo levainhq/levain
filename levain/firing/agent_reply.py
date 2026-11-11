@@ -41,7 +41,7 @@ _BUILTIN_ACTION_KINDS = frozenset({FINISH_ACTION_KIND, "ThinkAction"})
 # regression into a loud test failure.
 CORRECTIVE_NUDGE_MARKER = "did not include a function call or a message. Please use a tool"
 
-# levain's OWN synthetic nudge — the narrate-without-act backstop (spore-358 follow-through). The SDK's
+# levain's OWN synthetic nudge — the narrate-without-act backstop (intention-358 follow-through). The SDK's
 # corrective nudge (above) fires only when the model returns NEITHER a function call NOR a message; it
 # does NOT fire when a weak open model returns a MESSAGE that is an unexecuted PLAN ("I'll run the
 # tests…") with no tool call — OpenHands reads that plan as a valid answer and ends the turn, task
@@ -142,7 +142,7 @@ _UNWRAPPABLE_CALLS = frozenset({"finish", "think"})
 
 
 def humanize_finish_json(text: str) -> str:
-    """spore-297: a weak open model (minimax-m3, verified live 2026-07-09) sometimes emits its tool
+    """intention-297: a weak open model (minimax-m3, verified live 2026-07-09) sometimes emits its tool
     calls as JSON TEXT instead of structured tool calls — e.g.::
 
         {"name": "think", "arguments": {"summary": "...", "thought": "..."}}

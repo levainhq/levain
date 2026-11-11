@@ -102,7 +102,7 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
                     card["carried"] = carried
             from levain.consent.questions import intention_of, intention_text_of
 
-            ring = intention_of(question_store, q)      # the spore id this row rings, only when the host can act on it
+            ring = intention_of(question_store, q)      # the intention id this row rings, only when the host can act on it
             if ring is not None:
                 card["intention"] = ring
                 words = intention_text_of(question_store, q)

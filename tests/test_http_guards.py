@@ -1,4 +1,4 @@
-"""spore-1013: the request guards live once, in levain.http_guards, and all three servers use them.
+"""intention-1013: the request guards live once, in levain.http_guards, and all three servers use them.
 
 Before the extraction, `levain serve`, `levain init --web` and `levain docs` each carried a copy of
 the guard code, and a test compared two of the copies' ASTs to catch drift. The copies had already
@@ -99,7 +99,7 @@ def test_a_framework_generated_response_carries_the_security_headers(tmp_path, k
 
 @pytest.mark.parametrize("kind", ["serve", "init", "docs"])
 def test_a_change_to_the_shared_cross_site_check_reaches_every_server(tmp_path, kind, monkeypatch):
-    """One mutant in the shared code turns all three red (the spore's acceptance test)."""
+    """One mutant in the shared code turns all three red (the intention's acceptance test)."""
     with _server(kind, tmp_path) as port:
         assert _request(port, "GET", headers={"Sec-Fetch-Site": "same-origin"})[0] == 200
         monkeypatch.setattr(GuardedHandler, "_cross_site_read", lambda self: True)

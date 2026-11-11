@@ -18,7 +18,7 @@ from tests.test_cockpit_k1 import _http, _install, _serve
 def _panels() -> list[dict[str, Any]]:
     return [
         {"id": "tray", "zone": "operate", "title": "Tray by age (2 overdue)", "note": "40 pending",
-         "lines": [{"meta": "spore-9", "text": "zeta first", "accent": True},
+         "lines": [{"meta": "intention-9", "text": "zeta first", "accent": True},
                    {"meta": "", "text": "alpha second", "dim": True},
                    {"meta": "m", "text": "middle"}],
          "empty": "nothing pending."},
@@ -83,7 +83,7 @@ def test_lines_become_rows_in_the_source_order_with_meta_and_emphasis() -> None:
     ck, _ = _cockpit(_Counted())
     p = snapshot(ck)["panels"]["ext:tray"]
     assert [(r["facets"].get("legacy_meta"), r["emphasis"]) for r in p["rows"]] == [
-        ("spore-9", "accent"), (None, "dim"), ("m", "none")]
+        ("intention-9", "accent"), (None, "dim"), ("m", "none")]
     assert p["order"] == "legacy.source" and p["kind"] == "list"
 
 

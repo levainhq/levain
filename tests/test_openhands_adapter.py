@@ -1,4 +1,4 @@
-"""The hookless `openhands` adapter — install path + doctor + verify (spore-277 step 3).
+"""The hookless `openhands` adapter — install path + doctor + verify (intention-277 step 3).
 
 `openhands` is the first HOOKLESS adapter: it lays down seed + store + a config marker, but
 NO activation tree, NO hooks, NO MCP (its activation is the runtime `LevainCondenser`, wired by
@@ -36,7 +36,7 @@ from levain.verify import run_verify_hooks
 
 def _openhands_install(install: Path) -> None:
     """A real base (no-pack) openhands install — real seed render + real anneal store."""
-    # The same resolution production init and doctor use (spore-751). A PATH lookup here
+    # The same resolution production init and doctor use (intention-751). A PATH lookup here
     # recorded the lock against a different anneal than doctor then reads.
     anneal = resolve_anneal_bin()
     with _templates_root() as templates_root:

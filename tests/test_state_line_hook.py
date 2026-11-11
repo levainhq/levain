@@ -1,4 +1,4 @@
-"""The per-prompt, change-only state line (spore-1410): session_start shows the operator's
+"""The per-prompt, change-only state line (intention-1410): session_start shows the operator's
 state line and seeds a per-session marker; user_prompt_submit speaks only when it changed or
 went away. The real hook scripts run as subprocesses against a tmp install, for both
 adapters. Behaviour reference: flow's scripts/state_line_hook.py."""

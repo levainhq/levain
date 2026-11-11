@@ -123,7 +123,7 @@ def _run_update(
     apparatus / tests can drive it without a TTY."""
     install = Path(str(path)).expanduser().resolve()
     store = install / ".levain" / "memory.db"
-    anneal_path = manifest.resolve_anneal_bin()  # spore-751
+    anneal_path = manifest.resolve_anneal_bin()  # intention-751
 
     if confirm is None:
         confirm = _make_confirm(yes)

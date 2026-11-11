@@ -14,13 +14,13 @@ BOARD = "#write_token=T&board"
 READY = {"until": "document.querySelector('.ck-zgrid[data-ck-zone=\"operate\"] .panel[data-ck-panel=\"tray\"] .pbody .row')"}
 SETTLE = {"eval": "new Promise(r => setTimeout(r, 500)).then(() => 1)"}
 
-# [panel ids and titles that name Keep, the badge words of the row for a spore id in a panel]
+# [panel ids and titles that name Keep, the badge words of the row for an intention id in a panel]
 KEEP_PANELS = ("[...document.querySelectorAll('[data-ck-panel]')].filter(p => p.dataset.ckPanel === 'keep' "
                "|| /^\\s*keep\\b/i.test((p.querySelector('h2') || {}).textContent || '')).length")
 
 
 def _row(panel: str, sid: str) -> str:
-    return (f"(() => {{ const r = document.querySelector('[data-ck-panel=\"{panel}\"] .row[data-spore=\"{sid}\"]');"
+    return (f"(() => {{ const r = document.querySelector('[data-ck-panel=\"{panel}\"] .row[data-intention=\"{sid}\"]');"
             " return r && { tags: [...r.querySelectorAll('[data-ck-tag]')].map(t => t.textContent),"
             " verbs: [...r.querySelectorAll('.verb-btn')].map(b => b.textContent) }; })()")
 
@@ -31,11 +31,11 @@ def test_the_kernel_cockpit_has_no_keep_panel_and_files_both_halves_where_they_b
     heads = ck.manifest(CRED)["panels"]
     assert "keep" not in heads and not any(h.get("title", "").startswith("Keep") for h in heads.values())
     loops = {r["id"]: r for r in ck.panel("loops")["rows"]}
-    parked = loops[f"spore:{ids['parked']}"]
+    parked = loops[f"intention:{ids['parked']}"]
     assert parked["facets"]["tier"] == "parked"                      # the parked marker rides the tier facet
     tray = {r["id"]: r for r in ck.panel("tray")["rows"]}
-    assert tray[f"spore:{ids['note']}"]["facets"]["disposition"] == "note"      # a legacy note: visible, not dropped
-    assert f"spore:{ids['note']}" not in loops and f"spore:{ids['parked']}" not in tray
+    assert tray[f"intention:{ids['note']}"]["facets"]["disposition"] == "note"      # a legacy note: visible, not dropped
+    assert f"intention:{ids['note']}" not in loops and f"intention:{ids['parked']}" not in tray
 
 
 def test_the_text_render_and_the_substrate_view_name_no_keep(tmp_path: Path) -> None:
@@ -65,31 +65,31 @@ def test_the_page_draws_a_parked_loop_in_open_loops_marked_and_a_legacy_note_in_
             assert not any(t.strip().lower().startswith("keep") for t in titles), (width, titles)
             assert parked and "parked" in parked["tags"], (width, parked)                 # the visible marker
             assert "reactivate" in parked["verbs"] and "park" not in parked["verbs"], (width, parked)
-            assert note and note["tags"] == ["spore"], (width, note)                      # still listed, in the List, as a spore row; the note badge is gone with the Keep
+            assert note and note["tags"] == ["intention"], (width, note)                      # still listed, in the List, as an intention row; the note badge is gone with the Keep
 
 
 def test_the_removed_keep_ordering_id_still_resolves_to_the_loops_ordering() -> None:
-    # TS-5a L3 MED: a downstream manifest naming "spore.keep" must still register and sort as loops do
+    # TS-5a L3 MED: a downstream manifest naming "intention.keep" must still register and sort as loops do
     from levain.cockpit.registry import ORDERINGS
-    assert ORDERINGS["spore.keep"].key is ORDERINGS["spore.loops"].key
+    assert ORDERINGS["intention.keep"].key is ORDERINGS["intention.loops"].key
 
 
 def test_the_tui_unpark_is_bound_to_the_version_it_rendered(tmp_path: Path) -> None:
     # TS-5a L3 MED (codex): the TUI un-park CASed only the disposition, so a tier changed elsewhere
     # (parked -> hot) was overwritten with warm and reported "reactivated". It is version-bound now.
     from dataclasses import replace
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
     from levain import _tui_curses, tui
     root, src, ids = _install(tmp_path)
     view = src.build()
     model = tui.TuiModel(view=view, zone_idx=0, panel_idx=0, read_only=False)
     for zi, (zone, _l) in enumerate(tui.ZONES):
         for pi, p in enumerate(tui.panels_for_zone(view, zone)):
-            if p.get("kind") == "spores":
+            if p.get("kind") == "intentions":
                 model = replace(model, zone_idx=zi, panel_idx=pi)
-    idx = next(i for i, s in enumerate(view.open_spores) if s.id == ids["parked"])
+    idx = next(i for i, s in enumerate(view.open_intentions) if s.id == ids["parked"])
     model = replace(model, item_idx=idx)
-    SporeStore(root / ".levain" / "memory.spores.json").update(ids["parked"], tier="hot")   # another process moved it
-    out = _tui_curses._handle_verb(None, model, src, tui.Verb("p", "[p] un-park", "spore_unpark"))
-    assert SporeStore(root / ".levain" / "memory.spores.json").get(ids["parked"])["tier"] == "hot"   # not overwritten
+    IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").update(ids["parked"], tier="hot")   # another process moved it
+    out = _tui_curses._handle_verb(None, model, src, tui.Verb("p", "[p] un-park", "intention_unpark"))
+    assert IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").get(ids["parked"])["tier"] == "hot"   # not overwritten
     assert "reactivated" not in out.status

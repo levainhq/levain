@@ -163,7 +163,7 @@ def test_a_pristine_pre_751_codex_block_upgrades_without_a_lost_customisation_al
     said: list[str] = []
     _merge_codex_config(cfg, fragment, emit=said.append)
     assert not [m for m in said if "customisation is gone" in m], said
-    # Preserve always (spore-865): the benign relaunch is still backed up; only its notice is benign.
+    # Preserve always (intention-865): the benign relaunch is still backed up; only its notice is benign.
     assert len(list(tmp_path.glob("config.toml.bak*"))) == 1
     assert [m for m in said if "keeps its store" in m], said
     assert '"-P", "-m", "anneal_memory"' in cfg.read_text(encoding="utf-8")

@@ -89,7 +89,7 @@ def test_each_link_has_the_one_format_the_rule_gives_it(world):
     db = world.plant({"op": "create_grant", "grant": link(world, 2)}, fmt=V3)
     assert f"this create_grant link carries {V3}; a link like it is written {V4}" in world.replay_verdict(db)
     # and a link with nothing of the agent kinds is not written /4
-    db = world.plant({"op": "raise", "verb": "spore_touch", "tier": "T3"}, fmt=V4)
+    db = world.plant({"op": "raise", "verb": "intention_touch", "tier": "T3"}, fmt=V4)
     assert f"this raise link carries {V4}; a link like it is written {V1}" in world.replay_verdict(db)
 
 

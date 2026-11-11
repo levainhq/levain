@@ -337,5 +337,5 @@ def render(e: dict, presence_note: str = "") -> str:
     if e.get("recheck"):
         bits.append(f"  re-check: {oneline(e['recheck'])}")
     # One fold over every line this emits, whatever field fed it: per-field folding missed a new field each review
-    # round (spore-813), and a line break in any of them draws a forged line in an agent's context.
+    # round (intention-813), and a line break in any of them draws a forged line in an agent's context.
     return "\n".join(oneline(b) for b in bits)

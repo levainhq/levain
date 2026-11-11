@@ -30,7 +30,7 @@ against a rich operator profile.
 TWO BUDGETS, and the ratio is the load-bearing one:
 
   MECHANISM SHARE   the fraction of the eager surface that is documentation ABOUT
-                    the substrate (`memory.md`, `spore_instructions.md`) rather
+                    the substrate (`memory.md`, `intention_instructions.md`) rather
                     than identity or method. THIS is the defect Alex found. A big
                     surface that is mostly identity is healthy; a big surface that
                     is mostly machinery is the bug.
@@ -39,10 +39,10 @@ TWO BUDGETS, and the ratio is the load-bearing one:
                     while staying proportional.
 
 ⚠ THE MECHANISM BUDGET IS SET ABOVE WHERE THE BASE SITS TODAY, ON PURPOSE. F2 shipped
-its FIRST CUT only (`spore_instructions.md`), and `memory.md` at 21,347 B is the bigger
+its FIRST CUT only (`intention_instructions.md`), and `memory.md` at 21,347 B is the bigger
 half and still loads eagerly. Setting the budget at today's number would freeze the
 defect in place and call it compliance. It is set where it is to stop REGRESSION now,
-and it should be RATCHETED DOWN when the `memory.md` half lands (`spore-451`).
+and it should be RATCHETED DOWN when the `memory.md` half lands (`intention-451`).
 
 ⚠ THE CURRENT SHARE IS NOT RESTATED HERE — RUN THE SCRIPT (0.4.1). This paragraph used
 to say "~60% mechanism as of 2026-08-01" while `measure()` five lines down printed 55%,

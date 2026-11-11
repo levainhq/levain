@@ -241,7 +241,7 @@ def _minimal_seed(install: Path) -> Path:
 
 
 def test_doctor_fails_when_the_on_demand_seed_is_missing(tmp_path: Path):
-    """`spore_instructions.md` is pointed at by the carrier, not @imported.
+    """`intention_instructions.md` is pointed at by the carrier, not @imported.
 
     Eagerly imported, a vanished file announced itself — the adapter carried a
     broken `@seed/` line. Behind a POINTER it does not: the entity is told to read
@@ -249,12 +249,12 @@ def test_doctor_fails_when_the_on_demand_seed_is_missing(tmp_path: Path):
     on-demand is exactly what makes this existence check load-bearing."""
     install = tmp_path / "ent"
     seed = _minimal_seed(install)
-    (seed / "spore_instructions.md").unlink()
+    (seed / "intention_instructions.md").unlink()
 
     results = _check_install_layout(install, expect_hooks=False)
     seed_checks = [r for r in results if r.name == "seed/"]
     assert seed_checks and not seed_checks[0].ok
-    assert "spore_instructions.md" in seed_checks[0].detail
+    assert "intention_instructions.md" in seed_checks[0].detail
 
 
 def test_doctor_seed_hint_lists_every_required_file(tmp_path: Path):
@@ -285,12 +285,12 @@ def test_doctor_flags_a_stale_carrier_that_still_eagerly_imports_an_on_demand_se
     install.mkdir()
     (install / "CLAUDE.md").write_text(
         "# Partnership\n\n@seed/origin.md\n@seed/memory.md\n"
-        "@seed/spore_instructions.md\n",
+        "@seed/intention_instructions.md\n",
         encoding="utf-8",
     )
     results = _check_carrier_freshness(install, install / "CLAUDE.md")
     assert results and not results[0].ok
-    assert "spore_instructions.md" in results[0].detail
+    assert "intention_instructions.md" in results[0].detail
     # the remedy is `levain update`, which refreshes the carrier since install truth
     # (test_update_refresh proves following it clears this check)
     assert "levain update" in results[0].hint
@@ -307,7 +307,7 @@ def test_doctor_carrier_freshness_passes_on_a_current_carrier(tmp_path: Path):
         "# Partnership\n\n@seed/origin.md\n@seed/partnership.md\n@seed/world.md\n@seed/memory.md\n"
         "@seed/memory_workflow.md\n\n@.levain/memory.continuity.md\n\n"
         "## Read these when you need them\n\n"
-        "- `seed/spore_instructions.md` — plant one with `spore_add`.\n",
+        "- `seed/intention_instructions.md` — plant one with `intention_add`.\n",
         encoding="utf-8",
     )
     results = _check_carrier_freshness(install, install / "CLAUDE.md")
@@ -321,12 +321,12 @@ def test_doctor_carrier_freshness_catches_the_codex_read_list_form(tmp_path: Pat
     install.mkdir()
     (install / "AGENTS.md").write_text(
         "# Partnership\n\n1. `seed/origin.md` — Who You Are\n"
-        "5. `seed/spore_instructions.md` — Your Open Loops\n",
+        "5. `seed/intention_instructions.md` — Your Open Loops\n",
         encoding="utf-8",
     )
     results = _check_carrier_freshness(install, install / "AGENTS.md")
     assert results and not results[0].ok
-    assert "spore_instructions.md" in results[0].detail
+    assert "intention_instructions.md" in results[0].detail
 
 
 def test_stale_carrier_reaches_the_ADAPTER_check_not_just_the_helper(tmp_path: Path):
@@ -336,7 +336,7 @@ def test_stale_carrier_reaches_the_ADAPTER_check_not_just_the_helper(tmp_path: P
     CONNECTION was not. A guard nothing calls is a guard that does not exist."""
     install = tmp_path / "ent"
     (install / ".claude").mkdir(parents=True)
-    (install / "CLAUDE.md").write_text("@seed/spore_instructions.md\n", encoding="utf-8")
+    (install / "CLAUDE.md").write_text("@seed/intention_instructions.md\n", encoding="utf-8")
 
     results = _check_claude_code(install)
     freshness = [r for r in results if "freshness" in r.name]
@@ -350,7 +350,7 @@ def test_stale_carrier_reaches_the_CODEX_adapter_check(tmp_path: Path):
     install = tmp_path / "ent"
     install.mkdir()
     (install / "AGENTS.md").write_text(
-        "1. `seed/spore_instructions.md` — Your Open Loops\n", encoding="utf-8"
+        "1. `seed/intention_instructions.md` — Your Open Loops\n", encoding="utf-8"
     )
     results = _check_codex(install)
     freshness = [r for r in results if "freshness" in r.name]
@@ -711,7 +711,7 @@ def test_stale_hook_hint_does_not_reassure_past_what_init_force_preserves(tmp_pa
         "the remedy rewrites the activation tree — it must say where edits go")
     assert "hooks and all" in hint and "moved whole" in hint, (
         "hooks are the file class this hint's omission actually cost an operator; "
-        "since spore-861 the whole previous tree is what is kept")
+        "since intention-861 the whole previous tree is what is kept")
     # The old shape must not come back: an enumeration of survivors with no
     # mention of the tree being rewritten.
     assert "are kept" not in hint, (

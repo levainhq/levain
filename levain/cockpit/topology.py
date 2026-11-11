@@ -4,7 +4,7 @@ One value over what the install already holds: the session records its hooks wri
 grouped by the repository its working directory is in, a linked worktree folded into its main repository), the
 consent queue and the question store (a session waiting on a pending request or an open question is WAITING ON YOU,
 and the record is the task it waits on), the dispatch job store and the F7 outcome ledger (a contract is a task, its
-ledger labels its outcomes), and the entity's open loops (a spore is a task). A session that no task names is a
+ledger labels its outcomes), and the entity's open loops (an intention is a task). A session that no task names is a
 worker of the one ``unattached`` task, never of a guessed one.
 
 The two quiet states never merge. WAITING ON YOU is a record: a pending consent request, an open question, a
@@ -51,11 +51,11 @@ from levain.cockpit.display_safe import visible
 from levain.cockpit.registry import CONSENT_ROW_PREFIX, QUESTION_ROW_PREFIX, opened_day, parse_date
 from levain.cockpit.results import Fault, Read, Result
 
-__all__ = ["LOST_CACHE_S", "LOST_WORKTREES_MAX", "NOT_KEPT", "SPORES_MAX", "STALL_S", "topology_reader"]
+__all__ = ["LOST_CACHE_S", "LOST_WORKTREES_MAX", "NOT_KEPT", "INTENTIONS_MAX", "STALL_S", "topology_reader"]
 
 STALL_S = 5 * 60                   # a session mid-turn (last event a prompt or a tool) silent this long is STALLED
 RATE_WINDOW_S = 5 * 60             # a node's rate: logged events per minute over this window
-SPORES_MAX = 20                    # open loops shown as tasks, in the store's order
+INTENTIONS_MAX = 20                    # open loops shown as tasks, in the store's order
 DISPATCH_DONE_H = 14               # a finished contract stays on the board this long (the sky's window)
 LOST_WORKTREES_MAX = act.ACTIVITY_REPOS_MAX
 LOST_CACHE_S = 30.0
@@ -560,12 +560,12 @@ def _dispatch_tasks(directory: Path, now: datetime, *, past: bool = False) -> tu
     return tasks, errors
 
 
-#: the heat an open loop carries, as the spore store's own tier names it (the Open loops panel's word for it)
+#: the heat an open loop carries, as the intention store's own tier names it (the Open loops panel's word for it)
 HEATS = ("hot", "warm", "cold", "parked")
 
 
 def _opened(created: Any, now: datetime) -> str | None:
-    """When a spore was opened, as an instant: its own ISO stamp, or its date taken as local midnight (the Open loops
+    """When an intention was opened, as an instant: its own ISO stamp, or its date taken as local midnight (the Open loops
     panel counts calendar days in the install's own clock, so the age the renderer draws agrees with it). None when
     the store has no usable date: unknown, never a guess."""
     t = act._parse(created) if isinstance(created, str) else None
@@ -578,7 +578,7 @@ def _opened(created: Any, now: datetime) -> str | None:
 
 
 def _age_days(created: Any, now: datetime) -> int | None:
-    """Whole calendar days from the day a spore was opened to the provider's own day (the install's local day, the one the
+    """Whole calendar days from the day an intention was opened to the provider's own day (the install's local day, the one the
     Open loops panel counts in): the number the page draws, so no browser clock or zone decides it. None when the store has no
     usable date."""
     opened = opened_day(created)
@@ -587,17 +587,17 @@ def _age_days(created: Any, now: datetime) -> int | None:
     return max(0, (now.astimezone().date() - opened).days)
 
 
-def _spore_tasks(spores: list[Any], now: datetime | None = None) -> list[dict[str, Any]]:
-    """The first ``SPORES_MAX`` open loops as tasks. The spore store links no loop to a session or a record, so a
+def _intention_tasks(intentions: list[Any], now: datetime | None = None) -> list[dict[str, Any]]:
+    """The first ``INTENTIONS_MAX`` open loops as tasks. The intention store links no loop to a session or a record, so a
     loop is never WAITING, and RUNNING only if a worker is on it (``workers`` is empty today). A loop nobody is on is
     OPEN, not STUCK: STUCK is a live worker gone silent. It carries ``opened`` (its created time) and ``heat`` (its
     tier, the Open loops panel's own value), each null when the store does not say. A recent touch is not a worker."""
     now = now or datetime.now(timezone.utc)
     tasks = []
-    for s in spores[:SPORES_MAX]:
+    for s in intentions[:INTENTIONS_MAX]:
         workers: list[str] = []
         tier = getattr(s, "tier", None)
-        tasks.append({"id": f"spore:{_wire(s.id)}", "kind": "spore", "label": _wire(s.text),
+        tasks.append({"id": f"intention:{_wire(s.id)}", "kind": "intention", "label": _wire(s.text),
                       "state": "running" if workers else "open", "waits_on": [], "card": None, "outcomes": [],
                       "cost": dict(NO_COST), "workers": workers, "opened": _opened(getattr(s, "created", None), now),
                       "age_days": _age_days(getattr(s, "created", None), now),
@@ -662,14 +662,14 @@ def topology_reader(*, install_root: Path | None,
                     consent: Callable[[], Callable[[datetime], Any] | None],
                     questions: Callable[[], Any],
                     hub_label: Callable[[Any], str],
-                    spores: Callable[[Any], list[Any]] | None = None,
+                    intentions: Callable[[Any], list[Any]] | None = None,
                     dispatch_dir: Callable[[], Path | None] = lambda: None,
                     home: str | None = None,
                     scan: Callable[..., tuple[dict[str, dict[str, Any]], list[str]]] = _lost_scan
                     ) -> Callable[[Any], Result]:
     """The ``topology`` provider's read: ``read(ctx)``. ``consent`` and ``questions`` are looked up at each read
     (the server attaches them after the cockpit is built); ``dispatch_dir`` names the directory holding the
-    dispatch and outcome stores (the consent queue's directory; this read creates neither store), ``spores`` the entity's open
+    dispatch and outcome stores (the consent queue's directory; this read creates neither store), ``intentions`` the entity's open
     loops (raising for a store that cannot be read), ``hub_label`` the entity's name. ``scan`` is the worktree
     scan (a test's seam).
 
@@ -859,17 +859,17 @@ def topology_reader(*, install_root: Path | None,
                 errors += errs
             except Exception as exc:  # noqa: BLE001 - an unread store is named, never shown as no contracts
                 blind("dispatch", f"unreadable ({type(exc).__name__})")
-        if spores is None:
-            blind("spores", "no spore store is attached")
+        if intentions is None:
+            blind("intentions", "no intention store is attached")
         elif past:
             # the store dates a loop's opening by DAY (a loop opened on T's day cannot be placed before or after T),
             # and this read is handed only the loops open now (one resolved since T is not among them)
-            blind("spores", f"{NOT_KEPT} (a loop is dated by day, and only the loops open now are read)")
+            blind("intentions", f"{NOT_KEPT} (a loop is dated by day, and only the loops open now are read)")
         else:
             try:
-                tasks += _spore_tasks(list(spores(ctx)), now)
+                tasks += _intention_tasks(list(intentions(ctx)), now)
             except Exception as exc:  # noqa: BLE001
-                blind("spores", f"unreadable ({type(exc).__name__})")
+                blind("intentions", f"unreadable ({type(exc).__name__})")
         on_task = {w for t in tasks for w in t["workers"]}
         # unattached work is the work of sessions that are ACTIVE (running, waiting, stalled); an idle session
         # leaves the Work lens (it stays a node), and no state here is ever `done`: silence is not completion

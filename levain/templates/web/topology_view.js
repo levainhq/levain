@@ -36,7 +36,7 @@
     done: ["Done", "finished"],
   };
   const NODE_WORDS = { waiting: "waiting on you", errored: "errored", stalled: "stalled", running: "running", idle: "idle" };
-  const KIND_WORDS = { dispatch: "dispatch", spore: "open loop", consent: "consent", question: "question", unattached: "unattached" };
+  const KIND_WORDS = { dispatch: "dispatch", intention: "open loop", consent: "consent", question: "question", unattached: "unattached" };
   const CARD_WORDS = { consent: "a consent request", question: "a question", dispatch: "a dispatch contract" };
 
   const GROUP_CAP = 4;                     // tasks of one state the Work stack shows before "show N more"
@@ -477,7 +477,7 @@
   }
   // an open loop opens its row in the page's Open loops panel, through the page's own callback (this file knows no page DOM)
   function openLoopCard(node, t, opts) {
-    if (!opts || typeof opts.openLoop !== "function" || typeof t.id !== "string" || t.id.indexOf("spore:") !== 0 || t.id.length <= 6) return;
+    if (!opts || typeof opts.openLoop !== "function" || typeof t.id !== "string" || t.id.indexOf("intention:") !== 0 || t.id.length <= 6) return;
     const sid = t.id.slice(6);
     const title = node.querySelector(".tv-task-t");
     node.classList.add("tv-open");
@@ -531,7 +531,7 @@
     if (t.kind !== "unattached") foot.appendChild(el("span", "tv-cost" + (costText(t.cost) === "cost not tracked" ? " dim" : ""), costText(t.cost)));
     if (foot.children.length) c.appendChild(foot);
     if (t.state === "waiting") openable(c, t.card, opts);
-    else if (t.kind === "spore") openLoopCard(c, t, opts);
+    else if (t.kind === "intention") openLoopCard(c, t, opts);
     return c;
   }
   function outcomeList(t) {
@@ -1746,7 +1746,7 @@
   // live refetch is paused (`paused()`, read by cockpit_view.refetchPanel) and the badge says so; Live (or Esc) drops T and resumes it.
   // What the past read could not rebuild (`unreadable`) is drawn as unknown. The histogram is the activity panel's events bucketed by `at`.
   const WINDOW_MS = 14 * 3600e3, STEP_MS = 5 * 60e3, MIN_MS = 60e3, KEY_MS = 250, LO_MARGIN_MS = 2 * MIN_MS, HIST_STALE_MS = 60e3, RETURN_MS = 10e3;
-  const UNKNOWN_WORDS = { spores: "open loops", lost_if_closed: "what closing would lose", context: "model and tokens", session_logs: "rate and state from the session logs",
+  const UNKNOWN_WORDS = { intentions: "open loops", lost_if_closed: "what closing would lose", context: "model and tokens", session_logs: "rate and state from the session logs",
                           conflicts: "file conflicts", decisions: "decisions", questions: "questions" };
   // Two times are kept apart. `at` is the REQUESTED T (set when a scrub goes out; non-null = the live refetch is paused); `cat` is the COMMITTED T (the
   // T whose answer is `value`). The badge says "live paused" only over `value` with cat === at; while a read is out it says "loading" and the
@@ -1995,7 +1995,7 @@
   }
 
   // ---- the body ----
-  // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to, openLoop(sporeId): open an open loop's row,
+  // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to, openLoop(intentionId): open an open loop's row,
   // replay: {readJson(url, signal), resume()} when the panel head says `replay: true`}
   function render(v, opts) {
     const o0 = opts || {};

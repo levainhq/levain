@@ -1,4 +1,4 @@
-"""levain.run — the `levain run` REPL for a sovereign entity (spore-277 step 3).
+"""levain.run — the `levain run` REPL for a sovereign entity (intention-277 step 3).
 
 Splits into two tiers:
   - PURE / guard tests (no openhands extra): `_resolve_model`, `_latest_agent_text`, and the
@@ -216,7 +216,7 @@ def test_latest_agent_text_none_on_empty():
     assert _latest_agent_text([]) is None
 
 
-# ---------- narrate-without-act backstop (spore-358 follow-through) ----------
+# ---------- narrate-without-act backstop (intention-358 follow-through) ----------
 
 def test_planned_without_acting_fires_on_a_zero_tool_plan_finish():
     # The dominant weak-model stall: the agent "finishes" with a plan and takes no action.
@@ -358,7 +358,7 @@ def test_planned_without_acting_ignores_a_prior_levain_nudge_as_boundary():
     assert planned_without_acting(events) is False
 
 
-# ---------- spore-297: finish/think-as-JSON-text reply (observed live on minimax-m3) ----------
+# ---------- intention-297: finish/think-as-JSON-text reply (observed live on minimax-m3) ----------
 
 # The EXACT shape observed live (2026-07-09): the model emits its think + finish tool calls as
 # concatenated JSON TEXT in a MessageEvent instead of structured tool calls.
@@ -549,7 +549,7 @@ def test_run_entity_refuses_residue_bearing_openhands_marker(tmp_path: Path, cap
 
 
 def _hands(tools) -> list[str]:
-    """The hands one ``levain_hands`` spec grants (spore-438: both hands are ONE spec carrying the
+    """The hands one ``levain_hands`` spec grants (intention-438: both hands are ONE spec carrying the
     binding, with ``with_bash`` deciding the second)."""
     assert [t.name for t in tools] == ["levain_hands"]
     return ["file_editor", "bash"] if tools[0].params["with_bash"] else ["file_editor"]
@@ -665,7 +665,7 @@ class _LocalhostProvider:
 def test_run_entity_drops_bash_where_the_provider_cannot_deny_localhost(
     tmp_path: Path, monkeypatch, capsys, _clean_entity_env
 ):
-    """The generic seam (spore-755): a provider that cannot refuse a connect back to this host gets
+    """The generic seam (intention-755): a provider that cannot refuse a connect back to this host gets
     NO bash while the entity's floor asks for that deny, rather than bash without it. No shipped
     provider takes this path since 2026-10-01 (bwrap enforces the deny with --unshare-net)."""
     pytest.importorskip("openhands.sdk", reason="openhands extra absent")
@@ -864,7 +864,7 @@ def test_run_entity_rejects_a_malformed_confinement_config(
     assert "confinement config is invalid" in capsys.readouterr().out
 
 
-# ---------- the REPL's turn boundary, end-to-end (spore-373 blocker [1]) ----------
+# ---------- the REPL's turn boundary, end-to-end (intention-373 blocker [1]) ----------
 #
 # `levain.turn_input` is unit-tested against real pipes and a real pty; these two drive the
 # ACTUAL `run_entity` loop over a pty, because the defect was never in a helper — it was in
@@ -1038,7 +1038,7 @@ def test_banner_names_readable_standard_creds(capsys) -> None:
     assert "(set deny_standard_creds false to allow)" in out2 and "to allow" not in out
 
 
-# ---------- the banner states the TIME BOUND, and its absence (K4a ⑥, `spore-434`) ----------
+# ---------- the banner states the TIME BOUND, and its absence (K4a ⑥, `intention-434`) ----------
 
 def test_banner_names_the_wall_clock_bound_and_the_new_exit_code(tmp_path: Path, capsys):
     """The banner ENUMERATES the exit codes, so a new code that is not listed leaves it advertising

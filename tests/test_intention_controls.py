@@ -28,7 +28,7 @@ class HostStore:
     """The public surface of a host store (flow's NeedsQuestions) with the intention capability."""
 
     def __init__(self) -> None:
-        self.rows = [_q(11, "np-ring0001", intention="spore-9"), _q(12, "np-plain002")]
+        self.rows = [_q(11, "np-ring0001", intention="intention-9"), _q(12, "np-plain002")]
         self.acts: list[tuple[str, str, dict[str, Any]]] = []
         self.refuse: str | None = None
         self.refuse_stale = False
@@ -50,7 +50,7 @@ class HostStore:
         if self.refuse:
             raise (IntentionStale if self.refuse_stale else ConsentError)(self.refuse)
         self.acts.append((ref, action, {"until": until, "text": text, "channel": channel}))
-        hit = lambda q: ref in (q.id, q.intention) and q.answer is None   # noqa: E731 - the spore id or the row id, as flow's
+        hit = lambda q: ref in (q.id, q.intention) and q.answer is None   # noqa: E731 - the intention id or the row id, as flow's
         if not any(hit(q) for q in self.rows):
             raise ConsentError(f"{ref} rings no open row")
         if action == "edit":
@@ -95,7 +95,7 @@ def test_decisions_an_intention_row_gets_the_four_and_a_machine_row_keeps_its_an
     rig, _ = host_rig
     assert _verbs(_decision(rig, 11)) == FOUR
     assert _verbs(_decision(rig, 12)) == {"question_answer"}
-    assert _decision(rig, 11)["facets"]["question_intention"] == "spore-9"
+    assert _decision(rig, 11)["facets"]["question_intention"] == "intention-9"
     assert "question_intention" not in _decision(rig, 12)["facets"]
 
 
@@ -103,7 +103,7 @@ def test_list_an_intention_band_row_gets_the_four_and_a_machine_row_none(host_ri
     rig, _ = host_rig
     rows = rig.rows()
     assert _verbs(rows["band:np-ring0001"]) == FOUR
-    assert rows["band:np-ring0001"]["facets"]["intention"] == "spore-9"
+    assert rows["band:np-ring0001"]["facets"]["intention"] == "intention-9"
     assert _verbs(rows["band:np-plain002"]) == set()        # read-only, as every band row was
 
 
@@ -140,8 +140,8 @@ def test_each_verb_calls_intention_act_once_with_the_right_action(tmp_path: Path
     rig.ck.attach_question_rows(host)
     row = _decision(rig, 11) if panel == "decisions" else rig.rows()["band:np-ring0001"]
     out = _fire(rig, panel, row, verb, params)
-    assert out["intention"] == want[0] and out["ref"] == "spore-9"          # the reminder the row showed
-    assert host.acts == [("spore-9", want[0], {**want[1], "channel": "cockpit"})]
+    assert out["intention"] == want[0] and out["ref"] == "intention-9"          # the reminder the row showed
+    assert host.acts == [("intention-9", want[0], {**want[1], "channel": "cockpit"})]
 
 
 @pytest.mark.parametrize("panel", ["decisions", "tray"])
@@ -166,7 +166,7 @@ def test_done_takes_no_confirm(host_rig) -> None:
 def test_the_hosts_refusal_comes_back_in_its_own_words(host_rig) -> None:
     rig, host = host_rig
     row = rig.rows()["band:np-ring0001"]
-    host.refuse, host.refuse_stale = "spore-9 is already finished", True
+    host.refuse, host.refuse_stale = "intention-9 is already finished", True
     with pytest.raises(EditError) as exc:
         _fire(rig, "tray", row, "intention_done", {})
     assert exc.value.http_status == 409 and "already finished" in str(exc.value)
@@ -254,7 +254,7 @@ def test_a_host_exception_marked_stale_is_a_409(host_rig, monkeypatch) -> None:
         stale = True
 
     def act(ref, action, *, until=None, text=None, channel):
-        raise HostIntentionError("spore-9 closed while it was being closed")
+        raise HostIntentionError("intention-9 closed while it was being closed")
 
     monkeypatch.setattr(host, "intention_act", act)
     with pytest.raises(EditError) as exc:
@@ -263,10 +263,10 @@ def test_a_host_exception_marked_stale_is_a_409(host_rig, monkeypatch) -> None:
 
 
 def test_the_act_names_the_reminder_the_page_showed(host_rig) -> None:
-    """C1: the host is handed the spore id the row displayed, never a row id it would re-resolve."""
+    """C1: the host is handed the intention id the row displayed, never a row id it would re-resolve."""
     rig, host = host_rig
     _fire(rig, "decisions", _decision(rig, 11), "intention_done", {})
-    assert [a[0] for a in host.acts] == ["spore-9"]
+    assert [a[0] for a in host.acts] == ["intention-9"]
 
 
 def test_a_malformed_snooze_reads_in_plain_words(host_rig) -> None:

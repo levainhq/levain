@@ -950,7 +950,7 @@ def test_print_manifest_expands_activation_files(tmp_path: Path, capsys):
     assert "posture.md" in out
 
 
-# ---------- apply_init: the shared write-half (spore-181 Slice B1) ----------
+# ---------- apply_init: the shared write-half (intention-181 Slice B1) ----------
 
 def test_apply_init_writes_seed_adapter_and_inits_store(tmp_path: Path, monkeypatch):
     """apply_init is the write-half extracted from run_init so the CLI and the
@@ -984,7 +984,7 @@ def test_apply_init_writes_seed_adapter_and_inits_store(tmp_path: Path, monkeypa
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
             [
                 SeedEntry(n, templates_root / "seed" / n, "verbatim")
-                for n in ("partnership.md", "memory.md", "memory_workflow.md", "spore_instructions.md",
+                for n in ("partnership.md", "memory.md", "memory_workflow.md", "intention_instructions.md",
                           "continuity.md", "README.md")
             ],
         )
@@ -1002,7 +1002,7 @@ def test_apply_init_writes_seed_adapter_and_inits_store(tmp_path: Path, monkeypa
     assert (install / "seed" / "origin.md").is_file()
     # Verbatim seed files copied — byte-for-byte, not just present.
     assert (install / "seed" / "partnership.md").read_bytes() == src_partnership
-    assert (install / "seed" / "spore_instructions.md").is_file()
+    assert (install / "seed" / "intention_instructions.md").is_file()
     # claude-code adapter wiring laid down.
     assert (install / "CLAUDE.md").is_file()
     assert (install / ".claude" / "settings.json").is_file()
@@ -1035,7 +1035,7 @@ def test_apply_init_persists_answers_json(tmp_path: Path, monkeypatch):
             install, "claude-code", answers, templates_root,
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
             [SeedEntry(n, templates_root / "seed" / n, "verbatim")
-             for n in ("partnership.md", "memory.md", "memory_workflow.md", "spore_instructions.md",
+             for n in ("partnership.md", "memory.md", "memory_workflow.md", "intention_instructions.md",
                        "continuity.md", "README.md")],
         )
     stored = _json.loads((install / ".levain" / "answers.json").read_text(encoding="utf-8"))
@@ -1069,7 +1069,7 @@ def test_apply_init_returns_store_failure(tmp_path: Path, monkeypatch):
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
             [
                 SeedEntry(n, templates_root / "seed" / n, "verbatim")
-                for n in ("partnership.md", "memory.md", "memory_workflow.md", "spore_instructions.md",
+                for n in ("partnership.md", "memory.md", "memory_workflow.md", "intention_instructions.md",
                           "continuity.md", "README.md")
             ],
         )
@@ -1110,7 +1110,7 @@ def test_apply_init_codex_adapter_path(tmp_path: Path, monkeypatch):
             "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin],
             [
                 SeedEntry(n, templates_root / "seed" / n, "verbatim")
-                for n in ("partnership.md", "memory.md", "memory_workflow.md", "spore_instructions.md",
+                for n in ("partnership.md", "memory.md", "memory_workflow.md", "intention_instructions.md",
                           "continuity.md", "README.md")
             ],
         )
@@ -1343,8 +1343,8 @@ def test_apply_init_generates_claude_seed_imports_byte_identical(tmp_path: Path,
     assert "@seed/README.md" not in got
     # An on-demand seed is NOT eagerly imported, but IS pointed at. Asserting only
     # the first half would pass for a file that vanished from the install entirely.
-    assert "@seed/spore_instructions.md" not in got
-    assert "`seed/spore_instructions.md`" in got
+    assert "@seed/intention_instructions.md" not in got
+    assert "`seed/intention_instructions.md`" in got
     # the surrounding template prose survives — not just the generated block — and the
     # live continuity loads at session start as its own import line (1003+21's demo runs:
     # without it the agent read its memory on 4-5 of 8 days)
@@ -1393,8 +1393,8 @@ def test_apply_init_generates_codex_seed_imports_byte_identical(tmp_path: Path, 
     got = (install / "AGENTS.md").read_text(encoding="utf-8")
     assert got == expected
     # Off the numbered read-list, but still pointed at (see the claude twin).
-    assert "6. `seed/spore_instructions.md`" not in got
-    assert "`seed/spore_instructions.md`" in got
+    assert "6. `seed/intention_instructions.md`" not in got
+    assert "`seed/intention_instructions.md`" in got
     # The backtick-wrapped form is the import-LIST entry — absent here (continuity
     # / README never load). The bare names DO appear in the trailing explanatory
     # comment, so assert the list form, not the substring.
@@ -1440,7 +1440,7 @@ def test_apply_init_pack_seed_file_loads_in_both_adapters(tmp_path: Path, monkey
     claude = (cc / "CLAUDE.md").read_text(encoding="utf-8")
     assert "@seed/audit_method.md" in claude
     # appended AFTER the base curriculum (the last EAGER base import is memory_workflow.md;
-    # spore_instructions.md is on-demand and off this list entirely)
+    # intention_instructions.md is on-demand and off this list entirely)
     assert claude.index("@seed/memory.md") < claude.index("@seed/audit_method.md")
 
     cx = tmp_path / "cx"
@@ -1533,12 +1533,12 @@ def test_apply_init_missing_base_seed_fails_loud(tmp_path: Path, monkeypatch):
     with _templates_root() as templates_root:
         spec_world = parse_template(templates_root / "seed" / "world.md")
         spec_origin = parse_template(templates_root / "seed" / "origin.md")
-        # verbatim DELIBERATELY omits spore_instructions.md (the corrupt-wheel case)
+        # verbatim DELIBERATELY omits intention_instructions.md (the corrupt-wheel case)
         verbatim = [
             SeedEntry(n, templates_root / "seed" / n, "verbatim")
             for n in ("partnership.md", "memory.md", "continuity.md", "README.md")
         ]
-        with pytest.raises(InitError, match="spore_instructions.md"):
+        with pytest.raises(InitError, match="intention_instructions.md"):
             apply_init(
                 install, "claude-code", {}, templates_root,
                 "/usr/bin/python3", "anneal-memory", [spec_world, spec_origin], verbatim,
@@ -1716,7 +1716,7 @@ def test_activation_no_edit_notice_when_current_matches_winning_pack(
     """No spurious "Operator-edited" notice when the installed posture.md already matches
     the WINNING pack override (even though it DIFFERS from base) — proves the notice
     compares against the winning source, not base. The previous tree is still kept whole
-    (spore-861); only the claim is at stake here."""
+    (intention-861); only the claim is at stake here."""
     monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _OKRun())
     pack = _make_activation_pack(
         tmp_path / "pack", order=10, activation={"posture.md": "PACK POSTURE\n"}
@@ -1821,7 +1821,7 @@ def test_copy_activation_patched_nested_hook_is_backed_up(tmp_path: Path):
     # The package version won the install...
     assert (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8") == "NEW PACKAGE HOOK\n"
     # ...but the operator's patch survives, at its relative path, inside the whole
-    # previous tree (spore-861).
+    # previous tree (intention-861).
     assert _backed_up_files(install) == ["hooks/_levain_hook.py", "posture.md"]
     bak = next((install / ".levain" / "backups" / "activation").rglob("_levain_hook.py"))
     assert bak.read_text(encoding="utf-8") == "OPERATOR PATCHED HOOK\n"
@@ -1830,7 +1830,7 @@ def test_copy_activation_patched_nested_hook_is_backed_up(tmp_path: Path):
 def test_copy_activation_pristine_substituted_hook_is_NOT_announced(tmp_path: Path):
     """⛔ Install substitutes `{{ANNEAL_MEMORY}}` into hooks, so the INSTALLED hook never
     equals its package SOURCE; a pristine hook must never be reported as operator-edited.
-    Since spore-900 the claim comes from the install receipt, so the tree is installed first
+    Since intention-900 the claim comes from the install receipt, so the tree is installed first
     (L1 MED: built by hand it had no receipt, and the no-receipt branch can never claim an
     edit, so this test could not fail).
 
@@ -1855,7 +1855,7 @@ def test_copy_activation_pristine_substituted_hook_is_NOT_announced(tmp_path: Pa
 
 def test_copy_activation_patched_hook_still_caught_under_substitution(tmp_path: Path):
     """The other half, and what makes the fix a correction rather than a mute button:
-    a REAL patch to a placeholder-bearing hook must still be named. Since spore-900 the
+    a REAL patch to a placeholder-bearing hook must still be named. Since intention-900 the
     claim comes from the install receipt, so the tree is installed first."""
     base = _mk_layer(tmp_path / "base", {
         "posture.md": "P\n",
@@ -1879,7 +1879,7 @@ def test_copy_activation_patched_hook_still_caught_under_substitution(tmp_path: 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the unreadable-dir permission")
 def test_copy_activation_unreadable_dir_is_KEPT_in_the_backup(tmp_path: Path):
     """⛔ An unreadable subdirectory used to be a problem only because the old design had
-    to SCAN every file to decide what to copy. Since spore-861 nothing is scanned before
+    to SCAN every file to decide what to copy. Since intention-861 nothing is scanned before
     the swap: the whole previous tree is renamed into the backup, unreadable directory and
     all, and the reinstall proceeds. The post-swap comparison against the receipt cannot
     read it, so it names it, and the tree cannot prove unedited, so it is never pruned.
@@ -1931,7 +1931,7 @@ def _hook_layer(root: Path) -> Path:
 
 def test_pristine_hook_is_not_backed_up_when_the_anneal_PATH_MOVES(tmp_path: Path):
     """⛔ `anneal_path` is re-resolved EVERY run. It was `shutil.which("anneal-memory")`
-    until spore-751 and is now the script of the anneal the running interpreter imports,
+    until intention-751 and is now the script of the anneal the running interpreter imports,
     which still moves when init runs from a different venv. So a PRISTINE installed hook's
     `_INSTALL_ANNEAL_BIN` line legitimately differs from the line about to replace it
     whenever that resolution moves — a venv vs a plain shell. Comparing raw bytes called that an operator edit and printed
@@ -1940,7 +1940,7 @@ def test_pristine_hook_is_not_backed_up_when_the_anneal_PATH_MOVES(tmp_path: Pat
     ⚠ AND IT RECURS: each run writes its OWN resolution in, so alternating shells
     re-trigger it forever. Measured on real installs 2026-09-06 before the fix.
 
-    Since spore-900 the answer comes from the install receipt rather than from normalising
+    Since intention-900 the answer comes from the install receipt rather than from normalising
     the substituted line: each run's hook matches the receipt the previous run wrote.
 
     MUTATION CONTROL: drop the receipt's `notify = False` branch and this fails — the
@@ -1976,7 +1976,7 @@ def test_an_edit_CONFINED_to_the_substituted_line_is_PRESERVED_AND_NAMED(tmp_pat
     the edit with no backup.
 
     The 09-06 answer preserved it silently, because by inspection a human-written wrapper
-    path and install's own output are the same bytes. spore-900 adds the missing record:
+    path and install's own output are the same bytes. intention-900 adds the missing record:
     the receipt holds what install wrote, so the edit is now both preserved AND claimed.
 
     MUTATION CONTROL: drop `known_edit = True` and the notice assertion fails; make the
@@ -2020,7 +2020,7 @@ def test_a_pristine_reinstall_is_never_BLOCKED_by_an_unwritable_backup_dir(tmp_p
     finally:
         os.chmod(backups_root, 0o700)
     assert '"/usr/local/bin/anneal-memory"' in (dst / "hooks" / "_levain_hook.py").read_text(encoding="utf-8")
-    # And the previous tree was still kept, beside activation/ instead (spore-861).
+    # And the previous tree was still kept, beside activation/ instead (intention-861).
     kept = list(install.glob(".levain-activation-prev-*/hooks/_levain_hook.py"))
     assert len(kept) == 1 and '"/opt/a/anneal-memory"' in kept[0].read_text(encoding="utf-8")
 
@@ -2035,7 +2035,7 @@ def test_a_failed_best_effort_copy_is_ANNOUNCED_not_swallowed(tmp_path: Path):
     edit was neither preserved NOR reported. Silence is the defect, not the failure —
     a safe branch that can fail must leave a trace, or a weak heuristic runs forever
     with nothing to indict it."""
-    # spore-861: the whole previous tree is moved, never classified; an unwritable backups
+    # intention-861: the whole previous tree is moved, never classified; an unwritable backups
     # dir sends it to a sibling beside activation/ instead of blocking the reinstall.
     base = _hook_layer(tmp_path / "base")
     install = tmp_path / "install"
@@ -2122,7 +2122,7 @@ def test_a_best_effort_note_buffered_before_an_aborted_swap_is_NEVER_emitted(
 
 @pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
 def test_a_symlink_in_the_previous_tree_is_kept_AS_A_SYMLINK(tmp_path: Path):
-    """spore-860's cases were losses of classification: a directory symlink was never
+    """intention-860's cases were losses of classification: a directory symlink was never
     enumerated and a file symlink was replaced by a copy of its target. Renaming the whole
     tree keeps both exactly as they were."""
     base = _mk_layer(tmp_path / "base", {"posture.md": "P\n"})
@@ -2223,7 +2223,7 @@ def test_a_REAL_patch_is_still_caught_when_the_anneal_path_also_moves(tmp_path: 
 
 
 def test_a_receiptless_tree_is_preserved_WITHOUT_a_claim_either_way(tmp_path: Path):
-    """⛔ No receipt = UNKNOWN (spore-900). Every install made before the receipt existed
+    """⛔ No receipt = UNKNOWN (intention-900). Every install made before the receipt existed
     looks like this on its first `init --force`. The changed file is backed up, but levain
     must neither call it operator-edited nor stay silent about it.
 
@@ -2300,7 +2300,7 @@ def test_a_store_path_with_a_backslash_is_inserted_LITERALLY(tmp_path: Path):
     group reference`). The replacement is now a lambda, so it is inserted verbatim.
 
     The block holds the path escaped for a TOML basic string, as levain renders it since
-    spore-866 (a raw backslash there was invalid TOML; `_merge_codex_config` now refuses to
+    intention-866 (a raw backslash there was invalid TOML; `_merge_codex_config` now refuses to
     write a config that does not parse). The escaped text must survive `re.sub` verbatim and
     parse back to the path."""
     path = tmp_path / "config.toml"
@@ -2607,7 +2607,7 @@ def test_copy_activation_operator_added_nested_file_is_backed_up(tmp_path: Path)
 
 
 def test_copy_activation_pristine_tree_announces_nothing(tmp_path: Path):
-    """The whole previous tree is kept (spore-861), so the property left to grade is the
+    """The whole previous tree is kept (intention-861), so the property left to grade is the
     notice: a reinstall over an untouched install must not produce a single
     "Operator-edited" line. Installed first so a receipt exists (L1 MED)."""
     files = {"posture.md": "P\n", "hooks/h.py": "H\n", "recency_directives.md": "R\n"}
@@ -3038,7 +3038,7 @@ def test_fill_seed_on_demand_drops_the_block_when_nothing_is_on_demand():
 
 
 def test_on_demand_block_carries_the_retention_summary_not_a_bare_filename():
-    """A bare pointer would silently kill the layer it points at: the spore TOOLS
+    """A bare pointer would silently kill the layer it points at: the intention TOOLS
     stay in context, but the discipline that makes them fire lives only in the
     file. The block must carry the retained content."""
     root = Path(__file__).resolve().parent.parent / "levain" / "templates" / "seed"
@@ -3050,7 +3050,7 @@ def test_on_demand_block_carries_the_retention_summary_not_a_bare_filename():
         assert f"`seed/{name}`" in block
         assert ON_DEMAND_SUMMARY[name] in block
     # the operative instruction, not just a description of the file
-    assert "spore_add" in block and "must close" in block
+    assert "intention_add" in block and "must close" in block
     assert _on_demand_block([]) == ""
 
 
@@ -3063,15 +3063,15 @@ def test_pack_override_of_an_on_demand_file_does_not_inherit_the_base_summary(tm
     content would keep the pointer asserting the BASE discipline over pack-authored
     text. Confidently describing a procedure the file does not contain is worse than
     describing none, so a non-base winner falls back to the file's own H1."""
-    pack_file = tmp_path / "spore_instructions.md"
+    pack_file = tmp_path / "intention_instructions.md"
     pack_file.write_text("# Domain Loop Protocol\n\nentirely different.\n", encoding="utf-8")
-    entry = SeedEntry(name="spore_instructions.md", path=pack_file, mode="verbatim")
+    entry = SeedEntry(name="intention_instructions.md", path=pack_file, mode="verbatim")
 
     block = _on_demand_block([entry])
     assert "Domain Loop Protocol" in block
     # the base discipline is NOT asserted over the pack's file
-    assert "spore_add" not in block
-    assert ON_DEMAND_SUMMARY["spore_instructions.md"] not in block
+    assert "intention_add" not in block
+    assert ON_DEMAND_SUMMARY["intention_instructions.md"] not in block
 
 
 def test_base_seed_still_gets_its_full_retention_summary():
@@ -3079,11 +3079,11 @@ def test_base_seed_still_gets_its_full_retention_summary():
     the pack fix would have silently degraded every ordinary install."""
     root = Path(__file__).resolve().parent.parent / "levain" / "templates" / "seed"
     entry = SeedEntry(
-        name="spore_instructions.md", path=root / "spore_instructions.md", mode="verbatim"
+        name="intention_instructions.md", path=root / "intention_instructions.md", mode="verbatim"
     )
     block = _on_demand_block([entry])
-    assert ON_DEMAND_SUMMARY["spore_instructions.md"] in block
-    assert "spore_add" in block
+    assert ON_DEMAND_SUMMARY["intention_instructions.md"] in block
+    assert "intention_add" in block
 
 
 def test_fill_seed_on_demand_empty_does_not_double_the_blank_line():
@@ -3101,7 +3101,7 @@ def test_fill_seed_on_demand_empty_leaves_an_inline_placeholder_line_intact():
 
 
 # ---------------------------------------------------------------------------
-# spore-1023: the per-install lock. Reproduced through the CLI first: two
+# intention-1023: the per-install lock. Reproduced through the CLI first: two
 # concurrent `levain init --force` runs on one install left the activation
 # receipt describing a tree that was not installed (1/40 pairs), and crashed
 # one run with a FileNotFoundError mid-swap (27/40 pairs).

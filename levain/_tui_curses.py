@@ -34,9 +34,9 @@ import tempfile
 from dataclasses import replace
 
 from levain.cockpit.engine import Cockpit
-from levain.cockpit.providers import spore_view_version
+from levain.cockpit.providers import intention_view_version
 from levain.dashboard import CLASS_A, CLASS_B, CLASS_C, SubstrateSource, SubstrateView
-from levain.spores import PARKED_TIER
+from levain.intentions import PARKED_TIER
 from levain.tui import (
     ZONES,
     TuiModel,
@@ -46,7 +46,7 @@ from levain.tui import (
     build_descend_req,
     build_seed_req,
     build_set_disposition_req,
-    build_spore_update_req,
+    build_intention_update_req,
     build_state_edit_req,
     build_surface_at_req,
     build_tombstone_req,
@@ -229,7 +229,7 @@ def _active_verbs(model: TuiModel) -> list[Verb]:
     changes the affordance (NO THEATER — never advertise a key the selected row can't
     honor):
     - **edits** — ``[u]ndo`` only on a file-undoable record (mirrors the server refusal).
-    - **spores/tray** — a resolve verb is advertised only when the SELECTED row's
+    - **intentions/tray** — a resolve verb is advertised only when the SELECTED row's
       type actually yields that kind (``descend_kinds`` / ``ascend_kinds``), mirroring the
       web's ``Array.isArray(...) && .length`` gate; on a PARKED loop ``[p]ark`` is
       replaced by ``un-park``; on a legacy note in the Tray ``re[c]lassify`` is dropped
@@ -251,22 +251,22 @@ def _active_verbs(model: TuiModel) -> list[Verb]:
         return verbs
     if kind == "episodes":
         # episode_tombstone acts on the selected EPISODE — a DIFFERENT row source than the
-        # spore projections below (`current_row` covers only spores/tray). Keep its verb
+        # intention projections below (`current_row` covers only intentions/tray). Keep its verb
         # when a row is selected; the empty case already returned above (codex L3).
         return verbs if current_episode(model) is not None else []
-    # the two spore projections — prune by the SELECTED row so the footer never advertises
+    # the two intention projections — prune by the SELECTED row so the footer never advertises
     # a key the row can't honor (the NO-THEATER contract this function exists to keep).
     row = current_row(model)
     if row is None:
         return [v for v in verbs if not v.row_scoped]
     if not getattr(row, "descend_kinds", None):
-        verbs = [v for v in verbs if v.kind != "spore_descend"]
+        verbs = [v for v in verbs if v.kind != "intention_close"]
     if not getattr(row, "ascend_kinds", None):
-        verbs = [v for v in verbs if v.kind != "spore_ascend"]
-    if kind == "spores" and getattr(row, "tier", None) == PARKED_TIER:
-        verbs = [Verb("p", "[p] un-park", "spore_unpark") if v.kind == "spore_park" else v for v in verbs]
+        verbs = [v for v in verbs if v.kind != "intention_promote"]
+    if kind == "intentions" and getattr(row, "tier", None) == PARKED_TIER:
+        verbs = [Verb("p", "[p] un-park", "intention_unpark") if v.kind == "intention_park" else v for v in verbs]
     if kind == "tray" and getattr(row, "disposition", None) == "note":
-        verbs = [v for v in verbs if v.kind != "spore_reclassify"]
+        verbs = [v for v in verbs if v.kind != "intention_reclassify"]
     return verbs
 
 
@@ -315,21 +315,21 @@ def _handle_verb(
     if kind == "edit":
         return _handle_edit(stdscr, model, source)
 
-    # The spore lifecycle verbs act on the SELECTED row of whichever spore projection is
+    # The intention lifecycle verbs act on the SELECTED row of whichever intention projection is
     # active (Open Loops / Tray) — current_row dispatches to the right list.
-    if kind == "spore_touch":
+    if kind == "intention_touch":
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
         return _apply(model, source, build_touch_req(s.id), f"touched {s.id}")
 
-    if kind == "spore_descend":
+    if kind == "intention_close":
         # One verb, two faces by panel (parity with the web): Open Loops "compost" +
         # Tray "dismiss" both pick a resolve kind.
-        # CAS-GUARDED (spore-173): the kind/face is chosen off the SNAPSHOT row, so the
+        # CAS-GUARDED (intention-173): the kind/face is chosen off the SNAPSHOT row, so the
         # snapshot disposition rides the request as expect_disposition; the server descend
-        # CASes it (anneal AM-SPORE-CAS-DESCEND, parity with ascend), so a cross-process
-        # re-route in the confirm window FAILS CLOSED (stale → re-read, spore-174) rather than
+        # CASes it (anneal AM-INTENTION-CAS-DESCEND, parity with ascend), so a cross-process
+        # re-route in the confirm window FAILS CLOSED (stale → re-read, intention-174) rather than
         # composting a now-live loop under a stale intent. (s.disposition is the
         # rendered value; the server normalizes 'loop'→key-absent for the raw compare.)
         s = current_row(model)
@@ -348,7 +348,7 @@ def _handle_verb(
                       build_descend_req(s.id, chosen, expect_disposition=s.disposition),
                       f"{past} {s.id}")
 
-    if kind == "spore_ascend":
+    if kind == "intention_promote":
         s = current_row(model)
         if s is None:
             return replace(model, status="no loop selected")
@@ -366,7 +366,7 @@ def _handle_verb(
 
     # ---- Slice-3b operator-I/O verbs (the curses peer of the web dump/sort/promote verbs) ----
 
-    if kind == "spore_edit":  # refine text in $EDITOR → spore_update{text} (server strips)
+    if kind == "plain_intention_edit":  # refine text in $EDITOR → intention_update{text} (server strips)
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
@@ -377,13 +377,13 @@ def _handle_verb(
             return replace(model, status="⚠ text cannot be cleared to empty")
         if edited.strip() == (s.text or "").strip():
             return replace(model, status="no change")
-        return _apply(model, source, build_spore_update_req(s.id, text=edited), f"edited {s.id}")
+        return _apply(model, source, build_intention_update_req(s.id, text=edited), f"edited {s.id}")
 
-    if kind == "spore_capture":  # PANEL-level freeform dump → Tray seed
+    if kind == "intention_capture":  # PANEL-level freeform dump → Tray seed
         # Deliberately sends NO `type` → the server defaults to `thought` and the AI sorts it
         # ("human dumps, AI sorts" — the same as the web dump's default "let flow sort" option).
         # The operator classifies post-dump via the Tray `c` (reclassify) verb when they care.
-        disposition = "seed"
+        disposition = "someday"
         text = _edit_via_editor(stdscr, "")
         if text is None:
             return replace(model, status="⚠ capture not saved — $EDITOR is missing or exited non-zero")
@@ -392,7 +392,7 @@ def _handle_verb(
         label = "kept a note" if disposition == "note" else "dropped a List seed"
         return _apply(model, source, build_seed_req(text, disposition), label)
 
-    if kind == "spore_reclassify":  # change a forming Tray item's type (locks at metabolize)
+    if kind == "intention_reclassify":  # change a forming Tray item's type (locks at metabolize)
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
@@ -402,17 +402,17 @@ def _handle_verb(
             return replace(model, status="cancelled")
         if chosen == s.type:
             return replace(model, status="no change")
-        return _apply(model, source, build_spore_update_req(s.id, spore_type=chosen),
+        return _apply(model, source, build_intention_update_req(s.id, intention_type=chosen),
                       f"reclassified {s.id} → {chosen}")
 
-    if kind == "spore_metabolize":  # Tray seed → live cognition loop (gain direction, no confirm)
+    if kind == "intention_metabolize":  # Tray seed → live cognition loop (gain direction, no confirm)
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
         return _apply(model, source, build_set_disposition_req(s.id, "loop", expect_disposition=s.disposition),
                       f"metabolized {s.id} → loop")
 
-    if kind == "spore_schedule":  # surface_at on a loop/Tray item ('-' clears the alarm)
+    if kind == "intention_schedule":  # surface_at on a loop/Tray item ('-' clears the alarm)
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
@@ -425,28 +425,28 @@ def _handle_verb(
         ok = f"cleared schedule on {s.id}" if value == "" else f"scheduled {s.id} → {date}"
         return _apply(model, source, build_surface_at_req(s.id, value), ok)
 
-    if kind == "spore_park":  # pin a loop dormant (hide from cognition, stays open, shown parked)
+    if kind == "intention_park":  # pin a loop dormant (hide from cognition, stays open, shown parked)
         s = current_row(model)
         if s is None:
             return replace(model, status="no loop selected")
-        # CAS the snapshot (spore-173): park is offered only on a loop; the snapshot rides the
+        # CAS the snapshot (intention-173): park is offered only on a loop; the snapshot rides the
         # tier update so a concurrent re-route before the write fails closed (not tier-parks a note).
         return _apply(model, source,
-                      build_spore_update_req(s.id, tier="parked", expect_disposition=s.disposition,
-                                             expected_version=spore_view_version(s)),
+                      build_intention_update_req(s.id, tier="parked", expect_disposition=s.disposition,
+                                             expected_version=intention_view_version(s)),
                       f"parked {s.id}")
 
-    if kind == "spore_unpark":  # a parked Open loop → back into active cognition
+    if kind == "intention_unpark":  # a parked Open loop → back into active cognition
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
-        # un-park: CAS-GUARDED (spore-173) — the loop-vs-note route is read off
+        # un-park: CAS-GUARDED (intention-173) — the loop-vs-note route is read off
         # the SNAPSHOT, so the snapshot disposition rides the tier update as expect_disposition;
-        # a stale note now FAILS CLOSED (stale → re-read, spore-174) instead of accepting tier=warm +
+        # a stale note now FAILS CLOSED (stale → re-read, intention-174) instead of accepting tier=warm +
         # falsely reporting "reactivated" while it stays a note.
         return _apply(model, source,
-                      build_spore_update_req(s.id, tier="warm", expect_disposition=s.disposition,
-                                             expected_version=spore_view_version(s)),
+                      build_intention_update_req(s.id, tier="warm", expect_disposition=s.disposition,
+                                             expected_version=intention_view_version(s)),
                       f"reactivated {s.id} → warm")
 
     if kind == "episode_tombstone":

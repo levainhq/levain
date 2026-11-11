@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from levain.slot import SUDO
+from levain.intention_legacy import STORE_FILE_NAME
 
 if TYPE_CHECKING:
     from levain.firing.hands import HostOS
@@ -67,7 +68,7 @@ EXIT_BROKEN = 1
 
 EXIT_UPGRADE_PENDING = 6
 """Every failing check is a routine post-upgrade step that has not been applied yet
-(``spore-840``, ruled 2026-09-13).
+(``intention-840``, ruled 2026-09-13).
 
 Its own code because the two states want opposite responses: ``1`` means something is
 wrong, ``6`` means run the remedy the output names. ⛔ It is NOT a success. Until the step
@@ -287,7 +288,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
 # installed adapter file or a recorded roster, not grow this constant (Slice 3
 # deferral).
 #
-# ⚠ `spore_instructions.md` JOINED THIS LIST 2026-08-01, WITH THE MOVE THAT MADE IT
+# ⚠ `intention_instructions.md` JOINED THIS LIST 2026-08-01, WITH THE MOVE THAT MADE IT
 # ON-DEMAND. It had never been here: eagerly imported, its absence surfaced anyway
 # (a broken `@seed/` line in the carrier). Behind a POINTER it would not — the
 # carrier would instruct the entity to read a file that is not on disk, with doctor
@@ -300,7 +301,7 @@ _SEED_REQUIRED = (
     "world.md",
     "memory.md",
     "memory_workflow.md",
-    "spore_instructions.md",
+    "intention_instructions.md",
 )
 _SEED_EXPECTED = _SEED_REQUIRED + ("continuity.md", "README.md")
 _HOOK_REQUIRED = ("session_start.py", "user_prompt_submit.py", "_levain_hook.py")
@@ -3133,7 +3134,7 @@ def _check_runtime(install: Path) -> list[CheckResult]:
 
     from levain.manifest import resolve_anneal_bin
 
-    # spore-751: report the ONE anneal levain's interpreter resolves, which is the one init
+    # intention-751: report the ONE anneal levain's interpreter resolves, which is the one init
     # wires, instead of whatever PATH finds first.
     am_cli = resolve_anneal_bin()
     script_failure = ""
@@ -4132,45 +4133,45 @@ def _check_continuity_headroom(install: Path) -> list[CheckResult]:
 
 
 def _check_keep_migration(install: Path) -> list[CheckResult]:
-    """One row, only while Keep rows (notes, handoffs, undated agendas) still await ``levain spores keep-migrate``.
-    A warning, never a failure; says nothing when nothing waits or there is no spore store."""
+    """One row, only while Keep rows (notes, handoffs, undated agendas) still await ``levain intentions keep-migrate``.
+    A warning, never a failure; says nothing when nothing waits or there is no intention store."""
     from levain import keep_migrate
 
-    spores = install / ".levain" / "memory.spores.json"
-    if not spores.is_file():
+    intentions = install / ".levain" / STORE_FILE_NAME
+    if not intentions.is_file():
         return []
     try:
-        line = keep_migrate.doctor_line(spores)
+        line = keep_migrate.doctor_line(intentions)
     except keep_migrate.KeepMigrateError as exc:
         return [CheckResult("keep", True, f"could not be read ({exc})", warn=True)]
     if line is None:
         return []
-    return [CheckResult("keep", True, line.removeprefix("keep: "), "Run `levain spores keep-migrate` for a dry run.",
+    return [CheckResult("keep", True, line.removeprefix("keep: "), "Run `levain intentions keep-migrate` for a dry run.",
                         warn=True)]
 
 
 def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]:
-    """``spores: overdue-agenda`` (TS-3): an open agenda whose ``next`` day is before today and that was never
+    """``intentions: overdue-agenda`` (TS-3): an open agenda whose ``next`` day is before today and that was never
     germinated is a defect (the session-start, 06:10 and minute runs all missed it). Report only, no gate: a warning
-    row, never a failure. Silent with no spores file, no agenda or none overdue."""
+    row, never a failure. Silent with no intentions file, no agenda or none overdue."""
     from datetime import date as _date
 
     from levain.germinate import _is_agenda
-    from levain.spores import _parse_when, list_open_readonly
+    from levain.intentions import _parse_when, list_open_readonly
 
-    spores = install / ".levain" / "memory.spores.json"
-    if not spores.is_file():
+    intentions = install / ".levain" / STORE_FILE_NAME
+    if not intentions.is_file():
         return []
     day = today.date() if hasattr(today, "date") else (today or _date.today())
-    name = "spores: overdue-agenda"
+    name = "intentions: overdue-agenda"
     try:
-        items = list_open_readonly(spores, today=day)
+        items = list_open_readonly(intentions, today=day)
     except Exception as e:  # noqa: BLE001 - a doctor check reports, it never crashes the run
         return [CheckResult(name, False, f"could not read .levain/memory.spores.json ({type(e).__name__}: {e})",
-                            "The spore store is unreadable; restore it from a backup or git.")]
+                            "The intention store is unreadable; restore it from a backup or git.")]
     late = []
     for s in items:
-        try:   # one malformed spore is skipped, never the row (known edge, closed: a stamped-but-uncomposed agenda is the 06:10 run's)
+        try:   # one malformed intention is skipped, never the row (known edge, closed: a stamped-but-uncomposed agenda is the 06:10 run's)
             if not _is_agenda(s) or s.get("germinated"):
                 continue
             when = _parse_when(s.get("next"))
@@ -4182,7 +4183,7 @@ def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]
         return []
     ids = ", ".join(f"{s.get('id', '?')} (next {s.get('next')})" for s in late[:5]) + (" ..." if len(late) > 5 else "")
     return [CheckResult(name, True, f"{len(late)} agenda{'s' if len(late) != 1 else ''} past its date and not germinated: {ids}",
-                        "Run `levain spores germinate --path <install>`; if it was already run, read its errors.", warn=True)]
+                        "Run `levain intentions germinate --path <install>`; if it was already run, read its errors.", warn=True)]
 
 
 def _check_compat_set(install: Path) -> list[CheckResult]:
@@ -4745,7 +4746,7 @@ def _check_automemory_mirror(install: Path, hooks: dict) -> list[CheckResult]:
 # FILES. What decides whether a hook emits anything is a RUNTIME gate,
 # `_levain_hook.in_install_session()`, and doctor never mentioned it existed.
 # Alex moved Levain into a global tool, worked in his own project directories,
-# and lost posture / recency directives / spore surfacing / crystal recall / the
+# and lost posture / recency directives / intention surfacing / crystal recall / the
 # wrap nudge in every session that mattered, for weeks, with doctor green.
 #
 # ⛔ DELIBERATELY NARROW, AND IT MUST STAY THAT WAY. This is additive: it reads
@@ -5010,7 +5011,7 @@ def _check_activation_scope(install: Path) -> list[CheckResult]:
                 False,
                 f"install-scoped, but this install's hooks are wired at the user "
                 f"level ({where}) — they run for sessions outside the install and "
-                f"then SUPPRESS THEMSELVES, so posture, recency directives, spore "
+                f"then SUPPRESS THEMSELVES, so posture, recency directives, intention "
                 f"surfacing, crystal recall and the wrap nudge are all silently off "
                 f"in those sessions" + env_note,
                 # A fresh `levain init` writes NO config.json, so this has to
@@ -5131,7 +5132,7 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
     """Does the rendered adapter carrier still match the CURRENT seed classification?
 
     History: when this check was written (2026-08-01), adapter carriers were written at
-    `init` only, so when a seed file changed class — as `spore_instructions.md` did,
+    `init` only, so when a seed file changed class — as `intention_instructions.md` did,
     eager -> on-demand — every EXISTING install kept eagerly importing it, gaining none
     of the benefit, while every other check stayed green. Since the install-truth
     work, `levain update` refreshes the carrier (`install.refresh_adapter`), and the
@@ -6892,10 +6893,10 @@ def _check_codex(install: Path) -> list[CheckResult]:
 def _check_mcp_command(name: str, command: object, args: list, install: Path) -> CheckResult:
     """Is the memory server registration launched by THIS levain's interpreter?
 
-    `spore-751` (ruled 2026-09-13): `init` registers `<levain python> -P -m anneal_memory`,
+    `intention-751` (ruled 2026-09-13): `init` registers `<levain python> -P -m anneal_memory`,
     so the anneal that serves memory is the one levain imports, checks and upgrades. A
     registration naming any other command can start a different anneal from the one every
-    other doctor line describes. Deferred from item 1 into `spore-840` because every install
+    other doctor line describes. Deferred from item 1 into `intention-840` because every install
     written before that change fails it on upgrade — an upgrade step pending, so it carries
     that exit code; an unresolvable command is broken and does not.
     """
@@ -6947,7 +6948,7 @@ def _check_mcp_command(name: str, command: object, args: list, install: Path) ->
             upgrade_pending=True,
         )
     if not module_form:
-        # Only the registration every pre-spore-751 install carries is a pending upgrade
+        # Only the registration every pre-intention-751 install carries is a pending upgrade
         # step: a console script named exactly `anneal-memory` with argv exactly
         # `--db <store> serve`. Any other command is not something `init` ever wrote, so
         # doctor cannot vouch for it (codex MED); a name PREFIX let `anneal-memory-<anything>`
@@ -7022,7 +7023,7 @@ def _match_store(name: str, install: Path, args: list) -> CheckResult:
 
     Compares resolved paths so symlinked prefixes (e.g. macOS /tmp -> /private/tmp)
     match correctly. The store is read from the `--db <path>` pair wherever it sits in
-    the args, so the pre-spore-751 shape and the `-P -m anneal_memory` shape both parse.
+    the args, so the pre-intention-751 shape and the `-P -m anneal_memory` shape both parse.
     """
     expected = (install / ".levain" / "memory.db").resolve()
     configured: str | None = None

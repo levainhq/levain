@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 
-from tests.test_cockpit_f12b_topology_view import MID, NARROW, TV, _run, _spore, _value
+from tests.test_cockpit_f12b_topology_view import MID, NARROW, TV, _run, _intention, _value
 from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_k7_build import DESKTOP, _sessions_fixture
 
@@ -52,7 +52,7 @@ def test_the_panel_sits_right_of_the_sessions_card_at_1440_and_below_it_under_14
 @needs_browser
 def test_through_the_real_provider_each_live_session_is_a_line_and_an_unread_tree_never_says_nothing_at_risk(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     probe = ("JSON.stringify({head: %s.querySelector('.lc-h').innerText.replace(/\\s+/g, ' '), lines: [...%s.querySelectorAll('.lc-line')].map(l => l.innerText.replace(/\\s+/g, ' ')), "
              "foot: (%s.querySelector('.lc-foot') || {textContent: ''}).textContent})") % (LC, LC, LC)
     out = _run(tmp_path, src, [{"until": LC}, {"eval": probe},

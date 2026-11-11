@@ -1,4 +1,4 @@
-"""levain.firing.seed — the entity-seed reader + PresenceSource (spore-294, step 4).
+"""levain.firing.seed — the entity-seed reader + PresenceSource (intention-294, step 4).
 
 The seed leaf renders an entity's OWN ``seed/*.md`` into the two identity seams (constitution +
 re-anchor). Like the rest of ``levain.firing`` it is a dependency-isolated leaf (stdlib +
@@ -124,7 +124,7 @@ def test_reanchor_none_when_origin_absent(tmp_path):
 
 
 def test_a_zero_arg_seed_reads_nothing_even_with_a_stale_process_env(tmp_path, monkeypatch):
-    """spore-438: a zero-arg EntitySeed has no entity — the retired $LEVAIN_ENTITY_DIR is not a
+    """intention-438: a zero-arg EntitySeed has no entity — the retired $LEVAIN_ENTITY_DIR is not a
     fallback (a fork rebuilds the presence WITH the entity the condenser serializes)."""
     ent = _seed_entity(tmp_path)
     monkeypatch.setenv("LEVAIN_ENTITY_DIR", str(ent))

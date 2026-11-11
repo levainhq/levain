@@ -25,7 +25,7 @@ def test_a_passkey_key_signs_no_authority_link_but_a_revoke(world) -> None:
     conn = sqlite3.connect(world["root"] / "cockpit.db", isolation_level=None)
     try:
         with pytest.raises(auth.AuthorityError, match="consent answers and grant revokes only, never another"):
-            auth.sign_and_append(conn, {"op": "raise", "verb": "spore_touch", "tier": "T3"},
+            auth.sign_and_append(conn, {"op": "raise", "verb": "intention_touch", "tier": "T3"},
                                  signer_fp=world["passkey_fp"], sign=lambda m: "not a signature",
                                  clock=lambda: datetime.now(timezone.utc), cache=ReplayCache(),
                                  anchor=anchor_path(world["root"]))
