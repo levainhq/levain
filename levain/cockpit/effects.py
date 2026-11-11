@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
+from levain.intention_legacy import OLD_EFFECT_STORE, OLD_KIND_TO_NEW, OLD_ROW_PREFIX
+
 # --- the effect ----------------------------------------------------------------------------------
 
 
@@ -62,8 +64,11 @@ class Effect:
 
     @classmethod
     def from_record(cls, rec: Mapping[str, Any]) -> "Effect":
-        """The effect as the signed record holds it. A malformed entry raises ``ValueError``: the
-        journal treats that as a corrupt record and fails closed (§2 integrity framing)."""
+        """The effect as the signed record holds it, read as history: a store or resource key the release that said
+        "spore" signed comes back under its new name (:func:`read_recorded_store`, :func:`read_recorded_key`), so an op
+        in flight across the update settles on the intention store. The record's own bytes are never touched. A malformed
+        entry raises ``ValueError``: the journal treats that as a corrupt record and fails closed (§2 integrity
+        framing)."""
         try:
             expect, changes, proj = rec["expect"], rec["changes"], rec.get("projection")
             if not isinstance(expect, Mapping) or not isinstance(changes, Mapping):
@@ -72,7 +77,8 @@ class Effect:
                 raise TypeError("projection must be an object or null")
             if not all(isinstance(rec.get(k, []), list) for k in ("writes", "binds")):
                 raise TypeError("writes and binds must be lists")
-            return cls(resource_key=str(rec["resource_key"]), store=str(rec["store"]),
+            return cls(resource_key=read_recorded_key(str(rec["resource_key"])),
+                       store=read_recorded_store(str(rec["store"])),
                        expect=copy.deepcopy(dict(expect)), changes=copy.deepcopy(dict(changes)),
                        projection=None if proj is None else copy.deepcopy(dict(proj)),
                        writes=tuple(str(f) for f in rec.get("writes", ())),
@@ -409,6 +415,38 @@ def create_origin_key(pending_id: str, idx: int) -> str:
 
 def intention_resource_key(origin_key: str) -> str:
     return INTENTION_KEY_PREFIX + origin_key
+
+
+# --- readers of history ----------------------------------------------------------------------------
+# A signed record, an effects row and a label row are append-only: what the release that said "spore" wrote keeps its
+# spelling, and the journal holds ops across the update. These readers are the one place a recorded old spelling becomes
+# the new one, on READ. None accepts an old spelling as a NEW request (the builders, ``_origin_key_of`` and the verb
+# registry are new-only), and none writes: every new row carries the new spelling.
+
+def read_recorded_store(store: str) -> str:
+    """A recorded effect store name, as the broker now registers it."""
+    return INTENTIONS if store == OLD_EFFECT_STORE else store
+
+
+def read_recorded_key(resource_key: str) -> str:
+    """A recorded resource key, with the intention prefix in place of the old one; any other key is returned as it is."""
+    if resource_key.startswith(OLD_ROW_PREFIX):
+        return INTENTION_KEY_PREFIX + resource_key[len(OLD_ROW_PREFIX):]
+    return resource_key
+
+
+def read_recorded_verb(verb: Any) -> Any:
+    """A recorded verb id (a signed record's, a pending's), under its new name; anything else is returned as it is."""
+    return OLD_KIND_TO_NEW.get(verb, verb) if isinstance(verb, str) else verb
+
+
+def read_recorded_target(target: Mapping[str, Any]) -> dict[str, Any]:
+    """A recorded target with its ``row_id`` in the new prefix, as a copy: the signed record is never edited."""
+    out = dict(target)
+    row_id = out.get("row_id")
+    if isinstance(row_id, str):
+        out["row_id"] = read_recorded_key(row_id)
+    return out
 
 
 def _origin_key_of(resource_key: str) -> str:

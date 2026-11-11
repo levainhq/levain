@@ -51,6 +51,13 @@ from levain.cockpit.consent import (
 from levain.cockpit.shortcode import (SHORT_ALPHABET, SHORT_LENGTH, SHORT_MAX_FAILURES, SHORT_PAIRING_TTL,
                                        display_short, normalize_short)
 from levain.autonomic.durable_sqlite import MIN_SQLITE, open_durable, read_transaction, write_transaction
+# the journal is history across the rename: a row the release that said "spore" wrote is read in the new words
+from levain.cockpit.effects import (
+    read_recorded_key,
+    read_recorded_store,
+    read_recorded_target,
+    read_recorded_verb,
+)
 
 _OPERATION_ID = re.compile(r"cp[0-9a-f]{32}")
 
@@ -579,7 +586,8 @@ def _effect_rows(op: str, record: dict[str, Any], rows: list[sqlite3.Row],
             raise _corrupt(op, f"effects row {idx} pre_image does not parse") from exc
         if r["status"] == "PLANNED" and r["applied_at"] is not None:
             raise _corrupt(op, f"effects row {idx} is planned with an applied_at")
-        out.append(EffectRow(idx=idx, store=r["store"], resource_key=r["resource_key"],
+        out.append(EffectRow(idx=idx, store=read_recorded_store(r["store"]),
+                             resource_key=read_recorded_key(r["resource_key"]),
                              pre_image=pre, native_id=r["native_id"], status=r["status"],
                              reason=r["reason"], applied_at=r["applied_at"], attempts=attempts,
                              next_attempt_at=r["next_attempt_at"], last_fault=r["last_fault"]))
@@ -970,7 +978,7 @@ class CockpitDB:
                             "INSERT INTO labels (resource_key, field, operation_id, value_sha256, "
                             "decision_kind, signer_fp, credential, fired_at, epoch) "
                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (plan[r.idx]["resource_key"], field, operation_id, digest,
+                            (read_recorded_key(plan[r.idx]["resource_key"]), field, operation_id, digest,
                              view.decision_kind, view.signer_fp, view.credential,
                              view.decided_at, epoch))
                 conn.execute("COMMIT")
@@ -1514,9 +1522,9 @@ class CockpitDB:
                 rec_eff = view.record["effects"][idx]
                 proj = rec_eff.get("projection")
                 kept.append(EditRow(
-                    operation_id=op, idx=idx, state=view.state, verb=view.record.get("verb"),
+                    operation_id=op, idx=idx, state=view.state, verb=read_recorded_verb(view.record.get("verb")),
                     resource_key=eff.resource_key, store=eff.store, changes=changes,
-                    target=target if isinstance(target, dict) else {},
+                    target=read_recorded_target(target) if isinstance(target, dict) else {},
                     decision_kind=view.decision_kind, credential=view.credential,
                     applied_at=eff.applied_at, projection=proj if isinstance(proj, dict) else None,
                     label_fields=tuple(str(f) for f in (*rec_eff.get("writes", ()), *rec_eff.get("binds", ())))))
@@ -1554,8 +1562,9 @@ class CockpitDB:
                         expires = parse_stamp(record["expires_at"])
                         if expires > cutoff:
                             pendings.append((expires, row["rowid"], PendingRow(
-                                pending_id=op, verb=record.get("verb"),
-                                target=record["target"] if isinstance(record.get("target"), dict) else {},
+                                pending_id=op, verb=read_recorded_verb(record.get("verb")),
+                                target=(read_recorded_target(record["target"])
+                                        if isinstance(record.get("target"), dict) else {}),
                                 principal=row["principal"], tier=record["tier"],
                                 issued_at=record["issued_at"], expires_at=record["expires_at"])))
                             continue
@@ -1576,7 +1585,7 @@ class CockpitDB:
                     outcome = "deleted"
                 outcomes.append((at, row["rowid"], OutcomeRow(
                     operation_id=op, state=state, outcome=outcome, terminal_at=terminal_at,
-                    verb=record.get("verb"), reason=reason,
+                    verb=read_recorded_verb(record.get("verb")), reason=reason,
                     unapplied=tuple(e.resource_key for e in effects if e.status == "UNAPPLIED"),
                     cancelled_by=row["cancelled_by"], record_sha256=row["record_sha256"])))
         pendings.sort(key=lambda t: (t[0], t[1]))
