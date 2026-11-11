@@ -134,10 +134,13 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     help="Allow this enable to turn an existing live install into a shadow, or a shadow into a live "
                          "one (refused without it: both answer to the same signed link).")
     en.add_argument("--time", default=None, metavar="HH:MM",
-                    help="The time the dream starts, local to the install's zone (default 00:00). It must lie inside the "
+                    help="The time the dream starts, local to the install's zone. Omitted, the registered dream keeps "
+                         "its time (00:00 when none is registered); only --time changes it. It must lie inside the "
                          "22:00-05:00 window, with a minute from 00 to 19 (the dream is then tried again every 20 "
                          "minutes until 05:00). The time is part of the signed spec: a changed time is a new spec "
-                         "(--revise) and needs a new signed link, and an enable that omits --time asks for 00:00.")
+                         "(--revise) and needs a new signed link. A time cannot go back to one an earlier version "
+                         "was registered with (an agent version is written once): pick a nearby minute, or retire "
+                         "the agent.")
     en.add_argument("--revise", action="store_true", help="Write a new version when the stored spec differs.")
     en.add_argument("--json", action="store_true")
     en.set_defaults(func=run_dream_enable)
@@ -159,16 +162,24 @@ def run_dream_enable(args: argparse.Namespace) -> int:
     from levain.dream import agent as da
     from levain.dream import executor as ex
 
-    try:
-        when = da.validate_time(da.DEFAULT_TIME if args.time is None else args.time)
-    except da.TimeRefused as exc:
-        print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
-        return 1
+    from levain.agents.spec import SpecError
+
+    if args.time is not None:
+        try:
+            da.validate_time(args.time)
+        except da.TimeRefused as exc:
+            print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
+            return 1
     try:
         store = open_agent_store(args.agent_store_dir)
         zone = get_default_zone(store)
-    except AgentStoreRefused as exc:
+        # only an explicit --time changes the time: without one, the stored dream's time is kept (00:00 when none)
+        when = da.validate_time(args.time) if args.time is not None else (da.stored_time(store) or da.DEFAULT_TIME)
+    except (AgentStoreRefused, SpecError) as exc:
         print(f"levain dream enable: {exc}", file=sys.stderr)
+        return 1
+    except da.TimeRefused as exc:
+        print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
         return 1
     # Every refusal of the install is judged before the dream is registered and before the instructions copy or the
     # facts file is written (the scratch directory is never created here: the first seed makes it).
