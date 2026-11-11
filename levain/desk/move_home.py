@@ -377,7 +377,10 @@ def _store_dirs(base: Path, store_dir: Path | str | None) -> list[Path]:
         return [Path(store_dir)]
     from levain.desk.work_attach import board_store_dir, live_consent_dir
 
-    env = dict(os.environ, LEVAIN_HOME=str(base))
+    # only what the resolvers read: LEVAIN_HOME, and HOME for a ``~`` in it (never a copy of the process environment)
+    env = {"LEVAIN_HOME": str(base)}
+    if "HOME" in os.environ:
+        env["HOME"] = os.environ["HOME"]
     out: list[Path] = []
     for d in (live_consent_dir(env), board_store_dir(env)):
         if all(os.path.realpath(d) != os.path.realpath(o) for o in out):

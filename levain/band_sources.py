@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.desk.review import NO_REC, require_aware_now
-from levain.desk.legacy import ROLE_DESK
+from levain.desk.legacy import ROLE_DESK, role_word
 
 __all__ = ["Extra", "Extras", "NO_REC", "NotOffered", "TOKEN", "UnsafeValue", "consent_rule_command", "read_extras",
            "rec_letter_of", "sheet_text", "sign_request_menu", "SOURCES"]
@@ -309,7 +309,7 @@ def _unreadable_sign(rec: Mapping[str, Any], at: Mapping[str, str], why: str) ->
 
     ref = str(rec.get("reply_id") or "?")
     extend = rec.get("ref_store") == budget.SIGN_REF
-    return Extra("extend" if extend else "sign", ref, at.get(ref) or "", ROLE_DESK,
+    return Extra("extend" if extend else "sign", ref, at.get(ref) or "", role_word(ROLE_DESK),
                  f"UNREADABLE: SIGN {_line(ref, 80)} could not be read", (), NO_REC, None, "unknown",
                  f"desk record {_line(ref, 80)}", why, {}, None if extend else _sign_key(rec))
 
@@ -348,7 +348,7 @@ def _one_record(rec: dict[str, Any], unresolved: bool, threads: dict[str, str], 
         origin = f"budget SIGN {_line(rec['ref_id'], 120)}"
     else:
         options = ("sign (allow)", "deny")
-        source, tag = "sign", ROLE_DESK
+        source, tag = "sign", role_word(ROLE_DESK)     # the card's display tag, never compared
         key = _sign_key(rec)
         if rec["ref_id"] in pointed:
             return                                # one item per request: a second SIGN on it adds no second item

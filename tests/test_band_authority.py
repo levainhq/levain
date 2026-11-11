@@ -784,6 +784,14 @@ def test_a_sign_filed_on_a_shown_undecided_request_keeps_its_number_and_never_re
     assert "UNDECIDED: Bash" not in after.text and "NEEDS YOU · 1 open" in after.text
 
 
+def test_an_unreadable_sign_is_tagged_with_the_desk_word_not_the_stored_role():
+    """The card's tag is display text: it reads "desk", never the stored role value (the rename, lane R)."""
+    from levain import band_sources
+
+    item = band_sources._unreadable_sign({"reply_id": "r-1"}, {}, "garbled")
+    assert item.tag == "desk"
+
+
 def test_a_pending_request_shown_by_its_sign_keeps_its_number_when_it_goes_undecided(night, cq, qdir, qs):
     req = file_req(cq, night)
     review.push_sign(night.store, night.T, req.id, "land it", rec="a")
