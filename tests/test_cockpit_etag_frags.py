@@ -131,19 +131,28 @@ def test_the_etag_is_byte_identical_to_the_old_formula_over_the_whole_matrix(ck,
         assert ck._etag_of(snap, kw.pop("groups"), kw.pop("cred"), TODAY, **kw, auth=auth) == want
 
 
-def test_a_second_etag_over_one_snapshot_does_not_serialise_its_rows_again(ck, monkeypatch) -> None:
+@pytest.mark.parametrize("snap_name", ["rows_with_filtered_and_skipped", "value_panel"])
+def test_a_second_etag_over_one_snapshot_does_not_serialise_its_parts_again(ck, monkeypatch, snap_name) -> None:
     from levain.cockpit import engine
-    snap = _snaps()["rows"]
+    snap = _snaps()[snap_name]
     auth = ck.authority()
     ck._etag_of(snap, None, "token", TODAY, auth=auth)
     kept = snap._etag_frags
     assert kept is not None and set(kept) == {"rows", "value", "filtered", "skipped"}
+    with pytest.raises(TypeError):
+        kept["rows"] = "x"                                  # a read-only view: nothing can rewrite the kept text
     seen: list[Any] = []
-    real = engine._canon_text
+    stripped: list[Any] = []
+    real, real_strip = engine._canon_text, engine._etag_rows
     monkeypatch.setattr(engine, "_canon_text", lambda o: (seen.append(o), real(o))[1])
+    monkeypatch.setattr(engine, "_etag_rows", lambda r: (stripped.append(r), real_strip(r))[1])
     ck._etag_of(snap, None, "token", TODAY, auth=auth)
     assert snap._etag_frags is kept
-    assert not any(isinstance(o, list) and o and isinstance(o[0], dict) and "version" in o[0] for o in seen)
+    assert seen, "the light parts are serialised on every call"
+    # by call count: the serialiser was handed none of the four heavy parts (by identity), and the clock strip never ran
+    heavy = [h for h in (snap.rows, snap.value, snap.filtered, snap.skipped) if h is not None]   # None is also a light part
+    assert heavy and sum(1 for o in seen for h in heavy if o is h) == 0
+    assert stripped == []
 
 
 def test_the_light_parts_still_move_the_etag_over_one_snapshot(ck) -> None:
@@ -180,3 +189,54 @@ def test_a_stale_copy_of_a_cached_snapshot_carries_the_kept_text_and_the_same_et
     assert late._etag_frags is fresh._etag_frags and fresh._etag_frags is not None
     want = _old_etag_of(c, late, None, "token", TODAY, auth=auth)
     assert c._etag_of(late, None, "token", TODAY, auth=auth) == want
+
+
+# --- the snapshot owns its heavy data ---------------------------------------------------------------------------------
+def _row_panel(retained: list[str]) -> ProviderSpec:
+    """A refresher panel whose provider RETAINS the nested container it puts in a row facet (``tags``)."""
+    return ProviderSpec("p", "triage-list", "P", "gate",
+                        lambda ctx: Read(rows=(RowIn(id="np:1", title="t", facets={"tags": retained}),)),
+                        refresh_every_s=20.0, stale_after_s=30.0, order="decision.dated", version_fields=("what",),
+                        facets=frozenset({"tags"}))
+
+
+def _board_panel(value: dict[str, Any]) -> ProviderSpec:
+    """A refresher panel whose provider RETAINS the value it returns (nested columns and cards)."""
+    return ProviderSpec("b", "board", "B", "feed", lambda ctx: Read(value=value), refresh_every_s=20.0,
+                        stale_after_s=30.0)
+
+
+def _board(title: str) -> dict[str, Any]:
+    return {"queue": "ok", "columns": [{"category": "ready", "cards": [{"id": "c1", "title": title}]}]}
+
+
+def _shown(body: dict[str, Any], kind: str) -> Any:
+    return body["rows"][0]["facets"]["tags"] if kind == "rows" else body["value"]["columns"][0]["cards"][0]["title"]
+
+
+@pytest.mark.parametrize("kind", ["rows", "value"])
+def test_a_provider_that_keeps_and_changes_what_it_returned_cannot_split_the_body_from_the_etag(kind) -> None:
+    """A refresher panel's snapshot is shared by every read until the next refresh, and its etag text is kept; so the
+    snapshot owns its data. A provider that retained a nested container and changed it afterwards changes neither the
+    body nor the etag until it is read again (a refresh); and after that refresh both move together."""
+    tags, board = ["before"], _board("before")
+    spec = _row_panel(tags) if kind == "rows" else _board_panel(board)
+    pid = spec.id
+    c = Cockpit(clock=lambda: NOW)
+    c.register(spec)
+    c.refresh(pid)
+    first = c.panel(pid)
+    assert _shown(first, kind) in (["before"], "before")
+    # the provider changes what it handed over, in place, without being read again
+    if kind == "rows":
+        tags[0] = "after"
+    else:
+        board["columns"][0]["cards"][0]["title"] = "after"
+    second = c.panel(pid)
+    assert _shown(second, kind) in (["before"], "before"), "the body followed the provider's retained container"
+    assert second["etag"] == first["etag"]
+    # a refresh is the only thing that publishes the change, and then body and etag move together
+    c.refresh(pid)
+    third = c.panel(pid)
+    assert _shown(third, kind) in (["after"], "after")
+    assert third["etag"] != first["etag"]

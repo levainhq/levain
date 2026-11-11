@@ -44,8 +44,8 @@ from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from types import SimpleNamespace
-from typing import Any, Callable
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Callable, Mapping
 
 from levain.cockpit.registry import (
     FACETS,
@@ -160,7 +160,7 @@ def _sha(obj: Any) -> str:
     return hashlib.sha256(_canon(obj)).hexdigest()
 
 
-def _sha_with_frags(light: dict[str, Any], frags: dict[str, str]) -> str:
+def _sha_with_frags(light: dict[str, Any], frags: Mapping[str, str]) -> str:
     """``_sha`` of the dict ``{**light, <each frags key>: <the value frags[key] was serialised from>}``, byte for byte:
     ``frags`` holds the canonical text of the heavy values already (``_canon_text``), so only ``light`` is serialised
     here. The canonical form is one object with its keys sorted and the same separators, so joining each key's
@@ -393,15 +393,18 @@ class _Snap:
     # the canonical text of the four heavy parts the panel etag covers (rows with the clock facets taken out, value,
     # filtered, skipped), built on the first etag and kept: a snapshot is built once by ``_read_snap`` and never
     # written after (every later stage copies a row, none mutates it), so a read over an unchanged snapshot does not
-    # serialise its rows again. Not an init field: a copy made with ``dataclasses.replace`` carries it by hand.
-    _etag_frags: dict[str, str] | None = field(default=None, init=False, repr=False, compare=False)
+    # serialise its rows again. A snapshot shared across reads owns that data (``Cockpit._own``), so the kept text can
+    # never describe something other than what a read serves. Not an init field: a copy made with
+    # ``dataclasses.replace`` carries it by hand.
+    _etag_frags: Mapping[str, str] | None = field(default=None, init=False, repr=False, compare=False)
 
-    def etag_frags(self) -> dict[str, str]:
+    def etag_frags(self) -> Mapping[str, str]:
+        """The kept canonical text of the four heavy parts, as a read-only view (the same view on every call)."""
         frags = self._etag_frags
         if frags is None:
-            frags = self._etag_frags = {
+            frags = self._etag_frags = MappingProxyType({
                 "rows": _canon_text(_etag_rows(self.rows)), "value": _canon_text(self.value),
-                "filtered": _canon_text(self.filtered), "skipped": _canon_text(self.skipped)}
+                "filtered": _canon_text(self.filtered), "skipped": _canon_text(self.skipped)})
         return frags
 
 
@@ -1401,8 +1404,14 @@ class Cockpit:
         bookkeeping and publication of ``snap``, ``last_completion`` and ``fresh``."""
         def produce() -> Any:
             if spec is self._dec.spec:
-                return self._compose_decisions(ctx)
-            return self._normalize(spec, ctx, spec.read(ctx))
+                out = self._compose_decisions(ctx)
+            else:
+                out = self._normalize(spec, ctx, spec.read(ctx))
+            # a refresher's snapshot is the one every read until the next refresh serves, and its etag text is kept: it
+            # owns its data, copied here once per refresh on the refresher's own thread. An on-demand panel's snapshot is
+            # request-local (``_snap_for`` reads it from this call and never from ``st.snap`` for such a panel; the
+            # concurrent callers of one flight share it only inside that flight), so it needs no copy.
+            return self._own(spec, out) if spec.refresh_every_s is not None else out
 
         def commit(raw: Any) -> _Snap:
             snap = self._book(spec, st, raw, ctx)
@@ -1459,6 +1468,22 @@ class Cockpit:
         return snap
 
     # --- result -> snapshot ----------------------------------------------------------
+    @staticmethod
+    def _own(spec: ProviderSpec, out: Any) -> Any:
+        """A snapshot that will be shared across reads (a refresher's, a replay's) owns its rows, value, filtered and
+        skipped: ``_value`` and ``_row`` hand back the provider's own nested containers (a row's facet lists, a value's
+        columns), so a provider that kept one and changed it later would change what a read serves while the snapshot's
+        kept etag text still described the old one. Deep-copied once, here, in the read worker (provider data is never
+        touched on the owner); the body served and the etag are then the same data. A copy that cannot be made is the
+        read's Fault, like any other malformed provider output."""
+        if not isinstance(out, _Snap):
+            return out
+        try:
+            out.rows, out.value, out.filtered, out.skipped = copy.deepcopy((out.rows, out.value, out.filtered, out.skipped))
+        except Exception as exc:  # noqa: BLE001 - provider data of ANY shape is a Fault, never a crash
+            return Fault(f"provider output refused: could not be copied: {_safe_str(exc)}")
+        return out
+
     def _normalize(self, spec: ProviderSpec, ctx: ReadContext, res: Any) -> Any:
         """Provider output -> a snapshot, or the Fault/Absent it already is. Runs in the read worker:
         everything that touches provider-controlled data (rows, values) happens here, under the
@@ -2437,7 +2462,8 @@ class Cockpit:
                 if hit is not None and hit[1] is spec and time.monotonic() - hit[0] < REPLAY_CACHE_S:
                     return hit[2]
             def once(c: ReadContext) -> Any:
-                return self._normalize(spec, c, spec.read_at(c, iso))     # type: ignore[misc]
+                # kept REPLAY_CACHE_S and served to every re-read of that minute: it owns its data, like a refresher's
+                return self._own(spec, self._normalize(spec, c, spec.read_at(c, iso)))     # type: ignore[misc]
             raw = self._bounded_fresh(("replay", spec.id), spec.timeout_s, once, ctx, pool="replay", allow_snap=True)
         if isinstance(raw, _Snap):
             if raw.status != "error":
