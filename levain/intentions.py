@@ -3,9 +3,10 @@
 An intention's ``disposition`` routes it across THREE operator-facing classes:
   - ``loop`` (the default, absent/``loop``) — the entity's OWN prospective loop; belongs in
     its cognition (recall / salience / digest / Top of Mind).
-  - the **Tray** inbox (``seed`` / ``handoff`` / ``agenda``) — operator session-I/O that
-    should NOT pollute cognition; a ``seed`` metabolizes into a ``loop`` (or resolves). It
-    FORMS, then resolves.
+  - the **Tray** inbox (``someday`` / ``handoff`` / ``agenda``) — operator session-I/O that
+    should NOT pollute cognition; a ``someday`` metabolizes into a ``loop`` (or resolves). It
+    FORMS, then resolves. ``seed`` is the retired spelling of ``someday``: resolved records
+    keep it for good, so it still reads, and no write sets it.
   - legacy **note** reference (``note``) — durable operator reference; persists until removed,
     resolve-EXEMPT (never germinates, never ascends; removed via descend). There is no Keep
     panel any more: a note still in a store renders in the Tray, and a pinned-dormant loop
@@ -53,6 +54,7 @@ __all__ = [
     "TRAY_WRITE_DISPOSITIONS",
     "RETIRED_HANDOFF_MSG",
     "RETIRED_KEEP_NOTE_MSG",
+    "RETIRED_SEED_MSG",
     "RetiredDisposition",
     "retired_message",
     "refuse_retired_disposition",
@@ -83,11 +85,12 @@ __all__ = [
 
 LOOP_DISPOSITION = "loop"
 TRAY_DISPOSITIONS = ("someday", "seed", "handoff", "agenda")   # operator INBOX — the READ set (a legacy handoff still reads)
-TRAY_WRITE_DISPOSITIONS = ("someday", "seed", "agenda")        # the Tray values a NEW write may take
-# RETIRED (TS-1): legacy rows still carry these. They stay in the READ sets (a legacy handoff
-# or Keep note still renders, descends, and re-dispositions to seed/agenda) but are OUT of the
-# WRITE set (WRITE_DISPOSITIONS): a new handoff or Keep note is refused at the write seam.
-RETIRED_DISPOSITIONS = ("handoff", "note")
+TRAY_WRITE_DISPOSITIONS = ("someday", "agenda")                # the Tray values a NEW write may take
+# RETIRED: legacy rows still carry these. They stay in the READ sets (a legacy handoff, Keep note
+# or seed still renders, closes, and re-dispositions to someday/agenda) but are OUT of the WRITE
+# set (WRITE_DISPOSITIONS): a new handoff, Keep note or seed is refused at the write seam. A
+# resolved record keeps ``seed`` for good (anneal's update cannot edit a resolved record).
+RETIRED_DISPOSITIONS = ("handoff", "note", "seed")
 KEEP_DISPOSITIONS = ("note",)                        # legacy operator REFERENCE — read-only vocabulary
 # Everything the operator authored as I/O — all excluded from the entity's OWN cognition.
 # The retired names STAY: ``is_loop`` fails OPEN on an unknown value, so dropping them would
@@ -101,16 +104,17 @@ WRITE_DISPOSITIONS = (LOOP_DISPOSITION,) + TRAY_WRITE_DISPOSITIONS
 
 RETIRED_HANDOFF_MSG = (
     "handoff is retired: ask the operator now with `levain ask`, "
-    "or record a seed, or an agenda with a date, in the Tray"
+    "or record a someday, or an agenda with a date, in the Tray"
 )
 RETIRED_KEEP_NOTE_MSG = (
     "the Keep is retired: a fact or command goes to memory (Durable Facts), "
-    "an intention is a seed"
+    "an intention is a someday"
 )
+RETIRED_SEED_MSG = "seed is now called someday: write the disposition `someday`"
 
 
 class RetiredDisposition(ValueError):
-    """A write tried to SET a disposition outside the write set: a retired handoff / Keep note (any
+    """A write tried to SET a disposition outside the write set: a retired handoff / Keep note / seed (any
     spelling anneal would persist as one), or a value nothing reads."""
 
 
@@ -132,11 +136,13 @@ def retired_message(value: Any) -> str | None:
         return RETIRED_HANDOFF_MSG
     if key == "note":
         return RETIRED_KEEP_NOTE_MSG
+    if key == "seed":
+        return RETIRED_SEED_MSG
     return None
 
 
 def refuse_retired_disposition(value: Any, current: Any = None) -> None:
-    """TS-1, the write seams' early refusal (a clean 422 before the store is touched). A retired value
+    """The write seams' early refusal (a clean 422 before the store is touched). A retired value
     is refused unless ``current`` already holds its persisted form: an echo, which the seam must then
     DROP from its write (the store guard, :func:`guarded_intention_store`, refuses every retired value it is
     handed). An undo that RESTORES a retired value is a change, so it is refused."""
@@ -232,8 +238,8 @@ def disposition_of(item: Mapping[str, Any]) -> str:
 def is_loop(item: Mapping[str, Any]) -> bool:
     """True iff the intention flows into the entity's OWN cognition (salience / Top of Mind /
     digest / constellation agent seeds). The operator-I/O dispositions — the Tray inbox
-    (seed/handoff/agenda) AND Keep reference (note) — are the complement, kept OUT of
-    cognition.
+    (someday/handoff/agenda, and the retired spelling seed) AND Keep reference (note) — are the
+    complement, kept OUT of cognition.
 
     Fail-OPEN on the unknown: only an EXPLICITLY known operator-I/O disposition is
     excluded; a falsy/absent value (every pre-Slice-3 intention) OR an unrecognized string
@@ -247,7 +253,7 @@ def is_loop(item: Mapping[str, Any]) -> bool:
 
 
 def is_tray(item: Mapping[str, Any]) -> bool:
-    """The operator session-I/O INBOX set (seed/agenda, plus a legacy handoff row) — EXPLICIT membership,
+    """The operator session-I/O INBOX set (someday/agenda, plus a legacy handoff or seed row) — EXPLICIT membership,
     NOT ``not is_loop``: a ``note`` is also non-cognition but it is Keep reference, not
     the Tray, so the three classes (loop / tray / keep) are distinct."""
     return disposition_of(item) in TRAY_DISPOSITIONS
@@ -263,7 +269,7 @@ def bucket_of(item: Mapping[str, Any]) -> str:
     """Classify an intention into its operator-facing render bucket — a TOTAL partition (every
     intention lands in exactly one):
 
-    - ``BUCKET_TRAY`` — a Tray inbox disposition (seed/handoff/agenda), ANY tier, or a legacy
+    - ``BUCKET_TRAY`` — a Tray inbox disposition (someday/seed/handoff/agenda), ANY tier, or a legacy
       ``note`` row (the Keep is gone; a note still in a store is shown, badged ``note``, never
       dropped). Disposition wins over tier.
     - ``BUCKET_LOOP`` — a loop on any tier, a ``parked`` one included (pinned-dormant, exempt

@@ -35,14 +35,14 @@ from levain.intentions import (
 
 def test_frozen_disposition_literals():
     assert LOOP_DISPOSITION == "loop"
-    assert TRAY_DISPOSITIONS == ("seed", "handoff", "agenda")      # the READ set
-    assert TRAY_WRITE_DISPOSITIONS == ("seed", "agenda")
-    assert RETIRED_DISPOSITIONS == ("handoff", "note")
+    assert TRAY_DISPOSITIONS == ("someday", "seed", "handoff", "agenda")      # the READ set
+    assert TRAY_WRITE_DISPOSITIONS == ("someday", "agenda")
+    assert RETIRED_DISPOSITIONS == ("handoff", "note", "seed")
     assert KEEP_DISPOSITIONS == ("note",)
     # the READ set keeps the retired names (is_loop fails open on an unknown value); the WRITE set loses them
-    assert NON_COGNITION_DISPOSITIONS == ("seed", "handoff", "agenda", "note")
-    assert VALID_DISPOSITIONS == ("loop", "seed", "handoff", "agenda", "note")   # every value a row may hold
-    assert WRITE_DISPOSITIONS == ("loop", "seed", "agenda")
+    assert NON_COGNITION_DISPOSITIONS == ("someday", "seed", "handoff", "agenda", "note")
+    assert VALID_DISPOSITIONS == ("loop", "someday", "seed", "handoff", "agenda", "note")   # every value a row may hold
+    assert WRITE_DISPOSITIONS == ("loop", "someday", "agenda")
 
 
 def test_parked_tier_is_a_real_anneal_tier():
