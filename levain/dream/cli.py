@@ -11,6 +11,7 @@ import json
 import math
 import os
 import shlex
+import sqlite3
 import sys
 import time
 import uuid
@@ -79,7 +80,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "--manual, the one a run-now at --now would consolidate).")
     rd.add_argument("--now", default=None, help="An aware ISO time standing in for the clock (default: now).")
     rd.add_argument("--zone", default=None, help="An IANA zone (default: the TZ variable, else the host's zone file).")
-    rd.add_argument("--manual", action="store_true", help="Evaluate as a manual run (waives checks 5 and 6).")
+    rd.add_argument("--manual", action="store_true", help="Evaluate as a manual run (waives check 6; check 5 always runs and passes).")
     rd.add_argument("--json", action="store_true")
     rd.set_defaults(func=run_dream_ready)
     dr = sub.add_parser("drill", allow_abbrev=False, help="Prove the latest snapshot restores, on a scratch copy.",
@@ -138,9 +139,10 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                          "its time (00:00 when none is registered); only --time changes it. It must lie inside the "
                          "22:00-05:00 window, with a minute from 00 to 19 (the dream is then tried again every 20 "
                          "minutes until 05:00). The time is part of the signed spec: a changed time is a new spec "
-                         "(--revise) and needs a new signed link. A time cannot go back to one an earlier version "
-                         "was registered with (an agent version is written once): pick a nearby minute, or retire "
-                         "the agent.")
+                         "(--revise) and needs a new signed link. A complete spec identical to an earlier version "
+                         "cannot be restored (an agent version is written once), so going back to the same time "
+                         "under the same binding is refused: pick a nearby minute, or retire the agent. The same "
+                         "time under a different binding is a different spec and is allowed.")
     en.add_argument("--revise", action="store_true", help="Write a new version when the stored spec differs.")
     en.add_argument("--json", action="store_true")
     en.set_defaults(func=run_dream_enable)
@@ -175,7 +177,7 @@ def run_dream_enable(args: argparse.Namespace) -> int:
         zone = get_default_zone(store)
         # only an explicit --time changes the time: without one, the stored dream's time is kept (00:00 when none)
         when = da.validate_time(args.time) if args.time is not None else (da.stored_time(store) or da.DEFAULT_TIME)
-    except (AgentStoreRefused, SpecError) as exc:
+    except (AgentStoreRefused, SpecError, sqlite3.Error, OSError) as exc:
         print(f"levain dream enable: {exc}", file=sys.stderr)
         return 1
     except da.TimeRefused as exc:

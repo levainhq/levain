@@ -1055,6 +1055,43 @@ def test_an_enable_without_time_over_a_cron_this_build_cannot_read_refuses_namin
     assert spec_mod.list_agents(agent_store.open_agent_store(store_dir)) == []
 
 
+def test_a_bare_enable_over_a_dream_registered_with_the_old_cron_is_refused_and_names_revise(tmp_path, capsys, monkeypatch):
+    """The old cron reads back as 22:00, whose spec is written in the new form: a different spec, so a bare enable is
+    refused (rule 4) and the refusal names --revise; --revise then writes the next version."""
+    store_dir = tmp_path / "ag"
+    store = agent_store.open_agent_store(store_dir)
+    agent_store.set_default_zone(store, ZONE)
+    monkeypatch.setattr(da, "cron_for", lambda time=da.DEFAULT_TIME: da.LEGACY_CRON)
+    assert da.register_dream(store).version == 1
+    monkeypatch.undo()
+    assert spec_mod.stored_specs(store)["dream"]["trigger"]["cron"] == da.LEGACY_CRON
+    code, out, err, _ = _enable(tmp_path, capsys)
+    assert code == 1 and out == "" and "--revise" in err and "rule 4" in err, err
+    code, out, err, _ = _enable(tmp_path, capsys, "--revise")
+    assert code == 0 and json.loads(out)["version"] == 2 and json.loads(out)["time"] == "22:00", err
+
+
+def test_a_stored_spec_with_no_cron_is_named_as_having_no_schedule_trigger_not_as_the_cron_none():
+    with pytest.raises(da.TimeRefused) as exc:
+        da.time_from_cron(None)
+    msg = str(exc.value)
+    assert "no schedule trigger" in msg and "--time HH:MM" in msg and "'None'" not in msg
+
+
+@pytest.mark.parametrize("failure", [sqlite3.DatabaseError("file is not a database"), sqlite3.OperationalError(
+    "database is locked"), PermissionError("denied")])
+def test_an_enable_without_time_over_a_store_that_cannot_be_read_prints_the_usual_message_and_exits_1(
+        tmp_path, capsys, monkeypatch, failure):
+    def broken(store):
+        raise failure
+
+    monkeypatch.setattr(spec_mod, "stored_specs", broken)
+    code, out, err, store_dir = _enable(tmp_path, capsys)
+    assert code == 1 and out == "" and err.startswith("levain dream enable: ") and str(failure) in err, err
+    monkeypatch.undo()
+    assert spec_mod.list_agents(agent_store.open_agent_store(store_dir)) == []
+
+
 def test_a_changed_time_is_a_re_sign_the_old_signed_link_no_longer_covers_the_new_spec(tmp_path):
     """The link signs ``spec_hash``; the launch takes only a link whose ``spec_hash`` is the occurrence's. A real signed
     link over the 00:00 spec admits a 00:00 occurrence and ends a 03:15 occurrence ``no_link``; a link signed for 03:15
