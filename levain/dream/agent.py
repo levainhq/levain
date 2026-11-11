@@ -98,6 +98,36 @@ def cron_for(time: str = DEFAULT_TIME) -> str:
 
 #: the cron of the default time (kept as a name: a caller that does not set a time reads it)
 CRON = cron_for(DEFAULT_TIME)
+#: the one cron a dream was registered with before the time was a setting; its first slot is 22:00
+LEGACY_CRON = "*/20 22-23,0-4 * * *"
+
+
+def time_from_cron(cron: object) -> str:
+    """The time setting a stored spec's cron was written for: the inverse of :func:`cron_for`, so an enable that does not
+    name a time keeps the one the operator chose. :data:`LEGACY_CRON` reads as 22:00. Any other cron is refused
+    (:class:`TimeRefused`) rather than guessed at: the operator names the time with ``--time``."""
+    if cron == LEGACY_CRON:
+        return "22:00"
+    try:
+        minutes, hours = str(cron).split(" ")[:2]
+        t = f"{int(hours.split(',')[0].split('-')[0]):02d}:{int(minutes.split(',')[0]):02d}"
+        if isinstance(cron, str) and cron_for(t) == cron:
+            return t
+    except (ValueError, TimeRefused):
+        pass
+    raise TimeRefused(f"the stored dream's cron {str(cron)[:60]!r} is not one this build writes, so its time cannot be "
+                      "kept: pass --time HH:MM to name it")
+
+
+def stored_time(store: Any) -> str | None:
+    """The time setting of the dream spec registered in ``store`` (None when there is none); :func:`time_from_cron`'s
+    refusal when its cron cannot be read back."""
+    from levain.agents import spec as _spec
+
+    held = _spec.stored_specs(store).get(NAME)
+    if held is None:
+        return None
+    return time_from_cron((held.get("trigger") or {}).get("cron"))
 STOP_AT_S = 3600
 PAUSE_AFTER = 2
 WIN_CHECK = "dream.win"

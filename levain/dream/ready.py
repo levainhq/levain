@@ -34,13 +34,15 @@ The six checks, each mapped from flow's ``dream.py`` ``gate``:
   so it is outside that set, survives the save, and is listed by ``Store.episodes_since_wrap()`` as the next wrap's
   input (a delay, never a loss). This module reads episodes that way and only that way: check 4 counts
   ``episodes_since_wrap()``, and nothing here compares an episode timestamp with a clock.
-* *The store turns ON ``consolidate_requires_baton``.* ``levain init`` creates a Levain install's store with the
-  policy (anneal 1.0, KL-19) and claims the baton for :data:`SESSION_ID` (``levain.install._ensure_baton``, repeated by
-  ``levain update``); the dream consolidates as that session (``executor.consolidate_store`` passes the session id
-  exactly when the store reports the policy). So with seats live a seat can capture but cannot consolidate: anneal's
-  ``prepare_wrap`` downgrades any session that is not the baton's holder to capture-only, and check 2 refuses a dream
-  while the baton is anyone else's. Without the policy only ``wrap.lock`` would stop a second handle's tokenless save,
-  which is why check 2 states it rather than assuming it.
+* *The dream's open wrap keeps a seat's own consolidate out, not the baton.* A Levain seat's anneal server runs under
+  this install's session id (:data:`SESSION_ID`), the id the baton is held for, so the baton admits it. What stops it
+  while the dream's wrap is open is that wrap: anneal refuses a second ``prepare_wrap`` (``WrapInProgressError``), and
+  ``levain wrap`` is also stopped by ``wrap.lock``. Before the dream's ``prepare_wrap`` and after its save a seat may
+  consolidate as it always could; checks 2 and 3 see that wrap.
+* *The ``consolidate_requires_baton`` policy guards against other session ids only.* On a store with the policy,
+  anneal downgrades a ``prepare_wrap`` under any other id, or none, to capture-only, and check 2 refuses a dream
+  while the baton is anyone else's. A store created by ``levain init`` has the policy; a store without it is named in
+  check 5's detail when seats are live, never refused on (for a Levain seat the policy changes nothing).
 * *Check 2 still refuses an open wrap.* A seat that is itself mid-wrap is a wrap in progress, not a live seat.
 """
 from __future__ import annotations
@@ -267,8 +269,9 @@ def _check3(src: Sources, agent: str, key: str, day: date, zone: str) -> Check:
         skew = timedelta(seconds=CLOCK_SKEW_S)
         spans.append((_when(r["launched_at"]) - skew, _when(r["ended_at"]) + skew))
     since = sorted(((_when(at), wid) for wid, at in _guard(src.wraps, "the wrap history") if _when(at) >= start))
-    # an occurrence made ONE wrap, the last inside its span (the baton keeps any other writer out of the span, and a
-    # wrap just after it is somebody else's); everything else since the day's start is foreign
+    # an occurrence made ONE wrap, taken as the last inside its span (no other wrap can open while the occurrence's is
+    # open, but a seat's may land inside the span before its prepare_wrap or after its save, and the baton does not stop
+    # a Levain seat); a wrap just after the span is somebody else's; everything else since the day's start is foreign
     for lo, hi in spans:
         inside = [w for w in since if lo <= w[0] <= hi]
         if inside:
@@ -315,9 +318,10 @@ def _check5(src: Sources) -> Check:
                      "prepare_wrap is outside the frozen episode set and is the next dream's input")
         try:
             if not _guard(src.requires_baton, "the baton policy"):
-                parts.append("this store does NOT require the consolidate baton, so with seats live only anneal's "
-                             "wrap state and wrap.lock keep a seat's own consolidate out; `levain init` creates a store "
-                             "that requires it")
+                parts.append("this store does not require the consolidate baton: a seat's own consolidate is kept out "
+                             "while the dream's wrap is open by that open wrap (and `levain wrap` by wrap.lock) either "
+                             "way, and the policy would add only a downgrade for a writer under another session id "
+                             "than this install's; `levain init` creates a new store with it")
         except SourceUnreadable:
             pass                                          # check 2 reads the same source and answers for it
     elif bad:
