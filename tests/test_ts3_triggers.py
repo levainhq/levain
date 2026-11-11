@@ -109,7 +109,7 @@ def test_overdue_agenda_silent_when_today_future_or_not_an_agenda(tmp_path):
     _add(root, "2026-11-07")
     _add(root, "2026-11-07T00:01")
     _add(root, "2026-11-20")
-    _add(root, "2026-11-01", disposition="seed")
+    _add(root, "2026-11-01", disposition="someday")
     assert doctor._check_overdue_agenda(root, today=TODAY) == []
 
 
