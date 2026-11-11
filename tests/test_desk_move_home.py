@@ -557,3 +557,27 @@ def test_an_unreadable_existing_record_still_refuses(tmp_path, monkeypatch):
     monkeypatch.setattr(door, "_record_paths", lambda: [rec])
     rc, out, err = _run(home, settings)
     assert rc == 1 and (home / LEGACY_HOME_NAME).is_dir()
+
+
+# --- the verb's command line (Diogenes 457bb0df, and --queue-dir) ------------------------------------------------------
+def test_the_cli_queue_dir_names_the_store_whose_directory_moves(tmp_path, monkeypatch, capsys):
+    # a desk store outside the consent directory and the board is reachable only through --queue-dir
+    home, settings = _setup(tmp_path)
+    st = _store_with_cwd(tmp_path, f"{home}/{LEGACY_HOME_NAME}")
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    monkeypatch.setenv(SETTINGS_ENV, str(settings))
+    rc = cli.main(["desk", "move-home", "--queue-dir", str(tmp_path / "queue")])
+    assert rc == 0, capsys.readouterr().err
+    assert st.coord_setting().cwd == f"{home}/{DESK_HOME_NAME}"
+
+
+def test_the_help_names_what_the_verb_refuses_and_every_write_it_makes(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / ".levain"))
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["desk", "move-home", "--help"])
+    assert ex.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    # it refuses on BOTH real directories, not on the new one alone, and says which writes it makes
+    assert "old directory is a real directory and the new one exists too" in text
+    assert "desk's stored directory" in text and "workspace record" in text
+    assert "--queue-dir" in text

@@ -160,6 +160,7 @@ def _refuse_unwritable(value: Any) -> None:
         or f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {value!r})")
 
 
+NEW_ID_PREFIX = "intention"   # a record this store mints (anneal 1.0.7 ``id_prefix``): ``intention-NNN``; ``spore-N`` ids still read
 _GUARDED: Any = None
 _GUARDED_LOCK = threading.Lock()   # anneal is imported lazily (this module stays stdlib-only), so build once under a lock
 
@@ -174,7 +175,7 @@ def guarded_spore_store(path: Any) -> Any:
     with _GUARDED_LOCK:
         if _GUARDED is None:
             _GUARDED = _build_guarded_class()
-    return _GUARDED(path)
+    return _GUARDED(path, id_prefix=NEW_ID_PREFIX)
 
 
 def _build_guarded_class() -> Any:

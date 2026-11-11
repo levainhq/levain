@@ -198,7 +198,8 @@ def open_ended_of(q: Any) -> bool:
 
 
 INTENTION_ACTIONS = ("snooze", "edit", "done", "clear")
-INTENTION_ID = re.compile(r"spore-[0-9A-Za-z_-]{1,56}")
+# an id minted before anneal 1.0.7 is ``spore-N``; a new one (``id_prefix="intention"``) is ``intention-NNN``: both are read
+INTENTION_ID = re.compile(r"(?:spore|intention)-[0-9A-Za-z_-]{1,56}")
 
 
 def valid_intention_id(value: Any) -> bool:
