@@ -17,6 +17,7 @@ from levain import split
 from levain.consent import band
 from levain.consent.questions import QuestionStore
 from levain.desk.store import CoordStore
+from levain.intention_legacy import OLD_ID_PREFIX
 from levain.intentions import guarded_intention_store
 from levain.writes import EditError, WriteScope, apply_edit
 
@@ -80,7 +81,8 @@ def test_a_linked_part_wakes_when_its_first_part_is_done(tmp_path, qdir, pings):
     res = _run(root, qdir)
     assert [o["intention_id"] for o in res["due"]] == [f["id"]]
     stamp = _intention(root, f["id"])["germinated"]
-    assert stamp["target"] == "band" and stamp["ref"].startswith("q-")
+    assert stamp["target"] == "band" and stamp["ref"].startswith("q-") and stamp["event"] == f"done:{a['id']}"
+    assert _intention(root, f["id"]).get("on_event") is None                       # the wake consumed the link
     assert [q.id for q in QuestionStore(qdir).open_questions()] == [stamp["ref"]]
 
 
@@ -212,9 +214,15 @@ def test_the_check_by_rings_once_unstamped_and_the_event_can_still_wake_it(tmp_p
     row = _rows(qdir)[0]
     assert "Still waiting on done:" in row.what and f["id"] in row.what and early["id"] not in row.what
     assert _intention(root, f["id"]).get("germinated") is None                                   # the link stays live
+    ring = row
     _done(root, a["id"])
     woke = _run(root, qdir)
     assert sorted(o["intention_id"] for o in woke["due"]) == sorted([f["id"], early["id"]])
+    # the ring filed before the wake is closed by it, in words, and the result says so
+    closed = QuestionStore(qdir).get(ring.id)
+    assert closed.answer is not None and closed.answer.kind == "text" and "happened" in closed.answer.value
+    assert [(c["via"], c["ref"]) for c in woke["checkby"]] == [("superseded", ring.id)]
+    assert ring.id not in [q.id for q in QuestionStore(qdir).open_questions()] and len(QuestionStore(qdir).open_questions()) == 2
 
 
 def test_keeping_it_moves_the_check_by_a_week_and_dropping_it_ends_the_agenda(tmp_path, qdir, pings):
@@ -302,7 +310,7 @@ def test_then_you_files_a_band_agenda_linked_to_this_item_with_a_week_to_check(t
     row = _intention(root, made["intention_id"])
     assert (row["disposition"], row["target"], row["type"], row["text"]) == ("agenda", "band", "task", "send the invoice")
     assert row["on_event"] == f"done:{a['id']}" and row["check_by"] == "2026-11-18" and made["replay"] is False
-    assert "note" not in made
+    assert made["note"] == f"filed {made['intention_id']}: it comes to your band when this is marked done; if it is not, you are asked on 2026-11-18"
 
 
 def test_then_you_twice_lands_one_row_and_says_it_replayed(tmp_path):
@@ -335,11 +343,35 @@ def test_then_you_refuses_a_resolved_or_a_loop_first_part(tmp_path):
         split.create_then(_intentions(root), loop["id"], "next", today=TODAY)
 
 
-def test_then_you_on_a_machine_part_says_it_will_not_wake_on_done(tmp_path):
+@pytest.mark.parametrize("target", ["desk", "board:levain"])
+def test_then_you_on_a_machine_part_is_refused_in_words(tmp_path, target):
+    """A desk or board first part is composted when it germinates, so done: could never wake the link: refused, nothing filed."""
     root = _install(tmp_path)
-    a = guarded_intention_store(_intentions(root)).add(type="task", text="draft it", disposition="agenda", target="desk")
-    made = split.create_then(_intentions(root), a["id"], "send it", today=TODAY)
-    assert "check-by day (2026-11-18)" in made["note"]
+    a = guarded_intention_store(_intentions(root)).add(type="task", text="draft it", disposition="agenda", target=target)
+    with pytest.raises(split.ThenRefused, match="handed to the desk or a board"):
+        split.create_then(_intentions(root), a["id"], "send it", today=TODAY)
+    assert [s for s in IntentionStore(_intentions(root), id_prefix="intention").list_open() if s.get("on_event")] == []
+
+
+def test_then_you_replayed_after_the_second_part_ended_is_refused_naming_it(tmp_path):
+    root = _install(tmp_path)
+    a = _anchor(root)
+    one = split.create_then(_intentions(root), a["id"], "send the invoice", today=TODAY)
+    _done(root, one["intention_id"], "dropped")
+    with pytest.raises(split.ThenRefused, match=one["intention_id"]) as why:
+        split.create_then(_intentions(root), a["id"], "send the invoice", today=TODAY)
+    assert why.value.status == 409
+    assert split.create_then(_intentions(root), a["id"], "send a different invoice", today=TODAY)["replay"] is False
+
+
+def test_then_you_keys_the_link_with_the_stored_id_and_followers_match_either_spelling(tmp_path):
+    root = _install(tmp_path)
+    a = _anchor(root)
+    other = (OLD_ID_PREFIX if a["id"].startswith("intention-") else "intention-") + a["id"].partition("-")[2]
+    made = split.create_then(_intentions(root), other, "send the invoice", today=TODAY)
+    assert made["event"] == f"done:{a['id']}"
+    items = IntentionStore(_intentions(root), id_prefix="intention").list_open()
+    assert [f["id"] for f in split.followers_of(items, a["id"])] == [f["id"] for f in split.followers_of(items, other)] == [made["intention_id"]]
 
 
 def test_the_verb_binds_the_row_version_and_audits(tmp_path, qdir):
@@ -403,3 +435,82 @@ def test_a_desk_first_part_is_composted_at_germination_and_never_wakes_the_secon
     res = _run(root, qdir)
     assert [o["intention_id"] for o in res["due"]] == [a["id"]] and _intention(root, a["id"])["resolution"]["kind"] == "composted"
     assert _run(root, qdir)["due"] == [] and _intention(root, f["id"]).get("germinated") is None
+
+
+# --- review fixes (L1 + L2, row 178 build 2) --------------------------------------------------------------------------
+def test_a_snoozed_woken_part_is_not_woken_again_and_comes_back_as_a_dated_agenda(tmp_path, qdir, pings):
+    root = _install(tmp_path)
+    a = _anchor(root)
+    f = _follower(root, a["id"])
+    _done(root, a["id"])
+    _run(root, qdir)
+    QuestionStore(qdir).intention_act(f["id"], "snooze", until="2026-11-14", channel="cockpit")
+    again = _run(root, qdir)
+    assert again["due"] == [] and QuestionStore(qdir).open_questions() == []        # the snooze holds
+    part = _intention(root, f["id"])
+    assert part["next"] == "2026-11-14" and not part.get("on_event")
+    back = _run(root, qdir, today=date(2026, 11, 14))
+    assert [o["intention_id"] for o in back["due"]] == [f["id"]] and "event" not in back["due"][0]   # an ordinary dated wake now
+
+
+def test_a_typed_drop_to_the_check_by_ring_drops_it_and_any_other_words_keep_it(tmp_path, qdir, pings):
+    root = _install(tmp_path)
+    a = _anchor(root)
+    drop = _follower(root, a["id"], "drop me", check_by="2026-11-10")
+    keep = _follower(root, a["id"], "keep me", check_by="2026-11-10")
+    _run(root, qdir)
+    qs = QuestionStore(qdir)
+    for sid, words in ((drop["id"], " Drop "), (keep["id"], "no, I did it already")):
+        qs.answer(next(q.id for q in qs.open_questions() if sid in q.what), text=words, channel="cli")
+    res = _run(root, qdir)
+    assert {c["intention_id"]: c["via"] for c in res["checkby"]} == {drop["id"]: "dropped", keep["id"]: "kept"}
+    assert _intention(root, drop["id"])["status"] == "resolved" and _intention(root, keep["id"])["status"] == "open"
+
+
+def test_the_list_keeps_an_event_agenda_whose_key_is_not_done(tmp_path):
+    from tests.test_cockpit_list_panel import Rig, TODAY as LIST_TODAY
+
+    r = Rig(tmp_path, band=False, board=False)
+    kinds = {}
+    for key in ("landed:np-123", "answered:q-abc"):
+        kinds[key] = r.sp.add(type="task", text=f"after {key}", disposition="agenda", target="band", on_event=key,
+                              check_by=(LIST_TODAY.replace(day=LIST_TODAY.day + 5)).isoformat(), today=LIST_TODAY)["id"]
+    panel = r.panel()
+    rows = _list_rows(panel)
+    for key, sid in kinds.items():
+        facets = rows[f"intention:{sid}"]["facets"]
+        assert facets["after"] is None and facets["time_state"] == "later" and facets["wake_line"].startswith(f"on {key}, check by ")
+    assert not [w for w in panel.get("skipped", []) if "wrong type" in str(w)]
+
+
+def test_when_on_an_event_agenda_is_refused_in_words_and_clearing_is_not(tmp_path, qdir):
+    root = _install(tmp_path)
+    a = _anchor(root)
+    f = _follower(root, a["id"])
+    scope = _scope(root, qdir)
+    with pytest.raises(EditError, match=f"waits on done:{a['id']}, not on a date") as why:
+        apply_edit(scope, {"kind": "intention_surface_at", "intention_id": f["id"], "surface_at": "2026-11-20", "expect_disposition": "agenda"})
+    assert why.value.http_status == 422 and _intention(root, f["id"]).get("next") is None
+    assert apply_edit(scope, {"kind": "intention_surface_at", "intention_id": f["id"], "surface_at": None, "expect_disposition": "agenda"})["ok"]
+    plain = _anchor(root, "a dated one")                       # an ordinary agenda still takes a date
+    assert apply_edit(scope, {"kind": "intention_surface_at", "intention_id": plain["id"], "surface_at": "2026-11-20", "expect_disposition": "agenda"})["ok"]
+
+
+def test_then_you_is_not_offered_on_a_desk_or_board_row_and_the_edit_kind_is_mediated(tmp_path):
+    from levain import writes
+    from tests.test_cockpit_list_panel import Rig
+
+    r = Rig(tmp_path, band=False, board=False)
+    rows = _list_rows(r.panel())
+    assert not any(x["verb"] == "intention_then" for x in rows[f"intention:{r.ids['drop_late']}"]["actions"])
+    assert any(x["verb"] == "intention_then" for x in rows[f"intention:{r.ids['agenda_old']}"]["actions"])
+    assert "intention_then" in writes._VERB_KINDS
+
+
+def test_an_event_run_matches_the_key_in_either_id_spelling(tmp_path, qdir, pings):
+    root = _install(tmp_path)
+    a = _anchor(root)
+    f = _follower(root, a["id"])
+    _done(root, a["id"])
+    other = (OLD_ID_PREFIX if a["id"].startswith("intention-") else "intention-") + a["id"].partition("-")[2]
+    assert [o["intention_id"] for o in _run(root, qdir, event=f"done:{other}")["due"]] == [f["id"]]
