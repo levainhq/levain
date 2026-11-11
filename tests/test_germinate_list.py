@@ -272,7 +272,7 @@ def test_an_agenda_keeps_its_steering(tmp_path):
 
 def test_the_store_carries_a_talk_seed_and_it_is_recognised_and_never_germinated(tmp_path, qdir, pings):
     root = _install(tmp_path)
-    s = guarded_intention_store(_intentions(root)).add(type="thought", text="talk this through", disposition="seed",
+    s = guarded_intention_store(_intentions(root)).add(type="thought", text="talk this through", disposition="someday",
                                                attention="talk")
     got = IntentionStore(_intentions(root), id_prefix="intention").get(s["id"])
     assert got["attention"] == "talk" and sp.is_talk_seed(got)
