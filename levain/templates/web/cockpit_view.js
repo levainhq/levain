@@ -1213,6 +1213,7 @@
   // renderer reads the same pairs), a link keeps its words, whitespace collapses, and a line past `max` characters ends at a word with an ellipsis. The full text is the modal's.
   const TILE_NOTE_CHARS = 160, TILE_ITEM_CHARS = 90;
   function plainLine(text, max) {
+    max = max == null ? Infinity : max;   // a caller that names no cap gets the whole line, never a NaN comparison
     const s = String(text == null ? "" : text).replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\*\*([^*]+?)\*\*|__([^_]+?)__|\*([^*\s][^*]*?)\*|`([^`]*)`/g, (m, a, b, c, d) => a || b || c || d || "").replace(/\s+/g, " ").trim();
     if (s.length <= max) return s;
     const cut = s.slice(0, max), sp = cut.lastIndexOf(" ");
