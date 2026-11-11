@@ -106,7 +106,7 @@ def bare(text):
     coord verb prints (``levain desk VERB: ...`` on stderr) names the program, not a command to run: it is skipped."""
     text = re.sub(r"^levain desk [a-z]+: ", "", text, flags=re.M)
     # the verbs print `<lv> coord ...`; a bare command is `levain` with any spelling of the tree (desk, coord, coordinator)
-    return re.search(r"\blevain (?:desk|coordinator|coord)\b", text.replace(f"{lv()} coord", "")) is not None
+    return re.search(r"\blevain (?:desk|coordinator|coord)\b", text.replace(f"{lv()} coord ", "")) is not None
 
 
 def sql(store, query, *args):
