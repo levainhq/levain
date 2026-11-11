@@ -161,7 +161,7 @@ def _run_update(
         if packs_drifted:
             reconcile.run_pack_reconcile(install, dry_run=True, emit=emit)
         plan = refresh_adapter(install, apply=False, emit=emit, carrier=not packs_drifted, messaging=_messaging)
-        seeds_planned = _plan_intention_migration(install, emit)
+        seeds_planned = _plan_intention_migration(install, emit, held=bool(plan.review))
         if engine_clean and not packs_drifted and not plan.refreshed and not plan.review and not seeds_planned:
             emit("--dry-run: nothing to reconcile mechanically. Nothing was changed.")
             return 0
@@ -175,7 +175,7 @@ def _run_update(
         # An upgrade with the lock already current still leaves the activation tree and
         # adapter files at the previous release (gap #19), so this runs here too.
         adapter = refresh_adapter(install, apply=True, emit=emit, messaging=_messaging)
-        seeds_refused = _migrate_intentions(install, emit)
+        seeds_refused = _migrate_intentions(install, emit, held=bool(adapter.review))
         if adapter.review:
             emit("\nAdapter files need your review (listed above) — merge by hand or "
                  "re-onboard (`levain init --force`), then re-run `levain update`.")
@@ -285,7 +285,7 @@ def _run_update(
     #    pack reconcile, which may have changed the roster the carrier lists. --
     adapter = refresh_adapter(install, apply=True, emit=emit, carrier=not pack_needs_review, messaging=_messaging)
     adapter_needs_review = bool(adapter.review)
-    seeds_refused = _migrate_intentions(install, emit)
+    seeds_refused = _migrate_intentions(install, emit, held=adapter_needs_review)
 
     # -- 3.7 record the `--ack` decided at step 3, now that everything that can rewrite an
     #    instruction file has run. The proposals were shown against the files as they were
@@ -384,25 +384,45 @@ def _install_intention_paths(install: Path):
     return AnnealPaths.from_db(install / ".levain" / "memory.db")
 
 
-def _migrate_intentions(install: Path, emit: Emit) -> bool:
+def _held_line(n: int, *, plan: bool) -> str:
+    return (f"intentions: {n} open seed record(s) {'would be' if plan else 'are'} left for the next `levain update`, not "
+            f"rewritten to someday: levain's files {'would be' if plan else 'were'} held for review (listed above), so "
+            f"the installed hooks may still be ones that do not know `someday`")
+
+
+def _migrate_intentions(install: Path, emit: Emit, *, held: bool = False) -> bool:
     """Rewrite the store's open ``seed`` records to ``someday`` (ruling H8, :mod:`levain.intention_migrate`): copied
     first, idempotent, one compare-and-set per record. Every line the migration reports is printed. True when the
     migration REFUSED (an unwritable backup, an unreadable store): the caller ends the update non-zero, so a refusal is
-    never swallowed."""
-    from levain.intention_migrate import migrate_seed_to_someday
+    never swallowed.
 
-    report = migrate_seed_to_someday(_install_intention_paths(install))
+    ``held``: the adapter refresh held files for review (``AdapterRefresh.review``), so the hooks may not have moved, and
+    an older hook reads ``someday`` as an unknown disposition (1111-32 G2). The migration is then left for the next
+    update and one line says so: every read keeps ``seed`` and the migration is idempotent, so waiting changes nothing.
+    Not a refusal (False): the held files already end the update non-zero."""
+    from levain.intention_migrate import migrate_seed_to_someday, open_seed_ids
+
+    paths = _install_intention_paths(install)
+    if held:
+        ids = open_seed_ids(paths)
+        if ids:
+            emit(_held_line(len(ids), plan=False))
+        return False
+    report = migrate_seed_to_someday(paths)
     for line in report.lines():
         emit(line)
     return report.refused is not None
 
 
-def _plan_intention_migration(install: Path, emit: Emit) -> bool:
-    """The ``--dry-run`` plan of :func:`_migrate_intentions`, read-only. True when it WOULD rewrite something."""
+def _plan_intention_migration(install: Path, emit: Emit, *, held: bool = False) -> bool:
+    """The ``--dry-run`` plan of :func:`_migrate_intentions`, read-only. True when it WOULD rewrite something (``held``:
+    it would wait, so the line says that and it is still True: the plan is not empty)."""
     from levain.intention_migrate import open_seed_ids
 
     ids = open_seed_ids(_install_intention_paths(install))
-    if ids:
+    if ids and held:
+        emit(_held_line(len(ids), plan=True))
+    elif ids:
         emit(f"intentions: {len(ids)} open seed record(s) would be rewritten to someday "
              f"({', '.join(ids)}); the store is copied first")
     return bool(ids)
