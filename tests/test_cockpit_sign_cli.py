@@ -60,7 +60,7 @@ def served(home: Path) -> Iterator[dict[str, Any]]:
 
 def _issue(url: str, text: str) -> str:
     status, out = _post(f"{url}/cockpit/verb", {
-        "verb": "intention_seed", "panel_id": "tray", "params": {"text": text, "type": "thought", "disposition": "seed"},
+        "verb": "intention_seed", "panel_id": "tray", "params": {"text": text, "type": "thought", "disposition": "someday"},
         "intent": "sign", "idempotency_key": text, "tier_seen": "T3", "gesture_seen": "laptop-only"}, token=TOKEN)
     assert (status, out.get("state"), out.get("tier")) == (200, "WAITING", "T3"), out
     return out["pending_id"]
@@ -142,7 +142,7 @@ def test_a_default_namespace_signature_is_refused_and_the_cli_signs_the_same_pen
     out = captured.out
     assert f"signing {pid}: intention_seed (sign, T3)" in out and "COMMITTED: decision ALLOWED" in out, out
     assert _state(s, pid) == "COMMITTED"
-    assert IntentionStore(s["spores"], id_prefix="intention").get_by_origin_key(f"ck.{pid[2:]}.0")["text"] == "signed from the terminal"
+    assert IntentionStore(s["intentions"], id_prefix="intention").get_by_origin_key(f"ck.{pid[2:]}.0")["text"] == "signed from the terminal"
 
 
 def test_a_key_whose_class_does_not_cover_the_tier_is_refused_before_signing(served, monkeypatch, capsys):
