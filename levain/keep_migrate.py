@@ -755,8 +755,8 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
                 db = None
         else:
             db = None
+        guarded = guarded_spore_store(spores_json)       # first: an anneal below the floor gets its clear error here
         plain = SporeStore(spores_json, id_prefix=NEW_ID_PREFIX)         # ONLY for restoring a retired disposition (see module doc)
-        guarded = guarded_spore_store(spores_json)
         rep = Report(pp)
 
         def block(it: dict[str, Any], base: str, why: str) -> None:

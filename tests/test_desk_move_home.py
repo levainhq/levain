@@ -581,11 +581,30 @@ def test_the_help_names_what_the_verb_refuses_and_every_write_it_makes(tmp_path,
     assert "old directory is a real directory and the new one exists too" in text
     assert "desk's stored directory" in text and "workspace record" in text
     assert "cannot be read" in text and "neither home exists" in text       # the refusals the code has, not only the first
+    assert "holds no desk store" in text
     assert "--queue-dir" in text
 
 
-def test_a_queue_dir_with_no_desk_store_warns_instead_of_reading_as_nothing_to_do(tmp_path):
+def test_a_queue_dir_with_no_desk_store_refuses_and_changes_nothing(tmp_path):
     home, settings = _setup(tmp_path)
+    before = settings.read_text()
     out, err = io.StringIO(), io.StringIO()
     rc = move_home(home=home, settings=settings, store_dir=tmp_path / "typo", out=out, err=err)
-    assert rc == 0 and "holds no" in err.getvalue() and "typo" in err.getvalue()
+    assert rc == 1 and "holds no" in err.getvalue() and "typo" in err.getvalue() and "nothing was changed" in err.getvalue()
+    assert (home / LEGACY_HOME_NAME).is_dir() and not (home / DESK_HOME_NAME).exists() and settings.read_text() == before
+
+
+def test_queue_dir_is_the_only_store_looked_at(tmp_path, monkeypatch, capsys):
+    # a decoy desk store in the DEFAULT place keeps the old path: --queue-dir replaces the default stores, as its help says
+    from levain.desk.store import CoordStore
+
+    home, settings = _setup(tmp_path)
+    old_cwd = f"{home}/{LEGACY_HOME_NAME}"
+    decoy = CoordStore(home / "consent")
+    decoy.coord_set_agent("claude", cwd=old_cwd)
+    named = _store_with_cwd(tmp_path, old_cwd)
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    monkeypatch.setenv(SETTINGS_ENV, str(settings))
+    assert cli.main(["desk", "move-home", "--queue-dir", str(tmp_path / "queue")]) == 0
+    assert named.coord_setting().cwd == f"{home}/{DESK_HOME_NAME}"
+    assert decoy.coord_setting().cwd == old_cwd

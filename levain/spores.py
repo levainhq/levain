@@ -178,7 +178,7 @@ def guarded_spore_store(path: Any) -> Any:
     try:
         return _GUARDED(path, id_prefix=NEW_ID_PREFIX)
     except TypeError as exc:
-        if "id_prefix" not in str(exc):
+        if "unexpected keyword argument 'id_prefix'" not in str(exc):
             raise
         # anneal-memory before 1.0.7 has no id_prefix: say what to do, never a bare TypeError on every store open
         raise RuntimeError("levain needs anneal-memory>=1.0.7 (the installed one predates the intention id prefix): "

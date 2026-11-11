@@ -2750,8 +2750,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                     "the board, or --queue-dir), and adds the new path to the door's workspace record beside the old "
                     "one. Refuses, changing nothing, when the old directory is a real directory and the new one "
                     "exists too, when the old path is a link and the new directory is missing, when a settings file "
-                    "is not valid JSON, when the workspace record exists but cannot be read, or when neither home "
-                    "exists yet a hook still names the old path; with the move already done it finishes whatever is "
+                    "is not valid JSON, when the workspace record exists but cannot be read, when neither home "
+                    "exists yet a hook still names the old path, or when --queue-dir holds no desk store; with the move already done it finishes whatever is "
                     "left. --dry-run prints the plan first. Run it again: it says nothing to do.")
     cmh.add_argument("--settings", type=Path, default=None, metavar="PATH",
                      help="The Claude Code settings.json to rewrite (default: $LEVAIN_CLAUDE_SETTINGS, else ~/.claude/settings.json).")

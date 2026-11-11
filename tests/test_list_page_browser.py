@@ -78,11 +78,11 @@ def test_the_intake_box_prints_the_servers_receipt_for_each_kind_and_a_refusal(t
             {"eval": f"{RECEIPT}.textContent"},
             # a talk line: a reported intent commits it
             *_type_and_enter("? the future of the List"),
-            _receipt_is("/^talk (spore|intention)-/.test(r.textContent)"),
+            _receipt_is("/^talk intention-/.test(r.textContent)"),
             {"eval": f"{RECEIPT}.textContent"},
             # a drop: commits too, the receipt says when it fires
             *_type_and_enter("@+3h send the invoice"),
-            _receipt_is("/^scheduled drop (spore|intention)-.* fires /.test(r.textContent)"),
+            _receipt_is("/^scheduled drop intention-.* fires /.test(r.textContent)"),
             {"eval": f"{RECEIPT}.textContent"},
             # a refusal: the parser's words, nothing written; the unsent line stays in the box
             *_type_and_enter("@yesterday 9am too late"),
@@ -100,8 +100,8 @@ def test_the_intake_box_prints_the_servers_receipt_for_each_kind_and_a_refusal(t
     assert attrs["enter"] == "send" and attrs["ac"] == "off" and attrs["lp"] == "true" and attrs["h"] >= 44, attrs
     texts = [x for x in v if isinstance(x, str) and not x.startswith("{")]
     assert "sent to the desk to sort" in texts, v
-    assert any(t.startswith(("talk spore-", "talk intention-")) for t in texts), v
-    assert any(t.startswith(("scheduled drop spore-", "scheduled drop intention-")) and " fires " in t for t in texts), v
+    assert any(t.startswith("talk intention-") for t in texts), v
+    assert any(t.startswith("scheduled drop intention-") and " fires " in t for t in texts), v
     refused = json.loads(next(x for x in v if isinstance(x, str) and x.startswith('{"r"')))
     assert refused["kept"] == "@yesterday 9am too late" and refused["r"], refused
     assert "intake_refused" not in refused["r"], refused           # the parser's sentence, not a code
