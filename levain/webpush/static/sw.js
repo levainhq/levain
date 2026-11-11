@@ -6,11 +6,13 @@
 // whichever opens first creates the store; correctness depends on no timing (an unread key waits for the next trigger).
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's shell, recorded in the trace so a device's trace says which worker ran. The literal below is a
-// PLACEHOLDER: the server writes a digest of the cockpit page it serves (the page names every precached asset by its own
-// content digest), of the other assets the server serves for the shell (the mic worklet, which the page loads by a
-// script call rather than names) and of this file's text into it when it starts (levain/web_server.py make_server), so
-// by construction of that digest this file's bytes change whenever the page or any of those assets does. Never hand-edit
-// it; a server that cannot replace it refuses to start.
+// PLACEHOLDER: the server writes a digest of the cockpit page it serves (the page names every script and stylesheet it
+// precaches by its own content digest), of every other path in the server's asset table (the mic worklet among them, which
+// the page loads by a script call rather than names) and of this file's text into it when it starts
+// (levain/shell_version.py, run by levain/web_server.py make_server), so this file's bytes change whenever the page, a script
+// or stylesheet it names, any other path in that table or this file does. NOT covered: the web app manifest, the icons, the screenshots and the signing page: none is
+// in the shell cache this worker precaches, so a change to one needs no reload bar. Never hand-edit it; a server that cannot
+// replace it refuses to start.
 const SW_VERSION = '__LEVAIN_SHELL_VERSION__';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
@@ -405,7 +407,7 @@ async function writeShell(resp, staged) {
 }
 // The attribute-name boundary: `data-src` is not `src` (a plain \b matched it, the hyphen being a word boundary). It consumes the
 // character before the name (capture group 1) instead of looking behind: a regex lookbehind throws in Safari before 16.4, and a
-// throw here caches no shell. The server's _ATTR_BOUNDARY (levain/web_server.py) is this exact source text; tests/test_shell_asset_versions.py
+// throw here caches no shell. The server's _ATTR_BOUNDARY (levain/shell_version.py, bound in levain/web_server.py) is this exact source text; tests/test_shell_asset_versions.py
 // asserts they are equal and that no lookbehind appears in the worker's regexes.
 const ATTR_BOUNDARY = String.raw`(^|[^\w-])`;
 // Same-origin absolute URLs named by <script src> and <link rel=stylesheet href> in the shell html, as {key: path+query, kind}.
@@ -521,7 +523,7 @@ async function cachedAsset(key, kind) {
 }
 // An unversioned url names no fixed bytes (a deploy changes them under the same name), so it is never served without the
 // network's say; only the digest in the url makes cache-first correct.
-// The server's digest is always the first 12 hex of the SHA-256 of the bytes it serves (levain/web_server.py _asset_digest).
+// The server's digest is always the first 12 hex of the SHA-256 of the bytes it serves (levain/shell_version.py asset_digest).
 function versionOf(key) { try { const v = new URL(key, 'https://shell.invalid').searchParams.get('v') || ''; return /^[0-9a-f]{12}$/i.test(v) ? v.toLowerCase() : ''; } catch (_) { return ''; } }
 function versionedKey(key) { return !!versionOf(key); }
 // A network answer for a versioned url is cached only when its bytes ARE that version (an old page's ?v=OLD answered by a

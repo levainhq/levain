@@ -14,8 +14,10 @@ digest, and the served worker (``/sw.js``) has the shape the content-hash redesi
 With ``--tree`` it also asks whether the origin serves the BYTES of that tree: each shell asset's digest, every other
 static page and script, the cockpit page itself (the served page minus its ``?v=`` digests must equal the tree's
 template), the sign sheet (``/sign/<id>``, served only beside a signer: an origin without one prints UNVERIFIED for it
-and the last line says so), and the worker. The tree is read as the server reads it (``read_text``, so a CRLF checkout
-matches), never run or imported: the asset table is parsed out of its ``web_server.py`` with ``ast``. Exit 0 no FAIL (an
+and the last line says so), and the worker, whose version label must EQUAL the one the tree's own ``levain/shell_version.py`` derives from the tree's
+bytes (the one pure, standard-library-only module the server derives it with, loaded by file path and called). The tree is
+read as the server reads it (``read_text``, so a CRLF checkout matches); apart from that one module it is never run or
+imported: the asset table is parsed out of its ``web_server.py`` with ``ast``. Exit 0 no FAIL (an
 UNVERIFIED line is not a FAIL, and is never counted as a PASS), 1 any FAIL, 2 the origin or the tree could not be read (a
 declared asset the tree lacks, a cut, oversized or unfinished-in-time response, a malformed asset table, a tree file that is not UTF-8).
 
@@ -28,6 +30,7 @@ import argparse
 import ast
 import hashlib
 import http.client
+import importlib.util
 import re
 import sys
 import time
@@ -361,13 +364,39 @@ def check_tree(base: str, pkg: Path, page: str, versioned: dict[str, str], sw: b
         out.append(Result(False, "tree /sw.js", "the origin served an empty or no worker (see worker /sw.js), so nothing to compare"))
     else:
         tb = tree_bytes(t_sw)
-        # The tree keeps a PLACEHOLDER where the server writes the version it derives from the shell (1111-20): compared
-        # with the version line normalised on both sides, and the served version must be a derived hex label, never the
-        # placeholder (a worker the server did not render).
-        same = _no_version(tb) == _no_version(sw) and re.fullmatch(r"[0-9a-f]{12}", _sw_version(sw)) is not None
-        out.append(Result(same, "tree /sw.js", f"SW_VERSION {_sw_version(sw)}" if same else
-                          f"served SW_VERSION {_sw_version(sw)} ({digest(sw)}), tree SW_VERSION {_sw_version(tb)} ({digest(tb)})"))
+        # The tree keeps a PLACEHOLDER where the server writes the version it derives from the shell (1111-20). Two
+        # things are judged apart: the worker's code (compared with the version line blanked on both sides) and the
+        # LABEL, which must EQUAL the one the server's own derivation gives over this tree's bytes (so a stale, hand-set or
+        # merely hex-shaped label fails, and a placeholder, a worker the server did not render, fails too).
+        code_same = _no_version(tb) == _no_version(sw)
+        served = _sw_version(sw)
+        try:
+            want = _derived_version(pkg, assets, template, tb)
+            ok_label, why_label = served == want, f"derived {want}"
+        except (OSError, SyntaxError, ValueError, ImportError, AttributeError) as e:
+            ok_label, why_label = False, f"could not derive the label from the tree: {e}"
+        same = code_same and ok_label
+        out.append(Result(same, "tree /sw.js", f"SW_VERSION {served} ({why_label})" if same else
+                          f"served SW_VERSION {served} ({digest(sw)}), tree SW_VERSION {_sw_version(tb)} ({digest(tb)})"
+                          + ("" if code_same else "; the worker's code differs") + ("" if ok_label else f"; label: {why_label}")))
     return out
+
+
+def _derived_version(pkg: Path, assets: dict[str, str], template: str, worker_template: bytes) -> str:
+    """The worker label the server would derive from this tree: the tree's own ``levain/shell_version.py`` (pure, standard
+    library only; the ONE implementation ``make_server`` runs) called over the tree's bytes: the cockpit template, every
+    other path in the tree's ``_ASSETS`` and the worker source. Loaded by file path, so nothing else of the tree is
+    imported or run. Without ``--tree`` there is no tree to derive from, so the origin alone is judged on the worker's
+    shape (check_origin) and no label is compared."""
+    src = pkg / "shell_version.py"
+    if not src.is_file():
+        raise OSError(f"the tree has no {src.relative_to(pkg.parent)} (a release that derives the worker's label from the shell has it)")
+    spec = importlib.util.spec_from_file_location("levain_tree_shell_version", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    web = pkg / "templates" / "web"
+    others = {p: tree_bytes(web / fn) for p, fn in assets.items() if p != "/"}
+    return mod.derive_shell(template, others, worker_template)[2]
 
 
 def _template_shell_paths(template: str) -> set[str]:

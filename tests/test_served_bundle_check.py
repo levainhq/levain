@@ -66,7 +66,8 @@ def test_one_changed_asset_byte_on_the_server_fails_naming_that_asset_and_no_oth
                         lambda fn: real(fn) + "\n// one byte-level change\n" if fn == "sky.js" else real(fn))
     with _up(tmp_path) as base:
         results = sbc.run(base, REPO)
-    assert _failed(results) == ["tree /sky.js"], [r.line() for r in results if not r.ok]
+    # and the served worker's label, derived by the server from the bytes it runs, is not the label this tree derives
+    assert _failed(results) == ["tree /sky.js", "tree /sw.js"], [r.line() for r in results if not r.ok]
     # the origin is self-consistent (its page names the digest of what it serves): only the compare against the tree sees it
     assert all(r.ok for r in results if r.name.startswith("served "))
 
@@ -80,7 +81,8 @@ def test_a_changed_non_shell_page_and_a_changed_cockpit_template_are_each_caught
     monkeypatch.setattr(web_server, "load_web_asset", changed)
     with _up(tmp_path) as base:
         results = sbc.run(base, REPO)
-    assert sorted(_failed(results)) == ["tree /", "tree /pair"], [r.line() for r in results if not r.ok]
+    # the cockpit page is an input of the derived worker label, so the worker label differs from this tree's too
+    assert sorted(_failed(results)) == ["tree /", "tree /pair", "tree /sw.js"], [r.line() for r in results if not r.ok]
 
 
 def _with_sw(sw_edit):
@@ -100,20 +102,48 @@ def test_a_worker_that_is_not_the_row_35_shape_fails_the_shape_and_the_tree_comp
 
 
 def test_a_served_worker_version_must_be_a_derived_hex_label(tmp_path: Path) -> None:
-    """1111-25: the tree compare blanks the version line on both sides, so without the hex requirement a served
-    placeholder or a hand-set label would pass. A derived 12-hex label passes (the first test of this file)."""
+    """1111-25: the tree compare blanks the version line on both sides, so the label itself is judged apart: with a tree
+    it must EQUAL the label the server's own derivation (``levain/shell_version.py``) gives over that tree's bytes, so a
+    placeholder, a hand-set label, a short hex and a valid but WRONG 12-hex label each fail; the really derived one
+    passes. Without a tree there is nothing to derive from, so only the 12-hex shape is required."""
     def with_version(v: bytes):
         return _with_sw(lambda b: re.sub(rb"const SW_VERSION = '[^']*';", b"const SW_VERSION = '" + v + b"';", b))
 
     with _up(tmp_path) as base:
-        derived = sbc.run(base, REPO, with_version(b"0123456789ab"))
+        real = sbc._sw_version(sbc.fetch(base + "/sw.js")[1]).encode()
+        derived = sbc.run(base, REPO, with_version(real))
+        wrong_hex = sbc.run(base, REPO, with_version(b"0123456789ab" if real != b"0123456789ab" else b"ba9876543210"))
         placeholder = sbc.run(base, REPO, with_version(b"__LEVAIN_SHELL_VERSION__"))
         hand_set = sbc.run(base, REPO, with_version(b"1107-56-decl-1"))
         short_hex = sbc.run(base, REPO, with_version(b"0123456789a"))
+        no_tree_wrong_hex = sbc.run(base, None, with_version(b"0123456789ab"))
     assert _failed(derived) == [], [r.line() for r in derived if not r.ok]
+    assert real != b"0123456789ab"
+    assert _failed(wrong_hex) == ["tree /sw.js"]
+    assert "derive" in next(r.detail for r in wrong_hex if r.name == "tree /sw.js")
     assert _failed(placeholder) == ["tree /sw.js"]
     assert _failed(hand_set) == ["tree /sw.js"]
     assert _failed(short_hex) == ["tree /sw.js"]
+    assert _failed(no_tree_wrong_hex) == []                     # no tree: nothing to derive from (documented in the checker)
+
+
+def test_the_checker_derives_the_label_through_the_servers_own_function_not_a_copy(tmp_path: Path) -> None:
+    """One implementation: the tree's ``levain/shell_version.py`` is what the checker runs, so a tree whose derivation
+    differs (here: a salt in it) expects a different label than the server serving the original, and fails."""
+    tree = _tree(tmp_path / "t")
+    mod = tree / "levain" / "shell_version.py"
+    mod.write_text(mod.read_text(encoding="utf-8").replace("levain-shell\\0", "levain-shell-X\\0"), encoding="utf-8")
+    with _up(tmp_path / "a") as base:
+        results = sbc.run(base, tree)
+    assert _failed(results) == ["tree /sw.js"], [r.line() for r in results if not r.ok]
+
+
+def test_a_tree_with_no_shell_version_module_fails_the_worker_compare_naming_it(tmp_path: Path) -> None:
+    tree = _tree(tmp_path / "t")
+    (tree / "levain" / "shell_version.py").unlink()
+    with _up(tmp_path / "a") as base:
+        results = sbc.run(base, tree)
+    assert _failed(results) == ["tree /sw.js"] and "shell_version.py" in next(r.detail for r in results if r.name == "tree /sw.js")
 
 
 def test_an_origin_that_predates_the_digests_and_a_page_naming_a_wrong_digest_both_fail(tmp_path: Path) -> None:
@@ -173,6 +203,7 @@ def _tree(tmp: Path) -> Path:
     pkg = tmp / "levain"
     shutil.copytree(REPO / "levain" / "templates" / "web", pkg / "templates" / "web")
     shutil.copy(REPO / "levain" / "web_server.py", pkg / "web_server.py")
+    shutil.copy(REPO / "levain" / "shell_version.py", pkg / "shell_version.py")
     (pkg / "webpush" / "static").mkdir(parents=True)
     shutil.copy(REPO / "levain" / "webpush" / "static" / "sw.js", pkg / "webpush" / "static" / "sw.js")
     return tmp
