@@ -47,6 +47,7 @@ from types import MappingProxyType
 from typing import Any
 
 from levain import pathid       # containment by identity (stdlib-only leaf); the consent root refusal's home test
+from levain.intention_legacy import OLD_VERB_TO_NEW      # pure data: the ids a signed raise may still name
 # the link-signature verifier lives in levain.authority_sig, so root's route-map check verifies without importing this
 # store; every name is re-exported here, and this module's own calls go through these module attributes
 from levain.authority_sig import (_WEBAUTHN_SIG_TYPE, NAMESPACE, AuthorityError, VerifierUnavailable,
@@ -1335,6 +1336,26 @@ def _validate_egress_grant(grant: Mapping[str, Any], what: str, at: datetime | N
     return _thaw(grant)
 
 
+def _verb_id_at_replay(verb: str) -> str:
+    """The id ``verb`` holds in the replayed policy. A raise an older release signed names a verb by the id it had
+    then (:data:`levain.intention_legacy.OLD_VERB_TO_NEW`); the replay holds its floor under the id the verb has now, in
+    memory only: the signed record, its hash and its signature are never touched. An id the table does not hold keeps
+    the name it was signed with."""
+    return OLD_VERB_TO_NEW.get(verb, verb)
+
+
+def _refuse_retired_verb_ids(rec: Mapping[str, Any]) -> None:
+    """A NEW policy link (never one already in the log) may not name a verb by a retired id: a reader of history accepts
+    nothing new in the old spelling, so a raise, or a loosen whose policy carries a floor, names the id the verb has now."""
+    named = [rec.get("verb")] if rec.get("op") == "raise" else []
+    if rec.get("op") == "loosen" and isinstance(rec.get("policy"), Mapping) and isinstance(
+            rec["policy"].get("raise_to"), Mapping):
+        named = list(rec["policy"]["raise_to"])
+    for verb in named:
+        if isinstance(verb, str) and verb in OLD_VERB_TO_NEW:
+            raise AuthorityError(f"{verb!r} is retired: name {OLD_VERB_TO_NEW[verb]!r} instead")
+
+
 def _validate_policy(data: Any, *, at: datetime | None = None) -> StandingPolicy:
     if not isinstance(data, Mapping) or set(data) != {"raise_to", "timeouts", "grants"}:
         raise AuthorityError("a policy must carry exactly raise_to, timeouts and grants")
@@ -1350,7 +1371,12 @@ def _validate_policy(data: Any, *, at: datetime | None = None) -> StandingPolicy
         g = _validate_grant(grant, f"policy.grants[{gid!r}]", at=at)
         if g["id"] != gid:
             raise AuthorityError(f"policy.grants[{gid!r}] carries id {g['id']!r}")
-    return StandingPolicy.from_dict(data)
+    held: dict[str, str] = {}
+    for verb, tier in raise_to.items():
+        verb = _verb_id_at_replay(verb)
+        # a log that names one verb under both spellings (never written by a release; only hand-made) keeps the stricter
+        held[verb] = max(held.get(verb, tier), tier, key=tiers.index)
+    return StandingPolicy.from_dict({**data, "raise_to": held})
 
 
 def _finite_json(value: Any) -> bool:
@@ -1385,14 +1411,15 @@ def _renewable_kind(grant: Mapping[str, Any], gid: Any) -> _GrantKind:
 
 def _apply_policy_op(policy: StandingPolicy, rec: Mapping[str, Any]) -> StandingPolicy:
     """The policy after the declared op, refusing a malformed or impossible one. Does NOT judge the
-    delta's kind: that is :func:`classify`, on the result alone."""
+    delta's kind: that is :func:`classify`, on the result alone. A verb a record names by a retired id is held under
+    its current id (:func:`_verb_id_at_replay`)."""
     op = rec["op"]
     data = policy.as_dict()
     if op == "raise":
         verb, tier = rec["verb"], rec["tier"]
         if not isinstance(verb, str) or not verb or tier not in _tiers():
             raise AuthorityError("raise needs a verb and a tier")
-        data["raise_to"][verb] = tier
+        data["raise_to"][_verb_id_at_replay(verb)] = tier
     elif op == "loosen":
         return _validate_policy(rec["policy"], at=_parse_stamp(rec["at"], "at"))
     elif op == "timeouts":
@@ -2652,6 +2679,8 @@ def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: 
                                  + "; enrol another first, or revoke it with compromised_since if it is lost or stolen")
         keys[fp] = replace(target, revoked_seq=seq, compromised_since=since)
         return ranks[target.key_class]
+    if new_link:
+        _refuse_retired_verb_ids(rec)
     return _apply_policy_op(state.policy, rec)
 
 
