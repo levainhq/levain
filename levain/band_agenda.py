@@ -3,17 +3,18 @@
 A machine-filed band row the operator wants pushed past the snooze window is not a band row: it becomes a dated agenda that
 wakes back into the band on its day. Two acts in a fixed order:
 
-1. plant the agenda (the row's words, the day, target ``band``, the question id in its ``pointer``) in ONE ``add`` under a
-   key derived from the question id alone, so a retry lands the same spore whatever day it names;
-2. answer the row with the deferral words, so the stopped seat reads that it must wait, then deliver the answer as any
-   cockpit answer is delivered.
+1. plant the agenda (the row's words, the day, target ``band``, the question id in its ``pointer``) in ONE anneal ``apply``
+   add under a key derived from the question id alone, so a retry lands the same spore whatever day it names, and exactly
+   one of two racing calls is told it created it;
+2. answer the row with the deferral words, so the stopped seat reads that it must wait.
 
-The audit line is written after both. Every refusal that can be known beforehand is raised before act 1: a row settled by
-signing, a row that rings a reminder, a host that cannot take a text answer. A crash between the acts leaves the row open with
-its agenda planted; the retry finds the key, keeps the day already planted and goes on to act 2. When the host REFUSES act 2
-(a host may refuse an unsigned answer by its own setting, which levain cannot ask beforehand) and this call planted the
-agenda, the agenda is composted with the refusal in its note and an audit line records the aborted attempt, so a refused
-deferral leaves nothing planted. Each act is its own function so a test can fail the seam between them."""
+Then the row is READ BACK, and that read alone decides: only a row that records this call's deferral (text, these words, the
+cockpit channel) gets the receipt, the delivery to the stopped agent and the audit line. A row answered otherwise, gone, or
+refused while still open gets a refusal, and an agenda THIS call created is composted first (a note names why) unless it was
+changed since, which the refusal names; an agenda this call did not create is never composted. Every refusal that can be known
+beforehand is raised before act 1: a row settled by signing, a row that rings a reminder, a host that cannot take a text
+answer. A crash between the acts (a store error with the row still open) leaves the agenda planted; the retry finds the key,
+keeps the day already planted and goes on to act 2. Each act is its own function so a test can fail the seam between them."""
 
 from __future__ import annotations
 
@@ -21,9 +22,9 @@ import hashlib
 import inspect
 import sqlite3
 import threading
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from levain.consent.questions import SNOOZE_MAX_DAYS, valid_date, valid_intention_id
 
@@ -86,9 +87,28 @@ def offer_block(questions: Any, question_id: str) -> str | None:
     if answer_refusal(questions):
         return BLOCK_NO_ANSWER
     try:
-        return question_block(questions.get(question_id))
+        return target_block(questions, questions.get(question_id))
     except Exception:  # noqa: BLE001 - a row that cannot be read is not offered a write
         return BLOCK_UNREADABLE
+
+
+def target_block(questions: Any, q: Any) -> str | None:
+    """:func:`question_block` for a row read by ``get``, judged as the List judges it. A host store's ``get`` may project less
+    than its ``open_questions`` (flow's ``NeedsQuestions.get`` never carries the ``sign_request`` its ``open_questions``
+    attaches), so on a host store a row ``get`` shows unsigned is judged again on its ``open_questions`` entry. A listing that
+    cannot be read blocks the row."""
+    code = question_block(q)
+    if code is not None:
+        return code
+    from levain import band_view
+
+    if not band_view._foreign(questions):          # levain's own store: get and the band read share one projection
+        return None
+    try:
+        listed = next((o for o in questions.open_questions() if getattr(o, "id", None) == q.id), None)
+    except Exception:  # noqa: BLE001 - the signing facts cannot be read, so the row is not offered a write
+        return BLOCK_UNREADABLE
+    return question_block(listed) if listed is not None else None
 
 
 def agenda_origin_key(question_id: str) -> str:
@@ -100,34 +120,66 @@ def agenda_origin_key(question_id: str) -> str:
 def day_refusal(day: Any, today: date) -> str | None:
     """Why ``day`` cannot be the agenda's day, in the words the operator reads, or None: a real ``YYYY-MM-DD`` strictly after
     the snooze window's last day. A nearer day is a snooze's, and the words say so."""
-    if not valid_date(day):
+    parsed = _day_of(day)
+    if parsed is None:
         return f"an agenda's day is written YYYY-MM-DD: {day!r} is not a date"
+    today = _date_of(today)
     latest = today + timedelta(days=SNOOZE_MAX_DAYS)
-    if date.fromisoformat(day) <= today:      # a snooze refuses this day too, so the words do not point at one
+    if parsed <= today:      # a snooze refuses this day too, so the words do not point at one
         return (f"{day} is not after today ({today.isoformat()}): an agenda is for a day after {latest.isoformat()}")
-    if date.fromisoformat(day) <= latest:
+    if parsed <= latest:
         return (f"{day} is within the snooze window (a snooze is at most {SNOOZE_MAX_DAYS} days, so {latest.isoformat()} at "
                 f"the latest): snooze the row instead; an agenda is for a day after {latest.isoformat()}")
     return None
+
+
+def _day_of(day: Any) -> date | None:
+    """``day`` parsed once: a ``YYYY-MM-DD`` string that is a real date, else None (never raises)."""
+    if not valid_date(day):
+        return None
+    try:
+        return date.fromisoformat(day)
+    except (TypeError, ValueError):
+        return None
+
+
+def _date_of(today: date) -> date:
+    """The day of ``today``: a ``datetime`` (a ``date`` subclass that refuses to compare with one) is cut to its date."""
+    return today.date() if isinstance(today, datetime) else today
 
 
 def deferral_words(day: str, agenda_id: str) -> str:
     return f"deferred: comes back {day} as {agenda_id}; do not proceed before then"
 
 
-def _plant(store: Any, *, text: str, day: str, question_id: str, today: date) -> dict[str, Any]:
-    """Act 1: the one ``add``. Its own seam so a test can fail it; a key already held returns that spore unchanged."""
-    return store.add(type=AGENDA_TYPE, text=text, disposition="agenda", next=day, target=AGENDA_TARGET,
-                     pointer=f"question:{question_id}", origin_key=agenda_origin_key(question_id), today=today)
+def _plant(store: Any, *, text: str, day: str, question_id: str, today: date) -> tuple[dict[str, Any], bool, str | None]:
+    """Act 1: ONE ``apply`` add under the row's key. anneal holds its lock across the key check and the write, so exactly one
+    of two racing calls is told it created the spore. Returns (the spore carrying the key; a key held by a deleted spore is
+    ``{"id": ..., "status": "deleted"}``), whether THIS call created it, and the version it was created at (None unless it
+    was). A key already held writes nothing. Its own seam so a test can fail it."""
+    from anneal_memory.spores import SporeApply
+
+    fields: dict[str, Any] = {"type": AGENDA_TYPE, "text": text, "disposition": "agenda", "next": day, "target": AGENDA_TARGET,
+                              "pointer": f"question:{question_id}"}
+    got = store.apply(SporeApply(op="add", origin_key=agenda_origin_key(question_id), args={**fields, "today": today},
+                                 postcondition=fields))
+    created = got.outcome == "applied"
+    spore = got.spore if got.spore is not None else {"id": got.spore_id, "status": "deleted"}
+    return spore, created, (got.version if created else None)
 
 
 def _answer_deferred(questions: Any, question_id: str, words: str) -> None:
-    """Act 2: record the answer (channel ``cockpit``, unsigned: it authorises nothing), then deliver it to the agent's session
-    on a daemon thread, as ``question_answer`` does. A delivery error never undoes the answer: ``levain question deliver``
-    retries it. Its own seam so a test can fail it after the agenda landed."""
-    from levain.consent import band
-
+    """Act 2: record the answer (channel ``cockpit``, unsigned: it authorises nothing). Whether it landed is judged afterwards
+    by what the row records (:func:`_row_state`), never by this call returning or by an error's words. Its own seam so a test
+    can fail it after the agenda landed."""
     questions.answer(question_id, text=words, channel="cockpit")
+
+
+def _deliver(questions: Any, question_id: str) -> None:
+    """Deliver the recorded answer to the agent's session on a daemon thread, as ``question_answer`` does. A delivery error
+    never undoes the answer (``levain question deliver`` retries it), and a second delivery of one answer starts nothing
+    (``deliver_answer`` reads the delivery state under its session lock)."""
+    from levain.consent import band
 
     def deliver() -> None:
         try:
@@ -138,17 +190,54 @@ def _answer_deferred(questions: Any, question_id: str, words: str) -> None:
     threading.Thread(target=deliver, name="levain-answer-delivery", daemon=True).start()
 
 
+# what the row records after act 2 (:func:`_row_state`)
+ROW_OURS = "ours"      # answered with exactly this call's deferral: kind text, these words, on the cockpit channel
+ROW_OTHER = "other"    # answered with anything else (another surface, other words)
+ROW_OPEN = "open"      # still unanswered
+ROW_GONE = "gone"      # the store no longer has it
+
+
+def _row_state(questions: Any, question_id: str, words: str) -> tuple[str | None, Any]:
+    """(what the row records now, its answer), or (None, None) when it cannot be read. Only an answer that IS this call's
+    deferral (text kind, the same words, the cockpit channel) counts as the deferral landing."""
+    try:
+        q = questions.get(question_id)
+    except Exception:  # noqa: BLE001 - unknown: the caller neither composts nor claims the deferral
+        return None, None
+    if q is None:
+        return ROW_GONE, None
+    ans = getattr(q, "answer", None)
+    if ans is None:
+        return ROW_OPEN, None
+    value = getattr(ans, "value", None)
+    if (getattr(ans, "kind", None) == "text" and getattr(ans, "channel", None) == "cockpit" and isinstance(value, str)
+            and value.strip() == words.strip()):
+        return ROW_OURS, ans
+    return ROW_OTHER, ans
+
+
+def _said(ans: Any) -> str:
+    """An answer the operator did not give through this call, in a few words: its kind, channel and the start of its value."""
+    value = str(getattr(ans, "value", "") or "")
+    short = value if len(value) <= 60 else value[:57] + "..."
+    return f"{getattr(ans, 'kind', '?')} on {getattr(ans, 'channel', '?')}: {short!r}"
+
+
 def defer(*, questions: Any, spores_json: Path, ledger_root: Path, question_id: str, day: Any, today: date,
           now: str | None = None) -> dict[str, Any]:
-    """Make the open band row ``question_id`` an agenda for ``day``. Refusals raise :class:`levain.writes.EditError` with
-    nothing written."""
-    from anneal_memory.spores import SporeError
+    """Make the open band row ``question_id`` an agenda for ``day``. Refusals raise :class:`levain.writes.EditError`.
 
-    from levain.cockpit.consent import ConsentError
+    THE INVARIANT (a consent boundary): the operator is told a deferral landed only when the row, read back after act 2,
+    records THIS call's deferral (:data:`ROW_OURS`); an agenda this call planted is composted whenever the row ends answered
+    otherwise, gone or refused (unless it was changed since this call planted it, which the refusal names); and an agenda
+    this call did not plant (an earlier attempt's, a racing call's) is never composted."""
+    from anneal_memory.spores import PostconditionFailed, SporeError
+
     from levain.consent.questions import QuestionStoreError, intention_of
     from levain.spores import guarded_spore_store
     from levain.writes import EditError, _audit_verb
 
+    today = _date_of(today)
     refused = day_refusal(day, today)
     if refused:
         raise EditError("bad_request", 400, refused)
@@ -157,97 +246,173 @@ def defer(*, questions: Any, spores_json: Path, ledger_root: Path, question_id: 
         raise EditError("not_built", 501, f"{cannot}: nothing was planted")
     try:
         q = questions.get(question_id)
-    except (QuestionStoreError, OSError, sqlite3.Error) as exc:
+    except (QuestionStoreError, OSError, sqlite3.Error, ValueError) as exc:   # flow's reader raises ValueError on a bad line
         raise EditError("source_unavailable", 503, f"the question store cannot be read now: {exc}") from None
-    if q is None or q.answer is not None:
+    if q is None or getattr(q, "answer", None) is not None:
         raise EditError("stale", 409, "the row was answered or is gone since it was read")
-    if question_block(q) == BLOCK_SIGNS:
+    if not isinstance(getattr(q, "id", None), str) or not q.id:
+        raise EditError("source_unavailable", 503, "the row could not be read as a question (it has no id): nothing was planted")
+    block = target_block(questions, q)
+    if block == BLOCK_UNREADABLE:
+        raise EditError("source_unavailable", 503, "the row's signing facts cannot be read now: nothing was planted")
+    if block == BLOCK_SIGNS:
         raise EditError("needs_signature", 409, "this row is settled by signing: sign it, or answer it on its own sheet in "
                                                 "Decisions; nothing was planted")
     if intention_of(questions, q) is not None:
         raise EditError("rings_a_reminder", 409, "this row rings a reminder: its Snooze moves it any distance, so it needs no agenda")
-    if question_block(q) == BLOCK_RINGS:        # a reminder this host offers no controls for: still a reminder (Q1)
-        raise EditError("rings_a_reminder", 409, f"this row rings a reminder ({q.intention}): change the reminder where it was "
-                                                 "set; the row needs no agenda")
-    text = str(q.what or "").strip()
+    if block == BLOCK_RINGS:        # a reminder this host offers no controls for: still a reminder (Q1)
+        raise EditError("rings_a_reminder", 409, f"this row rings a reminder ({getattr(q, 'intention', None)}): change the "
+                                                 "reminder where it was set; the row needs no agenda")
+    text = str(getattr(q, "what", None) or "").strip()
     if not text:
         raise EditError("bad_verb_arg", 422, "an agenda needs the row's words: this row has none")
 
     key = agenda_origin_key(q.id)
     try:
         store = guarded_spore_store(spores_json)
-        created = store.get_by_origin_key(key) is None      # whether THIS call plants it (a crash's retry finds it planted)
-        agenda = _plant(store, text=text, day=day, question_id=q.id, today=today)
-    except (SporeError, ValueError) as exc:
+        agenda, created, version = _plant(store, text=text, day=day, question_id=q.id, today=today)
+    except (SporeError, ValueError, PostconditionFailed) as exc:
         raise EditError("verb_failed", 422, f"the agenda could not be planted: {exc}") from None
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from None
-    if agenda.get("status") == "resolved":
+    aid = str(agenda.get("id"))
+    if agenda.get("status") != "open":          # composted, done, dropped or deleted: it can never wake the row
         raise EditError("agenda_resolved", 409,
-                        f"this row's agenda ({agenda.get('id')}) was already resolved, so it cannot wake the row: "
-                        "answer the row in words")
+                        f"this row's agenda ({aid}) is {agenda.get('status')}, so it cannot wake the row: answer the row in "
+                        "words")
     planted = str(agenda.get("next") or day)
     earlier = planted != day                  # the key alone decides: an earlier plant's day stands
-    words = deferral_words(planted, str(agenda["id"]))
-    warning: str | None = None
+    words = deferral_words(planted, aid)
+    raised: Exception | None = None
     try:
         _answer_deferred(questions, q.id, words)
-    except (QuestionStoreError, OSError, sqlite3.Error) as exc:
-        raise EditError("source_unavailable", 503,
-                        f"agenda {agenda['id']} is planted for {planted} but the row was not answered ({exc}): retry") from None
-    except Exception as exc:  # noqa: BLE001 - the host refused act 2 (a ConsentError) or failed in a way a retry repeats
-        if isinstance(exc, ConsentError) and "already answered" in str(exc):
-            raise EditError("stale", 409, f"the row was answered meanwhile; its agenda {agenda['id']} stands for {planted}") from None
-        state = _answered_now(questions, q.id)
-        if state is None:
-            raise EditError("source_unavailable", 503,
-                            f"agenda {agenda['id']} is planted for {planted}; the answer failed ({exc}) and whether the row "
-                            "closed cannot be read now: retry") from None
-        if state:
-            warning = str(exc)          # the host closed the row, then raised: act 2 landed, and its words are kept
-        else:
-            _abort(store, agenda, created=created, why=str(exc), q_id=q.id, planted=planted, today=today,
+    except Exception as exc:  # noqa: BLE001 - judged below by what the row records, never by the words
+        raised = exc
+    state, found = _row_state(questions, q.id, words)
+    after = _After(store=store, key=key, aid=aid, created=created, version=version, q_id=q.id, planted=planted, today=today,
                    ledger_root=ledger_root, now=now)
-    edit_id = _audit_verb(ledger_root, kind="band_agenda", action="band_agenda", target=f"spore:{agenda['id']}", now=now,
+    if state is None:
+        if raised is None:      # the host took the answer; the read-back failed, so the deferral is not claimed
+            after.audit("unconfirmed", None)
+            raise EditError("source_unavailable", 503,
+                            f"agenda {aid} is planted for {planted} and the host took the deferral answer, but the row could "
+                            "not be read back to confirm it: reload the List (if the row is gone, the deferral landed)")
+        raise EditError("source_unavailable", 503,
+                        f"agenda {aid} is planted for {planted}; the answer failed ({raised}) and whether the row closed "
+                        "cannot be read now: retry") from None
+    if state in (ROW_OTHER, ROW_GONE):
+        why = (f"the row was answered otherwise ({_said(found)})" if state == ROW_OTHER else "the row is gone")
+        after.refuse("stale", f"{why}, so this deferral did not land", why)
+    if state == ROW_OPEN:
+        if isinstance(raised, (QuestionStoreError, OSError, sqlite3.Error)):     # a crash's shape: the retry finishes it
+            raise EditError("source_unavailable", 503,
+                            f"agenda {aid} is planted for {planted} but the row was not answered ({raised}): retry") from None
+        why = str(raised) if raised is not None else "the host returned, but the row is still open"
+        after.refuse("answer_refused", f"the row was not answered ({why})", why)
+    _deliver(questions, q.id)                 # ROW_OURS: the deferral landed (its host may still have raised after it)
+    edit_id = _audit_verb(ledger_root, kind="band_agenda", action="band_agenda", target=f"spore:{aid}", now=now,
                           extra={"question": q.id, "day": planted, "origin_key": key})
-    line = f"-> Later, wakes {planted} · band ({agenda['id']})"
+    line = f"-> Later, wakes {planted} · band ({aid})"
     if earlier:
         line += f"; planted earlier, so that day stands (you asked for {day})"
-    return {"ok": True, "id": edit_id, "source": f"spore:{agenda['id']}", "action": "band_agenda", "agenda": agenda["id"],
+    warning = str(raised) if raised is not None else None
+    return {"ok": True, "id": edit_id, "source": f"spore:{aid}", "action": "band_agenda", "agenda": aid,
             "day": planted, "question": q.id, "receipt_line": line, **({"earlier_day_kept": True} if earlier else {}),
             **({"warning": warning} if warning else {})}
 
 
-def _answered_now(questions: Any, question_id: str) -> bool | None:
-    """Whether the row is closed now (a row that is gone counts as not answered), or None when it cannot be read."""
-    try:
-        q = questions.get(question_id)
-    except Exception:  # noqa: BLE001 - unknown: the caller neither composts nor claims the deferral
+class _After:
+    """Act 2 did not land this call's deferral: undo what this call planted, record the attempt, and refuse in words."""
+
+    def __init__(self, *, store: Any, key: str, aid: str, created: bool, version: str | None, q_id: str, planted: str,
+                 today: date, ledger_root: Path, now: str | None) -> None:
+        self.store, self.key, self.aid, self.created, self.version = store, key, aid, created, version
+        self.q_id, self.planted, self.today, self.ledger_root, self.now = q_id, planted, today, ledger_root, now
+
+    def audit(self, outcome: str, why: str | None) -> str | None:
+        """The attempt's audit line; a failure to write it is returned in words and never masks what was done."""
+        from levain.writes import _audit_verb
+
+        try:
+            _audit_verb(self.ledger_root, kind="band_agenda", action="band_agenda", target=f"spore:{self.aid}", now=self.now,
+                        extra={"question": self.q_id, "day": self.planted, "origin_key": self.key, "outcome": outcome,
+                               **({"refused": why} if why is not None else {})})
+        except Exception as exc:  # noqa: BLE001 - the refusal below still says what happened to the agenda
+            return f"{type(exc).__name__}: {exc}"
         return None
-    return q is not None and getattr(q, "answer", None) is not None
+
+    def refuse(self, code: str, head: str, why: str) -> NoReturn:
+        """Compost the agenda when this call planted it and nobody changed it since, then raise ``code`` with ``head`` and
+        what became of the agenda. An agenda this call did not plant is named and left standing. Always raises."""
+        from levain.writes import EditError
+
+        if not self.created:
+            tail = f"agenda {self.aid}, planted by an earlier attempt, stands for {self.planted}"
+            if code == "stale":
+                tail += ": compost it if it is not wanted"
+            raise EditError(code, 409, f"{head}; {tail}")
+        fate, detail = _compensate(self.store, self.key, self.version,
+                                   f"band_agenda aborted: the row {self.q_id} did not take the deferral answer ({why})",
+                                   self.today)
+        mine = f"the agenda this attempt planted ({self.aid})"
+        tail = {
+            "composted": f"{mine} was composted, so nothing remains planted",
+            "already": f"{mine} is already composted, so nothing remains planted",
+            "deleted": f"{mine} was deleted meanwhile, so nothing remains planted",
+            "resolved": f"{mine} was resolved meanwhile ({detail}), so it cannot wake the row",
+            "touched": f"{mine} was changed since this attempt planted it, so it was left standing for {self.planted}: "
+                       "compost it if it is not wanted",
+            "failed": f"{mine} could not be composted ({detail}): compost it",
+        }[fate]
+        lost = self.audit("aborted", why)
+        if lost:
+            tail += f" (the audit line could not be written: {lost})"
+        raise EditError(code, 409, f"{head}; {tail}")
 
 
-def _abort(store: Any, agenda: dict[str, Any], *, created: bool, why: str, q_id: str, planted: str, today: date,
-           ledger_root: Path, now: str | None) -> None:
-    """Act 2 was refused with the row still open. An agenda THIS call planted is composted (a note names the refusal) and the
-    aborted attempt gets its audit line; an agenda an earlier call planted stands, as its key's day does. Always raises."""
-    from anneal_memory.spores import SporeError, spore_version
+def _compensate(store: Any, key: str, version: str | None, note: str, today: date) -> tuple[str, str]:
+    """Compost the spore carrying ``key`` only while it is open at ``version`` (the version this call created it at): a note
+    names the refusal, then one versioned descend. Returns (fate, detail): ``composted``, ``already`` (composted by someone
+    else), ``deleted``, ``resolved`` (detail: the kind), ``touched`` (open at another version: never composted) or ``failed``
+    (detail: the error). Every write is compare-and-set on the version, so a spore another writer moved is never composted."""
+    from anneal_memory.spores import PostconditionFailed, SporeApply, SporeError, spore_version
 
-    from levain.writes import EditError, _audit_verb
+    def where(expect: str | None) -> tuple[str, str] | None:
+        cur = store.get_by_origin_key(key)
+        if cur is None:
+            return "deleted", ""
+        if cur.get("status") != "open":
+            kind = str((cur.get("resolution") or {}).get("kind") or cur.get("status"))
+            return ("already", "") if kind == "composted" else ("resolved", kind)
+        if expect is None or spore_version(cur) != expect:
+            return "touched", ""
+        return None
 
-    aid = str(agenda["id"])
-    if not created:
-        raise EditError("answer_refused", 409, f"the row was not answered ({why}); agenda {aid}, planted by an earlier "
-                                               f"attempt, stands for {planted}")
+    expect = version
     try:
-        cur = store.update(aid, add_note=f"band_agenda aborted: the row {q_id} refused the deferral answer ({why})",
-                           expected_version=spore_version(agenda), today=today)
-        store.descend(aid, kind="composted", expect_disposition="agenda", expected_version=spore_version(cur), today=today)
-    except (SporeError, ValueError, OSError) as exc:
-        raise EditError("answer_refused", 409, f"the row was not answered ({why}); the agenda this attempt planted ({aid}) "
-                                               f"could not be composted ({exc}): compost it") from None
-    _audit_verb(ledger_root, kind="band_agenda", action="band_agenda", target=f"spore:{aid}", now=now,
-                extra={"question": q_id, "day": planted, "origin_key": agenda_origin_key(q_id), "outcome": "aborted",
-                       "refused": why})
-    raise EditError("answer_refused", 409, f"the row was not answered ({why}); the agenda this attempt planted ({aid}) was "
-                                           "composted, so nothing remains planted")
+        found = where(expect)
+        if found is not None:
+            return found
+        cur = store.get_by_origin_key(key)
+        noted = store.update(cur["id"], add_note=note, expected_version=expect, today=today)
+        expect = spore_version(noted)
+        got = store.apply(SporeApply(op="descend", origin_key=key, spore_id=cur["id"],
+                                     args={"kind": "composted", "expect_disposition": "agenda", "today": today},
+                                     expected_version=expect,
+                                     postcondition={"status": "resolved", ("resolution", "kind"): "composted"}))
+    except (SporeError, ValueError, OSError, PostconditionFailed) as exc:   # a CAS that lost a race: say what is there now
+        try:
+            found = where(expect)
+        except Exception:  # noqa: BLE001 - the store cannot be read either: the first error is the one named
+            found = None
+        return found if found is not None else ("failed", str(exc))
+    if got.outcome == "applied":
+        return "composted", ""
+    if got.outcome == "already":
+        return "already", ""
+    try:                                                  # precondition_lost: moved between the note and the descend
+        found = where(expect)
+    except Exception as exc:  # noqa: BLE001
+        return "failed", str(exc)
+    return found if found is not None else ("failed", "the descend found its precondition lost")
+
