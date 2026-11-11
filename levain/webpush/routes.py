@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from levain.shell_version import SHELL_VERSION_LEN
 from levain.webpush import ece, vapid
 from levain.webpush.store import PAIRED_PREFIX, DeviceNotLive, PushStore
 
@@ -43,10 +44,11 @@ def worker_template() -> bytes:
 
 
 def render_worker(template: bytes, version: str) -> bytes:
-    """``template`` with its version placeholder replaced by ``version`` (a short lowercase-hex label). Raises ValueError
-    unless the placeholder line appears exactly once, so a worker whose version could not be written is never served."""
-    if not re.fullmatch(r"[0-9a-f]{1,64}", version):
-        raise ValueError(f"refusing to start: the worker version {version!r} is not a hex label")
+    """``template`` with its version placeholder replaced by ``version`` (lowercase hex, exactly ``SHELL_VERSION_LEN``
+    characters, the length the shell derivation produces and the bundle checker requires). Raises ValueError unless the
+    placeholder line appears exactly once, so a worker whose version could not be written is never served."""
+    if not re.fullmatch(r"[0-9a-f]{%d}" % SHELL_VERSION_LEN, version):
+        raise ValueError(f"refusing to start: the worker version {version!r} is not a {SHELL_VERSION_LEN}-character hex label")
     if template.count(WORKER_VERSION_LINE) != 1:
         raise ValueError("refusing to start: the service worker source does not carry its version placeholder line "
                          f"{WORKER_VERSION_LINE.decode()!r} exactly once")
