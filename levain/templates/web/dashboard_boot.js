@@ -34,6 +34,7 @@
   // the same as before a part was ever drawn), and it ends at the first whole draw or a refusal; a persistently failing server is read once
   // per 30 s, never in a tight loop.
   let everDrawn = false, wholeDrawn = false, retryN = 0, retryT = 0, retryMs = 0, refusedStop = false;
+  let holdT = 0, holdSpent = false;     // the watchdog on an inert part (boardMark): its timer, and whether it has already released the page
   // a refusal travels as a typed property, never as message text (a connection-refused network error must still retry)
   function refusal(msg) { const e = new Error(msg); e.refused = true; return e; }
   const RETRY_MS = [2000, 4000, 8000, 15000, 30000];
@@ -41,11 +42,16 @@
   // WHOLE OR PART. The first board draws in parts (S4: the Needs strip and the core panels as they land), and the whole draw then REPLACES
   // every node, so anything a reader or a test did on a part would be lost under them. Two things keep that from mattering:
   // - `html[data-board-whole]` is the positive "nothing more is coming that would replace this board" signal. It is set by the code that has
-  //   just drawn the whole board, or that knows no whole draw is coming soon (a refusal, a failure with no part drawn, or a failure after a
-  //   part once the retry backoff is at its last step: the page is then left as it is, live, and the retry below still runs); a failure after
-  //   a part with a retry queued leaves it unset and the part inert until that retry draws; a partial draw clears it, and it is never set on
+  //   just drawn the whole board, or that knows no whole draw is coming soon (a refusal, a failure with no part drawn, or the watchdog below
+  //   at its bound: the page is then left as it is, live, and the retry below still runs); a failure after a part with a retry queued
+  //   leaves it unset and the part inert until that retry draws or the watchdog fires; a partial draw clears it, and it is never set on
   //   a partial draw. Absent is the default, so the
   //   page is not ready from the first byte. A deep link's jump (dashboard_core.js) and the test driver wait for it.
+  // - ONE bound, a clock: the first inert part arms a watchdog (BOARD_HOLD_MS, below) that releases the page as it is when it fires, whatever
+  //   the reads are doing (a hung read, a dead server, retries re-queued behind a read in flight). Any boardMark(true) clears it; a further
+  //   partial draw does not re-arm it, and after it has fired the same cold read draws no more partial boards, so the bound is from the
+  //   FIRST inert part and a stream of partial redraws cannot extend it. After it releases, a later whole draw replaces the board like any
+  //   redraw. No count of failures releases the part.
   // - while only a part is drawn the regions the draw replaces are `inert`, so nothing in them can be focused, clicked or opened; the whole
   //   draw replaces their children and drops `inert` in the same synchronous turn (dashboard.css dims them). The masthead and the nav (the
   //   tabs, the theme switch, Sync, a deep link's jump targets) are not in the list and stay live. The list is the page's own: #board holds
@@ -63,6 +69,8 @@
       const h = document.documentElement;
       if (h && typeof h.setAttribute === "function") { if (whole) h.setAttribute("data-board-whole", ""); else h.removeAttribute("data-board-whole"); }
     } catch (_) { /* a page without these nodes (the node harnesses) has no board to mark */ }
+    if (whole) { clearTimeout(holdT); holdT = 0; }
+    else if (!holdT && !holdSpent) holdT = setTimeout(function () { holdT = 0; holdSpent = true; boardMark(true); }, BOARD_HOLD_MS);
   }
   function retryUntilDrawn(why, refused) {
     if (wholeDrawn) return;
@@ -75,23 +83,25 @@
     }
     if (storeEl) { storeEl.hidden = false; storeEl.textContent = "can't reach the cockpit yet (" + why + "), trying again…"; }
     if (retryT) return;
-    // a read already in flight (a foreground started one) would drop this retry and end the chain: wait and ask again instead
+    // only a FAILED read advances the backoff
     retryMs = RETRY_MS[Math.min(retryN++, RETRY_MS.length - 1)];
+    armRetry(why);
+  }
+  function armRetry(why) {
     retryT = setTimeout(function () {
       retryT = 0;
       if (wholeDrawn || refusedStop) return;
-      if (inflight) { retryUntilDrawn(why); return; }
+      // a read already in flight (a foreground started one) would drop this retry and end the chain: wait and ask again instead, on the
+      // SAME delay (no read failed, so the backoff does not advance)
+      if (inflight) { armRetry(why); return; }
       load({ passive: true, auto: true });
     }, retryMs);
   }
-  // A failed read after a part, with a retry queued, keeps the part inert and the signal unset: the retry's whole draw is coming and
-  // replaces the part. That wait is bounded: once the retry is on the backoff's last step (RETRY_MS's final entry, a server that has failed
-  // every read so far) the page is released as it is, so a dead server cannot leave it inert for good; the chain goes on and a later whole
-  // draw replaces the part as any later redraw does. A refusal queues no retry, so it releases at once, as does a failure with no part drawn.
-  function holdPartForRetry(refused) {
-    if (!everDrawn || wholeDrawn || refused) return false;
-    return (retryT ? retryMs : RETRY_MS[Math.min(retryN, RETRY_MS.length - 1)]) < RETRY_MS[RETRY_MS.length - 1];
-  }
+  // A failed read after a part, with the watchdog still armed (boardMark), keeps the part inert and the signal unset: the retry's whole draw
+  // is coming and replaces the part. The wait is bounded by that watchdog's clock alone, so a dead server or a hung read cannot leave the page
+  // inert for good. A refusal queues no retry, so it releases at once (boardMark(true) also clears the watchdog), as does a failure with no
+  // part drawn (no watchdog armed).
+  function holdingPart(refused) { return !refused && holdT !== 0; }
   // (the node harnesses that load this file hand it a window with no event API)
   if (typeof window.addEventListener === "function") window.addEventListener("online", function () { if (!wholeDrawn && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
@@ -169,6 +179,11 @@
   const PARTIAL_GAP_MS = 250;        // two partial draws are at least this far apart, and at least PARTIAL_IDLE x the last draw's own time (a slow phone renders slowly)
   const PARTIAL_IDLE = 4;
   const PANEL_TIMEOUT_MS = 30000;    // a panel that has not answered by then is drawn as its own failure, the rest of the board stays usable
+  // The longest a part may stay inert, from the first inert part: one full panel attempt (PANEL_TIMEOUT_MS, the longest any read of the
+  // rest of the board can take) plus a margin of about the retry backoff's first four waits (2 + 4 + 8 + 15 s), so a board that is only
+  // slow lands its whole draw first and the release is for a read that is hung or a server that is dead.
+  const BOARD_HOLD_MARGIN_MS = 30000;
+  const BOARD_HOLD_MS = PANEL_TIMEOUT_MS + BOARD_HOLD_MARGIN_MS;
   function drawOrder(manifest, ids) {
     const r = (manifest && manifest.regions) || {};
     const core = [];
@@ -1192,7 +1207,7 @@
         };
         let partialDrawn = false;
         const onPartial = everDrawn ? null : (build, n, total) => {
-          runPartial(() => myGen === loadGen && !editInProgress(), build, (pview) => {
+          runPartial(() => myGen === loadGen && !editInProgress() && !holdSpent, build, (pview) => {     // holdSpent: the watchdog released the page, it is not made inert again
             boardMark(false);     // a part: inert, and not whole (before the draw, so a draw that throws midway still leaves nothing to act on)
             drawView(pview);
             partialDrawn = true;
@@ -1267,9 +1282,10 @@
       if (myGen !== loadGen) return false;     // a superseded read's failure says nothing about the page now
       status("read failed: " + (e && e.message ? e.message : e));
       const refused = !!(e && e.refused);
-      // a part with a retry queued stays inert and unsigned (the retry's whole draw replaces it and sets the signal); anything else
-      // (no part drawn, a refusal, or the backoff at its last step) releases the page as it is, and the retry below still reads again
-      if (!holdPartForRetry(refused)) boardMark(true);
+      // a part with the watchdog armed stays inert and unsigned (the retry's whole draw replaces it and sets the signal, or the watchdog
+      // releases it); anything else (no part drawn, a refusal, or the watchdog already fired) releases the page as it is, and the retry
+      // below still reads again
+      if (!holdingPart(refused)) boardMark(true);
       retryUntilDrawn(e && e.message ? e.message : String(e || "read failed"), refused);
       return false;
     } finally {

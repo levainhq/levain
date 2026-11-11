@@ -47,6 +47,11 @@ REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-brief", "ck-widgets", "state",
 PART_UP = ("(() => { const w = document.getElementById('ck-widgets'); return !!w && w.hasAttribute('inert') && !!w.querySelector('.ck-card') && "
            "!document.documentElement.hasAttribute('data-board-whole') && 1; })()")
 WHOLE_UP = "document.documentElement.hasAttribute('data-board-whole') && 1"
+# How long the tests wait for the signal after the release. It MUST stay well inside the page's watchdog (BOARD_HOLD_MS in dashboard_boot.js,
+# a minute from the first inert part): the watchdog also releases the page and sets the signal, so a wait that could outlast it would let a
+# whole draw that forgot to set the signal pass on the watchdog's release (found by mutation: with this at 60 s, deleting the whole draw's
+# boardMark(true) left both tests green). The steps before the release take a few seconds, so 30 s here keeps the signal the whole draw's own.
+WHOLE_WAIT_MS = 30000
 STATE = """JSON.stringify((() => { const h = document.documentElement; const ids = REGIONS;
   const present = ids.filter((id) => document.getElementById(id));
   const focusable = document.querySelector('#ck-widgets .ck-card, #ck-needs button, #board button'); let focused = null;
@@ -92,7 +97,7 @@ def test_a_partial_board_is_inert_and_not_whole_and_the_whole_draw_is_live_and_s
             {"tap": AT_CARD, "before": LISTEN, "ms": 5000, "partial": True},
             {"eval": HITS, "partial": True},
             {"eval": RELEASE, "partial": True},
-            {"until": WHOLE_UP, "ms": 60000, "partial": True},
+            {"until": WHOLE_UP, "ms": WHOLE_WAIT_MS, "partial": True},
             {"eval": STATE, "partial": True},
             {"eval": "JSON.stringify(window.__wholeLog)", "partial": True},
             {"tap": AT_CARD, "before": "window.__hits = []", "ms": 5000},
@@ -121,10 +126,13 @@ def test_a_whole_draw_deferred_for_an_open_editor_leaves_the_part_inert_and_the_
     after the editor closes. (The signal is never set on a claim the board will not be replaced: the deferred draw would falsify it.)"""
     ADD_EDITOR = "(() => { const e = document.createElement('div'); e.className = 'state-editor'; e.id = 'fake-editor'; document.body.appendChild(e); return 1; })()"
     DROP_EDITOR = "(() => { document.getElementById('fake-editor').remove(); return 1; })()"
-    # past the release of the held panels, with the editor still open: wait until every held read has been answered, then a settle in which the
-    # whole draw would have landed had the editor not deferred it (a longer settle only strengthens the test; the correct code never draws)
+    # past the release of the held panels, with the editor still open: the page reads its panels a few at a time, so `started` counts only the
+    # reads begun so far and a tick between two batches sees done == started with more to come. So: wait until every held read begun so far has
+    # been answered, then a settle in which the whole draw would have landed had the editor not deferred it (a longer settle only strengthens
+    # the test; the correct code never draws), and take it as settled only if NO further read began during that settle (else wait again)
     SETTLED = ("new Promise((r) => { const t0 = Date.now(); const tick = () => { const h = window.__held; "
-               "if (h.started > 0 && h.done >= h.started) setTimeout(() => r(1), 3000); else if (Date.now() - t0 > 20000) r(0); else setTimeout(tick, 100); }; tick(); })")
+               "if (Date.now() - t0 > 20000) r(0); else if (h.started > 0 && h.done >= h.started) { const n = h.started; "
+               "setTimeout(() => { const g = window.__held; if (g.started === n && g.done === n) r(1); else tick(); }, 3000); } else setTimeout(tick, 100); }; tick(); })")
     with _boot(tmp_path) as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"init": DELAY}, DESKTOP,
@@ -134,7 +142,7 @@ def test_a_whole_draw_deferred_for_an_open_editor_leaves_the_part_inert_and_the_
             {"eval": SETTLED, "partial": True},
             {"eval": STATE, "partial": True},
             {"eval": DROP_EDITOR, "partial": True},
-            {"until": WHOLE_UP, "ms": 60000, "partial": True},
+            {"until": WHOLE_UP, "ms": WHOLE_WAIT_MS, "partial": True},
             {"eval": STATE, "partial": True},
         ])["values"]
     assert out[3] in (1, "1"), out                                                  # every held read was answered before the state was read
