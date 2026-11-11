@@ -389,6 +389,22 @@ def test_check5_names_a_store_without_the_baton_policy_when_seats_are_live(ent):
     assert v.verdict == rd.READY and "does not require" not in c5(v).detail
 
 
+def test_check5_an_unreadable_baton_policy_is_named_when_seats_are_live_and_never_refused_on(ent):
+    """The policy note is produced only with seats live; when that read fails the detail says so, like any other
+    unreadable source, and check 5 still passes."""
+    ent.pending_launch()
+
+    def broken(src):
+        def boom():
+            raise RuntimeError("policy read broke")
+        src.requires_baton = boom
+
+    v = ent.evaluate(sources_patch=broken)
+    assert c5(v).status == "pass", c5(v).detail
+    assert "the baton policy could not be read" in c5(v).detail and "policy read broke" in c5(v).detail
+    assert "not every source could be read" in c5(v).detail
+
+
 def test_the_open_wrap_not_the_baton_keeps_a_seat_under_this_installs_id_out(ent):
     """The module docstring's safety argument, run: on a store with the policy and the baton held by this install, the
     dream's open wrap refuses a second prepare_wrap under the SAME id (a Levain seat), while another id is downgraded to
@@ -432,6 +448,12 @@ def test_a_live_seat_does_not_hide_any_other_refusal(tmp_path, seat):
     live(e)
     e.occurrence("done", launched=utc(2026, 11, 3, 3, 0), ended=utc(2026, 11, 3, 3, 20))
     assert (e.evaluate().check, e.evaluate().kind) == (1, "already-dreamed")
+
+    e = Entity(tmp_path / "wrapped")                               # a wrap since the dream-day's start (check 3)
+    live(e)
+    now = _wrap_now(e)
+    v = e.evaluate(now=now + timedelta(minutes=5), day=rd.dream_day_at(now, ZONE))
+    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 3, "consolidated-today")
 
     e = Entity(tmp_path / "empty", episodes=0)                     # nothing to consolidate (check 4)
     live(e)
