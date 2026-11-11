@@ -52,8 +52,20 @@ def test_every_item_carries_exactly_the_schema_fields():
 def test_unknown_category_is_reported():
     (case,) = [c for c in CASES if "unknown category" in c["name"]]
     by = {i["id"]: i for i in ready.derive_items(case["input"])}
-    assert by["intention-1005"]["unknown_category"] == "frozen"
-    assert by["intention-1006"]["unknown_category"] is None
+    assert by["spore-1005"]["unknown_category"] == "frozen"
+    assert by["spore-1006"]["unknown_category"] is None
+
+
+def test_an_intentions_item_carries_the_provenance_flow_emits():
+    """flow's producer names an item it read from the intention store ``intentions`` and its ref
+    ``state/intentions.json#<id>``; a handoff item's ref is its pointer. The old words are not read as new ones."""
+    work = {"id": "intention-5", "status": "open", "text": "Build it",
+            "work": {"repo": "flow", "category": "ready", "status": "ready", "tier": "sonnet", "done_line": "x", "rank": 1}}
+    (it,) = ready.derive_items({"spores": [work]})
+    assert (it["provenance"]["source"], it["provenance"]["ref"]) == ("intentions", "state/intentions.json#intention-5")
+    handoff = {"id": "intention-9", "status": "open", "disposition": "handoff", "pointer": "projects/flow/x.md", "text": "t"}
+    (hand,) = ready.derive_items({"spores": [handoff]})
+    assert (hand["provenance"]["source"], hand["provenance"]["ref"]) == ("intentions", "projects/flow/x.md")
 
 
 def test_derive_is_pure_and_does_not_mutate_its_input():

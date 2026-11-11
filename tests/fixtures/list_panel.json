@@ -8,7 +8,7 @@
     "panel_id": "tray"
    },
    "tier": "T2",
-   "verb": "spore_seed"
+   "verb": "intention_seed"
   },
   {
    "escalates": [],
@@ -47,6 +47,7 @@
   "held_until",
   "intention",
   "intention_text",
+  "intention_type",
   "last_seen",
   "list_pointer",
   "overdue",
@@ -54,7 +55,6 @@
   "repo",
   "salience",
   "source",
-  "spore_type",
   "surface",
   "target",
   "tier",
@@ -123,7 +123,7 @@
  "kind": "list",
  "next": null,
  "note": "Band rows are what only you can answer: answer them in Decisions. Board rows are the agents' ready queue.",
- "order": "spore.list",
+ "order": "intention.list",
  "priority": "gate",
  "rank": 10,
  "refresh_every_s": null,
@@ -164,17 +164,17 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-006",
-      "row_version": "e1c59b494abc5a5f"
+      "row_id": "intention:intention-006",
+      "row_version": "4a79d475f7d8b840"
      },
      "tier": "C1",
-     "verb": "spore_touch"
+     "verb": "intention_touch"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "composted",
        "done",
        "dropped"
@@ -182,11 +182,11 @@
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-006",
-      "row_version": "e1c59b494abc5a5f"
+      "row_id": "intention:intention-006",
+      "row_version": "4a79d475f7d8b840"
      },
      "tier": "C1",
-     "verb": "spore_descend"
+     "verb": "intention_close"
     },
     {
      "escalates": [
@@ -205,11 +205,11 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-006",
-      "row_version": "e1c59b494abc5a5f"
+      "row_id": "intention:intention-006",
+      "row_version": "4a79d475f7d8b840"
      },
      "tier": "C1",
-     "verb": "spore_surface_at"
+     "verb": "intention_surface_at"
     },
     {
      "escalates": [
@@ -238,50 +238,50 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-006",
-      "row_version": "e1c59b494abc5a5f"
+      "row_id": "intention:intention-006",
+      "row_version": "4a79d475f7d8b840"
      },
      "tier": "C1",
-     "verb": "spore_update"
+     "verb": "intention_update"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-006",
-      "row_version": "e1c59b494abc5a5f"
+      "row_id": "intention:intention-006",
+      "row_version": "4a79d475f7d8b840"
      },
      "tier": "T2",
-     "verb": "spore_retarget"
+     "verb": "intention_retarget"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-006",
-      "row_version": "e1c59b494abc5a5f"
+      "row_id": "intention:intention-006",
+      "row_version": "4a79d475f7d8b840"
      },
      "tier": "T2",
-     "verb": "spore_set_disposition"
+     "verb": "intention_set_disposition"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "project",
        "thread"
       ]
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-006",
-      "row_version": "e1c59b494abc5a5f"
+      "row_id": "intention:intention-006",
+      "row_version": "4a79d475f7d8b840"
      },
      "tier": "T2",
-     "verb": "spore_ascend"
+     "verb": "intention_promote"
     }
    ],
    "badges": [
@@ -305,11 +305,11 @@
     "due": "2026-11-10",
     "fires": "2026-11-10T09:00",
     "handoff_expired": false,
+    "intention_type": "task",
     "last_seen": "2026-11-08",
     "overdue": false,
     "overdue_days": 0,
     "salience": 0,
-    "spore_type": "task",
     "surface": "drop",
     "target": "desk",
     "tier": "warm",
@@ -319,7 +319,7 @@
     "wake_line": "wakes Tue 11-10 → desk"
    },
    "group": "later",
-   "id": "spore:spore-006",
+   "id": "intention:intention-006",
    "provenance": null,
    "text_hidden": false,
    "title": "renew the domain",
@@ -333,17 +333,17 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-007",
-      "row_version": "2f3bc747d27b450c"
+      "row_id": "intention:intention-007",
+      "row_version": "284eb3ea11656c80"
      },
      "tier": "C1",
-     "verb": "spore_touch"
+     "verb": "intention_touch"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "composted",
        "done",
        "dropped"
@@ -351,22 +351,22 @@
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-007",
-      "row_version": "2f3bc747d27b450c"
+      "row_id": "intention:intention-007",
+      "row_version": "284eb3ea11656c80"
      },
      "tier": "C1",
-     "verb": "spore_descend"
+     "verb": "intention_close"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-007",
-      "row_version": "2f3bc747d27b450c"
+      "row_id": "intention:intention-007",
+      "row_version": "284eb3ea11656c80"
      },
      "tier": "C1",
-     "verb": "spore_surface_at"
+     "verb": "intention_surface_at"
     },
     {
      "escalates": [
@@ -395,50 +395,50 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-007",
-      "row_version": "2f3bc747d27b450c"
+      "row_id": "intention:intention-007",
+      "row_version": "284eb3ea11656c80"
      },
      "tier": "C1",
-     "verb": "spore_update"
+     "verb": "intention_update"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-007",
-      "row_version": "2f3bc747d27b450c"
+      "row_id": "intention:intention-007",
+      "row_version": "284eb3ea11656c80"
      },
      "tier": "T2",
-     "verb": "spore_retarget"
+     "verb": "intention_retarget"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-007",
-      "row_version": "2f3bc747d27b450c"
+      "row_id": "intention:intention-007",
+      "row_version": "284eb3ea11656c80"
      },
      "tier": "T2",
-     "verb": "spore_set_disposition"
+     "verb": "intention_set_disposition"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "project",
        "thread"
       ]
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-007",
-      "row_version": "2f3bc747d27b450c"
+      "row_id": "intention:intention-007",
+      "row_version": "284eb3ea11656c80"
      },
      "tier": "T2",
-     "verb": "spore_ascend"
+     "verb": "intention_promote"
     }
    ],
    "badges": [
@@ -466,18 +466,18 @@
     "due": "2026-11-01",
     "fires": null,
     "handoff_expired": false,
+    "intention_type": "task",
     "last_seen": "2026-10-30",
     "overdue": true,
     "overdue_days": 7,
     "salience": 0,
-    "spore_type": "task",
-    "surface": "spore",
+    "surface": "intention",
     "target": null,
     "tier": "warm",
     "time_state": "now"
    },
    "group": "overdue",
-   "id": "spore:spore-007",
+   "id": "intention:intention-007",
    "provenance": null,
    "text_hidden": false,
    "title": "an agenda from last week",
@@ -491,17 +491,17 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-004",
-      "row_version": "5dc423a44e9c2215"
+      "row_id": "intention:intention-004",
+      "row_version": "fa8372a07bb02c41"
      },
      "tier": "C1",
-     "verb": "spore_touch"
+     "verb": "intention_touch"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "composted",
        "done",
        "dropped"
@@ -509,22 +509,22 @@
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-004",
-      "row_version": "5dc423a44e9c2215"
+      "row_id": "intention:intention-004",
+      "row_version": "fa8372a07bb02c41"
      },
      "tier": "C1",
-     "verb": "spore_descend"
+     "verb": "intention_close"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-004",
-      "row_version": "5dc423a44e9c2215"
+      "row_id": "intention:intention-004",
+      "row_version": "fa8372a07bb02c41"
      },
      "tier": "C1",
-     "verb": "spore_surface_at"
+     "verb": "intention_surface_at"
     },
     {
      "escalates": [
@@ -553,50 +553,50 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-004",
-      "row_version": "5dc423a44e9c2215"
+      "row_id": "intention:intention-004",
+      "row_version": "fa8372a07bb02c41"
      },
      "tier": "C1",
-     "verb": "spore_update"
+     "verb": "intention_update"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-004",
-      "row_version": "5dc423a44e9c2215"
+      "row_id": "intention:intention-004",
+      "row_version": "fa8372a07bb02c41"
      },
      "tier": "T2",
-     "verb": "spore_retarget"
+     "verb": "intention_retarget"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-004",
-      "row_version": "5dc423a44e9c2215"
+      "row_id": "intention:intention-004",
+      "row_version": "fa8372a07bb02c41"
      },
      "tier": "T2",
-     "verb": "spore_set_disposition"
+     "verb": "intention_set_disposition"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "project",
        "thread"
       ]
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-004",
-      "row_version": "5dc423a44e9c2215"
+      "row_id": "intention:intention-004",
+      "row_version": "fa8372a07bb02c41"
      },
      "tier": "T2",
-     "verb": "spore_ascend"
+     "verb": "intention_promote"
     }
    ],
    "badges": [
@@ -620,18 +620,18 @@
     "due": "2026-11-08",
     "fires": "2026-11-08T11:00",
     "handoff_expired": false,
+    "intention_type": "task",
     "last_seen": "2026-11-05",
     "overdue": true,
     "overdue_days": 0,
     "salience": 0,
-    "spore_type": "task",
     "surface": "drop",
     "target": "desk",
     "tier": "warm",
     "time_state": "now"
    },
    "group": "overdue",
-   "id": "spore:spore-004",
+   "id": "intention:intention-004",
    "provenance": null,
    "text_hidden": false,
    "title": "call Sunil",
@@ -645,17 +645,17 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-005",
-      "row_version": "9fe894af9a4ee074"
+      "row_id": "intention:intention-005",
+      "row_version": "bdda42444c43a7a9"
      },
      "tier": "C1",
-     "verb": "spore_touch"
+     "verb": "intention_touch"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "composted",
        "done",
        "dropped"
@@ -663,22 +663,22 @@
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-005",
-      "row_version": "9fe894af9a4ee074"
+      "row_id": "intention:intention-005",
+      "row_version": "bdda42444c43a7a9"
      },
      "tier": "C1",
-     "verb": "spore_descend"
+     "verb": "intention_close"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-005",
-      "row_version": "9fe894af9a4ee074"
+      "row_id": "intention:intention-005",
+      "row_version": "bdda42444c43a7a9"
      },
      "tier": "C1",
-     "verb": "spore_surface_at"
+     "verb": "intention_surface_at"
     },
     {
      "escalates": [
@@ -707,50 +707,50 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-005",
-      "row_version": "9fe894af9a4ee074"
+      "row_id": "intention:intention-005",
+      "row_version": "bdda42444c43a7a9"
      },
      "tier": "C1",
-     "verb": "spore_update"
+     "verb": "intention_update"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-005",
-      "row_version": "9fe894af9a4ee074"
+      "row_id": "intention:intention-005",
+      "row_version": "bdda42444c43a7a9"
      },
      "tier": "T2",
-     "verb": "spore_retarget"
+     "verb": "intention_retarget"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-005",
-      "row_version": "9fe894af9a4ee074"
+      "row_id": "intention:intention-005",
+      "row_version": "bdda42444c43a7a9"
      },
      "tier": "T2",
-     "verb": "spore_set_disposition"
+     "verb": "intention_set_disposition"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "project",
        "thread"
       ]
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-005",
-      "row_version": "9fe894af9a4ee074"
+      "row_id": "intention:intention-005",
+      "row_version": "bdda42444c43a7a9"
      },
      "tier": "T2",
-     "verb": "spore_ascend"
+     "verb": "intention_promote"
     }
    ],
    "badges": [
@@ -774,18 +774,18 @@
     "due": "2026-11-08",
     "fires": "2026-11-08T13:00",
     "handoff_expired": false,
+    "intention_type": "task",
     "last_seen": "2026-11-07",
     "overdue": false,
     "overdue_days": 0,
     "salience": 0,
-    "spore_type": "task",
     "surface": "drop",
     "target": "desk",
     "tier": "warm",
     "time_state": "now"
    },
    "group": "today",
-   "id": "spore:spore-005",
+   "id": "intention:intention-005",
    "provenance": null,
    "text_hidden": false,
    "title": "send the invoice",
@@ -843,17 +843,17 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-002",
-      "row_version": "26150bd4731b639a"
+      "row_id": "intention:intention-002",
+      "row_version": "9d62e4872f971cea"
      },
      "tier": "C1",
-     "verb": "spore_touch"
+     "verb": "intention_touch"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "composted",
        "done",
        "dropped"
@@ -861,22 +861,22 @@
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-002",
-      "row_version": "26150bd4731b639a"
+      "row_id": "intention:intention-002",
+      "row_version": "9d62e4872f971cea"
      },
      "tier": "C1",
-     "verb": "spore_descend"
+     "verb": "intention_close"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-002",
-      "row_version": "26150bd4731b639a"
+      "row_id": "intention:intention-002",
+      "row_version": "9d62e4872f971cea"
      },
      "tier": "C1",
-     "verb": "spore_surface_at"
+     "verb": "intention_surface_at"
     },
     {
      "escalates": [
@@ -905,50 +905,50 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-002",
-      "row_version": "26150bd4731b639a"
+      "row_id": "intention:intention-002",
+      "row_version": "9d62e4872f971cea"
      },
      "tier": "C1",
-     "verb": "spore_update"
+     "verb": "intention_update"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-002",
-      "row_version": "26150bd4731b639a"
+      "row_id": "intention:intention-002",
+      "row_version": "9d62e4872f971cea"
      },
      "tier": "T2",
-     "verb": "spore_retarget"
+     "verb": "intention_retarget"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-002",
-      "row_version": "26150bd4731b639a"
+      "row_id": "intention:intention-002",
+      "row_version": "9d62e4872f971cea"
      },
      "tier": "T2",
-     "verb": "spore_set_disposition"
+     "verb": "intention_set_disposition"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "project",
        "thread"
       ]
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-002",
-      "row_version": "26150bd4731b639a"
+      "row_id": "intention:intention-002",
+      "row_version": "9d62e4872f971cea"
      },
      "tier": "T2",
-     "verb": "spore_ascend"
+     "verb": "intention_promote"
     }
    ],
    "badges": [
@@ -968,17 +968,17 @@
     "due": null,
     "fires": null,
     "handoff_expired": false,
+    "intention_type": "task",
     "last_seen": "2026-10-27",
     "overdue": false,
     "salience": 0,
-    "spore_type": "task",
     "surface": "talk",
     "target": null,
     "tier": "warm",
     "time_state": "now"
    },
    "group": "talk",
-   "id": "spore:spore-002",
+   "id": "intention:intention-002",
    "provenance": null,
    "text_hidden": false,
    "title": "talk about the cockpit",
@@ -992,17 +992,17 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-003",
-      "row_version": "f209b8ddc4ff360b"
+      "row_id": "intention:intention-003",
+      "row_version": "93f01ce191a0e4ac"
      },
      "tier": "C1",
-     "verb": "spore_touch"
+     "verb": "intention_touch"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "composted",
        "done",
        "dropped"
@@ -1010,22 +1010,22 @@
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-003",
-      "row_version": "f209b8ddc4ff360b"
+      "row_id": "intention:intention-003",
+      "row_version": "93f01ce191a0e4ac"
      },
      "tier": "C1",
-     "verb": "spore_descend"
+     "verb": "intention_close"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-003",
-      "row_version": "f209b8ddc4ff360b"
+      "row_id": "intention:intention-003",
+      "row_version": "93f01ce191a0e4ac"
      },
      "tier": "C1",
-     "verb": "spore_surface_at"
+     "verb": "intention_surface_at"
     },
     {
      "escalates": [
@@ -1054,50 +1054,50 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-003",
-      "row_version": "f209b8ddc4ff360b"
+      "row_id": "intention:intention-003",
+      "row_version": "93f01ce191a0e4ac"
      },
      "tier": "C1",
-     "verb": "spore_update"
+     "verb": "intention_update"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-003",
-      "row_version": "f209b8ddc4ff360b"
+      "row_id": "intention:intention-003",
+      "row_version": "93f01ce191a0e4ac"
      },
      "tier": "T2",
-     "verb": "spore_retarget"
+     "verb": "intention_retarget"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-003",
-      "row_version": "f209b8ddc4ff360b"
+      "row_id": "intention:intention-003",
+      "row_version": "93f01ce191a0e4ac"
      },
      "tier": "T2",
-     "verb": "spore_set_disposition"
+     "verb": "intention_set_disposition"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "project",
        "thread"
       ]
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-003",
-      "row_version": "f209b8ddc4ff360b"
+      "row_id": "intention:intention-003",
+      "row_version": "93f01ce191a0e4ac"
      },
      "tier": "T2",
-     "verb": "spore_ascend"
+     "verb": "intention_promote"
     }
    ],
    "badges": [
@@ -1117,17 +1117,17 @@
     "due": null,
     "fires": null,
     "handoff_expired": false,
+    "intention_type": "task",
     "last_seen": "2026-11-06",
     "overdue": false,
     "salience": 0,
-    "spore_type": "task",
     "surface": "talk",
     "target": null,
     "tier": "warm",
     "time_state": "now"
    },
    "group": "talk",
-   "id": "spore:spore-003",
+   "id": "intention:intention-003",
    "provenance": null,
    "text_hidden": false,
    "title": "talk about the water",
@@ -1141,17 +1141,17 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-001",
-      "row_version": "a6b5b1ce8c837458"
+      "row_id": "intention:intention-001",
+      "row_version": "b7fdfa7dc0865970"
      },
      "tier": "C1",
-     "verb": "spore_touch"
+     "verb": "intention_touch"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "composted",
        "done",
        "dropped"
@@ -1159,22 +1159,22 @@
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-001",
-      "row_version": "a6b5b1ce8c837458"
+      "row_id": "intention:intention-001",
+      "row_version": "b7fdfa7dc0865970"
      },
      "tier": "C1",
-     "verb": "spore_descend"
+     "verb": "intention_close"
     },
     {
      "escalates": [],
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-001",
-      "row_version": "a6b5b1ce8c837458"
+      "row_id": "intention:intention-001",
+      "row_version": "b7fdfa7dc0865970"
      },
      "tier": "C1",
-     "verb": "spore_surface_at"
+     "verb": "intention_surface_at"
     },
     {
      "escalates": [
@@ -1203,50 +1203,50 @@
      "gesture": "direct",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-001",
-      "row_version": "a6b5b1ce8c837458"
+      "row_id": "intention:intention-001",
+      "row_version": "b7fdfa7dc0865970"
      },
      "tier": "C1",
-     "verb": "spore_update"
+     "verb": "intention_update"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-001",
-      "row_version": "a6b5b1ce8c837458"
+      "row_id": "intention:intention-001",
+      "row_version": "b7fdfa7dc0865970"
      },
      "tier": "T2",
-     "verb": "spore_retarget"
+     "verb": "intention_retarget"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-001",
-      "row_version": "a6b5b1ce8c837458"
+      "row_id": "intention:intention-001",
+      "row_version": "b7fdfa7dc0865970"
      },
      "tier": "T2",
-     "verb": "spore_set_disposition"
+     "verb": "intention_set_disposition"
     },
     {
      "escalates": [],
      "gesture": "direct-reported",
      "options": {
-      "spore_kind": [
+      "intention_kind": [
        "project",
        "thread"
       ]
      },
      "target": {
       "panel_id": "tray",
-      "row_id": "spore:spore-001",
-      "row_version": "a6b5b1ce8c837458"
+      "row_id": "intention:intention-001",
+      "row_version": "b7fdfa7dc0865970"
      },
      "tier": "T2",
-     "verb": "spore_ascend"
+     "verb": "intention_promote"
     }
    ],
    "badges": [
@@ -1266,17 +1266,17 @@
     "due": null,
     "fires": null,
     "handoff_expired": false,
+    "intention_type": "task",
     "last_seen": "2026-11-08",
     "overdue": false,
     "salience": 0,
-    "spore_type": "task",
-    "surface": "spore",
+    "surface": "intention",
     "target": null,
     "tier": "warm",
     "time_state": "someday"
    },
    "group": "someday",
-   "id": "spore:spore-001",
+   "id": "intention:intention-001",
    "provenance": null,
    "text_hidden": false,
    "title": "a plain seed",
@@ -1303,14 +1303,14 @@
  "value": null,
  "view_rows": {
   "age": [
-   "spore:spore-002",
-   "spore:spore-007",
-   "spore:spore-004",
-   "spore:spore-003",
-   "spore:spore-005",
+   "intention:intention-002",
+   "intention:intention-007",
+   "intention:intention-004",
+   "intention:intention-003",
+   "intention:intention-005",
    "band:q-0001",
-   "spore:spore-001",
-   "spore:spore-006",
+   "intention:intention-001",
+   "intention:intention-006",
    "board:levain:a",
    "board:levain:b"
   ]
@@ -1318,7 +1318,7 @@
  "views": [
   {
    "id": "age",
-   "order": "spore.age",
+   "order": "intention.age",
    "title": "By age"
   }
  ],
