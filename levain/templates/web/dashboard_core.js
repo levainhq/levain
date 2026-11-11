@@ -1925,16 +1925,37 @@
     codeSpansInto(n, String(text != null ? text : ""));
     return n;
   }
-  function appendClause(row, text) {
+  // A date (2026-10-15) inside already-drawn inline nodes never breaks at its hyphens: each one in a text node becomes a nowrap span. Code spans
+  // are left as written.
+  function nowrapDates(node) {
+    for (const c of Array.from(node.childNodes)) {
+      if (c.nodeType === 3) {
+        const parts = c.nodeValue.split(/(\b\d{4}-\d{2}-\d{2}\b)/);
+        if (parts.length < 2) continue;
+        const f = document.createDocumentFragment();
+        parts.forEach((p, i) => { if (i % 2) f.appendChild(el("span", "nowrap", p)); else if (p) f.appendChild(document.createTextNode(p)); });
+        node.replaceChild(f, c);
+      } else if (c.nodeType === 1 && c.tagName !== "CODE") nowrapDates(c);
+    }
+  }
+  // `md` draws the whole text through the inline markdown renderer (a count list's provider rows: bold, italic, code, links), where the
+  // default opens only code spans; such a row also clamps to two lines collapsed (a headline), the caret opening the rest.
+  function appendClause(row, text, md) {
     // .clampable is what the CSS clamps + measureClauses targets — bare .clause (crystals,
     // wrap/edit labels) stays full so it never clamps without this expand affordance.
     const clause = el("span", "clause clampable");
-    // a date (2026-10-15) never breaks at its hyphens: each one is a nowrap span, the text around it plain text
-    const parts = String(text != null ? text : "").split(/(\b\d{4}-\d{2}-\d{2}\b)/);   // nullish text draws an empty clause, as el() does
-    parts.forEach((part, i) => {
-      if (i % 2) clause.appendChild(el("span", "nowrap", part));
-      else if (part) codeSpansInto(clause, part);
-    });
+    if (md) {
+      mdInline(String(text != null ? text : ""), clause, 0);
+      nowrapDates(clause);
+      row.classList.add("md-row");
+    } else {
+      // a date (2026-10-15) never breaks at its hyphens: each one is a nowrap span, the text around it plain text
+      const parts = String(text != null ? text : "").split(/(\b\d{4}-\d{2}-\d{2}\b)/);   // nullish text draws an empty clause, as el() does
+      parts.forEach((part, i) => {
+        if (i % 2) clause.appendChild(el("span", "nowrap", part));
+        else if (part) codeSpansInto(clause, part);
+      });
+    }
     row.appendChild(clause);
     const toggle = el("button", "clause-toggle", "⌄");  // caret only; the action lives in aria-label
     toggle.type = "button";
@@ -9042,7 +9063,7 @@
         // the row's meta (badges, provenance, group) after the address line, never dropped
         if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
       }
-      appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
+      appendClause(row, o.text != null ? String(o.text) : "", o.md === true);  // per-item expand, like episodes
       if (typeof o.session === "string" && o.session) row.appendChild(sessionTxControl(o.session));
       if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));
       if (o.review) appendReviewVerb(row, o.review);

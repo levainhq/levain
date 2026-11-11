@@ -309,6 +309,7 @@
      newline-heavy value (a\nb\nc) collapses to one line, measures non-overflowing, and its
      structure is unreachable [codex L3 MED]. */
   .clause.clampable { white-space: pre-wrap; }
+  .row.md-row:not(.row-expanded) .clause.clampable { -webkit-line-clamp: 2; line-clamp: 2; }   /* a provider's markdown row is a two-line headline collapsed; the caret opens the whole */
   .row:not(.row-expanded) .clause.clampable { display: -webkit-box; -webkit-box-orient: vertical;
     -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }
   /* caret-only (no "more"/"less" word) — subtle but a comfortable tap target on mobile
@@ -2150,7 +2151,7 @@ body.ke .tray-dump:not(.text-editor):not(.action-bare):has(.tray-dump-ta:not(:pl
   body.ke .ck-widgets > .ck-card.w[data-last] { grid-column: 1 / -1; }
   body.ke .ck-widgets .wbody, body.ke .ck-widgets .w .xbody, body.ke .ck-widgets .w .dots { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
   body.ke .ck-widgets > .ck-card.w { padding-right: var(--sp-6); }
-  body.ke .ck-widgets .w .sub { white-space: normal; }
+  body.ke .ck-widgets .w .sub { white-space: normal; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow-wrap: anywhere; }   /* a tile line is at most three lines: the count's own word, never the list behind it */
   body.ke .ck-widgets .w .row { flex-wrap: wrap; white-space: normal; }
   body.ke .ck-widgets .w .big, body.ke .ck-widgets[data-shape="tiles"] .w .big { font-size: 28px; }
   body.ke .ck-widgets .w .bigrow { flex-wrap: wrap; row-gap: 0; }   /* a wide figure keeps its unit: the unit drops under it instead of being cut */
