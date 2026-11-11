@@ -10115,13 +10115,17 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   // A `needs` link with an `item`: wait (bounded, given up when the reader touches the page) for the Decisions lines to be read, then
   // scroll to the card and open its focus view; an id that is not among the waiting items falls back to the plain Needs view with a
   // one-line notice. Without a read by the deadline it falls back the same way.
+  // The first board draws in parts (S4) and the whole draw then replaces every node: a jump made on a part would land where the rest of the
+  // page pushes it from. The boot sets html[data-board-whole] when (and only when) the whole board is drawn, so a jump waits for that, and at
+  // its deadline falls back to the target as the page has it (a slow board still gets its jump, a dead link is worse than a mispositioned one).
+  function boardWhole() { return !!document.documentElement && typeof document.documentElement.hasAttribute === "function" && document.documentElement.hasAttribute("data-board-whole"); }
   function needsItemJump(item, run, deadline) {
     if (run !== phoneJumpRun) return;
     const dec = ((currentView && currentView.extra_panels || {}).decisions || {});
     const lines = dec.lines;
     // an EMPTY listing is an answer only when the panel says so itself: `clean` (a whole read, status ok or empty, nothing skipped or
     // filtered) with no error or note. Any other empty one (unread, short, partial) is not (the next read may hold the item): keep waiting
-    const whole = Array.isArray(lines) && (lines.length > 0 || (dec.clean === true && !dec.error && !dec.note));
+    const whole = boardWhole() && Array.isArray(lines) && (lines.length > 0 || (dec.clean === true && !dec.error && !dec.note));
     if (whole) {
       const it = needsWaiting(needsItems(lines)).find((x) => needsItemMatch(x, item));
       if (it) {
@@ -10188,7 +10192,8 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   // nothing waiting the page stays where it opened.
   function needsDeepJump(run, deadline) {
     if (run !== phoneJumpRun) return;
-    if (document.querySelector(PHONE_JUMP_TARGET.needs)) { phoneJump("needs", null); return; }
+    const there = !!document.querySelector(PHONE_JUMP_TARGET.needs);
+    if (there && (boardWhole() || Date.now() >= deadline)) { phoneJump("needs", null); return; }
     if (Date.now() < deadline) window.setTimeout(() => needsDeepJump(run, deadline), PHONE_JUMP_STEP_MS);
   }
 
