@@ -270,6 +270,11 @@
   let focusAsk = null;
   // the ask names a DOM dataset value (always a string) and the tile model names its panel by e.id (a string or a number): both sides compare as strings
   function askTileFocus(id) { focusAsk = id ? { id: String(id), until: Date.now() + 3000 } : null; }
+  // the reader's own press or key is an answer to where focus should be: a pending ask is dropped on it (capture phase, so a handler that
+  // the same input runs, such as Esc closing a focus view, still arms its own ask after this one has cleared). Added once, at load.
+  if (typeof document !== "undefined" && document && typeof document.addEventListener === "function") {
+    for (const t of ["pointerdown", "keydown"]) document.addEventListener(t, () => { focusAsk = null; }, true);
+  }
   function giveTileFocus(node, id) {
     if (!focusAsk || focusAsk.id !== String(id)) return;
     if (Date.now() > focusAsk.until || (document.activeElement && document.activeElement !== document.body)) { focusAsk = null; return; }
@@ -10116,8 +10121,9 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   // scroll to the card and open its focus view; an id that is not among the waiting items falls back to the plain Needs view with a
   // one-line notice. Without a read by the deadline it falls back the same way.
   // The first board draws in parts (S4) and the whole draw then replaces every node: a jump made on a part would land where the rest of the
-  // page pushes it from. The boot sets html[data-board-whole] when the whole board is drawn, or when no whole draw is coming (a failed or refused
-  // read), and never on a partial draw, so a jump waits for that, and at its deadline falls back to the target as the page has it (a slow board still gets its jump, a dead link is worse than a mispositioned one).
+  // page pushes it from. The boot sets html[data-board-whole] when the whole board is drawn, or when no whole draw is coming soon (a refused
+  // read, a failed one with no part drawn, or a failure after a part once the retry backoff has reached its last step; while a retry is queued
+  // after a part the signal stays unset and the part inert), and never on a partial draw, so a jump waits for that, and at its deadline falls back to the target as the page has it (a slow board still gets its jump, a dead link is worse than a mispositioned one).
   function boardWhole() { return !!document.documentElement && typeof document.documentElement.hasAttribute === "function" && document.documentElement.hasAttribute("data-board-whole"); }
   function needsItemJump(item, run, deadline) {
     if (run !== phoneJumpRun) return;

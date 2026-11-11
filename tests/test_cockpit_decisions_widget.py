@@ -66,6 +66,33 @@ def test_an_empty_decisions_tile_says_so_plainly_and_opens_and_closes(tmp_path: 
 
 
 @needs_browser
+def test_a_pending_focus_ask_is_dropped_by_the_readers_own_input_and_a_close_still_arms_its_own(tmp_path: Path) -> None:
+    """Esc closing a focus view over a tile that is present but not openable yet arms an ask: the tile takes focus once it is openable (here
+    the redraw that follows), only while focus is still on the page body. The reader's own press or key in between answers where focus should
+    be, so the ask is dropped (it used to take focus back from the page body they had just pressed). Controls: with no input in between the
+    successor gets focus (so the Esc's own keydown, which the capture listener sees first, does not cancel the ask it then arms), and a plain
+    redraw over a focused tile gives it back."""
+    # focus the open tile, redraw it, look 600 ms later: the successor of a redraw is openable at once, so the ask is given as soon as it is armed
+    plain = (f"(async () => {{ {TILE}.focus(); if (document.activeElement !== {TILE}) return 'tile did not take focus'; LevainDashboard.redraw(); "
+             f"await new Promise(r => setTimeout(r, 600)); return document.activeElement === {TILE}; }})()")
+
+    def closed_over_an_unopenable_tile(between: str) -> str:   # open the view, put a non-openable stand-in under it, Esc, act, then redraw
+        return (f"(async () => {{ {TILE}.click(); const t = {TILE}; const c = t.cloneNode(true); c.classList.remove('w-open'); t.replaceWith(c); {ESC}; "
+                f"if (document.getElementById('levain-modal')) return 'modal did not close'; {between}; LevainDashboard.redraw(); "
+                f"await new Promise(r => setTimeout(r, 600)); return document.activeElement === {TILE}; }})()")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": f"{TILE} && {TILE}.classList.contains('w-open')"},
+            {"eval": plain},
+            {"eval": closed_over_an_unopenable_tile("0")},
+            {"eval": closed_over_an_unopenable_tile("document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))")},
+            {"eval": closed_over_an_unopenable_tile("document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }))")},
+        ])["values"]
+    assert out[1:] == [True, True, False, False], out
+
+
+@needs_browser
 def test_the_tile_counts_the_rows_and_the_modal_lists_them(tmp_path: Path) -> None:
     _root, src, _ids = _install(tmp_path)
     switch = time.monotonic() + 10.0      # the rows change under the page at this instant, the count unchanged
