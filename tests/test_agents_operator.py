@@ -135,7 +135,7 @@ def test_an_unattached_dream_is_reported_beside_a_record_made_by_another_role(st
 def test_a_revise_of_the_dream_to_a_newer_version_keeps_it_attached(store, monkeypatch):
     da.register_dream(store)
     real = da.dream_spec
-    monkeypatch.setattr(da, "dream_spec", lambda h, binding=None: {**real(h, binding), "stop_at": 3000})
+    monkeypatch.setattr(da, "dream_spec", lambda h, binding=None, **kw: {**real(h, binding, **kw), "stop_at": 3000})
     revised = da.register_dream(store, revise=True)
     assert revised.version == 2
     agent = view(store)
