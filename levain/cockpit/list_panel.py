@@ -48,6 +48,7 @@ from levain.cockpit.providers import (
 from levain.cockpit.registry import DONE_DAYS, opened_day, parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.dashboard import SubstrateSource
+from levain.intention_legacy import OLD_ID_PREFIX
 
 LIST_PANEL_ID = "tray"          # the wire id (a code name); the operator-facing title is "List"
 LIST_TITLE = "List"
@@ -141,6 +142,12 @@ def _wake_facets(day: date, today: date, surface: str, target: Any, disposition:
     return {"time_state": "later", "wake_day": wake_day, "wake_bucket": bucket,
             "wake_line": f"wakes {band_view.later_words(wake_day, today.isoformat())} \u2192 {_lands(surface, target, disposition)}"}
 
+def _other_spelling(sid: str) -> str:
+    """``sid`` with the other id prefix (an old-prefix id <-> ``intention-N``); an id of neither shape comes back unchanged."""
+    prefix, _, num = sid.partition("-")
+    old = OLD_ID_PREFIX.rstrip("-")
+    return f"{'intention' if prefix == old else old}-{num}" if prefix in (old, "intention") and num else sid
+
 
 def _event_facets(raw: dict[str, Any], today: date, steer: dict[str, dict[str, Any]], surface: str, target: Any,
                   disposition: str) -> tuple[dict[str, Any], bool]:
@@ -149,7 +156,8 @@ def _event_facets(raw: dict[str, Any], today: date, steer: dict[str, dict[str, A
     check-by day, and is NOW from then on."""
     anchor = intentions.event_anchor(raw)
     cb = parse_date(raw.get("check_by")) if intentions.valid_check_by(raw.get("check_by")) else None
-    first = steer.get(anchor or "", {})
+    # exact spelling first, then the other (an old-prefix id and ``intention-N`` name one intention, as anneal's own lookup reads them)
+    first = steer.get(anchor or "") or steer.get(_other_spelling(anchor or "")) or {}
     words = " ".join(str(first.get("text") or "").split())[:80] if first else ""
     facets: dict[str, Any] = {"on_event": raw.get("on_event"), "check_by": cb.isoformat() if cb else None,
                               "after": anchor, "after_text": words or None}
