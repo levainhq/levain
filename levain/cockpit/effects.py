@@ -867,9 +867,10 @@ def _ce_update(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, orig
 def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
                  version_of: Callable[..., str]) -> Effect:
     """The List's "who does it": set an agenda's germinate ``target``. A seed given a target becomes an agenda in the same
-    write, which needs a date (``surface_at``, or the one the row already holds). Only a value flow's germinate also accepts
+    write, which needs a date (``surface_at``, or the one the row already holds; a part that waits on an event needs none and
+    is refused one). Only a value flow's germinate also accepts
     is written (the two halves read one store)."""
-    from levain.intentions import check_steering, valid_next, valid_retarget
+    from levain.intentions import check_steering, is_event_agenda, valid_next, valid_retarget
 
     pre = _require_open(pre)
     stray = sorted(set(params) - {"target", "surface_at"})
@@ -893,6 +894,10 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
             raise ValueError("an agenda needs a date: a target cannot clear it (leave surface_at out to keep the date)")
         _no_date_on_event_agenda(pre, params["surface_at"])
         changes["next"] = _norm_date(params["surface_at"])
+    elif is_event_agenda(pre):
+        # a part that waits on an event has no date and must not get one (an event or a date, never both): handing it to someone
+        # else changes who acts when it wakes, and it keeps waiting on its event (germinate reads the target at the wake)
+        pass
     elif not valid_next(pre.get("next")):
         raise ValueError("an agenda needs a date: give surface_at with the target")
     attention = pre.get("attention")
