@@ -28,22 +28,30 @@
   // A FAILED first read (a radio still waking on foreground, a proxy hiccup) used to leave the cold "connecting…" line and an empty
   // board with nothing to try again until the next foreground: Phill 11-06 saw both phones sit there. Until a board has been drawn
   // once, a failure says so in the line and re-reads on a short backoff (and when the network returns); a refusal (token) is not retried.
-  let everDrawn = false, retryN = 0, retryT = 0, refusedStop = false;
+  // `everDrawn` is any draw (a part counts: it ends the cold placeholder and the partial draws); `wholeDrawn` is a WHOLE board, and it is what
+  // ends the retry: a read that fails after a part was drawn leaves the reader a part, so it is retried like a first read that drew nothing.
+  // What bounds the chain: one timer at a time (retryT), the backoff below (2, 4, 8, 15 s, then 30 s for as long as the server keeps failing,
+  // the same as before a part was ever drawn), and it ends at the first whole draw or a refusal; a persistently failing server is read once
+  // per 30 s, never in a tight loop.
+  let everDrawn = false, wholeDrawn = false, retryN = 0, retryT = 0, refusedStop = false;
   // a refusal travels as a typed property, never as message text (a connection-refused network error must still retry)
   function refusal(msg) { const e = new Error(msg); e.refused = true; return e; }
   const RETRY_MS = [2000, 4000, 8000, 15000, 30000];
-  function drawnOnce() { if (everDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; everDrawn = true; refusedStop = false; retryN = 0; clearTimeout(retryT); retryT = 0; }
+  function drawnOnce(whole) { if (wholeDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; everDrawn = true; if (whole === true) wholeDrawn = true; refusedStop = false; retryN = 0; clearTimeout(retryT); retryT = 0; }
   // WHOLE OR PART. The first board draws in parts (S4: the Needs strip and the core panels as they land), and the whole draw then REPLACES
   // every node, so anything a reader or a test did on a part would be lost under them. Two things keep that from mattering:
-  // - `html[data-board-whole]` is the positive "this board is the one that stays" signal. Only the code that has just drawn the whole board
-  //   (or a terminal failure / refusal, which draws none) sets it, and a partial draw clears it; absent is the default, so the page is not
-  //   ready from the first byte. A deep link's jump (dashboard_core.js) and the test driver wait for it.
+  // - `html[data-board-whole]` is the positive "nothing more is coming that would replace this board" signal. It is set by the code that has
+  //   just drawn the whole board, or that knows no whole draw is coming for this read (a failure or a refusal: the page is then left as it is,
+  //   live, and the retry below still runs); a partial draw clears it, and it is never set on a partial draw. Absent is the default, so the
+  //   page is not ready from the first byte. A deep link's jump (dashboard_core.js) and the test driver wait for it.
   // - while only a part is drawn the regions the draw replaces are `inert`, so nothing in them can be focused, clicked or opened; the whole
   //   draw replaces their children and drops `inert` in the same synchronous turn (dashboard.css dims them). The masthead and the nav (the
   //   tabs, the theme switch, Sync, a deep link's jump targets) are not in the list and stay live. The list is the page's own: #board holds
-  //   the zones, but the hero, the Needs strip, the drop, the notes, the brief and the widgets (the tiles) are its siblings, and those are
-  //   where a reader first acts (dashboard.html; renderKe in dashboard_core.js fills them).
-  const BOARD_REGIONS = ["ck-hero", "ck-needs", "ck-drop", "ck-notes", "ck-brief", "ck-widgets", "state", "board"];
+  //   the zones, but the hero, the Needs strip, the notes, the brief and the widgets (the tiles) are its siblings, and those are where a
+  //   reader first acts (dashboard.html; renderKe in dashboard_core.js fills them). The drop (#ck-drop) is NOT in the list: renderDropHero
+  //   builds its card once and refreshes it in place, so the whole draw never replaces it, and an inert drop would make a tap on the Drop
+  //   tab scroll without focusing the box (phoneJump focuses inside a frame callback, which is a no-op on an inert node).
+  const BOARD_REGIONS = ["ck-hero", "ck-needs", "ck-notes", "ck-brief", "ck-widgets", "state", "board"];
   function boardMark(whole) {
     try {
       for (const id of BOARD_REGIONS) {
@@ -55,7 +63,7 @@
     } catch (_) { /* a page without these nodes (the node harnesses) has no board to mark */ }
   }
   function retryUntilDrawn(why, refused) {
-    if (everDrawn) return;
+    if (wholeDrawn) return;
     // a refusal (the token the page holds is missing or wrong) is not a network blip: a retry would only ask again, and each ask can
     // put up the token prompt. Say it and stop; the next foreground or the Refresh button reads again.
     if (refused) {
@@ -68,13 +76,13 @@
     // a read already in flight (a foreground started one) would drop this retry and end the chain: wait and ask again instead
     retryT = setTimeout(function () {
       retryT = 0;
-      if (everDrawn || refusedStop) return;
+      if (wholeDrawn || refusedStop) return;
       if (inflight) { retryUntilDrawn(why); return; }
       load({ passive: true, auto: true });
     }, RETRY_MS[Math.min(retryN++, RETRY_MS.length - 1)]);
   }
   // (the node harnesses that load this file hand it a window with no event API)
-  if (typeof window.addEventListener === "function") window.addEventListener("online", function () { if (!everDrawn && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
+  if (typeof window.addEventListener === "function") window.addEventListener("online", function () { if (!wholeDrawn && !refusedStop && !inflight) { clearTimeout(retryT); retryT = 0; load({ passive: true, auto: true }); } });
   // A non-passive (save / boot) reload is AUTHORITATIVE — it must eventually render. If one
   // lands while a load is in flight, the shared `inflight` guard would drop it; latch it
   // here and re-fire when the current load settles, so a save's reload can't be swallowed by
@@ -1148,7 +1156,7 @@
     // rather than throwing an opaque TypeError after a successful fetch.
     if (!window.LevainDashboard || typeof window.LevainDashboard.render !== "function") {
       status("render core failed to load");
-      boardMark(true);     // nothing will ever draw: a driver or a deep link waiting on the whole board would only stall
+      boardMark(true);     // no whole draw is coming (the core is missing): a driver or a deep link waiting on the signal would only stall
       return false;
     }
     // Pre-fetch fast path: don't even fetch if we already know an edit is open.
@@ -1193,7 +1201,7 @@
         }
         status("read " + new Date().toLocaleTimeString());
         showNotice();
-        landed = true; drawnOnce();
+        landed = true; drawnOnce(true);
         return true;
       }
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
@@ -1218,7 +1226,7 @@
           dropToken();
           refusedStop = true;
           status("read refused — off-box token missing or invalid");
-          boardMark(true);     // terminal: no whole board is coming
+          boardMark(true);     // refused: no whole draw is coming for this read
           return false;
         }
       }
@@ -1242,12 +1250,12 @@
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       boardMark(true);
       status("read " + new Date().toLocaleTimeString());
-      landed = true; drawnOnce();
+      landed = true; drawnOnce(true);
       return true;
     } catch (e) {
       if (myGen !== loadGen) return false;     // a superseded read's failure says nothing about the page now
       status("read failed: " + (e && e.message ? e.message : e));
-      boardMark(true);     // terminal for this read: the board shown (a part, or none) is what stays until the next read
+      boardMark(true);     // failed: no whole draw is coming for this read, so the part (or nothing) is released as it is; the retry below reads again until a whole board is drawn
       retryUntilDrawn(e && e.message ? e.message : String(e || "read failed"), !!(e && e.refused));
       return false;
     } finally {
