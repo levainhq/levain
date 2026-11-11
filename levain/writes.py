@@ -2005,7 +2005,7 @@ def _apply_intention_seed(
         raise EditError(
             "bad_verb_arg", 422,
             f"a captured item's disposition must be a Tray value "
-            f"({list(TRAY_WRITE_DISPOSITIONS)}; got {disposition!r}) — a seed or an agenda, "
+            f"({list(TRAY_WRITE_DISPOSITIONS)}; got {disposition!r}) — a someday or an agenda, "
             f"never a plain cognition loop (those come from metabolize or the CLI)",
         )
 
@@ -2046,7 +2046,8 @@ def _apply_intention_set_disposition(
     scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
     """Re-route an OPEN intention across the operator-I/O classes (the AI's triage verb, AND the
-    Keep-note promote). ``disposition`` ∈ loop / seed / handoff / agenda / note: ``loop``
+    Keep-note promote). ``disposition`` ∈ loop / someday / agenda (a retired seed / handoff / note is
+    accepted only as an echo of the row's own value): ``loop``
     METABOLIZES an operator-I/O item into a cognition loop (clears the tag → key-free); a Tray
     value moves it within / into the Tray inbox; ``note`` routes it to durable Keep reference.
     An optional ``surface_at`` (``YYYY-MM-DD`` / null / '') rides the re-route atomically — the
@@ -2102,7 +2103,7 @@ def _apply_intention_set_disposition(
         raise EditError(
             "bad_verb_arg", 422,
             "a Keep note doesn't resurface on a schedule — promote it to the Tray "
-            "(disposition 'someday'/'seed'/'handoff'/'agenda') to set a reminder. Clearing surface_at on a "
+            "(disposition 'someday'/'agenda') to set a reminder. Clearing surface_at on a "
             "note is allowed.",
         )
     if disposition == "note":
