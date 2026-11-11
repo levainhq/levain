@@ -1633,6 +1633,20 @@ def _asset_digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:12]
 
 
+def _shell_version(versioned_page: bytes, worker_template: bytes) -> str:
+    """The service worker's version label: a digest of the cockpit page AS SERVED (every script and stylesheet the worker
+    precaches is named in it by its own content digest, so the page bytes cover the page and every asset beside it) and of
+    the worker's own source. Content only (no clock, no path, no order): the same shell and worker give the same label, a
+    one-byte change to any precached asset, the page or the worker gives another. Raises ValueError when the page names no
+    versioned shell asset (nothing would be covered by the digest)."""
+    if not re.search(rb"\?v=[0-9a-f]{12}[\"']", versioned_page):
+        raise ValueError("refusing to start: the cockpit page names no ?v=<digest> shell asset, so the worker's version "
+                         "would cover nothing")
+    return hashlib.sha256(
+        b"levain-shell\0" + hashlib.sha256(versioned_page).digest() + hashlib.sha256(worker_template).digest()
+    ).hexdigest()[:12]
+
+
 def _version_shell_page(page: str, digests: Mapping[str, str]) -> str:
     """``page`` with each ``<script src>`` and ``<link href>`` naming a path in ``digests`` (path -> digest) rewritten
     to ``<path>?v=<digest>``. A reference that already carries a query or fragment, or names another path, is left alone."""
@@ -1963,6 +1977,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     levain_source: SubstrateSource
     levain_assets: dict[str, bytes]
     levain_shell_digests: dict[str, str]   # path -> digest of the bytes served; a ?v= must equal it
+    levain_worker: bytes                   # the served /sw.js, its version derived from the shell (:func:`_shell_version`)
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
     read_gate: threading.BoundedSemaphore
@@ -3019,6 +3034,12 @@ class _Handler(GuardedHandler):
         record, behind :meth:`_sign_read_admitted`."""
         from levain.webpush import routes as push_routes
 
+        if not read and path == push_routes.WORKER_PATH:
+            # the worker is rendered once at make_server (its version derives from the shell); ``no-cache`` so the browser
+            # re-checks it by bytes on every update check, which is what makes a changed shell raise the reload bar
+            self._send(self.server.levain_worker, "text/javascript; charset=utf-8", status=200, head=head,
+                       cache_control="no-cache")
+            return
         if not read:
             # the app shell reads no queue: it is served with or without a Signer
             status, body, ctype = push_routes.handle("GET", path, {}, b"", queue_dir=Path("."), authorized=False,
@@ -6141,7 +6162,13 @@ def make_server(
     _shell_page = _version_shell_page(assets[_shell_file].decode("utf-8"), _shell_digests)
     _assert_shell_versioned(_shell_page, _shell_digests)
     assets[_shell_file] = _shell_page.encode("utf-8")
+    # The worker's version is derived here, once, from the same bytes: a changed shell cannot ship an unchanged /sw.js.
+    from levain.webpush import routes as _push_routes
+
+    _worker_template = _push_routes.worker_template()
+    _worker = _push_routes.render_worker(_worker_template, _shell_version(assets[_shell_file], _worker_template))
     httpd = _LevainHTTPServer((host, port), _Handler)
+    httpd.levain_worker = _worker
     httpd.watch_paths = watch_tuple
     httpd.levain_source = source
     httpd.levain_assets = assets

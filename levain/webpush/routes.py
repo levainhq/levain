@@ -31,6 +31,26 @@ _STATIC_FILES = {
     "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
 }
 STATIC_PATHS = frozenset(_STATIC_FILES)
+WORKER_PATH = "/sw.js"
+# The one line of the worker whose value the server derives (see :func:`render_worker`); the worker's source keeps this
+# placeholder, and a source that does not carry it exactly once is refused, never served.
+WORKER_VERSION_LINE = b"const SW_VERSION = '__LEVAIN_SHELL_VERSION__';"
+
+
+def worker_template() -> bytes:
+    """The worker's source as shipped (its version still the placeholder). Raises OSError when the file is missing."""
+    return (STATIC / _STATIC_FILES[WORKER_PATH][0]).read_bytes()
+
+
+def render_worker(template: bytes, version: str) -> bytes:
+    """``template`` with its version placeholder replaced by ``version`` (a short lowercase-hex label). Raises ValueError
+    unless the placeholder line appears exactly once, so a worker whose version could not be written is never served."""
+    if not re.fullmatch(r"[0-9a-f]{1,64}", version):
+        raise ValueError(f"refusing to start: the worker version {version!r} is not a hex label")
+    if template.count(WORKER_VERSION_LINE) != 1:
+        raise ValueError("refusing to start: the service worker source does not carry its version placeholder line "
+                         f"{WORKER_VERSION_LINE.decode()!r} exactly once")
+    return template.replace(WORKER_VERSION_LINE, WORKER_VERSION_LINE.replace(b"__LEVAIN_SHELL_VERSION__", version.encode("ascii")))
 MAX_BODY = 8192
 MAX_RECEIPT_BODY = 512
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -153,6 +173,8 @@ def handle(method: str, path: str, query: dict, body: bytes, *, queue_dir: Path 
            device_id: str | None, journal: Path | str | None = None) -> tuple[int, bytes, str] | None:
     """``journal``: the cockpit data root whose pairing journal holds ``device_id`` when it is a ``paired-`` device
     (the cockpit's caller), stored with its subscription and asked again inside the subscribe's write."""
+    if method == "GET" and path == WORKER_PATH:
+        return None   # the worker is the server's to render (its version is derived, :func:`render_worker`): never the raw source
     if method == "GET" and path in _STATIC_FILES:
         name, ctype = _STATIC_FILES[path]
         return 200, (STATIC / name).read_bytes(), ctype
