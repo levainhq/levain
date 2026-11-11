@@ -1,9 +1,11 @@
 """levain.dream.ready (D1-1c): the day-ready predicate (D1_EXECUTOR §4.2).
 
 ``evaluate`` answers ``ready``, ``quiet`` or ``unreadable`` for one dream-day and records ALL six checks, whatever the
-answer. It is fail-closed: a source that cannot be read is ``unreadable`` (never a pass), and ``unreadable`` is never a
-reason to launch. A definite ``quiet`` outranks an ``unreadable`` (the reason it names is a fact), and among several the
-lowest check number names the verdict; every check is still in ``checks``.
+answer. Every source that gates is fail-closed: one that cannot be read is ``unreadable`` (never a pass), and
+``unreadable`` is never a reason to launch. Check 5's seat telemetry is the one source that does not gate: it is read
+fail-open, and what it could not read is named in its detail. A definite ``quiet`` outranks an ``unreadable`` (the
+reason it names is a fact), and among several the lowest check number names the verdict; every check is still in
+``checks``.
 
 The predicate reads sources through zero-argument callables (:class:`Sources`), so a test (or the controller) injects
 exactly what it means each source to say: a callable that raises means that source was UNREADABLE. :func:`sources_for`
@@ -23,7 +25,8 @@ The six checks, each mapped from flow's ``dream.py`` ``gate``:
    work thread in ``awake.json``, another session in anneal's session registry, which a hooked Claude Code session
    heartbeats into) and names what it found in its detail, so ``levain dream ready`` and the card can say who was
    live; it always passes, and a source it could not read is named in the detail, not turned into a refusal (nothing
-   in the verdict rests on this list any more). A manual run is no different
+   in the verdict rests on this list any more). When seats are live it also reads the baton policy, to name a store
+   without it (an unreadable policy is named the same way). A manual run is no different
 6. the window's one scheduled attempt is not already spent (a launched run that failed or was stopped). Waived for a
    manual run: the catch-up is the remedy for exactly that failure, and check 1's ceiling bounds it
 
@@ -322,8 +325,8 @@ def _check5(src: Sources) -> Check:
                              "while the dream's wrap is open by that open wrap (and `levain wrap` by wrap.lock) either "
                              "way, and the policy would add only a downgrade for a writer under another session id "
                              "than this install's; `levain init` creates a new store with it")
-        except SourceUnreadable:
-            pass                                          # check 2 reads the same source and answers for it
+        except SourceUnreadable as exc:
+            bad.append(f"the baton policy could not be read ({str(exc)[:120]})")
     elif bad:
         parts.append("no live seat found in the sources that could be read")
     else:
