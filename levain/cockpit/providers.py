@@ -61,7 +61,7 @@ EPISODE_LIMIT = 50
 HANDOFF_FRESH_DAYS = 7
 
 # the verbs an intention panel offers (design §4.2); anneal still refuses a verb the intention's type forbids
-INTENTION_ROW_VERBS = ("intention_touch", "intention_close", "intention_surface_at", "intention_update", "intention_retarget",
+INTENTION_ROW_VERBS = ("intention_touch", "intention_close", "intention_surface_at", "intention_update", "intention_retarget", "intention_then",
                    "intention_set_disposition", "intention_promote")
 INTENTION_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen",
                 "origin_key", "target", "attention", "germinated")

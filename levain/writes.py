@@ -740,6 +740,8 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_intention_surface_at(scope, req, now, guard)
         if kind == "intention_update":
             return _apply_intention_update(scope, req, now, guard)
+        if kind == "intention_then":
+            return _apply_intention_then(scope, req, now, guard)
         if kind == "intention_retarget":
             # a target wakes an agent with the intention's words: it is signed through the cockpit broker's effect, as a
             # capture that carries one is (``_apply_intention_seed``); this write never takes it on a bearer token
@@ -1950,7 +1952,74 @@ def _apply_intention_verb(
         scope.ledger_root, kind=_AUDIT_KINDS[verb], action=verb,
         target=f"intention:{intention_id}", now=now, extra=extra,
     )
-    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": verb}
+    out = {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": verb}
+    if verb == "descend":
+        out.update(_wake_after_resolve(scope, intention_id))
+    return out
+
+
+def _wake_after_resolve(scope: WriteScope, intention_id: str) -> dict[str, Any]:
+    """The second parts of a split that wait on ``intention_id`` wake now, not at the next germinate run. The resolve has already
+    committed, so a failure here never fails it: it is reported (``wake_error``), and the next germinate run wakes the same
+    rows (the wake reads the first part's own resolution). ``woke`` names the ids woken."""
+    from levain import split
+    from levain.consent.queue import default_queue_dir
+
+    try:
+        qs = scope.questions
+        woke = split.wake_after(scope.anneal.intentions_json, intention_id,
+                                queue_dir=qs.directory if qs is not None else default_queue_dir())
+    except Exception as exc:  # noqa: BLE001 - the resolve stands; the next germinate run converges
+        warnings.warn(f"waking what waits on {intention_id} failed ({exc}); the resolve stands and the next germinate run "
+                      "wakes the same rows", RuntimeWarning, stacklevel=2)
+        return {"wake_error": f"{type(exc).__name__}: {exc}"}
+    return {"woke": woke} if woke else {}
+
+
+def _apply_intention_then(
+    scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None,
+) -> dict[str, Any]:
+    """``intention_then`` (the List's "then you", row 178 build 2): files the SECOND part of a split, a new band agenda that wakes
+    when this item is done (``levain.split.create_then``). One act, safe to run again: the new row's key is derived from this
+    item and the words, so a retry lands it once (``replay`` says so). The item itself is not written; the operator's
+    row version still binds the write, so a row that moved since it was read is refused as stale, ahead of anything written."""
+    from anneal_memory.spores import IntentionError
+
+    from levain import split
+
+    intention_id = _require_str(req, "intention_id")
+    paths = scope.anneal
+    if not paths.intentions_json.is_file():
+        raise EditError("not_found", 404, "no intention store yet: the entity has no open loops")
+    store = guarded_intention_store(paths.intentions_json)
+    intention = store.get(intention_id)
+    if not isinstance(intention, dict) or intention.get("status") == "resolved":
+        raise EditError("stale", 409, "the item was resolved or removed since it was read")
+    _client_snapshot(req, intention, intention_id)
+    if guard is not None and guard.expected is not None:
+        try:
+            guard.version_of(intention)
+        except IntentionError as exc:
+            raise _intention_refusal(guard, exc, store, intention_id) from exc
+        if guard.found != guard.expected:
+            raise EditError("stale", 409, "the item changed since it was read; re-read it and retry")
+    text = req.get("text")
+    if isinstance(text, str) and len(text.encode("utf-8")) > MAX_INTENTION_TEXT_BYTES:
+        raise EditError("too_large", 413, f"intention text exceeds the {MAX_INTENTION_TEXT_BYTES}-byte cap")
+    check_by = req.get("check_by")
+    if check_by is not None and not isinstance(check_by, str):
+        raise EditError("bad_verb_arg", 422, "check_by must be a day, YYYY-MM-DD")
+    try:
+        made = split.create_then(paths.intentions_json, intention_id, text if isinstance(text, str) else "", check_by=check_by)
+    except split.ThenRefused as exc:
+        raise EditError(exc.code, exc.status, str(exc)) from exc
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
+    edit_id = _audit_verb(
+        scope.ledger_root, kind="intention_then", action="then", target=f"intention:{intention_id}", now=now,
+        extra={"then_id": made["intention_id"], "on_event": made["event"], "check_by": made["check_by"]},
+    )
+    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": "then", **made}
 
 
 # the episode a Keep writes: its source label (never caller-chosen) and its tag

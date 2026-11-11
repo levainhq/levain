@@ -48,6 +48,8 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
+from levain.intention_legacy import OLD_ID_PREFIX
+
 __all__ = [
     "LOOP_DISPOSITION",
     "TRAY_DISPOSITIONS",
@@ -81,6 +83,14 @@ __all__ = [
     "valid_target",
     "valid_retarget",
     "executor_of",
+    "EVENT_DONE_PREFIX",
+    "DEFAULT_CHECK_BY_DAYS",
+    "COMPLETION_KINDS",
+    "done_event",
+    "event_anchor",
+    "valid_check_by",
+    "is_event_agenda",
+    "finished_by_completion",
 ]
 
 LOOP_DISPOSITION = "loop"
@@ -338,6 +348,56 @@ def executor_of(target: Any) -> str | None:
     if not valid_target(target):
         return None
     return "operator" if target in ("band", "nudge") else "machine"
+
+
+# --- the split (row 178 build 2): an agenda that waits on another intention's completion, not on a date -----------------
+EVENT_DONE_PREFIX = "done:"
+DEFAULT_CHECK_BY_DAYS = 7
+# the descend kinds that mean the work FINISHED (anneal's per-type kinds); composted and dropped mean it did not, so
+# they never wake a part that waits on completion
+COMPLETION_KINDS = ("done", "answered", "explored")
+_EVENT_DONE = re.compile(rf"done:((?:{re.escape(OLD_ID_PREFIX)}|intention-)[0-9A-Za-z_-]{{1,56}})")   # old ids live in existing stores
+_CHECK_BY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def done_event(intention_id: str) -> str:
+    """The event key that names ``intention_id`` finishing."""
+    return EVENT_DONE_PREFIX + intention_id
+
+
+def event_anchor(item: Mapping[str, Any]) -> str | None:
+    """The intention id a ``done:<id>`` ``on_event`` waits on, else None (no event, or a kind this build does not wake)."""
+    raw = item.get("on_event")
+    m = _EVENT_DONE.fullmatch(raw) if isinstance(raw, str) else None
+    return m.group(1) if m else None
+
+
+def valid_check_by(value: Any) -> bool:
+    """The strict write shape for ``check_by``: a real calendar day, ``YYYY-MM-DD``."""
+    if not isinstance(value, str) or _CHECK_BY.fullmatch(value) is None:
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def is_event_agenda(item: Mapping[str, Any]) -> bool:
+    """An open agenda that waits on an event (any ``on_event``, a kind this build wakes or not) and has not germinated: it
+    wakes on its event, never on a date, and rings at its ``check_by`` so nothing waits silently."""
+    d = item.get("disposition")
+    return (isinstance(d, str) and d.strip().casefold() == "agenda" and bool(item.get("on_event"))
+            and not item.get("germinated") and item.get("status", "open") == "open")
+
+
+def finished_by_completion(intention: Mapping[str, Any] | None) -> bool:
+    """True when ``intention`` was resolved DOWNWARD with a completion kind (the thing it names finished). A missing intention, an
+    open one, an ascend and a composted or dropped one are not."""
+    if not isinstance(intention, Mapping) or intention.get("status") != "resolved":
+        return False
+    res = intention.get("resolution")
+    return (isinstance(res, Mapping) and res.get("direction") == "descend" and res.get("kind") in COMPLETION_KINDS)
 
 
 def is_talk_seed(item: Mapping[str, Any]) -> bool:
