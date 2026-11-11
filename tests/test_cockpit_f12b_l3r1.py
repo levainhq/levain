@@ -72,18 +72,25 @@ def test_a_topology_provider_faulted_at_load_is_said_in_the_sessions_card_in_eit
 
 
 @needs_browser
-def test_a_waiting_task_with_no_card_is_a_record_and_the_header_agrees_with_the_left_column(tmp_path, monkeypatch):
+def test_a_waiting_task_with_no_card_is_counted_and_only_a_card_can_be_jumped_to(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     v = _value()
     v["tasks"] = [t for t in v["tasks"] if t["id"] not in ("t-wait",)]
     for t in v["tasks"]:
         if t["id"] == "t-sign":
             t["card"] = None                                                                                          # the real provider: a contract waiting on a signature has no card
-    probe = ("JSON.stringify({recs: [...%s.querySelectorAll('.tv-rec')].map(r => [r.dataset.rec, r.classList.contains('tv-open')]), "
-             "none: !!%s.querySelector('.tv-wl .tv-none'), hdr: %s.querySelector('[data-k=waiting]').textContent.replace(/\\s+/g, ' ')})") % ((TV,) * 3)
+    probe = ("JSON.stringify({recs: %s.querySelectorAll('.tv-rec, .tv-wl').length, jump: [...%s.querySelectorAll('.tv-jump')].map(b => b.dataset.k), "
+             "hdr: %s.querySelector('[data-k=waiting]').textContent.replace(/\\s+/g, ' ')})") % ((TV,) * 3)
+    out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe},
+                               {"eval": TV + ".querySelector('.tv-jump').click(); window.__opened"}])
+    got = json.loads(out[-2])
+    assert got["hdr"] == "1 waiting on you" and got["recs"] == 0, got                                                    # counted, never listed
+    assert got["jump"] == ["waiting"] and out[-1] == "consent:abc", out                                                  # the waiting session still carries its card: the count goes there
+    for nd in v["nodes"]:
+        nd["card"] = None                                                                                                # no card anywhere: the figure is counted but there is nowhere to jump
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])
     got = json.loads(out[-1])
-    assert got["hdr"] == "1 waiting on you" and got["recs"] == [["t-sign", False]] and got["none"] is False, got       # a record, but only a card can be clicked
+    assert got["hdr"] == "1 waiting on you" and got["jump"] == [] and got["recs"] == 0, got
 
 
 # --- codex MED + glm LOW + complement 7: one ResizeObserver --------------------------------------------------
@@ -192,9 +199,10 @@ def test_a_worker_id_that_is_an_object_property_name_is_not_a_node(tmp_path, mon
 
 
 @needs_browser
-def test_stacked_the_records_column_leaves_no_blank_gap_before_the_task_heading(tmp_path, monkeypatch):
+def test_stacked_no_blank_gap_leads_the_task_heading(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     v = _value()
-    probe = ("JSON.stringify({gap: Math.round(%s.querySelector('.tv-colh1').getBoundingClientRect().top - %s.querySelector('.tv-wl').getBoundingClientRect().bottom)})") % (TV, TV)
+    # the records column is gone: the task heading is the first thing in the lens body, so the gap is its distance from the body's top
+    probe = ("JSON.stringify({gap: Math.round(%s.querySelector('.tv-colh1').getBoundingClientRect().top - %s.querySelector('.tv-lensbody').getBoundingClientRect().top)})") % (TV, TV)
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}], first=NARROW)
     assert json.loads(out[-1])["gap"] < 40, out
