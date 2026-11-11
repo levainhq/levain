@@ -7,8 +7,10 @@
 const DB = 'levain-sw-2', STORE = 'opened';
 // A short id of this worker's shell, recorded in the trace so a device's trace says which worker ran. The literal below is a
 // PLACEHOLDER: the server writes a digest of the cockpit page it serves (the page names every precached asset by its own
-// content digest) and of this file's text into it when it starts (levain/web_server.py make_server), so a changed shell
-// always changes this file's bytes. Never hand-edit it; a server that cannot replace it refuses to start.
+// content digest), of the other assets the server serves for the shell (the mic worklet, which the page loads by a
+// script call rather than names) and of this file's text into it when it starts (levain/web_server.py make_server), so
+// by construction of that digest this file's bytes change whenever the page or any of those assets does. Never hand-edit
+// it; a server that cannot replace it refuses to start.
 const SW_VERSION = '__LEVAIN_SHELL_VERSION__';
 // The TRACE: an append-only ring in its own cache, one entry per step, key TRACE_PREFIX + <time ms, zero padded> + '-' +
 // <seq>, value JSON {t, src, step, ...detail}. The /tap_trace page and sw_open.js read and write the same ring. Writes are
@@ -278,7 +280,9 @@ function dropOldDatabase() {
 }
 
 // A new worker whose install could not fetch '/' would otherwise delete the last good shell and leave nothing for an
-// outage: before the old caches go, the newest older shell's copy is carried into the current cache when that is empty.
+// outage: before the old caches go, an older shell's copy is carried into the current cache when that is empty. Current labels
+// are content digests, so there is no "newest": candidates are tried in an arbitrary but fixed order and the first that
+// passes the gate below is carried.
 // Every mutation of the shell cache (commit with its snapshot/write/rollback/prune, the activation carry, the runtime
 // write-through) runs through this ONE chain, so no two ever interleave. Network fetches and validation stay outside it;
 // only cache reads of existing state and the writes run inside. A rejected task is observed by its caller and never poisons
@@ -289,9 +293,11 @@ function serial(fn) {
   shellChain = run.then(() => {}, () => {});
   return run;
 }
-// Cache names carry a version label ('0.11.10', '1105-pwaab-1'): compared run by run, digit runs as NUMBERS (so 0.11.10 is
-// newer than 0.11.9), other runs as text. A digit run outranks a text run at the same place, so a label with no digits at all
-// (malformed) sorts below every numbered one and is then ordered as plain text. Never throws.
+// Cache names carry a version label. Workers before 1111-20 wrote hand-set labels ('0.11.10', '1105-pwaab-1'), which this
+// orders run by run, digit runs as NUMBERS (so 0.11.10 sorts above 0.11.9), other runs as text; a worker since 1111-20 writes
+// a 12-hex content digest, which has no age, so among digests the order is arbitrary (a fixed total order, nothing more).
+// A digit run outranks a text run at the same place, so a label with no digits at all sorts below every numbered one and is
+// then ordered as plain text. Never throws.
 function versionRuns(v) { return String(v).match(/\d+|\D+/g) || []; }
 function compareVersions(a, b) {
   const x = versionRuns(a), y = versionRuns(b);
@@ -314,16 +320,19 @@ async function carryShellForwardNow() {
     const page = await from.match(SHELL_KEY);
     if (!page) continue;
     // Only the old '/' and exactly the assets it names, each held to the same gate as a fresh write. An old generation
-    // that fails it (a missing or query-mismatched asset, an HTML body under a script key) carries NOTHING: the app falls
-    // to the network, honest, rather than a half shell. Everything else in the old cache is dropped with it.
-    if (!shellCacheable(page)) { drain(page); return; }   // headers only; the body stays unread for the clone below
+    // that fails it (a missing or query-mismatched asset, an HTML body under a script key) is skipped whole, never half
+    // carried, and the next candidate is tried; when none passes nothing is carried and the app falls to the network,
+    // honest, rather than a half shell. Everything else in the old cache is dropped with it.
+    if (!shellCacheable(page)) { drain(page); continue; }   // headers only; the body stays unread for the clone below
     const html = await page.clone().text();
     const staged = [];
+    let whole = true;
     for (const a of shellAssets(html)) {
       const hit = await from.match(a.key);
-      if (!assetOk(hit, a.kind)) { drain(hit); drain(page); return; }
+      if (!assetOk(hit, a.kind)) { drain(hit); drain(page); whole = false; break; }
       staged.push([a.key, new Response(await hit.arrayBuffer(), { status: 200, headers: { 'content-type': hit.headers.get('content-type') } })]);
     }
+    if (!whole) continue;
     const to = await caches.open(SHELL_CACHE);
     for (const [k, r] of staged) await to.put(k, r);
     await to.put(SHELL_KEY, page);
