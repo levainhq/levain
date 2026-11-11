@@ -471,7 +471,9 @@ def test_a_filter_that_is_stopped_kills_the_repo_command_and_denies(tmp_path, si
     import signal
     import time
     marker = tmp_path / "late"
-    root = os.path.dirname(os.path.dirname(os.path.abspath(hook_run.__file__)))
+    # the child imports the very package this test imported: the import root is the directory holding the `levain`
+    # package (slot/ -> levain/ -> its parent), never the cwd and never an installed copy
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(hook_run.__file__))))
     code = ("import io,sys; sys.path.insert(0, %r); from levain.slot import hook_run as H; "
             "sys.exit(H.repo_filter('f', ['PreToolUse', '30', sys.argv[1]], stdin=io.BytesIO(b'{}')))" % root)
     ready = tmp_path / "ready"
