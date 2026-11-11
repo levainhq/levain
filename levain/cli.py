@@ -1469,8 +1469,8 @@ def build_parser() -> argparse.ArgumentParser:
     km_mode.add_argument("--apply", type=Path, default=None, metavar="PLAN", help="Apply this plan.")
     km_mode.add_argument("--revert", type=Path, default=None, metavar="PLAN", help="Revert this plan.")
     km_p.add_argument(
-        "--handoff-to", choices=("seed", "agenda"), default=None, dest="handoff_to",
-        help="Dry run only: where handoffs go (default: seed). agenda needs --agenda-date.",
+        "--handoff-to", type=_handoff_to, choices=("someday", "agenda"), default=None, dest="handoff_to",
+        help="Dry run only: where handoffs go (default: someday). agenda needs --agenda-date.",
     )
     km_p.add_argument(
         "--agenda-date", default=None, dest="agenda_date", metavar="D",
@@ -2162,6 +2162,17 @@ def _refuse_retired_spores(rest: list[str], verbs: tuple[str, ...]) -> int:
     return 2
 
 
+def _handoff_to(value: str) -> str:
+    """``--handoff-to`` value: the retired ``seed`` is refused with the word that replaced it (ruling D5)."""
+    from levain.intention_legacy import OLD_DISPOSITION_TO_NEW
+
+    if value in OLD_DISPOSITION_TO_NEW:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is retired: it is called {OLD_DISPOSITION_TO_NEW[value]!r} now; use --handoff-to "
+            f"{OLD_DISPOSITION_TO_NEW[value]}")
+    return value
+
+
 def _cmd_intentions_keep_migrate(args: argparse.Namespace) -> int:
     from levain import keep_migrate as km
     from levain.dashboard import AnnealPaths
@@ -2178,7 +2189,7 @@ def _cmd_intentions_keep_migrate(args: argparse.Namespace) -> int:
     try:
         if act is None:
             out = km.plan(paths.intentions_json, migrations_dir=root / ".levain" / km.MIGRATIONS_SUBDIR,
-                          episodic_db=db, handoff_to=args.handoff_to or "seed", agenda_date=args.agenda_date)
+                          episodic_db=db, handoff_to=args.handoff_to or "someday", agenda_date=args.agenda_date)
             doc = km.load_plan(out)
             c = doc["counts"]
             print(f"keep-migrate plan: {out}")

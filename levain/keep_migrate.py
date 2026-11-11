@@ -45,7 +45,7 @@ Safety rules (L3 1107-63):
   original is left exactly as it is (never resurrected).
 * ``revert`` re-adds an original under a revert key and records its id before touching the
   destination; a re-run finds the key and never re-adds or re-writes it.
-* Every keyed intention this module plants (a destination seed / agenda, a restored original) is created
+* Every keyed intention this module plants (a destination someday / agenda, a restored original) is created
   WITH its verbatim notes / created / seen in one store transaction (:func:`_add_verbatim`), so no
   keyed row ever exists half-made, and a keyed row found on a retry is left exactly as found (an
   edit made to it after a crash is never re-written; apply names it in ``Report.kept``).
@@ -94,6 +94,7 @@ from levain.intention_legacy import (
     KEEP_PLAN_DEST_KIND,
     KEEP_PLAN_ID_KEY,
     KEEP_PLAN_STORE_KEY,
+    OLD_DISPOSITION_TO_NEW,
 )
 
 try:
@@ -141,7 +142,7 @@ STATE_REVERT_BLOCKED = "revert_blocked"     # revert could not finish it (destin
 DEST_EPISODE = "episode"
 DEST_INTENTION = KEEP_PLAN_DEST_KIND     # a persisted plan key: a plan an older release wrote still names it
 EPISODE_TYPES = ("observation", "decision")
-INTENTION_DISPOSITIONS = ("seed", "agenda")
+INTENTION_DISPOSITIONS = ("someday", "agenda")
 
 Fault = Callable[[str, Mapping[str, Any]], None]
 
@@ -187,7 +188,7 @@ def _notes(row: Mapping[str, Any]) -> list[str]:
 
 def pending_counts(intentions_json: Path | str) -> dict[str, int]:
     """What awaits migration, for ``levain doctor`` and the one-line ``levain update`` print:
-    ``{"notes": N, "handoffs": M, "agendas": K}`` (K = undated agendas, which migrate to seeds).
+    ``{"notes": N, "handoffs": M, "agendas": K}`` (K = undated agendas, which migrate to somedays).
     Read-only; a missing store counts zero."""
     out = {"notes": 0, "handoffs": 0, "agendas": 0}
     for row in _read_doc(Path(intentions_json))["spores"]:
@@ -207,7 +208,7 @@ def doctor_line(intentions_json: Path | str) -> str | None:
         return None
     line = f"keep: {c['notes']} notes / {c['handoffs']} handoffs await migration"
     if c["agendas"]:
-        line += f" (+ {c['agendas']} undated agendas to seeds)"
+        line += f" (+ {c['agendas']} undated agendas to someday)"
     return line
 
 
@@ -224,12 +225,12 @@ _FACT_HINT = re.compile(r"(`|\$ |\bhttps?://|--[a-z]|\bgotcha\b|\bnever\b|\balwa
 
 
 def classify_note(text: str) -> tuple[str, str]:
-    """``(destination, why)`` for a Keep note: ``decision`` | ``seed`` | ``observation``. Ruling beats
+    """``(destination, why)`` for a Keep note: ``decision`` | ``someday`` | ``observation``. Ruling beats
     intention; anything the cues do not place is an ``observation`` (nothing is lost, T3 (b))."""
     if _RULING.search(text):
         return "decision", "wording of a ruling (ruled/decided/approved/...): kept as a decision episode, his words as written"
     if _INTENT.search(text):
-        return "seed", "reads as an intention (starts with a to-do verb): re-planted as a seed"
+        return "someday", "reads as an intention (starts with a to-do verb): re-planted as a someday"
     if _FACT_HINT.search(text):
         return "observation", "a fact, command or gotcha: an observation episode in Durable Facts form for the next wrap to place"
     return "observation", "unplaced by the classifier: kept whole as an observation episode, nothing lost"
@@ -276,17 +277,17 @@ def _propose(row: Mapping[str, Any], *, handoff_to: str, agenda_date: str | None
     text = str(row.get("text", ""))
     if d == "note":
         kind, why = classify_note(text)
-        if kind == "seed":
-            return {"kind": DEST_INTENTION, "disposition": "seed", "next": None}, why
+        if kind == "someday":
+            return {"kind": DEST_INTENTION, "disposition": "someday", "next": None}, why
         return {"kind": DEST_EPISODE, "episode_type": kind}, why
     if d == "handoff":
         if handoff_to == "agenda":
             return ({"kind": DEST_INTENTION, "disposition": "agenda", "next": agenda_date},
                     f"legacy handoff to a dated agenda ({agenda_date}), so it reaches him once as a band row (T10b)")
-        return ({"kind": DEST_INTENTION, "disposition": "seed", "next": None},
-                "legacy handoff to a seed: the agent sees it in the Tray at session start (T10a)")
-    return ({"kind": DEST_INTENTION, "disposition": "seed", "next": None},
-            "undated agenda never germinates: becomes a seed (SD-15, decided)")
+        return ({"kind": DEST_INTENTION, "disposition": "someday", "next": None},
+                "legacy handoff to a someday: the agent sees it in the Tray at session start (T10a)")
+    return ({"kind": DEST_INTENTION, "disposition": "someday", "next": None},
+            "undated agenda never germinates: becomes a someday (SD-15, decided)")
 
 
 # ---------------------------------------------------------------- the plan file
@@ -338,17 +339,19 @@ def load_plan(plan_path: Path | str) -> dict[str, Any]:
 
 
 def plan(intentions_json: Path | str, *, migrations_dir: Path | str, episodic_db: Path | str | None = None,
-         handoff_to: str = "seed", agenda_date: str | None = None,
+         handoff_to: str = "someday", agenda_date: str | None = None,
          overrides: Mapping[str, Mapping[str, Any]] | None = None,
          now: datetime | None = None) -> Path:
     """The DRY RUN. Writes the plan file and returns its path; ``intentions_json`` is read, never written.
 
     ``overrides`` maps an item's origin key (or intention id) to a destination dict, for a model pass or a
     test (T3 (a)); the operator can equally edit the file. ``handoff_to="agenda"`` needs ``agenda_date``
-    (``YYYY-MM-DD``; the upgrade day), else handoffs become seeds."""
+    (``YYYY-MM-DD``; the upgrade day), else handoffs become somedays."""
     intentions_json = Path(intentions_json)
-    if handoff_to not in ("seed", "agenda"):
-        raise KeepMigrateError("handoff_to must be 'seed' or 'agenda'")
+    if handoff_to in OLD_DISPOSITION_TO_NEW:
+        raise KeepMigrateError(f"handoff_to {handoff_to!r} is retired: it is called {OLD_DISPOSITION_TO_NEW[handoff_to]!r} now")
+    if handoff_to not in ("someday", "agenda"):
+        raise KeepMigrateError("handoff_to must be 'someday' or 'agenda'")
     if handoff_to == "agenda":
         try:
             date.fromisoformat(agenda_date or "")
@@ -527,15 +530,28 @@ def _needs_episodes(doc: Mapping[str, Any], states: Sequence[str]) -> bool:
                for i in doc["items"])
 
 
-def _validate_dest(item: Mapping[str, Any]) -> None:
+def _dest_disposition(dest: Mapping[str, Any]) -> Any:
+    """The disposition a stored destination plants. A plan an older release wrote names ``seed``; it is read as
+    ``someday`` (a reader of history: the plan file itself is never rewritten)."""
+    d = dest.get("disposition")
+    return OLD_DISPOSITION_TO_NEW.get(d, d) if isinstance(d, str) else d
+
+
+def _validate_dest(item: Mapping[str, Any], *, history: bool = False) -> None:
+    """Judge one item's destination. ``history`` is a stored plan being applied (an old ``seed`` reads as ``someday``);
+    otherwise it is a NEW destination (a plan being made, an override) and a retired spelling is refused."""
     d = item.get("destination") or {}
+    if not history and d.get("kind") == DEST_INTENTION and d.get("disposition") in OLD_DISPOSITION_TO_NEW:
+        old = d["disposition"]
+        raise KeepMigrateError(f"item {item.get('index')}: the disposition {old!r} is retired: name "
+                               f"{OLD_DISPOSITION_TO_NEW[old]!r}")
     k = d.get("kind")
     if k == DEST_EPISODE:
         if d.get("episode_type") not in EPISODE_TYPES or not str(d.get("body") or "").strip():
             raise KeepMigrateError(f"item {item.get('index')}: an episode destination needs episode_type "
                                    f"{EPISODE_TYPES} and a body")
     elif k == DEST_INTENTION:
-        if d.get("disposition") not in INTENTION_DISPOSITIONS:
+        if _dest_disposition(d) not in INTENTION_DISPOSITIONS:
             raise KeepMigrateError(f"item {item.get('index')}: an intention destination must be one of {INTENTION_DISPOSITIONS}")
         if d["disposition"] == "agenda":
             try:
@@ -564,7 +580,7 @@ def _write_destination(item: dict[str, Any], plan_id: str, intentions: Any, db: 
                 origin_key=key)
         return {"kind": DEST_EPISODE, "id": ep.id, "origin_key": key}, None
     made, created = _add_verbatim(intentions, origin_key=key, row=item["row"], text=item["text"],
-                                  disposition=d["disposition"], next_=d.get("next") or None, guard=True)
+                                  disposition=_dest_disposition(d), next_=d.get("next") or None, guard=True)
     return {"kind": DEST_INTENTION, "id": made["id"], "origin_key": key}, (None if created else made)
 
 
@@ -670,7 +686,7 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
         live = (STATE_PENDING, STATE_DEST, STATE_STALE)
         for it in doc["items"]:
             if it["state"] in live:
-                _validate_dest(it)             # every item judged before the first write
+                _validate_dest(it, history=True)   # every item judged before the first write
         db = _episode_store(doc, episodic_db) if _needs_episodes(doc, live) else None
         intentions = guarded_intention_store(intentions_json)
 
@@ -737,7 +753,7 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
 def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
            fault: Fault | None = None, today: date | None = None) -> Report:
     """``--revert <plan>``. Per applied (or half-applied) item: re-add the original (same text, notes,
-    disposition), THEN remove what the apply made (tombstone the episode / compost the seed).
+    disposition), THEN remove what the apply made (tombstone the episode / compost the someday).
 
     A ``conflict`` item (destination written, original changed) and a ``pending`` / ``stale`` one whose
     destination is found by its key (a crash before the record) get their destination removed and
