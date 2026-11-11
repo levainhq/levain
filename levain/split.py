@@ -35,7 +35,7 @@ from levain.intentions import (
     valid_check_by,
 )
 
-__all__ = ["ThenRefused", "create_then", "followers_of", "then_origin_key", "wake_after"]
+__all__ = ["ThenRefused", "WakeFailed", "create_then", "followers_of", "then_origin_key", "wake_after"]
 
 THEN_KEY_PREFIX = "levain-then:"
 
@@ -46,6 +46,15 @@ class ThenRefused(ValueError):
     def __init__(self, code: str, status: int, message: str) -> None:
         super().__init__(message)
         self.code, self.status = code, status
+
+
+class WakeFailed(RuntimeError):
+    """A wake that hit an error part-way. ``woke`` holds the ids that DID wake before or beside it (their stamps are committed),
+    so a caller reports them with the error instead of dropping them; the next germinate run wakes the rest."""
+
+    def __init__(self, message: str, woke: list[str]) -> None:
+        super().__init__(message)
+        self.woke = woke
 
 
 def then_origin_key(anchor: dict[str, Any], text: str) -> str:
@@ -111,7 +120,8 @@ def wake_after(intentions_json: Path | str, anchor_id: str, *, queue_dir: Path |
                agent: str = "claude_code") -> list[str]:
     """Wake the second parts that wait on ``anchor_id`` now: the ids woken, none when nothing waits on it (then nothing is
     opened or written, no band store is created). The event is checked against the store by the germinate it runs, so a
-    caller that names a first part that is not finished wakes nothing."""
+    caller that names a first part that is not finished wakes nothing. An error in the run raises :class:`WakeFailed`, which
+    carries the ids that did wake."""
     from levain import germinate as g
     from levain.consent.queue import default_queue_dir
 
@@ -120,7 +130,8 @@ def wake_after(intentions_json: Path | str, anchor_id: str, *, queue_dir: Path |
         return []
     qdir = Path(queue_dir) if queue_dir is not None else default_queue_dir()
     res = g.germinate(path, qdir, install=path.parent.parent, agent=agent, event=done_event(anchor_id))
+    woke = [str(o["intention_id"]) for o in res["due"] if o.get("done")]
     if res["errors"]:
-        raise RuntimeError("; ".join(str(e.get("error")) for e in res["errors"]))
-    return [str(o["intention_id"]) for o in res["due"] if o.get("done")]
+        raise WakeFailed("; ".join(str(e.get("error")) for e in res["errors"]), woke)
+    return woke
 

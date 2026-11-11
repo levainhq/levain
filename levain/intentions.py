@@ -83,6 +83,8 @@ __all__ = [
     "valid_target",
     "valid_retarget",
     "executor_of",
+    "parse_target",
+    "date_on_event_agenda_refusal",
     "EVENT_DONE_PREFIX",
     "DEFAULT_CHECK_BY_DAYS",
     "COMPLETION_KINDS",
@@ -352,12 +354,38 @@ def valid_retarget(value: Any) -> bool:
     return value in GERMINATE_TARGETS or _FLOW_REPO.fullmatch(value[len("board:"):]) is not None
 
 
+def parse_target(raw: Any) -> tuple[str, str | None] | None:
+    """The ONE reading of a stored ``target``, shared by germination and every caller that asks who acts: ``(kind, repo)`` with
+    ``kind`` ``band``, ``nudge``, ``desk`` or ``board:<repo>``, the keyword matched without regard to case and the ends trimmed
+    (the repo keeps its own case), or None when the value is not a target (no target included). A write is stricter
+    (:func:`valid_target`); this is how a store that holds a hand-edited ``" Desk "`` is READ."""
+    t = raw.strip() if isinstance(raw, str) else ""
+    low = t.casefold()
+    if low in GERMINATE_TARGETS:
+        return low, None
+    if low.startswith("board:") and t[len("board:"):].strip():
+        repo = t[len("board:"):].strip()
+        return f"board:{repo}", repo
+    return None
+
+
 def executor_of(target: Any) -> str | None:
     """Who acts once an agenda with this target wakes, derived and never stored: ``operator`` for a band row or a nudge (it
-    rings in the band), ``machine`` for the desk or a board item. None for no target, or one that is not a target."""
-    if not valid_target(target):
+    rings in the band), ``machine`` for the desk or a board item. None for no target, or one that is not a target. Read through
+    :func:`parse_target`, so it agrees with what germination does with the same stored value."""
+    parsed = parse_target(target)
+    if parsed is None:
         return None
-    return "operator" if target in ("band", "nudge") else "machine"
+    return "operator" if parsed[0] in ("band", "nudge") else "machine"
+
+
+def date_on_event_agenda_refusal(intention: Mapping[str, Any] | None) -> str | None:
+    """Why a DATE may not be set on ``intention`` (a row as stored), or None when it may: a part waits on an event or a date, never
+    both. The one rule every write that sets ``next`` asks (the legacy writes and the planned effects), so no door is a way around it."""
+    if not isinstance(intention, Mapping) or not is_event_agenda(intention):
+        return None
+    return (f"{intention.get('id')} waits on {intention.get('on_event')}, not on a date: a part waits on an event or a date, never "
+            "both. It is asked about on its check-by day if the event has not come")
 
 
 # --- the split (row 178 build 2): an agenda that waits on another intention's completion, not on a date -----------------
