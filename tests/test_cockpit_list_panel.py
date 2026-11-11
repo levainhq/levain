@@ -29,7 +29,6 @@ from levain.desk.store import CoordStore
 from levain.dashboard import SubstrateSource
 from levain.writes import EditError
 from tests.test_dashboard import _make_levain_install
-from levain.desk.legacy import ROLE_DESK
 
 FIXTURE = Path(__file__).parent / "fixtures" / "list_panel.json"
 CRED = {"class": "token", "name": "browser", "device_class": None}
@@ -251,7 +250,7 @@ def test_an_unreadable_board_is_named_and_the_rest_still_shows(rig: Rig, monkeyp
     monkeypatch.setattr(ready, "snapshot", boom)
     p = rig.panel()
     assert p["status"] == "partial"
-    assert any("agents' board could not be fully read" in s["reason"] and ROLE_DESK in s["reason"] for s in p["skipped"])
+    assert any("agents' board could not be fully read (desk" in s["reason"] for s in p["skipped"]), p["skipped"]
     assert not [r for r in p["rows"] if r["facets"]["surface"] == "board"]
     assert [r for r in p["rows"] if r["facets"]["surface"] == "band"]
 

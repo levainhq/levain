@@ -170,7 +170,7 @@ def test_f16_report_says_queued_and_the_next_pass_and_reports_reads_the_outcome(
     code = main(["coord", "report", "levain:a", "--worker", launch_id, "--event", "attach", "--launch", launch_id,
                  "--report-id", "r-ok", "--board-store", str(board)])
     words = capsys.readouterr().out
-    assert code == 0 and "r-ok" in words and "queued" in words and "coord watch" in words
+    assert code == 0 and "r-ok" in words and "queued" in words and "levain desk watch" in words
     code, st = _reports(board, capsys, "r-ok")
     assert code == 0 and (st["state"], st["item_id"]) == ("queued", "levain:a")
     _report(board, capsys, "levain:nowhere", "--worker", launch_id, "--event", "attach", "--launch", launch_id,

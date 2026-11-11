@@ -63,6 +63,34 @@ def test_coord_ready_add_passes_the_door_and_a_not_door_verb_is_refused(tmp_path
     assert "is the operator's, and this is the desk's workspace" in capsys.readouterr().err
 
 
+def test_every_spelling_of_the_desk_tree_meets_the_same_door(tmp_path, monkeypatch, capsys):
+    """`levain coord ...` and `levain coordinator ...` (an old brief, a pasted command) are the same leaves as
+    `levain desk ...`: each carries the leaf's own mark, so no alias spelling is an unclassified command."""
+    parser = build_parser()
+    marks = door.declared_leaves(parser)
+    assert not [p for p in marks if p and p[0] in ("coord", "coordinator")]    # one leaf per verb, under its first name
+    for path in (p for p in marks if p and p[0] == "desk"):
+        leaf = parser
+        for word in path:
+            leaf = next(a for a in leaf._actions if isinstance(a, argparse._SubParsersAction)).choices[word]
+        sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        for alias in ("coord", "coordinator"):
+            alias_leaf = sub.choices[alias]
+            for word in path[1:]:
+                alias_leaf = next(a for a in alias_leaf._actions
+                                  if isinstance(a, argparse._SubParsersAction)).choices[word]
+            assert alias_leaf is leaf, (alias, path)
+    q = _workspace(tmp_path, monkeypatch)
+    for word in ("desk", "coord", "coordinator"):
+        assert main([word, "take", "--queue-dir", str(q)]) == 1
+        err = capsys.readouterr().err
+        assert "levain desk take: `levain desk take` is the operator's" in err, (word, err)
+        main([word, "ready", "add", "it-1", "--repo", "levain", "--title", "t", "--who", "c", "--why", "w",
+              "--queue-dir", str(q)])
+        err = capsys.readouterr().err
+        assert "is the operator's" not in err and "levain desk ready add:" in err, (word, err)
+
+
 def test_a_leaf_with_no_declaration_is_refused(tmp_path, monkeypatch):
     _workspace(tmp_path, monkeypatch)
     root = argparse.ArgumentParser(prog="levain")

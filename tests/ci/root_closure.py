@@ -71,6 +71,9 @@ DYNAMIC_SITES = {
     # ``_LAZY_FIRING_MODULES`` / ``_LAZY_PRESENCE_MODULES`` for the operator's daemon (a variable, not a root target);
     # the cockpit one is the operator's panel, importing ``levain.consent.limits`` (not a root-run module)
     "levain/cockpit/providers.py::_limit_lines::" 'mod = importlib.import_module("levain.consent.limits")': (),
+    # the 1.x old-name shim: its loader imports the real ``levain.desk.<x>`` a ``levain.coordinator.<x>`` import
+    # names (the same module object); no levain module imports ``levain.coordinator``, so no root process reaches it
+    "levain/coordinator/__init__.py::_AliasLoader.create_module::return importlib.import_module(self._real)": (),
     "levain/firing/contract.py::<module>::" '# rather than ``import_module(f"{__name__}.{kind}")`` GOVERNS which leaves build_firing may': (),
     "levain/firing/contract.py::build_firing::" 'importlib.import_module(module)  # blessed leaf — its own import errors propagate': (),
     "levain/firing/presence.py::build_presence::" 'importlib.import_module(module)  # blessed leaf — its own import errors propagate': (),

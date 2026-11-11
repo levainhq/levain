@@ -306,8 +306,12 @@ def test_every_levain_home_reader_is_named_for_the_fallback():
     # the home path itself into the launchd unit's environment and builds no directory under it, so it adds no name.
     # dream/cli.py: `dream enable` reads the home only to name the default cockpit root in the install-facts file it
     # writes into the agent store's directory; it builds nothing under the home, so it adds no name either.
+    # desk/move_home.py: `levain desk move-home` resolves the home to rename the desk's directory from
+    # LEGACY_HOME_NAME to DESK_HOME_NAME (both already named) and finds the desk stores through
+    # work_attach.live_consent_dir / board_store_dir (consent/queue.py's read); it builds no other directory.
     assert reads == {"autonomic/db.py": 1, "chat_egress/srt_pin.py": 1, "cli.py": 1, "cockpit/custody.py": 1,
-                     "consent/queue.py": 1, "desk/legacy.py": 1, "dream/cli.py": 1, "firing/confinement.py": 2,
+                     "consent/queue.py": 1, "desk/legacy.py": 1, "desk/move_home.py": 1, "dream/cli.py": 1,
+                     "firing/confinement.py": 2,
                      "firing/ssh_agent.py": 1, "observe.py": 1}, reads
     names = {default_store_dir().name, default_key_dir().name, default_queue_dir().name, GRANTS_DIR,
              ssh_agent.RUN_DIR, ssh_agent.HOST_KEYS_DIR, default_desk_dir().name, LEGACY_HOME_NAME, default_prefix().name, OBSERVE_DIR}

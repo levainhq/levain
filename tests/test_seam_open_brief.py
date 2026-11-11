@@ -953,7 +953,8 @@ def test_each_detail_row_names_its_row_oldest_first(world):
     assert by_id[long.drop_id].endswith("  cli  " + "x" * 59 + "…")         # at most 60 characters
     (receipt,) = [ln for ln in detail if f"re {d2.drop_id}" in ln]
     assert receipt.split("  ")[2] == "replies" and receipt.split("  ")[4] == "drop_receipt"
-    assert any(ln.endswith("  ready_journal  levain:doc-fix  desk  new -> ready") for ln in detail)
+    # the journal's who is a stored field, shown as stored (the role value, not its display word)
+    assert any(ln.endswith(f"  ready_journal  levain:doc-fix  {ROLE_DESK}  new -> ready") for ln in detail)
     assert any(ln.endswith("  coord_settings") for ln in detail)             # a table with no id is named alone
 
 
