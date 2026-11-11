@@ -323,7 +323,27 @@ const shotOnTimeoutInner = async (n, setPath) => {
   } catch {}
 };
 let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)
+// The cockpit draws its first board in parts and the whole draw then REPLACES every node (S4): a step that taps or tags a node on a part loses
+// it. The page says when its board is the one that stays with a POSITIVE signal, html[data-board-whole] (dashboard_boot.js: set only by the
+// code that has just drawn the whole board, or by a terminal failure; absent is the default); a page with no #board is not the cockpit board
+// and has nothing to wait for. The wait is bounded and not fatal (a page that never says gets its step after the bound, as every step did
+// before the parts), reads through the short-timeout evaluateOutcome, and an error outcome (the page navigating, no answer) is a RETRY, never
+// "ready". After one timeout the later steps skip the wait (a stuck page is named once, not paid for on every step). A step that watches the
+// parts themselves says `"partial": true`.
+let boardWaitGaveUp = false;
+const WHOLE_BOARD = "(() => { try { return document.readyState === 'complete' && (!document.getElementById('board') || document.documentElement.hasAttribute('data-board-whole')); } catch (e) { return false; } })()";
+const SETUP_STEPS = ["authenticator", "user_verified", "init", "emulate", "scheme"];
+const waitForWholeBoard = async () => {
+  for (const end = Date.now() + scaled(15000); Date.now() < end;) {
+    const o = await evaluateOutcome(WHOLE_BOARD, Math.min(Math.max(end - Date.now(), 250), 1500));
+    if (!("error" in o) && o.value === true) return;
+    await sleep(50);
+  }
+  boardWaitGaveUp = true;
+  console.error("page-drive: the board never said it was whole within the bound; later steps will not wait for it");
+};
 for (const s of steps) {
+  if (!s.partial && !boardWaitGaveUp && !SETUP_STEPS.some((k) => s[k] !== undefined)) await waitForWholeBoard();
   const waitMs = scaled(s.ms || 20000);
   const deadline = Date.now() + waitMs;
   if (s.authenticator !== undefined) {

@@ -1,0 +1,123 @@
+"""The cockpit's progressive first draw (S4) in a real browser: the board draws as its panels land, and the page says when it is WHOLE.
+
+The first board is drawn in parts and the whole draw then REPLACES every node, so anything a reader (or a test) did on a part was lost
+under them (the decisions tile that lost its focus, a /?view=needs jump that landed 495 px off, consent rows tapped on a part). Two earlier
+fixes marked the PARTIAL board with a flag that something had to clear, and each review found a new way for it to stay set or clear early.
+The frame is the other way round: ready is a POSITIVE whole-board signal, `html[data-board-whole]`, set only by the code that has just drawn
+the whole board (or a terminal failure), and the partial board is drawn inert (`#board[inert]`, dimmed) so nothing can be done on it.
+
+The partial window is made long by delaying every panel read after the first four (the core: activity, state, begin, decisions) to a fixed
+moment after the page started, so each state can be read in it. Steps in that window say `"partial": true` (the driver otherwise waits for
+the positive signal before every step)."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_k2a import _install, _serve
+from tests.test_cockpit_k4a_needs import DESKTOP
+
+# every panel read after the first four distinct ones waits until HOLD_MS after the document began; the core four answer at once, so the board
+# draws a part, and the rest land together at the release. The init step reloads the page once; this runs in the reloaded document.
+HOLD_MS = 9000
+DELAY = """(() => { const f = window.fetch; const seen = new Set(); const t0 = Date.now(); window.fetch = async (...a) => {
+  const u = String(a[0]);
+  if (u.indexOf('/cockpit/panel/') === 0) { seen.add(u); if (seen.size > 4) await new Promise((r) => setTimeout(r, Math.max(0, t0 + HOLD - Date.now()))); }
+  return f.apply(window, a); };
+  // what the page looked like at the moment the signal appeared (a mutation observer runs right after the task that set the attribute): how many
+  // elements were still inert, and how many tiles the widgets region held
+  window.__wholeLog = [];
+  new MutationObserver(() => { if (document.documentElement.hasAttribute('data-board-whole') && !window.__wholeLog.length)
+    window.__wholeLog.push({ inert: document.querySelectorAll('[inert]').length, tiles: document.querySelectorAll('#ck-widgets .ck-card').length }); })
+    .observe(document, { attributes: true, subtree: true, attributeFilter: ['data-board-whole'] });   // the init script runs before <html> exists
+})();""".replace("HOLD", str(HOLD_MS))
+
+# the regions the draw replaces (dashboard_boot.js BOARD_REGIONS): #board holds the zones, and its siblings hold the hero, the Needs strip, the
+# drop, the notes, the brief and the widgets (the tiles), where a reader first acts. The masthead and the nav are not among them.
+REGIONS = ["ck-hero", "ck-needs", "ck-drop", "ck-notes", "ck-brief", "ck-widgets", "state", "board"]
+# the board is a part: the regions are inert, a tile is drawn in the widgets region, and the signal is not there
+PART_UP = ("(() => { const w = document.getElementById('ck-widgets'); return !!w && w.hasAttribute('inert') && !!w.querySelector('.ck-card') && "
+           "!document.documentElement.hasAttribute('data-board-whole') && 1; })()")
+WHOLE_UP = "document.documentElement.hasAttribute('data-board-whole') && 1"
+STATE = """JSON.stringify((() => { const h = document.documentElement; const ids = REGIONS;
+  const present = ids.filter((id) => document.getElementById(id));
+  const focusable = document.querySelector('#ck-widgets .ck-card, #ck-needs button, #board button'); let focused = null;
+  if (focusable) { if (!focusable.hasAttribute('tabindex')) focusable.setAttribute('tabindex', '-1'); focusable.focus(); focused = document.activeElement === focusable; }
+  const live = (sel) => { const n = document.querySelector(sel); return !!n && !n.closest('[inert]'); };
+  const w = document.getElementById('ck-widgets');
+  return { inert: present.filter((id) => document.getElementById(id).hasAttribute('inert')), present: present, whole: h.hasAttribute('data-board-whole'),
+    tiles: w.querySelectorAll('.ck-card').length, opacity: getComputedStyle(w).opacity, focusableFound: !!focusable, focused: focused,
+    live: { sync: live('#refresh'), nav: live('[data-phone-jump]'), theme: live('[data-theme-set]'), tab: live('[data-mode-tab]'), masthead: live('.masthead') },
+    inertElsewhere: [...document.querySelectorAll('[inert]')].filter((n) => ids.indexOf(n.id) < 0).length }; })())""".replace("REGIONS", json.dumps(REGIONS))
+
+# a press at the centre of the first tile in the viewport, whatever the page's hit test says: the driver's tap step presses where `contains` says
+# the element is, so the stand-in below hands it the tile's rectangle. The listeners record where every press landed.
+LISTEN = """(() => { window.__hits = []; for (const t of ['pointerdown', 'mousedown', 'mouseup', 'click'])
+  window.addEventListener(t, (ev) => { window.__hits.push({ type: t, inTile: !!(ev.target && ev.target.closest && ev.target.closest('#ck-widgets .ck-card')), at: ev.target && (ev.target.id || ev.target.tagName) }); }, true); })()"""
+AT_CARD = """(() => { const c = document.querySelector('#ck-widgets .ck-card'); if (!c) return null; c.scrollIntoView({ block: 'center' }); const r = c.getBoundingClientRect();
+  return { disabled: false, ownerDocument: document, scrollIntoView() {}, getBoundingClientRect: () => r, contains: () => true }; })()"""
+HITS = "JSON.stringify(window.__hits)"
+
+
+def _boot(tmp_path: Path):
+    _root, src, _ids = _install(tmp_path)
+    return _serve(src, surface_tokens={"browser": "T"}, install_class="reported")
+
+
+@needs_browser
+def test_a_partial_board_is_inert_and_not_whole_and_the_whole_draw_is_live_and_says_so(tmp_path: Path) -> None:
+    """Partial: every region the draw replaces carries inert (the masthead, the nav, Sync and the theme switch do not), the part is dimmed, a tile
+    on it cannot take focus, a press at the tile's centre lands outside it (the probe: CDP mouse events skip inert nodes), and the positive
+    signal is absent. After the whole draw: nothing is inert, the signal is there, and when the signal appeared nothing was inert any more and
+    the tiles were drawn (same turn). The same focus attempt and the same press now reach the tile (the controls that show the probes can
+    see a live one)."""
+    with _boot(tmp_path) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"init": DELAY}, DESKTOP,
+            {"until": PART_UP, "ms": 40000, "partial": True},
+            {"eval": STATE, "partial": True},
+            {"tap": AT_CARD, "before": LISTEN, "ms": 5000, "partial": True},
+            {"eval": HITS, "partial": True},
+            {"until": WHOLE_UP, "ms": 60000, "partial": True},
+            {"eval": STATE, "partial": True},
+            {"eval": "JSON.stringify(window.__wholeLog)", "partial": True},
+            {"tap": AT_CARD, "before": "window.__hits = []", "ms": 5000},
+            {"eval": HITS},
+        ])["values"]
+    assert len(out) == 9, out
+    part, hits_part, whole, whole_log, hits_whole = (json.loads(out[i]) for i in (1, 3, 5, 6, 8))
+    assert part["whole"] is False and part["tiles"] > 0, part
+    assert part["inert"] == part["present"] and "ck-widgets" in part["inert"] and "board" in part["inert"], part   # every region the draw replaces
+    assert float(part["opacity"]) < 1, part                                   # inert has no look of its own: the part is dimmed
+    assert part["focusableFound"] and part["focused"] is False, part          # nothing on the part takes focus
+    assert all(part["live"].values()) and part["inertElsewhere"] == 0, part   # the masthead, the nav, Sync and the theme switch stay live
+    assert hits_part and all(h["inTile"] is False for h in hits_part), hits_part   # the press went to the page behind, never into the tile
+    assert whole["inert"] == [] and whole["whole"] is True and float(whole["opacity"]) == 1, whole
+    assert whole["focused"] is True, whole                                    # control: the same focus attempt lands on the live tile
+    assert len(whole_log) == 1 and whole_log[0]["inert"] == 0 and whole_log[0]["tiles"] > 0, whole_log   # inert was already gone when the signal came
+    assert any(h["inTile"] for h in hits_whole), hits_whole                   # control: the same press on the whole board lands on the tile
+
+
+@needs_browser
+def test_a_whole_draw_deferred_for_an_open_editor_leaves_the_part_inert_and_the_signal_unset_until_it_lands(tmp_path: Path) -> None:
+    """An editor open when the rest of the panels land defers the whole draw (the page's own rule: a draw that would replace what the reader is
+    typing in waits). The signal stays unset and the part stays inert for as long as that holds, and both turn over when the deferred draw lands
+    after the editor closes. (The signal is never set on a claim the board will not be replaced: the deferred draw would falsify it.)"""
+    ADD_EDITOR = "(() => { const e = document.createElement('div'); e.className = 'state-editor'; e.id = 'fake-editor'; document.body.appendChild(e); return 1; })()"
+    DROP_EDITOR = "(() => { document.getElementById('fake-editor').remove(); return 1; })()"
+    LATE = f"new Promise((r) => setTimeout(() => r(1), {HOLD_MS + 6000}))"      # past the release of the held panels, with the editor still open
+    with _boot(tmp_path) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"init": DELAY}, DESKTOP,
+            {"until": PART_UP, "ms": 40000, "partial": True},
+            {"eval": ADD_EDITOR, "partial": True},
+            {"eval": LATE, "partial": True},
+            {"eval": STATE, "partial": True},
+            {"eval": DROP_EDITOR, "partial": True},
+            {"until": WHOLE_UP, "ms": 60000, "partial": True},
+            {"eval": STATE, "partial": True},
+        ])["values"]
+    held, landed = json.loads(out[3]), json.loads(out[6])
+    assert held["whole"] is False and held["inert"] == held["present"], held      # the panels have all landed, the draw is deferred: still a part
+    assert landed["whole"] is True and landed["inert"] == [], landed
