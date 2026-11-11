@@ -288,6 +288,17 @@
     return { verb: c.verb, fields: fields };
   }
 
+  // A list a provider draws as a count titles each row "kind: words" (flow's desk morning card: "contradiction: ...", "To apply (keep) felt:
+  // ...") and carries the whole text in its body. The generic row draws the body, so the kind is read back off the title: display only, never
+  // acted on, and only when the title's remainder is the body's own start (a title that merely contains a colon names no kind).
+  function rowKind(r) {
+    const t = typeof r.title === "string" ? r.title : "", b = typeof r.body === "string" ? r.body : "";
+    const m = /^((?:To apply \([^)]{1,30}\) )?[a-z][a-z _-]{1,24}): /.exec(t);
+    if (!m || !b || b === t) return "";
+    const rest = t.slice(m[0].length).replace(/(…|\.\.\.)$/, "");
+    return rest && b.indexOf(rest.slice(0, 24)) === 0 ? m[1] : "";
+  }
+
   function externalOf(head, panel, groupTitles, nowMs) {
     const v = panel.value || {};
     const kind = ALIAS[head.kind] || head.kind;
@@ -318,9 +329,13 @@
         // a list drawn as a count opens into the focus modal, where its groups are headings (Waiting on you, Waiting on a
         // signature, ...) in the kernel's own order, so a group is the heading and no longer repeated on each row
         const grouped = panel.face === "count" && grp;
-        const meta = [typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grouped ? "" : grp, badges, prov]
+        // a count list's own rows (not the Decisions or Sessions rows, which draw typed cards) are plain provider words: they are drawn as
+        // markdown, and the kind its title leads with ("contradiction: ...") leads the meta line, since the body drawn is the words alone
+        const mdRow = panel.face === "count" && head.id !== "decisions" && head.id !== "sessions";
+        const meta = [mdRow ? rowKind(r) : "", typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grouped ? "" : grp, badges, prov]
           .filter(Boolean).join(" · ");
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
+        if (mdRow) line.md = true;
         if (head.id === "sessions") {
           line.wrapMeta = true;
           // the Build tab's session row (paintBuildSessions below): the provider's own measures, never a full cwd
@@ -1196,6 +1211,15 @@
   const moreNote = (host, n) => { if (n > 0) host.appendChild(el("div", "xnote", "+" + n + " more")); };
   // F5 (a): a count tile that holds rows names what is in front, not only how many. Decisions names the top item the strip draws
   // first (levain-needs, dashboard_core.js, orders both); Sessions says live and quiet and names the busiest.
+  // A tile line is one reading of provider words: paired markdown markers and code ticks drop out (a tile draws text, never markup), a
+  // link keeps its words, whitespace collapses, and a line past `max` characters ends at a word with an ellipsis. The full text is the modal's.
+  const TILE_NOTE_CHARS = 160, TILE_ITEM_CHARS = 90;
+  function plainLine(text, max) {
+    const s = String(text == null ? "" : text).replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\*\*|__|\*|`/g, "").replace(/\s+/g, " ").trim();
+    if (s.length <= max) return s;
+    const cut = s.slice(0, max), sp = cut.lastIndexOf(" ");
+    return (sp > max / 2 ? cut.slice(0, sp) : cut).replace(/[\s,;:.·-]+$/, "") + "…";
+  }
   function glanceFace(d, n, host) {
     const N = root.LevainNeeds;
     if (d.pid === "decisions" && n && N && Array.isArray(d.lines)) {
@@ -1250,15 +1274,15 @@
       // the face names the top item and counts the rest ("backfill +3 more"), so the tile reads as an answer, not a bare number
       const topItem = () => {
         if (glanced || !n || s.ctx.alerted || !Array.isArray(d.lines) || !d.lines[0] || typeof d.lines[0].text !== "string") return;
-        host.appendChild(el("div", "sub", d.lines[0].text + (n > 1 ? " +" + (n - 1) + " more" : "")));
+        host.appendChild(el("div", "sub", plainLine(d.lines[0].text, TILE_ITEM_CHARS) + (n > 1 ? " +" + (n - 1) + " more" : "")));
       };
       if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
       else if (note) {
         // with something waiting (or a degraded zero), the provider's note is its word on what the read covers ("no cockpit
-        // broker: decisions waiting on a signature are not shown"), so it is the first line: a strip tile draws only its first
-        // sub line, and a count with its caveat dropped reads as the whole answer. The top item follows it.
-        host.appendChild(el("div", "sub", note));
-        topItem();
+        // broker: decisions waiting on a signature are not shown"), so it is the tile's line: the count and that word, and the
+        // items are the modal's (Phill 11-11: the face is a count that opens into the detail). A strip tile draws only its first
+        // sub line, and a count with its caveat dropped reads as the whole answer.
+        host.appendChild(el("div", "sub", plainLine(note, TILE_NOTE_CHARS)));
       }
       else topItem();
       while (glance.firstChild) host.appendChild(glance.firstChild);
