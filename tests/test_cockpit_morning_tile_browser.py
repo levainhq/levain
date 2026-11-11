@@ -69,7 +69,7 @@ def _drive_tile(tmp_path, monkeypatch, note):
         {"eval": "(() => { const m = document.getElementById('levain-modal'); const rows = [...m.querySelectorAll('.row')]; "
                  "return {raw: m.textContent.indexOf('**') >= 0, strong: m.querySelectorAll('strong.md-b').length, em: m.querySelectorAll('em.md-i').length, "
                  "code: m.querySelectorAll('code.md-code-i').length, meta: rows.map(r => r.querySelector('.ext-meta').textContent), "
-                 "toggles: rows.map(r => !!r.querySelector('.clause-toggle')), dates: m.querySelectorAll('.clause .nowrap').length, "
+                 "toggles: rows.map(r => !!r.querySelector('.clause-toggle')), dates: rows[0].querySelectorAll('.clause .nowrap').length, "
                  "clamp: getComputedStyle(rows[0].querySelector('.clause')).webkitLineClamp}; })()"},
         {"key": "Escape"},
         {"until": "!document.getElementById('levain-modal')", "ms": 4000},
