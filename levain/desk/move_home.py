@@ -395,5 +395,7 @@ def _db_name() -> str:
 
 
 def run_move_home(args: Any, out: Any = None) -> int:
+    queue_dir = getattr(args, "queue_dir", None)
     return move_home(home=getattr(args, "home", None), settings=getattr(args, "settings", None),
-                     dry_run=bool(getattr(args, "dry_run", False)), out=out)
+                     dry_run=bool(getattr(args, "dry_run", False)), out=out,
+                     store_dir=queue_dir.expanduser() if queue_dir is not None else None)

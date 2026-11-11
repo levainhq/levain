@@ -285,7 +285,7 @@ def test_the_cli_verb_runs_for_real(tmp_path, qdir, pings, capsys):
     root = _install(tmp_path)
     _add(root, "go")
     rc = main(["spores", "germinate", "--path", str(root), "--queue-dir", str(qdir)])
-    assert rc == 0 and "germinated spore-" in capsys.readouterr().out and len(_rows(qdir)) == 1
+    assert rc == 0 and "germinated intention-" in capsys.readouterr().out and len(_rows(qdir)) == 1
 
 
 # --- TS-2 L3 round: the findings that clear the reachability line ---------------------------------------------------

@@ -2743,13 +2743,21 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         p.set_defaults(func=run_coord)
     cmh = c_sub.add_parser(
         "move-home", help="Rename an old install's desk home to the new name and rewrite the hook paths.",
-        description="Renames <levain home>/<old name> to <levain home>/desk, rewrites every Claude Code hook command in "
-                    "your settings.json that names the old path (the earlier file is kept as settings.json.pre-desk-move), "
-                    "and leaves the old path as a link for one release. Refuses, changing nothing, when the new "
-                    "directory already exists or settings.json is not valid JSON. Run it again: it says nothing to do.")
+        description="Renames <levain home>/<old name> to <levain home>/desk and leaves the old path as a link for one "
+                    "release. It also rewrites every Claude Code hook command that names the old path, in your "
+                    "settings.json and in the desk home's own .claude settings (each earlier file is kept as "
+                    "<name>.pre-desk-move), moves the desk's stored directory in its store (the consent directory and "
+                    "the board, or --queue-dir), and adds the new path to the door's workspace record beside the old "
+                    "one. Refuses, changing nothing, when the old directory is a real directory and the new one "
+                    "exists too, when the old path is a link and the new directory is missing, or when a settings "
+                    "file is not valid JSON; with the move already done it finishes whatever is left. --dry-run prints "
+                    "the plan first. Run it again: it says nothing to do.")
     cmh.add_argument("--settings", type=Path, default=None, metavar="PATH",
                      help="The Claude Code settings.json to rewrite (default: $LEVAIN_CLAUDE_SETTINGS, else ~/.claude/settings.json).")
     cmh.add_argument("--home", type=Path, default=None, metavar="DIR", help="The levain home (default: $LEVAIN_HOME, else ~/.levain).")
+    cmh.add_argument("--queue-dir", dest="queue_dir", type=Path, default=None, metavar="DIR",
+                     help="The desk store whose stored directory to move, when it is not the consent directory or the "
+                          "board under the levain home (it is then the only store looked at).")
     cmh.add_argument("--dry-run", dest="dry_run", action="store_true", help="Print what would change and change nothing.")
     cmh.set_defaults(func=run_move_home)
     not_door(cmh)
