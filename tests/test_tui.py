@@ -162,7 +162,7 @@ def test_panels_for_zone_operate_order():
     by_kind = {p["kind"]: p for p in panels}
     # intentions + episodes are Class B (verb-mediated); Tray FLIPs to Class B in 3b
     # (the governed dump/triage/park verbs); only the edit log carries no chip.
-    assert by_kind["spores"]["edit_class"] == CLASS_B
+    assert by_kind["intentions"]["edit_class"] == CLASS_B
     assert by_kind["episodes"]["edit_class"] == CLASS_B
     assert by_kind["edits"]["edit_class"] == ""
     assert by_kind["tray"]["edit_class"] == CLASS_B
@@ -185,7 +185,7 @@ def test_panels_for_zone_mind_has_sections_and_state_is_class_a():
 def test_panel_item_count_only_verb_lists_are_selectable():
     v = _view()
     by_kind = {p["kind"]: p for p in v.layout()}
-    assert tui.panel_item_count(v, by_kind["spores"]) == 3
+    assert tui.panel_item_count(v, by_kind["intentions"]) == 3
     assert tui.panel_item_count(v, by_kind["episodes"]) == 2
     assert tui.panel_item_count(v, by_kind["edits"]) == 2
     # crystals + wraps render rich and scroll, but carry no per-item verb → 0
@@ -584,13 +584,13 @@ def test_intention_panel_titles_degraded_not_zero_count_on_fault():
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
                       errors={"open_intentions": "IntentionError: bad"})
     titles = {p["kind"]: p["title"] for p in v.layout() if p["kind"] in ("intentions", "tray", "keep")}
-    assert titles["spores"] == "Open loops (unavailable)", titles
+    assert titles["intentions"] == "Open loops (unavailable)", titles
     assert titles["tray"] == "Tray (unavailable)", titles
     assert "keep" not in titles, titles
     # control: a healthy (empty) store still shows the honest "(0)" count, not a false degrade
     ok = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
     ok_titles = {p["kind"]: p["title"] for p in ok.layout() if p["kind"] in ("intentions", "tray", "keep")}
-    assert ok_titles["spores"] == "Open loops (0)", ok_titles
+    assert ok_titles["intentions"] == "Open loops (0)", ok_titles
 
 
 def test_tray_is_verb_navigable():
@@ -848,7 +848,7 @@ def test_handle_verb_capture_disposition_by_panel(monkeypatch):
     # Tray panel → a seed (and NO type is sent — the AI sorts). No Keep panel → no note capture.
     _tui_curses._handle_verb(None, _model_on(v, "tray", read_only=False), None,
                              _verb_of("tray", "intention_capture"))
-    assert cap["req"] == {"kind": "intention_seed", "text": "a fresh dump", "disposition": "seed"}
+    assert cap["req"] == {"kind": "intention_seed", "text": "a fresh dump", "disposition": "someday"}
 
 
 def test_active_verbs_prunes_resolve_verbs_when_row_has_no_kinds():
