@@ -247,7 +247,9 @@ class QueueStore:
     def append_alarm(self, record: dict[str, Any]) -> None:
         """One line (the canonical JSON of ``record``) appended to ``requests/`` :data:`ALARM_LOG`, fsynced, mode
         0640. A log this line would take past :data:`ALARM_LOG_MAX` is first renamed to ``<log>.1`` (replacing the
-        older one), so the two files bound the disk. The caller serialises appends (one writer: the broker)."""
+        older one), so the two files bound the disk. The caller serialises appends (one writer: the broker). A write or
+        fsync that raises first truncates the log back to its size before this append (best effort), so a retry never
+        lands after a partial line nor duplicates one; the original error is what is raised."""
         line = canonical_bytes(record) + b"\n"
         if len(line) > ALARM_LOG_MAX:
             raise ValueError("an alarm record larger than the log")
@@ -263,11 +265,22 @@ class QueueStore:
                 fd = -1
                 os.replace(path, self.requests / (ALARM_LOG + ".1"))
                 fd = os.open(path, flags | os.O_EXCL, ROW_MODE)
+                size_before = 0
+            else:
+                size_before = st.st_size
             os.fchmod(fd, ROW_MODE)
             view = memoryview(line)
-            while view:
-                view = view[os.write(fd, view):]
-            os.fsync(fd)
+            try:
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            except BaseException:
+                try:
+                    os.ftruncate(fd, size_before)
+                    os.fsync(fd)
+                except OSError:
+                    pass
+                raise
         finally:
             if fd >= 0:
                 os.close(fd)
