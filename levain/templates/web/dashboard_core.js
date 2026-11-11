@@ -7618,8 +7618,7 @@
   // A record that names a card (the Work lens's waiting items) goes to the strip's card with that id: scrolled to and lit by an
   // animation that ends on its own (needs-lit), any earlier light cleared first. Where the strip is the bar (Build, Memory) the matching
   // chip is lit instead. False when no card or chip carries the id, so the caller can open the history.
-  // `focus`: the keyboard's place moves to the lit card too (it is a button, so it takes focus as it is), so Tab goes on from there; the Work lens's jump asks for it
-  function needsGo(id, instant, focus) {
+  function needsGo(id, instant) {
     const host = document.getElementById("ck-needs");
     if (!host || host.hidden || !id) return false;
     for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
@@ -7627,6 +7626,12 @@
     const sel = cards ? ".needs-row" : ".needs-chip-btn";
     const node = Array.prototype.find.call(host.querySelectorAll(sel), (n) => n.dataset.needsId === id);
     if (!node) return false;
+    needsLight(node, instant, false);
+    return true;
+  }
+  // Scroll to a card or chip and light it by an animation that ends on its own. `focus`: the keyboard's place moves to it too (it is a button, so it takes
+  // focus as it is), so Tab goes on from there; only the Work lens's jump to the first card asks for it, no other caller's focus moves.
+  function needsLight(node, instant, focus) {
     // `instant`: the caller locks the page the next moment (the item link opens the card's sheet at once), and the lock freezes the page at the
     // scroll position it finds: a smooth scroll only begun would be frozen at the top, so the reader's place behind the sheet would be lost
     if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "center", behavior: instant ? "auto" : "smooth" });
@@ -7636,6 +7641,34 @@
     const off = () => node.classList.remove("needs-lit");
     node.addEventListener("animationend", off, { once: true });
     window.setTimeout(off, 3000);   // a page that plays no animation (reduced motion) still ends the light
+  }
+  // The strip's first waiting card, as the reader sees the strip NOW (the Work lens's "waiting on you" button asks the strip itself, not the topology):
+  // the strip is on the page and holds a waiting item, and it is drawn as cards or as the bar. True is what the button needs to be there at all.
+  function needsCanGoFirst() {
+    const host = document.getElementById("ck-needs");
+    if (!host || host.hidden || host.dataset.waiting !== "1") return false;
+    const bar = host.querySelector(".needs-bar"), grid = host.querySelector(".needs-grid");
+    return !!((bar && bar.offsetParent) || (grid && grid.offsetParent));
+  }
+  // Light, scroll to and focus the first card the strip draws (its own order: questions first, then soonest to expire; the first row is never behind the fold).
+  // The Desk owes tab holds none of the waiting-on-you cards, so it is switched to Needs you through the strip's own tab helper first. On Build and Memory
+  // the strip is the bar: its first chip. False (nothing moved) when no such card is drawn.
+  function needsGoFirst() {
+    if (!needsCanGoFirst()) return false;
+    const host = document.getElementById("ck-needs");
+    const bar = host.querySelector(".needs-bar");
+    const barShown = !!(bar && bar.offsetParent);
+    let node = null;
+    if (barShown) node = Array.prototype.find.call(bar.querySelectorAll(".needs-chip-btn"), (n) => n.offsetParent) || null;
+    else {
+      if (needsTabNow === "desk") setNeedsTab("you");
+      const on = host.querySelector(".needs-tab.is-on");
+      if (!on || on.dataset.needsTab !== "you") return false;       // the strip did not come to Needs you: the first row on screen would be a desk row
+      node = Array.prototype.find.call(host.querySelectorAll(".needs-grid .needs-row"), (n) => n.offsetParent) || null;
+    }
+    if (!node) return false;
+    for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
+    needsLight(node, false, true);
     return true;
   }
 
@@ -10952,7 +10985,7 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   window.LevainNotifyCenter = { open: openNotifyCenter, state: () => ({ status: nc.status, unread: nc.unread, total: nc.total, needs: nc.needs }), read: ncRead };
 
   window.LevainAgentPage = { open: openAgentPage };
-  window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, history: openDecisionsHistory };
+  window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, canGoFirst: needsCanGoFirst, goFirst: needsGoFirst, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
   window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();
