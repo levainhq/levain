@@ -1214,9 +1214,16 @@
   const TILE_NOTE_CHARS = 160, TILE_ITEM_CHARS = 90;
   function plainLine(text, max) {
     max = max == null ? Infinity : max;   // a caller that names no cap gets the whole line, never a NaN comparison
-    const s = String(text == null ? "" : text).replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\*\*([^*]+?)\*\*|__([^_]+?)__|\*([^*\s][^*]*?)\*|`([^`]*)`/g, (m, a, b, c, d) => a || b || c || d || "").replace(/\s+/g, " ").trim();
+    let s = String(text == null ? "" : text).replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+    // matched pairs only; a marker inside another ("**use `desk` now**") takes a second pass, and three passes are the bound
+    for (let i = 0; i < 3; i++) {
+      const t = s.replace(/\*\*([^*]+?)\*\*|__([^_]+?)__|\*([^*\s][^*]*?)\*|`([^`]*)`/g, (m, a, b, c, d) => a || b || c || d || "");
+      if (t === s) break;
+      s = t;
+    }
+    s = s.replace(/\s+/g, " ").trim();
     if (s.length <= max) return s;
-    const cut = s.slice(0, max), sp = cut.lastIndexOf(" ");
+    const cut = s.slice(0, max - 1), sp = cut.lastIndexOf(" ");
     return (sp > max / 2 ? cut.slice(0, sp) : cut).replace(/[\s,;:.·-]+$/, "") + "…";
   }
   // F5 (a): a count tile that holds rows names what is in front, not only how many. Decisions names the top item the strip draws
