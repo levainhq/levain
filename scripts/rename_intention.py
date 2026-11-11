@@ -222,7 +222,7 @@ STORED_TOKEN_RULES: list[Rule] = [
          ),
     Rule(r'^["\']spores["\']$', "keep-as-legacy-constant",
          "the store document key `spores` is anneal-owned (raw reads of the document), and the READY schema v1 `sources`/`source` word is flow's until flow's producer flips (H11)",
-         paths=("levain/spores.py", "levain/keep_migrate.py", "levain/desk/ready.py")),
+         paths=("levain/spores.py", "levain/intentions.py", "levain/keep_migrate.py", "levain/desk/ready.py")),    # old and new path: a second run stays a no-op
     Rule(r'^["\']spores["\']$', "keep-as-legacy-constant",
          "a test building or reading the raw store document (`{\"spores\": [...]}`) or the READY `sources` key",
          paths=("tests/*",),
@@ -237,7 +237,7 @@ STORED_TOKEN_RULES: list[Rule] = [
          paths=("levain/cli.py",)),
     Rule(r'^["\']spore["\']$', "keep-as-legacy-constant",
          "keep-migrate's persisted plan destination kind `spore` and its episode metadata key",
-         paths=("levain/keep_migrate.py", "tests/test_keep_migrate.py"), context=r'DEST_SPORE =|"spore": item|kind"?: ?"spore"|\{"episode", "spore"\}'),
+         paths=("levain/keep_migrate.py", "tests/test_keep_migrate.py"), context=r'DEST_(?:SPORE|INTENTION) =|"spore": item|kind"?: ?"spore"|\{"episode", "spore"\}'),
 
     # ---- the seed doc's old path in the released-hash table (H6) ----
     Rule(r'"seed/spore_instructions\.md"', "keep-as-legacy-constant",
@@ -1135,6 +1135,7 @@ def default_root() -> Path:
 
 def _emit(report: str, path: Path | None) -> None:
     if path:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(report, encoding="utf-8")
     sys.stdout.write(report)
 
