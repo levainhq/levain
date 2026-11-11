@@ -435,6 +435,15 @@ def read_recorded_key(resource_key: str) -> str:
     return resource_key
 
 
+def recorded_key_forms(resource_key: str) -> tuple[str, ...]:
+    """Every spelling a journal row for this resource key may carry on disk, the current one first: an intention key was
+    written under the old prefix by the release that said "spore" and under the new one since. Any other key has one."""
+    key = read_recorded_key(resource_key)
+    if key.startswith(INTENTION_KEY_PREFIX):
+        return key, OLD_ROW_PREFIX + key[len(INTENTION_KEY_PREFIX):]
+    return (key,)
+
+
 def read_recorded_verb(verb: Any) -> Any:
     """A recorded verb id (a signed record's, a pending's), under its new name; anything else is returned as it is."""
     return OLD_KIND_TO_NEW.get(verb, verb) if isinstance(verb, str) else verb

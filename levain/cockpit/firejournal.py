@@ -57,6 +57,7 @@ from levain.cockpit.effects import (
     read_recorded_store,
     read_recorded_target,
     read_recorded_verb,
+    recorded_key_forms,
 )
 
 _OPERATION_ID = re.compile(r"cp[0-9a-f]{32}")
@@ -1466,20 +1467,23 @@ class CockpitDB:
 
     def label_for(self, resource_key: str, field: str, value_sha256: str) -> LabelRow | None:
         """The label that describes a field's current value (§5): in the current epoch, the row whose
-        value hash matches with the latest ``fired_at``, ties to the later-inserted pending."""
+        value hash matches with the latest ``fired_at``, ties to the later-inserted pending. A label the release that
+        said "spore" wrote sits under the old key prefix and a newer one under the new prefix; both name the same
+        resource, so the latest of either answers."""
+        forms = recorded_key_forms(resource_key)
         with self.read() as conn:
             epoch = _int_meta("-", _meta(conn, "epoch"), "epoch")
             row = conn.execute(
                 "SELECT l.*, p.record, p.record_sha256 FROM labels l "
                 "JOIN pendings p ON p.pending_id = l.operation_id "
-                "WHERE l.resource_key = ? AND l.field = ? AND l.value_sha256 = ? AND l.epoch = ? "
-                "ORDER BY l.fired_at DESC, p.rowid DESC LIMIT 1",
-                (resource_key, field, value_sha256, epoch)).fetchone()
+                f"WHERE l.resource_key IN ({', '.join('?' * len(forms))}) AND l.field = ? AND l.value_sha256 = ? "
+                "AND l.epoch = ? ORDER BY l.fired_at DESC, p.rowid DESC LIMIT 1",
+                (*forms, field, value_sha256, epoch)).fetchone()
         if row is None:
             return None
         _parse_record(row["operation_id"], row["record"], row["record_sha256"])
         _check_stamp(row["operation_id"], "label fired_at", row["fired_at"], nullable=False)
-        return LabelRow(resource_key=row["resource_key"], field=row["field"],
+        return LabelRow(resource_key=read_recorded_key(row["resource_key"]), field=row["field"],
                         operation_id=row["operation_id"], value_sha256=row["value_sha256"],
                         decision_kind=row["decision_kind"], signer_fp=row["signer_fp"],
                         credential=row["credential"], fired_at=row["fired_at"], epoch=row["epoch"])
