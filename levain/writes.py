@@ -702,7 +702,7 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     if expected_version is not None and (type(expected_version) is not str or not expected_version):
         raise EditError("bad_request", 400, "expected_version must be a non-empty string")
     guard = _VersionGuard(expected_version)
-    if expected_version is not None and not str(kind).startswith("spore_"):
+    if expected_version is not None and str(kind) not in _VERSIONED_KINDS:
         raise EditError("bad_request", 400, f"expected_version binds a spore write, not {kind!r}")
     # Serialize the entire mutation (read→check→backup→audit→write) across the
     # server's request threads — this is what makes single-writer true (L1 HIGH).
@@ -1602,6 +1602,11 @@ _VERB_KINDS = frozenset(
         "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update", "spore_retarget",
     }
 )
+# the kinds whose write may bind a row version: every verb kind but the episode tombstone (a spore kind, the old
+# ``startswith("spore_")`` check, spelled as the set it always was)
+_VERSIONED_KINDS = _VERB_KINDS - {"episode_tombstone"}
+# the audit-ledger kind of the three row verbs ``_apply_spore_verb`` serves, spelled out (it was built with an f-string)
+_AUDIT_KINDS = {"touch": "spore_touch", "descend": "spore_descend", "ascend": "spore_ascend"}
 
 
 def _require_confirm(req: dict[str, Any], what: str) -> None:
@@ -1940,7 +1945,7 @@ def _apply_spore_verb(
     elif descend_has_snapshot:
         extra["prior_disposition"] = descend_expect or LOOP_DISPOSITION
     edit_id = _audit_verb(
-        scope.ledger_root, kind=f"spore_{verb}", action=verb,
+        scope.ledger_root, kind=_AUDIT_KINDS[verb], action=verb,
         target=f"spore:{spore_id}", now=now, extra=extra,
     )
     return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}", "action": verb}
