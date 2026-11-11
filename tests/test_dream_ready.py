@@ -377,13 +377,30 @@ def test_check5_is_the_same_for_a_manual_run_it_no_longer_waives(ent):
 
 
 def test_check5_names_a_store_without_the_baton_policy_when_seats_are_live(ent):
-    """A store that does not require the baton leaves only anneal's wrap state and wrap.lock between a seat's own
-    consolidate and the dream; the detail says so (it is stated, not refused: D1_design 3.4)."""
+    """A store without the baton policy is named when seats are live (stated, not refused: D1_design 3.4), and the
+    detail says what keeps a seat's consolidate out (the open wrap) and what the policy adds (other ids only)."""
     ent.pending_launch()
-    assert "does NOT require the consolidate baton" in c5(ent.evaluate()).detail
+    v = ent.evaluate()
+    d = c5(v).detail
+    assert v.verdict == rd.READY and "does not require the consolidate baton" in d
+    assert "by that open wrap" in d and "another session id" in d
     _require_baton(ent, rd.SESSION_ID)
     v = ent.evaluate()
-    assert v.verdict == rd.READY and "does NOT require" not in c5(v).detail
+    assert v.verdict == rd.READY and "does not require" not in c5(v).detail
+
+
+def test_the_open_wrap_not_the_baton_keeps_a_seat_under_this_installs_id_out(ent):
+    """The module docstring's safety argument, run: on a store with the policy and the baton held by this install, the
+    dream's open wrap refuses a second prepare_wrap under the SAME id (a Levain seat), while another id is downgraded to
+    capture-only by the policy."""
+    from anneal_memory import WrapInProgressError
+
+    _require_baton(ent, rd.SESSION_ID)
+    with Store(str(ent.db), section_schema=None) as dream, Store(str(ent.db), section_schema=None) as seat:
+        assert prepare_wrap(dream, wrap_token="a" * 32, session_id=rd.SESSION_ID)["status"] == "ready"
+        with pytest.raises(WrapInProgressError):
+            prepare_wrap(seat, wrap_token="b" * 32, session_id=rd.SESSION_ID)
+        assert prepare_wrap(seat, wrap_token="c" * 32, session_id="some-seat")["status"].startswith("downgraded")
 
 
 @pytest.mark.parametrize("seat", ["launch", "thread", "hooked"])
