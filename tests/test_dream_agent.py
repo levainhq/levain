@@ -57,7 +57,7 @@ def test_the_role_and_spec_pass_the_real_parsers_and_every_refusal_rule(astore):
     # the name "dream" is reserved: the dream's own registration passes it, an operator's registration does not
     assert refuse.check_spec(spec, role=role, default_zone=ZONE, names_held=frozenset(), as_dream=True) == []
     assert [r.rule for r in refuse.check_spec(spec, role=role, default_zone=ZONE, names_held=frozenset())] == ["name"]
-    assert spec["stop_at"] == 3600 and spec["trigger"]["cron"] == "*/20 22-23,0-4 * * *"
+    assert spec["stop_at"] == 3600 and spec["trigger"]["cron"] == "0,20,40 0-4 * * *"
     assert spec["trigger"]["window"] == {"start": "22:00", "end": "05:00"}
     assert spec["on_failure"] == {"pause_after": 2} and spec["overlap"] == "skip" and spec["missed"] == "skip"
     assert refuse.derived_flags(role)["review_required"] is True
@@ -107,7 +107,7 @@ def test_an_install_with_no_default_zone_refuses_and_names_the_verb(tmp_path):
 def test_a_changed_spec_needs_revise_and_never_overwrites(astore, monkeypatch):
     da.register_dream(astore)
     real = da.dream_spec
-    monkeypatch.setattr(da, "dream_spec", lambda h, binding=None: {**real(h, binding), "stop_at": 3000})
+    monkeypatch.setattr(da, "dream_spec", lambda h, binding=None, **kw: {**real(h, binding, **kw), "stop_at": 3000})
     with pytest.raises(da.EnableRefused, match="rule 4"):
         da.register_dream(astore)
     assert da.register_dream(astore, revise=True).version == 2
@@ -124,7 +124,7 @@ def test_the_enable_verb_registers_prints_the_card_and_signs_nothing(tmp_path, c
     args = p.parse_args(["dream", "enable", "--agent-store-dir", str(store_dir), "--json"])
     assert args.func(args) == 0
     doc = json.loads(capsys.readouterr().out)
-    assert doc["created"] and doc["zone"] == ZONE and "between 22:00 and 05:00 (America/New_York)" in doc["signing_card"]
+    assert doc["created"] and doc["zone"] == ZONE and "starting at 00:00 (America/New_York)" in doc["signing_card"]
     assert "$20.00 a run and $40.00 a night" in doc["signing_card"] and "levain dream rollback" in doc["signing_card"]
     bare = tmp_path / "bare"
     args = p.parse_args(["dream", "enable", "--agent-store-dir", str(bare)])
@@ -135,8 +135,8 @@ def _trigger():
     return {"cron": da.CRON, "window": dict(rd.WINDOW)}
 
 
-@pytest.mark.parametrize("opens,n", [((2026, 10, 30), 21), ((2026, 10, 31), 24), ((2026, 11, 7), 21), ((2027, 3, 13), 18)])
-def test_the_window_has_21_slots_a_night_24_on_fall_back_and_18_on_spring_forward(opens, n):
+@pytest.mark.parametrize("opens,n", [((2026, 10, 30), 15), ((2026, 10, 31), 18), ((2026, 11, 7), 15), ((2027, 3, 13), 12)])
+def test_the_default_night_has_15_slots_18_on_fall_back_and_12_on_spring_forward(opens, n):
     start = datetime(*opens, 21, 59, tzinfo=NY)
     end = datetime(*opens, 5, 0, tzinfo=NY) + timedelta(days=1)
     slots = schedule.slots_between(_trigger(), ZONE, start, end)
@@ -239,6 +239,17 @@ class Night:
         return rd._read_occurrences(self.ent.agent_dir)
 
 
+def hold_a_wrap_open(ent) -> None:
+    """A wrap some other session left open on the store: every slot's check 2 is quiet (``wrap-open``), a reason that is
+    news. (A live seat used to make every slot quiet here; since D1-L1 a live seat is noted, not refused, so the
+    standing-item rule is exercised with a refusal that still exists.)"""
+    from anneal_memory import Store
+    from anneal_memory.continuity import prepare_wrap
+
+    with Store(str(ent.db), section_schema=None) as s:
+        assert prepare_wrap(s, wrap_token="a" * 32)["status"] == "ready"
+
+
 def filed(store, **kw):
     from levain.desk.store import StoreAbsent
 
@@ -255,19 +266,19 @@ def count(out):
     return c
 
 
-def test_a_full_21_slot_night_is_one_done_and_twenty_skipped_no_input(tmp_path):
+def test_a_full_15_slot_night_is_one_done_and_fourteen_skipped_no_input(tmp_path):
     n = Night(tmp_path)
     slots, out = n.run(date(2026, 10, 30))
-    assert len(slots) == 21 and count(out) == {"done": 1, "skipped-no-input": 20}
+    assert len(slots) == 15 and count(out) == {"done": 1, "skipped-no-input": 14}
     assert out[0][1] == "done"
     skipped = [r for r in n.rows() if r["state"] == "skipped-no-input"]
     assert {da.parse_recorded(r["reason"])[:2] for r in skipped} == {("quiet", "already-dreamed")}
 
 
-def test_the_fall_back_night_has_24_slots_and_still_one_done(tmp_path):
+def test_the_fall_back_night_has_18_slots_and_still_one_done(tmp_path):
     n = Night(tmp_path)
     slots, out = n.run(date(2026, 10, 31))
-    assert len(slots) == 24 and count(out) == {"done": 1, "skipped-no-input": 23}
+    assert len(slots) == 18 and count(out) == {"done": 1, "skipped-no-input": 17}
 
 
 def test_three_nights_on_one_persistent_store(tmp_path):
@@ -290,9 +301,9 @@ def test_three_nights_on_one_persistent_store(tmp_path):
     assert not second_rb.ok, "a rollback after a rollback must refuse: only the newest dream is one step back"
 
 
-def test_a_night_with_a_live_seat_after_the_first_slots_files_one_card_and_a_second_such_night_files_none(tmp_path):
+def test_a_night_with_a_wrap_left_open_files_one_card_and_a_second_such_night_files_none(tmp_path):
     n = Night(tmp_path)
-    n.ent.awake(["thread-a"], until=utc(2030, 1, 1).timestamp())
+    hold_a_wrap_open(n.ent)
     q = tmp_path / "q"
     q.mkdir(mode=0o700)
     rs = CoordStore(q)
@@ -300,7 +311,7 @@ def test_a_night_with_a_live_seat_after_the_first_slots_files_one_card_and_a_sec
     n.run(day1)
     after = datetime(2026, 10, 31, 5, 0, tzinfo=NY)
     r1 = da.close_window(agent_id=AID, day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED, occ_dir=tmp_path)
-    assert r1.action == "filed" and r1.cls == "live-seat"
+    assert r1.action == "filed" and r1.cls == "wrap-open"
     assert r1.action == "filed" and len(filed(rs)) == 1
     again = da.close_window(agent_id=AID, day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
     assert again.action == "duplicate"
@@ -308,13 +319,13 @@ def test_a_night_with_a_live_seat_after_the_first_slots_files_one_card_and_a_sec
     r2 = da.close_window(agent_id=AID, day=day2, now=after + timedelta(days=1), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
     assert r2.action == "standing" and len(filed(rs)) == 1
     item = filed(rs)[0]
-    assert item.body["kind"] == "did-not-consolidate" and item.body["reason"].startswith("live-seat: night did not")
+    assert item.body["kind"] == "did-not-consolidate" and item.body["reason"].startswith("wrap-open: night did not")
     assert item.authority_relevant is False
 
 
 def test_a_cleared_standing_item_lets_the_next_night_file_again(tmp_path):
     n = Night(tmp_path)
-    n.ent.awake(["thread-a"], until=utc(2030, 1, 1).timestamp())
+    hold_a_wrap_open(n.ent)
     q = tmp_path / "q"
     q.mkdir(mode=0o700)
     rs = CoordStore(q)
@@ -331,7 +342,7 @@ def test_a_cleared_standing_item_lets_the_next_night_file_again(tmp_path):
 def test_a_failing_night_files_exactly_one_failed_card_not_one_per_slot(tmp_path):
     n = Night(tmp_path)
     slots, out = n.run(date(2026, 10, 30), fail=True)
-    assert count(out) == {"failed": 1, "skipped-no-input": 20}
+    assert count(out) == {"failed": 1, "skipped-no-input": 14}
     q = tmp_path / "q"
     q.mkdir(mode=0o700)
     rs = CoordStore(q)
@@ -344,7 +355,7 @@ def test_a_failing_night_files_exactly_one_failed_card_not_one_per_slot(tmp_path
 def test_a_quiet_day_with_nothing_to_consolidate_files_no_card(tmp_path):
     n = Night(tmp_path, episodes=0)
     slots, out = n.run(date(2026, 10, 30))
-    assert count(out) == {"skipped-no-input": 21}
+    assert count(out) == {"skipped-no-input": 15}
     q = tmp_path / "q"
     q.mkdir(mode=0o700)
     r = da.close_window(agent_id=AID, day=date(2026, 10, 30), now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(),
@@ -836,3 +847,190 @@ def test_a_defect_in_the_shipped_spec_is_not_dressed_as_an_enable_refusal(astore
     monkeypatch.setattr(spec_mod, "parse_spec", bad)
     with pytest.raises(spec_mod.SpecError, match="template defect"):
         da.register_dream(astore)
+
+
+# ------------------------------------------------------------------------- D1-L1: the dream's time is an install setting
+
+@pytest.mark.parametrize("text", ["00:00", "00:19", "03:15", "04:00", "04:19", "22:00", "22:19", "23:10", "01:05"])
+def test_a_time_inside_the_window_with_a_minute_under_20_is_accepted_as_written(text):
+    assert da.validate_time(text) == text
+
+
+@pytest.mark.parametrize("text", [
+    "", "0:00", "00:0", "000:00", "00:00:00", "24:00", "00:60", "ab:cd", " 00:00", "00:00 ", "00:00\n", "00-00", "0000",
+    "12am", "٠٠:٠٠",                                            # not HH:MM at all (the last is Arabic-Indic digits)
+    "05:00", "12:00", "21:59",                                   # outside the window (22:00 up to 05:00)
+    "00:20", "00:30", "03:45", "04:59", "22:59"])                # a minute of 20+: the first hour's retry slots would fire early
+def test_a_time_that_is_not_hh_mm_or_cannot_be_honoured_is_refused_never_repaired(text):
+    with pytest.raises(da.TimeRefused):
+        da.validate_time(text)
+
+
+@pytest.mark.parametrize("value", [None, 0, 3, 0.0, True, b"00:00", ["00:00"]])
+def test_a_time_that_is_not_a_string_is_refused(value):
+    with pytest.raises(da.TimeRefused):
+        da.validate_time(value)
+
+
+def _night_slots(time: str, opens: tuple[int, int, int] = (2026, 11, 7)) -> list[datetime]:
+    trig = {"cron": da.cron_for(time), "window": dict(rd.WINDOW)}
+    start = datetime(*opens, 21, 59, tzinfo=NY)
+    end = datetime(*opens, 5, 0, tzinfo=NY) + timedelta(days=1)
+    return [s.astimezone(NY) for s in schedule.slots_between(trig, ZONE, start, end)]
+
+
+@pytest.mark.parametrize("time", ["00:00", "00:15", "03:00", "03:19", "04:00", "04:19", "22:00", "22:10", "23:00", "23:19"])
+def test_the_first_slot_is_the_time_then_every_20_minutes_until_05_00_and_none_before_it(time):
+    """The schedule's own walk over real instants (the stored zone, DST-aware): the time is the FIRST slot of the night,
+    the retries step by 20 minutes, nothing fires before the time, and the last is before 05:00."""
+    slots = _night_slots(time)
+    first = slots[0]
+    assert (first.hour, first.minute) == (int(time[:2]), int(time[3:]))
+    assert all((b - a) == timedelta(minutes=20) for a, b in zip(slots, slots[1:]))
+    assert slots[-1] < datetime(2026, 11, 8, 5, 0, tzinfo=NY) <= slots[-1] + timedelta(minutes=20)
+    assert [s for s in slots if s < first] == []
+
+
+def test_the_default_is_flows_slot_00_00_and_matches_its_cron_form():
+    assert da.DEFAULT_TIME == "00:00" and da.CRON == da.cron_for("00:00") == "0,20,40 0-4 * * *"
+    slots = _night_slots("00:00")
+    assert len(slots) == 15 and slots[0] == datetime(2026, 11, 8, 0, 0, tzinfo=NY)
+    assert slots[-1] == datetime(2026, 11, 8, 4, 40, tzinfo=NY)
+    # the old default (22:00 on) is exactly the 22:00 setting, so a night that wants it can still say so
+    assert len(_night_slots("22:00")) == 21 and da.cron_for("22:00") == "0,20,40 22-23,0-4 * * *"
+
+
+def test_every_slot_of_a_night_keeps_the_one_window_key_whatever_the_time():
+    for time in ("22:10", "23:00", "00:00", "04:00"):
+        trig = {"cron": da.cron_for(time), "window": dict(rd.WINDOW)}
+        slots = schedule.slots_between(trig, ZONE, datetime(2026, 11, 7, 21, 59, tzinfo=NY),
+                                       datetime(2026, 11, 8, 5, 0, tzinfo=NY))
+        assert {schedule.window_key(trig, ZONE, s) for s in slots} == {rd.window_key_for(date(2026, 11, 7))}, time
+
+
+def test_a_time_in_the_hour_that_does_not_exist_is_skipped_not_shifted_by_the_schedule():
+    """No zone arithmetic is invented here: spring-forward 2027-03-14 02:00 -> 03:00, so a 02:10 setting has no 02:xx slot,
+    and the night's first slot is the schedule's own next one (03:10)."""
+    slots = _night_slots("02:10", opens=(2027, 3, 13))
+    assert slots[0] == datetime(2027, 3, 14, 3, 10, tzinfo=NY) and all(s.hour != 2 for s in slots)
+
+
+def test_the_time_is_in_the_spec_so_a_changed_time_is_a_new_spec_and_a_revert_is_refused_by_name(astore):
+    first = da.register_dream(astore, time="00:00")
+    assert first.created and first.version == 1
+    same = da.register_dream(astore, time="00:00")
+    assert not same.created and same.spec_hash == first.spec_hash
+    with pytest.raises(da.EnableRefused, match="rule 4"):                      # a changed time without --revise never overwrites
+        da.register_dream(astore, time="03:15")
+    moved = da.register_dream(astore, time="03:15", revise=True)
+    assert moved.version == 2 and moved.spec_hash != first.spec_hash
+    stored = spec_mod.stored_specs(astore)["dream"]
+    assert stored["trigger"]["cron"] == "15,35,55 3-4 * * *" and stored["trigger"]["window"] == {"start": "22:00", "end": "05:00"}
+    assert da.dream_spec("r" * 64, time="03:15")["trigger"]["cron"] == stored["trigger"]["cron"]
+    assert da.dream_spec("r" * 64)["trigger"]["cron"] == da.CRON                       # the default still reads as before
+
+
+def test_register_dream_refuses_a_bad_time_before_anything_is_written(astore):
+    for bad in ("12:00", "0:00", "00:30", None):
+        with pytest.raises(da.EnableRefused):
+            da.register_dream(astore, time=bad)
+    assert spec_mod.list_agents(astore) == []
+
+
+def test_the_signing_card_says_the_time_and_no_longer_says_no_session_is_live():
+    card = da.signing_card_text(ZONE, per_run_usd=20.0, night_usd=40.0, expires="E", time="03:15")
+    assert "starting at 03:15 (America/New_York)" in card and "every 20 minutes until 05:00" in card
+    assert "between 22:00 and 05:00" not in card and "no session is live" not in card
+    assert "Seats may be live" in card and "new signed link" in card
+    assert "starting at 00:00" in da.signing_card_text(ZONE, per_run_usd=20.0, night_usd=40.0, expires="E")
+    shadow = da.shadow_signing_card_text(ZONE, flow_root="/f", scratch="/s", coord_dir="/c", agent_dir="/a",
+                                         flow_instructions="/i", facts_path="/x", model="m", per_run_usd=20.0,
+                                         night_usd=40.0, expires="E", time="00:15")
+    assert "starting at 00:15 (America/New_York)" in shadow and "between 22:00 and 05:00" not in shadow
+    with pytest.raises(da.TimeRefused):
+        da.signing_card_text(ZONE, per_run_usd=1.0, night_usd=2.0, expires="E", time="12:00")
+
+
+def _enable(tmp_path, capsys, *extra):
+    import argparse
+
+    from levain.dream.cli import add_parsers
+
+    store_dir = tmp_path / "ag"
+    agent_store.set_default_zone(agent_store.open_agent_store(store_dir), ZONE)
+    p = argparse.ArgumentParser()
+    add_parsers(p.add_subparsers())
+    args = p.parse_args(["dream", "enable", "--agent-store-dir", str(store_dir), "--json", *extra])
+    code = args.func(args)
+    cap = capsys.readouterr()
+    return code, cap.out, cap.err, store_dir
+
+
+def test_the_enable_verb_takes_the_time_and_prints_it_in_the_card(tmp_path, capsys):
+    code, out, _, store_dir = _enable(tmp_path, capsys, "--time", "03:15")
+    doc = json.loads(out)
+    assert code == 0 and doc["time"] == "03:15" and "starting at 03:15 (America/New_York)" in doc["signing_card"]
+    assert spec_mod.stored_specs(agent_store.open_agent_store(store_dir))["dream"]["trigger"]["cron"] == "15,35,55 3-4 * * *"
+
+
+def test_the_enable_verb_refuses_a_bad_time_and_writes_nothing(tmp_path, capsys):
+    for i, bad in enumerate(("12:00", "0:00", "00:30", "03:15:00")):
+        (tmp_path / f"t{i}").mkdir()
+        code, out, err, store_dir = _enable(tmp_path / f"t{i}", capsys, "--time", bad)
+        assert code == 1 and out == "" and "levain dream enable:" in err and "nothing was registered" in err, bad
+        assert spec_mod.list_agents(agent_store.open_agent_store(store_dir)) == [], bad
+
+
+def test_a_changed_time_through_the_verb_needs_revise_and_says_so(tmp_path, capsys):
+    code, _, _, store_dir = _enable(tmp_path, capsys)
+    assert code == 0
+    import argparse
+
+    from levain.dream.cli import add_parsers
+
+    p = argparse.ArgumentParser()
+    add_parsers(p.add_subparsers())
+    args = p.parse_args(["dream", "enable", "--agent-store-dir", str(store_dir), "--time", "03:00"])
+    assert args.func(args) == 1 and "rule 4" in capsys.readouterr().err
+
+
+def test_a_changed_time_is_a_re_sign_the_old_signed_link_no_longer_covers_the_new_spec(tmp_path):
+    """The link signs ``spec_hash``; the launch takes only a link whose ``spec_hash`` is the occurrence's. A real signed
+    link over the 00:00 spec admits a 00:00 occurrence and ends a 03:15 occurrence ``no_link``; a link signed for 03:15
+    then admits it. (The rig and the signer are the launch tests' own.)"""
+    import shutil
+
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("needs ssh-keygen")
+    pytest.importorskip("cryptography")
+    from tests.test_agents_launch import BINDING, Rig, _stopped  # noqa: F401
+    from tests.test_authority_agent_link import link as link_record
+    from tests.test_authority_graduation_kind import World
+    from levain.agents.authority_replica import AgentAuthority
+
+    class DreamRig(Rig):
+        def __init__(self, tmp):
+            self.world = World(tmp)
+            self.store = agent_store.open_agent_store(tmp / "s")
+            agent_store.set_default_zone(self.store, ZONE)
+            reg = da.register_dream(self.store, time="00:00")
+            self.agent, self.spec_hash = reg.agent_id, reg.spec_hash
+            with self.store.read() as c:
+                self.sid = c.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()[0]
+            self.authority = AgentAuthority(self.world.root)
+            self.n = 0
+
+    rig = DreamRig(tmp_path)
+    rig.link()                                                  # the operator signs the 00:00 dream's link
+    oid_old = rig.claim("k-0000")
+    assert rig.launch(oid_old, on_input=None).outcome == "launched"
+    rig.finish(oid_old)
+    old_hash = rig.spec_hash
+    moved = da.register_dream(rig.store, time="03:15", revise=True)               # the time changes: a new spec
+    assert moved.spec_hash != old_hash and moved.agent_id == rig.agent
+    rig.spec_hash = moved.spec_hash
+    oid_new = rig.claim("k-0315")
+    _stopped(rig, oid_new, "no_link", rig.launch(oid_new, on_input=None))        # the old signature does not cover it
+    rig.link()                                                  # a new link, over the new spec_hash
+    oid_next = rig.claim("k-0316")
+    assert rig.launch(oid_next, on_input=None).outcome == "launched"

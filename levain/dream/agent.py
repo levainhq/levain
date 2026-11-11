@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -41,8 +42,62 @@ from levain.dream import snapshot as _snap
 _log = logging.getLogger("levain.dream.agent")
 
 NAME = "dream"
-CRON = "*/20 22-23,0-4 * * *"
 WINDOW = dict(_ready.WINDOW)
+#: the dream's time of night (local, in the install's zone) unless the operator sets another: flow's measured slot.
+#: The setting is the FIRST slot; the same 20-minute retry slots follow until the window ends (05:00), so a quiet slot
+#: (a wrap open, a baton not ours) is tried again. The window (22:00-05:00) and the 05:00 dream-day boundary do not move.
+DEFAULT_TIME = "00:00"
+RETRY_MINUTES = 20
+
+
+class TimeRefused(ValueError):
+    """The dream's time setting is not one this install can honour; the message says which rule."""
+
+
+def validate_time(value: object) -> str:
+    """``value`` as the canonical ``HH:MM`` (24 hour, local to the install's zone) the dream may start at, or
+    :class:`TimeRefused`. Strict, and nothing is repaired: only a string of exactly two digits, a colon and two digits is
+    read (no spaces, no ``9:30``, no ``12am``, no zone suffix); the hour is 00-23 and the minute 00-59. Then the two
+    rules the schedule imposes, each refused rather than bent:
+
+    * the time lies inside the window (22:00 up to, not including, 05:00): the window and the 05:00 dream-day boundary
+      stay, so a time outside it would never fire; and
+    * the minute is 00-19: the retry slots are every :data:`RETRY_MINUTES` minutes on the grid the minute sets, and a
+      cron field cannot start the grid mid-hour, so a minute of 20 or more would also fire at the grid's earlier slots of
+      the first hour, BEFORE the time the operator named.
+
+    No zone arithmetic happens here: the time is a wall-clock time in the install's own zone, which the schedule
+    (:func:`levain.agents.schedule.slots_between`, which reads the agent's stored zone) already handles."""
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]{2}:[0-9]{2}", value) is None:
+        raise TimeRefused(f"the dream's time {str(value)[:20]!r} is not HH:MM (24 hour, two digits each, e.g. 00:00 or 03:15)")
+    hour, minute = int(value[:2]), int(value[3:])
+    if hour > 23 or minute > 59:
+        raise TimeRefused(f"the dream's time {value!r} is not a time of day (hour 00-23, minute 00-59)")
+    if not (hour >= int(WINDOW["start"][:2]) or hour < int(WINDOW["end"][:2])):
+        raise TimeRefused(f"the dream's time {value} is outside its window {WINDOW['start']}-{WINDOW['end']}, which "
+                          "does not move: pick a time inside it")
+    if minute >= RETRY_MINUTES:
+        raise TimeRefused(f"the dream's time {value} has a minute of {RETRY_MINUTES} or more: its {RETRY_MINUTES}-minute "
+                          f"retry slots would then fire earlier in that hour, before {value}. Pick a minute from 00 to "
+                          f"{RETRY_MINUTES - 1} (for example {value[:2]}:00 or {value[:2]}:15)")
+    return value
+
+
+def cron_for(time: str = DEFAULT_TIME) -> str:
+    """The cron of the dream's slots for ``time`` (:func:`validate_time`): the minute grid of the time's minute every
+    :data:`RETRY_MINUTES` minutes, in the hours from the time's hour to 04:xx. Intersected with the window by the
+    schedule, this is the time itself, then a retry every 20 minutes until 05:00."""
+    t = validate_time(time)
+    hour, minute = int(t[:2]), int(t[3:])
+    minutes = ",".join(str(minute + k * RETRY_MINUTES) for k in range(60 // RETRY_MINUTES))
+    last = int(WINDOW["end"].split(":")[0]) - 1
+    hours = (f"{hour}-{last}" if hour < last else str(hour)) if hour <= last else (
+        (f"{hour}-23" if hour < 23 else "23") + f",0-{last}")
+    return f"{minutes} {hours} * * *"
+
+
+#: the cron of the default time (kept as a name: a caller that does not set a time reads it)
+CRON = cron_for(DEFAULT_TIME)
 STOP_AT_S = 3600
 PAUSE_AFTER = 2
 WIN_CHECK = "dream.win"
@@ -83,13 +138,18 @@ SHADOW_SOURCE = ("a SHADOW of flow's dream, bound to these install facts (a chan
                  "signed link): ")
 
 
-def dream_spec(role_hash: str, binding: str | None = None) -> dict[str, Any]:
+def dream_spec(role_hash: str, binding: str | None = None, time: str = DEFAULT_TIME) -> dict[str, Any]:
     """The AgentSpec template (§1.2). The zone is left unset: the install's default zone fills it (rule 6), and an
     install with none refuses, naming ``levain agents zone``. One ``output`` is the spec's shape; it carries the
     morning card (the push output). The corpus and recovery outputs of §1.3 have no field in a spec.
 
     ``binding`` (:func:`shadow_binding`) makes it a SHADOW install's spec: the install facts are part of the signed
-    object, so a link signed for one shadow install never covers another, nor a live one (and the reverse)."""
+    object, so a link signed for one shadow install never covers another, nor a live one (and the reverse).
+
+    ``time`` (:func:`validate_time`) is the dream's time of night, an install setting; it is written into the spec as the
+    trigger's cron (:func:`cron_for`), so it is part of the signed object too: the link names the spec's hash, and the
+    launch takes only a link whose ``spec_hash`` is the occurrence's, so a changed time is a new spec (``enable --revise``)
+    and an old signature no longer covers it. A time that is refused raises :class:`TimeRefused`."""
     return {
         "name": NAME,
         "role": {"name": NAME, "role_hash": role_hash},
@@ -99,7 +159,7 @@ def dream_spec(role_hash: str, binding: str | None = None) -> dict[str, Any]:
                    "reader": "flow at /morning; Phill only for authority_relevant cards",
                    "moment": "/morning, cleared by 14:00 the next day"},
         "win": {"kind": "verifier", "check": WIN_CHECK},
-        "trigger": {"kind": "schedule", "cron": CRON, "window": dict(WINDOW)},
+        "trigger": {"kind": "schedule", "cron": cron_for(time), "window": dict(WINDOW)},
         "stop_at": STOP_AT_S,
         "overlap": "skip", "missed": "skip", "on_failure": {"pause_after": PAUSE_AFTER},
         "memory": "stateless", "placement": "local", "feeds": []}
@@ -119,7 +179,8 @@ class Registered:
     zone: str
 
 
-def register_dream(store: Any, *, revise: bool = False, binding: str | None = None) -> Registered:
+def register_dream(store: Any, *, revise: bool = False, binding: str | None = None,
+                   time: str = DEFAULT_TIME) -> Registered:
     """Register the role and the spec in ``store`` (an :class:`~levain.agents.store.AgentStore`) and attach the spec to the
     store's operator agent, on every exit including the same-content one (that is how an install whose dream was registered
     before K2b gets attached). Idempotent: the same content registers nothing twice and attaches once. Raises :class:`EnableRefused` with every refusal; nothing is written when a
@@ -128,7 +189,10 @@ def register_dream(store: Any, *, revise: bool = False, binding: str | None = No
     from levain.agents.store import AgentStoreRefused, get_default_zone
 
     role = _role.parse_role(dream_role())
-    parsed = _spec.parse_spec(dream_spec(_role.role_hash(role), binding))    # pure: a defect in the shipped spec is a bug, not a refusal
+    try:
+        parsed = _spec.parse_spec(dream_spec(_role.role_hash(role), binding, time=time))    # pure: a defect in the shipped spec is a bug, not a refusal
+    except TimeRefused as exc:
+        raise EnableRefused(str(exc)) from exc
     try:    # any store call can meet a moved marker, so none sits outside the guard
         zone = get_default_zone(store)
         held = {a["name"] for a in _spec.list_agents(store)}
@@ -158,10 +222,22 @@ def _same(store: Any, parsed: Mapping[str, Any], zone: str | None) -> bool:
         return False
 
 
-def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expires: str) -> str:
-    """The words the link's signing card carries (§6), with the numbers the caller computed from §2.4's ``R``."""
-    return (f"Dream consolidates this install's memory once a night, between 22:00 and 05:00 ({zone}), and only when "
-            "the day has new episodes and no session is live. It writes the always-loaded memory text, never the "
+def _when_text(zone: str, time: str) -> str:
+    """The schedule sentence both cards carry, from the time setting (:func:`validate_time`) and the window."""
+    return (f"once a night, starting at {validate_time(time)} ({zone}) and tried again every {RETRY_MINUTES} minutes "
+            f"until {WINDOW['end']} if it could not start")
+
+
+def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expires: str,
+                      time: str = DEFAULT_TIME) -> str:
+    """The words the link's signing card carries (§6), with the numbers the caller computed from §2.4's ``R``. ``time``
+    is the install's time setting; it is part of the spec the link signs, so the card says it and a changed time is a
+    new card to sign."""
+    return (f"Dream consolidates this install's memory {_when_text(zone, time)}, and only when the day has new "
+            "episodes and no other consolidation is in progress. Seats may be live while it runs: it works from the "
+            "episodes recorded before it starts, and whatever a seat records during it is kept and goes to the next "
+            "dream. The time is part of what you sign: a new time needs a new signed link. "
+            "It writes the always-loaded memory text, never the "
             "crystal tier, and it never sends, pushes or publishes. It spends at most "
             f"${per_run_usd:.2f} a run and ${night_usd:.2f} a night (2 runs) at list price; each compose stops early "
             "enough that the one model call that can run past its cap still fits inside the run's limit. Undo: "
@@ -171,11 +247,12 @@ def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expire
 
 def shadow_signing_card_text(zone: str, *, flow_root: Path | str, scratch: Path | str, coord_dir: Path | str,
                              agent_dir: Path | str, flow_instructions: Path | str, facts_path: Path | str | None,
-                             model: str, per_run_usd: float, night_usd: float, expires: str) -> str:
+                             model: str, per_run_usd: float, night_usd: float, expires: str,
+                             time: str = DEFAULT_TIME) -> str:
     """The signing card's words for a SHADOW install (D1_EXECUTOR section 8): what it reads, every place it writes and
     what it costs, from the install's own facts and the caller's ``R``. The spec the link signs binds these facts
     (:func:`shadow_binding`), so the card describes the object signed."""
-    return (f"Dream runs as a SHADOW of flow's dream, once a night between 22:00 and 05:00 ({zone}), and only for a "
+    return (f"Dream runs as a SHADOW of flow's dream, {_when_text(zone, time)}, and only for a "
             f"day flow's own dream has committed. Its input is flow's committed pre-dream snapshot under {flow_root}, "
             "read only, each file checked against the hash that snapshot's own manifest records, and copied into the "
             f"scratch store {scratch}. It writes: that scratch store; one comparison card a night in the desk "
@@ -188,7 +265,7 @@ def shadow_signing_card_text(zone: str, *, flow_root: Path | str, scratch: Path 
                if facts_path is not None else
                "No first-run facts file is named, so every fire refuses until one is. ")
             + f"It composes with {model}, a paid model call at list price, and spends at most ${per_run_usd:.2f} a run "
-            f"and ${night_usd:.2f} a night (2 runs), the same limits as a live dream. These paths and the model are bound "
+            f"and ${night_usd:.2f} a night (2 runs), the same limits as a live dream. These paths, the model and the time are bound "
             "into the spec this link signs: an enable that changes one writes a new spec (--revise), which needs a new "
             "signed link, and a fire whose facts differ from its spec's refuses. Undo: nothing to undo, the scratch "
             "store is a copy. Stop it with `levain agents pause`, `retire` or `revoke`, or by deleting the install "
@@ -417,6 +494,7 @@ def classify_window(rows: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
     if state == _ready.QUIET and kind in NOT_NEWS:
         return "", reason
     if state == _ready.QUIET and kind == "live-seat":
+        # no check answers this since D1-L1 (a live seat is noted, not refused); a row recorded before it can still carry it
         return "live-seat", reason
     return (kind if state in (_ready.QUIET, _ready.UNREADABLE) else "unknown"), reason
 
