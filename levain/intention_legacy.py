@@ -52,6 +52,15 @@ OLD_KIND_TO_NEW = {
 OLD_ROW_PREFIX = 'spore:'
 OLD_EFFECT_STORE = 'spores'
 
+# The same row prefix without its colon (the kind of a `<kind>:<id>` resource key a journal row carries), and the key an
+# old `/edit` body named its row by. The journal is history and the policy replay reads the first; the second is an old
+# spelling arriving as a NEW request, which is refused with a pointer.
+OLD_ROW_KIND = 'spore'
+OLD_ROW_ID_KEY = 'spore_id'
+
+# The old CLI command word. `levain spores ...` is refused with a pointer to `levain intentions ...` (ruling H10).
+OLD_CLI_COMMAND = 'spores'
+
 # The old id prefix: `spore-NNN` ids live in every store and, cited, in immutable history. The id resolver reads both
 # prefixes for good (ruling E1); nothing mints this prefix any more.
 OLD_ID_PREFIX = 'spore-'

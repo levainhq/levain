@@ -26,6 +26,7 @@ from levain.cockpit.effects import INTENTION_AUTHORITY_FIELDS, _stored_authority
 from levain.cockpit.engine import PANEL_READ_DEADLINE_S, Cockpit, ProviderSpec, ReadContext, row_version_of
 from levain.cockpit.registry import opened_day, parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
+from levain.intention_legacy import OLD_ROW_KIND, OLD_VERB_TO_NEW
 from levain.dashboard import (
     CLASS_A,
     CLASS_B,
@@ -782,7 +783,8 @@ _EDIT_PHRASES = {
 
 def _edit_target(resource_key: str) -> str:
     kind, _, ident = resource_key.partition(":")
-    if kind == "intention" and ident:
+    # a journal row an older release wrote names its item under the old kind: history reads it, nothing new writes it
+    if kind in ("intention", OLD_ROW_KIND) and ident:
         return f"item {ident}"
     if kind == "section" and ident:
         return f"the {ident} section"
@@ -811,7 +813,8 @@ def plain_edit_title(verb: str, target: str, credential: Any) -> str:
     """A broker fire as a sentence a person reads: ``resolved item intention-017, from the browser``."""
     verb = verb if isinstance(verb, str) else ""     # a journal row's verb is a string; a malformed one must not take the panel down
     target = target if isinstance(target, str) else ""     # likewise for a malformed target
-    phrase = _EDIT_PHRASES.get(verb) or verb.replace("_", " ")
+    # a journal row's verb is the id its release signed: an older release's reads through the legacy map
+    phrase = _EDIT_PHRASES.get(OLD_VERB_TO_NEW.get(verb, verb)) or verb.replace("_", " ")
     # a sort's drop reads as an aside to the line it was typed as: "added a line, sent to the desk to sort"
     said = (f"{phrase}, {target}" if target.startswith("sent to ") else " ".join(x for x in (phrase, target) if x))
     return ", ".join(x for x in (said, _edit_origin(credential)) if x)

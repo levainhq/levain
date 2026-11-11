@@ -89,6 +89,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from levain.intention_legacy import (
+    KEEP_EPISODE_META_KEY,
+    KEEP_PLAN_DEST_KIND,
+    KEEP_PLAN_ID_KEY,
+    KEEP_PLAN_STORE_KEY,
+)
+
 try:
     import fcntl
 except ImportError:                              # pragma: no cover - Windows: guarded writes are refused anyway
@@ -132,7 +139,7 @@ STATE_REVERT_BLOCKED = "revert_blocked"     # revert could not finish it (destin
 #                                             gone): never `reverted`, `revert_from` keeps its prior state, retried
 
 DEST_EPISODE = "episode"
-DEST_INTENTION = "spore"
+DEST_INTENTION = KEEP_PLAN_DEST_KIND     # a persisted plan key: a plan an older release wrote still names it
 EPISODE_TYPES = ("observation", "decision")
 INTENTION_DISPOSITIONS = ("seed", "agenda")
 
@@ -361,7 +368,7 @@ def plan(intentions_json: Path | str, *, migrations_dir: Path | str, episodic_db
             why = str(ov.get("why") or "destination set by override")
         item: dict[str, Any] = {
             "index": len(items),
-            "spore_id": row.get("id"),
+            KEEP_PLAN_ID_KEY: row.get("id"),
             "origin_key": okey,
             "disposition": _disp(row),
             "text": row.get("text", ""),
@@ -391,7 +398,7 @@ def plan(intentions_json: Path | str, *, migrations_dir: Path | str, episodic_db
     _atomic_write(out, {
         "kind": PLAN_KIND, "schema": PLAN_SCHEMA, "plan_id": out.stem,
         "created": (now or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
-        "spores_json": str(intentions_json),
+        KEEP_PLAN_STORE_KEY: str(intentions_json),
         "episodic_db": str(episodic_db) if episodic_db is not None else None,
         "options": {"handoff_to": handoff_to, "agenda_date": agenda_date},
         "counts": counts,
@@ -444,7 +451,7 @@ def _plan_lock(plan_path: Path) -> Iterator[None]:
 # ---------------------------------------------------------------- apply / revert
 
 def _item_key(item: Mapping[str, Any]) -> str:
-    return item.get("origin_key") or f"id:{item.get('spore_id')}"
+    return item.get("origin_key") or "id:" + str(item.get(KEEP_PLAN_ID_KEY))
 
 
 def _dest_key(plan_id: str, item: Mapping[str, Any]) -> str:
@@ -467,7 +474,7 @@ def _find_row(store: Any, item: Mapping[str, Any]) -> dict[str, Any] | None:
             row = None
         if row is not None:
             return row
-    sid = item.get("spore_id")
+    sid = item.get(KEEP_PLAN_ID_KEY)
     return store.get(sid) if sid else None
 
 
@@ -553,7 +560,7 @@ def _write_destination(item: dict[str, Any], plan_id: str, intentions: Any, db: 
             ep = st.record(
                 content=d["body"], episode_type=d["episode_type"], source=EPISODE_SOURCE,
                 metadata={"tags": list(d.get("tags") or EPISODE_TAGS), "plan": plan_id,
-                          "spore": item.get("spore_id")},
+                          KEEP_EPISODE_META_KEY: item.get(KEEP_PLAN_ID_KEY)},
                 origin_key=key)
         return {"kind": DEST_EPISODE, "id": ep.id, "origin_key": key}, None
     made, created = _add_verbatim(intentions, origin_key=key, row=item["row"], text=item["text"],
@@ -657,7 +664,7 @@ def apply(plan_path: Path | str, *, episodic_db: Path | str | None = None,
     pp = Path(plan_path).resolve()
     with _plan_lock(pp):
         doc = load_plan(pp)                    # read under the lock: never a copy another run is rewriting
-        intentions_json = Path(doc["spores_json"])
+        intentions_json = Path(doc[KEEP_PLAN_STORE_KEY])
         plan_id = doc["plan_id"]
         rep = Report(pp)
         live = (STATE_PENDING, STATE_DEST, STATE_STALE)
@@ -744,7 +751,7 @@ def revert(plan_path: Path | str, *, episodic_db: Path | str | None = None,
     with _plan_lock(pp):
         doc = load_plan(pp)
         plan_id = doc["plan_id"]
-        intentions_json = Path(doc["spores_json"])
+        intentions_json = Path(doc[KEEP_PLAN_STORE_KEY])
         restore_states = (STATE_APPLIED, STATE_DEST)
         if _needs_episodes(doc, restore_states + (STATE_CONFLICT, STATE_REVERT_BLOCKED)):
             db: Path | None = _episode_store(doc, episodic_db)

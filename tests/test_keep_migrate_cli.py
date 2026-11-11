@@ -60,7 +60,7 @@ def test_bad_handoff_to_is_refused_by_the_parser():
 
 def test_intentions_alone_needs_a_verb():
     with pytest.raises(SystemExit) as e:
-        main(["spores"])
+        main(["intentions"])
     assert e.value.code == 2
 
 
