@@ -101,3 +101,8 @@ def test_a_count_tile_with_no_note_names_its_first_row_as_one_clean_line(tmp_pat
     assert line.endswith("\u2026 +2 more") and "**" not in line and "FLOW BECOMES A LEVAIN INSTALL" in line, tile
     assert len(line) <= 90 + len(" +2 more"), tile
     assert tile["h"] < 260, tile
+
+
+def test_a_note_keeps_a_lone_marker_and_drops_nested_pairs(tmp_path, monkeypatch):
+    tile, _modal = _drive_tile(tmp_path, monkeypatch, "Run **use `desk` now** on lib/* and *this*")
+    assert tile["subs"] == ["Run use desk now on lib/* and this"], tile
