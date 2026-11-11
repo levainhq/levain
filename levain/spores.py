@@ -83,6 +83,7 @@ __all__ = [
     "DEFAULT_CHECK_BY_DAYS",
     "COMPLETION_KINDS",
     "done_event",
+    "norm_event",
     "event_anchor",
     "valid_check_by",
     "is_event_agenda",
@@ -355,6 +356,13 @@ _CHECK_BY = re.compile(r"\d{4}-\d{2}-\d{2}")
 def done_event(spore_id: str) -> str:
     """The event key that names ``spore_id`` finishing."""
     return EVENT_DONE_PREFIX + spore_id
+
+
+def norm_event(key: Any) -> str:
+    """``key`` with a ``done:`` id in one spelling (``spore-N`` and ``intention-N`` name the same intention), so two keys that
+    name the same first part compare equal whichever spelling a writer used; anything else comes back as it is."""
+    m = _EVENT_DONE.fullmatch(key) if isinstance(key, str) else None
+    return f"{EVENT_DONE_PREFIX}intention-{m.group(1).partition('-')[2]}" if m else str(key or "")
 
 
 def event_anchor(item: Mapping[str, Any]) -> str | None:

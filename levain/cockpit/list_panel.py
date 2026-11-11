@@ -189,6 +189,10 @@ def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, 
     items = view.tray
     rows: list[RowIn] = []
     later: list[RowIn] = []
+    waiting_on: dict[str, list[str]] = {}      # the first part's event key -> the ids of the parts that wait on it
+    for i, r in steer.items():
+        if r.get("on_event"):
+            waiting_on.setdefault(spores.norm_event(r["on_event"]), []).append(i)
     for s in items:
         raw = steer.get(s.id, {})
         if ringing and spores.ringing_ref(raw, ringing):
@@ -201,7 +205,7 @@ def _spore_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, 
         fires, overdue = _timing(s.next, now, ctx.today)
         extra: dict[str, Any] = {"surface": surface, "fires": fires, "overdue": overdue, "target": target,
                                  "attention": raw.get("attention") if isinstance(raw.get("attention"), str) else None}
-        waits = [i for i, r in steer.items() if r.get("on_event") == spores.done_event(s.id)]
+        waits = waiting_on.get(spores.norm_event(spores.done_event(s.id)), [])
         if waits:
             extra["then"] = waits      # the second parts that wait on this item finishing
         if raw and spores.is_event_agenda(raw):

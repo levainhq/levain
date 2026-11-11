@@ -221,3 +221,76 @@ def test_a_datetime_today_does_not_crash_the_row(tmp_path):
     root = _install(tmp_path)
     _add(root, "2026-11-05")
     assert len(doctor._check_overdue_agenda(root, today=datetime(2026, 11, 7, 3, 0))) == 1
+
+
+# --- an agenda that waits on an event (a split's second part): the hook and doctor count it as due too ---------------
+def _event_rig(tmp_path):
+    """One install, a real store: open and finished first parts, and second parts in every state the due rule reads."""
+    root = _install(tmp_path)
+    st = guarded_spore_store(root / ".levain" / "memory.spores.json")
+    kw = dict(type="task", disposition="agenda", target="band")
+    open_first = st.add(text="open first", **kw)["id"]
+    done_first = st.add(text="done first", **kw)["id"]
+    st.descend(done_first, kind="done")
+    ev = {}
+    ev["waiting"] = st.add(text="waits", on_event=f"done:{open_first}", check_by="2026-11-20", **kw)["id"]
+    ev["check_by_passed"] = st.add(text="ring", on_event=f"done:{open_first}", check_by="2026-11-06", **kw)["id"]
+    ev["first_done"] = st.add(text="woke", on_event=f"done:{done_first}", check_by="2026-11-20", **kw)["id"]
+    ev["stamped"] = st.add(text="stamped", on_event=f"done:{done_first}", check_by="2026-11-06",
+                           germinated={"on": "2026-11-06"}, **kw)["id"]
+    ev["no_check_by_old"] = st.add(text="old", on_event=f"done:{open_first}", today=date(2026, 10, 20), **kw)["id"]
+    ev["no_check_by_new"] = st.add(text="new", on_event=f"done:{open_first}", today=date(2026, 11, 3), **kw)["id"]
+    ev["other_key_check_by_passed"] = st.add(text="landed", on_event="landed:np-1", check_by="2026-11-06", **kw)["id"]
+    ev["dated_and_event_is_not_dated"] = st.add(text="both", on_event=f"done:{open_first}", check_by="2026-11-20", next="2026-11-01", **kw)["id"]
+    return root, st, ev
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_the_hook_and_doctor_agree_on_which_event_agendas_are_due(agent, tmp_path):
+    import re
+
+    h = _load(agent).hook
+    root, st, ev = _event_rig(tmp_path)
+    rows = st.list_open(today=TODAY)
+    hook_due = {s["id"] for s in h.due_agendas(rows, now=datetime(2026, 11, 7, 12, 0))}
+    rep = doctor._check_overdue_agenda(root, today=TODAY)
+    doc_due = set(re.findall(r"((?:intention|spore)-\d+) \(", rep[0].detail)) if rep else set()
+    expected = {ev["check_by_passed"], ev["first_done"], ev["no_check_by_old"], ev["other_key_check_by_passed"]}
+    assert hook_due == doc_due == expected and rep[0].warn
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_first_part_that_is_gone_is_worth_a_run_to_the_hook_and_not_to_doctor(agent, tmp_path):
+    """The hook sees open spores only, so it cannot tell a composted first part from a finished one: it asks for a run (the
+    run decides, and files nothing for a compost). Doctor reads the store and warns only for a finish."""
+    h = _load(agent).hook
+    root, st, ev = _event_rig(tmp_path)
+    composted = st.add(type="task", text="c", disposition="agenda", target="band")["id"]
+    st.descend(composted, kind="composted")
+    follower = st.add(type="task", text="after c", disposition="agenda", target="band", on_event=f"done:{composted}", check_by="2026-11-20")["id"]
+    assert follower in {s["id"] for s in h.due_agendas(st.list_open(today=TODAY), now=datetime(2026, 11, 7, 12, 0))}
+    rep = doctor._check_overdue_agenda(root, today=TODAY)
+    assert follower not in rep[0].detail
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_finished_first_part_makes_the_session_start_hook_spawn_germinate(agent, monkeypatch, capsys, tmp_path):
+    """The reproduced failure: a part whose first part was finished by any path waited for an unrelated dated agenda."""
+    mod = _load(agent)
+    root = _install(tmp_path)
+    st = guarded_spore_store(root / ".levain" / "memory.spores.json")
+    first = st.add(type="task", text="call Jim", disposition="agenda", target="band")["id"]
+    st.add(type="task", text="send the invoice", disposition="agenda", target="band", on_event=f"done:{first}",
+           check_by=(date.today() + timedelta(days=5)).isoformat())
+    spawned, ctx = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert spawned == [] and "[germinate]" not in ctx          # the first part is open: nothing to run
+    st.descend(first, kind="done")
+    spawned, ctx = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert len(spawned) == 1 and "[germinate] 1 agenda came due" in ctx
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_the_hooks_event_pattern_is_levains(agent):
+    from levain import spores
+
+    assert _load(agent).hook._EVENT_DONE_RE.pattern == spores._EVENT_DONE.pattern

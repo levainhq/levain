@@ -394,6 +394,15 @@ def _unbuilt_fire(why: str) -> Callable[..., dict[str, Any]]:
 
 
 _SPORE_ROW = lambda r: str(r.get("id", "")).startswith("spore:")   # noqa: E731
+
+
+def _machine_part(r: dict[str, Any]) -> bool:
+    """The row is an agenda handed to the desk or a board (its target says who does it)."""
+    from levain.spores import executor_of
+
+    return executor_of(_facet(r, "target")) == "machine"
+
+
 # an OPEN question row only: an answered one is a 409 (the row it was rendered on is no longer offered the verb)
 _OPEN_QUESTION_ROW = lambda r: (str(r.get("id", "")).startswith("question:")   # noqa: E731
                                 and _facet(r, "question_state") == "open")
@@ -1030,8 +1039,11 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("spore_then", "then you", "files what you do after this one is done as a new item that wakes in the band when "
              "this one is marked done, with a day to be asked if it has not", "row", fields=("text", "check_by"),
              floor="C1", tier_fn=_const("C1"), fire=_spore_fire("spore_then"), legacy_kind="spore_then",
-             # a band row for the operator only (no target a wake could send to an agent), so nothing here needs a signature
-             applies_to=lambda r: _SPORE_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() == "agenda"),
+             # a band row for the operator only (no target a wake could send to an agent), so nothing here needs a signature;
+             # offered on an agenda the operator does himself: a desk or board part is closed when it is handed off, so
+             # nothing could mark it done
+             applies_to=lambda r: (_SPORE_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() == "agenda"
+                                   and not _machine_part(r))),
     VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
              fire=_spore_fire("spore_set_disposition"), legacy_kind="spore_set_disposition", device_ok=True,

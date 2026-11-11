@@ -1601,7 +1601,7 @@ _VERB_KINDS = frozenset(
         "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone",
         # Slice 3b — the operator-I/O write kinds (capture + disposition + schedule +
         # the forming-workbench metadata edit: text / reclassify-type / re-tier):
-        "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update", "spore_retarget",
+        "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update", "spore_retarget", "spore_then",
     }
 )
 
@@ -2316,6 +2316,17 @@ def _apply_spore_surface_at(
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = guarded_spore_store(paths.spores_json)
     _refuse_if_ringing(scope, store, spore_id)
+    if surface_at:
+        from levain.spores import is_event_agenda
+
+        try:
+            waiting = store.get(spore_id)
+        except Exception:  # noqa: BLE001 - the write's own compare-and-set then refuses what is wrong
+            waiting = None
+        if isinstance(waiting, dict) and is_event_agenda(waiting):
+            raise EditError("bad_verb_arg", 422,
+                            f"{spore_id} waits on {waiting.get('on_event')}, not on a date: a part waits on an event or a "
+                            "date, never both. It is asked about on its check-by day if the event has not come")
     try:
         store.update(spore_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
     except ValueError as exc:

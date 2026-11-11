@@ -299,6 +299,8 @@ _PORTED_FNS = (
     # adapter-specific by design, so it gets its own body-parity test below.
     "format_wrap_blocked", "_config_dict", "configured_scope",
     "open_spores", "_is_loop", "_tokens", "spores_colliding", "due_dormant_spores",
+    # the germinate trigger: a dated agenda and one that waits on an event (a split's second part)
+    "due_agendas", "_event_due",
     "_format_spore_lines", "format_spore_collisions", "format_due_spores",
     # compatibility-manifest drift surface — byte-identical across both copies
     "read_manifest_lock", "_is_migrate_check", "compat_drift",

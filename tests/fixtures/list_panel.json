@@ -262,17 +262,6 @@
     },
     {
      "escalates": [],
-     "gesture": "direct",
-     "target": {
-      "panel_id": "tray",
-      "row_id": "spore:spore-006",
-      "row_version": "e1c59b494abc5a5f"
-     },
-     "tier": "C1",
-     "verb": "spore_then"
-    },
-    {
-     "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
@@ -599,17 +588,6 @@
     },
     {
      "escalates": [],
-     "gesture": "direct",
-     "target": {
-      "panel_id": "tray",
-      "row_id": "spore:spore-004",
-      "row_version": "5dc423a44e9c2215"
-     },
-     "tier": "C1",
-     "verb": "spore_then"
-    },
-    {
-     "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
@@ -761,17 +739,6 @@
      },
      "tier": "T2",
      "verb": "spore_retarget"
-    },
-    {
-     "escalates": [],
-     "gesture": "direct",
-     "target": {
-      "panel_id": "tray",
-      "row_id": "spore:spore-005",
-      "row_version": "9fe894af9a4ee074"
-     },
-     "tier": "C1",
-     "verb": "spore_then"
     },
     {
      "escalates": [],

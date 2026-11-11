@@ -14,9 +14,8 @@ Two acts, each safe to run again:
   it. It is an accelerator: the next ordinary germinate run wakes the same row if this one never ran.
 
 Build 2 covers a first part that is the operator's (band or nudge): its completion is the operator marking it done. A desk or
-board first part is composted when it germinates (its work has not happened yet), so its ``done:`` never fires; that arrives
-with the ``landed:`` event in build 3, and until then such a link rings at its check-by day. :func:`create_then` says so in
-its result.
+board first part is composted when it germinates (its work has not happened yet), so its ``done:`` could never fire:
+:func:`create_then` refuses a link on one, in words. That arrives with the ``landed:`` event in a later build.
 """
 from __future__ import annotations
 
@@ -32,6 +31,7 @@ from levain.spores import (
     executor_of,
     guarded_spore_store,
     list_open_readonly,
+    norm_event,
     valid_check_by,
 )
 
@@ -55,17 +55,17 @@ def then_origin_key(anchor: dict[str, Any], text: str) -> str:
 
 
 def followers_of(items: list[dict[str, Any]], anchor_id: str) -> list[dict[str, Any]]:
-    """The open agendas among ``items`` that wait on ``anchor_id`` finishing."""
-    key = done_event(anchor_id)
-    return [s for s in items if s.get("on_event") == key and s.get("status", "open") == "open"]
+    """The open agendas among ``items`` that wait on ``anchor_id`` finishing (either spelling of its id)."""
+    key = norm_event(done_event(anchor_id))
+    return [s for s in items if norm_event(s.get("on_event")) == key and s.get("status", "open") == "open"]
 
 
 def create_then(spores_json: Path | str, anchor_id: str, text: str, *, check_by: str | None = None,
                 today: date | None = None) -> dict[str, Any]:
     """File the second part of a split: a new agenda for the operator (target ``band``) that wakes when ``anchor_id`` is done,
     with a check-by day (default :data:`DEFAULT_CHECK_BY_DAYS` days on; a day before today is refused, since it would ring at
-    once). The first part must be open and a Tray row (a seed or an agenda). Returns ``{"spore_id", "replay", "check_by",
-    "event"}`` plus ``note`` when the first part is a machine part (see the module docstring). Raises :class:`ThenRefused`."""
+    once). The first part must be open, a Tray row (a seed or an agenda) and the operator's own (not a desk or board part). Returns
+    ``{"spore_id", "replay", "check_by", "event", "note"}``. Raises :class:`ThenRefused`."""
     from anneal_memory.spores import SporeError
 
     today = today or datetime.now().date()
@@ -85,21 +85,26 @@ def create_then(spores_json: Path | str, anchor_id: str, text: str, *, check_by:
     disposition = anchor.get("disposition")
     if not isinstance(disposition, str) or disposition.strip().casefold() not in TRAY_WRITE_DISPOSITIONS:
         raise ThenRefused("bad_verb_arg", 422, "a then-part follows a seed or an agenda on the List, not a loop")
+    if executor_of(anchor.get("target")) == "machine":
+        raise ThenRefused("bad_verb_arg", 422, "this part is handed to the desk or a board, and it is closed when it is handed "
+                          "off, so nothing could mark it done: a then-part follows a part you do yourself")
     key = then_origin_key(anchor, words)
-    replay = any(s.get("origin_key") == key for s in store.list_open())
+    prior = store.get_by_origin_key(key)
+    if prior is not None and prior.get("status") == "resolved":
+        raise ThenRefused("stale", 409, f"that part was already filed as {prior.get('id')} and has ended; "
+                          "word it differently to file it again")
+    replay = prior is not None
+    event = done_event(anchor["id"])
     try:
-        made = store.add(type="task", text=words, disposition="agenda", target="band", on_event=done_event(anchor_id),
+        made = store.add(type="task", text=words, disposition="agenda", target="band", on_event=event,
                          check_by=check_by, origin_key=key, today=today)
     except ValueError as exc:
         raise ThenRefused("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:
         raise ThenRefused("verb_failed", 422, str(exc)) from exc
-    out: dict[str, Any] = {"spore_id": made["id"], "replay": replay, "check_by": made.get("check_by") or check_by,
-                           "event": done_event(anchor_id)}
-    if executor_of(anchor.get("target")) == "machine":
-        out["note"] = ("the first part is a desk or board part: it is composted when it germinates, so done: does not fire "
-                       f"from it; this row rings at its check-by day ({out['check_by']}) until the landing event exists")
-    return out
+    day = made.get("check_by") or check_by
+    return {"spore_id": made["id"], "replay": replay, "check_by": day, "event": event,
+            "note": f"filed {made['id']}: it comes to your band when this is marked done; if it is not, you are asked on {day}"}
 
 
 def wake_after(spores_json: Path | str, anchor_id: str, *, queue_dir: Path | str | None = None,

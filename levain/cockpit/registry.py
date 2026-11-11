@@ -202,7 +202,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # and words (when that part is still open) and its check-by day; the first part names the ids of the parts that wait on it
     "on_event": ("str", _is_str),
     "check_by": ("YYYY-MM-DD calendar date|null", _opt(_is_iso_day)),
-    "after": ("spore id", lambda v: _is_intention_id(v)),
+    "after": ("spore id|null", _opt(lambda v: _is_intention_id(v))),
     "after_text": ("str|null", _opt(_is_str)),
     "then": ("list[str]", _is_str_list),
 }
