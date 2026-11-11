@@ -131,7 +131,9 @@ def _slow_decisions(tmp_path: Path, monkeypatch, press: bool) -> dict:
     _root, src, _ids = _install(tmp_path)
     steps = [{"init": SLOW_DECISIONS}, DESKTOP, GO_LINK]
     if press:
-        steps.append({"tap": "document.querySelector('[data-theme-set=\"dark\"]')", "ms": 40000})
+        # the press lands WHILE the jump waits (the slow Decisions read keeps the board partial): the step says so, or the driver would wait
+        # for the whole board and press after the jump had run. The theme switch is in the masthead, which the inert partial board does not cover.
+        steps.append({"tap": "document.querySelector('[data-theme-set=\"dark\"]')", "ms": 40000, "partial": True})
     steps += [{"until": ROWS, "ms": 40000}, {"eval": "new Promise(r => setTimeout(() => r(1), 9000))"}, {"eval": READ}]
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", steps)["values"]
