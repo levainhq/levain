@@ -1027,6 +1027,11 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              fire=_unbuilt_fire("spore_retarget fires through the broker (a target wakes an agent: signed)"),
              legacy_kind="spore_retarget", device_ok=True,
              applies_to=lambda r: _SPORE_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() in ("seed", "agenda")),
+    VerbSpec("spore_then", "then you", "files what you do after this one is done as a new item that wakes in the band when "
+             "this one is marked done, with a day to be asked if it has not", "row", fields=("text", "check_by"),
+             floor="C1", tier_fn=_const("C1"), fire=_spore_fire("spore_then"), legacy_kind="spore_then",
+             # a band row for the operator only (no target a wake could send to an agent), so nothing here needs a signature
+             applies_to=lambda r: _SPORE_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() == "agenda"),
     VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
              fire=_spore_fire("spore_set_disposition"), legacy_kind="spore_set_disposition", device_ok=True,

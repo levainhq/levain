@@ -1138,8 +1138,22 @@ class QuestionStore:
             if not moved:
                 raise
             _log.warning("intention %s on %s: the reminder moved but its row could not be closed: %s", action, q.id, exc)
-            return f"reminder {words}; the row could not be closed: {_safe_words(exc)}"
-        return f"{sid} {words}"
+            return f"reminder {words}; the row could not be closed: {_safe_words(exc)}" + self._woke_tail(action, path, sid)
+        return f"{sid} {words}" + self._woke_tail(action, path, sid)
+
+    def _woke_tail(self, action: str, path: Path, sid: str) -> str:
+        """After a ``done``: the second parts of a split that waited on this intention wake now (the last thing, outside this
+        store's write lock). A failure never undoes the done."""
+        if action != "done":
+            return ""
+        from levain import split
+
+        try:
+            woke = split.wake_after(path, sid, queue_dir=self.directory)
+        except Exception as exc:  # noqa: BLE001 - the reminder is done; a wake that failed is reported, never raised
+            _log.warning("waking what waits on %s failed: %s", sid, exc)
+            return f"; waking what waits on it failed: {_safe_words(exc)}"
+        return f"; woke {', '.join(woke)}" if woke else ""
 
     def snoozes(self, ref: Any) -> list[Snooze]:
         """Every snooze row of a question, oldest first (its history; the newest is its snooze). Empty for no store,

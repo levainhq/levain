@@ -27,6 +27,8 @@
  "error": null,
  "etag": "<etag>",
  "facets": [
+  "after",
+  "after_text",
   "age_days",
   "attention",
   "band_age",
@@ -37,6 +39,7 @@
   "band_since",
   "board_rank",
   "board_tier",
+  "check_by",
   "disposition",
   "domain",
   "done_kind",
@@ -49,6 +52,7 @@
   "intention_text",
   "last_seen",
   "list_pointer",
+  "on_event",
   "overdue",
   "overdue_days",
   "repo",
@@ -57,6 +61,7 @@
   "spore_type",
   "surface",
   "target",
+  "then",
   "tier",
   "time_state",
   "wake_bucket",
@@ -257,6 +262,17 @@
     },
     {
      "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-006",
+      "row_version": "e1c59b494abc5a5f"
+     },
+     "tier": "C1",
+     "verb": "spore_then"
+    },
+    {
+     "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
@@ -411,6 +427,17 @@
      },
      "tier": "T2",
      "verb": "spore_retarget"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-007",
+      "row_version": "2f3bc747d27b450c"
+     },
+     "tier": "C1",
+     "verb": "spore_then"
     },
     {
      "escalates": [],
@@ -572,6 +599,17 @@
     },
     {
      "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-004",
+      "row_version": "5dc423a44e9c2215"
+     },
+     "tier": "C1",
+     "verb": "spore_then"
+    },
+    {
+     "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
@@ -723,6 +761,17 @@
      },
      "tier": "T2",
      "verb": "spore_retarget"
+    },
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "spore:spore-005",
+      "row_version": "9fe894af9a4ee074"
+     },
+     "tier": "C1",
+     "verb": "spore_then"
     },
     {
      "escalates": [],

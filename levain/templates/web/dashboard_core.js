@@ -3346,7 +3346,7 @@
   // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
   const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", park: "spore_update",
-    reactivate: "spore_update", "when?": "spore_surface_at", who: "spore_retarget", Resolve: "spore_descend", metabolize: "spore_set_disposition",
+    reactivate: "spore_update", "when?": "spore_surface_at", who: "spore_retarget", "then you": "spore_then", Resolve: "spore_descend", metabolize: "spore_set_disposition",
     dismiss: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
     tombstone: "episode_tombstone" };
 
@@ -3429,6 +3429,10 @@
       wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
       // an agenda holds a target, so it has a who to change (a seed is given one through when?)
       if (rowTarget(s)) wrap.appendChild(verbBtn("who", "who does it: you or the machine", () => openWhoForm(wrap, s)));
+      // only where the cockpit offers spore_then (an agenda); a row with no actions list (a legacy row) is offered none
+      if (Array.isArray(s.actions) && s.actions.some((x) => x && x.verb === "spore_then")) {
+        wrap.appendChild(verbBtn("then you", "what you do after this is done: it comes to the band when this is marked done", () => openThenForm(wrap, s)));
+      }
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
         wrap.appendChild(verbBtn("Resolve", "resolve or compost this inbox item", () =>
           openResolveForm(wrap, "spore_descend", "dismiss", s, s.descend_kinds, false)));
@@ -3766,6 +3770,20 @@
       showFail(msg, res, "failed");
       go.disabled = false; cancel.disabled = false;
     });
+  }
+
+  // The then form (spore_then): the second part of a split, filed as a band agenda that wakes when this row is marked done
+  function openThenForm(host, s) {
+    openRowForm(host, () => {
+      const inp = el("input", "verb-ref");
+      inp.type = "text"; inp.maxLength = 300; inp.placeholder = "then you...";
+      inp.setAttribute("aria-label", "what you do after this is done");
+      return { nodes: [inp], focus: inp };
+    }, (f, msg) => {
+      const text = f.nodes[0].value.trim();
+      if (!text) { msg.className = "edit-msg err"; msg.textContent = "say what you do next"; return null; }
+      return { kind: "spore_then", spore_id: s.id, text, expect_disposition: s.disposition };
+    }, "file it");
   }
 
   // Shared inline-form scaffold for the per-row verbs (edit / reclassify / remove): hide the

@@ -198,6 +198,13 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "wake_line": ("str", _is_str),
     "done_on": ("YYYY-MM-DD calendar date", _is_iso_day),
     "done_kind": ("str", _is_str),
+    # the split (row 178): an agenda that waits on another intention finishing names its event (done:<id>), the first part's id
+    # and words (when that part is still open) and its check-by day; the first part names the ids of the parts that wait on it
+    "on_event": ("str", _is_str),
+    "check_by": ("YYYY-MM-DD calendar date|null", _opt(_is_iso_day)),
+    "after": ("spore id", lambda v: _is_intention_id(v)),
+    "after_text": ("str|null", _opt(_is_str)),
+    "then": ("list[str]", _is_str_list),
 }
 
 

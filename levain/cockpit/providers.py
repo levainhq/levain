@@ -60,7 +60,7 @@ EPISODE_LIMIT = 50
 HANDOFF_FRESH_DAYS = 7
 
 # the verbs a spore panel offers (design §4.2); anneal still refuses a verb the spore's type forbids
-SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update", "spore_retarget",
+SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update", "spore_retarget", "spore_then",
                    "spore_set_disposition", "spore_ascend")
 SPORE_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen",
                 "origin_key", "target", "attention", "germinated")
