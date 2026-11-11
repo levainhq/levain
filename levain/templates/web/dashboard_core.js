@@ -3367,7 +3367,7 @@
   // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
   const BUTTON_VERB = { touch: "intention_touch", edit: "intention_update", park: "intention_update",
-    reactivate: "intention_update", "when?": "intention_surface_at", who: "intention_retarget", Resolve: "intention_close", metabolize: "intention_set_disposition",
+    reactivate: "intention_update", "when?": "intention_surface_at", who: "intention_retarget", "then you": "intention_then", Resolve: "intention_close", metabolize: "intention_set_disposition",
     dismiss: "intention_close", compost: "intention_close", promote: "intention_promote",
     tombstone: "episode_tombstone" };
 
@@ -3450,6 +3450,10 @@
       wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
       // an agenda holds a target, so it has a who to change (a seed is given one through when?)
       if (rowTarget(s)) wrap.appendChild(verbBtn("who", "who does it: you or the machine", () => openWhoForm(wrap, s)));
+      // only where the cockpit offers intention_then (an agenda); a row with no actions list (a legacy row) is offered none
+      if (Array.isArray(s.actions) && s.actions.some((x) => x && x.verb === "intention_then")) {
+        wrap.appendChild(verbBtn("then you", "what you do after this is done: it comes to the band when this is marked done", () => openThenForm(wrap, s)));
+      }
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
         wrap.appendChild(verbBtn("Resolve", "resolve or compost this inbox item", () =>
           openResolveForm(wrap, "intention_close", "dismiss", s, s.descend_kinds, false)));
@@ -3787,6 +3791,20 @@
       showFail(msg, res, "failed");
       go.disabled = false; cancel.disabled = false;
     });
+  }
+
+  // The then form (intention_then): the second part of a split, filed as a band agenda that wakes when this row is marked done
+  function openThenForm(host, s) {
+    openRowForm(host, () => {
+      const inp = el("input", "verb-ref");
+      inp.type = "text"; inp.maxLength = 300; inp.placeholder = "then you...";
+      inp.setAttribute("aria-label", "what you do after this is done");
+      return { nodes: [inp], focus: inp };
+    }, (f, msg) => {
+      const text = f.nodes[0].value.trim();
+      if (!text) { msg.className = "edit-msg err"; msg.textContent = "say what you do next"; return null; }
+      return { kind: "intention_then", intention_id: s.id, text, expect_disposition: s.disposition };
+    }, "file it");
   }
 
   // Shared inline-form scaffold for the per-row verbs (edit / reclassify / remove): hide the
