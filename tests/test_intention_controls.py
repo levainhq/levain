@@ -223,11 +223,11 @@ def test_a_band_row_without_an_intention_is_still_no_write_target(host_rig) -> N
 def test_a_refusal_of_any_exception_class_comes_back_as_its_words_never_a_500(host_rig, monkeypatch) -> None:
     rig, host = host_rig
 
-    class IntentionError(Exception):
+    class HostIntentionError(Exception):
         pass
 
     def act(ref, action, *, until=None, text=None, channel):
-        raise IntentionError("a date in the past is not a snooze")
+        raise HostIntentionError("a date in the past is not a snooze")
 
     monkeypatch.setattr(host, "intention_act", act)
     with pytest.raises(EditError) as exc:
@@ -250,11 +250,11 @@ def test_a_validation_refusal_is_a_400_whatever_its_words(host_rig) -> None:
 def test_a_host_exception_marked_stale_is_a_409(host_rig, monkeypatch) -> None:
     rig, host = host_rig
 
-    class IntentionError(Exception):
+    class HostIntentionError(Exception):
         stale = True
 
     def act(ref, action, *, until=None, text=None, channel):
-        raise IntentionError("spore-9 closed while it was being closed")
+        raise HostIntentionError("spore-9 closed while it was being closed")
 
     monkeypatch.setattr(host, "intention_act", act)
     with pytest.raises(EditError) as exc:

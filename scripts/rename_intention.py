@@ -127,7 +127,13 @@ class Rule:
     replacement: str | None = None
     const: str | None = None
     always: bool = False
+    # ``context``: a regex that must also match the source LINE holding the match (a hand-listed site by its neighbours).
+    # ``expect``: how many times the rule must fire on the first run (a hand-listed site list drifts when the tree moves;
+    # a rule that fires a different number of times refuses the run). Once applied it fires 0 times, which is fine.
+    context: str | None = None
+    expect: int | None = None
     rx: re.Pattern[str] = field(init=False, repr=False)
+    ctx: re.Pattern[str] | None = field(init=False, repr=False, default=None)
     # What a rewrite leaves behind. A replacement that still holds the word (an id pattern reading both prefixes) would
     # be rewritten again on the next run, so the text it produces is protected: that is what keeps a second run a no-op.
     settled: re.Pattern[str] | None = field(init=False, repr=False, default=None)
@@ -142,6 +148,7 @@ class Rule:
         if self.always and not self.paths:
             raise ValueError("an always rule must name its paths: it rewrites without a detector")
         self.rx = re.compile(self.pattern)
+        self.ctx = re.compile(self.context) if self.context else None
         if self.replacement is not None and ANY_WORD_RE.search(self.replacement):
             if re.search(r"\\(?:\d|g<)", self.replacement):
                 raise ValueError("a replacement that keeps the word cannot use a group reference: its output must be a fixed text")
@@ -150,13 +157,150 @@ class Rule:
     def applies_to(self, rel: str) -> bool:
         return not self.paths or any(fnmatch.fnmatchcase(rel, g) for g in self.paths)
 
+    def in_context(self, text: str, off: int) -> bool:
+        """True when the rule has no ``context`` or the source line holding ``off`` matches it."""
+        if self.ctx is None:
+            return True
+        a = text.rfind("\n", 0, off) + 1
+        b = text.find("\n", off)
+        return self.ctx.search(text[a:len(text) if b < 0 else b]) is not None
 
-# The inventory fills this table. First match wins. An entry's reason says what stored or wire byte it protects.
+
+# Identifier collisions, resolved by hand (inventory Q6): the rewritten name already exists in the tree (the band-row variant
+# `intention_*` next to the plain-row variant `spore_*`), so the plain-row variant gets a DISTINCT name here instead of the
+# word rewrite's. old whole-identifier -> new whole-identifier. A resolution's target must not exist in the tree, unless the
+# old name is in MERGES: there the word rewrite's result is meant (the two things ARE the same concept) and the merge is
+# accepted knowingly, the reason beside it.
+COLLISION_RESOLUTIONS: dict[str, str] = {
+    "_SPORE_ROW": "_PLAIN_INTENTION_ROW",           # verbs.py: the plain-row predicate; `_INTENTION_ROW` is the band-row lambda
+    "_spore_fire": "_plain_intention_fire",         # verbs.py: the plain-row fire; `_intention_fire` fires a band row
+    "buildSporeVerbs": "buildPlainIntentionVerbs",  # dashboard_core.js: the plain-row verbs; `buildIntentionVerbs` is the band row's
+    "spore_edit": "plain_intention_edit",           # the TUI kind for a plain row; `intention_edit` is the cockpit band verb id
+    "SporeError": "IntentionError",                 # MERGE: anneal's alias for it is `IntentionError`; the two test stand-ins are hand-renamed
+    "spore_": "intention_",                         # MERGE: the bare prefix token in prose and CHANGELOG; its two CODE sites are hand-listed rules
+}
+MERGES = frozenset({"SporeError", "spore_"})
+
+# The inventory fills this table (rulings H4, H5, H7, H10, H11). First match wins, per candidate; an ``always`` rule is
+# applied wherever its pattern matches in the files it names. Order matters: carve-outs (keeps) come before the classes
+# that rewrite. A rule's reason says what stored or wire byte it protects, or why the rewrite is right.
+_T = "levain/templates/*"
+_W = r"(?<![A-Za-z0-9_])"
+_E = r"(?![A-Za-z0-9_])"
+_SEED_SITES = "hand-listed disposition site (H7, inventory Q3): `someday` joins the sets and the stored `seed` stays readable and writable until the migration lane (H8) retires it"
+
 STORED_TOKEN_RULES: list[Rule] = [
+    # ---- the id resolver (E1) ----
     Rule(re.escape('INTENTION_ID = re.compile(r"spore-[0-9A-Za-z_-]{1,56}")'), "rewrite",
          "the id resolver reads both prefixes for good: old ids live in immutable history",
          paths=("levain/consent/questions.py",),
          replacement='INTENTION_ID = re.compile(r"(?:intention|spore)-[0-9A-Za-z_-]{1,56}")', always=True),
+
+    # ---- anneal-owned names (H5): the attributes of anneal's apply result ----
+    Rule(_W + r"res\.spore(?:_id)?" + _E, "keep-as-legacy-constant",
+         "anneal-owned: the attributes of SporeApplyResult (`.spore`, `.spore_id`) keep their names in 1.0.7 (known edge)",
+         paths=("levain/*", "tests/*"), always=True),
+
+    # ---- history citations (H13, trap 14): 18 printed messages cite old ids; they are history, not ids to resolve ----
+    Rule(r"spore-\d+", "keep-as-legacy-constant",
+         "a printed message citing an old id is a history citation (the permanent resolver keeps the id live); rewriting it changes a message and the seatbelt profile text for nothing",
+         paths=("levain/daemon.py", "levain/doctor.py", "levain/firing/confinement.py", "levain/run.py", "levain/session.py")),
+
+    Rule(r"spore-\d+", "keep-as-legacy-constant",
+         "session.py's four docstring-position messages (K3, K4a, the banner floor) cite old ids: history citations too",
+         paths=("levain/session.py",), context=r"EFFERENT GATE with actions|WALL-CLOCK BOUND|\"\"\"spore-725", always=True, expect=4),
+
+    # ---- the store file and the document keys (H5; A1, A3) ----
+    Rule(r"memory\.spores\.json|\.spores\.json|spores\.json", "keep-as-legacy-constant",
+         "the store file name is anneal's (`<db-stem>.spores.json`, kept in 1.0.7): a standalone hook template cannot import the constant, so its bytes stay",
+         paths=(_T,)),
+    Rule(r"memory\.spores\.json", "keep-as-legacy-constant",
+         "the store file name is anneal's and keeps its name: one named constant in levain/intention_legacy.py",
+         paths=("levain/*",), const="STORE_FILE_NAME"),
+    Rule(r"[\w.\-]*spores?\.json", "keep-as-legacy-constant",
+         "the store file name (`.spores.json`, `spores.json`) is anneal's, and `state/spores.json` is flow's path: bytes that name a file on disk",
+         ),
+    Rule(r'^["\']spores["\']$', "keep-as-legacy-constant",
+         "the store document key `spores` is anneal-owned (raw reads of the document), and the READY schema v1 `sources`/`source` word is flow's until flow's producer flips (H11)",
+         paths=("levain/spores.py", "levain/keep_migrate.py", "levain/desk/ready.py")),
+    Rule(r'^["\']spores["\']$', "keep-as-legacy-constant",
+         "a test building or reading the raw store document (`{\"spores\": [...]}`) or the READY `sources` key",
+         paths=("tests/*",),
+         context=r"""\[\s*["']spores["']\s*\]|\.get\(\s*["']spores["']|["']spores["']\s*:\s*(?:\[|rows|\{)|setdefault\(\s*["']spores["']|sources\W|["']version["']"""),
+
+    # ---- keep-migrate persisted plan keys (H10): an old plan must still apply and revert ----
+    Rule(r'^["\'](?:spores_json|spore_id)["\']$|spore_id', "keep-as-legacy-constant",
+         "keep-migrate plan files persist `spores_json` and `spore_id`; the keys keep their names so an old plan still applies and reverts",
+         paths=("levain/keep_migrate.py", "tests/test_keep_migrate*.py")),
+    Rule(r'^["\']spores_json["\']$', "keep-as-legacy-constant",
+         "the plan reader in cli.py compares the persisted `spores_json` key",
+         paths=("levain/cli.py",)),
+    Rule(r'^["\']spore["\']$', "keep-as-legacy-constant",
+         "keep-migrate's persisted plan destination kind `spore` and its episode metadata key",
+         paths=("levain/keep_migrate.py", "tests/test_keep_migrate.py"), context=r'DEST_SPORE =|"spore": item|kind"?: ?"spore"|\{"episode", "spore"\}'),
+
+    # ---- the seed doc's old path in the released-hash table (H6) ----
+    Rule(r'"seed/spore_instructions\.md"', "keep-as-legacy-constant",
+         "`_RELEASED_BASE_SEED_SHA256` keeps the OLD key: an unedited old copy is recognised by its released hashes",
+         paths=("levain/install.py",), context=r"frozenset"),
+
+    # ---- the verbs whose NAME changes (the verb map): descend -> close, ascend -> promote; everywhere ----
+    Rule(_W + r"spore_descend" + _E, "rewrite", "verb map: `descend` -> `close` (the anneal 1.0.7 tool is `intention_close`)",
+         paths=("*",), replacement="intention_close", always=True),
+    Rule(_W + r"spore_ascend" + _E, "rewrite", "verb map: `ascend` -> `promote` (the anneal 1.0.7 tool is `intention_promote`)",
+         paths=("*",), replacement="intention_promote", always=True),
+
+    # ---- the disposition `seed` -> `someday` (H7), a hand-listed set of sites ----
+    Rule(re.escape('TRAY_DISPOSITIONS = ("seed", "handoff", "agenda")'), "rewrite", _SEED_SITES, paths=("levain/spores.py",),
+         replacement='TRAY_DISPOSITIONS = ("someday", "seed", "handoff", "agenda")', always=True, expect=1),
+    Rule(re.escape('TRAY_WRITE_DISPOSITIONS = ("seed", "agenda")'), "rewrite", _SEED_SITES, paths=("levain/spores.py",),
+         replacement='TRAY_WRITE_DISPOSITIONS = ("someday", "seed", "agenda")', always=True, expect=1),
+    Rule(re.escape('NON_COGNITION_DISPOSITIONS = ("seed", "handoff", "agenda", "note")'), "rewrite", _SEED_SITES,
+         paths=("levain/spores.py",),
+         replacement='NON_COGNITION_DISPOSITIONS = ("someday", "seed", "handoff", "agenda", "note")', always=True, expect=1),
+    Rule(re.escape('_NON_COGNITION_DISPOSITIONS = ("seed", "handoff", "agenda", "note")'), "rewrite", _SEED_SITES + " (the hook copies are byte-twins of the canonical tuple)",
+         paths=("levain/templates/activation/hooks/_levain_hook.py", "levain/templates/adapters/codex/activation/hooks/_levain_hook.py"),
+         replacement='_NON_COGNITION_DISPOSITIONS = ("someday", "seed", "handoff", "agenda", "note")', always=True, expect=2),
+    Rule(re.escape('d.strip().casefold() == "seed"'), "rewrite", _SEED_SITES, paths=("levain/spores.py",),
+         replacement='d.strip().casefold() in ("someday", "seed")', always=True, expect=1),
+    Rule(re.escape('if d == "seed" and target is None'), "rewrite", _SEED_SITES, paths=("levain/spores.py",),
+         replacement='if d in ("someday", "seed") and target is None', always=True, expect=1),
+    Rule(re.escape('_enum("loop", "seed", "handoff", "agenda", "note")'), "rewrite", _SEED_SITES, paths=("levain/cockpit/registry.py",),
+         replacement='_enum("loop", "someday", "seed", "handoff", "agenda", "note")', always=True, expect=1),
+    Rule(re.escape('_DISP_ORDER = {"handoff": 0, "seed": 1, "agenda": 2}'), "rewrite", _SEED_SITES, paths=("levain/cockpit/registry.py",),
+         replacement='_DISP_ORDER = {"handoff": 0, "someday": 1, "seed": 1, "agenda": 2}', always=True, expect=1),
+    Rule(re.escape('.casefold() in ("seed", "agenda")'), "rewrite", _SEED_SITES, paths=("levain/cockpit/verbs.py",),
+         replacement='.casefold() in ("someday", "seed", "agenda")', always=True, expect=1),
+    Rule(re.escape('params.get("disposition", "seed")'), "rewrite", _SEED_SITES + " (a NEW capture defaults to the new word)",
+         paths=("levain/cockpit/effects.py",), replacement='params.get("disposition", "someday")', always=True, expect=1),
+    Rule(re.escape('"disposition": "seed", "attention": "talk"'), "rewrite", _SEED_SITES + " (a new talk capture)",
+         paths=("levain/cockpit/effects.py",), replacement='"disposition": "someday", "attention": "talk"', always=True, expect=1),
+    Rule(re.escape('if disposition not in ("seed", "agenda"):'), "rewrite", _SEED_SITES, paths=("levain/cockpit/effects.py",),
+         replacement='if disposition not in ("someday", "seed", "agenda"):', always=True, expect=1),
+    Rule(re.escape('disposition == "seed" and attention == "talk"'), "rewrite", _SEED_SITES, paths=("levain/cockpit/effects.py",),
+         replacement='disposition in ("someday", "seed") and attention == "talk"', always=True, expect=1),
+    Rule(re.escape('disposition: str = "seed"'), "rewrite", _SEED_SITES + " (the default of a new row)", paths=("levain/cockpit/list_panel.py",),
+         replacement='disposition: str = "someday"', always=True, expect=2),
+    Rule(re.escape('s.disposition == "seed"'), "rewrite", _SEED_SITES, paths=("levain/cockpit/list_panel.py",),
+         replacement='s.disposition in ("someday", "seed")', always=True, expect=1),
+    Rule(re.escape('req.get("disposition", "seed")'), "rewrite", _SEED_SITES + " (a NEW capture through the write seam)", paths=("levain/writes.py",),
+         replacement='req.get("disposition", "someday")', always=True, expect=1),
+    Rule(re.escape("(disposition 'seed'/'handoff'/'agenda')"), "rewrite", "operator-visible text naming the disposition words (H7)",
+         paths=("levain/writes.py",), replacement="(disposition 'someday'/'seed'/'handoff'/'agenda')", always=True, expect=1),
+    Rule(re.escape('disposition = "seed"'), "rewrite", _SEED_SITES + " (the TUI capture)", paths=("levain/_tui_curses.py",),
+         replacement='disposition = "someday"', always=True, expect=1),
+
+    # ---- the classes that follow the word rewrite, with their consumers, in one landing ----
+    Rule(r"[\"']spore:spore-\d+", "rewrite", "test datum: a row id of the plain-row kind; row ids are the new prefix and the new id"),
+    Rule(r"spore-\d", "rewrite", "test datum or a literal id: ids move to the new prefix (the resolver reads both)", paths=("tests/*",)),
+    Rule(_W + r"spore_(?:touch|update|add|list|get|surface_at|surface|retarget|set_disposition|seed|capture|park|unpark|reclassify|metabolize|schedule|undo_edit|undo_seed|edit)" + _E,
+         "rewrite", "verb ids, ledger kinds and anneal tool names: `spore_x` -> `intention_x` (writers and the cockpit/TUI/page consumers move together; an old id arriving new refuses in the behaviour lane, H10)"),
+    Rule(_W + r"spore:", "rewrite", "row and resource-key prefix: `spore:` -> `intention:`; history rows are read by the reader lane (H2)"),
+    Rule(r"(?i)spores?[_:]", "rewrite",
+         "identifier names spelled as strings (monkeypatch targets, getattr names, request/payload/field names such as `spore_id`, `spore_kind`, `spores_json`), constants quoted in messages, and f-strings that build a row id: they follow the word rewrite so the string stays in step with the name it spells"),
+    Rule(r'^["\']spores?["\']$', "rewrite",
+         "panel kinds, surfaces, topology kinds, argv words, the broker store name, rowsets and tags: renamed with the page JS, the TUI and the tests that read them"),
+    Rule(r"spore-\d", "rewrite", "a literal id in a template or page: moves to the new prefix", paths=("levain/templates/*",)),
 ]
 
 # --------------------------------------------------------------------------------------------------------------
@@ -181,6 +325,7 @@ ID_PREFIX_KW = 'id_prefix="intention"'
 
 WIRE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])spores?[_:]", re.IGNORECASE)     # "spore_touch", "spore:tray", "spore:"
 BARE_BODY_RE = re.compile(r"spores?", re.IGNORECASE)                            # a whole literal: a key, a verb, an argv word
+ID_CITE_RE = re.compile(r"(?<![A-Za-z0-9])spore-\d")                           # "(spore-755)": a history citation inside a string
 STORE_FILE_RE = re.compile(r"[\w.\-]*spores?\.json", re.IGNORECASE)
 CODE_SUFFIXES = {".js", ".mjs", ".html", ".json", ".toml", ".yml", ".yaml", ".sh", ".css", ".cfg", ".ini", ".svg"}
 QUOTED_RE = re.compile(r"""(?P<q>["'`])(?P<body>(?:\\.|(?!(?P=q))[^\\\n])*)(?P=q)""")
@@ -499,13 +644,16 @@ def transform_file(rel: str, text: str, rules: list[Rule]) -> FileOut:
     for idx, rule in active:
         if rule.always:
             for m in rule.rx.finditer(text):
+                if not rule.in_context(text, m.start()):
+                    continue
                 apply_rule(idx, rule, m.start(), m.end(), m, None)
                 covered.append(m.span())
 
     # candidates
     cands: list[Cand] = []
     for m in STORE_FILE_RE.finditer(text):
-        cands.append(Cand(m.start(), m.end(), "store-file", m.group(0), _line_of(text, m.start())))
+        owner = next((lt for lt in lits if lt.start <= m.start() and m.end() <= lt.end and not lt.doc and not lt.fstring), None)
+        cands.append(Cand(m.start(), m.end(), "store-file", m.group(0), _line_of(text, m.start()), owner))
     if kind == "py":
         for lit in lits:
             if lit.doc or not ANY_WORD_RE.search(text[lit.start:lit.end]) \
@@ -518,6 +666,8 @@ def transform_file(rel: str, text: str, rules: list[Rule]) -> FileOut:
                 cands.append(Cand(lit.start, lit.end, "wire-token", body_text, lit.line, lit))
             elif ANNEAL_PATH_RE.search(body_text):
                 cands.append(Cand(lit.start, lit.end, "anneal-module", body_text, lit.line, lit))
+            elif ID_CITE_RE.search(body_text):
+                cands.append(Cand(lit.start, lit.end, "id-citation", body_text, lit.line, lit))
         assert tree is not None
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -547,7 +697,7 @@ def transform_file(rel: str, text: str, rules: list[Rule]) -> FileOut:
         for idx, rule in active:
             if rule.always:
                 continue
-            ms = list(rule.rx.finditer(c.text))
+            ms = [m for m in rule.rx.finditer(c.text) if rule.in_context(text, c.start + m.start())]
             if not ms:
                 continue
             for m in ms:
@@ -605,6 +755,7 @@ def transform_file(rel: str, text: str, rules: list[Rule]) -> FileOut:
         ops.append(Op(pos, pos, stmt, "legacy import"))
 
     # the word rewrite
+    done_runs: set[int] = set()
     for m in SUB_RE.finditer(text):
         s, e = m.span()
         s3 = m.start(3)
@@ -625,6 +776,13 @@ def transform_file(rel: str, text: str, rules: list[Rule]) -> FileOut:
             out.refusals.append(f"{rel}:{_line_of(text, s3)}: token {run!r} holds both spore and intent")
             continue
         art = m.group(1)
+        if run in COLLISION_RESOLUTIONS and not art and not clash(run_s, run_e):
+            if run_s not in done_runs:
+                done_runs.add(run_s)
+                ops.append(Op(run_s, run_e, COLLISION_RESOLUTIONS[run], "collision resolution"))
+                out.subs += 1
+                out.rewritten[run] = COLLISION_RESOLUTIONS[run]
+            continue
         rep = (("An" if art == "A" else "an") + m.group(2) if art else "") + new
         ops.append(Op(s, e, rep, "word"))
         out.subs += 1
@@ -824,9 +982,20 @@ def build_plan(root: Path, rules: list[Rule] | None = None) -> Plan:
             plan.writes[new_rel] = out.text
         if out.rewritten:
             for old, new in out.rewritten.items():
+                if old in COLLISION_RESOLUTIONS:
+                    if old not in MERGES and new in tokens:
+                        plan.refusals.append(("collision", f"{old} -> {new}: the resolution target already exists in the tree "
+                                                           f"(first seen renaming in {rel})"))
+                    continue
                 if new in tokens:
                     plan.refusals.append(("collision", f"{old} -> {new}: the new name already exists in the tree "
                                                        f"(first seen renaming in {rel})"))
+    # hand-listed site rules: a rule with ``expect`` must fire exactly that many times on a run that has work to do
+    if plan.writes or plan.moves:
+        fired = Counter(idx for _rel, idx, _a, _l, _e in plan.rule_hits)
+        for idx, rule in enumerate(rules):
+            if rule.expect is not None and fired.get(idx, 0) != rule.expect:
+                plan.refusals.append(("rule drift", f"rule {idx} ({rule.reason}) fired {fired.get(idx, 0)} times, expected {rule.expect}"))
     # collisions are reported once per identifier
     seen: set[str] = set()
     uniq: list[tuple[str, str]] = []
