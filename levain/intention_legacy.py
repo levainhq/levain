@@ -81,7 +81,8 @@ OLD_DISPOSITION_TO_NEW = {'seed': 'someday'}
 # by the old path (ruling H6).
 OLD_SEED_DOC = 'seed/spore_instructions.md'
 
-# The READY schema v1 shared with flow: the key of `sources` and the path flow emits are flow's words until flow's own
-# producer flips (ruling H11). The levain consumer accepts what flow emits today.
+# The READY schema v1 shared with flow: the key under which the input of `levain.desk.ready.derive` carries the intention
+# rows is flow's own word (flow's `ready.collect` and the shared conformance fixture name it), so it is read through this
+# constant. The provenance `source` and `ref` the items carry are the new words (`intentions`, `state/intentions.json#`):
+# flow flips its producer in the same landing step, and nothing reads the old pair.
 READY_SOURCE_KEY = 'spores'
-READY_REF_PREFIX = 'state/spores.json#'

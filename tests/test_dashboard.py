@@ -750,7 +750,7 @@ class TestSlice15Surfaces:
         # verb-mediated lifecycle data — intentions AND episodes are Class B (episode
         # mutation = tombstone verb), NOT direct-edit. [L4 HIGH]
         by_kind = {e["kind"]: e for e in layout}
-        assert by_kind["spores"]["edit_class"] == "B"
+        assert by_kind["intentions"]["edit_class"] == "B"
         assert by_kind["episodes"]["edit_class"] == "B"
         # Tray (Slice 3b): now Class B in the Operate zone (dump/triage/park verbs).
         for k in ("tray",):

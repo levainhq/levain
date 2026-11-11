@@ -7,7 +7,7 @@ so a seat reads the queue with no desk live; only writes need one.
 
 Three parts:
 
-* :func:`derive` — PURE over the fixture's normalized input shape (``intentions``, ``resolved``, ``needs_phill``,
+* :func:`derive` — PURE over the fixture's normalized input shape (``intentions`` under flow's input key, ``resolved``, ``needs_phill``,
   ``seats``, ``ci``, ``plan``) plus ``store``, the desk store's current items. It applies SCHEMA sections 2-5:
   the closed category set, a dependency holding a declared-ready item back, needs-you winning, the order, and the
   derived ``well_formed`` / ``independent``. It reads no file and no clock (``generated`` is the caller's).
@@ -54,6 +54,7 @@ from levain.cockpit.consent import parse_stamp
 from levain.desk.store import _OID, CoordError, CoordStore, StoreAbsent, _append_only, next_gseq
 from levain.dispatch import DispatchError
 from levain.desk.legacy import ROLE_DESK, SQL_ROLE_DESK
+from levain.intention_legacy import READY_SOURCE_KEY
 
 __all__ = [
     "CATEGORIES", "HANDOFF_RANK_BASE", "HEALTHY_AT", "JOURNAL_SOURCES", "LIFECYCLE_SCHEMA", "SCHEMA_VERSION", "TIERS",
@@ -287,7 +288,7 @@ def derive_items(sources: Mapping[str, Any]) -> builtins.list:
     """Every item, SCHEMA §§2-5, in the §4 rule 3 order (repo, column, rank, id). Pure: reads only ``sources``.
 
     ``sources`` keys (each optional): ``store`` (desk store rows: id, repo, title, category, status, tier,
-    done_line, depends_on, rank, set_by, set_at, ref), ``intentions`` + ``resolved`` (flow), ``plan`` (LANE MENU rows),
+    done_line, depends_on, rank, set_by, set_at, ref), the intentions under flow's input key (``READY_SOURCE_KEY``) + ``resolved`` (flow), ``plan`` (LANE MENU rows),
     ``needs_phill`` (open band rows: id, repo, what, stopped), ``seats`` (token, repo, name), ``ci`` (id, repo,
     branch), ``repos`` (known repo names, for a handoff pointer), ``home`` (the home directory, for one)."""
     resolved = {str(r) for r in sources.get("resolved") or ()}
@@ -305,20 +306,20 @@ def derive_items(sources: Mapping[str, Any]) -> builtins.list:
             keep(_work_item(row, source="plan", ref=str(row.get("ref") or f"dispatch.db#ready_items/{row['id']}"),
                             default_repo="levain"))
     handoff_order = 0
-    for s in sources.get("spores") or ():
+    for s in sources.get(READY_SOURCE_KEY) or ():
         if not isinstance(s, Mapping) or not s.get("id") or s.get("status", "open") != "open":
             continue
         work = s.get("work")
         if isinstance(work, Mapping):
             keep(_work_item({**work, "id": s["id"], "title": s.get("text"), "set_by": work.get("set_by"),
                              "set_at": work.get("set_at")},
-                            source="spores", ref=f"state/spores.json#{s['id']}", default_repo="flow"))
+                            source="intentions", ref=f"state/intentions.json#{s['id']}", default_repo="flow"))
         elif s.get("disposition") == "handoff" and isinstance(s.get("pointer"), str):
             repo = _repo_of_pointer(s["pointer"], sources.get("repos"), sources.get("home"))
             if repo:
                 handoff_order += 1
                 keep(_item(id=str(s["id"]), repo=repo, title=s.get("text"), declared="ready",
-                           rank=HANDOFF_RANK_BASE + handoff_order, source="spores", ref=s["pointer"]))
+                           rank=HANDOFF_RANK_BASE + handoff_order, source="intentions", ref=s["pointer"]))
     for it in _plan_items([r for r in sources.get("plan") or () if isinstance(r, Mapping)]):
         keep(it)
 

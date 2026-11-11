@@ -4853,8 +4853,8 @@ def _levain_render_variant(
 # The base seed files a release adds to installs that never had them. Only these are written on
 # the strength of "no receipt record"; for every other seed that reading also fits a deleted file
 # or a damaged receipt, and the operator's absence is kept.
-# `intention_instructions.md` is the old `spore_instructions.md` under its new name: an install made before the rename
-# holds the old file and has no record of the new one.
+# `intention_instructions.md` is the old seed document (`OLD_SEED_DOC`) under its new name: an install made before the
+# rename holds the old file and has no record of the new one.
 _SEEDS_NEW_TO_THE_PACKAGE = frozenset(MEMORY_LOAD_SEED) | {"intention_instructions.md"}
 
 
