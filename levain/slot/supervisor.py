@@ -675,14 +675,6 @@ def operator_clone(repo: Path, branch: str, dest: Path, *, git: str = "git",
                      refusal="clone-failed"))
 
 
-def _fold(name: str) -> str:
-    # a case- and normalization-insensitive store (APFS by default) checks `.Claude/Settings.json` out where CC would
-    # read `.claude/settings.json`: such a spelling is found by its folded name and named, never parsed. The one fold
-    # is render's (PRE-L3 4-2), imported where it is used.
-    from levain.slot.render import fold_name
-    return fold_name(name)
-
-
 def _ls_tree(clone: Path, treeish: str, *, git: str, run: Callable[..., subprocess.CompletedProcess]
              ) -> List[Tuple[bytes, bytes, bytes, str]]:
     p = _git(["-C", str(clone), "ls-tree", "-z", treeish], git=git, run=run, refusal="repo-settings-malformed")
@@ -713,6 +705,7 @@ def repo_layer_docs(clone: Path, *, git: str = "git",
     effect there. Refused ``repo-settings-malformed`` when an exact entry is a link or a submodule, is over
     :data:`SETTINGS_CAP`, is not JSON, or repeats a key (DECISION: two values for one key is refused, not resolved),
     or nests too deep to parse."""
+    from levain.slot.render import fold_name as _fold   # the one fold, imported where it is used
     names = {Path(n).name for n in REPO_SETTINGS}
     folded = {_fold(n) for n in names}
     docs: Dict[str, Any] = {}
@@ -760,7 +753,7 @@ def worktree_layer_docs(top: Path, ignored: Optional[List[str]] = None) -> Dict[
     directory / regular file, a file over :data:`SETTINGS_CAP`, not JSON, a repeated key, nesting too deep. Each file is
     opened without following a link and checked on the open descriptor."""
     import stat as st
-
+    from levain.slot.render import fold_name as _fold   # the one fold, imported where it is used
     names = {Path(n).name for n in REPO_SETTINGS}
     folded = {_fold(n) for n in names}
     try:
