@@ -406,8 +406,10 @@ _INTENTION_ROW = lambda r: ((str(r.get("id", "")).startswith("question:")   # no
                              and _facet(r, "question_state") == "open" and _facet(r, "question_intention") is not None)
                             or (str(r.get("id", "")).startswith("band:") and _facet(r, "intention") is not None))
 
-# a List band row that rings no reminder: a machine-filed row, whatever its section or whether it is snoozed
-_PLAIN_BAND_ROW = lambda r: str(r.get("id", "")).startswith("band:") and _facet(r, "intention") is None   # noqa: E731
+# a List band row that rings no reminder: a machine-filed row, whatever its section or whether it is snoozed, unless its
+# ``agenda_blocked`` facet says why not
+_PLAIN_BAND_ROW = lambda r: (str(r.get("id", "")).startswith("band:") and _facet(r, "intention") is None   # noqa: E731
+                             and _facet(r, "agenda_blocked") is None)
 
 
 # the kernel's agent-text rows on the composed decisions panel: (row-id prefix, the facet only the kernel writes, the

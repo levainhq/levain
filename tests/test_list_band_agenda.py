@@ -132,13 +132,24 @@ def test_the_agenda_key_is_the_question_id_alone_in_anneals_grammar() -> None:
 # --- refusals write nothing ----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("offset", [-1, 0, 1, SNOOZE_MAX_DAYS])
+@pytest.mark.parametrize("offset", [1, SNOOZE_MAX_DAYS])
 def test_a_day_inside_the_snooze_window_is_refused_with_the_rule_and_the_remedy(rig: Rig, offset: int) -> None:
     day = (TODAY + timedelta(days=offset)).isoformat()
     with pytest.raises(EditError) as ei:
         _fire(rig, _row(rig), day)
     words = str(ei.value)
     assert ei.value.http_status == 400 and f"{SNOOZE_MAX_DAYS} days" in words and "snooze the row instead" in words
+    assert (TODAY + timedelta(days=SNOOZE_MAX_DAYS)).isoformat() in words
+    assert _agendas(rig) == [] and rig.qs.get(rig.q.id).answer is None and _audit(rig) == []
+
+
+@pytest.mark.parametrize("offset", [-1, 0])
+def test_a_day_not_after_today_is_refused_without_pointing_at_a_snooze_that_refuses_it_too(rig: Rig, offset: int) -> None:
+    day = (TODAY + timedelta(days=offset)).isoformat()
+    with pytest.raises(EditError) as ei:
+        _fire(rig, _row(rig), day)
+    words = str(ei.value)
+    assert ei.value.http_status == 400 and "snooze" not in words and TODAY.isoformat() in words
     assert (TODAY + timedelta(days=SNOOZE_MAX_DAYS)).isoformat() in words
     assert _agendas(rig) == [] and rig.qs.get(rig.q.id).answer is None and _audit(rig) == []
 
@@ -255,6 +266,163 @@ def test_a_second_identical_call_after_success_is_stale_and_plants_no_second_age
                           ledger_root=rig.src.write_scope.ledger_root, question_id=rig.q.id, day=PAST, today=TODAY)
     assert ei2.value.code == "stale"
     assert len(_agendas(rig)) == 1 and len(_audit(rig)) == 1
+
+
+class AnsweringHost(HostStore):
+    """A host store whose ``answer`` records like flow's: it can refuse an unsigned text answer (flow's signed-answers setting),
+    or close the row and then raise (flow's desk wake failing after the row resolved)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.answer_refuses: str | None = None
+        self.answer_raises: Exception | None = None
+        self.raise_after_closing = False
+
+    def answer(self, ref, *, option=None, text=None, channel):
+        from dataclasses import replace as _replace
+
+        from levain.cockpit.consent import ConsentError
+        from levain.consent.questions import Answer
+
+        if self.answer_refuses:
+            raise ConsentError(self.answer_refuses)
+        if self.answer_raises is not None:
+            raise self.answer_raises
+        q = self.get(ref)
+        self.rows = [_replace(r, answer=Answer(r.id, "text", text, channel, "2026-11-08T11:00:00Z")) if r.id == q.id else r
+                     for r in self.rows]
+        if self.raise_after_closing:
+            raise ConsentError(f"{q.id} is resolved but the desk was NOT woken (OSError); tell it")
+        return self.rows
+
+
+def _host_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host: Any) -> Rig:
+    monkeypatch.setattr(band, "deliver_answer", lambda *a, **k: None)
+    rig = Rig(tmp_path, band=False)
+    rig.ck.attach_question_rows(host)
+    return rig
+
+
+def _defer(rig: Rig, host: Any, qid: str, day: str = PAST) -> dict[str, Any]:
+    return band_agenda.defer(questions=host, spores_json=rig.src.anneal.spores_json, ledger_root=rig.src.write_scope.ledger_root,
+                             question_id=qid, day=day, today=TODAY)
+
+
+def _keyed(rig: Rig, qid: str) -> dict[str, Any] | None:
+    return rig.sp.get_by_origin_key(band_agenda.agenda_origin_key(qid))
+
+
+def test_a_signing_row_is_not_offered_the_verb_and_a_direct_call_refuses_writing_nothing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dataclasses import replace
+
+    from levain.consent.questions import Link
+
+    host = AnsweringHost()
+    host.rows = [*host.rows, replace(host.rows[1], n=13, id="np-sign0003", sign_request="sr-0003"),
+                 replace(host.rows[1], n=14, id="np-link0004", link=Link("a", "push", "rq-4", "qu-4"))]
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    rows = rig.rows()
+    for qid in ("np-sign0003", "np-link0004"):
+        assert "band_agenda" not in {a["verb"] for a in rows[f"band:{qid}"]["actions"]}, qid
+        with pytest.raises(EditError) as ei:
+            _defer(rig, host, qid)
+        assert ei.value.code == "needs_signature" and "sign" in str(ei.value)
+        assert _keyed(rig, qid) is None and host.get(qid).answer is None
+    assert {a["verb"] for a in rows["band:np-plain002"]["actions"]} == {"band_agenda"}
+    assert _audit(rig) == []
+
+
+def test_a_host_that_refuses_the_unsigned_answer_after_the_plant_leaves_no_agenda_behind(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    host = AnsweringHost()
+    host.answer_refuses = "needs a signed answer: open the sign link in its ping, a tap does not answer it"
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    words = str(ei.value)
+    assert ei.value.code == "answer_refused" and "needs a signed answer" in words and "nothing remains planted" in words
+    assert _agendas(rig) == [] and host.get("np-plain002").answer is None          # no orphan agenda, the row still open
+    gone = _keyed(rig, "np-plain002")
+    assert gone["status"] == "resolved" and gone["resolution"]["kind"] == "composted"
+    assert any("needs a signed answer" in str(n) for n in gone.get("notes") or ())
+    [line] = _audit(rig)
+    assert line["outcome"] == "aborted" and line["question"] == "np-plain002"
+
+
+def test_a_refused_answer_on_a_retry_keeps_the_agenda_an_earlier_call_planted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    host = AnsweringHost()
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    with monkeypatch.context() as m:
+        _fail(m, "_answer_deferred")
+        with pytest.raises(EditError):
+            _defer(rig, host, "np-plain002")
+    host.answer_refuses = "needs a signed answer"
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    [agenda] = _agendas(rig)                                # an earlier call's agenda: the key's day stands (Q4)
+    assert ei.value.code == "answer_refused" and agenda["id"] in str(ei.value) and "nothing remains planted" not in str(ei.value)
+
+
+@pytest.mark.parametrize("exc", [ValueError("bad host"), AttributeError("no such field")])
+def test_an_unexpected_answer_fault_with_the_row_still_open_leaves_no_agenda(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    host = AnsweringHost()
+    host.answer_raises = exc
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    assert ei.value.code == "answer_refused" and "nothing remains planted" in str(ei.value)
+    assert _agendas(rig) == [] and host.get("np-plain002").answer is None
+
+
+def test_a_host_that_closes_the_row_and_then_raises_still_reports_the_deferral(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    host = AnsweringHost()
+    host.raise_after_closing = True
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    out = _defer(rig, host, "np-plain002")
+    [agenda] = _agendas(rig)
+    assert out["ok"] and out["agenda"] == agenda["id"] and "desk was NOT woken" in out["warning"]
+    assert host.get("np-plain002").answer is not None and len(_audit(rig)) == 1
+
+
+@pytest.mark.parametrize("answer", [None, lambda self, ref: None])
+def test_a_host_with_no_text_answer_is_not_offered_the_verb_and_plants_nothing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer: Any) -> None:
+    class NoAnswer(AnsweringHost):
+        pass
+    NoAnswer.answer = answer                                 # type: ignore[assignment]
+    host = NoAnswer()
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    assert "band_agenda" not in {a["verb"] for a in rig.rows()["band:np-plain002"]["actions"]}
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    assert ei.value.code == "not_built" and _keyed(rig, "np-plain002") is None
+
+
+def test_an_older_hosts_ringing_row_is_refused_though_the_host_cannot_act_on_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.test_intention_controls import OlderHost
+
+    host = OlderHost()
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    assert "band_agenda" not in {a["verb"] for a in rig.rows()["band:np-ring0001"]["actions"]}
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-ring0001")
+    assert ei.value.code == "rings_a_reminder" and "spore-9" in str(ei.value) and _keyed(rig, "np-ring0001") is None
+
+
+def test_an_unreadable_band_row_is_not_offered_the_verb() -> None:
+    from datetime import datetime, timezone
+
+    from levain.cockpit import verbs
+    from levain.cockpit.list_panel import _band_row
+
+    row = _band_row({"id": "band:q-x", "title": "UNREADABLE: this band item could not be read", "unreadable": True},
+                    TODAY, datetime(2026, 11, 11, 12, tzinfo=timezone.utc))
+    assert row.facets["agenda_blocked"] == "unreadable"
+    assert not verbs._PLAIN_BAND_ROW({"id": row.id, "facets": row.facets})
 
 
 def test_the_agenda_is_one_atomic_add_with_no_second_write(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -59,7 +59,7 @@ BOARD_POINTER = "the agents' ready queue (levain board)"
 LIST_FACETS = SPORE_FACETS | frozenset({
     "surface", "fires", "overdue", "target", "attention", "list_pointer", "band_number", "board_rank", "board_tier",
     "source", "repo", "held_until", "intention", "intention_text", "band_section", "band_carried", "band_age", "band_since", "band_later_words",
-    "time_state", "wake_day", "wake_bucket", "wake_line", "done_on", "done_kind",
+    "agenda_blocked", "time_state", "wake_day", "wake_bucket", "wake_line", "done_on", "done_kind",
     "kept_line", "kept_at", "kept_type", "kept_source",
 })
 SURFACES = ("band", "board", "spore", "talk", "drop", "kept")
@@ -236,8 +236,9 @@ def _age_text(instant: Any, now: datetime) -> str | None:
     return f"{h // 24}d{h % 24}h" if h >= 24 else f"{h}h" if h else f"{int(secs // 60)}m"
 
 
-def _band_row(card: dict[str, Any], today: date, now: datetime) -> RowIn:
-    """One needs-you card as a read-only band row."""
+def _band_row(card: dict[str, Any], today: date, now: datetime, block: str | None = None) -> RowIn:
+    """One needs-you card as a band row: a pointer to Decisions whose only writes are its own row verbs. ``block`` is why a row
+    that rings nothing is still not offered ``band_agenda`` (:func:`levain.band_agenda.offer_blocks`)."""
     ref = str(card.get("id", ""))
     ring = card.get("intention") if isinstance(card.get("intention"), str) else None
     words = card.get("intention_text") if ring is not None else None
@@ -269,6 +270,8 @@ def _band_row(card: dict[str, Any], today: date, now: datetime) -> RowIn:
         facets["intention"] = ring
         if isinstance(words, str) and words:
             facets["intention_text"] = words        # the Edit field's start: the reminder's own words, exact
+    elif card.get("unreadable") or block:
+        facets["agenda_blocked"] = "unreadable" if card.get("unreadable") else block
     if card.get("section") in ("you", "desk"):
         facets["band_section"] = card["section"]
     if isinstance(card.get("carried"), bool):
@@ -297,10 +300,13 @@ def _board_part(store_dir: Any, question_store: Any, today: date, now: datetime)
     others = sorted({u for u in unreadable if u != "band"})
     if others:
         out.skipped.append((1, f"the agents' board could not be fully read ({', '.join(others)})"))
+    from levain import band_agenda
+
+    every, per_row = band_agenda.offer_blocks(question_store) if cols.get("needs-you") else (None, {})
     for card in cols.get("needs-you", ()):
         if card.get("unreadable"):
             out.skipped.append((1, "a band item that could not be read"))
-        out.rows.append(_band_row(card, today, now))
+        out.rows.append(_band_row(card, today, now, every or per_row.get(str(card.get("id", ""))[len("band:"):])))
     for card in cols.get("ready", ()):
         rid = f"board:{card.get('id')}"
         title = visible(str(card.get("title") or "")) or "(no title)"
@@ -430,7 +436,10 @@ def list_read_one(source: SubstrateSource, ck: Cockpit | None = None) -> Callabl
                 return Fault("the needs-you band could not be read")
             for card in cards:
                 if card.get("id") == row_id and not card.get("unreadable"):      # an open row, ringing or not
-                    return Read(rows=(_band_row(card, ctx.today, ctx.now),))
+                    from levain import band_agenda
+
+                    block = band_agenda.offer_block(ck.question_store, row_id[len("band:"):])
+                    return Read(rows=(_band_row(card, ctx.today, ctx.now, block),))
             return Absent(f"row {row_id!r} is gone or could not be read: it has no write")
         if not row_id.startswith("spore:"):
             return Absent(f"row {row_id!r} is a read-only List row; it has no write")

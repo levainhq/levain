@@ -28,6 +28,7 @@
  "etag": "<etag>",
  "facets": [
   "age_days",
+  "agenda_blocked",
   "attention",
   "band_age",
   "band_carried",
