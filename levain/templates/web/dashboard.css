@@ -2370,9 +2370,11 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-stat.warn, .tv-stat.warn b { color: var(--warn); }
 .tv-stat.bad, .tv-stat.bad b { color: var(--bad); }
 .tv-stat.dim { color: var(--meta); }
-/* the "waiting on you" figure when something waits and a card names where to go: a button, drawn as the figure it is (the .hot rule above colours it) */
-.tv-jump { appearance: none; background: none; border: 0; padding: 0; margin: 0; font: inherit; cursor: pointer; }
-.tv-jump:hover { text-decoration: underline; text-underline-offset: 3px; }
+/* the "waiting on you" figure when something waits and a card names where to go: a button that shows it is one at rest (the Needs chip's accent-line border
+   and an arrow), so a touch screen, which has no hover, still reads it as pressable; the .hot rule above colours the figure */
+.tv-jump { appearance: none; background: var(--card); border: 1px solid var(--accent-line); border-radius: var(--r-sm); padding: var(--sp-1) var(--sp-3); margin: 0; font: inherit; cursor: pointer; }
+.tv-jump::after { content: "\2192"; margin-left: var(--sp-2); }
+.tv-jump:hover { border-color: var(--accent); }
 .tv-jump:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
 @media (pointer: coarse) { .tv-jump { display: inline-flex; align-items: center; min-height: var(--hit-min); } }
 .tv-right { margin-left: auto; }
