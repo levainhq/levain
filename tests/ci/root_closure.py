@@ -522,6 +522,8 @@ LAZY_SITES = {
     'levain/slot/supervisor.py::check_repo_layer::from levain.slot.render import repo_loosening_refusals': 'root',
     # root: ``repo_layer_docs`` feeds ``check_repo_layer`` on the same two paths (``readset._layer_check`` runs it in the dispatch run server); its target is already a closure member
     'levain/slot/supervisor.py::repo_layer_docs::from levain.slot.render import fold_name as _fold   # the one fold, imported where it is used': 'root',
+    # operator: ``worktree_layer_docs`` reads the operator's checkout as it is on disk and is called only by ``Supervisor.run``, the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
+    'levain/slot/supervisor.py::worktree_layer_docs::from levain.slot.render import fold_name as _fold   # the one fold, imported where it is used': 'operator',
     # operator: ``identity_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
     'levain/slot/supervisor.py::identity_answer::from levain.slot.records import _REASON_RE, OBSERVED_ID_RE': 'operator',
     # operator: ``prepare_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
