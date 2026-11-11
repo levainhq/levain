@@ -10122,8 +10122,8 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   // one-line notice. Without a read by the deadline it falls back the same way.
   // The first board draws in parts (S4) and the whole draw then replaces every node: a jump made on a part would land where the rest of the
   // page pushes it from. The boot sets html[data-board-whole] when the whole board is drawn, or when no whole draw is coming soon (a refused
-  // read, a failed one with no part drawn, or a failure after a part once the retry backoff has reached its last step; while a retry is queued
-  // after a part the signal stays unset and the part inert), and never on a partial draw, so a jump waits for that, and at its deadline falls back to the target as the page has it (a slow board still gets its jump, a dead link is worse than a mispositioned one).
+  // read, a failed one with no part drawn, or the boot's watchdog, a clock from the first inert part, which releases a part whatever its reads
+  // are doing; while a retry is queued after a part the signal stays unset and the part inert until then), and never on a partial draw, so a jump waits for that, and at its deadline falls back to the target as the page has it (a slow board still gets its jump, a dead link is worse than a mispositioned one).
   function boardWhole() { return !!document.documentElement && typeof document.documentElement.hasAttribute === "function" && document.documentElement.hasAttribute("data-board-whole"); }
   function needsItemJump(item, run, deadline) {
     if (run !== phoneJumpRun) return;
