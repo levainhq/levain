@@ -267,8 +267,7 @@ jobs:
 
       - name: Install bubblewrap and allow it a user namespace
         run: |
-          sudo timeout 300 apt-get -o Acquire::Retries=3 update -q || true
-          sudo timeout 300 apt-get -o Acquire::Retries=3 install -y -q bubblewrap
+          bash tests/ci/apt_install.sh bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --bind / / --proc /proc --dev /dev --unshare-pid /bin/true && echo "bwrap ok"
           # Each command runs in a cgroup leaf of the runner user's systemd user manager; a runner has no
@@ -418,7 +417,7 @@ jobs:
 
       - name: Install the ACL tools (Linux)
         if: runner.os == 'Linux'
-        run: command -v setfacl || (sudo apt-get update && sudo apt-get install -y acl)
+        run: command -v setfacl || bash tests/ci/apt_install.sh acl
 
       - name: Set up, check and undo isolation
         run: bash tests/ci/isolation_e2e.sh
@@ -464,8 +463,7 @@ jobs:
         # user namespace. Lifted on the throwaway runner VM, the remedy the linux-live and browser jobs apply.
         if: runner.os == 'Linux'
         run: |
-          sudo timeout 300 apt-get -o Acquire::Retries=3 update -q || true
-          sudo timeout 300 apt-get -o Acquire::Retries=3 install -y -q bubblewrap socat ripgrep
+          bash tests/ci/apt_install.sh bubblewrap socat ripgrep
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           bwrap --version
           command -v socat
