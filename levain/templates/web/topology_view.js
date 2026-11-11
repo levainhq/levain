@@ -409,9 +409,14 @@
     const n = t ? null : arr(v.nodes).find((x) => x.state === "waiting" && card(x));
     return t ? card(t) : n ? card(n) : null;
   }
+  // the tasks the Work lens draws as cards (a pending consent / question record is none: the Needs strip lists it), and the unattached work it draws last:
+  // ONE predicate for the lens's cards and for the strip's task counts, so the figures above the list are the list's own
+  const drawnTask = (t) => t.kind !== "unattached" && t.kind !== "consent" && t.kind !== "question";
+  // what the "waiting on you" figure counts, said in its tooltip: sessions and asks, not the cards in the lens
+  const WAITING_TIP = "sessions waiting on you, plus any ask no waiting session carries, each counted once (a session with several asks counts once; the Needs strip lists each ask)";
   // the Work lens's strip, as drawn: the tasks lead, then the loud states, then conflicts and tokens
   function stripWork(v, opts) {
-    const tasks = arr(v.tasks).filter((t) => t.kind !== "unattached");
+    const tasks = arr(v.tasks).filter(drawnTask);
     const n = (st) => tasks.filter((t) => t.state === st).length;
     const row = el("div", "tv-strip");
     const stat = (k, num, word, cls, tag) => {
@@ -423,10 +428,11 @@
     // a button (Enter and Space are the browser's own) only while something waits and a card names where to go; otherwise the plain figure
     const wn = waitingOnYou(v), wcard = wn && opts && typeof opts.openCard === "function" ? waitingCard(v) : null;
     const waiting = stat("waiting", wn, "waiting on you", wn ? "hot" : "", wcard ? "button" : "span");
+    waiting.title = "Counts " + WAITING_TIP;
     if (wcard) {
       waiting.type = "button";
       waiting.classList.add("tv-jump");
-      waiting.title = "go to what is waiting on you";
+      waiting.title = "Go to the first one in the Needs strip. Counts " + WAITING_TIP;
       waiting.addEventListener("click", () => opts.openCard(wcard));
     }
     row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), waiting, stat("tasks-waiting", n("waiting"), n("waiting") === 1 ? "task waiting" : "tasks waiting"));
@@ -594,7 +600,7 @@
     const centre = [];
     const heatRank = (t) => { const i = HEAT_ORDER.indexOf(t.heat); return i < 0 ? HEAT_ORDER.length : i; };
     for (const st of TASK_ORDER) {
-      const group = tasks.filter((t) => t.state === st && t.kind !== "unattached" && t.kind !== "consent" && t.kind !== "question");
+      const group = tasks.filter((t) => t.state === st && drawnTask(t));
       if (st === "open") group.sort((a, b) => heatRank(a) - heatRank(b));       // hot first; the store's order within a heat (the sort is stable)
       centre.push(...group);
     }
@@ -629,7 +635,11 @@
         row += 1;
       }
     }
-    if (!centre.length) wrap.appendChild(el("p", "tv-none tv-no-tasks", "No task records and no active work."));
+    if (!centre.length) {
+      // nothing drawn: when asks wait on you, they are in the Needs strip (the figure above is the way there), so the sentence says that, not "no records"
+      const wn = waitingOnYou(v);
+      wrap.appendChild(el("p", "tv-none tv-no-tasks", wn ? "No task is running or listed here; " + wn + " waiting on you, in the Needs strip." : "No task records and no active work."));
+    }
     heads[1].hidden = !centre.some((t) => arr(t.outcomes).length);
     wrap.classList.toggle("tv-noouts", heads[1].hidden);        // no outcomes anywhere: the second column gives its width back
     // the lines: drawn after layout, again when the card is resized; a wrap with no lines to draw has no overlay

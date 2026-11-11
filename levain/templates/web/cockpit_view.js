@@ -2396,7 +2396,7 @@
   // the card id the row carries (data-card). With no Decisions panel on the page, the Board tab is shown instead.
   function openNeedsYouCard(card) {
     const N = root.LevainNeeds;
-    if (N && N.go(card)) return;   // the strip's card (or, on Build, its chip) is lit; the strip is on the page only while the item waits
+    if (N && N.go(card, false, true)) return;   // the strip's card (or, on Build, its chip) is lit; the strip is on the page only while the item waits
     const mark = (tries) => {
       const row = Array.from(document.querySelectorAll("[data-card]")).find((r) => r.dataset.card === card && !r.classList.contains("tv-open"));
       if (row) { row.classList.add("tv-lit"); if (row.scrollIntoView) row.scrollIntoView({ block: "center" }); return; }
