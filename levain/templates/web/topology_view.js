@@ -35,6 +35,7 @@
     running: ["Running", "a worker or a live job is on it"],
     done: ["Done", "finished"],
   };
+  const ROW_PREFIX = "intention:";   // the cockpit's id of an intention row; the open-loop id is what follows it
   const NODE_WORDS = { waiting: "waiting on you", errored: "errored", stalled: "stalled", running: "running", idle: "idle" };
   const KIND_WORDS = { dispatch: "dispatch", intention: "open loop", consent: "consent", question: "question", unattached: "unattached" };
   const CARD_WORDS = { consent: "a consent request", question: "a question", dispatch: "a dispatch contract" };
@@ -477,8 +478,8 @@
   }
   // an open loop opens its row in the page's Open loops panel, through the page's own callback (this file knows no page DOM)
   function openLoopCard(node, t, opts) {
-    if (!opts || typeof opts.openLoop !== "function" || typeof t.id !== "string" || t.id.indexOf("intention:") !== 0 || t.id.length <= 6) return;
-    const sid = t.id.slice(6);
+    if (!opts || typeof opts.openLoop !== "function" || typeof t.id !== "string" || t.id.indexOf(ROW_PREFIX) !== 0 || t.id.length <= ROW_PREFIX.length) return;
+    const sid = t.id.slice(ROW_PREFIX.length);
     const title = node.querySelector(".tv-task-t");
     node.classList.add("tv-open");
     node.dataset.loop = sid;
