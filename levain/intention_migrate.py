@@ -39,7 +39,7 @@ except ImportError:                              # pragma: no cover - Windows: g
 
 from levain.intention_legacy import STORE_DOC_KEY_OPEN
 
-__all__ = ["BACKUP_SUBDIR", "MigrationReport", "migrate_seed_to_someday"]
+__all__ = ["BACKUP_SUBDIR", "MigrationReport", "migrate_seed_to_someday", "open_seed_ids"]
 
 BACKUP_SUBDIR = ("backups", "intentions")        # <store dir>/backups/intentions/ (an install: <install>/.levain/backups/intentions/)
 _OLD = "seed"
@@ -115,6 +115,15 @@ def migrate_seed_to_someday(paths: Any, *, now: datetime | None = None,
         else:
             report.migrated.append(rid)
     return report
+
+
+def open_seed_ids(paths: Any) -> list[str]:
+    """What :func:`migrate_seed_to_someday` WOULD rewrite, read without writing anything (a dry run's plan). An
+    unreadable store has none to name here: the real run refuses it and says why."""
+    try:
+        return _open_seed_ids(Path(paths.intentions_json))
+    except (OSError, ValueError):
+        return []
 
 
 def _open_seed_ids(store_path: Path) -> list[str]:

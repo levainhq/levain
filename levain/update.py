@@ -161,7 +161,8 @@ def _run_update(
         if packs_drifted:
             reconcile.run_pack_reconcile(install, dry_run=True, emit=emit)
         plan = refresh_adapter(install, apply=False, emit=emit, carrier=not packs_drifted, messaging=_messaging)
-        if engine_clean and not packs_drifted and not plan.refreshed and not plan.review:
+        seeds_planned = _plan_intention_migration(install, emit)
+        if engine_clean and not packs_drifted and not plan.refreshed and not plan.review and not seeds_planned:
             emit("--dry-run: nothing to reconcile mechanically. Nothing was changed.")
             return 0
         emit("--dry-run: the plan above is what `levain update` WOULD do. "
@@ -174,6 +175,7 @@ def _run_update(
         # An upgrade with the lock already current still leaves the activation tree and
         # adapter files at the previous release (gap #19), so this runs here too.
         adapter = refresh_adapter(install, apply=True, emit=emit, messaging=_messaging)
+        seeds_refused = _migrate_intentions(install, emit)
         if adapter.review:
             emit("\nAdapter files need your review (listed above) — merge by hand or "
                  "re-onboard (`levain init --force`), then re-run `levain update`.")
@@ -193,6 +195,9 @@ def _run_update(
         # recorded baseline (codex re-verify: the early path missed this).
         if not _record_lock(install, installed, emit):
             emit("Could not record the compatibility lock — re-run `levain update`.")
+            return 1
+        if seeds_refused:
+            emit(_SEEDS_REFUSED_TAIL)
             return 1
         return 0
 
@@ -280,6 +285,7 @@ def _run_update(
     #    pack reconcile, which may have changed the roster the carrier lists. --
     adapter = refresh_adapter(install, apply=True, emit=emit, carrier=not pack_needs_review, messaging=_messaging)
     adapter_needs_review = bool(adapter.review)
+    seeds_refused = _migrate_intentions(install, emit)
 
     # -- 3.7 record the `--ack` decided at step 3, now that everything that can rewrite an
     #    instruction file has run. The proposals were shown against the files as they were
@@ -343,6 +349,9 @@ def _run_update(
         emit("Adapter files need your review (listed above) — merge by hand or "
              "re-onboard (`levain init --force`), then re-run `levain update`.")
         return 1
+    if seeds_refused:
+        emit(_SEEDS_REFUSED_TAIL)
+        return 1
     if pack_needs_review:
         # Engine is at known-good, but a pulled pack carried changes that can't
         # auto-reconcile (render / activation / manifest / seed-set). Non-zero so it
@@ -364,6 +373,39 @@ def _run_update(
 # ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
+
+_SEEDS_REFUSED_TAIL = ("The open `seed` intentions were NOT rewritten to `someday` (the reason is listed above): "
+                       "fix that, then re-run `levain update`.")
+
+
+def _install_intention_paths(install: Path):
+    from levain.dashboard import AnnealPaths
+
+    return AnnealPaths.from_db(install / ".levain" / "memory.db")
+
+
+def _migrate_intentions(install: Path, emit: Emit) -> bool:
+    """Rewrite the store's open ``seed`` records to ``someday`` (ruling H8, :mod:`levain.intention_migrate`): copied
+    first, idempotent, one compare-and-set per record. Every line the migration reports is printed. True when the
+    migration REFUSED (an unwritable backup, an unreadable store): the caller ends the update non-zero, so a refusal is
+    never swallowed."""
+    from levain.intention_migrate import migrate_seed_to_someday
+
+    report = migrate_seed_to_someday(_install_intention_paths(install))
+    for line in report.lines():
+        emit(line)
+    return report.refused is not None
+
+
+def _plan_intention_migration(install: Path, emit: Emit) -> bool:
+    """The ``--dry-run`` plan of :func:`_migrate_intentions`, read-only. True when it WOULD rewrite something."""
+    from levain.intention_migrate import open_seed_ids
+
+    ids = open_seed_ids(_install_intention_paths(install))
+    if ids:
+        emit(f"intentions: {len(ids)} open seed record(s) would be rewritten to someday "
+             f"({', '.join(ids)}); the store is copied first")
+    return bool(ids)
 
 def _reconcile_anneal(
     target: str, *, no_pip: bool, confirm: Callable[[str], bool], emit: Emit
