@@ -6,13 +6,13 @@
 // hub is whatever the provider names (Levain: the install; flow: the desk), groups are repos or seats, nodes are sessions or
 // lanes. Everything is built with textContent: a wire string never reaches an HTML sink.
 //
-//   Work lens: three columns as drawn. LEFT, the waiting records (one per pending consent / question, plus a
-//   dispatch contract waiting on a signature). CENTRE, the tasks as compact cards, loudest state first; waiting-orange is a
+//   Work lens: two columns as drawn. LEFT, the tasks as compact cards, loudest state first; waiting-orange is a
 //   border and a tag, stuck is dashed amber, done is quiet. RIGHT, each task's outcomes on the task's own row. A line joins a
-//   record to the task that waits on it and a task to its outcomes (the lines are ornament: the columns are the grammar).
+//   task to its outcomes (the lines are ornament: the columns are the grammar). The lens lists no pending consent or question
+//   (the Needs strip does, organized): its "waiting on you" figure is the one way there, a button that goes to the first waiting card.
 //   Agents are small chips on the task they work. A session with no task object sits in an "unattached work" block, never a
 //   guessed task. Waiting (a pending record the operator can answer) and stuck (silence, no record) never merge. In a
-//   narrow card the columns stack: records, tasks, each task's outcomes beneath it.
+//   narrow card the columns stack: tasks, each task's outcomes beneath it.
 //   Agents lens (the header's default on a cold open): the graph as the F12 mock draws it. One hub (the install), the groups on its two sides, each group's sessions beside it
 //   with a subagent under its parent, every node with its face and a state ring, edges hub -> group -> node -> child that carry particle
 //   streams whose density is the node's rate. A file conflict is the file's name on a chip between its nodes.
@@ -331,7 +331,7 @@
   // ---- the header strip ----
   // "waiting on you" is ONE figure from ONE function: every distinct thing he can answer, counted once. A session in state waiting is one; so is
   // a waiting task that no waiting session carries (a seat-less ask arrives as a task with no workers), while a waiting task whose worker session
-  // is itself waiting is that same ask and adds nothing. Every lens's headline figure and the Work lens's empty sentence read it; the Work lens's
+  // is itself waiting is that same ask and adds nothing. Every lens's headline figure and the Work lens's button read it; the Work lens's
   // own count of task records says "tasks waiting" and is never the headline.
   const waitingOnYou = (v) => {
     const nodes = arr(v.nodes), waitingIds = new Set(nodes.filter((n) => n.state === "waiting").map((n) => n.id));
@@ -401,18 +401,35 @@
     if (conflicts && conflicts.length) { const n = conflictCount(v); row.appendChild(m("conflicts", n === 1 ? "file conflict" : "file conflicts", String(n), "files two live sessions are both writing", "warn")); }
     return row;
   }
+  // The Needs-you card the Work lens's "waiting on you" figure goes to: the first waiting task's card, else a waiting session's; null when none names one
+  // (the Work lens lists no waiting item itself: the Needs strip does, organized, and this figure is the one way from here to it)
+  function waitingCard(v) {
+    const card = (x) => (typeof x.card === "string" && x.card ? x.card : null);
+    const t = arr(v.tasks).find((x) => x.kind !== "unattached" && x.state === "waiting" && card(x));
+    const n = t ? null : arr(v.nodes).find((x) => x.state === "waiting" && card(x));
+    return t ? card(t) : n ? card(n) : null;
+  }
   // the Work lens's strip, as drawn: the tasks lead, then the loud states, then conflicts and tokens
-  function stripWork(v) {
+  function stripWork(v, opts) {
     const tasks = arr(v.tasks).filter((t) => t.kind !== "unattached");
     const n = (st) => tasks.filter((t) => t.state === st).length;
     const row = el("div", "tv-strip");
-    const stat = (k, num, word, cls) => {
-      const s = el("span", "tv-stat" + (cls ? " " + cls : ""));
+    const stat = (k, num, word, cls, tag) => {
+      const s = el(tag || "span", "tv-stat" + (cls ? " " + cls : ""));
       s.dataset.k = k;
       s.append(el("b", null, num), " " + word);
       return s;
     };
-    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), stat("waiting", waitingOnYou(v), "waiting on you", waitingOnYou(v) ? "hot" : ""), stat("tasks-waiting", n("waiting"), n("waiting") === 1 ? "task waiting" : "tasks waiting"));
+    // a button (Enter and Space are the browser's own) only while something waits and a card names where to go; otherwise the plain figure
+    const wn = waitingOnYou(v), wcard = wn && opts && typeof opts.openCard === "function" ? waitingCard(v) : null;
+    const waiting = stat("waiting", wn, "waiting on you", wn ? "hot" : "", wcard ? "button" : "span");
+    if (wcard) {
+      waiting.type = "button";
+      waiting.classList.add("tv-jump");
+      waiting.title = "go to what is waiting on you";
+      waiting.addEventListener("click", () => opts.openCard(wcard));
+    }
+    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), waiting, stat("tasks-waiting", n("waiting"), n("waiting") === 1 ? "task waiting" : "tasks waiting"));
     if (n("failed")) row.appendChild(stat("failed", n("failed"), "failed", "bad"));
     row.append(stat("stuck", n("stuck"), "stuck"));
     if (n("open")) row.appendChild(stat("open", n("open"), "open"));
@@ -547,18 +564,6 @@
     }
     return o;
   }
-  // a waiting record on the left: the title, then what it is and who is stopped on it
-  function recordCard(t, byId, opts) {
-    const r = el("div", "tv-rec waiting");
-    r.dataset.rec = t.id;
-    const ti = el("b", "tv-rec-t", t.label);
-    ti.title = t.label;
-    const who = arr(t.workers).map((id) => byId.get(id)).filter(Boolean).map((n) => n.label);
-    const m = el("span", "tv-rec-m", [KIND_WORDS[t.kind] || cardWords(t.card)].concat(who).join(" · "));
-    r.append(ti, m);
-    openable(r, t.card, opts);
-    return r;
-  }
   // one line joining two drawn things, in the wrap's own coordinates; none when the columns are stacked
   function drawLinks(wrap, svg, links) {
     while (svg.firstChild) svg.removeChild(svg.firstChild);
@@ -583,22 +588,9 @@
     const tasks = arr(v.tasks);
     release();
     const wrap = el("div", "tv-work");
-    const heads = ["Waiting on you", "Tasks · who is working on them", "Outcomes"].map((txt, i) => { const h = el("div", "tv-colh tv-colh" + i, txt); wrap.appendChild(h); return h; });
-    // the left column: a record for every pending consent / question, and for a dispatch contract waiting on its signature
-    const left = el("div", "tv-wl");
-    // waiting is the task's state, whether or not it has a card to open: only the click needs one
-    const recs = tasks.filter((t) => t.state === "waiting");
-    const recBy = new Map();
-    for (const t of recs) {
-      const r = recordCard(t, byId, opts);
-      left.appendChild(r);
-      recBy.set(t.id, r);
-      if (typeof t.card === "string" && t.card) recBy.set(t.card, r);
-    }
-    const sessWait = waitingOnYou(v);
-    if (!recs.length) left.appendChild(el("p", "tv-none", sessWait ? "no record is waiting \u00b7 " + sessWait + (sessWait === 1 ? " session is" : " sessions are") + " waiting on you" : "nothing is waiting on you"));
-    wrap.appendChild(left);
-    // the centre: every other task, loudest state first; the right: its outcomes, on the same row
+    const heads = ["Tasks · who is working on them", "Outcomes"].map((txt, i) => { const h = el("div", "tv-colh tv-colh" + (i + 1), txt); wrap.appendChild(h); return h; });
+    // the left: every task, loudest state first (a pending consent / question is no task here: the Needs strip lists it, and the strip's "waiting on you"
+    // figure goes to it); the right: its outcomes, on the same row
     const centre = [];
     const heatRank = (t) => { const i = HEAT_ORDER.indexOf(t.heat); return i < 0 ? HEAT_ORDER.length : i; };
     for (const st of TASK_ORDER) {
@@ -620,10 +612,9 @@
       const o = outcomeList(t);
       c.hidden = hide;
       if (o) o.hidden = hide;
-      if (!hide) { place(c, 2); if (o) place(o, 3); }
+      if (!hide) { place(c, 1); if (o) place(o, 2); }
       wrap.appendChild(c);
       if (o) wrap.appendChild(o);
-      for (const id of new Set(arr(t.waits_on).concat(t.state === "waiting" && t.card ? [t.card] : []))) if (recBy.has(id) && !hide) links.push([recBy.get(id), c, "waiting"]);
       if (o && !hide) for (const li of o.children) links.push([c, li, li.classList.contains("bad") ? "bad" : "ok"]);
       if (!hide) row += 1;
       // a long run of one state (a Tray's open loops) shows its first few and one button for the rest; the choice outlives a redraw
@@ -633,15 +624,14 @@
         more.type = "button";
         more.dataset.more = st;
         more.addEventListener("click", () => { if (shownAll.has(st)) shownAll.delete(st); else shownAll.add(st); if (opts && opts.repaint) opts.repaint(); });
-        place(more, 2);
+        place(more, 1);
         wrap.appendChild(more);
         row += 1;
       }
     }
-    left.style.gridRow = "2 / " + Math.max(row, 3);
     if (!centre.length) wrap.appendChild(el("p", "tv-none tv-no-tasks", "No task records and no active work."));
-    heads[2].hidden = !centre.some((t) => arr(t.outcomes).length);
-    wrap.classList.toggle("tv-noouts", heads[2].hidden);        // no outcomes anywhere: the third column gives its width back
+    heads[1].hidden = !centre.some((t) => arr(t.outcomes).length);
+    wrap.classList.toggle("tv-noouts", heads[1].hidden);        // no outcomes anywhere: the second column gives its width back
     // the lines: drawn after layout, again when the card is resized; a wrap with no lines to draw has no overlay
     if (links.length) {
       const svg = document.createElementNS(SVG_NS, "svg");
@@ -2012,7 +2002,7 @@
     if (o.replay && R.at !== null) w.dataset.rat = isoMin(R.at);
     if (o.replay && replaying()) w.dataset.rshown = past && R.cat !== null ? isoMin(R.cat) : "live";
     const bar = el("div", "tv-bar");
-    bar.append(o0.lensSeg || el("span"), which === "agents" ? metricsStrip(v) : stripWork(v));
+    bar.append(o0.lensSeg || el("span"), which === "agents" ? metricsStrip(v) : stripWork(v, o0));
     w.appendChild(bar);
     const conf = conflictList(v);
     if (conf) w.appendChild(conf);
