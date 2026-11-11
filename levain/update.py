@@ -116,7 +116,8 @@ def _run_update(
 ) -> int:
     """Reconcile the install's set to the declared known-good. Returns 0 when
     the set is at (or was brought to) known-good, 1 when actionable drift
-    remains (so it composes with shell pipelines, like ``levain doctor``).
+    remains or the ``seed`` -> ``someday`` migration was refused (so it composes
+    with shell pipelines, like ``levain doctor``).
 
     ``confirm`` is the yes/no gate for the env-mutating pip step; it defaults to
     an interactive ``input`` prompt (auto-yes under ``--yes``). Injectable so the

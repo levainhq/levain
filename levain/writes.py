@@ -1602,8 +1602,8 @@ _VERB_KINDS = frozenset(
         "intention_seed", "intention_set_disposition", "intention_surface_at", "intention_update", "intention_retarget",
     }
 )
-# the kinds whose write may bind a row version: every verb kind but the episode tombstone (an intention kind, the old
-# ``startswith("intention_")`` check, spelled as the set it always was)
+# the kinds whose write may bind a row version: every verb kind but the episode tombstone (an intention kind; this set
+# replaces the old ``startswith("spore_")`` prefix test, spelled out as the kinds that test matched)
 _VERSIONED_KINDS = _VERB_KINDS - {"episode_tombstone"}
 # the audit-ledger kind of the three row verbs ``_apply_intention_verb`` serves, spelled out (it was built with an f-string)
 _AUDIT_KINDS = {"touch": "intention_touch", "descend": "intention_close", "ascend": "intention_promote"}

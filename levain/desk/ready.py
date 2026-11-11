@@ -7,7 +7,7 @@ so a seat reads the queue with no desk live; only writes need one.
 
 Three parts:
 
-* :func:`derive` — PURE over the fixture's normalized input shape (``intentions`` under flow's input key, ``resolved``, ``needs_phill``,
+* :func:`derive` — PURE over the fixture's normalized input shape (the intention rows under the literal key ``spores`` (``READY_SOURCE_KEY``, flow's input key), ``resolved``, ``needs_phill``,
   ``seats``, ``ci``, ``plan``) plus ``store``, the desk store's current items. It applies SCHEMA sections 2-5:
   the closed category set, a dependency holding a declared-ready item back, needs-you winning, the order, and the
   derived ``well_formed`` / ``independent``. It reads no file and no clock (``generated`` is the caller's).

@@ -1,4 +1,4 @@
-"""Export contract v3, strict profile (seam design intention1344_seam_design_1005.md §3a items 2-7 + prev_root), on real git
+"""Export contract v3, strict profile (seam design spore1344_seam_design_1005.md §3a items 2-7 + prev_root), on real git
 with real SSH keys, read back by anneal-memory's own v3 reader.
 
 The anneal side is the reader on anneal-memory origin/main (not released when this was written), so the tests that
