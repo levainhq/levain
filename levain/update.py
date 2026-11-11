@@ -393,7 +393,7 @@ def _held_line(n: int, *, plan: bool) -> str:
 def _migrate_intentions(install: Path, emit: Emit, *, held: bool = False) -> bool:
     """Rewrite the store's open ``seed`` records to ``someday`` (ruling H8, :mod:`levain.intention_migrate`): copied
     first, idempotent, one compare-and-set per record. Every line the migration reports is printed. True when the
-    migration REFUSED (an unwritable backup, an unreadable store): the caller ends the update non-zero, so a refusal is
+    migration REFUSED (an unwritable backup, an unreadable store, an anneal-memory below 1.0.7): the caller ends the update non-zero, so a refusal is
     never swallowed.
 
     ``held``: the adapter refresh held files for review (``AdapterRefresh.review``), so the hooks may not have moved, and

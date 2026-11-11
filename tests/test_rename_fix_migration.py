@@ -99,6 +99,47 @@ def test_g2_a_held_dry_run_says_the_migration_would_wait(install, monkeypatch):
     assert "would be left for the next `levain update`" in text and "would be rewritten" not in text, text
 
 
+def _anneal_before_1_0_7(monkeypatch) -> None:
+    """anneal-memory 1.0.4's `anneal_memory.spores` has `SporeError` / `SporeStore` and no `Intention*` alias: simulated by
+    making the `Intention*` names unimportable (no real downgrade)."""
+    import anneal_memory.spores as am_spores
+
+    import levain.intentions as lint
+
+    for name in ("IntentionError", "IntentionStore", "IntentionApply"):
+        monkeypatch.delattr(am_spores, name, raising=False)
+    monkeypatch.setattr(lint, "_GUARDED", None)                     # the guarded class is built lazily from IntentionStore
+
+
+def test_med1_an_anneal_below_the_floor_refuses_before_any_backup(install, monkeypatch):
+    """L1 MED-1: the imports ran AFTER the backup, so an anneal below 1.0.7 crashed `levain update` with a raw ImportError,
+    lock unrecorded, one more backup per retry. Now: a refusal naming the floor, rc 1, no backup, store untouched."""
+    _plant_open_seed(install)
+    before = _paths(install).intentions_json.read_bytes()
+    _anneal_before_1_0_7(monkeypatch)
+    lines: list[str] = []
+    assert run_update(install, no_pip=True, emit=lines.append) == 1
+    assert _paths(install).intentions_json.read_bytes() == before
+    assert _backups(install) == []
+    text = "\n".join(lines)
+    assert "was not done" in text and "anneal-memory>=1.0.7" in text, text
+    assert (install / ".levain" / "manifest.json").is_file()        # the lock is still recorded (the refusal path ran)
+
+
+def test_med1_the_migration_itself_refuses_without_a_backup(tmp_path, monkeypatch):
+    from levain.intention_migrate import migrate_seed_to_someday
+
+    from anneal_memory.spores import IntentionStore
+
+    paths = AnnealPaths.from_db(tmp_path / "memory.db")
+    IntentionStore(paths.intentions_json).add(type="thought", text="x", disposition="seed")
+    before = paths.intentions_json.read_bytes()
+    _anneal_before_1_0_7(monkeypatch)
+    report = migrate_seed_to_someday(paths)
+    assert report.refused and "anneal-memory>=1.0.7" in report.refused and report.backup is None
+    assert not (tmp_path / "backups").exists() and paths.intentions_json.read_bytes() == before
+
+
 def test_g2_the_reconcile_path_also_defers(install, monkeypatch):
     """A drifted pack takes the long path through `_run_update`; the deferral is there too."""
     from types import SimpleNamespace

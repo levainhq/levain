@@ -99,7 +99,7 @@ KNOWN_GOOD_SCHEMA = "partnership"
 #
 # Through 0.9.6 (intention-218 — the AM-WRAP-GENERATED reconcile on the
 # intention-216 crystal-recall base). The seed genuinely incorporates every migration
-# entry through this version: the intentions boundary (0.4.7 AM-INTENTIONS-BOUNDARY), the
+# entry through this version: the intentions boundary (0.4.7 AM-SPORES-BOUNDARY, anneal's own id), the
 # `levain update` upgrade habit (0.4.7 AM-MIGRATE-NOTIFY), the bare-path demotion
 # fix (0.4.8 AM-PRESERVE-BARE-PATH — a transparent engine fix, no template edit
 # required), the crystallized-pattern tier (0.7.1 AM-CRYSTAL) and its MCP read
