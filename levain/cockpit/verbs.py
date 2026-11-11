@@ -1052,6 +1052,11 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              fire=_unbuilt_fire("intention_retarget fires through the broker (a target wakes an agent: signed)"),
              legacy_kind="intention_retarget", device_ok=True,
              applies_to=lambda r: _PLAIN_INTENTION_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() in ("someday", "seed", "agenda")),
+    VerbSpec("intention_then", "then you", "files what you do after this one is done as a new item that wakes in the band when "
+             "this one is marked done, with a day to be asked if it has not", "row", fields=("text", "check_by"),
+             floor="C1", tier_fn=_const("C1"), fire=_plain_intention_fire("intention_then"), legacy_kind="intention_then",
+             # a band row for the operator only (no target a wake could send to an agent), so nothing here needs a signature
+             applies_to=lambda r: _PLAIN_INTENTION_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() == "agenda"),
     VerbSpec("intention_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
              fire=_plain_intention_fire("intention_set_disposition"), legacy_kind="intention_set_disposition", device_ok=True,
