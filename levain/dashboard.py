@@ -1226,9 +1226,9 @@ class SubstrateView:
     crystal_index: list[CrystalEntry] = field(default_factory=list)
     # The intention layer, split into its three operator-facing projections (Slice 3). The
     # FULL list_open result is bucketed via ``levain.intentions.bucket_of`` — a total
-    # partition, so an intention lands in exactly one. ``open_intentions`` keeps its name (the
-    # active prospective loops — the entity's live cognition) for backward-compat with
-    # every existing consumer (parked loops included, marked by their tier); ``tray`` (the
+    # partition, so an intention lands in exactly one. ``open_intentions`` (named ``open_spores``
+    # before the rename, with no alias) holds the active prospective loops — the entity's live
+    # cognition (parked loops included, marked by their tier); ``tray`` (the
     # operator session-I/O inbox, plus any legacy note) is new. Each is independently capped at ``max_intentions``.
     open_intentions: list[OpenIntention] = field(default_factory=list)
     tray: list[OpenIntention] = field(default_factory=list)
