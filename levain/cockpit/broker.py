@@ -85,11 +85,13 @@ from levain.cockpit.effects import (
     canonical_effect,
     create_origin_key,
     plan_units,
+    read_recorded_verb,
     registration_refusals,
     resolve_effect,
     settle,
     intention_resource_key,
 )
+from levain.intention_legacy import OLD_KIND_TO_NEW
 from levain.cockpit.firejournal import (
     CockpitDB,
     CockpitFormatError,
@@ -1383,6 +1385,11 @@ class Broker:
         ``pending_cancel``'s tier is recomputed as :meth:`cancel` set it, under ``policy`` (the
         deciding request's: the stored fence makes it the issuing one's, or the decision is STALE)."""
         rec = view.record
+        if rec["verb"] in OLD_KIND_TO_NEW:
+            # signed under a verb id the release that said "spore" served and this one does not: the decision rebuilds
+            # the effects and compares them with the signed ones, and a retired id builds none. The pending ends STALE
+            # through the same comparison, and the page reissues under the new id; it is never decided on the old record.
+            return self._moved(rec)
         try:
             built = self._build(db, rec["verb"], rec.get("params") or {}, rec.get("target") or {},
                                 view.pending_id, at_issue=False)
@@ -1522,7 +1529,7 @@ class Broker:
             # (the same signed field ``firejournal._expire`` compares), and never hands out a record to sign
             state, reason = "EXPIRED", "expired"
         out: dict[str, Any] = {"ok": True, "pending_id": pid, "state": state, "reason": reason,
-                               "verb": view.record.get("verb"), "tier": view.record.get("tier"),
+                               "verb": read_recorded_verb(view.record.get("verb")), "tier": view.record.get("tier"),
                                "intent": view.record.get("intent"), "decision_kind": view.decision_kind,
                                "replay": replay}
         if view.decision_kind is not None:
