@@ -994,6 +994,67 @@ def test_a_changed_time_through_the_verb_needs_revise_and_says_so(tmp_path, caps
     assert args.func(args) == 1 and "rule 4" in capsys.readouterr().err
 
 
+def _every_accepted_time() -> list[str]:
+    out = []
+    for h in range(24):
+        for m in range(60):
+            try:
+                out.append(da.validate_time(f"{h:02d}:{m:02d}"))
+            except da.TimeRefused:
+                pass
+    return out
+
+
+def test_the_stored_time_is_read_back_from_every_cron_the_setting_can_write():
+    """``time_from_cron`` inverts ``cron_for`` for every time ``validate_time`` accepts (the named edges included)."""
+    accepted = _every_accepted_time()
+    assert {"22:00", "23:19", "00:00", "03:15", "04:19"} <= set(accepted)
+    for t in accepted:
+        assert da.time_from_cron(da.cron_for(t)) == t, t
+
+
+def test_the_pre_setting_cron_reads_as_22_00_and_any_other_cron_is_refused_by_name():
+    assert da.time_from_cron("*/20 22-23,0-4 * * *") == "22:00"
+    for odd in ("*/20 22-23,0-4 * * * ", "5 1 * * *", "0,20,40 0-3 * * *", "0,20,40 23-23,0-4 * * *", "", "٠,20,40 0-4 * * *",
+                None, 7):
+        with pytest.raises(da.TimeRefused) as exc:
+            da.time_from_cron(odd)
+        assert "--time" in str(exc.value), odd
+
+
+def test_an_enable_without_time_keeps_the_stored_time_even_with_revise(tmp_path, capsys):
+    """A bare re-enable (the attach remedy, or a --revise for another reason) never moves a chosen time back to 00:00."""
+    code, out, _, store_dir = _enable(tmp_path, capsys, "--time", "03:15")
+    assert code == 0 and json.loads(out)["version"] == 1
+    for extra in ((), ("--revise",)):
+        code, out, err, _ = _enable(tmp_path, capsys, *extra)
+        doc = json.loads(out)
+        assert code == 0 and doc["time"] == "03:15" and not doc["created"] and doc["version"] == 1, (extra, err)
+        assert "starting at 03:15" in doc["signing_card"]
+    assert spec_mod.stored_specs(agent_store.open_agent_store(store_dir))["dream"]["trigger"]["cron"] == "15,35,55 3-4 * * *"
+    code, out, _, _ = _enable(tmp_path, capsys, "--time", "00:05", "--revise")      # only an explicit --time moves it
+    assert code == 0 and json.loads(out)["time"] == "00:05" and json.loads(out)["version"] == 2
+
+
+def test_an_enable_without_time_on_a_fresh_store_asks_for_00_00(tmp_path, capsys):
+    code, out, _, _ = _enable(tmp_path, capsys)
+    assert code == 0 and json.loads(out)["time"] == "00:00"
+
+
+def test_an_enable_without_time_over_a_cron_this_build_cannot_read_refuses_naming_it(tmp_path, capsys, monkeypatch):
+    real = spec_mod.stored_specs
+
+    def odd(store):
+        got = real(store)
+        return {**got, "dream": {"trigger": {"cron": "5 1 * * *"}}}
+
+    monkeypatch.setattr(spec_mod, "stored_specs", odd)
+    code, out, err, store_dir = _enable(tmp_path, capsys)
+    assert code == 1 and out == "" and "'5 1 * * *'" in err and "--time" in err and "nothing was registered" in err
+    monkeypatch.setattr(spec_mod, "stored_specs", real)
+    assert spec_mod.list_agents(agent_store.open_agent_store(store_dir)) == []
+
+
 def test_a_changed_time_is_a_re_sign_the_old_signed_link_no_longer_covers_the_new_spec(tmp_path):
     """The link signs ``spec_hash``; the launch takes only a link whose ``spec_hash`` is the occurrence's. A real signed
     link over the 00:00 spec admits a 00:00 occurrence and ends a 03:15 occurrence ``no_link``; a link signed for 03:15
