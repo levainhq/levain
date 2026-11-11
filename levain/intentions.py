@@ -166,7 +166,7 @@ def _refuse_unwritable(value: Any) -> None:
         or f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {value!r})")
 
 
-NEW_ID_PREFIX = "intention"   # a record this store mints (anneal 1.0.7 ``id_prefix``): ``intention-NNN``; ``intention-N`` ids still read
+NEW_ID_PREFIX = "intention"   # a record this store mints (anneal 1.0.7 ``id_prefix``): ``intention-NNN``; ``spore-N`` ids still read
 _GUARDED: Any = None
 _GUARDED_LOCK = threading.Lock()   # anneal is imported lazily (this module stays stdlib-only), so build once under a lock
 

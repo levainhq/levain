@@ -2451,7 +2451,7 @@
     const verbs = isVerbPanel(entry);
     // CLIENT-side filter over the loaded loops (they all ride the wire — no server round-trip,
     // unlike the episode keyword search). Matches the intention TEXT (case-insensitive substring)
-    // OR the id ("intention-103", "intention-103" or "103"), so you can jump straight to a loop by handle or
+    // OR the id ("intention-103", "spore-103" or "103"), so you can jump straight to a loop by handle or
     // content [2026-06-19]. Reuses the .ep-search sticky bar for visual parity.
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");

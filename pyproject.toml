@@ -147,7 +147,7 @@ dependencies = [
     # minute precision; a bare date still works), which `_validate_surface_at` and the cockpit's `_norm_date` now pass
     # through. No migration-manifest entry, so TEMPLATES_RECONCILED_ANNEAL stays 1.0.2. KNOWN_GOOD_ANNEAL moves with this floor.
     # `>=1.0.7,<1.1` (2026-11-11, row 774 / np-91cd76d5): anneal 1.0.7 takes `IntentionStore(path, id_prefix="intention")`, which
-    # mints `intention-NNN` ids for NEW records and still reads every existing `intention-N` id (and the other way round).
+    # mints `intention-NNN` ids for NEW records and still reads every existing `spore-N` id (and the other way round).
     # levain.intentions.guarded_intention_store passes it, and levain.consent.questions.INTENTION_ID reads both prefixes. No
     # migration-manifest entry, so TEMPLATES_RECONCILED_ANNEAL stays 1.0.2. KNOWN_GOOD_ANNEAL moves with this floor.
     "anneal-memory>=1.0.7,<1.1",

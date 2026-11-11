@@ -61,6 +61,7 @@ from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.queue import default_queue_dir
 from levain.consent.record import AGENTS
+from levain.intention_legacy import OLD_ID_PREFIX
 from levain.intention_legacy import STORE_FILE_NAME
 
 __all__ = ["ANSWER_CHANNELS", "DB_NAME", "FORMAT", "SNOOZE_MAX_DAYS", "SNOOZE_VIAS", "Answer", "Link", "Question",
@@ -199,8 +200,10 @@ def open_ended_of(q: Any) -> bool:
 
 
 INTENTION_ACTIONS = ("snooze", "edit", "done", "clear")
-# an id minted before anneal 1.0.7 is ``intention-N``; a new one (``id_prefix="intention"``) is ``intention-NNN``: both are read
-INTENTION_ID = re.compile(r"(?:intention|intention)-[0-9A-Za-z_-]{1,56}")
+# an id minted before anneal 1.0.7 carries the old prefix (``OLD_ID_PREFIX``, ``spore-N``) for good; a new one
+# (``id_prefix="intention"``) is ``intention-NNN``: both are read. The old arm comes from the legacy constant, never a second
+# literal, so a word swap over this file cannot collapse the alternation into the new word twice.
+INTENTION_ID = re.compile(rf"(?:{re.escape(OLD_ID_PREFIX)}|intention-)[0-9A-Za-z_-]{{1,56}}")
 
 
 def valid_intention_id(value: Any) -> bool:

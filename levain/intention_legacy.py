@@ -62,7 +62,7 @@ OLD_ROW_ID_KEY = 'spore_id'
 OLD_CLI_COMMAND = 'spores'
 
 # The old id prefix: `spore-NNN` ids live in every store and, cited, in immutable history. The id resolver reads both
-# prefixes for good (ruling E1); nothing mints this prefix any more.
+# prefixes for good (ruling E1): `levain.consent.questions.INTENTION_ID` builds its old arm from this. Nothing mints it any more.
 OLD_ID_PREFIX = 'spore-'
 
 # The keep-migrate plan files an old release wrote under `.levain/migrations/`. They keep their persisted keys so an old
