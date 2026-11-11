@@ -154,6 +154,10 @@ t = 0; timers = [];
 const slowBody = lib.readPanelBody("/s", { attempt: (u) => lib.timedAttempt(mkFetch([{ status: 200, bodyAfter: 20000, body: { slow: 1 } }]), u, clock), isReject: async () => false, reauth: async () => false, token: () => "", drop: () => {} })
   .then((v) => ({ v }), (e) => ({ err: e.message }));
 await sleepTick(); advance(20000); await sleepTick(); out.slowBody = await slowBody; out.slowBodyTimers = timers.length;
+// the buffered answer is a Response in shape: text() is a method that gives the body string (a Promise), json() parses it, clone() is itself
+t = 0; timers = [];
+const wrapped = await lib.timedAttempt(mkFetch([{ status: 200, body: { a: 1 } }]), "/w", clock);
+out.wrapper = { textType: typeof wrapped.text, text: typeof wrapped.text === "function" ? await wrapped.text() : null, json: await wrapped.json(), clone: wrapped.clone() === wrapped, status: wrapped.status, ok: wrapped.ok };
 console.log(JSON.stringify(out));
 })();
 """
@@ -204,6 +208,8 @@ def test_the_first_board_reads_its_top_first_narrows_the_manifest_and_paces_its_
     for k in ("bodyHung", "bodyHung403"):
         assert out[k + "Early"] == 1 and out[k] == {"err": "no answer in 30 s"} and out[k + "Timers"] == 0
     assert out["slowBody"] == {"v": {"slow": 1}} and out["slowBodyTimers"] == 0
+    # the buffered answer keeps a Response's shape: text() is a method (it was the body string itself), json() still parses
+    assert out["wrapper"] == {"textType": "function", "text": '{"a":1}', "json": {"a": 1}, "clone": True, "status": 200, "ok": True}, out["wrapper"]
 
 
 # The WHOLE boot under node, with the real view mapper, a fake server and a fake page: a read that fails AFTER a partial board was drawn.
@@ -240,11 +246,11 @@ function makeEnv(opts) {
   opts = opts || {};
   const fx = fixture();
   const renders = [], marks = [], timers = [], listeners = {};
-  let loopsReads = 0, failManifest = opts.failManifest || 0, release = null;
+  let loopsReads = 0, failManifest = opts.failManifest || 0, refuseManifest = 0, release = null;
   const held = new Promise((r) => { release = r; });
   const resp = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body, text: async () => JSON.stringify(body), headers: { get: () => null }, clone() { return this; } });
   async function fetchFn(url) {
-    if (url.indexOf("/cockpit/manifest.json") >= 0) { if (failManifest > 0) { failManifest--; return resp(500, {}); } return resp(200, fx.manifest); }
+    if (url.indexOf("/cockpit/manifest.json") >= 0) { if (refuseManifest > 0) { refuseManifest--; return resp(401, {}); } if (failManifest > 0) { failManifest--; return resp(500, {}); } return resp(200, fx.manifest); }
     const m = /\/cockpit\/panel\/([^/.]+)\.json/.exec(url);
     if (m && fx.panels[m[1]]) {
       if (m[1] === "loops" && opts.holdLoops && loopsReads++ === 0) await held;
@@ -270,7 +276,7 @@ function makeEnv(opts) {
     visibilityState: "visible", body: { dataset: {} } };
   const fakeSet = (f, ms) => { if (RETRY.has(ms)) { const h = { fake: true, f, ms }; timers.push(h); return h; } return real.setTimeout(f, ms); };
   const fakeClear = (h) => { if (h && h.fake) { const i = timers.indexOf(h); if (i >= 0) timers.splice(i, 1); } else real.clearTimeout(h); };
-  const env = { renders, timers, listeners, store, stamp, regions, html, release, fx, armFail: (n) => { failManifest = n; } };
+  const env = { renders, timers, listeners, store, stamp, regions, html, release, fx, armFail: (n) => { failManifest = n; }, armRefuse: (n) => { refuseManifest = n; } };
   env.start = async () => {
     new Function("window", "document", "location", "history", "fetch", "console", "setTimeout", "clearTimeout", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console, fakeSet, fakeClear);
     await settle();
@@ -318,9 +324,20 @@ function makeEnv(opts) {
     e.armFail(99);
     e.listeners["levain:resume"][0]({ detail: { hiddenAt: Date.now() + 5000 } });
     await settle();
-    out.cDelays = [];
-    for (let i = 0; i < 4; i++) { out.cDelays.push(e.timers.map((t) => t.ms)[0]); await e.fire(); }
+    out.cDelays = []; out.cSnaps = [e.snap()];     // cSnaps[k] is the page right after the (k+1)th failure in a row
+    for (let i = 0; i < 4; i++) { out.cDelays.push(e.timers.map((t) => t.ms)[0]); await e.fire(); out.cSnaps.push(e.snap()); }
     out.cAfter = e.snap(); }
+
+  // D: a refusal queues no retry, so nothing is coming: released and signed at once (the part is not held for a read that will not happen)
+  { const e = await makeEnv({ holdLoops: true }).start();
+    e.armRefuse(1);
+    e.listeners["levain:resume"][0]({ detail: { hiddenAt: Date.now() + 5000 } });
+    await settle();
+    out.dRefused = e.snap(); }
+
+  // E: a failure with NO part drawn keeps its behaviour: nothing was ever inert, the signal is set at once, the retry runs
+  { const e = await makeEnv({ failManifest: 1 }).start();
+    out.eFailed = e.snap(); out.eRetryDelay = await e.fire(); out.eRetried = e.snap(); }
   console.warn = quiet;
   console.log(JSON.stringify(out));
   process.exit(0);
@@ -330,8 +347,10 @@ function makeEnv(opts) {
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
 def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_is_drawn(tmp_path: Path) -> None:
-    """L1 finding 1. The failure releases the part and sets the signal (a page left inert forever on a failing server is worse), but the
-    retry chain must still run: no WHOLE board has been drawn, so the reader is looking at a part under a live-looking page."""
+    """L1 finding 1 + L3 round 1. The retry chain runs after a failure that follows a part (no WHOLE board has been drawn). While a retry is
+    queued the part stays inert and the signal stays unset (the signal means "no whole draw is coming soon"; a deep link or the driver acting
+    on a part that the retry replaces 2 s later is the defect), the retry's whole draw drops inert and sets the signal, and a server that
+    keeps failing releases the page when the backoff reaches its steady step (never inert forever). A refusal queues no retry: released at once."""
     driver = tmp_path / "page.js"
     driver.write_text(_PAGE, encoding="utf-8")
     run = subprocess.run([shutil.which("node"), str(driver), str(WEB / "cockpit_view.js"), str(WEB / "dashboard_boot.js")],
@@ -341,23 +360,32 @@ def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_
     cp = out["controlPart"]
     assert (cp["renders"], cp["whole"], cp["inert"], cp["timers"]) == (1, False, 7, []), cp
     assert (out["controlWhole"]["renders"], out["controlWhole"]["whole"], out["controlWhole"]["inert"], out["controlWhole"]["timers"]) == (2, True, 0, []), out["controlWhole"]
-    # A: supersede + a failed manifest read after a part: released and signed (kept), AND a retry is queued
+    # A: supersede + a failed manifest read after a part: a retry is queued, and the part stays inert with the signal UNSET while it waits
     assert (out["aPart"]["renders"], out["aPart"]["whole"], out["aPart"]["inert"]) == (1, False, 7), out["aPart"]
-    assert out["aFailed"]["whole"] is True and out["aFailed"]["inert"] == 0 and out["aFailed"]["renders"] == 1, out["aFailed"]
-    assert out["aFailed"]["timers"] == [2000], out["aFailed"]               # RED before the fix: [] (everDrawn latched by the part)
+    assert out["aFailed"]["whole"] is False and out["aFailed"]["inert"] == 7 and out["aFailed"]["renders"] == 1, out["aFailed"]
+    assert out["aFailed"]["timers"] == [2000], out["aFailed"]
     assert "can't reach the cockpit yet" in out["aFailed"]["store"], out["aFailed"]
     # the retry draws the whole board once, the line is clean, nothing else is queued, and the superseded read's late panel changes nothing
     assert out["aRetryDelay"] == 2000
     assert (out["aRetried"]["renders"], out["aRetried"]["whole"], out["aRetried"]["inert"], out["aRetried"]["timers"], out["aRetried"]["store"]) == (2, True, 0, [], ""), out["aRetried"]
     assert out["aLate"]["renders"] == 2 and out["aLate"]["timers"] == [], out["aLate"]
-    # B: the whole board's draw throws once after a part: released, signed, retried, and the retry lands
+    # B: the whole board's draw throws once after a part: still inert and unsigned, a retry queued, and the retry's whole draw lands live and signed
     assert (out["bPart"]["renders"], out["bPart"]["whole"]) == (1, False), out["bPart"]
-    assert out["bFailed"]["whole"] is True and out["bFailed"]["inert"] == 0 and out["bFailed"]["timers"] == [2000], out["bFailed"]
+    assert out["bFailed"]["whole"] is False and out["bFailed"]["inert"] == 7 and out["bFailed"]["timers"] == [2000], out["bFailed"]
     assert out["bRetryDelay"] == 2000
-    assert (out["bRetried"]["renders"], out["bRetried"]["whole"], out["bRetried"]["timers"], out["bRetried"]["store"]) == (2, True, [], ""), out["bRetried"]
-    # C: a server that keeps failing is retried on the boot's own backoff (2, 4, 8, 15 s, then 30 s), never in a tight loop, and the page is left live
+    assert (out["bRetried"]["renders"], out["bRetried"]["whole"], out["bRetried"]["inert"], out["bRetried"]["timers"], out["bRetried"]["store"]) == (2, True, 0, [], ""), out["bRetried"]
+    # C: a server that keeps failing is retried on the boot's own backoff (2, 4, 8, 15 s, then 30 s), never in a tight loop. The first four
+    # failures (each queues a fake-able delay below the steady step) hold the part inert and unsigned; the fifth queues the steady 30 s step
+    # (a real timer here, so no fake one shows) and releases the page and sets the signal
     assert out["cDelays"] == [2000, 4000, 8000, 15000], out["cDelays"]
-    assert out["cAfter"]["whole"] is True and out["cAfter"]["inert"] == 0, out["cAfter"]
+    for k in range(4):
+        assert (out["cSnaps"][k]["whole"], out["cSnaps"][k]["inert"]) == (False, 7), (k, out["cSnaps"][k])
+    assert out["cAfter"]["whole"] is True and out["cAfter"]["inert"] == 0 and out["cAfter"]["timers"] == [], out["cAfter"]
+    # D: a refusal queues no retry, so the page is released and signed at once (no timer, no part held for a read that will not happen)
+    assert (out["dRefused"]["whole"], out["dRefused"]["inert"], out["dRefused"]["timers"]) == (True, 0, []), out["dRefused"]
+    # E: a failure with no part drawn is as before: the signal is set at once (nothing was ever inert), the retry runs and draws
+    assert (out["eFailed"]["whole"], out["eFailed"]["inert"], out["eFailed"]["timers"]) == (True, 0, [2000]), out["eFailed"]
+    assert out["eRetryDelay"] == 2000 and (out["eRetried"]["whole"], out["eRetried"]["inert"], out["eRetried"]["timers"]) == (True, 0, []), out["eRetried"]
 
 
 def test_the_cold_load_draws_partial_boards_and_a_panel_read_is_bounded() -> None:
