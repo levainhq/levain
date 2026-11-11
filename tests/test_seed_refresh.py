@@ -19,6 +19,7 @@ import pytest
 
 import levain.install as install_mod
 from levain.install import ADAPTER_RECEIPT_REL, PENDING_REL, _base_seed_files, refresh_adapter
+from levain.intention_legacy import OLD_SEED_DOC
 from levain.packs import SeedEntry
 from tests.test_update_refresh import make_install  # noqa: F401  (fixture)
 
@@ -160,7 +161,7 @@ def test_the_released_seed_table_matches_the_release_tags():
     if len(tags) < 28:
         pytest.skip("not every release tag through v0.5.4 is in this checkout")
     derived: dict[str, set[str]] = {}
-    for key in BASE_SEEDS:
+    for key in (OLD_SEED_DOC if k == "seed/intention_instructions.md" else k for k in BASE_SEEDS):  # the tags hold the old name
         for tag in tags:
             r = subprocess.run(["git", "-C", str(repo), "show",
                                 f"{tag}:levain/templates/{key}"], capture_output=True)

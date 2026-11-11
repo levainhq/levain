@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from levain.answers import AnswersError
+from levain.intention_legacy import OLD_SEED_DOC
 from levain.packs import (
     BASE_SEED_REACHABLE,
     DEFAULT_MEMORY_LOAD,
@@ -3552,7 +3553,7 @@ _RELEASED_BASE_SEED_SHA256: dict[str, frozenset[str]] = {
         "fb09110a644e26f885a5a273cdb23545753e35e4a0174363574f6587ea416e7b",
         "daa5913e99f21cafd4b116a291895cc52e42a685d7e056e25aa1cd5c4851be19",
     }),
-    "seed/spore_instructions.md": frozenset({
+    OLD_SEED_DOC: frozenset({
         "e23c7a439c852ebbc872bb0a1b14e4ca24f1a01485e34059c9b12c1baab0b670",
         "4b66417ef61a4e7c0fc3754d944967af94d819e93883bee6f263b8199a94a162",
         "01e246c4df5ab23c6d83e5151b72e034e340be90b4421322e5d7699350b4dd56",
@@ -3937,6 +3938,7 @@ def _refresh_adapter(
                     files = {t: x for t, x in files.items() if t != install / ".claude" / "settings.json"}
         _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines,
                                variants=variants, carrier_name=carrier_name)
+        _retire_seed_files(install, apply=apply, lines=lines)
         if adapter == "claude-code" and not cc_aliased:
             if cc_in_local:
                 _migrate_settings_json_hooks(install, apply=apply, carried=carried, out=out, lines=lines)
@@ -3996,6 +3998,7 @@ def _refresh_seeds_only(
                          f"{', '.join(missing)}; re-onboard (`levain init --force`).")
         else:
             _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines)
+            _retire_seed_files(install, apply=apply, lines=lines)
     if out.refreshed or lines:
         emit("\n• seed files:")
         verb = "refreshed" if apply else "would refresh"
@@ -4089,6 +4092,84 @@ def _pack_held_activation(recorded: Sequence) -> set[str]:
             for rel in (*d.added, *d.modified, *d.removed) if rel.startswith(prefix)}
 
 
+def _module_level_names(source: str) -> set[str] | None:
+    """The names a module defines at its top level (def, class, assignment, import; also inside a module-level
+    if/try/with/for/while), or None when it does not parse."""
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    names: set[str] = set()
+
+    def target(node: ast.AST) -> None:
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            for elt in node.elts:
+                target(elt)
+        elif isinstance(node, ast.Starred):
+            target(node.value)
+
+    def visit(body: list[ast.stmt]) -> None:
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    target(t)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                target(node.target)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    names.add((alias.asname or alias.name).split(".")[0])
+            for attr in ("body", "orelse", "finalbody"):
+                inner = getattr(node, attr, None)
+                if isinstance(inner, list) and not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    visit(inner)
+            for handler in getattr(node, "handlers", ()):
+                visit(handler.body)
+
+    visit(tree.body)
+    return names
+
+
+def _helper_names_called(source: str) -> set[str]:
+    """The attributes a hook entry point reads off the shared helper (``hook.<name>``, the way every entry point
+    imports ``_levain_hook``)."""
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return set()
+    return {n.attr for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "hook"}
+
+
+_HOOK_HELPER = "hooks/_levain_hook.py"
+
+
+def _hook_name_mismatches(result: Mapping[str, bytes | None]) -> dict[str, list[str]]:
+    """For the hook files as they WOULD stand (``{rel under activation/: bytes, None when absent}``): the entry points
+    whose ``hook.<name>`` calls name something ``_levain_hook.py`` does not define, ``{rel: [names]}``. The entry
+    points import the helper and call it by function name, and every one of those calls sits in a catch-all that
+    swallows the AttributeError, so a mixed set raises nothing: the surface it feeds goes dark and doctor stays green."""
+    helper = result.get(_HOOK_HELPER)
+    defined = _module_level_names(helper.decode("utf-8", "replace")) if helper is not None else None
+    if defined is None:
+        return {}  # no helper, or one that does not parse: nothing here can say what it lacks
+    out: dict[str, list[str]] = {}
+    for rel, data in sorted(result.items()):
+        if data is None or rel == _HOOK_HELPER or not (rel.startswith("hooks/") and rel.endswith(".py")):
+            continue
+        missing = sorted(_helper_names_called(data.decode("utf-8", "replace")) - defined)
+        if missing:
+            out[rel] = missing
+    return out
+
+
 def _refresh_activation(
     install: Path,
     expected: Mapping[str, tuple[bytes, Path]],
@@ -4147,21 +4228,53 @@ def _refresh_activation(
         del new_receipt[rel]
         lines.append(f"  note: activation/{rel} is no longer shipped by this levain; it is "
                      f"left in place (delete it yourself if you do not want it).")
-    for rel, (want, src) in sorted(expected.items()):
+    decided: dict[str, tuple[bytes | None, str]] = {}
+    for rel, (want, _src) in sorted(expected.items()):
         here = disk(rel)
+        if rel in unreadable:
+            continue
+        last = record[rel]["installed"] if rel in record else None
+        decided[rel] = (here, _refresh_decision(here, want, last, levain_code=rel.startswith("hooks/")
+                                                and rel.endswith(".py"), legacy=legacy))
+    # The hook entry points call the shared helper by function name, so the hook files move as one set: a file replaced
+    # while its partner is kept would leave one calling names the other no longer defines, and that raises into a
+    # catch-all, so the surface just goes dark. Judged on what the files WOULD be after this refresh, and only a NEW
+    # mismatch holds the move (an install already mixed by an earlier update is not made worse, and may be mended).
+    hook_rels = [r for r in {*expected, *held} if r.startswith("hooks/") and r.endswith(".py")]
+    moving_hooks = {r for r in hook_rels if r in decided and decided[r][1] in ("write", "write_backup")}
+    coupled_hold: dict[str, list[str]] = {}
+    if moving_hooks:
+        now = {r: disk(r) for r in hook_rels}
+        after = {r: (expected[r][0] if r in moving_hooks else now[r]) for r in hook_rels}
+        before_bad = _hook_name_mismatches(now)
+        coupled_hold = {r: m for r, m in _hook_name_mismatches(after).items() if m != before_bad.get(r)}
+    written_hooks: list[tuple[str, Path, bytes | None]] = []
+    for rel, (want, src) in sorted(expected.items()):
         if rel in unreadable:
             out.review.append(f"activation/{rel}")
             lines.append(f"  activation/{rel}: could not be read, so whether it is current "
                          f"cannot be told.")
             continue
-        last = record[rel]["installed"] if rel in record else None
-        action = _refresh_decision(here, want, last, levain_code=rel.startswith("hooks/")
-                                   and rel.endswith(".py"), legacy=legacy)
+        here, action = decided[rel]
         entry = {"installed": hashlib.sha256(want).hexdigest(),
                  "source": _sha256_stream(src)}
         if action == "keep":
             continue
         key = f"activation/{rel}"
+        if coupled_hold and rel in moving_hooks:
+            # not recorded: the file stays what levain wrote, so a later update, once the set agrees, replaces it
+            out.review.append(key)
+            where = install.joinpath(*PENDING_REL, *key.split("/"))
+            if apply:
+                try:
+                    where = _put_pending(install, key, want)
+                except OSError as e:
+                    lines.append(f"  {key}: could not stage the package's version ({e}).")
+            calls = "; ".join(f"activation/{r} would call {', '.join(m)}" for r, m in sorted(coupled_hold.items()))
+            lines.append(f"  {key}: not refreshed, because the hook files move together and replacing it alone would "
+                         f"leave them calling names _levain_hook.py does not define ({calls}). The package's version is "
+                         f"at {where}; merge the hook files together.")
+            continue
         if action == "current":
             if rel not in record:
                 new_receipt[rel] = entry  # a pre-receipt install gains its record
@@ -4198,11 +4311,32 @@ def _refresh_activation(
             target.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(target, want, like=src)
             new_receipt[rel] = entry
+            if rel in moving_hooks:
+                written_hooks.append((rel, target, here))
             _drop_pending(install, key, lines, out.review)
         except OSError as e:
             out.refreshed.pop()
             out.review.append(key)
             lines.append(f"  {key}: could not be written ({e}).")
+            # the hook files are one set: the ones already replaced go back, or the set is mixed
+            for done_rel, done_target, before in reversed(written_hooks):
+                try:
+                    if before is None:
+                        done_target.unlink()
+                    else:
+                        _atomic_write_bytes(done_target, before, like=done_target)
+                except OSError as e2:
+                    lines.append(f"  activation/{done_rel}: could not be put back ({e2}); it is this levain's "
+                                 f"version while {key} is not, so the hook files are mixed until the next update.")
+                    continue
+                if done_rel in record:
+                    new_receipt[done_rel] = record[done_rel]
+                else:
+                    new_receipt.pop(done_rel, None)
+                out.refreshed.remove(f"activation/{done_rel}")
+                lines.append(f"  activation/{done_rel}: put back as it was, because {key} could not be written and "
+                             f"the hook files move together.")
+            written_hooks.clear()
     if apply and new_receipt != record:
         try:
             _write_activation_receipt(install, new_receipt)
@@ -4719,7 +4853,9 @@ def _levain_render_variant(
 # The base seed files a release adds to installs that never had them. Only these are written on
 # the strength of "no receipt record"; for every other seed that reading also fits a deleted file
 # or a damaged receipt, and the operator's absence is kept.
-_SEEDS_NEW_TO_THE_PACKAGE = frozenset(MEMORY_LOAD_SEED)
+# `intention_instructions.md` is the old `spore_instructions.md` under its new name: an install made before the rename
+# holds the old file and has no record of the new one.
+_SEEDS_NEW_TO_THE_PACKAGE = frozenset(MEMORY_LOAD_SEED) | {"intention_instructions.md"}
 
 
 def carrier_load_gaps(text: str, adapter: str, mode: str) -> list[str]:
@@ -4885,6 +5021,81 @@ def _refresh_adapter_files(
             _write_adapter_receipt(install, new_receipt)
         except OSError as e:
             lines.append(f"  note: could not record the adapter receipt ({e}).")
+
+
+# Base seed files an earlier release installed that this one no longer ships, each with the file that replaced it (install-relative
+# paths). `levain update` retires one only when it is provably levain's own copy, and says so when it is not: a seed file is the
+# operator's to edit, and a retirement is not a reason to delete an edit.
+_RETIRED_SEED_FILES: tuple[tuple[str, str], ...] = ((OLD_SEED_DOC, "seed/intention_instructions.md"),)
+
+
+def _retire_seed_files(install: Path, *, apply: bool, lines: list[str]) -> None:
+    """Retire the base seed files this release renamed away.
+
+    A retired file is removed (its bytes kept under ``.levain/backups/seed/``, its receipt record dropped) only when
+    (a) the file that replaced it is installed, (b) the carrier no longer names it (a carrier the operator edited is
+    staged, not replaced, and may still point here), and (c) the bytes are levain's own: the hash the receipt recorded,
+    or one an earlier release shipped (``_RELEASED_BASE_SEED_SHA256``). An edited copy is left where it is and the update
+    says so; it is never a reason to hold the carrier or to exit non-zero."""
+    record = _read_adapter_receipt(install)
+    new_record = dict(record) if record is not None else None
+    for key, successor in _RETIRED_SEED_FILES:
+        target = install / key
+        try:
+            text = target.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            if new_record is not None:
+                new_record.pop(key, None)  # nothing left to retire: its record goes with it
+            continue
+        except (OSError, ValueError) as e:
+            lines.append(f"  {key}: could not be read ({e}), so whether it is levain's own copy cannot be told; "
+                         f"it is the old name of {successor}.")
+            continue
+        unedited = (_sha256_text(text) == (record or {}).get(key)
+                    or _sha256_text(text) in _RELEASED_BASE_SEED_SHA256.get(key, ()))
+        if not apply:
+            lines.append(f"  {key}: is the old name of {successor}; "
+                         + (f"your copy is levain's own, unedited, and would be retired once the carrier names the new file."
+                            if unedited else
+                            f"your copy is edited, so it would be kept as it is."))
+            continue
+        if not (install / successor).is_file():
+            continue  # the refresh above reports why the new file is not there; nothing is retired ahead of it
+        naming = [c for c in ("CLAUDE.md", "AGENTS.md")
+                  if key in _file_text_or_empty(install / c)]
+        if naming:
+            lines.append(f"  {key}: kept, because {naming[0]} still names it. It is the old name of {successor}: "
+                         f"it is retired by a later update once {naming[0]} points at {successor}.")
+            continue
+        if not unedited:
+            lines.append(f"  {key}: yours is kept as it is (edited). Levain renamed this file {successor}, which is now "
+                         f"installed and is the one your agent reads; carry your edits into it, then delete {key}.")
+            continue
+        try:
+            _ensure_gitignored(install / ".levain", "backups/")
+            backup = install.joinpath(".levain", "backups", "seed", f"{target.name}.{time.time_ns()}")
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, backup)
+            target.unlink()
+        except OSError as e:
+            lines.append(f"  {key}: could not be retired ({e}); it is the old name of {successor}.")
+            continue
+        if new_record is not None:
+            new_record.pop(key, None)
+        lines.append(f"  {key}: renamed {successor}, which is installed; your copy was levain's own, unedited, "
+                     f"and is retired. Its bytes are kept at {backup.relative_to(install)}.")
+    if apply and new_record is not None and new_record != record:
+        try:
+            _write_adapter_receipt(install, new_record)
+        except OSError as e:
+            lines.append(f"  note: could not update the adapter receipt ({e}).")
+
+
+def _file_text_or_empty(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ""
 
 
 def _first_foreign_line(spec: TemplateSpec, text: str, record: Mapping[str, str]) -> str:
