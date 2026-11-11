@@ -292,8 +292,8 @@ def test_the_header_strip_counts_and_a_conflict_lists_its_file_and_both_sessions
              "conf: (%s.querySelector('.tv-conf') || {innerText: ''}).textContent})") % (TV, TV)
     out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": probe}])
     got = json.loads(out[-1])["strip"]
-    assert got == {"tasks": "6 tasks", "waiting": "1 waiting on you", "tasks-waiting": "2 tasks waiting", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
-                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead; "waiting on you" is waitingOnYou(v), the same figure the Agents lens shows (the fixture's one waiting task rides the waiting session n1, so it is one)
+    assert got == {"tasks": "5 tasks", "waiting": "1 waiting on you", "tasks-waiting": "1 task waiting", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
+                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead and count the cards drawn (the fixture's consent record t-wait is no card: 5 and 1); "waiting on you" is waitingOnYou(v), the same figure the Agents lens shows (the fixture's one waiting task rides the waiting session n1, so it is one)
     metrics = "JSON.stringify([...%s.querySelectorAll('.tv-metrics .tv-m')].map(m => m.dataset.k + '=' + m.firstChild.textContent))" % TV
     out = _run(tmp_path, src, [{"eval": _paint(_value(), "agents")}, {"eval": probe}, {"eval": metrics}])
     figs = json.loads(out[-1])
@@ -734,3 +734,63 @@ def test_a_cache_count_the_validator_would_refuse_draws_nothing_and_one_read_is_
     assert "1 cache read" in work["stat"]["text"] and "1 cache reads" not in work["stat"]["text"], work
     assert "1 cache read" in agents["metric"]["sub"] and "1 cache reads" not in agents["metric"]["sub"], agents
     assert "reports 1 cache read beside it" in agents["metric"]["title"], agents
+
+
+# --- the strip counts what the lens draws; the empty sentence; the jump control's affordance and focus -------------------
+
+
+@needs_browser
+def test_the_strips_task_counts_equal_the_task_cards_the_lens_draws_with_consent_and_question_records_hidden(tmp_path, monkeypatch):
+    """Review finding (MED): consent / question task records are not drawn in the lens, so "N tasks" and "M tasks waiting" must not count them. Graded
+    against the DOM: the strip's figures equal the cards on the page, while the separate "waiting on you" figure still counts the asks."""
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    v = _waiting_value(3)                              # three waiting asks, as consent / question records, beside the fixture's other tasks
+    v["tasks"].append({**next(t for t in _value()["tasks"] if t["id"] == "t-sign"), "id": "t-wait-real"})        # and one waiting dispatch task, which IS drawn
+    probe = ("JSON.stringify({drawn: [...%s.querySelectorAll('.tv-task')].filter(c => c.dataset.kind !== 'unattached').length, "
+             "drawn_waiting: [...%s.querySelectorAll('.tv-task')].filter(c => c.dataset.kind !== 'unattached' && c.dataset.state === 'waiting').length, "
+             "kinds: [...%s.querySelectorAll('.tv-task')].map(c => c.dataset.kind), "
+             "tasks: +%s.querySelector('[data-k=tasks] b').textContent, tw: +%s.querySelector('[data-k=tasks-waiting] b').textContent, "
+             "wy: +%s.querySelector('[data-k=waiting] b').textContent})") % ((TV,) * 6)
+    got = json.loads(_run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])[-1])
+    assert not any(k in ("consent", "question") for k in got["kinds"]), got                            # the hidden records are really not drawn
+    assert got["tasks"] == got["drawn"] and got["tw"] == got["drawn_waiting"] == 1, got                # the strip counts the cards on the page
+    assert got["wy"] >= 3, got                                                                         # the asks are still counted, in the figure that names them
+
+
+@needs_browser
+def test_with_only_hidden_asks_waiting_the_empty_sentence_does_not_deny_what_the_button_says(tmp_path, monkeypatch):
+    """Review finding (LOW): nothing drawn but something waiting on you: the sentence under the button must say where the asks are, not that there are no
+    records. With nothing waiting it stays the plain empty sentence."""
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    v = _waiting_value(2)
+    v["tasks"] = [t for t in v["tasks"] if t["kind"] in ("consent", "question")]                       # only the asks: no task card is drawn
+    v["nodes"] = [n for n in v["nodes"] if n["id"].startswith("w")]
+    quiet = {**_waiting_value(0), "tasks": [], "nodes": []}
+    probe = ("JSON.stringify({cards: %s.querySelectorAll('.tv-task').length, btn: !!%s.querySelector('.tv-jump'), "
+             "none: (%s.querySelector('.tv-no-tasks') || {textContent: null}).textContent})") % ((TV,) * 3)
+    out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}, {"eval": _paint(quiet)}, {"eval": probe}])
+    waiting, nothing = json.loads(out[-3]), json.loads(out[-1])
+    assert waiting["cards"] == 0 and waiting["btn"] is True, waiting
+    assert "no task records" not in waiting["none"].lower() and "2 waiting on you" in waiting["none"] and "Needs" in waiting["none"], waiting
+    assert nothing["cards"] == 0 and nothing["btn"] is False and nothing["none"] == "No task records and no active work.", nothing
+
+
+@needs_browser
+def test_the_jump_button_shows_it_is_a_button_without_hover_and_the_jump_lands_focus_on_the_lit_card(tmp_path, monkeypatch):
+    """Review finding (LOW): hover-only affordance fails on touch, and the jump left keyboard focus behind. At rest the control has a border and an arrow
+    (no hover state), at both widths; after the real jump through the page, focus is on the lit Needs card so Tab continues from it."""
+    _root, src = _sessions_fixture(tmp_path, monkeypatch)
+    probe = ("JSON.stringify((() => { const b = %s.querySelector('.tv-jump'), cs = getComputedStyle(b); "
+             "return {tag: b.tagName, border: parseFloat(cs.borderTopWidth), arrow: getComputedStyle(b, '::after').content, "
+             "tip: b.title, w: Math.round(b.getBoundingClientRect().width)}; })())") % TV
+    for size in (DESKTOP, NARROW):
+        got = json.loads(_run(tmp_path, src, [{"eval": _paint(_waiting_value(2))}, {"eval": probe}], first=size)[-1])
+        assert got["tag"] == "BUTTON" and got["border"] >= 1 and got["arrow"] not in ("none", "normal", ""), (size, got)
+        assert "session" in got["tip"] and "Needs" in got["tip"], (size, got)                          # the tooltip says what the figure counts and where it goes
+    out = _run(tmp_path, src, [
+        {"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
+        {"until": TV + " && " + TV + ".querySelector('.tv-jump')"},
+        {"eval": TV + ".querySelector('.tv-jump').click(); 1"},
+        {"until": "document.querySelector('#ck-needs .needs-lit[data-needs-id^=consent]')"},
+        {"eval": "JSON.stringify({focus: document.activeElement === document.querySelector('#ck-needs .needs-lit'), lit: document.querySelectorAll('#ck-needs .needs-lit').length})"}])
+    assert json.loads(out[-1]) == {"focus": True, "lit": 1}, out
