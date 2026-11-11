@@ -1515,8 +1515,10 @@ class TestListPagePins:
         surfaces = {r["facets"]["surface"] for r in panel["rows"]}
         assert {"band", "board", "intention", "talk", "drop"} <= surfaces
         for r in panel["rows"]:
-            if r["facets"]["surface"] in ("band", "board"):
+            if r["facets"]["surface"] == "board":
                 assert r["actions"] == [] if "actions" in r else True, r["id"]
+            if r["facets"]["surface"] == "band":      # no intention verb; its one verb is the band row's own
+                assert {a["verb"] for a in r.get("actions", [])} <= {"band_agenda"}, r["id"]
         assert panel["note"]
 
 

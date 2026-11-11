@@ -8,8 +8,8 @@ The Tray becomes the List in every operator-facing word. The List is a VIEW over
 * **intention** the operator's seeds, agendas and talk seeds, through the same intention view the Tray read, with ``verbs`` unchanged.
 
 One panel, one ordering (``intention.list``), one row set. Every row carries a ``surface`` facet in {band, board, intention, talk,
-drop}. A row's id says whose it is: ``band:<ref>``, ``board:<item>``, ``intention:<id>``. Only a ``intention:`` row is ever offered a
-intention verb (each ``intention_*`` row verb is ``applies_to`` a ``intention:`` id), so a band or board row has no write by construction.
+drop}. A row's id says whose it is: ``band:<ref>``, ``board:<item>``, ``intention:<id>``. Only an ``intention:`` row is ever offered an
+intention verb (each ``intention_*`` row verb is ``applies_to`` an ``intention:`` id), so a band or board row is never offered one (a plain band row has its own ``band_agenda``; a board row has no write).
 
 The panel's WIRE ID stays ``tray`` (``LIST_PANEL_ID``): the id is a code name like ``TRAY_*`` and the ``intention_*`` verbs, and the
 tab map, row-verb routes and ~40 tests name it; the operator-facing words are the title and the group names. Flipping the id is
@@ -52,7 +52,7 @@ from levain.dashboard import SubstrateSource
 LIST_PANEL_ID = "tray"          # the wire id (a code name); the operator-facing title is "List"
 LIST_TITLE = "List"
 LIST_ROWSET = "intention:tray"
-LIST_VERBS = INTENTION_ROW_VERBS + ("intention_keep", "intention_seed", "list_intake", *INTENTION_VERBS)      # a verb the registry does not know yet is simply not offered
+LIST_VERBS = INTENTION_ROW_VERBS + ("intention_keep", "intention_seed", "list_intake", "band_agenda", *INTENTION_VERBS)      # a verb the registry does not know yet is simply not offered
 LIST_NOTE = "Band rows are what only you can answer: answer them in Decisions. Board rows are the agents' ready queue."
 BAND_POINTER = "answer it in Decisions (levain band)"
 BOARD_POINTER = "the agents' ready queue (levain board)"
@@ -417,9 +417,10 @@ def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext],
 
 
 def list_read_one(source: SubstrateSource, ck: Cockpit | None = None) -> Callable[[ReadContext, str], Result]:
-    """One row from the SOURCE, for a write. A ``intention:`` row is a write target; so is a ``band:`` row that rings an intention
-    (its version is the row's own, read from the host's band now, so an act on a row that has since moved or closed is stale).
-    Any other band row and every board row is read-only."""
+    """One row from the SOURCE, for a write. An ``intention:`` row is a write target; so is an open ``band:`` row (its version is
+    the row's own, read from the host's band now, so an act on a row that has since moved or closed is stale). Which verb a band
+    row is offered is the verb's ``applies_to``: a ringing row's four intention verbs, a plain row's ``band_agenda``. Every board
+    row is read-only."""
     seen = [False]
 
     def read_one(ctx: ReadContext, row_id: str) -> Result:
@@ -428,9 +429,9 @@ def list_read_one(source: SubstrateSource, ck: Cockpit | None = None) -> Callabl
             if bad:
                 return Fault("the needs-you band could not be read")
             for card in cards:
-                if card.get("id") == row_id and isinstance(card.get("intention"), str):
+                if card.get("id") == row_id and not card.get("unreadable"):      # an open row, ringing or not
                     return Read(rows=(_band_row(card, ctx.today, ctx.now),))
-            return Absent(f"row {row_id!r} is gone or rings no intention: it is a read-only List row")
+            return Absent(f"row {row_id!r} is gone or could not be read: it has no write")
         if not row_id.startswith("intention:"):
             return Absent(f"row {row_id!r} is a read-only List row; it has no write")
         part = _intention_part(source, ctx, seen, apply_hold=False)
