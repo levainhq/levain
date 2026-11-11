@@ -1,0 +1,23 @@
+{
+  "spores": [
+    {
+      "id": "spore-001",
+      "type": "thought",
+      "text": "iota",
+      "domain": "",
+      "tier": "warm",
+      "salience": 0,
+      "seen": "2026-11-11",
+      "next": "2030-01-01",
+      "created": "2026-11-11",
+      "status": "open",
+      "resolution": null,
+      "pointer": null,
+      "notes": [],
+      "origin_key": "k.i",
+      "disposition": "agenda"
+    }
+  ],
+  "resolved": [],
+  "schema_version": 1
+}

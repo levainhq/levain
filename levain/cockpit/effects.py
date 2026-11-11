@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
-from levain.intention_legacy import OLD_EFFECT_STORE, OLD_KIND_TO_NEW, OLD_ROW_PREFIX
+from levain.intention_legacy import OLD_DISPOSITION_TO_NEW, OLD_EFFECT_STORE, OLD_KIND_TO_NEW, OLD_ROW_PREFIX
 
 # --- the effect ----------------------------------------------------------------------------------
 
@@ -77,10 +77,11 @@ class Effect:
                 raise TypeError("projection must be an object or null")
             if not all(isinstance(rec.get(k, []), list) for k in ("writes", "binds")):
                 raise TypeError("writes and binds must be lists")
-            return cls(resource_key=read_recorded_key(str(rec["resource_key"])),
-                       store=read_recorded_store(str(rec["store"])),
-                       expect=copy.deepcopy(dict(expect)), changes=copy.deepcopy(dict(changes)),
-                       projection=None if proj is None else copy.deepcopy(dict(proj)),
+            store = read_recorded_store(str(rec["store"]))
+            as_read = read_recorded_fields if store == INTENTIONS else dict
+            return cls(resource_key=read_recorded_key(str(rec["resource_key"])), store=store,
+                       expect=copy.deepcopy(dict(expect)), changes=copy.deepcopy(as_read(changes)),
+                       projection=None if proj is None else copy.deepcopy(as_read(proj)),
                        writes=tuple(str(f) for f in rec.get("writes", ())),
                        binds=tuple(str(f) for f in rec.get("binds", ())))
         except (KeyError, TypeError) as exc:
@@ -447,6 +448,18 @@ def recorded_key_forms(resource_key: str) -> tuple[str, ...]:
 def read_recorded_verb(verb: Any) -> Any:
     """A recorded verb id (a signed record's, a pending's), under its new name; anything else is returned as it is."""
     return OLD_KIND_TO_NEW.get(verb, verb) if isinstance(verb, str) else verb
+
+
+def read_recorded_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+    """A recorded ``changes`` or ``projection`` of an intention effect, as a copy with the disposition an old release signed
+    (``seed``) read as the word that replaced it (``someday``), so an op signed before the rename completes instead of
+    ending refused at the write guard (ruling D2). The signed record keeps its bytes; the label a fire carries was computed
+    over the recorded value, so the rewritten row's disposition reads unverified, as a migrated one does."""
+    out = dict(fields)
+    disposition = out.get("disposition")
+    if isinstance(disposition, str):
+        out["disposition"] = OLD_DISPOSITION_TO_NEW.get(disposition, disposition)
+    return out
 
 
 def read_recorded_target(target: Mapping[str, Any]) -> dict[str, Any]:
