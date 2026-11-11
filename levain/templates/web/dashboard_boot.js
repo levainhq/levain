@@ -33,6 +33,27 @@
   function refusal(msg) { const e = new Error(msg); e.refused = true; return e; }
   const RETRY_MS = [2000, 4000, 8000, 15000, 30000];
   function drawnOnce() { if (everDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; everDrawn = true; refusedStop = false; retryN = 0; clearTimeout(retryT); retryT = 0; }
+  // WHOLE OR PART. The first board draws in parts (S4: the Needs strip and the core panels as they land), and the whole draw then REPLACES
+  // every node, so anything a reader or a test did on a part would be lost under them. Two things keep that from mattering:
+  // - `html[data-board-whole]` is the positive "this board is the one that stays" signal. Only the code that has just drawn the whole board
+  //   (or a terminal failure / refusal, which draws none) sets it, and a partial draw clears it; absent is the default, so the page is not
+  //   ready from the first byte. A deep link's jump (dashboard_core.js) and the test driver wait for it.
+  // - while only a part is drawn the regions the draw replaces are `inert`, so nothing in them can be focused, clicked or opened; the whole
+  //   draw replaces their children and drops `inert` in the same synchronous turn (dashboard.css dims them). The masthead and the nav (the
+  //   tabs, the theme switch, Sync, a deep link's jump targets) are not in the list and stay live. The list is the page's own: #board holds
+  //   the zones, but the hero, the Needs strip, the drop, the notes, the brief and the widgets (the tiles) are its siblings, and those are
+  //   where a reader first acts (dashboard.html; renderKe in dashboard_core.js fills them).
+  const BOARD_REGIONS = ["ck-hero", "ck-needs", "ck-drop", "ck-notes", "ck-brief", "ck-widgets", "state", "board"];
+  function boardMark(whole) {
+    try {
+      for (const id of BOARD_REGIONS) {
+        const n = document.getElementById(id);
+        if (n && typeof n.setAttribute === "function") { if (whole) n.removeAttribute("inert"); else n.setAttribute("inert", ""); }
+      }
+      const h = document.documentElement;
+      if (h && typeof h.setAttribute === "function") { if (whole) h.setAttribute("data-board-whole", ""); else h.removeAttribute("data-board-whole"); }
+    } catch (_) { /* a page without these nodes (the node harnesses) has no board to mark */ }
+  }
   function retryUntilDrawn(why, refused) {
     if (everDrawn) return;
     // a refusal (the token the page holds is missing or wrong) is not a network blip: a retry would only ask again, and each ask can
@@ -217,7 +238,8 @@
     try { show(build()); return true; }
     catch (e) { if (typeof console !== "undefined") console.warn("levain: a partial board draw failed:", e); return false; }
   }
-  // the whole board's draw: a load that drew a partial board (now interactive) is held to the same edit rule as a passive one
+  // the whole board's draw: a load that drew a partial board (held inert) is held to the same edit rule as a passive one; the whole-board
+  // signal stays unset until the deferred draw lands
   function mayDrawWhole(passive, partialDrawn, editing) { return !((passive || partialDrawn) && editing); }
   // END progressive draw
   let writeTokenRequired = false;
@@ -1126,6 +1148,7 @@
     // rather than throwing an opaque TypeError after a successful fetch.
     if (!window.LevainDashboard || typeof window.LevainDashboard.render !== "function") {
       status("render core failed to load");
+      boardMark(true);     // nothing will ever draw: a driver or a deep link waiting on the whole board would only stall
       return false;
     }
     // Pre-fetch fast path: don't even fetch if we already know an edit is open.
@@ -1151,6 +1174,7 @@
         let partialDrawn = false;
         const onPartial = everDrawn ? null : (build, n, total) => {
           runPartial(() => myGen === loadGen && !editInProgress(), build, (pview) => {
+            boardMark(false);     // a part: inert, and not whole (before the draw, so a draw that throws midway still leaves nothing to act on)
             drawView(pview);
             partialDrawn = true;
             if (storeEl) storeEl.removeAttribute("data-cold");
@@ -1162,6 +1186,7 @@
         if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
         if (!mayDrawWhole(passive, partialDrawn, editInProgress())) { notice = null; return refuseForEdit(); }
         drawView(mview);
+        boardMark(true);     // the whole board, drawn: live, and the signal, in this same turn
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;
           document.dispatchEvent(new CustomEvent("levain:cockpit-held"));   // the change stream starts, or restarts, on this
@@ -1193,6 +1218,7 @@
           dropToken();
           refusedStop = true;
           status("read refused — off-box token missing or invalid");
+          boardMark(true);     // terminal: no whole board is coming
           return false;
         }
       }
@@ -1214,12 +1240,14 @@
       // `recall` (episode search) is a READ — injected in BOTH branches so search works on a
       // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
+      boardMark(true);
       status("read " + new Date().toLocaleTimeString());
       landed = true; drawnOnce();
       return true;
     } catch (e) {
       if (myGen !== loadGen) return false;     // a superseded read's failure says nothing about the page now
       status("read failed: " + (e && e.message ? e.message : e));
+      boardMark(true);     // terminal for this read: the board shown (a part, or none) is what stays until the next read
       retryUntilDrawn(e && e.message ? e.message : String(e || "read failed"), !!(e && e.refused));
       return false;
     } finally {
