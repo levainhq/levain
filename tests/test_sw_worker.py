@@ -567,6 +567,20 @@ def test_the_carried_shell_is_the_numerically_newest_older_generation_and_a_malf
 
 
 @needs_node
+def test_a_stale_cache_that_fails_the_gate_does_not_stop_the_next_candidate_being_carried() -> None:
+    """1111-25: shell labels are now content digests, so the first-tried candidate is arbitrary. A candidate that fails the
+    gate (its page names an asset the cache does not hold) is skipped, never the end of the search: the other stale
+    cache, which passes, is carried. The broken one sorts first here (a digit run outranks the text label `OLD`)."""
+    broken = {"label": "5", "html": '<script src="/missing.js"></script>'}
+    got = _run("carry", json.dumps([broken]))
+    assert got["shells"][0][1] == [["/", "<html>old shell</html>"]], got
+    # and the other way round: the good one first-tried is carried, the broken one after it is never reached
+    good_first = {"label": "5", "html": "<html>good five</html>"}
+    got = _run("carry", json.dumps([good_first]))
+    assert got["shells"][0][1] == [["/", "<html>good five</html>"]], got
+
+
+@needs_node
 def test_activation_carries_only_the_old_shell_and_the_assets_it_names_each_revalidated_else_nothing() -> None:
     """Reproduced red on 61196fff: activation copied EVERY entry of the old generation (strays, a query-mismatched asset,
     an HTML body under a script key) and the old shell stayed whole regardless."""

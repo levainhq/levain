@@ -86,6 +86,14 @@ def test_the_shell_page_changing_changes_the_worker_bytes_too(tmp_path: Path, mo
     assert _version_of(page_change) != _version_of(base_sw)
 
 
+def test_a_changed_mic_worklet_changes_the_worker_version_though_the_page_does_not_name_it(tmp_path: Path, monkeypatch) -> None:
+    """1111-25: /mic_worklet.js is loaded by audioWorklet.addModule, so no ?v= in the page names it; its bytes must still move
+    the served worker, or a worklet-only change ships an unchanged /sw.js and no reload bar."""
+    base_sw = _sw_bytes(tmp_path / "a", monkeypatch)
+    worklet = _sw_bytes(tmp_path / "b", monkeypatch, lambda fn, t: t + "\n// a worklet edit\n" if fn == "mic_worklet.js" else t)
+    assert _version_of(worklet) != _version_of(base_sw)
+
+
 def test_the_worker_is_served_no_cache_and_the_hand_edited_constant_is_gone(tmp_path: Path) -> None:
     src = (Path(web_server.__file__).parent / "webpush" / "static" / "sw.js").read_text(encoding="utf-8")
     assert len(re.findall(r"const SW_VERSION\s*=", src)) == 1 and "'1107-56-decl-1'" not in src
@@ -110,4 +118,4 @@ def test_a_worker_without_its_version_placeholder_refuses_to_start(tmp_path: Pat
 def test_a_shell_page_naming_no_versioned_asset_refuses_to_start() -> None:
     import pytest
     with pytest.raises(ValueError, match="no \\?v="):
-        web_server._shell_version(b"<html></html>", b"worker")
+        web_server._shell_version(b"<html></html>", b"worker", {})
