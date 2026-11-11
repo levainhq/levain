@@ -50,6 +50,7 @@ from levain.cockpit.engine import DECISIONS_ID, INTENTION_VERBS, NOTE_VERB, QUES
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import NOTE_ROW_PREFIX, QUESTION_ROW_PREFIX, parse_date
 from levain.cockpit.results import Absent, Fault, Read
+from levain.intention_legacy import OLD_KIND_TO_NEW, OLD_ROW_ID_KEY, OLD_ROW_PREFIX
 from levain.writes import (ActionVerb, EditError, _apply_operator_state_edit, _normalize_expect_disposition,
                            apply_action, apply_edit)
 
@@ -1373,6 +1374,25 @@ def _refuse(code: str, status: int, message: str) -> EditError:
     return EditError(code, status, message)
 
 
+def retired_id_message(name: Any) -> str | None:
+    """What a page loaded before the rename is told when it posts a retired verb id or edit kind, or None when ``name`` is
+    not one. It is the refusal of an old spelling arriving as a NEW request (ruling H10): the page cannot be taught the new
+    id by a shim, so the words ask the person to reload, and name the id the reloaded page posts."""
+    new = OLD_KIND_TO_NEW.get(name) if isinstance(name, str) else None
+    if new is None:
+        return None
+    return (f"{name!r} was renamed {new!r}: this page was loaded before levain was updated. Reload the page and try "
+            "again.")
+
+
+def _retired_row_message(row_id: Any) -> str | None:
+    """The same for a row id: ``<old prefix><id>`` is named ``intention:<id>`` now."""
+    if not isinstance(row_id, str) or not row_id.startswith(OLD_ROW_PREFIX):
+        return None
+    return (f"row {row_id!r} is named {'intention:' + row_id[len(OLD_ROW_PREFIX):]!r} now: this page was loaded before "
+            "levain was updated. Reload the page and try again.")
+
+
 def _read_target(cockpit: "Cockpit", verb: VerbSpec, panel_id: str, row_id: str | None) -> dict[str, Any] | None:
     if verb.binding != "row":
         return None
@@ -1454,7 +1474,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         if verb is None:
             # a downstream VerbSpec is a cockpit verb: it is offered by a panel and bound to what that
             # panel rendered, which a legacy /action body cannot name, so it fires on /cockpit/verb only
-            raise _refuse("unknown_verb", 404, f"no such action verb: {name!r}")
+            raise _refuse("unknown_verb", 404, retired_id_message(name) or f"no such action verb: {name!r}")
         params = req.get("params", {})
         if not isinstance(params, dict):
             raise _refuse("bad_request", 400, "'params' must be a JSON object")
@@ -1475,7 +1495,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         raise _refuse("route_broker", 400, f"{name!r} is answered on the broker's remote-control path")
     verb = registry.get(name) if isinstance(name, str) else None
     if verb is None:
-        raise _refuse("unknown_verb", 404, f"no such verb: {name!r}")
+        raise _refuse("unknown_verb", 404, retired_id_message(name) or f"no such verb: {name!r}")
     if device and not verb.device_ok:
         raise _refuse("laptop_only", 403, f"{verb.name!r} is not a device verb: it is fired on the laptop")
     panel_id = req.get("panel_id")
@@ -1499,6 +1519,9 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     if verb.binding == "row":
         if not isinstance(req.get("row_id"), str) or not req["row_id"]:
             raise _refuse("bad_request", 400, f"{verb.name!r} names a row: 'row_id' is required")
+        retired = _retired_row_message(req["row_id"])
+        if retired is not None:
+            raise _refuse("stale", 409, retired)      # the answer for a row that is gone, with the reason the page can show
         asked_target["row_id"] = req["row_id"]
     # a dry run never touches the journal: a replay could resume (decide) a pending a dead request left
     replayed = None if req.get("dry_run") is True else _broker_replay(
@@ -1789,9 +1812,12 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
     kind = req.get("kind")
     name = LEGACY_KINDS.get(kind) if isinstance(kind, str) else None
     if name is None:
-        raise _refuse("bad_kind", 400, f"unknown edit kind {kind!r}")
+        raise _refuse("bad_kind", 400, retired_id_message(kind) or f"unknown edit kind {kind!r}")
     verb = registry.get(name)
     assert verb is not None
+    if OLD_ROW_ID_KEY in req:
+        raise _refuse("bad_request", 400, f"{OLD_ROW_ID_KEY!r} was renamed 'intention_id': this page was loaded before "
+                      "levain was updated. Reload the page and try again.")
     params = {k: v for k, v in req.items()
               if k not in ("kind", "confirm") and k not in _ROW_KEYS and k not in _LEGACY_BINDING}
     bad = sorted(set(params) - set(verb.fields or ()))

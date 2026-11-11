@@ -3899,7 +3899,12 @@ class _Handler(GuardedHandler):
         refused 429 ``too_many_open`` before anything is filed (``levain.consent.sign.draft_bindings``); a draft
         already bound is answered whatever the count."""
         from levain.consent.sign import SignRefused, bind_compose, draft_bindings, error_word, request_id_ok, sign_dir
-        from levain.cockpit.verbs import KERNEL_COMPOSERS, SIGN_PARAM
+        from levain.cockpit.verbs import KERNEL_COMPOSERS, SIGN_PARAM, retired_id_message
+
+        retired = retired_id_message(req.get("verb")) if isinstance(req, dict) else None
+        if retired is not None and self.server.signer is not None:
+            # a page loaded before the rename names a verb by its old id; say so before the route-not-served answers
+            return {"error": "unknown_verb", "message": retired}, 404
 
         if self.server.signer is None or (self.server.compose_signer is None and not (
                 isinstance(req, dict) and isinstance(req.get("verb"), str) and req["verb"] in KERNEL_COMPOSERS)):
@@ -3913,7 +3918,7 @@ class _Handler(GuardedHandler):
             return {"error": "bad_request", "message": "'client_txn' must be 8 to 64 of A-Z a-z 0-9 _ -"}, 400
         spec = self.server.verb_registry.get(name) if isinstance(name, str) else None
         if spec is None:
-            return {"error": "unknown_verb", "message": f"no such verb: {str(name)[:80]!r}"}, 404
+            return {"error": "unknown_verb", "message": retired_id_message(name) or f"no such verb: {str(name)[:80]!r}"}, 404
         if not spec.sign:
             return {"error": "not_signed", "message": f"{spec.name!r} is not a signed verb: it is sent as it is"}, 400
         # c4-mut R1: a KERNEL signed verb's request is levain's own to file (its namespace no caller may name); every
