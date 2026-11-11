@@ -324,6 +324,15 @@ const shotOnTimeoutInner = async (n, setPath) => {
 };
 let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)
 for (const s of steps) {
+  // The cockpit draws its first board in parts (S4) and marks the page `data-board-partial` until the whole one is drawn. A step acts on the
+  // whole board, as every step did before the parts: a node it taps or tags on a part would be replaced by the whole draw a moment later.
+  // Bounded, and not fatal: a page that never marks itself passes at once; a step that watches the parts says `"partial": true`.
+  if (!s.partial) {
+    for (const end = Date.now() + scaled(15000); Date.now() < end;) {
+      if (await evaluate("!(document.documentElement && document.documentElement.hasAttribute('data-board-partial'))") !== false) break;
+      await sleep(50);
+    }
+  }
   const waitMs = scaled(s.ms || 20000);
   const deadline = Date.now() + waitMs;
   if (s.authenticator !== undefined) {

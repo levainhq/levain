@@ -1153,6 +1153,7 @@
           runPartial(() => myGen === loadGen && !editInProgress(), build, (pview) => {
             drawView(pview);
             partialDrawn = true;
+            if (document.documentElement) document.documentElement.setAttribute("data-board-partial", "");   // a link's jump waits for the whole board (dashboard_core.js)
             if (storeEl) storeEl.removeAttribute("data-cold");
             drawnOnce();
             status("reading " + n + " of " + total + " panels...");
@@ -1225,6 +1226,7 @@
     } finally {
      if (myGen === loadGen) {
       inflight = false;
+      if (document.documentElement) document.documentElement.removeAttribute("data-board-partial");
       if (btn) btn.disabled = false;
       // Run a reload that arrived (authoritative, non-passive) while we were in flight.
       // Always non-passive → never deferred, so a saved edit's state always lands.
