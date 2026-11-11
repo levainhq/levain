@@ -197,8 +197,9 @@ def test_band_and_board_rows_are_read_only_labelled_and_point_at_where_they_are_
 
 def test_no_intention_verb_is_offered_on_a_band_or_board_row_and_none_can_be_fired_on_one(rig: Rig) -> None:
     rows = rig.rows()
-    for rid in (f"band:{rig.q.id}", "board:levain:a", "board:levain:b"):
+    for rid in ("board:levain:a", "board:levain:b"):
         assert rows[rid]["actions"] == [], rid
+    assert {a["verb"] for a in rows[f"band:{rig.q.id}"]["actions"]} == {"band_agenda"}     # a band row's one verb is its own
     intention = rows[f"intention:{rig.ids['plain']}"]
     assert {a["verb"] for a in intention["actions"]} >= {"intention_touch", "intention_close", "intention_surface_at"}
     panel_verbs = {a["verb"] for a in rig.panel()["actions"]}
@@ -217,7 +218,8 @@ def test_read_one_finds_a_intention_even_when_held_and_has_no_write_row_for_band
     assert isinstance(ctx_read("tray", f"intention:{rig.ids['drop_later']}"), Read)           # held, but a write finds it
     assert isinstance(ctx_read("tray", f"intention:{rig.ids['talk_old']}"), Read)
     assert isinstance(ctx_read("tray", "intention:ghost"), Absent)
-    assert isinstance(ctx_read("tray", f"band:{rig.q.id}"), Absent)
+    assert isinstance(ctx_read("tray", f"band:{rig.q.id}"), Read)            # an open band row is a write target for band_agenda
+    assert isinstance(ctx_read("tray", "band:q-ghost"), Absent)
     assert isinstance(ctx_read("tray", "board:levain:a"), Absent)
 
 
@@ -308,6 +310,7 @@ def _normal(panel: dict[str, Any], rig: Rig) -> dict[str, Any]:
     """The panel with what varies per run made stable: the question id, the etag, the read time, the versions."""
     text = json.dumps(panel, sort_keys=True).replace(rig.q.id, "q-0001")
     text = re.sub(r'"(version|etag|as_of|read_at|band_since)": "[^"]*"', lambda m: f'"{m.group(1)}": "<{m.group(1)}>"', text)
+    text = re.sub(r'("row_id": "band:q-0001", "row_version": )"[^"]*"', r'\1"<row_version>"', text)   # a band row's version moves with its question id
     return json.loads(text)
 
 
