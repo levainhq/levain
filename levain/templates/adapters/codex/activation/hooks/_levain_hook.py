@@ -54,7 +54,7 @@ import sys
 import time
 import unicodedata
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -1112,16 +1112,47 @@ def open_intentions(timeout: float = 2.0) -> list[dict]:
 _WHEN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?")
 
 
+_EVENT_DONE_RE = re.compile(r"done:((?:spore|intention)-[0-9A-Za-z_-]{1,56})")   # `spore-N`: an id already in an existing store
+
+
+def _event_due(s: dict, open_ids: set, today) -> bool:
+    """True when an unstamped agenda that waits on an event is worth a germinate run now: its check-by day has come
+    (`check_by`, or seven days after `created` when it has none or a bad one), or the `done:<id>` first part it names is no
+    longer among the open intentions (resolved or gone; the run itself tells a completion from a compost). The two spellings of
+    an id (`spore-N`, `intention-N`) name one first part. Mirrors levain.germinate (this file imports nothing of it)."""
+    raw, day = s.get("check_by"), None
+    if isinstance(raw, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        try:
+            day = datetime.strptime(raw, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    if day is None and isinstance(s.get("created"), str):
+        try:
+            day = datetime.strptime(s["created"][:10], "%Y-%m-%d").date() + timedelta(days=7)
+        except ValueError:
+            pass
+    if day is not None and day <= today:
+        return True
+    m = _EVENT_DONE_RE.fullmatch(s.get("on_event")) if isinstance(s.get("on_event"), str) else None
+    return m is not None and m.group(1).partition("-")[2] not in open_ids
+
+
 def due_agendas(intentions: list, now: datetime | None = None) -> list[dict]:
     """Open AGENDA intentions that have come due and are not yet germinated (TS-3): a date-only `next` on or before
     today, a timed `next` (YYYY-MM-DDTHH:MM, local) from that minute; no `next`, a malformed one or a stamped
-    `germinated` is never due. Mirrors levain.germinate.is_due (this file is stranger-side and imports nothing of it)."""
+    `germinated` is never due. An agenda that waits on an event (`on_event`) is never due by a date: it is due when
+    `_event_due` says so. Mirrors levain.germinate.is_due (this file is stranger-side and imports nothing of it)."""
     now = now or datetime.now()
+    open_ids = {str(s.get("id")).partition("-")[2] for s in intentions if isinstance(s, dict)}
     due = []
     for s in intentions:
         if not isinstance(s, dict) or str(s.get("disposition") or "").strip().casefold() != "agenda":
             continue
         if s.get("germinated"):
+            continue
+        if s.get("on_event"):
+            if _event_due(s, open_ids, now.date()):
+                due.append(s)
             continue
         raw = s.get("next")
         m = _WHEN_RE.fullmatch(raw) if isinstance(raw, str) else None
