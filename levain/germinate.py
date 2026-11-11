@@ -23,6 +23,13 @@ is due from that minute; an agenda with no ``next`` is never due) it does, in or
    agenda (``done`` / ``answered`` / ``explored`` by its type). An agenda that handed a desk drop (``board``,
    ``desk``) is composted, as before, with a second compare-and-set.
 
+An agenda that waits on an EVENT (``on_event: done:<id>``, ``check_by``: the second part of a split, ``levain.split``) is never
+due by a date. It wakes, through the same filing and stamp as a due one, when the intention it names has been finished (resolved
+downward with a completion kind), read from that intention's own resolution on every run, so a writer that hurried the wake and
+died leaves nothing to repair. When its ``check_by`` day comes first it rings as one unstamped band row ("still waiting on
+...") whose answer keeps or drops it (``checkby`` in the result). ``event=<key>`` limits a run to the parts waiting on that
+exact key: nothing dated, no check-by pass.
+
 One bad intention never stops the others: its error is recorded under ``errors`` and the run goes on; the CLI prints every
 outcome that did complete and exits non-zero when any intention errored. A missing ``.levain/memory.spores.json`` is
 refused with a reason (exit 2), never reported as "nothing due". A run holds a per-install lock (``--dry-run`` does
@@ -59,11 +66,12 @@ import re
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from levain.intentions import _parse_when, is_timed
+from levain.intentions import (DEFAULT_CHECK_BY_DAYS, _parse_when, event_anchor, finished_by_completion, is_event_agenda,
+                               is_timed, valid_check_by)
 from levain.intention_legacy import STORE_FILE_NAME
 
 __all__ = ["GerminateRefused", "KEY_PREFIX", "Outcome", "add_parsers", "germinate", "is_due", "outbox_id_for",
@@ -89,10 +97,14 @@ class Outcome:
     filed: bool          # this run created the row or drop
     pinged: bool
     done: bool           # stamped and composted (False on a dry run)
+    event: str = ""      # the event key that woke it (a split's second part), "" for a dated wake
 
     def as_dict(self) -> dict[str, Any]:
-        return {"intention_id": self.intention_id, "origin_key": self.origin_key, "target": self.target, "via": self.via,
-                "ref": self.ref, "filed": self.filed, "pinged": self.pinged, "done": self.done}
+        out = {"intention_id": self.intention_id, "origin_key": self.origin_key, "target": self.target, "via": self.via,
+               "ref": self.ref, "filed": self.filed, "pinged": self.pinged, "done": self.done}
+        if self.event:
+            out["event"] = self.event
+        return out
 
 
 def outbox_id_for(origin_key: str) -> str:
@@ -119,8 +131,8 @@ def _is_agenda(item: dict[str, Any]) -> bool:
 def is_due(item: dict[str, Any], today: date, now: datetime | None = None) -> bool:
     """SD-4: agenda, open (the caller lists open intentions), no ``germinated``, and ``next`` due: a TIMED ``next`` from that
     minute (a malformed timed value is never due and never read as a date), a date-only ``next`` on or before today."""
-    if not _is_agenda(item) or item.get("germinated"):
-        return False
+    if not _is_agenda(item) or item.get("germinated") or item.get("on_event"):
+        return False       # an agenda that waits on an event wakes on it (the split), never on a date
     raw = item.get("next")
     if is_timed(raw):
         when = _parse_when(raw)
@@ -187,10 +199,12 @@ def _run_lock(intentions_json: Path, dry_run: bool) -> Iterator[None]:
 
 def germinate(intentions_json: Path | str, queue_dir: Path | str, *, install: Path | str, agent: str = "claude_code",
               today: date | None = None, now: datetime | None = None, dry_run: bool = False, timed_only: bool = False,
-              ping: Callable[..., bool] | None = None) -> dict[str, Any]:
+              ping: Callable[..., bool] | None = None, event: str | None = None) -> dict[str, Any]:
     """Germinate every due agenda in ``intentions_json`` (``timed_only``: only those whose ``next`` carries a time).
     Returns ``{"today", "due": [...], "finish": [...], "errors": [...], "skipped": [...]}``; ``due`` and ``finish``
-    hold :class:`Outcome` dicts. ``dry_run`` writes nothing (it files nothing, pings nothing, and creates no store).
+    hold :class:`Outcome` dicts; ``checkby`` (present only when an event agenda reached its check-by) holds what the
+    check-by did to each. ``event`` limits the run to the agendas waiting on that exact key (a wake after the event,
+    nothing dated, no check-by pass); the key is verified against the store, never taken on the caller's word. ``dry_run`` writes nothing (it files nothing, pings nothing, and creates no store).
     ``now`` is the local naive clock for a timed ``next`` (default: the host's). ``ping`` is the notify seam (default
     :func:`levain.consent.band._send_ping`, read at call time). Raises :class:`GerminateRefused` with no intentions file."""
     intentions_json = Path(intentions_json)
@@ -198,11 +212,12 @@ def germinate(intentions_json: Path | str, queue_dir: Path | str, *, install: Pa
         raise GerminateRefused(f"{intentions_json} does not exist: this is not a Levain install with an intention store "
                                "(check --path); nothing was read or written")
     with _run_lock(intentions_json, dry_run):
-        return _germinate(intentions_json, Path(queue_dir), Path(install), agent, today, now, dry_run, timed_only, ping)
+        return _germinate(intentions_json, Path(queue_dir), Path(install), agent, today, now, dry_run, timed_only, ping, event)
 
 
 def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, today: date | None, now: datetime | None,
-               dry_run: bool, timed_only: bool, ping: Callable[..., bool] | None) -> dict[str, Any]:
+               dry_run: bool, timed_only: bool, ping: Callable[..., bool] | None,
+               event: str | None = None) -> dict[str, Any]:
     from anneal_memory.spores import IntentionError, intention_version
 
     from levain.consent import band
@@ -220,6 +235,7 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
     else:
         open_items = store.list_open(today=today)
     due = [s for s in open_items if is_due(s, today, now) and (not timed_only or is_timed(s.get("next")))]
+    event_agendas = [s for s in open_items if is_event_agenda(s)]
     # a dry run on a machine with no band yet must not create one
     questions = None if dry_run and not (qdir / DB_NAME).exists() else QuestionStore(qdir)
     open_qs = questions.open_questions() if questions is not None else []
@@ -245,6 +261,8 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
     finish = [s for s in open_items if _is_agenda(s) and s.get("germinated")
               and (_stamp_ref(s).startswith("dr-") or not _stamp_ref(s)
                    or (ringing_ref(s, open_ids) is None and _answered(_stamp_ref(s))))]
+    if event is not None:    # an event-only run wakes that event's agendas and nothing else
+        due, finish = [], []
     coord = CoordStore(qdir)
     ping = ping or band._send_ping
     has_board = coord.desk_present()
@@ -278,8 +296,27 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
         except Exception as exc:  # noqa: BLE001 - one bad intention never stops the others
             _err(sid, okey, exc)
 
-    for item in due:
+    # A split's second part wakes when the part it waits on was FINISHED. Read after the finish pass above, so an anchor
+    # that pass just closed as done wakes its follower in the same run; and read from the store (the anchor's own
+    # resolution), so the wake never depends on a crashed or skipped emitter having run.
+    woke_by: dict[str, str] = {}
+    woken: list[dict[str, Any]] = []
+    for item in event_agendas:
+        anchor = event_anchor(item)
+        if anchor is None or (event is not None and item.get("on_event") != event):
+            continue
+        try:
+            finished = finished_by_completion(store.get(anchor))
+        except Exception as exc:  # noqa: BLE001 - one unreadable anchor never stops the others
+            _err(item.get("id"), item.get("origin_key"), exc)
+            continue
+        if finished:
+            woke_by[str(item.get("id"))] = anchor
+            woken.append(item)
+
+    for item in [*due, *woken]:
         sid, okey = item.get("id"), item.get("origin_key")
+        anchor_id = woke_by.get(str(sid), "")
         try:
             if not isinstance(sid, str) or not isinstance(okey, str) or not okey:
                 raise ValueError("the intention has no id or no origin_key; it cannot be keyed, so it is skipped")
@@ -308,7 +345,9 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
                 via = target if target in (TARGET_BAND, TARGET_NUDGE) else "band-fallback"
                 ref = ""
                 if not dry_run:
-                    blocks = (f"agenda {sid} in {install.name} came due "
+                    blocks = (f"agenda {sid} in {install.name} woke because {anchor_id} was done; it waits on you"
+                              if anchor_id else
+                              f"agenda {sid} in {install.name} came due "
                               f"{nxt.isoformat() if nxt else today.isoformat()}; it waits on you")
                     if repo:
                         blocks += f" (board {repo}: no board here, so it is on the band)"
@@ -316,7 +355,8 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
                         blocks += " (desk: no desk here, so it is on the band)"
                     q, filed = questions.file_once(
                         agent=agent, key=KEY_PREFIX + okey,
-                        what=f"Due {(nxt or today).strftime('%m-%d')}: {title} ({sid})",
+                        what=(f"After {anchor_id} was done: {title} ({sid})" if anchor_id
+                              else f"Due {(nxt or today).strftime('%m-%d')}: {title} ({sid})"),
                         options=[("done", "Done")], rec="done", blocks=_line(blocks, 600), cwd=str(install.resolve()),
                         held_by=ANSWER_CHANNELS)
                     ref = q.id
@@ -348,10 +388,77 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
                     result["skipped"].append({"intention_id": sid, "origin_key": okey, "ref": ref,
                                               "reason": f"changed while germinating ({exc}); left open"})
                     continue
-            result["due"].append(Outcome(sid, okey, target, via, ref, filed, pinged, done).as_dict())
+            result["due"].append(Outcome(sid, okey, target, via, ref, filed, pinged, done,
+                                         f"done:{anchor_id}" if anchor_id else "").as_dict())
         except Exception as exc:  # noqa: BLE001 - one bad intention never stops the others
             _err(sid, okey, exc)
+    if event is None:
+        _check_by_pass(event_agendas, woke_by, store, questions, today, dry_run, agent, install, result, _err)
     return result
+
+
+def _check_by_day(item: dict[str, Any]) -> date | None:
+    """The day an event agenda must be asked about: its ``check_by``, or (a hand-made row with none, or a bad one) seven days
+    after it was created, so no event agenda can wait without end."""
+    if valid_check_by(item.get("check_by")):
+        return datetime.strptime(item["check_by"], "%Y-%m-%d").date()
+    made = _day(item.get("created"))
+    return None if made is None else made + timedelta(days=DEFAULT_CHECK_BY_DAYS)
+
+
+def _check_by_pass(event_agendas: list[dict[str, Any]], woke_by: dict[str, str], store: Any, questions: Any, today: date,
+                   dry_run: bool, agent: str, install: Path, result: dict[str, Any],
+                   _err: Callable[..., None]) -> None:
+    """An event agenda whose event has not fired by its check-by rings in the band as one row, "still waiting on <event>: still
+    want this?", unstamped (the event link stays live: the event may still wake it). The row's key names the check-by day, so
+    an answer is honoured exactly once and a moved check-by is asked again on its new day: ``keep`` moves the check-by seven
+    days on, ``drop`` ends the agenda, any other answer is a keep. A re-run after a crash between the answer and its effect
+    applies the effect again, and it is the same effect."""
+    from anneal_memory.spores import IntentionError, intention_version
+
+    from levain.consent.questions import ANSWER_CHANNELS
+    from levain.intentions import dropped_descend_kind
+
+    for item in event_agendas:
+        sid, okey = item.get("id"), item.get("origin_key")
+        if str(sid) in woke_by:
+            continue
+        try:
+            day = _check_by_day(item)
+            if day is None or day > today or not isinstance(sid, str) or not isinstance(okey, str) or not okey:
+                continue
+            on_event = str(item.get("on_event"))
+            entry = {"intention_id": sid, "origin_key": okey, "event": on_event, "check_by": day.isoformat(),
+                     "via": "ringing", "ref": ""}
+            if dry_run or questions is None:
+                result.setdefault("checkby", []).append(entry)
+                continue
+            q, _filed = questions.file_once(
+                agent=agent, key=f"{KEY_PREFIX}checkby:{okey}:{day.isoformat()}",
+                what=_line(f"Still waiting on {on_event}: {_title(item, sid)} ({sid}). Still want this?", 900),
+                options=[("keep", "Still want it"), ("drop", "Drop it")], rec="keep",
+                blocks=_line(f"agenda {sid} in {install.name} waits on {on_event}; its check-by {day.isoformat()} has come", 600),
+                cwd=str(install.resolve()), held_by=ANSWER_CHANNELS)
+            entry["ref"] = q.id
+            if q.answer is not None:
+                try:
+                    if q.answer.kind == "option" and q.answer.value == "drop":
+                        store.descend(sid, kind=dropped_descend_kind(item.get("type")), expect_disposition="agenda",
+                                      expected_version=intention_version(item), today=today)
+                        entry["via"] = "dropped"
+                    else:
+                        store.update(sid, check_by=(today + timedelta(days=DEFAULT_CHECK_BY_DAYS)).isoformat(),
+                                     expect_disposition="agenda", expected_version=intention_version(item), today=today)
+                        entry["via"] = "kept"
+                except IntentionError as exc:
+                    if "changed since read" not in str(exc) and "disposition changed" not in str(exc):
+                        raise
+                    result["skipped"].append({"intention_id": sid, "origin_key": okey, "ref": q.id,
+                                              "reason": f"changed while its check-by answer was applied ({exc}); left open"})
+                    continue
+            result.setdefault("checkby", []).append(entry)
+        except Exception as exc:  # noqa: BLE001 - one bad intention never stops the others
+            _err(sid, okey, exc)
 
 
 def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path]:
@@ -387,9 +494,11 @@ def run_germinate(args: argparse.Namespace, out: Any = None) -> int:
         print(f"{verb} {o['intention_id']} ({o['target']}) via {o['via']}" + (f" -> {o['ref']}" if o["ref"] else "") + live, file=out)
     for o in res["finish"]:
         print(f"{'would finish' if args.dry_run else 'finished'} {o['intention_id']} (stamped, now closed)", file=out)
+    for c in res.get("checkby", []):
+        print(f"{c['intention_id']} still waits on {c['event']}; its check-by {c['check_by']} has come ({c['via']})", file=out)
     for s in res["skipped"]:
         print(f"skipped {s['intention_id']}: {s['reason']}", file=out)
-    if not res["due"] and not res["finish"] and not res["errors"] and not res["skipped"]:
+    if not res["due"] and not res["finish"] and not res["errors"] and not res["skipped"] and not res.get("checkby"):
         print("no agenda is due", file=out)
     return rc
 
