@@ -453,8 +453,9 @@ def read_recorded_verb(verb: Any) -> Any:
 def read_recorded_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
     """A recorded ``changes`` or ``projection`` of an intention effect, as a copy with the disposition an old release signed
     (``seed``) read as the word that replaced it (``someday``), so an op signed before the rename completes instead of
-    ending refused at the write guard (ruling D2). The signed record keeps its bytes; the label a fire carries was computed
-    over the recorded value, so the rewritten row's disposition reads unverified, as a migrated one does."""
+    ending refused at the write guard (ruling D2). The signed record keeps its bytes; the label a fire writes is computed
+    over this read value (``someday``), so the row renders under its signer's label, as the same disposition under its new
+    name. A disposition rewritten by ``levain update`` has no fire behind it and reads unverified."""
     out = dict(fields)
     disposition = out.get("disposition")
     if isinstance(disposition, str):

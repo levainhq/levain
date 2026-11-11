@@ -88,6 +88,20 @@ def test_ops_signed_on_seed_complete_as_someday_not_unapplied_refused(old):
     assert all(e == ("APPLIED", None) for e in _sql(data, "SELECT status, reason FROM effects"))
 
 
+def test_the_label_of_an_op_signed_on_seed_is_the_signers_over_someday(old):
+    """A fire writes a label row per authority field it applied, as ``sha256(value)`` keyed to the op that signed it. The
+    op signed ``seed`` and the store now holds ``someday``, so the row carries the digest of ``someday`` and the row
+    renders under that signature (the same disposition under its new name), not as ``unverified``."""
+    from levain.cockpit.consent import value_sha256
+
+    data, store = old
+    _settle(data, store)
+    rows = _sql(data, "SELECT field, operation_id, value_sha256 FROM labels WHERE field = ?", "disposition")
+    assert rows, "the settled ops wrote no disposition label"
+    assert {r[2] for r in rows} == {value_sha256("someday")}, rows
+    assert all(r[2] != value_sha256("seed") for r in rows)
+
+
 def test_the_signed_record_is_never_rewritten(old):
     data, store = old
     before = [_sql(data, "SELECT record, record_sha256 FROM pendings WHERE pending_id = ?", OPS[n]["pending_id"])
