@@ -2430,12 +2430,12 @@
     const verbs = isVerbPanel(entry);
     // CLIENT-side filter over the loaded loops (they all ride the wire — no server round-trip,
     // unlike the episode keyword search). Matches the spore TEXT (case-insensitive substring)
-    // OR the spore-id ("spore-103" / "103"), so you can jump straight to a loop by handle or
+    // OR the id ("spore-103", "intention-103" or "103"), so you can jump straight to a loop by handle or
     // content [2026-06-19]. Reuses the .ep-search sticky bar for visual parity.
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");
     input.type = "search";
-    input.placeholder = "filter loops by text or spore-id…";
+    input.placeholder = "filter loops by text or id…";
     input.setAttribute("aria-label", "filter open loops by text or spore id");
     const status = el("span", "ep-search-status", "");
     bar.append(input, status);

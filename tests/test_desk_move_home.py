@@ -580,4 +580,12 @@ def test_the_help_names_what_the_verb_refuses_and_every_write_it_makes(tmp_path,
     # it refuses on BOTH real directories, not on the new one alone, and says which writes it makes
     assert "old directory is a real directory and the new one exists too" in text
     assert "desk's stored directory" in text and "workspace record" in text
+    assert "cannot be read" in text and "neither home exists" in text       # the refusals the code has, not only the first
     assert "--queue-dir" in text
+
+
+def test_a_queue_dir_with_no_desk_store_warns_instead_of_reading_as_nothing_to_do(tmp_path):
+    home, settings = _setup(tmp_path)
+    out, err = io.StringIO(), io.StringIO()
+    rc = move_home(home=home, settings=settings, store_dir=tmp_path / "typo", out=out, err=err)
+    assert rc == 0 and "holds no" in err.getvalue() and "typo" in err.getvalue()
