@@ -115,6 +115,9 @@ def time_from_cron(cron: object) -> str:
             return t
     except (ValueError, TimeRefused):
         pass
+    if cron is None:
+        raise TimeRefused("the stored dream has no schedule trigger, so its time cannot be kept: pass --time HH:MM to "
+                          "give it one")
     raise TimeRefused(f"the stored dream's cron {str(cron)[:60]!r} is not one this build writes, so its time cannot be "
                       "kept: pass --time HH:MM to name it")
 
