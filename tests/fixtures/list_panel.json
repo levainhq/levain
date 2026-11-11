@@ -285,17 +285,6 @@
     },
     {
      "escalates": [],
-     "gesture": "direct",
-     "target": {
-      "panel_id": "tray",
-      "row_id": "intention:intention-006",
-      "row_version": "4a79d475f7d8b840"
-     },
-     "tier": "C1",
-     "verb": "intention_then"
-    },
-    {
-     "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
@@ -644,17 +633,6 @@
     },
     {
      "escalates": [],
-     "gesture": "direct",
-     "target": {
-      "panel_id": "tray",
-      "row_id": "intention:intention-004",
-      "row_version": "fa8372a07bb02c41"
-     },
-     "tier": "C1",
-     "verb": "intention_then"
-    },
-    {
-     "escalates": [],
      "gesture": "direct-reported",
      "target": {
       "panel_id": "tray",
@@ -817,17 +795,6 @@
      },
      "tier": "T2",
      "verb": "intention_retarget"
-    },
-    {
-     "escalates": [],
-     "gesture": "direct",
-     "target": {
-      "panel_id": "tray",
-      "row_id": "intention:intention-005",
-      "row_version": "bdda42444c43a7a9"
-     },
-     "tier": "C1",
-     "verb": "intention_then"
     },
     {
      "escalates": [],
