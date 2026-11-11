@@ -16,12 +16,8 @@ from __future__ import annotations
 # which cannot import levain) through this constant.
 STORE_FILE_NAME = 'memory.spores.json'
 
-# The suffix form (`<db-stem>` + suffix), for the one f-string that derives the store beside `memory.db`.
-STORE_FILE_SUFFIX = '.spores.json'
-
-# The document keys of that file, anneal-owned: raw reads of the document (`data.get(...)`) use them.
+# The document key of the open records in that file, anneal-owned: a raw read of the document (`data.get(...)`) uses it.
 STORE_DOC_KEY_OPEN = 'spores'
-STORE_DOC_KEY_RESOLVED = 'resolved'
 
 # The old verb ids, to their new ids. A signed authority-log `raise` link names a verb by its id, and the policy replay maps
 # a recorded old id to the new one so a floor an operator signed keeps binding (ruling H1). `descend` becomes `close` and
