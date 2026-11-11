@@ -49,3 +49,14 @@ def test_an_anneal_without_id_prefix_gets_a_clear_error_not_a_bare_type_error(tm
     monkeypatch.setattr(sp, "_GUARDED", old_anneal)
     with pytest.raises(RuntimeError, match=r"anneal-memory>=1\.0\.7"):
         sp.guarded_spore_store(tmp_path / "memory.spores.json")
+
+
+def test_only_the_id_prefix_type_error_is_translated(tmp_path, monkeypatch):
+    import levain.spores as sp
+
+    def other(path, **kw):
+        raise TypeError("id_prefix must be a string")      # a different TypeError that merely names id_prefix
+
+    monkeypatch.setattr(sp, "_GUARDED", other)
+    with pytest.raises(TypeError, match="must be a string"):
+        sp.guarded_spore_store(tmp_path / "memory.spores.json")
