@@ -29,6 +29,7 @@ from levain.autonomic.journal import JournalCorruptError
 from levain.cockpit.authority import LabelKey, unavailable
 from levain.cockpit.install import GOVERNED, REPORTED
 from levain.cockpit.consent import ConsentError, parse_stamp, value_sha256
+from levain.cockpit.effects import read_recorded_key
 from levain.cockpit.firejournal import CockpitDB, _parse_record
 
 if TYPE_CHECKING:
@@ -80,10 +81,11 @@ class LabelSnapshot:
         or a value with no matching fire is ``unverified`` with nulls."""
         if key is None or (self.revision is None and self.error is None):
             return None
+        resource_key = read_recorded_key(key.resource_key)
         blind = self.error is not None or (key.gate is not None and key.gate != "match") \
-            or key.resource_key in self._degraded_keys
+            or resource_key in self._degraded_keys
         fires: dict[str, _Fire | None] = {
-            f: None if blind else self._fire(key.resource_key, f, v, key.operation_id)
+            f: None if blind else self._fire(resource_key, f, v, key.operation_id)
             for f, v in key.values.items()}
         fields = {f: dict(_NO_FIELD) if fire is None else {
             "label": fire.label, "signer": fire.signer, "fired_at": fire.fired_at,
@@ -186,11 +188,13 @@ def _build(conn: sqlite3.Connection, revision: tuple[str, int, int, str],
             record = records[op]
             if record is not None:
                 fire = _fire_of(r, install_class, record, authority)
+        # a label the release that said "spore" wrote sits under the old key prefix: it is the same resource's label
+        resource_key = read_recorded_key(r["resource_key"])
         if fire is None:
             degraded += 1
-            degraded_keys.add(r["resource_key"])
+            degraded_keys.add(resource_key)
             continue
-        index.setdefault((r["resource_key"], r["field"]), []).append(fire)
+        index.setdefault((resource_key, r["field"]), []).append(fire)
     return LabelSnapshot(revision=revision, error=None, degraded=degraded,
                          _index={k: tuple(v) for k, v in index.items()},
                          _degraded_keys=frozenset(degraded_keys))
