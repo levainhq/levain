@@ -66,6 +66,7 @@ from levain import unshowable
 from levain.cockpit.display_safe import visible
 from levain.cockpit.authority import NO_LABELS, LabelKey, LabelSnapshot, RequestAuthority, current, unavailable
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
+from levain.intention_legacy import OLD_KIND_TO_NEW
 
 SCHEMA = "levain.cockpit/2"
 # the budget one panel read has before it is a fault (a provider's default ``timeout_s``, the shared-read memo's wait); other
@@ -2506,14 +2507,16 @@ class Cockpit:
 
     def _log_sentences(self, value: dict[str, Any], cred: str, auth: RequestAuthority) -> dict[str, Any]:
         """One sentence per log row from the manifest's verb LABELS ("Snoozed · intention-1238"); a verb with
-        no label renders as its raw name."""
+        no label renders as its raw name. A row an older release recorded names its verb by the id that release
+        served: its label is the new id's (history is read in the new words; the row itself is untouched)."""
         try:
             labels = {n: v.get("label") for n, v in
                       (self._verb_view.verbs_map(cred, auth=auth) if self._verb_view else {}).items()}
         except Exception:  # noqa: BLE001 - a label lookup never fails a read
             labels = {}
         return {**value, "rows": [
-            {**r, "sentence": f"{labels.get(r['verb']) or r['verb']} \u00b7 {r['target']}"} for r in value["rows"]]}
+            {**r, "sentence": f"{labels.get(r['verb']) or labels.get(OLD_KIND_TO_NEW.get(r['verb'], '')) or r['verb']}"
+                              f" \u00b7 {r['target']}"} for r in value["rows"]]}
 
     @staticmethod
     def _view_order(spec: ProviderSpec, rows: list[dict[str, Any]], today: date) -> dict[str, list[str]]:
