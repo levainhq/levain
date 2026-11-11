@@ -2364,7 +2364,7 @@
   // the card id the row carries (data-card). With no Decisions panel on the page, the Board tab is shown instead.
   function openNeedsYouCard(card) {
     const N = root.LevainNeeds;
-    if (N && N.go(card, false, true)) return;   // the strip's card (or, on Build, its chip) is lit; the strip is on the page only while the item waits
+    if (N && N.go(card)) return;   // the strip's card (or, on Build, its chip) is lit; the strip is on the page only while the item waits
     const mark = (tries) => {
       const row = Array.from(document.querySelectorAll("[data-card]")).find((r) => r.dataset.card === card && !r.classList.contains("tv-open"));
       if (row) { row.classList.add("tv-lit"); if (row.scrollIntoView) row.scrollIntoView({ block: "center" }); return; }
@@ -2373,6 +2373,10 @@
     if (N && N.history()) mark(12);
     else applyMode("board", true);
   }
+  // The Work lens's "waiting on you" button asks the live Needs strip, not the topology: it is drawn only while the strip holds a waiting card on screen
+  // (canOpenFirstNeeds), and the click lights, scrolls to and focuses the strip's own first card (openFirstNeeds; the Desk owes tab is switched away from first).
+  const canOpenFirstNeeds = () => { const N = root.LevainNeeds; return !!(N && typeof N.canGoFirst === "function" && N.canGoFirst()); };
+  const openFirstNeeds = () => { const N = root.LevainNeeds; return !!(N && typeof N.goFirst === "function" && N.goFirst()); };
   // The Work lens's open loop: its row in the Open loops panel (on the tab that shows that panel), scrolled to and lit.
   // Finds the row first: with no such row on the page nothing moves and the caller says so (false); null when an unsaved edit would not let it unfold; "hidden" for any other failure.
   function openLoop(sporeId) {
@@ -2439,7 +2443,7 @@
     const has = !!(I.tvLive || I.tfault);
     if (!has) { if (!host.hidden || host.firstChild) { TV.release(); host.replaceChildren(); host.hidden = true; } hSig = ""; return; }
     if (document.body.dataset.mode === "memory") { TV.release(); hSig = ""; return; }      // the header is not on Memory: nothing runs behind it
-    const sig = JSON.stringify([lens, I.tfault, I.tv ? TV.signature(I.tv, lens) : "", I.canReplay]);
+    const sig = JSON.stringify([lens, I.tfault, I.tv ? TV.signature(I.tv, lens) : "", I.canReplay, canOpenFirstNeeds()]);     // the Work lens's button is there while the strip holds a card
     if (sig === hSig && !host.hidden) return;
     hSig = sig;
     host.hidden = false;
@@ -2458,7 +2462,7 @@
     if (I.tv) {
       // the Replay strip rides the page's own read path (LevainCockpitTransport.readJson: its auth headers and token handling); resume re-reads the live topology
       const replay = I.canReplay ? { readJson: root.LevainCockpitTransport.readJson, resume: () => refetchPanel("topology") } : undefined;
-      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, openLoop, replay }); } catch (e) { fail = true; }
+      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, openNeeds: openFirstNeeds, canOpenNeeds: canOpenFirstNeeds, openLoop, replay }); } catch (e) { fail = true; }
     }
     if (body) { host.replaceChildren(body); return; }
     // a fault, or a throw while drawing: said in words with the switch beside it, so the Event graph is one click away

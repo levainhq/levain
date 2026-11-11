@@ -400,14 +400,10 @@
     if (conflicts && conflicts.length) { const n = conflictCount(v); row.appendChild(m("conflicts", n === 1 ? "file conflict" : "file conflicts", String(n), "files two live sessions are both writing", "warn")); }
     return row;
   }
-  // The Needs-you card the Work lens's "waiting on you" figure goes to: the first waiting task's card, else a waiting session's; null when none names one
-  // (the Work lens lists no waiting item itself: the Needs strip does, organized, and this figure is the one way from here to it)
-  function waitingCard(v) {
-    const card = (x) => (typeof x.card === "string" && x.card ? x.card : null);
-    const t = arr(v.tasks).find((x) => x.kind !== "unattached" && x.state === "waiting" && card(x));
-    const n = t ? null : arr(v.nodes).find((x) => x.state === "waiting" && card(x));
-    return t ? card(t) : n ? card(n) : null;
-  }
+  // Whether the Work lens's "waiting on you" figure can be a way to the Needs strip: the page hands `opts.openNeeds` (go to the strip's own first card) and
+  // `opts.canOpenNeeds` (the live strip holds a waiting card on screen right now), and the frame is live: a replayed frame (`opts.still`) is the past, and the
+  // strip shows the present, so there the figure stays plain. The topology's own card ids are not consulted: the strip is asked, not the topology.
+  const needsJump = (opts) => !!opts && !opts.still && typeof opts.openNeeds === "function" && typeof opts.canOpenNeeds === "function" && !!opts.canOpenNeeds();
   // the tasks the Work lens draws as cards (a pending consent / question record is none: the Needs strip lists it), and the unattached work it draws last:
   // ONE predicate for the lens's cards and for the strip's task counts, so the figures above the list are the list's own
   const drawnTask = (t) => t.kind !== "unattached" && t.kind !== "consent" && t.kind !== "question";
@@ -424,15 +420,16 @@
       s.append(el("b", null, num), " " + word);
       return s;
     };
-    // a button (Enter and Space are the browser's own) only while something waits and a card names where to go; otherwise the plain figure
-    const wn = waitingOnYou(v), wcard = wn && opts && typeof opts.openCard === "function" ? waitingCard(v) : null;
-    const waiting = stat("waiting", wn, "waiting on you", wn ? "hot" : "", wcard ? "button" : "span");
+    // a button (Enter and Space are the browser's own) only while something waits and the live Needs strip holds a card to go to; otherwise the plain figure
+    const wn = waitingOnYou(v), jump = wn && needsJump(opts);
+    const waiting = stat("waiting", wn, "waiting on you", wn ? "hot" : "", jump ? "button" : "span");
     waiting.title = "Counts " + WAITING_TIP;
-    if (wcard) {
+    if (jump) {
       waiting.type = "button";
       waiting.classList.add("tv-jump");
-      waiting.title = "Go to the first one in the Needs strip. Counts " + WAITING_TIP;
-      waiting.addEventListener("click", () => opts.openCard(wcard));
+      waiting.title = "Go to the first card in the Needs strip. Counts " + WAITING_TIP;
+      // the strip may have moved since this was drawn: a jump it cannot make draws the lens again, and the figure is plain
+      waiting.addEventListener("click", () => { if (!opts.openNeeds() && typeof opts.repaint === "function") opts.repaint(); });
     }
     row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), waiting, stat("tasks-waiting", n("waiting"), n("waiting") === 1 ? "task waiting" : "tasks waiting"));
     if (n("failed")) row.appendChild(stat("failed", n("failed"), "failed", "bad"));
@@ -636,8 +633,9 @@
     }
     if (!centre.length) {
       // nothing drawn: when asks wait on you, they are in the Needs strip (the figure above is the way there), so the sentence says that, not "no records"
+      // (unattached work is in `centre`, so this line never sits under a card it denies); "in the Needs strip" only where the figure above is the way there
       const wn = waitingOnYou(v);
-      wrap.appendChild(el("p", "tv-none tv-no-tasks", wn ? "No task is running or listed here; " + wn + " waiting on you, in the Needs strip." : "No task records and no active work."));
+      wrap.appendChild(el("p", "tv-none tv-no-tasks", wn ? "No task is running or listed here; " + wn + " waiting on you" + (needsJump(opts) ? ", in the Needs strip." : ".") : "No task records and no active work."));
     }
     heads[1].hidden = !centre.some((t) => arr(t.outcomes).length);
     wrap.classList.toggle("tv-noouts", heads[1].hidden);        // no outcomes anywhere: the second column gives its width back
@@ -1996,6 +1994,7 @@
 
   // ---- the body ----
   // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to, openLoop(sporeId): open an open loop's row,
+  // openNeeds(): go to the live Needs strip's first card (true when it went), canOpenNeeds(): the strip holds one on screen now (the Work lens's "waiting on you" button needs both),
   // replay: {readJson(url, signal), resume()} when the panel head says `replay: true`}
   function render(v, opts) {
     const o0 = opts || {};
@@ -2011,7 +2010,7 @@
     if (o.replay && R.at !== null) w.dataset.rat = isoMin(R.at);
     if (o.replay && replaying()) w.dataset.rshown = past && R.cat !== null ? isoMin(R.cat) : "live";
     const bar = el("div", "tv-bar");
-    bar.append(o0.lensSeg || el("span"), which === "agents" ? metricsStrip(v) : stripWork(v, o0));
+    bar.append(o0.lensSeg || el("span"), which === "agents" ? metricsStrip(v) : stripWork(v, o));      // `o`, not `o0`: a replayed frame carries `still`, and its figure is not a way to the live strip
     w.appendChild(bar);
     const conf = conflictList(v);
     if (conf) w.appendChild(conf);
