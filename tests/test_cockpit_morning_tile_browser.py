@@ -27,14 +27,16 @@ ITEMS = [
 TILE = 'document.querySelector("[data-ck-panel=coord-morning]")'
 
 
-def _flow_like_read(ctx):
-    # flow's title is "kind: words" cut by the kernel; the whole text rides in the body
-    rows = tuple(RowIn(id=f"dream:{n}", title=f"{k}: {t[:60]}", body=t, facets={"legacy_meta": m}, stored={"id": str(n), "kind": k})
-                 for n, (k, t, m) in enumerate(ITEMS))
-    return Read(rows=rows, note=NOTE)
+def _flow_like_read_with(note):
+    def read(ctx):
+        # flow's title is "kind: words" cut by the kernel; the whole text rides in the body
+        rows = tuple(RowIn(id=f"dream:{n}", title=f"{k}: {t[:60]}", body=t, facets={"legacy_meta": m}, stored={"id": str(n), "kind": k})
+                     for n, (k, t, m) in enumerate(ITEMS))
+        return Read(rows=rows, note=note)
+    return read
 
 
-def test_a_count_tile_is_a_count_and_its_modal_draws_markdown(tmp_path, monkeypatch):
+def _drive_tile(tmp_path, monkeypatch, note):
     monkeypatch.setattr(morning, "card", lambda store: {"away": {"claude_code": {"away": False}, "codex": {"away": None}}, "undecided": [],
                                                        "budgets": [], "waiting": {"threads": {}, "loose": [], "unresolved": []},
                                                        "delivery_ran": None, "errors": []})
@@ -44,7 +46,7 @@ def test_a_count_tile_is_a_count_and_its_modal_draws_markdown(tmp_path, monkeypa
         disc = orig(*a, **k)
 
         def d2(ctx):
-            return [dataclasses.replace(sp, title="Desk morning card", region="widgets", rank=0, face="count", read=_flow_like_read,
+            return [dataclasses.replace(sp, title="Desk morning card", region="widgets", rank=0, face="count", read=_flow_like_read_with(note),
                                         facets=frozenset({"legacy_meta"}), search_fields=("title", "body")) if sp.id == dp.MORNING_ID else sp
                     for sp in disc(ctx)]
         return d2
@@ -74,8 +76,12 @@ def test_a_count_tile_is_a_count_and_its_modal_draws_markdown(tmp_path, monkeypa
     ]
     with _serve(src, install_class="reported") as (url, _httpd):
         got = _drive(tmp_path, url, steps)
-    tile = next(v for v in got["values"] if isinstance(v, dict) and "subs" in v)
-    modal = next(v for v in got["values"] if isinstance(v, dict) and "strong" in v)
+    return (next(v for v in got["values"] if isinstance(v, dict) and "subs" in v),
+            next(v for v in got["values"] if isinstance(v, dict) and "strong" in v))
+
+
+def test_a_count_tile_is_a_count_and_its_modal_draws_markdown(tmp_path, monkeypatch):
+    tile, modal = _drive_tile(tmp_path, monkeypatch, NOTE)
     # the face: the count and the provider's note, never a row's words (it was 844 px with the first row whole)
     assert tile["subs"] == [NOTE], tile
     assert "**" not in tile["text"] and "FLOW BECOMES" not in tile["text"], tile
@@ -85,3 +91,13 @@ def test_a_count_tile_is_a_count_and_its_modal_draws_markdown(tmp_path, monkeypa
     assert [m.split(" · ")[0] for m in modal["meta"]] == ["contradiction", "felt", "pattern"], modal
     assert modal["toggles"] == [True, True, True] and modal["clamp"] == "2", modal
     assert modal["dates"] == 2, modal      # the two dates in the first row: a date inside a markdown row never breaks at its hyphens
+
+
+def test_a_count_tile_with_no_note_names_its_first_row_as_one_clean_line(tmp_path, monkeypatch):
+    tile, _modal = _drive_tile(tmp_path, monkeypatch, "")
+    # no note: the first row, paired markers dropped, cut at a word within the tile's character cap, then the count of the rest
+    assert len(tile["subs"]) == 1, tile
+    line = tile["subs"][0]
+    assert line.endswith("\u2026 +2 more") and "**" not in line and "FLOW BECOMES A LEVAIN INSTALL" in line, tile
+    assert len(line) <= 90 + len(" +2 more"), tile
+    assert tile["h"] < 260, tile

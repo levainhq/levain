@@ -1209,17 +1209,17 @@
   // the static caps allow); `s.units` is how many it could draw, `s.hidden` how many it does not (a "+N more" line), `s.clamp` whether
   // a run of text had to be cut to two lines. fitWidget() finds the budget that fits the tile's real height.
   const moreNote = (host, n) => { if (n > 0) host.appendChild(el("div", "xnote", "+" + n + " more")); };
-  // F5 (a): a count tile that holds rows names what is in front, not only how many. Decisions names the top item the strip draws
-  // first (levain-needs, dashboard_core.js, orders both); Sessions says live and quiet and names the busiest.
-  // A tile line is one reading of provider words: paired markdown markers and code ticks drop out (a tile draws text, never markup), a
-  // link keeps its words, whitespace collapses, and a line past `max` characters ends at a word with an ellipsis. The full text is the modal's.
+  // A tile line is one reading of provider words: PAIRED markdown markers (bold, italic, code ticks) drop out and a lone one stays as written (a tile draws text, never markup; the modal's
+  // renderer reads the same pairs), a link keeps its words, whitespace collapses, and a line past `max` characters ends at a word with an ellipsis. The full text is the modal's.
   const TILE_NOTE_CHARS = 160, TILE_ITEM_CHARS = 90;
   function plainLine(text, max) {
-    const s = String(text == null ? "" : text).replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\*\*|__|\*|`/g, "").replace(/\s+/g, " ").trim();
+    const s = String(text == null ? "" : text).replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/\*\*([^*]+?)\*\*|__([^_]+?)__|\*([^*\s][^*]*?)\*|`([^`]*)`/g, (m, a, b, c, d) => a || b || c || d || "").replace(/\s+/g, " ").trim();
     if (s.length <= max) return s;
     const cut = s.slice(0, max), sp = cut.lastIndexOf(" ");
     return (sp > max / 2 ? cut.slice(0, sp) : cut).replace(/[\s,;:.·-]+$/, "") + "…";
   }
+  // F5 (a): a count tile that holds rows names what is in front, not only how many. Decisions names the top item the strip draws
+  // first (levain-needs, dashboard_core.js, orders both); Sessions says live and quiet and names the busiest.
   function glanceFace(d, n, host) {
     const N = root.LevainNeeds;
     if (d.pid === "decisions" && n && N && Array.isArray(d.lines)) {
