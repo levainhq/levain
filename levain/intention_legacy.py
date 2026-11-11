@@ -72,6 +72,11 @@ KEEP_PLAN_ID_KEY = 'spore_id'
 KEEP_PLAN_DEST_KIND = 'spore'
 KEEP_EPISODE_META_KEY = 'spore'
 
+# The stored disposition an old release wrote, to the word that replaced it (ruling D2/H8). A signed op or a keep-migrate
+# plan an old release made can name `seed`; the code that replays or applies it reads it as `someday`. A reader of history
+# only: a NEW write naming `seed` is refused (`levain.intentions.RETIRED_SEED_MSG`).
+OLD_DISPOSITION_TO_NEW = {'seed': 'someday'}
+
 # The seed document an old install holds. `levain update` recognises the old copy by its released hashes, which are keyed
 # by the old path (ruling H6).
 OLD_SEED_DOC = 'seed/spore_instructions.md'

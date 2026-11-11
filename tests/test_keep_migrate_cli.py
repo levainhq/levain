@@ -98,7 +98,7 @@ def _open_rows(install: Path) -> list[dict]:
 def test_apply_and_revert_refuse_dry_run_options(install: Path, capsys):
     for mode in ("--apply", "--revert"):
         assert main(["intentions", "keep-migrate", "--path", str(install), mode, "p.json",
-                     "--handoff-to", "seed"]) == 1
+                     "--handoff-to", "someday"]) == 1
         assert "cannot be combined" in capsys.readouterr().err
 
 

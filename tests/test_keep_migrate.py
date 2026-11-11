@@ -96,11 +96,11 @@ def test_routing_per_frame(env: Env):
     assert gotcha["episode_type"] == "observation" and "durable-fact" in gotcha["tags"] \
         and "keep-migrated" in gotcha["tags"] and "— cues:" in gotcha["body"] and "bit me twice" in gotcha["body"]
     assert by["decided: the pace floor is 4"]["destination"]["episode_type"] == "decision"
-    assert by["remember to renew the domain"]["destination"]["disposition"] == "seed"
+    assert by["remember to renew the domain"]["destination"]["disposition"] == "someday"
     purple = by["purple"]
     assert purple["destination"]["episode_type"] == "observation" and "nothing lost" in purple["why"]
-    assert by["pick up the Liz thread"]["destination"]["disposition"] == "seed"
-    assert by["an undated agenda"]["destination"]["disposition"] == "seed"
+    assert by["pick up the Liz thread"]["destination"]["disposition"] == "someday"
+    assert by["an undated agenda"]["destination"]["disposition"] == "someday"
 
 
 def test_handoff_to_agenda_needs_a_date(env: Env):
@@ -112,7 +112,7 @@ def test_handoff_to_agenda_needs_a_date(env: Env):
 
 def test_counts_and_doctor_line(env: Env):
     assert km.pending_counts(env.intentions) == {"notes": 4, "handoffs": 1, "agendas": 1}
-    assert km.doctor_line(env.intentions) == "keep: 4 notes / 1 handoffs await migration (+ 1 undated agendas to seeds)"
+    assert km.doctor_line(env.intentions) == "keep: 4 notes / 1 handoffs await migration (+ 1 undated agendas to someday)"
     p = _plan(env)
     km.apply(p, episodic_db=env.db)
     assert km.pending_counts(env.intentions) == {"notes": 0, "handoffs": 0, "agendas": 0}
@@ -131,7 +131,7 @@ def test_apply_then_revert_round_trips_the_open_set(env: Env):
     assert ("an ordinary loop", (), None) in after and ("a DATED agenda stays", (), "agenda") in after
     # the migrated seeds carry the original's notes verbatim
     assert ("pick up the Liz thread", tuple(next(i for i in km.load_plan(p)["items"]
-                                               if i["text"] == "pick up the Liz thread")["notes"]), "seed") in after
+                                               if i["text"] == "pick up the Liz thread")["notes"]), "someday") in after
     rv = km.revert(p, episodic_db=env.db)
     assert len(rv.reverted) == 6
     assert env.open_set() == original                                   # (text, notes, disposition), notes verbatim
@@ -179,9 +179,9 @@ def test_crash_between_destination_and_compost_loses_nothing(env: Env, stage: st
     eps = env.episodes()
     assert len(eps) == 3                                      # gotcha, decision, the unplaced note: none doubled
     assert len({e.id for e in eps}) == len(eps)
-    seeds = [r for r in env.plain().list_open() if r.get("disposition") == "seed"]
+    seeds = [r for r in env.plain().list_open() if r.get("disposition") == "someday"]
     assert sorted(r["text"] for r in seeds) == sorted(
-        ["a live seed", "remember to renew the domain", "pick up the Liz thread", "an undated agenda"])
+        ["remember to renew the domain", "pick up the Liz thread", "an undated agenda"])
     rv = km.revert(p, episodic_db=env.db)
     assert env.open_set() == original and env.episodes() == []
 
@@ -281,7 +281,7 @@ def test_scheduling_an_undated_agenda_after_the_plan_makes_it_stale(env: Env):
     assert _open_row(env, "an undated agenda")["disposition"] == "agenda"
     assert _open_row(env, "an undated agenda")["next"] == "2030-06-01"
     assert not [r for r in env.plain().list_open()
-                if r["text"] == "an undated agenda" and r.get("disposition") == "seed"]
+                if r["text"] == "an undated agenda" and r.get("disposition") == "someday"]
 
 
 def test_an_edit_between_the_compare_and_the_compost_is_not_composted(env: Env):
@@ -351,7 +351,7 @@ def test_intention_destinations_carry_the_agenda_fields_and_the_age(env: Env):
     p = _plan(env)
     km.apply(p, episodic_db=env.db)
     seed = _open_row(env, "a targeted handoff")
-    assert seed["disposition"] == "seed" and seed["id"] != h["id"]
+    assert seed["disposition"] == "someday" and seed["id"] != h["id"]
     assert seed.get("target") == "alice" and seed.get("attention") == "high" \
         and seed.get("germinated") == {"on": "2026-10-01"}
     assert _open_row(env, "an undated agenda")["created"] == "2025-01-02"
@@ -373,11 +373,11 @@ def test_crash_on_a_intention_destination_retries_once(env: Env, stage: str):
     rep = km.apply(p, episodic_db=env.db)
     assert idx in rep.applied
     liz = [r for r in env.plain().list_open() if r["text"] == "pick up the Liz thread"]
-    assert len(liz) == 1 and liz[0]["disposition"] == "seed"
+    assert len(liz) == 1 and liz[0]["disposition"] == "someday"
     assert liz[0]["notes"] == km.load_plan(p)["items"][idx]["notes"]
-    seeds = [r for r in env.plain().list_open() if r.get("disposition") == "seed"]
+    seeds = [r for r in env.plain().list_open() if r.get("disposition") == "someday"]
     assert sorted(r["text"] for r in seeds) == sorted(
-        ["a live seed", "remember to renew the domain", "pick up the Liz thread", "an undated agenda"])
+        ["remember to renew the domain", "pick up the Liz thread", "an undated agenda"])
     km.revert(p, episodic_db=env.db)
     assert env.open_set() == original
 
@@ -395,7 +395,7 @@ def test_a_note_added_to_a_crashed_destination_survives_the_retry(env: Env):
     with pytest.raises(Boom):
         km.apply(p, episodic_db=env.db, fault=fault)
     seed = next(r for r in env.plain().list_open()
-                if r["text"] == "pick up the Liz thread" and r.get("disposition") == "seed")
+                if r["text"] == "pick up the Liz thread" and r.get("disposition") == "someday")
     env.plain().update(seed["id"], add_note="added to the seed after the crash")
     rep = km.apply(p, episodic_db=env.db)
     assert idx in rep.applied
@@ -450,7 +450,7 @@ def _edit_destination_on_read(monkeypatch, env: Env, text: str) -> list:
 
         def get_then_edit(sid):
             row = get(sid)
-            if row is not None and row.get("text") == text and row.get("disposition") == "seed" \
+            if row is not None and row.get("text") == text and row.get("disposition") == "someday" \
                     and row.get("status") == "open" and not hits:
                 hits.append(sid)
                 env.plain().update(sid, add_note="edited mid-revert")
@@ -475,7 +475,7 @@ def test_a_destination_edited_mid_revert_is_retried_not_marked_reverted(env: Env
     assert idx not in rep.reverted and any(i == idx for i, _ in rep.skipped)
     assert km.load_plan(p)["items"][idx]["state"] == km.STATE_REVERT_BLOCKED
     assert [r for r in env.plain().list_open() if r["text"] == "pick up the Liz thread"
-            and r.get("disposition") == "seed"]                        # the destination is still open
+            and r.get("disposition") == "someday"]                        # the destination is still open
     again = km.revert(p, episodic_db=env.db)                            # a later revert retries it
     assert idx in again.reverted
     liz = [r for r in env.plain().list_open() if r["text"] == "pick up the Liz thread"]
@@ -502,7 +502,7 @@ def test_an_original_deleted_outside_the_plan_is_not_resurrected(env: Env):
     rep = km.revert(p, episodic_db=env.db)
     assert idx not in rep.reverted and any(i == idx for i, _ in rep.skipped)
     liz = [r for r in env.plain().list_open() if r["text"] == "pick up the Liz thread"]
-    assert len(liz) == 1 and liz[0]["disposition"] == "seed"           # not resurrected; the copy is kept
+    assert len(liz) == 1 and liz[0]["disposition"] == "someday"           # not resurrected; the copy is kept
     assert km.load_plan(p)["items"][idx]["state"] == km.STATE_REVERT_BLOCKED
 
 
