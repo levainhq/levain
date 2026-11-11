@@ -153,7 +153,7 @@ def _isolate_activation_env(monkeypatch):
     monkeypatch.delenv("LEVAIN_SCOPE", raising=False)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     # Same shape for the floor: `ANNEAL_MEMORY_DERIVE_TRUST` adds write-denies to every policy
-    # build_policy assembles (spore-1308), so a shell that sets it would grade the floor tests.
+    # build_policy assembles (intention-1308), so a shell that sets it would grade the floor tests.
     monkeypatch.delenv("ANNEAL_MEMORY_DERIVE_TRUST", raising=False)
     # A test that runs the template session_start.py in place would otherwise spawn a detached
     # auto-memory sweep rooted at levain/templates/ (measured: it wrote .levain/ state there).
@@ -360,7 +360,7 @@ _RUN_SEAT_AT_IMPORT = os.environ.get("LEVAIN_SEAT")
 
 @pytest.fixture(autouse=True)
 def _reset_entity_process_latch():
-    """`$LEVAIN_ENTITY_PROCESS` is a one-way latch by design (spore-438): opening an entity sets it
+    """`$LEVAIN_ENTITY_PROCESS` is a one-way latch by design (intention-438): opening an entity sets it
     and nothing in levain clears it, because nothing should. A test process opens many entities, so
     without this every later test would run as an entity process. Both halves (the in-process flag
     and the env var) are reset here, and only here. Popped by hand both sides:

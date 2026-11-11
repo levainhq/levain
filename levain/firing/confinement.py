@@ -1,6 +1,6 @@
 """levain.firing.confinement — the OS-sandbox confinement floor for a sovereign entity's HANDS.
 
-STEP (spore-303, rescoped 2026-07-10 → spore-311): the sovereign ``levain run`` entity becomes a
+STEP (intention-303, rescoped 2026-07-10 → intention-311): the sovereign ``levain run`` entity becomes a
 complete CC/Codex REPLACEMENT — a stateful networked shell that works on the operator's REAL repos,
 not a workspace jail. The file-editor slice (step 6) confined the entity's file hands IN-PROCESS;
 bash cannot be confined that way (a persistent host shell's ``cd ~`` / absolute paths escape any
@@ -32,7 +32,7 @@ it needed an empirically-hunted "system allow-set"; a default-ALLOW profile need
     agent-mode round-trip 2026-07-12 (real ``ssh -T git@github.com`` auth + ``git ls-remote``, raw key
     read denied) confirmed agent-mode is tight AND functional, so raw is genuinely only a fallback.
   - the ssh persistence/exec vectors ``~/.ssh/{authorized_keys,authorized_keys2,config,rc}`` WRITE —
-    denied in BOTH ssh_modes (slice 3, spore-322): a planted key (sshd honours it), a ``ProxyCommand``/
+    denied in BOTH ssh_modes (slice 3, intention-322): a planted key (sshd honours it), a ``ProxyCommand``/
     ``Match exec`` in ``config`` (the operator's next ssh runs it), or an ``rc`` hook (sshd runs it on
     login) is code the operator/sshd runs LATER — a persistent backdoor, zero legit entity use. Rendered
     write-ONLY (raw-mode ~/.ssh reads still work), AND ~/.ssh's dir anchor — the LEXICAL path, so even a
@@ -115,12 +115,12 @@ is tabulated above :func:`_bwrap_argv`.
     broad non-jewel authority. ⚠ **The K3 efferent gate does NOT bound this one** — it halts actions
     BEFORE they run, and a setsid survivor is already running. Since K4a ships scheduled seats, the
     old "human-in-the-loop bounds it now" is FALSE for an unattended seat: there is no human. The
-    per-domain network policy (``spore-417``) remains the real answer.
+    per-domain network policy (``intention-417``) remains the real answer.
   - NETWORK EXFIL of non-crown-jewel data: default-allow network + broad read means anything not
     crown-jeweled is exfiltratable — the SAME risk profile as CC. Mitigation is now the K3 gate for
     a GATED drive (bash is always efferent, so an exfil attempt halts before it runs) plus
     human-in-the-loop where a human is present — but NEITHER covers an ``efferent_gate: "ungated"``
-    seat or a setsid survivor. Per-domain network gating is ``spore-417`` (NOT spore-295, which
+    seat or a setsid survivor. Per-domain network gating is ``intention-417`` (NOT intention-295, which
     shipped as the gate and has composted).
   - IPC / LOCALHOST SIDE CHANNELS (apparatus L2, confirmed): default-allow leaves mach + loopback
     open, so the entity can drive an EXISTING unsandboxed daemon (``pbcopy``/``pasteboardd``) or hit a
@@ -132,15 +132,15 @@ is tabulated above :func:`_bwrap_argv`.
     in the outside control); ``launchctl print`` still answers, so launchd is reachable but will not
     create jobs for a sandboxed caller. Other routes to an unsandboxed process (Apple Events to an
     app, say) were not tried.
-    Same class as network-exfil: gated-drive halt + human-in-the-loop where present, ``spore-417``
+    Same class as network-exfil: gated-drive halt + human-in-the-loop where present, ``intention-417``
     for the per-domain policy. ⚠ An unattended seat has no human in this class either.
     ⛔ sshd ON THIS HOST IS THE SHARPEST INSTANCE OF THIS CLASS, AND ``ssh_mode="agent"`` MAKES IT
-    WORSE, NOT TIGHTER (spore-755, REPRODUCED end to end 2026-09-13 on 0.4.5 and HEAD). Agent-mode
+    WORSE, NOT TIGHTER (intention-755, REPRODUCED end to end 2026-09-13 on 0.4.5 and HEAD). Agent-mode
     forwards ``SSH_AUTH_SOCK`` by design; so with Remote Login on and a key the agent holds in
     ``authorized_keys``, ``ssh localhost cat <jewel>`` has sshd — unsandboxed, root — read a file the
     floor denies, authorised by the very socket agent-mode forwards. The forwarded agent socket is
     the SOLE carrier (disable it and the attack fails "Permission denied (publickey)"; the key FILE
-    stays floor-denied). This is spore-725's "a floor that forwards a credential to an unsandboxed
+    stays floor-denied). This is intention-725's "a floor that forwards a credential to an unsandboxed
     root reader is decorative for that file" applied one step over, and it reaches the host by ANY of
     its own addresses (loopback AND the LAN IP — seatbelt's ``localhost`` keyword covers every
     local-interface address), not loopback only. CLOSED for the FRESH-CONNECTION case in BOTH
@@ -153,7 +153,7 @@ is tabulated above :func:`_bwrap_argv`.
     ⚠ RESIDUAL for 0.5 — raw mode still lets the entity READ the operator's ~/.ssh key material
     directly (worse than the agent socket, which never yields the key). The loopback deny stops that
     key reaching a LOCAL sshd, but not a remote one; the 0.5 redesign (default F / D2, and retiring or
-    redefining raw mode as scoped-credential-only) is the real fix. See spore-1005.
+    redefining raw mode as scoped-credential-only) is the real fix. See intention-1005.
     ⛔ RESIDUAL, NOT CLOSED — THE FORWARDED AGENT IS A SIGNING ORACLE (codex L3 HIGH#2, and this is
     the deepest limit). It signs for ANY sshd that authorises the agent's key, reached through ANY hop
     the floor allows. A REMOTE relay defeats the localhost deny entirely: ``ssh -o ProxyCommand='ssh
@@ -163,8 +163,8 @@ is tabulated above :func:`_bwrap_argv`.
     deny; the real closures are agent MEDIATION (destination/host-key constraints) or not forwarding
     the agent. ⚠ On THIS machine the precondition is currently absent — ~/.ssh/authorized_keys does
     not authorise the agent's key (MEASURED 2026-09-13) — but that is a fact about this Mac, not the
-    class. Tracked in spore-1005.
-    ⚠ RESIDUAL, NOT CLOSED — ssh CONNECTION MULTIPLEXING (spore-755 follow-up, REPRODUCED
+    class. Tracked in intention-1005.
+    ⚠ RESIDUAL, NOT CLOSED — ssh CONNECTION MULTIPLEXING (intention-755 follow-up, REPRODUCED
     2026-09-13). If a ssh ControlMaster/mux socket to LOCALHOST already exists (operator runs
     ``ControlMaster auto``/``yes`` and has a live master to this host) and the entity can NAME the
     ControlPath (it may read ``~/.ssh/config`` in agent mode, or guess a default/tmp path), then
@@ -177,11 +177,11 @@ is tabulated above :func:`_bwrap_argv`.
     exempting that socket's literal did NOT restore resolution), so it is not the default. The
     practical precondition is narrow — ssh multiplexing to LOCALHOST specifically is rare. Scoped
     closure (a resolver-preserving deny, or forcing ``ControlPath=none`` in the entity's own ssh
-    invocation) is a follow-up; see the handoff spore.
+    invocation) is a follow-up; see the handoff intention.
   - CROWN-JEWEL DIRECTORY NAMES leak: ``ls ~`` lists ``.anneal-memory`` as a NAME (the parent's
     metadata is allowed; the subtree's CONTENTS + the jewel dir's own stat are denied). Names are
     already public; informational.
-  - FLOOR-EXPANSION (spore-322, ratified 2026-07-12): ``~/.ssh/authorized_keys`` WRITE is now in
+  - FLOOR-EXPANSION (intention-322, ratified 2026-07-12): ``~/.ssh/authorized_keys`` WRITE is now in
     the UNIVERSAL floor (:data:`_SSH_AUTHORIZED_KEYS`, both ssh_modes — a persistence backdoor with zero
     legit use, so it is folded unconditionally). The other default-allow-readable standard cred stores
     — :data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES` (a GitHub token = repo push/admin) — are ≥
@@ -214,7 +214,7 @@ differently per drive:
 ⚠ **UNATTENDED OPERATION IS NOW A v1 CLAIM** (K4a — ``levain daemon install-seat`` runs a governed
 seat on a schedule). This paragraph used to say the opposite, and said it correctly while the gate
 was still a spec. What remains ABSENT is not the gate but the per-domain threshold POLICY
-(``spore-417``): the stakes/context escalators, capability recalibration, and a graduation tier of
+(``intention-417``): the stakes/context escalators, capability recalibration, and a graduation tier of
 the gate's own. **Nothing graduates without the operator's explicit ratification; everything efferent
 gates** (a standing grant's posture is loosened only as a re-ratification the operator applies: a new
 sealed grant replacing the old, :mod:`levain.autonomic.graduation`). So v1 = **structural
@@ -350,7 +350,7 @@ _GNUPG_CONF_WRITE_DENIED = (
 # The entity's OWN store files under ``<entity>/.levain/``, WRITE-denied to its confined hands (read
 # stays allowed). anneal writes these IN THE HOST PROCESS (capture/wrap), never through the sandboxed
 # shell, so the deny fences only the entity's own hands — not the legitimate composer. Load-bearing
-# because spore-359 folds ``memory.continuity.md`` into the always-loaded system suffix and per-turn
+# because intention-359 folds ``memory.continuity.md`` into the always-loaded system suffix and per-turn
 # recall reads ``memory.crystal.json``; ``memory.db`` is the episodic source the wrap consolidates FROM.
 # A raw self-write to any of them is a poison-the-next-session vector that bypasses the GOVERNED wrap
 # path. (Said "human-gated" until K4a [6]: a seat may now wrap UNATTENDED — bounded, and structurally
@@ -377,7 +377,7 @@ _OWN_MEMORY_FILENAMES = (
 # ``deny_standard_creds: false``. They are >= the ssh key in impact (a gh token = repo push/admin; aws
 # creds = infra/$), which is why the drive layer denies them by default. ``~/.config/gh`` is a DIR (the token
 # lives in ``hosts.yml``) → a denied subtree; ``credentials`` / ``.netrc`` are files.
-# The Keychain's mach services (spore-1245). SecurityServer + securityd.xpc were MEASURED to carry the
+# The Keychain's mach services (intention-1245). SecurityServer + securityd.xpc were MEASURED to carry the
 # reads (denying them refused `security -w` and the osxkeychain helper); systemkeychain is Apple's
 # separate System-keychain endpoint (codex L3), denied by name, not exercised.
 _KEYCHAIN_MACH_SERVICES = (
@@ -1071,7 +1071,7 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
     pins = tuple(sorted(_dedup_paths([*root_t, *links, *_write_deny_ancestors(pin_sources)]), key=str))
     return root_t, dir_t, file_t, pins
 
-# CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
+# CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (intention-725).
 #
 # ⛔ A REACHABLE CONTAINER DAEMON IS A TOTAL BYPASS OF EVERYTHING ELSE IN THIS MODULE, and it
 # was CONFIRMED END-TO-END on the shipping build (2026-09-03, re-reproduced independently
@@ -1099,7 +1099,7 @@ def _persistence_agent_paths(home: Path, workspace: Path) -> tuple[
 # pin it, receive the rename- and ancestor-denies, and get **no connect protection at all while
 # believing it closed** — a false closure, which is worse than a known gap.
 # ⛔ AND THE ENUMERATION IS A **SPAWN-TIME SNAPSHOT** — WAS A BUILD-TIME ONE, WHICH WAS THE
-# codex L3 HIGH OF 2026-09-04 (CONFIRMED BY EXECUTION, FIXED HERE — spore-768). ``deny_sockets``
+# codex L3 HIGH OF 2026-09-04 (CONFIRMED BY EXECUTION, FIXED HERE — intention-768). ``deny_sockets``
 # stores each path RESOLVED. If a listed path is ABSENT at resolution it resolves to itself; if
 # something later creates it as a symlink to an UNLISTED target, ``connect()`` canonicalises to that
 # target — absent from the set — and a lexical ``network-outbound`` literal is MEASURED INERT.
@@ -1748,7 +1748,7 @@ class CrownJewelsPolicy:
     # the floor is itself floor-protected (read+write denied), so the entity can't rewrite its own jail
     # (apparatus L1 — confinement.json lives in the entity-writable .levain/; a self-authored
     # ssh_mode="raw" / emptied deny_files would weaken the NEXT session's operator-declared floor).
-    deny_sockets: tuple[Path, ...] = ()  # container/VM DAEMON sockets, RESOLVED (spore-725).
+    deny_sockets: tuple[Path, ...] = ()  # container/VM DAEMON sockets, RESOLVED (intention-725).
     # ⛔ A SEPARATE FIELD FROM ``deny_files`` ON PURPOSE, AND THE REASON IS THE WHOLE FINDING:
     # the two need DIFFERENT RENDERING VERBS. A seatbelt ``file-read* file-write*`` deny does
     # NOT block ``connect()`` to a unix socket — MEASURED 2026-09-04: with both docker socket
@@ -1794,7 +1794,7 @@ class CrownJewelsPolicy:
     # plus `deny_write_files` (both spellings, arms ii/iii).
     own_memory_files: tuple[Path, ...] = ()   # <entity>/.levain/memory.{continuity.md,crystal.json,db}
     # — the entity's OWN consolidated memory, crystal store, and episodic store: WRITE-denied (read
-    # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because spore-359 folds
+    # stays allowed on the seatbelt hand → the entity can `cat` its own memory), because intention-359 folds
     # memory.continuity.md into the always-loaded system_message_suffix and per-turn recall reads
     # memory.crystal.json — so a raw file-write by the entity's OWN confined hands would poison the
     # highest-trust surface on a FUTURE session, BYPASSING the GOVERNED `levain wrap` (said
@@ -1818,7 +1818,7 @@ class CrownJewelsPolicy:
     # this field exists rather than re-reading `_CONTAINER_DAEMON_SOCKETS` at spawn: the opt-out
     # must survive into the refresh, and inferring it from an empty `deny_sockets` would be a proxy.
     #
-    # ⛔ WHY A SEPARATE FIELD AT ALL — THE TOCTOU (codex L3 HIGH, 2026-09-04; spore-768).
+    # ⛔ WHY A SEPARATE FIELD AT ALL — THE TOCTOU (codex L3 HIGH, 2026-09-04; intention-768).
     # `deny_sockets` is RESOLVED, and this policy is built at TOOL-CREATION time while the confined
     # shell is spawned LAZILY afterwards (`SandboxedBashExecutor._ensure_shell`) and RE-spawned
     # after every `exit`/reset. A path resolved when the shell does not yet exist can stop being
@@ -1840,13 +1840,13 @@ class CrownJewelsPolicy:
     # targeted network deny is `deny_localhost_outbound` below — WIRED (it renders and enforces),
     # not an `allow_network`-style promise, and off by default so the connect-to-self side-channel
     # is closed only where a drive-layer caller opts in.
-    deny_keychain: bool = False   # macOS: deny the Keychain services (spore-1245), set from the SAME
+    deny_keychain: bool = False   # macOS: deny the Keychain services (intention-1245), set from the SAME
     # resolved switch as the standard cred stores (``deny_standard_creds``: denied by default in every
     # drive, the interactive REPL included, per-entity overridable), so ``false`` reopens both together.
     # Measured 2026-10-01 from inside the confined shell, before this flag:
     # ``security find-generic-password -w`` and ``git credential-osxkeychain get`` both read secrets.
     # No Linux counterpart is rendered: no Secret Service existed on any host available to test.
-    deny_localhost_outbound: bool = False  # deny outbound connect() to THIS host — the spore-755
+    deny_localhost_outbound: bool = False  # deny outbound connect() to THIS host — the intention-755
     # class, for a FRESH connection. If this host runs sshd (Remote Login) and it authorises a key
     # the entity can use, ``ssh localhost cat <jewel>`` has sshd — root, OUTSIDE the sandbox — read a
     # file the floor denies. REPRODUCED end to end 2026-09-13 on 0.4.5 and HEAD. In ``ssh_mode="agent"``
@@ -1856,7 +1856,7 @@ class CrownJewelsPolicy:
     # (2026-09-13, 0.4.6 = A+B). codex L3 HIGH#1 REPRODUCED a raw-mode variant (the entity reads its own
     # key, but the OTHER jewels — ~/.anneal-memory, sibling stores, deny_files — stay floor-denied and
     # a local sshd reads THEM as root just the same), so both modes get the deny.
-    # Same class as the container-daemon socket (spore-725): a floor
+    # Same class as the container-daemon socket (intention-725): a floor
     # that denies the FILE but lets an unsandboxed root reader be reached is decorative for that file.
     # Renders ``(deny network-outbound (remote ip "localhost:*"))``.
     # ⚠ MEASURED SEMANTICS, not the name's face value: seatbelt's ``localhost`` keyword matches
@@ -1879,7 +1879,7 @@ class CrownJewelsPolicy:
     # or not forwarding the agent, not this deny. Also not covered: an off-interface address (NAT
     # hairpin to the router's external IP). And ssh CONNECTION MULTIPLEXING — a live localhost
     # ControlMaster socket the entity can name (AF_UNIX, unseen by this IP deny). Both tracked in
-    # spore-1005 / the honest-limits block above.
+    # intention-1005 / the honest-limits block above.
     sqlite_sidecars: tuple[Path, ...] = ()  # the ``-wal``/``-shm``/``-journal`` paths of every
     # non-directory jewel, a subset of ``deny_files``. A WAL-mode SQLite store keeps committed frames
     # that have not been checkpointed in ``<db>-wal``, so denying only the main file left them
@@ -1888,9 +1888,9 @@ class CrownJewelsPolicy:
     # spawn, so a jewel that is a SQLite database refuses bash there instead
     # (:func:`_refuse_plantable_sqlite_jewels`); bwrap mounts only the sidecars present at spawn.
     trust_spellings: tuple[Path, ...] = ()  # the derive-trust file's write-denied spellings
-    # (spore-1308) — MESSAGE CLASSIFICATION ONLY, like `socket_spellings`; enforcement is
+    # (intention-1308) — MESSAGE CLASSIFICATION ONLY, like `socket_spellings`; enforcement is
     # `deny_write_files`. ⚠ NEW FIELDS GO AT THE END: one inserted earlier shifts every later field
-    # for a positional caller (codex, L3 2026-10-02, reproduced; repeated by spore-1308's first cut,
+    # for a positional caller (codex, L3 2026-10-02, reproduced; repeated by intention-1308's first cut,
     # L1 2026-10-03). tests/test_floor_project_memory.py freezes the order.
     ro_tool_dirs: tuple[Path, ...] = ()  # the standard cred files' tool directories
     # (:data:`_CRED_TOOL_DIRS`, raw ``Path.home()`` spelling), set with ``deny_standard_creds``. Linux
@@ -1962,7 +1962,7 @@ DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 
 def _project_memory_jewels(home: Path) -> tuple[list[Path], list[Path], list[Path]]:
-    """The operator's PROJECT memory: ``(subtrees, trust_spellings, store_links)`` (spore-1308, ruled
+    """The operator's PROJECT memory: ``(subtrees, trust_spellings, store_links)`` (intention-1308, ruled
     2026-10-03, option A).
 
     ``~/.anneal-projects`` holds per-project anneal stores and, by the embedder's convention, the derive-trust
@@ -2060,7 +2060,7 @@ def _anneal_trusted_dbs(path: Path) -> list[str]:
 
 def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[Path]:
     """Directories of the project stores the operator's anneal trust files name, to deny read+write
-    (spore-1308 follow-on, ruled 2026-10-03: "yes for trust file thing").
+    (intention-1308 follow-on, ruled 2026-10-03: "yes for trust file thing").
 
     A store lives wherever its trust file's ``stores[].db`` points, so naming one directory does not
     cover a moved project home. Read at each policy build and each spawn (:func:`refresh_socket_denies`):
@@ -2080,7 +2080,7 @@ def _trust_listed_stores(home: Path, entity_dir: Path, workspace: Path) -> list[
     ⛔ A store whose directory cannot be denied as a whole REFUSES THE FLOOR (ConfinementError): the
     filesystem root, a top-level or temp directory, a directory that is or holds ``$HOME``, the entity or
     the workspace, or one inside the entity or workspace. anneal writes more than twenty names beside a
-    db (continuity, crystal, spores, temp files, backups, locks), new ones by rename, so a partial deny
+    db (continuity, crystal, intentions, temp files, backups, locks), new ones by rename, so a partial deny
     of those files would be a guard to be bypassed one name at a time; the store needs a directory of its
     own. Containment is decided by file identity, so a case- or link-variant spelling cannot dodge it.
     NOT covered: a trust file this process cannot locate (a flow home moved by
@@ -2521,7 +2521,7 @@ def build_policy(
             f"fail-closed. A truthy non-bool would DISABLE the container-socket floor "
             f"entirely (spore-725)."
         )
-    # Same boundary guard for the spore-755 opt-*in* deny. Unlike the flag above this one fails
+    # Same boundary guard for the intention-755 opt-*in* deny. Unlike the flag above this one fails
     # CLOSED (a truthy non-bool turns the deny ON, over-restrictive, not a bypass) — but passing the
     # STRING "false" would still flip a caller's intended OFF to ON and silently break localhost, so
     # the public boundary is held to the same bool contract (glm L3, 2026-09-13). `isinstance(True,
@@ -2690,7 +2690,7 @@ def build_policy(
     # gnupg's defaults join a conversation's floor only when its grants hold gpg's extra socket
     # (:func:`with_gpg_program_denies`).
     deny_write_files_l.extend(_gpg_program_spellings())
-    # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
+    # The relocated derive-trust file (intention-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
     # A trust spelling whose own location (final component unresolved) is already denied both ways
     # is dropped: inside any read+write subtree (operator stores, siblings, extras, credential
@@ -2733,7 +2733,7 @@ def build_policy(
                 out.append(p)
         return tuple(out)
 
-    # CONTAINER-DAEMON SOCKETS (spore-725) — THREE ARMS, EACH MEASURED SEPARATELY 2026-09-04
+    # CONTAINER-DAEMON SOCKETS (intention-725) — THREE ARMS, EACH MEASURED SEPARATELY 2026-09-04
     # against a real unix-socket server under a real ``sandbox-exec`` profile, and each kept
     # only after the profile WITHOUT it was shown to lose:
     #   (i)   CONNECT — ``deny_sockets`` renders ``(deny network-outbound (literal <resolved>))``.
@@ -2810,7 +2810,7 @@ def build_policy(
             "refusing to grant confined hands. A symlinked config could be unlinked and rewritten to "
             "weaken the next session's floor; make it a plain file inside .levain/."
         )
-    # spore-359 safety (L2 domain review, 2026-07-17): WRITE-deny the entity's OWN store files so its
+    # intention-359 safety (L2 domain review, 2026-07-17): WRITE-deny the entity's OWN store files so its
     # confined hands cannot compose the always-loaded memory — only the host-process wrap/capture may.
     # LEXICAL paths (the path the hands would write / anneal writes), so a CREATE of a not-yet-existing
     # file (pre-first-wrap pre-planting) is denied too. Fail-CLOSED on a symlinked store file (same
@@ -3041,7 +3041,7 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     return a policy whose socket denies are the build-time sets UNION the freshly-derived ones.
 
     Called by :meth:`ConfinementProvider.spawn_shell` immediately before the profile is rendered, and
-    by the tool executor before each (re)spawn so the union PERSISTS. ``spore-768`` / codex L3 HIGH
+    by the tool executor before each (re)spawn so the union PERSISTS. ``intention-768`` / codex L3 HIGH
     2026-09-04, corrected by a second codex L3 the same day.
 
     ⛔ **ALL THREE ARMS, AND THE FIRST VERSION OF THIS FUNCTION REFRESHED ONLY THE CONNECT ARM.**
@@ -3082,10 +3082,10 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
 
     ▶ SIDE EFFECT WORTH NAMING: when a listed name does point somewhere unenumerated, the union gives
     that target the full three-arm treatment — so the refresh closes the unlisted socket a listed
-    name reaches. It does NOT close unlisted sockets generally; that is ``spore-754`` (an
+    name reaches. It does NOT close unlisted sockets generally; that is ``intention-754`` (an
     operator-declared socket list) and is deliberately a separate change."""
     # Trust-listed project stores are re-derived at the same seam, as a union for the same reason
-    # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
+    # (intention-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
     # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
     gpg_conf = [f for f in _dirmngr_home_conf_spellings() if f not in policy.deny_write_files]
     if gpg_conf:   # a dirmngr home that appeared since the build: its configuration, for the editor too
@@ -3327,7 +3327,7 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str, *, write: bo
     fd and refuses a symlink among them (``levain.firing.openhands.tools._floored_move``). Also denies
     the entity's OWN memory STORE files (``own_memory_files`` — continuity/crystal/db + sidecars): the
     file editor has no legit reason to touch the store (the wrap composes it in-process), so it is denied OUTRIGHT
-    here (read included), while the seatbelt hand still allows bash to READ it — spore-359, so a hand-
+    here (read included), while the seatbelt hand still allows bash to READ it — intention-359, so a hand-
     write can't poison the always-loaded memory the wrap alone composes. The rest of ``<entity>/.levain/``
     is NOT a jewel (the entity's memory is its own to read); the firing's ``assert_entity_isolated``
     moat, not this predicate, is what keeps recall/capture off the operator's store."""
@@ -3474,7 +3474,7 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str, *, write: bo
         # (its memory is composed by the host-process wrap, never edited by hand) → denied OUTRIGHT
         # here (read included), same fail-closed stance as the ssh write-files. The SEATBELT hand still
         # allows the READ (bash may `cat` it); denying both hands the WRITE is what closes the poison-
-        # the-always-loaded-memory vector (spore-359 / L2 review).
+        # the-always-loaded-memory vector (intention-359 / L2 review).
         if _ci_within(p, mf):
             return f"{p} is the entity's own memory store — only `levain wrap` composes it, not the hands"
     return None
@@ -3508,7 +3508,7 @@ class ConfinementConfig:
     # is not a graceful degrade: it bricks `levain run`. Resolution, and why absent stays distinct
     # from false now that the default no longer reads the drive → `levain.firing.drive.resolve_cred_floor`.
     allow_container_sockets: bool = False
-    # spore-725. Default FALSE = the container/VM daemon sockets are DENIED (the floor's normal
+    # intention-725. Default FALSE = the container/VM daemon sockets are DENIED (the floor's normal
     # state). Set true ONLY if this entity genuinely needs to drive containers and the operator
     # accepts that doing so voids the rest of the floor on that machine: the daemon is root and
     # unsandboxed, so anything it will mount, it will read. ⚠ NOT a tri-state like
@@ -3518,13 +3518,13 @@ class ConfinementConfig:
     # so there is no mode for the absent value to derive a different answer from, and a
     # tri-state would only add a third way to spell the same two outcomes.
     efferent_gate: GateSetting = "auto"
-    # The K3 EFFERENT GATE (spore-295). "auto" (default) derives the mode from whether a human is
+    # The K3 EFFERENT GATE (intention-295). "auto" (default) derives the mode from whether a human is
     # driving — ungated at the REPL (the operator watching the stream IS the fan-in), gated for
     # `--task` and any unattended seat. "gated" / "ungated" pin it explicitly. It lives HERE, beside
     # the crown-jewels floor, because the two answer one operator question — what may this entity do
     # to the world — and splitting that answer across two files is how half of it stops being read.
     allow_localhost_outbound: bool = False
-    # spore-755. The OPT-OUT of the connect-to-self deny, and the exact sibling of
+    # intention-755. The OPT-OUT of the connect-to-self deny, and the exact sibling of
     # ``allow_container_sockets`` above (allow_* = opt out of a default deny; absent means False =
     # the deny stays on). Default FALSE means the floor denies outbound connect() to THIS host in
     # BOTH ssh_modes (2026-09-13, 0.4.6 = A+B), closing the FRESH-CONNECTION local-sshd bypass
@@ -3642,7 +3642,7 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
             f"{efferent_gate!r} — fail-closed."
         )
 
-    # spore-725. A plain bool, and ABSENT means FALSE (deny) — the opposite treatment from
+    # intention-725. A plain bool, and ABSENT means FALSE (deny) — the opposite treatment from
     # ``deny_standard_creds`` above, whose absence is a live sentinel. Absence here can safely
     # collapse to the default precisely BECAUSE the default is the safe one: an operator who
     # never heard of this key gets the socket denied. ⚠ A literal null is still REFUSED rather
@@ -3656,7 +3656,7 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
             f"daemon sockets DENIED (the default)."
         )
 
-    # spore-755. Same absent-means-False/deny treatment as allow_container_sockets — a null is still
+    # intention-755. Same absent-means-False/deny treatment as allow_container_sockets — a null is still
     # REFUSED, not read as absence, on the same fail-closed grounds.
     allow_localhost_outbound = data.get("allow_localhost_outbound", False)
     if not isinstance(allow_localhost_outbound, bool):
@@ -4330,7 +4330,7 @@ class SandboxedShell:
 
     :meth:`run` spawns ``<driver argv> -c <runner> bash`` in a new session, writes its input to its
     stdin and waits for it. **Completion is levain's ``waitpid`` on that process and the status is its
-    waitpid status** (spore-1385, the operator's ruling): nothing the shell prints is parsed for either, so
+    waitpid status** (intention-1385, the operator's ruling): nothing the shell prints is parsed for either, so
     code the entity runs cannot end a command early or forge its status. The model this replaced ran
     one bash reading commands from a pipe and took completion and ``$?`` from a line bash printed; bash
     read that pipe one byte at a time on fd 255, so a builtin in a command could read the status line
@@ -4908,7 +4908,7 @@ class ConfinementProvider(ABC):
     and measured, never ported."""
 
     #: Whether this provider can deny an outbound connect to THIS host (``deny_localhost_outbound``,
-    #: spore-755). A provider that cannot must refuse to spawn while that deny is requested, never
+    #: intention-755). A provider that cannot must refuse to spawn while that deny is requested, never
     #: run without it; the operator's opt-out is ``allow_localhost_outbound`` in confinement.json.
     enforces_localhost_deny: bool = False
     #: Whether this provider enforces that deny by removing IP networking from bash (bwrap's
@@ -4930,7 +4930,7 @@ class ConfinementProvider(ABC):
         (``sandbox-exec`` / ``bwrap`` / a container runtime) while the QUESTION does not. The previous
         shape asked the polymorphic :func:`select_provider` which provider applies and then checked
         the macOS driver unconditionally — one requirement with two enforcement models, which is the
-        exact trap ``spore-418`` names for the confinement policy itself, arriving in the GATE. That
+        exact trap ``intention-418`` names for the confinement policy itself, arriving in the GATE. That
         shape had two faces the moment a second provider existed: on Linux a working ``bwrap`` floor
         would never be offered (the macOS driver is absent), and on a Mac asked about Linux it would
         answer True from a host that cannot know. Neither is a platform branch away — the check has
@@ -4996,7 +4996,7 @@ class ConfinementProvider(ABC):
 
         ⛔ The K4c branch, written before this seam existed, had ``BwrapProvider`` (and its own
         ``SeatbeltProvider``) override ``spawn_shell`` DIRECTLY, and a docstring then claimed it
-        inherited the refresh anyway. It did not; that was spore-768 waiting to return on Linux. The
+        inherited the refresh anyway. It did not; that was intention-768 waiting to return on Linux. The
         2026-09-30 port moved ``BwrapProvider`` onto ``_spawn_shell_impl``, and
         ``test_no_shipped_provider_overrides_spawn_shell`` now asserts it for every provider.
         ⚖ This is not a reversal of "make the refresh structural" — it is a stronger form of it. The
@@ -5013,7 +5013,7 @@ class ConfinementProvider(ABC):
         # the refresh left the invariant enforced at exactly ONE call site, so any second consumer —
         # `BwrapProvider` on the held branch, a future debug or preview harness, a test — that calls
         # `spawn_shell(policy)` without refreshing first renders the BUILD-TIME `deny_sockets`. That
-        # is the spore-768 regression this whole release exists to close, reintroduced by the fix
+        # is the intention-768 regression this whole release exists to close, reintroduced by the fix
         # for the guard that was protecting against it.
         # ⚠ AND DOUBLE-REFRESHING IS SAFE NOW, which it was not in round 4: the caller keeps the
         # policy the SHELL reports (`effective_policy`), not its own earlier snapshot, and
@@ -5540,7 +5540,7 @@ class SeatbeltProvider(ConfinementProvider):
 
         if policy.own_memory_files:
             # The entity's OWN store (memory.continuity.md / crystal.json / db) — WRITE-only denied so a
-            # confined-hands write can't poison the always-loaded memory that spore-359 injects, bypassing
+            # confined-hands write can't poison the always-loaded memory that intention-359 injects, bypassing
             # the GOVERNED wrap ("human-gated" until K4a [6]; a seat may now wrap unattended, so the
             # property is the VALIDATED composer, not human presence). READ stays allowed (bash may
             # `cat` its own memory). anneal composes
@@ -6998,7 +6998,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
         "--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup",
     ]
     if policy.deny_localhost_outbound:
-        # spore-755 on Linux (option B, see LINUX_LOCALHOST_REFUSAL's comment): a new, empty network
+        # intention-755 on Linux (option B, see LINUX_LOCALHOST_REFUSAL's comment): a new, empty network
         # namespace. Closes connects back to this host over TCP AND abstract unix sockets (both
         # measured), at the cost of IP networking inside bash. Not closed: pathname unix sockets,
         # named in ``OFFLINE_RESIDUAL``.
@@ -7482,7 +7482,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     # mount whose target is missing makes bwrap create it (steps 1, 2, 4, 6 too), and step (2a)
     # exists because doing it inside the entity's own store broke that store.
     # A mount needs a mountpoint. macOS denies a path STRING, so it covers a file that does not exist
-    # YET — which is the entire point of the ssh vector floor (`spore-322`): the attack is PLANTING an
+    # YET — which is the entire point of the ssh vector floor (`intention-322`): the attack is PLANTING an
     # authorized_keys that was never there. bwrap can only over-mount something that exists, so a
     # missing vector gets `--ro-bind /dev/null`, and bwrap CREATES the mountpoint — leaving a 0-byte
     # `-r--r--r--` regular file on the host after the sandbox exits (measured). Blocking the plant is
@@ -7574,7 +7574,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
         else:
             masks.append(str(_host_spelling(f)))
 
-    # (6) CONTAINER-DAEMON SOCKETS (spore-725) — THE CONNECT ARM, MEASURED 2026-09-30 on a Linux
+    # (6) CONTAINER-DAEMON SOCKETS (intention-725) — THE CONNECT ARM, MEASURED 2026-09-30 on a Linux
     # kernel (6.12, bubblewrap 0.9.0, in Docker with the namespace restrictions relaxed):
     #   ``--ro-bind S S``           connect SUCCEEDS. A read-only mount does not stop connect(),
     #                               which is the same fact as ``-v docker.sock:...:ro`` still
@@ -7636,7 +7636,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy,
     # below). A fresh tmpfs over the dir, and nothing of the host's bound back into it but the operator's
     # grants, each a socket FILE bound at spawn (:func:`_grant_ops`). Never a directory: a bound directory
     # would carry every socket beside the one wanted, and stay renameable. That closes three things at once:
-    #   · the user's service manager and session bus (spore-1244, MEASURED 2026-09-30, systemd 255):
+    #   · the user's service manager and session bus (intention-1244, MEASURED 2026-09-30, systemd 255):
     #     reachable, `systemd-run --user --pipe --wait cat <jewel>` from inside bash printed the
     #     jewel; hidden, it is "Failed to connect to bus";
     #   · gnupg's dirmngr, which fetches what a client asks for over the network. A mask by path did
@@ -8209,7 +8209,7 @@ def bwrap_available() -> bool:
     """True iff ``bwrap`` is present AND CAN ACTUALLY ESTABLISH A NAMESPACE ON THIS HOST RIGHT NOW.
 
     ⛔ THIS EXECUTES bwrap. THAT IS THE POINT, AND A FILE-EXISTENCE CHECK IS NOT A SUBSTITUTE — the
-    check that spore-418 specified (``bwrap`` present + ``unprivileged_userns_clone``) REPORTS GREEN
+    check that intention-418 specified (``bwrap`` present + ``unprivileged_userns_clone``) REPORTS GREEN
     ON A HOST WHERE bwrap CANNOT RUN. Measured on argushub 2026-09-03: ``/usr/bin/bwrap`` present,
     ``kernel.unprivileged_userns_clone = 1``, and every invocation fails with ``setting up uid map:
     Permission denied``, because Ubuntu 23.10+ gates unprivileged user namespaces behind a DIFFERENT
@@ -8269,7 +8269,7 @@ def bwrap_netns_available() -> bool:
 # (curl rc 7), an abstract-socket D-Bus is refused (busctl rc 1), the internet is gone (rc 6) and bash
 # itself works; with no flag all three are reachable. The entity's own model calls are made by the
 # levain process, outside bwrap. ``allow_localhost_outbound: true`` gives bash the network back, with
-# the spore-755 exposure. Until 2026-10-01 the deny refused bash outright on Linux (option C).
+# the intention-755 exposure. Until 2026-10-01 the deny refused bash outright on Linux (option C).
 #: The refusal for a provider that CANNOT enforce the deny (see :func:`resolve_localhost_deny`).
 LINUX_LOCALHOST_REFUSAL = (
     "this platform's sandbox cannot block connections back to this host, and this entity's floor "
@@ -8289,7 +8289,7 @@ NETNS_REFUSAL = (
 
 #: What bash can still reach when the deny runs as ``--unshare-net``. One string, printed by the
 #: banner and doctor, so the residual is named everywhere the posture is (codex, L3 on option B
-#: twice; the ControlMaster class is spore-1005).
+#: twice; the ControlMaster class is intention-1005).
 OFFLINE_RESIDUAL = (
     "bash keeps only its own isolated loopback. NOT blocked: a unix socket at a file path the floor "
     "does not deny (an ssh ControlMaster or a proxy socket in /tmp, X11, a daemon that fetches "
@@ -9735,7 +9735,7 @@ def _hands_launch_problem(hands: HandsIdentity) -> str | None:
 
 class _BwrapShell(SandboxedShell):
     """A :class:`SandboxedShell` that checks, before every command, that the disk still matches the
-    mounts it was started with (spore-1312, rec C, ruled 2026-10-03, widened by its L3).
+    mounts it was started with (intention-1312, rec C, ruled 2026-10-03, widened by its L3).
 
     Three checks, one rule each:
       - the spawn-time SQLite jewel check (:func:`_refuse_plantable_sqlite_jewels`) again, because an
@@ -10254,7 +10254,7 @@ class BwrapProvider(ConfinementProvider):
         # reaper is pid 1 and passes bash's status on through an eventfd the reaper holds; the reaper
         # runs as bash's user and stays dumpable (bubblewrap.c: do_init, monitor_child), so code in the
         # sandbox that could take that fd from it (ptrace, or pidfd_getfd where Yama allows) could
-        # write a status of its choosing (spore-1385). With bash as pid 1 there is no such channel.
+        # write a status of its choosing (intention-1385). With bash as pid 1 there is no such channel.
         # `--new-session`: bash calls setsid(), so it and everything it starts are in a process group
         # of their own, apart from the bwrap process levain waits on. Without it a `kill 0` inside the
         # sandbox reached bwrap too (a group signal crosses pid namespaces), so a command could stop or
@@ -10634,7 +10634,7 @@ def _apparmor_restricts_userns() -> bool:
     """True if this kernel's AppArmor policy is the thing blocking unprivileged user namespaces.
 
     ⛔ DIAGNOSTIC ONLY. THIS MUST NEVER BECOME THE CAPABILITY GATE, and the distinction is the
-    whole lesson of K4c: ``spore-418`` specified exactly this shape of check (read a sysctl) and it
+    whole lesson of K4c: ``intention-418`` specified exactly this shape of check (read a sysctl) and it
     reported GREEN on a host where bwrap could not run, because it named the OTHER sysctl —
     ``unprivileged_userns_clone``, the older Debian-lineage knob, which still reads 1 on Ubuntu
     while ``apparmor_restrict_unprivileged_userns`` is what actually decides. Capability is decided

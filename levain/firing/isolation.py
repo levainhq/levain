@@ -89,7 +89,7 @@ def resolve_entity_dir(explicit: Path | str | None = None) -> Path:
     Raises :class:`IsolationError` when there is none — an isolated firing with no entity FAILS
     CLOSED (no store) rather than falling back to a default, because the only conceivable default is
     the operator-laptop store this module exists to refuse. There is no process-level entity channel
-    to fall back to (spore-438: an entity is carried by the object being served, never looked up)."""
+    to fall back to (intention-438: an entity is carried by the object being served, never looked up)."""
     raw = str(explicit).strip() if explicit is not None else ""
     if not raw:
         raise IsolationError(

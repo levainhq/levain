@@ -1,5 +1,5 @@
-"""K2b-1 spore effects (design §4.0-§4.1): settle over the SporeEffectStore against real anneal
-SporeStores in tmp dirs. Divergent values are injected by wrapping the args the adapter hands to
+"""K2b-1 intention effects (design §4.0-§4.1): settle over the IntentionEffectStore against real anneal
+IntentionStores in tmp dirs. Divergent values are injected by wrapping the args the adapter hands to
 anneal, never by mocking anneal."""
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain.cockpit.effects import (
     ApplyUnit,
@@ -18,14 +18,14 @@ from levain.cockpit.effects import (
     EffectState,
     EffectStatus,
     PermanentApplyRefusal,
-    SporeEffectStore,
+    IntentionEffectStore,
     TransientApplyFault,
     canonical_effect,
     create_origin_key,
     plan_units,
     registration_refusals,
     settle,
-    spore_resource_key,
+    intention_resource_key,
 )
 
 PENDING = "cp" + "ab" * 16
@@ -34,7 +34,7 @@ PENDING = "cp" + "ab" * 16
 @pytest.fixture()
 def path(tmp_path: Path) -> Path:
     p = tmp_path / "spores.json"
-    st = SporeStore(p)
+    st = IntentionStore(p, id_prefix="intention")
     st.add(type="task", text="a loop", origin_key="k.loop")
     st.add(type="thought", text="a tray seed", disposition="seed", origin_key="k.seed")
     st.add(type="thought", text="a note", disposition="note", origin_key="k.note")
@@ -42,43 +42,43 @@ def path(tmp_path: Path) -> Path:
 
 
 def _row(path: Path, key: str) -> dict | None:
-    return SporeStore(path).get_by_origin_key(key)
+    return IntentionStore(path, id_prefix="intention").get_by_origin_key(key)
 
 
-def _effect(es: SporeEffectStore, verb: str, params: dict, key: str | None, *, idx: int = 0) -> Effect:
-    if verb == "spore_seed":
+def _effect(es: IntentionEffectStore, verb: str, params: dict, key: str | None, *, idx: int = 0) -> Effect:
+    if verb == "intention_seed":
         ok = create_origin_key(PENDING, idx)
-        return canonical_effect(verb, params, es.snapshot(spore_resource_key(ok)).row, origin_key=ok)
+        return canonical_effect(verb, params, es.snapshot(intention_resource_key(ok)).row, origin_key=ok)
     assert key is not None
-    return canonical_effect(verb, params, es.snapshot(spore_resource_key(key)).row)
+    return canonical_effect(verb, params, es.snapshot(intention_resource_key(key)).row)
 
 
-def _settle(es: SporeEffectStore, eff: Effect, idx: int = 0, prior: dict | None = None):
+def _settle(es: IntentionEffectStore, eff: Effect, idx: int = 0, prior: dict | None = None):
     (unit,) = es.units([(idx, eff)])
     return settle(unit, es, prior or {})
 
 
-# every spore kind of the §13 row, with the stored check of its applied state
+# every intention kind of the §13 row, with the stored check of its applied state
 KINDS = [
-    ("seed", "spore_seed", {"text": "  new capture  ", "type": "task"}, None,
+    ("seed", "intention_seed", {"text": "  new capture  ", "type": "task"}, None,
      lambda r: r["text"] == "new capture" and r["disposition"] == "seed" and r["status"] == "open"),
-    ("text", "spore_update", {"text": "edited\r\n"}, "k.loop", lambda r: r["text"] == "edited"),
-    ("domain", "spore_update", {"domain": "levain"}, "k.loop", lambda r: r["domain"] == "levain"),
-    ("type", "spore_update", {"type": "question"}, "k.seed", lambda r: r["type"] == "question"),
-    ("disposition", "spore_set_disposition", {"disposition": "loop", "surface_at": "2026-12-01"}, "k.seed",
+    ("text", "intention_update", {"text": "edited\r\n"}, "k.loop", lambda r: r["text"] == "edited"),
+    ("domain", "intention_update", {"domain": "levain"}, "k.loop", lambda r: r["domain"] == "levain"),
+    ("type", "intention_update", {"type": "question"}, "k.seed", lambda r: r["type"] == "question"),
+    ("disposition", "intention_set_disposition", {"disposition": "loop", "surface_at": "2026-12-01"}, "k.seed",
      lambda r: "disposition" not in r and r["next"] == "2026-12-01"),
-    ("pull_forward", "spore_surface_at", {"surface_at": "2026-10-11"}, "k.loop",
+    ("pull_forward", "intention_surface_at", {"surface_at": "2026-10-11"}, "k.loop",
      lambda r: r["next"] == "2026-10-11"),
-    ("ascend", "spore_ascend", {"spore_kind": "project", "ref": "commit abc"}, "k.loop",
+    ("ascend", "intention_promote", {"intention_kind": "project", "ref": "commit abc"}, "k.loop",
      lambda r: r["status"] == "resolved" and r["resolution"]["ref"] == "commit abc"),
-    ("undo_edit", "spore_undo_edit", {"restore": {"text": "a loop", "tier": "cold"}}, "k.loop",
+    ("undo_edit", "intention_undo_edit", {"restore": {"text": "a loop", "tier": "cold"}}, "k.loop",
      lambda r: r["tier"] == "cold"),
 ]
 
 
 @pytest.mark.parametrize("name,verb,params,key,check", KINDS, ids=[k[0] for k in KINDS])
 def test_each_kind_applies_then_reapplies_as_already(path, name, verb, params, key, check):
-    es = SporeEffectStore(path)
+    es = IntentionEffectStore(path)
     eff = _effect(es, verb, params, key)
     first = _settle(es, eff)
     assert first.status is EffectStatus.APPLIED, first
@@ -89,25 +89,25 @@ def test_each_kind_applies_then_reapplies_as_already(path, name, verb, params, k
     again = _settle(es, eff)
     assert again.status is EffectStatus.APPLIED
     assert path.read_bytes() == before
-    if verb == "spore_seed":
+    if verb == "intention_seed":
         assert first.members[0].native_id == row["id"] == again.members[0].native_id
         assert set(first.members[0].label_fields) == {"text", "disposition", "domain"}   # a create labels every field, the empty domain too
 
 
-def test_ascend_kind_validated_against_spore_type(path):
-    es = SporeEffectStore(path)
+def test_ascend_kind_validated_against_intention_type(path):
+    es = IntentionEffectStore(path)
     with pytest.raises(ValueError):
-        _effect(es, "spore_ascend", {"spore_kind": "nonsense", "ref": "x"}, "k.loop")
+        _effect(es, "intention_promote", {"intention_kind": "nonsense", "ref": "x"}, "k.loop")
     with pytest.raises(ValueError):
-        _effect(es, "spore_ascend", {"spore_kind": "project", "ref": "x"}, "k.note")
+        _effect(es, "intention_promote", {"intention_kind": "project", "ref": "x"}, "k.note")
 
 
 def test_undo_of_a_seed_deletes_then_already(path):
-    es = SporeEffectStore(path)
-    seed = _effect(es, "spore_seed", {"text": "oops"}, None)
+    es = IntentionEffectStore(path)
+    seed = _effect(es, "intention_seed", {"text": "oops"}, None)
     assert _settle(es, seed).status is EffectStatus.APPLIED
     key = create_origin_key(PENDING, 0)
-    undo = _effect(es, "spore_undo_seed", {}, key)
+    undo = _effect(es, "intention_undo_seed", {}, key)
     assert undo.changes == {"deleted": True} and undo.projection is None
     r = _settle(es, undo)
     assert r.status is EffectStatus.APPLIED and r.members[0].label_fields == ()
@@ -122,11 +122,11 @@ def test_undo_of_a_seed_deletes_then_already(path):
 
 @pytest.mark.parametrize("other", ["edit", "resolve"])
 def test_create_found_by_origin_key_after_another_writer_is_already(path, other):
-    es = SporeEffectStore(path)
-    seed = _effect(es, "spore_seed", {"text": "planted", "disposition": "agenda"}, None)
+    es = IntentionEffectStore(path)
+    seed = _effect(es, "intention_seed", {"text": "planted", "disposition": "agenda"}, None)
     first = _settle(es, seed)
     native = first.members[0].native_id
-    st = SporeStore(path)
+    st = IntentionStore(path, id_prefix="intention")
     if other == "edit":
         st.update(native, text="rewritten by the CLI")
     else:
@@ -144,10 +144,10 @@ def test_create_found_by_origin_key_after_another_writer_is_already(path, other)
 
 
 def test_precondition_moved_is_changed(path):
-    es = SporeEffectStore(path)
-    eff = _effect(es, "spore_update", {"text": "mine"}, "k.loop")
+    es = IntentionEffectStore(path)
+    eff = _effect(es, "intention_update", {"text": "mine"}, "k.loop")
     row = _row(path, "k.loop")
-    SporeStore(path).update(row["id"], tier="hot")
+    IntentionStore(path, id_prefix="intention").update(row["id"], tier="hot")
     before = path.read_bytes()
     r = _settle(es, eff)
     assert (r.status, r.reason) == (EffectStatus.UNAPPLIED, "changed")
@@ -155,13 +155,13 @@ def test_precondition_moved_is_changed(path):
 
 
 def test_resolved_by_another_writer_is_changed(path):
-    es = SporeEffectStore(path)
-    eff = _effect(es, "spore_update", {"text": "mine"}, "k.loop")
-    SporeStore(path).descend(_row(path, "k.loop")["id"], kind="composted")
+    es = IntentionEffectStore(path)
+    eff = _effect(es, "intention_update", {"text": "mine"}, "k.loop")
+    IntentionStore(path, id_prefix="intention").descend(_row(path, "k.loop")["id"], kind="composted")
     assert _settle(es, eff).reason == "changed"
 
 
-class _Divergent(SporeEffectStore):
+class _Divergent(IntentionEffectStore):
     """Writes ``value`` instead of the signed value of ``field`` (a nested ``resolution`` field is
     named ``resolution.<leaf>``), leaving the postcondition the signed one."""
 
@@ -169,8 +169,8 @@ class _Divergent(SporeEffectStore):
         super().__init__(path)
         self.field, self.value = field, value
 
-    def spore_apply(self, effect):
-        sa = super().spore_apply(effect)
+    def intention_apply(self, effect):
+        sa = super().intention_apply(effect)
         args = dict(sa.args)
         leaf = self.field.split(".")[-1]
         assert leaf in args, (self.field, args)
@@ -179,23 +179,23 @@ class _Divergent(SporeEffectStore):
 
 
 DIVERGENT = [
-    ("seed.text", "spore_seed", {"text": "signed"}, None, "text", "not signed"),
-    ("seed.type", "spore_seed", {"text": "signed", "type": "task"}, None, "type", "question"),
-    ("seed.disposition", "spore_seed", {"text": "signed"}, None, "disposition", "handoff"),
-    ("update.text", "spore_update", {"text": "signed"}, "k.loop", "text", "other"),
-    ("update.domain", "spore_update", {"domain": "signed"}, "k.loop", "domain", "other"),
-    ("update.type", "spore_update", {"type": "question"}, "k.seed", "type", "task"),
-    ("update.tier", "spore_update", {"tier": "hot"}, "k.loop", "tier", "cold"),
-    ("update.next", "spore_update", {"next": "2026-11-01"}, "k.loop", "next", "2026-11-02"),
-    ("disposition.disposition", "spore_set_disposition", {"disposition": "agenda"}, "k.seed",
+    ("seed.text", "intention_seed", {"text": "signed"}, None, "text", "not signed"),
+    ("seed.type", "intention_seed", {"text": "signed", "type": "task"}, None, "type", "question"),
+    ("seed.disposition", "intention_seed", {"text": "signed"}, None, "disposition", "handoff"),
+    ("update.text", "intention_update", {"text": "signed"}, "k.loop", "text", "other"),
+    ("update.domain", "intention_update", {"domain": "signed"}, "k.loop", "domain", "other"),
+    ("update.type", "intention_update", {"type": "question"}, "k.seed", "type", "task"),
+    ("update.tier", "intention_update", {"tier": "hot"}, "k.loop", "tier", "cold"),
+    ("update.next", "intention_update", {"next": "2026-11-01"}, "k.loop", "next", "2026-11-02"),
+    ("disposition.disposition", "intention_set_disposition", {"disposition": "agenda"}, "k.seed",
      "disposition", "seed"),
-    ("disposition.next", "spore_set_disposition", {"disposition": "agenda", "surface_at": "2026-11-01"}, "k.seed", "next", "2026-11-02"),
-    ("pull_forward.next", "spore_surface_at", {"surface_at": "2026-10-12"}, "k.loop", "next", "2026-10-13"),
-    ("descend.kind", "spore_descend", {"spore_kind": "composted"}, "k.loop", "resolution.kind", "dropped"),
-    ("ascend.kind", "spore_ascend", {"spore_kind": "project", "ref": "r"}, "k.loop",
+    ("disposition.next", "intention_set_disposition", {"disposition": "agenda", "surface_at": "2026-11-01"}, "k.seed", "next", "2026-11-02"),
+    ("pull_forward.next", "intention_surface_at", {"surface_at": "2026-10-12"}, "k.loop", "next", "2026-10-13"),
+    ("descend.kind", "intention_close", {"intention_kind": "composted"}, "k.loop", "resolution.kind", "dropped"),
+    ("ascend.kind", "intention_promote", {"intention_kind": "project", "ref": "r"}, "k.loop",
      "resolution.kind", "thread"),
-    ("ascend.ref", "spore_ascend", {"spore_kind": "project", "ref": "r"}, "k.loop", "resolution.ref", "r2"),
-    ("undo_edit.text", "spore_undo_edit", {"restore": {"text": "back"}}, "k.loop", "text", "elsewhere"),
+    ("ascend.ref", "intention_promote", {"intention_kind": "project", "ref": "r"}, "k.loop", "resolution.ref", "r2"),
+    ("undo_edit.text", "intention_undo_edit", {"restore": {"text": "back"}}, "k.loop", "text", "elsewhere"),
 ]
 
 
@@ -204,9 +204,9 @@ def test_divergent_value_on_each_changes_field_is_refused_in_transaction(path, n
                                                                          value):
     from anneal_memory.spores import ASCEND_BY_TYPE, DESCEND_BY_TYPE
     if fld == "resolution.kind":   # the injected kind must be one anneal takes for the type
-        valid = (ASCEND_BY_TYPE if verb == "spore_ascend" else DESCEND_BY_TYPE)["task"]
+        valid = (ASCEND_BY_TYPE if verb == "intention_promote" else DESCEND_BY_TYPE)["task"]
         assert value in valid
-    good = SporeEffectStore(path)
+    good = IntentionEffectStore(path)
     eff = _effect(good, verb, params, key)
     before = path.read_bytes()
     r = _settle(_Divergent(path, fld, value), eff)
@@ -217,15 +217,15 @@ def test_divergent_value_on_each_changes_field_is_refused_in_transaction(path, n
 def test_divergent_symbolic_ascend_ref_is_refused(path):
     """An ascend whose loop ``ref`` names effect 0, the seed this same fire creates: the store must
     hold exactly the created id, and any other id is refused."""
-    es = SporeEffectStore(path)
-    seed = _effect(es, "spore_seed", {"text": "what it became"}, None)
-    asc = _effect(es, "spore_ascend", {"spore_kind": "project", "ref": {"from_effect": 0, "field": "native_id"}},
+    es = IntentionEffectStore(path)
+    seed = _effect(es, "intention_seed", {"text": "what it became"}, None)
+    asc = _effect(es, "intention_promote", {"intention_kind": "project", "ref": {"from_effect": 0, "field": "native_id"}},
                   "k.loop", idx=1)
     assert asc.changes["resolution"]["ref"] == {"from_effect": 0, "field": "native_id"}
     r0 = _settle(es, seed)
     prior = {0: EffectState(EffectStatus.APPLIED, r0.members[0].native_id)}
     before = path.read_bytes()
-    bad = _settle(_Divergent(path, "resolution.ref", "spore-1"), asc, idx=1, prior=prior)
+    bad = _settle(_Divergent(path, "resolution.ref", "intention-1"), asc, idx=1, prior=prior)
     assert (bad.status, bad.reason) == (EffectStatus.UNAPPLIED, "refused")
     assert path.read_bytes() == before
     ok = _settle(es, asc, idx=1, prior=prior)
@@ -234,8 +234,8 @@ def test_divergent_symbolic_ascend_ref_is_refused(path):
 
 
 def test_symbolic_ref_waits_on_planned_and_fails_on_unapplied(path):
-    es = SporeEffectStore(path)
-    asc = _effect(es, "spore_ascend", {"spore_kind": "project", "ref": {"from_effect": 0, "field": "native_id"}},
+    es = IntentionEffectStore(path)
+    asc = _effect(es, "intention_promote", {"intention_kind": "project", "ref": {"from_effect": 0, "field": "native_id"}},
                   "k.loop", idx=1)
     before = path.read_bytes()
     wait = _settle(es, asc, idx=1, prior={0: EffectState(EffectStatus.PLANNED)})
@@ -247,16 +247,16 @@ def test_symbolic_ref_waits_on_planned_and_fails_on_unapplied(path):
     assert path.read_bytes() == before
 
 
-class _ExtraField(SporeEffectStore):
+class _ExtraField(IntentionEffectStore):
     """Also writes ``tier``, a version field the effect does not change."""
 
-    def spore_apply(self, effect):
-        sa = super().spore_apply(effect)
+    def intention_apply(self, effect):
+        sa = super().intention_apply(effect)
         return dataclasses.replace(sa, args={**sa.args, "tier": "parked"})
 
 
 def test_write_of_a_non_changes_version_field_is_refused(path):
-    eff = _effect(SporeEffectStore(path), "spore_update", {"text": "signed"}, "k.loop")
+    eff = _effect(IntentionEffectStore(path), "intention_update", {"text": "signed"}, "k.loop")
     before = path.read_bytes()
     r = _settle(_ExtraField(path), eff)
     assert (r.status, r.reason) == (EffectStatus.UNAPPLIED, "refused")
@@ -264,56 +264,56 @@ def test_write_of_a_non_changes_version_field_is_refused(path):
 
 
 def test_corrupt_store_is_transient_then_applies_after_repair(path):
-    es = SporeEffectStore(path)
-    eff = _effect(es, "spore_update", {"text": "survives"}, "k.loop")
+    es = IntentionEffectStore(path)
+    eff = _effect(es, "intention_update", {"text": "survives"}, "k.loop")
     good = path.read_bytes()
     path.write_text("{ not json")
     with pytest.raises(TransientApplyFault) as fault:
         _settle(es, eff)
-    assert fault.value.fault_class == "SporeError"
+    assert fault.value.fault_class == "IntentionError"
     path.write_bytes(good)
     assert _settle(es, eff).status is EffectStatus.APPLIED
     assert _row(path, "k.loop")["text"] == "survives"
 
 
 def test_missing_store_is_store_gone_for_all_but_a_create(path):
-    es = SporeEffectStore(path)
-    eff = _effect(es, "spore_update", {"text": "x"}, "k.loop")
+    es = IntentionEffectStore(path)
+    eff = _effect(es, "intention_update", {"text": "x"}, "k.loop")
     path.unlink()
     r = _settle(es, eff)
     assert (r.status, r.reason) == (EffectStatus.UNAPPLIED, "store gone")
     assert not path.exists()
     # anneal makes the file for a create
-    seed = _effect(es, "spore_seed", {"text": "x"}, None)
+    seed = _effect(es, "intention_seed", {"text": "x"}, None)
     assert _settle(es, seed).status is EffectStatus.APPLIED and path.exists()
 
 
-class _Boom(SporeEffectStore):
+class _Boom(IntentionEffectStore):
     def apply_unit(self, unit):
         raise RuntimeError("a bug")
 
 
 def test_any_other_exception_is_transient(path):
-    eff = _effect(SporeEffectStore(path), "spore_update", {"text": "x"}, "k.loop")
+    eff = _effect(IntentionEffectStore(path), "intention_update", {"text": "x"}, "k.loop")
     with pytest.raises(TransientApplyFault) as fault:
         _settle(_Boom(path), eff)
     assert (fault.value.fault_class, fault.value.message) == ("RuntimeError", "a bug")
 
 
 @pytest.mark.parametrize("verb,params,key", [
-    ("spore_seed", {"text": "raced"}, None),
-    ("spore_update", {"text": "raced"}, "k.loop"),
-    ("spore_ascend", {"spore_kind": "project", "ref": "r"}, "k.loop"),
+    ("intention_seed", {"text": "raced"}, None),
+    ("intention_update", {"text": "raced"}, "k.loop"),
+    ("intention_promote", {"intention_kind": "project", "ref": "r"}, "k.loop"),
 ], ids=["seed", "update", "ascend"])
 def test_two_concurrent_settlers_both_end_applied(path, verb, params, key):
-    eff = _effect(SporeEffectStore(path), verb, params, key)
+    eff = _effect(IntentionEffectStore(path), verb, params, key)
     barrier = threading.Barrier(2)
     results: list = []
     errors: list = []
 
     def run() -> None:
         try:
-            es = SporeEffectStore(path)            # own SporeStore, own lock fd
+            es = IntentionEffectStore(path)            # own IntentionStore, own lock fd
             es.snapshot(eff.resource_key)          # the lock-free read
             barrier.wait(timeout=10)
             results.append(_settle(es, eff))
@@ -327,29 +327,29 @@ def test_two_concurrent_settlers_both_end_applied(path, verb, params, key):
         t.join(20)
     assert not errors, errors
     assert [r.status for r in results] == [EffectStatus.APPLIED, EffectStatus.APPLIED]
-    if verb == "spore_seed":
+    if verb == "intention_seed":
         assert results[0].members[0].native_id == results[1].members[0].native_id
         data = json.loads(path.read_text())
         assert sum(1 for s in data["spores"] if s.get("text") == "raced") == 1
 
 
 def test_effect_record_round_trip_and_units(path):
-    es = SporeEffectStore(path)
-    effs = [_effect(es, "spore_seed", {"text": "a"}, None),
-            _effect(es, "spore_ascend", {"spore_kind": "project", "ref": {"from_effect": 0, "field": "native_id"}},
+    es = IntentionEffectStore(path)
+    effs = [_effect(es, "intention_seed", {"text": "a"}, None),
+            _effect(es, "intention_promote", {"intention_kind": "project", "ref": {"from_effect": 0, "field": "native_id"}},
                     "k.loop", idx=1)]
     assert [Effect.from_record(json.loads(json.dumps(e.to_record()))) for e in effs] == effs
-    units = plan_units(effs, {"spores": es})
+    units = plan_units(effs, {"intentions": es})
     assert [u.indices for u in units] == [(0,), (1,)]
     with pytest.raises(ValueError):
         Effect.from_record({"resource_key": "x"})
     with pytest.raises(PermanentApplyRefusal):
-        es.apply_unit(ApplyUnit("spores", (0, 1), tuple(effs)))
+        es.apply_unit(ApplyUnit("intentions", (0, 1), tuple(effs)))
 
 
 def test_registration_declarations(path):
-    es = SporeEffectStore(path)
-    assert registration_refusals(es, {"spore_update": object()}) == []
+    es = IntentionEffectStore(path)
+    assert registration_refusals(es, {"intention_update": object()}) == []
     assert registration_refusals(object(), {"x": object()}) == ["no EffectStore adapter"]
     assert "no canonical_effect" in registration_refusals(es, {})
     assert set(es.authority_fields) <= set(es.version_fields)

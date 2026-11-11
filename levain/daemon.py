@@ -1,6 +1,6 @@
 """Cross-platform daemon recipe for the always-on ``levain serve`` cockpit.
 
-The DAILY-DRIVER autostart (spore-205): make ``levain serve --write`` start on login and
+The DAILY-DRIVER autostart (intention-205): make ``levain serve --write`` start on login and
 survive a crash, so the cockpit "just works" for a non-flow operator — no ad-hoc ``nohup``,
 no manual restart after a reboot.
 
@@ -53,7 +53,7 @@ DEFAULT_SEAT_INTERVAL = 3600
 # alternative is the SDK's own limit, which nobody chose for this purpose. Calibrate against a
 # seat that has actually run rather than reasoning about it (`derive_dont_invent`).
 DEFAULT_SEAT_MAX_ITERATIONS = 40
-# A STARTING wall-clock bound for an unattended turn (K4a ⑥, `spore-434`). Finite for a REASON that
+# A STARTING wall-clock bound for an unattended turn (K4a ⑥, `intention-434`). Finite for a REASON that
 # is stronger than the step bound's: a turn hung inside ONE step is unbounded by `max_iterations`,
 # and because launchd COALESCES per label the seat then never runs again at all — behind a unit
 # still reporting installed and loaded. So this is not belt-and-braces on the step bound; it is the
@@ -311,7 +311,7 @@ def build_seat_spec(
       is a STARTING bound to be calibrated against a seat that has actually run — not a derived
       number (``derive_dont_invent``). Pass ``None`` to fall back to the SDK's own limit.
     - **``--max-seconds`` defaults ON, and it is the one that makes "restartable" TRUE**
-      (K4a ⑥, ``spore-434``). The step bound above counts STEPS, so a turn hung inside ONE of them —
+      (K4a ⑥, ``intention-434``). The step bound above counts STEPS, so a turn hung inside ONE of them —
       a stalled model call, a socket with no read timeout — is not bounded by it at all. And because
       launchd **coalesces per label**, launchd will not start the next turn while that one lives:
       the seat stops running FOREVER behind a unit that still reports installed and loaded, with
@@ -953,7 +953,7 @@ class SystemdUserProvider(DaemonProvider):
 
     ⚠ **LINGERING IS WHAT MAKES AN ALWAYS-ON AGENT ACTUALLY ALWAYS-ON.** By default a user's systemd
     instance stops when their last session ends, so a headless box's seat would die on logout — the
-    precise contradiction ``spore-418`` names ("an always-on agent that dies when the laptop lid
+    precise contradiction ``intention-418`` names ("an always-on agent that dies when the laptop lid
     closes is a contradiction in terms"), reappearing as a session lifetime instead of a lid.
     ``install`` requests ``loginctl enable-linger`` and REPORTS whether it was granted rather than
     assuming it; a refusal is surfaced in the install summary, never swallowed."""

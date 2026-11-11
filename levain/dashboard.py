@@ -8,7 +8,7 @@ assemble the entity's WHOLE substrate — the anneal stores AND the install's
 seed/config surface — into a single ``SubstrateView`` that renders from outside
 (the local sovereign web-app, a CLI, the parked in-host MCP-App).
 
-Slice 1 served State + health + graph + crystals + spores. **Slice 1.5 shows
+Slice 1 served State + health + graph + crystals + intentions. **Slice 1.5 shows
 EVERYTHING, read-only:** every neocortex section, the seed/config surface
 (origin / operator / posture / constitution), recent episodes, the wrap-history
 timeline — organized by the ``Identity · Operate · Mind`` IA. Every emitted
@@ -29,7 +29,7 @@ Three properties make this the correct first slice:
 - **billing-immune** — invoked human-present, never headless.
 
 Failure discipline mirrors the recall hook: each sub-read is independently
-fail-soft. A corrupt crystal file, an absent spore store, an unwrapped entity with
+fail-soft. A corrupt crystal file, an absent intention store, an unwrapped entity with
 no continuity yet, a missing ``seed/`` dir — none of these blank the whole board.
 Every degradation lands in ``SubstrateView.errors`` so the surface can SHOW that a
 tier is unavailable rather than silently rendering it empty (a silent-empty health
@@ -54,7 +54,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
-from levain.spores import (
+from levain.intentions import (
     BUCKET_TRAY,
     LOOP_DISPOSITION,
     PARKED_TIER,
@@ -78,7 +78,7 @@ __all__ = [
     "GraphEdge",
     "AssociationGraph",
     "CrystalEntry",
-    "OpenSpore",
+    "OpenIntention",
     "EpisodeRow",
     "WrapRow",
     "ConfigDoc",
@@ -146,14 +146,14 @@ class AnnealPaths:
     episodic_db: Path
     continuity_md: Path
     crystal_json: Path
-    spores_json: Path
+    intentions_json: Path
 
     @classmethod
     def from_db(cls, episodic_db: str | Path) -> "AnnealPaths":
         """Derive the sibling stores from the episodic db path, by stem.
 
         ``/x/memory.db`` → continuity ``/x/memory.continuity.md``,
-        spores ``/x/memory.spores.json``, crystal ``/x/memory.crystal.json``.
+        intentions ``/x/memory.spores.json``, crystal ``/x/memory.crystal.json``.
         """
         db = Path(episodic_db).expanduser()
         parent, stem = db.parent, db.stem
@@ -161,7 +161,7 @@ class AnnealPaths:
             episodic_db=db,
             continuity_md=parent / f"{stem}.continuity.md",
             crystal_json=parent / f"{stem}.crystal.json",
-            spores_json=parent / f"{stem}.spores.json",
+            intentions_json=parent / f"{stem}.spores.json",
         )
 
 
@@ -194,7 +194,7 @@ class SubstrateSource:
     # it — the web /substrate.json, the TUI refresh, and post-write rebuilds all call a
     # bare source.build(), not just the first render. None → build_substrate_view's own
     # defaults apply. [codex L3 MED]
-    max_spores: int | None = None
+    max_intentions: int | None = None
     # Surface-level branding override (entity name + masthead wordmark/model). The bridge
     # flow-brands its cockpit; None → the view's derived entity + the renderers' Levain
     # default chrome (so a bare Levain install is untouched).
@@ -239,10 +239,10 @@ class SubstrateSource:
 
     def build(self, **kwargs: Any) -> "SubstrateView":
         """Assemble the view from this source. The single call entry points use,
-        so a team-commons source flows through unchanged. A source-level ``max_spores``
+        so a team-commons source flows through unchanged. A source-level ``max_intentions``
         is applied to EVERY build path (an explicit kwarg still wins)."""
-        if self.max_spores is not None:
-            kwargs.setdefault("max_spores", self.max_spores)
+        if self.max_intentions is not None:
+            kwargs.setdefault("max_intentions", self.max_intentions)
         view = build_substrate_view(
             self.anneal,
             install_root=self.install_root,
@@ -566,7 +566,7 @@ class CrystalEntry:
 
 
 @dataclass
-class OpenSpore:
+class OpenIntention:
     """An open prospective loop — the entity's unfinished intentions. ``tier`` /
     ``salience`` / ``next`` convey live state; germination is computed, not stored."""
 
@@ -582,15 +582,15 @@ class OpenSpore:
     # The operator-I/O disposition (control-plane Slice 3): ``loop`` (default — the
     # entity's own prospective loop) vs ``seed``/``handoff``/``agenda`` (the operator Tray).
     # Drives the Open-Loops / Tray render split; absent/falsy → ``loop`` (every
-    # pre-Slice-3 spore). See ``levain.spores`` for the vocab + the bucketing partition.
+    # pre-Slice-3 intention). See ``levain.intentions`` for the vocab + the bucketing partition.
     disposition: str = LOOP_DISPOSITION
-    # The valid Class-B resolve kinds for THIS spore's type, derived from anneal's
+    # The valid Class-B resolve kinds for THIS intention's type, derived from anneal's
     # own DESCEND_BY_TYPE / ASCEND_BY_TYPE (Slice 2b-ii). Schema-driven from the
     # substrate so the plane's verb affordances can't drift from anneal's taxonomy
     # (principle #4). Empty for an unknown type → the plane offers no resolve verb.
     descend_kinds: list[str] = field(default_factory=list)
     ascend_kinds: list[str] = field(default_factory=list)
-    # when the spore was created, as stored ("" when the store has none): the Tray's age, never versioned
+    # when the intention was created, as stored ("" when the store has none): the Tray's age, never versioned
     created: str = ""
     # anneal's store-assigned origin key ("" when the store has none): the key a cockpit label is
     # written under (K2b-3b), so a rendered row can name its own label resource. Never versioned
@@ -608,14 +608,14 @@ class OpenSpore:
         return self.__dict__.copy()
 
 
-def open_spore_from(s: Mapping[str, Any]) -> "OpenSpore":
-    """One stored spore (anneal's dict) as the view's ``OpenSpore``. The cockpit's spore rows and
-    the version a spore write is compared against (``cockpit.providers.spore_row_version``) are
+def open_intention_from(s: Mapping[str, Any]) -> "OpenIntention":
+    """One stored intention (anneal's dict) as the view's ``OpenIntention``. The cockpit's intention rows and
+    the version an intention write is compared against (``cockpit.providers.intention_row_version``) are
     both built through here. Raises ``ValueError``/``TypeError`` on a malformed row."""
     from anneal_memory.spores import ASCEND_BY_TYPE, DESCEND_BY_TYPE   # lazy, as the view's own read
 
     stype = str(s.get("type", ""))
-    return OpenSpore(
+    return OpenIntention(
         id=str(s.get("id", "")),
         type=stype,
         tier=str(s.get("tier", "")),
@@ -651,7 +651,7 @@ class EpisodeRow:
     """One recent episode — the raw input layer the consolidate compresses from.
     The PANEL is Class B (read-only here): per scope §4's edit-class taxonomy the
     chip encodes the EDIT MODEL, and the only episode mutation is a verb-mediated
-    tombstone (never a raw write), exactly like spores — so the Operate zone is
+    tombstone (never a raw write), exactly like intentions — so the Operate zone is
     coherently verb-mediated. (§6's build-note loosely said "Class A"; §4, the
     canonical table, governs — and seam #2 keys Slice-2 affordances off this chip,
     so it must signal verb-mediated, not direct-edit.) The dashboard surfaces the
@@ -671,7 +671,7 @@ class EpisodeRow:
 @dataclass
 class WrapRow:
     """One historical wrap — the consolidate's audit trail surfaced as a timeline.
-    The read foundation for the **projection-history viewer** (Slice 2b-ii / spore-093
+    The read foundation for the **projection-history viewer** (Slice 2b-ii / intention-093
     v0): each wrap is a RE-PROJECTION of the continuity from the moving substrate, not
     a saved version — so the timeline teaches *view-as-of + re-project, never restore*
     (the Slice-2 RESTORE half was killed 2026-06-14 as incoherent over a projection of
@@ -707,7 +707,7 @@ class ConfigDoc:
       draft lumped it with the operator's ``world.md`` as Class A — corrected). The
       operator's legitimate influence on the entity's self is the future
       correction-as-input channel (§9), not a file rewrite; until then it reads.
-    - the constitution (``partnership.md`` / ``memory.md`` / ``memory_workflow.md`` / ``spore_instructions.md``)
+    - the constitution (``partnership.md`` / ``memory.md`` / ``memory_workflow.md`` / ``intention_instructions.md``)
       → **Class C-view** (the advanced "fork my methodology" edit is Slice 2+).
 
     All live in the Identity zone. ``heading`` is the exact ``## `` section heading
@@ -1224,14 +1224,14 @@ class SubstrateView:
     health: Health | None = None
     graph: AssociationGraph | None = None
     crystal_index: list[CrystalEntry] = field(default_factory=list)
-    # The spore layer, split into its three operator-facing projections (Slice 3). The
-    # FULL list_open result is bucketed via ``levain.spores.bucket_of`` — a total
-    # partition, so a spore lands in exactly one. ``open_spores`` keeps its name (the
+    # The intention layer, split into its three operator-facing projections (Slice 3). The
+    # FULL list_open result is bucketed via ``levain.intentions.bucket_of`` — a total
+    # partition, so an intention lands in exactly one. ``open_intentions`` keeps its name (the
     # active prospective loops — the entity's live cognition) for backward-compat with
     # every existing consumer (parked loops included, marked by their tier); ``tray`` (the
-    # operator session-I/O inbox, plus any legacy note) is new. Each is independently capped at ``max_spores``.
-    open_spores: list[OpenSpore] = field(default_factory=list)
-    tray: list[OpenSpore] = field(default_factory=list)
+    # operator session-I/O inbox, plus any legacy note) is new. Each is independently capped at ``max_intentions``.
+    open_intentions: list[OpenIntention] = field(default_factory=list)
+    tray: list[OpenIntention] = field(default_factory=list)
     episodes: list[EpisodeRow] = field(default_factory=list)
     sections: list[Section] = field(default_factory=list)
     config_docs: list[ConfigDoc] = field(default_factory=list)
@@ -1253,7 +1253,7 @@ class SubstrateView:
         reads ``edit_class`` to enable affordances; 1.5 renders read-only.
 
         Panels are emitted Identity → Operate → Mind (tab/scroll order). Singleton
-        kinds (health/graph/crystals/spores/episodes/wraps) read their data from the
+        kinds (health/graph/crystals/intentions/episodes/wraps) read their data from the
         matching view field; indexed kinds (config/section) carry ``ref``."""
         panels: list[dict[str, Any]] = []
 
@@ -1272,20 +1272,20 @@ class SubstrateView:
             )
 
         # --- Operate: the inputs/loops you steer -----------------------------
-        # The two spore projections, adjacent: the entity's loops (parked ones marked), the operator
+        # The two intention projections, adjacent: the entity's loops (parked ones marked), the operator
         # session-I/O inbox (Slice 3 capture-UX (A) — ONE Tray, not three disposition panels;
         # the Keep panel is gone, TS-5a). Both are Class B: Open Loops gets
         # the lifecycle verbs; Tray (Slice 3b) gets the freeform dump box + per-row triage
         # verbs (metabolize / schedule / dismiss).
-        # Honesty floor: the two projections share ONE spore read; when it FAULTS the
+        # Honesty floor: the two projections share ONE intention read; when it FAULTS the
         # count is meaningless, so the header must show "(unavailable)" — never "(0)" over
         # an unreadable store (that would contradict the body's "unavailable" and read as a
         # false zero on a header-only glance). [no_data != no_event; header/body parity]
-        _spore_err = "open_spores" in self.errors
-        _oc = "unavailable" if _spore_err else len(self.open_spores)
-        _tc = "unavailable" if _spore_err else len(self.tray)
+        _intention_err = "open_intentions" in self.errors
+        _oc = "unavailable" if _intention_err else len(self.open_intentions)
+        _tc = "unavailable" if _intention_err else len(self.tray)
         panels.append(
-            {"kind": "spores", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
+            {"kind": "intentions", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
              "title": f"Open loops ({_oc})"}
         )
         panels.append(
@@ -1344,7 +1344,7 @@ class SubstrateView:
                 "episodic_db": str(self.paths.episodic_db),
                 "continuity_md": str(self.paths.continuity_md),
                 "crystal_json": str(self.paths.crystal_json),
-                "spores_json": str(self.paths.spores_json),
+                "intentions_json": str(self.paths.intentions_json),
             },
             "scope": self.scope,
             "entity_name": self.entity_name,
@@ -1353,7 +1353,7 @@ class SubstrateView:
             "health": self.health.to_dict() if self.health else None,
             "graph": self.graph.to_dict() if self.graph else None,
             "crystal_index": [c.to_dict() for c in self.crystal_index],
-            "open_spores": [s.to_dict() for s in self.open_spores],
+            "open_intentions": [s.to_dict() for s in self.open_intentions],
             "tray": [s.to_dict() for s in self.tray],
             "episodes": [e.to_dict() for e in self.episodes],
             "sections": [s.to_dict() for s in self.sections],
@@ -1505,11 +1505,11 @@ _CONSTITUTION = (
     ("partnership.md", "Constitution · how we work"),
     ("memory.md", "Constitution · your memory"),
     ("memory_workflow.md", "Constitution · your memory's wrap"),
-    ("spore_instructions.md", "Constitution · open loops"),
+    ("intention_instructions.md", "Constitution · open loops"),
 )
 
 # Bound the one operator-unbounded config tier: every other tier is capped
-# (max_spores/max_episodes/max_wraps/max_graph_nodes), but world.md splits into
+# (max_intentions/max_episodes/max_wraps/max_graph_nodes), but world.md splits into
 # one panel per ``##`` section, so a pathological world.md could emit arbitrarily
 # many. Cap the world-section split (the shipped template has 11; 40 is generous
 # headroom) so the Identity zone can't become an unbounded document dump.
@@ -1693,7 +1693,7 @@ def _episode_tags(ep: Any) -> list[str]:
 def _episode_row(ep: Any) -> EpisodeRow:
     """Build the dashboard's ``EpisodeRow`` from a raw anneal episode — the SINGLE
     place the row shape lives, so the recent-episodes panel and the keyword-recall
-    surface (spore-107) can never drift apart. Content rides FULL (raw) over the wire:
+    surface (intention-107) can never drift apart. Content rides FULL (raw) over the wire:
     truncating it here lost the tail with no way to see it (and an edit would have
     written the truncation back). The surface clamps the row for density + offers a
     per-item expand; the canonical text stays whole [display-renders / view-clamps]."""
@@ -1718,7 +1718,7 @@ def recall_episode_rows(
     episodic_db: Path, *, keyword: str, limit: int
 ) -> tuple[list[EpisodeRow], str | None]:
     """Read-only keyword search over the episodic store — the data layer behind the
-    cockpit's episode-search box (spore-107). Opens the Store ``read_only=True`` and
+    cockpit's episode-search box (intention-107). Opens the Store ``read_only=True`` and
     delegates the match to anneal's own ``Store.recall(keyword=...)`` (content ``LIKE``,
     wildcards escaped, newest first), returning rows in the SAME shape as the recent-
     episodes panel (via ``_episode_row``) so the surface renders them identically.
@@ -1791,7 +1791,7 @@ def build_substrate_view(
     graph_min_strength: float = 0.0,
     max_graph_nodes: int = 300,
     max_graph_edges: int = 2000,
-    max_spores: int = 50,
+    max_intentions: int = 50,
     max_episodes: int = 50,
     max_wraps: int = 50,
     sections: tuple[str, ...] = _ALL_SECTIONS,
@@ -1987,50 +1987,50 @@ def build_substrate_view(
     except store_faults as exc:
         view.errors["crystal_index"] = f"{type(exc).__name__}: {exc}"
 
-    # --- open spores → the three operator-facing projections (Slice 3) ------
+    # --- open intentions → the three operator-facing projections (Slice 3) ------
     #     Open Loops (cognition, parked loops marked) / Tray (operator session-I/O inbox,
-    #     legacy notes included), bucketed via levain.spores.bucket_of. Bucket the
+    #     legacy notes included), bucketed via levain.intentions.bucket_of. Bucket the
     #     FULL ranked list_open result (NOT a pre-sliced head): an inbox row must not be
     #     starved out of the Tray by loops ahead of it in the rank. Each bucket is independently capped at
-    #     max_spores (parked loops under their own cap inside Open loops: they rank LAST) — keeping each bucket's TOP max_spores BY RANK, which is meaningful
+    #     max_intentions (parked loops under their own cap inside Open loops: they rank LAST) — keeping each bucket's TOP max_intentions BY RANK, which is meaningful
     #     ONLY because list_open is pre-ranked (a future refactor that feeds an UNRANKED
     #     list here would make each bucket's cap arbitrary). Defensive per-row: one
     #     malformed row skipped, the tier survives.
     try:
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import IntentionStore
 
-        if paths.spores_json.exists():
-            # bucket name → its destination list; the BUCKET_LOOP default is open_spores
+        if paths.intentions_json.exists():
+            # bucket name → its destination list; the BUCKET_LOOP default is open_intentions
             bucket_target = {BUCKET_TRAY: view.tray}
-            parked_n = 0   # parked loops in view.open_spores (their cap is separate)
-            for s in SporeStore(paths.spores_json).list_open(today=today):
+            parked_n = 0   # parked loops in view.open_intentions (their cap is separate)
+            for s in IntentionStore(paths.intentions_json, id_prefix="intention").list_open(today=today):
                 # The WHOLE per-row pipeline (status-skip → route → cap → construct) lives
                 # in ONE try, so a fault on ANY phase drops just that row — the "one
                 # malformed row skipped, the tier survives" guarantee holds for routing,
                 # not only construction [complement L3 LOW]. (anneal's _load already
                 # guarantees dict rows, so this is defense-in-depth, not a live exposure.)
                 try:
-                    # Defensive (codex L3 MED): anneal MOVES a resolved spore to the
+                    # Defensive (codex L3 MED): anneal MOVES a resolved intention to the
                     # `resolved` array AND sets status=resolved, so a status=resolved row
-                    # still in the `spores` array is store drift. list_open does NOT filter
+                    # still in the `intentions` array is store drift. list_open does NOT filter
                     # status — skip it so it can't render as an open loop carrying verbs.
                     if s.get("status") == "resolved":
                         continue
-                    target = bucket_target.get(bucket_of(s), view.open_spores)
+                    target = bucket_target.get(bucket_of(s), view.open_intentions)
                     # A parked loop rides in Open loops but under its OWN cap: it ranks LAST, so a
                     # shared cap would drop every one of them on a busy install (the starvation the
                     # old separate Keep bucket existed to prevent) [TS-5a L3].
-                    parked = target is view.open_spores and s.get("tier") == PARKED_TIER
-                    held = parked_n if parked else len(target) - (parked_n if target is view.open_spores else 0)
-                    if held >= max_spores:
+                    parked = target is view.open_intentions and s.get("tier") == PARKED_TIER
+                    held = parked_n if parked else len(target) - (parked_n if target is view.open_intentions else 0)
+                    if held >= max_intentions:
                         continue  # this pool is full — keep scanning for the others
-                    target.append(open_spore_from(s))
+                    target.append(open_intention_from(s))
                     if parked:
                         parked_n += 1
                 except (ValueError, TypeError):
                     continue  # one malformed row skipped; the tier survives
     except store_faults as exc:
-        view.errors["open_spores"] = f"{type(exc).__name__}: {exc}"
+        view.errors["open_intentions"] = f"{type(exc).__name__}: {exc}"
 
     # --- continuity narrative sections (every neocortex section) ------------
     try:
@@ -2182,9 +2182,9 @@ def render_text(view: SubstrateView) -> str:
             out.append(f"  - {c.name} ({c.level}x) — {c.one_clause}")
         out.append("")
 
-    if view.open_spores:
-        out.append(f"Open loops ({len(view.open_spores)})")
-        for s in view.open_spores:
+    if view.open_intentions:
+        out.append(f"Open loops ({len(view.open_intentions)})")
+        for s in view.open_intentions:
             nxt = f" → next {s.next}" if s.next else ""
             out.append(f"  - [{s.tier}] {s.text}{nxt}")
         out.append("")
@@ -2241,7 +2241,7 @@ def render_summary(view: SubstrateView) -> str:
     The full ``SubstrateView`` rides in ``structuredContent`` (the UI's render
     prop, hidden from the model). This is the compact, reason-over-able digest
     the model actually sees: write-path health, the load-bearing counts, and the
-    State / Active-Threads headlines — NOT the whole graph + spore + crystal dump
+    State / Active-Threads headlines — NOT the whole graph + intention + crystal dump
     (that would bloat model context, which is the exact inversion the
     content/structuredContent split exists to prevent). Also the text-only
     fallback for hosts without MCP-Apps support."""
@@ -2278,7 +2278,7 @@ def render_summary(view: SubstrateView) -> str:
         lines.append(f"Health: unavailable — {view.errors['store']}")
 
     lines.append(f"Crystallized patterns: {len(view.crystal_index)}")
-    lines.append(f"Open loops: {len(view.open_spores)}")
+    lines.append(f"Open loops: {len(view.open_intentions)}")
     if view.tray:
         lines.append(f"Tray (operator inbox): {len(view.tray)}")
     lines.append(f"Recent episodes: {len(view.episodes)}")

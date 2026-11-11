@@ -61,6 +61,7 @@ from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent.queue import default_queue_dir
 from levain.consent.record import AGENTS
+from levain.intention_legacy import STORE_FILE_NAME
 
 __all__ = ["ANSWER_CHANNELS", "DB_NAME", "FORMAT", "SNOOZE_MAX_DAYS", "SNOOZE_VIAS", "Answer", "Link", "Question",
            "QuestionStore", "QuestionStoreError", "Snooze", "local_today", "snooze_refusal", "valid_date"]
@@ -177,10 +178,10 @@ class Question:
     # :func:`levain.band_view._later_date` to fold a row that comes back on a later day into its LATER line
     snoozed_until: str | None = None
     dated: str | None = None
-    # the spore id of the open intention this row rings (an open agenda whose stamp names the row), projected by the host at
+    # the intention id of the open intention this row rings (an open agenda whose stamp names the row), projected by the host at
     # read time and never stored here. None = a machine-filed row, which keeps its answer options
     intention: str | None = None
-    # that intention's own words (the spore's text, not the row's filed words), projected beside it: what the row draws and
+    # that intention's own words (the intention's text, not the row's filed words), projected beside it: what the row draws and
     # what its Edit field starts from. None = the host sends none, and the Edit field starts empty
     intention_text: str | None = None
 
@@ -198,8 +199,8 @@ def open_ended_of(q: Any) -> bool:
 
 
 INTENTION_ACTIONS = ("snooze", "edit", "done", "clear")
-# an id minted before anneal 1.0.7 is ``spore-N``; a new one (``id_prefix="intention"``) is ``intention-NNN``: both are read
-INTENTION_ID = re.compile(r"(?:spore|intention)-[0-9A-Za-z_-]{1,56}")
+# an id minted before anneal 1.0.7 is ``intention-N``; a new one (``id_prefix="intention"``) is ``intention-NNN``: both are read
+INTENTION_ID = re.compile(r"(?:intention|intention)-[0-9A-Za-z_-]{1,56}")
 
 
 def valid_intention_id(value: Any) -> bool:
@@ -207,21 +208,21 @@ def valid_intention_id(value: Any) -> bool:
 
 
 def intention_of(store: Any, q: Any) -> str | None:
-    """The spore id of the open intention ``q`` rings, only when ``store`` can act on it (a host with no callable
+    """The intention id of the open intention ``q`` rings, only when ``store`` can act on it (a host with no callable
     ``intention_act`` offers no controls, so the row stays a plain answerable one) and ``q`` is still open."""
     if not callable(getattr(store, "intention_act", None)) or getattr(q, "answer", None) is not None:
         return None
     got = getattr(q, "intention", None)
     if got is None and callable(getattr(store, "intention_for", None)):
         try:
-            got = store.intention_for(q)         # a native store projects it from its own spore store
+            got = store.intention_for(q)         # a native store projects it from its own intention store
         except Exception:  # noqa: BLE001 - a row that cannot be projected is a plain row
             got = None
     return got if valid_intention_id(got) else None
 
 
 def intention_text_of(store: Any, q: Any) -> str | None:
-    """The words of the intention ``q`` rings (the spore's own text), only when :func:`intention_of` names one: the host's
+    """The words of the intention ``q`` rings (the intention's own text), only when :func:`intention_of` names one: the host's
     projected ``intention_text``, else a native store's own read. None when neither has them."""
     if intention_of(store, q) is None:
         return None
@@ -546,13 +547,13 @@ class QuestionStore:
 
     def __init__(self, directory: Path | str | None = None, *,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 spores_json: Path | str | None = None) -> None:
+                 intentions_json: Path | str | None = None) -> None:
         self.directory = Path(directory) if directory is not None else default_queue_dir()
         self.path = self.directory / DB_NAME
         self._clock = clock
         self._ready = False
-        # the spore store whose open agendas ring this band's rows; None = the one under a question's own install
-        self._spores_json = Path(spores_json) if spores_json is not None else None
+        # the intention store whose open agendas ring this band's rows; None = the one under a question's own install
+        self._intentions_json = Path(intentions_json) if intentions_json is not None else None
         self._rings_seen: tuple[Any, dict[str, tuple[str, str]]] | None = None
 
     # --- store ---------------------------------------------------------------------------------------
@@ -960,7 +961,7 @@ class QuestionStore:
 
     # --- deferring -----------------------------------------------------------------------------------
     def snooze(self, ref: Any, *, until: str | None, channel: str, via: str, note: str | None = None,
-               spores_json: Path | str | None = None) -> Snooze:
+               intentions_json: Path | str | None = None) -> Snooze:
         """Defer an open question to the local day ``until`` (``YYYY-MM-DD``, after today and at most
         :data:`SNOOZE_MAX_DAYS` days ahead), or bring a deferred one back now (``until=None``), as one appended
         ``question_snoozes`` row: the newest row of a question wins. The question stays OPEN: its number, its version
@@ -984,13 +985,13 @@ class QuestionStore:
                 raise ConsentError(f"question #{q.n} was already answered at {q.answer.answered_at}: there is nothing "
                                    "to snooze")
             if until is not None:
-                from levain.spores import spore_ringing_question
+                from levain.intentions import intention_ringing_question
 
-                # the spore store the INSTALL uses (the caller's), then, for a row filed from another install, the one under
+                # the intention store the INSTALL uses (the caller's), then, for a row filed from another install, the one under
                 # the question's own cwd
                 sid = None
-                for path in (spores_json, Path(q.cwd) / ".levain" / "memory.spores.json" if q.cwd else None):
-                    sid = spore_ringing_question(path, q.id) if path is not None else None
+                for path in (intentions_json, Path(q.cwd) / ".levain" / STORE_FILE_NAME if q.cwd else None):
+                    sid = intention_ringing_question(path, q.id) if path is not None else None
                     if sid:
                         break
                 if sid:
@@ -1014,17 +1015,17 @@ class QuestionStore:
         return Snooze(seq, q.id, until, channel, via, note, stamp)
 
     # --- intentions ----------------------------------------------------------------------------------
-    def _spores_path(self, q: Question) -> Path | None:
-        # Known edge: a store built with no spore store (the served cockpit's own) reads the one under the row's install;
+    def _intentions_path(self, q: Question) -> Path | None:
+        # Known edge: a store built with no intention store (the served cockpit's own) reads the one under the row's install;
         # germinate files its rows with that install as their cwd, so a row filed with none rings nothing
-        if self._spores_json is not None:
-            return self._spores_json
-        return Path(q.cwd) / ".levain" / "memory.spores.json" if q.cwd else None
+        if self._intentions_json is not None:
+            return self._intentions_json
+        return Path(q.cwd) / ".levain" / STORE_FILE_NAME if q.cwd else None
 
     def _rings(self, path: Path) -> dict[str, tuple[str, str]]:
-        """``{question id: (spore id, spore text)}`` for every open agenda whose stamp names a question: one read of the
-        spore store, kept while the file looks unchanged and forgotten whenever this store writes it."""
-        from levain.spores import list_open_readonly, ringing_ref
+        """``{question id: (intention id, intention text)}`` for every open agenda whose stamp names a question: one read of the
+        intention store, kept while the file looks unchanged and forgotten whenever this store writes it."""
+        from levain.intentions import list_open_readonly, ringing_ref
 
         try:
             st = path.stat()
@@ -1047,16 +1048,16 @@ class QuestionStore:
         return out
 
     def _ring_of(self, q: Question) -> tuple[str, str] | None:
-        path = self._spores_path(q)
+        path = self._intentions_path(q)
         return None if path is None else self._rings(path).get(q.id)
 
     def intention_for(self, q: Question) -> str | None:
-        """The spore id of the open agenda ringing ``q`` (its stamp names ``q.id``), else None: a machine-filed row."""
+        """The intention id of the open agenda ringing ``q`` (its stamp names ``q.id``), else None: a machine-filed row."""
         ring = self._ring_of(q)
         return None if ring is None else ring[0]
 
     def intention_text_for(self, q: Question) -> str | None:
-        """The own words of the open agenda ringing ``q`` (its spore text, not the row's filed words), else None."""
+        """The own words of the open agenda ringing ``q`` (its intention text, not the row's filed words), else None."""
         ring = self._ring_of(q)
         return None if ring is None else ring[1]
 
@@ -1065,16 +1066,16 @@ class QuestionStore:
         """Act on the intention an open band row rings: ``snooze`` (the agenda moves to ``until`` and loses its stamp, the
         row closes, and the agenda files a new row the day it wakes), ``edit`` (the agenda's text, written only when it
         changed; the row keeps the words it was filed with), ``done`` or ``clear`` (the agenda resolves, the row closes).
-        ``ref`` is the spore id (the reminder the operator saw: it must still ring an open row) or the question (as
+        ``ref`` is the intention id (the reminder the operator saw: it must still ring an open row) or the question (as
         :meth:`get`). A snooze, done or clear holds this store's write transaction from "the row is still open" to its
         close, so an answer elsewhere either lands first (and this is refused, the reminder untouched) or waits. A close
         that fails after the reminder moved is reported in the words returned, never as a refusal. A moved row or reminder
         raises :class:`IntentionStale`; the operator's own input, :class:`ConsentError`. Nothing here authorises anything."""
-        from anneal_memory.spores import SporeError, spore_version
+        from anneal_memory.spores import IntentionError, intention_version
 
-        from levain.spores import answered_descend_kind, dropped_descend_kind, guarded_spore_store
+        from levain.intentions import answered_descend_kind, dropped_descend_kind, guarded_intention_store
 
-        # Lock order, by intent: this store's question lock is taken first, then the spore store's own lock inside it.
+        # Lock order, by intent: this store's question lock is taken first, then the intention store's own lock inside it.
         if action not in INTENTION_ACTIONS:
             raise ConsentError(f"unknown intention action {action!r}")
         if channel not in ANSWER_CHANNELS:
@@ -1090,7 +1091,7 @@ class QuestionStore:
         if q.answer is not None:
             raise IntentionStale(f"question #{q.n} was already answered at {q.answer.answered_at}")
         sid = self.intention_for(q)
-        path = self._spores_path(q)
+        path = self._intentions_path(q)
         if sid is None or path is None:
             raise IntentionStale(f"question #{q.n} rings no open intention now: answer it as before")
         if action == "snooze":
@@ -1099,16 +1100,16 @@ class QuestionStore:
                 raise ConsentError(refused)
         elif action == "edit" and not (isinstance(text, str) and text.strip()):
             raise ConsentError("the text cannot be empty")
-        spores = guarded_spore_store(path)
-        item = next((i for i in spores.list_open() if i.get("id") == sid), None)
+        intentions = guarded_intention_store(path)
+        item = next((i for i in intentions.list_open() if i.get("id") == sid), None)
         if item is None:
             raise IntentionStale(f"{sid} is no longer open: the row has moved")
         if action == "edit":
             if text == item.get("text"):
                 return f"{sid} unchanged"
             try:
-                spores.update(sid, text=text, expect_disposition="agenda", expected_version=spore_version(item))
-            except SporeError as exc:
+                intentions.update(sid, text=text, expect_disposition="agenda", expected_version=intention_version(item))
+            except IntentionError as exc:
                 raise IntentionStale(f"{sid} changed while you looked ({exc}): the row has moved") from None
             finally:
                 self._rings_seen = None
@@ -1122,13 +1123,13 @@ class QuestionStore:
                     raise IntentionStale(f"question #{q.n} was answered while you looked: the row has moved")
                 try:
                     if action == "snooze":
-                        spores.update(sid, next=until, germinated={}, expect_disposition="agenda",
-                                      expected_version=spore_version(item))
+                        intentions.update(sid, next=until, germinated={}, expect_disposition="agenda",
+                                      expected_version=intention_version(item))
                     else:
                         kind = (answered_descend_kind(item.get("type")) if action == "done"
                                 else dropped_descend_kind(item.get("type")))
-                        spores.descend(sid, kind=kind, expect_disposition="agenda", expected_version=spore_version(item))
-                except SporeError as exc:
+                        intentions.descend(sid, kind=kind, expect_disposition="agenda", expected_version=intention_version(item))
+                except IntentionError as exc:
                     raise IntentionStale(f"{sid} changed while you looked ({exc}): the row has moved") from None
                 finally:
                     self._rings_seen = None

@@ -103,7 +103,7 @@ class ActionManifest:
     or the new, never a mix. A binding risk resolver that reads a catalog of its own is not frozen by the
     gate; ``GateHandle.swap`` builds its resolver over a frozen snapshot of the catalog it is given.
 
-    What the freeze is NOT (L3 r6-r7, spore-813): a defence against code running in the gate's own
+    What the freeze is NOT (L3 r6-r7, intention-813): a defence against code running in the gate's own
     process. Such code can reassign or edit any private attribute (``gate._manifest``, its ``_actions``),
     as it can edit a ``frozen=True`` :class:`ActionRisk` with ``object.__setattr__`` (run 2026-10-09);
     no Python-level guard bounds it, so none is added. The authority boundary is outside the process:

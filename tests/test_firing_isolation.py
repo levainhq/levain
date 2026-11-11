@@ -1,4 +1,4 @@
-"""Isolation tests (spore-277) — the sovereignty guard for a runnable ISOLATED Levain entity.
+"""Isolation tests (intention-277) — the sovereignty guard for a runnable ISOLATED Levain entity.
 
 The #1 requirement: an OpenHands entity firing must recall/capture ONLY under its own
 ``<entity>/.levain/`` store and NEVER touch the operator-laptop flow store (``~/.anneal-memory/``).
@@ -191,7 +191,7 @@ def test_resolve_entity_dir_explicit_wins(tmp_path):
 
 
 def test_resolve_entity_dir_ignores_a_stale_process_env(tmp_path, monkeypatch):
-    """spore-438: there is no process-level entity channel. A leftover $LEVAIN_ENTITY_DIR (the retired
+    """intention-438: there is no process-level entity channel. A leftover $LEVAIN_ENTITY_DIR (the retired
     channel) names nothing — an entity is carried by the object being served, never looked up."""
     monkeypatch.setenv("LEVAIN_ENTITY_DIR", str(tmp_path / "envent"))
     with pytest.raises(IsolationError, match="no entity given"):

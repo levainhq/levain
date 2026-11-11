@@ -98,7 +98,7 @@ class TestAnnealPaths:
         p = AnnealPaths.from_db("/x/y/memory.db")
         assert p.continuity_md == Path("/x/y/memory.continuity.md")
         assert p.crystal_json == Path("/x/y/memory.crystal.json")
-        assert p.spores_json == Path("/x/y/memory.spores.json")
+        assert p.intentions_json == Path("/x/y/memory.spores.json")
 
     def test_expanduser(self) -> None:
         p = AnnealPaths.from_db("~/foo/bar.db")
@@ -107,7 +107,7 @@ class TestAnnealPaths:
     def test_nondefault_stem(self) -> None:
         p = AnnealPaths.from_db("/x/entity.db")
         assert p.continuity_md.name == "entity.continuity.md"
-        assert p.spores_json.name == "entity.spores.json"
+        assert p.intentions_json.name == "entity.spores.json"
 
 
 # --- build_substrate_view --------------------------------------------------
@@ -139,7 +139,7 @@ class TestBuildView:
         assert v.health.status == "no-wraps"
         assert v.health.total_episodes == 0
         assert v.crystal_index == []
-        assert v.open_spores == []
+        assert v.open_intentions == []
         assert v.sections == []
         assert v.graph is not None
         assert v.graph.nodes == []
@@ -231,34 +231,34 @@ class TestBuildView:
         assert [s.heading for s in v.sections] == ["State", "Active Threads"]
         assert "current focus" in v.sections[0].body
 
-    def test_open_spores_surfaced(self, tmp_path: Path) -> None:
-        from anneal_memory.spores import SporeStore
+    def test_open_intentions_surfaced(self, tmp_path: Path) -> None:
+        from anneal_memory.spores import IntentionStore
 
         db = tmp_path / "memory.db"
-        SporeStore(tmp_path / "memory.spores.json").add(
+        IntentionStore(tmp_path / "memory.spores.json", id_prefix="intention").add(
             type="task", text="an open loop", tier="hot", salience=2
         )
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert len(v.open_spores) == 1
-        assert v.open_spores[0].text == "an open loop"
-        assert v.open_spores[0].tier == "hot"
+        assert len(v.open_intentions) == 1
+        assert v.open_intentions[0].text == "an open loop"
+        assert v.open_intentions[0].tier == "hot"
 
-    def test_long_spore_text_rides_full_and_raw_on_the_wire(self, tmp_path: Path) -> None:
-        # DATA-SAFETY regression: the wire MUST carry the FULL, RAW spore text — not a
+    def test_long_intention_text_rides_full_and_raw_on_the_wire(self, tmp_path: Path) -> None:
+        # DATA-SAFETY regression: the wire MUST carry the FULL, RAW intention text — not a
         # 200-char whitespace-collapsed cap. The old cap (a) hid the tail with no way to
         # see it AND (b) seeded the 3b text-editor, so save wrote the truncation back =
         # silent destruction of everything past char 200. Newlines must survive too (the
         # old _truncate collapsed them → an edit would have flattened structure). The
         # surface clamps the ROW for density; the canonical text stays whole.
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import IntentionStore
 
         long_text = "first line\n" + ("L" * 600) + "\n\ntail marker"  # past 200, multi-line
         db = tmp_path / "memory.db"
-        SporeStore(tmp_path / "memory.spores.json").add(
+        IntentionStore(tmp_path / "memory.spores.json", id_prefix="intention").add(
             type="task", text=long_text, tier="hot", salience=2
         )
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert v.open_spores[0].text == long_text  # FULL + RAW, byte-for-byte
+        assert v.open_intentions[0].text == long_text  # FULL + RAW, byte-for-byte
 
     def test_long_episode_content_rides_full_on_the_wire(self, tmp_path: Path) -> None:
         # Same data-safety contract for episode content (was capped at 280). Read-only, so
@@ -273,35 +273,35 @@ class TestBuildView:
         v = build_substrate_view(AnnealPaths.from_db(db))
         assert any(e.content == long_content for e in v.episodes)  # FULL, byte-for-byte
 
-    def test_source_level_max_spores_threads_to_every_build(self, tmp_path: Path) -> None:
-        # [codex L3 MED] A source-level max_spores must apply to EVERY build() path —
+    def test_source_level_max_intentions_threads_to_every_build(self, tmp_path: Path) -> None:
+        # [codex L3 MED] A source-level max_intentions must apply to EVERY build() path —
         # the web /substrate.json, the TUI refresh, and post-write rebuilds all call a
-        # BARE source.build(), not an explicit build(max_spores=) kwarg. Without the
-        # source-level field, "show ALL spores" silently reverts to the default cap after
+        # BARE source.build(), not an explicit build(max_intentions=) kwarg. Without the
+        # source-level field, "show ALL intentions" silently reverts to the default cap after
         # the first render.
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import IntentionStore
 
         from levain.dashboard import SubstrateSource
 
         db = tmp_path / "memory.db"
-        spores = SporeStore(tmp_path / "memory.spores.json")
+        intentions = IntentionStore(tmp_path / "memory.spores.json", id_prefix="intention")
         for i in range(3):
-            spores.add(type="task", text=f"loop {i}", tier="hot", salience=2)
+            intentions.add(type="task", text=f"loop {i}", tier="hot", salience=2)
         anneal = AnnealPaths.from_db(db)
-        capped = SubstrateSource(anneal=anneal, max_spores=2).build()  # source-level cap
-        assert len(capped.open_spores) == 2
+        capped = SubstrateSource(anneal=anneal, max_intentions=2).build()  # source-level cap
+        assert len(capped.open_intentions) == 2
         uncapped = SubstrateSource(anneal=anneal).build()  # no cap → all three
-        assert len(uncapped.open_spores) == 3
+        assert len(uncapped.open_intentions) == 3
 
-    def test_max_spores_cap(self, tmp_path: Path) -> None:
-        from anneal_memory.spores import SporeStore
+    def test_max_intentions_cap(self, tmp_path: Path) -> None:
+        from anneal_memory.spores import IntentionStore
 
         db = tmp_path / "memory.db"
-        store = SporeStore(tmp_path / "memory.spores.json")
+        store = IntentionStore(tmp_path / "memory.spores.json", id_prefix="intention")
         for i in range(5):
             store.add(type="task", text=f"loop {i}", tier="warm")
-        v = build_substrate_view(AnnealPaths.from_db(db), max_spores=3)
-        assert len(v.open_spores) == 3
+        v = build_substrate_view(AnnealPaths.from_db(db), max_intentions=3)
+        assert len(v.open_intentions) == 3
 
     def test_corrupt_crystal_is_failsoft(self, tmp_path: Path) -> None:
         """A corrupt crystal store degrades VISIBLY (errors) without blanking the
@@ -325,10 +325,10 @@ class TestBuildView:
         json.dumps(v.to_dict())
 
 
-class TestSporeProjections:
-    """Slice 3: the open-spore layer splits into Open Loops / Tray / Keep by disposition
-    + tier (``levain.spores.bucket_of``). Tests write spores.json DIRECTLY — anneal's
-    ``SporeStore.add`` is disposition-blind by design (the de-risk: anneal round-trips an
+class TestIntentionProjections:
+    """Slice 3: the open-intention layer splits into Open Loops / Tray / Keep by disposition
+    + tier (``levain.intentions.bucket_of``). Tests write spores.json DIRECTLY — anneal's
+    ``IntentionStore.add`` is disposition-blind by design (the de-risk: anneal round-trips an
     unknown ``disposition`` untouched), so a disposition can only be set out-of-band."""
 
     @staticmethod
@@ -358,24 +358,24 @@ class TestSporeProjections:
             self._row(id="s6", tier="parked", text="parked seed", disposition="seed"),
             self._row(id="s7", type="thought", text="legacy note", disposition="note"),
         ])
-        v = build_substrate_view(AnnealPaths.from_db(db), max_spores=1000)
+        v = build_substrate_view(AnnealPaths.from_db(db), max_intentions=1000)
         # TS-5a: a parked loop stays in Open loops (its tier is the parked marker) ...
-        assert {s.id for s in v.open_spores} == {"s1", "s5"}
-        assert next(s for s in v.open_spores if s.id == "s5").tier == "parked"
+        assert {s.id for s in v.open_intentions} == {"s1", "s5"}
+        assert next(s for s in v.open_intentions if s.id == "s5").tier == "parked"
         # ... disposition WINS over the parked tier: s6 (parked seed) is an un-triaged Tray
         # item, and a legacy note (s7) is shown in the Tray, never dropped.
         assert {s.id for s in v.tray} == {"s2", "s3", "s4", "s6", "s7"}
         assert next(s for s in v.tray if s.id == "s7").disposition == "note"
         assert not hasattr(v, "keep")
-        # TOTAL partition — every spore lands in exactly one bucket, nothing lost.
-        assert len(v.open_spores) + len(v.tray) == 7
+        # TOTAL partition — every intention lands in exactly one bucket, nothing lost.
+        assert len(v.open_intentions) + len(v.tray) == 7
 
     def test_disposition_defaults_to_loop(self, tmp_path: Path) -> None:
         db = tmp_path / "memory.db"
         self._write(tmp_path / "memory.spores.json",
                     [self._row(id="s1", tier="hot", text="no disposition key")])
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert v.open_spores[0].disposition == "loop"
+        assert v.open_intentions[0].disposition == "loop"
 
     def test_unknown_disposition_fails_open_to_loop(self, tmp_path: Path) -> None:
         # is_loop fails OPEN: an unknown/typo disposition reads as an in-cognition loop (a
@@ -385,7 +385,7 @@ class TestSporeProjections:
         self._write(tmp_path / "memory.spores.json",
                     [self._row(id="s1", tier="hot", text="typo", disposition="sed")])
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert [s.id for s in v.open_spores] == ["s1"]
+        assert [s.id for s in v.open_intentions] == ["s1"]
         assert v.tray == []
 
     def test_each_bucket_capped_independently(self, tmp_path: Path) -> None:
@@ -396,8 +396,8 @@ class TestSporeProjections:
             rows.append(self._row(id=f"seed{i}", text=f"seed {i}", disposition="seed"))
             rows.append(self._row(id=f"note{i}", text=f"note {i}", disposition="note"))
         self._write(tmp_path / "memory.spores.json", rows)
-        v = build_substrate_view(AnnealPaths.from_db(db), max_spores=2)
-        assert len(v.open_spores) == 2 and len(v.tray) == 2
+        v = build_substrate_view(AnnealPaths.from_db(db), max_intentions=2)
+        assert len(v.open_intentions) == 2 and len(v.tray) == 2
 
     def test_tray_not_starved_by_loop_heavy_store(self, tmp_path: Path) -> None:
         # Bucketing the FULL ranked list (not a pre-sliced head) keeps inbox rows alive when
@@ -406,32 +406,32 @@ class TestSporeProjections:
         rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}") for i in range(60)]
         rows.append(self._row(id="dump", text="must survive", disposition="seed"))
         self._write(tmp_path / "memory.spores.json", rows)
-        v = build_substrate_view(AnnealPaths.from_db(db))  # default max_spores=50
-        assert len(v.open_spores) == 50
+        v = build_substrate_view(AnnealPaths.from_db(db))  # default max_intentions=50
+        assert len(v.open_intentions) == 50
         assert [s.id for s in v.tray] == ["dump"]
 
     def test_parked_loops_not_starved_by_a_busy_install(self, tmp_path: Path) -> None:
         # TS-5a L3 HIGH: parked sorts LAST in the rank, so a shared Open-loops cap dropped every
-        # parked loop once max_spores live loops existed. Parked loops keep their own cap.
+        # parked loop once max_intentions live loops existed. Parked loops keep their own cap.
         db = tmp_path / "memory.db"
         rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}") for i in range(60)]
         rows.append(self._row(id="parked1", tier="parked", text="dormant"))
         self._write(tmp_path / "memory.spores.json", rows)
-        v = build_substrate_view(AnnealPaths.from_db(db))  # default max_spores=50
-        assert len([s for s in v.open_spores if s.tier != "parked"]) == 50
-        assert [s.id for s in v.open_spores if s.tier == "parked"] == ["parked1"]
+        v = build_substrate_view(AnnealPaths.from_db(db))  # default max_intentions=50
+        assert len([s for s in v.open_intentions if s.tier != "parked"]) == 50
+        assert [s.id for s in v.open_intentions if s.tier == "parked"] == ["parked1"]
 
     def test_resolved_status_drift_row_is_skipped(self, tmp_path: Path) -> None:
-        # A status=resolved row left in the `spores` array is store drift (anneal MOVES
-        # resolved spores to the `resolved` array); list_open doesn't filter status, so the
+        # A status=resolved row left in the `intentions` array is store drift (anneal MOVES
+        # resolved intentions to the `resolved` array); list_open doesn't filter status, so the
         # dashboard skips it defensively — it must not render as an open loop with verbs.
         db = tmp_path / "memory.db"
         self._write(tmp_path / "memory.spores.json", [
             self._row(id="s1", tier="hot", text="live loop"),
             self._row(id="drift", tier="hot", text="resolved drift", status="resolved"),
         ])
-        v = build_substrate_view(AnnealPaths.from_db(db), max_spores=1000)
-        all_ids = ([s.id for s in v.open_spores]
+        v = build_substrate_view(AnnealPaths.from_db(db), max_intentions=1000)
+        all_ids = ([s.id for s in v.open_intentions]
                    + [s.id for s in v.tray])
         assert all_ids == ["s1"]  # the drift row excluded from EVERY bucket
 
@@ -442,7 +442,7 @@ class TestSporeProjections:
         self._write(tmp_path / "memory.spores.json",
                     [self._row(id="s1", tier="hot", text="loop", next=20260626)])
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert v.open_spores[0].next == "20260626"
+        assert v.open_intentions[0].next == "20260626"
 
     def test_to_dict_and_render_text_carry_tray_and_parked(self, tmp_path: Path) -> None:
         from levain.dashboard import render_text
@@ -458,7 +458,7 @@ class TestSporeProjections:
         d = v.to_dict()
         assert [s["id"] for s in d["tray"]] == ["s2", "s6"]
         assert "keep" not in d
-        assert {s["id"] for s in d["open_spores"]} == {"s1", "s5"}
+        assert {s["id"] for s in d["open_intentions"]} == {"s1", "s5"}
         text = render_text(v)
         assert "Tray (2)" in text and "[seed] a fresh dump" in text and "[note] legacy note" in text
         assert "Open loops (2)" in text and "[parked] parked loop" in text
@@ -533,7 +533,7 @@ class TestCLISurface:
 
     def test_render_text_with_content(self, tmp_path: Path) -> None:
         from anneal_memory import Store
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import IntentionStore
 
         from levain.dashboard import AnnealPaths, build_substrate_view, render_text
 
@@ -543,7 +543,7 @@ class TestCLISurface:
             b = store.record("episode B", "observation")
             store.wrap_started(token="w1", episode_ids=[a.id, b.id])
             store.wrap_completed(2, 20, wrap_token="w1", episode_ids=[a.id, b.id])
-        SporeStore(tmp_path / "memory.spores.json").add(
+        IntentionStore(tmp_path / "memory.spores.json", id_prefix="intention").add(
             type="task", text="loop", tier="hot"
         )
         (tmp_path / "memory.continuity.md").write_text("## State\nfoc\n", encoding="utf-8")
@@ -584,7 +584,7 @@ def _make_levain_install(tmp_path: Path) -> Path:
     )
     (seed / "partnership.md").write_text("# How We Work\n\nPartner, not assistant.\n", encoding="utf-8")
     (seed / "memory.md").write_text("# Your Memory\n\nanneal.\n", encoding="utf-8")
-    (seed / "spore_instructions.md").write_text("# Open Loops\n\nspores.\n", encoding="utf-8")
+    (seed / "intention_instructions.md").write_text("# Open Loops\n\nspores.\n", encoding="utf-8")
     activation = root / "activation"
     activation.mkdir()
     (activation / "posture.md").write_text("# Posture\n\nthink out loud.\n", encoding="utf-8")
@@ -727,7 +727,7 @@ class TestSlice15Surfaces:
         kinds = [e["kind"] for e in layout]
         assert "keep" not in kinds   # TS-5a: no Keep panel in the layout
         # every panel kind is represented
-        for k in ("config", "spores", "tray", "episodes", "edits", "health",
+        for k in ("config", "intentions", "tray", "episodes", "edits", "health",
                   "graph", "crystals", "section", "wraps"):
             assert k in kinds
         # zones appear in IA order: identity → operate → mind (no interleaving)
@@ -747,7 +747,7 @@ class TestSlice15Surfaces:
         edits_panel = next(e for e in layout if e["kind"] == "edits")
         assert edits_panel["edit_class"] == "" and edits_panel["zone"] == "operate"
         # the edit-class chip encodes the EDIT MODEL (§4): the Operate zone is
-        # verb-mediated lifecycle data — spores AND episodes are Class B (episode
+        # verb-mediated lifecycle data — intentions AND episodes are Class B (episode
         # mutation = tombstone verb), NOT direct-edit. [L4 HIGH]
         by_kind = {e["kind"]: e for e in layout}
         assert by_kind["spores"]["edit_class"] == "B"
@@ -1009,7 +1009,7 @@ class TestEntityNameExtraction:
 
 
 class TestRecallEpisodeRows:
-    """recall_episode_rows — the read-only keyword-search data layer (spore-107)."""
+    """recall_episode_rows — the read-only keyword-search data layer (intention-107)."""
 
     def _db(self, tmp_path: Path):
         from anneal_memory import Store
@@ -1497,12 +1497,12 @@ class TestListPagePins:
 
     def test_a_band_or_board_row_returns_before_any_verb(self) -> None:
         core = self._js("dashboard_core.js")
-        row = self._fn(core, "  function sporeRow(", "  // The filter bar the spore panels share")
+        row = self._fn(core, "  function intentionRow(", "  // The filter bar the intention panels share")
         foreign = row[row.index("if (foreign) {"):]
         foreign = foreign[:foreign.index("return row;")]
-        # no spore verb, ever; the one thing a band row may draw is the four intention controls, and only when the row carries
+        # no intention verb, ever; the one thing a band row may draw is the four intention controls, and only when the row carries
         # an intention the kernel offered them on
-        assert "buildSporeVerbs" not in foreign
+        assert "buildPlainIntentionVerbs" not in foreign
         calls = [ln for ln in foreign.splitlines() if "appendRowVerbs(" in ln]
         assert all("buildIntentionVerbs(" in ln and "if (intend)" in ln for ln in calls), calls
         assert 'const intend = s.surface === "band" && s.intention && s.row_id && hasIntentionControls(s.actions);' in foreign
@@ -1513,7 +1513,7 @@ class TestListPagePins:
         panel = json.loads((Path(__file__).parent / "fixtures" / "list_panel.json").read_text())
         assert panel["id"] == "tray" and "list_intake" in {a["verb"] for a in panel["actions"]}
         surfaces = {r["facets"]["surface"] for r in panel["rows"]}
-        assert {"band", "board", "spore", "talk", "drop"} <= surfaces
+        assert {"band", "board", "intention", "talk", "drop"} <= surfaces
         for r in panel["rows"]:
             if r["facets"]["surface"] in ("band", "board"):
                 assert r["actions"] == [] if "actions" in r else True, r["id"]

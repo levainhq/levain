@@ -945,7 +945,7 @@ def build_parser() -> argparse.ArgumentParser:
             "serves a fresh SubstrateView snapshot on every request. READ-ONLY by "
             "default — it binds a socket, so read-only is the safe default (unlike "
             "`levain tui`, a local terminal, which defaults writable); pass --write for "
-            "the GOVERNED WRITABLE cockpit (operate State / spores / the List through "
+            "the GOVERNED WRITABLE cockpit (operate State / intentions / the List through "
             "the same governed seam `levain tui` uses; every write needs the write token "
             "the server prints at start). "
             "`serve-app` is the in-host MCP App alternative."
@@ -983,7 +983,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Serve the GOVERNED WRITABLE cockpit instead of a read-only glance — "
-            "enables State / spore touch/descend/ascend / the List / episode-tombstone "
+            "enables State / intention touch/descend/ascend / the List / episode-tombstone "
             "edits through the governed write seam. Every write needs the write token "
             "this server prints at start, with a link that carries it (loopback too: "
             "127.0.0.1 is reachable by every local user). Loopback-ONLY — there "
@@ -1450,16 +1450,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     adopt_p.set_defaults(func=_cmd_adopt_answers)
 
-    from levain.germinate import spores_verbs as _spores_verbs
+    from levain.germinate import intentions_verbs as _intentions_verbs
 
-    spores_sub = _spores_verbs(subparsers)
-    km_p = spores_sub.add_parser(
+    intentions_sub = _intentions_verbs(subparsers)
+    km_p = intentions_sub.add_parser(
         "keep-migrate",
         help="Move the retired Keep (notes, handoffs) into episodes and seeds: dry run, apply, revert.",
         description=(
             "With no --apply or --revert, writes a PLAN file under .levain/migrations/ and prints it; the "
-            "spore store is not touched. Edit the plan if a destination is wrong, then --apply PLAN moves "
-            "each Keep row to its destination (an episode or a spore) and composts the original; "
+            "intention store is not touched. Edit the plan if a destination is wrong, then --apply PLAN moves "
+            "each Keep row to its destination (an episode or an intention) and composts the original; "
             "--revert PLAN puts the originals back and removes what the apply made. Both are resumable "
             "and safe to run twice."
         ),
@@ -1476,7 +1476,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--agenda-date", default=None, dest="agenda_date", metavar="D",
         help="Dry run only: the YYYY-MM-DD date handoffs are scheduled for with --handoff-to agenda.",
     )
-    km_p.set_defaults(func=_cmd_spores_keep_migrate)
+    km_p.set_defaults(func=_cmd_intentions_keep_migrate)
     from levain.desk.door import not_door as _not_door
 
     _not_door(km_p)
@@ -2138,13 +2138,13 @@ def _cmd_tui(args: argparse.Namespace) -> int:
     return run_tui(path=args.path, read_only=args.read_only, manifest=args.manifest)
 
 
-def _cmd_spores_keep_migrate(args: argparse.Namespace) -> int:
+def _cmd_intentions_keep_migrate(args: argparse.Namespace) -> int:
     from levain import keep_migrate as km
     from levain.dashboard import AnnealPaths
 
     act = args.apply or args.revert
     if act is not None and (args.handoff_to is not None or args.agenda_date is not None):
-        print("levain spores keep-migrate: --handoff-to and --agenda-date shape a dry run; the plan file "
+        print("levain intentions keep-migrate: --handoff-to and --agenda-date shape a dry run; the plan file "
               "already holds the choice, so they cannot be combined with --apply or --revert.", file=sys.stderr)
         return 1
     root = Path(args.path).expanduser().resolve()
@@ -2152,7 +2152,7 @@ def _cmd_spores_keep_migrate(args: argparse.Namespace) -> int:
     paths = AnnealPaths.from_db(db)
     try:
         if act is None:
-            out = km.plan(paths.spores_json, migrations_dir=root / ".levain" / km.MIGRATIONS_SUBDIR,
+            out = km.plan(paths.intentions_json, migrations_dir=root / ".levain" / km.MIGRATIONS_SUBDIR,
                           episodic_db=db, handoff_to=args.handoff_to or "seed", agenda_date=args.agenda_date)
             doc = km.load_plan(out)
             c = doc["counts"]
@@ -2162,24 +2162,24 @@ def _cmd_spores_keep_migrate(args: argparse.Namespace) -> int:
                 d = it["destination"]
                 label = d.get("episode_type") if d.get("kind") == km.DEST_EPISODE else d.get("disposition")
                 print(f"  [{it['index']}] {it['disposition']} -> {d.get('kind')} {label}: {str(it['text'])[:70]}")
-            print(f"Nothing was changed. Apply with: levain spores keep-migrate --apply {out}")
+            print(f"Nothing was changed. Apply with: levain intentions keep-migrate --apply {out}")
             return 0
         doc = km.load_plan(act)
         rec_sp, rec_ep = doc.get("spores_json"), doc.get("episodic_db")
         wrong = []
-        if rec_sp is not None and Path(str(rec_sp)).expanduser().resolve() != paths.spores_json.resolve():
-            wrong.append(f"spore store {rec_sp} (--path install: {paths.spores_json})")
+        if rec_sp is not None and Path(str(rec_sp)).expanduser().resolve() != paths.intentions_json.resolve():
+            wrong.append(f"intention store {rec_sp} (--path install: {paths.intentions_json})")
         if rec_ep is not None and Path(str(rec_ep)).expanduser().resolve() != db.resolve():
             wrong.append(f"episode store {rec_ep} (--path install: {db})")
         if wrong:
-            print("levain spores keep-migrate: this plan was made for another install: its recorded "
+            print("levain intentions keep-migrate: this plan was made for another install: its recorded "
                   + " and ".join(wrong) + ". Nothing was changed; run it with --path of the install that made "
                   "the plan.", file=sys.stderr)
             return 1
         fn = km.apply if args.apply is not None else km.revert
         rep = fn(act, episodic_db=db)
     except km.KeepMigrateError as exc:
-        print(f"levain spores keep-migrate: {exc}", file=sys.stderr)
+        print(f"levain intentions keep-migrate: {exc}", file=sys.stderr)
         return 1
     done, verb = (rep.applied, "applied") if args.apply is not None else (rep.reverted, "reverted")
     print(f"keep-migrate {verb}: {len(done)} items ({rep.plan_path})")

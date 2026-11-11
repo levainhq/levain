@@ -183,7 +183,7 @@ def value_version_of(stored: Any) -> str:
 
 def row_version_of(stored: dict[str, Any], fields: tuple[str, ...], excluded: tuple[str, ...] = ()) -> str:
     """A row's version (§4.4) over its stored record: the ONE computation, used for every rendered
-    row and by a store that recomputes it inside its own write (a spore's ``version_of``)."""
+    row and by a store that recomputes it inside its own write (an intention's ``version_of``)."""
     if "*" in fields:
         payload = {k: v for k, v in stored.items() if k not in excluded}
     else:
@@ -215,7 +215,7 @@ class ProviderSpec:
     refresh_every_s: float | None = None
     stale_after_s: float = 900.0
     optional: bool = False
-    # a source the substrate only creates on first use (the spore store): absent before it was ever seen is an EMPTY panel,
+    # a source the substrate only creates on first use (the intention store): absent before it was ever seen is an EMPTY panel,
     # never a fault. Once seen, its disappearance is still a fault ("source disappeared").
     absent_is_empty: bool = False
     timeout_s: float = PANEL_READ_DEADLINE_S
@@ -2505,7 +2505,7 @@ class Cockpit:
         return {**value, "rows": keep}
 
     def _log_sentences(self, value: dict[str, Any], cred: str, auth: RequestAuthority) -> dict[str, Any]:
-        """One sentence per log row from the manifest's verb LABELS ("Snoozed · spore-1238"); a verb with
+        """One sentence per log row from the manifest's verb LABELS ("Snoozed · intention-1238"); a verb with
         no label renders as its raw name."""
         try:
             labels = {n: v.get("label") for n, v in
@@ -3203,7 +3203,7 @@ def _v_log(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
 
 
 TOPOLOGY_NODE_STATES = ("waiting", "errored", "stalled", "running", "idle")
-TOPOLOGY_TASK_KINDS = ("dispatch", "spore", "consent", "question", "unattached")
+TOPOLOGY_TASK_KINDS = ("dispatch", "intention", "consent", "question", "unattached")
 TOPOLOGY_TASK_STATES = ("waiting", "stuck", "running", "open", "done", "failed")
 TOPOLOGY_TASK_HEATS = ("hot", "warm", "cold", "parked")
 # "transcript": the tokens a task's workers spent, read from their session transcripts. Tokens only: a transcript carries no price.

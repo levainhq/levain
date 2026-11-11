@@ -9,10 +9,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from anneal_memory import SporeStore
+from anneal_memory import IntentionStore
 
 from levain import doctor
-from levain.spores import guarded_spore_store
+from levain.intentions import guarded_intention_store
 
 _T = Path(__file__).resolve().parents[1] / "levain" / "templates"
 _HOOK_DIRS = {"claude_code": _T / "activation" / "hooks", "codex": _T / "adapters" / "codex" / "activation" / "hooks"}
@@ -34,7 +34,7 @@ def _load(agent: str):
     return mod
 
 
-def _run(mod, monkeypatch, capsys, spores, tmp_path, rc=None):
+def _run(mod, monkeypatch, capsys, intentions, tmp_path, rc=None):
     h = mod.hook
     spawned: list[list[str]] = []
     kw_seen: list[dict] = []
@@ -42,9 +42,9 @@ def _run(mod, monkeypatch, capsys, spores, tmp_path, rc=None):
     monkeypatch.setattr(h.subprocess, "Popen", lambda argv, **kw: (spawned.append(argv), kw_seen.append(kw), _Child(rc))[2])
     monkeypatch.setattr(h, "install_root", lambda: tmp_path)
     monkeypatch.setattr(h, "should_fire", lambda: True)
-    monkeypatch.setattr(h, "open_agendas", lambda *a, **k: spores)
+    monkeypatch.setattr(h, "open_agendas", lambda *a, **k: intentions)
     monkeypatch.setattr(h, "wrap_state", lambda timeout=None: (0, False), raising=False)
-    for opt in ("open_spores", "due_dormant_spores"):
+    for opt in ("open_intentions", "due_dormant_intentions"):
         monkeypatch.setattr(h, opt, lambda *a, **k: [], raising=False)
     for opt in ("compat_drift", "pack_drift"):
         monkeypatch.setattr(h, opt, lambda *a, **k: None, raising=False)
@@ -58,7 +58,7 @@ def _run(mod, monkeypatch, capsys, spores, tmp_path, rc=None):
 
 
 def _agenda(nxt, **kw):
-    return {"id": "spore-001", "disposition": "agenda", "next": nxt, "text": "x", **kw}
+    return {"id": "intention-001", "disposition": "agenda", "next": nxt, "text": "x", **kw}
 
 
 @pytest.mark.parametrize("agent", ["claude_code", "codex"])
@@ -87,7 +87,7 @@ def _install(tmp_path) -> Path:
 def _add(root, nxt, disposition="agenda"):
     path = root / ".levain" / "memory.spores.json"
     day = nxt[:10]
-    s = guarded_spore_store(path).add(type="thought", text="call him", disposition=disposition, next=day)
+    s = guarded_intention_store(path).add(type="thought", text="call him", disposition=disposition, next=day)
     if nxt != day:      # anneal's write path takes a date only; a timed next is stored by hand (as a hand edit would)
         doc = json.loads(path.read_text())
         for row in (doc["spores"] if isinstance(doc, dict) else doc):
@@ -113,7 +113,7 @@ def test_overdue_agenda_silent_when_today_future_or_not_an_agenda(tmp_path):
     assert doctor._check_overdue_agenda(root, today=TODAY) == []
 
 
-def test_overdue_agenda_silent_with_no_spores_file(tmp_path):
+def test_overdue_agenda_silent_with_no_intentions_file(tmp_path):
     assert doctor._check_overdue_agenda(tmp_path, today=TODAY) == []
 
 
@@ -197,7 +197,7 @@ _PARITY = [
 def test_hook_and_doctor_agree_on_which_agendas_are_due(agent, tmp_path):
     h = _load(agent).hook
     root = _install(tmp_path)
-    rows = [{"id": f"spore-{i:03d}", "disposition": d, "next": n, "text": "x", "type": "thought", "status": "open"}
+    rows = [{"id": f"intention-{i:03d}", "disposition": d, "next": n, "text": "x", "type": "thought", "status": "open"}
             for i, (d, n) in enumerate(_PARITY)]
     path = root / ".levain" / "memory.spores.json"
     path.write_text(json.dumps({"version": 1, "spores": rows}))
@@ -207,14 +207,14 @@ def test_hook_and_doctor_agree_on_which_agendas_are_due(agent, tmp_path):
     assert hook_due == doc_due and hook_due       # every past valid one is due in both; every malformed one in neither
 
 
-def test_one_malformed_spore_is_skipped_not_the_row(tmp_path, monkeypatch):
+def test_one_malformed_intention_is_skipped_not_the_row(tmp_path, monkeypatch):
     root = _install(tmp_path)
     (root / ".levain" / "memory.spores.json").write_text("{}")
-    good = {"id": "spore-001", "disposition": "agenda", "next": "2026-11-05"}
+    good = {"id": "intention-001", "disposition": "agenda", "next": "2026-11-05"}
 
-    monkeypatch.setattr("levain.spores.list_open_readonly", lambda p, today=None: [object(), good])
+    monkeypatch.setattr("levain.intentions.list_open_readonly", lambda p, today=None: [object(), good])
     rows = doctor._check_overdue_agenda(root, today=TODAY)
-    assert len(rows) == 1 and rows[0].ok and "spore-001" in rows[0].detail
+    assert len(rows) == 1 and rows[0].ok and "intention-001" in rows[0].detail
 
 
 def test_a_datetime_today_does_not_crash_the_row(tmp_path):

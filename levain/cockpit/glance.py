@@ -1,6 +1,6 @@
 """levain.cockpit.glance: two of the At a glance tiles a plain install fills from its own data (SHAPE F5).
 
-``memory_glance`` (Memory): episodes today, episodes in all, open spores, and the top open item named. ``doctor``
+``memory_glance`` (Memory): episodes today, episodes in all, open intentions, and the top open item named. ``doctor``
 (Levain health): doctor's own checks, read-only, grouped into status dots. The tile runs only checks ``levain
 doctor`` runs and that write nothing (the hook-pin check is left out: its first run records a pin), and shows only
 those: what doctor has no check for gets no dot at all, never a permanent unknown.
@@ -26,7 +26,7 @@ TOP_MAX = 80
 
 def memory_glance_reader(view: Callable[[Any], Any]) -> Callable[[Any], Result]:
     """``read(ctx)`` over the cycle's substrate view (``view(ctx)``): the store's episode counts and the open
-    spores (the List's own and Open loops), with the first open loop named."""
+    intentions (the List's own and Open loops), with the first open loop named."""
     def read(ctx: Any) -> Result:
         v = view(ctx)
         for k in ("store", "health"):
@@ -37,17 +37,17 @@ def memory_glance_reader(view: Callable[[Any], Any]) -> Callable[[Any], Result]:
             return Fault("memory: no health read")
         numbers: list[dict[str, Any]] = []
         today = v.jar.today if v.jar is not None else None      # known on a young store too (status no_history)
-        # one set of numbers, the total leading: "52 episodes · 16 today · 15 open spores" ("today" is a part of the total, not a second count)
+        # one set of numbers, the total leading: "52 episodes · 16 today · 15 open intentions" ("today" is a part of the total, not a second count)
         numbers.append({"label": "episodes", "value": h.total_episodes, "unit": None})
         if today is not None:
             numbers.append({"label": "today", "value": today, "unit": None})
         out: dict[str, Any] = {"numbers": numbers}
-        if "open_spores" in v.errors:
-            out["note"] = "open spores unreadable"
+        if "open_intentions" in v.errors:
+            out["note"] = "open intentions unreadable"
         else:
             # a parked loop is dormant by design (TS-5a: it shows in Open loops, marked): not live cognition
-            live = [s for s in v.open_spores if s.tier != "parked"]
-            numbers.append({"label": "open spores", "value": len(v.tray) + len(live), "unit": None})
+            live = [s for s in v.open_intentions if s.tier != "parked"]
+            numbers.append({"label": "open intentions", "value": len(v.tray) + len(live), "unit": None})
             top = (v.tray or live or [None])[0]
             if top is not None:
                 text = " ".join(str(top.text).split())

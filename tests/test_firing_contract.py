@@ -2,7 +2,7 @@
 
 These are PURE-CONSTANT tests (no ``openhands`` extra), deliberately here and NOT in
 ``test_firing_condenser.py`` (which is ``pytest.importorskip("openhands.sdk")``-gated). The
-spore-296 drift-lock is the guard that justifies the whole "package-locus directives" design —
+intention-296 drift-lock is the guard that justifies the whole "package-locus directives" design —
 it MUST run in the default/base test lane, so a base-only CI can't let the package directives
 silently diverge from the template (apparatus L3: complement + anansi converged on this).
 """
@@ -37,7 +37,7 @@ def _real_read_blocks():
 
 
 def test_directive_parity_with_shared_activation_template():
-    """spore-296 drift-lock: the package ``DIRECTIVES`` (the HOOKLESS OpenHands entity's ONLY
+    """intention-296 drift-lock: the package ``DIRECTIVES`` (the HOOKLESS OpenHands entity's ONLY
     per-turn drift-defense surface) stay in sync with the SHARED activation template's block bodies
     (the HOOKED adapters' ``recency_directives.md``) — a package upgrade improves BOTH surfaces
     together (the package-locus benefit). Locks against the REAL ``read_blocks`` the hook uses, so a
@@ -54,7 +54,7 @@ def test_directive_parity_with_shared_activation_template():
 
 
 def test_directives_carry_no_flow_private_references():
-    """spore-296: the entity's drift-defense is UNIVERSAL machinery, NOT the identity moat. The flow
+    """intention-296: the entity's drift-defense is UNIVERSAL machinery, NOT the identity moat. The flow
     presence-hook variants it generalizes FROM reference flow's own private memory files
     (``continuity.md`` / ``me.md``) — alien to a Levain entity (which has origin/world/partnership).
     A regression re-copying the raw flow variants would inject flow's identity into every sovereign

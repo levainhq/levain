@@ -1,10 +1,10 @@
-"""K10 KEEP (Phill 10-20, his words): "a spore expanded and I am reading it, a page update closes it; the list scrolled down
-reloads back to the top". A spore row the reader opens stays open (and visible, and closable) and its body keeps its scroll
+"""K10 KEEP (Phill 10-20, his words): "an intention expanded and I am reading it, a page update closes it; the list scrolled down
+reloads back to the top". An intention row the reader opens stays open (and visible, and closable) and its body keeps its scroll
 across the refresh button and across a real store write seen through the change stream.
 
 The K10 board folds the rows that do not fit a card (`foldRows`); a row that grew past the card on the reader's click used to be
-folded away with the rest, so the open spore vanished on the click and on every redraw. Driven in headless Chrome against a
-served cockpit with a long Tray: a tall spore at the top and thirty more under it (the Keep panel was removed, TS-5a; the Tray is the surviving list that holds these rows)."""
+folded away with the rest, so the open intention vanished on the click and on every redraw. Driven in headless Chrome against a
+served cockpit with a long Tray: a tall intention at the top and thirty more under it (the Keep panel was removed, TS-5a; the Tray is the surviving list that holds these rows)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TODAY, _install
 from tests.test_cockpit_k4a_needs import DESKTOP
@@ -40,7 +40,7 @@ COUNT_RENDERS = ("window.__r = 0; const L = window.LevainDashboard, o = L.render
 
 def _long_tray(tmp_path: Path) -> tuple[Path, Any]:
     root, src, _ids = _install(tmp_path)
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     for i in range(30):
         store.add(type="task", text=f"TRAYBULK {i:02d} a note " + PARA, disposition="seed", today=TODAY - timedelta(days=i % 5))
     store.add(type="task", text=GIANT, disposition="seed", today=TODAY + timedelta(days=2))   # newest: the first row of the Tray
@@ -52,12 +52,12 @@ def _assert_held(opened: dict[str, Any], after: Any, why: str) -> None:
     assert before and before["drawn"] and before["open"] and before["closable"], f"the tall row did not stay open and drawn on the click: {before}"
     assert before["room"] > 100, f"the card's body does not scroll, the scroll check proves nothing: {before}"
     assert scrolled > 100, f"the body was never scrolled: {scrolled}"
-    assert after and after["drawn"] and after["open"] and after["closable"], f"{why}: the open spore was closed or folded away: {after}"
+    assert after and after["drawn"] and after["open"] and after["closable"], f"{why}: the open intention was closed or folded away: {after}"
     assert abs(after["scroll"] - scrolled) <= 3, f"{why}: the scroll moved from {scrolled} to {after['scroll']}"
 
 
 @needs_browser
-def test_the_refresh_button_keeps_a_tall_open_spore_and_its_scroll(tmp_path: Path) -> None:
+def test_the_refresh_button_keeps_a_tall_open_intention_and_its_scroll(tmp_path: Path) -> None:
     _root, src = _long_tray(tmp_path)
     with _serve_plain(src) as url:
         out = _drive(tmp_path, f"{url}/", [
@@ -75,10 +75,10 @@ def test_the_refresh_button_keeps_a_tall_open_spore_and_its_scroll(tmp_path: Pat
 
 
 @needs_browser
-def test_a_store_write_keeps_a_tall_open_spore_and_its_scroll(tmp_path: Path) -> None:
-    """The change stream path: a seat writes a spore while the page is open, the Tray moves, the board is drawn again."""
+def test_a_store_write_keeps_a_tall_open_intention_and_its_scroll(tmp_path: Path) -> None:
+    """The change stream path: a seat writes an intention while the page is open, the Tray moves, the board is drawn again."""
     root, src = _long_tray(tmp_path)
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     stop = threading.Event()
 
     def writer() -> None:
@@ -152,7 +152,7 @@ def test_any_remeasure_keeps_the_reading_place(tmp_path: Path) -> None:
 def test_opening_another_row_keeps_the_reading_place(tmp_path: Path) -> None:
     """K2: a row above the open one opening re-folds the card (the click path); the scroll must stay where the reader put it."""
     root, src = _long_tray(tmp_path)
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     store.add(type="task", text="ABOVETRAY " + PARA, disposition="seed", today=TODAY + timedelta(days=3))   # newest: above the tall one
     above = f"[...{PANEL}.querySelectorAll('.row')].find(r => r.textContent.indexOf('ABOVETRAY') >= 0)"
     click = (f"(async () => {{ const b = {BODY}; {above}.querySelector(':scope > .clause-toggle').click();"

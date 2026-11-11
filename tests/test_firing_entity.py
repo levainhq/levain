@@ -1,4 +1,4 @@
-"""build_entity_agent — the isolated-entity agent chokepoint (spore-277).
+"""build_entity_agent — the isolated-entity agent chokepoint (intention-277).
 
 Proves the structural enforcement point: the ONE blessed constructor fail-closes on the sovereignty
 guard BEFORE building, binds the entity, and wires an OpenHands Agent whose firing/condenser use the
@@ -94,14 +94,14 @@ def test_guard_entity_returns_resolved_stores_and_writes_no_process_state(tmp_pa
     assert ed == ent.resolve()
     assert crystal == (ent / ".levain" / "memory.crystal.json").resolve()
     assert episodic == (ent / ".levain" / "memory.db").resolve()
-    # spore-438: an entity is carried by the objects that serve it, never published to the process.
+    # intention-438: an entity is carried by the objects that serve it, never published to the process.
     assert os.environ.get("LEVAIN_ENTITY_DIR", "") == ""
     assert os.environ.get(LEVAIN_ENTITY_PROCESS_ENV) is None
     assert os.environ.get("VAGUS_EPISODIC_PATH", "") == ""
 
 
 def test_an_entity_process_refuses_every_default_kind_store_op(tmp_path, monkeypatch):
-    """spore-438 §6 (Phill 2026-10-02, "approve levain design"): once a process has built an entity
+    """intention-438 §6 (Phill 2026-10-02, "approve levain design"): once a process has built an entity
     agent, the laptop-defaulting "anneal" kind REFUSES — a stray bare vagus_run / wrap_nudge can
     neither read nor write ~/.anneal-memory, and is never redirected to an entity (the latch names
     none, so two entities in one process change nothing). An explicit entity firing is unaffected."""
@@ -224,7 +224,7 @@ def test_build_entity_agent_wires_isolated_kind(tmp_path):
 
 
 def test_build_entity_agent_boots_as_itself_from_seed(tmp_path):
-    """Step 4 (spore-294): a fresh entity WITH a seed boots as ITSELF — its origin identity + operator
+    """Step 4 (intention-294): a fresh entity WITH a seed boots as ITSELF — its origin identity + operator
     + partnership floor ride the set-once constitution suffix (so "who are you?" is the seed, not the
     model's stock "I am OpenHands"), and the re-anchor kind is the seed source. Guidance blockquotes +
     interview comments are stripped; the generic default is REPLACED (not appended)."""
@@ -277,7 +277,7 @@ _NEOCORTEX = (
 
 
 def test_build_entity_agent_folds_neocortex_into_the_constitution(tmp_path):
-    """spore-359: a fresh run boots on the entity's OWN consolidated memory, not only crystal recall.
+    """intention-359: a fresh run boots on the entity's OWN consolidated memory, not only crystal recall.
     With a seed AND a written neocortex, the set-once session_start suffix carries BOTH the static seed
     identity AND the dynamic neocortex (State/Context…), under the memory preamble that marks it as
     lived memory — the seed (birth) precedes the memory (life)."""
@@ -422,7 +422,7 @@ def test_build_entity_agent_seedless_drops_memory_even_if_neocortex_present(tmp_
 
 def test_built_agents_firing_resolves_to_entity_store(tmp_path, monkeypatch):
     """The isolation carries THROUGH the built agent AND a fork: the condenser serializes its kind AND
-    its entity (spore-438), so the serialize→validate round-trip a fork performs rebuilds an
+    its entity (intention-438), so the serialize→validate round-trip a fork performs rebuilds an
     AnnealEntityFiring + SeedPresence on THIS entity — and a rebuild with no entity carried has no
     store at all (there is no process-level entity to fall back to)."""
     ent = _entity(tmp_path)
@@ -459,7 +459,7 @@ def test_build_entity_agent_fail_closed_before_build(tmp_path, monkeypatch):
 
 def test_capture_turn_pins_entity_kind(tmp_path, monkeypatch):
     """binding.capture_turn captures through capture_completed_turn with an explicit ISOLATED firing
-    on the binding's own entity (NOT vagus_run's laptop-defaulting 'anneal' default, F1; spore-438:
+    on the binding's own entity (NOT vagus_run's laptop-defaulting 'anneal' default, F1; intention-438:
     carried, never looked up). It never goes through vagus_run, which would run the conversation."""
     import levain.firing.openhands.capture as capmod
     from levain.firing.anneal import AnnealEntityFiring

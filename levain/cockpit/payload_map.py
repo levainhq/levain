@@ -47,17 +47,17 @@ S = "substrate"
 _add(S, "map", "manifest entity", True, "entity_name", "brand_wordmark", "brand_model")
 _add(S, "map", "manifest entity.store_label: a home-relative display label for the masthead's store line, never the "
      "absolute path (10-09 20:54, option c; honours §6.2). The pattern is the DASHBOARD payload's source key.", False, "paths.episodic_db")
-_add(S, "drop", "install-private paths", True, "paths.continuity_md", "paths.crystal_json", "paths.spores_json", "scope")
+_add(S, "drop", "install-private paths", True, "paths.continuity_md", "paths.crystal_json", "paths.intentions_json", "scope")
 _add(S, "map", "regions.zones[].panels + PanelHead", True,
      "layout[].kind", "layout[].id", "layout[].zone", "layout[].title")
-_add(S, "map", "Row.id / title / body / facets (open_spores, tray rows)", True,
-     "open_spores[].type", "open_spores[].salience", "open_spores[].text",
+_add(S, "map", "Row.id / title / body / facets (open_intentions, tray rows)", True,
+     "open_intentions[].type", "open_intentions[].salience", "open_intentions[].text",
      "tray[].type", "tray[].salience", "tray[].text")
-_add(S, "map", "spore row facets / Row.id of the tray and loops panels", False,
-     *(f"{b}[].{f}" for b in ("open_spores", "tray")
+_add(S, "map", "intention row facets / Row.id of the tray and loops panels", False,
+     *(f"{b}[].{f}" for b in ("open_intentions", "tray")
        for f in ("id", "tier", "domain", "disposition", "next", "seen", "pointer")))
-_add(S, "drop", "derived from the spore type by anneal; verbs and their kinds arrive with K2a's registry", False,
-     *(f"{b}[].{f}" for b in ("open_spores", "tray") for f in ("descend_kinds", "ascend_kinds")))
+_add(S, "drop", "derived from the intention type by anneal; verbs and their kinds arrive with K2a's registry", False,
+     *(f"{b}[].{f}" for b in ("open_intentions", "tray") for f in ("descend_kinds", "ascend_kinds")))
 _add(S, "map", "episodes panel: facets episode_type, source, at", True,
      "episodes[].type", "episodes[].source", "episodes[].timestamp")
 _add(S, "map", "episodes row Row.id / title+body / tags", False, "episodes[].id", "episodes[].content", "episodes[].tags")
@@ -122,8 +122,8 @@ _add(F, "map", "constellation panel note", True, "note")
 _add(F, "map", "visual constellation + one manifest per entity", True, "entities[].name", "entities[].governance")
 _add(F, "map", "that entity's metric health", True, "entities[].card.health.*")
 _add(F, "map", "line focus", True, "entities[].card.state_focus")
-_add(F, "map", "metric panel with six counts (string deleted)", True, "entities[].card.spore_summary")
-_add(F, "map", "triage-lists", True, "entities[].card.attention_spores", "entities[].card.inbox_items")
+_add(F, "map", "metric panel with six counts (string deleted)", True, "entities[].card.intention_summary")
+_add(F, "map", "triage-lists", True, "entities[].card.attention_intentions", "entities[].card.inbox_items")
 _add(F, "map", "metric inbox", True, "entities[].card.inbox_line")
 _add(F, "map", "line overnight", True, "entities[].card.overnight")
 _add(F, "map", "Alerts on the health metric panel", True, "entities[].card.flags")

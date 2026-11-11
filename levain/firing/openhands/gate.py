@@ -87,7 +87,7 @@ class LevainEfferentAnalyzer(SecurityAnalyzerBase):
     Carries no configuration by design: the classification rule lives in the pure
     :mod:`levain.firing.gate` leaf where it can be exercised exhaustively without a conversation,
     and a per-session knob here would be the first step toward the per-domain policy curve that
-    is explicitly ``spore-417`` / v2.x.
+    is explicitly ``intention-417`` / v2.x.
     """
 
     def security_risk(self, action: Any) -> SecurityRisk:

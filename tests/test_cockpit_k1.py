@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain.cockpit import (
     Absent,
@@ -41,11 +41,11 @@ NONE_CRED = {"class": "none", "device_class": None}
 
 def _install(tmp_path: Path) -> tuple[Path, SubstrateSource]:
     root = _make_levain_install(tmp_path)
-    spores = SporeStore(root / ".levain" / "memory.spores.json")
-    spores.add(type="task", text="loop one", tier="hot", salience=2)
-    spores.add(type="task", text="seed overdue", disposition="seed", next="2020-01-01")
-    spores.add(type="task", text="handoff undated", disposition="handoff")
-    spores.add(type="task", text="a long reference note " + "word " * 40 + "NEEDLEINBODY tail", disposition="note")
+    intentions = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    intentions.add(type="task", text="loop one", tier="hot", salience=2)
+    intentions.add(type="task", text="seed overdue", disposition="seed", next="2020-01-01")
+    intentions.add(type="task", text="handoff undated", disposition="handoff")
+    intentions.add(type="task", text="a long reference note " + "word " * 40 + "NEEDLEINBODY tail", disposition="note")
     (root / ".levain" / "memory.crystal.json").write_text(json.dumps(
         {"crystal": [{"name": "a_pattern", "status": "crystallized", "level": 2,
                       "explanation": "It means a thing. More.", "permanence": "graduated",
@@ -105,12 +105,12 @@ def _dirify(path: Path):
 
 def _cases(root: Path):
     lv = root / ".levain"
-    spores, db, crystal = lv / "memory.spores.json", lv / "memory.db", lv / "memory.crystal.json"
+    intentions, db, crystal = lv / "memory.spores.json", lv / "memory.db", lv / "memory.crystal.json"
     edits, ctxj, jobs = lv / "edits.jsonl", lv / "context.json", lv / "jobs.json"
     cont = lv / "memory.continuity.md"
     out = []
     for pid in ("tray", "loops"):
-        out.append((pid, "spores", _rm(spores), _garble(spores)))
+        out.append((pid, "intentions", _rm(intentions), _garble(intentions)))
     for pid in ("episodes", "health", "graph", "wraps"):
         out.append((pid, "db", _rm(db), _garble(db)))
     out.append(("crystals", "crystal", _rm(crystal), _garble(crystal)))
@@ -186,7 +186,7 @@ class TestEveryBuiltInProviderFailsLoudly:
 
 
 class TestWhyProvidersCheckTheirOwnSources:
-    """providers.py's docstring says SubstrateView hides a missing spore file, crystal file and
+    """providers.py's docstring says SubstrateView hides a missing intention file, crystal file and
     context file as empty rather than as an error. This makes that claim fail when it stops holding."""
 
     def test_the_view_hides_missing_sources(self, tmp_path: Path) -> None:
@@ -195,7 +195,7 @@ class TestWhyProvidersCheckTheirOwnSources:
             (root / ".levain" / name).unlink()
         view = src.build()
         assert view.tray == [] and view.crystal_index == [] and (view.state is None or view.state.text is None)
-        assert not ({"open_spores", "crystal_index"} & set(view.errors))
+        assert not ({"open_intentions", "crystal_index"} & set(view.errors))
 
     def test_recent_edits_swallows_a_directory_in_place_of_the_ledger(self, tmp_path: Path) -> None:
         root, src = _install(tmp_path)
@@ -251,13 +251,13 @@ class TestRegistrationRefusals:
     def test_a_downstream_ordering_under_a_kernel_prefix_is_refused(self) -> None:
         from levain.cockpit import Ordering, register_ordering
         with pytest.raises(CockpitRegistrationError, match="kernel-owned"):
-            register_ordering(Ordering("spore.mine", lambda r, t: (0,)))
+            register_ordering(Ordering("intention.mine", lambda r, t: (0,)))
 
     def test_one_panel_per_row_set(self) -> None:
         ck = Cockpit()
-        ck.register(_simple("a", rowset="spores"))
+        ck.register(_simple("a", rowset="intentions"))
         with pytest.raises(CockpitRegistrationError, match="one panel per row set"):
-            ck.register(_simple("b", rowset="spores"))
+            ck.register(_simple("b", rowset="intentions"))
 
     def test_empty_comes_only_from_a_read(self) -> None:
         ck = Cockpit()
@@ -411,7 +411,7 @@ class TestHttpRoutes:
         with _serve(src) as (base, _h):
             assert _http(f"{base}/cockpit/panel/nope.json")[0] == 404
             assert _http(f"{base}/cockpit/panel/tray.json?profile=huge")[0] == 400
-            assert _http(f"{base}/cockpit/panel/tray.json?row=spore:nope")[0] == 404
+            assert _http(f"{base}/cockpit/panel/tray.json?row=intention:nope")[0] == 404
 
     def test_a_cockpit_route_cannot_be_claimed_by_a_downstream(self, tmp_path: Path) -> None:
         _root, src = _install(tmp_path)
@@ -458,13 +458,13 @@ class TestRowVersions:
                 checked += 1
         assert checked > 30
 
-    def test_a_touch_and_the_clock_do_not_change_a_spore_version_and_an_edit_does(self, env) -> None:
+    def test_a_touch_and_the_clock_do_not_change_a_intention_version_and_an_edit_does(self, env) -> None:
         root, _s, ck = env
         v0 = {r["id"]: r["version"] for r in ck.panel("tray")["rows"]}
         path = root / ".levain" / "memory.spores.json"
         data = json.loads(path.read_text())
         for s in data["spores"]:
-            s["seen"] = "2031-01-01"          # a spore_touch / session-open
+            s["seen"] = "2031-01-01"          # an intention_touch / session-open
         path.write_text(json.dumps(data))
         assert {r["id"]: r["version"] for r in ck.panel("tray")["rows"]} == v0
         for s in data["spores"]:
@@ -473,7 +473,7 @@ class TestRowVersions:
         path.write_text(json.dumps(data))
         v2 = {r["id"]: r["version"] for r in ck.panel("tray")["rows"]}
         changed = [k for k in v0 if v2.get(k) != v0[k]]
-        assert changed == ["spore:spore-002"]
+        assert changed == ["intention:intention-002"]
 
     def test_the_version_is_the_same_in_every_profile(self, env) -> None:
         _r, _s, ck = env
@@ -490,12 +490,12 @@ class TestRowVersions:
         path = root / ".levain" / "memory.spores.json"
         data = json.loads(path.read_text())
         for s in data["spores"]:
-            if f"spore:{s['id']}" == row_id:
+            if f"intention:{s['id']}" == row_id:
                 s["text"] = "changed under the snapshot"
         path.write_text(json.dumps(data))
         after = ck.read_one("tray", row_id)
         assert isinstance(after, Read) and after.value["version"] != before.value["version"]
-        assert isinstance(ck.read_one("tray", "spore:ghost"), Absent)
+        assert isinstance(ck.read_one("tray", "intention:ghost"), Absent)
 
 
 # --- profiles and search ---------------------------------------------------------------------------
@@ -541,12 +541,12 @@ class TestProfilesAndSearch:
 
 
 class TestOrderingAndGroups:
-    def test_spore_tray_groups_and_order(self, env) -> None:
+    def test_intention_tray_groups_and_order(self, env) -> None:
         _r, _s, ck = env
         p = ck.panel("tray")
         by_group = {r["id"]: r["group"] for r in p["rows"]}
-        # spore-004 is the fixture's legacy note: shown in the Tray (the Keep is gone), undated -> "also"
-        assert by_group == {"spore:spore-003": "today", "spore:spore-002": "overdue", "spore:spore-004": "also"}
+        # intention-004 is the fixture's legacy note: shown in the Tray (the Keep is gone), undated -> "also"
+        assert by_group == {"intention:intention-003": "today", "intention:intention-002": "overdue", "intention:intention-004": "also"}
         assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also", "someday", "done"]   # THE LIST's groups
         assert [r["group"] for r in p["rows"]] == ["overdue", "today", "also"]  # group order leads
         assert all(r["band"] == "now" for r in p["rows"] if r["group"] != "also")
@@ -558,7 +558,7 @@ class TestOrderingAndGroups:
                       stored={"id": f"s:{i}"}) for i, d in enumerate(["2026-09-01", "2026-01-01", "2026-05-01"])]
         ck.register(ProviderSpec(
             id="t", kind="triage-list", title="t", priority="gate", read=lambda c: Read(rows=tuple(rows)),
-            order="spore.tray", facets=frozenset({"due", "disposition", "tier", "salience", "handoff_expired"}),
+            order="intention.tray", facets=frozenset({"due", "disposition", "tier", "salience", "handoff_expired"}),
             version_fields=("id",)))
         assert [r["id"] for r in ck.panel("t")["rows"]] == ["s:1", "s:2", "s:0"]
 
@@ -568,14 +568,14 @@ class TestOrderingAndGroups:
                       stored={"id": "h"})]
         ck.register(ProviderSpec(
             id="t", kind="triage-list", title="t", priority="gate", read=lambda c: Read(rows=tuple(rows)),
-            order="spore.tray", facets=frozenset({"disposition", "handoff_expired", "tier", "salience"}),
+            order="intention.tray", facets=frozenset({"disposition", "handoff_expired", "tier", "salience"}),
             version_fields=("id",)))
         row = ck.panel("t")["rows"][0]
         assert row["group"] == "also" and row["band"] == "later"
 
     def test_a_future_surface_date_is_filtered_not_hidden(self, env) -> None:
         root, _s, ck = env
-        SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="later", disposition="seed", next="2999-01-01")
+        IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="later", disposition="seed", next="2999-01-01")
         p = ck.panel("tray")
         assert p["status"] == "ok" and p["filtered"] == []                      # a future date is the Later group, not a filtered row
         assert p["count"] == 3 and [r["group"] for r in p["rows"]].count("later") == 1
@@ -702,7 +702,7 @@ class TestL3R1Fixes:
             assert isinstance(one, Read)
             assert (one.value["group"], one.value["band"], one.value["version"]) == (row["group"], row["band"], row["version"])
 
-    def test_a_spore_rescheduled_into_the_future_is_still_found_by_read_one(self, env) -> None:
+    def test_a_intention_rescheduled_into_the_future_is_still_found_by_read_one(self, env) -> None:
         root, _s, ck = env
         path = root / ".levain" / "memory.spores.json"
         data = json.loads(path.read_text())
@@ -710,8 +710,8 @@ class TestL3R1Fixes:
             if s["text"] == "seed overdue":
                 s["next"] = "2999-01-01"
         path.write_text(json.dumps(data))
-        assert {r["id"]: r["group"] for r in ck.panel("tray")["rows"]}["spore:spore-002"] == "later"   # listed under Later
-        assert isinstance(ck.read_one("tray", "spore:spore-002"), Read)                # but a write finds it
+        assert {r["id"]: r["group"] for r in ck.panel("tray")["rows"]}["intention:intention-002"] == "later"   # listed under Later
+        assert isinstance(ck.read_one("tray", "intention:intention-002"), Read)                # but a write finds it
 
     def test_malformed_provider_output_is_a_fault_not_a_crash(self) -> None:
         ck = Cockpit()
@@ -773,7 +773,7 @@ class TestL3R1Fixes:
         ck = Cockpit()
         rows = [RowIn("a", "a", {"tier": "hot"}, stored={"id": "a"}), RowIn("b", "b", {"tier": "scorching"}, stored={"id": "b"})]
         ck.register(_derived({**_simple().__dict__, "read": lambda c: Read(rows=tuple(rows)),
-                                    "facets": frozenset({"tier"}), "order": "spore.loops"}))
+                                    "facets": frozenset({"tier"}), "order": "intention.loops"}))
         got = ck.panel("p")
         assert got["status"] == "partial" and [r["id"] for r in got["rows"]] == ["a"] and got["skipped"][0]["count"] == 1
 
@@ -798,11 +798,11 @@ class TestL3R1Fixes:
 
     def test_exactly_the_cap_is_not_reported_as_truncated(self, env, monkeypatch) -> None:
         import levain.cockpit.providers as prov
-        monkeypatch.setattr(prov, "SPORE_CAP", 3)
+        monkeypatch.setattr(prov, "INTENTION_CAP", 3)
         _r, _s, ck = env
         got = ck.panel("loops")   # one loop, cap 3
         assert got["status"] == "ok" and got["skipped"] == []
-        monkeypatch.setattr(prov, "SPORE_CAP", 0)
+        monkeypatch.setattr(prov, "INTENTION_CAP", 0)
         assert ck.panel("loops")["skipped"]
 
 
@@ -851,10 +851,10 @@ class TestL3R2Fixes:
     def test_a_held_row_does_not_displace_a_visible_one_under_the_cap(self, tmp_path: Path, monkeypatch) -> None:
         import levain.cockpit.providers as prov
         root, src = _install(tmp_path)
-        sp = SporeStore(root / ".levain" / "memory.spores.json")
+        sp = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
         for i in range(4):
             sp.add(type="task", text=f"held {i}", disposition="seed", next="2999-01-01", tier="hot", salience=3)
-        monkeypatch.setattr(prov, "SPORE_CAP", 2)
+        monkeypatch.setattr(prov, "INTENTION_CAP", 2)
         got = build_default_cockpit(src).panel("tray")
         assert [r["group"] for r in got["rows"]].count("later") == 2 and got["count"] == 2   # the later rows are capped apart: the due rows survive
         assert {"count": 2, "reason": "later rows over the display cap of 2"} in got["skipped"]
@@ -862,8 +862,8 @@ class TestL3R2Fixes:
     def test_read_one_is_not_truncated_by_the_cap(self, env, monkeypatch) -> None:
         import levain.cockpit.providers as prov
         _r, _s, ck = env
-        monkeypatch.setattr(prov, "SPORE_CAP", 1)
-        assert isinstance(ck.read_one("tray", "spore:spore-002"), Read)
+        monkeypatch.setattr(prov, "INTENTION_CAP", 1)
+        assert isinstance(ck.read_one("tray", "intention:intention-002"), Read)
 
     def test_a_crystal_added_between_two_reads_cannot_fake_a_malformed_row(self, env) -> None:
         root, _s, ck = env

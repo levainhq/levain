@@ -11,10 +11,10 @@ Injects, at primacy position:
   2. Operator-local date and time — models have no clock.
   3. On a genuinely fresh session (startup | clear) only: a wrap-check flag if
      the previous session left episodes unwrapped, AND the time-based
-     prospective surface — open spores that have gone dormant or whose `next`
+     prospective surface — open intentions that have gone dormant or whose `next`
      date has arrived, surfaced once so nothing rots silently. `resume` and
      `compact` both carry ongoing work, not a fresh start — they get posture
-     re-injection but skip the wrap-check and the due-spore surface. (`compact`
+     re-injection but skip the wrap-check and the due-intention surface. (`compact`
      is the most important re-injection case: compaction rebuilds the context
      window and the primacy posture goes with it.)
 
@@ -166,20 +166,20 @@ def main() -> int:
                 pass
 
             try:
-                # Time-based spore germination — open loops that have gone dormant
+                # Time-based intention germination — open loops that have gone dormant
                 # or whose `next` date has arrived, surfaced once on a fresh session
                 # so nothing rots silently. Growing/resting/parked stay out of the
                 # way. Fires only on a fresh session (with the wrap-check), not on
                 # resume/compact mid-flow.
-                due = hook.due_dormant_spores(hook.open_spores())
+                due = hook.due_dormant_intentions(hook.open_intentions())
                 if due:
-                    sections.append(hook.format_due_spores(due))
+                    sections.append(hook.format_due_intentions(due))
             except Exception:
                 pass
 
             try:
                 # Agenda germination (TS-3): a dated agenda that has come due is put in front of him by a detached,
-                # fail-soft `levain spores germinate`; spawned ONLY when one is due, one spawn per session start.
+                # fail-soft `levain intentions germinate`; spawned ONLY when one is due, one spawn per session start.
                 n = len(hook.due_agendas(hook.open_agendas()))
                 if n:
                     st = hook.start_germinate('claude_code')
@@ -187,7 +187,7 @@ def main() -> int:
                     if st == 'started':
                         sections.append(f"[germinate] {n} agenda{plural} came due; germination started")
                     elif st == 'failed':
-                        sections.append(f"[germinate] {n} agenda{plural} came due but germination did not start: run `levain spores germinate`")
+                        sections.append(f"[germinate] {n} agenda{plural} came due but germination did not start: run `levain intentions germinate`")
                     elif st == 'busy':
                         sections.append(f"[germinate] {n} agenda{plural} came due; germination was already started within the last minute")
             except Exception:

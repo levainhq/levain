@@ -564,7 +564,7 @@ def test_enroll_refuses_a_passkey_at_another_custody_before_it_signs(tmp_path, m
 
 # --- the 1022+18 L3 r1 sites: the cockpit broker's pending ALLOW, the anchor reset, the signers snapshot door ----------
 
-def cockpit_verdict(home: Path, spores: Path, keydir: Path, custody: str, *, laptop_signs: bool = False,
+def cockpit_verdict(home: Path, intentions: Path, keydir: Path, custody: str, *, laptop_signs: bool = False,
                     **sig) -> str | None:
     """``None`` when the cockpit broker takes ``pk``'s signature over a waiting pending (``pk`` display-phone at
     ``custody`` in the broker's own signed log, beside an ssh laptop-presence genesis key), else the refusal. The log
@@ -575,7 +575,7 @@ def cockpit_verdict(home: Path, spores: Path, keydir: Path, custody: str, *, lap
     from tests.cockpit_authority_rig import RealKey, enrol, link
     from tests.test_cockpit_k2b_broker import _broker, _move
 
-    b = _broker(home, spores)
+    b = _broker(home, intentions)
     try:
         root = RealKey(keydir, "root")
         pk = WebAuthnKey()
@@ -584,7 +584,7 @@ def cockpit_verdict(home: Path, spores: Path, keydir: Path, custody: str, *, lap
             link(b.db, {"op": "enrol", "fingerprint": pk.fp, "public_key": pk.public_key, "class": "display-phone",
                         "custody": custody}, root)
         auth.PROCESS_CACHE.clear()
-        pid = _move(b, spores)["pending_id"]
+        pid = _move(b, intentions)["pending_id"]
         record = b.outcome(pid)["record"].encode()
         signature = root.sign(record, COCKPIT_NAMESPACE) if laptop_signs else pk.sign(record, COCKPIT_NAMESPACE, **sig)
         try:
@@ -603,9 +603,9 @@ def broker_home():
     d = anchor_scratch("custody-broker-")
     try:
         (d / "keys").mkdir(mode=0o700)
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import IntentionStore
 
-        st = SporeStore(d / "spores.json")
+        st = IntentionStore(d / "spores.json", id_prefix="intention")
         st.add(type="thought", text="a tray seed", disposition="seed", origin_key="k.seed")
         yield d
     finally:

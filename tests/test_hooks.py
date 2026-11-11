@@ -40,9 +40,9 @@ def _load_codex_hook():
 codex_hook = _load_codex_hook()
 
 
-def _spore(**kw):
+def _intention(**kw):
     base = {
-        "id": "spore-001", "type": "task", "text": "",
+        "id": "intention-001", "type": "task", "text": "",
         "germination": "growing", "next": None,
     }
     base.update(kw)
@@ -58,66 +58,66 @@ class TestTokens:
         assert "restrict" in hook._tokens("Restrict the Keys")
 
 
-class TestSporesColliding:
+class TestIntentionsColliding:
     def test_collides_on_two_shared_tokens(self):
-        s = _spore(text="restrict the api keys", id="spore-007")
-        hits = hook.spores_colliding("can we restrict the api keys now", [s])
-        assert len(hits) == 1 and hits[0]["id"] == "spore-007"
+        s = _intention(text="restrict the api keys", id="intention-007")
+        hits = hook.intentions_colliding("can we restrict the api keys now", [s])
+        assert len(hits) == 1 and hits[0]["id"] == "intention-007"
 
     def test_below_threshold_no_match(self):
         # Only "keys" overlaps (1) — below the 2-token precision floor.
-        s = _spore(text="restrict the api keys")
-        assert hook.spores_colliding("where are my house keys", [s]) == []
+        s = _intention(text="restrict the api keys")
+        assert hook.intentions_colliding("where are my house keys", [s]) == []
 
     def test_empty_prompt(self):
-        assert hook.spores_colliding("", [_spore(text="restrict api keys")]) == []
+        assert hook.intentions_colliding("", [_intention(text="restrict api keys")]) == []
 
     def test_ranks_by_overlap_and_caps(self):
-        spores = [
-            _spore(id="a", text="restrict api keys vault"),     # 4 overlap
-            _spore(id="b", text="restrict api"),                # 2 overlap
-            _spore(id="c", text="rotate api keys vault token"), # 4 overlap
-            _spore(id="d", text="unrelated grocery list"),      # 0
+        intentions = [
+            _intention(id="a", text="restrict api keys vault"),     # 4 overlap
+            _intention(id="b", text="restrict api"),                # 2 overlap
+            _intention(id="c", text="rotate api keys vault token"), # 4 overlap
+            _intention(id="d", text="unrelated grocery list"),      # 0
         ]
-        hits = hook.spores_colliding(
-            "restrict rotate the api keys vault", spores, limit=2
+        hits = hook.intentions_colliding(
+            "restrict rotate the api keys vault", intentions, limit=2
         )
         assert {h["id"] for h in hits} == {"a", "c"}  # the two highest-overlap
 
     def test_skips_non_str_text(self):
-        assert hook.spores_colliding("api keys", [_spore(text=None)]) == []
+        assert hook.intentions_colliding("api keys", [_intention(text=None)]) == []
 
 
 class TestDueDormant:
     def test_only_dormant(self):
-        spores = [
-            _spore(id="a", germination="dormant"),
-            _spore(id="b", germination="growing"),
-            _spore(id="c", germination="resting"),
-            _spore(id="d", germination="parked"),
-            _spore(id="e", germination="dormant"),
+        intentions = [
+            _intention(id="a", germination="dormant"),
+            _intention(id="b", germination="growing"),
+            _intention(id="c", germination="resting"),
+            _intention(id="d", germination="parked"),
+            _intention(id="e", germination="dormant"),
         ]
-        assert {s["id"] for s in hook.due_dormant_spores(spores)} == {"a", "e"}
+        assert {s["id"] for s in hook.due_dormant_intentions(intentions)} == {"a", "e"}
 
     def test_caps(self):
-        spores = [_spore(id=str(i), germination="dormant") for i in range(10)]
-        assert len(hook.due_dormant_spores(spores, limit=3)) == 3
+        intentions = [_intention(id=str(i), germination="dormant") for i in range(10)]
+        assert len(hook.due_dormant_intentions(intentions, limit=3)) == 3
 
 
 class TestFormatting:
     def test_collisions_format(self):
-        s = _spore(text="restrict api keys", id="spore-007", type="task")
-        out = hook.format_spore_collisions([s])
-        assert "restrict api keys" in out and "spore-007" in out
+        s = _intention(text="restrict api keys", id="intention-007", type="task")
+        out = hook.format_intention_collisions([s])
+        assert "restrict api keys" in out and "intention-007" in out
         assert "relevant" in out.lower()
 
     def test_due_format_includes_next(self):
-        s = _spore(
-            text="schedule the panel", id="spore-009", type="task",
+        s = _intention(
+            text="schedule the panel", id="intention-009", type="task",
             next="2026-06-10",
         )
-        out = hook.format_due_spores([s])
-        assert "schedule the panel" in out and "spore-009" in out
+        out = hook.format_due_intentions([s])
+        assert "schedule the panel" in out and "intention-009" in out
         assert "2026-06-10" in out
 
 
@@ -142,13 +142,13 @@ class TestAnnealJsonRobustness:
         assert calls["n"] == 1
 
     def test_validator_skips_wrong_shape_candidate(self, monkeypatch):
-        # Two candidates need a substituted install bin: since spore-751 the hook no longer
+        # Two candidates need a substituted install bin: since intention-751 the hook no longer
         # tries a PATH anneal, so an unsubstituted placeholder leaves only the module form.
         monkeypatch.setattr(hook, "_INSTALL_ANNEAL_BIN", "/opt/levain/bin/anneal-memory")
         results = iter([self._FakeResult('{"wrong": 1}'), self._FakeResult("[]")])
         monkeypatch.setattr(hook.subprocess, "run", lambda *a, **k: next(results))
         out = hook._anneal_json(
-            ["spore", "list", "--json"], 2.0, validator=lambda d: isinstance(d, list)
+            ["intention", "list", "--json"], 2.0, validator=lambda d: isinstance(d, list)
         )
         assert out == []  # skipped the dict candidate, returned the list one
 
@@ -161,33 +161,33 @@ def test_tokens_capped_for_huge_input():
 
 
 def test_generic_work_tokens_dont_false_collide():
-    # Two generic work tokens shared with an unrelated spore are NOT a match.
-    s = _spore(text="review the test file for the parser")
-    assert hook.spores_colliding("please review the test file i sent", [s]) == []
+    # Two generic work tokens shared with an unrelated intention are NOT a match.
+    s = _intention(text="review the test file for the parser")
+    assert hook.intentions_colliding("please review the test file i sent", [s]) == []
 
 
-class TestOpenSporesTrayExclusion:
-    """Slice 3b: the stranger-side cognition-exclude. open_spores is the SINGLE chokepoint
+class TestOpenIntentionsTrayExclusion:
+    """Slice 3b: the stranger-side cognition-exclude. open_intentions is the SINGLE chokepoint
     both germination surfaces (dormant + collision) read; operator-I/O dispositions (Tray
     inbox + Keep notes) must be filtered OUT so they can't leak into a Levain install's
     cognition."""
 
     def test_filters_operator_io_dispositions(self, monkeypatch):
         rows = [
-            _spore(id="loop1"),                          # no disposition → a loop
-            _spore(id="loop2", disposition="loop"),      # explicit loop
-            _spore(id="seed1", disposition="seed"),
-            _spore(id="handoff1", disposition="handoff"),
-            _spore(id="agenda1", disposition="agenda"),
-            _spore(id="note1", disposition="note"),      # Keep reference — also excluded
+            _intention(id="loop1"),                          # no disposition → a loop
+            _intention(id="loop2", disposition="loop"),      # explicit loop
+            _intention(id="seed1", disposition="seed"),
+            _intention(id="handoff1", disposition="handoff"),
+            _intention(id="agenda1", disposition="agenda"),
+            _intention(id="note1", disposition="note"),      # Keep reference — also excluded
         ]
         monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: rows)
-        assert [s["id"] for s in hook.open_spores()] == ["loop1", "loop2"]
+        assert [s["id"] for s in hook.open_intentions()] == ["loop1", "loop2"]
 
     def test_unknown_disposition_fails_open_as_a_loop(self, monkeypatch):
         # a typo'd/unknown disposition is NOT silently dropped (the silent-loss direction)
-        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: [_spore(id="x", disposition="bogus")])
-        assert [s["id"] for s in hook.open_spores()] == ["x"]
+        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: [_intention(id="x", disposition="bogus")])
+        assert [s["id"] for s in hook.open_intentions()] == ["x"]
 
     def test_is_loop_predicate(self):
         assert hook._is_loop({"disposition": "loop"}) is True
@@ -196,9 +196,9 @@ class TestOpenSporesTrayExclusion:
         assert hook._is_loop({"disposition": "note"}) is False  # Keep reference excluded
         assert hook._is_loop({"disposition": ""}) is True  # falsy → loop
 
-    def test_hook_vocab_matches_canonical_levain_spores(self):
+    def test_hook_vocab_matches_canonical_levain_intentions(self):
         # DRIFT GUARD: the standalone hook copy must equal the canonical taxonomy.
-        import levain.spores as lv
+        import levain.intentions as lv
         assert hook._NON_COGNITION_DISPOSITIONS == lv.NON_COGNITION_DISPOSITIONS
 
 
@@ -298,8 +298,8 @@ _PORTED_FNS = (
     # in_install_session is NOT here: its BODY is shared but its docstring is
     # adapter-specific by design, so it gets its own body-parity test below.
     "format_wrap_blocked", "_config_dict", "configured_scope",
-    "open_spores", "_is_loop", "_tokens", "spores_colliding", "due_dormant_spores",
-    "_format_spore_lines", "format_spore_collisions", "format_due_spores",
+    "open_intentions", "_is_loop", "_tokens", "intentions_colliding", "due_dormant_intentions",
+    "_format_intention_lines", "format_intention_collisions", "format_due_intentions",
     # compatibility-manifest drift surface — byte-identical across both copies
     "read_manifest_lock", "_is_migrate_check", "compat_drift",
     # pack-drift surface — byte-identical across both copies AND vs levain.manifest
@@ -389,16 +389,16 @@ class TestCodexParity:
     def test_codex_collision_surface_works(self):
         # Not just identical text — the Codex module actually imports and runs
         # (guards a codex-only import/typo that source-identity wouldn't catch).
-        s = _spore(text="restrict the api keys", id="spore-007")
-        hits = codex_hook.spores_colliding("can we restrict the api keys now", [s])
-        assert len(hits) == 1 and hits[0]["id"] == "spore-007"
+        s = _intention(text="restrict the api keys", id="intention-007")
+        hits = codex_hook.intentions_colliding("can we restrict the api keys now", [s])
+        assert len(hits) == 1 and hits[0]["id"] == "intention-007"
 
     def test_codex_due_dormant_surface_works(self):
-        spores = [
-            _spore(id="a", germination="dormant"),
-            _spore(id="b", germination="growing"),
+        intentions = [
+            _intention(id="a", germination="dormant"),
+            _intention(id="b", germination="growing"),
         ]
-        assert {s["id"] for s in codex_hook.due_dormant_spores(spores)} == {"a"}
+        assert {s["id"] for s in codex_hook.due_dormant_intentions(intentions)} == {"a"}
 
     def test_codex_crystal_surface_works(self, monkeypatch):
         # the Codex copy actually imports + runs the crystal surface (guards a
@@ -1167,7 +1167,7 @@ class TestPreO42HelperCompat:
             monkeypatch.setattr(helper, "wrap_state",
                                 lambda timeout=None: (31, True), raising=False)
             monkeypatch.delattr(helper, "format_wrap_blocked", raising=False)
-            for opt in ("open_spores", "due_dormant_spores", "spores_colliding",
+            for opt in ("open_intentions", "due_dormant_intentions", "intentions_colliding",
                         "crystal_recall", "compat_drift", "pack_drift"):
                 monkeypatch.setattr(helper, opt, lambda *a, **k: [], raising=False)
 
@@ -1310,7 +1310,7 @@ class TestWrapBlockedDoesNotUnderstateTheRisk:
                                 lambda timeout=None: 40, raising=False)
             monkeypatch.delattr(helper, "wrap_state", raising=False)
             monkeypatch.delattr(helper, "format_wrap_blocked", raising=False)
-            for opt in ("open_spores", "due_dormant_spores", "spores_colliding",
+            for opt in ("open_intentions", "due_dormant_intentions", "intentions_colliding",
                         "crystal_recall", "compat_drift", "pack_drift"):
                 monkeypatch.setattr(helper, opt, lambda *a, **k: [], raising=False)
 
@@ -1381,7 +1381,7 @@ class TestWrapAdviceRoutingThroughMain:
             lambda *a, **k: {"episodes_since_wrap": episodes,
                              "wrap_in_progress": in_progress},
             raising=False)
-        for opt in ("open_spores", "due_dormant_spores", "spores_colliding",
+        for opt in ("open_intentions", "due_dormant_intentions", "intentions_colliding",
                     "crystal_recall", "compat_drift", "pack_drift"):
             monkeypatch.setattr(helper, opt, lambda *a, **k: [], raising=False)
 

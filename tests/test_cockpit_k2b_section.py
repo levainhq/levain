@@ -13,7 +13,7 @@ from anneal_memory import Store
 
 from levain.cockpit.anneal_effects import SECTIONS, EpisodeEffectStore, SectionEffectStore
 from levain.cockpit.broker import Broker
-from levain.cockpit.effects import SporeEffectStore
+from levain.cockpit.effects import IntentionEffectStore
 from levain.cockpit.verbs import dispatch, retier
 from tests.test_cockpit_k2a import CRED, INSTALL_CLASS, Rig, _refused
 from tests.test_cockpit_k2b_broker import Key, _refused as _broker_refused, _rows, _state as _pending_state, home, keydir  # noqa: F401
@@ -23,11 +23,11 @@ from tests.test_cockpit_k2b_broker import Key, _refused as _broker_refused, _row
 def rig_broker(home: Path):
     rig = Rig(home)
     db = Path(rig.src.anneal.episodic_db)
-    spores = rig.root / ".levain" / "memory.spores.json"
+    intentions = rig.root / ".levain" / "memory.spores.json"
     b = Broker(home / "data",
-               stores={"spores": SporeEffectStore(spores), "episodes": EpisodeEffectStore(db),
+               stores={"intentions": IntentionEffectStore(intentions), "episodes": EpisodeEffectStore(db),
                        SECTIONS: SectionEffectStore(db)},
-               store_paths=[spores, db], install_class="reported",
+               store_paths=[intentions, db], install_class="reported",
                tier_of=lambda verb, params, target: retier(rig.reg, rig.ck, verb, dict(params), dict(target)))
     b.start()
     try:

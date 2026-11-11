@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain.authority import AuthoritySnapshot, StandingPolicy, genesis_policy
 from levain.cockpit import verbs as verbs_mod
@@ -53,7 +53,7 @@ class Clock:
 
 def _install(tmp_path: Path) -> tuple[Path, SubstrateSource, dict[str, str]]:
     root = _make_levain_install(tmp_path)
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     ids = {
         "seed": store.add(type="task", text="a tray seed", disposition="seed", today=TODAY)["id"],
         "held": store.add(type="task", text="a held seed", disposition="seed",
@@ -76,10 +76,10 @@ class Rig:
         self.ck = build_default_cockpit(self.src, clock=self.clock)
         self.reg = VerbRegistry(extra)
         self.ck.attach_verbs(VerbView(self.reg, self.ck, INSTALL_CLASS))
-        self.store = SporeStore(self.root / ".levain" / "memory.spores.json")
+        self.store = IntentionStore(self.root / ".levain" / "memory.spores.json", id_prefix="intention")
 
     def row(self, panel: str, key: str) -> dict[str, Any]:
-        res = self.ck.read_one(panel, f"spore:{self.ids[key]}")
+        res = self.ck.read_one(panel, f"intention:{self.ids[key]}")
         return res.value
 
     def post(self, verb: str, panel: str, key: str | None = None, params: dict | None = None, **env: Any) -> dict:
@@ -94,7 +94,7 @@ class Rig:
     def tier(self, verb: str, panel: str, key: str | None = None, params: dict | None = None) -> str:
         return self.post(verb, panel, key, params, dry_run=True)["tier"]
 
-    def spore(self, key: str) -> dict[str, Any]:
+    def intention(self, key: str) -> dict[str, Any]:
         return self.store.get(self.ids[key])
 
     def edit(self, req: dict[str, Any]) -> dict:
@@ -155,10 +155,10 @@ T2_T3_EDIT_BODIES = {
     "config": {"kind": "config", "source": "seed/world.md", "heading": "X", "expected_body": "", "new_body": "y"},
     "entity_name": {"kind": "entity_name", "value": "n", "expected": None},
     "state": {"kind": "state", "heading": "State", "expected_body": "", "new_body": "y"},
-    "spore_seed": {"kind": "spore_seed", "text": "planted"},
-    "spore_set_disposition": {"kind": "spore_set_disposition", "disposition": "agenda"},
-    "spore_ascend": {"kind": "spore_ascend", "spore_kind": "x", "ref": "r", "confirm": True},
-    "spore_update_text": {"kind": "spore_update", "text": "new words"},
+    "intention_seed": {"kind": "intention_seed", "text": "planted"},
+    "intention_set_disposition": {"kind": "intention_set_disposition", "disposition": "agenda"},
+    "intention_promote": {"kind": "intention_promote", "intention_kind": "x", "ref": "r", "confirm": True},
+    "intention_update_text": {"kind": "intention_update", "text": "new words"},
     "episode_tombstone": {"kind": "episode_tombstone", "episode_id": "e1", "confirm": True},
     "undo": {"kind": "undo", "edit_id": "nope"},
 }
@@ -172,15 +172,15 @@ class TestCredentialAndTiers:
         _root, src, ids = _install(tmp_path)
         before = (_root / ".levain" / "memory.spores.json").read_text()
         with _serve(src, write_token=TOKEN) as (base, _h):
-            touch = {"kind": "spore_touch", "spore_id": ids["seed"]}
+            touch = {"kind": "intention_touch", "intention_id": ids["seed"]}
             st, body = _post(f"{base}/edit", touch)
             assert (st, body["error"]) == (403, "credential_required")
-            st, body = _post(f"{base}/cockpit/verb", {"verb": "spore_touch", "panel_id": "tray"})
+            st, body = _post(f"{base}/cockpit/verb", {"verb": "intention_touch", "panel_id": "tray"})
             assert (st, body["error"]) == (403, "credential_required")
             for name, b in T2_T3_EDIT_BODIES.items():
                 b = dict(b)
-                if "spore" in b["kind"] and b["kind"] != "spore_seed":
-                    b["spore_id"] = ids["loop"]
+                if "intention" in b["kind"] and b["kind"] != "intention_seed":
+                    b["intention_id"] = ids["loop"]
                 for tok in (None, TOKEN):
                     st, body = _post(f"{base}/edit", b, tok)
                     assert st in (403, 409), (name, tok, st, body)
@@ -195,29 +195,29 @@ class TestCredentialAndTiers:
         _root, src, ids = _install(tmp_path)
         with _serve(src, write_token=TOKEN) as (base, _h):
             rows = _get(f"{base}/cockpit/panel/tray.json", TOKEN)["rows"]
-            row = next(r for r in rows if r["id"] == f"spore:{ids['seed']}")
-            st, body = _post(f"{base}/cockpit/verb", {"verb": "spore_surface_at", "panel_id": "tray",
+            row = next(r for r in rows if r["id"] == f"intention:{ids['seed']}")
+            st, body = _post(f"{base}/cockpit/verb", {"verb": "intention_surface_at", "panel_id": "tray",
                                                        "row_id": row["id"], "row_version": row["version"],
                                                        "params": {"surface_at": "2030-01-01"}}, TOKEN)
             assert st == 200, body
-        assert SporeStore(_root / ".levain" / "memory.spores.json").get(ids["seed"])["next"] == "2030-01-01"
+        assert IntentionStore(_root / ".levain" / "memory.spores.json", id_prefix="intention").get(ids["seed"])["next"] == "2030-01-01"
 
     def test_a_writable_source_given_no_token_gets_a_per_launch_one(self, tmp_path: Path) -> None:
         _root, src, ids = _install(tmp_path)
         with _serve(src) as (base, httpd):
             tok = httpd.surface_tokens["browser"]
             assert len(tok) >= 32
-            assert _post(f"{base}/edit", {"kind": "spore_touch", "spore_id": ids["seed"]})[0] == 403
-            assert _post(f"{base}/edit", {"kind": "spore_touch", "spore_id": ids["seed"]}, tok)[0] == 200
+            assert _post(f"{base}/edit", {"kind": "intention_touch", "intention_id": ids["seed"]})[0] == 403
+            assert _post(f"{base}/edit", {"kind": "intention_touch", "intention_id": ids["seed"]}, tok)[0] == 200
 
     def test_no_t2_or_t3_ever_fires_from_the_post_handler(self, rig: Rig) -> None:
         """'no T2 or T3 ever fires from the POST handler (before K2b lands they are refused with
         "needs the broker")'"""
         before = rig.store.get(rig.ids["loop"])
-        cases = [("spore_set_disposition", "loops", "loop", {"disposition": "agenda"}),
-                 ("spore_ascend", "loops", "loop", {"spore_kind": "x", "ref": "r"}),
-                 ("spore_update", "loops", "loop", {"text": "new"}),
-                 ("spore_seed", "tray", None, {"text": "planted"})]
+        cases = [("intention_set_disposition", "loops", "loop", {"disposition": "agenda"}),
+                 ("intention_promote", "loops", "loop", {"intention_kind": "x", "ref": "r"}),
+                 ("intention_update", "loops", "loop", {"text": "new"}),
+                 ("intention_seed", "tray", None, {"text": "planted"})]
         for verb, panel, key, params in cases:
             e = _refused("needs_broker", rig.post, verb, panel, key, params, confirm=True, intent="reported",
                          tier_seen="T2", gesture_seen="direct-reported")
@@ -270,11 +270,11 @@ class TestCredentialAndTiers:
 
     def test_dry_run_returns_tier_and_gesture_and_writes_nothing(self, rig: Rig) -> None:
         """'a dry_run POST returns the tier and gesture and creates no pending'"""
-        before = rig.spore("loop")
-        out = rig.post("spore_update", "loops", "loop", {"text": "x"}, dry_run=True)
+        before = rig.intention("loop")
+        out = rig.post("intention_update", "loops", "loop", {"text": "x"}, dry_run=True)
         assert (out["tier"], out["gesture"], out["dry_run"]) == ("T2", "direct-reported", True)
-        assert rig.spore("loop") == before
-        assert not (rig.root / ".levain" / "edits.jsonl").exists() or "spore_update" not in \
+        assert rig.intention("loop") == before
+        assert not (rig.root / ".levain" / "edits.jsonl").exists() or "intention_update" not in \
             (rig.root / ".levain" / "edits.jsonl").read_text()
 
 
@@ -287,7 +287,7 @@ class TestBinding:
         r = rig.row("tray", "seed")
         rig.store.update(rig.ids["seed"], text="edited elsewhere")
         e = _refused("stale", dispatch, registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope,
-                     req={"verb": "spore_touch", "panel_id": "tray", "row_id": r["id"], "row_version": r["version"]},
+                     req={"verb": "intention_touch", "panel_id": "tray", "row_id": r["id"], "row_version": r["version"]},
                      credential=CRED, install_class=INSTALL_CLASS, route="cockpit")
         assert e.http_status == 409
 
@@ -305,26 +305,26 @@ class TestBinding:
                  panel_version="0" * 16)
 
     def test_touch_session_open_and_midnight_leave_the_version_alone(self, rig: Rig) -> None:
-        """'a spore_touch, a session-open and a clock moved past midnight between render and write →
+        """'an intention_touch, a session-open and a clock moved past midnight between render and write →
         the write still lands (version unchanged)'"""
         r = rig.row("tray", "seed")
         rig.store.touch(rig.ids["seed"], today=TODAY + timedelta(days=1))   # a touch, as session-open writes it
         rig.clock.advance(1)
-        out = rig.post("spore_surface_at", "tray", None, {"surface_at": "2030-01-01"},
+        out = rig.post("intention_surface_at", "tray", None, {"surface_at": "2030-01-01"},
                        row_id=r["id"], row_version=r["version"])
         assert out["ok"]
 
     def test_a_touch_that_clears_an_elapsed_next_changes_the_version(self, rig: Rig) -> None:
         """Measured for the desk (1010+31's anneal finding): anneal's touch clears an ELAPSED ``next``,
         and ``next`` is a stored, versioned field, so that touch IS a state change and the next write
-        on the old render gets 409. The §9 line above holds for a spore whose alarm has not elapsed."""
+        on the old render gets 409. The §9 line above holds for an intention whose alarm has not elapsed."""
         sid = rig.store.add(type="task", text="alarm", disposition="seed", next="2026-10-09", today=TODAY)["id"]
         rig.ids["alarm"] = sid
         r = rig.row("tray", "alarm")
         rig.store.touch(sid, today=TODAY)
         if rig.store.get(sid).get("next") is None:
             assert rig.row("tray", "alarm")["version"] != r["version"]
-            _refused("stale", rig.post, "spore_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
+            _refused("stale", rig.post, "intention_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
         else:
             pytest.fail("anneal's touch kept an elapsed next; the desk's premise no longer holds, re-read it")
 
@@ -338,13 +338,13 @@ class TestBinding:
             rig.store.update(rig.ids["seed"], text="landed in the window")
             return res
         monkeypatch.setattr(rig.ck, "read_one", read_then_race)
-        _refused("stale", rig.post, "spore_surface_at", "tray", None, {"surface_at": "2030-01-01"},
+        _refused("stale", rig.post, "intention_surface_at", "tray", None, {"surface_at": "2030-01-01"},
                  row_id=r["id"], row_version=r["version"])
 
     def test_a_verb_on_a_panel_that_does_not_offer_it_is_refused(self, rig: Rig) -> None:
         """'a verb on a panel that does not offer it → refused'"""
-        _refused("not_offered", rig.post, "spore_touch", "episodes")
-        _refused("not_offered", rig.post, "spore_seed", "loops", None, {"text": "x"})
+        _refused("not_offered", rig.post, "intention_touch", "episodes")
+        _refused("not_offered", rig.post, "intention_seed", "loops", None, {"text": "x"})
 
     def test_removing_a_panel_removes_its_verb(self, rig: Rig) -> None:
         """'removing a panel removes its verb (404)'"""
@@ -368,20 +368,20 @@ class TestTierLadder:
                 assert r["provenance"] is None
 
     def test_update_carrying_tier_and_text_reports_t2(self, rig: Rig) -> None:
-        """'a spore_update carrying tier and text reports T2'"""
-        assert rig.tier("spore_update", "loops", "loop", {"tier": "warm", "text": "x"}) == "T2"
-        assert rig.tier("spore_update", "loops", "loop", {"tier": "warm"}) == "C1"
+        """'an intention_update carrying tier and text reports T2'"""
+        assert rig.tier("intention_update", "loops", "loop", {"tier": "warm", "text": "x"}) == "T2"
+        assert rig.tier("intention_update", "loops", "loop", {"tier": "warm"}) == "C1"
 
     def test_on_an_unverified_tray_row_a_later_snooze_and_a_retier_fire_as_c1(self, rig: Rig) -> None:
         """'on an UNVERIFIED Tray row a later-dated snooze and a re-tier fire as C1 (RULED Q4)'"""
-        assert rig.post("spore_surface_at", "tray", "seed", {"surface_at": "2031-01-01"})["ok"]
-        assert rig.spore("seed")["next"] == "2031-01-01"
-        r = rig.ck.read_one("tray", f"spore:{rig.ids['note']}").value
+        assert rig.post("intention_surface_at", "tray", "seed", {"surface_at": "2031-01-01"})["ok"]
+        assert rig.intention("seed")["next"] == "2031-01-01"
+        r = rig.ck.read_one("tray", f"intention:{rig.ids['note']}").value
         out = dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope,
-                       req={"verb": "spore_update", "panel_id": "tray", "row_id": r["id"],
+                       req={"verb": "intention_update", "panel_id": "tray", "row_id": r["id"],
                             "row_version": r["version"], "params": {"tier": "hot"}},
                        credential=CRED, install_class=INSTALL_CLASS, route="cockpit")
-        assert out["ok"] and rig.spore("note")["tier"] == "hot"
+        assert out["ok"] and rig.intention("note")["tier"] == "hot"
 
     def test_a_held_row_pulled_forward_or_cleared_reports_t2_and_stays_held(self, rig: Rig) -> None:
         """'on an unverified row held to a future date, a date of tomorrow, of today, in the past, or a
@@ -389,55 +389,55 @@ class TestTierLadder:
         still out of tray and now'"""
         tomorrow, today, past = TODAY + timedelta(days=1), TODAY, TODAY - timedelta(days=3)
         for new in (tomorrow.isoformat(), today.isoformat(), past.isoformat(), None):
-            assert rig.tier("spore_surface_at", "tray", "held", {"surface_at": new}) == "T2", new
-            _refused("needs_intent", rig.post, "spore_surface_at", "tray", "held", {"surface_at": new})
-            _refused("needs_broker", rig.post, "spore_surface_at", "tray", "held", {"surface_at": new},
+            assert rig.tier("intention_surface_at", "tray", "held", {"surface_at": new}) == "T2", new
+            _refused("needs_intent", rig.post, "intention_surface_at", "tray", "held", {"surface_at": new})
+            _refused("needs_broker", rig.post, "intention_surface_at", "tray", "held", {"surface_at": new},
                      intent="reported", tier_seen="T2", gesture_seen="direct-reported")
         rig.clock.advance(2)    # past every rejected date, still before the stored one
-        held = f"spore:{rig.ids['held']}"
+        held = f"intention:{rig.ids['held']}"
         assert {r["id"]: r["group"] for r in rig.ck.panel("tray", credential_class="token")["rows"]}[held] == "later"   # still under Later
 
     def test_surface_at_on_a_legacy_note_keeps_it_in_the_tray(self, rig: Rig) -> None:
         """'surface_at on a legacy note (shown in the Tray since the Keep left) is accepted'"""
-        r = rig.ck.read_one("tray", f"spore:{rig.ids['note']}").value
+        r = rig.ck.read_one("tray", f"intention:{rig.ids['note']}").value
         dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope,
-                 req={"verb": "spore_surface_at", "panel_id": "tray", "row_id": r["id"], "row_version": r["version"],
+                 req={"verb": "intention_surface_at", "panel_id": "tray", "row_id": r["id"], "row_version": r["version"],
                       "params": {"surface_at": TODAY.isoformat()}},
                  credential=CRED, install_class=INSTALL_CLASS, route="cockpit")
-        assert f"spore:{rig.ids['note']}" in rig.panel_ids("tray")   # legacy, but never dropped from view
+        assert f"intention:{rig.ids['note']}" in rig.panel_ids("tray")   # legacy, but never dropped from view
 
     def test_set_disposition_reports_t2_for_every_target_on_every_row(self, rig: Rig) -> None:
-        """'spore_set_disposition reports T2 for every target on every row'"""
+        """'intention_set_disposition reports T2 for every target on every row'"""
         for key, panel in (("seed", "tray"), ("held", "tray"), ("loop", "loops"), ("note", "tray"), ("parked", "loops")):
             for target in ("seed", "handoff", "agenda", "note", "loop"):
-                assert rig.tier("spore_set_disposition", panel, key, {"disposition": target}) == "T2"
+                assert rig.tier("intention_set_disposition", panel, key, {"disposition": target}) == "T2"
 
     def test_a_retier_of_an_unverified_parked_loop_to_hot_reports_t2(self, rig: Rig) -> None:
         """'a re-tier of an unverified parked loop to hot reports T2'"""
         panel = "loops"
-        assert f"spore:{rig.ids['parked']}" in rig.panel_ids("loops")   # a parked loop is an Open loops row
-        r = rig.ck.read_one(panel, f"spore:{rig.ids['parked']}")
+        assert f"intention:{rig.ids['parked']}" in rig.panel_ids("loops")   # a parked loop is an Open loops row
+        r = rig.ck.read_one(panel, f"intention:{rig.ids['parked']}")
         assert r.value["facets"]["tier"] == "parked"
-        assert rig.tier("spore_update", panel, "parked", {"tier": "hot"}) == "T2"
-        assert rig.tier("spore_update", "loops", "loop", {"tier": "parked"}) == "T2"
+        assert rig.tier("intention_update", panel, "parked", {"tier": "hot"}) == "T2"
+        assert rig.tier("intention_update", "loops", "loop", {"tier": "parked"}) == "T2"
 
     def test_salience_and_free_text_descend_fields_are_refused(self, rig: Rig) -> None:
-        """'a spore_update carrying salience → refused'; 'a spore_descend carrying a free-text field → refused'"""
-        _refused("field_not_allowed", rig.post, "spore_update", "loops", "loop", {"salience": 9})
-        _refused("field_not_allowed", rig.post, "spore_descend", "loops", "loop",
-                 {"spore_kind": "x", "note": "free text"}, confirm=True)
+        """'an intention_update carrying salience → refused'; 'a intention_close carrying a free-text field → refused'"""
+        _refused("field_not_allowed", rig.post, "intention_update", "loops", "loop", {"salience": 9})
+        _refused("field_not_allowed", rig.post, "intention_close", "loops", "loop",
+                 {"intention_kind": "x", "note": "free text"}, confirm=True)
 
     def test_an_escalating_snooze_without_intent_is_refused_needs_intent(self, rig: Rig) -> None:
         """'a snooze POST with an escalating date and no intent → refused "needs intent"'"""
-        e = _refused("needs_intent", rig.post, "spore_surface_at", "tray", "held", {"surface_at": None})
+        e = _refused("needs_intent", rig.post, "intention_surface_at", "tray", "held", {"surface_at": None})
         assert e.http_status == 409
 
     def test_an_escalating_snooze_through_the_edit_alias_is_refused_needs_intent(self, rig: Rig) -> None:
         """'an escalating snooze through the /edit alias, in a reported install, is refused "needs intent"'"""
         assert INSTALL_CLASS == "reported"
-        _refused("needs_intent", rig.edit, {"kind": "spore_surface_at", "spore_id": rig.ids["held"], "surface_at": None})
-        assert rig.spore("held")["next"] == (TODAY + timedelta(days=5)).isoformat()
-        assert rig.edit({"kind": "spore_surface_at", "spore_id": rig.ids["held"], "surface_at": "2031-01-01"})["ok"]
+        _refused("needs_intent", rig.edit, {"kind": "intention_surface_at", "intention_id": rig.ids["held"], "surface_at": None})
+        assert rig.intention("held")["next"] == (TODAY + timedelta(days=5)).isoformat()
+        assert rig.edit({"kind": "intention_surface_at", "intention_id": rig.ids["held"], "surface_at": "2031-01-01"})["ok"]
 
     def test_decision_answer_is_not_registered(self, rig: Rig) -> None:
         """'a needs_phill row without owner_install → decision_answer refused': the kernel has no
@@ -453,39 +453,39 @@ class TestTierLadder:
 class TestRenderedActions:
     def test_row_actions_carry_tier_gesture_escalates_and_target(self, rig: Rig) -> None:
         rows = rig.ck.panel("tray", credential_class="token")["rows"]
-        seed = next(r for r in rows if r["id"] == f"spore:{rig.ids['seed']}")
+        seed = next(r for r in rows if r["id"] == f"intention:{rig.ids['seed']}")
         acts = {a["verb"]: a for a in seed["actions"]}
-        assert acts["spore_touch"]["tier"] == "C1" and acts["spore_touch"]["gesture"] == "direct"
-        assert acts["spore_set_disposition"]["gesture"] == "direct-reported"
-        assert acts["spore_touch"]["target"] == {"panel_id": "tray", "row_id": seed["id"], "row_version": seed["version"]}
+        assert acts["intention_touch"]["tier"] == "C1" and acts["intention_touch"]["gesture"] == "direct"
+        assert acts["intention_set_disposition"]["gesture"] == "direct-reported"
+        assert acts["intention_touch"]["target"] == {"panel_id": "tray", "row_id": seed["id"], "row_version": seed["version"]}
         none_rows = rig.ck.panel("tray", credential_class="none")["rows"]
         assert all(a["gesture"] == "refused" for r in none_rows for a in r["actions"])
 
     def test_past_midnight_a_passed_held_date_changes_the_etag_and_the_snooze_tier(self, rig: Rig) -> None:
         """'past midnight, a row whose held date passed returns a new panel etag and the snooze's new tier'"""
         before = rig.ck.panel("loops", credential_class="token")["etag"]
-        assert rig.tier("spore_surface_at", "tray", "held", {"surface_at": None}) == "T2"
+        assert rig.tier("intention_surface_at", "tray", "held", {"surface_at": None}) == "T2"
         rig.clock.advance(6)    # the held date (TODAY+5) has passed
         assert rig.ck.panel("loops", credential_class="token")["etag"] != before
-        assert rig.tier("spore_surface_at", "tray", "held", {"surface_at": None}) == "C1"
+        assert rig.tier("intention_surface_at", "tray", "held", {"surface_at": None}) == "C1"
 
     def test_a_policy_change_changes_the_panel_etag_with_rows_unchanged(self, rig: Rig) -> None:
         """'a policy change that alters a panel action's gesture with rows unchanged returns a new panel
         etag (no 304)'. The policy is the request's snapshot's (S4a); a real signed raise is
         ``test_cockpit_standing_policy.py``'s."""
         p1 = rig.ck.panel("tray", credential_class="token")
-        raised = StandingPolicy.from_dict({"raise_to": {"spore_touch": "T2"}, "timeouts": {}, "grants": {}})
+        raised = StandingPolicy.from_dict({"raise_to": {"intention_touch": "T2"}, "timeouts": {}, "grants": {}})
         snap = AuthoritySnapshot("store0001", 1, "a" * 64, {}, raised, ("a" * 64,))
         rig.ck.attach_authority(lambda now: RequestAuthority(now, authority=snap))
         p2 = rig.ck.panel("tray", credential_class="token")
         assert [r["version"] for r in p1["rows"]] == [r["version"] for r in p2["rows"]]
         assert p1["etag"] != p2["etag"]
-        touch = next(a for a in p2["rows"][0]["actions"] if a["verb"] == "spore_touch")
+        touch = next(a for a in p2["rows"][0]["actions"] if a["verb"] == "intention_touch")
         assert (touch["tier"], touch["gesture"]) == ("T2", "direct-reported")
 
     def test_the_manifest_verbs_map_holds_only_offered_verbs(self, rig: Rig) -> None:
         vm = rig.ck.manifest(CRED)["verbs"]
-        assert "spore_touch" in vm and vm["spore_touch"]["route"] == "cockpit"
+        assert "intention_touch" in vm and vm["intention_touch"]["route"] == "cockpit"
         assert "entity_name" not in vm          # no panel offers it
         assert "harness_approve" not in vm      # no panel offers it yet (the decisions panel is K2b's)
 
@@ -516,7 +516,7 @@ class TestRound1:
                 sp["salience"] = "x"
         p.write_text(json.dumps(data))
         before = p.read_text()
-        e = _refused("stale", rig.edit, {"kind": "spore_surface_at", "spore_id": sid, "surface_at": TODAY.isoformat()})
+        e = _refused("stale", rig.edit, {"kind": "intention_surface_at", "intention_id": sid, "surface_at": TODAY.isoformat()})
         assert e.http_status == 409
         assert p.read_text() == before
 
@@ -528,7 +528,7 @@ class TestRound1:
         real = v.apply_edit
         monkeypatch.setattr(v, "apply_edit", lambda scope, req, **kw: seen.append({**req, **kw}) or real(scope, req, **kw))
         rig_row_version = rig.row("loops", "loop")["version"]
-        rig.edit({"kind": "spore_descend", "spore_id": rig.ids["loop"], "spore_kind": "dropped", "confirm": True,
+        rig.edit({"kind": "intention_close", "intention_id": rig.ids["loop"], "intention_kind": "dropped", "confirm": True,
                   "expect_disposition": None})        # the rendered snapshot, compared normalised (loop = null)
         assert seen and seen[0]["expect_disposition"] == "loop"   # the row's own, normalised by the handler
         assert seen[0]["expected_version"] == rig_row_version          # and its version (S2)
@@ -551,13 +551,13 @@ class TestRound1:
         _refused("stale", rig.post, "operator_state", "state", None, {"text": "again"},
                  panel_version=verbs_mod.VALUE_ABSENT)
 
-    def test_spore_update_refuses_fields_its_handler_cannot_write(self, rig: Rig) -> None:
+    def test_intention_update_refuses_fields_its_handler_cannot_write(self, rig: Rig) -> None:
         """L1 M3 / L2 L1: next and domain were allowlisted and silently dropped. domain is now a field
         (Phill 10-11): always T2, so with no broker it refuses rather than reach the legacy write."""
-        _refused("field_not_allowed", rig.post, "spore_update", "loops", "loop", {"tier": "warm", "next": "2030-01-01"})
-        _refused("needs_broker", rig.post, "spore_update", "loops", "loop", {"tier": "warm", "domain": "x"},
+        _refused("field_not_allowed", rig.post, "intention_update", "loops", "loop", {"tier": "warm", "next": "2030-01-01"})
+        _refused("needs_broker", rig.post, "intention_update", "loops", "loop", {"tier": "warm", "domain": "x"},
                  intent="reported", confirm=True, idempotency_key="dom", tier_seen="T2", gesture_seen="direct-reported")
-        assert rig.spore("loop").get("domain") != "x"
+        assert rig.intention("loop").get("domain") != "x"
 
     def test_an_external_panel_cannot_offer_a_kernel_verb(self, tmp_path: Path) -> None:
         """L1 #12 / L2 L3."""
@@ -576,18 +576,18 @@ class TestRound1:
 
     def test_an_idempotency_key_on_a_non_idempotent_verb_is_refused(self, rig: Rig) -> None:
         """L1 #9: it was accepted and silently ignored."""
-        _refused("bad_request", rig.post, "spore_touch", "tray", "seed", {}, idempotency_key="k")
+        _refused("bad_request", rig.post, "intention_touch", "tray", "seed", {}, idempotency_key="k")
 
     def test_hung_write_reads_are_bounded_and_finished_ones_do_not_count(self, rig: Rig, monkeypatch) -> None:
         """L1 M5: write-time reads no longer join an older flight; the bound is on reads still running."""
         import levain.cockpit.engine as eng
         for _ in range(eng.WRITE_READ_CAP + 5):      # finished reads never fill the cap
-            assert rig.tier("spore_touch", "tray", "seed") == "C1"
+            assert rig.tier("intention_touch", "tray", "seed") == "C1"
         gate = threading.Event()
         spec = rig.ck.spec("tray")
         monkeypatch.setattr(spec, "read_one", lambda ctx, rid: (gate.wait(5), Absent("x"))[1])
         monkeypatch.setattr(spec, "timeout_s", 0.05)
-        outs = [rig.ck.read_one("tray", "spore:x") for _ in range(eng.WRITE_READ_CAP + 1)]
+        outs = [rig.ck.read_one("tray", "intention:x") for _ in range(eng.WRITE_READ_CAP + 1)]
         gate.set()
         assert "still running" in outs[-1].message
 
@@ -649,14 +649,14 @@ class TestL3Round1:
     def test_a_legacy_descend_rendered_on_another_list_is_409(self, rig: Rig) -> None:
         """codex #3: /edit dropped the body's expect_disposition and bound to a fresh read, so a
         'remove note' confirmed on an old render descended a now-live loop."""
-        before = rig.spore("loop")
-        e = _refused("stale", rig.edit, {"kind": "spore_descend", "spore_id": rig.ids["loop"],
-                                         "spore_kind": "composted", "confirm": True, "expect_disposition": "note"})
-        assert e.http_status == 409 and rig.spore("loop") == before
-        _refused("bad_request", rig.edit, {"kind": "spore_descend", "spore_id": rig.ids["loop"],
-                                           "spore_kind": "dropped", "confirm": True})
-        assert rig.spore("loop") == before
-        assert rig.edit({"kind": "spore_descend", "spore_id": rig.ids["loop"], "spore_kind": "dropped",
+        before = rig.intention("loop")
+        e = _refused("stale", rig.edit, {"kind": "intention_close", "intention_id": rig.ids["loop"],
+                                         "intention_kind": "composted", "confirm": True, "expect_disposition": "note"})
+        assert e.http_status == 409 and rig.intention("loop") == before
+        _refused("bad_request", rig.edit, {"kind": "intention_close", "intention_id": rig.ids["loop"],
+                                           "intention_kind": "dropped", "confirm": True})
+        assert rig.intention("loop") == before
+        assert rig.edit({"kind": "intention_close", "intention_id": rig.ids["loop"], "intention_kind": "dropped",
                          "confirm": True, "expect_disposition": "loop"})["ok"]
 
     def test_the_state_line_and_its_version_come_from_one_read(self, rig: Rig) -> None:
@@ -696,9 +696,9 @@ class TestL3Round1:
 
     def test_a_non_bool_dry_run_is_refused_not_a_live_write(self, rig: Rig) -> None:
         """codex #8: dry_run "true" fell through to a live write."""
-        before = rig.spore("seed")
-        e = _refused("bad_request", rig.post, "spore_touch", "tray", "seed", dry_run="true")
-        assert e.http_status == 400 and rig.spore("seed") == before
+        before = rig.intention("seed")
+        e = _refused("bad_request", rig.post, "intention_touch", "tray", "seed", dry_run="true")
+        assert e.http_status == 400 and rig.intention("seed") == before
 
     def test_the_verbs_map_is_what_panels_offer_and_never_a_feed_named_broker_head(self, tmp_path: Path) -> None:
         """codex #9 / complement #5: the map read raw spec.verbs, so a feed could publish a broker head
@@ -765,10 +765,10 @@ class TestL1Round2:
         spec = rig.ck.spec("tray")
         monkeypatch.setattr(spec, "read_one", lambda ctx, rid: (gate.wait(5), Absent("x"))[1])
         monkeypatch.setattr(spec, "timeout_s", 0.05)
-        outs = [rig.ck.read_one("tray", "spore:x") for _ in range(eng.WRITE_READ_CAP + 1)]
+        outs = [rig.ck.read_one("tray", "intention:x") for _ in range(eng.WRITE_READ_CAP + 1)]
         try:
             assert "reads of panel 'tray' are still running" in outs[-1].message
-            assert rig.tier("spore_touch", "loops", "loop") == "C1"      # another source still reads
+            assert rig.tier("intention_touch", "loops", "loop") == "C1"      # another source still reads
         finally:
             gate.set()
 
@@ -936,17 +936,17 @@ class TestL3Round2:
         assert e.http_status == 503 and cj.read_text() == before
 
 
-# --- S2: the spore write is compared, inside anneal's transaction, with the row the kernel read ----
+# --- S2: the intention write is compared, inside anneal's transaction, with the row the kernel read ----
 
 
-class TestSporeCas:
+class TestIntentionCas:
     @pytest.mark.parametrize("verb,panel,key,params,env", [
-        ("spore_touch", "tray", "seed", {}, {}),
-        ("spore_surface_at", "loops", "loop", {"surface_at": "2030-01-01"}, {}),
-        ("spore_update", "loops", "loop", {"tier": "warm"}, {}),
-        ("spore_descend", "loops", "loop", {"spore_kind": "dropped"}, {"confirm": True}),
+        ("intention_touch", "tray", "seed", {}, {}),
+        ("intention_surface_at", "loops", "loop", {"surface_at": "2030-01-01"}, {}),
+        ("intention_update", "loops", "loop", {"tier": "warm"}, {}),
+        ("intention_close", "loops", "loop", {"intention_kind": "dropped"}, {"confirm": True}),
     ])
-    def test_a_write_landing_between_read_one_and_the_fire_is_409_on_every_c1_spore_verb(
+    def test_a_write_landing_between_read_one_and_the_fire_is_409_on_every_c1_intention_verb(
             self, rig: Rig, monkeypatch, verb: str, panel: str, key: str, params: dict, env: dict) -> None:
         r = rig.row(panel, key)
         real = rig.ck.read_one
@@ -958,30 +958,30 @@ class TestSporeCas:
         monkeypatch.setattr(rig.ck, "read_one", read_then_race)
         e = _refused("stale", rig.post, verb, panel, None, params, row_id=r["id"], row_version=r["version"], **env)
         assert e.http_status == 409
-        after = rig.spore(key)
+        after = rig.intention(key)
         assert after is not None and after["text"] == "landed in the window" and after.get("status") != "resolved"
 
     def test_the_version_anneal_compares_is_the_version_the_panel_rendered(self, rig: Rig) -> None:
-        """Every rendered spore row, odd stored shapes included (L1 #5 on 6ae3218: the first version
-        skipped rows it could not read and held only well-formed spores)."""
-        from levain.cockpit.providers import spore_row_version
+        """Every rendered intention row, odd stored shapes included (L1 #5 on 6ae3218: the first version
+        skipped rows it could not read and held only well-formed intentions)."""
+        from levain.cockpit.providers import intention_row_version
         p = rig.root / ".levain" / "memory.spores.json"
         data = json.loads(p.read_text())
         loop = next(sp for sp in data["spores"] if sp["id"] == rig.ids["loop"])
         loop.pop("disposition", None)                  # the loop sentinel: key absent
-        odd = dict(loop, id="spore-odd1", text="odd shapes", salience="2", pointer={"k": 1})
+        odd = dict(loop, id="intention-odd1", text="odd shapes", salience="2", pointer={"k": 1})
         odd.pop("next", None)
         data["spores"].append(odd)
         p.write_text(json.dumps(data))
         rows = {r["id"]: r for pid in ("tray", "loops")
                 for r in (rig.ck.panel(pid, credential_class="token") or {}).get("rows") or []}
         stored = {sp["id"]: sp for sp in json.loads(p.read_text())["spores"]}
-        assert set(rows) == {f"spore:{i}" for i in stored}   # a later row is in view too
+        assert set(rows) == {f"intention:{i}" for i in stored}   # a later row is in view too
         for rid, row in rows.items():
-            assert spore_row_version(stored[rid[len("spore:"):]]) == row["version"], rid
+            assert intention_row_version(stored[rid[len("intention:"):]]) == row["version"], rid
 
-    def test_a_spore_resolved_between_read_one_and_the_fire_is_409_not_422(self, rig: Rig, monkeypatch) -> None:
-        """L1 #1 on 6ae3218: anneal refuses a resolved spore before it computes a version, and that
+    def test_a_intention_resolved_between_read_one_and_the_fire_is_409_not_422(self, rig: Rig, monkeypatch) -> None:
+        """L1 #1 on 6ae3218: anneal refuses a resolved intention before it computes a version, and that
         surfaced as a generic 422."""
         r = rig.row("tray", "seed")
         real = rig.ck.read_one
@@ -991,26 +991,26 @@ class TestSporeCas:
             rig.store.descend(rig.ids["seed"], kind="dropped")
             return res
         monkeypatch.setattr(rig.ck, "read_one", read_then_resolve)
-        e = _refused("stale", rig.post, "spore_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
+        e = _refused("stale", rig.post, "intention_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
         assert e.http_status == 409
 
     @pytest.mark.parametrize("req", [
-        {"kind": "spore_set_disposition", "disposition": "agenda", "confirm": True},
-        {"kind": "spore_ascend", "spore_kind": "done", "ref": "r", "confirm": True},
+        {"kind": "intention_set_disposition", "disposition": "agenda", "confirm": True},
+        {"kind": "intention_promote", "intention_kind": "done", "ref": "r", "confirm": True},
     ])
-    def test_the_t2_spore_writes_are_guarded_too(self, rig: Rig, req: dict) -> None:
+    def test_the_t2_intention_writes_are_guarded_too(self, rig: Rig, req: dict) -> None:
         """The broker (K2b) fires these; the guard is already on their store call (L1 #5)."""
         from levain.writes import apply_edit
         v = rig.row("loops", "loop")["version"]
         rig.store.update(rig.ids["loop"], text="moved on")
-        e = _refused("stale", apply_edit, rig.src.write_scope, {**req, "spore_id": rig.ids["loop"]}, expected_version=v)
-        assert e.http_status == 409 and rig.spore("loop")["text"] == "moved on"
+        e = _refused("stale", apply_edit, rig.src.write_scope, {**req, "intention_id": rig.ids["loop"]}, expected_version=v)
+        assert e.http_status == 409 and rig.intention("loop")["text"] == "moved on"
 
-    def test_a_spore_resolved_after_render_is_409(self, rig: Rig) -> None:
+    def test_a_intention_resolved_after_render_is_409(self, rig: Rig) -> None:
         """Liveness at write (design §4.4 as amended 10-10): resolved between render and read_one."""
         r = rig.row("tray", "seed")
         rig.store.descend(rig.ids["seed"], kind="dropped")
-        e = _refused("stale", rig.post, "spore_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
+        e = _refused("stale", rig.post, "intention_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
         assert e.http_status == 409
 
     @pytest.mark.parametrize("exc", [OverflowError("1e400"), KeyError("x"), AttributeError("x")])
@@ -1018,20 +1018,20 @@ class TestSporeCas:
         """r3 consensus (complement #2, codex #3, glm): only ValueError/TypeError were caught."""
         import levain.cockpit.providers as prov
         r = rig.row("tray", "seed")
-        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(exc))
-        before = rig.spore("seed")
-        _refused("stale", rig.post, "spore_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
-        assert rig.spore("seed") == before
+        monkeypatch.setattr(prov, "open_intention_from", lambda raw: (_ for _ in ()).throw(exc))
+        before = rig.intention("seed")
+        _refused("stale", rig.post, "intention_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
+        assert rig.intention("seed") == before
 
-    def test_a_spore_the_kernel_cannot_version_is_refused_stale(self, rig: Rig, monkeypatch) -> None:
+    def test_a_intention_the_kernel_cannot_version_is_refused_stale(self, rig: Rig, monkeypatch) -> None:
         import levain.cockpit.providers as prov
         r = rig.row("tray", "seed")
-        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(ValueError("bad row")))
-        before = rig.spore("seed")
-        _refused("stale", rig.post, "spore_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
-        assert rig.spore("seed") == before
+        monkeypatch.setattr(prov, "open_intention_from", lambda raw: (_ for _ in ()).throw(ValueError("bad row")))
+        before = rig.intention("seed")
+        _refused("stale", rig.post, "intention_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
+        assert rig.intention("seed") == before
 
-    def test_expected_version_binds_only_a_spore_write(self, rig: Rig) -> None:
+    def test_expected_version_binds_only_a_intention_write(self, rig: Rig) -> None:
         from levain.writes import apply_edit
         e = _refused("bad_request", apply_edit, rig.src.write_scope, {"kind": "operator_state", "text": "x"},
                      expected_version="0" * 16)
@@ -1044,12 +1044,12 @@ class TestL3Round4:
         passing that exact expected_version made an unreadable row compare equal and the write land."""
         import levain.cockpit.providers as prov
         from levain.writes import apply_edit
-        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
-        before = rig.spore("seed")
+        monkeypatch.setattr(prov, "open_intention_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
+        before = rig.intention("seed")
         for v in ("unversionable", "x"):
-            _refused("stale", apply_edit, rig.src.write_scope, {"kind": "spore_touch", "spore_id": rig.ids["seed"]},
+            _refused("stale", apply_edit, rig.src.write_scope, {"kind": "intention_touch", "intention_id": rig.ids["seed"]},
                      expected_version=v)
-        assert rig.spore("seed") == before
+        assert rig.intention("seed") == before
 
 
 class TestL3Round5:
@@ -1058,45 +1058,45 @@ class TestL3Round5:
         an empty expected_version. The marker is deleted (the guard raises) and levain refuses it itself."""
         import levain.cockpit.providers as prov
         from levain.writes import apply_edit
-        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
-        before = rig.spore("seed")
+        monkeypatch.setattr(prov, "open_intention_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
+        before = rig.intention("seed")
         for v in ("", 0, b"x"):
             e = _refused("bad_request", apply_edit, rig.src.write_scope,
-                         {"kind": "spore_touch", "spore_id": rig.ids["seed"]}, expected_version=v)
+                         {"kind": "intention_touch", "intention_id": rig.ids["seed"]}, expected_version=v)
             assert e.http_status == 400
-        assert rig.spore("seed") == before
+        assert rig.intention("seed") == before
 
     def test_an_unversionable_row_is_stale_through_every_guarded_verb(self, rig: Rig, monkeypatch) -> None:
-        """The guard raises inside anneal's transaction, so each guarded spore verb refuses 409 and saves
+        """The guard raises inside anneal's transaction, so each guarded intention verb refuses 409 and saves
         nothing, whatever expected_version the caller sent."""
         import levain.cockpit.providers as prov
         from levain.writes import apply_edit
-        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
-        before = rig.spore("seed")
-        for req in ({"kind": "spore_touch"}, {"kind": "spore_surface_at", "surface_at": "2030-01-01"},
-                    {"kind": "spore_update", "text": "y"}):
-            e = _refused("stale", apply_edit, rig.src.write_scope, {**req, "spore_id": rig.ids["seed"]},
+        monkeypatch.setattr(prov, "open_intention_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
+        before = rig.intention("seed")
+        for req in ({"kind": "intention_touch"}, {"kind": "intention_surface_at", "surface_at": "2030-01-01"},
+                    {"kind": "intention_update", "text": "y"}):
+            e = _refused("stale", apply_edit, rig.src.write_scope, {**req, "intention_id": rig.ids["seed"]},
                          expected_version="0" * 16)
             assert "could not be versioned" in str(e)
-        assert rig.spore("seed") == before
+        assert rig.intention("seed") == before
 
     def test_the_guard_raises_on_an_unreadable_row_and_records_why(self, rig: Rig, monkeypatch) -> None:
-        """complement #1 r5: version_of returned "" for a row it could not version. It raises SporeError
+        """complement #1 r5: version_of returned "" for a row it could not version. It raises IntentionError
         (anneal saves nothing when the transaction body raises) and found stays unset."""
         import levain.cockpit.providers as prov
-        from anneal_memory.spores import SporeError
+        from anneal_memory.spores import IntentionError
         from levain.writes import _VersionGuard
-        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
+        monkeypatch.setattr(prov, "open_intention_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
         guard = _VersionGuard("x" * 16)
-        with pytest.raises(SporeError, match="could not be versioned"):
-            guard.version_of(rig.spore("seed"))
+        with pytest.raises(IntentionError, match="could not be versioned"):
+            guard.version_of(rig.intention("seed"))
         assert guard.found is None and guard.error and "OverflowError" in guard.error
-        before = rig.spore("seed")
+        before = rig.intention("seed")
         guard = _VersionGuard("x" * 16)
-        with pytest.raises(SporeError):
+        with pytest.raises(IntentionError):
             rig.store.touch(rig.ids["seed"], expected_version="x" * 16, version_of=guard.version_of)
         assert guard.found is None and guard.error
-        assert rig.spore("seed") == before
+        assert rig.intention("seed") == before
 
     def test_a_str_subclass_id_is_an_errors_entry_and_never_hashed(self, tmp_path: Path) -> None:
         """codex MED r5: a str subclass with __hash__ = None passed isinstance and crashed the Counter."""

@@ -1,5 +1,5 @@
 """levain.cockpit.effects: a consented effect, its apply units, the one classifier that settles
-them, and the spore adapter (K2b design §0.4-0.5, §4.0-§4.1).
+them, and the intention adapter (K2b design §0.4-0.5, §4.0-§4.1).
 
 An ``Effect`` is one object's entry in a consent record's ``effects`` list. Execution groups
 effects into APPLY UNITS, the effects one store primitive applies in one transaction (§4.0). Each
@@ -11,9 +11,9 @@ result into APPLIED / UNAPPLIED, and every exception it cannot name into ``Trans
 so a repaired store can still take the consented write (§4.1.2); the retry policy is §4.1.2's
 ``record_fault``.
 
-The spore adapter maps each spore effect to anneal's ``SporeStore.apply(SporeApply(...))``,
+The intention adapter maps each intention effect to anneal's ``IntentionStore.apply(IntentionApply(...))``,
 addressed by ``origin_key``, with the postcondition leaves anneal requires (§4.1.2, the anneal
-mapping). Every effect it reads is a spore whose ``resource_key`` is ``spore:<origin_key>``."""
+mapping). Every effect it reads is an intention whose ``resource_key`` is ``intention:<origin_key>``."""
 
 from __future__ import annotations
 
@@ -388,16 +388,16 @@ def _is_anneal_refusal(exc: BaseException) -> bool:
     return isinstance(exc, (ApplyRefused, PostconditionFailed))
 
 
-# --- the spore adapter ---------------------------------------------------------------------------
+# --- the intention adapter ---------------------------------------------------------------------------
 
-SPORES = "spores"
-SPORE_KEY_PREFIX = "spore:"
-SPORE_AUTHORITY_FIELDS = ("text", "domain", "disposition")
-# anneal fills these at write; none sits in a spore effect's ``changes``
-SPORE_STORE_ASSIGNED = ("id", "seen", "created", "origin_key", "notes", "resolution.on", "resolution.at")
-# the fields an update-shaped spore effect may change (anneal's update args, ``add_note`` excluded); ``target`` and
-# ``attention`` reach an effect only through spore_retarget's builder (the edit verb's builder refuses both)
-SPORE_UPDATE_FIELDS = ("type", "tier", "next", "text", "salience", "domain", "pointer", "disposition", "target",
+INTENTIONS = "intentions"
+INTENTION_KEY_PREFIX = "intention:"
+INTENTION_AUTHORITY_FIELDS = ("text", "domain", "disposition")
+# anneal fills these at write; none sits in an intention effect's ``changes``
+INTENTION_STORE_ASSIGNED = ("id", "seen", "created", "origin_key", "notes", "resolution.on", "resolution.at")
+# the fields an update-shaped intention effect may change (anneal's update args, ``add_note`` excluded); ``target`` and
+# ``attention`` reach an effect only through intention_retarget's builder (the edit verb's builder refuses both)
+INTENTION_UPDATE_FIELDS = ("type", "tier", "next", "text", "salience", "domain", "pointer", "disposition", "target",
                        "attention")
 
 
@@ -407,14 +407,14 @@ def create_origin_key(pending_id: str, idx: int) -> str:
     return f"ck.{hexpart}.{idx}"
 
 
-def spore_resource_key(origin_key: str) -> str:
-    return SPORE_KEY_PREFIX + origin_key
+def intention_resource_key(origin_key: str) -> str:
+    return INTENTION_KEY_PREFIX + origin_key
 
 
 def _origin_key_of(resource_key: str) -> str:
-    if not resource_key.startswith(SPORE_KEY_PREFIX) or len(resource_key) == len(SPORE_KEY_PREFIX):
-        raise PermanentApplyRefusal(f"{resource_key!r} is not a spore resource key")
-    return resource_key[len(SPORE_KEY_PREFIX):]
+    if not resource_key.startswith(INTENTION_KEY_PREFIX) or len(resource_key) == len(INTENTION_KEY_PREFIX):
+        raise PermanentApplyRefusal(f"{resource_key!r} is not an intention resource key")
+    return resource_key[len(INTENTION_KEY_PREFIX):]
 
 
 def _stored_authority(row: Mapping[str, Any], f: str) -> Any:
@@ -435,41 +435,41 @@ def _keeps_disposition(effect: Effect) -> bool:
     return "disposition" in effect.changes and "disposition" not in effect.writes
 
 
-class SporeEffectStore:
-    """The ``EffectStore`` over an anneal ``SporeStore`` (§4.1.2's anneal mapping). Versions are the
-    cockpit's own row version (``providers.spore_row_version``), which anneal recomputes under its
-    lock as ``version_of``. Every effect is its own unit: one ``SporeApply`` is one transaction."""
+class IntentionEffectStore:
+    """The ``EffectStore`` over an anneal ``IntentionStore`` (§4.1.2's anneal mapping). Versions are the
+    cockpit's own row version (``providers.intention_row_version``), which anneal recomputes under its
+    lock as ``version_of``. Every effect is its own unit: one ``IntentionApply`` is one transaction."""
 
-    name = SPORES
-    authority_fields = SPORE_AUTHORITY_FIELDS
-    store_assigned_fields = SPORE_STORE_ASSIGNED
+    name = INTENTIONS
+    authority_fields = INTENTION_AUTHORITY_FIELDS
+    store_assigned_fields = INTENTION_STORE_ASSIGNED
 
     def __init__(self, path: str | os.PathLike[str],
                  version_of: Callable[[Mapping[str, Any]], str] | None = None) -> None:
-        from levain.cockpit.providers import SPORE_VERSION_FIELDS, spore_row_version
+        from levain.cockpit.providers import INTENTION_VERSION_FIELDS, intention_row_version
 
         self.path = Path(path)
-        self.version_fields = tuple(SPORE_VERSION_FIELDS)
+        self.version_fields = tuple(INTENTION_VERSION_FIELDS)
         # resolved here, before any store lock: the callback anneal runs under its lock imports nothing
-        self.version_of = version_of or spore_row_version
-        from levain.spores import guarded_spore_store
+        self.version_of = version_of or intention_row_version
+        from levain.intentions import guarded_intention_store
 
-        self._store = guarded_spore_store(self.path)
+        self._store = guarded_intention_store(self.path)
 
     # -- reads --
 
     def snapshot(self, resource_key: str) -> Snapshot:
-        from anneal_memory.spores import SporeError
+        from anneal_memory.spores import IntentionError
 
         key = _origin_key_of(resource_key)
         try:
             row = self._store.get_by_origin_key(key) if self.path.exists() else None
             return Snapshot(row, None if row is None else self.version_of(copy.deepcopy(row)))
-        except (SporeError, OSError, ValueError, TypeError) as exc:
+        except (IntentionError, OSError, ValueError, TypeError) as exc:
             raise TransientApplyFault.of(exc) from exc
 
     def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:
-        return [ApplyUnit(SPORES, (i,), (e,)) for i, e in effects]
+        return [ApplyUnit(INTENTIONS, (i,), (e,)) for i, e in effects]
 
     def label_fields(self, effect: Effect, stored: Mapping[str, Any] | None) -> tuple[str, ...]:
         if stored is None or effect.projection is None:
@@ -479,14 +479,14 @@ class SporeEffectStore:
 
     # -- apply --
 
-    def spore_apply(self, effect: Effect) -> Any:
-        """The ``SporeApply`` for one concrete effect: the op from its shape, ``args`` from its
+    def intention_apply(self, effect: Effect) -> Any:
+        """The ``IntentionApply`` for one concrete effect: the op from its shape, ``args`` from its
         ``changes``, and the postcondition leaves anneal requires (add/update: the fields in
         ``args``; descend: ``status`` + ``resolution.kind``; ascend: those + ``resolution.ref``;
         delete: none). An update does not write a disposition it does not change: it carries it as
         ``expect_disposition`` (anneal's CAS), out of the postcondition. ``None`` when that leaves
         nothing to write (only ``apply_unit`` calls this; it answers that case itself)."""
-        from anneal_memory.spores import SporeApply
+        from anneal_memory.spores import IntentionApply
 
         key = _origin_key_of(effect.resource_key)
         changes = dict(effect.changes)
@@ -494,12 +494,12 @@ class SporeEffectStore:
         if effect.is_create:
             if set(effect.expect) != {"absent"}:
                 raise PermanentApplyRefusal(f"a create expects only absence (got {dict(effect.expect)!r})")
-            return SporeApply(op="add", origin_key=key, args=dict(changes), postcondition=dict(changes))
+            return IntentionApply(op="add", origin_key=key, args=dict(changes), postcondition=dict(changes))
         if set(effect.expect) != {"version"} or not isinstance(version, str) or not version:
-            raise PermanentApplyRefusal(f"a spore effect expects a version (got {dict(effect.expect)!r})")
+            raise PermanentApplyRefusal(f"an intention effect expects a version (got {dict(effect.expect)!r})")
         guard = {"expected_version": version, "version_of": self.version_of}
         if effect.is_delete:
-            return SporeApply(op="delete", origin_key=key, **guard)
+            return IntentionApply(op="delete", origin_key=key, **guard)
         if changes.get("status") == "resolved":
             res = changes.get("resolution")
             if set(changes) != {"status", "resolution"} or not isinstance(res, Mapping):
@@ -512,10 +512,10 @@ class SporeEffectStore:
             leaves: dict[Any, Any] = {"status": "resolved", ("resolution", "kind"): res["kind"]}
             if op == "ascend":
                 leaves[("resolution", "ref")] = res["ref"]
-            return SporeApply(op=op, origin_key=key, args=args, postcondition=leaves, **guard)
-        stray = sorted(set(changes) - set(SPORE_UPDATE_FIELDS))
+            return IntentionApply(op=op, origin_key=key, args=args, postcondition=leaves, **guard)
+        stray = sorted(set(changes) - set(INTENTION_UPDATE_FIELDS))
         if not changes or stray:
-            raise PermanentApplyRefusal(f"an update changes {list(SPORE_UPDATE_FIELDS)} only (got {sorted(changes)})")
+            raise PermanentApplyRefusal(f"an update changes {list(INTENTION_UPDATE_FIELDS)} only (got {sorted(changes)})")
         args: dict[str, Any] = {}
         if _keeps_disposition(effect):
             # the disposition the row already holds is not WRITTEN (the guarded store refuses a legacy
@@ -525,20 +525,20 @@ class SporeEffectStore:
             args["expect_disposition"] = changes.pop("disposition")
             if not changes:
                 return None   # writes nothing: apply_unit answers it, version and CAS both checked
-        return SporeApply(op="update", origin_key=key, args={**changes, **args}, postcondition=dict(changes), **guard)
+        return IntentionApply(op="update", origin_key=key, args={**changes, **args}, postcondition=dict(changes), **guard)
 
     def apply_unit(self, unit: ApplyUnit) -> UnitApplyResult:
-        from anneal_memory.spores import ApplyRefused, PostconditionFailed, SporeError
+        from anneal_memory.spores import ApplyRefused, PostconditionFailed, IntentionError
 
-        if len(unit.effects) != 1 or unit.store != SPORES:
-            raise PermanentApplyRefusal(f"a spore unit is one spore effect (got {len(unit.effects)} on {unit.store!r})")
+        if len(unit.effects) != 1 or unit.store != INTENTIONS:
+            raise PermanentApplyRefusal(f"an intention unit is one intention effect (got {len(unit.effects)} on {unit.store!r})")
         effect = unit.effects[0]
-        spore_apply = self.spore_apply(effect)
+        intention_apply = self.intention_apply(effect)
         # anneal loads a missing file as an empty store, so only a create may meet one (anneal
         # makes the file); for any other effect a missing file is a definite absence
         if not effect.is_create and (not self.path.parent.is_dir() or not self.path.exists()):
             raise StoreGone(f"{self.path} is absent")
-        if spore_apply is None:
+        if intention_apply is None:
             # an update whose one field, the disposition, is the row's own: nothing to write, so nothing
             # anneal can be handed. Both guards are checked here, on one read of the store: ALREADY only
             # while the row is open, at the signed version, and still holds that disposition (the CAS,
@@ -550,16 +550,16 @@ class SporeEffectStore:
                 return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(row.get("id"), row),))
             return UnitApplyResult(ApplyOutcome.PRECONDITION_LOST, (MemberApply(None if row is None else row.get("id"), row),))
         try:
-            res = self._store.apply(spore_apply)
+            res = self._store.apply(intention_apply)
         except (PostconditionFailed, ApplyRefused) as exc:
             raise PermanentApplyRefusal(f"{type(exc).__name__}: {exc}") from exc
-        except (SporeError, OSError) as exc:
+        except (IntentionError, OSError) as exc:
             raise TransientApplyFault.of(exc) from exc
         outcome = {"already": ApplyOutcome.ALREADY, "applied": ApplyOutcome.APPLIED,
                    "precondition_lost": ApplyOutcome.PRECONDITION_LOST}.get(res.outcome)
         if outcome is None:
             raise TransientApplyFault("ValueError", f"anneal apply outcome {res.outcome!r}")
-        cas = dict(spore_apply.args).get("expect_disposition", _NO_CAS)
+        cas = dict(intention_apply.args).get("expect_disposition", _NO_CAS)
         if (outcome is ApplyOutcome.ALREADY and cas is not _NO_CAS
                 and (res.spore is None or res.spore.get("disposition") != cas)):
             # anneal answers ALREADY from the written leaves before it reads its CAS, so a kept
@@ -569,23 +569,23 @@ class SporeEffectStore:
         return UnitApplyResult(outcome, (MemberApply(res.spore_id, res.spore),))
 
 
-# --- canonical_effect per spore verb (flow design §4.5) -----------------------------------------
+# --- canonical_effect per intention verb (flow design §4.5) -----------------------------------------
 
 
 def _norm(value: Any) -> str:
-    from anneal_memory.spores import normalize_spore_field
+    from anneal_memory.spores import normalize_intention_field
 
     if not isinstance(value, str):
         raise ValueError(f"expected a string (got {value!r})")
-    return normalize_spore_field(value)
+    return normalize_intention_field(value)
 
 
 def _norm_disposition(value: Any, current: Any = None) -> str | None:
     """``current``: the stored disposition. A retired value is refused only as a CHANGE: an echo of a
     legacy row's own retired value (in any spelling anneal persists as it) is accepted, and
-    ``SporeEffectStore.spore_apply`` leaves it out of the write. Any other invalid value (None
+    ``IntentionEffectStore.intention_apply`` leaves it out of the write. Any other invalid value (None
     included) is refused as not one of the write set (``WRITE_DISPOSITIONS``)."""
-    from levain.spores import (
+    from levain.intentions import (
         LOOP_DISPOSITION,
         WRITE_DISPOSITIONS,
         RetiredDisposition,
@@ -653,31 +653,31 @@ def _norm_update_field(f: str, value: Any, pre: Mapping[str, Any] | None = None)
         if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 3:
             raise ValueError(f"salience must be an int 0-3 (got {value!r})")
         return value
-    raise ValueError(f"{f!r} is not a field a spore edit changes")
+    raise ValueError(f"{f!r} is not a field an intention edit changes")
 
 
 def _require_open(pre_state: Mapping[str, Any] | None) -> Mapping[str, Any]:
     if pre_state is None:
-        raise ValueError("the spore does not exist")
+        raise ValueError("the intention does not exist")
     if pre_state.get("status", "open") != "open":
-        raise ValueError("the spore is resolved")
+        raise ValueError("the intention is resolved")
     if not isinstance(pre_state.get("origin_key"), str) or not pre_state.get("origin_key"):
-        raise ValueError("the spore carries no origin_key, so no effect can address it")
+        raise ValueError("the intention carries no origin_key, so no effect can address it")
     return pre_state
 
 
 def _existing_effect(pre: Mapping[str, Any], changes: dict[str, Any], version_of: Callable[..., str]) -> Effect:
-    projection = {f: _stored_authority({**pre, **changes}, f) for f in SPORE_AUTHORITY_FIELDS}
-    writes = tuple(f for f in SPORE_AUTHORITY_FIELDS
+    projection = {f: _stored_authority({**pre, **changes}, f) for f in INTENTION_AUTHORITY_FIELDS}
+    writes = tuple(f for f in INTENTION_AUTHORITY_FIELDS
                    if f in changes and _stored_authority(changes, f) != _stored_authority(pre, f))
-    return Effect(spore_resource_key(str(pre["origin_key"])), SPORES,
+    return Effect(intention_resource_key(str(pre["origin_key"])), INTENTIONS,
                   {"version": version_of(copy.deepcopy(dict(pre)))}, changes, projection, writes, ())
 
 
 def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
              version_of: Callable[..., str]) -> Effect:
     from anneal_memory.spores import VALID_TYPES
-    from levain.spores import TRAY_WRITE_DISPOSITIONS
+    from levain.intentions import TRAY_WRITE_DISPOSITIONS
 
     if pre is not None:
         raise ValueError("a create's origin_key is already in use")
@@ -686,8 +686,8 @@ def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin
     stype = params.get("type", "thought")
     if stype not in VALID_TYPES:
         raise ValueError(f"type must be one of {list(VALID_TYPES)} (got {stype!r})")
-    disposition = params.get("disposition", "seed")
-    from levain.spores import RetiredDisposition, refuse_retired_disposition
+    disposition = params.get("disposition", "someday")
+    from levain.intentions import RetiredDisposition, refuse_retired_disposition
 
     try:
         refuse_retired_disposition(disposition)
@@ -700,12 +700,12 @@ def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin
     if params.get("domain"):
         changes["domain"] = _norm_update_field("domain", params["domain"])
     changes.update(_seed_steering(params, changes["disposition"]))
-    projection = {f: _stored_authority(changes, f) for f in SPORE_AUTHORITY_FIELDS}
+    projection = {f: _stored_authority(changes, f) for f in INTENTION_AUTHORITY_FIELDS}
     # a create sets EVERY authority field, an empty domain included, so it labels all of them (flow §4.5
     # invariant 5 makes the row's label its weakest field's: an unlabelled empty field would hold a row this
     # fire wrote whole at unverified). label_fields still labels only a field the store holds as projected
-    writes = SPORE_AUTHORITY_FIELDS
-    return Effect(spore_resource_key(origin_key), SPORES, {"absent": True}, changes, projection, writes, ())
+    writes = INTENTION_AUTHORITY_FIELDS
+    return Effect(intention_resource_key(origin_key), INTENTIONS, {"absent": True}, changes, projection, writes, ())
 
 
 # THE LIST (task_surfaces_1107.md): the three optional fields a create may carry. ``next`` is stored exactly as
@@ -715,7 +715,7 @@ SEED_STEERING_FIELDS = ("next", "target", "attention")
 
 
 def _seed_steering(params: Mapping[str, Any], disposition: str) -> dict[str, Any]:
-    from levain.spores import check_steering, valid_next
+    from levain.intentions import check_steering, valid_next
 
     out: dict[str, Any] = {}
     nxt = params.get("next")
@@ -736,16 +736,16 @@ def _seed_steering(params: Mapping[str, Any], disposition: str) -> dict[str, Any
 
 # --- THE LIST's one-line intake (task_surfaces_1107.md "intake grammar") ------------------------------------------
 # One panel verb, ``{line}``: the server reads the line with ``levain.intake.parse_intake`` (the browser holds no
-# grammar). A ``drop`` and a ``talk`` become a ``spore_seed`` effect (below) through the broker; a ``sort`` is a
-# desk drop (``verbs._intake_fire``), never a spore.
+# grammar). A ``drop`` and a ``talk`` become a ``intention_seed`` effect (below) through the broker; a ``sort`` is a
+# desk drop (``verbs._intake_fire``), never an intention.
 INTAKE_VERB = "list_intake"
 # the tier of each kind. A drop wakes the desk at its minute with the line's words as the operator's (germinate files
-# them as a desk drop from surface ``cli``), so it is signed. A talk seed is a spore agents read (the talk
-# queue), the exposure every ``spore_seed`` is T2 for, so it is signed too: a
-# ``?`` prefix must not be a way around spore_seed's floor. A sort is the room composer's own write (a desk drop
+# them as a desk drop from surface ``cli``), so it is signed. A talk seed is an intention agents read (the talk
+# queue), the exposure every ``intention_seed`` is T2 for, so it is signed too: a
+# ``?`` prefix must not be a way around intention_seed's floor. A sort is the room composer's own write (a desk drop
 # from the cockpit surface, "your words, kept verbatim, never authority"), C1 as that is. "Signed" is T2's gesture in a
-# governed install; a REPORTED install fires a token's T2 as reported (``gesture_for``), as it does every spore_seed,
-# which is that install class's declared trade. A standing raise of spore_seed governs a drop and a talk too
+# governed install; a REPORTED install fires a token's T2 as reported (``gesture_for``), as it does every intention_seed,
+# which is that install class's declared trade. A standing raise of intention_seed governs a drop and a talk too
 # (``verbs._intake_policy_also``). Pinned by the tests
 INTAKE_TIERS = {"drop": "T2", "talk": "T2", "sort": "C1"}
 
@@ -760,7 +760,7 @@ def intake_kind_of(line: Any) -> str | None:
 
 
 def intake_seed_params(parsed: Mapping[str, Any]) -> dict[str, Any]:
-    """The ``spore_seed`` params a parsed ``drop`` or ``talk`` plants. A drop is an agenda for the desk at the
+    """The ``intention_seed`` params a parsed ``drop`` or ``talk`` plants. A drop is an agenda for the desk at the
     resolved minute, stored whole (``YYYY-MM-DDTHH:MM``, never cut to a date); a talk is a seed with ``attention:
     talk`` and no target. The words are the operator's, verbatim (``_ce_seed`` strips the ends only)."""
     kind = parsed.get("kind")
@@ -768,8 +768,8 @@ def intake_seed_params(parsed: Mapping[str, Any]) -> dict[str, Any]:
         return {"type": "task", "text": parsed["text"], "disposition": "agenda", "target": "desk",
                 "next": parsed["when"]}
     if kind == "talk":
-        return {"type": "thought", "text": parsed["text"], "disposition": "seed", "attention": "talk"}
-    raise ValueError(f"a {kind!r} intake plants no spore")
+        return {"type": "thought", "text": parsed["text"], "disposition": "someday", "attention": "talk"}
+    raise ValueError(f"a {kind!r} intake plants no intention")
 
 
 def _ce_update(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
@@ -778,11 +778,11 @@ def _ce_update(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, orig
     allowed = ("text", "domain", "type", "tier", "next")
     stray = sorted(set(params) - set(allowed))
     if stray or not params:
-        raise ValueError(f"spore_update changes one or more of {list(allowed)} (got {sorted(params)})")
+        raise ValueError(f"intention_update changes one or more of {list(allowed)} (got {sorted(params)})")
     if "type" in params:
-        from levain.spores import is_tray
+        from levain.intentions import is_tray
 
-        # the reclassify gate writes._apply_spore_update holds on the legacy path: type is plastic
+        # the reclassify gate writes._apply_intention_update holds on the legacy path: type is plastic
         # only while an item is forming in the Tray
         if not is_tray(pre):
             raise ValueError("type is only reclassifiable while an item is forming in the Tray")
@@ -794,18 +794,18 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
     """The List's "who does it": set an agenda's germinate ``target``. A seed given a target becomes an agenda in the same
     write, which needs a date (``surface_at``, or the one the row already holds). Only a value flow's germinate also accepts
     is written (the two halves read one store)."""
-    from levain.spores import check_steering, valid_next, valid_retarget
+    from levain.intentions import check_steering, valid_next, valid_retarget
 
     pre = _require_open(pre)
     stray = sorted(set(params) - {"target", "surface_at"})
     if stray or "target" not in params:
-        raise ValueError(f"spore_retarget sets target, and may carry surface_at (got {sorted(params)})")
+        raise ValueError(f"intention_retarget sets target, and may carry surface_at (got {sorted(params)})")
     target = params["target"]
     if not valid_retarget(target):
         raise ValueError(f"target must be band, nudge, desk or board:<repo> (got {target!r})")
     disposition = str(pre.get("disposition") or "").strip().casefold()
-    if disposition not in ("seed", "agenda"):
-        raise ValueError("a target steers a seed or an agenda; this spore is neither")
+    if disposition not in ("someday", "seed", "agenda"):
+        raise ValueError("a target steers a seed or an agenda; this intention is neither")
     stamp = pre.get("germinated")
     if stamp:
         # germinate never reads a stamped agenda's target again: a new one would change the record and nothing else
@@ -820,7 +820,7 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
     elif not valid_next(pre.get("next")):
         raise ValueError("an agenda needs a date: give surface_at with the target")
     attention = pre.get("attention")
-    if disposition == "seed" and attention == "talk":
+    if disposition in ("someday", "seed") and attention == "talk":
         # talk is a seed's steering (the talk queue reads seeds only): the seed that becomes an agenda leaves it behind
         changes["attention"] = None
         attention = None
@@ -854,13 +854,13 @@ def _ce_resolve(direction: str) -> Callable[..., Effect]:
     def build(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
               version_of: Callable[..., str]) -> Effect:
         from anneal_memory.spores import ASCEND_BY_TYPE, DESCEND_BY_TYPE
-        from levain.spores import is_note
+        from levain.intentions import is_note
 
         pre = _require_open(pre)
-        kind = params.get("spore_kind")
+        kind = params.get("intention_kind")
         valid = (ASCEND_BY_TYPE if direction == "ascend" else DESCEND_BY_TYPE).get(str(pre.get("type")), frozenset())
         if kind not in valid:
-            raise ValueError(f"{direction} kind {kind!r} is invalid for a {pre.get('type')!r} spore")
+            raise ValueError(f"{direction} kind {kind!r} is invalid for a {pre.get('type')!r} intention")
         resolution: dict[str, Any] = {"direction": direction, "kind": kind}
         if direction == "ascend":
             if is_note(pre):
@@ -881,7 +881,7 @@ def _ce_undo_edit(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, o
     """``params["restore"]``: the field values the reversed edit replaced. Known edge: an undo that
     restores a RETIRED disposition (a legacy handoff/note the edit had re-dispositioned) is refused,
     since the current row no longer holds it, so it is a CHANGE into a retired value. No UI builds
-    ``spore_undo_edit`` for a disposition."""
+    ``intention_undo_edit`` for a disposition."""
     pre = _require_open(pre)
     restore = params.get("restore")
     if not isinstance(restore, Mapping) or not restore:
@@ -892,35 +892,35 @@ def _ce_undo_edit(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, o
 def _ce_undo_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
                   version_of: Callable[..., str]) -> Effect:
     if pre is None:
-        raise ValueError("the spore does not exist")
+        raise ValueError("the intention does not exist")
     if not isinstance(pre.get("origin_key"), str) or not pre.get("origin_key"):
-        raise ValueError("the spore carries no origin_key, so no effect can address it")
-    return Effect(spore_resource_key(str(pre["origin_key"])), SPORES,
+        raise ValueError("the intention carries no origin_key, so no effect can address it")
+    return Effect(intention_resource_key(str(pre["origin_key"])), INTENTIONS,
                   {"version": version_of(copy.deepcopy(dict(pre)))}, {"deleted": True}, None, (), ())
 
 
-SPORE_CANONICAL: dict[str, Callable[..., Effect]] = {
-    "spore_seed": _ce_seed,
-    "spore_update": _ce_update,
-    "spore_set_disposition": _ce_set_disposition,
-    "spore_surface_at": _ce_surface_at,
-    "spore_retarget": _ce_retarget,
-    "spore_descend": _ce_resolve("descend"),
-    "spore_ascend": _ce_resolve("ascend"),
-    "spore_undo_edit": _ce_undo_edit,
-    "spore_undo_seed": _ce_undo_seed,
+INTENTION_CANONICAL: dict[str, Callable[..., Effect]] = {
+    "intention_seed": _ce_seed,
+    "intention_update": _ce_update,
+    "intention_set_disposition": _ce_set_disposition,
+    "intention_surface_at": _ce_surface_at,
+    "intention_retarget": _ce_retarget,
+    "intention_close": _ce_resolve("descend"),
+    "intention_promote": _ce_resolve("ascend"),
+    "intention_undo_edit": _ce_undo_edit,
+    "intention_undo_seed": _ce_undo_seed,
 }
 
 
 def canonical_effect(verb: str, params: Mapping[str, Any], pre_state: Mapping[str, Any] | None, *,
                      origin_key: str | None = None,
                      version_of: Callable[[Mapping[str, Any]], str] | None = None) -> Effect:
-    """The effect a spore verb's params make of ``pre_state`` (the snapshot row, None for a create),
+    """The effect an intention verb's params make of ``pre_state`` (the snapshot row, None for a create),
     every stored value computed by anneal's exported normaliser. ``origin_key`` names a create.
     ``ValueError`` for params the verb refuses; the broker records it as REFUSED."""
-    if verb not in SPORE_CANONICAL:
+    if verb not in INTENTION_CANONICAL:
         raise ValueError(f"no canonical_effect for {verb!r}")
     if version_of is None:
-        from levain.cockpit.providers import spore_row_version
-        version_of = spore_row_version
-    return SPORE_CANONICAL[verb](dict(params), pre_state, origin_key=origin_key, version_of=version_of)
+        from levain.cockpit.providers import intention_row_version
+        version_of = intention_row_version
+    return INTENTION_CANONICAL[verb](dict(params), pre_state, origin_key=origin_key, version_of=version_of)

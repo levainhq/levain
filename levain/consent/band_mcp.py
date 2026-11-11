@@ -53,7 +53,7 @@ TOOL: dict[str, Any] = {
             "on": {"type": "string",
                    "description": "YYYY-MM-DD (after today) or YYYY-MM-DDTHH:MM (after now, local time; a time later "
                                   "today works). Use when you are NOT stopped yet because the date has not "
-                                  "come: no question is filed, ONE agenda spore is written and it reaches the "
+                                  "come: no question is filed, ONE agenda intention is written and it reaches the "
                                   "operator on that date (give what and blocks only; no options, rec or open). A "
                                   "bare date of today or earlier, or a time already past, is refused."},
             "path": {"type": "string",
@@ -145,7 +145,7 @@ def _meta_session(params: dict[str, Any]) -> str | None:
 
 
 def _ask_on(raw: dict[str, Any]) -> dict[str, Any]:
-    """``ask`` with ``on`` (TS-11): one agenda spore, no question (:func:`band.file_agenda`)."""
+    """``ask`` with ``on`` (TS-11): one agenda intention, no question (:func:`band.file_agenda`)."""
     on, attention, path = raw["on"], raw.get("attention"), raw.get("path")
     # `0 == False`, so "not given" is decided by identity: absent, None, false, [] and ""
     extra = [k for k in ("options", "rec", "open")

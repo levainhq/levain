@@ -421,7 +421,7 @@
   .ext-meta { color: var(--faint); flex: 0 1 auto; min-width: 0; max-width: 100%; overflow-wrap: anywhere; font: var(--fw-semibold) var(--fs-micro)/1.6 var(--round);
     letter-spacing: 0; }
 
-  /* episode keyword-search (spore-107): the inline read-only search box on the
+  /* episode keyword-search (intention-107): the inline read-only search box on the
      episodes panel. Glass aesthetic — a thin mono field that lights to --mind (the
      cognition hue) on focus, matching .name-input's focus language. */
   /* the search bar pins to the top of the (now-scrolling) episodes body so you can
@@ -434,7 +434,7 @@
        must not look tucked UNDER the search box (the operator's visual gate, twice). No shadow (D7). */
     border-bottom: 1px solid var(--line-hot); }
   /* ONE filter look (spec D4): 28px, 8px radius, 12px sans. .xfilter (KE panels) wraps its input,
-     .ep-search-input (episodes / spore filters) is the bare input; both draw this box. */
+     .ep-search-input (episodes / intention filters) is the bare input; both draw this box. */
   .ep-search-input { flex: 1 1 150px; min-width: 0; height: var(--ctl-md); box-sizing: border-box;
     background: var(--bg); color: var(--ink); border: 1px solid var(--hair-2); border-radius: var(--r-md);
     padding: 0 var(--sp-4); font: var(--fw-regular) var(--fs-meta)/1.4 var(--sans); -webkit-appearance: none; appearance: none; }
@@ -449,7 +449,7 @@
   .pbody.clamped .ep-results, .pbody.clamped .sp-results { margin-top: var(--sp-4); }
 
   .note { color: var(--dim); font-size: var(--fs-micro); margin-top: var(--sp-3); letter-spacing: 0; }
-  /* projection-history size delta (spore-093 v0): the projection regenerating */
+  /* projection-history size delta (intention-093 v0): the projection regenerating */
   .delta { flex: 0 0 auto; font: var(--fw-bold) var(--fs-meta)/var(--lh-list) var(--sans); letter-spacing: 0; color: var(--faint); }
   .delta.up { color: var(--text); }
   .delta.down { color: var(--label); }
@@ -611,7 +611,7 @@
   /* THE MASTHEAD lives OUTSIDE any .panel[data-zone] — where `--accent` gets defined per zone
      for the shared .edit-save/.edit-cancel gradient + border + shadow. Unset here, those
      `var(--accent)` refs are INVALID → the save button renders transparent + near-black on the
-     dark masthead = INVISIBLE (spore-280, the twin of the .state-editor catch below). Define it
+     dark masthead = INVISIBLE (intention-280, the twin of the .state-editor catch below). Define it
      to the entity-name's own cognition-green so the shared buttons resolve AND read on-theme. */
   .name-editor { display: inline-flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
   .name-input {
@@ -669,7 +669,7 @@
   .undo-btn:hover { color: var(--text); background: var(--card-2); }
   .undo-btn:disabled { opacity: .4; cursor: default; }
 
-  /* Class-B verb affordances (Slice 2b-ii) — spores/episodes are Operate-zone
+  /* Class-B verb affordances (Slice 2b-ii) — intentions/episodes are Operate-zone
      INPUTS the operator resolves through anneal's validated verbs. Metal controls,
      Operate accent; the destructive ones open a confirm form (kind select + optional
      ref), and `confirm tombstone` reads hot (.danger). Aligned to the row's right. */
@@ -2092,7 +2092,7 @@ body.ke .row.k7-res { position: relative; padding-left: var(--sp-5); }
 body.ke .row.k7-res > .k7-rdot { grid-row: 2 !important; grid-column: 1 !important; justify-self: start; align-self: start; margin: .55em 0 0 calc(-1 * var(--sp-5)); position: relative; z-index: 1; width: 8px; height: 8px; border-radius: 50%; background: var(--meta); }
 body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
 body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
-/* Open loops on Build: an accent bar, the title, then the spore id, how long it has been open and its repo */
+/* Open loops on Build: an accent bar, the title, then the intention id, how long it has been open and its repo */
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--heat, var(--accent)); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
 body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause { order: -1; flex: 1 1 calc(100% - var(--sp-8)); min-width: 0; }
 /* the fold chevron rides the title line's right edge (as on the Board), never the meta row beneath it */
@@ -2425,7 +2425,7 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-task-t[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (pointer: coarse) { .tv-chip.tv-open { min-height: var(--hit-min); } }
 /* a loop row the Work lens jumps to stops under the sticky strip, never behind it */
-body.ke .panel[data-ck-panel="loops"] .row[data-spore] { scroll-margin-top: calc(var(--hit-min) + var(--sp-4)); }
+body.ke .panel[data-ck-panel="loops"] .row[data-intention] { scroll-margin-top: calc(var(--hit-min) + var(--sp-4)); }
 .tv-task-h { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
 .tv-task-t { flex: 0 1 auto; min-width: 0; font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tv-loose-h { font: var(--fw-semibold) var(--fs-micro)/1.4 var(--sans); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
@@ -2621,7 +2621,7 @@ body.ke .panel[data-ck-panel="loops"] .row[data-spore] { scroll-margin-top: calc
 .tv-more:hover { background: var(--card-2); color: var(--text); }
 
 /* ═══════════════════════════ BOARD WORK LISTS TO THE MOCK (K10 S4) ═══════════════════════════
-   Open loops: a left stripe per heat (hot orange, warm violet, parked grey), the spore id, "open N d" and the repo, on Board as on Build.
+   Open loops: a left stripe per heat (hot orange, warm violet, parked grey), the intention id, "open N d" and the repo, on Board as on Build.
    Tray: what is late reads first, with a red stripe and "overdue N d" in red; the row's verbs are always shown, never hover-only. */
 body.ke [data-ck-panel="loops"] .row[data-heat] { --heat: var(--meta); }
 body.ke [data-ck-panel="loops"] .row[data-heat="hot"] { --heat: var(--accent); }
@@ -2657,7 +2657,7 @@ body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-
 body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col > .row { break-inside: avoid; }
 @media (max-width: 900px) { body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results { display: block; }
   body.ke[data-mode="morning"] [data-ck-panel="tray"] .sp-results:not(:has(> .grp-col ~ .grp-col)) > .grp-col { columns: auto; } }
-body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="spore_descend"] { order: -1; }
+body.ke [data-ck-panel="tray"] .row .verb-actions > .verb-btn[data-verb="intention_close"] { order: -1; }
 
 /* ═══════════════════════════ NARROW VIEW (1023+13): the cockpit at half a laptop screen ═══════════════════════════ */
 /* A rename editor open in the masthead takes its own line below the tabs, never a slot beside the brand (the unit is display: contents

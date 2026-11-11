@@ -20,7 +20,7 @@ def _sp(i, text, *, disposition="agenda", nxt="", tier="warm", domain="", seen="
 
 
 def _begin(tray=(), loops=(), **view_kw):
-    view = SimpleNamespace(tray=list(tray), open_spores=list(loops), errors=view_kw.pop("errors", {}), **view_kw)
+    view = SimpleNamespace(tray=list(tray), open_intentions=list(loops), errors=view_kw.pop("errors", {}), **view_kw)
     ctx = SimpleNamespace(today=TODAY, memo=lambda k, f: view)
     return _where_to_begin(SimpleNamespace(build=lambda **kw: view))(ctx).value
 
@@ -30,7 +30,7 @@ def _wrap(at="2026-10-20T16:31:00+00:00"):
 
 
 def test_where_to_begin_names_its_sources_and_hands_the_open_loops_to_the_card():
-    loops = [_sp("spore-1", "cold thing", tier="cold", domain="alpha"), _sp("spore-2", "hot thing", tier="hot", domain="beta")]
+    loops = [_sp("intention-1", "cold thing", tier="cold", domain="alpha"), _sp("intention-2", "hot thing", tier="hot", domain="beta")]
     got = _begin(loops=loops)
     assert got["title"] == "Where to begin" and got["source"] == "from the List and Open loops"
     assert [t["text"] for t in got["threads"]] == ["hot thing", "cold thing"]          # hottest first, none dropped
@@ -53,10 +53,10 @@ def test_where_to_begin_draws_the_overnight_line_only_when_the_install_knows_it(
 
 
 def test_where_to_begin_does_not_offer_a_parked_loop():
-    # TS-5a L3: parked loops now ride view.open_spores; a dormant loop is not a place to begin
-    got = _begin(loops=[_sp("spore-p", "dormant", tier="parked")])
+    # TS-5a L3: parked loops now ride view.open_intentions; a dormant loop is not a place to begin
+    got = _begin(loops=[_sp("intention-p", "dormant", tier="parked")])
     assert got["headline"] == "Nothing set for today yet" and "threads" not in got
-    mixed = _begin(loops=[_sp("spore-h", "hot", tier="hot"), _sp("spore-p", "dormant", tier="parked")])
+    mixed = _begin(loops=[_sp("intention-h", "hot", tier="hot"), _sp("intention-p", "dormant", tier="parked")])
     assert [t["text"] for t in mixed["threads"]] == ["hot"]
 
 

@@ -107,7 +107,7 @@ def store_path() -> Path:
 # Reported by Alex De Groodt 2026-08-04. He moved Levain into a global tool and
 # wired the hooks at the user level so his entity would be present in the projects
 # he actually works in. in_install_session() gates on cwd containment alone, so
-# the entire activation layer — posture, recency directives, spore surfacing,
+# the entire activation layer — posture, recency directives, intention surfacing,
 # crystal recall, the wrap nudge — went dark in every one of those sessions, while
 # `levain doctor` reported healthy. He was carrying a local patch to this file,
 # which `levain init --force` replaced on each upgrade — that command rewrites the
@@ -223,7 +223,7 @@ def read_blocks(path: Path) -> list[str]:
 
 
 # Install-time-resolved anneal-memory binary path: the script of the anneal
-# package levain's own interpreter imports (spore-751). `levain init`
+# package levain's own interpreter imports (intention-751). `levain init`
 # substitutes this placeholder after copying the hook scripts into the
 # operator's install dir, so the hooks don't depend on PATH at fire time
 # (Claude Code + Codex both sanitize hook env aggressively). The `"{{" in ...`
@@ -245,7 +245,7 @@ def _anneal_json(
     first, then the module form on this interpreter (`-P`, so the working
     directory cannot shadow the package). It never tries a bare `anneal-memory`
     from PATH: that is how a second anneal used to answer these queries while a
-    different one served memory (spore-751).
+    different one served memory (intention-751).
 
     No-stall (the load-bearing invariant): a ``TimeoutExpired`` ABORTS the
     candidate loop and returns None. A timeout means this anneal invocation is
@@ -1079,43 +1079,43 @@ def pack_drift() -> str | None:
     )
 
 
-# ---- Prospective layer (spores) — the germination surfaces ----
+# ---- Prospective layer (intentions) — the germination surfaces ----
 
 # Operator-I/O dispositions (control-plane Slice 3): the Tray inbox (seed/handoff/agenda)
-# + Keep durable reference (note). A spore carrying one is operator I/O, NOT one of the
+# + Keep durable reference (note). An intention carrying one is operator I/O, NOT one of the
 # entity's own prospective loops — so it stays OUT of the activation surfaces that feed the
 # entity's cognition (the session-start dormant-surface + the per-prompt collision), exactly
 # as the embedder's own layer-2 keeps operator I/O out of salience / digest / Top of Mind.
 #
-# DRIFT CONTRACT (load-bearing): this tuple MUST equal levain.spores.NON_COGNITION_DISPOSITIONS
-# (and the embedder's scripts/spores.py) — anneal stays disposition-blind, so every interpreter of the
+# DRIFT CONTRACT (load-bearing): this tuple MUST equal levain.intentions.NON_COGNITION_DISPOSITIONS
+# (and the embedder's scripts/intentions.py) — anneal stays disposition-blind, so every interpreter of the
 # taxonomy carries the vocab. This hook is a STANDALONE template (stdlib only, no levain import
 # on a stranger install), so it carries its own copy; keep it byte-identical. (levain's test
-# suite asserts this copy == levain.spores.)
+# suite asserts this copy == levain.intentions.)
 # "handoff" and "note" are RETIRED (TS-1: no new ones are written) but legacy rows carry them, so they STAY here:
 # is_loop fails open on an unknown value, and dropping them would flood the collision surface.
-_NON_COGNITION_DISPOSITIONS = ("seed", "handoff", "agenda", "note")
+_NON_COGNITION_DISPOSITIONS = ("someday", "seed", "handoff", "agenda", "note")
 
 
-def _is_loop(spore: dict) -> bool:
-    """True iff the spore flows into the entity's OWN cognition (the complement of operator
+def _is_loop(intention: dict) -> bool:
+    """True iff the intention flows into the entity's OWN cognition (the complement of operator
     I/O — the Tray inbox + Keep notes). Fail-OPEN on the unknown: only an EXPLICITLY-known
     operator-I/O disposition is excluded — a typo'd/unknown value reads as a visible loop,
     never silently dropped (the silent-loss direction the whole slice guards). Mirrors
-    levain.spores.is_loop / the embedder's scripts/spores.is_loop."""
-    return (spore.get("disposition") or "loop") not in _NON_COGNITION_DISPOSITIONS
+    levain.intentions.is_loop / the embedder's scripts/intentions.is_loop."""
+    return (intention.get("disposition") or "loop") not in _NON_COGNITION_DISPOSITIONS
 
 
-def open_spores(timeout: float = 2.0) -> list[dict]:
-    """The entity's own open prospective loops, via anneal-memory's `spore list --json`.
+def open_intentions(timeout: float = 2.0) -> list[dict]:
+    """The entity's own open prospective loops, via anneal-memory's `intention list --json`.
     Tray dispositions (the operator inbox) are filtered OUT here — the SINGLE chokepoint
     both germination surfaces (dormant-surface + collision) read, so the Tray can't leak
     into a Levain install's cognition (the stranger-side twin of the embedder's layer-2).
-    Returns [] on any failure (an anneal too old to have spores, no store yet, an error)
+    Returns [] on any failure (an anneal too old to have intentions, no store yet, an error)
     — the prospective surfaces then show nothing. Tight default timeout: the collision
     surface runs before every prompt."""
     data = _anneal_json(
-        ["spore", "list", "--json"], timeout, validator=lambda d: isinstance(d, list)
+        ["intention", "list", "--json"], timeout, validator=lambda d: isinstance(d, list)
     )
     if isinstance(data, list):
         return [s for s in data if isinstance(s, dict) and _is_loop(s)]
@@ -1124,13 +1124,13 @@ def open_spores(timeout: float = 2.0) -> list[dict]:
 _WHEN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?")
 
 
-def due_agendas(spores: list, now: datetime | None = None) -> list[dict]:
-    """Open AGENDA spores that have come due and are not yet germinated (TS-3): a date-only `next` on or before
+def due_agendas(intentions: list, now: datetime | None = None) -> list[dict]:
+    """Open AGENDA intentions that have come due and are not yet germinated (TS-3): a date-only `next` on or before
     today, a timed `next` (YYYY-MM-DDTHH:MM, local) from that minute; no `next`, a malformed one or a stamped
     `germinated` is never due. Mirrors levain.germinate.is_due (this file is stranger-side and imports nothing of it)."""
     now = now or datetime.now()
     due = []
-    for s in spores:
+    for s in intentions:
         if not isinstance(s, dict) or str(s.get("disposition") or "").strip().casefold() != "agenda":
             continue
         if s.get("germinated"):
@@ -1149,13 +1149,13 @@ def due_agendas(spores: list, now: datetime | None = None) -> list[dict]:
 
 
 def open_agendas(timeout: float = 2.0) -> list[dict]:
-    """Every open spore as anneal lists it, unfiltered (open_spores drops the agenda disposition by design)."""
-    data = _anneal_json(["spore", "list", "--json"], timeout, validator=lambda d: isinstance(d, list))
+    """Every open intention as anneal lists it, unfiltered (open_intentions drops the agenda disposition by design)."""
+    data = _anneal_json(["intention", "list", "--json"], timeout, validator=lambda d: isinstance(d, list))
     return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
 
 
 def start_germinate(agent: str = "claude_code") -> str:
-    """Spawn `levain spores germinate` detached for THIS install. Returns "started" (the child was alive after a short
+    """Spawn `levain intentions germinate` detached for THIS install. Returns "started" (the child was alive after a short
     grace, or exited 0), "busy" (another start spawned one within the last minute: germinate is idempotent by origin_key,
     this only spares a pile of redundant children) or "failed" (Popen raised, or the child died non-zero at once, e.g.
     no `levain` for this interpreter). Known edges, closed: the child's own later failure is the doctor row's to report;
@@ -1177,7 +1177,7 @@ def start_germinate(agent: str = "claude_code") -> str:
     except OSError:
         pass
     argv = [sys.executable] + (["-P"] if sys.version_info >= (3, 11) else []) + [
-        "-m", "levain", "spores", "germinate", "--path", str(root), "--agent", agent]
+        "-m", "levain", "intentions", "germinate", "--path", str(root), "--agent", agent]
     try:
         proc = subprocess.Popen(argv, cwd=str(root), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
@@ -1208,7 +1208,7 @@ def start_germinate(agent: str = "claude_code") -> str:
 # Tokens of 3+ word-chars; common words that would create false collisions are
 # dropped so a >=2-token overlap means genuine content kinship, not "the"/"and".
 # The set includes generic *work* words (code/test/file/review/…) because two
-# such shared tokens between a prompt and an unrelated spore would be noise, not
+# such shared tokens between a prompt and an unrelated intention would be noise, not
 # kinship (codex L3 LOW — precision).
 _WORD_RE = re.compile(r"[A-Za-z0-9_]{3,}")
 _STOPWORDS = frozenset({
@@ -1225,7 +1225,7 @@ _STOPWORDS = frozenset({
 
 
 # Cap on the characters fed to the regex/set-build, so a pasted huge prompt or
-# a pathological spore text can't burn CPU before the result cap applies
+# a pathological intention text can't burn CPU before the result cap applies
 # (codex L3 MEDIUM). Collision matches on the gist; the first few KB suffice.
 _MAX_TOKENIZE_CHARS = 4000
 
@@ -1234,10 +1234,10 @@ def _tokens(text: str) -> set[str]:
     return {t.lower() for t in _WORD_RE.findall(text[:_MAX_TOKENIZE_CHARS])} - _STOPWORDS
 
 
-def spores_colliding(
-    prompt: str, spores: list[dict], min_overlap: int = 2, limit: int = 3
+def intentions_colliding(
+    prompt: str, intentions: list[dict], min_overlap: int = 2, limit: int = 3
 ) -> list[dict]:
-    """Open spores whose text collides with `prompt` by >= `min_overlap`
+    """Open intentions whose text collides with `prompt` by >= `min_overlap`
     distinct, non-trivial shared tokens — the EVENT-based germination surface
     (an open loop surfaces when the current work touches it). Precision-biased:
     a 2-token floor and a small result cap keep this "better nothing than
@@ -1247,7 +1247,7 @@ def spores_colliding(
     if not p:
         return []
     scored: list[tuple[int, dict]] = []
-    for s in spores:
+    for s in intentions:
         text = s.get("text")
         if not isinstance(text, str):
             continue
@@ -1258,18 +1258,18 @@ def spores_colliding(
     return [s for _, s in scored[:limit]]
 
 
-def due_dormant_spores(spores: list[dict], limit: int = 5) -> list[dict]:
-    """Open spores that have gone DORMANT — quiet too long, or their `next`
+def due_dormant_intentions(intentions: list[dict], limit: int = 5) -> list[dict]:
+    """Open intentions that have gone DORMANT — quiet too long, or their `next`
     surface-date has arrived (anneal computes the `germination` tier). This is
     the TIME-based germination surface, shown once at session start. Growing,
-    resting, and parked spores stay out of the way. Capped at `limit`."""
-    due = [s for s in spores if s.get("germination") == "dormant"]
+    resting, and parked intentions stay out of the way. Capped at `limit`."""
+    due = [s for s in intentions if s.get("germination") == "dormant"]
     return due[:limit]
 
 
-def _format_spore_lines(spores: list[dict], *, with_next: bool) -> list[str]:
+def _format_intention_lines(intentions: list[dict], *, with_next: bool) -> list[str]:
     lines: list[str] = []
-    for s in spores:
+    for s in intentions:
         stype = s.get("type", "?")
         text = s.get("text", "")
         sid = s.get("id", "?")
@@ -1280,24 +1280,24 @@ def _format_spore_lines(spores: list[dict], *, with_next: bool) -> list[str]:
     return lines
 
 
-def format_spore_collisions(spores: list[dict]) -> str:
+def format_intention_collisions(intentions: list[dict]) -> str:
     """The recency-position injection for the event-based surface."""
     return "\n".join([
         "[open loops — relevant to what you're doing]",
-        *_format_spore_lines(spores, with_next=False),
+        *_format_intention_lines(intentions, with_next=False),
         "These open loops touch the current work. Advance, resolve "
-        "(spore_descend / spore_ascend), or set aside as fits — don't let a "
+        "(intention_close / intention_promote), or set aside as fits — don't let a "
         "relevant one go unattended.",
     ])
 
 
-def format_due_spores(spores: list[dict]) -> str:
+def format_due_intentions(intentions: list[dict]) -> str:
     """The primacy-position injection for the time-based surface."""
     return "\n".join([
         "[open loops — due or gone quiet]",
-        *_format_spore_lines(spores, with_next=True),
+        *_format_intention_lines(intentions, with_next=True),
         "These have gone quiet or their time has come. For each: still alive "
-        "(spore_touch to keep it), or ready to compost (spore_descend)?",
+        "(intention_touch to keep it), or ready to compost (intention_close)?",
     ])
 
 
@@ -1319,7 +1319,7 @@ def crystal_recall(prompt: str, timeout: float = 2.0) -> list[dict]:
     capped to the same bound as the tokenizer so a pasted huge prompt can't burn
     time before anneal answers. Returns [] on an empty/absent crystal store, a
     too-old anneal lacking the subcommand, or any failure — the surface then
-    injects nothing (fail-silent, exactly like the spore surfaces). Tight default
+    injects nothing (fail-silent, exactly like the intention surfaces). Tight default
     timeout: this runs before every prompt."""
     if not prompt.strip():
         return []

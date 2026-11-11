@@ -1,9 +1,9 @@
-"""Tests for ``levain.spores`` — the disposition vocab + the Open-Loops/Tray/Keep
+"""Tests for ``levain.intentions`` — the disposition vocab + the Open-Loops/Tray/Keep
 bucketing partition (control-plane Slice 3)."""
 
 from __future__ import annotations
 
-from levain.spores import (
+from levain.intentions import (
     BUCKET_LOOP,
     BUCKET_TRAY,
     KEEP_DISPOSITIONS,
@@ -24,11 +24,11 @@ from levain.spores import (
 
 
 # --- the frozen-literal contract -------------------------------------------
-# ⚠ The drift guard (L2 Q4). This vocab is duplicated in flow's scripts/spores.py BY
+# ⚠ The drift guard (L2 Q4). This vocab is duplicated in flow's scripts/intentions.py BY
 # DESIGN (anneal is deliberately disposition-blind — the de-risk). The two copies MUST
 # agree, but they live in separate installs with no shared import, so a self-pin here can
 # only catch an ACCIDENTAL unilateral edit WITHIN Levain (reddens this repo's CI). The
-# TRUE cross-repo equality check (levain.spores == flow's scripts/spores) lives flow-side,
+# TRUE cross-repo equality check (levain.intentions == flow's scripts/intentions) lives flow-side,
 # where both modules are importable in one venv — scripts/test_tray_disposition.py. Pin
 # the literals here so any change to this tuple is a deliberate, CI-visible act that
 # prompts "did I update flow too?".
@@ -65,7 +65,7 @@ def test_disposition_of_defaults_and_falsy_read_as_loop():
 
 
 def test_is_loop_excludes_all_operator_io_dispositions():
-    assert is_loop({})  # absent → loop (every pre-Slice-3 spore)
+    assert is_loop({})  # absent → loop (every pre-Slice-3 intention)
     assert is_loop({"disposition": "loop"})
     # both Tray inbox AND Keep notes are operator I/O → excluded from cognition
     for d in NON_COGNITION_DISPOSITIONS:
@@ -105,7 +105,7 @@ def test_bucket_of_is_a_total_partition():
     # ... and a parked loop stays an Open loop (the row carries the parked marker)
     assert bucket_of({"tier": "parked"}) == BUCKET_LOOP
     assert bucket_of({"disposition": "loop", "tier": "parked"}) == BUCKET_LOOP
-    import levain.spores as sp
+    import levain.intentions as sp
     assert not hasattr(sp, "BUCKET_KEEP")
 
 

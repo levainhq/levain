@@ -115,7 +115,7 @@ def _kinds(v: dict[str, Any], kind: str) -> list[dict[str, Any]]:
 def test_at_1130_the_session_is_there_its_consent_waits_and_no_open_loop_is_drawn(tmp_path, monkeypatch):
     ck, _root, _cdir, _work = _rig(tmp_path, monkeypatch)
     live = ck.panel("topology", credential_class="none")["value"]
-    assert _kinds(live, "spore") and not _kinds(live, "consent")      # control: live has the loop, no waiting consent
+    assert _kinds(live, "intention") and not _kinds(live, "consent")      # control: live has the loop, no waiting consent
     v = _at(ck, _m(90))
     assert v["as_of"] == _m(90).isoformat() and v["replay"] is True
     nodes = {n["id"]: n for n in v["nodes"]}
@@ -127,8 +127,8 @@ def test_at_1130_the_session_is_there_its_consent_waits_and_no_open_loop_is_draw
     assert len(question) == 1 and question[0]["workers"] == [_node("claude_code", "s-b")]
     assert _node("claude_code", "s-late") not in nodes                # started after T
     # the open loops cannot be rebuilt for T: named, never drawn as none
-    assert not _kinds(v, "spore") and "spores" in v["unreadable"]
-    assert any(e.startswith("spores: not kept for the past") for e in v["errors"])
+    assert not _kinds(v, "intention") and "intentions" in v["unreadable"]
+    assert any(e.startswith("intentions: not kept for the past") for e in v["errors"])
     # model and tokens are read from the transcript as it is now: null at T, and said
     assert all(n["model"] is None and n["tokens"] is None for n in v["nodes"]) and "context" in v["unreadable"]
 

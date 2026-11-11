@@ -270,7 +270,7 @@ def test_the_verb_is_not_offered_on_a_row_of_another_kind(tmp_path, lh):
     _file(QuestionStore(lh))
     with _serve(src, write_token=TOKEN) as (base, _h):
         status, body = _post(f"{base}/cockpit/verb", {"verb": "question_answer", "panel_id": "tray",
-                                                       "row_id": f"spore:{ids['seed']}", "row_version": "x",
+                                                       "row_id": f"intention:{ids['seed']}", "row_version": "x",
                                                        "params": {"option": "ship"}}, TOKEN)
         assert status == 404 and body["error"] == "not_offered"
 

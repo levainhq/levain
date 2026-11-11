@@ -857,7 +857,7 @@ class GitLedger:
         Join's frame (code L3 r4), applied whole: everything is validated and every local step that can fail runs
         BEFORE the clone's state is saved, which is the last local step and one save; nothing is ever rolled back and
         nothing resumes. A roll-back (r7-r9) and then a resume record (r10-r13) each drew new findings every round
-        (spore-813), so both are DELETED: a stop before the save names the exact cleanup; a stop after it is only the
+        (intention-813), so both are DELETED: a stop before the save names the exact cleanup; a stop after it is only the
         push, which `levain team sync` finishes."""
         from . import signing as S
         from . import tenure as T

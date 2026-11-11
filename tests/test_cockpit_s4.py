@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain.cockpit import (
     Absent,
@@ -38,7 +38,7 @@ def _clock() -> datetime:
 
 def _install(tmp_path: Path) -> tuple[Path, SubstrateSource, dict[str, str]]:
     root = _make_levain_install(tmp_path)
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     ids = {
         "mid": store.add(type="task", text="five days old", disposition="seed", today=date(2026, 10, 5))["id"],
         "old": store.add(type="task", text="nine days old", disposition="seed", today=date(2026, 10, 1))["id"],
@@ -93,14 +93,14 @@ class TestTrayAgeView:
     def test_head_declares_the_view_only_on_the_tray(self, rig) -> None:
         _src, _i, ck = rig
         heads = ck.manifest(CRED)["panels"]
-        assert heads["tray"]["views"] == [{"id": "age", "title": "By age", "order": "spore.age"}]
+        assert heads["tray"]["views"] == [{"id": "age", "title": "By age", "order": "intention.age"}]
         for pid in ("loops", "episodes", "edits"):
             assert heads[pid]["views"] is None
 
     def test_view_rows_oldest_first_undated_last(self, rig) -> None:
         _src, ids, ck = rig
         age = _tray(ck)["view_rows"]["age"]
-        sid = lambda k: f"spore:{ids[k]}"  # noqa: E731
+        sid = lambda k: f"intention:{ids[k]}"  # noqa: E731
         assert age[:3] == [sid("old"), sid("mid"), sid("new")]
         assert set(age[3:]) == {sid("undated"), sid("future"), sid("junk")}
         assert age[3:] == sorted(age[3:])
@@ -109,7 +109,7 @@ class TestTrayAgeView:
         _src, _i, ck = rig
         p = _tray(ck)
         ins = [RowIn(id=r["id"], title=r["title"], facets=r["facets"]) for r in p["rows"]]
-        resorted = [r.id for r, _g in apply_ordering("spore.tray", ins, TODAY)]
+        resorted = [r.id for r, _g in apply_ordering("intention.tray", ins, TODAY)]
         assert _ids(p) == resorted
         assert _ids(p) != p["view_rows"]["age"]
 
@@ -118,18 +118,18 @@ class TestTrayAgeView:
         p = _tray(ck)
         assert sorted(p["view_rows"]["age"]) == sorted(_ids(p))
         q = _tray(ck, q="days old")
-        assert sorted(_ids(q)) == sorted([f"spore:{ids['old']}", f"spore:{ids['mid']}"])
-        assert q["view_rows"]["age"] == [f"spore:{ids['old']}", f"spore:{ids['mid']}"]
+        assert sorted(_ids(q)) == sorted([f"intention:{ids['old']}", f"intention:{ids['mid']}"])
+        assert q["view_rows"]["age"] == [f"intention:{ids['old']}", f"intention:{ids['mid']}"]
 
     def test_age_facet_and_badge(self, rig) -> None:
         _src, ids, ck = rig
         rows = {r["id"]: r for r in _tray(ck)["rows"]}
-        old = rows[f"spore:{ids['old']}"]
+        old = rows[f"intention:{ids['old']}"]
         assert old["facets"]["age_days"] == 9
         assert {"kind": "age_days", "value": 9} in old["badges"]
-        assert rows[f"spore:{ids['new']}"]["facets"]["age_days"] == 0
+        assert rows[f"intention:{ids['new']}"]["facets"]["age_days"] == 0
         for k in ("undated", "future", "junk"):
-            r = rows[f"spore:{ids[k]}"]
+            r = rows[f"intention:{ids[k]}"]
             assert "age_days" not in r["facets"]
             assert all(b["kind"] != "age_days" for b in r["badges"])
 
@@ -144,19 +144,19 @@ def _simple(pid: str = "p", **kw: Any) -> ProviderSpec:
 
 class TestViewRegistration:
     def test_a_valid_view_registers(self) -> None:
-        Cockpit().register(_simple(views=(("age", "By age", "spore.age"),), order="spore.tray",
+        Cockpit().register(_simple(views=(("age", "By age", "intention.age"),), order="intention.tray",
                                    facets=frozenset({"age_days"})))
 
     @pytest.mark.parametrize("views", [
-        (("Bad Id", "t", "spore.age"),),
-        (("", "t", "spore.age"),),
-        (("default", "t", "spore.age"),),
-        (("age\n", "t", "spore.age"),),
-        (("a", "t", "spore.age"), ("a", "u", "spore.age")),
+        (("Bad Id", "t", "intention.age"),),
+        (("", "t", "intention.age"),),
+        (("default", "t", "intention.age"),),
+        (("age\n", "t", "intention.age"),),
+        (("a", "t", "intention.age"), ("a", "u", "intention.age")),
         (("a", "t", "no.such.ordering"),),
-        (("a", "t", "spore.tray"),),
+        (("a", "t", "intention.tray"),),
         (("a", "t"),),
-        (("a", 1, "spore.age"),),
+        (("a", 1, "intention.age"),),
     ])
     def test_refused(self, views: Any) -> None:
         with pytest.raises(CockpitRegistrationError):
@@ -165,7 +165,7 @@ class TestViewRegistration:
     def test_only_a_triage_list_has_views(self) -> None:
         with pytest.raises(CockpitRegistrationError):
             Cockpit().register(ProviderSpec(
-                "g", "gauge", "g", "feed", lambda ctx: Read(value={}), views=(("a", "t", "spore.age"),)))
+                "g", "gauge", "g", "feed", lambda ctx: Read(value={}), views=(("a", "t", "intention.age"),)))
 
 
 def _ep(rid: str, at: str, *, agent: str | None = None, content: str = "c", **over: Any) -> RowIn:

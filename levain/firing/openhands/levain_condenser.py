@@ -117,7 +117,7 @@ class LevainCondenser(VagusCondenser):
 
         Signature keeps ``firing``/``firing_kind`` positional to match ``VagusCondenser.build`` (LSP);
         ``presence``/``presence_kind`` are trailing optionals a subclass may add. ``entity_dir`` is the
-        inherited per-conversation entity (spore-438); it feeds the presence rebuild too."""
+        inherited per-conversation entity (intention-438); it feeds the presence rebuild too."""
         obj = cls(
             inner=inner, firing_kind=firing_kind, presence_kind=presence_kind, entity_dir=entity_dir,
             identity=identity,

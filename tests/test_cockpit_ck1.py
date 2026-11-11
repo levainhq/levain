@@ -182,7 +182,7 @@ def test_form_contract() -> None:
 
 # --- log ---------------------------------------------------------------------------------------
 
-LOG = {"rows": [{"verb": "snooze", "target": "spore-1238", "actor": "phill", "at": NOW},
+LOG = {"rows": [{"verb": "snooze", "target": "intention-1238", "actor": "phill", "at": NOW},
                 {"verb": "mystery", "target": "x", "actor": "a", "at": NOW}]}
 
 
@@ -209,7 +209,7 @@ def test_log_sentence_uses_the_manifest_verb_label() -> None:
 
     ck._verb_view = V()    # type: ignore[assignment]
     rows = ck.panel("p")["value"]["rows"]
-    assert rows[0]["sentence"] == "Snoozed · spore-1238" and rows[1]["sentence"] == "mystery · x"
+    assert rows[0]["sentence"] == "Snoozed · intention-1238" and rows[1]["sentence"] == "mystery · x"
 
 
 # --- list / count-queue (the RowIn engine) -----------------------------------------------------
@@ -324,7 +324,7 @@ def test_roster_and_log_rows_are_searched_by_their_own_fields() -> None:
     assert [r["name"] for r in ck.panel("p", q="ops")["value"]["rows"]] == ["argus"]
     ck = _value_panel("log", LOG)
     p = ck.panel("p", q="1238")
-    assert [r["target"] for r in p["value"]["rows"]] == ["spore-1238"] and p["matched"] == 1
+    assert [r["target"] for r in p["value"]["rows"]] == ["intention-1238"] and p["matched"] == 1
 
 
 def test_store_scope_calls_the_hook_with_the_bounded_limit_and_labels_the_count() -> None:
@@ -353,11 +353,11 @@ def test_a_hook_that_fails_or_returns_junk_is_a_search_error_not_an_empty_answer
 
 def test_store_scope_for_roster_and_log_validates_hook_rows_with_the_kind_contract() -> None:
     ck = _value_panel("log", LOG, window=2, search_scope="store",
-                      search=lambda q, n: [{"verb": "snooze", "target": "spore-1", "actor": "p", "at": NOW}])
-    p = ck.panel("p", q="spore")
-    assert p["match_label"] == "1 matches in the store" and p["value"]["rows"][0]["sentence"].endswith("spore-1")
+                      search=lambda q, n: [{"verb": "snooze", "target": "intention-1", "actor": "p", "at": NOW}])
+    p = ck.panel("p", q="intention")
+    assert p["match_label"] == "1 matches in the store" and p["value"]["rows"][0]["sentence"].endswith("intention-1")
     ck = _value_panel("log", LOG, window=2, search_scope="store", search=lambda q, n: [{"verb": ""}])
-    assert "unusable rows" in ck.panel("p", q="spore")["search_error"]
+    assert "unusable rows" in ck.panel("p", q="intention")["search_error"]
 
 
 def test_a_windowed_panel_with_no_hook_filters_its_window_and_says_so() -> None:

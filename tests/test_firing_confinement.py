@@ -1,6 +1,6 @@
-"""Confinement tests (spore-311) — the OS-sandbox crown-jewels FLOOR for a sovereign entity's bash.
+"""Confinement tests (intention-311) — the OS-sandbox crown-jewels FLOOR for a sovereign entity's bash.
 
-The rescope (spore-303 → spore-311): the sovereign ``levain run`` entity becomes a CC/Codex
+The rescope (intention-303 → intention-311): the sovereign ``levain run`` entity becomes a CC/Codex
 replacement — a stateful networked shell on the operator's REAL repos, with the OS sandbox INVERTED
 from a workspace jail into a crown-jewels floor (``(allow default)`` → DENY flow store + declared
 creds + sibling ``.levain/`` stores + ``~/.ssh/id_*``). These prove it in two layers:
@@ -566,7 +566,7 @@ def test_live_ssh_keys_denied_location_based_known_hosts_usable(tmp_path: Path, 
 def test_live_raw_mode_authorized_keys_write_denied_but_read_allowed(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """SLICE 3 (spore-322): ``ssh_mode="raw"`` allows raw ~/.ssh READS (its whole purpose — the private
+    """SLICE 3 (intention-322): ``ssh_mode="raw"`` allows raw ~/.ssh READS (its whole purpose — the private
     key IS readable here) but STILL denies PLANTING an authorized key. The persistence-vector floor is
     ssh_mode-independent. Uses a FAKE HOME under tmp_path so the operator's real ~/.ssh is never
     touched (the raw-mode gap this closes was first confirmed by a bare append that SUCCEEDED)."""
@@ -746,7 +746,7 @@ def test_crown_jewel_reason_raw_ssh_mode_does_not_deny_ssh(tmp_path: Path, monke
 
 def test_crown_jewel_reason_own_store_writable_except_memory_files(tmp_path: Path, monkeypatch) -> None:
     # The entity's OWN .levain/ is its working space — NOT a crown jewel — EXCEPT the three store files
-    # (memory.continuity.md / crystal.json / db), which are write-protected from the HANDS since spore-359
+    # (memory.continuity.md / crystal.json / db), which are write-protected from the HANDS since intention-359
     # folds the neocortex into the always-loaded frame (only the host-process wrap composes them).
     monkeypatch.setenv("HOME", str(tmp_path))
     ent = _entity(tmp_path)
@@ -770,7 +770,7 @@ def test_crown_jewel_reason_fails_closed_on_an_unresolvable_path(tmp_path: Path)
 
 def test_build_policy_always_write_denies_ssh_exec_vectors(tmp_path: Path, monkeypatch) -> None:
     """All the ssh persistence/exec vectors (authorized_keys(2), config, rc) are in ``deny_write_files``
-    in BOTH ssh_modes — the floor is ssh_mode-independent (slice 3, spore-322; config/rc added after
+    in BOTH ssh_modes — the floor is ssh_mode-independent (slice 3, intention-322; config/rc added after
     apparatus L1 caught the ProxyCommand/rc gap)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     ent = _entity(tmp_path)
@@ -997,7 +997,7 @@ def test_build_policy_ssh_vectors_do_not_double_up_without_symlinks(
         hits = [p for p in policy.deny_write_files if p.name == name]
         assert len(hits) == 1, f"{name} duplicated in the no-symlink case: {hits}"
     # ⚠ SCOPED TO THE SSH VECTORS, not to the whole list (2026-09-04). This read
-    # `len(policy.deny_write_files) == 4` and broke when spore-725 put the container-daemon
+    # `len(policy.deny_write_files) == 4` and broke when intention-725 put the container-daemon
     # sockets through the same write-deny machinery. The assertion's subject was the ENTIRE
     # list; the claim its name makes is about the SSH vectors — so it failed the moment the
     # list gained a second, unrelated population, while the property it exists to protect
@@ -1320,7 +1320,7 @@ def test_crown_jewel_reason_denies_the_confinement_config(tmp_path: Path) -> Non
     policy = build_policy(ed)
     cfg = ed / ".levain" / "confinement.json"
     assert crown_jewel_reason(policy, cfg) is not None
-    # ...and since spore-359 the entity's own MEMORY store files are write-protected too (only the
+    # ...and since intention-359 the entity's own MEMORY store files are write-protected too (only the
     # host-process wrap composes them); a non-store .levain file stays the entity's own.
     assert crown_jewel_reason(policy, ed / ".levain" / "memory.db") is not None
     assert crown_jewel_reason(policy, ed / ".levain" / "scratch.txt") is None
@@ -1335,7 +1335,7 @@ def test_render_profile_denies_the_confinement_config(tmp_path: Path) -> None:
 
 
 def test_build_policy_write_denies_own_memory_store(tmp_path: Path, monkeypatch) -> None:
-    """spore-359 floor: the entity's own continuity/crystal/episodic files are in ``own_memory_files``
+    """intention-359 floor: the entity's own continuity/crystal/episodic files are in ``own_memory_files``
     (write-denied to the hands) so a self-write can't poison the always-loaded memory the wrap alone
     composes."""
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -1353,7 +1353,7 @@ def test_build_policy_write_denies_own_memory_store(tmp_path: Path, monkeypatch)
 
 def test_render_profile_write_denies_own_memory_but_allows_read(tmp_path: Path, monkeypatch) -> None:
     """The store files render as WRITE-only denies (bash may still ``cat`` its own memory) — NOT the
-    read+write deny the config gets. Read stays allowed so spore-359's build-time read + the entity's
+    read+write deny the config gets. Read stays allowed so intention-359's build-time read + the entity's
     own inspection work."""
     monkeypatch.setenv("HOME", str(tmp_path))
     policy = build_policy(_entity(tmp_path))
@@ -1473,7 +1473,7 @@ def test_every_production_caller_of_build_policy_declares_the_cred_floor() -> No
     split is right, but it leaves a real hole (glm L3 for creds; codex L3 HIGH#1 2026-09-13 for the
     localhost deny): a future production path that builds a floor directly and forgets an argument
     would silently ship the PERMISSIVE default — allowing ~/.config/gh on an unattended seat, or
-    leaving the spore-755 self-sshd bypass open. Rather than make the mechanism opinionated
+    leaving the intention-755 self-sshd bypass open. Rather than make the mechanism opinionated
     (duplicating policy into two places that can disagree) or churn 70+ test call sites that
     legitimately do not care, pin the thing that matters: PRODUCTION callers decide explicitly.
     Tests may omit it; shipped code may not.
@@ -1508,7 +1508,7 @@ def test_every_production_caller_of_build_policy_declares_the_cred_floor() -> No
     assert not offenders, (
         "production call(s) to build_policy() omit a security floor argument — it would silently "
         "default to PERMISSIVE (deny_standard_creds → ~/.config/gh readable; deny_localhost_outbound "
-        "→ the spore-755 self-sshd bypass open). Declare both explicitly "
+        "→ the intention-755 self-sshd bypass open). Declare both explicitly "
         "(resolve_cred_floor(...) for the creds; `not cfg.allow_localhost_outbound` for the deny): "
         + ", ".join(offenders)
     )
@@ -1564,10 +1564,10 @@ def test_the_ssh_anchor_is_redundant_because_the_ancestor_walk_already_names_it(
         )
 
 
-# --- container/VM daemon sockets (spore-725) ------------------------------------------
+# --- container/VM daemon sockets (intention-725) ------------------------------------------
 #
 # ⛔ THE DEFECT THESE PIN IS NOT "THE SOCKET WAS NOT DENIED" — it is that the OBVIOUS deny does
-# not work. Adding the socket paths to `deny_files` (the shape the spore originally proposed)
+# not work. Adding the socket paths to `deny_files` (the shape the intention originally proposed)
 # emits correct-looking literals into the profile, reads clean in review, and leaves the exploit
 # working, because a seatbelt `file-read* file-write*` rule does not block `connect()`. Every
 # test below exists because a version of the fix WITHOUT it was measured and lost.
@@ -1785,7 +1785,7 @@ def test_load_confinement_config_bad_allow_container_sockets_fails_closed(tmp_pa
 
 
 def test_load_confinement_config_allow_localhost_outbound_defaults_to_denied(tmp_path: Path) -> None:
-    """spore-755. ABSENT means the connect-to-self deny stays ON (in agent mode) — same safe-default
+    """intention-755. ABSENT means the connect-to-self deny stays ON (in agent mode) — same safe-default
     treatment as ``allow_container_sockets``."""
     ent = _entity(tmp_path)
     (ent / ".levain" / "confinement.json").write_text('{"deny_files": []}')
@@ -1889,8 +1889,8 @@ def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypa
     assert providers == {"SeatbeltProvider", "BwrapProvider"}, (
         f"the ConfinementProvider roster changed to {sorted(providers)}. Every provider MUST "
         f"enforce (or, for the localhost deny, refuse to spawn without) the connect-denies — "
-        f"CrownJewelsPolicy.deny_sockets (spore-725, a reachable container daemon is a total "
-        f"crown-jewels bypass) AND CrownJewelsPolicy.deny_localhost_outbound (spore-755, a local "
+        f"CrownJewelsPolicy.deny_sockets (intention-725, a reachable container daemon is a total "
+        f"crown-jewels bypass) AND CrownJewelsPolicy.deny_localhost_outbound (intention-755, a local "
         f"sshd reached via the forwarded agent socket is the same class). Both are connect-denies "
         f"with NO in-process twin, so a provider that ignores either fails OPEN silently. Wire the "
         f"new provider for BOTH and update this assertion, or the floor is macOS-only while the "
@@ -1900,7 +1900,7 @@ def test_every_confinement_provider_must_consume_deny_sockets(tmp_path, monkeypa
 
 def test_no_shipped_provider_overrides_spawn_shell() -> None:
     """The refresh lives in the base `spawn_shell`; a provider that overrides it skips the refresh
-    (spore-768). The K4c branch did exactly that before the port."""
+    (intention-768). The K4c branch did exactly that before the port."""
     from levain.firing import confinement as _conf
 
     shipped = [c for c in _conf.ConfinementProvider.__subclasses__() if c.__module__ == _conf.__name__]
@@ -1959,7 +1959,7 @@ def test_offline_bash_cannot_reach_the_hosts_resolver_deputies(tmp_path, monkeyp
 
 
 # Literal, not the module constant: a red on the parent must be the absent PROPERTY (the conf is not
-# write-denied), not an AttributeError on a new symbol (spore-938).
+# write-denied), not an AttributeError on a new symbol (intention-938).
 _GNUPG_CONFS = ("gpg-agent.conf", "scdaemon.conf", "gpg.conf", "dirmngr.conf", "common.conf")
 
 
@@ -2342,7 +2342,7 @@ def test_spawn_shell_refreshes_so_every_consumer_gets_it_not_just_one_call_site(
     bypasses across five versions; correctly deleted) with the REFRESH ITSELF at the layer that owns
     it. Removing the refresh left the invariant on exactly ONE call site, so any second consumer —
     `BwrapProvider` on the held branch, a debug harness, a test — rendering `spawn_shell(policy)`
-    without refreshing first would get the BUILD-TIME `deny_sockets`: the spore-768 regression,
+    without refreshing first would get the BUILD-TIME `deny_sockets`: the intention-768 regression,
     reintroduced by the fix for the guard protecting against it.
 
     Call `spawn_shell` DIRECTLY, with no executor involved, and assert the refresh still happened."""
@@ -2392,7 +2392,7 @@ def test_a_seatbelt_shell_rescans_its_profile_text_before_every_spawn(tmp_path, 
 
 
 # =============================================================================================
-# CONNECT-TO-SELF (spore-755) — the loopback/local-interface sshd bypass and its deny
+# CONNECT-TO-SELF (intention-755) — the loopback/local-interface sshd bypass and its deny
 # =============================================================================================
 
 
@@ -2400,7 +2400,7 @@ def test_localhost_outbound_deny_is_gated_by_the_flag(tmp_path: Path, monkeypatc
     """RENDER-LAYER (always on): the ``deny_localhost_outbound`` flag is the ONLY thing that emits
     the ``(deny network-outbound (remote ip "localhost:*"))`` rule — off by default, on when asked.
     This grades the profile STRING; the actual closure is graded by the live attack test below
-    (a render assertion cannot prove a connect() is refused — spore-938)."""
+    (a render assertion cannot prove a connect() is refused — intention-938)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     prov = SeatbeltProvider()
     line = '(deny network-outbound (remote ip "localhost:*"))'
@@ -2414,9 +2414,9 @@ def test_localhost_outbound_deny_is_gated_by_the_flag(tmp_path: Path, monkeypatc
 
 @live
 def test_live_localhost_outbound_deny_blocks_the_self_sshd_bypass(tmp_path: Path) -> None:
-    """⛔ spore-755, THE LIVE PROOF (reproduced end to end 2026-09-13, ruled by Phill). A sshd this
+    """⛔ intention-755, THE LIVE PROOF (reproduced end to end 2026-09-13, ruled by Phill). A sshd this
     host runs reads, as unsandboxed root, a file the floor denies — the container-daemon-socket class
-    (spore-725). Fully self-contained: a THROWAWAY non-root sshd on a spare port authorising a FRESH
+    (intention-725). Fully self-contained: a THROWAWAY non-root sshd on a spare port authorising a FRESH
     key held by a DEDICATED agent (never the operator's real sshd / Remote Login / agent).
 
     The attack is agent-ONLY — no ``-i``, ``IdentitiesOnly=yes`` + ``IdentityAgent`` pointed at the
@@ -2887,7 +2887,7 @@ def test_bwrap_write_only_files_are_ro_self_binds_when_they_exist(tmp_path, monk
 
 def test_bwrap_blocks_planting_a_vector_that_does_not_exist_yet(tmp_path, monkeypatch) -> None:
     """⚠ THE ssh PERSISTENCE VECTOR IS ABOUT A FILE THAT DOES NOT EXIST YET — planting an
-    authorized_keys that was never there (spore-322). macOS denies a path STRING, so it covers future
+    authorized_keys that was never there (intention-322). macOS denies a path STRING, so it covers future
     creation for free; a MOUNT needs a mountpoint. A missing vector therefore gets
     ``--ro-bind /dev/null``, which blocks the plant (measured against a control run that plants
     successfully without it) at the cost of bwrap creating a 0-byte ``-r--r--r--`` file on the host.
@@ -3425,7 +3425,7 @@ def test_diagnose_linux_namespace_denied_without_apparmor_is_a_different_sentenc
 
 
 def test_apparmor_probe_is_diagnostic_only_and_never_gates(monkeypatch) -> None:
-    """⛔ THE LESSON OF K4c, PINNED. `spore-418` specified a sysctl read as the capability check and
+    """⛔ THE LESSON OF K4c, PINNED. `intention-418` specified a sysctl read as the capability check and
     it reported GREEN on a host where bwrap could not run. `bwrap_available` must therefore depend
     on EXECUTING bwrap, never on this probe — so flipping the probe must not move the gate."""
     calls = []
@@ -3582,7 +3582,7 @@ def test_bwrap_a_file_subtree_root_is_not_rebound_readable_by_the_write_floor(tm
     ("interactive", False, False),  # the opt-in is the only way the REPL reaches it (N7)
 ])
 def test_seatbelt_keychain_rule_follows_the_cred_floor(tmp_path, mode, setting, expected) -> None:
-    """spore-1245, ruled by Phill 2026-10-01 (deny for autonomous ops, not while a human drives;
+    """intention-1245, ruled by Phill 2026-10-01 (deny for autonomous ops, not while a human drives;
     since N7, 2026-10-12, denied at the REPL too unless the entity opts in).
     Measured before the rule: from inside the confined shell `security find-generic-password -w`
     and `git credential-osxkeychain get` read secrets. Measured after, on the real provider:

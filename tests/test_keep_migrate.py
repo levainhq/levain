@@ -18,7 +18,7 @@ def _sha(p: Path) -> str:
 class Env:
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.spores = root / "memory.spores.json"
+        self.intentions = root / "memory.spores.json"
         self.db = root / "memory.db"
         self.mig = root / "migrations"
         from anneal_memory import Store
@@ -27,9 +27,9 @@ class Env:
             pass                                  # create the episode store
 
     def plain(self):
-        from anneal_memory.spores import SporeStore
+        from anneal_memory.spores import IntentionStore
 
-        return SporeStore(self.spores)
+        return IntentionStore(self.intentions, id_prefix="intention")
 
     def seed_legacy(self) -> None:
         """A store holding every shape the migration meets (retired dispositions via anneal's plain store,
@@ -68,18 +68,18 @@ def env(tmp_path: Path) -> Env:
 
 
 def _plan(env: Env, **kw) -> Path:
-    return km.plan(env.spores, migrations_dir=env.mig, episodic_db=env.db, **kw)
+    return km.plan(env.intentions, migrations_dir=env.mig, episodic_db=env.db, **kw)
 
 
 def test_dry_run_changes_no_byte(env: Env):
     # a keyless legacy row: anneal's own keyed read would backfill + save it, the dry run must not
-    doc = json.loads(env.spores.read_text())
+    doc = json.loads(env.intentions.read_text())
     doc["spores"][0].pop("origin_key")
-    env.spores.write_text(json.dumps(doc, indent=1))
-    before = _sha(env.spores)
+    env.intentions.write_text(json.dumps(doc, indent=1))
+    before = _sha(env.intentions)
     p = _plan(env)
-    km.pending_counts(env.spores)
-    assert _sha(env.spores) == before
+    km.pending_counts(env.intentions)
+    assert _sha(env.intentions) == before
     plan = km.load_plan(p)
     assert p.parent == env.mig and p.name.startswith("keep-")
     texts = [i["text"] for i in plan["items"]]
@@ -111,12 +111,12 @@ def test_handoff_to_agenda_needs_a_date(env: Env):
 
 
 def test_counts_and_doctor_line(env: Env):
-    assert km.pending_counts(env.spores) == {"notes": 4, "handoffs": 1, "agendas": 1}
-    assert km.doctor_line(env.spores) == "keep: 4 notes / 1 handoffs await migration (+ 1 undated agendas to seeds)"
+    assert km.pending_counts(env.intentions) == {"notes": 4, "handoffs": 1, "agendas": 1}
+    assert km.doctor_line(env.intentions) == "keep: 4 notes / 1 handoffs await migration (+ 1 undated agendas to seeds)"
     p = _plan(env)
     km.apply(p, episodic_db=env.db)
-    assert km.pending_counts(env.spores) == {"notes": 0, "handoffs": 0, "agendas": 0}
-    assert km.doctor_line(env.spores) is None
+    assert km.pending_counts(env.intentions) == {"notes": 0, "handoffs": 0, "agendas": 0}
+    assert km.doctor_line(env.intentions) is None
     assert km.pending_counts(env.root / "nope.json") == {"notes": 0, "handoffs": 0, "agendas": 0}
 
 
@@ -147,7 +147,7 @@ def test_every_applied_destination_resolves(env: Env):
     kinds = set()
     for i in plan["items"]:
         assert i["state"] == km.STATE_APPLIED
-        assert km.resolve_destination(i["result"], spores_json=env.spores, episodic_db=env.db), i["result"]
+        assert km.resolve_destination(i["result"], intentions_json=env.intentions, episodic_db=env.db), i["result"]
         kinds.add(i["result"]["kind"])
     assert kinds == {"episode", "spore"}
     # the originals are composted with the plan path in a note
@@ -207,10 +207,10 @@ def test_a_row_edited_after_the_plan_is_left_alone(env: Env):
 
 def test_apply_without_the_episode_store_changes_nothing(env: Env):
     p = _plan(env)
-    before = _sha(env.spores)
+    before = _sha(env.intentions)
     with pytest.raises(km.KeepMigrateError):
         km.apply(p, episodic_db=env.root / "missing.db")
-    assert _sha(env.spores) == before
+    assert _sha(env.intentions) == before
 
 
 class Boom(RuntimeError):
@@ -338,16 +338,16 @@ def test_an_episode_override_without_a_type_is_a_clean_error(env: Env):
         _plan(env, overrides={row["origin_key"]: {"kind": "episode"}})
 
 
-def test_spore_destinations_carry_the_agenda_fields_and_the_age(env: Env):
+def test_intention_destinations_carry_the_agenda_fields_and_the_age(env: Env):
     # (6) target / attention / germinated ride over; so do created / seen when the row has no notes
     s = env.plain()
     h = s.add(type="task", text="a targeted handoff", disposition="handoff", target="alice",
               attention="high", germinated={"on": "2026-10-01"})
-    doc = json.loads(env.spores.read_text())
+    doc = json.loads(env.intentions.read_text())
     for r in doc["spores"]:
         if r["text"] == "an undated agenda":
             r["created"] = "2025-01-02"
-    env.spores.write_text(json.dumps(doc, indent=1))
+    env.intentions.write_text(json.dumps(doc, indent=1))
     p = _plan(env)
     km.apply(p, episodic_db=env.db)
     seed = _open_row(env, "a targeted handoff")
@@ -358,8 +358,8 @@ def test_spore_destinations_carry_the_agenda_fields_and_the_age(env: Env):
 
 
 @pytest.mark.parametrize("stage", ["after_destination", "after_record"])
-def test_crash_on_a_spore_destination_retries_once(env: Env, stage: str):
-    # (7) the spore-destination crash-retry path: each seed lands exactly once, notes once
+def test_crash_on_a_intention_destination_retries_once(env: Env, stage: str):
+    # (7) the intention-destination crash-retry path: each seed lands exactly once, notes once
     original = env.open_set()
     p = _plan(env)
     idx = _index_of(p, "pick up the Liz thread")
@@ -406,11 +406,11 @@ def test_a_note_added_to_a_crashed_destination_survives_the_retry(env: Env):
 
 
 def _crash_on_the_save_after(monkeypatch, prefix: str) -> None:
-    """Raise Boom at the first spore-store save AFTER the save that first committed a row keyed
+    """Raise Boom at the first intention-store save AFTER the save that first committed a row keyed
     under ``prefix`` (a process dying right after anneal's keyed add commits)."""
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
 
-    real = SporeStore._save
+    real = IntentionStore._save
     st = {"armed": False, "fired": False}
 
     def save(self, data):
@@ -421,7 +421,7 @@ def _crash_on_the_save_after(monkeypatch, prefix: str) -> None:
         if any(str(r.get("origin_key") or "").startswith(prefix) for r in data.get("spores", [])):
             st["armed"] = True
 
-    monkeypatch.setattr(SporeStore, "_save", save)
+    monkeypatch.setattr(IntentionStore, "_save", save)
 
 
 def test_a_crash_right_after_the_restore_add_loses_no_notes(env: Env, monkeypatch):
@@ -439,9 +439,9 @@ def test_a_crash_right_after_the_restore_add_loses_no_notes(env: Env, monkeypatc
 
 def _edit_destination_on_read(monkeypatch, env: Env, text: str) -> list:
     """The guarded store's ``get`` of the destination seed returns it, then an edit lands (once)."""
-    import levain.spores as ls
+    import levain.intentions as ls
 
-    real = ls.guarded_spore_store
+    real = ls.guarded_intention_store
     hits: list = []
 
     def wrapped(path):
@@ -459,7 +459,7 @@ def _edit_destination_on_read(monkeypatch, env: Env, text: str) -> list:
         store.get = get_then_edit
         return store
 
-    monkeypatch.setattr(ls, "guarded_spore_store", wrapped)
+    monkeypatch.setattr(ls, "guarded_intention_store", wrapped)
     return hits
 
 
@@ -495,10 +495,10 @@ def test_an_original_deleted_outside_the_plan_is_not_resurrected(env: Env):
     with pytest.raises(Boom):
         km.apply(p, episodic_db=env.db, fault=fault)
     s = env.plain()
-    from anneal_memory.spores import spore_version
+    from anneal_memory.spores import intention_version
 
     orig = next(r for r in s.list_open() if r["text"] == "pick up the Liz thread" and r["disposition"] == "handoff")
-    s.delete(orig["id"], expected_version=spore_version(orig))
+    s.delete(orig["id"], expected_version=intention_version(orig))
     rep = km.revert(p, episodic_db=env.db)
     assert idx not in rep.reverted and any(i == idx for i, _ in rep.skipped)
     liz = [r for r in env.plain().list_open() if r["text"] == "pick up the Liz thread"]
@@ -507,10 +507,10 @@ def test_an_original_deleted_outside_the_plan_is_not_resurrected(env: Env):
 
 
 def test_the_guard_still_refuses_a_new_retired_write(env: Env):
-    from levain.spores import RetiredDisposition, guarded_spore_store
+    from levain.intentions import RetiredDisposition, guarded_intention_store
 
     with pytest.raises(RetiredDisposition):
-        guarded_spore_store(env.spores).add(type="thought", text="x", disposition="note")
+        guarded_intention_store(env.intentions).add(type="thought", text="x", disposition="note")
 
 
 # --- the private-anneal pin: _add_verbatim leans on three private names; this is the one place that says so.
@@ -523,15 +523,15 @@ def test_add_verbatim_stores_the_same_shape_as_anneals_public_add(tmp_path: Path
     verbatim copy of it must change too. This fails then, instead of the migration writing rows the
     rest of the stack reads differently. Apart from notes / created / seen (set verbatim on purpose)
     the two rows must carry the same keys with the same value types."""
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
 
     kw = dict(type="thought", domain="ops", tier="warm", salience=2, pointer="p/q.md",
               disposition="seed", target=None, attention=None, germinated=None)
-    pub = SporeStore(tmp_path / "pub.json").add(text="the same words", next="2030-01-01",
+    pub = IntentionStore(tmp_path / "pub.json", id_prefix="intention").add(text="the same words", next="2030-01-01",
                                                 origin_key="pt-a1b2c3d4e5f6", **kw)
     row = {**kw, "notes": ["n1"], "created": "2020-01-02", "seen": "2020-01-03"}
     ver, created = km._add_verbatim(
-        SporeStore(tmp_path / "ver.json"), origin_key="pt-a1b2c3d4e5f6", row=row, text="the same words",
+        IntentionStore(tmp_path / "ver.json", id_prefix="intention"), origin_key="pt-a1b2c3d4e5f6", row=row, text="the same words",
         disposition="seed", next_="2030-01-01", guard=False)
     assert created
     assert ver["notes"] == ["n1"] and ver["created"] == "2020-01-02" and ver["seen"] == "2020-01-03"
@@ -545,8 +545,8 @@ def test_add_verbatim_stores_the_same_shape_as_anneals_public_add(tmp_path: Path
 
 @pytest.mark.parametrize("name", ["_prepare_add", "_find_by_origin_key", "_add_locked", "_transaction"])
 def test_the_private_anneal_names_add_verbatim_uses_still_exist(name: str):
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
 
-    assert hasattr(SporeStore, name), (
-        f"anneal's SporeStore no longer has {name}, which levain.keep_migrate._add_verbatim calls. "
+    assert hasattr(IntentionStore, name), (
+        f"anneal's IntentionStore no longer has {name}, which levain.keep_migrate._add_verbatim calls. "
         "Update _add_verbatim, or ask anneal for a public add that takes notes/created/seen.")

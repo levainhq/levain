@@ -32,17 +32,17 @@ def _fire(rig: Rig, b: Any, verb: str, panel: str, key: str, params: dict, **env
 def test_a_fire_with_intent_must_name_the_tier_and_gesture_it_previewed(rig_broker) -> None:
     rig, b, _db = rig_broker
     for env in ({}, {"tier_seen": "T2"}, {"gesture_seen": "direct-reported"}):
-        err = _refused("bad_request", _fire, rig, b, "spore_update", "tray", "seed", {"domain": "work"},
+        err = _refused("bad_request", _fire, rig, b, "intention_update", "tray", "seed", {"domain": "work"},
                        intent="reported", idempotency_key="k-missing", **env)
         assert "tier_seen" in str(err) or "gesture_seen" in str(err), err
-    assert rig.spore("seed").get("domain") in (None, "")
+    assert rig.intention("seed").get("domain") in (None, "")
 
 
 def test_tier_seen_and_gesture_seen_must_be_known_values(rig_broker) -> None:
     rig, b, _db = rig_broker
     for env in ({"tier_seen": "T9", "gesture_seen": "direct-reported"},
                 {"tier_seen": "T2", "gesture_seen": "teleport"}):
-        err = _refused("bad_request", _fire, rig, b, "spore_update", "tray", "seed", {"domain": "work"},
+        err = _refused("bad_request", _fire, rig, b, "intention_update", "tray", "seed", {"domain": "work"},
                        intent="reported", idempotency_key="k-bad", **env)
         assert "T9" in str(err) or "teleport" in str(err), err
 
@@ -50,36 +50,36 @@ def test_tier_seen_and_gesture_seen_must_be_known_values(rig_broker) -> None:
 def test_a_dry_run_refuses_tier_seen_and_gesture_seen(rig_broker) -> None:
     rig, b, _db = rig_broker
     for env in ({"tier_seen": "T2"}, {"gesture_seen": "direct-reported"}):
-        err = _refused("bad_request", _fire, rig, b, "spore_update", "tray", "seed", {"domain": "work"},
+        err = _refused("bad_request", _fire, rig, b, "intention_update", "tray", "seed", {"domain": "work"},
                        dry_run=True, **env)
         assert "dry run" in str(err), err
 
 
 def test_a_previewed_fire_matching_its_preview_lands(rig_broker) -> None:
     rig, b, _db = rig_broker
-    pre = _fire(rig, b, "spore_update", "tray", "seed", {"domain": "work"}, dry_run=True)
-    out = _fire(rig, b, "spore_update", "tray", "seed", {"domain": "work"}, intent="reported",
+    pre = _fire(rig, b, "intention_update", "tray", "seed", {"domain": "work"}, dry_run=True)
+    out = _fire(rig, b, "intention_update", "tray", "seed", {"domain": "work"}, intent="reported",
                 idempotency_key="k-ok", confirm=True, tier_seen=pre["tier"], gesture_seen=pre["gesture"])
     assert (out["state"], out["label"]) == ("COMMITTED", "claims cockpit token"), out
-    assert rig.spore("seed")["domain"] == "work"
+    assert rig.intention("seed")["domain"] == "work"
 
 
 def test_a_tier_that_moved_since_the_preview_is_refused_tier_moved(rig_broker) -> None:
     """T2 at the preview, C1 at the fire: the page holds a key minted for a T2 fire, which a
     non-idempotent C1 verb would refuse 400; the move answers first."""
     rig, b, _db = rig_broker
-    err = _refused("tier_moved", _fire, rig, b, "spore_update", "tray", "seed", {"tier": "hot"},
+    err = _refused("tier_moved", _fire, rig, b, "intention_update", "tray", "seed", {"tier": "hot"},
                    intent="reported", idempotency_key="k-moved", tier_seen="T2", gesture_seen="direct-reported")
     assert err.http_status == 409 and (err.extra["tier"], err.extra["tier_seen"]) == ("C1", "T2"), err.extra
-    assert rig.spore("seed").get("tier") != "hot"
+    assert rig.intention("seed").get("tier") != "hot"
 
 
 def test_a_gesture_that_moved_since_the_preview_is_refused_gesture_moved(rig_broker) -> None:
     rig, b, _db = rig_broker
-    err = _refused("gesture_moved", _fire, rig, b, "spore_update", "tray", "seed", {"domain": "work"},
+    err = _refused("gesture_moved", _fire, rig, b, "intention_update", "tray", "seed", {"domain": "work"},
                    intent="reported", idempotency_key="k-g", confirm=True, tier_seen="T2", gesture_seen="sign")
     assert err.http_status == 409 and (err.extra["gesture"], err.extra["gesture_seen"]) == ("direct-reported", "sign")
-    assert rig.spore("seed").get("domain") in (None, "")
+    assert rig.intention("seed").get("domain") in (None, "")
 
 
 # --- 2. transport in the manifest ---------------------------------------------------------------
@@ -120,17 +120,17 @@ def test_a_resolve_row_action_names_the_kinds_its_rows_type_takes(rig) -> None:
     rows = rig.ck.panel("loops", credential_class="token")["rows"]
     seen = set()
     for row in rows:
-        stype = row["facets"]["spore_type"]
+        stype = row["facets"]["intention_type"]
         for a in row["actions"]:
-            if a["verb"] == "spore_descend":
-                assert a["options"] == {"spore_kind": sorted(DESCEND_BY_TYPE[stype])}, a
-            elif a["verb"] == "spore_ascend":
-                assert a["options"] == {"spore_kind": sorted(ASCEND_BY_TYPE[stype])}, a
+            if a["verb"] == "intention_close":
+                assert a["options"] == {"intention_kind": sorted(DESCEND_BY_TYPE[stype])}, a
+            elif a["verb"] == "intention_promote":
+                assert a["options"] == {"intention_kind": sorted(ASCEND_BY_TYPE[stype])}, a
             else:
                 assert "options" not in a, a
                 continue
             seen.add(a["verb"])
-    assert seen == {"spore_descend", "spore_ascend"}
+    assert seen == {"intention_close", "intention_promote"}
 
 
 # --- 4. the downstream effect seam --------------------------------------------------------------
@@ -212,13 +212,13 @@ def test_a_downstream_effect_is_refused_at_server_construction(tmp_path: Path) -
         authority_fields = ()
 
     class Squatter(FakeInbox):
-        name = "spores"
+        name = "intentions"
 
     cases = {   # each case's effects, and the words its refusal names
         "no authority_fields": ({"send_inbox": DownstreamEffect(NoAuthority(), send_inbox_effect)},
                                 "refused at registration"),
         "reserved": ({"send_inbox": DownstreamEffect(Squatter(), send_inbox_effect)}, "reserved or empty"),
-        "not a downstream verb": ({"spore_seed": inbox_downstream()[1]}, "must name a verb in extra_verbs"),
+        "not a downstream verb": ({"intention_seed": inbox_downstream()[1]}, "must name a verb in extra_verbs"),
         "no such verb": ({"nope": inbox_downstream()[1]}, "must name a verb in extra_verbs"),
         "no canonical_effect": ({"send_inbox": DownstreamEffect(FakeInbox(), None)},  # type: ignore[arg-type]
                                 "refused at registration"),
@@ -236,7 +236,7 @@ def test_a_downstream_effect_is_refused_at_server_construction(tmp_path: Path) -
                     extra_effects={"send_inbox": inbox_downstream()[1], "send_other": inbox_downstream()[1]})
 
 
-@pytest.mark.parametrize("verb", ["spore_seed", "spore_touch", "operator_state", "episode_tombstone",
+@pytest.mark.parametrize("verb", ["intention_seed", "intention_touch", "operator_state", "episode_tombstone",
                                   "pending_cancel"])
 def test_the_broker_refuses_a_downstream_effect_on_any_kernel_verb(home: Path, verb: str) -> None:  # noqa: F811
     from levain.cockpit.broker import Broker
@@ -252,16 +252,16 @@ def test_a_killed_send_inbox_applies_exactly_once_after_recovery(home: Path, poi
     import subprocess
     import sys
 
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
     from levain.cockpit.broker import Broker
-    from levain.cockpit.effects import SporeEffectStore
+    from levain.cockpit.effects import IntentionEffectStore
     from tests._inbox_fake import inbox_downstream
     from tests.test_cockpit_k2b_crash import ENTRY, _ops, _wait_state
 
-    spores, inbox, data = home / "spores.json", home / "inbox.json", home / "data"
-    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
+    intentions, inbox, data = home / "spores.json", home / "inbox.json", home / "data"
+    IntentionStore(intentions, id_prefix="intention").add(type="task", text="a loop", origin_key="k.loop")
     params, target = {"body": "killed mid-send", "for": "cli"}, {"kind": "panel", "panel_id": "ext:inbox"}
-    cfg = {"data_root": str(data), "spores": str(spores), "inbox": str(inbox), "kill_at": point,
+    cfg = {"data_root": str(data), "intentions": str(intentions), "inbox": str(inbox), "kill_at": point,
            "verb": "send_inbox", "params": params, "target": target, "idempotency_key": "send-k"}
     proc = subprocess.run([sys.executable, str(ENTRY), json.dumps(cfg)], capture_output=True, text=True,
                           timeout=120, cwd=str(Path(__file__).parent.parent))
@@ -270,7 +270,7 @@ def test_a_killed_send_inbox_applies_exactly_once_after_recovery(home: Path, poi
 
     def broker() -> tuple[Any, Broker]:
         store, effect = inbox_downstream(inbox)
-        b = Broker(data, stores={"spores": SporeEffectStore(spores)}, store_paths=[spores],
+        b = Broker(data, stores={"intentions": IntentionEffectStore(intentions)}, store_paths=[intentions],
                    install_class="reported", downstream={"send_inbox": effect})
         b.start()
         return store, b
@@ -378,16 +378,16 @@ def test_a_retired_note_recovers_applied_unlabelled_and_is_never_sent_twice(home
     import subprocess
     import sys
 
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
     from levain.cockpit.broker import Broker
-    from levain.cockpit.effects import SporeEffectStore
+    from levain.cockpit.effects import IntentionEffectStore
     from tests._inbox_fake import inbox_downstream
     from tests.test_cockpit_k2b_broker import _rows
     from tests.test_cockpit_k2b_crash import ENTRY, _effects, _ops, _wait_state
 
-    spores, inbox, data = home / "spores.json", home / "inbox.json", home / "data"
-    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
-    cfg = {"data_root": str(data), "spores": str(spores), "inbox": str(inbox), "kill_at": "applied:0",
+    intentions, inbox, data = home / "spores.json", home / "inbox.json", home / "data"
+    IntentionStore(intentions, id_prefix="intention").add(type="task", text="a loop", origin_key="k.loop")
+    cfg = {"data_root": str(data), "intentions": str(intentions), "inbox": str(inbox), "kill_at": "applied:0",
            "verb": "send_inbox", "params": {"body": "then deleted", "for": "cli"}, "target": _PANEL,
            "idempotency_key": "send-r"}
     proc = subprocess.run([sys.executable, str(ENTRY), json.dumps(cfg)], capture_output=True, text=True,
@@ -397,7 +397,7 @@ def test_a_retired_note_recovers_applied_unlabelled_and_is_never_sent_twice(home
     store, effect = inbox_downstream(inbox)
     (key,) = store.notes
     store.retire(key)
-    b = Broker(data, stores={"spores": SporeEffectStore(spores)}, store_paths=[spores],
+    b = Broker(data, stores={"intentions": IntentionEffectStore(intentions)}, store_paths=[intentions],
                install_class="reported", downstream={"send_inbox": effect})
     b.start()
     try:
@@ -424,7 +424,7 @@ def test_a_stored_note_that_differs_from_the_changes_settles_applied_unlabelled(
     assert [m.label_fields for m in got.members] == [("for",)]
 
 
-def test_the_fake_inbox_stores_the_body_as_anneal_normalises_a_spore_field() -> None:
+def test_the_fake_inbox_stores_the_body_as_anneal_normalises_a_intention_field() -> None:
     from tests._inbox_fake import send_inbox_effect
 
     eff = send_inbox_effect({"body": "  line one  \r\nline two‮  "}, origin_key="ck.ab.0")

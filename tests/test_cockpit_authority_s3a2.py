@@ -36,7 +36,7 @@ from tests.test_cockpit_k2b_broker import (  # noqa: F401 - fixtures
     _state,
     home,
     keydir,
-    spores,
+    intentions,
 )
 from tests.test_cockpit_k2b_section import rig_broker  # noqa: F401 - fixture
 
@@ -44,16 +44,16 @@ LEVAIN = Path(levain.__file__).parent
 
 
 @pytest.fixture
-def broker(home: Path, spores: Path):
-    b = _broker(home, spores)
+def broker(home: Path, intentions: Path):
+    b = _broker(home, intentions)
     try:
         yield b
     finally:
         b.stop()
 
 
-def _sign_pending(b, spores, key: Key, origin: str = "k.seed") -> tuple[str, str]:
-    pid = _move(b, spores, origin)["pending_id"]
+def _sign_pending(b, intentions, key: Key, origin: str = "k.seed") -> tuple[str, str]:
+    pid = _move(b, intentions, origin)["pending_id"]
     return pid, key.sign(b.outcome(pid)["record"].encode())
 
 
@@ -63,7 +63,7 @@ def _raw(b) -> sqlite3.Connection:
 
 # --- a planted key row is ignored -----------------------------------------------------------------------
 
-def test_a_planted_keys_row_grants_nothing(broker, spores, keydir):
+def test_a_planted_keys_row_grants_nothing(broker, intentions, keydir):
     Key(keydir, "phone").enroll(broker, "display-phone")
     planted = Key(keydir, "planted")
     conn = _raw(broker)
@@ -74,15 +74,15 @@ def test_a_planted_keys_row_grants_nothing(broker, spores, keydir):
     conn.execute("INSERT INTO keys VALUES (?, ?, ?, 'laptop-presence', '2026-10-10T00:00:00.000000Z', "
                  "'laptop cli', NULL, NULL)", (planted.fingerprint, planted.principal, planted.public))
     conn.close()
-    pid, sig = _sign_pending(broker, spores, planted)
+    pid, sig = _sign_pending(broker, intentions, planted)
     _refused("bad_signature", broker.submit, pid, sig)
     assert _state(broker, pid) == "WAITING"
 
 
-def test_a_directly_inserted_unsigned_link_refuses_the_whole_log(broker, spores, keydir):
+def test_a_directly_inserted_unsigned_link_refuses_the_whole_log(broker, intentions, keydir):
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
     planted = Key(keydir, "planted")
-    pid, _ = _sign_pending(broker, spores, planted)
+    pid, _ = _sign_pending(broker, intentions, planted)
     conn = _raw(broker)
     head = conn.execute("SELECT seq, hash FROM authority_log ORDER BY seq DESC LIMIT 1").fetchone()
     conn.execute("INSERT INTO authority_log (seq, prev_hash, record, signer_fp, signature, hash) "
@@ -92,14 +92,14 @@ def test_a_directly_inserted_unsigned_link_refuses_the_whole_log(broker, spores,
     assert auth.authority is None and "authority log is refused" in str(auth.authority_error)
     # nothing signs and nothing issues against a refused log, a token-reported write included
     _refused("authority_unavailable", broker.submit, pid, phone.sign(broker.outcome(pid)["record"].encode()))
-    _refused("authority_unavailable", _move, broker, spores, "k.seed2", intent="reported")
+    _refused("authority_unavailable", _move, broker, intentions, "k.seed2", intent="reported")
 
 
 # --- a direct meta write grants nothing ---------------------------------------------------------------
 
-def test_a_direct_meta_write_grants_nothing(broker, spores, keydir):
+def test_a_direct_meta_write_grants_nothing(broker, intentions, keydir):
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
-    pid, sig = _sign_pending(broker, spores, phone)
+    pid, sig = _sign_pending(broker, intentions, phone)
     conn = _raw(broker)
     # the retired integer fence, and a meta row naming the head: neither moves anything
     conn.execute("INSERT INTO meta (key, value) VALUES ('policy_rev', '0')")
@@ -111,21 +111,21 @@ def test_a_direct_meta_write_grants_nothing(broker, spores, keydir):
     assert broker.submit(pid, sig)["state"] == "COMMITTED"
 
 
-def test_deleting_the_uninitialised_marker_grants_nothing_on_an_empty_log(broker, spores, keydir):
+def test_deleting_the_uninitialised_marker_grants_nothing_on_an_empty_log(broker, intentions, keydir):
     phone = Key(keydir, "phone")
     conn = _raw(broker)
     conn.execute("INSERT INTO meta (key, value) VALUES ('authority_uninitialised', 'authority migrated')")
     conn.execute("DELETE FROM meta WHERE key = 'authority_uninitialised'")
     conn.close()
-    pid, sig = _sign_pending(broker, spores, phone)
+    pid, sig = _sign_pending(broker, intentions, phone)
     err = _refused("not_initialised", broker.submit, pid, sig)
     assert "ledger init" in str(err)
 
 
 # --- a truncated log is refused at open ---------------------------------------------------------------
 
-def test_a_truncated_log_is_refused_by_its_anchor(home, spores, keydir):
-    b = _broker(home, spores)
+def test_a_truncated_log_is_refused_by_its_anchor(home, intentions, keydir):
+    b = _broker(home, intentions)
     try:
         Key(keydir, "phone").enroll(b, "display-phone")
         assert len(_rows(b, "SELECT seq FROM authority_log")) == 2
@@ -134,12 +134,12 @@ def test_a_truncated_log_is_refused_by_its_anchor(home, spores, keydir):
     conn = sqlite3.connect(home / "data" / "cockpit.db", isolation_level=None)
     conn.execute("DELETE FROM authority_log WHERE seq = 2")          # the phone's enrolment rolled back
     conn.close()
-    b = _broker(home, spores)                                         # open again
+    b = _broker(home, intentions)                                         # open again
     try:
         auth = b.capture()
         assert auth.authority is None and "behind its anchor" in str(auth.authority_error)
         assert "anchor reset" in str(auth.authority_error)
-        _refused("authority_unavailable", _move, b, spores, intent="reported")
+        _refused("authority_unavailable", _move, b, intentions, intent="reported")
     finally:
         b.stop()
 
@@ -242,7 +242,7 @@ def _refuse_the_log(data_root: Path) -> bytes:
     return good
 
 
-def test_a_replayed_reported_pending_on_a_refused_log_is_unavailable_and_stays_waiting(broker, spores, keydir):
+def test_a_replayed_reported_pending_on_a_refused_log_is_unavailable_and_stays_waiting(broker, intentions, keydir):
     from datetime import timedelta
 
     from levain.cockpit.consent import utc_stamp
@@ -250,19 +250,19 @@ def test_a_replayed_reported_pending_on_a_refused_log_is_unavailable_and_stays_w
     from tests.test_cockpit_k2b_broker import _target
 
     Key(keydir, "phone").enroll(broker, "display-phone")
-    tgt = _target(spores, "k.seed")
+    tgt = _target(intentions, "k.seed")
     dead = new_pending_id()
     with broker._admitted() as db:                 # the request that died after `issued`
-        built = broker._build(db, "spore_set_disposition", {"disposition": "agenda"}, tgt, dead, at_issue=True)
+        built = broker._build(db, "intention_set_disposition", {"disposition": "agenda"}, tgt, dead, at_issue=True)
         n = broker._now()
-        raw = broker._record(pid=dead, verb="spore_set_disposition", intent="reported", built=built,
+        raw = broker._record(pid=dead, verb="intention_set_disposition", intent="reported", built=built,
                              params={"disposition": "agenda"}, tier="T2", fence=broker.capture().fence,
                              issued_at=utc_stamp(n), expires_at=utc_stamp(n + timedelta(minutes=15)))
         db.issue(record_bytes=raw, principal="token:browser:1", idempotency_key="died", now=n, cap_exempt=True)
     good = _refuse_the_log(broker.data_root)
 
     def replay() -> dict[str, Any]:
-        return broker.issue(verb="spore_set_disposition", params={"disposition": "agenda"}, target=tgt, tier="T2",
+        return broker.issue(verb="intention_set_disposition", params={"disposition": "agenda"}, target=tgt, tier="T2",
                             credential=BROWSER, intent="reported", idempotency_key="died")
     err = _refused("authority_unavailable", replay)
     assert err.status == 503
@@ -294,10 +294,10 @@ def _as_v2(data: Path, rows: list[tuple[Any, ...]]) -> None:
     conn.close()
 
 
-def test_a_v2_store_migrates_and_refuses_signed_acts_until_init(home, spores, keydir):
-    b = _broker(home, spores)
+def test_a_v2_store_migrates_and_refuses_signed_acts_until_init(home, intentions, keydir):
+    b = _broker(home, intentions)
     try:
-        waiting = _move(b, spores)["pending_id"]                      # a WAITING pending from before
+        waiting = _move(b, intentions)["pending_id"]                      # a WAITING pending from before
     finally:
         b.stop()
     phone, gone = RealKey(keydir, "phone"), RealKey(keydir, "gone")
@@ -308,7 +308,7 @@ def test_a_v2_store_migrates_and_refuses_signed_acts_until_init(home, spores, ke
     label_rev = sqlite3.connect(home / "data" / "cockpit.db").execute(
         "SELECT value FROM meta WHERE key = 'label_rev'").fetchone()[0]
 
-    b = _broker(home, spores)                                         # the new code's first open
+    b = _broker(home, intentions)                                         # the new code's first open
     try:
         tables = {r[0] for r in _rows(b, "SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"authority_log", "legacy_keys"} <= tables and not {"keys", "policy"} & tables
@@ -321,13 +321,13 @@ def test_a_v2_store_migrates_and_refuses_signed_acts_until_init(home, spores, ke
         assert _rows(b, "SELECT state, reason FROM pendings WHERE pending_id = ?", waiting) == [
             ("STALE", "authority migrated")]
         # the migrated keys authorise nothing: a legacy key's signature is refused, naming init
-        pid, sig = _sign_pending(b, spores, phone, "k.seed2")
+        pid, sig = _sign_pending(b, intentions, phone, "k.seed2")
         assert "ledger init" in str(_refused("not_initialised", b.submit, pid, sig))
         # an initialisation in progress (links appended, the marker still set) still refuses
         laptop = RealKey(keydir, "laptop")
         enrol_any(b.db, laptop, "laptop-presence")
         enrol_any(b.db, phone, "display-phone")
-        pid2, sig2 = _sign_pending(b, spores, phone, "k.loop")
+        pid2, sig2 = _sign_pending(b, intentions, phone, "k.loop")
         assert "ledger init" in str(_refused("not_initialised", b.submit, pid2, sig2))
     finally:
         b.stop()
@@ -358,45 +358,45 @@ def test_enrol_and_revoke_each_move_label_rev(broker, keydir):
     assert rev() == before + 3
 
 
-def test_a_revoked_key_signs_nothing_and_its_compromised_fires_read_revoked(broker, spores, keydir):
+def test_a_revoked_key_signs_nothing_and_its_compromised_fires_read_revoked(broker, intentions, keydir):
     from levain.cockpit.authority import LabelKey
 
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
-    pid, sig = _sign_pending(broker, spores, phone)
+    pid, sig = _sign_pending(broker, intentions, phone)
     assert broker.submit(pid, sig)["label"] == "signed · reported"
-    key = LabelKey("spore:k.seed", {"disposition": "agenda"})
+    key = LabelKey("intention:k.seed", {"disposition": "agenda"})
     assert broker.capture().labels.label(key) == "signed · reported"
     fired_at = broker.capture().authority.seq
     revoke_any(broker.db, phone, compromised_since=fired_at)
     assert broker.capture().labels.label(key) == "signed by a revoked key"
-    pid2, sig2 = _sign_pending(broker, spores, phone, "k.seed2")
+    pid2, sig2 = _sign_pending(broker, intentions, phone, "k.seed2")
     _refused("bad_signature", broker.submit, pid2, sig2)
 
 
-def test_a_compromise_after_the_fire_leaves_its_label(broker, spores, keydir):
+def test_a_compromise_after_the_fire_leaves_its_label(broker, intentions, keydir):
     from levain.cockpit.authority import LabelKey
 
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
-    pid, sig = _sign_pending(broker, spores, phone)
+    pid, sig = _sign_pending(broker, intentions, phone)
     broker.submit(pid, sig)
     Key(keydir, "other").enroll(broker, "presence")                    # the head moves past the fire
     revoke_any(broker.db, phone, compromised_since=broker.capture().authority.seq)
-    assert broker.capture().labels.label(LabelKey("spore:k.seed", {"disposition": "agenda"})) == "signed · reported"
+    assert broker.capture().labels.label(LabelKey("intention:k.seed", {"disposition": "agenda"})) == "signed · reported"
 
 
-def test_an_append_stales_a_waiting_signed_pending(broker, spores, keydir):
+def test_an_append_stales_a_waiting_signed_pending(broker, intentions, keydir):
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
-    pid, sig = _sign_pending(broker, spores, phone)
+    pid, sig = _sign_pending(broker, intentions, phone)
     Key(keydir, "later").enroll(broker, "presence")
     out = broker.submit(pid, sig)
     assert (out["state"], out["reason"]) == ("STALE", "authority changed")
 
 
-def test_one_request_captures_once(broker, spores, keydir, monkeypatch):
+def test_one_request_captures_once(broker, intentions, keydir, monkeypatch):
     from levain.cockpit.authority import RequestAuthority
 
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
-    pid, sig = _sign_pending(broker, spores, phone)
+    pid, sig = _sign_pending(broker, intentions, phone)
     calls = []
     real = RequestAuthority.capture.__func__
 
@@ -410,7 +410,7 @@ def test_one_request_captures_once(broker, spores, keydir, monkeypatch):
 
 # --- L3 r1 (1012+80): the fence's head hash, the migration's lock, the anchor read's order ---------------
 
-def test_a_pending_issued_on_a_replaced_suffix_ends_stale(broker, spores, keydir):
+def test_a_pending_issued_on_a_replaced_suffix_ends_stale(broker, intentions, keydir):
     """F1: a fork after a failed anchor advance puts a second validly signed link at the same seq. A
     pending issued on the first is decided under the second, so its fence must name the head hash."""
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
@@ -421,7 +421,7 @@ def test_a_pending_issued_on_a_replaced_suffix_ends_stale(broker, spores, keydir
                                          "class": "presence", "custody": "unstated"}, signer_fp=root.fingerprint, sign=root.sign_link,
                                   clock=lambda: datetime.now(timezone.utc), anchor=None)
     issued_on = broker.capture().authority
-    pid, sig = _sign_pending(broker, spores, phone)
+    pid, sig = _sign_pending(broker, intentions, phone)
     raw = _raw(broker)
     raw.execute("DELETE FROM authority_log WHERE seq = ?", (issued_on.seq,))
     raw.close()
@@ -444,11 +444,11 @@ def _hold_lock(data: Path) -> subprocess.Popen:
     return p
 
 
-def _a_v2_store(home: Path, spores: Path, keydir: Path) -> str:
+def _a_v2_store(home: Path, intentions: Path, keydir: Path) -> str:
     """A /2 journal (started reported) holding one WAITING pending; its id."""
-    b = _broker(home, spores)
+    b = _broker(home, intentions)
     try:
-        waiting = _move(b, spores)["pending_id"]
+        waiting = _move(b, intentions)["pending_id"]
     finally:
         b.stop()
     phone = RealKey(keydir, "phone")
@@ -468,12 +468,12 @@ def _still_v2(data: Path, waiting: str) -> None:
         conn.close()
 
 
-def test_a_cli_open_of_a_v2_store_under_a_live_server_refuses_and_migrates_nothing(home, spores, keydir, capsys):
+def test_a_cli_open_of_a_v2_store_under_a_live_server_refuses_and_migrates_nothing(home, intentions, keydir, capsys):
     """F2 (a): the one-way migration runs only under ``cockpit.lock``; a server holding it (an old
     ``levain serve`` still running) leaves the store /2 and the command names what to do."""
     from levain import cli
 
-    waiting = _a_v2_store(home, spores, keydir)
+    waiting = _a_v2_store(home, intentions, keydir)
     data = home / "data"
     holder = _hold_lock(data)
     try:
@@ -488,11 +488,11 @@ def test_a_cli_open_of_a_v2_store_under_a_live_server_refuses_and_migrates_nothi
         "SELECT value FROM meta WHERE key = 'format'").fetchone()[0] == STORE_FORMAT
 
 
-def test_keys_on_a_governed_v2_store_refuses_before_migrating(home, spores, keydir, capsys):
+def test_keys_on_a_governed_v2_store_refuses_before_migrating(home, intentions, keydir, capsys):
     """F2 (b): the install-class check comes before any mutation: a governed /2 journal stays /2."""
     from levain import cli
 
-    waiting = _a_v2_store(home, spores, keydir)
+    waiting = _a_v2_store(home, intentions, keydir)
     data = home / "data"
     conn = sqlite3.connect(data / "cockpit.db", isolation_level=None)
     conn.execute("UPDATE meta SET value = 'governed' WHERE key = 'install_class'")

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from levain import germinate as g
 from levain.consent.questions import QuestionStore
-from levain.spores import guarded_spore_store
+from levain.intentions import guarded_intention_store
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture: the consent directory the server reads)
 
@@ -37,11 +37,11 @@ def _post(base: str, path: str, body: dict) -> tuple[int, dict]:
 
 def test_a_list_intention_row_acts_on_the_served_cockpit(tmp_path: Path, qdir) -> None:  # noqa: F811
     root, src, _ids = _install(tmp_path)
-    spores = root / ".levain" / "memory.spores.json"
+    intentions = root / ".levain" / "memory.spores.json"
     today = date.today()
-    sid = guarded_spore_store(spores).add(type="task", text="renew the thing", disposition="agenda",
+    sid = guarded_intention_store(intentions).add(type="task", text="renew the thing", disposition="agenda",
                                           next=(today - timedelta(days=1)).isoformat())["id"]
-    res = g.germinate(spores, qdir, install=root, today=today)
+    res = g.germinate(intentions, qdir, install=root, today=today)
     assert not res["errors"], res
     (q,) = QuestionStore(qdir).open_questions()
     with _serve(src, write_token=TOKEN) as (base, _httpd):
@@ -53,5 +53,5 @@ def test_a_list_intention_row_acts_on_the_served_cockpit(tmp_path: Path, qdir) -
         status, out = _post(base, "/cockpit/verb", {"verb": "intention_done", "panel_id": "tray", "row_id": row["id"],
                                                      "row_version": row["version"], "params": {}})
     assert status == 200, out
-    assert guarded_spore_store(spores).get(sid)["status"] != "open"
+    assert guarded_intention_store(intentions).get(sid)["status"] != "open"
     assert QuestionStore(qdir).get(q.id).answer is not None

@@ -7,7 +7,7 @@ so a seat reads the queue with no desk live; only writes need one.
 
 Three parts:
 
-* :func:`derive` — PURE over the fixture's normalized input shape (``spores``, ``resolved``, ``needs_phill``,
+* :func:`derive` — PURE over the fixture's normalized input shape (``intentions``, ``resolved``, ``needs_phill``,
   ``seats``, ``ci``, ``plan``) plus ``store``, the desk store's current items. It applies SCHEMA sections 2-5:
   the closed category set, a dependency holding a declared-ready item back, needs-you winning, the order, and the
   derived ``well_formed`` / ``independent``. It reads no file and no clock (``generated`` is the caller's).
@@ -31,7 +31,7 @@ a consistent snapshot and needs no desk. No UI and no CLI verb here: those are C
 
 [seat 1028-15 C13] choices the contract does not state: the store's items enter :func:`derive` as the ``store`` input
 with provenance source ``plan`` (SCHEMA section 5: "the desk store once C13 exists"); a store item shadows a
-plan row or spore of the same id; ``status`` equals the category (v1) and the writer takes no separate status; a write
+plan row or intention of the same id; ``status`` equals the category (v1) and the writer takes no separate status; a write
 that changes nothing is refused; an item's repo is fixed at ``add``. Stdlib only.
 
 Known edge (row 156 L3 C5): the current-state read looks up each item's prose hold with its own queries, so a list
@@ -230,7 +230,7 @@ def _int(value: Any) -> int:
 
 
 def _work_item(row: Mapping[str, Any], *, source: str, ref: str, default_repo: str) -> dict:
-    """A writer-owned item (a flow spore's ``work`` object, or a desk store row)."""
+    """A writer-owned item (a flow intention's ``work`` object, or a desk store row)."""
     raw = row.get("category")
     it = _item(id=str(row["id"]), repo=str(row.get("repo") or default_repo), title=row.get("title"),
                declared=_category(raw), status=row.get("status") if raw in CATEGORIES else None,
@@ -287,7 +287,7 @@ def derive_items(sources: Mapping[str, Any]) -> builtins.list:
     """Every item, SCHEMA §§2-5, in the §4 rule 3 order (repo, column, rank, id). Pure: reads only ``sources``.
 
     ``sources`` keys (each optional): ``store`` (desk store rows: id, repo, title, category, status, tier,
-    done_line, depends_on, rank, set_by, set_at, ref), ``spores`` + ``resolved`` (flow), ``plan`` (LANE MENU rows),
+    done_line, depends_on, rank, set_by, set_at, ref), ``intentions`` + ``resolved`` (flow), ``plan`` (LANE MENU rows),
     ``needs_phill`` (open band rows: id, repo, what, stopped), ``seats`` (token, repo, name), ``ci`` (id, repo,
     branch), ``repos`` (known repo names, for a handoff pointer), ``home`` (the home directory, for one)."""
     resolved = {str(r) for r in sources.get("resolved") or ()}

@@ -11,7 +11,7 @@ from tests.test_cockpit_k1 import _install, _status
 
 
 @pytest.mark.parametrize("pid", ["tray", "loops"])
-def test_an_absent_spore_store_never_created_is_empty_not_error(tmp_path: Path, pid: str) -> None:
+def test_an_absent_intention_store_never_created_is_empty_not_error(tmp_path: Path, pid: str) -> None:
     root, src = _install(tmp_path)
     (root / ".levain" / "memory.spores.json").unlink()
     got = _status(build_default_cockpit(src), pid)
@@ -19,7 +19,7 @@ def test_an_absent_spore_store_never_created_is_empty_not_error(tmp_path: Path, 
     assert got["rows"] == [] and "Nothing yet" in got["empty"]
 
 
-def test_a_spore_store_seen_then_gone_is_still_a_fault(tmp_path: Path) -> None:
+def test_a_intention_store_seen_then_gone_is_still_a_fault(tmp_path: Path) -> None:
     root, src = _install(tmp_path)
     ck = build_default_cockpit(src)
     assert _status(ck, "tray")["status"] != "error"

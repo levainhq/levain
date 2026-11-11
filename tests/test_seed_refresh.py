@@ -22,7 +22,7 @@ from levain.install import ADAPTER_RECEIPT_REL, PENDING_REL, _base_seed_files, r
 from levain.packs import SeedEntry
 from tests.test_update_refresh import make_install  # noqa: F401  (fixture)
 
-BASE_SEEDS = ("seed/memory.md", "seed/partnership.md", "seed/spore_instructions.md")
+BASE_SEEDS = ("seed/memory.md", "seed/partnership.md", "seed/intention_instructions.md")
 OLD = b"# Memory\n\nan earlier release's seed text\n"
 
 

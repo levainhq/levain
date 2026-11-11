@@ -171,7 +171,7 @@ class FiringContract(Protocol):
 _FIRING_REGISTRY: dict[str, Callable[..., FiringContract]] = {}
 
 
-# Kinds whose factory serves ONE entity and takes ``entity_dir`` (spore-438). Every other kind is
+# Kinds whose factory serves ONE entity and takes ``entity_dir`` (intention-438). Every other kind is
 # handed no entity, so a zero-arg factory (the stub, a third party's) keeps working when the
 # condenser that rebuilds it carries one.
 _ENTITY_FIRING_KINDS: set[str] = set()
@@ -217,7 +217,7 @@ def build_firing(
 ) -> FiringContract:
     """Rebuild a ``FiringContract`` from its registered kind (used on fork / reload).
 
-    ``entity_dir`` is the per-conversation entity an isolated kind serves (spore-438). It travels as
+    ``entity_dir`` is the per-conversation entity an isolated kind serves (intention-438). It travels as
     serialized DATA on the object being rebuilt (the condenser), so a server holding several
     entities' conversations in one process rebuilds each firing against its OWN store rather than
     whatever the process-global channel last said. It reaches only a kind registered with
@@ -267,7 +267,7 @@ def build_firing(
 # the HOOKED adapters (Claude Code / Codex) inject via their ``UserPromptSubmit`` hook. The
 # OpenHands entity is HOOKLESS (``init --adapter openhands`` lays down NO activation tree — the
 # ``LevainCondenser`` IS its activation, per step 3), so it cannot read that file; this package
-# constant is the ONE per-turn drift-defense surface it has. Spore-296 (package locus,
+# constant is the ONE per-turn drift-defense surface it has. Intention-296 (package locus,
 # 2026-07-10) folds the rich directives in HERE, not into the entity seed: the drift-defense is
 # UNIVERSAL machinery (NOT the identity moat — the seed owns identity), so one canonical set lives
 # in the package and a package upgrade improves every entity at once. The base-lane

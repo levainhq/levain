@@ -1,4 +1,4 @@
-"""The confined shell learns a command's completion and exit status OUT OF BAND (spore-1385).
+"""The confined shell learns a command's completion and exit status OUT OF BAND (intention-1385).
 
 Each command is its own bash process, spawned and reaped by levain; completion is levain's waitpid on
 it and the status is that waitpid status. Nothing the shell prints is parsed for either, so code the
@@ -68,7 +68,7 @@ def _kill_all(pids: list[int]) -> None:
 
 @live
 def test_a_command_cannot_forge_its_completion_or_status_by_reading_the_shells_script(tmp_path):
-    """spore-1385. Under the old model bash read its commands from levain's pipe one byte at a time
+    """intention-1385. Under the old model bash read its commands from levain's pipe one byte at a time
     (fd 255), so a builtin in the command could read the next line, levain's status printf, and run it
     with a status of its choosing while the real command kept running. Here the command reads fd 255,
     rewrites whatever it finds to report 42, and evaluates it; the real status is 5, a second later."""

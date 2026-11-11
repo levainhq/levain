@@ -20,5 +20,5 @@ venv/
 htmlcov/
 .worktrees/
 
-# Local project memory — never tracked (personal-data exposure, spore-1179-class)
+# Local project memory — never tracked (personal-data exposure, intention-1179-class)
 project_memory/

@@ -73,10 +73,10 @@ __all__ = [
 ]
 
 # There is no process-level drive-mode channel. ``$LEVAIN_DRIVE_MODE`` and its widen-refusal guard were
-# retired on 2026-10-02 ("b on levain") once spore-438 moved the mode onto each conversation
+# retired on 2026-10-02 ("b on levain") once intention-438 moved the mode onto each conversation
 # (:class:`levain.firing.binding.ConversationBinding`) and no reader of the env was left anywhere —
 # in levain, flow, anneal-memory, the hub, or any child process (the confined shell and the daemon
-# start from env dicts built from scratch). A process-global mode is the race spore-438 reproduced.
+# start from env dicts built from scratch). A process-global mode is the race intention-438 reproduced.
 
 DriveMode = Literal["interactive", "headless", "unattended"]
 

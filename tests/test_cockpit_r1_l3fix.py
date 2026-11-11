@@ -85,12 +85,12 @@ def _dump(url: str) -> str:
 
 def _bare_install(tmp_path: Path, texts: list[str]):
     from levain.dashboard import SubstrateSource
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
     from tests.test_cockpit_k2a import TODAY
     from tests.test_dashboard import _make_levain_install
 
     root = _make_levain_install(tmp_path)
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     for t in texts:
         store.add(type="task", text=t, disposition="seed", today=TODAY)
     (root / ".levain" / "context.json").write_text(json.dumps(
@@ -106,7 +106,7 @@ def test_the_default_cockpit_in_a_browser_offers_no_rename_and_no_text_edit_on_a
     assert "plain seed" in dom and "&lt;U+200B&gt;" in dom, dom[:400]
     assert 'class="name-edit"' not in dom, "rename is not offered by the kernel"
     assert 'aria-label="add a line to the List"' in dom, "the List has its capture box (the Keep's note box retired with the Keep)"
-    edits = re.findall(r'<button[^>]*data-verb="spore_update"[^>]*>edit</button>', dom)
+    edits = re.findall(r'<button[^>]*data-verb="intention_update"[^>]*>edit</button>', dom)
     locked = [b for b in edits if "hidden characters" in b]
     assert len(edits) == 2 and len(locked) == 1 and "disabled" in locked[0], edits
 

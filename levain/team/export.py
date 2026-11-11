@@ -11,7 +11,7 @@ chain-verified.
 Framing makes per-file structure checkable (one root, one author per file); it is not authentication: the stream is one
 trust unit this exporter vouches for.
 
-Contract v3 (:func:`snapshot`, :func:`export_v3`; seam design ``spore1344_seam_design_1005.md`` §3a items 2-3, strict
+Contract v3 (:func:`snapshot`, :func:`export_v3`; seam design ``intention1344_seam_design_1005.md`` §3a items 2-3, strict
 profile, plus ``prev_root``): ONE CLONE'S COMPLETE VERDICT. A header naming this clone (``key``, clone-local, never
 pushed), the ledger it pinned (``root``, ``prev_root``), its trust state (``epoch``, ``repin_n``) and the published
 position it judged from (``pos``, ``seq``, ``judged``); then one envelope per non-blank line of the tenure CHAIN SET,

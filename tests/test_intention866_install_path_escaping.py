@@ -1,4 +1,4 @@
-"""spore-866, reproduced 2026-10-10 with a real `levain init`: an install path holding `\\`
+"""intention-866, reproduced 2026-10-10 with a real `levain init`: an install path holding `\\`
 or `"` exited 0 and wrote a codex config.toml, a codex hooks.json and a claude-code
 .mcp.json that no longer parsed (the raw path was substituted into string literals); L1 found
 the same in every hook .py's `_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"`, and L2 DEL in TOML. L3 r1:

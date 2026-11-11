@@ -2,7 +2,7 @@
 
 Reproduced through the CLI before any of this existed: an install made by levain
 0.4.6 from PyPI, then this branch's `levain update`, left `doctor` at exit 6 (a stale
-`_levain_hook.py` and a pre-spore-751 `.mcp.json` command); only `init --force`, which
+`_levain_hook.py` and a pre-intention-751 `.mcp.json` command); only `init --force`, which
 re-runs the whole interview, cleared it. These build a REAL install with `run_init`,
 because the refresh decides from real receipts and real template bytes.
 """
@@ -231,7 +231,7 @@ def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path
 
 
 def _codex_r7_shape(shape: str, current: str, tmp_path: Path) -> str:
-    """hooks.json texts from spore-866 L3 r7's findings against the deleted text predicate,
+    """hooks.json texts from intention-866 L3 r7's findings against the deleted text predicate,
     and a legacy install's own render from another interpreter. On 3d6152a the echo,
     symlink and legacy texts were overwritten; nan_constant was already refused there and
     stays as a regression pin."""
@@ -408,7 +408,7 @@ def test_update_on_a_path_that_is_not_an_install_creates_nothing(tmp_path):
 
 
 def _pre_launcher_mcp(install: Path, store: str) -> Path:
-    """.mcp.json as levain 0.4.6 wrote it (before spore-751's launcher), and no record."""
+    """.mcp.json as levain 0.4.6 wrote it (before intention-751's launcher), and no record."""
     mcp = install / ".mcp.json"
     mcp.write_text(json.dumps({"mcpServers": {"anneal_memory": {
         "type": "stdio", "command": "/usr/local/bin/anneal-memory",
@@ -652,7 +652,7 @@ def test_doctor_names_update_for_a_stale_hook_and_carrier_and_update_clears_both
     hook.write_bytes(b"# old hook\n")
     _set_receipt(install, HOOK, b"# old hook\n")
     carrier = install / "CLAUDE.md"
-    stale_text = carrier.read_text() + "\n@seed/spore_instructions.md\n"
+    stale_text = carrier.read_text() + "\n@seed/intention_instructions.md\n"
     carrier.write_text(stale_text)
     receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
     data = json.loads(receipt.read_text())

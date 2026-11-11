@@ -136,7 +136,7 @@ if ! LEVAIN_PUSH_FILE="$push" "$PY" -m pytest "$test_id" -q -rs -p no:cacheprovi
     echo "   A pushed commit is stamped at an already-released version, or its two" >&2
     echo "   stamps disagree. Bump BOTH (pyproject.toml, levain/__init__.py) to the next" >&2
     echo "   .devN — or, if this IS the release commit, make the stamp bump and" >&2
-    echo "   the tag the SAME commit. See spore-710 and CHANGELOG 'Versioning'." >&2
+    echo "   the tag the SAME commit. See intention-710 and CHANGELOG 'Versioning'." >&2
     echo >&2
     echo "   To push anyway: git push --no-verify" >&2
     exit 1

@@ -77,6 +77,7 @@ from levain import unshowable
 from levain.cockpit.consent import ConsentError
 from levain.consent.questions import ANSWER_CHANNELS, Link, Question, QuestionStore, QuestionStoreError
 from levain.desk.legacy import BAND_KEY_DESK_STOPPED
+from levain.intention_legacy import STORE_FILE_NAME
 
 __all__ = ["AGENT_LINE", "ANSWER_TAIL", "KNOW_TAIL", "NO_SESSION", "QUOTED_NOTE", "add_parsers", "answer_line", "ask_resume_meta",
            "deliver_answer", "deliver_answers", "file_question", "know_line", "question_context", "release_held_pings",
@@ -686,31 +687,31 @@ def close_desk_stopped(qdir: Path | str, verb: str) -> list[Question]:
 
 
 def _find_install(start: Path) -> Path | None:
-    """The spore store of the INNERMOST Levain install holding ``start``: the first directory, walking up, with a
+    """The intention store of the INNERMOST Levain install holding ``start``: the first directory, walking up, with a
     ``.levain`` directory (a fresh install has no ``memory.spores.json`` yet; the store creates it)."""
     home = Path.home().resolve()
     for d in (start, *start.parents):
         if d == home:
             continue   # ~/.levain is the user's global config directory, never an install's store
         if (d / ".levain").is_dir():
-            return d / ".levain" / "memory.spores.json"
+            return d / ".levain" / STORE_FILE_NAME
     return None
 
 
 def file_agenda(what: str, blocks: str, on: str, attention: str | None = None, *, start: Path | None = None
                 ) -> tuple[dict[str, Any] | None, str]:
     """``levain ask --on`` / the ``ask`` tool's ``on`` (TS-11): nothing is stopped yet because the date has not come,
-    so NO question is filed: ONE ``agenda`` spore is written in the install holding ``start`` (the current directory,
+    so NO question is filed: ONE ``agenda`` intention is written in the install holding ``start`` (the current directory,
     walking up to the innermost ``.levain`` directory): ``next=on``, ``target`` ``band`` (``nudge`` with
-    ``attention: talk``), ``attention``. ``levain spores germinate`` files it on its date. Returns ``(spore, text)``;
-    the spore is ``None`` when refused, with the reason. ``on`` is ``YYYY-MM-DD`` (after today) or
+    ``attention: talk``), ``attention``. ``levain intentions germinate`` files it on its date. Returns ``(intention, text)``;
+    the intention is ``None`` when refused, with the reason. ``on`` is ``YYYY-MM-DD`` (after today) or
     ``YYYY-MM-DDTHH:MM`` (after now); anneal 1.0.4's store write path takes a timed ``next`` (TS-64), so both shapes are filed."""
     import hashlib
     from datetime import datetime
 
-    from anneal_memory.spores import SporeError
+    from anneal_memory.spores import IntentionError
 
-    from levain.spores import GERMINATE_ATTENTIONS, _parse_when, check_steering, guarded_spore_store, is_timed
+    from levain.intentions import GERMINATE_ATTENTIONS, _parse_when, check_steering, guarded_intention_store, is_timed
 
     def refuse(why: str) -> tuple[None, str]:
         return None, f"levain ask: refused, nothing was filed: {why}"
@@ -726,7 +727,7 @@ def file_agenda(what: str, blocks: str, on: str, attention: str | None = None, *
             return refuse(f"--on {on} is not in the future; if it is stopped now, file the question without --on")
     elif when.date() <= now.date():
         return refuse(f"--on {on} is today or past: an ask whose date has come is a question now, so file it "
-                      "without --on (a spore is for a date that has not come)")
+                      "without --on (an intention is for a date that has not come)")
     if attention is not None and attention not in GERMINATE_ATTENTIONS:
         return refuse(f"attention must be one of {', '.join(GERMINATE_ATTENTIONS)} (got {attention!r})")
     what, blocks = what.strip(), blocks.strip()
@@ -737,24 +738,24 @@ def file_agenda(what: str, blocks: str, on: str, attention: str | None = None, *
     if why:
         return refuse(why)
     here = (start or Path.cwd()).resolve()
-    spores = _find_install(here)
-    if spores is None:
+    intentions = _find_install(here)
+    if intentions is None:
         return refuse(f"no Levain install (.levain directory) at or above {here}: run it from inside the install "
                       "or pass --path")
-    # a retry after a failed save is the same ask: the key is the ask's identity, so the store returns the first spore
-    # and only an EXACT retry: a differing blocks, attention or target is a different ask and files its own spore
-    ident = "\0".join((what, blocks, on, attention or "", target, str(spores)))
+    # a retry after a failed save is the same ask: the key is the ask's identity, so the store returns the first intention
+    # and only an EXACT retry: a differing blocks, attention or target is a different ask and files its own intention
+    ident = "\0".join((what, blocks, on, attention or "", target, str(intentions)))
     origin_key = "ask-on-" + hashlib.sha256(ident.encode()).hexdigest()[:32]
     try:
-        item = guarded_spore_store(spores).add(
+        item = guarded_intention_store(intentions).add(
             type="thought", text=f"{what} (waits on: {blocks})" if blocks else what, disposition="agenda", next=on,
             target=target, origin_key=origin_key, **({} if attention is None else {"attention": attention}))
-    except SporeError as exc:
-        return refuse(f"the spore store {spores} could not be read: {exc}")
+    except IntentionError as exc:
+        return refuse(f"the intention store {intentions} could not be read: {exc}")
     except ValueError as exc:
         return refuse(str(exc))
     except OSError as exc:
-        return refuse(f"the spore store could not be written: {exc}")
+        return refuse(f"the intention store could not be written: {exc}")
     return item, (f"levain ask: filed for {on} as agenda {item['id']} ({target}); it reaches the operator then. "
                   "No question was filed: do not wait for an answer.")
 
@@ -918,7 +919,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     a.add_argument("--remote", default=None, help="With --would-push: the remote URL, as `levain push` takes it.")
     a.add_argument("--branch", default=None, help="With --would-push: the branch, as `levain push` takes it.")
     a.add_argument("--on", default=None, metavar="DATE",
-                   help="Not stopped yet because the date has not come: file NO question; write one agenda spore that "
+                   help="Not stopped yet because the date has not come: file NO question; write one agenda intention that "
                         "reaches the operator on DATE (YYYY-MM-DD after today, or YYYY-MM-DDTHH:MM after now, "
                         "local time, so a time later today works). A question you are stopped on now "
                         "is filed without --on.")

@@ -842,7 +842,7 @@ def test_prompt_for_slot_line_prompt_string_unchanged_for_back_compat():
     assert captured == ["  X: "]
 
 
-# ---------- _prompt_for_slot: :clear / :empty (spore-070) ----------
+# ---------- _prompt_for_slot: :clear / :empty (intention-070) ----------
 
 @pytest.mark.parametrize("style", ["line", "prose", "bullet", "optional-line"])
 @pytest.mark.parametrize("cmd", [":clear", ":empty"])
@@ -1083,7 +1083,7 @@ def test_conduct_interview_return_to_bailed_field_restores_section_context(tmp_p
     assert len(second_headers) >= 2  # first arrival + the re-orient on return
 
 
-# ---------- build_field_plan: the shared field-plan seam (spore-181) ----------
+# ---------- build_field_plan: the shared field-plan seam (intention-181) ----------
 
 def _three_line_spec(tmp_path: Path):
     template = tmp_path / "three.md"

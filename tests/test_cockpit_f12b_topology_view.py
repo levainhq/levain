@@ -19,11 +19,11 @@ MID = {"emulate": {"w": 1200, "h": 900, "dpr": 1}}
 TV = "document.querySelector('#ck-hlens .tv')"
 
 
-def _spore(root: Path) -> None:
+def _intention(root: Path) -> None:
     from datetime import datetime
 
-    from anneal_memory.spores import SporeStore
-    SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="tighten the rounding guard", tier="hot", domain="ledgerline",
+    from anneal_memory.spores import IntentionStore
+    IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="tighten the rounding guard", tier="hot", domain="ledgerline",
                                                             today=datetime.now().astimezone().date())
 
 
@@ -46,7 +46,7 @@ def _value() -> dict:
         "tasks": [task("t-done", "dispatch", "done", label="tally 0.4.0 to PyPI", cost={"usd": 2.1, "tokens": None, "source": "dispatch"},
                        outcomes=[{"label": "0.4.0 published", "at": "2026-10-18T15:00:00Z", "ok": True}]),
                   task("t-run", "dispatch", "running", label="docs refresh", workers=["n2"], cost={"usd": 0.0, "tokens": 5000, "source": "ledger"}),
-                  task("t-stuck", "spore", "stuck", label="constraint step"),
+                  task("t-stuck", "intention", "stuck", label="constraint step"),
                   task("t-fail", "dispatch", "failed", label="guard test", outcomes=[{"label": "guard test failed", "at": "2026-10-19T15:04:00Z", "ok": False}]),
                   task("t-wait", "consent", "waiting", label="git push origin main", waits_on=["consent:abc"], card="consent:abc", workers=["n1", "n3"]),
                   task("t-sign", "dispatch", "waiting", label="release 0.4.1", waits_on=["consent:abc"], card="dispatch:s1", workers=["n1"]),
@@ -73,7 +73,7 @@ def _run(tmp_path, src, steps, first=DESKTOP, until="document.querySelector('#k7
 @needs_browser
 def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     probe = ("JSON.stringify({lens: %s.dataset.lens, recs: %s.querySelectorAll('.tv-wl .tv-rec').length, "
              "strip: [...%s.querySelectorAll('.tv-stat')].map(s => s.dataset.k + '=' + s.textContent.replace(/\\s+/g, ' ')), "
              "cols: %s.querySelectorAll('.tv-col').length, "
@@ -88,7 +88,7 @@ def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, mo
     assert got["recs"] >= 1, got                                                        # the pending consents are records in the left column
     assert not any(t[1] in ("consent", "question") for t in got["tasks"]), got          # ... and not centre cards
     by = {t[1]: t for t in got["tasks"]}
-    assert by["spore"][0] == "open" and by["spore"][2] == "cost not tracked" and by["spore"][3] == [], got   # a spore carries no session: open, never stuck
+    assert by["intention"][0] == "open" and by["intention"][2] == "cost not tracked" and by["intention"][3] == [], got   # an intention carries no session: open, never stuck
     assert any(t[0] != "waiting" and t[1] == "unattached" for t in got["tasks"]), got                              # the codex session: no task, none guessed
     strip = dict(s.split("=", 1) for s in got["strip"])
     # K10 S5 item 2 (67d28166): both live sessions have a readable tool log and no path is shared, so the provider OBSERVED no conflict and
@@ -101,7 +101,7 @@ def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, mo
 def test_a_cold_open_draws_the_header_on_the_agents_graph_lens(tmp_path, monkeypatch):
     """K11: no stored choice -> the header's default lens is the Agents graph, with the three-way switch in its order."""
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     probe = ("JSON.stringify({lens: %s && %s.dataset.lens, hl: document.getElementById('ck-skycard').dataset.hlens, graph: !!%s.querySelector('svg.tv-graph'), "
              "stored: localStorage.getItem('levain_cockpit_header_lens'), "
              "buttons: [...document.querySelectorAll('#ck-hlens .tv-seg-b')].map(b => [b.textContent, b.getAttribute('aria-pressed')])})") % (TV, TV, TV)
@@ -115,7 +115,7 @@ def test_a_cold_open_draws_the_header_on_the_agents_graph_lens(tmp_path, monkeyp
 def test_choosing_the_event_graph_survives_a_reload(tmp_path, monkeypatch):
     """K11: the header's choice is a per-browser view preference: Event graph, reload, still Event graph (the Activity band shown, no topology drawn)."""
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     probe = ("JSON.stringify({hl: document.getElementById('ck-skycard').dataset.hlens, tv: !!%s, "
              "pressed: [...document.querySelectorAll('#ck-hlens .tv-seg [aria-pressed=true]')].map(b => b.textContent), "
              "sky: getComputedStyle(document.getElementById('ck-sky')).display})") % TV
@@ -133,7 +133,7 @@ def test_choosing_the_event_graph_survives_a_reload(tmp_path, monkeypatch):
 def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_path, monkeypatch):
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain_home"))
     _root, src, _ids = _install(tmp_path)
-    src.anneal.spores_json.unlink(missing_ok=True)                  # K10: an open loop is work, so "bare" means no loop either
+    src.anneal.intentions_json.unlink(missing_ok=True)                  # K10: an open loop is work, so "bare" means no loop either
     probe = ("JSON.stringify({tv: !!%s, switch: document.querySelectorAll('#ck-hlens [data-tv]').length, "
              "quiet: !!document.querySelector('#ck-hlens .tv-quiet'), text: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' ')})") % TV
     out = _run(tmp_path, src, [{"eval": probe}], until="document.querySelector('#k7-sessions .k7-none')")   # a bare install draws no card and no .tv: its one line is the signal
@@ -253,12 +253,12 @@ def test_the_header_strip_counts_and_a_conflict_lists_its_file_and_both_sessions
 def test_what_the_provider_could_not_read_is_one_quiet_line_never_hidden(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     v = _value()
-    v["errors"] = ["dispatch: no consent directory is attached, so no dispatch store to read", "spores: no spore store is attached"]
-    v["unreadable"] = ["dispatch", "spores"]
+    v["errors"] = ["dispatch: no consent directory is attached, so no dispatch store to read", "intentions: no intention store is attached"]
+    v["unreadable"] = ["dispatch", "intentions"]
     probe = "JSON.stringify([...%s.querySelectorAll('.tv-quiet')].map(q => q.textContent))" % TV
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])
     lines = json.loads(out[-1])
-    assert len(lines) == 1 and "dispatch: no consent directory" in lines[0] and "spores: no spore store" in lines[0], lines
+    assert len(lines) == 1 and "dispatch: no consent directory" in lines[0] and "intentions: no intention store" in lines[0], lines
 
 
 @needs_browser
@@ -280,7 +280,7 @@ def test_no_horizontal_scroll_at_1440_and_at_390_in_either_lens(tmp_path, monkey
 @needs_browser
 def test_a_long_group_shows_its_first_four_and_one_button_for_the_rest(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     v = _value()
     base = v["tasks"][2]
     v["tasks"] += [{**base, "id": f"t-more-{i}", "label": f"loop {i}"} for i in range(5)]          # six stuck in all
@@ -305,7 +305,7 @@ def test_a_transcript_cost_reads_as_tokens_from_transcripts_never_a_price(tmp_pa
 
 def _work_value() -> dict:
     v = _value()
-    v["tasks"] += [{"id": "spore:spore-017", "kind": "spore", "label": "tighten the rounding guard", "state": "open", "waits_on": [], "card": None,
+    v["tasks"] += [{"id": "intention:intention-017", "kind": "intention", "label": "tighten the rounding guard", "state": "open", "waits_on": [], "card": None,
                     "outcomes": [], "cost": {"usd": None, "tokens": None, "source": None}, "workers": ["n2"], "opened": None, "age_days": 3, "heat": "hot"}]
     return v
 
@@ -318,8 +318,8 @@ def _paint_with(value: dict, page: bool, loop: bool) -> str:
             "h.replaceChildren(window.LevainTopologyView.render(%s, %s)); return 1; })()") % (stub, json.dumps(value), opts)
 
 
-CHIP = TV + ".querySelector('.tv-task[data-task=\"spore:spore-017\"] .tv-chip')"
-LOOP = TV + ".querySelector('.tv-task[data-task=\"spore:spore-017\"]')"
+CHIP = TV + ".querySelector('.tv-task[data-task=\"intention:intention-017\"] .tv-chip')"
+LOOP = TV + ".querySelector('.tv-task[data-task=\"intention:intention-017\"]')"
 LOOP_TITLE = LOOP + ".querySelector('.tv-task-t')"
 KEY = "new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true})"
 
@@ -346,21 +346,21 @@ def test_without_the_agent_page_a_chip_stays_a_plain_span(tmp_path, monkeypatch)
 
 
 @needs_browser
-def test_an_open_loop_card_calls_open_loop_with_its_spore_id_by_click_and_by_key(tmp_path, monkeypatch):
+def test_an_open_loop_card_calls_open_loop_with_its_intention_id_by_click_and_by_key(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     probe = "JSON.stringify({role: %s.getAttribute('role'), tab: %s.tabIndex, title: %s.getAttribute('role'), loop: window.__loop})" % (LOOP, LOOP, LOOP_TITLE)
     out = _run(tmp_path, src, [{"eval": _paint_with(_work_value(), True, True)}, {"eval": LOOP + ".click(); 1"}, {"eval": probe},
                                {"eval": "window.__loop = null; " + LOOP_TITLE + ".dispatchEvent(" + KEY + "); 1"}, {"eval": "window.__loop"}])
     # the card is not itself a button (its chips would sit inside one): its title is the control
-    assert json.loads(out[-3]) == {"role": None, "tab": -1, "title": "button", "loop": "spore-017"}, out
-    assert out[-1] == "spore-017", out
+    assert json.loads(out[-3]) == {"role": None, "tab": -1, "title": "button", "loop": "intention-017"}, out
+    assert out[-1] == "intention-017", out
 
 
 @needs_browser
 def test_an_open_loop_card_is_inert_when_the_page_passes_no_open_loop(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     probe = ("JSON.stringify({role: %s.getAttribute('role'), open: %s.classList.contains('tv-open'), "
-             "any: !!%s.querySelector('.tv-task[data-kind=spore].tv-open')})") % (LOOP, LOOP, TV)
+             "any: !!%s.querySelector('.tv-task[data-kind=intention].tv-open')})") % (LOOP, LOOP, TV)
     out = _run(tmp_path, src, [{"eval": _paint_with(_work_value(), True, False)}, {"eval": LOOP + ".click(); 1"}, {"eval": probe}, {"eval": "window.__loop"}])
     assert json.loads(out[-2]) == {"role": None, "open": False, "any": False}, out
     assert out[-1] is None, out
@@ -377,55 +377,55 @@ def test_a_waiting_card_still_opens_its_needs_you_card_and_the_loop_card_does_no
 
 @needs_browser
 def test_the_work_lens_open_loop_scrolls_to_and_lights_the_row_in_open_loops(tmp_path, monkeypatch):
-    """Through the real page: the Work lens's loop card lights the row carrying that spore's data-spore in the Open loops panel."""
+    """Through the real page: the Work lens's loop card lights the row carrying that intention's data-intention in the Open loops panel."""
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
-    row = "document.querySelector('[data-ck-panel=\"loops\"] .row[data-spore]')"
+    _intention(root)
+    row = "document.querySelector('[data-ck-panel=\"loops\"] .row[data-intention]')"
     out = _run(tmp_path, src, [
         {"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
-        {"until": TV + " && " + TV + ".querySelector('.tv-task[data-kind=spore].tv-open')"},
+        {"until": TV + " && " + TV + ".querySelector('.tv-task[data-kind=intention].tv-open')"},
         {"until": row},
-        {"eval": "JSON.stringify({spore: " + row + ".dataset.spore, lit: " + row + ".classList.contains('tv-lit'), "
-                 "card: " + TV + ".querySelector('.tv-task[data-kind=spore]').dataset.loop})"},
-        {"eval": TV + ".querySelector('.tv-task[data-kind=spore]').click(); 1"},
+        {"eval": "JSON.stringify({intention: " + row + ".dataset.intention, lit: " + row + ".classList.contains('tv-lit'), "
+                 "card: " + TV + ".querySelector('.tv-task[data-kind=intention]').dataset.loop})"},
+        {"eval": TV + ".querySelector('.tv-task[data-kind=intention]').click(); 1"},
         {"until": row + ".classList.contains('tv-lit')"},
-        {"eval": "JSON.stringify([" + row + ".dataset.spore, " + row + ".classList.contains('tv-lit')])"}])
+        {"eval": "JSON.stringify([" + row + ".dataset.intention, " + row + ".classList.contains('tv-lit')])"}])
     before = json.loads(out[-4])
-    assert before["lit"] is False and before["spore"] and before["card"] == before["spore"], before
+    assert before["lit"] is False and before["intention"] and before["card"] == before["intention"], before
     assert "timeout" not in json.dumps(out[-2]), out
-    assert json.loads(out[-1]) == [before["spore"], True], out
+    assert json.loads(out[-1]) == [before["intention"], True], out
 
 
 # --- the jump to an open loop: find before moving, unfold through the panel's own paths, land on the row --------------------
 
 
-def _spores(root: Path, n: int) -> None:
+def _intentions(root: Path, n: int) -> None:
     from datetime import datetime
 
-    from anneal_memory.spores import SporeStore
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    from anneal_memory.spores import IntentionStore
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     for i in range(n):
         store.add(type="task", text=f"loop number {i} about the ledger rounding guard", tier="hot", domain="ledgerline", today=datetime.now().astimezone().date())
 
 
-PAGE_ROW = "document.querySelector('[data-ck-panel=\"loops\"]:not(.modal *) .row[data-spore]')"
+PAGE_ROW = "document.querySelector('[data-ck-panel=\"loops\"]:not(.modal *) .row[data-intention]')"
 LOOPS = "document.querySelector('[data-ck-panel=\"loops\"]')"
-CARD = TV + ".querySelector('.tv-task[data-kind=spore]')"
+CARD = TV + ".querySelector('.tv-task[data-kind=intention]')"
 
 
 def _to_work(tmp_path, src, steps, first=DESKTOP):
     ready = [{"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
-             {"until": TV + " && " + TV + ".querySelector('.tv-task[data-kind=spore].tv-open')"}, {"until": PAGE_ROW}]
+             {"until": TV + " && " + TV + ".querySelector('.tv-task[data-kind=intention].tv-open')"}, {"until": PAGE_ROW}]
     return _run(tmp_path, src, ready + steps, first)[len(ready) + 1:]
 
 
 @needs_browser
 def test_a_collapsed_loops_card_is_expanded_through_its_own_control_and_the_row_lit(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     out = _to_work(tmp_path, src, [
         {"eval": LOOPS + ".querySelector('.ck-lay-fold').click(); " + LOOPS + ".classList.contains('ck-collapsed')"},
-        {"eval": "JSON.stringify([window.LevainLoops.go(" + PAGE_ROW + ".dataset.spore), " + LOOPS + ".classList.contains('ck-collapsed'), "
+        {"eval": "JSON.stringify([window.LevainLoops.go(" + PAGE_ROW + ".dataset.intention), " + LOOPS + ".classList.contains('ck-collapsed'), "
                  + PAGE_ROW + ".classList.contains('tv-lit'), !!" + PAGE_ROW + ".getClientRects().length])"}])
     assert out[0] is True, out
     assert json.loads(out[1]) == [True, False, True, True], out
@@ -434,12 +434,12 @@ def test_a_collapsed_loops_card_is_expanded_through_its_own_control_and_the_row_
 @needs_browser
 def test_a_card_that_will_not_unfold_lights_nothing_and_says_false(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     # ONE synchronous eval: the fold click schedules a 60 ms ckRefreshAll, whose layoutControls re-enables the button; disabling it in
     # a later step let a loaded runner's refresh undo it (CI flake), so disable and go() share one task, before any refresh can run.
     out = _to_work(tmp_path, src, [
         {"eval": LOOPS + ".querySelector('.ck-lay-fold').click(); " + LOOPS + ".querySelector('.ck-lay-fold').disabled = true; "
-                 "JSON.stringify([window.LevainLoops.go(" + PAGE_ROW + ".dataset.spore), " + LOOPS + ".classList.contains('ck-collapsed'), "
+                 "JSON.stringify([window.LevainLoops.go(" + PAGE_ROW + ".dataset.intention), " + LOOPS + ".classList.contains('ck-collapsed'), "
                  + PAGE_ROW + ".classList.contains('tv-lit')])"}])
     assert json.loads(out[0]) == [False, True, False], out
 
@@ -447,15 +447,15 @@ def test_a_card_that_will_not_unfold_lights_nothing_and_says_false(tmp_path, mon
 @needs_browser
 def test_a_folded_row_is_shown_through_the_folds_own_pin_with_its_heading_and_the_count_right(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spores(root, 40)
-    rows = LOOPS + ".querySelectorAll('.row[data-spore]')"
+    _intentions(root, 40)
+    rows = LOOPS + ".querySelectorAll('.row[data-intention]')"
     probe = ("(() => { const hid = [...%s].filter(r => r.dataset.folded); const t = hid[hid.length - 1]; if (!t) return null; "
-             "window.__t = t.dataset.spore; return [hid.length, (%s.querySelector('.more-foot') || {}).textContent]; })()") % (rows, LOOPS)
+             "window.__t = t.dataset.intention; return [hid.length, (%s.querySelector('.more-foot') || {}).textContent]; })()") % (rows, LOOPS)
     out = _to_work(tmp_path, src, [
         {"until": probe},
-        {"eval": "JSON.stringify([window.LevainLoops.go(window.__t), [...%s].find(r => r.dataset.spore === window.__t).classList.contains('tv-lit'), "
-                 "!![...%s].find(r => r.dataset.spore === window.__t).getClientRects().length, [...%s].filter(r => r.dataset.folded).length, "
-                 "(%s.querySelector('.more-foot') || {}).textContent, [...%s].filter(r => r.dataset.spore === window.__t)[0].classList.contains('row-expanded')])"
+        {"eval": "JSON.stringify([window.LevainLoops.go(window.__t), [...%s].find(r => r.dataset.intention === window.__t).classList.contains('tv-lit'), "
+                 "!![...%s].find(r => r.dataset.intention === window.__t).getClientRects().length, [...%s].filter(r => r.dataset.folded).length, "
+                 "(%s.querySelector('.more-foot') || {}).textContent, [...%s].filter(r => r.dataset.intention === window.__t)[0].classList.contains('row-expanded')])"
                  % (rows, rows, rows, LOOPS, rows)}])
     first = json.loads(out[0]) if isinstance(out[0], str) else out[0]
     after = json.loads(out[1])
@@ -467,13 +467,13 @@ def test_a_folded_row_is_shown_through_the_folds_own_pin_with_its_heading_and_th
 @needs_browser
 def test_a_filter_that_hides_the_row_is_cleared_through_the_bar_and_the_row_lit(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     inp = LOOPS + ".querySelector('.ep-search-input')"
     out = _to_work(tmp_path, src, [
-        {"eval": "window.__id = " + PAGE_ROW + ".dataset.spore; " + inp + ".value = 'zzz-no-such'; " + inp + ".dispatchEvent(new Event('input', {bubbles: true})); " + "!!" + PAGE_ROW},
+        {"eval": "window.__id = " + PAGE_ROW + ".dataset.intention; " + inp + ".value = 'zzz-no-such'; " + inp + ".dispatchEvent(new Event('input', {bubbles: true})); " + "!!" + PAGE_ROW},
         {"eval": "JSON.stringify([window.LevainLoops.go(window.__id), " + inp + ".value, " + PAGE_ROW + ".classList.contains('tv-lit')])"},
         # a query that matches nothing and a row that is not there: the person's query stays
-        {"eval": inp + ".value = 'keep me'; " + inp + ".dispatchEvent(new Event('input', {bubbles: true})); JSON.stringify([!!window.LevainLoops.find('spore-nope'), " + inp + ".value])"}])
+        {"eval": inp + ".value = 'keep me'; " + inp + ".dispatchEvent(new Event('input', {bubbles: true})); JSON.stringify([!!window.LevainLoops.find('intention-nope'), " + inp + ".value])"}])
     assert out[0] is False, out                       # the filter hid the row
     assert json.loads(out[1]) == [True, "", True], out
     assert json.loads(out[2]) == [False, "keep me"], out
@@ -482,17 +482,17 @@ def test_a_filter_that_hides_the_row_is_cleared_through_the_bar_and_the_row_lit(
 @needs_browser
 def test_an_absent_row_moves_nothing_and_the_card_says_so(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     out = _to_work(tmp_path, src, [
         {"eval": "window.__mode = document.body.dataset.mode; " + PAGE_ROW + ".remove(); " + CARD + ".click(); "
-                 "JSON.stringify([document.body.dataset.mode === window.__mode, " + CARD + ".title, !!document.querySelector('.tv-lit[data-spore]')])"}])
+                 "JSON.stringify([document.body.dataset.mode === window.__mode, " + CARD + ".title, !!document.querySelector('.tv-lit[data-intention]')])"}])
     assert json.loads(out[0]) == [True, "not in Open loops now", False], out
 
 
 @needs_browser
 def test_a_second_tap_keeps_the_full_highlight_and_focus_lands_on_the_row(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     wait = "new Promise(r => setTimeout(r, %d))"
     out = _to_work(tmp_path, src, [
         {"eval": "(async () => { " + CARD + ".click(); await " + wait % 1300 + "; " + CARD + ".click(); await " + wait % 1400 + "; "
@@ -505,7 +505,7 @@ def test_a_second_tap_keeps_the_full_highlight_and_focus_lands_on_the_row(tmp_pa
 @needs_browser
 def test_enter_on_the_loop_title_opens_it_and_a_chip_tap_does_not_open_the_loop(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     out = _to_work(tmp_path, src, [
         {"eval": CARD + ".querySelector('.tv-task-t').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true})); "
                  + PAGE_ROW + ".classList.contains('tv-lit')"},
@@ -533,9 +533,9 @@ def test_focus_returns_to_the_live_chip_when_the_agent_page_closes_after_a_repai
 @needs_browser
 def test_a_card_carrying_the_loops_panel_id_does_not_steal_the_jump(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     out = _to_work(tmp_path, src, [
-        {"eval": "window.__id = " + PAGE_ROW + ".dataset.spore; const c = document.createElement('div'); c.className = 'ck-card w'; "
+        {"eval": "window.__id = " + PAGE_ROW + ".dataset.intention; const c = document.createElement('div'); c.className = 'ck-card w'; "
                  "c.setAttribute('data-ck-panel', 'loops'); document.body.insertBefore(c, document.body.firstChild); "
                  "JSON.stringify([window.LevainLoops.go(window.__id), " + PAGE_ROW + ".classList.contains('tv-lit')])"}])
     assert json.loads(out[0]) == [True, True], out
@@ -544,9 +544,9 @@ def test_a_card_carrying_the_loops_panel_id_does_not_steal_the_jump(tmp_path, mo
 @needs_browser
 def test_a_rows_own_tabindex_is_kept_and_a_temporary_one_is_removed_on_blur(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     out = _to_work(tmp_path, src, [
-        {"eval": "window.__id = " + PAGE_ROW + ".dataset.spore; " + PAGE_ROW + ".tabIndex = 0; window.LevainLoops.go(window.__id); " + PAGE_ROW + ".tabIndex"},
+        {"eval": "window.__id = " + PAGE_ROW + ".dataset.intention; " + PAGE_ROW + ".tabIndex = 0; window.LevainLoops.go(window.__id); " + PAGE_ROW + ".tabIndex"},
         {"eval": "(async () => { const wait = () => new Promise(r => setTimeout(r, 120)); const r = " + PAGE_ROW + "; r.blur(); await wait(); r.removeAttribute('tabindex'); await wait(); "
                  "window.LevainLoops.go(window.__id); const during = r.getAttribute('tabindex'); const was = document.activeElement === r; r.dispatchEvent(new FocusEvent('blur')); await wait(); "
                  "return JSON.stringify([during, r.getAttribute('tabindex'), was]); })()"}])
@@ -557,10 +557,10 @@ def test_a_rows_own_tabindex_is_kept_and_a_temporary_one_is_removed_on_blur(tmp_
 @needs_browser
 def test_a_filter_is_put_back_when_the_jump_fails_after_clearing_it(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     inp = LOOPS + ".querySelector('.ep-search-input')"
     out = _to_work(tmp_path, src, [
-        {"eval": "window.__id = " + PAGE_ROW + ".dataset.spore; " + LOOPS + ".style.display = 'none'; "   # a panel that cannot show the row once found
+        {"eval": "window.__id = " + PAGE_ROW + ".dataset.intention; " + LOOPS + ".style.display = 'none'; "   # a panel that cannot show the row once found
                  + inp + ".value = 'zzz-no-such'; " + inp + ".dispatchEvent(new Event('input', {bubbles: true})); 1"},
         {"eval": "JSON.stringify([window.LevainLoops.go(window.__id), " + inp + ".value])"}])
     assert json.loads(out[1]) == [False, "zzz-no-such"], out
@@ -569,7 +569,7 @@ def test_a_filter_is_put_back_when_the_jump_fails_after_clearing_it(tmp_path, mo
 @needs_browser
 def test_the_card_says_the_edit_reason_only_for_the_edit_refusal(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     out = _to_work(tmp_path, src, [
         {"eval": LOOPS + ".querySelector('.ck-lay-fold').click(); " + LOOPS + ".querySelector('.ck-lay-fold').disabled = true; " + CARD + ".click(); " + CARD + ".title"},
         {"eval": LOOPS + ".querySelector('.ck-lay-fold').disabled = false; " + LOOPS + ".querySelector('.ck-lay-fold').click(); "
@@ -582,26 +582,26 @@ def test_the_card_says_the_edit_reason_only_for_the_edit_refusal(tmp_path, monke
 @needs_browser
 def test_a_card_inside_a_button_still_opens_and_the_chip_returns_to_its_own_card(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    spore_chip = TV + ".querySelector('.tv-task[data-task=\"spore:spore-017\"] .tv-chip')"
+    intention_chip = TV + ".querySelector('.tv-task[data-task=\"intention:intention-017\"] .tv-chip')"
     out = _run(tmp_path, src, [
         {"eval": "window.LevainAgentPage = {open: (n) => { window.__pg = n.id; }}; " + _paint_with(_work_value(), True, True)},
         {"eval": "const h = document.getElementById('ck-hlens'); const b = document.createElement('div'); b.setAttribute('role', 'button'); "
                  "while (h.firstChild) b.appendChild(h.firstChild); h.appendChild(b); " + LOOP + ".click(); window.__loop"},
     ])
-    assert out[-1] == "spore-017", out
+    assert out[-1] == "intention-017", out
     # the focus return: one worker on two cards, the later card's chip opened the page, a repaint replaced both
     out = _run(tmp_path, src, [
-        {"eval": _paint(_work_value())}, {"eval": "window.__old = " + spore_chip + "; window.__old.click(); 1"},
+        {"eval": _paint(_work_value())}, {"eval": "window.__old = " + intention_chip + "; window.__old.click(); 1"},
         {"until": "document.querySelector('.agent-page')"},
         {"eval": _paint(_work_value())},
         {"eval": "(document.getElementById('levain-modal') || document).dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); "
-                 "JSON.stringify([document.body.contains(window.__old), document.activeElement === " + spore_chip + "])"},
+                 "JSON.stringify([document.body.contains(window.__old), document.activeElement === " + intention_chip + "])"},
         {"eval": "document.querySelector('.agent-page') ? 1 : 0"},
     ])
     assert json.loads(out[-2]) == [False, True], out
     # and when that exact card is gone the focus goes to nothing, not to the other card's chip
     out = _run(tmp_path, src, [
-        {"eval": _paint(_work_value())}, {"eval": "window.__old = " + spore_chip + "; window.__old.click(); 1"},
+        {"eval": _paint(_work_value())}, {"eval": "window.__old = " + intention_chip + "; window.__old.click(); 1"},
         {"until": "document.querySelector('.agent-page')"},
         {"eval": _paint(_value())},
         {"eval": "(document.getElementById('levain-modal') || document).dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); "

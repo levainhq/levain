@@ -24,8 +24,8 @@ def make_record(*, intent: str = "reported", text: str = "new", n_effects: int =
                 ttl: timedelta = timedelta(hours=1), effects: list | None = None) -> tuple[str, bytes]:
     pid = new_pending_id()
     rec = build_record(
-        operation_id=pid, verb="spore_update", intent=intent,  # type: ignore[arg-type]
-        target={"kind": "row", "panel_id": "loops", "origin_key": "ok-0", "row_id": "spore-1",
+        operation_id=pid, verb="intention_update", intent=intent,  # type: ignore[arg-type]
+        target={"kind": "row", "panel_id": "loops", "origin_key": "ok-0", "row_id": "intention-1",
                 "expected_version": 3},
         params={"text": text}, effects=effects or [effect(i, text) for i in range(n_effects)],
         tier="T2", fence=authority_fence(None), issued_at=utc_stamp(T0), expires_at=utc_stamp(T0 + ttl))

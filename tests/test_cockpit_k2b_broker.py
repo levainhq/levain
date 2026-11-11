@@ -1,7 +1,7 @@
-"""K2b-1 broker (design §3, §4.2, §6, §10 item 1): the reported spore DONE lines against real anneal
-SporeStores and real ssh-keygen keys, in throwaway directories under the home directory (a signers
+"""K2b-1 broker (design §3, §4.2, §6, §10 item 1): the reported intention DONE lines against real anneal
+IntentionStores and real ssh-keygen keys, in throwaway directories under the home directory (a signers
 file is a trust anchor, and a world-writable ancestor such as /tmp is refused). The one allowed mock
-is statfs, for the network-filesystem refusal. A fault is injected by wrapping the real spore
+is statfs, for the network-filesystem refusal. A fault is injected by wrapping the real intention
 adapter, never by mocking anneal."""
 
 from __future__ import annotations
@@ -16,13 +16,13 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain.autonomic.confirm import NOT_VERIFIED, UNAVAILABLE, VERIFIED, verify_cockpit_signature
 from levain.cockpit import install
 from levain.cockpit.broker import STANDBY_FAULT, Broker, BrokerError, Lifecycle, label_class
 from levain.cockpit.consent import value_sha256
-from levain.cockpit.effects import SporeEffectStore, TransientApplyFault
+from levain.cockpit.effects import IntentionEffectStore, TransientApplyFault
 from levain.cockpit.results import Fault
 from tests.cockpit_authority_rig import RealKey, enrol_any, revoke_any
 
@@ -42,43 +42,43 @@ def home() -> Iterator[Path]:
 
 
 @pytest.fixture
-def spores(home: Path) -> Path:
+def intentions(home: Path) -> Path:
     p = home / "spores.json"
-    st = SporeStore(p)
+    st = IntentionStore(p, id_prefix="intention")
     st.add(type="task", text="a loop", origin_key="k.loop")
     st.add(type="thought", text="a tray seed", disposition="seed", origin_key="k.seed")
     st.add(type="thought", text="another seed", disposition="seed", origin_key="k.seed2")
     return p
 
 
-def _broker(home: Path, spores: Path, store: Any = None, **kw: Any) -> Broker:
+def _broker(home: Path, intentions: Path, store: Any = None, **kw: Any) -> Broker:
     kw.setdefault("install_class", "reported")
-    b = Broker(home / "data", stores={"spores": store or SporeEffectStore(spores)},
-               store_paths=[spores], **kw)
+    b = Broker(home / "data", stores={"intentions": store or IntentionEffectStore(intentions)},
+               store_paths=[intentions], **kw)
     b.start()
     return b
 
 
 @pytest.fixture
-def broker(home: Path, spores: Path) -> Iterator[Broker]:
-    b = _broker(home, spores)
+def broker(home: Path, intentions: Path) -> Iterator[Broker]:
+    b = _broker(home, intentions)
     try:
         yield b
     finally:
         b.stop()
 
 
-def _target(spores: Path, key: str) -> dict[str, Any]:
-    row = SporeStore(spores).get_by_origin_key(key)
+def _target(intentions: Path, key: str) -> dict[str, Any]:
+    row = IntentionStore(intentions, id_prefix="intention").get_by_origin_key(key)
     assert row is not None
-    version = SporeEffectStore(spores).snapshot(f"spore:{key}").version
-    return {"kind": "row", "panel_id": "tray", "row_id": f"spore:{row['id']}", "row_version": version}
+    version = IntentionEffectStore(intentions).snapshot(f"intention:{key}").version
+    return {"kind": "row", "panel_id": "tray", "row_id": f"intention:{row['id']}", "row_version": version}
 
 
-def _move(b: Broker, spores: Path, key: str = "k.seed", *, cred: dict = BROWSER, **kw: Any) -> dict:
+def _move(b: Broker, intentions: Path, key: str = "k.seed", *, cred: dict = BROWSER, **kw: Any) -> dict:
     kw.setdefault("tier", "T2")
-    return b.issue(verb="spore_set_disposition", params={"disposition": "agenda"},
-                   target=_target(spores, key), credential=cred, **kw)
+    return b.issue(verb="intention_set_disposition", params={"disposition": "agenda"},
+                   target=_target(intentions, key), credential=cred, **kw)
 
 
 def _refused(code: str, fn: Any, *a: Any, **kw: Any) -> BrokerError:
@@ -96,8 +96,8 @@ def _rows(b: Broker, sql: str, *args: Any) -> list[tuple]:
         conn.close()
 
 
-def _disposition(spores: Path, key: str) -> str | None:
-    row = SporeStore(spores).get_by_origin_key(key)
+def _disposition(intentions: Path, key: str) -> str | None:
+    row = IntentionStore(intentions, id_prefix="intention").get_by_origin_key(key)
     assert row is not None
     return row.get("disposition")
 
@@ -145,40 +145,40 @@ def keydir(home: Path) -> Path:
 
 # --- DONE: a T2 on the token fires as ALLOWED-REPORTED and reads `claims cockpit token` ----------------
 
-def test_a_t2_on_the_token_fires_allowed_reported_and_reads_claims_cockpit_token(broker, spores):
-    out = _move(broker, spores, intent="reported")
+def test_a_t2_on_the_token_fires_allowed_reported_and_reads_claims_cockpit_token(broker, intentions):
+    out = _move(broker, intentions, intent="reported")
     assert (out["state"], out["decision_kind"], out["label"]) == ("COMMITTED", "ALLOWED_REPORTED",
                                                                   "claims cockpit token")
-    assert _disposition(spores, "k.seed") == "agenda"
-    assert _label(broker, "spore:k.seed", "disposition", "agenda") == "claims cockpit token"
+    assert _disposition(intentions, "k.seed") == "agenda"
+    assert _label(broker, "intention:k.seed", "disposition", "agenda") == "claims cockpit token"
     # the fire is journalled: no fire without a pending (a handler fired directly fails this line)
     assert _rows(broker, "SELECT verb, intent, state FROM pendings") == [
-        ("spore_set_disposition", "reported", "COMMITTED")]
+        ("intention_set_disposition", "reported", "COMMITTED")]
     # a later value written outside the broker is unlabelled
-    SporeStore(spores).update(SporeStore(spores).get_by_origin_key("k.seed")["id"], disposition="seed")
-    assert _label(broker, "spore:k.seed", "disposition", "seed") == "unverified"
+    IntentionStore(intentions, id_prefix="intention").update(IntentionStore(intentions, id_prefix="intention").get_by_origin_key("k.seed")["id"], disposition="seed")
+    assert _label(broker, "intention:k.seed", "disposition", "seed") == "unverified"
 
 
-def test_a_seed_created_on_the_token_is_journalled_with_its_native_id(broker, spores):
-    out = broker.issue(verb="spore_seed", params={"text": "captured", "type": "task"},
+def test_a_seed_created_on_the_token_is_journalled_with_its_native_id(broker, intentions):
+    out = broker.issue(verb="intention_seed", params={"text": "captured", "type": "task"},
                        target={"kind": "create", "panel_id": "tray"}, tier="T2", credential=BROWSER,
                        intent="reported")
     assert out["state"] == "COMMITTED"
     key = "ck." + out["pending_id"][2:] + ".0"
-    row = SporeStore(spores).get_by_origin_key(key)
+    row = IntentionStore(intentions, id_prefix="intention").get_by_origin_key(key)
     assert row is not None and row["text"] == "captured"
     assert _rows(broker, "SELECT native_id, status FROM effects") == [(row["id"], "APPLIED")]
-    assert _label(broker, f"spore:{key}", "text", "captured") == "claims cockpit token"
+    assert _label(broker, f"intention:{key}", "text", "captured") == "claims cockpit token"
 
 
 # --- DONE: sign returns a pending that fires only on a valid signature; a bad one spends nothing ------
 
-def test_sign_returns_a_pending_that_fires_only_on_a_valid_signature(broker, spores, keydir):
+def test_sign_returns_a_pending_that_fires_only_on_a_valid_signature(broker, intentions, keydir):
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
     stranger = Key(keydir, "stranger")
-    out = _move(broker, spores, intent="sign")
+    out = _move(broker, intentions, intent="sign")
     pid = out["pending_id"]
-    assert out["state"] == "WAITING" and _disposition(spores, "k.seed") == "seed"
+    assert out["state"] == "WAITING" and _disposition(intentions, "k.seed") == "seed"
     record = out["record"].encode()
 
     # a bad signature leaves WAITING and spends nothing: not enrolled, the wrong namespace, other bytes
@@ -186,105 +186,105 @@ def test_sign_returns_a_pending_that_fires_only_on_a_valid_signature(broker, spo
                 "not a signature"):
         _refused("bad_signature", broker.submit, pid, bad)
         assert _rows(broker, "SELECT state, signature, decided_at FROM pendings") == [("WAITING", None, None)]
-        assert _disposition(spores, "k.seed") == "seed"
+        assert _disposition(intentions, "k.seed") == "seed"
 
     done = broker.submit(pid, phone.sign(record))
     assert (done["state"], done["decision_kind"], done["label"]) == ("COMMITTED", "ALLOWED", "signed · reported")
-    assert _disposition(spores, "k.seed") == "agenda"
+    assert _disposition(intentions, "k.seed") == "agenda"
     assert _rows(broker, "SELECT signer_fp FROM pendings") == [(phone.fingerprint,)]
     # a resubmitted signature after the outcome returns it and fires nothing again
-    before = spores.read_bytes()
+    before = intentions.read_bytes()
     again = broker.submit(pid, phone.sign(record))
-    assert (again["state"], again["replay"]) == ("COMMITTED", True) and spores.read_bytes() == before
+    assert (again["state"], again["replay"]) == ("COMMITTED", True) and intentions.read_bytes() == before
 
 
-def test_a_presence_key_cannot_sign_a_t2_and_a_revoked_key_is_not_in_the_signers_file(broker, spores, keydir):
+def test_a_presence_key_cannot_sign_a_t2_and_a_revoked_key_is_not_in_the_signers_file(broker, intentions, keydir):
     weak = Key(keydir, "weak").enroll(broker, "presence")
-    pid = _move(broker, spores)["pending_id"]
+    pid = _move(broker, intentions)["pending_id"]
     rec = broker.outcome(pid)["record"].encode()
     out = broker.submit(pid, weak.sign(rec))
     assert (out["state"], out["reason"]) == ("REFUSED", "key class presence does not cover T2")
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
     revoke_any(broker.db, phone)
-    pid2 = _move(broker, spores, "k.seed2")["pending_id"]
+    pid2 = _move(broker, intentions, "k.seed2")["pending_id"]
     _refused("bad_signature", broker.submit, pid2, phone.sign(broker.outcome(pid2)["record"].encode()))
     assert _state(broker, pid2) == "WAITING"
 
 
 # --- DONE: replay; no intent = sign; T3 on the token refused --------------------------------------------
 
-def test_a_replayed_token_post_returns_the_same_fired_pending(broker, spores):
-    first = _move(broker, spores, intent="reported", idempotency_key="k-1")
-    after = spores.read_bytes()
-    again = _move(broker, spores, intent="reported", idempotency_key="k-1")
+def test_a_replayed_token_post_returns_the_same_fired_pending(broker, intentions):
+    first = _move(broker, intentions, intent="reported", idempotency_key="k-1")
+    after = intentions.read_bytes()
+    again = _move(broker, intentions, intent="reported", idempotency_key="k-1")
     assert (again["pending_id"], again["state"], again["replay"]) == (first["pending_id"], "COMMITTED", True)
-    assert spores.read_bytes() == after
+    assert intentions.read_bytes() == after
     assert len(_rows(broker, "SELECT 1 FROM pendings")) == 1
     # the same key with other params is a conflict, never a second fire
-    _refused("idempotency_conflict", broker.issue, verb="spore_set_disposition", params={"disposition": "seed"},
-             target=_target(spores, "k.seed"), tier="T2", credential=BROWSER, intent="reported",
+    _refused("idempotency_conflict", broker.issue, verb="intention_set_disposition", params={"disposition": "seed"},
+             target=_target(intentions, "k.seed"), tier="T2", credential=BROWSER, intent="reported",
              idempotency_key="k-1")
 
 
-def test_no_intent_is_sign(broker, spores):
-    out = _move(broker, spores)
+def test_no_intent_is_sign(broker, intentions):
+    out = _move(broker, intentions)
     assert (out["state"], out["intent"]) == ("WAITING", "sign")
-    assert _disposition(spores, "k.seed") == "seed"
+    assert _disposition(intentions, "k.seed") == "seed"
 
 
-def test_a_t3_on_the_token_alone_is_refused_and_records_nothing(broker, spores):
-    e = _refused("refused", _move, broker, spores, intent="reported", tier="T3")
+def test_a_t3_on_the_token_alone_is_refused_and_records_nothing(broker, intentions):
+    e = _refused("refused", _move, broker, intentions, intent="reported", tier="T3")
     assert "T3" in str(e)
     assert _rows(broker, "SELECT 1 FROM pendings") == []
-    _refused("refused", broker.issue, verb="spore_set_disposition", params={"disposition": "agenda"},
-             target=_target(spores, "k.seed"), tier="T2", credential={"class": "device", "fingerprint": "SHA256:x"},
+    _refused("refused", broker.issue, verb="intention_set_disposition", params={"disposition": "agenda"},
+             target=_target(intentions, "k.seed"), tier="T2", credential={"class": "device", "fingerprint": "SHA256:x"},
              intent="reported")
 
 
-def test_a_row_without_an_origin_key_is_refused(broker, spores):
+def test_a_row_without_an_origin_key_is_refused(broker, intentions):
     # anneal keys an unkeyed row on read unless its save fails; a read-only directory makes it fail,
     # so the row reaches the broker with no origin_key, and none is invented
-    data = json.loads(spores.read_text())
+    data = json.loads(intentions.read_text())
     for s in data["spores"]:
         if s.get("origin_key") == "k.loop":
             del s["origin_key"]
             sid = s["id"]
-    spores.write_text(json.dumps(data))
-    spores.parent.chmod(0o500)
+    intentions.write_text(json.dumps(data))
+    intentions.parent.chmod(0o500)
     try:
-        e = _refused("refused", broker.issue, verb="spore_set_disposition", params={"disposition": "agenda"},
-                     target={"kind": "row", "panel_id": "loops", "row_id": f"spore:{sid}"}, tier="T2",
+        e = _refused("refused", broker.issue, verb="intention_set_disposition", params={"disposition": "agenda"},
+                     target={"kind": "row", "panel_id": "loops", "row_id": f"intention:{sid}"}, tier="T2",
                      credential=BROWSER, intent="reported")
     finally:
-        spores.parent.chmod(0o700)
+        intentions.parent.chmod(0o700)
     assert "no label resource yet" in str(e)
     assert _rows(broker, "SELECT 1 FROM pendings") == []
 
 
 # --- DONE: caps; cancel own; cross-principal cancel; rotation -----------------------------------------
 
-def test_the_cap_holds_per_token_and_a_reported_fire_still_goes_through(broker, spores):
+def test_the_cap_holds_per_token_and_a_reported_fire_still_goes_through(broker, intentions):
     for i in range(8):
-        _move(broker, spores, idempotency_key=f"s{i}")
-    _refused("pending_cap", _move, broker, spores, idempotency_key="s8")
+        _move(broker, intentions, idempotency_key=f"s{i}")
+    _refused("pending_cap", _move, broker, intentions, idempotency_key="s8")
     # the other surface's token is not blocked, and a reported write never counts against the cap
-    assert _move(broker, spores, cred=PHONE)["state"] == "WAITING"
-    assert _move(broker, spores, intent="reported", idempotency_key="r")["state"] == "COMMITTED"
+    assert _move(broker, intentions, cred=PHONE)["state"] == "WAITING"
+    assert _move(broker, intentions, intent="reported", idempotency_key="r")["state"] == "COMMITTED"
     # cancelling one occupying pending frees a slot and records who cancelled it
     pid = _rows(broker, "SELECT pending_id FROM pendings WHERE idempotency_key = 's0'")[0][0]
     assert broker.cancel(pid, credential=BROWSER)["state"] == "CANCELLED"
     assert _rows(broker, "SELECT cancelled_by FROM pendings WHERE pending_id = ?", pid) == [("token:browser:1",)]
-    assert _move(broker, spores, "k.seed2", idempotency_key="s9")["state"] == "WAITING"
+    assert _move(broker, intentions, "k.seed2", idempotency_key="s9")["state"] == "WAITING"
 
 
-def test_cancel_after_the_commit_decision_is_refused(broker, spores):
-    pid = _move(broker, spores, intent="reported")["pending_id"]
+def test_cancel_after_the_commit_decision_is_refused(broker, intentions):
+    pid = _move(broker, intentions, intent="reported")["pending_id"]
     _refused("refused", broker.cancel, pid, credential=BROWSER)
     assert _state(broker, pid) == "COMMITTED"
 
 
-def test_a_cross_principal_cancel_is_a_pending_of_the_targets_tier(broker, spores):
-    pid = _move(broker, spores)["pending_id"]
+def test_a_cross_principal_cancel_is_a_pending_of_the_targets_tier(broker, intentions):
+    pid = _move(broker, intentions)["pending_id"]
     out = broker.cancel(pid, credential=PHONE)
     assert out["verb"] == "pending_cancel" and out["tier"] == "T2" and out["state"] == "WAITING"
     assert _state(broker, pid) == "WAITING"
@@ -296,11 +296,11 @@ def test_a_cross_principal_cancel_is_a_pending_of_the_targets_tier(broker, spore
     assert broker.cancel(out["pending_id"], credential=PHONE)["state"] == "CANCELLED"
 
 
-def test_rotation_cancels_the_old_generations_waiting_rows_in_one_act(broker, spores, keydir):
+def test_rotation_cancels_the_old_generations_waiting_rows_in_one_act(broker, intentions, keydir):
     laptop = Key(keydir, "laptop").enroll(broker, "laptop-presence")
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
-    olds = [_move(broker, spores, idempotency_key=f"o{i}")["pending_id"] for i in range(2)]
-    other = _move(broker, spores, cred=PHONE)["pending_id"]
+    olds = [_move(broker, intentions, idempotency_key=f"o{i}")["pending_id"] for i in range(2)]
+    other = _move(broker, intentions, cred=PHONE)["pending_id"]
     _refused("refused", broker.rotate_token, "browser", credential=BROWSER, intent="reported")
     rot = broker.rotate_token("browser", credential=PHONE)
     assert (rot["tier"], rot["state"]) == ("T3", "WAITING")
@@ -314,20 +314,20 @@ def test_rotation_cancels_the_old_generations_waiting_rows_in_one_act(broker, sp
             ("CANCELLED", "token rotated")]
     assert _state(broker, other) == "WAITING"
     # the token's next pending is the new generation's
-    new = _move(broker, spores, idempotency_key="after")["pending_id"]
+    new = _move(broker, intentions, idempotency_key="after")["pending_id"]
     assert _rows(broker, "SELECT principal FROM pendings WHERE pending_id = ?", new) == [("token:browser:2",)]
 
 
 # --- DONE: lock, STANDBY, heal, DRAINING ---------------------------------------------------------------
 
-def test_a_second_broker_on_the_root_is_standby_opens_no_journal_and_heals(home, spores):
-    first = _broker(home, spores)
-    pid = _move(first, spores)["pending_id"]
-    second = _broker(home, spores, lock_poll=0.05)
+def test_a_second_broker_on_the_root_is_standby_opens_no_journal_and_heals(home, intentions):
+    first = _broker(home, intentions)
+    pid = _move(first, intentions)["pending_id"]
+    second = _broker(home, intentions, lock_poll=0.05)
     try:
         assert second.state is Lifecycle.STANDBY and second.db is None
         assert second.outcome(pid) == Fault(STANDBY_FAULT)
-        _refused("standby", _move, second, spores, "k.seed2")
+        _refused("standby", _move, second, intentions, "k.seed2")
         first.stop()
         assert _wait(lambda: second.state is Lifecycle.ACTIVE, 3.0)
         assert second.outcome(pid)["state"] == "WAITING"
@@ -336,14 +336,14 @@ def test_a_second_broker_on_the_root_is_standby_opens_no_journal_and_heals(home,
         second.stop()
 
 
-def test_a_standby_broker_opens_no_cockpit_db(home, spores, monkeypatch):
-    first = _broker(home, spores, max_wait=60.0)
+def test_a_standby_broker_opens_no_cockpit_db(home, intentions, monkeypatch):
+    first = _broker(home, intentions, max_wait=60.0)
     time.sleep(0.3)          # the first broker's thread has made its pass and waits: it opens nothing now
     opened: list[Path] = []
     import levain.cockpit.firejournal as fj
     real = fj.open_durable
     monkeypatch.setattr(fj, "open_durable", lambda p: (opened.append(Path(p)), real(p))[1])
-    second = _broker(home, spores, lock_poll=0.05)
+    second = _broker(home, intentions, lock_poll=0.05)
     try:
         second.outcome("cp" + "0" * 32)
         time.sleep(0.2)
@@ -353,7 +353,7 @@ def test_a_standby_broker_opens_no_cockpit_db(home, spores, monkeypatch):
         second.stop()
 
 
-class Blocking(SporeEffectStore):
+class Blocking(IntentionEffectStore):
     """The real adapter, held inside apply_unit until released."""
 
     def __init__(self, path: Path) -> None:
@@ -367,39 +367,39 @@ class Blocking(SporeEffectStore):
         return super().apply_unit(unit)
 
 
-def test_draining_holds_the_lock_while_an_admitted_settler_is_blocked(home, spores):
-    store = Blocking(spores)
-    first = _broker(home, spores, store, drain_timeout=10)
-    t = threading.Thread(target=lambda: _move(first, spores, intent="reported"), daemon=True)
+def test_draining_holds_the_lock_while_an_admitted_settler_is_blocked(home, intentions):
+    store = Blocking(intentions)
+    first = _broker(home, intentions, store, drain_timeout=10)
+    t = threading.Thread(target=lambda: _move(first, intentions, intent="reported"), daemon=True)
     t.start()
     assert store.entered.wait(5)
     stopper = threading.Thread(target=first.stop, daemon=True)
     stopper.start()
     assert _wait(lambda: first.state is Lifecycle.DRAINING, 2)
-    second = _broker(home, spores, lock_poll=0.05)
+    second = _broker(home, intentions, lock_poll=0.05)
     try:
         time.sleep(0.3)
         assert second.state is Lifecycle.STANDBY       # the lock is still the draining broker's
-        _refused("broker_unavailable", _move, first, spores, "k.seed2")
+        _refused("broker_unavailable", _move, first, intentions, "k.seed2")
         store.release.set()
         t.join(5)
         stopper.join(5)
         assert first.state is Lifecycle.CLOSED
         assert _wait(lambda: second.state is Lifecycle.ACTIVE, 3.0)
-        assert _disposition(spores, "k.seed") == "agenda"
+        assert _disposition(intentions, "k.seed") == "agenda"
     finally:
         store.release.set()
         second.stop()
 
 
-def test_a_settler_that_outlives_the_drain_keeps_the_lock(home, spores):
-    store = Blocking(spores)
-    first = _broker(home, spores, store, drain_timeout=0.3)
-    t = threading.Thread(target=lambda: _move(first, spores, intent="reported"), daemon=True)
+def test_a_settler_that_outlives_the_drain_keeps_the_lock(home, intentions):
+    store = Blocking(intentions)
+    first = _broker(home, intentions, store, drain_timeout=0.3)
+    t = threading.Thread(target=lambda: _move(first, intentions, intent="reported"), daemon=True)
     t.start()
     assert store.entered.wait(5)
     assert first.stop() is Lifecycle.CLOSED
-    second = _broker(home, spores, lock_poll=0.05)
+    second = _broker(home, intentions, lock_poll=0.05)
     try:
         store.release.set()
         t.join(5)
@@ -411,7 +411,7 @@ def test_a_settler_that_outlives_the_drain_keeps_the_lock(home, spores):
 
 # --- DONE: re-drive ------------------------------------------------------------------------------------
 
-class FaultOnce(SporeEffectStore):
+class FaultOnce(IntentionEffectStore):
     """The real adapter, raising one transient fault on its first apply."""
 
     def __init__(self, path: Path) -> None:
@@ -425,43 +425,43 @@ class FaultOnce(SporeEffectStore):
         return super().apply_unit(unit)
 
 
-def test_a_fault_with_no_reads_retries_by_itself(home, spores):
-    store = FaultOnce(spores)
-    b = _broker(home, spores, store)
+def test_a_fault_with_no_reads_retries_by_itself(home, intentions):
+    store = FaultOnce(intentions)
+    b = _broker(home, intentions, store)
     try:
-        out = _move(b, spores, intent="reported")
+        out = _move(b, intentions, intent="reported")
         assert out["state"] == "applying"
         assert _rows(b, "SELECT attempts, status FROM effects") == [(1, "PLANNED")]
         # no read of any kind from here: only the thread can finish it, at next_attempt_at (5 s)
         assert _wait(lambda: _state(b, out["pending_id"]) == "COMMITTED", 9.0)
-        assert store.calls == 2 and _disposition(spores, "k.seed") == "agenda"
+        assert store.calls == 2 and _disposition(intentions, "k.seed") == "agenda"
     finally:
         b.stop()
 
 
-def test_a_new_earlier_deadline_cuts_a_long_wait(home, spores):
-    store = FaultOnce(spores)
-    b = _broker(home, spores, store, max_wait=60.0)
+def test_a_new_earlier_deadline_cuts_a_long_wait(home, intentions):
+    store = FaultOnce(intentions)
+    b = _broker(home, intentions, store, max_wait=60.0)
     try:
         time.sleep(0.3)                     # the thread is now in a 60 s wait (nothing is due)
-        out = _move(b, spores, intent="reported")
+        out = _move(b, intentions, intent="reported")
         assert out["state"] == "applying"
         assert _wait(lambda: _state(b, out["pending_id"]) == "COMMITTED", 9.0)
     finally:
         b.stop()
 
 
-def test_listings_wake_but_never_spend_an_attempt(home, spores):
-    class AlwaysFault(SporeEffectStore):
+def test_listings_wake_but_never_spend_an_attempt(home, intentions):
+    class AlwaysFault(IntentionEffectStore):
         calls = 0
 
         def apply_unit(self, unit: Any) -> Any:
             type(self).calls += 1
             raise TransientApplyFault("OSError", "down")
 
-    b = _broker(home, spores, AlwaysFault(spores))
+    b = _broker(home, intentions, AlwaysFault(intentions))
     try:
-        pid = _move(b, spores, intent="reported")["pending_id"]
+        pid = _move(b, intentions, intent="reported")["pending_id"]
         for _ in range(40):
             assert b.outcome(pid)["state"] == "applying"
             time.sleep(0.02)
@@ -470,26 +470,26 @@ def test_listings_wake_but_never_spend_an_attempt(home, spores):
         b.stop()
 
 
-def test_start_recovery_finishes_a_decided_op(home, spores):
-    store = FaultOnce(spores)
-    b = _broker(home, spores, store)
-    pid = _move(b, spores, intent="reported")["pending_id"]
+def test_start_recovery_finishes_a_decided_op(home, intentions):
+    store = FaultOnce(intentions)
+    b = _broker(home, intentions, store)
+    pid = _move(b, intentions, intent="reported")["pending_id"]
     b.stop()
     assert _state(b, pid) == "DECIDED"
     with sqlite3.connect(b.data_root / "cockpit.db") as conn:
         conn.execute("UPDATE effects SET next_attempt_at = '2000-01-01T00:00:00.000000Z'")
-    again = _broker(home, spores, store)
+    again = _broker(home, intentions, store)
     try:
-        assert _state(again, pid) == "COMMITTED" and _disposition(spores, "k.seed") == "agenda"
+        assert _state(again, pid) == "COMMITTED" and _disposition(intentions, "k.seed") == "agenda"
     finally:
         again.stop()
 
 
 # --- DONE: install class and the network-FS refusal -----------------------------------------------------
 
-def test_a_network_fs_data_root_is_refused(home, spores, monkeypatch):
+def test_a_network_fs_data_root_is_refused(home, intentions, monkeypatch):
     monkeypatch.setattr(install, "statfs_type", lambda p: "nfs" if install.sys.platform == "darwin" else "0x6969")
-    b = _broker(home, spores)
+    b = _broker(home, intentions)
     assert b.state is Lifecycle.INSTALL_DISABLED
     assert "network filesystem" in (b.disabled_reason or "")
     assert not (home / "data" / "cockpit.lock").exists() and not (home / "data" / "cockpit.db").exists()
@@ -497,19 +497,19 @@ def test_a_network_fs_data_root_is_refused(home, spores, monkeypatch):
     assert b.state is Lifecycle.INSTALL_DISABLED
 
 
-def test_a_local_fs_is_accepted(home, spores):
-    assert install.network_fs_problem([home, spores]) is None
+def test_a_local_fs_is_accepted(home, intentions):
+    assert install.network_fs_problem([home, intentions]) is None
 
 
-def test_no_declaration_disables_the_broker_with_run_the_installer(home, spores):
-    b = _broker(home, spores, install_class=None)
+def test_no_declaration_disables_the_broker_with_run_the_installer(home, intentions):
+    b = _broker(home, intentions, install_class=None)
     assert b.state is Lifecycle.INSTALL_DISABLED and "run the installer" in (b.disabled_reason or "")
     assert not (home / "data").exists()
-    e = _refused("install_disabled", _move, b, spores)
+    e = _refused("install_disabled", _move, b, intentions)
     assert "run the installer" in str(e)
 
 
-def test_a_governed_marker_is_a_typed_refusal_and_beats_reported(home, spores):
+def test_a_governed_marker_is_a_typed_refusal_and_beats_reported(home, intentions):
     markers = home / "markers"
     markers.mkdir()
     path = install.marker_path(home / "data", markers)
@@ -553,13 +553,13 @@ def test_the_post_routes_reach_the_broker_only_in_a_declared_install(tmp_path, m
     from tests.test_cockpit_k2a import _install, _post, _serve
 
     root, src, ids = _install(tmp_path)
-    store = SporeStore(root / ".levain" / "memory.spores.json")
-    body = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "agenda"}}
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    body = {"verb": "intention_set_disposition", "panel_id": "tray", "params": {"disposition": "agenda"}}
 
     def row(url: str) -> dict:
         from tests.test_cockpit_k2a import _get
         rows = _get(f"{url}/cockpit/panel/tray.json", token="T")["rows"]
-        return next(r for r in rows if r["id"] == f"spore:{ids['seed']}")
+        return next(r for r in rows if r["id"] == f"intention:{ids['seed']}")
 
     # with the broker stubbed out (no declaration) the POST handler fires nothing
     with _serve(src, surface_tokens={"browser": "T"}) as (url, httpd):

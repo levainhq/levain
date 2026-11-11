@@ -671,7 +671,7 @@ class TestReleaseStampIsNotAPublishedVersion:
         clone can hold the release commit without its tag. Unset, the subject
         is HEAD against the local tags, which is what a plain suite run means.
         The L3 r1 of 2026-10-11 (codex) reached a mid-range commit, so ranges are
-        walked; the earlier tips-only scope had cited ``spore-551``, which rules
+        walked; the earlier tips-only scope had cited ``intention-551``, which rules
         how many gates exist, not how wide one is.
         """
         import os
@@ -762,7 +762,7 @@ class TestReleaseStampIsNotAPublishedVersion:
                     f"({released[committed]}). A clean working tree is not the question: "
                     f"a push publishes THIS COMMIT. Bump both stamps (pyproject.toml, "
                     f"levain/__init__.py) to the next .dev0 and COMMIT the bump. See "
-                    f"spore-710 and CHANGELOG 'Versioning'."
+                    f"intention-710 and CHANGELOG 'Versioning'."
                 )
 
     def _run_hook(self, root, stdin):

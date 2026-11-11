@@ -138,8 +138,8 @@ def test_genesis_policy_is_the_pinned_constant():
 
 
 def test_raise_by_phone_applies(base, keys):
-    snap = link(base, {"op": "raise", "verb": "spore_note", "tier": "T3"}, keys["phone"])
-    assert snap.policy.apply("spore_note", "C1") == "T3"
+    snap = link(base, {"op": "raise", "verb": "intention_note", "tier": "T3"}, keys["phone"])
+    assert snap.policy.apply("intention_note", "C1") == "T3"
     assert snap.policy.apply("other", "C1") == "C1"
 
 

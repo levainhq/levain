@@ -228,11 +228,11 @@ def test_results_are_worded_and_ordered_by_when_the_job_finished_not_when_it_was
 
 def test_the_open_days_chip_reads_the_integer_the_kernel_sends_not_the_badge_words(tmp_path, monkeypatch):
     """The "open N d" chip once parsed the badge text ("3d old"), whose producer is cockpit_view.js `badgeText`; it now
-    reads the row's integer `age_days` facet, which the spores provider computes from the spore's own created date."""
-    from anneal_memory.spores import SporeStore
+    reads the row's integer `age_days` facet, which the intentions provider computes from the intention's own created date."""
+    from anneal_memory.spores import IntentionStore
 
     root, src, _ids = _install(tmp_path)
-    SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="aged loop", tier="hot", domain="ledgerline",
+    IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="aged loop", tier="hot", domain="ledgerline",
                                                             today=datetime.now().astimezone().date() - timedelta(days=3))
     rows = build_default_cockpit(src).panel("loops", credential_class="none")["rows"]
     mine = [r for r in rows if "aged loop" in (r["body"] or r["title"])]
@@ -415,10 +415,10 @@ def test_results_are_the_job_stores_finished_jobs_with_an_outcome_dot(tmp_path, 
 @needs_browser
 def test_build_places_results_left_and_edits_over_loops_right_with_loops_carrying_open_days_and_repo(tmp_path, monkeypatch):
     from levain.jobs import JobRuntime, JobStore
-    from anneal_memory.spores import SporeStore
+    from anneal_memory.spores import IntentionStore
 
     root, src, _ids = _install(tmp_path)
-    SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="loop with a repo", tier="hot", domain="ledgerline",
+    IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="loop with a repo", tier="hot", domain="ledgerline",
                                                             today=datetime.now().astimezone().date() - timedelta(days=3))
     store = JobStore(root / ".levain" / "jobs.json")
     t = datetime.now(timezone.utc).isoformat()
@@ -450,7 +450,7 @@ def test_build_places_results_left_and_edits_over_loops_right_with_loops_carryin
 def test_a_bare_install_says_one_line_per_section_and_draws_no_empty_card(tmp_path, monkeypatch):
     monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain_home"))
     _root, src, _ids = _install(tmp_path)
-    src.anneal.spores_json.unlink(missing_ok=True)                  # K10: an open loop is work the Sessions card draws, so "bare" means no loop either
+    src.anneal.intentions_json.unlink(missing_ok=True)                  # K10: an open loop is work the Sessions card draws, so "bare" means no loop either
     probe = ("JSON.stringify({sess: document.querySelector('#k7-sessions').innerText.replace(/\\s+/g, ' '), rows: document.querySelectorAll('#k7-sessions .k7-srow').length, "
              "tabs: document.querySelectorAll('#k7-sessions .k7-srows').length, "
              "results: (document.querySelector('.k7-results-none') || {innerText: ''}).innerText.replace(/\\s+/g, ' '), "

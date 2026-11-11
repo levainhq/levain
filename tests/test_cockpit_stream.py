@@ -321,7 +321,7 @@ class TestServerWatchToken:
             assert a is not None and httpd._watch_token() == a
             httpd.get_cockpit().manifest({"class": "none", "device_class": None})      # a read after that moves nothing
             assert httpd._watch_token() == a
-            (root / ".levain" / "memory.spores.json").write_text('{"spores": []}')
+            (root / ".levain" / "memory.spores.json").write_text('{"intentions": []}')
             b = httpd._watch_token()
             assert b != a
             q = httpd.question_store
@@ -781,7 +781,7 @@ class TestServerTokenInputs:
         ctx = tmp_path / "ctx" / "context.json"
         ctx.parent.mkdir()
         ctx.write_text("{}")
-        src2 = dataclasses.replace(src, anneal=dataclasses.replace(src.anneal, spores_json=other / "s.json"),
+        src2 = dataclasses.replace(src, anneal=dataclasses.replace(src.anneal, intentions_json=other / "s.json"),
                                    context_json=ctx)
         (other / "s.json").write_text("[]")
         httpd = make_server(src2, host="127.0.0.1", port=0)

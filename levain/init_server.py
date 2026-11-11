@@ -145,7 +145,7 @@ class _InitServer(ThreadingHTTPServer):
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family (idle keep-alive resets)
         instead of dumping a traceback; defer genuine errors to the base so real
-        bugs still surface (mirrors ``_LevainHTTPServer``, spore-178)."""
+        bugs still surface (mirrors ``_LevainHTTPServer``, intention-178)."""
         exc = sys.exc_info()[1]
         if isinstance(exc, (ConnectionError, TimeoutError)):
             return
@@ -419,7 +419,7 @@ class _InitHandler(GuardedHandler):
                 # install as a wheel-corruption "templates" error with no progress).
                 # ONE install lock across apply_init AND the pack-docs refresh, as run_init holds it:
                 # the refresh wipes and recopies .levain/docs, and outside the lock a CLI init/update
-                # could interleave its own (spore-1250, reproduced 2026-10-03). apply_init takes the
+                # could interleave its own (intention-1250, reproduced 2026-10-03). apply_init takes the
                 # same lock; it is reentrant per (install, thread), so that acquisition nests. A busy
                 # lock is refused here, before any write, with the same 409 apply_init's own refusal
                 # gets (uncaught, the outer InitError handler reports it as a 500 "templates" fault).
@@ -619,7 +619,7 @@ def make_init_server(
     httpd.python_path = sys.executable
     from levain.manifest import resolve_anneal_bin
 
-    httpd.anneal_path = resolve_anneal_bin()  # spore-751
+    httpd.anneal_path = resolve_anneal_bin()  # intention-751
     httpd.assets = assets
     # Re-verify the ACTUAL bound address is loopback (verify-the-bound-address, not
     # the resolver — a tampered hosts file could map 'localhost' off-box). Refuse

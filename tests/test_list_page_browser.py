@@ -1,4 +1,4 @@
-"""THE LIST's page (levain 64 L3), in real headless Chrome against a served cockpit with a real broker, spore store and desk
+"""THE LIST's page (levain 64 L3), in real headless Chrome against a served cockpit with a real broker, intention store and desk
 store in the scratch home (the conftest isolates HOME: nothing here touches an operator's live apps or queue).
 
 Pinned: the intake box submits ONE line and prints the server's receipt sentence verbatim (a plain line, a ``?`` talk, an ``@`` drop
@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain.consent.queue import default_queue_dir
 from levain.desk.store import CoordStore
@@ -46,7 +46,7 @@ def _receipt_is(text_test: str) -> dict[str, Any]:
 
 
 def _seed_more(root: Path) -> None:
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     store.add(type="task", text="talk about the water", disposition="seed", attention="talk")
     store.add(type="task", text="call the dentist", disposition="agenda", target="desk", next="2020-01-07T09:00")
     qdir = default_queue_dir()
@@ -192,7 +192,7 @@ def test_open_loops_is_off_the_board_tab_and_on_build(tmp_path: Path) -> None:
 
 def _seed_phone(root: Path) -> None:
     """Rows shaped like the ones on an operator's phone: band rows led by their own origin ("desk:", "levain:") with a long
-    unbroken detail line, a spore that merely MENTIONS a repo, more spores than the first page, and held rows."""
+    unbroken detail line, an intention that merely MENTIONS a repo, more intentions than the first page, and held rows."""
     from datetime import date, timedelta
 
     from levain.consent.questions import QuestionStore
@@ -207,7 +207,7 @@ def _seed_phone(root: Path) -> None:
     qs.file(agent="claude_code", agent_session_id="s2", what="levain: TUE 11-10: read the release essay draft 2 and fill its 17 slots; it ships with a long tail of words after that",
             options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold",
             blocks=f"Tuesday 11-10, your read (04_DRAFT.md; levain 59 surfaces the essay) {long_path}", cwd="/w/levain")
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     store.add(type="task", text="TALK: HACK THE ECHO: reflash an old Echo (routed by desk 26 on 11-07)", disposition="seed", attention="talk")
     for i in range(14):
         store.add(type="task", text=f"a plain seed number {i} with some words to fill the line a bit", disposition="seed")
@@ -300,7 +300,7 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
     qs.file(agent="claude_code", agent_session_id="s3", what="note: call Alice about the thing on Friday",
             options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="detail", cwd="/w/levain")
     from datetime import date, timedelta
-    SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="plain domain row zz", domain="life", disposition="seed",
+    IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="plain domain row zz", domain="life", disposition="seed",
                                                             next=(date.today() + timedelta(days=30)).isoformat())   # held: the path that draws a trailing chip
     ph = f"{TRAY}.querySelector('.list-intake-input').placeholder"
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
@@ -508,8 +508,8 @@ def test_r4_the_card_holds_due_rows_and_one_control_and_the_focus_view_every_gro
     # the control's "desk owes N" is the rows a person sees under Desk owes: the carried row is listed there too, as the footer prints it
     assert len(focus["desk"]) == desk and len(focus["later"]) == later, focus
     assert any(t.startswith("desk: carried") for t in focus["desk"]), focus
-    # the type chips cut across the time-states: the focus view's spores chip also holds the dated seed the card leaves to its control
-    assert num(card["chips"], "spores") + 1 == num(focus["chips"], "spores"), (card["chips"], focus["chips"])
+    # the type chips cut across the time-states: the focus view's intentions chip also holds the dated seed the card leaves to its control
+    assert num(card["chips"], "intentions") + 1 == num(focus["chips"], "intentions"), (card["chips"], focus["chips"])
     assert num(card["chips"], "held") is None and num(focus["chips"], "held") is None, (card, focus)        # no held chip: Later is a time-state
 
 
@@ -523,7 +523,7 @@ _CTL_PROBE = f"""(() => {{
 }})()"""
 
 
-def _carried_install(tmp_path: Path, monkeypatch: Any, *, all_desk: bool = False, spores: bool = True) -> Any:
+def _carried_install(tmp_path: Path, monkeypatch: Any, *, all_desk: bool = False, intentions: bool = True) -> Any:
     root, src, ids = _install(tmp_path)
     _seed_more(root)
     from levain.consent.questions import QuestionStore
@@ -536,8 +536,8 @@ def _carried_install(tmp_path: Path, monkeypatch: Any, *, all_desk: bool = False
             options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the essay", cwd="/w/levain")
     qs.file(agent="claude_code", agent_session_id="s9", what="desk: Write the BJE plan.",
             options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the plan", cwd="/w/bje")
-    if not spores:       # nothing but band rows is left on the card
-        store = SporeStore(root / ".levain" / "memory.spores.json")
+    if not intentions:       # nothing but band rows is left on the card
+        store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
         for sp in store.list_open():
             store.update(sp["id"], disposition="loop")
         for key in ("seed", "held", "note"):
@@ -576,7 +576,7 @@ def test_listpanel_r5_the_control_is_44px_at_every_width_has_its_label_and_closi
 
 @needs_browser
 def test_listpanel_r5_a_card_with_only_desk_and_later_rows_says_nothing_is_due_and_a_search_finds_them_in_the_full_list(tmp_path: Path, monkeypatch: Any) -> None:
-    src = _carried_install(tmp_path, monkeypatch, all_desk=True, spores=False)
+    src = _carried_install(tmp_path, monkeypatch, all_desk=True, intentions=False)
     type_q = lambda q: (f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = {json.dumps(q)}; "
                         "i.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()")
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
@@ -605,7 +605,7 @@ def test_lpr3_one_carried_desk_row_only_is_counted_in_the_control_and_listed_und
     """A carried desk row is needs-you on the card and counted as ONE desk owes in the control; the focus view lists it under Desk owes
     too, so the number a person reads is the rows they can see there."""
     root, src, ids = _install(tmp_path)
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     for sp in store.list_open():
         store.update(sp["id"], disposition="loop")
     from levain.consent.questions import QuestionStore
@@ -711,7 +711,7 @@ def _seed_time(root: Path) -> None:
     """One row of each time-state a page must draw: a dated board drop, a dated talk, a dated band-bound drop, one resolved row."""
     from datetime import date, datetime, timedelta, timezone
 
-    st = SporeStore(root / ".levain" / "memory.spores.json")
+    st = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     d = date.today()
     st.add(type="task", text="draft the BOBS note for the board", disposition="agenda", target="board:levain",
            next=(d + timedelta(days=9)).isoformat() + "T09:00")
@@ -769,7 +769,7 @@ def test_the_list_is_time_first_with_a_type_tag_on_every_row_and_the_type_chips_
     assert [c.split(" ")[0] for c in vals["chips"]] == ["Now", "Later", "Someday", "Done"], vals["chips"]
     later = vals["later"]
     assert later and all(r["t"] == "later" for r in later), later                    # the chip narrows to Later, whatever the source
-    assert {r["s"] for r in later} == {"drop", "talk", "spore"}, later               # a drop, a talk and a plain dated seed
+    assert {r["s"] for r in later} == {"drop", "talk", "intention"}, later               # a drop, a talk and a plain dated seed
     assert all(r["line"].startswith("wakes ") and "→" in r["line"] for r in later), later
     assert vals["subs"] == ["Tomorrow", "Next 7 days", "Later dates"], vals["subs"]
     assert vals["talk_later"] and all(r["s"] == "talk" and r["t"] == "later" for r in vals["talk_later"]), vals["talk_later"]
@@ -791,7 +791,7 @@ def test_a_snooze_moves_the_row_to_later_at_once_with_its_wake_line(tmp_path: Pa
             *_reload(),
             {"until": f"{TRAY} && {row} && 1"},
             {"eval": f"JSON.stringify({{before: {row}.dataset.timeState}})"},
-            {"eval": f"{row}.querySelector('.verb-btn[data-verb=\"spore_surface_at\"]').click(); 1"},
+            {"eval": f"{row}.querySelector('.verb-btn[data-verb=\"intention_surface_at\"]').click(); 1"},
             {"eval": f"(() => {{ const i = {row}.querySelector('.verb-date'); i.value = {json.dumps(day)}; "
                      f"i.dispatchEvent(new Event('input', {{bubbles: true}})); {row}.querySelector('.verb-confirm').click(); return 1; }})()"},
             # the write re-reads the page: the row has left the card (the card holds what is due) with no wait for a poll
@@ -1112,7 +1112,7 @@ def test_r5_with_a_type_chosen_on_the_card_each_footer_number_is_the_rows_its_ta
                                             options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")
     _host_band(monkeypatch)
     steps: list[dict[str, Any]] = []
-    for surface in ("band", "spores", "talk"):
+    for surface in ("band", "intentions", "talk"):
         steps += [
             {"eval": f"(() => {{ const c = {TRAY}.querySelector('.list-surface-chip[data-surface=\"{surface}\"]'); if (c) c.click(); return 1; }})()"},
             {"eval": "new Promise(r => setTimeout(() => r(1), 700))"},
@@ -1209,7 +1209,7 @@ def test_r6_a_time_chosen_in_the_focus_view_leaves_the_card_footer_counting_what
 
 def _seed_when(root: Path) -> dict[str, str]:
     """Four DUE rows (a past day, so the card holds them): three plain seeds and the desk drop."""
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     ids = {k: store.add(type="task", text=f"when row {k}", disposition="seed", next="2020-01-01")["id"] for k in ("a", "b", "c")}
     ids["drop"] = store.add(type="task", text="who row drop", disposition="agenda", target="desk", next="2020-01-07T09:00")["id"]
     qdir = default_queue_dir()
@@ -1223,7 +1223,7 @@ def _row_of(text: str) -> str:
 
 
 def _open_when(text: str) -> str:
-    return f"{_row_of(text)}.querySelector('.verb-btn[data-verb=\"spore_surface_at\"]').click(); 1"
+    return f"{_row_of(text)}.querySelector('.verb-btn[data-verb=\"intention_surface_at\"]').click(); 1"
 
 
 @pytest.mark.parametrize("width,height,mobile", [(1280, 1000, False), (390, 844, True)])
@@ -1273,7 +1273,7 @@ def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_
             {"until": f"!({_row_of('when row c')}) && 1"},
             # the desk drop says who from its target, and the who verb hands it to you without touching its day
             {"eval": f"JSON.stringify({{chip: (({_row_of('who row drop')}.querySelector('.list-who')) || {{}}).textContent || ''}})"},
-            {"eval": f"{_row_of('who row drop')}.querySelector('.verb-btn[data-verb=\"spore_retarget\"]').click(); 1"},
+            {"eval": f"{_row_of('who row drop')}.querySelector('.verb-btn[data-verb=\"intention_retarget\"]').click(); 1"},
             {"eval": f"(() => {{ const f = {_row_of('who row drop')}.querySelector('.who-form'); const on = f.querySelector('.who-opt[aria-pressed=\"true\"]').dataset.who;"
                      "f.querySelector('.who-opt[data-who=\"you\"]').click(); f.querySelector('.verb-confirm').click(); return JSON.stringify({was: on}); })()"},
             {"until": f"(() => {{ const r = {_row_of('who row drop')}; return !!r && r.querySelector('.list-who').textContent === 'you' && 1; }})()"},
@@ -1290,15 +1290,15 @@ def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_
         assert form["pickH"] >= 44 and form["timeFs"] >= 16, form
     assert vals["repo"] == {"shown": True, "val": "desk"}, vals["repo"]
     assert vals["chip"] == "the machine" and vals["was"] == "the machine" and vals["chip2"] == "you", vals
-    store = SporeStore(root / ".levain" / "memory.spores.json")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     a, b, c, drop = (store.get(ids[k]) for k in ("a", "b", "c", "drop"))
     assert (a["next"], a["disposition"]) == (tomorrow + "T09:00", "seed") and "target" not in a, a
     assert (b["next"], "target" in b) == (day + "T17:45", False), b
     assert (c["disposition"], c["target"], c["next"]) == ("agenda", "desk", monday.isoformat() + "T09:00"), c
     assert (drop["target"], drop["next"]) == ("band", "2020-01-07T09:00"), drop
     posts = [(p["verb"], p["params"]) for p in _posts(out)]
-    assert ("spore_retarget", {"target": "desk", "surface_at": monday.isoformat() + "T09:00"}) in posts, posts
-    assert ("spore_retarget", {"target": "band"}) in posts, posts
+    assert ("intention_retarget", {"target": "desk", "surface_at": monday.isoformat() + "T09:00"}) in posts, posts
+    assert ("intention_retarget", {"target": "band"}) in posts, posts
 
 
 _CONFIRM_REACH = (
@@ -1412,5 +1412,5 @@ def test_when_form_keeps_a_date_only_row_date_only_and_prefills_a_timed_rows_min
     vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
     assert vals == {"dropTime": "09:00", "day": "2020-01-01"}, vals
     posts = [(p["verb"], p["params"]) for p in _posts(out)]
-    assert ("spore_surface_at", {"surface_at": "2020-01-01"}) in posts, posts
-    assert SporeStore(root / ".levain" / "memory.spores.json").get(ids["a"])["next"] == "2020-01-01"
+    assert ("intention_surface_at", {"surface_at": "2020-01-01"}) in posts, posts
+    assert IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").get(ids["a"])["next"] == "2020-01-01"

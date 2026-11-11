@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 from anneal_memory import Store
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain.cockpit import providers
 from levain.cockpit.providers import build_default_cockpit
@@ -83,7 +83,7 @@ def test_a_store_change_rebuilds_once_more(counted) -> None:
     root, src, ck, _clock, calls = counted
     ck.panel("episodes")
     assert len(calls) == 1
-    SporeStore(root / ".levain" / "memory.spores.json").add(type="task", text="new loop", tier="hot", salience=2)
+    IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="new loop", tier="hot", salience=2)
     ck.panel("episodes")
     ck.panel("health")
     assert len(calls) == 2, len(calls)
@@ -612,14 +612,14 @@ def test_the_signature_is_retaken_when_a_reader_looks_again(tmp_path: Path, monk
     real_sig = providers._store_signature
     monkeypatch.setattr(providers, "_store_signature", lambda source: (taken.append(1), real_sig(source))[1])
     entered, release, calls = _gate_build(monkeypatch, src)
-    spores = root / ".levain" / "memory.spores.json"
+    intentions = root / ".levain" / "memory.spores.json"
     ts, _o = _readers(src, 1)
     entered.wait(5)
-    SporeStore(spores).add(type="task", text="one", tier="hot", salience=2)
+    IntentionStore(intentions, id_prefix="intention").add(type="task", text="one", tier="hot", salience=2)
     ts2, _o2 = _readers(src, 1)                     # its signature differs from the flight's: it waits, then looks again
     time.sleep(0.3)
     n_before = len(taken)
-    SporeStore(spores).add(type="task", text="two", tier="hot", salience=2)
+    IntentionStore(intentions, id_prefix="intention").add(type="task", text="two", tier="hot", salience=2)
     release.set()
     for t in ts + ts2:
         t.join(10)
@@ -660,7 +660,7 @@ def test_a_signature_that_cannot_be_taken_means_no_caching_not_an_exception(tmp_
     from types import SimpleNamespace
     from levain.cockpit.engine import ReadContext
     built: list[int] = []
-    anneal = SimpleNamespace(episodic_db=tmp_path / "m.db")            # no continuity_md, crystal_json, spores_json
+    anneal = SimpleNamespace(episodic_db=tmp_path / "m.db")            # no continuity_md, crystal_json, intentions_json
     fake = SimpleNamespace(anneal=anneal, build=lambda **kw: built.append(1) or SimpleNamespace(errors={}, health=None))
     assert providers._store_signature(fake) is None
     for _ in range(2):
@@ -701,7 +701,7 @@ def test_a_hot_source_is_not_evicted_before_a_colder_one(tmp_path: Path) -> None
             f.write_text("x")
         built: list[int] = []
         anneal = SimpleNamespace(episodic_db=files["m.db"], continuity_md=files["c.md"], crystal_json=files["c.json"],
-                                 spores_json=files["s.json"])
+                                 intentions_json=files["s.json"])
         return SimpleNamespace(anneal=anneal, built=built,
                                build=lambda **kw: built.append(1) or SimpleNamespace(errors={})), files["s.json"]
 

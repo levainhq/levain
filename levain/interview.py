@@ -142,7 +142,7 @@ class InterviewField:
     primitive (str/int/bool) — no live template/section object — so the plan
     projects cleanly to JSON for the web surface.
 
-    Shape ratified by the spore-181 Slice-A seam-lens review (still provisional
+    Shape ratified by the intention-181 Slice-A seam-lens review (still provisional
     until the live web form consumes it). Two guidance fields by design:
     `section_guidance` is the FULL section guidance, shown ONCE under the section
     header (mirroring the terminal); `guidance` is this slot's split sub-clause

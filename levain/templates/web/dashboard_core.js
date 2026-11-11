@@ -109,7 +109,7 @@
   let reviewItem = null;
   let pollJob = null;
   // The episode-search READ transport (GET /recall.json), injected by the boot layer so the core
-  // stays token-agnostic — the boot layer attaches the off-box token (spore-220 gates /recall.json
+  // stays token-agnostic — the boot layer attaches the off-box token (intention-220 gates /recall.json
   // off-box, exactly like /substrate.json). null → search falls back to a direct token-free fetch:
   // the transport-agnostic-core SAFETY NET so the core never hard-requires the transport. The
   // shipped web boot injects `recall` on EVERY surface (both render branches), so for `levain serve`
@@ -149,13 +149,13 @@
   let modalEpisodeQuery = "";
   // Open-Loops filter query — CLIENT-side (the loops all ride the wire), persisted across
   // re-renders (a verb fires → the board rebuilds → you stay in your filter) and into the
-  // focus modal. Empty = show all. Matches spore text OR spore-id.
+  // focus modal. Empty = show all. Matches intention text OR intention-id.
   let openLoopsQuery = "";
-  const sporeQueries = Object.create(null);  // Tray / Open loops filter queries, keyed by panel kind
+  const intentionQueries = Object.create(null);  // Tray / Open loops filter queries, keyed by panel kind
   // The Tray's chosen view ("" = the kernel's own order, else a view id) and the Episodes agent filter
   // ("" = all). Both are display choices that survive a refresh re-render in the same page.
   let trayView = "";
-  // The List's surface filter ("" = all, else band | board | spore | talk | drop) and the intake box's kept state: the receipt
+  // The List's surface filter ("" = all, else band | board | intention | talk | drop) and the intake box's kept state: the receipt
   // line under the box and an unsent line. A landed write re-reads the page and rebuilds the box, so both live here, not in the DOM.
   let listSurface = "";
   // The List's time filter ("" = every time-state, else now | later | someday | done): it cuts across the type chips above.
@@ -308,7 +308,7 @@
     }
     if (entityEl) {
       const stem = (paths.episodic_db ? String(paths.episodic_db).split("/").pop() : "") || "substrate";
-      // A rename editor open in the masthead (spore-280 — the pre-existing twin of the 247
+      // A rename editor open in the masthead (intention-280 — the pre-existing twin of the 247
       // state-line stranding). Unlike renderState (which replaceChildren-rebuilds #state and so
       // tears its editor down for free), the entity name toggles #entity's display + hangs a
       // sibling .name-editor on .unit — so the teardown must be EXPLICIT here or a successful
@@ -421,7 +421,7 @@
   // reflow), short panels render at natural height (no wasted space, no scrollbar).
   // Replaces the clamp+fade+click-to-expand model (Slice 1.5): bounded overview +
   // details-on-demand (the search box + the Slice-2 modal).
-  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "spores", "tray", "external", "edits"]);
+  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "intentions", "tray", "external", "edits"]);
 
   // Measure whether a bounded body overflows its cap; set the overflow SCENT (.has-overflow)
   // AND a keyboard scroll affordance accordingly. RE-RUNNABLE — clears the state when content
@@ -431,7 +431,7 @@
   // The work lists draw whole rows and say how many they leave out: a list that does not fit its card folds the rows below the fold
   // (display none, never a half row) and ends in an "N more" link that opens the panel's focus view. Re-runnable: a redraw, a filter
   // or a resize unfolds first and measures again.
-  const FOLD_PANELS = ["tray", "loops", "episodes", "inbox", "roster", "stream", "flow-episodes", "flow-spores"];
+  const FOLD_PANELS = ["tray", "loops", "episodes", "inbox", "roster", "stream", "flow-episodes", "flow-intentions"];
   // what a folding list is made of: its rows (a work row, a roster row, a log line) and the headings that group them
   const FOLD_ROW = ".row, .rrow, .lrow", FOLD_HEAD = ".grp-head, .grp-h";
   function foldRows(body) {
@@ -1599,7 +1599,7 @@
       case "health": return renderHealth(entry, view);
       case "graph": return renderGraph(entry, view);
       case "crystals": return renderCrystals(entry, view);
-      case "spores": return renderSpores(entry, view);
+      case "intentions": return renderIntentions(entry, view);
       case "tray": return renderTray(entry, view, opts);
       case "episodes": return renderEpisodes(entry, view, opts);
       case "wraps": return renderWraps(entry, view);
@@ -1909,7 +1909,7 @@
     restoreKeptScroll(root, kept);
   }
 
-  // Append a clause + its per-item expand toggle (shared by spore + episode rows). The
+  // Append a clause + its per-item expand toggle (shared by intention + episode rows). The
   // FULL canonical text goes into the DOM via textContent (the wire no longer truncates),
   // so expand is instant and any edit reads the whole thing — no truncation, no data loss.
   // CSS clamps the clause to 3 lines; measureClauses reveals the toggle only when it
@@ -1973,12 +1973,12 @@
     return clause;
   }
 
-  // One spore row, shared by the two projections (Open Loops / Tray). The
+  // One intention row, shared by the two projections (Open Loops / Tray). The
   // leading chip is the panel's salient axis: Tray badges the `disposition` (the
   // operator-I/O class — seed/handoff/agenda), Open Loops badges the `tier` (a parked loop badges "parked"). `verbs`
   // rides only on a Class-B panel (Open Loops in 3a; Tray renders read-only until 3b
   // turns on the governed dump/sort/park verbs — edit_class "" → isVerbPanel false → none).
-  // The ONE place a verb-bearing row takes its verbs: every row kind (spore, episode, pending cancel) passes through
+  // The ONE place a verb-bearing row takes its verbs: every row kind (intention, episode, pending cancel) passes through
   // here. On the KE page the verbs are clipped until the row is hovered or has focus, so the row itself must be
   // focusable (tabIndex 0) or a keyboard user never reaches them.
   // On the KE page at most VERBS_VISIBLE verbs show; the rest sit behind a "···" menu (a popover: Enter/Space opens it,
@@ -2095,19 +2095,19 @@
     }
     return s.surface;
   }
-  function sporeRow(s, verbs, badgeField, panelKind) {
+  function intentionRow(s, verbs, badgeField, panelKind) {
     const row = el("div", "row");
     if (s.row_id) row.dataset.rowKey = s.row_id;   // where a transport notice lands after the board is rebuilt
-    // A List row says which store it comes from. A band or board row is NOT a spore (an operator question, a ready work item): it
-    // shows no spore id and no spore verb, whatever the row's actions say.
+    // A List row says which store it comes from. A band or board row is NOT an intention (an operator question, a ready work item): it
+    // shows no intention id and no intention verb, whatever the row's actions say.
     const foreign = s.surface === "band" || s.surface === "board";
     // a List row keeps its meta (id, surface chip, tags) in ONE grid cell that wraps: the row grid has four
     // fixed meta columns, and a drop row carries more than four small facts
     const host = s.surface ? el("span", "list-meta") : row;
     if (s.surface) row.dataset.surface = s.surface;
     if (s.surface && s.time_state) row.dataset.timeState = s.time_state;
-    // the spore id is the common reference handle (how flow tracks + you name it,
-    // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
+    // the intention id is the common reference handle (how flow tracks + you name it,
+    // e.g. "compost intention-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
     // A List row's pill names THAT ROW'S OWN origin: its repo, or the lowercase "<origin>:" its text leads with ("desk: ...",
     // "levain: ..."). Never the store the row sits in (the pointer already says that) and never a repo its words merely mention;
@@ -2122,7 +2122,7 @@
       originDrawn = !!origin;
       if (origin) { const pill = el("span", "k7-repo", String(origin)); pill.dataset.repoFacet = String(origin); pill.dataset.originPill = "1"; host.appendChild(pill); }
     }
-    if (s.id && !foreign) { host.appendChild(el("span", "sid", s.id)); row.dataset.spore = String(s.id); }   // the Work lens finds a loop's row by this
+    if (s.id && !foreign) { host.appendChild(el("span", "sid", s.id)); row.dataset.intention = String(s.id); }   // the Work lens finds a loop's row by this
     // Tray badges the disposition (a legacy note badges "note"); Open Loops the tier (a parked loop badges "parked").
     let badge;
     if (badgeField === "disposition") badge = s.disposition;
@@ -2181,7 +2181,7 @@
       if (s.surface === "talk" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(tagEl("muted", s.age_days + " d old"));
       if (s.deliver_to && s.surface === "drop" && !s.wake_line) host.appendChild(tagEl("muted", "to " + s.deliver_to));
       if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
-      if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
+      if (verbs && s.id) appendRowVerbs(row, buildPlainIntentionVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
       return row;
     }
     if (s.next) {
@@ -2200,28 +2200,28 @@
     if (panelKind !== "tray" && s.tier) row.dataset.heat = String(s.tier);   // Open loops: a stripe per heat
     if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
     // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
-    // the integer the kernel sends (the spore's own created date), never the badge words parsed back
+    // the integer the kernel sends (the intention's own created date), never the badge words parsed back
     if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
     if (s.domain && !originDrawn) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
-    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
+    if (verbs && s.id) appendRowVerbs(row, buildPlainIntentionVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
 
-  // The filter bar the spore panels share (Open Loops / Tray): CLIENT-side over the
-  // loaded list, text (case-insensitive substring) OR spore-id. The query persists per panel
-  // kind in `sporeQueries`, so a verb that rebuilds the board leaves you in your filter.
+  // The filter bar the intention panels share (Open Loops / Tray): CLIENT-side over the
+  // loaded list, text (case-insensitive substring) OR intention-id. The query persists per panel
+  // kind in `intentionQueries`, so a verb that rebuilds the board leaves you in your filter.
   // FILTER-EXTRACT-START (a node test lifts this block)
   // opts (optional): controls(bar, redraw) adds in-panel controls to the bar; pick(list) returns the
   // rows to filter (a view's own order), re-read on every redraw; extra() returns rows listed apart that are
   // filtered with the rest; empty is the message shown when nothing is listed and there is no query;
   // unlisted() returns rows that are not listed now (held back) but would be searched, so an empty result
   // can say how many of them match the query and offer to show them (hintShow(n, show) builds that offer).
-  function mountSporeFilter(p, all, noun, kind, drawRows, opts) {
+  function mountIntentionFilter(p, all, noun, kind, drawRows, opts) {
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");
     input.type = "search";
-    narrowPlaceholder(input, "filter " + noun + " by text or spore-id…", "filter by text or id…");
-    input.setAttribute("aria-label", "filter " + kind + " by text or spore id");
+    narrowPlaceholder(input, "filter " + noun + " by text or intention-id…", "filter by text or id…");
+    input.setAttribute("aria-label", "filter " + kind + " by text or intention id");
     const status = el("span", "ep-search-status", "");
     bar.append(input, status);
     p.appendChild(bar);
@@ -2246,17 +2246,17 @@
       const b = results.closest(".pbody"); if (b) measureOverflow(b);
       measureClauses(results);
     };
-    input.addEventListener("input", () => { sporeQueries[kind] = input.value; render(input.value); });
+    input.addEventListener("input", () => { intentionQueries[kind] = input.value; render(input.value); });
     if (opts && opts.controls) opts.controls(bar, () => render(input.value));
-    if (sporeQueries[kind]) input.value = sporeQueries[kind];
+    if (intentionQueries[kind]) input.value = intentionQueries[kind];
     render(input.value);
   }
 
   // FILTER-EXTRACT-END
 
-  // The three spore projections share one renderer — same read/verb contract, different
+  // The three intention projections share one renderer — same read/verb contract, different
   // source list + badge axis + empty copy. All three read their fault from the single
-  // `open_spores` error key (the dashboard does ONE spore read that fills all three).
+  // `open_intentions` error key (the dashboard does ONE intention read that fills all three).
   // a group heading in a list is a heading to a screen reader too (VoiceOver rotor), the look is the same
   function headingEl(text) {
     const h = el("div", "grp-head", text);
@@ -2266,13 +2266,13 @@
   }
   // the heading the kernel gives the List's desk group; a carried desk row's second listing wears it when no desk row sent it
   const DESK_OWES_TITLE = "Desk owes (the desk is on these; nothing for you)";
-  function renderSporeProjection(entry, view, list, emptyMsg, badgeField, ropts) {
+  function renderIntentionProjection(entry, view, list, emptyMsg, badgeField, ropts) {
     const p = panel(entry);
-    // Both projections (Open Loops / Tray) come from ONE dashboard spore read,
-    // whose fault is recorded under the single "open_spores" key — so every projection
+    // Both projections (Open Loops / Tray) come from ONE dashboard intention read,
+    // whose fault is recorded under the single "open_intentions" key — so every projection
     // reads its error from there BY DESIGN (not a copy-paste slip). If a future split gives
     // Tray its own source, give each its own error key here. [complement L3 LOW]
-    const err = tierErr(view, "open_spores");
+    const err = tierErr(view, "open_intentions");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
@@ -2413,7 +2413,7 @@
       },
       pick: () => rowsFor(stateNow()),
     } : undefined;
-    mountSporeFilter(p, list || [], "items", entry.kind, (rows, results) => {
+    mountIntentionFilter(p, list || [], "items", entry.kind, (rows, results) => {
       let lastGroup = null;
       let lastBucket = null;
       let box = results;
@@ -2437,27 +2437,27 @@
           box.appendChild(sub);
         }
         lastGroup = g;
-        box.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
+        box.appendChild(intentionRow(s, verbs, badgeField, entry.kind));
       }
     }, opts);
     return p;
   }
 
-  function renderSpores(entry, view) {
+  function renderIntentions(entry, view) {
     const p = panel(entry);
-    const err = tierErr(view, "open_spores");
+    const err = tierErr(view, "open_intentions");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
-    const all = view.open_spores || [];
+    const all = view.open_intentions || [];
     const verbs = isVerbPanel(entry);
     // CLIENT-side filter over the loaded loops (they all ride the wire — no server round-trip,
-    // unlike the episode keyword search). Matches the spore TEXT (case-insensitive substring)
-    // OR the id ("spore-103", "intention-103" or "103"), so you can jump straight to a loop by handle or
+    // unlike the episode keyword search). Matches the intention TEXT (case-insensitive substring)
+    // OR the id ("intention-103", "intention-103" or "103"), so you can jump straight to a loop by handle or
     // content [2026-06-19]. Reuses the .ep-search sticky bar for visual parity.
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");
     input.type = "search";
     input.placeholder = "filter loops by text or id…";
-    input.setAttribute("aria-label", "filter open loops by text or spore id");
+    input.setAttribute("aria-label", "filter open loops by text or intention id");
     const status = el("span", "ep-search-status", "");
     bar.append(input, status);
     p.appendChild(bar);
@@ -2474,7 +2474,7 @@
         results.appendChild(el("p", "empty",
           q ? "no loops match “" + raw.trim() + "”" : "Nothing yet. What stays open after " + (view.entity_name || "the assistant") + " sorts the Tray is listed here."));
       } else {
-        for (const s of rows) results.appendChild(sporeRow(s, verbs, "tier", entry.kind));
+        for (const s of rows) results.appendChild(intentionRow(s, verbs, "tier", entry.kind));
       }
       status.textContent = q ? (rows.length + (rows.length === 1 ? " match" : " matches") + " · ⌫ to clear") : "";
       // result set changed → recompute the panel scent + the per-item expand toggles. .pbody
@@ -2503,7 +2503,7 @@
   }
 
   function renderTray(entry, view, opts) {
-    const p = renderSporeProjection(entry, view, view.tray,
+    const p = renderIntentionProjection(entry, view, view.tray,
       "Nothing yet. Drop a line in the box above and " + (view.entity_name || "the assistant") + " sorts it.", "disposition", opts);
     // The intake box is the primary capture affordance (the List's one line) — mounted under the title when
     // writable. A read-only port (mesh) shows the List but offers no box (NO-THEATER). A panel that sends no `surface` on its
@@ -2517,7 +2517,7 @@
 
   // The List's surface filter: one chip per store that has a row now, with its count, plus All. A display choice only
   // (`listSurface`); the rows and their order are the kernel's.
-  const SURFACE_WORDS = { band: "band", board: "board", spore: "spores", talk: "talk", drop: "drops" };
+  const SURFACE_WORDS = { band: "band", board: "board", intention: "intentions", talk: "talk", drop: "drops" };
   // ONE rule for which rows a surface chip stands for: the chip's count and the rows the focus view draws under it both use it, so
   // a number on a chip is the number of rows its tap shows, and the type chips add up to "all" in every time-state.
   function inSurfaceChip(s) {
@@ -2682,7 +2682,7 @@
   }
 
   // One episode row — the SINGLE markup for both the recent list and keyword-search
-  // hits (spore-107), so they render identically. `verbs` carries the panel's verb
+  // hits (intention-107), so they render identically. `verbs` carries the panel's verb
   // affordance (the tombstone), which works on search rows too: `commit` is the
   // module-level closure, available to dynamically-added rows.
   function episodeRow(e, verbs, showAgent) {
@@ -2711,7 +2711,7 @@
     const modal = !!(opts && opts.modal);
     const myGen = modalGen;
 
-    // spore-107: inline keyword search over the episodic store, READ-ONLY. Enter runs
+    // intention-107: inline keyword search over the episodic store, READ-ONLY. Enter runs
     // a /recall.json query and swaps the recent list for matches; clearing the box
     // restores the recent list. (Slice-2 evolution = search-into-modal, shape (c).)
     const bar = el("div", "ep-search");
@@ -2788,7 +2788,7 @@
       status.textContent = "searching…";
       try {
         // Route through the injected recall transport when present (it carries the off-box token —
-        // spore-220 gates /recall.json off-box); fall back to a direct token-free fetch otherwise.
+        // intention-220 gates /recall.json off-box); fall back to a direct token-free fetch otherwise.
         let data;
         if (recall) {
           data = await recall(q);
@@ -2839,7 +2839,7 @@
     return p;
   }
 
-  // Projection history (Slice 2b-ii / spore-093 v0). Each wrap is a RE-PROJECTION of
+  // Projection history (Slice 2b-ii / intention-093 v0). Each wrap is a RE-PROJECTION of
   // the continuity from the moving substrate — a regeneration, not a saved version.
   // The teaching frame + the per-wrap size delta make the projection visibly REGENERATE;
   // the deliberate ABSENCE of a restore button is the lesson (you can't roll a
@@ -3271,10 +3271,10 @@
       (entry.kind === "config" || entry.kind === "section");
   }
 
-  // A Class-B panel (spores / episodes — the operator's INPUT layer) gets
+  // A Class-B panel (intentions / episodes — the operator's INPUT layer) gets
   // verb affordances when a write transport is present (read-only port → none).
   // The verbs are anneal-validated lifecycle ops, never raw edits; a DESTRUCTIVE
-  // one (resolving a spore / tombstoning an episode) sends confirm:true — and the
+  // one (resolving an intention / tombstoning an episode) sends confirm:true — and the
   // server enforces that too, so the UI confirm is the affordance, not the gate.
   function isVerbPanel(entry) {
     return !!commit && entry.edit_class === "B";
@@ -3303,7 +3303,7 @@
     const editor = el("div", "editor");
     const ta = el("textarea", "edit-ta");
     ta.value = doc.body || "";  // .value (not innerHTML) — store text never becomes markup
-    ta.dataset.orig = ta.value;  // dirty baseline for hasUnsavedEdit (spore-108): an involuntary
+    ta.dataset.orig = ta.value;  // dirty baseline for hasUnsavedEdit (intention-108): an involuntary
     // re-render (visibilitychange / refresh-button) is deferred while value diverges from this.
     const controls = el("div", "edit-controls");
     const save = el("button", "edit-save", "save");
@@ -3359,16 +3359,16 @@
   }
 
   // ---- Class-B verb affordances (Slice 2b-ii) ----
-  // Spores + episodes are the operator's INPUTS, mutated through anneal's validated
+  // Intentions + episodes are the operator's INPUTS, mutated through anneal's validated
   // verbs (never raw writes). A metal button per row; destructive verbs open a small
   // confirm/kind form that sends confirm:true (the server requires it regardless).
 
-  // The cockpit verb each spore button fires. On a manifest row (one that lists its `actions`) a button
+  // The cockpit verb each intention button fires. On a manifest row (one that lists its `actions`) a button
   // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
-  const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", park: "spore_update",
-    reactivate: "spore_update", "when?": "spore_surface_at", who: "spore_retarget", Resolve: "spore_descend", metabolize: "spore_set_disposition",
-    dismiss: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
+  const BUTTON_VERB = { touch: "intention_touch", edit: "intention_update", park: "intention_update",
+    reactivate: "intention_update", "when?": "intention_surface_at", who: "intention_retarget", Resolve: "intention_close", metabolize: "intention_set_disposition",
+    dismiss: "intention_close", compost: "intention_close", promote: "intention_promote",
     tombstone: "episode_tombstone" };
 
   // a row tag (a disposition, a tier, a type, hashtags, a due date): plain meta text; the page's CSS decides how it
@@ -3430,7 +3430,7 @@
     return b;
   }
 
-  function buildSporeVerbs(s, panelKind) {
+  function buildPlainIntentionVerbs(s, panelKind) {
     const wrap = el("span", "verb-actions");
 
     // A TRAY item (the forming workbench): edit is
@@ -3441,7 +3441,7 @@
       // silent-loss direction, so no confirm); the type LOCKS at this boundary.
       wrap.appendChild(verbBtn("metabolize", "promote into cognition as a live loop", async (ev) => {
         const b = ev.currentTarget; b.disabled = true;
-        const res = await commit({ kind: "spore_set_disposition", spore_id: s.id, disposition: "loop",
+        const res = await commit({ kind: "intention_set_disposition", intention_id: s.id, disposition: "loop",
           expect_disposition: s.disposition });
         if (res && res.ok) return;  // re-rendered
         b.disabled = false;
@@ -3452,7 +3452,7 @@
       if (rowTarget(s)) wrap.appendChild(verbBtn("who", "who does it: you or the machine", () => openWhoForm(wrap, s)));
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
         wrap.appendChild(verbBtn("Resolve", "resolve or compost this inbox item", () =>
-          openResolveForm(wrap, "spore_descend", "dismiss", s, s.descend_kinds, false)));
+          openResolveForm(wrap, "intention_close", "dismiss", s, s.descend_kinds, false)));
       }
       return gateByActions(wrap, s.actions);
     }
@@ -3460,7 +3460,7 @@
     // OPEN LOOPS — the entity's live cognition: the lifecycle verbs (+ edit + schedule).
     wrap.appendChild(verbBtn("touch", "mark seen — reset its clock", async (ev) => {
       const b = ev.currentTarget; b.disabled = true;
-      const res = await commit({ kind: "spore_touch", spore_id: s.id });
+      const res = await commit({ kind: "intention_touch", intention_id: s.id });
       if (res && res.ok) return;  // shim re-fetched + re-rendered → this DOM is gone
       b.disabled = false;
       verbErr(wrap, res);
@@ -3470,13 +3470,13 @@
     // park — pin dormant: hide from active cognition but the loop stays OPEN (exempt from the
     // dormancy→compost prompt), resurfaceable, and shown HERE with a parked marker (the Keep panel is gone).
     // A parked row offers the inverse, "reactivate" (un-park, back to warm). A tier change
-    // (spore_update{tier}), NON-destructive (the loop isn't resolved), so no confirm.
-    // spore-173: both are offered only on a loop (this Open-Loops branch) → CAS the snapshot so a
+    // (intention_update{tier}), NON-destructive (the loop isn't resolved), so no confirm.
+    // intention-173: both are offered only on a loop (this Open-Loops branch) → CAS the snapshot so a
     // concurrent re-route before the write fails closed instead of tiering a now-note.
     if (s.tier === "parked") {
       wrap.appendChild(verbBtn("reactivate", "un-park → back into active cognition", async (ev) => {
         const b = ev.currentTarget; b.disabled = true;
-        const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "warm",
+        const res = await commit({ kind: "intention_update", intention_id: s.id, tier: "warm",
                                    expect_disposition: s.disposition });
         if (res && res.ok) return;  // re-rendered
         b.disabled = false;
@@ -3485,7 +3485,7 @@
     } else {
       wrap.appendChild(verbBtn("park", "pin dormant — hide from cognition, stays open (reactivate to restore)", async (ev) => {
         const b = ev.currentTarget; b.disabled = true;
-        const res = await commit({ kind: "spore_update", spore_id: s.id, tier: "parked",
+        const res = await commit({ kind: "intention_update", intention_id: s.id, tier: "parked",
                                    expect_disposition: s.disposition });
         if (res && res.ok) return;  // re-rendered
         b.disabled = false;
@@ -3493,20 +3493,20 @@
       }));
     }
     // compost (descend) / promote (ascend) — destructive; kind comes from the
-    // spore's own type taxonomy (server-emitted, so the UI can't offer an invalid kind).
+    // intention's own type taxonomy (server-emitted, so the UI can't offer an invalid kind).
     if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
       wrap.appendChild(verbBtn("compost", "resolve this loop downward", () =>
-        openResolveForm(wrap, "spore_descend", "compost", s, s.descend_kinds, false)));
+        openResolveForm(wrap, "intention_close", "compost", s, s.descend_kinds, false)));
     }
     if (Array.isArray(s.ascend_kinds) && s.ascend_kinds.length) {
       wrap.appendChild(verbBtn("promote", "transmute into memory / project", () =>
-        openResolveForm(wrap, "spore_ascend", "promote", s, s.ascend_kinds, true)));
+        openResolveForm(wrap, "intention_promote", "promote", s, s.ascend_kinds, true)));
     }
     return gateByActions(wrap, s.actions);
   }
 
   // WHO acts when an agenda wakes is derived from its target and never stored: a band row or a nudge rings in the band (you),
-  // the desk and a board item are the machine's. Editing it sets `target` (spore_retarget), through the same words.
+  // the desk and a board item are the machine's. Editing it sets `target` (intention_retarget), through the same words.
   // the row's germinate target as the page holds it (the cockpit view names it deliver_to)
   const rowTarget = (s) => (typeof s.deliver_to === "string" && s.deliver_to ? s.deliver_to : "");
   function executorOf(target) {
@@ -3575,15 +3575,15 @@
     return picks;
   }
 
-  // The "when?" form on a spore row: quick picks (one tap writes), a date and a time input (two inputs, never datetime-local: a
+  // The "when?" form on an intention row: quick picks (one tap writes), a date and a time input (two inputs, never datetime-local: a
   // date-only pick stays one tap, and the phone's date and time wheels each open on their own), the who control, then
-  // schedule / clear / cancel. It writes `YYYY-MM-DDTHH:MM` through spore_surface_at; when the who control names a target the
-  // row does not hold, the same write goes through spore_retarget (a seed given a who becomes a dated agenda in that write).
+  // schedule / clear / cancel. It writes `YYYY-MM-DDTHH:MM` through intention_surface_at; when the who control names a target the
+  // row does not hold, the same write goes through intention_retarget (a seed given a who becomes a dated agenda in that write).
   // Mirrors openResolveForm's hide-triggers / one-form-at-a-time / Escape-cancel shape.
   // `opts` (the intention snooze): {label, post(value), min, back(value), done(value), stale}: the same date picker, a different
   // button word, no "clear" (a snooze always names a day), the earliest day it takes (`min`, refused in plain words before
   // anything is sent), a visible line naming when the row comes back, the row's words once it is sent, and the words a stale
-  // refusal reads as; the pick is posted through `post` instead of the spore write.
+  // refusal reads as; the pick is posted through `post` instead of the intention write.
   function openSurfaceForm(host, s, opts) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
@@ -3591,9 +3591,9 @@
     triggers.forEach((b) => (b.style.display = "none"));
     const form = el("span", "verb-form when-form");
     const picksBox = el("span", "when-picks");
-    // the who control only where the cockpit offers spore_retarget (a seed or an agenda): a loop is nobody's to hand off
+    // the who control only where the cockpit offers intention_retarget (a seed or an agenda): a loop is nobody's to hand off
     // a row with no actions list (a legacy row) is offered none: the who control is drawn only on the kernel's offer
-    const canWho = Array.isArray(s.actions) && s.actions.some((x) => x && x.verb === "spore_retarget");
+    const canWho = Array.isArray(s.actions) && s.actions.some((x) => x && x.verb === "intention_retarget");
     const who = canWho ? whoControl(s) : { node: null, value: () => null };
     const input = el("input", "verb-date");
     input.type = "date";
@@ -3650,8 +3650,8 @@
       for (const b of all) b.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = opts && opts.post ? await opts.post(value) : await commit(retarget
-        ? { kind: "spore_retarget", spore_id: s.id, target: t, surface_at: value }
-        : { kind: "spore_surface_at", spore_id: s.id, surface_at: value });
+        ? { kind: "intention_retarget", intention_id: s.id, target: t, surface_at: value }
+        : { kind: "intention_surface_at", intention_id: s.id, surface_at: value });
       if (res && res.ok) {   // re-rendered; a row that stays (or a redraw still to come) reads what was done
         if (opts && opts.done) { msg.className = "edit-msg"; msg.textContent = opts.done(value); }
         return;
@@ -3755,7 +3755,7 @@
     return gateByActions(wrap, actions);
   }
 
-  // The who form: a row that already holds a target changes hands without touching its day (spore_retarget{target}).
+  // The who form: a row that already holds a target changes hands without touching its day (intention_retarget{target}).
   function openWhoForm(host, s) {
     if (host.querySelector(".verb-form")) return;
     const stale = host.querySelector(".edit-msg"); if (stale) stale.remove();
@@ -3782,7 +3782,7 @@
       if (t === null || t === rowTarget(s)) { msg.className = "edit-msg err"; msg.textContent = "pick who does it"; return; }
       go.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "…";
-      const res = await commit({ kind: "spore_retarget", spore_id: s.id, target: t });
+      const res = await commit({ kind: "intention_retarget", intention_id: s.id, target: t });
       if (res && res.ok) return;  // re-rendered
       showFail(msg, res, "failed");
       go.disabled = false; cancel.disabled = false;
@@ -3793,7 +3793,7 @@
   // trigger buttons, mount a form, wire cancel + Escape (stopPropagation so it doesn't nuke an
   // enclosing focus-modal), and run `onConfirm` which returns the commit request (or null to
   // validate-fail with `msg`). One form per row at a time.
-  // A write refused as stale (spore-174) leaves the form that submitted it pointing at a row this page no
+  // A write refused as stale (intention-174) leaves the form that submitted it pointing at a row this page no
   // longer has right. Retire THAT form only: its inputs stop counting as unsaved text (so the re-read that
   // replaces the row is not held off by the refused request's own leftovers) and its buttons stay off so the old
   // request cannot be sent again. Other open editors are untouched. The boot layer re-reads on the event.
@@ -3839,12 +3839,12 @@
     });
   }
 
-  // Inline text edit — the forming-workbench refine (spore_update{text}). Any spore. When the kernel offers
+  // Inline text edit — the forming-workbench refine (intention_update{text}). Any intention. When the kernel offers
   // `domain` on this row's edit, the form carries a domain input too (prefilled from the row): domain is
   // sent only when it differs from what was shown, and as "" only when the operator clears a domain on
   // purpose. A text-only edit keeps the same request.
   function offersDomain(s) {
-    const a = Array.isArray(s.actions) ? s.actions.find((x) => x && x.verb === "spore_update") : null;
+    const a = Array.isArray(s.actions) ? s.actions.find((x) => x && x.verb === "intention_update") : null;
     return !!a && Array.isArray(a.escalates) && a.escalates.some((x) => x && x.param === "domain");
   }
   function openTextEdit(host, s) {
@@ -3852,12 +3852,12 @@
     openRowForm(host, () => {
       const ta = el("textarea", "verb-edit-ta");
       ta.value = s.text || "";  // FULL canonical text — the wire no longer truncates, so edit
-      // reads/writes the WHOLE thing (edit-raw, no data loss). Size to content so a long spore
+      // reads/writes the WHOLE thing (edit-raw, no data loss). Size to content so a long intention
       // is visible without hunting in a 2-row box (it still scrolls past the cap; the full
       // value is always in .value regardless).
       const lines = ta.value.split("\n").length;
       ta.rows = Math.min(16, Math.max(3, lines, Math.ceil(ta.value.length / 56)));
-      ta.dataset.orig = ta.value;  // dirty baseline for hasUnsavedEdit (spore-108)
+      ta.dataset.orig = ta.value;  // dirty baseline for hasUnsavedEdit (intention-108)
       if (!withDomain) return { nodes: [ta], focus: ta, ta };
       const dom = el("input", "verb-domain");
       dom.type = "text"; dom.maxLength = 64; dom.placeholder = "domain";
@@ -3867,12 +3867,12 @@
       return { nodes: [ta, dom], focus: ta, ta, dom };
     }, (f, msg) => {
       // Save the value VERBATIM — only trim for the empty-CHECK. trimming the saved text
-      // would silently strip a spore's structural leading/trailing newlines on its first
+      // would silently strip an intention's structural leading/trailing newlines on its first
       // edit (the small sibling of the truncation data-loss this slice fixes) [complement L3].
       const text = f.ta.value;
       if (!text.trim()) { msg.className = "edit-msg err"; msg.textContent = "text can't be empty"; return null; }
-      if (!f.dom) return { kind: "spore_update", spore_id: s.id, text };
-      const req = { kind: "spore_update", spore_id: s.id };
+      if (!f.dom) return { kind: "intention_update", intention_id: s.id, text };
+      const req = { kind: "intention_update", intention_id: s.id };
       const textChanged = text !== (s.text || "");
       const domChanged = f.dom.value.trim() !== (s.domain || "");
       if (!textChanged && !domChanged) { msg.className = "edit-msg err"; msg.textContent = "nothing changed"; return null; }
@@ -3922,7 +3922,7 @@
     return buildCaptureBox(
       `Drop anything. ${entity} sorts it.`,
       "drop", "nothing to drop", false,
-      (text) => ({ kind: "spore_seed", text }), entity);
+      (text) => ({ kind: "intention_seed", text }), entity);
   }
 
   // The destructive resolve form: a kind <select> (+ a ref <input> for ascend) and a
@@ -3962,8 +3962,8 @@
       if (!go.disabled) close();
     });
     go.addEventListener("click", async () => {
-      const req = { kind: kind, spore_id: s.id, spore_kind: sel.value, confirm: true };
-      // spore-173/174: the face (compost/dismiss) and the promote were chosen off the rendered row, so
+      const req = { kind: kind, intention_id: s.id, intention_kind: sel.value, confirm: true };
+      // intention-173/174: the face (compost/dismiss) and the promote were chosen off the rendered row, so
       // that row's disposition rides the request and the server compares it first; a re-route in the
       // confirm window answers stale instead of acting on a row the operator never saw.
       req.expect_disposition = s.disposition;
@@ -4031,11 +4031,11 @@
   // fixed-height + internal scroll + ⤢ expand-to-modal every other box has (no link off the
   // page — the modal IS the full view). Each line renders as a `.row` with an optional leading
   // `meta` label + the body as an `appendClause` (clamped to 4 lines with per-item expand —
-  // the episodes/spores idiom), plus an optional `accent` (e.g. unread) / `dim` (e.g. read)
+  // the episodes/intentions idiom), plus an optional `accent` (e.g. unread) / `dim` (e.g. read)
   // flag. The kernel knows nothing domain-specific — the flow Bridge renders its inbox here.
   // Every store-derived string is textContent (via el()/appendClause), never innerHTML.
   // The governed COMPOSE affordance for an external panel's action verb (the external-panel-
-  // ACTION seam — the write-peer of how spore panels carry verbs). One control per declared
+  // ACTION seam — the write-peer of how intention panels carry verbs). One control per declared
   // field (textarea | text | csv); a submit labeled from the verb REGISTRY; when the verb is
   // confirm_required, a confirm/cancel step before sending confirm:true (the kernel 409s without
   // it — the confirm is the fat-finger affordance, the server is the gate). On success the board
@@ -7619,7 +7619,7 @@
     return Array.prototype.find.call(document.querySelectorAll('.panel[data-ck-panel="loops"]'), (p) => !p.closest(".modal")) || null;
   }
   function loopRowIn(panel, id) {
-    return Array.prototype.find.call(panel.querySelectorAll(".row[data-spore]"), (n) => n.dataset.spore === id && !n.closest(".modal")) || null;
+    return Array.prototype.find.call(panel.querySelectorAll(".row[data-intention]"), (n) => n.dataset.intention === id && !n.closest(".modal")) || null;
   }
   // The page's row for a loop, or null. A filter typed into the panel's bar hides rows by not drawing them, so a row that is missing under a
   // query is looked for again with the query cleared through the bar's own input path; when it is not there either, the person's query is put back.
@@ -7673,7 +7673,7 @@
     }
     if (!row.getClientRects().length) { loopRestore(id); loopWhy = "hidden"; return false; }
     loopCleared = null;
-    for (const n of document.querySelectorAll(".tv-lit[data-spore]")) n.classList.remove("tv-lit");
+    for (const n of document.querySelectorAll(".tv-lit[data-intention]")) n.classList.remove("tv-lit");
     row.classList.add("tv-lit");
     window.clearTimeout(loopLitTimer);
     loopLitTimer = window.setTimeout(() => row.classList.remove("tv-lit"), 2600);
@@ -9184,7 +9184,7 @@
       msg.className = "edit-msg busy"; msg.textContent = "saving…";
       // Mark the editor "saving" so the SUCCESS reload's render() tears it down + restores the
       // entity line to the committed name, instead of the (passive-defer) guard leaving it
-      // stranded frozen on "saving…" (spore-280 — the twin of the 247 state-line stranding). A
+      // stranded frozen on "saving…" (intention-280 — the twin of the 247 state-line stranding). A
       // passive reload defers via hasUnsavedEdit(".name-editor"); only this save's passive:false
       // reload rebuilds #entity.
       editor.dataset.saving = "1";
@@ -9273,7 +9273,7 @@
   // Expand-to-modal (Slice 2): the ⤢ on a dense panel opens a focused, full-screen
   // re-render of THAT panel — the SAME per-kind renderer, unbounded (no .clamped cap)
   // and given the whole screen. So per-type functionality comes for free: the episode
-  // keyword-search becomes a roomy surface (search-into-modal, shape (c)), spore verbs
+  // keyword-search becomes a roomy surface (search-into-modal, shape (c)), intention verbs
   // and the in-place State edit work exactly as in the grid. It is a PURE projection
   // of `currentView`, rebuilt on every render(), so a verb fired inside it reflects at
   // once and it stays put. A read-only source (no commit) opens a read+search-only
@@ -9284,7 +9284,7 @@
   // panels are uniquely identified by their write-address (source + heading), so the key
   // OMITS the list-index `ref` for them — a ref shift (a section added/removed above the
   // expanded one between fetches) must NOT spuriously close the modal. Singleton kinds
-  // (episodes/spores/crystals/wraps/…) are unique by kind alone. JSON.stringify + a
+  // (episodes/intentions/crystals/wraps/…) are unique by kind alone. JSON.stringify + a
   // disjoint tag keeps the two key spaces from ever colliding.
   const entryKey = (e) =>
     e.kind === "external"
@@ -9596,12 +9596,12 @@
   });
 
   // Is the operator mid-edit/capture with text that an involuntary re-render would
-  // discard? (spore-108) render() rebuilds the whole #board (+ modal) via
+  // discard? (intention-108) render() rebuilds the whole #board (+ modal) via
   // replaceChildren, so a visibilitychange / refresh-button re-read fired while a
   // textarea is open silently loses the typing. The boot shim calls this to DEFER those
   // passive re-reads — NOT the save's own commit→load reload, which intentionally
   // rebuilds to show saved state (that's the call-site split that avoids breaking save).
-  //   - an edit-of-existing (`.edit-ta` State/config, `.verb-edit-ta` spore text) is
+  //   - an edit-of-existing (`.edit-ta` State/config, `.verb-edit-ta` intention text) is
   //     dirty once its value diverges from the `data-orig` stamped at open;
   //   - a capture/free-text box (`.tray-dump-ta` Tray dump; `.verb-ref`
   //     the ascend "what it became" ref — both always-empty at open, never prefilled) is
@@ -9615,7 +9615,7 @@
   //   (the masthead rename `.name-editor` USED to be excluded here — it survives a board
   //   rebuild since it lives outside `#board` — but render() now TEARS a data-saving editor
   //   down to close the rename, so a passive reload firing mid-save could strip it early and
-  //   flash the OLD name; it is gated below with `.state-editor`, spore-280.)
+  //   flash the OLD name; it is gated below with `.state-editor`, intention-280.)
   // Fails SAFE: a missing `data-orig` reads as dirty → defers a harmless passive re-read
   // rather than risking data loss (the boot shim's editInProgress fails closed the same way).
   function hasUnsavedEdit() {
@@ -9631,7 +9631,7 @@
     // An open masthead RENAME editor is unsaved work too, and for the same reason render()
     // now tears a saving one down: a passive reload must defer or it could strip the editor
     // mid-save and flash the old name (or drop the half-typed one). The authoritative SAVE
-    // reload is passive:false → NOT gated here → still rebuilds #entity (spore-280).
+    // reload is passive:false → NOT gated here → still rebuilds #entity (intention-280).
     if (document.querySelector(".name-editor")) return true;
     // a text panel's editor is prefilled with the current text: it is dirty only when it differs from that text (a closed
     // one, or one the person has not touched, must not hold off every refresh), and it is not an empty compose box

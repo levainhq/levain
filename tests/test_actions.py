@@ -34,7 +34,7 @@ def _writable_source(tmp_path: Path) -> SubstrateSource:
     (root / "seed").mkdir(parents=True)
     (root / "activation").mkdir(parents=True)
     (root / ".levain").mkdir()
-    for fn in ("world.md", "origin.md", "partnership.md", "memory.md", "spore_instructions.md"):
+    for fn in ("world.md", "origin.md", "partnership.md", "memory.md", "intention_instructions.md"):
         (root / "seed" / fn).write_text("# seed\n\n## Identity\n\nx\n", encoding="utf-8")
     (root / "activation" / "posture.md").write_text("Slow is fast.\n", encoding="utf-8")
     (root / "activation" / "recency_directives.md").write_text("No gatekeeping.\n", encoding="utf-8")
@@ -537,7 +537,7 @@ class TestActionRoute:
     def test_a_kernel_verb_is_not_an_action_alias(self, tmp_path: Path) -> None:
         # /action reaches DOWNSTREAM verbs only; a kernel verb name is 404 unknown_verb, not a bypass.
         with _serving_verbs(_writable_source(tmp_path), {}) as (base, _httpd):
-            status, body = _post(base + "/action", {"verb": "spore_touch", "params": {}})
+            status, body = _post(base + "/action", {"verb": "intention_touch", "params": {}})
         assert status == 404 and body["error"] == "unknown_verb"
 
     def test_action_shares_the_edit_auth_gate_cross_origin_refused(self, tmp_path: Path) -> None:

@@ -446,13 +446,13 @@ NON_IMPORT_SEED: tuple[str, ...] = ("continuity.md", "README.md")
 # leave a POINTER, so a new entry costs the carrier nothing.
 #
 # ⚠ THE POINTER IS NOT A FILENAME. A bare `see also` here would silently kill the
-# layer it points at: the spore tools stay in context, but the DISCIPLINE that
+# layer it points at: the intention tools stay in context, but the DISCIPLINE that
 # makes them fire (plant the moment a loop opens, resolution is mandatory) lives
 # only in the file. So each on-demand seed ships a RETENTION SUMMARY — the part
 # the entity must hold without opening the file — and the detail is one read away.
 # Same rule flow applies to its own on-demand siblings: capability + name stay
 # inline (reachable), the exact procedure one read away.
-ON_DEMAND_SEED: tuple[str, ...] = ("spore_instructions.md",)
+ON_DEMAND_SEED: tuple[str, ...] = ("intention_instructions.md",)
 
 # The wrap procedure is the one base file whose load class is the operator's choice,
 # per install and per agent. Eager is the default (an entity that never opens a file
@@ -467,14 +467,14 @@ MEMORY_LOAD_SEED: tuple[str, ...] = ("memory_workflow.md",)
 # every ON_DEMAND_SEED name has one, so adding to that tuple without writing the
 # summary FAILS rather than quietly emitting a bare pointer.
 ON_DEMAND_SUMMARY: dict[str, str] = {
-    "spore_instructions.md": (
+    "intention_instructions.md": (
         "**Your open loops are a real layer of your mind** — prospective memory, "
         "the sibling of anneal-memory. Your memory holds what happened and never "
-        "completes; a spore holds what is OPEN and must close. Plant one with "
-        "`spore_add` the moment a loop opens, rather than carrying it in your head "
-        "or burying it in your continuity. Every spore resolves exactly one of two "
-        "ways: `spore_descend` (it composted) or `spore_ascend` (it grew into "
-        "memory or work). A spore that never resolves is a leak. **Read this file "
+        "completes; an intention holds what is OPEN and must close. Plant one with "
+        "`intention_add` the moment a loop opens, rather than carrying it in your head "
+        "or burying it in your continuity. Every intention resolves exactly one of two "
+        "ways: `intention_close` (it composted) or `intention_promote` (it grew into "
+        "memory or work). An intention that never resolves is a leak. **Read this file "
         "before you plant, resolve, or reason about an open loop** — it holds the "
         "typed lifecycle, the germination surface, and the ascend membrane into "
         "your retrospective memory."
@@ -501,7 +501,7 @@ ON_DEMAND_SUMMARY: dict[str, str] = {
 # still loads, appended after these in roster order. Overriding one of these
 # (same filename) keeps its curriculum position.
 #
-# `spore_instructions.md` LEFT this list 2026-08-01 — it is now ON_DEMAND_SEED.
+# `intention_instructions.md` LEFT this list 2026-08-01 — it is now ON_DEMAND_SEED.
 # It is still a base methodology seed and still MUST reach the entity, which is
 # what BASE_SEED_REACHABLE below exists to keep true.
 BASE_IMPORT_ORDER: tuple[str, ...] = (
@@ -539,7 +539,7 @@ SEED_ROLE: dict[str, str] = {
     "partnership.md": "method",
     "memory.md": "mechanism",
     "memory_workflow.md": "mechanism",
-    "spore_instructions.md": "mechanism",
+    "intention_instructions.md": "mechanism",
 }
 
 # Share of the EAGER surface that may be `mechanism` before the composition is

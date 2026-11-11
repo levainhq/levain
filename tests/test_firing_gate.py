@@ -1,4 +1,4 @@
-"""The EFFERENT GATE's pure classifier — K3, spore-295.
+"""The EFFERENT GATE's pure classifier — K3, intention-295.
 
 BASE LANE on purpose: no ``importorskip``. :mod:`levain.firing.gate` is a stdlib-only leaf
 precisely so the rule that decides what an entity may do to the world can be exercised

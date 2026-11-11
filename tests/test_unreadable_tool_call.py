@@ -480,7 +480,7 @@ def test_a_finish_message_never_hides_a_call_that_did_not_run():
     assert humanize_finish_json(CALL_THEN_FINISH) == CALL_THEN_FINISH
     unknown = '{"name": "spreadsheet", "arguments": {}}\n{"name": "finish", "arguments": {"message": "Done"}}'
     assert humanize_finish_json(unknown) == unknown
-    # spore-297's shape, think and finish only, is still unwrapped to the reply
+    # intention-297's shape, think and finish only, is still unwrapped to the reply
     ok = '{"name": "think", "arguments": {"thought": "t"}}\n{"name": "finish", "arguments": {"message": "Hi"}}'
     assert humanize_finish_json(ok) == "Hi"
 

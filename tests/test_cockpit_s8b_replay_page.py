@@ -137,7 +137,7 @@ def test_a_source_the_past_read_could_not_rebuild_is_drawn_as_unknown_never_as_n
     # a literal replay value: every unreadable name is said, in words, with the same reason
     v = _value()
     v["replay"] = True
-    v["unreadable"] = ["spores", "lost_if_closed", "session_logs"]
+    v["unreadable"] = ["intentions", "lost_if_closed", "session_logs"]
     o = _run(tmp_path, src, [{"until": STRIP}, {"eval": _paint(v, "work")}, {"eval": PROBE}])
     unk = json.loads(o[-1])["unk"]
     assert [u.split(":")[0] for u in unk] == ["open loops", "what closing would lose", "rate and state from the session logs"], unk

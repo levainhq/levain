@@ -4,8 +4,8 @@ Builds a broker over a data root with ``kill_at`` passed as an argument (never a
 starts it, and drives ONE reported write. A kill point that fires ends this process with ``os._exit(137)``;
 a run that reaches the end prints the result as JSON and exits 0.
 
-argv[1]: JSON ``{data_root, spores, kill_at, verb, params, target, idempotency_key}``; the anneal kinds
-add ``db`` (the anneal store), which registers the episode and section stores beside the spore store;
+argv[1]: JSON ``{data_root, intentions, kill_at, verb, params, target, idempotency_key}``; the anneal kinds
+add ``db`` (the anneal store), which registers the episode and section stores beside the intention store;
 ``inbox`` (a file path) registers the fake downstream inbox (``tests/_inbox_fake.py``) for ``send_inbox``.
 """
 from __future__ import annotations
@@ -18,13 +18,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from levain.cockpit.broker import Broker
-from levain.cockpit.effects import SporeEffectStore
+from levain.cockpit.effects import IntentionEffectStore
 from levain.cockpit.anneal_effects import EPISODES, SECTIONS, EpisodeEffectStore, SectionEffectStore
 
 
 def main() -> int:
     cfg = json.loads(sys.argv[1])
-    stores: dict = {"spores": SporeEffectStore(cfg["spores"])}
+    stores: dict = {"spores": IntentionEffectStore(cfg["spores"])}
     paths = [cfg["spores"]]
     if cfg.get("db"):
         stores.update({EPISODES: EpisodeEffectStore(cfg["db"]), SECTIONS: SectionEffectStore(cfg["db"])})

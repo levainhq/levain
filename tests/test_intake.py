@@ -38,12 +38,12 @@ def test_refusal_is_a_valueerror_with_reason():
 
 
 def test_receipts():
-    line, d = receipt(parse_intake("@tomorrow check backups", _NOW), "spore-7")
-    assert line == "scheduled drop spore-7 fires Mon 11-09 09:00"
-    assert d == {"kind": "drop", "id": "spore-7", "fires": "2026-11-09T09:00", "text": "check backups"}
-    line, d = receipt(parse_intake("? flow's future", _NOW), "spore-8")
-    assert line == "talk spore-8"
-    assert d == {"kind": "talk", "id": "spore-8", "fires": None, "text": "flow's future"}
+    line, d = receipt(parse_intake("@tomorrow check backups", _NOW), "intention-7")
+    assert line == "scheduled drop intention-7 fires Mon 11-09 09:00"
+    assert d == {"kind": "drop", "id": "intention-7", "fires": "2026-11-09T09:00", "text": "check backups"}
+    line, d = receipt(parse_intake("? flow's future", _NOW), "intention-8")
+    assert line == "talk intention-8"
+    assert d == {"kind": "talk", "id": "intention-8", "fires": None, "text": "flow's future"}
     line, d = receipt(parse_intake("buy milk", _NOW))
     assert line == "sent to the desk to sort"
     assert d == {"kind": "sort", "id": None, "fires": None, "text": "buy milk"}

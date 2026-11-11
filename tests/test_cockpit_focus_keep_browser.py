@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
@@ -48,7 +48,7 @@ class _Churn:
 
     def _run(self) -> None:
         try:
-            store = SporeStore(self.root / ".levain" / "memory.spores.json")
+            store = IntentionStore(self.root / ".levain" / "memory.spores.json", id_prefix="intention")
             n = 0
             while self.on and not self.stop.is_set():
                 n += 1

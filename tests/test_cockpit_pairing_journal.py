@@ -49,7 +49,7 @@ def _waiting(db: CockpitDB, principal: str, n: int = 2) -> list[str]:
     ids = []
     for i in range(n):
         pid = new_pending_id()
-        rec = encode({"operation_id": pid, "verb": "spore_set_disposition", "tier": "T2", "intent": "sign",
+        rec = encode({"operation_id": pid, "verb": "intention_set_disposition", "tier": "T2", "intent": "sign",
                       "issued_at": utc_stamp(NOW), "expires_at": utc_stamp(NOW + timedelta(hours=1)),
                       "params": {"i": i}, "target": {"row_id": f"r{i}"}, "effects": []})
         db.issue(record_bytes=rec, principal=principal, idempotency_key=f"k{i}-{pid}", now=NOW)

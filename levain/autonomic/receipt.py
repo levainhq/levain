@@ -12,7 +12,7 @@ through a human).
 It populates a dict slice — it does NOT build a receipt system (the schema is anneal-owned). It
 carries the afferent face's builder (``build_action_face``, below) so the persisted shape is EXACTLY
 the frozen contract (no new keys, just the nulls filled). anneal absorbs these fields (``gate``/``authority_scope`` from ``RECEIPT_VERSION=3``, ``terminal_state``/``refuse_class`` from 4) when it unifies the
-recall + action corpora (the ``spore-166`` coordination checkpoint) — DECOUPLED: the vagus writes
+recall + action corpora (the ``intention-166`` coordination checkpoint) — DECOUPLED: the vagus writes
 its own slice now.
 """
 from __future__ import annotations

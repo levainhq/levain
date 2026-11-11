@@ -12,13 +12,13 @@ section — the one Class-A section of the consolidated-cognition file (live-sta
 last-writer-wins), confined to ``State`` alone (``_apply_state_edit``).
 
 **Class B — lifecycle data (verb-mediated).** Slice 2b-ii: the operator's open
-loops (**spores** — ``touch`` / ``descend`` / ``ascend``) and raw inputs
+loops (**intentions** — ``touch`` / ``descend`` / ``ascend``) and raw inputs
 (**episodes** — ``tombstone``), mutated ONLY through anneal's own *validated*
 verbs against a WRITABLE anneal handle (the dashboard read path opens everything
 ``read_only=True``; this is the one governed writable path). The lifecycle
 invariants — kind-validation, tombstones, id integrity — live in anneal, not
 here (``thinness_is_the_architecture``); this layer locates the store, calls the
-verb, and records the change. A *destructive* verb (resolving a spore /
+verb, and records the change. A *destructive* verb (resolving an intention /
 tombstoning an episode) requires an explicit ``confirm: true`` — the per-write
 confirm gate, enforced server-side (a raw client without it is refused too).
 
@@ -92,7 +92,7 @@ from anneal_memory import (  # the SHARED cross-process continuity lock
 )
 
 from levain.idempotency import StoreCorruptError  # the at-most-once dedup keystore's corrupt sentinel
-from levain.spores import (  # the operator-I/O disposition vocabulary (anneal stays blind)
+from levain.intentions import (  # the operator-I/O disposition vocabulary (anneal stays blind)
     LOOP_DISPOSITION,
     NON_COGNITION_DISPOSITIONS,
     RETIRED_HANDOFF_MSG,
@@ -102,7 +102,7 @@ from levain.spores import (  # the operator-I/O disposition vocabulary (anneal s
     WRITE_DISPOSITIONS,
     RetiredDisposition,
     retired_message,
-    guarded_spore_store,
+    guarded_intention_store,
     refuse_retired_disposition,
     disposition_of,
     is_loop,
@@ -134,10 +134,10 @@ MAX_NAME_LEN = 120
 # A client-supplied idempotency key is an opaque token (a UUID is 36 chars); bound it so a
 # runaway request can't persist an arbitrarily large key into the dedup store.
 MAX_IDEMPOTENCY_KEY_LEN = 200
-# A spore is a one-line-ish open loop, not a document; a Tray dump may be a short
+# An intention is a one-line-ish open loop, not a document; a Tray dump may be a short
 # paragraph. Bound the captured text so a runaway request can't persist an arbitrarily
-# large spore (the server caps the request body too — this is the data-layer backstop).
-MAX_SPORE_TEXT_BYTES = 8 * 1024
+# large intention (the server caps the request body too — this is the data-layer backstop).
+MAX_INTENTION_TEXT_BYTES = 8 * 1024
 # Provenance for an operator-context (state line) set: who authored it. A small allowlist — anything else (a
 # spoofed HTTP value) falls back to the honest default for the only HTTP caller ("web").
 _CONTEXT_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app", "phone"})
@@ -173,13 +173,13 @@ class WriteScope:
     """WHERE + WHETHER a substrate is writable — the write-path peer of the read
     path's :class:`~levain.dashboard.SubstrateSource`. Decouples the governed write
     surface from the ``.levain/`` install convention so a non-install substrate (e.g.
-    the embedder's own store — anneal at ``~/.anneal-memory``, spores in its repo, NO
+    the embedder's own store — anneal at ``~/.anneal-memory``, intentions in its repo, NO
     ``.levain/``) is governed through the SAME seam a Levain install uses.
 
     Four explicit fields, each the trusted source for one class of write:
 
     - ``anneal`` — the explicit store paths (``continuity_md`` for the State edit,
-      ``spores_json`` for the Class-B spore verbs, ``episodic_db`` for the tombstone).
+      ``intentions_json`` for the Class-B intention verbs, ``episodic_db`` for the tombstone).
       These are TRUSTED (never request-supplied) → confined by construction.
     - ``ledger_root`` — the dir holding the append-only ``edits.jsonl`` audit trail +
       the ``backups/`` tree (reversibility for Class-A file edits).
@@ -355,7 +355,7 @@ class ActionVerb:
 @contextmanager
 def _governed_continuity_lock(path: Path) -> Iterator[bool]:
     """Take anneal's shared cross-process continuity lock with ``require=True`` —
-    Levain's governed continuity writes FAIL CLOSED (spore-091 #2). On a lock-less
+    Levain's governed continuity writes FAIL CLOSED (intention-091 #2). On a lock-less
     filesystem / non-POSIX volume the lock can't serialize against the anneal
     consolidate; Levain has no 2PC / recovery oracle of its own (anneal's save
     does, so anneal stays best-effort), so editing State unserialized risks a
@@ -689,21 +689,21 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     ``scope.install_root``; ``state`` (the neocortex ``State`` section, Class A, targets
     ``scope.anneal.continuity_md``); ``operator_state`` (the operator's freeform expiring
     state line, Class A, targets ``scope.context_json`` — live-state, last-writer-wins, no
-    backup/undo; named ``operator_state`` because ``state`` is the neocortex edit above); the Class-B verbs (``spore_touch`` /
-    ``spore_descend`` / ``spore_ascend`` / ``episode_tombstone``, off ``scope.anneal``);
-    the Slice-3b Tray operator-I/O kinds (``spore_seed`` capture / ``spore_set_disposition``
-    re-route / ``spore_surface_at`` schedule, off ``scope.anneal`` — non-destructive);
+    backup/undo; named ``operator_state`` because ``state`` is the neocortex edit above); the Class-B verbs (``intention_touch`` /
+    ``intention_close`` / ``intention_promote`` / ``episode_tombstone``, off ``scope.anneal``);
+    the Slice-3b Tray operator-I/O kinds (``intention_seed`` capture / ``intention_set_disposition``
+    re-route / ``intention_surface_at`` schedule, off ``scope.anneal`` — non-destructive);
     ``undo`` (restore a Class-A edit's backup)."""
     if not isinstance(req, dict):
         raise EditError("bad_request", 400, "request must be a JSON object")
     kind = req.get("kind")
-    # a spore kind's row version, compared by anneal inside its write transaction (the cockpit
+    # an intention kind's row version, compared by anneal inside its write transaction (the cockpit
     # passes the Row.version it read); None keeps a caller's write unguarded, as before
     if expected_version is not None and (type(expected_version) is not str or not expected_version):
         raise EditError("bad_request", 400, "expected_version must be a non-empty string")
     guard = _VersionGuard(expected_version)
     if expected_version is not None and str(kind) not in _VERSIONED_KINDS:
-        raise EditError("bad_request", 400, f"expected_version binds a spore write, not {kind!r}")
+        raise EditError("bad_request", 400, f"expected_version binds an intention write, not {kind!r}")
     # Serialize the entire mutation (read→check→backup→audit→write) across the
     # server's request threads — this is what makes single-writer true (L1 HIGH).
     if kind == "operator_state":
@@ -722,25 +722,25 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_state_edit(scope, req, now)
         if kind == "entity_name":
             return _apply_entity_name(scope, req, now)
-        if kind == "spore_touch":
-            return _apply_spore_verb(scope, req, now, "touch", guard)
-        if kind == "spore_descend":
-            return _apply_spore_verb(scope, req, now, "descend", guard)
-        if kind == "spore_ascend":
-            return _apply_spore_verb(scope, req, now, "ascend", guard)
-        if kind == "spore_seed":
+        if kind == "intention_touch":
+            return _apply_intention_verb(scope, req, now, "touch", guard)
+        if kind == "intention_close":
+            return _apply_intention_verb(scope, req, now, "descend", guard)
+        if kind == "intention_promote":
+            return _apply_intention_verb(scope, req, now, "ascend", guard)
+        if kind == "intention_seed":
             if expected_version is not None:
-                raise EditError("bad_request", 400, "a new spore has no version to bind")
-            return _apply_spore_seed(scope, req, now)
-        if kind == "spore_set_disposition":
-            return _apply_spore_set_disposition(scope, req, now, guard)
-        if kind == "spore_surface_at":
-            return _apply_spore_surface_at(scope, req, now, guard)
-        if kind == "spore_update":
-            return _apply_spore_update(scope, req, now, guard)
-        if kind == "spore_retarget":
-            # a target wakes an agent with the spore's words: it is signed through the cockpit broker's effect, as a
-            # capture that carries one is (``_apply_spore_seed``); this write never takes it on a bearer token
+                raise EditError("bad_request", 400, "a new intention has no version to bind")
+            return _apply_intention_seed(scope, req, now)
+        if kind == "intention_set_disposition":
+            return _apply_intention_set_disposition(scope, req, now, guard)
+        if kind == "intention_surface_at":
+            return _apply_intention_surface_at(scope, req, now, guard)
+        if kind == "intention_update":
+            return _apply_intention_update(scope, req, now, guard)
+        if kind == "intention_retarget":
+            # a target wakes an agent with the intention's words: it is signed through the cockpit broker's effect, as a
+            # capture that carries one is (``_apply_intention_seed``); this write never takes it on a bearer token
             raise EditError("bad_verb_arg", 422, "a target is set from the cockpit's List, where it is signed")
         if kind == "episode_tombstone":
             return _apply_episode_tombstone(scope, req, now)
@@ -759,7 +759,7 @@ def _action_record(edit_id: str, verb: str, label: str, now: str | None,
     happened (anti-spoofing). Same shape family as ``_audit_verb``'s record so the existing
     ``recent_edits`` reader renders it (``undoable: False`` — a sent message has no undo).
 
-    ``idempotency_key`` (when the verb is idempotent) is RECORDED ON THE RECEIPT (spore-188):
+    ``idempotency_key`` (when the verb is idempotent) is RECORDED ON THE RECEIPT (intention-188):
     the trace carries the at-most-once key, so the receipt corpus shows which fire each retry
     deduped against. ``outcome="replay"`` marks a deduped retry that did NOT re-fire."""
     record: dict[str, Any] = {
@@ -1284,7 +1284,7 @@ def _apply_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -
     # this read). Lock is INNER to `_WRITE_LOCK`; it is the only cross-process
     # lock, so the order can't deadlock. require=True (via _governed_continuity_lock)
     # → fail CLOSED (503) on a lock-less FS rather than edit cognition unserialized
-    # [spore-091 #2].
+    # [intention-091 #2].
     # A store whose anneal has ``Store.replace_section`` owns the continuity file (on a gen-3 store the
     # file is a projection and a hand edit is overwritten), so the edit goes through it; that call takes
     # the continuity lock itself, so it must NOT sit inside `_governed_continuity_lock` (a second flock
@@ -1587,26 +1587,26 @@ def _apply_entity_name(scope: WriteScope, req: dict[str, Any], now: str | None) 
 # Class B — lifecycle data (verb-mediated). The operator's INPUTS (open loops,
 # raw episodes), mutated ONLY through anneal's validated verbs against a WRITABLE
 # handle. No file backup is taken: a Class-B verb is not a file edit, and its
-# reversibility is anneal's (a composted spore stays in the `resolved` set; a
+# reversibility is anneal's (a composted intention stays in the `resolved` set; a
 # tombstoned episode keeps a tombstone row) — so `_apply_undo` REFUSES these.
 # ---------------------------------------------------------------------------
 
 # Verb-mediated kinds: recorded in the audit trail but NOT file-undoable (the
 # mutation is canonical in anneal — the resolved set / a tombstone row / the live
-# spore fields — so undo routes through anneal/the verb, never a file restore).
+# intention fields — so undo routes through anneal/the verb, never a file restore).
 _VERB_KINDS = frozenset(
     {
-        "spore_touch", "spore_descend", "spore_ascend", "episode_tombstone",
+        "intention_touch", "intention_close", "intention_promote", "episode_tombstone",
         # Slice 3b — the operator-I/O write kinds (capture + disposition + schedule +
         # the forming-workbench metadata edit: text / reclassify-type / re-tier):
-        "spore_seed", "spore_set_disposition", "spore_surface_at", "spore_update", "spore_retarget",
+        "intention_seed", "intention_set_disposition", "intention_surface_at", "intention_update", "intention_retarget",
     }
 )
-# the kinds whose write may bind a row version: every verb kind but the episode tombstone (a spore kind, the old
-# ``startswith("spore_")`` check, spelled as the set it always was)
+# the kinds whose write may bind a row version: every verb kind but the episode tombstone (an intention kind, the old
+# ``startswith("intention_")`` check, spelled as the set it always was)
 _VERSIONED_KINDS = _VERB_KINDS - {"episode_tombstone"}
-# the audit-ledger kind of the three row verbs ``_apply_spore_verb`` serves, spelled out (it was built with an f-string)
-_AUDIT_KINDS = {"touch": "spore_touch", "descend": "spore_descend", "ascend": "spore_ascend"}
+# the audit-ledger kind of the three row verbs ``_apply_intention_verb`` serves, spelled out (it was built with an f-string)
+_AUDIT_KINDS = {"touch": "intention_touch", "descend": "intention_close", "ascend": "intention_promote"}
 
 
 def _require_confirm(req: dict[str, Any], what: str) -> None:
@@ -1627,7 +1627,7 @@ def _audit_verb(
     extra: dict[str, Any] | None = None,
 ) -> str:
     """Append a verb-mediated audit record AFTER the (anneal-atomic, canonical) verb
-    has committed. ``source`` is a ``spore:<id>`` / ``episode:<id>`` label (the edit-log
+    has committed. ``source`` is a ``intention:<id>`` / ``episode:<id>`` label (the edit-log
     renders it); ``undoable: False`` marks it not-file-undoable (the frontend gates the
     undo button on this, and ``_apply_undo`` refuses it server-side regardless).
 
@@ -1635,7 +1635,7 @@ def _audit_verb(
     which audits BEFORE the (reversible) file write so a crash can't leave a changed
     file with no record — a Class-B verb commits in anneal FIRST (its own atomic
     ``_transaction`` / ``_db_boundary``), and that committed state IS the canonical
-    record (the resolved-spore set / the tombstone row). So a failure to append the
+    record (the resolved-intention set / the tombstone row). So a failure to append the
     SECONDARY Levain edit-log line must NOT collapse a committed, possibly destructive,
     op into a reported failure that makes the operator retry an already-done action. On
     an append failure we ``warn`` (surfaces in the server log) and return ``""`` — the
@@ -1670,18 +1670,18 @@ def _normalize_expect_disposition(value: Any) -> str | None:
     compare-and-set value. A plain loop RENDERS as ``LOOP_DISPOSITION`` ('loop') but is
     STORED key-absent (``None``), so 'loop'/null/'' → ``None``; an operator-I/O tag passes
     through. Mirrors ``anneal_disposition = None if d == LOOP_DISPOSITION else d`` in
-    ``_apply_spore_set_disposition`` — one translation point so the wire→store mapping can't
+    ``_apply_intention_set_disposition`` — one translation point so the wire→store mapping can't
     drift. The CALLER owns PRESENCE: it threads the CAS ONLY when the request carries a
     snapshot (``"expect_disposition" in req``); absent ⇒ no CAS (back-compat for callers that
     don't render-snapshot, e.g. the flow CLI, which is already single-flock-atomic).
 
     PRECONDITION (the loop sentinel is KEY-ABSENT, owned by THIS vocabulary layer — anneal
     stays blind to the taxonomy): every governed writer clears ``loop``→``None`` at write time
-    (``_apply_spore_seed`` refuses it; ``_apply_spore_set_disposition`` maps it), so the store
+    (``_apply_intention_seed`` refuses it; ``_apply_intention_set_disposition`` maps it), so the store
     never holds a literal ``'loop'`` string. A raw-anneal-API caller that BYPASSES this layer and
     stores ``'loop'`` verbatim would make this mapping (``'loop'``→``None``) mismatch the raw
     stored ``'loop'`` → the CAS fails CLOSED (a false REJECT on a valid loop, the safe direction;
-    never a false match). [L3 converged LOW: codex/complement/nemotron, spore-173.]"""
+    never a false match). [L3 converged LOW: codex/complement/nemotron, intention-173.]"""
     if value in (None, "", LOOP_DISPOSITION):
         return None
     if not isinstance(value, str):
@@ -1692,8 +1692,8 @@ def _normalize_expect_disposition(value: Any) -> str | None:
     return value
 
 
-def _client_snapshot(req: dict[str, Any], current: dict[str, Any] | None, spore_id: str) -> Any:
-    """The disposition compare-and-set a rendered-row spore write must carry (spore-174).
+def _client_snapshot(req: dict[str, Any], current: dict[str, Any] | None, intention_id: str) -> Any:
+    """The disposition compare-and-set a rendered-row intention write must carry (intention-174).
 
     The precondition is the one the CLIENT rendered, never the server's own fresh read: a
     server-read CAS closes only the server's read→write window, not the operator's
@@ -1713,16 +1713,16 @@ def _client_snapshot(req: dict[str, Any], current: dict[str, Any] | None, spore_
             raise EditError(
                 "stale", 409,
                 f"disposition changed since read (expected {expect!r}, found {found!r}); "
-                "re-read the spore and retry.",
+                "re-read the intention and retry.",
             )
         return raw   # anneal's CAS compares the stored value itself
     return expect
 
 
 class _VersionGuard:
-    """A spore write bound to the row version the caller read (design §4.4). anneal recomputes the
+    """An intention write bound to the row version the caller read (design §4.4). anneal recomputes the
     version inside its write transaction with ``version_of`` (the cockpit's own row version,
-    ``cockpit.providers.spore_row_version``) and refuses on a mismatch; ``found`` records what it
+    ``cockpit.providers.intention_row_version``) and refuses on a mismatch; ``found`` records what it
     computed, so the refusal is reported as the stale write it is (409), never a generic failure."""
 
     def __init__(self, expected: str | None) -> None:
@@ -1732,16 +1732,16 @@ class _VersionGuard:
         if expected is not None:
             # resolved before any store lock is taken, so the callback anneal runs under its lock
             # imports nothing
-            from anneal_memory.spores import SporeError
-            from levain.cockpit.providers import spore_row_version   # lazy: the cockpit imports this module
-            self._version = spore_row_version
-            self._refuse = SporeError
+            from anneal_memory.spores import IntentionError
+            from levain.cockpit.providers import intention_row_version   # lazy: the cockpit imports this module
+            self._version = intention_row_version
+            self._refuse = IntentionError
 
-    def version_of(self, spore: dict[str, Any]) -> str:
+    def version_of(self, intention: dict[str, Any]) -> str:
         if self.expected is None:
             raise RuntimeError("version_of on an unguarded write: there is no version to compare")
         try:
-            self.found = self._version(spore)
+            self.found = self._version(intention)
         except (MemoryError, RecursionError):
             raise
         except Exception as exc:  # noqa: BLE001 - a stored row the kernel cannot read matches no version it
@@ -1749,7 +1749,7 @@ class _VersionGuard:
             # It RAISES: there is no return value a caller's expected_version could equal, and anneal
             # saves nothing when its transaction body raises.
             self.error = f"{type(exc).__name__}: {exc}"
-            raise self._refuse(f"the stored spore could not be versioned ({self.error})") from exc
+            raise self._refuse(f"the stored intention could not be versioned ({self.error})") from exc
         return self.found
 
 
@@ -1762,29 +1762,29 @@ def _guard_kwargs(guard: "_VersionGuard | None") -> dict[str, Any]:
 _NO_CAS = object()   # a write that sent anneal no disposition compare-and-set
 
 
-def _spore_refusal(guard: "_VersionGuard | None", exc: Exception, store: Any = None,
-                   spore_id: str | None = None, expect_disposition: Any = _NO_CAS) -> EditError:
-    """A refused guarded spore write. Stale (409) when anneal's recompute differed, when the spore
+def _intention_refusal(guard: "_VersionGuard | None", exc: Exception, store: Any = None,
+                   intention_id: str | None = None, expect_disposition: Any = _NO_CAS) -> EditError:
+    """A refused guarded intention write. Stale (409) when anneal's recompute differed, when the intention
     the caller read is no longer open (resolved or removed in the window: anneal refuses that before
     it computes a version), or when the write carried a disposition compare-and-set
     (``expect_disposition``, the RAW value sent to anneal) and the stored disposition now differs.
     Each is read back here, never matched by message. Stale is the answer both surfaces re-read on
-    (spore-174): a ``verb_failed`` left the stale snapshot on screen to fire again."""
+    (intention-174): a ``verb_failed`` left the stale snapshot on screen to fire again."""
     if guard is not None and guard.expected is not None:
         if guard.error is not None:
             return EditError("stale", 409, f"the stored item could not be versioned ({guard.error}); re-read it")
         if guard.found not in (None, guard.expected):
             return EditError("stale", 409, "the item changed since it was read; re-read it and retry")
-        if guard.found is None and store is not None and spore_id is not None:
+        if guard.found is None and store is not None and intention_id is not None:
             try:
-                cur = store.get(spore_id)
+                cur = store.get(intention_id)
             except Exception:  # noqa: BLE001 - the original refusal stands
                 cur = {}
             if cur is None or cur.get("status") == "resolved":
                 return EditError("stale", 409, "the item was resolved or removed since it was read")
-    if expect_disposition is not _NO_CAS and store is not None and spore_id is not None:
+    if expect_disposition is not _NO_CAS and store is not None and intention_id is not None:
         try:
-            cur = store.get(spore_id)
+            cur = store.get(intention_id)
         except Exception:  # noqa: BLE001 - the original refusal stands
             return EditError("verb_failed", 422, str(exc))
         # an id the store does not hold is not a race this write lost: its own refusal stands
@@ -1795,17 +1795,17 @@ def _spore_refusal(guard: "_VersionGuard | None", exc: Exception, store: Any = N
     return EditError("verb_failed", 422, str(exc))
 
 
-def _refuse_if_ringing(scope: WriteScope, store: Any, spore_id: str) -> None:
-    """The ONE guard every spore write entry point (the cockpit verbs and the TUI alike) calls: an open agenda whose stamp
-    names a band row that is STILL OPEN is that row's intention, moved from the band, not by a spore verb. A spore the store
+def _refuse_if_ringing(scope: WriteScope, store: Any, intention_id: str) -> None:
+    """The ONE guard every intention write entry point (the cockpit verbs and the TUI alike) calls: an open agenda whose stamp
+    names a band row that is STILL OPEN is that row's intention, moved from the band, not by an intention verb. An intention the store
     cannot read says nothing (the write's own compare-and-set then refuses what is wrong)."""
-    from levain.spores import open_question_ids, ringing_ref
+    from levain.intentions import open_question_ids, ringing_ref
 
     try:
-        spore = store.get(spore_id) or {}
+        intention = store.get(intention_id) or {}
     except Exception:  # noqa: BLE001
         return
-    stamp = spore.get("germinated")
+    stamp = intention.get("germinated")
     if not isinstance(stamp, Mapping) or not stamp.get("ref"):
         return
     qs = scope.questions
@@ -1815,60 +1815,60 @@ def _refuse_if_ringing(scope: WriteScope, store: Any, spore_id: str) -> None:
 
         d = default_queue_dir()
         qs = QuestionStore(d) if (d / DB_NAME).exists() else None
-    ref = ringing_ref(spore, open_question_ids(qs) if qs is not None else frozenset())
+    ref = ringing_ref(intention, open_question_ids(qs) if qs is not None else frozenset())
     if ref:
         raise EditError("rings_in_band", 409,
-                        f"{spore_id} rings in the band as {ref}: use the band row's edit / done / clear there; to defer it, "
+                        f"{intention_id} rings in the band as {ref}: use the band row's edit / done / clear there; to defer it, "
                         "snooze the agenda itself (its snooze moves the date and ends the ring)")
 
 
-def _apply_spore_verb(
+def _apply_intention_verb(
     scope: WriteScope, req: dict[str, Any], now: str | None,
     verb: Literal["touch", "descend", "ascend"], guard: "_VersionGuard | None" = None,
 ) -> dict[str, Any]:
-    """A Class-B spore lifecycle verb: ``touch`` (engage — non-destructive),
+    """A Class-B intention lifecycle verb: ``touch`` (engage — non-destructive),
     ``descend`` (compost downward) or ``ascend`` (transmute upward). The two
     resolving verbs are destructive (the loop leaves the open set) → confirm-gated
-    and carry a ``kind`` anneal validates against the spore's type; ``ascend`` also
+    and carry a ``kind`` anneal validates against the intention's type; ``ascend`` also
     requires a ``ref`` (what the loop became). anneal owns the validation + the
     atomic write (its own ``_transaction`` flock); this records the audit entry.
 
     Both resolving verbs CAS the disposition against the operator's render-time SNAPSHOT
-    (spore-173): ``ascend`` reads it server-side for its own ``is_note`` refusal gate (so a
+    (intention-173): ``ascend`` reads it server-side for its own ``is_note`` refusal gate (so a
     server-fresh read is correct — the gate asks "can this CURRENTLY ascend"); ``descend``
     has NO server gate (any disposition descends — it's how Keep "remove", Tray "dismiss",
     and loop "compost" all work), so its kind/FACE is chosen client-side off the rendered
     snapshot, and the CAS must verify THAT snapshot (an absent key ⇒ no CAS, back-compat)."""
-    from anneal_memory.spores import SporeError  # lazy
+    from anneal_memory.spores import IntentionError  # lazy
 
-    spore_id = _require_str(req, "spore_id")
-    spore_kind: str | None = None
+    intention_id = _require_str(req, "intention_id")
+    intention_kind: str | None = None
     ref: str | None = None
     if verb == "descend":
-        spore_kind = _require_str(req, "spore_kind")
+        intention_kind = _require_str(req, "intention_kind")
         _require_confirm(
             req,
-            f"compost spore {spore_id} as '{spore_kind}'? this resolves the loop "
+            f"compost intention {intention_id} as '{intention_kind}'? this resolves the loop "
             "(it stays recoverable in anneal's resolved set)",
         )
     elif verb == "ascend":
-        spore_kind = _require_str(req, "spore_kind")
+        intention_kind = _require_str(req, "intention_kind")
         ref = _require_str(req, "ref").strip()
         if not ref:
             raise EditError("bad_verb_arg", 422, "ascend requires a non-empty ref")
         _require_confirm(
             req,
-            f"promote spore {spore_id} → '{ref}' as '{spore_kind}'? this resolves "
+            f"promote intention {intention_id} → '{ref}' as '{intention_kind}'? this resolves "
             "the loop",
         )
 
     paths = scope.anneal
-    if not paths.spores_json.is_file():
-        raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
-    store = guarded_spore_store(paths.spores_json)
-    _refuse_if_ringing(scope, store, spore_id)
+    if not paths.intentions_json.is_file():
+        raise EditError("not_found", 404, "no intention store yet — the entity has no open loops")
+    store = guarded_intention_store(paths.intentions_json)
+    _refuse_if_ringing(scope, store, intention_id)
     ascend_expect: str | None = None  # the raw disposition read for the ascend CAS (below)
-    # The descend CAS uses the CLIENT render-time SNAPSHOT (spore-173) — validated + normalized up
+    # The descend CAS uses the CLIENT render-time SNAPSHOT (intention-173) — validated + normalized up
     # front (a non-string raises bad_verb_arg BEFORE the store touch). Presence is the gate: an
     # absent key ⇒ no CAS (back-compat). Hoisted so the audit trail can record it too [L1 #5].
     descend_has_snapshot = verb == "descend" and "expect_disposition" in req
@@ -1885,10 +1885,10 @@ def _apply_spore_verb(
         # 2026-06-23): the disposition we read here is passed as `expect_disposition` to
         # `store.ascend`, which CAS-checks it INSIDE the resolve transaction — so a concurrent
         # writer flipping loop→note between this read and the resolve makes the ascend FAIL
-        # CLOSED (SporeError → stale, read back in _spore_refusal) rather than transmute a now-note. The CAS mirrors
-        # the one `update` already uses (anneal `AM-SPORE-CAS`).
-        current = store.get(spore_id)
-        snapshot = _client_snapshot(req, current, spore_id)   # a moved row is stale, ahead of the note gate
+        # CLOSED (IntentionError → stale, read back in _intention_refusal) rather than transmute a now-note. The CAS mirrors
+        # the one `update` already uses (anneal `AM-INTENTION-CAS`).
+        current = store.get(intention_id)
+        snapshot = _client_snapshot(req, current, intention_id)   # a moved row is stale, ahead of the note gate
         if current is not None and is_note(current):
             raise EditError(
                 "not_ascendable", 409,
@@ -1901,39 +1901,39 @@ def _apply_spore_verb(
             ascend_expect = cast("str | None", current.get("disposition")) if current is not None else None
     try:
         if verb == "touch":
-            store.touch(spore_id, **_guard_kwargs(guard))
+            store.touch(intention_id, **_guard_kwargs(guard))
         elif verb == "descend":
-            assert spore_kind is not None  # set in the descend validation branch above
+            assert intention_kind is not None  # set in the descend validation branch above
             # CAS the operator's render-time SNAPSHOT disposition (the resolve FACE — Keep
             # "remove" vs Tray "dismiss" vs loop "compost" — was chosen against it client-side):
             # a cross-process re-route in the render→confirm→resolve window now FAILS CLOSED
             # rather than compost a now-live loop under a Keep-"remove" intent [codex L3 HIGH,
-            # spore-173]. The snapshot must be the CLIENT's (a server-fresh read would already
+            # intention-173]. The snapshot must be the CLIENT's (a server-fresh read would already
             # reflect the re-route and pass vacuously). Absent key ⇒ no CAS (back-compat).
-            descend_kwargs: dict[str, Any] = {"kind": spore_kind}
+            descend_kwargs: dict[str, Any] = {"kind": intention_kind}
             if descend_has_snapshot:
                 descend_kwargs["expect_disposition"] = descend_expect
-            store.descend(spore_id, **descend_kwargs, **_guard_kwargs(guard))
+            store.descend(intention_id, **descend_kwargs, **_guard_kwargs(guard))
         else:  # ascend
-            assert spore_kind is not None and ref is not None  # set in the ascend branch
+            assert intention_kind is not None and ref is not None  # set in the ascend branch
             # expect_disposition = the (non-note) value we just read → fail-closed if a
             # concurrent writer flipped it to a note (or anything else) before this resolve.
-            store.ascend(spore_id, kind=spore_kind, ref=ref, expect_disposition=ascend_expect,
+            store.ascend(intention_id, kind=intention_kind, ref=ref, expect_disposition=ascend_expect,
                          **_guard_kwargs(guard))
-    except ValueError as exc:  # bad kind for the spore's type (anneal arg validation)
+    except ValueError as exc:  # bad kind for the intention's type (anneal arg validation)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
-    except SporeError as exc:  # unknown id / already resolved / store drift / CAS mismatch
+    except IntentionError as exc:  # unknown id / already resolved / store drift / CAS mismatch
         sent: Any = (descend_expect if descend_has_snapshot else _NO_CAS) if verb == "descend" \
             else (ascend_expect if verb == "ascend" else _NO_CAS)
-        raise _spore_refusal(guard, exc, store, spore_id, sent) from exc
-    except OSError as exc:  # raw IO from SporeStore._transaction (ENOLCK on a lock-less
+        raise _intention_refusal(guard, exc, store, intention_id, sent) from exc
+    except OSError as exc:  # raw IO from IntentionStore._transaction (ENOLCK on a lock-less
         # FS, permission, fsync/replace) — not wrapped by anneal; map to a clean
         # retryable 503 instead of leaking a generic internal 500 [codex L3 MED].
-        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
 
     extra: dict[str, Any] = {}
-    if spore_kind is not None:
-        extra["verb_kind"] = spore_kind
+    if intention_kind is not None:
+        extra["verb_kind"] = intention_kind
     if ref is not None:
         extra["ref"] = ref
     # Record the disposition that was RESOLVED — the forensic "which Keep note / Tray item / loop
@@ -1946,26 +1946,26 @@ def _apply_spore_verb(
         extra["prior_disposition"] = descend_expect or LOOP_DISPOSITION
     edit_id = _audit_verb(
         scope.ledger_root, kind=_AUDIT_KINDS[verb], action=verb,
-        target=f"spore:{spore_id}", now=now, extra=extra,
+        target=f"intention:{intention_id}", now=now, extra=extra,
     )
-    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}", "action": verb}
+    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": verb}
 
 
 # --- Slice 3b: the Tray operator-I/O write kinds -----------------------------
 # Capture (dump→seed), re-route (set_disposition), schedule (surface_at). The
 # disposition is the Levain/flow Tray taxonomy (anneal stays blind — it persists the
-# opaque tag; see ``levain.spores`` + the anneal ``add``/``update`` passthrough). All
+# opaque tag; see ``levain.intentions`` + the anneal ``add``/``update`` passthrough). All
 # three are NON-destructive (a mis-capture is composted, a re-route/schedule is just
-# re-applied) → no confirm gate; audit-recorded, NOT file-undoable (the live spore is
-# canonical in anneal). The "human dumps, AI sorts" capture-UX: ``spore_seed`` is the
-# human's freeform dump (always a Tray disposition); ``spore_set_disposition`` /
-# ``spore_surface_at`` are the AI's triage verbs.
+# re-applied) → no confirm gate; audit-recorded, NOT file-undoable (the live intention is
+# canonical in anneal). The "human dumps, AI sorts" capture-UX: ``intention_seed`` is the
+# human's freeform dump (always a Tray disposition); ``intention_set_disposition`` /
+# ``intention_surface_at`` are the AI's triage verbs.
 
 
-def _apply_spore_seed(
+def _apply_intention_seed(
     scope: WriteScope, req: dict[str, Any], now: str | None
 ) -> dict[str, Any]:
-    """Capture a freeform operator-I/O item (the in-GUI dump). Creates a NEW spore carrying
+    """Capture a freeform operator-I/O item (the in-GUI dump). Creates a NEW intention carrying
     an operator-I/O ``disposition`` — a Tray inbox item (default ``seed``) OR a Keep
     durable reference (``note``) — so it lands in the operator surface and is held OUT of
     the entity's cognition (``is_loop``=False) regardless of tier. Never a plain cognition
@@ -1974,14 +1974,14 @@ def _apply_spore_seed(
 
     ``type`` defaults to ``thought`` (the catch-all for an un-sorted dump — the freeform
     drop supplies no type), settable when known (the type dropdown / an AI capture). A Tray
-    item is EXCEPTIONAL: while forming it is type-PLASTIC — ``spore_update`` can reclassify
+    item is EXCEPTIONAL: while forming it is type-PLASTIC — ``intention_update`` can reclassify
     it (the lock binds at metabolize, not at drop). A ``note`` still CARRIES a type for
     storage uniformity but it is lifecycle-INERT — a note never ascends (refused) and is
     removed via descend, so its type is never consulted for resolution."""
-    from anneal_memory.spores import SporeError, VALID_TYPES  # lazy
+    from anneal_memory.spores import IntentionError, VALID_TYPES  # lazy
 
     # THE LIST's three create fields (a timed next, a germinate target, attention) are the cockpit's, signed through
-    # the broker's spore_seed effect (cockpit/effects._ce_seed); this legacy write never takes them, so a desk drop
+    # the broker's intention_seed effect (cockpit/effects._ce_seed); this legacy write never takes them, so a desk drop
     # can never be planted on a bearer token here
     text = _require_str(req, "text").strip()
     if not text:
@@ -1990,16 +1990,16 @@ def _apply_spore_seed(
     if steering:
         raise EditError("bad_verb_arg", 422, f"a capture here takes no {steering}: a scheduled drop or a talk seed "
                                              "is added from the cockpit's List, where it is signed")
-    if len(text.encode("utf-8")) > MAX_SPORE_TEXT_BYTES:
+    if len(text.encode("utf-8")) > MAX_INTENTION_TEXT_BYTES:
         raise EditError("too_large", 413,
-                        f"spore text exceeds the {MAX_SPORE_TEXT_BYTES}-byte cap")
+                        f"intention text exceeds the {MAX_INTENTION_TEXT_BYTES}-byte cap")
     stype = req.get("type", "thought")
     if stype not in VALID_TYPES:
         raise EditError(
             "bad_verb_arg", 422,
             f"type must be one of {list(VALID_TYPES)} (got {stype!r})",
         )
-    disposition = req.get("disposition", "seed")
+    disposition = req.get("disposition", "someday")
     _refuse_retired_disposition(disposition)
     if disposition not in TRAY_WRITE_DISPOSITIONS:
         raise EditError(
@@ -2009,7 +2009,7 @@ def _apply_spore_seed(
             f"never a plain cognition loop (those come from metabolize or the CLI)",
         )
 
-    store = guarded_spore_store(scope.anneal.spores_json)
+    store = guarded_intention_store(scope.anneal.intentions_json)
     try:
         # No explicit tier → anneal's default (`warm`). Harmless: an operator-I/O disposition
         # is cognition-EXCLUDED (is_loop=False) regardless of tier, so tier has no
@@ -2018,19 +2018,19 @@ def _apply_spore_seed(
         created = store.add(type=stype, text=text, disposition=disposition)
     except ValueError as exc:  # anneal arg validation (e.g. empty text)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
-    except SporeError as exc:  # corrupt/ambiguous store (symmetry with the sibling verbs)
+    except IntentionError as exc:  # corrupt/ambiguous store (symmetry with the sibling verbs)
         raise EditError("verb_failed", 422, str(exc)) from exc
-    except OSError as exc:  # raw IO from SporeStore._transaction → retryable 503
-        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+    except OSError as exc:  # raw IO from IntentionStore._transaction → retryable 503
+        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
 
-    spore_id = created["id"]
+    intention_id = created["id"]
     edit_id = _audit_verb(
-        scope.ledger_root, kind="spore_seed", action="seed",
-        target=f"spore:{spore_id}", now=now,
+        scope.ledger_root, kind="intention_seed", action="seed",
+        target=f"intention:{intention_id}", now=now,
         extra={"disposition": disposition, "type": stype, "text": text[:120]},
     )
-    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}",
-            "action": "seed", "spore_id": spore_id}
+    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}",
+            "action": "seed", "intention_id": intention_id}
 
 
 def _refuse_retired_disposition(disposition: Any, current: Any = None) -> None:
@@ -2042,10 +2042,10 @@ def _refuse_retired_disposition(disposition: Any, current: Any = None) -> None:
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
 
 
-def _apply_spore_set_disposition(
+def _apply_intention_set_disposition(
     scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
-    """Re-route an OPEN spore across the operator-I/O classes (the AI's triage verb, AND the
+    """Re-route an OPEN intention across the operator-I/O classes (the AI's triage verb, AND the
     Keep-note promote). ``disposition`` ∈ loop / seed / handoff / agenda / note: ``loop``
     METABOLIZES an operator-I/O item into a cognition loop (clears the tag → key-free); a Tray
     value moves it within / into the Tray inbox; ``note`` routes it to durable Keep reference.
@@ -2056,9 +2056,9 @@ def _apply_spore_set_disposition(
     (note→loop / note→Tray) — the former note-terminal refusal is RELAXED (it was right for a
     true reference, wrong for a deferred someday/maybe that had no path out but delete+recreate).
     The note-ascend lock is preserved as a deliberate TWO-STEP, not lost: a note still can't
-    ``ascend`` DIRECTLY (``_apply_spore_verb``'s guard), so a reference can't resolve into a false
+    ``ascend`` DIRECTLY (``_apply_intention_verb``'s guard), so a reference can't resolve into a false
     lineage in one move — you activate it to a loop first, then ascend the loop. Lineage is
-    preserved (same spore; mutation, not re-create).
+    preserved (same intention; mutation, not re-create).
 
     ONE boundary is confirm-guarded: **demoting a LIVE cognition loop into operator I/O**
     (current = loop, target ∈ NON_COGNITION — Tray OR note) removes it from salience / digest /
@@ -2068,9 +2068,9 @@ def _apply_spore_set_disposition(
     Everything else — loop→loop, Tray↔Tray, filing INTO Keep, AND promoting a note OUT (a gain
     into cognition / a lateral move into the Tray) — is non-destructive → no confirm. The prior
     disposition is always audited so any move stays reconstructable."""
-    from anneal_memory.spores import SporeError  # lazy
+    from anneal_memory.spores import IntentionError  # lazy
 
-    spore_id = _require_str(req, "spore_id")
+    intention_id = _require_str(req, "intention_id")
     disposition = req.get("disposition")
     # exact names only: a retired name reaches the echo-or-refuse check below (an echo is then left
     # out of the write), any other spelling stops here
@@ -2083,7 +2083,7 @@ def _apply_spore_set_disposition(
     # its resurface in ONE atomic op. Two sequential GUI commits is impossible — a successful
     # commit re-renders, destroying the form's DOM — so the schedule must ride the promote.
     # ABSENT key ⇒ leave `next` untouched (the plain reroutes don't reschedule); present ⇒ set it
-    # (null/'' clears). Validated via the SAME helper as spore_surface_at (no drift).
+    # (null/'' clears). Validated via the SAME helper as intention_surface_at (no drift).
     has_surface_at = "surface_at" in req
     surface_at = _validate_surface_at(req.get("surface_at")) if has_surface_at else None
     # A Keep note has NO temporal dimension — it does not resurface on a schedule (promoting it to
@@ -2102,7 +2102,7 @@ def _apply_spore_set_disposition(
         raise EditError(
             "bad_verb_arg", 422,
             "a Keep note doesn't resurface on a schedule — promote it to the Tray "
-            "(disposition 'seed'/'handoff'/'agenda') to set a reminder. Clearing surface_at on a "
+            "(disposition 'someday'/'seed'/'handoff'/'agenda') to set a reminder. Clearing surface_at on a "
             "note is allowed.",
         )
     if disposition == "note":
@@ -2112,10 +2112,10 @@ def _apply_spore_set_disposition(
     else:
         set_next, next_value = False, None            # absent ⇒ leave `next` untouched (plain reroute)
     paths = scope.anneal
-    if not paths.spores_json.is_file():
-        raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
-    store = guarded_spore_store(paths.spores_json)
-    _refuse_if_ringing(scope, store, spore_id)
+    if not paths.intentions_json.is_file():
+        raise EditError("not_found", 404, "no intention store yet — the entity has no open loops")
+    store = guarded_intention_store(paths.intentions_json)
+    _refuse_if_ringing(scope, store, intention_id)
 
     # Read current state to (a) record the prior disposition in the audit, (b) gate the one
     # silent-loss direction, and (c) seed the optimistic CAS below. `is_loop` (the SAME
@@ -2123,23 +2123,23 @@ def _apply_spore_set_disposition(
     # so an unknown/typo'd disposition (which cognition renders as a loop, fail-open) is also
     # guarded, and the guard can't drift from the render boundary [codex L3 HIGH]. Absent
     # `status` reads as open (anneal treats it so), so a malformed-but-open record is gated.
-    current = store.get(spore_id)
-    # raw stored value (None ≡ a key-free loop) — disposition is an unmodeled SporeDict key
+    current = store.get(intention_id)
+    # raw stored value (None ≡ a key-free loop) — disposition is an unmodeled IntentionDict key
     prior_raw = cast("str | None", current.get("disposition")) if current else None
     if current is None and retired_message(disposition) is not None:
-        raise EditError("not_found", 404, f"no spore {spore_id!r}")   # a missing row is 404, ahead of the retirement 422
+        raise EditError("not_found", 404, f"no intention {intention_id!r}")   # a missing row is 404, ahead of the retirement 422
     _refuse_retired_disposition(disposition, prior_raw)   # TS-1: refuse a CHANGE into a retired value
-    snapshot = _client_snapshot(req, current, spore_id)   # a moved row is stale, ahead of the confirm gate
+    snapshot = _client_snapshot(req, current, intention_id)   # a moved row is stale, ahead of the confirm gate
     prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit
     # The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a Keep note CAN now be re-routed OUT —
     # note→loop (activate) / note→Tray (promote) — the mirror of the Tray's seed→loop
     # metabolize. The former note-terminal guard here was the OVER-correction: terminal is right
     # for a true reference, WRONG for a deferred someday/maybe (which had no path out but
     # delete+recreate — friction + lost lineage). The note-ascend lock is NOT lost — it MOVES to
-    # the deliberate two-step: a note still can't `ascend` DIRECTLY (`_apply_spore_verb`'s H2
+    # the deliberate two-step: a note still can't `ascend` DIRECTLY (`_apply_intention_verb`'s H2
     # guard STAYS), so promoting note→loop here does NOT let a reference ascend in one move — the
     # now-loop must be ascended as a SECOND explicit, audited verb. A pure reference note simply
-    # never gets promoted (reference-vs-someday stays emergent). LINEAGE preserved (same spore id
+    # never gets promoted (reference-vs-someday stays emergent). LINEAGE preserved (same intention id
     # + history; mutation, not re-create). Promotion is a GAIN into cognition (or a lateral move
     # into the Tray), never the silent-loss direction, so it needs no confirm — `demoting_live_loop`
     # below is False for a note (is_loop(note) is False); only DEMOTING a live loop confirms.
@@ -2161,7 +2161,7 @@ def _apply_spore_set_disposition(
         dest = "a Keep note" if disposition in ("note",) else "the Tray"
         _require_confirm(
             req,
-            f"move loop {spore_id} into {dest}? it leaves the entity's active cognition "
+            f"move loop {intention_id} into {dest}? it leaves the entity's active cognition "
             "(salience / digest / Top of Mind) until it's re-triaged",
         )
 
@@ -2184,28 +2184,28 @@ def _apply_spore_set_disposition(
         # re-reads and the confirm decision is re-made on fresh state. The disposition + the
         # optional surface_at land in ONE store.update (one transaction, one CAS) — the promote
         # and its schedule never half-apply.
-        store.update(spore_id, **update_kwargs, **_guard_kwargs(guard))
+        store.update(intention_id, **update_kwargs, **_guard_kwargs(guard))
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
-    except SporeError as exc:  # unknown id / already resolved / store drift / CAS mismatch
-        raise _spore_refusal(guard, exc, store, spore_id, update_kwargs["expect_disposition"]) from exc
+    except IntentionError as exc:  # unknown id / already resolved / store drift / CAS mismatch
+        raise _intention_refusal(guard, exc, store, intention_id, update_kwargs["expect_disposition"]) from exc
     except OSError as exc:
-        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
 
     edit_id = _audit_verb(
-        scope.ledger_root, kind="spore_set_disposition", action="set_disposition",
-        target=f"spore:{spore_id}", now=now,
+        scope.ledger_root, kind="intention_set_disposition", action="set_disposition",
+        target=f"intention:{intention_id}", now=now,
         extra={"disposition": disposition, "prior_disposition": prior,
                **({"surface_at": next_value} if set_next else {})},
     )
-    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}",
+    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}",
             "action": "set_disposition"}
 
 
 def _validate_surface_at(value: Any) -> str | None:
     """Validate a surface_at date value → the normalized result (a ``YYYY-MM-DD`` or ``YYYY-MM-DDTHH:MM`` string, or
-    ``None`` for a clear). Shared by ``spore_surface_at`` AND the optional schedule carried on a
-    ``spore_set_disposition`` promote (the "remind me" tickler) so the date contract can't drift
+    ``None`` for a clear). Shared by ``intention_surface_at`` AND the optional schedule carried on a
+    ``intention_set_disposition`` promote (the "remind me" tickler) so the date contract can't drift
     between them. Caller owns the key-PRESENCE policy (surface_at requires the key present;
     set_disposition treats an absent key as "leave next alone"); this validates only the VALUE.
 
@@ -2231,15 +2231,15 @@ def _validate_surface_at(value: Any) -> str | None:
     return value
 
 
-def _apply_spore_surface_at(
+def _apply_intention_surface_at(
     scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
-    """Schedule WHEN a spore re-surfaces — the operator-input twin of a spore's ``next:``
+    """Schedule WHEN an intention re-surfaces — the operator-input twin of an intention's ``next:``
     alarm: author now, time the surfacing for a future session-open. ``surface_at`` is
     ``YYYY-MM-DD`` (or ``null``/``''`` to clear). Reversible → non-destructive."""
-    from anneal_memory.spores import SporeError  # lazy
+    from anneal_memory.spores import IntentionError  # lazy
 
-    spore_id = _require_str(req, "spore_id")
+    intention_id = _require_str(req, "intention_id")
     # A MISSING key must NOT silently clear the alarm — that's almost always a client bug
     # (typo'd/omitted field) destroying a scheduled surfacing with no signal [complement L3
     # LOW]. Clearing is explicit: pass null or "". Presence is required; value may be null.
@@ -2248,31 +2248,31 @@ def _apply_spore_surface_at(
                         "surface_at is required (use null or '' to clear the alarm)")
     surface_at = _validate_surface_at(req.get("surface_at"))
     paths = scope.anneal
-    if not paths.spores_json.is_file():
-        raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
-    store = guarded_spore_store(paths.spores_json)
-    _refuse_if_ringing(scope, store, spore_id)
+    if not paths.intentions_json.is_file():
+        raise EditError("not_found", 404, "no intention store yet — the entity has no open loops")
+    store = guarded_intention_store(paths.intentions_json)
+    _refuse_if_ringing(scope, store, intention_id)
     try:
-        store.update(spore_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
+        store.update(intention_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
     except ValueError as exc:
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
-    except SporeError as exc:
-        raise _spore_refusal(guard, exc, store, spore_id) from exc
+    except IntentionError as exc:
+        raise _intention_refusal(guard, exc, store, intention_id) from exc
     except OSError as exc:
-        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
 
     edit_id = _audit_verb(
-        scope.ledger_root, kind="spore_surface_at", action="surface_at",
-        target=f"spore:{spore_id}", now=now, extra={"surface_at": surface_at or None},
+        scope.ledger_root, kind="intention_surface_at", action="surface_at",
+        target=f"intention:{intention_id}", now=now, extra={"surface_at": surface_at or None},
     )
-    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}",
+    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}",
             "action": "surface_at"}
 
 
-def _apply_spore_update(
+def _apply_intention_update(
     scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
-    """A governed metadata edit of an OPEN spore — the operator's forming-workbench levers:
+    """A governed metadata edit of an OPEN intention — the operator's forming-workbench levers:
     edit ``text`` (refine in place), reclassify ``type`` (ONLY while forming — a Tray item;
     the type LOCKS once it metabolizes into a loop or is a Keep note), re-``tier`` (e.g.
     un-park a Keep loop → active). At least one of text/type/tier required; all
@@ -2285,18 +2285,18 @@ def _apply_spore_update(
     from anneal_memory.spores import (  # lazy
         VALID_TIERS,
         VALID_TYPES,
-        SporeError,
+        IntentionError,
     )
 
-    spore_id = _require_str(req, "spore_id")
+    intention_id = _require_str(req, "intention_id")
     if "domain" in req:
         # this write has no domain field; dropping it would report a partial edit as ok. A cockpit
         # domain edit is T2 and lands through the broker's effect instead
-        raise EditError("bad_verb_arg", 422, "spore_update here does not take domain")
+        raise EditError("bad_verb_arg", 422, "intention_update here does not take domain")
     has_text, has_type, has_tier = "text" in req, "type" in req, "tier" in req
     if not (has_text or has_type or has_tier):
         raise EditError("bad_verb_arg", 422,
-                        "spore_update needs at least one of: text, type, tier")
+                        "intention_update needs at least one of: text, type, tier")
 
     # Validate every provided field up-front (before touching the store).
     new_text: str | None = None
@@ -2304,9 +2304,9 @@ def _apply_spore_update(
         new_text = _require_str(req, "text").strip()
         if not new_text:
             raise EditError("bad_verb_arg", 422, "text cannot be cleared to empty")
-        if len(new_text.encode("utf-8")) > MAX_SPORE_TEXT_BYTES:
+        if len(new_text.encode("utf-8")) > MAX_INTENTION_TEXT_BYTES:
             raise EditError("too_large", 413,
-                            f"spore text exceeds the {MAX_SPORE_TEXT_BYTES}-byte cap")
+                            f"intention text exceeds the {MAX_INTENTION_TEXT_BYTES}-byte cap")
     new_type = req.get("type") if has_type else None
     if has_type and new_type not in VALID_TYPES:
         raise EditError("bad_verb_arg", 422,
@@ -2317,17 +2317,17 @@ def _apply_spore_update(
                         f"tier must be one of {list(VALID_TIERS)} (got {new_tier!r})")
 
     paths = scope.anneal
-    if not paths.spores_json.is_file():
-        raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
-    store = guarded_spore_store(paths.spores_json)
-    _refuse_if_ringing(scope, store, spore_id)
-    current = store.get(spore_id)
+    if not paths.intentions_json.is_file():
+        raise EditError("not_found", 404, "no intention store yet — the entity has no open loops")
+    store = guarded_intention_store(paths.intentions_json)
+    _refuse_if_ringing(scope, store, intention_id)
+    current = store.get(intention_id)
     prior_raw = cast("str | None", current.get("disposition")) if current else None
-    tier_snapshot = _client_snapshot(req, current, spore_id) if has_tier else _NO_CAS
+    tier_snapshot = _client_snapshot(req, current, intention_id) if has_tier else _NO_CAS
 
     # RECLASSIFY GATE — type is plastic ONLY while forming (a Tray item). A committed loop
     # or a Keep note has a LOCKED type; the immune property binds at the cognition boundary,
-    # not at capture. (A missing id falls through to update's own SporeError, not 409.)
+    # not at capture. (A missing id falls through to update's own IntentionError, not 409.)
     if has_type and current is not None and not is_tray(current):
         raise EditError(
             "type_locked", 409,
@@ -2349,7 +2349,7 @@ def _apply_spore_update(
     #  - ``tier`` (park / un-park): the ROUTE (park a loop vs un-park a parked LOOP, as opposed
     #    to promoting a NOTE) is chosen client-side off the rendered SNAPSHOT; with no CAS,
     #    tier=warm lands on a now-NOTE and reports "reactivated" while it stays a note [codex MED
-    #    + complement MED-1, spore-173]. CAS the CLIENT snapshot (a server-fresh read would pass
+    #    + complement MED-1, intention-173]. CAS the CLIENT snapshot (a server-fresh read would pass
     #    vacuously). anneal.update already supports the param — no anneal change for this half.
     # A text-only edit is disposition-independent → no CAS (a benign concurrent re-route mustn't
     # spuriously reject a text refine). Absent snapshot on a tier edit ⇒ no CAS (back-compat).
@@ -2361,13 +2361,13 @@ def _apply_spore_update(
     elif tier_snapshot is not _NO_CAS:
         kwargs["expect_disposition"] = tier_snapshot
     try:
-        store.update(spore_id, **kwargs, **_guard_kwargs(guard))
+        store.update(intention_id, **kwargs, **_guard_kwargs(guard))
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
-    except SporeError as exc:  # unknown id / resolved / drift / CAS mismatch
-        raise _spore_refusal(guard, exc, store, spore_id, kwargs.get("expect_disposition", _NO_CAS)) from exc
+    except IntentionError as exc:  # unknown id / resolved / drift / CAS mismatch
+        raise _intention_refusal(guard, exc, store, intention_id, kwargs.get("expect_disposition", _NO_CAS)) from exc
     except OSError as exc:
-        raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
+        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
 
     fields = [f for f, h in (("text", has_text), ("type", has_type), ("tier", has_tier)) if h]
     extra: dict[str, Any] = {"fields": fields}
@@ -2376,10 +2376,10 @@ def _apply_spore_update(
     if has_tier:
         extra["tier"] = new_tier
     edit_id = _audit_verb(
-        scope.ledger_root, kind="spore_update", action="update",
-        target=f"spore:{spore_id}", now=now, extra=extra,
+        scope.ledger_root, kind="intention_update", action="update",
+        target=f"intention:{intention_id}", now=now, extra=extra,
     )
-    return {"ok": True, "id": edit_id, "source": f"spore:{spore_id}", "action": "update"}
+    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": "update"}
 
 
 def _apply_episode_tombstone(
@@ -2404,7 +2404,7 @@ def _apply_episode_tombstone(
     if not paths.episodic_db.is_file():
         raise EditError("not_found", 404, "no episodic store yet")
     # Cross-process safety [L1 H1 — intentional, documented]: a tombstone touches the
-    # EPISODIC DB, NOT the continuity file — a DIFFERENT resource than spore-091's
+    # EPISODIC DB, NOT the continuity file — a DIFFERENT resource than intention-091's
     # `continuity_lock` guards, so it deliberately takes NO continuity lock (that would
     # serialize the wrong thing). The episodic Store is WAL-mode and every mutation runs
     # inside anneal's `_db_boundary`, which makes the DELETE + tombstone-insert
@@ -2446,12 +2446,12 @@ def _apply_undo(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict
     # their reversibility is anneal's, not this layer's. Refuse server-side
     # (the frontend also hides the undo button via `undoable: False`, but this is
     # the enforcement — a stale/hand-built undo request can't no-op its way through
-    # the file-restore path against a `spore:`/`episode:` pseudo-source).
+    # the file-restore path against a `intention:`/`episode:` pseudo-source).
     if record.get("kind") in _VERB_KINDS or record.get("undoable") is False:
         raise EditError(
             "not_undoable", 400,
             "verb-mediated edits aren't file-undoable from the plane: a composted / "
-            "promoted spore is recoverable from anneal's resolved set, but a tombstoned "
+            "promoted intention is recoverable from anneal's resolved set, but a tombstoned "
             "episode's content is PERMANENTLY erased (only an audit tombstone row "
             "remains) — there is nothing to restore",
         )
@@ -2483,7 +2483,7 @@ def _apply_undo(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict
     # consolidate) as a State edit, so hold the shared lock across the whole
     # read→CAS→restore — a wrap landing between read_bytes and _atomic_write is the
     # lost-update codex flagged in 2b-i. (`_commit`'s CAS+lock close the same window on
-    # the forward State-edit path.) spore-091 #2: the continuity case uses
+    # the forward State-edit path.) intention-091 #2: the continuity case uses
     # _governed_continuity_lock (require=True) so undo of State FAILS CLOSED (503) on a
     # lock-less FS too — undo's CAS→write window (read_bytes → backup → audit →
     # _atomic_write) is WIDER than _commit's, so a degraded best-effort lock here would

@@ -30,24 +30,24 @@ const bootSrc = fs.readFileSync(process.argv[3], "utf8");
 const only = process.argv[4] || null;
 
 const ROW = (verb, tier, gesture, escalates, extra) => Object.assign({ verb, tier, gesture, escalates: escalates || [],
-  target: { panel_id: "loops", row_id: "spore:spore-1", row_version: "v1" } }, extra || {});
+  target: { panel_id: "loops", row_id: "intention:intention-1", row_version: "v1" } }, extra || {});
 const UPDATE_ESC = [{ param: "text", op: "present", tier: "T2" }, { param: "domain", op: "present", tier: "T2" }];
 const HEADS = {
-  spore_touch: { label: "touch", tier: "C1", confirm: false, idempotent: false, fields: [], effect: "marks seen", gesture: "direct" },
-  spore_update: { label: "edit", tier: "C1", confirm: false, idempotent: false, fields: ["text", "domain"], effect: "changes the text", gesture: "direct" },
-  spore_surface_at: { label: "snooze", tier: "C1", confirm: false, idempotent: true, fields: ["surface_at"], effect: "sets the date", gesture: "direct" },
-  spore_descend: { label: "resolve", tier: "C1", confirm: true, idempotent: false, fields: ["spore_kind"], effect: "resolves", gesture: "direct" },
-  spore_set_disposition: { label: "move", tier: "T2", confirm: false, idempotent: false, fields: ["disposition"], effect: "moves", gesture: "direct-reported" },
+  intention_touch: { label: "touch", tier: "C1", confirm: false, idempotent: false, fields: [], effect: "marks seen", gesture: "direct" },
+  intention_update: { label: "edit", tier: "C1", confirm: false, idempotent: false, fields: ["text", "domain"], effect: "changes the text", gesture: "direct" },
+  intention_surface_at: { label: "snooze", tier: "C1", confirm: false, idempotent: true, fields: ["surface_at"], effect: "sets the date", gesture: "direct" },
+  intention_close: { label: "resolve", tier: "C1", confirm: true, idempotent: false, fields: ["intention_kind"], effect: "resolves", gesture: "direct" },
+  intention_set_disposition: { label: "move", tier: "T2", confirm: false, idempotent: false, fields: ["disposition"], effect: "moves", gesture: "direct-reported" },
   operator_state: { label: "set state", tier: "C1", confirm: false, idempotent: false, fields: ["text"], effect: "sets state", gesture: "direct" },
   send_inbox: { label: "Send to inbox", tier: "T2", confirm: true, idempotent: false, fields: ["message", "for"], effect: "sends a note", gesture: "direct-reported" },
 };
 
 function fixture(over) {
   over = over || {};
-  const acts = over.actions || [ROW("spore_touch", "C1", "direct"), ROW("spore_update", "C1", "direct", UPDATE_ESC),
-    ROW("spore_surface_at", "C1", "direct", [{ param: "surface_at", op: "before", value: "2026-12-01", tier: "T2" }]),
-    ROW("spore_set_disposition", "T2", "direct-reported"),
-    ROW("spore_descend", "C1", "direct", [], { options: { spore_kind: ["composted", "completed"] } })];
+  const acts = over.actions || [ROW("intention_touch", "C1", "direct"), ROW("intention_update", "C1", "direct", UPDATE_ESC),
+    ROW("intention_surface_at", "C1", "direct", [{ param: "surface_at", op: "before", value: "2026-12-01", tier: "T2" }]),
+    ROW("intention_set_disposition", "T2", "direct-reported"),
+    ROW("intention_close", "C1", "direct", [], { options: { intention_kind: ["composted", "completed"] } })];
   const head = (id, kind) => ({ id, kind, title: id, status: "ok", as_of: "2026-10-11T12:00:00+00:00" });
   const manifest = { schema: "levain.cockpit/1", entity: { name: "t", governance: "reported", brand: {} },
     generated_at: "2026-10-11T12:00:00+00:00", regions: { header: ["state"], zones: [{ id: "operate", title: "Operate", panels: ["loops", "decisions", "inbox"] }] },
@@ -56,10 +56,10 @@ function fixture(over) {
   const panels = {
     state: Object.assign(head("state", "line"), { value: { lines: [{ label: "state", text: "hi", at: "2026-10-11T11:00:00.000Z", source: "web" }], value_version: "sv1" },
       actions: [{ verb: "operator_state", tier: "C1", gesture: "direct", escalates: [], target: { panel_id: "state", panel_version: "sv1" } }] }),
-    loops: Object.assign(head("loops", "triage-list"), { rows: [{ id: "spore:spore-1", version: "v1", title: "one", body: "one", group: null,
-      facets: { disposition: "loop", domain: "apps", tier: "hot", spore_type: "task" }, actions: acts }], actions: [] }),
+    loops: Object.assign(head("loops", "triage-list"), { rows: [{ id: "intention:intention-1", version: "v1", title: "one", body: "one", group: null,
+      facets: { disposition: "loop", domain: "apps", tier: "hot", intention_type: "task" }, actions: acts }], actions: [] }),
     decisions: Object.assign(head("decisions", "triage-list"), { groups: [{ id: "waiting", title: "Waiting on a signature", count: 1 }],
-      rows: [{ id: "pend:cp1", version: "pv", title: "move on spore:spore-1", group: "waiting", facets: { pending_tier: "T2" },
+      rows: [{ id: "pend:cp1", version: "pv", title: "move on intention:intention-1", group: "waiting", facets: { pending_tier: "T2" },
         actions: [{ verb: "pending_cancel", tier: "T2", gesture: "direct-reported", escalates: [], target: { kind: "pending", pending_id: "cp1" }, route: "/cockpit/pending/cp1/cancel" }] }], actions: [] }),
     inbox: Object.assign(head("inbox", "triage-list"), { rows: [], actions: over.inboxActions === undefined
       ? [{ verb: "send_inbox", tier: "T2", gesture: "direct-reported", escalates: [], target: { panel_id: "inbox" } }] : over.inboxActions }),
@@ -118,8 +118,8 @@ const cases = {};
 cases.mapper_carries_the_write_surface = async () => {
   const env = await makeEnv().start();
   const v = env.view();
-  const s = v.open_spores[0];
-  ok(s.panel_id === "loops" && s.row_id === "spore:spore-1" && s.row_version === "v1", "row target kept");
+  const s = v.open_intentions[0];
+  ok(s.panel_id === "loops" && s.row_id === "intention:intention-1" && s.row_version === "v1", "row target kept");
   ok(Array.isArray(s.actions) && s.actions.length === 5, "row actions kept");
   ok(s.domain === "apps", "domain kept");
   ok(JSON.stringify(s.descend_kinds) === '["composted","completed"]' && s.ascend_kinds.length === 0, "kind options from the action");
@@ -139,11 +139,11 @@ cases.no_transport_means_read_only = async () => {
 
 cases.direct_c1_with_no_escalation_fires_once_with_no_intent = async () => {
   const env = await makeEnv().start();
-  const r = await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  const r = await env.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
   ok(r.ok === true, "touch landed");
   ok(env.posts.length === 1 && env.posts[0].url === "/cockpit/verb", "one post to /cockpit/verb");
   const b = env.posts[0].body;
-  ok(b.verb === "spore_touch" && b.panel_id === "loops" && b.row_id === "spore:spore-1" && b.row_version === "v1", "target named");
+  ok(b.verb === "intention_touch" && b.panel_id === "loops" && b.row_id === "intention:intention-1" && b.row_version === "v1", "target named");
   ok(!("intent" in b) && !("tier_seen" in b) && !("idempotency_key" in b) && !("dry_run" in b), "no intent, no key, no dry run");
   ok(!env.posts.some((p) => p.url === "/edit" || p.url === "/action"), "never the legacy routes");
 };
@@ -152,7 +152,7 @@ cases.an_escalating_write_fires_on_one_click_with_the_dry_run_tier = async () =>
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
   await env.start();
-  const req = { kind: "spore_update", spore_id: "spore-1", text: "new text" };
+  const req = { kind: "intention_update", intention_id: "intention-1", text: "new text" };
   const r = await env.opts().commit(req);
   ok(r.ok === true && !r.preview, "one click fires: " + JSON.stringify(r));
   ok(env.posts.length === 2 && env.posts[0].body.dry_run === true, "a dry run, then the fire");
@@ -168,7 +168,7 @@ cases.the_fire_uses_the_dry_run_gesture_not_the_rendered_one = async () => {
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "sign" }]];
   await env.start();
-  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const req = { kind: "intention_update", intention_id: "intention-1", text: "x" };
   await env.opts().commit(req);
   ok(env.posts[1].body.intent === "sign" && env.posts[1].body.gesture_seen === "sign", "sign from the dry run");
 };
@@ -177,7 +177,7 @@ cases.a_dry_run_that_stays_c1_fires_at_once = async () => {
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "C1", rendered_tier: "C1", gesture: "direct" }]];
   await env.start();
-  const r = await env.opts().commit({ kind: "spore_surface_at", spore_id: "spore-1", surface_at: "2026-12-24" });
+  const r = await env.opts().commit({ kind: "intention_surface_at", intention_id: "intention-1", surface_at: "2026-12-24" });
   ok(r.ok === true && env.posts.length === 2, "dry run then fire in one click");
   const f = env.posts[1].body;
   ok(!("intent" in f) && !("tier_seen" in f), "C1 sends no intent");
@@ -190,7 +190,7 @@ cases.stale_and_tier_moved_reread_and_never_retry_with_an_intent = async () => {
     env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }],
                        [status, { error: code, message: "the server says " + code }]];
     await env.start();
-    const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+    const req = { kind: "intention_update", intention_id: "intention-1", text: "x" };
     const before = env.reads.length;
     const r = await env.opts().commit(req);
     await env.settle();
@@ -208,7 +208,7 @@ cases.a_lost_answer_replays_under_the_same_key_and_an_answer_clears_it = async (
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }], "net"];
   await env.start();
-  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const req = { kind: "intention_update", intention_id: "intention-1", text: "x" };
   const r = await env.opts().commit(req);
   ok(r.ok === false && r.error === "network", "a lost answer is reported as such");
   const stored = JSON.parse(env.ss.levain_cockpit_keys);
@@ -227,7 +227,7 @@ cases.a_replay_survives_a_reload = async () => {
   const env1 = makeEnv();
   env1.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }], "net"];
   await env1.start();
-  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const req = { kind: "intention_update", intention_id: "intention-1", text: "x" };
   await env1.opts().commit(req);
   const lost = env1.posts[1].body;
   const env2 = makeEnv({ session: { levain_cockpit_keys: env1.ss.levain_cockpit_keys } });
@@ -243,7 +243,7 @@ cases.a_lost_write_that_landed_is_replayed_not_dry_run_into_stale = async () => 
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }], "net",
                      [409, { error: "stale", message: "the row moved" }]];
   await env.start();
-  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const req = { kind: "intention_update", intention_id: "intention-1", text: "x" };
   await env.opts().commit(req);
   const first = env.posts[1].body;
   env.verbAnswers = [[200, { ok: true, state: "COMMITTED", label: "replayed" }]];
@@ -259,7 +259,7 @@ cases.a_5xx_with_a_json_body_keeps_the_envelope = async () => {
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }],
                      [503, { error: "unavailable", message: "try later" }]];
   await env.start();
-  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const req = { kind: "intention_update", intention_id: "intention-1", text: "x" };
   const r = await env.opts().commit(req);
   ok(r.ok === false, "the 5xx is shown");
   ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 1, "the envelope is kept");
@@ -272,7 +272,7 @@ cases.identical_submits_in_flight_fire_once = async () => {
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
   await env.start();
-  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const req = { kind: "intention_update", intention_id: "intention-1", text: "x" };
   const [a, b] = await Promise.all([env.opts().commit(req), env.opts().commit(req)]);
   ok(a.ok === true && b.ok === true, "both callers get the answer");
   ok(env.posts.length === 2 && env.posts[0].body.dry_run === true && !env.posts[1].body.dry_run, "one dry run and one fire: " + env.posts.length);
@@ -280,9 +280,9 @@ cases.identical_submits_in_flight_fire_once = async () => {
 
 cases.refused_and_laptop_only_never_post = async () => {
   for (const g of ["refused", "laptop-only"]) {
-    const env = makeEnv({ actions: [ROW("spore_touch", "C1", g)] });
+    const env = makeEnv({ actions: [ROW("intention_touch", "C1", g)] });
     await env.start();
-    const r = await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+    const r = await env.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
     ok(r.ok === false && /cannot be done from this page/.test(r.message) && !/refused|laptop-only|C1/.test(r.message) && env.posts.length === 0, g + " is not posted, and says so in plain words: " + r.message);
   }
 };
@@ -291,30 +291,30 @@ cases.a_dry_run_that_turns_refused_does_not_fire = async () => {
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T3", rendered_tier: "C1", gesture: "laptop-only" }]];
   await env.start();
-  const r = await env.opts().commit({ kind: "spore_update", spore_id: "spore-1", text: "x" });
+  const r = await env.opts().commit({ kind: "intention_update", intention_id: "intention-1", text: "x" });
   ok(r.ok === false && !r.preview && env.posts.length === 1, "the T3 laptop-only answer stops the click");
 };
 
 cases.a_missing_action_is_not_offered = async () => {
-  const env = await makeEnv({ actions: [ROW("spore_touch", "C1", "direct")] }).start();
-  const r = await env.opts().commit({ kind: "spore_update", spore_id: "spore-1", text: "x" });
+  const env = await makeEnv({ actions: [ROW("intention_touch", "C1", "direct")] }).start();
+  const r = await env.opts().commit({ kind: "intention_update", intention_id: "intention-1", text: "x" });
   ok(r.ok === false && r.error === "not_offered" && env.posts.length === 0, "a verb the kernel did not offer is not posted");
 };
 
 cases.confirm_is_sent_only_when_the_head_says_confirm_and_the_operator_confirmed = async () => {
   const env = await makeEnv().start();
-  await env.opts().commit({ kind: "spore_descend", spore_id: "spore-1", spore_kind: "composted", confirm: true, expect_disposition: "loop" });
+  await env.opts().commit({ kind: "intention_close", intention_id: "intention-1", intention_kind: "composted", confirm: true, expect_disposition: "loop" });
   const b = env.posts[0].body;
-  ok(b.confirm === true && b.params.spore_kind === "composted" && !("expect_disposition" in b.params), "confirm sent, legacy CAS key not a param");
+  ok(b.confirm === true && b.params.intention_kind === "composted" && !("expect_disposition" in b.params), "confirm sent, legacy CAS key not a param");
   const env2 = await makeEnv().start();
-  await env2.opts().commit({ kind: "spore_touch", spore_id: "spore-1", confirm: true });
+  await env2.opts().commit({ kind: "intention_touch", intention_id: "intention-1", confirm: true });
   ok(!("confirm" in env2.posts[0].body), "a verb that does not confirm gets no confirm");
 };
 
 cases.a_fire_shows_its_real_state = async () => {
   const env = makeEnv({ verbAnswers: [[200, { ok: true, state: "WAITING", label: null }]] });
   await env.start();
-  const r = await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  const r = await env.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
   ok(r.ok === true && r.data.state === "WAITING", "the answer's state reaches the caller");
 };
 
@@ -330,10 +330,10 @@ cases.write_token_requirement_comes_from_the_transport = async () => {
   await env.start();
   ok(env.view().write_token_required === true, "the transport flag reaches the view");
   env.stored = true;
-  const r = await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  const r = await env.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
   ok(r.ok === true && env.posts[0].headers["X-Levain-Write-Token"] === "tok", "the stored credential rides the write");
   const off = await makeEnv({ transport: { writable: true, write_token_required: false } }).start();
-  await off.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  await off.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
   ok(!("X-Levain-Write-Token" in off.posts[0].headers), "no credential when the transport asks for none");
 };
 
@@ -372,18 +372,18 @@ function withTray(env) {
     env.fx.manifest.regions.zones[0].panels.push(id);
     env.fx.panels[id] = Object.assign(head(id), { rows: [], actions: [] });
   }
-  env.fx.panels.tray.actions = [{ verb: "spore_seed", tier: "C1", gesture: "direct", escalates: [], target: { panel_id: "tray", panel_version: "tv" } }];
-  env.fx.manifest.verbs.spore_seed = { label: "capture", tier: "C1", confirm: false, idempotent: false, fields: ["text", "type", "disposition"], effect: "adds a seed", gesture: "direct" };
+  env.fx.panels.tray.actions = [{ verb: "intention_seed", tier: "C1", gesture: "direct", escalates: [], target: { panel_id: "tray", panel_version: "tv" } }];
+  env.fx.manifest.verbs.intention_seed = { label: "capture", tier: "C1", confirm: false, idempotent: false, fields: ["text", "type", "disposition"], effect: "adds a seed", gesture: "direct" };
 }
 
 cases.a_seed_capture_posts_the_trays_create_with_the_disposition = async () => {
   const env = makeEnv();
   withTray(env);
   await env.start();
-  const r = await env.opts().commit({ kind: "spore_seed", text: "drop this", disposition: "seed" });
+  const r = await env.opts().commit({ kind: "intention_seed", text: "drop this", disposition: "seed" });
   ok(r.ok === true, "the seed capture landed");
   const b = env.posts[0].body;
-  ok(b.verb === "spore_seed" && b.panel_id === "tray" && b.params.disposition === "seed" && b.params.text === "drop this", "the tray's create, disposition in params");
+  ok(b.verb === "intention_seed" && b.panel_id === "tray" && b.params.disposition === "seed" && b.params.text === "drop this", "the tray's create, disposition in params");
 };
 
 cases.the_board_draws_no_keep_card_even_when_the_manifest_still_names_one = async () => {
@@ -415,7 +415,7 @@ cases.a_declined_token_prompt_stays_quiet_on_refresh_and_a_passive_load_never_as
   for (const f of env.listeners.visibilitychange || []) f();
   await env.settle();
   ok(asked === 1, "a passive refresh after a decline does not ask again");
-  await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  await env.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
   ok(asked === 2, "a write gesture asks for the token");
 };
 
@@ -423,7 +423,7 @@ cases.an_undefined_param_is_dropped_and_never_throws = async () => {
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
   await env.start();
-  const r = await env.opts().commit({ kind: "spore_update", spore_id: "spore-1", text: "x", domain: undefined });
+  const r = await env.opts().commit({ kind: "intention_update", intention_id: "intention-1", text: "x", domain: undefined });
   ok(r.ok === true, "the write lands");
   ok(env.posts.every((p) => !("domain" in p.body.params)), "an undefined value is not sent");
 };
@@ -454,7 +454,7 @@ cases.a_token_required_manifest_read_without_a_token_prompts_then_rereads = asyn
   ok(asked === 1, "one prompt");
   ok(env.reads.filter((u) => u.indexOf("/cockpit/manifest.json") >= 0).length === 2, "the manifest is read again");
   ok(env.view().writable === true, "drawn writable");
-  const r = await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  const r = await env.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
   ok(r.ok === true && env.posts[0].headers["X-Levain-Write-Token"] === "newtok", "the entered token rides the write");
 };
 
@@ -463,15 +463,15 @@ cases.a_hidden_character_row_offers_no_inline_text_edit = async () => {
   env.fx.panels.loops.rows[0].body = "one​two";
   env.fx.panels.loops.rows[0].text_hidden = true;           // as the server's levain.unshowable flags it
   env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0],
-    { id: "spore:spore-2", body: "plain", text_hidden: false }));
+    { id: "intention:intention-2", body: "plain", text_hidden: false }));
   // a leading combining mark: the page's escape keeps it, the server's predicate calls it hidden
   env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0],
-    { id: "spore:spore-3", body: "̀x", text_hidden: true }));
+    { id: "intention:intention-3", body: "̀x", text_hidden: true }));
   // the page never judges: an escape it would make does not lock a row the server did not flag
   env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0],
-    { id: "spore:spore-4", body: "a​b", text_hidden: false }));
+    { id: "intention:intention-4", body: "a​b", text_hidden: false }));
   await env.start();
-  const [a, b, c, d] = env.view().open_spores;
+  const [a, b, c, d] = env.view().open_intentions;
   ok(/hidden characters/.test(a.text_locked || ""), "the flagged row is locked with a reason");
   ok(a.text.indexOf("<U+200B>") >= 0, "and still shows the marker");
   ok(b.text_locked === undefined, "a plain row is not");
@@ -480,10 +480,10 @@ cases.a_hidden_character_row_offers_no_inline_text_edit = async () => {
 };
 
 cases.offered_verbs_lists_only_what_a_postable_action_offers = async () => {
-  const env = await makeEnv({ actions: [ROW("spore_touch", "C1", "direct"), ROW("spore_update", "T3", "laptop-only")] }).start();
+  const env = await makeEnv({ actions: [ROW("intention_touch", "C1", "direct"), ROW("intention_update", "T3", "laptop-only")] }).start();
   const o = env.view().offered_verbs;
-  ok(o.spore_touch === true && o.operator_state === true && o.entity_name === undefined, "touch and the state line, not rename");
-  ok(o.spore_update === undefined, "a laptop-only action is not postable");
+  ok(o.intention_touch === true && o.operator_state === true && o.entity_name === undefined, "touch and the state line, not rename");
+  ok(o.intention_update === undefined, "a laptop-only action is not postable");
 };
 
 
@@ -500,13 +500,13 @@ function fakeRow(key) {
 cases.the_answer_reaches_the_row_before_the_reread_resolves = async () => {
   const env = makeEnv();
   await env.start();
-  const row = fakeRow("spore:spore-1");
+  const row = fakeRow("intention:intention-1");
   // the page's doc is the one handed to the boot function: patch its row query
   env.rows = [row];
   let release;
   const gate = new Promise((r) => { release = r; });
   env.holdReads = gate;
-  const p = env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  const p = env.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
   await env.settle();
   // a landed write says nothing on the row: no state code, no authority label (Phill 10-14), the re-read shows the new content
   ok(!row.msg || row.msg.textContent === "", "a landed write leaves no status text on the row: " + (row.msg && row.msg.textContent));
@@ -521,9 +521,9 @@ cases.an_unknown_state_speaks_never_reads_as_landed = async () => {
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, state: "MYSTERY" }]];
   await env.start();
-  const row = fakeRow("spore:spore-1");
+  const row = fakeRow("intention:intention-1");
   env.rows = [row];
-  const p = env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  const p = env.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
   await env.settle();
   ok(row.msg && /did not finish/.test(row.msg.textContent), "a state the page does not know says so: " + (row.msg && row.msg.textContent));
   await p;
@@ -533,11 +533,11 @@ cases.a_refusal_shows_its_text_at_once = async () => {
   const env = makeEnv();
   env.verbAnswers = [[409, { ok: false, error: "stale", message: "the row moved" }]];
   await env.start();
-  const row = fakeRow("spore:spore-1");
+  const row = fakeRow("intention:intention-1");
   env.rows = [row];
   let release;
   env.holdReads = new Promise((r) => { release = r; });
-  const p = env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  const p = env.opts().commit({ kind: "intention_touch", intention_id: "intention-1" });
   await env.settle();
   ok(row.msg && /changed somewhere else/.test(row.msg.textContent) && !/row moved|stale/.test(row.msg.textContent), "refusal text on the row before the re-read: " + (row.msg && row.msg.textContent));
   release();

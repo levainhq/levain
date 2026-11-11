@@ -98,7 +98,7 @@ def test_an_empty_card_with_no_compose_box_is_a_full_width_bar_after_its_zones_c
 def test_a_fire_reads_as_a_sentence_and_an_unknown_shape_is_named_as_the_store_names_it() -> None:
     from levain.cockpit.providers import _edit_target, plain_edit_title
 
-    assert plain_edit_title("spore_descend", _edit_target("spore:spore-017"), "token:browser:1") == "resolved item spore-017, from the browser"
+    assert plain_edit_title("intention_close", _edit_target("intention:intention-017"), "token:browser:1") == "resolved item intention-017, from the browser"
     assert plain_edit_title("section_edit", _edit_target("section:State"), "device:ab12") == "edited the State section, from a signed device"
     assert plain_edit_title("token_rotate", _edit_target("token:browser"), "token:browser:2") == "rotated the surface token browser, from the browser"
     assert plain_edit_title("pending_cancel", _edit_target("pend:xyz"), "") == "cancelled a pending change"

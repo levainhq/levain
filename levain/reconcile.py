@@ -91,7 +91,7 @@ class PackReconcile:
     backed_up: list[str] = field(default_factory=list)  # operator-edited -> .bak + applied
     added: list[str] = field(default_factory=list)      # new seeds copied in
     removed: list[str] = field(default_factory=list)    # dropped seeds removed
-    # dropped OVERRIDES: the next-winning lower layer's file was put back (spore-450)
+    # dropped OVERRIDES: the next-winning lower layer's file was put back (intention-450)
     restored: list[str] = field(default_factory=list)
     review: list[str] = field(default_factory=list)     # surfaced for the operator
     # New rendered-output hashes for render seeds this run wrote (folded into the
@@ -109,7 +109,7 @@ class _SeedStack:
 
     A pack reconciles only the seed files it WINS. ``install/seed/`` is flat and the
     roster is last-wins by filename, so a file one pack adds, changes or drops may be
-    another layer's to show (spore-450: dropping an override deleted the base file it
+    another layer's to show (intention-450: dropping an override deleted the base file it
     had been hiding, leaving the carrier's ``@seed/`` import dangling).
 
     Each layer is read ON ITS OWN, so one bad layer never blinds the reconcile for the
@@ -390,7 +390,7 @@ def _show_winner(
     flag: Callable[[str, str], None],
 ) -> None:
     """A pack stopped shipping ``rel`` while another layer still ships it: put that
-    layer's file in the install (spore-450). A render-mode winner is flagged, not
+    layer's file in the install (intention-450). A render-mode winner is flagged, not
     restored: ``levain update`` does not re-render a seed from a layer it did not just
     reconcile, so the dropped copy stays loaded until a re-onboard."""
     fname = rel[len("seed/"):]
@@ -560,7 +560,7 @@ def reconcile_pack(
 
     # dropped seed files. What the drop MEANS depends on who else ships the filename:
     # no other layer -> the doctrine is authoritatively gone, remove it; a LOWER layer
-    # -> the pack dropped an OVERRIDE, so the file it was hiding comes back (spore-450);
+    # -> the pack dropped an OVERRIDE, so the file it was hiding comes back (intention-450);
     # a HIGHER layer -> leave it, UNLESS the install still holds exactly this pack's
     # last-shipped bytes (a pack `order` change moved the win), which no layer ships now.
     # Back up any operator-diverged copy before replacing or unlinking it (a RENDERED

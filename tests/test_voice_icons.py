@@ -67,7 +67,7 @@ def _card(tmp_path: Path, monkeypatch, open_ended: bool) -> None:
     (home / "consent").mkdir(parents=True, mode=0o700)
     store = QuestionStore(home / "consent")
     if open_ended:
-        store.file(agent="codex", agent_session_id="s2", what="flow: Due 11-09 15:30: Call with Jim (spore-1663)",
+        store.file(agent="codex", agent_session_id="s2", what="flow: Due 11-09 15:30: Call with Jim (intention-1663)",
                    blocks="nothing acts on it until you do", cwd="/w", open_ended=True)
     else:
         store.file(agent="claude_code", agent_session_id="s1", what="Should a rule be a 30-day lease?",

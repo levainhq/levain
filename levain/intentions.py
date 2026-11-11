@@ -1,6 +1,6 @@
-"""levain.spores — the spore *disposition* vocabulary (control-plane Slice 3).
+"""levain.intentions — the intention *disposition* vocabulary (control-plane Slice 3).
 
-A spore's ``disposition`` routes it across THREE operator-facing classes:
+An intention's ``disposition`` routes it across THREE operator-facing classes:
   - ``loop`` (the default, absent/``loop``) — the entity's OWN prospective loop; belongs in
     its cognition (recall / salience / digest / Top of Mind).
   - the **Tray** inbox (``seed`` / ``handoff`` / ``agenda``) — operator session-I/O that
@@ -12,29 +12,29 @@ A spore's ``disposition`` routes it across THREE operator-facing classes:
     (the ``parked`` TIER) renders in Open loops, marked parked.
 Tray + note are both ``NON_COGNITION``; lineage rides the existing ``pointer``.
 
-The field is ADDITIVE: every pre-Slice-3 spore has no ``disposition`` key and reads as a
+The field is ADDITIVE: every pre-Slice-3 intention has no ``disposition`` key and reads as a
 ``loop`` (no migration; anneal round-trips an unknown ``disposition`` untouched — the
 Slice-3 de-risk, proven empirically, is exactly why anneal needs NO change).
 
-This module is the dashboard's render half: it CLASSIFIES a spore dict into the three
+This module is the dashboard's render half: it CLASSIFIES an intention dict into the three
 operator-facing projections — Open Loops / Tray — via :func:`bucket_of`.
 
 ⚠ **Scope of the "keep operator-I/O OUT of cognition" invariant.** ``is_loop`` is the
 PREDICATE; who ENFORCES it depends on the surface. The embedder's own store enforces it at its
-cognition reads (``scripts/spores.py`` + flow_state/constellation — the embedder's layer 2). A bare
+cognition reads (``scripts/intentions.py`` + flow_state/constellation — the embedder's layer 2). A bare
 LEVAIN install's cognition surfaces are its activation hooks
 (``templates/activation/hooks/*`` — session-start dormant-surface + per-prompt collision):
 3b ports ``is_loop`` there (the standalone hook copies filter on
 ``_NON_COGNITION_DISPOSITIONS``), so the boundary holds for a stranger too.
 
 ⚠ **Drift contract (load-bearing).** The taxonomy is duplicated in FOUR places BY DESIGN —
-this module, the embedder's ``scripts/spores.py``, and the TWO standalone hook copies (Claude +
+this module, the embedder's ``scripts/intentions.py``, and the TWO standalone hook copies (Claude +
 Codex adapters, which can't import a package). anneal — the shared dependency — deliberately
 does NOT carry the taxonomy (the de-risk keeps the canonical object's storage
 disposition-blind), so every consumer that must INTERPRET disposition carries the vocab. A
 NEW operator-I/O disposition added upstream must be added to ALL FOUR (and to the write
 seam's ``choices``). Guards: the flow↔levain cross-repo equality test
-(``flow/scripts/test_tray_disposition.py``); the hook↔hook parity + hook↔levain.spores tests
+(``flow/scripts/test_tray_disposition.py``); the hook↔hook parity + hook↔levain.intentions tests
 (``levain/tests/test_hooks.py``). The ``is_loop`` definition below is the byte-for-byte twin
 of the reference implementation's; keep them identical.
 """
@@ -56,7 +56,7 @@ __all__ = [
     "RetiredDisposition",
     "retired_message",
     "refuse_retired_disposition",
-    "guarded_spore_store",
+    "guarded_intention_store",
     "KEEP_DISPOSITIONS",
     "RETIRED_DISPOSITIONS",
     "NON_COGNITION_DISPOSITIONS",
@@ -82,8 +82,8 @@ __all__ = [
 ]
 
 LOOP_DISPOSITION = "loop"
-TRAY_DISPOSITIONS = ("seed", "handoff", "agenda")   # operator INBOX — the READ set (a legacy handoff still reads)
-TRAY_WRITE_DISPOSITIONS = ("seed", "agenda")        # the Tray values a NEW write may take
+TRAY_DISPOSITIONS = ("someday", "seed", "handoff", "agenda")   # operator INBOX — the READ set (a legacy handoff still reads)
+TRAY_WRITE_DISPOSITIONS = ("someday", "seed", "agenda")        # the Tray values a NEW write may take
 # RETIRED (TS-1): legacy rows still carry these. They stay in the READ sets (a legacy handoff
 # or Keep note still renders, descends, and re-dispositions to seed/agenda) but are OUT of the
 # WRITE set (WRITE_DISPOSITIONS): a new handoff or Keep note is refused at the write seam.
@@ -93,7 +93,7 @@ KEEP_DISPOSITIONS = ("note",)                        # legacy operator REFERENCE
 # The retired names STAY: ``is_loop`` fails OPEN on an unknown value, so dropping them would
 # flood every legacy note and handoff into the agent's collision surface. The order is the
 # hook copies' tuple order (drift contract: byte-equal to ``_NON_COGNITION_DISPOSITIONS``).
-NON_COGNITION_DISPOSITIONS = ("seed", "handoff", "agenda", "note")
+NON_COGNITION_DISPOSITIONS = ("someday", "seed", "handoff", "agenda", "note")
 # Two sets, two names. VALID: every value a row may HOLD (the read set; byte-equal to the embedder's
 # ``VALID_DISPOSITIONS``, a drift-contract tuple). WRITE: every value a write may SET.
 VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + NON_COGNITION_DISPOSITIONS
@@ -115,13 +115,13 @@ class RetiredDisposition(ValueError):
 
 
 def stored_disposition(value: Any) -> Any:
-    """``value`` as anneal will persist it (``normalize_spore_field``: controls and trailing
+    """``value`` as anneal will persist it (``normalize_intention_field``: controls and trailing
     whitespace removed, NFC). A non-string is returned unchanged; anneal refuses it itself."""
     if not isinstance(value, str):
         return value
-    from anneal_memory.spores import normalize_spore_field
+    from anneal_memory.spores import normalize_intention_field
 
-    return normalize_spore_field(value)
+    return normalize_intention_field(value)
 
 
 def retired_message(value: Any) -> str | None:
@@ -138,7 +138,7 @@ def retired_message(value: Any) -> str | None:
 def refuse_retired_disposition(value: Any, current: Any = None) -> None:
     """TS-1, the write seams' early refusal (a clean 422 before the store is touched). A retired value
     is refused unless ``current`` already holds its persisted form: an echo, which the seam must then
-    DROP from its write (the store guard, :func:`guarded_spore_store`, refuses every retired value it is
+    DROP from its write (the store guard, :func:`guarded_intention_store`, refuses every retired value it is
     handed). An undo that RESTORES a retired value is a change, so it is refused."""
     msg = retired_message(value)
     if msg is not None and stored_disposition(value) != current:
@@ -160,13 +160,13 @@ def _refuse_unwritable(value: Any) -> None:
         or f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {value!r})")
 
 
-NEW_ID_PREFIX = "intention"   # a record this store mints (anneal 1.0.7 ``id_prefix``): ``intention-NNN``; ``spore-N`` ids still read
+NEW_ID_PREFIX = "intention"   # a record this store mints (anneal 1.0.7 ``id_prefix``): ``intention-NNN``; ``intention-N`` ids still read
 _GUARDED: Any = None
 _GUARDED_LOCK = threading.Lock()   # anneal is imported lazily (this module stays stdlib-only), so build once under a lock
 
 
-def guarded_spore_store(path: Any) -> Any:
-    """An anneal ``SporeStore`` that will not SET a disposition outside ``WRITE_DISPOSITIONS``
+def guarded_intention_store(path: Any) -> Any:
+    """An anneal ``IntentionStore`` that will not SET a disposition outside ``WRITE_DISPOSITIONS``
     through ``add``, ``update`` or ``apply`` (a planned cockpit effect that deserialized after an
     upgrade included), so no writer (``apply_edit``, the cockpit effects, a CLI, a migration) can
     route around the retirement. Legacy rows still read, and an update that does not name
@@ -186,17 +186,17 @@ def guarded_spore_store(path: Any) -> Any:
 
 
 def _build_guarded_class() -> Any:
-    from anneal_memory.spores import ApplyRefused, SporeStore
+    from anneal_memory.spores import ApplyRefused, IntentionStore
 
-    class GuardedSporeStore(SporeStore):  # type: ignore[misc]
+    class GuardedIntentionStore(IntentionStore):  # type: ignore[misc]
         # keyword-only, as anneal's own add/update are: a positional disposition cannot exist
         def add(self, **kw: Any) -> Any:
             _refuse_unwritable(kw.get("disposition"))
             return super().add(**kw)
 
-        def update(self, spore_id: str, **kw: Any) -> Any:
+        def update(self, intention_id: str, **kw: Any) -> Any:
             _refuse_unwritable(kw.get("disposition"))
-            return super().update(spore_id, **kw)
+            return super().update(intention_id, **kw)
 
         def apply(self, effect: Any) -> Any:
             if getattr(effect, "op", None) in ("add", "update"):
@@ -206,7 +206,7 @@ def _build_guarded_class() -> Any:
                     raise ApplyRefused(str(exc)) from exc
             return super().apply(effect)
 
-    return GuardedSporeStore
+    return GuardedIntentionStore
 
 
 # The tier value that means *deliberate dormancy* (anneal's own ``Tier`` literal — see
@@ -224,24 +224,24 @@ BUCKET_TRAY = "tray"   # the operator inbox awaiting AI triage + legacy notes (T
 
 
 def disposition_of(item: Mapping[str, Any]) -> str:
-    """A spore with no ``disposition`` key is a normal prospective loop (the default
-    for every pre-Slice-3 spore)."""
+    """An intention with no ``disposition`` key is a normal prospective loop (the default
+    for every pre-Slice-3 intention)."""
     return item.get("disposition") or LOOP_DISPOSITION
 
 
 def is_loop(item: Mapping[str, Any]) -> bool:
-    """True iff the spore flows into the entity's OWN cognition (salience / Top of Mind /
+    """True iff the intention flows into the entity's OWN cognition (salience / Top of Mind /
     digest / constellation agent seeds). The operator-I/O dispositions — the Tray inbox
     (seed/handoff/agenda) AND Keep reference (note) — are the complement, kept OUT of
     cognition.
 
     Fail-OPEN on the unknown: only an EXPLICITLY known operator-I/O disposition is
-    excluded; a falsy/absent value (every pre-Slice-3 spore) OR an unrecognized string
+    excluded; a falsy/absent value (every pre-Slice-3 intention) OR an unrecognized string
     reads as in-cognition. The exclusion axis is the silent-harm one — an operator-I/O
     item leaking into a render is visible text, but a real loop wrongly bucketed out
     vanishes from the Open-Loops panel with no signal. An unknown value is almost always
     a typo / corruption / version-skew on a real loop — fail it toward the visible loop.
-    (Byte-for-byte twin of the embedder's ``scripts/spores.py:is_loop``; keeping them identical
+    (Byte-for-byte twin of the embedder's ``scripts/intentions.py:is_loop``; keeping them identical
     is the drift contract above.)"""
     return disposition_of(item) not in NON_COGNITION_DISPOSITIONS
 
@@ -260,8 +260,8 @@ def is_note(item: Mapping[str, Any]) -> bool:
 
 
 def bucket_of(item: Mapping[str, Any]) -> str:
-    """Classify a spore into its operator-facing render bucket — a TOTAL partition (every
-    spore lands in exactly one):
+    """Classify an intention into its operator-facing render bucket — a TOTAL partition (every
+    intention lands in exactly one):
 
     - ``BUCKET_TRAY`` — a Tray inbox disposition (seed/handoff/agenda), ANY tier, or a legacy
       ``note`` row (the Keep is gone; a note still in a store is shown, badged ``note``, never
@@ -336,11 +336,11 @@ def executor_of(target: Any) -> str | None:
 
 def is_talk_seed(item: Mapping[str, Any]) -> bool:
     """An open ``seed`` that carries ``attention: talk``: a thing to talk through with the operator (the talk queue).
-    Such a seed does not go stale silently. Levain's own spore code has no TTL expiry or resurface step of its own
+    Such a seed does not go stale silently. Levain's own intention code has no TTL expiry or resurface step of its own
     (anneal's ``list_open`` ranks and ``germination_tier`` classifies; nothing in levain expires or resurfaces a seed),
     so this predicate is the contract hook for a caller that adds one."""
     d = item.get("disposition")
-    return (isinstance(d, str) and d.strip().casefold() == "seed"
+    return (isinstance(d, str) and d.strip().casefold() in ("someday", "seed")
             and isinstance(item.get("attention"), str) and item["attention"].strip() == "talk")
 
 
@@ -352,10 +352,10 @@ def check_steering(disposition: Any, target: Any, attention: Any) -> str | None:
         return f"target must be band, nudge, desk or board:<repo> (got {target!r})"
     if attention is not None and attention not in GERMINATE_ATTENTIONS:
         return f"attention must be one of {', '.join(GERMINATE_ATTENTIONS)} (got {attention!r})"
-    if d == "seed" and target is None and attention == "talk":
+    if d in ("someday", "seed") and target is None and attention == "talk":
         return None
     if (target is not None or attention is not None) and d != "agenda":
-        return ("target and attention steer how an AGENDA germinates; this spore is not one "
+        return ("target and attention steer how an AGENDA germinates; this intention is not one "
                 "(the one exception: a seed may carry attention talk)")
     if attention not in (None, "none") and target == "desk":
         return "attention pings a band row, and a desk target files a drop, none; drop attention or use target band or nudge"
@@ -364,27 +364,27 @@ def check_steering(disposition: Any, target: Any, attention: Any) -> str | None:
     return None
 
 
-def ringing_ref(spore: Mapping[str, Any], open_questions: Any) -> str | None:
-    """The band row an OPEN agenda rings in, or None. The one definition of "rings": the spore is an open agenda, its
+def ringing_ref(intention: Mapping[str, Any], open_questions: Any) -> str | None:
+    """The band row an OPEN agenda rings in, or None. The one definition of "rings": the intention is an open agenda, its
     ``germinated`` stamp names a ref that is not a desk drop (``dr-``), and that ref is one of ``open_questions``
     (the ids of the questions still open): an answered, snoozed-away or missing question does not ring. Read from the
     stored record, never a facet, so it holds whatever the List could or could not read."""
-    stamp = spore.get("germinated")
+    stamp = intention.get("germinated")
     ref = stamp.get("ref") if isinstance(stamp, Mapping) else None
-    if (spore.get("disposition") == "agenda" and spore.get("status", "open") == "open"
+    if (intention.get("disposition") == "agenda" and intention.get("status", "open") == "open"
             and isinstance(ref, str) and ref and not ref.startswith("dr-") and ref in open_questions):
         return ref
     return None
 
 
-def answered_descend_kind(spore_type: Any) -> str:
-    """The descend kind that says an intention was answered, by the spore's type (anneal validates a kind against it)."""
-    return {"task": "done", "question": "answered", "thought": "explored"}.get(str(spore_type), "composted")
+def answered_descend_kind(intention_type: Any) -> str:
+    """The descend kind that says an intention was answered, by the intention's type (anneal validates a kind against it)."""
+    return {"task": "done", "question": "answered", "thought": "explored"}.get(str(intention_type), "composted")
 
 
-def dropped_descend_kind(spore_type: Any) -> str:
-    """The descend kind that says an intention was dropped, by the spore's type."""
-    return {"task": "dropped", "question": "mooted", "thought": "dropped"}.get(str(spore_type), "composted")
+def dropped_descend_kind(intention_type: Any) -> str:
+    """The descend kind that says an intention was dropped, by the intention's type."""
+    return {"task": "dropped", "question": "mooted", "thought": "dropped"}.get(str(intention_type), "composted")
 
 
 def open_question_ids(questions: Any) -> frozenset[str]:
@@ -395,15 +395,15 @@ def open_question_ids(questions: Any) -> frozenset[str]:
         return frozenset()
 
 
-def spore_ringing_question(spores_json: Any, ref: Any) -> str | None:
+def intention_ringing_question(intentions_json: Any, ref: Any) -> str | None:
     """The id of the open agenda whose stamp names the OPEN band row ``ref``, or None (no store, no such stamp, an unreadable
     store: a guard that cannot read says nothing, it never blocks an unrelated act)."""
     from pathlib import Path
 
     try:
-        if not Path(spores_json).is_file():
+        if not Path(intentions_json).is_file():
             return None
-        for item in list_open_readonly(spores_json):
+        for item in list_open_readonly(intentions_json):
             if ringing_ref(item, (ref,)) == ref:
                 return str(item.get("id"))
     except Exception:  # noqa: BLE001 - see the docstring
@@ -417,7 +417,7 @@ def list_open_readonly(path: Any, *, today: Any = None) -> list[dict[str, Any]]:
     as ``list_open`` does, and gives a keyless row a TEMPORARY in-memory key (display only, never persisted)."""
     import uuid
 
-    store = guarded_spore_store(path)
+    store = guarded_intention_store(path)
     data = store._load()   # noqa: SLF001 - the non-mutating read; `_load_keyed` is the one that saves
     items = [dict(s) for s in data.get("spores", []) if isinstance(s, dict)]
     for it in items:

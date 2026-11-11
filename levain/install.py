@@ -8,7 +8,7 @@ Walks a stranger through standing up a new Levain install:
   4. Run the scripted interview to fill the render templates (`world.md` +
      `origin.md` in the base pack) and render them into `seed/`.
   5. Copy the verbatim seed files byte-exact (`partnership.md`, `memory.md`,
-     `spore_instructions.md`, the continuity scaffold, README in the base pack).
+     `intention_instructions.md`, the continuity scaffold, README in the base pack).
   6. Lay down the adapter's wiring (settings, MCP registration, hooks).
   7. Initialize the install-pinned anneal-memory store.
   8. Print next-steps banner.
@@ -17,7 +17,7 @@ Idempotency: a non-empty install dir is refused unless `--force`. With
 `--force` the whole `activation/` tree is REPLACED, and the previous tree is
 first moved whole to `.levain/backups/activation/tree-<ts>/`; old trees are
 removed only when they prove unedited against their install receipt
-(spore-861, spore-900). The anneal-memory store is preserved as-is. The Codex global `~/.codex/hooks.json` is backed up
+(intention-861, intention-900). The anneal-memory store is preserved as-is. The Codex global `~/.codex/hooks.json` is backed up
 before being overwritten, and `~/.codex/config.toml` is backed up and the
 change announced when the MCP block is repointed at a DIFFERENT store.
 
@@ -404,7 +404,7 @@ def run_init(
     from levain.manifest import resolve_anneal_bin
 
     python_path = sys.executable
-    anneal_path = resolve_anneal_bin()  # spore-751: the interpreter's anneal, never PATH's
+    anneal_path = resolve_anneal_bin()  # intention-751: the interpreter's anneal, never PATH's
 
     print()
     print(f"Levain init — installing to {install}")
@@ -562,7 +562,7 @@ def run_init(
             _report_partial_state(install)
             return 1
 
-        # One install lock across every write (spore-1023): the docs rebuild below
+        # One install lock across every write (intention-1023): the docs rebuild below
         # wipes .levain/docs, so a concurrent init must not interleave with it either.
         try:
             with install_lock(install):
@@ -786,7 +786,7 @@ def _apply_init(
     # template named it, so the break was visible). Fail loud, named.
     #
     # ⚠ CHECKED AGAINST REACHABILITY, NOT THE EAGER IMPORT LIST. When
-    # spore_instructions.md moved to ON_DEMAND_SEED, an import-list check would
+    # intention_instructions.md moved to ON_DEMAND_SEED, an import-list check would
     # have kept passing while quietly ceasing to cover it — a guard that reports
     # itself armed and no longer defends the file it was written for. Reachable =
     # eagerly imported OR carrying a carrier pointer.
@@ -1139,8 +1139,8 @@ def _record_compat_lock(
     migration-manifest entry through ``manifest.TEMPLATES_RECONCILED_ANNEAL`` (a
     reviewed release-checklist assertion, test-locked) — so a freshly-rendered,
     current adopter genuinely has nothing to review through that version, and
-    acking it does NOT suppress a real proposal. (This is the spore-216 reconcile
-    of the spore-213 default: before the templates carried the migrate-notify /
+    acking it does NOT suppress a real proposal. (This is the intention-216 reconcile
+    of the intention-213 default: before the templates carried the migrate-notify /
     crystal / linkgate guidance — and before the activation hook actually fired
     per-turn crystal recall — NOT acking was the honest call; now that they do,
     acking to the reconciled version is — and it gives a fresh adopter a clean
@@ -1429,7 +1429,7 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
 
     Two ``levain init --force`` runs on one install used to interleave their activation
     swaps: reproduced through the CLI as an uncaught FileNotFoundError mid-swap, and as
-    a receipt describing a tree that was not installed (spore-1023).
+    a receipt describing a tree that was not installed (intention-1023).
 
     REENTRANT per (install, thread): a nested ``install_lock`` inside a held one is a
     no-op, so a caller can hold it across ``apply_init`` (which takes it too) and the
@@ -2460,7 +2460,7 @@ def _claude_code_files(
                                           local=_cc_hooks_in_local(install) if in_local is None else in_local)[0]
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
-    # spore-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
+    # intention-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
     # that serves memory is structurally the one levain imports.
     mcp_text = _fill(mcp_text, {"INSTALL_DIR": _string_body(str(install)),
                                 "PYTHON": _string_body(python_path)})
@@ -3911,7 +3911,7 @@ def _refresh_adapter(
                 # its bytes are what levain last wrote for THIS install; anything else,
                 # another install's file, an edit, or a file from before the receipt, is
                 # staged under .levain/pending/ and never overwritten. Ownership is not
-                # inferred from the file's text (spore-866 L3 r1-r7; ruled 2026-10-10 "go
+                # inferred from the file's text (intention-866 L3 r1-r7; ruled 2026-10-10 "go
                 # with B"), the way dpkg treats a conffile.
                 files = {**files, hooks: want}
         carried = False
@@ -4239,7 +4239,7 @@ def _atomic_write_bytes(target: Path, data: bytes, *, like: Path | None = None) 
 def _string_body(value: str) -> str:
     """``value`` as the body of a double-quoted string literal, for a template slot that sits
     inside one: JSON, a TOML basic string or a Python ``"..."`` (the hooks' anneal path).
-    spore-866: a raw path with a `\\`, `"` or newline broke the file around it (and could
+    intention-866: a raw path with a `\\`, `"` or newline broke the file around it (and could
     inject keys or code). JSON's escapes with ensure_ascii=False, plus DEL as ``\\u007f``
     (TOML forbids it raw), are valid in all three; the ASCII form would emit surrogate pairs
     TOML rejects. A lone surrogate (a path whose bytes are not UTF-8) cannot be written to a
@@ -4535,7 +4535,7 @@ def _toml_error(text: str) -> str | None:
 def _require_toml(text: str, path: Path, before: str | None) -> str | None:
     """Refuse (``InitError``) when levain's change is what would stop codex's machine-global
     ``path`` parsing: a parse failure there takes down every MCP server codex has, not only
-    levain's (spore-866). A file that did not parse BEFORE the change either (``before``) is not
+    levain's (intention-866). A file that did not parse BEFORE the change either (``before``) is not
     levain's to judge, since codex's parser may accept what ``tomllib`` refuses: returns the
     error it has AFTER the change, for the caller to report once the write has landed;
     otherwise None."""
@@ -4658,7 +4658,7 @@ def _levain_render_variant(
     machine or release: the same keys and list lengths as ``want``, differing only at
     leaves that are a per-machine variable (the leaf in ``variant``, rendered with a
     sentinel interpreter, holds the sentinel). With ``mcp``, the anneal_memory server's
-    ``command``/``args`` are levain's launcher (spore-751 changed its shape) and are set
+    ``command``/``args`` are levain's launcher (intention-751 changed its shape) and are set
     aside, but only while the old args still serve THIS install's store."""
     try:
         x, y, v = json.loads(here), json.loads(want), json.loads(variant)
@@ -4908,7 +4908,7 @@ def run_adopt_answers(
     """``levain adopt-answers``: make the install's RENDERED seed files the interview record
     (``.levain/answers.json``), so a hand edit stops being something the next re-render
     (``init --force`` from the record, a pack render reconcile) silently reverts
-    (spore-423; reproduced: an edited LOCATION in world.md was reverted by a re-onboard
+    (intention-423; reproduced: an edited LOCATION in world.md was reverted by a re-onboard
     from the record, with no backup of the seed).
 
     ALL-OR-REFUSE: every render seed must read back to exactly one answer set that
@@ -5401,7 +5401,7 @@ def hook_body(text: str) -> str:
     The docstring above worried about staying in lockstep with `_substitute_hook_placeholders`
     while sitting in a different module; that is the coupling, and adjacency is the cheapest
     guard for it. `_copy_activation_tree`'s operator-edit backup used it too until
-    `spore-900` (2026-09-13), which replaced the normalisation there with the install receipt.
+    `intention-900` (2026-09-13), which replaced the normalisation there with the install receipt.
     """
     return re.sub(
         r"^_INSTALL_ANNEAL_BIN = .*$", "_INSTALL_ANNEAL_BIN = <>", text, flags=re.M
@@ -5409,7 +5409,7 @@ def hook_body(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The activation install receipt — `spore-900`, ruled 2026-09-13.
+# The activation install receipt — `intention-900`, ruled 2026-09-13.
 #
 # What install WROTE into `activation/`, per file: the sha256 of the installed bytes
 # (after placeholder substitution) and of the composed layer source they came from.
@@ -5420,7 +5420,7 @@ def hook_body(text: str) -> str:
 # install's own output). It CANNOT answer "has the PACKAGE moved since install?": a receipt
 # agrees with the install it describes by construction. That second question stays with
 # `doctor._check_hook_freshness`, which compares against the live package tree. Diogenes'
-# 2026-08-12 HIGH against `spore-492` is the reason both maps are recorded and neither
+# 2026-08-12 HIGH against `intention-492` is the reason both maps are recorded and neither
 # check replaces the other.
 #
 # ⛔ An ABSENT, CORRUPT or EMPTY receipt is UNKNOWN, never "nothing was edited". Every
@@ -5470,7 +5470,7 @@ def read_activation_receipt_file(
     """Read a receipt as ``({relpath: {"installed": sha, "source": sha}}, status)``.
 
     Takes a file path, not an install, so a receipt copied beside a retained backup tree
-    (``spore-861`` ruling B, 2026-09-13) is read by the same validation as the live one.
+    (``intention-861`` ruling B, 2026-09-13) is read by the same validation as the live one.
 
     ``status`` is ``"ok"``, ``"absent"``, ``"corrupt"`` or ``"empty"``; the map is None
     unless ``"ok"``. A receipt that parses but carries a malformed entry is CORRUPT as a
@@ -5580,12 +5580,12 @@ def _compose_activation_layers(layer_roots: Sequence[Path]) -> dict[str, Path]:
     return composed
 
 
-_ACTIVATION_TREES_KEPT = 3  # spore-861: the newest three trees that PROVE pristine are kept
+_ACTIVATION_TREES_KEPT = 3  # intention-861: the newest three trees that PROVE pristine are kept
 _TREE_BACKUP_PREFIX = "tree-"
 
 
 def _tree_receipt_path(tree: Path) -> Path:
-    """Where a retained tree's receipt lives: BESIDE it, never inside (spore-861 ruling B).
+    """Where a retained tree's receipt lives: BESIDE it, never inside (intention-861 ruling B).
 
     Inside the tree it would be one more file every reader of `activation/` has to exclude,
     including the pristine proof's own "no extra files" rule."""
@@ -5672,8 +5672,8 @@ def _edits_against_receipt(
 def _tree_proves_pristine(tree: Path) -> bool:
     """True only if the tree matches, file for file, the receipt copied beside it.
 
-    ⛔ An absent, corrupt or empty sibling receipt is UNPROVEN, never pristine (spore-861
-    ruling B; spore-492's "an empty receipt is never OK")."""
+    ⛔ An absent, corrupt or empty sibling receipt is UNPROVEN, never pristine (intention-861
+    ruling B; intention-492's "an empty receipt is never OK")."""
     files, status = read_activation_receipt_file(_tree_receipt_path(tree))
     if status != "ok" or files is None:
         return False
@@ -5684,7 +5684,7 @@ def _tree_proves_pristine(tree: Path) -> bool:
 def _prune_activation_backups(backups_root: Path, keep: int) -> list[str]:
     """Remove whole-tree backups that PROVE pristine, beyond the newest ``keep`` of them.
 
-    ⚖ spore-861, ruling B (2026-09-13). A tree may be deleted only if it matches the
+    ⚖ intention-861, ruling B (2026-09-13). A tree may be deleted only if it matches the
     receipt of the install that wrote it, with no extra files. Every other tree, including
     every one without a readable receipt, is kept and named. Only ``tree-<digits>``
     directories are candidates; the bare-timestamp directories older releases wrote can
@@ -5750,14 +5750,14 @@ def _copy_activation_tree(
     `anneal_path`, when provided, is substituted into `{{ANNEAL_MEMORY}}` in every hook .py
     under `dst/hooks/` (recursively, so a pack's nested hook is reached).
 
-    ⛔ THE PREVIOUS TREE IS THE BACKUP (spore-861). On a re-install the whole previous `dst`
+    ⛔ THE PREVIOUS TREE IS THE BACKUP (intention-861). On a re-install the whole previous `dst`
     is RENAMED into `<install>/.levain/backups/activation/tree-<time_ns>/`, so nothing is
     classified before anything is destroyed: every file, symlink and directory the operator
     had is kept, including an edit saved a moment before the swap. If that location cannot
     take the rename, the tree goes to a sibling `.levain-activation-prev-<time_ns>` and the
     operator is told; if that fails too, nothing has moved and this raises.
 
-    THE RECEIPT (spore-900). `.levain/activation-manifest.json` records, per file, the
+    THE RECEIPT (intention-900). `.levain/activation-manifest.json` records, per file, the
     sha256 of the bytes installed and of the winning source. It is copied BESIDE the
     retained tree as `tree-<ns>.receipt.json` before the swap, so that tree can later be
     proved unedited (`_tree_proves_pristine`), and the live receipt is removed before the
@@ -5803,7 +5803,7 @@ def _copy_activation_tree(
             shutil.copy2(source, target)
         if anneal_path is not None:
             # The slot sits in a Python string literal, so the value is escaped for one, the same
-            # way `_expected_activation` renders it (spore-866).
+            # way `_expected_activation` renders it (intention-866).
             _substitute_hook_placeholders(new_tree / "hooks", {"{{ANNEAL_MEMORY}}": _py_literal_body(anneal_path)})
 
         # This run's receipt, from the staged bytes and the winning source of each.
@@ -6118,7 +6118,7 @@ def _without_levain_keys(parsed: dict | None) -> dict | None:
 def _is_levain_launcher(parsed: dict | None, store: str | None, *, server: str = "anneal_memory",
                         agent: str | None = None) -> bool:
     """Whether the anneal_memory server table launches `store` exactly as a levain `init`
-    wrote it: the pre-spore-751 `anneal-memory --db <store> serve`, the pre-KL-19
+    wrote it: the pre-intention-751 `anneal-memory --db <store> serve`, the pre-KL-19
     `<python> -P -m anneal_memory --db <store> serve`, or the current
     `<python> -P -m anneal_memory --db <store> serve --session-id levain`. Any other launcher
     was chosen by someone, and replacing it is replacing their customisation.
@@ -6310,7 +6310,7 @@ def _merge_codex_config(
         )
         # ⛔ LEVAIN'S OWN KEYS ARE NOT A CUSTOMISATION (Diogenes MEDIUM, 2026-09-14, his
         # signature reproduced: 7 lines and a backup). `command` and `args` are what `init`
-        # writes, so they change on every pre-spore-751 upgrade and on a re-init from another
+        # writes, so they change on every pre-intention-751 upgrade and on a re-init from another
         # interpreter; compared whole, the dicts always differed and the operator was told a
         # customisation was gone when nothing of theirs was touched.
         # ⛔ AND ONLY WHILE THE OLD LAUNCHER IS ONE LEVAIN ITSELF WROTE (codex HIGH, round 2,
@@ -6329,7 +6329,7 @@ def _merge_codex_config(
         # which the replacement below deletes (codex MED, round 4, reproduced 2026-09-14: a
         # `# corporate runbook` line vanished with no backup and no notice).
         raw_changed = old_block_match.group(0).rstrip() + "\n" != new_block
-        # ⛔ PRESERVE ALWAYS; THE HEURISTIC CHOOSES ONLY THE WORDING (spore-865, applied 2026-09-14
+        # ⛔ PRESERVE ALWAYS; THE HEURISTIC CHOOSES ONLY THE WORDING (intention-865, applied 2026-09-14
         # after three review rounds each found a launcher the classifier misjudged, and a fourth
         # found a comment-only change no named case covered). The gate is the two FACTS, not the
         # named cases: back up whenever the parsed block or its raw text differs, so a gap in the

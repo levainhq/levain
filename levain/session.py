@@ -30,7 +30,7 @@ agent emit a reply, did it raise. It deliberately carries **no notion of "the ta
 succeeded,"** because the entity cannot supply one truthfully. That is not a hypothetical:
 a confined entity reported *"25 failed, 1617 passed… pre-existing on clean base"* for a
 suite that was **1702 passed / 0 failed** outside the sandbox — its control was sound, its
-conclusion was right, and its diagnosis was wrong (``spore-373`` blocker [5]). An exit code
+conclusion was right, and its diagnosis was wrong (``intention-373`` blocker [5]). An exit code
 derived from an agent's self-assessment would ship exactly the false-all-clear class
 Levain's trust pitch says cannot happen — the same shape as a ``levain doctor`` that
 validates wiring and calls a scrambled seed green. **Harness-observable facts only.** If a
@@ -421,7 +421,7 @@ def resolve_llm_kwargs(model: str, base_url: str, api_key: str | None) -> dict:
     """LLM kwargs — route OPEN (Ollama) models through Ollama's OpenAI-compatible ``/v1``
     endpoint with NATIVE tool-calling.
 
-    This REPLACES the spore-358 default (the ``ollama/`` litellm provider + PROMPT-mode
+    This REPLACES the intention-358 default (the ``ollama/`` litellm provider + PROMPT-mode
     tool-calling). That default existed because the ``ollama/`` provider drops glm/kimi
     tool-calls to JSON-TEXT — the model emits a well-formed call, but not as a structured
     ``tool_calls`` entry, so OpenHands sees a plain message and ends the turn, task untouched.
@@ -624,7 +624,7 @@ def _agent_parts(events) -> list[str]:
             continue
         text = message_event_text(e) or finish_message(e)
         if text:
-            text = humanize_finish_json(text)  # spore-297: unwrap finish/think-as-JSON-text
+            text = humanize_finish_json(text)  # intention-297: unwrap finish/think-as-JSON-text
             if text not in parts:  # dedup a finish echoing a prior MessageEvent
                 parts.append(text)
     return parts
@@ -772,7 +772,7 @@ class EntitySession:
         - ``"unattended"`` — a scheduled seat. A scheduler invoked it; nobody necessarily reads
           anything.
 
-        The **efferent gate** (K3, ``spore-295``) resolves on ``human_present(mode)``, which is
+        The **efferent gate** (K3, ``intention-295``) resolves on ``human_present(mode)``, which is
         ``True`` only for ``interactive`` — an operator watching the stream already IS the fan-in
         the gate exists to provide, so the gate supplies that fan-in exactly when presence does
         not. The gate therefore treats ``headless`` and ``unattended`` identically, which is
@@ -826,7 +826,7 @@ class EntitySession:
         # Before any construction (only the mode, entity and import checks above precede it, and they
         # build nothing): this process now hosts
         # an entity, so a stray DEFAULT-kind store op anywhere in it refuses rather than reach
-        # ~/.anneal-memory (spore-438; a one-way latch, so a failed start that set it can only make
+        # ~/.anneal-memory (intention-438; a one-way latch, so a failed start that set it can only make
         # such an op refuse).
         mark_entity_process()
 
@@ -872,7 +872,7 @@ class EntitySession:
             if cfg is not None and cfg.hands_user is not None:
                 hands_lock_fd = hold_session_lock(entity_dir)
             ssh_mode = cfg.ssh_mode if cfg is not None else "agent"
-            # NOT drive-resolved (spore-725): a live daemon socket is a total bypass whether or
+            # NOT drive-resolved (intention-725): a live daemon socket is a total bypass whether or
             # not a human is watching, so there is no mode that should soften it.
             allow_container_sockets = cfg.allow_container_sockets if cfg is not None else False
             # A provider that cannot deny connects back to this host drops bash here, before the
@@ -905,7 +905,7 @@ class EntitySession:
                 assert_workspace_isolated(workspace, entity_dir=entity_dir)
                 workspace.mkdir(parents=True, exist_ok=True)
                 assert_workspace_isolated(workspace, entity_dir=entity_dir)
-            # spore-438: THIS conversation's entity + drive mode + floor, resolved ONCE from the
+            # intention-438: THIS conversation's entity + drive mode + floor, resolved ONCE from the
             # config read above and carried into both hands as data (the tool spec), which are
             # built from it below before open returns. Another session's binding is another object.
             # The scoped ssh agent, before the binding that carries it and the first bash command: an

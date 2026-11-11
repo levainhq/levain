@@ -12,7 +12,7 @@ from typing import Any, Iterator
 import pytest
 
 pytest.importorskip("cryptography")
-from anneal_memory.spores import SporeStore  # noqa: E402
+from anneal_memory.spores import IntentionStore  # noqa: E402
 
 from levain import intake  # noqa: E402
 from levain.cockpit.broker import Broker, BrokerError  # noqa: E402
@@ -29,7 +29,7 @@ from levain.cockpit.effects import (  # noqa: E402
     ApplyOutcome,
     ApplyUnit,
     EffectStatus,
-    SporeEffectStore,
+    IntentionEffectStore,
     StoreGone,
     create_origin_key,
     registration_refusals,
@@ -56,14 +56,14 @@ def home() -> Iterator[Path]:
 
 @pytest.fixture
 def world(home: Path) -> Iterator[SimpleNamespace]:
-    spores = home / "spores.json"
-    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
+    intentions = home / "spores.json"
+    IntentionStore(intentions, id_prefix="intention").add(type="task", text="a loop", origin_key="k.loop")
     qdir = home / "dispatch"
     qdir.mkdir(mode=0o700)
     where: list[Path | None] = [qdir]
-    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores),
+    b = Broker(home / "data", stores={"intentions": IntentionEffectStore(intentions),
                                       DESK: CoordDropEffectStore(lambda: where[0])},
-               store_paths=[spores], install_class="reported")
+               store_paths=[intentions], install_class="reported")
     b.start()
     keys = home / "keys"
     keys.mkdir(mode=0o700)
@@ -73,7 +73,7 @@ def world(home: Path) -> Iterator[SimpleNamespace]:
     phone = SoftPasskey()
     enrol(b.db, phone, "display-phone", by=laptop, custody="passkey")    # type: ignore[arg-type]
     try:
-        yield SimpleNamespace(b=b, phone=phone, qdir=qdir, where=where, spores=spores,
+        yield SimpleNamespace(b=b, phone=phone, qdir=qdir, where=where, intentions=intentions,
                               dev={"class": "device", "fingerprint": phone.fingerprint, "transport": "paired-a"})
     finally:
         b.stop()
@@ -192,9 +192,9 @@ def test_a_sort_with_no_desk_directory_is_a_501_at_issue_and_writes_nothing(worl
 
 
 def test_a_sort_with_no_desk_store_registered_is_a_501(home):
-    spores = home / "spores.json"
-    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
-    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores)}, store_paths=[spores],
+    intentions = home / "spores.json"
+    IntentionStore(intentions, id_prefix="intention").add(type="task", text="a loop", origin_key="k.loop")
+    b = Broker(home / "data", stores={"intentions": IntentionEffectStore(intentions)}, store_paths=[intentions],
                install_class="reported")
     b.start()
     try:
@@ -292,8 +292,8 @@ def test_recent_edits_read_a_sort_as_a_line_sent_to_the_desk():
 
     assert plain_edit_title("list_intake", _edit_target(drop_resource_key("ck.ab.0")), "device:ab12") == \
         "added a line, sent to the desk to sort, from a signed device"
-    assert plain_edit_title("list_intake", _edit_target("spore:spore-017"), "token:browser:1") == \
-        "added a line item spore-017, from the browser"
+    assert plain_edit_title("list_intake", _edit_target("intention:intention-017"), "token:browser:1") == \
+        "added a line item intention-017, from the browser"
 
 
 def test_a_desk_directory_that_is_not_0700_is_refused_not_retried(home):
@@ -383,9 +383,9 @@ def test_the_server_built_broker_writes_a_signed_sort_into_the_consent_readers_d
     the broker is built (as ``make_server`` does) and the sort lands in its directory."""
     from levain import web_server
 
-    spores = home / "spores.json"
-    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
-    anneal = SimpleNamespace(spores_json=spores, episodic_db=home / "episodes.db", continuity_md=home / "other.md")
+    intentions = home / "spores.json"
+    IntentionStore(intentions, id_prefix="intention").add(type="task", text="a loop", origin_key="k.loop")
+    anneal = SimpleNamespace(intentions_json=intentions, episodic_db=home / "episodes.db", continuity_md=home / "other.md")
     source = SimpleNamespace(write_scope=SimpleNamespace(ledger_root=home / "ledger", anneal=anneal))
     (home / "ledger").mkdir(mode=0o700)
     httpd = SimpleNamespace(verb_registry=None, get_cockpit=lambda: None)         # no consent_reader yet
@@ -415,12 +415,12 @@ def test_the_server_built_broker_writes_a_signed_sort_into_the_consent_readers_d
 
 
 def test_a_registered_store_without_a_directory_is_the_same_typed_501(home):
-    spores = home / "spores.json"
-    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
+    intentions = home / "spores.json"
+    IntentionStore(intentions, id_prefix="intention").add(type="task", text="a loop", origin_key="k.loop")
     bare = SimpleNamespace(name=DESK)               # registered under "desk", no directory()
-    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores),
+    b = Broker(home / "data", stores={"intentions": IntentionEffectStore(intentions),
                                       DESK: CoordDropEffectStore(lambda: None)},
-               store_paths=[spores], install_class="reported")      # registration needs a real adapter; swapped below
+               store_paths=[intentions], install_class="reported")      # registration needs a real adapter; swapped below
     b.start()
     try:
         for cs in (bare, SimpleNamespace(name=DESK, directory=lambda: None)):

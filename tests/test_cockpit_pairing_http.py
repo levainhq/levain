@@ -136,13 +136,13 @@ def test_rp10_2_a_paired_token_makes_a_c1_write_and_a_broker_backed_t2(src) -> N
         st, man, _ = _call(port, "GET", "/cockpit/manifest.json", token=tok, headers=PROXY)
         assert st == 200 and man["credential"]["name"] == PAIRED_PREFIX + device
         row = _tray_row(port, tok)
-        st, out, _ = _call(port, "POST", "/cockpit/verb", {"verb": "spore_touch", "panel_id": "tray",
+        st, out, _ = _call(port, "POST", "/cockpit/verb", {"verb": "intention_touch", "panel_id": "tray",
                                                            "row_id": row["id"], "row_version": row["version"],
                                                            "params": {}}, token=tok, headers=PROXY)
         assert st == 200 and out["ok"], out
         row = _tray_row(port, tok)
         st, out, _ = _call(port, "POST", "/cockpit/verb", {
-            "verb": "spore_set_disposition", "panel_id": "tray", "row_id": row["id"], "row_version": row["version"],
+            "verb": "intention_set_disposition", "panel_id": "tray", "row_id": row["id"], "row_version": row["version"],
             "params": {"disposition": "agenda"}, "intent": "reported", "tier_seen": "T2",
             "gesture_seen": "direct-reported", "idempotency_key": "t2-1"}, token=tok, headers=PROXY)
         assert (st, out.get("state"), out.get("decision_kind")) == (200, "COMMITTED", "ALLOWED_REPORTED"), out
@@ -155,7 +155,7 @@ def test_rp10_4_revoke_refuses_the_next_request_cascades_and_rotates(src) -> Non
         s, ts = _pair(port)                             # a sibling minted by the browser surface
         row = _tray_row(port, ta)
         st, held, _ = _call(port, "POST", "/cockpit/verb", {      # a WAITING pending under A (no intent = sign)
-            "verb": "spore_set_disposition", "panel_id": "tray", "row_id": row["id"],
+            "verb": "intention_set_disposition", "panel_id": "tray", "row_id": row["id"],
             "row_version": row["version"], "params": {"disposition": "agenda"}}, token=ta, headers=PROXY)
         assert (st, held["state"]) == (200, "WAITING"), held
         db = httpd.broker.active_db()
@@ -258,7 +258,7 @@ def test_ru5_the_cockpit_read_path_with_its_inner_catch_answers_503_not_500(src,
 
 def test_ru1_where_paired_tokens_cannot_exist_a_junk_header_is_a_plain_miss(src, tmp_path) -> None:
     """RU-1: a read-only source (no ledger_root, no broker): an off-box read with a junk header is served token-free
-    (spore-220) as today, never a 503. A disabled broker (no install class) over a journal with no paired device keeps
+    (intention-220) as today, never a 503. A disabled broker (no install class) over a journal with no paired device keeps
     a wrong token's definite 403; over one that holds a paired device, that device's token gets the 503 (L3 r2), since
     a 403 would make the page drop a good token."""
     ro = SubstrateSource(anneal=src.anneal, write_scope=None, context_json=src.context_json)

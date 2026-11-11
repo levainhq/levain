@@ -33,7 +33,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    # Partnership seed needs the 0.8.x stack: spores (0.4.0), schema-aware
+    # Partnership seed needs the 0.8.x stack: intentions (0.4.0), schema-aware
     # budget (0.4.2), `init --schema partnership` (0.4.4 — AM-INITSCHEMA), the
     # crystallized-pattern tier (0.6.0 store + 0.7.0 opt-in / `crystal index`+
     # `recall` / `retrieve_patterns`), the AM-CRYSTAL-RECALL associative
@@ -41,17 +41,17 @@ dependencies = [
     # AND the AM-CONTLOCK shared `continuity_lock` (0.9.0) the governed State /
     # undo writes take to serialize against the anneal consolidate cross-process.
     # The prior `<0.8` ceiling capped adopters out of the 0.8.x crystal-recall
-    # tier (spore-060); `<0.5` before that predated crystals entirely. (0.9.0
+    # tier (intention-060); `<0.5` before that predated crystals entirely. (0.9.0
     # ships with anneal Slice C — main carries this pin ahead of the PyPI publish,
     # per the coordinated shadow-ship plan.) `>=0.9.1` is REQUIRED: Slice-3b's Tray
-    # write seam calls the SporeStore disposition passthrough + the expect_disposition
+    # write seam calls the IntentionStore disposition passthrough + the expect_disposition
     # CAS, both added in 0.9.1 — an older 0.9.0 would TypeError at runtime, not refuse
     # cleanly [codex L3 HIGH], so the API contract is version-gated, not feature-detected.
-    # `>=0.9.4` (AM-SPORE-CAS): the KEEP-NOTE LIFECYCLE's `_apply_spore_verb` ascend guard now
-    # passes `expect_disposition` to `SporeStore.ascend` (the ascend CAS added in 0.9.4) — same
+    # `>=0.9.4` (AM-INTENTION-CAS): the KEEP-NOTE LIFECYCLE's `_apply_intention_verb` ascend guard now
+    # passes `expect_disposition` to `IntentionStore.ascend` (the ascend CAS added in 0.9.4) — same
     # version-gated contract: an older anneal lacks the param and would TypeError, not refuse.
-    # `>=0.9.5` (AM-SPORE-CAS-DESCEND, spore-173): `_apply_spore_verb`'s descend branch now passes
-    # `expect_disposition` to `SporeStore.descend` (the descend CAS added in 0.9.5). Same contract —
+    # `>=0.9.5` (AM-INTENTION-CAS-DESCEND, intention-173): `_apply_intention_verb`'s descend branch now passes
+    # `expect_disposition` to `IntentionStore.descend` (the descend CAS added in 0.9.5). Same contract —
     # 0.9.4's `descend` has no such param, so the first compost/dismiss/remove would TypeError, not
     # refuse cleanly. (The tier CAS rides `update`'s expect_disposition, present since 0.9.1.)
     # `>=0.9.8` (AM-MCP-WRAPCANCEL): a real API contract gate, not a lockstep bump.
@@ -59,7 +59,7 @@ dependencies = [
     # of a stuck wrap, and that tool does not exist before anneal 0.9.8 — against 0.9.7
     # the advice would name a tool the agent cannot call, which is the very defect
     # (a message pointing at an unreachable path) this pair of releases exists to fix.
-    # `>=0.9.6` (spore-225 — the Chris release bundle): a RELEASE-GATE lockstep bump, NOT a new-API
+    # `>=0.9.6` (intention-225 — the Chris release bundle): a RELEASE-GATE lockstep bump, NOT a new-API
     # contract gate. The compat-manifest's `pip_floor_verdict` release-gate requires this floor ==
     # `manifest.KNOWN_GOOD_ANNEAL`, so they move together or `levain doctor`'s `compat: pip-pin`
     # check flags the skew.
@@ -74,7 +74,7 @@ dependencies = [
     # seed-following entity never produced an affected line — which is exactly why this survived to
     # 0.9.6 unnoticed, and why the floor moved on 2026-08-14 while the templates did not.
     #
-    # ⚠ THAT CLAUSE IS NOW HISTORY, NOT CURRENT STATE (2026-08-31, spore-535). The seed's
+    # ⚠ THAT CLAUSE IS NOW HISTORY, NOT CURRENT STATE (2026-08-31, intention-535). The seed's
     # `memory.md` taught a ladder terminating at 3x for seventeen days after the library removed
     # the cap, so every Levain entity was taught a practice that structurally could not reach 4x —
     # SAFE (no adopter was ever broken, which is what made TEMPLATES_RECONCILED_ANNEAL = 0.9.7 an
@@ -89,7 +89,7 @@ dependencies = [
     # floor IS a contract gate. Two answers in one file, the wrong one sitting last before the
     # specifier. Deleted rather than re-worded.)
     #
-    # `>=0.9.10` (2026-09-14, spore-1022): a CORRECTNESS floor, not an API gate; levain calls no
+    # `>=0.9.10` (2026-09-14, intention-1022): a CORRECTNESS floor, not an API gate; levain calls no
     # 0.9.10-only API. Per anneal's own 0.9.10 CHANGELOG, both defects reproduced on tag v0.9.9:
     # `verify()` returned `valid=True` with no entries once the sealed file its manifest names and
     # the active file were deleted (total audit loss read as a clean empty trail), and
@@ -104,8 +104,8 @@ dependencies = [
     # older anneal does not accept, and cancels every wrap by that token.
     # `>=0.9.41` (2026-10-10): 0.9.40/0.9.41 stop a pruned or deleted team entry coming back on the next
     # `team-import`; 0.9.41 is what 0.7.0 was tested against, and KNOWN_GOOD_ANNEAL moves with this floor.
-    # `>=0.9.42` (2026-10-10): an API gate. Every cockpit spore write passes `expected_version=` and
-    # `version_of=` to SporeStore's update/touch/descend/ascend (first in 0.9.42), which an older anneal
+    # `>=0.9.42` (2026-10-10): an API gate. Every cockpit intention write passes `expected_version=` and
+    # `version_of=` to IntentionStore's update/touch/descend/ascend (first in 0.9.42), which an older anneal
     # does not accept. KNOWN_GOOD_ANNEAL moves with this floor.
     # `>=0.9.39` (2026-10-04): 0.9.38 added FRAMED `team-import` and carried a library-only regression (an endless
     # blank-line iterable looped in `import_ledger`); 0.9.39 fixes it, and KNOWN_GOOD_ANNEAL and this floor are one number.
@@ -140,15 +140,15 @@ dependencies = [
     # `>=1.0.3,<2` (2026-11-07, TS-0): anneal 1.0.3 passes `target`, `attention` and `germinated` through as opaque
     # keys, which the task-surface port needs. No migration-manifest entry, so TEMPLATES_RECONCILED_ANNEAL stays 1.0.2
     # (the seed templates are unchanged). KNOWN_GOOD_ANNEAL moves with this floor.
-    # `<1.1` (2026-11-07): `levain.keep_migrate._add_verbatim` calls three PRIVATE anneal SporeStore methods (_prepare_add,
+    # `<1.1` (2026-11-07): `levain.keep_migrate._add_verbatim` calls three PRIVATE anneal IntentionStore methods (_prepare_add,
     # _find_by_origin_key, _add_locked), pinned by tests/test_keep_migrate.py. A new anneal minor is where such a change could
     # land, so levain takes it deliberately (re-run that test, raise the cap) rather than resolving to it on install.
-    # `>=1.0.4,<2` (2026-11-07, TS-64): anneal 1.0.4 accepts a TIMED `next` on a spore (`YYYY-MM-DDTHH:MM`, local, no zone,
+    # `>=1.0.4,<2` (2026-11-07, TS-64): anneal 1.0.4 accepts a TIMED `next` on an intention (`YYYY-MM-DDTHH:MM`, local, no zone,
     # minute precision; a bare date still works), which `_validate_surface_at` and the cockpit's `_norm_date` now pass
     # through. No migration-manifest entry, so TEMPLATES_RECONCILED_ANNEAL stays 1.0.2. KNOWN_GOOD_ANNEAL moves with this floor.
-    # `>=1.0.7,<1.1` (2026-11-11, row 774 / np-91cd76d5): anneal 1.0.7 takes `SporeStore(path, id_prefix="intention")`, which
-    # mints `intention-NNN` ids for NEW records and still reads every existing `spore-N` id (and the other way round).
-    # levain.spores.guarded_spore_store passes it, and levain.consent.questions.INTENTION_ID reads both prefixes. No
+    # `>=1.0.7,<1.1` (2026-11-11, row 774 / np-91cd76d5): anneal 1.0.7 takes `IntentionStore(path, id_prefix="intention")`, which
+    # mints `intention-NNN` ids for NEW records and still reads every existing `intention-N` id (and the other way round).
+    # levain.intentions.guarded_intention_store passes it, and levain.consent.questions.INTENTION_ID reads both prefixes. No
     # migration-manifest entry, so TEMPLATES_RECONCILED_ANNEAL stays 1.0.2. KNOWN_GOOD_ANNEAL moves with this floor.
     "anneal-memory>=1.0.7,<1.1",
     # The reply classifier (levain.firing.agent_reply.unreadable_tool_call) reads Markdown code regions with a

@@ -1,4 +1,4 @@
-"""The whole cockpit mic chain, run end to end with ONLY the provider faked (spore-938: the first spend on a never-run path is a RUN).
+"""The whole cockpit mic chain, run end to end with ONLY the provider faked (intention-938: the first spend on a never-run path is a RUN).
 
 Real: ``levain serve`` (``make_server`` with premium_stt ON, a signed custody-held deepgram key in a fake keychain), the S3 routes,
 the S1 session registry + meter, the S2 websocket client, the S2b Deepgram adapter, and the shipped page (``mic.js`` and the REAL

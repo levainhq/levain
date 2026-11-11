@@ -1,6 +1,6 @@
 """levain.cockpit.providers: the built-in providers over ``SubstrateView`` (design §6.2).
 
-``SubstrateView`` degrades quietly: a missing spore file, a missing crystal file, a missing edit
+``SubstrateView`` degrades quietly: a missing intention file, a missing crystal file, a missing edit
 ledger and an unreadable context file all arrive as an EMPTY list, which a naive provider would
 render as "nothing waiting". So each provider here checks its own source first and returns
 ``Absent`` / ``Fault`` where the view would have hidden it (the typed-result rule, §3.4), and the
@@ -22,7 +22,7 @@ from typing import Any, Callable, Collection, Mapping, Sequence
 from levain import unshowable
 from levain.cockpit.anneal_effects import section_resource_key
 from levain.cockpit.authority import LabelKey
-from levain.cockpit.effects import SPORE_AUTHORITY_FIELDS, _stored_authority, spore_resource_key
+from levain.cockpit.effects import INTENTION_AUTHORITY_FIELDS, _stored_authority, intention_resource_key
 from levain.cockpit.engine import PANEL_READ_DEADLINE_S, Cockpit, ProviderSpec, ReadContext, row_version_of
 from levain.cockpit.registry import opened_day, parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
@@ -33,22 +33,22 @@ from levain.dashboard import (
     LOOP_DISPOSITION,
     SubstrateSource,
     SubstrateView,
-    OpenSpore,
+    OpenIntention,
     graph_caption,
     _episode_row,
     _read_levain_config,
     _one_clause,
-    open_spore_from,
+    open_intention_from,
     state_from_data,
     state_record,
 )
 
-# The view caps each spore bucket at ``max_spores``. The cockpit asks for far more than any store
+# The view caps each intention bucket at ``max_intentions``. The cockpit asks for far more than any store
 # holds and DISCLOSES a cap that is still hit, so a panel never shows a prefix as the whole set.
-SPORE_CAP = 5000
+INTENTION_CAP = 5000
 # The view's own per-bucket limit is raised out of the way so the cockpit's cap is applied AFTER the
 # hold filter: ranking and holds decide what is visible, then the cap truncates what is visible.
-VIEW_SPORE_LIMIT = 100_000
+VIEW_INTENTION_LIMIT = 100_000
 EDITS_LIMIT = 20
 # the entity's own episodes the view reads (newest first). Feed rows are not cut to that window: a busy
 # entity's newest few minutes would otherwise hide every other agent (measured on flow, 10-10); the
@@ -59,22 +59,22 @@ EPISODE_LIMIT = 50
 # one led the queue for 26 days). A dated handoff never expires.
 HANDOFF_FRESH_DAYS = 7
 
-# the verbs a spore panel offers (design §4.2); anneal still refuses a verb the spore's type forbids
-SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update", "spore_retarget",
-                   "spore_set_disposition", "spore_ascend")
-SPORE_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen",
+# the verbs an intention panel offers (design §4.2); anneal still refuses a verb the intention's type forbids
+INTENTION_ROW_VERBS = ("intention_touch", "intention_close", "intention_surface_at", "intention_update", "intention_retarget",
+                   "intention_set_disposition", "intention_promote")
+INTENTION_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen",
                 "origin_key", "target", "attention", "germinated")
 # seen alone never stales a write (a touch that clears an elapsed next does); origin_key is store-assigned
 # once and names the label resource, so it is carried, not versioned
-SPORE_VERSION_EXCLUDED = ("seen", "origin_key")
-SPORE_VERSION_FIELDS = tuple(f for f in SPORE_STORED if f not in SPORE_VERSION_EXCLUDED)
-SPORE_FACETS = frozenset({
-    "disposition", "domain", "tier", "salience", "spore_type", "due", "fires", "overdue_days",
+INTENTION_VERSION_EXCLUDED = ("seen", "origin_key")
+INTENTION_VERSION_FIELDS = tuple(f for f in INTENTION_STORED if f not in INTENTION_VERSION_EXCLUDED)
+INTENTION_FACETS = frozenset({
+    "disposition", "domain", "tier", "salience", "intention_type", "due", "fires", "overdue_days",
     "handoff_expired", "last_seen", "age_days",
 })
 # the Tray's second view (2026-10-10, "yes to all": "Tray by Age" is a view of the Tray box, not
 # a second box): the same rows, oldest first
-TRAY_VIEWS = (("age", "By age", "spore.age"),)
+TRAY_VIEWS = (("age", "By age", "intention.age"),)
 EPISODE_FACETS = frozenset({"episode_type", "source", "at", "tags", "agent"})
 EPISODE_STORED = ("id", "timestamp", "type", "source", "content", "tags")
 # a federated episode feed's name: it is part of every row id the feed contributes
@@ -121,7 +121,7 @@ def _stat_of(p: Path | None) -> tuple | None:
 
 def _store_signature(source: Any) -> tuple | None:
     """What a build of this source reads that moves when the store does: the anneal files (the db with its WAL,
-    the continuity file, the crystals, the spores), the state-line file, and the edit-log ledger. None when the
+    the continuity file, the crystals, the intentions), the state-line file, and the edit-log ledger. None when the
     source names none of them, or the signature cannot be taken: no signal, so no caching, never an exception."""
     try:
         return _signature_of(source)
@@ -138,7 +138,7 @@ def _signature_of(source: Any) -> tuple | None:
     root = getattr(source, "install_root", None)
     ledger = ledger if ledger is not None else (Path(root) / ".levain" if root is not None else None)
     # no -shm: it is not a write signal; the db and its -wal move on every write
-    files = [db, Path(f"{db}-wal"), anneal.continuity_md, anneal.crystal_json, anneal.spores_json,
+    files = [db, Path(f"{db}-wal"), anneal.continuity_md, anneal.crystal_json, anneal.intentions_json,
              getattr(source, "context_json", None), Path(ledger) / "edits.jsonl" if ledger is not None else None]
     if root is not None:
         # the config docs: the install dir, its seed/ and activation/ dirs (a removed or added file moves the
@@ -203,7 +203,7 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
                         raise TimeoutError(f"shared read 'view' did not finish in {PANEL_READ_DEADLINE_S:g}s")
                     _view_builds[key] = _view_builds.get(key, 0) + 1
                 try:
-                    return source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                    return source.build(max_intentions=VIEW_INTENTION_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
                 finally:
                     with _view_cache_lock:
                         left = _view_builds.get(key, 1) - 1
@@ -249,7 +249,7 @@ def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
             try:
                 # the signature is taken BEFORE the build: a change landing mid-build leaves a stale signature on the
                 # stored view, so the next read sees a mismatch and rebuilds
-                view = source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
+                view = source.build(max_intentions=VIEW_INTENTION_LIMIT, max_episodes=EPISODE_LIMIT, now=ctx.now)
                 flight.view = view          # the readers waiting on this flight share it, an errored view too
                 if not view.errors:
                     with _view_cache_lock:
@@ -292,12 +292,12 @@ def _handoff_expired(s: Any, today: date) -> bool:
 
 
 def next_date(value: Any) -> date | None:
-    """The DATE a spore's ``next`` names: a timed value reads through ``spores._parse_when`` (never a date-prefix read, which
+    """The DATE an intention's ``next`` names: a timed value reads through ``intentions._parse_when`` (never a date-prefix read, which
     would take a malformed timed value as a day), a date-only one as it always has."""
-    from levain import spores
+    from levain import intentions
 
-    if spores.is_timed(value):
-        when = spores._parse_when(value)
+    if intentions.is_timed(value):
+        when = intentions._parse_when(value)
         return when.date() if when is not None else None
     return parse_date(value)
 
@@ -305,20 +305,20 @@ def next_date(value: Any) -> date | None:
 def next_minute(value: Any) -> str | None:
     """The minute a timed ``next`` names (``YYYY-MM-DDTHH:MM``), or None for a date-only, absent or unreadable one: the row's
     ``fires`` facet, which the snooze tier reads as the instant a held row wakes."""
-    from levain import spores
+    from levain import intentions
 
-    if not spores.is_timed(value):
+    if not intentions.is_timed(value):
         return None
-    when = spores._parse_when(value)
+    when = intentions._parse_when(value)
     return when.strftime("%Y-%m-%dT%H:%M") if when is not None else None
 
 
-def _spore_row(s: Any, today: date) -> RowIn:
+def _intention_row(s: Any, today: date) -> RowIn:
     due = next_date(s.next)
     expired = _handoff_expired(s, today)
     facets: dict[str, Any] = {
         "disposition": s.disposition, "domain": s.domain, "tier": s.tier, "salience": s.salience,
-        "spore_type": s.type, "handoff_expired": expired, "last_seen": s.seen or None,
+        "intention_type": s.type, "handoff_expired": expired, "last_seen": s.seen or None,
         "due": due.isoformat() if due else None, "fires": next_minute(s.next),
     }
     if due:
@@ -326,27 +326,27 @@ def _spore_row(s: Any, today: date) -> RowIn:
     created = opened_day(s.created)
     if created and created <= today:
         facets["age_days"] = (today - created).days
-    return RowIn(id=f"spore:{s.id}", title=s.text, body=s.text, facets=facets, stored=spore_stored(s))
+    return RowIn(id=f"intention:{s.id}", title=s.text, body=s.text, facets=facets, stored=intention_stored(s))
 
 
-def spore_stored(s: OpenSpore) -> dict[str, Any]:
-    """A spore row's stored record: what its version covers (``SPORE_VERSION_FIELDS``)."""
-    # getattr with a default: SPORE_STORED may name a steering field (target, attention) the OpenSpore does not carry yet
-    return {f: getattr(s, f, None) for f in SPORE_STORED}
+def intention_stored(s: OpenIntention) -> dict[str, Any]:
+    """An intention row's stored record: what its version covers (``INTENTION_VERSION_FIELDS``)."""
+    # getattr with a default: INTENTION_STORED may name a steering field (target, attention) the OpenIntention does not carry yet
+    return {f: getattr(s, f, None) for f in INTENTION_STORED}
 
 
-def spore_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
-    """A spore row's label key (K2b-3b §2): its authority fields as stored, under its origin key. A
-    spore with no origin_key was never a cockpit target, so it has none."""
+def intention_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
+    """An intention row's label key (K2b-3b §2): its authority fields as stored, under its origin key. A
+    intention with no origin_key was never a cockpit target, so it has none."""
     ok = stored.get("origin_key")
     if not isinstance(ok, str) or not ok:
         return None
-    values = {f: _stored_authority(stored, f) for f in SPORE_AUTHORITY_FIELDS}
+    values = {f: _stored_authority(stored, f) for f in INTENTION_AUTHORITY_FIELDS}
     if values["disposition"] == LOOP_DISPOSITION:
         # the view names a plain loop's absent disposition LOOP_DISPOSITION; the store, and so the label,
         # hold it as absent (None), so the hash is taken over None
         values["disposition"] = None
-    return LabelKey(spore_resource_key(ok), values)
+    return LabelKey(intention_resource_key(ok), values)
 
 
 def section_label_key(heading: str) -> Callable[[Mapping[str, Any]], LabelKey | None]:
@@ -358,31 +358,31 @@ def section_label_key(heading: str) -> Callable[[Mapping[str, Any]], LabelKey | 
     return key
 
 
-def spore_row_version(raw: Mapping[str, Any]) -> str:
-    """The ``version`` the spore panels render for this stored spore, from anneal's raw dict. A
-    spore write passes it to anneal as ``version_of``, so the compare runs inside anneal's write
+def intention_row_version(raw: Mapping[str, Any]) -> str:
+    """The ``version`` the intention panels render for this stored intention, from anneal's raw dict. A
+    intention write passes it to anneal as ``version_of``, so the compare runs inside anneal's write
     transaction against exactly what the operator was shown (§4.4)."""
-    return spore_view_version(open_spore_from(raw))
+    return intention_view_version(open_intention_from(raw))
 
 
-def spore_view_version(spore: Any) -> str:
-    """The same ``version`` from a spore already built for the view (an ``OpenSpore``): what the TUI binds a tier write to."""
-    return row_version_of(spore_stored(spore), SPORE_VERSION_FIELDS, SPORE_VERSION_EXCLUDED)
+def intention_view_version(intention: Any) -> str:
+    """The same ``version`` from an intention already built for the view (an ``OpenIntention``): what the TUI binds a tier write to."""
+    return row_version_of(intention_stored(intention), INTENTION_VERSION_FIELDS, INTENTION_VERSION_EXCLUDED)
 
 
-# a fresh install has no spore store until something is dropped: each panel says what fills it
-SPORE_EMPTY = {
+# a fresh install has no intention store until something is dropped: each panel says what fills it
+INTENTION_EMPTY = {
     "tray": "Nothing yet. Drop a line in the box above and {entity} sorts it.",
     "loops": "Nothing yet. What stays open after {entity} sorts the List is listed here.",
 }
 # what the Tray's capture box says when the install has no name for its entity (dashboard_core.js ``buildTrayDump`` says the same)
-SPORE_EMPTY_ENTITY = "the assistant"
+INTENTION_EMPTY_ENTITY = "the assistant"
 
 
-def spore_empty(bucket: str, entity: Any) -> str:
+def intention_empty(bucket: str, entity: Any) -> str:
     """The panel's empty sentence, naming the install's own entity (never a fixed name)."""
-    name = entity.strip() if isinstance(entity, str) and entity.strip() else SPORE_EMPTY_ENTITY
-    return SPORE_EMPTY[bucket].replace("{entity}", name)
+    name = entity.strip() if isinstance(entity, str) and entity.strip() else INTENTION_EMPTY_ENTITY
+    return INTENTION_EMPTY[bucket].replace("{entity}", name)
 
 
 def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
@@ -395,7 +395,7 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
 
     def read(ctx: ReadContext) -> Result:
         v = _view(source, ctx)
-        bad = _view_fault(v, "open_spores")
+        bad = _view_fault(v, "open_intentions")
         if bad:
             return bad
         today = ctx.today
@@ -411,7 +411,7 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         late.sort(key=lambda t: t[0])
         first = [s for _d, s in late] + due
         # a parked loop is dormant by design (TS-5a: it shows in Open loops, marked): never a place to begin
-        loops = sorted((s for s in v.open_spores if s.tier != "parked"), key=lambda s: {"hot": 0, "warm": 1, "cold": 2, "parked": 3}.get(s.tier, 9))
+        loops = sorted((s for s in v.open_intentions if s.tier != "parked"), key=lambda s: {"hot": 0, "warm": 1, "cold": 2, "parked": 3}.get(s.tier, 9))
         lines: list[dict[str, str]] = []
         for i, s in enumerate(first[:3]):
             lines.append({"label": ("first", "then", "after that")[i], "text": clip(s.text)})
@@ -457,51 +457,51 @@ def _overnight(v: Any) -> dict[str, Any] | None:
 TOP_MAX_BEGIN = 110
 
 
-def _spore_provider(
+def _intention_provider(
     source: SubstrateSource, bucket: str, *, apply_hold: bool = True
 ) -> Callable[[ReadContext], Result]:
     seen = [False]      # the store has existed on a read: a later absence stays a fault, as the engine reads it
 
     def read(ctx: ReadContext) -> Result:
-        path = source.anneal.spores_json
+        path = source.anneal.intentions_json
         if not path.exists():
             if seen[0]:
-                return Absent(f"no spore store at {path}")
+                return Absent(f"no intention store at {path}")
             # never present: the panel is empty, and its sentence names the entity as the view resolves it on THIS read
             # (config name, else the origin.md H1), so a rename shows without a restart
             try:
                 name = _view(source, ctx).entity_name
             except Exception:       # noqa: BLE001 — a view that cannot be built still leaves an empty panel
                 name = _configured_entity_name(source)
-            return Read(rows=(), empty=spore_empty(bucket, name))
+            return Read(rows=(), empty=intention_empty(bucket, name))
         seen[0] = True
         view = _view(source, ctx)
-        bad = _view_fault(view, "open_spores")
+        bad = _view_fault(view, "open_intentions")
         if bad:
             return bad
         if not path.exists():           # removed while the view was being built
-            return Absent(f"no spore store at {path}")
-        items = {"tray": view.tray, "loops": view.open_spores}[bucket]
-        rows = [_spore_row(s, ctx.today) for s in items]
-        view_full = len(items) >= VIEW_SPORE_LIMIT
-        over = max(0, len(rows) - SPORE_CAP) if apply_hold else 0
-        rows = rows[:SPORE_CAP] if apply_hold else rows
+            return Absent(f"no intention store at {path}")
+        items = {"tray": view.tray, "loops": view.open_intentions}[bucket]
+        rows = [_intention_row(s, ctx.today) for s in items]
+        view_full = len(items) >= VIEW_INTENTION_LIMIT
+        over = max(0, len(rows) - INTENTION_CAP) if apply_hold else 0
+        rows = rows[:INTENTION_CAP] if apply_hold else rows
         skipped = ()
         if over:
-            skipped += ((over, f"over the display cap of {SPORE_CAP}"),)
+            skipped += ((over, f"over the display cap of {INTENTION_CAP}"),)
         if view_full:
-            skipped += ((1, f"the substrate view stopped at {VIEW_SPORE_LIMIT} rows; at least this many more exist"),)
-        return Read(rows=tuple(rows), skipped=skipped, empty=spore_empty(bucket, view.entity_name))
+            skipped += ((1, f"the substrate view stopped at {VIEW_INTENTION_LIMIT} rows; at least this many more exist"),)
+        return Read(rows=tuple(rows), skipped=skipped, empty=intention_empty(bucket, view.entity_name))
     return read
 
 
-def _spore_read_one(source: SubstrateSource, bucket: str) -> Callable[[ReadContext, str], Result]:
+def _intention_read_one(source: SubstrateSource, bucket: str) -> Callable[[ReadContext, str], Result]:
     def read_one(ctx: ReadContext, row_id: str) -> Result:
         # a fresh read of the SOURCE: ``ctx`` is the write's own (``Cockpit.read_one`` makes one per
         # read, never the render cycle's), passed through so it keeps the request's authority (§8d row 6).
         # The row by its id, NOT through the list's visibility rules: a row rescheduled into the
         # future since the render still exists, and a write must find it
-        res = _spore_provider(source, bucket, apply_hold=False)(ctx)
+        res = _intention_provider(source, bucket, apply_hold=False)(ctx)
         if not isinstance(res, Read):
             return res
         for r in res.rows or ():
@@ -774,15 +774,15 @@ def _tomb_gate(store: Any, origin_key: str, effect_id: Any, episode_id: str) -> 
 
 # what a broker fire reads as in Recent edits: a past-tense phrase per verb, then the thing it touched, then where it came from
 _EDIT_PHRASES = {
-    "spore_touch": "marked seen", "spore_descend": "resolved", "spore_surface_at": "rescheduled", "spore_retarget": "retargeted", "spore_update": "edited",
-    "list_intake": "added a line", "spore_set_disposition": "moved", "spore_ascend": "promoted", "spore_seed": "added", "episode_tombstone": "deleted episode",
+    "intention_touch": "marked seen", "intention_close": "resolved", "intention_surface_at": "rescheduled", "intention_retarget": "retargeted", "intention_update": "edited",
+    "list_intake": "added a line", "intention_set_disposition": "moved", "intention_promote": "promoted", "intention_seed": "added", "episode_tombstone": "deleted episode",
     "operator_state": "set the state line", "section_edit": "edited", "config": "edited", "entity_name": "renamed the entity",
     "undo": "undid an edit", "pending_cancel": "cancelled a pending change", "token_rotate": "rotated the surface token"}
 
 
 def _edit_target(resource_key: str) -> str:
     kind, _, ident = resource_key.partition(":")
-    if kind == "spore" and ident:
+    if kind == "intention" and ident:
         return f"item {ident}"
     if kind == "section" and ident:
         return f"the {ident} section"
@@ -808,7 +808,7 @@ def _edit_origin(credential: Any) -> str:
 
 
 def plain_edit_title(verb: str, target: str, credential: Any) -> str:
-    """A broker fire as a sentence a person reads: ``resolved item spore-017, from the browser``."""
+    """A broker fire as a sentence a person reads: ``resolved item intention-017, from the browser``."""
     verb = verb if isinstance(verb, str) else ""     # a journal row's verb is a string; a malformed one must not take the panel down
     target = target if isinstance(target, str) else ""     # likewise for a malformed target
     phrase = _EDIT_PHRASES.get(verb) or verb.replace("_", " ")
@@ -1652,9 +1652,9 @@ def build_default_cockpit(
 
     ck = Cockpit(entity=entity, clock=clock)
     edits_read = _edits(source, lambda: ck.edits_reader)
-    spore_common = dict(
-        facets=SPORE_FACETS,
-        version_fields=SPORE_VERSION_FIELDS, version_excluded=SPORE_VERSION_EXCLUDED,
+    intention_common = dict(
+        facets=INTENTION_FACETS,
+        version_fields=INTENTION_VERSION_FIELDS, version_excluded=INTENTION_VERSION_EXCLUDED,
         search_fields=("title", "body", "domain"), edit_class=CLASS_B,
     )
     ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source),
@@ -1666,20 +1666,20 @@ def build_default_cockpit(
     # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops (row a, tall) / [Inbox, Fleet,
     # Stream: downstream-only] / Recent episodes, Recent edits. Ranks leave gaps so a downstream's
     # Inbox, Fleet and Stream slot in 16-39, between Open loops and Recent episodes without renumbering the kernel's.
-    # THE LIST takes the Tray's place (id `tray`, a code name): a view over band + board + spores, levain.cockpit.list_panel
+    # THE LIST takes the Tray's place (id `tray`, a code name): a view over band + board + intentions, levain.cockpit.list_panel
     from levain.cockpit.list_panel import register_list
 
-    register_list(ck, source, spore_common)
+    register_list(ck, source, intention_common)
     for pid, title, bucket, prio, order, rank, views, size in (
-        ("loops", "Open loops", "loops", "feed", "spore.loops", 15, (), "tall"),
+        ("loops", "Open loops", "loops", "feed", "intention.loops", 15, (), "tall"),
     ):
         ck.register(ProviderSpec(
-            pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank, size=size,
-            order=order, views=views, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
-            label_key=spore_label_key,
+            pid, "triage-list", title, prio, _intention_provider(source, bucket), region="operate", rank=rank, size=size,
+            order=order, views=views, rowset=f"intention:{bucket}", read_one=_intention_read_one(source, bucket),
+            label_key=intention_label_key,
             # the registered text is the fallback only: a store that does not exist yet answers per read with the view's name
-            empty=spore_empty(bucket, _configured_entity_name(source)), absent_is_empty=True, verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
-            **spore_common))
+            empty=intention_empty(bucket, _configured_entity_name(source)), absent_is_empty=True, verbs=INTENTION_ROW_VERBS + (("intention_seed",) if bucket == "tray" else ()),
+            **intention_common))
     ck.register(ProviderSpec(
         "episodes", "triage-list", "Recent episodes", "feed", _episodes(source, feeds), region="operate", rank=40,
         # a write's read: the entity's own rows only (a feed row is never a tombstone target)
@@ -1734,12 +1734,12 @@ def build_default_cockpit(
         from levain.cockpit.topology import topology_reader
 
         def open_loops(ctx: ReadContext) -> list[Any]:
-            if not source.anneal.spores_json.exists():
+            if not source.anneal.intentions_json.exists():
                 return []
             v = _view(source, ctx)
-            if "open_spores" in v.errors or "store" in v.errors:
-                raise RuntimeError("the spore store did not read")
-            return [s for s in v.open_spores if s.tier != "parked"]   # a parked loop is dormant (TS-5a)
+            if "open_intentions" in v.errors or "store" in v.errors:
+                raise RuntimeError("the intention store did not read")
+            return [s for s in v.open_intentions if s.tier != "parked"]   # a parked loop is dormant (TS-5a)
 
         def hub_label(ctx: ReadContext) -> str:
             try:
@@ -1750,7 +1750,7 @@ def build_default_cockpit(
         ck.register(ProviderSpec(
             "topology", "topology", "Topology", "gauge",
             topology_reader(install_root=source.install_root, consent=lambda: ck.consent_reader,
-                            questions=lambda: ck.question_store, hub_label=hub_label, spores=open_loops,
+                            questions=lambda: ck.question_store, hub_label=hub_label, intentions=open_loops,
                             dispatch_dir=lambda: _dispatch_dir(ck.consent_reader)),
             region="operate", rank=80, size="tall", optional=True,
             timeout_s=ACTIVITY_GIT_DEADLINE_S + 6.0, edit_class=CLASS_C,

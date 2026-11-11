@@ -13,7 +13,7 @@ constructor, not a discipline scattered across call sites):
   3. latch the process as an entity process (:func:`~levain.firing.binding.mark_entity_process`), so a
      stray DEFAULT-kind store op here refuses instead of reaching ``~/.anneal-memory``; the agent
      itself carries its entity as data — its condenser serializes it and its hands' spec carries the
-     :class:`~levain.firing.binding.ConversationBinding` (spore-438) — so ``fork()`` / reload rebuild
+     :class:`~levain.firing.binding.ConversationBinding` (intention-438) — so ``fork()`` / reload rebuild
      the firing + presence on it, and nothing is looked up;
   4. build ``Agent(agent_context=vagus_agent_context(firing_kind="anneal_entity"),
      condenser=LevainCondenser.build(firing_kind="anneal_entity", ...))`` — EVERY firing/condenser
@@ -89,7 +89,7 @@ class EntityBinding:
         from levain.firing.anneal import AnnealEntityFiring
         from levain.firing.openhands.capture import capture_completed_turn
 
-        # spore-438: an EXPLICIT firing on this binding's own entity — an entity is carried, never
+        # intention-438: an EXPLICIT firing on this binding's own entity — an entity is carried, never
         # looked up. The firing still re-guards its store per op.
         capture_completed_turn(
             conversation, AnnealEntityFiring(entity_dir=self.entity_dir), session_id=session_id
@@ -273,7 +273,7 @@ def build_entity_agent(
     is never summarized away or counted toward the size threshold — the shipped VagusCondenser
     contract).
 
-    IDENTITY (step 4 — spore-294): the entity boots as ITSELF, sourced from its OWN ``seed/``:
+    IDENTITY (step 4 — intention-294): the entity boots as ITSELF, sourced from its OWN ``seed/``:
       - the **constitution** (session_start) is rendered from ``<entity>/seed/*.md``
         (:class:`~levain.firing.seed.EntitySeed`) — ``origin`` (who it is) + ``world`` (its operator)
         + ``partnership`` (how it works) — and baked into the set-once ``system_message_suffix``, so a
@@ -313,7 +313,7 @@ def build_entity_agent(
             SEED_SUBDIR,
             SEED_SUBDIR,
         )
-    # spore-359: fold the entity's OWN consolidated memory (the wrap's neocortex) onto the static
+    # intention-359: fold the entity's OWN consolidated memory (the wrap's neocortex) onto the static
     # seed, so a fresh `levain run` boots knowing WHERE THINGS STAND (State / Active Threads /
     # Context / Understanding), not only WHO IT IS. Before this, run recall was crystal-ONLY — a
     # never-graduated (young) entity recalled nothing of its own lived sessions and read amnesiac,
@@ -328,7 +328,7 @@ def build_entity_agent(
     constitution = _compose_constitution(seed_constitution, memory_block)
     agent_ctx = vagus_agent_context(
         firing_kind=ENTITY_FIRING_KIND,
-        # spore-438: consulted only for a seedless entity's generic constitution — on THIS entity,
+        # intention-438: consulted only for a seedless entity's generic constitution — on THIS entity,
         # not whatever the process-level channel names.
         firing=build_firing(ENTITY_FIRING_KIND, entity_dir=str(ed)),
         constitution=constitution,
@@ -361,7 +361,7 @@ def build_entity_agent(
             inner=resolved_inner,
             firing_kind=ENTITY_FIRING_KIND,
             presence_kind=presence_kind,
-            # spore-438: recall + re-anchor resolve THIS entity, not the process-global channel.
+            # intention-438: recall + re-anchor resolve THIS entity, not the process-global channel.
             entity_dir=str(ed),
         ),
     )

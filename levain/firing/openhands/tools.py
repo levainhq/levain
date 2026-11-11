@@ -5,7 +5,7 @@ builds them, and it builds them so the (less-trusted, open-model) entity can wor
 Codex on the operator's REAL repos while the sovereignty CROWN JEWELS stay structurally off-limits no
 matter what the model is told to do:
 
-  - :class:`LevainBashTool` — a stateful bash confined by an OS sandbox (spore-311's
+  - :class:`LevainBashTool` — a stateful bash confined by an OS sandbox (intention-311's
     :class:`~levain.firing.confinement.SandboxedShell`), NOT the SDK's un-confinable host
     ``TerminalExecutor``. This is the CC/Codex-replacement hand: `cd` anywhere, run builds, SSH out,
     hit the network — everything you use bash for — with the crown jewels fenced at the syscall level.
@@ -17,7 +17,7 @@ matter what the model is told to do:
 **One floor, two enforcers (``structural_invariants_beat_discipline``).** A
 :class:`~levain.firing.confinement.CrownJewelsPolicy` — resolved ONCE per conversation into its
 :class:`~levain.firing.binding.ConversationBinding` and handed to both hands as one
-:class:`_SharedFloor` by :class:`LevainHands` (spore-438) — fences BOTH hands. bash rides the rendered platform sandbox — macOS
+:class:`_SharedFloor` by :class:`LevainHands` (intention-438) — fences BOTH hands. bash rides the rendered platform sandbox — macOS
 ``sandbox-exec`` or, since K4c, a Linux ``bwrap`` mount namespace (the OS fences it — a stateful
 shell whose cwd wanders can't be confined in-process, which is the whole reason bash needed an OS
 sandbox). The POLICY is identical on both; only the enforcement model differs. The file editor is ordinary in-process Python, NOT
@@ -36,7 +36,7 @@ resolved ``deny_standard_creds`` is on (every drive, the interactive REPL includ
 ``_STANDARD_CRED_FILES``). The entity's OWN ``<entity>/.levain/`` is its working space, NOT a jewel — readable,
 and its non-store files are writable — EXCEPT its own memory STORE files (``memory.{continuity.md,
 crystal.json,db}`` + the SQLite sidecars), which are WRITE-denied to the hands (``own_memory_files``,
-spore-359): spore-359 folds the neocortex into the always-loaded frame, so only the host-process wrap
+intention-359): intention-359 folds the neocortex into the always-loaded frame, so only the host-process wrap
 may compose it, never the hands. The firing's ``assert_entity_isolated`` moat, not these tools, keeps
 recall/capture off the operator's store.
 
@@ -53,7 +53,7 @@ every efferent action — bash is ALWAYS efferent — when no human is present: 
 ``efferent_gate: "ungated"`` disarms it in both cases, so a surface claiming an entity is governed
 must RESOLVE that setting rather than assume it. **UNATTENDED OPERATION IS NOW A v1 CLAIM** (K4a,
 ``levain daemon install-seat``); what is still absent is the per-domain threshold POLICY
-(``spore-417``) — nothing graduates, everything efferent gates. The full honest limits live on
+(``intention-417``) — nothing graduates, everything efferent gates. The full honest limits live on
 :mod:`levain.firing.confinement`, and they are NOT identical across platforms: the shared ones are
 a hardlink a host process creates while a shell is live, resource exhaustion, non-crown-jewel
 network exfil and IPC side channels,
@@ -1096,7 +1096,7 @@ class _SharedFloor:
         return self._refusal
 
     def refuse(self, reason: str) -> None:
-        """Mark the floor unusable for BOTH hands (spore-1308 follow-on, codex L3 2026-10-03): a refresh
+        """Mark the floor unusable for BOTH hands (intention-1308 follow-on, codex L3 2026-10-03): a refresh
         that fails, e.g. on a store a trust file started naming in an unsafe place, used to leave the
         file editor on the old floor while only bash refused."""
         with self._lock:
@@ -1133,7 +1133,7 @@ class _SharedFloor:
     def absorb(self, spawned: CrownJewelsPolicy) -> None:
         """UNION the evolving fields of ``spawned`` into the live policy, under the floor's own lock:
         the four socket fields, and ``deny_read_write``, which gains the project stores a trust file
-        names after the conversation opened (spore-1308 follow-on; without it a late store was denied
+        names after the conversation opened (intention-1308 follow-on; without it a late store was denied
         to bash and left open to the file editor, codex L3 2026-10-03). Monotonic: a merge can only ever ADD a deny, never drop one — the same
         fail-closed property :func:`refresh_socket_denies` provides within a single spawn, extended
         across concurrent spawners."""
@@ -1441,7 +1441,7 @@ class LevainFileEditorTool(FileEditorTool):
 
 
 class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
-    """Drives spore-311's :class:`~levain.firing.confinement.SandboxedShell` (a stateful
+    """Drives intention-311's :class:`~levain.firing.confinement.SandboxedShell` (a stateful
     OS-confined bash — ``sandbox-exec`` on macOS, ``bwrap`` on Linux since K4c) instead of the SDK's
     un-confinable host ``TerminalExecutor``.
 
@@ -1741,7 +1741,7 @@ class LevainBashTool(TerminalTool):
 
 
 class LevainHands(ToolDefinition[Action, Observation]):
-    """BOTH hands for one conversation, registered under :data:`LEVAIN_HANDS_TOOL` (spore-438).
+    """BOTH hands for one conversation, registered under :data:`LEVAIN_HANDS_TOOL` (intention-438).
 
     The SDK resolves a spec as ``create(conv_state=..., **spec.params)``, and may resolve separate
     specs concurrently. One spec for both hands means ONE ``create`` call builds ONE

@@ -22,7 +22,7 @@ Properties carried straight from the data layer:
 - **writes are governed** — TWO write routes, ``POST /edit`` + the governed
   ``POST /action`` ops-verb seam, both behind the write/auth boundary below.
   ``/edit`` mutates Class-A operator inputs (``world.md`` sections, ``posture``/
-  ``recency``, the entity name), the ``## State`` section, the spore lifecycle
+  ``recency``, the entity name), the ``## State`` section, the intention lifecycle
   (touch/descend/ascend/seed/disposition/surface_at), and episode tombstones via
   ``levain.writes`` — never the consolidated FELT layer (the five felt sections;
   the consolidate stays their single writer). Every write is backed up + audited +
@@ -47,7 +47,7 @@ Sovereignty boundary (load-bearing, not incidental):
   auth, with no token. K2a (design §4.3) reversed that: 127.0.0.1 is reachable by every
   local uid, so every write carries a per-surface write token on every bind
   (``_WRITE_TOKEN_HEADER``; a writable serve with none given mints a per-launch one). The
-  ``/chat`` routes take their own per-launch token (``_CHAT_TOKEN_HEADER``; spore-1310).
+  ``/chat`` routes take their own per-launch token (``_CHAT_TOKEN_HEADER``; intention-1310).
   Reads on a loopback bind stay token-free unless the request came through a proxy (an
   ``extra_hosts`` Host or a proxy header: then it is off-box and every route needs the token). Around the token, a write still passes the
   Host allowlist and two CSRF layers: (1) ``Sec-Fetch-Site`` must be absent (a non-browser client like the
@@ -109,7 +109,7 @@ from levain.cockpit.anneal_effects import (
     SectionEffectStore,
     section_paths_agree,
 )
-from levain.cockpit.effects import SPORES, DownstreamEffect, SporeEffectStore
+from levain.cockpit.effects import INTENTIONS, DownstreamEffect, IntentionEffectStore
 from levain.cockpit.engine import Cockpit
 from levain.cockpit.external import ExternalPanels, discoverer
 from levain.cockpit.routes import CACHE_CONTROL as COCKPIT_CACHE_CONTROL
@@ -1050,7 +1050,7 @@ __all__ = [
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7420
 
-# Cap on episode keyword-search results (spore-107). The recall route is a bounded
+# Cap on episode keyword-search results (intention-107). The recall route is a bounded
 # read like /substrate.json; a fixed ceiling keeps a broad keyword from returning an
 # unbounded payload. 100 matches is plenty for a triage glance — narrow for more.
 _RECALL_LIMIT = 100
@@ -1164,15 +1164,15 @@ def _store_fault(what: str, exc: BaseException) -> dict[str, str]:
     return {"error": "internal", "message": f"the {what} store could not be read ({type(exc).__name__})"}
 
 
-# The write token header. spore-129 introduced it for an off-loopback writable bind; since K2a
+# The write token header. intention-129 introduced it for an off-loopback writable bind; since K2a
 # (design §4.3) every write carries a surface token in it on EVERY bind, loopback included,
 # constant-time compared against the surface tokens ``make_server`` holds. Off-box, the same
-# token also gates the substrate-bearing reads (spore-220), and every route of a PROXIED request (an extra host or a
+# token also gates the substrate-bearing reads (intention-220), and every route of a PROXIED request (an extra host or a
 # proxy header) whatever the source; loopback reads with no proxy header stay token-free.
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
 _HEADER_SAFE_TOKEN = re.compile(r"[\x21-\x7e]+")   # printable ASCII, no spaces: it travels in a header
 
-# The CHAT factor (spore-1310, rec B, ruled 2026-10-03). Slice 2a's token-free loopback write
+# The CHAT factor (intention-1310, rec B, ruled 2026-10-03). Slice 2a's token-free loopback write
 # rested on "anything that can reach loopback can already edit the files" (K2a later dropped it for
 # writes too). It always failed for /chat, which makes an entity execute and spend the model endpoint: a container reaching host
 # loopback through host.docker.internal, a sandboxed app with a network entitlement, or another OS
@@ -1776,7 +1776,7 @@ def build_substrate_json(
     if "writable" in payload:
         raise RuntimeError("SubstrateView.to_dict() collided with transport `writable`")
     payload["writable"] = source.write_scope is not None
-    # OFF-BOX write signal (spore-129): true iff this surface is writable AND bound off-loopback,
+    # OFF-BOX write signal (intention-129): true iff this surface is writable AND bound off-loopback,
     # i.e. the server's POST /edit will REQUIRE the X-Levain-Write-Token header (see do_POST).
     # It tells the frontend to attach the device-held token. The handler computes the predicate
     # (it owns the bound-address fact) and, since K2a, also sets it on any writable surface,
@@ -1843,7 +1843,7 @@ def build_substrate_json(
                     "empty": p.get("empty", ""),
                     "error": p.get("error"),
                     # OPTIONAL governed compose/action affordance (the external-panel-ACTION
-                    # seam, the write-peer of how spore panels carry verbs): a {verb, fields}
+                    # seam, the write-peer of how intention panels carry verbs): a {verb, fields}
                     # spec the frontend renders as a confirm-gated compose box → POST /action.
                     # Passed through like lines/note (the panel author's contract); the frontend
                     # renders it ONLY when the surface is writable AND the verb is in the
@@ -1969,7 +1969,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     read_waiters: int
     read_waiters_lock: threading.Lock
     # ``is_loopback_bind`` is computed from the ACTUAL bound address (un-foolable) and gates
-    # whether the substrate READS need a token (spore-220). ``write_token`` is the ``browser``
+    # whether the substrate READS need a token (intention-220). ``write_token`` is the ``browser``
     # surface's token: minted on a writable server given no tokens at all, None when the caller's
     # ``surface_tokens`` name no browser surface, and None on a read-only server.
     is_loopback_bind: bool
@@ -2153,7 +2153,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             return None
         src = self.levain_source
         a = src.anneal
-        files: list[Path] = [a.episodic_db, a.continuity_md, a.crystal_json, a.spores_json]
+        files: list[Path] = [a.episodic_db, a.continuity_md, a.crystal_json, a.intentions_json]
         if src.context_json is not None:
             files.append(Path(src.context_json))
         dirs: list[Path] = []
@@ -2342,7 +2342,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         flooding the console with noise for connections that were never a server fault
         (the server keeps serving thread-per-connection; only the log is wrong). Filter
         that family to silence; defer any genuine error to the base so real bugs still
-        surface (spore-178)."""
+        surface (intention-178)."""
         exc = sys.exc_info()[1]
         if isinstance(exc, (ConnectionError, TimeoutError)):
             return
@@ -2506,7 +2506,7 @@ class _Handler(GuardedHandler):
 
     def _write_token_required(self) -> bool:
         """True iff this request needs a surface token on EVERY route, the substrate-bearing READS included
-        (spore-220, spore-129): it is PROXIED, or it reaches a WRITABLE surface on an off-loopback bind.
+        (intention-220, intention-129): it is PROXIED, or it reaches a WRITABLE surface on an off-loopback bind.
 
         PROXIED (L3 r2 on 0867f2c0, whatever the source's write scope): its Host names an ``extra_hosts`` entry, or
         it carries a proxy header (``X-Forwarded-For``, ``X-Forwarded-Host``, ``Forwarded``, any
@@ -2515,7 +2515,7 @@ class _Handler(GuardedHandler):
         extra_hosts on a server with no surface token; a proxy header reaching a loopback server with no token at all
         is refused (fail closed: a proxy nobody named gets nothing).
 
-        The spore-220 carve-out stays: a READ-ONLY source on an off-loopback bind, not proxied, serves reads
+        The intention-220 carve-out stays: a READ-ONLY source on an off-loopback bind, not proxied, serves reads
         token-free (iPad/iPhone viewing; make_server allows that bind only for a no-install source). Writes are also
         gated by ``_writes_need_credential`` on every bind (K2a); the frontend's ``write_token_required`` signal is
         the OR of the two. Plain loopback with no proxy header stays token-free."""
@@ -4827,14 +4827,14 @@ class _Handler(GuardedHandler):
             self._serve_pair_list(head=head)
             return
 
-        # OFF-BOX READ GATE (spore-220): the substrate-bearing reads must carry the SAME device-held
+        # OFF-BOX READ GATE (intention-220): the substrate-bearing reads must carry the SAME device-held
         # token the writes do WHEN ``_write_token_required``: a PROXIED request (an extra host or a
         # proxy header; writable source or not, L3 r2), or a writable surface bound off-loopback —
         # else any tailnet node reads the full store (``/substrate.json`` / ``/recall.json`` /
         # ``/job.json`` / a downstream ``extra_json`` view) token-free. Same predicate + constant-time
         # compare as ``do_POST`` (the two shared helpers), so a read is never served under weaker auth
         # than a write. Two deliberate carve-outs stay token-free: (1) a read-ONLY mesh bind, not
-        # proxied (spore-220: iPad/iPhone VIEWING); (2) the APP-SHELL static assets (the built-in html/css/js + any
+        # proxied (intention-220: iPad/iPhone VIEWING); (2) the APP-SHELL static assets (the built-in html/css/js + any
         # downstream ``extra_asset``) — they carry NO substrate data, and the browser must load them
         # to supply the token on the data fetches (the bootstrap). Everything else off-box requires
         # the token, so a 404-class path returns a uniform 403 to an unauthed node (no path probing).
@@ -4856,7 +4856,7 @@ class _Handler(GuardedHandler):
             # 403-retry (dashboard_boot.js). Served via _send (GET has no unread body to drain).
             # ⚠ CROSS-REPO COUPLING: the frontends (dashboard_boot.js + an embedder's own frontend) match
             # ``/token/i`` on this "token" wording to trigger the prompt — keep the word "token" here
-            # AND in do_POST's identical message if ever reworded (spore-129/220, two repos).
+            # AND in do_POST's identical message if ever reworded (intention-129/220, two repos).
             self._token_403("forbidden", close=False, head=head)
             return
 
@@ -4980,7 +4980,7 @@ class _Handler(GuardedHandler):
             return
 
         if path == "/recall.json":
-            # Read-only keyword search over episodes (spore-107). Bounded like
+            # Read-only keyword search over episodes (intention-107). Bounded like
             # /substrate.json — the store read is the expensive part; past the cap → 503.
             if not self.server.request_gate.acquire(blocking=False):
                 self._send(
@@ -5210,7 +5210,7 @@ class _Handler(GuardedHandler):
         if self._refuse_write_origin():
             return
         # The write gate: a write route on a writable surface needs a surface token on every bind
-        # (K2a). Every POST for which _write_token_required holds needs it too (spore-129/220; a proxied
+        # (K2a). Every POST for which _write_token_required holds needs it too (intention-129/220; a proxied
         # one whatever the source, L3 r2), with the same constant-time compare as the read gate in _route,
         # so a write is never served under weaker auth than a read. A READ-ONLY surface not proxied (loopback,
         # or its token-free mesh bind) falls through to the 422 'read_only' refusal below, NOT a token-403
@@ -5688,12 +5688,12 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
                   httpd: "_LevainHTTPServer",
                   downstream: "Mapping[str, DownstreamEffect] | None" = None) -> "Broker | None":
     """The cockpit broker over a writable source (K2b §4.2, §6): its data root is
-    ``<ledger_root>/cockpit``, its stores the source's spores and episodes plus each downstream
+    ``<ledger_root>/cockpit``, its stores the source's intentions and episodes plus each downstream
     verb's, its tier recompute the kernel's."""
     scope = source.write_scope
     if scope is None:
         return None
-    spores, episodes = scope.anneal.spores_json, scope.anneal.episodic_db
+    intentions, episodes = scope.anneal.intentions_json, scope.anneal.episodic_db
     from levain.cockpit.desk_effects import DESK, CoordDropEffectStore
     from levain.cockpit.providers import _dispatch_dir
 
@@ -5703,11 +5703,11 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
         return _dispatch_dir(getattr(httpd, "consent_reader", None))
 
     return Broker(scope.ledger_root / "cockpit",
-                  stores={SPORES: SporeEffectStore(spores), EPISODES: EpisodeEffectStore(episodes),
+                  stores={INTENTIONS: IntentionEffectStore(intentions), EPISODES: EpisodeEffectStore(episodes),
                           DESK: CoordDropEffectStore(coord_dir),
                           **({SECTIONS: SectionEffectStore(episodes)} if section_paths_agree(scope.anneal)
                              else {})},
-                  install_class=install_class, store_paths=[spores, episodes], downstream=downstream,
+                  install_class=install_class, store_paths=[intentions, episodes], downstream=downstream,
                   tier_of=lambda verb, params, target: retier(
                       httpd.verb_registry, httpd.get_cockpit(), verb, dict(params), dict(target)))
 
@@ -5777,7 +5777,7 @@ def make_server(
     re-implement (and could drift from) the bind-refusal contract
     (``structural_invariants_beat_discipline``). ``extra_assets`` maps a path →
     ``(content_type, body_bytes)`` (cached, ungated — like the built-in assets); ⚠ SECURITY
-    (spore-220): an ``extra_asset`` is served TOKEN-FREE even on an off-box writable bind (it is the
+    (intention-220): an ``extra_asset`` is served TOKEN-FREE even on an off-box writable bind (it is the
     app shell — the browser must load it to supply the off-box token on the data fetches), so it MUST
     NOT carry substrate data — put any per-request substrate behind ``extra_json``, which the off-box
     read gate covers. This is a REGISTRANT contract the kernel can't enforce on static bytes.
@@ -5811,17 +5811,17 @@ def make_server(
     - a READ-ONLY, NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` —
       e.g. the embedder's self-ops cockpit over a bare anneal store) MAY bind off-loopback: the write
       route 422s and there is no seed/config to expose, so the private mesh (Tailscale's
-      WireGuard) is the access boundary and its reads stay token-free (spore-220: iPad viewing).
+      WireGuard) is the access boundary and its reads stay token-free (intention-220: iPad viewing).
       That carve-out is for the bare bind only: a PROXIED request (an ``extra_hosts`` Host or a
       proxy header) needs the token whatever the source (L3 r2 on 0867f2c0);
-    - a WRITABLE source MAY bind off-loopback ONLY with ``write_token`` (spore-129) — the
+    - a WRITABLE source MAY bind off-loopback ONLY with ``write_token`` (intention-129) — the
       off-box governance factor that replaces loopback-is-auth. Then POST /edit requires the
       ``X-Levain-Write-Token`` header (constant-time compared). Since K2a every write needs
       a surface token on a loopback bind too; there a writable source given neither
       ``write_token`` nor ``surface_tokens`` gets a per-launch browser token. Without a token
       a writable source stays loopback-only;
     - an INSTALL-bearing source stays loopback-only UNCONDITIONALLY (its seed/config is
-      operator-private; a token does not relax this — a different concern than spore-129).
+      operator-private; a token does not relax this — a different concern than intention-129).
     Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]
 
     ``signer`` (DESIGN_SIGN D4) is a :class:`levain.consent.sign.Signer` the cockpit page signs sign requests
@@ -5867,7 +5867,7 @@ def make_server(
     if not _is_loopback_host(host):
         # An INSTALL-bearing source is loopback-only UNCONDITIONALLY — its seed/config is
         # operator-private (matching the pre-WriteScope boundary that gated on install
-        # presence). A token does NOT relax this; it is a different concern than spore-129.
+        # presence). A token does NOT relax this; it is a different concern than intention-129.
         # _is_install_bearing checks BOTH install_root fields (source + write_scope) — they can
         # diverge and the write path keys off the write_scope's [L1 + codex L3].
         if _is_install_bearing(source):
@@ -5876,7 +5876,7 @@ def make_server(
                 "(127.0.0.1 / localhost) — its seed/config is operator-private. Only a "
                 "NO-INSTALL source MAY bind a non-loopback address for private-mesh access."
             )
-        # A WRITABLE source MAY bind off-loopback (spore-129) — but ONLY with a write_token,
+        # A WRITABLE source MAY bind off-loopback (intention-129) — but ONLY with a write_token,
         # the off-box factor that also gates its reads. Without one it stays loopback-only, where
         # make_server mints a per-launch token for its writes.
         # `not write_token` (not `is None`): an EMPTY-string token must also refuse the bind, not
@@ -6170,7 +6170,7 @@ def make_server(
     httpd._cockpit_lock = threading.Lock()
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
-    # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
+    # OFF-BOX write auth (intention-129): key the token requirement on the ACTUAL bound address
     # (un-foolable — the real socket, not the requested ``host`` string). It decides whether the
     # READS need a token; every write needs one on every bind (K2a). The bind-refusal above
     # already guaranteed a writable off-loopback source was given one.
@@ -6423,7 +6423,7 @@ def run_web_server(
     READ-ONLY by default (``write=False``): the served source carries no write scope,
     so every edit affordance is dark and ``POST /edit`` 422s — a pure inspection
     cockpit. ``write=True`` (``levain serve --write``) serves the GOVERNED WRITABLE
-    cockpit — State / spore / Tray-Keep / episode edits through the same ``apply_edit``
+    cockpit — State / intention / Tray-Keep / episode edits through the same ``apply_edit``
     seam ``levain tui`` uses. Every write needs the write token this function prints at start
     (with a link that carries it), loopback included, behind the Host/CSRF guards. An install-bearing
     substrate is loopback-only either way (its seed/config is operator-private), so

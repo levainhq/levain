@@ -138,7 +138,7 @@ def _tray_cockpit(*, fault: bool = False, stale: bool = False) -> Cockpit:
     """The kernel's own `tray` id (so the dashboard's native Tray component takes it) over the
     deliberately non-natural test ordering, plus optional fault / stale panels."""
     ck = Cockpit(entity=lambda ctx: {"name": "test entity", "governance": "x", "brand": {"wordmark": "W", "model": "M"}})
-    rows = [RowIn(f"spore:spore-{i}", f"title {i}", {"at": f"2026-10-0{i}T00:00:00+00:00"}, stored={"id": f"spore-{i}"})
+    rows = [RowIn(f"intention:intention-{i}", f"title {i}", {"at": f"2026-10-0{i}T00:00:00+00:00"}, stored={"id": f"intention-{i}"})
             for i in range(1, 6)]
     ck.register(ProviderSpec("tray", "triage-list", "Tray", "gate", lambda c: Read(rows=tuple(rows)),
                              order="test.reversed", facets=frozenset({"at"}), version_fields=("id",)))
@@ -177,7 +177,7 @@ class TestManifestMapper:
         served = [r["id"] for r in ck.panel("tray")["rows"]]
         assert served != sorted(served)
         view = _view(snapshot(ck))
-        assert [f"spore:{s['id']}" for s in view["tray"]] == served
+        assert [f"intention:{s['id']}" for s in view["tray"]] == served
         assert [s["group_title"] for s in view["tray"]] == ["Odd ids"] * 3 + ["Even ids"] * 2
         assert [e["id"] for e in view["layout"]][:1] == ["tray"]   # the kernel's panel order
 
@@ -213,7 +213,7 @@ class TestManifestMapperAdversarial:
         except Exception:  # noqa: BLE001 - registered once per process
             pass
         ck = Cockpit()
-        rows = [RowIn("spore:spore-1", "t", {"at": "2026-10-01T00:00:00+00:00"}, stored={"id": "spore-1"})]
+        rows = [RowIn("intention:intention-1", "t", {"at": "2026-10-01T00:00:00+00:00"}, stored={"id": "intention-1"})]
         ck.register(ProviderSpec("tray", "triage-list", "Tray", "gate", lambda c: Read(rows=tuple(rows)),
                                  order="test.proto", facets=frozenset({"at"}), version_fields=("id",)))
         ck.register(ProviderSpec("constructor", "line", "Odd id", "gauge",
@@ -600,7 +600,7 @@ class TestTheDashboardPageFromTheManifest:
             httpd.shutdown()
             httpd.server_close()
             t.join(timeout=5)
-        assert re.findall(r'class="sid"[^>]*>(spore-\d)<', dom) == served
+        assert re.findall(r'class="sid"[^>]*>(intention-\d)<', dom) == served
         assert dom.index("Odd ids") < dom.index("Even ids")
         assert "disk on fire" in dom and "unavailable" in dom
 
@@ -618,7 +618,7 @@ class TestTheDashboardPageFromTheManifest:
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 class TestTrayKeepFilter:
-    """Tray and Keep carry the filter bar Open Loops has (text or spore-id, client-side, persisted)."""
+    """Tray and Keep carry the filter bar Open Loops has (text or intention-id, client-side, persisted)."""
 
     DRIVER = r"""
 const fs = require("fs");
@@ -632,26 +632,26 @@ function mk(t) { return { tagName: t, className: "", children: [], attrs: {}, li
   setAttribute(k, v) { this.attrs[k] = String(v); }, addEventListener(e, f) { this.listeners[e] = f; },
   closest() { return null; } }; }
 const el = (t, c, x) => { const n = mk(t); if (c) n.className = c; if (x != null) n.textContent = x; return n; };
-const sporeQueries = {};
-const f = new Function("el", "sporeQueries", "measureOverflow", "measureClauses", "narrowPlaceholder", block + "\nreturn mountSporeFilter;");
+const intentionQueries = {};
+const f = new Function("el", "intentionQueries", "measureOverflow", "measureClauses", "narrowPlaceholder", block + "\nreturn mountIntentionFilter;");
 const rowsOf = (panel) => panel.children[1].children.filter((c) => c.className === "row").length;
-const ROWS = [1, 2, 3, 4, 5].map((i) => ({ id: "spore-" + i, text: i === 4 ? "Kettle bell" : "item " + i }));
-for (const kind of ["tray", "spores"]) {
-  const mount = f(el, sporeQueries, () => {}, () => {}, () => {});
+const ROWS = [1, 2, 3, 4, 5].map((i) => ({ id: "intention-" + i, text: i === 4 ? "Kettle bell" : "item " + i }));
+for (const kind of ["tray", "intentions"]) {
+  const mount = f(el, intentionQueries, () => {}, () => {}, () => {});
   const p = mk("div");
   mount(p, ROWS, "items", kind, (rows, results) => rows.forEach((s) => results.appendChild(el("div", "row", s.id))));
   const input = p.children[0].children[0];
   const type = (v) => { input.value = v; input.listeners.input(); };
   const fail = (m) => { console.error("FAIL " + kind + ": " + m); process.exit(1); };
   if (rowsOf(p) !== 5) fail("initial rows " + rowsOf(p));
-  type("spore-2"); if (rowsOf(p) !== 1) fail("id filter gave " + rowsOf(p));
+  type("intention-2"); if (rowsOf(p) !== 1) fail("id filter gave " + rowsOf(p));
   type("KETTLE"); if (rowsOf(p) !== 1) fail("text filter gave " + rowsOf(p));
   type("nomatch"); if (rowsOf(p) !== 0 || !p.children[1].children[0].textContent.includes("nomatch")) fail("empty state");
   type(""); if (rowsOf(p) !== 5) fail("clearing did not restore, got " + rowsOf(p));
-  type("spore-3");                                     // persists into the next render of the same kind
+  type("intention-3");                                     // persists into the next render of the same kind
   const p2 = mk("div"); mount(p2, ROWS, "items", kind, (rows, results) => rows.forEach((s) => results.appendChild(el("div", "row", s.id))));
   if (rowsOf(p2) !== 1) fail("query not persisted across a re-render");
-  sporeQueries[kind] = "";
+  intentionQueries[kind] = "";
 }
 console.log("OK");
 """
@@ -665,8 +665,8 @@ console.log("OK");
 
     def test_tray_and_loops_projections_mount_the_filter_by_panel_kind(self) -> None:
         core = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
-        body = core[core.index("function renderSporeProjection"):core.index("function renderSpores(")]
-        assert "mountSporeFilter(p, list" in body and "entry.kind" in body
-        assert "const sporeQueries = Object.create(null)" in core            # a kind named "constructor" is data
+        body = core[core.index("function renderIntentionProjection"):core.index("function renderIntentions(")]
+        assert "mountIntentionFilter(p, list" in body and "entry.kind" in body
+        assert "const intentionQueries = Object.create(null)" in core            # a kind named "constructor" is data
         assert "try { return renderPanel(entry, view, opts); }" in core      # a panel that cannot be drawn degrades alone
         assert core.count("renderPanelSafe(") >= 3                          # the board AND the modal draw through it

@@ -18,12 +18,12 @@ from levain.cockpit.effects import (
     ApplyUnit,
     Effect,
     PermanentApplyRefusal,
-    SporeEffectStore,
+    IntentionEffectStore,
     StoreGone,
     TransientApplyFault,
     plan_units,
 )
-from tests.test_cockpit_k2b_broker import BROWSER, Key, _label, _refused, _rows, _state, home, keydir, spores  # noqa: F401
+from tests.test_cockpit_k2b_broker import BROWSER, Key, _label, _refused, _rows, _state, home, keydir, intentions  # noqa: F401
 
 @pytest.fixture
 def db(home: Path) -> Path:
@@ -34,9 +34,9 @@ def db(home: Path) -> Path:
     return p
 
 @pytest.fixture
-def broker(home: Path, spores: Path, db: Path) -> Iterator[Broker]:
-    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores), EPISODES: EpisodeEffectStore(db)},
-               store_paths=[spores, db], install_class="reported")
+def broker(home: Path, intentions: Path, db: Path) -> Iterator[Broker]:
+    b = Broker(home / "data", stores={"intentions": IntentionEffectStore(intentions), EPISODES: EpisodeEffectStore(db)},
+               store_paths=[intentions, db], install_class="reported")
     b.start()
     try:
         yield b
@@ -209,9 +209,9 @@ def _kernel_broker(home: Path) -> tuple[Any, Broker, Path]:
 
     rig = Rig(home)
     db = Path(rig.src.anneal.episodic_db)
-    spores = rig.root / ".levain" / "memory.spores.json"
-    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores), EPISODES: EpisodeEffectStore(db)},
-               store_paths=[spores, db], install_class="reported",
+    intentions = rig.root / ".levain" / "memory.spores.json"
+    b = Broker(home / "data", stores={"intentions": IntentionEffectStore(intentions), EPISODES: EpisodeEffectStore(db)},
+               store_paths=[intentions, db], install_class="reported",
                tier_of=lambda verb, params, target: retier(rig.reg, rig.ck, verb, dict(params), dict(target)))
     return rig, b, db
 

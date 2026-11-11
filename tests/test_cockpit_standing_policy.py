@@ -26,11 +26,11 @@ from levain.cockpit.verbs import dispatch
 from levain.writes import EditError
 from tests.cockpit_authority_rig import link
 from tests.test_cockpit_k2a import CRED, INSTALL_CLASS
-from tests.test_cockpit_k2b_broker import Key, home, keydir, spores  # noqa: F401 - fixtures
+from tests.test_cockpit_k2b_broker import Key, home, keydir, intentions  # noqa: F401 - fixtures
 from tests.test_cockpit_k2b_section import rig_broker  # noqa: F401 - fixture
 
 LEVAIN = Path(levain.__file__).parent
-RAISE = {"op": "raise", "verb": "spore_touch", "tier": "T2"}
+RAISE = {"op": "raise", "verb": "intention_touch", "tier": "T2"}
 
 
 @pytest.fixture
@@ -45,15 +45,15 @@ def stack(rig_broker, keydir):  # noqa: F811 - fixture
 
 
 def _touch(rig: Any) -> dict[str, Any]:
-    """The seed row's rendered ``spore_touch`` action, as the tray panel shows it."""
-    rid = f"spore:{rig.ids['seed']}"
+    """The seed row's rendered ``intention_touch`` action, as the tray panel shows it."""
+    rid = f"intention:{rig.ids['seed']}"
     return next(a for r in rig.ck.panel("tray", credential_class="token")["rows"] if r["id"] == rid
-                for a in r["actions"] if a["verb"] == "spore_touch")
+                for a in r["actions"] if a["verb"] == "intention_touch")
 
 
 def _fire(rig: Any, b: Any = None, **env: Any) -> dict[str, Any]:
     row = rig.row("tray", "seed")
-    req = {"verb": "spore_touch", "panel_id": "tray", "params": {}, "row_id": row["id"],
+    req = {"verb": "intention_touch", "panel_id": "tray", "params": {}, "row_id": row["id"],
            "row_version": row["version"], **env}
     return dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope, req=req, credential=CRED,
                     install_class=INSTALL_CLASS, route="cockpit", broker=b)
@@ -63,14 +63,14 @@ def _fire(rig: Any, b: Any = None, **env: Any) -> dict[str, Any]:
 
 def test_a_signed_raise_moves_the_displayed_and_the_enforced_tier(stack):
     rig, b, _laptop, phone = stack
-    assert rig.tier("spore_touch", "tray", "seed") == "C1"
+    assert rig.tier("intention_touch", "tray", "seed") == "C1"
     assert _touch(rig)["tier"] == "C1"
-    assert rig.ck.manifest(CRED)["verbs"]["spore_touch"]["tier"] == "C1"
+    assert rig.ck.manifest(CRED)["verbs"]["intention_touch"]["tier"] == "C1"
     link(b.db, RAISE, phone)                      # T2's op, signed by a display-phone key
-    assert rig.tier("spore_touch", "tray", "seed") == "T2"                        # enforced (dispatch)
+    assert rig.tier("intention_touch", "tray", "seed") == "T2"                        # enforced (dispatch)
     shown = _touch(rig)
     assert (shown["tier"], shown["gesture"]) == ("T2", "direct-reported")         # displayed (the row)
-    assert rig.ck.manifest(CRED)["verbs"]["spore_touch"]["tier"] == "T2"          # displayed (the manifest)
+    assert rig.ck.manifest(CRED)["verbs"]["intention_touch"]["tier"] == "T2"          # displayed (the manifest)
 
 
 # --- (b) the manifest and verb-view etags move on that append -------------------------------------------
@@ -99,7 +99,7 @@ def test_the_manifest_etag_moves_with_the_authority_head_and_nothing_else(tmp_pa
     from tests.test_cockpit_k2a import Rig
 
     rig = Rig(tmp_path)
-    policy = type(genesis_policy()).from_dict({"raise_to": {"spore_touch": "T2"}, "timeouts": {}, "grants": {}})
+    policy = type(genesis_policy()).from_dict({"raise_to": {"intention_touch": "T2"}, "timeouts": {}, "grants": {}})
     heads = {"now": AuthoritySnapshot("store0001", 1, "a" * 64, {}, genesis_policy(), ("a" * 64,))}
     rig.ck.attach_authority(lambda now: RequestAuthority(now, authority=heads["now"]))
     m1 = rig.ck.manifest(CRED)
@@ -107,7 +107,7 @@ def test_the_manifest_etag_moves_with_the_authority_head_and_nothing_else(tmp_pa
     heads["now"] = AuthoritySnapshot("store0001", 2, "b" * 64, {}, policy, ("a" * 64, "b" * 64))
     m2 = rig.ck.manifest(CRED)
     assert m2["etag"] != m1["etag"]
-    assert m2["verbs"]["spore_touch"]["tier"] == "T2"
+    assert m2["verbs"]["intention_touch"]["tier"] == "T2"
 
 
 # --- (c) a fire made against the pre-raise render is refused ----------------------------------------------
@@ -118,36 +118,36 @@ def test_a_fire_carrying_the_pre_raise_preview_is_refused_and_fires_nothing(stac
     becomes a WAITING pending at the new tier, or ``not_built`` for a verb with no adapter (the next
     test; codex 4, L3 r1, a known edge in the CHANGELOG)."""
     rig, b, _laptop, phone = stack
-    before = rig.spore("seed")
-    preview = rig.post("spore_touch", "tray", "seed", dry_run=True)
+    before = rig.intention("seed")
+    preview = rig.post("intention_touch", "tray", "seed", dry_run=True)
     assert (preview["tier"], preview["gesture"]) == ("C1", "direct")
     link(b.db, RAISE, phone)
     with pytest.raises(EditError) as ei:
         _fire(rig, b, intent="reported", tier_seen=preview["tier"], gesture_seen=preview["gesture"])
     assert ei.value.code == "tier_moved"
-    assert rig.spore("seed") == before
+    assert rig.intention("seed") == before
 
 
 def test_after_a_raise_a_pre_raise_c1_action_becomes_a_pending_at_the_new_tier(stack):
     """What really happens to an ordinary C1 action rendered BEFORE a raise and clicked after it (codex
     4): it is not refused; it becomes a WAITING pending at the new tier, the safe direction, and the row
-    is untouched until it is signed. A raised verb the broker has no adapter for (``spore_touch``) answers
+    is untouched until it is signed. A raised verb the broker has no adapter for (``intention_touch``) answers
     ``not_built``: it never fires direct either."""
     rig, b, _laptop, phone = stack
     params = {"surface_at": "2026-10-20"}
-    assert rig.tier("spore_surface_at", "tray", "seed", params) == "C1"
+    assert rig.tier("intention_surface_at", "tray", "seed", params) == "C1"
     rendered = next(a for r in rig.ck.panel("tray", credential_class="token")["rows"]
-                    if r["id"] == f"spore:{rig.ids['seed']}" for a in r["actions"] if a["verb"] == "spore_surface_at")
+                    if r["id"] == f"intention:{rig.ids['seed']}" for a in r["actions"] if a["verb"] == "intention_surface_at")
     assert rendered["tier"] == "C1" and "tier_seen" not in rendered    # the click carries no seen tier
-    before = rig.spore("seed")
-    link(b.db, {"op": "raise", "verb": "spore_surface_at", "tier": "T2"}, phone)
-    out = _fire(rig, b, verb="spore_surface_at", params=params)       # no intent: the sign path
+    before = rig.intention("seed")
+    link(b.db, {"op": "raise", "verb": "intention_surface_at", "tier": "T2"}, phone)
+    out = _fire(rig, b, verb="intention_surface_at", params=params)       # no intent: the sign path
     assert out.get("pending_id") and out.get("state") == "WAITING", out
-    assert rig.spore("seed") == before
+    assert rig.intention("seed") == before
     link(b.db, RAISE, phone)
     with pytest.raises(EditError, match="no EffectStore adapter"):
         _fire(rig, b)
-    assert rig.spore("seed") == before
+    assert rig.intention("seed") == before
 
 
 # --- what S4a adds ---------------------------------------------------------------------------------------
@@ -161,14 +161,14 @@ def test_a_refused_log_tiers_every_verb_t3_and_fires_no_c1(stack):
     at = authority.read_anchor(anchor)
     anchor.write_text(json.dumps({"format": authority.ANCHOR_FORMAT, "store_id": at.store_id,
                                   "seq": at.seq + 1, "head_hash": "0" * 64}))     # the log is behind it
-    before = rig.spore("seed")
-    assert rig.tier("spore_touch", "tray", "seed") == "T3"
+    before = rig.intention("seed")
+    assert rig.tier("intention_touch", "tray", "seed") == "T3"
     assert _touch(rig)["tier"] == "T3"
     with pytest.raises(EditError):
         _fire(rig)
-    assert rig.spore("seed") == before
+    assert rig.intention("seed") == before
     anchor.write_bytes(good)
-    assert rig.tier("spore_touch", "tray", "seed") == "C1"
+    assert rig.tier("intention_touch", "tray", "seed") == "C1"
 
 
 def test_the_policy_and_revision_of_each_capture_kind():
@@ -228,24 +228,24 @@ def test_the_cli_raise_signs_through_the_log_and_the_classifier_refuses_a_presen
         return {"signer_fp": k.fingerprint, "sign": k.sign_link, "clock": lambda: now}
 
     with pytest.raises(KeyError_, match="presence key cannot sign this raise"):
-        policy_raise(root, "spore_touch", "T2", **by(presence))
-    assert policy_raise(root, "spore_touch", "T2", **by(phone))[:2] == ("T2", 4)
+        policy_raise(root, "intention_touch", "T2", **by(presence))
+    assert policy_raise(root, "intention_touch", "T2", **by(phone))[:2] == ("T2", 4)
     with pytest.raises(KeyError_, match="a raise link computes to a loosen change"):
-        policy_raise(root, "spore_touch", "C1", **by(laptop))
+        policy_raise(root, "intention_touch", "C1", **by(laptop))
     with pytest.raises(KeyError_, match="changes nothing"):
-        policy_raise(root, "spore_touch", "T2", **by(phone))
+        policy_raise(root, "intention_touch", "T2", **by(phone))
 
     from levain import cli
     from levain.cockpit.keys import keys
 
-    argv = ["cockpit", "policy", "raise", "spore_touch", "T3", "--signing-key", str(phone.path), "--data-root",
+    argv = ["cockpit", "policy", "raise", "intention_touch", "T3", "--signing-key", str(phone.path), "--data-root",
             str(root)]
     assert cli.main(argv) == 0
     with db.read() as conn:
-        assert authority.snapshot(conn).policy.raise_to["spore_touch"] == "T3"
+        assert authority.snapshot(conn).policy.raise_to["intention_touch"] == "T3"
     assert keys(root, now=now)[0]        # the store still opens
     with pytest.raises(SystemExit):
-        cli.main(["cockpit", "policy", "raise", "spore_touch", "C1", "--signing-key", str(phone.path)])
+        cli.main(["cockpit", "policy", "raise", "intention_touch", "C1", "--signing-key", str(phone.path)])
 
 
 # --- the fence: no module-level policy, no fallback to the shipped default -------------------------------
@@ -287,7 +287,7 @@ def test_a_standby_broker_tiers_every_verb_t3_fires_nothing_and_no_genesis_captu
 
     rig, b, _laptop, phone = stack
     params = {"surface_at": "2026-10-20"}
-    link(b.db, {"op": "raise", "verb": "spore_surface_at", "tier": "T2"}, phone)
+    link(b.db, {"op": "raise", "verb": "intention_surface_at", "tier": "T2"}, phone)
     second = Broker(b.data_root, stores=dict(b.stores), store_paths=list(b.store_paths), install_class="reported",
                     tier_of=b.tier_of, ssh_keygen=b.ssh_keygen, lock_poll=0.05)
     second.start()
@@ -296,17 +296,17 @@ def test_a_standby_broker_tiers_every_verb_t3_fires_nothing_and_no_genesis_captu
         rig.ck.attach_authority(second.capture)
         stood_by = second.capture()
         assert stood_by.policy is UNKNOWN_POLICY and stood_by.revision == ["unknown"]
-        before = rig.spore("seed")
-        assert rig.tier("spore_surface_at", "tray", "seed", params) == "T3"
-        assert rig.ck.manifest(CRED)["verbs"]["spore_surface_at"]["tier"] == "T3"
+        before = rig.intention("seed")
+        assert rig.tier("intention_surface_at", "tray", "seed", params) == "T3"
+        assert rig.ck.manifest(CRED)["verbs"]["intention_surface_at"]["tier"] == "T3"
         with pytest.raises(EditError):
-            _fire(rig, second, verb="spore_surface_at", params=params)
-        assert rig.spore("seed") == before
+            _fire(rig, second, verb="intention_surface_at", params=params)
+        assert rig.intention("seed") == before
         b.stop()
         assert _wait(lambda: second.state is Lifecycle.ACTIVE, 5.0)
         assert stood_by.policy is UNKNOWN_POLICY                          # no genesis capture survives
-        assert second.capture().policy.raise_to["spore_surface_at"] == "T2"
-        assert rig.tier("spore_surface_at", "tray", "seed", params) == "T2"
+        assert second.capture().policy.raise_to["intention_surface_at"] == "T2"
+        assert rig.tier("intention_surface_at", "tray", "seed", params) == "T2"
     finally:
         second.stop()
 
@@ -314,10 +314,10 @@ def test_a_standby_broker_tiers_every_verb_t3_fires_nothing_and_no_genesis_captu
 # --- FIX1 H2: pending_cancel honours its standing floor, on every path ----------------------------------
 
 @pytest.fixture
-def canceller(home, spores, keydir):  # noqa: F811 - fixtures
+def canceller(home, intentions, keydir):  # noqa: F811 - fixtures
     from tests.test_cockpit_k2b_broker import _broker
 
-    b = _broker(home, spores)
+    b = _broker(home, intentions)
     try:
         Key(keydir, "laptop").enroll(b, "laptop-presence")
         phone = Key(keydir, "phone").enroll(b, "display-phone")
@@ -326,7 +326,7 @@ def canceller(home, spores, keydir):  # noqa: F811 - fixtures
         b.stop()
 
 
-def test_a_raised_pending_cancel_lifts_a_foreign_cancellation_and_the_render(canceller, spores):  # noqa: F811 - fixture
+def test_a_raised_pending_cancel_lifts_a_foreign_cancellation_and_the_render(canceller, intentions):  # noqa: F811 - fixture
     """codex 2 (L3 r1, HIGH): with ``pending_cancel`` raised to T3, another token's reported T2
     cancellation of a T2 pending is refused (T3 on the token alone), never committed below the floor;
     the decisions row offers the cancel at T3."""
@@ -336,7 +336,7 @@ def test_a_raised_pending_cancel_lifts_a_foreign_cancellation_and_the_render(can
 
     b, phone = canceller
     link(b.db, {"op": "raise", "verb": "pending_cancel", "tier": "T3"}, phone)
-    pid = _move(b, spores)["pending_id"]
+    pid = _move(b, intentions)["pending_id"]
     with pytest.raises(BrokerError) as ei:
         b.cancel(pid, credential=PHONE, intent="reported", idempotency_key="c1")
     assert ei.value.code == "refused" and "T3" in str(ei.value)
@@ -348,7 +348,7 @@ def test_a_raised_pending_cancel_lifts_a_foreign_cancellation_and_the_render(can
     assert [a["tier"] for a in pending_actions(row, "token", "reported", policy=policy)] == ["T3"]
 
 
-def test_a_raised_pending_cancel_lifts_an_own_cancellation_off_c1_and_recompute_agrees(canceller, spores):  # noqa: F811 - fixture
+def test_a_raised_pending_cancel_lifts_an_own_cancellation_off_c1_and_recompute_agrees(canceller, intentions):  # noqa: F811 - fixture
     """The canceller's own pending: C1 at genesis, so with ``pending_cancel`` raised to T2 it is a T2
     pending (the target stays WAITING), and a reported one of a T3 target commits: the decide's
     recompute reproduces the floor over C1, never the target's T3 (which would end it STALE)."""
@@ -356,24 +356,24 @@ def test_a_raised_pending_cancel_lifts_an_own_cancellation_off_c1_and_recompute_
     from tests.test_cockpit_k2b_broker import BROWSER, _move
 
     link(b.db, {"op": "raise", "verb": "pending_cancel", "tier": "T2"}, phone)
-    pid = _move(b, spores)["pending_id"]
+    pid = _move(b, intentions)["pending_id"]
     out = b.cancel(pid, credential=BROWSER)
     assert out["pending_id"] != pid and out["state"] == "WAITING"
     assert b.outcome(pid)["state"] == "WAITING"
-    t3 = _move(b, spores, "k.seed2", tier="T3")["pending_id"]
+    t3 = _move(b, intentions, "k.seed2", tier="T3")["pending_id"]
     done = b.cancel(t3, credential=BROWSER, intent="reported", idempotency_key="c3")
     assert done["state"] == "COMMITTED", done
     assert b.outcome(t3)["state"] == "CANCELLED"
 
 
-def test_under_a_refused_log_an_own_cancellation_is_refused_and_cancels_nothing(canceller, spores):  # noqa: F811 - fixture
+def test_under_a_refused_log_an_own_cancellation_is_refused_and_cancels_nothing(canceller, intentions):  # noqa: F811 - fixture
     """codex 2: the own-cancel branch mutated the pending as C1 without capturing authority. Under a
     refused log the policy is unknown, so the cancellation is T3 and refused for want of a fence."""
     from levain.cockpit.broker import BrokerError
     from tests.test_cockpit_k2b_broker import BROWSER, _move
 
     b, _phone = canceller
-    pid = _move(b, spores)["pending_id"]
+    pid = _move(b, intentions)["pending_id"]
     anchor = anchor_path(b.data_root)
     at = authority.read_anchor(anchor)
     anchor.write_text(json.dumps({"format": authority.ANCHOR_FORMAT, "store_id": at.store_id,
@@ -389,11 +389,11 @@ def test_the_cli_raise_refuses_a_verb_nothing_honours(tmp_path):
     before anything is signed; ``pending_cancel`` (an internal verb that honours a floor) is accepted."""
     from levain.cockpit.keys import KeyError_, _raisable
 
-    for verb, why in (("spore_tuch", "not a cockpit verb"), ("token_rotate", "honours no standing-policy floor")):
+    for verb, why in (("intention_tuch", "not a cockpit verb"), ("token_rotate", "honours no standing-policy floor")):
         with pytest.raises(KeyError_, match=why):
             _raisable(verb)
     _raisable("pending_cancel")
-    _raisable("spore_touch")
+    _raisable("intention_touch")
 
 
 def test_a_downstream_verb_raises_against_what_the_deployment_serves(tmp_path, monkeypatch):
@@ -444,11 +444,11 @@ def test_a_downstream_verb_raises_against_what_the_deployment_serves(tmp_path, m
     httpd = make_server(source, port=0, extra_verbs=extra)
     httpd.server_close()
     served, _ = served_verbs(root)
-    assert {"deploy", "publish", "spore_touch"} <= served
+    assert {"deploy", "publish", "intention_touch"} <= served
     assert oct((root / SERVED_VERBS_NAME).stat().st_mode & 0o777) == "0o600"
 
     # the finding: a misspelling of a served downstream verb is refused, and so is a kernel misspelling
-    for verb in ("deplyo", "spore_tuch"):
+    for verb in ("deplyo", "intention_tuch"):
         with pytest.raises(KeyError_, match="not a verb this deployment serves"):
             policy_raise(root, verb, "T3", **by_phone)
         assert cli_raise(verb) == 1
@@ -474,7 +474,7 @@ def test_a_downstream_verb_raises_against_what_the_deployment_serves(tmp_path, m
     (root / SERVED_VERBS_NAME).write_text("{not json", encoding="utf-8")
     with pytest.raises(KeyError_, match="unreadable"):
         _raisable("deploy", data_root=root)
-    _raisable("spore_touch", data_root=root)       # a kernel verb never needs the record
+    _raisable("intention_touch", data_root=root)       # a kernel verb never needs the record
 
     # a server that cannot write its record removes the earlier one, so nothing is checked against a
     # server that no longer serves: the raise is refused
@@ -493,13 +493,13 @@ def test_a_downstream_verb_raises_against_what_the_deployment_serves(tmp_path, m
         _raisable("deploy", data_root=root)
 
 
-def test_an_inactive_broker_keeps_the_shipped_tiers_only_where_no_log_was_ever_kept(home, spores):  # noqa: F811 - fixture
+def test_an_inactive_broker_keeps_the_shipped_tiers_only_where_no_log_was_ever_kept(home, intentions):  # noqa: F811 - fixture
     """The one inactive case that is positively empty: no journal, no WAL, no anchor on the data root (by
     ``lstat``, no opener). Any trace of a log, and the policy is unknown."""
     from levain.cockpit.authority import UNKNOWN_POLICY
     from tests.test_cockpit_k2b_broker import _broker
 
-    b = _broker(home, spores, install_class=None)
+    b = _broker(home, intentions, install_class=None)
     try:
         assert not b.enabled
         fresh = b.capture()

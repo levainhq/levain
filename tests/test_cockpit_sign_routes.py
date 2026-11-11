@@ -579,7 +579,7 @@ def test_a_read_only_source_through_an_extra_host_needs_the_token(tmp_path: Path
 
 
 def test_the_read_only_mesh_carve_out_does_not_reach_a_proxied_request(tmp_path: Path) -> None:
-    """Head ruling on Q1 (L3 r2, spore-220): a read-only no-install source bound off-loopback stays token-free for
+    """Head ruling on Q1 (L3 r2, intention-220): a read-only no-install source bound off-loopback stays token-free for
     reads (iPad viewing, test_web_server's carve-out test), but the carve-out is for the bare bind only. The same
     source given extra_hosts and no surface token is refused before binding: every proxied request needs one, so
     that server would answer every proxied request 403. With a token it binds; with no proxy named it binds as today."""
@@ -594,7 +594,7 @@ def test_the_read_only_mesh_carve_out_does_not_reach_a_proxied_request(tmp_path:
 
 
 def test_a_proxied_request_to_a_read_only_mesh_bind_needs_the_token(tmp_path: Path) -> None:
-    """The bare read-only mesh bind is token-free (spore-220); a request to it carrying a proxy header is not."""
+    """The bare read-only mesh bind is token-free (intention-220); a request to it carrying a proxy header is not."""
     httpd = make_server(_read_only(tmp_path), host="127.0.0.1", port=0,
                         surface_tokens={"browser": TOK, "flowconnect": FC})
     httpd.is_loopback_bind = False                          # what a real tailnet bind sets (no mesh interface here)

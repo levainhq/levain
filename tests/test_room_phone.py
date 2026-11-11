@@ -1,5 +1,5 @@
 """RM-H (CH-U2): the room on a phone and its foreground voice. STRUCTURAL ONLY: headless Chrome clamps the window width
-(spore-1066), so a 390 emulation proves the rules apply and nothing overflows, never how it looks. Residue (his iPhone): the layout in
+(intention-1066), so a 390 emulation proves the rules apply and nothing overflows, never how it looks. Residue (his iPhone): the layout in
 the Home Screen app, and whether any dictation control appears there at all."""
 from __future__ import annotations
 

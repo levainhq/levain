@@ -1,5 +1,5 @@
 """THE LIST's intake, end to end (levain 64 integration of L1 + L2): ``list_intake`` posted through the cockpit's own
-``dispatch`` on the List panel (wire id ``tray``), with a real broker, a real spore store and a real desk store in
+``dispatch`` on the List panel (wire id ``tray``), with a real broker, a real intention store and a real desk store in
 tmp dirs. Nothing here touches an operator's live apps."""
 
 from __future__ import annotations
@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from anneal_memory.spores import SporeStore
+from anneal_memory.spores import IntentionStore
 
 from levain import intake
 from levain.cockpit import list_panel
 from levain.cockpit.broker import Broker
-from levain.cockpit.effects import SporeEffectStore
+from levain.cockpit.effects import IntentionEffectStore
 from levain.cockpit.verbs import dispatch
 from levain.desk.store import CoordStore
 from levain.cockpit.verbs import _intake_outbox_id
@@ -29,8 +29,8 @@ def rig(tmp_path: Path) -> Rig:
 
 @pytest.fixture
 def broker(rig: Rig, tmp_path: Path):
-    spores = rig.root / ".levain" / "memory.spores.json"
-    b = Broker(tmp_path / "broker", stores={"spores": SporeEffectStore(spores)}, store_paths=[spores],
+    intentions = rig.root / ".levain" / "memory.spores.json"
+    b = Broker(tmp_path / "broker", stores={"intentions": IntentionEffectStore(intentions)}, store_paths=[intentions],
                install_class=INSTALL_CLASS, clock=lambda: NOW)
     b.start()
     try:
@@ -68,7 +68,7 @@ def test_a_talk_line_plants_a_talk_seed_through_the_panel(rig: Rig, broker: Brok
     sid = out["receipt"]["id"]
     assert out["receipt"]["kind"] == "talk" and sid
     assert out["receipt_line"] == f"talk {sid}"
-    row = SporeStore(rig.root / ".levain" / "memory.spores.json").get(sid)
+    row = IntentionStore(rig.root / ".levain" / "memory.spores.json", id_prefix="intention").get(sid)
     assert (row["disposition"], row.get("attention")) == ("seed", "talk")
 
 
@@ -79,7 +79,7 @@ def test_a_timed_drop_plants_an_agenda_for_the_desk_through_the_panel(rig: Rig, 
     assert out["receipt"] == {"kind": "drop", "id": sid, "fires": fires, "text": "call the dentist"}
     assert out["receipt_line"] == intake.receipt_line(out["receipt"])
     assert out["receipt_line"].startswith(f"scheduled drop {sid} fires ")
-    row = SporeStore(rig.root / ".levain" / "memory.spores.json").get(sid)
+    row = IntentionStore(rig.root / ".levain" / "memory.spores.json", id_prefix="intention").get(sid)
     assert (row["disposition"], row["target"], row["next"]) == ("agenda", "desk", fires)
 
 

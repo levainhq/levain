@@ -335,7 +335,7 @@ def test_the_entry_renders_the_band_outside_any_install_and_its_stop_verifies(ri
     assert "NEEDS YOU band" in sc and "posture" not in sc.lower()
     band = ctx(rig.run_entry("UserPromptSubmit", {"prompt": "hello"}, rig.outside))
     assert band.startswith("NEEDS YOU · 1 open") and "Which retry policy?" in band
-    assert "wrap nudge" not in band and "[spore" not in band.lower()          # band only
+    assert "wrap nudge" not in band and "[intention" not in band.lower()          # band only
     block = rig.run_entry("Stop", {"last_assistant_message": "done, nothing to add", "stop_hook_active": False}, rig.outside)
     assert json.loads(block)["decision"] == "block"                            # the reply dropped the band: reprint
     ok = rig.run_entry("Stop", {"last_assistant_message": band + "\n\ndone", "stop_hook_active": False}, rig.outside)

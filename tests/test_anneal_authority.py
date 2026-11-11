@@ -1,4 +1,4 @@
-"""spore-751: exactly one anneal is authoritative — the one levain's own interpreter imports.
+"""intention-751: exactly one anneal is authoritative — the one levain's own interpreter imports.
 
 Ruled by Phill 2026-09-13. `levain init` used to resolve anneal with
 `shutil.which("anneal-memory")` and wire that into the MCP registration, so a second
@@ -69,7 +69,7 @@ def test_resolve_anneal_bin_falls_back_to_the_interpreter_not_path(tmp_path, mon
 
 def test_the_resolved_script_and_the_module_are_the_same_anneal():
     """The hooks bake the script and the MCP server runs the module. If those two ever
-    report different versions, the split this spore closed is back."""
+    report different versions, the split this intention closed is back."""
     def version(cmd: list[str]) -> str:
         return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
 

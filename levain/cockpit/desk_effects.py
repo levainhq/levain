@@ -16,7 +16,7 @@ would create it.
 Known edges (closed as design, not code). The desk directory is resolved when the drop is written, not bound
 into the signed effect, so a pending signed under one LEVAIN_HOME and decided (or recovered) after a restart under
 another, with the same ledger root, writes to the second directory (the directory comes from the process
-environment, fixed for a server's life). The broker's local-filesystem check covers the spore and episode stores,
+environment, fixed for a server's life). The broker's local-filesystem check covers the intention and episode stores,
 not the desk directory (resolved per call).
 """
 

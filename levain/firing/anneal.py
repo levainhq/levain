@@ -410,7 +410,7 @@ class AnnealEntityFiring(AnnealFiring):
 
     Why the KIND carries isolation (not just env): ``firing_kind`` is a SERIALIZED field, so a
     ``fork()`` / reload rebuilds this as ``AnnealEntityFiring`` — never the laptop-defaulting
-    ``AnnealFiring``. The entity DIR rides the condenser's serialized ``entity_dir`` (spore-438), so a
+    ``AnnealFiring``. The entity DIR rides the condenser's serialized ``entity_dir`` (intention-438), so a
     fork rebuilds this firing on the SAME entity. A firing built with no entity has no store at all —
     there is no process-level entity to fall back to. The stores are re-derived and re-guarded per op,
     never frozen.

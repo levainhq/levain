@@ -728,7 +728,7 @@ def test_the_held_stop_and_doctors_commands_carry_the_one_recovery_note(env, cap
 
 
 def test_upgrade_holds_no_second_copy_of_the_recovery_note(monkeypatch):
-    """spore-1549: one producer. `_held_note` is doctor's text whole, even from a doctor read as a stub, and the
+    """intention-1549: one producer. `_held_note` is doctor's text whole, even from a doctor read as a stub, and the
     narrow fallback sentence upgrade once carried is nowhere in upgrade.py."""
     from levain import doctor
 

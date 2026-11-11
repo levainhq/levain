@@ -1,4 +1,4 @@
-"""levain.firing.encoding — the mojibake shield at the capture boundary (spore-373 blocker [2]).
+"""levain.firing.encoding — the mojibake shield at the capture boundary (intention-373 blocker [2]).
 
 Two obligations, and the SECOND is the harder one:
 

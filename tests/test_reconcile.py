@@ -482,7 +482,7 @@ class TestBrandRebakeOnUpdate:
 
 
 # --------------------------------------------------------------------------
-# seed OWNERSHIP across layers — spore-450: a pack reconciles only the files it wins
+# seed OWNERSHIP across layers — intention-450: a pack reconciles only the files it wins
 # --------------------------------------------------------------------------
 
 def _base_seed(name: str) -> bytes:
@@ -533,12 +533,12 @@ class TestSeedOwnership:
         assert "seed set changed" not in out  # the filename never left the roster
 
     def test_dropped_override_of_an_on_demand_seed_restores_and_flags_the_pointer(self, tmp_path):
-        pack = _write_pack(tmp_path / "p", name="p", seed={"spore_instructions.md": "# PACK\n"})
+        pack = _write_pack(tmp_path / "p", name="p", seed={"intention_instructions.md": "# PACK\n"})
         inst = _install_stack(tmp_path, [pack])
-        (pack / "seed" / "spore_instructions.md").unlink()
+        (pack / "seed" / "intention_instructions.md").unlink()
         out, _prov, _drifted, review = _reconcile(inst)
-        assert (inst / "seed" / "spore_instructions.md").read_bytes() == _base_seed(
-            "spore_instructions.md")
+        assert (inst / "seed" / "intention_instructions.md").read_bytes() == _base_seed(
+            "intention_instructions.md")
         assert review and "retained summary" in out
 
     def test_operator_edited_override_is_backed_up_before_the_restore(self, tmp_path):
@@ -770,7 +770,7 @@ def _set_order(pack: Path, name: str, order: int) -> None:
 
 class TestOrderChangeMovesAWin:
     """A pack `order` change alone moves which layer wins a filename while no seed
-    file changes (codex L3 r2 HIGH on spore-450). Reproduced through the CLI first:
+    file changes (codex L3 r2 HIGH on intention-450). Reproduced through the CLI first:
     the install kept the old winner's copy and every later update reported clean."""
 
     def _ab(self, tmp_path, *, wins=True):

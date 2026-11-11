@@ -117,7 +117,7 @@ def build_presence(kind: str, *, entity_dir: str | None = None) -> PresenceSourc
     """Rebuild a ``PresenceSource`` from its registered kind (used on fork / reload).
 
     ``entity_dir``: the per-conversation entity, exactly as :func:`levain.firing.contract.build_firing`
-    takes it (spore-438): only a kind registered with ``takes_entity=True`` receives it.
+    takes it (intention-438): only a kind registered with ``takes_entity=True`` receives it.
 
     Serialization-safe: fork/reload reconstruct from the kind ALONE. A kind may live in an OPTIONAL
     leaf that self-registers on import (:data:`_LAZY_PRESENCE_MODULES`); if it isn't registered yet

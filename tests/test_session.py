@@ -123,7 +123,7 @@ def test_exit_codes_are_distinct_and_stable():
 
 def test_turn_result_carries_no_task_success_field():
     """THE HONESTY FLOOR ON RESULTS. TurnResult must never grow a 'succeeded' / 'task_ok' field:
-    a confined entity cannot truthfully report on its own environment (spore-373 [5] — it
+    a confined entity cannot truthfully report on its own environment (intention-373 [5] — it
     reported '25 failed, 1617 passed' for a suite that was 1702/0 outside the sandbox). This
     test fails the moment someone adds one, which is the point.
 
@@ -133,7 +133,7 @@ def test_turn_result_carries_no_task_success_field():
     asserted about its own work. The forbidden list below is what a self-report looks like.
     Widening this set is fine; widening it with a self-report is the failure.
 
-    The K4a ⑥ addition (``timed_out``, ``spore-434``) is admissible for the same reason, and is
+    The K4a ⑥ addition (``timed_out``, ``intention-434``) is admissible for the same reason, and is
     arguably the purest case of it: it records that OUR OWN wall-clock timer fired. The agent has
     no input into it at all — indeed the whole point is that it holds even when the agent has
     stopped responding entirely, which is the one circumstance in which a self-report is guaranteed
@@ -749,7 +749,7 @@ def test_apply_drive_policy_handles_a_toolless_session(monkeypatch):
     assert _apply_drive_policy(None, "unattended") is True
 
 
-# ---------- the WALL-CLOCK BOUND reaches the driver (K4a ⑥, `spore-434`) ----------
+# ---------- the WALL-CLOCK BOUND reaches the driver (K4a ⑥, `intention-434`) ----------
 #
 # These exist because a mutation pass found the hole: removing the deadline from `run_task`
 # ENTIRELY, and deleting the branch that reports a timeout, both SURVIVED the suite. Nothing was

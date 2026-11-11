@@ -70,7 +70,7 @@ class VagusCondenser(CondenserBase):
 
     inner: CondenserBase
     firing_kind: str = "stub"
-    # spore-438. The entity THIS conversation serves, carried as serialized data on the condenser
+    # intention-438. The entity THIS conversation serves, carried as serialized data on the condenser
     # (it rides fork/reload with the kind) so an isolated firing is rebuilt against its own store.
     # There is no process-level entity to look up instead. ``None`` = rebuild from the kind alone.
     entity_dir: str | None = None

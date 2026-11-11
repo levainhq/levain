@@ -80,11 +80,11 @@ def _is_sign_facet(v: Any) -> bool:
 
 # name -> (type label, validator). The type label is documentation the diff script can print.
 FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
-    "disposition": ("enum", _enum("loop", "seed", "handoff", "agenda", "note")),
+    "disposition": ("enum", _enum("loop", "someday", "seed", "handoff", "agenda", "note")),
     "domain": ("str", _is_str),
     "tier": ("enum", _enum("hot", "warm", "cold", "parked")),
     "salience": ("int", _is_int),
-    "spore_type": ("str", _is_str),
+    "intention_type": ("str", _is_str),
     "age_days": ("int", _is_int),
     "due": ("date|null", _opt(_is_date)),
     "overdue_days": ("int", _is_int),
@@ -169,8 +169,8 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "agent_kind": ("enum", _enum("job", "role", "unreadable")),
     "session_view": ("object", lambda v: isinstance(v, dict)),   # K7: what the Build tab's session row draws (the provider's own measures, no full cwd)
     "session_activity": ("enum", _enum("active", "quiet")),   # Q7a: how recently a session's hook last fired (the provider's measure)
-    # THE LIST (levain.cockpit.list_panel): one view over band + board + spores, each row labelled with its surface
-    "surface": ("enum", _enum("band", "board", "spore", "talk", "drop")),
+    # THE LIST (levain.cockpit.list_panel): one view over band + board + intentions, each row labelled with its surface
+    "surface": ("enum", _enum("band", "board", "intention", "talk", "drop")),
     "fires": ("timed|null", _opt(_is_str)),      # a timed `next` (YYYY-MM-DDTHH:MM, local); null for a date-only or no `next`
     "overdue": ("bool", _is_bool),               # a timed next whose minute has passed, or a date-only next before today
     "target": ("str|null", _opt(_is_str)),       # an agenda's germinate target (desk, band, nudge, board:<repo>)
@@ -183,10 +183,10 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "band_age": ("str", _is_str),                # a band row's age in the footer's form ("1d6h"), from the host's refile clock
     "band_since": ("str", _is_str),              # the instant that age counts from: the page ticks the age text from it
     "band_later_words": ("Mon..Sun, optionally followed by MM-DD", _is_later_words),
-    # an open band row that rings an intention (the spore id): the row is then offered snooze, edit, done and clear in place
+    # an open band row that rings an intention (the intention id): the row is then offered snooze, edit, done and clear in place
     # of an answer box. Present only when the host can act on it
-    "intention": ("spore id", lambda v: _is_intention_id(v)),
-    "question_intention": ("spore id", lambda v: _is_intention_id(v)),
+    "intention": ("intention id", lambda v: _is_intention_id(v)),
+    "question_intention": ("intention id", lambda v: _is_intention_id(v)),
     "intention_text": ("str", _is_str),          # that reminder's own words (a List row only: the List carries words)
     "board_rank": ("int|null", _opt(_is_int)),
     "board_tier": ("str|null", _opt(_is_str)),
@@ -243,10 +243,10 @@ class Ordering:
     uncounted: frozenset[str] = frozenset()
 
 
-KERNEL_PREFIXES = frozenset({"spore", "time", "decision", "exposure", "crystal", "legacy"})
+KERNEL_PREFIXES = frozenset({"intention", "time", "decision", "exposure", "crystal", "legacy"})
 
 _TIER_ORDER = {"hot": 0, "warm": 1, "cold": 2, "parked": 3}
-_DISP_ORDER = {"handoff": 0, "seed": 1, "agenda": 2}
+_DISP_ORDER = {"handoff": 0, "someday": 1, "seed": 1, "agenda": 2}
 
 
 def parse_date(v: Any) -> date | None:
@@ -262,9 +262,9 @@ def parse_date(v: Any) -> date | None:
 
 
 def opened_day(v: Any) -> date | None:
-    """The one rule for "the day a spore was opened": the install's LOCAL calendar day of the stored instant (an ISO
+    """The one rule for "the day an intention was opened": the install's LOCAL calendar day of the stored instant (an ISO
     timestamp with a zone, parsed and converted), a date-only or zone-less string as written, None when unusable. Every
-    server view that counts a spore's age calls this, so none can count from a different day."""
+    server view that counts an intention's age calls this, so none can count from a different day."""
     if not isinstance(v, str):
         return None
     if v and len(v) <= 40:
@@ -433,7 +433,7 @@ def register_ordering(o: Ordering, *, builtin: bool = False) -> None:
 
 register_ordering(
     Ordering(
-        "spore.tray", _tray_order_key, _tray_group,
+        "intention.tray", _tray_order_key, _tray_group,
         (("overdue", "Overdue"), ("today", "Today"), ("also", "Also pending")),   # overdue leads: what is late is read first
         frozenset({"today", "overdue"}),
     ),
@@ -503,7 +503,7 @@ def _list_key(row: RowIn, today: date) -> tuple:
 
 register_ordering(
     Ordering(
-        "spore.list", _list_key, _list_group,
+        "intention.list", _list_key, _list_group,
         (("band", "Needs you (answer it in Decisions)"), ("desk", "Desk owes (the desk is on these; nothing for you)"),
          ("later", "Later"), ("overdue", "Overdue"), ("today", "Today"),
          ("board", "Ready for agents"), ("talk", "To talk through"), ("also", "Also pending"),
@@ -512,11 +512,11 @@ register_ordering(
     ),
     builtin=True,
 )
-register_ordering(Ordering("spore.loops", _loops_key), builtin=True)
+register_ordering(Ordering("intention.loops", _loops_key), builtin=True)
 # the removed Keep panel's ordering id (TS-5a): its key was identical to the loops key, so a downstream manifest that still
 # names it keeps registering and sorting the same way (an unknown ordering id refuses the whole registration)
-register_ordering(Ordering("spore.keep", _loops_key), builtin=True)
-register_ordering(Ordering("spore.age", _age_key), builtin=True)   # the Tray's "by age" view
+register_ordering(Ordering("intention.keep", _loops_key), builtin=True)
+register_ordering(Ordering("intention.age", _age_key), builtin=True)   # the Tray's "by age" view
 register_ordering(Ordering("time.desc", _time_desc_key), builtin=True)
 register_ordering(Ordering("decision.dated", _decision_key), builtin=True)
 register_ordering(

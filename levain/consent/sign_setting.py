@@ -1,6 +1,6 @@
 """levain.consent.sign_setting — whether a caller files its operator's answers as passkey sign requests at all.
 
-Ruled 2026-10-20 (Phill, at the desk, on the signed band, spore-1439): *"if it causes friction I am going to drop that
+Ruled 2026-10-20 (Phill, at the desk, on the signed band, intention-1439): *"if it causes friction I am going to drop that
 shit faster than a hot coal with sharp teeth and a biting problem AND make it something that you can opt out of in
 levain"*, then *"1d"*: only answers that AUTHORISE something are signed; the setting is off | authority-only | all.
 

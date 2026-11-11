@@ -6,7 +6,7 @@ copy of the same guard code: the security headers, the DNS-rebinding Host check,
 refusal, and (for the two with a write route) the cross-origin, JSON-only and Content-Length checks
 on a write. The copies drifted: a fix that moved the security headers into ``end_headers`` (so the
 stdlib's own error responses carry them too) reached two of the three, and ``levain serve`` answered
-an OPTIONS or PUT with a 501 that had no CSP, no ``nosniff`` and no ``X-Frame-Options`` (spore-1013,
+an OPTIONS or PUT with a 501 that had no CSP, no ``nosniff`` and no ``X-Frame-Options`` (intention-1013,
 reproduced 2026-10-03). Every guard now lives here once, in :class:`GuardedHandler`, and each server
 subclasses it. A server keeps only what is its own: its routes, its body limit, and the ORDER in which
 it applies the write checks. (Server-level setup, the allowed-hosts set and ``handle_error``, is still

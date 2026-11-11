@@ -48,8 +48,8 @@ def make_record(*, pid: str | None = None, intent: str = "sign", tier: str = "T2
                 version: int = 3, ttl: timedelta = timedelta(hours=1)) -> tuple[str, bytes]:
     pid = pid or new_pending_id()
     rec = build_record(
-        operation_id=pid, verb="spore_update", intent=intent,  # type: ignore[arg-type]
-        target={"kind": "row", "panel_id": "loops", "origin_key": "ok-0", "row_id": "spore-1",
+        operation_id=pid, verb="intention_update", intent=intent,  # type: ignore[arg-type]
+        target={"kind": "row", "panel_id": "loops", "origin_key": "ok-0", "row_id": "intention-1",
                 "expected_version": version},
         params=params if params is not None else {"text": "new 0"},
         effects=[effect(i, version) for i in range(n_effects)], tier=tier,
@@ -393,12 +393,12 @@ def test_a_reported_decision_records_allowed_reported_and_no_signer(db):
 def test_record_unit_writes_every_member_and_its_labels(db):
     pid = decided(db)
     out = db.record_unit(pid, [
-        UnitResult(0, "APPLIED", native_id="spore-9", labels=[("text", "h0")]),
+        UnitResult(0, "APPLIED", native_id="intention-9", labels=[("text", "h0")]),
         UnitResult(1, "UNAPPLIED", reason="changed")], now=T0 + timedelta(minutes=2))
     assert out.recorded
     view = db.load(pid)
     assert [(e.status, e.native_id, e.reason) for e in view.effects] == [
-        ("APPLIED", "spore-9", None), ("UNAPPLIED", None, "changed")]
+        ("APPLIED", "intention-9", None), ("UNAPPLIED", None, "changed")]
     label = db.label_for("ok-0", "text", "h0")
     assert label is not None and label.fired_at == view.decided_at and label.signer_fp == FP_PHONE
 
@@ -407,13 +407,13 @@ def test_a_unit_a_concurrent_settler_recorded_returns_its_result_and_inserts_no_
     pid = decided(db)
     other = raw_conn(db)
     other.execute("UPDATE effects SET status = 'APPLIED', "
-                  "native_id = CASE idx WHEN 0 THEN 'spore-7' END, "
+                  "native_id = CASE idx WHEN 0 THEN 'intention-7' END, "
                   "applied_at = '2026-10-10T12:01:30.000000Z' WHERE operation_id = ?", (pid,))
     other.close()
-    out = db.record_unit(pid, [UnitResult(0, "APPLIED", native_id="spore-9", labels=[("text", "h")]),
+    out = db.record_unit(pid, [UnitResult(0, "APPLIED", native_id="intention-9", labels=[("text", "h")]),
                                UnitResult(1, "APPLIED", labels=[("text", "h")])],
                          now=T0 + timedelta(minutes=2))
-    assert not out.recorded and [e.native_id for e in out.effects] == ["spore-7", None]
+    assert not out.recorded and [e.native_id for e in out.effects] == ["intention-7", None]
     with db.read() as conn:
         assert conn.execute("SELECT COUNT(*) FROM labels").fetchone()[0] == 0
 

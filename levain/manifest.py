@@ -9,7 +9,7 @@ sync:
   so they are levain-versioned.
 
 ``pip``'s solver is structurally blind to the *methodology-content* alignment: a
-new anneal feature (e.g. the ``spores`` prospective layer) can land as a
+new anneal feature (e.g. the ``intentions`` prospective layer) can land as a
 **conflict** with an operator's stale, hand-tuned methodology instructions even
 when the library API is fully compatible. That is the drift that broke an early
 adopter's install — the library upgraded, the methodology did not, and a feature
@@ -97,9 +97,9 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # said 0.9.7 for nineteen days. What follows is HISTORY of what each entry required,
 # not a second declaration of the cap.
 #
-# Through 0.9.6 (spore-218 — the AM-WRAP-GENERATED reconcile on the
-# spore-216 crystal-recall base). The seed genuinely incorporates every migration
-# entry through this version: the spores boundary (0.4.7 AM-SPORES-BOUNDARY), the
+# Through 0.9.6 (intention-218 — the AM-WRAP-GENERATED reconcile on the
+# intention-216 crystal-recall base). The seed genuinely incorporates every migration
+# entry through this version: the intentions boundary (0.4.7 AM-INTENTIONS-BOUNDARY), the
 # `levain update` upgrade habit (0.4.7 AM-MIGRATE-NOTIFY), the bare-path demotion
 # fix (0.4.8 AM-PRESERVE-BARE-PATH — a transparent engine fix, no template edit
 # required), the crystallized-pattern tier (0.7.1 AM-CRYSTAL) and its MCP read
@@ -285,7 +285,7 @@ def declared_set() -> CompatSet:
 # ---------------------------------------------------------------------------
 
 # The first levain release whose lock records the anneal its own interpreter imports
-# (spore-751). Locks from earlier releases recorded whichever `anneal-memory` PATH found.
+# (intention-751). Locks from earlier releases recorded whichever `anneal-memory` PATH found.
 # ⚠ `_cmp` ignores `.devN`, so a lock written by a 0.4.7.dev0 build from before 751 merged
 # is treated as post-751; that affects dev installs only.
 _FIRST_SINGLE_ANNEAL_LEVAIN = "0.4.7"
@@ -295,7 +295,7 @@ def anneal_invocation(*args: str) -> str:
     """The command an operator should TYPE to reach the anneal levain's interpreter imports.
 
     For advice strings only. A bare `anneal-memory` resolves through PATH, which can name a
-    different anneal from the one serving the store: the split `spore-751` ended in the
+    different anneal from the one serving the store: the split `intention-751` ended in the
     code and left standing in the remediation text (Diogenes LOW, 2026-09-14).
 
     Pass the real arguments: all of them are shell-quoted together, so an install path
@@ -316,7 +316,7 @@ def pip_invocation() -> str:
 def resolve_anneal_bin() -> str:
     """The ``anneal-memory`` console script of the anneal THIS interpreter imports.
 
-    ``spore-751``, ruled 2026-09-13: exactly one anneal is authoritative, and it
+    ``intention-751``, ruled 2026-09-13: exactly one anneal is authoritative, and it
     is the one levain's own interpreter (``sys.executable``) resolves. It used to be
     ``shutil.which("anneal-memory")``, which returns whatever PATH finds first. On a
     machine with a second anneal earlier on PATH, init wired THAT one into the hooks
@@ -547,7 +547,7 @@ def compute_drift(
     ):
         if lock.levain and _cmp(lock.levain, _FIRST_SINGLE_ANNEAL_LEVAIN) < 0:
             # ⚖ 2026-09-14, option 3: the exit code stays, the TEXT names the likely
-            # cause. A pre-spore-751 levain recorded whichever `anneal-memory` came first on
+            # cause. A pre-intention-751 levain recorded whichever `anneal-memory` came first on
             # PATH, so a mismatch here is most likely a second anneal on PATH at lock-write
             # time, not an upgrade (measured on a scratch-HOME upgrade from published 0.4.6).
             verdicts.append(AxisVerdict(
@@ -859,7 +859,7 @@ def write_lock(
     """Atomically record the composed set to ``.levain/manifest.json``.
 
     Unique-tmp + file fsync + ``os.replace`` + directory fsync — the full
-    atomic-write invariant anneal's marker / spore stores use, so a concurrent
+    atomic-write invariant anneal's marker / intention stores use, so a concurrent
     writer or a crash mid-write cannot leave a torn lock. Stamps ``recorded_at``
     (UTC ISO-8601) for provenance.
 

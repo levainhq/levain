@@ -10,7 +10,7 @@ import pytest
 
 from levain.cockpit import Cockpit, ProviderSpec, Read
 from levain.cockpit.results import Fault
-from tests.test_cockpit_f12b_topology_view import MID, NARROW, TV, _paint, _run, _spore, _value
+from tests.test_cockpit_f12b_topology_view import MID, NARROW, TV, _paint, _run, _intention, _value
 from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_k7_build import DESKTOP, _sessions_fixture
 from tests.test_cockpit_topology import _good, _panel
@@ -130,7 +130,7 @@ def test_the_provider_value_is_refused_when_parents_form_a_cycle():
 @needs_browser
 def test_a_renderer_that_throws_leaves_the_list_and_one_line_not_a_dead_card(tmp_path, monkeypatch):
     root, src = _sessions_fixture(tmp_path, monkeypatch)
-    _spore(root)
+    _intention(root)
     probe = ("JSON.stringify({rows: document.querySelectorAll('#k7-sessions .k7-srow').length, tv: !!%s, "
              "text: document.querySelector('#ck-hlens').innerText.replace(/\\s+/g, ' ')})") % TV
     out = _run(tmp_path, src, [{"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
