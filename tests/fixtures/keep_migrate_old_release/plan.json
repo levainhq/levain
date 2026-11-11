@@ -1,0 +1,130 @@
+{
+  "kind": "keep-migrate",
+  "schema": 1,
+  "plan_id": "keep-20261109T120000Z",
+  "created": "2026-11-09T12:00:00+00:00",
+  "spores_json": "/var/folders/3_/69qtc6w96kxb6b0l61yl5bhr0000gn/T/oldplan-tyokfbgh/memory.spores.json",
+  "episodic_db": "/var/folders/3_/69qtc6w96kxb6b0l61yl5bhr0000gn/T/oldplan-tyokfbgh/memory.db",
+  "options": {
+    "handoff_to": "seed",
+    "agenda_date": null
+  },
+  "counts": {
+    "items": 3,
+    "notes": 1,
+    "handoffs": 1,
+    "agendas": 1
+  },
+  "items": [
+    {
+      "index": 0,
+      "spore_id": "spore-001",
+      "origin_key": "a1f3f34b4ae84e3e94af5c51e9e85cf8",
+      "disposition": "note",
+      "text": "gotcha: never run `foo --all` on the prod box",
+      "notes": [
+        "[2026-11-11] bit me twice"
+      ],
+      "created": "2026-11-11",
+      "row": {
+        "id": "spore-001",
+        "type": "thought",
+        "text": "gotcha: never run `foo --all` on the prod box",
+        "domain": "",
+        "tier": "warm",
+        "salience": 0,
+        "seen": "2026-11-11",
+        "next": null,
+        "created": "2026-11-11",
+        "status": "open",
+        "resolution": null,
+        "pointer": null,
+        "notes": [
+          "[2026-11-11] bit me twice"
+        ],
+        "origin_key": "a1f3f34b4ae84e3e94af5c51e9e85cf8",
+        "disposition": "note"
+      },
+      "destination": {
+        "kind": "episode",
+        "episode_type": "observation",
+        "body": "- gotcha: never run `foo --all` on the prod box — cues: gotcha, never, prod\n\nnotes on the item:\n- [2026-11-11] bit me twice",
+        "tags": [
+          "keep-migrated",
+          "durable-fact"
+        ]
+      },
+      "why": "a fact, command or gotcha: an observation episode in Durable Facts form for the next wrap to place",
+      "state": "pending",
+      "result": null
+    },
+    {
+      "index": 1,
+      "spore_id": "spore-002",
+      "origin_key": "3b1a7e543a0e4ec6abf542484bae5741",
+      "disposition": "handoff",
+      "text": "pick up the Liz thread",
+      "notes": [],
+      "created": "2026-11-11",
+      "row": {
+        "id": "spore-002",
+        "type": "task",
+        "text": "pick up the Liz thread",
+        "domain": "",
+        "tier": "warm",
+        "salience": 0,
+        "seen": "2026-11-11",
+        "next": null,
+        "created": "2026-11-11",
+        "status": "open",
+        "resolution": null,
+        "pointer": null,
+        "notes": [],
+        "origin_key": "3b1a7e543a0e4ec6abf542484bae5741",
+        "disposition": "handoff"
+      },
+      "destination": {
+        "kind": "spore",
+        "disposition": "seed",
+        "next": null
+      },
+      "why": "legacy handoff to a seed: the agent sees it in the Tray at session start (T10a)",
+      "state": "pending",
+      "result": null
+    },
+    {
+      "index": 2,
+      "spore_id": "spore-003",
+      "origin_key": "95b6705508784be7a3bed393c5a676a3",
+      "disposition": "agenda",
+      "text": "an undated agenda",
+      "notes": [],
+      "created": "2026-11-11",
+      "row": {
+        "id": "spore-003",
+        "type": "thought",
+        "text": "an undated agenda",
+        "domain": "",
+        "tier": "warm",
+        "salience": 0,
+        "seen": "2026-11-11",
+        "next": null,
+        "created": "2026-11-11",
+        "status": "open",
+        "resolution": null,
+        "pointer": null,
+        "notes": [],
+        "origin_key": "95b6705508784be7a3bed393c5a676a3",
+        "disposition": "agenda"
+      },
+      "destination": {
+        "kind": "spore",
+        "disposition": "seed",
+        "next": null
+      },
+      "why": "undated agenda never germinates: becomes a seed (SD-15, decided)",
+      "state": "pending",
+      "result": null
+    }
+  ]
+}

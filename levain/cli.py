@@ -1480,6 +1480,9 @@ def build_parser() -> argparse.ArgumentParser:
     from levain.desk.door import not_door as _not_door
 
     _not_door(km_p)
+    # what `levain intentions` really has, kept for the refusal of the retired command (see `main`): a pointer cannot name
+    # a verb the parser lacks
+    parser.intentions_verbs = tuple(intentions_sub.choices)  # type: ignore[attr-defined]
 
     iso_p = subparsers.add_parser(
         "setup-isolation",
@@ -1678,6 +1681,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    from levain.intention_legacy import OLD_CLI_COMMAND
+
+    words = list(sys.argv[1:] if argv is None else argv)
+    if words[:1] == [OLD_CLI_COMMAND]:
+        return _refuse_retired_spores(words[1:], parser.intentions_verbs)  # type: ignore[attr-defined]
     args = parser.parse_args(argv)
     from levain.launch import api_key_lifted
 
@@ -2138,9 +2146,26 @@ def _cmd_tui(args: argparse.Namespace) -> int:
     return run_tui(path=args.path, read_only=args.read_only, manifest=args.manifest)
 
 
+def _refuse_retired_spores(rest: list[str], verbs: tuple[str, ...]) -> int:
+    """``levain spores <rest>``, the retired command (ruling H10): exit 2 and the same line under ``levain intentions``.
+    ``main`` answers it before argparse runs: the parser has no ``spores`` command (a doc or hook teaching it fails its
+    parse), and a parser tombstone could not take a leading option (``levain spores -h``, ``spores --path X germinate``).
+    It writes nothing, so it needs no guard from the desk's door."""
+    import shlex
+
+    if rest and rest[0] in verbs:
+        pointer = shlex.join(["levain", "intentions", *rest])
+        print(f"levain spores: retired, spores are called intentions now. Run `{pointer}`.", file=sys.stderr)
+    else:
+        print("levain spores: retired, spores are called intentions now. Its verbs moved under "
+              f"`levain intentions <verb>`, where <verb> is one of: {', '.join(verbs)}.", file=sys.stderr)
+    return 2
+
+
 def _cmd_intentions_keep_migrate(args: argparse.Namespace) -> int:
     from levain import keep_migrate as km
     from levain.dashboard import AnnealPaths
+    from levain.intention_legacy import KEEP_PLAN_STORE_KEY
 
     act = args.apply or args.revert
     if act is not None and (args.handoff_to is not None or args.agenda_date is not None):
@@ -2165,7 +2190,7 @@ def _cmd_intentions_keep_migrate(args: argparse.Namespace) -> int:
             print(f"Nothing was changed. Apply with: levain intentions keep-migrate --apply {out}")
             return 0
         doc = km.load_plan(act)
-        rec_sp, rec_ep = doc.get("spores_json"), doc.get("episodic_db")
+        rec_sp, rec_ep = doc.get(KEEP_PLAN_STORE_KEY), doc.get("episodic_db")
         wrong = []
         if rec_sp is not None and Path(str(rec_sp)).expanduser().resolve() != paths.intentions_json.resolve():
             wrong.append(f"intention store {rec_sp} (--path install: {paths.intentions_json})")

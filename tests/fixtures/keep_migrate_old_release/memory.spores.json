@@ -1,0 +1,59 @@
+{
+  "spores": [
+    {
+      "id": "spore-001",
+      "type": "thought",
+      "text": "gotcha: never run `foo --all` on the prod box",
+      "domain": "",
+      "tier": "warm",
+      "salience": 0,
+      "seen": "2026-11-11",
+      "next": null,
+      "created": "2026-11-11",
+      "status": "open",
+      "resolution": null,
+      "pointer": null,
+      "notes": [
+        "[2026-11-11] bit me twice"
+      ],
+      "origin_key": "a1f3f34b4ae84e3e94af5c51e9e85cf8",
+      "disposition": "note"
+    },
+    {
+      "id": "spore-002",
+      "type": "task",
+      "text": "pick up the Liz thread",
+      "domain": "",
+      "tier": "warm",
+      "salience": 0,
+      "seen": "2026-11-11",
+      "next": null,
+      "created": "2026-11-11",
+      "status": "open",
+      "resolution": null,
+      "pointer": null,
+      "notes": [],
+      "origin_key": "3b1a7e543a0e4ec6abf542484bae5741",
+      "disposition": "handoff"
+    },
+    {
+      "id": "spore-003",
+      "type": "thought",
+      "text": "an undated agenda",
+      "domain": "",
+      "tier": "warm",
+      "salience": 0,
+      "seen": "2026-11-11",
+      "next": null,
+      "created": "2026-11-11",
+      "status": "open",
+      "resolution": null,
+      "pointer": null,
+      "notes": [],
+      "origin_key": "95b6705508784be7a3bed393c5a676a3",
+      "disposition": "agenda"
+    }
+  ],
+  "resolved": [],
+  "schema_version": 1
+}
