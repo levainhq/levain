@@ -140,6 +140,29 @@ def test_med1_the_migration_itself_refuses_without_a_backup(tmp_path, monkeypatc
     assert not (tmp_path / "backups").exists() and paths.intentions_json.read_bytes() == before
 
 
+def test_e2_the_migration_backup_is_git_ignored(install):
+    """1111-32 E2: the copy of the private store under .levain/backups/intentions/ is covered by .levain/.gitignore."""
+    import subprocess
+
+    _plant_open_seed(install)
+    gi = install / ".levain" / ".gitignore"
+    gi.write_text("\n".join(ln for ln in (gi.read_text(encoding="utf-8").splitlines() if gi.is_file() else [])
+                            if ln.strip() != "backups/") + "\n", encoding="utf-8")   # an install that never backed up a seed
+    assert run_update(install, no_pip=True, emit=lambda s: None) == 0
+    (backup,) = _backups(install)
+    assert "backups/" in gi.read_text(encoding="utf-8").splitlines()
+    subprocess.run(["git", "init", "-q", str(install)], check=True)
+    r = subprocess.run(["git", "-C", str(install), "check-ignore", "-q", str(backup)])
+    assert r.returncode == 0, "the store copy would be committable"
+
+
+def test_e2_an_install_with_nothing_to_migrate_gets_no_line(install):
+    gi = install / ".levain" / ".gitignore"
+    before = gi.read_text(encoding="utf-8") if gi.is_file() else None
+    assert run_update(install, no_pip=True, emit=lambda s: None) == 0
+    assert (gi.read_text(encoding="utf-8") if gi.is_file() else None) == before
+
+
 def test_g2_the_reconcile_path_also_defers(install, monkeypatch):
     """A drifted pack takes the long path through `_run_update`; the deferral is there too."""
     from types import SimpleNamespace

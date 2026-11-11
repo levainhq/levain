@@ -13,7 +13,8 @@ What the migration does, in order, and what it refuses:
    REFUSES the migration here, before any copy: nothing is copied or rewritten.
 2. It copies the store file to ``<store dir>/backups/intentions/<store file name>.<UTC time>`` while holding the store's
    own lock (the sibling ``<store>.lock`` anneal serialises every write on), and checks the copy equals the bytes it read.
-   A backup that cannot be written REFUSES the migration: nothing is rewritten.
+   A backup that cannot be written REFUSES the migration: nothing is rewritten. The default backup place is git-ignored
+   first (``backups/`` in the store dir's ``.gitignore``).
 3. For each open ``seed`` record it calls anneal's ``update(disposition="someday", expect_disposition="seed")``: one
    transaction under the store lock per record, compare-and-set on the disposition, so a record that moved since step 1
    (resolved, re-routed, edited by a concurrent writer) is skipped and named in the report, never overwritten. Only the
@@ -110,6 +111,12 @@ def migrate_seed_to_someday(paths: Any, *, now: datetime | None = None,
         return report
     when = now or datetime.now(timezone.utc)
     dest_dir = Path(backup_dir) if backup_dir is not None else store_path.parent.joinpath(*BACKUP_SUBDIR)
+    if backup_dir is None:
+        # the copy is the private store's bytes: in a repo-tracked install it must not be committable (1111-32 E2), the
+        # same `backups/` line the seed-file backups add to the store dir's .gitignore (best-effort, as theirs)
+        from levain.install import _ensure_gitignored
+
+        _ensure_gitignored(store_path.parent, BACKUP_SUBDIR[0] + "/")
     try:
         report.backup = _backup(store_path, dest_dir, when)
     except OSError as exc:
