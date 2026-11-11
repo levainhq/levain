@@ -9,11 +9,19 @@ where node or srt is absent, and a gate that silently skips is not a gate. junit
 
 from __future__ import annotations
 
+import os
 import sys
 import xml.etree.ElementTree as ET
 
 
 def main(path: str) -> int:
+    if not os.path.isfile(path):
+        print(
+            f"ERROR: the marker step never produced its report ({path}): the marker step did not run or failed "
+            "before writing it. Look at the marker step above, not at this one.",
+            file=sys.stderr,
+        )
+        return 1
     root = ET.parse(path).getroot()
     skipped, xfailed, bad, total = [], 0, 0, 0
     for case in root.iter("testcase"):
