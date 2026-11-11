@@ -18,10 +18,30 @@ The six checks, each mapped from flow's ``dream.py`` ``gate``:
 3. no wrap since the dream-day's start, apart from the one wrap each of this agent's ``done`` occurrences for OTHER
    dream-days made
 4. something to consolidate
-5. no live session: no live desk launch, no work thread in ``awake.json``, no other session in anneal's
-   session registry (a hooked Claude Code session heartbeats there). Waived for a manual run
+5. live seats are NOTED, never refused (D1-L1, D1_design section 3.4; PLAN D1's 10-30 amendment: the dream runs at
+   the operator's time WITH seats live). The check still reads the three places a seat shows (a live desk launch, a
+   work thread in ``awake.json``, another session in anneal's session registry, which a hooked Claude Code session
+   heartbeats into) and names what it found in its detail, so ``levain dream ready`` and the card can say who was
+   live; it always passes, and a source it could not read is named in the detail, not turned into a refusal (nothing
+   in the verdict rests on this list any more). A manual run is no different
 6. the window's one scheduled attempt is not already spent (a launched run that failed or was stopped). Waived for a
    manual run: the catch-up is the remedy for exactly that failure, and check 1's ceiling bounds it
+
+**Why a live seat no longer needs a refusal (what carries the safety instead).**
+
+* *The episode set is frozen at ``prepare_wrap``, never by a clock.* anneal stores the frozen list of episode ids
+  (``wrap_episode_ids``) with the wrap; a seat's capture while the wrap is open is recorded with a later session id,
+  so it is outside that set, survives the save, and is listed by ``Store.episodes_since_wrap()`` as the next wrap's
+  input (a delay, never a loss). This module reads episodes that way and only that way: check 4 counts
+  ``episodes_since_wrap()``, and nothing here compares an episode timestamp with a clock.
+* *The store turns ON ``consolidate_requires_baton``.* ``levain init`` creates a Levain install's store with the
+  policy (anneal 1.0, KL-19) and claims the baton for :data:`SESSION_ID` (``levain.install._ensure_baton``, repeated by
+  ``levain update``); the dream consolidates as that session (``executor.consolidate_store`` passes the session id
+  exactly when the store reports the policy). So with seats live a seat can capture but cannot consolidate: anneal's
+  ``prepare_wrap`` downgrades any session that is not the baton's holder to capture-only, and check 2 refuses a dream
+  while the baton is anyone else's. Without the policy only ``wrap.lock`` would stop a second handle's tokenless save,
+  which is why check 2 states it rather than assuming it.
+* *Check 2 still refuses an open wrap.* A seat that is itself mid-wrap is a wrap in progress, not a live seat.
 """
 from __future__ import annotations
 
@@ -67,7 +87,7 @@ class Check:
     status: str            # pass | quiet | unreadable | waived
     detail: str
     kind: str = ""         # for a quiet: already-dreamed, ceiling, in-flight, wrap-open, baton, consolidated-today,
-    #                        nothing-to-consolidate, live-seat, attempt-spent
+    #                        nothing-to-consolidate, attempt-spent (never "live-seat": check 5 no longer answers quiet)
 
     def as_dict(self) -> dict[str, Any]:
         return {"n": self.n, "name": self.name, "status": self.status, "detail": self.detail, "kind": self.kind}
@@ -272,10 +292,12 @@ def _check4(src: Sources) -> Check:
     return Check(4, name, "pass", f"{n} episode(s) since the last wrap")
 
 
-def _check5(src: Sources, manual: bool) -> Check:
-    name = "no live session"
-    if manual:
-        return Check(5, name, "waived", "a manual run waives the live-session check (flow's --now fallback)")
+CHECK5_NAME = "live seats noted, not a gate"
+
+
+def _check5(src: Sources) -> Check:
+    """Name the live seats and PASS (see the module docstring, check 5): the dream runs with seats live. Never raises
+    and never answers quiet or unreadable: nothing in the verdict rests on this list."""
     found: list[str] = []
     bad: list[str] = []
     for label, fn in (("desk launch", src.launches), ("awake.json work thread", src.awake_threads),
@@ -287,12 +309,26 @@ def _check5(src: Sources, manual: bool) -> Check:
             continue
         if ids:
             found.append(f"{label}: {', '.join(str(i) for i in ids)[:120]}")
+    parts: list[str] = []
     if found:
-        return Check(5, name, QUIET, "; ".join(found), "live-seat")
+        parts.append("seats live, the dream runs with them (" + "; ".join(found) + "); a capture made after "
+                     "prepare_wrap is outside the frozen episode set and is the next dream's input")
+        try:
+            if not _guard(src.requires_baton, "the baton policy"):
+                parts.append("this store does NOT require the consolidate baton, so with seats live only anneal's "
+                             "wrap state and wrap.lock keep a seat's own consolidate out; `levain init` creates a store "
+                             "that requires it")
+        except SourceUnreadable:
+            pass                                          # check 2 reads the same source and answers for it
+    elif bad:
+        parts.append("no live seat found in the sources that could be read")
+    else:
+        parts.append("no live desk launch, work thread or hooked session")
     if bad:
-        return Check(5, name, UNREADABLE, "; ".join(bad))
-    return Check(5, name, "pass", "no live desk launch, work thread or hooked session"
-                 + (f" ({'; '.join(src.absent)})" if src.absent else ""))
+        parts.append("not every source could be read, and none gates the dream: " + "; ".join(bad))
+    if src.absent:
+        parts.append("; ".join(src.absent))
+    return Check(5, CHECK5_NAME, "pass", " | ".join(parts))
 
 
 def _check6(src: Sources, agent: str, key: str, manual: bool) -> Check:
@@ -321,7 +357,7 @@ def evaluate(src: Sources, *, day: date, now: datetime, zone: str, agent_id: str
         (2, "baton free, no open wrap", lambda: _check2(src)),
         (3, "no consolidate yet for the day", lambda: _check3(src, agent_id, key, day, zone)),
         (4, "something to consolidate", lambda: _check4(src)),
-        (5, "no live session", lambda: _check5(src, manual)),
+        (5, CHECK5_NAME, lambda: _check5(src)),
         (6, "the window's attempt is not spent", lambda: _check6(src, agent_id, key, manual)),
     ]
     checks: list[Check] = []
