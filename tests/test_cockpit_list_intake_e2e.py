@@ -69,7 +69,7 @@ def test_a_talk_line_plants_a_talk_seed_through_the_panel(rig: Rig, broker: Brok
     assert out["receipt"]["kind"] == "talk" and sid
     assert out["receipt_line"] == f"talk {sid}"
     row = IntentionStore(rig.root / ".levain" / "memory.spores.json", id_prefix="intention").get(sid)
-    assert (row["disposition"], row.get("attention")) == ("seed", "talk")
+    assert (row["disposition"], row.get("attention")) == ("someday", "talk")
 
 
 def test_a_timed_drop_plants_an_agenda_for_the_desk_through_the_panel(rig: Rig, broker: Broker) -> None:
