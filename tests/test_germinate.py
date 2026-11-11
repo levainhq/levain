@@ -221,7 +221,7 @@ def test_an_undated_agenda_a_future_one_and_non_agendas_are_never_due(tmp_path, 
     store = guarded_intention_store(_intentions(root))
     undated = store.add(type="thought", text="someday", disposition="agenda")
     future = _add(root, "later", nxt=FUTURE)
-    seed = _add(root, "a seed", disposition="seed")
+    seed = _add(root, "a seed", disposition="someday")
     loop = guarded_intention_store(_intentions(root)).add(type="thought", text="plain loop", next=PAST)
     today = _add(root, "today counts", nxt=TODAY.isoformat())
     res = _run(root, qdir)
