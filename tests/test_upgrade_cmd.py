@@ -171,6 +171,14 @@ def test_no_isolation_install_runs_pip_and_stops(env, capsys):
     env.runner.calls.clear()
     rc, out = env.run(capsys, no_pip=True)
     assert rc == 0 and "No Levain isolation install" in out and env.runner.calls == []
+    _says_update_each_install(out)
+
+
+def _says_update_each_install(out: str) -> None:
+    """1111-32 G3: an upgrade replaces the package and touches no install, and there is no `levain spores` shim (D5), so
+    the closing output names the next step and why: an install's old hook still calls `levain spores germinate`."""
+    assert "run `levain update` in each Levain install" in out
+    assert "`levain spores germinate`" in out and "refuses" in out and "do not ring" in out
 
 
 # 4
@@ -418,6 +426,7 @@ def test_ok_prints_done_and_pending_lines(env, capsys):
     assert rc == 0 and "Done: the root side runs 9.9.9" in out and GEN in out
     assert out.index("Done:") < out.index("pending: runtime-helper verbs") and "levain update" in out
     assert "progress" not in out
+    _says_update_each_install(out)
 
 
 # 15

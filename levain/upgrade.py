@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+from levain.intention_legacy import OLD_CLI_COMMAND
 from levain.slot import SUDO
 
 EXIT_OK, EXIT_REFUSED, EXIT_HELD, EXIT_WAITED_OUT, EXIT_INTERNAL = 0, 1, 3, 4, 70
@@ -874,6 +875,7 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool,
 
     if not isolated:
         print("No Levain isolation install on this machine; nothing else to upgrade.")
+        print(_UPDATE_EACH_INSTALL)
         return EXIT_OK
     assert uid is not None
     _package_names(pkg)
@@ -894,6 +896,17 @@ def _run_upgrade(s: Seams, no_pip: bool, dry_run: bool, verbose: bool,
     # when the installer found nothing newer. `--dry-run` shows both generations without sudo.
     print("Updating the root side (stops and restarts Levain's services). sudo will ask for your password.")
     return _sudo(s, pkg, gen, verbose)
+
+
+# The closing line of a successful upgrade (1111-32 G3). An upgrade replaces the package and touches no install, so each
+# install keeps the hooks it was given until `levain update` re-writes them. A hook from before the spore -> intention
+# rename starts `levain spores germinate` when an agenda is due; this release refuses that command (exit 2, no shim by
+# ruling D5), so until the install is updated a due agenda files no band row at session start.
+_UPDATE_EACH_INSTALL = (
+    "Now run `levain update` in each Levain install: an upgrade does not touch installs, and until `levain update` "
+    f"replaces its hooks, a hook from before the rename still starts `levain {OLD_CLI_COMMAND} germinate`, which this "
+    "release refuses, so agendas that come due do not ring at session start (`levain doctor` warns of one once its "
+    "date has passed).")
 
 
 def _generation(s: Seams, pkg: str, h11: Path) -> Optional[str]:
@@ -938,7 +951,7 @@ def _sudo(s: Seams, pkg: str, gen: Optional[str], verbose: bool) -> int:
         for ln in errs:
             if ln.startswith(_PENDING):
                 print(ln)
-        print("Each Levain install: run `levain update` in it to refresh its hooks.")
+        print(_UPDATE_EACH_INSTALL)
         return EXIT_OK
     print(f"refused {reply.get('refused', '?')}")
     for ln in errs[-_STDERR_TAIL:]:
