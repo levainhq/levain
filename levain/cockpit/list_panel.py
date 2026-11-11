@@ -61,6 +61,7 @@ LIST_FACETS = INTENTION_FACETS | frozenset({
     "source", "repo", "held_until", "intention", "intention_text", "band_section", "band_carried", "band_age", "band_since", "band_later_words",
     "agenda_blocked", "time_state", "wake_day", "wake_bucket", "wake_line", "done_on", "done_kind",
     "kept_line", "kept_at", "kept_type", "kept_source",
+    "on_event", "check_by", "after", "after_text", "then",
 })
 SURFACES = ("band", "board", "intention", "talk", "drop", "kept")
 KEPT_PREFIX = "kept:"             # a kept row's id (an episode id behind it): never an ``intention:`` id, so no intention verb applies
@@ -141,6 +142,27 @@ def _wake_facets(day: date, today: date, surface: str, target: Any, disposition:
             "wake_line": f"wakes {band_view.later_words(wake_day, today.isoformat())} \u2192 {_lands(surface, target, disposition)}"}
 
 
+def _event_facets(raw: dict[str, Any], today: date, steer: dict[str, dict[str, Any]], surface: str, target: Any,
+                  disposition: str) -> tuple[dict[str, Any], bool]:
+    """``(facets, is_later)`` for an open agenda that waits on an event (the second part of a split): what it waits on, the
+    first part's words when that part is still open, the check-by day, and the line the List prints. It sits in LATER until its
+    check-by day, and is NOW from then on."""
+    anchor = intentions.event_anchor(raw)
+    cb = parse_date(raw.get("check_by")) if intentions.valid_check_by(raw.get("check_by")) else None
+    first = steer.get(anchor or "", {})
+    words = " ".join(str(first.get("text") or "").split())[:80] if first else ""
+    facets: dict[str, Any] = {"on_event": raw.get("on_event"), "check_by": cb.isoformat() if cb else None,
+                              "after": anchor, "after_text": words or None}
+    lands = _lands(surface, target, disposition)
+    if cb and cb > today:
+        wake_day, bucket = _wake(cb, today)
+        facets.update({"time_state": "later", "wake_day": wake_day, "wake_bucket": bucket,
+                       "wake_line": f"on {raw.get('on_event')}, check by {band_view.later_words(cb.isoformat(), today.isoformat())} \u2192 {lands}"})
+        return facets, True
+    facets.update({"time_state": "now", "wake_line": f"still waiting on {raw.get('on_event')}"})
+    return facets, False
+
+
 def _intention_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool], *, apply_hold: bool = True,
                 ringing: frozenset[str] = frozenset()) -> _Part:
     """``ringing`` = the band rows the band read returned: an open agenda whose stamp names one of them is that row's
@@ -184,7 +206,13 @@ def _intention_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool],
         fires, overdue = _timing(s.next, now, ctx.today)
         extra: dict[str, Any] = {"surface": surface, "fires": fires, "overdue": overdue, "target": target,
                                  "attention": raw.get("attention") if isinstance(raw.get("attention"), str) else None}
-        if is_later:
+        waits = [i for i, r in steer.items() if r.get("on_event") == intentions.done_event(s.id)]
+        if waits:
+            extra["then"] = waits      # the second parts that wait on this item finishing
+        if raw and intentions.is_event_agenda(raw):
+            ev, is_later = _event_facets(raw, ctx.today, steer, surface, target, s.disposition)
+            extra.update(ev)
+        elif is_later:
             extra.update(_wake_facets(d, ctx.today, surface, target, s.disposition))
         elif not d and ((surface == "intention" and s.disposition in ("someday", "seed")) or s.disposition == "agenda"):
             extra["time_state"] = "someday"          # an undated seed or agenda: it is never due mechanically
