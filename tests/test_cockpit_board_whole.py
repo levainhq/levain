@@ -7,8 +7,8 @@ The frame is the other way round: ready is a POSITIVE whole-board signal, `html[
 board is drawn or when no whole draw is coming (a failed or refused read), never on a partial draw, and the partial board is drawn inert
 (the regions the draw replaces carry `inert`, dimmed) so nothing can be done on it.
 
-The partial window is made long by delaying every panel read after the first four (the core: activity, state, begin, decisions) to a fixed
-moment after the page started, so each state can be read in it. Steps in that window say `"partial": true` (the driver otherwise waits for
+The partial window is made long by holding every panel read after the first four (the core: activity, state, begin, decisions) until the
+test releases them from the page, so each state can be read in it and the window lasts exactly as long as the test needs. Steps in that window say `"partial": true` (the driver otherwise waits for
 the positive signal before every step)."""
 from __future__ import annotations
 
@@ -19,12 +19,16 @@ from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_k4a_needs import DESKTOP
 
-# every panel read after the first four distinct ones waits until HOLD_MS after the document began; the core four answer at once, so the board
-# draws a part, and the rest land together at the release. The init step reloads the page once; this runs in the reloaded document.
-HOLD_MS = 9000
-DELAY = """(() => { const f = window.fetch; const seen = new Set(); const t0 = Date.now(); window.fetch = async (...a) => {
+# every panel read after the first four distinct ones is held until the test calls window.__releasePanels() (a step of its own); the core four
+# answer at once, so the board draws a part, and the rest land together at the release. The partial window therefore lasts exactly as long as
+# the test needs, with no wall clock to lose on a loaded runner (the one bound is the page's own per-panel timeout, PANEL_TIMEOUT_MS in
+# dashboard_boot.js: a read held longer than that fails, so the steps before the release must finish inside it). `__held` counts the held
+# reads started and answered. The init step reloads the page once; this runs in the reloaded document.
+DELAY = """(() => { const f = window.fetch; const seen = new Set(); let open = null; const gate = new Promise((r) => { open = r; });
+  window.__releasePanels = () => { open(); return 1; }; window.__held = { started: 0, done: 0 };
+  window.fetch = async (...a) => {
   const u = String(a[0]);
-  if (u.indexOf('/cockpit/panel/') === 0) { seen.add(u); if (seen.size > 4) await new Promise((r) => setTimeout(r, Math.max(0, t0 + HOLD - Date.now()))); }
+  if (u.indexOf('/cockpit/panel/') === 0) { seen.add(u); if (seen.size > 4) { window.__held.started++; await gate; const r = await f.apply(window, a); window.__held.done++; return r; } }
   return f.apply(window, a); };
   // what the page looked like at the moment the signal appeared (a mutation observer runs right after the task that set the attribute): how many
   // elements were still inert, and how many tiles the widgets region held
@@ -32,7 +36,8 @@ DELAY = """(() => { const f = window.fetch; const seen = new Set(); const t0 = D
   new MutationObserver(() => { if (document.documentElement.hasAttribute('data-board-whole') && !window.__wholeLog.length)
     window.__wholeLog.push({ inert: document.querySelectorAll('[inert]').length, tiles: document.querySelectorAll('#ck-widgets .ck-card').length }); })
     .observe(document, { attributes: true, subtree: true, attributeFilter: ['data-board-whole'] });   // the init script runs before <html> exists
-})();""".replace("HOLD", str(HOLD_MS))
+})();"""
+RELEASE = "window.__releasePanels()"
 
 # the regions the draw replaces (dashboard_boot.js BOARD_REGIONS): #board holds the zones, and its siblings hold the hero, the Needs strip, the
 # notes, the brief and the widgets (the tiles), where a reader first acts. The masthead and the nav are not among them, and neither is the
@@ -86,14 +91,15 @@ def test_a_partial_board_is_inert_and_not_whole_and_the_whole_draw_is_live_and_s
             {"eval": STATE, "partial": True},
             {"tap": AT_CARD, "before": LISTEN, "ms": 5000, "partial": True},
             {"eval": HITS, "partial": True},
+            {"eval": RELEASE, "partial": True},
             {"until": WHOLE_UP, "ms": 60000, "partial": True},
             {"eval": STATE, "partial": True},
             {"eval": "JSON.stringify(window.__wholeLog)", "partial": True},
             {"tap": AT_CARD, "before": "window.__hits = []", "ms": 5000},
             {"eval": HITS},
         ])["values"]
-    assert len(out) == 9, out
-    part, hits_part, whole, whole_log, hits_whole = (json.loads(out[i]) for i in (1, 3, 5, 6, 8))
+    assert len(out) == 10, out
+    part, hits_part, whole, whole_log, hits_whole = (json.loads(out[i]) for i in (1, 3, 6, 7, 9))
     assert part["whole"] is False and part["tiles"] > 0, part
     assert part["inert"] == part["present"] and "ck-widgets" in part["inert"] and "board" in part["inert"], part   # every region the draw replaces
     assert float(part["opacity"]) < 1, part                                   # inert has no look of its own: the part is dimmed
@@ -115,18 +121,23 @@ def test_a_whole_draw_deferred_for_an_open_editor_leaves_the_part_inert_and_the_
     after the editor closes. (The signal is never set on a claim the board will not be replaced: the deferred draw would falsify it.)"""
     ADD_EDITOR = "(() => { const e = document.createElement('div'); e.className = 'state-editor'; e.id = 'fake-editor'; document.body.appendChild(e); return 1; })()"
     DROP_EDITOR = "(() => { document.getElementById('fake-editor').remove(); return 1; })()"
-    LATE = f"new Promise((r) => setTimeout(() => r(1), {HOLD_MS + 6000}))"      # past the release of the held panels, with the editor still open
+    # past the release of the held panels, with the editor still open: wait until every held read has been answered, then a settle in which the
+    # whole draw would have landed had the editor not deferred it (a longer settle only strengthens the test; the correct code never draws)
+    SETTLED = ("new Promise((r) => { const t0 = Date.now(); const tick = () => { const h = window.__held; "
+               "if (h.started > 0 && h.done >= h.started) setTimeout(() => r(1), 3000); else if (Date.now() - t0 > 20000) r(0); else setTimeout(tick, 100); }; tick(); })")
     with _boot(tmp_path) as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"init": DELAY}, DESKTOP,
             {"until": PART_UP, "ms": 40000, "partial": True},
             {"eval": ADD_EDITOR, "partial": True},
-            {"eval": LATE, "partial": True},
+            {"eval": RELEASE, "partial": True},
+            {"eval": SETTLED, "partial": True},
             {"eval": STATE, "partial": True},
             {"eval": DROP_EDITOR, "partial": True},
             {"until": WHOLE_UP, "ms": 60000, "partial": True},
             {"eval": STATE, "partial": True},
         ])["values"]
-    held, landed = json.loads(out[3]), json.loads(out[6])
+    assert out[3] in (1, "1"), out                                                  # every held read was answered before the state was read
+    held, landed = json.loads(out[4]), json.loads(out[7])
     assert held["whole"] is False and held["inert"] == held["present"], held      # the panels have all landed, the draw is deferred: still a part
     assert landed["whole"] is True and landed["inert"] == [], landed
