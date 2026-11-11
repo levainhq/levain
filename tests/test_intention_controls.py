@@ -104,7 +104,7 @@ def test_list_an_intention_band_row_gets_the_four_and_a_machine_row_none(host_ri
     rows = rig.rows()
     assert _verbs(rows["band:np-ring0001"]) == FOUR
     assert rows["band:np-ring0001"]["facets"]["intention"] == "spore-9"
-    assert _verbs(rows["band:np-plain002"]) == set()        # read-only, as every band row was
+    assert _verbs(rows["band:np-plain002"]) == {"band_agenda"}      # a plain row's one verb; none of the four
 
 
 def test_an_older_host_without_intention_act_offers_nothing_new(tmp_path: Path) -> None:
@@ -112,7 +112,7 @@ def test_an_older_host_without_intention_act_offers_nothing_new(tmp_path: Path) 
     rig.ck.attach_question_rows(OlderHost())
     assert _verbs(_decision(rig, 11)) == {"question_answer"}
     assert "question_intention" not in _decision(rig, 11)["facets"]
-    assert _verbs(rig.rows()["band:np-ring0001"]) == set()
+    assert _verbs(rig.rows()["band:np-ring0001"]) == {"band_agenda"}        # an older host's row rings nothing: a plain row
 
 
 def test_the_intention_verbs_never_land_on_an_answered_row_or_a_machine_row(host_rig) -> None:

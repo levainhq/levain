@@ -139,7 +139,19 @@
  "refresh_every_s": null,
  "rows": [
   {
-   "actions": [],
+   "actions": [
+    {
+     "escalates": [],
+     "gesture": "direct",
+     "target": {
+      "panel_id": "tray",
+      "row_id": "band:q-0001",
+      "row_version": "<row_version>"
+     },
+     "tier": "C1",
+     "verb": "band_agenda"
+    }
+   ],
    "badges": [
     {
      "kind": "age_days",

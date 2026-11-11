@@ -406,6 +406,9 @@ _INTENTION_ROW = lambda r: ((str(r.get("id", "")).startswith("question:")   # no
                              and _facet(r, "question_state") == "open" and _facet(r, "question_intention") is not None)
                             or (str(r.get("id", "")).startswith("band:") and _facet(r, "intention") is not None))
 
+# a List band row that rings no reminder: a machine-filed row, whatever its section or whether it is snoozed
+_PLAIN_BAND_ROW = lambda r: str(r.get("id", "")).startswith("band:") and _facet(r, "intention") is None   # noqa: E731
+
 
 # the kernel's agent-text rows on the composed decisions panel: (row-id prefix, the facet only the kernel writes, the
 # one verb the row offers). Each pair binds BOTH ways: the row offers only its verb, and the verb fires only on it
@@ -891,6 +894,20 @@ def _intention_fire(action: str) -> Callable[..., dict[str, Any]]:
     return fire
 
 
+def _band_agenda_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
+    """The List's band row to agenda: both acts, in order, in :func:`levain.band_agenda.defer`. ``today`` is the request's own
+    snapshot day, the one the window is judged on."""
+    from levain import band_agenda
+
+    store = target.get("questions")
+    if store is None:
+        raise EditError("not_built", 501, "this cockpit has no question store")
+    if set(params) != {"day"}:
+        raise EditError("bad_request", 400, "band_agenda takes exactly the day")
+    return band_agenda.defer(questions=store, spores_json=scope.anneal.spores_json, ledger_root=scope.ledger_root,
+                             question_id=str(target["row"]["id"])[len("band:"):], day=params["day"], today=target["today"])
+
+
 def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
     """Answer the NEEDS YOU band by its shorthand (Q17-ALL S5a): ``{text, store_id, view_id}``, recorded once per
     item, unsigned, channel ``cockpit``, viewer ``cockpit:<credential>``, only while that view is still the viewer's
@@ -1074,6 +1091,12 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("intention_clear", "Clear", "drops the reminder behind this row: the row closes and the reminder is dropped",
              "row", floor="C1", tier_fn=_const("C1"), confirm_required=True, reversible=False,
              fire=_intention_fire("clear"), applies_to=_INTENTION_ROW),
+    # a plain open band row (no reminder behind it): an agenda for a day past the snooze window, then the row answered. confirm as
+    # spore_keep (the answer is irreversible); NOT device_ok (a device's C1 is a broker pending, and a two-act verb has no broker effect)
+    VerbSpec("band_agenda", "Make an agenda", "plants a dated agenda from this row's words that wakes it back into the band on that "
+             "day, then answers the row so the stopped agent waits: for a day past the snooze window", "row", fields=("day",),
+             floor="C1", tier_fn=_const("C1"), confirm_required=True, reversible=False, fire=_band_agenda_fire,
+             applies_to=_PLAIN_BAND_ROW),
     VerbSpec("band_answer", "answer", "records your shorthand answers to the NEEDS YOU band and sends them to the "
              "agents (it authorises nothing)", "create", fields=("text", "store_id", "view_id"), floor="C1",
              tier_fn=_const("C1"), reversible=False, fire=_band_fire),
@@ -1558,7 +1581,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
                               # the credential's name: the viewer a band answer binds to (``cockpit:<name>``)
                               "credential": str(credential.get("name") or ""),
                               # an at-most-once kernel fire's key (the List's sort names its desk drop by it)
-                              "idempotency_key": req.get("idempotency_key"),
+                              "idempotency_key": req.get("idempotency_key"), "today": today,
                               # whether the request came from a paired device, asked of that device's store (a review
                               # verb writes only for one), and where the desk store is (the directory the review
                               # panel reads)
