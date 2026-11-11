@@ -34,7 +34,7 @@ from typing import Any, NamedTuple
 from levain.desk import work_delta
 from levain.desk.store import (REPLY_WINDOW_HOURS, UNREPLIED_AFTER_MINUTES, UNREPLIED_SHOWN_DAYS, CoordError,
                                       CoordStore, next_gseq)
-from levain.desk.legacy import ROLE_DESK, SQL_KIND_DESK_REPLY
+from levain.desk.legacy import ROLE_DESK, SQL_KIND_DESK_REPLY, role_word
 
 __all__ = ["REPLY_MAX", "DropReply", "Unreplied", "VIEWER", "replies", "unreplied", "unreplied_line", "write_reply"]
 
@@ -121,7 +121,9 @@ def write_reply(store: CoordStore, drop_id: str, text: str, *, token: object) ->
                 conn.execute("INSERT INTO intake_views (open_id, via, ref, at) VALUES (?, 'drop_reply', ?, ?)",
                              (delta.intake_open, reply_id, now))
     except sqlite3.IntegrityError as exc:
-        raise CoordError(f"refused: {exc}") from exc
+        # the trigger's text is stored schema and keeps the stored role value; the operator reads the desk word
+        why = str(exc).replace(f"{ROLE_DESK} reply", f"{role_word(ROLE_DESK)} reply")
+        raise CoordError(f"refused: {why}") from exc
     return DropReply(reply_id, drop_id, gseq, now, body["surface"], body["received_at"], text, block, since, delta.through)
 
 

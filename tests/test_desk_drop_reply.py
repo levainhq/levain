@@ -105,7 +105,8 @@ def test_a_second_reply_to_one_drop_is_refused_by_the_trigger(qdir, store, token
     d = _drop(store)
     code, _out, _err = _cli(qdir, d, "first", token, capsys)
     assert code == 0
-    with pytest.raises(sqlite3.IntegrityError, match="one desk reply"):
+    # the trigger's text is stored schema (CREATE TRIGGER IF NOT EXISTS): it keeps the stored role value
+    with pytest.raises(sqlite3.IntegrityError, match=f"one {ROLE_DESK} reply"):
         _insert(qdir, d, _stamp(datetime.now(timezone.utc)))
     code, _out, err = _cli(qdir, d, "second", token, capsys)
     assert code == 1 and "one desk reply" in err
