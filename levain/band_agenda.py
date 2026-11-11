@@ -96,7 +96,7 @@ def target_block(questions: Any, q: Any) -> str | None:
     """:func:`question_block` for a row read by ``get``, judged as the List judges it. A host store's ``get`` may project less
     than its ``open_questions`` (flow's ``NeedsQuestions.get`` never carries the ``sign_request`` its ``open_questions``
     attaches), so on a host store a row ``get`` shows unsigned is judged again on its ``open_questions`` entry. A listing that
-    cannot be read blocks the row."""
+    cannot be read, or that does not list the row, blocks it (:data:`BLOCK_UNREADABLE`)."""
     code = question_block(q)
     if code is not None:
         return code
@@ -108,7 +108,9 @@ def target_block(questions: Any, q: Any) -> str | None:
         listed = next((o for o in questions.open_questions() if getattr(o, "id", None) == q.id), None)
     except Exception:  # noqa: BLE001 - the signing facts cannot be read, so the row is not offered a write
         return BLOCK_UNREADABLE
-    return question_block(listed) if listed is not None else None
+    if listed is None:      # get shows it but the listing omits it: its signing facts are unknown, so it fails closed
+        return BLOCK_UNREADABLE
+    return question_block(listed)
 
 
 def agenda_origin_key(question_id: str) -> str:
@@ -212,7 +214,7 @@ def _row_state(questions: Any, question_id: str, words: str) -> tuple[str | None
         return ROW_OPEN, None
     value = getattr(ans, "value", None)
     if (getattr(ans, "kind", None) == "text" and getattr(ans, "channel", None) == "cockpit" and isinstance(value, str)
-            and value.strip() == words.strip()):
+            and value == words):        # exact: the native store keeps answer text verbatim, so padded words are another answer
         return ROW_OURS, ans
     return ROW_OTHER, ans
 
@@ -255,7 +257,8 @@ def defer(*, questions: Any, intentions_json: Path, ledger_root: Path, question_
         raise EditError("source_unavailable", 503, "the row could not be read as a question (it has no id): nothing was planted")
     block = target_block(questions, q)
     if block == BLOCK_UNREADABLE:
-        raise EditError("source_unavailable", 503, "the row's signing facts cannot be read now: nothing was planted")
+        raise EditError("source_unavailable", 503, "the row's signing facts cannot be read now (the band listing cannot be read, "
+                                                   "or does not list this row): nothing was planted")
     if block == BLOCK_SIGNS:
         raise EditError("needs_signature", 409, "this row is settled by signing: sign it, or answer it on its own sheet in "
                                                 "Decisions; nothing was planted")
@@ -311,12 +314,19 @@ def defer(*, questions: Any, intentions_json: Path, ledger_root: Path, question_
         why = str(raised) if raised is not None else "the host returned, but the row is still open"
         after.refuse("answer_refused", f"the row was not answered ({why})", why)
     _deliver(questions, q.id)                 # ROW_OURS: the deferral landed (its host may still have raised after it)
-    edit_id = _audit_verb(ledger_root, kind="band_agenda", action="band_agenda", target=f"intention:{aid}", now=now,
-                          extra={"question": q.id, "day": planted, "origin_key": key})
+    warnings: list[str] = []
+    if raised is not None:
+        warnings.append(f"the host raised after recording this deferral ({raised}); delivery to the agent was started")
+    try:            # the deferral landed and delivery started: a lost audit line is named, never a 500 in place of the receipt
+        edit_id = _audit_verb(ledger_root, kind="band_agenda", action="band_agenda", target=f"intention:{aid}", now=now,
+                              extra={"question": q.id, "day": planted, "origin_key": key})
+    except Exception as exc:  # noqa: BLE001
+        edit_id = ""
+        warnings.append(f"the audit line could not be written ({type(exc).__name__}: {exc})")
     line = f"-> Later, wakes {planted} · band ({aid})"
     if earlier:
         line += f"; planted earlier, so that day stands (you asked for {day})"
-    warning = str(raised) if raised is not None else None
+    warning = "; ".join(warnings) or None
     return {"ok": True, "id": edit_id, "source": f"intention:{aid}", "action": "band_agenda", "agenda": aid,
             "day": planted, "question": q.id, "receipt_line": line, **({"earlier_day_kept": True} if earlier else {}),
             **({"warning": warning} if warning else {})}
@@ -352,9 +362,12 @@ class _After:
             if code == "stale":
                 tail += ": compost it if it is not wanted"
             raise EditError(code, 409, f"{head}; {tail}")
-        fate, detail = _compensate(self.store, self.key, self.version,
-                                   f"band_agenda aborted: the row {self.q_id} did not take the deferral answer ({why})",
-                                   self.today)
+        try:        # whatever the store raises, the refusal and its audit line still go out
+            fate, detail = _compensate(self.store, self.key, self.version,
+                                       f"band_agenda aborted: the row {self.q_id} did not take the deferral answer ({why})",
+                                       self.today)
+        except Exception as exc:  # noqa: BLE001
+            fate, detail = "failed", f"{type(exc).__name__}: {exc}"
         mine = f"the agenda this attempt planted ({self.aid})"
         tail = {
             "composted": f"{mine} was composted, so nothing remains planted",
@@ -378,23 +391,26 @@ def _compensate(store: Any, key: str, version: str | None, note: str, today: dat
     (detail: the error). Every write is compare-and-set on the version, so an intention another writer moved is never composted."""
     from anneal_memory.spores import IntentionApply, IntentionError, PostconditionFailed, intention_version
 
-    def where(expect: str | None) -> tuple[str, str] | None:
+    def read(expect: str | None) -> tuple[tuple[str, str] | None, Any]:
+        """(the fate, when the intention is not open at ``expect``; the intention read)."""
         cur = store.get_by_origin_key(key)
         if cur is None:
-            return "deleted", ""
+            return ("deleted", ""), None
         if cur.get("status") != "open":
             kind = str((cur.get("resolution") or {}).get("kind") or cur.get("status"))
-            return ("already", "") if kind == "composted" else ("resolved", kind)
+            return (("already", "") if kind == "composted" else ("resolved", kind)), cur
         if expect is None or intention_version(cur) != expect:
-            return "touched", ""
-        return None
+            return ("touched", ""), cur
+        return None, cur
+
+    def where(expect: str | None) -> tuple[str, str] | None:
+        return read(expect)[0]
 
     expect = version
     try:
-        found = where(expect)
+        found, cur = read(expect)       # ONE read: the versioned update below catches any change after it
         if found is not None:
             return found
-        cur = store.get_by_origin_key(key)
         noted = store.update(cur["id"], add_note=note, expected_version=expect, today=today)
         expect = intention_version(noted)
         got = store.apply(IntentionApply(op="descend", origin_key=key, spore_id=cur["id"],      # ``spore_id``: anneal's own field
