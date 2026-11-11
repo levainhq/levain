@@ -76,7 +76,7 @@ function makeEnv(over) {
   const ls = Object.assign({}, over.local || { levain_write_token: "tok" });
   const localStorage = { getItem: (k) => (k in ls ? ls[k] : null), setItem: (k, v) => { ls[k] = String(v); }, removeItem: (k) => { delete ls[k]; } };
   let n = 0;
-  const resp = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body, clone() { return this; } });
+  const resp = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body, headers: { get: () => null }, clone() { return this; } });
   const env = { posts, reads, renders, ss, fx };
   env.verbAnswers = over.verbAnswers || [];
   async function fetchFn(url, init) {

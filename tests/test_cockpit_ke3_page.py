@@ -63,7 +63,7 @@ function makeEnv(over) {
   const posts = [], renders = [];
   const store = () => { const m = {}; return { getItem: (k) => (k in m ? m[k] : null), setItem: (k, v) => { m[k] = String(v); }, removeItem: (k) => { delete m[k]; } }; };
   let n = 0;
-  const resp = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body, clone() { return this; } });
+  const resp = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body, headers: { get: () => null }, clone() { return this; } });
   async function fetchFn(url, init) {
     if (init && init.method === "POST") {
       const body = JSON.parse(init.body);
