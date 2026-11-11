@@ -133,6 +133,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     en.add_argument("--replace-install", action="store_true",
                     help="Allow this enable to turn an existing live install into a shadow, or a shadow into a live "
                          "one (refused without it: both answer to the same signed link).")
+    en.add_argument("--time", default=None, metavar="HH:MM",
+                    help="The time the dream starts, local to the install's zone (default 00:00). It must lie inside the "
+                         "22:00-05:00 window, with a minute from 00 to 19 (the dream is then tried again every 20 "
+                         "minutes until 05:00). The time is part of the signed spec: a changed time is a new spec "
+                         "(--revise) and needs a new signed link, and an enable that omits --time asks for 00:00.")
     en.add_argument("--revise", action="store_true", help="Write a new version when the stored spec differs.")
     en.add_argument("--json", action="store_true")
     en.set_defaults(func=run_dream_enable)
@@ -154,6 +159,11 @@ def run_dream_enable(args: argparse.Namespace) -> int:
     from levain.dream import agent as da
     from levain.dream import executor as ex
 
+    try:
+        when = da.validate_time(da.DEFAULT_TIME if args.time is None else args.time)
+    except da.TimeRefused as exc:
+        print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
+        return 1
     try:
         store = open_agent_store(args.agent_store_dir)
         zone = get_default_zone(store)
@@ -179,7 +189,7 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
             return 1
     try:
-        reg = da.register_dream(store, revise=args.revise, binding=binding)
+        reg = da.register_dream(store, revise=args.revise, binding=binding, time=when)
     except da.EnableRefused as exc:
         why = str(exc)
         # the advice is about a changed spec; a refusal that is the agent store's own (its schema marker) is printed alone
@@ -210,14 +220,15 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             card = da.shadow_signing_card_text(str(zone), flow_root=inst.shadow_flow_root,
                                                scratch=inst.store_path.parent, coord_dir=inst.coord_dir,
                                                agent_dir=store.directory, flow_instructions=inst.flow_instructions,
-                                               facts_path=inst.facts_path, model=inst.model, per_run_usd=r, night_usd=2 * r, expires=expires)
+                                               facts_path=inst.facts_path, model=inst.model, per_run_usd=r, night_usd=2 * r, expires=expires,
+                                               time=when)
         except da.InstallRefused as exc:
             card = f"The shadow install's facts cannot be read ({exc}); no fire runs until `levain dream enable` " \
                    "writes them again."
     else:
-        card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r, expires=expires)
+        card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r, expires=expires, time=when)
     doc = {"agent_id": reg.agent_id, "spec_hash": reg.spec_hash, "role_hash": reg.role_hash, "version": reg.version,
-           "created": reg.created, "zone": reg.zone, "signing_card": card,
+           "created": reg.created, "zone": reg.zone, "time": when, "signing_card": card,
            "install_facts": None if install_path is None else str(install_path), "install_kind": now,
            "replaced": replaced}
     if args.json:
