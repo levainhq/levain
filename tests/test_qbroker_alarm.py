@@ -241,6 +241,50 @@ def test_an_alarm_whose_append_failed_is_written_by_its_retry_and_charges_no_bud
     assert len([r for r in records(L) if "reason" in r]) == qbroker.ALARM_SLOT_BUDGET
 
 
+def _log_bytes(L):
+    path = L / "queue" / "requests" / ALARM_LOG
+    return path.read_bytes() if path.exists() else b""
+
+
+def test_an_append_cut_short_by_a_full_disk_leaves_no_prefix_for_the_retry_to_join(L, monkeypatch):
+    import errno
+    from levain.qbroker import store as store_mod
+    store = QueueStore(L / "queue")
+    store.append_alarm(_record("before", 0))
+    before = _log_bytes(L)
+    real_write = store_mod.os.write
+
+    def half_then_full(fd, data):
+        real_write(fd, bytes(data[:len(data) // 2]))
+        raise OSError(errno.ENOSPC, "No space left on device")
+    monkeypatch.setattr(store_mod.os, "write", half_then_full)
+    with pytest.raises(OSError):
+        store.append_alarm(_record("lost?", 1))
+    monkeypatch.setattr(store_mod.os, "write", real_write)
+    assert _log_bytes(L) == before
+    store.append_alarm(_record("lost?", 1))
+    assert [r["reason"] for r in records(L)] == ["before", "lost?"]
+
+
+def test_an_append_whose_fsync_failed_is_not_duplicated_by_its_retry(L, monkeypatch):
+    import errno
+    from levain.qbroker import store as store_mod
+    store = QueueStore(L / "queue")
+    store.append_alarm(_record("before", 0))
+    before = _log_bytes(L)
+    real_fsync = store_mod.os.fsync
+
+    def failing_fsync(fd):
+        raise OSError(errno.EIO, "I/O error")
+    monkeypatch.setattr(store_mod.os, "fsync", failing_fsync)
+    with pytest.raises(OSError):
+        store.append_alarm(_record("once", 1))
+    monkeypatch.setattr(store_mod.os, "fsync", real_fsync)
+    assert _log_bytes(L) == before
+    store.append_alarm(_record("once", 1))
+    assert [r["reason"] for r in records(L)] == ["before", "once"]
+
+
 def test_doctor_says_when_the_queue_is_not_searchable_by_this_user(L, broker, clock):
     alarm(broker)
     queue = L / "queue"
