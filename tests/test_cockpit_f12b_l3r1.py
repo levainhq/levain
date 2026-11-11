@@ -72,7 +72,7 @@ def test_a_topology_provider_faulted_at_load_is_said_in_the_sessions_card_in_eit
 
 
 @needs_browser
-def test_a_waiting_task_with_no_card_is_counted_and_only_a_card_can_be_jumped_to(tmp_path, monkeypatch):
+def test_a_waiting_task_with_no_card_is_counted_and_the_button_follows_the_live_strip_not_the_topologys_cards(tmp_path, monkeypatch):
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     v = _value()
     v["tasks"] = [t for t in v["tasks"] if t["id"] not in ("t-wait",)]
@@ -82,15 +82,18 @@ def test_a_waiting_task_with_no_card_is_counted_and_only_a_card_can_be_jumped_to
     probe = ("JSON.stringify({recs: %s.querySelectorAll('.tv-rec, .tv-wl').length, jump: [...%s.querySelectorAll('.tv-jump')].map(b => b.dataset.k), "
              "hdr: %s.querySelector('[data-k=waiting]').textContent.replace(/\\s+/g, ' ')})") % ((TV,) * 3)
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe},
-                               {"eval": TV + ".querySelector('.tv-jump').click(); window.__opened"}])
+                               {"eval": TV + ".querySelector('.tv-jump').click(); window.__first"}])
     got = json.loads(out[-2])
     assert got["hdr"] == "1 waiting on you" and got["recs"] == 0, got                                                    # counted, never listed
-    assert got["jump"] == ["waiting"] and out[-1] == "consent:abc", out                                                  # the waiting session still carries its card: the count goes there
+    assert got["jump"] == ["waiting"] and out[-1] == 1, out                                                              # the live strip holds a card: the count asks it to go there
     for nd in v["nodes"]:
-        nd["card"] = None                                                                                                # no card anywhere: the figure is counted but there is nowhere to jump
+        nd["card"] = None                                                                                                # no card anywhere in the topology: the strip is still what decides
     out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])
     got = json.loads(out[-1])
-    assert got["hdr"] == "1 waiting on you" and got["jump"] == [] and got["recs"] == 0, got
+    assert got["hdr"] == "1 waiting on you" and got["jump"] == ["waiting"] and got["recs"] == 0, got                    # the strip, not the topology's card ids, makes the button
+    out = _run(tmp_path, src, [{"eval": _paint(v, strip=False)}, {"eval": probe}])
+    got = json.loads(out[-1])
+    assert got["hdr"] == "1 waiting on you" and got["jump"] == [] and got["recs"] == 0, got                              # the strip holds no card: counted, nowhere to jump
 
 
 # --- codex MED + glm LOW + complement 7: one ResizeObserver --------------------------------------------------
