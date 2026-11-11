@@ -2471,6 +2471,8 @@
     host.replaceChildren(bar, el("p", "k7-none err", I.tfault ? "Topology unavailable: " + I.tfault : "The topology could not be drawn."));
     if (fail) hSig = "";
   }
+  // The strip says when its "can the header's button go to a card" answer flips (dashboard_core.js announceNeedsReach): the signature above carries it, so this repaint is a no-op otherwise.
+  if (typeof document.addEventListener === "function") document.addEventListener("levain-needs-reach", () => { try { paintHeaderLens(); } catch (_) { /* the header repaints on its next paint */ } });
   function paintBuildSessions() {
     const sec = k7Host();
     if (!sec) return;

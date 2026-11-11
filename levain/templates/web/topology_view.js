@@ -427,7 +427,7 @@
     if (jump) {
       waiting.type = "button";
       waiting.classList.add("tv-jump");
-      waiting.title = "Go to the first card in the Needs strip. Counts " + WAITING_TIP;
+      waiting.title = "Go to the first item in the Needs strip. Counts " + WAITING_TIP;
       // the strip may have moved since this was drawn: a jump it cannot make draws the lens again, and the figure is plain
       waiting.addEventListener("click", () => { if (!opts.openNeeds() && typeof opts.repaint === "function") opts.repaint(); });
     }

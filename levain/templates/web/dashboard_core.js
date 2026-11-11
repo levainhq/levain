@@ -7240,9 +7240,10 @@
     renderNeeds(needsViewRef);
     if (focusSel) { const n = host.querySelector(focusSel); if (n && typeof n.focus === "function") n.focus({ preventScroll: true }); }
   }
-  function setNeedsTab(key) {
+  // `viewOnly`: switch the tab for this page without writing the reader's saved choice (the Work lens's jump needs Needs you; it does not change what he keeps)
+  function setNeedsTab(key, viewOnly) {
     needsTabNow = key === "desk" ? "desk" : "you";
-    needsStore(false, NEEDS_TAB_KEY, needsTabNow);
+    if (!viewOnly) needsStore(false, NEEDS_TAB_KEY, needsTabNow);
     needsMoreOpen = false;
     rerenderNeeds('.needs-tab[data-needs-tab="' + needsTabNow + '"]');
   }
@@ -7315,7 +7316,17 @@
   function renderNeeds(view) {
     if (needsExpiryTimer) { window.clearTimeout(needsExpiryTimer); needsExpiryTimer = 0; }
     try { renderNeedsNow(view); }
-    finally { armNeedsExpiry(view); }
+    finally { armNeedsExpiry(view); announceNeedsReach(); }
+  }
+  // The Work lens's "waiting on you" button follows the strip: when the strip's answer to "can it go to a first card?" flips after a draw (a Decisions-only
+  // refresh emptied it, or it drew after the header did), the header is told so it repaints now, not at its next timer.
+  let needsReachSaid = null;
+  function announceNeedsReach() {
+    let now = false;
+    try { now = needsCanGoFirst(); } catch (e) { now = false; }
+    if (now === needsReachSaid) return;
+    needsReachSaid = now;
+    try { if (typeof document.dispatchEvent === "function" && typeof Event === "function") document.dispatchEvent(new Event("levain-needs-reach")); } catch (e) { /* the header repaints at its next paint */ }
   }
   function armNeedsExpiry(view) {
     if (typeof window.setTimeout !== "function") return;
@@ -7600,31 +7611,36 @@
   }
   // The strip's first waiting card, as the reader sees the strip NOW (the Work lens's "waiting on you" button asks the strip itself, not the topology):
   // the strip is on the page and holds a waiting item, and it is drawn as cards or as the bar. True is what the button needs to be there at all.
-  function needsCanGoFirst() {
-    const host = document.getElementById("ck-needs");
-    if (!host || host.hidden || host.dataset.waiting !== "1") return false;
-    const bar = host.querySelector(".needs-bar"), grid = host.querySelector(".needs-grid");
-    return !!((bar && bar.offsetParent) || (grid && grid.offsetParent));
-  }
-  // Light, scroll to and focus the first card the strip draws (its own order: questions first, then soonest to expire; the first row is never behind the fold).
-  // The Desk owes tab holds none of the waiting-on-you cards, so it is switched to Needs you through the strip's own tab helper first. On Build and Memory
-  // the strip is the bar: its first chip. False (nothing moved) when no such card is drawn.
-  function needsGoFirst() {
-    if (!needsCanGoFirst()) return false;
-    const host = document.getElementById("ck-needs");
+  // ONE predicate for both questions ("can it go?" and "go"): the strip's first visible waiting card ({node}) or chip ({node}), asked of the DOM as the reader sees it.
+  // On the Desk owes tab the waiting-on-you rows are detached: the answer is {node: null, viaTab: true} (the strip holds waiting items, Needs you is one tab away,
+  // and the page has the view it re-renders from). Null when the strip is hidden, holds nothing waiting, or draws an empty list (a stale flag over an empty grid).
+  function needsFirstTarget(host) {
+    if (!host || host.hidden || host.dataset.waiting !== "1") return null;
+    const visible = (list) => Array.prototype.find.call(list, (n) => n.offsetParent) || null;
     const bar = host.querySelector(".needs-bar");
-    const barShown = !!(bar && bar.offsetParent);
-    let node = null;
-    if (barShown) node = Array.prototype.find.call(bar.querySelectorAll(".needs-chip-btn"), (n) => n.offsetParent) || null;
-    else {
-      if (needsTabNow === "desk") setNeedsTab("you");
-      const on = host.querySelector(".needs-tab.is-on");
-      if (!on || on.dataset.needsTab !== "you") return false;       // the strip did not come to Needs you: the first row on screen would be a desk row
-      node = Array.prototype.find.call(host.querySelectorAll(".needs-grid .needs-row"), (n) => n.offsetParent) || null;
+    if (bar && bar.offsetParent) { const chip = visible(bar.querySelectorAll(".needs-chip-btn")); return chip ? { node: chip } : null; }
+    const grid = host.querySelector(".needs-grid");
+    if (!grid || !grid.offsetParent) return null;
+    const on = host.querySelector(".needs-tab.is-on");
+    if (on && on.dataset.needsTab === "desk") return needsViewRef ? { node: null, viaTab: true } : null;
+    const row = visible(grid.querySelectorAll(".needs-row"));
+    return row ? { node: row } : null;
+  }
+  function needsCanGoFirst() { return !!needsFirstTarget(document.getElementById("ck-needs")); }
+  // Light, scroll to and focus the first card the strip draws (its own order: questions first, then soonest to expire; the first row is never behind the fold).
+  // The Desk owes tab holds none of the waiting-on-you cards, so the strip is switched to Needs you for this view only (the saved tab choice is not overwritten).
+  // On Build the strip is the bar: its first chip. False (nothing moved) when no such card is drawn.
+  function needsGoFirst() {
+    const host = document.getElementById("ck-needs");
+    let t = needsFirstTarget(host);
+    if (!t) return false;
+    if (t.viaTab) {
+      setNeedsTab("you", true);
+      t = needsFirstTarget(host);
+      if (!t || !t.node) return false;
     }
-    if (!node) return false;
     for (const n of host.querySelectorAll(".needs-lit")) n.classList.remove("needs-lit");
-    needsLight(node, false, true);
+    needsLight(t.node, false, true);
     return true;
   }
 

@@ -916,3 +916,44 @@ def test_unattached_work_alone_is_drawn_and_no_empty_sentence_denies_it(tmp_path
     probe = "JSON.stringify({cards: %s.querySelectorAll('.tv-task').length, none: !!%s.querySelector('.tv-no-tasks')})" % (TV, TV)
     got = json.loads(_run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])[-1])
     assert got["cards"] == 1 and got["none"] is False, got
+
+
+# --- L3 round 2: one predicate, a button that follows the strip, a jump that keeps the saved tab ----------------------------
+
+
+@needs_browser
+def test_a_visible_empty_strip_with_a_stale_waiting_flag_gives_no_button(tmp_path, monkeypatch):
+    """L3 r2 (codex + deepseek): the button's availability is the same visible-row predicate the jump uses. A visible grid with no row left and the waiting
+    flag still "1" is not a card to go to: canGoFirst is false, goFirst moves nothing, and a lens drawn from it is a plain figure."""
+    src = _strip_page(tmp_path, monkeypatch)
+    out = _board(tmp_path, src, [
+        {"eval": "document.querySelectorAll('#ck-needs .needs-grid .needs-row').forEach(r => r.remove()); 1"},
+        {"eval": "JSON.stringify({flag: document.getElementById('ck-needs').dataset.waiting, grid: !!document.querySelector('#ck-needs .needs-grid').offsetParent, can: window.LevainNeeds.canGoFirst(), went: window.LevainNeeds.goFirst()})"},
+        {"eval": _paint_live(_waiting_value(2))}, {"eval": "JSON.stringify({btn: !!%s.querySelector('.tv-jump')})" % TV}])
+    state, lens = json.loads(out[-3]), json.loads(out[-1])
+    assert state == {"flag": "1", "grid": True, "can": False, "went": False}, state
+    assert lens == {"btn": False}, lens
+
+
+@needs_browser
+def test_a_refresh_that_empties_the_strip_takes_the_button_off_at_once(tmp_path, monkeypatch):
+    """L3 r2 (codex F1 skew, complement 1): a Decisions-only refresh (adoptPanel) that leaves the strip empty repaints the header without the button, with no
+    click and no timer to wait for."""
+    src = _strip_page(tmp_path, monkeypatch)
+    fresh = json.dumps({"layout": [{"id": "decisions"}], "extra_panels": {"decisions": {"lines": []}}, "targets": {"rows": {}, "panels": {}}})
+    # read in the SAME turn as the refresh: the header's own 1.5 s repaint timer would otherwise hide whether the strip told it
+    out = _board(tmp_path, src, [{"eval": "(() => { window.LevainDashboard.adoptPanel('decisions', %s); return JSON.stringify({flag: document.getElementById('ck-needs').dataset.waiting || null, "
+                                          "hidden: document.getElementById('ck-needs').hidden, btn: !!%s.querySelector('.tv-jump'), tag: %s.querySelector('[data-k=waiting]').tagName}); })()" % (fresh, TV, TV)}])
+    assert json.loads(out[-1]) == {"flag": None, "hidden": True, "btn": False, "tag": "SPAN"}, out
+
+
+@needs_browser
+def test_the_jump_from_desk_owes_does_not_overwrite_the_saved_tab(tmp_path, monkeypatch):
+    """L3 r2 (complement LOW 2): the jump shows Needs you for this view; the reader's saved choice (Desk owes) is not rewritten."""
+    src = _strip_page(tmp_path, monkeypatch)
+    stored = "(() => { try { return window.localStorage.getItem('levain.needs.tab'); } catch (e) { return 'unreadable'; } })()"
+    out = _board(tmp_path, src, [{"eval": "document.querySelector('#ck-needs [data-needs-tab=desk]').click(); 1"},
+                                 {"until": "document.querySelector('#ck-needs .needs-tab.is-on').dataset.needsTab === 'desk'", "ms": 10000},
+                                 {"eval": TV + ".querySelector('.tv-jump').click(); 1"}, {"until": "document.querySelector('#ck-needs .needs-lit')", "ms": 10000},
+                                 {"eval": "JSON.stringify({tab: document.querySelector('#ck-needs .needs-tab.is-on').dataset.needsTab, stored: %s})" % stored}])
+    assert json.loads(out[-1]) == {"tab": "you", "stored": "desk"}, out
