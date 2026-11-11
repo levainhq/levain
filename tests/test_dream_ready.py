@@ -187,7 +187,7 @@ def test_check1_a_manual_launch_counts_the_days_manual_runs_plus_the_window_hold
     ent.occurrence("failed", window="w:2026-11-02T22:00", launched=utc(2026, 11, 3, 3, 0))   # not held by 08:00
     v = ent.evaluate(now=now, manual=True)
     assert (v.check, v.kind) == (1, "ceiling")
-    assert status(v, 5) == "waived"
+    assert status(v, 5) == "pass"                                   # no longer waived: it never gates (D1-L1)
 
 
 # ---------------------------------------------------------------------------------------- check 2: baton, open wrap
@@ -286,22 +286,30 @@ def test_check4_no_episodes_is_quiet_and_names_nothing_to_consolidate(tmp_path):
 
 
 def test_check4_a_quiet_for_a_known_fact_outranks_an_unreadable_source(ent):
-    def break_launches(src):
-        src.launches = lambda: (_ for _ in ()).throw(OSError("dispatch.db is unreadable"))
+    def break_wraps(src):
+        src.wraps = lambda: (_ for _ in ()).throw(OSError("the wrap history is unreadable"))
 
-    v = Entity(ent.root / "b", episodes=0).evaluate(sources_patch=break_launches)
-    assert (v.verdict, v.check) == (rd.QUIET, 4) and status(v, 5) == "unreadable"
+    v = Entity(ent.root / "b", episodes=0).evaluate(sources_patch=break_wraps)
+    assert (v.verdict, v.check) == (rd.QUIET, 4) and status(v, 3) == "unreadable"
 
 
-# --------------------------------------------------------------------------------------- check 5: no live session
+# ------------------------------------------------------------- check 5: live seats are noted, never a gate (D1-L1)
+# Written from the run-first exercise on a scratch store (task 1111-25): before this change each live seat below made
+# the predicate answer quiet at check 5 (kind live-seat); the dream now runs with seats live, so each one is READY and
+# named in check 5's detail, while every other check still refuses with the seat live.
 
-def test_check5_a_pending_desk_launch_is_a_live_seat(ent):
+def c5(v: rd.Verdict) -> rd.Check:
+    return next(c for c in v.checks if c.n == 5)
+
+
+def test_check5_a_pending_desk_launch_is_noted_and_the_day_is_ready(ent):
     lid = ent.pending_launch()
     v = ent.evaluate()
-    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 5, "live-seat") and lid in v.reason
+    assert v.verdict == rd.READY and v.check is None, v.reason
+    assert c5(v).status == "pass" and lid in c5(v).detail and "seats live" in c5(v).detail
 
 
-def test_check5_an_active_desk_launch_is_a_live_seat(ent):
+def test_check5_an_active_desk_launch_is_noted_and_the_day_is_ready(ent):
     from levain.desk.store import CoordStore
 
     lid = ent.pending_launch()
@@ -310,23 +318,24 @@ def test_check5_an_active_desk_launch_is_a_live_seat(ent):
     cs.launch_activate(lid, harness_session_id="sess-1")
     assert lid in [ln.launch_id for ln in cs.launches_active()]
     v = ent.evaluate()
-    assert (v.check, v.kind) == (5, "live-seat") and lid in v.reason
+    assert v.verdict == rd.READY and lid in c5(v).detail
 
 
-def test_check5_a_work_thread_in_awake_json_is_a_live_seat_and_an_expired_hold_is_not(ent):
+def test_check5_a_work_thread_in_awake_json_is_noted_and_an_expired_hold_names_nothing(ent):
     ent.awake(["thr-1"])
     v = ent.evaluate()
-    assert (v.check, v.kind) == (5, "live-seat") and "thr-1" in v.reason
+    assert v.verdict == rd.READY and "thr-1" in c5(v).detail
     ent.awake(["thr-1"], until=NOW.timestamp() - 60)
-    assert ent.evaluate().verdict == rd.READY
+    v = ent.evaluate()
+    assert v.verdict == rd.READY and "thr-1" not in c5(v).detail and "no live desk launch" in c5(v).detail
 
 
-def test_check5_a_hooked_session_stub_makes_the_predicate_answer_quiet(ent):
+def test_check5_a_hooked_session_stub_is_noted_and_the_day_is_ready(ent):
     # STUB: a registry marker such as a session hook writes; no process exists
     with Store(str(ent.db), section_schema=None) as s:
         sessions.register_session(s.continuity_path, "claude-code-7f3a", label="hooked session (stub)")
     v = ent.evaluate()
-    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 5, "live-seat") and "claude-code-7f3a" in v.reason
+    assert v.verdict == rd.READY and "claude-code-7f3a" in c5(v).detail
 
 
 def test_check5_the_installs_own_session_marker_is_not_another_seat(ent):
@@ -346,23 +355,119 @@ def test_check5_a_stale_session_marker_is_not_live(ent):
     assert ent.evaluate().verdict == rd.READY
 
 
-def test_check5_an_unreadable_awake_json_is_unreadable_never_a_pass(ent):
+def test_check5_an_unreadable_seat_source_is_named_and_gates_nothing(ent):
+    """The list is informational now, so a source that cannot be read is named, not turned into a refusal."""
     (ent.coord_dir / "awake.json").write_text("{not json", encoding="utf-8")
     v = ent.evaluate()
-    assert (v.verdict, v.check) == (rd.UNREADABLE, 5), v.reason
+    assert v.verdict == rd.READY and c5(v).status == "pass", v.reason
+    assert "awake.json work thread" in c5(v).detail and "not every source could be read" in c5(v).detail
 
 
-def test_check5_a_live_launch_still_wins_over_an_unreadable_source(ent):
-    ent.pending_launch()
+def test_check5_a_live_launch_and_an_unreadable_source_are_both_named(ent):
+    lid = ent.pending_launch()
     (ent.coord_dir / "awake.json").write_text("{not json", encoding="utf-8")
     v = ent.evaluate()
-    assert (v.verdict, v.kind) == (rd.QUIET, "live-seat")
+    assert v.verdict == rd.READY and lid in c5(v).detail and "not every source could be read" in c5(v).detail
 
 
-def test_check5_is_waived_for_a_manual_run(ent):
-    ent.pending_launch()
+def test_check5_is_the_same_for_a_manual_run_it_no_longer_waives(ent):
+    lid = ent.pending_launch()
     v = ent.evaluate(manual=True)
-    assert v.verdict == rd.READY and status(v, 5) == "waived"
+    assert v.verdict == rd.READY and c5(v).status == "pass" and lid in c5(v).detail
+
+
+def test_check5_names_a_store_without_the_baton_policy_when_seats_are_live(ent):
+    """A store that does not require the baton leaves only anneal's wrap state and wrap.lock between a seat's own
+    consolidate and the dream; the detail says so (it is stated, not refused: D1_design 3.4)."""
+    ent.pending_launch()
+    assert "does NOT require the consolidate baton" in c5(ent.evaluate()).detail
+    _require_baton(ent, rd.SESSION_ID)
+    v = ent.evaluate()
+    assert v.verdict == rd.READY and "does NOT require" not in c5(v).detail
+
+
+@pytest.mark.parametrize("seat", ["launch", "thread", "hooked"])
+def test_a_live_seat_does_not_hide_any_other_refusal(tmp_path, seat):
+    """Each other check still refuses beside a live seat: the seat changes nothing about them."""
+    def live(e: Entity) -> None:
+        if seat == "launch":
+            e.pending_launch()
+        elif seat == "thread":
+            e.awake(["thr-1"])
+        else:
+            with Store(str(e.db), section_schema=None) as s:
+                sessions.register_session(s.continuity_path, "claude-code-7f3a")
+
+    e = Entity(tmp_path / "wrap")                                  # a wrap open (check 2)
+    live(e)
+    with Store(str(e.db), section_schema=None) as s:
+        assert prepare_wrap(s, wrap_token="a" * 32)["status"] == "ready"
+    v = e.evaluate()
+    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 2, "wrap-open")
+
+    e = Entity(tmp_path / "baton")                                 # the baton is another session's (check 2)
+    live(e)
+    _require_baton(e, "flow-seat")
+    v = e.evaluate()
+    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 2, "baton")
+
+    e = Entity(tmp_path / "done")                                  # already dreamed (check 1)
+    live(e)
+    e.occurrence("done", launched=utc(2026, 11, 3, 3, 0), ended=utc(2026, 11, 3, 3, 20))
+    assert (e.evaluate().check, e.evaluate().kind) == (1, "already-dreamed")
+
+    e = Entity(tmp_path / "empty", episodes=0)                     # nothing to consolidate (check 4)
+    live(e)
+    v = e.evaluate()
+    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 4, "nothing-to-consolidate")
+
+    e = Entity(tmp_path / "spent")                                 # the window's attempt is spent (check 6)
+    live(e)
+    e.occurrence("failed", launched=utc(2026, 11, 3, 3, 0))
+    v = e.evaluate()
+    assert (v.verdict, v.check, v.kind) == (rd.QUIET, 6, "attempt-spent")
+
+
+def test_a_capture_during_a_wrap_is_the_next_wraps_input_and_a_live_seat_does_not_stop_the_dream(ent):
+    """The PLAN row's test, through the real dream path (``consolidate_store``): a stand-in seat records two episodes
+    through its own connection while the dream's wrap is open (seats are live: a desk launch and a work thread). The
+    admission is READY with the seats live; the frozen set holds only what was recorded before ``prepare_wrap``; the
+    two captures are not lost and are exactly what ``episodes_since_wrap()`` lists afterwards, and the NEXT dream's
+    admission (check 4) and its prepared input both carry them. Reproduced first by hand on a scratch store."""
+    from levain.dream import executor as ex
+
+    ent.pending_launch()
+    ent.awake(["thr-1"])
+    assert ent.evaluate().verdict == rd.READY
+    with Store(str(ent.db), section_schema=None) as s:
+        before = {e.id for e in s.episodes_since_wrap()}
+    made: list[str] = []
+    frozen: list[list[str]] = []
+
+    class SeatCapturing(Fake):
+        def compose(self, req):                                      # the seat keeps capturing while the mind composes
+            with Store(str(ent.db), section_schema=None) as s:
+                frozen.append(list(s.load_wrap_snapshot()["episode_ids"]))
+                made.extend(s.record(content=f"seat capture {i} during the wrap", episode_type="observation",
+                                     source="seat").id for i in range(2))
+            return super().compose(req)
+
+    r = ex.consolidate_store(ent.db, mind=SeatCapturing(text_n(1)), occurrence_dir=ent.store_dir / "dream" / "o1",
+                             max_seconds=3000)
+    assert r.outcome == "saved" and len(made) == 2
+    assert set(frozen[0]) == before and not set(made) & set(frozen[0])       # the set was frozen at prepare
+    with Store(str(ent.db), section_schema=None) as s:
+        assert {e.id for e in s.episodes_since_wrap()} == set(made)          # nothing lost, nothing re-offered
+    # the next dream's admission sees them (the next dream-day: no wrap since its start, seats still live) ...
+    # (anneal stamps the wrap with the real clock, so the next day is taken from it)
+    nxt = rd.dream_day_at(datetime.now(timezone.utc), ZONE) + timedelta(days=1)
+    v = ent.evaluate(now=rd.day_start(nxt, ZONE) + timedelta(hours=19), day=nxt)
+    assert v.verdict == rd.READY and "2 episode(s)" in next(c for c in v.checks if c.n == 4).detail
+    # ... and its prepared input carries both
+    with Store(str(ent.db), section_schema=FLOW_SCHEMA) as s:
+        pkg = str(prepare_wrap(s, wrap_token="b" * 32)["package"])
+        assert set(s.load_wrap_snapshot()["episode_ids"]) == set(made)
+        assert all(f"seat capture {i} during the wrap" in pkg for i in range(2))
 
 
 # --------------------------------------------------------------------------------------- check 6: attempt spent
@@ -449,15 +554,23 @@ def test_verb_prints_ready_with_exit_0(ent):
 
 
 def test_verb_prints_quiet_with_exit_1_and_the_reason(ent):
-    ent.pending_launch()
+    ent.pending_launch()                                           # a live seat beside the refusal changes nothing
+    with Store(str(ent.db), section_schema=None) as s:
+        assert prepare_wrap(s, wrap_token="a" * 32)["status"] == "ready"
     code, doc = run_verb(*common(ent))
-    assert code == 1 and doc["verdict"] == "quiet" and doc["check"] == 5 and doc["kind"] == "live-seat"
+    assert code == 1 and doc["verdict"] == "quiet" and doc["check"] == 2 and doc["kind"] == "wrap-open"
+
+
+def test_verb_a_live_seat_is_ready_with_exit_0_and_named(ent):
+    lid = ent.pending_launch()
+    code, doc = run_verb(*common(ent))
+    assert code == 0 and doc["verdict"] == "ready" and lid in next(c["detail"] for c in doc["checks"] if c["n"] == 5)
 
 
 def test_verb_prints_unreadable_with_exit_3(ent):
-    (ent.coord_dir / "awake.json").write_text("{nope", encoding="utf-8")
+    (ent.agent_dir / DB_NAME).write_bytes(b"this is not a sqlite database at all" * 10)
     code, doc = run_verb(*common(ent))
-    assert code == 3 and doc["verdict"] == "unreadable" and doc["check"] == 5
+    assert code == 3 and doc["verdict"] == "unreadable" and doc["check"] == 1
 
 
 def test_verb_on_a_bare_store_copy_runs_and_says_which_sources_were_absent(ent):
@@ -467,10 +580,10 @@ def test_verb_on_a_bare_store_copy_runs_and_says_which_sources_were_absent(ent):
     assert "no agent store given" in next(c["detail"] for c in doc["checks"] if c["n"] == 5)
 
 
-def test_verb_manual_flag_waives_check_5(ent):
+def test_verb_manual_flag_notes_the_live_seat_as_a_scheduled_run_does(ent):
     ent.pending_launch()
     code, doc = run_verb(*common(ent), "--manual")
-    assert code == 0 and next(c["status"] for c in doc["checks"] if c["n"] == 5) == "waived"
+    assert code == 0 and next(c["status"] for c in doc["checks"] if c["n"] == 5) == "pass"
 
 
 def test_verb_refuses_a_naive_now_and_an_unknown_zone(ent):
@@ -545,14 +658,14 @@ def test_check3_excludes_only_the_one_wrap_an_own_occurrence_made(ent):
     assert v.verdict == rd.READY, v.reason
 
 
-def test_check5_a_pending_launch_whose_spawn_is_claimed_is_still_a_live_seat(ent):
+def test_check5_a_pending_launch_whose_spawn_is_claimed_is_still_named_as_a_live_seat(ent):
     """Reproduced: ``launches_unspawned`` drops a claimed spawn and ``launches_active`` does not hold it yet."""
     from levain.desk.store import CoordStore
 
     lid = ent.pending_launch()
     assert CoordStore(ent.coord_dir).launch_claim_spawn(lid, 4242)[1] is None
     v = ent.evaluate()
-    assert (v.check, v.kind) == (5, "live-seat") and lid in v.reason
+    assert v.verdict == rd.READY and lid in c5(v).detail
 
 
 def test_the_ready_verb_opens_the_store_without_writing_it(ent):
