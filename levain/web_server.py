@@ -2116,10 +2116,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         """A cheap fingerprint of the stores the panels read, or None when it cannot be taken whole (the watcher then
         builds on its slow tick). Each named store file contributes ``(mtime_ns, size)``; each watched directory
         contributes its files the same way and its subdirectories by name. SQLite's ``-shm`` and ``-journal`` files are
-        left out (they move on a read), and a ``-wal`` file by size only. Cost per call: one stat per named file, plus
+        left out (they move on a read); a ``-wal`` file counts by mtime and size (a commit after a checkpoint rewrites
+        it in place at the same size). Cost per call: one stat per named file, plus
         one scandir per watched directory (the install's ``.levain``, ``seed``, ``activation``, the ledger, consent and
-        sign queue dirs, and any ``watch_paths`` directory), each capped at ``_WATCH_ENTRIES_MAX`` entries: a directory
-        past the cap makes the whole token unknown. A file inside a subdirectory, the clock and in-memory state reach
+        sign queue dirs, and any ``watch_paths`` directory), each capped at ``_WATCH_ENTRIES_MAX`` stat-ed entries and ``_WATCH_SCAN_MAX`` entries looked at: a directory
+        past either cap makes the whole token unknown. A file inside a subdirectory, the clock and in-memory state reach
         the page on the watcher's backstop build."""
         downstream = self.cockpit is not None and self.cockpit is not self.default_cockpit
         if (downstream or self.extra_panels is not None) and not self.watch_paths:
@@ -2151,26 +2152,26 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             if str(f) not in seen:
                 seen.add(str(f))
                 out.append((str(f), _stat_sig(f)))
-                out.append((str(f) + "-wal", _stat_sig(Path(str(f) + "-wal"), size_only=True)))
+                out.append((str(f) + "-wal", _stat_sig(Path(str(f) + "-wal"))))
         for r in dirs:
             key = str(r)
             if key in seen:
                 continue
             seen.add(key)
             try:
-                n = 0
+                n = seen_n = 0
                 with os.scandir(r) as it:
                     for e in it:
+                        seen_n += 1
+                        if seen_n > _WATCH_SCAN_MAX:
+                            return None     # a hard bound on entries looked at, whatever they are
                         if e.name.endswith(("-shm", "-journal")):
-                            continue        # not counted against the cap: a reader's own files
+                            continue        # not counted against the entry cap: a reader's own files
                         n += 1
                         if n > _WATCH_ENTRIES_MAX:
                             return None
-                        if e.name.endswith("-wal"):
-                            out.append((key + "/" + e.name, _stat_sig(e.path, size_only=True)))
-                        else:
-                            # a subdirectory is its name only: its own mtime moves with every temp file made in it
-                            out.append((key + "/" + e.name, None if e.is_dir() else _stat_sig(e.path)))
+                        # a subdirectory is its name only: its own mtime moves with every temp file made in it
+                        out.append((key + "/" + e.name, None if e.is_dir() else _stat_sig(e.path)))
             except OSError:
                 out.append((key, "unreadable"))     # a missing or unreadable directory is one stable entry
         return tuple(out)
@@ -5681,17 +5682,17 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
                       httpd.verb_registry, httpd.get_cockpit(), verb, dict(params), dict(target)))
 
 
-_WATCH_ENTRIES_MAX = 500    # entries read per watched directory by the change token; past it the token is unknown
+_WATCH_ENTRIES_MAX = 500    # entries stat-ed per watched directory by the change token; past it the token is unknown
+_WATCH_SCAN_MAX = 2000      # entries looked at per watched directory, skipped ones included; past it the token is unknown
 
 
-def _stat_sig(path: Any, size_only: bool = False) -> "tuple[int, int] | None":
-    """``(mtime_ns, size)`` of one path (the size alone when ``size_only``), None when it does not exist (its
-    appearing moves the token)."""
+def _stat_sig(path: Any) -> "tuple[int, int] | None":
+    """``(mtime_ns, size)`` of one path, None when it does not exist (its appearing moves the token)."""
     try:
         st = os.stat(path)
     except OSError:
         return None
-    return (0 if size_only else st.st_mtime_ns), st.st_size
+    return st.st_mtime_ns, st.st_size
 
 
 def make_server(

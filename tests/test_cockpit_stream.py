@@ -836,3 +836,63 @@ class TestServerTokenInputs:
             raise AssertionError("an invalid watch path was accepted")
         httpd = make_server(src, host="127.0.0.1", port=port)       # the port was never taken
         httpd.server_close()
+
+
+class TestWalFingerprint:
+    def test_a_commit_after_a_checkpoint_moves_the_wal_mtime_but_not_its_size_and_a_read_moves_neither(self, tmp_path: Path) -> None:
+        import os
+        import sqlite3
+        from levain import web_server
+        p = tmp_path / "x.db"
+        w = sqlite3.connect(str(p))
+        w.execute("pragma journal_mode=wal")
+        w.execute("create table t(x)")
+        for i in range(50):
+            w.execute("insert into t values (?)", (i,))
+        w.commit()
+        wal = Path(str(p) + "-wal")
+        before = web_server._stat_sig(wal)
+        r = sqlite3.connect(str(p))
+        list(r.execute("select count(*) from t"))
+        r.close()
+        assert web_server._stat_sig(wal) == before          # (a) a read-only open moves nothing
+        w.execute("pragma wal_checkpoint(PASSIVE)")
+        mid = web_server._stat_sig(wal)
+        time.sleep(0.02)
+        w.execute("insert into t values (999)")
+        w.commit()
+        after = web_server._stat_sig(wal)
+        w.close()
+        assert after[1] == mid[1] and after[0] != mid[0]    # (b) same size, later mtime: a size-only print is blind to it
+
+    def test_the_token_moves_on_a_commit_after_a_checkpoint(self, tmp_path: Path) -> None:
+        import sqlite3
+        root, src = _install(tmp_path)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        try:
+            db = src.anneal.episodic_db
+            w = sqlite3.connect(str(db))
+            w.execute("pragma journal_mode=wal")
+            w.execute("create table if not exists t(x)")
+            w.execute("insert into t values (1)")
+            w.commit()
+            w.execute("pragma wal_checkpoint(PASSIVE)")
+            a = httpd._watch_token()
+            time.sleep(0.02)
+            w.execute("insert into t values (2)")
+            w.commit()
+            assert httpd._watch_token() != a
+            w.close()
+        finally:
+            httpd.server_close()
+
+    def test_a_directory_of_skipped_entries_is_still_bounded(self, tmp_path: Path) -> None:
+        from levain import web_server
+        root, src = _install(tmp_path)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        try:
+            for i in range(web_server._WATCH_SCAN_MAX + 5):
+                (root / ".levain" / f"z{i}.db-journal").write_text("")
+            assert httpd._watch_token() is None
+        finally:
+            httpd.server_close()
