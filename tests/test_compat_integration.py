@@ -354,7 +354,7 @@ def test_template_ack_target_caps_and_skips():
 # guarded` is the one entry that has both halves today, and it is the shape to copy.
 _COVERAGE_SENTINELS = {
     # feature: (owning seed file, sentinel text)
-    "AM-INTENTIONS-BOUNDARY": ("intention_instructions.md", "intention_add"),      # prospective-layer tools
+    "AM-SPORES-BOUNDARY": ("intention_instructions.md", "intention_add"),  # prospective-layer tools (anneal's manifest id, anneal-owned: it still says SPORES)
     "AM-MIGRATE-NOTIFY": ("memory.md", "levain update"),               # the upgrade habit
     "AM-CRYSTAL": ("memory_workflow.md", "crystallization candidates"),  # crystallize-OUT routing (moved with the wrap procedure, intention-451)
     "AM-MCP-CRYSTAL": ("memory.md", "crystal_recall"),                 # the MCP read surface
