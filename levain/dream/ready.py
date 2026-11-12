@@ -247,8 +247,9 @@ def _check1(src: Sources, agent: str, key: str, day: date, zone: str, now: datet
 def _check2(src: Sources) -> Check:
     name = "baton free, no open wrap"
     if _guard(src.wrap_open, "the wrap state"):
-        return Check(2, name, QUIET, "a wrap is open on the store (a stale orphan is healed inside the effect, not "
-                                     "judged here)", "wrap-open")
+        return Check(2, name, QUIET, "a wrap is open on the store: the dream does not start while one is open, a dead "
+                                     "seat's included, and nothing on this path clears it (anneal's wrap-status and "
+                                     "wrap-cancel do)", "wrap-open")
     if not _guard(src.requires_baton, "the baton policy"):
         return Check(2, name, "pass", "no wrap open; the store does not require the baton")
     holder = _guard(src.baton_holder, "the baton")
