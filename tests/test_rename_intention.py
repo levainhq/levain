@@ -546,3 +546,63 @@ def test_the_real_rule_table_resolves_the_inventory_collisions_and_names_every_l
     assert set(ns["OLD_VERB_TO_NEW"]) == {"spore_" + w for w in
                                           ("touch", "descend", "surface_at", "update", "retarget", "set_disposition", "ascend", "seed")}
     assert ns["OLD_VERB_TO_NEW"]["spore_descend"] == "intention_close" and ns["OLD_VERB_TO_NEW"]["spore_ascend"] == "intention_promote"
+
+
+# --- the old document key has one spelling in code ------------------------------------------------------------------
+
+# Files that cannot import levain, so they spell the key as bytes (the standalone hook templates run inside an install's
+# own interpreter, with no levain on the path). intention_legacy.py defines the constant itself.
+_DOC_KEY_EXEMPT = {
+    "levain/intention_legacy.py": "defines the constant",
+}
+_DOC_KEY_EXEMPT_PREFIXES = {
+    "levain/templates/": "standalone hook templates: they cannot import levain",
+}
+
+
+def _doc_key_uses(tree):
+    """Lines where the string constant is used AS a document key: a subscript, a dict-literal key, the first argument of
+    ``.get`` / ``.setdefault`` / ``.pop``, or an operand of ``in`` / ``not in``. A docstring or a comment is not a use."""
+    import ast
+
+    def is_key(node):
+        return isinstance(node, ast.Constant) and node.value == legacy_key
+
+    from levain.intention_legacy import STORE_DOC_KEY_OPEN as legacy_key
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and is_key(node.slice):
+            hits.append(node.lineno)
+        elif isinstance(node, ast.Dict):
+            hits.extend(k.lineno for k in node.keys if k is not None and is_key(k))
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr in ("get", "setdefault", "pop") and node.args and is_key(node.args[0])):
+            hits.append(node.lineno)
+        elif isinstance(node, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
+            hits.extend(n.lineno for n in [node.left, *node.comparators] if is_key(n))
+    return hits
+
+
+def test_the_old_document_key_is_spelled_only_by_the_legacy_constant():
+    import ast
+    stray = []
+    for path in sorted((ROOT / "levain").rglob("*.py")):
+        rel = path.relative_to(ROOT).as_posix()
+        if rel in _DOC_KEY_EXEMPT or any(rel.startswith(p) for p in _DOC_KEY_EXEMPT_PREFIXES):
+            continue
+        stray.extend(f"{rel}:{line}" for line in _doc_key_uses(ast.parse(path.read_text(encoding="utf-8"))))
+    assert not stray, ("the old document key is read as a raw literal; import STORE_DOC_KEY_OPEN from "
+                       "levain.intention_legacy: " + ", ".join(stray))
+
+
+def test_the_document_key_scan_sees_each_use_shape_and_ignores_prose():
+    import ast
+    src = ('"""the spores key"""\n'
+           'a = d["spores"]\n'
+           'b = d.get("spores", [])\n'
+           'd.setdefault("spores", [])\n'
+           'c = {"spores": []}\n'
+           'e = "spores" in d\n'
+           '# d["spores"]\n'
+           'f = "spores_x"\n')
+    assert _doc_key_uses(ast.parse(src)) == [2, 3, 4, 5, 6]
