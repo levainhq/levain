@@ -97,6 +97,7 @@ from levain.intention_legacy import (
     KEEP_PLAN_ID_KEY,
     KEEP_PLAN_STORE_KEY,
     OLD_DISPOSITION_TO_NEW,
+    STORE_DOC_KEY_OPEN,
 )
 
 try:
