@@ -450,20 +450,28 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
     Only the scheduled rows of the dream agent are launched: a ``manual`` row is its verb's. A row is launched at most
     once however many ticks see it (the launch is a compare-and-set on ``state = 'admitted'``). It runs after the
     renewals and the claims, so the renewal-gap arithmetic in the module docstring is untouched; an exception in one row
-    is named and does not stop the others or the notices."""
+    is named and does not stop the others or the notices, and one in the set-up before the rows (the dream's agent row,
+    the admitted rows' read, the install) is named the same way and stops only the launches."""
     from levain.agents import schedule as _sched
     from levain.agents import spec as _spec
     from levain.dream import agent as _da
     from levain.dream import executor as _ex
 
     try:
-        agent = _spec.get_agent(st, _da.NAME)
-    except _spec.SpecError:
-        return                      # no dream registered: nothing to launch
-    with st.read() as conn:
-        rows = conn.execute(
-            "SELECT occurrence_id, window_key FROM agent_occurrences WHERE agent_id = ? AND kind = 'scheduled'"
-            " AND state = 'admitted' ORDER BY admitted_at, occurrence_id", (agent["agent_id"],)).fetchall()
+        try:
+            agent = _spec.get_agent(st, _da.NAME)
+        except _spec.SpecError:
+            return                      # no dream registered: nothing to launch
+        with st.read() as conn:
+            rows = conn.execute(
+                "SELECT occurrence_id, window_key FROM agent_occurrences WHERE agent_id = ? AND kind = 'scheduled'"
+                " AND state = 'admitted' ORDER BY admitted_at, occurrence_id", (agent["agent_id"],)).fetchall()
+        trigger = agent["spec"]["trigger"]
+    except Exception as exc:  # noqa: BLE001 - the set-up is guarded as each row is: named, and the notices still run
+        notes.append(f"the dream's admitted slots could not be read, so nothing was launched ({type(exc).__name__}: "
+                     f"{exc}); the next tick tries again")
+        seen["launch"] = "raised"
+        return
     if not rows:
         return
     now = clock()
@@ -474,7 +482,6 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
                      f"launched ({type(exc).__name__}: {exc})")
         seen["launch"] = "install"
         return
-    trigger = agent["spec"]["trigger"]
     for oid, window_key in rows:
         try:
             # the span a SCHEDULED launch counts manual runs over is the window its own key names, in the signed
