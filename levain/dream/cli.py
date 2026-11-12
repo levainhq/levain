@@ -18,16 +18,39 @@ import uuid
 from pathlib import Path
 
 
+#: What reading the install's facts can raise besides its own refusal (``InstallRefused`` is a ``ValueError``): a path
+#: fact like ``~no_such_user/f`` makes ``Path.expanduser`` raise ``RuntimeError``, and any read can meet an ``OSError``.
+#: The enable has already registered the dream by the time it builds the card, so a read that cannot finish falls back
+#: to the card's placeholder text; it never aborts with a traceback.
+_INSTALL_READ_ERRORS = (ValueError, OSError, RuntimeError)
+
+
+def _retry_minutes() -> int:
+    """The dream's retry cadence, read from the schedule's own constant (never restated in help text)."""
+    from levain.dream import agent as da
+
+    return da.RETRY_MINUTES
+
+
+def _window_end() -> str:
+    """The time the dream's window ends (the schedule's last slot is the one before it)."""
+    from levain.dream import agent as da
+
+    return da.WINDOW["end"]
+
+
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser("dream", help="Dreaming: run on a store copy; ready, rollback, recover, drill, shadow; "
-                                            "enable the scheduled dream.",
+                                            "enable the scheduled dream; start one by hand.",
                               allow_abbrev=False,
                               description="Consolidate a store through a compose mind (`run`, on a COPY of a store), "
                                           "check whether a night is due (`ready`), roll back, recover or drill a dream, "
-                                          "dry-run a shadow night (`shadow`), and register the scheduled dream "
-                                          "(`enable`). Once enabled and under a live signed link, the agents tick "
-                                          "(`levain agents tick`) launches it once a night at its time; `enable` "
-                                          "signs nothing.")
+                                          "dry-run a shadow night (`shadow`), register the scheduled dream "
+                                          "(`enable`) and start it now, by hand (`start`). Once enabled, the dream's "
+                                          "schedule has a slot at its time and another every "
+                                          f"{_retry_minutes()} minutes until {_window_end()}, and a slot that finds the "
+                                          "night not ready is tried again at the next one; `enable` signs nothing, and "
+                                          "`start` goes through the same signed link and ceiling.")
     p.set_defaults(func=run_dream)
     sub = p.add_subparsers(dest="dream_command")
     r = sub.add_parser("run", allow_abbrev=False, help="Consolidate a store COPY once.",
@@ -151,6 +174,20 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     en.add_argument("--revise", action="store_true", help="Write a new version when the stored spec differs.")
     en.add_argument("--json", action="store_true")
     en.set_defaults(func=run_dream_enable)
+    stt = sub.add_parser("start", allow_abbrev=False, help="Start the registered dream now, by hand (same signed link and ceiling).",
+                         description="Start the dream now instead of waiting for its next slot. It goes through the SAME "
+                                     "gates a scheduled window meets: it claims nothing unless a live signed link covers "
+                                     "the dream's current spec, the launch holds it to the link's signed run ceiling and "
+                                     "budgets, and the day-ready checks run as a MANUAL run (the window's one-attempt "
+                                     "check is waived; a wrap open, a baton held elsewhere, the day already dreamed and "
+                                     "two runs launched today still refuse). It then spawns the same detached fire a "
+                                     "scheduled run has, and returns; the result is a card on the desk. It spends real "
+                                     "money on the Claude route, inside the link's signed limits.")
+    stt.add_argument("--agent-store-dir", type=Path, default=None,
+                     help="The autonomic store directory the dream is registered in (default: $LEVAIN_HOME/autonomic), "
+                          "the same one `levain dream enable` was given.")
+    stt.add_argument("--json", action="store_true")
+    stt.set_defaults(func=run_dream_start)
 
 
 def _store_and_occurrence(p: argparse.ArgumentParser) -> None:
@@ -159,9 +196,27 @@ def _store_and_occurrence(p: argparse.ArgumentParser) -> None:
 
 
 def run_dream(args: argparse.Namespace) -> int:
-    print("levain dream: choose run, rollback, recover, ready, drill, shadow or enable (see `levain dream --help`)",
+    print("levain dream: choose run, rollback, recover, ready, drill, shadow, enable or start (see `levain dream --help`)",
           file=sys.stderr)
     return 1
+
+
+def run_dream_start(args: argparse.Namespace) -> int:
+    from levain.agents.store import AgentStoreRefused, open_agent_store
+    from levain.agents.spec import SpecError
+    from levain.dream import start as st
+
+    try:
+        store = open_agent_store(args.agent_store_dir)
+        got = st.start(store)
+    except (AgentStoreRefused, SpecError, sqlite3.Error, OSError, ValueError) as exc:
+        print(f"levain dream start: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(got.as_dict(), sort_keys=True))
+    else:
+        print(f"levain dream start: {got.text}", file=sys.stdout if got.code == 0 else sys.stderr)
+    return got.code
 
 
 def run_dream_enable(args: argparse.Namespace) -> int:
@@ -240,13 +295,13 @@ def run_dream_enable(args: argparse.Namespace) -> int:
                                                agent_dir=store.directory, flow_instructions=inst.flow_instructions,
                                                facts_path=inst.facts_path, model=inst.model, per_run_usd=r, night_usd=2 * r, expires=expires,
                                                time=when)
-        except da.InstallRefused as exc:
+        except _INSTALL_READ_ERRORS as exc:
             card = f"The shadow install's facts cannot be read ({exc}); no fire runs until `levain dream enable` " \
                    "writes them again."
     else:
         try:                                    # the Undo command carries the install's store when its facts are written
             install_store = da.read_install(store.directory).store_path.parent
-        except da.InstallRefused:
+        except _INSTALL_READ_ERRORS:
             install_store = None
         card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r, expires=expires, time=when,
                                     store_dir=install_store)
