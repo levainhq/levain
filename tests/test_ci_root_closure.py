@@ -101,6 +101,15 @@ def test_the_queue_broker_imports_neither_the_agent_hooks_nor_the_dispatch_cli()
                        "levain.dispatch.cli"}
 
 
+def test_the_root_closure_never_holds_the_operator_side_effects_module():
+    """The fire journal is root-run code, and ``levain.cockpit.effects`` is operator-side (its function-local imports and
+    the tests that import ``anneal_memory`` come with it): the journal's history readers live in ``levain.intention_legacy``,
+    so root-run code does not import the operator-side effects module. A root-run import of it fails the root-py39 job."""
+    assert "levain.cockpit.effects" not in set(rc.closure()), (
+        "levain.cockpit.effects entered the root closure: the journal's history readers live in intention_legacy so "
+        "root-run code does not import the operator-side effects module; import them from levain.intention_legacy")
+
+
 def test_every_excluded_test_file_exists_is_selected_without_the_table_and_holds_its_evidence():
     """An entry of NOT_ROOT_TESTS cannot rot: its file exists, the import rule alone would still select it (so the
     entry still excludes something), and both evidence strings of its reason are where it says."""
