@@ -505,6 +505,22 @@ def test_t17_a_list_that_cannot_be_read_is_said_and_the_revoke_still_succeeds(wo
     assert world.state().keys[world.fps["a"]].revoked_seq is not None             # and the key is revoked
 
 
+@pytest.mark.parametrize("fault", [RuntimeError("a replay fault"), ValueError("a bad row"),
+                                   auth.VerifierUnavailable("ssh-keygen is gone")])
+def test_t17_any_fault_in_the_fresh_read_leaves_the_revoke_succeeded(world, capsys, monkeypatch, fault) -> None:
+    """The fresh replay after the revoke raises, a key command's refusal or anything else: the revoke is done, so the
+    verb still exits 0 with its ``revoked:`` line, says the list could not be read, and the key is revoked in the log."""
+    world.consent("cg-A")
+
+    def boom(*_a, **_k):
+        raise fault
+    monkeypatch.setattr(G, "_capture", boom)                     # the second read only: the revoke reads its own way
+    code, out, err = _revoke_cli(world, capsys, "a")
+    assert code == 0 and out.startswith(f"revoked: {world.fps['a']} at seq ") and out.count("\n") == 1
+    assert "could not be listed" in err and "Traceback" not in err
+    assert world.state().keys[world.fps["a"]].revoked_seq is not None
+
+
 def test_t17_a_creator_string_is_shown_through_visible() -> None:
     """Every creator string in the notice goes through ``visible``: an agent, a workspace, a host or a name that carries a
     terminal control sequence is shown as its marker."""
