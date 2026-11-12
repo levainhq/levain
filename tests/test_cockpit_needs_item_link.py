@@ -121,14 +121,16 @@ def test_the_link_keeps_nothing_across_a_reload() -> None:
 # Decisions is held until the test releases it (no fixed delay: a press that lands on a loaded runner after a timer ran out tested nothing).
 HELD_DECISIONS = """(() => { const f = window.fetch; let release; const gate = new Promise((r) => { release = r; }); window.__releaseDecisions = release;
   window.fetch = async (...a) => {
-  if (String(a[0]).indexOf('/cockpit/panel/decisions.json') === 0) await gate;
+  if (String(a[0]).indexOf('/cockpit/panel/decisions.json') === 0) { window.__decisionsWaiting = true; await gate; }
   return f.apply(window, a); }; })();"""
 # The harness's init step reloads the page once, which would drop the link, so the link is opened after it. That eval returns before the
 # link's document exists, and a press sent then lands on the old document, or on the new one before the page armed its jump (a press moves
 # the run counter, and the jump takes its own number after); so the test waits for the new document to be loaded.
 # Every step below runs while Decisions is held, so the board is partial and never says it is whole: each says "partial" (else the driver waits out its bound).
 MARK_OLD = {"eval": "window.__oldDoc = true; location.assign('/?view=needs&item=question:2#write_token=T'); 1", "partial": True}
-NEW_DOC = {"until": "document.readyState === 'complete' && window.__oldDoc === undefined && !!window.__releaseDecisions && 1", "ms": 40000, "partial": True}
+# The hook exists as soon as the document does, but the Decisions request may not have started yet: a release then opens the gate before
+# anything waits on it and the press races the normal board load. So the new document is ready only once a request is waiting on the gate.
+NEW_DOC = {"until": "document.readyState === 'complete' && window.__oldDoc === undefined && window.__decisionsWaiting === true && 1", "ms": 40000, "partial": True}
 RELEASE = {"eval": "window.__releaseDecisions(); 1", "partial": True}
 
 
