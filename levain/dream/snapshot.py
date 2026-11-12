@@ -242,12 +242,99 @@ def take(store: Any, occ_dir: Path | None) -> dict[str, Any]:
 
 # ------------------------------------------------------------------------------------- record-post (step 6) and prune
 
+def _schema_of(db: Path) -> list[Any] | None:
+    """The store's persisted section schema by plain read-only sqlite, validated by anneal (an absent row is anneal's
+    DEFAULT_SCHEMA, as ``Store.section_schema_for_wrap`` reads it); None when it cannot be read or is corrupt."""
+    from anneal_memory.schema import DEFAULT_SCHEMA, validate_schema
+
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = con.execute("select value from metadata where key = 'section_schema'").fetchone()
+        finally:
+            con.close()
+        return validate_schema(DEFAULT_SCHEMA if row is None else json.loads(row[0]))
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
+
+
+def _nonblank(text: str) -> list[str]:
+    return [ln for ln in text.split("\n") if ln.strip()]
+
+
+def reinsertion_proof(db: Path, occ_dir: Path, m: Mapping[str, Any], wrap_id: Any, composed_sha256: str,
+                      live_sha256: str | None) -> list[str] | None:
+    """The re-inserted durable lines when the live continuity text is provably what THIS dream's wrap saved from its
+    composed text, differing from it only by anneal's own re-insertion of prior durable lines; else None. All of:
+
+    1. the wrap: ``wrap_id`` is the ONE completed wrap past the journal's ``last_wrap_before``, and the live bytes
+       hash to that wrap's ``content_hash`` (the sha256 anneal commits with the wrap row, of the exact text it
+       writes). A later save is a second wrap row, a raw write or a save that did not land breaks the hash, and a
+       different or missing id is not that row: each is refused.
+    2. the inputs: the occurrence's ``composed.continuity.md`` hashes to the journal's ``composed_sha256`` and the
+       snapshot's continuity copy to the manifest's pre-save hash.
+    3. anneal's own step: ``enforce_durable_facts`` (the function the save runs) applied to the snapshot's prior text
+       and the composed text, canonicalised as the save does, reproduces the live text byte for byte, and its report
+       names at least one re-inserted line.
+    4. additions only: the live text's non-blank lines are the composed text's non-blank lines, in order, plus
+       exactly the re-inserted lines (and the section heading when anneal had to re-create the section).
+    """
+    try:
+        if isinstance(wrap_id, bool) or not isinstance(wrap_id, int) or not live_sha256:
+            return None
+        prog = _read_json(occ_dir / "progress.json") or {}
+        if "last_wrap_before" not in prog:
+            return None
+        rows = wraps_after(db, prog.get("last_wrap_before"))
+        if not rows or len(rows) != 1 or rows[0][0] != wrap_id or rows[0][1] != live_sha256:
+            return None
+        live_raw = text_tier(db)["continuity"].read_bytes()
+        composed_raw = (occ_dir / "composed.continuity.md").read_bytes()
+        ent = (m.get("files") or {}).get("continuity") or {}
+        if not ent.get("sha256") or not ent.get("name"):
+            return None                                   # no prior text: nothing could have been re-inserted
+        prior_raw = (occ_dir / SNAP_DIR / ent["name"]).read_bytes()
+        if (hashlib.sha256(live_raw).hexdigest() != live_sha256
+                or hashlib.sha256(composed_raw).hexdigest() != composed_sha256
+                or hashlib.sha256(prior_raw).hexdigest() != ent["sha256"]):
+            return None
+        live, composed, prior = (b.decode("utf-8") for b in (live_raw, composed_raw, prior_raw))
+        schema = _schema_of(db)
+        if schema is None:
+            return None
+        from anneal_memory.durable import durable_spec, enforce_durable_facts
+        from anneal_memory.graduation import canonical_continuity_text
+
+        spec = durable_spec(schema)
+        if spec is None:
+            return None
+        expected, report = enforce_durable_facts(canonical_continuity_text(prior), composed, schema)
+        if report is None or not report.reinserted or canonical_continuity_text(expected) != live:
+            return None
+        added = [ln for raw in report.reinserted for ln in raw.split("\n") if ln.strip()]
+        if report.recreated:
+            added = [f"## {spec['heading']}", *added]
+        want, rest = _nonblank(composed), []
+        i = 0
+        for ln in _nonblank(live):
+            if i < len(want) and ln == want[i]:
+                i += 1
+            else:
+                rest.append(ln)
+        if i != len(want) or rest != added:
+            return None
+        return list(report.reinserted)
+    except Exception:  # noqa: BLE001 - any failure to prove is a refusal, never a crash of the post record
+        return None
+
 def record_post_for(db_path: Path | str, occ_dir: Path | str, wrap_id: Any, *, composed_sha256: str | None = None,
                     prune: bool = True) -> dict[str, str | None]:
     """Record the text tier the dream's save wrote (``post_files``) and the wrap id in the manifest. Refuses (raises
     :class:`SnapshotRefused`) when there is no snapshot, a post record already exists (a second could bless a later
     wrap's text as the dream's), the tier is unchanged since the snapshot, or ``composed_sha256`` is given and the
-    live continuity text is not it (the live text would not be the dream's)."""
+    live continuity text is not it (the live text would not be the dream's) UNLESS :func:`reinsertion_proof` proves
+    the one difference anneal's save makes on its own: durable lines of the prior text that the compose left out, put
+    back verbatim. Those lines are then recorded as the manifest's ``reinserted`` (absent when there were none)."""
     occ_dir, db = Path(occ_dir), Path(db_path)
     m = read_manifest(occ_dir)
     if m is None:
@@ -257,11 +344,17 @@ def record_post_for(db_path: Path | str, occ_dir: Path | str, wrap_id: Any, *, c
     post = tier_hashes(db)
     if post == {k: e["sha256"] for k, e in m["files"].items()}:
         raise SnapshotRefused("the text tier is unchanged since the snapshot; there is no save to record")
+    reinserted: list[str] = []
     if composed_sha256 and post["continuity"] != composed_sha256:
-        raise SnapshotRefused("the live continuity text is not the text this dream composed (a save that did not land, "
-                              "or a later write); it is not recorded as the dream's")
+        proved = reinsertion_proof(db, occ_dir, m, wrap_id, composed_sha256, post["continuity"])
+        if not proved:
+            raise SnapshotRefused("the live continuity text is not the text this dream composed (a save that did not "
+                                  "land, or a later write); it is not recorded as the dream's")
+        reinserted = proved
     m["post_files"] = post
     m["wrap_id"] = wrap_id
+    if reinserted:
+        m["reinserted"] = reinserted
     _write_manifest(occ_dir, m)
     if prune:
         with contextlib.suppress(Exception):  # retention is housekeeping: never a reason to lose the record
