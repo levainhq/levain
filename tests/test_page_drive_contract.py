@@ -259,3 +259,14 @@ def test_a_no_sw_step_keeps_later_loads_out_of_the_pages_worker(tmp_path: Path, 
         bypassed = _drive_at(tmp_path, url, [{"no_sw": True}, *reload_then_read], timeout=90)
     assert control.returncode == 0 and json.loads(control.stdout)["values"][-1] is False, (control.stderr, control.stdout)
     assert bypassed.returncode == 0 and json.loads(bypassed.stdout)["values"][-1] is True, (bypassed.stderr, bypassed.stdout)
+
+
+@needs_browser
+def test_a_reload_under_no_sw_does_not_wait_for_a_worker_that_cannot_take_control(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A bypassed document never has a controller, so a wait for one can only run out its 5 s bound. The wait is skipped and says so in
+    # the timeout block; the elapsed time of the drive is not asserted (a slow runner would make that a flake), the block's own line is.
+    monkeypatch.setenv("LEVAIN_DRIVE_FULL_CHROME", "1")
+    with _worker_site() as url:
+        r = _drive_at(tmp_path, url, [{"no_sw": True}, {"eval": "location.reload(); 1"}, {"until": "false", "ms": 1500}], timeout=90)
+    assert r.returncode == 1 and "until never came true" in r.stderr, (r.returncode, r.stderr)
+    assert re.search(r"WORKER WAITS: bypassed after 0ms/0 polls", r.stderr), r.stderr

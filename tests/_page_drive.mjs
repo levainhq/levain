@@ -26,8 +26,9 @@
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>, "safe": {"top","bottom","left","right"} optional}}   a device size, applied before the page is drawn again
 //   {"no_sw": true}                         from this step on, the page's navigations and fetches skip the service worker (CDP
 //                                            Network.setBypassServiceWorker): a drive whose subject has nothing to do with the worker asks for it, so a
-//                                            reload cannot race the worker's install / activate / claim; nothing is collected. It does not stop the
-//                                            page registering the worker. A step before the first load cannot undo what the first load did
+//                                            reload cannot race the worker's install / activate / claim, and a reload no longer waits for the worker to
+//                                            take control (a bypassed document never has one); nothing is collected. It does not stop the page
+//                                            registering the worker. A step before the first load cannot undo what the first load did
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
 //   {"motion": "reduce"|"no-preference"}    the phone's reduce-motion setting (prefers-reduced-motion); it keeps a scheme step's setting
 //   {"init": "<js source>"}                 runs before the page's own scripts on every later load, then reloads the page once (a
@@ -230,7 +231,7 @@ if (!ws) {
   pageWsUrl = targets.find((t) => t.type === "page").webSocketDebuggerUrl;
   ws = await within(openSocket(pageWsUrl, "chrome's page"), 15000, "the page websocket");
 }
-let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = []; const workerWaits = [];   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts; workerWaits: how each awaitWorkerSettled ended (the last 10)
+let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = []; const workerWaits = []; let swBypassed = false;   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts; workerWaits: how each awaitWorkerSettled ended (the last 10); swBypassed: a `no_sw` step is in force
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
@@ -377,6 +378,8 @@ const awaitWorkerSettled = async () => {
   // How each wait ENDED is kept (workerWaits, reported by the timeout block): a hang after a reload reads very differently when the wait
   // left on `settled` than when it ran out its deadline or gave up on an absent registration, and the log alone cannot tell them apart.
   let absent = 0; let how = "deadline"; let last = "not polled"; let polls = 0; const t0 = Date.now();
+  // A page under `no_sw` is never controlled, so "in control" can never come true: the wait would only run out its deadline on every reload.
+  if (swBypassed) { workerWaits.push({ how: "bypassed", last: "no_sw step in force", polls: 0, ms: 0, at: t0 }); if (workerWaits.length > 10) workerWaits.shift(); return; }
   for (const end = t0 + scaled(5000); Date.now() < end;) {
     const o = await evaluateOutcome("(async () => { const sw = navigator.serviceWorker; if (!sw) return 'none'; const r = await sw.getRegistration();"
       + " if (!r) return 'absent'; return (!r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller) ? 'settled' : 'pending'; })()",
@@ -440,6 +443,7 @@ for (const s of steps) {
   } else if (s.no_sw !== undefined) {
     const set = await send("Network.setBypassServiceWorker", { bypass: !!s.no_sw });
     if (set.error) throw new Error("no_sw: the service worker bypass was refused: " + JSON.stringify(set.error));
+    swBypassed = !!s.no_sw;
   } else if (s.emulate !== undefined) {
     await send("Emulation.setDeviceMetricsOverride", { width: s.emulate.w, height: s.emulate.h, deviceScaleFactor: s.emulate.dpr || 1, mobile: !!s.emulate.mobile });
     if (s.emulate.safe) await send("Emulation.setSafeAreaInsetsOverride", { insets: s.emulate.safe });   // the iPhone notch / status bar / home indicator
