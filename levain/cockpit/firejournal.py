@@ -52,7 +52,7 @@ from levain.cockpit.shortcode import (SHORT_ALPHABET, SHORT_LENGTH, SHORT_MAX_FA
                                        display_short, normalize_short)
 from levain.autonomic.durable_sqlite import MIN_SQLITE, open_durable, read_transaction, write_transaction
 # the journal is history across the rename: a row the release that said "spore" wrote is read in the new words
-from levain.cockpit.effects import (
+from levain.intention_legacy import (
     read_recorded_key,
     read_recorded_store,
     read_recorded_target,

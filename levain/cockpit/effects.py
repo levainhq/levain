@@ -26,7 +26,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
-from levain.intention_legacy import OLD_DISPOSITION_TO_NEW, OLD_EFFECT_STORE, OLD_KIND_TO_NEW, OLD_ROW_PREFIX
+from levain.intention_legacy import (  # noqa: F401  (the readers of history are re-exported: every name still resolves here)
+    INTENTION_KEY_PREFIX,
+    INTENTIONS,
+    read_recorded_fields,
+    read_recorded_key,
+    read_recorded_store,
+    read_recorded_target,
+    read_recorded_verb,
+    recorded_key_forms,
+)
 
 # --- the effect ----------------------------------------------------------------------------------
 
@@ -397,8 +406,7 @@ def _is_anneal_refusal(exc: BaseException) -> bool:
 
 # --- the intention adapter ---------------------------------------------------------------------------
 
-INTENTIONS = "intentions"
-INTENTION_KEY_PREFIX = "intention:"
+# INTENTIONS and INTENTION_KEY_PREFIX are defined in ``levain.intention_legacy`` (imported above): its history readers need them
 INTENTION_AUTHORITY_FIELDS = ("text", "domain", "disposition")
 # anneal fills these at write; none sits in an intention effect's ``changes``
 INTENTION_STORE_ASSIGNED = ("id", "seen", "created", "origin_key", "notes", "resolution.on", "resolution.at")
@@ -420,56 +428,10 @@ def intention_resource_key(origin_key: str) -> str:
 
 # --- readers of history ----------------------------------------------------------------------------
 # A signed record, an effects row and a label row are append-only: what the release that said "spore" wrote keeps its
-# spelling, and the journal holds ops across the update. These readers are the one place a recorded old spelling becomes
-# the new one, on READ. None accepts an old spelling as a NEW request (the builders, ``_origin_key_of`` and the verb
-# registry are new-only), and none writes: every new row carries the new spelling.
-
-def read_recorded_store(store: str) -> str:
-    """A recorded effect store name, as the broker now registers it."""
-    return INTENTIONS if store == OLD_EFFECT_STORE else store
-
-
-def read_recorded_key(resource_key: str) -> str:
-    """A recorded resource key, with the intention prefix in place of the old one; any other key is returned as it is."""
-    if resource_key.startswith(OLD_ROW_PREFIX):
-        return INTENTION_KEY_PREFIX + resource_key[len(OLD_ROW_PREFIX):]
-    return resource_key
-
-
-def recorded_key_forms(resource_key: str) -> tuple[str, ...]:
-    """Every spelling a journal row for this resource key may carry on disk, the current one first: an intention key was
-    written under the old prefix by the release that said "spore" and under the new one since. Any other key has one."""
-    key = read_recorded_key(resource_key)
-    if key.startswith(INTENTION_KEY_PREFIX):
-        return key, OLD_ROW_PREFIX + key[len(INTENTION_KEY_PREFIX):]
-    return (key,)
-
-
-def read_recorded_verb(verb: Any) -> Any:
-    """A recorded verb id (a signed record's, a pending's), under its new name; anything else is returned as it is."""
-    return OLD_KIND_TO_NEW.get(verb, verb) if isinstance(verb, str) else verb
-
-
-def read_recorded_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
-    """A recorded ``changes`` or ``projection`` of an intention effect, as a copy with the disposition an old release signed
-    (``seed``) read as the word that replaced it (``someday``), so an op signed before the rename completes instead of
-    ending refused at the write guard (ruling D2). The signed record keeps its bytes; the label a fire writes is computed
-    over this read value (``someday``), so the row renders under its signer's label, as the same disposition under its new
-    name. A disposition rewritten by ``levain update`` has no fire behind it and reads unverified."""
-    out = dict(fields)
-    disposition = out.get("disposition")
-    if isinstance(disposition, str):
-        out["disposition"] = OLD_DISPOSITION_TO_NEW.get(disposition, disposition)
-    return out
-
-
-def read_recorded_target(target: Mapping[str, Any]) -> dict[str, Any]:
-    """A recorded target with its ``row_id`` in the new prefix, as a copy: the signed record is never edited."""
-    out = dict(target)
-    row_id = out.get("row_id")
-    if isinstance(row_id, str):
-        out["row_id"] = read_recorded_key(row_id)
-    return out
+# spelling, and the journal holds ops across the update. The readers (``read_recorded_store`` / ``_key`` / ``_verb`` /
+# ``_fields`` / ``_target`` and ``recorded_key_forms``) are the one place a recorded old spelling becomes the new one, on
+# READ. They live in ``levain.intention_legacy``, because the fire journal that reads them is root-run code and this module
+# is operator-side; they are imported here so every name keeps resolving from ``levain.cockpit.effects``.
 
 
 def _origin_key_of(resource_key: str) -> str:

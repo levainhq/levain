@@ -29,7 +29,7 @@ from levain.autonomic.journal import JournalCorruptError
 from levain.cockpit.authority import LabelKey, unavailable
 from levain.cockpit.install import GOVERNED, REPORTED
 from levain.cockpit.consent import ConsentError, parse_stamp, value_sha256
-from levain.cockpit.effects import read_recorded_key
+from levain.intention_legacy import read_recorded_key
 from levain.cockpit.firejournal import CockpitDB, _parse_record
 
 if TYPE_CHECKING:
