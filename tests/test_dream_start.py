@@ -611,21 +611,23 @@ def test_d4_the_dream_group_help_states_the_retry_rule_the_code_has():
 # --------------------------------------------------------------------------- LOW N2: no placeholder command in a card
 
 def test_n2_a_consolidated_or_failed_card_cannot_be_built_without_the_store(tmp_path):
+    # D1-N made store_dir a required keyword on every kind (a call that omits it is a TypeError); a None or blank one
+    # is the ValueError this test pinned for the two kinds whose remedy prints a command that needs --store-dir
     for kind in ("consolidated", "failed"):
-        with pytest.raises(ValueError, match="store_dir"):
-            cd.build_card(kind, occurrence="o1")
-        with pytest.raises(ValueError, match="store_dir"):
-            cd.remedy_for(kind, "o1")
-    # an explicit remedy carries its own commands; a kind that prints no store command needs none
-    assert cd.build_card("consolidated", occurrence="o1", remedy="see the desk").body["remedy"] == "see the desk"
-    assert cd.build_card("rolled-back", occurrence="o1").body["remedy"]
+        with pytest.raises(ValueError, match="--store-dir"):
+            cd.build_card(kind, occurrence="o1", store_dir=None)
+        with pytest.raises(ValueError, match="--store-dir"):
+            cd.remedy_for(kind, "o1", store_dir=None)
+    # an explicit remedy carries its own commands
+    assert cd.build_card("consolidated", occurrence="o1", store_dir=None, remedy="see the desk").body["remedy"] == "see the desk"
+    assert cd.build_card("rolled-back", occurrence="o1", store_dir=tmp_path).body["remedy"]
     assert "<the store's directory>" not in cd.build_card("consolidated", occurrence="o1", store_dir=tmp_path).body["remedy"]
 
 
 def test_n2_from_spec_without_a_store_or_a_db_refuses_for_those_kinds(tmp_path):
     for kind in ("consolidated", "failed"):
-        with pytest.raises(ValueError, match="store_dir"):
-            cd.from_spec({"kind": kind, "occurrence": "o1"}, occ_dir=tmp_path / "dream" / "o1")
+        with pytest.raises(ValueError, match="--store-dir"):
+            cd.from_spec({"kind": kind, "occurrence": "o1"}, occ_dir=tmp_path / "dream" / "o1", store_dir=None)
     ok = cd.from_spec({"kind": "failed", "occurrence": "o1", "reason": "x"}, occ_dir=tmp_path / "dream" / "o1",
-                      db_path=tmp_path / "memory.db")
+                      db_path=tmp_path / "memory.db", store_dir=tmp_path)
     assert str(tmp_path) in ok.body["remedy"]
