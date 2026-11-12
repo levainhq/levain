@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import shlex
 from collections.abc import Callable, Mapping, Sequence
@@ -361,6 +362,7 @@ def day_ready(store_path: Path | str, row: Mapping[str, Any], *, now: datetime, 
         me = row.get("occurrence_id")
         if not isinstance(me, str) or not me.strip():
             raise ValueError("the occurrence row carries no occurrence_id")
+        floor_s = orphan_floor_s(agent_dir)       # the operator's age floor for a seat's dead wrap; None = shipped (off)
         manual = row.get("kind") == "manual"
         if manual and not row.get("launched_at"):
             # a manual run is checked while still `admitted`, before it has a launched_at: its own day is now's
@@ -371,7 +373,7 @@ def day_ready(store_path: Path | str, row: Mapping[str, Any], *, now: datetime, 
         # reads any admitted row of the agent as a dream in flight: it must not count itself
         rows = src.occurrences
         src.occurrences = lambda: [r for r in rows() if r.get("occurrence_id") != me]
-        v = _ready.evaluate(src, day=day, now=now, zone=zone, agent_id=agent_id, manual=manual)
+        v = _ready.evaluate(src, day=day, now=now, zone=zone, agent_id=agent_id, manual=manual, orphan_floor_s=floor_s)
     except Exception as exc:  # noqa: BLE001 - a predicate that cannot run has not said ready
         return InputVerdict(False, _ready.UNREADABLE, "unreadable", f"{type(exc).__name__}: {exc}")
     finally:
@@ -1081,9 +1083,17 @@ class DreamInstall:
     shadow_flow_root: Path | None = None
     instructions_path: Path | None = None
     flow_instructions: Path | None = None
+    #: D1-O. The operator's AGE FLOOR, in hours, for an open wrap the dream did not open (a seat's): admission passes
+    #: such a wrap only when this is set and the executor's own age rule, raised to this floor, says it is dead. It
+    #: SHIPS UNSET (``None``), and unset keeps the old behaviour: an open wrap keeps the dream quiet. Set only by a
+    #: person (``levain dream enable --store-dir <dir> --orphan-floor-hours <hours>``). A wrap the dream itself opened
+    #: needs no floor: the executor's bound judges it. A live install fact; a shadow install carries none.
+    orphan_floor_hours: float | None = None
 
 
 INSTALL_SCHEMA = 1
+#: ``write_install(orphan_floor_hours=ORPHAN_FLOOR_OFF)`` clears the floor (back to the shipped, unset state)
+ORPHAN_FLOOR_OFF = "off"
 #: the read-only copy of flow's instructions a shadow install composes with, in the agent store's directory
 SHADOW_INSTRUCTIONS = "shadow_instructions.md"
 #: the install facts only a shadow install carries; a write that does not pass ``shadow_flow_root`` drops them all
@@ -1092,6 +1102,47 @@ SHADOW_FACTS = ("shadow_flow_root", "flow_instructions")
 
 class InstallRefused(ValueError):
     """The install facts cannot be written or trusted; the message names the file and the one fact at fault."""
+
+
+def validate_orphan_floor_hours(value: object) -> float:
+    """``value`` as the age floor in hours, or :class:`InstallRefused`. A real number (not a bool, not a string), finite,
+    and not under the executor's own horizon (``ready.executor_orphan_horizon_s``): the executor never discards a younger
+    wrap, so a lower floor would admit a run that then refuses and spends the window's one attempt. The floor can only
+    raise the age a wrap must reach, never lower it."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise InstallRefused(f"orphan_floor_hours {value!r} is not a positive number of hours")
+    low = _ready.executor_orphan_horizon_s() / 3600.0
+    if value < low:
+        raise InstallRefused(f"orphan_floor_hours {value!r} is under the executor's own age rule ({low:.2f} hours, its "
+                             "bound plus grace plus margin): the executor never discards a younger wrap, so a lower "
+                             "floor would do nothing")
+    return value
+
+
+def orphan_floor_state(agent_dir: Path | str | None) -> tuple[float | None, str | None]:
+    """``(hours, problem)`` for the age floor the install in ``agent_dir`` holds: ``(hours, None)`` when one is set and
+    valid, ``(None, None)`` in the shipped state (no install, no floor, or a shadow install), ``(None, why)`` when the
+    install holds a floor that does not validate. Never raises."""
+    if agent_dir is None:
+        return None, None
+    try:
+        doc = json.loads((Path(agent_dir) / INSTALL_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None, None
+    if not isinstance(doc, dict) or doc.get("shadow_flow_root") is not None or "orphan_floor_hours" not in doc:
+        return None, None
+    try:
+        return validate_orphan_floor_hours(doc["orphan_floor_hours"]), None
+    except InstallRefused as exc:
+        return None, str(exc)
+
+
+def orphan_floor_s(agent_dir: Path | str | None) -> float | None:
+    """The age floor in seconds the install in ``agent_dir`` sets for an open wrap the dream did not open, or None
+    (the shipped state) when there is no install, no floor, or a floor that does not validate. Never raises: admission
+    reads it, and a floor it cannot trust is no floor (the wrap keeps the dream quiet, as it always did)."""
+    hours, _ = orphan_floor_state(agent_dir)
+    return None if hours is None else hours * 3600.0
 
 
 def _fact_path(doc: Mapping[str, Any], key: str, path: Path, *, kind: str, writing: bool = False) -> Path:
@@ -1349,10 +1400,19 @@ def read_install(agent_dir: Path | str) -> DreamInstall:
         if not instr.is_file():
             raise InstallRefused(f"{path}: the shadow's instructions copy {instr} is missing; run `levain dream enable` "
                                  "again")
+    floor = None
+    if "orphan_floor_hours" in doc:
+        if shadow_root is not None:
+            raise InstallRefused(f"{path}: orphan_floor_hours is a live install fact, and this install is a shadow")
+        try:
+            floor = validate_orphan_floor_hours(doc["orphan_floor_hours"])
+        except InstallRefused as exc:
+            raise InstallRefused(f"{path}: {exc}; run `levain dream enable --store-dir <dir> --orphan-floor-hours off` "
+                                 "to clear it") from exc
     return DreamInstall(store_path, cockpit_root, coord_dir, zone,
                         None if facts is None else Path(facts).expanduser(),
                         doc.get("model") or "claude-opus-5-5", doc.get("claude_bin") or "claude",
-                        shadow_root, instr, src)
+                        shadow_root, instr, src, floor)
 
 
 def _prior_doc(path: Path) -> dict[str, Any]:
@@ -1366,9 +1426,12 @@ def _prior_doc(path: Path) -> dict[str, Any]:
 def install_doc(agent_dir: Path | str, *, store_path: Path | str, cockpit_root: Path | str, coord_dir: Path | str,
                 zone: str, facts_path: Path | str | None = None, model: str | None = None,
                 claude_bin: str | None = None, shadow_flow_root: Path | str | None = None,
-                flow_instructions: Path | str | None = None) -> dict[str, Any]:
+                flow_instructions: Path | str | None = None,
+                orphan_floor_hours: float | str | None = None) -> dict[str, Any]:
     """The facts document :func:`write_install` would write for these arguments over the file in ``agent_dir`` (the
-    merge of the mode-agnostic optional facts included), with no check made and nothing written."""
+    merge of the mode-agnostic optional facts included), with no check made and nothing written. ``orphan_floor_hours``
+    is a LIVE install fact: a number sets it, :data:`ORPHAN_FLOOR_OFF` clears it, None keeps the prior one (a shadow
+    install never inherits one)."""
     prior = _prior_doc(Path(agent_dir) / INSTALL_FILE)
     doc: dict[str, Any] = {"schema": INSTALL_SCHEMA, "store_path": str(store_path), "cockpit_root": str(cockpit_root),
                            "coord_dir": str(coord_dir), "zone": zone}
@@ -1380,6 +1443,10 @@ def install_doc(agent_dir: Path | str, *, store_path: Path | str, cockpit_root: 
     for key, given in (("shadow_flow_root", shadow_flow_root), ("flow_instructions", flow_instructions)):
         if given is not None:
             doc[key] = str(given)
+    if orphan_floor_hours is not None and orphan_floor_hours != ORPHAN_FLOOR_OFF:
+        doc["orphan_floor_hours"] = orphan_floor_hours
+    elif orphan_floor_hours is None and shadow_flow_root is None and prior.get("orphan_floor_hours") is not None:
+        doc["orphan_floor_hours"] = prior["orphan_floor_hours"]
     return doc
 
 
@@ -1392,7 +1459,7 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
                   zone: str, facts_path: Path | str | None = None, model: str | None = None,
                   claude_bin: str | None = None, shadow_flow_root: Path | str | None = None,
                   flow_instructions: Path | str | None = None, replace_install: bool = False,
-                  check_only: bool = False) -> Path:
+                  check_only: bool = False, orphan_floor_hours: float | str | None = None) -> Path:
     """Write ``<agent_dir>/dream_install.json`` atomically (a temp file in the directory, fsynced, mode 0600, renamed
     over the old one), and read it back through :func:`read_install`. The checks :func:`read_install` makes are made
     here first (the instructions copy aside: this call makes it), plus two only an enable needs: a shadow's flow root
@@ -1415,8 +1482,15 @@ def write_install(agent_dir: Path | str, *, store_path: Path | str, cockpit_root
     prior = _prior_doc(path)
     doc = install_doc(agent_dir, store_path=store_path, cockpit_root=cockpit_root, coord_dir=coord_dir, zone=zone,
                       facts_path=facts_path, model=model, claude_bin=claude_bin, shadow_flow_root=shadow_flow_root,
-                      flow_instructions=flow_instructions)
+                      flow_instructions=flow_instructions, orphan_floor_hours=orphan_floor_hours)
     shadow = "shadow_flow_root" in doc
+    if "orphan_floor_hours" in doc:
+        if shadow:
+            raise InstallRefused(f"{path}: orphan_floor_hours is a live install fact (a shadow install has none)")
+        try:
+            validate_orphan_floor_hours(doc["orphan_floor_hours"])
+        except InstallRefused as exc:
+            raise InstallRefused(f"{path}: {exc}") from exc
     if prior and not replace_install:
         was = "shadow" if prior.get("shadow_flow_root") is not None else "live"
         now = "shadow" if shadow else "live"
