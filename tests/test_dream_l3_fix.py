@@ -154,6 +154,57 @@ def test_d_the_tick_gives_the_card_the_install_it_closes_for(tmp_path, monkeypat
     assert all(kw["install"] == da.read_install(rig.store.directory) for kw in seen), seen
 
 
+# --------------------------------- E (L2 F6, F7): a class that needs a person is not told "nothing needs doing by hand"
+
+_DB = "/tmp/some store/memory.db"
+_NEEDS_A_PERSON = ("unreadable", "unknown", "in-flight", "live-seat", "some-class-no-check-has-yet")
+
+
+def _levain_cmds(text: str) -> list[str]:
+    return [c for c in re.findall(r"`([^`]+)`", text) if c.startswith("levain ")]
+
+
+def _all_parse(text: str) -> None:
+    cache: dict = {}
+    for c in _levain_cmds(text):
+        assert _verdict(c, cache) is None, c
+        levain_cli.build_parser().parse_args(shlex.split(c)[1:])
+
+
+def test_e_a_class_that_needs_a_person_names_what_to_run_and_never_says_nothing_needs_doing():
+    for cls in _NEEDS_A_PERSON:
+        text = da.window_remedy(cls, _DB)
+        assert "nothing needs doing" not in text, (cls, text)
+        cmds = " | ".join(_levain_cmds(text))
+        assert "levain dream ready --store-dir '/tmp/some store' --agent-dir" in cmds, (cls, text)
+        assert "levain dream start" in cmds, (cls, text)
+        _all_parse(text)
+    for cls in ("unknown", "in-flight", "live-seat", "some-class-no-check-has-yet"):
+        assert "levain agents show dream" in " | ".join(_levain_cmds(da.window_remedy(cls, _DB))), cls
+
+
+def test_e_only_the_classes_that_clear_by_themselves_keep_nothing_needs_doing():
+    for cls in ("laptop-slept", "attempt-spent", "ceiling"):
+        assert da.window_remedy(cls, _DB).startswith("nothing needs doing by hand"), cls
+
+
+def test_e_with_the_install_known_the_commands_name_its_own_directories_and_agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home"))
+    rig = _live_rig(tmp_path)
+    inst = da.read_install(rig.store.directory)
+    ad = str(Path(rig.store.directory).resolve())
+    for cls in ("unreadable", "unknown"):
+        text = da.window_remedy(cls, rig.db, agent_dir=rig.store.directory, agent_id=rig.agent)
+        cmds = _levain_cmds(text)
+        (ready,) = [c for c in cmds if c.startswith("levain dream ready ")]
+        args = levain_cli.build_parser().parse_args(shlex.split(ready)[1:])
+        assert (args.agent_dir, args.agent_id, args.zone) == (ad, rig.agent, inst.zone), ready
+        assert Path(args.coord_dir) == inst.coord_dir.resolve() and Path(args.store_dir) == rig.db.parent, ready
+        (start,) = [c for c in cmds if c.startswith("levain dream start")]
+        assert levain_cli.build_parser().parse_args(shlex.split(start)[1:]).agent_store_dir == Path(ad), start
+        _all_parse(text)
+
+
 def test_a_todays_admitted_manual_row_is_still_the_one_resumed(tmp_path):
     rig = _live_rig(tmp_path)
     left = _claim(rig, "left-admitted-today")
