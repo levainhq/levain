@@ -50,7 +50,7 @@ from levain.agents.store import AgentStore
 from levain.autonomic.journal import EffectOutcome, EffectStatus, RunJournal
 
 __all__ = ["MAX_TRIES", "LEASE_S", "STOP_DEADLINE_S", "STOP_BUDGET_S", "ATTENTION_PREFIX", "Effected", "End", "Hooks",
-           "HOOKS", "Reaped", "Supervisor"]
+           "HOOKS", "Reaped", "Supervisor", "prime_authority"]
 
 _log = logging.getLogger("levain.agents.supervise")
 
@@ -151,6 +151,19 @@ def _executor_usage(executor: accounting.Executor) -> accounting.Usage:
     except Exception:  # noqa: BLE001 - unreadable is Usage(None, ...): the whole reservation is debited
         usage = None
     return usage if type(usage) is accounting.Usage else accounting.Usage(None, None, None, "unreadable")
+
+
+def prime_authority(authority: AgentAuthority) -> bool:
+    """Replay a fire's fresh authority once, before its run: a fire is a new process, and an authority that holds no
+    replay refuses its first fence read. True when the replay read. A refresh that fails is logged at debug and
+    swallowed: the supervisor meets the same failure on its own one refresh and reports it. It calls the authority
+    itself, never :meth:`Supervisor.refresh_once`, which remembers its result for the tick."""
+    try:
+        authority.refresh()
+    except Exception as exc:  # noqa: BLE001 - the failure is the supervisor's to meet again and report
+        _log.debug("agent fire: the authority pre-refresh failed (%s): %s", type(exc).__name__, exc)
+        return False
+    return True
 
 
 class Supervisor:
