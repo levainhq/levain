@@ -1679,14 +1679,19 @@ class Supervisor:
 
             judge = self.s.allow_judge or slot_allow.default_judge(qdir)
             refused: list = []
-            slot_allow.apply_answered(qdir, path, judge=judge, refused=refused)
-            for rule, why in refused:
-                self.say(f"slot allow rule answered yes, not carried: {rule} ({why}); the next time a slot saves it, "
-                         "it is asked again")
             try:
-                slot_allow.remind(qdir, path, judge=judge)
-            except Exception:   # noqa: BLE001 - a reminder never stops a launch
-                pass
+                slot_allow.apply_answered(qdir, path, judge=judge, refused=refused)
+            except slot_allow.LockBusy as e:
+                # another writer is slow: answered rows wait for the next launch; the stored rules still carry
+                self.say(f"slot allow: answered rows not applied this launch ({e})")
+            else:
+                for rule, why in refused:
+                    self.say(f"slot allow rule answered yes, not carried: {rule} ({why}); the next time a slot "
+                             "saves it, it is asked again")
+                try:
+                    slot_allow.remind(qdir, path, judge=judge)
+                except Exception:   # noqa: BLE001 - a reminder never stops a launch
+                    pass
             rules, skipped = slot_allow.carried(path, judge, slot_allow.store_id_of(QuestionStore(qdir)))
         except slot_allow.AllowRefused as e:
             self.say(f"slot allow rules not read ({e}): this session asks for everything the repo does not allow")
@@ -2299,11 +2304,21 @@ class Supervisor:
 
 
 def run_session(req: Request, seams: Optional[Seams] = None) -> int:
+    note = None
     if seams is None:
         from levain.consent.queue import default_queue_dir
 
-        seams = Seams(allow_dir=default_queue_dir())
-    return Supervisor(req, seams).run()
+        try:
+            allow_dir: Optional[Path] = default_queue_dir()
+        except Exception as e:   # noqa: BLE001 - the slot allow rules are a convenience: the launch goes on without
+            allow_dir = None
+            note = (f"slot allow rules off for this launch: the consent directory cannot be named "
+                    f"({type(e).__name__}: {e})")
+        seams = Seams(allow_dir=allow_dir)
+    sup = Supervisor(req, seams)
+    if note is not None:
+        sup.say(note)
+    return sup.run()
 
 
 __all__ = ["HOOKS_BY_AUTH", "REPO_SETTINGS", "Request", "STOP_SIGNALS", "Seams", "Supervisor", "TermFilter",

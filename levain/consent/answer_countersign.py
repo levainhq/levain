@@ -26,7 +26,7 @@ from urllib.parse import urlsplit
 
 from levain.contracts.namespaces import ANSWER_COUNTERSIGN_NAMESPACE as NS, LEVAIN_SIGN_REQUESTS
 
-__all__ = ["CARD_TITLE", "CARD_TTL_S", "CardResult", "SignQueue", "Verdict", "build_card", "countersign_evidence", "file_card", "nonce_of",
+__all__ = ["CARD_TITLE", "CARD_TTL_S", "CardResult", "EvidenceUnavailable", "SignQueue", "Verdict", "build_card", "countersign_evidence", "file_card", "nonce_of",
            "resolve_sign_queue", "sign_queue_dir", "sign_queue_hint", "verdict", "badge_words"]
 
 CARD_TTL_S = 24 * 3600
@@ -47,10 +47,24 @@ class CardResult:
 
 @dataclass(frozen=True)
 class Verdict:
-    """``state``: countersigned | open | expired | no-card | disowned | failed. Only ``countersigned`` reads as signed."""
+    """``state``: countersigned | open | expired | no-card | disowned | failed. Only ``countersigned`` reads as signed.
+    ``retry``: a ``failed`` that is no verdict on the card (the verifier, the passkeys or the store could not be read
+    now), so a reader that keeps the answer may ask again later."""
     state: str
     reason: str = ""
     signed_at: str | None = None
+    retry: bool = False
+
+
+class EvidenceUnavailable(Exception):
+    """The countersign could not be judged now (the verifier, the passkeys or the evidence store unreadable): no
+    verdict on the answer either way."""
+
+
+def _transient(exc: BaseException) -> bool:
+    """Whether ``exc`` is a read that may succeed later (an I/O or store failure), not something wrong with the card:
+    a file that is gone is a verdict (the card or its signature is not there)."""
+    return isinstance(exc, sqlite3.Error) or (isinstance(exc, OSError) and not isinstance(exc, FileNotFoundError))
 
 
 @dataclass(frozen=True)
@@ -269,7 +283,7 @@ def verdict(store: Any, question_id: str, *, sign_queue: Path | str | None,
     try:
         return _verdict(store, question_id, sign_queue, keys, now)
     except Exception as exc:  # noqa: BLE001 - fail closed
-        return Verdict("failed", f"{type(exc).__name__}")
+        return Verdict("failed", f"{type(exc).__name__}", retry=_transient(exc))
 
 
 def _verdict(store: Any, question_id: str, sign_queue: Path | str | None, keys: Any, now: datetime | None) -> Verdict:
@@ -318,8 +332,8 @@ def _verdict(store: Any, question_id: str, sign_queue: Path | str | None, keys: 
     try:
         record = json.loads((d / f"{rid}.signed.json").read_text(encoding="utf-8"))
         signature = (d / f"{rid}.sig").read_text(encoding="ascii")
-    except (OSError, ValueError):
-        return Verdict("failed", "the signature cannot be read")
+    except (OSError, ValueError) as exc:
+        return Verdict("failed", "the signature cannot be read", retry=_transient(exc))
     if (not isinstance(record, dict) or record.get("namespace") != NS
             or record.get("message_sha256") != hashlib.sha256(message).hexdigest()):
         return Verdict("failed", "the record is not over the card")
@@ -330,7 +344,7 @@ def _verdict(store: Any, question_id: str, sign_queue: Path | str | None, keys: 
     try:
         active = (keys or passkey_key_source(qdir, host))()
     except SignRefused:
-        return Verdict("failed", "the passkeys cannot be read now")
+        return Verdict("failed", "the passkeys cannot be read now", retry=True)
     fp = record.get("signer_fp")
     key = active.get(fp) if isinstance(fp, str) else None
     if key is None:
@@ -340,7 +354,7 @@ def _verdict(store: Any, question_id: str, sign_queue: Path | str | None, keys: 
     try:
         ok = _verified(message, signature, key)
     except VerifierUnavailable:
-        return Verdict("failed", "the signature could not be verified now")
+        return Verdict("failed", "the signature could not be verified now", retry=True)
     if not ok:
         return Verdict("failed", "the signature does not verify")
     try:
@@ -368,11 +382,20 @@ def countersign_evidence(store: Any, question_id: str, *, sign_queue: Path | str
                          keys: Any = None, now: datetime | None = None) -> tuple[str, str, str] | None:
     """``(message, signature, signer_fp)`` of the card the phone countersigned for ``question_id``, or ``None``:
     only when :func:`verdict` reads it as countersigned now. The bytes are what a later reader re-verifies by itself
-    (the card's message, its signature and the passkey's fingerprint); nothing here says they still hold then."""
-    if sign_queue is None or verdict(store, question_id, sign_queue=sign_queue, keys=keys, now=now).state != "countersigned":
+    (the card's message, its signature and the passkey's fingerprint); nothing here says they still hold then.
+    Raises :class:`EvidenceUnavailable` when the countersign cannot be judged now (a verdict marked ``retry``, or the
+    store or the card's files unreadable for a reason other than being gone): that is no verdict on the answer."""
+    if sign_queue is None:
+        return None
+    v = verdict(store, question_id, sign_queue=sign_queue, keys=keys, now=now)
+    if v.state != "countersigned":
+        if v.retry:
+            raise EvidenceUnavailable(v.reason)
         return None
     try:
         with store._peek() as conn:
+            if conn is None:
+                return None
             row = conn.execute("SELECT request_id FROM answer_countersign WHERE question_id = ?", (question_id,)).fetchone()
         if row is None:
             return None
@@ -383,7 +406,9 @@ def countersign_evidence(store: Any, question_id: str, *, sign_queue: Path | str
         record = json.loads((d / f"{row[0]}.signed.json").read_text(encoding="utf-8"))
         signature = (d / f"{row[0]}.sig").read_text(encoding="ascii")
         fp = record.get("signer_fp") if isinstance(record, dict) else None
-    except Exception:  # noqa: BLE001 - evidence that cannot be read is no evidence
+    except Exception as exc:  # noqa: BLE001 - evidence that cannot be read is no evidence
+        if _transient(exc):
+            raise EvidenceUnavailable(f"the countersign cannot be read now ({type(exc).__name__})") from None
         return None
     return (request.message, signature, fp) if isinstance(fp, str) else None
 
