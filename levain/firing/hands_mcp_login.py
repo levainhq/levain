@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from levain import pathid
-from levain.authority import STOPPED_BORN as STOPPED_WORDS
+from levain.authority import STOPPED_BORN, STOPPED_CURRENT
 from levain.firing import hands_login as hl
 from levain.firing.confinement import HandsIdentity
 from levain.hands_mcp import registration_problems
@@ -59,6 +59,8 @@ REMOVE_NOTICE = ("This remove is LOCAL ONLY: it cleared the login on this machin
                  "revoke the token at the provider. Revoke it there, on the provider's connected-apps page for {host}. "
                  "Anything that ran as the hands account could have used the login.")
 LINUX_EDGE = hl.LINUX_LOGIN_EDGE
+#: the skipped whys that mean a revoked key stopped the entry (born or last renewer); no renew brings one back
+STOP_REASONS = (STOPPED_BORN, STOPPED_CURRENT)
 
 
 class HandsMcpError(RuntimeError):
@@ -78,10 +80,11 @@ def cockpit_root_of(entity_dir: Path | str) -> Path:
 def load_registry(cockpit_root: Path | str, now: datetime | None = None) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """``(live entries, skipped (id, why))`` from the cockpit's verified, anchored replay, or :class:`HandsMcpError`.
     A log that cannot be read is an error, never an empty registry. An entry stopped because a key that signed it was
-    revoked (:func:`levain.authority.grants_in_force`) is not live and is skipped with the reason ``signer``, whatever
-    else is true of it (an expired one included: register it again, do not renew it). It stays in the log."""
+    revoked (:func:`levain.authority.grants_in_force`) is not live and is skipped with its stop reason as the why
+    (:func:`levain.authority.grant_stop_reason`: the creator's words or the last renewer's, one of :data:`STOP_REASONS`),
+    whatever else is true of it (an expired one included: register it again, do not renew it). It stays in the log."""
     from levain.agent_authority import AgentAuthority
-    from levain.authority import HANDS_MCP_KIND, NotInitialised, grants_in_force
+    from levain.authority import HANDS_MCP_KIND, NotInitialised, grant_stop_reason, grants_in_force
     from levain.cockpit.firejournal import DB_NAME
     from levain.hands_mcp import live_entries
     if not (Path(cockpit_root) / DB_NAME).is_file():
@@ -94,7 +97,7 @@ def load_registry(cockpit_root: Path | str, now: datetime | None = None) -> tupl
         raise HandsMcpError(f"the authority log cannot be read ({type(exc).__name__}: {str(exc)[:160]})") from None
     in_force = grants_in_force(state)
     live, skipped = live_entries(in_force, now or datetime.now(timezone.utc))
-    stopped = [(gid, "signer") for gid, g in state.policy.grants.items()
+    stopped = [(gid, grant_stop_reason(state, gid) or STOPPED_BORN) for gid, g in state.policy.grants.items()
                if gid not in in_force and isinstance(g, Mapping) and g.get("kind") == HANDS_MCP_KIND]
     return live, sorted(skipped + stopped)
 
@@ -275,9 +278,9 @@ def entry_for_signin(entity_dir: Path | str, cockpit_root: Path | str, name: str
         if not known:
             raise HandsMcpRefused(f"{name!r} is not registered for the hands account; nothing was changed")
         why = sorted({w for gid, w in skipped if any(k["id"] == gid for k in known)}) or ["not live"]
-        if why == ["signer"]:       # a renew does not bring a stopped entry back: it has to be registered again
-            raise HandsMcpRefused(f"{name!r} is registered but stopped: {STOPPED_WORDS}; register it again with a key "
-                                  "you hold. Nothing was changed")
+        if all(w in STOP_REASONS for w in why):   # a renew does not bring a stopped entry back: register it again
+            raise HandsMcpRefused(f"{name!r} is registered but stopped: {'; '.join(why)}; register it again with a "
+                                  "key you hold. Nothing was changed")
         raise HandsMcpRefused(f"{name!r} is registered but not live ({', '.join(why)}); renew or re-register it. "
                               "Nothing was changed")
     if e["transport"] != "remote":
@@ -487,8 +490,8 @@ def status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None) 
         rows.append((False, f"hands mcp config: unknown (the hands account's server list could not be read: {exc})"))
     live_names = {e["name"]: e for e in live}
     for gid, why in skipped:
-        rows.append((True, f"hands mcp entry {gid}: " + (f"stopped: {STOPPED_WORDS} (answers nothing; register it "
-                                                          "again to use it)" if why == "signer" else f"not live ({why})")))
+        rows.append((True, f"hands mcp entry {gid}: " + (f"stopped: {why} (answers nothing; register it "
+                                                          "again to use it)" if why in STOP_REASONS else f"not live ({why})")))
     if held is not None:
         for name in sorted(set(record) | set(held) | set(live_names)):
             rows.append(server_status(name, record.get(name), held.get(name), live_names.get(name)))
