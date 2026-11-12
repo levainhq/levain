@@ -172,6 +172,48 @@ def test_a_crash_among_ordinary_failures_blocks_the_whole_rerun(run):
     assert rc == 1 and reruns == []
 
 
+LONG = "tests/test_a.py::test_x[" + "-".join(["a-very-long-parametrize-id"] * 4) + "]"
+
+
+@pytest.mark.parametrize("crash_lines", [
+    "[gw3] node down: Not properly terminated\nreplacing crashed worker gw3\n",
+    f"worker 'gw3' crashed while running '{LONG}'\n",
+    f"[gw3] node down: Not properly terminated\n\nreplacing crashed worker gw3\n",
+    "maximum crashed workers reached: 2\n",
+    "worker gw3 crashed and worker restarting disabled\n",
+])
+def test_a_crash_in_the_log_body_blocks_a_rerun_even_when_the_summary_line_is_truncated(run, crash_lines):
+    # pytest cuts the summary reason to the terminal width, so a long id leaves a bare FAILED line with no crash text;
+    # xdist's own report lines in the body are what still say the worker died
+    log = ("..F\n" + crash_lines
+           + f"=== short test summary info ===\nFAILED {LONG}\n1 failed, 2 passed in 1s\n")
+    assert mod.parse_log(log) == ([LONG], True)
+    rc, reruns, rec = run(1, log, f"{LONG}\n")
+    assert rc == 1 and reruns == [] and not rec.exists()
+
+
+def test_a_bare_failed_line_with_no_crash_report_still_reruns(run):
+    log = f"..F\n=== short test summary info ===\nFAILED {LONG}\n1 failed, 2 passed in 1s\n"
+    assert mod.parse_log(log) == ([LONG], False)
+    rc, reruns, _ = run(1, log, f"{LONG}\n")
+    assert rc == 0 and len(reruns) == 1
+
+
+@pytest.mark.parametrize("msg", [
+    "node down: Not properly terminated",
+    "worker 'gw3' crashed while running 'tests/test_a.py::test_one'",
+    "replacing crashed worker gw3",
+])
+def test_an_assertion_message_that_merely_contains_crash_text_is_an_ordinary_failure(run, msg):
+    # the text is quoted inside a failure body and a summary reason, never the start of an xdist report line
+    log = (f"=== FAILURES ===\n___ test_one ___\n    def test_one():\n>       assert False, {msg!r}\n"
+           f"E       AssertionError: {msg}\n\n"
+           f"=== short test summary info ===\nFAILED {A} - AssertionError: {msg}\n1 failed in 1s\n")
+    assert mod.parse_log(log) == ([A], False)
+    rc, reruns, _ = run(1, log, f"{A}\n")
+    assert rc == 0 and len(reruns) == 1
+
+
 @pytest.mark.parametrize("outcome", ["skipped", "xfailed", "errored", "failed", "deselected", "nofile"])
 def test_a_rerun_that_exits_zero_without_every_node_passing_is_not_a_pass(run, outcome):
     # pytest exits 0 for a skipped or xfailed node, so the exit code alone must not decide

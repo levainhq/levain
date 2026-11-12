@@ -7,7 +7,7 @@ The shard step runs pytest with -rfE and tees the log. When pytest failed, this 
 the ledger (tests/ci/flake_ledger.txt: one node id per line, `#` comments; a missing file is an empty ledger, so with no
 ledger nothing ever reruns). It exits 1, with no rerun, unless pytest exited 1 (tests failed; any other code is an
 interrupt, usage or collection error), every failure is a FAILED line (no ERROR line), and every failed node id is on
-the ledger, and no failure is an xdist worker-crash report. Otherwise it reruns those node ids once; the rerun counts as
+the ledger, and the log carries no xdist worker-crash report on a line of its own. Otherwise it reruns those node ids once; the rerun counts as
 passed only if pytest exited 0 and its junit file shows every requested node passed (a skip, xfail, error or deselected
 node is not a pass). A test not on the ledger never reruns.
 
@@ -53,8 +53,12 @@ def _split_reason(rest):
 
 
 _ERR_ITEM = re.compile(r"^_+ ERROR (at (setup|teardown) of|collecting) ")
-# xdist reports a dead worker as an ordinary failed test; a crash is infrastructure, never a flake, so it is never rerun.
-_CRASH = re.compile(r"worker '[^']*' crashed|node down:|Not properly terminated|maximum crashed workers")
+# xdist's own crash reports, each only at the START of a line (optionally behind a `[gwN]` prefix): a dead worker is
+# infrastructure, never a flake, so it is never rerun. The same pattern is read against the reason of a FAILED line, again
+# only from its start, so an assertion message that merely quotes this text stays an ordinary failure.
+_CRASH = re.compile(
+    r"(?:\[gw\d+\]\s*)?\s*(?:node down:|replacing crashed worker |worker '[^']*' crashed while running |"
+    r"worker \S+ crashed and worker restarting disabled|maximum crashed workers reached)")
 
 
 def _rerun_all_passed(xml_path, requested):
@@ -75,13 +79,16 @@ def parse_log(text):
     captured output earlier cannot reopen it); a log with no such header yields no failures (the caller then does not
     rerun). Fail closed: any "ERROR " line in the summary, and any unparseable "FAILED " line, counts as errored. An
     "ERRORS" section header counts only when it precedes that summary and is followed by a pytest "ERROR at
-    setup/teardown of" (or "collecting") item line, so a bare header in captured output is ignored."""
+    setup/teardown of" (or "collecting") item line, so a bare header in captured output is ignored. An xdist crash
+    report at the start of any line, or at the start of a FAILED line's reason, counts as errored."""
     lines = text.splitlines()
+    # pytest cuts a summary reason to the terminal width, so the crash report is also read from the whole log
+    crashed = any(_CRASH.match(ln) for ln in lines)
     last = max((i for i, ln in enumerate(lines)
                 if (m := _HEADER.match(ln)) and m.group(1).strip() == "short test summary info"), default=None)
     if last is None:
-        return [], False
-    failed, errored = [], False
+        return [], crashed
+    failed, errored = [], crashed
     for i, ln in enumerate(lines[:last]):
         m = _HEADER.match(ln)
         if m and m.group(1).strip() == "ERRORS" and any(_ERR_ITEM.match(x) for x in lines[i + 1:last]):
@@ -94,7 +101,7 @@ def parse_log(text):
         elif ln.startswith("FAILED "):
             rest = ln.split(" ", 1)[1]
             nid = _split_reason(rest)
-            if not _NODE.match(nid) or _CRASH.search(rest[len(nid):]):
+            if not _NODE.match(nid) or _CRASH.match(rest[len(nid):].removeprefix(" - ")):
                 errored = True
             elif nid not in failed:
                 failed.append(nid)
