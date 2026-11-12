@@ -38,7 +38,8 @@ from pathlib import Path
 from typing import Any
 
 from levain import host_guard as hg
-from levain.authority import SEAT_LEASE_KIND, SEAT_LEASE_MAX, AuthoritySnapshot, NotInitialised, _parse_stamp, _thaw
+from levain.authority import (SEAT_LEASE_KIND, SEAT_LEASE_MAX, AuthoritySnapshot, NotInitialised, _parse_stamp, _thaw,
+                              grant_stop_reason, grants_in_force)
 from levain.seat_profile import SeatProfile, SeatRefusal, build_seat_profile
 
 __all__ = ["SEAT_LEASE_KIND", "SeatLaunchRefused", "LaunchPlan", "live_lease", "key_dir_for", "ensure_launcher_key",
@@ -67,9 +68,12 @@ def _canonical(value: Any) -> str:
 def live_lease(state: AuthoritySnapshot, now: datetime) -> Mapping[str, Any] | None:
     """The one live seat-root lease the verified replay ``state`` holds at ``now`` (its fields, plus ``incarnation``:
     the seq of the link that brought its id into the policy), or None. More than one live is refused (the log refuses
-    to append a second; a foreign writer could leave two): which one a launch means is not an answer."""
+    to append a second; a foreign writer could leave two): which one a launch means is not an answer.
+
+    A lease whose signer was revoked is stopped (:func:`levain.authority.grants_in_force`) and is not read here: it is
+    still in the policy, so it still counts at append and can still be revoked (:func:`stopped_lease`)."""
     live = []
-    for gid, grant in state.policy.grants.items():
+    for gid, grant in grants_in_force(state).items():
         if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_LEASE_KIND):
             continue
         try:
@@ -83,6 +87,25 @@ def live_lease(state: AuthoritySnapshot, now: datetime) -> Mapping[str, Any] | N
         return None
     gid, grant = live[0]
     return {**_thaw(grant), "incarnation": state.grant_born.get(gid, 0)}
+
+
+def stopped_lease(state: AuthoritySnapshot, now: datetime) -> tuple[str, str] | None:
+    """``(id, why)`` of an unexpired seat-root lease the policy holds that :func:`live_lease` does not read because a key
+    that signed it was revoked, or None. It tells the operator why a launch is refused when this is the reason; it never
+    authorises anything."""
+    for gid in sorted(state.policy.grants):
+        grant = state.policy.grants[gid]
+        if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_LEASE_KIND):
+            continue
+        why = grant_stop_reason(state, gid)
+        if why is None:
+            continue
+        try:
+            if _parse_stamp(grant["expires_at"], "expires_at") > now:
+                return gid, why
+        except Exception:  # noqa: BLE001 - a lease whose expiry cannot be read is not live, stopped or not
+            continue
+    return None
 
 
 def _replay(cockpit_root: Path | str) -> AuthoritySnapshot | None:
@@ -409,6 +432,10 @@ def _lease_and_key(cockpit_root: Path, clock: Callable[[], datetime], install: P
     state = _replay(cockpit_root)
     lease = None if state is None else live_lease(state, clock())
     if lease is None:
+        stopped = None if state is None else stopped_lease(state, clock())
+        if stopped is not None:     # a stopped lease still blocks a second one (the append rule reads the raw policy)
+            raise SeatLaunchRefused(f"No seat can launch: the seat-root lease stopped when {stopped[1]} ({stopped[0]}). "
+                                    f"Revoke it, then sign a new one: {SIGN_COMMAND}")
         raise SeatLaunchRefused(f"no live seat-root lease: a launch needs one, and never falls back to a prompt. "
                                 f"Sign one: {SIGN_COMMAND}")
     lanes, returns = Path(lease["lanes_parent"]), Path(lease["returns_parent"])
