@@ -1109,8 +1109,12 @@ def validate_orphan_floor_hours(value: object) -> float:
     and not under the executor's own horizon (``ready.executor_orphan_horizon_s``): the executor never discards a younger
     wrap, so a lower floor would admit a run that then refuses and spends the window's one attempt. The floor can only
     raise the age a wrap must reach, never lower it."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-        raise InstallRefused(f"orphan_floor_hours {value!r} is not a positive number of hours")
+    try:
+        finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+    except OverflowError:                       # an integer too large for a float (a hand-written 10**400)
+        finite = False
+    if not finite or value <= 0:
+        raise InstallRefused(f"orphan_floor_hours {value!r:.80} is not a positive number of hours")
     low = _ready.executor_orphan_horizon_s() / 3600.0
     if value < low:
         raise InstallRefused(f"orphan_floor_hours {value!r} is under the executor's own age rule ({low:.2f} hours, its "
