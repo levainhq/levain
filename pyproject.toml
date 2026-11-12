@@ -154,7 +154,7 @@ dependencies = [
     # intention-store release. Open rows are keyed `intentions` (levain's `spores` key is renamed with it), and a schema-1 store is
     # refused until `anneal-memory intention migrate-key` converts it. The pin sits AHEAD of the PyPI publish of 2.0.0 on this
     # branch only (release_gate gate e tests this named ref, Phill np-61eb6709 (b)). KNOWN_GOOD_ANNEAL moves with this floor.
-    "anneal-memory>=2.0,<2.1",
+    "anneal-memory>=2.0.0,<2.1",
     # The reply classifier (levain.firing.agent_reply.unreadable_tool_call) reads Markdown code regions with a
     # CommonMark parser rather than a hand-written one: four review rounds on a hand reader each found its next edge
     # (Phill 2026-10-05, "Let's do A"). Floor 4.0: 3.0.0 took 23 s on a reply of 5,000 reference definitions,
