@@ -344,8 +344,27 @@ def test_t16_hands_mcp_list_and_the_sign_in_refusal_say_stopped(world, tmp_path,
     assert "renew" not in str(exc.value)
 
 
+def test_t16_an_entry_whose_last_renewer_was_revoked_says_renewed_not_signed(world, monkeypatch) -> None:
+    """A live key creates the entry, a key revoked since renewed it: both the list row and the sign-in refusal give the
+    renewer's words, never the creator's."""
+    world.entry("hm-000000000001", "files", by="b")
+    world.renew("hm-000000000001", "a")
+    world.revoke_key("a", by="b")
+    monkeypatch.setattr(hml.hl, "load_hands_identity", lambda entity: object())
+    monkeypatch.setattr(hml, "read_record", lambda entity: {})
+    monkeypatch.setattr(hml, "vendor_servers", lambda hands, entity, sweep=False: {})
+    rows, _code = hml.status_rows(world.entity, world.root)
+    lines = [line for _ok, line in rows if line.startswith("hands mcp entry")]
+    assert lines == [f"hands mcp entry hm-000000000001: stopped: {CURRENT} (answers nothing; register it again to use it)"]
+    with pytest.raises(hml.HandsMcpRefused) as exc:
+        hml.entry_for_signin(world.entity, world.root, "files")
+    assert str(exc.value) == (f"'files' is registered but stopped: {CURRENT}; register it again with a key you hold. "
+                              "Nothing was changed")
+    assert BORN not in str(exc.value)
+
+
 def test_t16_an_entry_that_is_merely_expired_keeps_its_old_words(world, tmp_path) -> None:
-    """Only the ``signer`` reason is reworded: an expired entry is still told to renew or re-register it."""
+    """Only a stop reason is reworded: an expired entry is still told to renew or re-register it."""
     world.entry("hm-000000000001", "files")
     with pytest.raises(hml.HandsMcpRefused) as exc:
         hml.entry_for_signin(world.entity, world.root, "files", _now() + timedelta(days=3))

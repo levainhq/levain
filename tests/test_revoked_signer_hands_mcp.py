@@ -2,8 +2,8 @@
 
 An entry is a ``create_grant`` link in the authority log. The registry the hands account's servers are rendered and signed
 in from (``levain.firing.hands_mcp_login.load_registry``) reads the entries a key that was revoked since did NOT sign
-(``levain.authority.grants_in_force``): a stopped entry is not live, and it is reported as skipped with the reason
-``signer``. The entry is still in the log (so it can be revoked or listed). Throwaway ed25519 keys in tmp_path, a throwaway
+(``levain.authority.grants_in_force``): a stopped entry is not live, and it is reported as skipped with its stop reason
+(the creator's words or the last renewer's). The entry is still in the log (so it can be revoked or listed). Throwaway ed25519 keys in tmp_path, a throwaway
 cockpit, real ``ssh-keygen``: nothing of the operator's is read.
 """
 from __future__ import annotations
@@ -103,23 +103,23 @@ def test_control_an_entry_is_live_while_its_signers_are_active(world) -> None:
     assert _registry(world) == (["hm-000000000001"], [])
 
 
-def test_an_entry_whose_born_signer_was_revoked_is_not_live_and_is_skipped_as_signer(world) -> None:
-    """Key A signs the entry, B revokes A: the entry is left out of the live registry and reported with the reason
-    ``signer``. It is still in the log: the policy holds it, so it can be listed or revoked."""
+def test_an_entry_whose_born_signer_was_revoked_is_not_live_and_is_skipped_with_the_born_reason(world) -> None:
+    """Key A signs the entry, B revokes A: the entry is left out of the live registry and reported with the creator's
+    stop reason. It is still in the log: the policy holds it, so it can be listed or revoked."""
     world.entry("hm-000000000001", "files", "a")
     world.revoke_key("a", "b")
-    assert _registry(world) == ([], [("hm-000000000001", "signer")])
+    assert _registry(world) == ([], [("hm-000000000001", auth.STOPPED_BORN)])
     assert "hm-000000000001" in AgentAuthority(world.root).replay().policy.grants
 
 
-def test_an_entry_whose_last_renewer_was_revoked_is_not_live_and_is_skipped_as_signer(world) -> None:
+def test_an_entry_whose_last_renewer_was_revoked_is_not_live_and_is_skipped_with_the_renewer_reason(world) -> None:
     """B signs the entry (born), A renews it; A is revoked since: the CURRENT link's signer counts too, so the entry
-    stops although the key that created it is active."""
+    stops although the key that created it is active, and the reason is the renewer's, not the creator's."""
     world.entry("hm-000000000001", "files", "b")
     world.renew("hm-000000000001", "a")
     assert _registry(world)[0] == ["hm-000000000001"]
     world.revoke_key("a", "b")
-    assert _registry(world) == ([], [("hm-000000000001", "signer")])
+    assert _registry(world) == ([], [("hm-000000000001", auth.STOPPED_CURRENT)])
 
 
 def test_a_key_that_signed_nothing_of_the_entry_does_not_stop_it(world) -> None:
@@ -127,15 +127,15 @@ def test_a_key_that_signed_nothing_of_the_entry_does_not_stop_it(world) -> None:
     world.entry("hm-000000000001", "files", "a")
     world.entry("hm-000000000002", "other", "c")
     world.revoke_key("c", "b")
-    assert _registry(world) == (["hm-000000000001"], [("hm-000000000002", "signer")])
+    assert _registry(world) == (["hm-000000000001"], [("hm-000000000002", auth.STOPPED_BORN)])
 
 
-def test_a_stopped_entry_that_has_also_expired_is_reported_as_signer(world) -> None:
+def test_a_stopped_entry_that_has_also_expired_is_reported_as_stopped(world) -> None:
     """The reason that no renew repairs wins over ``expired``: the operator is told to register it again, not to renew."""
     world.entry("hm-000000000001", "files", "a")
     world.revoke_key("a", "b")
     later = _now() + timedelta(days=3)
-    assert _registry(world, later) == ([], [("hm-000000000001", "signer")])
+    assert _registry(world, later) == ([], [("hm-000000000001", auth.STOPPED_BORN)])
 
 
 def test_signin_refuses_a_stopped_entry_and_says_why(world, tmp_path: Path) -> None:
