@@ -296,8 +296,9 @@ def fire_factory(store: AgentStore, occurrence_id: str, launch_epoch: int, *,
     register_session_win_check()
     # the episode's agent id is the occurrence's own agent_id and the role the SIGNED spec pins, never agents.name
     hooks = None if install.episodic_path is None else _episode_hooks(store, install, row[0], signed["role"]["role_hash"])
-    sup = supervise.Supervisor(store, authority=AgentAuthority(install.cockpit_root), clock=clock, journal=journal,
-                               hooks=hooks)
+    authority = AgentAuthority(install.cockpit_root)
+    supervise.prime_authority(authority)   # a fire is a fresh process: replay once, so the first fence read is not refused
+    sup = supervise.Supervisor(store, authority=authority, clock=clock, journal=journal, hooks=hooks)
     extra = {} if clock is None else {"clock": clock}   # a test seam: production passes none and both read real time
     return {**extra, "sup": sup, "role": role, "values": dict(install.values), "recall": recall, "launcher": launcher,
             "exposure": None if reserved is None else reserved.exposure,

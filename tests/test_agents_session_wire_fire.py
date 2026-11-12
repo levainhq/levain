@@ -82,6 +82,21 @@ def test_a_production_fire_with_the_stub_named_ends_done(rig, monkeypatch):
     assert (code, row["state"], row["reason"]) == (0, "done", "completed") and len(stub.launches) == 1
 
 
+def test_a_production_session_fires_log_does_not_open_with_the_cold_start_cover_warning(rig, monkeypatch, caplog):
+    # behaviour: the factory replays its fresh authority before the run, so the journal's "risk fence ... unreadable
+    # (AgentCoverMoved)" line does not head the fire's log, and the run still ends done
+    from levain.agents import gauges
+    monkeypatch.setattr(gauges, "_CHECKS", _AcceptAll())
+    oid = _session_occurrence(rig)
+    stub = Stub()
+    W.register_launcher("stub", lambda store: stub)
+    _install(rig, launcher="stub")
+    with caplog.at_level("WARNING"):
+        code = _fire(rig, oid, monkeypatch)
+    assert "unreadable (AgentCoverMoved)" not in caplog.text, caplog.text
+    assert (code, rig.row(oid)["state"]) == (0, "done")
+
+
 def test_the_factory_admits_nothing_the_launch_admitted_the_run_once(rig):
     oid = _session_occurrence(rig)
     _install(rig)
