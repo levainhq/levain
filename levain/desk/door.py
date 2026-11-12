@@ -162,9 +162,9 @@ def _write_record_paths() -> list[Path]:
     from levain import home_guard
 
     paths = _record_paths()
-    own = _own_home()
-    if (len(paths) > 1 and own is not None and home_guard.guarded_run() is not None
-            and not home_guard.vouched_scratch(own)):
+    # one lookup of the account home, the one _record_paths made: the copy is judged by its own path, so a second
+    # password-database lookup that failed could never leave it in a guarded run's writes
+    if len(paths) > 1 and home_guard.guarded_run() is not None and not home_guard.vouched_scratch(paths[1]):
         paths = paths[:1]
     return paths
 
