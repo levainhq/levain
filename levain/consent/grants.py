@@ -32,7 +32,7 @@ from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, 
                               UnsignedLink, VerifierUnavailable, anchor_path, append,
                               consent_grant, consent_grant_tool_problem, consent_resolved_workspace,
                               contained_shell_grant, grant_stop_reason, grants_stopped_by, inert_grant,
-                              passkey_revocable, prepare, voice_key_record)
+                              passkey_revocable, prepare, stopped_way, voice_key_record)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
@@ -411,10 +411,12 @@ def _stopped_tail(grant: Mapping[str, Any]) -> str:
     return f"{field('kind')} grant"
 
 
-def stopped_line(why: str) -> str:
+def stopped_line(why: str, kind: Any = None) -> str:
     """How a list line says a grant is stopped: the reason (:func:`levain.authority.grant_stop_reason`'s sentence), what
-    that means for the grant and the way back."""
-    return f"stopped: {why} (answers nothing; create it again to use it)"
+    that means for the grant and the way back for its ``kind`` (:func:`levain.authority.stopped_way`: a kind with a
+    one-live rule is revoked first)."""
+    way = stopped_way(kind)
+    return f"stopped: {why} (answers nothing; {way if kind == HANDS_MCP_KIND else way + ' to use it'})"
 
 
 def stopped_by_key(data_root: Path | str, fingerprint: str, *, now: datetime,
@@ -438,7 +440,9 @@ def stopped_by_key(data_root: Path | str, fingerprint: str, *, now: datetime,
 
 def stopped_notice(stopped: list[tuple[str, str, str]]) -> list[str]:
     """The lines `levain cockpit keys revoke` prints after its own ``revoked:`` line: each grant the revoked key signed,
-    now stopped, and the two ways forward; or the sentence that none was signed by it (said, never silent)."""
+    now stopped, then the way to use each again in the order that works for its kind (:func:`levain.authority.
+    stopped_way`: a kind with a one-live rule is refused at create until the stopped one is revoked) and the revoke
+    verb; or the sentence that none was signed by it (said, never silent)."""
     if not stopped:
         return ["No standing grant was signed by this key."]
     n = len(stopped)
@@ -446,8 +450,16 @@ def stopped_notice(stopped: list[tuple[str, str, str]]) -> list[str]:
              f"{'It answers' if n == 1 else 'They answer'} nothing from now on, though "
              f"{'it has' if n == 1 else 'they have'} not expired:"]
     lines += [f"  {gid}  {words}" for gid, _kind, words in stopped]
-    lines.append("To use one again, create it again with a key you still hold (a renew does not bring it back).")
-    lines.append("To clear it from the list: levain consent grant revoke --signing-key <key> -- <id>")
+    ways: dict[str, list[str]] = {}                  # first seen first: the rows come sorted by id, the ways by rank
+    for gid, kind, _words in stopped:
+        ways.setdefault(stopped_way(kind), []).append(gid)
+    it = "it" if n == 1 else "one"
+    lines.append(f"A renew does not bring {it} back. To use {it} again:")
+    rank = {stopped_way(None): 0, stopped_way(SEAT_LEASE_KIND): 1}   # create-only first, revoke-then-create, the rest
+    for way in sorted(ways, key=lambda w: rank.get(w, 2)):
+        shown = way if way == stopped_way(HANDS_MCP_KIND) else f"{way} with a key you still hold"
+        lines.append(f"  {shown}: {', '.join(ways[way])}")
+    lines.append("To revoke one: levain consent grant revoke --signing-key <key> -- <id>")
     if any(kind == EGRESS_KEY_KIND for _gid, kind, _words in stopped):
-        lines.append("A chat key clears with: levain chat key revoke --signing-key <key> <id>")
+        lines.append("A chat key revokes with: levain chat key revoke --signing-key <key> <id>")
     return lines

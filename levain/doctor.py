@@ -3852,8 +3852,11 @@ def _check_standing_grants(install: Path) -> list[CheckResult]:
     state = got.authority
     if state is None or got.authority_error is not None:
         return []
-    stopped = {gid: why for gid in sorted(state.policy.grants)
-               if (why := _auth.grant_stop_reason(state, gid)) is not None}
+    from collections.abc import Mapping
+
+    # one read of the raw policy: the ids to name and each one's kind (for the way back), the stop judged by the helper
+    kinds = {gid: g.get("kind") if isinstance(g, Mapping) else None for gid, g in sorted(state.policy.grants.items())}
+    stopped = {gid: why for gid in kinds if (why := _auth.grant_stop_reason(state, gid)) is not None}
     if not stopped:
         return []
     n = len(stopped)
@@ -3861,9 +3864,15 @@ def _check_standing_grants(install: Path) -> list[CheckResult]:
     cause = (f"the key that signed {it} was revoked" if all(why == _auth.STOPPED_BORN for why in stopped.values())
              else f"a key that signed or last renewed {it} was revoked")
     shown = ", ".join(str(visible(gid)) for gid in list(stopped)[:5]) + (f" and {n - 5} more" if n > 5 else "")
+    # a kind with a one-live rule still counts a stopped grant at create (ruling R-C): its create is refused until the
+    # stopped one is revoked, so "create it again" alone would send the operator into that refusal
+    revoke_first = any(_auth.stopped_way(kinds[gid]) != _auth.stopped_way(None) for gid in stopped)
+    hint = (f"Revoke {it} to clear the list (levain consent grant revoke --signing-key <key> -- <id>); a seat-root "
+            "lease, seat-egress grant, chat key, voice key or hands entry must be revoked before it is created again."
+            if revoke_first else f"Create {it} again with a key you hold, or revoke {it} to clear the list.")
     return [CheckResult("standing grants", True,
                         f"{n} standing grant{'' if n == 1 else 's'} stopped because {cause}; {they} nothing ({shown})",
-                        f"Create {it} again with a key you hold, or revoke {it} to clear the list.", warn=True)]
+                        hint, warn=True)]
 
 
 def _check_cockpit_key_files(install: Path, *, key_dirs: list[Path] | None = None) -> list[CheckResult]:
