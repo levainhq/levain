@@ -267,6 +267,29 @@ def test_a_record_the_store_could_not_update_is_reported_and_leaves_the_migratio
     assert any(ids["open"] in ln and "left as it is" in ln for ln in report.lines())
 
 
+@pytest.mark.parametrize("how", ["read_only_file", "a_directory"])
+def test_a_gitignore_that_cannot_be_written_does_not_stop_the_migration(tmp_path: Path, how: str) -> None:
+    """The git-ignore line for the backup directory is best-effort: a `.gitignore` the store dir cannot take (read-only, or
+    something that is not a file) is no refusal and no traceback, and the migration still runs (1111-32 L3 round 1,
+    deepseek 5 claimed it escapes: it does not, `_ensure_gitignored` catches the OSError itself)."""
+    import os
+
+    paths, ids = _old_store(tmp_path)
+    gi = tmp_path / ".levain" / ".gitignore"
+    if how == "read_only_file":
+        if os.geteuid() == 0:
+            pytest.skip("root writes through a read-only mode")
+        gi.write_text("sessions/\n")
+        gi.chmod(0o444)
+    else:
+        gi.mkdir()
+
+    report = _migrate(paths)
+
+    assert report.refused is None and sorted(report.migrated) == sorted([ids["open"], ids["talk"]])
+    assert report.backup is not None and report.backup.is_file()
+
+
 def test_the_report_says_the_provenance_label_degrades(tmp_path: Path) -> None:
     """A label is the sha256 of a signed field value: the rewritten disposition matches no signed fire."""
     from levain.cockpit.consent import value_sha256
