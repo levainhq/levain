@@ -26,7 +26,8 @@ in the occurrence directory, the snapshot, and the card on the desk.
 
 A hand start that claims a row and does not launch it ends that row (``stopped``, reason ``hand_start_*``): an
 ``admitted`` row blocks every scheduled slot behind it, and nothing launches a manual row on a tick. A launch that did
-happen is never ended here.
+happen is never ended here. An admitted manual row left by a start of an earlier local day is not resumed (it would
+launch under that day's window key and escape today's count): it is ended the same way and a fresh one is claimed.
 
 Nothing here reads or writes the anneal store; the fire does, as it does at night.
 """
@@ -211,21 +212,32 @@ def start(store: Any, *, clock: Callable[[], datetime] | None = None, authority:
     live = [r for r in ready._read_occurrences(Path(store.directory))
             if r.get("agent_id") == agent_id and r.get("state") in ("admitted", "launched")]
     resumed = False
+    oid: str | None = None
+    today = manual_window_key(now, inst.zone)
     if live:
         mine = [r for r in live if r.get("kind") == "manual" and r.get("state") == "admitted"]
-        if len(live) == 1 and len(mine) == 1:
-            # an earlier hand start was claimed and could not launch (a store busy, a cover that moved): this run IS
-            # the retry; no second occurrence is claimed beside it
+        if len(live) == 1 and len(mine) == 1 and mine[0].get("window_key") == today:
+            # an earlier hand start of TODAY was claimed and could not launch (a store busy, a cover that moved): this
+            # run IS the retry; no second occurrence is claimed beside it
             oid, resumed = mine[0]["occurrence_id"], True
+        elif len(live) == 1 and len(mine) == 1:
+            # one of an earlier local day (a start killed outright after its claim): resumed, it would launch under that
+            # day's window key and escape today's manual count, so it is ended and a fresh occurrence is claimed
+            stale = mine[0]["occurrence_id"]
+            left = _end_unlaunched(store, stale, REASON_INTERRUPTED, clock)
+            if left in ("admitted", "launched"):
+                return _refused(f"{stale} is a hand start of an earlier day ({mine[0].get('window_key')}) that never "
+                                f"launched, and it could not be ended (it is {left}); nothing was claimed. "
+                                "`levain agents show dream` says more")
         else:
             r = live[0]
             return _refused(f"{r.get('occurrence_id')} ({r.get('kind')}, {r.get('state')}) is still in flight, and the "
                             "dream runs one occurrence at a time; nothing was claimed")
-    else:
+    if oid is None:
         key = f"hand-{_stamp(now)}-{secrets.token_hex(3)}"   # never a dedupe: two starts a second apart are two starts
         with store.write() as conn:
             oid, outcome = ctl.claim(conn, agent_id=agent_id, kind="manual", key=key, spec_hash=spec_hash,
-                                     binding_id=binding, window_key=manual_window_key(now, inst.zone), now=now)
+                                     binding_id=binding, window_key=today, now=now)
         if outcome != ctl.CLAIMED:
             return Started(1, outcome, f"the claim answered {outcome}: another occurrence of the dream is live or this "
                                        "second was already claimed; nothing was started", oid)
