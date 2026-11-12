@@ -595,6 +595,37 @@ def test_t18_the_row_goes_when_the_stopped_grant_is_revoked(world, capsys) -> No
     assert D._check_standing_grants(world.entity) == []
 
 
+def _anchor_unreadable(world, monkeypatch) -> None:
+    anchor = auth.anchor_path(world.root)
+    anchor.unlink()
+    anchor.mkdir()                                               # a read of it raises an OSError, not FileNotFoundError
+
+
+def _verifier_down(world, monkeypatch) -> None:
+    def down(*_a, **_k):
+        raise auth.VerifierUnavailable("ssh-keygen could not run")
+    monkeypatch.setattr(auth, "snapshot", down)
+
+
+def _log_refused(world, monkeypatch) -> None:
+    def refused(*_a, **_k):
+        raise auth.AuthorityError("link 3 does not verify")
+    monkeypatch.setattr(auth, "snapshot", refused)
+
+
+@pytest.mark.parametrize("cause", [_anchor_unreadable, _verifier_down, _log_refused])
+def test_t18_a_log_the_authority_row_calls_unreadable_gets_no_second_row(world, monkeypatch, cause) -> None:
+    """A log that cannot be read is said once, by the ``cockpit authority`` row: the standing-grants row adds nothing,
+    through the same doctor wrapper the run uses (a builder that raised would be its own failure row)."""
+    world.consent("cg-A")
+    world.revoke_key("a", by="b")
+    assert len(D._guarded("standing grants", lambda: D._check_standing_grants(world.entity))) == 1   # control
+    cause(world, monkeypatch)
+    assert D._guarded("standing grants", lambda: D._check_standing_grants(world.entity)) == []
+    (row,) = D._guarded("cockpit authority", lambda: D._check_cockpit_authority(world.entity))
+    assert (row.name, row.ok, row.warn) == ("cockpit authority", True, True)
+
+
 def test_t18_the_row_is_wired_into_the_doctor_run() -> None:
     assert '_check_standing_grants(install)' in inspect.getsource(D._run_doctor)
 
