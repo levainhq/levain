@@ -18,7 +18,7 @@ from levain.cockpit.verbs import dispatch
 from levain.consent import band
 from levain.consent.questions import QuestionStore
 from levain.desk.store import CoordStore
-from levain.intention_legacy import OLD_ID_PREFIX
+from levain.intention_legacy import OLD_ID_PREFIX, STORE_DOC_KEY_OPEN
 from levain.intentions import guarded_intention_store
 from levain.writes import EditError, WriteScope, apply_edit
 
@@ -618,7 +618,7 @@ def test_the_target_is_read_one_way_by_germination_and_by_then_you(tmp_path, qdi
     path = _intentions(root)
     import json
     data = json.loads(path.read_text())
-    next(s for s in data["spores"] if s["id"] == a["id"])["target"] = target          # a hand-edited store
+    next(s for s in data[STORE_DOC_KEY_OPEN] if s["id"] == a["id"])["target"] = target          # a hand-edited store
     path.write_text(json.dumps(data))
     assert _machine_part({"id": f"intention:{a['id']}", "facets": {"target": target}})
     with pytest.raises(split.ThenRefused, match="handed to the desk or a board"):
