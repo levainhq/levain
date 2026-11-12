@@ -9,8 +9,8 @@ order, and every one of them is the controller's own code:
   again (:func:`levain.agents.controller.launch`: the agent registered and active, its spec unmoved, no open bar, the
   link live and its signer still enrolled).
 * **the ceiling.** The launch reserves under the link's SIGNED ``run_ceiling`` and budgets (``accounting.reserve``),
-  counting the day's manual runs and the scheduled runs of the window that holds now (A0 §2.6: one signed limit covers
-  both kinds). On top of it the day-ready check 1 stops at :data:`levain.dream.ready.RUN_CEILING` launched runs.
+  counting what ``accounting.count_span`` of now names: inside 22:00-05:00 that night's scheduled runs and hand starts,
+  either side of midnight; outside it the daytime's hand starts (one signed limit covers both kinds). On top of it the day-ready check 1 stops at :data:`levain.dream.ready.RUN_CEILING` launched runs.
 * **the admission.** The occurrence is ``kind = 'manual'``, so the dream's own input hook
   (:func:`levain.dream.agent.install_on_input`, via ``controller.launch``'s default hook) runs
   :func:`levain.dream.ready.evaluate` with ``manual=True``: check 6 (the window's one attempt) is waived, because a
@@ -27,7 +27,7 @@ in the occurrence directory, the snapshot, and the card on the desk.
 A hand start that claims a row and does not launch it ends that row (``stopped``, reason ``hand_start_*``): an
 ``admitted`` row blocks every scheduled slot behind it, and nothing launches a manual row on a tick. A launch that did
 happen is never ended here. An admitted manual row left by a start of an earlier local day is not resumed (it would
-launch under that day's window key and escape today's count): it is ended the same way and a fresh one is claimed.
+launch filed under that day's window key, a name that no longer matches when it ran): it is ended the same way and a fresh one is claimed.
 
 Nothing here reads or writes the anneal store; the fire does, as it does at night.
 """
@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
@@ -68,21 +68,21 @@ def _stamp(moment: datetime) -> str:
 
 
 def window_for(now: datetime, zone: str):
-    """The :class:`levain.agents.controller.Window` a MANUAL launch at ``now`` counts over: today in the install's
-    zone (local midnight to the next, as UTC text; ``Limits.span_start`` is inclusive, ``span_end`` exclusive) and the
-    scheduled window holding now, or None outside 22:00-05:00 (A0 §2.6)."""
+    """The :class:`levain.agents.controller.Window` a MANUAL launch at ``now`` counts over: ``accounting.count_span``
+    of ``now`` over the dream's window (Phill's ruling np-8ec243e5 (a)). Inside 22:00-05:00 that is the night, with the
+    night's key, so the hand start shares the night's allowance with its scheduled runs and its other hand starts,
+    either side of midnight; outside it, the daytime 05:00-22:00, which no night's run touches."""
+    from levain.agents.accounting import count_span
     from levain.agents.controller import Window
     from levain.dream import ready
 
-    z = ZoneInfo(zone)
-    local = now.astimezone(z)
-    start = datetime(local.year, local.month, local.day, tzinfo=z)
-    end = datetime(*(local + timedelta(days=1)).timetuple()[:3], tzinfo=z)
-    return Window(_stamp(start), _stamp(end), ready.window_holding(now, zone))
+    span = count_span(ready.WINDOW, zone, now)
+    return Window(span.span_start, span.span_end, span.window_key)
 
 
 def manual_window_key(now: datetime, zone: str) -> str:
-    """The window key a hand start files under, ``m:<local date>``: the form check 1 and the accounting count manual runs by."""
+    """The window key a hand start files under, ``m:<local date>``. It names the row; it is not what the row counts
+    against: the ceiling and check 1 count a hand start by the instant it launched (``accounting.count_span``)."""
     return f"m:{now.astimezone(ZoneInfo(zone)).date().isoformat()}"
 
 
@@ -221,8 +221,8 @@ def start(store: Any, *, clock: Callable[[], datetime] | None = None, authority:
             # run IS the retry; no second occurrence is claimed beside it
             oid, resumed = mine[0]["occurrence_id"], True
         elif len(live) == 1 and len(mine) == 1:
-            # one of an earlier local day (a start killed outright after its claim): resumed, it would launch under that
-            # day's window key and escape today's manual count, so it is ended and a fresh occurrence is claimed
+            # one of an earlier local day (a start killed outright after its claim): resumed, it would launch filed under
+            # that day's window key, a name that no longer matches when it ran, so it is ended and a fresh occurrence is claimed
             stale = mine[0]["occurrence_id"]
             left = _end_unlaunched(store, stale, REASON_INTERRUPTED, clock)
             if left in ("admitted", "launched"):
