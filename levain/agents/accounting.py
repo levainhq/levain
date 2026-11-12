@@ -160,7 +160,7 @@ def count_span(window: Mapping[str, str] | None, zone: str, at: datetime) -> Cou
     a scheduled one and a hand start alike, and a run launched outside every window counts against the daytime it falls
     in, from the last window's end to the next window's start, so a night's runs never count against a day or the other
     way round. ``window`` is the schedule's ``{"start": "HH:MM", "end": "HH:MM"}`` in ``zone``; None (or a start equal
-    to its end) is the whole calendar day, keyed ``d:<date>`` as the schedule keys it.
+    to its end) is the whole calendar day, keyed ``d:<date>`` here (the dream's own window never takes this branch).
 
     A window and its span come from :func:`levain.agents.schedule.window_key` and ``window_span``, the functions the
     scheduled slots are keyed and launched by, so the night a hand start counts against is the very night a scheduled
