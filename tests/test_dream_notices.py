@@ -259,6 +259,23 @@ def test_the_restore_drill_runs_in_the_tick_over_a_real_snapshot(night):
     assert last is not None and last["outcome"] == "ok", (last, night.err)
 
 
+def test_1112_1_f8_the_tick_hands_the_drill_whether_a_dream_run_is_launched(night, monkeypatch):
+    assert dream(night.ent.db, "o1", _VALID).outcome == "saved"
+    seen = []
+    real = da.drill_tick
+
+    def spy(*a, **kw):
+        seen.append(kw.get("dream_running"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(da, "drill_tick", spy)
+    root = night.ent.db.parent / "dream"
+    night.row(night.last_closed, "launched")                      # a dream occurrence the fire has launched
+    assert night.tick() == T.EXIT_OK, night.err
+    assert seen == [True] and sn.last_drill(root) is None         # the drill did not run, so it took no lock
+    assert not [i for i in night.items() if i.body.get("kind") == "attention"]
+
+
 def test_a_failed_drill_raises_an_attention_item_a_reader_sees(night, monkeypatch):
     assert dream(night.ent.db, "o1", _VALID).outcome == "saved"
     real = sn.drill
