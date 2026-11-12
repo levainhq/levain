@@ -267,6 +267,19 @@ def test_a_kept_read_fault_is_the_searchs_to_report_never_a_plain_reads(rig: Rig
     assert any("kept memory could not be read" in x["reason"] for x in got["skipped"]) and got["status"] == "partial"
 
 
+def test_a_search_and_a_plain_read_of_one_snapshot_never_share_the_kept_etag_text(rig: Rig) -> None:
+    """The snapshot is shared and keeps the canonical text of its rows for the etag (``_Snap.etag_frags``): a read with no
+    ``q`` hashes the rows without the kept part, a search hashes them with it, in either order and again."""
+    _keep(rig, rig.ids["plain"])
+    plain = rig.ck.panel("tray", credential_class="token")
+    found = rig.ck.panel("tray", credential_class="token", q="noticed Z")
+    assert any(r["facets"]["surface"] == "kept" for r in found["rows"])
+    assert not any(r["facets"]["surface"] == "kept" for r in plain["rows"])
+    assert plain["etag"] != found["etag"]
+    assert rig.ck.panel("tray", credential_class="token")["etag"] == plain["etag"]
+    assert rig.ck.panel("tray", credential_class="token", q="noticed Z")["etag"] == found["etag"]
+
+
 def test_a_new_episode_does_not_move_a_query_less_etag(rig: Rig) -> None:
     before = rig.panel()["etag"]
     with Store(str(rig.src.anneal.episodic_db)) as st:
