@@ -233,3 +233,21 @@ def test_f4_the_readme_row_is_the_dream_groups_own_help():
     assert "enable" in info["group_help"] and "ready" in info["group_help"]   # the stale row named neither
 
 
+
+
+# ------------------------------------------------------------------------------------------------------------- F5
+
+def test_f5_the_desk_brief_says_a_running_desk_keeps_the_memory_it_loaded():
+    from levain.desk import seam
+
+    assert "dreaming (D1) and memory freshness are not built" not in seam.NOT_BUILT
+    assert "keeps the memory it loaded" in seam.NOT_BUILT
+    assert f"Not built: {seam.NOT_BUILT}" in seam.verbose_lines()
+
+
+def test_f5_the_signing_card_and_the_changelog_say_it_too():
+    card = da.signing_card_text("America/New_York", per_run_usd=20.0, night_usd=40.0, expires="x")
+    assert "keeps the memory it loaded" in card
+    changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
+    bullet = next(ln for ln in changelog.splitlines() if ln.startswith("- **The dream runs with seats live"))
+    assert "keeps the memory it loaded" in bullet
