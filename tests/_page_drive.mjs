@@ -362,8 +362,8 @@ const awaitWorkerSettled = async () => {
   for (const end = Date.now() + scaled(5000); Date.now() < end;) {
     const o = await evaluateOutcome("(async () => { const sw = navigator.serviceWorker; if (!sw) return 'none'; const r = await sw.getRegistration();"
       + " if (!r) return 'absent'; return (!r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller) ? 'settled' : 'pending'; })()",
-      Math.min(Math.max(end - Date.now(), 250), 1500));
-    if ("error" in o) { await sleep(50); continue; }
+      Math.min(Math.max(end - Date.now(), 250), scaled(1500)));
+    if ("error" in o) { absent = 0; await sleep(50); continue; }       // "8 in a row" means in a row: an error breaks the run
     if (o.value === "none" || o.value === "settled") break;
     absent = o.value === "absent" ? absent + 1 : 0;
     if (absent >= 8) break;
