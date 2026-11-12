@@ -117,7 +117,11 @@ def test_the_tick_passes_the_launch_what_the_hand_start_passes(tmp_path, hook, m
     slot = _boundary(rig)
     _claim_the_slot(rig, Spawns(), slot)
     (kw,) = seen
-    assert kw["window"] == st.window_for(slot + MIN, ZONE)
+    # 1111-38 fix round: a scheduled row's span is the window its own key names (this rig's schedule has no window, so
+    # its key is the slot's local day), not the hand start's window_for(now)
+    (row,) = _rows(rig)
+    lo, hi = schedule.window_span({"window": None}, ZONE, row["window_key"])
+    assert kw["window"] == ctl.Window(ctl._stamp(lo), ctl._stamp(hi), None)
     assert kw["now"] == slot + MIN
     assert kw["authority"] is rig.authority
     assert callable(kw["on_input"])                                  # the dream's hook, PASSED, never the default
