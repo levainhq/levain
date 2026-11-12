@@ -282,7 +282,9 @@ def test_a_free_slot_never_ends_an_occurrence_as_no_slot(tmp_path):
                   (ctl.CURSOR_PREFIX + ag, "2026-11-02T11:58:00Z"))
     ctl.tick(store, lambda: T0 + MIN, armed)
     r = ctl.tick(store, lambda: T0 + 40 * MIN, armed)                        # past grace, both slots free
-    assert r.no_slot == [] and _rows(store)[0] == ("2026-11-02T12:00:00Z", "admitted", None)
+    # D1-Q: still never ended as no_slot (that reason is for a held cap); a row past its grace that nothing launched
+    # now ends for what it is
+    assert r.no_slot == [] and _rows(store)[0] == ("2026-11-02T12:00:00Z", "missed", ctl.NEVER_LAUNCHED)
 
 
 def test_an_expired_desk_lease_frees_the_slot_the_tick_would_have_refused(tmp_path):
@@ -333,4 +335,7 @@ def test_closing_an_occurrence_releases_a_slot_it_holds_and_an_unreadable_cap_ha
     with store.write() as c:                                                 # a cap nobody can read
         c.execute("INSERT INTO agent_settings (key, value) VALUES ('max_slots', 'lots')")
     r = ctl.tick(store, lambda: T0 + 61 * MIN, armed)                        # the tick completes and still claims
-    assert r.overlapped == [(ag, "2026-11-02T13:00:00Z")] and r.no_slot == []   # it walked the slot, nothing halted
+    # it walked the slot, nothing halted. D1-Q: the 12:40 row, admitted and 21 minutes old, is ended without reading
+    # the cap (an admitted row holds nothing), so 13:00 is claimed, not filed skipped-overlap behind it
+    assert r.claimed == [(ag, "2026-11-02T13:00:00Z")] and r.overlapped == [] and r.no_slot == []
+    assert r.unlaunched == [(ag, "2026-11-02T12:40:00Z")]
