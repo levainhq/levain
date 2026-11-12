@@ -139,6 +139,7 @@ def _cmd_revoke(args: argparse.Namespace) -> int:
 def _cmd_list(args: argparse.Namespace) -> int:
     from levain.cli import _cockpit_refusals, _cockpit_root, _utc_now
     from levain.cockpit.display_safe import visible
+    from levain.authority import VOICE_KEY_KIND
     from levain.consent.grants import stopped_line
     from levain.voice import custody
 
@@ -152,5 +153,5 @@ def _cmd_list(args: argparse.Namespace) -> int:
     for r in rows:
         print(f"{visible(r['id'])}  {r['provider']}  {','.join(r['uses'])}  service {visible(r['source'])}  "
               f"account {visible(r['account'])}  "
-              + (stopped_line(r["stopped_why"]) if r["state"] == "stopped" else "stands until revoked"))
+              + (stopped_line(r["stopped_why"], VOICE_KEY_KIND) if r["state"] == "stopped" else "stands until revoked"))
     return 0
