@@ -224,15 +224,16 @@ if (!ws) {
   let targets = null;
   for (let i = 0; i < 80 && !targets; i++) { try { targets = await (await fetch(`http://127.0.0.1:${port}/json`)).json(); } catch { await sleep(250); } }
   if (!targets) { console.error("chrome never answered"); await giveUp(2); }
-  pageWsUrl = targets.find((t) => t.type === "page").webSocketDebuggerUrl;
+  const pageTarget = targets.find((t) => t.type === "page");
+  pageWsUrl = pageTarget.webSocketDebuggerUrl; ourTargetId = pageTarget.id;   // the id of the page THIS drive drives: a popup the page opened is a page target too
   ws = await within(openSocket(pageWsUrl, "chrome's page"), 15000, "the page websocket");
 }
 let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = [];   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts
 const T0 = Date.now(); let lastEventAt = T0; const navTrail = [];   // lastEventAt / navTrail: what the page last said and when, for the timeout block (a page that stops answering is told apart from one that never loaded)
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
-  lastEventAt = Date.now();
-  if (/^(Page\.(frameStartedLoading|frameNavigated|frameStoppedLoading|loadEventFired|domContentEventFired|navigatedWithinDocument)|Inspector\.(targetCrashed|detached))$/.test(d.method || "")) { navTrail.push(`+${lastEventAt - T0}ms ${d.method.replace(/^(Page|Inspector)\./, "")}${d.params && d.params.reason ? " " + d.params.reason : ""}`); if (navTrail.length > 14) navTrail.shift(); }
+  if (d.method) lastEventAt = Date.now();   // events only: the {id,result} replies to the driver's own commands (the timeout probe's included) are not the page speaking
+  if (/^(Page\.(frameStartedLoading|frameNavigated|frameStoppedLoading|loadEventFired|domContentEventFired|navigatedWithinDocument)|Inspector\.(targetCrashed|detached))$/.test(d.method || "")) { navTrail.push(`+${Date.now() - T0}ms ${d.method.replace(/^(Page|Inspector)\./, "")}${d.params && d.params.reason ? " " + d.params.reason : ""}`); if (navTrail.length > 14) navTrail.shift(); }
   if (d.method === "Inspector.targetCrashed") consoleLog.push("PAGE CRASHED: Inspector.targetCrashed (the renderer died)");
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
   if (d.method === "Runtime.consoleAPICalled") consoleLog.push(`console.${d.params.type}: ` + (d.params.args || []).map((a) => String(a.value !== undefined ? a.value : (a.description || a.type))).join(" ").slice(0, 300));
@@ -302,25 +303,27 @@ const targetState = async () => {
     if (sharedPort && bws && ourTargetId) {
       const r = await Promise.race([bsend("Target.getTargets"), sleep(2000).then(() => null)]);
       if (!r) return "browser did not answer Target.getTargets within 2000ms";
+      if (r.error) return `browser answered Target.getTargets with an error: ${String(r.error.message || JSON.stringify(r.error)).slice(0, 120)}`;
       const t = (r.result?.targetInfos || []).find((x) => x.targetId === ourTargetId);
-      return t ? `listed, attached=${t.attached} url=${String(t.url).slice(0, 120)} title=${String(t.title).slice(0, 60)}` : "NOT LISTED (the page target is gone)";
+      return t ? `listed, id=${ourTargetId} attached=${t.attached} url=${String(t.url).slice(0, 120)} title=${String(t.title).slice(0, 60)}` : "NOT LISTED (the page target is gone)";
     }
     if (port) {
       const list = await (await fetch(`http://127.0.0.1:${port}/json`, { signal: AbortSignal.timeout(2000) })).json();
-      const t = list.find((x) => x.type === "page");
-      return t ? `listed, url=${String(t.url).slice(0, 120)} title=${String(t.title).slice(0, 60)}` : "NOT LISTED (no page target)";
+      const t = list.find((x) => x.id === ourTargetId);
+      return t ? `listed, id=${ourTargetId} url=${String(t.url).slice(0, 120)} title=${String(t.title).slice(0, 60)}` : "NOT LISTED (this drive's page target is not in the browser's list)";
     }
   } catch (e) { return "browser unreachable: " + String(e && e.message || e).slice(0, 80); }
-  return "?";
+  return "no browser connection to ask";
 };
 const timeoutBlock = async (shotPath) => {
+  const quietMs = Date.now() - lastEventAt;   // taken before any await: the probe's own wait must not read as the page having spoken or being silent
   try {
     const probe = await evaluateOutcome("(() => { try { const m = document.querySelector('#levain-modal'); return JSON.stringify({ url: location.href, ready: document.readyState, modal: !!m, rows: m ? m.querySelectorAll('[data-question-row]').length : null, text: String((document.body && document.body.innerText) || '').slice(0, 600) }); } catch (e) { return JSON.stringify({ probe_error: String(e) }); } })()", 3000);
     let o = {}; try { o = JSON.parse(probe.value); } catch { o = { probe_error: probe.error || "no answer" }; }
     const lines = ["--- page state at the timeout ---",
       `PAGE URL: ${o.url ?? "?"}`, `READY STATE: ${o.ready ?? "?"}`,
       `MODAL: #levain-modal exists=${o.modal ?? "?"} [data-question-row] count=${o.rows ?? "?"}` + (o.probe_error ? ` (probe error: ${o.probe_error})` : ""),
-      `TARGET: ${await targetState()}`, `LAST PAGE EVENT: ${Date.now() - lastEventAt}ms ago; NAV TRAIL: ${navTrail.join(", ") || "none"}`,
+      `TARGET: ${await targetState()}`, `LAST PAGE EVENT: ${quietMs}ms ago; NAV TRAIL: ${navTrail.join(", ") || "none"}`,
       `CONSOLE (last 20 of ${consoleLog.length}):`, ...consoleLog.slice(-20).map((c) => "  " + c),
       "BODY TEXT (first 600):", String(o.text ?? "").replace(/\n{2,}/g, "\n"),
       `SCREENSHOT: ${shotPath || "none"}`, "--- end page state ---"];
