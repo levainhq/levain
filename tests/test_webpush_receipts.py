@@ -924,7 +924,7 @@ def test_the_command_filters_by_ref_prints_text_and_refuses_a_bad_since(tmp_path
 
 # --- row 187: the receipt carries the worker's version and the app-badge call's result ---------------------------------
 
-SW_NOW = "1110-13-r187-1"
+SW_NOW = "__LEVAIN_SHELL_VERSION__"   # the worker source carries the placeholder; the server derives the served version (1111-20)
 DEV1 = "https://fcm.googleapis.com/fcm/send/dev1"      # the endpoint the worker rig's getSubscription answers with
 
 
