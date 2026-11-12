@@ -263,13 +263,18 @@ def _when_text(zone: str, time: str) -> str:
 
 
 def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expires: str,
-                      time: str = DEFAULT_TIME, store_dir: Path | str | None = None) -> str:
+                      store_dir: Path | str | None, time: str = DEFAULT_TIME) -> str:
     """The words the link's signing card carries (§6), with the numbers the caller computed from §2.4's ``R``. ``time``
     is the install's time setting; it is part of the spec the link signs, so the card says it and a changed time is a
-    new card to sign. ``store_dir`` is the directory holding the install's ``memory.db``: the Undo command needs it
-    (``levain dream rollback`` requires ``--store-dir``), so the card prints it when the install is known and a plain
-    placeholder when it is not."""
-    sd = shlex.quote(str(store_dir)) if store_dir is not None else _card._STORE_DIR_UNKNOWN
+    new card to sign. ``store_dir`` is the directory holding the install's ``memory.db`` and has NO default: the Undo
+    command needs it (``levain dream rollback`` requires ``--store-dir``), so the caller says it. ``None`` is the
+    caller saying the install's facts are not written yet; the card then names the verb and no command line, so it
+    never prints a stand-in for a path. A blank string is refused."""
+    if store_dir is None:
+        undo = ("`levain dream rollback` (each morning card names the exact command, with this install's store in it)")
+    else:
+        undo = (f"`levain dream rollback <occurrence> --store-dir {shlex.quote(_card.required_store_dir(store_dir))}` "
+                "(each morning card names the exact command)")
     return (f"Dream consolidates this install's memory {_when_text(zone, time)}, and only when the day has new "
             "episodes and no other consolidation is in progress. Seats may be live while it runs: it works from the "
             "episodes recorded before it starts, and whatever a seat records during it is kept and goes to the next "
@@ -278,8 +283,7 @@ def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expire
             "crystal tier, and it never sends, pushes or publishes. A running desk keeps the memory it loaded until "
             "it is started again; the dream seam that rotates a desk onto the new text is not built. It spends at most "
             f"${per_run_usd:.2f} a run and ${night_usd:.2f} a night (2 runs) at list price; each compose stops early "
-            "enough that the one model call that can run past its cap still fits inside the run's limit. Undo: "
-            f"`levain dream rollback <occurrence> --store-dir {sd}` (each morning card names the exact command) "
+            f"enough that the one model call that can run past its cap still fits inside the run's limit. Undo: {undo} "
             "restores the memory text in one step; that day's episodes stay "
             f"counted as consolidated and are not offered again. Until: {expires}, review by the same date.")
 
@@ -663,7 +667,7 @@ def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Se
             out.action = "standing"
             return out
         c = _card.build_card("did-not-consolidate", occurrence=f"window {key}", agent_id=agent_id, day=day.isoformat(),
-                             reason=f"{cls}: night did not consolidate: {detail}",
+                             store_dir=Path(store_path).parent, reason=f"{cls}: night did not consolidate: {detail}",
                              remedy=remedy or window_remedy(cls, store_path),
                              out_dir=occ_dir if occ_dir is not None and Path(occ_dir).is_dir() else None)
         _, new = _card.file_card(review_store, c, feed=feed)

@@ -24,6 +24,8 @@ from levain.dream import snapshot as sn
 from levain.dream import usage as us
 from tests.test_dream_snapshot import _VALID, add_episode, dream, occ, scratch, text_n  # noqa: F401
 
+SD = "/data/levain store"          # the directory holding the store's memory.db (a card's commands need it; no default)
+
 FEED = "digest"
 
 
@@ -57,7 +59,7 @@ def test_the_bound_is_the_review_stores_bound():
 
 def test_an_unresolved_contradiction_files_authority_relevant_1(review_store):
     notes = {"contradictions": [{"what": "flow 2 says X, levain 2a says not X", "episodes": ["d8c428d6"]}]}
-    c = cd.build_card("consolidated", occurrence="o1", day="2026-11-02", prior=_VALID, saved=text_n(1), notes=notes)
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="o1", day="2026-11-02", prior=_VALID, saved=text_n(1), notes=notes)
     assert c.authority_relevant and len(c.body["his"]) == 1 and "d8c428d6" in c.body["his"][0]
     item = filed(review_store, c)
     assert item.authority_relevant is True
@@ -66,7 +68,7 @@ def test_an_unresolved_contradiction_files_authority_relevant_1(review_store):
 
 def test_unknown_commit_files_authority_relevant_1(review_store):
     spec = rc._card("failed", rc.UNKNOWN_COMMIT, "o2", his=["the save may have committed; nothing was adopted"])
-    c = cd.from_spec(spec, occ_dir=review_store.directory.parent)
+    c = cd.from_spec(spec, store_dir=SD, occ_dir=review_store.directory.parent)
     assert c.kind == "failed" and c.authority_relevant and c.body["reason"] == rc.UNKNOWN_COMMIT
     assert filed(review_store, c).authority_relevant is True
 
@@ -74,7 +76,7 @@ def test_unknown_commit_files_authority_relevant_1(review_store):
 def test_a_consolidated_card_with_only_own_files_authority_relevant_0(review_store):
     notes = {"premise_flags": [{"ruling": "R", "why": "the ground moved"}], "for_phill": [{"what": "keep X?"}],
              "retired": [{"what": "Y", "his_words": "Y is dead as of today for all of us", "episodes": ["e1"]}]}
-    c = cd.build_card("consolidated", occurrence="o3", day="2026-11-02", prior=_VALID, saved=text_n(1), notes=notes)
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="o3", day="2026-11-02", prior=_VALID, saved=text_n(1), notes=notes)
     assert c.body["his"] == [] and not c.authority_relevant
     assert any("premise moved: R" in x for x in c.body["own"]) and any("for Phill: keep X?" in x for x in c.body["own"])
     item = filed(review_store, c)
@@ -84,7 +86,7 @@ def test_a_consolidated_card_with_only_own_files_authority_relevant_0(review_sto
 
 
 def test_a_did_not_consolidate_card_files_authority_relevant_0(review_store):
-    c = cd.build_card("did-not-consolidate", occurrence="2026-11-02", day="2026-11-02",
+    c = cd.build_card("did-not-consolidate", store_dir=SD, occurrence="2026-11-02", day="2026-11-02",
                       reason="the laptop slept", remedy="levain dream run-now")
     assert c.dedupe_key == "dream-night:dream:2026-11-02" and not c.authority_relevant
     assert filed(review_store, c).authority_relevant is False
@@ -93,7 +95,7 @@ def test_a_did_not_consolidate_card_files_authority_relevant_0(review_store):
 @pytest.mark.parametrize("reason", [rc.COMMITTED_NOT_RECORDED, rc.COMMITTED_AFTER_STOP])
 def test_a_recovered_commit_card_files_authority_relevant_0(review_store, reason):
     spec = rc._card("consolidated", reason, "o4")
-    c = cd.from_spec(spec, occ_dir=review_store.directory.parent)
+    c = cd.from_spec(spec, store_dir=SD, occ_dir=review_store.directory.parent)
     assert c.kind == "consolidated" and c.body["reason"] == reason and c.body["his"] == []
     assert not c.authority_relevant and filed(review_store, c).authority_relevant is False
 
@@ -101,13 +103,13 @@ def test_a_recovered_commit_card_files_authority_relevant_0(review_store, reason
 def test_a_rolled_back_card_is_flows_and_keys_by_the_rollback(review_store):
     spec = {"kind": "rolled-back", "dedupe_key": "dream-rollback:o5", "occurrence": "o5", "who": "operator",
             "at": "2026-11-03T06:00:00Z", "files": ["memory.continuity.md"], "limit": sn.LIMIT}
-    c = cd.from_spec(spec, occ_dir=review_store.directory.parent)
+    c = cd.from_spec(spec, store_dir=SD, occ_dir=review_store.directory.parent)
     assert c.dedupe_key == "dream-rollback:o5" and not c.authority_relevant
     assert "memory.continuity.md" in c.body["reason"] and sn.LIMIT in c.body["reason"]
 
 
 def test_a_card_is_filed_once_per_key(review_store):
-    c = cd.build_card("did-not-consolidate", occurrence="n", day="2026-11-02", reason="r")
+    c = cd.build_card("did-not-consolidate", store_dir=SD, occurrence="n", day="2026-11-02", reason="r")
     assert cd.file_card(review_store, c, feed=FEED)[1] is True
     assert cd.file_card(review_store, c, feed=FEED)[1] is False
 
@@ -115,7 +117,7 @@ def test_a_card_is_filed_once_per_key(review_store):
 def test_the_agent_feed_is_refused_until_p8_adds_it(review_store):
     if cd.FEED in review.FEEDS:
         pytest.skip("P8 has added the agent feed")
-    c = cd.build_card("did-not-consolidate", occurrence="n", day="2026-11-02", reason="r")
+    c = cd.build_card("did-not-consolidate", store_dir=SD, occurrence="n", day="2026-11-02", reason="r")
     with pytest.raises(review.CoordError):
         cd.file_card(review_store, c)
 
@@ -125,28 +127,28 @@ def test_the_agent_feed_is_refused_until_p8_adds_it(review_store):
 def test_a_retirement_without_his_verified_words_is_his_when_the_source_is_given():
     notes = {"retired": [{"what": "ZERO PROMPTS", "his_words": "zero prompts might not be feasible here today",
                           "episodes": ["4b166f5e"]}]}
-    ok = cd.build_card("consolidated", occurrence="a", notes=notes,
+    ok = cd.build_card("consolidated", store_dir=SD, occurrence="a", notes=notes,
                        source={"4b166f5e": "honestly I realize ZERO prompts might not be feasible here, today"})
     assert ok.body["his"] == [] and not ok.authority_relevant
-    bad = cd.build_card("consolidated", occurrence="b", notes=notes, source={"4b166f5e": "something else entirely"})
+    bad = cd.build_card("consolidated", store_dir=SD, occurrence="b", notes=notes, source={"4b166f5e": "something else entirely"})
     assert bad.authority_relevant and "without his verified words" in bad.body["his"][0]
-    short = cd.build_card("consolidated", occurrence="c", source={"e": "yes"},
+    short = cd.build_card("consolidated", store_dir=SD, occurrence="c", source={"e": "yes"},
                           notes={"retired": [{"what": "W", "his_words": "yes", "episodes": ["e"]}]})
     assert short.authority_relevant                      # too few words to tell what they retire
-    unchecked = cd.build_card("consolidated", occurrence="d", notes=notes)
+    unchecked = cd.build_card("consolidated", store_dir=SD, occurrence="d", notes=notes)
     assert not unchecked.authority_relevant              # no source given: own, never a guess
 
 
 def test_unreadable_notes_are_a_card_line_and_never_his():
-    c = cd.build_card("consolidated", occurrence="a", notes={"notes_problem": "JSONDecodeError: torn"})
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="a", notes={"notes_problem": "JSONDecodeError: torn"})
     assert not c.authority_relevant and any("notes were unreadable" in x for x in c.body["own"])
-    odd = cd.build_card("consolidated", occurrence="b", notes={"contradictions": "not a list"})
+    odd = cd.build_card("consolidated", store_dir=SD, occurrence="b", notes={"contradictions": "not a list"})
     assert odd.authority_relevant and "not a list" in odd.body["his"][0]     # a malformed note surfaces, to him
 
 
 def test_a_card_kind_must_be_one_of_the_four():
     with pytest.raises(cd.CardError):
-        cd.build_card("quiet", occurrence="a")
+        cd.build_card("quiet", store_dir=SD, occurrence="a")
 
 
 # ------------------------------------------------------------------------------------------------ the diff and own
@@ -158,7 +160,7 @@ def test_own_names_decisions_that_left_patterns_that_changed_and_the_identity_ti
     saved = ("## Patterns\n!!! alpha | 4x (2026-11-02)\n!! gamma | 1x (2026-11-02)\n\n"
              "## Decisions\n[decided] **KEEP ME** x\n\n[forwarded] **FOLD ME** -> state/x.md\n\n"
              "## Understanding\nPhill is a ensemble mind, changed.\n\nHe loves games.\n")
-    own = cd.build_card("consolidated", occurrence="a", prior=prior, saved=saved).body["own"]
+    own = cd.build_card("consolidated", store_dir=SD, occurrence="a", prior=prior, saved=saved).body["own"]
     assert "Decisions: DROP ME left the Decisions entries (no forwarding address in the saved text)" in own
     assert any(x.startswith("Decisions: FOLD ME") for x in own) is False        # FOLD ME is still an entry title
     assert "Patterns: removed beta" in own and "Patterns: added gamma" in own
@@ -170,13 +172,13 @@ def test_own_names_decisions_that_left_patterns_that_changed_and_the_identity_ti
 def test_a_title_that_left_decisions_but_stands_elsewhere_names_where():
     prior = "## Decisions\n[decided] **GONE** x\n\n## Context\nnothing\n"
     saved = "## Decisions\nnone\n\n## Context\nSee GONE for the record.\n"
-    own = cd.build_card("consolidated", occurrence="a", prior=prior, saved=saved).body["own"]
+    own = cd.build_card("consolidated", store_dir=SD, occurrence="a", prior=prior, saved=saved).body["own"]
     assert own == ["Decisions: GONE left the Decisions entries (its title still stands in Context)"]
 
 
 def test_per_section_counts_and_the_diff_artifact_carry_the_change(tmp_path):
     prior, saved = _VALID, text_n(2).replace("Nothing committed yet.", "A decision.")
-    c = cd.build_card("consolidated", occurrence="a", prior=prior, saved=saved, out_dir=tmp_path)
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="a", prior=prior, saved=saved, out_dir=tmp_path)
     d = c.body["diff"]
     text = (tmp_path / cd.DIFF_FILE).read_text(encoding="utf-8")
     assert d["sha256"] == hashlib.sha256(text.encode()).hexdigest() and d["path"] == str(tmp_path / cd.DIFF_FILE)
@@ -191,7 +193,7 @@ def test_two_25k_neocortices_fit_and_the_diff_is_an_artifact(tmp_path, review_st
     assert len(prior) > 20_000 and len(cd.full_diff(prior, saved)) > cd.BODY_LIMIT      # the diff alone is refused
     with pytest.raises(review.CoordError, match="too long"):
         review.file_item(review_store, FEED, {"diff": cd.full_diff(prior, saved)}, dedupe_key="raw")
-    c = cd.build_card("consolidated", occurrence="big", day="2026-11-02", prior=prior, saved=saved, out_dir=tmp_path)
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="big", day="2026-11-02", prior=prior, saved=saved, out_dir=tmp_path)
     assert len(canonical(c.body)) <= cd.BODY_LIMIT
     assert filed(review_store, c).body["diff"]["sha256"] == c.body["diff"]["sha256"]
     # own was cut to first lines and a count; the full list sits beside the occurrence
@@ -203,7 +205,7 @@ def test_two_25k_neocortices_fit_and_the_diff_is_an_artifact(tmp_path, review_st
 
 def test_his_is_never_cut_and_moves_whole_to_an_artifact_when_it_alone_passes_the_limit(tmp_path, review_store):
     notes = {"contradictions": [{"what": f"contradiction {i}: " + "x" * 300, "episodes": [f"e{i}"]} for i in range(40)]}
-    c = cd.build_card("consolidated", occurrence="his", day="2026-11-02", prior=big_text(0, "a"), saved=big_text(1, "b"),
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="his", day="2026-11-02", prior=big_text(0, "a"), saved=big_text(1, "b"),
                       notes=notes, out_dir=tmp_path)
     assert len(canonical(c.body)) <= cd.BODY_LIMIT
     assert c.authority_relevant                                   # decided from the full list, before the cut
@@ -215,19 +217,19 @@ def test_his_is_never_cut_and_moves_whole_to_an_artifact_when_it_alone_passes_th
 
 def test_small_his_stays_in_the_body_whole_even_when_own_is_cut(tmp_path):
     notes = {"contradictions": [{"what": "one real one", "episodes": ["e1"]}]}
-    c = cd.build_card("consolidated", occurrence="a", prior=big_text(0, "a"), saved=big_text(1, "b"), notes=notes,
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="a", prior=big_text(0, "a"), saved=big_text(1, "b"), notes=notes,
                       out_dir=tmp_path)
     assert c.body["his"] == ["contradiction: one real one [e1]"] and "his_path" not in c.body
 
 
 def test_a_cut_without_an_out_dir_raises_instead_of_dropping_content():
     with pytest.raises(cd.CardError):
-        cd.build_card("consolidated", occurrence="a", prior=big_text(0, "a"), saved=big_text(1, "b"))
+        cd.build_card("consolidated", store_dir=SD, occurrence="a", prior=big_text(0, "a"), saved=big_text(1, "b"))
 
 
 def test_a_pathological_card_falls_back_to_a_skeleton_that_still_files(tmp_path, review_store):
     huge_reason = "r" * 20_000
-    c = cd.build_card("failed", occurrence="p", day="2026-11-02", reason=huge_reason, prior=big_text(0, "a"),
+    c = cd.build_card("failed", store_dir=SD, occurrence="p", day="2026-11-02", reason=huge_reason, prior=big_text(0, "a"),
                       saved=big_text(1, "b"), out_dir=tmp_path, notes={"contradictions": ["c"]})
     assert len(canonical(c.body)) <= cd.BODY_LIMIT and c.authority_relevant
     remedy = filed(review_store, c).body.get("remedy")             # the skeleton keeps the next step; a failed card
@@ -244,7 +246,7 @@ def test_a_real_dream_becomes_a_consolidated_card_from_its_own_files(scratch):
     prior, saved = cd.texts_for(scratch, occ(scratch, "o2"))
     assert prior == _VALID and saved == text_n(2)
     spec = rc._card("consolidated", rc.COMMITTED_NOT_RECORDED, "o2")
-    c = cd.from_spec(spec, occ_dir=occ(scratch, "o2"), db_path=scratch, day="2026-11-02")
+    c = cd.from_spec(spec, store_dir=scratch.parent, occ_dir=occ(scratch, "o2"), db_path=scratch, day="2026-11-02")
     assert c.body["diff"]["sections"] == {"Understanding": {"added": 1, "removed": 1}}
     assert c.body["usage"]["source"] == "fake" and c.body["usage"]["readable"] is True
     assert c.body["models"] == ["fake"] and c.body["composes"]["n"] == 1
@@ -269,7 +271,7 @@ def test_a_real_rollback_card_files_as_flows(scratch, review_store):
     dream(scratch, "o2", text_n(2))
     res = sn.rollback(scratch, occ(scratch, "o2"), who="operator")
     assert res.ok and res.card["kind"] == "rolled-back"
-    c = cd.from_spec(res.card, occ_dir=occ(scratch, "o2"))
+    c = cd.from_spec(res.card, store_dir=SD, occ_dir=occ(scratch, "o2"))
     assert c.dedupe_key == "dream-rollback:o2" and not c.authority_relevant
     assert filed(review_store, c).authority_relevant is False
 
@@ -311,7 +313,7 @@ def test_compose_refusals_ride_the_card_in_one_line_each():
     doc = {"unit": "tokens", "readable": True, "composes": [
         {"n": 1, "error": "the saved text dropped the Decisions section\nand more", "model": "m1"},
         {"n": 2, "error": None, "model": "m1", "models_charged": ["m1", "m2"]}]}
-    c = cd.build_card("consolidated", occurrence="a", usage_doc=doc)
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="a", usage_doc=doc)
     assert c.body["composes"] == {"n": 2, "refusals": ["compose 1: the saved text dropped the Decisions section"],
                                   "refusals_total": 1}
     assert c.body["models"] == ["m1", "m2"]
@@ -347,9 +349,9 @@ def test_notes_the_model_wrote_in_the_wrong_shape_never_stop_the_card():
     notes = {"contradictions": [{"what": "x", "episodes": 42}],
              "retired": [{"what": "R", "his_words": "four words of his own", "episodes": 7}],
              "for_phill": [{"what": "F", "episodes": {"a": 1}}]}
-    c = cd.build_card("consolidated", occurrence="o", notes=notes, source={})
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="o", notes=notes, source={})
     assert c.authority_relevant and "[42]" in c.body["his"][0]
-    c2 = cd.build_card("consolidated", occurrence="o", usage_doc={"composes": [{"model": "m",
+    c2 = cd.build_card("consolidated", store_dir=SD, occurrence="o", usage_doc={"composes": [{"model": "m",
                                                                              "models_charged": "abc"}]})
     assert c2.body["models"] == ["m"]                   # a string is not a list of model ids
 
@@ -357,15 +359,15 @@ def test_notes_the_model_wrote_in_the_wrong_shape_never_stop_the_card():
 def test_a_quote_is_not_found_inside_a_longer_word():
     """Reproduced: ``"no prompts at all"`` matched inside ``"piano prompts at all"``."""
     notes = {"retired": [{"what": "W", "his_words": "no prompts at all", "episodes": ["e"]}]}
-    c = cd.build_card("consolidated", occurrence="a", notes=notes, source={"e": "a piano prompts at all today"})
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="a", notes=notes, source={"e": "a piano prompts at all today"})
     assert c.authority_relevant
-    ok = cd.build_card("consolidated", occurrence="b", notes=notes, source={"e": "I said no prompts at all, today"})
+    ok = cd.build_card("consolidated", store_dir=SD, occurrence="b", notes=notes, source={"e": "I said no prompts at all, today"})
     assert not ok.authority_relevant
 
 
 def test_a_card_builds_into_an_out_dir_that_does_not_exist_yet(tmp_path):
     out = tmp_path / "a" / "b"
-    c = cd.build_card("consolidated", occurrence="o", prior=big_text(0, "a"), saved=big_text(1, "b"), out_dir=out)
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="o", prior=big_text(0, "a"), saved=big_text(1, "b"), out_dir=out)
     assert (out / cd.DIFF_FILE).is_file() and c.artifacts["diff"] == str(out / cd.DIFF_FILE)
 
 
@@ -394,7 +396,7 @@ def test_concurrent_builders_of_one_card_do_not_share_a_temporary_file(tmp_path)
 def test_own_shown_is_set_whenever_the_own_list_was_cut_to_first_lines(tmp_path):
     """Reproduced: a body that fit after the first-line cut carried ``own_total`` and no ``own_shown``."""
     own = [f"entry {i}: " + "w" * 200 + "\nsecond line" for i in range(60)]
-    c = cd.build_card("consolidated", occurrence="o", own_extra=own, out_dir=tmp_path)
+    c = cd.build_card("consolidated", store_dir=SD, occurrence="o", own_extra=own, out_dir=tmp_path)
     assert c.body["own_total"] == 60 and c.body["own_shown"] == len(c.body["own"]) == 60
 
 
