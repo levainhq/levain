@@ -394,8 +394,9 @@ def _held_line(n: int, *, plan: bool) -> str:
 def _migrate_intentions(install: Path, emit: Emit, *, held: bool = False) -> bool:
     """Rewrite the store's open ``seed`` records to ``someday`` (ruling H8, :mod:`levain.intention_migrate`): copied
     first, idempotent, one compare-and-set per record. Every line the migration reports is printed. True when the
-    migration REFUSED (an unwritable backup, an unreadable store, an anneal-memory below 1.0.7): the caller ends the update non-zero, so a refusal is
-    never swallowed.
+    migration REFUSED (an unwritable backup, an unreadable store, an anneal-memory below 1.0.7) or left an open ``seed``
+    behind because the store failed on it (a record that merely moved since it was read is not a failure): the caller
+    ends the update non-zero, so neither is swallowed.
 
     ``held``: the adapter refresh held files for review (``AdapterRefresh.review``), so the hooks may not have moved, and
     an older hook reads ``someday`` as an unknown disposition (1111-32 G2). The migration is then left for the next
@@ -412,7 +413,7 @@ def _migrate_intentions(install: Path, emit: Emit, *, held: bool = False) -> boo
     report = migrate_seed_to_someday(paths)
     for line in report.lines():
         emit(line)
-    return report.refused is not None
+    return report.failed
 
 
 def _plan_intention_migration(install: Path, emit: Emit, *, held: bool = False) -> bool:

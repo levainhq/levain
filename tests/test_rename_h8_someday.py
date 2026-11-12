@@ -225,6 +225,46 @@ def test_a_record_that_moved_since_the_read_is_skipped_not_overwritten(tmp_path:
     assert report.migrated == [] and sorted(r for r, _why in report.skipped) == sorted([ids["open"], ids["talk"]])
     assert _open(paths, ids["open"])["disposition"] == "agenda"                  # its writer's value stands
     assert any(ln.startswith("  ") and "left as it is" in ln for ln in report.lines())
+    assert not report.incomplete          # a record that moved is its writer's: nothing is left behind to migrate
+
+
+def _fail_updates_of(monkeypatch, fail_ids, exc: BaseException) -> None:
+    """Make the migration's guarded store raise ``exc`` from ``update`` for the ids in ``fail_ids`` (the rest go through)."""
+    import levain.intentions as li
+
+    real = li.guarded_intention_store
+
+    def build(path):
+        store = real(path)
+        orig = store.update
+
+        def update(rid, **kw):
+            if rid in fail_ids:
+                raise exc
+            return orig(rid, **kw)
+
+        store.update = update
+        return store
+
+    monkeypatch.setattr(li, "guarded_intention_store", build)
+
+
+@pytest.mark.parametrize("exc", [OSError(5, "I/O error"), ValueError("a field the store rejects")])
+def test_a_record_the_store_could_not_update_is_reported_and_leaves_the_migration_incomplete(tmp_path: Path, monkeypatch,
+                                                                                            exc) -> None:
+    """A store FAULT on one record (an OSError, or any other exception) never escapes mid-update with the backup already
+    written, and it is not a plain compare-and-set loss: the row is still an open ``seed``, so the run is incomplete
+    (1111-32 L3 round 1, complement 1 / codex 3)."""
+    paths, ids = _old_store(tmp_path)
+    _fail_updates_of(monkeypatch, {ids["open"]}, exc)
+
+    report = _migrate(paths)
+
+    assert report.migrated == [ids["talk"]] and [r for r, _why in report.skipped] == [ids["open"]]
+    assert report.incomplete and report.refused is None
+    assert _open(paths, ids["open"])["disposition"] == "seed"           # still there, for the next `levain update`
+    assert _open(paths, ids["talk"])["disposition"] == "someday"
+    assert any(ids["open"] in ln and "left as it is" in ln for ln in report.lines())
 
 
 def test_the_report_says_the_provenance_label_degrades(tmp_path: Path) -> None:

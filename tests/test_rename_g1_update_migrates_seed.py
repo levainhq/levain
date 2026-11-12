@@ -105,6 +105,35 @@ def test_a_refused_backup_surfaces_and_the_update_exits_non_zero(install):
     assert "was not done" in text and "backup could not be written" in text
 
 
+@pytest.mark.parametrize("exc", [OSError(5, "I/O error"), ValueError("a field the store rejects")])
+def test_a_record_the_store_could_not_update_ends_the_update_non_zero_and_stays_a_seed(install, monkeypatch, exc):
+    import levain.intentions as li
+    from levain.update import _SEEDS_REFUSED_TAIL
+
+    ids = _plant_old_store(install)
+    real = li.guarded_intention_store
+
+    def build(path):
+        store = real(path)
+        orig = store.update
+
+        def update(rid, **kw):
+            if rid == ids["open"]:
+                raise exc
+            return orig(rid, **kw)
+
+        store.update = update
+        return store
+
+    monkeypatch.setattr(li, "guarded_intention_store", build)
+    lines: list[str] = []
+    assert run_update(install, no_pip=True, emit=lines.append) == 1
+    got = _dispositions(install)
+    assert got[ids["open"]] == "seed" and got[ids["talk"]] == "someday"
+    text = "\n".join(lines)
+    assert ids["open"] in text and "left as it is" in text and _SEEDS_REFUSED_TAIL in text
+
+
 def test_a_dry_run_says_what_it_would_rewrite_and_changes_nothing(install):
     _plant_old_store(install)
     before = _paths(install).intentions_json.read_bytes()

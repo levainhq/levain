@@ -56,15 +56,27 @@ class MigrationReport:
     """What one run did. ``migrated`` are the ids whose disposition is now ``someday``; ``skipped`` are
     ``(id, why)`` for a record that moved since it was read; ``refused`` is a reason when the run changed nothing
     because it could not do so safely (an unwritable backup, an unreadable store, an anneal-memory below 1.0.7);
-    ``backup`` is the copy taken."""
+    ``unmigrated`` are the skipped ids that are STILL an open ``seed`` after the run (a store fault, not a record that
+    moved: that one is its writer's); ``backup`` is the copy taken."""
     migrated: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    unmigrated: list[str] = field(default_factory=list)
     backup: Path | None = None
     refused: str | None = None
 
     @property
     def count(self) -> int:
         return len(self.migrated)
+
+    @property
+    def incomplete(self) -> bool:
+        """True when an open ``seed`` was left behind by a store fault: `levain update` ends non-zero on it."""
+        return bool(self.unmigrated)
+
+    @property
+    def failed(self) -> bool:
+        """True when `levain update` must end non-zero: the run refused, or it left an open ``seed`` behind."""
+        return self.refused is not None or self.incomplete
 
     def lines(self) -> list[str]:
         """The operator-facing lines `levain update` prints; empty when there was nothing to do."""
@@ -130,8 +142,19 @@ def migrate_seed_to_someday(paths: Any, *, now: datetime | None = None,
             report.skipped.append((rid, str(exc)))
         except OSError as exc:
             report.skipped.append((rid, f"the store was unavailable: {exc}"))
+        except Exception as exc:                 # never out of `levain update` after the backup is written
+            report.skipped.append((rid, f"the store refused it: {type(exc).__name__}: {exc}"))
         else:
             report.migrated.append(rid)
+    if report.skipped:
+        # A skip is a plain compare-and-set loss (the row moved: resolved, re-routed, edited) or a store fault. The two
+        # are told apart by the store itself: a skipped row that is STILL an open `seed` was not rewritten and is left for
+        # the next run, so the run is incomplete; one that moved is its writer's and is not.
+        try:
+            still = set(_scan_open_seeds(store_path))
+        except (OSError, ValueError):
+            still = {rid for rid, _why in report.skipped}   # cannot tell, so none is assumed done
+        report.unmigrated = [rid for rid, _why in report.skipped if rid in still]
     return report
 
 
@@ -146,6 +169,10 @@ def open_seed_ids(paths: Any) -> list[str]:
 
 def _open_seed_ids(store_path: Path) -> list[str]:
     """The ids of the open records whose stored disposition is ``seed``, read raw. A missing store has none."""
+    return _scan_open_seeds(store_path)
+
+
+def _scan_open_seeds(store_path: Path) -> list[str]:
     try:
         data = json.loads(store_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
