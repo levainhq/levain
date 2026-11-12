@@ -40,6 +40,13 @@ What the tick wires (and what it does not): the ``executor_of`` router (:func:`e
 the supervisor reads as "nothing to ask" and raises its attention row), the production ``binding_of`` (the live link's
 binding, from the authority log) and the attention sink (:func:`attention_sink`: one stderr line per key; the agent store
 holds no attention table yet). It changes no stop rule: which rows a reaper ENDs live in ``session.py`` (S11b).
+
+THE NIGHT'S NOTICES (D1-N): after the claims, a store whose install names a dream runs
+``levain.dream.agent.tick_notices``: the did-not-consolidate card for each closed window (one per window and class,
+however many ticks), the pause notice, the link-renewal card and the weekly restore drill. They reach a reader through
+the ``agent`` feed of the desk's review store (``levain desk review list``), beside the tick's stderr line. They start
+only while :data:`TICK_NOTICE_RESERVE_S` of the graceful bound is left, run after the renewals (so
+:data:`WORST_RENEW_GAP_S` is unchanged), and a failed or skipped notice is :data:`EXIT_NOTICES` plus a stderr line.
 """
 from __future__ import annotations
 
@@ -68,15 +75,22 @@ TICK_SOFT_BOUND_S = 540
 TICK_PRE_RENEW_BOUND_S = 60
 #: the worst gap between two renewals of one non-withheld row (the invariant the lease needs to exceed).
 WORST_RENEW_GAP_S = TICK_INTERVAL_S + TICK_HARD_BOUND_S + TICK_PRE_RENEW_BOUND_S
+#: the night's notices (D1-N) start only while at least this much of the graceful bound is left. They run after the
+#: renewals and the claims, so they cannot move the lease arithmetic above; this keeps them from being the thing that
+#: runs a tick into the graceful bound. The one slow step is the weekly restore drill (a store copy and a rollback).
+TICK_NOTICE_RESERVE_S = 120
 #: exit codes: 0 a pass ran; 1 refused (store, install: with an install refusal the renewals of rows it could stop
 #: still ran, the claims did not); 2 the reaper raised; 3 the graceful bound fired; 4 a launched session row had no
 #: session launcher to END it, so it was not renewed and its lease lapses to takeover (an install that names none, or
-#: whose launcher cannot be built); 70 the watchdog took the process.
-EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_HARD_TIMEOUT = 0, 1, 2, 3, 4, 70
+#: whose launcher cannot be built); 5 a night notice failed, raised, or was skipped for time (the tick itself ran;
+#: the stderr line says which); 70 the watchdog took the process.
+EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_NOTICES, EXIT_HARD_TIMEOUT = (
+    0, 1, 2, 3, 4, 5, 70)
 
-__all__ = ["TICK_INTERVAL_S", "TICK_HARD_BOUND_S", "TICK_SOFT_BOUND_S", "TICK_PRE_RENEW_BOUND_S", "WORST_RENEW_GAP_S",
-           "EXIT_OK", "EXIT_REFUSED", "EXIT_REAPER_ERROR", "EXIT_SOFT_TIMEOUT", "EXIT_NO_LAUNCHER", "EXIT_HARD_TIMEOUT",
-           "bounded", "executor_of_factory", "binding_of_factory", "attention_sink", "run_tick"]
+__all__ = ["TICK_INTERVAL_S", "TICK_HARD_BOUND_S", "TICK_SOFT_BOUND_S", "TICK_PRE_RENEW_BOUND_S", "TICK_NOTICE_RESERVE_S",
+           "WORST_RENEW_GAP_S", "EXIT_OK", "EXIT_REFUSED", "EXIT_REAPER_ERROR", "EXIT_SOFT_TIMEOUT", "EXIT_NO_LAUNCHER",
+           "EXIT_NOTICES", "EXIT_HARD_TIMEOUT", "bounded", "executor_of_factory", "binding_of_factory", "attention_sink",
+           "run_tick"]
 
 
 def _hard_report(seconds: float) -> str:
@@ -238,6 +252,27 @@ def binding_of_factory(store: AgentStore, authority: Any, clock: Callable[[], da
                 return binding if type(binding) is str and binding else None
         return None
 
+    def latest_link(agent_id: str, spec_hash: str) -> dict[str, str] | None:
+        """``{"id", "expires_at"}`` of the agent's link of that spec that expires LAST, or None (no link). Read from the
+        same one replay :func:`binding_of` uses, so the notice phase adds no second read of the log. The last expiry
+        is the one that decides when the agent stops being armed. A log that could not be replayed RAISES: the renewal
+        check must say it could not look, never read it as "no link"."""
+        snap = state()
+        if snap is None:
+            raise RuntimeError("the authority log could not be replayed, so no link's expiry could be read")
+        with store.read() as conn:
+            store_id = _ctl._store_id_of(conn)
+        grants = snap.policy.grants
+        best: dict[str, str] | None = None
+        for gid in _auth.agent_links(snap, agent_id, store_id):
+            grant = grants.get(gid) or {}
+            expires = grant.get("expires_at")
+            if grant.get("spec_hash") == spec_hash and type(expires) is str and (
+                    best is None or expires > best["expires_at"]):      # the one stamp form is fixed-width: it sorts as time
+                best = {"id": gid, "expires_at": expires}
+        return best
+
+    binding_of.latest_link = latest_link  # type: ignore[attr-defined]
     return binding_of
 
 
@@ -379,6 +414,36 @@ def _utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _run_notices(st: AgentStore, result: Any, clock: Callable[[], datetime], started: datetime, soft_s: float,
+                 link_of: Callable[[str, str], Any], stream: Any, notes: list[str], seen: dict) -> None:
+    """The night's notices (D1-N, Q6 (a)): ``levain.dream.agent.tick_notices`` once a tick has finished its claims. It
+    starts only while at least :data:`TICK_NOTICE_RESERVE_S` of the graceful bound is left (the restore drill, once a
+    week, is the one slow step); a tick already later than that says so and leaves them to the next, which repeats
+    them harmlessly (every step is once-per-key). A step that failed, a pass that raised, or a skip sets ``seen["notices"]``,
+    which :func:`run_tick` turns into :data:`EXIT_NOTICES`; each is one line on stderr, never swallowed."""
+    from levain.dream import agent as _da
+
+    spent = (clock() - started).total_seconds()
+    if spent > soft_s - TICK_NOTICE_RESERVE_S:
+        notes.append(f"the night's notices were not run: the tick was already {spent:.0f}s in, with under "
+                     f"{TICK_NOTICE_RESERVE_S}s of its {soft_s:.0f}s graceful bound left for them; the next tick runs them")
+        seen["notices"] = "late"
+        return
+    try:
+        report = _da.tick_notices(st, now=clock(), missed_windows=getattr(result, "missed_windows", None),
+                                  link_of=link_of, stream=stream)
+    except Exception as exc:  # noqa: BLE001 - tick_notices guards each step; this is a defect in the pass itself
+        notes.append(f"the night's notices raised {type(exc).__name__}: {exc}")
+        seen["notices"] = "raised"
+        return
+    for line in report.notes:
+        notes.append(line)
+    for problem in report.problems:
+        notes.append(f"night notice failed: {problem}")
+    if report.problems:
+        seen["notices"] = "problems"
+
+
 def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | None = None,
              clock: Callable[[], datetime] | None = None, authority: Any = None,
              launcher_of: Callable[[], Any] | None = None,
@@ -456,7 +521,11 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
                 seen["reaper_error"] = type(exc).__name__
             return None
         session_alive, launch_over = _lazy_probes(st, coord_dir, notes)
-        return _ctl.tick(st, clock, binding_of_factory(st, auth, clock), session_alive, launch_over, reaper=reaper)
+        binding_of = binding_of_factory(st, auth, clock)
+        result = _ctl.tick(st, clock, binding_of, session_alive, launch_over, reaper=reaper)
+        # AFTER the renewals and the claims, so the lease arithmetic above is untouched: the night's notices
+        _run_notices(st, result, clock, started, soft_s, binding_of.latest_link, stream, notes, seen)
+        return result
 
     def say(text: str) -> None:
         print(f"levain agents tick: {text}", file=stream or sys.stderr, flush=True)
@@ -487,4 +556,6 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
         return EXIT_REFUSED
     if unlaunchable:
         return EXIT_NO_LAUNCHER
+    if seen.get("notices"):
+        return EXIT_NOTICES
     return EXIT_OK
