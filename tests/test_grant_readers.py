@@ -20,9 +20,8 @@ Each row says what the reader is, and why a raw read is right there:
 A row counts reads (``n``), so a new raw read inside an already-listed function is noticed too, and a row whose function
 no longer reads raw (or moved) fails as stale. Keyed by file and function name, never by line number.
 
-Known edge, closed rather than built against: this finds the attribute spelling ``policy.grants``. A read through
-``getattr(state.policy, "grants")`` or through ``policy.as_dict()["grants"]`` is not found; the ordinary spelling is the
-one every reader in the table uses.
+Known gap of this scan: it finds only the attribute spelling ``policy.grants``. A raw read through
+``getattr(state.policy, "grants")`` or through ``policy.as_dict()["grants"]`` is not found, and nothing here catches one.
 """
 from __future__ import annotations
 
