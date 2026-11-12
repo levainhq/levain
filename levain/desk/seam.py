@@ -70,7 +70,10 @@ __all__ = ["Brief", "BriefTooBig", "DETAIL_FIELDS", "DETAIL_ROWS_MAX", "NOT_BUIL
 
 #: the most Since detail rows one brief reads, whatever the byte cap leaves
 DETAIL_ROWS_MAX = 1000
-NOT_BUILT = "dreaming (D1) and memory freshness are not built"
+#: what this brief cannot tell a desk. An enabled dream writes the always-loaded memory text under live seats (D1-L1);
+#: what is not built is the part that gets a desk onto that text, so a running desk keeps the memory it loaded.
+NOT_BUILT = ("the dream seam (rotating a desk onto the memory a dream wrote) and memory freshness are not built: a "
+             "running desk keeps the memory it loaded")
 _LIST_LINES = 30           # a board, a band, a card: never the whole of a long one
 _LINE = 240
 
