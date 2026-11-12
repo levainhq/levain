@@ -172,6 +172,15 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                          "under the same binding is refused: pick a nearby minute, or retire the agent. The same "
                          "time under a different binding is a different spec and is allowed.")
     en.add_argument("--revise", action="store_true", help="Write a new version when the stored spec differs.")
+    en.add_argument("--orphan-floor-hours", default=None, metavar="HOURS|off",
+                    help="The age, in hours, past which the dream may clear an open wrap it did NOT open (a seat "
+                         "killed between opening a wrap and saving leaves one, and it keeps the dream quiet every "
+                         "night). Unset (the shipped state) such a wrap keeps the dream quiet until a person clears "
+                         "it. Set, admission passes the wrap only when it is older than this AND older than the "
+                         "executor's own bound, and the run then clears it and consolidates; a live seat's wrap "
+                         "that outlasts the floor is cancelled, so pick it above any wrap a seat honestly holds. "
+                         "`off` clears the floor. Needs --store-dir; kept (an install fact) when a later enable "
+                         "does not pass it.")
     en.add_argument("--json", action="store_true")
     en.set_defaults(func=run_dream_enable)
     stt = sub.add_parser("start", allow_abbrev=False, help="Start the registered dream now, by hand (same signed link and ceiling).",
@@ -250,6 +259,21 @@ def run_dream_enable(args: argparse.Namespace) -> int:
         print("levain dream enable: a shadow install needs --store-dir (the scratch directory), --shadow-flow-root and "
               "--flow-instructions together; nothing was registered or written", file=sys.stderr)
         return 1
+    if getattr(args, "orphan_floor_hours", None) is not None:
+        # a setting a person makes: refused before anything is registered or written, and only where it can be kept
+        if args.store_dir is None:
+            print("levain dream enable: --orphan-floor-hours is an install fact and needs --store-dir to write it; "
+                  "nothing was registered or written", file=sys.stderr)
+            return 1
+        if args.shadow_flow_root is not None:
+            print("levain dream enable: --orphan-floor-hours is for a live install, not a shadow; nothing was "
+                  "registered or written", file=sys.stderr)
+            return 1
+        try:
+            args.orphan_floor_hours = _parse_orphan_floor(args.orphan_floor_hours, da)
+        except da.InstallRefused as exc:
+            print(f"levain dream enable: {exc}; nothing was registered or written", file=sys.stderr)
+            return 1
     was = da.install_kind(store.directory)
     # the spec binds a shadow install's facts (the facts this call writes, or the file as it stands without
     # --store-dir), so a link signed for one install never covers changed facts
@@ -305,10 +329,11 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             install_store = None
         card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r, expires=expires, time=when,
                                     store_dir=install_store)
+    floor_hours, floor_problem = da.orphan_floor_state(store.directory)
     doc = {"agent_id": reg.agent_id, "spec_hash": reg.spec_hash, "role_hash": reg.role_hash, "version": reg.version,
            "created": reg.created, "zone": reg.zone, "time": when, "signing_card": card,
            "install_facts": None if install_path is None else str(install_path), "install_kind": now,
-           "replaced": replaced}
+           "replaced": replaced, "orphan_floor_hours": floor_hours}
     if args.json:
         print(json.dumps(doc, sort_keys=True))
     else:
@@ -318,9 +343,38 @@ def run_dream_enable(args: argparse.Namespace) -> int:
               "install facts: not written (pass --store-dir); a scheduled fire refuses without them")
         if replaced:
             print(f"install facts: {replaced}")
+        if now != "shadow":
+            print(_orphan_floor_line(floor_hours, floor_problem, da))
         print(card)
         print("Not signed. The dream launches only under a live signed agent link for this spec_hash.")
     return 0
+
+
+def _parse_orphan_floor(text: str, da: object) -> float | str:
+    """``--orphan-floor-hours`` as the number write_install takes (a whole number stays an int), or ``off``."""
+    t = str(text).strip().lower()
+    if t == da.ORPHAN_FLOOR_OFF:
+        return da.ORPHAN_FLOOR_OFF
+    try:
+        v = float(t)
+    except ValueError:
+        raise da.InstallRefused(f"orphan_floor_hours {text!r} is not a number of hours (or `off`)") from None
+    return da.validate_orphan_floor_hours(int(v) if v.is_integer() else v)
+
+
+def _orphan_floor_line(hours: float | None, problem: str | None, da: object) -> str:
+    """The one status line that shows the age floor, whatever its state."""
+    low = da._ready.executor_orphan_horizon_s()
+    if problem:
+        return (f"orphan wrap floor: INVALID in the install facts ({problem}); a scheduled fire refuses until "
+                "`levain dream enable --store-dir <dir> --orphan-floor-hours <hours>|off` rewrites it")
+    if hours is None:
+        return ("orphan wrap floor: unset (orphan healing is off for a wrap a seat left open: it keeps the dream quiet "
+                "until a person clears it; a wrap the dream itself left open is cleared past the executor's "
+                f"{low / 60:.1f} min bound. Set one with `--orphan-floor-hours <hours>` and --store-dir)")
+    return (f"orphan wrap floor: {hours:g} hours (an open wrap the dream did not open, older than this and than the "
+            f"executor's {low / 60:.1f} min bound, is cleared by the run, which then consolidates; `--orphan-floor-hours "
+            "off` unsets it)")
 
 
 def _write_install_facts(args: argparse.Namespace, store: object, zone: str, da: object, *,
@@ -352,7 +406,8 @@ def _install_kwargs(args: argparse.Namespace, zone: str, da: object) -> dict:
     db = next((c for c in (base / "memory.db", base / ".levain" / "memory.db") if c.is_file()), None)
     if db is None:
         raise da.InstallRefused(f"no memory.db under {base} (looked in the dir and in .levain/)")
-    return dict(store_path=db.resolve(), cockpit_root=cockpit, coord_dir=coord, zone=zone)
+    return dict(store_path=db.resolve(), cockpit_root=cockpit, coord_dir=coord, zone=zone,
+                orphan_floor_hours=getattr(args, "orphan_floor_hours", None))
 
 
 def _refused(p: Path) -> str | None:
@@ -605,8 +660,12 @@ def run_dream_ready(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 — a store that will not open is unreadable, never ready
         print(f"levain dream ready: the store could not be opened ({type(exc).__name__}: {exc})", file=sys.stderr)
         return 3
+    from levain.dream import agent as da
+
     try:
-        v = rd.evaluate(src, day=day, now=now, zone=zone, agent_id=args.agent_id, manual=args.manual)
+        # the age floor is read from the install beside the agent store, as the scheduled input check reads it
+        v = rd.evaluate(src, day=day, now=now, zone=zone, agent_id=args.agent_id, manual=args.manual,
+                        orphan_floor_s=da.orphan_floor_s(args.agent_dir))
     finally:
         close()
     if args.json:
