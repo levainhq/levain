@@ -602,9 +602,7 @@ def window_remedy(cls: str, store_path: Path | str) -> str:
                 f"does not start. See who holds it with `{anneal} --db {db} baton status`; {again} once this "
                 "install's session holds it.")
     if cls == "failed":
-        return ("`levain agents show dream` names the run that failed and why; the agent pauses after "
-                f"{PAUSE_AFTER} failed runs in a row (`levain agents resume dream` lifts a pause once the cause is "
-                f"fixed); {again}.")
+        return f"`levain agents show dream` names the run that failed and why; {again}."
     return f"nothing needs doing by hand; {again}."
 
 
