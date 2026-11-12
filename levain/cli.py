@@ -3614,6 +3614,7 @@ def _cmd_chat_setup(args: argparse.Namespace) -> int:
 
 
 def _cmd_chat_key_list(args: argparse.Namespace) -> int:
+    from levain.authority import EGRESS_KEY_KIND
     from levain.chat_egress.key_setup import _REFUSALS, list_keys
     from levain.cockpit.display_safe import visible
     from levain.consent.grants import stopped_line
@@ -3630,7 +3631,8 @@ def _cmd_chat_key_list(args: argparse.Namespace) -> int:
               f"source {visible(r['source'])}  account {visible(str(r.get('account', '-')))}  "
               f"{r['placement']['scheme']}  repos "
               f"{', '.join(visible(x) for x in r['repos']) or '-'}  "
-              + (stopped_line(r["stopped_why"]) if r["state"] == "stopped" else f"until {visible(r['expires_at'])}"))
+              + (stopped_line(r["stopped_why"], EGRESS_KEY_KIND) if r["state"] == "stopped"
+                 else f"until {visible(r['expires_at'])}"))
     return 0
 
 
@@ -3743,7 +3745,7 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
         print("no consent grants")
     stamp = utc_stamp(now)
     for g in grants:
-        state = (stopped_line(g.stopped_why) if g.stopped_why else
+        state = (stopped_line(g.stopped_why, g.kind) if g.stopped_why else
                  "expired" if g.expires_at <= stamp else f"until {g.expires_at}")
         refused = [t for t in g.tools if g.tool_problem(t) is not None]
         if refused:
@@ -3754,7 +3756,7 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
         if g.mcp_fields:
             print(f"  declared fields ({g.kind}): {_grant_fields_text(g.mcp_fields)}")
     for gid, kind, expires_at, seq, why in inert:
-        state = stopped_line(why) if why else "expired" if expires_at <= stamp else f"until {expires_at}"
+        state = stopped_line(why, kind) if why else "expired" if expires_at <= stamp else f"until {expires_at}"
         print(f"{gid!r}  kind {kind}  {state}  (seq {seq}): a grant kind this levain does not know, held inert: it "
               "answers nothing here (upgrade levain to use it; `levain consent grant revoke` removes it)")
     return 0
@@ -3903,6 +3905,7 @@ def _cmd_seat(args: argparse.Namespace) -> int:
             print(res)
             return 0
         if args.seat_lease_cmd == "list":
+            from levain.authority import SEAT_LEASE_KIND
             from levain.consent.grants import stopped_line
 
             state = seat_lease._replay(root)
@@ -3912,7 +3915,7 @@ def _cmd_seat(args: argparse.Namespace) -> int:
             if stopped is not None:     # the policy holds it, a launch reads it as no lease: say which and why
                 held = state.policy.grants[stopped[0]]
                 print(f"{stopped[0]}  lanes {held['lanes_parent']}  returns {held['returns_parent']}  "
-                      f"{stopped_line(stopped[1])}")
+                      f"{stopped_line(stopped[1], SEAT_LEASE_KIND)}")
             else:
                 print("no live seat-root lease" if lease is None else
                       f"{lease['id']}  lanes {lease['lanes_parent']}  returns {lease['returns_parent']}  "
@@ -4015,6 +4018,7 @@ def _cmd_seat_egress(args: argparse.Namespace, root: Path) -> int:
     from levain.cockpit.keys import ssh_signer
 
     if args.seat_egress_cmd == "list":
+        from levain.authority import SEAT_EGRESS_KIND
         from levain.consent.grants import stopped_line
 
         state = seat_lease._replay(root)
@@ -4024,7 +4028,7 @@ def _cmd_seat_egress(args: argparse.Namespace, root: Path) -> int:
         if stopped is not None:         # the policy holds it, a push reads it as no grant: say which and why
             held = state.policy.grants[stopped[0]]
             print(f"{stopped[0]}  lanes {held['lanes_parent']}  remote {held['push_remote']}  "
-                  f"domains {','.join(held['allowed_domains']) or '-'}  {stopped_line(stopped[1])}")
+                  f"domains {','.join(held['allowed_domains']) or '-'}  {stopped_line(stopped[1], SEAT_EGRESS_KIND)}")
         else:
             print("no live seat-egress grant" if grant is None else
                   f"{grant['id']}  lanes {grant['lanes_parent']}  remote {grant['push_remote']}  "
