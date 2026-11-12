@@ -2150,7 +2150,7 @@ def _refuse_retired_spores(rest: list[str], verbs: tuple[str, ...]) -> int:
     """``levain spores <rest>``, the retired command (ruling H10): exit 2 and the same line under ``levain intentions``.
     ``main`` answers it before argparse runs, and only when ``spores`` is the FIRST word on the line: the parser has no
     ``spores`` command (a doc or hook teaching it fails its parse), and a parser tombstone could not take an option that
-    follows the word (``levain spores -h``, ``levain spores --path X germinate``). A line with anything before ``spores``
+    follows the word (a help flag, or a global option placed before the verb). A line with anything before ``spores``
     is not answered here: it goes to argparse, which does not know the word, and no pointer is printed.
     It writes nothing, so it needs no guard from the desk's door."""
     import shlex
