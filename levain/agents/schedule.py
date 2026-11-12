@@ -145,7 +145,7 @@ def window_span(trigger: dict[str, Any], zone: str | None, key: str) -> tuple[da
     """The inverse of :func:`window_key`: the UTC instants ``[start, end)`` of the window ``key`` names, read in the
     stored zone. ``d:<date>`` is that local day, midnight to midnight; ``w:<date>T<start>`` opens at the window's start
     on that date and closes at its end, the next day when the window wraps midnight (a window whose start is its end is
-    a whole day). A key this trigger would not write (another form, another window start, a date that does not parse)
+    a whole day, keyed and spanned by the calendar date, midnight to midnight, as :func:`window_key` dates it). A key this trigger would not write (another form, another window start, a date that does not parse)
     raises ``ValueError``: a span is never guessed."""
     z = _zone(zone)
     window = trigger.get("window")
@@ -160,8 +160,11 @@ def window_span(trigger: dict[str, Any], zone: str | None, key: str) -> tuple[da
                 raise ValueError
             day = datetime.strptime(key[2:12], "%Y-%m-%d")
             start, end = _hhmm(window["start"]), _hhmm(window["end"])
-            opens = (day + timedelta(minutes=start)).replace(tzinfo=z)
-            closes = (day + timedelta(days=0 if start < end else 1, minutes=end)).replace(tzinfo=z)
+            if start == end:  # window_key dates a whole-day window by the slot's own calendar date
+                opens, closes = day.replace(tzinfo=z), (day + timedelta(days=1)).replace(tzinfo=z)
+            else:
+                opens = (day + timedelta(minutes=start)).replace(tzinfo=z)
+                closes = (day + timedelta(days=0 if start < end else 1, minutes=end)).replace(tzinfo=z)
     except (ValueError, TypeError, AttributeError):
         raise ValueError(f"{key!r} is not a window key this schedule writes") from None
     return opens.astimezone(timezone.utc), closes.astimezone(timezone.utc)
