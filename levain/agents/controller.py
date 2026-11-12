@@ -10,7 +10,8 @@ that read first holds a snapshot and gets SQLite's busy error, which writes noth
 
 ``tick`` walks every registered, active agent's slots since its stored cursor, in the agent's stored zone, with an
 injected clock. Before the walk it ends every admitted occurrence the full cap has held past its grace
-(:func:`close_no_slot`); ``launch_over`` and ``session_alive`` are the desk-lease probes (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
+(:func:`close_no_slot`), then every admitted occurrence nothing launched past its grace
+(:func:`close_unlaunched`, D1-Q); ``launch_over`` and ``session_alive`` are the desk-lease probes (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
 binding_id | None``; ``None`` means the agent is not armed), because arming is derived from the authority log and a
 binding is minted by the launch slice, neither of which is this module's.
 """
@@ -44,7 +45,7 @@ from levain.agents.store import AgentStore, open_agent_store
 _log = logging.getLogger("levain.agents.controller")
 
 __all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim",
-           "close_no_slot", "tick", "heartbeat", "takeover", "Window", "LaunchResult", "launch",
+           "close_no_slot", "close_unlaunched", "NEVER_LAUNCHED", "tick", "heartbeat", "takeover", "Window", "LaunchResult", "launch",
            "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE", "SESSION_GRACE_S",
            "Ended", "settle_terminal", "GatedChild", "GATE_REFUSED", "fire_argv", "fire_record_path", "spawn_fire",
            "claim_fire", "fire", "miss_streak", "miss_windows"]
@@ -54,6 +55,7 @@ DUPLICATE = "duplicate"
 OVERLAP = "skipped-overlap"
 
 LEASE_S = 900  # A0 r7 section 2.3 [judged]: the desk slot's lease
+NEVER_LAUNCHED = "never_launched"
 
 CURSOR_PREFIX = "tick_cursor:"
 STREAK_PREFIX = "miss_streak:"
@@ -121,6 +123,7 @@ class TickResult:
     changed: list[str] = field(default_factory=list)                 # lifecycle moved mid-tick: left for next tick
     clamped: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, cursor): a cursor past the clock
     no_slot: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, key): admitted, past grace, no slot
+    unlaunched: list[tuple[str, str]] = field(default_factory=list)  # (agent_id, key): admitted, past grace, never launched
     missed_windows: dict[str, list[str]] = field(default_factory=dict)  # agent_id -> windows with a missed slot, once each
     silent: list[str] = field(default_factory=list)                  # agents with a miss this pass that fired nothing
     reaped: object = None                                            # what the reaper returned this pass (P6-4b)
@@ -220,6 +223,52 @@ def _close_no_slot_detailed(conn: sqlite3.Connection, now: datetime,
     return closed
 
 
+def close_unlaunched(conn: sqlite3.Connection, now: datetime) -> list[tuple[str, str]]:
+    """End every ``admitted`` occurrence past its grace that nothing launched (D1-Q), whether or not a slot is free.
+    Returns ``(agent_id, key)``; runs in the caller's write transaction."""
+    return [(agent_id, key) for agent_id, key, _, _, _ in _close_unlaunched_detailed(conn, now)]
+
+
+def _close_unlaunched_detailed(conn: sqlite3.Connection, now: datetime) -> list[tuple[str, str, str, str, str]]:
+    """:func:`close_unlaunched`, returning ``(agent_id, key, window_key, marker, kind)`` for :func:`tick`'s report.
+
+    An ``admitted`` row holds no slot, no reservation and no fire (A0 §2.4): it is a claim waiting for its launch, and
+    the launch is retried each pass only until the row's grace (:func:`_admitted_since`, :data:`schedule.GRACE`, the
+    one clock :func:`close_no_slot` and :func:`check_input` already read). A row still ``admitted`` past it was never
+    launched (the process died between the claim and the launch, the cover could not be read for the whole grace, the
+    agent was unarmed after the claim, or nothing launches that agent), and left alone it reads as a live previous
+    occurrence to every later claim (``skipped-overlap``) and to the dream's ``levain dream start`` ("in flight"). It ends:
+
+    * ``missed`` for a scheduled row (the slot's window did not run, so the miss streak counts it, as
+      :func:`close_no_slot` and :func:`check_input` count theirs);
+    * ``stopped`` for any other kind (a hand start that was killed between its claim and its launch: not "the laptop
+      slept", the state ``levain dream start`` gives its own non-launch exits);
+
+    each with reason :data:`NEVER_LAUNCHED`, one ``UPDATE`` guarded by ``state = 'admitted'``. No ceiling, authority or
+    admission rule is read or changed here: a row this ends was never admitted to run."""
+    at = _stamp(now)
+    closed = []
+    misses: dict[str, list[tuple[str, str]]] = {}
+    for oid, agent_id, kind, key, admitted_at, window in conn.execute(
+            "SELECT occurrence_id, agent_id, kind, key, admitted_at, window_key FROM agent_occurrences"
+            " WHERE state = 'admitted' ORDER BY admitted_at, occurrence_id").fetchall():
+        since = _admitted_since(kind, key, admitted_at)
+        if since is None or schedule.classify(since, now) != schedule.MISSED:
+            continue
+        state = "missed" if kind == "scheduled" else "stopped"
+        cur = conn.execute("UPDATE agent_occurrences SET state = ?, reason = ?, ended_at = ?"
+                           " WHERE occurrence_id = ? AND state = 'admitted'", (state, NEVER_LAUNCHED, at, oid))
+        if cur.rowcount != 1:
+            continue
+        slots.release(conn, oid)   # an admitted occurrence holds nothing (A0 §2.4), so this frees nothing today
+        closed.append((agent_id, key, window, _stamp(since), kind))
+        if state == "missed":
+            misses.setdefault(agent_id, []).append((_miss_identity(oid, kind, window), _stamp(since)))
+    for agent_id, theirs in misses.items():
+        _record_misses(conn, agent_id, theirs)
+    return closed
+
+
 def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
          binding_of: Callable[[str, str], str | None],
          session_alive: Callable[[str], bool | None] | None = None,
@@ -260,6 +309,13 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
             out.no_slot.append((agent_id, key))
             out.missed[agent_id] = out.missed.get(agent_id, 0) + 1
             _report_windows(out, agent_id, [window])
+        # what the cap did not hold but nothing launched either: ended before the walk, so the slot this pass claims is
+        # not filed skipped-overlap behind a row that holds no fire
+        for agent_id, key, window, _, kind in _close_unlaunched_detailed(conn, now):
+            out.unlaunched.append((agent_id, key))
+            if kind == "scheduled":       # a killed hand start is not a missed window (it did not reach the miss streak)
+                out.missed[agent_id] = out.missed.get(agent_id, 0) + 1
+                _report_windows(out, agent_id, [window])
     with store.read() as conn:
         agents = _agents(conn)
     for agent_id, name, operation, version, digest, text in agents:
