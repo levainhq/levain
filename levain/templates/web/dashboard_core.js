@@ -5039,6 +5039,9 @@
   // question key -> the first line of its words, whole up to QUESTION_LINE_CHARS: a wide focus view titles itself with it (the handle
   // is a strip row's few words; a desk's dialog has the room). Bounded with the handles.
   const questionLines = new Map();
+  // the open Needs focus view's item ({it, id}), and whether the breakpoint listener is installed: declared here, before anything that
+  // can open a focus view during init reads them (a `let` read earlier than its line throws)
+  let needsFocusNow = null, wideWatched = false;
   const QUESTION_LINE_CHARS = 140;
   const QUESTION_HANDLE_WORDS = 6, QUESTION_HANDLE_CHARS = 60, QUESTION_HANDLES_MAX = 200;
   // a refused send's words, by question id: a stale refusal empties the box so the owed re-read is not held off by it,
@@ -5067,7 +5070,7 @@
     if (cps.length <= QUESTION_LINE_CHARS) return line;
     let head = cps.slice(0, QUESTION_LINE_CHARS - 1).join("");
     if (!/\s/.test(cps[QUESTION_LINE_CHARS - 1])) head = head.replace(/\s+\S*$/, "");
-    return head + "\u2026";
+    return head.replace(/\s+$/, "") + "\u2026";    // never a space before the ellipsis, whichever way the cut fell
   }
   function rememberQuestionHandle(q, handle, line) {
     const k = questionKeyOf(q);
@@ -5081,7 +5084,11 @@
       questionLines.set(k, cutQuestionLine(line));
       if (questionLines.size > QUESTION_HANDLES_MAX) questionLines.delete(questionLines.keys().next().value);
     }
-    if (changed || (line && questionLines.get(k) !== prevLine)) repaintNeedsNames(k);
+    if (changed || (line && questionLines.get(k) !== prevLine)) {
+      repaintNeedsNames(k);
+      // a read that lands while this question's focus view is open (another surface's read of the same words) retakes its title too
+      if (needsFocusNow && needsFocusNow.it.kind === "question" && questionKeyOf(needsFocusNow.it.q) === k) retitleNeedsFocus(needsFocusNow.it, needsFocusNow.id);
+    }
   }
   // The glance tile is drawn before a question's words are read, so a name learned later is painted into the tile that already
   // stands (cockpit_view.js glanceFace marks it with the item it names). Only a tile naming `key` is touched (all of them when
@@ -6977,7 +6984,6 @@
     if (it.kind === "question") Promise.resolve(questionBody(it.q, null)).then(() => retitleNeedsFocus(it, id), () => {});
   }
   // the desk/phone title form is read when the title is built: crossing the breakpoint with the dialog open retakes it
-  let needsFocusNow = null, wideWatched = false;
   function watchWideDialog() {
     if (wideWatched || !window.matchMedia) return;
     wideWatched = true;
@@ -6988,7 +6994,8 @@
     } catch (e) { wideWatched = false; }
   }
   function retitleNeedsFocus(it, id) {
-    if (!modalCustom || modalCustom.page || modalCustom.id !== id) return;
+    // only the Needs focus view of this very item: a custom modal that reuses the id is another view and keeps its own title
+    if (!modalCustom || modalCustom.page || modalCustom.id !== id || modalKey !== "needs:" + id) return;
     const title = needsName(it, true);
     if (title === modalCustom.title) return;
     modalCustom.title = title;
@@ -7004,6 +7011,7 @@
     modalCustom = { id: String(spec.id || "custom"), title: String(spec.title || "panel"), build: spec.build, live: spec.live === true };
     modalGlance = false;
     modalKey = "custom:" + modalCustom.id;
+    needsFocusNow = null;
     modalReturnFocus = spec.opener || null;
     modalEpisodeQuery = "";
     buildModal(null);
@@ -9447,6 +9455,7 @@
   function openModal(entry, triggerEl, glance) {
     modalGlance = !!glance;
     modalKey = entryKey(entry);
+    needsFocusNow = null;
     modalReturnFocus = triggerEl || null;
     modalEpisodeQuery = "";  // a fresh open starts with the recent list, not a stale query
     proposalRead = null;     // a fresh open reads the proposals again: a denial or a grant since withdraws its card
@@ -9630,6 +9639,7 @@
     unlockNeedsScroll();
     modalKey = null;
     modalCustom = null;
+    needsFocusNow = null;
     modalGlance = false;
     modalPending = null;
     modalAwaiting = false;
