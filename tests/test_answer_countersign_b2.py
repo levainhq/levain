@@ -213,6 +213,47 @@ def test_countersign_evidence_is_the_card_and_its_signature_only_once_countersig
     assert got() is None                                    # an edited card is not the one filed
 
 
+def test_countersign_evidence_that_cannot_be_judged_now_is_no_verdict(monkeypatch, store, env, keydir, signq, pushes):
+    """L3 r1 (row 165): a verifier, passkey or store outage is not a bad countersign. The reader that keeps the answer
+    (slot_allow) must be able to tell it from one, so it raises instead of reading as no evidence; a bad card still
+    reads as none."""
+    from levain.authority import VerifierUnavailable
+    from levain.consent.sign import SignRefused
+
+    qs = seen(store, env, 1)
+    remote_line(monkeypatch, store, env, keydir, "1a", signq)
+    [path] = cards(signq)
+    pk = _Passkey()
+    sign_card(signq, pk, path.stem)
+    enrolled = lambda: {pk.key.fingerprint: pk.key}  # noqa: E731
+    got = lambda keys=enrolled: ac.countersign_evidence(store, qs[0].id, sign_queue=signq, keys=keys)  # noqa: E731
+    assert got() is not None
+
+    def no_keys():
+        raise SignRefused("the cockpit db is locked")
+    with pytest.raises(ac.EvidenceUnavailable, match="passkeys"):
+        got(no_keys)
+    real = ac._verified
+
+    def down(*a, **k):
+        raise VerifierUnavailable("ssh-keygen timed out")
+    monkeypatch.setattr(ac, "_verified", down)
+    with pytest.raises(ac.EvidenceUnavailable, match="verified now"):
+        got()
+    monkeypatch.setattr(ac, "_verified", real)
+    real_peek = type(store)._peek
+
+    def locked(self):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(type(store), "_peek", locked)
+    with pytest.raises(ac.EvidenceUnavailable):
+        got()
+    monkeypatch.setattr(type(store), "_peek", real_peek)
+    assert got() is not None                                # back: the same card is evidence again
+    path.write_text(path.read_text().replace("fixed 30 s", "fail loud"))
+    assert got() is None                                    # a card that is wrong stays a verdict, never a retry
+
+
 # --- 4. the local answer path is unchanged ----------------------------------------------------------------------
 
 def test_a_local_signed_line_files_no_card_and_reads_as_before(monkeypatch, store, env, keydir, signq, pushes):
