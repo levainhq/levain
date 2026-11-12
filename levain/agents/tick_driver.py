@@ -430,7 +430,7 @@ def _run_notices(st: AgentStore, result: Any, clock: Callable[[], datetime], sta
         seen["notices"] = "late"
         return
     try:
-        report = _da.tick_notices(st, now=clock(), missed_windows=getattr(result, "missed_windows", None),
+        report = _da.tick_notices(st, now=clock(), missed_windows=result.missed_windows,
                                   link_of=link_of, stream=stream)
     except Exception as exc:  # noqa: BLE001 - tick_notices guards each step; this is a defect in the pass itself
         notes.append(f"the night's notices raised {type(exc).__name__}: {exc}")
