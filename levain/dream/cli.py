@@ -600,10 +600,12 @@ def run_dream_drill(args: argparse.Namespace) -> int:
         print(json.dumps(res.as_dict(), sort_keys=True))
     else:
         print(f"levain dream drill: {res.outcome}" + (f" (snapshot {res.snapshot})" if res.snapshot else
-                                                       " (no snapshot yet: not a failure)"))
+                                                       " (no snapshot yet: not a failure)")
+              + (": no restore ran, so this is not a pass" if res.outcome == "skipped" else ""))
         for st in res.steps:
             print(f"  {st['name']:10s} {st['status']:8s} {st['detail']}")
-    return 1 if res.outcome == "failed" else 0
+    # 1 failed; 3 skipped (the restore did not run: nothing was proved, so it must not read as 0)
+    return {"failed": 1, "skipped": 3}.get(res.outcome, 0)
 
 
 def _host_zone() -> str | None:
