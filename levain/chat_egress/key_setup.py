@@ -230,8 +230,13 @@ def setup_key(data_root: Path | str, *, entity: str, host: str, source: str, acc
     if rid in state.policy.grants:
         raise SetupRefused(f"a grant {rid!r} already exists")
     if live and not replace:
+        # the refusal stands for a stopped record too; the words say so, since the record answers nothing yet blocks
+        stopped = [(gid, why) for gid in live if (why := grant_stop_reason(state, gid)) is not None]
         raise SetupRefused(f"{entity[:80]!r} already has a live setup record for {canon} ({', '.join(live)}): pass "
-                           "--replace to supersede it, or revoke it first")
+                           "--replace to supersede it, or revoke it first"
+                           + "".join(f"; {gid} was stopped ({why}) and answers nothing, but it still counts here "
+                                     f"until --replace supersedes it or `levain chat key revoke {gid}` removes it"
+                                     for gid, why in stopped))
     if replace and not live:
         raise SetupRefused(f"nothing to replace: {entity[:80]!r} has no live setup record for {canon}")
     if replace:

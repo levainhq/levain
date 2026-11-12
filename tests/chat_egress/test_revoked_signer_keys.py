@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 import levain.authority as auth
-from levain.chat_egress import keys
+from levain.chat_egress import key_setup, keys
 from levain.cockpit.firejournal import CockpitDB
 from levain.cockpit.keys import fingerprint_of, revoke
 from levain.consent.queue import authority_source
@@ -102,8 +102,17 @@ def world(tmp_path: Path):
     def liveness() -> keys.AuthorityLiveness:
         return keys.AuthorityLiveness(source, clock=_now, timeout_s=30.0)
 
+    def setup(by: str, **kw):
+        """`levain chat key setup` for entity `ent` on example.com, key ``by`` signing, a fake keychain of one item."""
+        by_path, by_fp = paths[by]
+        args = {"entity": "ent", "host": "example.com", "source": "levain-chat-test-item",
+                "account": "levain-chat-test-account", "placement": {"scheme": "bearer"}, "repos": ["/o/r.git"],
+                "expires": timedelta(days=7), "confirm": lambda preview: True, "signer_fp": by_fp,
+                "sign": _signer(by_path), "clock": _now, "keychain": SimpleNamespace(count=lambda s, a: 1)}
+        return key_setup.setup_key(root, **{**args, **kw})
+
     return SimpleNamespace(source=source, create=create, renew=renew, revoke_key=revoke_key, launch=launch,
-                           liveness=liveness)
+                           liveness=liveness, setup=setup)
 
 
 def _route(routes: keys.RouteSet) -> keys.RouteSnapshot:
@@ -177,3 +186,21 @@ def test_t13_a_stopped_record_is_not_a_second_live_record_for_its_host(world, mo
         world.launch()                                                      # control: both live is the refusal
     world.revoke_key("a", by="b")
     assert _route(world.launch()).record_id == "ek-000000000002"
+
+
+def test_a_setup_refused_by_a_stopped_record_says_it_was_stopped_and_the_way_on(world) -> None:
+    """A stopped record still counts in the one-live rule (the log counts it the same way), so a plain setup is refused
+    as before; the refusal now says that record was stopped, why, and that --replace or a revoke of it is the way on."""
+    world.create(by="a")
+    with pytest.raises(key_setup.SetupRefused) as live:              # control: a live record, the plain words
+        world.setup("b")
+    assert "stopped" not in str(live.value)
+    world.revoke_key("a", by="b")
+    with pytest.raises(key_setup.SetupRefused) as exc:
+        world.setup("b")
+    said = str(exc.value)
+    assert said.startswith(str(live.value))                         # the refusal itself is unchanged
+    assert f"{RID} was stopped ({auth.STOPPED_BORN})" in said
+    assert "--replace" in said and f"levain chat key revoke {RID}" in said
+    rec, _warning = world.setup("b", replace=True)                    # and the way on it names works
+    assert _route(world.launch()).record_id == rec["id"]
