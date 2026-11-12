@@ -342,13 +342,15 @@ const waitForWholeBoard = async () => {
   boardWaitGaveUp = true;
   console.error("page-drive: the board never said it was whole within the bound; later steps will not wait for it");
 };
-// The same race belongs to ANY reload of a page that has just loaded, not only the `init` step's: an `eval` that reloads waits for the worker first.
+// The same race belongs to the `init` step's reload and to an `eval` step whose source contains `location.reload` (RELOADS_PAGE): both wait for the
+// worker first. Any other way a step reloads or navigates (`location.assign`, `location.href = ...`, `history.go(0)`, a click that navigates) is NOT
+// covered: such a step waits for nothing, and a flake in one of them gets the same fix by widening RELOADS_PAGE.
 const awaitWorkerSettled = async () => {
   // A page that registers a service worker at load (the cockpit's /sw.js) is still INSTALLING it when the load event fires. Reloading
   // while it installs races the worker's install -> activate -> clients.claim against the reload's navigation: measured, under heavy
   // machine load, the reload's document response arrived, the worker activated in that same instant, and the navigation never
   // committed (no Page.frameNavigated, and every Runtime.evaluate queued behind it for 60 s). So a reload waits, bounded, until the
-  // worker the page registered has settled (activated and in control); a page with no registration passes at once. Not fatal: a worker
+  // worker the page registered has settled (activated and in control); a page with no service-worker API passes at once. Not fatal: a worker
   // that never takes control only costs this bounded wait, and the reload is then sent as before.
   // No registration is NOT settled at once: register() is asynchronous, so under load the first poll can run before the page's own
   // registration exists. "No registration" counts only after it has been seen on 8 polls in a row (a page with no worker
@@ -603,8 +605,8 @@ for (const s of steps) {
     }
     values.push(v || { timeout: s.until });
   } else {
-    const before = navStarts;
     if (RELOADS_PAGE.test(String(s.eval))) await awaitWorkerSettled();
+    const before = navStarts;       // after the wait: a navigation that began during it is not this eval's
     const o = await evaluateOutcome(s.eval);
     if ("error" in o && isNavigationError(o.error)) {
       // a navigation-class error counts as "the eval navigated" only when the page really began a navigation during it

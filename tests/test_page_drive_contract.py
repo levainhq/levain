@@ -178,7 +178,7 @@ def test_a_timeout_prints_the_page_state_after_its_named_line_and_keeps_the_exit
     assert len(block) < 4100, len(block)
 
 
-_SLOW_WORKER = "self.addEventListener('install', () => self.skipWaiting());\nself.addEventListener('activate', (e) => e.waitUntil(new Promise((r) => setTimeout(r, 1200)).then(() => self.clients.claim())));\n"
+_SLOW_WORKER = "self.addEventListener('install', () => self.skipWaiting());\nself.addEventListener('activate', (e) => e.waitUntil(new Promise((r) => setTimeout(r, 3000)).then(() => self.clients.claim())));\n"
 _WORKER_PAGE = ("<!doctype html><title>w</title><p>w</p><script>navigator.serviceWorker.register('/sw.js', {scope: '/'});\n"
                 "addEventListener('beforeunload', () => sessionStorage.setItem('ctl', String(!!navigator.serviceWorker.controller)));</script>")
 
@@ -187,7 +187,7 @@ _WORKER_PAGE = ("<!doctype html><title>w</title><p>w</p><script>navigator.servic
 def test_an_eval_that_reloads_waits_for_the_pages_worker_to_take_control(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # CI, the List LATER phone test, 1 run in 4: the page reloaded while its worker was still installing, the navigation never committed and
     # the page stopped answering (reproduced at a 10x CPU throttle: 11 of 27 runs; 0 of 14 with the wait). The `init` step has always waited
-    # for the worker before its reload; an `eval` that reloads waits the same way. The worker here takes 1200 ms to activate, so a reload
+    # for the worker before its reload; an `eval` that reloads waits the same way. The worker here takes 3000 ms to activate (a wide margin, so a stalled box still reads red without the wait), so a reload
     # sent at once reads no controller at the moment the page unloads; a reload that waited reads one.
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
