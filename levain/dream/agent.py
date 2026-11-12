@@ -277,7 +277,10 @@ def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expire
         undo = (f"`levain dream rollback <occurrence> --store-dir {shlex.quote(_card.required_store_dir(store_dir))}` "
                 "(each morning card names the exact command)")
     return (f"Dream consolidates this install's memory {_when_text(zone, time)}, and only when the day has new "
-            "episodes and no other consolidation is in progress. Seats may be live while it runs: it works from the "
+            "episodes and no other consolidation is in progress. It clears an open wrap it proves dead: one its own run "
+            "left, once older than the executor's age bound, and a seat's wrap only if you have set an age floor and "
+            "the wrap is older than that too, a setting which is not part of what you sign. "
+            "Seats may be live while it runs: it works from the "
             "episodes recorded before it starts, and whatever a seat records during it is kept and goes to the next "
             "dream. The time is part of what you sign: a new time needs a new signed link. "
             "It writes the always-loaded memory text, never the "
