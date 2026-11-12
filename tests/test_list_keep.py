@@ -96,7 +96,7 @@ def test_a_keep_of_an_intention_with_an_awkward_origin_key_lands(rig: Rig) -> No
     import json
 
     data = json.loads(path.read_text())
-    rows = data["spores"] if isinstance(data, dict) and "spores" in data else data     # anneal's document key (its own word)
+    rows = data["intentions"] if isinstance(data, dict) and "spores" in data else data     # anneal's document key (its own word)
     target = next(r for r in rows if r["id"] == sid)
     target["origin_key"] = "a " + "\u00e9" * 127           # 129 characters, spaces and Unicode
     path.write_text(json.dumps(data))

@@ -336,7 +336,7 @@ class TestIntentionProjections:
         import json
 
         path.write_text(
-            json.dumps({"schema_version": 1, "resolved": [], "spores": rows}),
+            json.dumps({"schema_version": 2, "resolved": [], "intentions": rows}),
             encoding="utf-8",
         )
 

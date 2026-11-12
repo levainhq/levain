@@ -96,7 +96,7 @@ def _row(store: Path, key: str) -> dict[str, Any] | None:
 
 def _origin_count(store: Path, key: str) -> int:
     raw = json.loads(store.read_text())
-    return sum(1 for r in (*raw.get("spores", []), *raw.get("resolved", [])) if r.get("origin_key") == key)
+    return sum(1 for r in (*raw.get("intentions", []), *raw.get("resolved", [])) if r.get("origin_key") == key)
 
 
 def _create_key(data: Path) -> str:

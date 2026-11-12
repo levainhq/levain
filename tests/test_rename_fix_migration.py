@@ -75,7 +75,7 @@ def test_g2_held_hooks_leave_the_migration_for_the_next_update(install, monkeypa
     text = "\n".join(lines)
     assert "left for the next `levain update`" in text and "held" in text, text
     assert "record(s) rewritten to someday" not in text and "was not done" not in text
-    assert json.loads(before)["spores"][0]["id"] == sid
+    assert json.loads(before)["intentions"][0]["id"] == sid
 
 
 def test_g2_once_nothing_is_held_the_next_update_migrates(install, monkeypatch):
@@ -86,7 +86,7 @@ def test_g2_once_nothing_is_held_the_next_update_migrates(install, monkeypatch):
     lines: list[str] = []
     assert run_update(install, no_pip=True, emit=lines.append) == 0
     doc = json.loads(_paths(install).intentions_json.read_text(encoding="utf-8"))
-    assert {r["id"]: r["disposition"] for r in doc["spores"]}[sid] == "someday"
+    assert {r["id"]: r["disposition"] for r in doc["intentions"]}[sid] == "someday"
     assert "1 open seed record(s) rewritten to someday" in "\n".join(lines)
 
 

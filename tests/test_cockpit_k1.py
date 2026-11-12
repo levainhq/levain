@@ -463,11 +463,11 @@ class TestRowVersions:
         v0 = {r["id"]: r["version"] for r in ck.panel("tray")["rows"]}
         path = root / ".levain" / "memory.spores.json"
         data = json.loads(path.read_text())
-        for s in data["spores"]:
+        for s in data["intentions"]:
             s["seen"] = "2031-01-01"          # an intention_touch / session-open
         path.write_text(json.dumps(data))
         assert {r["id"]: r["version"] for r in ck.panel("tray")["rows"]} == v0
-        for s in data["spores"]:
+        for s in data["intentions"]:
             if s["text"] == "seed overdue":
                 s["text"] = "seed overdue, edited"
         path.write_text(json.dumps(data))
@@ -489,7 +489,7 @@ class TestRowVersions:
         assert isinstance(before, Read)
         path = root / ".levain" / "memory.spores.json"
         data = json.loads(path.read_text())
-        for s in data["spores"]:
+        for s in data["intentions"]:
             if f"intention:{s['id']}" == row_id:
                 s["text"] = "changed under the snapshot"
         path.write_text(json.dumps(data))
@@ -706,7 +706,7 @@ class TestL3R1Fixes:
         root, _s, ck = env
         path = root / ".levain" / "memory.spores.json"
         data = json.loads(path.read_text())
-        for s in data["spores"]:
+        for s in data["intentions"]:
             if s["text"] == "seed overdue":
                 s["next"] = "2999-01-01"
         path.write_text(json.dumps(data))

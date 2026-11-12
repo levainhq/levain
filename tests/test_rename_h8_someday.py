@@ -60,7 +60,7 @@ def _doc(paths: AnnealPaths) -> dict:
 
 
 def _open(paths: AnnealPaths, rid: str) -> dict:
-    return next(r for r in _doc(paths)["spores"] if r["id"] == rid)
+    return next(r for r in _doc(paths)["intentions"] if r["id"] == rid)
 
 
 # --- the sets ------------------------------------------------------------------------------------------------------

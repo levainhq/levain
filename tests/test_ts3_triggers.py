@@ -90,7 +90,7 @@ def _add(root, nxt, disposition="agenda"):
     s = guarded_intention_store(path).add(type="thought", text="call him", disposition=disposition, next=day)
     if nxt != day:      # anneal's write path takes a date only; a timed next is stored by hand (as a hand edit would)
         doc = json.loads(path.read_text())
-        for row in (doc["spores"] if isinstance(doc, dict) else doc):
+        for row in (doc["intentions"] if isinstance(doc, dict) else doc):
             if row["id"] == s["id"]:
                 row["next"] = nxt
         path.write_text(json.dumps(doc))
@@ -200,7 +200,7 @@ def test_hook_and_doctor_agree_on_which_agendas_are_due(agent, tmp_path):
     rows = [{"id": f"intention-{i:03d}", "disposition": d, "next": n, "text": "x", "type": "thought", "status": "open"}
             for i, (d, n) in enumerate(_PARITY)]
     path = root / ".levain" / "memory.spores.json"
-    path.write_text(json.dumps({"version": 1, "spores": rows}))
+    path.write_text(json.dumps({"schema_version": 2, "intentions": rows}))
     hook_due = {s["id"] for s in h.due_agendas(rows, now=datetime(2026, 11, 7, 12, 0))}
     rep = doctor._check_overdue_agenda(root, today=TODAY)
     doc_due = {r["id"] for r in rows if rep and r["id"] in rep[0].detail}

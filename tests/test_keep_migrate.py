@@ -74,7 +74,7 @@ def _plan(env: Env, **kw) -> Path:
 def test_dry_run_changes_no_byte(env: Env):
     # a keyless legacy row: anneal's own keyed read would backfill + save it, the dry run must not
     doc = json.loads(env.intentions.read_text())
-    doc["spores"][0].pop("origin_key")
+    doc["intentions"][0].pop("origin_key")
     env.intentions.write_text(json.dumps(doc, indent=1))
     before = _sha(env.intentions)
     p = _plan(env)
@@ -87,7 +87,7 @@ def test_dry_run_changes_no_byte(env: Env):
     for i in plan["items"]:
         assert i["why"] and i["destination"]["kind"] and "origin_key" in i and isinstance(i["notes"], list)
     first = plan["items"][0]
-    assert first["notes"] == [n for n in doc["spores"][0]["notes"]]
+    assert first["notes"] == [n for n in doc["intentions"][0]["notes"]]
 
 
 def test_routing_per_frame(env: Env):
@@ -344,7 +344,7 @@ def test_intention_destinations_carry_the_agenda_fields_and_the_age(env: Env):
     h = s.add(type="task", text="a targeted handoff", disposition="handoff", target="alice",
               attention="high", germinated={"on": "2026-10-01"})
     doc = json.loads(env.intentions.read_text())
-    for r in doc["spores"]:
+    for r in doc["intentions"]:
         if r["text"] == "an undated agenda":
             r["created"] = "2025-01-02"
     env.intentions.write_text(json.dumps(doc, indent=1))
@@ -418,7 +418,7 @@ def _crash_on_the_save_after(monkeypatch, prefix: str) -> None:
             st["fired"] = True
             raise Boom
         real(self, data)
-        if any(str(r.get("origin_key") or "").startswith(prefix) for r in data.get("spores", [])):
+        if any(str(r.get("origin_key") or "").startswith(prefix) for r in data.get("intentions", [])):
             st["armed"] = True
 
     monkeypatch.setattr(IntentionStore, "_save", save)

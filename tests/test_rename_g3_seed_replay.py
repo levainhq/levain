@@ -83,7 +83,7 @@ def test_ops_signed_on_seed_complete_as_someday_not_unapplied_refused(old):
     got = _settle(data, store)
     assert got == {"h": "COMMITTED", "i": "COMMITTED"}, (got, _sql(data, "SELECT status, reason FROM effects"))
     raw = json.loads(store.read_text())
-    rows = [r for r in raw["spores"] if r["origin_key"] == "k.i" or r["text"] == "captured as a seed"]
+    rows = [r for r in raw["intentions"] if r["origin_key"] == "k.i" or r["text"] == "captured as a seed"]
     assert sorted(r["disposition"] for r in rows) == ["someday", "someday"]
     assert all(e == ("APPLIED", None) for e in _sql(data, "SELECT status, reason FROM effects"))
 
