@@ -187,3 +187,13 @@ def test_f2_enable_prints_the_undo_command_with_the_installs_store(tmp_path, cap
     assert code == 0, err
     card = json.loads(out)["signing_card"]
     assert f"`levain dream rollback <occurrence> --store-dir {e.store_dir.resolve()}`" in card
+
+
+# ------------------------------------------------------------------------------------------------------------- F3
+
+def test_f3_the_ready_module_does_not_say_the_card_names_who_was_live():
+    assert "and the card can say who was live" not in " ".join(rd.__doc__.split())
+    # the claim was false: the consolidated card carries no seat field, and the check's detail is the only record
+    body = cd.build_card("consolidated", occurrence="o1").body
+    assert not any("seat" in k or "live" in k for k in body)
+

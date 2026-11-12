@@ -23,8 +23,9 @@ The six checks, each mapped from flow's ``dream.py`` ``gate``:
 5. live seats are NOTED, never refused (D1-L1, D1_design section 3.4; PLAN D1's 10-30 amendment: the dream runs at
    the operator's time WITH seats live). The check still reads the three places a seat shows (a live desk launch, a
    work thread in ``awake.json``, another session in anneal's session registry, which a hooked Claude Code session
-   heartbeats into) and names what it found in its detail, so ``levain dream ready`` and the card can say who was
-   live; it always passes, and a source it could not read is named in the detail, not turned into a refusal (nothing
+   heartbeats into) and names what it found in its detail, so ``levain dream ready`` can say who is live when it runs
+   (nothing records who was live when a scheduled night ran: the card has no seat field and a ready admission's detail is
+   not stored); it always passes, and a source it could not read is named in the detail, not turned into a refusal (nothing
    in the verdict rests on this list any more). When seats are live it also reads the baton policy, to name a store
    without it (an unreadable policy is named the same way). A manual run is no different
 6. the window's one scheduled attempt is not already spent (a launched run that failed or was stopped). Waived for a
