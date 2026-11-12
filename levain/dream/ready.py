@@ -28,8 +28,10 @@ The six checks, each mapped from flow's ``dream.py`` ``gate``:
    not stored); it always passes, and a source it could not read is named in the detail, not turned into a refusal (nothing
    in the verdict rests on this list any more). When seats are live it also reads the baton policy, to name a store
    without it (an unreadable policy is named the same way). A manual run is no different
-6. the window's one scheduled attempt is not already spent (a launched run that failed or was stopped). Waived for a
-   manual run: the catch-up is the remedy for exactly that failure, and check 1's ceiling bounds it
+6. the window's one scheduled attempt is not already spent (a launched run that failed or was stopped, except the
+   first run per window that lapse recovery ended before any fire claimed it: it never ran, and Phill ruled it does not
+   spend the attempt). Waived for a manual run: the catch-up is the remedy for exactly that failure, and check 1's
+   ceiling bounds it
 
 **Why a live seat no longer needs a refusal (what carries the safety instead).**
 
@@ -466,6 +468,20 @@ def _check5(src: Sources) -> Check:
     return Check(5, CHECK5_NAME, "pass", " | ".join(parts))
 
 
+#: Phill's ruling (np-11fe7532 b): a run taken over before any fire claimed it does not spend the night's attempt, and
+#: the extra launch it buys is one per window, inside check 1's ceiling and the window's budget whatever their numbers
+TAKEN_OVER_EXTRA_LAUNCHES = 1
+_TAKEN_OVER_REASON = "crash_recovered"   # levain.agents.controller.CRASH_RECOVERED, compared by value; a test pins it
+
+
+def _taken_over_unclaimed(row: Mapping[str, Any]) -> bool:
+    """True for a launched row that lapse recovery ended while no fire had ever claimed it: ``stopped`` for the
+    takeover's reason with neither ``pid`` nor ``session_key`` written (a claim writes one and nothing clears it). A
+    fire that claimed the row and was then lost has a pid, so its run still spends the attempt."""
+    return (row.get("state") == "stopped" and row.get("reason") == _TAKEN_OVER_REASON
+            and row.get("pid") is None and row.get("session_key") is None)
+
+
 def _check6(src: Sources, agent: str, key: str, manual: bool) -> Check:
     name = "the window's attempt is not spent"
     if manual:
@@ -473,10 +489,16 @@ def _check6(src: Sources, agent: str, key: str, manual: bool) -> Check:
                                         "ceiling bounds it")
     rows = [r for r in _guard(src.occurrences, "the occurrence table") if r.get("agent_id") == agent
             and r.get("window_key") == key and r.get("launched_at") and r.get("state") in _SPENT_STATES]
+    # a run lapse recovery ended before any fire claimed it never ran: the first one per window is not an attempt
+    forgiven = [r for r in rows if _taken_over_unclaimed(r)][:TAKEN_OVER_EXTRA_LAUNCHES]
+    rows = [r for r in rows if not any(r is f for f in forgiven)]
     if rows:
         r = rows[0]
         return Check(6, name, QUIET, f"{r.get('occurrence_id')} launched in this window and {r.get('state')}: one "
                                      "scheduled launch per window", "attempt-spent")
+    if forgiven:
+        return Check(6, name, "pass", f"{forgiven[0].get('occurrence_id')} was taken over before any fire claimed it: it "
+                                      "did not spend the window's attempt")
     return Check(6, name, "pass", "no launched run of this window has failed")
 
 
