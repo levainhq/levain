@@ -235,7 +235,8 @@ def setup_key(data_root: Path | str, *, entity: str, host: str, source: str, acc
         raise SetupRefused(f"{entity[:80]!r} already has a live setup record for {canon} ({', '.join(live)}): pass "
                            "--replace to supersede it, or revoke it first"
                            + "".join(f"; {gid} was stopped ({why}) and answers nothing, but it still counts here "
-                                     f"until --replace supersedes it or `levain chat key revoke {gid}` removes it"
+                                     "until --replace supersedes it or `levain chat key revoke --signing-key <key> "
+                                     f"{gid}` removes it"
                                      for gid, why in stopped))
     if replace and not live:
         raise SetupRefused(f"nothing to replace: {entity[:80]!r} has no live setup record for {canon}")
