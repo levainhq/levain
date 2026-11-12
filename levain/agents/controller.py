@@ -40,7 +40,7 @@ from urllib.parse import quote
 from levain import authority as _auth
 from levain.agent_authority import AgentCoverMoved
 from levain.agents import accounting, schedule, slots
-from levain.agents.spec import _check_row
+from levain.agents.spec import DEFAULT_PAUSE_AFTER, _check_row
 from levain.agents.store import AgentStore, open_agent_store
 
 _log = logging.getLogger("levain.agents.controller")
@@ -50,7 +50,7 @@ __all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurren
            "Window", "LaunchResult", "launch",
            "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE", "SESSION_GRACE_S",
            "Ended", "settle_terminal", "GatedChild", "GATE_REFUSED", "fire_argv", "fire_record_path", "spawn_fire",
-           "claim_fire", "fire", "miss_streak", "miss_windows"]
+           "claim_fire", "fire", "miss_streak", "miss_windows", "FAILING_STOPS", "counts_as_failed_run"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
@@ -58,6 +58,10 @@ OVERLAP = "skipped-overlap"
 
 LEASE_S = 900  # A0 r7 section 2.3 [judged]: the desk slot's lease
 NEVER_LAUNCHED = "never_launched"
+CRASH_RECOVERED = "crash_recovered"   # the reason :func:`takeover` writes
+# the reason the reaper writes for a run past its signed ``stop_at`` (the same text as
+# levain.agents.supervise.STOP_AT_REASON, which imports this module; tests/test_agents_failure_streak.py pins them equal)
+STOP_AT = "stop_at"
 
 CURSOR_PREFIX = "tick_cursor:"
 STREAK_PREFIX = "miss_streak:"
@@ -569,7 +573,7 @@ def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime,
     if lease is None or at <= lease:
         return False
     proven = type(stopped) is accounting.StopResult and stopped.terminated is True
-    ended = _end_launched(conn, occurrence_id, "stopped", "crash_recovered",
+    ended = _end_launched(conn, occurrence_id, "stopped", CRASH_RECOVERED,
                           usage if usage is not None and proven else _UNREAD, at, "lease_until = ?", (row[0],),
                           bump=True)
     return ended.ended
@@ -628,13 +632,68 @@ class Ended:
     released: bool = False
 
 
+# The `stopped` reasons that mean the fire did NOT complete its run, as an allow-list: a reason not named here (a bar,
+# a fence, a link no longer live: the operator's or the authority's own revocation; anything a later change adds) never
+# counts against the agent. `failed` needs no list: whatever its reason, a run that ended `failed` did not complete.
+FAILING_STOPS = (CRASH_RECOVERED, STOP_AT)
+
+
+def counts_as_failed_run(state: str, reason: str | None) -> bool:
+    """Whether a launched run's end is a FAILED run for the agent's ``failure_streak`` (D1-P, board row 1688).
+
+    * ``failed``: yes, whatever the reason (a run error, a verifier's verdict, ``budget_breach``);
+    * ``stopped`` with :data:`CRASH_RECOVERED` (the lease lapsed and a takeover ended the row: the fire died or never
+      claimed) or :data:`STOP_AT` (the run was cut at its signed ceiling): yes, the run did not complete;
+    * ``stopped`` for anything else (``barred``, ``fenced``, ``link_not_live``: someone revoked it): no;
+    * ``done``: no (it resets the streak instead).
+
+    Rows that never launched (``skipped-*``, ``missed``, a hand start ended :data:`NEVER_LAUNCHED`) do not reach
+    :func:`_end_launched` and so never reach this: a night with nothing to do is not a failing agent."""
+    return state == "failed" or (state == "stopped" and reason in FAILING_STOPS)
+
+
+def _pause_after_of(spec_text: object) -> int:
+    """``on_failure.pause_after`` of a stored spec (a signed field, 1 or more), or :data:`DEFAULT_PAUSE_AFTER` when the
+    text cannot be read: a spec that fails its integrity check is the tick's to refuse, not this writer's."""
+    try:
+        value = json.loads(spec_text)["on_failure"]["pause_after"]    # type: ignore[arg-type]
+    except (TypeError, ValueError, KeyError):
+        return DEFAULT_PAUSE_AFTER
+    return value if type(value) is int and value >= 1 else DEFAULT_PAUSE_AFTER
+
+
+def _record_run_end(conn: sqlite3.Connection, occurrence_id: str, state: str, reason: str) -> None:
+    """The ONE writer of ``agents.failure_streak`` (and the only place a run's failure pauses its agent), called by
+    :func:`_end_launched` inside the transaction that writes the occurrence's end, so a crash leaves either both or
+    neither. ``done`` resets the streak; a failed run (:func:`counts_as_failed_run`) adds one and, at the spec's
+    ``on_failure.pause_after``, sets ``operation = 'paused'``: the tick walks no slot of a paused agent and
+    :func:`_admit` refuses a launch of its claimed row (``stopped`` / ``paused``). Anything else changes nothing. Only
+    :func:`levain.agents.spec.set_operation` (resume) clears a pause, and it resets the streak with it."""
+    found = conn.execute("SELECT agent_id FROM agent_occurrences WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
+    if found is None:
+        return
+    agent_id = found[0]
+    if state == "done":
+        conn.execute("UPDATE agents SET failure_streak = 0 WHERE agent_id = ? AND failure_streak != 0", (agent_id,))
+        return
+    if not counts_as_failed_run(state, reason):
+        return
+    conn.execute("UPDATE agents SET failure_streak = failure_streak + 1 WHERE agent_id = ?", (agent_id,))
+    streak, text = conn.execute(
+        "SELECT a.failure_streak, s.spec FROM agents a LEFT JOIN agent_specs s ON s.agent_id = a.agent_id"
+        " AND s.version = a.current_version WHERE a.agent_id = ?", (agent_id,)).fetchone()
+    if streak >= _pause_after_of(text):
+        conn.execute("UPDATE agents SET operation = 'paused' WHERE agent_id = ?", (agent_id,))
+
+
 def _end_launched(conn: sqlite3.Connection, occurrence_id: str, state: str, reason: str, usage: accounting.Usage,
                   at: datetime, guard: str, args: tuple, *, bump: bool) -> Ended:
     """The one place a launched occurrence's slot is freed and its reservation settled (an admitted one holds neither,
     A0 §2.4; :func:`close_no_slot`'s release on it is defensive): under the caller's write lock, the
     row is read as ``launched`` under ``guard``; the reservation is settled, a breach turns the end into
-    ``failed``/``budget_breach``, the state is written under the same guard (with ``epoch + 1`` for lapse recovery)
-    and the slot is released. A row the guard does not find gets nothing written, settled or freed."""
+    ``failed``/``budget_breach``, the state is written under the same guard (with ``epoch + 1`` for lapse recovery),
+    the agent's failure streak is written (:func:`_record_run_end`) and the slot is released. A row the guard does
+    not find gets nothing written, settled or freed."""
     _write_lock(conn)
     where = f"occurrence_id = ? AND state = 'launched' AND {guard}"
     if conn.execute(f"SELECT 1 FROM agent_occurrences WHERE {where}", (occurrence_id, *args)).fetchone() is None:
@@ -647,6 +706,7 @@ def _end_launched(conn: sqlite3.Connection, occurrence_id: str, state: str, reas
                        (state, reason, _stamp(at), occurrence_id, *args))
     if cur.rowcount != 1:   # the lock is held since the read: only a trigger gets here; the caller rolls back
         raise RuntimeError(f"occurrence {occurrence_id} moved inside its own terminal transaction")
+    _record_run_end(conn, occurrence_id, state, reason)   # the agent's failure streak, in this same transaction
     return Ended(True, state, reason, settled, slots.release(conn, occurrence_id))
 
 
