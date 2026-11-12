@@ -196,7 +196,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                                      "the dream's current spec, the launch holds it to the link's signed run ceiling and "
                                      "budgets, and the day-ready checks run as a MANUAL run (the window's one-attempt "
                                      "check is waived; a wrap open, a baton held elsewhere, the day already dreamed and "
-                                     "two runs launched today still refuse). It then spawns the same detached fire a "
+                                     "two runs launched in the same night, or the same daytime, still refuse). It then spawns the same detached fire a "
                                      "scheduled run has, and returns; the result is a card on the desk. It spends real "
                                      "money on the Claude route, inside the link's signed limits.")
     stt.add_argument("--agent-store-dir", type=Path, default=None,

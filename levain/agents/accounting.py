@@ -17,11 +17,13 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Protocol, runtime_checkable
+from zoneinfo import ZoneInfo
 
 __all__ = ["Usage", "StopResult", "Executor", "ActionExposure", "SubscriptionExecutor", "FRONT_READ_BUFFER", "BILLINGS",
            "Limits", "Reserved", "Refused", "Settled", "reserve", "settle",
-           "open_reservations", "WINDOW_KEY_FORMS"]
+           "open_reservations", "WINDOW_KEY_FORMS", "CountSpan", "count_span"]
 
 # the three forms of ``agent_occurrences.window_key`` (A0 §2.6); the first two are scheduled, the third is manual
 WINDOW_KEY_FORMS = ("w:<zone date of window start>T<HH:MM>", "d:<YYYY-MM-DD in the agent's zone>", "m:<YYYY-MM-DD>")
@@ -109,8 +111,10 @@ class Limits:
     ``run_ceiling`` and ``budget_window_usd_micros`` are the link's signed fields. ``scheduled_window_key`` is read
     for a MANUAL launch only: the window that holds now, or None when none does. A scheduled launch always counts its
     own occurrence's window key, whatever is passed here. ``span_start``/``span_end`` bound, as UTC ISO text with
-    start inclusive and end exclusive, the manual runs that count (the window for a scheduled launch, today in the
-    agent's zone for a manual one). One signed limit covers both kinds: no second allowance for manual runs.
+    start inclusive and end exclusive, the manual runs that count. All three come from ONE rule, :func:`count_span`
+    of the launch's instant: a run launched inside a window counts against that window (a hand start at 23:30 or 00:10
+    against that night, with the night's scheduled runs), a run launched outside every window against the daytime it
+    falls in, untouched by any night's runs. One signed limit covers both kinds: no second allowance for manual runs.
 
     ``billing`` and the two per-run action caps are the link's (P7-A §2.2): an ``api_key`` link carries zero caps and a
     ``subscription`` link carries positive ones and zero dollar budgets. The defaults are the shipped link's reading.
@@ -128,6 +132,63 @@ class Limits:
     budget_run_calls: int = 0
     budget_run_tunnel_bytes: int = 0
     budget_run_usd_micros: int = 0
+
+
+@dataclass(frozen=True)
+class CountSpan:
+    """The one allowance an instant counts against (:func:`count_span`): runs launched in ``[start, end)`` and the
+    scheduled runs keyed ``window_key`` share one signed ceiling and one window budget. ``window_key`` is the scheduled
+    window the instant falls inside, None for the daytime between two windows (no scheduled run is keyed there)."""
+    window_key: str | None
+    start: datetime
+    end: datetime
+
+    @property
+    def span_start(self) -> str:
+        return self.start.astimezone(timezone.utc).strftime(_STAMP)
+
+    @property
+    def span_end(self) -> str:
+        return self.end.astimezone(timezone.utc).strftime(_STAMP)
+
+
+_STAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def count_span(window: Mapping[str, str] | None, zone: str, at: datetime) -> CountSpan:
+    """THE counting rule (Phill's ruling np-8ec243e5 (a), 11-12): a run counts against the window it launches inside,
+    a scheduled one and a hand start alike, and a run launched outside every window counts against the daytime it falls
+    in, from the last window's end to the next window's start, so a night's runs never count against a day or the other
+    way round. ``window`` is the schedule's ``{"start": "HH:MM", "end": "HH:MM"}`` in ``zone``; None (or a start equal
+    to its end) is the whole calendar day, keyed ``d:<date>`` as the schedule keys it.
+
+    A window and its span come from :func:`levain.agents.schedule.window_key` and ``window_span``, the functions the
+    scheduled slots are keyed and launched by, so the night a hand start counts against is the very night a scheduled
+    slot counts. A pure function of ``at``: it reads no clock. Local times are built per date in ``zone``, so a night
+    the clocks change in keeps its 22:00 and 05:00 ends and its true length."""
+    from levain.agents import schedule
+
+    if at.tzinfo is None:
+        raise ValueError("a counted instant must be timezone-aware")
+    trigger = {"window": dict(window) if window is not None else None}
+    z = ZoneInfo(zone)
+    local = at.astimezone(z)
+    whole_day = window is None or window["start"] == window["end"]
+    if whole_day or schedule._in_window(trigger["window"], local):
+        key = schedule.window_key(trigger, zone, at)
+        lo, hi = schedule.window_span(trigger, zone, key)
+        return CountSpan(key, lo, hi)
+    start, end = schedule._hhmm(window["start"]), schedule._hhmm(window["end"])
+    day = datetime(local.year, local.month, local.day)
+    if start > end:                       # a window across midnight: the daytime is end..start of the same date
+        lo_day, hi_day = day, day
+    elif local.hour * 60 + local.minute < start:   # before today's window: since yesterday's ended
+        lo_day, hi_day = day - timedelta(days=1), day
+    else:                                 # after today's window: until tomorrow's opens
+        lo_day, hi_day = day, day + timedelta(days=1)
+    lo = (lo_day + timedelta(minutes=end)).replace(tzinfo=z)
+    hi = (hi_day + timedelta(minutes=start)).replace(tzinfo=z)
+    return CountSpan(None, lo.astimezone(timezone.utc), hi.astimezone(timezone.utc))
 
 
 @dataclass(frozen=True)
@@ -202,8 +263,8 @@ _MAX_MICROS = 2**63 - 1
 # A manual run is left out only when it is PROVABLY outside the span: julianday() is NULL for a stamp (or bound) it
 # cannot parse, the comparison is then NULL, COALESCE makes it 0, and the run counts (fail-closed, never dropped).
 # julianday is a double (~ms resolution): a stamp within about a millisecond of a bound may land on either side.
-# Per A0 §2.6 a manual launch with no window holding now (:swk NULL) counts manual runs only: that is the contract's
-# basis, not an omission here; a scheduled launch's :swk is its own window key, read from the occurrence (reserve).
+# A manual launch outside every window (:swk NULL, the daytime count_span names) counts manual runs only: no scheduled
+# run is keyed in a daytime span; a scheduled launch's :swk is its own window key, read from the occurrence (reserve).
 _COUNTED = ("FROM agent_occurrences o WHERE o.agent_id = :agent AND o.occurrence_id != :me"
             " AND (o.launched_at IS NOT NULL OR EXISTS (SELECT 1 FROM agent_reservations r"
             " WHERE r.occurrence_id = o.occurrence_id))"
