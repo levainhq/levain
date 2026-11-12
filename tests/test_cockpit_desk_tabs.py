@@ -166,8 +166,9 @@ def _later_home(tmp_path: Path, monkeypatch, specs: list[tuple[str, int]], desk:
 
 @needs_browser
 def test_a_dated_desk_question_is_a_desk_later_line_and_the_head_stays(tmp_path: Path, monkeypatch) -> None:
-    """F1 + F2 + F3: a dated desk question is no actionable card and no count on Desk owes; each tab draws only its own LATER
-    lines; a strip of LATER rows alone keeps its head (tabs); the LATER lines carry their band number."""
+    """F1 + F2 + F3: a dated desk question is no actionable card, but the desk still owes it, so Desk owes counts it (the footer's
+    DESK OWES does); each tab draws only its own LATER lines; a strip of LATER rows alone keeps its head (tabs); the LATER lines
+    carry their band number."""
     _later_home(tmp_path, monkeypatch, [("You later", 3), ("Desk later", 2)], desk=("Desk later",))
     _root, src, _ids = _install(tmp_path)
     lines = "Array.from(document.querySelectorAll('#ck-needs .needs-later-line'))"
@@ -186,7 +187,7 @@ def test_a_dated_desk_question_is_a_desk_later_line_and_the_head_stays(tmp_path:
             {"eval": probe}])["values"]
     got = [json.loads(v) for v in vals if isinstance(v, str) and v.startswith("{")]
     you, dsk = got[0], got[-1]
-    assert you["tabs"] == ["Needs you (0)", "Desk owes (0)"] and you["later"] == ["1"] and you["rows"] == 0, you
+    assert you["tabs"] == ["Needs you (0)", "Desk owes (1)"] and you["later"] == ["1"] and you["rows"] == 0, you
     assert dsk["later"] == ["2"] and dsk["rows"] == 0 and dsk["empty"] == "The desk owes you nothing right now.", dsk
     assert all(b for b in you["bands"] + dsk["bands"]), (you, dsk)
 

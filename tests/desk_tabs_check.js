@@ -30,5 +30,13 @@ const dated = { question: { section: "you", state: "open", carried: false, later
 const dt2 = C.deskTabs([q("you", "open"), dated, q("desk", "open")]);
 check(dt2.you === 1 && dt2.desk === 1, "a dated question is not counted: " + dt2.you + "/" + dt2.desk);
 check(C.deskTabs([{ question: { section: "you", state: "open", later: "soon" } }, q("desk", "open")]).you === 1, "a malformed later day is due");
+// a desk row dated or snoozed to a later day waits on nobody today (not in you) but the desk still owes it: it is THE desk-owes
+// number's row, as flow's footer lists it under DESK OWES (a dated row of his own is not)
+const deskLater = { question: { section: "desk", state: "open", carried: false, later: "2099-01-01" } };
+const dt3 = C.deskTabs([q("you", "open"), deskLater, deskLater, q("desk", "open"), q("desk", "open", true), dated]);
+check(dt3.desk === 4 && dt3.you === 2, "a dated desk row is owed by the desk today: " + dt3.you + "/" + dt3.desk);
+check(JSON.stringify(dt3.tags) === JSON.stringify(["you", "desk", "desk", "desk", "both", "you"]), "a dated desk row keeps its desk tag: " + dt3.tags);
+check(C.deskTabs([deskLater]).show === true && C.deskTabs([deskLater]).desk === 1, "a band of dated desk rows alone still shows the tab, counted");
+check(C.deskTabs([{ question: { section: "desk", state: "answered", later: "2099-01-01" } }]).desk === 0, "an answered desk row is not owed");
 console.log(failures === 0 ? "ALL PASS" : failures + " FAILED");
 process.exit(failures === 0 ? 0 : 1);
