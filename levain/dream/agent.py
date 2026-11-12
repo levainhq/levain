@@ -1218,6 +1218,17 @@ def run_body(sup: Any, occurrence_id: str, launch_epoch: int, *, store_path: Pat
     return RunReport(0 if end.state == "done" else 1, outcome=outcome, state=end.state, card=card)
 
 
+def _reinserted_sentence(occ: Path) -> str:
+    """One plain sentence for a consolidated card when the save put back durable lines the compose left out (the
+    snapshot manifest's ``reinserted``, recorded only after the post record proved them anneal's); else ""."""
+    lines = (_snap.read_manifest(occ) or {}).get("reinserted") or []
+    if not isinstance(lines, list) or not lines:
+        return ""
+    n = len(lines)
+    shown = "; ".join(" / ".join(str(x).split("\n")) for x in lines)
+    return f"The save put back {n} line{'s' if n != 1 else ''} the compose left out: {shown}"
+
+
 def _file_run_card(outcome: str, result: Mapping[str, Any], occurrence_id: str, occ: Path, store_path: Path | str,
                    review_store: Any, day: str | None, manual: bool, slot: str | None, feed: str,
                    saved_card: Callable[[], _card.Card] | None = None) -> str:
@@ -1227,7 +1238,8 @@ def _file_run_card(outcome: str, result: Mapping[str, Any], occurrence_id: str, 
             _, new = _card.file_card(review_store, saved_card(), feed=feed)
             return "filed" if new else "duplicate"
         spec: dict[str, Any] = {"kind": "consolidated" if outcome == "saved" else "failed", "occurrence": occurrence_id,
-                                "reason": "" if outcome == "saved" else f"{outcome}: {result.get('detail') or ''}".strip()}
+                                "reason": _reinserted_sentence(occ) if outcome == "saved" else
+                                f"{outcome}: {result.get('detail') or ''}".strip()}
         c = _card.from_spec(spec, occ_dir=occ, db_path=store_path if outcome == "saved" else None, day=day,
                             manual=manual, slot=slot, store_dir=Path(store_path).parent)
         _, new = _card.file_card(review_store, c, feed=feed)
