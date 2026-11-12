@@ -132,6 +132,11 @@ def test_a_launched_slot_is_not_launched_or_spawned_again_by_the_next_tick(tmp_p
     rig = _live_rig(tmp_path)
     spawn, slot = Spawns(), _boundary(rig)
     _claim_the_slot(rig, spawn, slot)
+    # 1111-38 fix round: the seam starts no fire, and a row no fire claims is now spawned again past SESSION_GRACE_S
+    # (tests/test_agents_dq_fix.py); here its fire claims it, as a real one does within seconds
+    (row,) = _rows(rig)
+    with rig.store.write() as c:
+        assert ctl.claim_fire(c, row["occurrence_id"], 4242, slot + MIN) is not None
     _tick_run(rig, slot + 2 * MIN, spawn)
     _tick_run(rig, slot + 3 * MIN, spawn)
     assert len(spawn.calls) == 1 and len(_rows(rig)) == 1
