@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -557,13 +558,47 @@ def _open_same_class(review_store: Any, feed: str, agent_id: str, cls: str) -> b
     return False
 
 
+def window_remedy(cls: str, store_path: Path | str | None = None) -> str:
+    """The next step a did-not-consolidate card names for class ``cls``, every command in it one that exists and runs as
+    printed. There is NO verb that starts a dream by hand (``levain agents`` has no run-now, and ``levain dream run``
+    is for a store COPY), so no class names one: the dream tries again in its next window by itself.
+
+    ``store_path`` is the install's ``memory.db``; the anneal commands need it (``--db``: without it anneal reads
+    ``~/.anneal-memory``, another store), so the text carries it when known and a plain placeholder when not. An open
+    wrap keeps the dream from starting, whoever opened it, and nothing on the scheduled path clears it (the executor
+    clears a stale one only after a run has been admitted, and an open wrap is a refusal at admission), so a dead
+    seat's wrap is a person's to clear, with anneal's own two commands."""
+    from levain.manifest import anneal_invocation
+
+    again = "the dream tries again in its next window"
+    anneal = anneal_invocation()
+    db = shlex.quote(str(store_path)) if store_path is not None else "<the store's memory.db>"
+    if cls == "wrap-open":
+        return (f"A wrap is open on the store, so the dream does not start, and nothing in the dream clears one. If a "
+                f"live seat opened it, leave it: it ends when that seat saves or cancels. If that seat is dead, look at "
+                f"it with `{anneal} --db {db} wrap-status` and, once you have confirmed it is dead, clear it with "
+                f"`{anneal} --db {db} wrap-cancel --wrap-token <token>` (the token is the one wrap-status prints); "
+                f"{again}.")
+    if cls == "baton":
+        return (f"The consolidate baton is not held by this install's session ({_ready.SESSION_ID!r}), so the dream "
+                f"does not start. See who holds it with `{anneal} --db {db} baton status`; {again} once this "
+                "install's session holds it.")
+    if cls == "failed":
+        return ("`levain agents show dream` names the run that failed and why; the agent pauses after "
+                f"{PAUSE_AFTER} failed runs in a row (`levain agents resume dream` lifts a pause once the cause is "
+                f"fixed); {again}.")
+    return f"nothing needs doing by hand; {again}."
+
+
 def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Sequence[Mapping[str, Any]],
                  review_store: Any, occ_dir: Path | str | None = None, miss_streak: int = 0,
                  missed_windows: Sequence[str] = (),
                  attention: Callable[[str, str], None] | None = None, feed: str = CARD_FEED,
-                 remedy: str = f"levain agents run-now {NAME}") -> CloseResult:
+                 remedy: str | None = None, store_path: Path | str | None = None) -> CloseResult:
     """The first pass after window ``day`` closes. Files at most one did-not-consolidate card for the window, never one
     per slot. ``rows`` are the agent's occurrence rows (any window; this selects its scheduled rows of ``day``).
+    ``remedy`` is the card's next step; omitted, :func:`window_remedy` writes it for the night's class, carrying
+    ``store_path`` (the install's ``memory.db``) so the commands it prints run as printed.
 
     * The window is closed only from the next dream-day's start (05:00 local); before that, or while any row of the
       window is ``admitted`` or ``launched``, nothing is decided (the in-flight gate).
@@ -612,7 +647,8 @@ def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Se
             out.action = "standing"
             return out
         c = _card.build_card("did-not-consolidate", occurrence=f"window {key}", agent_id=agent_id, day=day.isoformat(),
-                             reason=f"{cls}: night did not consolidate: {detail}", remedy=remedy,
+                             reason=f"{cls}: night did not consolidate: {detail}",
+                             remedy=remedy or window_remedy(cls, store_path),
                              out_dir=occ_dir if occ_dir is not None and Path(occ_dir).is_dir() else None)
         _, new = _card.file_card(review_store, c, feed=feed)
     except Exception as exc:  # noqa: BLE001 - nothing filed is reported, never swallowed
