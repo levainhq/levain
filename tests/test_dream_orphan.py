@@ -609,6 +609,26 @@ def test_a_stored_floor_under_twelve_reads_as_unset_with_a_problem_naming_twelve
     assert da.orphan_floor_s(ent.agent_dir) is None
 
 
+def test_the_dream_refuses_to_read_an_install_that_stores_a_floor_under_twelve(ent, tmp_path):
+    """The admission check reads a stored sub-minimum floor as unset, but start, tick and fire all go through
+    read_install, which refuses it whole and names the way out: the CHANGELOG's claim, pinned."""
+    facts(ent, tmp_path)
+    path = ent.agent_dir / da.INSTALL_FILE
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps({**doc, "orphan_floor_hours": 3}), encoding="utf-8")
+    with pytest.raises(da.InstallRefused) as refused:
+        da.read_install(ent.agent_dir)
+    assert "12 hours" in str(refused.value) and "levain dream enable" in str(refused.value), str(refused.value)
+
+
+def test_the_minimum_floor_is_the_larger_of_twelve_hours_and_the_executors_horizon(monkeypatch):
+    monkeypatch.setattr(rd, "executor_orphan_horizon_s", lambda: 13 * 3600.0)
+    assert da.orphan_floor_minimum_hours() == 13.0
+    with pytest.raises(da.InstallRefused):
+        da.validate_orphan_floor_hours(12)
+    assert da.validate_orphan_floor_hours(13) == 13
+
+
 def test_every_operator_surface_that_quotes_the_floor_quotes_the_constant(ent, tmp_path, capsys):
     from levain.dream.cli import add_parsers
 
