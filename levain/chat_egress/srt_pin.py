@@ -64,6 +64,8 @@ def _as_problem(fn):
 
 
 def default_prefix() -> Path:
+    from levain.home_guard import refuse_real_home_fallback
+    refuse_real_home_fallback("the chat network's install prefix")
     home = os.environ.get("LEVAIN_HOME")
     return ((Path(home).expanduser() if home else Path.home() / ".levain") / "chat-node").resolve()
 

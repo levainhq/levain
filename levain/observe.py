@@ -141,6 +141,8 @@ OBSERVE_DIR = "observe"  # named in firing.confinement.LEVAIN_HOME_STATE_DIRS (a
 
 
 def home_dir() -> Path:
+    from levain.home_guard import refuse_real_home_fallback
+    refuse_real_home_fallback("the observe counters' home")
     h = os.environ.get("LEVAIN_HOME")
     return Path(h).expanduser() if h else Path.home() / ".levain"
 
