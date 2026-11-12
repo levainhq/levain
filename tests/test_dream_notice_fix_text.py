@@ -1,14 +1,14 @@
-"""D1-N fix round, finding 3: the words the ``failed`` card prints say what is true today."""
+"""D1-N fix round, finding 3: the words the ``failed`` card prints say what is true today (D1-P: the pause is real)."""
 from __future__ import annotations
 
 from levain.dream import agent as da
 
 
-def test_the_failed_card_does_not_promise_a_pause_nothing_writes():
-    """Nothing under levain/ increments ``failure_streak`` (the writer is a board row), so no agent is paused after
-    failed runs; the card must not say one is."""
+def test_the_failed_card_says_what_two_failed_runs_in_a_row_do():
+    """D1-P (1112-1) gave ``failure_streak`` its writer: two failed runs in a row pause the dream, so the card's words
+    are true at one failure (it tries again) and at two (it is paused until resumed)."""
     text = da.window_remedy("failed", "/tmp/some/store/memory.db")
-    assert "pauses" not in text and "in a row" not in text and "resume" not in text, text
+    assert "Two failed runs in a row pause the dream" in text and "levain agents resume dream" in text
     assert "levain agents show dream" in text and "next window" in text
 
 
