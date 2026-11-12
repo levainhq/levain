@@ -168,3 +168,104 @@ def test_the_build_group_carries_the_common_backends_beside_setuptools():
 
 def test_drift_says_a_red_with_no_changed_package_is_likely_flaky():
     assert "red with no version change: likely flaky test, not drift" in DRIFT
+
+
+# --- the lock agrees with pyproject.toml (offline twin of the stage-0 `uv lock --check`) --------------------------------
+
+def _requirement_keys(requirements, extra=None):
+    from packaging.requirements import Requirement
+    from packaging.specifiers import SpecifierSet
+
+    keys = set()
+    for text in requirements:
+        req = Requirement(text)
+        found = re.search(r"""extra == ['"]([^'"]+)['"]""", str(req.marker or ""))
+        keys.add((req.name.lower().replace("_", "-"), (found[1] if found else None) or extra, SpecifierSet(str(req.specifier))))
+    return keys
+
+
+def _lock_levain_entry():
+    return next(p for p in tomllib.loads((ROOT / "uv.lock").read_text())["package"] if p["name"] == "levain")
+
+
+def test_the_lock_records_the_dependencies_pyproject_declares_now():
+    """A dependency floor moved in pyproject.toml without regenerating uv.lock leaves every locked install on the old
+    pin while the stage-0 job fails the push; this catches it on the laptop, with no network, before the push."""
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    declared = _requirement_keys(pyproject["project"]["dependencies"])
+    for extra, reqs in pyproject["project"]["optional-dependencies"].items():
+        declared |= _requirement_keys(reqs, extra)
+    locked = _requirement_keys(
+        (f"{d['name']}{d.get('specifier', '')}" + (f"; {d['marker']}" if d.get("marker") else ""))
+        for d in _lock_levain_entry()["metadata"]["requires-dist"]
+    )
+    assert declared == locked, f"only in pyproject: {sorted(declared - locked, key=str)}; only in uv.lock: {sorted(locked - declared, key=str)}"
+
+
+def test_the_lock_records_the_build_group_pyproject_declares_now():
+    declared = _requirement_keys(tomllib.loads((ROOT / "pyproject.toml").read_text())["dependency-groups"]["build"])
+    locked = _requirement_keys(
+        f"{d['name']}{d.get('specifier', '')}" for d in _lock_levain_entry()["metadata"]["requires-dev"]["build"]
+    )
+    assert declared == locked
+
+
+# --- the drift workflow's issue step, run for real against a stub `gh` ---------------------------------------------------
+
+def _drift_issue_step():
+    import yaml
+
+    steps = yaml.safe_load(DRIFT)["jobs"]["drift"]["steps"]
+    return next(s["run"] for s in steps if s.get("name", "").startswith("File, update or close"))
+
+
+def _run_issue_step(tmp_path, drift_code, log_text, open_issue=""):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    calls = tmp_path / "gh.log"
+    (bindir / "gh").write_text(
+        '#!/bin/sh\n'
+        'echo "gh $*" >> "$GH_LOG"\n'
+        'if [ "$1 $2" = "issue list" ]; then echo "$GH_OPEN"; fi\n'
+        'while [ $# -gt 0 ]; do if [ "$1" = "--body-file" ]; then cp "$2" "$GH_BODY"; fi; shift; done\n'
+    )
+    (bindir / "gh").chmod(0o755)
+    (tmp_path / "drift.log").write_text(log_text)
+    env = {
+        "PATH": f"{bindir}:{os.path.dirname(sys.executable)}:/usr/bin:/bin", "HOME": str(tmp_path),
+        "RUNNER_TEMP": str(tmp_path), "GH_LOG": str(calls), "GH_BODY": str(tmp_path / "body.copy"), "GH_OPEN": open_issue,
+        "GH_TOKEN": "x", "DRIFT_CODE": drift_code, "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "levainhq/levain", "GITHUB_RUN_ID": "1",
+    }
+    proc = subprocess.run([BASH, "-c", _drift_issue_step()], env=env, capture_output=True, text=True, timeout=60)
+    body = (tmp_path / "body.copy")
+    return proc, (calls.read_text().splitlines() if calls.exists() else []), (body.read_text() if body.exists() else "")
+
+
+RED_LINE = 'DEP_DRIFT {"result": "red", "stage": "suite", "changed": ["pyyaml 6.0.1 -> 6.0.3"], "failed_tests": ["tests/test_x.py::test_y"]}'
+
+
+@pytest.mark.skipif(not os.path.exists(BASH), reason="needs /bin/bash")
+def test_a_red_night_files_one_issue_naming_the_changed_package_and_the_failing_test(tmp_path):
+    proc, calls, body = _run_issue_step(tmp_path, "1", "noise\n" + RED_LINE + "\n")
+    assert proc.returncode == 0, proc.stderr
+    assert any(c.startswith("gh issue create --title dependency drift red --label dep-drift") for c in calls), calls
+    assert "- pyyaml 6.0.1 -> 6.0.3" in body and "- tests/test_x.py::test_y" in body
+
+
+@pytest.mark.skipif(not os.path.exists(BASH), reason="needs /bin/bash")
+def test_a_second_red_night_comments_on_the_open_issue_instead_of_filing_another(tmp_path):
+    proc, calls, _ = _run_issue_step(tmp_path, "1", RED_LINE + "\n", open_issue="7")
+    assert proc.returncode == 0, proc.stderr
+    assert any(c.startswith("gh issue comment 7") for c in calls) and not any("issue create" in c for c in calls)
+
+
+@pytest.mark.skipif(not os.path.exists(BASH), reason="needs /bin/bash")
+def test_the_first_green_night_closes_the_open_issue_and_a_green_night_with_none_does_nothing(tmp_path):
+    proc, calls, _ = _run_issue_step(tmp_path, "0", "", open_issue="7")
+    assert proc.returncode == 0, proc.stderr
+    assert any(c.startswith("gh issue close 7") for c in calls)
+    other = tmp_path / "second"
+    other.mkdir()
+    proc, calls, _ = _run_issue_step(other, "0", "")
+    assert proc.returncode == 0 and not any("issue close" in c or "issue create" in c for c in calls)

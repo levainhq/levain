@@ -27,6 +27,11 @@ itself editable; it needs `python` with `pip`, and installs `uv` and `pip` at pi
 scripts/ci_install_locked.sh dev openhands
 ```
 
+Changing a dependency in `pyproject.toml` means regenerating the lock in the same commit: run `uv lock` with the `uv`
+version the script pins, and `uv lock --check` (which CI runs first) confirms the two agree. A nightly job, `dep-drift`,
+re-resolves every package to its newest allowed release in a scratch copy, runs the suite on that, and keeps one open
+`dep-drift` issue while it is red; `python scripts/dep_drift.py` runs the same check on your machine.
+
 Some tests need something your machine may not have and skip themselves where it is absent: macOS's `sandbox-exec`, a
 live Ollama, the Linux image, a real Chrome (the `needs_browser` tests), Node with `srt` and `uv` (the chat egress
 tests). CI runs several of these in their own jobs, and one more job runs root-run code on Python 3.9; plain `pytest`
