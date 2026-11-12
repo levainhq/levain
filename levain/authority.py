@@ -4,7 +4,10 @@ Who may sign what, and the standing policy, are not stored anywhere: they are wh
 ``authority_log`` says. Each link is canonical JSON, hash-chained to its predecessor and signed (SSHSIG,
 namespace :data:`NAMESPACE`) by a key the replay has enrolled. Every link is judged against the state at
 its predecessor: its chain position, its signature, its signer's class and every op rule. A key revoked at
-seq N signs nothing after N, and the links it signed before N stay valid (no retroactive voiding).
+seq N signs nothing after N, and the links it signed before N stay valid in the replay: the log
+replays the same and the policy they built is still the policy (no retroactive voiding of the log). What a standing
+grant may DO is judged at each use: a grant whose born or current link was signed by a key revoked since answers
+nothing (:func:`grant_stop_reason`; USE paths read :func:`grants_in_force`, never ``policy.grants``).
 
 A policy link is classified by RECOMPUTE: the declared op is applied to the replayed policy and the
 difference is classified on its own (:func:`classify`). A declared op that disagrees with the computed
@@ -1280,6 +1283,60 @@ def graduation_links(state: AuthoritySnapshot, grant_id: str) -> tuple[str, str]
             or not (1 <= born <= state.seq and 1 <= current <= state.seq):
         return None
     return signers[born - 1], signers[current - 1]
+
+
+# What a stopped grant says about itself. Born wins when both signers are revoked: it is the cause that cannot be
+# repaired by a renew.
+STOPPED_BORN = "the key that signed it was revoked"
+STOPPED_CURRENT = "the key that last renewed it was revoked"
+
+
+def grant_signers(state: AuthoritySnapshot, grant_id: str) -> tuple[str, str] | None:
+    """``(born_signer_fp, current_signer_fp)`` of ANY standing grant ``grant_id`` in ``state``: the signer of the link
+    that brought it into the policy (``grant_born``) and of the link that last created or changed it (``grant_seqs``,
+    which a renew moves; a restatement that leaves the grant unchanged does not). Kind-blind. None when the policy holds
+    no such grant, or ``state`` does not carry one signer per link (``link_signers``, by seq)."""
+    if state.policy.grants.get(grant_id) is None:
+        return None
+    born, current = state.grant_born.get(grant_id), state.grant_seqs.get(grant_id)
+    signers = state.link_signers
+    if born is None or current is None or len(signers) != state.seq \
+            or not (1 <= born <= state.seq and 1 <= current <= state.seq):
+        return None
+    return signers[born - 1], signers[current - 1]
+
+
+def grant_stop_reason(state: AuthoritySnapshot, grant_id: str) -> str | None:
+    """Why standing grant ``grant_id`` may answer nothing, or None while it may: the key that signed its born link and
+    the key that signed its current link must both be active (:func:`grant_signers`). Judged from ``state`` alone at
+    the moment of use, never stored: the replay is untouched and the policy still holds the grant, so it can be
+    revoked, listed or replaced. Kind-blind and class-blind (it reads ``.active`` and nothing else of a key). Fails
+    closed: a grant in the policy whose signers ``state`` cannot name is stopped, as is a signer ``state`` has no key
+    for. None for an id the policy does not hold."""
+    if state.policy.grants.get(grant_id) is None:
+        return None
+    signers = grant_signers(state, grant_id)
+    if signers is None:
+        return STOPPED_BORN
+    for fp, why in zip(signers, (STOPPED_BORN, STOPPED_CURRENT)):
+        key = state.keys.get(fp)
+        if key is None or not key.active:
+            return why
+    return None
+
+
+def grants_in_force(state: AuthoritySnapshot) -> Mapping[str, Any]:
+    """``state.policy.grants`` without every grant :func:`grant_stop_reason` stops: what a USE path reads. Recomputed on
+    each call (a caller holds a fresh replay), read-only. A write path, an append rule and the replay read
+    ``policy.grants`` itself, because a stopped grant is still in the policy."""
+    return MappingProxyType({gid: grant for gid, grant in state.policy.grants.items()
+                             if grant_stop_reason(state, gid) is None})
+
+
+def grants_stopped_by(state: AuthoritySnapshot, fingerprint: str) -> list[str]:
+    """The ids of the standing grants whose born or current link ``fingerprint`` signed, sorted: what revoking that key
+    stops (for the revoke verb to name)."""
+    return sorted(gid for gid in state.policy.grants if fingerprint in (grant_signers(state, gid) or ()))
 
 
 def _egress_key_append_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
@@ -2989,6 +3046,12 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     grant = state.policy.grants.get(rec["grant_id"])
     if grant is None:
         raise AuthorityError(f"no grant {rec['grant_id']!r}")
+    # one place for every renew writer: a renew by a key still held would otherwise move the current link back to an
+    # active signer and bring a stopped grant back
+    stopped = grant_stop_reason(state, rec["grant_id"])
+    if stopped is not None:
+        raise AuthorityError(f"grant {str(rec['grant_id'])[:80]} stopped when {stopped}; a renew does not bring it "
+                             "back: create it again with a key you hold")
     kind = _renewable_kind(grant, rec["grant_id"])
     after = (f"; grant {str(rec['grant_id'])[:80]!r} was signed before this rule: revoke it "
              "(levain consent grant revoke) and create a new one")
