@@ -161,6 +161,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_check_baton(install))
     core.extend(_check_host_awake())
     core.extend(_check_cockpit_authority(install))
+    core.extend(_guarded("standing grants", lambda: _check_standing_grants(install)))
     core.extend(_check_authority_signers(install))
     core.extend(_check_cockpit_key_files(install))
     core.extend(_guarded("terminal key", _check_terminal_key))
@@ -2011,7 +2012,10 @@ def _api_key_links(install: Path) -> list[tuple[str, int, Any]]:
         raise RuntimeError(str(got.authority_error))
     out = []
     for gid, g in sorted(state.policy.grants.items()):
-        if _auth.agent_link(g) and _auth.agent_link_terms(g)[0] == "api_key" and _auth.agent_link_arms(state, gid, now=now):
+        # a link whose signing key was revoked is stopped (grant_stop_reason) and arms nothing, so no budget row is
+        # listed for it
+        if _auth.agent_link(g) and _auth.agent_link_terms(g)[0] == "api_key" \
+                and _auth.grant_stop_reason(state, gid) is None and _auth.agent_link_arms(state, gid, now=now):
             out.append((gid, g["budget_run_usd_micros"], None))
     return out
 
@@ -3809,6 +3813,52 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
                                    warn=True)]
     return rows + [CheckResult(name, True,
                                f"{len(laptops)} {LAPTOP} keys enrolled (head at seq {auth.authority.seq})")]
+
+
+def _check_standing_grants(install: Path) -> list[CheckResult]:
+    """One WARN row, ``standing grants``, when the cockpit's authority log holds a standing grant a revoked key signed:
+    it is still in the policy (listed, revocable) but answers nothing from its next use on
+    (:func:`levain.authority.grant_stop_reason`). No row when none is stopped, no journal, no log, or a log that cannot
+    be read (the ``cockpit authority`` row says that). Read-only, as :func:`_check_cockpit_authority` reads: the
+    journal opens read-only and the stop is judged from the verified replay, never stored."""
+    from datetime import datetime, timezone
+
+    from levain import authority as _auth
+    from levain.authority import anchor_path
+    from levain.cockpit.authority import RequestAuthority
+    from levain.cockpit.display_safe import visible
+    from levain.cockpit.firejournal import DB_NAME
+
+    root = install / ".levain" / "cockpit"
+    journal = root / DB_NAME
+    if not journal.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{journal}?mode=ro", uri=True, timeout=2, isolation_level=None)
+        try:
+            conn.execute("BEGIN")
+            got = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=anchor_path(root),
+                                           source=str(journal))
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    state = got.authority
+    if state is None or got.authority_error is not None:
+        return []
+    stopped = {gid: why for gid in sorted(state.policy.grants)
+               if (why := _auth.grant_stop_reason(state, gid)) is not None}
+    if not stopped:
+        return []
+    n = len(stopped)
+    it, they = ("it", "it answers") if n == 1 else ("them", "they answer")
+    cause = (f"the key that signed {it} was revoked" if all(why == _auth.STOPPED_BORN for why in stopped.values())
+             else f"a key that signed or last renewed {it} was revoked")
+    shown = ", ".join(str(visible(gid)) for gid in list(stopped)[:5]) + (f" and {n - 5} more" if n > 5 else "")
+    return [CheckResult("standing grants", True,
+                        f"{n} standing grant{'' if n == 1 else 's'} stopped because {cause}; {they} nothing ({shown})",
+                        f"Create {it} again with a key you hold, or revoke {it} to clear the list.", warn=True)]
 
 
 def _check_cockpit_key_files(install: Path, *, key_dirs: list[Path] | None = None) -> list[CheckResult]:

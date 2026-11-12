@@ -7948,10 +7948,15 @@
     }
     row.appendChild(head);
     const facts = el("div", "consent-facts");
+    // a grant whose signing key was revoked is still in the policy, so it is listed (and can be revoked), but it answers
+    // nothing: the facts say why and how to get one that does. It has no "until <date>": the date no longer means anything
+    const stopped = state === "stopped";
+    if (stopped) facts.appendChild(el("span", "ext-meta grant-stopped", "Stopped" + (sv(g.stopped_why) ? ": " + g.stopped_why : "")
+                                      + ". It answers nothing. " + (voiceKey ? "Set it again" : "Create it again") + " to use it."));
     if (sv(g.workspace)) facts.appendChild(el("span", "ext-meta", "in " + g.workspace));
     if (Array.isArray(g.postures) && g.postures.length) facts.appendChild(el("span", "ext-meta", g.postures.join(", ") + " mode"));
     // a voice key has no date: it is live until revoked, and any other state is drawn as its bare word (the head says it too)
-    const untilText = voiceKey ? (state === "live" ? "Live until you revoke it" : state)
+    const untilText = stopped ? "" : voiceKey ? (state === "live" ? "Live until you revoke it" : state)
                                : (state === "expired" ? "expired " : "until ") + sv(g.expires_at);
     if (untilText) facts.appendChild(el("span", "ext-meta", untilText));
     facts.appendChild(el("span", "ext-meta", sv(g.kind) + " " + sv(g.id_shown)));

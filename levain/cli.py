@@ -2616,7 +2616,24 @@ def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
           + (f" (compromised since seq {row.compromised_since})" if row.compromised_since else ""))
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
+    _print_stopped_by_revoke(args, row.fingerprint)
     return 0
+
+
+def _print_stopped_by_revoke(args: argparse.Namespace, fingerprint: str) -> None:
+    """After a key revoke: the standing grants that key signed, which now answer nothing. A second, fresh read of the
+    log (the revoke is done and `revoke` returns no list); words only, so a read that fails is said and never changes
+    the revoke's exit code, and one that races a later link can only make the list stale."""
+    from levain.consent.grants import stopped_by_key, stopped_notice
+
+    try:
+        lines = stopped_notice(stopped_by_key(_cockpit_root(args), fingerprint, now=_utc_now()))
+    except _cockpit_refusals() as exc:
+        print(f"note: the standing grants this key signed could not be listed ({exc}); `levain consent grant list` "
+              "shows which are stopped", file=sys.stderr)
+        return
+    for line in lines:
+        print(line)
 
 
 def _cmd_cockpit_anchor_reset(args: argparse.Namespace) -> int:
@@ -3590,6 +3607,7 @@ def _cmd_chat_setup(args: argparse.Namespace) -> int:
 def _cmd_chat_key_list(args: argparse.Namespace) -> int:
     from levain.chat_egress.key_setup import _REFUSALS, list_keys
     from levain.cockpit.display_safe import visible
+    from levain.consent.grants import stopped_line
 
     try:
         rows = list_keys(_cockpit_root(args), now=_utc_now())
@@ -3602,7 +3620,8 @@ def _cmd_chat_key_list(args: argparse.Namespace) -> int:
         print(f"{visible(r['id'])}  {r['state']}  entity {visible(r['entity'])}  host {visible(r['host'])}  "
               f"source {visible(r['source'])}  account {visible(str(r.get('account', '-')))}  "
               f"{r['placement']['scheme']}  repos "
-              f"{', '.join(visible(x) for x in r['repos']) or '-'}  until {visible(r['expires_at'])}")
+              f"{', '.join(visible(x) for x in r['repos']) or '-'}  "
+              + (stopped_line(r["stopped_why"]) if r["state"] == "stopped" else f"until {visible(r['expires_at'])}"))
     return 0
 
 
@@ -3703,7 +3722,7 @@ def _cmd_consent_grant_revoke(args: argparse.Namespace) -> int:
 
 def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     from levain.cockpit.consent import utc_stamp
-    from levain.consent.grants import grant_listing
+    from levain.consent.grants import grant_listing, stopped_line
 
     try:
         now = _utc_now()
@@ -3715,7 +3734,8 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
         print("no consent grants")
     stamp = utc_stamp(now)
     for g in grants:
-        state = "expired" if g.expires_at <= stamp else f"until {g.expires_at}"
+        state = (stopped_line(g.stopped_why) if g.stopped_why else
+                 "expired" if g.expires_at <= stamp else f"until {g.expires_at}")
         refused = [t for t in g.tools if g.tool_problem(t) is not None]
         if refused:
             state += f" (answers nothing for {','.join(map(str, refused))}: a tool a grant may not name)"
@@ -3724,8 +3744,8 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
               f"(seq {g.seq})")
         if g.mcp_fields:
             print(f"  declared fields ({g.kind}): {_grant_fields_text(g.mcp_fields)}")
-    for gid, kind, expires_at, seq in inert:
-        state = "expired" if expires_at <= stamp else f"until {expires_at}"
+    for gid, kind, expires_at, seq, why in inert:
+        state = stopped_line(why) if why else "expired" if expires_at <= stamp else f"until {expires_at}"
         print(f"{gid!r}  kind {kind}  {state}  (seq {seq}): a grant kind this levain does not know, held inert: it "
               "answers nothing here (upgrade levain to use it; `levain consent grant revoke` removes it)")
     return 0
@@ -3874,11 +3894,20 @@ def _cmd_seat(args: argparse.Namespace) -> int:
             print(res)
             return 0
         if args.seat_lease_cmd == "list":
+            from levain.consent.grants import stopped_line
+
             state = seat_lease._replay(root)
-            lease = None if state is None else seat_lease.live_lease(state, _utc_now())
-            print("no live seat-root lease" if lease is None else
-                  f"{lease['id']}  lanes {lease['lanes_parent']}  returns {lease['returns_parent']}  "
-                  f"until {lease['expires_at']}")
+            now = _utc_now()
+            lease = None if state is None else seat_lease.live_lease(state, now)
+            stopped = None if state is None or lease is not None else seat_lease.stopped_lease(state, now)
+            if stopped is not None:     # the policy holds it, a launch reads it as no lease: say which and why
+                held = state.policy.grants[stopped[0]]
+                print(f"{stopped[0]}  lanes {held['lanes_parent']}  returns {held['returns_parent']}  "
+                      f"{stopped_line(stopped[1])}")
+            else:
+                print("no live seat-root lease" if lease is None else
+                      f"{lease['id']}  lanes {lease['lanes_parent']}  returns {lease['returns_parent']}  "
+                      f"until {lease['expires_at']}")
             return 0
         signer_fp, sign = ssh_signer(args.signing_key)
         if args.seat_lease_cmd == "create":
@@ -3977,11 +4006,20 @@ def _cmd_seat_egress(args: argparse.Namespace, root: Path) -> int:
     from levain.cockpit.keys import ssh_signer
 
     if args.seat_egress_cmd == "list":
+        from levain.consent.grants import stopped_line
+
         state = seat_lease._replay(root)
-        grant = None if state is None else seat_push.live_egress(state, _utc_now())
-        print("no live seat-egress grant" if grant is None else
-              f"{grant['id']}  lanes {grant['lanes_parent']}  remote {grant['push_remote']}  "
-              f"domains {','.join(grant['allowed_domains']) or '-'}  until {grant['expires_at']}")
+        now = _utc_now()
+        grant = None if state is None else seat_push.live_egress(state, now)
+        stopped = None if state is None or grant is not None else seat_push.stopped_egress(state, now)
+        if stopped is not None:         # the policy holds it, a push reads it as no grant: say which and why
+            held = state.policy.grants[stopped[0]]
+            print(f"{stopped[0]}  lanes {held['lanes_parent']}  remote {held['push_remote']}  "
+                  f"domains {','.join(held['allowed_domains']) or '-'}  {stopped_line(stopped[1])}")
+        else:
+            print("no live seat-egress grant" if grant is None else
+                  f"{grant['id']}  lanes {grant['lanes_parent']}  remote {grant['push_remote']}  "
+                  f"domains {','.join(grant['allowed_domains']) or '-'}  until {grant['expires_at']}")
         return 0
     signer_fp, sign = ssh_signer(args.signing_key)
     if args.seat_egress_cmd == "create":
