@@ -24,6 +24,10 @@ scheduled run writes: the occurrence row (kind ``manual``, its window key ``m:<l
 reservation, the run in the journal, the fire's identity record, ``result.json`` / ``usage.json`` / ``progress.json``
 in the occurrence directory, the snapshot, and the card on the desk.
 
+A hand start that claims a row and does not launch it ends that row (``stopped``, reason ``hand_start_*``): an
+``admitted`` row blocks every scheduled slot behind it, and nothing launches a manual row on a tick. A launch that did
+happen is never ended here.
+
 Nothing here reads or writes the anneal store; the fire does, as it does at night.
 """
 from __future__ import annotations
@@ -41,8 +45,8 @@ _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 @dataclass(frozen=True)
 class Started:
     """``code`` 0 only when the occurrence launched and its fire was spawned. ``outcome`` is ``launched``, ``refused``
-    (nothing was claimed or written) or the controller's own outcome for a launch that did not happen. ``text`` is what
-    the operator is told."""
+    (nothing was claimed or written), ``error`` (the start broke between its claim and its launch's answer) or the
+    controller's own outcome for a launch that did not happen. ``text`` is what the operator is told."""
     code: int
     outcome: str
     text: str
@@ -95,6 +99,68 @@ def _why_no_input(inst: Any, store: Any, oid: str, now: datetime) -> str:
         return "the verdict could not be read again"
     v = da.day_ready(inst.store_path, row, now=now, zone=inst.zone, agent_dir=store.directory, coord_dir=inst.coord_dir)
     return f"{v.state}/{v.kind}: {v.reason} (read again just now, after the row ended)"
+
+
+REASON_UNCLASSIFIED = "hand_start_unclassified"   # the input check could not answer (or the authority could not be read)
+REASON_NO_SLOT = "hand_start_no_slot"              # every execution slot was held
+REASON_INTERRUPTED = "hand_start_interrupted"      # the start broke or was interrupted between its claim and its launch
+_ROW_COLS = ("agent_id", "kind", "key", "state", "epoch", "window_key", "spec_hash", "binding_id", "admitted_at")
+
+
+def _row_of(store: Any, oid: str) -> dict[str, Any] | None:
+    with store.read() as conn:
+        row = conn.execute("SELECT " + ", ".join(_ROW_COLS) + " FROM agent_occurrences WHERE occurrence_id = ?",
+                           (oid,)).fetchone()
+    return None if row is None else dict(zip(_ROW_COLS, row), occurrence_id=oid)
+
+
+def _end_unlaunched(store: Any, oid: str, reason: str, clock: Callable[[], datetime]) -> str:
+    """End the ``admitted`` row this verb claimed (or resumed) when it did not launch, and return the row's state read
+    afterwards: ``stopped`` when this ended it, the row's own state when it was no longer admitted (a launch that DID
+    happen is never ended: the write is guarded by ``state = 'admitted'`` and the epoch just read), ``admitted`` when
+    the end itself could not be written, ``unknown`` when the row cannot be read. It never raises.
+
+    The end is the controller's own for an admitted row that ends without launching
+    (:func:`levain.agents.controller._end_after_input`, the one write the input check's ends use), with the state
+    ``stopped`` (the state a launch-time refusal of an admitted row uses) and a reason that says what happened. Not
+    ``missed``: that state also feeds the miss streak, whose attention row reads "the laptop slept through them", which
+    a failed hand start is not."""
+    from levain.agents import controller as ctl
+
+    state = "unknown"
+    try:
+        for _ in range(2):                    # a second look when the epoch moved under the first
+            occ = _row_of(store, oid)
+            if occ is None:
+                return "unknown"
+            state = occ["state"]
+            if state != "admitted":
+                return state
+            ctl._end_after_input(store, occ, ctl.STOPPED, reason, clock())
+        occ = _row_of(store, oid)
+        return "unknown" if occ is None else occ["state"]
+    except Exception:  # noqa: BLE001 - this runs on the way out of a failure; the row's state is reported as it stands
+        try:
+            occ = _row_of(store, oid)
+            return state if occ is None else occ["state"]
+        except Exception:  # noqa: BLE001
+            return state
+
+
+def _after_end(oid: str, left: str, reason: str, why: str) -> str:
+    """What the operator is told about a hand start that did not launch, by what became of its row."""
+    if left == "stopped":
+        return (f"{oid} did not launch ({why}). It was ended stopped ({reason}), so it holds nothing and no scheduled "
+                "slot is blocked behind it; `levain dream start` starts a fresh occurrence when the cause is gone")
+    if left == "admitted":
+        return (f"{oid} did not launch ({why}) and could not be ended: it is still admitted, and until it launches or "
+                "is ended every scheduled slot of the dream is skipped behind it, tonight's included. `levain dream "
+                "start` retries that same occurrence")
+    if left == "launched":
+        return (f"{oid} did not return normally ({why}), but its launch had already happened: the row is launched and "
+                "is not ended here. `levain agents show dream` says whether its fire is running")
+    return (f"{oid} did not launch ({why}); its row is now {left}, not admitted, so it blocks no scheduled slot. "
+            "`levain agents show dream` says more")
 
 
 def start(store: Any, *, clock: Callable[[], datetime] | None = None, authority: Any = None,
@@ -163,13 +229,22 @@ def start(store: Any, *, clock: Callable[[], datetime] | None = None, authority:
         if outcome != ctl.CLAIMED:
             return Started(1, outcome, f"the claim answered {outcome}: another occurrence of the dream is live or this "
                                        "second was already claimed; nothing was started", oid)
-    # (2) the ceiling and (3) the admission, both inside the controller's launch
-    launch_over, session_alive = ctl.dispatch_probes(inst.coord_dir)
-    # the admission is the dream's own hook, PASSED: launch's defaulted on_input resolves it from the signed name, and a
-    # default that ever came back None would admit with no day-ready at all, silently
-    res = ctl.launch(store, oid, authority=auth, executor=executor, window=window_for(now, inst.zone), now=now,
-                     launch_over=launch_over, session_alive=session_alive,
-                     on_input=da.install_on_input(store.directory))
+    # (2) the ceiling and (3) the admission, both inside the controller's launch. From here to the launch's answer this
+    # verb owns an `admitted` row, and an `admitted` row blocks every scheduled slot behind it (`claim` files them
+    # skipped-overlap), so every way out of this stretch that did not launch ends the row (_end_unlaunched).
+    try:
+        launch_over, session_alive = ctl.dispatch_probes(inst.coord_dir)
+        # the admission is the dream's own hook, PASSED: launch's defaulted on_input resolves it from the signed name, and
+        # a default that ever came back None would admit with no day-ready at all, silently
+        res = ctl.launch(store, oid, authority=auth, executor=executor, window=window_for(now, inst.zone), now=now,
+                         launch_over=launch_over, session_alive=session_alive,
+                         on_input=da.install_on_input(store.directory))
+    except Exception as exc:  # noqa: BLE001 - whatever broke, the row this verb owns is not left blocking tonight
+        left = _end_unlaunched(store, oid, REASON_INTERRUPTED, clock)
+        return Started(1, "error", _after_end(oid, left, REASON_INTERRUPTED, f"{type(exc).__name__}: {exc}"), oid, resumed)
+    except BaseException:   # an interrupt: end the row, then let it go on up
+        _end_unlaunched(store, oid, REASON_INTERRUPTED, clock)
+        raise
     verb = "resumed" if resumed else "claimed"
     if res.outcome == ctl.LAUNCHED:
         try:
@@ -192,7 +267,9 @@ def start(store: Any, *, clock: Callable[[], datetime] | None = None, authority:
                                        "another start launched or ended it, so this one started nothing. "
                                        "`levain agents show dream` says which", oid, resumed)
     if res.outcome in (ctl.NO_SLOT, ctl.UNCLASSIFIED):
-        return Started(1, res.outcome, f"{oid} did not launch ({res.outcome}: {res.reason}); it stays admitted, and "
-                                       "running `levain dream start` again retries that same occurrence",
-                       oid, resumed)
+        # the controller wrote nothing and left the row admitted for ITS next tick; nothing launches a manual row on a
+        # tick, so this verb ends it
+        token = REASON_NO_SLOT if res.outcome == ctl.NO_SLOT else REASON_UNCLASSIFIED
+        left = _end_unlaunched(store, oid, token, clock)
+        return Started(1, res.outcome, _after_end(oid, left, token, f"{res.outcome}: {res.reason}"), oid, resumed)
     return Started(1, res.outcome, f"{oid} ended {res.outcome}: {res.reason}; nothing was started", oid, resumed)
