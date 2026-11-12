@@ -112,11 +112,11 @@ def test_the_pause_threshold_is_the_specs_own_and_defaults_to_two():
     """``on_failure.pause_after`` is a signed spec field (default 2); the writer reads the CURRENT version's."""
     import json
 
-    assert ctl._pause_after_of(json.dumps({"on_failure": {"pause_after": 3}})) == 3
-    assert ctl._pause_after_of(json.dumps({"on_failure": {"pause_after": 1}})) == 1
+    assert ctl.pause_after_of(json.dumps({"on_failure": {"pause_after": 3}})) == 3
+    assert ctl.pause_after_of(json.dumps({"on_failure": {"pause_after": 1}})) == 1
     for unreadable in (None, "", "{", json.dumps({}), json.dumps({"on_failure": {"pause_after": 0}}),
                        json.dumps({"on_failure": {"pause_after": True}}), json.dumps({"on_failure": []})):
-        assert ctl._pause_after_of(unreadable) == spec_mod.DEFAULT_PAUSE_AFTER, unreadable
+        assert ctl.pause_after_of(unreadable) == spec_mod.DEFAULT_PAUSE_AFTER, unreadable
 
 
 # (c) ------------------------------------------------------------------------------------------ done resets it
@@ -206,3 +206,30 @@ def test_a_budget_breach_still_pauses_and_still_counts_as_a_failed_run(rig):
         ended = ctl.settle_terminal(c, oid, epoch, "done", "completed", Usage(10**12, 1, 1, "t"), rig.now())
     assert (ended.state, ended.reason) == ("failed", "budget_breach")
     assert _agent(rig) == ("paused", 1)
+
+
+# (g) ------------------------------------------------------------------ D1-P review round 1 (board row 1688)
+
+def test_an_agent_row_that_is_missing_does_not_make_the_end_raise(rig):
+    """``accounting.settle`` already tolerates an occurrence whose agent row is gone (no FK; its UPDATE finds nothing);
+    the streak writer is the first writer in the terminal path that could otherwise refuse to end a row."""
+    oid, epoch = _launch(rig, "k1")
+    with rig.store.write() as c:
+        c.execute("DELETE FROM agents WHERE agent_id = ?", (rig.agent,))
+        ended = ctl.settle_terminal(c, oid, epoch, "failed", "run_failed", USAGE, rig.now())
+    assert ended.ended and rig.row(oid)["state"] == "failed"
+
+
+def test_the_rows_behind_the_streak_are_the_rows_the_writer_counts():
+    """One predicate, two readers: the dream's pause notice names ``failing_run_rows``, not a list of its own."""
+    rows = [
+        {"occurrence_id": "a", "state": "failed", "reason": "run_failed", "ended_at": "2026-11-01T02:00:00Z"},
+        {"occurrence_id": "b", "state": "done", "reason": "completed", "ended_at": "2026-11-02T02:00:00Z"},
+        {"occurrence_id": "c", "state": "failed", "reason": "run_failed", "ended_at": "2026-11-03T02:00:00Z"},
+        {"occurrence_id": "d", "state": "stopped", "reason": "barred", "ended_at": "2026-11-04T02:00:00Z"},
+        {"occurrence_id": "e", "state": "stopped", "reason": "never_launched", "ended_at": "2026-11-04T03:00:00Z"},
+        {"occurrence_id": "f", "state": "stopped", "reason": "crash_recovered", "ended_at": "2026-11-05T02:00:00Z"},
+        {"occurrence_id": "g", "state": "launched", "reason": None, "ended_at": None, "admitted_at": "2026-11-06T02:00:00Z"},
+    ]
+    assert [r["occurrence_id"] for r in ctl.failing_run_rows(rows)] == ["c", "f"]
+    assert ctl.failing_run_rows([]) == []

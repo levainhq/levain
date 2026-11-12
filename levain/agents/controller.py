@@ -50,7 +50,8 @@ __all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurren
            "Window", "LaunchResult", "launch",
            "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE", "SESSION_GRACE_S",
            "Ended", "settle_terminal", "GatedChild", "GATE_REFUSED", "fire_argv", "fire_record_path", "spawn_fire",
-           "claim_fire", "fire", "miss_streak", "miss_windows", "FAILING_STOPS", "counts_as_failed_run"]
+           "claim_fire", "fire", "miss_streak", "miss_windows", "FAILING_STOPS", "counts_as_failed_run", "failing_run_rows",
+           "pause_after_of"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
@@ -560,7 +561,9 @@ def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime,
     executor's own :class:`accounting.StopResult` with ``terminated`` True: a reading taken while the process may
     still run is a snapshot, and settling it would free the slot below what the run goes on to spend. Without that
     proof the end is unreadable whatever ``usage`` says (§2.4: all of the reservation is debited, or the caps recorded
-    on a subscription run). It takes the caller's write lock first, as :func:`heartbeat` does."""
+    on a subscription run). The end is a failed run for the agent (:func:`counts_as_failed_run`: ``stopped`` /
+    ``crash_recovered``): its failure streak is written in this transaction and the agent is paused at its signed
+    ``on_failure.pause_after``. It takes the caller's write lock first, as :func:`heartbeat` does."""
     if not conn.in_transaction:
         raise RuntimeError("a takeover runs inside the caller's write transaction")
     at = schedule._utc(now)
@@ -633,8 +636,8 @@ class Ended:
 
 
 # The `stopped` reasons that mean the fire did NOT complete its run, as an allow-list: a reason not named here (a bar,
-# a fence, a link no longer live: the operator's or the authority's own revocation; anything a later change adds) never
-# counts against the agent. `failed` needs no list: whatever its reason, a run that ended `failed` did not complete.
+# a fence, a link no longer live (revoked OR expired): the operator's or the authority's own doing; anything a later
+# change adds) never counts against the agent. `failed` needs no list: whatever its reason, a run that ended `failed` did not complete.
 FAILING_STOPS = (CRASH_RECOVERED, STOP_AT)
 
 
@@ -652,11 +655,26 @@ def counts_as_failed_run(state: str, reason: str | None) -> bool:
     return state == "failed" or (state == "stopped" and reason in FAILING_STOPS)
 
 
-def _pause_after_of(spec_text: object) -> int:
-    """``on_failure.pause_after`` of a stored spec (a signed field, 1 or more), or :data:`DEFAULT_PAUSE_AFTER` when the
-    text cannot be read: a spec that fails its integrity check is the tick's to refuse, not this writer's."""
+def failing_run_rows(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """The occurrence rows behind ONE agent's current failure streak, oldest first: of ``rows`` (that agent's
+    occurrence rows, any order), those :func:`counts_as_failed_run` counts, after the latest ``done`` (which reset the
+    streak). The pause notice names these rows, so what it names is what the writer counted: one predicate, two readers.
+    A row that is neither counted nor ``done`` (a bar, a refused launch, a run still in flight) is skipped."""
+    out: list[Mapping[str, Any]] = []
+    for row in sorted(rows, key=lambda r: str(r.get("ended_at") or r.get("admitted_at") or "")):
+        if row.get("state") == "done":
+            out = []
+        elif counts_as_failed_run(str(row.get("state")), row.get("reason")):
+            out.append(row)
+    return out
+
+
+def pause_after_of(spec: object) -> int:
+    """``on_failure.pause_after`` of a stored spec (text) or a parsed one (a signed field, 1 or more), or
+    :data:`DEFAULT_PAUSE_AFTER` when it cannot be read: a spec that fails its integrity check is the tick's to refuse,
+    not the writer's. The writer (:func:`_record_run_end`) and the dream's pause notice both read the number here."""
     try:
-        value = json.loads(spec_text)["on_failure"]["pause_after"]    # type: ignore[arg-type]
+        value = (json.loads(spec) if isinstance(spec, (str, bytes)) else spec)["on_failure"]["pause_after"]  # type: ignore[index]
     except (TypeError, ValueError, KeyError):
         return DEFAULT_PAUSE_AFTER
     return value if type(value) is int and value >= 1 else DEFAULT_PAUSE_AFTER
@@ -668,7 +686,9 @@ def _record_run_end(conn: sqlite3.Connection, occurrence_id: str, state: str, re
     neither. ``done`` resets the streak; a failed run (:func:`counts_as_failed_run`) adds one and, at the spec's
     ``on_failure.pause_after``, sets ``operation = 'paused'``: the tick walks no slot of a paused agent and
     :func:`_admit` refuses a launch of its claimed row (``stopped`` / ``paused``). Anything else changes nothing. Only
-    :func:`levain.agents.spec.set_operation` (resume) clears a pause, and it resets the streak with it."""
+    :func:`levain.agents.spec.set_operation` (resume) clears a pause, and it resets the streak with it. An occurrence
+    or an agent row that is missing ends quietly with nothing written (``accounting.settle`` tolerates both too): the
+    writer never makes an end raise for want of a row."""
     found = conn.execute("SELECT agent_id FROM agent_occurrences WHERE occurrence_id = ?", (occurrence_id,)).fetchone()
     if found is None:
         return
@@ -679,10 +699,12 @@ def _record_run_end(conn: sqlite3.Connection, occurrence_id: str, state: str, re
     if not counts_as_failed_run(state, reason):
         return
     conn.execute("UPDATE agents SET failure_streak = failure_streak + 1 WHERE agent_id = ?", (agent_id,))
-    streak, text = conn.execute(
+    row = conn.execute(
         "SELECT a.failure_streak, s.spec FROM agents a LEFT JOIN agent_specs s ON s.agent_id = a.agent_id"
         " AND s.version = a.current_version WHERE a.agent_id = ?", (agent_id,)).fetchone()
-    if streak >= _pause_after_of(text):
+    if row is None:
+        return
+    if row[0] >= pause_after_of(row[1]):
         conn.execute("UPDATE agents SET operation = 'paused' WHERE agent_id = ?", (agent_id,))
 
 
@@ -720,7 +742,9 @@ def settle_terminal(conn: sqlite3.Connection, occurrence_id: str, epoch: int, st
     with ``failed``/``budget_breach`` (the agent is paused in the same transaction). The supervisor calls this for a
     run it stopped only after ``stop()`` reported ``terminated`` (§2.4's first row); ``awake.sync`` is the caller's,
     after its commit. Raises on a bad argument before reading anything, and when the write fails: the caller's
-    transaction must then roll back."""
+    transaction must then roll back. The same transaction writes the agent's failure streak (:func:`_record_run_end`): a
+    ``done`` resets it, a failed run (:func:`counts_as_failed_run`) adds one and pauses the agent at its signed
+    ``on_failure.pause_after``, and a budget breach has already paused it (the settle) whatever the streak."""
     if not conn.in_transaction:
         raise RuntimeError("a terminal state is written inside the caller's write transaction")
     if state not in _ENDS:
