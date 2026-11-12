@@ -642,8 +642,13 @@ def class_covers(key_class: str, tier: str) -> bool:
 def queue_dir_for(environ: Mapping[str, str]) -> Path:
     """``<levain home>/consent`` as ``environ`` names it: ``$LEVAIN_HOME/consent`` if set (``~`` expanded under
     ``environ["HOME"]``), else ``$HOME/.levain/consent``, made absolute (as
-    ``levain.autonomic.db.default_store_dir`` does for the autonomic store). Reads nothing of this process's own
-    environment; with no ``HOME`` in ``environ``, the password database's home, as ``os.path.expanduser`` does."""
+    ``levain.autonomic.db.default_store_dir`` does for the autonomic store). The directory is named from ``environ``
+    alone, never this process's own environment (only the guard below also asks the process what kind of run it is);
+    with no ``HOME`` in ``environ``, the password database's home, as ``os.path.expanduser`` does.
+    Refuses the fallback home in a test run or a scratch run (:mod:`levain.home_guard`): every caller that derives the
+    levain home from an environment comes through here."""
+    from levain.home_guard import refuse_real_home_fallback
+    refuse_real_home_fallback("the consent directory", environ)
     home = environ.get("LEVAIN_HOME")
     if home and home.startswith("~") and not (home == "~" or home.startswith("~/")):
         base = Path(home).expanduser()      # ~user: the password database's, no $HOME read
@@ -658,10 +663,7 @@ def queue_dir_for(environ: Mapping[str, str]) -> Path:
 
 def default_queue_dir() -> Path:
     """:func:`queue_dir_for` this process's environment. Not for the core path: the hook entry points call
-    :func:`queue_dir_for` with the environment they bound. Refuses the fallback home in a test run or a scratch run
-    (:mod:`levain.home_guard`)."""
-    from levain.home_guard import refuse_real_home_fallback
-    refuse_real_home_fallback("the consent directory")
+    :func:`queue_dir_for` with the environment they bound."""
     return queue_dir_for(os.environ)
 
 
