@@ -133,7 +133,8 @@ def test_t7_a_renew_by_a_held_key_does_not_bring_back_a_grant_the_last_renewer_l
     stopped = world.revoke("b")
     said = world.refused(world.renew_lease("a"), "a")
     assert f"grant {LID} stopped when {auth.STOPPED_CURRENT}" in said
-    assert "a renew does not bring it back: create it again with a key you hold" in said
+    # a lease has a one-live rule that still counts it, so the way back revokes it first (L4 F1)
+    assert "a renew does not bring it back: revoke it, then create it again with a key you hold" in said
     assert world.state().seq == stopped.seq                      # nothing was written
     assert auth.grant_stop_reason(world.state(), LID) == auth.STOPPED_CURRENT
 
