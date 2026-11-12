@@ -882,7 +882,7 @@ def renewal_check(link: Mapping[str, Any], *, now: datetime, review_store: Any, 
 
 @dataclass
 class DrillTick:
-    action: str          # no-snapshot | not-due | ok | skipped | failed | deferred
+    action: str          # no-snapshot | not-due | ok | skipped | failed | deferred | unhandled
     detail: str = ""
 
 
@@ -893,9 +893,13 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
     drill raises one attention row (F12). A drill that cannot run because a writer holds the store records nothing,
     stays due, and raises the row only when the last recorded drill is more than two cadences old (or none exists and
     a snapshot does). ``dream_running`` (the dream has a ``launched`` occurrence) is the same deferral, taken before the
-    drill reaches for ``wrap.lock``, so the drill never makes the fire's lock fail ``lock-held`` (F8). A drill whose
-    restore step was skipped (``skipped``) is not a pass: it resolves no row, and a failure the drill before it found is
-    kept open (and re-raised from the record if its row was lost) until a drill really restores (F10)."""
+    drill reaches for ``wrap.lock``, so on the tick path the drill does not make the fire's lock fail ``lock-held`` (F8).
+    Known edge: a hand ``levain dream start`` in another process during the drill's store copy is not covered (the
+    guard reads the rows once, at the top of the tick). A drill whose restore step was skipped (``skipped``) is not a
+    pass: it resolves no row for a failure on the restore or open step, which stays open (and is re-raised from the
+    record if its row was lost) until a drill really restores (F10); a failure on a step the skipped drill re-proved
+    (setup, hash, copy, integrity) is resolved by it. Every outcome ``drill`` can return is handled by name; one this
+    function does not know (``unhandled``) changes no state and is reported in the returned detail."""
     run = drill or _snap.drill
     key = "dream-drill"
     ref = now or datetime.now(timezone.utc)
@@ -930,9 +934,7 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
         # that failed after the record was written is retried here rather than lost for a cadence
         last = _snap.last_drill(root) or {}
         if last.get("outcome") == "failed":
-            bad = "; ".join(f"{s.get('name')}: {s.get('detail')}" for s in last.get("steps") or []
-                            if s.get("status") == "failed") or "a step failed"
-            raise_row(f"the dream restore drill failed: {bad}")
+            raise_row(f"the dream restore drill failed: {_snap.failed_steps_text(last.get('steps'))}")
         elif last.get("outcome") == "skipped" and last.get("carried_failure"):
             raise_row(f"the dream restore drill failed: {last['carried_failure']}")
         elif last.get("outcome") == "ok":
@@ -951,13 +953,15 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
     if dream_running:
         return defer("a dream run is launched; the drill would take the wrap lock the fire wants",
                      first_drill_waits=True)
+    prior = _snap.last_drill(root) or {}
+    had_failure = prior.get("outcome") == "failed" or bool(prior.get("carried_failure"))
     try:
         res = run(store_path, root)
     except Exception as exc:  # noqa: BLE001 - a drill that raised proved nothing
         raise_row(f"the dream restore drill raised {type(exc).__name__}: {exc}")
         return DrillTick("failed", f"{type(exc).__name__}")
     if res.outcome == "failed":
-        bad = "; ".join(f"{s['name']}: {s['detail']}" for s in res.steps if s.get("status") == "failed") or "a step failed"
+        bad = _snap.failed_steps_text(res.steps)
         raise_row(f"the dream restore drill failed: {bad}")
         return DrillTick("failed", bad)
     if res.outcome == "deferred":
@@ -966,10 +970,19 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
         carried = getattr(res, "carried_failure", None)
         if carried:
             raise_row(f"the dream restore drill failed: {carried}")
+        elif had_failure:
+            settle()    # what the last drill found failed was setup, hash, copy or integrity, and this one just passed them
         why = next((str(s.get("detail"))[:160] for s in res.steps if s.get("name") == "restore"), "")
         return DrillTick("skipped", f"no restore ran: {why}")
-    settle()
-    return DrillTick(res.outcome)
+    if res.outcome == "ok":
+        settle()
+        return DrillTick("ok")
+    if res.outcome == "no-snapshot":
+        # the snapshots were pruned between this tick's check and the drill's own look: nothing was proved, nothing is
+        # recorded, and no row is resolved or raised
+        return DrillTick("no-snapshot", "the snapshots were gone when the drill looked (no-snapshot): nothing was proved")
+    return DrillTick("unhandled", f"the drill returned outcome {res.outcome!r}, which the tick does not handle: "
+                                  "no state was changed")
 
 
 # ------------------------------------------------------------------------------------------- the tick's caller (D1-N)
@@ -1119,9 +1132,11 @@ def tick_notices(store: Any, *, now: datetime, missed_windows: Mapping[str, Sequ
 
     def drilled() -> None:
         running = any(r.get("agent_id") == agent_id and r.get("state") == "launched" for r in rows)
-        rep.steps["drill_tick"] = drill_tick(inst.store_path, inst.store_path.parent / "dream", now=now,
-                                             attention=attention, resolve=resolve, drill=drill,
-                                             dream_running=running).action
+        got = drill_tick(inst.store_path, inst.store_path.parent / "dream", now=now, attention=attention,
+                         resolve=resolve, drill=drill, dream_running=running)
+        rep.steps["drill_tick"] = got.action
+        if got.action == "unhandled" or (got.action == "no-snapshot" and got.detail):
+            rep.notes.append(f"dream drill: {got.detail}")
 
     guard("drill_tick", drilled)
     return rep

@@ -464,10 +464,73 @@ def test_1112_1_a_skipped_drill_after_a_failed_one_carries_the_failure_forward(s
     (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')              # a seat wrote since the dream
     res = sn.drill(scratch, root)
     assert res.outcome == "skipped"
-    assert "hash" in sn.last_drill(root)["carried_failure"]                        # the failed record is not lost
+    # 1112-1 round 2: the hash step passed in THIS skipped drill, so the failure it found is not carried (it was a
+    # false red: the record said "hash: ..." while the same record's own steps said hash ok)
+    assert "carried_failure" not in sn.last_drill(root) and res.steps[0] == {
+        "name": "hash", "status": "ok", "detail": res.steps[0]["detail"]}
+    (scratch.parent / "memory.crystal.json").unlink()
+    assert sn.drill(scratch, root).outcome == "ok"
+
+
+class _Refused:
+    """A rollback that fails on the copy for a reason that is not the guard's: the restore step itself failed."""
+    outcome, code, message, restored = "failed", "x", "boom: the restore wrote the wrong files", []
+    ok = False
+
+
+def test_1112_1_r2_a_failure_on_the_restore_step_stays_carried_through_skipped_drills(scratch, monkeypatch):
+    two_dreams(scratch)
+    root = scratch.parent / "dream"
+    with monkeypatch.context() as mp:
+        mp.setattr(sn, "rollback", lambda *a, **k: _Refused())
+        assert sn.drill(scratch, root).outcome == "failed"
+    (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')                # a seat wrote since the dream
+    res = sn.drill(scratch, root)
+    assert res.outcome == "skipped" and "restore: boom" in sn.last_drill(root)["carried_failure"]
     assert sn.drill(scratch, root).as_dict()["carried_failure"] == sn.last_drill(root)["carried_failure"]
     (scratch.parent / "memory.crystal.json").unlink()                              # and a real pass drops it
     assert sn.drill(scratch, root).outcome == "ok" and "carried_failure" not in sn.last_drill(root)
+
+
+def test_1112_1_r2_only_restore_and_open_failures_are_carried_by_a_skip(scratch):
+    two_dreams(scratch)
+    root = scratch.parent / "dream"
+    steps = lambda *names: [{"name": n, "status": "failed", "detail": f"{n} broke"} for n in names]   # noqa: E731
+    for name, carried in (("setup", False), ("hash", False), ("copy", False), ("integrity", False),
+                          ("restore", True), ("open", True)):
+        sn._write_json(root / sn.DRILL_RECORD, {"outcome": "failed", "snapshot": "o2", "steps": steps(name),
+                                                "at": "2026-01-01T00:00:00+00:00"})
+        (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')
+        rec = sn.drill(scratch, root).as_dict()
+        assert rec["outcome"] == "skipped" and ("carried_failure" in rec) is carried, (name, rec)
+        if carried:
+            assert rec["carried_failure"] == sn.failed_steps_text(steps(name))
+    (scratch.parent / "memory.crystal.json").unlink()
+
+
+def test_1112_1_r2_a_record_written_before_this_change_with_a_skipped_restore_reads_as_skipped(tmp_path):
+    root = tmp_path / "r"
+    root.mkdir()
+    old = {"outcome": "ok", "snapshot": "o2", "at": "2026-11-01T00:00:00+00:00",
+           "steps": [{"name": "hash", "status": "ok", "detail": ""}, {"name": "integrity", "status": "ok", "detail": ""},
+                     {"name": "restore", "status": "skipped", "detail": "foreign-write: ..."},
+                     {"name": "open", "status": "skipped", "detail": "no restored copy"}]}
+    sn._write_json(root / sn.DRILL_RECORD, old)
+    assert sn.last_drill(root)["outcome"] == "skipped"                            # was "ok"
+    assert json.loads((root / sn.DRILL_RECORD).read_text())["outcome"] == "ok"   # the file is not rewritten: a read-time view
+    real = {**old, "steps": [{**s, "status": "ok"} for s in old["steps"]]}
+    sn._write_json(root / sn.DRILL_RECORD, real)
+    assert sn.last_drill(root)["outcome"] == "ok"                                 # a real pass is untouched
+
+
+def test_1112_1_r2_a_drill_that_finds_no_snapshot_does_not_overwrite_the_last_record(scratch):
+    root = scratch.parent / "dream"
+    root.mkdir(parents=True, exist_ok=True)
+    sn._write_json(root / sn.DRILL_RECORD, {"outcome": "failed", "at": "2026-11-01T00:00:00+00:00",
+                                            "steps": [{"name": "hash", "status": "failed", "detail": "d"}]})
+    res = sn.drill(scratch, root)                                                 # no dream has run: no snapshot
+    assert res.outcome == "no-snapshot"
+    assert sn.last_drill(root)["outcome"] == "failed"                             # was "no-snapshot"
 
 
 # ------------------------------------------------------------------------------------------------------------ the verbs
@@ -499,6 +562,28 @@ def test_1112_1_the_drill_verb_says_skipped_and_exits_non_zero_when_the_restore_
     out = capsys.readouterr().out
     assert out.splitlines()[0].startswith("levain dream drill: skipped") and "not a pass" in out.splitlines()[0]
     assert "levain dream drill: ok" not in out
+
+
+def test_1112_1_r2_the_drill_verb_exits_4_and_names_the_holder_when_the_wrap_lock_is_held(scratch, capsys):
+    from levain import wrap as w
+    two_dreams(scratch)
+    capsys.readouterr()
+    fd = w._lock_wrap_file(scratch.parent / "wrap.lock")
+    try:
+        code = dcli.run_dream_drill(_args(store_dir=str(scratch.parent), root=None, json=False))
+    finally:
+        w._unlock_wrap(fd)
+    out = capsys.readouterr().out
+    assert code == 4, (code, out)                                                  # was 0
+    first = out.splitlines()[0]
+    assert first.startswith("levain dream drill: deferred") and "wrap lock" in first and "nothing was proved" in first
+    assert "not a failure" not in out and "no snapshot yet" not in out
+    assert sn.last_drill(scratch.parent / "dream") is None                         # nothing recorded: still due
+
+
+def test_1112_1_r2_the_drill_verb_on_a_fresh_install_says_so_and_exits_0(scratch, capsys):
+    assert dcli.run_dream_drill(_args(store_dir=str(scratch.parent), root=None, json=False)) == 0
+    assert "no snapshot yet: not a failure" in capsys.readouterr().out
 
 
 def test_the_verbs_refuse_the_live_store_and_exist_in_the_parser(monkeypatch, tmp_path, capsys):
