@@ -219,3 +219,19 @@ def test_an_eval_that_reloads_waits_for_the_pages_worker_to_take_control(tmp_pat
         t.join(timeout=5)
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["values"][-1] == "true", r.stdout
+
+
+@needs_browser
+def test_a_timeout_on_a_page_that_stopped_answering_says_what_the_browser_and_the_page_last_said(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # CI, three page-drive hangs in one morning (board row 1698 and after): a page that stops answering the debugging channel came back as
+    # "PAGE URL: ?  READY STATE: ?", which cannot tell a renderer that hung, one that crashed and a target that is gone. The block now asks
+    # the BROWSER whether the page is listed, and prints the last page event and the navigation trail.
+    monkeypatch.setenv("LEVAIN_TEST_WAIT_SCALE", "1")
+    page = "data:text/html,<p>hang</p><script>addEventListener('load', () => setTimeout(() => { for (;;) {} }, 400))</script>"
+    r = _drive_at(tmp_path, page, [{"emulate": {"w": 430, "h": 844, "dpr": 2, "mobile": True}}, {"until": "false", "ms": 1500}], timeout=90)
+    assert r.returncode == 1 and "until never came true within 1500ms" in r.stderr, (r.returncode, r.stderr)
+    _, _, block = r.stderr.partition("--- page state at the timeout ---")
+    assert "PAGE URL: ?" in block, r.stderr                              # the page did not answer: the premise of the test
+    assert "TARGET: listed" in block, r.stderr                           # the browser still lists it
+    assert "LAST PAGE EVENT: " in block and "loadEventFired" in block, r.stderr   # and the page's trail names its load
+    assert len(block) < 4100, len(block)
