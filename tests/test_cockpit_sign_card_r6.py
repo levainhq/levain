@@ -54,11 +54,13 @@ def test_s1_an_answer_still_on_its_way_is_fenced_by_its_attempt_read_and_never_l
 
 # the second case is the CI box: the page's change stream says hello after the page was drawn and the test has begun
 # (CI run 43184130543 on levainhq/levain: `assert 1 == 0`, one flushReload inside the window)
-@pytest.mark.parametrize("hello_delay", [0.0, 1.5], ids=["hello_on_time", "hello_late"])
+@pytest.mark.parametrize("hello_delay,manifest_delay", [(0.0, 0.0), (1.5, 0.0), (0.0, 1.5)],
+                         ids=["hello_on_time", "hello_late", "manifest_slow"])
 @needs_browser
 @needs_ssh
-def test_s1_s6_an_answer_that_never_left_comes_back_on_its_attempts_refusal_and_is_not_redrawn(tmp_path, monkeypatch, hello_delay) -> None:
-    rig = _Rig(tmp_path, monkeypatch, hello_delay=hello_delay)
+def test_s1_s6_an_answer_that_never_left_comes_back_on_its_attempts_refusal_and_is_not_redrawn(
+        tmp_path, monkeypatch, hello_delay, manifest_delay) -> None:
+    rig = _Rig(tmp_path, monkeypatch, hello_delay=hello_delay, manifest_delay=manifest_delay)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),
