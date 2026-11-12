@@ -271,8 +271,10 @@ def _install_session_home() -> None:
     _SESSION_HOME.append(home)
     os.environ["HOME"] = home
     # the one admission of the real-home guard (levain/home_guard.py): a test that unsets $LEVAIN_HOME on purpose, under
-    # a $HOME it moved into the temp root, takes a scratch fallback. A process this conftest did not start has no such
-    # variable, and an operator's real $HOME is never inside the temp root.
+    # a $HOME it moved into the temp root, takes a scratch fallback. Set in the process environment, so a child a test
+    # spawns inherits it (with pytest's per-test variable) and is admitted only while its own $HOME is inside the temp
+    # root; a script the suite did not start has no voucher, and a root that holds the account's own home vouches for
+    # nothing.
     os.environ[home_guard.TEST_SCRATCH_ROOT_ENV] = str(Path(tempfile.gettempdir()).resolve())
     for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "CODEX_HOME"):
         os.environ.pop(name, None)

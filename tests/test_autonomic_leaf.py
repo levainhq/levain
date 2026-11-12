@@ -16,7 +16,9 @@ trust-anchor rule ``confirm`` uses, which root's route-map check runs without im
 ``levain.fsync_errnos``, the one set of errnos every ``F_FULLFSYNC`` flush falls back on (the journal reads it);
 and ``levain.home_guard``, the one refusal of a test run's or scratch run's fall-back to the operator's real levain
 home, which the store directory's resolver (``default_store_dir``) calls before it names a directory.
-Each is held to more than the package is: it may import ``ALLOWED_OUTSIDE_STDLIB`` roots and nothing of ``levain``.
+Each may import the ``ALLOWED_OUTSIDE_STDLIB`` roots (the package's own stdlib list and a few more), any extra its
+own entry in ``ALLOWED_OUTSIDE_EXTRA`` names (``sys`` for ``levain.home_guard`` alone, which reads ``sys.modules`` to
+tell a pytest run), and nothing of ``levain``.
 
 Also flagged: the builtin loader names (``__import__``, ``__builtins__``, ``exec``, ``eval``, a bare
 ``compile``) and any attribute chain off the name ``levain`` other than ``levain.autonomic`` (an
@@ -49,8 +51,10 @@ ALLOWED_STDLIB = frozenset({
 })
 # What the modules named in ALLOWED_OUTSIDE may import: kept apart so a stdlib module they need never
 # widens the closed package's own list above.
-ALLOWED_OUTSIDE_STDLIB = ALLOWED_STDLIB | frozenset({"shutil", "sys", "time"})
+ALLOWED_OUTSIDE_STDLIB = ALLOWED_STDLIB | frozenset({"shutil", "time"})
 ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor", "levain.hands_live", "levain.fsync_errnos", "levain.home_guard"})
+# a stdlib root one outside module needs and the others must not gain
+ALLOWED_OUTSIDE_EXTRA = {"levain.home_guard": frozenset({"sys"})}
 _LOADER_NAMES = frozenset({"__import__", "__builtins__", "exec", "eval", "compile"})
 
 
@@ -123,12 +127,14 @@ def test_importing_the_package_loads_nothing_outside_it():
 
 def test_each_allowed_outside_module_imports_only_the_stdlib_allowlist():
     for name in sorted(ALLOWED_OUTSIDE):
+        allowed = ALLOWED_OUTSIDE_STDLIB | ALLOWED_OUTSIDE_EXTRA.get(name, frozenset())
         tree = ast.parse((ROOT / (name.replace(".", "/") + ".py")).read_text(encoding="utf-8"))
         bad = [n for n in ast.walk(tree)
-               if isinstance(n, ast.ImportFrom) and (n.level or (n.module or "").split(".")[0] not in ALLOWED_OUTSIDE_STDLIB)
-               or isinstance(n, ast.Import) and any(a.name.split(".")[0] not in ALLOWED_OUTSIDE_STDLIB for a in n.names)
+               if isinstance(n, ast.ImportFrom) and (n.level or (n.module or "").split(".")[0] not in allowed)
+               or isinstance(n, ast.Import) and any(a.name.split(".")[0] not in allowed for a in n.names)
                or isinstance(n, ast.Name) and n.id in _LOADER_NAMES]
         assert bad == [], (name, [ast.dump(n) for n in bad])
+    assert "sys" not in ALLOWED_OUTSIDE_STDLIB and set(ALLOWED_OUTSIDE_EXTRA) <= ALLOWED_OUTSIDE
 
 
 def test_the_static_check_flags_each_way_out(tmp_path):
