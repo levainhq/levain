@@ -187,14 +187,15 @@ def test_an_answer_the_grant_gave_before_the_revoke_is_not_delivered_after_it(wo
     assert again is None or again.via != "grant"
 
 
-def test_the_listing_still_shows_the_grant_after_its_signer_is_revoked(world) -> None:
-    """What the operator sees: nothing marks the grant (it lists like any live grant). Records the current behaviour."""
+def test_the_listing_still_shows_the_grant_after_its_signer_is_revoked_marked_stopped(world) -> None:
+    """What the operator sees: the grant is still listed (it is in the policy, so it can be revoked) and says it is
+    stopped, not live."""
     world.grant("cg-A")
     world.revoke_a()
     grants = list_grants(world.root, now=_now())
-    assert [g.id for g in grants] == ["cg-A"]
+    assert [(g.id, g.stopped_why) for g in grants] == [("cg-A", auth.STOPPED_BORN)]
     page = grant_view(world.qdir, now=_now())               # the cockpit page / phone read
-    assert [(r["id"], r["state"]) for r in page["grants"]] == [("cg-A", "live")]
+    assert [(r["id"], r["state"]) for r in page["grants"]] == [("cg-A", "stopped")]
 
 
 # --- who signed what: the born signer and the last renewer both count -------------------------------------------
