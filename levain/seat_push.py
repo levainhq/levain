@@ -56,7 +56,8 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from levain import host_guard as hg
-from levain.authority import SEAT_EGRESS_KIND, SEAT_EGRESS_MAX, AuthoritySnapshot, _parse_stamp, _thaw
+from levain.authority import (SEAT_EGRESS_KIND, SEAT_EGRESS_MAX, AuthoritySnapshot, _parse_stamp, _thaw,
+                              grant_stop_reason, grants_in_force)
 from levain.consent import push
 
 __all__ = ["SEAT_EGRESS_KIND", "SeatPushRefused", "SIGN_COMMAND", "STOP_TIMEOUT", "SESSION_END_TIMEOUT",
@@ -107,9 +108,12 @@ class SeatPushRefused(Exception):
 
 def live_egress(state: AuthoritySnapshot, now: datetime) -> Mapping[str, Any] | None:
     """The one live ``seat-egress`` grant of the verified replay ``state`` at ``now`` (its fields plus ``link_seq``), or
-    None. More than one live is refused (the log refuses to append a second; a foreign writer could leave two)."""
+    None. More than one live is refused (the log refuses to append a second; a foreign writer could leave two).
+
+    A grant whose signer was revoked is stopped (:func:`levain.authority.grants_in_force`) and is not read here: it is
+    still in the policy, so it still counts at append and can still be revoked (:func:`stopped_egress`)."""
     live = []
-    for gid, grant in state.policy.grants.items():
+    for gid, grant in grants_in_force(state).items():
         if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_EGRESS_KIND):
             continue
         try:
@@ -124,6 +128,25 @@ def live_egress(state: AuthoritySnapshot, now: datetime) -> Mapping[str, Any] | 
     gid, grant = live[0]
     link = state.grant_link(gid)
     return {**_thaw(grant), "link_seq": 0 if link is None else link[0], "incarnation": state.grant_born.get(gid, 0)}
+
+
+def stopped_egress(state: AuthoritySnapshot, now: datetime) -> tuple[str, str] | None:
+    """``(id, why)`` of an unexpired seat-egress grant the policy holds that :func:`live_egress` does not read because a
+    key that signed it was revoked, or None. It tells the operator why a push is refused when this is the reason; it
+    never authorises anything."""
+    for gid in sorted(state.policy.grants):
+        grant = state.policy.grants[gid]
+        if not (isinstance(grant, Mapping) and grant.get("kind") == SEAT_EGRESS_KIND):
+            continue
+        why = grant_stop_reason(state, gid)
+        if why is None:
+            continue
+        try:
+            if _parse_stamp(grant["expires_at"], "expires_at") > now:
+                return gid, why
+        except Exception:  # noqa: BLE001 - a grant whose expiry cannot be read is not live, stopped or not
+            continue
+    return None
 
 
 def create_egress(cockpit_root: Path | str, *, lanes_parent: Path | str, push_remote: str,
@@ -218,6 +241,10 @@ def egress_refusal(cockpit_root: Path | str, key_dir: Path, *, now: Callable[[],
         except (SeatPushRefused, seat_lease.SeatLaunchRefused) as exc:
             return str(exc)
         if grant is None:
+            stopped = None if state is None else stopped_egress(state, clock())
+            if stopped is not None:
+                return (f"nothing is pushed: the seat-egress grant stopped when {stopped[1]} ({stopped[0]}); "
+                        f"commits stay in the clone")
             return "no live seat-egress grant (revoked, expired or never signed): nothing is pushed"
         try:
             row = _mint_for(key_dir, path)
@@ -483,7 +510,10 @@ def run_hook(event: str, stdin_text: str, *, clone: Path | str, key_dir: Path | 
         state = seat_lease._replay(cockpit_root)
         grant = None if state is None else live_egress(state, clock())
         if grant is None:
-            _log(home, {**base, "outcome": "refused", "detail": "no live seat-egress grant: commits stay local"})
+            stopped = None if state is None else stopped_egress(state, clock())
+            detail = ("no live seat-egress grant: commits stay local" if stopped is None else
+                      f"the seat-egress grant {stopped[0]} stopped when {stopped[1]}: commits stay local")
+            _log(home, {**base, "outcome": "refused", "detail": detail})
             return 0
         if _last_pushed(key_dir, lane) == _pushed_mark(tip, grant):
             return 0                                           # this tip already went to THIS grant's remote: silent
