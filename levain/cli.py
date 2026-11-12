@@ -2626,13 +2626,13 @@ def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
 
 def _print_stopped_by_revoke(args: argparse.Namespace, fingerprint: str) -> None:
     """After a key revoke: the standing grants that key signed, which now answer nothing. A second, fresh read of the
-    log (the revoke is done and `revoke` returns no list); words only, so a read that fails is said and never changes
-    the revoke's exit code, and one that races a later link can only make the list stale."""
+    log (the revoke is done and `revoke` returns no list); words only, so a read that fails in any way is said and never
+    changes the revoke's exit code, and one that races a later link can only make the list stale."""
     from levain.consent.grants import stopped_by_key, stopped_notice
 
     try:
         lines = stopped_notice(stopped_by_key(_cockpit_root(args), fingerprint, now=_utc_now()))
-    except _cockpit_refusals() as exc:
+    except Exception as exc:  # noqa: BLE001 - the revoke already succeeded; a non-zero exit would invite a second one
         print(f"note: the standing grants this key signed could not be listed ({exc}); `levain consent grant list` "
               "shows which are stopped", file=sys.stderr)
         return
