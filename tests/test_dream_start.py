@@ -289,6 +289,121 @@ def _only_row(rig) -> dict:
     return row
 
 
+def test_f1_a_hook_that_cannot_answer_ends_the_row_the_verb_claimed(tmp_path, monkeypatch):
+    # reproduced: the dream's input check raising (the wrap state or the baton unreadable) is UNCLASSIFIED within the
+    # grace; the verb printed "it stays admitted" and the manual row blocked every scheduled slot behind it
+    rig = _live_rig(tmp_path)
+
+    def cannot_answer(agent_dir, **kw):
+        def hook(row):
+            raise rd.SourceUnreadable("the wrap state cannot be read")
+        return hook
+
+    monkeypatch.setattr(da, "install_on_input", cannot_answer)
+    got, spawned = _go(rig)
+    assert (got.code, got.outcome) == (1, "unclassified") and spawned == [], got
+    row = _only_row(rig)
+    assert (row["state"], row["reason"]) == ("stopped", "hand_start_unclassified"), row
+    assert row["ended_at"] and row["launched_at"] is None and rig.taken(row["occurrence_id"]) == ([], [])
+    assert "stays admitted" not in got.text and "stopped" in got.text and "no scheduled slot is blocked" in got.text, got.text
+    assert _scheduled_claim_outcome(rig) == ctl.CLAIMED       # tonight's slot is not behind a stuck row
+
+
+def test_f1_a_full_cap_ends_the_row_the_verb_claimed(tmp_path):
+    from levain.agents import slots
+
+    rig = _live_rig(tmp_path)
+    with rig.store.write() as c:                              # both slots held by other launches
+        assert slots.take(c, slots.LAUNCH, "ln-a", rig.now()) == 1
+        assert slots.take(c, slots.LAUNCH, "ln-b", rig.now()) == 2
+    got, spawned = _go(rig)
+    assert (got.code, got.outcome) == (1, "no-slot") and spawned == [], got
+    row = _only_row(rig)
+    assert (row["state"], row["reason"]) == ("stopped", "hand_start_no_slot"), row
+    assert row["launched_at"] is None and rig.taken(row["occurrence_id"]) == ([], [])
+    assert "stays admitted" not in got.text and "no scheduled slot is blocked" in got.text, got.text
+    assert _scheduled_claim_outcome(rig) == ctl.CLAIMED
+
+
+def test_f1_an_exception_between_the_claim_and_the_launch_ends_the_row_and_says_so(tmp_path, monkeypatch):
+    rig = _live_rig(tmp_path)
+
+    def boom(*a, **k):
+        raise RuntimeError("the launch transaction broke")
+
+    monkeypatch.setattr(ctl, "launch", boom)
+    got, spawned = _go(rig)
+    assert (got.code, got.outcome) == (1, "error") and spawned == [], got
+    assert "RuntimeError" in got.text and "the launch transaction broke" in got.text and "stopped" in got.text, got.text
+    row = _only_row(rig)
+    assert (row["state"], row["reason"]) == ("stopped", "hand_start_interrupted"), row
+    assert _scheduled_claim_outcome(rig) == ctl.CLAIMED
+
+
+def test_f1_an_interrupt_between_the_claim_and_the_launch_ends_the_row_and_goes_on_up(tmp_path, monkeypatch):
+    rig = _live_rig(tmp_path)
+
+    def interrupt(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ctl, "launch", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _go(rig)
+    row = _only_row(rig)
+    assert (row["state"], row["reason"]) == ("stopped", "hand_start_interrupted"), row
+    assert _scheduled_claim_outcome(rig) == ctl.CLAIMED
+
+
+def test_f1_a_resumed_row_that_cannot_launch_is_ended_too(tmp_path, monkeypatch):
+    rig = _live_rig(tmp_path)
+    left = _claim(rig, "left-admitted")
+    monkeypatch.setattr(da, "install_on_input", lambda agent_dir, **kw: (_ for _ in ()).throw(OSError("busy")))
+    got, spawned = _go(rig)
+    assert (got.outcome, got.resumed, got.occurrence_id) == ("error", True, left) and spawned == [], got
+    assert (_only_row(rig)["state"], _only_row(rig)["reason"]) == ("stopped", "hand_start_interrupted")
+
+
+def test_f1_when_the_row_cannot_be_ended_the_verb_says_it_still_blocks_tonight(tmp_path, monkeypatch):
+    rig = _live_rig(tmp_path)
+
+    def cannot_answer(agent_dir, **kw):
+        return lambda row: (_ for _ in ()).throw(rd.SourceUnreadable("unreadable"))
+
+    monkeypatch.setattr(da, "install_on_input", cannot_answer)
+    monkeypatch.setattr(ctl, "_end_after_input", lambda *a, **k: (_ for _ in ()).throw(OSError("store busy")))
+    got, spawned = _go(rig)
+    assert (got.code, got.outcome) == (1, "unclassified") and spawned == [], got
+    assert "could not be ended" in got.text and "still admitted" in got.text and "tonight's included" in got.text, got.text
+    assert _only_row(rig)["state"] == "admitted"
+    _parses(got.text)
+
+
+def test_f1_a_launch_that_did_happen_is_never_ended(tmp_path, monkeypatch):
+    # the launch committed and something raised after it (the call, or the spawn): the row is launched, a fire may
+    # exist, and the verb ends nothing it did not leave admitted
+    rig = _live_rig(tmp_path)
+    real = ctl.launch
+
+    def launches_then_raises(*a, **k):
+        real(*a, **k)
+        raise RuntimeError("after the commit")
+
+    monkeypatch.setattr(ctl, "launch", launches_then_raises)
+    got, spawned = _go(rig)
+    assert got.outcome == "error" and "launched" in got.text and spawned == [], got
+    assert _only_row(rig)["state"] == "launched"
+    monkeypatch.undo()
+
+    def interrupted_spawn(directory, oid):
+        raise KeyboardInterrupt
+
+    (tmp_path / "two").mkdir()
+    rig2 = _live_rig(tmp_path / "two")
+    with pytest.raises(KeyboardInterrupt):
+        st.start(rig2.store, clock=rig2.now, authority=rig2.authority, spawn=interrupted_spawn)
+    assert _only_row(rig2)["state"] == "launched"
+
+
 # ------------------------------------------------ F2: a launch that found the row not admitted says what is true
 
 def test_f2_the_loser_of_two_starts_is_not_told_the_row_stays_admitted(tmp_path, monkeypatch):
