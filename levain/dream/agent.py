@@ -263,10 +263,13 @@ def _when_text(zone: str, time: str) -> str:
 
 
 def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expires: str,
-                      time: str = DEFAULT_TIME) -> str:
+                      time: str = DEFAULT_TIME, store_dir: Path | str | None = None) -> str:
     """The words the link's signing card carries (§6), with the numbers the caller computed from §2.4's ``R``. ``time``
     is the install's time setting; it is part of the spec the link signs, so the card says it and a changed time is a
-    new card to sign."""
+    new card to sign. ``store_dir`` is the directory holding the install's ``memory.db``: the Undo command needs it
+    (``levain dream rollback`` requires ``--store-dir``), so the card prints it when the install is known and a plain
+    placeholder when it is not."""
+    sd = shlex.quote(str(store_dir)) if store_dir is not None else _card._STORE_DIR_UNKNOWN
     return (f"Dream consolidates this install's memory {_when_text(zone, time)}, and only when the day has new "
             "episodes and no other consolidation is in progress. Seats may be live while it runs: it works from the "
             "episodes recorded before it starts, and whatever a seat records during it is kept and goes to the next "
@@ -275,7 +278,8 @@ def signing_card_text(zone: str, *, per_run_usd: float, night_usd: float, expire
             "crystal tier, and it never sends, pushes or publishes. It spends at most "
             f"${per_run_usd:.2f} a run and ${night_usd:.2f} a night (2 runs) at list price; each compose stops early "
             "enough that the one model call that can run past its cap still fits inside the run's limit. Undo: "
-            "`levain dream rollback <occurrence>` restores the memory text in one step; that day's episodes stay "
+            f"`levain dream rollback <occurrence> --store-dir {sd}` (each morning card names the exact command) "
+            "restores the memory text in one step; that day's episodes stay "
             f"counted as consolidated and are not offered again. Until: {expires}, review by the same date.")
 
 
@@ -846,7 +850,7 @@ def _file_run_card(outcome: str, result: Mapping[str, Any], occurrence_id: str, 
         spec: dict[str, Any] = {"kind": "consolidated" if outcome == "saved" else "failed", "occurrence": occurrence_id,
                                 "reason": "" if outcome == "saved" else f"{outcome}: {result.get('detail') or ''}".strip()}
         c = _card.from_spec(spec, occ_dir=occ, db_path=store_path if outcome == "saved" else None, day=day,
-                            manual=manual, slot=slot)
+                            manual=manual, slot=slot, store_dir=Path(store_path).parent)
         _, new = _card.file_card(review_store, c, feed=feed)
         return "filed" if new else "duplicate"
     except Exception as exc:  # noqa: BLE001 - an unfiled card is a failed run (the win includes the card), not a crash
