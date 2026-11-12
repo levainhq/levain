@@ -92,18 +92,18 @@ def test_a_band_row_ringing_an_old_or_new_id_offers_the_controls_and_acts(tmp_pa
     assert got["next"] == "2026-11-12" and got["status"] == "open" and qs.open_questions() == []
 
 
-def test_an_anneal_without_id_prefix_gets_a_clear_error_not_a_bare_type_error(tmp_path, monkeypatch):
+def test_an_anneal_older_than_the_pin_gets_a_clear_error_naming_it_not_a_bare_type_error(tmp_path, monkeypatch):
+    """An anneal before the id prefix also lacks the schema-2 open key; the store guard names the pin before any construction."""
+    import anneal_memory.spores as spores
+
     import levain.intentions as sp
 
-    def old_anneal(path, **kw):
-        raise TypeError("IntentionStore.__init__() got an unexpected keyword argument 'id_prefix'")
-
-    monkeypatch.setattr(sp, "_GUARDED", old_anneal)
-    with pytest.raises(RuntimeError, match=r"anneal-memory>=1\.0\.7"):
+    monkeypatch.delattr(spores, "OPEN_KEY")
+    with pytest.raises(RuntimeError, match=r"anneal-memory>=2\.0\.0,<2\.1"):
         sp.guarded_intention_store(tmp_path / "memory.spores.json")
 
 
-def test_only_the_id_prefix_type_error_is_translated(tmp_path, monkeypatch):
+def test_a_type_error_from_the_store_constructor_is_never_translated(tmp_path, monkeypatch):
     import levain.intentions as sp
 
     def other(path, **kw):
