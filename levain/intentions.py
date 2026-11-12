@@ -189,7 +189,7 @@ def guarded_intention_store(path: Any) -> Any:
         if "unexpected keyword argument 'id_prefix'" not in str(exc):
             raise
         # anneal-memory before 1.0.7 has no id_prefix: say what to do, never a bare TypeError on every store open
-        raise RuntimeError("levain needs anneal-memory>=1.0.7 (the installed one predates the intention id prefix): "
+        raise RuntimeError("levain needs anneal-memory>=2.0.0,<2.1 (the installed one predates the intention id prefix): "
                            "pip install -U 'anneal-memory>=2.0.0,<2.1'") from exc
 
 

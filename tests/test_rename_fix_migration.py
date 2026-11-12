@@ -122,7 +122,7 @@ def test_med1_an_anneal_below_the_floor_refuses_before_any_backup(install, monke
     assert _paths(install).intentions_json.read_bytes() == before
     assert _backups(install) == []
     text = "\n".join(lines)
-    assert "was not done" in text and "anneal-memory>=1.0.7" in text, text
+    assert "was not done" in text and "anneal-memory>=2.0.0,<2.1" in text, text
     assert (install / ".levain" / "manifest.json").is_file()        # the lock is still recorded (the refusal path ran)
 
 
@@ -136,7 +136,7 @@ def test_med1_the_migration_itself_refuses_without_a_backup(tmp_path, monkeypatc
     before = paths.intentions_json.read_bytes()
     _anneal_before_1_0_7(monkeypatch)
     report = migrate_seed_to_someday(paths)
-    assert report.refused and "anneal-memory>=1.0.7" in report.refused and report.backup is None
+    assert report.refused and "anneal-memory>=2.0.0,<2.1" in report.refused and report.backup is None
     assert not (tmp_path / "backups").exists() and paths.intentions_json.read_bytes() == before
 
 
@@ -179,3 +179,38 @@ def test_g2_the_reconcile_path_also_defers(install, monkeypatch):
     assert run_update(install, no_pip=True, emit=lines.append) == 1
     assert _paths(install).intentions_json.read_bytes() == before
     assert "left for the next `levain update`" in "\n".join(lines)
+
+
+def _as_schema_1(store: Path) -> None:
+    """Rewrite a store the way a release before anneal 2.0 left it: the open rows under the old document key, schema 1."""
+    from levain.intention_legacy import STORE_DOC_KEY_OPEN, STORE_DOC_KEY_OPEN_V1
+
+    doc = json.loads(store.read_text(encoding="utf-8"))
+    doc = {(STORE_DOC_KEY_OPEN_V1 if k == STORE_DOC_KEY_OPEN else k): v for k, v in doc.items()}
+    doc["schema_version"] = 1
+    store.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+
+
+def test_a_schema_1_store_is_refused_with_its_conversion_named_then_migrates(install):
+    """The upgrade an operator actually makes: anneal 2.0 refuses a store whose open rows sit under the old key until it is
+    converted once. `levain update` must leave that store untouched (no copy, no half rewrite), say which command converts
+    it and end non-zero; after the conversion the next update rewrites the open `seed` as usual."""
+    from anneal_memory.spores import IntentionStore
+
+    sid = _plant_open_seed(install)
+    store = _paths(install).intentions_json
+    _as_schema_1(store)
+    before = store.read_bytes()
+
+    lines: list[str] = []
+    assert run_update(install, no_pip=True, emit=lines.append) == 1
+    text = "\n".join(lines)
+    assert store.read_bytes() == before and _backups(install) == []
+    assert "was not done" in text and "schema 1" in text and "anneal-memory intention migrate-key" in text, text
+
+    assert IntentionStore(store).migrate_to_v2()["status"] != "already-current"
+    again: list[str] = []
+    assert run_update(install, no_pip=True, emit=again.append) == 0
+    doc = json.loads(store.read_text(encoding="utf-8"))
+    assert doc["schema_version"] == 2 and {r["id"]: r["disposition"] for r in doc["intentions"]}[sid] == "someday"
+    assert len(_backups(install)) == 1

@@ -253,6 +253,10 @@ DOC_RENAME = {"seed/spore_instructions.md": "seed/intention_instructions.md"}
 # A changed line must be about the rename: a changed line without one of these words is an unrelated change (a `seed`
 # directory or a sampling parameter swept up by a quoted-word rewrite would be exactly that).
 RENAME_WORDS = re.compile(r"spore|intention|someday|germinat|_NON_COGNITION_DISPOSITIONS", re.IGNORECASE)
+# The seed document names the retired disposition as a word of prose (the old copy says `seed` where the new one says
+# `someday`), so its changed lines may carry the old word too. Only that document: in a hook or the carrier a bare
+# `seed` is the install's directory, not a disposition.
+RETIRED_DISPOSITION_IN_DOC = re.compile(r"\bseed\b", re.IGNORECASE)
 
 
 def _tree(install: Path) -> dict[str, bytes]:
@@ -307,7 +311,9 @@ def test_nothing_that_is_not_the_disposition_word_changed_in_those_files(both_in
     for rel in sorted(RENAMED_FILES | set(DOC_RENAME.values())):
         a, b = t_old[rel].decode(), t_new[rel].decode()
         for line in _changed_lines(a, b):
-            assert RENAME_WORDS.search(line), f"{rel}: a changed line that is not about the rename: {line!r}"
+            about_the_rename = RENAME_WORDS.search(line) or (
+                rel in DOC_RENAME.values() and RETIRED_DISPOSITION_IN_DOC.search(line))
+            assert about_the_rename, f"{rel}: a changed line that is not about the rename: {line!r}"
         # the install's `seed/` directory is not a disposition: every path through it survives
         assert a.count("seed/") == b.count("seed/"), rel
 

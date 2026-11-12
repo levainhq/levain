@@ -118,7 +118,7 @@ def migrate_seed_to_someday(paths: Any, *, now: datetime | None = None,
 
         store = guarded_intention_store(store_path)
     except (ImportError, RuntimeError) as exc:
-        report.refused = (f"the installed anneal-memory cannot do it (levain needs anneal-memory>=1.0.7: "
+        report.refused = (f"the installed anneal-memory cannot do it (levain needs anneal-memory>=2.0.0,<2.1: "
                           f"pip install -U 'anneal-memory>=2.0.0,<2.1'; {exc}); nothing was copied or rewritten")
         return report
     when = now or datetime.now(timezone.utc)

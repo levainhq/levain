@@ -72,12 +72,12 @@ Everything above is *your* prospective memory: open loops that flow into your co
 
 **The band — what the machine is stopped on that only the operator can give.** A band row is a question, a choice or a signature you cannot do without them. File one with `levain ask` (the band MCP tool `ask` does the same) and keep working. Every row names what waits on the answer (`--blocks`): that is the stopped test. If you can do the next step yourself, it is not a band row, it is work. If nothing is stopped yet because the date has not come, it is not a band row either; it is a dated intention (below). The band is for what is waiting now, not for what will wait later.
 
-**Intentions — intentions that are not live yet.** Two kinds the operator reaches you with:
+**Somedays and agendas — intentions that are not live yet.** Two dispositions the operator reaches you with:
 
-- **seed** — undated, and allowed to go stale. A freeform capture the operator dropped for you to **sort**; the default for anything they dump. Read it and route it: promote it to an open `loop` so it joins your cognition, `ascend` it into a project or an episode, or let it rest. A seed that nobody wants any more is composted (`descend`), not carried.
-- **agenda** — dated, or set off by a date: something for a day, not for now. It sits in the Tray with its date and stays out of your cognition surfaces until you sort it. Give it the date in `next` on your intention tools (the cockpit calls the same field `surface_at`). Treat an agenda with no date as a seed.
+- **someday** — undated, and allowed to go stale. A freeform capture the operator dropped for you to **sort**; the default for anything they dump. Read it and route it: promote it to an open `loop` so it joins your cognition, `ascend` it into a project or an episode, or let it rest. A someday that nobody wants any more is composted (`descend`), not carried.
+- **agenda** — dated, or set off by a date: something for a day, not for now. It sits in the Tray with its date and stays out of your cognition surfaces until you sort it. Give it the date in `next` on your intention tools (the cockpit calls the same field `surface_at`). Treat an agenda with no date as a someday.
 
-There is no `handoff` disposition for new items: "pick this up next session" is a seed, a dated agenda, or, if the machine is stopped on the operator, a band row. And there is no Keep. Reference is memory, not a task:
+There is no `handoff` disposition for new items: "pick this up next session" is a someday, a dated agenda, or, if the machine is stopped on the operator, a band row. And there is no Keep. Reference is memory, not a task:
 
 - a **fact** that stays true goes in your continuity under `## Durable Facts` (if your store has that section; otherwise as a `finding` episode), written with the cue words that would bring it back;
 - a **ruling** (the operator decided something) is a `decision` episode with their words, the date and the premise;
@@ -85,7 +85,7 @@ There is no `handoff` disposition for new items: "pick this up next session" is 
 
 Old `handoff` and `note` items from earlier installs still appear, in the Tray (`intention_list` and the cockpit's Tray panel show them badged `handoff` or `note`). Resolve one with `intention_close` (done) or `intention_promote` (it grew), or from the cockpit started with `levain serve --write`; you just do not create new ones.
 
-**The capture contract: the human dumps; you sort.** This is the load-bearing rule. Your operator's mental model is "I drop things for you." They do NOT learn the seed / agenda vocabulary; *you* carry it. Disposition is something you infer and assign, never something the human has to get right. A fresh dump is a `seed` by default (already outside your cognition surfaces, so a raw dump cannot pollute your salience before you have looked at it), and you do the sorting. Keep the freeform door wide.
+**The capture contract: the human dumps; you sort.** This is the load-bearing rule. Your operator's mental model is "I drop things for you." They do NOT learn the someday / agenda vocabulary; *you* carry it. Disposition is something you infer and assign, never something the human has to get right. A fresh dump is a `someday` by default (already outside your cognition surfaces, so a raw dump cannot pollute your salience before you have looked at it), and you do the sorting. Keep the freeform door wide.
 
 ---
 
