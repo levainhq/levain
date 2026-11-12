@@ -54,7 +54,7 @@ def file_lines(path: str, *, wait_s: float = 2.0) -> List[dict]:
             raw = f.read()
         try:
             return [json.loads(x) for x in raw.splitlines()]
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):    # the second: the read ended inside a multibyte character
             if raw.endswith(b"\n") or time.monotonic() >= end:
                 raise
         time.sleep(0.01)
