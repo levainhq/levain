@@ -430,8 +430,10 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
                         spawn: Callable[[Path | str, str], Any], notes: list[str], seen: dict) -> None:
     """D1-Q: launch the dream slots the claims left ``admitted``, the way ``levain dream start`` launches a hand start
     (``levain.dream.start.start``): ``controller.launch`` (the link, the signed run ceiling and budgets, the slot cap and
-    the dream's own admission hook, ``levain.dream.agent.install_on_input``, PASSED as the hook, with the window
-    ``levain.dream.start.window_for`` gives) and then ``controller.spawn_fire``. Nothing in the launch is decided here: the
+    the dream's own admission hook, ``levain.dream.agent.install_on_input``, PASSED as the hook) and then
+    ``controller.spawn_fire``. The one argument that differs from the hand start's is the window: a scheduled row counts
+    the manual runs inside the night its own ``window_key`` names (``schedule.window_span`` in the signed trigger's zone),
+    where a hand start counts its local day (``levain.dream.start.window_for``). Nothing in the launch is decided here: the
     controller answers, and what it answers is acted on as the hand-start verb acts on it, except where the tick can do
     better than the verb:
 
@@ -449,19 +451,19 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
     once however many ticks see it (the launch is a compare-and-set on ``state = 'admitted'``). It runs after the
     renewals and the claims, so the renewal-gap arithmetic in the module docstring is untouched; an exception in one row
     is named and does not stop the others or the notices."""
+    from levain.agents import schedule as _sched
     from levain.agents import spec as _spec
     from levain.dream import agent as _da
     from levain.dream import executor as _ex
-    from levain.dream import start as _start
 
     try:
         agent = _spec.get_agent(st, _da.NAME)
     except _spec.SpecError:
         return                      # no dream registered: nothing to launch
     with st.read() as conn:
-        rows = [r[0] for r in conn.execute(
-            "SELECT occurrence_id FROM agent_occurrences WHERE agent_id = ? AND kind = 'scheduled'"
-            " AND state = 'admitted' ORDER BY admitted_at, occurrence_id", (agent["agent_id"],)).fetchall()]
+        rows = conn.execute(
+            "SELECT occurrence_id, window_key FROM agent_occurrences WHERE agent_id = ? AND kind = 'scheduled'"
+            " AND state = 'admitted' ORDER BY admitted_at, occurrence_id", (agent["agent_id"],)).fetchall()
     if not rows:
         return
     now = clock()
@@ -472,9 +474,13 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
                      f"launched ({type(exc).__name__}: {exc})")
         seen["launch"] = "install"
         return
-    window = _start.window_for(now, inst.zone)
-    for oid in rows:
+    trigger = agent["spec"]["trigger"]
+    for oid, window_key in rows:
         try:
+            # the span a SCHEDULED launch counts manual runs over is the window its own key names, in the signed
+            # trigger's zone (accounting.Limits: "the window for a scheduled launch"), never the manual launch's day
+            lo, hi = _sched.window_span(trigger, trigger["zone"], window_key)
+            window = _ctl.Window(_ctl._stamp(lo), _ctl._stamp(hi), None)
             executor = _ex.DreamExecutor(agent_store_dir=st.directory, occurrence_id=oid,
                                          occ_dir=inst.store_path.parent / "dream" / oid, route="claude",
                                          model=inst.model, facts_path=inst.facts_path)
