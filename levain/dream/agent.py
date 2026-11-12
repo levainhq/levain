@@ -525,8 +525,12 @@ def _row_time(r: Mapping[str, Any]) -> str:
 
 def classify_window(rows: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
     """``(class, detail)`` of a closed window's scheduled rows with no ``done``: ``failed`` (a run failed or stopped,
-    launched or not),``laptop-slept`` (every slot missed), or the class of the LAST skipped slot's recorded reason. A class of
-    ``""`` is a quiet day that is not news. An unrecognised reason is its own class, so it is filed."""
+    launched or not), ``not-launched`` (every slot missed, and at least one was claimed while the laptop was awake and
+    never launched: the controller recorded ``never_launched``, ``input_unreadable`` or ``no_slot``), ``laptop-slept``
+    (every slot missed, none of them for one of those reasons), or the class of the LAST skipped slot's recorded reason.
+    A class of ``""`` is a quiet day that is not news. An unrecognised reason is its own class, so it is filed."""
+    from levain.agents import controller as _ctl
+
     # a run that died at the claim or the fence never launched; it is still a run that failed
     launched = [r for r in rows if r.get("state") in ("failed", "stopped")]
     if launched:
@@ -534,6 +538,13 @@ def classify_window(rows: Sequence[Mapping[str, Any]]) -> tuple[str, str]:
         return "failed", f"{last.get('state')}: {last.get('reason') or 'no reason recorded'}"
     live = [r for r in rows if r.get("state") not in ("missed",)]
     if rows and not live:
+        # a slot the tick claimed and could not launch until its grace is not a slept laptop, and does not clear by
+        # itself: the reason the controller wrote is kept (1111-38 L2: it was thrown away and the card said "nothing")
+        held = sorted((r for r in rows if r.get("reason") in (_ctl.NEVER_LAUNCHED, _ctl.INPUT_UNREADABLE, "no_slot")),
+                      key=_row_time)
+        if held:
+            return "not-launched", (f"{len(held)} of {len(rows)} slot(s) were claimed and never launched; the last "
+                                    f"ended missed: {held[-1].get('reason')}")
         return "laptop-slept", "the laptop slept"
     skipped = sorted((r for r in rows if r.get("state") == "skipped-no-input"), key=_row_time)
     if not skipped:
@@ -630,7 +641,8 @@ def window_remedy(cls: str, store_path: Path | str, *, agent_dir: Path | str | N
     night does). "Nothing needs doing by hand" is said only for a night that clears by itself: ``laptop-slept``,
     ``attempt-spent``, ``ceiling`` (and a quiet day that is not news, which files no card). Every other class needs a
     person: an ``unreadable`` night names ``levain dream ready`` (it prints the failing check) and the hand start for
-    after it passes; ``unknown``, ``in-flight``, ``live-seat`` and any class not listed here name ``levain agents show
+    after it passes; a ``not-launched`` night (slots claimed and never launched) names ``levain agents show dream``, the
+    tick that names each launch failure, ``levain dream ready`` and the hand start; ``unknown``, ``in-flight``, ``live-seat`` and any class not listed here name ``levain agents show
     dream`` and ``levain dream start`` (an ``admitted`` hand start left behind keeps every window from running, and the
     verb resumes it, or ends it when it is from an earlier day) beside ``levain dream ready``. ``agent_id`` is the
     registered agent's id, which ``levain dream ready`` needs to find the dream's occurrences.
@@ -680,6 +692,13 @@ def window_remedy(cls: str, store_path: Path | str, *, agent_dir: Path | str | N
     if cls == "ceiling" or cls in NOT_NEWS:
         return f"nothing needs doing by hand; {again}."
     ready, start, show, add = _person_commands(store_path, agent_dir, install, agent_id)
+    if cls == "not-launched":
+        tick = show[: -len("show dream")] + "tick"
+        return (f"The night's slots were claimed while the laptop was awake and none of them launched, so the dream did "
+                f"not run; this does not clear by itself. `{show}` lists the dream's occurrences and the reason each "
+                f"ended with; the tick named why each launch failed on its stderr (`{tick}` run by hand prints it, and "
+                f"exits 6 while it fails); `{ready}` prints the day-ready check that fails, if one does. Once the cause "
+                f"is fixed, {again}, or `{start}`{add} runs it now under the same signed link.")
     if cls == "unreadable":
         return (f"The dream could not read one of its sources, so it stays quiet every night until it can; this does "
                 f"not clear by itself. `{ready}` prints the check that fails and what it could not read. Once that "
