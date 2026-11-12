@@ -64,7 +64,7 @@ def _pushes_value(s: dict[str, Any]) -> bool:
     """Whether the driver (tests/_page_drive.mjs, its if-chain over the step's key, in this order) appends one entry to
     `values` for this step. `_drive` needs it to find where an injected diag step's answer sits; it checks the answer
     there, so a drift of this mirror from the driver fails loudly rather than dropping a real value."""
-    for k in ("authenticator", "user_verified", "init", "emulate", "scheme", "key"):
+    for k in ("authenticator", "user_verified", "init", "emulate", "scheme", "no_sw", "key"):
         if k in s:
             return False
     if "tap" in s:

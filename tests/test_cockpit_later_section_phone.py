@@ -119,7 +119,9 @@ def test_the_lists_later_group_tag_is_one_line_on_a_phone(tmp_path: Path, monkey
     shots = _shots()
     prefix = os.environ.get("LEVAIN_LATER_SECTION_PREFIX", "section")
     widths = (430, 390, 200)
-    steps: list = []
+    # This test measures a layout fact at three widths and has no use for the page's service worker; each reload below navigates the
+    # page, and a navigation that goes through a worker still installing can fail to commit. Asking for no worker keeps the reloads plain.
+    steps: list = [{"no_sw": True}]
     for w in widths:
         steps += [{"emulate": {"w": w, "h": 844, "dpr": 2, "mobile": True}}, {"eval": "location.reload(); 1"},
                   {"until": "!!document.querySelector('[data-ck-panel=tray] [data-list-more]')", "ms": 30000},

@@ -24,6 +24,10 @@
 // The fixed settle sleeps (emulate / scheme / motion / key) are not scaled.
 // A failing wait also saves timeout-step-<n>.png (+ .txt, the page text) beside the steps file and names it on stderr.
 //   {"emulate": {"w": <px>, "h": <px>, "dpr": <n>, "mobile": <bool>, "safe": {"top","bottom","left","right"} optional}}   a device size, applied before the page is drawn again
+//   {"no_sw": true}                         from this step on, the page's navigations and fetches skip the service worker (CDP
+//                                            Network.setBypassServiceWorker): a drive whose subject has nothing to do with the worker asks for it, so a
+//                                            reload cannot race the worker's install / activate / claim; nothing is collected. It does not stop the
+//                                            page registering the worker. A step before the first load cannot undo what the first load did
 //   {"scheme": "dark"|"light"}              the phone's colour-scheme setting (prefers-color-scheme), applied before the next read
 //   {"motion": "reduce"|"no-preference"}    the phone's reduce-motion setting (prefers-reduced-motion); it keeps a scheme step's setting
 //   {"init": "<js source>"}                 runs before the page's own scripts on every later load, then reloads the page once (a
@@ -344,7 +348,7 @@ let authenticatorId = null;   // the virtual authenticator an `authenticator` st
 // parts themselves says `"partial": true`.
 let boardWaitGaveUp = false;
 const WHOLE_BOARD = "(() => { try { return document.readyState === 'complete' && (!document.getElementById('board') || document.documentElement.hasAttribute('data-board-whole')); } catch (e) { return false; } })()";
-const SETUP_STEPS = ["authenticator", "user_verified", "init", "emulate", "scheme"];
+const SETUP_STEPS = ["authenticator", "user_verified", "init", "emulate", "scheme", "no_sw"];
 const waitForWholeBoard = async () => {
   for (const end = Date.now() + scaled(15000); Date.now() < end;) {
     const o = await evaluateOutcome(WHOLE_BOARD, Math.min(Math.max(end - Date.now(), 250), 1500));
@@ -433,6 +437,9 @@ for (const s of steps) {
       if (Date.now() >= end) throw new Error("init: the reload did not complete");
       await sleep(100);
     }
+  } else if (s.no_sw !== undefined) {
+    const set = await send("Network.setBypassServiceWorker", { bypass: !!s.no_sw });
+    if (set.error) throw new Error("no_sw: the service worker bypass was refused: " + JSON.stringify(set.error));
   } else if (s.emulate !== undefined) {
     await send("Emulation.setDeviceMetricsOverride", { width: s.emulate.w, height: s.emulate.h, deviceScaleFactor: s.emulate.dpr || 1, mobile: !!s.emulate.mobile });
     if (s.emulate.safe) await send("Emulation.setSafeAreaInsetsOverride", { insets: s.emulate.safe });   // the iPhone notch / status bar / home indicator

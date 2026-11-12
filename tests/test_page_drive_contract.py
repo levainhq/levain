@@ -243,3 +243,19 @@ def test_a_timeout_after_a_reload_says_how_the_worker_wait_ended_and_where_the_t
     assert re.search(r"WORKER WAITS: settled after \d+ms/\d+ polls \(last settled, \d+ms ago\)", block), r.stderr
     assert re.search(r"NAVIGATION: events=\d+ loads=\d+", block), r.stderr
     assert f'TARGET (browser\'s /json): page url="{url}"' in block, r.stderr
+
+
+@needs_browser
+def test_a_no_sw_step_keeps_later_loads_out_of_the_pages_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Same page and slow worker as above. Without the step a reloaded document is controlled by the worker (the control arm, so this test
+    # cannot pass on a page that is never controlled); with `no_sw` first the reloaded document is not.
+    monkeypatch.setenv("LEVAIN_DRIVE_FULL_CHROME", "1")
+    # a mark on the old document tells the reloaded one apart from it
+    reload_then_read = [{"eval": "window.__old = 1"}, {"eval": "location.reload(); 1"},
+                        {"until": "document.readyState === 'complete' && window.__old === undefined", "ms": 20000},
+                        {"eval": "navigator.serviceWorker.controller === null"}]
+    with _worker_site() as url:
+        control = _drive_at(tmp_path, url, reload_then_read, timeout=90)
+        bypassed = _drive_at(tmp_path, url, [{"no_sw": True}, *reload_then_read], timeout=90)
+    assert control.returncode == 0 and json.loads(control.stdout)["values"][-1] is False, (control.stderr, control.stdout)
+    assert bypassed.returncode == 0 and json.loads(bypassed.stdout)["values"][-1] is True, (bypassed.stderr, bypassed.stdout)
