@@ -310,13 +310,13 @@ def test_a_night_with_a_wrap_left_open_files_one_card_and_a_second_such_night_fi
     day1, day2 = date(2026, 10, 30), date(2026, 10, 31)
     n.run(day1)
     after = datetime(2026, 10, 31, 5, 0, tzinfo=NY)
-    r1 = da.close_window(agent_id=AID, day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED, occ_dir=tmp_path)
+    r1 = da.close_window(agent_id=AID, day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED, occ_dir=tmp_path, store_path=n.ent.db)
     assert r1.action == "filed" and r1.cls == "wrap-open"
     assert r1.action == "filed" and len(filed(rs)) == 1
-    again = da.close_window(agent_id=AID, day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
+    again = da.close_window(agent_id=AID, day=day1, now=after, zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED, store_path=n.ent.db)
     assert again.action == "duplicate"
     n.run(day2)
-    r2 = da.close_window(agent_id=AID, day=day2, now=after + timedelta(days=1), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
+    r2 = da.close_window(agent_id=AID, day=day2, now=after + timedelta(days=1), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED, store_path=n.ent.db)
     assert r2.action == "standing" and len(filed(rs)) == 1
     item = filed(rs)[0]
     assert item.body["kind"] == "did-not-consolidate" and item.body["reason"].startswith("wrap-open: night did not")
@@ -332,10 +332,10 @@ def test_a_cleared_standing_item_lets_the_next_night_file_again(tmp_path):
     d1, d2 = date(2026, 10, 30), date(2026, 10, 31)
     n.run(d1)
     n.run(d2)
-    da.close_window(agent_id=AID, day=d1, now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
+    da.close_window(agent_id=AID, day=d1, now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED, store_path=n.ent.db)
     first = filed(rs)[0]
     review.clear_item(rs, first.item_id, mode="manual")
-    r = da.close_window(agent_id=AID, day=d2, now=datetime(2026, 11, 1, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED)
+    r = da.close_window(agent_id=AID, day=d2, now=datetime(2026, 11, 1, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(), review_store=rs, feed=FEED, store_path=n.ent.db)
     assert r.action == "filed" and len(filed(rs, include_cleared=True)) == 2
 
 
@@ -347,7 +347,7 @@ def test_a_failing_night_files_exactly_one_failed_card_not_one_per_slot(tmp_path
     q.mkdir(mode=0o700)
     rs = CoordStore(q)
     r = da.close_window(agent_id=AID, day=date(2026, 10, 30), now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(),
-                        review_store=rs, feed=FEED)
+                        review_store=rs, feed=FEED, store_path=n.ent.db)
     assert r.action == "filed" and r.cls == "failed" and "budget" in r.detail
     assert len(filed(rs)) == 1
 
@@ -359,7 +359,7 @@ def test_a_quiet_day_with_nothing_to_consolidate_files_no_card(tmp_path):
     q = tmp_path / "q"
     q.mkdir(mode=0o700)
     r = da.close_window(agent_id=AID, day=date(2026, 10, 30), now=datetime(2026, 10, 31, 5, 0, tzinfo=NY), zone=ZONE, rows=n.rows(),
-                        review_store=CoordStore(q), feed=FEED)
+                        review_store=CoordStore(q), feed=FEED, store_path=n.ent.db)
     assert r.action == "quiet-day" and r.cls == ""
 
 
@@ -378,11 +378,13 @@ def rs(tmp_path):
 
 
 CLOSED = datetime(2026, 10, 31, 5, 0, tzinfo=NY)
+STORE_PATH = "/scratch/store/memory.db"      # close_window needs the install's memory.db (D1-N: required, no default)
 
 
 def close(rs, rows, **kw):
     kw.setdefault("now", CLOSED)
     kw.setdefault("agent_id", AID)
+    kw.setdefault("store_path", STORE_PATH)
     return da.close_window(day=date(2026, 10, 30), zone=ZONE, rows=rows, review_store=rs, feed=FEED, **kw)
 
 
@@ -439,7 +441,7 @@ def test_missed_rows_alone_are_a_slept_laptop(rs):
 
 def test_without_the_agent_feed_the_card_is_refused_and_nothing_is_filed(rs):
     r = da.close_window(agent_id=AID, day=date(2026, 10, 30), now=CLOSED, zone=ZONE, review_store=rs,
-                        rows=[row("skipped-no-input", reason="quiet/live-seat: s")])
+                        store_path=STORE_PATH, rows=[row("skipped-no-input", reason="quiet/live-seat: s")])
     assert (r.action == "refused") == ("agent" not in review.FEEDS)
     if r.action == "refused":
         assert review.list_items(rs) == [] and r.why
@@ -462,17 +464,42 @@ def test_the_pause_names_the_two_failures_and_the_resume_command_once_per_key():
 
 def test_the_renewal_card_comes_three_days_out_once_and_is_his_to_clear(rs):
     seen = []
-    link = {"id": "al-0123456789ab", "expires_at": "2026-11-20T00:00:00Z"}
+    # the authority log's one stamp form carries microseconds; a link read from the log is never the short form
+    link = {"id": "al-0123456789ab", "expires_at": "2026-11-20T00:00:00.000000Z"}
     att = lambda k, t: seen.append(k)   # noqa: E731
-    assert da.renewal_check(link, now=utc(2026, 11, 16), review_store=rs, attention=att, feed=FEED).action == "not-due"
-    r = da.renewal_check(link, now=utc(2026, 11, 17, 1), review_store=rs, attention=att, feed=FEED)
+    root = "/scratch/cockpit"
+    kw = dict(review_store=rs, attention=att, feed=FEED, data_root=root)
+    assert da.renewal_check(link, now=utc(2026, 11, 16), **kw).action == "not-due"
+    r = da.renewal_check(link, now=utc(2026, 11, 17, 1), **kw)
     assert r.action == "filed" and 2.9 < r.days_left < 3
-    assert da.renewal_check(link, now=utc(2026, 11, 18), review_store=rs, attention=att, feed=FEED).action == "duplicate"
+    assert da.renewal_check(link, now=utc(2026, 11, 18), **kw).action == "duplicate"
     item = filed(rs)[0]
     assert item.authority_relevant is True and item.body["kind"] == "renewal-due" and seen == []
-    assert da.renewal_check(link, now=utc(2026, 11, 20), review_store=rs, attention=att, feed=FEED).action == "expired"
+    assert "--data-root /scratch/cockpit" in item.body["remedy"]
+    assert da.renewal_check(link, now=utc(2026, 11, 20), **kw).action == "expired"
     assert seen == ["dream-link-expired:al-0123456789ab"]
-    assert da.renewal_check({"id": "x"}, now=utc(2026, 11, 20), review_store=rs, attention=att).action == "refused"
+    assert da.renewal_check({"id": "x"}, now=utc(2026, 11, 20), **kw).action == "refused"
+    # the short form the log never writes is refused, not guessed at
+    assert da.renewal_check({**link, "expires_at": "2026-11-20T00:00:00Z"}, now=utc(2026, 11, 20), **kw).action == "refused"
+
+
+def test_the_store_path_is_a_required_argument_of_close_window_and_window_remedy():
+    """L3 N1: close_window had no production caller, and its first caller would not have passed store_path, so the card
+    would have printed a placeholder where the --db path goes. Required, with no default, turns that into a refusal."""
+    import inspect
+
+    close = inspect.signature(da.close_window).parameters["store_path"]
+    remedy = inspect.signature(da.window_remedy).parameters["store_path"]
+    assert close.default is inspect.Parameter.empty and remedy.default is inspect.Parameter.empty
+    with pytest.raises(TypeError):
+        da.window_remedy("wrap-open")                                    # type: ignore[call-arg]
+    for bad in (None, "", "  "):
+        with pytest.raises(ValueError):
+            da.window_remedy("wrap-open", bad)
+        with pytest.raises(ValueError):
+            da.close_window(agent_id=AID, day=date(2026, 10, 30), now=CLOSED, zone=ZONE, rows=[], review_store=None,
+                            store_path=bad)
+    assert "<the store's memory.db>" not in Path(da.__file__).read_text(encoding="utf-8")
 
 
 def test_the_drill_runs_on_its_own_seven_day_cadence_and_only_with_a_snapshot(scratch_store):
@@ -692,7 +719,8 @@ def test_the_input_check_and_the_filer_take_the_agent_id_from_the_row_and_never_
     gone = {k: v for k, v in occurrence_row().items() if k != "agent_id"}
     assert not da.day_ready(ent.db, gone, now=now, zone=ZONE, agent_dir=ent.agent_dir, coord_dir=ent.coord_dir).ok
     with pytest.raises(ValueError):
-        da.close_window(agent_id="", day=date(2026, 10, 30), now=CLOSED, zone=ZONE, rows=[], review_store=None)
+        da.close_window(agent_id="", day=date(2026, 10, 30), now=CLOSED, zone=ZONE, rows=[], review_store=None,
+                        store_path=STORE_PATH)
 
 
 def test_a_prior_failed_run_of_the_registered_agent_is_seen_by_the_input_check(tmp_path):
@@ -734,7 +762,7 @@ def test_a_failed_row_that_never_launched_is_a_failed_window_not_a_quiet_day():
 def test_the_standing_rule_holds_across_three_nights_not_just_two(rs):
     def night(day):
         return da.close_window(agent_id=AID, day=day, now=datetime(day.year, day.month, day.day, 5, tzinfo=NY)
-                               + timedelta(days=1), zone=ZONE, review_store=rs, feed=FEED, rows=[
+                               + timedelta(days=1), zone=ZONE, review_store=rs, feed=FEED, store_path=STORE_PATH, rows=[
             row("skipped-no-input", reason="quiet/live-seat: seat", day=day)])
 
     d1 = date(2026, 10, 30)
