@@ -161,7 +161,8 @@ def test_the_presence_read_does_not_report_a_stopped_key_ready(rig):
     assert cockpit_voice.premium_stt_state(None, rig.root) == "off"
     body = cockpit_voice.serve_voice(rig.root, meter, last_read={})
     row = next(r for r in body["providers"] if r["name"] == "openai")
-    assert (row["key"], row["record_id"], row["uses"]) == ("not_set", None, [])
+    assert (row["key"], row["record_id"], row["uses"]) == ("stopped", None, [])
+    assert row["stopped_why"] == auth.STOPPED_BORN
 
 
 def test_a_dictation_stream_ends_when_its_keys_signer_is_revoked(rig):
