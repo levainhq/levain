@@ -563,13 +563,22 @@ def _open_same_class(review_store: Any, feed: str, agent_id: str, cls: str) -> b
     return False
 
 
-def window_remedy(cls: str, store_path: Path | str | None = None) -> str:
+def _required_store_path(store_path: object) -> str:
+    """``store_path`` as text, or a ValueError: a caller that has no store to name must not get a command that does not
+    run. (L3 N1: a placeholder in place of the --db path reached a card because the argument was optional.)"""
+    if store_path is None or not str(store_path).strip():
+        raise ValueError("the install's memory.db path is required: the anneal commands on the card need --db, and "
+                         "without it anneal reads another store")
+    return str(store_path)
+
+
+def window_remedy(cls: str, store_path: Path | str) -> str:
     """The next step a did-not-consolidate card names for class ``cls``, every command in it one that exists and runs as
     printed. There is NO verb that starts a dream by hand (``levain agents`` has no run-now, and ``levain dream run``
     is for a store COPY), so no class names one: the dream tries again in its next window by itself.
 
-    ``store_path`` is the install's ``memory.db``; the anneal commands need it (``--db``: without it anneal reads
-    ``~/.anneal-memory``, another store), so the text carries it when known and a plain placeholder when not. An open
+    ``store_path`` is the install's ``memory.db`` and is REQUIRED; the anneal commands need it (``--db``: without it
+    anneal reads ``~/.anneal-memory``, another store). An open
     wrap keeps the dream from starting, whoever opened it, and nothing on the scheduled path clears it (the executor
     clears a stale one only after a run has been admitted, and an open wrap is a refusal at admission), so a dead
     seat's wrap is a person's to clear, with anneal's own two commands."""
@@ -577,7 +586,7 @@ def window_remedy(cls: str, store_path: Path | str | None = None) -> str:
 
     again = "the dream tries again in its next window"
     anneal = anneal_invocation()
-    db = shlex.quote(str(store_path)) if store_path is not None else "<the store's memory.db>"
+    db = shlex.quote(_required_store_path(store_path))
     if cls == "wrap-open":
         return (f"A wrap is open on the store, so the dream does not start, and nothing in the dream clears one. If a "
                 f"live seat opened it, leave it: it ends when that seat saves or cancels. If that seat is dead, look at "
@@ -596,14 +605,15 @@ def window_remedy(cls: str, store_path: Path | str | None = None) -> str:
 
 
 def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Sequence[Mapping[str, Any]],
-                 review_store: Any, occ_dir: Path | str | None = None, miss_streak: int = 0,
+                 review_store: Any, store_path: Path | str, occ_dir: Path | str | None = None, miss_streak: int = 0,
                  missed_windows: Sequence[str] = (),
                  attention: Callable[[str, str], None] | None = None, feed: str = CARD_FEED,
-                 remedy: str | None = None, store_path: Path | str | None = None) -> CloseResult:
+                 remedy: str | None = None) -> CloseResult:
     """The first pass after window ``day`` closes. Files at most one did-not-consolidate card for the window, never one
     per slot. ``rows`` are the agent's occurrence rows (any window; this selects its scheduled rows of ``day``).
-    ``remedy`` is the card's next step; omitted, :func:`window_remedy` writes it for the night's class, carrying
-    ``store_path`` (the install's ``memory.db``) so the commands it prints run as printed.
+    ``store_path`` (the install's ``memory.db``) is REQUIRED, with no default: ``remedy`` is the card's next step and,
+    omitted, :func:`window_remedy` writes it for the night's class carrying ``store_path``, so the commands it prints
+    run as printed.
 
     * The window is closed only from the next dream-day's start (05:00 local); before that, or while any row of the
       window is ``admitted`` or ``launched``, nothing is decided (the in-flight gate).
@@ -618,6 +628,7 @@ def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Se
     A card that cannot be filed (the ``agent`` feed is P8's) is ``refused``, with nothing filed."""
     if not isinstance(agent_id, str) or not agent_id.strip():
         raise ValueError("close_window needs the registered agent's id")
+    _required_store_path(store_path)
     key = _ready.window_key_for(day)
     out = CloseResult("waiting", key)
     if now.tzinfo is None:
@@ -687,16 +698,23 @@ class RenewalResult:
     why: str = ""
 
 
-def renewal_check(link: Mapping[str, Any], *, now: datetime, review_store: Any,
+def renewal_check(link: Mapping[str, Any], *, now: datetime, review_store: Any, data_root: Path | str,
                   attention: Callable[[str, str], None], feed: str = CARD_FEED,
                   days_before: int = RENEW_DAYS_BEFORE) -> RenewalResult:
-    """F14. ``link`` has ``id`` and ``expires_at`` (a UTC stamp). Within ``days_before`` days of expiry, one renewal card
-    (``authority_relevant``: the renewal is his signature), once per link and expiry; at or past it, one attention row."""
+    """F14. ``link`` has ``id`` and ``expires_at`` (a UTC stamp in the authority log's one form,
+    ``levain.cockpit.consent.utc_stamp``). Within ``days_before`` days of expiry, one renewal card
+    (``authority_relevant``: the renewal is his signature), once per link and expiry; at or past it, one attention row.
+    ``data_root`` is the cockpit's data root (the install's ``cockpit_root``), REQUIRED: the card's command names it.
+    The signing key is the one thing the card cannot know: it is his, and the card says so."""
+    from levain.cockpit.consent import ConsentError, parse_stamp
+
     try:
-        expires = datetime.strptime(str(link["expires_at"]), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        expires = parse_stamp(str(link["expires_at"]))     # the log's form has microseconds; strptime of "...SZ" refused every real one
         link_id = str(link["id"])
-    except (KeyError, ValueError) as exc:
+    except (KeyError, ValueError, ConsentError) as exc:
         return RenewalResult("refused", 0.0, f"the link record cannot be read ({type(exc).__name__})")
+    if data_root is None or not str(data_root).strip():
+        raise ValueError("the cockpit data root is required: the renewal command names it")
     left = (expires - now).total_seconds() / 86400
     if left <= 0:
         attention(f"dream-link-expired:{link_id}", f"the dream's link {link_id} expired at {link['expires_at']}; "
@@ -708,7 +726,8 @@ def renewal_check(link: Mapping[str, Any], *, now: datetime, review_store: Any,
 
     body = {"kind": "renewal-due", "link": link_id, "expires_at": str(link["expires_at"]),
             "reason": f"the dream's link {link_id} expires {link['expires_at']}; its renewal is his signature",
-            "remedy": f"levain agents renew {link_id} --data-root <cockpit data root> --signing-key <key> --days 29"}
+            "remedy": (f"levain agents renew {link_id} --data-root {shlex.quote(str(data_root))} "
+                       "--signing-key <your signing key file> --days 29")}
     try:
         _, new = review.file_item(review_store, feed, body, dedupe_key=f"dream-renew:{link_id}:{link['expires_at']}",
                                   authority_relevant=True)
