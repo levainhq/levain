@@ -542,18 +542,18 @@ LAZY_SITES = {
     'levain/agents/accounting.py::count_span::from levain.agents import schedule': 'root',
     # root: ``read_allow`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
     'levain/slot/runtime_helper.py::read_allow::from levain.slot import store_verbs as SV': 'root',
-    # root: ``Supervisor._allow_file`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
-    'levain/slot/supervisor.py::Supervisor._allow_file::from levain.slot import slot_allow': 'root',
-    # root: ``Supervisor._file_allow_rows`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
-    'levain/slot/supervisor.py::Supervisor._file_allow_rows::from levain.slot import slot_allow': 'root',
-    # root: ``Supervisor._read_allow`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
-    'levain/slot/supervisor.py::Supervisor._read_allow::from levain.slot.slot_allow import AllowRefused': 'root',
-    # root: ``Supervisor._with_slot_allow`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
-    'levain/slot/supervisor.py::Supervisor._with_slot_allow::from levain.consent.questions import QuestionStore': 'root',
-    # root: ``Supervisor._with_slot_allow`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
-    'levain/slot/supervisor.py::Supervisor._with_slot_allow::from levain.slot import slot_allow': 'root',
-    # root: ``run_session`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
-    'levain/slot/supervisor.py::run_session::from levain.consent.queue import default_queue_dir': 'root',
+    # operator: ``Supervisor._allow_file`` <- ``_with_slot_allow`` / ``_file_allow_rows``, the interactive supervisor's own code (``Supervisor.run`` refuses uid 0, ``supervisor-is-root``), the operator uid's process; the dispatch run server imports the module for its names and never builds a ``Supervisor``
+    'levain/slot/supervisor.py::Supervisor._allow_file::from levain.slot import slot_allow': 'operator',
+    # operator: ``Supervisor._file_allow_rows`` <- ``Supervisor._teardown`` <- ``Supervisor.run``, the interactive supervisor's own code, the operator uid's process (it calls root only through ``self.helper("read-allow")``, i.e. sudo)
+    'levain/slot/supervisor.py::Supervisor._file_allow_rows::from levain.slot import slot_allow': 'operator',
+    # operator: ``Supervisor._read_allow`` <- ``_file_allow_rows`` <- ``_teardown`` <- ``Supervisor.run``, the operator uid's process; root's half is ``runtime_helper.read_allow``, reached through sudo
+    'levain/slot/supervisor.py::Supervisor._read_allow::from levain.slot.slot_allow import AllowRefused': 'operator',
+    # operator: ``Supervisor._with_slot_allow`` <- ``Supervisor.run`` (after its uid-0 refusal), the interactive supervisor's own code, the operator uid's process
+    'levain/slot/supervisor.py::Supervisor._with_slot_allow::from levain.consent.questions import QuestionStore': 'operator',
+    # operator: ``Supervisor._with_slot_allow`` <- ``Supervisor.run`` (after its uid-0 refusal), the interactive supervisor's own code, the operator uid's process
+    'levain/slot/supervisor.py::Supervisor._with_slot_allow::from levain.slot import slot_allow': 'operator',
+    # operator: ``run_session`` <- ``levain.slot.launch.main`` (``levain session``, registered by ``cli.py``), the operator's interpreter; no root entry imports ``levain.slot.launch``
+    'levain/slot/supervisor.py::run_session::from levain.consent.queue import default_queue_dir': 'operator',
 }
 _NEEDLES = ("run_module(", "module_argv(", "import_module(", "__import__(")
 
