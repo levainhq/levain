@@ -143,6 +143,9 @@ dependencies = [
     # `<1.1` (2026-11-07): `levain.keep_migrate._add_verbatim` calls three PRIVATE anneal IntentionStore methods (_prepare_add,
     # _find_by_origin_key, _add_locked), pinned by tests/test_keep_migrate.py. A new anneal minor is where such a change could
     # land, so levain takes it deliberately (re-run that test, raise the cap) rather than resolving to it on install.
+    # The dream's post record (`levain.dream.snapshot.reinsertion_proof`) relies the same way on
+    # `anneal_memory.durable.enforce_durable_facts` and its `DurableReport` fields, which that module's `__all__` does
+    # not export; the `<1.1` cap is why that is acceptable (re-run tests/test_dream_o1_reinsert.py before raising it).
     # `>=1.0.4,<2` (2026-11-07, TS-64): anneal 1.0.4 accepts a TIMED `next` on an intention (`YYYY-MM-DDTHH:MM`, local, no zone,
     # minute precision; a bare date still works), which `_validate_surface_at` and the cockpit's `_norm_date` now pass
     # through. No migration-manifest entry, so TEMPLATES_RECONCILED_ANNEAL stays 1.0.2. KNOWN_GOOD_ANNEAL moves with this floor.
