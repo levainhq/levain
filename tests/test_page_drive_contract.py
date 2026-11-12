@@ -176,3 +176,46 @@ def test_a_timeout_prints_the_page_state_after_its_named_line_and_keeps_the_exit
                   "--- end page state ---"):
         assert label in block, (label, r.stderr)
     assert len(block) < 4100, len(block)
+
+
+_SLOW_WORKER = "self.addEventListener('install', () => self.skipWaiting());\nself.addEventListener('activate', (e) => e.waitUntil(new Promise((r) => setTimeout(r, 1200)).then(() => self.clients.claim())));\n"
+_WORKER_PAGE = ("<!doctype html><title>w</title><p>w</p><script>navigator.serviceWorker.register('/sw.js', {scope: '/'});\n"
+                "addEventListener('beforeunload', () => sessionStorage.setItem('ctl', String(!!navigator.serviceWorker.controller)));</script>")
+
+
+@needs_browser
+def test_an_eval_that_reloads_waits_for_the_pages_worker_to_take_control(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # CI, the List LATER phone test, 1 run in 4: the page reloaded while its worker was still installing, the navigation never committed and
+    # the page stopped answering (reproduced at a 10x CPU throttle: 11 of 27 runs; 0 of 14 with the wait). The `init` step has always waited
+    # for the worker before its reload; an `eval` that reloads waits the same way. The worker here takes 1200 ms to activate, so a reload
+    # sent at once reads no controller at the moment the page unloads; a reload that waited reads one.
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            body, ctype = (_SLOW_WORKER, "text/javascript") if self.path == "/sw.js" else (_WORKER_PAGE, "text/html")
+            raw = body.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *a: object) -> None:
+            pass
+
+    monkeypatch.setenv("LEVAIN_DRIVE_FULL_CHROME", "1")                  # headless-shell has no service worker; this drive declares it needs one
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        r = _drive_at(tmp_path, f"http://127.0.0.1:{httpd.server_address[1]}/",
+                      [{"eval": "location.reload(); 1"}, {"until": "document.readyState === 'complete' && sessionStorage.getItem('ctl') !== null", "ms": 20000},
+                       {"eval": "sessionStorage.getItem('ctl')"}], timeout=90)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["values"][-1] == "true", r.stdout

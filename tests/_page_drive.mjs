@@ -342,6 +342,28 @@ const waitForWholeBoard = async () => {
   boardWaitGaveUp = true;
   console.error("page-drive: the board never said it was whole within the bound; later steps will not wait for it");
 };
+// The same race belongs to ANY reload of a page that has just loaded, not only the `init` step's: an `eval` that reloads waits for the worker first.
+const awaitWorkerSettled = async () => {
+  // A page that registers a service worker at load (the cockpit's /sw.js) is still INSTALLING it when the load event fires. Reloading
+  // while it installs races the worker's install -> activate -> clients.claim against the reload's navigation: measured, under heavy
+  // machine load, the reload's document response arrived, the worker activated in that same instant, and the navigation never
+  // committed (no Page.frameNavigated, and every Runtime.evaluate queued behind it for 60 s). So a reload waits, bounded, until the
+  // worker the page registered has settled (activated and in control); a page with no registration passes at once. Not fatal: a worker
+  // that never takes control only costs this bounded wait, and the reload is then sent as before.
+  // No registration is NOT settled at once: register() is asynchronous, so under load the first poll can run before the page's own
+  // registration exists. "No registration" counts only after it has been seen on 8 polls in a row (a page with no worker
+  // pays that short wait); a registration that has appeared is waited for until it is activated and in control.
+  let absent = 0;
+  for (const end = Date.now() + scaled(5000);;) {
+    const state = await evaluate("(async () => { const sw = navigator.serviceWorker; if (!sw) return 'none'; const r = await sw.getRegistration();"
+      + " if (!r) return 'absent'; return (!r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller) ? 'settled' : 'pending'; })()");
+    if (state === "none" || state === "settled" || Date.now() >= end) break;
+    absent = state === "absent" ? absent + 1 : 0;
+    if (absent >= 8) break;
+    await sleep(50);
+  }
+};
+const RELOADS_PAGE = /\blocation\.reload\b/;
 for (const s of steps) {
   if (!s.partial && !boardWaitGaveUp && !SETUP_STEPS.some((k) => s[k] !== undefined)) await waitForWholeBoard();
   const waitMs = scaled(s.ms || 20000);
@@ -376,24 +398,7 @@ for (const s of steps) {
       if (Date.now() >= end) throw new Error("init: the first load did not complete");
       await sleep(100);
     }
-    // A page that registers a service worker at load (the cockpit's /sw.js) is still INSTALLING it when the load event fires. Reloading
-    // while it installs races the worker's install -> activate -> clients.claim against the reload's navigation: measured, under heavy
-    // machine load, the reload's document response arrived, the worker activated in that same instant, and the navigation never
-    // committed (no Page.frameNavigated, and every Runtime.evaluate queued behind it for 60 s). So the reload waits, bounded, until the
-    // worker the page registered has settled (activated and in control); a page with no registration passes at once. Not fatal: a worker
-    // that never takes control only costs this bounded wait, and the reload is then sent as before.
-    // No registration is NOT settled at once: register() is asynchronous, so under load the first poll can run before the page's own
-    // registration exists. "No registration" counts only after it has been seen on 8 polls in a row (a page with no worker
-    // pays that short wait); a registration that has appeared is waited for until it is activated and in control.
-    let absent = 0;
-    for (const end = Date.now() + scaled(5000);;) {
-      const state = await evaluate("(async () => { const sw = navigator.serviceWorker; if (!sw) return 'none'; const r = await sw.getRegistration();"
-        + " if (!r) return 'absent'; return (!r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller) ? 'settled' : 'pending'; })()");
-      if (state === "none" || state === "settled" || Date.now() >= end) break;
-      absent = state === "absent" ? absent + 1 : 0;
-      if (absent >= 8) break;
-      await sleep(50);
-    }
+    await awaitWorkerSettled();
     await evaluate("window.__driveOldDocument = true");   // a mark the reloaded document will not carry
     const reloaded = await send("Page.reload", {});
     if (reloaded.error) throw new Error("init: the reload was refused: " + JSON.stringify(reloaded.error));
@@ -599,6 +604,7 @@ for (const s of steps) {
     values.push(v || { timeout: s.until });
   } else {
     const before = navStarts;
+    if (RELOADS_PAGE.test(String(s.eval))) await awaitWorkerSettled();
     const o = await evaluateOutcome(s.eval);
     if ("error" in o && isNavigationError(o.error)) {
       // a navigation-class error counts as "the eval navigated" only when the page really began a navigation during it
