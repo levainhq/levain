@@ -226,7 +226,7 @@ if (!ws) {
   pageWsUrl = targets.find((t) => t.type === "page").webSocketDebuggerUrl;
   ws = await within(openSocket(pageWsUrl, "chrome's page"), 15000, "the page websocket");
 }
-let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = [];   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts
+let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = []; const workerWaits = [];   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts; workerWaits: how each awaitWorkerSettled ended (the last 10)
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
@@ -295,8 +295,21 @@ const timeoutBlock = async (shotPath) => {
   try {
     const probe = await evaluateOutcome("(() => { try { const m = document.querySelector('#levain-modal'); return JSON.stringify({ url: location.href, ready: document.readyState, modal: !!m, rows: m ? m.querySelectorAll('[data-question-row]').length : null, text: String((document.body && document.body.innerText) || '').slice(0, 600) }); } catch (e) { return JSON.stringify({ probe_error: String(e) }); } })()", 3000);
     let o = {}; try { o = JSON.parse(probe.value); } catch { o = { probe_error: probe.error || "no answer" }; }
+    // What the page's evaluation cannot say when the page does not answer: how the service-worker waits before reloads ended, how many
+    // navigation / load events this connection saw, and the url the BROWSER holds for this page's target (the /json endpoint answers
+    // from the browser process, so an empty url there is a navigation that never committed, not a page that is merely busy).
+    const waits = workerWaits.length
+      ? workerWaits.map((w) => `${w.how} after ${w.ms}ms/${w.polls} polls (last ${w.last}, ${Math.max(0, Date.now() - w.at)}ms ago)`).join("; ")
+      : "none run";
+    let target = "unknown";
+    try {
+      const list = await (await fetch(`http://127.0.0.1:${sharedPort || port}/json`, { signal: AbortSignal.timeout(3000) })).json();
+      const mine = list.find((t) => pageWsUrl && String(t.webSocketDebuggerUrl || "").endsWith("/" + String(pageWsUrl).split("/").pop()));
+      target = mine ? `${mine.type} url=${JSON.stringify(String(mine.url).slice(0, 120))} title=${JSON.stringify(String(mine.title || "").slice(0, 40))}` : `not listed among ${list.length} targets`;
+    } catch (e) { target = `/json failed: ${String((e && e.message) || e).slice(0, 80)}`; }
     const lines = ["--- page state at the timeout ---",
       `PAGE URL: ${o.url ?? "?"}`, `READY STATE: ${o.ready ?? "?"}`,
+      `WORKER WAITS: ${waits}`, `NAVIGATION: events=${navStarts} loads=${loads}`, `TARGET (browser's /json): ${target}`,
       `MODAL: #levain-modal exists=${o.modal ?? "?"} [data-question-row] count=${o.rows ?? "?"}` + (o.probe_error ? ` (probe error: ${o.probe_error})` : ""),
       `CONSOLE (last 20 of ${consoleLog.length}):`, ...consoleLog.slice(-20).map((c) => "  " + c),
       "BODY TEXT (first 600):", String(o.text ?? "").replace(/\n{2,}/g, "\n"),
@@ -322,8 +335,7 @@ const shotOnTimeoutInner = async (n, setPath) => {
     if (typeof t.value === "string") writeFileSync(p.replace(/\.png$/, ".txt"), "PAGE STATE: " + (typeof st.value === "string" ? st.value : JSON.stringify(st)) + "\nREFUSALS AND PROMPTS: " + JSON.stringify(trail) + "\n" + t.value);
   } catch {}
 };
-let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)
-// The cockpit draws its first board in parts and the whole draw then REPLACES every node (S4): a step that taps or tags a node on a part loses
+let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)// The cockpit draws its first board in parts and the whole draw then REPLACES every node (S4): a step that taps or tags a node on a part loses
 // it. The page says when its board is the one that stays with a POSITIVE signal, html[data-board-whole] (dashboard_boot.js: set only by the
 // code that has just drawn the whole board, or by a terminal failure; absent is the default); a page with no #board is not the cockpit board
 // and has nothing to wait for. The wait is bounded and not fatal (a page that never says gets its step after the bound, as every step did
@@ -358,17 +370,23 @@ const awaitWorkerSettled = async () => {
   // A register() and a reload sent in the SAME eval are not covered either: the registration does not exist yet when this wait runs.
   // Each probe is raced against the time left (as waitForWholeBoard does), so a page that does not answer cannot stretch the bound to the
   // 60 s evaluate default; an error outcome (the page navigating, no answer) is a retry until the deadline, never "settled".
-  let absent = 0;
-  for (const end = Date.now() + scaled(5000); Date.now() < end;) {
+  // How each wait ENDED is kept (workerWaits, reported by the timeout block): a hang after a reload reads very differently when the wait
+  // left on `settled` than when it ran out its deadline or gave up on an absent registration, and the log alone cannot tell them apart.
+  let absent = 0; let how = "deadline"; let last = "not polled"; let polls = 0; const t0 = Date.now();
+  for (const end = t0 + scaled(5000); Date.now() < end;) {
     const o = await evaluateOutcome("(async () => { const sw = navigator.serviceWorker; if (!sw) return 'none'; const r = await sw.getRegistration();"
       + " if (!r) return 'absent'; return (!r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller) ? 'settled' : 'pending'; })()",
       Math.min(Math.max(end - Date.now(), 250), scaled(1500)));
+    polls++;
+    last = "error" in o ? `error: ${String(o.error).slice(0, 80)}` : String(o.value);
     if ("error" in o) { absent = 0; await sleep(50); continue; }       // "8 in a row" means in a row: an error breaks the run
-    if (o.value === "none" || o.value === "settled") break;
+    if (o.value === "none" || o.value === "settled") { how = o.value; break; }
     absent = o.value === "absent" ? absent + 1 : 0;
-    if (absent >= 8) break;
+    if (absent >= 8) { how = "absent8"; break; }
     await sleep(50);
   }
+  workerWaits.push({ how, last, polls, ms: Date.now() - t0, at: Date.now() });
+  if (workerWaits.length > 10) workerWaits.shift();
 };
 const RELOADS_PAGE = /\blocation\.reload\b/;
 for (const s of steps) {
