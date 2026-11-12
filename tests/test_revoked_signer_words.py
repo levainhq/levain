@@ -524,6 +524,23 @@ def test_t17_a_list_that_cannot_be_read_is_said_and_the_revoke_still_succeeds(wo
     assert world.state().keys[world.fps["a"]].revoked_seq is not None             # and the key is revoked
 
 
+def test_t17_the_note_for_a_fault_in_the_list_is_bounded_and_clean(world, capsys, monkeypatch) -> None:
+    """The fault's text is shown on stderr, so it is cut to a bound and its terminal controls (an escape, a newline) are
+    marked: the note stays one clean line, and the revoke still exits 0."""
+    world.consent("cg-A")
+    text = "bad row \x1b[31mred\x1b[0m\nsecond line " + "x" * 400
+
+    def boom(*_a, **_k):
+        raise RuntimeError(text)
+    monkeypatch.setattr(G, "stopped_by_key", boom)
+    code, out, err = _revoke_cli(world, capsys, "a")
+    assert code == 0 and out.startswith(f"revoked: {world.fps['a']} at seq ")
+    assert "\x1b" not in err and err.count("\n") == 1 and err.endswith("\n")
+    assert "⟨U+001B⟩" in err and "⟨U+000A⟩" in err
+    assert "x" * 161 not in err and "x" * 100 in err             # cut to the bound, not dropped
+    assert world.state().keys[world.fps["a"]].revoked_seq is not None
+
+
 @pytest.mark.parametrize("fault", [RuntimeError("a replay fault"), ValueError("a bad row"),
                                    auth.VerifierUnavailable("ssh-keygen is gone")])
 def test_t17_any_fault_in_the_fresh_read_leaves_the_revoke_succeeded(world, capsys, monkeypatch, fault) -> None:

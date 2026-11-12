@@ -2651,7 +2651,12 @@ def _print_stopped_by_revoke(args: argparse.Namespace, fingerprint: str) -> None
     try:
         lines = stopped_notice(stopped_by_key(_cockpit_root(args), fingerprint, now=_utc_now()))
     except Exception as exc:  # noqa: BLE001 - the revoke already succeeded; a non-zero exit would invite a second one
-        print(f"note: the standing grants this key signed could not be listed ({exc}); `levain consent grant list` "
+        from levain.cockpit.display_safe import visible
+
+        # bounded first (as load_registry bounds a reason), then its unshowable characters marked and the note kept to
+        # one line: an exception's text can carry a path or a value from a log row and must not reach the terminal raw
+        why = visible(str(exc)[:160]).replace("\n", "⟨U+000A⟩").replace("\t", "⟨U+0009⟩")
+        print(f"note: the standing grants this key signed could not be listed ({why}); `levain consent grant list` "
               "shows which are stopped", file=sys.stderr)
         return
     for line in lines:
