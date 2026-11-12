@@ -301,3 +301,27 @@ def test_importlib_call_sites_are_dynamic_sites(tmp_path, monkeypatch):
     monkeypatch.setattr(rc, "DYNAMIC_SITES", {})
     assert rc.dynamic_sites() == ['levain/a.py::<module>::x = importlib.import_module("levain.x")',
                                   'levain/a.py::<module>::y = __import__("levain.y")']  # unclassified until a row names them
+
+
+def test_the_remembered_walk_answers_the_import_functions_exactly_as_the_plain_one_does(monkeypatch):
+    """``_MemoAst._IMPORT_ONLY`` hands two functions the import nodes alone. That is only right while their loops read
+    nothing else, and an edit that made them inspect another node type would silently shrink their input and still pass
+    every test that shares the shortened view. So the same real test files go through both views, and the results are
+    equal."""
+    every = sorted(Path(__file__).resolve().parent.glob("test_*.py"))
+    # a few plain files, and a few that spell a ``levain.`` module as a string (the node type an edit would start reading)
+    files = every[:6] + [p for p in every if '"levain.' in p.read_text(encoding="utf-8")][:6]
+    assert len(set(files)) > 10, files
+
+    def both():
+        out = []
+        for path in files:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            out.append((str(path), rc._levain_imports(tree), rc._test_deps(path, set())))
+        return out
+
+    plain = both()
+    monkeypatch.setattr(rc, "ast", _MemoAst())
+    remembered = both()
+    assert any(deps for _p, _i, deps in plain), "the sample must hold a file with imports, or the comparison proves nothing"
+    assert remembered == plain
