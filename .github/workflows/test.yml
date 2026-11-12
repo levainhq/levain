@@ -241,6 +241,18 @@ jobs:
           path: ${{ runner.temp }}/flake-rerun/
           if-no-files-found: ignore
 
+      - name: Drop links the upload cannot stat
+        # Intent: a failed run must show its own failure, not a second red step from the upload below. Some tests leave a
+        # symlink loop or a dangling link under the basetemp on purpose, and the upload action stats every path its glob
+        # meets (ELOOP, CI run 43282594627). Remove the links that do not resolve. Written as -type l plus test -e rather than
+        # GNU find's -xtype l because that is the one form that also runs on the macOS find; a cleanup that itself fails
+        # stays red, so the cause is named and not hidden behind the upload's error.
+        if: failure()
+        run: |
+          if [ -d /tmp/levain-pt ]; then
+            find /tmp/levain-pt -type l ! -exec test -e {} \; -delete
+          fi
+
       - name: Keep what the page showed at a failed wait
         # the page driver writes timeout-step-<n>.png / .txt beside its steps file, under pytest's basetemp; reading them is how a
         # lost-event failure is told from a slow one
@@ -436,6 +448,18 @@ jobs:
           if grep -q -E "^SKIPPED|[0-9]+ skipped" browser.log; then
             echo "a test skipped in the browser job (reasons above, from -rs)"
             exit 1
+          fi
+
+      - name: Drop links the upload cannot stat
+        # Intent: a failed run must show its own failure, not a second red step from the upload below. Some tests leave a
+        # symlink loop or a dangling link under the basetemp on purpose, and the upload action stats every path its glob
+        # meets (ELOOP, CI run 43282594627). Remove the links that do not resolve. Written as -type l plus test -e rather than
+        # GNU find's -xtype l because that is the one form that also runs on the macOS find; a cleanup that itself fails
+        # stays red, so the cause is named and not hidden behind the upload's error.
+        if: failure()
+        run: |
+          if [ -d /tmp/levain-pt ]; then
+            find /tmp/levain-pt -type l ! -exec test -e {} \; -delete
           fi
 
       - name: Keep what the page showed at a failed wait
