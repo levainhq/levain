@@ -294,13 +294,13 @@ def test_a_running_signing_server_has_published_only_its_origin_and_its_needs_co
     root = _install(tmp_path)[0]
     q = _queue(tmp_path)
     with _running(root, monkeypatch, write=True, sign_queue_dir=q, sign_host=HOST):
-        # while up: exactly the published origin and the needs count the badge reads (an empty queue has no orphaned
-        # attempt to settle)
-        assert sorted(p.name for p in q.rglob("*")) == sorted(["cockpit-origin.json", needs.COUNT_FILE])
+        # while up: exactly the published origin, the needs count the badge reads and the lock file whose holder owns
+        # that record (an empty queue has no orphaned attempt to settle)
+        assert sorted(p.name for p in q.rglob("*")) == sorted(["cockpit-origin.json", needs.COUNT_FILE, needs.LOCK_FILE])
         assert json.loads((q / "cockpit-origin.json").read_text()) == {"cockpit_origin": f"https://{HOST}"}
-    # stopped: the stop withdrew its origin; the count record is never withdrawn (it ages out on its own freshness) and
-    # nothing else was ever made
-    assert sorted(p.name for p in q.rglob("*")) == [needs.COUNT_FILE]
+    # stopped: the stop withdrew its origin; the count record and its lock file are never withdrawn (the record ages
+    # out on its own freshness; the lock is only a file name for the flock) and nothing else was ever made
+    assert sorted(p.name for p in q.rglob("*")) == sorted([needs.COUNT_FILE, needs.LOCK_FILE])
 
 
 # --- r1 finding 2: the queue is validated, never created, before anything is built ---------------------------------
