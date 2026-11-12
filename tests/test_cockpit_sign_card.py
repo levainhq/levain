@@ -84,10 +84,12 @@ class _Rig:
     question whose answer is signed through ``QRID``, and a Signer on rpId localhost pinned to this page."""
 
     def __init__(self, tmp_path: Path, monkeypatch: Any, *, sign: bool = True, compose: bool = True,
-                 two_keys: bool = False, fillers: int = 0, hello_delay: float = 0.0) -> None:
+                 two_keys: bool = False, fillers: int = 0, hello_delay: float = 0.0, manifest_delay: float = 0.0) -> None:
         # `hello_delay` (seconds) holds the change stream's hello back, as a slow CI box does, so it arrives after the page
-        # is drawn and the test has begun acting
+        # is drawn and the test has begun acting; `manifest_delay` holds back every manifest read made after the hello, so
+        # the hello's compare of the manifest with the board is slow
         self.hello_delay = hello_delay
+        self.manifest_delay = manifest_delay
         home = tmp_path / "levain_home"
         monkeypatch.setenv("LEVAIN_HOME", str(home))
         (home / "consent").mkdir(parents=True, mode=0o700)
@@ -170,13 +172,24 @@ class _Rig:
         thread.start()
         url = f"http://127.0.0.1:{httpd.server_address[1]}"
         real_run = cockpit_stream.run
+        hello_sent = threading.Event()
 
         def late_run(*a: Any, **k: Any) -> Any:
             time.sleep(self.hello_delay)
+            hello_sent.set()
             return real_run(*a, **k)
 
-        if self.hello_delay:
+        real_manifest = self.ck.manifest
+
+        def slow_manifest(*a: Any, **k: Any) -> Any:
+            if hello_sent.is_set():
+                time.sleep(self.manifest_delay)
+            return real_manifest(*a, **k)
+
+        if self.hello_delay or self.manifest_delay:
             cockpit_stream.run = late_run
+        if self.manifest_delay:
+            self.ck.manifest = slow_manifest
         try:
             # the question's caller names its sign request (flow's desk reader does this; the kernel store files none)
             signed = _Signed(httpd.question_store, {self.question.n: QRID})
@@ -185,6 +198,7 @@ class _Rig:
             yield url, httpd
         finally:
             cockpit_stream.run = real_run
+            self.ck.__dict__.pop("manifest", None)
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=5)
@@ -327,12 +341,16 @@ def test_the_listing_names_the_page_the_ceremony_is_pinned_to(tmp_path, monkeypa
 OPEN_Q = ("(document.querySelector('#levain-modal .needs-question') || "
           "((r) => r && (r.click(), null))(document.querySelector('#ck-needs .needs-row.needs-question')))")
 STRIP_FACET = f"{OPEN_Q} && document.querySelector('#levain-modal .needs-question .sign-facet .sign-option')"
-# the page's change stream has said hello and been left alone for 800 ms. A test that counts reloads waits for this before it
-# moves the store; the `hello_late` cases of the r6 s1_s6 and sheet h9 tests fail without it
+# the page's change stream is live AND the manifest compare its hello starts has been read (a second /cockpit/manifest.json
+# entry beside the board's own first read) AND no /cockpit read has completed for 700 ms (the stream's reload, if the compare
+# wants one, is armed 500 ms after the read that asked). A test that counts reloads waits for this before it moves the store;
+# the `hello_late` and `manifest_slow` cases of the r6 s1_s6 and sheet h9 tests fail without it
 STREAM_SETTLED = ("(() => { const c = document.querySelector('.livechip'); if (!c || c.dataset.state !== 'live') return false; "
-                  "window.__liveAt = window.__liveAt || Date.now(); return Date.now() - window.__liveAt >= 800; })()")
+                  "const rs = performance.getEntriesByType('resource').filter((e) => /\\/cockpit\\//.test(e.name)); "
+                  "if (rs.filter((e) => /\\/cockpit\\/manifest\\.json/.test(e.name)).length < 2) return false; "
+                  "return performance.now() - Math.max(...rs.map((e) => e.responseEnd)) >= 700; })()")
 STRIP_SETTLED = f"{STRIP_FACET} && {STREAM_SETTLED}"
-FACET_NOTE = f"(({OPEN_Q},document.querySelector('#levain-modal .needs-question .sign-note')) || {{}}).textContent"
+FACET_NOTE = f"(({OPEN_Q}, document.querySelector('#levain-modal .needs-question .sign-note')) || {{}}).textContent"
 OPTION_B = ("[...document.querySelectorAll('#levain-modal .needs-question .sign-option')]"
             ".find(b => /^\\(b\\)/.test(b.textContent))")
 WRITE_IN = "document.querySelector('#levain-modal .needs-question .sign-write-in')"

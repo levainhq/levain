@@ -45,8 +45,9 @@ def resolutions(path: str) -> List[tuple]:
 
 
 def file_lines(path: str, *, wait_s: float = 2.0) -> List[dict]:
-    """The file's lines as dicts. A writer thread may be mid-append, so a last line with no newline yet is waited for (at
-    most `wait_s`, then the parse error stands); a newline-terminated line that does not parse is corruption and raises at once."""
+    """The file's lines as dicts. A writer thread may be mid-append, so a parse error on a file whose last line has no newline
+    yet is waited out (at most `wait_s`, then the parse error stands); one on a file that ends in a newline is corruption and
+    raises at once."""
     end = time.monotonic() + wait_s
     while True:
         with open(path, "rb") as f:

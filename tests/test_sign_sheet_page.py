@@ -509,10 +509,11 @@ WAIT_RELOAD = {"eval": "new Promise((r) => setTimeout(() => r(window.__reloads),
 UNPAIRED_READ = "(real, u, o) => Promise.resolve({ ok: false, status: 403, json: () => Promise.resolve({}) })"
 
 
-@pytest.mark.parametrize("hello_delay", [0.0, 1.5], ids=["hello_on_time", "hello_late"])
+@pytest.mark.parametrize("hello_delay,manifest_delay", [(0.0, 0.0), (1.5, 0.0), (0.0, 1.5)],
+                         ids=["hello_on_time", "hello_late", "manifest_slow"])
 @needs_browser
-def test_h9_a_close_from_the_sheet_alone_schedules_no_board_read(tmp_path: Path, monkeypatch, hello_delay) -> None:
-    rig = _Rig(tmp_path, monkeypatch, hello_delay=hello_delay)
+def test_h9_a_close_from_the_sheet_alone_schedules_no_board_read(tmp_path: Path, monkeypatch, hello_delay, manifest_delay) -> None:
+    rig = _Rig(tmp_path, monkeypatch, hello_delay=hello_delay, manifest_delay=manifest_delay)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, *OPEN_FRAMED,
