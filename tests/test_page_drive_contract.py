@@ -3,7 +3,12 @@ never fails it), an act-until step repeats its action with its assertion and onl
 environment scale stretches every deadline."""
 from __future__ import annotations
 
+import contextlib
 import json
+import re
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -172,6 +177,7 @@ def test_a_timeout_prints_the_page_state_after_its_named_line_and_keeps_the_exit
     head, _, block = r.stderr.partition("--- page state at the timeout ---")
     assert block, r.stderr                                           # the block follows the unchanged line, never replaces it
     for label in ("PAGE URL:", "READY STATE: complete", "MODAL: #levain-modal exists=true [data-question-row] count=2",
+                  "WORKER WAITS: none run", "NAVIGATION: events=", "TARGET (browser's /json): page url=\"data:text/html",
                   "CONSOLE (last 20", "console.log: hello-from-the-page", "page error: Error: late-page-error", "BODY TEXT (first 600):", "SCREENSHOT: ",
                   "--- end page state ---"):
         assert label in block, (label, r.stderr)
@@ -183,15 +189,9 @@ _WORKER_PAGE = ("<!doctype html><title>w</title><p>w</p><script>navigator.servic
                 "addEventListener('beforeunload', () => sessionStorage.setItem('ctl', String(!!navigator.serviceWorker.controller)));</script>")
 
 
-@needs_browser
-def test_an_eval_that_reloads_waits_for_the_pages_worker_to_take_control(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # CI, the List LATER phone test, 1 run in 4: the page reloaded while its worker was still installing, the navigation never committed and
-    # the page stopped answering (reproduced at a 10x CPU throttle: 11 of 27 runs; 0 of 14 with the wait). The `init` step has always waited
-    # for the worker before its reload; an `eval` that reloads waits the same way. The worker here takes 2000 ms to activate (the driver's wait is bounded at 5 s, so the waited reload keeps slack under the bound, and the unwaited one goes out as soon as the page has loaded), so a reload
-    # sent at once reads no controller at the moment the page unloads; a reload that waited reads one.
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
+@contextlib.contextmanager
+def _worker_site() -> Iterator[str]:
+    """A local origin whose page registers a worker that takes 2000 ms to activate; yields its url."""
     class H(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             body, ctype = (_SLOW_WORKER, "text/javascript") if self.path == "/sw.js" else (_WORKER_PAGE, "text/html")
@@ -205,17 +205,41 @@ def test_an_eval_that_reloads_waits_for_the_pages_worker_to_take_control(tmp_pat
         def log_message(self, *a: object) -> None:
             pass
 
-    monkeypatch.setenv("LEVAIN_DRIVE_FULL_CHROME", "1")                  # headless-shell has no service worker; this drive declares it needs one
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), H)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     try:
-        r = _drive_at(tmp_path, f"http://127.0.0.1:{httpd.server_address[1]}/",
-                      [{"eval": "location.reload(); 1"}, {"until": "document.readyState === 'complete' && sessionStorage.getItem('ctl') !== null", "ms": 20000},
-                       {"eval": "sessionStorage.getItem('ctl')"}], timeout=90)
+        yield f"http://127.0.0.1:{httpd.server_address[1]}/"
     finally:
         httpd.shutdown()
         httpd.server_close()
         t.join(timeout=5)
+
+
+@needs_browser
+def test_an_eval_that_reloads_waits_for_the_pages_worker_to_take_control(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # CI, the List LATER phone test, 1 run in 4: the page reloaded while its worker was still installing, the navigation never committed and
+    # the page stopped answering (reproduced at a 10x CPU throttle: 11 of 27 runs; 0 of 14 with the wait). The `init` step has always waited
+    # for the worker before its reload; an `eval` that reloads waits the same way. The worker here takes 2000 ms to activate (the driver's wait is bounded at 5 s, so the waited reload keeps slack under the bound, and the unwaited one goes out as soon as the page has loaded), so a reload
+    # sent at once reads no controller at the moment the page unloads; a reload that waited reads one.
+    monkeypatch.setenv("LEVAIN_DRIVE_FULL_CHROME", "1")                  # headless-shell has no service worker; this drive declares it needs one
+    with _worker_site() as url:
+        r = _drive_at(tmp_path, url,
+                      [{"eval": "location.reload(); 1"}, {"until": "document.readyState === 'complete' && sessionStorage.getItem('ctl') !== null", "ms": 20000},
+                       {"eval": "sessionStorage.getItem('ctl')"}], timeout=90)
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["values"][-1] == "true", r.stdout
+
+
+@needs_browser
+def test_a_timeout_after_a_reload_says_how_the_worker_wait_ended_and_where_the_target_was(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A hang after a reload is read from the timeout block alone, so the block must say how the wait before that reload ended (here:
+    # `settled`, after the slow worker took control) and which url the browser itself holds for the page's target.
+    monkeypatch.setenv("LEVAIN_DRIVE_FULL_CHROME", "1")
+    with _worker_site() as url:
+        r = _drive_at(tmp_path, url, [{"eval": "location.reload(); 1"}, {"until": "false", "ms": 1500}], timeout=90)
+    assert r.returncode == 1 and "until never came true" in r.stderr, (r.returncode, r.stderr)
+    _, _, block = r.stderr.partition("--- page state at the timeout ---")
+    assert re.search(r"WORKER WAITS: settled after \d+ms/\d+ polls \(last settled, \d+ms ago\)", block), r.stderr
+    assert re.search(r"NAVIGATION: events=\d+ loads=\d+", block), r.stderr
+    assert f'TARGET (browser\'s /json): page url="{url}"' in block, r.stderr
