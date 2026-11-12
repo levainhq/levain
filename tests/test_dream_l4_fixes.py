@@ -155,7 +155,7 @@ def hold_a_wrap_open_on(db: Path) -> None:
 def test_f2_recovery_cards_carry_the_store_and_a_failed_one_names_no_rollback(scratch):
     spec = rc._card("failed", rc.UNKNOWN_COMMIT, "o2", his=["x"])
     assert "remedy" not in spec                                       # the store is not known to the spec
-    c = cd.from_spec(spec, occ_dir=occ(scratch, "o2"), db_path=scratch.parent / "memory.db")
+    c = cd.from_spec(spec, occ_dir=occ(scratch, "o2"), db_path=scratch.parent / "memory.db", store_dir=scratch.parent)
     assert "levain dream rollback" not in c.body["remedy"]
     assert str(scratch.parent) in c.body["remedy"]
     ok = cd.build_card("consolidated", occurrence="o1", store_dir=scratch.parent)
@@ -168,8 +168,12 @@ def test_f2_the_signing_card_undo_command_carries_the_store_dir():
     kw = dict(per_run_usd=20.0, night_usd=40.0, expires="x")
     known = da.signing_card_text("America/New_York", store_dir="/data/levain store", **kw)
     assert "levain dream rollback <occurrence> --store-dir '/data/levain store'" in known
-    unknown = da.signing_card_text("America/New_York", **kw)
-    assert "--store-dir <the store's directory>" in unknown            # never a bare command that cannot run
+    with pytest.raises(TypeError):
+        da.signing_card_text("America/New_York", **kw)                 # the caller says it: there is no default
+    with pytest.raises(ValueError):
+        da.signing_card_text("America/New_York", store_dir="", **kw)
+    unknown = da.signing_card_text("America/New_York", store_dir=None, **kw)   # an install whose facts are not written
+    assert "levain dream rollback" in unknown and "--store-dir" not in unknown and "<" not in unknown.split("Undo:")[1][:60]
 
 
 
@@ -194,7 +198,7 @@ def test_f2_enable_prints_the_undo_command_with_the_installs_store(tmp_path, cap
 def test_f3_the_ready_module_does_not_say_the_card_names_who_was_live():
     assert "and the card can say who was live" not in " ".join(rd.__doc__.split())
     # the claim was false: the consolidated card carries no seat field, and the check's detail is the only record
-    body = cd.build_card("consolidated", occurrence="o1").body
+    body = cd.build_card("consolidated", occurrence="o1", store_dir="/s").body
     assert not any("seat" in k or "live" in k for k in body)
 
 
@@ -246,7 +250,7 @@ def test_f5_the_desk_brief_says_a_running_desk_keeps_the_memory_it_loaded():
 
 
 def test_f5_the_signing_card_and_the_changelog_say_it_too():
-    card = da.signing_card_text("America/New_York", per_run_usd=20.0, night_usd=40.0, expires="x")
+    card = da.signing_card_text("America/New_York", per_run_usd=20.0, night_usd=40.0, expires="x", store_dir="/s")
     assert "keeps the memory it loaded" in card
     changelog = (REPO / "CHANGELOG.md").read_text(encoding="utf-8")
     bullet = next(ln for ln in changelog.splitlines() if ln.startswith("- **The dream runs with seats live"))

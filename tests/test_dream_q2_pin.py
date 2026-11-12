@@ -31,6 +31,6 @@ def test_the_rolled_back_card_says_the_undone_days_episodes_are_not_re_offered(e
     res = sn.rollback(ent.db, occ_dir)
     assert res.ok and res.card, res
     store = CoordStore(ent.coord_dir)
-    cd.file_card(store, cd.from_spec(res.card, occ_dir=occ_dir), feed="agent")
+    cd.file_card(store, cd.from_spec(res.card, occ_dir=occ_dir, store_dir=ent.store_dir), feed="agent")
     cards = [i for i in review.list_items(store, feed="agent") if i.body.get("kind") == "rolled-back"]
     assert len(cards) == 1 and ROLLED_BACK in cards[0].body["reason"]

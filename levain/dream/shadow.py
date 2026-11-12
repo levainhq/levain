@@ -563,7 +563,7 @@ def shadow_card(flow_day: FlowDay, shadow_text: str, *, occurrence: str, occ_dir
         ipath, isha = instructions
         own.append(f"shadow: instructions {ipath} (sha256 {isha[:16]})" if isha else
                    f"shadow: instructions {ipath} (sha256 not recorded)")
-    return _card.build_card("consolidated", occurrence=occurrence, agent_id=agent_id, day=flow_day.day,
+    return _card.build_card("consolidated", occurrence=occurrence, store_dir=None, agent_id=agent_id, day=flow_day.day,
                             reason=reason or f"shadow night against flow's {flow_day.run_id}; nothing was saved to a real store",
                             own_extra=own, usage_doc=usage_doc, out_dir=occ,
                             remedy="nothing to undo: the shadow store is a scratch copy")
