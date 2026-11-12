@@ -165,8 +165,11 @@ def start(store: Any, *, clock: Callable[[], datetime] | None = None, authority:
                                        "second was already claimed; nothing was started", oid)
     # (2) the ceiling and (3) the admission, both inside the controller's launch
     launch_over, session_alive = ctl.dispatch_probes(inst.coord_dir)
+    # the admission is the dream's own hook, PASSED: launch's defaulted on_input resolves it from the signed name, and a
+    # default that ever came back None would admit with no day-ready at all, silently
     res = ctl.launch(store, oid, authority=auth, executor=executor, window=window_for(now, inst.zone), now=now,
-                     launch_over=launch_over, session_alive=session_alive)
+                     launch_over=launch_over, session_alive=session_alive,
+                     on_input=da.install_on_input(store.directory))
     verb = "resumed" if resumed else "claimed"
     if res.outcome == ctl.LAUNCHED:
         try:
