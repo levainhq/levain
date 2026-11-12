@@ -355,12 +355,17 @@ const awaitWorkerSettled = async () => {
   // No registration is NOT settled at once: register() is asynchronous, so under load the first poll can run before the page's own
   // registration exists. "No registration" counts only after it has been seen on 8 polls in a row (a page with no worker
   // pays that short wait); a registration that has appeared is waited for until it is activated and in control.
+  // A register() and a reload sent in the SAME eval are not covered either: the registration does not exist yet when this wait runs.
+  // Each probe is raced against the time left (as waitForWholeBoard does), so a page that does not answer cannot stretch the bound to the
+  // 60 s evaluate default; an error outcome (the page navigating, no answer) is a retry until the deadline, never "settled".
   let absent = 0;
-  for (const end = Date.now() + scaled(5000);;) {
-    const state = await evaluate("(async () => { const sw = navigator.serviceWorker; if (!sw) return 'none'; const r = await sw.getRegistration();"
-      + " if (!r) return 'absent'; return (!r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller) ? 'settled' : 'pending'; })()");
-    if (state === "none" || state === "settled" || Date.now() >= end) break;
-    absent = state === "absent" ? absent + 1 : 0;
+  for (const end = Date.now() + scaled(5000); Date.now() < end;) {
+    const o = await evaluateOutcome("(async () => { const sw = navigator.serviceWorker; if (!sw) return 'none'; const r = await sw.getRegistration();"
+      + " if (!r) return 'absent'; return (!r.installing && !!r.active && r.active.state === 'activated' && !!sw.controller) ? 'settled' : 'pending'; })()",
+      Math.min(Math.max(end - Date.now(), 250), 1500));
+    if ("error" in o) { await sleep(50); continue; }
+    if (o.value === "none" || o.value === "settled") break;
+    absent = o.value === "absent" ? absent + 1 : 0;
     if (absent >= 8) break;
     await sleep(50);
   }
