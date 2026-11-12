@@ -350,8 +350,11 @@ def _orphan_judge(src: Sources, now: datetime, floor_s: float | None) -> tuple[b
     horizon = executor_orphan_horizon_s()
     if occ is not None:
         if _w._orphan_is_stale(started, bound, now=now):
-            return True, (f"the dream's own wrap (occurrence {occ} recorded its token), started {started}, is past the "
-                          f"executor's age bound of {_minutes(horizon)}: proven dead; the run clears it and consolidates")
+            # age alone: admission does not see whether that occurrence's fire still holds wrap.lock, so the note claims
+            # the age and leaves the proof to the run, which takes the lock before it clears anything
+            return True, (f"the dream's own wrap (occurrence {occ} recorded its token), started {started}, is older "
+                          f"than the executor's age bound of {_minutes(horizon)}; the run's lock decides whether its "
+                          "fire is gone, and the run then clears it and consolidates")
         return _held(f"it is the dream's own wrap (occurrence {occ}), started {started}, and is not yet provably dead: "
                      f"younger than the executor's age bound of {_minutes(horizon)}, past which the dream clears it")
     effective = max(floor_s, horizon)
@@ -371,7 +374,7 @@ def _check2(src: Sources, now: datetime, floor_s: float | None) -> Check:
         dead, note = _orphan_proof(src, now, floor_s)
         if not dead:
             return Check(2, name, QUIET, note, "wrap-open")
-        healed = f"an open wrap is proven dead ({note}); "
+        healed = f"an open wrap passes admission ({note}); "
     if not _guard(src.requires_baton, "the baton policy"):
         return Check(2, name, "pass", healed + "the store does not require the baton" if healed
                      else "no wrap open; the store does not require the baton")
