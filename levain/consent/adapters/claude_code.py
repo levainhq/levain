@@ -478,24 +478,21 @@ def _under_hooks_path(path: Path, cwd: str, cache: dict[Any, Any] | None = None,
         return True   # a path that cannot be examined (or no operator home to ask git as) is tagged
 
 
-def nothing_can_decide(settings: AdapterSettings, tier: str | None = None, *, contained_shell: bool = False) -> bool:
-    """No explicit word on and the cockpit the settings point at replays to no active key and no standing grant (or
-    has no database, or does not replay): no grant or signed answer can verify and no hold is asked (input idle
-    holds only for an enrolled key, :func:`away_hold`), so the hook
-    files nothing (a queue row is kept for good). The PermissionRequest hook then leaves the call to the agent's own
-    dialog; the PreToolUse gate does so in ``default`` only, and in every other mode denies a
-    T3 call (the floor, Q10 D1: no dialog asks there). A cockpit.db the cockpit made
-    before any key was enrolled is not something that can decide (L3 r1 codex MED). For ``tier`` T3
-    (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an active key whose class can sign a T3 allow counts;
-    a standing grant never does, nor does away mode: a held T3 call that no key can sign only halts its session
-    (L3 r1 codex 6, r2). With ``contained_shell`` (:func:`decide_ex` sets it for a chat Bash call that carries its
-    launch's proof, the one call an SH1 grant can answer) an unexpired contained-shell grant counts too (L3 r1
-    complement MED)."""
-    return nothing_can_decide_why(settings, tier, contained_shell=contained_shell) is not None
+def nothing_can_decide(settings: AdapterSettings, tier: str | None = None) -> bool:
+    """No explicit word on and the cockpit the settings point at replays to no active key (or has no database, or does
+    not replay): no signed answer can verify and no hold is asked (input idle holds only for an enrolled key,
+    :func:`away_hold`), so the hook files nothing (a queue row is kept for good). The PermissionRequest hook then
+    leaves the call to the agent's own dialog; the PreToolUse gate does so in ``default`` only, and in every other
+    mode denies a T3 call (the floor, Q10 D1: no dialog asks there). A cockpit.db the cockpit made before any key was
+    enrolled is not something that can decide (L3 r1 codex MED). A standing grant is not counted: a grant answers only
+    while a key that signed it is still active, so with no active key none can, and counting one would only keep a
+    hook armed that nothing can answer. For ``tier`` T3 (:data:`AGENT_CONFIG_TIER`, never grant-eligible) only an
+    active key whose class can sign a T3 allow counts, and away mode does not: a held T3 call that no key can sign
+    only halts its session (L3 r1 codex 6, r2)."""
+    return nothing_can_decide_why(settings, tier) is not None
 
 
-def nothing_can_decide_why(settings: AdapterSettings, tier: str | None = None, *,
-                           contained_shell: bool = False) -> str | None:
+def nothing_can_decide_why(settings: AdapterSettings, tier: str | None = None) -> str | None:
     """Why :func:`nothing_can_decide` holds, in words for the operator, or ``None`` when something can decide. The
     one body of that judgement: :func:`nothing_can_decide` is this being not ``None``."""
     if settings.away_mode and tier != AGENT_CONFIG_TIER:
@@ -515,36 +512,9 @@ def nothing_can_decide_why(settings: AdapterSettings, tier: str | None = None, *
         if any(class_covers(key.key_class, tier) for key in snap.active_keys()):
             return None
         return "no enrolled key can sign an agent-config allow"
-    if snap.active_keys() or _a_consent_grant_in_force(snap.policy.grants.values()):
+    if snap.active_keys():
         return None
-    if contained_shell:
-        from levain.authority import contained_shell_grant
-
-        if _a_consent_grant_in_force(snap.policy.grants.values(), kind=contained_shell_grant):
-            return None
-    return "no enrolled key and no standing grant in force"
-
-
-def _a_consent_grant_in_force(grants: Iterable[Any], *, kind: Callable[[Any], bool] | None = None) -> bool:
-    """Whether any grant is a consent grant (or, with ``kind``, a grant ``kind`` accepts) that has not expired: the
-    two criteria of ``grant_refusal`` that hold for every request (L3 r2 codex MED: an expired or other-kind grant
-    answers nothing)."""
-    from datetime import datetime, timezone
-
-    from levain.authority import consent_grant
-    from levain.cockpit.consent import parse_stamp
-
-    is_kind = consent_grant if kind is None else kind
-    now = datetime.now(timezone.utc)
-    for grant in grants:
-        if not is_kind(grant):
-            continue
-        try:
-            if now < parse_stamp(grant.get("expires_at")):
-                return True
-        except Exception:
-            continue
-    return False
+    return "no enrolled key is active"
 
 
 def _under(path: Path, roots: tuple[str, ...]) -> bool:
@@ -1219,16 +1189,16 @@ def decide_ex(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, env
     tool_use_id = event.get("tool_use_id")
     mode = event.get("permission_mode")
     posture = mode if isinstance(mode, str) and mode else None
-    # the one call an SH1 grant can answer (policy.contained_shell_refusal: exactly Bash, a chat call, a proof, never
-    # agent config); for that call agent_config is known before the no-decider gate, for every other call after it.
-    # Known agent config is judged at its own tier there: away mode and a grant decide nothing for it
+    # a chat Bash call that carries its launch's proof (the one call an SH1 grant can answer) has agent_config known
+    # before the no-decider gate, every other call after it. Known agent config is judged at its own tier there:
+    # away mode decides nothing for it, and no grant does either
     sh1: dict[str, Any] = {}
     agent_config: bool | None = None
     if launch_nonce and contained_launch is not None and tool_name == "Bash":
         protected = protected_paths(Path(queue.directory), settings, home=home, environ=environ, cwd=cwd)
         agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, environ=environ,
                                             protected=protected)
-        sh1 = {"tier": AGENT_CONFIG_TIER} if agent_config else {"contained_shell": True}
+        sh1 = {"tier": AGENT_CONFIG_TIER} if agent_config else {}
     if policy is None and nothing_can_decide(settings, **sh1):
         return Abstained(call, "no_decider", None, nothing_can_decide_why(settings, **sh1) or "nothing can decide")
     if agent_config is None:
