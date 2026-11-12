@@ -188,7 +188,7 @@ process.on("unhandledRejection", (e) => { console.error(e && e.stack || String(e
 process.on("exit", () => { try { chrome.kill(); } catch {} });
 const parent = process.ppid;
 setInterval(() => { if (process.ppid !== parent) done(130); }, 1000).unref();
-let pageWsUrl = null;
+let pageWsUrl = null; let ourTargetId = null;   // ourTargetId: the shared Chrome's id for this drive's page (the timeout block asks the browser whether it is alive)
 const setupShared = async () => {
   let version = null;
   for (const end = Date.now() + 5000; Date.now() < end && !version;) {
@@ -205,6 +205,7 @@ const setupShared = async () => {
   // newWindow: the width and height apply to a target only when it gets a window of its own
   const made = await within(bsend("Target.createTarget", { url: "about:blank", browserContextId: contextId, width: 1440, height: 1000, newWindow: true }), SETUP_MS, "createTarget");
   if (!made.result?.targetId) throw new Error("no target: " + JSON.stringify(made.error || made.result));
+  ourTargetId = made.result.targetId;
   pageWsUrl = `ws://127.0.0.1:${sharedPort}/devtools/page/${made.result.targetId}`;
   return await within(openSocket(pageWsUrl, "the shared chrome's page"), SETUP_MS, "the page websocket");
 };
@@ -227,8 +228,12 @@ if (!ws) {
   ws = await within(openSocket(pageWsUrl, "chrome's page"), 15000, "the page websocket");
 }
 let id = 0; let navStarts = 0; let loads = 0; const pend = new Map(); const posts = []; const dialogs = []; const trail = []; const consoleLog = [];   // consoleLog: the page's console output and errors, for the timeout block; trail: what a timeout dump reports of the page's refusals and prompts
+const T0 = Date.now(); let lastEventAt = T0; const navTrail = [];   // lastEventAt / navTrail: what the page last said and when, for the timeout block (a page that stops answering is told apart from one that never loaded)
 ws.addEventListener("message", (m) => {
   const d = JSON.parse(m.data);
+  lastEventAt = Date.now();
+  if (/^(Page\.(frameStartedLoading|frameNavigated|frameStoppedLoading|loadEventFired|domContentEventFired|navigatedWithinDocument)|Inspector\.(targetCrashed|detached))$/.test(d.method || "")) { navTrail.push(`+${lastEventAt - T0}ms ${d.method.replace(/^(Page|Inspector)\./, "")}${d.params && d.params.reason ? " " + d.params.reason : ""}`); if (navTrail.length > 14) navTrail.shift(); }
+  if (d.method === "Inspector.targetCrashed") consoleLog.push("PAGE CRASHED: Inspector.targetCrashed (the renderer died)");
   if (d.method === "Network.responseReceived" && d.params.response.status >= 400) trail.push(`${Math.round(d.params.timestamp * 1000) % 1e6}ms ${d.params.response.status} ${d.params.response.url.replace(/^https?:\/\/[^/]+/, "")}`);
   if (d.method === "Runtime.consoleAPICalled") consoleLog.push(`console.${d.params.type}: ` + (d.params.args || []).map((a) => String(a.value !== undefined ? a.value : (a.description || a.type))).join(" ").slice(0, 300));
   if (d.method === "Runtime.exceptionThrown") consoleLog.push("page error: " + String(d.params.exceptionDetails?.exception?.description || d.params.exceptionDetails?.text).slice(0, 300));
@@ -255,7 +260,7 @@ const send = (method, params = {}) => new Promise((res, rej) => {
   try { ws.send(JSON.stringify({ id: i, method, params })); } catch (e) { pend.delete(i); rej(e); }
 });
 await send("Page.enable"); await send("Network.enable");
-for (const m of ["Runtime.enable", "Log.enable"]) { try { await Promise.race([send(m), sleep(3000)]); } catch {} }   // console capture is best-effort: never a reason to fail a drive
+for (const m of ["Runtime.enable", "Log.enable", "Inspector.enable"]) { try { await Promise.race([send(m), sleep(3000)]); } catch {} }   // console capture is best-effort: never a reason to fail a drive
 await send("Page.navigate", { url });
 const values = [];
 // an act-until re-run's own result key, and whether a `do` source parses as one expression (compiled here in node, never run)
@@ -291,6 +296,23 @@ for (const end = Date.now() + scaled(15000); Date.now() < end;) {
 // (each call is raced against ~3 s: a wedged page must not turn the named failure into the runner's timeout)
 // the diagnostic block a timeout prints AFTER its named failure line: page state through one probe that cannot throw, the
 // last 20 console messages / page errors, and the screenshot path; capped at 4000 characters, never able to change the exit
+// does the BROWSER still list this drive's page, and what does it say it is showing? (the page's own channel is the one in doubt, so ask the browser's)
+const targetState = async () => {
+  try {
+    if (sharedPort && bws && ourTargetId) {
+      const r = await Promise.race([bsend("Target.getTargets"), sleep(2000).then(() => null)]);
+      if (!r) return "browser did not answer Target.getTargets within 2000ms";
+      const t = (r.result?.targetInfos || []).find((x) => x.targetId === ourTargetId);
+      return t ? `listed, attached=${t.attached} url=${String(t.url).slice(0, 120)} title=${String(t.title).slice(0, 60)}` : "NOT LISTED (the page target is gone)";
+    }
+    if (port) {
+      const list = await (await fetch(`http://127.0.0.1:${port}/json`, { signal: AbortSignal.timeout(2000) })).json();
+      const t = list.find((x) => x.type === "page");
+      return t ? `listed, url=${String(t.url).slice(0, 120)} title=${String(t.title).slice(0, 60)}` : "NOT LISTED (no page target)";
+    }
+  } catch (e) { return "browser unreachable: " + String(e && e.message || e).slice(0, 80); }
+  return "?";
+};
 const timeoutBlock = async (shotPath) => {
   try {
     const probe = await evaluateOutcome("(() => { try { const m = document.querySelector('#levain-modal'); return JSON.stringify({ url: location.href, ready: document.readyState, modal: !!m, rows: m ? m.querySelectorAll('[data-question-row]').length : null, text: String((document.body && document.body.innerText) || '').slice(0, 600) }); } catch (e) { return JSON.stringify({ probe_error: String(e) }); } })()", 3000);
@@ -298,6 +320,7 @@ const timeoutBlock = async (shotPath) => {
     const lines = ["--- page state at the timeout ---",
       `PAGE URL: ${o.url ?? "?"}`, `READY STATE: ${o.ready ?? "?"}`,
       `MODAL: #levain-modal exists=${o.modal ?? "?"} [data-question-row] count=${o.rows ?? "?"}` + (o.probe_error ? ` (probe error: ${o.probe_error})` : ""),
+      `TARGET: ${await targetState()}`, `LAST PAGE EVENT: ${Date.now() - lastEventAt}ms ago; NAV TRAIL: ${navTrail.join(", ") || "none"}`,
       `CONSOLE (last 20 of ${consoleLog.length}):`, ...consoleLog.slice(-20).map((c) => "  " + c),
       "BODY TEXT (first 600):", String(o.text ?? "").replace(/\n{2,}/g, "\n"),
       `SCREENSHOT: ${shotPath || "none"}`, "--- end page state ---"];
