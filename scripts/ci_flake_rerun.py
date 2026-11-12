@@ -7,8 +7,9 @@ The shard step runs pytest with -rfE and tees the log. When pytest failed, this 
 the ledger (tests/ci/flake_ledger.txt: one node id per line, `#` comments; a missing file is an empty ledger, so with no
 ledger nothing ever reruns). It exits 1, with no rerun, unless pytest exited 1 (tests failed; any other code is an
 interrupt, usage or collection error), every failure is a FAILED line (no ERROR line), and every failed node id is on
-the ledger. Otherwise it reruns those node ids once and exits with that rerun's status. A test not on the ledger never
-reruns.
+the ledger, and no failure is an xdist worker-crash report. Otherwise it reruns those node ids once; the rerun counts as
+passed only if pytest exited 0 and its junit file shows every requested node passed (a skip, xfail, error or deselected
+node is not a pass). A test not on the ledger never reruns.
 
 The rerun is printed, appended to $GITHUB_STEP_SUMMARY when that is set, and written as a JSON row to
 <record dir>/rows.jsonl for the workflow to upload. This script writes nothing else and commits nothing.
@@ -19,6 +20,7 @@ import re
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 _run = subprocess.run  # indirection so tests patch this, not the global subprocess.run
@@ -51,6 +53,20 @@ def _split_reason(rest):
 
 
 _ERR_ITEM = re.compile(r"^_+ ERROR (at (setup|teardown) of|collecting) ")
+# xdist reports a dead worker as an ordinary failed test; a crash is infrastructure, never a flake, so it is never rerun.
+_CRASH = re.compile(r"worker '[^']*' crashed|node down:|Not properly terminated|maximum crashed workers")
+
+
+def _rerun_all_passed(xml_path, requested):
+    """True only if the rerun's junit file holds exactly one testcase per requested node and none of them carries a
+    failure, error or skip (an xfail is written as a skip). pytest exits 0 for a skipped or xfailed node, so the exit
+    code alone cannot say a test actually ran; an unreadable file or a deselected node is not a pass."""
+    try:
+        cases = list(ET.parse(xml_path).getroot().iter("testcase"))
+    except (OSError, ET.ParseError):
+        return False
+    bad = {"failure", "error", "skipped"}
+    return len(cases) == requested and not any(child.tag in bad for case in cases for child in case)
 
 
 def parse_log(text):
@@ -76,8 +92,9 @@ def parse_log(text):
         if ln.startswith("ERROR "):
             errored = True
         elif ln.startswith("FAILED "):
-            nid = _split_reason(ln.split(" ", 1)[1])
-            if not _NODE.match(nid):
+            rest = ln.split(" ", 1)[1]
+            nid = _split_reason(rest)
+            if not _NODE.match(nid) or _CRASH.search(rest[len(nid):]):
                 errored = True
             elif nid not in failed:
                 failed.append(nid)
@@ -103,11 +120,13 @@ def main(argv):
     print(f"rerunning once, all {len(failed)} failure(s) are on the flake ledger:")
     for n in failed:
         print(f"  {n}")
-    rerun = _run(["pytest", "-q", "-rf", "--basetemp=/tmp/levain-pt-rerun", *failed])
-    passed = rerun.returncode == 0
+    record_dir.mkdir(parents=True, exist_ok=True)
+    junit = record_dir / "rerun.xml"
+    junit.unlink(missing_ok=True)
+    rerun = _run(["pytest", "-q", "-rf", "--basetemp=/tmp/levain-pt-rerun", f"--junitxml={junit}", *failed])
+    passed = rerun.returncode == 0 and _rerun_all_passed(junit, len(failed))
     row = {"label": label, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tests": failed,
            "rerun_passed": passed, "sha": os.environ.get("GITHUB_SHA", ""), "run_id": os.environ.get("GITHUB_RUN_ID", "")}
-    record_dir.mkdir(parents=True, exist_ok=True)
     with (record_dir / "rows.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
