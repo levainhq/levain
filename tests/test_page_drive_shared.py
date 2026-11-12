@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -61,6 +62,18 @@ def test_a_shared_drive_sees_the_same_viewport_as_a_spawned_one(tmp_path: Path, 
     shared = _geometry(tmp_path, {"LEVAIN_DRIVE_CDP_PORT": str(shared_port)})
     assert shared == spawned, {"spawned": spawned, "shared": shared}
     assert shared[0] == 1440, shared
+
+
+@needs_browser
+def test_a_page_that_stops_answering_on_the_shared_chrome_is_still_listed_by_the_browser(tmp_path: Path, shared_port: int) -> None:
+    # the timeout block asks the SHARED Chrome (Target.getTargets) whether this drive's own page target is alive, by its id: the url
+    # carries a marker no other drive's page in the same Chrome has, so the line names this drive's target and not a neighbour's
+    steps = [{"eval": "location.hash = '#shared-hang-marker'; setTimeout(() => { for (;;) {} }, 50); 1"}, {"until": "false", "ms": 1500}]
+    r = _drive(tmp_path, steps, {"LEVAIN_DRIVE_CDP_PORT": str(shared_port), "LEVAIN_TEST_WAIT_SCALE": "1"}, timeout=90)
+    assert r.returncode == 1 and "until never came true within 1500ms" in r.stderr, (r.returncode, r.stderr)
+    _, _, block = r.stderr.partition("--- page state at the timeout ---")
+    assert "PAGE URL: ?" in block, r.stderr                                           # the page did not answer: the premise of the test
+    assert re.search(r"TARGET: listed, id=[0-9A-F]{32} attached=\w+ url=about:blank#shared-hang-marker", block), r.stderr
 
 
 # ---- a shared Chrome that fails during setup: the drive still runs, on its own Chrome, within a bound --------------------------
