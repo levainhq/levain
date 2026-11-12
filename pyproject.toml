@@ -150,7 +150,11 @@ dependencies = [
     # mints `intention-NNN` ids for NEW records and still reads every existing `spore-N` id (and the other way round).
     # levain.intentions.guarded_intention_store passes it, and levain.consent.questions.INTENTION_ID reads both prefixes. No
     # migration-manifest entry, so TEMPLATES_RECONCILED_ANNEAL stays 1.0.2. KNOWN_GOOD_ANNEAL moves with this floor.
-    "anneal-memory>=1.0.7,<1.1",
+    # `>=2.0,<2.1` (2026-11-12, Phill np-ac4908a7 (a), the key half of the intention rename): anneal 2.0.0 is the schema-2
+    # intention-store release. Open rows are keyed `intentions` (levain's `spores` key is renamed with it), and a schema-1 store is
+    # refused until `anneal-memory intention migrate-key` converts it. The pin sits AHEAD of the PyPI publish of 2.0.0 on this
+    # branch only (release_gate gate e tests this named ref, Phill np-61eb6709 (b)). KNOWN_GOOD_ANNEAL moves with this floor.
+    "anneal-memory>=2.0,<2.1",
     # The reply classifier (levain.firing.agent_reply.unreadable_tool_call) reads Markdown code regions with a
     # CommonMark parser rather than a hand-written one: four review rounds on a hand reader each found its next edge
     # (Phill 2026-10-05, "Let's do A"). Floor 4.0: 3.0.0 took 23 s on a reply of 5,000 reference definitions,
