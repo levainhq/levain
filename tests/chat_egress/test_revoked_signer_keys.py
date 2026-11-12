@@ -201,6 +201,45 @@ def test_a_setup_refused_by_a_stopped_record_says_it_was_stopped_and_the_way_on(
     said = str(exc.value)
     assert said.startswith(str(live.value))                         # the refusal itself is unchanged
     assert f"{RID} was stopped ({auth.STOPPED_BORN})" in said
-    assert "--replace" in said and f"levain chat key revoke {RID}" in said
+    assert "--replace" in said and "levain chat key revoke" in said and said.rstrip().endswith("removes it")
+    assert f"{RID}` removes it" in said                              # the command names the record it removes
     rec, _warning = world.setup("b", replace=True)                    # and the way on it names works
     assert _route(world.launch()).record_id == rec["id"]
+
+
+def _revoke_verb_parser():
+    """The `levain chat key revoke` subparser, found by walking the real parser."""
+    import argparse
+
+    from levain.cli import build_parser
+
+    parser = build_parser()
+    for name in ("chat", "key", "revoke"):
+        sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        parser = sub.choices[name]
+    return parser
+
+
+def test_a_setup_refusal_names_a_revoke_command_that_carries_every_required_argument(world) -> None:
+    """The refusal names `levain chat key revoke ...` as a way on; the command shown must be one the verb's parser
+    takes, so a copy-paste of it (a placeholder for the key path) runs: every required argument of the verb, derived
+    from the parser, appears in it, and the parser accepts it."""
+    import re
+    import shlex
+
+    world.create(by="a")
+    world.revoke_key("a", by="b")
+    with pytest.raises(key_setup.SetupRefused) as exc:
+        world.setup("b")
+    shown = re.search(r"`(levain chat key revoke[^`]*)`", str(exc.value))
+    assert shown is not None
+    words = shlex.split(shown.group(1))
+    revoke_parser = _revoke_verb_parser()
+    required = [a for a in revoke_parser._actions if a.required or (not a.option_strings and a.nargs is None)]
+    assert any(a.option_strings for a in required)               # the control: the verb does have a required option
+    for action in required:
+        if action.option_strings:
+            assert action.option_strings[0] in words, action.option_strings
+    argv = [("/key" if w.startswith("<") else w) for w in words[4:]]
+    args = revoke_parser.parse_args(argv)                        # a copy-paste with the placeholder filled parses
+    assert args.record_id == RID
