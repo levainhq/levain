@@ -621,14 +621,19 @@ def _enable_flags(agent_dir: Path | str | None, install: DreamInstall | None = N
 
 
 def window_remedy(cls: str, store_path: Path | str, *, agent_dir: Path | str | None = None,
-                  install: DreamInstall | None = None) -> str:
+                  install: DreamInstall | None = None, agent_id: str | None = None) -> str:
     """The next step a did-not-consolidate card names for class ``cls``, every command in it one that exists and runs as
     printed. ``levain dream start`` starts a dream by hand through the same signed link and ceiling as a scheduled run
     (``levain agents`` has no run-now, and ``levain dream run`` is for a store COPY), and a class names it only where it
     can run: ``failed``, ``laptop-slept`` and ``attempt-spent`` (a manual run waives the window's one-attempt check),
     and ``wrap-open`` and ``baton`` AFTER the person has cleared the wrap or the baton (a hand start meets check 2 as a
-    night does). The others name none: a ``ceiling`` or ``in-flight`` night would be refused again, an ``unreadable`` one
-    cannot read its sources, and an unknown class is not known to be one a hand start fixes.
+    night does). "Nothing needs doing by hand" is said only for a night that clears by itself: ``laptop-slept``,
+    ``attempt-spent``, ``ceiling`` (and a quiet day that is not news, which files no card). Every other class needs a
+    person: an ``unreadable`` night names ``levain dream ready`` (it prints the failing check) and the hand start for
+    after it passes; ``unknown``, ``in-flight``, ``live-seat`` and any class not listed here name ``levain agents show
+    dream`` and ``levain dream start`` (an ``admitted`` hand start left behind keeps every window from running, and the
+    verb resumes it, or ends it when it is from an earlier day) beside ``levain dream ready``. ``agent_id`` is the
+    registered agent's id, which ``levain dream ready`` needs to find the dream's occurrences.
 
     ``store_path`` is the install's ``memory.db`` and is REQUIRED; the anneal commands need it (``--db``: without it
     anneal reads ``~/.anneal-memory``, another store). An open wrap keeps the dream from starting until the dream's
@@ -672,7 +677,52 @@ def window_remedy(cls: str, store_path: Path | str, *, agent_dir: Path | str | N
         return f"`levain agents show dream` names the run that failed and why; {again}, or {now}."
     if cls in ("laptop-slept", "attempt-spent"):
         return f"nothing needs doing by hand; {again}, or {now}."
-    return f"nothing needs doing by hand; {again}."
+    if cls == "ceiling" or cls in NOT_NEWS:
+        return f"nothing needs doing by hand; {again}."
+    ready, start, show, add = _person_commands(store_path, agent_dir, install, agent_id)
+    if cls == "unreadable":
+        return (f"The dream could not read one of its sources, so it stays quiet every night until it can; this does "
+                f"not clear by itself. `{ready}` prints the check that fails and what it could not read. Once that "
+                f"check passes, {again}, or `{start}`{add} runs it now under the same signed link.")
+    return (f"The night's rows do not show a cause that clears by itself ({cls}). `{show}` lists the dream's "
+            f"occurrences: a hand start left `admitted` (one stopped before it launched) keeps every window behind it "
+            f"from running, and `{start}`{add} resumes it, or ends it and starts afresh when it is from an earlier day. "
+            f"`{ready}` prints the check that keeps the dream quiet; once it passes, {again}.")
+
+
+def _person_commands(store_path: Path | str, agent_dir: Path | str | None, install: DreamInstall | None,
+                     agent_id: str | None) -> tuple[str, str, str, str]:
+    """``(ready, start, show, add)``: ``levain dream ready``, ``levain dream start`` and ``levain agents show dream``
+    as a person runs them against THIS install, plus a note to print after the start command when the agent store is
+    not known. ``ready`` carries the install's store directory, agent store, desk queue and zone and the registered
+    agent id when they are known (each one omitted falls back to a default that may read another install, so a
+    placeholder stands where the agent store is unknown); the other two carry ``--agent-store-dir`` / ``--store-dir``
+    only for an agent store that is not the default one."""
+    from levain.autonomic.db import default_store_dir
+
+    sd = shlex.quote(str(Path(store_path).parent))
+    if agent_dir is None:
+        ready = f"levain dream ready --store-dir {sd} --agent-dir <agent-store-dir>"
+        if agent_id:
+            ready += f" --agent-id {shlex.quote(agent_id)}"
+        return (ready, "levain dream start", "levain agents show dream",
+                " (add --agent-store-dir if enable was given one)")
+    ad = Path(agent_dir).expanduser().resolve()
+    inst = install
+    if inst is None:
+        try:
+            inst = read_install(agent_dir)
+        except Exception:  # noqa: BLE001 - the commands still name the store and the agent dir
+            inst = None
+    ready = f"levain dream ready --store-dir {sd} --agent-dir {shlex.quote(str(ad))}"
+    if inst is not None:
+        ready += f" --coord-dir {shlex.quote(str(inst.coord_dir))} --zone {shlex.quote(inst.zone)}"
+    if agent_id:
+        ready += f" --agent-id {shlex.quote(agent_id)}"
+    if ad == default_store_dir():
+        return ready, "levain dream start", "levain agents show dream", ""
+    q = shlex.quote(str(ad))
+    return ready, f"levain dream start --agent-store-dir {q}", f"levain agents --store-dir {q} show dream", ""
 
 
 def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Sequence[Mapping[str, Any]],
@@ -738,7 +788,8 @@ def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Se
             return out
         c = _card.build_card("did-not-consolidate", occurrence=f"window {key}", agent_id=agent_id, day=day.isoformat(),
                              store_dir=Path(store_path).parent, reason=f"{cls}: night did not consolidate: {detail}",
-                             remedy=remedy or window_remedy(cls, store_path, agent_dir=agent_dir, install=install),
+                             remedy=remedy or window_remedy(cls, store_path, agent_dir=agent_dir, install=install,
+                                                            agent_id=agent_id),
                              out_dir=occ_dir if occ_dir is not None and Path(occ_dir).is_dir() else None)
         _, new = _card.file_card(review_store, c, feed=feed)
     except Exception as exc:  # noqa: BLE001 - nothing filed is reported, never swallowed
