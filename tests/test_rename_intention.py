@@ -568,7 +568,10 @@ def _doc_key_uses(tree):
     def is_key(node):
         return isinstance(node, ast.Constant) and node.value == legacy_key
 
-    from levain.intention_legacy import STORE_DOC_KEY_OPEN as legacy_key
+    # The RETIRED key ('spores'), not the schema-2 one: 'intentions' is also a CLI verb and a panel kind, so a scan for it would
+    # flag every such use. Reads of the live key go through anneal and STORE_DOC_KEY_OPEN; the retired spelling is the one that
+    # must never come back as a literal outside intention_legacy.
+    from levain.intention_legacy import STORE_DOC_KEY_OPEN_V1 as legacy_key
     hits = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and is_key(node.slice):
@@ -591,8 +594,8 @@ def test_the_old_document_key_is_spelled_only_by_the_legacy_constant():
         if rel in _DOC_KEY_EXEMPT or any(rel.startswith(p) for p in _DOC_KEY_EXEMPT_PREFIXES):
             continue
         stray.extend(f"{rel}:{line}" for line in _doc_key_uses(ast.parse(path.read_text(encoding="utf-8"))))
-    assert not stray, ("the old document key is read as a raw literal; import STORE_DOC_KEY_OPEN from "
-                       "levain.intention_legacy: " + ", ".join(stray))
+    assert not stray, ("the retired document key is spelled as a raw literal; the store's key is STORE_DOC_KEY_OPEN and the "
+                       "retired one STORE_DOC_KEY_OPEN_V1, both from levain.intention_legacy: " + ", ".join(stray))
 
 
 def test_the_document_key_scan_sees_each_use_shape_and_ignores_prose():
