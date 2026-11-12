@@ -661,7 +661,7 @@ def test_the_win_check_turns_a_done_without_its_card_or_its_wrap_into_a_reason(s
                                on_snapshot=on_snap, on_saved=on_saved)
     (occ_dir / da.RESULT_FILE).write_text(json.dumps(res.as_dict(), default=str))
     assert da.win_check(end, locate=loc, feed=FEED) == "win: the card is not filed"
-    c = cd.from_spec({"kind": "consolidated", "occurrence": "oc-w"}, occ_dir=occ_dir, db_path=db)
+    c = cd.from_spec({"kind": "consolidated", "occurrence": "oc-w"}, occ_dir=occ_dir, db_path=db, store_dir=Path(db).parent)
     cd.file_card(review_store, c, feed=FEED)
     assert da.win_check(end, locate=loc, feed=FEED) is None
     m = sn.read_manifest(occ_dir)
@@ -966,17 +966,18 @@ def test_register_dream_refuses_a_bad_time_before_anything_is_written(astore):
 
 
 def test_the_signing_card_says_the_time_and_no_longer_says_no_session_is_live():
-    card = da.signing_card_text(ZONE, per_run_usd=20.0, night_usd=40.0, expires="E", time="03:15")
+    card = da.signing_card_text(ZONE, per_run_usd=20.0, night_usd=40.0, expires="E", time="03:15", store_dir="/s")
     assert "starting at 03:15 (America/New_York)" in card and "every 20 minutes until 05:00" in card
     assert "between 22:00 and 05:00" not in card and "no session is live" not in card
     assert "Seats may be live" in card and "new signed link" in card
-    assert "starting at 00:00" in da.signing_card_text(ZONE, per_run_usd=20.0, night_usd=40.0, expires="E")
+    assert "starting at 00:00" in da.signing_card_text(ZONE, per_run_usd=20.0, night_usd=40.0, expires="E",
+                                                       store_dir="/s")
     shadow = da.shadow_signing_card_text(ZONE, flow_root="/f", scratch="/s", coord_dir="/c", agent_dir="/a",
                                          flow_instructions="/i", facts_path="/x", model="m", per_run_usd=20.0,
                                          night_usd=40.0, expires="E", time="00:15")
     assert "starting at 00:15 (America/New_York)" in shadow and "between 22:00 and 05:00" not in shadow
     with pytest.raises(da.TimeRefused):
-        da.signing_card_text(ZONE, per_run_usd=1.0, night_usd=2.0, expires="E", time="12:00")
+        da.signing_card_text(ZONE, per_run_usd=1.0, night_usd=2.0, expires="E", time="12:00", store_dir="/s")
 
 
 def _enable(tmp_path, capsys, *extra):

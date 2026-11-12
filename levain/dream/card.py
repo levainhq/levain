@@ -254,24 +254,31 @@ def _models(doc: Mapping[str, Any] | None, given: Sequence[str] | None) -> list[
     return seen
 
 
-_STORE_DIR_UNKNOWN = "<the store's directory>"
+def required_store_dir(store_dir: object) -> str:
+    """``store_dir`` as text, or a ValueError. A card's commands (``levain dream rollback``, ``levain dream recover``)
+    REQUIRE ``--store-dir``; a caller with no store to name must not get a command that cannot run, so there is no
+    placeholder and no default (the class of L3 N1: an optional argument that printed a stand-in in place of a path)."""
+    if store_dir is None or not str(store_dir).strip():
+        raise ValueError("the store's directory (the one holding memory.db) is required: the card's commands need "
+                         "--store-dir and cannot run without it")
+    return str(store_dir)
 
 
-def remedy_for(kind: str, occurrence: str, *, store_dir: Path | str | None = None,
-               occ_dir: Path | str | None = None) -> str:
+def remedy_for(kind: str, occurrence: str, *, store_dir: Path | str, occ_dir: Path | str | None = None) -> str:
     """The next step a card of ``kind`` names, written so that every command in it runs as printed.
 
     ``levain dream rollback`` and ``levain dream recover`` both REQUIRE ``--store-dir`` (the directory holding the
-    store's ``memory.db``), so the remedy carries it when ``store_dir`` is known; a caller that cannot know it gets the
-    placeholder ``<the store's directory>``, which is plainly not a path. The occurrence is its bare id when its dir sits
+    store's ``memory.db``), so ``store_dir`` is REQUIRED here too, with no default: a blank one raises
+    :func:`required_store_dir`'s ValueError. The occurrence is its bare id when its dir sits
     under ``<store dir>/dream/``, else the dir's full path (the two forms the verbs accept). Only a ``consolidated``
     card can be rolled back: a ``failed`` one changed nothing (the executor saves or leaves the text alone), and a
     ``rolled-back`` one is already undone, so neither names a rollback (the verb refuses both)."""
-    sd = shlex.quote(str(store_dir)) if store_dir is not None else _STORE_DIR_UNKNOWN
+    store_dir = required_store_dir(store_dir)
+    sd = shlex.quote(store_dir)
     occ = occurrence
     if occ_dir is not None:
         occ_dir = Path(occ_dir)
-        occ = occ_dir.name if store_dir is not None and _under_dream(occ_dir, store_dir) else str(occ_dir.resolve())
+        occ = occ_dir.name if _under_dream(occ_dir, store_dir) else str(occ_dir.resolve())
     occ = shlex.quote(occ)
     if kind == "consolidated":
         return f"levain dream rollback {occ} --store-dir {sd}"
@@ -292,18 +299,20 @@ def _under_dream(occ_dir: Path | str, store_dir: Path | str) -> bool:
         return False
 
 
-def build_card(kind: str, *, occurrence: str, agent_id: str = "dream", day: str | None = None, reason: str = "",
+def build_card(kind: str, *, occurrence: str, store_dir: Path | str | None, agent_id: str = "dream",
+               day: str | None = None, reason: str = "",
                manual: bool = False, slot: str | None = None, prior: str = "", saved: str = "",
                notes: Mapping[str, Any] | None = None, source: Mapping[str, str] | None = None,
                his_extra: Sequence[str] = (), own_extra: Sequence[str] = (), models: Sequence[str] | None = None,
                usage_doc: Mapping[str, Any] | None = None, remedy: str | None = None,
-               out_dir: Path | str | None = None, limit: int = BODY_LIMIT,
-               store_dir: Path | str | None = None) -> Card:
+               out_dir: Path | str | None = None, limit: int = BODY_LIMIT) -> Card:
     """Build one card. ``out_dir`` (the occurrence dir) receives ``card_diff.txt`` always when ``prior`` or ``saved``
     is given, and ``card_his.json`` / ``card_own.json`` when a list is cut from the body; a cut that needs a path and
     has no ``out_dir`` raises :class:`CardError`. ``his_extra`` is recovery's integrity lines (``unknown-commit``).
     ``remedy`` is the next step the card names; omitted, :func:`remedy_for` writes it for the card's kind, carrying
-    ``store_dir`` (the directory holding the store's ``memory.db``) so the commands it prints run as printed."""
+    ``store_dir`` (the directory holding the store's ``memory.db``) so the commands it prints run as printed.
+    ``store_dir`` has NO default: the caller says it. ``None`` is the caller saying "this card has no store of its own",
+    which is legal only with a ``remedy`` of the caller's own (a shadow night); without one, :func:`remedy_for` refuses."""
     if kind not in KINDS:
         raise CardError(f"a card kind is one of {', '.join(KINDS)} (got {kind!r})")
     out = Path(out_dir) if out_dir is not None else None
@@ -419,14 +428,16 @@ def texts_for(db_path: Path | str, occ_dir: Path | str) -> tuple[str, str]:
                     f"(sha256 {recorded[:12]}): a later write has moved the live text")
 
 
-def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, db_path: Path | str | None = None,
+def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, store_dir: Path | str | None,
+              db_path: Path | str | None = None,
               notes: Mapping[str, Any] | None = None, source: Mapping[str, str] | None = None,
               day: str | None = None, manual: bool = False, slot: str | None = None,
-              agent_id: str = "dream", store_dir: Path | str | None = None) -> Card:
+              agent_id: str = "dream") -> Card:
     """A card from the spec recovery (``RecoverResult.card``) or a rollback (``RollbackResult.card``) returned, plus
     the occurrence's own files: the snapshot's prior text, the text the dream saved (when ``db_path`` is given) and
     ``usage.json``. The spec's ``his`` lines (``unknown-commit``) are his. A spec with no ``remedy`` gets
-    :func:`remedy_for`'s, carrying ``store_dir`` (default: the directory of ``db_path``)."""
+    :func:`remedy_for`'s, carrying ``store_dir``, which is REQUIRED (no default, and no guess from ``db_path``);
+    ``None`` is legal only for a spec that carries its own ``remedy``."""
     occ = Path(occ_dir)
     kind = str(spec.get("kind"))
     prior = saved = ""
@@ -439,8 +450,7 @@ def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, db_path: Path | s
     return build_card(kind, occurrence=str(spec.get("occurrence") or occ.name), agent_id=agent_id, day=day,
                       reason=reason, manual=manual, slot=slot, prior=prior, saved=saved, notes=notes, source=source,
                       his_extra=list(spec.get("his") or []), usage_doc=_usage.read_doc(occ),
-                      remedy=spec.get("remedy"), out_dir=occ,
-                      store_dir=store_dir if store_dir is not None else (Path(db_path).parent if db_path else None))
+                      remedy=spec.get("remedy"), out_dir=occ, store_dir=store_dir)
 
 
 def file_card(store: Any, card: Card, *, feed: str = FEED, thread_id: str | None = None) -> tuple[Any, bool]:
