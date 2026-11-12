@@ -242,7 +242,7 @@ def _orphan_tmp(db: Path) -> list[str]:
 
 def _card(kind: str, reason: str, occ: str, *, his: list[str] | None = None) -> dict[str, Any]:
     return {"kind": kind, "reason": reason, "occurrence": occ, "his": his or [],
-            "dedupe_key": f"dream:{occ}", "remedy": f"levain dream rollback {occ}"}
+            "dedupe_key": f"dream:{occ}"}      # the remedy is added by :func:`_with_remedy`, which knows the store
 
 
 def _record(occ_dir: Path, res: RecoverResult) -> RecoverResult:
@@ -302,8 +302,9 @@ def recover(store_path: Path | str, occ_dir: Path | str, *, state: str = "launch
     db, occ_dir = Path(store_path).resolve(), Path(occ_dir)
     prior = _sn._read_json(occ_dir / RECOVERY_RECORD)
     if prior and prior.get("ending") in ("failed", "done", "stopped"):
-        return RecoverResult(prior["ending"], prior.get("reason", ""), prior.get("card"), list(prior.get("notes", [])),
-                             prior.get("child", "none-recorded"), prior.get("wrap", "untouched"), True)
+        return _with_remedy(RecoverResult(prior["ending"], prior.get("reason", ""), prior.get("card"),
+                                          list(prior.get("notes", [])), prior.get("child", "none-recorded"),
+                                          prior.get("wrap", "untouched"), True), db, occ_dir)
     pfile = occ_dir / "progress.json"
     if pfile.exists():
         prog = _sn._read_json(pfile)
@@ -331,6 +332,19 @@ def recover(store_path: Path | str, occ_dir: Path | str, *, state: str = "launch
             res.card = _card("failed", "child-not-confirmed", occ_dir.name, his=[line])
         else:
             res.card = {**res.card, "his": [*res.card.get("his", []), line]}
+    return _with_remedy(res, db, occ_dir)
+
+
+def _with_remedy(res: RecoverResult, db: Path, occ_dir: Path) -> RecoverResult:
+    """Give the result's card its next step, written by :func:`levain.dream.card.remedy_for` for the card's kind and
+    carrying the store, so the commands in it run as printed. A card recorded by an older build (it names a rollback on
+    every kind, and without ``--store-dir``) is rewritten the same way: its remedy is a command, and it was wrong."""
+    from levain.dream import card as _cd
+
+    if res.card is not None:
+        res.card = {**res.card, "remedy": _cd.remedy_for(str(res.card.get("kind")),
+                                                         str(res.card.get("occurrence") or occ_dir.name),
+                                                         store_dir=db.parent, occ_dir=occ_dir)}
     return res
 
 
