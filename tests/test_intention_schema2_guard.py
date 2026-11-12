@@ -48,6 +48,18 @@ def test_the_installed_anneal_is_accepted(tmp_path):
     assert store.add(type="thought", text="x")["id"].startswith("intention-")
 
 
+def test_list_open_readonly_refuses_a_retired_key_document_the_loader_let_through(tmp_path, monkeypatch):
+    path = tmp_path / "memory.spores.json"
+    path.write_text(json.dumps({"schema_version": 1, "spores": [{"id": "spore-1", "status": "open", "type": "thought",
+                                                                  "text": "x"}], "resolved": []}))
+    # a loader that returns the document without refusing it: the raw read must still not answer []
+    store_cls = type(guarded_intention_store(path))
+    monkeypatch.setattr(store_cls, "_load", lambda self: json.loads(path.read_text()))
+    with pytest.raises(RuntimeError) as exc:
+        list_open_readonly(path)
+    assert "migrate-key" in str(exc.value)
+
+
 def test_list_open_readonly_reads_a_schema2_document(tmp_path):
     path = tmp_path / "memory.spores.json"
     store = guarded_intention_store(path)
