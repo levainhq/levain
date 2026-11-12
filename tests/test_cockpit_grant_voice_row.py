@@ -214,3 +214,66 @@ def test_the_grant_slot_shots(world, tmp_path, monkeypatch):
     assert "missing" not in phone["values"] and "missing" not in desk["values"]
     for name in ("390", "1440"):
         assert (out_dir / f"{prefix}_{name}.png").stat().st_size > 1000, name
+
+
+# --- a stopped grant (row 190): a key that signed it was revoked ------------------------------------------------------
+
+STOPPED_WHY = "the key that signed it was revoked"
+
+
+def _stopped(row: dict, why: str = STOPPED_WHY) -> dict:
+    return {**row, "state": "stopped", "stopped_why": why}
+
+
+@needs_browser
+def test_a_stopped_consent_row_says_stopped_with_its_reason_and_no_until(world, tmp_path, monkeypatch):
+    """Head "standing grant · stopped", one facts line with the reason and the way back, no "until <date>" (the date means
+    nothing for a grant that answers nothing), dimmed, and still revocable. Red with the stopped branch of grantCard reverted
+    (the row said "until 2026-12-01T00:00:00Z" beside "stopped")."""
+    gid = "cg-0000000000aa"
+    got = _drive_cards(tmp_path, world, monkeypatch, [_stopped(_consent_row(gid))])
+    html, text = got[gid]
+    assert "standing grant · stopped" in text, text
+    assert f"Stopped: {STOPPED_WHY}. It answers nothing. Create it again to use it." in text, text
+    assert "until" not in text.replace("Create it again to use it", ""), text
+    assert "2026-12-01" not in text, text
+    assert "ext-dim" in html and '<code class="consent-code">' + _REVOKE_HTML + gid + "</code>" in html, html
+
+
+@needs_browser
+def test_a_row_stopped_for_its_last_renewer_says_that(world, tmp_path, monkeypatch):
+    gid = "cg-0000000000aa"
+    why = "the key that last renewed it was revoked"
+    got = _drive_cards(tmp_path, world, monkeypatch, [_stopped(_consent_row(gid), why)])
+    assert f"Stopped: {why}. It answers nothing." in got[gid][1], got[gid][1]
+
+
+@needs_browser
+def test_a_stopped_voice_key_says_to_set_it_again_and_is_not_live_until_revoked(world, tmp_path, monkeypatch):
+    """A voice key has no renew and its recovery is a new set, so its line says set. Red with the voice branch printing
+    "Live until you revoke it" or the bare state word beside the stopped line."""
+    gid = "vk-0000000000aa"
+    got = _drive_cards(tmp_path, world, monkeypatch, [_stopped(_voice_row("openai", gid))])
+    html, text = got[gid]
+    assert "OpenAI voice key" in text and "standing grant · stopped" in text, text
+    assert f"Stopped: {STOPPED_WHY}. It answers nothing. Set it again to use it." in text, text
+    assert "Live until you revoke it" not in text, text
+    assert '<span class="ext-meta">stopped</span>' not in html, html
+
+
+@needs_browser
+def test_an_expired_row_and_a_live_row_draw_as_they_did_beside_a_stopped_one(world, tmp_path, monkeypatch):
+    """Only a stopped row changes: the live row is string-equal to what it was, the expired row keeps its date."""
+    rows = [_consent_row("cg-0000000000aa"), {**_consent_row("cg-0000000000bb"), "state": "expired"},
+            _stopped(_consent_row("cg-0000000000cc"))]
+    got = _drive_cards(tmp_path, world, monkeypatch, rows)
+    assert got["cg-0000000000aa"][0] == CONSENT_BEFORE, got["cg-0000000000aa"][0]
+    assert "expired 2026-12-01T00:00:00Z" in got["cg-0000000000bb"][1] and "Stopped" not in got["cg-0000000000bb"][1]
+    assert "Stopped" in got["cg-0000000000cc"][1]
+
+
+def test_the_served_page_carries_the_stopped_sentence():
+    """Where no browser is available the renderer's source still carries the words the stopped row draws (the running-page
+    look is a person's to take)."""
+    js = (Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "dashboard_core.js").read_text()
+    assert '"Stopped"' in js and '". It answers nothing. "' in js and '"Create it again"' in js

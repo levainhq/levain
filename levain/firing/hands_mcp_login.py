@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from levain import pathid
+from levain.authority import STOPPED_BORN as STOPPED_WORDS
 from levain.firing import hands_login as hl
 from levain.firing.confinement import HandsIdentity
 from levain.hands_mcp import registration_problems
@@ -274,6 +275,9 @@ def entry_for_signin(entity_dir: Path | str, cockpit_root: Path | str, name: str
         if not known:
             raise HandsMcpRefused(f"{name!r} is not registered for the hands account; nothing was changed")
         why = sorted({w for gid, w in skipped if any(k["id"] == gid for k in known)}) or ["not live"]
+        if why == ["signer"]:       # a renew does not bring a stopped entry back: it has to be registered again
+            raise HandsMcpRefused(f"{name!r} is registered but stopped: {STOPPED_WORDS}; register it again with a key "
+                                  "you hold. Nothing was changed")
         raise HandsMcpRefused(f"{name!r} is registered but not live ({', '.join(why)}); renew or re-register it. "
                               "Nothing was changed")
     if e["transport"] != "remote":
@@ -483,7 +487,8 @@ def status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None) 
         rows.append((False, f"hands mcp config: unknown (the hands account's server list could not be read: {exc})"))
     live_names = {e["name"]: e for e in live}
     for gid, why in skipped:
-        rows.append((True, f"hands mcp entry {gid}: not live ({why})"))
+        rows.append((True, f"hands mcp entry {gid}: " + (f"stopped: {STOPPED_WORDS} (answers nothing; register it "
+                                                          "again to use it)" if why == "signer" else f"not live ({why})")))
     if held is not None:
         for name in sorted(set(record) | set(held) | set(live_names)):
             rows.append(server_status(name, record.get(name), held.get(name), live_names.get(name)))
