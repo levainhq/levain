@@ -39,6 +39,13 @@ def _window_end() -> str:
     return da.WINDOW["end"]
 
 
+def _floor_min_hours() -> str:
+    """The least orphan-wrap age floor, as the validator holds it (never restated in help or status text)."""
+    from levain.dream import agent as da
+
+    return f"{da.orphan_floor_minimum_hours():g}"
+
+
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser("dream", help="Dreaming: run on a store copy; ready, rollback, recover, drill, shadow; "
                                             "enable the scheduled dream; start one by hand.",
@@ -179,8 +186,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                          "it. Set, admission passes the wrap only when it is older than this AND older than the "
                          "executor's own bound, and the run then clears it and consolidates; a live seat's wrap "
                          "that outlasts the floor is cancelled, so pick it above any wrap a seat honestly holds. "
-                         "`off` clears the floor. Needs --store-dir; kept (an install fact) when a later enable "
-                         "does not pass it.")
+                         f"The least floor is {_floor_min_hours()} hours; `off` clears the floor. "
+                         "Needs --store-dir; kept (an install fact) when a later enable does not pass it.")
     en.add_argument("--json", action="store_true")
     en.set_defaults(func=run_dream_enable)
     stt = sub.add_parser("start", allow_abbrev=False, help="Start the registered dream now, by hand (same signed link and ceiling).",
@@ -371,7 +378,8 @@ def _orphan_floor_line(hours: float | None, problem: str | None, da: object) -> 
     if hours is None:
         return ("orphan wrap floor: unset (orphan healing is off for a wrap a seat left open: it keeps the dream quiet "
                 "until a person clears it; a wrap the dream itself left open is cleared past the executor's "
-                f"{low / 60:.1f} min bound. Set one with `--orphan-floor-hours <hours>` and --store-dir)")
+                f"{low / 60:.1f} min bound. Set one with `--orphan-floor-hours <hours>` (at least "
+                f"{_floor_min_hours()} hours) and --store-dir)")
     return (f"orphan wrap floor: {hours:g} hours (an open wrap the dream did not open, older than this and than the "
             f"executor's {low / 60:.1f} min bound, is cleared by the run, which then consolidates; `--orphan-floor-hours "
             "off` unsets it)")

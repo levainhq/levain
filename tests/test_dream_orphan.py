@@ -565,3 +565,59 @@ def test_the_ready_verb_shows_the_floor_it_was_given_from_the_agent_dir(ent, tmp
     out = capsys.readouterr().out
     assert "ready for dream-day" in out and "proven dead" in out, out
     assert "the operator's floor of 24 h: proven dead" in out, out         # the floor as given, not any 24 in the output
+
+
+# ----------------------------------------------------------------------------- 1692: the floor is 12 hours or off
+
+def test_the_floor_minimum_is_twelve_hours_and_one_named_constant():
+    assert da.ORPHAN_FLOOR_MIN_HOURS == 12
+
+
+@pytest.mark.parametrize("low", [1, 2, 11, 11.9, 11.99, HORIZON_S / 3600.0, 55.5 / 60.0, 0.93])
+def test_a_floor_under_twelve_hours_is_refused_and_the_text_names_twelve(low):
+    with pytest.raises(da.InstallRefused) as exc:
+        da.validate_orphan_floor_hours(low)
+    assert f"{da.ORPHAN_FLOOR_MIN_HOURS:g} hours" in str(exc.value), str(exc.value)
+
+
+@pytest.mark.parametrize("ok", [12, 12.0, 12.5, 24, 72])
+def test_twelve_hours_and_above_are_accepted(ok):
+    assert da.validate_orphan_floor_hours(ok) == ok
+
+
+def test_off_stays_valid_and_a_floor_of_twelve_round_trips_through_enable(ent, tmp_path, capsys):
+    base = enable_args(ent, tmp_path)
+    code, out, err, ag = run_enable(tmp_path, capsys, *base, "--orphan-floor-hours", "12")
+    assert code == 0 and da.orphan_floor_s(ag) == 12 * HOUR, (out, err)
+    code, out, err, ag = run_enable(tmp_path, capsys, *base, "--orphan-floor-hours", "off")
+    assert code == 0 and da.orphan_floor_s(ag) is None, (out, err)
+
+
+def test_enable_refuses_eleven_point_nine_and_names_the_minimum(ent, tmp_path, capsys):
+    code, out, err, ag = run_enable(tmp_path, capsys, *enable_args(ent, tmp_path), "--orphan-floor-hours", "11.9")
+    assert code == 1 and "12 hours" in err and "nothing was registered" in err, (out, err)
+    assert not (ag / da.INSTALL_FILE).exists()
+
+
+def test_a_stored_floor_under_twelve_reads_as_unset_with_a_problem_naming_twelve(ent, tmp_path):
+    facts(ent, tmp_path)
+    path = ent.agent_dir / da.INSTALL_FILE
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    path.write_text(json.dumps({**doc, "orphan_floor_hours": 3}), encoding="utf-8")
+    hours, problem = da.orphan_floor_state(ent.agent_dir)
+    assert hours is None and problem and "12 hours" in problem, problem
+    assert da.orphan_floor_s(ent.agent_dir) is None
+
+
+def test_every_operator_surface_that_quotes_the_floor_quotes_the_constant(ent, tmp_path, capsys):
+    from levain.dream.cli import add_parsers
+
+    minimum = f"{da.ORPHAN_FLOOR_MIN_HOURS:g} hours"
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers()
+    add_parsers(sub)
+    enable = sub.choices["dream"]._subparsers._group_actions[0].choices["enable"]
+    help_text = " ".join(a.help or "" for a in enable._actions if "--orphan-floor-hours" in a.option_strings)
+    assert minimum in help_text, help_text
+    code, out, err, _ = run_enable(tmp_path, capsys, *enable_args(ent, tmp_path))
+    assert code == 0 and minimum in out, out                       # the unset status line says what a floor may be
