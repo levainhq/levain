@@ -1321,6 +1321,10 @@ class DreamInstall:
 INSTALL_SCHEMA = 1
 #: ``write_install(orphan_floor_hours=ORPHAN_FLOOR_OFF)`` clears the floor (back to the shipped, unset state)
 ORPHAN_FLOOR_OFF = "off"
+#: the least age floor, in hours, an operator may set: the number Phill chose (np-6108f5e9 (a): "12 hours, the number
+#: you chose, so the floor is 12 or 'off'"). Below it a live seat's wrap that honestly waits on review would be
+#: cancelled by the dream. The one home of the number: the validator, its refusal text and the CLI quote this.
+ORPHAN_FLOOR_MIN_HOURS = 12
 #: the read-only copy of flow's instructions a shadow install composes with, in the agent store's directory
 SHADOW_INSTRUCTIONS = "shadow_instructions.md"
 #: the install facts only a shadow install carries; a write that does not pass ``shadow_flow_root`` drops them all
@@ -1331,22 +1335,28 @@ class InstallRefused(ValueError):
     """The install facts cannot be written or trusted; the message names the file and the one fact at fault."""
 
 
+def orphan_floor_minimum_hours() -> float:
+    """The least floor that validates: :data:`ORPHAN_FLOOR_MIN_HOURS`, or the executor's own horizon
+    (``ready.executor_orphan_horizon_s``) should a later release raise that above it, since the executor never discards
+    a younger wrap and a lower floor would admit a run that then refuses and spends the window's one attempt."""
+    return max(float(ORPHAN_FLOOR_MIN_HOURS), _ready.executor_orphan_horizon_s() / 3600.0)
+
+
 def validate_orphan_floor_hours(value: object) -> float:
     """``value`` as the age floor in hours, or :class:`InstallRefused`. A real number (not a bool, not a string), finite,
-    and not under the executor's own horizon (``ready.executor_orphan_horizon_s``): the executor never discards a younger
-    wrap, so a lower floor would admit a run that then refuses and spends the window's one attempt. The floor can only
-    raise the age a wrap must reach, never lower it."""
+    and not under :func:`orphan_floor_minimum_hours`. The floor can only raise the age a wrap must reach, never lower
+    it; the way to no floor is :data:`ORPHAN_FLOOR_OFF`, not a small number."""
     try:
         finite = not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
     except OverflowError:                       # an integer too large for a float (a hand-written 10**400)
         finite = False
     if not finite or value <= 0:
         raise InstallRefused(f"orphan_floor_hours {value!r:.80} is not a positive number of hours")
-    low = _ready.executor_orphan_horizon_s() / 3600.0
+    low = orphan_floor_minimum_hours()
     if value < low:
-        raise InstallRefused(f"orphan_floor_hours {value!r} is under the executor's own age rule ({low:.2f} hours, its "
-                             "bound plus grace plus margin): the executor never discards a younger wrap, so a lower "
-                             "floor would do nothing")
+        raise InstallRefused(f"orphan_floor_hours {value!r} is under the minimum of {low:g} hours: a live seat's wrap "
+                             "can honestly wait that long (on review, say) and a lower floor would let the dream cancel "
+                             f"it. Use {low:g} or more, or `{ORPHAN_FLOOR_OFF}` for no floor")
     return value
 
 
