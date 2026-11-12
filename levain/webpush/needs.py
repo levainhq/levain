@@ -101,8 +101,9 @@ def _key(queue_dir: "Path | str") -> str:
 
 
 def _close_inherited() -> None:
-    """After a fork the child holds the parent's lock fd and ownership claim; it is not the owner. Close the fd (the parent's
-    flock lives on in its own open file description) and forget the claim."""
+    """After a fork the child holds the parent's lock fd and ownership claim; it is not the owner. Close the fd (the child
+    shares the parent's open file description, so closing here releases nothing: the parent's flock lives on while the
+    parent's own fd stays open) and forget the claim."""
     global _OWN_LOCK
     _OWN_LOCK = threading.Lock()      # the forking thread may have been mid-_own: never inherit a held lock
     for fd, _pid in list(_OWNED.values()):
