@@ -264,6 +264,12 @@ def required_store_dir(store_dir: object) -> str:
     return str(store_dir)
 
 
+#: The hand start (``levain dream start``) goes through the same signed link and ceiling as a scheduled run. It runs
+#: against the default agent store unless it is given ``--agent-store-dir`` (the one ``levain dream enable`` was given),
+#: so the sentence that names it says so.
+_START_NOW = "`levain dream start` runs it now under the same signed link (add --agent-store-dir if enable was given one)"
+
+
 def remedy_for(kind: str, occurrence: str, *, store_dir: Path | str, occ_dir: Path | str | None = None) -> str:
     """The next step a card of ``kind`` names, written so that every command in it runs as printed.
 
@@ -272,7 +278,9 @@ def remedy_for(kind: str, occurrence: str, *, store_dir: Path | str, occ_dir: Pa
     :func:`required_store_dir`'s ValueError. The occurrence is its bare id when its dir sits
     under ``<store dir>/dream/``, else the dir's full path (the two forms the verbs accept). Only a ``consolidated``
     card can be rolled back: a ``failed`` one changed nothing (the executor saves or leaves the text alone), and a
-    ``rolled-back`` one is already undone, so neither names a rollback (the verb refuses both)."""
+    ``rolled-back`` one is already undone, so neither names a rollback (the verb refuses both). A ``failed`` run and
+    the generic did-not-consolidate card name the hand start, because a manual run is the catch-up for exactly that
+    failure (the window's one-attempt check is waived for it)."""
     store_dir = required_store_dir(store_dir)
     sd = shlex.quote(store_dir)
     occ = occurrence
@@ -285,11 +293,11 @@ def remedy_for(kind: str, occurrence: str, *, store_dir: Path | str, occ_dir: Pa
     if kind == "failed":
         return ("nothing was consolidated, so there is nothing to roll back; the day's episodes stay and go to the next "
                 f"dream. If the run did not end cleanly, `levain dream recover {occ} --store-dir {sd}` settles the "
-                "store side; the dream tries again in its next window")
+                f"store side; the dream tries again in its next window, or {_START_NOW}")
     if kind == "rolled-back":
         return ("nothing further: this dream was rolled back; the text it replaced is kept under reverted-from/ in the "
                 "occurrence's directory")
-    return "nothing was consolidated; the dream tries again in its next window"
+    return f"nothing was consolidated; the dream tries again in its next window, or {_START_NOW}"
 
 
 def _under_dream(occ_dir: Path | str, store_dir: Path | str) -> bool:
