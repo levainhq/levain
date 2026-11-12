@@ -427,10 +427,11 @@ def test_each_dictate_error_event_says_its_own_reason(tmp_path, w) -> None:
 
 @needs_browser
 def test_a_dictate_start_that_throws_says_so(tmp_path, w) -> None:
-    """Red with: the start() catch freeing the box with no note (the tap does nothing, silently)."""
-    thrower = RECOG + "\n(() => { const C = window.SpeechRecognition; window.SpeechRecognition = class extends C { start() { throw new DOMException('x', 'InvalidStateError'); } }; })();"
+    """Red with: the start() catch freeing the box with no note (the tap does nothing, silently); or with no abort() of the
+    recognizer that threw (a half-started engine is left live behind a freed box)."""
+    thrower = RECOG + "\n(() => { const C = window.SpeechRecognition; window.SpeechRecognition = class extends C { start() { throw new DOMException('x', 'InvalidStateError'); } abort() { window.__aborts = (window.__aborts || 0) + 1; } }; })();"
     out = _page(tmp_path, w, [
         *_boxes("a"),
-        {"eval": f"{_dict()}.click(); JSON.stringify([window.__notes[window.__notes.length - 1], window.__m.a.busy()])"},
+        {"eval": f"{_dict()}.click(); JSON.stringify([window.__notes[window.__notes.length - 1], window.__m.a.busy(), window.__aborts || 0])"},
     ], init=thrower)
-    assert json.loads(out["values"][-1]) == ["Dictation could not start; tap Dictate again.", False], out["values"]
+    assert json.loads(out["values"][-1]) == ["Dictation could not start; tap Dictate again.", False, 1], out["values"]
