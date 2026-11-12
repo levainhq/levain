@@ -109,7 +109,7 @@ def test_contained_shell_refusal_answers_a_chat_call(ws):
     assert _refusal(ws, "chat:toolu_1") is None
 
 
-# --- D2: the no-decider gate counts a live SH1 grant for a chat Bash call with a proof ----------------------
+# --- D2: the no-decider gate counts keys only: a live SH1 grant alone arms nothing ----------------------------
 
 def _only_sh1(monkeypatch, tmp_path, grant):
     root = tmp_path / "cockpit"
@@ -120,12 +120,15 @@ def _only_sh1(monkeypatch, tmp_path, grant):
     return cc.AdapterSettings(cockpit_data_root=str(root))
 
 
-def test_an_sh1_grant_alone_lets_a_chat_bash_call_with_a_proof_be_filed(tmp_path, monkeypatch):
+def test_an_sh1_grant_alone_does_not_arm_the_gate_for_a_chat_bash_call_with_a_proof(tmp_path, monkeypatch):
+    """With no active key a grant is not counted (every key that signed it is revoked, so it answers nothing): the
+    chat Bash call is not filed and the refusal says no enrolled key is active."""
     settings = _only_sh1(monkeypatch, tmp_path, _sh1(str(tmp_path)))
     q = Q(None)
     out = ex(_event("Bash", INPUT, tool_use_id="toolu_1"), q, tmp_path, settings=settings, nonce=NONCE,
              proof=_proof(tmp_path))
-    assert len(q.filed) == 1 and not (isinstance(out, cc.Abstained) and out.reason == "no_decider")
+    assert isinstance(out, cc.Abstained) and out.reason == "no_decider" and q.filed == []
+    assert out.why == "no enrolled key is active"
 
 
 @pytest.mark.parametrize("case", ["hook", "no_proof", "not_bash", "expired"])
