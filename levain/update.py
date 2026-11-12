@@ -399,7 +399,7 @@ def _unreadable_line(paths, exc: Exception) -> str:
 def _migrate_intentions(install: Path, emit: Emit, *, held: bool = False) -> bool:
     """Rewrite the store's open ``seed`` records to ``someday`` (ruling H8, :mod:`levain.intention_migrate`): copied
     first, idempotent, one compare-and-set per record. Every line the migration reports is printed. True when the
-    migration REFUSED (an unwritable backup, an unreadable store, an anneal-memory below 1.0.7) or left an open ``seed``
+    migration REFUSED (an unwritable backup, an unreadable store, an anneal-memory older than ``manifest.KNOWN_GOOD_ANNEAL``) or left an open ``seed``
     behind because the store failed on it (a record that merely moved since it was read is not a failure): the caller
     ends the update non-zero, so neither is swallowed.
 

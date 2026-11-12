@@ -9,8 +9,8 @@ What the migration does, in order, and what it refuses:
 
 1. It reads the store file WITHOUT writing it (the raw document, no anneal load: anneal's keyed read backfills origin
    keys and saves, which would change bytes). No open ``seed`` record means it stops here: no backup, the store is not
-   touched, a second run is a no-op. An installed anneal-memory below 1.0.7 (no ``Intention*`` names, no ``id_prefix``)
-   REFUSES the migration here, before any copy: nothing is copied or rewritten.
+   touched, a second run is a no-op. An installed anneal-memory older than the pinned one (it keys the open list differently:
+   :func:`levain.intentions.guarded_intention_store`) REFUSES the migration here, before any copy: nothing is copied or rewritten.
 2. It copies the store file to ``<store dir>/backups/intentions/<store file name>.<UTC time>`` while holding the store's
    own lock (the sibling ``<store>.lock`` anneal serialises every write on), and checks the copy equals the bytes it read.
    A backup that cannot be written REFUSES the migration: nothing is rewritten. The default backup place is git-ignored
@@ -55,7 +55,7 @@ LABEL_NOTE = ("the provenance label of each rewritten record's disposition reads
 class MigrationReport:
     """What one run did. ``migrated`` are the ids whose disposition is now ``someday``; ``skipped`` are
     ``(id, why)`` for a record that moved since it was read; ``refused`` is a reason when the run changed nothing
-    because it could not do so safely (an unwritable backup, an unreadable store, an anneal-memory below 1.0.7);
+    because it could not do so safely (an unwritable backup, an unreadable store, an anneal-memory older than the pin);
     ``unmigrated`` are the skipped ids that are STILL an open ``seed`` after the run (a store fault, not a record that
     moved: that one is its writer's); ``backup`` is the copy taken."""
     migrated: list[str] = field(default_factory=list)
@@ -108,8 +108,8 @@ def migrate_seed_to_someday(paths: Any, *, now: datetime | None = None,
     if fcntl is None:                            # pragma: no cover - the guarded writes below need the POSIX lock
         report.refused = "this platform has no file locking, which the compare-and-set needs"
         return report
-    # The anneal names the rewrite needs come BEFORE the backup (1111-32 L1 MED-1): an anneal-memory below 1.0.7 has no
-    # `Intention*` names and no `id_prefix`, and finding that out after the copy left a raw ImportError mid-update and one
+    # The anneal names the rewrite needs come BEFORE the backup (1111-32 L1 MED-1): an anneal-memory older than the pin has
+    # no schema-2 open key (the store guard refuses it), and finding that out after the copy left a raw ImportError mid-update and one
     # more backup per retry. Building the store reads and writes nothing (anneal's constructor only keeps the path).
     try:
         from anneal_memory.spores import IntentionError
