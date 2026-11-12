@@ -185,7 +185,13 @@ def start(store: Any, *, clock: Callable[[], datetime] | None = None, authority:
     if res.outcome == ctl.SKIPPED_NO_INPUT:
         return Started(1, res.outcome, f"{oid} ended skipped-no-input: nothing was started. "
                                        f"{_why_no_input(inst, store, oid, now)}", oid, resumed)
-    if res.outcome in (ctl.NO_SLOT, ctl.UNCLASSIFIED, ctl.NOT_ADMITTED):
+    if res.outcome == ctl.NOT_ADMITTED:
+        # the row is by definition not admitted: another start launched it, or something ended it. It is not this
+        # start's to end or to retry.
+        return Started(1, res.outcome, f"{oid} was no longer admitted when this start reached it ({res.reason}): "
+                                       "another start launched or ended it, so this one started nothing. "
+                                       "`levain agents show dream` says which", oid, resumed)
+    if res.outcome in (ctl.NO_SLOT, ctl.UNCLASSIFIED):
         return Started(1, res.outcome, f"{oid} did not launch ({res.outcome}: {res.reason}); it stays admitted, and "
                                        "running `levain dream start` again retries that same occurrence",
                        oid, resumed)
