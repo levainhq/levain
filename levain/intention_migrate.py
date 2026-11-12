@@ -159,12 +159,10 @@ def migrate_seed_to_someday(paths: Any, *, now: datetime | None = None,
 
 
 def open_seed_ids(paths: Any) -> list[str]:
-    """What :func:`migrate_seed_to_someday` WOULD rewrite, read without writing anything (a dry run's plan). An
-    unreadable store has none to name here: the real run refuses it and says why."""
-    try:
-        return _open_seed_ids(Path(paths.intentions_json))
-    except (OSError, ValueError):
-        return []
+    """What :func:`migrate_seed_to_someday` WOULD rewrite, read without writing anything (a dry run's plan). A missing
+    store has none. An unreadable or malformed one RAISES (OSError or ValueError): an empty answer there would read as
+    "nothing to do" about a store nobody could read, so each caller says it cannot tell."""
+    return _open_seed_ids(Path(paths.intentions_json))
 
 
 def _open_seed_ids(store_path: Path) -> list[str]:

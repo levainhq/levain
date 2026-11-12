@@ -144,6 +144,30 @@ def test_a_dry_run_says_what_it_would_rewrite_and_changes_nothing(install):
     assert "2 open seed record(s) would be rewritten to someday" in "\n".join(lines)
 
 
+@pytest.mark.parametrize("how", ["malformed_json", "not_a_json_object", "a_directory"])
+def test_a_dry_run_on_a_store_it_cannot_read_says_it_cannot_tell_and_exits_non_zero(install, how):
+    """`open_seed_ids` used to turn every read failure into `[]`, so the dry run printed "nothing to reconcile" and exited
+    0 about a store it could not read (1111-32 L3 round 1, codex 6)."""
+    target = _paths(install).intentions_json
+    if how == "malformed_json":
+        target.write_text("{not json", encoding="utf-8")
+    elif how == "not_a_json_object":
+        target.write_text("[1, 2]", encoding="utf-8")
+    else:
+        target.mkdir()
+    lines: list[str] = []
+    assert run_update(install, dry_run=True, no_pip=True, emit=lines.append) == 1
+    text = "\n".join(lines)
+    assert "cannot be read" in text and "cannot tell" in text and "nothing to reconcile" not in text
+
+
+def test_a_dry_run_with_no_intention_store_file_still_has_nothing_to_reconcile(install):
+    assert not _paths(install).intentions_json.exists()
+    lines: list[str] = []
+    assert run_update(install, dry_run=True, no_pip=True, emit=lines.append) == 0
+    assert "nothing to reconcile" in "\n".join(lines)
+
+
 def test_the_migration_also_runs_on_the_reconcile_path(install, monkeypatch):
     """A drifted pack takes the long path through `_run_update`; the migration is there too."""
     from types import SimpleNamespace

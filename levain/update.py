@@ -391,6 +391,11 @@ def _held_line(n: int, *, plan: bool) -> str:
             f"the installed hooks may still be ones that do not know `someday`")
 
 
+def _unreadable_line(paths, exc: Exception) -> str:
+    return (f"intentions: the store {paths.intentions_json} cannot be read ({exc}), so levain cannot tell whether open "
+            f"seed records need rewriting to someday")
+
+
 def _migrate_intentions(install: Path, emit: Emit, *, held: bool = False) -> bool:
     """Rewrite the store's open ``seed`` records to ``someday`` (ruling H8, :mod:`levain.intention_migrate`): copied
     first, idempotent, one compare-and-set per record. Every line the migration reports is printed. True when the
@@ -406,7 +411,11 @@ def _migrate_intentions(install: Path, emit: Emit, *, held: bool = False) -> boo
 
     paths = _install_intention_paths(install)
     if held:
-        ids = open_seed_ids(paths)
+        try:
+            ids = open_seed_ids(paths)
+        except (OSError, ValueError) as exc:
+            emit(_unreadable_line(paths, exc))
+            return False
         if ids:
             emit(_held_line(len(ids), plan=False))
         return False
@@ -418,10 +427,16 @@ def _migrate_intentions(install: Path, emit: Emit, *, held: bool = False) -> boo
 
 def _plan_intention_migration(install: Path, emit: Emit, *, held: bool = False) -> bool:
     """The ``--dry-run`` plan of :func:`_migrate_intentions`, read-only. True when it WOULD rewrite something (``held``:
-    it would wait, so the line says that and it is still True: the plan is not empty)."""
+    it would wait, so the line says that and it is still True: the plan is not empty). A store it cannot read is True too,
+    with a line saying it cannot tell: an unknown is not "nothing to reconcile"."""
     from levain.intention_migrate import open_seed_ids
 
-    ids = open_seed_ids(_install_intention_paths(install))
+    paths = _install_intention_paths(install)
+    try:
+        ids = open_seed_ids(paths)
+    except (OSError, ValueError) as exc:
+        emit(_unreadable_line(paths, exc))
+        return True
     if ids and held:
         emit(_held_line(len(ids), plan=True))
     elif ids:
