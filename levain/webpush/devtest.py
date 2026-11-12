@@ -223,10 +223,11 @@ def _note(queue_dir, device_id: str, event: str, state: str) -> None:
 def _push(queue_dir, device_id: str) -> None:
     """The delayed send, in the timer thread. Pushes to ``device_id`` only. Under a test run it sends nothing unless the
     test replaced ``sender.send`` itself."""
+    from levain.home_guard import under_test_run
     from levain.webpush import sender
 
     try:
-        if os.environ.get("PYTEST_CURRENT_TEST") and getattr(sender.send, "__module__", "") == sender.__name__:
+        if under_test_run() and getattr(sender.send, "__module__", "") == sender.__name__:
             _note(queue_dir, device_id, "pushed", "blocked: test run")
             return
         results = sender.send(queue_dir, kind="devtest", ref=None, title=TITLE, body=BODY, url="/devtest", device=device_id, extra=EXTRA)
