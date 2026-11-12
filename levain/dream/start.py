@@ -262,10 +262,13 @@ def start(store: Any, *, clock: Callable[[], datetime] | None = None, authority:
     if res.outcome == ctl.LAUNCHED:
         try:
             spawn(store.directory, oid)
-        except Exception as exc:  # noqa: BLE001 - a launched row with no fire is reported, and the reaper owns it
+        except Exception as exc:  # noqa: BLE001 - a launched row with no fire is reported, and the tick owns it
             return Started(1, "launched", f"{oid} launched but its fire could not be started ({type(exc).__name__}: "
-                                          f"{exc}); the row is launched with nothing running, and lapses to takeover "
-                                          f"when its {ctl.LEASE_S}s lease runs out", oid, resumed)
+                                          f"{exc}); the row is launched with nothing running. The agents tick spawns "
+                                          f"its fire again from {ctl.SESSION_GRACE_S}s after the launch, and if no "
+                                          f"fire has claimed it when its {ctl.LEASE_S}s launch lease lapses, ends it "
+                                          "stopped/crash_recovered (its slot freed, its reservation settled)",
+                           oid, resumed)
         occ_dir = inst.store_path.parent / "dream" / oid
         return Started(0, "launched", f"{verb} and launched {oid}; its fire runs detached. Its progress and result are "
                                       f"under {occ_dir} (progress.json, result.json), and its card is filed on the desk "
