@@ -115,3 +115,75 @@ def da_id() -> str:
     return AID
 
 
+# ------------------------------------------------------------------------------------------------------------- F2
+
+def test_f2_the_rollback_remedy_on_a_consolidated_card_runs_as_printed(scratch, rs, capsys):
+    r = dream(scratch, "o1", _VALID)
+    assert r.outcome == "saved"
+    got = da._file_run_card("saved", {}, "o1", occ(scratch, "o1"), scratch, rs, "2026-11-02", False, None, FEED)
+    assert got == "filed"
+    remedy = review.list_items(rs, feed=FEED)[0].body["remedy"]
+    assert remedy.startswith("levain dream rollback o1 --store-dir "), remedy
+    assert levain_cli.main(shlex.split(remedy)[1:]) == 0               # the printed command, run through the real CLI
+    assert "rolled back o1" in capsys.readouterr().out
+
+
+def test_f2_a_failed_card_names_no_rollback_and_the_verb_would_have_refused_it(scratch, rs, capsys):
+    dream(scratch, "o1", _VALID)                                       # a saved dream: rollback has something to refuse
+    add_episode(scratch, "a seat's capture after the dream")
+    hold_a_wrap_open_on(scratch)                                      # the seat-wrap race: a wrap opens, the run fails
+    got = da._file_run_card("precondition", {"detail": "wrap in progress: a wrap is already in progress"}, "o2",
+                            occ(scratch, "o2"), scratch, rs, "2026-11-02", False, None, FEED)
+    assert got == "filed"
+    body = review.list_items(rs, feed=FEED)[0].body
+    assert body["kind"] == "failed"
+    assert "levain dream rollback" not in body["remedy"] and "nothing to roll back" in body["remedy"], body["remedy"]
+    assert_levain_commands_parse(body["remedy"])
+    # the remedy it used to print, run for real: refused ("Nothing was changed")
+    assert levain_cli.main(["dream", "rollback", "o1", "--store-dir", str(scratch.parent)]) == 1
+    assert "REFUSED (wrap-open)" in capsys.readouterr().out
+
+
+def hold_a_wrap_open_on(db: Path) -> None:
+    from anneal_memory import Store
+    from anneal_memory.continuity import prepare_wrap
+
+    with Store(str(db), section_schema=None) as s:
+        assert prepare_wrap(s, wrap_token="b" * 32)["status"] == "ready"
+
+
+def test_f2_recovery_cards_carry_the_store_and_a_failed_one_names_no_rollback(scratch):
+    spec = rc._card("failed", rc.UNKNOWN_COMMIT, "o2", his=["x"])
+    assert "remedy" not in spec                                       # the store is not known to the spec
+    c = cd.from_spec(spec, occ_dir=occ(scratch, "o2"), db_path=scratch.parent / "memory.db")
+    assert "levain dream rollback" not in c.body["remedy"]
+    assert str(scratch.parent) in c.body["remedy"]
+    ok = cd.build_card("consolidated", occurrence="o1", store_dir=scratch.parent)
+    assert f"--store-dir {shlex.quote(str(scratch.parent))}" in ok.body["remedy"]
+    done = cd.build_card("rolled-back", occurrence="o1", store_dir=scratch.parent)
+    assert "levain dream rollback" not in done.body["remedy"]          # rolling back twice is "already-reverted"
+
+
+def test_f2_the_signing_card_undo_command_carries_the_store_dir():
+    kw = dict(per_run_usd=20.0, night_usd=40.0, expires="x")
+    known = da.signing_card_text("America/New_York", store_dir="/data/levain store", **kw)
+    assert "levain dream rollback <occurrence> --store-dir '/data/levain store'" in known
+    unknown = da.signing_card_text("America/New_York", **kw)
+    assert "--store-dir <the store's directory>" in unknown            # never a bare command that cannot run
+
+
+
+
+def test_f2_enable_prints_the_undo_command_with_the_installs_store(tmp_path, capsys):
+    import json
+
+    from tests.test_dream_agent import _enable
+
+    e = Entity(tmp_path / "ent")
+    cockpit = tmp_path / "cockpit"
+    cockpit.mkdir()
+    code, out, err, _ = _enable(tmp_path, capsys, "--store-dir", str(e.store_dir), "--cockpit-root", str(cockpit),
+                                "--coord-dir", str(e.coord_dir))
+    assert code == 0, err
+    card = json.loads(out)["signing_card"]
+    assert f"`levain dream rollback <occurrence> --store-dir {e.store_dir.resolve()}`" in card

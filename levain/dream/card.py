@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -253,15 +254,56 @@ def _models(doc: Mapping[str, Any] | None, given: Sequence[str] | None) -> list[
     return seen
 
 
+_STORE_DIR_UNKNOWN = "<the store's directory>"
+
+
+def remedy_for(kind: str, occurrence: str, *, store_dir: Path | str | None = None,
+               occ_dir: Path | str | None = None) -> str:
+    """The next step a card of ``kind`` names, written so that every command in it runs as printed.
+
+    ``levain dream rollback`` and ``levain dream recover`` both REQUIRE ``--store-dir`` (the directory holding the
+    store's ``memory.db``), so the remedy carries it when ``store_dir`` is known; a caller that cannot know it gets the
+    placeholder ``<the store's directory>``, which is plainly not a path. The occurrence is its bare id when its dir sits
+    under ``<store dir>/dream/``, else the dir's full path (the two forms the verbs accept). Only a ``consolidated``
+    card can be rolled back: a ``failed`` one changed nothing (the executor saves or leaves the text alone), and a
+    ``rolled-back`` one is already undone, so neither names a rollback (the verb refuses both)."""
+    sd = shlex.quote(str(store_dir)) if store_dir is not None else _STORE_DIR_UNKNOWN
+    occ = occurrence
+    if occ_dir is not None:
+        occ_dir = Path(occ_dir)
+        occ = occ_dir.name if store_dir is not None and _under_dream(occ_dir, store_dir) else str(occ_dir.resolve())
+    occ = shlex.quote(occ)
+    if kind == "consolidated":
+        return f"levain dream rollback {occ} --store-dir {sd}"
+    if kind == "failed":
+        return ("nothing was consolidated, so there is nothing to roll back; the day's episodes stay and go to the next "
+                f"dream. If the run did not end cleanly, `levain dream recover {occ} --store-dir {sd}` settles the "
+                "store side; the dream tries again in its next window")
+    if kind == "rolled-back":
+        return ("nothing further: this dream was rolled back; the text it replaced is kept under reverted-from/ in the "
+                "occurrence's directory")
+    return "nothing was consolidated; the dream tries again in its next window"
+
+
+def _under_dream(occ_dir: Path | str, store_dir: Path | str) -> bool:
+    try:
+        return Path(occ_dir).resolve().parent == (Path(store_dir).resolve() / "dream")
+    except OSError:
+        return False
+
+
 def build_card(kind: str, *, occurrence: str, agent_id: str = "dream", day: str | None = None, reason: str = "",
                manual: bool = False, slot: str | None = None, prior: str = "", saved: str = "",
                notes: Mapping[str, Any] | None = None, source: Mapping[str, str] | None = None,
                his_extra: Sequence[str] = (), own_extra: Sequence[str] = (), models: Sequence[str] | None = None,
                usage_doc: Mapping[str, Any] | None = None, remedy: str | None = None,
-               out_dir: Path | str | None = None, limit: int = BODY_LIMIT) -> Card:
+               out_dir: Path | str | None = None, limit: int = BODY_LIMIT,
+               store_dir: Path | str | None = None) -> Card:
     """Build one card. ``out_dir`` (the occurrence dir) receives ``card_diff.txt`` always when ``prior`` or ``saved``
     is given, and ``card_his.json`` / ``card_own.json`` when a list is cut from the body; a cut that needs a path and
-    has no ``out_dir`` raises :class:`CardError`. ``his_extra`` is recovery's integrity lines (``unknown-commit``)."""
+    has no ``out_dir`` raises :class:`CardError`. ``his_extra`` is recovery's integrity lines (``unknown-commit``).
+    ``remedy`` is the next step the card names; omitted, :func:`remedy_for` writes it for the card's kind, carrying
+    ``store_dir`` (the directory holding the store's ``memory.db``) so the commands it prints run as printed."""
     if kind not in KINDS:
         raise CardError(f"a card kind is one of {', '.join(KINDS)} (got {kind!r})")
     out = Path(out_dir) if out_dir is not None else None
@@ -295,7 +337,7 @@ def build_card(kind: str, *, occurrence: str, agent_id: str = "dream", day: str 
     body["his"] = list(his)
     body["own"] = list(own)
     body["usage"] = _usage.summary(dict(usage_doc) if usage_doc is not None else None)
-    body["remedy"] = remedy or f"levain dream rollback {occurrence}"
+    body["remedy"] = remedy or remedy_for(kind, occurrence, store_dir=store_dir, occ_dir=out)
 
     def size() -> int:
         return len(canonical(body))
@@ -380,10 +422,11 @@ def texts_for(db_path: Path | str, occ_dir: Path | str) -> tuple[str, str]:
 def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, db_path: Path | str | None = None,
               notes: Mapping[str, Any] | None = None, source: Mapping[str, str] | None = None,
               day: str | None = None, manual: bool = False, slot: str | None = None,
-              agent_id: str = "dream") -> Card:
+              agent_id: str = "dream", store_dir: Path | str | None = None) -> Card:
     """A card from the spec recovery (``RecoverResult.card``) or a rollback (``RollbackResult.card``) returned, plus
     the occurrence's own files: the snapshot's prior text, the text the dream saved (when ``db_path`` is given) and
-    ``usage.json``. The spec's ``his`` lines (``unknown-commit``) are his."""
+    ``usage.json``. The spec's ``his`` lines (``unknown-commit``) are his. A spec with no ``remedy`` gets
+    :func:`remedy_for`'s, carrying ``store_dir`` (default: the directory of ``db_path``)."""
     occ = Path(occ_dir)
     kind = str(spec.get("kind"))
     prior = saved = ""
@@ -396,7 +439,8 @@ def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, db_path: Path | s
     return build_card(kind, occurrence=str(spec.get("occurrence") or occ.name), agent_id=agent_id, day=day,
                       reason=reason, manual=manual, slot=slot, prior=prior, saved=saved, notes=notes, source=source,
                       his_extra=list(spec.get("his") or []), usage_doc=_usage.read_doc(occ),
-                      remedy=spec.get("remedy"), out_dir=occ)
+                      remedy=spec.get("remedy"), out_dir=occ,
+                      store_dir=store_dir if store_dir is not None else (Path(db_path).parent if db_path else None))
 
 
 def file_card(store: Any, card: Card, *, feed: str = FEED, thread_id: str | None = None) -> tuple[Any, bool]:
