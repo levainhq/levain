@@ -1510,7 +1510,7 @@
     vcBody.appendChild(hr);
 
     // keys and the estimated spend: read only
-    const keys = vcState.providers.map((p) => p.name + ": " + (p.key === "set" ? "key set" : "no key")).join(" · ");
+    const keys = vcState.providers.map((p) => p.name + ": " + (p.key === "set" ? "key set" : p.key === "stopped" ? "key stopped" : "no key")).join(" · ");
     vcBody.appendChild(el("p", "dev-note vc-keys", "Keys: " + keys + ". Revoke a key beside its grant."));
     const caps = vcState.caps, has = (v) => v !== null && v !== undefined;
     if (caps && has(caps.spent_month_est) && has(caps.spent_day_est) && has(caps.day_usd) && has(caps.month_usd)) {
@@ -1534,11 +1534,12 @@
     const calls = (c) => c + (c === 1 ? " call" : " calls");
     const spendWords = (sp) => "$" + sp.day_est_usd + " today (" + calls(sp.day_calls) + ") · $" + sp.month_est_usd + " this month (" + calls(sp.month_calls) + ")";
     for (const p of vcState.providers) {
-      if (p.key !== "set" && !p.spend) continue;         // a row for every provider that holds a key or has counted spend
+      if (p.key !== "set" && p.key !== "stopped" && !p.spend) continue;   // a row for every provider that holds a key (stopped or not) or has counted spend
       const r = el("div", "dev-row vc-row vc-spend"); r.dataset.provider = p.name;
       r.appendChild(el("span", "vc-lab", cap1(p.name)));
       let words = p.spend ? spendWords(p.spend) : "—";
-      if (p.key !== "set" && p.spend && (!vcState.authority || vcState.authority === "ok")) words += " · no key now";
+      if (p.key === "stopped" && (!vcState.authority || vcState.authority === "ok")) words += " · key stopped: " + (typeof p.stopped_why === "string" && p.stopped_why ? p.stopped_why : "a key that signed it was revoked") + ". Set it again to use it";
+      else if (p.key !== "set" && p.spend && (!vcState.authority || vcState.authority === "ok")) words += " · no key now";
       r.appendChild(el("span", "vc-spend-val", words));
       if (p.console_url) {
         const a = el("a", "vc-console", "Reload credit"); a.href = p.console_url; a.target = "_blank"; a.rel = "noopener noreferrer";
