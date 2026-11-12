@@ -534,6 +534,8 @@ LAZY_SITES = {
     'levain/slot/supervisor.py::prepare_answer::from levain.slot.runtime_helper import PREPARE_RESULT_FORMAT': 'operator',
     # operator: ``probe_answer`` is the interactive supervisor's own code, the operator uid's process; the dispatch run server imports the module for its names
     'levain/slot/supervisor.py::probe_answer::from levain.slot.probe import MAX_PROBE_ADDRS, PROBE_HOSTS': 'operator',
+    # root: ``count_span`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
+    'levain/agents/accounting.py::count_span::from levain.agents import schedule': 'root',
 }
 _NEEDLES = ("run_module(", "module_argv(", "import_module(", "__import__(")
 
