@@ -111,8 +111,10 @@ def test_one_occurrence_per_instant(tmp_path):
         ctl.tick(store, _clock(box), _armed)
     keys = [r[0] for r in _rows(store)]
     assert keys == ["2026-11-02T12:20:00Z", "2026-11-02T12:40:00Z"] and len(set(keys)) == len(keys)
-    # the second slot found the first still admitted (unlaunched): its own overlap row, never a second fire
-    assert [r[1] for r in _rows(store)] == ["admitted", "skipped-overlap"]
+    # D1-Q: the second slot (20 minutes on) found the first still admitted and past its 15 minute grace; nothing had
+    # launched it, so it ended (never_launched) and the second slot was claimed, not filed skipped-overlap behind it
+    assert [r[1] for r in _rows(store)] == ["missed", "admitted"]
+    assert [r[2] for r in _rows(store)] == [ctl.NEVER_LAUNCHED, None]
 
 
 def test_a_refused_schema_refuses_the_tick_with_the_named_reason(tmp_path):
