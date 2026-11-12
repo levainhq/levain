@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import (EGRESS_KEY_KIND, AuthorityError, _thaw, anchor_path, append, egress_key_live,
-                              egress_key_record, prepare)
+                              egress_key_record, grant_stop_reason, prepare)
 from levain.authority_sig import VerifierUnavailable
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.chat_egress.keys import _remote_repo, workspace_remote_urls
@@ -223,6 +223,8 @@ def setup_key(data_root: Path | str, *, entity: str, host: str, source: str, acc
               "expires_at": utc_stamp(expires_at)}
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, now, ssh_keygen))
+    # RAW policy on purpose: a record a revoked key stopped is still the record the one-live rule counts, and the one
+    # a `--replace` supersedes (the log's own append rule counts it the same way)
     live = sorted(gid for gid, g in state.policy.grants.items()
                   if egress_key_live(g, now) and g["entity"] == entity and g["host"] == canon)
     if rid in state.policy.grants:
@@ -290,14 +292,18 @@ def revoke_key(data_root: Path | str, record_id: str, *, signer_fp: str, sign: S
 
 def list_keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
               marker_directory: Path | None = None) -> list[dict[str, Any]]:
-    """Every setup record the replay holds, by id, each with `state` "live" or "expired" (no value: there is none)."""
+    """Every setup record the replay holds, by id, each with `state` "live", "expired" or "stopped" (no value: there is
+    none). "stopped" is a record a key that signed it was revoked for (`stopped_why` says which: a record that is
+    not stopped carries ""); the policy still holds it, so it is listed and can be revoked, but a launch builds no
+    route for it. It wins over "expired", as the grant page's state does."""
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, now, ssh_keygen))
     out = []
     for gid, g in sorted(state.policy.grants.items()):
         if egress_key_record(g):
-            out.append({**_thaw(g), "state": "live" if egress_key_live(g, now) else "expired",
-                        "link_seq": state.grant_seqs.get(gid)})
+            why = grant_stop_reason(state, gid) or ""
+            out.append({**_thaw(g), "state": "stopped" if why else "live" if egress_key_live(g, now) else "expired",
+                        "stopped_why": why, "link_seq": state.grant_seqs.get(gid)})
     return out
 
 
