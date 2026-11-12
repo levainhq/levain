@@ -75,8 +75,10 @@ delivery or reading of a decision (:meth:`ConsentQueue.decision`, :meth:`Consent
 ruling and its signature, checks it binds this queue, this request (and, for a ruling, the request's gap number) and the row's decision, and
 re-verifies it against a FRESH replay of the authority log taken at delivery (the queue's ``authority``
 source): a key revoked after it answered delivers nothing. A grant answer is re-verified the same way: the grant
-must still be in a fresh replay, unexpired, its criteria still true for the tool input and posture the deliverer
-holds. Anything that fails is ``None``, never an allow;
+must still be in a fresh replay and in force (:func:`levain.authority.grants_in_force`: neither the key that signed
+it nor the key that last renewed it has been revoked since), unexpired, its criteria still true for the tool input
+and posture the deliverer holds; the same test decides which grants may answer a request at all, so a grant a
+revoked key signed answers nothing and delivers nothing. Anything that fails is ``None``, never an allow;
 a raw write can only take a decision away (the native dialog then stands), never make one (one stated
 exception, a deleted later deny, under known edges below).
 
@@ -136,7 +138,7 @@ from typing import Any
 
 from levain.authority import (
     _WEBAUTHN_SIG_TYPE, PASSKEY, AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable,
-    custody_mismatch, sshsig_public_key, verify_link_sig,
+    custody_mismatch, grants_in_force, sshsig_public_key, verify_link_sig,
 )
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
@@ -2653,11 +2655,12 @@ class ConsentQueue:
     # --- standing grants (Q4) --------------------------------------------------------------------------
     def _matching_grant(self, authority: AuthoritySnapshot, request: ExternalGateRequest, *, tool_input: Any,
                         posture: Any, now: datetime) -> tuple[str, int, str] | None:
-        """``(grant_id, link seq, link hash)`` of the first consent grant (by id) in ``authority`` that answers
-        ``request``, or ``None``."""
-        for gid in sorted(authority.policy.grants):
+        """``(grant_id, link seq, link hash)`` of the first consent grant (by id) among the grants IN FORCE in
+        ``authority`` (a grant whose signer was revoked is not one) that answers ``request``, or ``None``."""
+        in_force = grants_in_force(authority)
+        for gid in sorted(in_force):
             link = authority.grant_link(gid)
-            if link is not None and grant_refusal(authority.policy.grants[gid], request, tool_input=tool_input,
+            if link is not None and grant_refusal(in_force[gid], request, tool_input=tool_input,
                                                   posture=posture, now=now, home=self.home) is None:
                 return gid, link[0], link[1]
         return None
@@ -2693,8 +2696,8 @@ class ConsentQueue:
                         payload: Mapping[str, Any], *, tool_input: Any, posture: Any) -> Decision | None:
         """A grant-answered row's decision, re-verified now: the stored record binds this queue, this request
         and its digest; the deliverer holds the tool input the request was filed for and the posture recorded;
-        and the named grant is still in a fresh replay, at the link recorded, unexpired, its criteria true at the
-        queue's clock."""
+        and the named grant is still in a fresh replay and in force (its signers' keys unrevoked), at the link
+        recorded, unexpired, its criteria true at the queue's clock."""
         if set(payload) != _GRANT_ANSWER_KEYS or payload["format"] != GRANT_ANSWER_FORMAT \
                 or payload["queue_id"] != queue_id or payload["request_id"] != request.id \
                 or payload["request_digest"] != request.digest or payload["expires_at"] != request.expires_at \
@@ -2705,7 +2708,8 @@ class ConsentQueue:
             return None
         gid = payload["grant_id"]
         authority = self._fresh_authority()
-        grant = None if authority is None or not isinstance(gid, str) else authority.policy.grants.get(gid)
+        grant = None if authority is None or not isinstance(gid, str) else grants_in_force(authority).get(gid)
+        # a grant a revoked key signed is not in force, so it is no grant here: the answer it gave is not delivered
         # the link recorded is the one that created or last changed the grant in this replay: a raw writer cannot
         # name another, and a renew, tighten or loosen after the answer takes back an undelivered answer
         if grant is None or authority.grant_link(gid) != (payload["grant_seq"], payload["grant_hash"]) \
@@ -2720,12 +2724,13 @@ class ConsentQueue:
     def _matching_contained_shell_grant(self, authority: AuthoritySnapshot, request: ExternalGateRequest, *,
                                         tool_input: Any, posture: Any, now: datetime,
                                         contained_launch: ContainedLaunchProof) -> tuple[str, int, str] | None:
-        """``(grant_id, link seq, link hash)`` of the first contained-shell grant (by id) in ``authority`` that
-        answers ``request`` from the launch ``contained_launch`` proves, or ``None``."""
-        for gid in sorted(authority.policy.grants):
+        """``(grant_id, link seq, link hash)`` of the first contained-shell grant (by id) among the grants IN
+        FORCE in ``authority`` that answers ``request`` from the launch ``contained_launch`` proves, or ``None``."""
+        in_force = grants_in_force(authority)
+        for gid in sorted(in_force):
             link = authority.grant_link(gid)
             if link is not None and contained_shell_refusal(
-                    authority.policy.grants[gid], request, tool_input=tool_input, posture=posture, now=now,
+                    in_force[gid], request, tool_input=tool_input, posture=posture, now=now,
                     home=self.home, contained_launch=contained_launch) is None:
                 return gid, link[0], link[1]
         return None
@@ -2769,7 +2774,7 @@ class ConsentQueue:
                                   contained_launch: ContainedLaunchProof | None) -> Decision | None:
         """A contained-shell-answered row's decision, re-verified now, for a caller holding ``contained_launch``:
         :meth:`_grant_decision`'s checks, the stored proof fields equal to the caller's proof (all five), and the
-        named grant still in a fresh replay at the link recorded, with
+        named grant still in a fresh replay, in force, at the link recorded, with
         :func:`~levain.consent.policy.contained_shell_refusal` ``None`` at the queue's clock. A caller with no
         proof (every hook caller) gets ``None``: the hook never delivers a contained-shell answer."""
         if not isinstance(contained_launch, ContainedLaunchProof) or contained_launch.problem() is not None:
@@ -2786,7 +2791,7 @@ class ConsentQueue:
             return None
         gid = payload["grant_id"]
         authority = self._fresh_authority()
-        grant = None if authority is None or not isinstance(gid, str) else authority.policy.grants.get(gid)
+        grant = None if authority is None or not isinstance(gid, str) else grants_in_force(authority).get(gid)
         if grant is None or authority.grant_link(gid) != (payload["grant_seq"], payload["grant_hash"]) \
                 or contained_shell_refusal(grant, request, tool_input=tool_input, posture=posture,
                                            now=_now_utc(self._clock), home=self.home,
