@@ -11,7 +11,8 @@ that read first holds a snapshot and gets SQLite's busy error, which writes noth
 ``tick`` walks every registered, active agent's slots since its stored cursor, in the agent's stored zone, with an
 injected clock. Before the walk it ends every admitted occurrence the full cap has held past its grace
 (:func:`close_no_slot`), then every admitted occurrence nothing launched past its grace
-(:func:`close_unlaunched`, D1-Q); ``launch_over`` and ``session_alive`` are the desk-lease probes (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
+(:func:`close_unlaunched`, D1-Q), then every launched occurrence no fire claimed inside its launch lease, through
+:func:`takeover` (:func:`take_over_unclaimed`, which states the recovery rule); ``launch_over`` and ``session_alive`` are the desk-lease probes (see :mod:`slots`). What it needs from outside the store comes in as ``binding_of`` (``(agent_id, spec_hash) ->
 binding_id | None``; ``None`` means the agent is not armed), because arming is derived from the authority log and a
 binding is minted by the launch slice, neither of which is this module's.
 """
@@ -45,7 +46,8 @@ from levain.agents.store import AgentStore, open_agent_store
 _log = logging.getLogger("levain.agents.controller")
 
 __all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurrence_id", "run_id", "claim",
-           "close_no_slot", "close_unlaunched", "NEVER_LAUNCHED", "tick", "heartbeat", "takeover", "Window", "LaunchResult", "launch",
+           "close_no_slot", "close_unlaunched", "NEVER_LAUNCHED", "tick", "heartbeat", "takeover", "take_over_unclaimed",
+           "Window", "LaunchResult", "launch",
            "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE", "SESSION_GRACE_S",
            "Ended", "settle_terminal", "GatedChild", "GATE_REFUSED", "fire_argv", "fire_record_path", "spawn_fire",
            "claim_fire", "fire", "miss_streak", "miss_windows"]
@@ -124,6 +126,7 @@ class TickResult:
     clamped: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, cursor): a cursor past the clock
     no_slot: list[tuple[str, str]] = field(default_factory=list)     # (agent_id, key): admitted, past grace, no slot
     unlaunched: list[tuple[str, str]] = field(default_factory=list)  # (agent_id, key): admitted, past grace, never launched
+    recovered: list[tuple[str, str, str]] = field(default_factory=list)  # (agent_id, oid, key): no fire claimed, taken over
     missed_windows: dict[str, list[str]] = field(default_factory=dict)  # agent_id -> windows with a missed slot, once each
     silent: list[str] = field(default_factory=list)                  # agents with a miss this pass that fired nothing
     reaped: object = None                                            # what the reaper returned this pass (P6-4b)
@@ -316,6 +319,8 @@ def tick(store: AgentStore | Path | str | None, clock: Callable[[], datetime],
             if kind == "scheduled":       # a killed hand start is not a missed window (it did not reach the miss streak)
                 out.missed[agent_id] = out.missed.get(agent_id, 0) + 1
                 _report_windows(out, agent_id, [window])
+        # a launched row no fire claimed inside its launch lease: lapse recovery, also before the walk (D1-Q fix round)
+        out.recovered.extend(take_over_unclaimed(conn, now))
     with store.read() as conn:
         agents = _agents(conn)
     for agent_id, name, operation, version, digest, text in agents:
@@ -496,7 +501,7 @@ SESSION_GRACE_S = 120  # [judged, against nothing measured]: what a session run'
 
 
 def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: datetime, lease_s: int = LEASE_S, *,
-              session_grace_s: int | None = None) -> bool:
+              session_grace_s: int | None = None, unclaimed_lapses: bool = False) -> bool:
     """The supervisor's heartbeat: extend a ``launched`` row's lease to ``now + lease_s``. It is a compare-and-set on
     the epoch the holder launched or last renewed under and on the exact lease it read, so a holder that a takeover
     fenced (the epoch moved, the row left ``launched``) writes nothing and is told ``False``. A lease that has already
@@ -508,19 +513,26 @@ def heartbeat(conn: sqlite3.Connection, occurrence_id: str, epoch: int, now: dat
     ``session_grace_s`` is for a run that opens an S1 session (the supervisor knows its executor; the row does not):
     a row that has recorded no ``session_key`` by ``launched_at + session_grace_s`` is refused, so a fire that never
     opened its session lapses to takeover instead of being renewed for ever. ``None`` (a sessionless run, the dream)
-    applies no such bound. A ``launched_at`` that cannot be read is refused under the bound."""
+    applies no such bound. A ``launched_at`` that cannot be read is refused under the bound.
+
+    ``unclaimed_lapses`` is for a sessionless run (the reaper passes it where ``session_grace_s`` is None): a row no
+    fire has claimed (``pid`` and ``session_key`` both NULL) is refused, so it keeps the lease its launch wrote and,
+    if no fire claims it inside that, lapses to :func:`take_over_unclaimed` (D1-Q fix round)."""
     if not conn.in_transaction:
         raise RuntimeError("a heartbeat runs inside the caller's write transaction")
     if session_grace_s is not None and (type(session_grace_s) is not int or session_grace_s < 0):
         raise ValueError("session_grace_s is a non-negative integer of seconds, or None")
     at = schedule._utc(now)
     _write_lock(conn)
-    row = conn.execute("SELECT lease_until, session_key, launched_at FROM agent_occurrences WHERE occurrence_id = ?"
-                       " AND state = 'launched' AND epoch = ?", (occurrence_id, epoch)).fetchone()
+    row = conn.execute("SELECT lease_until, session_key, launched_at, pid FROM agent_occurrences"
+                       " WHERE occurrence_id = ? AND state = 'launched' AND epoch = ?",
+                       (occurrence_id, epoch)).fetchone()
     if row is None:
         return False
     lease = _lease(row[0])
     if lease is None or at > lease:
+        return False
+    if unclaimed_lapses and row[1] is None and row[3] is None:
         return False
     if session_grace_s is not None and row[1] is None:
         launched = _lease(row[2])
@@ -561,6 +573,41 @@ def takeover(conn: sqlite3.Connection, occurrence_id: str, now: datetime,
                           usage if usage is not None and proven else _UNREAD, at, "lease_until = ?", (row[0],),
                           bump=True)
     return ended.ended
+
+
+def take_over_unclaimed(conn: sqlite3.Connection, now: datetime) -> list[tuple[str, str, str]]:
+    """Lapse recovery for a ``launched`` row NO FIRE EVER CLAIMED (D1-Q fix round, L2 HIGH), the one production caller
+    of :func:`takeover`; :func:`tick` runs it in its write transaction before the walk. Returns
+    ``(agent_id, occurrence_id, key)`` per row it ended.
+
+    A launch commits ``launched`` with a lease of :data:`LEASE_S` and then the launcher spawns the fire, which claims the
+    row (:func:`claim_fire`: its ``pid``). Three things leave the row with neither ``pid`` nor ``session_key``: (a) the
+    spawn raised, (b) the launcher was cut or killed between the commit and the spawn, (c) the fire died before its
+    claim. Before this nothing ended such a row: the reaper renewed every launched row, the reaper's stop path never
+    asks a row with neither key, and :func:`takeover` had no caller, so the row held its slot and an open reservation
+    for ever and every later slot was filed ``skipped-overlap``. The rule, from two existing constants and no new state:
+
+    * the reaper renews a sessionless (dream) row only once a fire has claimed it (:func:`heartbeat`'s
+      ``unclaimed_lapses``), so an unclaimed row keeps the lease its launch wrote: ``launched_at + LEASE_S``, the time a
+      fire has to claim it (a session row has its own ``SESSION_GRACE_S`` bound on its session key, as before);
+    * from ``launched_at + SESSION_GRACE_S`` (the time a run is given to show its identity, the bound a session row's
+      key already has) the tick spawns a dream row's fire again on each pass while the lease is live
+      (``levain.agents.tick_driver``); that is safe because :func:`fire` refuses to replace a live fire's identity
+      record and :func:`claim_fire` is a compare-and-set on ``pid IS NULL``, so of two fires one claims and the other
+      exits having done nothing;
+    * once the lease has lapsed with still no fire, this ends the row through :func:`takeover`: ``stopped`` /
+      ``crash_recovered``, ``epoch + 1`` (a late fire's claim is fenced), the slot freed and the reservation settled as
+      unread (all of it debited, A0 §2.4's lapse row), so the next slot is claimed rather than skipped behind it.
+
+    Only rows with neither ``pid`` nor ``session_key`` are read: a claimed row is its fire's, and its lapse is not
+    decided here. A row whose lease is live, absent or unreadable is left as :func:`takeover` leaves it."""
+    out = []
+    for oid, agent_id, key in conn.execute(
+            "SELECT occurrence_id, agent_id, key FROM agent_occurrences WHERE state = 'launched' AND pid IS NULL"
+            " AND session_key IS NULL ORDER BY launched_at, occurrence_id").fetchall():
+        if takeover(conn, oid, now):
+            out.append((agent_id, oid, key))
+    return out
 
 
 # --- the terminal transaction (A0 r8 §2.4's release table, §2.5 launched -> done/failed/stopped; P6-5b) --------------

@@ -228,3 +228,168 @@ def test_a_launch_that_answers_unclassified_exits_6_and_a_full_cap_does_not(tmp_
     assert _tick(rig, slot + 2 * MIN, spawn) == T.EXIT_OK            # a full cap is normal: quiet
     (row,) = _rows(rig)
     assert row["state"] == "admitted" and spawn.calls == []
+
+
+# ------------------------------------- (1) a launched dream row no fire claimed has an owner (the L2 HIGH)
+#
+# The rule (controller.take_over_unclaimed's docstring): the launch writes a LEASE_S lease; the reaper renews a dream
+# row's lease only once a fire has claimed it (its pid), so a row no fire claims keeps the launch's own lease; past
+# launched_at + SESSION_GRACE_S the tick spawns its fire again each pass (claim_fire's compare-and-set lets one fire
+# win); once the launch lease has lapsed, the tick ends it through controller.takeover (stopped / crash_recovered),
+# freeing its slot and settling its reservation, before the walk claims the next slot.
+
+class Failing:
+    """A spawn seam that records each call and then raises, as Popen does when the venv is mid-upgrade."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, directory, oid):
+        self.calls.append(oid)
+        raise FileNotFoundError("python3: no such file (the venv is being replaced)")
+
+
+def _row(rig, oid):
+    return next(r for r in _rows(rig) if r["occurrence_id"] == oid)
+
+
+def _when(stamp):
+    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+def _launched_with_no_fire(rig, spawn):
+    slot = _slot(rig)
+    assert _tick(rig, slot - 10 * MIN, spawn) == T.EXIT_OK
+    assert _tick(rig, slot + MIN, spawn) == T.EXIT_LAUNCH
+    (row,) = _rows(rig)
+    assert row["state"] == "launched" and row["pid"] is None and row["session_key"] is None
+    return slot, row
+
+
+def test_a_launched_dream_row_no_fire_claimed_is_spawned_again_past_its_start_grace(tmp_path, hook):
+    rig = _live_rig(tmp_path)
+    spawn = Failing()
+    slot, row = _launched_with_no_fire(rig, spawn)
+    oid, launched, lease = row["occurrence_id"], _when(row["launched_at"]), row["lease_until"]
+    assert spawn.calls == [oid]
+    _tick(rig, launched + MIN, spawn)                                   # inside SESSION_GRACE_S: a fire may be starting
+    assert spawn.calls == [oid]
+    assert _row(rig, oid)["lease_until"] == lease                       # not renewed: no fire has claimed it
+    code = _tick(rig, launched + timedelta(seconds=ctl.SESSION_GRACE_S), spawn)
+    assert spawn.calls == [oid, oid] and code == T.EXIT_LAUNCH          # spawned again, and it failed again: named
+    assert _row(rig, oid)["state"] == "launched" and _row(rig, oid)["lease_until"] == lease
+    good = Spawns()
+    _tick(rig, launched + timedelta(seconds=ctl.SESSION_GRACE_S) + MIN, good)
+    assert good.calls == [(Path(rig.store.directory), oid)]             # each pass until a fire claims it
+
+
+def test_a_claimed_dream_row_is_renewed_and_never_spawned_again(tmp_path, hook):
+    rig = _live_rig(tmp_path)
+    spawn = Failing()
+    slot, row = _launched_with_no_fire(rig, spawn)
+    oid, launched = row["occurrence_id"], _when(row["launched_at"])
+    with rig.store.write() as c:
+        assert ctl.claim_fire(c, oid, 4242, launched + MIN) is not None
+    at = launched + timedelta(seconds=ctl.SESSION_GRACE_S) + MIN
+    _tick(rig, at, spawn)
+    assert spawn.calls == [oid]
+    assert _when(_row(rig, oid)["lease_until"]) >= at + timedelta(seconds=ctl.LEASE_S)   # renewed
+
+
+def test_a_dream_row_no_fire_ever_claims_is_taken_over_when_its_launch_lease_lapses_and_the_next_slot_runs(
+        tmp_path, hook):
+    from levain.agents import slots
+
+    rig = _live_rig(tmp_path)
+    spawn = Failing()
+    slot, row = _launched_with_no_fire(rig, spawn)
+    oid, lease = row["occurrence_id"], _when(row["lease_until"])
+    with rig.store.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM agent_slots WHERE owner_id = ?", (oid,)).fetchone()[0] == 1
+    _tick(rig, lease - MIN, spawn)
+    assert _row(rig, oid)["state"] == "launched"                        # inside the lease: still the fire's to claim
+    _tick(rig, lease + MIN, spawn)
+    ended = _row(rig, oid)
+    assert (ended["state"], ended["reason"]) == ("stopped", "crash_recovered"), ended
+    assert ended["epoch"] == row["epoch"] + 1                           # fenced: a late fire cannot claim it
+    with rig.store.read() as c:
+        assert c.execute("SELECT COUNT(*) FROM agent_slots WHERE owner_id = ?", (oid,)).fetchone()[0] == 0
+        assert c.execute("SELECT state FROM agent_reservations WHERE occurrence_id = ?", (oid,)).fetchone() == \
+            ("settled",)
+    retry = slot + timedelta(minutes=30)
+    good = Spawns()
+    _tick(rig, retry + MIN, good)
+    nxt = next(r for r in _rows(rig) if r["key"] == schedule.slot_key(retry))
+    assert (nxt["state"], nxt["kind"]) == ("launched", "scheduled"), nxt   # claimed and launched, not skipped-overlap
+    assert good.calls == [(Path(rig.store.directory), nxt["occurrence_id"])]
+
+
+def test_a_hand_start_whose_fire_never_started_is_spawned_again_then_taken_over_and_the_verb_runs_again(
+        tmp_path, hook):
+    rig = _live_rig(tmp_path)
+    spawn = Failing()
+    got = st.start(rig.store, clock=rig.now, authority=rig.authority, spawn=spawn)
+    assert got.outcome == "launched" and got.code == 1, got
+    row = _row(rig, got.occurrence_id)
+    assert row["kind"] == "manual" and row["state"] == "launched" and row["pid"] is None
+    launched, lease = _when(row["launched_at"]), _when(row["lease_until"])
+    _tick(rig, launched + timedelta(seconds=ctl.SESSION_GRACE_S) + MIN, spawn)
+    assert spawn.calls == [got.occurrence_id, got.occurrence_id]        # the tick owns the hand start's fire-less row too
+    refused = st.start(rig.store, clock=lambda: lease - MIN, authority=rig.authority, spawn=Spawns())
+    assert refused.outcome == "refused" and "in flight" in refused.text
+    _tick(rig, lease + MIN, spawn)
+    assert (_row(rig, got.occurrence_id)["state"], _row(rig, got.occurrence_id)["reason"]) == \
+        ("stopped", "crash_recovered")
+    again = st.start(rig.store, clock=lambda: lease + 2 * MIN, authority=rig.authority, spawn=Spawns())
+    assert again.outcome == "launched", again
+
+
+def test_heartbeat_keeps_an_unclaimed_rows_launch_lease_when_asked_to():
+    import sqlite3 as sq
+
+    conn = sq.connect(":memory:", isolation_level=None)
+    conn.execute("CREATE TABLE agent_occurrences (occurrence_id TEXT, state TEXT, epoch INT, lease_until TEXT,"
+                 " session_key TEXT, launched_at TEXT, pid INT)")
+    conn.execute("INSERT INTO agent_occurrences VALUES ('o', 'launched', 1, '2026-11-12T00:15:00Z', NULL,"
+                 " '2026-11-12T00:00:00Z', NULL)")
+    now = datetime(2026, 11, 12, 0, 5, tzinfo=UTC)
+    conn.execute("BEGIN")
+    assert ctl.heartbeat(conn, "o", 1, now, unclaimed_lapses=True) is False
+    assert ctl.heartbeat(conn, "o", 1, now) is True                     # the default is unchanged
+    conn.execute("UPDATE agent_occurrences SET pid = 7, lease_until = '2026-11-12T00:15:00Z'")
+    assert ctl.heartbeat(conn, "o", 1, now, unclaimed_lapses=True) is True
+    conn.execute("ROLLBACK")
+
+
+def test_two_fires_spawned_for_one_row_run_one_body(tmp_path):
+    """The re-spawn is safe because a fire that loses claim_fire's compare-and-set (or finds a live fire's identity
+    record) exits having done nothing: two real fire processes, one row, one body."""
+    import os
+
+    rig = _live_rig(tmp_path)
+    oid = _claim(rig, "double", kind="manual", at=rig.now(), window=st.manual_window_key(rig.now(), ZONE))
+    assert ctl.launch(rig.store, oid, authority=rig.authority, window=st.window_for(rig.now(), ZONE), now=rig.now(),
+                      executor=_exec(rig, oid), on_input=None).outcome == "launched"
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    script = tmp_path / "fire_double.py"
+    script.write_text(
+        "import os, sys, time\n"
+        "from datetime import datetime, timezone\n"
+        "from pathlib import Path\n"
+        "from levain.agents import controller as ctl\n"
+        "store, oid, marks = sys.argv[1], sys.argv[2], Path(sys.argv[3])\n"
+        "def run(s, o, e):\n"
+        "    (marks / str(os.getpid())).write_text(str(e))\n"
+        "    time.sleep(1)\n"
+        "    return 0\n"
+        "sys.exit(ctl.fire(store, oid, run=run, clock=lambda: datetime.now(timezone.utc)))\n")
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    argv = [sys.executable, str(script), str(rig.store.directory), oid, str(marks)]
+    procs = [ctl.spawn_fire(rig.store.directory, oid, argv=argv, env=env, log=tmp_path / f"f{i}.log")
+             for i in range(2)]
+    codes = [p.wait(timeout=60) for p in procs]
+    ran = sorted(p.name for p in marks.iterdir())
+    assert codes == [0, 0], [(tmp_path / f"f{i}.log").read_text() for i in range(2)]
+    assert len(ran) == 1, ran
+    assert str(_row(rig, oid)["pid"]) == ran[0]

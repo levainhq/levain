@@ -59,7 +59,7 @@ from __future__ import annotations
 import logging
 import sys
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -426,6 +426,57 @@ def _utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _respawn_dream_fires(st: AgentStore, result: Any, clock: Callable[[], datetime],
+                         spawn: Callable[[Path | str, str], Any], notes: list[str], seen: dict) -> None:
+    """D1-Q fix round (L2 HIGH): the tick owns a launched dream row no fire has claimed (neither ``pid`` nor
+    ``session_key``: its spawn raised, the launcher was cut between the launch and the spawn, or the fire died before its
+    claim), whichever launched it, this tick or ``levain dream start``. The rule is
+    :func:`levain.agents.controller.take_over_unclaimed`'s: from ``launched_at + SESSION_GRACE_S`` while the launch lease
+    is live the fire is spawned again, once a pass (two fires for one row run one body: ``claim_fire`` is a
+    compare-and-set), and the rows the controller's pass already ended through ``takeover`` once the lease lapsed
+    (``result.recovered``) are named here. A spawn that fails again, a recovered row or a set-up failure exits
+    :data:`EXIT_LAUNCH`."""
+    from levain.agents import spec as _spec
+    from levain.dream import agent as _da
+
+    for agent_id, oid, key in getattr(result, "recovered", []):
+        notes.append(f"{oid} ({key}) was launched but no fire claimed it within its {_ctl.LEASE_S}s launch lease: it "
+                     "was ended stopped/crash_recovered (takeover), its slot freed and its reservation settled")
+        seen["launch"] = "recovered"
+    try:
+        try:
+            agent = _spec.get_agent(st, _da.NAME)
+        except _spec.SpecError:
+            return
+        with st.read() as conn:
+            rows = conn.execute(
+                "SELECT occurrence_id, launched_at, lease_until FROM agent_occurrences WHERE agent_id = ?"
+                " AND state = 'launched' AND pid IS NULL AND session_key IS NULL ORDER BY launched_at, occurrence_id",
+                (agent["agent_id"],)).fetchall()
+    except Exception as exc:  # noqa: BLE001 - named; the next tick reads them again
+        notes.append(f"the dream's fire-less launched rows could not be read ({type(exc).__name__}: {exc}); the next "
+                     "tick tries again")
+        seen["launch"] = "raised"
+        return
+    now = clock()
+    for oid, launched_at, lease_until in rows:
+        launched, lease = _ctl._lease(launched_at), _ctl._lease(lease_until)
+        if launched is None or lease is None or now >= lease:
+            continue                # unreadable, or lapsed: takeover's (next pass), never a fire's
+        if now < launched + timedelta(seconds=_ctl.SESSION_GRACE_S):
+            continue                # its first fire may still be starting
+        try:
+            spawn(st.directory, oid)
+        except Exception as exc:  # noqa: BLE001 - named; tried again next pass, until the launch lease lapses
+            notes.append(f"{oid} is launched and no fire has claimed it; spawning its fire again failed "
+                         f"({type(exc).__name__}: {exc}); it is tried each tick until its launch lease lapses at "
+                         f"{lease_until}, when it is ended stopped/crash_recovered")
+            seen["launch"] = "spawn"
+            continue
+        notes.append(f"{oid} is launched and no fire had claimed it {_ctl.SESSION_GRACE_S}s after its launch: its fire "
+                     "was spawned again")
+
+
 def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime],
                         session_alive: Callable[[str], bool | None], launch_over: Callable[[str], bool | None],
                         spawn: Callable[[Path | str, str], Any], notes: list[str], seen: dict) -> None:
@@ -633,6 +684,9 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
         session_alive, launch_over = _lazy_probes(st, coord_dir, notes)
         binding_of = binding_of_factory(st, auth, clock)
         result = _ctl.tick(st, clock, binding_of, session_alive, launch_over, reaper=reaper)
+        # D1-Q fix round: a launched dream row no fire claimed gets its fire again (the pass already took over the ones
+        # whose launch lease lapsed); before the launches, so a row this pass launches is never spawned twice here
+        _respawn_dream_fires(st, result, clock, spawn or _ctl.spawn_fire, notes, seen)
         # D1-Q: what the claims left admitted is launched now, before the notices read the night
         _launch_dream_slots(st, auth, clock, session_alive, launch_over, spawn or _ctl.spawn_fire, notes, seen)
         # AFTER the renewals and the claims, so the lease arithmetic above is untouched: the night's notices
