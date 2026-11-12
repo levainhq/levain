@@ -154,13 +154,14 @@ def _remote_repo(url: str, host: str) -> str | None:
 
 def build_route_set(authority: Any, *, entity: str, now: datetime) -> RouteSet:
     """The launch's route snapshot from one verified replay (`levain.authority.AuthoritySnapshot`): the live setup
-    records of `entity` (expired, revoked and superseded ones are not live), one route each, bound to the record's
-    incarnation, its declared repos the record's signed list only (K-8: no workspace input). Two live records of
+    records of `entity` (expired, revoked, superseded and key-stopped ones are not live), one route each, bound to
+    the record's incarnation, its declared repos the record's signed list only (K-8: no workspace input). Two live records of
     `entity` for one canonical host (a store a foreign writer left so; the log refuses a second at append) refuse the
     launch naming both; another entity's records are not this launch's and are not read."""
-    from levain.authority import egress_key_conflicts, egress_key_incarnation, egress_key_live
+    from levain.authority import egress_key_conflicts, egress_key_incarnation, egress_key_live, grants_in_force
 
-    grants = authority.policy.grants
+    # A record whose signing key was revoked since is stopped: no route, and it is no "second live record" either.
+    grants = grants_in_force(authority)
     conflicts = [c for c in egress_key_conflicts(grants, now) if c[0] == entity]
     if conflicts:
         named = "; ".join(f"{host}: {', '.join(ids)}" for _e, host, ids in conflicts)
@@ -234,8 +235,8 @@ class _Flight:
 
 
 class AuthorityLiveness:
-    """The per-request liveness check (R15-22-1): is the snapshot's record still a live setup record, AS THE
-    INCARNATION THE LAUNCH READ (`levain.authority.egress_key_incarnation`), in a fresh verified replay? `source`
+    """The per-request liveness check (R15-22-1): is the snapshot's record still a live setup record (expiry ahead,
+    signing keys still active), AS THE INCARNATION THE LAUNCH READ (`levain.authority.egress_key_incarnation`), in a fresh verified replay? `source`
     returns that replay (production: `levain.consent.queue.authority_source(...)`). No retry, bounded by `timeout_s`:
     an error, a timeout or an exception raises :class:`LivenessUnreadable` (R15-24-1).
 
@@ -290,11 +291,12 @@ class AuthorityLiveness:
                 raise LivenessUnreadable("the setup-record store did not answer in time")
 
     def check(self, record_id: str, incarnation: str | None) -> bool:
-        from levain.authority import egress_key_incarnation, egress_key_live
+        from levain.authority import egress_key_incarnation, egress_key_live, grants_in_force
 
         snap = self._answer()
         try:
-            live = egress_key_live(snap.policy.grants.get(record_id), self._clock())
+            # grants_in_force: a record stopped by a key revoke since the launch is no longer live for this request
+            live = egress_key_live(grants_in_force(snap).get(record_id), self._clock())
             return live and incarnation is not None and egress_key_incarnation(snap, record_id) == incarnation
         except Exception as exc:             # noqa: BLE001: a malformed answer is no answer
             raise LivenessUnreadable(f"the setup-record store gave no usable answer ({type(exc).__name__})") from None
