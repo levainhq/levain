@@ -247,8 +247,18 @@ class _Policy:
     grants = {"g1": object()}
 
 
+class _Key:
+    active = True
+
+
 class _Authority:
+    """Just enough of a snapshot for the queue to find grant ``g1`` in force: one link, signed by one active key."""
     policy = _Policy()
+    seq = 1
+    link_signers = ("k",)
+    grant_born = {"g1": 1}
+    grant_seqs = {"g1": 1}
+    keys = {"k": _Key()}
 
     def grant_link(self, gid):
         return (1, "h")
