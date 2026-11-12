@@ -853,6 +853,10 @@ NOT_ROOT_TESTS = {
                                           "fixture", "confirm_signers", _CONFTEST_SIGNERS),
     "tests/test_cockpit_k2b_journal.py": ("the test itself calls sqlite3.Connection.setconfig, 3.12+",
                                           ".setconfig(", ("tests/test_cockpit_k2b_journal.py", ".setconfig(")),
+    "tests/test_rename_intention.py": ("it runs scripts/rename_intention.py, whose tokenizer needs tokenize.FSTRING_START, "
+                                       "3.12+ (a function-local intention_legacy import is all that makes the import rule "
+                                       "select it)", "rename_intention.py",
+                                       ("scripts/rename_intention.py", "tokenize.FSTRING_START")),
     "tests/test_consent_queue.py": ("its fixture signs through authority.sign_and_append, whose replay reaches "
                                     "levain.writes, which imports anneal_memory (not installed for 3.9)",
                                     "sign_and_append", ("levain/writes.py", "from anneal_memory import")),
