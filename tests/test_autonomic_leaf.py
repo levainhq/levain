@@ -13,7 +13,9 @@ Adding a stdlib module to the package means adding it here, on purpose, in revie
 Modules outside the package are allowed by name (``ALLOWED_OUTSIDE``): ``levain.trust_anchor``, the
 trust-anchor rule ``confirm`` uses, which root's route-map check runs without importing this package;
 ``levain.hands_live``, the hands user's liveness check and lock, which ws-git and the automation executor share;
-and ``levain.fsync_errnos``, the one set of errnos every ``F_FULLFSYNC`` flush falls back on (the journal reads it).
+``levain.fsync_errnos``, the one set of errnos every ``F_FULLFSYNC`` flush falls back on (the journal reads it);
+and ``levain.home_guard``, the one refusal of a test run's or scratch run's fall-back to the operator's real levain
+home, which the store directory's resolver (``default_store_dir``) calls before it names a directory.
 Each is held to more than the package is: it may import ``ALLOWED_OUTSIDE_STDLIB`` roots and nothing of ``levain``.
 
 Also flagged: the builtin loader names (``__import__``, ``__builtins__``, ``exec``, ``eval``, a bare
@@ -47,8 +49,8 @@ ALLOWED_STDLIB = frozenset({
 })
 # What the modules named in ALLOWED_OUTSIDE may import: kept apart so a stdlib module they need never
 # widens the closed package's own list above.
-ALLOWED_OUTSIDE_STDLIB = ALLOWED_STDLIB | frozenset({"shutil", "time"})
-ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor", "levain.hands_live", "levain.fsync_errnos"})
+ALLOWED_OUTSIDE_STDLIB = ALLOWED_STDLIB | frozenset({"shutil", "sys", "time"})
+ALLOWED_OUTSIDE = frozenset({"levain.trust_anchor", "levain.hands_live", "levain.fsync_errnos", "levain.home_guard"})
 _LOADER_NAMES = frozenset({"__import__", "__builtins__", "exec", "eval", "compile"})
 
 

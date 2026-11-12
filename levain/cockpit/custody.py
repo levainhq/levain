@@ -430,7 +430,10 @@ def default_custody(*, platform: str | None = None, bioutil: Path | str = BIOUTI
 
 
 def default_key_dir() -> Path:
-    """``<levain home>/keys``: ``$LEVAIN_HOME/keys`` if set, else ``~/.levain/keys``."""
+    """``<levain home>/keys``: ``$LEVAIN_HOME/keys`` if set, else ``~/.levain/keys``. Refuses the fallback home in a
+    test run or a scratch run (:mod:`levain.home_guard`)."""
+    from levain.home_guard import refuse_real_home_fallback
+    refuse_real_home_fallback("the key directory")
     home = os.environ.get("LEVAIN_HOME")
     return (Path(home).expanduser() if home else Path.home() / ".levain") / "keys"
 

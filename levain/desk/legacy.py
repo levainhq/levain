@@ -89,6 +89,9 @@ def desk_home(levain_home: Path | str | None = None, *, create: bool = False) ->
     ``levain_home`` defaults to ``$LEVAIN_HOME`` else ``~/.levain``. Nothing is created unless ``create`` is true: a
     read-only verb that asks where the desk lives must not make the directory."""
     if levain_home is None:
+        if create:
+            from levain.home_guard import refuse_real_home_fallback
+            refuse_real_home_fallback("the desk home")
         env = os.environ.get("LEVAIN_HOME")
         base = Path(env).expanduser() if env else Path.home() / ".levain"
     else:
