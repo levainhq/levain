@@ -496,7 +496,9 @@ def test_a_did_not_consolidate_remedy_names_the_hand_start_where_it_can_run(cls)
     _parses(text)
 
 
-@pytest.mark.parametrize("cls", ["ceiling", "in-flight", "unreadable", "unknown", "live-seat", "consolidated-today"])
+# unreadable, unknown, in-flight and live-seat name the hand start since the 1111-38 fix round (L2 F6, F7): an admitted
+# hand start left behind is what the verb resumes, and tests/test_dream_l3_fix.py pins their text
+@pytest.mark.parametrize("cls", ["ceiling", "consolidated-today"])
 def test_a_remedy_where_a_hand_start_would_be_refused_does_not_name_it(cls):
     assert "levain dream start" not in da.window_remedy(cls, _STORE)
 
