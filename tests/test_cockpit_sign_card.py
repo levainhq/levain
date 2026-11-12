@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,6 +27,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 
 from levain.cockpit import ProviderSpec, Read, RowIn
+from levain.cockpit import stream as cockpit_stream
 from levain.cockpit.authority import UNKNOWN_POLICY
 from levain.cockpit.effects import DownstreamEffect
 from levain.cockpit.providers import build_default_cockpit
@@ -82,7 +84,10 @@ class _Rig:
     question whose answer is signed through ``QRID``, and a Signer on rpId localhost pinned to this page."""
 
     def __init__(self, tmp_path: Path, monkeypatch: Any, *, sign: bool = True, compose: bool = True,
-                 two_keys: bool = False, fillers: int = 0) -> None:
+                 two_keys: bool = False, fillers: int = 0, hello_delay: float = 0.0) -> None:
+        # `hello_delay` (seconds) holds the change stream's hello back, as a slow CI box does, so it arrives after the page
+        # is drawn and the test has begun acting
+        self.hello_delay = hello_delay
         home = tmp_path / "levain_home"
         monkeypatch.setenv("LEVAIN_HOME", str(home))
         (home / "consent").mkdir(parents=True, mode=0o700)
@@ -164,6 +169,14 @@ class _Rig:
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         url = f"http://127.0.0.1:{httpd.server_address[1]}"
+        real_run = cockpit_stream.run
+
+        def late_run(*a: Any, **k: Any) -> Any:
+            time.sleep(self.hello_delay)
+            return real_run(*a, **k)
+
+        if self.hello_delay:
+            cockpit_stream.run = late_run
         try:
             # the question's caller names its sign request (flow's desk reader does this; the kernel store files none)
             signed = _Signed(httpd.question_store, {self.question.n: QRID})
@@ -171,6 +184,7 @@ class _Rig:
             self.ck.attach_question_rows(signed)
             yield url, httpd
         finally:
+            cockpit_stream.run = real_run
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=5)
@@ -313,7 +327,12 @@ def test_the_listing_names_the_page_the_ceremony_is_pinned_to(tmp_path, monkeypa
 OPEN_Q = ("(document.querySelector('#levain-modal .needs-question') || "
           "((r) => r && (r.click(), null))(document.querySelector('#ck-needs .needs-row.needs-question')))")
 STRIP_FACET = f"{OPEN_Q} && document.querySelector('#levain-modal .needs-question .sign-facet .sign-option')"
-FACET_NOTE = f"(({OPEN_Q}, document.querySelector('#levain-modal .needs-question .sign-note')) || {{}}).textContent"
+# the page's change stream has said hello and been left alone for 800 ms. A test that counts reloads waits for this before it
+# moves the store; the `hello_late` cases of the r6 s1_s6 and sheet h9 tests fail without it
+STREAM_SETTLED = ("(() => { const c = document.querySelector('.livechip'); if (!c || c.dataset.state !== 'live') return false; "
+                  "window.__liveAt = window.__liveAt || Date.now(); return Date.now() - window.__liveAt >= 800; })()")
+STRIP_SETTLED = f"{STRIP_FACET} && {STREAM_SETTLED}"
+FACET_NOTE = f"(({OPEN_Q},document.querySelector('#levain-modal .needs-question .sign-note')) || {{}}).textContent"
 OPTION_B = ("[...document.querySelectorAll('#levain-modal .needs-question .sign-option')]"
             ".find(b => /^\\(b\\)/.test(b.textContent))")
 WRITE_IN = "document.querySelector('#levain-modal .needs-question .sign-write-in')"
