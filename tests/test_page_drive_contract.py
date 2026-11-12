@@ -251,11 +251,16 @@ def test_a_timeout_on_a_page_that_stopped_answering_says_what_the_browser_and_th
     # "PAGE URL: ?  READY STATE: ?", which cannot tell a renderer that hung, one that crashed and a target that is gone. The block now asks
     # the BROWSER whether the page is listed, and prints the last page event and the navigation trail.
     monkeypatch.setenv("LEVAIN_TEST_WAIT_SCALE", "1")
-    page = "data:text/html,<p>hang</p><script>addEventListener('load', () => setTimeout(() => { for (;;) {} }, 400))</script>"
-    r = _drive_at(tmp_path, page, [{"emulate": {"w": 430, "h": 844, "dpr": 2, "mobile": True}}, {"until": "false", "ms": 1500}], timeout=90)
+    # the hang is started by the drive itself, AFTER setup and the emulate round trip (a timer that fires 50 ms after an eval that has already
+    # returned), so no setup poll can race it; the failing until then runs against a page that no longer answers
+    page = "data:text/html,<p>hang</p>"
+    r = _drive_at(tmp_path, page, [{"emulate": {"w": 430, "h": 844, "dpr": 2, "mobile": True}},
+                                   {"eval": "setTimeout(() => { for (;;) {} }, 50); 1"}, {"until": "false", "ms": 1500}], timeout=90)
     assert r.returncode == 1 and "until never came true within 1500ms" in r.stderr, (r.returncode, r.stderr)
     _, _, block = r.stderr.partition("--- page state at the timeout ---")
     assert "PAGE URL: ?" in block, r.stderr                              # the page did not answer: the premise of the test
     assert "TARGET: listed" in block, r.stderr                           # the browser still lists it
     assert "LAST PAGE EVENT: " in block and "loadEventFired" in block, r.stderr   # and the page's trail names its load
+    quiet = re.search(r"LAST PAGE EVENT: (\d+)ms ago", block)
+    assert quiet and int(quiet.group(1)) >= 1000, r.stderr             # the page was silent for the whole wait: a reply to the driver's own probe is not the page speaking
     assert len(block) < 4100, len(block)
