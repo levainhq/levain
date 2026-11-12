@@ -882,17 +882,20 @@ def renewal_check(link: Mapping[str, Any], *, now: datetime, review_store: Any, 
 
 @dataclass
 class DrillTick:
-    action: str          # no-snapshot | not-due | ok | failed | deferred
+    action: str          # no-snapshot | not-due | ok | skipped | failed | deferred
     detail: str = ""
 
 
 def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None = None,
                attention: Callable[[str, str], None], resolve: Callable[[str], None] | None = None,
-               drill: Callable[..., Any] | None = None) -> DrillTick:
+               drill: Callable[..., Any] | None = None, dream_running: bool = False) -> DrillTick:
     """Run the restore drill when 7 days have passed since the last one, and only while a snapshot exists. A failed
     drill raises one attention row (F12). A drill that cannot run because a writer holds the store records nothing,
     stays due, and raises the row only when the last recorded drill is more than two cadences old (or none exists and
-    a snapshot does)."""
+    a snapshot does). ``dream_running`` (the dream has a ``launched`` occurrence) is the same deferral, taken before the
+    drill reaches for ``wrap.lock``, so the drill never makes the fire's lock fail ``lock-held`` (F8). A drill whose
+    restore step was skipped (``skipped``) is not a pass: it resolves no row, and a failure the drill before it found is
+    kept open (and re-raised from the record if its row was lost) until a drill really restores (F10)."""
     run = drill or _snap.drill
     key = "dream-drill"
     ref = now or datetime.now(timezone.utc)
@@ -930,9 +933,24 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
             bad = "; ".join(f"{s.get('name')}: {s.get('detail')}" for s in last.get("steps") or []
                             if s.get("status") == "failed") or "a step failed"
             raise_row(f"the dream restore drill failed: {bad}")
+        elif last.get("outcome") == "skipped" and last.get("carried_failure"):
+            raise_row(f"the dream restore drill failed: {last['carried_failure']}")
         elif last.get("outcome") == "ok":
             settle()
         return DrillTick("not-due")
+
+    def defer(why: str, *, first_drill_waits: bool = False) -> DrillTick:
+        # ``first_drill_waits``: a dream's snapshot exists from its start, so a drill that has never run is not yet
+        # overdue just because that dream is still launched
+        last = _snap.last_drill(root)
+        overdue = (not first_drill_waits) if last is None else _snap.drill_due(root, ref, 2 * _snap.DRILL_CADENCE_S)
+        if overdue:
+            raise_row("no dream restore drill has run in two cadences: a writer held the store each time")
+        return DrillTick("deferred", why)
+
+    if dream_running:
+        return defer("a dream run is launched; the drill would take the wrap lock the fire wants",
+                     first_drill_waits=True)
     try:
         res = run(store_path, root)
     except Exception as exc:  # noqa: BLE001 - a drill that raised proved nothing
@@ -943,10 +961,13 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
         raise_row(f"the dream restore drill failed: {bad}")
         return DrillTick("failed", bad)
     if res.outcome == "deferred":
-        last = _snap.last_drill(root)
-        if last is None or _snap.drill_due(root, ref, 2 * _snap.DRILL_CADENCE_S):
-            raise_row("no dream restore drill has run in two cadences: a writer held the store each time")
-        return DrillTick("deferred")
+        return defer("")
+    if res.outcome == "skipped":
+        carried = getattr(res, "carried_failure", None)
+        if carried:
+            raise_row(f"the dream restore drill failed: {carried}")
+        why = next((str(s.get("detail"))[:160] for s in res.steps if s.get("name") == "restore"), "")
+        return DrillTick("skipped", f"no restore ran: {why}")
     settle()
     return DrillTick(res.outcome)
 
@@ -1097,8 +1118,10 @@ def tick_notices(store: Any, *, now: datetime, missed_windows: Mapping[str, Sequ
     guard("renewal_check", renew)
 
     def drilled() -> None:
+        running = any(r.get("agent_id") == agent_id and r.get("state") == "launched" for r in rows)
         rep.steps["drill_tick"] = drill_tick(inst.store_path, inst.store_path.parent / "dream", now=now,
-                                             attention=attention, resolve=resolve, drill=drill).action
+                                             attention=attention, resolve=resolve, drill=drill,
+                                             dream_running=running).action
 
     guard("drill_tick", drilled)
     return rep

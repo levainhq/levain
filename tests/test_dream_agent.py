@@ -519,6 +519,69 @@ def test_the_drill_runs_on_its_own_seven_day_cadence_and_only_with_a_snapshot(sc
     assert r.action == "failed" and seen and seen[0][0] == "dream-drill" and sn.DB_BACKUP in seen[0][1]
 
 
+def _break_the_backup(root, name="o1"):
+    bk = root / name / "snap" / sn.DB_BACKUP
+    good = bk.read_bytes()
+    bk.write_bytes(good[:-100] + b"\0" * 100)
+    return lambda: bk.write_bytes(good)
+
+
+def test_1112_1_a_week_whose_restore_was_skipped_neither_resolves_a_failure_row_nor_counts_as_a_pass(scratch_store):
+    db = scratch_store
+    root = db.parent / "dream"
+    seen, resolved = [], []
+    kw = dict(attention=lambda k, t: seen.append((k, t)), resolve=resolved.append)
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    now = datetime.now(timezone.utc)
+    mend = _break_the_backup(root)
+    assert da.drill_tick(db, root, now=now, **kw).action == "failed" and len(seen) == 1 and resolved == []
+    mend()
+    (db.parent / "memory.crystal.json").write_text('{"x": 1}')                   # a seat wrote after the dream
+    week2 = now + timedelta(days=8)
+    r = da.drill_tick(db, root, now=week2, **kw)
+    assert r.action == "skipped", r                                              # was "ok"
+    assert resolved == [], "a week with no restore must not clear the failure row"
+    assert len(seen) == 2 and "hash" in seen[-1][1], seen                        # the row is kept open, with its cause
+    # and the ticks after it, inside the cadence, still do not clear it, and keep carrying the cause
+    assert da.drill_tick(db, root, **kw).action == "not-due"                     # (the record is stamped at real now)
+    assert resolved == [] and "hash" in seen[-1][1]
+    # a drill that really restores does clear it
+    (db.parent / "memory.crystal.json").unlink()
+    assert da.drill_tick(db, root, now=now + timedelta(days=17), **kw).action == "ok" and resolved == ["dream-drill"]
+
+
+def test_1112_1_a_skipped_drill_with_no_prior_failure_raises_nothing_and_resolves_nothing(scratch_store):
+    db = scratch_store
+    root = db.parent / "dream"
+    seen, resolved = [], []
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    (db.parent / "memory.crystal.json").write_text('{"x": 1}')
+    kw = dict(attention=lambda k, t: seen.append((k, t)), resolve=resolved.append)
+    assert da.drill_tick(db, root, **kw).action == "skipped"
+    assert da.drill_tick(db, root, **kw).action == "not-due"
+    assert seen == [] and resolved == []
+
+
+def test_1112_1_f8_a_launched_dream_row_makes_the_drill_tick_skip_without_taking_the_lock(scratch_store):
+    db = scratch_store
+    root = db.parent / "dream"
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    called, seen = [], []
+
+    def drill(*a, **k):
+        called.append(1)
+        raise AssertionError("the drill took the wrap lock while a dream run was launched")
+
+    r = da.drill_tick(db, root, attention=lambda k, t: seen.append(k), drill=drill, dream_running=True)
+    assert r.action == "deferred" and "launched" in r.detail and called == [] and seen == []   # a first drill just waits
+    assert sn.last_drill(root) is None and sn.drill_due(root)                    # nothing recorded: it stays due
+    # a launched row that never ends cannot hide the drill for good: the two-cadence row is raised as for any deferral
+    sn._write_json(root / sn.DRILL_RECORD, {"outcome": "ok", "at": (datetime.now(timezone.utc)
+                                                                    - timedelta(days=15)).isoformat()})
+    da.drill_tick(db, root, attention=lambda k, t: seen.append(k), drill=drill, dream_running=True)
+    assert seen == ["dream-drill"] and called == []
+
+
 def test_a_deferred_drill_raises_the_row_only_after_two_cadences(tmp_path):
     seen = []
 

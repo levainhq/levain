@@ -544,15 +544,23 @@ def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
 @dataclass
 class DrillResult:
     """``outcome``: ``ok`` (every applicable step passed), ``failed`` (a step failed: an attention row) or
-    ``no-snapshot`` (a fresh install: not a failure) or ``deferred`` (a dream or another writer holds the store, so
-    the live store could not be copied consistently; nothing is recorded and the drill stays due). A step is ``ok``, ``failed`` or ``skipped`` (with why)."""
+    ``skipped`` (the checks that ran passed, but the restore step did not run, so no restore was proved: it is
+    recorded, so the drill is next due in a cadence, but it is not a pass and clears nothing), ``no-snapshot`` (a fresh
+    install: not a failure) or ``deferred`` (a dream or another writer holds the store, so the live store could not be
+    copied consistently; nothing is recorded and the drill stays due). A step is ``ok``, ``failed`` or ``skipped`` (with
+    why). ``carried_failure`` is set only on a ``skipped`` result: the text of the failure the last recorded drill
+    found, kept until a drill really restores, so a week with no restore can neither clear that failure nor lose it."""
     outcome: str
     snapshot: str | None = None
     steps: list[dict[str, str]] = field(default_factory=list)
     at: str = ""
+    carried_failure: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"outcome": self.outcome, "snapshot": self.snapshot, "steps": self.steps, "at": self.at}
+        out: dict[str, Any] = {"outcome": self.outcome, "snapshot": self.snapshot, "steps": self.steps, "at": self.at}
+        if self.carried_failure:
+            out["carried_failure"] = self.carried_failure
+        return out
 
 
 def _step(res: DrillResult, name: str, status: str, detail: str) -> str:
@@ -565,8 +573,9 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
     snapshot file and the db backup against the manifest; (2) ``PRAGMA integrity_check`` on the backup; (3) copy the live
     store to a scratch dir and run the real :func:`rollback` against the copy, then check each restored file hashes to
     the manifest's ``pre``; (4) open the restored copy with anneal and read its status. Step 3 is skipped (not failed)
-    when the snapshot is not the one the live text matches (a later write, a finished rollback), because the rollback's
-    own guard is then doing its job. The result is written to ``<root>/drill.json`` for the gauge."""
+    when the snapshot is not the one the live text matches (a later write, a finished rollback) or has no post-save
+    record, because the rollback's own guard is then doing its job; the outcome is then ``skipped``, never ``ok``,
+    since nothing was restored. The result is written to ``<root>/drill.json`` for the gauge."""
     from anneal_memory import Store
     from levain.dream.executor import _copy_store
 
@@ -665,7 +674,7 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
         if not m.get("post_files") or copy_db is None:
             _step(res, "restore", "skipped", "the snapshot has no post-save record, so a rollback of it is refused by design")
             _step(res, "open", "skipped", "no restored copy")
-            return _drill_done(res, root, write_result)
+            return _drill_done(res, root, write_result, skipped=True)
         # the revert markers stay as the real manifest has them: a finished rollback then refuses on the copy as
         # ``already-reverted`` (skipped), instead of the copy reading "nothing to roll back" (a false failure)
         _write_manifest(socc, {**m, "store_db": str(copy_db)})
@@ -676,7 +685,7 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
             _step(res, "restore", "skipped", f"{rb.code}: the live store is past this dream, and the rollback guard "
                                              f"refused it on the copy (as designed). {rb.message}")
             _step(res, "open", "skipped", "no restored copy")
-            return _drill_done(res, root, write_result)
+            return _drill_done(res, root, write_result, skipped=True)
         if not rb.ok or rb.outcome == "nothing":
             _step(res, "restore", "failed", rb.message)
             return _drill_done(res, root, write_result, failed=True)
@@ -707,9 +716,25 @@ def _deferred(res: DrillResult, why: str) -> DrillResult:
     return res
 
 
-def _drill_done(res: DrillResult, root: Path, write: bool, *, failed: bool = False) -> DrillResult:
+def failed_steps_text(steps: Any) -> str:
+    """The failed steps of a drill result as one line (the attention row's cause)."""
+    return "; ".join(f"{s.get('name')}: {s.get('detail')}" for s in steps or [] if s.get("status") == "failed") \
+        or "a step failed"
+
+
+def _drill_done(res: DrillResult, root: Path, write: bool, *, failed: bool = False,
+                skipped: bool = False) -> DrillResult:
     if failed:
         res.outcome = "failed"
+    elif skipped:
+        # the restore did not run, so this is not a pass; the failure the last recorded drill found is carried
+        # forward (a drill that really restores drops it), so the skip neither clears it nor loses it
+        res.outcome = "skipped"
+        prior = last_drill(root) or {}
+        if prior.get("outcome") == "failed":
+            res.carried_failure = failed_steps_text(prior.get("steps"))
+        elif prior.get("outcome") == "skipped" and prior.get("carried_failure"):
+            res.carried_failure = str(prior["carried_failure"])
     if write:
         with contextlib.suppress(OSError):
             root.mkdir(parents=True, exist_ok=True)
