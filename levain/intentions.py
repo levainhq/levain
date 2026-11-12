@@ -180,17 +180,26 @@ def guarded_intention_store(path: Any) -> Any:
     route around the retirement. Legacy rows still read, and an update that does not name
     ``disposition`` edits one freely."""
     global _GUARDED
+    _require_schema2_anneal()
     with _GUARDED_LOCK:
         if _GUARDED is None:
             _GUARDED = _build_guarded_class()
-    try:
-        return _GUARDED(path, id_prefix=NEW_ID_PREFIX)
-    except TypeError as exc:
-        if "unexpected keyword argument 'id_prefix'" not in str(exc):
-            raise
-        # anneal-memory before 1.0.7 has no id_prefix: say what to do, never a bare TypeError on every store open
-        raise RuntimeError("levain needs anneal-memory>=2.0.0,<2.1 (the installed one predates the intention id prefix): "
-                           "pip install -U 'anneal-memory>=2.0.0,<2.1'") from exc
+    return _GUARDED(path, id_prefix=NEW_ID_PREFIX)
+
+
+def _require_schema2_anneal() -> None:
+    """Refuse an installed anneal-memory that keys the store's open records differently from the key levain reads raw.
+
+    The contract is the installed package's own ``OPEN_KEY``, compared with the one key levain spells
+    (:data:`STORE_DOC_KEY_OPEN`), not a version number: it is the exact thing that breaks (an older anneal that is still
+    installed through a checkout run directly, ``--no-deps`` or ``--no-pip`` accepts ``id_prefix``, loads and writes schema 1
+    under the old key, and levain's raw reads of the new key then see an empty store). An anneal without the constant is
+    an older one, and no hand-kept floor number is added beside the pin."""
+    from anneal_memory import spores
+
+    if getattr(spores, "OPEN_KEY", None) != STORE_DOC_KEY_OPEN:
+        raise RuntimeError("levain needs anneal-memory>=2.0.0,<2.1 (the installed one keeps its open records in a schema "
+                           "levain no longer reads): pip install -U 'anneal-memory>=2.0.0,<2.1'")
 
 
 def _build_guarded_class() -> Any:
