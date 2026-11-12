@@ -231,7 +231,8 @@ def sync(store: Any = None, *, directory: Path | str | None = None,
     desk. ``agent_dir=`` is a TEST SEAM: production callers use the default agent store (the queue directory and
     the agent store are one pairing in 1.0). Never raises: a host that cannot hold one is reported by
     :func:`describe`."""
-    if os.environ.get("LEVAIN_NO_IDLE_ASSERTION") or (os.environ.get("PYTEST_CURRENT_TEST") and not _IN_TESTS):
+    from levain.home_guard import under_test_run
+    if os.environ.get("LEVAIN_NO_IDLE_ASSERTION") or (under_test_run() and not _IN_TESTS):
         # a test run that moves threads must not leave a real holder on the developer's machine
         return {"held": False, "why": "disabled by the environment (LEVAIN_NO_IDLE_ASSERTION or a test run)"}
     if fcntl is None:
