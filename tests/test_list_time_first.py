@@ -251,8 +251,7 @@ def test_an_unreadable_store_names_the_done_rows_it_could_not_read(rig: Rig) -> 
 
 def test_a_seed_with_a_malformed_next_is_read_as_undated(rig: Rig) -> None:
     sid = rig.sp.add(type="task", text="a seed with a bad date", disposition="seed", today=TODAY)["id"]
-    _edit_store(rig, lambda d: [s.update(next="soonish") for s in d["spores"] if s["id"] == sid] if "spores" in d else
-                [s.update(next="soonish") for s in d["open"] if s["id"] == sid])
+    _edit_store(rig, lambda d: [s.update(next="soonish") for s in d["intentions"] if s["id"] == sid])
     row = _rows(rig)[f"intention:{sid}"]
     assert row["facets"]["time_state"] == "someday" and not row["facets"].get("due"), row["facets"]
 

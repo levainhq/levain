@@ -50,7 +50,7 @@ def _install(tmp_path: Path) -> tuple[Path, SubstrateSource, dict[str, str]]:
     }
     path = root / ".levain" / "memory.spores.json"
     data = json.loads(path.read_text())
-    for s in data["spores"]:
+    for s in data["intentions"]:
         if s["id"] == ids["undated"]:
             del s["created"]
         if s["id"] == ids["junk"]:

@@ -27,7 +27,7 @@ def test_an_id_minted_before_the_prefix_still_reads_through_the_same_store(tmp_p
     first = guarded_intention_store(path).add(type="thought", text="old")
     # rewrite the stored id as the pre-1.0.7 spelling an older install carries
     body = json.loads(path.read_text())
-    body["spores"] = [{**s, "id": "spore-007"} if s["id"] == first["id"] else s for s in body["spores"]]
+    body["intentions"] = [{**s, "id": "spore-007"} if s["id"] == first["id"] else s for s in body["intentions"]]
     path.write_text(json.dumps(body))
     store = guarded_intention_store(path)
     assert store.get("spore-007")["text"] == "old"
@@ -68,7 +68,7 @@ def _ringing_with_id(tmp_path, old_id):
     qdir.mkdir(mode=0o700)
     made = guarded_intention_store(path).add(type="task", text="renew the thing", disposition="agenda", next="2026-11-06")
     body = json.loads(path.read_text())
-    body["spores"] = [{**s, "id": old_id} if s["id"] == made["id"] else s for s in body["spores"]]
+    body["intentions"] = [{**s, "id": old_id} if s["id"] == made["id"] else s for s in body["intentions"]]
     path.write_text(json.dumps(body))
     res = g.germinate(path, qdir, install=root, today=date(2026, 11, 7))
     assert not res["errors"] and [o["intention_id"] for o in res["due"]] == [old_id], res

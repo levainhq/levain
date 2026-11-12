@@ -56,7 +56,7 @@ def _set_next(root, sid, value):
     """anneal 1.0.3 writes only a date-only ``next``; a timed one is placed in the file as THE LIST's writer will."""
     path = _intentions(root)
     data = json.loads(path.read_text())
-    for row in data["spores"]:
+    for row in data["intentions"]:
         if row["id"] == sid:
             row["next"] = value
     path.write_text(json.dumps(data))

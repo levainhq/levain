@@ -330,7 +330,7 @@ def test_two_concurrent_settlers_both_end_applied(path, verb, params, key):
     if verb == "intention_seed":
         assert results[0].members[0].native_id == results[1].members[0].native_id
         data = json.loads(path.read_text())
-        assert sum(1 for s in data["spores"] if s.get("text") == "raced") == 1
+        assert sum(1 for s in data["intentions"] if s.get("text") == "raced") == 1
 
 
 def test_effect_record_round_trip_and_units(path):

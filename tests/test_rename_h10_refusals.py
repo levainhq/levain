@@ -73,7 +73,7 @@ def test_the_pointer_is_a_command_the_real_parser_accepts(argv, capsys):
 def test_a_bare_or_unknown_retired_command_names_every_verb_the_new_command_has(capsys):
     verbs = set(build_parser()._subparsers._group_actions[0].choices["intentions"]._levain_verbs.choices)
     assert verbs                                    # derived from the live parser, never retyped here
-    for argv in (["spores"], ["spores", "bogus"], ["spores", "-h"]):
+    for argv in (["intentions"], ["spores", "bogus"], ["spores", "-h"]):
         code, _out, err = _run(argv, capsys)
         assert code == 2, (argv, err)
         assert "levain intentions" in err

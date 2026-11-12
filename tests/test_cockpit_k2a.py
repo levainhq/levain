@@ -511,7 +511,7 @@ class TestRound1:
                             next=(TODAY + timedelta(days=5)).isoformat(), today=TODAY)["id"]
         p = rig.root / ".levain" / "memory.spores.json"
         data = json.loads(p.read_text())
-        for sp in data["spores"]:
+        for sp in data["intentions"]:
             if sp["id"] == sid:
                 sp["salience"] = "x"
         p.write_text(json.dumps(data))
@@ -967,15 +967,15 @@ class TestIntentionCas:
         from levain.cockpit.providers import intention_row_version
         p = rig.root / ".levain" / "memory.spores.json"
         data = json.loads(p.read_text())
-        loop = next(sp for sp in data["spores"] if sp["id"] == rig.ids["loop"])
+        loop = next(sp for sp in data["intentions"] if sp["id"] == rig.ids["loop"])
         loop.pop("disposition", None)                  # the loop sentinel: key absent
         odd = dict(loop, id="intention-odd1", text="odd shapes", salience="2", pointer={"k": 1})
         odd.pop("next", None)
-        data["spores"].append(odd)
+        data["intentions"].append(odd)
         p.write_text(json.dumps(data))
         rows = {r["id"]: r for pid in ("tray", "loops")
                 for r in (rig.ck.panel(pid, credential_class="token") or {}).get("rows") or []}
-        stored = {sp["id"]: sp for sp in json.loads(p.read_text())["spores"]}
+        stored = {sp["id"]: sp for sp in json.loads(p.read_text())["intentions"]}
         assert set(rows) == {f"intention:{i}" for i in stored}   # a later row is in view too
         for rid, row in rows.items():
             assert intention_row_version(stored[rid[len("intention:"):]]) == row["version"], rid

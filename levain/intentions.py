@@ -48,6 +48,8 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
+from levain.intention_legacy import STORE_DOC_KEY_OPEN       # pure data; the one place the stored document's key is spelled
+
 __all__ = [
     "LOOP_DISPOSITION",
     "TRAY_DISPOSITIONS",
@@ -425,7 +427,7 @@ def list_open_readonly(path: Any, *, today: Any = None) -> list[dict[str, Any]]:
 
     store = guarded_intention_store(path)
     data = store._load()   # noqa: SLF001 - the non-mutating read; `_load_keyed` is the one that saves
-    items = [dict(s) for s in data.get("spores", []) if isinstance(s, dict)]
+    items = [dict(s) for s in data.get(STORE_DOC_KEY_OPEN, []) if isinstance(s, dict)]
     for it in items:
         k = it.get("origin_key")
         if not isinstance(k, str) or not k:

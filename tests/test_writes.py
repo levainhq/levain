@@ -1441,7 +1441,7 @@ class TestIntentionUpdate:
         # anneal clears "" itself, so only a hand-edited store holds one: write it as a hand would
         path = _scope(install).anneal.intentions_json
         data = json.loads(path.read_text(encoding="utf-8"))
-        rows = data["spores"] if isinstance(data, dict) else data
+        rows = data["intentions"] if isinstance(data, dict) else data
         next(r for r in rows if r["id"] == sid)["disposition"] = ""
         path.write_text(json.dumps(data), encoding="utf-8")
         assert _intention_store(install).get(sid).get("disposition") == ""

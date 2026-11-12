@@ -245,7 +245,7 @@ def test_a_row_without_an_origin_key_is_refused(broker, intentions):
     # anneal keys an unkeyed row on read unless its save fails; a read-only directory makes it fail,
     # so the row reaches the broker with no origin_key, and none is invented
     data = json.loads(intentions.read_text())
-    for s in data["spores"]:
+    for s in data["intentions"]:
         if s.get("origin_key") == "k.loop":
             del s["origin_key"]
             sid = s["id"]

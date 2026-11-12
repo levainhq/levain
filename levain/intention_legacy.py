@@ -24,7 +24,10 @@ from typing import Any, Mapping
 STORE_FILE_NAME = 'memory.spores.json'
 
 # The document key of the open records in that file, anneal-owned: a raw read of the document (`data.get(...)`) uses it.
-STORE_DOC_KEY_OPEN = 'spores'
+# anneal's schema 2 (the 11-12 key rename) keys them 'intentions'; schema 1 kept them under STORE_DOC_KEY_OPEN_V1, and
+# anneal REFUSES a schema 1 document until `anneal-memory intention migrate-key --file <store>` converts it once.
+STORE_DOC_KEY_OPEN = 'intentions'
+STORE_DOC_KEY_OPEN_V1 = 'spores'
 
 # The old verb ids, to their new ids. A signed authority-log `raise` link names a verb by its id, and the policy replay maps
 # a recorded old id to the new one so a floor an operator signed keeps binding (ruling H1). `descend` becomes `close` and

@@ -436,7 +436,7 @@ def _keyless_store(root):
     path = _intentions(root)
     sid = _add(root, "keyless one")["id"]
     doc = json.loads(path.read_text())
-    for row in doc["spores"]:
+    for row in doc["intentions"]:
         row.pop("origin_key", None)
     path.write_text(json.dumps(doc))
     return path, sid

@@ -89,7 +89,7 @@ def _count(intentions: Path, key: str) -> int:
             return sum(walk(v) for v in o)
         return 0
     raw = json.loads(intentions.read_text())     # the "deleted" ledger of tombstones is not a row
-    return walk(raw.get("spores", [])) + walk(raw.get("resolved", []))
+    return walk(raw.get("intentions", [])) + walk(raw.get("resolved", []))
 
 
 def _target(intentions: Path, key: str | None) -> dict[str, Any]:

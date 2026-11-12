@@ -39,7 +39,7 @@ try:
 except ImportError:                              # pragma: no cover - Windows: guarded writes are refused anyway
     fcntl = None  # type: ignore[assignment]
 
-from levain.intention_legacy import STORE_DOC_KEY_OPEN
+from levain.intention_legacy import STORE_DOC_KEY_OPEN, STORE_DOC_KEY_OPEN_V1
 
 __all__ = ["BACKUP_SUBDIR", "MigrationReport", "migrate_seed_to_someday", "open_seed_ids"]
 
@@ -177,6 +177,9 @@ def _scan_open_seeds(store_path: Path) -> list[str]:
         return []
     if not isinstance(data, dict):
         raise ValueError("the document is not a JSON object")
+    if STORE_DOC_KEY_OPEN_V1 in data:       # a schema 1 store reads as "no open seeds" if its key is simply absent
+        raise ValueError(f"the store is schema 1 (open records under {STORE_DOC_KEY_OPEN_V1!r}); convert it once: "
+                         f"anneal-memory intention migrate-key --file {store_path}")
     open_rows = data.get(STORE_DOC_KEY_OPEN, [])
     if not isinstance(open_rows, list):
         raise ValueError("the open list is not a list")
