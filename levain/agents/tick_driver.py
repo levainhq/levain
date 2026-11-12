@@ -89,7 +89,8 @@ TICK_NOTICE_RESERVE_S = 120
 #: still ran, the claims did not); 2 the reaper raised; 3 the graceful bound fired; 4 a launched session row had no
 #: session launcher to END it, so it was not renewed and its lease lapses to takeover (an install that names none, or
 #: whose launcher cannot be built); 5 a night notice failed, raised, or was skipped for time (the tick itself ran;
-#: the stderr line says which); 6 a claimed dream slot could not be launched, or a launched one could not have its fire
+#: the stderr line says which); 6 a claimed dream slot could not be launched (its launch raised or answered
+#: ``unclassified``; a full cap is a normal wait and is not this), or a launched one could not have its fire
 #: spawned (D1-Q: the row is retried until its grace, or lapses to takeover; the stderr line says which); 70 the
 #: watchdog took the process.
 EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_NOTICES, EXIT_HARD_TIMEOUT = (
@@ -443,7 +444,8 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
     * ``no-slot`` and ``unclassified`` (a full cap; an authority or hook that could not answer) write nothing and leave the
       row ``admitted``. The verb ends its own row there because nothing retries a manual row; the tick IS the retry,
       once a pass, until the row's grace is gone, when :func:`levain.agents.controller.close_unlaunched` (or the input
-      check's own ``missed``) ends it. No state is invented.
+      check's own ``missed``) ends it. No state is invented. ``unclassified`` exits :data:`EXIT_LAUNCH` (the dream did
+      not run); ``no-slot`` does not (a full cap is a normal wait).
     * every other answer (``skipped-no-input``, ``skipped-budget``, ``stopped``, ``missed``, ``not-admitted``) has already
       been written by the controller; it is named on stderr, and it is not a failed pass.
 
@@ -516,6 +518,9 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
         retried = res.outcome in (_ctl.NO_SLOT, _ctl.UNCLASSIFIED)
         notes.append(f"{oid} did not launch: {res.outcome} ({res.reason})"
                      + ("; it stays admitted and is retried next tick until its grace is gone" if retried else ""))
+        if res.outcome == _ctl.UNCLASSIFIED:
+            seen["launch"] = "unclassified"   # the authority or the hook could not answer: the dream did not run (a
+            #                                   full cap, NO_SLOT, is a normal wait and stays a clean pass)
 
 
 def _run_notices(st: AgentStore, result: Any, clock: Callable[[], datetime], started: datetime, soft_s: float,
