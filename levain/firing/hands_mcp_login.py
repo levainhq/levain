@@ -76,9 +76,11 @@ def cockpit_root_of(entity_dir: Path | str) -> Path:
 
 def load_registry(cockpit_root: Path | str, now: datetime | None = None) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """``(live entries, skipped (id, why))`` from the cockpit's verified, anchored replay, or :class:`HandsMcpError`.
-    A log that cannot be read is an error, never an empty registry."""
+    A log that cannot be read is an error, never an empty registry. An entry stopped because a key that signed it was
+    revoked (:func:`levain.authority.grants_in_force`) is not live and is skipped with the reason ``signer``, whatever
+    else is true of it (an expired one included: register it again, do not renew it). It stays in the log."""
     from levain.agent_authority import AgentAuthority
-    from levain.authority import NotInitialised
+    from levain.authority import HANDS_MCP_KIND, NotInitialised, grants_in_force
     from levain.cockpit.firejournal import DB_NAME
     from levain.hands_mcp import live_entries
     if not (Path(cockpit_root) / DB_NAME).is_file():
@@ -89,7 +91,11 @@ def load_registry(cockpit_root: Path | str, now: datetime | None = None) -> tupl
         return [], []                                   # a journal with an empty log registered nothing
     except Exception as exc:  # noqa: BLE001 - a log that cannot be replayed is a fault, never "nothing registered"
         raise HandsMcpError(f"the authority log cannot be read ({type(exc).__name__}: {str(exc)[:160]})") from None
-    return live_entries(state.policy.grants, now or datetime.now(timezone.utc))
+    in_force = grants_in_force(state)
+    live, skipped = live_entries(in_force, now or datetime.now(timezone.utc))
+    stopped = [(gid, "signer") for gid, g in state.policy.grants.items()
+               if gid not in in_force and isinstance(g, Mapping) and g.get("kind") == HANDS_MCP_KIND]
+    return live, sorted(skipped + stopped)
 
 
 def _grants_named(cockpit_root: Path | str, name: str) -> list[dict[str, Any]]:
