@@ -1218,7 +1218,8 @@ def test_r1c_the_unreachable_refusal_reaches_the_user_as_a_sentence_never_a_bare
 
 def _revoke_laptop_as_compromised(ck: "KeyedCockpit") -> None:
     """Revoke ``ck``'s laptop key through the supported lost-or-stolen path (``compromised_since``: the last
-    laptop-presence key can be revoked only that way), signed by itself. The voice-key record before it stands."""
+    laptop-presence key can be revoked only that way), signed by itself. A voice key that key signed stays in the policy
+    but is stopped from then on (row 190), so a read of it refuses ``no_key``; the revoke-reach checks come first."""
     conn = sqlite3.connect(ck.root / "cockpit.db", isolation_level=None)
     try:
         head = auth.log_head(conn)
@@ -1352,9 +1353,11 @@ def test_r5b_grant_routes_on_another_cockpit_and_no_laptop_key_refuses_before_an
 
 
 def test_r5d_grant_routes_on_this_cockpit_are_unchanged_and_never_ask_the_cli_check(rig, monkeypatch):
-    """(d): the hook names the data root, so the phone's revoke reaches: allowed even with the laptop key revoked and
-    only a passkey left, and the command-line check is never consulted. Red with: the matching branch falling through
-    to ``_cli_revoke_refusal``."""
+    """(d): the hook names the data root, so the phone's revoke reaches: not refused even with the laptop key revoked
+    and only a passkey left, and the command-line check is never consulted. The only voice key was signed by that
+    laptop key, so it is stopped (row 190) and the request ends at the key read, ``no_key``, with no provider call;
+    ``revoke_unreachable`` is what a falling-through branch would answer. Red with: the matching branch falling
+    through to ``_cli_revoke_refusal``."""
     rig.add_key()
     _phone(rig.ck)
     _revoke_laptop_as_compromised(rig.ck)
@@ -1364,8 +1367,9 @@ def test_r5d_grant_routes_on_this_cockpit_are_unchanged_and_never_ask_the_cli_ch
     assert cockpit_voice.revoke_refusal(rig.qdir, rig.data_root) is None
     g = rig.reply("Read this aloud.")
     with served(rig) as (port, _httpd):
-        assert speak(port, rig, g)[0] == 200
-    assert asked == [] and len(rig.transport.seen) == 1
+        status, _h, body = speak(port, rig, g)
+    assert (status, js(body)["error"]) == (409, "no_key"), body
+    assert asked == [] and rig.transport.seen == []
 
 
 def test_r5e_a_fault_stays_unchecked_on_either_branch(rig, tmp_path, monkeypatch):
