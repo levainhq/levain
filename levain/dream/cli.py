@@ -392,13 +392,10 @@ def _install_kwargs(args: argparse.Namespace, zone: str, da: object) -> dict:
     seed, never here; write_install refuses a write destination inside ~/.anneal-memory or flow's root, a non-empty
     scratch directory with no shadow marker and a flow root without its ledger, then copies flow's instructions
     read-only beside the facts."""
-    from levain.desk.launch import default_desk_dir
-
     base = Path(args.store_dir).expanduser().resolve()
-    home = os.environ.get("LEVAIN_HOME")
-    levain_home = Path(home).expanduser() if home else Path.home() / ".levain"
-    cockpit = Path(args.cockpit_root if args.cockpit_root is not None else levain_home / "cockpit").expanduser().resolve()
-    coord = Path(args.coord_dir if args.coord_dir is not None else default_desk_dir()).expanduser().resolve()
+    default_cockpit, default_coord = da.install_defaults()
+    cockpit = (Path(args.cockpit_root).expanduser().resolve() if args.cockpit_root is not None else default_cockpit)
+    coord = (Path(args.coord_dir).expanduser().resolve() if args.coord_dir is not None else default_coord)
     if args.shadow_flow_root is not None:
         return dict(store_path=base / "memory.db", cockpit_root=cockpit, coord_dir=coord, zone=zone,
                     shadow_flow_root=Path(args.shadow_flow_root).expanduser().resolve(),

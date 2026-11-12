@@ -6,12 +6,18 @@ Every store is real, as in ``tests/test_dream_start.py`` (whose rig this reuses)
 called."""
 from __future__ import annotations
 
+import re
+import shlex
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from levain import cli as levain_cli
 from levain.dream import agent as da
+from levain.dream import cli as dcli
 from levain.dream import ready as rd
 from levain.dream import start as st
+from tests.test_cockpit_anchor_reset import _verdict
 from tests.test_dream_start import ZONE, _claim, _go, _live_rig, _rows
 
 
@@ -93,6 +99,59 @@ def _walk(obj):
             yield from _walk(v)
     else:
         yield obj
+
+
+# ------------------------------------------- D (L2 F5): the wrap-open card's enable line names THIS install's flags
+
+def _enable_cmd(text: str) -> str:
+    (cmd,) = [c for c in re.findall(r"`([^`]+)`", text) if c.startswith("levain dream enable ")]
+    return cmd
+
+
+def test_d_a_non_default_install_gets_an_enable_line_that_keeps_its_facts(tmp_path, monkeypatch):
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home"))       # the defaults are elsewhere than this install
+    rig = _live_rig(tmp_path)
+    inst = da.read_install(rig.store.directory)
+    cmd = _enable_cmd(da.window_remedy("wrap-open", rig.db, agent_dir=rig.store.directory))
+    assert _verdict(cmd, {}) is None, cmd
+    args = levain_cli.build_parser().parse_args(shlex.split(cmd)[1:])
+    assert args.orphan_floor_hours == "<hours>"
+    assert Path(args.agent_store_dir).resolve() == Path(rig.store.directory).resolve(), cmd
+    got = dcli._install_kwargs(args, ZONE, da)                       # what the pasted line would write
+    assert got["store_path"] == inst.store_path.resolve(), cmd
+    assert got["cockpit_root"] == inst.cockpit_root.resolve(), cmd
+    assert got["coord_dir"] == inst.coord_dir.resolve(), cmd
+
+
+def test_d_the_default_install_keeps_the_short_line(tmp_path, monkeypatch):
+    from anneal_memory import FLOW_SCHEMA, Store
+
+    from levain.desk.launch import default_desk_dir
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    agent_dir = home / "autonomic"
+    agent_dir.mkdir(parents=True)
+    (home / "cockpit").mkdir()
+    default_desk_dir().mkdir(mode=0o700)
+    db = tmp_path / "st" / "memory.db"
+    db.parent.mkdir()
+    with Store(str(db), section_schema=FLOW_SCHEMA):
+        pass
+    da.write_install(agent_dir, store_path=db, cockpit_root=home / "cockpit", coord_dir=default_desk_dir(), zone=ZONE)
+    cmd = _enable_cmd(da.window_remedy("wrap-open", db, agent_dir=agent_dir))
+    assert cmd == f"levain dream enable --store-dir {shlex.quote(str(db.parent))} --orphan-floor-hours <hours>", cmd
+
+
+def test_d_the_tick_gives_the_card_the_install_it_closes_for(tmp_path, monkeypatch):
+    rig = _live_rig(tmp_path)
+    seen = []
+    monkeypatch.setattr(da, "close_window", lambda **kw: seen.append(kw) or da.CloseResult("waiting", "w:x"))
+    da.tick_notices(rig.store, now=rig.now(), attention=lambda k, t: None, resolve=lambda k: None,
+                    drill=lambda *a, **k: None)
+    assert seen and all(Path(kw["agent_dir"]) == Path(rig.store.directory) for kw in seen), seen
+    # the facts the tick read once, not a second read per card
+    assert all(kw["install"] == da.read_install(rig.store.directory) for kw in seen), seen
 
 
 def test_a_todays_admitted_manual_row_is_still_the_one_resumed(tmp_path):
