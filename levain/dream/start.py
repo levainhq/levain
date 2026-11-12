@@ -247,10 +247,11 @@ def start(store: Any, *, clock: Callable[[], datetime] | None = None, authority:
     try:
         launch_over, session_alive = ctl.dispatch_probes(inst.coord_dir)
         # the admission is the dream's own hook, PASSED: launch's defaulted on_input resolves it from the signed name, and
-        # a default that ever came back None would admit with no day-ready at all, silently
+        # a default that ever came back None would admit with no day-ready at all, silently. Its clock is this start's
+        # one instant, so the day it judges is the day the claim, the limits and the launch are filed under.
         res = ctl.launch(store, oid, authority=auth, executor=executor, window=window_for(now, inst.zone), now=now,
                          launch_over=launch_over, session_alive=session_alive,
-                         on_input=da.install_on_input(store.directory))
+                         on_input=da.install_on_input(store.directory, clock=lambda: now))
     except Exception as exc:  # noqa: BLE001 - whatever broke, the row this verb owns is not left blocking tonight
         left = _end_unlaunched(store, oid, REASON_INTERRUPTED, clock)
         return Started(1, "error", _after_end(oid, left, REASON_INTERRUPTED, f"{type(exc).__name__}: {exc}"), oid, resumed)
