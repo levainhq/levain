@@ -31,13 +31,36 @@ def test_a_last_line_still_being_appended_is_waited_for(tmp_path) -> None:
     assert [o["kind"] for o in got] == ["reserved", "settled"]
 
 
-def test_a_terminated_line_that_does_not_parse_fails_at_once(tmp_path) -> None:
+def test_a_terminated_line_that_does_not_parse_fails_at_once(tmp_path, monkeypatch) -> None:
     p = tmp_path / "ledger.jsonl"
     p.write_bytes(b'{"kind": "reserved"}\n{not json}\n')
-    start = time.monotonic()
+
+    def no_wait(_s: float) -> None:
+        raise AssertionError("the retry path was entered for a terminated line")
+
+    monkeypatch.setattr("tests.ledger_support.time.sleep", no_wait)
     with pytest.raises(json.JSONDecodeError):
         file_lines(str(p))
-    assert time.monotonic() - start < 0.5
+
+
+def test_a_last_line_cut_inside_a_multibyte_character_is_waited_for(tmp_path) -> None:
+    p = tmp_path / "ledger.jsonl"
+    whole = '{"kind": "noted", "who": "José"}\n'.encode("utf-8")
+    cut = whole.index(b"\xc3") + 1                      # the first byte of the two-byte é is written, the second is not yet
+    p.write_bytes(b'{"kind": "reserved"}\n' + whole[:cut])
+
+    def finish() -> None:
+        time.sleep(0.15)
+        with open(p, "ab") as f:
+            f.write(whole[cut:])
+
+    t = threading.Thread(target=finish)
+    t.start()
+    try:
+        got = file_lines(str(p))
+    finally:
+        t.join()
+    assert [o["kind"] for o in got] == ["reserved", "noted"] and got[1]["who"] == "José"
 
 
 def test_a_last_line_that_never_finishes_fails_after_the_bounded_wait(tmp_path) -> None:
