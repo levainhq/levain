@@ -1226,6 +1226,20 @@ def _open_when(text: str) -> str:
     return f"{_row_of(text)}.querySelector('.verb-btn[data-verb=\"intention_surface_at\"]').click(); 1"
 
 
+_FAKE_CLOCK = (
+    "(() => { const Real = Date; const at = %d; const hh = %d, mm = %d; const now = new Real(2031, 4, 14, hh, mm, 0).getTime();"
+    "window.Date = class extends Real { constructor(...a) { if (a.length) super(...a); else super(now); } static now() { return now; } };"
+    "return 1; })()"
+)
+
+
+# The quick picks depend on the page's clock: "Later today" needs a clock before 23:00 and "Tonight" one before 20:00, so a test that
+# reads them off the real clock fails for an hour or more of every day. The when form is therefore opened under a page clock pinned
+# to a mid-morning instant of a known day, and every date it expects is derived from that day, never from the host's date.
+_PIN_DAY = (2031, 5, 14)      # the day _FAKE_CLOCK stands on (a Wednesday)
+_PIN_AT = (10, 0)             # the pinned time of day: both of today's picks are offered
+
+
 @pytest.mark.parametrize("width,height,mobile", [(1280, 1000, False), (390, 844, True)])
 @needs_browser
 def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_who_control_sets_the_target(
@@ -1234,9 +1248,10 @@ def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_
 
     root, src, _ids = _install(tmp_path)
     ids = _seed_when(root)
-    tomorrow = (date.today() + timedelta(days=1)).isoformat()
-    monday = date.today() + timedelta(days=((8 - ((date.today().weekday() + 1) % 7)) % 7) or 7)
-    day = (date.today() + timedelta(days=9)).isoformat()
+    today = date(*_PIN_DAY)
+    tomorrow = (today + timedelta(days=1)).isoformat()
+    monday = today + timedelta(days=((8 - ((today.weekday() + 1) % 7)) % 7) or 7)
+    day = (today + timedelta(days=9)).isoformat()
     emu = {"w": width, "h": height, "dpr": 2 if mobile else 1}
     if mobile:
         emu["mobile"] = True
@@ -1245,6 +1260,7 @@ def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_
             {"emulate": emu},
             *_reload(),
             {"until": f"{TRAY} && {_row_of('when row a')} && {_row_of('when row b')} && {_row_of('when row c')} && 1"},
+            {"eval": _FAKE_CLOCK % ((0,) + _PIN_AT)},                  # the page's clock, before any form reads it
             # the form's own facts: picks, two inputs (no datetime-local), no who-chip on a seed, the who control with nothing chosen
             {"eval": _open_when("when row a")},
             {"eval": f"(() => {{ const f = {_row_of('when row a')}.querySelector('.when-form'); const b = f.getBoundingClientRect();"
@@ -1281,7 +1297,7 @@ def test_when_form_writes_a_minute_from_a_quick_pick_or_a_date_and_time_and_the_
         ])
     vals = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}
     form = vals["form"]
-    assert {"later", "tomorrow", "monday", "now"} <= set(form["picks"]), form
+    assert {"later", "tonight", "tomorrow", "monday", "now"} <= set(form["picks"]), form    # every pick, under the pinned clock
     assert (form["date"], form["time"], form["timeVal"], form["dt"]) == ("date", "time", "", False), form   # a date-only row: no time
     assert "host" in form["zone"], form                                                   # the times are the host's clock
     assert form["pressed"] == ["false", "false"] and form["repoHidden"] is True, form
@@ -1327,13 +1343,6 @@ def test_when_form_confirm_row_is_reachable_on_a_390_phone(tmp_path: Path) -> No
         ])
     reach = {k: v for x in out["values"] if isinstance(x, str) and x.startswith("{") for k, v in json.loads(x).items()}["reach"]
     assert reach["inBody"] and reach["inCard"] and reach["inView"] and reach["topmost"], reach
-
-
-_FAKE_CLOCK = (
-    "(() => { const Real = Date; const at = %d; const hh = %d, mm = %d; const now = new Real(2031, 4, 14, hh, mm, 0).getTime();"
-    "window.Date = class extends Real { constructor(...a) { if (a.length) super(...a); else super(now); } static now() { return now; } };"
-    "return 1; })()"
-)
 
 
 @needs_browser
