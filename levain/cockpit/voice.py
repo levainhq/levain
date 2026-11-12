@@ -47,7 +47,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from levain.authority import voice_key_for, voice_key_record
+from levain.authority import grants_in_force, voice_key_for, voice_key_record
 from levain.cockpit import card_script
 from levain.cockpit import room as cockpit_room
 from levain.voice import custody
@@ -298,10 +298,11 @@ def base_type(content_type: str | None) -> str:
 # --- the read ---------------------------------------------------------------------------------------------------------
 
 def _grants_for(data_root: Path | str) -> tuple[Any, str]:
-    """The voice-key grants from ONE verified replay of the authority log, and ``"ok"`` / ``"unreadable"``. Presence
-    metadata only: the keychain is never read here."""
+    """The voice-key grants IN FORCE from ONE verified replay of the authority log, and ``"ok"`` / ``"unreadable"``: a
+    key whose signing key was revoked is stopped (:func:`levain.authority.grants_in_force`), so it is not reported
+    ready. Presence metadata only: the keychain is never read here."""
     try:
-        return custody.authority_for(data_root)().policy.grants, "ok"
+        return grants_in_force(custody.authority_for(data_root)()), "ok"
     except Exception:       # noqa: BLE001 - any failure is "the log could not be verified now", said, not raised
         return {}, "unreadable"
 
@@ -869,7 +870,7 @@ def _stream_revoked(provider: str, data_root: Path | str, revoke_queue: Path | s
     reaches it (:func:`revoke_refusal`). The key itself is not read."""
     key_code = ""
     try:
-        grants = custody.authority_for(data_root)().policy.grants
+        grants = grants_in_force(custody.authority_for(data_root)())     # a key stopped by its signer's revoke is gone
         record = grants.get(bound[0]) if bound is not None else None
         if record is None or not voice_key_record(record) or record.get("provider") != provider:
             key_code = "not_set"
