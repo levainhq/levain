@@ -1218,15 +1218,35 @@ def run_body(sup: Any, occurrence_id: str, launch_epoch: int, *, store_path: Pat
     return RunReport(0 if end.state == "done" else 1, outcome=outcome, state=end.state, card=card)
 
 
-def _reinserted_sentence(occ: Path) -> str:
-    """One plain sentence for a consolidated card when the save put back durable lines the compose left out (the
-    snapshot manifest's ``reinserted``, recorded only after the post record proved them anneal's); else ""."""
-    lines = (_snap.read_manifest(occ) or {}).get("reinserted") or []
-    if not isinstance(lines, list) or not lines:
-        return ""
-    n = len(lines)
-    shown = "; ".join(" / ".join(str(x).split("\n")) for x in lines)
-    return f"The save put back {n} line{'s' if n != 1 else ''} the compose left out: {shown}"
+#: A durable-change sentence on a card shows this many lines, each cut to this many characters; the manifest keeps all.
+DURABLE_SHOWN_LINES = 3
+DURABLE_LINE_CHARS = 120
+_BULLET_LEAD = re.compile(r"^[ \t]*(?:[-*]|\d+\.)[ \t]+")
+
+
+def _durable_lines(lines: list[Any]) -> str:
+    shown = []
+    for raw in lines[:DURABLE_SHOWN_LINES]:
+        one = " / ".join(part.strip() for part in str(raw).split("\n") if part.strip())
+        one = _BULLET_LEAD.sub("", one)
+        shown.append(one if len(one) <= DURABLE_LINE_CHARS else one[:DURABLE_LINE_CHARS - 1] + "…")
+    more = len(lines) - len(shown)
+    return "; ".join(shown) + (f"; and {more} more" if more > 0 else "")
+
+
+def _durable_sentence(occ: Path) -> str:
+    """Plain sentences for a consolidated card when the save put back durable lines the compose left out or removed
+    lines through drop markers (the snapshot manifest's ``reinserted`` and ``dropped``, recorded only after the post
+    record proved them anneal's); else ""."""
+    m = _snap.read_manifest(occ) or {}
+    out = []
+    for key, what in (("reinserted", "put back {n} line{s} the compose left out"),
+                      ("dropped", "removed {n} line{s} through drop markers")):
+        lines = m.get(key) or []
+        if isinstance(lines, list) and lines:
+            n = len(lines)
+            out.append(f"The save {what.format(n=n, s='s' if n != 1 else '')}: {_durable_lines(lines)}.")
+    return " ".join(out)
 
 
 def _file_run_card(outcome: str, result: Mapping[str, Any], occurrence_id: str, occ: Path, store_path: Path | str,
@@ -1238,7 +1258,7 @@ def _file_run_card(outcome: str, result: Mapping[str, Any], occurrence_id: str, 
             _, new = _card.file_card(review_store, saved_card(), feed=feed)
             return "filed" if new else "duplicate"
         spec: dict[str, Any] = {"kind": "consolidated" if outcome == "saved" else "failed", "occurrence": occurrence_id,
-                                "reason": _reinserted_sentence(occ) if outcome == "saved" else
+                                "reason": _durable_sentence(occ) if outcome == "saved" else
                                 f"{outcome}: {result.get('detail') or ''}".strip()}
         c = _card.from_spec(spec, occ_dir=occ, db_path=store_path if outcome == "saved" else None, day=day,
                             manual=manual, slot=slot, store_dir=Path(store_path).parent)
