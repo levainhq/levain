@@ -137,3 +137,48 @@ def test_window_span_is_window_keys_inverse():
     for bad in ("m:2026-11-12", "w:2026-11-12T21:00", "w:2026-13-12T22:00", "d:2026-11-12"):
         with pytest.raises(ValueError):
             schedule.window_span(trigger, ZONE, bad)
+
+
+# ------------------------------------------------- (3) the launch's set-up is guarded like each row is
+
+class Notices:
+    """``tick_notices`` replaced by one that records that it ran and reports nothing."""
+
+    def __init__(self):
+        self.ran = 0
+
+    def __call__(self, *a, **kw):
+        from types import SimpleNamespace
+
+        self.ran += 1
+        return SimpleNamespace(notes=[], problems=[])
+
+
+def _slot(rig) -> datetime:
+    t = rig.now().astimezone(UTC).replace(second=0, microsecond=0) + timedelta(minutes=10)
+    return t + timedelta(minutes=(30 - t.minute % 30) % 30)
+
+
+def test_a_set_up_failure_before_the_rows_is_named_and_costs_the_pass_nothing_else(tmp_path, hook, monkeypatch, capsys):
+    from levain.agents import spec as spec_mod
+
+    rig = _live_rig(tmp_path)
+    slot, spawn = _slot(rig), Spawns()
+    assert _tick(rig, slot - 10 * MIN, spawn) == T.EXIT_OK
+    notices = Notices()
+    monkeypatch.setattr(da, "tick_notices", notices)
+    real = spec_mod.get_agent
+
+    def locked(store, ref, version=None):
+        if ref == da.NAME:
+            raise sqlite3.OperationalError("database is locked")
+        return real(store, ref, version)
+
+    monkeypatch.setattr(spec_mod, "get_agent", locked)
+    code = _tick(rig, slot + MIN, spawn)                     # before the fix: the OperationalError escaped run_tick
+    assert code == T.EXIT_LAUNCH
+    assert notices.ran == 1                                  # the notices still ran
+    err = capsys.readouterr().err
+    assert "database is locked" in err and "OperationalError" in err
+    (row,) = _rows(rig)
+    assert row["state"] == "admitted" and spawn.calls == []  # retried next tick, until its grace
