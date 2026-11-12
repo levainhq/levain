@@ -864,7 +864,9 @@ def tick_notices(store: Any, *, now: datetime, missed_windows: Mapping[str, Sequ
 
     Each step runs on its own: one that raises, or a card the feed refuses, is a ``problem`` in the report and is raised
     as an attention item too (``dream-notice-failed:<step>``) when the feed is writable, and the steps after it still
-    run. Nothing here swallows a failure. The facts it needs (the rows, the agent, the miss streak, the install) are read
+    run. Nothing here swallows a failure. The windows with a missed slot are this tick's ``missed_windows`` UNION the
+    controller's miss-streak record (:func:`levain.agents.controller.miss_windows`): a walk's missed slots are never
+    rows, so a laptop that woke before the window closed would otherwise lose its card to the next tick. The facts it needs (the rows, the agent, the miss streak, the install) are read
     once per call; a store with no dream install, or no registered dream, is a quiet "not applicable"."""
     rep = NoticeReport()
     agent_dir = Path(store.directory)
@@ -890,6 +892,7 @@ def tick_notices(store: Any, *, now: datetime, missed_windows: Mapping[str, Sequ
         rows = _ready._read_occurrences(agent_dir)
         with store.read() as conn:
             streak = _ctl.miss_streak(conn, agent_id)
+            recorded = _ctl.miss_windows(conn, agent_id)
         review_store = CoordStore(inst.coord_dir)
     except Exception as exc:  # noqa: BLE001
         rep.problems.append(f"setup: the facts the notices read could not be read ({type(exc).__name__}: {exc})")
@@ -914,7 +917,9 @@ def tick_notices(store: Any, *, now: datetime, missed_windows: Mapping[str, Sequ
 
     zone = inst.zone
     today = _ready.dream_day_at(now, zone)
-    missed = list((missed_windows or {}).get(agent_id, ()))
+    # this tick's walk, and the controller's streak record: a walk's missed slots are no rows, and the tick that saw
+    # them may have run before the window closed, so a later tick reads them from the record
+    missed = list(dict.fromkeys([*(missed_windows or {}).get(agent_id, ()), *recorded]))
     for back in range(days, 0, -1):
         day = today - timedelta(days=back)
         step = f"close_window {_ready.window_key_for(day)}"
