@@ -6,8 +6,11 @@ Every store is real, as in ``tests/test_dream_start.py`` (whose rig this reuses)
 called."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
+from levain.dream import agent as da
+from levain.dream import ready as rd
 from levain.dream import start as st
 from tests.test_dream_start import ZONE, _claim, _go, _live_rig, _rows
 
@@ -29,6 +32,36 @@ def test_a_stale_day_admitted_manual_row_is_ended_and_a_fresh_one_launches_under
     fresh = by_id[got.occurrence_id]
     assert (fresh["state"], fresh["kind"], fresh["window_key"]) == ("launched", "manual", today), fresh
     assert spawned == [(rig.store.directory, got.occurrence_id)]
+
+
+def _next_local(after: datetime, hour: int, minute: int, second: int) -> datetime:
+    local = after.astimezone(ZoneInfo(ZONE))
+    t = local.replace(hour=hour, minute=minute, second=second, microsecond=0)
+    return t if t > local else t + timedelta(days=1)
+
+
+def test_b_the_input_check_judges_the_instant_the_start_claims_and_launches_at(tmp_path, monkeypatch):
+    # 13:59:59 local is the last second whose manual run consolidates the previous dream-day; a check that read the
+    # wall clock (or any later instant: 14:00:01) would judge a different dream-day than the launch is attributed to
+    rig = _live_rig(tmp_path)
+    t0 = _next_local(rig.now() + timedelta(minutes=1), 13, 59, 59)
+    later = t0 + timedelta(seconds=2)
+    assert rd.manual_day_at(t0, ZONE) != rd.manual_day_at(later, ZONE)
+    calls = []
+
+    def clock():
+        calls.append(None)
+        return t0 if len(calls) == 1 else later
+
+    seen = []
+    real = da.day_ready
+    monkeypatch.setattr(da, "day_ready", lambda *a, **k: seen.append(k["now"]) or real(*a, **k))
+    spawned = []
+    got = st.start(rig.store, clock=clock, authority=rig.authority, spawn=lambda d, oid: spawned.append(oid))
+    assert seen, got
+    assert seen == [t0], (seen, t0, got)
+    row = next(r for r in _rows(rig) if r["occurrence_id"] == got.occurrence_id)
+    assert row["window_key"] == st.manual_window_key(t0, ZONE)
 
 
 def test_a_todays_admitted_manual_row_is_still_the_one_resumed(tmp_path):
