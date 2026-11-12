@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -30,19 +31,31 @@ def run(tmp_path, monkeypatch):
 
     def fake_run(cmd, *a, **k):
         reruns.append(cmd)
+        # stand in for pytest's --junitxml: one testcase per requested node, shaped by fake_run.outcome
+        xml = next((c.split("=", 1)[1] for c in cmd if c.startswith("--junitxml=")), None)
+        nodes = [c for c in cmd if "::" in c]
+        if xml and fake_run.outcome != "nofile":
+            if fake_run.outcome == "deselected":
+                nodes = nodes[:-1]
+            child = {"skipped": "<skipped type='pytest.skip'/>", "xfailed": "<skipped type='pytest.xfail'/>",
+                     "errored": "<error message='teardown'/>", "failed": "<failure message='x'/>"}.get(fake_run.outcome, "")
+            cases = "".join(f"<testcase classname='c' name='{i}'>{child}</testcase>" for i, _ in enumerate(nodes))
+            Path(xml).write_text(f"<testsuites><testsuite>{cases}</testsuite></testsuites>")
         return subprocess.CompletedProcess(cmd, fake_run.rc)
 
     fake_run.rc = 0
+    fake_run.outcome = "passed"
     monkeypatch.setattr(mod, "_run", fake_run)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
     ledger = tmp_path / "ledger.txt"
     real_ledger_ids = mod.ledger_ids
     monkeypatch.setattr(mod, "ledger_ids", lambda: real_ledger_ids(ledger))
 
-    def go(code, log, ledger_text=None, rerun_rc=0):
+    def go(code, log, ledger_text=None, rerun_rc=0, outcome="passed"):
         if ledger_text is not None:
             ledger.write_text(ledger_text)
         fake_run.rc = rerun_rc
+        fake_run.outcome = outcome
         logf = tmp_path / "pytest.log"
         logf.write_text(log)
         rec = tmp_path / "rec"
@@ -139,3 +152,50 @@ def test_a_dash_inside_brackets_is_part_of_the_id():
     nid = "tests/test_a.py::test_p[a - b]"
     log = f"==== short test summary info ====\nFAILED {nid} - AssertionError: x - y\n"
     assert mod.parse_log(log) == ([nid], False)
+
+
+@pytest.mark.parametrize("reason", [
+    "worker 'gw3' crashed while running 'tests/test_a.py::test_one'",
+    "node down: Not properly terminated",
+])
+def test_an_xdist_worker_crash_is_errored_and_never_rerun(run, reason):
+    log = f"==== short test summary info ====\nFAILED {A} - {reason}\n1 failed in 1s\n"
+    assert mod.parse_log(log)[1] is True
+    rc, reruns, rec = run(1, log, f"{A}\n")
+    assert rc == 1 and reruns == [] and not rec.exists()
+
+
+def test_a_crash_among_ordinary_failures_blocks_the_whole_rerun(run):
+    log = (f"==== short test summary info ====\nFAILED {A} - AssertionError\n"
+           f"FAILED {B} - worker 'gw0' crashed while running '{B}'\n")
+    rc, reruns, _ = run(1, log, f"{A}\n{B}\n")
+    assert rc == 1 and reruns == []
+
+
+@pytest.mark.parametrize("outcome", ["skipped", "xfailed", "errored", "failed", "deselected", "nofile"])
+def test_a_rerun_that_exits_zero_without_every_node_passing_is_not_a_pass(run, outcome):
+    # pytest exits 0 for a skipped or xfailed node, so the exit code alone must not decide
+    rc, reruns, rec = run(1, LOG_FAILED, f"{A}\n{B}\n", rerun_rc=0, outcome=outcome)
+    assert rc == 1 and len(reruns) == 1
+    assert json.loads((rec / "rows.jsonl").read_text())["rerun_passed"] is False
+
+
+def test_the_rerun_asks_pytest_for_a_junit_file_in_the_record_dir(run):
+    rc, reruns, rec = run(1, LOG_FAILED, f"{A}\n{B}\n")
+    assert rc == 0 and f"--junitxml={rec / 'rerun.xml'}" in reruns[0]
+
+
+@pytest.mark.parametrize("body, nodes, want", [
+    ("def test_ok():\n    pass\n", ["t.py::test_ok"], True),
+    ("import pytest\ndef test_s():\n    pytest.skip('gone')\n", ["t.py::test_s"], False),
+    ("import pytest\n@pytest.mark.xfail\ndef test_x():\n    assert False\n", ["t.py::test_x"], False),
+    ("def test_ok():\n    pass\ndef test_b():\n    pass\n", ["t.py::test_ok", "t.py::test_b"], True),
+])
+def test_the_junit_check_reads_what_real_pytest_writes(tmp_path, body, nodes, want):
+    # real pytest exits 0 for the skip and the xfail; only the junit file tells them from a pass
+    (tmp_path / "t.py").write_text(body)
+    xml = tmp_path / "r.xml"
+    proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                           f"--rootdir={tmp_path}", f"--junitxml={xml}", *nodes], cwd=tmp_path, capture_output=True)
+    assert proc.returncode == 0
+    assert mod._rerun_all_passed(xml, len(nodes)) is want
