@@ -317,6 +317,72 @@ def test_a_scratch_run_adds_no_workspace_to_the_account_homes_desk_record(tmp_pa
     assert not (account / ".levain").exists()
 
 
+DESK_RECORD_READ = """
+import argparse, json, sys
+from pathlib import Path
+from levain.desk import door
+door._own_home = lambda: Path(sys.argv[1])       # stands in for the password database's home: the operator's own
+parser = argparse.ArgumentParser(prog="levain")
+parser.add_subparsers(dest="cmd").add_parser("op")              # an operator-only command: never door_ok
+try:
+    print("WORKSPACE", door.workspace())
+    print("REFUSAL", door.refusal(parser, parser.parse_args(["op"])))
+except door.RecordUnreadable as exc:
+    print("UNREADABLE", exc)
+    sys.exit(0)
+ws2 = Path(sys.argv[2]); ws2.mkdir()
+door.record(ws2)
+print("RECORDED")
+"""
+
+
+def _guarded_desk_run(tmp_path: Path, marker: dict[str, str], account_record: str):
+    """A guarded run (``marker``) with a scratch LEVAIN_HOME, started inside a workspace that only the account home's
+    record names (no role hint): the env game the account-home copy exists to defeat."""
+    account = tmp_path / "account-home"
+    consent = account / ".levain" / "consent"
+    consent.mkdir(parents=True)
+    ws_op = tmp_path / "ws-op"
+    ws_op.mkdir()
+    record_file = consent / "coordinator_workspaces.json"
+    record_file.write_text(account_record.replace("WS_OP", os.path.realpath(ws_op)), encoding="utf-8")
+    before = record_file.read_bytes()
+    scratch = tmp_path / "scratch-levain"
+    script = tmp_path / "desk_record_read.py"
+    script.write_text(DESK_RECORD_READ, encoding="utf-8")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path / "fake-home"),
+           "PYTHONPATH": str(REPO), "LEVAIN_HOME": str(scratch), **marker}
+    done = subprocess.run([sys.executable, str(script), str(account), str(tmp_path / "ws2")], env=env,
+                          capture_output=True, text=True, timeout=60, cwd=str(ws_op))
+    return done, record_file, before, scratch
+
+
+_MARKERS = [pytest.param({home_guard.SCRATCH_ENV: "1"}, id="scratch-run"),
+            pytest.param({"PYTEST_CURRENT_TEST": "tests/test_x.py::test_y (call)"}, id="test-run")]
+
+
+@pytest.mark.parametrize("marker", _MARKERS)
+def test_a_guarded_run_still_reads_the_account_homes_desk_record(tmp_path, marker):
+    """The guard narrows WRITES to the account-home record, never its read: an environment variable anyone can set must
+    not take the account record off the door's read path and let an operator-only command through in a workspace
+    only that record names. The run's own record is still written; the account record is left as it was."""
+    done, record_file, before, scratch = _guarded_desk_run(
+        tmp_path, marker, '{"coordinator_workspaces": ["WS_OP"]}\n')
+    assert "WORKSPACE None" not in done.stdout, done.stdout + done.stderr
+    assert "WORKSPACE " + os.path.realpath(tmp_path / "ws-op") in done.stdout, done.stdout + done.stderr
+    assert "REFUSAL levain op: `levain op` is the operator's" in done.stdout, done.stdout + done.stderr
+    assert "RECORDED" in done.stdout, done.stderr
+    assert record_file.read_bytes() == before
+    assert (scratch / "consent" / "coordinator_workspaces.json").is_file()
+
+
+@pytest.mark.parametrize("marker", _MARKERS)
+def test_a_guarded_run_fails_closed_on_an_unreadable_account_record(tmp_path, marker):
+    """An account record that cannot be read refuses in a guarded run as in any other, rather than being skipped."""
+    done, _, _, _ = _guarded_desk_run(tmp_path, marker, "not json at all\n")
+    assert "UNREADABLE" in done.stdout and "account-home" in done.stdout, done.stdout + done.stderr
+
+
 def test_the_suites_own_account_home_still_gets_the_second_copy(tmp_path):
     """Inside the suite the conftest points the account home at a scratch directory in the vouched root, so the
     door's two-record behaviour stays tested."""
