@@ -599,13 +599,20 @@ def run_dream_drill(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(res.as_dict(), sort_keys=True))
     else:
-        print(f"levain dream drill: {res.outcome}" + (f" (snapshot {res.snapshot})" if res.snapshot else
-                                                       " (no snapshot yet: not a failure)")
-              + (": no restore ran, so this is not a pass" if res.outcome == "skipped" else ""))
-        for st in res.steps:
-            print(f"  {st['name']:10s} {st['status']:8s} {st['detail']}")
-    # 1 failed; 3 skipped (the restore did not run: nothing was proved, so it must not read as 0)
-    return {"failed": 1, "skipped": 3}.get(res.outcome, 0)
+        if res.outcome == "deferred":
+            held = next((str(st["detail"]) for st in res.steps if st["name"] == "restore"), "a writer holds the store")
+            print(f"levain dream drill: deferred ({held.removeprefix('deferred: ')}): nothing was proved and nothing "
+                  f"was recorded, so the drill stays due; run it again when the writer is done")
+        else:
+            print(f"levain dream drill: {res.outcome}" + (f" (snapshot {res.snapshot})" if res.snapshot else
+                                                           " (no snapshot yet: not a failure)")
+                  + (": no restore ran, so this is not a pass" if res.outcome == "skipped" else ""))
+            for st in res.steps:
+                print(f"  {st['name']:10s} {st['status']:8s} {st['detail']}")
+    # 0 a pass, or a fresh install (no snapshot yet); 1 a failed step; 2 an unusable --store-dir/--root (above);
+    # 3 skipped (the restore did not run: nothing was proved); 4 deferred (a writer holds the wrap lock: nothing was
+    # looked at).
+    return {"failed": 1, "skipped": 3, "deferred": 4}.get(res.outcome, 0)
 
 
 def _host_zone() -> str | None:
