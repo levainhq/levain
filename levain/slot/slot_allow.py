@@ -465,7 +465,7 @@ def _verify_evidence(rule: str, ev: Any, authority: Any, store_id: Optional[str]
     from levain.consent import terminal_sign as ts
     from levain.consent.queue import class_covers
     from levain.contracts.namespaces import ANSWER_COUNTERSIGN_NAMESPACE
-    from levain.coordinator.review import SIGN_TIER
+    from levain.desk.review import SIGN_TIER
 
     if not shape_ok(rule):
         return "not a dialog rule shape"
