@@ -807,6 +807,154 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
     return DrillTick(res.outcome)
 
 
+# ------------------------------------------------------------------------------------------- the tick's caller (D1-N)
+
+#: how many closed windows each tick looks back over. :func:`close_window` is idempotent (a window already carded
+#: answers ``duplicate``, a class already standing answers ``standing``), so a tick that runs every minute repeats
+#: reads, not cards; looking back a few windows lets a tick after a long sleep still file the night it woke into.
+NOTICE_DAYS = 3
+
+
+@dataclass
+class NoticeReport:
+    """What :func:`tick_notices` did. ``steps`` maps each step to its outcome word; ``problems`` are the failures (a step
+    that raised, a card the feed refused): the tick says each on stderr and exits non-zero. ``notes`` are named causes
+    that change no exit code (an install that cannot be read is also named by the tick's own probes)."""
+    steps: dict[str, str] = field(default_factory=dict)
+    problems: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+def review_attention(review_store: Any, *, stream: Any = None, feed: str = CARD_FEED
+                     ) -> tuple[Callable[[str, str], None], Callable[[str], None]]:
+    """``(attention, resolve)`` for the night's notices: the tick's own stderr line (kept, so the log still has it) AND an
+    item in the ``agent`` feed of the desk's review store, the place ``levain desk review list`` and the cockpit read,
+    where the did-not-consolidate and renewal cards already go. The item's key is the attention key plus a digest of
+    the text: the same notice, tick after tick, is one item; a changed notice (a new failed run) is a new one; and an
+    item he cleared stays cleared while its text stands. ``resolve`` prints only: clearing is his."""
+    import sys
+
+    from levain.desk import review
+
+    def attention(key: str, text: str) -> None:
+        print(f"attention [{key}]: {text}", file=stream or sys.stderr, flush=True)
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+        review.file_item(review_store, feed, {"kind": "attention", "key": key, "reason": text},
+                         dedupe_key=f"attention:{key}:{digest}")
+
+    def resolve(key: str) -> None:
+        print(f"attention resolved [{key}]", file=stream or sys.stderr, flush=True)
+
+    return attention, resolve
+
+
+def tick_notices(store: Any, *, now: datetime, missed_windows: Mapping[str, Sequence[str]] | None = None,
+                 link_of: Callable[[str, str], Mapping[str, Any] | None] | None = None, stream: Any = None,
+                 attention: Callable[[str, str], None] | None = None,
+                 resolve: Callable[[str], None] | None = None,
+                 drill: Callable[..., Any] | None = None, days: int = NOTICE_DAYS) -> NoticeReport:
+    """The production caller of the night's notices (Q6 (a)): once per agents tick, after the claims, for a store whose
+    install names a dream. In order: :func:`close_window` for each of the last ``days`` closed windows (oldest first, so
+    the standing-item rule reads in time order), :func:`pause_notice`, :func:`renewal_check` on the dream's live link
+    (``link_of(agent_id, spec_hash)``, the tick's own replay of the authority log), :func:`drill_tick`.
+
+    Each step runs on its own: one that raises, or a card the feed refuses, is a ``problem`` in the report and is raised
+    as an attention item too (``dream-notice-failed:<step>``) when the feed is writable, and the steps after it still
+    run. Nothing here swallows a failure. The facts it needs (the rows, the agent, the miss streak, the install) are read
+    once per call; a store with no dream install, or no registered dream, is a quiet "not applicable"."""
+    rep = NoticeReport()
+    agent_dir = Path(store.directory)
+    if not (agent_dir / INSTALL_FILE).exists():
+        rep.steps["notices"] = "no dream install"
+        return rep
+    try:
+        inst = read_install(agent_dir)
+    except Exception as exc:  # noqa: BLE001 - named, never read as "no install"
+        rep.notes.append(f"the dream install cannot be read, so the night's notices were not run "
+                         f"({type(exc).__name__}: {exc})")
+        return rep
+    try:
+        from levain.agents import controller as _ctl, spec as _spec
+        from levain.desk.store import CoordStore
+
+        agents = [a for a in _spec.list_agents(store) if a["name"] == NAME]
+        if not agents:
+            rep.steps["notices"] = "no registered dream"
+            return rep
+        agent = agents[0]
+        agent_id = agent["agent_id"]
+        rows = _ready._read_occurrences(agent_dir)
+        with store.read() as conn:
+            streak = _ctl.miss_streak(conn, agent_id)
+        review_store = CoordStore(inst.coord_dir)
+    except Exception as exc:  # noqa: BLE001
+        rep.problems.append(f"setup: the facts the notices read could not be read ({type(exc).__name__}: {exc})")
+        return rep
+    sink, settle = review_attention(review_store, stream=stream)
+    attention, resolve = attention or sink, resolve or settle
+
+    def guard(step: str, fn: Callable[[], None], kind: str | None = None) -> None:
+        # ``kind`` names the notice for the raised item, so three windows failing the same way are ONE item, while the
+        # report keeps each window's own line
+        kind = kind or step
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - a failed notice is itself a notice
+            detail = f"{type(exc).__name__}: {exc}"
+            rep.problems.append(f"{step}: {detail}")
+            rep.steps[step] = "failed"
+            try:
+                attention(f"dream-notice-failed:{kind}", f"the dream's {kind} notice failed: {detail}")
+            except Exception:  # noqa: BLE001 - the feed is what failed; the problem is already in the report
+                _log.warning("dream notices: the failure of %s could not be raised either", step)
+
+    zone = inst.zone
+    today = _ready.dream_day_at(now, zone)
+    missed = list((missed_windows or {}).get(agent_id, ()))
+    for back in range(days, 0, -1):
+        day = today - timedelta(days=back)
+        step = f"close_window {_ready.window_key_for(day)}"
+
+        def close(day: date = day, step: str = step) -> None:
+            got = close_window(agent_id=agent_id, day=day, now=now, zone=zone, rows=rows, review_store=review_store,
+                               store_path=inst.store_path, miss_streak=streak, missed_windows=missed,
+                               attention=attention)
+            rep.steps[step] = got.action
+            if got.action == "refused":
+                raise RuntimeError(f"the card was refused: {got.why}")
+
+        guard(step, close, "close_window")
+
+    def pause() -> None:
+        failed = [r for r in rows if r.get("agent_id") == agent_id and r.get("state") in ("failed", "stopped")]
+        rep.steps["pause_notice"] = "raised" if pause_notice(agent, failed, attention=attention) else "not paused"
+
+    guard("pause_notice", pause)
+
+    def renew() -> None:
+        if link_of is None:
+            rep.steps["renewal_check"] = "no link source"
+            return
+        spec_hash = _spec.get_agent(store, agent_id)["spec_hash"]
+        link = link_of(agent_id, spec_hash)
+        if link is None:
+            rep.steps["renewal_check"] = "no link"
+            return
+        got = renewal_check(link, now=now, review_store=review_store, attention=attention, data_root=inst.cockpit_root)
+        rep.steps["renewal_check"] = got.action
+        if got.action == "refused":
+            raise RuntimeError(f"the link could not be checked: {got.why}")
+
+    guard("renewal_check", renew)
+
+    def drilled() -> None:
+        rep.steps["drill_tick"] = drill_tick(inst.store_path, inst.store_path.parent / "dream", now=now,
+                                             attention=attention, resolve=resolve, drill=drill).action
+
+    guard("drill_tick", drilled)
+    return rep
+
+
 # ------------------------------------------------------------------------------------------------------- the fire body
 
 @dataclass
