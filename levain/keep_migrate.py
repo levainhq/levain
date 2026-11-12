@@ -95,6 +95,7 @@ from levain.intention_legacy import (
     KEEP_PLAN_ID_KEY,
     KEEP_PLAN_STORE_KEY,
     OLD_DISPOSITION_TO_NEW,
+    STORE_DOC_KEY_OPEN,
 )
 
 try:
@@ -159,12 +160,12 @@ def _read_doc(intentions_json: Path) -> dict[str, Any]:
         with open(intentions_json, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
-        return {"spores": [], "resolved": []}
+        return {STORE_DOC_KEY_OPEN: [], "resolved": []}
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise KeepMigrateError(f"{intentions_json} is unreadable ({exc}); inspect it by hand") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("spores", []), list):
+    if not isinstance(data, dict) or not isinstance(data.get(STORE_DOC_KEY_OPEN, []), list):
         raise KeepMigrateError(f"{intentions_json} is not an intentions document; inspect it by hand")
-    data.setdefault("spores", [])
+    data.setdefault(STORE_DOC_KEY_OPEN, [])
     data.setdefault("resolved", [])
     return data
 
@@ -191,7 +192,7 @@ def pending_counts(intentions_json: Path | str) -> dict[str, int]:
     ``{"notes": N, "handoffs": M, "agendas": K}`` (K = undated agendas, which migrate to somedays).
     Read-only; a missing store counts zero."""
     out = {"notes": 0, "handoffs": 0, "agendas": 0}
-    for row in _read_doc(Path(intentions_json))["spores"]:
+    for row in _read_doc(Path(intentions_json))[STORE_DOC_KEY_OPEN]:
         if not isinstance(row, dict) or not _is_candidate(row):
             continue
         d = _disp(row)
@@ -360,7 +361,7 @@ def plan(intentions_json: Path | str, *, migrations_dir: Path | str, episodic_db
     doc = _read_doc(intentions_json)
     stamp = _utc_stamp(now)
     items: list[dict[str, Any]] = []
-    for row in doc["spores"]:
+    for row in doc[STORE_DOC_KEY_OPEN]:
         if not isinstance(row, dict) or not _is_candidate(row):
             continue
         dest, why = _propose(row, handoff_to=handoff_to, agenda_date=agenda_date)
