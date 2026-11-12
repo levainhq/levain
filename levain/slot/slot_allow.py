@@ -12,8 +12,8 @@ rule forward without ever widening what the operator's own sessions do:
 * :func:`apply_answered` is the one consumer of those records, run first by every entry point: it walks them once,
   each from one read of its question by id, and appends a rule to ``slot-allow.json`` only for a row whose ``yes``
   carries the operator's own signature over exactly this rule's question and answer (:func:`rule_evidence`), storing
-  that signature with it; a yes it cannot judge because the authority log cannot be read keeps its record for the
-  next apply; any other answer drops the record, so "No: keep asking" and a refused yes are asked again at the next
+  that signature with it; a yes it cannot judge now (the authority log, the verifier or a phone countersign cannot
+  be read) keeps its record for the next apply; any other answer drops the record, so "No: keep asking" and a refused yes are asked again at the next
   save;
 * :func:`carried` re-verifies every stored rule's evidence against the authority log at each launch, so the file alone
   (an operator-uid file any session of his could write) carries nothing;
@@ -29,7 +29,9 @@ Known edges:
   A revoked list in the same file would be no stronger (the same process edits it); closing this needs a signed
   revoke in the authority log.
 * The lock is held across the signature checks of an apply (the local ``ssh-keygen`` verify): a hung verifier
-  delays other launches' writers until it returns.
+  delays other launches' writers until it returns or :data:`LOCK_WAIT_S` passes, when they skip the step and say so.
+* A writer killed between creating its temp file and renaming it leaves ``.<name>.<pid>.tmp`` in the consent
+  directory; only a later writer with the same pid removes it.
 * "No: keep asking" asks again the next time a slot saves the rule. A no to a row filed for a STORED rule (a renewal,
   or a stored rule that no longer carries) ends the rule instead: it leaves ``rules`` for ``revoked`` without its signed
   answer, as :func:`revoke` leaves it, and no launch asks about it again; it is asked again only the way any rule first
@@ -222,13 +224,37 @@ def load(path: Path) -> Dict[str, Any]:
 
 _held = threading.local()
 
+#: how long a writer waits for another one's lock before it gives up (fail-soft: the step is skipped and said). An
+#: apply holds the lock across its signature checks (a terminal answer's ``ssh-keygen`` verify is bounded at 10 s),
+#: so this covers one slow verifier; a hung one costs another launch this long, never forever.
+LOCK_WAIT_S = 15.0
+_LOCK_POLL_S = 0.05
+
+
+class LockBusy(AllowRefused):
+    """Another writer held the lock past :data:`LOCK_WAIT_S`: nothing was read or written."""
+
+
+def _private_dir(qdir: str) -> None:
+    """``qdir`` made (0700) when absent and checked the way the question store checks it (a real directory of this
+    user that nobody else can reach), before the lock file is opened in it."""
+    from levain.consent.questions import QuestionStore, QuestionStoreError
+
+    try:
+        QuestionStore(Path(qdir))._check_directory()
+    except QuestionStoreError as e:
+        raise AllowRefused(str(e)) from None
+
 
 @contextmanager
 def _locked(qdir: Path) -> Iterator[None]:
     """One writer at a time over ``slot-allow.json`` and the pending file in ``qdir``: an exclusive ``flock`` on a
     sibling lock file, held across a whole load-modify-save. Several slots launch and end at once, so two writers is
     a real path. The same thread re-entering holds the lock it has (a nested ``flock`` on a second descriptor would
-    wait on itself), whatever spelling of the directory it names: the hold is keyed by the resolved path."""
+    wait on itself), whatever spelling of the directory it names: the hold is keyed by the resolved path. The wait is
+    bounded (:data:`LOCK_WAIT_S`, then :class:`LockBusy`), and the directory is made private on first use."""
+    import time
+
     key = os.path.realpath(qdir)
     depth: Dict[str, int] = getattr(_held, "depth", None) or {}
     _held.depth = depth
@@ -239,10 +265,19 @@ def _locked(qdir: Path) -> Iterator[None]:
         finally:
             depth[key] -= 1
         return
+    _private_dir(key)
     fd = os.open(os.path.join(key, LOCK_NAME), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                  0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        give_up = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= give_up:
+                    raise LockBusy(f"{LOCK_NAME} busy: another writer held it over {LOCK_WAIT_S:g} s") from None
+                time.sleep(_LOCK_POLL_S)
         depth[key] = 1
         try:
             yield
@@ -253,7 +288,13 @@ def _locked(qdir: Path) -> Iterator[None]:
 
 
 def _save(path: Path, doc: Mapping[str, Any]) -> None:
+    """``doc`` written whole to a temp file, synced, renamed over ``path``, then the directory synced. A document over
+    :data:`FILE_CAP` (which :func:`load` would refuse) is refused before anything is written (:class:`AllowRefused`),
+    and a failure up to the rename leaves the previous file as it was and no temp file behind (only the directory
+    sync can fail after it, with the new file in place)."""
     data = (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode()
+    if len(data) > FILE_CAP:
+        raise AllowRefused(f"{path.name}: the update would be over {FILE_CAP} bytes; nothing was written")
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     try:
@@ -263,11 +304,25 @@ def _save(path: Path, doc: Mapping[str, Any]) -> None:
         os.unlink(tmp)
         fd = os.open(tmp, flags, 0o600)
     try:
-        os.write(fd, data)
-        os.fsync(fd)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dfd)
     finally:
-        os.close(fd)
-    os.replace(tmp, path)
+        os.close(dfd)
 
 
 def rules_of(path: Path) -> List[str]:
@@ -446,7 +501,10 @@ def verify_evidence(rule: str, ev: Mapping[str, Any], *, authority: Any, store_i
     class covers signing for a phone countersign. Nothing here reads the question store: the signed bytes are the whole
     evidence. Never raises."""
     try:
-        why = _verify_evidence(rule, ev, authority, store_id, ctk)
+        try:
+            why = _verify_evidence(rule, ev, authority, store_id, ctk)
+        except _VerifierDown as exc:
+            return f"the signature could not be verified ({exc})"
         if why is None and lease:
             kind, why_lease = _lease_check(ev, now or datetime.now(timezone.utc))
             if kind == "lapsed":
@@ -458,8 +516,13 @@ def verify_evidence(rule: str, ev: Mapping[str, Any], *, authority: Any, store_i
         return f"its signature could not be checked ({type(exc).__name__})"
 
 
+class _VerifierDown(Exception):
+    """The verifier could not run (``ssh-keygen`` unavailable or timed out, a key file unreadable): no verdict."""
+
+
 def _verify_evidence(rule: str, ev: Any, authority: Any, store_id: Optional[str],
                      ctk: Optional[Callable[[str], Tuple[Optional[bool], str]]]) -> Optional[str]:
+    """:func:`verify_evidence` without the lease, raising :class:`_VerifierDown` when the verifier cannot run."""
     from levain.authority import LAPTOP, VerifierUnavailable, custody_mismatch
     from levain.authority_sig import _signers_line, verify_link_sig
     from levain.consent import terminal_sign as ts
@@ -523,7 +586,7 @@ def _verify_evidence(rule: str, ev: Any, authority: Any, store_id: Optional[str]
                             ctk=ctk, namespace=namespace)
             got_fp, problem = (res.fingerprint, None) if res.ok else (None, res.problem or "the signature does not verify")
     except (VerifierUnavailable, ts.KeyError_) as exc:
-        return f"the signature could not be verified ({exc})"
+        raise _VerifierDown(str(exc)) from None
     if problem is not None:
         return problem
     if got_fp != key.fingerprint or key.fingerprint != fp:
@@ -571,7 +634,8 @@ def store_id_of(store: Any) -> Optional[str]:
 
 
 class _LogUnreadable(Exception):
-    """The authority log could not be read: no verdict on the answer either way."""
+    """The answer could not be judged now: the authority log, the verifier or the countersign evidence could not be
+    read. No verdict on the answer either way, so its pending record is kept for the next apply."""
 
 
 def rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[Optional[Dict[str, str]], str]:
@@ -589,7 +653,8 @@ def rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[O
 
 def _rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[Optional[Dict[str, str]], str]:
     """:func:`rule_evidence`, raising :class:`_LogUnreadable` when the authority log cannot be read (or yields
-    nothing) instead of refusing: a log read failure is not a verdict on the answer."""
+    nothing), the verifier cannot run, or a phone countersign cannot be read now, instead of refusing: none of those
+    is a verdict on the answer. A signature that verifies as bad, or evidence that is not there, is a refusal."""
     from levain.band_view import answer_sign_of
     from levain.cockpit.consent import parse_stamp
     from levain.consent import answer_countersign as ac
@@ -612,7 +677,10 @@ def _rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[
         except Exception as exc:  # noqa: BLE001
             return None, f"the signed answer cannot be read ({type(exc).__name__})"
     elif sign and sign.get("sign_state") == "unsigned" and sign.get("sign_reason") == "remote":
-        got = ac.countersign_evidence(store, question.id, sign_queue=judge.sign_queue)
+        try:
+            got = ac.countersign_evidence(store, question.id, sign_queue=judge.sign_queue)
+        except ac.EvidenceUnavailable as exc:
+            raise _LogUnreadable(f"the phone's countersign cannot be judged now ({exc})") from None
         if got is None:
             return None, "answered at a remote terminal and not countersigned on your phone"
         ev = {"question_id": question.id, "channel": PHONE, "signer_fp": got[2], "message": got[0], "sig": got[1],
@@ -625,7 +693,13 @@ def _rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[
         raise _LogUnreadable(f"the authority log cannot be read ({type(exc).__name__})") from None
     if snapshot is None:
         raise _LogUnreadable("the authority log cannot be read (no replay)")
-    why = verify_evidence(rule, ev, authority=snapshot, store_id=store_id_of(store), ctk=judge.ctk)
+    sid = store_id_of(store)            # a store read failure raises here, as before: no verdict, the record stays
+    try:
+        why = _verify_evidence(rule, ev, snapshot, sid, judge.ctk)
+    except _VerifierDown as exc:
+        raise _LogUnreadable(f"the signature could not be verified now ({exc})") from None
+    except Exception as exc:  # noqa: BLE001 - evidence that cannot be checked does not carry (as verify_evidence)
+        why = f"its signature could not be checked ({type(exc).__name__})"
     if why:
         return None, why
     kind, why = _lease_check(ev, _clock(judge), recorded=False)     # a lease already over is never stored
@@ -903,7 +977,7 @@ def remind(qdir: Path, allow_file: Path, store: Any = None, now: Optional[dateti
 def _resolve(qs: Any, rec: Mapping[str, Any], judge: Optional[Judge]) -> Tuple[str, Optional[Dict[str, str]], str]:
     """Where one pending record stands, from ONE read of its question: ``("open", None, "")`` while unanswered;
     ``("yes", evidence, "")`` for the operator's signed yes to exactly this rule; ``("unreadable", None, why)`` for a
-    yes the authority log could not be read to judge (the record stays, as an open one does); ``("refused", None,
+    yes that could not be judged now (:class:`_LogUnreadable`: the record stays, as an open one does); ``("refused", None,
     why)`` for any other yes; ``("no", None, why)`` for a no; ``("drop", None, why)`` for anything else (words, a row
     that is gone or is not this rule's)."""
     from levain.consent.questions import ANSWER_CHANNELS
@@ -936,7 +1010,7 @@ def apply_answered(qdir: Path, allow_file: Path, store: Any = None, now: Callabl
     """The ONE consumer of the pending records: the only step that deletes or replaces one. Walks them once, each
     resolved from one read of its question (:func:`_resolve`): the operator's signed yes to exactly the rule
     (:func:`rule_evidence`) carries it into ``allow_file`` with that answer stored beside it; a record still open (or
-    still being filed, or a yes the authority log could not be read to judge) is left; anything else (a no, an unsigned or otherwise refused yes, a row that is gone) drops
+    still being filed, or a yes that could not be judged now: :class:`_LogUnreadable`) is left; anything else (a no, an unsigned or otherwise refused yes, a row that is gone) drops
     the record, so the next time a slot saves the rule it is asked again. A no to a row filed for a stored rule
     (``renew``) also ends that rule (:func:`_decline`). A refused yes is kept as refused (with why) until a slot END
     files the rule's next row: ``list`` names it and :func:`remind` does not re-ask it. It is appended to ``refused``
@@ -1025,9 +1099,10 @@ def merge_into_frozen(settings: Mapping[str, Any], rules: Sequence[str]) -> Dict
     out = dict(settings)
     if not rules:
         return out
-    perms = {k: list(v) for k, v in dict(out.get("permissions", {})).items()}
-    have = perms.setdefault("allow", [])
+    perms = dict(out.get("permissions", {}))
+    have = list(perms.get("allow", []))           # a copy: the frozen layer's own list is not changed
     have.extend(r for r in rules if r not in have)
+    perms["allow"] = have
     out["permissions"] = perms
     return out
 
@@ -1069,7 +1144,11 @@ def run(args: Any, out: Any = None) -> int:
     from levain.consent.queue import default_queue_dir
 
     out = out or sys.stdout
-    qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
+    try:
+        qdir = args.queue_dir.expanduser().resolve() if args.queue_dir is not None else default_queue_dir()
+    except Exception as e:   # noqa: BLE001 - said, never a traceback
+        out.write(f"levain slot-allow: the consent directory cannot be named ({type(e).__name__}: {e})\n")
+        return 1
     path = qdir / FILE_NAME
     try:
         verb = args.slot_allow_verb
