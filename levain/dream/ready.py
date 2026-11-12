@@ -69,6 +69,8 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+from levain.agents.accounting import CountSpan, count_span
+
 READY = "ready"
 QUIET = "quiet"
 UNREADABLE = "unreadable"
@@ -183,12 +185,9 @@ def window_key_for(day: date) -> str:
 
 
 def window_holding(now: datetime, zone: str) -> str | None:
-    """The scheduled window key holding ``now``, or None when ``now`` is outside 22:00-05:00 local."""
-    local = now.astimezone(ZoneInfo(zone))
-    if 5 <= local.hour < 22:
-        return None
-    opened = local.date() if local.hour >= 22 else local.date() - timedelta(days=1)
-    return window_key_for(opened)
+    """The scheduled window key holding ``now``, or None when ``now`` is outside 22:00-05:00 local (the key
+    ``accounting.count_span`` names)."""
+    return count_span(WINDOW, zone, now).window_key
 
 
 def manual_day_at(moment: datetime, zone: str) -> date:
@@ -231,6 +230,18 @@ def _c_unreadable(n: int, name: str, exc: Exception) -> Check:
     return Check(n, name, UNREADABLE, str(exc))
 
 
+def _counted(row: Mapping[str, Any], span: CountSpan) -> bool:
+    """Whether a launched row counts against ``span``: a scheduled one by its window key, any other by when it
+    launched. A launch stamp that cannot be read counts (fail-closed, as the accounting's count does)."""
+    if row.get("kind") == "scheduled":
+        return span.window_key is not None and row.get("window_key") == span.window_key
+    try:
+        at = _when(row["launched_at"])
+    except (ValueError, TypeError):
+        return True
+    return span.start <= at < span.end
+
+
 def _check1(src: Sources, agent: str, key: str, day: date, zone: str, now: datetime, manual: bool) -> Check:
     name = "not already dreamed"
     rows = [r for r in _guard(src.occurrences, "the occurrence table") if r.get("agent_id") == agent]
@@ -244,16 +255,15 @@ def _check1(src: Sources, agent: str, key: str, day: date, zone: str, now: datet
     inflight = [r for r in rows if r.get("state") in ("admitted", "launched")]
     if inflight:
         return Check(1, name, QUIET, f"{inflight[0].get('occurrence_id')} is still in flight", "in-flight")
-    launched = [r for r in rows if r.get("window_key") == key and r.get("state") in _LAUNCHED_STATES
-                and r.get("launched_at")]
+    # the launch's own counting rule (accounting.count_span, Phill's ruling np-8ec243e5 (a)), never a second one: a
+    # manual run counts what its instant falls inside, the night with its scheduled runs or the daytime; a scheduled
+    # one counts its own night, the hand starts launched inside it included
     if manual:
-        # A0 §2.6: a manual launch counts the day's launched manual runs plus the scheduled runs of the window
-        # that holds now; a run-now at 08:00 has no window holding it
-        held = window_holding(now, zone)
-        today = f"m:{now.astimezone(ZoneInfo(zone)).date().isoformat()}"
-        launched = [r for r in rows if r.get("state") in _LAUNCHED_STATES and r.get("launched_at")
-                    and ((r.get("kind") == "manual" and r.get("window_key") == today)
-                         or (r.get("kind") == "scheduled" and held is not None and r.get("window_key") == held))]
+        span = count_span(WINDOW, zone, now)
+    else:
+        h, m = (int(x) for x in WINDOW["start"].split(":"))
+        span = count_span(WINDOW, zone, datetime(day.year, day.month, day.day, h, m, tzinfo=ZoneInfo(zone)))
+    launched = [r for r in rows if r.get("state") in _LAUNCHED_STATES and r.get("launched_at") and _counted(r, span)]
     if len(launched) >= RUN_CEILING:
         return Check(1, name, QUIET, f"{len(launched)} runs already launched (the ceiling is {RUN_CEILING})", "ceiling")
     return Check(1, name, "pass", f"no done occurrence for dream-day {day}; {len(launched)} launched")
