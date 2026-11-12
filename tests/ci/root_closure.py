@@ -540,6 +540,20 @@ LAZY_SITES = {
     'levain/consent/queue.py::queue_dir_for::from levain.home_guard import refuse_real_home_fallback': 'root',
     # root: ``count_span`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
     'levain/agents/accounting.py::count_span::from levain.agents import schedule': 'root',
+    # root: ``read_allow`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
+    'levain/slot/runtime_helper.py::read_allow::from levain.slot import store_verbs as SV': 'root',
+    # root: ``Supervisor._allow_file`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
+    'levain/slot/supervisor.py::Supervisor._allow_file::from levain.slot import slot_allow': 'root',
+    # root: ``Supervisor._file_allow_rows`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
+    'levain/slot/supervisor.py::Supervisor._file_allow_rows::from levain.slot import slot_allow': 'root',
+    # root: ``Supervisor._read_allow`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
+    'levain/slot/supervisor.py::Supervisor._read_allow::from levain.slot.slot_allow import AllowRefused': 'root',
+    # root: ``Supervisor._with_slot_allow`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
+    'levain/slot/supervisor.py::Supervisor._with_slot_allow::from levain.consent.questions import QuestionStore': 'root',
+    # root: ``Supervisor._with_slot_allow`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
+    'levain/slot/supervisor.py::Supervisor._with_slot_allow::from levain.slot import slot_allow': 'root',
+    # root: ``run_session`` has a caller a root process can run, and no call path shows it operator-only, so the table's default applies (levain 16, 11-12)
+    'levain/slot/supervisor.py::run_session::from levain.consent.queue import default_queue_dir': 'root',
 }
 _NEEDLES = ("run_module(", "module_argv(", "import_module(", "__import__(")
 
