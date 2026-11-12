@@ -65,7 +65,7 @@ STAGE0_RESULTS = ("success", "failure", "cancelled", "skipped")
 def test_there_are_heavy_jobs():
     assert len(_heavy()) >= 6
     # the jobs the move names; a heavy job that dropped its stage0 dependency falls out of _heavy(), so name them
-    for n in ("plan", "root-py39", "linux-live", "browser", "isolation", "chat-egress-srt"):
+    for n in ("plan", "test", "root-py39", "linux-live", "browser", "isolation", "chat-egress-srt"):
         assert n in _heavy(), n
 
 
@@ -80,7 +80,7 @@ def test_stage0_runs_the_invariant_tests_alone_behind_the_gate():
 
 def _shard_pytest_line():
     runs = "\n".join(s.get("run", "") for s in JOBS["test"]["steps"])
-    lines = [ln for ln in runs.splitlines() if re.match(r"\s*pytest -q .*-r\w*\s.*tee", ln)]
+    lines = [ln for ln in runs.splitlines() if re.match(r"\s*pytest\s.*\s-r\w*\s.*tee", ln)]
     assert len(lines) == 1, lines
     return lines[0]
 
@@ -117,15 +117,13 @@ def test_every_heavy_job_skips_only_when_the_gate_succeeded_and_said_skip(name):
     assert evaluate(cond, "cancelled", "", cancelled=False) is True, name
 
 
-@pytest.mark.parametrize("name", _heavy() + ["test"])
+@pytest.mark.parametrize("name", _heavy())
 def test_a_heavy_job_runs_only_after_a_successful_stage0(name):
     assert "stage0" in _needs(name), name
     cond = JOBS[name]["if"]
     assert "needs.stage0.result == 'success'" in cond, name
     for stage0 in STAGE0_RESULTS:
         for result, skip, _ in HEAVY_TABLE:
-            if name == "test":
-                continue  # `test` also needs plan; covered by the simulation below
             assert evaluate(cond, result, skip, stage0=stage0) is (stage0 == "success" and evaluate(cond, result, skip)), \
                 (name, stage0, result, skip)
 
@@ -150,6 +148,28 @@ def test_the_stage0_checks_can_fail():
     finally:
         for n, (i, nd) in saved.items():
             JOBS[n]["if"], JOBS[n]["needs"] = i, nd
+
+
+def test_every_job_but_the_gate_the_verified_marker_and_stage0_itself_needs_stage0():
+    # Fail fast means no fan-out: a job added later that names only the gate would start beside stage 0 and not behind it.
+    # `gate` decides, `verified` only prints the verdict the gate found, `stage0` is the front.
+    front = {"gate", "verified", "stage0"}
+    assert [n for n in JOBS if n not in front and "stage0" not in _needs(n)] == []
+
+
+def test_the_shard_pytest_runs_under_xdist_and_reports_failures_for_the_rerun():
+    # The two changes meet on one line: -n auto is the cost work, -rfE feeds scripts/ci_flake_rerun.py. Losing either
+    # one in a later edit of that line would pass every other check.
+    line = _shard_pytest_line()
+    assert " -n auto " in line and _reports_errors(line), line
+
+
+def test_stage0_runs_serial_since_marker_selection_follows_a_full_collection():
+    # `-m invariant` deselects after the whole tree is collected, so each xdist worker would repeat that collection
+    # for a tier of tests that are not parallel-bound; the shard jobs are where -n auto earns its cost.
+    for step in JOBS["stage0"]["steps"]:
+        run = step.get("run", "")
+        assert "-n " not in run and "xdist" not in run, run
 
 
 def test_the_verified_job_needs_a_successful_gate_that_said_skip():
@@ -346,7 +366,8 @@ def test_no_run_line_expands_a_branch_name_or_an_api_string():
 # ---- CI speed (levain 78 ciB): static shard list, one Python off the landing refs, the check names ----------------
 
 def test_the_pytest_matrix_no_longer_waits_on_the_plan_job():
-    assert JOBS["test"]["needs"] == "gate"
+    # it waits on the gate and on stage0 and on nothing else: the shard list is static, so no planning job sits in front
+    assert sorted(_needs("test")) == ["gate", "stage0"]
     assert JOBS["plan"]["name"] == "plan test shards"
     assert not any("plan" in _needs(n) for n in JOBS)
 
