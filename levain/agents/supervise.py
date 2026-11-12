@@ -320,8 +320,10 @@ class Supervisor:
     def _renew(self, row: dict, session_grace_s: int | None) -> bool:
         try:
             with self._store.write() as conn:
+                # a sessionless (dream) row is renewed only once a fire claimed it: an unclaimed one keeps its launch
+                # lease and lapses to controller.take_over_unclaimed (D1-Q fix round)
                 return _ctl.heartbeat(conn, row["occurrence_id"], row["epoch"], self._clock(), LEASE_S,
-                                      session_grace_s=session_grace_s)
+                                      session_grace_s=session_grace_s, unclaimed_lapses=session_grace_s is None)
         except Exception as exc:  # noqa: BLE001 - one row's renewal failing never stops the others'
             _log.warning("agent supervisor: the lease renewal of %s raised %s: %s", row["occurrence_id"],
                          type(exc).__name__, exc)
