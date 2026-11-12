@@ -254,9 +254,11 @@ def binding_of_factory(store: AgentStore, authority: Any, clock: Callable[[], da
 
     def latest_link(agent_id: str, spec_hash: str) -> dict[str, str] | None:
         """``{"id", "expires_at"}`` of the agent's link of that spec that expires LAST, or None (no link). Read from the
-        same one replay :func:`binding_of` uses, so the notice phase adds no second read of the log. The last expiry
-        is the one that decides when the agent stops being armed. A log that could not be replayed RAISES: the renewal
-        check must say it could not look, never read it as "no link"."""
+        same one replay :func:`binding_of` uses, so the notice phase adds no second read of the log. It returns the
+        link that is PRESENT in the log with the latest ``expires_at``, not the live one: a link whose signer was
+        since revoked still counts here (``authority.agent_links`` is presence, not liveness), where ``binding_of``
+        arms only a link that passes the authority's liveness peek. A log that could not be replayed RAISES: the
+        renewal check must say it could not look, never read it as "no link"."""
         snap = state()
         if snap is None:
             raise RuntimeError("the authority log could not be replayed, so no link's expiry could be read")
