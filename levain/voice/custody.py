@@ -381,11 +381,15 @@ def revoke_key(data_root: Path | str, record_id: str, *, signer_fp: str, sign: S
 
 def list_keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
               marker_directory: Path | None = None) -> list[dict[str, Any]]:
-    """Every voice key record the replay holds, by id (names only: there is no value to show)."""
+    """Every voice key record the replay holds, by id (names only: there is no value to show), each with ``state``
+    ``live``, or ``stopped`` and ``stopped_why`` when a key that signed it was revoked (the record is still held, so it
+    is listed and can be revoked, but a read finds no key for it)."""
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, now, ssh_keygen))
-    return [{**_thaw(g), "link_seq": state.grant_seqs.get(gid)}
-            for gid, g in sorted(state.policy.grants.items()) if voice_key_record(g)]
+    return [{**_thaw(g), "link_seq": state.grant_seqs.get(gid), "state": "stopped" if why else "live",
+             "stopped_why": why or ""}
+            for gid, g in sorted(state.policy.grants.items()) if voice_key_record(g)
+            for why in [grant_stop_reason(state, gid)]]
 
 
 # the CLI's refusals

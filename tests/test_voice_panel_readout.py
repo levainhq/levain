@@ -219,3 +219,46 @@ def test_a_path_that_cannot_be_resolved_is_a_meter_error_and_the_panel_says_unre
     monkeypatch.setattr(cv, "_grants_for", lambda root: ({"g": 1}, "ok"))
     monkeypatch.setattr(cv, "voice_key_for", lambda grants, name: _rec(["tts"]) if name == "inworld" else None)
     assert cv.serve_voice(tmp_path, meter, last_read={})["meter"] == "unreadable"
+
+
+# --- a key a revoked signing key stopped (row 190): "stopped", not "no key" ---------------------------------------------
+
+STOPPED = "the key that signed it was revoked"
+
+
+def test_a_provider_whose_key_was_stopped_reads_stopped_with_its_reason(tmp_path, monkeypatch):
+    """The server says stopped (and why) for a provider the policy holds a stopped key for; every other keyless provider
+    stays ``not_set``. Red with the readout's ``key`` ignoring the stop."""
+    monkeypatch.setattr(cv, "_stopped_voice_keys", lambda root: {"inworld": STOPPED})
+    rows = {r["name"]: r for r in _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]})["providers"]}
+    assert (rows["inworld"]["key"], rows["inworld"]["stopped_why"]) == ("stopped", STOPPED)
+    assert (rows["deepgram"]["key"], rows["deepgram"]["stopped_why"]) == ("set", "")
+    assert (rows["openai"]["key"], rows["openai"]["stopped_why"]) == ("not_set", "")
+
+
+def test_the_stop_is_not_asked_for_when_the_log_could_not_be_read(tmp_path, monkeypatch):
+    """``authority`` != ok says the log is unreadable in its own words; the rows do not guess a stop from it."""
+    monkeypatch.setattr(cv, "_grants_for", lambda root: ({}, "unreadable"))
+    asked = []
+    monkeypatch.setattr(cv, "_stopped_voice_keys", lambda root: asked.append(1) or {"inworld": STOPPED})
+    b = cv.serve_voice(tmp_path, _seed(tmp_path / "voice.db"), last_read={})
+    assert asked == [] and {r["key"] for r in b["providers"]} == {"not_set"}
+
+
+@needs_browser
+def test_the_panel_says_a_stopped_key_is_stopped(tmp_path, monkeypatch):
+    """The Keys line and the provider's spend row say stopped and how to get a key again, where they said "no key" /
+    "no key now". Red with the panel's stopped branch reverted."""
+    monkeypatch.setattr(cv, "_stopped_voice_keys", lambda root: {"inworld": STOPPED})
+    b = _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]})
+    v = _run(tmp_path, monkeypatch, [
+        {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
+        {"until": READY_BLOCK, "ms": 20000},
+        {"eval": "JSON.stringify({keys: document.querySelector('.vc-keys').textContent,"
+                 " spend: [...document.querySelectorAll('.vc-spend')].map((r) => r.textContent)})"},
+    ], b)
+    got = json.loads(v[1])
+    assert "inworld: key stopped" in got["keys"] and "inworld: no key" not in got["keys"], got
+    assert "deepgram: key set" in got["keys"], got
+    (inworld,) = [s for s in got["spend"] if s.startswith("Inworld")]
+    assert f"key stopped: {STOPPED}. Set it again to use it" in inworld and "no key now" not in inworld, got
