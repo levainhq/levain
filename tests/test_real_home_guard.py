@@ -160,16 +160,170 @@ def test_a_test_that_unsets_levain_home_under_a_scratch_home_takes_the_scratch_f
     assert default_queue_dir() == (tmp_path.resolve() / ".levain" / "consent")
 
 
-def test_the_voucher_is_the_conftests_alone():
+def test_the_voucher_is_the_conftests_alone(monkeypatch):
     refuse = home_guard.refuse_real_home_fallback
     root = str(Path(os.environ[home_guard.TEST_SCRATCH_ROOT_ENV]))
     inside = {"PYTEST_CURRENT_TEST": "t", "HOME": root + "/some-scratch", home_guard.TEST_SCRATCH_ROOT_ENV: root}
     refuse("x", inside)                                                           # vouched: a scratch fallback
-    with pytest.raises(RealHomeReached):                                          # no voucher in the environment
-        refuse("x", {k: v for k, v in inside.items() if k != home_guard.TEST_SCRATCH_ROOT_ENV})
+    no_voucher = {k: v for k, v in inside.items() if k != home_guard.TEST_SCRATCH_ROOT_ENV}
+    refuse("x", no_voucher)                                                       # the process's voucher stands in
     with pytest.raises(RealHomeReached):                                          # a home outside the vouched root
         refuse("x", {**inside, "HOME": "/Users/somebody"})
     with pytest.raises(RealHomeReached):                                          # `..` out of the root is resolved
         refuse("x", {**inside, "HOME": root + "/../../Users/somebody"})
+    monkeypatch.delenv(home_guard.TEST_SCRATCH_ROOT_ENV)
+    with pytest.raises(RealHomeReached):                                          # no voucher anywhere
+        refuse("x", no_voucher)
     with pytest.raises(RealHomeReached):                                          # an empty voucher vouches for nothing
         refuse("x", {**inside, home_guard.TEST_SCRATCH_ROOT_ENV: ""})
+
+
+def test_a_root_that_holds_the_account_home_vouches_for_nothing(monkeypatch):
+    """The root is the system temp directory, which follows TMPDIR: a root at or above the password database's home
+    would pass the operator's real home as scratch."""
+    import pwd
+
+    account = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    for root in (account.parent, account):
+        monkeypatch.setenv(home_guard.TEST_SCRATCH_ROOT_ENV, str(root))
+        assert not home_guard.vouched_scratch(account / ".levain-guard-test")
+        with pytest.raises(RealHomeReached):
+            home_guard.refuse_real_home_fallback("x", {"HOME": str(account)})
+
+
+def test_a_child_of_the_suite_inherits_the_voucher_only_for_a_home_inside_the_root(tmp_path):
+    """The conftest sets the voucher and pytest sets its per-test variable in the process environment, so a child a
+    test spawns inherits both: admitted with a HOME inside the root, refused with any other."""
+    script = "import os\nfrom levain.consent.queue import queue_dir_for\nprint(queue_dir_for(os.environ))\n"
+    path = tmp_path / "child.py"
+    path.write_text(script, encoding="utf-8")
+    base = {k: v for k, v in os.environ.items() if k != "LEVAIN_HOME"}
+    assert home_guard.TEST_SCRATCH_ROOT_ENV in base and "PYTEST_CURRENT_TEST" in base
+    scratch = tmp_path / "child-home"
+    scratch.mkdir()
+    ok = subprocess.run([sys.executable, str(path)], env={**base, "HOME": str(scratch), "PYTHONPATH": str(REPO)},
+                        capture_output=True, text=True, timeout=60, cwd=str(tmp_path))
+    assert ok.returncode == 0, ok.stderr
+    assert Path(ok.stdout.strip()) == scratch.resolve() / ".levain" / "consent"
+    outside = "/Users/nobody-levain-guard-test"
+    no = subprocess.run([sys.executable, str(path)], env={**base, "HOME": outside, "PYTHONPATH": str(REPO)},
+                        capture_output=True, text=True, timeout=60, cwd=str(tmp_path))
+    assert no.returncode != 0 and "RealHomeReached" in no.stderr, no.stderr
+    assert not Path(outside).exists()
+
+
+# --- the resolver every caller shares: queue_dir_for(environ) ---------------------------------------------------
+# The hook entry points, the band hook's receipt, the desk board and the seat profile name the levain home through
+# queue_dir_for with the environment they were handed, never through default_queue_dir, so the check lives there.
+
+CLAUDE_CODE_HOOK = """
+import io, json, sys
+from levain.consent.adapters import claude_code
+event = {"hook_event_name": "PreToolUse", "session_id": "S-guard", "cwd": "/w", "permission_mode": "default",
+         "tool_name": "Read", "tool_input": {"file_path": "/etc/hosts"}}
+print("RC", claude_code.main(["--max-hold", "0"], stdin=io.StringIO(json.dumps(event)), stdout=sys.stdout))
+"""
+
+CODEX_HOOK = """
+import io, json, sys
+from levain.consent.adapters import codex
+event = {"hook_event_name": "PreToolUse", "session_id": "S-guard", "turn_id": "t1", "transcript_path": None,
+         "cwd": "/w", "model": "m", "permission_mode": "default", "tool_name": "Bash",
+         "tool_input": {"command": "true"}}
+print("RC", codex.main(["--max-hold", "0"], stdin=io.StringIO(json.dumps(event)), stdout=sys.stdout))
+"""
+
+
+@pytest.mark.parametrize("script", [CLAUDE_CODE_HOOK, CODEX_HOOK], ids=["claude_code", "codex"])
+def test_a_hook_entry_point_under_a_test_run_opens_no_queue_in_the_fallback_home(tmp_path, script):
+    """The hook mains resolve their queue with queue_dir_for(os.environ): the incident's shape reaches it directly."""
+    done, fake_home = _spawn(tmp_path, script, test_run=True)
+    assert "RC 0" in done.stdout, (done.stdout, done.stderr)            # a hook always exits 0
+    assert "RealHomeReached" in done.stderr, done.stderr
+    assert not (fake_home / ".levain").exists()
+
+
+ENV_RESOLVERS = [
+    ("levain.consent.queue", "queue_dir_for(os.environ)"),
+    ("levain.desk.work_attach", "board_store_dir()"),
+    ("levain.band_hook", "receipt_path()"),
+    ("levain.seat_profile", "real_levain_home(os.environ)"),
+]
+
+
+@pytest.mark.parametrize("module,call", ENV_RESOLVERS, ids=[m.rsplit(".", 1)[-1] + ":" + c for m, c in ENV_RESOLVERS])
+def test_each_environ_resolver_refuses_the_fallback_home(tmp_path, module, call):
+    script = f"import os\nfrom {module} import {call.split('(')[0]}\n{call}\nprint('RESOLVED')\n"
+    for test_run, marker in ((True, False), (False, True)):
+        sub = tmp_path / f"run-{test_run}"
+        sub.mkdir()
+        done, fake_home = _spawn(sub, script, test_run=test_run, scratch_marker=marker)
+        assert done.returncode != 0 and "RESOLVED" not in done.stdout, done.stdout
+        assert "RealHomeReached" in done.stderr, done.stderr
+        assert not (fake_home / ".levain").exists()
+
+
+def test_the_band_hook_install_refuses_before_it_writes_the_settings_file(tmp_path):
+    script = ("from levain import band_hook\n"
+              "print(band_hook.install())\n")
+    done, fake_home = _spawn(tmp_path, script, test_run=True)
+    assert done.returncode != 0 and "RealHomeReached" in done.stderr, done.stderr
+    assert not (fake_home / ".claude" / "settings.json").exists() and not (fake_home / ".levain").exists()
+
+
+def test_a_made_up_environ_is_vouched_by_the_process_or_refused(monkeypatch, tmp_path):
+    """Tests hand queue_dir_for an environment of their own; the run is still this process's (a test run), and the
+    voucher may come from the process when the dict carries none."""
+    from levain.consent.queue import queue_dir_for
+
+    assert queue_dir_for({"HOME": str(tmp_path)}) == tmp_path.resolve() / ".levain" / "consent"
+    with pytest.raises(RealHomeReached):                      # no HOME: the password database's, the operator's own
+        queue_dir_for({})
+    with pytest.raises(RealHomeReached):
+        queue_dir_for({"HOME": "/Users/nobody-levain-guard-test"})
+    monkeypatch.delenv(home_guard.TEST_SCRATCH_ROOT_ENV)
+    with pytest.raises(RealHomeReached):                      # no voucher anywhere
+        queue_dir_for({"HOME": str(tmp_path)})
+    assert queue_dir_for({"HOME": "/nowhere", "LEVAIN_HOME": str(tmp_path)}) == tmp_path.resolve() / "consent"
+
+
+# --- the desk record's own-home copy ------------------------------------------------------------------------------
+
+DESK_RECORD = """
+import sys
+from pathlib import Path
+from levain.desk import door
+door._own_home = lambda: Path(sys.argv[1])       # stands in for the password database's home: the operator's own
+ws = Path(sys.argv[2]); ws.mkdir()
+door.record(ws)
+print("RECORDED")
+"""
+
+
+def test_a_scratch_run_adds_no_workspace_to_the_account_homes_desk_record(tmp_path):
+    """A bare script that follows the guard's own advice (the scratch marker and a scratch LEVAIN_HOME) still wrote the
+    desk record's second copy under the password database's home, which LEVAIN_HOME does not move."""
+    account = tmp_path / "account-home"
+    account.mkdir()
+    scratch = tmp_path / "scratch-levain"
+    script = tmp_path / "desk_record.py"
+    script.write_text(DESK_RECORD, encoding="utf-8")
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path / "fake-home"),
+           "PYTHONPATH": str(REPO), home_guard.SCRATCH_ENV: "1", "LEVAIN_HOME": str(scratch)}
+    done = subprocess.run([sys.executable, str(script), str(account), str(tmp_path / "ws")], env=env,
+                          capture_output=True, text=True, timeout=60, cwd=str(tmp_path))
+    assert "RECORDED" in done.stdout, done.stderr
+    assert (scratch / "consent" / "coordinator_workspaces.json").is_file()
+    assert not (account / ".levain").exists()
+
+
+def test_the_suites_own_account_home_still_gets_the_second_copy(tmp_path):
+    """Inside the suite the conftest points the account home at a scratch directory in the vouched root, so the
+    door's two-record behaviour stays tested."""
+    from levain.desk import door
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    door.record(ws)
+    paths = door._record_paths()
+    assert len(paths) == 2 and all(p.is_file() for p in paths)
