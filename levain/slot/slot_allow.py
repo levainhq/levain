@@ -32,6 +32,12 @@ Known edges:
   delays other launches' writers until it returns or :data:`LOCK_WAIT_S` passes, when they skip the step and say so.
 * A writer killed between creating its temp file and renaming it leaves ``.<name>.<pid>.tmp`` in the consent
   directory; only a later writer with the same pid removes it.
+* When the live Secure Enclave check cannot run as a yes is applied (``sc_auth`` missing or unreadable),
+  ``terminal_sign.verify`` reads it as "not checked" and the yes carries on its recorded custody, as every launch's
+  re-check does (:func:`_no_live_check`). It is not kept for a retry. No key file is read on this path (the signing
+  key comes from the authority log), so a damaged key file on this machine never keeps a record forever.
+* No bound on how many rules are stored: a store at :data:`FILE_CAP` refuses each new yes (:data:`FULL_WHY`), and the
+  rules already stored still carry. A revoke makes room.
 * "No: keep asking" asks again the next time a slot saves the rule. A no to a row filed for a STORED rule (a renewal,
   or a stored rule that no longer carries) ends the rule instead: it leaves ``rules`` for ``revoked`` without its signed
   answer, as :func:`revoke` leaves it, and no launch asks about it again; it is asked again only the way any rule first
@@ -287,14 +293,23 @@ def _locked(qdir: Path) -> Iterator[None]:
         os.close(fd)        # closing the only descriptor releases the lock
 
 
+class AllowFull(AllowRefused):
+    """A save refused because the document would be over :data:`FILE_CAP`: nothing was written, and the file on disk
+    (at most :data:`FILE_CAP`, so :func:`load` still reads it) is as it was."""
+
+
+#: why a signed yes is not carried when the rule store has no room for it
+FULL_WHY = "the rule store is full: revoke a rule to make room"
+
+
 def _save(path: Path, doc: Mapping[str, Any]) -> None:
     """``doc`` written whole to a temp file, synced, renamed over ``path``, then the directory synced. A document over
-    :data:`FILE_CAP` (which :func:`load` would refuse) is refused before anything is written (:class:`AllowRefused`),
+    :data:`FILE_CAP` (which :func:`load` would refuse) is refused before anything is written (:class:`AllowFull`),
     and a failure up to the rename leaves the previous file as it was and no temp file behind (only the directory
     sync can fail after it, with the new file in place)."""
     data = (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode()
     if len(data) > FILE_CAP:
-        raise AllowRefused(f"{path.name}: the update would be over {FILE_CAP} bytes; nothing was written")
+        raise AllowFull(f"{path.name}: the update would be over {FILE_CAP} bytes; nothing was written")
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     try:
@@ -653,8 +668,10 @@ def rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[O
 
 def _rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[Optional[Dict[str, str]], str]:
     """:func:`rule_evidence`, raising :class:`_LogUnreadable` when the authority log cannot be read (or yields
-    nothing), the verifier cannot run, or a phone countersign cannot be read now, instead of refusing: none of those
-    is a verdict on the answer. A signature that verifies as bad, or evidence that is not there, is a refusal."""
+    nothing), the verifier cannot run, a phone countersign cannot be read now, or the check meets an I/O or store
+    error (``answer_countersign._transient``: an ``OSError`` other than a file that is gone, a ``sqlite3`` error),
+    instead of refusing: none of those is a verdict on the answer. A signature that verifies as bad, evidence that is
+    not there, or any other error in the check, is a refusal."""
     from levain.band_view import answer_sign_of
     from levain.cockpit.consent import parse_stamp
     from levain.consent import answer_countersign as ac
@@ -699,6 +716,8 @@ def _rule_evidence(store: Any, question: Any, rule: str, judge: Judge) -> Tuple[
     except _VerifierDown as exc:
         raise _LogUnreadable(f"the signature could not be verified now ({exc})") from None
     except Exception as exc:  # noqa: BLE001 - evidence that cannot be checked does not carry (as verify_evidence)
+        if ac._transient(exc):      # an I/O or store failure on the way (not a file that is gone): no verdict
+            raise _LogUnreadable(f"the signature could not be checked now ({type(exc).__name__})") from None
         why = f"its signature could not be checked ({type(exc).__name__})"
     if why:
         return None, why
@@ -1014,7 +1033,8 @@ def apply_answered(qdir: Path, allow_file: Path, store: Any = None, now: Callabl
     the record, so the next time a slot saves the rule it is asked again. A no to a row filed for a stored rule
     (``renew``) also ends that rule (:func:`_decline`). A refused yes is kept as refused (with why) until a slot END
     files the rule's next row: ``list`` names it and :func:`remind` does not re-ask it. It is appended to ``refused``
-    when given. A rule already stored is replaced
+    when given. A signed yes the rule store has no room for (:class:`AllowFull`) is refused the same way, with
+    :data:`FULL_WHY`, so one full store never leaves a record that fails every launch. A rule already stored is replaced
     unless its old entry still verifies with a lease at least as long (:func:`append`). Returns the rules added."""
     from levain.consent.questions import QuestionStore
 
@@ -1037,13 +1057,18 @@ def apply_answered(qdir: Path, allow_file: Path, store: Any = None, now: Callabl
                 if not judged_old:
                     old_ok, judged_old = _old_ok(judge, store_id_of(qs)), True
                 doc["refused"].pop(rule, None)
-                if append(allow_file, rule, str(rec.get("session", "?")), ev, now, old_ok=old_ok):
-                    added.append(rule)
-            elif state == "refused":
+                try:
+                    if append(allow_file, rule, str(rec.get("session", "?")), ev, now, old_ok=old_ok):
+                        added.append(rule)
+                except AllowFull:
+                    # no room for this rule: refused as any other yes is (its record consumed, said, asked again
+                    # when a slot next saves it), and the rows after it and the rules already stored go on
+                    state, why = "refused", FULL_WHY
+            if state == "refused":
                 doc["refused"][rule] = why
                 if refused is not None:
                     refused.append((rule, why))
-            else:
+            elif state != "yes":
                 doc["refused"].pop(rule, None)
                 if state == "no" and rec.get("renew") is True:
                     _decline(allow_file, rule, now)
@@ -1206,6 +1231,6 @@ def run(args: Any, out: Any = None) -> int:
         return 1
 
 
-__all__ = ["AGENT", "AllowRefused", "FILE_NAME", "FORMAT", "NO", "YES", "append", "apply_answered", "file_rows", "load",
+__all__ = ["AGENT", "AllowFull", "AllowRefused", "FILE_NAME", "FORMAT", "NO", "YES", "append", "apply_answered", "file_rows", "load",
            "merge_into_frozen", "parse_local_allow", "read_regular", "register", "revoke", "run", "rules_of", "shape_ok", "undo", "not_carried",
            "Judge", "carried", "lease_end", "offer", "remind", "default_judge", "rule_evidence", "verify_evidence", "asked_text", "yes_text"]
