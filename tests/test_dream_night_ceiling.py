@@ -122,6 +122,15 @@ def test_check1_a_daytime_start_is_not_held_to_a_nights_run_of_its_own_calendar_
     assert _check1(v).status == "pass", _check1(v).detail
 
 
+def test_the_night_check_1_derives_for_a_dream_day_is_the_key_check_6_filters_by():
+    """check 1 re-derives a scheduled night's span from the dream-day and check 6 filters by the key the caller passes;
+    they are one night only while the dream's window opens on the dream-day, so a move of the window that broke that
+    fails here instead of letting the two checks disagree."""
+    day = date(2026, 11, 12)
+    opens = datetime(day.year, day.month, day.day, int(rd.WINDOW["start"][:2]), int(rd.WINDOW["start"][3:]), tzinfo=NY)
+    assert accounting.count_span(rd.WINDOW, ZONE, opens).window_key == rd.window_key_for(day)
+
+
 def test_check1_counts_the_fall_back_night_as_one_night(ent):
     _hand(ent, datetime(2026, 10, 31, 23, 30, tzinfo=NY))
     _hand(ent, datetime(2026, 11, 1, 1, 30, tzinfo=NY))                   # EDT
