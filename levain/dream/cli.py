@@ -19,10 +19,15 @@ from pathlib import Path
 
 
 def add_parsers(subparsers: argparse._SubParsersAction) -> None:
-    p = subparsers.add_parser("dream", help="Dreaming: run on a store copy; rollback, recover and drill.",
+    p = subparsers.add_parser("dream", help="Dreaming: run on a store copy; ready, rollback, recover, drill, shadow; "
+                                            "enable the scheduled dream.",
                               allow_abbrev=False,
                               description="Consolidate a store through a compose mind (`run`, on a COPY of a store), "
-                                          "and roll back, recover or drill a dream. Nothing schedules a dream.")
+                                          "check whether a night is due (`ready`), roll back, recover or drill a dream, "
+                                          "dry-run a shadow night (`shadow`), and register the scheduled dream "
+                                          "(`enable`). Once enabled and under a live signed link, the agents tick "
+                                          "(`levain agents tick`) launches it once a night at its time; `enable` "
+                                          "signs nothing.")
     p.set_defaults(func=run_dream)
     sub = p.add_subparsers(dest="dream_command")
     r = sub.add_parser("run", allow_abbrev=False, help="Consolidate a store COPY once.",
@@ -154,7 +159,7 @@ def _store_and_occurrence(p: argparse.ArgumentParser) -> None:
 
 
 def run_dream(args: argparse.Namespace) -> int:
-    print("levain dream: choose run, rollback, recover, ready, drill or enable (see `levain dream --help`)",
+    print("levain dream: choose run, rollback, recover, ready, drill, shadow or enable (see `levain dream --help`)",
           file=sys.stderr)
     return 1
 
