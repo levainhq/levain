@@ -450,3 +450,50 @@ def test_the_xcheck_pytest_step_runs_serial_since_its_tests_share_one_emit_file(
     x = yaml.safe_load((Path(__file__).resolve().parent.parent / ".github" / "workflows" / "contracts-xcheck.yml").read_text())
     step = next(st for st in x["jobs"]["xcheck"]["steps"] if "LEVAIN_XCHECK_EMIT" in st.get("env", {}))
     assert "-n " not in step["run"] and "xdist" not in step["run"], step["run"]
+
+
+UPLOAD_STEP = "Keep what the page showed at a failed wait"
+
+
+def _unstatted_links_cleared(steps):
+    """Every UPLOAD_STEP in `steps` is directly preceded by a step that, on failure(), deletes the links under the
+    basetemp that do not resolve, so the upload action's glob never stats a symlink loop (ELOOP). Returns how many
+    upload steps it saw; raises AssertionError on the first that is not covered."""
+    seen = 0
+    for i, st in enumerate(steps):
+        if st.get("name") != UPLOAD_STEP:
+            continue
+        seen += 1
+        assert i > 0, "the upload step has nothing in front of it"
+        prev = steps[i - 1]
+        assert prev.get("if") == "failure()" and st.get("if") == "failure()", (prev.get("if"), st.get("if"))
+        run = prev.get("run", "")
+        # a link that does not resolve (a loop or a dangling one) is found with -type l plus a failing test -e, and removed
+        assert "/tmp/levain-pt" in run and "-type l" in run and "! -exec test -e {}" in run and "-delete" in run, run
+        # the cleanup must not be able to swallow its own failure
+        assert "|| true" not in run, run
+    return seen
+
+
+def test_every_page_timeout_upload_is_preceded_by_the_dead_link_cleanup():
+    for job in ("test", "browser"):
+        assert _unstatted_links_cleared(JOBS[job]["steps"]) == 1, job
+    # no other job in the file uploads through this step name without the cleanup either
+    for name, j in JOBS.items():
+        _unstatted_links_cleared(j["steps"])
+
+
+def test_the_dead_link_cleanup_check_can_fail():
+    ok = {"name": "x", "if": "failure()", "run": "find /tmp/levain-pt -type l ! -exec test -e {} \\; -delete"}
+    up = {"name": UPLOAD_STEP, "if": "failure()"}
+    assert _unstatted_links_cleared([ok, up]) == 1
+    with pytest.raises(AssertionError):
+        _unstatted_links_cleared([up])
+    with pytest.raises(AssertionError):
+        _unstatted_links_cleared([{"name": "y", "run": "true"}, up])
+    with pytest.raises(AssertionError):
+        _unstatted_links_cleared([dict(ok, run=ok["run"].replace("-delete", "-print")), up])
+    with pytest.raises(AssertionError):
+        _unstatted_links_cleared([dict(ok, **{"if": "always()"}), up])
+    with pytest.raises(AssertionError):
+        _unstatted_links_cleared([dict(ok, run=ok["run"] + " || true"), up])

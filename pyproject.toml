@@ -220,7 +220,7 @@ levain = ["**/__pycache__/*", "**/*.pyc", "**/*.pyo"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
-# `invariant`: the whole-tree invariant tests listed in tests/ci/invariant_tests.txt; `pytest -m invariant` selects them (the marker was cut for a future pre-push hook; none runs it).
+# `invariant`: the whole-tree invariant tests listed in tests/ci/invariant_tests.txt; `pytest -m invariant` selects them (the marker exists so this tier can run on its own, ahead of the heavy jobs in CI and as a cheap check on the laptop).
 markers = [
     "journey: a stage-1 golden journey (tests/test_journeys_stage1.py): one real operator act driven end to end in the shared Chrome",
     "invariant: asserts something about every file of the source tree (listed in tests/ci/invariant_tests.txt)",
