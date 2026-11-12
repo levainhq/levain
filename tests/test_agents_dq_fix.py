@@ -182,3 +182,49 @@ def test_a_set_up_failure_before_the_rows_is_named_and_costs_the_pass_nothing_el
     assert "database is locked" in err and "OperationalError" in err
     (row,) = _rows(rig)
     assert row["state"] == "admitted" and spawn.calls == []  # retried next tick, until its grace
+
+
+# ------------------------------------------------- (4) an unclassified launch is not a clean pass; a full cap is
+
+def test_an_install_zone_this_host_does_not_know_is_a_named_launch_failure_not_a_traceback(tmp_path, monkeypatch,
+                                                                                           capsys):
+    import json
+
+    rig = _live_rig(tmp_path)
+    path = Path(rig.store.directory) / da.INSTALL_FILE
+    doc = json.loads(path.read_text())
+    doc["zone"] = "Mars/Olympus"
+    path.write_text(json.dumps(doc))
+    monkeypatch.setattr(da, "tick_notices", Notices())
+    slot, spawn = _slot(rig), Spawns()
+    assert _tick(rig, slot - 10 * MIN, spawn) == T.EXIT_OK
+    code = _tick(rig, slot + MIN, spawn)
+    assert code == T.EXIT_LAUNCH, code
+    (row,) = _rows(rig)
+    assert row["state"] == "admitted" and spawn.calls == []
+    err = capsys.readouterr().err
+    assert row["occurrence_id"] in err and "unclassified" in err
+
+
+def test_a_launch_that_answers_unclassified_exits_6_and_a_full_cap_does_not(tmp_path, monkeypatch):
+    from levain.agents import slots
+
+    rig = _live_rig(tmp_path)
+
+    def dead(agent_dir, *, clock=None):
+        def check(row):
+            raise RuntimeError("the wrap cannot be read")
+        return check
+
+    monkeypatch.setattr(da, "install_on_input", dead)
+    monkeypatch.setattr(da, "tick_notices", Notices())
+    slot, spawn = _slot(rig), Spawns()
+    assert _tick(rig, slot - 10 * MIN, spawn) == T.EXIT_OK
+    assert _tick(rig, slot + MIN, spawn) == T.EXIT_LAUNCH            # the dream never ran: exit 6
+    monkeypatch.setattr(da, "install_on_input", lambda agent_dir, *, clock=None: (lambda row: True))
+    with rig.store.write() as c:
+        slots.take(c, slots.LAUNCH, "ln-a", slot)
+        slots.take(c, slots.LAUNCH, "ln-b", slot)
+    assert _tick(rig, slot + 2 * MIN, spawn) == T.EXIT_OK            # a full cap is normal: quiet
+    (row,) = _rows(rig)
+    assert row["state"] == "admitted" and spawn.calls == []
