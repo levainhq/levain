@@ -241,6 +241,20 @@ def test_a_stopped_consent_row_says_stopped_with_its_reason_and_no_until(world, 
 
 
 @needs_browser
+def test_a_stopped_lease_and_egress_row_say_revoke_it_first(world, tmp_path, monkeypatch):
+    """A seat-root lease and a seat-egress grant allow one live at a time and a stopped one still counts (ruling R-C), so
+    "create it again" alone is refused: their line names the revoke first (L4 F1). A consent row beside them keeps the
+    create words."""
+    rows = [_stopped({**_consent_row("sl-0000000000aa"), "kind": "seat-root-lease"}),
+            _stopped({**_consent_row("se-0000000000aa"), "kind": "seat-egress"}),
+            _stopped(_consent_row("cg-0000000000aa"))]
+    got = _drive_cards(tmp_path, world, monkeypatch, rows)
+    for gid in ("sl-0000000000aa", "se-0000000000aa"):
+        assert f"Stopped: {STOPPED_WHY}. It answers nothing. Revoke it, then create it again to use it." in got[gid][1], got[gid][1]
+    assert f"Stopped: {STOPPED_WHY}. It answers nothing. Create it again to use it." in got["cg-0000000000aa"][1]
+
+
+@needs_browser
 def test_a_row_stopped_for_its_last_renewer_says_that(world, tmp_path, monkeypatch):
     gid = "cg-0000000000aa"
     why = "the key that last renewed it was revoked"

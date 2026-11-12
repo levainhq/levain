@@ -82,7 +82,7 @@ def load_registry(cockpit_root: Path | str, now: datetime | None = None) -> tupl
     A log that cannot be read is an error, never an empty registry. An entry stopped because a key that signed it was
     revoked (:func:`levain.authority.grants_in_force`) is not live and is skipped with its stop reason as the why
     (:func:`levain.authority.grant_stop_reason`: the creator's words or the last renewer's, one of :data:`STOP_REASONS`),
-    whatever else is true of it (an expired one included: register it again, do not renew it). It stays in the log."""
+    whatever else is true of it (an expired one included: no renew brings it back). It stays in the log until revoked."""
     from levain.agent_authority import AgentAuthority
     from levain.authority import HANDS_MCP_KIND, NotInitialised, grant_stop_reason, grants_in_force
     from levain.cockpit.firejournal import DB_NAME
@@ -100,6 +100,13 @@ def load_registry(cockpit_root: Path | str, now: datetime | None = None) -> tupl
     stopped = [(gid, grant_stop_reason(state, gid) or STOPPED_BORN) for gid, g in state.policy.grants.items()
                if gid not in in_force and isinstance(g, Mapping) and g.get("kind") == HANDS_MCP_KIND]
     return live, sorted(skipped + stopped)
+
+
+def _revoke_cmd(gid: str) -> str:
+    """The verb that clears a stopped entry from the log, every required argument shown (no hands verb revokes one; the
+    kind-blind consent revoke does)."""
+    from levain.authority import _HANDS_MCP_REVOKE
+    return _HANDS_MCP_REVOKE.format(gid=gid)
 
 
 def _grants_named(cockpit_root: Path | str, name: str) -> list[dict[str, Any]]:
@@ -277,10 +284,12 @@ def entry_for_signin(entity_dir: Path | str, cockpit_root: Path | str, name: str
         known = _grants_named(cockpit_root, name)
         if not known:
             raise HandsMcpRefused(f"{name!r} is not registered for the hands account; nothing was changed")
-        why = sorted({w for gid, w in skipped if any(k["id"] == gid for k in known)}) or ["not live"]
-        if all(w in STOP_REASONS for w in why):   # a renew does not bring a stopped entry back: register it again
-            raise HandsMcpRefused(f"{name!r} is registered but stopped: {'; '.join(why)}; register it again with a "
-                                  "key you hold. Nothing was changed")
+        mine = [(gid, w) for gid, w in skipped if any(k["id"] == gid for k in known)]
+        why = sorted({w for _gid, w in mine}) or ["not live"]
+        if all(w in STOP_REASONS for w in why):   # a renew does not bring a stopped entry back, and no verb registers one
+            cmds = ", ".join(f"`{_revoke_cmd(gid)}`" for gid, _w in mine)
+            raise HandsMcpRefused(f"{name!r} is registered but stopped: {'; '.join(why)}; revoke it to clear it "
+                                  f"({cmds}); no levain verb registers a hands entry yet. Nothing was changed")
         raise HandsMcpRefused(f"{name!r} is registered but not live ({', '.join(why)}); renew or re-register it. "
                               "Nothing was changed")
     if e["transport"] != "remote":
@@ -467,6 +476,9 @@ def status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None) 
     """One ``(ok, line)`` per finding and the exit code. Every read that fails is its own line, never silence.
     Read-only, for both callers (``list`` and the doctor): its reads run with ``sweep=False``, so one that runs out
     kills only its own child and never the hands account's other processes (there is no sweeping variant)."""
+    from levain.authority import HANDS_MCP_KIND
+    from levain.consent.grants import stopped_line
+
     root = cockpit_root if cockpit_root is not None else cockpit_root_of(entity_dir)
     rows: list[tuple[bool, str]] = []
     try:
@@ -490,8 +502,11 @@ def status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None) 
         rows.append((False, f"hands mcp config: unknown (the hands account's server list could not be read: {exc})"))
     live_names = {e["name"]: e for e in live}
     for gid, why in skipped:
-        rows.append((True, f"hands mcp entry {gid}: " + (f"stopped: {why} (answers nothing; register it "
-                                                          "again to use it)" if why in STOP_REASONS else f"not live ({why})")))
+        # a stopped entry is a failing row: it answers nothing and no renew brings it back, so it is not health
+        if why in STOP_REASONS:
+            rows.append((False, f"hands mcp entry {gid}: {stopped_line(why, HANDS_MCP_KIND)}: `{_revoke_cmd(gid)}`"))
+        else:
+            rows.append((True, f"hands mcp entry {gid}: not live ({why})"))
     if held is not None:
         for name in sorted(set(record) | set(held) | set(live_names)):
             rows.append(server_status(name, record.get(name), held.get(name), live_names.get(name)))

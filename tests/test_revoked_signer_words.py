@@ -265,6 +265,8 @@ def _out(capsys, *argv: str) -> tuple[int, str, str]:
 
 
 STOPPED_LINE = f"stopped: {BORN} (answers nothing; create it again to use it)"
+# a kind with a one-live rule (lease, egress, chat key, voice key) is revoked before it is created again (L4 F1)
+STOPPED_ONE_LIVE = f"stopped: {BORN} (answers nothing; revoke it, then create it again to use it)"
 
 
 def test_t16_consent_grant_list_says_stopped_and_not_until(world, capsys, monkeypatch) -> None:
@@ -305,7 +307,7 @@ def test_t16_chat_key_list_says_stopped(world, capsys) -> None:
     assert (rows["ek-000000000002"]["state"], rows["ek-000000000002"]["stopped_why"]) == ("live", "")
     code, out, _err = _out(capsys, "chat", "key", "list", "--data-root", str(world.root))
     lines = {line.split()[0]: line for line in out.splitlines()}
-    assert code == 0 and STOPPED_LINE in lines["ek-000000000001"] and " until " not in lines["ek-000000000001"]
+    assert code == 0 and STOPPED_ONE_LIVE in lines["ek-000000000001"] and " until " not in lines["ek-000000000001"]
     assert " until " in lines["ek-000000000002"]
 
 
@@ -316,9 +318,9 @@ def test_t16_seat_lease_and_egress_list_say_stopped(world, capsys) -> None:
     assert code == 0 and out.startswith("sl-aaaaaaaaaaaa") and " until " in out                  # control
     world.revoke_key("a", by="b")
     code, out, _err = _out(capsys, "seat", "lease", "list", "--data-root", str(world.root))
-    assert code == 0 and out.startswith("sl-aaaaaaaaaaaa") and STOPPED_LINE in out and " until " not in out
+    assert code == 0 and out.startswith("sl-aaaaaaaaaaaa") and STOPPED_ONE_LIVE in out and " until " not in out
     code, out, _err = _out(capsys, "seat", "egress", "list", "--data-root", str(world.root))
-    assert code == 0 and out.startswith("se-aaaaaaaaaaaa") and STOPPED_LINE in out and "no live seat-egress grant" not in out
+    assert code == 0 and out.startswith("se-aaaaaaaaaaaa") and STOPPED_ONE_LIVE in out and "no live seat-egress grant" not in out
 
 
 def test_t16_a_lease_that_is_revoked_still_reads_as_none(world, capsys) -> None:
@@ -336,11 +338,14 @@ def test_t16_hands_mcp_list_and_the_sign_in_refusal_say_stopped(world, tmp_path,
     monkeypatch.setattr(hml, "vendor_servers", lambda hands, entity, sweep=False: {})
     rows, _code = hml.status_rows(world.entity, world.root)
     lines = [line for _ok, line in rows if line.startswith("hands mcp entry")]
-    assert lines == [f"hands mcp entry hm-000000000001: stopped: {BORN} (answers nothing; register it again to use it)"]
+    assert lines == [f"hands mcp entry hm-000000000001: stopped: {BORN} (answers nothing; revoke it to clear it; no "
+                     "levain verb registers a hands entry yet): `levain consent grant revoke --signing-key <key> -- "
+                     "hm-000000000001`"]
     with pytest.raises(hml.HandsMcpRefused) as exc:
         hml.entry_for_signin(world.entity, world.root, "files")
-    assert str(exc.value) == (f"'files' is registered but stopped: {BORN}; register it again with a key you hold. "
-                              "Nothing was changed")
+    assert str(exc.value) == (f"'files' is registered but stopped: {BORN}; revoke it to clear it (`levain consent grant "
+                              "revoke --signing-key <key> -- hm-000000000001`); no levain verb registers a hands entry "
+                              "yet. Nothing was changed")
     assert "renew" not in str(exc.value)
 
 
@@ -355,11 +360,14 @@ def test_t16_an_entry_whose_last_renewer_was_revoked_says_renewed_not_signed(wor
     monkeypatch.setattr(hml, "vendor_servers", lambda hands, entity, sweep=False: {})
     rows, _code = hml.status_rows(world.entity, world.root)
     lines = [line for _ok, line in rows if line.startswith("hands mcp entry")]
-    assert lines == [f"hands mcp entry hm-000000000001: stopped: {CURRENT} (answers nothing; register it again to use it)"]
+    assert lines == [f"hands mcp entry hm-000000000001: stopped: {CURRENT} (answers nothing; revoke it to clear it; no "
+                     "levain verb registers a hands entry yet): `levain consent grant revoke --signing-key <key> -- "
+                     "hm-000000000001`"]
     with pytest.raises(hml.HandsMcpRefused) as exc:
         hml.entry_for_signin(world.entity, world.root, "files")
-    assert str(exc.value) == (f"'files' is registered but stopped: {CURRENT}; register it again with a key you hold. "
-                              "Nothing was changed")
+    assert str(exc.value) == (f"'files' is registered but stopped: {CURRENT}; revoke it to clear it (`levain consent "
+                              "grant revoke --signing-key <key> -- hm-000000000001`); no levain verb registers a hands "
+                              "entry yet. Nothing was changed")
     assert BORN not in str(exc.value)
 
 
@@ -400,7 +408,7 @@ def test_t16_a_stopped_voice_key_is_listed_stopped_everywhere(voice, capsys) -> 
     page = {r["id"]: r for r in G.grant_view(voice.qdir, now=_now())["grants"]}
     assert (page[rec["id"]]["state"], page[rec["id"]]["stopped_why"]) == ("stopped", BORN)
     code, out, _err = _out(capsys, "voice", "key", "list", "--data-root", str(voice.root))
-    assert code == 0 and STOPPED_LINE in out and "stands until revoked" not in out
+    assert code == 0 and STOPPED_ONE_LIVE in out and "stands until revoked" not in out
     body = cockpit_voice.serve_voice(voice.root, vmeter.Meter(voice.tmp / "voice-ledger.db"), last_read={})
     openai = next(p for p in body["providers"] if p["name"] == "openai")
     other = next(p for p in body["providers"] if p["name"] == "deepgram")
@@ -444,10 +452,13 @@ def test_t17_the_revoke_names_each_grant_the_key_signed_with_what_it_is(world, c
         f"  se-000000000001  seat-egress grant: seats push to {seat['se-000000000001']['push_remote']}",
         f"  sl-9f8e7d6c5b4a  seat-root lease: seats launch under {seat['sl-9f8e7d6c5b4a']['lanes_parent']}"]
     assert "cg-keptbyb" not in out
-    assert lines[8] == "To use one again, create it again with a key you still hold (a renew does not bring it back)."
-    assert lines[9] == "To clear it from the list: levain consent grant revoke --signing-key <key> -- <id>"
-    assert lines[10] == "A chat key clears with: levain chat key revoke --signing-key <key> <id>"
-    assert len(lines) == 11
+    assert lines[8:] == [
+        "A renew does not bring one back. To use one again:",
+        "  create it again with a key you still hold: cg-1a2b3c4d5e6f, cg-sh0000000001",
+        "  revoke it, then create it again with a key you still hold: ek-000000000001, se-000000000001, sl-9f8e7d6c5b4a",
+        "  revoke it to clear it; no levain verb registers a hands entry yet: hm-000000000001",
+        "To revoke one: levain consent grant revoke --signing-key <key> -- <id>",
+        "A chat key revokes with: levain chat key revoke --signing-key <key> <id>"]
 
 
 def test_t17_each_kinds_tail_is_what_the_design_says(world) -> None:
@@ -482,7 +493,7 @@ def test_t17_one_grant_reads_in_the_singular(world, capsys) -> None:
     assert code == 0
     assert lines[1] == "1 standing grant this key signed has stopped. It answers nothing from now on, though it has not expired:"
     assert lines[2].startswith("  cg-A  consent grant: claude_code may ")
-    assert "A chat key clears" not in out                                   # only said when a chat key is named
+    assert "A chat key revokes" not in out                                  # only said when a chat key is named
 
 
 def test_t17_a_key_that_signed_no_grant_says_so(world, capsys) -> None:
@@ -602,7 +613,10 @@ def test_t18_one_warn_row_names_the_stopped_grants_and_the_way_out(world) -> Non
     assert (row.name, row.ok, row.warn) == ("standing grants", True, True)
     assert row.detail == ("2 standing grants stopped because the key that signed them was revoked; they answer nothing "
                           "(cg-A, sl-aaaaaaaaaaaa)")
-    assert row.hint == "Create them again with a key you hold, or revoke them to clear the list."
+    # a lease is among them, and its create is refused until it is revoked (L4 F1): the hint says revoke first
+    assert row.hint == ("Revoke them to clear the list (levain consent grant revoke --signing-key <key> -- <id>); a "
+                        "seat-root lease, seat-egress grant, chat key, voice key or hands entry must be revoked before "
+                        "it is created again.")
 
 
 def test_t18_one_stopped_grant_reads_in_the_singular(world) -> None:
