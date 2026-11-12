@@ -276,6 +276,23 @@ def test_1112_1_f8_the_tick_hands_the_drill_whether_a_dream_run_is_launched(nigh
     assert not [i for i in night.items() if i.body.get("kind") == "attention"]
 
 
+def test_1112_1_r2_a_drill_outcome_the_tick_does_not_handle_is_a_visible_tick_line_and_no_state_change(night, monkeypatch):
+    assert dream(night.ent.db, "o1", _VALID).outcome == "saved"
+    root = night.ent.db.parent / "dream"
+    real = sn.drill
+
+    def odd(store_path, root, **kw):
+        res = real(store_path, root, write_result=False)
+        res.outcome = "a-future-outcome"
+        return res
+
+    monkeypatch.setattr(sn, "drill", odd)
+    assert night.tick() == T.EXIT_OK, night.err
+    assert "a-future-outcome" in night.err and "dream drill" in night.err, night.err
+    assert sn.last_drill(root) is None and "attention resolved" not in night.err
+    assert not [i for i in night.items() if i.body.get("kind") == "attention"]
+
+
 def test_a_failed_drill_raises_an_attention_item_a_reader_sees(night, monkeypatch):
     assert dream(night.ent.db, "o1", _VALID).outcome == "saved"
     real = sn.drill

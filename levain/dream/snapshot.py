@@ -548,8 +548,10 @@ class DrillResult:
     recorded, so the drill is next due in a cadence, but it is not a pass and clears nothing), ``no-snapshot`` (a fresh
     install: not a failure) or ``deferred`` (a dream or another writer holds the store, so the live store could not be
     copied consistently; nothing is recorded and the drill stays due). A step is ``ok``, ``failed`` or ``skipped`` (with
-    why). ``carried_failure`` is set only on a ``skipped`` result: the text of the failure the last recorded drill
-    found, kept until a drill really restores, so a week with no restore can neither clear that failure nor lose it."""
+    why). ``carried_failure`` is set only on a ``skipped`` result: the text of the ``restore`` or ``open`` failure the
+    last recorded drill found, kept until a drill really restores. A skipped drill re-proved setup, hash, copy and
+    integrity, so a failure on one of those is superseded by it, not carried; a failure on a step it did not run is
+    neither cleared nor lost by a week with no restore."""
     outcome: str
     snapshot: str | None = None
     steps: list[dict[str, str]] = field(default_factory=list)
@@ -575,7 +577,8 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
     the manifest's ``pre``; (4) open the restored copy with anneal and read its status. Step 3 is skipped (not failed)
     when the snapshot is not the one the live text matches (a later write, a finished rollback) or has no post-save
     record, because the rollback's own guard is then doing its job; the outcome is then ``skipped``, never ``ok``,
-    since nothing was restored. The result is written to ``<root>/drill.json`` for the gauge."""
+    since nothing was restored. The result is written to ``<root>/drill.json``, read by :func:`last_drill` (the weekly
+    tick and the next drill); no gauge reads it. ``deferred`` and ``no-snapshot`` write nothing."""
     from anneal_memory import Store
     from levain.dream.executor import _copy_store
 
@@ -617,7 +620,7 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
         try:
             snaps = snapshots(root)
             if not snaps:
-                return _drill_done(res, root, write_result)
+                return res     # nothing to prove, so nothing is recorded: the last record (a failure) must stand
             name, m = snaps[-1]
             occ = root / name
             res.snapshot, res.outcome = name, "ok"
@@ -717,9 +720,21 @@ def _deferred(res: DrillResult, why: str) -> DrillResult:
 
 
 def failed_steps_text(steps: Any) -> str:
-    """The failed steps of a drill result as one line (the attention row's cause)."""
+    """The failed steps of a drill result as one line (the attention row's cause). The ONE place this text is made: the
+    row's dedupe key is a hash of it, so the row, its re-raise from the record and the carried copy must be identical."""
     return "; ".join(f"{s.get('name')}: {s.get('detail')}" for s in steps or [] if s.get("status") == "failed") \
         or "a step failed"
+
+
+#: the steps a ``skipped`` drill does NOT prove: it reaches the skip only after setup, hash, copy and integrity passed,
+#: but never ran the restore or the open. A carried failure on any other step is superseded by that skipped drill.
+UNPROVEN_BY_A_SKIP = ("restore", "open")
+
+
+def _carried_text(steps: Any) -> str | None:
+    """The part of a prior failure a skipped drill cannot have re-proved, as the row text, or None."""
+    kept = [s for s in steps or [] if s.get("status") == "failed" and s.get("name") in UNPROVEN_BY_A_SKIP]
+    return failed_steps_text(kept) if kept else None
 
 
 def _drill_done(res: DrillResult, root: Path, write: bool, *, failed: bool = False,
@@ -732,7 +747,7 @@ def _drill_done(res: DrillResult, root: Path, write: bool, *, failed: bool = Fal
         res.outcome = "skipped"
         prior = last_drill(root) or {}
         if prior.get("outcome") == "failed":
-            res.carried_failure = failed_steps_text(prior.get("steps"))
+            res.carried_failure = _carried_text(prior.get("steps"))
         elif prior.get("outcome") == "skipped" and prior.get("carried_failure"):
             res.carried_failure = str(prior["carried_failure"])
     if write:
@@ -743,8 +758,14 @@ def _drill_done(res: DrillResult, root: Path, write: bool, *, failed: bool = Fal
 
 
 def last_drill(root: Path | str) -> dict[str, Any] | None:
-    """The last drill result under ``root``, or None."""
-    return _read_json(Path(root) / DRILL_RECORD)
+    """The last drill result under ``root``, or None. A record written before ``skipped`` existed (``outcome: ok`` with a
+    skipped ``restore`` step) reads as ``skipped``: nothing was restored, so it was never a pass. The file is not rewritten."""
+    rec = _read_json(Path(root) / DRILL_RECORD)
+    if isinstance(rec, dict) and rec.get("outcome") == "ok" and any(
+            isinstance(s, dict) and s.get("name") == "restore" and s.get("status") == "skipped"
+            for s in rec.get("steps") or []):
+        rec = {**rec, "outcome": "skipped"}
+    return rec
 
 
 def drill_due(root: Path | str, now: _dt.datetime | None = None, cadence_s: float = DRILL_CADENCE_S) -> bool:
