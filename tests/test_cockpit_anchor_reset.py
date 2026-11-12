@@ -457,7 +457,8 @@ def test_every_printed_levain_remedy_names_an_argv_the_cli_accepts() -> None:
     refusal) and `levain dispatch --dispatch-dir` (the phone command's --queue-dir help; the flag is
     `levain dispatch file`'s) NOT-REAL. Derive the full table:
     ``python project_memory/1022-20/anchorq2/sweep.py <worktree>``."""
-    files = [LEVAIN / "authority.py", LEVAIN / "doctor.py", LEVAIN / "cli.py", *sorted((LEVAIN / "cockpit").glob("*.py"))]
+    files = [LEVAIN / "authority.py", LEVAIN / "doctor.py", LEVAIN / "cli.py", *sorted((LEVAIN / "cockpit").glob("*.py")),
+             *sorted((LEVAIN / "dream").glob("*.py"))]
     cache: dict = {}
     bad = []
     for f in files:

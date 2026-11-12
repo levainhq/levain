@@ -521,6 +521,32 @@ def test_the_generic_did_not_consolidate_card_names_the_hand_start(tmp_path):
     _parses(text)
 
 
+def test_f4_every_command_the_dream_prints_parses_as_printed(tmp_path):
+    """The repo-wide sweep (test_cockpit_anchor_reset) now scans levain/dream/ too; this names each string the hand-start
+    work added, so it is parsed whichever way that sweep goes: the verb's own refusals, the window remedies for every
+    class, the card remedies (a bare `levain dream rollback ...` is the whole remedy, not backticked) and the end texts."""
+    classes = ["failed", "laptop-slept", "attempt-spent", "wrap-open", "baton", "ceiling", "in-flight", "unreadable",
+               "unknown", "live-seat", "consolidated-today"]
+    texts = [da.window_remedy(c, _STORE) for c in classes]
+    texts += [cd.remedy_for(k, "oc-1", store_dir=tmp_path) for k in ("failed", "consolidated", "rolled-back")]
+    texts.append(cd.remedy_for("did-not-consolidate", "window w:x", store_dir=tmp_path))
+    texts += [st._after_end("oc-1", left, "hand_start_unclassified", "why") for left in ("stopped", "admitted", "launched", "x")]
+    (tmp_path / "rig").mkdir()
+    rig = _live_rig(tmp_path / "rig")
+    with rig.store.write() as c:
+        c.execute("UPDATE agents SET operation = 'paused' WHERE agent_id = ?", (rig.agent,))
+    texts.append(_go(rig)[0].text)
+    seen: set[str] = set()
+    for text in texts:
+        cmds = _cmds(text) + ([text.strip()] if text.strip().startswith("levain ") else [])
+        for c in cmds:
+            levain_cli.build_parser().parse_args(shlex.split(c)[1:])
+            seen.add(" ".join(c.split()[:3]))
+    for printed in ("levain dream start", "levain agents show", "levain agents resume", "levain dream recover",
+                    "levain dream rollback"):
+        assert printed in seen, (printed, sorted(seen))
+
+
 def test_the_window_remedy_docstring_no_longer_says_no_verb_starts_a_dream_by_hand():
     assert "There is NO verb that starts a dream by hand" not in " ".join(da.window_remedy.__doc__.split())
 
