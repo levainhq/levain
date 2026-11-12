@@ -4249,6 +4249,7 @@ def _refresh_activation(
         before_bad = _hook_name_mismatches(now)
         coupled_hold = {r: m for r, m in _hook_name_mismatches(after).items() if m != before_bad.get(r)}
     written_hooks: list[tuple[str, Path, bytes | None]] = []
+    hook_failed: str | None = None   # the key of the first write that failed once the hook set was in motion
     for rel, (want, src) in sorted(expected.items()):
         if rel in unreadable:
             out.review.append(f"activation/{rel}")
@@ -4297,6 +4298,18 @@ def _refresh_activation(
                          f"{where}. Merge it in, or copy it over yours if you never edited "
                          f"it. Listed once: the next update is quiet about it.")
             continue
+        if hook_failed is not None and rel in moving_hooks:
+            # the set is one transaction: a file failed and the ones before it were put back, so none after it is written
+            out.review.append(key)
+            where = install.joinpath(*PENDING_REL, *key.split("/"))
+            if apply:
+                try:
+                    where = _put_pending(install, key, want)
+                except OSError as e:
+                    lines.append(f"  {key}: could not stage the package's version ({e}).")
+            lines.append(f"  {key}: not refreshed, because the hook files move together and {hook_failed} could not be "
+                         f"written. The package's version is at {where}; the next `levain update` retries the set.")
+            continue
         out.refreshed.append(key)
         if not apply:
             continue
@@ -4318,6 +4331,8 @@ def _refresh_activation(
             out.refreshed.pop()
             out.review.append(key)
             lines.append(f"  {key}: could not be written ({e}).")
+            if rel in moving_hooks or written_hooks:
+                hook_failed = key                # every moving hook after this one is held (the branch above)
             # the hook files are one set: the ones already replaced go back, or the set is mixed
             for done_rel, done_target, before in reversed(written_hooks):
                 try:

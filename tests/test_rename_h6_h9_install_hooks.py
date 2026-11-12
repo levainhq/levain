@@ -601,3 +601,36 @@ def test_a_hook_that_cannot_be_written_puts_the_others_back(old_install, scratch
     for rel in COUPLED:
         assert receipt_after[rel] == receipt_before[rel], rel
     _coherent(old_install, scratch)
+
+
+@pytest.mark.parametrize("failing_name", HOOK_FILES)
+def test_a_failed_hook_write_holds_every_remaining_hook_whichever_file_fails(old_install, scratch, monkeypatch,
+                                                                              failing_name):
+    """The hook set moves as ONE transaction (ruling H9): the first moving file that cannot be written puts the ones
+    already written back AND stops the rest from being written, so the first, a middle and the last file failing all end
+    on the all-old set (1111-32 L3 round 1: the loop used to go on and write the files after the failure)."""
+    hooks = old_install / "activation" / "hooks"
+    before = {n: (hooks / n).read_bytes() for n in HOOK_FILES}
+    receipt_before = json.loads(activation_receipt_path(old_install).read_text())["files"]
+    real = install_mod._atomic_write_bytes
+
+    def failing(target, data, *, like=None):
+        if Path(target).name == failing_name and data != before[failing_name]:
+            raise OSError(28, "No space left on device")
+        return real(target, data, like=like)
+
+    with monkeypatch.context() as m:
+        m.setattr(install_mod, "_atomic_write_bytes", failing)
+        out, text = _update(old_install)
+    for n in HOOK_FILES:
+        assert (hooks / n).read_bytes() == before[n], f"{n} is not the old generation after {failing_name} failed"
+    failed_at = HOOK_FILES.index(failing_name)
+    for n in HOOK_FILES[failed_at:]:   # the failed file and every one held behind it are listed for review
+        assert f"activation/hooks/{n}" in out.review, (n, out.review)
+    for rel in COUPLED:
+        assert f"activation/{rel}" not in out.refreshed, (rel, out.refreshed)
+    assert "could not be written" in text and "together" in text, text
+    receipt_after = json.loads(activation_receipt_path(old_install).read_text())["files"]
+    for rel in COUPLED:
+        assert receipt_after[rel] == receipt_before[rel], rel
+    _coherent(old_install, scratch)
