@@ -284,7 +284,15 @@ _CANCEL_FAILED = (
 )
 
 
-def _orphan_is_stale(started: object, bound: float | None) -> bool:
+def _orphan_horizon(bound: float | None) -> float:
+    """The age, in seconds, at which an in-progress wrap counts as stale under ``bound``: the bound plus the hard-exit
+    grace plus the margin, or :data:`_ORPHAN_FALLBACK_SECONDS` when the consolidate is unbounded. The one place the
+    number is computed; :func:`_orphan_is_stale` and the dream's admission both read it."""
+    return (bound + HARD_EXIT_GRACE_SECONDS + _ORPHAN_MARGIN_SECONDS) if bound else _ORPHAN_FALLBACK_SECONDS
+
+
+def _orphan_is_stale(started: object, bound: float | None, *, floor: float | None = None,
+                     now: object = None) -> bool:
     """Is an in-progress wrap old enough that no live writer could still legitimately hold it?
 
     **THE SECOND HALF OF THE AUTO-DISCARD'S SAFETY ARGUMENT, and it exists because the first half is
@@ -304,6 +312,11 @@ def _orphan_is_stale(started: object, bound: float | None) -> bool:
     Fails SAFE in every ambiguous direction: an unparseable or absent timestamp returns ``False``
     (refuse to discard), because the cost of skipping one consolidate is a delayed wrap, and the cost
     of a wrong discard is destroying someone's live work.
+
+    ``floor`` (seconds) can only RAISE the horizon, never lower it: a wrap is stale only when it is past the bound's
+    horizon AND past ``floor``. The dream's admission passes the operator's age floor for a wrap the dream did not
+    open (D1-O); the executor passes none. ``now`` is the clock to judge against (default: the real one); admission
+    passes its own so ``levain dream ready --now`` judges against the time it was asked about.
     """
     from datetime import datetime, timezone
 
@@ -311,13 +324,16 @@ def _orphan_is_stale(started: object, bound: float | None) -> bool:
         return False
     # A bound of None (explicitly unbounded) has no natural staleness horizon, so fall back to a
     # conservative fixed one rather than inventing a smaller number from nothing.
-    horizon = (bound + HARD_EXIT_GRACE_SECONDS + _ORPHAN_MARGIN_SECONDS) if bound else _ORPHAN_FALLBACK_SECONDS
+    horizon = _orphan_horizon(bound)
+    if floor is not None:
+        horizon = max(horizon, floor)
     try:
         text = str(started).replace("Z", "+00:00")
         ts = datetime.fromisoformat(text)
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        clock = now if isinstance(now, datetime) else datetime.now(timezone.utc)
+        age = (clock - ts).total_seconds()
     except (ValueError, TypeError) as exc:
         _log.debug("orphan staleness undecidable (%s): %s", type(exc).__name__, exc)
         return False
