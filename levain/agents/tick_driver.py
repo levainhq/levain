@@ -490,7 +490,8 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
     the dream's own admission hook, ``levain.dream.agent.install_on_input``, PASSED as the hook) and then
     ``controller.spawn_fire``. The one argument that differs from the hand start's is the window: a scheduled row counts
     the manual runs inside the night its own ``window_key`` names (``schedule.window_span`` in the signed trigger's zone),
-    where a hand start counts its local day (``levain.dream.start.window_for``). Nothing in the launch is decided here: the
+    where a hand start counts what ``accounting.count_span`` of its instant names (``levain.dream.start.window_for``):
+    the same night when it launches inside one, else its daytime. Nothing in the launch is decided here: the
     controller answers, and what it answers is acted on as the hand-start verb acts on it, except where the tick can do
     better than the verb:
 
