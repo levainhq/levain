@@ -47,7 +47,13 @@ The six checks, each mapped from flow's ``dream.py`` ``gate``:
   anneal downgrades a ``prepare_wrap`` under any other id, or none, to capture-only, and check 2 refuses a dream
   while the baton is anyone else's. A store created by ``levain init`` has the policy; a store without it is named in
   check 5's detail when seats are live, never refused on (for a Levain seat the policy changes nothing).
-* *Check 2 still refuses an open wrap.* A seat that is itself mid-wrap is a wrap in progress, not a live seat.
+* *Check 2 still refuses an open wrap,* except one the executor's own age rule proves dead (D1-O, Phill's Q4 (a)). A
+  seat that is itself mid-wrap is a wrap in progress, not a live seat. Admission calls the executor's age function
+  (``levain.wrap._orphan_is_stale``, with the bound ``executor.DREAM_BUDGET_S``) and discards nothing: the executor
+  needs ``wrap.lock`` and stays the only judge that acts. A wrap the dream's own occurrence recorded (its
+  ``progress.json`` names the token) passes on that bound alone. A wrap the dream did not open, a seat's, passes only
+  while the operator has set the age floor (``orphan_floor_s``, the install fact ``orphan_floor_hours``; it ships UNSET,
+  and unset is the old behaviour: refuse), and only past both the bound and the floor, which can only raise the age.
 """
 from __future__ import annotations
 
@@ -140,6 +146,12 @@ class Sources:
     sessions: Callable[[], Sequence[str]]
     #: notes appended to the check details for sources that were not given (the verb's bare-copy mode)
     absent: tuple[str, ...] = ()
+    #: D1-O. ``(token, started_at)`` of the wrap now open, read the way the executor reads it
+    #: (``levain.wrap._observe_prior_wrap``); ``None`` (not given) means an open wrap can never be judged dead here
+    open_wrap: Callable[[], tuple[str | None, str | None]] | None = None
+    #: D1-O. ``{wrap token: occurrence id}`` of the wraps this agent's own occurrences recorded in their
+    #: ``progress.json``: how a wrap is known to be the dream's own (a dead seat's is not in it)
+    dream_wraps: Callable[[], Mapping[str, str]] | None = None
 
 
 # ------------------------------------------------------------------------------------------------------- time helpers
@@ -245,19 +257,102 @@ def _check1(src: Sources, agent: str, key: str, day: date, zone: str, now: datet
     return Check(1, name, "pass", f"no done occurrence for dream-day {day}; {len(launched)} launched")
 
 
-def _check2(src: Sources) -> Check:
+OPEN_WRAP_REFUSAL = ("a wrap is open on the store: the dream does not start while one is open, a dead seat's included, "
+                     "and nothing on this path clears it (anneal's wrap-status and wrap-cancel do)")
+
+
+def executor_orphan_bound_s() -> float:
+    """The bound the executor judges an orphan wrap against: ``max_seconds`` of the scheduled consolidate
+    (``executor.DREAM_BUDGET_S``, the number ``fire_factory`` passes). Read from the executor, never copied."""
+    from levain.dream import executor as ex
+
+    return float(ex.DREAM_BUDGET_S)
+
+
+def executor_orphan_horizon_s() -> float:
+    """The age at which the executor's own rule (``levain.wrap._orphan_is_stale``) calls an open wrap dead: that bound
+    plus the hard-exit grace plus the margin. The lowest age floor that can mean anything."""
+    from levain import wrap as _w
+
+    return float(_w._orphan_horizon(executor_orphan_bound_s()))
+
+
+def _minutes(seconds: float) -> str:
+    return f"{seconds / 60:.1f} min"
+
+
+def _hours(seconds: float) -> str:
+    return f"{seconds / 3600:g} h"
+
+
+def _orphan_proof(src: Sources, now: datetime, floor_s: float | None) -> tuple[bool, str]:
+    """May admission pass the open wrap, and the words for either answer (D1-O; Phill's Q4 (a)).
+
+    **Admission judges nothing of its own.** It calls the executor's age function (``levain.wrap._orphan_is_stale``,
+    the one ``consolidate_store`` calls with the same bound) on the start time the executor itself reads
+    (``_observe_prior_wrap``), and it discards nothing: the executor, which takes ``wrap.lock`` first, is the only code
+    that acts, and it judges again when it runs. Two judges would drift.
+
+    * a wrap the dream's own occurrence recorded (``progress.json`` names its token): dead when the executor's age
+      function says so under the executor's own bound. No number of the operator's is needed.
+    * a wrap the dream did NOT open (a seat's: its honest wrap can last longer than the dream's bound): dead only when
+      the operator has set an age floor AND the same function says so with that floor, which can only raise the horizon.
+      No floor set: never (today's behaviour).
+
+    Every failure to judge (a source missing, a read that raised, a start time that will not parse) is "not dead"."""
+    from levain import wrap as _w
+
+    if src.open_wrap is None:
+        return False, "this reading cannot see the open wrap's age, so nothing here can prove it dead"
+    try:
+        token, started = src.open_wrap()
+    except Exception as exc:  # noqa: BLE001 — a wrap that cannot be read is not proven dead
+        return False, f"the open wrap could not be read ({type(exc).__name__}: {str(exc)[:120]}), so it is not proven dead"
+    mine: Mapping[str, str] = {}
+    if src.dream_wraps is not None:
+        try:
+            mine = src.dream_wraps()
+        except Exception:  # noqa: BLE001 — no attribution is the stricter path
+            mine = {}
+    bound = executor_orphan_bound_s()
+    horizon = executor_orphan_horizon_s()
+    occ = mine.get(token) if token else None
+    if occ is not None:
+        if _w._orphan_is_stale(started, bound, now=now):
+            return True, (f"the dream's own wrap (occurrence {occ} recorded its token), started {started}, is past the "
+                          f"executor's age bound of {_minutes(horizon)}: proven dead; the run clears it and consolidates")
+        return False, (f"it is the dream's own wrap (occurrence {occ}), started {started}, and is not yet provably dead: "
+                       f"younger than the executor's age bound of {_minutes(horizon)}")
+    if floor_s is None:
+        return False, ("orphan healing is off for a wrap the dream did not open: no age floor is set "
+                       "(`levain dream enable --store-dir <dir> --orphan-floor-hours <hours>` sets one)")
+    effective = max(floor_s, horizon)
+    if _w._orphan_is_stale(started, bound, floor=floor_s, now=now):
+        return True, (f"a wrap the dream did not open, started {started}, is past both the executor's age bound of "
+                      f"{_minutes(horizon)} and the operator's floor of {_hours(floor_s)}: proven dead; the run clears "
+                      "it and consolidates")
+    return False, (f"a wrap the dream did not open, started {started}, is not yet provably dead: it must be older than "
+                   f"{_hours(effective)} (the operator's floor is {_hours(floor_s)}, the executor's bound "
+                   f"{_minutes(horizon)}); its seat may still be alive")
+
+
+def _check2(src: Sources, now: datetime, floor_s: float | None) -> Check:
     name = "baton free, no open wrap"
+    healed = ""
     if _guard(src.wrap_open, "the wrap state"):
-        return Check(2, name, QUIET, "a wrap is open on the store: the dream does not start while one is open, a dead "
-                                     "seat's included, and nothing on this path clears it (anneal's wrap-status and "
-                                     "wrap-cancel do)", "wrap-open")
+        dead, note = _orphan_proof(src, now, floor_s)
+        if not dead:
+            return Check(2, name, QUIET, f"{OPEN_WRAP_REFUSAL} | {note}", "wrap-open")
+        healed = f"an open wrap is proven dead ({note}); "
     if not _guard(src.requires_baton, "the baton policy"):
-        return Check(2, name, "pass", "no wrap open; the store does not require the baton")
+        return Check(2, name, "pass", healed + "the store does not require the baton" if healed
+                     else "no wrap open; the store does not require the baton")
     holder = _guard(src.baton_holder, "the baton")
     if holder != SESSION_ID:
         return Check(2, name, QUIET, f"the baton is {'held by ' + repr(holder) if holder else 'unheld'}, not by "
                                      f"{SESSION_ID!r}", "baton")
-    return Check(2, name, "pass", f"no wrap open; the baton is held by {SESSION_ID!r}")
+    return Check(2, name, "pass", f"{healed}the baton is held by {SESSION_ID!r}" if healed
+                 else f"no wrap open; the baton is held by {SESSION_ID!r}")
 
 
 def _check3(src: Sources, agent: str, key: str, day: date, zone: str) -> Check:
@@ -355,15 +450,18 @@ def _check6(src: Sources, agent: str, key: str, manual: bool) -> Check:
 
 
 def evaluate(src: Sources, *, day: date, now: datetime, zone: str, agent_id: str = "dream",
-             manual: bool = False) -> Verdict:
-    """Run all six checks for dream-day ``day`` at ``now`` and return the verdict. Never raises for a bad source."""
+             manual: bool = False, orphan_floor_s: float | None = None) -> Verdict:
+    """Run all six checks for dream-day ``day`` at ``now`` and return the verdict. Never raises for a bad source.
+
+    ``orphan_floor_s`` is the operator's age floor (seconds) for an open wrap the dream did not open (D1-O, check 2);
+    ``None`` is the shipped state: such a wrap keeps the dream quiet, as it always did."""
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
     ZoneInfo(zone)
     key = window_key_for(day)
     jobs: list[tuple[int, str, Callable[[], Check]]] = [
         (1, "not already dreamed", lambda: _check1(src, agent_id, key, day, zone, now, manual)),
-        (2, "baton free, no open wrap", lambda: _check2(src)),
+        (2, "baton free, no open wrap", lambda: _check2(src, now, orphan_floor_s)),
         (3, "no consolidate yet for the day", lambda: _check3(src, agent_id, key, day, zone)),
         (4, "something to consolidate", lambda: _check4(src)),
         (5, CHECK5_NAME, lambda: _check5(src)),
@@ -424,6 +522,29 @@ def _awake_threads(coord_dir: Path, now: datetime) -> list[str]:
     return [str(t) for t in threads]
 
 
+def _dream_wraps(root: Path) -> dict[str, str]:
+    """``{wrap token: occurrence id}`` for every occurrence directory under ``root`` (``<store dir>/dream``) whose
+    ``progress.json`` names a wrap token: the wraps the dream's own runs opened. A directory or file that cannot be read,
+    is a link, or is not the record's shape names nothing, which leaves its wrap unattributed (the stricter path)."""
+    out: dict[str, str] = {}
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return out
+    for d in children:
+        path = d / "progress.json"
+        try:
+            if d.is_symlink() or not d.is_dir() or path.is_symlink() or not path.is_file():
+                continue
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        token = doc.get("wrap_token") if isinstance(doc, dict) else None
+        if isinstance(token, str) and token:
+            out[token] = d.name
+    return out
+
+
 def sources_for(store_path: Path | str, *, agent_dir: Path | str | None = None, coord_dir: Path | str | None = None,
                 now: datetime | None = None) -> tuple[Sources, Callable[[], None]]:
     """The real sources for the store at ``store_path``, and a ``close`` to call when done. The store is opened
@@ -459,6 +580,13 @@ def sources_for(store_path: Path | str, *, agent_dir: Path | str | None = None, 
     def other_sessions() -> list[str]:
         return [s["session_id"] for s in sessions.live_sessions(store.continuity_path) if s["session_id"] != SESSION_ID]
 
+    def open_wrap() -> tuple[str | None, str | None]:
+        from levain import wrap as _w
+
+        return _w._observe_prior_wrap(store)           # the token and start time the executor reads, the token first
+
+    occurrence_root = Path(store_path).expanduser().parent / "dream"
+
     src = Sources(
         occurrences=(lambda: _read_occurrences(agent)) if agent is not None else (lambda: []),
         wrap_open=lambda: bool(store.get_wrap_started_at()),
@@ -469,5 +597,7 @@ def sources_for(store_path: Path | str, *, agent_dir: Path | str | None = None, 
         launches=launches,
         awake_threads=(lambda: _awake_threads(coord, now)) if coord is not None else (lambda: []),
         sessions=other_sessions,
-        absent=tuple(absent))
+        absent=tuple(absent),
+        open_wrap=open_wrap,
+        dream_wraps=lambda: _dream_wraps(occurrence_root))
     return src, store.close
