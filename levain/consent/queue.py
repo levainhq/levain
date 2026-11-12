@@ -658,7 +658,10 @@ def queue_dir_for(environ: Mapping[str, str]) -> Path:
 
 def default_queue_dir() -> Path:
     """:func:`queue_dir_for` this process's environment. Not for the core path: the hook entry points call
-    :func:`queue_dir_for` with the environment they bound."""
+    :func:`queue_dir_for` with the environment they bound. Refuses the fallback home in a test run or a scratch run
+    (:mod:`levain.home_guard`)."""
+    from levain.home_guard import refuse_real_home_fallback
+    refuse_real_home_fallback("the consent directory")
     return queue_dir_for(os.environ)
 
 

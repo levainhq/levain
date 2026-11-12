@@ -38,6 +38,8 @@ BACKUP_NAME = "settings.json" + BACKUP_SUFFIX     # the user's settings.json's b
 def levain_home(override: Path | str | None = None) -> Path:
     if override is not None:
         return Path(override).expanduser()
+    from levain.home_guard import refuse_real_home_fallback
+    refuse_real_home_fallback("the levain home `desk move-home` renames under")
     env = os.environ.get("LEVAIN_HOME")
     return Path(env).expanduser() if env else Path.home() / ".levain"
 
