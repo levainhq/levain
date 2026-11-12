@@ -3,8 +3,9 @@
 Recovery reads ``progress.json`` and anneal's wrap history. **The commit oracle is anneal's completed wrap id and its
 content hash, never the live file's sha**: a crash in anneal's save leaves the wrap committed and the live text
 unchanged, and once the lock is released another writer can change the live file. The hash is the plain sha256 of the
-saved text, stored in ``wraps.content_hash``; the executor wrote the same value to ``progress.json`` as
-``composed_sha256`` before it saved.
+text anneal saved, stored in ``wraps.content_hash``. The journal's ``composed_sha256`` is the hash of the text the
+dream composed; the two are equal unless anneal's durable-facts step changed the text at the save (a re-inserted or a
+dropped durable line).
 
 The occurrence's own state (``launched`` with a lapsed lease, ``stopped``) belongs to the supervisor, so it is an input
 here and the result says what the occurrence should END as; this module never writes an occurrence row. It cancels
