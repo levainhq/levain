@@ -138,9 +138,18 @@ def record_path() -> Path:
 def _record_paths() -> list[Path]:
     """Where the door reads records and :func:`record` writes them: :func:`record_path`, and the same file under the
     account's own home from the password database, so a process started with another ``$LEVAIN_HOME`` or ``$HOME``
-    (or none) reads the same record (a workspace is recorded when either names it)."""
+    (or none) reads the same record (a workspace is recorded when either names it).
+
+    In a test run or a scratch run that second copy is left out unless its home is the suite's vouched scratch
+    (:func:`levain.home_guard.vouched_scratch`): ``$LEVAIN_HOME`` never moves it, so a scratch run that set a scratch
+    home as the guard asks would otherwise still add its temp workspaces to the operator's real, add-only record.
+    Left out rather than refused: the first copy is the run's own record and the door still has one to read."""
+    from levain import home_guard
+
     paths = [record_path()]
     own = _own_home()
+    if own is not None and home_guard.guarded_run() is not None and not home_guard.vouched_scratch(own):
+        own = None
     if own is not None:
         other = _resolved(own / ".levain" / "consent" / RECORD_NAME)
         if other != paths[0]:
