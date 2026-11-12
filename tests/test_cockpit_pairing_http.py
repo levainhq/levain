@@ -95,7 +95,10 @@ def quick_wait(monkeypatch: pytest.MonkeyPatch) -> None:
 def _standby(src: SubstrateSource) -> Iterator[tuple[int, int, str, Any]]:
     """A live serve and a second serve on the SAME ledger (its broker STANDBY: the first holds cockpit.lock), plus
     a device token paired on the live one: (live port, standby port, device token, standby httpd)."""
-    with _serve(src) as (live, _a):
+    with _serve(src) as (live, a):
+        # start the live broker synchronously: the pairing call below must not depend on a settle wait (under
+        # quick_wait a still-ACTIVATING broker answers the offer 503 on a loaded runner)
+        assert a.broker.start() is Lifecycle.ACTIVE
         _dev, tok = _pair(live)
         with _serve(src) as (other, b):
             assert b.broker.start() is Lifecycle.STANDBY
