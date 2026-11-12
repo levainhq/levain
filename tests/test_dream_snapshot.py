@@ -421,8 +421,10 @@ def test_the_drill_skips_the_restore_when_the_live_store_is_past_the_dream(scrat
     two_dreams(scratch)
     (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')
     res = sn.drill(scratch, scratch.parent / "dream")
-    assert res.outcome == "ok" and [s["status"] for s in res.steps] == ["ok", "ok", "skipped", "skipped"]
+    # 1112-1 (F10): a drill whose restore was skipped is not a pass; it is its own outcome
+    assert res.outcome == "skipped" and [s["status"] for s in res.steps] == ["ok", "ok", "skipped", "skipped"]
     assert "foreign-write" in res.steps[2]["detail"]
+    assert sn.last_drill(scratch.parent / "dream")["outcome"] == "skipped"
 
 
 def test_a_fresh_install_has_no_snapshot_yet_which_is_not_a_failure(scratch):
@@ -440,6 +442,32 @@ def test_drill_due_reads_the_cadence(tmp_path):
     assert not sn.drill_due(root, now + dt.timedelta(days=6)) and sn.drill_due(root, now + dt.timedelta(days=7, seconds=1))
     sn._write_json(root / sn.DRILL_RECORD, {"outcome": "ok", "at": "garbage"})
     assert sn.drill_due(root)
+
+
+def test_1112_1_a_snapshot_with_no_post_save_record_is_a_skipped_drill_not_a_pass(scratch):
+    two_dreams(scratch)
+    m = sn.read_manifest(occ(scratch, "o2"))
+    m["post_files"], m["wrap_id"] = None, None
+    sn._write_manifest(occ(scratch, "o2"), m)
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "skipped" and [s["status"] for s in res.steps] == ["ok", "ok", "skipped", "skipped"]
+
+
+def test_1112_1_a_skipped_drill_after_a_failed_one_carries_the_failure_forward(scratch):
+    two_dreams(scratch)
+    root = scratch.parent / "dream"
+    bk = occ(scratch, "o2") / "snap" / sn.DB_BACKUP
+    good = bk.read_bytes()
+    bk.write_bytes(good[:-100] + b"\0" * 100)
+    assert sn.drill(scratch, root).outcome == "failed"
+    bk.write_bytes(good)
+    (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')              # a seat wrote since the dream
+    res = sn.drill(scratch, root)
+    assert res.outcome == "skipped"
+    assert "hash" in sn.last_drill(root)["carried_failure"]                        # the failed record is not lost
+    assert sn.drill(scratch, root).as_dict()["carried_failure"] == sn.last_drill(root)["carried_failure"]
+    (scratch.parent / "memory.crystal.json").unlink()                              # and a real pass drops it
+    assert sn.drill(scratch, root).outcome == "ok" and "carried_failure" not in sn.last_drill(root)
 
 
 # ------------------------------------------------------------------------------------------------------------ the verbs
@@ -461,6 +489,16 @@ def test_the_verbs_roll_back_and_drill_a_store_copy(scratch, capsys):
     assert dcli.run_dream_rollback(_args(occurrence="o2", store_dir=d, who="cli", json=False)) == 0
     assert "already-reverted" in capsys.readouterr().out
     assert dcli.run_dream_rollback(_args(occurrence="nope", store_dir=d, who="cli", json=False)) == 2
+
+
+def test_1112_1_the_drill_verb_says_skipped_and_exits_non_zero_when_the_restore_was_not_exercised(scratch, capsys):
+    two_dreams(scratch)
+    (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')
+    capsys.readouterr()
+    assert dcli.run_dream_drill(_args(store_dir=str(scratch.parent), root=None, json=False)) == 3
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].startswith("levain dream drill: skipped") and "not a pass" in out.splitlines()[0]
+    assert "levain dream drill: ok" not in out
 
 
 def test_the_verbs_refuse_the_live_store_and_exist_in_the_parser(monkeypatch, tmp_path, capsys):
@@ -544,7 +582,7 @@ def test_m5_the_drill_after_a_real_rollback_skips_instead_of_failing(scratch):
     two_dreams(scratch)
     assert sn.rollback(scratch, occ(scratch, "o2")).ok
     res = sn.drill(scratch, scratch.parent / "dream")
-    assert res.outcome == "ok" and [s["status"] for s in res.steps] == ["ok", "ok", "skipped", "skipped"]
+    assert res.outcome == "skipped" and [s["status"] for s in res.steps] == ["ok", "ok", "skipped", "skipped"]
     assert "already-reverted" in res.steps[2]["detail"]
 
 
