@@ -594,7 +594,7 @@ Every top-level `levain` verb, each with the one line `levain --help` gives it. 
 | `levain envelope` | Thread envelopes: what the desk may do for a thread, signed by you. |
 | `levain observe` | Observe-mode PermissionRequest logger: aggregate counts only, answers nothing. |
 | `levain agents` | Named agents on the autonomic store (the store check, then one verb per act; see `levain agents --help`). |
-| `levain dream` | Dreaming: run on a store copy; rollback, recover and drill. |
+| `levain dream` | Dreaming: run on a store copy; ready, rollback, recover, drill, shadow; enable the scheduled dream. |
 | `levain run` | Run a sovereign entity as an interactive partner on an open model. |
 | `levain wrap` | Consolidate a sovereign entity's memory — metabolize its episodes into felt memory. |
 | `levain serve` | Serve the substrate dashboard as a local web-app (localhost). |
