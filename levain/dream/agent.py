@@ -1863,8 +1863,16 @@ def fire_factory(store: Any, occurrence_id: str, launch_epoch: int) -> dict[str,
 
     executor = ex.DreamExecutor(agent_store_dir=store.directory, occurrence_id=occurrence_id, occ_dir=occ_dir,
                                 route="claude", model=inst.model, facts_path=inst.facts_path)
-    sup = supervise.Supervisor(store, authority=AgentAuthority(inst.cockpit_root),
-                               hooks=supervise.Hooks(verify=verify))
+    authority = AgentAuthority(inst.cockpit_root)
+    sup = supervise.Supervisor(store, authority=authority, hooks=supervise.Hooks(verify=verify))
+    # A fire is a fresh process: its authority holds no replay until one is taken, so the first fence read would refuse
+    # ("no verified replay is held"), log the journal's warning as line 1 of every night, and only then be refreshed
+    # and retried by the supervisor. Replay once here instead. A refresh that fails is left to the supervisor exactly
+    # as before: nothing is held, the first fence read is UNCLASSIFIED, its one refresh fails, the effect waits.
+    try:
+        authority.refresh()
+    except Exception as exc:  # noqa: BLE001 - the failure is the supervisor's to meet again and report
+        _log.debug("dream fire: the authority pre-refresh failed (%s): %s", type(exc).__name__, exc)
 
     def consolidate() -> Any:
         on_snapshot, on_saved = _snap.hooks()

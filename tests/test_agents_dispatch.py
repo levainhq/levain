@@ -442,6 +442,56 @@ def test_fire_factory_binds_a_consolidate_that_handles_a_stop(tmp_path, monkeypa
     assert seen["handle_stop"] is True
 
 
+# 1112-1 (board 1693): a fire is a fresh process whose AgentAuthority never replayed the log, so the first fence read
+# raised AgentCoverMoved("no verified replay is held") and line 1 of every fire's log was the journal's warning about it.
+
+def _real_authority_fire(tmp_path, monkeypatch):
+    """A launched dream occurrence whose install names the rig's own cockpit root (the signed link's log), and the
+    keyword arguments the production factory builds for it; nothing composes."""
+    from levain.dream import executor as _ex
+    monkeypatch.setattr(_ex, "DreamExecutor", lambda **kw: object())
+    rig = Rig(tmp_path)
+    rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
+    rig.link()
+    oid = rig.claim("k")
+    assert rig.launch(oid).outcome == "launched"
+    da.write_install(rig.store.directory, **{**_facts(tmp_path), "cockpit_root": rig.world.root})
+    kw = da.fire_factory(rig.store, oid, 0)
+    kw["sup"]._clock = rig.now      # the rig's links are dated on its fake clock; the factory's supervisor reads the wall
+    return rig, oid, kw
+
+
+def test_a_dream_fires_log_does_not_open_with_the_cold_start_cover_warning(tmp_path, monkeypatch, caplog):
+    # behaviour: the fire's own fresh authority holds a verified replay before the first fence read, so the journal's
+    # "risk fence ... unreadable (AgentCoverMoved)" line no longer heads every night's log; the run still ends done
+    rig, oid, kw = _real_authority_fire(tmp_path, monkeypatch)
+    ran = []
+    sup = kw.pop("sup")
+    with caplog.at_level("WARNING"):
+        rep = da.run_body(sup, oid, 0, **{**kw, "executor": Ex(), "consolidate": lambda: ran.append(1) or {"outcome": "empty"}})
+    assert "unreadable (AgentCoverMoved)" not in caplog.text, caplog.text
+    assert ran == [1] and rep.state == "done" and rep.code == 0, (rep, caplog.text)
+    assert rig.row(oid)["state"] == "done"
+
+
+def test_a_fire_whose_authority_log_cannot_be_read_still_ends_unclassified_and_launched(tmp_path, monkeypatch, caplog):
+    # behaviour: the refresh the factory tries fails too (the authority anchor is unreadable), so nothing changes from before:
+    # the effect is UNCLASSIFIED and never runs, the supervisor's one refresh fails, the row stays launched, exit 1
+    rig, oid, kw = _real_authority_fire(tmp_path, monkeypatch)
+    from levain import authority as _auth
+    anchor = _auth.anchor_path(rig.world.root)
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.write_bytes(b"not an anchor")
+    ran = []
+    sup = kw.pop("sup")
+    with caplog.at_level("WARNING"):
+        rep = da.run_body(sup, oid, 0, **{**kw, "executor": Ex(), "consolidate": lambda: ran.append(1) or {"outcome": "empty"}})
+    assert ran == [] and rep.code == 1 and rep.state == "launched" and "unclassified" in rep.note
+    assert rig.row(oid)["state"] == "launched"
+    assert "unreadable (AgentCoverMoved)" in caplog.text            # the journal still fails closed, and says so
+    assert caplog.text.count("the authority refresh failed") == 1    # the supervisor's own one refresh, as before
+
+
 def test_an_ordinary_agent_gets_no_hook_whatever_its_role_row_holds_and_a_mismatch_still_does(rig, monkeypatch):
     # behaviour: the default hook reads only the signed name; an unreadable role row never gives a non-dream agent the
     # raising hook (it launches as before); a signed-name mismatch still gets the raising one
