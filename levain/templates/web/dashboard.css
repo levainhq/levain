@@ -2456,6 +2456,12 @@ body.ke .panel[data-ck-panel="loops"] .row[data-intention] { scroll-margin-top: 
   .tv-task, .tv-outs, .tv-more { grid-column: var(--tv-c); grid-row: var(--tv-r); }
   .tv-more { justify-self: start; }
   .tv-no-tasks { grid-column: 2; grid-row: 2; }
+  /* nothing waits on him in a live read (the band says what does): the first column gives its width back, as the outcomes' does */
+  .tv-work.tv-nowait { grid-template-columns: minmax(0, 1fr) minmax(200px, 280px); }
+  .tv-work.tv-nowait.tv-noouts { grid-template-columns: minmax(0, 1fr); }
+  .tv-nowait .tv-colh1 { grid-column: 1; }
+  .tv-nowait .tv-colh2 { grid-column: 2; }
+  .tv-nowait .tv-no-tasks { grid-column: 1; }
 }
 /* the Agents lens: the graph as the F12 mock draws it. The SVG carries every node, ring, edge and face; a canvas under it carries only the particle streams. */
 .tv-agents { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }

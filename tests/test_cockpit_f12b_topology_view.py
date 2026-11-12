@@ -75,17 +75,18 @@ def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, mo
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     _intention(root)
     probe = ("JSON.stringify({lens: %s.dataset.lens, recs: %s.querySelectorAll('.tv-wl .tv-rec').length, "
+             "waiting_col: [...%s.querySelectorAll('.tv-colh0, .tv-wl')].some(e => !e.hidden), "
              "strip: [...%s.querySelectorAll('.tv-stat')].map(s => s.dataset.k + '=' + s.textContent.replace(/\\s+/g, ' ')), "
              "cols: %s.querySelectorAll('.tv-col').length, "
              "tasks: [...%s.querySelectorAll('.tv-task')].map(t => [t.dataset.state, t.dataset.kind, "
              "(t.querySelector('.tv-cost') || {textContent: ''}).textContent, [...t.querySelectorAll('.tv-chip')].map(c => c.textContent)]), "
-             "pressed: [...document.querySelectorAll('#ck-hlens .tv-seg [aria-pressed=true]')].map(b => b.textContent)})") % ((TV,) * 5)
+             "pressed: [...document.querySelectorAll('#ck-hlens .tv-seg [aria-pressed=true]')].map(b => b.textContent)})") % ((TV,) * 6)
     out = _run(tmp_path, src, [{"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
                                {"until": TV + " && " + TV + ".querySelector('.tv-task')"}, {"eval": probe}])
     got = json.loads(out[-1])
     assert got["lens"] == "work" and got["cols"] == 0, got                              # Work, not Agents
     assert got["pressed"] == ["Work"], got                                              # the header's switch says so
-    assert got["recs"] >= 1, got                                                        # the pending consents are records in the left column
+    assert got["recs"] == 0 and got["waiting_col"] is False, got                        # the live graph draws no "Waiting on you" records or column: the band lists them
     assert not any(t[1] in ("consent", "question") for t in got["tasks"]), got          # ... and not centre cards
     by = {t[1]: t for t in got["tasks"]}
     assert by["intention"][0] == "open" and by["intention"][2] == "cost not tracked" and by["intention"][3] == [], got   # an intention carries no session: open, never stuck
@@ -94,7 +95,7 @@ def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, mo
     # K10 S5 item 2 (67d28166): both live sessions have a readable tool log and no path is shared, so the provider OBSERVED no conflict and
     # says 0; "not tracked" is the null it sends only when live nodes exist and none has a log (test_conflicts_are_null_when_no_live_node_has_a_log)
     assert strip["conflicts"] == "0 conflicts" and strip["tokens"] == "0 tokens today", got   # the fixture transcripts spent nothing today: a real zero
-    assert list(strip) == ["tasks", "waiting", "tasks-waiting", "stuck", "open", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["open"] == "2 open", got
+    assert list(strip) == ["tasks", "stuck", "open", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["open"] == "2 open", got
 
 
 @needs_browser
@@ -147,16 +148,19 @@ def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_p
 
 
 @needs_browser
-def test_a_click_on_a_waiting_record_opens_the_card_it_waits_on(tmp_path, monkeypatch):
+def test_a_live_work_lens_has_no_waiting_record_to_click_so_the_band_is_the_only_place_to_answer(tmp_path, monkeypatch):
+    """The sessions fixture has a pending consent request, which the Needs strip lists. The live graph used to draw it again as a
+    clickable record in its own column; it is the strip's row alone now (the click path of a record a host sends is the next test)."""
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [
         {"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
-        {"until": TV + " && " + TV + ".querySelector('.tv-rec.tv-open')"},
-        {"eval": TV + ".querySelector('.tv-rec.tv-open').click(); 1"},
-        {"until": "document.querySelector('#ck-needs .needs-lit[data-needs-id^=consent]')"},      # K10 S3: the strip's card (Build: its chip) is lit, no modal
-        {"eval": "JSON.stringify([!document.querySelector('.modal-overlay'), document.querySelector('#ck-needs .needs-lit').className])"}])
-    assert "timeout" not in json.dumps(out[-2]), out
-    assert json.loads(out[-1])[0] is True, out
+        {"until": TV + " && " + TV + ".querySelector('.tv-task')"},
+        {"until": "document.querySelector('#ck-needs .needs-row[data-needs-id^=consent]') && 1", "ms": 30000},
+        {"eval": "JSON.stringify([" + TV + ".querySelectorAll('.tv-rec').length, " + TV + ".querySelectorAll('.tv-task.waiting').length, "
+                 "document.querySelectorAll('#ck-needs .needs-row[data-needs-id^=consent]').length])"}])
+    recs, waiting_tasks, strip_rows = json.loads(out[-1])
+    assert recs == 0 and waiting_tasks == 0, out                       # nothing on the graph ...
+    assert strip_rows == 1, out                                        # ... and the one row is where it always was
 
 
 # --- a literal value ---------------------------------------------------------------------------------------
@@ -239,12 +243,13 @@ def test_the_header_strip_counts_and_a_conflict_lists_its_file_and_both_sessions
              "conf: (%s.querySelector('.tv-conf') || {innerText: ''}).textContent})") % (TV, TV)
     out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": probe}])
     got = json.loads(out[-1])["strip"]
-    assert got == {"tasks": "6 tasks", "waiting": "1 waiting on you", "tasks-waiting": "2 tasks waiting", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
-                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead; "waiting on you" is waitingOnYou(v), the same figure the Agents lens shows (the fixture's one waiting task rides the waiting session n1, so it is one)
+    assert got == {"tasks": "6 tasks", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
+                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead; NO figure of what waits on him, though the fixture has waiting tasks and a waiting session: the band is the one place
     metrics = "JSON.stringify([...%s.querySelectorAll('.tv-metrics .tv-m')].map(m => m.dataset.k + '=' + m.firstChild.textContent))" % TV
     out = _run(tmp_path, src, [{"eval": _paint(_value(), "agents")}, {"eval": probe}, {"eval": metrics}])
     figs = json.loads(out[-1])
     assert figs[0].startswith("sessions=") and "tokens=2.4M" in figs, figs                               # the Agents lens draws the metrics block, not the count row
+    assert not [f for f in figs if f.startswith("waiting=")], figs                                       # ... and no waiting figure in it
     conf = json.loads(out[-2])["conf"]
     assert "money.py" in conf and "claude_code · ledgerline" in conf and "codex · tally" in conf
 

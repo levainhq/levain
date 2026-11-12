@@ -3728,10 +3728,10 @@ def _compact_value(kind: str, value: Any) -> Any:
     if kind == "brief":
         return {"headline": value.get("headline", "")}
     if kind == "topology":
-        # the phone draws no topology (F12_SPEC): the counts, and the full value one link away
+        # the phone draws no topology (F12_SPEC): the counts, and the full value one link away. No count of what waits on the
+        # operator: that is the band's, and a second copy of it can only disagree
         return {"as_of": value.get("as_of"), "nodes": len(value.get("nodes") or []),
-                "tasks": len(value.get("tasks") or []),
-                "waiting": sum(1 for t in value.get("tasks") or [] if t.get("state") == "waiting")}
+                "tasks": len(value.get("tasks") or [])}
     if kind == "board":
         # the same reduction: per-column counts and the queue's own state (never the cards), the full value one link away
         return {"queue": value.get("queue"), "note": value.get("note"), "unreadable": list(value.get("unreadable") or []),

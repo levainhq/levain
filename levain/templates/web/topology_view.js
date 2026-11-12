@@ -329,19 +329,11 @@
   }
 
   // ---- the header strip ----
-  // "waiting on you" is ONE figure from ONE function: every distinct thing he can answer, counted once. A session in state waiting is one; so is
-  // a waiting task that no waiting session carries (a seat-less ask arrives as a task with no workers), while a waiting task whose worker session
-  // is itself waiting is that same ask and adds nothing. Every lens's headline figure and the Work lens's empty sentence read it; the Work lens's
-  // own count of task records says "tasks waiting" and is never the headline.
-  const waitingOnYou = (v) => {
-    const nodes = arr(v.nodes), waitingIds = new Set(nodes.filter((n) => n.state === "waiting").map((n) => n.id));
-    const alone = arr(v.tasks).filter((t) => t.kind !== "unattached" && t.state === "waiting" && !arr(t.workers).some((id) => waitingIds.has(id)));
-    return waitingIds.size + alone.length;
-  };
+  // No header carries a count of what waits on him, live or replayed. The band (the Needs strip) is the one place that number lives; a
+  // second copy, read by a second definition, can only disagree with it.
   function strip(v, which) {
     const nodes = arr(v.nodes);
     const running = nodes.filter((n) => n.state === "running").length;
-    const waiting = waitingOnYou(v);
     const row = el("div", "tv-strip");
     const stat = (k, n, word, cls) => {
       const s = el("span", "tv-stat" + (cls ? " " + cls : ""));
@@ -349,8 +341,7 @@
       s.append(el("b", null, n), " " + word);
       return s;
     };
-    row.append(stat("groups", arr(v.groups).length, "groups"), stat("nodes", nodes.length, "nodes"), stat("running", running, "running"),
-               stat("waiting", waiting, "waiting on you", waiting ? "hot" : ""));
+    row.append(stat("groups", arr(v.groups).length, "groups"), stat("nodes", nodes.length, "nodes"), stat("running", running, "running"));
     const conflicts = Array.isArray(v.conflicts) ? v.conflicts : null;       // anything but a list is "not tracked", never a zero
     let c;
     if (conflicts === null) { c = el("span", "tv-stat dim", "conflicts not tracked"); }
@@ -370,7 +361,7 @@
   function metricsStrip(v) {
     const nodes = arr(v.nodes), counts = isObj(v.counts) ? v.counts : {};
     const live = nodes.filter((n) => n.state !== "idle").length;
-    const running = nodes.filter((n) => n.state === "running").length, waiting = waitingOnYou(v);
+    const running = nodes.filter((n) => n.state === "running").length;
     const row = el("div", "tv-metrics");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "Header figures");
@@ -393,7 +384,6 @@
         evN === null ? (past ? "not kept for the past" : "no session has an event log")
           : "hook events logged since local midnight" + (counts.events_partial ? " (a log was rotated past midnight, so at least this many)" : "")),
       m("running", "running", String(running), "sessions running now"),
-      m("waiting", "waiting on you", String(waiting), "sessions waiting on a decision or an answer from you", waiting ? "hot" : ""),
       m("tokens", "tokens today", tkN, tkN === null ? noTk
         : (tk.note ? "At least this many (" + tk.note + "). " : "") + "Fresh tokens since local midnight, from the message timestamps in " + (isNum(counts.tokens_read) ? counts.tokens_read : "the") + " session transcripts: input + output + cache writes (Codex: input - cached + output). Cache reads are not counted" + (tk.cache ? " in it; the provider reports " + tk.cache + " beside it." : "."),
         "", [tk && tk.note, tk && tk.cache, unread ? unread + (unread === 1 ? " session" : " sessions") + " not read" : ""].filter(Boolean).join(" \u00b7 ")));
@@ -412,7 +402,7 @@
       s.append(el("b", null, num), " " + word);
       return s;
     };
-    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), stat("waiting", waitingOnYou(v), "waiting on you", waitingOnYou(v) ? "hot" : ""), stat("tasks-waiting", n("waiting"), n("waiting") === 1 ? "task waiting" : "tasks waiting"));
+    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"));
     if (n("failed")) row.appendChild(stat("failed", n("failed"), "failed", "bad"));
     row.append(stat("stuck", n("stuck"), "stuck"));
     if (n("open")) row.appendChild(stat("open", n("open"), "open"));
@@ -595,8 +585,11 @@
       recBy.set(t.id, r);
       if (typeof t.card === "string" && t.card) recBy.set(t.card, r);
     }
-    const sessWait = waitingOnYou(v);
-    if (!recs.length) left.appendChild(el("p", "tv-none", sessWait ? "no record is waiting \u00b7 " + sessWait + (sessWait === 1 ? " session is" : " sessions are") + " waiting on you" : "nothing is waiting on you"));
+    // the column exists only when there is a record to put in it, which a live read never sends (a replay's history does): an empty
+    // "Waiting on you" column, or a sentence that nothing is, would be the graph speaking for the band
+    heads[0].hidden = left.hidden = !recs.length;
+    wrap.classList.toggle("tv-nowait", !recs.length);
+    const col = recs.length ? 2 : 1;
     wrap.appendChild(left);
     // the centre: every other task, loudest state first; the right: its outcomes, on the same row
     const centre = [];
@@ -620,7 +613,7 @@
       const o = outcomeList(t);
       c.hidden = hide;
       if (o) o.hidden = hide;
-      if (!hide) { place(c, 2); if (o) place(o, 3); }
+      if (!hide) { place(c, col); if (o) place(o, col + 1); }
       wrap.appendChild(c);
       if (o) wrap.appendChild(o);
       for (const id of new Set(arr(t.waits_on).concat(t.state === "waiting" && t.card ? [t.card] : []))) if (recBy.has(id) && !hide) links.push([recBy.get(id), c, "waiting"]);
@@ -633,7 +626,7 @@
         more.type = "button";
         more.dataset.more = st;
         more.addEventListener("click", () => { if (shownAll.has(st)) shownAll.delete(st); else shownAll.add(st); if (opts && opts.repaint) opts.repaint(); });
-        place(more, 2);
+        place(more, col);
         wrap.appendChild(more);
         row += 1;
       }
@@ -1640,9 +1633,12 @@
   }
 
   // the legend under the Agents graph: the five states and what a stream is
-  function legendAgents() {
+  // "waiting on you" is in a legend only when something drawn under it carries that state (a replay's history, or a host that sends it):
+  // a key to a mark nothing wears says there is a mark, which is the graph speaking for the band
+  const anyWaiting = (v) => arr(v.nodes).some((n) => n.state === "waiting") || arr(v.tasks).some((t) => t.state === "waiting");
+  function legendAgents(v) {
     const l = el("div", "tv-legend tv-legend-agents");
-    for (const st of ["waiting", "errored", "stalled", "running", "idle"]) {
+    for (const st of anyWaiting(v) ? ["waiting", "errored", "stalled", "running", "idle"] : ["errored", "stalled", "running", "idle"]) {
       const i = el("span", "tv-leg");
       const k = el("i", "tv-lg " + st);
       k.setAttribute("aria-hidden", "true");
@@ -1654,14 +1650,14 @@
   }
 
   // ---- the legend under the Work columns: the five states and the two definitions that keep waiting and stuck apart ----
-  function legend() {
-    const l = el("div", "tv-legend");
-    for (const st of ["waiting", "stuck", "failed", "running", "open", "done"]) {
+  function legend(v) {
+    const l = el("div", "tv-legend"), waits = anyWaiting(v);
+    for (const st of waits ? ["waiting", "stuck", "failed", "running", "open", "done"] : ["stuck", "failed", "running", "open", "done"]) {
       const i = el("span", "tv-leg");
       i.append(dot(st), st === "waiting" ? "waiting on you" : st);
       l.appendChild(i);
     }
-    l.appendChild(el("span", "tv-legdef", "waiting = a pending record you can answer; stuck = silence, no record"));
+    l.appendChild(el("span", "tv-legdef", waits ? "waiting = a pending record you can answer; stuck = silence, no record" : "stuck = silence, no record"));
     return l;
   }
 
@@ -2039,7 +2035,7 @@
       body.appendChild(wrapB);
     }
     w.appendChild(body);
-    w.appendChild(which === "agents" ? legendAgents() : legend());
+    w.appendChild(which === "agents" ? legendAgents(v) : legend(v));
     const unk = unknownLines(v);
     for (const u of unk) w.appendChild(u);
     const q = unk.length ? null : quietLine(v);        // the unknown lines already say what the past could not rebuild
@@ -2052,6 +2048,6 @@
     return w;
   }
 
-  root.LevainTopologyView = { headerLens, setHeaderLens, headerToggle, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, waitingOnYou, replaying, replayValue, returnToLive, leaveReplay, hourMarks };
+  root.LevainTopologyView = { headerLens, setHeaderLens, headerToggle, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, returnToLive, leaveReplay, hourMarks };
   if (typeof module !== "undefined" && module.exports) module.exports = root.LevainTopologyView;
 })(typeof globalThis !== "undefined" ? globalThis : this);

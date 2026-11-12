@@ -1,6 +1,6 @@
-"""LATER in the counts: a band question dated past today is not WAITING anywhere. The Work panel's topology feed (its
-"waiting on you" list and count) and the Decisions tile's count read the same predicate as the Needs you strip
-(band_view.later_facets / later_of); a fault there is due, so the question stays counted."""
+"""LATER in the counts: a band question dated past today is not WAITING anywhere. The Decisions tile's count and the app badge
+read the same predicate as the Needs you strip (band_view.later_facets / later_of); a fault there is due, so the question stays
+counted. The live agents graph reads no question at all (tests/test_cockpit_graph_not_band.py): the band is the one place."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -28,24 +28,24 @@ def _store(tmp_path: Path):
     return qs, now, due, l1, l2
 
 
-def test_the_work_panels_waiting_list_leaves_out_a_dated_question(tmp_path: Path) -> None:
+def test_the_live_graph_marks_neither_the_due_nor_the_dated_question(tmp_path: Path) -> None:
     qs, now, due, l1, l2 = _store(tmp_path)
     root = tmp_path / "inst"
     for sid in ("s-due", "s-l1", "s-l2"):
         _session(root, sid, "/w", timedelta(minutes=1))
     read = topo.topology_reader(install_root=root, consent=lambda: None, questions=lambda: qs, hub_label=lambda c: "x")
     v = read(ReadContext(now.astimezone(timezone.utc))).value      # the instant _store judged its days at: no midnight race
-    waiting = [t["card"] for t in v["tasks"] if t["kind"] == "question"]
-    assert waiting == [f"question:{due.n}"], waiting          # the strip's and flow's footer's count: one
-    assert [n["state"] for n in v["nodes"] if n["state"] == "waiting"] == ["waiting"], "only the due question's session waits"
+    assert [t for t in v["tasks"] if t["kind"] == "question"] == [], "the band shows the question; the graph draws no copy"
+    assert "waiting" not in [n["state"] for n in v["nodes"]], "no session is marked as waiting on one"
 
 
-def test_a_fault_in_the_one_predicate_leaves_the_question_waiting(tmp_path: Path, monkeypatch) -> None:
+def test_a_fault_in_the_one_predicate_leaves_the_question_due(tmp_path: Path, monkeypatch) -> None:
+    from levain.webpush.needs import open_needs_count
     qs, now, due, l1, l2 = _store(tmp_path)
     import levain.band_view as bv
     monkeypatch.setattr(bv, "_later_pair", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     assert later_facets(qs, l1, now) is None
-    assert len(topo._questions_at(qs, None, now)) == 3
+    assert open_needs_count(tmp_path / "q") == 3        # a fault is due, never hidden: the badge counts all three
 
 
 def test_the_decisions_tile_counts_only_due_questions(tmp_path: Path) -> None:

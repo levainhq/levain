@@ -2,16 +2,18 @@
 
 One value over what the install already holds: the session records its hooks write (the NODES: one per session,
 grouped by the repository its working directory is in, a linked worktree folded into its main repository), the
-consent queue and the question store (a session waiting on a pending request or an open question is WAITING ON YOU,
-and the record is the task it waits on), the dispatch job store and the F7 outcome ledger (a contract is a task, its
-ledger labels its outcomes), and the entity's open loops (an intention is a task). A session that no task names is a
-worker of the one ``unattached`` task, never of a guessed one.
+dispatch job store and the F7 outcome ledger (a contract is a task, its ledger labels its outcomes), and the entity's
+open loops (an intention is a task). A session that no task names is a worker of the one ``unattached`` task, never of
+a guessed one.
 
-The two quiet states never merge. WAITING ON YOU is a record: a pending consent request, an open question, a
-dispatch contract waiting on a signature or an authorisation. STALLED (a node) and STUCK (a task) are silence with
-no record behind it: a session whose last logged event is a prompt or a tool call and that has said nothing for
-``STALL_S``. An open loop nobody is working is neither: it is OPEN, a record with an age and a heat (the Open loops
-panel's own words), not silence.
+WHAT WAITS ON THE OPERATOR IS THE BAND'S, NOT THE GRAPH'S. A live read marks no session, task or count "waiting on you":
+the band (the Needs strip) is the one place that lives, and a second copy read by a second definition can only disagree
+with it. A REPLAY (``read_at``) is the one place the old marks remain, as the history of an instant: the consent queue and
+the question store at T, a session waiting on a request filed by T and not decided by T, the record being the task it
+waits on, a dispatch contract waiting on a signature or an authorisation. STALLED (a node) and STUCK (a task) are
+silence with no record behind it: a session whose last logged event is a prompt or a tool call and that has said nothing
+for ``STALL_S``. An open loop nobody is working is neither: it is OPEN, a record with an age and a heat (the Open loops
+panel's own words), not silence; a dispatch contract the live graph draws as waiting on a signature is OPEN the same way.
 
 "Lost if closed" is per live session, read by ``activity.git_worktree_state`` (its status read runs on a private git
 dir the cockpit owns, which takes only allow-listed, shape-checked settings from the repository's config and
@@ -81,8 +83,9 @@ QUESTIONS_SCAN = 500
 LOG_LINE_MARGIN = 32 * 1024
 
 # the dispatch job's state as a task's (jobs.STATES); filed waits on the operator's signature, verified and
-# recommended on his authorisation: a record, so WAITING. signed, queued and authorised are RUNNING because the job
-# runtime holds them (a record exists, it is not silence), with no worker named: the job record names no session.
+# recommended on his authorisation: a record, so WAITING in a replay (``_dispatch_tasks`` draws a live one as OPEN: it is not
+# a band row). signed, queued and authorised are RUNNING because the job runtime holds them (a record exists, it is not
+# silence), with no worker named: the job record names no session.
 _JOB_STATE = {"filed": "waiting", "signed": "running", "queued": "running", "running": "running",
               "verifying": "running", "verified": "waiting", "recommended": "waiting", "authorised": "running",
               "adopted": "done", "cancelled": "done", "failed": "failed"}
@@ -387,14 +390,12 @@ class _LostCache:
 
 # --- the tasks -------------------------------------------------------------------------------------------------
 
-def _consent_waiting(listing: Any, at: datetime | None, listed_at: datetime | None = None) -> list[Any]:
-    """The requests an agent waits on. Live (``at`` None): the pending and the undecided (waiting on a late ruling).
-    At a past instant T: every listed request filed at or before T and not decided by T (``decided_at`` is when it
-    was answered, ruled or expired; an undecided one waits on a ruling whatever its ``decided_at``), from the
-    pending, the undecided and the recently decided alike. Raises ``LookupError`` when the listing cannot answer
-    for T: no decided list, or one cut at its cap before reaching back to T (a request decided in between is lost)."""
-    if at is None:
-        return [e for e in (*listing.pending, *listing.undecided) if e.state in ("pending", "undecided")]
+def _consent_waiting(listing: Any, at: datetime, listed_at: datetime | None = None) -> list[Any]:
+    """The requests an agent waited on at the past instant T (``at``; a live graph reads none, see ``_read``): every listed
+    request filed at or before T and not decided by T (``decided_at`` is when it was answered, ruled or expired; an
+    undecided one waits on a ruling whatever its ``decided_at``), from the pending, the undecided and the recently
+    decided alike. Raises ``LookupError`` when the listing cannot answer for T: no decided list, or one cut at its cap
+    before reaching back to T (a request decided in between is lost)."""
     from levain.consent.listing import RECENT, RECENT_CAP
 
     recent = getattr(listing, "recent", None)
@@ -467,20 +468,13 @@ def _dispatch_label(job: Any) -> str:
     return _wire(f"dispatch · {job.contract.template.template_id}")
 
 
-def _questions_at(store: Any, at: datetime | None, now: datetime | None = None) -> list[Any]:
-    """The questions an agent waits on: the rows the Needs strip and the app badge count, no others. Live: the store's open
-    questions, less those snoozed past today (band_view.later_facets, the one LATER predicate; a fault there is due, so the
-    question stays) and less those the desk alone owes (band_view.desk_owed, the one rule; webpush.needs applies the same two).
-    At a past instant T: every question filed
-    at or before T and not answered by T (the store keeps both stamps and never deletes), oldest first; raises
-    ``LookupError`` when the store cannot answer for T (no ``recent`` read, or more than ``QUESTIONS_SCAN`` questions,
-    so an older one answered after T would not be seen). Known edge (reachability line): the past read keeps a question
-    snoozed at T, and one the desk alone owes now, since neither the snooze nor the section/carried flag carries a stamp of
-    when it was set; the past read fails open (shown waiting), never hidden."""
-    from levain.band_view import desk_owed, later_facets
-    if at is None:
-        return [q for q in store.open_questions() if later_facets(store, q, now) is None
-                and not desk_owed(getattr(q, "section", ""), getattr(q, "carried", False))]
+def _questions_at(store: Any, at: datetime) -> list[Any]:
+    """The questions an agent waited on at the past instant T (``at``; a live graph reads none, see ``_read``): every
+    question filed at or before T and not answered by T (the store keeps both stamps and never deletes), oldest first;
+    raises ``LookupError`` when the store cannot answer for T (no ``recent`` read, or more than ``QUESTIONS_SCAN``
+    questions, so an older one answered after T would not be seen). Known edge (reachability line): the past read keeps a
+    question snoozed at T, and one the desk alone owes, since neither the snooze nor the section/carried flag carries a
+    stamp of when it was set; the past read fails open (shown waiting), never hidden."""
     recent = getattr(store, "recent", None)
     if recent is None:
         raise LookupError("this question store lists no answered questions")
@@ -540,6 +534,8 @@ def _dispatch_tasks(directory: Path, now: datetime, *, past: bool = False) -> tu
             else:
                 hist, cur = list(job.history), job.state
             state = _JOB_STATE[cur]
+            if state == "waiting" and not past:
+                state = "open"                  # not a band row, so not "waiting on you" on a live graph (see ``_read``)
             last = hist[-1]
             last_at = act._parse(last.at)
             if cur in djobs.TERMINAL and (last_at is None or last_at < since):
@@ -705,40 +701,44 @@ def topology_reader(*, install_root: Path | None,
         if meta.get("truncated"):
             blind("session_records", f"{NOT_KEPT} (more session records than were read: a session live at T may be missing)")
 
-        # who waits on a record: a session (agent, session id) -> its first card
+        # who waits on a record: a session (agent, session id) -> its first card. ONLY a replay reads this: it is the history of an
+        # instant, labelled as of T, and cannot disagree with the band, which is read now. A live graph draws no session, task or
+        # count as "waiting on you": the band (the Needs strip) is the one place that lives, and a second copy of it, read by a
+        # second definition, is how a graph said 13 beside a band that said 0.
         waiting_card: dict[tuple[str, str], str] = {}
         waiting: list[Any] | None = None
-        reader = consent()
-        if reader is None:
-            blind("decisions", "no consent queue is attached to this cockpit")
-        else:
-            try:
-                # the listing as it is now; a past read keeps what was waiting at T (filed by T, not decided by T)
-                waiting = _consent_waiting(reader(ctx.now), at, ctx.now)
-                for e in waiting:
-                    waiting_card.setdefault((e.request.agent, e.request.agent_session_id),
-                                            f"{CONSENT_ROW_PREFIX}{e.request.id}")
-            except LookupError as exc:
-                waiting = None
-                blind("decisions", f"{NOT_KEPT} ({exc})")
-            except Exception as exc:  # noqa: BLE001 - an unread queue is named, never shown as nothing waiting
-                waiting = None
-                blind("decisions", f"unreadable ({type(exc).__name__})")
-        store = questions()
         open_qs: list[Any] | None = None
-        if store is None:
-            blind("questions", "no question store is attached to this cockpit")
-        else:
-            try:
-                open_qs = _questions_at(store, at, ctx.now)
-                for q in open_qs:
-                    waiting_card.setdefault((q.agent, q.agent_session_id), f"{QUESTION_ROW_PREFIX}{q.n}")
-            except LookupError as exc:
-                open_qs = None
-                blind("questions", f"{NOT_KEPT} ({exc})")
-            except Exception as exc:  # noqa: BLE001
-                open_qs = None
-                blind("questions", f"unreadable ({type(exc).__name__})")
+        if past:
+            reader = consent()
+            if reader is None:
+                blind("decisions", "no consent queue is attached to this cockpit")
+            else:
+                try:
+                    # what was waiting at T: filed by T, not decided by T
+                    waiting = _consent_waiting(reader(ctx.now), at, ctx.now)
+                    for e in waiting:
+                        waiting_card.setdefault((e.request.agent, e.request.agent_session_id),
+                                                f"{CONSENT_ROW_PREFIX}{e.request.id}")
+                except LookupError as exc:
+                    waiting = None
+                    blind("decisions", f"{NOT_KEPT} ({exc})")
+                except Exception as exc:  # noqa: BLE001 - an unread queue is named, never shown as nothing waiting
+                    waiting = None
+                    blind("decisions", f"unreadable ({type(exc).__name__})")
+            store = questions()
+            if store is None:
+                blind("questions", "no question store is attached to this cockpit")
+            else:
+                try:
+                    open_qs = _questions_at(store, at)
+                    for q in open_qs:
+                        waiting_card.setdefault((q.agent, q.agent_session_id), f"{QUESTION_ROW_PREFIX}{q.n}")
+                except LookupError as exc:
+                    open_qs = None
+                    blind("questions", f"{NOT_KEPT} ({exc})")
+                except Exception as exc:  # noqa: BLE001
+                    open_qs = None
+                    blind("questions", f"unreadable ({type(exc).__name__})")
 
         groups: dict[str, dict[str, Any]] = {}
         parent_of: dict[str, str] = {}             # a repository group's parent directory's name, for a label clash
