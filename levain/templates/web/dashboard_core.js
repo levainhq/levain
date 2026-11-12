@@ -7304,7 +7304,7 @@
     renderNeeds(needsViewRef);
     if (focusSel) { const n = host.querySelector(focusSel); if (n && typeof n.focus === "function") n.focus({ preventScroll: true }); }
   }
-  // `viewOnly`: switch the tab for this page without writing the reader's saved choice (the Work lens's jump needs Needs you; it does not change what he keeps)
+  // `viewOnly`: switch the tab for this page without writing the reader's saved choice (a go to the first waiting card needs Needs you; it does not change what he keeps)
   function setNeedsTab(key, viewOnly) {
     needsTabNow = key === "desk" ? "desk" : "you";
     if (!viewOnly) needsStore(false, NEEDS_TAB_KEY, needsTabNow);
@@ -7380,17 +7380,7 @@
   function renderNeeds(view) {
     if (needsExpiryTimer) { window.clearTimeout(needsExpiryTimer); needsExpiryTimer = 0; }
     try { renderNeedsNow(view); }
-    finally { armNeedsExpiry(view); announceNeedsReach(); }
-  }
-  // The Work lens's "waiting on you" button follows the strip: when the strip's answer to "can it go to a first card?" flips after a draw (a Decisions-only
-  // refresh emptied it, or it drew after the header did), the header is told so it repaints now, not at its next timer.
-  let needsReachSaid = null;
-  function announceNeedsReach() {
-    let now = false;
-    try { now = needsCanGoFirst(); } catch (e) { now = false; }
-    if (now === needsReachSaid) return;
-    needsReachSaid = now;
-    try { if (typeof document.dispatchEvent === "function" && typeof Event === "function") document.dispatchEvent(new Event("levain-needs-reach")); } catch (e) { /* the header repaints at its next paint */ }
+    finally { armNeedsExpiry(view); }
   }
   function armNeedsExpiry(view) {
     if (typeof window.setTimeout !== "function") return;
@@ -7666,7 +7656,7 @@
     return true;
   }
   // Scroll to a card or chip and light it by an animation that ends on its own. `focus`: the keyboard's place moves to it too (it is a button, so it takes
-  // focus as it is), so Tab goes on from there; only the Work lens's jump to the first card asks for it, no other caller's focus moves.
+  // focus as it is), so Tab goes on from there; only goFirst, the move to the first card, asks for it, no other caller's focus moves.
   function needsLight(node, instant, focus) {
     // `instant`: the caller locks the page the next moment (the item link opens the card's sheet at once), and the lock freezes the page at the
     // scroll position it finds: a smooth scroll only begun would be frozen at the top, so the reader's place behind the sheet would be lost
@@ -7678,8 +7668,8 @@
     node.addEventListener("animationend", off, { once: true });
     window.setTimeout(off, 3000);   // a page that plays no animation (reduced motion) still ends the light
   }
-  // The strip's first waiting card, as the reader sees the strip NOW (the Work lens's "waiting on you" button asks the strip itself, not the topology):
-  // the strip is on the page and holds a waiting item, and it is drawn as cards or as the bar. True is what the button needs to be there at all.
+  // The strip's first waiting card, as the reader sees the strip NOW (asked of the strip itself, not of the topology):
+  // the strip is on the page and holds a waiting item, and it is drawn as cards or as the bar. True is what a caller needs before it offers a way there.
   // ONE predicate for both questions ("can it go?" and "go"): the strip's first visible waiting card ({node}) or chip ({node}), asked of the DOM as the reader sees it.
   // On the Desk owes tab the waiting-on-you rows are detached: the answer is {node: null, viaTab: true} (the strip holds waiting items, Needs you is one tab away,
   // and the page has the view it re-renders from). Null when the strip is hidden, holds nothing waiting, or draws an empty list (a stale flag over an empty grid).

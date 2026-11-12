@@ -499,8 +499,7 @@
       // compact profile carries numbers where the full one carries arrays, and has nothing to draw
       const n = (x, c) => (Array.isArray(x) ? x.length : isNum(c) ? c : 0);
       const tasks = Array.isArray(v.tasks) ? v.tasks : [];
-      const waiting = Array.isArray(v.nodes) && root.LevainTopologyView && root.LevainTopologyView.waitingOnYou ? root.LevainTopologyView.waitingOnYou(v) : isNum(v.waiting) ? v.waiting : 0;   // the one function behind every "waiting on you" figure; the compact profile carries the count itself
-      out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions \u00b7 " + n(v.tasks, v.tasks) + " tasks \u00b7 " + waiting + " waiting on you" }];
+      out.lines = [{ meta: "topology", text: n(v.nodes, v.nodes) + " sessions \u00b7 " + n(v.tasks, v.tasks) + " tasks" }];   // no count of what waits on him: the band is the one place
       if (Array.isArray(v.nodes) && Array.isArray(v.tasks) && Array.isArray(v.groups) && isObj(v.hub)) { out.topology = v; out.typed = true; out.replay = head.replay === true || panel.replay === true; }   // typed: the page keeps a live state for it (the header lens and Build's Lost-if-closed read it)
     } else if (kind === "board") {
       // levain's board.json value (board_view.js draws it): the whole value rides to the painter, which turns it into the model
@@ -2405,10 +2404,6 @@
     if (N && N.history()) mark(12);
     else applyMode("board", true);
   }
-  // The Work lens's "waiting on you" button asks the live Needs strip, not the topology: it is drawn only while the strip holds a waiting card on screen
-  // (canOpenFirstNeeds), and the click lights, scrolls to and focuses the strip's own first card (openFirstNeeds; the Desk owes tab is switched away from first).
-  const canOpenFirstNeeds = () => { const N = root.LevainNeeds; return !!(N && typeof N.canGoFirst === "function" && N.canGoFirst()); };
-  const openFirstNeeds = () => { const N = root.LevainNeeds; return !!(N && typeof N.goFirst === "function" && N.goFirst()); };
   // The Work lens's open loop: its row in the Open loops panel (on the tab that shows that panel), scrolled to and lit.
   // Finds the row first: with no such row on the page nothing moves and the caller says so (false); null when an unsaved edit would not let it unfold; "hidden" for any other failure.
   function openLoop(intentionId) {
@@ -2475,7 +2470,7 @@
     const has = !!(I.tvLive || I.tfault);
     if (!has) { if (!host.hidden || host.firstChild) { TV.release(); host.replaceChildren(); host.hidden = true; } hSig = ""; return; }
     if (document.body.dataset.mode === "memory") { TV.release(); hSig = ""; return; }      // the header is not on Memory: nothing runs behind it
-    const sig = JSON.stringify([lens, I.tfault, I.tv ? TV.signature(I.tv, lens) : "", I.canReplay, canOpenFirstNeeds()]);     // the Work lens's button is there while the strip holds a card
+    const sig = JSON.stringify([lens, I.tfault, I.tv ? TV.signature(I.tv, lens) : "", I.canReplay]);
     if (sig === hSig && !host.hidden) return;
     hSig = sig;
     host.hidden = false;
@@ -2494,7 +2489,7 @@
     if (I.tv) {
       // the Replay strip rides the page's own read path (LevainCockpitTransport.readJson: its auth headers and token handling); resume re-reads the live topology
       const replay = I.canReplay ? { readJson: root.LevainCockpitTransport.readJson, resume: () => refetchPanel("topology") } : undefined;
-      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, openNeeds: openFirstNeeds, canOpenNeeds: canOpenFirstNeeds, openLoop, replay }); } catch (e) { fail = true; }
+      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, openLoop, replay }); } catch (e) { fail = true; }
     }
     if (body) { host.replaceChildren(body); return; }
     // a fault, or a throw while drawing: said in words with the switch beside it, so the Event graph is one click away
@@ -2503,8 +2498,6 @@
     host.replaceChildren(bar, el("p", "k7-none err", I.tfault ? "Topology unavailable: " + I.tfault : "The topology could not be drawn."));
     if (fail) hSig = "";
   }
-  // The strip says when its "can the header's button go to a card" answer flips (dashboard_core.js announceNeedsReach): the signature above carries it, so this repaint is a no-op otherwise.
-  if (typeof document !== "undefined" && typeof document.addEventListener === "function") document.addEventListener("levain-needs-reach", () => { try { paintHeaderLens(); } catch (_) { /* the header repaints on its next paint */ } });
   function paintBuildSessions() {
     const sec = k7Host();
     if (!sec) return;

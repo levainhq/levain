@@ -56,19 +56,10 @@ def _value() -> dict:
     }
 
 
-def _paint(value: dict, lens: str = "work", strip: bool = True) -> str:
-    """Replace the header's body with the renderer's own output for a literal value (the page's repaint leaves it: the signature is unchanged). The page's
-    "go to the Needs strip" pair is stubbed: `strip` says whether the live strip holds a card (canOpenNeeds), and the jump counts itself in window.__first."""
+def _paint(value: dict, lens: str = "work") -> str:
+    """Replace the header's body with the renderer's own output for a literal value (the page's repaint leaves it: the signature is unchanged)."""
     return ("(() => { const h = document.getElementById('ck-hlens'); h.hidden = false; "
-            "h.replaceChildren(window.LevainTopologyView.render(%s, {lens: %s, openCard: (id) => { window.__opened = id; }, "
-            "canOpenNeeds: () => %s, openNeeds: () => { window.__first = (window.__first || 0) + 1; return true; }})); return 1; })()") % (json.dumps(value), json.dumps(lens), json.dumps(strip))
-
-
-def _paint_live(value: dict, lens: str = "work") -> str:
-    """Like `_paint`, but the lens asks the page's own LevainNeeds (the live strip): the same two calls cockpit_view.js hands the real lens."""
-    return ("(() => { const h = document.getElementById('ck-hlens'); h.hidden = false; "
-            "h.replaceChildren(window.LevainTopologyView.render(%s, {lens: %s, openCard: (id) => { window.__opened = id; }, "
-            "canOpenNeeds: () => window.LevainNeeds.canGoFirst(), openNeeds: () => window.LevainNeeds.goFirst()})); return 1; })()") % (json.dumps(value), json.dumps(lens))
+            "h.replaceChildren(window.LevainTopologyView.render(%s, {lens: %s, openCard: (id) => { window.__opened = id; }})); return 1; })()") % (json.dumps(value), json.dumps(lens))
 
 
 def _run(tmp_path, src, steps, first=DESKTOP, until="document.querySelector('#k7-sessions .k7-card') && document.querySelector('#ck-hlens .tv')"):
@@ -103,7 +94,7 @@ def test_the_work_lens_draws_the_providers_own_nulls_as_not_tracked(tmp_path, mo
     # K10 S5 item 2 (67d28166): both live sessions have a readable tool log and no path is shared, so the provider OBSERVED no conflict and
     # says 0; "not tracked" is the null it sends only when live nodes exist and none has a log (test_conflicts_are_null_when_no_live_node_has_a_log)
     assert strip["conflicts"] == "0 conflicts" and strip["tokens"] == "0 tokens today", got   # the fixture transcripts spent nothing today: a real zero
-    assert list(strip) == ["tasks", "waiting", "tasks-waiting", "stuck", "open", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["open"] == "2 open", got
+    assert list(strip) == ["tasks", "stuck", "open", "done", "conflicts", "tokens"] and strip["tasks"].endswith(" tasks") and strip["open"] == "2 open", got
 
 
 @needs_browser
@@ -156,16 +147,19 @@ def test_a_bare_install_draws_no_switch_no_topology_and_keeps_the_one_line(tmp_p
 
 
 @needs_browser
-def test_a_click_on_the_waiting_count_opens_the_card_it_waits_on(tmp_path, monkeypatch):
+def test_a_live_work_lens_has_no_waiting_record_to_click_so_the_band_is_the_only_place_to_answer(tmp_path, monkeypatch):
+    """The sessions fixture has a pending consent request, which the Needs strip lists. The live graph used to draw it again as a
+    clickable record in its own column; it is the strip's row alone now (the click path of a record a host sends is the next test)."""
     root, src = _sessions_fixture(tmp_path, monkeypatch)
     out = _run(tmp_path, src, [
         {"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
-        {"until": TV + " && " + TV + ".querySelector('.tv-jump')"},
-        {"eval": TV + ".querySelector('.tv-jump').click(); 1"},
-        {"until": "document.querySelector('#ck-needs .needs-lit[data-needs-id^=consent]')"},      # K10 S3: the strip's card (Build: its chip) is lit, no modal
-        {"eval": "JSON.stringify([!document.querySelector('.modal-overlay'), document.querySelector('#ck-needs .needs-lit').className])"}])
-    assert "timeout" not in json.dumps(out[-2]), out
-    assert json.loads(out[-1])[0] is True, out
+        {"until": TV + " && " + TV + ".querySelector('.tv-task')"},
+        {"until": "document.querySelector('#ck-needs .needs-row[data-needs-id^=consent]') && 1", "ms": 30000},
+        {"eval": "JSON.stringify([" + TV + ".querySelectorAll('.tv-rec').length, " + TV + ".querySelectorAll('.tv-task.waiting').length, "
+                 "document.querySelectorAll('#ck-needs .needs-row[data-needs-id^=consent]').length])"}])
+    recs, waiting_tasks, strip_rows = json.loads(out[-1])
+    assert recs == 0 and waiting_tasks == 0, out                       # nothing on the graph ...
+    assert strip_rows == 1, out                                        # ... and the one row is where it always was
 
 
 # --- a literal value ---------------------------------------------------------------------------------------
@@ -191,8 +185,6 @@ def test_two_columns_tasks_left_outcomes_right_on_the_tasks_own_row_and_no_waiti
     assert got["tags"]["t-sign"] == "waiting on you" and got["tags"]["t-stuck"] == "stuck", got
     assert "waiting = a pending record you can answer; stuck = silence, no record" in got["legend"], got
     assert got["waiting_open"] is True and got["stuck_open"] is False, got                              # only a card can be opened; silence has none
-    out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": TV + ".querySelector('.tv-jump').click(); JSON.stringify([window.__first, window.__opened])"}])
-    assert json.loads(out[-1]) == [1, None], out                                                         # the one count asks the strip to go to ITS first card: no topology card id is used
 
 
 @needs_browser
@@ -232,24 +224,19 @@ def _waiting_value(n: int) -> dict:
 
 
 @needs_browser
-def test_the_work_lens_lists_no_waiting_items_only_one_count_that_jumps_to_the_needs_strip(tmp_path, monkeypatch):
-    """Phill 11-11: the left column listed every waiting item with no organisation, beside the Needs strip that does it better. The lens now draws no
-    per-item waiting record, only the one count (the existing "waiting on you" figure) as a button when something waits, and plain when nothing does."""
+def test_the_work_lens_lists_no_waiting_items_and_draws_no_count_or_button_for_them_at_any_number(tmp_path, monkeypatch):
+    """Phill 11-11: the left column listed every waiting item with no organisation, beside the Needs strip that does it better. Phill 11-12: the band is the
+    one place the number of what waits on him lives. So the lens draws no per-item record, no count of them and no button to the strip, at any number waiting."""
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    probe = ("JSON.stringify({recs: %s.querySelectorAll('.tv-rec, .tv-wl').length, jumps: [...%s.querySelectorAll('.tv-jump')].map(b => [b.tagName, b.textContent.replace(/\\s+/g, ' '), b.dataset.k]), "
-             "stat: %s.querySelector('[data-k=waiting]').textContent.replace(/\\s+/g, ' '), tasks: %s.querySelectorAll('.tv-task').length, "
+    probe = ("JSON.stringify({recs: %s.querySelectorAll('.tv-rec, .tv-wl').length, jumps: %s.querySelectorAll('.tv-jump').length, "
+             "stats: [...%s.querySelectorAll('.tv-stat, .tv-m')].map(s => s.dataset.k + '=' + s.textContent.replace(/\\s+/g, ' ')), tasks: %s.querySelectorAll('.tv-task').length, "
              "no_col: getComputedStyle(%s.querySelector('.tv-work')).gridTemplateColumns.split(' ').length})") % ((TV,) * 5)
     for n in (3, 1, 0):
-        out = _run(tmp_path, src, [{"eval": _paint(_waiting_value(n))}, {"eval": probe}, {"eval": "window.__first = 0; (" + TV + ".querySelector('.tv-jump') || {click() {}}).click(); window.__first"}])
-        got = json.loads(out[-2])
-        assert got["recs"] == 0, (n, got)                                                                # never a per-item record, at any count
-        assert got["stat"] == f"{n} waiting on you", (n, got)                                           # the one figure, from the same function as before
+        out = _run(tmp_path, src, [{"eval": _paint(_waiting_value(n))}, {"eval": probe}])
+        got = json.loads(out[-1])
+        assert got["recs"] == 0 and got["jumps"] == 0, (n, got)                                         # never a per-item record, never a button, at any count
+        assert not [s for s in got["stats"] if "waiting" in s], (n, got)                                # and no figure of how many wait on him
         assert got["tasks"] >= 4, (n, got)                                                              # tasks stay exactly as they were (the fixture's other states)
-        if n:
-            assert got["jumps"] == [["BUTTON", f"{n} waiting on you", "waiting"]], (n, got)           # one button, a native one: Enter and Space work
-            assert out[-1] == 1, (n, out)                                                               # it asks the live strip to go to its first card, once
-        else:
-            assert got["jumps"] == [] and out[-1] == 0, (n, got, out)                                  # nothing waits: no count line to press, and nowhere asked to go
 
 
 @needs_browser
@@ -301,12 +288,13 @@ def test_the_header_strip_counts_and_a_conflict_lists_its_file_and_both_sessions
              "conf: (%s.querySelector('.tv-conf') || {innerText: ''}).textContent})") % (TV, TV)
     out = _run(tmp_path, src, [{"eval": _paint(_value())}, {"eval": probe}])
     got = json.loads(out[-1])["strip"]
-    assert got == {"tasks": "5 tasks", "waiting": "1 waiting on you", "tasks-waiting": "1 task waiting", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
-                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead and count the cards drawn (the fixture's consent record t-wait is no card: 5 and 1); "waiting on you" is waitingOnYou(v), the same figure the Agents lens shows (the fixture's one waiting task rides the waiting session n1, so it is one)
+    assert got == {"tasks": "5 tasks", "failed": "1 failed", "stuck": "1 stuck", "done": "1 done",
+                   "conflicts": "1 file conflict", "tokens": "2.4M tokens today"}, got                  # the tasks lead and count the cards drawn (the fixture's consent record t-wait is no card: 5); NO figure of what waits on him, though the fixture has waiting tasks and a waiting session: the band is the one place
     metrics = "JSON.stringify([...%s.querySelectorAll('.tv-metrics .tv-m')].map(m => m.dataset.k + '=' + m.firstChild.textContent))" % TV
     out = _run(tmp_path, src, [{"eval": _paint(_value(), "agents")}, {"eval": probe}, {"eval": metrics}])
     figs = json.loads(out[-1])
     assert figs[0].startswith("sessions=") and "tokens=2.4M" in figs, figs                               # the Agents lens draws the metrics block, not the count row
+    assert not [f for f in figs if f.startswith("waiting=")], figs                                       # ... and no waiting figure in it
     conf = json.loads(out[-2])["conf"]
     assert "money.py" in conf and "claude_code · ledgerline" in conf and "codex · tally" in conf
 
@@ -745,68 +733,41 @@ def test_a_cache_count_the_validator_would_refuse_draws_nothing_and_one_read_is_
     assert "reports 1 cache read beside it" in agents["metric"]["title"], agents
 
 
-# --- the strip counts what the lens draws; the empty sentence; the jump control's affordance and focus -------------------
+# --- the strip counts what the lens draws; the empty sentence; the Needs strip's own way to its first card ---------------
 
 
 @needs_browser
 def test_the_strips_task_counts_equal_the_task_cards_the_lens_draws_with_consent_and_question_records_hidden(tmp_path, monkeypatch):
-    """Review finding (MED): consent / question task records are not drawn in the lens, so "N tasks" and "M tasks waiting" must not count them. Graded
-    against the DOM: the strip's figures equal the cards on the page, while the separate "waiting on you" figure still counts the asks."""
+    """Review finding (MED): consent / question task records are not drawn in the lens, so "N tasks" must not count them. Graded against the DOM: the
+    strip's figure equals the cards on the page, and no figure of the asks that wait on him is drawn at all (the band is the one place for that)."""
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     v = _waiting_value(3)                              # three waiting asks, as consent / question records, beside the fixture's other tasks
     v["tasks"].append({**next(t for t in _value()["tasks"] if t["id"] == "t-sign"), "id": "t-wait-real"})        # and one waiting dispatch task, which IS drawn
     probe = ("JSON.stringify({drawn: [...%s.querySelectorAll('.tv-task')].filter(c => c.dataset.kind !== 'unattached').length, "
-             "drawn_waiting: [...%s.querySelectorAll('.tv-task')].filter(c => c.dataset.kind !== 'unattached' && c.dataset.state === 'waiting').length, "
              "kinds: [...%s.querySelectorAll('.tv-task')].map(c => c.dataset.kind), "
-             "tasks: +%s.querySelector('[data-k=tasks] b').textContent, tw: +%s.querySelector('[data-k=tasks-waiting] b').textContent, "
-             "wy: +%s.querySelector('[data-k=waiting] b').textContent})") % ((TV,) * 6)
+             "tasks: +%s.querySelector('[data-k=tasks] b').textContent, "
+             "waiting_stats: %s.querySelectorAll('[data-k=waiting], [data-k=tasks-waiting]').length})") % ((TV,) * 4)
     got = json.loads(_run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])[-1])
     assert not any(k in ("consent", "question") for k in got["kinds"]), got                            # the hidden records are really not drawn
-    assert got["tasks"] == got["drawn"] and got["tw"] == got["drawn_waiting"] == 1, got                # the strip counts the cards on the page
-    assert got["wy"] >= 3, got                                                                         # the asks are still counted, in the figure that names them
+    assert got["tasks"] == got["drawn"], got                                                           # the strip counts the cards on the page
+    assert got["waiting_stats"] == 0, got                                                              # ... and draws no waiting figure beside them
 
 
 @needs_browser
-def test_with_only_hidden_asks_waiting_the_empty_sentence_does_not_deny_what_the_button_says(tmp_path, monkeypatch):
-    """Review finding (LOW): nothing drawn but something waiting on you: the sentence under the button must say where the asks are, not that there are no
-    records. With nothing waiting it stays the plain empty sentence."""
+def test_with_only_hidden_asks_waiting_the_empty_sentence_is_the_plain_one_and_no_button_is_drawn(tmp_path, monkeypatch):
+    """Nothing drawn but asks waiting on him: the sentence stays the plain empty one (it speaks of no count of the asks, which are the Needs strip's), and the
+    lens offers no button to the strip."""
     _root, src = _sessions_fixture(tmp_path, monkeypatch)
     v = _waiting_value(2)
     v["tasks"] = [t for t in v["tasks"] if t["kind"] in ("consent", "question")]                       # only the asks: no task card is drawn
     v["nodes"] = [n for n in v["nodes"] if n["id"].startswith("w")]
-    quiet = {**_waiting_value(0), "tasks": [], "nodes": []}
     probe = ("JSON.stringify({cards: %s.querySelectorAll('.tv-task').length, btn: !!%s.querySelector('.tv-jump'), "
              "none: (%s.querySelector('.tv-no-tasks') || {textContent: null}).textContent})") % ((TV,) * 3)
-    out = _run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}, {"eval": _paint(quiet)}, {"eval": probe}, {"eval": _paint(v, strip=False)}, {"eval": probe}])
-    waiting, nothing, nostrip = json.loads(out[-5]), json.loads(out[-3]), json.loads(out[-1])
-    assert waiting["cards"] == 0 and waiting["btn"] is True, waiting
-    assert "no task records" not in waiting["none"].lower() and "2 waiting on you" in waiting["none"] and "Needs" in waiting["none"], waiting
-    assert nostrip["btn"] is False and "2 waiting on you" in nostrip["none"] and "Needs" not in nostrip["none"], nostrip      # no strip card to go to: the sentence does not send him there
-    assert nothing["cards"] == 0 and nothing["btn"] is False and nothing["none"] == "No task records and no active work.", nothing
+    got = json.loads(_run(tmp_path, src, [{"eval": _paint(v)}, {"eval": probe}])[-1])
+    assert got == {"cards": 0, "btn": False, "none": "No task records and no active work."}, got
 
 
-@needs_browser
-def test_the_jump_button_shows_it_is_a_button_without_hover_and_the_jump_lands_focus_on_the_lit_card(tmp_path, monkeypatch):
-    """Review finding (LOW): hover-only affordance fails on touch, and the jump left keyboard focus behind. At rest the control has a border and an arrow
-    (no hover state), at both widths; after the real jump through the page, focus is on the lit Needs card so Tab continues from it."""
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    probe = ("JSON.stringify((() => { const b = %s.querySelector('.tv-jump'), cs = getComputedStyle(b); "
-             "return {tag: b.tagName, border: parseFloat(cs.borderTopWidth), arrow: getComputedStyle(b, '::after').content, "
-             "tip: b.title, w: Math.round(b.getBoundingClientRect().width)}; })())") % TV
-    for size in (DESKTOP, NARROW):
-        got = json.loads(_run(tmp_path, src, [{"eval": _paint(_waiting_value(2))}, {"eval": probe}], first=size)[-1])
-        assert got["tag"] == "BUTTON" and got["border"] >= 1 and got["arrow"] not in ("none", "normal", ""), (size, got)
-        assert "session" in got["tip"] and "Needs" in got["tip"], (size, got)                          # the tooltip says what the figure counts and where it goes
-    out = _run(tmp_path, src, [
-        {"until": TV}, {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},
-        {"until": TV + " && " + TV + ".querySelector('.tv-jump')"},
-        {"eval": TV + ".querySelector('.tv-jump').click(); 1"},
-        {"until": "document.querySelector('#ck-needs .needs-lit[data-needs-id^=consent]')"},
-        {"eval": "JSON.stringify({focus: document.activeElement === document.querySelector('#ck-needs .needs-lit'), lit: document.querySelectorAll('#ck-needs .needs-lit').length})"}])
-    assert json.loads(out[-1]) == {"focus": True, "lit": 1}, out
-
-
-# --- the button asks the LIVE Needs strip (L3 round 1: it used the topology's card ids) ---------------------------------------
+# --- the Needs strip's own way to its first card ---------------------------------------------------------------------------------
 
 
 def _strip_page(tmp_path, monkeypatch, questions: int = 2):
@@ -820,11 +781,11 @@ def _strip_page(tmp_path, monkeypatch, questions: int = 2):
 
 
 def _board(tmp_path, src, steps, rows: int = 3):
-    """The Board (the strip drawn as cards) with the real Work lens up and `rows` cards in the strip."""
+    """The Board (the strip drawn as cards) with `rows` cards in the strip and the strip ready to say where its first card is."""
     ready = "document.querySelectorAll('#ck-needs .needs-row').length === %d && document.querySelector('#ck-hlens .tv')" % rows
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         return _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": ready, "ms": 30000},
-                      {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"}, {"until": TV + " && " + TV + ".querySelector('.tv-jump')", "ms": 30000}, *steps])["values"]
+                      {"until": "window.LevainNeeds && window.LevainNeeds.canGoFirst()", "ms": 30000}, *steps])["values"]
 
 
 FIRST_STATE = ("JSON.stringify((() => { const rows = [...document.querySelectorAll('#ck-needs .needs-grid .needs-row')], lit = [...document.querySelectorAll('#ck-needs .needs-lit')]; "
@@ -835,69 +796,47 @@ FIRST_STATE = ("JSON.stringify((() => { const rows = [...document.querySelectorA
 
 
 @needs_browser
-def test_the_button_lands_on_the_strips_own_first_card_not_the_first_waiting_task_in_topology_order(tmp_path, monkeypatch):
-    """L3 r1 MED (all three seats): the strip draws questions first, then consents; the topology's first waiting card is the consent. The click must light and
-    focus the strip's first card (a question), asked of the live strip."""
+def test_the_strips_way_to_its_first_card_lands_on_the_strips_own_first_card_not_the_first_waiting_task_in_topology_order(tmp_path, monkeypatch):
+    """L3 r1 MED (all three seats): the strip draws questions first, then consents; the topology's first waiting card is the consent. The strip's own
+    goFirst must light and focus the strip's first card (a question), asked of the live strip."""
     src = _strip_page(tmp_path, monkeypatch)
-    out = _board(tmp_path, src, [{"eval": TV + ".querySelector('.tv-jump').click(); 1"}, {"until": "document.querySelector('#ck-needs .needs-lit')", "ms": 10000}, {"eval": FIRST_STATE}])
+    out = _board(tmp_path, src, [{"eval": "window.LevainNeeds.goFirst()"}, {"until": "document.querySelector('#ck-needs .needs-lit')", "ms": 10000}, {"eval": FIRST_STATE}])
     got = json.loads(out[-1])
     assert got["first_kind"] == "question" and got["first"], got                                       # the strip's order: a question leads
     assert got["lit"] == [got["first"]] and got["focus"] == got["first"] and got["modal"] is False, got   # lit, focused, no history sheet
 
 
 @needs_browser
-def test_with_the_desk_owes_tab_on_the_button_switches_to_needs_you_and_lands_on_its_first_card(tmp_path, monkeypatch):
+def test_with_the_desk_owes_tab_on_goFirst_switches_to_needs_you_and_lands_on_its_first_card(tmp_path, monkeypatch):
     """L3 r1 MED (codex): on the Desk owes tab the waiting-on-you rows are detached, so the old jump opened Decisions history or lit a hidden chip and
-    scrolled nowhere. It now switches the strip to Needs you (the strip's own tab helper) and goes to that tab's first card."""
+    scrolled nowhere. goFirst switches the strip to Needs you (the strip's own tab helper) and goes to that tab's first card."""
     src = _strip_page(tmp_path, monkeypatch)
     out = _board(tmp_path, src, [{"eval": "document.querySelector('#ck-needs [data-needs-tab=desk]').click(); 1"},
                                  {"until": "document.querySelector('#ck-needs .needs-tab.is-on').dataset.needsTab === 'desk' && !document.querySelector('#ck-needs .needs-grid .needs-row')", "ms": 10000},
-                                 {"eval": TV + ".querySelector('.tv-jump').click(); 1"}, {"until": "document.querySelector('#ck-needs .needs-lit')", "ms": 10000}, {"eval": FIRST_STATE}])
+                                 {"eval": "window.LevainNeeds.goFirst()"}, {"until": "document.querySelector('#ck-needs .needs-lit')", "ms": 10000}, {"eval": FIRST_STATE}])
     got = json.loads(out[-1])
     assert got["tab"] == "you" and got["first"], got
     assert got["lit"] == [got["first"]] and got["focus"] == got["first"] and got["modal"] is False, got
 
 
-@needs_browser
-def test_a_strip_that_holds_nothing_or_a_replayed_frame_gives_a_plain_figure(tmp_path, monkeypatch):
-    """L3 r1 MED (all three) + LOW (complement 2): the button is there only while the LIVE strip holds a card, and never over a replayed frame (the strip shows
-    the present). The lens is handed the page's own LevainNeeds pair, the topology still names a waiting card, and: strip present -> button; strip gone ->
-    plain figure and no "Needs strip" in the empty sentence; replay frame (strip present) -> plain figure."""
-    _root, src = _sessions_fixture(tmp_path, monkeypatch)
-    v = _waiting_value(2)
-    v["tasks"] = [t for t in v["tasks"] if t["kind"] in ("consent", "question")]
-    v["nodes"] = [n for n in v["nodes"] if n["id"].startswith("w")]
-    past = {**v, "replay": True}
-    probe = ("JSON.stringify({btn: !!%s.querySelector('.tv-jump'), tag: %s.querySelector('[data-k=waiting]').tagName, none: (%s.querySelector('.tv-no-tasks') || {textContent: ''}).textContent})") % ((TV,) * 3)
-    out = _run(tmp_path, src, [{"until": "window.LevainNeeds && window.LevainNeeds.canGoFirst()", "ms": 30000},
-                               {"eval": _paint_live(v)}, {"eval": probe},
-                               {"eval": _paint_live(past)}, {"eval": probe},
-                               {"eval": "document.getElementById('ck-needs').hidden = true; 1"}, {"eval": _paint_live(v)}, {"eval": probe}])
-    live, replay, gone = json.loads(out[-6]), json.loads(out[-4]), json.loads(out[-1])
-    assert live["btn"] is True and "in the Needs strip" in live["none"], live
-    assert replay["btn"] is False and replay["tag"] == "SPAN" and "Needs strip" not in replay["none"], replay
-    assert gone["btn"] is False and gone["tag"] == "SPAN" and "2 waiting on you" in gone["none"] and "Needs strip" not in gone["none"], gone
-
-
-@needs_browser
-def test_a_click_that_cannot_reach_the_strip_moves_nothing_and_the_lens_draws_the_figure_plain(tmp_path, monkeypatch):
-    """The strip can change between the lens's draw and the click (the topology and Decisions refresh separately): the jump then moves nothing, opens no
-    history, and the lens repaints without the button."""
-    src = _strip_page(tmp_path, monkeypatch)
-    out = _board(tmp_path, src, [{"eval": "document.getElementById('ck-needs').hidden = true; " + TV + ".querySelector('.tv-jump').click(); 1"},
-                                 {"until": "!document.querySelector('#ck-hlens .tv-jump')", "ms": 10000},
-                                 {"eval": "JSON.stringify({modal: !!document.querySelector('.modal-overlay, #levain-modal'), lit: document.querySelectorAll('.needs-lit').length})"}])
-    assert json.loads(out[-1]) == {"modal": False, "lit": 0}, out
+# the live provider marks no session waiting on him (the band is where that lives), but a host can still send a waiting node that names a strip card
+# (flow's provider does): the page's own renderer is handed one, naming the strip's first row, so the click goes through the page's own openNeedsYouCard
+PATCH_WAITING_NODE = ("(() => { const T = window.LevainTopologyView, orig = T.render; T.render = function (v, o) { const w = JSON.parse(JSON.stringify(v)); "
+                      "const r = document.querySelector('#ck-needs .needs-row'); if (r && w.nodes && w.nodes.length) { w.nodes[0].state = 'waiting'; w.nodes[0].card = r.dataset.needsId; } "
+                      "return orig.call(T, w, o); }; return 1; })()")
 
 
 @needs_browser
 def test_a_waiting_node_click_in_the_agents_lens_lights_its_card_but_does_not_take_focus(tmp_path, monkeypatch):
-    """L3 r1 LOW (complement 6): focus moving is the Work lens's jump alone. Every other caller of openNeedsYouCard (here a waiting node's click) lights the card
+    """L3 r1 LOW (complement 6): focus moving is the strip's goFirst alone. Every other caller of openNeedsYouCard (here a waiting node's click) lights the card
     exactly as before and leaves the keyboard where it was."""
     src = _strip_page(tmp_path, monkeypatch, questions=0)
     ready = "document.querySelectorAll('#ck-needs .needs-row').length === 1 && document.querySelector('#ck-hlens .tv')"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"until": ready, "ms": 30000},
+                     {"eval": PATCH_WAITING_NODE},
+                     {"eval": "document.querySelector('#ck-hlens [data-tv=work]').click(); 1"},      # the cold-open lens is Agents: leave it and come back so the patched render draws it
+                     {"until": "document.querySelector('#ck-hlens .tv[data-lens=work]')", "ms": 30000},
                      {"eval": "document.querySelector('#ck-hlens [data-tv=agents]').click(); 1"}, {"until": "document.querySelector('#ck-hlens .tv-open[data-card]')", "ms": 30000},
                      {"eval": "document.querySelector('#ck-hlens .tv-open[data-card]').dispatchEvent(new MouseEvent('click', {bubbles: true})); 1"},
                      {"until": "document.querySelector('#ck-needs .needs-lit')", "ms": 10000},
@@ -918,42 +857,24 @@ def test_unattached_work_alone_is_drawn_and_no_empty_sentence_denies_it(tmp_path
     assert got["cards"] == 1 and got["none"] is False, got
 
 
-# --- L3 round 2: one predicate, a button that follows the strip, a jump that keeps the saved tab ----------------------------
-
-
 @needs_browser
-def test_a_visible_empty_strip_with_a_stale_waiting_flag_gives_no_button(tmp_path, monkeypatch):
-    """L3 r2 (codex + deepseek): the button's availability is the same visible-row predicate the jump uses. A visible grid with no row left and the waiting
-    flag still "1" is not a card to go to: canGoFirst is false, goFirst moves nothing, and a lens drawn from it is a plain figure."""
+def test_a_visible_empty_strip_with_a_stale_waiting_flag_has_no_first_card_to_go_to(tmp_path, monkeypatch):
+    """L3 r2 (codex + deepseek): availability and the move are the same visible-row predicate. A visible grid with no row left and the waiting flag still
+    "1" is not a card to go to: canGoFirst is false and goFirst moves nothing."""
     src = _strip_page(tmp_path, monkeypatch)
     out = _board(tmp_path, src, [
         {"eval": "document.querySelectorAll('#ck-needs .needs-grid .needs-row').forEach(r => r.remove()); 1"},
-        {"eval": "JSON.stringify({flag: document.getElementById('ck-needs').dataset.waiting, grid: !!document.querySelector('#ck-needs .needs-grid').offsetParent, can: window.LevainNeeds.canGoFirst(), went: window.LevainNeeds.goFirst()})"},
-        {"eval": _paint_live(_waiting_value(2))}, {"eval": "JSON.stringify({btn: !!%s.querySelector('.tv-jump')})" % TV}])
-    state, lens = json.loads(out[-3]), json.loads(out[-1])
-    assert state == {"flag": "1", "grid": True, "can": False, "went": False}, state
-    assert lens == {"btn": False}, lens
+        {"eval": "JSON.stringify({flag: document.getElementById('ck-needs').dataset.waiting, grid: !!document.querySelector('#ck-needs .needs-grid').offsetParent, can: window.LevainNeeds.canGoFirst(), went: window.LevainNeeds.goFirst()})"}])
+    assert json.loads(out[-1]) == {"flag": "1", "grid": True, "can": False, "went": False}, out
 
 
 @needs_browser
-def test_a_refresh_that_empties_the_strip_takes_the_button_off_at_once(tmp_path, monkeypatch):
-    """L3 r2 (codex F1 skew, complement 1): a Decisions-only refresh (adoptPanel) that leaves the strip empty repaints the header without the button, with no
-    click and no timer to wait for."""
-    src = _strip_page(tmp_path, monkeypatch)
-    fresh = json.dumps({"layout": [{"id": "decisions"}], "extra_panels": {"decisions": {"lines": []}}, "targets": {"rows": {}, "panels": {}}})
-    # read in the SAME turn as the refresh: the header's own 1.5 s repaint timer would otherwise hide whether the strip told it
-    out = _board(tmp_path, src, [{"eval": "(() => { window.LevainDashboard.adoptPanel('decisions', %s); return JSON.stringify({flag: document.getElementById('ck-needs').dataset.waiting || null, "
-                                          "hidden: document.getElementById('ck-needs').hidden, btn: !!%s.querySelector('.tv-jump'), tag: %s.querySelector('[data-k=waiting]').tagName}); })()" % (fresh, TV, TV)}])
-    assert json.loads(out[-1]) == {"flag": None, "hidden": True, "btn": False, "tag": "SPAN"}, out
-
-
-@needs_browser
-def test_the_jump_from_desk_owes_does_not_overwrite_the_saved_tab(tmp_path, monkeypatch):
-    """L3 r2 (complement LOW 2): the jump shows Needs you for this view; the reader's saved choice (Desk owes) is not rewritten."""
+def test_goFirst_from_desk_owes_does_not_overwrite_the_saved_tab(tmp_path, monkeypatch):
+    """L3 r2 (complement LOW 2): goFirst shows Needs you for this view; the reader's saved choice (Desk owes) is not rewritten."""
     src = _strip_page(tmp_path, monkeypatch)
     stored = "(() => { try { return window.localStorage.getItem('levain.needs.tab'); } catch (e) { return 'unreadable'; } })()"
     out = _board(tmp_path, src, [{"eval": "document.querySelector('#ck-needs [data-needs-tab=desk]').click(); 1"},
                                  {"until": "document.querySelector('#ck-needs .needs-tab.is-on').dataset.needsTab === 'desk'", "ms": 10000},
-                                 {"eval": TV + ".querySelector('.tv-jump').click(); 1"}, {"until": "document.querySelector('#ck-needs .needs-lit')", "ms": 10000},
+                                 {"eval": "window.LevainNeeds.goFirst()"}, {"until": "document.querySelector('#ck-needs .needs-lit')", "ms": 10000},
                                  {"eval": "JSON.stringify({tab: document.querySelector('#ck-needs .needs-tab.is-on').dataset.needsTab, stored: %s})" % stored}])
     assert json.loads(out[-1]) == {"tab": "you", "stored": "desk"}, out

@@ -329,19 +329,11 @@
   }
 
   // ---- the header strip ----
-  // "waiting on you" is ONE figure from ONE function: every distinct thing he can answer, counted once. A session in state waiting is one; so is
-  // a waiting task that no waiting session carries (a seat-less ask arrives as a task with no workers), while a waiting task whose worker session
-  // is itself waiting is that same ask and adds nothing. Every lens's headline figure and the Work lens's button read it; the Work lens's
-  // own count of task records says "tasks waiting" and is never the headline.
-  const waitingOnYou = (v) => {
-    const nodes = arr(v.nodes), waitingIds = new Set(nodes.filter((n) => n.state === "waiting").map((n) => n.id));
-    const alone = arr(v.tasks).filter((t) => t.kind !== "unattached" && t.state === "waiting" && !arr(t.workers).some((id) => waitingIds.has(id)));
-    return waitingIds.size + alone.length;
-  };
+  // No header carries a count of what waits on him, live or replayed. The band (the Needs strip) is the one place that number lives; a
+  // second copy, read by a second definition, can only disagree with it.
   function strip(v, which) {
     const nodes = arr(v.nodes);
     const running = nodes.filter((n) => n.state === "running").length;
-    const waiting = waitingOnYou(v);
     const row = el("div", "tv-strip");
     const stat = (k, n, word, cls) => {
       const s = el("span", "tv-stat" + (cls ? " " + cls : ""));
@@ -349,8 +341,7 @@
       s.append(el("b", null, n), " " + word);
       return s;
     };
-    row.append(stat("groups", arr(v.groups).length, "groups"), stat("nodes", nodes.length, "nodes"), stat("running", running, "running"),
-               stat("waiting", waiting, "waiting on you", waiting ? "hot" : ""));
+    row.append(stat("groups", arr(v.groups).length, "groups"), stat("nodes", nodes.length, "nodes"), stat("running", running, "running"));
     const conflicts = Array.isArray(v.conflicts) ? v.conflicts : null;       // anything but a list is "not tracked", never a zero
     let c;
     if (conflicts === null) { c = el("span", "tv-stat dim", "conflicts not tracked"); }
@@ -370,7 +361,7 @@
   function metricsStrip(v) {
     const nodes = arr(v.nodes), counts = isObj(v.counts) ? v.counts : {};
     const live = nodes.filter((n) => n.state !== "idle").length;
-    const running = nodes.filter((n) => n.state === "running").length, waiting = waitingOnYou(v);
+    const running = nodes.filter((n) => n.state === "running").length;
     const row = el("div", "tv-metrics");
     row.setAttribute("role", "group");
     row.setAttribute("aria-label", "Header figures");
@@ -393,7 +384,6 @@
         evN === null ? (past ? "not kept for the past" : "no session has an event log")
           : "hook events logged since local midnight" + (counts.events_partial ? " (a log was rotated past midnight, so at least this many)" : "")),
       m("running", "running", String(running), "sessions running now"),
-      m("waiting", "waiting on you", String(waiting), "sessions waiting on a decision or an answer from you", waiting ? "hot" : ""),
       m("tokens", "tokens today", tkN, tkN === null ? noTk
         : (tk.note ? "At least this many (" + tk.note + "). " : "") + "Fresh tokens since local midnight, from the message timestamps in " + (isNum(counts.tokens_read) ? counts.tokens_read : "the") + " session transcripts: input + output + cache writes (Codex: input - cached + output). Cache reads are not counted" + (tk.cache ? " in it; the provider reports " + tk.cache + " beside it." : "."),
         "", [tk && tk.note, tk && tk.cache, unread ? unread + (unread === 1 ? " session" : " sessions") + " not read" : ""].filter(Boolean).join(" \u00b7 ")));
@@ -401,15 +391,9 @@
     if (conflicts && conflicts.length) { const n = conflictCount(v); row.appendChild(m("conflicts", n === 1 ? "file conflict" : "file conflicts", String(n), "files two live sessions are both writing", "warn")); }
     return row;
   }
-  // Whether the Work lens's "waiting on you" figure can be a way to the Needs strip: the page hands `opts.openNeeds` (go to the strip's own first card) and
-  // `opts.canOpenNeeds` (the live strip holds a waiting card on screen right now), and the frame is live: a replayed frame (`opts.still`) is the past, and the
-  // strip shows the present, so there the figure stays plain. The topology's own card ids are not consulted: the strip is asked, not the topology.
-  const needsJump = (opts) => !!opts && !opts.still && typeof opts.openNeeds === "function" && typeof opts.canOpenNeeds === "function" && !!opts.canOpenNeeds();
   // the tasks the Work lens draws as cards (a pending consent / question record is none: the Needs strip lists it), and the unattached work it draws last:
   // ONE predicate for the lens's cards and for the strip's task counts, so the figures above the list are the list's own
   const drawnTask = (t) => t.kind !== "unattached" && t.kind !== "consent" && t.kind !== "question";
-  // what the "waiting on you" figure counts, said in its tooltip: sessions and asks, not the cards in the lens
-  const WAITING_TIP = "sessions waiting on you, plus any ask no waiting session carries, each counted once (a session with several asks counts once; the Needs strip lists each ask)";
   // the Work lens's strip, as drawn: the tasks lead, then the loud states, then conflicts and tokens
   function stripWork(v, opts) {
     const tasks = arr(v.tasks).filter(drawnTask);
@@ -421,18 +405,7 @@
       s.append(el("b", null, num), " " + word);
       return s;
     };
-    // a button (Enter and Space are the browser's own) only while something waits and the live Needs strip holds a card to go to; otherwise the plain figure
-    const wn = waitingOnYou(v), jump = wn && needsJump(opts);
-    const waiting = stat("waiting", wn, "waiting on you", wn ? "hot" : "", jump ? "button" : "span");
-    waiting.title = "Counts " + WAITING_TIP;
-    if (jump) {
-      waiting.type = "button";
-      waiting.classList.add("tv-jump");
-      waiting.title = "Go to the first item in the Needs strip. Counts " + WAITING_TIP;
-      // the strip may have moved since this was drawn: a jump it cannot make draws the lens again, and the figure is plain
-      waiting.addEventListener("click", () => { if (!opts.openNeeds() && typeof opts.repaint === "function") opts.repaint(); });
-    }
-    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"), waiting, stat("tasks-waiting", n("waiting"), n("waiting") === 1 ? "task waiting" : "tasks waiting"));
+    row.append(stat("tasks", tasks.length, tasks.length === 1 ? "task" : "tasks"));
     if (n("failed")) row.appendChild(stat("failed", n("failed"), "failed", "bad"));
     row.append(stat("stuck", n("stuck"), "stuck"));
     if (n("open")) row.appendChild(stat("open", n("open"), "open"));
@@ -592,8 +565,8 @@
     release();
     const wrap = el("div", "tv-work");
     const heads = ["Tasks · who is working on them", "Outcomes"].map((txt, i) => { const h = el("div", "tv-colh tv-colh" + (i + 1), txt); wrap.appendChild(h); return h; });
-    // the left: every task, loudest state first (a pending consent / question is no task here: the Needs strip lists it, and the strip's "waiting on you"
-    // figure goes to it); the right: its outcomes, on the same row
+    // the left: every task, loudest state first (a pending consent / question is no task here: the Needs strip lists it, and no header here
+    // counts what waits on him); the right: its outcomes, on the same row
     const centre = [];
     const heatRank = (t) => { const i = HEAT_ORDER.indexOf(t.heat); return i < 0 ? HEAT_ORDER.length : i; };
     for (const st of TASK_ORDER) {
@@ -632,12 +605,8 @@
         row += 1;
       }
     }
-    if (!centre.length) {
-      // nothing drawn: when asks wait on you, they are in the Needs strip (the figure above is the way there), so the sentence says that, not "no records"
-      // (unattached work is in `centre`, so this line never sits under a card it denies); "in the Needs strip" only where the figure above is the way there
-      const wn = waitingOnYou(v);
-      wrap.appendChild(el("p", "tv-none tv-no-tasks", wn ? "No task is running or listed here; " + wn + " waiting on you" + (needsJump(opts) ? ", in the Needs strip." : ".") : "No task records and no active work."));
-    }
+    // (unattached work is in `centre`, so this line never sits under a card it denies; no figure of what waits on him is said here: that is the Needs strip's)
+    if (!centre.length) wrap.appendChild(el("p", "tv-none tv-no-tasks", "No task records and no active work."));
     heads[1].hidden = !centre.some((t) => arr(t.outcomes).length);
     wrap.classList.toggle("tv-noouts", heads[1].hidden);        // no outcomes anywhere: the second column gives its width back
     // the lines: drawn after layout, again when the card is resized; a wrap with no lines to draw has no overlay
@@ -1638,9 +1607,12 @@
   }
 
   // the legend under the Agents graph: the five states and what a stream is
-  function legendAgents() {
+  // "waiting on you" is in a legend only when something drawn under it carries that state (a replay's history, or a host that sends it):
+  // a key to a mark nothing wears says there is a mark, which is the graph speaking for the band
+  const anyWaiting = (v) => arr(v.nodes).some((n) => n.state === "waiting") || arr(v.tasks).some((t) => t.state === "waiting");
+  function legendAgents(v) {
     const l = el("div", "tv-legend tv-legend-agents");
-    for (const st of ["waiting", "errored", "stalled", "running", "idle"]) {
+    for (const st of anyWaiting(v) ? ["waiting", "errored", "stalled", "running", "idle"] : ["errored", "stalled", "running", "idle"]) {
       const i = el("span", "tv-leg");
       const k = el("i", "tv-lg " + st);
       k.setAttribute("aria-hidden", "true");
@@ -1652,14 +1624,14 @@
   }
 
   // ---- the legend under the Work columns: the five states and the two definitions that keep waiting and stuck apart ----
-  function legend() {
-    const l = el("div", "tv-legend");
-    for (const st of ["waiting", "stuck", "failed", "running", "open", "done"]) {
+  function legend(v) {
+    const l = el("div", "tv-legend"), waits = anyWaiting(v);
+    for (const st of waits ? ["waiting", "stuck", "failed", "running", "open", "done"] : ["stuck", "failed", "running", "open", "done"]) {
       const i = el("span", "tv-leg");
       i.append(dot(st), st === "waiting" ? "waiting on you" : st);
       l.appendChild(i);
     }
-    l.appendChild(el("span", "tv-legdef", "waiting = a pending record you can answer; stuck = silence, no record"));
+    l.appendChild(el("span", "tv-legdef", waits ? "waiting = a pending record you can answer; stuck = silence, no record" : "stuck = silence, no record"));
     return l;
   }
 
@@ -1995,7 +1967,6 @@
 
   // ---- the body ----
   // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to, openLoop(intentionId): open an open loop's row,
-  // openNeeds(): go to the live Needs strip's first card (true when it went), canOpenNeeds(): the strip holds one on screen now (the Work lens's "waiting on you" button needs both),
   // replay: {readJson(url, signal), resume()} when the panel head says `replay: true`}
   function render(v, opts) {
     const o0 = opts || {};
@@ -2038,7 +2009,7 @@
       body.appendChild(wrapB);
     }
     w.appendChild(body);
-    w.appendChild(which === "agents" ? legendAgents() : legend());
+    w.appendChild(which === "agents" ? legendAgents(v) : legend(v));
     const unk = unknownLines(v);
     for (const u of unk) w.appendChild(u);
     const q = unk.length ? null : quietLine(v);        // the unknown lines already say what the past could not rebuild
@@ -2051,6 +2022,6 @@
     return w;
   }
 
-  root.LevainTopologyView = { headerLens, setHeaderLens, headerToggle, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, waitingOnYou, replaying, replayValue, returnToLive, leaveReplay, hourMarks };
+  root.LevainTopologyView = { headerLens, setHeaderLens, headerToggle, hasWork, quietLine, signature, release, render, renderLost, renderLostFault, paused, replaying, replayValue, returnToLive, leaveReplay, hourMarks };
   if (typeof module !== "undefined" && module.exports) module.exports = root.LevainTopologyView;
 })(typeof globalThis !== "undefined" ? globalThis : this);

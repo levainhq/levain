@@ -1,13 +1,12 @@
-"""The agent graph's WAITING ON YOU counts exactly what NEEDS YOU counts: a row the desk alone owes (section desk, not carried
-over to him) is not a waiting question task. Fixture of the 1110-26 perf finding: 3 operator rows, 6 desk-owed, 1 carried
-desk row (his); the expected number comes from the app badge's own function (webpush.needs.open_needs_count)."""
+"""The agent graph's REPLAY keeps the question rows it can place at T. The live graph draws none (tests/test_cockpit_graph_not_band.py),
+so the old live pin (the graph counts what NEEDS YOU counts: a row the desk alone owes is not a waiting task) is gone with the
+count it pinned."""
 from __future__ import annotations
 
 import types
 from datetime import datetime, timezone
 
 from levain.cockpit import topology as T
-from levain.webpush.needs import open_needs_count
 
 
 def _q(n, section, carried):
@@ -21,18 +20,6 @@ class _Store:
 
     def open_questions(self, agent=None):
         return self.qs
-
-
-def test_graph_waiting_count_equals_needs_count(tmp_path) -> None:
-    qs = [_q(1, "you", False), _q(2, "you", False), _q(3, "you", False)]
-    qs += [_q(10 + i, "desk", False) for i in range(6)] + [_q(20, "desk", True)]
-    store = _Store(qs)
-    now = datetime(2026, 11, 10, 21, 0, tzinfo=timezone.utc)
-    tasks = T._question_tasks(T._questions_at(store, None, now), lambda a, s: None)
-    needs = open_needs_count(tmp_path / "q", question_source=store)
-    assert needs == 4
-    assert len(tasks) == needs
-    assert sorted(t["card"] for t in tasks) == ["question:1", "question:2", "question:20", "question:3"]
 
 
 class _PastStore(_Store):

@@ -200,7 +200,7 @@ def test_the_compact_profile_is_counts_and_a_link():
     ck.register(ProviderSpec(id="p", kind="topology", title="P", priority="gauge", read=lambda c: Read(value=_good()),
                              region="operate"))
     p = ck.panel("p", profile="compact")
-    assert p["value"] == {"as_of": NOW_ISO, "nodes": 3, "tasks": 2, "waiting": 1}
+    assert p["value"] == {"as_of": NOW_ISO, "nodes": 3, "tasks": 2}            # no count of what waits on him: the band's
     assert p["next"] == "/cockpit/panel/p.json?profile=full"
 
 
@@ -267,34 +267,28 @@ def _rig(tmp_path: Path, monkeypatch):
     return ck, root, src, cdir, work
 
 
-def test_waiting_and_stalled_are_two_states_and_unattached_work_is_never_a_guessed_task(tmp_path, monkeypatch):
+def test_stalled_is_silence_and_unattached_work_is_never_a_guessed_task(tmp_path, monkeypatch):
+    # the rig's pending consent request and open question are the band's rows: the live graph draws neither
+    # (tests/test_cockpit_graph_not_band.py), so the two sessions they belong to read as their own log says
     ck, _root, _src, _cdir, _work = _rig(tmp_path, monkeypatch)
     p = ck.panel("topology", credential_class="none")
     assert p["status"] == "ok", p
     v = p["value"]
     nodes = {n["id"]: n for n in v["nodes"]}
     st = {nid: n["state"] for nid, n in nodes.items()}
-    assert st[_stem("claude_code", "s-wait")] == "waiting"
-    assert st[_stem("codex", "s-q")] == "waiting"
+    assert st[_stem("claude_code", "s-wait")] == "idle" and st[_stem("codex", "s-q")] == "running"   # no log: the record alone
     assert st[_stem("claude_code", "s-stall")] == "stalled"       # mid-turn (a tool), silent 8 m, no record
     assert st[_stem("claude_code", "s-run")] == "running"
     assert st[_stem("claude_code", "s-done")] == "idle"           # its turn ended in a reply: not stalled
     assert st[_stem("claude_code", "s-old")] == "idle"
-    # waiting carries its card; stalled carries none (silence is not a record)
-    assert nodes[_stem("claude_code", "s-wait")]["card"].startswith("consent:")
-    assert nodes[_stem("codex", "s-q")]["card"].startswith("question:")
-    assert nodes[_stem("claude_code", "s-stall")]["card"] is None
+    assert all(n["card"] is None for n in nodes.values())         # no session names a card it waits on
     assert nodes[_stem("claude_code", "s-run")]["rate"] == pytest.approx(0.6)    # three events in five minutes
     tasks = {t["id"]: t for t in v["tasks"]}
-    consent = [t for t in v["tasks"] if t["kind"] == "consent"]
-    assert len(consent) == 1 and consent[0]["state"] == "waiting" and consent[0]["card"] == consent[0]["id"]
-    assert consent[0]["workers"] == [_stem("claude_code", "s-wait")] and consent[0]["label"] == "claude_code · Bash"
-    question = [t for t in v["tasks"] if t["kind"] == "question"]
-    assert len(question) == 1 and question[0]["workers"] == [_stem("codex", "s-q")]
-    assert question[0]["label"].startswith("codex · question #")
+    assert not [t for t in v["tasks"] if t["kind"] in ("consent", "question")]
     un = tasks["unattached"]
     assert un["kind"] == "unattached" and un["state"] == "stuck"   # a stalled worker sits there
-    assert set(un["workers"]) == {_stem("claude_code", s) for s in ("s-stall", "s-run")}     # active ones only
+    assert set(un["workers"]) >= {_stem("claude_code", s) for s in ("s-stall", "s-run")}     # active ones only
+    assert _stem("claude_code", "s-old") not in un["workers"] and _stem("claude_code", "s-done") not in un["workers"]
     assert not ({w for t in v["tasks"] if t["kind"] != "unattached" for w in t["workers"]} & set(un["workers"]))
     # every cost is "not tracked" on this branch, never a guess
     assert all(t["cost"] == {"usd": None, "tokens": None, "source": None} for t in v["tasks"])
@@ -319,10 +313,14 @@ def test_an_unread_source_is_named_and_unread_sessions_are_a_fault(tmp_path, mon
         raise OSError("no")
     ck.attach_consent_rows(boom)
     v = ck.panel("topology", credential_class="none")["value"]
-    assert "decisions" in v["unreadable"] and "dispatch" in v["unreadable"]   # no directory on a bare function
-    assert any(e.startswith("decisions: unreadable") for e in v["errors"])
-    # nothing waits on an unread queue, and nothing reads as "nothing waiting" either: the error names it
-    assert _stem("claude_code", "s-wait") not in {n["id"] for n in v["nodes"] if n["state"] == "waiting"}
+    assert "dispatch" in v["unreadable"]                              # no directory on a bare function
+    # the live graph never asks the consent queue what waits (the band does): an unreadable queue is nothing it lost
+    assert "decisions" not in v["unreadable"] and not any(e.startswith("decisions") for e in v["errors"])
+    # a replay does ask it, and an unreadable queue is named there, never shown as nothing waiting
+    past = ck.panel("topology", credential_class="none", at=(datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:00Z"))
+    assert past["replay"] is True and "decisions" in past["value"]["unreadable"], past
+    assert any(e.startswith("decisions: unreadable") for e in past["value"]["errors"])
+    assert _stem("claude_code", "s-wait") not in {n["id"] for n in past["value"]["nodes"] if n["state"] == "waiting"}
     read = topo.topology_reader(install_root=None, consent=lambda: None, questions=lambda: None,
                                 hub_label=lambda c: "x")
     got = read(ReadContext(datetime.now(timezone.utc)))
@@ -378,7 +376,7 @@ def test_dispatch_contracts_are_tasks_with_ledger_outcomes_and_no_cost(tmp_path,
     assert ta["state"] == "done" and ta["workers"] == []        # the filer is not the worker
     assert [o["label"] for o in ta["outcomes"]][-1] == "verifier pass" and ta["outcomes"][-1]["ok"] is True
     assert any(o["label"] == "adopted (adopted)" and o["ok"] for o in ta["outcomes"])
-    assert tb["state"] == "waiting" and tb["waits_on"] == [f"dispatch:{b.id}"] and tb["workers"] == []
+    assert tb["state"] == "open" and tb["waits_on"] == [] and tb["workers"] == []   # filed: a record, but not a band row, so not "waiting on you" live
     assert ta["label"] == "Fix the lint in a.py." and "Keep b as is" not in json.dumps(v)    # the goal's first line only
     assert ta["cost"] == tb["cost"] == {"usd": None, "tokens": None, "source": None}
     # a contract names no worker: the filing session stays where it was
@@ -806,7 +804,7 @@ def test_a_dispatch_filers_session_is_not_its_worker_and_only_a_record_waits(tmp
     store = JobStore(cdir)
     j, _cap = store.file(submission(path, base, expires_at=utc_stamp(now + timedelta(hours=2))),
                          resolve_template=registry(), policy=POLICY, filer_session="s-run", idem_key=None)
-    seen = {}
+    seen, past = {}, {}
     for to, cause in (("filed", None), ("signed", "signature"), ("running", "slot_taken"),
                       ("verifying", "runs_exited"), ("verified", "verifier_pass")):
         if cause is not None:
@@ -815,9 +813,14 @@ def test_a_dispatch_filers_session_is_not_its_worker_and_only_a_record_waits(tmp
         t = next(x for x in tasks if x["id"] == f"dispatch:{j.id}")
         assert t["workers"] == [], (to, t)               # the filing session ("s-run") is no worker, in any state
         seen[to] = t["state"]
-    # filed and verified wait on a person (a record); the states the job runtime holds are running, never silence
-    assert seen == {"filed": "waiting", "signed": "running", "running": "running", "verifying": "running",
-                    "verified": "waiting"}, seen
+        past[to] = next(x for x in topo._dispatch_tasks(cdir, datetime.now(timezone.utc), past=True)[0]
+                        if x["id"] == f"dispatch:{j.id}")["state"]
+    # filed and verified wait on a person (a record): a replay says so; the live graph draws them OPEN, because they are not a
+    # band row and the band is the one place that says what waits on him. The states the job runtime holds are running, never silence
+    assert seen == {"filed": "open", "signed": "running", "running": "running", "verifying": "running",
+                    "verified": "open"}, seen
+    assert past == {"filed": "waiting", "signed": "running", "running": "running", "verifying": "running",
+                    "verified": "waiting"}, past
 
 
 def test_unattached_is_for_active_sessions_only_and_is_never_done(tmp_path):

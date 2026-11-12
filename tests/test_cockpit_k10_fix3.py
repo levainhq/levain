@@ -147,14 +147,10 @@ def test_f5_a_listing_that_overflowed_or_skipped_cannot_answer_for_t(flag):
         setattr(listing, k, v)
     with pytest.raises(LookupError, match="incomplete"):
         topo._consent_waiting(listing, _m(90), NOW)
-    # control: the same listing, complete, answers; and a live read is not affected
+    # control: the same listing, complete, answers
     ok = _Listing(recent=(_Entry(_m(80), _m(85)),))
     ok.overflow, ok.skipped = False, 0
     assert topo._consent_waiting(ok, _m(90), NOW) == []
-    live = _Listing()
-    for k, v in flag.items():
-        setattr(live, k, v)
-    assert topo._consent_waiting(live, None) == []
 
 
 # --- F6: the query is read as sent --------------------------------------------------------------------------------
