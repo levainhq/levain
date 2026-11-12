@@ -2021,19 +2021,85 @@ def _read_durable(path: Path) -> bytes:
         return fh.read()
 
 
+#: Row 165: the one file a slot's "don't ask again" dialog writes, by its path below the session root (the tree), and
+#: the most of it root ever hands back (``read-allow``).
+ALLOW_REL = (b"repo", b".claude", b"settings.local.json")
+ALLOW_CAP = 64 * 1024
+_ALLOW_PATH_B64 = _b64(b"/".join(ALLOW_REL))
+
+
+def session_owner(facts: EndFacts) -> int | None:
+    """The uid the session's vendor dirs are owned by (§2.1): egress the slot uid, verifier the child uid."""
+    return facts.slot_uid if facts.slot.slot_class == "egress" else facts.child_uid
+
+
+def _live_allow_stat(facts: EndFacts) -> os.stat_result | None:
+    """The live dialog file's own lstat, reached one directory at a time with none followed; None when any
+    component is absent or not a real directory."""
+    try:
+        cur = os.open(facts.live, _DIR_FLAGS)
+    except OSError:
+        return None
+    try:
+        for part in ALLOW_REL[:-1]:
+            try:
+                nxt = os.open(part, _DIR_FLAGS, dir_fd=cur)
+            except OSError:
+                return None
+            prev, cur = cur, nxt
+            os.close(prev)
+        try:
+            return os.stat(ALLOW_REL[-1], dir_fd=cur, follow_symlinks=False)
+        except OSError:
+            return None
+    finally:
+        os.close(cur)
+
+
+def allow_provenance(facts: EndFacts, rec: Mapping[str, object] | None) -> dict | None:
+    """Row 165 (codex L3 HIGH: the tree step gives every retained entry to root, so ``read-allow`` cannot tell from
+    the owner whose file it was): the dialog file's provenance, taken while the tree is still the session's and every
+    session uid is proven dead, and kept in root's ``object.json`` as ``allow: {size, digest}``. ``rec`` is the
+    manifest's line for :data:`ALLOW_REL` (its digest root's own hash of the bytes, :func:`_hash_file`). Recorded only
+    for a regular file of one link, within :data:`ALLOW_CAP`, owned by EXACTLY the session owner
+    (:func:`session_owner`) and still the inode the manifest described (size, link count); anything else, an
+    UNOWNED or outside-linked file included, gets no record, so ``read-allow`` never reads it. Deterministic on a
+    redo: the object step runs before the tree step, on the frozen live tree."""
+    if rec is None or rec.get("type") != "file" or rec.get("nlink") != 1:
+        return None
+    size, digest = rec.get("size"), rec.get("digest")
+    if type(size) is not int or not 0 <= size <= ALLOW_CAP or type(digest) is not str:
+        return None
+    owner = session_owner(facts)
+    st = _live_allow_stat(facts)
+    if (owner is None or st is None or not stat.S_ISREG(st.st_mode) or st.st_uid != owner or st.st_nlink != 1
+            or st.st_size != size):
+        return None
+    return {"size": size, "digest": digest}
+
+
 def object_record(facts: EndFacts, created_at: str) -> dict:
-    """``levain-retained-object/1`` from the two durable inputs alone, so a redo writes the same bytes.
-    ``entries`` = manifest lines; ``bytes`` = the sum of their ``size``; ``created_at`` = the retain
-    journal's ``started_at`` (DECISION: deterministic across a redo)."""
+    """``levain-retained-object/1`` from the two durable inputs and the frozen live tree, so a redo writes the same
+    bytes. ``entries`` = manifest lines; ``bytes`` = the sum of their ``size``; ``created_at`` = the retain
+    journal's ``started_at`` (DECISION: deterministic across a redo); ``allow`` (row 165, only when there is one) =
+    :func:`allow_provenance`. An object without ``allow`` (none recorded, or retained before row 165) has nothing
+    ``read-allow`` will read."""
     manifest = _read_durable(facts.retained / "manifest.jsonl")
     meta = _read_durable(facts.retained / "meta.jsonl")
     entries = total = 0
+    allow_rec = None
     for line in manifest.splitlines():
         rec = canon.parse(line)
         entries += 1
         total += rec["size"]   # type: ignore[index]
-    return {"format": OBJECT_FORMAT, "session": facts.session, "manifest_digest": digest_bytes(manifest),
-            "meta_digest": digest_bytes(meta), "entries": entries, "bytes": total, "created_at": created_at}
+        if rec["path_b64"] == _ALLOW_PATH_B64:   # type: ignore[index]
+            allow_rec = rec
+    out = {"format": OBJECT_FORMAT, "session": facts.session, "manifest_digest": digest_bytes(manifest),
+           "meta_digest": digest_bytes(meta), "entries": entries, "bytes": total, "created_at": created_at}
+    allow = allow_provenance(facts, allow_rec)   # type: ignore[arg-type]
+    if allow is not None:
+        out["allow"] = allow
+    return out
 
 
 def _object_step(facts: EndFacts, created_at: str) -> None:
@@ -3114,4 +3180,4 @@ __all__ = ["BUDGET_REFUSALS", "NOT_AN_ATTEMPT", "PERMANENT_HELD", "PERMANENT_HEL
            "REPLACED", "UNCONFIRMED", "confirmed_relogin", "park_move", "park_plan", "read_as_session", "read_slot_state",
            "reconcile_session", "repo_cloned",
            "retain_plan", "return_move", "send_cas", "tree_manifest", "unbuilt_freeze", "unbuilt_kill", "unbuilt_no_process",
-           "utc_now", "walk"]
+           "utc_now", "walk", "ALLOW_CAP", "ALLOW_REL", "allow_provenance", "session_owner"]
