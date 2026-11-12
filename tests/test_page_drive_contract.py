@@ -250,8 +250,10 @@ def test_a_no_sw_step_keeps_later_loads_out_of_the_pages_worker(tmp_path: Path, 
     # Same page and slow worker as above. Without the step a reloaded document is controlled by the worker (the control arm, so this test
     # cannot pass on a page that is never controlled); with `no_sw` first the reloaded document is not.
     monkeypatch.setenv("LEVAIN_DRIVE_FULL_CHROME", "1")
-    # a mark on the old document tells the reloaded one apart from it
-    reload_then_read = [{"eval": "window.__old = 1"}, {"eval": "location.reload(); 1"},
+    # The first document waits until the worker controls it, so the only thing left that can keep the reloaded document from being
+    # controlled is the bypass itself (the driver's own wait for the worker is skipped under `no_sw`, and would otherwise be enough).
+    # A mark on the old document tells the reloaded one apart from it.
+    reload_then_read = [{"until": "!!navigator.serviceWorker.controller", "ms": 20000}, {"eval": "window.__old = 1"}, {"eval": "location.reload(); 1"},
                         {"until": "document.readyState === 'complete' && window.__old === undefined", "ms": 20000},
                         {"eval": "navigator.serviceWorker.controller === null"}]
     with _worker_site() as url:
