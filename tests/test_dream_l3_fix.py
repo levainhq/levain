@@ -18,6 +18,7 @@ from levain.dream import cli as dcli
 from levain.dream import ready as rd
 from levain.dream import start as st
 from tests.test_cockpit_anchor_reset import _verdict
+from tests.test_dream_ready import ent  # noqa: F401 - the fixture F's test uses
 from tests.test_dream_start import ZONE, _claim, _go, _live_rig, _rows
 
 
@@ -203,6 +204,23 @@ def test_e_with_the_install_known_the_commands_name_its_own_directories_and_agen
         (start,) = [c for c in cmds if c.startswith("levain dream start")]
         assert levain_cli.build_parser().parse_args(shlex.split(start)[1:]).agent_store_dir == Path(ad), start
         _all_parse(text)
+
+
+# ------------------------------- F (L2 F9): the dream's own aged wrap is "older than the bound", not "proven dead"
+
+def test_f_the_own_wrap_note_claims_age_and_leaves_the_proof_to_the_runs_lock(ent):
+    from tests.test_dream_agent import hold_a_wrap_open
+    from tests.test_dream_orphan import HORIZON_S, age_the_wrap_to, dream_left_a_wrap, evaluate
+
+    hold_a_wrap_open(ent)
+    dream_left_a_wrap(ent)
+    age_the_wrap_to(ent.db, HORIZON_S + 600)
+    v = evaluate(ent, None)
+    assert v.verdict == rd.READY, v.reason                   # behaviour unchanged: the wrap still passes admission
+    detail = next(c for c in v.checks if c.n == 2).detail
+    assert "the dream's own" in detail and "occ-dead" in detail, detail
+    assert "proven dead" not in detail, detail
+    assert "older than the executor's age bound" in detail and "the run's lock decides" in detail, detail
 
 
 def test_a_todays_admitted_manual_row_is_still_the_one_resumed(tmp_path):
