@@ -686,9 +686,12 @@ def window_remedy(cls: str, store_path: Path | str, *, agent_dir: Path | str | N
                 f"does not start. See who holds it with `{anneal} --db {db} baton status`; {again} once this "
                 f"install's session holds it, or, once it does, {now}.")
     if cls == "failed":
-        return (f"`levain agents show dream` names the run that failed and why; {again}, or {now}. Two failed runs in a "
-                f"row pause the dream: it then runs no window and `levain dream start` refuses, until "
-                f"`levain agents resume dream`, and a separate notice says so.")
+        # the card is filed for a night that failed, when the dream may or may not be paused, so it says what pauses it
+        # and what a paused dream does, instead of promising a next window it may not get
+        return (f"`levain agents show dream` names the run that failed and why; {again}, or {now}, unless it is paused. "
+                f"{PAUSE_AFTER} failed runs in a row pause the dream, and a budget breach pauses it at once; a paused "
+                f"dream runs no window and `levain dream start` refuses until `levain agents resume dream`, and that "
+                f"pause files its own notice.")
     if cls in ("laptop-slept", "attempt-spent"):
         return f"nothing needs doing by hand; {again}, or {now}."
     if cls == "ceiling" or cls in NOT_NEWS:
@@ -824,16 +827,32 @@ def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Se
 
 def pause_notice(agent: Mapping[str, Any], failed: Sequence[Mapping[str, Any]], *, pause_after: int = PAUSE_AFTER,
                  attention: Callable[[str, str], None]) -> bool:
-    """One attention row naming the failed runs and ``levain agents resume`` for an agent that is paused with its
-    failure streak at or past ``pause_after``. True when a row was raised. The key is per agent, so a second call
-    upserts the same row."""
-    if agent.get("operation") != "paused" or int(agent.get("failure_streak") or 0) < pause_after:
+    """One attention row naming the failed runs and ``levain agents resume`` for an agent that is paused by its
+    failures. True when a row was raised. The key is per agent, so a second call upserts the same row.
+
+    Two pauses are the failures' own: the agent's failure streak at or past ``pause_after`` (the agent's SIGNED
+    ``on_failure.pause_after``, :func:`levain.agents.controller.pause_after_of`; the caller passes it, the constant is
+    only the default), and a budget breach, which pauses at once at a streak of one (the accounting settle): its latest
+    failed run ended ``budget_breach``. A paused agent with a shorter streak and no breach was paused by hand: no row.
+    ``failed`` are the agent's counted failed runs (:func:`levain.agents.controller.failing_run_rows`, the writer's own
+    rule), so the runs named are the runs that counted."""
+    streak = int(agent.get("failure_streak") or 0)
+    if agent.get("operation") != "paused" or streak < 1:
         return False
-    recent = sorted(failed, key=lambda r: str(r.get("ended_at") or r.get("admitted_at") or ""))[-pause_after:]
-    named = "; ".join(f"{r.get('occurrence_id')} ({r.get('reason') or r.get('state')})" for r in recent) or "no run read"
-    attention(f"dream-paused:{agent.get('agent_id')}",
-              f"{agent.get('name', NAME)} is paused after {pause_after} failed runs in a row: {named}. "
-              f"After the cause is fixed: levain agents resume {agent.get('name', NAME)}")
+    name = agent.get("name", NAME)
+    recent = sorted(failed, key=lambda r: str(r.get("ended_at") or r.get("admitted_at") or ""))
+
+    def named(rows: Sequence[Mapping[str, Any]]) -> str:
+        return "; ".join(f"{r.get('occurrence_id')} ({r.get('reason') or r.get('state')})" for r in rows) or "no run read"
+
+    if recent and recent[-1].get("reason") == "budget_breach":
+        text = f"{name} is paused at once by a budget breach: {named(recent[-1:])}."
+    elif streak >= pause_after:
+        text = (f"{name} is paused after {pause_after} failed run{'' if pause_after == 1 else 's'} in a row: "
+                f"{named(recent[-pause_after:])}.")
+    else:
+        return False
+    attention(f"dream-paused:{agent.get('agent_id')}", f"{text} After the cause is fixed: levain agents resume {name}")
     return True
 
 
@@ -1111,8 +1130,11 @@ def tick_notices(store: Any, *, now: datetime, missed_windows: Mapping[str, Sequ
         guard(step, close, "close_window")
 
     def pause() -> None:
-        failed = [r for r in rows if r.get("agent_id") == agent_id and r.get("state") in ("failed", "stopped")]
-        rep.steps["pause_notice"] = "raised" if pause_notice(agent, failed, attention=attention) else "not paused"
+        # the runs the writer counted (its own rule), and the threshold it pauses at (the agent's signed one)
+        failed = _ctl.failing_run_rows([r for r in rows if r.get("agent_id") == agent_id])
+        after = _ctl.pause_after_of(_spec.get_agent(store, agent_id)["spec"])
+        rep.steps["pause_notice"] = ("raised" if pause_notice(agent, failed, pause_after=after, attention=attention)
+                                     else "not paused")
 
     guard("pause_notice", pause)
 
