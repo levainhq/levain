@@ -857,8 +857,8 @@ def tick_notices(store: Any, *, now: datetime, missed_windows: Mapping[str, Sequ
                  drill: Callable[..., Any] | None = None, days: int = NOTICE_DAYS) -> NoticeReport:
     """The production caller of the night's notices (Q6 (a)): once per agents tick, after the claims, for a store whose
     install names a dream. In order: :func:`close_window` for each of the last ``days`` closed windows (oldest first, so
-    the standing-item rule reads in time order), :func:`pause_notice`, :func:`renewal_check` on the dream's live link
-    (``link_of(agent_id, spec_hash)``, the tick's own replay of the authority log), :func:`drill_tick`.
+    the standing-item rule reads in time order), :func:`pause_notice`, :func:`renewal_check` on the dream's last-expiring
+    link (``link_of(agent_id, spec_hash)``, the tick's own replay of the authority log; present, not necessarily live), :func:`drill_tick`.
 
     Each step runs on its own: one that raises, or a card the feed refuses, is a ``problem`` in the report and is raised
     as an attention item too (``dream-notice-failed:<step>``) when the feed is writable, and the steps after it still
