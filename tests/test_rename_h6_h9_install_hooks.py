@@ -291,6 +291,16 @@ def _changed_lines(a: str, b: str) -> list[str]:
     return changed
 
 
+def _removed_lines(a: str, b: str) -> list[str]:
+    """The lines the old text `a` had that the new text `b` no longer has (the old half of every changed block)."""
+    lines_a, lines_b = a.split("\n"), b.split("\n")
+    gone: list[str] = []
+    for tag, i1, i2, _j1, _j2 in difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False).get_opcodes():
+        if tag != "equal":
+            gone += lines_a[i1:i2]
+    return gone
+
+
 def test_the_install_tree_differs_only_in_the_renamed_files(both_installs):
     old, new, _o, _n = both_installs
     t_old, t_new = _tree(old), _tree(new)
@@ -306,8 +316,17 @@ def test_nothing_that_is_not_the_disposition_word_changed_in_those_files(both_in
     t_new = _tree(new)
     for rel in sorted(RENAMED_FILES | set(DOC_RENAME.values())):
         a, b = t_old[rel].decode(), t_new[rel].decode()
-        for line in _changed_lines(a, b):
-            assert RENAME_WORDS.search(line), f"{rel}: a changed line that is not about the rename: {line!r}"
+        # The germinate-trigger helper gained a feature after the old release (row 178, the split: an agenda that waits on an
+        # event), which is ADDED code with no rename word in it. For that one file the rename guard is therefore on what the
+        # old release wrote: every line the old copy had and the new one lost must be about the rename (or be the
+        # `datetime` import the feature widened). Every other file is held to the full rule.
+        if rel == "activation/hooks/_levain_hook.py":
+            for line in _removed_lines(a, b):
+                assert RENAME_WORDS.search(line) or line == "from datetime import datetime, timezone", \
+                    f"{rel}: an old line lost that is not about the rename: {line!r}"
+        else:
+            for line in _changed_lines(a, b):
+                assert RENAME_WORDS.search(line), f"{rel}: a changed line that is not about the rename: {line!r}"
         # the install's `seed/` directory is not a disposition: every path through it survives
         assert a.count("seed/") == b.count("seed/"), rel
 
