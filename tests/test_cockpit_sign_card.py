@@ -18,10 +18,11 @@ import socket
 import subprocess
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from unittest import mock
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -186,19 +187,19 @@ class _Rig:
                 time.sleep(self.manifest_delay)
             return real_manifest(*a, **k)
 
-        if self.hello_delay or self.manifest_delay:
-            cockpit_stream.run = late_run
-        if self.manifest_delay:
-            self.ck.manifest = slow_manifest
+        patches = ExitStack()
         try:
+            if self.hello_delay or self.manifest_delay:
+                patches.enter_context(mock.patch.object(cockpit_stream, "run", late_run))
+            if self.manifest_delay:
+                patches.enter_context(mock.patch.object(self.ck, "manifest", slow_manifest))
             # the question's caller names its sign request (flow's desk reader does this; the kernel store files none)
             signed = _Signed(httpd.question_store, {self.question.n: QRID})
             httpd.question_store = signed
             self.ck.attach_question_rows(signed)
             yield url, httpd
         finally:
-            cockpit_stream.run = real_run
-            self.ck.__dict__.pop("manifest", None)
+            patches.close()
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=5)
