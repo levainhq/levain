@@ -47,7 +47,7 @@ __all__ = ["CLAIMED", "DUPLICATE", "OVERLAP", "LEASE_S", "TickResult", "occurren
            "close_no_slot", "tick", "heartbeat", "takeover", "Window", "LaunchResult", "launch",
            "record_session_key", "Started", "start_run", "dispatch_probes", "SESSION_KEY_RE", "SESSION_GRACE_S",
            "Ended", "settle_terminal", "GatedChild", "GATE_REFUSED", "fire_argv", "fire_record_path", "spawn_fire",
-           "claim_fire", "fire", "miss_streak"]
+           "claim_fire", "fire", "miss_streak", "miss_windows"]
 
 CLAIMED = "claimed"
 DUPLICATE = "duplicate"
@@ -370,6 +370,16 @@ def miss_streak(conn: sqlite3.Connection, agent_id: str) -> int:
     """Consecutive windows with a missed slot and no ``done`` run since, at most :data:`STREAK_CAP`; 0 when none or
     the record is unreadable."""
     return len(_since_done(_read_streak(conn, agent_id) or [], _last_done(conn, agent_id)))
+
+
+def miss_windows(conn: sqlite3.Connection, agent_id: str) -> list[str]:
+    """The scheduled windows (window keys) the streak record holds for ``agent_id``: the windows with a missed slot and
+    no ``done`` run since, oldest first. A walk's missed slots are never written as rows, and ``TickResult`` reports
+    them to the ONE tick that walked them, so this record is the only thing a later tick can read. A manual
+    occurrence's miss (identity ``occurrence:<id>``) is not a window and is left out. [] when none or the record is
+    unreadable."""
+    return [identity for _, identity in _since_done(_read_streak(conn, agent_id) or [], _last_done(conn, agent_id))
+            if not identity.startswith("occurrence:")]
 
 
 def _walk(store: AgentStore, agent_id: str, snap: tuple, trigger: dict, binding: str, cursor: datetime,
