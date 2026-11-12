@@ -230,7 +230,8 @@ def test_a_pathological_card_falls_back_to_a_skeleton_that_still_files(tmp_path,
     c = cd.build_card("failed", occurrence="p", day="2026-11-02", reason=huge_reason, prior=big_text(0, "a"),
                       saved=big_text(1, "b"), out_dir=tmp_path, notes={"contradictions": ["c"]})
     assert len(canonical(c.body)) <= cd.BODY_LIMIT and c.authority_relevant
-    assert filed(review_store, c).body.get("remedy") == "levain dream rollback p"
+    remedy = filed(review_store, c).body.get("remedy")             # the skeleton keeps the next step; a failed card
+    assert remedy and "nothing to roll back" in remedy             # changed nothing, so it names no rollback
 
 
 # ---------------------------------------------------------------------------------------- from a real dream's files
@@ -247,7 +248,7 @@ def test_a_real_dream_becomes_a_consolidated_card_from_its_own_files(scratch):
     assert c.body["diff"]["sections"] == {"Understanding": {"added": 1, "removed": 1}}
     assert c.body["usage"]["source"] == "fake" and c.body["usage"]["readable"] is True
     assert c.body["models"] == ["fake"] and c.body["composes"]["n"] == 1
-    assert c.body["remedy"] == "levain dream rollback o2" and not c.authority_relevant
+    assert c.body["remedy"] == f"levain dream rollback o2 --store-dir {scratch.parent}" and not c.authority_relevant
     assert (occ(scratch, "o2") / cd.DIFF_FILE).is_file()
 
 

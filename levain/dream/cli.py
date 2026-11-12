@@ -239,7 +239,12 @@ def run_dream_enable(args: argparse.Namespace) -> int:
             card = f"The shadow install's facts cannot be read ({exc}); no fire runs until `levain dream enable` " \
                    "writes them again."
     else:
-        card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r, expires=expires, time=when)
+        try:                                    # the Undo command carries the install's store when its facts are written
+            install_store = da.read_install(store.directory).store_path.parent
+        except da.InstallRefused:
+            install_store = None
+        card = da.signing_card_text(str(zone), per_run_usd=r, night_usd=2 * r, expires=expires, time=when,
+                                    store_dir=install_store)
     doc = {"agent_id": reg.agent_id, "spec_hash": reg.spec_hash, "role_hash": reg.role_hash, "version": reg.version,
            "created": reg.created, "zone": reg.zone, "time": when, "signing_card": card,
            "install_facts": None if install_path is None else str(install_path), "install_kind": now,
