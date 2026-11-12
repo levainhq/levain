@@ -44,9 +44,19 @@ def resolutions(path: str) -> List[tuple]:
     return out
 
 
-def file_lines(path: str) -> List[dict]:
-    with open(path, "rb") as f:
-        return [json.loads(x) for x in f.read().splitlines()]
+def file_lines(path: str, *, wait_s: float = 2.0) -> List[dict]:
+    """The file's lines as dicts. A writer thread may be mid-append, so a last line with no newline yet is waited for (at
+    most `wait_s`, then the parse error stands); a newline-terminated line that does not parse is corruption and raises at once."""
+    end = time.monotonic() + wait_s
+    while True:
+        with open(path, "rb") as f:
+            raw = f.read()
+        try:
+            return [json.loads(x) for x in raw.splitlines()]
+        except json.JSONDecodeError:
+            if raw.endswith(b"\n") or time.monotonic() >= end:
+                raise
+        time.sleep(0.01)
 
 
 def kinds(path: str) -> List[str]:

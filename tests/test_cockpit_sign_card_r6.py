@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_sign_card import FACET_NOTE, OPEN, OPTION_B, QRID, STRIP_FACET, TOK, _Rig, needs_ssh
 from tests.test_cockpit_sign_card_r5 import (AFTER, BUTTONS, NEVER_SENT, OTHER, RECORD, _card, _remember)
@@ -50,10 +52,13 @@ def test_s1_an_answer_still_on_its_way_is_fenced_by_its_attempt_read_and_never_l
     assert rig.nothing_signed(QRID)                       # and the answer that arrived after it was refused
 
 
+# the second case is the CI box: the page's change stream says hello after the page was drawn and the test has begun
+# (CI run 43184130543 on levainhq/levain: `assert 1 == 0`, one flushReload inside the window)
+@pytest.mark.parametrize("hello_delay", [0.0, 1.5], ids=["hello_on_time", "hello_late"])
 @needs_browser
 @needs_ssh
-def test_s1_s6_an_answer_that_never_left_comes_back_on_its_attempts_refusal_and_is_not_redrawn(tmp_path, monkeypatch) -> None:
-    rig = _Rig(tmp_path, monkeypatch)
+def test_s1_s6_an_answer_that_never_left_comes_back_on_its_attempts_refusal_and_is_not_redrawn(tmp_path, monkeypatch, hello_delay) -> None:
+    rig = _Rig(tmp_path, monkeypatch, hello_delay=hello_delay)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             *_card(rig),

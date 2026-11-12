@@ -13,7 +13,8 @@ from __future__ import annotations
 import json
 
 from tests.test_cockpit_flip_parity import _drive, needs_browser
-from tests.test_cockpit_sign_card import DESKTOP, FACET_NOTE, OPEN, OPTION_B, QRID, STRIP_FACET, TOK, _Rig, needs_ssh
+from tests.test_cockpit_sign_card import (DESKTOP, FACET_NOTE, OPEN, OPTION_B, QRID, STRIP_FACET, STRIP_SETTLED, TOK, _Rig,
+                                          needs_ssh)
 
 CRED = "bGV2YWluLWNhcmQtY3JlZA"        # base64url of the rig's credential id (b"levain-card-cred")
 OTHER = "c29tZS1vdGhlci1jcmVk"         # base64url of a credential id the authenticator does not hold
@@ -53,7 +54,7 @@ def _remember(rig: _Rig, raw_id: str) -> dict:
 
 
 def _card(rig: _Rig, *steps: dict) -> list:
-    return [DESKTOP, rig.authenticator(), *steps, {"until": STRIP_FACET + " && 1", "ms": 30000}, {"eval": SPY},
+    return [DESKTOP, rig.authenticator(), *steps, {"until": STRIP_SETTLED + " && 1", "ms": 30000}, {"eval": SPY},
             {"eval": HOLD_RELOAD}]
 
 
