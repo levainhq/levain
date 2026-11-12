@@ -581,7 +581,47 @@ def _required_store_path(store_path: object) -> str:
     return str(store_path)
 
 
-def window_remedy(cls: str, store_path: Path | str) -> str:
+def install_defaults() -> tuple[Path, Path]:
+    """``(cockpit_root, coord_dir)`` that ``levain dream enable`` writes when it is given no ``--cockpit-root`` and no
+    ``--coord-dir``, resolved: ``<levain home>/cockpit`` and the desk home. One function, so the enable verb and the
+    card that prints an enable line agree on what "default" means."""
+    import os
+
+    from levain.desk.launch import default_desk_dir
+
+    home = os.environ.get("LEVAIN_HOME")
+    levain_home = Path(home).expanduser() if home else Path.home() / ".levain"
+    return (levain_home / "cockpit").expanduser().resolve(), Path(default_desk_dir()).expanduser().resolve()
+
+
+def _enable_flags(agent_dir: Path | str | None, install: DreamInstall | None = None) -> str | None:
+    """The flags (each with its leading space) a pasted ``levain dream enable`` needs so that it names THIS install and
+    rewrites none of its facts: ``--agent-store-dir`` when the agent store is not the default one, ``--cockpit-root``
+    and ``--coord-dir`` when the install's own differ from :func:`install_defaults`. ``""`` for the default install;
+    None when ``agent_dir`` is not given or its install facts cannot be read (the caller then says so). ``install`` is
+    the facts the caller already read (:func:`read_install` of ``agent_dir``); omitted, they are read here."""
+    if agent_dir is None:
+        return None
+    try:
+        from levain.autonomic.db import default_store_dir
+
+        inst = install if install is not None else read_install(agent_dir)
+        cockpit, coord = install_defaults()
+        ad = Path(agent_dir).expanduser().resolve()
+        flags: list[str] = []
+        if ad != default_store_dir():
+            flags += ["--agent-store-dir", str(ad)]
+        if inst.cockpit_root.expanduser().resolve() != cockpit:
+            flags += ["--cockpit-root", str(inst.cockpit_root.expanduser().resolve())]
+        if inst.coord_dir.expanduser().resolve() != coord:
+            flags += ["--coord-dir", str(inst.coord_dir.expanduser().resolve())]
+    except Exception:  # noqa: BLE001 - a card is still filed; its text then names the flags it could not read
+        return None
+    return "".join(f" {shlex.quote(f)}" for f in flags)
+
+
+def window_remedy(cls: str, store_path: Path | str, *, agent_dir: Path | str | None = None,
+                  install: DreamInstall | None = None) -> str:
     """The next step a did-not-consolidate card names for class ``cls``, every command in it one that exists and runs as
     printed. ``levain dream start`` starts a dream by hand through the same signed link and ceiling as a scheduled run
     (``levain agents`` has no run-now, and ``levain dream run`` is for a store COPY), and a class names it only where it
@@ -599,7 +639,10 @@ def window_remedy(cls: str, store_path: Path | str) -> str:
     older than that floor and the bound; every other open wrap (a seat's with the floor unset, or any wrap younger
     than the bound or the floor) stays until a person clears it, with anneal's own two commands. The text names the
     setting with the install's real store directory (the parent of ``store_path``) and leaves only the hours, which
-    are the person's number, as a placeholder."""
+    are the person's number, as a placeholder. ``agent_dir`` (the agent store holding the install facts) lets that line
+    carry the install's own non-default ``--agent-store-dir``, ``--cockpit-root`` and ``--coord-dir``, so pasting it
+    rewrites no fact with a default; without it, the text says to add them. ``install`` is those facts when the caller
+    has already read them."""
     from levain.manifest import anneal_invocation
 
     again = "the dream tries again in its next window"
@@ -608,10 +651,14 @@ def window_remedy(cls: str, store_path: Path | str) -> str:
     db = shlex.quote(_required_store_path(store_path))
     if cls == "wrap-open":
         sd = shlex.quote(str(Path(store_path).parent))
+        flags = _enable_flags(agent_dir, install)
+        same = (" with the --agent-store-dir, --cockpit-root and --coord-dir enable was given, if any,"
+                if flags is None else "")
         return (f"A wrap is open on the store, so the dream does not start. The dream clears its own stale wrap by "
                 f"itself, once it is older than the executor's age bound; it clears a seat's wrap only when this "
-                f"install's `orphan_floor_hours` is set (`levain dream enable --store-dir {sd} --orphan-floor-hours "
-                f"<hours>` sets it, and the wrap must be older than that floor), and until then, or while the wrap "
+                f"install's `orphan_floor_hours` is set (`levain dream enable --store-dir {sd}{flags or ''} "
+                f"--orphan-floor-hours <hours>`{same} sets it, and the wrap must be older than that floor), and until "
+                f"then, or while the wrap "
                 f"is younger, it stays until you clear it. If a live seat opened it, leave it: it ends when that "
                 f"seat saves or cancels. If that seat is dead, look at it with `{anneal} --db {db} wrap-status` and, "
                 f"once you have confirmed it is dead, clear it with "
@@ -632,11 +679,14 @@ def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Se
                  review_store: Any, store_path: Path | str, occ_dir: Path | str | None = None, miss_streak: int = 0,
                  missed_windows: Sequence[str] = (),
                  attention: Callable[[str, str], None] | None = None, feed: str = CARD_FEED,
-                 remedy: str | None = None) -> CloseResult:
+                 remedy: str | None = None, agent_dir: Path | str | None = None,
+                 install: DreamInstall | None = None) -> CloseResult:
     """The first pass after window ``day`` closes. Files at most one did-not-consolidate card for the window, never one
     per slot. ``rows`` are the agent's occurrence rows (any window; this selects its scheduled rows of ``day``).
     ``store_path`` (the install's ``memory.db``) is REQUIRED, with no default: ``remedy`` is the card's next step and,
-    omitted, :func:`window_remedy` writes it for the night's class carrying ``store_path``, so the commands it prints
+    omitted, :func:`window_remedy` writes it for the night's class carrying ``store_path`` (and ``agent_dir``, the agent
+    store holding the install facts, and ``install``, those facts when already read, so its commands name this
+    install's own directories), so the commands it prints
     run as printed.
 
     * The window is closed only from the next dream-day's start (05:00 local); before that, or while any row of the
@@ -688,7 +738,7 @@ def close_window(*, agent_id: str, day: date, now: datetime, zone: str, rows: Se
             return out
         c = _card.build_card("did-not-consolidate", occurrence=f"window {key}", agent_id=agent_id, day=day.isoformat(),
                              store_dir=Path(store_path).parent, reason=f"{cls}: night did not consolidate: {detail}",
-                             remedy=remedy or window_remedy(cls, store_path),
+                             remedy=remedy or window_remedy(cls, store_path, agent_dir=agent_dir, install=install),
                              out_dir=occ_dir if occ_dir is not None and Path(occ_dir).is_dir() else None)
         _, new = _card.file_card(review_store, c, feed=feed)
     except Exception as exc:  # noqa: BLE001 - nothing filed is reported, never swallowed
@@ -947,7 +997,7 @@ def tick_notices(store: Any, *, now: datetime, missed_windows: Mapping[str, Sequ
         def close(day: date = day, step: str = step) -> None:
             got = close_window(agent_id=agent_id, day=day, now=now, zone=zone, rows=rows, review_store=review_store,
                                store_path=inst.store_path, miss_streak=streak, missed_windows=missed,
-                               attention=attention)
+                               attention=attention, agent_dir=agent_dir, install=inst)
             rep.steps[step] = got.action
             if got.action == "refused":
                 raise RuntimeError(f"the card was refused: {got.why}")
