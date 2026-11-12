@@ -101,12 +101,31 @@ def _eval_assigned(src: str, name: str):
     import types
     mod = types.ModuleType("levain.desk.legacy")
     mod.__dict__.update(ns)
-    sys.modules.setdefault("levain", types.ModuleType("levain"))
-    sys.modules.setdefault("levain.desk", types.ModuleType("levain.desk"))
-    sys.modules["levain.desk.legacy"] = mod
-    out: dict = {}
-    exec(compile(src, "t.py", "exec"), out)
-    return out[name]
+    # the three entries are put back as they were: a module left in sys.modules here served every later test in the
+    # process, and the desk store's own imports of levain.desk.legacy then got this stub (two desk-store tests that ran
+    # behind this file in one shard saw "no desk store")
+    names = ("levain", "levain.desk", "levain.desk.legacy")
+    saved = {n: sys.modules[n] for n in names if n in sys.modules}
+    try:
+        sys.modules.setdefault("levain", types.ModuleType("levain"))
+        sys.modules.setdefault("levain.desk", types.ModuleType("levain.desk"))
+        sys.modules["levain.desk.legacy"] = mod
+        out: dict = {}
+        exec(compile(src, "t.py", "exec"), out)
+        return out[name]
+    finally:
+        for n in names:
+            if n in saved:
+                sys.modules[n] = saved[n]
+            else:
+                sys.modules.pop(n, None)
+
+
+def test_the_transform_helper_leaves_sys_modules_as_it_found_it():
+    names = ("levain", "levain.desk", "levain.desk.legacy")
+    before = {n: sys.modules.get(n) for n in names}
+    assert _eval_assigned("ROLE = 1\n", "ROLE") == 1
+    assert {n: sys.modules.get(n) for n in names} == before
 
 
 def test_schema_text_is_byte_identical_after_the_transform():
