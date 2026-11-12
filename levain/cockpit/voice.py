@@ -47,7 +47,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from levain.authority import grants_in_force, voice_key_for, voice_key_record
+from levain.authority import grant_stop_reason, grants_in_force, voice_key_for, voice_key_record
 from levain.cockpit import card_script
 from levain.cockpit import room as cockpit_room
 from levain.voice import custody
@@ -307,6 +307,19 @@ def _grants_for(data_root: Path | str) -> tuple[Any, str]:
         return {}, "unreadable"
 
 
+def _stopped_voice_keys(data_root: Path | str) -> dict[str, str]:
+    """``provider -> why`` for each voice key the policy holds that a revoked signing key stopped
+    (:func:`levain.authority.grant_stop_reason`), so the readout can say "stopped" where it would say "no key". Words
+    only: nothing reads it to decide anything. Its own read of the log, so it is asked only when a provider shows no key
+    in force; a log that cannot be read says nothing here (``authority`` says that)."""
+    try:
+        state = custody.authority_for(data_root)()
+        return {str(g.get("provider")): why for gid, g in state.policy.grants.items()
+                if voice_key_record(g) and (why := grant_stop_reason(state, gid)) is not None}
+    except Exception:       # noqa: BLE001 - presence words only; the rows above are the readout
+        return {}
+
+
 def _stt_keyed(grants: Any) -> bool:
     """True when a served provider with a speech-to-text model holds a key whose uses list ``stt``."""
     if not grants:
@@ -355,13 +368,18 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     premium_stt_setting = premium_stt
     premium_stt = premium_stt if premium_stt is True or premium_stt is False else _stt_keyed(grants)
     rows = []
+    stops: dict[str, str] | None = None
     for name, data in offered().items():
         record = voice_key_for(grants, name) if grants else None
         uses = sorted(u for u in record["uses"] if u != "stt" or (premium_stt and data.stt_model)) \
             if record is not None else []
+        if record is None and authority == "ok":
+            stops = _stopped_voice_keys(data_root) if stops is None else stops
+        stopped_why = stops.get(name, "") if record is None and stops else ""
         rows.append({"name": name,
                      "uses": uses,
-                     "key": "set" if record is not None else "not_set",
+                     "key": "set" if record is not None else "stopped" if stopped_why else "not_set",
+                     "stopped_why": stopped_why,
                      "record_id": record["id"] if record is not None else None,
                      "last_read": last_read.get(name),
                      "voices": list(data.voices), "default_voice": data.default_voice, "tts_model": data.tts_model,
