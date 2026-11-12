@@ -445,9 +445,17 @@ def test_fire_factory_binds_a_consolidate_that_handles_a_stop(tmp_path, monkeypa
 # 1112-1 (board 1693): a fire is a fresh process whose AgentAuthority never replayed the log, so the first fence read
 # raised AgentCoverMoved("no verified replay is held") and line 1 of every fire's log was the journal's warning about it.
 
-def _real_authority_fire(tmp_path, monkeypatch):
+def _corrupt_anchor(rig):
+    from levain import authority as _auth
+    anchor = _auth.anchor_path(rig.world.root)
+    anchor.parent.mkdir(parents=True, exist_ok=True)
+    anchor.write_bytes(b"not an anchor")
+
+
+def _real_authority_fire(tmp_path, monkeypatch, *, anchor_unreadable_at_build=False):
     """A launched dream occurrence whose install names the rig's own cockpit root (the signed link's log), and the
-    keyword arguments the production factory builds for it; nothing composes."""
+    keyword arguments the production factory builds for it; nothing composes. With ``anchor_unreadable_at_build`` the
+    authority anchor is corrupted before the factory runs, so the factory's own refresh is the one that fails."""
     from levain.dream import executor as _ex
     monkeypatch.setattr(_ex, "DreamExecutor", lambda **kw: object())
     rig = Rig(tmp_path)
@@ -456,6 +464,8 @@ def _real_authority_fire(tmp_path, monkeypatch):
     oid = rig.claim("k")
     assert rig.launch(oid).outcome == "launched"
     da.write_install(rig.store.directory, **{**_facts(tmp_path), "cockpit_root": rig.world.root})
+    if anchor_unreadable_at_build:
+        _corrupt_anchor(rig)
     kw = da.fire_factory(rig.store, oid, 0)
     kw["sup"]._clock = rig.now      # the rig's links are dated on its fake clock; the factory's supervisor reads the wall
     return rig, oid, kw
@@ -474,14 +484,13 @@ def test_a_dream_fires_log_does_not_open_with_the_cold_start_cover_warning(tmp_p
     assert rig.row(oid)["state"] == "done"
 
 
-def test_a_fire_whose_authority_log_cannot_be_read_still_ends_unclassified_and_launched(tmp_path, monkeypatch, caplog):
-    # behaviour: the refresh the factory tries fails too (the authority anchor is unreadable), so nothing changes from before:
+def test_a_factory_refresh_that_fails_is_swallowed_and_the_fire_still_ends_unclassified_and_launched(tmp_path, monkeypatch, caplog):
+    # behaviour: the anchor is unreadable BEFORE the factory runs, so the factory's own refresh fails; building the fire
+    # still returns (the failure is logged at debug, not raised), and the run ends as it did before the pre-refresh:
     # the effect is UNCLASSIFIED and never runs, the supervisor's one refresh fails, the row stays launched, exit 1
-    rig, oid, kw = _real_authority_fire(tmp_path, monkeypatch)
-    from levain import authority as _auth
-    anchor = _auth.anchor_path(rig.world.root)
-    anchor.parent.mkdir(parents=True, exist_ok=True)
-    anchor.write_bytes(b"not an anchor")
+    with caplog.at_level("DEBUG"):
+        rig, oid, kw = _real_authority_fire(tmp_path, monkeypatch, anchor_unreadable_at_build=True)
+    assert caplog.text.count("the authority pre-refresh failed") == 1, caplog.text
     ran = []
     sup = kw.pop("sup")
     with caplog.at_level("WARNING"):
@@ -490,6 +499,40 @@ def test_a_fire_whose_authority_log_cannot_be_read_still_ends_unclassified_and_l
     assert rig.row(oid)["state"] == "launched"
     assert "unreadable (AgentCoverMoved)" in caplog.text            # the journal still fails closed, and says so
     assert caplog.text.count("the authority refresh failed") == 1    # the supervisor's own one refresh, as before
+
+
+def test_an_anchor_that_goes_unreadable_after_the_factory_refreshed_still_ends_unclassified_and_launched(tmp_path, monkeypatch, caplog):
+    # behaviour: the factory's refresh read; the anchor is corrupted afterwards, so the first fence read is refused: the
+    # effect is UNCLASSIFIED and never runs, the supervisor's one refresh fails, the row stays launched, exit 1
+    rig, oid, kw = _real_authority_fire(tmp_path, monkeypatch)
+    _corrupt_anchor(rig)
+    ran = []
+    sup = kw.pop("sup")
+    with caplog.at_level("WARNING"):
+        rep = da.run_body(sup, oid, 0, **{**kw, "executor": Ex(), "consolidate": lambda: ran.append(1) or {"outcome": "empty"}})
+    assert ran == [] and rep.code == 1 and rep.state == "launched" and "unclassified" in rep.note
+    assert rig.row(oid)["state"] == "launched"
+    assert "unreadable (AgentCoverMoved)" in caplog.text            # the journal still fails closed, and says so
+    assert caplog.text.count("the authority refresh failed") == 1    # the supervisor's own one refresh, as before
+
+
+def test_a_revoke_landing_between_the_factory_refresh_and_the_first_fence_read_ends_the_run_stopped_without_the_effect(
+        tmp_path, monkeypatch, caplog):
+    # behaviour: the factory's refresh read the log, then the agent's link is revoked; the first fence read sees the log
+    # head moved and is UNCLASSIFIED, the supervisor's one refresh re-reads the log, and the retry finds the link not
+    # live: STALE, the stop is confirmed, the row ends stopped, and the effect never ran
+    from tests.test_authority_agent_link import revoke_agent
+    rig, oid, kw = _real_authority_fire(tmp_path, monkeypatch)
+    rig.world.link(revoke_agent(rig.agent, rig.sid), "laptop")
+    ran = []
+    ex = Ex(True)
+    sup = kw.pop("sup")
+    with caplog.at_level("WARNING"):
+        rep = da.run_body(sup, oid, 0, **{**kw, "executor": ex, "consolidate": lambda: ran.append(1) or {"outcome": "empty"}})
+    assert ran == [] and rep.code == 1 and "stale" in rep.note and ex.stops == 1
+    row = rig.row(oid)
+    assert (row["state"], row["reason"]) == ("stopped", "link_not_live")
+    assert caplog.text.count("unreadable (AgentCoverMoved)") == 1      # the one UNCLASSIFIED read, then the re-read answered
 
 
 def test_an_ordinary_agent_gets_no_hook_whatever_its_role_row_holds_and_a_mismatch_still_does(rig, monkeypatch):
