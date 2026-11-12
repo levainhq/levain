@@ -6,7 +6,9 @@ account) and the uses allowed, never the value. This module is the one place a v
 
 * :func:`read_key` is the ONLY reader. It asks a fresh verified replay (an :class:`AuthoritySource`, never a snapshot
   a caller kept) whether the provider has a voice key RIGHT NOW, then reads the item the record names, once per call.
-  Nothing is cached, so a revoke stops the very next read, and a record no longer in the policy reads nothing.
+  Nothing is cached, so a revoke stops the very next read, and a record no longer in the policy reads nothing. A
+  record whose signing key was revoked since is still in the policy but is stopped (``grants_in_force``): it reads
+  nothing either, and says so, until the key is set again (the keychain item it names is not touched).
 * :func:`add_key` signs the record (a create or one replacing ``loosen``, which the log ranks as laptop-presence) and
   writes a NEW item (never one that exists or that a record names) through ONE function, :class:`SecurityStdinWriter`,
   that hands the value to ``security -i`` on stdin so it is in no argv. The writer is a seam (:class:`KeychainWriter`):
@@ -36,7 +38,7 @@ from typing import Any
 
 from levain import pathid
 from levain.authority import (VOICE_KEY_KIND, VOICE_KEY_PROVIDERS, VOICE_KEY_USES, AuthorityError, _thaw, anchor_path,
-                              append, prepare, voice_key_for, voice_key_record)
+                              append, grant_stop_reason, grants_in_force, prepare, voice_key_for, voice_key_record)
 from levain.authority_sig import VerifierUnavailable
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.chat_egress.key_setup import KeychainItems, SetupDeclined, SetupRefused
@@ -218,18 +220,24 @@ def read_key(provider: str, use: str, *, authority: AuthoritySource, store: Any 
 
     Each call replays the authority log afresh (``authority`` is exactly an :class:`AuthoritySource`, which reads and
     verifies on every call; any other callable, a subclass included, is a TypeError, so no caller can hand in a kept
-    snapshot), finds the provider's one voice key, checks ``use`` against its ``uses`` and only then reads the item it
-    names from ``store`` (default: the login keychain through :class:`KeychainStore`). Nothing is held between
-    calls, so a revoke stops the next read and a record that is gone reads nothing. The Secret carries the record it
-    was read for (:attr:`Secret.record`: id and uses, from this same replay)."""
+    snapshot), finds the provider's one voice key among the grants in force, checks ``use`` against its ``uses`` and
+    only then reads the item it names from ``store`` (default: the login keychain through :class:`KeychainStore`).
+    Nothing is held between calls, so a revoke stops the next read and a record that is gone reads nothing. A record
+    the policy still holds but whose signing key was revoked is stopped: ``not_set`` (the code client mappings
+    already read as "no live key"), in words that say why. The Secret carries the record it was read for
+    (:attr:`Secret.record`: id and uses, from this same replay)."""
     if type(authority) is not AuthoritySource:
         raise TypeError(f"read_key takes an AuthoritySource, not {type(authority).__name__}")
     try:
         state = authority()
     except Exception:                       # noqa: BLE001 - any failure is "the log could not be verified now"
         raise VoiceKeyUnavailable("authority_unreadable", "the authority log could not be verified") from None
-    record = voice_key_for(state.policy.grants, provider)
+    record = voice_key_for(grants_in_force(state), provider)
     if record is None:
+        held = voice_key_for(state.policy.grants, provider)      # the policy still holds a stopped record
+        why = None if held is None else grant_stop_reason(state, held["id"])
+        if why is not None:
+            raise VoiceKeyUnavailable("not_set", f"the {provider} voice key stopped: {why}; set it again")
         raise VoiceKeyUnavailable("not_set", f"no voice key is set for {provider}")
     if use not in record["uses"]:
         raise VoiceKeyUnavailable("use_not_granted", f"the {provider} key is not set for {use}")
@@ -308,7 +316,7 @@ def add_key(data_root: Path | str, *, provider: str, uses: Iterable[str], accoun
     state = _signing_authority(_capture(db, now, ssh_keygen))
     if rid in state.policy.grants:
         raise VoiceKeyRefused(f"a grant {rid!r} already exists")
-    live = voice_key_for(state.policy.grants, provider)
+    live = voice_key_for(state.policy.grants, provider)     # RAW: a stopped record is still the record to replace
     if live is not None and not replace:
         raise VoiceKeyRefused(f"{provider} already has a voice key ({live['id']}): pass --replace to supersede it, "
                               "or revoke it first")
