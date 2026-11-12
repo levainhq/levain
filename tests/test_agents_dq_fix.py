@@ -131,6 +131,13 @@ def test_window_span_is_window_keys_inverse():
         lo, hi = schedule.window_span(trigger, ZONE, key)
         assert lo <= local < hi and hi - lo <= timedelta(hours=8)
         assert schedule.window_key(trigger, ZONE, lo) == key
+    whole = {"kind": "schedule", "cron": "0 * * * *", "zone": ZONE, "window": {"start": "05:00", "end": "05:00"}}
+    for local in (datetime(2026, 11, 12, 3, 0, tzinfo=z), datetime(2026, 11, 12, 4, 0, tzinfo=z),
+                  datetime(2026, 11, 12, 5, 0, tzinfo=z), datetime(2026, 11, 12, 23, 0, tzinfo=z)):
+        key = schedule.window_key(whole, ZONE, local)
+        lo, hi = schedule.window_span(whole, ZONE, key)
+        assert lo <= local < hi, (local, key)                              # a whole day: the slot's own calendar day
+        assert schedule.window_key(whole, ZONE, lo) == key
     plain = {"kind": "schedule", "cron": "*/30 * * * *", "zone": ZONE, "window": None}
     lo, hi = schedule.window_span(plain, ZONE, "d:2026-11-12")
     assert (lo, hi) == (datetime(2026, 11, 12, tzinfo=z).astimezone(UTC), datetime(2026, 11, 13, tzinfo=z).astimezone(UTC))
@@ -325,7 +332,7 @@ def test_a_dream_row_no_fire_ever_claims_is_taken_over_when_its_launch_lease_lap
 
 
 def test_a_hand_start_whose_fire_never_started_is_spawned_again_then_taken_over_and_the_verb_runs_again(
-        tmp_path, hook):
+        tmp_path, hook, monkeypatch):
     rig = _live_rig(tmp_path)
     spawn = Failing()
     got = st.start(rig.store, clock=rig.now, authority=rig.authority, spawn=spawn)
@@ -337,6 +344,10 @@ def test_a_hand_start_whose_fire_never_started_is_spawned_again_then_taken_over_
     assert spawn.calls == [got.occurrence_id, got.occurrence_id]        # the tick owns the hand start's fire-less row too
     refused = st.start(rig.store, clock=lambda: lease - MIN, authority=rig.authority, spawn=Spawns())
     assert refused.outcome == "refused" and "in flight" in refused.text
+    # The rig runs on the wall clock, so whether the tick's own dream slot falls inside the night depends on when the
+    # suite runs; this test is about the hand start, so the tick here takes over and the schedule yields no slot.
+    monkeypatch.setattr(schedule, "slots_between", lambda *a, **k: [])
+    monkeypatch.setattr(T, "_launch_dream_slots", lambda *a, **k: None)
     _tick(rig, lease + MIN, spawn)
     assert (_row(rig, got.occurrence_id)["state"], _row(rig, got.occurrence_id)["reason"]) == \
         ("stopped", "crash_recovered")
