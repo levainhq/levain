@@ -686,7 +686,9 @@ def window_remedy(cls: str, store_path: Path | str, *, agent_dir: Path | str | N
                 f"does not start. See who holds it with `{anneal} --db {db} baton status`; {again} once this "
                 f"install's session holds it, or, once it does, {now}.")
     if cls == "failed":
-        return f"`levain agents show dream` names the run that failed and why; {again}, or {now}."
+        return (f"`levain agents show dream` names the run that failed and why; {again}, or {now}. Two failed runs in a "
+                f"row pause the dream: it then runs no window and `levain dream start` refuses, until "
+                f"`levain agents resume dream`, and a separate notice says so.")
     if cls in ("laptop-slept", "attempt-spent"):
         return f"nothing needs doing by hand; {again}, or {now}."
     if cls == "ceiling" or cls in NOT_NEWS:
