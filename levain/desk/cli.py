@@ -2224,7 +2224,7 @@ def _coord_review(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> i
     items = review.list_items(store, include_cleared=args.all, feed=args.feed)
     rows = [{"item_id": i.item_id, "feed": i.feed, "thread_id": i.thread_id, "state": i.state,
              "authority_relevant": i.authority_relevant, "at": i.at,
-             "text": str(review.body_fields(i).get("text", ""))[:500]}
+             "text": review.item_text(i)[:500]}      # text, else summary, else reason, else his: an agent card has no "text"
             for i in items]
     lines = [f"review queue: {len(rows)} {'item(s)' if args.all else 'open item(s)'}"]
     for r in rows:
