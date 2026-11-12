@@ -257,8 +257,15 @@ def _check1(src: Sources, agent: str, key: str, day: date, zone: str, now: datet
     return Check(1, name, "pass", f"no done occurrence for dream-day {day}; {len(launched)} launched")
 
 
+#: check 2's refusal of an open wrap while the operator's age floor is UNSET and the wrap is a seat's (or cannot be
+#: judged): byte for byte what it said before D1-O (a test pins the string), because unset is the old behaviour.
 OPEN_WRAP_REFUSAL = ("a wrap is open on the store: the dream does not start while one is open, a dead seat's included, "
                      "and nothing on this path clears it (anneal's wrap-status and wrap-cancel do)")
+#: the head of every other refusal of an open wrap (D1-O). OPEN_WRAP_REFUSAL says "nothing on this path clears it", which
+#: is true only while the floor is unset and the wrap is a seat's; once a floor is set, or the wrap is the dream's own, the
+#: run clears a wrap that is old enough, so those refusals carry this head and then the reason.
+OPEN_WRAP_HELD = ("a wrap is open on the store: the dream does not start while one is open that is not proven dead "
+                  "(anneal's wrap-status and wrap-cancel clear one sooner, once you have confirmed it is dead)")
 
 
 def executor_orphan_bound_s() -> float:
@@ -285,8 +292,16 @@ def _hours(seconds: float) -> str:
     return f"{seconds / 3600:g} h"
 
 
+def _held(why: str) -> tuple[bool, str]:
+    """A refusal that is not the old one: the true head, then why this wrap is not proven dead."""
+    return False, f"{OPEN_WRAP_HELD} | {why}"
+
+
 def _orphan_proof(src: Sources, now: datetime, floor_s: float | None) -> tuple[bool, str]:
-    """May admission pass the open wrap, and the words for either answer (D1-O; Phill's Q4 (a)).
+    """``(dead, text)``: may admission pass the open wrap (D1-O; Phill's Q4 (a)), and the words for either answer.
+    ``text`` is the pass note when ``dead``, and otherwise the WHOLE refusal detail. Never raises: any failure at all,
+    including one outside the readers below (the lazy import of the executor's bound), is "not proven dead", which is
+    QUIET ``wrap-open``, never a class change to UNREADABLE.
 
     **Admission judges nothing of its own.** It calls the executor's age function (``levain.wrap._orphan_is_stale``,
     the one ``consolidate_store`` calls with the same bound) on the start time the executor itself reads
@@ -297,43 +312,56 @@ def _orphan_proof(src: Sources, now: datetime, floor_s: float | None) -> tuple[b
       function says so under the executor's own bound. No number of the operator's is needed.
     * a wrap the dream did NOT open (a seat's: its honest wrap can last longer than the dream's bound): dead only when
       the operator has set an age floor AND the same function says so with that floor, which can only raise the horizon.
-      No floor set: never (today's behaviour).
+      No floor set: never, and the refusal reads exactly :data:`OPEN_WRAP_REFUSAL`, as it always did (so does one whose
+      age cannot be read while no floor is set).
 
     Every failure to judge (a source missing, a read that raised, a start time that will not parse) is "not dead"."""
+    try:
+        return _orphan_judge(src, now, floor_s)
+    except Exception as exc:  # noqa: BLE001 — a bug or a failed read here is "not proven dead", never UNREADABLE
+        if floor_s is None:
+            return False, OPEN_WRAP_REFUSAL
+        return _held(f"it could not be judged ({type(exc).__name__}: {str(exc)[:120]}), so it is not proven dead")
+
+
+def _orphan_judge(src: Sources, now: datetime, floor_s: float | None) -> tuple[bool, str]:
     from levain import wrap as _w
 
-    if src.open_wrap is None:
-        return False, "this reading cannot see the open wrap's age, so nothing here can prove it dead"
+    token: str | None = None
+    started: str | None = None
     try:
+        if src.open_wrap is None:
+            raise LookupError("this reading cannot see the open wrap's age")
         token, started = src.open_wrap()
     except Exception as exc:  # noqa: BLE001 — a wrap that cannot be read is not proven dead
-        return False, f"the open wrap could not be read ({type(exc).__name__}: {str(exc)[:120]}), so it is not proven dead"
+        if floor_s is None:
+            return False, OPEN_WRAP_REFUSAL
+        return _held(f"the open wrap could not be read ({type(exc).__name__}: {str(exc)[:120]}), so it is not proven dead")
     mine: Mapping[str, str] = {}
     if src.dream_wraps is not None:
         try:
             mine = src.dream_wraps()
         except Exception:  # noqa: BLE001 — no attribution is the stricter path
             mine = {}
+    occ = mine.get(token) if token else None
+    if occ is None and floor_s is None:
+        return False, OPEN_WRAP_REFUSAL                      # a seat's wrap, no floor: the old answer, in the old words
     bound = executor_orphan_bound_s()
     horizon = executor_orphan_horizon_s()
-    occ = mine.get(token) if token else None
     if occ is not None:
         if _w._orphan_is_stale(started, bound, now=now):
             return True, (f"the dream's own wrap (occurrence {occ} recorded its token), started {started}, is past the "
                           f"executor's age bound of {_minutes(horizon)}: proven dead; the run clears it and consolidates")
-        return False, (f"it is the dream's own wrap (occurrence {occ}), started {started}, and is not yet provably dead: "
-                       f"younger than the executor's age bound of {_minutes(horizon)}")
-    if floor_s is None:
-        return False, ("orphan healing is off for a wrap the dream did not open: no age floor is set "
-                       "(`levain dream enable --store-dir <dir> --orphan-floor-hours <hours>` sets one)")
+        return _held(f"it is the dream's own wrap (occurrence {occ}), started {started}, and is not yet provably dead: "
+                     f"younger than the executor's age bound of {_minutes(horizon)}, past which the dream clears it")
     effective = max(floor_s, horizon)
     if _w._orphan_is_stale(started, bound, floor=floor_s, now=now):
         return True, (f"a wrap the dream did not open, started {started}, is past both the executor's age bound of "
                       f"{_minutes(horizon)} and the operator's floor of {_hours(floor_s)}: proven dead; the run clears "
                       "it and consolidates")
-    return False, (f"a wrap the dream did not open, started {started}, is not yet provably dead: it must be older than "
-                   f"{_hours(effective)} (the operator's floor is {_hours(floor_s)}, the executor's bound "
-                   f"{_minutes(horizon)}); its seat may still be alive")
+    return _held(f"a wrap the dream did not open, started {started}, is not yet provably dead: it must be older than "
+                 f"{_hours(effective)} (the operator's floor is {_hours(floor_s)}, the executor's bound "
+                 f"{_minutes(horizon)}); its seat may still be alive")
 
 
 def _check2(src: Sources, now: datetime, floor_s: float | None) -> Check:
@@ -342,7 +370,7 @@ def _check2(src: Sources, now: datetime, floor_s: float | None) -> Check:
     if _guard(src.wrap_open, "the wrap state"):
         dead, note = _orphan_proof(src, now, floor_s)
         if not dead:
-            return Check(2, name, QUIET, f"{OPEN_WRAP_REFUSAL} | {note}", "wrap-open")
+            return Check(2, name, QUIET, note, "wrap-open")
         healed = f"an open wrap is proven dead ({note}); "
     if not _guard(src.requires_baton, "the baton policy"):
         return Check(2, name, "pass", healed + "the store does not require the baton" if healed
