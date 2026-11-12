@@ -197,3 +197,39 @@ def test_f3_the_ready_module_does_not_say_the_card_names_who_was_live():
     body = cd.build_card("consolidated", occurrence="o1").body
     assert not any("seat" in k or "live" in k for k in body)
 
+
+
+# ------------------------------------------------------------------------------------------------------------- F4
+
+def _dream_subparsers() -> tuple[argparse.ArgumentParser, dict[str, str]]:
+    top = levain_cli.build_parser()
+    sub = next(a for a in top._actions if isinstance(a, argparse._SubParsersAction))
+    dream_parser = sub.choices["dream"]
+    inner = next(a for a in dream_parser._actions if isinstance(a, argparse._SubParsersAction))
+    helps = {a.dest: a.help for a in sub._choices_actions}
+    return dream_parser, {"verbs": sorted(inner.choices), "group_help": helps["dream"]}  # type: ignore[dict-item]
+
+
+def test_f4_the_dream_group_help_does_not_say_nothing_schedules_a_dream():
+    parser, info = _dream_subparsers()
+    text = parser.format_help()
+    assert "Nothing schedules a dream" not in text
+    assert "enable" in parser.description and "scheduled" in parser.description
+
+
+def test_f4_the_bare_dream_verb_lists_every_subcommand():
+    parser, info = _dream_subparsers()
+    err = io.StringIO()
+    with redirect_stderr(err):
+        assert dcli.run_dream(argparse.Namespace()) == 1
+    for verb in info["verbs"]:
+        assert verb in err.getvalue(), (verb, err.getvalue())
+
+
+def test_f4_the_readme_row_is_the_dream_groups_own_help():
+    _, info = _dream_subparsers()
+    readme = (REPO / "README.md").read_text(encoding="utf-8")
+    assert f"| `levain dream` | {info['group_help']} |" in readme
+    assert "enable" in info["group_help"] and "ready" in info["group_help"]   # the stale row named neither
+
+
