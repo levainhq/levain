@@ -1321,7 +1321,7 @@ class DreamInstall:
 INSTALL_SCHEMA = 1
 #: ``write_install(orphan_floor_hours=ORPHAN_FLOOR_OFF)`` clears the floor (back to the shipped, unset state)
 ORPHAN_FLOOR_OFF = "off"
-#: the least age floor, in hours, an operator may set: the number Phill chose (np-6108f5e9 (a): "12 hours, the number
+#: the least age floor, in hours, an operator may set: the number the ruling names (np-6108f5e9 (a): "12 hours, the number
 #: you chose, so the floor is 12 or 'off'"). Below it a live seat's wrap that honestly waits on review would be
 #: cancelled by the dream. The one home of the number: the validator, its refusal text and the CLI quote this.
 ORPHAN_FLOOR_MIN_HOURS = 12

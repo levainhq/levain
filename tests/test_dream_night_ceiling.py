@@ -112,6 +112,16 @@ def test_check1_a_daytime_hand_start_counts_the_calendar_day_only(ent):
     assert (_check1(v).status, _check1(v).kind) == (rd.QUIET, "ceiling")
 
 
+def test_check1_a_daytime_start_is_not_held_to_a_nights_run_of_its_own_calendar_date(ent):
+    """The old rule counted the whole local date, so one daytime run plus the 00:10 night run read as two and refused
+    a second daytime start; the night is its own allowance, so the daytime start still passes."""
+    _hand(ent, datetime(2026, 11, 13, 0, 10, tzinfo=NY))
+    _hand(ent, datetime(2026, 11, 13, 9, 0, tzinfo=NY))
+    noon = datetime(2026, 11, 13, 12, 0, tzinfo=NY)
+    v = ent.evaluate(now=noon, day=rd.manual_day_at(noon, ZONE), manual=True)
+    assert _check1(v).status == "pass", _check1(v).detail
+
+
 def test_check1_counts_the_fall_back_night_as_one_night(ent):
     _hand(ent, datetime(2026, 10, 31, 23, 30, tzinfo=NY))
     _hand(ent, datetime(2026, 11, 1, 1, 30, tzinfo=NY))                   # EDT
