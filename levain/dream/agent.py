@@ -588,10 +588,15 @@ def window_remedy(cls: str, store_path: Path | str) -> str:
     cannot read its sources, and an unknown class is not known to be one a hand start fixes.
 
     ``store_path`` is the install's ``memory.db`` and is REQUIRED; the anneal commands need it (``--db``: without it
-    anneal reads ``~/.anneal-memory``, another store). An open
-    wrap keeps the dream from starting, whoever opened it, and nothing on the scheduled path clears it (the executor
-    clears a stale one only after a run has been admitted, and an open wrap is a refusal at admission), so a dead
-    seat's wrap is a person's to clear, with anneal's own two commands."""
+    anneal reads ``~/.anneal-memory``, another store). An open wrap keeps the dream from starting until the dream's
+    admission proves it dead (D1-O, ``ready`` check 2), and who clears what depends on who opened it: the dream clears
+    its OWN stale wrap (one an occurrence of the dream recorded) once it is older than the executor's age bound, with
+    no setting; it clears a SEAT's wrap only when the install fact ``orphan_floor_hours`` is set (it ships unset;
+    ``levain dream enable --store-dir <dir> --orphan-floor-hours <hours>`` sets it, ``off`` clears it) and the wrap is
+    older than that floor and the bound; every other open wrap (a seat's with the floor unset, or any wrap younger
+    than the bound or the floor) stays until a person clears it, with anneal's own two commands. The text names the
+    setting with the install's real store directory (the parent of ``store_path``) and leaves only the hours, which
+    are the person's number, as a placeholder."""
     from levain.manifest import anneal_invocation
 
     again = "the dream tries again in its next window"
@@ -599,9 +604,14 @@ def window_remedy(cls: str, store_path: Path | str) -> str:
     anneal = anneal_invocation()
     db = shlex.quote(_required_store_path(store_path))
     if cls == "wrap-open":
-        return (f"A wrap is open on the store, so the dream does not start, and nothing in the dream clears one. If a "
-                f"live seat opened it, leave it: it ends when that seat saves or cancels. If that seat is dead, look at "
-                f"it with `{anneal} --db {db} wrap-status` and, once you have confirmed it is dead, clear it with "
+        sd = shlex.quote(str(Path(store_path).parent))
+        return (f"A wrap is open on the store, so the dream does not start. The dream clears its own stale wrap by "
+                f"itself, once it is older than the executor's age bound; it clears a seat's wrap only when this "
+                f"install's `orphan_floor_hours` is set (`levain dream enable --store-dir {sd} --orphan-floor-hours "
+                f"<hours>` sets it, and the wrap must be older than that floor), and until then, or while the wrap "
+                f"is younger, it stays until you clear it. If a live seat opened it, leave it: it ends when that "
+                f"seat saves or cancels. If that seat is dead, look at it with `{anneal} --db {db} wrap-status` and, "
+                f"once you have confirmed it is dead, clear it with "
                 f"`{anneal} --db {db} wrap-cancel --wrap-token <token>` (the token is the one wrap-status prints); "
                 f"{again}, or, once the wrap is cleared, {now}.")
     if cls == "baton":
