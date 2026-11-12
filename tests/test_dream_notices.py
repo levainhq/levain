@@ -218,6 +218,23 @@ def test_a_paused_dream_with_a_failure_streak_raises_one_notice_a_reader_sees(ni
     assert "attention [dream-paused:" in night.err                      # the existing stderr line is kept beside it
 
 
+def test_the_desk_review_list_shows_the_words_of_a_notice_not_a_blank_line(night, capsys):
+    """Found by running the tick end to end: the CLI's list printed ``body["text"]`` only, and an agent card or an
+    attention item carries its words in ``reason``, so a reader ran the verb and saw ``agent: `` and nothing."""
+    from levain.cli import main
+
+    hold_a_wrap_open(night.ent)
+    night.wrap_open_night(night.last_closed)
+    night.row(night.last_closed, "failed", "budget")
+    night.row(night.last_closed, "failed", "deadline", hour=3)
+    night.pause()
+    night.tick()
+    assert main(["coord", "review", "list", "--json", "--feed", AGENT, "--queue-dir", str(night.ent.coord_dir)]) == 0
+    texts = sorted(r["text"] for r in __import__("json").loads(capsys.readouterr().out)["items"])
+    assert len(texts) == 2 and all(texts), texts
+    assert any("did not consolidate" in t for t in texts) and any("levain agents resume dream" in t for t in texts)
+
+
 def test_a_link_inside_three_days_of_expiry_files_one_renewal_card(night):
     night.sign_link(days_left=2)
     for minute in range(3):
