@@ -185,7 +185,9 @@ def test_a_fire_that_cannot_be_spawned_leaves_a_launched_row_and_is_not_a_clean_
     assert row["state"] == "launched"
     assert code == T.EXIT_LAUNCH
     err = capsys.readouterr().err
-    assert "no fork" in err and row["occurrence_id"] in err and "lapses to takeover" in err
+    assert "no fork" in err and row["occurrence_id"] in err
+    # 1111-38 fix round: the note states what the tick now does with the row, not a "lapses to takeover" nothing ran
+    assert "spawns its fire again" in err and "stopped/crash_recovered" in err and "lapses to takeover" not in err
 
 
 def test_an_input_hook_that_says_no_input_ends_the_row_and_spawns_nothing(tmp_path, monkeypatch):
