@@ -289,6 +289,27 @@ def _only_row(rig) -> dict:
     return row
 
 
+# ------------------------------------------------ F2: a launch that found the row not admitted says what is true
+
+def test_f2_the_loser_of_two_starts_is_not_told_the_row_stays_admitted(tmp_path, monkeypatch):
+    # reproduced: two starts resumed one admitted row; the loser's launch answered NOT_ADMITTED (the other launched it)
+    rig = _live_rig(tmp_path)
+    left = _claim(rig, "left-admitted")
+    real = ctl.launch
+
+    def the_other_start_won(*a, **k):
+        assert real(*a, **k).outcome == "launched"          # the concurrent start launched the row first ...
+        return ctl.LaunchResult(ctl.NOT_ADMITTED, "the occurrence is launched")   # ... this one reads it that way
+
+    monkeypatch.setattr(ctl, "launch", the_other_start_won)
+    got, spawned = _go(rig)
+    assert (got.code, got.outcome) == (1, "not-admitted") and spawned == [], got
+    assert "stays admitted" not in got.text and "retries that same occurrence" not in got.text, got.text
+    assert "levain agents show dream" in got.text and "another" in got.text, got.text
+    _parses(got.text)
+    assert _only_row(rig)["state"] == "launched" and got.occurrence_id == left     # not ours to end
+
+
 # --------------------------------------------- F5: the admission is the dream's hook, passed, never the default
 
 def test_f5_the_launch_is_handed_the_dreams_hook_explicitly(tmp_path, monkeypatch):
