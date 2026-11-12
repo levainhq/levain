@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from levain import home_guard
+
 # TEST ONLY: the per-test seam that lets a binding's effect run on a test executor (see the module).
 from tests.autonomic_test_only_confinement import test_only_confined_executor  # noqa: F401
 from tests.autonomic_test_only_coverage import test_only_every_effect_covered  # noqa: F401
@@ -268,6 +270,10 @@ def _install_session_home() -> None:
     Path(home, ".gitconfig").write_text("[user]\n\tname = levain test\n\temail = test@levain.invalid\n", encoding="utf-8")
     _SESSION_HOME.append(home)
     os.environ["HOME"] = home
+    # the one admission of the real-home guard (levain/home_guard.py): a test that unsets $LEVAIN_HOME on purpose, under
+    # a $HOME it moved into the temp root, takes a scratch fallback. A process this conftest did not start has no such
+    # variable, and an operator's real $HOME is never inside the temp root.
+    os.environ[home_guard.TEST_SCRATCH_ROOT_ENV] = str(Path(tempfile.gettempdir()).resolve())
     for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "CODEX_HOME"):
         os.environ.pop(name, None)
 
@@ -278,6 +284,7 @@ def pytest_configure(config):
 
 
 def pytest_unconfigure(config):
+    os.environ.pop(home_guard.TEST_SCRATCH_ROOT_ENV, None)
     while _SESSION_HOME:
         shutil.rmtree(_SESSION_HOME.pop(), ignore_errors=True)
     from tests import _shared_chrome

@@ -401,7 +401,11 @@ def _kill_answering(pid: int, sock: str) -> bool:
 def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME, ssh_mode: str = "agent") -> ScopedAgent:
     """Start one session's agent and return it, or :class:`AgentError` (nothing left behind). Sweeps
     agents a killed levain left first (:func:`sweep_orphans`). ``ssh_mode`` is the entity's floor
-    setting, recorded for :func:`add_key` (only ``agent`` hides ``~/.ssh`` from bash)."""
+    setting, recorded for :func:`add_key` (only ``agent`` hides ``~/.ssh`` from bash). Refuses the fallback home in a
+    test run or a scratch run (:mod:`levain.home_guard`): :func:`levain_home` is also the policy's read, so the guard
+    sits at this writer."""
+    from levain.home_guard import refuse_real_home_fallback
+    refuse_real_home_fallback("the scoped ssh agent's run directory")
     problem = openssh_problem()
     if problem is not None:
         raise AgentError(problem)
