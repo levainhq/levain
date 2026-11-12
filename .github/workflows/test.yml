@@ -111,6 +111,8 @@ jobs:
           pip install -e ".[dev,openhands]" hatchling
 
       - name: Run the invariant tests
+        # Serial on purpose: `-m invariant` selects after the whole tree is collected, and xdist would make every worker
+        # repeat that collection. The shard jobs below are where `-n auto` earns its cost.
         # basetemp outside $HOME, as in the shard job (tests/test_hermetic_home.py)
         env:
           LEVAIN_TEST_WAIT_SCALE: "2"
