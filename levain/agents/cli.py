@@ -106,8 +106,12 @@ def _add_tick_parsers(verbs: argparse._SubParsersAction) -> None:
         "tick", help="One reaper + scheduler pass over the agent store (run by a launchd user agent every minute).",
         allow_abbrev=False,
         description="Renew the leases of launched agent rows, stop the ones past their stop time, then claim scheduled "
-                    "windows. One pass, bounded (graceful at 540 s, hard exit at 600 s). Runs as you. --print-unit prints "
-                    "the launchd plist for the schedule and installs nothing. Give --store-dir before `tick`.")
+                    "windows. Then, for a store with a dream install, the night's notices: a closed night's "
+                    "did-not-consolidate card, the pause and link-renewal notices, and the weekly restore drill (which "
+                    "takes the store's wrap.lock); a notice that failed or was skipped for time ends the tick with exit "
+                    "code 5 and a line on stderr. One pass, bounded (graceful at 540 s, hard exit at 600 s). Runs as "
+                    "you. --print-unit prints the launchd plist for the schedule and installs nothing. Give "
+                    "--store-dir before `tick`.")
     tick.add_argument("--coord-dir", dest="coord_dir", type=Path, default=None,
                       help="The desk queue directory (its dispatch.db feeds the slot-lease probes).")
     tick.add_argument("--print-unit", dest="print_unit", action="store_true",
