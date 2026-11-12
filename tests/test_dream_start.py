@@ -271,7 +271,11 @@ def test_a_fire_that_cannot_be_spawned_is_reported_with_the_row_left_launched(tm
         raise OSError("no fork")
 
     got = st.start(rig.store, clock=rig.now, authority=rig.authority, spawn=boom)
-    assert (got.code, got.outcome) == (1, "launched") and "no fork" in got.text and "lapses to takeover" in got.text
+    # 1111-38 fix round: it states what now happens (the tick spawns the fire again, then takes the row over), not a
+    # "lapses to takeover" that nothing ran
+    assert (got.code, got.outcome) == (1, "launched") and "no fork" in got.text
+    assert "spawns its fire again" in got.text and "stopped/crash_recovered" in got.text
+    assert "lapses to takeover" not in got.text
     assert _rows(rig)[0]["state"] == "launched"
 
 

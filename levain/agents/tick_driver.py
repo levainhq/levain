@@ -32,8 +32,10 @@ every minute and a stable row set each row leads once in ``len(rows)`` minutes. 
 within its stable partition (proven-dead-fire rows first), so rows outside that group can still wait while that group
 alone fills the stop budget. Nothing new is stored.
 
-A sleeping laptop coalesces missed launchd ticks, so leases lapse during sleep and the first tick on wake runs lapse
-recovery (``takeover``). That is designed behaviour, not an alarm.
+A sleeping laptop coalesces missed launchd ticks, so leases lapse during sleep. The first tick on wake runs lapse
+recovery (``takeover``, through ``controller.take_over_unclaimed``) only for a launched row no fire ever claimed (no
+``pid``, no ``session_key``); a lapsed row whose fire claimed it is not renewed (``heartbeat`` refuses a lapsed lease)
+and is left to that fire's own end. That is designed behaviour, not an alarm.
 
 What the tick wires (and what it does not): the ``executor_of`` router (:func:`executor_of_factory`: ``session`` rows to
 :class:`levain.agents.session.RowSessionExecutor`, ``dream`` rows to the dream's own executor, anything else None, which
@@ -44,7 +46,9 @@ holds no attention table yet). It changes no stop rule: which rows a reaper ENDs
 THE DREAM'S LAUNCH (D1-Q): after the claims, the dream slots the walk left ``admitted`` are launched
 (:func:`_launch_dream_slots`: ``controller.launch`` under the signed link, run ceiling and the dream's admission hook,
 then ``controller.spawn_fire``), the path ``levain dream start`` takes; a row that cannot launch is retried each tick and
-ended by ``controller.close_unlaunched`` once its grace is gone. Before this nothing in ``levain`` called ``launch`` or
+ended by ``controller.close_unlaunched`` once its grace is gone. A launched dream row no fire claimed (from either
+launcher) has its fire spawned again (:func:`_respawn_dream_fires`) and, once its launch lease lapses unclaimed, is ended
+by ``controller.take_over_unclaimed``, whose docstring states that rule. Before this nothing in ``levain`` called ``launch`` or
 ``spawn_fire``, so a signed, armed dream claimed its slot and never ran it.
 
 THE NIGHT'S NOTICES (D1-N): after the claims, a store whose install names a dream runs
@@ -91,8 +95,9 @@ TICK_NOTICE_RESERVE_S = 120
 #: whose launcher cannot be built); 5 a night notice failed, raised, or was skipped for time (the tick itself ran;
 #: the stderr line says which); 6 a claimed dream slot could not be launched (its launch raised or answered
 #: ``unclassified``; a full cap is a normal wait and is not this), or a launched one could not have its fire
-#: spawned (D1-Q: the row is retried until its grace, or lapses to takeover; the stderr line says which); 70 the
-#: watchdog took the process.
+#: spawned, or one no fire claimed was ended by takeover (D1-Q: an admitted row is retried until its grace; a launched
+#: row with no fire has its fire spawned again until its launch lease lapses, then is ended stopped/crash_recovered;
+#: the stderr line says which); 70 the watchdog took the process.
 EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_NOTICES, EXIT_HARD_TIMEOUT = (
     0, 1, 2, 3, 4, 5, 70)
 EXIT_LAUNCH = 6
@@ -490,8 +495,9 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
     better than the verb:
 
     * ``launched`` -> the fire is spawned. A fire that cannot be spawned leaves a ``launched`` row with nothing running:
-      it lapses to takeover after its :data:`~levain.agents.controller.LEASE_S` lease, and the tick says so and exits
-      :data:`EXIT_LAUNCH`.
+      the tick says so and exits :data:`EXIT_LAUNCH`, and the row is :func:`_respawn_dream_fires`'s (its fire spawned
+      again from ``SESSION_GRACE_S`` after the launch, the row ended ``stopped``/``crash_recovered`` through
+      ``controller.takeover`` once its :data:`~levain.agents.controller.LEASE_S` launch lease lapses unclaimed).
     * ``no-slot`` and ``unclassified`` (a full cap; an authority or hook that could not answer) write nothing and leave the
       row ``admitted``. The verb ends its own row there because nothing retries a manual row; the tick IS the retry,
       once a pass, until the row's grace is gone, when :func:`levain.agents.controller.close_unlaunched` (or the input
@@ -560,10 +566,11 @@ def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime]
         if res.outcome == _ctl.LAUNCHED:
             try:
                 spawn(st.directory, oid)
-            except Exception as exc:  # noqa: BLE001 - a launched row with no fire is reported, and the reaper owns it
+            except Exception as exc:  # noqa: BLE001 - a launched row with no fire is reported; _respawn_dream_fires owns it
                 notes.append(f"{oid} launched but its fire could not be started ({type(exc).__name__}: {exc}); the row "
-                             f"is launched with nothing running, and lapses to takeover when its {_ctl.LEASE_S}s lease "
-                             "runs out")
+                             f"is launched with nothing running: the tick spawns its fire again from "
+                             f"{_ctl.SESSION_GRACE_S}s after the launch, and if no fire has claimed it when its "
+                             f"{_ctl.LEASE_S}s launch lease lapses, ends it stopped/crash_recovered")
                 seen["launch"] = "spawn"
             continue
         retried = res.outcome in (_ctl.NO_SLOT, _ctl.UNCLASSIFIED)
