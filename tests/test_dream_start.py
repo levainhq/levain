@@ -275,6 +275,58 @@ def test_a_fire_that_cannot_be_spawned_is_reported_with_the_row_left_launched(tm
     assert _rows(rig)[0]["state"] == "launched"
 
 
+# ------------------------------------------- F1: a start that claimed and did not launch ends the row it claimed
+
+def _scheduled_claim_outcome(rig) -> str:
+    """What the tick's next scheduled slot would be told: ``claimed`` only when no live row blocks it."""
+    with rig.store.write() as c:
+        return ctl.claim(c, agent_id=rig.agent, kind="scheduled", key="2026-11-12T05:00:00Z", spec_hash=rig.spec_hash,
+                         binding_id=BINDING, window_key="w:2026-11-12", now=rig.now())[1]
+
+
+def _only_row(rig) -> dict:
+    (row,) = _rows(rig)
+    return row
+
+
+# --------------------------------------------- F5: the admission is the dream's hook, passed, never the default
+
+def test_f5_the_launch_is_handed_the_dreams_hook_explicitly(tmp_path, monkeypatch):
+    rig = _live_rig(tmp_path)
+    real = ctl.launch
+    seen = []
+
+    def spy(*a, **k):
+        seen.append(k.get("on_input", ctl.DEFAULT_INPUT))
+        return real(*a, **k)
+
+    monkeypatch.setattr(ctl, "launch", spy)
+    got, _ = _go(rig)
+    assert got.outcome == "launched" and len(seen) == 1
+    assert seen[0] is not ctl.DEFAULT_INPUT and seen[0] is not None and callable(seen[0]), seen
+
+
+def test_f5_the_controllers_default_hook_is_never_what_runs(tmp_path, monkeypatch):
+    rig = _live_rig(tmp_path)
+
+    def default_would_run(*a, **k):
+        raise AssertionError("start relied on launch's defaulted on_input")
+
+    monkeypatch.setattr(ctl, "_default_input_check", default_would_run)
+    got, _ = _go(rig)
+    assert got.outcome == "launched", got.text
+
+
+def test_f5_a_hook_that_says_there_is_no_input_ends_the_row_quiet_and_the_verb_reports_it(tmp_path, monkeypatch):
+    # the explicit hook is the one the verb's admission rests on: swap it for one that answers False and the row ends
+    # skipped-no-input, so the default can never be what decided this
+    rig = _live_rig(tmp_path)
+    monkeypatch.setattr(da, "install_on_input", lambda agent_dir, **kw: (lambda row: False))
+    got, spawned = _go(rig)
+    assert (got.code, got.outcome) == (1, "skipped-no-input") and spawned == [], got
+    assert _only_row(rig)["state"] == "skipped-no-input"
+
+
 # ------------------------------------------------------------------------------------------------- the CLI front end
 
 def test_the_cli_prints_the_refusal_and_exits_one_when_there_is_nothing_to_start(tmp_path, capsys):
