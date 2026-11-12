@@ -7476,8 +7476,13 @@
     const tabs = el("div", "needs-tabs");
     tabs.setAttribute("role", "tablist");
     tabs.setAttribute("aria-label", "Needs you");
-    for (const [key, text, n] of [["you", "Needs you", items.length], ["desk", "Desk owes", desk.length]]) {
-      const b = el("button", "needs-tab" + (prefs.tab === key ? " is-on" : ""), text + " (" + n + ")");
+    // the Desk owes number is the Decisions card's own (card_format.js deskTabs): every open desk question, dated ones included
+    // (they are the LATER lines under this tab), so the strip counts the rows it draws and cannot differ from the card
+    // (a page whose card module did not load has no such number to draw: the tab then carries none, never one that could disagree)
+    const CFD = window.LevainCardFormat;
+    const deskOwed = CFD && typeof CFD.deskTabs === "function" ? CFD.deskTabs(Array.isArray(lines) ? lines : []).desk : null;
+    for (const [key, text, n] of [["you", "Needs you", items.length], ["desk", "Desk owes", deskOwed]]) {
+      const b = el("button", "needs-tab" + (prefs.tab === key ? " is-on" : ""), n === null ? text : text + " (" + n + ")");
       b.type = "button";
       b.setAttribute("role", "tab");
       b.setAttribute("aria-selected", prefs.tab === key ? "true" : "false");
