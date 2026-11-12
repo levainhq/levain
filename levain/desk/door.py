@@ -135,25 +135,37 @@ def record_path() -> Path:
     return _resolved(default_queue_dir() / RECORD_NAME)
 
 
-def _record_paths() -> list[Path]:
-    """Where the door reads records and :func:`record` writes them: :func:`record_path`, and the same file under the
-    account's own home from the password database, so a process started with another ``$LEVAIN_HOME`` or ``$HOME``
-    (or none) reads the same record (a workspace is recorded when either names it).
+def _account_record() -> Path | None:
+    """The desk record under the account's own home from the password database, or None where there is none."""
+    own = _own_home()
+    return None if own is None else _resolved(own / ".levain" / "consent" / RECORD_NAME)
 
-    In a test run or a scratch run that second copy is left out unless its home is the suite's vouched scratch
-    (:func:`levain.home_guard.vouched_scratch`): ``$LEVAIN_HOME`` never moves it, so a scratch run that set a scratch
-    home as the guard asks would otherwise still add its temp workspaces to the operator's real, add-only record.
-    Left out rather than refused: the first copy is the run's own record and the door still has one to read."""
+
+def _record_paths() -> list[Path]:
+    """Where the door reads records: :func:`record_path`, and the same file under the account's own home from the
+    password database, so a process started with another ``$LEVAIN_HOME`` or ``$HOME`` (or none) reads the same record
+    (a workspace is recorded when either names it). Always both, whatever the environment says: no variable takes the
+    account's copy off the read path. Writes go to :func:`_write_record_paths`."""
+    paths = [record_path()]
+    other = _account_record()
+    if other is not None and other != paths[0]:
+        paths.append(other)
+    return paths
+
+
+def _write_record_paths() -> list[Path]:
+    """Where :func:`record` and :func:`record_moved` write: :func:`_record_paths`, less the account home's copy in a test
+    run or a scratch run unless that home is the suite's vouched scratch (:func:`levain.home_guard.vouched_scratch`).
+    ``$LEVAIN_HOME`` never moves that copy, so a scratch run that set a scratch home as the guard asks would otherwise
+    still add its temp workspaces to the operator's real, add-only record. Left out of the writes rather than refused:
+    the first copy is the run's own record and still gets the entry. Reads keep the account copy either way."""
     from levain import home_guard
 
-    paths = [record_path()]
+    paths = _record_paths()
     own = _own_home()
-    if own is not None and home_guard.guarded_run() is not None and not home_guard.vouched_scratch(own):
-        own = None
-    if own is not None:
-        other = _resolved(own / ".levain" / "consent" / RECORD_NAME)
-        if other != paths[0]:
-            paths.append(other)
+    if (len(paths) > 1 and own is not None and home_guard.guarded_run() is not None
+            and not home_guard.vouched_scratch(own)):
+        paths = paths[:1]
     return paths
 
 
@@ -281,10 +293,11 @@ def _add(path: Path, real: Path, ident: tuple[int, int] | None) -> None:
 
 
 def record(directory: Path) -> Path:
-    """Add ``directory``'s real path to every desk record (once; nothing is ever taken out) and return that
-    real path. Called by ``levain desk agent`` before it records a setting. Refuses a directory that holds a record
-    file (compared by resolved path and by identity), which the desk's own turn could then write, and refuses
-    while any record cannot be read. Raises ``OSError`` or :class:`RecordUnreadable`."""
+    """Add ``directory``'s real path to every desk record :func:`_write_record_paths` names (once; nothing is ever
+    taken out) and return that real path. Called by ``levain desk agent`` before it records a setting. Refuses a
+    directory that holds any record file the door reads (compared by resolved path and by identity), which the desk's
+    own turn could then write, and refuses while any record cannot be read. Raises ``OSError`` or
+    :class:`RecordUnreadable`."""
     real = Path(os.path.realpath(directory))
     ident = _ident(real)
     paths = _record_paths()
@@ -293,17 +306,17 @@ def record(directory: Path) -> Path:
             raise OSError(f"{real} holds Levain's consent directory ({path.parent}); a desk workspace "
                           "never does")
     recorded()
-    for path in paths:
+    for path in _write_record_paths():
         _add(path, real, ident)
     return real
 
 
 def record_moved(real: str) -> None:
-    """Add the real path ``real`` to every desk record by its spelling alone (``levain desk move-home``): a renamed desk
+    """Add the real path ``real`` to every desk record :func:`_write_record_paths` names, by its spelling alone (``levain desk move-home``): a renamed desk
     home still matches its old entry by identity through the compat link, so :func:`record` would add nothing, and the
     entry would miss once that link is gone. Add-only, as :func:`record`; raises as it does."""
     recorded()
-    for path in _record_paths():
+    for path in _write_record_paths():
         _add(path, Path(real), None)
 
 
