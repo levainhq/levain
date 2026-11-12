@@ -3870,10 +3870,26 @@ def restore(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     return _store_verb(ctx, req, SV.restore)
 
 
-#: ``read-allow``: the one file a slot's "don't ask again" dialog writes, inside the retained clone.
-ALLOW_PATH = ("tree", "repo", ".claude")
-ALLOW_NAME = "settings.local.json"
-ALLOW_CAP = 64 * 1024
+#: ``read-allow``: the one file a slot's "don't ask again" dialog writes, inside the retained clone (END's
+#: :data:`end.ALLOW_REL`, below ``tree``), and END's cap on it.
+ALLOW_PATH = ("tree", *(os.fsdecode(p) for p in _E.ALLOW_REL[:-1]))
+ALLOW_NAME = os.fsdecode(_E.ALLOW_REL[-1])
+ALLOW_CAP = _E.ALLOW_CAP
+_ALLOW_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _allow_record(obj: object) -> Optional[Tuple[int, str]]:
+    """The ``allow`` provenance END kept in ``object.json`` (:func:`end.allow_provenance`), or None when it has none
+    (an object retained before row 165, or a file END did not find the session owner's) or one not of its shape."""
+    rec = obj.get("allow") if isinstance(obj, dict) else None
+    if not isinstance(rec, dict) or set(rec) != {"size", "digest"}:
+        return None
+    size, digest = rec["size"], rec["digest"]
+    if type(size) is not int or not 0 <= size <= ALLOW_CAP or type(digest) is not str:
+        return None
+    if not _ALLOW_DIGEST_RE.fullmatch(digest):
+        return None
+    return size, digest
 
 
 def _allow_dir(store_fd: int, session: str) -> Optional[int]:
@@ -3886,20 +3902,22 @@ def _allow_dir(store_fd: int, session: str) -> Optional[int]:
             try:
                 nxt = os.open(part, _O_DIR, dir_fd=cur)
             except FileNotFoundError:
-                os.close(cur)
+                fd, cur = cur, -1
+                os.close(fd)
                 return None
             except OSError as e:
                 if e.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
                     raise Refused("allow-unreadable", f"{part} is not a directory") from None
                 raise
-            os.close(cur)
-            cur = nxt
+            prev, cur = cur, nxt      # ``cur`` names the open fd before ``prev`` closes: a failing close leaks none
+            os.close(prev)
         return cur
     except BaseException:
-        try:
-            os.close(cur)
-        except OSError:
-            pass
+        if cur >= 0:
+            try:
+                os.close(cur)
+            except OSError:
+                pass
         raise
 
 
@@ -3908,9 +3926,19 @@ def read_allow(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     RETAINED session's clone, so the supervisor can offer the rules the slot's dialog saved. No path and no name come
     from the caller. The caller is bound as every lease-free verb binds it (``no-session`` for another's session); the
     session must be RETAINED by root's facts (``not-retained:trash``, ``not-retained:absent``). The file must be
-    regular, with one link, within :data:`ALLOW_CAP`; anything else is ``allow-unreadable``, never content. A file
-    the session owner (:func:`session_owner_uid`, the uid the clone is the slot's under) does not own is
-    ``allow-not-slots``: a link to a file of anyone else's is never read. Answers
+    regular, with one link, within :data:`ALLOW_CAP`; anything else is ``allow-unreadable``, never content.
+
+    Provenance (codex L3 HIGH): END's tree step gives every retained entry to root, so the owner on disk cannot say
+    whose the file was. END records it instead, while the tree is still the session's: ``object.json``'s ``allow``
+    (:func:`end.allow_provenance`: the session owner's own regular one-link file, its size and root's digest of it).
+    The file read here must be root's (END's chown, :attr:`Seams.chowned_uid` of 0) and that record must be there
+    BEFORE a byte is read; the bytes read must then be the ones it names. No record (an object retained before row
+    165, or a file END did not find the session owner's: UNOWNED, outside-linked, another uid's), a file not root's,
+    or bytes that differ is ``allow-not-slots``.
+
+    Held under root's per-session try-lock (:func:`session_lock`, the file discard / restore / purge take;
+    ``session-busy`` while one runs) from the state checks through the last byte, so a discard cannot move the tree
+    to trash between the checks and the read; a store journal in flight is ``intent-in-flight``. Answers
     ``{present: false}`` when the file or a directory above it is absent, else ``{present: true, b64}``."""
     from levain.slot import store_verbs as SV
 
@@ -3919,13 +3947,25 @@ def read_allow(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         a = read_alloc(ctx, req.session)
     except ContractError as e:
         raise Refused("no-session", req.session) from e
+    with session_lock(ctx, a.session):
+        return _read_allow_locked(ctx, a, SV)
+
+
+def _read_allow_locked(ctx: Ctx, a: R.Alloc, SV) -> Dict[str, object]:
+    """:func:`read_allow`'s body; the caller holds the session lock."""
     facts = SV.facts_from_alloc(a, ctx.seams.L)
     sv = SV.StoreSeams(cas=lambda target, fields: None, owner_ok=ctx.seams.trusted)
+    if os.path.lexists(facts.intent):
+        raise Refused("intent-in-flight", a.session)
     if os.path.lexists(facts.trash):
         raise Refused("not-retained:trash", a.session)
     if not SV.retained_whole(facts, sv):
         raise Refused("not-retained:absent", a.session)
-    owner = ctx.seams.chowned_uid(session_owner_uid(a))
+    try:
+        record = _allow_record(canon.parse(_E._read_durable(facts.retained / "object.json")))
+    except (OSError, ContractError):
+        raise Refused("not-retained:absent", a.session) from None
+    root = ctx.seams.chowned_uid(0)
     dfd = _allow_dir(ctx.store.fd, a.session)
     if dfd is None:
         return {"present": False}
@@ -3948,10 +3988,12 @@ def read_allow(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
                 raise Refused("allow-unreadable", f"{ALLOW_NAME} changed while opening")
             if st.st_nlink != 1:
                 raise Refused("allow-unreadable", f"{ALLOW_NAME} has {st.st_nlink} links")
-            if st.st_uid != owner:
-                raise Refused("allow-not-slots", f"{ALLOW_NAME} is owned by uid {st.st_uid}, not the session's")
+            if st.st_uid != root:
+                raise Refused("allow-not-slots", f"{ALLOW_NAME} is owned by uid {st.st_uid}, not END's root")
             if st.st_size > ALLOW_CAP:
                 raise Refused("allow-unreadable", f"{ALLOW_NAME} is over {ALLOW_CAP} bytes")
+            if record is None:
+                raise Refused("allow-not-slots", f"END recorded no {ALLOW_NAME} as the session owner's")
             out = bytearray()
             while len(out) <= ALLOW_CAP:
                 chunk = os.read(fd, min(65536, ALLOW_CAP + 1 - len(out)))
@@ -3960,6 +4002,8 @@ def read_allow(ctx: Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
                 out += chunk
             if len(out) > ALLOW_CAP:
                 raise Refused("allow-unreadable", f"{ALLOW_NAME} is over {ALLOW_CAP} bytes")
+            if (len(out), _E.digest_bytes(bytes(out))) != record:
+                raise Refused("allow-not-slots", f"{ALLOW_NAME} is not the bytes END recorded")
         finally:
             os.close(fd)
     finally:
