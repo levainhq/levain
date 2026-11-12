@@ -2995,7 +2995,7 @@ class _Handler(GuardedHandler):
 
         if not read and path == push_routes.WORKER_PATH:
             # the worker is rendered once at make_server (its version derives from the shell). What raises the reload bar is
-            # the bytes changing (spore-1682 was unchanged bytes). The browser already bypasses the HTTP cache for the worker
+            # the bytes changing (intention-1682 was unchanged bytes). The browser already bypasses the HTTP cache for the worker
             # script on update checks (W3C Service Workers, Update algorithm; default updateViaCache 'imports'); ``no-cache``
             # keeps an intermediary from serving a stale worker.
             self._send(self.server.levain_worker, "text/javascript; charset=utf-8", status=200, head=head,
