@@ -456,7 +456,8 @@ def test_an_unattached_spec_with_its_link_behaves_exactly_as_before_and_as_an_at
     armed = lambda agent_id, spec_hash: "b1"   # noqa: E731 - the link, as the controller sees it
     plain = fires(twin(tmp_path, "plain", attach=False), armed)
     joined = fires(twin(tmp_path, "joined", attach=True), armed)
-    assert plain and plain == joined and plain[0][1] == "admitted"
+    # D1-Q: an earlier slot nothing launched is ended past its grace, so the armed agent's LAST claim is the admitted one
+    assert plain and plain == joined and plain[-1][1] == "admitted"
 
 
 def test_recall_stays_keyed_by_the_ag_id_and_the_record_id_recalls_nothing(store, tmp_path):
