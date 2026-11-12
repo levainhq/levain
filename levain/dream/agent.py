@@ -578,8 +578,12 @@ def _required_store_path(store_path: object) -> str:
 
 def window_remedy(cls: str, store_path: Path | str) -> str:
     """The next step a did-not-consolidate card names for class ``cls``, every command in it one that exists and runs as
-    printed. There is NO verb that starts a dream by hand (``levain agents`` has no run-now, and ``levain dream run``
-    is for a store COPY), so no class names one: the dream tries again in its next window by itself.
+    printed. ``levain dream start`` starts a dream by hand through the same signed link and ceiling as a scheduled run
+    (``levain agents`` has no run-now, and ``levain dream run`` is for a store COPY), and a class names it only where it
+    can run: ``failed``, ``laptop-slept`` and ``attempt-spent`` (a manual run waives the window's one-attempt check),
+    and ``wrap-open`` and ``baton`` AFTER the person has cleared the wrap or the baton (a hand start meets check 2 as a
+    night does). The others name none: a ``ceiling`` or ``in-flight`` night would be refused again, an ``unreadable`` one
+    cannot read its sources, and an unknown class is not known to be one a hand start fixes.
 
     ``store_path`` is the install's ``memory.db`` and is REQUIRED; the anneal commands need it (``--db``: without it
     anneal reads ``~/.anneal-memory``, another store). An open
@@ -589,6 +593,7 @@ def window_remedy(cls: str, store_path: Path | str) -> str:
     from levain.manifest import anneal_invocation
 
     again = "the dream tries again in its next window"
+    now = _card._START_NOW
     anneal = anneal_invocation()
     db = shlex.quote(_required_store_path(store_path))
     if cls == "wrap-open":
@@ -596,13 +601,15 @@ def window_remedy(cls: str, store_path: Path | str) -> str:
                 f"live seat opened it, leave it: it ends when that seat saves or cancels. If that seat is dead, look at "
                 f"it with `{anneal} --db {db} wrap-status` and, once you have confirmed it is dead, clear it with "
                 f"`{anneal} --db {db} wrap-cancel --wrap-token <token>` (the token is the one wrap-status prints); "
-                f"{again}.")
+                f"{again}, or, once the wrap is cleared, {now}.")
     if cls == "baton":
         return (f"The consolidate baton is not held by this install's session ({_ready.SESSION_ID!r}), so the dream "
                 f"does not start. See who holds it with `{anneal} --db {db} baton status`; {again} once this "
-                "install's session holds it.")
+                f"install's session holds it, or, once it does, {now}.")
     if cls == "failed":
-        return f"`levain agents show dream` names the run that failed and why; {again}."
+        return f"`levain agents show dream` names the run that failed and why; {again}, or {now}."
+    if cls in ("laptop-slept", "attempt-spent"):
+        return f"nothing needs doing by hand; {again}, or {now}."
     return f"nothing needs doing by hand; {again}."
 
 
