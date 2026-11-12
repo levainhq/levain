@@ -1325,6 +1325,33 @@ def grant_stop_reason(state: AuthoritySnapshot, grant_id: str) -> str | None:
     return None
 
 
+def stopped_way(kind: Any) -> str:
+    """How a stopped grant of ``kind`` is used again, in words every surface shares (the revoke notice, a list line, the
+    renew refusal). A kind with a one-live rule (the seat-root lease, the seat-egress grant, a chat key per host, a
+    voice key per provider, a hands-mcp entry per name) still counts a stopped grant at append (ruling R-C, so an older
+    levain on the same log counts it too), so it is revoked before it is created again; no verb registers a hands-mcp
+    entry, so for one revoking only clears it."""
+    if kind == HANDS_MCP_KIND:
+        return "revoke it to clear it; no levain verb registers a hands entry yet"
+    if kind in (SEAT_LEASE_KIND, SEAT_EGRESS_KIND, EGRESS_KEY_KIND, VOICE_KEY_KIND):
+        return "revoke it, then create it again"
+    return "create it again"
+
+
+def _stopped_blocker(state: AuthoritySnapshot, gid: str, revoke_cmd: str) -> str | None:
+    """The words for a one-live refusal whose blocker ``gid`` is stopped, or None while it is not: it answers nothing yet
+    still counts (ruling R-C), and the verb that clears it, every required argument shown."""
+    why = grant_stop_reason(state, gid)
+    if why is None:
+        return None
+    return (f"{gid[:40]!r} was stopped ({why}) and answers nothing, but it still counts here until it is revoked: "
+            f"`{revoke_cmd.format(gid=gid[:40])}`")
+
+
+#: the verb that revokes a hands-mcp entry (no hands verb does; the kind-blind consent revoke does)
+_HANDS_MCP_REVOKE = "levain consent grant revoke --signing-key <key> -- {gid}"
+
+
 def grants_in_force(state: AuthoritySnapshot) -> Mapping[str, Any]:
     """``state.policy.grants`` without every grant :func:`grant_stop_reason` stops: what a USE path reads. Recomputed on
     each call (a caller holds a fresh replay), read-only. A write path, an append rule and the replay read
@@ -2001,11 +2028,16 @@ def _hands_mcp_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], no
         for oid, o in live.items():
             if oid == gid:
                 continue
+            # a stopped entry still counts here (ruling R-C); the words say it is stopped, never live
+            stopped = _stopped_blocker(state, oid, _HANDS_MCP_REVOKE)
             if o["name"] == g["name"]:
-                raise AuthorityError(f"one live hands MCP entry per name: {g['name']!r} is already live as "
+                raise AuthorityError(f"one live hands MCP entry per name: {g['name']!r}: {stopped}" if stopped else
+                                     f"one live hands MCP entry per name: {g['name']!r} is already live as "
                                      f"{oid[:40]!r}; revoke it first")
             if g["transport"] == o["transport"] == "remote" and g["callback_port"] == o["callback_port"]:
-                raise AuthorityError(f"one live hands MCP entry per callback port: {g['callback_port']} is already "
+                raise AuthorityError(f"one live hands MCP entry per callback port: {g['callback_port']}: {stopped}, or "
+                                     "register on another port" if stopped else
+                                     f"one live hands MCP entry per callback port: {g['callback_port']} is already "
                                      f"pinned by {oid[:40]!r}; revoke it first or register on another port")
 
 
@@ -2103,9 +2135,12 @@ def _seat_lease_check(grants: list[Any], after: str = "") -> None:
             raise AuthorityError(f"seat-root lease {str(grant.get('id'))[:40]!r}: " + "; ".join(problems) + after)
 
 
-def _unique_live_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime, kind: str, label: str) -> None:
+def _unique_live_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime, kind: str, label: str,
+                       revoke_cmd: str) -> None:
     """At append: a create, a loosen or a renew may not leave two LIVE grants of ``kind`` (``label`` names it; revoke the
-    first). Judged with the appender's clock, so an append rule."""
+    first). Judged with the appender's clock, so an append rule. "Live" here reads expiry only: a grant a revoked key
+    stopped still counts (ruling R-C), and the refusal names it as stopped, with ``revoke_cmd`` (a template with
+    ``{gid}``) as the verb that clears it."""
     op = rec["op"]
     if op == "create_grant":
         grant = rec["grant"]
@@ -2122,7 +2157,11 @@ def _unique_live_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: da
         return
     live = [gid for gid, g in after.items() if _kind_live(g, now, kind)]
     if len(live) > 1 and any(gid in live for gid in touched):
-        others = ", ".join(repr(g[:40]) for g in live if g not in touched) or "another"
+        blockers = [g for g in live if g not in touched]
+        stopped = [w for g in blockers if (w := _stopped_blocker(state, g, revoke_cmd)) is not None]
+        if stopped and len(stopped) == len(blockers):
+            raise AuthorityError(f"one live {label} at a time: " + "; ".join(stopped))
+        others = ", ".join(repr(g[:40]) for g in blockers) or "another"
         raise AuthorityError(f"one live {label} at a time: {others} is already live; revoke it first")
 
 
@@ -2136,11 +2175,13 @@ def _kind_live(grant: Any, now: datetime, kind: str) -> bool:
 
 
 def _seat_lease_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
-    _unique_live_check(state, rec, now, SEAT_LEASE_KIND, "seat-root lease")
+    _unique_live_check(state, rec, now, SEAT_LEASE_KIND, "seat-root lease",
+                       "levain seat lease revoke --signing-key <key> {gid}")
 
 
 def _seat_egress_unique_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
-    _unique_live_check(state, rec, now, SEAT_EGRESS_KIND, "seat-egress grant")
+    _unique_live_check(state, rec, now, SEAT_EGRESS_KIND, "seat-egress grant",
+                       "levain seat egress revoke --signing-key <key> {gid}")
 
 
 # A seat-egress grant (PATHZERO Z2a, ruling H2 a; ``levain.seat_push``): the signed authority under which Levain's OWN
@@ -3050,8 +3091,10 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     # active signer and bring a stopped grant back
     stopped = grant_stop_reason(state, rec["grant_id"])
     if stopped is not None:
+        stopped_kind = grant.get("kind") if isinstance(grant, Mapping) else None
         raise AuthorityError(f"grant {str(rec['grant_id'])[:80]} stopped when {stopped}; a renew does not bring it "
-                             "back: create it again with a key you hold")
+                             f"back: {stopped_way(stopped_kind)}"
+                             + ("" if stopped_kind == HANDS_MCP_KIND else " with a key you hold"))
     kind = _renewable_kind(grant, rec["grant_id"])
     after = (f"; grant {str(rec['grant_id'])[:80]!r} was signed before this rule: revoke it "
              "(levain consent grant revoke) and create a new one")
