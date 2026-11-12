@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from tests.test_cockpit_flip_parity import _drive, needs_browser
-from tests.test_cockpit_sign_card import DESKTOP, QRID, STRIP_FACET, TOK, _Rig, needs_ssh
+from tests.test_cockpit_sign_card import DESKTOP, QRID, STRIP_FACET, STRIP_SETTLED, TOK, _Rig, needs_ssh
 
 STATE = "document.getElementById('sheet').dataset.state"
 NOTE = "document.getElementById('sheet-note').textContent"
@@ -288,7 +290,7 @@ def test_h2_unsure_after_the_answer_landed_asks_its_attempt_and_shows_it_signed_
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
-            {"until": STRIP_FACET + " && 1", "ms": 30000},
+            {"until": STRIP_SETTLED + " && 1", "ms": 30000},
             {"eval": "(() => { window.__reloads = 0; const t = window.LevainCockpitTransport; const r = t.reload.bind(t); "
                      "t.reload = () => { window.__reloads++; return r(); }; return 1; })()"},
             {"eval": f"{OPEN_SHEET}.click() || 1"},
@@ -497,7 +499,7 @@ def test_h8_the_signed_line_never_prints_undefined(tmp_path: Path, monkeypatch) 
 
 COUNT_RELOADS = ("(() => { window.__reloads = 0; const t = window.LevainCockpitTransport; const r = t.reload.bind(t); "
                  "t.reload = () => { window.__reloads++; return r(); }; return 1; })()")
-OPEN_FRAMED = [{"until": STRIP_FACET + " && 1", "ms": 30000},
+OPEN_FRAMED = [{"until": STRIP_SETTLED + " && 1", "ms": 30000},
                {"eval": COUNT_RELOADS},
                {"eval": f"{OPEN_SHEET}.click() || 1"},
                {"until": f"{IN} && {IN}.getElementById('sheet') && {IN}.getElementById('sheet').dataset.state === 'open'", "ms": 30000}]
@@ -507,9 +509,10 @@ WAIT_RELOAD = {"eval": "new Promise((r) => setTimeout(() => r(window.__reloads),
 UNPAIRED_READ = "(real, u, o) => Promise.resolve({ ok: false, status: 403, json: () => Promise.resolve({}) })"
 
 
+@pytest.mark.parametrize("hello_delay", [0.0, 1.5], ids=["hello_on_time", "hello_late"])
 @needs_browser
-def test_h9_a_close_from_the_sheet_alone_schedules_no_board_read(tmp_path: Path, monkeypatch) -> None:
-    rig = _Rig(tmp_path, monkeypatch)
+def test_h9_a_close_from_the_sheet_alone_schedules_no_board_read(tmp_path: Path, monkeypatch, hello_delay) -> None:
+    rig = _Rig(tmp_path, monkeypatch, hello_delay=hello_delay)
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, *OPEN_FRAMED,
