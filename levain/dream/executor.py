@@ -29,8 +29,9 @@ Known edges:
   (``Store(...)`` then ``_lock_wrap``): a second run constructs a ``Store`` on a db a first run is consolidating
   before it returns ``lock-held``.
 - **A failed final progress write after a committed save** leaves ``progress.json`` at ``saving`` while the return
-  and ``usage.json`` say ``saved``: D1-1b's recovery must verify against the DB (wrap id past ``last_wrap_before``
-  with our content hash), never trust the journal's phase alone.
+  and ``usage.json`` say ``saved``: D1-1b's recovery must verify against the DB (a wrap id past ``last_wrap_before``
+  and its committed content hash, which is the hash of the composed text unless anneal's durable-facts step changed
+  the text at the save), never trust the journal's phase alone.
 - **The real save is not told ``unattended`` or the model.** anneal 1.0.2's ``validated_save_continuity`` accepts
   ``unattended=`` and ``model=``, and the original ``levain.wrap._consolidate`` passed neither, so the lift keeps
   that: every save (dream and ``levain wrap``) is recorded as attended with no model. (The crystallization guard is
