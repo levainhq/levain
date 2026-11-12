@@ -235,7 +235,11 @@ def worker_kind(kind: str, requested: str | None = None) -> str | None:
 
 def default_desk_dir() -> Path:
     """The desk home (:func:`levain.desk.legacy.desk_home`): ``<levain home>/desk`` for a new install, the existing
-    old-named directory (``LEGACY_HOME_NAME``, legacy.py) kept for an old one; ``$LEVAIN_HOME`` if set, else ``~/.levain`` is the levain home."""
+    old-named directory (``LEGACY_HOME_NAME``, legacy.py) kept for an old one; ``$LEVAIN_HOME`` if set, else ``~/.levain`` is the levain home.
+    The directory a desk install is written into, so it refuses the fallback home in a test run or a scratch run
+    (:mod:`levain.home_guard`)."""
+    from levain.home_guard import refuse_real_home_fallback
+    refuse_real_home_fallback("the desk home")
     return desk_home()
 
 

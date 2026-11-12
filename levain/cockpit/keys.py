@@ -29,7 +29,6 @@ import re
 import sqlite3
 import struct
 import subprocess
-import sys
 import unicodedata
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
@@ -77,8 +76,9 @@ def pwd_key_dir() -> Path:
 
 
 def under_test_run() -> bool:
-    """True inside a pytest run: the per-test variable pytest sets while a test runs, or pytest loaded at all."""
-    return "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules
+    """True inside a pytest run: the one detection, :func:`levain.home_guard.under_test_run`."""
+    from levain.home_guard import under_test_run as _under_test_run
+    return _under_test_run()
 
 
 def _resolved(path: Path) -> Path:

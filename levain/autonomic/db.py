@@ -165,7 +165,10 @@ def migrate_to_v2(conn: sqlite3.Connection) -> bool:
 def default_store_dir() -> Path:
     """``<levain home>/autonomic``: ``$LEVAIN_HOME/autonomic`` if set, else ``~/.levain/autonomic``. Made
     absolute here, as the confinement floor's deny rule for it is, so a relative ``$LEVAIN_HOME`` names
-    one directory for the life of the store, whatever the working directory does later."""
+    one directory for the life of the store, whatever the working directory does later. Refuses the fallback home in a
+    test run or a scratch run (:mod:`levain.home_guard`)."""
+    from levain.home_guard import refuse_real_home_fallback
+    refuse_real_home_fallback("the autonomic store directory")
     home = os.environ.get("LEVAIN_HOME")
     return ((Path(home).expanduser() if home else Path.home() / ".levain") / "autonomic").resolve()
 
