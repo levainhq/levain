@@ -64,6 +64,37 @@ def test_b_the_input_check_judges_the_instant_the_start_claims_and_launches_at(t
     assert row["window_key"] == st.manual_window_key(t0, ZONE)
 
 
+def test_c_the_signing_card_says_which_open_wraps_the_signed_run_clears():
+    # what the operator signs said the dream runs only when "no other consolidation is in progress", while the signed
+    # run clears a wrap it proves dead and, under an unsigned age floor, a seat's wrap
+    card = " ".join(da.signing_card_text(ZONE, per_run_usd=20.0, night_usd=40.0, expires="E", store_dir="/s").split())
+    assert "It clears an open wrap it proves dead" in card, card
+    assert "older than the executor's age bound" in card, card
+    assert "a seat's wrap only if you have set an age floor" in card, card
+    assert "which is not part of what you sign" in card, card
+
+
+def test_c_the_card_text_is_not_part_of_the_signed_spec():
+    from levain.agents import role as _role
+    from levain.agents import spec as _spec
+
+    role = _role.parse_role(da.dream_role())
+    spec = da.dream_spec(_role.role_hash(role))
+    words = " ".join(map(str, _walk(spec)))
+    assert "proves dead" not in words and "age floor" not in words
+
+
+def _walk(obj):
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _walk(v)
+    else:
+        yield obj
+
+
 def test_a_todays_admitted_manual_row_is_still_the_one_resumed(tmp_path):
     rig = _live_rig(tmp_path)
     left = _claim(rig, "left-admitted-today")
