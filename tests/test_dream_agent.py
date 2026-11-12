@@ -540,14 +540,59 @@ def test_1112_1_a_week_whose_restore_was_skipped_neither_resolves_a_failure_row_
     week2 = now + timedelta(days=8)
     r = da.drill_tick(db, root, now=week2, **kw)
     assert r.action == "skipped", r                                              # was "ok"
-    assert resolved == [], "a week with no restore must not clear the failure row"
-    assert len(seen) == 2 and "hash" in seen[-1][1], seen                        # the row is kept open, with its cause
-    # and the ticks after it, inside the cadence, still do not clear it, and keep carrying the cause
+    # 1112-1 round 2: the skipped drill re-proved the hash (it passed), so the hash failure is CLEARED, not re-stated
+    assert resolved == ["dream-drill"] and len(seen) == 1, (resolved, seen)
     assert da.drill_tick(db, root, **kw).action == "not-due"                     # (the record is stamped at real now)
-    assert resolved == [] and "hash" in seen[-1][1]
-    # a drill that really restores does clear it
+    assert len(seen) == 1                                                        # nothing re-raised for the mended hash
+    (db.parent / "memory.crystal.json").unlink()
+    assert da.drill_tick(db, root, now=now + timedelta(days=17), **kw).action == "ok"
+
+
+class _Refused:
+    outcome, code, message, restored = "failed", "x", "boom: the restore wrote the wrong files", []
+    ok = False
+
+
+def test_1112_1_r2_a_restore_failure_stays_open_through_skipped_weeks_and_its_row_text_is_the_originals(
+        scratch_store, monkeypatch):
+    db = scratch_store
+    root = db.parent / "dream"
+    seen, resolved = [], []
+    kw = dict(attention=lambda k, t: seen.append((k, t)), resolve=resolved.append)
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    now = datetime.now(timezone.utc)
+    with monkeypatch.context() as mp:
+        mp.setattr(sn, "rollback", lambda *a, **k: _Refused())
+        assert da.drill_tick(db, root, now=now, **kw).action == "failed"
+    (db.parent / "memory.crystal.json").write_text('{"x": 1}')                   # a seat wrote after the dream
+    assert da.drill_tick(db, root, now=now + timedelta(days=8), **kw).action == "skipped"
+    assert da.drill_tick(db, root, **kw).action == "not-due"
+    assert resolved == [] and len(seen) == 3 and "restore: boom" in seen[0][1]
+    # the carried row's text is the original's, so the dedupe (a hash of the text) sees ONE item
+    assert seen[1][1] == seen[0][1] == seen[2][1], seen
     (db.parent / "memory.crystal.json").unlink()
     assert da.drill_tick(db, root, now=now + timedelta(days=17), **kw).action == "ok" and resolved == ["dream-drill"]
+
+
+def test_1112_1_r2_an_outcome_the_tick_does_not_handle_changes_no_state_and_says_so(scratch_store):
+    db = scratch_store
+    root = db.parent / "dream"
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    seen, resolved = [], []
+    kw = dict(attention=lambda k, t: seen.append((k, t)), resolve=resolved.append)
+    old = datetime.now(timezone.utc) - timedelta(days=8)
+    sn._write_json(root / sn.DRILL_RECORD, {"outcome": "failed", "at": old.isoformat(), "snapshot": "o1",
+                                            "steps": [{"name": "restore", "status": "failed", "detail": "d"}]})
+
+    class Res:
+        steps = []
+
+    for outcome, action in (("no-snapshot", "no-snapshot"), ("a-future-outcome", "unhandled")):
+        Res.outcome = outcome
+        r = da.drill_tick(db, root, drill=lambda *a, **k: Res, **kw)
+        assert r.action == action and outcome in r.detail, r                       # was: settled, action == outcome
+        assert resolved == [] and seen == [], (outcome, resolved, seen)           # was: "attention resolved"
+    assert sn.last_drill(root)["outcome"] == "failed"                              # the failed record is intact
 
 
 def test_1112_1_a_skipped_drill_with_no_prior_failure_raises_nothing_and_resolves_nothing(scratch_store):
@@ -575,7 +620,9 @@ def test_1112_1_f8_a_launched_dream_row_makes_the_drill_tick_skip_without_taking
     r = da.drill_tick(db, root, attention=lambda k, t: seen.append(k), drill=drill, dream_running=True)
     assert r.action == "deferred" and "launched" in r.detail and called == [] and seen == []   # a first drill just waits
     assert sn.last_drill(root) is None and sn.drill_due(root)                    # nothing recorded: it stays due
-    # a launched row that never ends cannot hide the drill for good: the two-cadence row is raised as for any deferral
+    # once a drill record exists, a launched row that never ends cannot hide the drill for good: the two-cadence row
+    # is raised as for any deferral. With NO record the first drill just waits, so a stuck launched row hides a
+    # never-run drill until the row is reaped (the reaper and the row's own notices own that)
     sn._write_json(root / sn.DRILL_RECORD, {"outcome": "ok", "at": (datetime.now(timezone.utc)
                                                                     - timedelta(days=15)).isoformat()})
     da.drill_tick(db, root, attention=lambda k, t: seen.append(k), drill=drill, dream_running=True)
