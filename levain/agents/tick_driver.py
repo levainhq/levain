@@ -41,6 +41,12 @@ the supervisor reads as "nothing to ask" and raises its attention row), the prod
 binding, from the authority log) and the attention sink (:func:`attention_sink`: one stderr line per key; the agent store
 holds no attention table yet). It changes no stop rule: which rows a reaper ENDs live in ``session.py`` (S11b).
 
+THE DREAM'S LAUNCH (D1-Q): after the claims, the dream slots the walk left ``admitted`` are launched
+(:func:`_launch_dream_slots`: ``controller.launch`` under the signed link, run ceiling and the dream's admission hook,
+then ``controller.spawn_fire``), the path ``levain dream start`` takes; a row that cannot launch is retried each tick and
+ended by ``controller.close_unlaunched`` once its grace is gone. Before this nothing in ``levain`` called ``launch`` or
+``spawn_fire``, so a signed, armed dream claimed its slot and never ran it.
+
 THE NIGHT'S NOTICES (D1-N): after the claims, a store whose install names a dream runs
 ``levain.dream.agent.tick_notices``: the did-not-consolidate card for each closed window (one per window and class,
 however many ticks), the pause notice, the link-renewal card and the weekly restore drill. They reach a reader through
@@ -83,13 +89,16 @@ TICK_NOTICE_RESERVE_S = 120
 #: still ran, the claims did not); 2 the reaper raised; 3 the graceful bound fired; 4 a launched session row had no
 #: session launcher to END it, so it was not renewed and its lease lapses to takeover (an install that names none, or
 #: whose launcher cannot be built); 5 a night notice failed, raised, or was skipped for time (the tick itself ran;
-#: the stderr line says which); 70 the watchdog took the process.
+#: the stderr line says which); 6 a claimed dream slot could not be launched, or a launched one could not have its fire
+#: spawned (D1-Q: the row is retried until its grace, or lapses to takeover; the stderr line says which); 70 the
+#: watchdog took the process.
 EXIT_OK, EXIT_REFUSED, EXIT_REAPER_ERROR, EXIT_SOFT_TIMEOUT, EXIT_NO_LAUNCHER, EXIT_NOTICES, EXIT_HARD_TIMEOUT = (
     0, 1, 2, 3, 4, 5, 70)
+EXIT_LAUNCH = 6
 
 __all__ = ["TICK_INTERVAL_S", "TICK_HARD_BOUND_S", "TICK_SOFT_BOUND_S", "TICK_PRE_RENEW_BOUND_S", "TICK_NOTICE_RESERVE_S",
            "WORST_RENEW_GAP_S", "EXIT_OK", "EXIT_REFUSED", "EXIT_REAPER_ERROR", "EXIT_SOFT_TIMEOUT", "EXIT_NO_LAUNCHER",
-           "EXIT_NOTICES", "EXIT_HARD_TIMEOUT", "bounded", "executor_of_factory", "binding_of_factory", "attention_sink",
+           "EXIT_NOTICES", "EXIT_LAUNCH", "EXIT_HARD_TIMEOUT", "bounded", "executor_of_factory", "binding_of_factory", "attention_sink",
            "run_tick"]
 
 
@@ -416,6 +425,86 @@ def _utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _launch_dream_slots(st: AgentStore, auth: Any, clock: Callable[[], datetime],
+                        session_alive: Callable[[str], bool | None], launch_over: Callable[[str], bool | None],
+                        spawn: Callable[[Path | str, str], Any], notes: list[str], seen: dict) -> None:
+    """D1-Q: launch the dream slots the claims left ``admitted``, the way ``levain dream start`` launches a hand start
+    (``levain.dream.start.start``): ``controller.launch`` (the link, the signed run ceiling and budgets, the slot cap and
+    the dream's own admission hook, ``levain.dream.agent.install_on_input``, PASSED as the hook, with the window
+    ``levain.dream.start.window_for`` gives) and then ``controller.spawn_fire``. Nothing in the launch is decided here: the
+    controller answers, and what it answers is acted on as the hand-start verb acts on it, except where the tick can do
+    better than the verb:
+
+    * ``launched`` -> the fire is spawned. A fire that cannot be spawned leaves a ``launched`` row with nothing running:
+      it lapses to takeover after its :data:`~levain.agents.controller.LEASE_S` lease, and the tick says so and exits
+      :data:`EXIT_LAUNCH`.
+    * ``no-slot`` and ``unclassified`` (a full cap; an authority or hook that could not answer) write nothing and leave the
+      row ``admitted``. The verb ends its own row there because nothing retries a manual row; the tick IS the retry,
+      once a pass, until the row's grace is gone, when :func:`levain.agents.controller.close_unlaunched` (or the input
+      check's own ``missed``) ends it. No state is invented.
+    * every other answer (``skipped-no-input``, ``skipped-budget``, ``stopped``, ``missed``, ``not-admitted``) has already
+      been written by the controller; it is named on stderr, and it is not a failed pass.
+
+    Only the scheduled rows of the dream agent are launched: a ``manual`` row is its verb's. A row is launched at most
+    once however many ticks see it (the launch is a compare-and-set on ``state = 'admitted'``). It runs after the
+    renewals and the claims, so the renewal-gap arithmetic in the module docstring is untouched; an exception in one row
+    is named and does not stop the others or the notices."""
+    from levain.agents import spec as _spec
+    from levain.dream import agent as _da
+    from levain.dream import executor as _ex
+    from levain.dream import start as _start
+
+    try:
+        agent = _spec.get_agent(st, _da.NAME)
+    except _spec.SpecError:
+        return                      # no dream registered: nothing to launch
+    with st.read() as conn:
+        rows = [r[0] for r in conn.execute(
+            "SELECT occurrence_id FROM agent_occurrences WHERE agent_id = ? AND kind = 'scheduled'"
+            " AND state = 'admitted' ORDER BY admitted_at, occurrence_id", (agent["agent_id"],)).fetchall()]
+    if not rows:
+        return
+    now = clock()
+    try:
+        inst = _da.read_install(st.directory)
+    except Exception as exc:  # noqa: BLE001 - named; the rows age out through close_unlaunched
+        notes.append(f"{len(rows)} dream slot(s) are admitted but the dream's install cannot be read, so nothing was "
+                     f"launched ({type(exc).__name__}: {exc})")
+        seen["launch"] = "install"
+        return
+    window = _start.window_for(now, inst.zone)
+    for oid in rows:
+        try:
+            executor = _ex.DreamExecutor(agent_store_dir=st.directory, occurrence_id=oid,
+                                         occ_dir=inst.store_path.parent / "dream" / oid, route="claude",
+                                         model=inst.model, facts_path=inst.facts_path)
+            res = _ctl.launch(st, oid, authority=auth, executor=executor, window=window, now=now,
+                              launch_over=launch_over, session_alive=session_alive,
+                              on_input=_da.install_on_input(st.directory, clock=clock))
+        except _ex.ExposureRefused as exc:
+            notes.append(f"{oid} was not launched: the dream cannot state its exposure ({exc}); it is retried until its "
+                         "grace is gone")
+            seen["launch"] = "exposure"
+            continue
+        except Exception as exc:  # noqa: BLE001 - one row's failure is named and never costs the pass its other work
+            notes.append(f"{oid} was not launched: the launch raised {type(exc).__name__}: {exc}; it is retried until "
+                         "its grace is gone")
+            seen["launch"] = "raised"
+            continue
+        if res.outcome == _ctl.LAUNCHED:
+            try:
+                spawn(st.directory, oid)
+            except Exception as exc:  # noqa: BLE001 - a launched row with no fire is reported, and the reaper owns it
+                notes.append(f"{oid} launched but its fire could not be started ({type(exc).__name__}: {exc}); the row "
+                             f"is launched with nothing running, and lapses to takeover when its {_ctl.LEASE_S}s lease "
+                             "runs out")
+                seen["launch"] = "spawn"
+            continue
+        retried = res.outcome in (_ctl.NO_SLOT, _ctl.UNCLASSIFIED)
+        notes.append(f"{oid} did not launch: {res.outcome} ({res.reason})"
+                     + ("; it stays admitted and is retried next tick until its grace is gone" if retried else ""))
+
+
 def _run_notices(st: AgentStore, result: Any, clock: Callable[[], datetime], started: datetime, soft_s: float,
                  link_of: Callable[[str, str], Any], stream: Any, notes: list[str], seen: dict) -> None:
     """The night's notices (D1-N, Q6 (a)): ``levain.dream.agent.tick_notices`` once a tick has finished its claims. It
@@ -450,6 +539,7 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
              clock: Callable[[], datetime] | None = None, authority: Any = None,
              launcher_of: Callable[[], Any] | None = None,
              dream_of: Callable[[Mapping[str, Any]], Any] | None = None,
+             spawn: Callable[[Path | str, str], Any] | None = None,
              soft_s: float = TICK_SOFT_BOUND_S, hard_s: float = TICK_HARD_BOUND_S, stream=None) -> int:
     """One bounded pass: ``controller.tick`` with this module's reaper. Returns an exit code (see :data:`EXIT_OK`).
     The seams (``clock``, ``authority``, ``launcher_of``, ``dream_of``) are tests'; production passes none.
@@ -525,6 +615,8 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
         session_alive, launch_over = _lazy_probes(st, coord_dir, notes)
         binding_of = binding_of_factory(st, auth, clock)
         result = _ctl.tick(st, clock, binding_of, session_alive, launch_over, reaper=reaper)
+        # D1-Q: what the claims left admitted is launched now, before the notices read the night
+        _launch_dream_slots(st, auth, clock, session_alive, launch_over, spawn or _ctl.spawn_fire, notes, seen)
         # AFTER the renewals and the claims, so the lease arithmetic above is untouched: the night's notices
         _run_notices(st, result, clock, started, soft_s, binding_of.latest_link, stream, notes, seen)
         return result
@@ -558,6 +650,8 @@ def run_tick(store: AgentStore | Path | str | None, *, coord_dir: Path | str | N
         return EXIT_REFUSED
     if unlaunchable:
         return EXIT_NO_LAUNCHER
+    if seen.get("launch"):
+        return EXIT_LAUNCH
     if seen.get("notices"):
         return EXIT_NOTICES
     return EXIT_OK
