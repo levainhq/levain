@@ -219,3 +219,84 @@ def test_words_that_are_only_marks_make_no_handle(tmp_path: Path, monkeypatch) -
             {"until": f"{TITLE} && 1", "ms": 30000},
             {"eval": f"JSON.stringify({{title: {TITLE}, name: {_name(1)}}})"}])["values"]
     assert json.loads(out[-1]) == {"title": "claude_code · question", "name": "claude_code · question"}, out[-1]
+
+
+CLOSE = "document.querySelector('#levain-modal .modal-close').click(); 1"
+# the phone's width and back: the desk/phone title form is re-read when the breakpoint is crossed with a dialog open
+PHONE = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
+MODAL_TITLE_STATE = f"JSON.stringify({{title: {TITLE}, aria: (document.querySelector('#levain-modal .modal-body') || document.body).getAttribute('aria-label')}})"
+# another view that happens to reuse the question's card id (custom ids come from arbitrary row keys)
+OPEN_CUSTOM_SAME_ID = ("window.LevainDashboard.openCustom({id: 'question:1', title: 'Its own title', "
+                       "build: () => { const d = document.createElement('div'); d.textContent = 'a custom view'; return d; }}); 1")
+
+
+@needs_browser
+def test_a_custom_view_that_reuses_a_closed_questions_id_keeps_its_own_title_across_the_breakpoint(tmp_path: Path, monkeypatch) -> None:
+    _two_questions(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP,
+            {"until": "document.querySelectorAll('#ck-needs .needs-row').length === 2 && 1", "ms": 30000},
+            {"eval": _open(1)},
+            {"until": f"/^Ship the sweep fix\\? \\u00b7 claude_code$/.test({TITLE}) && 1", "ms": 30000},
+            {"eval": CLOSE},
+            {"eval": OPEN_CUSTOM_SAME_ID},
+            {"eval": MODAL_TITLE_STATE},
+            # crossing 761px runs the breakpoint listener the question's focus view installed
+            PHONE,
+            {"eval": MODAL_TITLE_STATE},
+            DESKTOP,
+            {"eval": MODAL_TITLE_STATE}])["values"]
+    states = [json.loads(v) for v in out[-4:] if isinstance(v, str) and v.startswith("{")]
+    assert len(states) == 3, out
+    assert all(s["title"] == "Its own title" and s["aria"].startswith("Its own title") for s in states), states
+
+
+# the words are refused until the page is told otherwise (a failed read keeps no name and is not cached)
+REFUSE_WORDS = ("const f = window.fetch.bind(window); window.fetch = (u, o) => /\\/cockpit\\/question\\//.test(String(u && u.url || u)) && !window.__wordsOk"
+                " ? Promise.resolve(new Response('', {status: 500})) : f(u, o);")
+# the Needs strip draws again from the view it holds, building its chips (each reads its question's words afresh when none are kept)
+REDRAW_STRIP = "document.querySelector('.needs-layout-btn[data-needs-layout=\"tiles\"]').click(); 1"
+
+
+@needs_browser
+def test_an_open_dialog_follows_the_words_when_another_read_of_them_lands(tmp_path: Path, monkeypatch) -> None:
+    _two_questions(tmp_path, monkeypatch)
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP, {"init": REFUSE_WORDS},
+            {"until": "document.querySelectorAll('#ck-needs .needs-row').length === 2 && 1", "ms": 30000},
+            {"eval": _open(1)},
+            {"until": f"{TITLE} && 1", "ms": 30000},
+            {"eval": "new Promise(r => setTimeout(() => r(1), 800))"},
+            {"eval": MODAL_TITLE_STATE},
+            # the words become readable and a read that is NOT the dialog's own (the strip's chip) lands while the dialog is open
+            {"eval": "window.__wordsOk = true; 1"},
+            {"eval": REDRAW_STRIP},
+            {"until": f"/^Ship the sweep fix\\? \\u00b7 claude_code$/.test({TITLE}) && 1", "ms": 30000},
+            {"eval": MODAL_TITLE_STATE}])["values"]
+    before, after = [json.loads(v) for v in out if isinstance(v, str) and v.startswith("{")]
+    assert before["title"] == "claude_code · question", before            # the refused read named nothing
+    assert after["title"] == "Ship the sweep fix? · claude_code" and after["aria"].startswith("Ship the sweep fix?"), after
+
+
+# a first line of 100 + 1 + 37 characters, then two spaces (code points 138 and 139) and more words: the cut falls in the blank run
+BLANK_RUN_HEAD = "w" * 100 + " " + "v" * 37
+BLANK_RUN_LINE = BLANK_RUN_HEAD + "  " + "tail words after the cut"
+
+
+@needs_browser
+def test_a_cut_title_never_ends_in_a_space_before_its_ellipsis(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "levain_home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    (home / "consent").mkdir(parents=True, mode=0o700)
+    QuestionStore(home / "consent").file(agent="claude_code", agent_session_id="s1", what=BLANK_RUN_LINE, options=[("a", "A"), ("b", "B")],
+                                         rec="a", blocks="x", cwd="/w")
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [DESKTOP,
+            {"until": "document.querySelectorAll('#ck-needs .needs-row').length === 1 && 1", "ms": 30000},
+            {"eval": _open(1)},
+            {"until": f"/\\u2026 \\u00b7 claude_code$/.test({TITLE}) && 1", "ms": 30000},
+            {"eval": MODAL_TITLE_STATE}])["values"]
+    assert json.loads(out[-1])["title"] == BLANK_RUN_HEAD + "… · claude_code", out[-1]

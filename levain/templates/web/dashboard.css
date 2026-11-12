@@ -1801,9 +1801,10 @@ body.ke .needs-card .intention-actions { display: grid; grid-template-columns: r
 body.ke .needs-card .intention-actions .verb-btn { min-height: 38px; height: auto; font-weight: var(--fw-semibold); color: var(--text); border: 1px solid var(--label); padding: var(--sp-2) var(--sp-4); text-align: center; }
 body.ke .needs-card .intention-actions .verb-btn:hover { border-color: var(--text); background: var(--card-2); }
 body.ke .needs-card .intention-actions > :not(.verb-btn) { grid-column: 1 / -1; margin-left: 0; }   /* a snooze/edit form or its result takes the whole row, left-aligned */
-/* the 38px verb height is the desktop look; a phone keeps the 44px touch floor (this rule is as specific as the one above and later) */
+/* the 38px verb and sheet-button height is the desktop look; a phone keeps the 44px touch floor from the button's own rule, whatever
+   container draws the card (each rule here is as specific as its desktop twin above and later) */
 @media (max-width: 720px) {
-  body.ke .needs-card .intention-actions .verb-btn { min-height: var(--hit-min, 44px); }
+  body.ke .needs-card .intention-actions .verb-btn, body.ke .needs-card .sign-sheet-open { min-height: var(--hit-min, 44px); }
   body.ke .needs-card .intention-actions .verb-btn:last-child:nth-child(odd) { grid-column: 1 / -1; }   /* an odd last verb fills the row instead of leaving a half row */
 }
 body.ke .needs-head > .card-voice { display: flex; align-items: center; gap: var(--sp-3); margin-left: auto; }

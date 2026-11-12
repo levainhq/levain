@@ -12,6 +12,7 @@ from anneal_memory import IntentionStore
 from levain.consent.questions import ANSWER_CHANNELS, QuestionStore
 from tests.test_cockpit_flip_parity import _drive, _eventually, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
+from tests.test_cockpit_sign_card import STRIP_FACET, TOK, _Rig, needs_ssh
 
 DESKTOP = {"emulate": {"w": 1440, "h": 900, "dpr": 1}}
 PHONE = {"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}
@@ -343,7 +344,31 @@ def test_on_a_phone_a_focused_reminder_card_keeps_the_44px_verbs(tmp_path: Path,
              ".map(b => b.getBoundingClientRect().height), probe: 1})")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [PHONE,
-            {"do": open_ring, "until": "document.querySelectorAll('#levain-modal .needs-card .intention-actions button').length >= 4", "ms": 30000, "every": 2000},
+            {"do": open_ring, "until": "[...document.querySelectorAll('#levain-modal .needs-card .intention-actions button')].filter(b => b.offsetParent).length >= 4", "ms": 30000, "every": 2000},
             {"eval": probe}])
     sizes = _probe(out)["sizes"]
     assert len(sizes) >= 4 and all(h >= 44 for h in sizes), sizes
+
+
+# the signed card's "open the sheet" button measured where the focus view draws it, and on a copy of the same card set outside
+# `.modal-body` (the touch floor must hold from the button's own rule, not only from a rule that happens to match its container)
+SHEET_PROBE = ("(() => { const hts = (root) => [...root.querySelectorAll('.needs-card .sign-sheet-open')].filter(b => b.offsetParent)"
+               ".map(b => b.getBoundingClientRect().height);"
+               " const modal = document.getElementById('levain-modal'); const inModal = hts(modal);"
+               " const host = document.createElement('div'); host.appendChild(modal.querySelector('.needs-card').cloneNode(true));"
+               " document.body.appendChild(host); const outside = hts(host); host.remove();"
+               " return JSON.stringify({inModal, outside, probe: 1}); })()")
+
+
+@needs_browser
+@needs_ssh
+def test_on_a_phone_the_signed_cards_sheet_button_keeps_the_44px_floor_in_and_out_of_the_focus_view(tmp_path: Path, monkeypatch) -> None:
+    """The signed card's 38px desktop sheet button must not undercut the phone touch floor, whichever container draws the card."""
+    rig = _Rig(tmp_path, monkeypatch)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [PHONE, rig.authenticator(),
+            {"until": STRIP_FACET + " && document.querySelector('#levain-modal .needs-card .sign-sheet-open') && 1", "ms": 30000},
+            {"eval": SHEET_PROBE}])
+    seen = _probe(out)
+    assert seen["inModal"] and seen["outside"], seen
+    assert all(h >= 44 for h in seen["inModal"] + seen["outside"]), seen
