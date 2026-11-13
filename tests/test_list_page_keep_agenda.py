@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -37,13 +38,27 @@ KEPT = f"{TRAY}.querySelector('[data-list-kept]')"
 SEARCH = f"{TRAY}.querySelector('.ep-search-input')"
 
 
+class _Delivered(list):
+    """The recorder that stands in for the answer's delivery to a stopped agent. The server starts that delivery on a daemon thread
+    after it has answered the page, so a test that reads the list right after the page's last step can read it before the thread
+    has run: ``arrived`` is set once a delivery is recorded, and a test waits on it (bounded) before it counts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.arrived = threading.Event()
+
+    def record(self, *a: Any, **_k: Any) -> None:
+        self.append(a)
+        self.arrived.set()
+
+
 def _world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Any, dict[str, str], Any]:
     """An install with the List's three stores, one plain band row (filed with no session: its answer reaches no agent) and
     one earlier Keep in memory. The delivery to a stopped agent is replaced by a recorder."""
     root, src, ids = _install(tmp_path)
     _seed_more(root)
-    delivered: list[Any] = []
-    monkeypatch.setattr(band, "deliver_answer", lambda *a, **k: delivered.append(a))
+    delivered = _Delivered()
+    monkeypatch.setattr(band, "deliver_answer", delivered.record)
     qs = QuestionStore(default_queue_dir())
     q = qs.file(agent="claude_code", agent_session_id=band.NO_SESSION, what=BAND_WORDS,
                 options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the essay waits on it", cwd="/w/levain")
@@ -251,6 +266,7 @@ def test_a_plain_band_row_makes_an_agenda_through_a_day_form_and_the_server_judg
     answered = qs.get(q.id)
     assert answered.answer is not None and answered.answer.kind == "text" and answered.answer.channel == "cockpit", answered.answer
     assert answered.answer.value.startswith("deferred: comes back " + past), answered.answer
+    assert delivered.arrived.wait(5), "the delivery thread never ran"        # it is started on a thread after the answer: wait for it
     assert len(delivered) == 1                                         # the stopped agent's delivery was started once
     assert '{"fits":true}' in v
 
@@ -272,7 +288,7 @@ def test_only_the_plain_band_row_offers_an_agenda_button(tmp_path: Path, monkeyp
 #
 # Each test below was run against the build as it stood (13ccd657d) first and failed there for the reason its comment names.
 
-AGENDA_PLANTED_LINE = ("The agenda may already be planted but the row was not closed. Reload the List and check; "
+AGENDA_PLANTED_LINE = ("The agenda may already be planted and the row may already be closed. Reload the List and check; "
                        "trying again is safe.")
 GENERIC_STORE_LINE = "The store behind that is unavailable right now. Nothing was added."
 FAULT_LINES = {
@@ -583,3 +599,246 @@ def test_agenda_day_refusal_matches_every_branch_of_the_hosts_real_day_refusal()
     assert res.returncode == 0, res.stderr
     assert json.loads(res.stdout) == {"not_after_today": True, "within_the_window": True, "not_a_date": True,
                                       "unrelated": False, "a_path_after_the_opening": False, "empty": False}, res.stdout
+
+
+# --- the L3 round 1 fixes (levain 24, key 1112-44, lane LISTPAGEFIX2) --------------------------------------------------------
+#
+# Each test below was run against the build as it stood (52fc9ea4f) first and failed there for the reason its comment names.
+
+WRITE_UNSURE_LINE = "Could not tell whether that went through. Reload the List and check; trying again is safe."
+_LONE_SURROGATE = r"/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/"
+# the page's tray.json reads that carry a search query (the memory half of the List's search), counted and shaped by a stub of fetch
+_COUNT_READS = ("window.__reads = []; const realFetch = window.fetch.bind(window); "
+                "window.fetch = (u, o) => { if (/tray\\.json/.test(String(u)) && /[?&]q=/.test(String(u))) window.__reads.push(String(u)); "
+                "return realFetch(u, o); }; 1")
+_LIST_WORDS = (f"JSON.stringify({{rows: {ROWS}.map(r => (r.querySelector('.clause') || {{}}).textContent), "
+               f"status: ({TRAY}.querySelector('.ep-search-status') || {{}}).textContent}})")
+
+
+def _seed_texts(root: Path, *texts: str) -> None:
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    for t in texts:
+        store.add(type="task", text=t, disposition="seed", attention="talk")
+
+
+def _list_words(out: dict[str, Any]) -> list[dict[str, Any]]:
+    return [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"rows"')]
+
+
+@needs_browser
+def test_a_list_with_no_live_rows_still_searches_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RED on 52fc9ea4f (codex MED): with no live row but one kept memory, the panel returned at its empty-state line before it
+    made the search box, so memory could not be searched at all."""
+    root, src, ids = _install(tmp_path)
+    apply_edit(src.write_scope, {"kind": "intention_keep", "intention_id": ids["note"]})         # "a keep note" is in memory now
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    for s in store.list_open():
+        store.descend(s["id"], kind="composted")                                                 # and nothing is left on the List
+    assert store.list_open() == []
+    # the Done group keeps a row a week: age every resolution, or the List still holds the rows just composted (it then has rows)
+    doc_path = root / ".levain" / "memory.spores.json"
+    doc = json.loads(doc_path.read_text("utf-8"))
+    assert doc["resolved"], doc.keys()
+    for r in doc["resolved"]:
+        r["resolution"]["at"] = "2020-01-07T09:00:00+00:00"
+    doc_path.write_text(json.dumps(doc), "utf-8")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && 1"},
+            {"eval": f"JSON.stringify({{rows: {ROWS}.length, search: !!{SEARCH}, empty: !!{TRAY}.querySelector('.empty'), host: !!{KEPT}}})"},
+            *_set_query("keep note"),
+            {"until": f"{KEPT} && !{KEPT}.hidden && {KEPT}.querySelectorAll('.row').length && 1"},
+            {"eval": f"JSON.stringify({{head: {KEPT}.querySelector('summary').textContent, line: {KEPT}.querySelector('.clause').textContent}})"},
+            *_set_query(""),
+            {"until": f"{KEPT}.hidden && {KEPT}.children.length === 0"},
+        ])
+    v = out["values"]
+    before = json.loads(next(x for x in v if isinstance(x, str) and x.startswith('{"rows"')))
+    assert before == {"rows": 0, "search": True, "empty": True, "host": True}, before     # nothing live, and the search is there
+    hit = json.loads(next(x for x in v if isinstance(x, str) and x.startswith('{"head"')))
+    assert "Kept in memory" in hit["head"] and hit["line"].startswith("a keep note"), hit
+
+
+@needs_browser
+def test_the_lists_live_rows_match_a_query_the_way_the_servers_memory_search_does(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RED on 52fc9ea4f (codex MED): live rows used one contiguous, case-folded substring, memory used accent-folded space-separated
+    AND terms, so `alpha beta` hid `alpha one beta two` while showing the same words from memory. The page now mirrors the
+    server's `_fold` and `_terms_match` (levain/cockpit/engine.py) for the List's rows."""
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_texts(root, "alpha one beta two", "Café Crème brûlée", "SHOUTING words")
+    asks = ["alpha beta", "BETA   alpha", "alpha gamma", "cafe creme", "CAFÉ", "brulee", "shouting WORDS", "intention-"]
+    steps: list[dict[str, Any]] = [{"emulate": {"w": 1280, "h": 1100, "dpr": 1}}, *_reload(),
+                                   {"until": f"{TRAY} && {ROWS}.length > 2 && 1"}]
+    for q in asks:
+        steps += [*_set_query(q), {"eval": _LIST_WORDS}]
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", steps)
+    got = {q: g["rows"] for q, g in zip(asks, _list_words(out))}
+    assert got["alpha beta"] == ["alpha one beta two"], got                    # terms, not one contiguous run
+    assert got["BETA   alpha"] == ["alpha one beta two"], got                  # any order, any run of spaces, any case
+    assert got["alpha gamma"] == [], got                                       # every term is required
+    assert got["cafe creme"] == ["Café Crème brûlée"], got                    # accents fold, both ways
+    assert got["CAFÉ"] == ["Café Crème brûlée"] and got["brulee"] == ["Café Crème brûlée"], got
+    assert got["shouting WORDS"] == ["SHOUTING words"], got
+    assert len(got["intention-"]) >= 4, got                                    # an intention id still matches
+    assert _list_words(out)[0]["status"].startswith("1 match"), _list_words(out)[0]
+
+
+@needs_browser
+def test_the_list_search_takes_at_most_200_characters_and_both_halves_read_the_same_query(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RED on 52fc9ea4f (codex LOW): rows filtered by the whole box while the memory read cut it to 200, so a long paste showed
+    memory hits for a query the rows beside it did not match. The box now holds 200 at most, and a value set past that
+    (a script, a restored query) is cut the same way for the rows."""
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    _seed_texts(root, "needle haystack")
+    long_query = "needle" + " " * 210 + "zzz"                                   # past 200, the tail is the only thing that does not match
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            {"eval": f"JSON.stringify({{max: {SEARCH}.maxLength}})"},
+            *_set_query(long_query),
+            {"eval": _LIST_WORDS},
+        ])
+    assert json.loads(next(x for x in out["values"] if isinstance(x, str) and x.startswith('{"max"'))) == {"max": 200}
+    assert _list_words(out)[0]["rows"] == ["needle haystack"], _list_words(out)
+
+
+@needs_browser
+def test_a_send_that_throws_leaves_the_keep_and_agenda_forms_with_a_fixed_line_and_live_buttons(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RED on 52fc9ea4f (complement LOW): a rejected send (a network drop) threw inside the click handler and left the form
+    disabled on "..." with no way out but a reload; both are irreversible writes, so the person must be told it is unknown."""
+    _root, src, _ids, _band = _world(tmp_path, monkeypatch)
+    past = (date.today() + timedelta(days=9)).isoformat()
+    seed = _row_of(SEED)
+    band_row = _row_of("levain: pick the release date")
+    state = lambda row: ("JSON.stringify({msg: " + row + ".querySelector('.verb-form .edit-msg').textContent, "      # noqa: E731
+                         "cls: " + row + ".querySelector('.verb-form .edit-msg').className, "
+                         "go: !" + row + ".querySelector('.verb-form .verb-confirm').disabled, "
+                         "cancel: !" + row + ".querySelector('.verb-form .verb-cancel').disabled})")
+    wait = {"eval": "new Promise(r => setTimeout(() => r(1), 600))"}
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {seed} && {band_row} && 1"},
+            {"eval": "window.LevainCockpitTransport.rowVerb = () => Promise.reject(new TypeError('Failed to fetch')); 1"},
+            # the Keep
+            {"eval": f"{seed}.querySelector('.verb-more').click(); {seed}.querySelector('[data-verb=intention_keep]').click(); 1"},
+            {"until": f"{seed}.querySelector('.verb-form .verb-confirm') && 1"},
+            _confirm(seed),
+            wait,
+            {"eval": state(seed)},
+            # the agenda
+            {"eval": f"{band_row}.querySelector('[data-verb=band_agenda]').click(); 1"},
+            {"until": f"{_day_input(band_row)} && 1"},
+            _pick(band_row, past),
+            _confirm(band_row),
+            wait,
+            {"eval": state(band_row)},
+        ])
+    got = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"msg"')]
+    assert len(got) == 2, out["values"]
+    for g in got:
+        assert g["msg"] == WRITE_UNSURE_LINE and "err" in g["cls"], g
+        assert g["go"] is True and g["cancel"] is True, g                          # the buttons are live again: a retry is possible
+
+
+@needs_browser
+def test_a_panel_redraw_leaves_no_read_from_its_old_search_box_and_a_newer_key_aborts_the_older_read(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RED on 52fc9ea4f (complement LOW 2, deepseek MED): a debounce armed in a panel that was then redrawn still fired its
+    read, and a superseded read was dropped but never aborted. The host check (`isConnected`) stops the first; the AbortController
+    the second."""
+    _root, src, _ids, _band = _world(tmp_path, monkeypatch)
+    hang = ("window.__sigs = []; window.__res = []; const real2 = window.fetch.bind(window); "
+            "window.fetch = (u, o) => { if (/tray\\.json/.test(String(u)) && /[?&]q=/.test(String(u))) "
+            "return new Promise((res, rej) => { const s = o && o.signal ? o.signal : null; window.__sigs.push(s); window.__res.push(res); "
+            "if (s) s.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError'))); }); return real2(u, o); }; 1")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            {"eval": _COUNT_READS},
+            # a control: a query is read once its debounce has run
+            *_set_query("keep note"),
+            {"until": "window.__reads.length === 1 && 1"},
+            {"until": f"{KEPT} && !{KEPT}.hidden && 1"},
+            # the panel is redrawn (its memory host replaced) while the next debounce is still pending: no read follows
+            *_set_query("tray seed"),
+            {"eval": f"window.__host = {KEPT}; window.__host.remove(); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(JSON.stringify({reads: window.__reads.length})), 800))"},
+            # the host is put back (the same box goes on): a hung read, then a newer key, and the older read's signal is aborted
+            {"eval": f"{TRAY}.querySelector('.sp-results').after(window.__host); 1"},
+            {"eval": hang},
+            *_set_query("keep"),
+            {"until": "window.__sigs.length === 1 && 1"},
+            *_set_query("keep n"),
+            {"eval": "JSON.stringify({aborted: window.__sigs[0] ? window.__sigs[0].aborted : null})"},
+            # the panel is redrawn while the newest read is in flight; the answer that comes after is drawn into nothing
+            {"until": "window.__sigs.length === 2 && 1"},
+            {"eval": "window.__host.remove(); 1"},
+            {"eval": "window.__res[1](new Response(JSON.stringify({status: 'ok', rows: [{id: 'k1', title: 'late', body: 'late words', "
+                     "facets: {surface: 'kept', kept_line: 'kept from the List: x'}}]}), {status: 200, headers: {'Content-Type': 'application/json'}})); 1"},
+            {"eval": "new Promise(r => setTimeout(() => r(JSON.stringify({late: window.__host.textContent.includes('late words')})), 400))"},
+        ])
+    v = out["values"]
+    assert '{"reads":1}' in v, v                                                   # the control's one read, and none from the orphan
+    assert '{"aborted":true}' in v, v
+    assert v[-1] == '{"late":false}', v                                                # an answer for a replaced panel draws nothing
+
+
+@needs_browser
+def test_a_refused_memory_read_prompts_no_token_and_drops_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RED on 52fc9ea4f (complement LOW 3): a keystroke-driven background read that the server answered with the token 403 ran
+    the transport's token bootstrap (a window.prompt, then a dropped token). It is now a quiet kept fault."""
+    _root, src, _ids, _band = _world(tmp_path, monkeypatch)
+    refuse = ("window.__prompts = 0; window.prompt = () => { window.__prompts++; return ''; }; "
+              "const real3 = window.fetch.bind(window); "
+              "window.fetch = (u, o) => (/tray\\.json/.test(String(u)) && /[?&]q=/.test(String(u)) "
+              "? Promise.resolve(new Response(JSON.stringify({message: 'missing or invalid write token'}), "
+              "{status: 403, headers: {'Content-Type': 'application/json'}})) : real3(u, o)); 1")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {ROWS}.length > 2 && 1"},
+            {"eval": refuse},
+            *_set_query("tray seed"),
+            {"until": f"{KEPT} && !{KEPT}.hidden && {KEPT}.textContent"},
+            {"eval": "JSON.stringify({prompts: window.__prompts, token: localStorage.getItem('levain_write_token')})"},
+        ])
+    shown = out["values"][-2]
+    assert shown.strip() == KEPT_FAULT_LINE, shown
+    assert json.loads(out["values"][-1]) == {"prompts": 0, "token": TOKEN}, out["values"]
+
+
+@needs_browser
+def test_the_keep_form_cuts_its_quoted_line_on_a_whole_character(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RED on 52fc9ea4f (complement LOW 4): `slice(0, 120)` counts UTF-16 units, so an astral character at the cut left half of
+    its pair in the quoted line."""
+    root, src, _ids, _band = _world(tmp_path, monkeypatch)
+    rocket = "\U0001F680"
+    _seed_texts(root, "q" * 119 + rocket + " and the rest of the words that follow it")
+    row = _row_of("q" * 20)
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {row} && 1"},
+            {"eval": f"{row}.querySelector('.verb-more').click(); {row}.querySelector('[data-verb=intention_keep]').click(); 1"},
+            {"until": f"{row}.querySelector('.verb-form .keep-ask') && 1"},
+            {"eval": f"(() => {{ const t = {row}.querySelector('.keep-ask').textContent; "
+                     f"return JSON.stringify({{lone: {_LONE_SURROGATE}.test(t), rocket: t.includes({json.dumps(rocket)}), "
+                     "cut: t.includes('\\u2026')}); })()"},
+        ])
+    assert json.loads(out["values"][-1]) == {"lone": False, "rocket": True, "cut": True}, out["values"]
