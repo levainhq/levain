@@ -88,6 +88,7 @@ from levain.cockpit.effects import (
     read_recorded_verb,
     registration_refusals,
     resolve_effect,
+    retarget_strands_refusal,
     settle,
     intention_resource_key,
 )
@@ -845,6 +846,11 @@ class Broker:
         snap = es.snapshot(intention_resource_key(ok))
         if at_issue and target.get("row_version") is not None and snap.version != target["row_version"]:
             raise BrokerError("stale", 409, f"row {target.get('row_id')!r} changed since it was rendered")
+        if verb == "intention_retarget" and snap.row is not None and hasattr(es, "waiting_on"):
+            # the split's invariant (a machine part is closed at hand-off, so nothing marks it done) holds after the link too
+            why = retarget_strands_refusal(params, snap.row, es.waiting_on(str(snap.row.get("id"))))
+            if why is not None:
+                raise ValueError(why)
         eff = canonical_effect(verb, params, snap.row, version_of=es.version_of)
         pre = None if snap.row is None else {f: _stored_authority(snap.row, f) for f in INTENTION_AUTHORITY_FIELDS}
         return _Built({"kind": "row", "panel_id": target.get("panel_id"), "row_id": target.get("row_id"),

@@ -244,3 +244,46 @@ def test_intention_update_never_carries_a_target(tmp_path: Path) -> None:
                                                    "row_version": r["version"], "params": {"target": "not-a-target"}}, TOKEN)
     assert st == 400 and body["error"] == "field_not_allowed", (st, body)
     assert "target" not in IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").get(ids["seed"])
+
+
+# --- a first part cannot be handed to the machine while a second part waits on it (diogenes-20261113-020650) --------------
+def _split_pair(root: Path) -> tuple[str, str]:
+    """A first part (the operator's own, band) and a second part that waits on it finishing."""
+    from levain.intentions import guarded_intention_store
+
+    store = guarded_intention_store(root / ".levain" / "memory.spores.json")
+    a = store.add(type="task", text="call Jim", disposition="agenda", target="band", next="2031-01-07", today=TODAY)["id"]
+    f = store.add(type="task", text="send the invoice", disposition="agenda", target="band", on_event=f"done:{a}",
+                  check_by="2031-01-14", today=TODAY)["id"]
+    return a, f
+
+
+@pytest.mark.parametrize("target", ["desk", "board:levain"])
+def test_a_first_part_with_a_waiting_second_part_is_not_handed_to_the_machine(tmp_path: Path, target: str) -> None:
+    """``create_then`` refuses a then-part whose first part is the machine's, because a machine part is closed when it is handed
+    off and nothing could mark it done. The retarget reached the same state after the link existed: the first part went to the desk,
+    germinate composted it, and the second part waited on an event that could no longer happen. Driven through the real dispatch."""
+    root, src, _ids = _install(tmp_path)
+    a, f = _split_pair(root)
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        st, body = _retarget(base, a, {"target": target})
+    assert st >= 400 and f in str(body) and "waits on" in str(body), (st, body)           # refused, naming the waiting part
+    assert store.get(a)["target"] == "band"
+
+
+def test_a_first_part_can_still_change_hands_to_the_operator_or_when_nothing_waits(tmp_path: Path) -> None:
+    """The refusal is for the machine only, and only while a part is still waiting: a band or nudge target, a part that waits
+    on nothing, and a first part whose second part has ended all retarget as before."""
+    root, src, ids = _install(tmp_path)
+    a, f = _split_pair(root)
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        st, body = _retarget(base, a, {"target": "nudge"})
+        assert st == 200, body                                                            # the operator still acts: it can be marked done
+        st, body = _retarget(base, ids["drop"], {"target": "board:levain"})
+        assert st == 200, body                                                            # nothing waits on it
+        store.descend(f, kind="composted", today=TODAY)                                   # the second part ended
+        st, body = _retarget(base, a, {"target": "desk"})
+        assert st == 200, body
+    assert store.get(a)["target"] == "desk"

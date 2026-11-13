@@ -491,6 +491,17 @@ class IntentionEffectStore:
         except (IntentionError, OSError, ValueError, TypeError) as exc:
             raise TransientApplyFault.of(exc) from exc
 
+    def waiting_on(self, anchor_id: str) -> list[str]:
+        """The ids of the open second parts (``on_event: done:<anchor_id>``) that wait on ``anchor_id`` finishing: a read, never
+        a write (``levain.split.followers_of`` over the store's open intentions)."""
+        from levain.intentions import list_open_readonly
+        from levain.split import followers_of
+
+        try:
+            return [str(s.get("id")) for s in followers_of(list_open_readonly(self.path), anchor_id)] if self.path.exists() else []
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            raise TransientApplyFault.of(exc) from exc
+
     def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:
         return [ApplyUnit(INTENTIONS, (i,), (e,)) for i, e in effects]
 
@@ -871,6 +882,21 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
     if why is not None:
         raise ValueError(why)
     return _existing_effect(pre, changes, version_of)
+
+
+def retarget_strands_refusal(params: Mapping[str, Any], pre: Mapping[str, Any] | None, waiting: Sequence[str]) -> str | None:
+    """Why ``intention_retarget`` may not hand ``pre`` to the desk or a board while ``waiting`` (the ids of the open second parts
+    that wait on it finishing) is not empty; ``None`` when it may. The split's one invariant, which ``levain.split.create_then``
+    holds at link time: a machine part is closed when it is handed off, so nothing could mark it done and the part waiting on it
+    would never wake. The effect sees only the one row, so the caller that holds the store reads ``waiting`` and asks."""
+    from levain.intentions import executor_of
+
+    if not waiting or pre is None or executor_of(params.get("target")) != "machine":
+        return None
+    names = ", ".join(waiting[:3]) + (" ..." if len(waiting) > 3 else "")
+    return (f"{pre.get('id')} waits to be marked done by you: {names} waits on it. Handed to the desk or a board it would be "
+            "closed when handed off, so nothing could mark it done and that part would never wake. Finish or drop what waits "
+            "on it first, or keep it yours.")
 
 
 def _ce_set_disposition(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *,
