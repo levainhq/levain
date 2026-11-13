@@ -275,7 +275,8 @@ def test_an_answer_that_failed_and_a_row_that_cannot_be_read_back_is_still_plant
         m.setattr(band_agenda, "_row_state", lambda *_a, **_k: (None, None))
         with pytest.raises(EditError) as ei:
             _fire(rig, _row(rig), PAST)
-    assert (ei.value.code, ei.value.http_status, str(ei.value)) == ("agenda_planted_unanswered", 503, PLANTED_UNANSWERED)
+    assert (ei.value.code, ei.value.http_status) == ("agenda_planted_unanswered", 503)
+    assert str(ei.value) != PLANTED_UNANSWERED and "may or may not" in str(ei.value)       # LISTSRV2: unreadable is indeterminate
     assert len(_agendas(rig)) == 1
 
 
@@ -947,3 +948,118 @@ def test_a_foreign_row_its_listing_omits_is_not_offered_and_plants_nothing(tmp_p
         _defer(rig, host, "np-plain002")
     assert ei.value.code == "source_unavailable" and ei.value.http_status == 503
     assert _keyed(rig, "np-plain002") is None and host.get("np-plain002").answer is None
+
+
+# --- LISTSRV2: an unreadable read-back is indeterminate; a standing agenda is named on every refusal ----------------
+
+
+def test_a_host_that_records_the_deferral_then_raises_with_the_readback_failing_never_says_not_answered_yet(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """L1 1 + codex MED 1 + deepseek MED 1: the answer RAISED and the row cannot be read back, but the host recorded the deferral
+    first (supported behaviour). "not answered yet: trying again finishes it" would be false, since the retry is stale."""
+    host = RacingHost()
+    host.raise_after_closing = True               # records OUR deferral, then raises
+    host.get_fails_after_answer = True            # and the read-back faults
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    words = str(ei.value)
+    [agenda] = _agendas(rig)
+    assert (ei.value.code, ei.value.http_status) == ("agenda_planted_unanswered", 503)
+    assert ei.value.extra == {"agenda": agenda["id"], "day": PAST}
+    assert words != PLANTED_UNANSWERED and "not answered yet" not in words and "trying again finishes it" not in words
+    assert "may or may not" in words and "reload the List" in words and "raised" in words
+    assert host.get_fails_after_answer and host._answered and host.rows[1].answer is not None      # the row WAS answered
+    assert "/Users" not in words and "unparseable" not in words                                      # no raw cause on the wire
+    assert ei.value.__cause__ is None                                                                # nor chained for a logger to walk
+
+
+def test_an_answer_that_raised_with_a_verified_open_row_still_says_not_answered_yet(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The words stay reserved for a VERIFIED open row (the crash shape), so the unreadable case and this one cannot share a sentence."""
+    import sqlite3
+
+    def locked(*_a: Any, **_k: Any) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as m:
+        m.setattr(band_agenda, "_answer_deferred", locked)
+        with pytest.raises(EditError) as ei:
+            _fire(rig, _row(rig), PAST)
+    assert str(ei.value) == PLANTED_UNANSWERED and ei.value.__cause__ is None
+
+
+def _planted_day_and_id(rig: Rig, host: Any) -> dict[str, Any]:
+    agenda = _keyed(rig, "np-plain002")
+    return {"agenda": agenda["id"], "day": PAST}
+
+
+def test_a_refusal_that_leaves_an_agenda_standing_names_it_in_extra_and_a_clean_one_does_not(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """L1 2: every refusal where an agenda STANDS carries agenda + day (codes and words unchanged); the composted one carries none."""
+    from levain.cockpit.consent import ConsentError
+
+    # (a) the compost itself failed: fate "failed", the agenda stands
+    host = AnsweringHost()
+    host.answer_refuses = "needs a signed answer"
+    rig = _host_rig(tmp_path / "a", monkeypatch, host)
+
+    def malformed(*_a: Any, **_k: Any) -> Any:
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    with monkeypatch.context() as m:
+        m.setattr(band_agenda, "_compensate", malformed)
+        with pytest.raises(EditError) as ei:
+            _defer(rig, host, "np-plain002")
+    assert ei.value.code == "answer_refused" and "could not be composted" in str(ei.value)
+    assert ei.value.extra == _planted_day_and_id(rig, host)
+
+    # (b) changed since this call planted it: fate "touched"
+    host = AnsweringHost()
+    rig = _host_rig(tmp_path / "b", monkeypatch, host)
+
+    def refuse_after_an_edit(ref, *, option=None, text=None, channel):
+        rig.sp.update(_keyed(rig, ref)["id"], text="edited meanwhile")
+        raise ConsentError("needs a signed answer")
+
+    host.answer = refuse_after_an_edit                    # type: ignore[method-assign]
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    assert ei.value.code == "answer_refused" and "changed since" in str(ei.value)
+    assert ei.value.extra == _planted_day_and_id(rig, host)
+
+    # (c) resolved meanwhile (done): fate "resolved", it cannot wake the row but it is not composted either
+    host = AnsweringHost()
+    rig = _host_rig(tmp_path / "c", monkeypatch, host)
+
+    def refuse_after_a_done(ref, *, option=None, text=None, channel):
+        rig.sp.descend(_keyed(rig, ref)["id"], kind="done")
+        raise ConsentError("needs a signed answer")
+
+    host.answer = refuse_after_a_done                     # type: ignore[method-assign]
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    assert ei.value.code == "answer_refused" and "resolved meanwhile" in str(ei.value)
+    assert ei.value.extra == _planted_day_and_id(rig, host)
+
+    # (d) planted by an earlier attempt, so it stands: not created by this call
+    host = RacingHost()
+    rig = _host_rig(tmp_path / "d", monkeypatch, host)
+    with monkeypatch.context() as m:
+        _fail(m, "_answer_deferred")
+        with pytest.raises(EditError):
+            _defer(rig, host, "np-plain002")
+    host.other = _other_answer("np-plain002")
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    assert ei.value.code == "stale" and "earlier attempt" in str(ei.value)
+    assert ei.value.extra == _planted_day_and_id(rig, host)
+
+
+def test_a_refusal_with_nothing_left_planted_carries_no_agenda_extra(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    host = AnsweringHost()
+    host.answer_refuses = "needs a signed answer"
+    rig = _host_rig(tmp_path, monkeypatch, host)
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    assert ei.value.code == "answer_refused" and "nothing remains planted" in str(ei.value)
+    assert ei.value.extra == {} and _agendas(rig) == []

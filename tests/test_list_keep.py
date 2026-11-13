@@ -249,7 +249,7 @@ def test_a_store_fault_on_the_compost_after_the_episode_says_kept_not_closed_503
             _keep(rig, sid)
     assert (ei.value.code, ei.value.http_status) == ("kept_not_closed", 503)
     words = str(ei.value)
-    assert "may already be kept" in words and "stays on the List" in words and "writes the memory once" in words
+    assert "the memory is kept" in words and "stays on the List" in words and "writes the memory once" in words
     [ep] = _keep_episodes(rig)                              # the irreversible act the code is about
     assert sid in _open_ids(rig)
     out = _keep(rig, sid)                                   # the retry the message promises: one memory, row closed
@@ -272,7 +272,7 @@ def test_a_row_that_moved_between_the_episode_and_the_compost_says_kept_not_clos
         with pytest.raises(EditError) as ei:
             _keep(rig, sid, expect_disposition="seed")
     assert (ei.value.code, ei.value.http_status) == ("kept_not_closed", 409)
-    assert "may already be kept" in str(ei.value) and "reload" in str(ei.value)
+    assert "the memory is kept" in str(ei.value) and "reload" in str(ei.value)
     [ep] = _keep_episodes(rig)
     assert sid in _open_ids(rig)                            # the row was not composted
     out = _keep(rig, sid)                                   # a fresh read of the moved row: one memory, row closed
@@ -438,4 +438,78 @@ def test_a_valueerror_that_is_not_a_retired_key_is_a_plain_refusal_that_names_it
         _keep(rig, sid)
     assert ei.value.code != "keep_key_retired" and "content must not be empty" in str(ei.value)
     assert "compost the item by hand" not in str(ei.value)
+    assert sid in _open_ids(rig)
+
+
+# --- LISTSRV2: the status follows the inner refusal; the episode is KNOWN to have landed; every post-episode fault is typed -------
+
+
+def _raise_in_compost(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise exc
+    monkeypatch.setattr(writes, "_keep_compost", boom)
+
+
+def test_a_cas_miss_after_the_episode_is_409_and_a_non_cas_intention_error_is_503_and_neither_loses_the_episode(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """L1 4 / complement 2 / codex MED 2 / deepseek MED 2: 409 only when the row moved (``_intention_refusal`` says ``stale``); a
+    corrupt or unreadable store is a fault, 503. Both say the memory is kept and carry the episode id."""
+    from anneal_memory.spores import IntentionError
+
+    sid = rig.ids["plain"]
+    with monkeypatch.context() as m:        # the row moved: a stale CAS miss
+        real = writes._keep_compost
+
+        def moved_then_compost(store: Any, intention_id: str, expect: Any, guard: Any) -> None:
+            rig.sp.update(intention_id, disposition="someday")
+            real(store, intention_id, expect, guard)
+
+        m.setattr(writes, "_keep_compost", moved_then_compost)
+        with pytest.raises(EditError) as moved:
+            _keep(rig, sid, expect_disposition="seed")
+    [ep] = _keep_episodes(rig)
+    assert (moved.value.code, moved.value.http_status) == ("kept_not_closed", 409)
+    assert moved.value.extra == {"episode_id": ep.id}
+
+    with monkeypatch.context() as m:        # a store fault that is an IntentionError but not a race
+        _raise_in_compost(m, IntentionError("/Users/someone/intentions.json is not valid JSON; inspect it by hand"))
+        with pytest.raises(EditError) as fault:
+            _keep(rig, sid)
+    assert (fault.value.code, fault.value.http_status) == ("kept_not_closed", 503)
+    assert fault.value.extra == {"episode_id": ep.id}
+    words = str(fault.value)
+    assert "/Users" not in words and "not valid JSON" not in words and "IntentionError" not in words     # fixed words, no raw cause
+    assert "is kept" in words and "may already" not in words and "writes the memory once" in words
+    assert [e.id for e in _keep_episodes(rig)] == [ep.id] and sid in _open_ids(rig)
+
+    out = _keep(rig, sid)                   # the retry after either: one episode, the row closed
+    assert out["ok"] and out["episode_id"] == ep.id and [e.id for e in _keep_episodes(rig)] == [ep.id]
+    assert sid not in _open_ids(rig)
+
+
+def test_both_kept_not_closed_statuses_say_the_memory_is_kept_and_carry_the_episode_id(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """L1 3: the server KNOWS the episode landed (``ep`` is bound), so no "may already be kept", and the proof is machine-readable."""
+    sid = rig.ids["plain"]
+    with monkeypatch.context() as m:
+        _fail_compost(m)
+        with pytest.raises(EditError) as ei:
+            _keep(rig, sid)
+    [ep] = _keep_episodes(rig)
+    assert ei.value.extra == {"episode_id": ep.id}
+    assert "the memory is kept; the item was not closed here" in str(ei.value) and "may" not in str(ei.value)
+    assert "injected" not in str(ei.value)          # the 503 no longer interpolates the raw exception text
+
+
+def test_a_value_error_from_the_compost_after_the_episode_is_kept_not_closed_503_not_an_untyped_500(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """codex LOW 5: anneal's ``descend`` raises ValueError for a persisted type with no ``composted`` kind (and for a bad guard)."""
+    sid = rig.ids["plain"]
+    with monkeypatch.context() as m:
+        _raise_in_compost(m, ValueError("descend kind 'composted' is invalid for a 'weird' spore. Valid: []."))
+        with pytest.raises(EditError) as ei:
+            _keep(rig, sid)
+    [ep] = _keep_episodes(rig)
+    assert (ei.value.code, ei.value.http_status) == ("kept_not_closed", 503)
+    assert ei.value.extra == {"episode_id": ep.id} and "weird" not in str(ei.value)
     assert sid in _open_ids(rig)

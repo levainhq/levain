@@ -308,13 +308,19 @@ def defer(*, questions: Any, intentions_json: Path, ledger_root: Path, question_
             raise EditError(PLANTED_UNANSWERED, 503,
                             f"agenda {aid} is planted for {planted} and the host took the deferral answer, but the row could "
                             "not be read back to confirm it: reload the List (if the row is gone, the deferral landed)", down)
-        raise EditError(PLANTED_UNANSWERED, 503, PLANTED_UNANSWERED_WORDS, down) from raised
+        # the answer act raised AND the read-back is unreadable: a host may record the deferral and then raise (supported), so the
+        # row may or may not be answered. PLANTED_UNANSWERED_WORDS is reserved for a row VERIFIED open (below). ``from None``: the
+        # raised exception can carry a path, and nothing here logs it (this module has no logger)
+        raise EditError(PLANTED_UNANSWERED, 503,
+                        f"agenda {aid} is planted for {planted} and the answer act raised, but the row could not be read back: "
+                        "the row may or may not be answered, so reload the List (a retry finishes it if the row is still open)",
+                        down) from None
     if state in (ROW_OTHER, ROW_GONE):
         why = (f"the row was answered otherwise ({_said(found)})" if state == ROW_OTHER else "the row is gone")
         after.refuse("stale", f"{why}, so this deferral did not land", why)
     if state == ROW_OPEN:
         if isinstance(raised, (QuestionStoreError, OSError, sqlite3.Error)):     # a crash's shape: the retry finishes it
-            raise EditError(PLANTED_UNANSWERED, 503, PLANTED_UNANSWERED_WORDS, down) from raised
+            raise EditError(PLANTED_UNANSWERED, 503, PLANTED_UNANSWERED_WORDS, down) from None
         why = str(raised) if raised is not None else "the host returned, but the row is still open"
         after.refuse("answer_refused", f"the row was not answered ({why})", why)
     _deliver(questions, q.id)                 # ROW_OURS: the deferral landed (its host may still have raised after it)
@@ -361,11 +367,12 @@ class _After:
         what became of the agenda. An agenda this call did not plant is named and left standing. Always raises."""
         from levain.writes import EditError
 
+        stands = {"agenda": self.aid, "day": self.planted}      # the page tells a stranded live agenda from a clean refusal
         if not self.created:
             tail = f"agenda {self.aid}, planted by an earlier attempt, stands for {self.planted}"
             if code == "stale":
                 tail += ": compost it if it is not wanted"
-            raise EditError(code, 409, f"{head}; {tail}")
+            raise EditError(code, 409, f"{head}; {tail}", stands)
         try:        # whatever the store raises, the refusal and its audit line still go out
             fate, detail = _compensate(self.store, self.key, self.version,
                                        f"band_agenda aborted: the row {self.q_id} did not take the deferral answer ({why})",
@@ -385,7 +392,7 @@ class _After:
         lost = self.audit("aborted", why)
         if lost:
             tail += f" (the audit line could not be written: {lost})"
-        raise EditError(code, 409, f"{head}; {tail}")
+        raise EditError(code, 409, f"{head}; {tail}", stands if fate in ("resolved", "touched", "failed") else None)
 
 
 def _compensate(store: Any, key: str, version: str | None, note: str, today: date) -> tuple[str, str]:

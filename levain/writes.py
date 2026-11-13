@@ -2040,7 +2040,9 @@ def _apply_intention_then(
 # the episode a Keep writes: its source label (never caller-chosen) and its tag
 KEEP_EPISODE_SOURCE = "levain-list-keep"
 KEEP_EPISODE_TAG = "list-keep"
-KEPT_NOT_CLOSED = "kept_not_closed"      # the Keep's episode landed and the compost did not (503: a fault; 409: the row moved)
+KEPT_NOT_CLOSED = "kept_not_closed"      # the Keep's episode landed and the compost did not: 409 when the row moved, else 503 (a fault)
+_KEPT_NOT_CLOSED_FAULT = ("the memory is kept; the item was not closed here (the store could not close it): the item stays on "
+                          "the List; keeping it again is safe and writes the memory once")      # fixed words: no raw exception text
 
 
 def keep_origin_key(intention: Mapping[str, Any]) -> str:
@@ -2084,8 +2086,9 @@ def _apply_intention_keep(
     by hand), and (c) the intention keeps its origin key. Whatever the intention's words are on the retry, an episode already
     holding this key means the Keep happened, so the retry goes on to the compost and the receipt says the earlier words were
     kept. The audit line lands after BOTH acts, so a crash between them leaves no line and the retry writes it. A fault of act 2
-    after act 1 landed is :data:`KEPT_NOT_CLOSED` (503 a store fault, 409 the row moved), never ``store_unavailable`` / ``stale``:
-    those codes tell the page nothing was written."""
+    after act 1 landed is :data:`KEPT_NOT_CLOSED` (409 when the row moved, i.e. the CAS refusal is ``stale``; 503 for any other
+    fault: a store error, an unreadable or corrupt store, a type with no ``composted`` kind), never ``store_unavailable`` / ``stale``:
+    those codes tell the page nothing was written. Both statuses say the memory is kept and carry ``episode_id``."""
     from anneal_memory import AnnealMemoryError, Store
     from anneal_memory.spores import IntentionError
     from anneal_memory.store import OriginKeyConflict
@@ -2144,16 +2147,17 @@ def _apply_intention_keep(
     try:
         _keep_compost(store, intention_id, expect, guard)
     except IntentionError as exc:
-        inner = _intention_refusal(guard, exc, store, intention_id, expect)
-        raise EditError(
-            KEPT_NOT_CLOSED, 409,
-            f"the item's memory may already be kept, but the item was not closed here ({inner}): reload the List to see where it "
-            "stands; keeping it again is safe and writes the memory once") from exc
-    except OSError as exc:
-        raise EditError(
-            KEPT_NOT_CLOSED, 503,
-            f"the item's memory may already be kept, but the item could not be closed ({exc}): the item stays on the List; "
-            "keeping it again is safe and writes the memory once") from exc
+        # 409 only when the row MOVED (the refusal the shared mapper reads back is ``stale``); any other IntentionError is the
+        # store (corrupt, unreadable, a validation fault) and a retry will not change a row that did not move: 503
+        if _intention_refusal(guard, exc, store, intention_id, expect).code == "stale":
+            raise EditError(
+                KEPT_NOT_CLOSED, 409,
+                "the memory is kept; the item was not closed here (the row changed since it was read): reload the List to see "
+                "where it stands; keeping it again is safe and writes the memory once",
+                {"episode_id": ep.id}) from exc
+        raise EditError(KEPT_NOT_CLOSED, 503, _KEPT_NOT_CLOSED_FAULT, {"episode_id": ep.id}) from exc
+    except (OSError, ValueError) as exc:        # ValueError: anneal's descend refuses a persisted type with no ``composted`` kind
+        raise EditError(KEPT_NOT_CLOSED, 503, _KEPT_NOT_CLOSED_FAULT, {"episode_id": ep.id}) from exc
     edit_id = _audit_verb(
         scope.ledger_root, kind="intention_keep", action="keep", target=f"intention:{intention_id}", now=now,
         extra={"episode_id": ep.id, "origin_key": key},
