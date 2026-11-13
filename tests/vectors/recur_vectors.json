@@ -1,0 +1,2116 @@
+{
+ "_about": "recur vectors generated from flow's scripts/intentions.py parse_recur/next_occurrence (tests/test_recur.py re-derives them live where flow is on the machine); canon null = the rule must refuse",
+ "cases": [
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-10T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-01T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-01T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-02-29T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-01T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-08T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-01T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-01T09:00"
+  },
+  {
+   "rule": "daily 09:00",
+   "canon": "daily 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-02-28T09:00"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-10T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-10T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-10T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-01T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-01-31T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-02-28T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-02-29T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-08T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-01T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-04-30T23:59"
+  },
+  {
+   "rule": "daily 23:59",
+   "canon": "daily 23:59",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-02-28T23:59"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-11T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-11T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-11T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-01T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-01T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-02-29T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-01T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-09T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-02T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-01T00:05"
+  },
+  {
+   "rule": "daily 0:05",
+   "canon": "daily 00:05",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-03-01T00:05"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-16T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-16T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-16T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-04T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-01T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-03-06T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-06T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-09T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-02T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-04T09:00"
+  },
+  {
+   "rule": "weekly MON 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-03-02T09:00"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-11T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-11T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-11T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-03T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-03T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-03-01T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-01T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-08T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-01T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-03T21:30"
+  },
+  {
+   "rule": "weekly sun,wed 21:30",
+   "canon": "weekly WED,SUN 21:30",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-03-01T21:30"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-11T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-11T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-11T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-01T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-01T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-02-29T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-01T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-09T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-02T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-01T08:00"
+  },
+  {
+   "rule": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "canon": "weekly MON,TUE,WED,THU,FRI 08:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-03-02T08:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-12-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-12-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-12-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-03-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-04-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-01T09:00"
+  },
+  {
+   "rule": "monthly 1 09:00",
+   "canon": "monthly 1 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-03-01T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-03-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-15T09:00"
+  },
+  {
+   "rule": "monthly 15 9:00",
+   "canon": "monthly 15 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-03-15T09:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-29T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-29T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-29T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-29T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-28T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-02-29T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-02-29T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-29T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-29T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-29T20:00"
+  },
+  {
+   "rule": "monthly 29 20:00",
+   "canon": "monthly 29 20:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-02-28T20:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-30T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-30T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-30T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-31T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-28T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-02-29T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-31T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-31T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-30T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-31T09:00"
+  },
+  {
+   "rule": "monthly 31 09:00",
+   "canon": "monthly 31 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-02-28T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-10-01",
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-10-01",
+   "next": "2026-11-11T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-10T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-11-09",
+   "next": "2026-11-10T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-10T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-10-01",
+   "next": "2026-11-10T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-11-09",
+   "next": "2027-01-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-01-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-10-01",
+   "next": "2027-01-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-11-09",
+   "next": "2027-02-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-02-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-10-01",
+   "next": "2027-02-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-02-29T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-11-09",
+   "next": "2028-02-29T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2028-02-29T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-10-01",
+   "next": "2028-02-29T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-11-09",
+   "next": "2028-03-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2028-03-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-10-01",
+   "next": "2028-03-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-08T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-10-01",
+   "next": "2026-11-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-02-28T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T09:00"
+  },
+  {
+   "rule": "every 1 days 09:00",
+   "canon": "every 1 days 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T09:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-10T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-12T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-11T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-10-01",
+   "next": "2026-11-12T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-10T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-12T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-11T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-10-01",
+   "next": "2026-11-12T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-10T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-11-09",
+   "next": "2026-11-12T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-11T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-10-01",
+   "next": "2026-11-12T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-03T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-11-09",
+   "next": "2027-01-02T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-01-01T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-10-01",
+   "next": "2027-01-02T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-03T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-11-09",
+   "next": "2027-02-01T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-02-03T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-10-01",
+   "next": "2027-02-01T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-02-28T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-11-09",
+   "next": "2028-02-29T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2028-02-28T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-10-01",
+   "next": "2028-02-29T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-02-29T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-11-09",
+   "next": "2028-02-29T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2028-03-02T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-10-01",
+   "next": "2028-02-29T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-08T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-01T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-10-01",
+   "next": "2026-11-03T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-03T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-02-28T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T18:00"
+  },
+  {
+   "rule": "every 3 days 18:00",
+   "canon": "every 3 days 18:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T18:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-24T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-23T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-19T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-10-01",
+   "next": "2026-11-12T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-10T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-23T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-19T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-10-01",
+   "next": "2026-11-12T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-10T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-11-09",
+   "next": "2026-11-23T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-19T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-10-01",
+   "next": "2026-11-12T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-14T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-11-09",
+   "next": "2027-01-04T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-01-14T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-10-01",
+   "next": "2027-01-07T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-14T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-11-09",
+   "next": "2027-02-01T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-02-11T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-10-01",
+   "next": "2027-02-04T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-02-28T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-11-09",
+   "next": "2028-02-28T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2028-03-09T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-10-01",
+   "next": "2028-03-02T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-02-29T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-11-09",
+   "next": "2028-03-13T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2028-03-09T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-10-01",
+   "next": "2028-03-02T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-08T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-01T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-10-01",
+   "next": "2026-11-12T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-14T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-02-28T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T10:00"
+  },
+  {
+   "rule": "every 14 days 10:00",
+   "canon": "every 14 days 10:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T10:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2027-11-11T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-11-09",
+   "next": "2027-11-10T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-11-06T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T14:00",
+   "prev": "2026-10-01",
+   "next": "2027-10-02T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2027-11-11T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-11-09",
+   "next": "2027-11-10T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-11-06T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T09:00",
+   "prev": "2026-10-01",
+   "next": "2027-10-02T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2027-11-11T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-11-09",
+   "next": "2027-11-10T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-11-06T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-10T08:59",
+   "prev": "2026-10-01",
+   "next": "2027-10-02T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2028-01-01T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-11-09",
+   "next": "2027-11-10T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-11-06T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-12-31T23:59",
+   "prev": "2026-10-01",
+   "next": "2027-10-02T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2028-02-01T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-11-09",
+   "next": "2027-11-10T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-11-05T10:00",
+   "next": "2027-11-06T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2027-01-31T23:30",
+   "prev": "2026-10-01",
+   "next": "2027-10-02T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2029-02-28T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-11-09",
+   "next": "2028-11-10T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2028-11-06T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2028-02-28T09:00",
+   "prev": "2026-10-01",
+   "next": "2028-10-02T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2029-03-01T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-11-09",
+   "next": "2028-11-10T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2028-11-06T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2028-02-29T09:00",
+   "prev": "2026-10-01",
+   "next": "2028-10-02T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2027-03-09T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-03-08T01:59",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2027-11-02T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-11-01T01:30",
+   "prev": "2026-10-01",
+   "next": "2027-10-02T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2027-05-01T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-04-30T21:00",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2027-03-01T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-11-09",
+   "next": "2026-11-09T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-11-05T10:00",
+   "next": "2026-11-05T00:00"
+  },
+  {
+   "rule": "every 366 days 00:00",
+   "canon": "every 366 days 00:00",
+   "after": "2026-02-28T08:00",
+   "prev": "2026-10-01",
+   "next": "2026-10-01T00:00"
+  },
+  {
+   "rule": "weekly MON,XXX 09:00",
+   "canon": null
+  },
+  {
+   "rule": "hourly 5",
+   "canon": null
+  },
+  {
+   "rule": "daily 24:00",
+   "canon": null
+  },
+  {
+   "rule": "every 0 days 09:00",
+   "canon": null
+  },
+  {
+   "rule": "every 367 days 09:00",
+   "canon": null
+  },
+  {
+   "rule": "monthly 32 09:00",
+   "canon": null
+  },
+  {
+   "rule": "daily",
+   "canon": null
+  },
+  {
+   "rule": "",
+   "canon": null
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-11-10T14:00",
+   "prev": null,
+   "next": "2026-11-16T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-11-10T09:00",
+   "prev": null,
+   "next": "2026-11-16T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-11-10T08:59",
+   "prev": null,
+   "next": "2026-11-16T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-12-31T23:59",
+   "prev": null,
+   "next": "2027-01-04T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2027-01-31T23:30",
+   "prev": null,
+   "next": "2027-02-01T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2028-02-28T09:00",
+   "prev": null,
+   "next": "2028-03-06T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2028-02-29T09:00",
+   "prev": null,
+   "next": "2028-03-06T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-03-08T01:59",
+   "prev": null,
+   "next": "2026-03-09T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-11-01T01:30",
+   "prev": null,
+   "next": "2026-11-02T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-04-30T21:00",
+   "prev": null,
+   "next": "2026-05-04T09:00"
+  },
+  {
+   "rule": "WEEKLY mon 09:00",
+   "canon": "weekly MON 09:00",
+   "after": "2026-02-28T08:00",
+   "prev": null,
+   "next": "2026-03-02T09:00"
+  }
+ ]
+}

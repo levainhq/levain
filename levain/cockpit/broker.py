@@ -898,9 +898,11 @@ class Broker:
                 reading = {"kind": "sort", "text": parsed["text"]}
             else:
                 reading = {"kind": parsed["kind"], "text": parsed["text"], "when": parsed.get("when")}
+                if parsed.get("recur"):
+                    reading["recur"] = parsed["recur"]
         else:
             reading = target.get("intake")
-            if not isinstance(reading, Mapping) or reading.get("kind") not in ("drop", "talk", "sort") \
+            if not isinstance(reading, Mapping) or reading.get("kind") not in ("drop", "remind", "talk", "sort") \
                     or not isinstance(reading.get("text"), str):
                 raise ValueError("the record's target carries no intake reading")
             reading = dict(reading)
@@ -917,15 +919,17 @@ class Broker:
                 "kind": "sort", "text": reading["text"]}}, [eff], [None])
         es = self._intentions()
         if not at_issue:
-            if reading["kind"] == "drop":
+            if reading["kind"] in ("drop", "remind"):
                 when = reading.get("when")
                 if not isinstance(when, str):
-                    raise ValueError("the record's drop reading carries no minute")
+                    raise ValueError(f"the record's {reading['kind']} reading carries no minute")
+                label = "reminder" if reading["kind"] == "remind" else "drop"
                 due = datetime.strptime(when, "%Y-%m-%dT%H:%M")
-                # strictly past: a drop decided inside its own minute is due now and germinates at once (an
-                # ``@+1m`` issued at hh:mm:59 and decided a second later is not refused)
+                # strictly past: a drop or reminder decided inside its own minute is due now and germinates at once (an
+                # ``@+1m`` issued at hh:mm:59 and decided a second later is not refused); a repeating reminder's FIRST
+                # minute is held to the same rule (typed again, never recomputed at the decision)
                 if due < self._now().astimezone().replace(tzinfo=None, second=0, microsecond=0):
-                    raise ValueError(f"the drop's minute ({when}) passed before it was signed")
+                    raise ValueError(f"the {label}'s minute ({when}) passed before it was signed")
         seed = intake_seed_params(reading)
         ok = create_origin_key(pid, 0)
         snap = es.snapshot(intention_resource_key(ok))
@@ -968,8 +972,11 @@ class Broker:
                 sid = None
         line, out = intake.receipt(dict(reading), id=sid)
         if sid is None:
-            what = (f"scheduled drop fires {datetime.strptime(out['fires'], '%Y-%m-%dT%H:%M'):%a %m-%d %H:%M}"
-                    if out["kind"] == "drop" else "talk")
+            fires = (f"{datetime.strptime(out['fires'], '%Y-%m-%dT%H:%M'):%a %m-%d %H:%M}"
+                     if out["kind"] in ("drop", "remind") else "")
+            what = (f"scheduled drop fires {fires}" if out["kind"] == "drop"
+                    else f"reminds you {fires}" + (f", then {out['recur']}" if out.get("recur") else "")
+                    if out["kind"] == "remind" else "talk")
             # a committed op whose row cannot be read now (a transient fault, or resolved since) WAS written: never
             # "not written", which would invite a second, duplicate line
             line = {"WAITING": f"{what}, awaiting your signature", "applying": f"{what}, being written",

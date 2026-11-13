@@ -760,7 +760,7 @@ def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin
 # THE LIST (task_surfaces_1107.md): the three optional fields a create may carry. ``next`` is stored exactly as
 # given, a timed minute never cut to its date; ``target``/``attention`` steer how an agenda germinates (a seed may
 # carry ``attention: talk`` and nothing else). Each is refused when it does not read, never coerced
-SEED_STEERING_FIELDS = ("next", "target", "attention")
+SEED_STEERING_FIELDS = ("next", "target", "attention", "recur")
 
 
 def _seed_steering(params: Mapping[str, Any], disposition: str) -> dict[str, Any]:
@@ -780,6 +780,18 @@ def _seed_steering(params: Mapping[str, Any], disposition: str) -> dict[str, Any
         out["target"] = target
     if attention is not None:
         out["attention"] = attention
+    recur = params.get("recur")
+    if recur is not None:
+        # a repeating agenda: the rule must read (stored as its canon string), it needs the first minute it rings, and it
+        # rings in the band or as a nudge: a desk drop composts at germination, so it has no ``done`` to advance
+        from levain.recur import RECURRING_TARGETS, parse_recur
+
+        canon = parse_recur(recur)["canon"]         # a rule that does not read raises its own ValueError, grammar attached
+        if disposition != "agenda" or target not in RECURRING_TARGETS or "next" not in out:
+            raise ValueError(f"a repeating reminder is an agenda with a date that rings as {' or '.join(RECURRING_TARGETS)} "
+                             f"(got disposition {disposition!r}, target {target!r}, next {out.get('next')!r})")
+        out["recur"] = canon
+        out["recur_anchor"] = out["next"]
     return out
 
 
@@ -796,26 +808,38 @@ INTAKE_VERB = "list_intake"
 # governed install; a REPORTED install fires a token's T2 as reported (``gesture_for``), as it does every intention_seed,
 # which is that install class's declared trade. A standing raise of intention_seed governs a drop and a talk too
 # (``verbs._intake_policy_also``). Pinned by the tests
-INTAKE_TIERS = {"drop": "T2", "talk": "T2", "sort": "C1"}
+REMIND_TIER = "T2"          # OPEN, Phill's call (row 188 P2): T2 keeps the signature as the confirm step; a lighter tier is his to rule
+REMIND_TARGET = "nudge"     # where a reminder rings (row 188 P1, a default and not a ruling): a nudge reaches his phone at its minute
+INTAKE_TIERS = {"drop": "T2", "talk": "T2", "remind": REMIND_TIER, "sort": "C1"}
 
 
 def intake_kind_of(line: Any) -> str | None:
     """The kind a line asks for, read from its prefix alone (the tier needs no clock): ``drop`` for ``@``, ``talk``
-    for ``?``, ``sort`` otherwise; None for a line that is not a string (refused, at the highest tier)."""
+    for ``?``, ``remind`` for ``remind [me]`` straight into a time word (``levain.when_parse.is_remind``, the same shape test
+    the parser reads), ``sort`` otherwise; None for a line that is not a string (refused, at the highest tier)."""
+    from levain.when_parse import is_remind
+
     if not isinstance(line, str):
         return None
     s = line.strip()
-    return "drop" if s.startswith("@") else "talk" if s.startswith("?") else "sort"
+    return "drop" if s.startswith("@") else "talk" if s.startswith("?") else "remind" if is_remind(s) else "sort"
 
 
 def intake_seed_params(parsed: Mapping[str, Any]) -> dict[str, Any]:
-    """The ``intention_seed`` params a parsed ``drop`` or ``talk`` plants. A drop is an agenda for the desk at the
-    resolved minute, stored whole (``YYYY-MM-DDTHH:MM``, never cut to a date); a talk is a seed with ``attention:
-    talk`` and no target. The words are the operator's, verbatim (``_ce_seed`` strips the ends only)."""
+    """The ``intention_seed`` params a parsed ``drop``, ``remind`` or ``talk`` plants. A drop is an agenda for the desk at the
+    resolved minute, stored whole (``YYYY-MM-DDTHH:MM``, never cut to a date); a remind is an agenda for HIM at that minute
+    (``REMIND_TARGET``), carrying ``recur`` when it repeats; a talk is a seed with ``attention: talk`` and no target. The
+    words are the operator's, verbatim (``_ce_seed`` strips the ends only)."""
     kind = parsed.get("kind")
     if kind == "drop":
         return {"type": "task", "text": parsed["text"], "disposition": "agenda", "target": "desk",
                 "next": parsed["when"]}
+    if kind == "remind":
+        out = {"type": "task", "text": parsed["text"], "disposition": "agenda", "target": REMIND_TARGET,
+               "next": parsed["when"]}
+        if parsed.get("recur"):
+            out["recur"] = parsed["recur"]
+        return out
     if kind == "talk":
         return {"type": "thought", "text": parsed["text"], "disposition": "someday", "attention": "talk"}
     raise ValueError(f"a {kind!r} intake plants no intention")
