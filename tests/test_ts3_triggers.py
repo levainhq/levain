@@ -290,6 +290,25 @@ def test_a_finished_first_part_makes_the_session_start_hook_spawn_germinate(agen
 
 
 @pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_session_start_over_an_older_hook_copy_still_spawns_germinate(agent, monkeypatch, capsys, tmp_path):
+    """A package upgrade whose hook copies were not re-installed yet: the older `_levain_hook.py` has no `ring_only_ids` and its
+    `start_germinate` takes the agent alone. The agenda surface must work as it always did, not go dark."""
+    mod = _load(agent)
+    h = mod.hook
+    root = _install(tmp_path)
+    st = guarded_intention_store(root / ".levain" / "memory.spores.json")
+    first = st.add(type="task", text="call Jim", disposition="agenda", target="band")["id"]
+    st.add(type="task", text="send the invoice", disposition="agenda", target="band", on_event=f"done:{first}",
+           check_by=(date.today() + timedelta(days=5)).isoformat())
+    st.descend(first, kind="done")
+    monkeypatch.delattr(h, "ring_only_ids")
+    real, calls = h.start_germinate, []
+    monkeypatch.setattr(h, "start_germinate", lambda agent_name="x": (calls.append(agent_name), real(agent_name))[1])
+    spawned, ctx = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert calls == [agent] and len(spawned) == 1 and "[germinate] 1 agenda came due; germination started" in ctx
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
 def test_the_hooks_event_pattern_is_levains(agent):
     from levain import intentions
 

@@ -184,7 +184,9 @@ def main() -> int:
                 due = hook.due_agendas(rows)
                 n = len(due)
                 if n:
-                    st = hook.start_germinate('claude_code', hook.ring_only_ids(due, rows))
+                    # an older hook copy has no `ring_only_ids`: it is called as it always was, with no ids
+                    ring_ids = getattr(hook, 'ring_only_ids', None)
+                    st = hook.start_germinate('claude_code', ring_ids(due, rows)) if ring_ids else hook.start_germinate('claude_code')
                     plural = 's' if n != 1 else ''
                     if st == 'started':
                         sections.append(f"[germinate] {n} agenda{plural} came due; germination started")
