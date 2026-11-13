@@ -1523,31 +1523,31 @@
       view.stop();
       view = null;
     }
-    if (roomSection) {
-      if (roomOn() && !token()) { setRoom(false); return; }   // the token went: the protected conversation leaves the page with it
-      const wantRoom = !!token() && roomOn() && document.visibilityState !== "hidden";
-      roomSection.hidden = !roomOn();
-      if (wantRoom && !roomView) {
-        roomHost.replaceChildren();
-        const T = window.LevainCockpitTransport;
-        roomView = window.LevainRoomView.mount(roomHost, { headers: () => (T ? T.headers() : {}), probe: false });
-      } else if (!wantRoom && roomView) {
-        roomView.stop();
-        roomView = null;
-      }
+    if (roomSection && roomOn() && !token()) { setRoom(false); return; }   // the token went: the protected conversation leaves the page with it
+    if (deskSection && deskOn() && !token()) { setDesk(false); return; }   // the token went: the protected view leaves the page with it
+    const wantRoom = !!roomSection && !!token() && roomOn() && document.visibilityState !== "hidden";
+    const wantDesk = !!deskSection && !!token() && deskOn();
+    if (roomSection) roomSection.hidden = !roomOn();
+    if (deskSection) deskSection.hidden = !deskOn();
+    // Every stop runs before any mount: the Room and the Desk both write the viewport variables (--rv-vvh, --rv-vvt) the page's
+    // keyboard fit reads, and a view stopped AFTER the other mounted would clear the ones the other had just set.
+    if (roomSection && !wantRoom && roomView) {
+      roomView.stop();
+      roomView = null;
     }
-    if (deskSection) {
-      if (deskOn() && !token()) { setDesk(false); return; }   // the token went: the protected view leaves the page with it
-      const wantDesk = !!token() && deskOn();
-      deskSection.hidden = !deskOn();
-      if (wantDesk && !deskView) {
-        deskHost.replaceChildren();
-        const T = window.LevainCockpitTransport;
-        deskView = window.LevainDeskView.mount(deskHost, { headers: () => (T ? T.headers() : {}) });
-      } else if (!wantDesk && deskView) {
-        deskView.stop();
-        deskView = null;
-      }
+    if (deskSection && !wantDesk && deskView) {
+      deskView.stop();
+      deskView = null;
+    }
+    if (roomSection && wantRoom && !roomView) {
+      roomHost.replaceChildren();
+      const T = window.LevainCockpitTransport;
+      roomView = window.LevainRoomView.mount(roomHost, { headers: () => (T ? T.headers() : {}), probe: false });
+    }
+    if (deskSection && wantDesk && !deskView) {
+      deskHost.replaceChildren();
+      const T = window.LevainCockpitTransport;
+      deskView = window.LevainDeskView.mount(deskHost, { headers: () => (T ? T.headers() : {}) });
     }
   }
 

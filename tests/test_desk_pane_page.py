@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,6 +57,7 @@ class DeskStub:
         self.upstream = upstream
         self.lock = threading.Lock()
         self.get = {"status": 200, "json": {"wired": False}}
+        self.by_thread: dict[str, dict] = {}     # a read that names a thread gets that thread's fixture (else `get`); either may carry a `delay`
         self.script: list[dict] = []
         self.sends: list[dict] = []
         self.gets: list[dict] = []
@@ -65,6 +67,8 @@ class DeskStub:
         with self.lock:
             if "get" in state:
                 self.get = state["get"]
+            if "by_thread" in state:
+                self.by_thread = dict(state["by_thread"])
             if "script" in state:
                 self.script = list(state["script"])
 
@@ -103,9 +107,14 @@ class DeskStub:
                 if path == "/cockpit/desk.json":
                     if not self._gate():
                         return
+                    q = urllib.parse.parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+                    asked = (q.get("thread") or [None])[0]
                     with stub.lock:
-                        stub.gets.append({"t": time.monotonic(), "path": self.path})
-                        fixture = stub.get
+                        stub.gets.append({"t": time.monotonic(), "path": self.path, "thread": asked, "after": (q.get("after") or [None])[0]})
+                        # "<thread>@<cursor>" answers a read that names that cursor; "<thread>" any other; no thread: `get`
+                        fixture = (stub.by_thread.get(f"{asked}@{(q.get('after') or [''])[0]}") or stub.by_thread.get(asked) or stub.get) if asked else stub.get
+                    if fixture.get("delay"):
+                        time.sleep(fixture["delay"])
                     self._json(fixture["status"], fixture["json"])
                     return
                 self._proxy(b"")
@@ -281,7 +290,9 @@ def test_the_server_serves_the_view_script():
 @needs_browser
 def test_every_state_of_the_wire_is_drawn_from_the_read_alone(tmp_path):
     with desk_page(tmp_path) as (stub, base):
-        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": {"wired": False}}), _TAP_DESK, _OPEN,
+        # an older page remembered ONE thread: it becomes a one-entry list (the events below arrive for it)
+        steps = [PHONE, *_TOKENED, {"eval": "sessionStorage.setItem('levain.desk.thread', JSON.stringify('t1')); 1"},
+                 put(get={"status": 200, "json": {"wired": False}}), _TAP_DESK, _OPEN,
                  until("document.querySelector('.dv-state-unwired')"), SNAP,                                     # 1 no desk wired
                  put(get={"status": 200, "json": wired()}), until("document.querySelector('.dv-lease-held')"), SNAP,   # 2 lease held
                  put(get={"status": 200, "json": wired(lease={"state": "none"})}), until("document.querySelector('.dv-lease-none')"), SNAP,   # 3 none
@@ -293,8 +304,12 @@ def test_every_state_of_the_wire_is_drawn_from_the_read_alone(tmp_path):
                  until("document.querySelectorAll('.dv-zone .rv-line').length >= 3"), SNAP,                      # 5 took, held, reply
                  put(get={"status": 200, "json": wired(thread_id="t1", cursor="c3", events=[], readable=False)}),
                  until("document.querySelector('.dv-unreadable')"), SNAP,                                          # 6 could not be fetched, held events kept
-                 put(get={"status": 500, "json": {"error": "boom"}}), until("document.querySelector('.dv-state-error')"), SNAP]  # 7 server error
+                 put(get={"status": 500, "json": {"error": "boom"}}), until("document.querySelector('.dv-state-error')"), SNAP,   # 7 server error
+                 {"eval": "JSON.stringify({kept: sessionStorage.getItem('levain.desk.threads'), legacy: sessionStorage.getItem('levain.desk.thread')})"}]
         out = _drive(tmp_path, base + "/", steps)
+    kept = json.loads(out["values"][-1])
+    assert kept["legacy"] is None, kept                                           # the single remembered thread is gone
+    assert json.loads(kept["kept"])[0]["id"] == "t1" and json.loads(kept["kept"])[0]["cursor"] == "c3", kept
     unwired, held, none, unknown, replies, unreadable, error = snaps(out)
     for s in (unwired, held, none, unknown, replies, unreadable, error):
         _no_ban_words(s)
@@ -312,8 +327,8 @@ def test_every_state_of_the_wire_is_drawn_from_the_read_alone(tmp_path):
     assert "could not be reached" in error["bar"] and "500" in error["bar"], error
     # the read names its thread and cursor once it has them, and never before
     reads = [g["path"] for g in stub.gets]
-    first = next(i for i, r in enumerate(reads) if "thread=" in r)
-    assert all(r == "/cockpit/desk.json" for r in reads[:first]) and reads[first] == "/cockpit/desk.json?thread=t1&after=c3", reads
+    assert reads[0] == "/cockpit/desk.json?thread=t1", reads                       # the migrated thread, no cursor yet
+    assert "/cockpit/desk.json?thread=t1&after=c3" in reads, reads                 # then the cursor the answer gave
 
 
 @needs_browser
@@ -402,7 +417,7 @@ def test_a_word_from_the_host_is_text_and_a_hidden_character_is_drawn_as_a_mark_
     hostile = "<img src=x onerror=\"window.__pwn=1\"><b id=pwned>x</b><script>window.__pwn=2</script>"
     mine = "a‮b <i>c</i>​d"
     with desk_page(tmp_path) as (stub, base):
-        steps = [PHONE, *_TOKENED,
+        steps = [PHONE, *_TOKENED, {"eval": "sessionStorage.setItem('levain.desk.thread', JSON.stringify('t9')); 1"},
                  put(get={"status": 200, "json": wired(lease={"state": "held", "holder": "desk " + hostile, "age_s": 5}, thread_id="t9", cursor="c1", events=[
                      {"by": "desk", "kind": "reply", "text": hostile + "‮gnp", "at": "12:00" + "​"}])},
                  script=[accepted("ref" + hostile + "​", thread="t9")]),
@@ -480,3 +495,181 @@ def test_the_phone_shows_the_desk_tab_whole_and_the_composer_pinned_with_no_side
     assert g["tabs"][-2:] == ["room", "desk"] and g["deskWhole"] and g["deskH"] >= 44, g
     assert abs(g["dockBottom"] - g["vh"]) <= 1 and g["sendW"] >= 44 and g["sendH"] >= 44 and g["font"] >= 16, g
     assert g["stateScroll"] <= g["stateW"] + 1, g                      # a long holder wraps, it does not push the page
+
+
+# --- the thread model (fix round 1): the host files EVERY typed line under a NEW thread ------------------------------------------
+
+CLICK_SEND = {"eval": "document.querySelector('.dv-zone .rv-send').click(); 1"}
+
+
+def _ev(kind, text="", by="desk", at="09:00:00"):
+    return {"by": by, "kind": kind, "text": text, "at": at}
+
+
+def _fixture(tid, cursor, *events, **kw):
+    return {"status": 200, "json": wired(thread_id=tid, cursor=cursor, events=list(events)), **kw}
+
+
+def _heads(s):
+    return [l["text"].split("\n")[0] for l in s["lines"]]
+
+
+def _send(text, n):
+    """One line typed, sent, and waited for until `n` lines are filed."""
+    return [typed(text), CLICK_SEND, until(f"document.querySelectorAll('.dv-zone .dv-filed').length === {n}")]
+
+
+@needs_browser
+def test_every_line_keeps_the_answers_of_its_own_thread_and_the_newest_three_are_read_and_six_are_kept(tmp_path):
+    """DESK-E M1 and codex HIGH 1: line one's took and reply stay beside it after line two (a new thread), a late reply to line
+    one is still fetched, a tick reads the newest three threads (one request each), and past six the oldest is dropped."""
+    took = lambda n: _ev("took", by="script", at=f"09:00:0{n}")   # noqa: E731
+    by_thread = {f"t{n}": _fixture(f"t{n}", "c1", took(n), _ev("reply", f"reply {n}")) for n in range(1, 8)}
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread=by_thread,
+                                       script=[accepted(f"inbox-{n}", thread=f"t{n}") for n in range(1, 8)]),
+                 _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 *_send("line 1", 1), until("document.body.innerText.indexOf('reply 1') >= 0"),
+                 *_send("line 2", 2), until("document.body.innerText.indexOf('reply 2') >= 0"), SNAP,       # 0: two lines, two threads
+                 # the desk answers line one AGAIN (after the cursor c1): it must still be fetched and drawn beside line one
+                 put(by_thread={**by_thread, "t1@c1": _fixture("t1", "c2", _ev("reply", "late 1")), "t1@c2": _fixture("t1", "c2")}),   # nothing after c2
+                 until("document.body.innerText.indexOf('late 1') >= 0"), SNAP,                               # 1
+                 *[s for n in range(3, 8) for s in _send(f"line {n}", n)],
+                 until("document.body.innerText.indexOf('reply 7') >= 0"), SNAP,                              # 2: seven lines sent
+                 {"eval": "JSON.stringify({threads: sessionStorage.getItem('levain.desk.threads')})"}]
+        out = _drive(tmp_path, base + "/", steps)
+        gets = list(stub.gets)
+    two, late, seven = snaps(out)[:3]
+    assert _heads(two) == ["line 1", "Desk took it at 09:00:01 (script)", "Desk · 09:00:00", "line 2", "Desk took it at 09:00:02 (script)", "Desk · 09:00:00"], two["lines"]
+    assert [l["text"].split("\n")[1] for l in two["lines"] if "rv-room" in l["cls"]] == ["reply 1", "reply 2"], two["lines"]
+    heads = _heads(late)
+    assert heads[:4] == ["line 1", "Desk took it at 09:00:01 (script)", "Desk · 09:00:00", "Desk · 09:00:00"] and heads[4] == "line 2", late["lines"]
+    assert late["lines"][3]["text"].endswith("late 1"), late["lines"]
+    # seven lines: every line stays drawn, only the last six threads keep (and draw) their answers
+    texts = [l["text"] for l in seven["lines"]]
+    assert [h for h in _heads(seven) if h.startswith("line ")] == [f"line {n}" for n in range(1, 8)], seven["lines"]
+    assert not any("reply 1" in t for t in texts) and all(any(f"reply {n}" in t for t in texts) for n in range(2, 8)), texts
+    stored = json.loads(json.loads(out["values"][-1])["threads"])
+    assert [t["id"] for t in stored] == [f"t{n}" for n in range(2, 8)], stored
+    # a tick reads the newest three, one request each: after the first read of t7, t4 and older are never asked again
+    asked = [g["thread"] for g in gets if g["thread"]]
+    after7 = asked[asked.index("t7"):]
+    assert set(after7) == {"t7", "t6", "t5"}, after7
+    assert "t1" in asked and any(g["path"] == "/cockpit/desk.json?thread=t1&after=c1" for g in gets), asked
+
+
+@needs_browser
+def test_a_slow_read_of_one_thread_never_switches_or_loses_another(tmp_path):
+    """codex HIGH 1 and 2, complement MED 1: a read of thread one is in flight when line two is answered with thread two. Its answer
+    lands on thread one alone: thread two is still read and its reply is drawn."""
+    by_thread = {"t1": _fixture("t1", "c1", _ev("took", by="script"), _ev("reply", "reply one"), delay=2.5),
+                 "t2": _fixture("t2", "c1", _ev("took", by="script"), _ev("reply", "reply two"))}
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread=by_thread,
+                                       script=[accepted("inbox-1", thread="t1"), accepted("inbox-2", thread="t2")]),
+                 _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 *_send("line one", 1),                           # the follow-up read of t1 is now held for 2.5 s
+                 *_send("line two", 2),                           # ... and line two is answered meanwhile
+                 until("document.body.innerText.indexOf('reply two') >= 0 && document.body.innerText.indexOf('reply one') >= 0", 25000), SNAP]
+        out = _drive(tmp_path, base + "/", steps)
+        asked = [g["thread"] for g in stub.gets if g["thread"]]
+    (s,) = snaps(out)
+    assert _heads(s) == ["line one", "Desk took it at 09:00:00 (script)", "Desk · 09:00:00", "line two", "Desk took it at 09:00:00 (script)", "Desk · 09:00:00"], s["lines"]
+    assert "t2" in asked, asked
+
+
+@needs_browser
+def test_a_send_answered_while_a_read_is_in_flight_is_read_at_once_not_a_tick_later(tmp_path):
+    """complement LOW 4: the send's follow-up read is queued behind the one in flight, not dropped until the next 4 s tick."""
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread={"t1": _fixture("t1", "c1", _ev("reply", "reply one"))},
+                                       script=[accepted("inbox-1", thread="t1")]),
+                 _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 put(get={"status": 200, "json": wired(), "delay": 2.0}),
+                 {"eval": _NUDGE},                                # a read of the desk, held for 2 s
+                 typed("line one"), CLICK_SEND,                   # answered while it is in flight
+                 {"until": "document.body.innerText.indexOf('reply one') >= 0", "ms": 15000, "every": 200}]
+        _drive(tmp_path, base + "/", steps)
+        sent_at = stub.sends[0]["t"]
+        first = next(g["t"] for g in stub.gets if g["thread"] == "t1")
+    assert first - sent_at < 3.0, first - sent_at                      # about 2 s (the read in flight); a lost follow-up is 4 s past that
+
+
+@needs_browser
+def test_a_headers_function_that_throws_clears_the_flags_and_the_send_and_the_poll_go_on(tmp_path):
+    """deepseek HIGH 2: a synchronous throw from the transport's headers() was a throw before any promise: the send flag and the
+    reading flag stayed set for good."""
+    boom = "window.__h = window.LevainCockpitTransport.headers; window.LevainCockpitTransport.headers = () => { throw new Error('no storage'); };"
+    unpatch = "window.LevainCockpitTransport.headers = window.__h; 1"
+    send_now = ("const t = document.querySelector('.dv-zone .rv-input'); t.value = 'line one'; t.dispatchEvent(new Event('input', {bubbles: true})); "
+                "document.querySelector('.dv-zone .rv-send').click(); 1")
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}), _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 # a read whose headers() throws before any request exists: it must not leave `reading` set
+                 {"eval": boom + " document.dispatchEvent(new Event('visibilitychange')); 1"}, {"eval": unpatch},
+                 put(get={"status": 200, "json": wired(lease={"state": "held", "holder": "desk 99", "age_s": 5})}),
+                 until("document.querySelector('.dv-state').innerText.indexOf('desk 99') >= 0"),           # the poll went on
+                 # a send whose headers() throws: the line is marked unreached and the button comes back
+                 {"eval": boom + " " + send_now}, {"until": "document.querySelector('.dv-zone .dv-failed')", "ms": 8000, "every": 200}, {"eval": unpatch}, SNAP,
+                 CLICK_SEND, until("document.querySelector('.dv-zone .dv-filed')"), SNAP]
+        out = _drive(tmp_path, base + "/", steps)
+    failed, filed = snaps(out)
+    assert "could not be reached" in failed["lines"][0]["text"] and failed["sendDisabled"] is False, failed
+    assert len(stub.sends) == 1 and stub.sends[0]["words"] == "line one", stub.sends     # the failed try never reached the server
+    assert "dv-filed" in filed["lines"][0]["cls"], filed
+
+
+@needs_browser
+def test_a_draw_that_throws_after_the_servers_200_never_marks_the_line_unreached(tmp_path):
+    """complement LOW 3: the failure path belongs to the POST. The server filed the line; a draw that throws afterwards is not
+    "The server could not be reached"."""
+    install = ("(() => { const of = window.fetch; window.fetch = (u, o) => of(u, o).then(r => { if (String(u).indexOf('/desk/send') >= 0) window.__arm = 1; return r; });"
+               " const oc = document.createElement.bind(document);"
+               " document.createElement = (...a) => { if (window.__arm) { window.__arm = 0; window.__threw = 1; throw new Error('draw failed'); } return oc(...a); }; return 1; })()")
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, {"eval": install}, put(get={"status": 200, "json": wired()}), _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 typed("line one"), CLICK_SEND, until("window.__threw"), until("document.querySelector('.dv-zone .dv-filed')"), SNAP]
+        out = _drive(tmp_path, base + "/", steps)
+    (s,) = snaps(out)
+    assert len(stub.sends) == 1, stub.sends
+    assert "dv-filed" in s["lines"][0]["cls"] and "could not be reached" not in s["text"] and "dv-failed" not in s["lines"][0]["cls"], s
+
+
+@needs_browser
+def test_the_bubble_draws_the_hosts_ref_once_as_text(tmp_path):
+    """DESK-E M3: the host's first stdout line is the ref and often says Filed itself."""
+    refs = ["Filed for the desk. (thread th-1)", "Filed; no desk is open, so it waits. <b>x</b>", "inbox-9"]
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, script=[accepted(r, thread=f"t{i}") for i, r in enumerate(refs)]),
+                 _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 *_send("a", 1), *_send("b", 2), *_send("c", 3), SNAP]
+        out = _drive(tmp_path, base + "/", steps)
+    (s,) = snaps(out)
+    notes = [l["text"].split("\n")[1] for l in s["lines"] if "dv-you" in l["cls"]]
+    assert notes == ["Filed for the desk. (thread th-1)", "Filed; no desk is open, so it waits. <b>x</b>", "Filed: inbox-9"], notes
+    assert s["imgs"] == 0, s
+
+
+@needs_browser
+def test_a_desk_to_room_switch_keeps_the_rooms_keyboard_fit(tmp_path):
+    """All three lineages: the Desk's stop() cleared --rv-vvh/--rv-vvt that the Room had JUST set (sync mounted the Room before it
+    stopped the Desk). Every stop now runs before any mount."""
+    read = ("new Promise(r => setTimeout(r, 400)).then(() => JSON.stringify({vvh: document.documentElement.style.getPropertyValue('--rv-vvh'), "
+            "vvt: document.documentElement.style.getPropertyValue('--rv-vvt'), rv: document.body.classList.contains('rv-on'), dv: document.body.classList.contains('dv-on'), "
+            "roomInput: !!document.querySelector('.rv-zone .rv-input'), deskInput: !!document.querySelector('.dv-zone .rv-input')}))")
+    click = lambda which: {"eval": f"document.querySelector('[data-phone-jump={which}]').click(); {read}"}   # noqa: E731
+    with desk_page(tmp_path) as (stub, base):
+        out = _drive(tmp_path, base + "/", [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}), click("desk"), until("document.querySelector('.dv-lease-held')"),
+                                           click("room"), click("desk")])
+    desk1, room, desk2 = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"vvh"' in v]
+    assert desk1["dv"] and desk1["deskInput"] and desk1["vvh"].endswith("px") and desk1["vvt"].endswith("px"), desk1
+    assert room["rv"] and not room["dv"] and room["roomInput"], room
+    assert room["vvh"].endswith("px") and room["vvt"].endswith("px"), room             # the Room's own, set by the Room, not cleared by the Desk
+    assert desk2["dv"] and desk2["vvh"].endswith("px") and desk2["vvt"].endswith("px"), desk2
+
+
+def test_the_desk_lets_go_of_what_it_listened_to_on_stop():
+    src = JS.read_text()
+    stop = src[src.index("stop: function ()"):][:900]
+    for listener in ('removeEventListener("visibilitychange", onVisible)', 'body.removeEventListener("scroll", onBodyScroll)', 'vv.removeEventListener("resize", fitViewport)'):
+        assert listener in stop, listener

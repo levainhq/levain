@@ -42,7 +42,8 @@ check(same(D.mergeEvents([], null, { events: [e("a")], cursor: "c1", unreadable:
 check(same(D.mergeEvents([e("a")], "c1", { events: [e("b")], cursor: "c2", unreadable: false }), { events: [e("a"), e("b")], cursor: "c2" }), "a later batch appends and moves the cursor");
 check(same(D.mergeEvents([e("a")], "c1", { events: [e("a")], cursor: "c1", unreadable: false }), { events: [e("a")], cursor: "c1" }), "a batch under the cursor already held adds nothing (no duplicate)");
 check(same(D.mergeEvents([e("a")], "c1", { events: [], cursor: "c1", unreadable: true }), { events: [e("a")], cursor: "c1" }), "an unreadable batch keeps what is held and the cursor");
-check(same(D.mergeEvents([e("a")], null, { events: [e("a"), e("b")], cursor: null, unreadable: false }), { events: [e("a"), e("b")], cursor: null }), "a batch with no cursor replaces (it cannot be followed)");
+check(same(D.mergeEvents([e("a")], null, { events: [e("a"), e("b")], cursor: null, unreadable: false }), { events: [e("a"), e("b")], cursor: null }), "a whole-thread batch with no cursor (none was held) replaces: it cannot be followed");
+check(same(D.mergeEvents([e("a"), e("b")], "c2", { events: [e("c")], cursor: null, unreadable: false }), { events: [e("a"), e("b"), e("c")], cursor: null }), "a batch with no cursor that came AFTER a held cursor appends (never replaces what is held) and drops the cursor so the next read refetches");
 
 // the send's answers
 const acc = D.sendOutcome(200, { outcome: "accepted", ref: "inbox-9", thread_id: "t9", reason: null, replayed: false });
@@ -59,6 +60,11 @@ check(D.sendOutcome(400, { error: "bad_request", message: "There is nothing to s
 const f5 = D.sendOutcome(502, null);
 check(f5.status === "failed" && !f5.settle && !f5.clear && /will not duplicate/.test(f5.words), "a 5xx keeps the id and the draft: a resend does not duplicate");
 check(D.sendOutcome(200, { outcome: "banana" }).status === "failed" && !D.sendOutcome(200, { outcome: "banana" }).settle, "an outcome the page does not know is not claimed");
+
+// the note under a filed line: the host's ref is drawn once
+check(D.filedNote("") === "Filed" && D.filedNote(null) === "Filed" && D.filedNote("inbox-9") === "Filed: inbox-9", "a short ref is prefixed with the outcome word");
+check(D.filedNote("Filed for the desk. (thread th-1)") === "Filed for the desk. (thread th-1)" && D.filedNote("Filed; no desk is open, so it waits.") === "Filed; no desk is open, so it waits.", "a ref that already begins with Filed is not prefixed");
+check(D.filedNote("Filedaway-9") === "Filed: Filedaway-9", "only the whole word Filed counts");
 
 // poll: 4 s open, 12 s hidden
 check(D.POLL_OPEN_MS === 4000 && D.POLL_HIDDEN_MS === 12000, "poll constants");

@@ -100,12 +100,43 @@ def test_a_line_is_filed_through_the_real_route_and_the_deskss_answers_draw_from
     assert before["sendDisabled"] is False and not before["taDisabled"], before
     assert [p.words for p in port.posts] == ["hello desk"] and port.posts[0].origin.startswith("cockpit:"), port.posts
     you = after["lines"][0]
-    assert you["text"].startswith("hello desk") and "Filed: Filed (thread th-sc1)." in you["text"], you
+    # the host's ref already begins "Filed": drawn once, never "Filed: Filed ..." (this line used to pin the doubled word)
+    assert you["text"].startswith("hello desk") and you["text"].endswith("\nFiled (thread th-sc1)."), you
+    assert "Filed: Filed" not in you["text"], you
     texts = [l["text"] for l in after["lines"][1:]]
     assert texts[0] == "Desk took it at 09:01:02 (script)", texts
     assert texts[1].startswith("Desk · 09:03:00") and "on it, back by noon" in texts[1], texts
     assert after["taValue"] == "", after                                                         # a filed line leaves the draft empty
     assert len(port.posts) == 1
+
+
+class AnswersTheOlderLine(Replying):
+    """A port that files every line under a NEW thread (as flight does) and whose desk, while taking line two, also answers line one."""
+
+    def post(self, words, *, outbox_id, origin):
+        result = super().post(words, outbox_id=outbox_id, origin=origin)
+        if len(self.posts) == 2:
+            self.script_event("th-sc1", "desk", "reply", "a later word on line one", "09:09:00")
+        return result
+
+
+@needs_browser
+def test_two_lines_two_threads_through_the_real_routes_each_keeps_its_own_answers(tmp_path, qdir):  # noqa: F811
+    """DESK-E M1 against the real routes: line one's took and reply stay beside it after line two (a new thread), and the desk's
+    later answer to line one is still read and drawn beside line one."""
+    port = AnswersTheOlderLine()
+    port.script_lease("held", "desk 25", 190)
+    with join_page(tmp_path, port) as base:
+        out = _go(tmp_path, base, [
+            until("document.querySelector('.dv-lease-held')"), typed("line one"), {"tap": SEND},
+            until("document.querySelectorAll('.dv-zone .rv-line.rv-room').length === 1"),
+            typed("line two"), {"tap": SEND},
+            until("document.body.innerText.indexOf('a later word on line one') >= 0 && document.querySelectorAll('.dv-zone .rv-line.rv-room').length === 3"), SNAP])
+    (s,) = snaps(out)
+    heads = [l["text"].split("\n")[0] for l in s["lines"]]
+    assert heads == ["line one", "Desk took it at 09:01:02 (script)", "Desk · 09:03:00", "Desk · 09:09:00", "line two", "Desk took it at 09:01:02 (script)", "Desk · 09:03:00"], s["lines"]
+    assert [p.words for p in port.posts] == ["line one", "line two"], port.posts
+    _no_ban_words(s)
 
 
 @needs_browser
