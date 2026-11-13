@@ -170,7 +170,7 @@ def test_both_ports_are_desk_ports(rig):
 def test_host_commands_key_set_holds_none_of_the_desk_keys():
     room_keys = {f.name for f in dataclasses.fields(HostCommands)}
     desk_keys = {f.name for f in dataclasses.fields(DeskCommands)}
-    assert room_keys == {"relay", "replies", "relay_without_tap"}
+    assert room_keys == {"relay", "replies", "relay_without_tap", "note"}   # "note": main's note_to_desk (80f48f69b) landed after this pin
     assert not room_keys & desk_keys, "a key in both is a desk argv the Room's model environment could carry"
     assert not issubclass(DeskCommands, HostCommands) and not issubclass(HostCommands, DeskCommands)
     assert desk_port.DESKCMD_ENV != room_host.HOSTCMD_ENV
