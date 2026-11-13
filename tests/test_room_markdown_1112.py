@@ -120,7 +120,7 @@ def _safe(g):
     """A hostile body is inert: its markup is text, its unsafe links are not links, nothing ran."""
     assert g["badEls"] == 0 and g["pwned"] == "undefined", g
     assert "<script>window.pwned = 1</script>" in g["badText"] and "<img src=x" in g["badText"] and "<iframe" in g["badText"], g
-    assert [h["href"] for h in g["allHrefs"]] == ["https://example.com/ok", "/relative"], g      # the allow-listed schemes and a relative path only
+    assert [h["href"] for h in g["allHrefs"]] == ["https://example.com/ok"], g                    # an http(s) link only; the relative path is plain text
     for h in g["allHrefs"]:
         assert h["rel"] == "noopener noreferrer nofollow" and h["target"] == "_blank", g
     assert g["badStrong"] == ["bold"], g                                                          # the safe markdown beside it still draws
@@ -210,3 +210,111 @@ def test_start_desk_opens_the_real_drop_sheet(tmp_path, qdir):
 def test_a_refused_open_says_no_desk_was_started(tmp_path, qdir):
     g = _desk(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, stub="null")
     assert g["drops"] == ["/fanin broad"] and g["note"] == "The signing sheet did not open, so no desk was started.", g
+
+
+# --- a seat's link is an http(s) or mailto link, nothing the cockpit itself would answer (L2 MED, ROOMC-FIX1) ---------------------------
+# The renderer keeps a cockpit-relative link, and `/#write_token=X` on the cockpit's own origin is the page's token intake: a reply the
+# seat wrote after reading a hostile web page could wipe the owner's stored write token, or open /sign/consent or /sign/drop preselected.
+# So drawMarkdown unwraps, after the render, every anchor that is not http(s)/mailto, and every one that resolves to the cockpit's own origin.
+
+_UNSAFE = [
+    ("tok", "[tok](/#write_token=EVILTOKEN123)"), ("consent", "[consent](/sign/consent?choice=allow#choice=allow)"),
+    ("drop", "[drop](/sign/drop)"), ("rel", "[rel](/relative)"), ("dots", "[dots](../up)"), ("frag", "[frag](#top)"),
+    ("query", "[query](?x=1)"), ("bare", "[bare](path/only)"), ("proto", "[proto](//evil.example/x)"),
+    ("bs1", r"[bs1](\\evil.example/x)"), ("bs2", r"[bs2](/\evil.example/x)"), ("bs3", r"[bs3](\/evil.example/x)"), ("bs4", r"[bs4](\evil.example/x)"),
+    ("padded", "[padded](  /sign/drop)"),
+    ("self", "[self](@ORIGIN@/#write_token=EVILTOKEN123)"), ("selfpath", "[selfpath](@ORIGIN@/sign/drop)"),
+    ("js", "[js](javascript:window.pwned=1)"), ("data", "[data](data:text/html,x)"),
+]
+_SAFE = [("ok", "[ok](https://example.org/x)", "https://example.org/x"), ("up", "[up](HTTPS://EXAMPLE.ORG/up)", "https://example.org/up"),
+         ("mail", "[mail](mailto:a@b.example)", "mailto:a@b.example"), ("local", "[local](http://localhost:9/x)", "http://localhost:9/x")]
+_LINK_ROWS = [{"gseq": 9100 + i, "kind": "vendor_agent_text", "source": "vendor", "ref": "agent_text:%d" % (9100 + i), "launch_id": "L1", "status": None,
+               "body": "see " + md, "at": "2026-11-12T10:01:%02d+00:00" % i} for i, md in enumerate([m for _n, m in _UNSAFE] + [m for _n, m, _h in _SAFE])]
+
+
+def _wrap(rows):
+    """Reads of the room get `rows` appended; @ORIGIN@ in a body becomes the page's own origin."""
+    return ("(() => { window.__roomRows = JSON.parse(%s.split('@ORIGIN@').join(location.origin)); const real = window.fetch.bind(window);"
+            " window.fetch = async (u, o) => { const r = await real(u, o); if (String(u).split('?')[0] !== '/cockpit/room.json') return r;"
+            " const j = await r.json(); j.stream = (j.stream || []).concat(window.__roomRows);"
+            " return new Response(JSON.stringify(j), {status: 200, headers: {'Content-Type': 'application/json'}}); }; return 1; })()" % json.dumps(json.dumps(rows)))
+
+
+def _run(tmp_path, qdir, emulate, rows, look, marker, lines, pre=(), shot=None):
+    rs, _launcher, src = _rig(tmp_path, qdir)
+    enter = list(_ENTER[:3]) + [{"eval": _wrap(rows)}] + [{"eval": e} for e in pre] + list(_ENTER[3:])
+    with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
+        out = _drive(tmp_path, base + "/", [{"emulate": emulate}] + enter + [
+            {"until": "document.querySelectorAll('.rv-room .rv-text').length >= %d" % lines},
+            {"eval": "new Promise(r => setTimeout(r, 400)).then(() => 1)"},
+            {"eval": look}] + ([{"eval": "document.querySelectorAll('.rv-room .rv-text')[0].scrollIntoView({block: 'start'}); 1"}] + _shot(shot) if shot else []))
+    return json.loads(next(v for v in out["values"] if isinstance(v, str) and v.startswith("{") and marker in v))
+
+
+_LINKS_LOOK = """(() => { const rows = [...document.querySelectorAll('.rv-room .rv-text')];
+  return JSON.stringify({linkrows: rows.map(r => ({text: r.textContent, links: [...r.querySelectorAll('a')].map(a => ({href: a.getAttribute('href'), rel: a.getAttribute('rel'),
+    target: a.getAttribute('target'), text: a.textContent, bidi: getComputedStyle(a).unicodeBidi}))})), origin: location.origin, pwned: typeof window.pwned}); })()"""
+
+
+@needs_browser
+def test_a_seats_link_is_http_or_mailto_never_something_the_cockpit_answers(tmp_path, qdir):
+    g = _run(tmp_path, qdir, {"w": 390, "h": 844, "dpr": 3, "mobile": True}, _LINK_ROWS, _LINKS_LOOK, '"linkrows"', len(_LINK_ROWS), shot="room_links_390.png")
+    rows = g["linkrows"]
+    assert len(rows) == len(_LINK_ROWS) and g["pwned"] == "undefined", g
+    for (name, _md), row in zip(_UNSAFE, rows):
+        assert row["links"] == [], (name, row)                                       # no anchor at all: the link text stays, as text
+        assert row["text"].startswith("see " + name) and "](" not in row["text"], (name, row)
+    for (name, _md, href), row in zip(_SAFE, rows[len(_UNSAFE):]):
+        assert len(row["links"]) == 1, (name, row)
+        link = row["links"][0]
+        assert link["href"].lower() == href and link["text"] == name, (name, row)
+        assert link["rel"] == "noopener noreferrer nofollow" and link["target"] == "_blank", (name, row)
+        assert link["bidi"] == "isolate", (name, row)                                  # a bidi control in the link text cannot reorder what follows it
+
+
+# --- the other gaps the L1 review named ---------------------------------------------------------------------------------------------------
+
+_THROW = "window.__thrown = 0; window.LevainMD.renderMarkdown = function () { window.__thrown++; throw new Error('boom'); }; 1"
+_THROW_LOOK = """(() => { const t = document.querySelector('.rv-room .rv-text');
+  return JSON.stringify({thrown: window.__thrown, cls: t.className, strong: [...t.querySelectorAll('strong')].map(s => s.textContent),
+    ic: [...t.querySelectorAll('code.rv-ic')].map(c => c.textContent), pre: [...t.querySelectorAll('pre.rv-code code')].map(c => c.textContent),
+    anchors: t.querySelectorAll('a').length, mdEls: t.querySelectorAll('[class^=md-], [class*=" md-"]').length, text: t.textContent, probe: 'throwlook'}); })()"""
+
+
+@needs_browser
+def test_a_renderer_that_throws_leaves_the_reply_drawn_the_plain_way(tmp_path, qdir):
+    g = _run(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, [_ROWS[1]], _THROW_LOOK, "throwlook", 1, pre=[_THROW])
+    assert g["thrown"] >= 1, g                                                           # the stub really ran: the branch was taken
+    assert "rv-md" not in g["cls"] and g["mdEls"] == 0 and g["anchors"] == 0, g
+    assert g["strong"] == ["bold"] and g["ic"] == ["inline"] and g["pre"] == [CODE], g   # the small pass drew it
+    assert "[link](https://example.com/docs)" in g["text"] and "## The plan" in g["text"], g
+
+
+_WIDE = [{"gseq": 9201, "kind": "vendor_agent_text", "source": "vendor", "ref": "agent_text:9201", "launch_id": "L1", "status": None,
+          "body": "Wide:\n\n```\n" + "x" * 300 + "\n```\n\nand [a long link](https://example.org/" + "a" * 200 + ") after it", "at": "2026-11-12T10:02:00+00:00"}]
+_WIDE_LOOK = """(() => { const b = document.querySelector('.rv-body'), t = document.querySelector('.rv-room .rv-text'), p = t.querySelector('pre.md-pre'),
+  a = t.querySelector('a'); const ar = a.getBoundingClientRect(), tr = t.getBoundingClientRect();
+  return JSON.stringify({bodyScroll: b.scrollWidth, bodyClient: b.clientWidth, pageScroll: document.documentElement.scrollWidth, vw: innerWidth,
+    preScroll: p.scrollWidth, preClient: p.clientWidth, preOverflow: getComputedStyle(p).overflowX, linkRight: ar.right, textRight: tr.right, probe: 'widelook'}); })()"""
+
+
+@needs_browser
+def test_wide_code_scrolls_inside_its_block_and_never_widens_the_phone_page(tmp_path, qdir):
+    g = _run(tmp_path, qdir, {"w": 390, "h": 844, "dpr": 3, "mobile": True}, _WIDE, _WIDE_LOOK, "widelook", 1, shot="room_wide_390.png")
+    assert g["preScroll"] > g["preClient"] + 100 and g["preOverflow"] == "auto", g         # the 300-character line scrolls in its block
+    assert g["bodyScroll"] <= g["bodyClient"] + 1 and g["pageScroll"] <= g["vw"] + 1, g    # and the page is no wider than the phone
+    assert g["linkRight"] <= g["textRight"] + 1, g                                          # a 200-character link wraps inside the column
+
+
+_GUARD_LOOK = """(() => { const d2 = document.implementation.createHTMLDocument('other'), host = d2.createElement('div'), V = window.LevainRoomView;
+  const m = V.roomModel({stream: [{gseq: 1, kind: 'vendor_agent_text', source: 'vendor', ref: 'a:1', body: '## h **b** [l](https://example.org)', at: '2026-11-12T10:00:00+00:00'}], proposals: []});
+  V.renderRoom(d2, host, m, {}, {open: {}}, {}); const t = host.querySelector('.rv-text');
+  return JSON.stringify({cls: t.className, ownerIsOther: t.ownerDocument === d2, anchors: t.querySelectorAll('a').length, strong: t.querySelectorAll('strong').length, mdEls: t.querySelectorAll('[class^=md-]').length, probe: 'guardlook'}); })()"""
+
+
+@needs_browser
+def test_a_document_that_is_not_the_renderers_own_gets_the_plain_pass(tmp_path, qdir):
+    # renderRoom is exported and takes any document; the markdown renderer builds in the page's own, so for another document the
+    # reply is drawn by the small pass (so the guard in drawMarkdown is reachable, and kept)
+    g = _run(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, [], _GUARD_LOOK, "guardlook", 0)
+    assert g["ownerIsOther"] and "rv-md" not in g["cls"] and g["mdEls"] == 0 and g["anchors"] == 0 and g["strong"] == 1, g
