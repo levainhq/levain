@@ -20,6 +20,8 @@ from levain.cockpit.effects import (
     INTAKE_TIERS,
     INTAKE_VERB,
     INTENTION_AUTHORITY_FIELDS,
+    REMIND_TARGET,
+    REMIND_TIER,
     EffectStatus,
     IntentionEffectStore,
     canonical_effect,
@@ -140,29 +142,38 @@ def test_steering_is_refused_never_coerced(intentions, name, extra, why):
 
 def test_the_intake_tier_table():
     """THE TIER TABLE (PLAN section 3, decided by L1): drop T2 (signed: it wakes the desk at its minute with his words),
-    talk T2 (an intention agents read, as every intention_seed), sort C1 (the room composer's own desk drop, which is
-    never authority). intention_seed stays T2 whatever it carries."""
-    assert INTAKE_TIERS == {"drop": "T2", "talk": "T2", "sort": "C1"}
+    talk T2 (an intention agents read, as every intention_seed), remind T2 (REMIND_TIER, an open call of Phill's: the
+    signature is the confirm step), sort C1 (the room composer's own desk drop, which is never authority). intention_seed
+    stays T2 whatever it carries."""
+    assert INTAKE_TIERS == {"drop": "T2", "talk": "T2", "remind": "T2", "sort": "C1"}
+    assert INTAKE_TIERS["remind"] == REMIND_TIER
     reg = VerbRegistry()
     spec = reg.get(INTAKE_VERB)
     assert spec is not None and spec.binding == "create" and spec.fields == ("line",) and spec.floor == "T2"
     assert spec.device_ok and INTAKE_VERB in DEVICE_VERBS
     today = NOW_LOCAL.date()
     tier = lambda line: spec.tier_fn({"line": line}, None, "unverified", today)  # noqa: E731
-    assert [tier(l) for l in ("@mon 9am call X", "  @+2h x", "? talk about y", "plain words", "", 7)] == \
-        ["T2", "T2", "T2", "C1", "C1", "T2"]
+    assert [tier(l) for l in ("@mon 9am call X", "  @+2h x", "? talk about y", "plain words", "", 7,
+                              "remind me thu 3pm call", "remind me every sun 9pm bins", "remind me to call Jim")] == \
+        ["T2", "T2", "T2", "C1", "C1", "T2", "T2", "T2", "C1"]
     seed = reg.get("intention_seed")
-    assert seed.fields == ("text", "type", "disposition", "next", "target", "attention")
+    assert seed.fields == ("text", "type", "disposition", "next", "target", "attention", "recur")
     assert seed.tier_fn({"text": "x", "disposition": "agenda", "target": "desk"}, None, "verified", today) == "T2"
     assert {v.name for v in KERNEL_VERBS}.issuperset({"intention_seed", INTAKE_VERB})
 
 
 def test_intake_kind_and_seed_params():
-    assert [intake_kind_of(x) for x in ("@x", "?x", "x", None)] == ["drop", "talk", "sort", None]
+    assert [intake_kind_of(x) for x in ("@x", "?x", "x", None, "remind me thu 3pm x", "remind me to x")] == \
+        ["drop", "talk", "sort", None, "remind", "sort"]
     assert intake_seed_params({"kind": "drop", "when": "2026-11-09T09:00", "text": "call X"}) == {
         "type": "task", "text": "call X", "disposition": "agenda", "target": "desk", "next": "2026-11-09T09:00"}
     assert intake_seed_params({"kind": "talk", "text": "y"}) == {
         "type": "thought", "text": "y", "disposition": "someday", "attention": "talk"}
+    assert intake_seed_params({"kind": "remind", "when": "2026-11-12T15:00", "text": "call"}) == {
+        "type": "task", "text": "call", "disposition": "agenda", "target": REMIND_TARGET, "next": "2026-11-12T15:00"}
+    assert intake_seed_params({"kind": "remind", "when": "2026-11-15T21:00", "text": "bins", "recur": "weekly SUN 21:00"}) == {
+        "type": "task", "text": "bins", "disposition": "agenda", "target": REMIND_TARGET, "next": "2026-11-15T21:00",
+        "recur": "weekly SUN 21:00"}
     with pytest.raises(ValueError):
         intake_seed_params({"kind": "sort", "text": "z"})
 
@@ -356,3 +367,87 @@ def test_a_drop_decided_inside_its_own_minute_still_builds_and_a_committed_recei
     got = broker._intake_receipt({"target": target}, "cp" + "ee" * 16, "COMMITTED")   # no row under that key
     assert got["receipt"]["id"] is None and got["receipt_line"].endswith(", written")
     assert "not written" not in got["receipt_line"]
+
+
+# --- 5: the reminder (row 188): `remind [me] <when|every ...> words` plants an agenda that rings for HIM ----------------------
+
+def test_a_timed_reminder_plants_an_agenda_for_him_at_its_minute(broker, intentions):
+    out = _issue(broker, "remind me +2h to call the dentist")
+    want = (NOW_LOCAL + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M")
+    assert out["state"] == "COMMITTED"
+    row = _row(intentions, "ck." + out["pending_id"][2:] + ".0")
+    assert (row["text"], row["disposition"], row["target"], row["next"]) == \
+        ("call the dentist", "agenda", REMIND_TARGET, want)
+    assert not row.get("recur") and not row.get("recur_anchor")
+    assert out["receipt"] == {"kind": "remind", "id": row["id"], "fires": want, "recur": None, "text": "call the dentist"}
+    assert out["receipt_line"] == intake.receipt_line(out["receipt"])
+    assert out["receipt_line"].startswith(f"reminder {row['id']} rings ") and "then" not in out["receipt_line"]
+
+
+def test_a_repeating_reminder_stores_its_canon_rule_and_anchors_it_on_its_first_minute(broker, intentions):
+    out = _issue(broker, "remind me every sun 9pm bins")
+    row = _row(intentions, "ck." + out["pending_id"][2:] + ".0")
+    first = intake.parse_intake("remind me every sun 9pm bins", NOW_LOCAL)["when"]
+    assert (row["target"], row["next"], row["recur"], row["recur_anchor"]) == (REMIND_TARGET, first, "weekly SUN 21:00", first)
+    assert out["receipt"]["recur"] == "weekly SUN 21:00"
+    assert out["receipt_line"].endswith(", then weekly SUN 21:00")
+
+
+def test_a_signed_reminder_waits_and_its_receipt_names_the_repeat_before_the_signature(broker, intentions):
+    out = _issue(broker, "remind me every weekday 8am meds", intent="sign")
+    assert out["state"] == "WAITING" and out["receipt"]["id"] is None and out["receipt"]["kind"] == "remind"
+    assert out["receipt_line"].startswith("reminds you ")
+    assert out["receipt_line"].endswith(", then weekly MON,TUE,WED,THU,FRI 08:00, awaiting your signature")
+    rec = json.loads(out["record"])
+    # the reading and the rule ride in the signed bytes twice, and the anchor is the first minute
+    assert rec["target"]["intake"]["recur"] == "weekly MON,TUE,WED,THU,FRI 08:00"
+    ch = rec["effects"][0]["changes"]
+    assert (ch["recur"], ch["recur_anchor"], ch["target"], ch["next"]) == \
+        ("weekly MON,TUE,WED,THU,FRI 08:00", ch["next"], REMIND_TARGET, rec["target"]["intake"]["when"])
+
+
+def test_a_reminder_signed_after_its_first_minute_no_longer_builds(broker, intentions):
+    out = _issue(broker, "remind me +30m x", intent="sign")
+    target = json.loads(out["record"])["target"]
+    broker._test_now[0] = NOW_UTC + timedelta(minutes=31)
+    with pytest.raises(ValueError, match="reminder's minute .* passed before it was signed"):
+        broker._build_intake({"line": "remind me +30m x"}, target, out["pending_id"], at_issue=False)
+
+
+@pytest.mark.parametrize("line,why", [
+    ("remind me thu 3 call", "without am/pm"),
+    ("remind me next thu call", "read two ways"),
+    ("remind me every week x", "which day"),
+    ("remind me tomorrow 9am", "no words after the time"),
+    ("remind me every ² days x", "not a repeat this can store"),
+])
+def test_a_reminder_that_does_not_read_is_refused_with_its_reason_and_writes_nothing(broker, intentions, line, why):
+    before = intentions.read_bytes()
+    with pytest.raises(BrokerError) as e:
+        _issue(broker, line)
+    assert (e.value.code, e.value.status) == ("intake_refused", 422) and why in str(e.value)
+    assert intentions.read_bytes() == before
+
+
+def test_prose_that_starts_with_remind_still_sorts_to_the_desk(broker):
+    """`remind me to call Jim` has no time word right after it: it is the sort it always was (a 501 here, no desk store)."""
+    with pytest.raises(BrokerError) as e:
+        _issue(broker, "remind me to call Jim", credential=DEVICE, tier="C1", intent="sign")
+    assert e.value.status == 501
+
+
+@pytest.mark.parametrize("extra,why", [
+    ({"recur": "weekly SUN 21:00", "disposition": "agenda", "target": "desk", "next": "2026-11-15T21:00"}, "repeating reminder"),
+    ({"recur": "weekly SUN 21:00", "disposition": "agenda", "target": "nudge"}, "repeating reminder"),
+    ({"recur": "weekly SUN 21:00", "disposition": "someday"}, "repeating reminder"),
+    ({"recur": "hourly 5", "disposition": "agenda", "target": "nudge", "next": "2026-11-15T21:00"}, "bad recurrence rule"),
+])
+def test_a_repeat_the_store_cannot_ring_is_refused_never_stored_without_its_series(intentions, extra, why):
+    with pytest.raises(ValueError) as e:
+        _seed(IntentionEffectStore(intentions), {"text": "x", **extra})
+    assert why in str(e.value)
+
+
+def test_the_remind_tier_is_one_named_constant_the_tier_table_reads():
+    """The open call (P2): T2 now, behind REMIND_TIER; changing that one constant is the whole of going lighter."""
+    assert REMIND_TIER == "T2" and INTAKE_TIERS["remind"] is REMIND_TIER
