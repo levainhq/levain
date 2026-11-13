@@ -8,6 +8,7 @@ that sent; ``session`` is a snapshot; a turn release waits for a send in flight 
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import sqlite3
 import threading
@@ -65,9 +66,9 @@ def _open_room_thread(store, thread):
         room.open_room_thread(conn, thread)
 
 
-def _room_launch(store, thread, sid):
+def _room_launch(store, thread, sid, harness="claude"):
     with store._write() as (conn, now):
-        ln = lease.open_room_launch(conn, now, harness="claude", model=None, cwd=str(store.path.parent),
+        ln = lease.open_room_launch(conn, now, harness=harness, model=None, cwd=str(store.path.parent),
                                     room_thread=thread, pid=4242)
     with store._write() as (conn, now):
         got, why = lease.activate_room(conn, now, ln.launch_id, harness_session_id=sid)
@@ -776,18 +777,31 @@ def test_the_clock_in_the_block_is_the_serves_local_time_in_flows_form(seen_worl
     assert clock == parse_stamp(at).astimezone().strftime("%I:%M %p %a %b %d")
 
 
-def test_the_clock_follows_the_serves_zone_not_utc(seen_world, cs, monkeypatch):
-    monkeypatch.setenv("TZ", "Pacific/Kiritimati")          # UTC+14: the hour and often the day differ from UTC
-    time.tzset()
-    try:
-        r = say(seen_world["svc"], seen_world["thread"])
-        clock = _BLOCK.match(seen_world["session"].commands[-1].text)["clock"]
-        at = cs._read(lambda conn: conn.execute("SELECT at FROM chat_outbox_events WHERE message_id = ? AND state = "
-                                                "'attempted'", (r.message_id,)).fetchone()[0])
-        assert clock == (parse_stamp(at) + timedelta(hours=14)).strftime("%I:%M %p %a %b %d")
-    finally:
-        monkeypatch.undo()
+@pytest.fixture
+def serve_zone():
+    """Sets the process zone for one test and puts it back last: it holds the zone itself (no monkeypatch, whose
+    undo would also revert the other fixtures' patches), and re-reads the zone only after the environment is restored."""
+    saved = os.environ.get("TZ")
+
+    def set_zone(name: str) -> None:
+        os.environ["TZ"] = name
         time.tzset()
+
+    yield set_zone
+    if saved is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = saved
+    time.tzset()
+
+
+def test_the_clock_follows_the_serves_zone_not_utc(seen_world, cs, serve_zone):
+    serve_zone("Pacific/Kiritimati")                        # UTC+14: the hour and often the day differ from UTC
+    r = say(seen_world["svc"], seen_world["thread"])
+    clock = _BLOCK.match(seen_world["session"].commands[-1].text)["clock"]
+    at = cs._read(lambda conn: conn.execute("SELECT at FROM chat_outbox_events WHERE message_id = ? AND state = "
+                                            "'attempted'", (r.message_id,)).fetchone()[0])
+    assert clock == (parse_stamp(at) + timedelta(hours=14)).strftime("%I:%M %p %a %b %d")
 
 
 def test_the_stored_message_is_his_exact_words_the_tag_never_enters_the_record(seen_world, cs):
@@ -882,10 +896,11 @@ def test_the_real_claude_session_writes_the_block_and_ingests_no_user_line_for_i
     assert not any("room-context" in (body or "") for _kind, body in rows)
 
 
-def test_a_vendor_that_did_echo_the_block_leaves_a_hidden_unmatched_item_and_no_lease_effect(seen_world, cs):
+def test_a_vendor_that_did_echo_the_block_leaves_an_unmatched_outside_line_and_no_lease_effect(seen_world, cs):
     """Not what the stream child does (it echoes nothing): the worst case if one ever did. The echo carries the block,
     so its digest is not the stored message's: no echo row, no epoch in a room, and his own message is still the
-    stored body alone."""
+    stored body alone. The unmatched item is NOT hidden: the timeline draws it as an outside line (``vendor_user_item``)
+    with the block in its body; that is the known edge of a vendor that echoes, pinned here so a change is seen."""
     r = say(seen_world["svc"], seen_world["thread"], body="hello there")
     seen_world["svc"].read_next(seen_world["launch"])
     items = cs._read(lambda conn: conn.execute("SELECT body FROM chat_events WHERE kind = 'user_item'").fetchall())
@@ -893,6 +908,73 @@ def test_a_vendor_that_did_echo_the_block_leaves_a_hidden_unmatched_item_and_no_
     assert count(cs, "SELECT COUNT(*) FROM chat_echoes") == 0
     assert count(cs, "SELECT COUNT(*) FROM turn_lease_events WHERE launch_id = ?", seen_world["launch"]) == 0
     assert cs.message(r.message_id).body == "hello there"
+    rows = cs._read(lambda conn: conn.execute("SELECT kind, body FROM chat_timeline WHERE thread_id = ?",
+                                              (seen_world["thread"],)).fetchall())
+    assert ("message", "hello there") in rows
+    carrying = [kind for kind, body in rows if "room-context" in (body or "")]
+    assert carrying == ["vendor_user_item"]          # shown as an outside line, never as his message
+
+
+# --- an ambiguous send is reconciled against the STORED body's digest: the block is written only where the vendor
+# is measured not to echo the line, so a digest mismatch can never turn an ambiguous send into not_delivered -----------
+class Scripting(Sent):
+    """A recording driver whose sends follow a script: ``("ambiguous",)`` echoes the wire text as a user item and
+    reports the send ambiguous (codex's scenario); ``("lose",)`` shows the vendor no line at all, ambiguous."""
+
+    def __init__(self, sends) -> None:
+        super().__init__()
+        self._sends = list(sends)
+
+
+def _ambiguous_then_read(store, cs, harness):
+    thread = _thread(store)
+    _open_room_thread(store, thread)
+    launch = _room_launch(store, thread, "room-sid-amb", harness=harness)
+    svc = ChatService(cs, **LIVE)
+    session = _attach(svc, cs, launch, Scripting(("ambiguous",)))
+    r = say(svc, thread, body="drop this: fix the thing")
+    assert r.state == "ambiguous"
+    svc.read_next(launch)
+    return r, session, cs._read(lambda conn: chat.outbox_state(conn, r.message_id))
+
+
+def test_an_ambiguous_room_send_on_a_non_claude_harness_is_the_bare_body_and_stays_ambiguous(store, cs):
+    r, session, state = _ambiguous_then_read(store, cs, "codex")
+    assert state == "ambiguous"                                              # his echo matches the stored digest: not absent
+    assert session.commands[-1].text == "drop this: fix the thing"          # no block where the invariant is unmeasured
+
+
+def test_an_ambiguous_room_send_on_claude_carries_the_block_and_a_silent_vendor_leaves_it_ambiguous(store, cs):
+    thread = _thread(store)
+    _open_room_thread(store, thread)
+    launch = _room_launch(store, thread, "room-sid-amb2")
+    svc = ChatService(cs, **LIVE)
+    session = _attach(svc, cs, launch, Scripting(("lose",)))                 # the claude stream child shows no user line
+    r = say(svc, thread, body="drop this: fix the thing")
+    assert r.state == "ambiguous" and _BLOCK.match(session.commands[-1].text) is not None
+    svc.read_next(launch)
+    assert cs._read(lambda conn: chat.outbox_state(conn, r.message_id)) == "ambiguous"
+
+
+# --- a quote id from the block: the contract is any operator message of THIS room thread ---------------------------
+def test_a_quote_may_name_his_message_to_an_earlier_launch_of_this_room_but_never_another_threads(seen_world, store, cs):
+    """The block hands the seat the id of the line it is answering; the relay's rule is thread-scoped, so an id from an
+    earlier launch of the same open room is his words and quotable, and an id from any other thread is refused."""
+    first = say(seen_world["svc"], seen_world["thread"], body="to the first launch")
+    with store._write() as (conn, now):
+        lease.end_launch(conn, now, seen_world["launch"], "ended", "replaced")
+    new = _room_launch(store, seen_world["thread"], "room-sid-next")
+    _attach(seen_world["svc"], cs, new)
+    other = _thread(store, title="other thread")
+    with cs._write() as (conn, now):
+        stranger, _ = record_message(conn, now, thread_id=other, recipient="thread", author_kind="operator",
+                                     author_surface="cli", client_id="c", outbox_id="ob-0000000c", body="elsewhere",
+                                     normalized="elsewhere")
+    with cs._write() as (conn, _now):
+        _room, words = room.quoted_words(conn, new, [first.message_id])
+        assert words == "to the first launch"
+        with pytest.raises(CoordError, match="only his words"):
+            room.quoted_words(conn, new, [stranger.message_id])
 
 
 def test_his_body_follows_the_block_byte_for_byte_whitespace_included(seen_world, cs):
