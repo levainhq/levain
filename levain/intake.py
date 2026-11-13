@@ -3,30 +3,24 @@
 Ported from flow's ``intentions.parse_intake`` (task_surfaces_1107.md, THE LIST). Parity
 contract: ``tests/vectors/list_intake_vectors.json``.
 
-  ``@<when> <words>`` -> ``{"kind": "drop", "when": "YYYY-MM-DDTHH:MM", "text": words}``
-  ``? <words>``       -> ``{"kind": "talk", "text": words}``
-  anything else       -> ``{"kind": "sort", "text": line}``
+  ``@<when> <words>``                      -> ``{"kind": "drop", "when": "YYYY-MM-DDTHH:MM", "text": words}``
+  ``remind [me] <when|every ...> [to] words`` -> ``{"kind": "remind", "when": ..., "text": words[, "recur": canon]}``
+  ``? <words>``                            -> ``{"kind": "talk", "text": words}``
+  anything else                            -> ``{"kind": "sort", "text": line}``
 
-``<when>``: ``HH:MM`` / ``9am`` / ``5:30 pm`` (today if still ahead, else tomorrow) ·
-``tomorrow [time]`` · ``mon..sun`` or full weekday ``[time]`` (the next one) ·
-``MM-DD [time]`` (the next one: this year if still ahead, else the next year that has the date) · ``YYYY-MM-DD [time]`` · ``+Nm`` / ``+Nh`` / ``+Nd``. No time given
-means 09:00. A ``<when>`` that does not read, a moment not in the future, an empty line,
-or no words after the prefix raises :class:`IntakeRefused` with the reason: a parser
-informs the human, it never guesses and never authorises.
+The ``<when>`` grammar (and the repeating phrases only a ``remind`` may use) is :mod:`levain.when_parse`. A ``<when>`` that does
+not read, a moment not in the future, an empty line, or no words after the prefix raises :class:`IntakeRefused` with the
+reason: a parser informs the human, it never guesses and never authorises.
 
 Pure grammar: no store writes, no clock reads (``now`` is a parameter), no cockpit.
 """
 
 from __future__ import annotations
 
-import re
-from datetime import date, datetime, timedelta
+from datetime import datetime
 
-DEFAULT_DROP_HOUR = 9
-_WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-_WEEKDAY_FULL = {"mon": "monday", "tue": "tuesday", "wed": "wednesday", "thu": "thursday",
-                 "fri": "friday", "sat": "saturday", "sun": "sunday"}
-_TIME_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$", re.I)
+from levain.when_parse import DEFAULT_HOUR as DEFAULT_DROP_HOUR, WhenRefused, is_remind, parse_remind, read_when_text  # noqa: F401
+
 _FMT = "%Y-%m-%dT%H:%M"
 
 
@@ -34,103 +28,25 @@ class IntakeRefused(ValueError):
     """The line cannot be read as written; the message says why. An intake never guesses."""
 
 
-def _clock(token):
-    m = _TIME_RE.match(token.strip())
-    if not m or (m.group(2) is None and m.group(3) is None):
-        return None
-    h, mi, ap = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower()
-    if ap:
-        if not 1 <= h <= 12:
-            return None
-        h = h % 12 + (12 if ap == "pm" else 0)
-    if h > 23 or mi > 59:
-        return None
-    return h, mi
-
-
-def _take_clock(tokens, i):
-    """((h, m), index after) for a time of day at tokens[i]; None if not time-shaped;
-    IntakeRefused if time-shaped but unreadable. A bare number is a word, not a time."""
-    if i >= len(tokens):
-        return None
-    tok = tokens[i].rstrip(",")
-    after = tokens[i + 1].lower().rstrip(",") if i + 1 < len(tokens) else ""
-    used = i + 1
-    if after in ("am", "pm") and re.match(r"^\d{1,2}(:\d{2})?$", tok):
-        tok, used = tok + after, i + 2
-    if not (re.match(r"^\d", tok) and (":" in tok or tok.lower().endswith(("am", "pm")))):
-        return None
-    c = _clock(tok)
-    if c is None:
-        raise IntakeRefused(f"{tok!r} does not read as a time of day (use 14:30 or 2:30pm)")
-    return c, used
-
-
-def _resolve_when(tokens, now):
-    if not tokens:
-        raise IntakeRefused("no time after '@'. Try @09:00, @tomorrow 9am, @mon 14:30, @11-09 19:30 or @+2h")
-    head = tokens[0].lower().rstrip(",")
-
-    def with_clock(day, used):
-        got = _take_clock(tokens, used)
-        (h, mi), used = (got[0], got[1]) if got else ((DEFAULT_DROP_HOUR, 0), used)
-        return datetime(day.year, day.month, day.day, h, mi), used
-
-    m = re.match(r"^\+(\d+)([mhd])$", head)
-    if m:
-        n = int(m.group(1))
-        delta = {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[m.group(2)]
-        return (now + delta).replace(second=0, microsecond=0), 1
-    got = _take_clock(tokens, 0)
-    if got:
-        when = datetime(now.year, now.month, now.day, got[0][0], got[0][1])
-        return (when if when > now else when + timedelta(days=1)), got[1]
-    if head == "tomorrow":
-        return with_clock((now + timedelta(days=1)).date(), 1)
-    if head[:3] in _WEEKDAYS and head in (head[:3], _WEEKDAY_FULL[head[:3]]):
-        ahead = (_WEEKDAYS.index(head[:3]) - now.weekday()) % 7
-        when, used = with_clock((now + timedelta(days=ahead)).date(), 1)
-        return (when if when > now else when + timedelta(days=7)), used
-    m = re.match(r"^(?:(\d{4})-)?(\d{1,2})-(\d{1,2})$", head)
-    if m:
-        month, dom = int(m.group(2)), int(m.group(3))
-        # a written year is held to (a past moment in it is refused by the caller, never moved); no year means the next
-        # occurrence (Phill 2026-11-08, row 456 (a)): this year if still ahead, else the next year that has the date
-        # (a leap day can be up to 8 years off)
-        years = [int(m.group(1))] if m.group(1) else range(now.year, now.year + 9)
-        day = None
-        for year in years:
-            try:
-                day = date(year, month, dom)
-            except ValueError:
-                continue
-            if m.group(1) or with_clock(day, 1)[0] > now:
-                break
-        if day is None:
-            raise IntakeRefused(f"{tokens[0]!r} is not a calendar date")
-        return with_clock(day, 1)
-    raise IntakeRefused(f"cannot read {tokens[0]!r} as a time. Forms: HH:MM, 9am, tomorrow [time], mon..sun [time], "
-                        f"MM-DD [time], YYYY-MM-DD [time], +30m, +2h, +3d (no time means {DEFAULT_DROP_HOUR:02d}:00)")
-
-
 def parse_intake(line, now):
     """One typed line into what it asks for. Deterministic, writes nothing. ``now`` is local time.
-    Raises :class:`IntakeRefused` (with the reason) for a line that cannot be read as written."""
+    Raises :class:`IntakeRefused` (with the reason) for a line that cannot be read as written. The time grammar lives in
+    :mod:`levain.when_parse`; this reads the line's prefix and words."""
     now = now.replace(second=0, microsecond=0)
     line = (line or "").strip()
     if not line:
         raise IntakeRefused("an empty line")
-    if line.startswith("@"):
-        body = line[1:]
-        spans = [m.span() for m in re.finditer(r"\S+", body)]
-        tokens = [body[a:b] for a, b in spans]
-        when, used = _resolve_when(tokens, now)
-        words = body[spans[used - 1][1]:].strip() if used <= len(spans) else ""
-        if when <= now:
-            raise IntakeRefused(f"{when:%Y-%m-%d %H:%M} is not in the future; a drop needs a moment still ahead")
-        if not words:
-            raise IntakeRefused("no words after the time: say what the drop should tell the desk")
-        return {"kind": "drop", "when": when.strftime(_FMT), "text": words}
+    try:
+        if line.startswith("@"):
+            when, words = read_when_text(line[1:], now, allow_recur=False)
+            if not words:
+                raise IntakeRefused("no words after the time: say what the drop should tell the desk")
+            return {"kind": "drop", "when": when.iso, "text": words}
+        remind = parse_remind(line, now)
+    except WhenRefused as exc:
+        raise IntakeRefused(str(exc)) from None
+    if remind is not None:
+        return remind
     if line.startswith("?"):
         words = line[1:].strip()
         if not words:
