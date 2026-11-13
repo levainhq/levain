@@ -1086,6 +1086,9 @@ _MAX_READ_INFLIGHT = _MAX_INFLIGHT - _RESERVED_SLOTS
 # ``_MAX_READ_INFLIGHT`` slots, so those routes always find ``_RESERVED_SLOTS`` free of a read burst.
 _READ_WAIT_SECONDS = 5.0
 _MAX_READ_WAITERS = 64
+# the Desk view's polls in flight at once, on a gate of their own (``desk_gate``): one page's overlapping polls and a
+# second device's, never more
+_DESK_READS_INFLIGHT = 2
 
 _log = logging.getLogger(__name__)
 
@@ -2037,6 +2040,10 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # the Desk view's port (levain.desk.desk_port.DeskPort): its two routes are served only beside one, and only with a
     # surface token (make_server refuses it without). None: GET /cockpit/desk.json says wired false, the send is a 404
     desk_port: "Any" = None
+    # bounds the Desk view's polls on their own: a poll runs the host's lease (and receipts) command, which may take as
+    # long as the port's timeout, so a poll never takes a ``request_gate`` slot (a host command that hangs would otherwise
+    # hold every cockpit slot, one poll at a time); past it the read is a 503
+    desk_gate: "threading.BoundedSemaphore | None" = None
     # premium voice (V1-4), served only beside a room host and a broker. voice_gate bounds the voice POSTs on their own
     # (they never take request_gate: a stalled upload holds a voice slot, never a cockpit slot); voice_transport is the
     # providers' HTTP (a test replays responses through it); voice_last_read is each provider's last key-read or call
@@ -4214,20 +4221,22 @@ class _Handler(GuardedHandler):
 
     def _serve_desk(self, *, head: bool) -> None:
         """``GET /cockpit/desk.json``: the Desk view's read (lease, capabilities, the named thread's receipts), behind the
-        room record's gate (a surface token on every bind). The port asks the host's commands, so the read holds a
-        ``request_gate`` slot for as long as they take and answers 503 when none is free. A server with no port answers
-        ``{"wired": false}`` (after the gate: whether this cockpit has a desk is not public)."""
+        room record's gate (a surface token on every bind). The port asks the host's commands, which may take as long as
+        the port's timeout, so the read holds a slot of ``desk_gate`` (never ``request_gate``) for as long as they take and
+        answers 503 when none is free. A server with no port answers ``{"wired": false}`` (after the gate: whether this
+        cockpit has a desk is not public)."""
         if not self._off_box_token_valid():
             self._gated_read_403("the desk view needs", head=head)
             return
         query = urllib.parse.urlsplit(self.path).query
-        if not self.server.request_gate.acquire(blocking=False):
+        gate = self.server.desk_gate
+        if gate is None or not gate.acquire(blocking=False):
             self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
             return
         try:
             status, payload = cockpit_desk.serve_desk(self.server.desk_port, query)
         finally:
-            self.server.request_gate.release()
+            gate.release()
         self._send(cockpit_desk.encode(payload), "application/json; charset=utf-8", status=status, head=head,
                    headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
 
@@ -6311,6 +6320,7 @@ def make_server(
     # _acquire_read_slot) and leave _RESERVED_SLOTS free; every other gated route answers 503 past the cap.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
     # premium voice (V1-4): its own small gate, never request_gate; the real providers' HTTP; per-provider last reads
+    httpd.desk_gate = threading.BoundedSemaphore(_DESK_READS_INFLIGHT)
     httpd.voice_gate = threading.BoundedSemaphore(cockpit_voice.VOICE_INFLIGHT)
     httpd.voice_transport = voice_providers.urllib_transport
     httpd.voice_last_read = {}
