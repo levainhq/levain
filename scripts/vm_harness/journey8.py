@@ -78,8 +78,8 @@ ADOPT = Probe(("session", "adopt", "{session}", "--repo", "{repo}", "--take", "h
 DISCARD = Probe(("session", "discard", "{session}"), select=r"^discard ")
 RESTORE = Probe(("session", "restore", "{session}"), select=r"^restore ")
 V_ADOPT = Verdict(0, r"took head: \S+ -> [0-9a-f]{40,64}")
-V_DISCARD = Verdict(0, r"discard <session>: done \([a-z][a-z-]*\)")
-V_RESTORE = Verdict(0, r"restore <session>: done \([a-z][a-z-]*\)")
+V_DISCARD = Verdict(0, r"discard <session>: done \([A-Za-z][A-Za-z-]*\)")
+V_RESTORE = Verdict(0, r"restore <session>: done \([A-Za-z][A-Za-z-]*\)")
 
 
 def _both(cell: Cell) -> dict[str, Cell]:
