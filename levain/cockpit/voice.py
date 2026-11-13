@@ -320,6 +320,16 @@ def _stopped_voice_keys(data_root: Path | str) -> dict[str, str]:
         return {}
 
 
+def _voice_way_back() -> str:
+    """How a stopped voice key is used again: :func:`levain.consent.grants.way_back` of the voice-key kind, the clause
+    `levain voice key list` and the grant page print (imported here, not at the top: that module reads the cockpit's
+    keys)."""
+    from levain.authority import VOICE_KEY_KIND
+    from levain.consent.grants import way_back
+
+    return way_back(VOICE_KEY_KIND)
+
+
 def _stt_keyed(grants: Any) -> bool:
     """True when a served provider with a speech-to-text model holds a key whose uses list ``stt``."""
     if not grants:
@@ -363,6 +373,8 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
     retention words leave transcription out, so a page has nothing to offer a dictation control from; the body says
     ``"premium_stt": false``. The panel's readout adds ``mic_in`` (the provider the server picked for dictation, or why
     none), per row ``console_url`` and ``spend`` (set for a provider that holds a key or has counted spend this month, the rows the page draws), and ``spend_other`` (counted spend from providers the page has no row for).
+    A row whose key is ``stopped`` carries ``stopped_why`` and ``way_back`` (the terminal's words for using it again,
+    :func:`_voice_way_back`); both are "" on every other row.
     The totals in ``caps`` and every ``spend`` come from ONE read of the ledger, so the rows add up to the totals."""
     grants, authority = _grants_for(data_root)
     premium_stt_setting = premium_stt
@@ -380,6 +392,9 @@ def serve_voice(data_root: Path | str, meter: vmeter.Meter, *, last_read: Mutabl
                      "uses": uses,
                      "key": "set" if record is not None else "stopped" if stopped_why else "not_set",
                      "stopped_why": stopped_why,
+                     # a stopped key's way back in the terminal's words (`levain voice key list`), so the panel keeps no
+                     # words of its own that could send the operator into a plain add's refusal
+                     "way_back": _voice_way_back() if stopped_why else "",
                      "record_id": record["id"] if record is not None else None,
                      "last_read": last_read.get(name),
                      "voices": list(data.voices), "default_voice": data.default_voice, "tts_model": data.tts_model,

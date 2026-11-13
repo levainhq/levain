@@ -1538,7 +1538,9 @@
       const r = el("div", "dev-row vc-row vc-spend"); r.dataset.provider = p.name;
       r.appendChild(el("span", "vc-lab", cap1(p.name)));
       let words = p.spend ? spendWords(p.spend) : "—";
-      if (p.key === "stopped" && (!vcState.authority || vcState.authority === "ok")) words += " · key stopped: " + (typeof p.stopped_why === "string" && p.stopped_why ? p.stopped_why : "a key that signed it was revoked") + ". Set it again to use it";
+      // a stopped key's way back is the server's words (`way_back`, the clause `levain voice key list` prints), drawn as
+      // they come: a plain add is refused while the stopped record is held, so the panel keeps no words of its own here
+      if (p.key === "stopped" && (!vcState.authority || vcState.authority === "ok")) words += " · key stopped: " + (typeof p.stopped_why === "string" && p.stopped_why ? p.stopped_why : "a key that signed it was revoked") + "." + (typeof p.way_back === "string" && p.way_back ? " " + p.way_back.charAt(0).toUpperCase() + p.way_back.slice(1) : "");
       else if (p.key !== "set" && p.spend && (!vcState.authority || vcState.authority === "ok")) words += " · no key now";
       r.appendChild(el("span", "vc-spend-val", words));
       if (p.console_url) {
