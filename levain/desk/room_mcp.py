@@ -27,14 +27,19 @@ tools are ``relay_to_desk`` (which RETIRES ``propose_drop``: a call to it is "un
 operator's own messages and nothing else, CLAIMS the relay (``room_relay_claims``, committed
 before anything runs: each of his messages goes once per room, and a claim that may have delivered is never re-run), runs
 the host's argv with those words on STDIN, and records its one outcome (``room_relay_outcomes``). ``desk_replies`` reads
-only a thread a relay from this room was sent on, for a live room launch. The door runs only the host's argv; the model
-names a quote set and a thread id, never a program or an argument."""
+only a thread a relay from this room was sent on, for a live room launch. ``note_to_desk`` (any host with a ``note``
+command, independent of the relay) takes ONE argument, ``note``: the seat's own words, not his. The door checks the launch,
+refuses control characters and any text that, behind the fixed ``[from the Room] `` attribution it puts in front, would
+pass :data:`room_host.NOTE_MAX`, then runs the host's argv with that text on STDIN. A note claims nothing: it is information
+the seat wrote, a repeat is harmless, and it never carries his direction. The door runs only the host's argv; the model
+names a quote set and a thread id, or the text of a note, never a program or an argument."""
 from __future__ import annotations
 
 import json
 import re
 import sqlite3
 import sys
+import unicodedata
 from typing import Any
 
 from levain.desk import room_host
@@ -42,7 +47,7 @@ from levain.desk.room_host import HOSTCMD_ENV, THREAD_RE, HostCommandError, Host
 from levain.consent.band_mcp import (INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
                                      _RpcError, _error, _ok)
 
-__all__ = ["TOOL", "RELAY_TOOL", "REPLIES_TOOL", "FRAME_MAX", "LAUNCH_ENV", "handle", "launch_from", "main", "serve"]
+__all__ = ["TOOL", "RELAY_TOOL", "REPLIES_TOOL", "NOTE_TOOL", "FRAME_MAX", "LAUNCH_ENV", "handle", "launch_from", "main", "serve"]
 
 LAUNCH_ENV = "LEVAIN_ROOM_LAUNCH"
 
@@ -106,6 +111,21 @@ REPLIES_TOOL: dict[str, Any] = {
         "type": "object",
         "properties": {"thread": {"type": "string", "description": "The thread id relay_to_desk gave (th-...)."}},
         "required": ["thread"],
+        "additionalProperties": False,
+    },
+}
+_NOTE_ARG_MAX = room_host.NOTE_MAX - len(room_host.NOTE_PREFIX)
+NOTE_TOOL: dict[str, Any] = {
+    "name": room_host.NOTE_TOOL,
+    "description": (
+        "File YOUR OWN note with the desk: analysis, context, what you saw, attributed to the Room seat and kept apart from "
+        "his words. Information only; it never carries his direction. Use it with relay_to_desk, not instead of it. One "
+        f"line of plain text, at most {_NOTE_ARG_MAX} characters; the desk is told it came from the Room."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"note": {"type": "string", "minLength": 1, "maxLength": _NOTE_ARG_MAX,
+                                "description": "Your own note, one line of plain text."}},
+        "required": ["note"],
         "additionalProperties": False,
     },
 }
@@ -185,6 +205,29 @@ def _relay_arguments(raw: Any) -> list[str]:
     if not all(isinstance(i, str) and 0 < len(i) <= _ID_MAX and not _has_control(i) for i in ids):
         raise _RpcError(INVALID_PARAMS, "every quote id must be a short string")
     return list(ids)
+
+
+def _unsafe_char(text: str) -> bool:
+    """A control character of ANY kind, newline and tab included, or a Unicode line/paragraph separator. A note is one
+    line: nothing in it can start a line of its own on the desk's side."""
+    return any(unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in text)
+
+
+def _note_arguments(raw: Any) -> str:
+    """The note's text, shape-checked, trimmed of surrounding spaces. Its length counts the room's fixed attribution too,
+    because the host's command counts everything it is given."""
+    raw = _reject_spoofs_and_extras(raw, frozenset({"note"}))
+    note = raw.get("note")
+    if not isinstance(note, str):
+        raise _RpcError(INVALID_PARAMS, "note must be a string")
+    if _unsafe_char(note):
+        raise _RpcError(INVALID_PARAMS, "a note is one line of plain text: no control characters, not even a newline or tab")
+    note = note.strip()
+    if not note:
+        raise _RpcError(INVALID_PARAMS, "note is empty")
+    if len(note) > _NOTE_ARG_MAX:
+        raise _RpcError(INVALID_PARAMS, f"note is over {_NOTE_ARG_MAX} characters ({len(note)}); shorten it, it is never cut")
+    return note
 
 
 def _room_launch_refusal(conn: sqlite3.Connection, launch_id: str) -> str | None:
@@ -291,6 +334,31 @@ def _replies(launch_id: str, params: dict[str, Any], host: HostCommands) -> dict
     return _text(ran.out or f"No reply yet on {thread}.", False)
 
 
+def _note(launch_id: str, params: dict[str, Any], host: HostCommands) -> dict[str, Any]:
+    from levain.consent.queue import default_queue_dir
+    from levain.desk.envelopes import EnvelopeStore
+    from levain.desk.store import CoordError, StoreAbsent
+    from levain.dispatch.jobs import JobStoreError
+
+    note = _note_arguments(params.get("arguments"))
+    fail = lambda why: _text(f"levain room: refused, no note was filed: {why}", True)       # noqa: E731
+    try:
+        with EnvelopeStore(default_queue_dir())._write(create=False) as (conn, _now):
+            why = _room_launch_refusal(conn, launch_id)
+            if why is not None:
+                return fail(why)
+    except (CoordError, StoreAbsent) as exc:
+        return fail(str(exc))
+    except (sqlite3.Error, JobStoreError, OSError) as exc:
+        return fail(f"a machine fault ({type(exc).__name__}: {exc})")
+    # no claim and no outcome row: a note is the seat's own information, and a repeat of one is harmless
+    ran = room_host.run(host.note, room_host.NOTE_PREFIX + note)
+    if ran.code:
+        return _text("levain room: note not filed (a command that timed out may still have landed; a repeated note is "
+                     f"harmless). {_command_fault(ran.code, ran.out)}", True)
+    return _text(f"levain room: note filed with the desk. {' '.join(ran.out.split())[:300] or 'no output'}", False)
+
+
 def _propose(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
     from levain.consent.queue import default_queue_dir
     from levain.desk import lease, room
@@ -360,6 +428,8 @@ def handle(launch_id: str, msg: Any, host: HostCommands | None = None) -> dict[s
                 return _ok(rid, _relay(launch_id, params, host))
             if name == room_host.REPLIES_TOOL and host is not None and host.replies is not None:
                 return _ok(rid, _replies(launch_id, params, host))
+            if name == room_host.NOTE_TOOL and host is not None and host.note is not None:
+                return _ok(rid, _note(launch_id, params, host))
             raise _RpcError(INVALID_PARAMS, f"unknown tool {name[:60]!r}")
         raise _RpcError(METHOD_NOT_FOUND, f"method not found: {method[:60]}")
     except _RpcError as exc:
@@ -368,7 +438,8 @@ def handle(launch_id: str, msg: Any, host: HostCommands | None = None) -> dict[s
         return _error(rid, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
 
 
-_DEFS = {_NAME: TOOL, room_host.RELAY_TOOL: RELAY_TOOL, room_host.REPLIES_TOOL: REPLIES_TOOL}
+_DEFS = {_NAME: TOOL, room_host.RELAY_TOOL: RELAY_TOOL, room_host.REPLIES_TOOL: REPLIES_TOOL,
+         room_host.NOTE_TOOL: NOTE_TOOL}
 
 
 def _frames(stream: Any):
