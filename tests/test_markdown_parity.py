@@ -91,3 +91,12 @@ def test_docs_frontend_is_textcontent_only() -> None:
                     f"{name}:{lineno} uses {tok} in code (not a comment/string) — "
                     "breaks the textContent-only render contract"
                 )
+
+
+def test_dashboard_shares_the_renderer_with_the_room_from_outside_the_markers() -> None:
+    """The Room draws the seat's replies with the dashboard's renderer, under the name the docs page gives its own. The export
+    sits outside the byte-locked core (so the lock against markdown.js is unaffected) and names the allow-listing helper too."""
+    dash = _web_asset("dashboard_core.js")
+    export = "window.LevainMD = { renderMarkdown: renderMarkdown, mdSafeHref: mdSafeHref };"
+    assert export in dash, "dashboard_core.js must export the shared renderer for room_view.js"
+    assert export not in _between_markers(dash), "the export must stay outside the [MD-EXTRACT] markers"

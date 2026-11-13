@@ -3172,6 +3172,9 @@
     return d;
   }
   // [MD-EXTRACT-END]
+  // The one renderer is shared with the other scripts of this page (the Room draws the seat's replies with it) under the
+  // same name the docs page gives it, so no page carries a second copy.
+  window.LevainMD = { renderMarkdown: renderMarkdown, mdSafeHref: mdSafeHref };
 
   // The Patterns and Decisions sections are decorated on the Memory tab, never re-parsed: the section is drawn by its own markdown
   // renderer (sectionDisplay, the same path every other section takes), then the rendered DOM is dressed in place. So whatever the
