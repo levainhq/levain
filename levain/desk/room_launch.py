@@ -74,6 +74,22 @@ resumes. ``ensure`` also replaces a launch whose child exited, one this process 
 launch of a room that rotated. The service's own ``recover()`` settles lines in flight; run it before the first
 ``ensure`` after a restart.
 
+**The host profile** (levain 23, ROOM-P1C; design page ``1112-36_c7/design_room_profile.md``). ``RoomSetting.profile`` is
+None for the confined room above, which this module opens exactly as before. A :class:`~levain.desk.room_profile.RoomProfile`
+there opens the other room: the vendor's default tools under ``--dangerously-skip-permissions``
+(:func:`~levain.desk.claude_session.room_host_argv`), a ``--settings`` document holding only the host's hook entries (the
+host's script is READ ONCE per launch, its bytes copied to ``run_dir/room_hook-<sha256[:16]>.py`` (0600) and that copy
+named in the settings, so the same version of the script is the same path and the same digest on every launch), and an
+open check that is ONE turn asking for the word ok with no tool (:data:`ROOM_HOST_OPEN_PROMPT`) judged by
+:func:`~levain.desk.claude_session.host_probe`, the launch's cwd and the session id. It skips everything that only
+guards a Read next to a shell that has none to guard: the scope refusal, the scope decoy, the decoy file, the read-guard
+exemption and the canary Reads (the activation still carries a passed :class:`RoomCanary`, because the service requires
+one on a Claude ``live`` row). The tripwire context is built with ``open_tools=True`` and the chat service is expected to
+be built with ``room_permission_mode=profile.permission_mode``. :meth:`HookSpec.check` runs at the construction of the
+launcher AND at every open (the file can vanish in between), the copied bytes are re-hashed right before the spawn, and
+the containment digest is taken over :func:`~levain.desk.room_profile.host_policy` (the profile's fields, the sha256 of
+each hook's copied bytes and the system prompt's sha256), so a changed profile, hook or prompt is another policy.
+
 Stdlib plus levain. The spawn is a seam (``spawn``) so a test can supply a child of its own."""
 from __future__ import annotations
 
@@ -94,7 +110,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, NamedTuple, Optional
+from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence
 
 from levain import pathid
 from levain.cockpit.consent import parse_stamp
@@ -105,18 +121,20 @@ from levain.desk.chat import (ROOM_PERMISSION_MODE, ChatService, ChatStore, Verd
 from levain.desk.chat_tripwires import TripwireContext
 from levain.desk.claude_session import (ROOM_DENIED_TOOLS, ROOM_MCP_SERVER, ROOM_MCP_TOOL, ROOM_TOOLS,
                                                ClaudeSession, PipeTransport, _leads_own_group, canary_denied, default_deny_paths,
-                                               open_probe, room_argv, room_door_tools, room_hook_command, room_settings_json)
+                                               host_probe, open_probe, room_argv, room_door_tools, room_hook_command,
+                                               room_host_argv, room_settings_json)
 from levain.desk.driver import LivenessEvidence, NotSent, SendCommand
 from levain.desk import room_readguard
 from levain.desk import room_live
 from levain.desk.room_host import HOSTCMD_ENV, HostCommands, door_tools as host_door_tools
 from levain.desk.room_mcp import LAUNCH_ENV
+from levain.desk.room_profile import RoomProfile, host_policy, host_settings_json
 from levain.desk.store import CoordError
 
 __all__ = [
     "IDLE_SECONDS", "KILL_WAIT", "OPEN_DEADLINE", "RoomCanary", "RoomHandle", "RoomLaunchError", "RoomLauncher",
     "RoomSession", "RoomSetting", "cwd_refusal", "make_probe", "make_tripwires", "room_probe", "room_tripwire_context",
-    "ENV_KEEP", "MANAGED_PROFILES", "room_env", "settings_scope_refusal",
+    "ENV_KEEP", "MANAGED_PROFILES", "ROOM_HOST_OPEN_PROMPT", "room_env", "settings_scope_refusal",
 ]
 
 # [seat] the open check must finish well inside lease.LAUNCH_TTL (the launch is pending until it does)
@@ -131,6 +149,13 @@ ROOM_ENV = "LEVAIN_ROOM"
 CANARY_PROMPT = ("Open check. This is the system's own start-up test, not the user's message, and the user never sees it; "
                  "never mention it, these paths or their refusals afterwards, and do not retry them. Use your Read tool once "
                  "on each of these exact paths, one call per path, then reply with the single word done:\n{path}\n{scope}")
+# the host profile's open turn (levain 23, ROOM-P1C): the child reports no ``init`` before its first message, so one
+# turn is still needed for the probe. Nothing is read or denied by it (under bypass the confined room's decoy Reads would
+# SUCCEED), so it asks for one word and no tool; the host probe judges the ``init`` it produced. Same op id as the canary
+# turn, so the cockpit's room read hides it the same way
+ROOM_HOST_OPEN_PROMPT = ("Open check. This is the system's own start-up test, not the user's message, and the user never "
+                         "sees it; never mention it afterwards. Reply with the single word ok; use no tool.")
+_OPEN_OP_ID = "room-open-check"
 _CANARY_NAME = ".env.levain-room-canary"
 # the scope decoy matches no deny rule: only the outside-the-cwd block can answer it (roomfix1 C2)
 _SCOPE_NAME = "levain-room-scope-canary.txt"
@@ -299,12 +324,18 @@ class _ChildExited(RoomLaunchError):
 @dataclass(frozen=True)
 class RoomSetting:
     """What the room runs as. ``cwd`` is the directory its file tools see first (absolute, an existing directory).
-    ``harness`` is ``claude``: the Codex room profile is RM-D3's."""
+    ``harness`` is ``claude``: the Codex room profile is RM-D3's. ``profile`` is the host's
+    :class:`~levain.desk.room_profile.RoomProfile` (module docstring, "The host profile"); None is the confined room."""
     cwd: str
     model: Optional[str] = None
     harness: str = "claude"
     claude_bin: str = "claude"
     host: Optional[HostCommands] = None      # D2: the commands the host gives the room (None: propose_drop only, as before)
+    profile: Optional[RoomProfile] = None
+
+    def __post_init__(self) -> None:
+        if self.profile is not None and not isinstance(self.profile, RoomProfile):
+            raise ValueError("profile must be a RoomProfile or None (the confined room)")
 
     @property
     def door_names(self) -> tuple:
@@ -403,37 +434,43 @@ def cwd_refusal(raw: Any, cwd: Optional[str]) -> Optional[str]:
 
 
 def room_probe(launch_id: str, evidence: LivenessEvidence, cwd: Optional[str] = None,
-               door_names: Optional[tuple] = None) -> Verdict:
+               door_names: Optional[tuple] = None, profile: Optional[RoomProfile] = None) -> Verdict:
     """The room's verdict on one ``init``: live only for exactly its tools, its one connected door, under ``dontAsk``,
-    in the launch's recorded ``cwd`` (no ``cwd`` given is not live)."""
+    in the launch's recorded ``cwd`` (no ``cwd`` given is not live). With a host ``profile`` the judge is
+    :func:`~levain.desk.claude_session.host_probe` instead (the profile's mode and required-tools floor)."""
     raw = evidence.raw if isinstance(evidence, LivenessEvidence) else None
-    got = open_probe(raw, door_names)
+    got = open_probe(raw, door_names) if profile is None else host_probe(raw, profile, door_names)
     if not got.live:
         return Verdict(False, got.reason)
     why = cwd_refusal(raw, cwd)
     return Verdict(False, why) if why is not None else Verdict(True, got.reason)
 
 
-def room_tripwire_context(cwd: str, door_names: Optional[tuple] = None) -> TripwireContext:
-    """The room's TripwireContext (what it accepts: the module docstring)."""
-    tools = (*ROOM_TOOLS, *room_door_tools(door_names))
-
+def room_tripwire_context(cwd: str, door_names: Optional[tuple] = None,
+                          profile: Optional[RoomProfile] = None) -> TripwireContext:
+    """The room's TripwireContext (what it accepts: the module docstring). A host ``profile`` gets the OPEN context:
+    under bypass every accepted call is ``{accept, config, mode}`` for any tool, so no tool list or allow rule is
+    named (``open_tools=True``, :mod:`levain.desk.chat_tripwires`); every other shape still latches."""
     def expected(tool: str) -> int:
         raise ValueError(f"{str(tool)[:60]} is not one of the room's tools")
 
+    if profile is not None:
+        return TripwireContext(cwd, expected, lambda _call, _input: False, frozenset(), open_tools=True)
+    tools = (*ROOM_TOOLS, *room_door_tools(door_names))
     return TripwireContext(cwd, expected, lambda _call, _input: False,
                            frozenset((t, s) for t in tools for s in _SOURCES))
 
 
 def make_probe(store: ChatStore, other: Optional[Callable[[str, LivenessEvidence], Verdict]] = None,
-               door_names: Optional[tuple] = None) -> Callable[[str, LivenessEvidence], Verdict]:
+               door_names: Optional[tuple] = None,
+               profile: Optional[RoomProfile] = None) -> Callable[[str, LivenessEvidence], Verdict]:
     """The one ``probe`` a ChatService takes: a room launch gets :func:`room_probe` over its recorded cwd, any other
     launch gets ``other`` (no verdict at all, which latches, when there is none)."""
     def probe(launch_id: str, evidence: LivenessEvidence) -> Verdict:
         row = store._read(lambda conn: conn.execute("SELECT role, cwd FROM launches WHERE launch_id = ?",
                                                     (launch_id,)).fetchone())
         if row is not None and row[0] == "room":
-            return room_probe(launch_id, evidence, row[1], door_names)
+            return room_probe(launch_id, evidence, row[1], door_names, profile)
         if other is None:
             return Verdict(False, "no probe is configured for this launch")
         return other(launch_id, evidence)
@@ -441,14 +478,15 @@ def make_probe(store: ChatStore, other: Optional[Callable[[str, LivenessEvidence
 
 
 def make_tripwires(store: ChatStore, other: Optional[Callable[[str], Optional[TripwireContext]]] = None,
-                   door_names: Optional[tuple] = None) -> Callable[[str], Optional[TripwireContext]]:
+                   door_names: Optional[tuple] = None,
+                   profile: Optional[RoomProfile] = None) -> Callable[[str], Optional[TripwireContext]]:
     """The one ``tripwires`` a ChatService takes: a room launch gets :func:`room_tripwire_context` over its recorded
     cwd, any other launch gets ``other`` (None when there is none)."""
     def tripwires(launch_id: str) -> Optional[TripwireContext]:
         row = store._read(lambda conn: conn.execute("SELECT role, cwd FROM launches WHERE launch_id = ?",
                                                     (launch_id,)).fetchone())
         if row is not None and row[0] == "room":
-            return room_tripwire_context(row[1] or "", door_names)
+            return room_tripwire_context(row[1] or "", door_names, profile)
         return other(launch_id) if other is not None else None
     return tripwires
 
@@ -488,10 +526,24 @@ def _guard_name(sha256: str) -> str:
     return f"room_readguard-{sha256[:16]}.py"
 
 
-def containment_digest(settings_json: str, readguard_sha256: str, host: Optional[HostCommands] = None) -> str:
+def _hook_name(sha256: str) -> str:
+    """A host hook script's file name in run_dir: one file per version of the script (stable across launches)."""
+    return f"room_hook-{sha256[:16]}.py"
+
+
+def containment_digest(settings_json: str, readguard_sha256: str, host: Optional[HostCommands] = None, *,
+                       profile: Optional[RoomProfile] = None, hook_sha256: Sequence[str] = ()) -> str:
     """64 hex: the containment policy a spawn ran under (tool flags, mode, sources, deny rules, the read-guard hook entry,
     door name) and ``readguard_sha256``, the sha256 of the script bytes written for THIS launch (L3 r1 codex MED: never a
-    re-read of the package, which an upgrade can change between the write and activation)."""
+    re-read of the package, which an upgrade can change between the write and activation).
+
+    With a host ``profile`` the policy is :func:`~levain.desk.room_profile.host_policy` instead (the confined dict is not
+    touched, so every pinned confined digest holds): ``readguard_sha256`` is ignored (that profile has no read guard) and
+    ``hook_sha256`` holds the sha256 of each hook script's COPIED bytes, one per hook, in order."""
+    if profile is not None:
+        policy = host_policy(profile, settings_json=settings_json, hook_sha256=hook_sha256, door=host_door_tools(host),
+                             host_commands=json.loads(host.to_json()) if host is not None else None)
+        return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     policy = {"tools": list(ROOM_TOOLS), "denied": sorted(ROOM_DENIED_TOOLS), "mode": ROOM_PERMISSION_MODE,
               "setting_sources": "user", "settings": json.loads(settings_json), "door": ROOM_MCP_TOOL,
               "readguard_sha256": readguard_sha256}
@@ -555,6 +607,15 @@ class RoomLauncher:
         self._levain_home = levain_home
         self._env_keep = tuple(env_keep)
         self._scope_dir = scope_dir          # where the scope decoy's directory is made (None: the system temp dir)
+        self._profile = setting.profile
+        if self._profile is not None:
+            # the host profile has no deny rules and no read guard (module docstring); its one early refusal is a hook
+            # script that is already gone, so a bridge that built the profile earlier fails here, before any launch row
+            self._deny = ()
+            for spec in self._profile.hooks:
+                self._check_hook(spec)
+            self._settings_json = "{}"
+            return
         # refused early, before any launch row: a bad cwd/deny pair is the operator's to fix
         self._deny = default_deny_paths(self._home, levain_home)
         # the read-guard hook's script lives in run_dir under a name carrying its sha256 (one immutable file per version,
@@ -563,6 +624,15 @@ class RoomLauncher:
         # bad cwd/deny pair is refused before any launch row; each launch rebuilds it for the bytes it wrote
         # (``_settings_json`` is the document for the package's script at construction, read for its deny rules)
         self._settings_json = self._settings_for(hashlib.sha256(_guard_source()).hexdigest())
+
+    @staticmethod
+    def _check_hook(spec: Any) -> None:
+        """:meth:`HookSpec.check` as a launch error (a script that vanished or became unreadable since the profile was
+        built)."""
+        try:
+            spec.check()
+        except ValueError as exc:
+            raise RoomLaunchError(f"the room profile's hook script cannot be used: {_one_line(str(exc))}") from exc
 
     def _settings_for(self, guard_sha256: str) -> str:
         """The room's ``--settings`` document whose hook runs the script file of ``guard_sha256``."""
@@ -662,8 +732,11 @@ class RoomLauncher:
         return self._conn
 
     def _open(self, room_thread: str, resume: Optional[str], *, resume_failed: Optional[str] = None) -> RoomHandle:
+        profile = self._profile
+        # the host profile's own model wins over the setting's (the argv and the launch row say the same one)
+        model = profile.model if profile is not None and profile.model else self._setting.model
         with self._store._write() as (conn, now):
-            ln = lease.open_room_launch(conn, now, harness="claude", model=self._setting.model,
+            ln = lease.open_room_launch(conn, now, harness="claude", model=model,
                                         cwd=self._setting.cwd, room_thread=room_thread, pid=os.getpid(),
                                         resumed_from=resume)
         launch_id = ln.launch_id
@@ -672,22 +745,35 @@ class RoomLauncher:
         sid = resume or str(uuid.uuid4())             # the one id the child is given, and must report
         proc = session = None
         scope_dir: Optional[str] = None
+        hook_files: list = []
         try:
             env = room_env(self._environ if self._environ is not None else os.environ, self._env_keep)
-            widened = settings_scope_refusal(env, self._home, cwd=self._setting.cwd)
-            if widened is not None:
-                raise RoomLaunchError(widened)
-            scope_dir, scope = self._scope_decoy()
-            argv, decoy, stderr_path, settings_json, guard, guard_sha = self._write_files(workdir, launch_id, resume, sid)
-            # one absolute string each, for the hook's exemption AND the open check: a relative or Path value can neither
-            # abort the launch after its files were written nor make the hook inert (L3 r1 complement)
-            decoy, scope = str(os.path.abspath(decoy)), str(os.path.abspath(scope))
-            # the hook leaves BOTH decoys to the vendor, so each canary is answered by what it tests (room_readguard)
-            env[room_readguard.EXEMPT_ENV] = json.dumps([decoy, scope])
-            # fail closed: the script the child will run must still be the bytes this launch's digest is taken over
-            if _file_sha256(guard) != guard_sha:
-                raise RoomLaunchError(f"the room's read-guard script {str(guard)[:160]!r} no longer holds the bytes "
-                                      "written for this launch; nothing was spawned")
+            if profile is not None:
+                # no read scope to widen, no decoys and no read guard to exempt them from: nothing of the confined
+                # room's open applies. The hook scripts are re-checked here (they can vanish after construction)
+                for spec in profile.hooks:
+                    self._check_hook(spec)
+                argv, stderr_path, settings_json, hook_files = self._write_host_files(workdir, launch_id, resume, sid)
+                decoy = scope = guard_sha = ""
+                for path, sha in hook_files:        # fail closed, as the read guard's check below
+                    if _file_sha256(path) != sha:
+                        raise RoomLaunchError(f"the room's hook script {str(path)[:160]!r} no longer holds the bytes "
+                                              "written for this launch; nothing was spawned")
+            else:
+                widened = settings_scope_refusal(env, self._home, cwd=self._setting.cwd)
+                if widened is not None:
+                    raise RoomLaunchError(widened)
+                scope_dir, scope = self._scope_decoy()
+                argv, decoy, stderr_path, settings_json, guard, guard_sha = self._write_files(workdir, launch_id, resume, sid)
+                # one absolute string each, for the hook's exemption AND the open check: a relative or Path value can neither
+                # abort the launch after its files were written nor make the hook inert (L3 r1 complement)
+                decoy, scope = str(os.path.abspath(decoy)), str(os.path.abspath(scope))
+                # the hook leaves BOTH decoys to the vendor, so each canary is answered by what it tests (room_readguard)
+                env[room_readguard.EXEMPT_ENV] = json.dumps([decoy, scope])
+                # fail closed: the script the child will run must still be the bytes this launch's digest is taken over
+                if _file_sha256(guard) != guard_sha:
+                    raise RoomLaunchError(f"the room's read-guard script {str(guard)[:160]!r} no longer holds the bytes "
+                                          "written for this launch; nothing was spawned")
             with open(stderr_path, "ab") as errf:
                 proc = self._spawn(argv, cwd=self._setting.cwd, env=env, stderr=errf)
             session = RoomSession(PipeTransport(proc), conn=self._next_conn(), session_id=sid,
@@ -696,15 +782,22 @@ class RoomLauncher:
                                           resumed=resume is not None, resume_failed=resume_failed)
             self._svc.activate(launch_id, "probing", "room spawned" if resume_failed is None else _one_line(
                 f"room spawned as a fresh session after the resume of {resume_failed} exited", 200), spawn_nonce=nonce)
-            init = self._open_check(session, proc, decoy, stderr_path, sid, scope)
+            if profile is not None:
+                init = self._open_check_host(session, proc, stderr_path, sid, profile)
+                canary = RoomCanary(True, "", "host profile: open turn ended")
+                cdigest = containment_digest(settings_json, "", self._setting.host, profile=profile,
+                                             hook_sha256=[sha for _p, sha in hook_files])
+            else:
+                init = self._open_check(session, proc, decoy, stderr_path, sid, scope)
+                canary = RoomCanary(True, decoy, "the canary Read was denied")
+                cdigest = containment_digest(settings_json, guard_sha, self._setting.host)
             digest = "sha256:" + hashlib.sha256(json.dumps(argv, sort_keys=True).encode()).hexdigest()
             # the launch stays pending, so send_room resolves nothing to it, until it is attached, live and holds a
             # vendor position; activation is the last step (L3_rme_r1 codex HIGH 1: a send in between was stored
             # refused or cancelled for good under its outbox_id)
             self._svc.attach(launch_id, session)
             self._svc.activate(launch_id, "live", "room open check passed", evidence=init, spawn_nonce=nonce,
-                               canary=RoomCanary(True, decoy, "the canary Read was denied"),
-                               containment_digest=containment_digest(settings_json, guard_sha, self._setting.host))
+                               canary=canary, containment_digest=cdigest)
             # the service sends nothing to a launch with no recorded vendor position: record the open check's events
             # (the first read ends at its turn boundary) and make sure they did not latch the room they opened
             self._svc.read_next(launch_id)
@@ -783,17 +876,66 @@ class RoomLauncher:
                          door_tools=self._setting.door_names, **({"resume": resume} if resume else {"session_id": sid}))
         return argv, str(decoy), stderr, settings_json, guard, guard_sha
 
+    def _write_host_files(self, workdir: Path, launch_id: str, resume: Optional[str], sid: str) -> tuple:
+        """The host profile's files for one launch: ``(argv, stderr_path, settings_json, hook_files)`` where
+        ``hook_files`` is ``[(path, sha256)]``, one per hook in the profile's order. Each hook script is read ONCE from
+        the host's path and its bytes written to ``run_dir/room_hook-<sha256[:16]>.py`` (:meth:`_put_script`), and the
+        settings name that copy, so the path is the same for the same bytes on every launch (the digest holds the
+        settings document) and what the child runs is what was hashed."""
+        profile = self._profile
+        assert profile is not None
+        self._run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        workdir.mkdir(mode=0o700)
+        os.chmod(workdir, 0o700)
+
+        def put(name: str, text: str) -> Path:
+            p = workdir / name
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            return p
+
+        hook_files, commands = [], []
+        for spec in profile.hooks:
+            try:
+                data = Path(spec.script).read_bytes()
+            except OSError as exc:
+                raise RoomLaunchError(f"the room profile's hook script {spec.script[:160]!r} could not be read: "
+                                      f"{_one_line(str(exc))}") from exc
+            path, sha = self._put_script(data, _hook_name(hashlib.sha256(data).hexdigest()), ".room_hook")
+            hook_files.append((path, sha))
+            commands.append(room_hook_command(self._python, path))
+        try:
+            settings_json = host_settings_json(profile, commands)
+        except ValueError as exc:
+            raise RoomLaunchError(f"the room's settings could not be built: {exc}") from exc
+        mcp = put("mcp.json", mcp_config_json(launch_id, self._python, self._setting.host))
+        settings = put("settings.json", settings_json)
+        stderr = put("child.stderr", "")
+        try:
+            argv = room_host_argv(profile, mcp_config=mcp, settings=settings, model=self._setting.model,
+                                  claude_bin=self._setting.claude_bin,
+                                  **({"resume": resume} if resume else {"session_id": sid}))
+        except ValueError as exc:
+            raise RoomLaunchError(f"the room's argv could not be built: {exc}") from exc
+        return argv, stderr, settings_json, hook_files
+
     def _put_guard(self) -> tuple:
         """``(path, sha256)``: the read-guard hook's script as the package holds it, read ONCE, written to
         ``run_dir/<_guard_name(sha256)>`` (0600, replaced whole when that file is missing or holds other bytes). The
         settings document names that file and the containment digest is taken over that sha256, so both describe the
         bytes written here, and another version of the script is another file."""
         data = _guard_source()
+        return self._put_script(data, _guard_name(hashlib.sha256(data).hexdigest()), ".room_readguard")
+
+    def _put_script(self, data: bytes, name: str, tmp_prefix: str) -> tuple:
+        """``(path, sha256)``: ``data`` written to ``run_dir/name`` (0600, replaced whole when that file is missing or
+        holds other bytes). ``name`` carries the sha256, so one file is one version of one script."""
         sha = hashlib.sha256(data).hexdigest()
-        path = self._run_dir / _guard_name(sha)
+        path = self._run_dir / name
         if _file_sha256(path) == sha:
             return path, sha
-        tmp = self._run_dir / f".room_readguard.{secrets.token_hex(6)}.tmp"
+        tmp = self._run_dir / f"{tmp_prefix}.{secrets.token_hex(6)}.tmp"
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as f:
@@ -806,15 +948,13 @@ class RoomLauncher:
                 pass
         return path, sha
 
-    def _open_check(self, session: RoomSession, proc: Any, decoy: str, stderr_path: Path,
-                    sid: str, scope: str) -> LivenessEvidence:
-        """Send the canary turn, wait for it to end, and return the ``init`` it produced once the probe, the launch's
-        cwd, the session id the child was given (``sid``) and BOTH canaries accept it: ``decoy`` (a deny-rule match)
-        and ``scope`` (outside the cwd, matching no rule: :meth:`_scope_decoy`). Raises :class:`RoomLaunchError` with
-        the reason otherwise (:class:`_ChildExited` when the child exited first)."""
+    def _open_turn(self, session: RoomSession, proc: Any, prompt: str, stderr_path: Path) -> LivenessEvidence:
+        """Send the open check's one turn (``prompt``, op id :data:`_OPEN_OP_ID`), wait for it to end and return the
+        ``init`` it produced; nothing about that ``init`` is judged here. Raises :class:`RoomLaunchError` when the turn
+        could not be sent, was not accepted, did not end in time, or the child exited (:class:`_ChildExited` when it
+        exited first). Both open checks (confined and host) run it."""
         try:
-            sent = session.send(SendCommand("room-open-check", CANARY_PROMPT.format(path=decoy, scope=scope), (),
-                                            "queue", None))
+            sent = session.send(SendCommand(_OPEN_OP_ID, prompt, (), "queue", None))
         except NotSent as exc:
             # a dead transport is proof of a dead child only once the child is actually gone (a short grace catches
             # one mid-exit); a live child with a transient dead pipe is a plain failure, so the history is kept
@@ -850,6 +990,34 @@ class RoomLauncher:
         if proc.poll() is not None:
             raise RoomLaunchError(f"the room child exited (code {proc.returncode}) after its open check"
                                   f"{self._tail(stderr_path)}")
+        return init
+
+    def _open_check_host(self, session: RoomSession, proc: Any, stderr_path: Path, sid: str,
+                         profile: RoomProfile) -> LivenessEvidence:
+        """The host profile's open check: the open turn (:data:`ROOM_HOST_OPEN_PROMPT`, no tool), then the ``init`` it
+        produced must pass :func:`~levain.desk.claude_session.host_probe` (the profile's mode and required tools, the one
+        connected door), report the launch's cwd and the session id the child was given (``sid``). No canary: the
+        confined room's decoy Reads would SUCCEED under bypass, and nothing else here reads or denies a file."""
+        init = self._open_turn(session, proc, ROOM_HOST_OPEN_PROMPT, stderr_path)
+        probe = host_probe(init.raw, profile, self._setting.door_names)
+        if not probe.live:
+            raise RoomLaunchError(f"the room could not open under its host profile: {probe.reason}")
+        why = cwd_refusal(init.raw, self._setting.cwd)
+        if why is not None:
+            raise RoomLaunchError(f"the room could not open in its cwd: {why}")
+        got = init.raw.get("session_id")
+        if got != sid:
+            raise RoomLaunchError(_one_line(f"the room child reports session id {str(got)[:60]!r}, not the "
+                                            f"{sid[:60]!r} it was given"))
+        return init
+
+    def _open_check(self, session: RoomSession, proc: Any, decoy: str, stderr_path: Path,
+                    sid: str, scope: str) -> LivenessEvidence:
+        """Send the canary turn, wait for it to end, and return the ``init`` it produced once the probe, the launch's
+        cwd, the session id the child was given (``sid``) and BOTH canaries accept it: ``decoy`` (a deny-rule match)
+        and ``scope`` (outside the cwd, matching no rule: :meth:`_scope_decoy`). Raises :class:`RoomLaunchError` with
+        the reason otherwise (:class:`_ChildExited` when the child exited first)."""
+        init = self._open_turn(session, proc, CANARY_PROMPT.format(path=decoy, scope=scope), stderr_path)
         probe = open_probe(init.raw, self._setting.door_names)
         if not probe.live:
             raise RoomLaunchError(f"the room could not open with its read-only tools: {probe.reason}")
