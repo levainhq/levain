@@ -3,14 +3,17 @@
 S1 of Q17-ALL (project_memory/1028-12/Q17ALL_DESIGN.md): the band over OPEN QUESTIONS only. Each open question is
 shown with a BAND NUMBER, a number space of its own (the question's ``#n`` stays as the source tag), allocated in the
 append-only ``band_items`` table of ``questions.db``: ``n INTEGER PRIMARY KEY AUTOINCREMENT`` and ``UNIQUE (source,
-ref)``, so a number is never reused, not after a restart and not after the band empties (D2). A number is allocated the
+ref)``. Recycling (levain#3): a number freed (its item closed) goes back to the pool only after :data:`QUARANTINE` (14
+days) and a new row takes the LOWEST free number, else max+1; a number freed less than 14 days ago is never reissued.
+The old row moves to ``band_items_retired`` (the audit trail of what N meant) and nothing else about the number space
+changes. A typed number resolves only against open rows. A number is allocated the
 first time an item is SHOWN, inside one bounded write (D3); a busy lock leaves the item as ``new (number pending)``,
 never with a provisional number. The whole band is printed every time, never reordered, never cut: past
 :data:`COMPACT_AFTER` items the rest take one line each (D15), and an item that cannot be read is listed as UNREADABLE
 (D13). A numbered question the operator snoozed to a later day (row 134) is listed by its number on ONE
 ``LATER (n): <number> <Wkd>[ MM-DD] · ...`` line under the items (flow's format) instead of in full, and the header
 then reads ``N due``, counting only the rest; it stays open and answers by its number. Closed is derived (the
-question has an answer) and shown as ``closed N`` in the next hook render, then it leaves; its number stays retired. The notice is recorded as shown only AFTER the hook's ``emit`` returned True (at-least-once).
+question has an answer) and shown as ``closed N`` in the next hook render, then it leaves; its number is held 14 days. The notice is recorded as shown only AFTER the hook's ``emit`` returned True (at-least-once).
 
 Three seams use it: the UserPromptSubmit hook (:func:`hook_prompt`: the render, nothing parsed), the SessionStart
 contract line (:func:`hook_contract`) and ``levain band`` (:func:`run_band`). The hooks FAIL OPEN: any error prints
@@ -52,7 +55,7 @@ import time
 import types
 import urllib.parse
 from collections.abc import Callable, Collection, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
@@ -69,12 +72,19 @@ __all__ = ["BAND_SCHEMA", "COMPACT_AFTER", "Applied", "apply_plan", "format_echo
            "gate_notice", "hook_stop", "is_autonomous", "last_view", "mark_closed_shown", "plan_for", "plan_for_full", "record_view", "render", "render_full", "render_with_closed", "session_band_state",
            "run_band", "run_band_answer", "AnswerCommitted", "AuthorityItem", "BandSnapshot", "PickNotOffered",
            "QUESTION_VERSION_FIELDS", "VersionMoved", "VersionedQuestionStore", "answer_item", "answerable",
-           "subject_for", "subject_version", "summary", "Signing", "answer_sign_of", "answer_badge", "answer_badges", "allocate", "ALLOCATABLE_SOURCES"]
+           "subject_for", "subject_version", "summary", "Signing", "answer_sign_of", "answer_badge", "answer_badges", "allocate", "release", "ALLOCATABLE_SOURCES", "QUARANTINE"]
 
 COMPACT_AFTER = 12
 _COMPACT_WHAT = 100
 _LETTERS = "abcdef"                       # an option's display letter is its position; the stored key never shows
-# a number shown must be final: this is the one place numbers are made, and nothing rewrites or removes one.
+#: levain#3: how long a freed band number is held before it can be issued again
+QUARANTINE = timedelta(days=14)
+# a retired row's own stamps say the quarantine had run (the triggers have no clock: they stop a stray edit, and a
+# writer that forges an archive row is outside what a trigger can see). Millisecond resolution, as strftime's %f.
+_QUARANTINED = (f"strftime('%Y-%m-%d %H:%M:%f', r.freed_at, '+{QUARANTINE.days} days') <= "
+                "strftime('%Y-%m-%d %H:%M:%f', r.retired_at)")
+# a number shown must be final: this is the one place numbers are made, and the only thing that removes one is the
+# retirement of a number freed 14 days ago (:func:`_retire_due`), behind an archive row.
 # The table's body is one constant so the L3 rebuild (:func:`_migrate_band_items`) makes exactly the schema's table.
 _ITEMS_BODY = ("(n INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL CHECK (source "
                "IN ('question','consent','sign','extend','host')), ref TEXT NOT NULL, numbered_at TEXT NOT NULL, "
@@ -83,9 +93,31 @@ BAND_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS band_items " + _ITEMS_BODY,
     # an item's closing, shown once to a hook: written once (a viewer's own delta is S2)
     "CREATE TABLE IF NOT EXISTS band_closed_shown (n INTEGER PRIMARY KEY REFERENCES band_items(n), at TEXT NOT NULL)",
+    # levain#3: a freed number's old row moves here before it leaves band_items: number N meant ``ref`` from
+    # ``numbered_at`` to ``freed_at``, retired at ``retired_at`` (>= freed_at + 14 days), its closed notice (if shown) at
+    # ``closed_shown_at``. The ONLY way a band_items / band_closed_shown row may be deleted is behind such a row.
+    "CREATE TABLE IF NOT EXISTS band_items_retired (n INTEGER NOT NULL, source TEXT NOT NULL, ref TEXT NOT NULL, "
+    "numbered_at TEXT NOT NULL, freed_at TEXT NOT NULL, retired_at TEXT NOT NULL, closed_shown_at TEXT, "
+    "PRIMARY KEY (n, numbered_at))",
+    # a host row's closing is the host's to say (:func:`release`): one row per numbered life of a (source, ref)
+    "CREATE TABLE IF NOT EXISTS band_freed (source TEXT NOT NULL, ref TEXT NOT NULL, numbered_at TEXT NOT NULL, "
+    "freed_at TEXT NOT NULL, PRIMARY KEY (source, ref, numbered_at))",
     "CREATE TRIGGER IF NOT EXISTS band_items_frozen BEFORE UPDATE ON band_items "
     "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
-    "CREATE TRIGGER IF NOT EXISTS band_items_kept BEFORE DELETE ON band_items "
+    "CREATE TRIGGER IF NOT EXISTS band_items_kept BEFORE DELETE ON band_items WHEN NOT EXISTS (SELECT 1 FROM "
+    "band_items_retired r WHERE r.n = OLD.n AND r.source = OLD.source AND r.ref = OLD.ref AND r.numbered_at = "
+    "OLD.numbered_at AND " + _QUARANTINED + ") "
+    "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS band_items_retired_of_a_row BEFORE INSERT ON band_items_retired WHEN NOT EXISTS "
+    "(SELECT 1 FROM band_items b WHERE b.n = NEW.n AND b.source = NEW.source AND b.ref = NEW.ref AND b.numbered_at = "
+    "NEW.numbered_at) BEGIN SELECT RAISE(ABORT, 'only a numbered row can be retired'); END",
+    "CREATE TRIGGER IF NOT EXISTS band_items_retired_frozen BEFORE UPDATE ON band_items_retired "
+    "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS band_items_retired_kept BEFORE DELETE ON band_items_retired "
+    "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS band_freed_frozen BEFORE UPDATE ON band_freed "
+    "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS band_freed_kept BEFORE DELETE ON band_freed "
     "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
     # INSERT OR REPLACE drops a row without a delete trigger: refuse a row that reuses a key or an explicit number
     "CREATE TRIGGER IF NOT EXISTS band_items_no_replace BEFORE INSERT ON band_items "
@@ -93,7 +125,8 @@ BAND_SCHEMA = (
     "BEGIN SELECT RAISE(ABORT, 'a band number is never replaced'); END",
     "CREATE TRIGGER IF NOT EXISTS band_closed_shown_frozen BEFORE UPDATE ON band_closed_shown "
     "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
-    "CREATE TRIGGER IF NOT EXISTS band_closed_shown_kept BEFORE DELETE ON band_closed_shown "
+    "CREATE TRIGGER IF NOT EXISTS band_closed_shown_kept BEFORE DELETE ON band_closed_shown WHEN NOT EXISTS (SELECT 1 "
+    "FROM band_items_retired r WHERE r.n = OLD.n AND r.closed_shown_at = OLD.at AND " + _QUARANTINED + ") "
     "BEGIN SELECT RAISE(ABORT, 'band numbers are append-only'); END",
     # S2 (D7): each render's view: what a viewer was shown, so an answer binds to it. `gen` is the render's own
     # generation (its wall-clock start, ns): the viewer's last view is its greatest gen, never its last commit
@@ -346,25 +379,136 @@ def _busy(exc: sqlite3.OperationalError) -> bool:
     return code is not None and (code & 0xFF) in (5, 6)
 
 
-def _number(store: QuestionStore, refs: list[Any], deadline: float, now: datetime | None = None) -> dict[Any, int]:
+_RECYCLE_META = ("band_numbers", "recycle-14d-1")
+
+
+def _ensure_recycling(conn: sqlite3.Connection) -> None:
+    """The recycling schema on a store that may predate it (idempotent, inside the caller's write): the new tables and
+    triggers (:data:`BAND_SCHEMA`, all ``IF NOT EXISTS``), and the two delete triggers an older store made without the
+    archive guard replaced IN PLACE under the same names (an older binary's ``IF NOT EXISTS`` then leaves them alone).
+    ``band_items`` itself is not rebuilt: a row with an explicit ``n`` goes into an AUTOINCREMENT table as it is. A
+    ``meta`` marker names the rule for anyone reading the store."""
+    for name in ("band_items_kept", "band_closed_shown_kept"):
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", (name,)).fetchone()
+        if row is not None and "band_items_retired" not in (row[0] or ""):
+            conn.execute(f"DROP TRIGGER {name}")
+    for stmt in BAND_SCHEMA:
+        conn.execute(stmt)
+    if "meta" in _tables(conn):
+        conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)", _RECYCLE_META)
+
+
+def _free_numbers(conn: sqlite3.Connection) -> list[int]:
+    """THE pool: the numbers that have been retired and have no row now, lowest first. The only place it is derived. A
+    number freed less than :data:`QUARANTINE` ago still has its row (it is retired only after the quarantine), so it is
+    never in the pool."""
+    return [r[0] for r in conn.execute("SELECT DISTINCT r.n FROM band_items_retired r WHERE NOT EXISTS "
+                                       "(SELECT 1 FROM band_items b WHERE b.n = r.n) ORDER BY r.n")]
+
+
+def _retire_due(conn: sqlite3.Connection, now: datetime, keep: Collection[tuple[str, str]],
+                gone: Collection[tuple[str, str]]) -> int:
+    """Move every row freed :data:`QUARANTINE` or longer before ``now`` to ``band_items_retired`` and out of
+    ``band_items`` (with its ``band_closed_shown`` row, kept in the archive row), inside the caller's write. Freed is:
+    a question: its answer's ``answered_at``; an authority item: the stamp of its closed notice, and only for a key in
+    ``gone`` (its source was read in full and it is not open); a host item: its :func:`release` stamp. A key in ``keep``
+    (asked for in this very call) is in use and stays. Returns how many were retired."""
+    cutoff = utc_stamp(now - QUARANTINE)
+    stamp = utc_stamp(now)
+    due: dict[int, tuple[Any, ...]] = {}
+    for row in conn.execute("SELECT b.n, b.source, b.ref, b.numbered_at, a.answered_at, s.at FROM band_items b JOIN "
+                            "answers a ON a.question_id = b.ref LEFT JOIN band_closed_shown s ON s.n = b.n "
+                            "WHERE b.source = 'question' AND a.answered_at <= ?", (cutoff,)):
+        due[row[0]] = tuple(row)
+    for row in conn.execute("SELECT b.n, b.source, b.ref, b.numbered_at, s.at, s.at FROM band_items b JOIN "
+                            f"band_closed_shown s ON s.n = b.n WHERE b.source IN {_AUTHORITY_IN} AND s.at <= ?",
+                            (cutoff,)):
+        if (row[1], row[2]) in gone:
+            due[row[0]] = tuple(row)
+    for row in conn.execute("SELECT b.n, b.source, b.ref, b.numbered_at, f.freed_at, s.at FROM band_items b JOIN "
+                            "band_freed f ON f.source = b.source AND f.ref = b.ref AND f.numbered_at = b.numbered_at "
+                            "LEFT JOIN band_closed_shown s ON s.n = b.n WHERE f.freed_at <= ?", (cutoff,)):
+        due[row[0]] = tuple(row)
+    done = 0
+    for n, source, ref, numbered_at, freed_at, shown_at in sorted(due.values()):
+        if (source, ref) in keep:
+            continue
+        conn.execute("INSERT INTO band_items_retired (n, source, ref, numbered_at, freed_at, retired_at, "
+                     "closed_shown_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (n, source, ref, numbered_at, freed_at, stamp,
+                                                                       shown_at))
+        conn.execute("DELETE FROM band_closed_shown WHERE n = ?", (n,))
+        conn.execute("DELETE FROM band_items WHERE n = ?", (n,))
+        done += 1
+    return done
+
+
+def _authority_gone(extras: Extras, extra_numbers: Mapping[tuple[str, str], int]) -> list[tuple[str, str]]:
+    """The numbered authority items of a source this render read in full that are not open now: the ones whose number
+    may be freed (:func:`_retire_due`). A source not read in full frees nothing."""
+    still = {e.band_key for e in extras.items}
+    return [k for k in extra_numbers if k[0] in extras.complete and k not in still]
+
+
+def _recycled_after(conn: sqlite3.Connection, ns: Collection[int], at: str | None) -> set[int]:
+    """Of the band numbers ``ns``, those that were retired once and whose CURRENT row was numbered after ``at`` (a
+    view's stamp): in a view made at ``at`` they meant another item, so nothing typed against that view may reach the
+    new row. A number never retired is not asked about (no existing path changes); ``at`` unknown: none."""
+    if at is None or not ns or "band_items_retired" not in _tables(conn):
+        return set()
+    got: set[int] = set()
+    todo = sorted(ns)
+    for i in range(0, len(todo), 500):
+        part = todo[i:i + 500]
+        got.update(r[0] for r in conn.execute(
+            f"SELECT b.n FROM band_items b WHERE b.n IN ({','.join('?' * len(part))}) AND b.numbered_at > ? AND "
+            "EXISTS (SELECT 1 FROM band_items_retired r WHERE r.n = b.n)", (*part, at)))
+    return got
+
+
+def _still_numbered(store: QuestionStore, pairs: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """The ``(n, ref)`` pairs whose number still names that ref: a ``closed N`` notice read before a numbering write
+    that retired N (its row was freed 14 days ago, unshown since) is dropped, never shown beside a reissued N."""
+    if not pairs:
+        return pairs
+    with store._peek() as conn:
+        if conn is None:
+            return []
+        return [(n, ref) for n, ref in pairs
+                if conn.execute("SELECT 1 FROM band_items WHERE n = ? AND ref = ?", (n, ref)).fetchone()]
+
+
+def _number(store: QuestionStore, refs: list[Any], deadline: float, now: datetime | None = None,
+            gone: Collection[tuple[str, str]] = ()) -> dict[Any, int]:
     """Number every ``refs`` that has no number yet (in the order given), in ONE write transaction waited for until
     ``deadline``. A ref is a question id, or ``(source, ref)`` for another source; the result is keyed as given. The numbers come back read under the lock, so two writers never number a ref twice. The lock still
-    busy at the deadline: nothing written, nothing returned (``new (number pending)``); any other error is raised."""
+    busy at the deadline: nothing written, nothing returned (``new (number pending)``); any other error is raised.
+    A new ref takes the LOWEST number in the pool (:func:`_free_numbers`, derived once per write, after the numbers
+    freed :data:`QUARANTINE` ago were retired), else the next one (AUTOINCREMENT, max+1). ``gone``: the authority keys
+    that may be freed (:func:`_authority_gone`)."""
     try:
         # no question was ever filed here: the store is set up for the first number, inside the same deadline
         store.ready_by(deadline)
         with store._write_by(deadline) as conn:
             _migrate_band_items(conn)
-            for stmt in BAND_SCHEMA:
-                conn.execute(stmt)
-            stamp = utc_stamp(now if now is not None else _now_utc(store._clock))   # ``now`` given: no clock is read
+            _ensure_recycling(conn)
+            moment = now if now is not None else _now_utc(store._clock)     # ``now`` given: no clock is read
+            stamp = utc_stamp(moment)
+            keys = [(k if isinstance(k, tuple) else ("question", k)) for k in refs]
+            have = {k: conn.execute("SELECT n FROM band_items WHERE source = ? AND ref = ?", k).fetchone()
+                    for k in dict.fromkeys(keys)}
+            if any(row is None for row in have.values()):
+                _retire_due(conn, moment, set(keys), gone)
+            pool = _free_numbers(conn) if any(row is None for row in have.values()) else []
             got: dict[Any, int] = {}
-            for key in refs:
-                source, ref = key if isinstance(key, tuple) else ("question", key)
+            for key, (source, ref) in zip(refs, keys):
                 row = conn.execute("SELECT n FROM band_items WHERE source = ? AND ref = ?", (source, ref)).fetchone()
                 if row is None:
-                    conn.execute("INSERT INTO band_items (source, ref, numbered_at) VALUES (?, ?, ?)",
-                                 (source, ref, stamp))
+                    if pool:
+                        conn.execute("INSERT INTO band_items (n, source, ref, numbered_at) VALUES (?, ?, ?, ?)",
+                                     (pool.pop(0), source, ref, stamp))
+                    else:
+                        conn.execute("INSERT INTO band_items (source, ref, numbered_at) VALUES (?, ?, ?)",
+                                     (source, ref, stamp))
                     row = conn.execute("SELECT n FROM band_items WHERE source = ? AND ref = ?",
                                        (source, ref)).fetchone()
                 got[key] = row[0]
@@ -385,7 +529,9 @@ def allocate(store: QuestionStore, source: str, refs: Sequence[str], *, deadline
     this source keeps its number (idempotent, never a second one); new refs are numbered in the order given. The lock
     still busy at the deadline: nothing is written and ``{}`` comes back, so the caller tells a missing key from a
     number. An empty ``refs`` returns ``{}`` without touching the store. Any other store error is raised.
-    Numbers are never reused and never change, and Levain's shorthand parse skips a number allocated here silently."""
+    A number never changes while its ref is numbered; it can be issued to another ref only after the host said the
+    ref closed (:func:`release`) and :data:`QUARANTINE` passed. Levain's shorthand parse skips a number allocated here
+    silently."""
     if source not in ALLOCATABLE_SOURCES:
         raise ValueError(f"unknown band source {source!r}: allocate takes one of {', '.join(ALLOCATABLE_SOURCES)}")
     keys = list(refs)
@@ -396,6 +542,44 @@ def allocate(store: QuestionStore, source: str, refs: Sequence[str], *, deadline
     limit = (time.monotonic() + HOOK_BUSY_MS / 1000) if deadline is None else deadline
     got = _number(store, [(source, r) for r in dict.fromkeys(keys)], limit, now)
     return {r: got[(source, r)] for r in keys if (source, r) in got}
+
+
+def release(store: QuestionStore, source: str, refs: Sequence[str], *, deadline: float | None = None,
+            now: datetime | None = None) -> dict[str, int]:
+    """Say that items of a caller outside Levain are closed for good (levain#3): their numbers are held
+    :data:`QUARANTINE` from now and then go back to the pool. Levain cannot see a host item close, so this is the only
+    way a host number is freed. ``source`` as :func:`allocate`; a ref with no number is skipped; a ref already released
+    keeps its first stamp (idempotent). Returns ``{ref: n}`` for each ref recorded; ``{}`` when the lock stayed busy
+    past ``deadline``. A released ref the caller allocates again before the number is retired keeps its number (it
+    stays released: a closed ref is not reopened under the same id). Other store errors are raised."""
+    if source not in ALLOCATABLE_SOURCES:
+        raise ValueError(f"unknown band source {source!r}: release takes one of {', '.join(ALLOCATABLE_SOURCES)}")
+    keys = list(dict.fromkeys(refs))
+    if any(not isinstance(r, str) or not r for r in keys):
+        raise ValueError("a band ref is a non-empty string")
+    if not keys:
+        return {}
+    limit = (time.monotonic() + HOOK_BUSY_MS / 1000) if deadline is None else deadline
+    try:
+        store.ready_by(limit)
+        with store._write_by(limit) as conn:
+            _migrate_band_items(conn)
+            _ensure_recycling(conn)
+            stamp = utc_stamp(now if now is not None else _now_utc(store._clock))
+            got: dict[str, int] = {}
+            for ref in keys:
+                row = conn.execute("SELECT n, numbered_at FROM band_items WHERE source = ? AND ref = ?",
+                                   (source, ref)).fetchone()
+                if row is None:
+                    continue
+                conn.execute("INSERT OR IGNORE INTO band_freed (source, ref, numbered_at, freed_at) VALUES (?, ?, ?, ?)",
+                             (source, ref, row[1], stamp))
+                got[ref] = row[0]
+            return got
+    except sqlite3.OperationalError as exc:
+        if _busy(exc):
+            return {}
+        raise
 
 
 def _host_numbers(store: QuestionStore, ns: set[int]) -> set[int] | None:
@@ -535,9 +719,12 @@ def _render_full(store: QuestionStore, gen: int, deadline: float, coord_conn: sq
     new = [k for k, _ in entries if (numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)) is None]
     new.sort(key=lambda k: filed.get(k, ""))              # each source's own filed time; a stable sort keeps ties
     if new and numbering:
-        got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline, now)
+        got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline, now,
+                      _authority_gone(extras, extra_numbers))
         numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
         extra_numbers = {**extra_numbers, **{k: v for k, v in got.items() if isinstance(k, tuple)}}
+        if got:                               # the write may have retired a number whose notice was read above
+            closed, extra_closed = _still_numbered(store, closed), _still_numbered(store, extra_closed)
 
     def number_of(k: tuple[str, str]) -> int | None:
         return numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)
@@ -650,7 +837,8 @@ def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list:
                 had = json.loads(row[2])
                 if not open_list and not had and int(row[1]) == int(seen_through):
                     return int(row[0])
-                if dedupe and had == sorted(open_list) and int(row[1]) == int(seen_through):
+                if (dedupe and had == sorted(open_list) and int(row[1]) == int(seen_through)
+                        and not _recycled_after(conn, open_list, row[4])):    # the same numbers, not the same items
                     return int(row[0])
             cur = conn.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at, gen) "
                                "VALUES (?, ?, ?, ?, ?, ?)",
@@ -667,7 +855,7 @@ def record_view(store: QuestionStore, viewer: str, seen_through: int, open_list:
         return None
 
 
-_NEWEST_VIEW = "SELECT seq, seen_through, open_list, store_id FROM band_views WHERE viewer = ? ORDER BY gen DESC, seq DESC LIMIT 1"
+_NEWEST_VIEW = "SELECT seq, seen_through, open_list, store_id, at FROM band_views WHERE viewer = ? ORDER BY gen DESC, seq DESC LIMIT 1"
 
 
 def _newest_view(store: QuestionStore, viewer: str) -> tuple[View, int] | None:
@@ -680,7 +868,7 @@ def _newest_view(store: QuestionStore, viewer: str) -> tuple[View, int] | None:
         row = conn.execute(_NEWEST_VIEW, (viewer,)).fetchone()
     if row is None:
         return None
-    return View(int(row[1]), tuple(int(n) for n in json.loads(row[2])), row[3]), int(row[0])
+    return View(int(row[1]), tuple(int(n) for n in json.loads(row[2])), row[3], row[4]), int(row[0])
 
 
 def last_view(store: QuestionStore, viewer: str) -> View | None:
@@ -696,11 +884,11 @@ def _view_by_id(store: QuestionStore, viewer: str, view_id: int) -> View | None:
     with store._peek() as conn:
         if conn is None or "band_views" not in _tables(conn):
             return None
-        row = conn.execute("SELECT seen_through, open_list, store_id FROM band_views WHERE viewer = ? AND seq = ?",
+        row = conn.execute("SELECT seen_through, open_list, store_id, at FROM band_views WHERE viewer = ? AND seq = ?",
                            (viewer, view_id)).fetchone()
     if row is None:
         return None
-    return View(int(row[0]), tuple(int(n) for n in json.loads(row[1])), row[2])
+    return View(int(row[0]), tuple(int(n) for n in json.loads(row[1])), row[2], row[3])
 
 
 def _letter_of(q: Question, key: str) -> str:
@@ -721,7 +909,10 @@ def _items_read(store: QuestionStore, view: View) -> tuple[dict[int, Question], 
     with store._peek() as conn:
         if conn is None or "band_items" not in _tables(conn):
             return out, dropped
+        stale = _recycled_after(conn, view.open_list, view.at)       # reissued since this view: another item now
         for n in view.open_list:
+            if n in stale:
+                continue
             row = conn.execute("SELECT ref FROM band_items WHERE source = 'question' AND n = ?", (n,)).fetchone()
             if row is None:
                 continue
@@ -749,7 +940,8 @@ def _extras_of(store: QuestionStore, view: View) -> tuple[dict[int, Extra], set[
     with store._peek() as conn:
         if conn is None or "band_items" not in _tables(conn):
             return {}, set()
-        refs = {n: (src, ref) for n in view.open_list for src, ref in [r for r in conn.execute(
+        stale = _recycled_after(conn, view.open_list, view.at)       # reissued since this view: another item now
+        refs = {n: (src, ref) for n in view.open_list if n not in stale for src, ref in [r for r in conn.execute(
             f"SELECT source, ref FROM band_items WHERE n = ? AND source IN {_AUTHORITY_IN}", (n,))]}
     if not refs:
         return {}, set()
@@ -1460,11 +1652,14 @@ def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: f
     new.sort(key=lambda k: filed.get(k, ""))
     if new and numbering:                     # a queue that is all numbered takes no write lock
         try:
-            got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline, now)
+            got = _number(store, [k[1] if k[0] == "question" else k for k in new], deadline, now,
+                          _authority_gone(extras, extra_numbers))
         except Exception:  # noqa: BLE001 - those items stay unnumbered and the snapshot says so, as number_for_ping does
             got = {}
         numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
         extra_numbers = {**extra_numbers, **{k: v for k, v in got.items() if isinstance(k, tuple)}}
+        if got:                               # the write may have retired a number whose notice was read above
+            closed, extra_closed = _still_numbered(store, closed), _still_numbered(store, extra_closed)
 
     def number_of(k: tuple[str, str]) -> int | None:
         return numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)
@@ -2519,8 +2714,14 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int], deadl
     ``origins`` (default :func:`_cockpit_origins`)."""
     if prev is None:
         return "first band on this seat"
-    new = [n for n in shown if n > prev.seen_through or n not in prev.open_list]
-    gone = [n for n in prev.open_list if n not in shown]
+    replaced: set[int] = set()
+    if not _foreign(store) and prev.at is not None:
+        with store._peek() as conn:
+            # a number reissued since the previous view is the same number and a different item: new, and the old gone
+            replaced = (_recycled_after(conn, [n for n in shown if n in prev.open_list], prev.at)
+                        if conn is not None else set())
+    new = [n for n in shown if n > prev.seen_through or n not in prev.open_list or n in replaced]
+    gone = [n for n in prev.open_list if n not in shown or n in replaced]
     if not new and not gone:
         return ""
     how: dict[int, str] = {}
@@ -2529,9 +2730,14 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int], deadl
         with store._peek() as conn:
             if conn is not None:
                 for n in gone:
-                    row = conn.execute("SELECT a.channel, b.ref FROM band_items b JOIN answers a "
-                                       "ON a.question_id = b.ref WHERE b.source = 'question' AND b.n = ?",
-                                       (n,)).fetchone()
+                    row = None if n in replaced else conn.execute(
+                        "SELECT a.channel, b.ref FROM band_items b JOIN answers a ON a.question_id = b.ref "
+                        "WHERE b.source = 'question' AND b.n = ?", (n,)).fetchone()
+                    if row is None and "band_items_retired" in _tables(conn):     # its row was retired: the archive knows
+                        row = conn.execute("SELECT a.channel, r.ref FROM band_items_retired r JOIN answers a ON "
+                                           "a.question_id = r.ref WHERE r.source = 'question' AND r.n = ? "
+                                           "AND r.numbered_at <= ? ORDER BY r.numbered_at DESC LIMIT 1",
+                                           (n, prev.at or "9")).fetchone()
                     how[n] = f"answered via {row[0]}" if row else "gone"
                     if row:
                         refs[n] = row[1]
@@ -3421,9 +3627,15 @@ def question_of_band_number(store: QuestionStore, n: int) -> str:
     a number never shown, one allocated to an authority item or to a host (only a Levain question can be snoozed)."""
     with store._peek() as conn:
         row = None
+        freed = None
         if conn is not None and "band_items" in _tables(conn):
             row = conn.execute("SELECT source, ref FROM band_items WHERE n = ?", (n,)).fetchone()
+            if row is None and "band_items_retired" in _tables(conn):
+                freed = conn.execute("SELECT MAX(freed_at) FROM band_items_retired WHERE n = ?", (n,)).fetchone()[0]
     if row is None:
+        if freed is not None:
+            raise ConsentError(f"band number {n} is not in use: its item closed on {freed[:10]} and the number is "
+                               "free until a new item takes it")
         raise ConsentError(f"band number {n} was never shown")
     if row[0] != "question":
         raise ConsentError(f"band item {n} is a {row[0]} item, not a question: only a question can be snoozed "
