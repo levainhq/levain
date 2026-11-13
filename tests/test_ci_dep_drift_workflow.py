@@ -57,7 +57,8 @@ def _expand(value, ctx):
     return re.sub(r"\$\{\{(.*?)\}\}", sub, str(value))
 
 
-def _run_issue_step(tmp_path, *, code, drift_result, log_lines, existing="", repo="levainhq/levain"):
+def _run_issue_step(tmp_path, *, code, drift_result, log_lines, existing="", repo="levainhq/levain",
+                    python3_broken=False):
     """Run the reporter's issue step as the `report` job would; return (returncode, gh calls, the body handed to
     `gh issue create|comment`, stderr, the GH_REPO each gh call saw). ``code`` is the drift job's ``outputs.code`` and
     ``drift_result`` its ``result``: a job cut off by its timeout has code "" and result "cancelled"."""
@@ -83,7 +84,11 @@ def _run_issue_step(tmp_path, *, code, drift_result, log_lines, existing="", rep
         'exit 0\n')
     gh.chmod(0o755)
     # The reporter has no setup-python: ubuntu-24.04 has `python3` and no bare `python`, so the stub dir offers only python3.
-    (bindir / "python3").symlink_to(sys.executable)
+    if python3_broken:
+        (bindir / "python3").write_text('#!/bin/sh\necho "python3: simulated crash" >&2\nexit 3\n')
+        (bindir / "python3").chmod(0o755)
+    else:
+        (bindir / "python3").symlink_to(sys.executable)
     runner_temp = tmp_path / "rt"
     runner_temp.mkdir()
     if log_lines is not None:
@@ -148,7 +153,26 @@ def test_only_the_reporter_may_write_issues():
     wf = _workflow()
     assert wf["permissions"] == {"contents": "read"}
     assert "issues" not in (wf["jobs"]["drift"].get("permissions") or {})
-    assert wf["jobs"]["report"]["permissions"] == {"issues": "write", "contents": "read"}
+    # The reporter has no checkout, and a same-run artifact download takes no token scope, so it holds issues:write and nothing else.
+    assert wf["jobs"]["report"]["permissions"] == {"issues": "write"}
+
+
+def test_the_reporter_holds_no_scope_it_does_not_use():
+    report = _job("report")
+    assert set(report["permissions"]) == {"issues"}
+    assert not any(str(s.get("uses", "")).startswith("actions/checkout") for s in report["steps"])
+
+
+def test_the_cancelled_run_trade_off_is_written_above_the_reporters_if():
+    """A user cancelling the whole run files a "Did not finish" issue, on purpose: `!cancelled()` would also stop the reporter
+    after a timeout-cancel. The `if:` stays `always()`, and the reason sits on the line above it."""
+    lines = DRIFT_YML.read_text().splitlines()
+    report_at = lines.index("  report:")
+    if_at = next(i for i in range(report_at, len(lines)) if lines[i].startswith("    if:"))
+    above = lines[if_at - 1].strip()
+    assert above.startswith("#") and "cancelled" in above and "did-not-finish by design" in above, above
+    assert "!cancelled()" in above and "timeout-cancel" in above, above
+    assert _job("report")["if"].strip() == "${{ always() && github.repository == 'levainhq/levain' }}"
 
 
 def test_the_drift_job_still_fails_the_run_on_red_and_saves_its_log_for_the_reporter():
@@ -218,6 +242,81 @@ def test_a_red_night_with_no_result_line_says_the_script_died(tmp_path):
     assert rc == 0, err
     assert [c for c in calls if c.startswith("gh issue comment 7")], calls
     assert "none (the script died before printing one)" in body
+
+
+UNREADABLE = "The result line could not be read"
+
+
+@needs_bash
+@pytest.mark.parametrize("result_line", [
+    'DEP_DRIFT {"result": "red", "stage": "suite", "changed": [',          # truncated JSON
+    "DEP_DRIFT this is not json at all",                                    # not JSON
+    "DEP_DRIFT ",                                                           # nothing after the marker
+    'DEP_DRIFT {"result": "red", "stage": "suite", "failed_tests": []}',    # no `changed` key
+    'DEP_DRIFT {"result": "red", "changed": "foo 1.0 -> 1.1"}',             # `changed` is a string
+    'DEP_DRIFT {"result": "red", "changed": 5}',                            # `changed` is a number
+    'DEP_DRIFT {"result": "red", "changed": null}',                         # `changed` is null
+    "DEP_DRIFT [1, 2]",                                                     # valid JSON, not an object
+    'DEP_DRIFT "just a string"',
+], ids=["truncated", "not-json", "empty", "no-changed", "changed-string", "changed-number", "changed-null",
+        "array", "string"])
+def test_a_result_line_that_cannot_be_read_still_files_the_issue(tmp_path, result_line):
+    """The reporter runs under `set -euo pipefail`: a parser that raised on a bad result line would end the step before
+    `gh issue create`, and the night would be a red `report` job with no issue. The issue is filed, says the line could not
+    be read, and still carries the log tail."""
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="1", drift_result="failure",
+                                                  log_lines=["collecting ...", "the last log line", result_line])
+    assert rc == 0, err
+    assert "Traceback" not in err, err
+    assert any(c.startswith("gh issue create") for c in calls), calls
+    assert UNREADABLE in body
+    assert "the last log line" in body, "the log tail is still the evidence"
+    assert "Red on" in body, "the headline for a red night is unchanged"
+
+
+@needs_bash
+def test_a_result_line_that_cannot_be_read_comments_on_the_open_issue(tmp_path):
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="1", drift_result="failure",
+                                                  log_lines=["DEP_DRIFT {oops"], existing="7")
+    assert rc == 0, err
+    assert [c for c in calls if c.startswith("gh issue comment 7")], calls
+    assert UNREADABLE in body
+
+
+@needs_bash
+def test_a_readable_result_line_does_not_claim_it_could_not_be_read(tmp_path):
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="1", drift_result="failure",
+                                                  log_lines=[RESULT_LINE])
+    assert rc == 0, err
+    assert UNREADABLE not in body and "foo 1.0 -> 1.1" in body
+
+
+@needs_bash
+def test_a_parser_that_crashes_outright_still_files_the_issue(tmp_path):
+    """The belt under the braces: whatever kills the python call (a missing or broken interpreter), the step still files."""
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="1", drift_result="failure",
+                                                  log_lines=["the last log line", RESULT_LINE], python3_broken=True)
+    assert rc == 0, err
+    assert any(c.startswith("gh issue create") for c in calls), calls
+    assert UNREADABLE in body and "the last log line" in body
+
+
+@needs_bash
+@pytest.mark.parametrize("failed", ["5", '"tests/a.py::x"', "null", "{}"])
+def test_a_failed_tests_field_that_is_not_a_list_does_not_unread_the_whole_line(tmp_path, failed):
+    line = 'DEP_DRIFT {"result": "red", "stage": "suite", "changed": ["foo 1.0 -> 1.1"], "failed_tests": %s}' % failed
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="1", drift_result="failure", log_lines=[line])
+    assert rc == 0, err
+    assert UNREADABLE not in body and "foo 1.0 -> 1.1" in body
+    assert "Failing tests" not in body
+
+
+@needs_bash
+def test_an_empty_changed_list_is_a_readable_line_not_an_unreadable_one(tmp_path):
+    line = 'DEP_DRIFT {"result": "red", "stage": "suite", "changed": [], "failed_tests": ["tests/test_b.py::u"]}'
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="1", drift_result="failure", log_lines=[line])
+    assert rc == 0, err
+    assert UNREADABLE not in body and "likely flaky test" in body and "tests/test_b.py::u" in body
 
 
 @needs_bash
