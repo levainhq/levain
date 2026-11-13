@@ -2007,8 +2007,11 @@ class ChatService:
             # R9: on Claude each send is a boundary, its probing in this transaction, before the bytes; the first send
             # under activation's probing (H9) writes none (stage 2 gives that launch its verdict)
             first = _first_send_open(conn, m.launch_id)
+            role, _state, harness = _launch_state(conn, m.launch_id)
+            # built before the attempt row commits, so a stamp that cannot be read leaves the message pending
+            prefix = _room_context(m.message_id, now) if role == "room" else ""
             outbox_step(conn, now, m.message_id, "attempted", cause="attempt", op_id=op_id, vendor_anchor=anchor)
-            claude = _launch_state(conn, m.launch_id)[2] == "claude"
+            claude = harness == "claude"
             if not first and claude:
                 _boundary(conn, now, m.launch_id, "send")
         if claude:
@@ -2021,7 +2024,7 @@ class ChatService:
         # only the transaction whose attempted row committed reaches this call (the partial unique index)
         self._fault("attempt_committed")
         try:
-            state, cause, turn, item, signal = self._call(session, _command(m, op_id))
+            state, cause, turn, item, signal = self._call(session, _command(m, op_id, prefix))
         finally:
             unmark()
         if signal is None:
@@ -2768,6 +2771,16 @@ class ChatService:
         return state
 
 
-def _command(m: ChatMessage, op_id: str) -> SendCommand:
-    """The driver command for a message's one attempt."""
-    return SendCommand(op_id, m.body, tuple(a["sha256"] for a in m.attachments), m.mode, m.expected_turn_id)
+def _room_context(message_id: str, now: str) -> str:
+    """The block a ROOM seat is handed ahead of his words: the serve's local time, where the line came from, and the
+    message's own id (the one ``relay_to_desk`` and a proposal name his words by). It is code-written and goes only
+    into the bytes handed to the driver: the stored message, its digest and every quote of it stay his words alone, and
+    an imitation of this block inside his words is just his words (it follows the real block, after a blank line)."""
+    clock = parse_stamp(now).astimezone().strftime("%I:%M %p %a %b %d")
+    return f"<room-context>\n[{clock} \u00b7 via the Room (cockpit chat) \u00b7 message {message_id}]\n</room-context>\n\n"
+
+
+def _command(m: ChatMessage, op_id: str, prefix: str = "") -> SendCommand:
+    """The driver command for a message's one attempt: ``prefix`` (a room's context block; empty for a worker, whose
+    line is his body byte for byte) then the stored body."""
+    return SendCommand(op_id, prefix + m.body, tuple(a["sha256"] for a in m.attachments), m.mode, m.expected_turn_id)
