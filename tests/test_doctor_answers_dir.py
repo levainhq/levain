@@ -10,7 +10,10 @@ import pytest
 
 from levain import doctor
 
+from levain.slot.install_helper import operator_record_text
+
 ME, GID, OLD = 501, 4321, 8765
+OPERATOR = "opname"
 
 
 def st(mode=0o2750, uid=ME, gid=GID, kind=stat.S_IFDIR):
@@ -19,7 +22,9 @@ def st(mode=0o2750, uid=ME, gid=GID, kind=stat.S_IFDIR):
 
 @pytest.fixture
 def store(tmp_path):
+    """A store as setup leaves it: ``policy/operator`` names the operator, whose uid is ``ME``."""
     (tmp_path / "policy").mkdir()
+    (tmp_path / "policy" / "operator").write_text(operator_record_text(OPERATOR, ME))
     return tmp_path
 
 
@@ -92,6 +97,60 @@ def test_a_missing_directory_is_a_failure(store):
     assert not r.ok and "levain upgrade" in r.hint
 
 
-def test_run_as_root_is_not_asked(store):
+def test_root_reads_a_healthy_directory_as_the_recorded_operators(store):
     r = row(store, st(), uid=0)
-    assert r.neutral and r.ok
+    assert r.ok and not r.neutral and not r.warn
+
+
+@pytest.mark.parametrize("what,kw", [
+    ("world writable", {"mode": 0o2757}),
+    ("dispatch-owned", {"uid": ME + 1}),
+    ("root-owned", {"uid": 0}),
+    ("the old group", {"gid": OLD, "mode": 0o2750}),
+])
+def test_root_fails_a_bad_directory_instead_of_passing_it_neutral(store, what, kw):
+    r = row(store, st(**kw), uid=0)
+    assert not r.ok and not r.neutral, what
+
+
+def test_root_sees_the_old_shape_warn(store):
+    r = row(store, st(gid=OLD, mode=0o2770), uid=0)
+    assert r.ok and r.warn and not r.neutral
+
+
+@pytest.mark.parametrize("uid", [0, ME + 7])
+def test_owner_is_the_recorded_operator_for_every_invoker(store, uid):
+    """An admin who is not the operator reads a correct directory as correct."""
+    r = row(store, st(), uid=uid)
+    assert r.ok and not r.warn and not r.neutral
+
+
+def test_owning_the_directory_does_not_make_an_admin_the_operator(store):
+    r = row(store, st(uid=ME + 7), uid=ME + 7)
+    assert not r.ok and OPERATOR in r.detail
+
+
+def test_an_owner_mismatch_names_the_operator_not_you(store):
+    r = row(store, st(uid=ME + 1), uid=ME)
+    assert not r.ok
+    assert f"owner {OPERATOR}" in r.detail and "owner you" not in r.detail
+
+
+@pytest.mark.parametrize("write", [None, b"", b"not an operator record", b'{"format":"levain-operator/1","name":"x","uid":0}'])
+def test_no_established_operator_is_neutral_and_says_why(tmp_path, write):
+    (tmp_path / "policy").mkdir()
+    if write is not None:
+        (tmp_path / "policy" / "operator").write_bytes(write)
+    for uid in (0, ME):
+        r = row(tmp_path, st(), uid=uid)
+        assert r.neutral and r.ok and not r.warn
+        assert "operator" in r.detail and "record" in r.detail, r.detail
+
+
+def test_the_missing_group_hint_is_the_upgrade_verb(store):
+    def gone():
+        raise KeyError("_levain_qbroker")
+    rows = doctor._check_queue_answers(host="darwin", store=store, uid=ME, lstat=lambda p: st(),
+                                       qbroker_gid=gone, legacy_gid=lambda: OLD)
+    assert len(rows) == 1 and not rows[0].ok
+    assert "levain upgrade" in rows[0].hint
