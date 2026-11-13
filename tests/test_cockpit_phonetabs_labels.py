@@ -28,7 +28,7 @@ def test_every_phone_tab_shows_its_whole_label_and_the_strip_scrolls_not_wraps(t
     with rig.serving():
         values = [json.loads(v) for v in drive_touch(tmp_path, url, steps)["values"] if isinstance(v, str) and v.startswith("{")]
     got = values[-1]
-    assert [t["jump"] for t in got["tabs"]] == ["needs", "board", "notifications", "grants", "drop", "room"], got
+    assert [t["jump"] for t in got["tabs"]] == ["needs", "board", "notifications", "grants", "drop", "room", "desk"], got
     assert all(t["text"] for t in got["tabs"]), got
     assert not [t for t in got["tabs"] if t["cut"] or t["ellipsis"]], got   # every label whole
     assert got["wrap"] == "nowrap" and len(got["tops"]) == 1, got           # one row

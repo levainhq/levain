@@ -1426,6 +1426,7 @@
   const WRITE_TOKEN_KEY = "levain_write_token";
   let section = null, host = null, view = null;
   let roomSection = null, roomHost = null, roomView = null;     // RM-G2: the cockpit's one Claude room, beside the threads
+  let deskSection = null, deskHost = null, deskView = null;     // the Desk view (levain 33), a second full tab beside the Room
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -1457,6 +1458,7 @@
     const main = document.querySelector("main.frame");
     if (main) main.appendChild(section); else document.body.appendChild(section);
     buildRoom(main);
+    buildDesk(main);
   }
 
   // The Room tab (1106-51; Phill, signed row 273: "full-tab Room"): the room owns the whole tab. body.rv-on (dashboard.css) hides
@@ -1473,11 +1475,38 @@
     roomSection.appendChild(roomHost);
     if (main && main.parentNode) main.parentNode.insertBefore(roomSection, main.nextSibling); else document.body.appendChild(roomSection);
   }
+  // The Desk view (levain 33): a second full tab beside the Room, the same mechanism. body.dv-on (dashboard.css) hides the rest of
+  // the page but the app's own header and views strip; desk_tab_view.js mounts over GET /cockpit/desk.json and POST
+  // /cockpit/desk/send only while that is on and with a write token. It is NOT stopped when the page is hidden: it reads slower
+  // then (the view's own 12 s), so a reply that arrives while the phone is away is waiting. Entering one view leaves the other.
+  function buildDesk(main) {
+    if (!window.LevainDeskView) return;
+    deskSection = el("section", "dv-zone");
+    deskSection.dataset.zone = "desk";
+    deskSection.hidden = true;
+    deskHost = el("div", "dv-body-host");
+    deskSection.appendChild(deskHost);
+    if (main && main.parentNode) main.parentNode.insertBefore(deskSection, main.nextSibling); else document.body.appendChild(deskSection);
+  }
   function roomOn() { return document.body.classList.contains("rv-on"); }
+  function deskOn() { return document.body.classList.contains("dv-on"); }
+  function paintViewTabs() {
+    [["room", roomOn()], ["desk", deskOn()]].forEach((p) => {
+      document.querySelectorAll('[data-phone-jump="' + p[0] + '"]').forEach((b) => { if (p[1]) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
+    });
+  }
   function setRoom(on) {
     if (on === roomOn()) return;
     document.body.classList.toggle("rv-on", on);
-    document.querySelectorAll('[data-phone-jump="room"]').forEach((b) => { if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
+    if (on) document.body.classList.remove("dv-on");
+    paintViewTabs();
+    sync();
+  }
+  function setDesk(on) {
+    if (on === deskOn()) return;
+    document.body.classList.toggle("dv-on", on);
+    if (on) document.body.classList.remove("rv-on");
+    paintViewTabs();
     sync();
   }
 
@@ -1507,13 +1536,26 @@
         roomView = null;
       }
     }
+    if (deskSection) {
+      if (deskOn() && !token()) { setDesk(false); return; }   // the token went: the protected view leaves the page with it
+      const wantDesk = !!token() && deskOn();
+      deskSection.hidden = !deskOn();
+      if (wantDesk && !deskView) {
+        deskHost.replaceChildren();
+        const T = window.LevainCockpitTransport;
+        deskView = window.LevainDeskView.mount(deskHost, { headers: () => (T ? T.headers() : {}) });
+      } else if (!wantDesk && deskView) {
+        deskView.stop();
+        deskView = null;
+      }
+    }
   }
 
   function start() {
     if (!window.LevainThreadView || !document.querySelector("main.frame")) return;
     build();
     let lastMode = document.body.dataset.mode;
-    new MutationObserver(() => { if (document.body.dataset.mode !== lastMode) { lastMode = document.body.dataset.mode; setRoom(false); } sync(); }).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
+    new MutationObserver(() => { if (document.body.dataset.mode !== lastMode) { lastMode = document.body.dataset.mode; setRoom(false); setDesk(false); } sync(); }).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
     // the Room tab enters the Room (captured, so the page's own jump never also scrolls to it); every other views tab and every mode tab leaves it
     document.addEventListener("click", (ev) => {
       const t = ev.target && ev.target.closest ? ev.target : null;
@@ -1522,14 +1564,19 @@
         if (!roomSection || !token()) return;
         ev.stopPropagation();
         setRoom(true);
-      } else if (jump || (t && t.closest("[data-mode-tab]"))) setRoom(false);
+      } else if (jump && jump.dataset.phoneJump === "desk") {
+        if (!deskSection || !token()) return;
+        ev.stopPropagation();
+        setDesk(true);
+      } else if (jump || (t && t.closest("[data-mode-tab]"))) { setRoom(false); setDesk(false); }
     }, true);
     // a mode shortcut (1-4) that re-selects the mode already showing changes no attribute, so it is caught here: it leaves the Room too
     document.addEventListener("keydown", (ev) => {
-      if (!roomOn() || ev.metaKey || ev.ctrlKey || ev.altKey || !/^[1-4]$/.test(ev.key)) return;
+      if (!(roomOn() || deskOn()) || ev.metaKey || ev.ctrlKey || ev.altKey || !/^[1-4]$/.test(ev.key)) return;
       const a = document.activeElement, tag = a && a.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (a && a.isContentEditable)) return;
       setRoom(false);
+      setDesk(false);
     }, true);
     document.addEventListener("visibilitychange", sync);
     window.addEventListener("storage", (e) => { if (e.key === WRITE_TOKEN_KEY) sync(); });
