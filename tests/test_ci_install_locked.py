@@ -88,6 +88,56 @@ def test_pip_is_pinned_to_an_exact_version_beside_uv(tmp_path):
     assert "--upgrade pip " not in boot + " "
 
 
+def _req_names(reqs):
+    return {re.split(r"[<>=!~ ;\[]", r.strip(), maxsplit=1)[0].lower().replace("_", "-") for r in reqs}
+
+
+@pytest.mark.skipif(not os.path.exists(BASH), reason="needs /bin/bash")
+def test_the_project_installs_editable_last_with_a_backend_the_locked_build_group_supplies(tmp_path):
+    """The shard jobs install ONLY through this script, so `import levain` works because of its last line (the editable
+    install, after both hashed installs) and that install builds without isolation, so the project's own backend
+    ([build-system].requires) must be in the `build` group the script installs from the lock first."""
+    proc, calls = _run(tmp_path, "dev", "openhands")
+    assert proc.returncode == 0, proc.stderr
+    pips = [c for c in calls if c.startswith("python -m pip install")]
+    assert pips[-1].endswith("--no-deps --no-build-isolation -e ."), pips
+    assert [("--require-hashes" in c) for c in pips[-3:-1]] == [True, True], pips
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    backend = _req_names(pyproject["build-system"]["requires"])
+    assert backend and backend <= _req_names(pyproject["dependency-groups"]["build"]), (
+        "the editable install runs with --no-build-isolation: its backend must come from the build group")
+    assert backend <= {n.lower() for n in _lock_versions()}
+
+
+def test_the_test_jobs_install_only_through_the_script_and_with_the_dev_extra():
+    import yaml
+    jobs = yaml.safe_load((ROOT / ".github" / "workflows" / "test.yml").read_text())["jobs"]
+    for name in ("stage0", "test"):
+        lines = [ln.strip() for s in jobs[name]["steps"] if isinstance(s.get("run"), str) for ln in s["run"].splitlines()]
+        via_script = [ln for ln in lines if "ci_install_locked.sh" in ln]
+        assert via_script and all(re.search(r"ci_install_locked\.sh\s.*\bdev\b", ln) for ln in via_script), (name, via_script)
+        # the one other pip install is the hashed root-python h11 file; nothing else resolves or installs the project
+        stray = [ln for ln in lines if re.search(r"\bpip\b.*\binstall\b", ln) and "requirements-ci-root-h11.txt" not in ln]
+        assert not stray, (name, stray)
+
+
+def test_the_dev_extra_and_the_py39_file_hold_what_the_workflow_tests_import():
+    """tests/test_ci_dep_drift_workflow.py imports yaml (PyYAML) and, below Python 3.11, tomli. The 3.12 and 3.13 jobs get
+    PyYAML from the `dev` extra and tomllib from the standard library. The py39 job installs requirements-ci-py39.txt, has
+    tomli but no PyYAML, and never selects these two files: the closure selects only test files that import a levain
+    module (tests/ci/root_closure.py `_test_files`), and neither imports one."""
+    import ast
+    dev = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]["dev"]
+    assert {"pytest", "pytest-xdist", "pyyaml"} <= _req_names(dev)
+    assert {"pytest", "pytest-xdist", "pyyaml"} <= {n.lower() for n in _lock_versions()}
+    assert {"tomli", "pytest"} <= set(_py39_pins())
+    for name in ("test_ci_dep_drift_workflow.py", "test_ci_install_locked.py"):
+        tree = ast.parse((ROOT / "tests" / name).read_text())
+        imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+        assert not any(m == "levain" or m.startswith("levain.") for m in imported), (name, imported)
+
+
 # --- requirements-ci-py39.txt -------------------------------------------------------------------------------------------
 
 PY39 = ROOT / "requirements-ci-py39.txt"

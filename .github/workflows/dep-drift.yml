@@ -4,6 +4,10 @@ name: dep-drift
 # (scripts/ci_install_locked.sh); this workflow re-resolves in the runner without committing anything, runs the suite on
 # that, and on red keeps ONE open `dep-drift` issue: a comment per red night naming every package whose version
 # changed against the committed lock, closed by the first green night. The same logic runs on a laptop: scripts/dep_drift.py prints a last line `DEP_DRIFT {json}`.
+#
+# Two jobs, on purpose: `drift` runs the suite and `report` files the issue. A reporter step inside the drift job would
+# share its timeout, and a step of a job that the timeout is cancelling has no guaranteed budget to run in; a job of its
+# own (needs: drift, if: always()) starts after the drift job has ended however it ended.
 
 on:
   schedule:
@@ -12,7 +16,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: dep-drift
@@ -26,8 +29,11 @@ jobs:
     runs-on: ubuntu-24.04
     # Not the 60 the sharded jobs get: this one runs the WHOLE suite on one runner, which test.yml's own comment puts at
     # ~55-67 min unsharded, before the install and the re-resolve. A cap under that cancels the job with no result line
-    # (the issue step below still runs on a cancel, and says the job did not finish). Revisit if the suite grows past it.
+    # (the `report` job below still runs after a cancel, and says the job did not finish). Revisit if the suite grows past it.
     timeout-minutes: 120
+    outputs:
+      # empty exactly when the drift step never finished (a timeout, a cancel or a failed setup step)
+      code: ${{ steps.drift.outputs.code }}
     steps:
       - uses: actions/checkout@v6
 
@@ -57,14 +63,51 @@ jobs:
         env:
           LEVAIN_TEST_WAIT_SCALE: "2"
 
-      - name: File, update or close the one dep-drift issue
-        # always(): a timeout, a cancel or a failed setup step ends the job before the drift step writes its exit
-        # code, and those are the nights that must not pass in silence. DRIFT_CODE is empty exactly then.
+      - name: Keep the drift log for the reporter
+        # Best effort: the reporter is another runner and cannot read this one's disk. On a hard timeout this step may
+        # get no time to run, and the reporter then files the issue without a log tail.
         if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: drift-log
+          path: ${{ runner.temp }}/drift.log
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Fail the run when the drift was red
+        if: always() && steps.drift.outputs.code != '0'
+        run: exit 1
+
+  report:
+    name: report the night to the dep-drift issue
+    needs: drift
+    # always(): this job runs whatever became of `drift` (green, red, cancelled by its timeout, a failed setup step).
+    # The repository guard is the drift job's own: always() would otherwise also run it on a fork, where drift is skipped.
+    if: ${{ always() && github.repository == 'levainhq/levain' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+      contents: read
+    steps:
+      - name: Fetch the drift log
+        # No checkout in this job (it must not depend on the thing that may have failed), so no step needs the repo.
+        # A night with no saved log is still reported, which is why a failed download is not a failure.
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: drift-log
+          path: ${{ runner.temp }}/drift-log
+
+      - name: File, update or close the one dep-drift issue
         env:
           GH_TOKEN: ${{ github.token }}
-          DRIFT_CODE: ${{ steps.drift.outputs.code }}
-          JOB_STATUS: ${{ job.status }}
+          # No checkout means no git remote, and gh reads GH_REPO (not GITHUB_REPOSITORY) when it has none.
+          GH_REPO: ${{ github.repository }}
+          # DRIFT_CODE is empty exactly when the drift step never wrote its exit code; JOB_STATUS is how that job ended.
+          DRIFT_CODE: ${{ needs.drift.outputs.code }}
+          JOB_STATUS: ${{ needs.drift.result }}
         run: |
           set -euo pipefail
           day="$(date -u +%F)"
@@ -78,8 +121,11 @@ jobs:
             fi
             exit 0
           fi
-          log="$RUNNER_TEMP/drift.log"
-          [ -f "$log" ] || : > "$log"
+          log="$RUNNER_TEMP/drift-log/drift.log"
+          if [ ! -f "$log" ]; then
+            mkdir -p "$RUNNER_TEMP/drift-log"
+            : > "$log"
+          fi
           line="$(grep '^DEP_DRIFT ' "$log" | tail -1 || true)"
           {
             if [ -z "$DRIFT_CODE" ]; then
@@ -94,7 +140,7 @@ jobs:
             echo "Result line: \`${line:-none (the script died before printing one)}\`"
             echo
             if [ -n "$line" ]; then
-              printf '%s' "${line#DEP_DRIFT }" | python -c '
+              printf '%s' "${line#DEP_DRIFT }" | python3 -c '
           import json, sys
           d = json.load(sys.stdin)
           if d["changed"]:
@@ -123,7 +169,3 @@ jobs:
           else
             gh issue create --title "$title" --label dep-drift --body-file "$RUNNER_TEMP/body.md"
           fi
-
-      - name: Fail the run when the drift was red
-        if: always() && steps.drift.outputs.code != '0'
-        run: exit 1
