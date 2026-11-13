@@ -1251,7 +1251,7 @@ def _check_slot_alarms(*, host: str | None = None, store: Path | None = None, no
         return [CheckResult(name, True, f"could not be read ({type(exc).__name__}: {exc})",
                             f"Look at {log_path}.", warn=True)]
     try:
-        recent, suppressed, summarised = [], {}, ""
+        recent, suppressed, summarised = [], {}, {}
         for rec in operator.alarms(store / "queue"):
             try:
                 at = parse_stamp(rec.get("at"))
@@ -1261,7 +1261,7 @@ def _check_slot_alarms(*, host: str | None = None, store: Path | None = None, no
                 continue
             if "suppressed" in rec:
                 suppressed[str(rec.get("slot"))] = rec["suppressed"]
-                summarised = str(rec.get("at"))
+                summarised[str(rec.get("slot"))] = str(rec.get("at"))   # each slot's own latest summary time
             else:
                 recent.append(rec)
     except operator.OperatorError as exc:
@@ -1283,8 +1283,10 @@ def _check_slot_alarms(*, host: str | None = None, store: Path | None = None, no
                    f"({last.get('reason')})")
     if more:
         # a summary's count runs from the start of the slot's 24-hour alarm budget, not from the start of this row's window
+        # the count is summed over slots, so no one slot's time stands for it: name the oldest and the newest of the latest
+        stamps = sorted(summarised.values())
         detail += (f"; at least {more} more suppressed (each slot's running count since its alarm budget began, "
-                   f"as of its latest summary, the last at {summarised})")
+                   f"as of that slot's latest summary: the oldest at {stamps[0]}, the newest at {stamps[-1]})")
     return [CheckResult(name, True, detail,
                         f"A slot session's hook blocked something and reported it. Every record is in {log_path}.",
                         warn=True)]
