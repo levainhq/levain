@@ -410,3 +410,67 @@ def test_a_run_that_finished_at_once_cleanly_is_recorded_too(agent, monkeypatch,
     an_hour_later()
     s2, c2 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
     assert s2 == [] and "[germinate]" not in c2
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_the_ids_recorded_are_the_ones_the_spawn_was_handed(agent, monkeypatch, tmp_path):
+    """`start_germinate` records what it is given, not what some later `due_agendas` call left behind."""
+    h = _load(agent).hook
+    root, st, anchor, follower, _ = _ring_rig(tmp_path)
+    monkeypatch.setattr(h.subprocess, "Popen", lambda argv, **kw: _Child(None))
+    monkeypatch.setattr(h, "install_root", lambda: tmp_path)
+    rows = st.list_open()
+    ids = h.ring_only_ids(h.due_agendas(rows), rows)
+    assert ids == [follower]
+    h.due_agendas([])                                  # a second call between the two: it must change nothing recorded
+    assert h.start_germinate(agent, ids) == "started"
+    assert json.loads((root / ".levain" / ".germinate-ringed").read_text())["ids"] == [follower]
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_spawn_handed_no_ids_records_nothing(agent, monkeypatch, tmp_path):
+    h = _load(agent).hook
+    root, st, anchor, follower, _ = _ring_rig(tmp_path)
+    monkeypatch.setattr(h.subprocess, "Popen", lambda argv, **kw: _Child(None))
+    monkeypatch.setattr(h, "install_root", lambda: tmp_path)
+    h.due_agendas(st.list_open())                      # a call that found a ring-only part, then a spawn that was not told
+    assert h.start_germinate(agent) == "started"
+    assert not (root / ".levain" / ".germinate-ringed").exists()
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_the_day_record_is_written_by_a_replace_and_leaves_no_temp_file(agent, monkeypatch, tmp_path):
+    h = _load(agent).hook
+    (tmp_path / ".levain").mkdir()
+    monkeypatch.setattr(h, "install_root", lambda: tmp_path)
+    real, seen = h.os.replace, []
+
+    def spy(src, dst):
+        seen.append((Path(src), Path(dst)))
+        assert not Path(dst).exists() or json.loads(Path(dst).read_text())     # the target is never a torn file at the swap
+        return real(src, dst)
+
+    monkeypatch.setattr(h.os, "replace", spy)
+    h.note_germinate_ringed(["intention-1"])
+    h.note_germinate_ringed(["intention-2"])
+    rec = tmp_path / ".levain" / ".germinate-ringed"
+    assert [d for _, d in seen] == [rec, rec] and all(s.parent == rec.parent and s != rec for s, _ in seen)
+    assert json.loads(rec.read_text())["ids"] == ["intention-1", "intention-2"]
+    assert sorted(p.name for p in rec.parent.iterdir()) == [".germinate-ringed"]
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_failed_swap_keeps_the_old_record_and_leaves_no_temp_file(agent, monkeypatch, tmp_path):
+    h = _load(agent).hook
+    (tmp_path / ".levain").mkdir()
+    monkeypatch.setattr(h, "install_root", lambda: tmp_path)
+    h.note_germinate_ringed(["intention-1"])
+    rec = tmp_path / ".levain" / ".germinate-ringed"
+    before = rec.read_text()
+
+    def refuse(src, dst):
+        raise OSError("no")
+
+    monkeypatch.setattr(h.os, "replace", refuse)
+    h.note_germinate_ringed(["intention-2"])           # best effort: it neither raises nor damages the record
+    assert rec.read_text() == before and sorted(p.name for p in rec.parent.iterdir()) == [".germinate-ringed"]

@@ -403,7 +403,13 @@ def test_a_target_the_verb_does_not_allow_gets_its_own_answer_with_or_without_a_
     assert _Counting.calls == 0
 
 
-@pytest.mark.parametrize("exc", [OSError("x"), ValueError("x"), TypeError("x"), RuntimeError("x"), KeyError("x"), AttributeError("x")])
+def _read_faults() -> list[Exception]:
+    from anneal_memory.spores import IntentionError
+
+    return [OSError("x"), ValueError("x"), TypeError("x"), RuntimeError("x"), KeyError("x"), AttributeError("x"), IntentionError("x")]
+
+
+@pytest.mark.parametrize("exc", _read_faults(), ids=lambda e: type(e).__name__)
 def test_waiting_on_reports_any_read_fault_as_a_transient_fault(intentions: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
     import levain.intentions as li
 
@@ -413,3 +419,16 @@ def test_waiting_on_reports_any_read_fault_as_a_transient_fault(intentions: Path
     monkeypatch.setattr(li, "list_open_readonly", boom)
     with pytest.raises(TransientApplyFault):
         IntentionEffectStore(intentions).waiting_on("intention-001")
+
+
+@pytest.mark.parametrize("exc", _read_faults(), ids=lambda e: type(e).__name__)
+def test_snapshot_and_waiting_on_answer_the_same_read_faults(intentions: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    """The two reads share one set of faults: a fault one wraps, the other wraps (they cannot drift apart)."""
+    store = IntentionEffectStore(intentions)
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(store._store, "get_by_origin_key", boom)
+    with pytest.raises(TransientApplyFault):
+        store.snapshot("intention:k.a")

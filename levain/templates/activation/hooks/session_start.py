@@ -180,9 +180,11 @@ def main() -> int:
             try:
                 # Agenda germination (TS-3): a dated agenda that has come due is put in front of him by a detached,
                 # fail-soft `levain intentions germinate`; spawned ONLY when one is due, one spawn per session start.
-                n = len(hook.due_agendas(hook.open_agendas()))
+                rows = hook.open_agendas()
+                due = hook.due_agendas(rows)
+                n = len(due)
                 if n:
-                    st = hook.start_germinate('claude_code')
+                    st = hook.start_germinate('claude_code', hook.ring_only_ids(due, rows))
                     plural = 's' if n != 1 else ''
                     if st == 'started':
                         sections.append(f"[germinate] {n} agenda{plural} came due; germination started")

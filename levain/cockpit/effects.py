@@ -458,6 +458,15 @@ def _keeps_disposition(effect: Effect) -> bool:
     return "disposition" in effect.changes and "disposition" not in effect.writes
 
 
+def _read_faults() -> tuple[type[BaseException], ...]:
+    """The faults a read of the intention store can raise that mean "could not read it now", not a verdict about the request:
+    ``snapshot`` and ``waiting_on`` both wrap exactly these into a ``TransientApplyFault`` (one tuple, so the two reads cannot
+    drift apart). A function because anneal is imported lazily in this module."""
+    from anneal_memory.spores import IntentionError
+
+    return (IntentionError, OSError, ValueError, TypeError, RuntimeError, KeyError, AttributeError)
+
+
 class IntentionEffectStore:
     """The ``EffectStore`` over an anneal ``IntentionStore`` (§4.1.2's anneal mapping). Versions are the
     cockpit's own row version (``providers.intention_row_version``), which anneal recomputes under its
@@ -482,13 +491,11 @@ class IntentionEffectStore:
     # -- reads --
 
     def snapshot(self, resource_key: str) -> Snapshot:
-        from anneal_memory.spores import IntentionError
-
         key = _origin_key_of(resource_key)
         try:
             row = self._store.get_by_origin_key(key) if self.path.exists() else None
             return Snapshot(row, None if row is None else self.version_of(copy.deepcopy(row)))
-        except (IntentionError, OSError, ValueError, TypeError) as exc:
+        except _read_faults() as exc:
             raise TransientApplyFault.of(exc) from exc
 
     def waiting_on(self, anchor_id: str) -> list[str]:
@@ -499,7 +506,7 @@ class IntentionEffectStore:
 
         try:
             return [str(s.get("id")) for s in followers_of(list_open_readonly(self.path), anchor_id)] if self.path.exists() else []
-        except (OSError, ValueError, TypeError, RuntimeError, KeyError, AttributeError) as exc:
+        except _read_faults() as exc:
             raise TransientApplyFault.of(exc) from exc
 
     def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:

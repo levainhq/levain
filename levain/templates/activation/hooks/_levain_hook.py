@@ -1157,19 +1157,15 @@ def _check_by_late(s: dict, today) -> bool:
     return day is not None and day <= today
 
 
-_ring_pending: list[str] = []     # the check-by-only ids of the last `due_agendas` call: `start_germinate` records them once it spawns
-
-
 def due_agendas(intentions: list, now: datetime | None = None, ringed: tuple | set | frozenset | None = None) -> list[dict]:
     """Open AGENDA intentions that have come due and are not yet germinated (TS-3): a date-only `next` on or before
     today, a timed `next` (YYYY-MM-DDTHH:MM, local) from that minute; no `next`, a malformed one or a stamped
     `germinated` is never due. An agenda that waits on an event (`on_event`) is never due by a date: it is due when
     `_event_due` says so, except that a part due ONLY by its check-by whose id is in `ringed` (default: today's record,
     `germinate_ringed`, written by `start_germinate` when it spawns) is not due again today: its run files the band question
-    once and the part stays unstamped until the operator answers, so a second run the same day is a no-op. The ids this call
-    found due only by their check-by are left in `_ring_pending` for `start_germinate`. Mirrors levain.germinate.is_due (this
-    file is stranger-side and imports nothing of it)."""
-    global _ring_pending
+    once and the part stays unstamped until the operator answers, so a second run the same day is a no-op. The caller that
+    spawns a run takes the check-by-only ids from `ring_only_ids` and hands them to `start_germinate`. Mirrors
+    levain.germinate.is_due (this file is stranger-side and imports nothing of it)."""
     now = now or datetime.now()
     if ringed is None:
         ringed = germinate_ringed(now)
@@ -1194,7 +1190,6 @@ def due_agendas(intentions: list, now: datetime | None = None, ringed: tuple | s
             continue
         if now >= when:
             due.append(s)
-    _ring_pending = ring_only_ids(due, intentions)
     return due
 
 
@@ -1223,18 +1218,29 @@ def germinate_ringed(now: datetime | None = None) -> set[str]:
 def note_germinate_ringed(ids: list, now: datetime | None = None) -> None:
     """Record today that a run was started for these check-by-only parts, so their next session starts of the day do not spawn
     another no-op run (germinate files the part's band question once; it is idempotent by origin key). One record per day
-    (the day rolls it over: a question still unanswered tomorrow gets one run tomorrow). Best effort: a failed write costs
-    only the redundant run it would have spared."""
+    (the day rolls it over: a question still unanswered tomorrow gets one run tomorrow). Written to a temp file beside the
+    record and swapped in with `os.replace`, so a reader never sees a torn file. Best effort: a failed write costs only the
+    redundant run it would have spared."""
     if not ids:
         return
+    tmp = None
     try:
         day = (now or datetime.now()).date().isoformat()
         path = _germinate_ringed_path()
         merged = sorted(germinate_ringed(now) | {str(i) for i in ids})
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"day": day, "ids": merged}), encoding="utf-8")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"day": day, "ids": merged}), encoding="utf-8")
+        os.replace(tmp, path)
+        tmp = None
     except OSError:
         pass
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def open_agendas(timeout: float = 2.0) -> list[dict]:
@@ -1243,13 +1249,14 @@ def open_agendas(timeout: float = 2.0) -> list[dict]:
     return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
 
 
-def start_germinate(agent: str = "claude_code") -> str:
+def start_germinate(agent: str = "claude_code", ring_ids: list | tuple = ()) -> str:
     """Spawn `levain intentions germinate` detached for THIS install. Returns "started" (the child was alive after a short
     grace, or exited 0), "busy" (another start spawned one within the last minute: germinate is idempotent by origin_key,
     this only spares a pile of redundant children) or "failed" (Popen raised, or the child died non-zero at once, e.g.
     no `levain` for this interpreter). Known edges, closed: the child's own later failure is the doctor row's to report;
     a due agenda reaches the first turn only if the child files its band row before UserPromptSubmit (the next prompt
     renders it otherwise)."""
+    # `ring_ids`: the parts due only by their check-by (`ring_only_ids`), recorded for the day once the spawn holds, and only then
     root = install_root()
     marker = Path(root) / ".levain" / ".germinate-spawn"
 
@@ -1284,13 +1291,13 @@ def start_germinate(agent: str = "claude_code") -> str:
     try:
         rc = proc.wait(timeout=0.4)
     except subprocess.TimeoutExpired:
-        note_germinate_ringed(_ring_pending)
+        note_germinate_ringed(list(ring_ids))
         return "started"
     except Exception:
         _drop()
         return "failed"
     if rc == 0:
-        note_germinate_ringed(_ring_pending)
+        note_germinate_ringed(list(ring_ids))
         return "started"
     _drop()
     return "failed"

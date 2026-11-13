@@ -330,7 +330,11 @@ def test_nothing_that_is_not_the_disposition_word_changed_in_those_files(both_in
                     f"{rel}: an old line lost that is not about the rename: {line!r}"
         else:
             for line in _changed_lines(a, b):
-                about_the_rename = RENAME_WORDS.search(line) or (
+                # the one feature line the session-start hooks gained after the old release: the agenda count is taken from the
+                # list that is also handed to the spawn (no rename word in it)
+                about_the_rename = RENAME_WORDS.search(line) or line.strip() in (
+                    "n = len(hook.due_agendas(hook.open_agendas()))", "rows = hook.open_agendas()",
+                    "due = hook.due_agendas(rows)", "n = len(due)") or (
                     rel in DOC_RENAME.values() and RETIRED_DISPOSITION_IN_DOC.search(line))
                 assert about_the_rename, f"{rel}: a changed line that is not about the rename: {line!r}"
         # the install's `seed/` directory is not a disposition: every path through it survives
@@ -474,9 +478,13 @@ def test_an_old_hook_set_and_a_new_one_each_work_whole_and_a_mixed_set_goes_dark
         hook_gen, start_gen, prompt_gen = gens
         assert (_DORMANT in got["start"]) == (start_gen == hook_gen), (gens, got["start"])
         assert (_COLLISION in got["prompt"]) == (prompt_gen == hook_gen), (gens, got["prompt"])
-        # the agenda surface calls only names the rename did not touch (due_agendas, open_agendas, start_germinate), so it
-        # survives a mixed set: what it spawns is the noun of the generation of `_levain_hook.py`, and what it prints on a
-        # refusal is the noun of the generation of `session_start.py`
+        # the agenda surface survives most mixed sets: what it spawns is the noun of the generation of `_levain_hook.py`, and
+        # what it prints on a refusal is the noun of the generation of `session_start.py`. The one exception is a NEW
+        # `session_start.py` over an OLD `_levain_hook.py`: it asks the hook for `ring_only_ids` (a name the old hook lacks),
+        # raises an AttributeError the hook swallows, and the surface goes dark like every other one in this matrix
+        if hook_gen == "old" and start_gen == "new":
+            assert got["spawned"] == "" and "[germinate]" not in got["start"], (gens, got["spawned"], got["start"])
+            continue
         spawn_noun = "spores" if hook_gen == "old" else "intentions"
         print_noun = "spores" if start_gen == "old" else "intentions"
         assert f"{spawn_noun} germinate" in got["spawned"], (gens, got["spawned"])
