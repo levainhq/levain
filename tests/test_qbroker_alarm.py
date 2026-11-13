@@ -115,7 +115,8 @@ def test_every_slots_budget_fits_the_log_at_the_largest_record():
                                    "slot": {"class": "egress", "index": 32}, "session": "s-" + "f" * 62,
                                    "suppressed": 10**9})) + 1
     most_suppressed = qbroker.ALARM_RATE * qbroker.ALARM_BUDGET_WINDOW + qbroker.ALARM_BURST
-    summaries = int(math.log2(most_suppressed)) + 1                # one at each doubling of the count
+    # one at each doubling of the count, and at most one per ALARM_SUMMARY_INTERVAL besides
+    summaries = int(math.log2(most_suppressed)) + 1 + math.ceil(qbroker.ALARM_BUDGET_WINDOW / qbroker.ALARM_SUMMARY_INTERVAL)
     per_slot = qbroker.ALARM_SLOT_BUDGET * biggest + summaries * summary
     # the newest ALARM_LOG_MAX - biggest bytes always survive a roll
     assert MAX_SLOTS * per_slot <= ALARM_LOG_MAX - biggest
@@ -412,3 +413,115 @@ def test_doctor_is_quiet_with_no_recent_alarm(L, broker, clock):
 
 def test_doctor_has_no_row_before_the_isolation_install(tmp_path):
     assert doctor._check_slot_alarms(store=tmp_path, now=NOW) == []
+
+
+# --- DIOGAP C1: a known cap that stops resolving stops being known ------------------------------------------------
+
+def _drain_unseen_bucket(b):
+    for i in range(3 * qbroker.ALARM_BURST):                         # bad caps at one instant: the unseen bucket runs dry
+        assert alarm(b, cap=f"bad-{i}")["refused"] in ("cap-unknown", "rate-limited")
+
+
+def test_c1_a_known_cap_that_still_resolves_stays_known_and_uncharged(L, resolver, clock):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    assert alarm(b, reason="first")["ok"] is True
+    _drain_unseen_bucket(b)
+    before = len(resolver.calls)
+    for _ in range(20):                                              # each frame a CONTROL round trip, never charged
+        mono["t"] += qbroker.RESOLVE_TTL + 0.1
+        assert alarm(b, reason="first")["ok"] is True
+    assert len(resolver.calls) - before == 20 and len(records(L)) == 1
+
+
+def test_c1_a_cap_that_stopped_resolving_pays_the_unseen_bucket_and_rejoins_when_it_resolves_again(L, resolver, clock):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    assert alarm(b, reason="first")["ok"] is True
+    saved = dict(resolver.caps)
+    resolver.caps.clear()                                            # its session ended
+    mono["t"] += qbroker.RESOLVE_TTL + 0.1
+    assert alarm(b, reason="gone")["refused"] == "cap-unknown"       # evicted here
+    _drain_unseen_bucket(b)
+    mono["t"] += qbroker.RESOLVE_TTL + 0.1
+    calls = len(resolver.calls)
+    assert alarm(b, reason="gone-2")["refused"] == "rate-limited"    # no longer known: the empty bucket stops it ...
+    assert len(resolver.calls) == calls                              # ... before a CONTROL round trip
+    resolver.caps.update(saved)                                      # the session is back (a new session, same cap)
+    mono["t"] += 1.0 / qbroker.ALARM_RATE
+    assert alarm(b, reason="back")["ok"] is True                     # one unseen token paid, resolves, known again
+    _drain_unseen_bucket(b)
+    mono["t"] += qbroker.RESOLVE_TTL + 0.1
+    assert alarm(b, reason="back-2")["ok"] is True                   # known: the dry bucket does not stop it
+
+
+# --- DIOGAP D3: a slot that keeps being suppressed keeps reaching the log -------------------------------------------
+
+def _flood_past_budget(b, mono, n):
+    for i in range(qbroker.ALARM_SLOT_BUDGET + n):
+        mono["t"] += 1.0 / qbroker.ALARM_RATE
+        assert alarm(b, reason=f"flood{i}")["ok"] is True
+
+
+def _summaries(L):
+    return [r for r in records(L) if "suppressed" in r]
+
+
+def test_d3_a_suppressed_alarm_an_hour_after_the_last_summary_writes_a_new_one_and_only_one(L, resolver, clock):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    _flood_past_budget(b, mono, 64)
+    assert [r["suppressed"] for r in _summaries(L)] == [1, 2, 4, 8, 16, 32, 64]
+    mono["t"] += qbroker.ALARM_SUMMARY_INTERVAL - 120                 # inside the hour: counted, not written
+    for i in range(3):
+        mono["t"] += 1.0 / qbroker.ALARM_RATE
+        assert alarm(b, reason=f"soon{i}")["ok"] is True
+    assert [r["suppressed"] for r in _summaries(L)][-1] == 64
+    mono["t"] += 120                                                  # past the hour: the next suppressed alarm writes
+    assert alarm(b, reason="hour")["ok"] is True
+    assert [r["suppressed"] for r in _summaries(L)][-1] == 64 + 3 + 1
+    for i in range(5):                                                # and the hour restarts from it
+        mono["t"] += 1.0 / qbroker.ALARM_RATE
+        assert alarm(b, reason=f"after{i}")["ok"] is True
+    assert [r["suppressed"] for r in _summaries(L)][-1] == 64 + 3 + 1
+
+
+def test_d3_an_interval_summary_does_not_move_the_next_doubling(L, resolver, clock):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    _flood_past_budget(b, mono, 64)
+    mono["t"] += qbroker.ALARM_SUMMARY_INTERVAL
+    assert alarm(b, reason="hour")["ok"] is True                      # count 65, written by the interval
+    for i in range(128 - 65):
+        mono["t"] += 1.0 / qbroker.ALARM_RATE
+        assert alarm(b, reason=f"more{i}")["ok"] is True
+    assert [r["suppressed"] for r in _summaries(L)][-2:] == [65, 128]
+
+
+def test_d3_the_summary_line_keeps_its_shape_and_the_row_reads_an_older_log(L, resolver, clock):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    _flood_past_budget(b, mono, 1)
+    [summary] = _summaries(L)
+    assert set(summary) == {"format", "at", "slot", "session", "suppressed"}     # the shape an older levain wrote
+    store = QueueStore(L / "queue")
+    stamp = (clock["fn"]() - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    old = {"format": qbroker.ALARM_FORMAT, "at": stamp, "slot": {"class": "egress", "index": 2},
+           "session": "s-old", "suppressed": 4}                                   # written by a levain before this change
+    store.append_alarm(old)
+    [row] = doctor._check_slot_alarms(store=L, now=clock["fn"]())
+    assert row.warn and "at least 5 more suppressed" in row.detail
+
+
+def test_d3_the_row_says_what_the_count_is_and_when_it_was_last_written(L, resolver, clock):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    t0 = clock["now"]
+    _flood_past_budget(b, mono, 64)
+    mono["t"] += 23 * 3600
+    clock["now"] = t0 + timedelta(hours=23)
+    assert alarm(b, reason="late")["ok"] is True
+    [row] = doctor._check_slot_alarms(store=L, now=t0 + timedelta(hours=24, minutes=30))
+    assert row.warn and "at least 65 more suppressed" in row.detail
+    assert "running count since its alarm budget began" in row.detail
+    assert [r["at"] for r in _summaries(L)][-1] in row.detail

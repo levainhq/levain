@@ -36,7 +36,8 @@ other shape is ``frame-malformed``. A cap that has resolved on this slot's ALARM
 drain the real hook's tokens; any other cap first takes one token from the slot's unseen-cap bucket (its own, at
 :data:`ALARM_RATE` and :data:`ALARM_BURST`), so the CONTROL round trips that unseen caps cause are bounded by it, and
 joins those caps when it resolves. A frame whose
-cap does not resolve is refused (one broker-log line per slot per :data:`ALARM_DEDUPE_WINDOW` says so). Known edge: a
+cap does not resolve is refused (one broker-log line per slot per :data:`ALARM_DEDUPE_WINDOW` says so), and a cap that
+was known leaves the known set, so its next frame pays the unseen bucket. Known edge: a
 slot that floods bad caps before its first real alarm can get that alarm refused ``rate-limited``; the config change
 is still blocked and the slot's stderr says so. The record
 names the session CONTROL resolved (and its run's id), never a session the hook claims, and is appended to
@@ -45,7 +46,10 @@ same (session, kind, reason) within :data:`ALARM_DEDUPE_WINDOW` is acknowledged,
 token; any other alarm takes one from the slot's own write bucket (:data:`ALARM_RATE`, :data:`ALARM_BURST`; past it
 ``rate-limited``). A slot writes at most :data:`ALARM_SLOT_BUDGET` records per :data:`ALARM_BUDGET_WINDOW`; past that
 an alarm is acknowledged and counted, and the count is written as one summary record (``suppressed``, no ``kind``)
-each time it doubles, so one slot can never roll another slot's records, nor its own first ones, out of the log.
+each time it doubles and, past that, when the slot's last summary is :data:`ALARM_SUMMARY_INTERVAL` old (so the
+count keeps reaching the log while alarms keep being suppressed, at most that many records per budget window more),
+so one slot can never roll another slot's records, nor its own first ones, out of the log. A summary's count is the
+running count since the slot's budget window began; its line shape is unchanged.
 The broker log gets one line per record written, never one per suppressed alarm. Each slot keeps its own dedupe
 stamps (:data:`ALARM_DEDUPE_MAX`, derived from its bucket), so no traffic of other slots can evict a live one. The
 dedupe stamp and the budget are kept only after the append succeeds: an append that fails is ``broker-error``, and
@@ -167,7 +171,7 @@ from levain.qbroker.store import ANSWER_ROW_FORMAT, REQUEST_ROW_FORMAT, QueueSto
 from levain.slot import limits_doc
 
 __all__ = ["ALARM_BUDGET_WINDOW", "ALARM_BURST", "ALARM_DEDUPE_WINDOW", "ALARM_FORMAT", "ALARM_KINDS", "ALARM_RATE",
-           "ALARM_KNOWN_CAPS", "ALARM_REASON_MAX", "ALARM_SLOT_BUDGET",
+           "ALARM_KNOWN_CAPS", "ALARM_REASON_MAX", "ALARM_SLOT_BUDGET", "ALARM_SUMMARY_INTERVAL",
            "ANSWER_BURST", "ANSWER_RATE", "CAP_MAX", "GATE_BURST", "GATE_RATE",
            "KINDS", "PENDING_PER_SESSION", "QUOTA_PER_RUN",
            "RECEIVED_SKEW", "RESOLVE_TTL", "RUN_CALLS_KIND", "RUN_DEADLINE_KIND", "RUN_KEYS", "RUN_OPTIONAL_KEYS",
@@ -267,9 +271,11 @@ ALARM_DEDUPE_MAX = math.ceil(ALARM_BURST + ALARM_RATE * ALARM_DEDUPE_WINDOW)
 # how many caps that resolved on a slot's ALARM it remembers (oldest out): those resolve before any token is charged
 ALARM_KNOWN_CAPS = 4
 # how many records one slot may write per ALARM_BUDGET_WINDOW seconds: past it an alarm is counted, not written, and
-# the count is written as a summary line each time it doubles
+# the count is written as a summary line each time it doubles (and, see ALARM_SUMMARY_INTERVAL, when the last is an hour old)
 ALARM_SLOT_BUDGET = 8
 ALARM_BUDGET_WINDOW = 24 * 3600.0
+# past the budget, a suppressed alarm also writes the summary when the slot's last one is this old (seconds)
+ALARM_SUMMARY_INTERVAL = 3600.0
 ALARM_FORMAT = "levain-queue-alarm/1"
 _ALARM_KEYS = frozenset({"v", "op", "id", "cap", "kind", "reason"})
 # the longest tool_use_id a GATE frame may carry (the counter keys a repeat by it; levain.consent.limits takes the same)
@@ -963,6 +969,8 @@ class Broker:
         if isinstance(who, str):
             now = self._monotonic()
             with self._alarm_lock:
+                if known:   # a cap that no longer resolves stops being known: its next frame pays the unseen bucket
+                    self._alarm_caps.get(slot, {}).pop(digest, None)
                 last = self._alarm_unresolved_logged.get(slot)
                 if last is None or now - last >= ALARM_DEDUPE_WINDOW:
                     self._alarm_unresolved_logged[slot] = now
@@ -984,7 +992,8 @@ class Broker:
                 return wire.refusal(rid, "rate-limited")
             # the budget is worked on a copy and kept only once the append (if any) succeeded, with the stamp
             budget = self._alarm_budget.get(slot)
-            budget = [now, 0, 0, 1] if budget is None or now - budget[0] >= ALARM_BUDGET_WINDOW else list(budget)
+            # [window start, written, suppressed, next doubling, when the last summary was written]
+            budget = [now, 0, 0, 1, now] if budget is None or now - budget[0] >= ALARM_BUDGET_WINDOW else list(budget)
             record: dict[str, Any] = {"format": ALARM_FORMAT, "at": utc_stamp(self._clock()), "slot": slot_ref(slot),
                                       "session": who.session}
             if budget[1] < ALARM_SLOT_BUDGET:
@@ -996,9 +1005,14 @@ class Broker:
             else:
                 budget[2] += 1
                 record["suppressed"] = budget[2]
-                write = budget[2] >= budget[3]
-                if write:
+                doubled = budget[2] >= budget[3]
+                if doubled:
                     budget[3] *= 2
+                # a suppressed alarm also lands a summary when the last one is an ALARM_SUMMARY_INTERVAL old, so the
+                # doctor's 24-hour row still sees a slot that keeps being suppressed after its last doubling aged out
+                write = doubled or now - budget[4] >= ALARM_SUMMARY_INTERVAL
+                if write:
+                    budget[4] = now
             if write:
                 self._store.append_alarm(record)
             self._alarm_budget[slot] = budget
