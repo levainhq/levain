@@ -182,7 +182,7 @@ def test_a_timeout_prints_the_page_state_after_its_named_line_and_keeps_the_exit
                   "--- end page state ---"):
         assert label in block, (label, r.stderr)
     assert len(block) < 4100, len(block)
-    assert block.count("TARGET") == 1, r.stderr                          # the browser's word on the page target is printed once
+    assert len(re.findall(r"^TARGET: ", block, re.M)) == 1, r.stderr     # the browser's word on the page target is printed once, as a line of its own
 
 
 _SLOW_WORKER = "self.addEventListener('install', () => self.skipWaiting());\nself.addEventListener('activate', (e) => e.waitUntil(new Promise((r) => setTimeout(r, 2000)).then(() => self.clients.claim())));\n"
@@ -243,7 +243,7 @@ def test_a_timeout_after_a_reload_says_how_the_worker_wait_ended_and_where_the_t
     _, _, block = r.stderr.partition("--- page state at the timeout ---")
     assert re.search(r"WORKER WAITS: settled after \d+ms/\d+ polls \(last settled, \d+ms ago\)", block), r.stderr
     assert re.search(r"NAVIGATION: events=\d+ loads=\d+", block), r.stderr
-    assert f' type=page url="{url}"' in block, r.stderr
+    assert f' type=page url={json.dumps(url, ensure_ascii=False)}' in block, r.stderr   # the driver quotes the url as JSON does
 
 
 @needs_browser
