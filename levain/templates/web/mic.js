@@ -350,19 +350,24 @@
     b.textContent = FACE_WORDS[kind]; b.classList.add("voice-words"); b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", FACE_WORDS[kind]);
   }
 
-  // SpeechRecognition error names (the spec's list, plus "start" for a start() that threw) -> the plain reason shown on the card.
+  // SpeechRecognition error names (the engine's list, plus "start" for a start() that threw) -> the plain reason shown on the card.
+  // service-not-allowed and language-not-supported are ONE sentence: the browsers answer the same cause (an on-device speech pack
+  // that is missing or not visible to this page) with either name, and the page cannot tell them apart, so the words say only what
+  // is known. Dictate is drawn on desktop browsers only, so no sentence points at a phone's keyboard. The bad-grammar and
+  // phrases-not-supported rows are defensive: this control sets neither grammars nor phrases.
   var DICTATE_REASONS = {
-    "not-allowed": "Dictation needs permission to use the microphone.",
-    "service-not-allowed": "This browser is not allowing dictation here (speech recognition is blocked or turned off for it).",
-    "language-not-supported": "This browser has no on-device dictation pack for this language yet, so Dictate cannot run; the keyboard dictation key works.",
+    "not-allowed": "Dictation needs the microphone: allow it for this site in the address bar, then tap Dictate again.",
+    "service-not-allowed": "Speech recognition could not run for this language: its on-device pack may be missing, or this browser blocks it.",
+    "language-not-supported": "Speech recognition could not run for this language: its on-device pack may be missing, or this browser blocks it.",
     "audio-capture": "No microphone was found, or it could not be opened.",
-    "network": "Dictation could not reach its speech service.",
+    "network": "Speech recognition failed; tap Dictate to try again.",
     "no-speech": "No speech was heard; tap Dictate and try again.",
-    "aborted": "Dictation was interrupted.",
+    "aborted": "Dictation was interrupted; tap Dictate to try again.",
     "bad-grammar": "Dictation could not use its settings.",
     "phrases-not-supported": "Dictation could not use its hint phrases in this browser.",
     "start": "Dictation could not start; tap Dictate again.",
   };
+  // the words for an error name live here once and are exported: a dictation control asks for them, it never keeps a table of its own
   function dictateReason(name) { return Object.prototype.hasOwnProperty.call(DICTATE_REASONS, name) ? DICTATE_REASONS[name] : "Dictation stopped" + (typeof name === "string" && /^[a-z-]{1,40}$/.test(name) ? " (" + name + ")." : "."); }
 
   var insts = [];                          // every attach() still in use: a capture started in one box ends the others'
@@ -384,6 +389,10 @@
     o = o || {};
     var doc = box.ownerDocument, cls = o.cls || "", say = typeof o.note === "function" ? o.note : function () {};
     var buttons = [], mine = false, typed = "", base = "", fin = "", rec = null, ending = false, dtimer = 0, gone = false, offs = [];
+    // Dictate's own words on the host's note line: what this control last said, so the next attempt takes back only that (the note
+    // line is the host's, shared with its other messages: clearing it blind could wipe one that is not Dictate's)
+    var spoke = false;
+    function tell(text) { spoke = true; say(text); }
     var locked = false, watch = 0, seen = box.isConnected, born = Date.now(), sb = null, db = null;
     function detached() { if (box.isConnected) seen = true; return gone || (seen && !box.isConnected); }
     function sync() {
@@ -449,10 +458,11 @@
         if (mine || gone) return;
         if (rec) { endDict(); return; }
         haltOthers();
-        if (S) { say("The microphone is in use: stop it first, then tap Dictate."); return; }
+        if (S) { tell("The microphone is in use: stop it first, then tap Dictate."); return; }
+        if (spoke) { spoke = false; say(""); }           // a new attempt: what Dictate last said is no longer true
         var r = new SR();
         r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
-        if (r.processLocally !== true) { say("This browser will not keep dictation on this device, so it is off; the keyboard dictation key works."); return; }
+        if (r.processLocally !== true) { tell("This browser will not keep dictation on this device, so it is off; the keyboard dictation key works."); return; }
         r.onresult = function (ev) {
           if (rec !== r) return;
           var all = "", done = "";
@@ -463,9 +473,19 @@
           fin = done; put(all);
         };
         r.onend = function () { if (rec === r) finishDict(); };
-        r.onerror = function (ev) { if (rec === r) { finishDict(); say(dictateReason(ev && ev.error)); } };
+        r.onerror = function (ev) {
+          if (rec !== r) return;
+          var was = ending, name = ev && ev.error;
+          finishDict();
+          // intent: a stop the operator asked for is not a failure. An engine that answers Stop with no-speech or aborted says
+          // nothing; every other error still speaks, Stop or not
+          if (was && (name === "no-speech" || name === "aborted")) return;
+          tell(dictateReason(name));
+        };
         begin(); rec = r; ending = false; face(db, "dictate-stop");
-        try { r.start(); } catch (e) { try { r.abort(); } catch (_) {} finishDict(); say(dictateReason("start")); }
+        // a start() that threw: detach and free the box FIRST, then abort, so an engine that answers abort() with an error or an
+        // end event at once finds nothing listening and the box says one thing
+        try { r.start(); } catch (e) { finishDict(); try { r.abort(); } catch (_) {} tell(dictateReason("start")); }
       });
       var leave = function () { if (detached()) { off(); return; } if (doc.visibilityState === "hidden") abortDict(); };
       doc.addEventListener("visibilitychange", leave);
@@ -498,6 +518,7 @@
   }
 
   window.LevainMic = {
+    dictateReason: dictateReason,
     attach: attach, localSpeech: localSpeech, available: available, probe: probe, start: start, stop: stop, active: function () { return !!S; }, closeFailed: function () { return !!(lastStopped && lastStopped.closeFailed); }, revoked: function () { return !!(lastStopped && lastStopped.revoked); }, deadlines: deadlines, limits: limits,
     onPartial: function (cb) { return on("partial", cb); }, onFinal: function (cb) { return on("final", cb); },
     onNote: function (cb) { return on("note", cb); }, onEnd: function (cb) { return on("end", cb); },
