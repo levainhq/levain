@@ -43,7 +43,9 @@ def test_at_most_three_verbs_show_and_the_rest_sit_in_the_overflow_menu(tmp_path
         rowfs: getComputedStyle({ROW}.querySelector('.clause')).fontSize, menuHidden: v.querySelector('.verb-menu').hidden}}; }})()"""}])
     got = vals[1]
     assert got["vis"] == ["when?", "Resolve", "···"]      # DOM order; CSS draws Resolve first, got
-    assert got["menu"] == ["edit", "metabolize"], got            # no reclassify: the type is the entity's to sort
+    # no reclassify: the type is the entity's to sort. "keep" is the List's Keep verb (intention_keep, offered on a plain
+    # intention row by dashboard_core.js; rows 182/183), which a plain intention row's menu carries after metabolize
+    assert got["menu"] == ["edit", "metabolize", "keep"], got
     # a copy of each inline verb waits in the menu for a narrow row (container query); it shows nowhere on a wide one
     assert got["dups"] == ["Resolve:none", "when?:none"], got
     assert (got["haspopup"], got["expanded"], got["menuHidden"]) == ("menu", "false", True), got
