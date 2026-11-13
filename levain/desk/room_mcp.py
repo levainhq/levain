@@ -109,7 +109,9 @@ RELAY_TOOL: dict[str, Any] = {
     "inputSchema": {
         "type": "object",
         "properties": {"quote_ids": {"type": "array", "minItems": 1, "items": {"type": "string"},
-                                     "description": "Ids (cm-...) of the operator's own messages in this room, in order."}},
+                                     "description": "Ids (cm-...) of the operator's own messages in this room, in order. "
+                                                    "Each of his messages reaches you with its id in the "
+                                                    "<room-context> block ahead of it."}},
         "required": ["quote_ids"],
         "additionalProperties": False,
     },
