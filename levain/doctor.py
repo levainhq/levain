@@ -3860,11 +3860,19 @@ def _check_standing_grants(install: Path) -> list[CheckResult]:
              else f"a key that signed or last renewed {it} was revoked")
     shown = ", ".join(str(visible(gid)) for gid in list(stopped)[:5]) + (f" and {n - 5} more" if n > 5 else "")
     # a kind with a one-live rule still counts a stopped grant at create (ruling R-C): its create is refused until the
-    # stopped one is revoked, so "create it again" alone would send the operator into that refusal
+    # stopped one is revoked, so "create it again" alone would send the operator into that refusal; and no verb makes a
+    # hands entry at all. So past the plain case the hint gives each kind's own way back, in the words and order of the
+    # revoke notice (grants.ways_back), never one sentence for every kind
+    from levain.consent.grants import ways_back
+
     revoke_first = any(_auth.stopped_way(kinds[gid]) != _auth.stopped_way(None) for gid in stopped)
-    hint = (f"Revoke {it} to clear the list (levain consent grant revoke --signing-key <key> -- <id>); a seat-root "
-            "lease, seat-egress grant, chat key, voice key or hands entry must be revoked before it is created again."
-            if revoke_first else f"Create {it} again with a key you hold, or revoke {it} to clear the list.")
+    if revoke_first:
+        def named(ids: list[str]) -> str:
+            return ", ".join(str(visible(g)) for g in ids[:5]) + (f" and {len(ids) - 5} more" if len(ids) > 5 else "")
+        hint = (f"Revoke {it} to clear the list (levain consent grant revoke --signing-key <key> -- <id>). "
+                + " ".join(f"{named(ids)}: {words}." for words, ids in ways_back((g, kinds[g]) for g in stopped)))
+    else:
+        hint = f"Create {it} again with a key you hold, or revoke {it} to clear the list."
     return [CheckResult("standing grants", True,
                         f"{n} standing grant{'' if n == 1 else 's'} stopped because {cause}; {they} nothing ({shown})",
                         hint, warn=True)]

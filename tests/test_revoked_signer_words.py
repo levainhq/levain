@@ -613,10 +613,10 @@ def test_t18_one_warn_row_names_the_stopped_grants_and_the_way_out(world) -> Non
     assert (row.name, row.ok, row.warn) == ("standing grants", True, True)
     assert row.detail == ("2 standing grants stopped because the key that signed them was revoked; they answer nothing "
                           "(cg-A, sl-aaaaaaaaaaaa)")
-    # a lease is among them, and its create is refused until it is revoked (L4 F1): the hint says revoke first
-    assert row.hint == ("Revoke them to clear the list (levain consent grant revoke --signing-key <key> -- <id>); a "
-                        "seat-root lease, seat-egress grant, chat key, voice key or hands entry must be revoked before "
-                        "it is created again.")
+    # a lease is among them, and its create is refused until it is revoked (L4 F1): the hint gives each its own way back
+    assert row.hint == ("Revoke them to clear the list (levain consent grant revoke --signing-key <key> -- <id>). "
+                        "cg-A: create it again with a key you still hold. "
+                        "sl-aaaaaaaaaaaa: revoke it, then create it again with a key you still hold.")
 
 
 def test_t18_one_stopped_grant_reads_in_the_singular(world) -> None:
