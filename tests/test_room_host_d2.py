@@ -487,6 +487,7 @@ def test_a_room_launch_files_at_most_its_hourly_notes(host, world, monkeypatch):
     r = note_call(world["launch"], host, {"note": "one too many"})
     text = r["result"]["content"][0]["text"]
     assert r["result"]["isError"] is True and "no note was filed" in text and "hour" in text, text
+    assert "attempted" in text and "has filed" not in text, text       # an attempt that failed may not have filed (L1 F4)
     assert len(recs(host)) == room_mcp.NOTE_PER_HOUR
     clock[0] += 3600.5
     assert note_call(world["launch"], host, {"note": "an hour on"})["result"]["isError"] is False
@@ -644,10 +645,14 @@ def test_a_hung_command_is_killed_at_its_bound_even_when_the_door_cannot_act(tmp
     hang.write_text(f"import os, time\nopen({str(pidf) + '.tmp'!r}, 'w').write(str(os.getpid()))\n"
                     f"os.replace({str(pidf) + '.tmp'!r}, {str(pidf)!r})\ntime.sleep(60)\n")
     runner = tmp_path / "runner.py"
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]      # the tree under test, not an installed copy (L1 F1, L2 6)
     runner.write_text(f"import sys\nfrom levain.desk import room_host\n"
+                      f"assert room_host.__file__.startswith({str(repo)!r}), room_host.__file__\n"
                       f"room_host.run((sys.executable, {str(hang)!r}), 'x', timeout=0.5)\n")
     bound = 0.5 + room_host._REAP + room_host._WATCH_SLACK
-    door = subprocess.Popen([sys.executable, str(runner)], cwd=os.getcwd())
+    door = subprocess.Popen([sys.executable, str(runner)], cwd=str(repo), env={**os.environ, "PYTHONPATH": str(repo)})
     try:
         _wait_for(pidf)
         pid = int(pidf.read_text())
@@ -658,6 +663,57 @@ def test_a_hung_command_is_killed_at_its_bound_even_when_the_door_cannot_act(tmp
     finally:
         door.kill()
         door.wait(10)
+
+
+def test_the_rooms_end_kills_the_whole_claude_group_and_the_commands_group_dies_with_it(tmp_path):
+    """The room's REAL end shape (``chat_driver._end_cli``, L2 6): ``killpg`` of the Claude process group, the door, its
+    in-flight command and the watchdog's lifeline all at once, not the door alone. The command and a grandchild it
+    started live in the watchdog's group, outside Claude's, so only the watchdog (EOF on its lifeline) can reach them."""
+    import os
+    import signal
+    import subprocess
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    cmd_pid, kid_pid = tmp_path / "cmd.pid", tmp_path / "kid.pid"
+
+    def stamp(path):    # a script line that records its own pid atomically
+        return f"open({str(path) + '.tmp'!r}, 'w').write(str(os.getpid())); os.replace({str(path) + '.tmp'!r}, {str(path)!r})"
+
+    kid = tmp_path / "kid.py"
+    kid.write_text(f"import os, time\n{stamp(kid_pid)}\ntime.sleep(60)\n")
+    cmd = tmp_path / "cmd.py"
+    cmd.write_text(f"import os, subprocess, sys, time\n{stamp(cmd_pid)}\nsubprocess.Popen([sys.executable, {str(kid)!r}])\n"
+                   f"time.sleep(60)\n")
+    door = tmp_path / "door.py"
+    door.write_text(f"import sys\nfrom levain.desk import room_host\n"
+                    f"assert room_host.__file__.startswith({str(repo)!r}), room_host.__file__\n"
+                    f"room_host.run((sys.executable, {str(cmd)!r}), 'x', timeout=30)\n")
+    claude = tmp_path / "claude.py"       # stands for the Claude CLI: the group leader, with the door as its child
+    claude.write_text(f"import subprocess, sys, time\nsubprocess.Popen([sys.executable, {str(door)!r}])\ntime.sleep(60)\n")
+    env = {**os.environ, "PYTHONPATH": str(repo)}
+    leader = subprocess.Popen([sys.executable, str(claude)], cwd=str(repo), env=env, start_new_session=True)
+    pids = []
+    try:
+        _wait_for(cmd_pid)
+        _wait_for(kid_pid)
+        pids = [int(cmd_pid.read_text()), int(kid_pid.read_text())]
+        os.killpg(leader.pid, signal.SIGKILL)       # the room's end
+        leader.wait(10)
+        for pid in pids:
+            if not _gone(pid, 6.0):
+                pytest.fail(f"pid {pid} outlived the killpg of the Claude group the door ran in")
+    finally:
+        for pid in pids:                            # leave nothing behind, whatever happened above
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        leader.wait(10)
 
 
 def test_run_reaps_every_process_it_starts_and_releases_its_watchdog(tmp_path, monkeypatch):
@@ -842,9 +898,10 @@ def test_the_real_stdio_door_reads_the_hosts_commands_from_its_environment(host,
     here), relays, reads the relayed thread, and refuses a foreign one."""
     import os
     import subprocess
+    from pathlib import Path
 
     env = {**os.environ, room_host.HOSTCMD_ENV: host.to_json(), room_mcp.LAUNCH_ENV: world["launch"],
-           "PYTHONPATH": os.getcwd()}
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     assert env["LEVAIN_HOME"] == str(qdir.parent)
     tool = lambda i, name, args: {"jsonrpc": "2.0", "id": i, "method": "tools/call",      # noqa: E731
                                   "params": {"name": name, "arguments": args}}
@@ -881,7 +938,7 @@ def test_a_note_command_dies_with_the_door_that_ran_it(host, qdir, world):
     from pathlib import Path
 
     env = {**os.environ, room_host.HOSTCMD_ENV: host.to_json(), room_mcp.LAUNCH_ENV: world["launch"],
-           "PYTHONPATH": os.getcwd()}
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     call_ = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
              "params": {"name": "note_to_desk", "arguments": {"note": "NOTEHANG a slow inbox"}}}
     door = subprocess.Popen([sys.executable, "-P", "-m", "levain.desk.room_mcp"], stdin=subprocess.PIPE,
