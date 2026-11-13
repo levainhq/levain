@@ -665,12 +665,16 @@ def _filtered_groups(ev: str, groups: list, dropped: set) -> list:
     ``type`` ``command`` with a non-empty string ``command``. Every other handler is dropped and named
     ``hooks.<event>:<type>``, and an ``async`` one is dropped and named ``hooks.<event>:async`` (Claude Code documents
     that it does not wait on one, so it could never deny; through the filter it would block every call); a group left
-    with none is dropped whole."""
+    with none is dropped whole. A group whose ``matcher`` is present and not a string (Claude Code documents a string
+    only) is dropped whole and named ``hooks.<event>:matcher``: wired without one it would run on every tool."""
     out = []
     for g in groups:
         handlers = g.get("hooks")
         if not isinstance(handlers, list):
             raise Refused("repo-settings-malformed", f"hooks.{ev}: a group's hooks is not a list")
+        if "matcher" in g and not isinstance(g["matcher"], str):
+            dropped.add(f"hooks.{ev}:matcher")
+            continue
         keep = []
         for h in handlers:
             if isinstance(h, Mapping) and h.get("async") is True:
@@ -846,7 +850,11 @@ def _filtered(blob: RenderBlob, facts: RenderFacts, ev: str, group: Mapping[str,
     """One repo group on a gate event as Claude Code gets it: each ``command`` handler replaced by the filter's
     command (:data:`REPO_FILTER`) with the event, the repo command's bounded timeout and the repo command itself as
     arguments, and of the handler's other keys only a string ``if`` (the condition it runs under); the group's string
-    ``matcher`` kept. None when nothing is left."""
+    ``matcher`` kept. None when nothing is left, and for a group whose ``matcher`` is present and not a string: the
+    freeze drops and names that one (:func:`_filtered_groups`), and a layer that reaches render another way is never
+    widened to every tool either."""
+    if "matcher" in group and not isinstance(group["matcher"], str):
+        return None
     handlers = []
     filter_cmd = hook_command(blob, facts, REPO_FILTER)
     for h in group.get("hooks") or ():
