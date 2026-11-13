@@ -97,9 +97,11 @@ def test_every_exemption_carries_a_reason() -> None:
 
 def test_the_exemption_checks_can_fail(monkeypatch: pytest.MonkeyPatch) -> None:
     """The reason check and the real-verb check refuse a bad exemption table (run against a patched table, not the real one)."""
-    monkeypatch.setitem(NOT_A_PAGE_VERB, "section_edit", "")
-    with pytest.raises(AssertionError):
-        test_every_exemption_carries_a_reason()
-    monkeypatch.setitem(NOT_A_PAGE_VERB, "no_such_verb_id", "typo")
-    with pytest.raises(AssertionError):
-        test_an_exempt_verb_is_a_real_verb()
+    with monkeypatch.context() as m:
+        m.setitem(NOT_A_PAGE_VERB, "section_edit", "")
+        with pytest.raises(AssertionError):
+            test_every_exemption_carries_a_reason()
+    with monkeypatch.context() as m:
+        m.setitem(NOT_A_PAGE_VERB, "no_such_verb_id", "typo")
+        with pytest.raises(AssertionError):
+            test_an_exempt_verb_is_a_real_verb()
