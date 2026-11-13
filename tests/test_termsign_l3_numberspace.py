@@ -351,7 +351,7 @@ def lived_in_old_store(store, env):
     """The production shape: a closed notice already shown and a band answer's context, in the schema before L3."""
     show(store, env)
     assert "recorded: 1a" in seat(store, env, "1a")
-    band_view.mark_closed_shown(store, [1])
+    band_view.mark_closed_shown(store, band_view.render_full(store).closed)    # the notice of 1, as a hook delivers it
     to_old_schema(store)
     before = counts(store)
     assert before["band_closed_shown"] == 1 and before["answer_context"] == 1
