@@ -103,12 +103,13 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: uv.lock
 
       - name: Install package with dev and openhands extras
+        # Installed from the committed uv.lock, hash-checked (scripts/ci_install_locked.sh); the build backend
+        # (hatchling) comes from the lock's build group, so it is no longer named here.
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev,openhands]" hatchling
+          scripts/ci_install_locked.sh dev openhands
 
       - name: Run the invariant tests
         # Serial on purpose: `-m invariant` selects after the whole tree is collected, and xdist would make every worker
