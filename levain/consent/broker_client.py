@@ -103,6 +103,11 @@ REQUEST_RETRY = 1.0
 GATE_BACKOFF = (0.05, 0.1, 0.2, 0.4, 0.8)
 # the longest tool_use_id a GATE carries (levain.qbroker.broker.TOOL_USE_ID_MAX)
 GATE_TOOL_USE_ID_MAX = 256
+# The display bound on a slot's REQUEST, in UTF-8 bytes (record.redact_display's limit): sized so the display, escaped
+# inside the broker's frame (levain.qbroker.wire.MAX_FRAME) and its stored row (levain.qbroker.store.ROW_MAX), where it
+# can at most double (every byte a quote or a backslash), leaves the rest of the request inside both; a test holds it.
+# Past it a slot's display is the over-bound words with its size, refused for signing as on the queue's own path.
+GATE_DISPLAY_MAX = 24 * 1024
 # a socket timeout and time.monotonic read different clocks: a call that ran out this close to the hold's end ended
 # the hold (undecided), it did not fail to run
 DEADLINE_SLOP = 0.05
@@ -381,7 +386,7 @@ def gate_request(*, agent: str, session: str, tool_name: str, tool_input: Any, c
         digest = input_bound_digest(tool_name, grant["paths"], grant["input"])
     return ExternalGateRequest.create(
         agent=agent, agent_session_id=session, event_id=event, tool_name=tool_name,
-        tool_input_digest=digest, display=redact_display(tool_name, tool_input), cwd=cwd,
+        tool_input_digest=digest, display=redact_display(tool_name, tool_input, GATE_DISPLAY_MAX), cwd=cwd,
         tier=tier, received_at=utc_stamp(now), expires_at=utc_stamp(now + timedelta(seconds=hold)))
 
 

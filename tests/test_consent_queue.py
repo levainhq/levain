@@ -28,7 +28,7 @@ from levain.consent import (
     ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, QueueStoreError, answer_message, answer_payload, authority_source,
 )
 from levain.consent.receipt_log import head as receipts_head
-from levain.consent.record import ExternalGateRequest, redact_display, tool_input_digest
+from levain.consent.record import OVER_BOUND, ExternalGateRequest, redact_display, tool_input_digest
 from tests._h4 import h4_home
 
 NOW = datetime(2026, 10, 13, 20, 0, tzinfo=timezone.utc)
@@ -710,7 +710,9 @@ def test_digest_and_display():
     assert tool_input_digest({"a": 1}) != tool_input_digest({"a": 2})
     shown = redact_display("mcp__x__y", {"api_key": "sk-123", "nested": {"Token": "t"}, "q": "hi"})
     assert "sk-123" not in shown and '"t"' not in shown and "hi" in shown
-    assert len(redact_display("Bash", {"command": "x" * 5000})) == 2000
+    # row 1704: a long input is shown whole (no cut at 2000), and past the bound the display names its size
+    assert redact_display("Bash", {"command": "x" * 5000}) == 'Bash {"command": "' + "x" * 5000 + '"}'
+    assert redact_display("Bash", {"command": "x" * 5000}, 100) == ("Bash " + OVER_BOUND.format(size=5020, limit=100))
 
 
 def test_display_masks_by_key_token_with_a_typed_marker():

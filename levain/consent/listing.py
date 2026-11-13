@@ -30,6 +30,7 @@ from levain.consent.record import ExternalGateRequest
 
 __all__ = ["ConsentEntry", "ConsentListing", "HISTORY", "KeyEvidence", "PENDING_CAP", "RECENT", "RECENT_CAP",
            "UNSHOWN", "audit_line", "consent_targets", "entry_body", "filed_input", "find_entry", "read_evidence",
+           "unshown_why",
            "read_grant_evidence", "read_listing"]
 
 RECENT = timedelta(hours=24)        # how long a terminal request stays in the listing
@@ -37,7 +38,8 @@ RECENT_CAP = 50
 HISTORY = timedelta(days=14)        # how far back the standing-rule proposals read decided requests
 PENDING_CAP = 200                   # pending rows read per listing; past it, flagged, never drawn
 UNSHOWN = object()
-TOO_LONG = "too long to answer from the terminal: answer in the agent's own dialog"
+# the note on a pending request that is not answerable here, after unshown_why's clause
+TOO_LONG = "not answered from the terminal or the phone: answer in the agent's own dialog"
 
 _REQUEST_FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display",
                    "cwd", "tier", "received_at", "expires_at")
@@ -46,8 +48,9 @@ _ACCESS_BY_OTHERS = 0o077
 
 def filed_input(request: object) -> object:
     """The tool input as filed, parsed back from the request's sealed display (``<tool_name> <json>``, secret-
-    named keys masked); :data:`UNSHOWN` when the display is not that whole: a display cut at its limit never
-    parses (the cut leaves the JSON unterminated, or trailed by the ellipsis)."""
+    named keys masked); :data:`UNSHOWN` when the display is not that whole: an over-bound display
+    (``record.OVER_BOUND``'s words) is no JSON, and a display filed under the old cut never parses (the cut left the
+    JSON unterminated, or trailed by the ellipsis)."""
     prefix = f"{request.tool_name} "
     if not request.display.startswith(prefix):
         return UNSHOWN
@@ -55,6 +58,21 @@ def filed_input(request: object) -> object:
         return json.loads(request.display[len(prefix):])
     except (ValueError, RecursionError):            # a display nested too deep to read back is not shown either
         return UNSHOWN
+
+
+def unshown_why(request: object) -> str | None:
+    """Why ``request``'s input is not shown whole (a clause: "its input is 300000 bytes, over ..."), or None when it
+    is (:func:`filed_input` reads it back). Every signing surface refuses an UNSHOWN request in these words."""
+    from levain.consent.record import LEGACY_DISPLAY_CUT, over_bound
+
+    if filed_input(request) is not UNSHOWN:
+        return None
+    over = over_bound(request.tool_name, request.display)
+    if over is not None:
+        return (f"its input is {over[0]} bytes, over the {over[1]}-byte bound a signer is shown whole, so it is not "
+                "shown")
+    return (f"it was filed under the old display cut (its input was kept only to {LEGACY_DISPLAY_CUT} characters), "
+            "so its whole input is not shown")
 
 
 def consent_targets(request: object) -> str:
@@ -65,7 +83,7 @@ def consent_targets(request: object) -> str:
 
     tool_input = filed_input(request)
     if tool_input is UNSHOWN:
-        return "(too long to answer here: the input as filed is cut at its display limit)"
+        return f"(not answered here: {unshown_why(request)})"
     got = _request_targets(request.agent, request.tool_name, tool_input)
     if not got:
         named = _named_by_tool(request.tool_name, tool_input)
@@ -177,8 +195,10 @@ def entry_body(entry: ConsentEntry, settled_lookup: Callable[[str, str], tuple[A
                ) -> dict[str, Any]:
     """What the page shows of one request beyond its panel row: the request as filed, where, what it names, how
     to answer it from a terminal, and, once decided, how it was. Served only to a caller holding a surface token
-    (``web_server``'s consent route), never in the token-free panel. A request whose display is cut at its limit
-    offers no commands: ``levain consent answer`` refuses to sign what it cannot show.
+    (``web_server``'s consent route), never in the token-free panel. ``display`` is the whole input as filed (secret-
+    named keys masked), however long under the queue's bound. A request whose input is not shown whole (over the
+    bound, or filed under the old cut: :func:`unshown_why`) offers no commands: ``levain consent answer`` refuses to
+    sign what it cannot show.
 
     ``settled_lookup(launch, request)`` is a READ-ONLY reading of a chat launch's egress rows
     (``levain.chat_egress.records.EgressReader.reading``). Given one, a ``levain_egress`` card's body also says what
@@ -200,7 +220,7 @@ def entry_body(entry: ConsentEntry, settled_lookup: Callable[[str, str], tuple[A
             "targets": visible(consent_targets(r)),
             "answer_allow": f"levain consent answer {r.id} allow --signing-key <key>" if answerable else None,
             "answer_deny": f"levain consent answer {r.id} deny --signing-key <key>" if answerable else None,
-            "note": TOO_LONG if pending and not answerable else "",
+            "note": f"{unshown_why(r)}: {TOO_LONG}" if pending and not answerable else "",
             # Q12: the two values the terminal prints before signing; Q16: hints, which inform and never authorise
             "tool_input_digest": r.tool_input_digest, "digest": r.digest,
             "hints": hints,

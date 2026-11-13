@@ -29,10 +29,11 @@ from levain.cockpit.consent import ConsentError, encode, parse_stamp, record_sha
 from levain.consent.receipt_log import head_problem
 
 __all__ = ["AGENTS", "ANSWER_FORMAT", "ANSWER_FORMAT_UNCHAINED", "ANSWER_NAMESPACE", "AWAY_LEAVE_FORMAT",
-           "AWAY_NAMESPACE", "DECISIONS", "DISPLAY_MAX", "GRANT_ANSWER_FORMAT", "POSTURE", "RULING_FORMAT",
+           "AWAY_NAMESPACE", "DECISIONS", "DISPLAY_MAX", "GRANT_ANSWER_FORMAT", "LEGACY_DISPLAY_CUT", "OVER_BOUND",
+           "POSTURE", "RULING_FORMAT",
            "RULING_FORMAT_UNCHAINED", "RULING_NAMESPACE", "UNCHAINED_FORMATS", "ExternalGateRequest",
            "answer_message", "answer_payload", "away_leave_message", "away_leave_payload", "grant_answer_payload",
-           "redact_display", "ruling_message", "ruling_payload", "tool_input_digest"]
+           "over_bound", "redact_display", "ruling_message", "ruling_payload", "tool_input_digest"]
 
 AGENTS: tuple[str, ...] = ("claude_code", "codex")
 DECISIONS: tuple[str, ...] = ("allow", "deny")
@@ -62,7 +63,18 @@ AWAY_NAMESPACE = "levain-consent-away"
 # what the queue stores when a standing consent grant answered (Q4): never signed per request; the grant's own
 # link in the authority log is the signature, re-verified at every delivery
 GRANT_ANSWER_FORMAT = "levain-consent-grant-answer/1"
-DISPLAY_MAX = 2000
+# The bound on a request's display, in UTF-8 bytes of the whole ``<tool> <json>`` text. Under it the display is the
+# whole redacted input, never cut, so a signer can read all of what an answer covers (on the phone, the cockpit page
+# and the terminal alike). Past it the display is OVER_BOUND's words naming the size, never a prefix of the input: such
+# a request is refused for signing with its size stated, and the agent's own dialog stands. Generous on purpose: a long
+# shell command (a heredoc, a sed script) is ordinary; a display this size costs one queue row and one page read.
+DISPLAY_MAX = 256 * 1024
+# The display bound before full displays: a display was CUT at this many characters and ended in an ellipsis. A request
+# filed then is still refused for signing (what it shows is not all it binds); only the refusal's words use this.
+LEGACY_DISPLAY_CUT = 2000
+OVER_BOUND = "[not shown: the input is {size} bytes, over the {limit}-byte bound a signer is shown whole]"
+_OVER_BOUND = re.compile(r"\[not shown: the input is ([0-9]+) bytes, over the ([0-9]+)-byte bound a signer is shown "
+                         r"whole\]")
 # A key is secret-named when one of these words occurs inside one of its tokens, or inside two adjacent tokens
 # joined. Tokens: the key split at ``_``, ``-``, any other non-alphanumeric and camelCase (``apiKey``, ``APIKey``,
 # ``x-api-key`` -> api, key), lower-cased. Inside a token, so a run-together ``accesstoken`` or ``secretkey`` is
@@ -148,15 +160,25 @@ def _mask(value: Any) -> Any:
     return value
 
 
-def redact_display(tool_name: str, tool_input: Any) -> str:
+def redact_display(tool_name: str, tool_input: Any, limit: int = DISPLAY_MAX) -> str:
     """What the operator is shown: the tool and its input with secret-named keys masked (a secret word inside a
-    key token, each masked value shown as its type and a string's length, ``[redacted: str, 12 chars]``),
-    bounded to :data:`DISPLAY_MAX` characters. A display, never what is signed: the answer binds the digest of the
-    whole input. A secret inside a free-text value (a shell command) is NOT masked: the queue does not parse
-    a command (K3)."""
+    key token, each masked value shown as its type and a string's length, ``[redacted: str, 12 chars]``), WHOLE.
+    Never cut: a text over ``limit`` UTF-8 bytes (default :data:`DISPLAY_MAX`) is instead ``<tool>`` and
+    :data:`OVER_BOUND`'s words with its size, which no reader parses back as an input, so it is never signed. A
+    display, never what is signed: an answer binds the request's digest, which holds the digest of the whole input
+    (:func:`tool_input_digest`). A secret inside a free-text value (a shell command) is NOT masked: the queue does not
+    parse a command (K3)."""
     body = json.dumps(_mask(tool_input), sort_keys=True, ensure_ascii=False, default=str)
     text = f"{tool_name} {body}"
-    return text if len(text) <= DISPLAY_MAX else text[:DISPLAY_MAX - 1] + "…"
+    size = len(text.encode("utf-8", "surrogatepass"))   # a lone surrogate is counted, never a raise here
+    return text if size <= limit else f"{tool_name} " + OVER_BOUND.format(size=size, limit=limit)
+
+
+def over_bound(tool_name: str, display: str) -> tuple[int, int] | None:
+    """``(size, limit)`` when ``display`` is :func:`redact_display`'s over-bound words for ``tool_name``, else None."""
+    prefix = f"{tool_name} "
+    m = _OVER_BOUND.fullmatch(display[len(prefix):]) if display.startswith(prefix) else None
+    return None if m is None else (int(m.group(1)), int(m.group(2)))
 
 
 def _need(name: str, value: Any) -> str:

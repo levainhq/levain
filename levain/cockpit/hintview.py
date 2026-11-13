@@ -24,6 +24,7 @@ _KEYS = ("command", "cmd")
 _CUT_FIELD = re.compile(r'"(?:command|cmd)": "((?:[^"\\]|\\.)*)')
 _UNESCAPE = re.compile(r'\\(["\\nt])')
 _UNESCAPED = {'"': '"', "\\": "\\", "n": "\n", "t": "\t"}
+OVER_HINT = "the command is over the display bound and not shown: no hints"
 
 
 def is_bash_like(tool: str) -> bool:
@@ -43,6 +44,10 @@ def hints_for(request: Any, tool_input: Any, cut: bool) -> list[str]:
     if not is_bash_like(request.tool_name):
         return []
     if cut:
+        from levain.consent.record import over_bound
+
+        if over_bound(request.tool_name, request.display) is not None:
+            return [OVER_HINT]      # nothing of the command is shown, so nothing is hinted
         shown = _from_cut_display(request.display, request.tool_name)
         got = shell_hints(shown, request.cwd) if shown else []
         return [CUT_HINT, *(got or ([NONE_HINT] if shown else []))]

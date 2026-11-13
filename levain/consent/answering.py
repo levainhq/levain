@@ -6,8 +6,9 @@ rules here, so neither re-spells them:
   - :func:`answer_root`: the cockpit data root an answer is verified against is the one the agent's consent hook
     replays (``cockpit_data_root`` in the queue directory's adapter settings), so a recorded answer is one the hook
     can deliver;
-  - :func:`refuse_cut_display`: a request whose display was cut at its limit is never signed by levain (the signer
-    could not see what it signs); the agent's own dialog stands;
+  - :func:`refuse_cut_display`: a request whose input is not shown whole (over the queue's display bound, or filed
+    under the old display cut) is never signed by levain (the signer could not see what it signs); the agent's own
+    dialog stands;
   - :func:`passkey_keys`: the enrolled, active passkey keys made on one https name (a passkey's rpId is part of its
     key, so a page on another name can never use it).
 """
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import PASSKEY, AuthorityKey, AuthoritySnapshot
-from levain.consent.listing import UNSHOWN, filed_input
+from levain.consent.listing import unshown_why
 from levain.consent.passkey import KEY_TYPE, PasskeyError, key_application
 from levain.consent.queue import AnswerRefused
 
@@ -72,11 +73,12 @@ def _holding_a_cockpit(root: Path) -> Path:
 
 
 def refuse_cut_display(request: Any, where: str) -> None:
-    """Raise :class:`AnswerRefused` when ``request``'s display was cut, so what a signer reads is not all it signs.
-    ``where`` names the signing surface in the refusal (``"from the terminal"``)."""
-    if filed_input(request) is UNSHOWN:
-        raise AnswerRefused(f"request {request.id}'s input is too long to show here (the queue keeps a display "
-                            f"cut at its limit), so it is not signed {where}; the agent's own dialog stands")
+    """Raise :class:`AnswerRefused` when ``request``'s input is not shown whole (over the display bound, with its size;
+    or filed under the old cut), so what a signer reads is not all it signs. ``where`` names the signing surface in
+    the refusal (``"from the terminal"``)."""
+    why = unshown_why(request)
+    if why is not None:
+        raise AnswerRefused(f"request {request.id}: {why}, so it is not signed {where}; the agent's own dialog stands")
 
 
 def passkey_keys(authority: AuthoritySnapshot, rp_id: str) -> list[AuthorityKey]:

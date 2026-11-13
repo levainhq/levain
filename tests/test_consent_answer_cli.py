@@ -85,20 +85,33 @@ def test_pending_names_each_target_once(scratch, capsys):
     assert "targets /w/a.txt  T2" in line
 
 
-def test_answer_refuses_a_display_cut_at_its_limit(scratch, capsys):
-    # seen red (probe_fix1 item 1): a 3,000-char Write showed a cut display and was signed and allowed
+def test_answer_shows_a_long_input_whole_and_refuses_one_over_the_bound(scratch, capsys):
+    # seen red (probe_fix1 item 1): a 3,000-char Write showed a cut display and was signed and allowed. Row 1704: the
+    # display is no longer cut, so the terminal prints the whole input, its decisive tail included, before signing; an
+    # input over the display bound is refused with its size, never signed over part of it
+    from levain.consent.record import DISPLAY_MAX
+
     queue, laptop, _, root = scratch
     request = queue.file(agent="claude_code", agent_session_id="s", tool_name="Write",
                          tool_input={"file_path": "/w/big.txt", "content": "benign " * 300 + "rm -rf ~"}, cwd="/w",
                          hold=timedelta(minutes=5), event_id="e3")
-    assert main(["consent", "pending", "--queue-dir", str(queue.directory)]) == 0
-    assert "too long to answer here" in capsys.readouterr().out
-    rc = main(["consent", "answer", request.id, "allow", "--signing-key", str(laptop),
+    rc = main(["consent", "answer", request.id, "deny", "--signing-key", str(laptop),
                "--queue-dir", str(queue.directory), "--data-root", str(root)])
     out = capsys.readouterr()
-    assert rc == 1 and "too long to show here" in out.err and "the agent's own dialog stands" in out.err
+    assert rc == 0, out.err
+    shown = next(ln for ln in out.out.splitlines() if ln.lstrip().startswith("input as filed"))
+    assert ("benign " * 300 + "rm -rf ~") in shown
+    over = queue.file(agent="claude_code", agent_session_id="s", tool_name="Write",
+                      tool_input={"file_path": "/w/big.txt", "content": "x" * DISPLAY_MAX}, cwd="/w",
+                      hold=timedelta(minutes=5), event_id="e3b")
+    assert main(["consent", "pending", "--queue-dir", str(queue.directory)]) == 0
+    assert "not answered here: its input is " in capsys.readouterr().out
+    rc = main(["consent", "answer", over.id, "allow", "--signing-key", str(laptop),
+               "--queue-dir", str(queue.directory), "--data-root", str(root)])
+    out = capsys.readouterr()
+    assert rc == 1 and f"over the {DISPLAY_MAX}-byte bound" in out.err and "the agent's own dialog stands" in out.err
     assert "answering" not in out.out
-    assert queue.get(request.id)[1] == "pending"
+    assert queue.get(over.id)[1] == "pending"
 
 
 def test_agent_sourced_fields_print_escaped(scratch, capsys):

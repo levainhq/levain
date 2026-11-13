@@ -7279,18 +7279,25 @@
   function consentRequest(display, tool) {
     let t = String(display || "");
     const head = tool && t.replace(/^\s+/, "").startsWith(tool) ? t.replace(/^\s+/, "").slice(tool.length) : t;
+    // row 1704: the input is the whole of it however long; a long value is its head and tail with the whole one tap away
+    const F = window.LevainCardFormat;
+    const long = F && typeof F.longText === "function";
     try {
       const o = JSON.parse(head.trim());
       if (o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length) {
         const dl = el("dl", "consent-kv");
         for (const [k, v] of Object.entries(o)) {
           dl.appendChild(el("dt", null, k));
-          dl.appendChild(el("dd", null, typeof v === "string" ? v : JSON.stringify(v)));
+          const s = typeof v === "string" ? v : JSON.stringify(v);
+          const big = long && Array.from(s).length > F.LONG_AT;
+          const dd = el("dd", null, big ? null : s);
+          if (big) dd.appendChild(F.longText(s, "consent-kv-long"));
+          dl.appendChild(dd);
         }
         return dl;
       }
     } catch (e) { /* not a JSON payload: the text below */ }
-    return el("pre", "consent-display", t);
+    return long ? F.longText(t, "consent-display") : el("pre", "consent-display", t);
   }
   function drawConsentCard(card, slot, b) {
     const sv = (x) => (typeof x === "string" ? x : "");

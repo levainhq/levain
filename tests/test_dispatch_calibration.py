@@ -8,6 +8,7 @@ from fractions import Fraction
 
 import pytest
 
+from levain.consent.record import DISPLAY_MAX
 from levain.dispatch import DispatchError
 from levain.dispatch.calibration import (CAVEAT, Label, agreement, deny_rate, proposal_eligible, read_labels)
 from tests.test_consent_queue import NOW, signed
@@ -488,7 +489,7 @@ def test_read_labels_carries_the_input_digest_from_the_real_queue(queue, keys):
 
 def test_a_cut_display_is_left_out_and_counted(queue, keys):
     short, cut = file_req(queue), queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit",
-                                             tool_input={"command": "x" * 5000}, cwd="/work/proj",
+                                             tool_input={"command": "x" * (DISPLAY_MAX + 1)}, cwd="/work/proj",
                                              hold=timedelta(minutes=5), tier="T2")
     decide(queue, keys, short, "allow")
     decide(queue, keys, cut, "deny")
@@ -552,7 +553,7 @@ def test_judge_is_a_plain_protocol_not_a_runtime_check():
 
 def test_the_report_carries_the_cut_count(queue, keys):
     short, cut = file_req(queue), queue.file(agent="claude_code", agent_session_id="s", tool_name="Edit",
-                                             tool_input={"command": "x" * 5000}, cwd="/work/proj",
+                                             tool_input={"command": "x" * (DISPLAY_MAX + 1)}, cwd="/work/proj",
                                              hold=timedelta(minutes=5), tier="T2")
     decide(queue, keys, short, "allow")
     decide(queue, keys, cut, "deny")

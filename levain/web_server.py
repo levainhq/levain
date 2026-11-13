@@ -538,7 +538,8 @@ class ConsentSheet:
         """The sheet's row for one request that is open to a passkey here (pending: an answer; undecided: a ruling),
         else None. ``signers``: the active passkeys enrolled on ``rp_id`` in the cockpit the request's hook names; an
         allow is offered only when one of them may allow the request's tier (``class_covers``, the phone's own check),
-        and only over a display shown whole (a deny is still ruled over a cut one, as on the phone). ``sha256``: the
+        and only over a display shown whole (``message``: the whole input as filed, however long under the queue's
+        display bound; a deny is still ruled over one not shown whole, as on the phone). ``sha256``: the
         version the sheet signs on (:meth:`version`), so a request that moved from pending to undecided reads as
         changed. A pending request whose hold has ended is not open here (the queue applies no answer to it)."""
         import sqlite3
@@ -547,7 +548,7 @@ class ConsentSheet:
         from levain.cockpit.consent import utc_stamp
         from levain.cockpit.hintview import visible
         from levain.consent.answering import answer_root, passkey_keys
-        from levain.consent.listing import UNSHOWN, filed_input
+        from levain.consent.listing import unshown_why
         from levain.consent.queue import AnswerRefused, ConsentQueue, authority_source, class_covers
 
         got = ConsentQueue(self.queue_dir, home=Path.home(),
@@ -560,7 +561,8 @@ class ConsentSheet:
         if state == "pending" and request.expires_at <= utc_stamp(datetime.now(timezone.utc)):
             return None
         mode = "answer" if state == "pending" else "rule"
-        cut = filed_input(request) is UNSHOWN
+        why = unshown_why(request)
+        cut = why is not None
         row: dict[str, Any] = {
             "id": request.id, "kind": "consent", "mode": mode, "state": state,
             "title": f"{visible(request.tool_name)} · {request.tier}", "requester": visible(request.agent),
@@ -579,8 +581,7 @@ class ConsentSheet:
             return self._versioned(row, request)
         verb = "answer" if mode == "answer" else "rule"
         if cut and mode == "answer":
-            row["refused"] = ("its input is too long to show here, so it is not signed from this page; the agent's own "
-                              "dialog stands")
+            row["refused"] = f"{why}, so it is not signed from this page; the agent's own dialog stands"
             return self._versioned(row, request)
         allow = [k.fingerprint for k in keys if class_covers(k.key_class, request.tier)]
         if allow and not cut:
