@@ -1,0 +1,13 @@
+{
+  "_note": "The `init` frame a stream-json child emitted on Claude Code 2.1.323 under --dangerously-skip-permissions with --strict-mcp-config and no MCP server configured (so mcp_servers is empty), recorded by the room-profile design lane (levain 22, key 1112-36) on 2026-11-12, trimmed to the keys the session keeps (claude_session._INIT_KEEP) with the cwd and session id replaced. The tool list is the vendor's default set as that version showed it, in the vendor's order.",
+  "type": "system",
+  "subtype": "init",
+  "cwd": "/scratch/room-host-probe",
+  "session_id": "00000000-0000-4000-8000-000000000001",
+  "tools": ["Task", "Bash", "CronCreate", "CronDelete", "CronList", "DesignSync", "Edit", "EnterWorktree", "ExitWorktree", "ListAgents", "LSP", "Monitor", "NotebookEdit", "PushNotification", "Read", "RemoteTrigger", "ReportFindings", "ScheduleWakeup", "SendMessage", "Skill", "TaskStop", "ToolSearch", "WebSearch", "Workflow", "Write"],
+  "mcp_servers": [],
+  "model": "claude-haiku-5-5",
+  "permissionMode": "bypassPermissions",
+  "claude_code_version": "2.1.323",
+  "uuid": "00000000-0000-4000-8000-000000000002"
+}
