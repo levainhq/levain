@@ -1,11 +1,13 @@
-"""The nightly dep-drift workflow's issue step, and the pins the lock-install path shares across files.
+"""The nightly dep-drift workflow's reporter job, and the pins the lock-install path shares across files.
 
-The issue step is run for real here: its ``run:`` block is pulled out of the workflow and executed under ``bash -e``
-with a stub ``gh`` that records its arguments and the issue body it was handed, so what a timed-out, a failed, a red
-and a green night each file (or close) is what is asserted, not what the YAML looks like."""
+The reporter is a job of its own (``report``, ``needs: drift``, ``if: always()``) so that a hard timeout of the job that
+holds the suite cannot take the reporter with it. Its issue step is run for real here: the ``run:`` block is pulled out
+of the workflow and executed under ``bash -e`` with a stub ``gh`` that records its arguments, its ``GH_REPO`` and the
+issue body it was handed. The step's ``env:`` is taken from the workflow too, with each ``${{ }}`` expression resolved
+from the values the ``drift`` job would have handed over (``needs.drift.result``, ``needs.drift.outputs.code``), so what a
+timed-out, a failed-setup, a red and a green night each file (or close) is what is asserted, not what the YAML looks like."""
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,12 +26,21 @@ DRIFT_YML = WORKFLOWS / "dep-drift.yml"
 BASH = "/bin/bash"
 
 
-def _drift_job():
-    return yaml.safe_load(DRIFT_YML.read_text())["jobs"]["drift"]
+def _workflow():
+    return yaml.safe_load(DRIFT_YML.read_text())
 
 
-def _step(prefix):
-    return next(s for s in _drift_job()["steps"] if s.get("name", "").startswith(prefix))
+def _job(name):
+    return _workflow()["jobs"][name]
+
+
+def _step(job, prefix):
+    return next(s for s in _job(job)["steps"] if s.get("name", "").startswith(prefix))
+
+
+def _needs(job):
+    needs = _job(job).get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)
 
 
 ISSUE_STEP_NAME = "File, update or close the one dep-drift issue"
@@ -37,34 +48,57 @@ ISSUE_STEP_NAME = "File, update or close the one dep-drift issue"
 RESULT_LINE = 'DEP_DRIFT {"result": "red", "stage": "suite", "changed": ["foo 1.0 -> 1.1"], "failed_tests": ["tests/test_a.py::t"]}'
 
 
-def _run_issue_step(tmp_path, *, code, log_lines, existing="", job_status="success"):
-    """Run the issue step; return (returncode, gh calls, the body handed to `gh issue create|comment`, stderr)."""
-    step = _step(ISSUE_STEP_NAME)
+def _expand(value, ctx):
+    """Resolve each ``${{ expr }}`` from ``ctx``; an expression the test did not model fails loudly instead of passing as text."""
+    def sub(m):
+        expr = m[1].strip()
+        assert expr in ctx, f"the reporter step reads {expr!r}, which this test does not model"
+        return ctx[expr]
+    return re.sub(r"\$\{\{(.*?)\}\}", sub, str(value))
+
+
+def _run_issue_step(tmp_path, *, code, drift_result, log_lines, existing="", repo="levainhq/levain"):
+    """Run the reporter's issue step as the `report` job would; return (returncode, gh calls, the body handed to
+    `gh issue create|comment`, stderr, the GH_REPO each gh call saw). ``code`` is the drift job's ``outputs.code`` and
+    ``drift_result`` its ``result``: a job cut off by its timeout has code "" and result "cancelled"."""
+    step = _step("report", ISSUE_STEP_NAME)
+    ctx = {"needs.drift.outputs.code": code, "needs.drift.result": drift_result, "github.repository": repo,
+           "github.token": "x"}
+    step_env = {k: _expand(v, ctx) for k, v in (step.get("env") or {}).items()}
     bindir = tmp_path / "bin"
     bindir.mkdir()
     calls = tmp_path / "calls.log"
     bodies = tmp_path / "bodies.log"
+    repos = tmp_path / "repos.log"
     gh = bindir / "gh"
+    # With neither a git remote (there is no checkout in the reporter) nor GH_REPO, the real gh has no repository and exits 1.
     gh.write_text(
         '#!/bin/sh\n'
         'echo "gh $*" >> "$STUB_CALLS"\n'
+        'echo "${GH_REPO:-}" >> "$STUB_REPOS"\n'
+        'if [ -z "${GH_REPO:-}" ]; then echo "gh: no git remote and no GH_REPO" >&2; exit 1; fi\n'
         'case "$*" in *"issue list"*) echo "$STUB_EXISTING";; esac\n'
         'prev=""\n'
         'for a in "$@"; do if [ "$prev" = "--body-file" ]; then cat "$a" >> "$STUB_BODIES"; echo "-----" >> "$STUB_BODIES"; fi; prev="$a"; done\n'
         'exit 0\n')
     gh.chmod(0o755)
-    (bindir / "python").symlink_to(sys.executable)
+    # The reporter has no setup-python: ubuntu-24.04 has `python3` and no bare `python`, so the stub dir offers only python3.
+    (bindir / "python3").symlink_to(sys.executable)
     runner_temp = tmp_path / "rt"
     runner_temp.mkdir()
     if log_lines is not None:
-        (runner_temp / "drift.log").write_text("\n".join(log_lines) + "\n")
+        # the `drift-log` artifact, downloaded into $RUNNER_TEMP/drift-log
+        (runner_temp / "drift-log").mkdir()
+        (runner_temp / "drift-log" / "drift.log").write_text("\n".join(log_lines) + "\n")
     env = {"PATH": f"{bindir}:/usr/bin:/bin", "RUNNER_TEMP": str(runner_temp), "STUB_CALLS": str(calls),
-           "STUB_BODIES": str(bodies), "STUB_EXISTING": existing, "DRIFT_CODE": code, "JOB_STATUS": job_status,
-           "GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": "levainhq/levain", "GITHUB_RUN_ID": "42",
-           "GH_TOKEN": "x", "HOME": str(tmp_path)}
-    proc = subprocess.run([BASH, "-e", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60)
+           "STUB_BODIES": str(bodies), "STUB_REPOS": str(repos), "STUB_EXISTING": existing,
+           "GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": repo, "GITHUB_RUN_ID": "42",
+           "HOME": str(tmp_path), **step_env}
+    proc = subprocess.run([BASH, "-e", "-c", step["run"]], env=env, capture_output=True, text=True, timeout=60,
+                          cwd=tmp_path)
     return (proc.returncode, calls.read_text().splitlines() if calls.exists() else [],
-            bodies.read_text() if bodies.exists() else "", proc.stderr)
+            bodies.read_text() if bodies.exists() else "", proc.stderr,
+            repos.read_text().splitlines() if repos.exists() else [])
 
 
 needs_bash = pytest.mark.skipif(not os.path.exists(BASH), reason="needs /bin/bash")
@@ -74,24 +108,64 @@ needs_bash = pytest.mark.skipif(not os.path.exists(BASH), reason="needs /bin/bas
 
 def test_the_drift_job_timeout_clears_the_suite_time_test_yml_measured():
     """test.yml's own comment puts the unsharded 3.12 suite at ~55-67 min; a cap below that cancels the job with no result."""
-    assert _drift_job()["timeout-minutes"] >= 100
+    assert _job("drift")["timeout-minutes"] >= 100
 
 
-def test_the_issue_step_runs_whatever_happened_before_it():
-    assert _step(ISSUE_STEP_NAME)["if"].strip() == "always()"
-    assert _step("Fail the run when the drift was red")["if"].strip().startswith("always()")
+def test_the_reporter_is_a_separate_job_that_runs_after_whatever_happened_to_the_drift_job():
+    """An always() step INSIDE the job a timeout cancels has no guaranteed budget; a job of its own does."""
+    jobs = _workflow()["jobs"]
+    report = jobs["report"]
+    assert report is not jobs["drift"]
+    assert "drift" in _needs("report")
+    assert "always()" in str(report["if"])
+    # it is not the job that holds the suite, and the job that holds the suite does not hold the reporter
+    assert not any("dep_drift.py" in str(s.get("run", "")) for s in report["steps"])
+    assert not any(s.get("name") == ISSUE_STEP_NAME for s in jobs["drift"]["steps"])
+    assert 0 < report["timeout-minutes"] <= 15 < jobs["drift"]["timeout-minutes"]
 
 
-def test_the_issue_step_is_told_the_job_status_and_the_drift_code():
-    env = _step(ISSUE_STEP_NAME)["env"]
-    assert env["DRIFT_CODE"] == "${{ steps.drift.outputs.code }}"
-    assert env["JOB_STATUS"] == "${{ job.status }}"
+def test_the_reporter_still_has_the_forks_guard_the_drift_job_has():
+    """always() also runs when `drift` was skipped, and a fork's skipped drift must not file an issue on the fork."""
+    assert "github.repository == 'levainhq/levain'" in str(_job("report")["if"])
+
+
+def test_the_reporter_has_no_checkout_and_reads_the_repo_from_gh_repo():
+    report = _job("report")
+    assert not any(str(s.get("uses", "")).startswith("actions/checkout") for s in report["steps"])
+    env = _step("report", ISSUE_STEP_NAME)["env"]
+    assert env["GH_REPO"] == "${{ github.repository }}"
+
+
+def test_the_reporter_is_told_the_drift_jobs_result_and_exit_code():
+    env = _step("report", ISSUE_STEP_NAME)["env"]
+    assert env["DRIFT_CODE"] == "${{ needs.drift.outputs.code }}"
+    assert env["JOB_STATUS"] == "${{ needs.drift.result }}"
+    assert env["GH_TOKEN"] == "${{ github.token }}"
+    assert _job("drift")["outputs"] == {"code": "${{ steps.drift.outputs.code }}"}
+
+
+def test_only_the_reporter_may_write_issues():
+    wf = _workflow()
+    assert wf["permissions"] == {"contents": "read"}
+    assert "issues" not in (wf["jobs"]["drift"].get("permissions") or {})
+    assert wf["jobs"]["report"]["permissions"] == {"issues": "write", "contents": "read"}
+
+
+def test_the_drift_job_still_fails_the_run_on_red_and_saves_its_log_for_the_reporter():
+    assert _step("drift", "Fail the run when the drift was red")["if"].strip().startswith("always()")
+    upload = _step("drift", "Keep the drift log")
+    assert upload["if"].strip() == "always()"
+    assert upload.get("continue-on-error") is True
+    assert upload["with"]["name"] == "drift-log" and upload["with"]["path"].endswith("/drift.log")
+    download = next(s for s in _job("report")["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact"))
+    assert download["with"]["name"] == "drift-log"
+    assert download.get("continue-on-error") is True, "a night with no saved log (the job was cut first) must still be reported"
+    assert download["with"]["path"].endswith("/drift-log")
 
 
 def test_the_drift_runs_stay_serialised_and_the_label_is_the_dedupe_key():
-    wf = yaml.safe_load(DRIFT_YML.read_text())
-    assert wf["concurrency"] == {"group": "dep-drift", "cancel-in-progress": False}
-    run = _step(ISSUE_STEP_NAME)["run"]
+    assert _workflow()["concurrency"] == {"group": "dep-drift", "cancel-in-progress": False}
+    run = _step("report", ISSUE_STEP_NAME)["run"]
     assert "gh issue list --state open --label dep-drift" in run
 
 
@@ -99,9 +173,9 @@ def test_the_drift_runs_stay_serialised_and_the_label_is_the_dedupe_key():
 
 @needs_bash
 def test_a_timed_out_job_files_a_did_not_finish_issue_not_a_red_one(tmp_path):
-    """The job was cancelled mid-suite: the drift step never wrote its exit code, so DRIFT_CODE is empty."""
-    rc, calls, body, err = _run_issue_step(tmp_path, code="", log_lines=["collecting ...", "tests/test_x.py ..."],
-                                           job_status="cancelled")
+    """The drift job was cancelled mid-suite: needs.drift.result is "cancelled" and its code output was never written."""
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="", drift_result="cancelled",
+                                                  log_lines=["collecting ...", "tests/test_x.py ..."])
     assert rc == 0, err
     assert any(c.startswith("gh issue create") for c in calls), calls
     assert "did not finish" in body.lower()
@@ -112,7 +186,7 @@ def test_a_timed_out_job_files_a_did_not_finish_issue_not_a_red_one(tmp_path):
 
 @needs_bash
 def test_a_failed_setup_step_with_no_log_at_all_still_files_an_issue(tmp_path):
-    rc, calls, body, err = _run_issue_step(tmp_path, code="", log_lines=None, job_status="failure")
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="", drift_result="failure", log_lines=None)
     assert rc == 0, err
     assert any(c.startswith("gh issue create") for c in calls), calls
     assert "did not finish" in body.lower() and "failure" in body
@@ -120,7 +194,8 @@ def test_a_failed_setup_step_with_no_log_at_all_still_files_an_issue(tmp_path):
 
 @needs_bash
 def test_a_did_not_finish_night_comments_on_the_one_open_issue_instead_of_opening_a_second(tmp_path):
-    rc, calls, body, err = _run_issue_step(tmp_path, code="", log_lines=["x"], existing="7", job_status="cancelled")
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="", drift_result="cancelled", log_lines=["x"],
+                                                  existing="7")
     assert rc == 0, err
     assert [c for c in calls if c.startswith("gh issue comment 7")], calls
     assert not any(c.startswith("gh issue create") or c.startswith("gh issue close") for c in calls), calls
@@ -128,7 +203,8 @@ def test_a_did_not_finish_night_comments_on_the_one_open_issue_instead_of_openin
 
 @needs_bash
 def test_a_red_night_names_the_changed_packages_and_the_failing_tests(tmp_path):
-    rc, calls, body, err = _run_issue_step(tmp_path, code="1", log_lines=["noise", RESULT_LINE])
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="1", drift_result="failure",
+                                                  log_lines=["noise", RESULT_LINE])
     assert rc == 0, err
     assert any(c.startswith("gh issue create") for c in calls), calls
     assert "Red on" in body and "foo 1.0 -> 1.1" in body and "tests/test_a.py::t" in body
@@ -137,7 +213,8 @@ def test_a_red_night_names_the_changed_packages_and_the_failing_tests(tmp_path):
 
 @needs_bash
 def test_a_red_night_with_no_result_line_says_the_script_died(tmp_path):
-    rc, calls, body, err = _run_issue_step(tmp_path, code="2", log_lines=["Traceback ..."], existing="7")
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="2", drift_result="failure",
+                                                  log_lines=["Traceback ..."], existing="7")
     assert rc == 0, err
     assert [c for c in calls if c.startswith("gh issue comment 7")], calls
     assert "none (the script died before printing one)" in body
@@ -145,7 +222,8 @@ def test_a_red_night_with_no_result_line_says_the_script_died(tmp_path):
 
 @needs_bash
 def test_a_green_night_closes_the_open_issue_and_files_nothing(tmp_path):
-    rc, calls, body, err = _run_issue_step(tmp_path, code="0", log_lines=[RESULT_LINE], existing="7")
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="0", drift_result="success",
+                                                  log_lines=[RESULT_LINE], existing="7")
     assert rc == 0, err
     assert [c for c in calls if c.startswith("gh issue close 7")], calls
     assert not any(c.startswith("gh issue create") or c.startswith("gh issue comment") for c in calls), calls
@@ -153,9 +231,32 @@ def test_a_green_night_closes_the_open_issue_and_files_nothing(tmp_path):
 
 @needs_bash
 def test_a_green_night_with_no_open_issue_does_nothing(tmp_path):
-    rc, calls, body, err = _run_issue_step(tmp_path, code="0", log_lines=["ok"], existing="")
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="0", drift_result="success", log_lines=["ok"],
+                                                  existing="")
     assert rc == 0, err
     assert not any(c.startswith(("gh issue create", "gh issue comment", "gh issue close")) for c in calls), calls
+
+
+@needs_bash
+def test_every_gh_call_names_its_repository_because_the_reporter_has_no_git_remote(tmp_path):
+    """gh reads GH_REPO, not GITHUB_REPOSITORY; with checkout failed or absent there is no remote to fall back on."""
+    rc, calls, body, err, repos = _run_issue_step(tmp_path, code="", drift_result="cancelled", log_lines=["x"])
+    assert rc == 0, err
+    assert calls and set(repos) == {"levainhq/levain"}, (calls, repos)
+
+
+# --- every workflow file, .yml and .yaml ----------------------------------------------------------------------------------
+
+def _workflow_files(root=WORKFLOWS):
+    """Every workflow GitHub would run: both spellings of the extension."""
+    return sorted(p for p in Path(root).iterdir() if p.suffix in (".yml", ".yaml"))
+
+
+def test_the_workflow_enumeration_reads_both_extensions(tmp_path):
+    for name in ("a.yml", "b.yaml", "c.txt", "d.yml.bak"):
+        (tmp_path / name).write_text("x: 1\n")
+    assert [p.name for p in _workflow_files(tmp_path)] == ["a.yml", "b.yaml"]
+    assert {"test.yml", "dep-drift.yml"} <= {p.name for p in _workflow_files()}
 
 
 # --- one uv pin, one pip pin ----------------------------------------------------------------------------------------------
@@ -166,14 +267,18 @@ def _script_pin(name):
     return m[1]
 
 
-def _pins_in_workflows(package):
-    """Every `<package>==X` under .github/workflows, as {file: [X, ...]}."""
+def _pins_in_workflows(package, root=WORKFLOWS):
+    """Every `<package>==X` under the workflows directory (.yml and .yaml), as {file: [X, ...]}."""
     found = {}
-    for wf in sorted(WORKFLOWS.glob("*.yml")):
+    for wf in _workflow_files(root):
         hits = re.findall(rf'(?<![\w-]){package}==([0-9][0-9.]*)', wf.read_text())
         if hits:
             found[wf.name] = hits
     return found
+
+
+def _pin_errors(package, want, root=WORKFLOWS):
+    return {f: v for f, v in _pins_in_workflows(package, root).items() if set(v) != {want}}
 
 
 def test_every_workflow_uv_pin_is_the_scripts_default():
@@ -182,8 +287,14 @@ def test_every_workflow_uv_pin_is_the_scripts_default():
     # The sites that exist today; a site that disappears or a new file that pins uv must be looked at, not skipped.
     assert set(found) == {"test.yml", "dep-drift.yml"}, found
     assert sum(len(v) for v in found.values()) >= 3, found
-    wrong = {f: v for f, v in found.items() if set(v) != {want}}
-    assert not wrong, f"uv pinned differently from scripts/ci_install_locked.sh ({want}): {wrong}"
+    assert not _pin_errors("uv", want), f"uv pinned differently from scripts/ci_install_locked.sh ({want})"
+
+
+def test_a_divergent_uv_pin_in_a_yaml_file_is_caught(tmp_path):
+    (tmp_path / "ok.yml").write_text("run: python -m pip install uv==9.9.9\n")
+    (tmp_path / "release.yaml").write_text("run: python -m pip install uv==0.12.0\n")
+    assert _pin_errors("uv", "9.9.9", tmp_path) == {"release.yaml": ["0.12.0"]}
+    assert set(_pins_in_workflows("uv", tmp_path)) == {"ok.yml", "release.yaml"}
 
 
 def test_the_workflow_pip_pin_is_the_scripts_default():
@@ -193,9 +304,23 @@ def test_the_workflow_pip_pin_is_the_scripts_default():
     assert re.findall(r'(?<![\w-])pip==([0-9][0-9.]*)', text) == [want]
 
 
+def _uv_literals(text):
+    """Every `uv==X.Y` version literal in ``text``; an f-string hole or a bare `uv==` has none."""
+    return re.findall(r'(?<![\w-])uv==[0-9]+(?:\.[0-9]+)*(?:[.-]?(?:post|dev|rc|a|b)[0-9]*)?', text)
+
+
 def test_the_stale_lock_message_quotes_the_scripts_uv_pin():
     text = (ROOT / "tests" / "test_ci_install_locked.py").read_text()
-    assert "0.13.5" not in text, "test_ci_install_locked.py quotes a literal uv version; it must read the script's default"
+    assert not _uv_literals(text), (
+        "test_ci_install_locked.py quotes a literal uv version; it must read the script's UV_VERSION: "
+        f"{_uv_literals(text)}")
+
+
+def test_the_uv_literal_check_sees_any_version_and_not_a_computed_one():
+    assert _uv_literals("regenerate with uv==0.13.5") == ["uv==0.13.5"]
+    assert _uv_literals("regenerate with uv==0.14.2.post1") == ["uv==0.14.2.post1"]
+    assert _uv_literals("uv==1") == ["uv==1"]
+    assert _uv_literals('f"`uv=={_pinned_uv()}`" and "uv==" in boot') == []
 
 
 # --- h11 for the system python, installed from a hashed file ---------------------------------------------------------------
@@ -229,12 +354,62 @@ def test_the_root_h11_file_satisfies_the_floor_root_vendors():
     assert tuple(int(x) for x in _file_h11()[0].split(".")) >= floor
 
 
+PIP_INSTALL_UNDER_PYTHON3 = re.compile(r"python3(?:\.\d+)?\s+-m\s+pip\s+install\b")
+
+
+def _root_h11_installs(root=WORKFLOWS):
+    """Every logical command line, in every step's ``run`` string of every workflow (.yml and .yaml, the one-line form
+    and the ``run: |`` block form alike), that runs ``python3 -m pip install`` and names h11: (file, job, command)."""
+    found = []
+    for wf in _workflow_files(root):
+        for job_name, job in (yaml.safe_load(wf.read_text()) or {}).get("jobs", {}).items():
+            for step in job.get("steps") or []:
+                run = step.get("run")
+                if not isinstance(run, str):
+                    continue
+                for line in run.replace("\\\n", " ").splitlines():
+                    if PIP_INSTALL_UNDER_PYTHON3.search(line) and "h11" in line:
+                        found.append((wf.name, job_name, line.strip()))
+    return found
+
+
+def _root_h11_problems(installs):
+    return [i for i in installs
+            if "--require-hashes" not in i[2] or not re.search(r"-r\s+requirements-ci-root-h11\.txt\b", i[2])
+            or "h11-spec" in i[2]]
+
+
 def test_every_root_h11_install_is_hashed_and_from_the_file():
-    seen = 0
-    for wf in sorted(WORKFLOWS.glob("*.yml")):
-        for m in re.finditer(r"^\s*run: (sudo /usr/bin/python3 -m pip install .*)$", wf.read_text(), re.M):
-            seen += 1
-            cmd = m[1]
-            assert "--require-hashes" in cmd and "-r requirements-ci-root-h11.txt" in cmd, (wf.name, cmd)
-            assert "h11-spec" not in cmd, (wf.name, cmd)
-    assert seen == 3, f"expected the three root h11 installs (two in test.yml, one in dep-drift.yml), found {seen}"
+    installs = _root_h11_installs()
+    assert not _root_h11_problems(installs), _root_h11_problems(installs)
+    assert len(installs) == 3, f"expected the three root h11 installs (two in test.yml, one in dep-drift.yml), found {installs}"
+
+
+def _write_workflow(tmp_path, name, run_block):
+    (tmp_path / name).write_text("jobs:\n  j:\n    runs-on: x\n    steps:\n      - name: s\n        run: " + run_block)
+    return tmp_path
+
+
+def test_a_root_h11_install_in_block_form_is_counted_and_an_unhashed_one_is_caught(tmp_path):
+    good = "sudo /usr/bin/python3 -m pip install --break-system-packages --require-hashes --no-deps -r requirements-ci-root-h11.txt"
+    _write_workflow(tmp_path, "good.yaml", "|\n          set -e\n          " + good + "\n")
+    (_write_workflow(tmp_path, "bad.yml", "|\n          set -e\n"
+                     "          sudo /usr/bin/python3 -m pip install --break-system-packages h11==0.16.0\n"))
+    installs = _root_h11_installs(tmp_path)
+    assert {i[0] for i in installs} == {"good.yaml", "bad.yml"}, installs
+    assert {i[0] for i in _root_h11_problems(installs)} == {"bad.yml"}
+
+
+def test_a_root_h11_install_continued_over_lines_is_read_as_one_command(tmp_path):
+    cont = "|\n          sudo /usr/bin/python3 -m pip install --break-system-packages \\\n            --require-hashes -r requirements-ci-root-h11.txt\n"
+    _write_workflow(tmp_path, "cont.yml", cont)
+    installs = _root_h11_installs(tmp_path)
+    assert len(installs) == 1 and not _root_h11_problems(installs), installs
+    loose = "|\n          sudo /usr/bin/python3 -m pip install --break-system-packages \\\n            -r requirements-ci-root-h11.txt\n"
+    _write_workflow(tmp_path, "loose.yml", loose)
+    assert {i[0] for i in _root_h11_problems(_root_h11_installs(tmp_path))} == {"loose.yml"}
+
+
+def test_an_unhashed_root_h11_install_in_a_yaml_file_is_caught(tmp_path):
+    _write_workflow(tmp_path, "release.yaml", "sudo /usr/bin/python3 -m pip install --break-system-packages h11\n")
+    assert [i[0] for i in _root_h11_problems(_root_h11_installs(tmp_path))] == ["release.yaml"]
