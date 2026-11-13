@@ -64,7 +64,6 @@ CHECKS = [
     ("dangling_band", "unknown: a dangling band link"),
     ("dangling_link", "unknown: a dangling queue link"),
     ("unchecked_document", "unknown: a document path the evidence never checked"),
-    ("gate_expired", "unknown: a gate past its recheck date"),
     ("conflict_closed_seat", "unknown: conflict, closed on main and a live seat"),
     ("conflict_closed_band", "unknown: conflict, closed on main and an open band row"),
     ("conflict_chain_orphan", "unknown: conflict, in the chain and an orphan branch"),

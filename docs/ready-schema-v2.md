@@ -41,7 +41,7 @@ The first rule that fires wins. The checks in section 4 run before this table, s
 | 4 | landing | commits carrying the id are in a live `queue/*` ref beyond origin/main, or a land waiter names the id |
 | 5 | in_flight | a live seat names the id or holds a branch carrying it |
 | 6 | landed_not_closed | commits carrying the id are on origin/main and rule 2 did not close it by the item's own `done_kind` (a closing trailer closes only a `merged` item; for `document`, `run` and `band` the file or the np row closes it), and no orphan branch carries more |
-| 7 | blocked | a `depends_on` link is unmet |
+| 7 | blocked | a `depends_on` link is unmet; if one of them is a `gate:` past its `recheck` date (judged against the UTC date of `now`) the item reads `unknown` instead, with the gate as the reason |
 | 8 | ready_with_start | an orphan branch carries the id: `ahead` > 0 (section 6) and no live seat holds it |
 | 9 | needs_grooming | no `done`, or a tier outside `sonnet`/`opus`/`haiku` |
 | 10 | ready | none of the above |
@@ -58,8 +58,7 @@ Checked in this order; the first that applies is the reason line.
 4. the item is in a `depends_on` cycle (`cycle a -> b -> a`).
 5. a typed link names nothing: `item:` not in the store, `band:` not in the band, `link:` not a ref on origin and not merged.
 6. a `document`/`run` item's path was never checked.
-7. a `gate:` is past its `recheck` date, judged against the UTC date of `now`.
-8. evidence contradicts itself, neither side winning: closed on main and a live seat names the id · closed on main and an open band row names it · in the chain and an orphan branch (`ahead` > 0) with commits the chain lacks.
+7. evidence contradicts itself, neither side winning: closed on main and a live seat names the id · closed on main and an open band row names it · in the chain and an orphan branch (`ahead` > 0) with commits the chain lacks.
 
 ## 5. The item store record (`items.jsonl`, one JSON object per line, append-only)
 
@@ -77,7 +76,7 @@ Common: `{"v": 1, "op": "add"|"amend"|"decide", "id": "<repo>#<n>", "at": "<UTC 
 
 ## 7. The board and the audit
 
-`{"schema": "ready-v2", "as_of", "items": [{id, repo, title, tier, state, column, reason, refs, as_of}], "audit": [{kind, id, why}], "unattributed", "problems"}`. Items are ordered by repo, then item number. Every unreadable source is reported on the board itself, whether or not an item needed it: one audit `unknown` entry (no id) and one `problems` line, `<source> unreadable: <why>`, so an empty store or an unread `unattributed` scan is never a clean board. An item appears in the audit once: an item that reads unknown because its gate expired is listed as `gate_expired`, any other unknown item as `unknown`. Where evidence ties (equal dates, several seats, refs or rows), the choice is made by sha, name or ref, never by list position, so two readers print one line for one world. The audit kinds are `unknown`, `landed_not_closed`, `gate_expired`, `unattributed_work` and `unknown_id_in_trailer`; a non-empty audit fails the pace gate's no-ready verdict.
+`{"schema": "ready-v2", "as_of", "items": [{id, repo, title, tier, state, column, reason, refs, as_of}], "audit": [{kind, id, why}], "unattributed", "problems"}`. Items are ordered by repo, then item number. Every unreadable source is reported on the board itself, whether or not an item needed it: one audit `unknown` entry (no id) and one `problems` line, `<source> unreadable: <why>`, so an empty store or an unread `unattributed` scan is never a clean board. An item appears in the audit once: an item that reads unknown because its gate expired is listed as `gate_expired`, any other unknown item as `unknown`. A gate past its recheck date beside a state that does not rest on it (`needs_you`, `landing`, `in_flight`, `landed_not_closed`) leaves the state alone and adds one `gate_expired` entry; a `done` or decided item is never touched by a gate. Where evidence ties (equal dates, several seats, refs or rows), the choice is made by sha, name or ref, never by list position, so two readers print one line for one world. The audit kinds are `unknown`, `landed_not_closed`, `gate_expired`, `unattributed_work` and `unknown_id_in_trailer`; a non-empty audit fails the pace gate's no-ready verdict.
 
 ## 8. Versioning
 
