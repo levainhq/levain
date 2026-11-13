@@ -455,6 +455,39 @@ def test_an_oversized_log_comments_on_the_open_issue_within_the_cap(tmp_path):
     assert len(_one_body(raw)) <= _script_constant("BODY_MAX")
 
 
+@needs_bash
+def test_a_log_that_lost_only_whole_lines_still_ends_with_the_marker(tmp_path):
+    """Nothing here is clipped by length: 61 short lines, so the oldest one is dropped from the tail and the body must say so."""
+    tail = _script_constant("TAIL_LINES")
+    log = ["n%02d" % i for i in range(tail)] + [RESULT_LINE]
+    assert len(log) == tail + 1
+    body = _filed(tmp_path, log_lines=log)
+    assert "n00\n" not in body and "n01\n" in body, "the oldest line is the one that gave way"
+    assert len(body) < _script_constant("BODY_MAX") // 10, "no length cut is in play: only the line count dropped something"
+    assert body.endswith("\n" + MARK + "\n"), body[-120:]
+
+
+@needs_bash
+def test_a_log_of_exactly_the_tail_length_loses_nothing_and_gets_no_marker(tmp_path):
+    tail = _script_constant("TAIL_LINES")
+    log = ["n%02d" % i for i in range(tail - 1)] + [RESULT_LINE]
+    assert len(log) == tail
+    body = _filed(tmp_path, log_lines=log)
+    assert "n00\n" in body, "all of the log is shown"
+    assert MARK not in body
+
+
+@needs_bash
+def test_a_newline_inside_a_list_entry_cannot_make_extra_markdown_lines(tmp_path):
+    line = ('DEP_DRIFT {"result": "red", "stage": "suite", "changed": ["foo 1.0 -> 1.1\\n## Injected\\n- extra"],'
+            ' "failed_tests": ["tests/a.py::t\\r\\n# Heading"]}')
+    body = _filed(tmp_path, log_lines=[line])
+    section = body.split("Log tail:")[0]
+    assert "- foo 1.0 -> 1.1 ## Injected - extra\n" in section, section
+    assert "- tests/a.py::t  # Heading\n" in section, section
+    assert not [ln for ln in section.splitlines() if ln.startswith("#")], section
+
+
 NORMAL_RED = (
     'Red on 2026-11-13: the suite does not pass on a freshly re-resolved lock.\n\n'
     'Run: https://github.com/levainhq/levain/actions/runs/42\n\n'

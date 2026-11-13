@@ -169,7 +169,7 @@ jobs:
               global cut
               lines, used = [], 0
               for i, c in enumerate(seq):
-                  b = "- " + clip(str(c), ITEM_MAX)
+                  b = "- " + clip(str(c).replace("\r", " ").replace("\n", " "), ITEM_MAX)
                   if used + len(b) + 1 > LIST_MAX:
                       lines.append("- ... and %d more" % (len(seq) - i))
                       cut = True
@@ -227,6 +227,8 @@ jobs:
           # The tail takes what is left of BODY_MAX (room kept for both fences and the marker), newest lines first.
           budget = BODY_MAX - len(prefix) - 2 * (TAIL_LINE_MAX + 2) - len(MARK) - 4
           kept, used = [], 0
+          if len(log_lines) > TAIL_LINES:  # the slice below drops the oldest whole lines, and a body that lost lines says so
+              cut = True
           for ln in reversed([clip(ln, TAIL_LINE_MAX) for ln in log_lines[-TAIL_LINES:]]):
               if used + len(ln) + 1 > budget:
                   cut = True
