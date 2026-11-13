@@ -19,6 +19,8 @@
   var POLL_OPEN_MS = 4000;      // while the view is open
   var POLL_HIDDEN_MS = 12000;   // while the page is hidden
   var KEEP_SENT = 30;
+  var MAX_THREADS = 6;          // threads kept and drawn
+  var POLL_THREADS = 3;         // the newest of them read on every tick, one request each
   var AMBIGUOUS_WORDS = "It may not have arrived. It is not sent again; say whether it did.";
   var UNWIRED_WORDS = "This cockpit has no desk wired.";
   var LEASE_STATES = { held: 1, none: 1, unknown: 1 };
@@ -92,11 +94,12 @@
   }
 
   // Fold one batch of events into the events held. The host returns the events AFTER the cursor it was given: a first batch (no
-  // cursor held) is the whole thread; a batch whose cursor is the one already held holds nothing new; a batch with no cursor
-  // cannot be followed, so it replaces what is held.
+  // cursor held) is the whole thread; a batch whose cursor is the one already held holds nothing new; a batch with no cursor of
+  // its own cannot be followed: it is appended when it came after a held cursor (those events are new) and the cursor goes null,
+  // so the next read asks for the whole thread again and replaces what is held.
   function mergeEvents(held, cursor, batch) {
     if (batch.unreadable) return { events: held, cursor: cursor };
-    if (batch.cursor === null) return { events: batch.events, cursor: null };
+    if (batch.cursor === null) return { events: cursor === null ? batch.events : held.concat(batch.events), cursor: null };
     if (cursor === null) return { events: batch.events, cursor: batch.cursor };
     if (batch.cursor === cursor) return { events: held, cursor: cursor };
     return { events: held.concat(batch.events), cursor: batch.cursor };
@@ -130,6 +133,13 @@
     }
     return { status: "failed", words: "The server answered " + status + "; the line may or may not have been filed. Sending again will not duplicate it.", ref: "", thread: null, settle: false, clear: false };
   }
+  // The note under a filed line. The ref is the host's own first line and often says "Filed" itself: it is drawn once, never as
+  // "Filed: Filed ...". Host text: the caller sets it with textContent.
+  function filedNote(ref) {
+    var r = str(ref);
+    if (!r) return "Filed";
+    return /^filed\b/i.test(r) ? r : "Filed: " + r;
+  }
   // The two marks an ambiguous line offers, drawn by the page alone (no route): the server never re-sends an ambiguous claim by
   // itself, and what the person says here is theirs, never the desk's.
   var ARRIVED_WORDS = "It arrived (your word; the desk has not confirmed it).";
@@ -159,7 +169,7 @@
       var row = el(doc, "div", "rv-line rv-you dv-you dv-" + it.status);
       row.appendChild(el(doc, "div", "rv-text", shown(it.text)));
       var note = el(doc, "div", "rv-note dv-status", it.status === "sending" ? "Filing..." :
-        (it.status === "filed" ? "Filed" + (it.ref ? ": " + shown(it.ref) : "") : shown(it.words)));
+        (it.status === "filed" ? shown(filedNote(it.ref)) : shown(it.words)));
       note.setAttribute("role", "status");
       row.appendChild(note);
       if (it.status === "ambiguous" && it.id && onMark) {
@@ -191,8 +201,11 @@
     var f = opts.fetch || root.fetch.bind(root);
     var headers = opts.headers || function () { return {}; };
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
-    var stopped = false, timer = 0, gen = 0, reading = false;
-    var current = null, thread = null, cursor = null, held = [], log = [], lastKey = "", note = "";
+    var stopped = false, timer = 0, gen = 0, reading = false, again = false;
+    // `threads` is the ordered list of the threads this page's sends returned (the host files each typed line under a NEW
+    // thread): {id, cursor, events} each, oldest first, at most MAX_THREADS. There is no "current thread": a read names the
+    // thread it asked for and is applied to that thread alone. `log` holds the lines this page sent.
+    var current = null, threads = [], log = [], lastKey = "", note = "";
     var flight = { send: false };
 
     var wrap = el(doc, "div", "rv dv"), top = el(doc, "div", "rv-top"), bar = el(doc, "div", "dv-state"),
@@ -207,7 +220,8 @@
     var wasEnd = true;
     function atEnd() { return body.scrollHeight - body.scrollTop - body.clientHeight <= 100; }
     function toEnd() { body.scrollTop = body.scrollHeight; }
-    body.addEventListener("scroll", function () { wasEnd = atEnd(); });
+    function onBodyScroll() { wasEnd = atEnd(); }
+    body.addEventListener("scroll", onBodyScroll);
     function fitViewport() {
       if (stopped || !vv) return;
       rootEl.style.setProperty("--rv-vvh", vv.height + "px");
@@ -254,18 +268,42 @@
     }
     function settle(id) { var p = kept("levain.desk.send"); if (p && p.id === id) keep("levain.desk.send", null); }
     function saveLog() {
-      var sent = log.filter(function (x) { return x.k === "you" && x.status !== "sending"; }).slice(-KEEP_SENT);
+      var sent = log.filter(function (x) { return x.status !== "sending"; }).slice(-KEEP_SENT);
       keep("levain.desk.sent", sent);
     }
     var priorSent = kept("levain.desk.sent");
     if (Array.isArray(priorSent)) {
       priorSent.forEach(function (x) {
-        if (x && x.k === "you" && typeof x.text === "string" && typeof x.status === "string") log.push({ k: "you", id: str(x.id), text: x.text, status: x.status, words: str(x.words), ref: str(x.ref) });
+        if (x && x.k === "you" && typeof x.text === "string" && typeof x.status === "string") log.push({ k: "you", id: str(x.id), text: x.text, status: x.status, words: str(x.words), ref: str(x.ref), thread: str(x.thread) });
       });
     }
     try { var d0 = store && store.getItem("levain.desk.draft"); if (d0) ta.value = d0; } catch (e) { /* no storage */ }
-    var t0 = kept("levain.desk.thread");
-    if (typeof t0 === "string" && t0) thread = t0;
+    function saveThreads() { keep("levain.desk.threads", threads.map(function (t) { return { id: t.id, cursor: t.cursor, events: t.events }; })); }
+    function threadById(id) {
+      for (var i = 0; i < threads.length; i++) if (threads[i].id === id) return threads[i];
+      return null;
+    }
+    // the threads kept from an earlier mount; an old single remembered thread becomes a one-entry list
+    var priorThreads = kept("levain.desk.threads");
+    if (Array.isArray(priorThreads)) {
+      priorThreads.forEach(function (x) {
+        if (!x || typeof x !== "object" || typeof x.id !== "string" || !x.id || threadById(x.id)) return;
+        var evs = Array.isArray(x.events) ? x.events.filter(function (e) { return e && typeof e === "object"; }).map(function (e) { return { by: str(e.by), kind: str(e.kind), text: str(e.text), at: str(e.at) }; }) : [];
+        threads.push({ id: x.id, cursor: typeof x.cursor === "string" && x.cursor ? x.cursor : null, events: evs, unreadable: false });
+      });
+      threads = threads.slice(-MAX_THREADS);
+    } else {
+      var t0 = kept("levain.desk.thread");
+      if (typeof t0 === "string" && t0) { threads.push({ id: t0, cursor: null, events: [], unreadable: false }); saveThreads(); }
+    }
+    keep("levain.desk.thread", null);
+    // a send's thread joins the end of the list (a thread already kept stays where it is); the oldest past the limit go
+    function addThread(id) {
+      if (!id || threadById(id)) return;
+      threads.push({ id: id, cursor: null, events: [], unreadable: false });
+      threads = threads.slice(-MAX_THREADS);
+      saveThreads();
+    }
 
     function grow() { ta.style.height = "auto"; if (ta.scrollHeight) ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + "px"; }
     function canSend() { return !!current && current.kind === "wired"; }
@@ -288,10 +326,26 @@
       sendB.click();
     });
 
+    // The rows drawn: each line this page sent is followed by the events of ITS thread (took, held, reply), in order, so a first
+    // line's answers stay beside it after a second is sent. A kept thread with no line drawn (an older page's thread, or one
+    // whose line has aged out of the log) comes last.
+    function rows() {
+      var out = [], used = {};
+      function evs(t) { t.events.forEach(function (e) { out.push({ k: "ev", by: e.by, kind: e.kind, text: e.text, at: e.at }); }); }
+      log.forEach(function (it) {
+        out.push(it);
+        var t = it.thread && !own(used, it.thread) ? threadById(it.thread) : null;
+        if (t) { used[t.id] = 1; evs(t); }
+      });
+      threads.forEach(function (t) { if (!own(used, t.id)) evs(t); });
+      return out;
+    }
+    function unreadableNow() { return threads.slice(-POLL_THREADS).some(function (t) { return t.unreadable; }); }
+
     function draw() {
-      var key = JSON.stringify([current, log, thread ? 1 : 0, note]);
+      var all = rows();
+      var key = JSON.stringify([current, all, unreadableNow(), note]);
       if (key === lastKey) { paintDock(); return; }
-      lastKey = key;
       var stick = wasEnd || atEnd();
       clear(bar);
       if (current && current.kind === "wired") {
@@ -303,25 +357,31 @@
           go.addEventListener("click", function () { var j = doc.querySelector('[data-phone-jump="drop"]'); if (j) j.click(); });
           bar.appendChild(go);
         }
-        if (current.unreadable && thread) bar.appendChild(el(doc, "div", "rv-note dv-unreadable", "The desk's answers could not be fetched just now."));
+        if (unreadableNow()) bar.appendChild(el(doc, "div", "rv-note dv-unreadable", "The desk's answers could not be fetched just now."));
       } else if (current) {
         bar.className = "dv-state dv-state-" + current.kind;
         bar.appendChild(el(doc, "div", "dv-leasewords", shown(current.words)));
       } else { bar.className = "dv-state"; }
       clear(body);
       var stream = el(doc, "div", "rv-stream");
-      if (!log.length) stream.appendChild(el(doc, "div", "rv-note", current && current.kind === "wired" ? "Nothing here yet. A line you send is filed for the desk; what it files back shows here." : ""));
-      log.forEach(function (it) { stream.appendChild(renderEntry(doc, it, mark)); });
+      if (!all.length) stream.appendChild(el(doc, "div", "rv-note", current && current.kind === "wired" ? "Nothing here yet. A line you send is filed for the desk; what it files back shows here." : ""));
+      all.forEach(function (it) { stream.appendChild(renderEntry(doc, it, mark)); });
       body.appendChild(stream);
       if (stick) toEnd();
       wasEnd = atEnd();
+      lastKey = key;       // only a draw that finished is remembered: one that threw is drawn again by the next
       paintDock();
     }
 
+    // One request, as a promise that can only settle: a synchronous throw (the transport's headers() failing, a blocked store)
+    // is a rejection like any other, so no flag is left set by a call that never started. `init` builds the options.
+    function ask(url, init) {
+      var p;
+      try { p = Promise.resolve(f(url, init())); } catch (e) { return Promise.reject(e); }
+      return p.then(function (res) { return res.text().then(function (t) { var j = null; try { j = JSON.parse(t); } catch (e) { /* not JSON */ } return { status: res.status, json: j }; }); });
+    }
     function post(payload) {
-      var h = Object.assign({ "Content-Type": "application/json" }, headers());
-      return f(SEND_PATH, { method: "POST", headers: h, body: JSON.stringify(payload) })
-        .then(function (res) { return res.text().then(function (t) { var j = null; try { j = JSON.parse(t); } catch (e) { /* not JSON */ } return { status: res.status, json: j }; }); });
+      return ask(SEND_PATH, function () { return { method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, headers()), body: JSON.stringify(payload) }; });
     }
     function entryFor(id) {
       for (var i = 0; i < log.length; i++) if (log[i].k === "you" && log[i].id === id) return log[i];
@@ -333,23 +393,27 @@
       if (!canSend() || !text.trim() || flight.send) return;
       var id = tryId(text);
       var entry = entryFor(id);
-      if (!entry) { entry = { k: "you", id: id, text: text, status: "sending", words: "", ref: "" }; log.push(entry); }
+      if (!entry) { entry = { k: "you", id: id, text: text, status: "sending", words: "", ref: "", thread: "" }; log.push(entry); }
       entry.status = "sending";
-      flight.send = true; note = ""; draw(); toEnd();
+      flight.send = true; note = "";
+      try { draw(); toEnd(); } catch (e) { /* the line still goes; the next draw repaints */ }
+      // The failure path is the POST's alone: once the server has answered, nothing the page does with the answer (a draw, a
+      // save, the follow-up read) can turn a filed line into one marked unreached.
       post({ words: text, outbox_id: id }).then(function (r) {
         flight.send = false;
         var o = sendOutcome(r.status, r.json);
         entry.status = o.status; entry.words = o.words; entry.ref = o.ref;
         if (o.settle) settle(id);
         if (o.clear && !stopped && ta.value === text) { ta.value = ""; try { if (store) store.removeItem("levain.desk.draft"); } catch (e) { /* no storage */ } grow(); }
-        if (o.thread && o.thread !== thread) { thread = o.thread; cursor = null; held = []; log = log.filter(function (x) { return x.k === "you"; }); keep("levain.desk.thread", thread); }
-        saveLog(); draw(); toEnd();
-        return pull();
-      }).catch(function () {
+        if (o.thread) { entry.thread = o.thread; addThread(o.thread); }
+        try { saveLog(); draw(); toEnd(); } finally { pull(); }
+      }, function () {
         flight.send = false;
         entry.status = "failed"; entry.words = UNREACHED_WORDS;
         saveLog(); draw();
-      });
+      }).catch(function (e) {
+        if (root.console && root.console.error) root.console.error("desk view: " + (e && e.message ? e.message : e));
+      }).then(function () { flight.send = false; paintDock(); });
     }
     sendB.addEventListener("click", doSend);
 
@@ -372,33 +436,46 @@
       saveLog(); draw();
     }
 
-    function url() {
-      return DESK_PATH + (thread ? "?thread=" + encodeURIComponent(thread) + (cursor ? "&after=" + encodeURIComponent(cursor) : "") : "");
+    function urlFor(id, after) {
+      return DESK_PATH + (id ? "?thread=" + encodeURIComponent(id) + (after ? "&after=" + encodeURIComponent(after) : "") : "");
     }
-    function pull() {
-      if (stopped || reading) return Promise.resolve();
-      reading = true;
-      var my = gen;
-      return f(url(), { headers: headers() }).then(function (res) {
-        return res.text().then(function (t) { var j = null; try { j = JSON.parse(t); } catch (e) { /* not JSON */ } return { status: res.status, json: j }; });
-      }).catch(function () { return { status: 0, json: null }; }).then(function (r) {
-        reading = false;
+    // One read of one thread (null = the desk alone, when no send has named a thread yet). The thread's id and cursor are taken
+    // when the request starts and the answer is applied to THAT thread alone, found again by its id: an answer for a thread that
+    // has gone is dropped, and no answer ever changes which threads are kept or read.
+    function pullOne(id, my) {
+      var entry = id ? threadById(id) : null, after = entry ? entry.cursor : null;
+      return ask(urlFor(id, after), function () { return { headers: headers() }; }).catch(function () { return { status: 0, json: null }; }).then(function (r) {
         if (stopped || my !== gen) return;
         // 503 is the desk's poll gate being full (another device's poll, a slow host command): try again at the next interval and
         // keep what is on the page. It is never a state, so the error line is not drawn for it.
         if (r.status === 503) return;
+        var t = id ? threadById(id) : null;
+        if (id && (!t || t.cursor !== after)) return;
         var m = deskModel(r.status, r.json);
-        if (m.kind === "wired" && thread && m.thread === null) m.thread = thread;
         current = m;
-        if (m.kind === "wired") {
-          if (m.thread && m.thread !== thread) { thread = m.thread; cursor = null; held = []; keep("levain.desk.thread", thread); }
-          var merged = mergeEvents(held, cursor, m);
-          if (merged.events !== held || merged.cursor !== cursor) {
-            held = merged.events; cursor = merged.cursor;
-            log = log.filter(function (x) { return x.k === "you"; }).concat(held.map(function (e) { return { k: "ev", by: e.by, kind: e.kind, text: e.text, at: e.at }; }));
-          }
+        if (t && m.kind === "wired") {
+          t.unreadable = m.unreadable;
+          var merged = mergeEvents(t.events, t.cursor, m);
+          if (merged.events !== t.events || merged.cursor !== t.cursor) { t.events = merged.events; t.cursor = merged.cursor; saveThreads(); }
         }
         draw();
+      });
+    }
+    // One tick: the newest threads, newest first, one request each, one after another (the route holds few poll slots, and one
+    // device's reads must not fill them); with no thread yet, the desk alone. A pull asked for while one is running is not lost: ONE
+    // follow-up runs when it ends (a send's new thread is read at once, not a tick later).
+    function pull() {
+      if (stopped) return Promise.resolve();
+      if (reading) { again = true; return Promise.resolve(); }
+      reading = true; again = false;
+      var my = gen;
+      var ids = threads.length ? threads.slice(-POLL_THREADS).reverse().map(function (t) { return t.id; }) : [null];
+      function next(i) { return i >= ids.length || stopped || my !== gen ? Promise.resolve() : pullOne(ids[i], my).then(function () { return next(i + 1); }); }
+      return next(0).catch(function (e) {
+        if (root.console && root.console.error) root.console.error("desk view: " + (e && e.message ? e.message : e));
+      }).then(function () {
+        reading = false;
+        if (again && !stopped) { again = false; return pull(); }
       });
     }
     function schedule() {
@@ -415,6 +492,7 @@
       stop: function () {
         stopped = true; gen++; clearTimeout(timer);
         doc.removeEventListener("visibilitychange", onVisible);
+        body.removeEventListener("scroll", onBodyScroll);
         if (vv) {
           vv.removeEventListener("resize", fitViewport); vv.removeEventListener("scroll", fitViewport);
           rootEl.style.removeProperty("--rv-vvh"); rootEl.style.removeProperty("--rv-vvt"); if (doc.body) doc.body.classList.remove("dv-kb");
@@ -422,12 +500,12 @@
       },
       refresh: function () { return pull(); },
       model: function () { return current; },
-      log: function () { return log.slice(); }
+      log: function () { return rows(); }
     };
   }
 
   var api = {
-    deskModel: deskModel, leaseModel: leaseModel, eventModel: eventModel, mergeEvents: mergeEvents, sendOutcome: sendOutcome,
+    deskModel: deskModel, leaseModel: leaseModel, eventModel: eventModel, mergeEvents: mergeEvents, sendOutcome: sendOutcome, filedNote: filedNote,
     pollDelay: pollDelay, shown: shown, ageWords: ageWords, mount: mount,
     POLL_OPEN_MS: POLL_OPEN_MS, POLL_HIDDEN_MS: POLL_HIDDEN_MS, AMBIGUOUS_WORDS: AMBIGUOUS_WORDS, ARRIVED_WORDS: ARRIVED_WORDS, NOT_ARRIVED_WORDS: NOT_ARRIVED_WORDS,
     HOSTILE_SOURCE: HOSTILE.source
