@@ -54,15 +54,83 @@ def test_pre_tool_use_keeps_exit_2_and_stderr():
     assert code == 2 and out.getvalue() == "" and "nope" in err.getvalue()
 
 
-def test_a_permission_request_deny_whose_answer_cannot_be_written_falls_back_to_exit_2():
-    """Lane A: a decision that cannot reach stdout is still a deny; exit 2 + stderr is the one answer left."""
-    class Broken(io.StringIO):
-        def write(self, s):
-            raise OSError("closed")
+class _Broken(io.StringIO):
+    """A stdout whose write fails and which has no file descriptor beneath it."""
+    def write(self, s):
+        raise OSError("closed")
+
+
+def test_a_permission_request_deny_whose_answer_cannot_be_written_is_a_hook_failure_exit_1():
+    """DIOGAP-A2 item 1 (codex MED, deepseek MED): exit 2 is ignored on PermissionRequest, so a decision that cannot
+    reach stdout is answered as a hook FAILURE (exit 1), which the rendered ``onFailure: block`` makes a deny there."""
     err = io.StringIO()
     code = hook_run.repo_filter("levain_repo_filter", ["PermissionRequest", "5", "echo nope >&2; exit 2"],
-                                stdin=io.BytesIO(b"{}"), stdout=Broken(), stderr=err)
-    assert code == 2 and "nope" in err.getvalue()
+                                stdin=io.BytesIO(b"{}"), stdout=_Broken(), stderr=err)
+    assert code == hook_run.FAILED_EXIT == 1 and "nope" in err.getvalue()
+
+
+def test_a_permission_request_deny_whose_stream_breaks_is_written_raw_to_its_descriptor():
+    """DIOGAP-A2 item 1: a broken text wrapper over an intact fd still delivers the decision, by one raw write."""
+    import os
+    r, w = os.pipe()
+    try:
+        class BrokenOverFd(_Broken):
+            def fileno(self):
+                return w
+        err = io.StringIO()
+        code = hook_run.repo_filter("levain_repo_filter", ["PermissionRequest", "5", "echo nope-from-repo >&2; exit 2"],
+                                    stdin=io.BytesIO(b"{}"), stdout=BrokenOverFd(), stderr=err)
+        os.close(w)
+        w = -1
+        got = os.read(r, 65536).decode()
+    finally:
+        os.close(r)
+        if w != -1:
+            os.close(w)
+    assert (code, err.getvalue()) == (0, "")
+    assert _decision(got) == {"behavior": "deny", "message": "nope-from-repo"}
+
+
+def test_a_permission_request_deny_whose_descriptor_is_broken_too_is_exit_1():
+    import os
+    r, w = os.pipe()
+    os.close(r)
+    try:
+        class BrokenOverDeadFd(_Broken):
+            def fileno(self):
+                return w
+        err = io.StringIO()
+        code = hook_run.repo_filter("levain_repo_filter", ["PermissionRequest", "5", "echo nope >&2; exit 2"],
+                                    stdin=io.BytesIO(b"{}"), stdout=BrokenOverDeadFd(), stderr=err)
+    finally:
+        os.close(w)
+    assert code == 1 and "nope" in err.getvalue()
+
+
+def test_a_short_raw_write_of_the_decision_is_exit_1(monkeypatch):
+    """The raw write counts only when the whole document went (the argv refusal: no repo command, no subprocess)."""
+    import os
+    r, w = os.pipe()
+    try:
+        class BrokenOverFd(_Broken):
+            def fileno(self):
+                return w
+        monkeypatch.setattr(hook_run.os, "write", lambda fd, b: len(b) - 1)
+        err = io.StringIO()
+        code = hook_run.repo_filter("levain_repo_filter", ["PermissionRequest", "5"], stdin=io.BytesIO(b"{}"),
+                                    stdout=BrokenOverFd(), stderr=err)
+    finally:
+        monkeypatch.undo()
+        os.close(r)
+        os.close(w)
+    assert code == 1 and "repo-filter-argv (2 argument(s))" in err.getvalue()
+
+
+def test_pre_tool_use_with_a_broken_stdout_is_still_exit_2():
+    err = io.StringIO()
+    code = hook_run.repo_filter("levain_repo_filter", ["PreToolUse", "5", "echo nope >&2; exit 2"],
+                                stdin=io.BytesIO(b"{}"), stdout=_Broken(), stderr=err)
+    assert code == 2 and err.getvalue() == "nope\n"
 
 
 @pytest.mark.parametrize("argv", [["PermissionRequest", "5"], ["PermissionRequest", "0", "c"],
@@ -74,6 +142,98 @@ def test_a_permission_request_filter_call_render_never_makes_is_a_deny_decision(
     assert code == 0 and err.getvalue() == ""
     got = _decision(out.getvalue())
     assert got["behavior"] == "deny" and "refused" in got["message"]
+
+
+@pytest.mark.parametrize("event", ["PermissionRequest", "PreToolUse"])
+@pytest.mark.parametrize("rest, reason", [
+    (["5"], "2 argument(s)"),
+    (["0", "c"], "timeout out of range"),
+    ([str(hook_run.REPO_TIMEOUT_MAX + 1), "c"], "timeout out of range"),
+    (["5x", "c"], "timeout '5x'"),
+    (["5", ""], "empty command"),
+])
+def test_the_argv_refusal_names_the_first_thing_that_failed(event, rest, reason):
+    """DIOGAP-A2 item 4 (deepseek LOW): the refusal said "3 argument(s)" when the count was right and the timeout or
+    the command was what failed."""
+    out, err = io.StringIO(), io.StringIO()
+    hook_run.repo_filter("levain_repo_filter", [event] + rest, stdin=io.BytesIO(b"{}"), stdout=out, stderr=err)
+    said = _decision(out.getvalue())["message"] if event == "PermissionRequest" else err.getvalue()
+    assert "repo-filter-argv (%s)" % reason in said
+    assert "3 argument(s)" not in said
+
+
+def test_the_argv_refusal_names_an_event_the_filter_does_not_take():
+    err = io.StringIO()
+    code = hook_run.repo_filter("levain_repo_filter", ["Stop", "5", "c"], stdin=io.BytesIO(b"{}"),
+                                stdout=io.StringIO(), stderr=err)
+    assert code == 2 and "repo-filter-argv (event 'Stop')" in err.getvalue()
+
+
+# --- DIOGAP-A2 item 2: run() (levain_queue, wired on PermissionRequest) denies with the decision object --------------
+
+def _queue(load, environ=None, stdout=None, name="levain_queue"):
+    out, err = (stdout if stdout is not None else io.StringIO()), io.StringIO()
+    env = {"LEVAIN_QUEUE_SOCKET": "/x/q.sock"} if environ is None else environ
+    code = hook_run.run(name, stdin=io.StringIO("{}"), stdout=out, stderr=err, environ=env, load_adapter=load)
+    return code, (out.getvalue() if isinstance(out, io.StringIO) and not isinstance(out, _Broken) else None), \
+        err.getvalue()
+
+
+def _no_adapter():
+    raise ImportError("no adapter here")
+
+
+class _Answers:
+    @staticmethod
+    def main(argv, stdin=None, stdout=None, environ=None):
+        stdout.write("{}\n")
+        return 0
+
+
+class _ExitsOne:
+    @staticmethod
+    def main(argv, stdin=None, stdout=None, environ=None):
+        return 1
+
+
+@pytest.mark.parametrize("load, environ, why", [
+    (_no_adapter, None, "hook-adapter-unavailable"),
+    (lambda: _ExitsOne, None, "hook-adapter-exit"),
+    (lambda: _Answers, {}, "hook-not-in-slot"),
+])
+def test_a_queue_refusal_is_a_deny_decision_object_and_exit_0(load, environ, why):
+    """complement MED: run()'s exit 2 + stderr is ignored on PermissionRequest, so the queue's refusal left the call
+    to the session's mode. Now it is the decision object, the refusal line its message."""
+    code, out, err = _queue(load, environ)
+    assert (code, err) == (0, "")
+    got = _decision(out)
+    assert got["behavior"] == "deny" and got["message"].startswith("levain hook levain_queue: refused: %s (" % why)
+    assert set(got) == {"behavior", "message"}
+
+
+def test_a_queue_answer_that_cannot_be_written_is_a_hook_failure_exit_1():
+    code, _out, err = _queue(lambda: _Answers, stdout=_Broken())
+    assert code == 1 and "refused: hook-adapter-failed (writing the answer" in err
+
+
+def test_a_queue_answer_passes_through_unchanged():
+    assert _queue(lambda: _Answers) == (0, "{}\n", "")
+
+
+def test_the_gate_refusal_is_still_exit_2_and_stderr():
+    code, out, err = _queue(_no_adapter, name="levain_gate")
+    assert (code, out) == (2, "") and "refused: hook-adapter-unavailable" in err
+
+
+def test_the_real_adapter_leaves_a_slot_permission_request_undecided_through_run(monkeypatch):
+    """The real adapter, in a slot, answers a PermissionRequest with no decision (Claude Code's mode answers): run()
+    on the queue passes that through unchanged, exit 0 and nothing written; only a refusal becomes a deny."""
+    monkeypatch.delenv("LEVAIN_QUEUE_SOCKET", raising=False)
+    out, err = io.StringIO(), io.StringIO()
+    ev = '{"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "ls"}}'
+    code = hook_run.run("levain_queue", stdin=io.StringIO(ev), stdout=out, stderr=err,
+                        environ={"LEVAIN_QUEUE_SOCKET": "/nonexistent/q.sock", "LEVAIN_QUEUE_CAP": "c"})
+    assert (code, out.getvalue()) == (0, "")
 
 
 def test_a_permission_request_decision_is_the_deny_and_nothing_else():
@@ -118,14 +278,16 @@ def _wait_for(path, seconds: float) -> bool:
 @pytest.mark.parametrize("raise_", ["emfile", "stopped"])
 def test_a_selector_that_cannot_be_made_leaves_no_repo_command_running(tmp_path, monkeypatch, raise_):
     """X4/C3: the selector failing (EMFILE) or the filter being stopped while it is made must not leave the repo
-    command running to its own end. The fake waits (bounded) for the command to have written its pid, so a filter that
-    makes the selector after starting the command is caught with the command alive."""
+    command running. The selector is made BEFORE the command starts, so the command never starts: the fake waits
+    (briefly, bounded) for a pid, and a filter that made the selector after the start would show one there and fail
+    (DIOGAP-A2 item 5: the old form waited 2 s and then asserted nothing on the fixed order)."""
     import errno
     import selectors
     pidfile = tmp_path / "pid"
+    started = []
 
     def boom():
-        _wait_for(pidfile, 2.0)
+        started.append(_wait_for(pidfile, 0.5))
         if raise_ == "emfile":
             raise OSError(errno.EMFILE, "Too many open files")
         raise hook_run._Stopped(15)
@@ -133,9 +295,10 @@ def test_a_selector_that_cannot_be_made_leaves_no_repo_command_running(tmp_path,
     out, err = io.StringIO(), io.StringIO()
     code = hook_run.repo_filter("levain_repo_filter", ["PreToolUse", "30", f"echo $$ > {pidfile}; exec /bin/sleep 30"],
                                 stdin=io.BytesIO(b"{}"), stdout=out, stderr=err)
-    assert code == 2 and err.getvalue().startswith(hook_run.REPO_FAILED)
     if pidfile.exists() and pidfile.read_text().strip():
-        assert _pid_dead(int(pidfile.read_text().strip()))
+        _pid_dead(int(pidfile.read_text().strip()))   # a regression's child is killed, so a failing run leaks nothing
+    assert started == [False] and not pidfile.exists(), "the repo command started before the selector was made"
+    assert code == 2 and err.getvalue().startswith(hook_run.REPO_FAILED)
 
 
 def test_a_register_that_fails_after_the_start_kills_the_repo_command(tmp_path, monkeypatch):

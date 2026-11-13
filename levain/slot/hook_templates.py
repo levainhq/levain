@@ -40,18 +40,25 @@ CONFIG_TIMEOUT = 30
 def body(host: str, name: str) -> bytes:
     """The hook script. Everything after ``import sys`` is inside one ``try``: the boot line, the import, the entry.
     Exit 0 or 2 is the entry's; ANY other outcome (an import that fails, the entry raising, a ``BaseException``
-    included, or returning anything but 0 or 2) is exit 2 with a named refusal, so the script fails closed even on a
-    Claude Code that ignores ``onFailure``. What it cannot cover (the interpreter or the script not starting, a kill,
-    a timeout) is ``onFailure``'s (render). The filter's entry also gets the script's arguments."""
+    included, or returning anything but 0 or 2) is a deny with a named refusal, so the script fails closed even on a
+    Claude Code that ignores ``onFailure``: exit 2 and the line on stderr, except on ``PermissionRequest``, where
+    Claude Code does not honour exit 2. There (``levain_queue``, and the filter when its first argument is that
+    event) the refusal is the deny ``decision`` object on stdout, exit 0, as :func:`levain.slot.hook_run._deny`
+    answers it; if that cannot be written, :data:`~levain.slot.hook_run.FAILED_EXIT` with the line on stderr, a hook
+    failure ``onFailure: block`` turns into a deny; and the entry's own ``FAILED_EXIT`` passes through on that event
+    only. What it cannot cover (the interpreter or the script not starting, a kill, a timeout) is ``onFailure``'s
+    (render). The filter's entry also gets the script's arguments."""
     if name not in EVENTS and name != REPO_FILTER:
         raise ValueError("unknown hook %r" % (name,))
     entry = ENTRIES.get(name, "run")
     call = "run(%r, sys.argv[1:])" % name if name == REPO_FILTER else "run(%r)" % name
+    pr = "sys.argv[1:2] == ['PermissionRequest']" if name == REPO_FILTER else repr(EVENTS[name] == "PermissionRequest")
     text = (
         "#!%s %s\n" % (ROOT_PYTHON[host], PY_FLAGS)
         + "# Levain slot hook %s. Written by render, root-owned. It FAILS CLOSED: an adapter that will not import\n" % name
-        + "# or answer is exit 2 with a named refusal, never exit 0 (levain.slot.hook_run). Wired onFailure block.\n"
+        + "# or answer is a named refusal, never exit 0 with no answer (levain.slot.hook_run). Wired onFailure block.\n"
         + "import sys\n"
+        + "pr = %s\n" % pr
         + "why = 'hook-adapter-unavailable'\n"
         + "code = None\n"
         + "try:\n"
@@ -59,17 +66,30 @@ def body(host: str, name: str) -> bytes:
         + "    from levain.slot.hook_run import %s as run\n" % entry
         + "    why = 'hook-run-failed'\n"
         + "    code = %s\n" % call
-        + "    if type(code) is not int or code not in (0, %d):\n" % hook_run.REFUSED_EXIT
+        + "    if type(code) is not int or code not in ((0, %d, %d) if pr else (0, %d)):\n"
+        % (hook_run.REFUSED_EXIT, hook_run.FAILED_EXIT, hook_run.REFUSED_EXIT)
         + "        why, code = 'hook-run-exit ' + repr(code)[:40], None\n"
         + "except BaseException as exc:\n"
         + "    why, code = why + ' (' + type(exc).__name__ + ')', None\n"
         + "if code is None:\n"
-        + "    try:\n"
-        + "        sys.stderr.write('levain hook %s: refused: ' + why + '\\n')\n" % name
-        + "        sys.stderr.flush()\n"
-        + "    except BaseException:\n"
-        + "        pass\n"
+        + "    line = 'levain hook %s: refused: ' + why\n" % name
         + "    code = %d\n" % hook_run.REFUSED_EXIT
+        + "    if pr:\n"
+        + "        code = %d\n" % hook_run.FAILED_EXIT
+        + "        try:\n"
+        + "            import json\n"
+        + "            sys.stdout.write(json.dumps({'hookSpecificOutput': {'hookEventName': 'PermissionRequest',\n"
+        + "                                         'decision': {'behavior': 'deny', 'message': line}}}))\n"
+        + "            sys.stdout.flush()\n"
+        + "            code = 0\n"
+        + "        except BaseException:\n"
+        + "            pass\n"
+        + "    if code:\n"
+        + "        try:\n"
+        + "            sys.stderr.write(line + '\\n')\n"
+        + "            sys.stderr.flush()\n"
+        + "        except BaseException:\n"
+        + "            pass\n"
         + "sys.exit(code)\n")
     return text.encode("utf-8")
 
