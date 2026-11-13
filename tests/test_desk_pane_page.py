@@ -1,10 +1,11 @@
 """The Desk view's page (levain 33, lane C): levain/templates/web/desk_tab_view.js mounted by dashboard_boot.js over the real cockpit
 page, driven in headless Chrome at a phone's size (390x844) first.
 
-The routes lane B builds (GET /cockpit/desk.json, POST /cockpit/desk/send) are not here yet, so a tiny stub server stands in front of
-the real cockpit: it answers those two routes from the fixture the test sets (behind the same write-token check the real gate makes)
-and forwards every other request to the real server. What this proves is the PAGE against `desk_wire.md` (the contract both lanes
-build to). It does not prove the real routes, the real port or a real phone: see the lane's return for the residue."""
+A tiny stub server stands in front of the real cockpit: it answers the two desk routes (GET /cockpit/desk.json, POST
+/cockpit/desk/send) from the fixture the test sets (behind the same write-token check the real gate makes) and forwards every other
+request to the real server. What this proves is the PAGE against `desk_wire.md`, with answers the real routes cannot be made to
+give (a dropped connection, a held answer, a hostile string). The page against the REAL routes and port is
+`tests/test_desk_join_1113.py`; neither file proves a real flow script or a real phone."""
 from __future__ import annotations
 
 import json
@@ -168,8 +169,7 @@ class DeskStub:
 def desk_page(tmp_path: Path):
     """The real cockpit page behind the stub. The stub's base is the page's origin."""
     _root, src, _ids = _install(tmp_path)
-    extra = {} if ASSET in web_server._ASSETS else {ASSET: ("text/javascript; charset=utf-8", JS.read_bytes())}
-    with _serve(src, write_token=TOKEN, extra_assets=extra) as (upstream, _h):
+    with _serve(src, write_token=TOKEN) as (upstream, _h):
         stub = DeskStub(upstream)
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), stub.handler())
         httpd.daemon_threads = True
@@ -271,10 +271,8 @@ def test_the_page_carries_the_desk_tab_and_its_script_after_the_rooms():
 
 
 def test_the_server_serves_the_view_script():
-    """The page loads /desk_tab_view.js, and only web_server.py's asset table can serve it. That file is lane B's, so this lane
-    could not add the entry: until the head's integration adds it this is an expected failure, named, never a silent skip."""
-    if ASSET not in web_server._ASSETS:
-        pytest.xfail("integration: web_server._ASSETS has no /desk_tab_view.js entry yet (lane C does not own web_server.py)")
+    """The page loads /desk_tab_view.js, and only web_server.py's asset table can serve it (the shell's digest check requires
+    every script the page names to be in that table)."""
     assert web_server._ASSETS[ASSET][0] == "desk_tab_view.js"
 
 
