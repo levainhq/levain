@@ -2,6 +2,7 @@
 no write bit for any other principal. Only the exact old shape warns; every other shape fails."""
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from pathlib import Path
@@ -153,19 +154,88 @@ def test_a_missing_or_malformed_operator_record_fails_for_every_invoker(tmp_path
         assert "no one can be named as owner" in r.detail, r.detail
 
 
-@pytest.mark.parametrize("write", [None, *MALFORMED])
-def test_the_operator_record_failure_names_a_remedy_that_exists(tmp_path, write):
-    """`levain upgrade` refuses this state and points back at doctor, so it is never the remedy; the isolation install
-    (the helper's `setup`, which writes the record last) is."""
+HELPERS = (("darwin", "/usr/local/libexec/levain/install-helper"), ("linux", "/usr/libexec/levain/install-helper"))
+
+
+def _break(tmp_path, case):
+    """The four states a record can be in once it is not a usable file: absent, malformed bytes, an entry that is not
+    a regular file (a directory; a dangling link), and a regular file that cannot be read."""
     (tmp_path / "policy").mkdir()
-    if write is not None:
-        (tmp_path / "policy" / "operator").write_bytes(write)
-    for host, helper in (("darwin", "/usr/local/libexec/levain/install-helper"),
-                         ("linux", "/usr/libexec/levain/install-helper")):
+    rec = tmp_path / "policy" / "operator"
+    if case == "missing":
+        pass
+    elif case == "malformed":
+        rec.write_bytes(b"not an operator record")
+    elif case == "directory":
+        rec.mkdir()
+    elif case == "link":
+        rec.symlink_to(tmp_path / "nowhere")
+    return rec
+
+
+@pytest.mark.parametrize("case", ["missing", "malformed", "directory", "link"])
+def test_the_operator_record_hint_never_prints_a_pasteable_setup_command(tmp_path, case):
+    """`setup` parses an absent --root as none and rewrites policy/roots from its arguments (grammar.py, then
+    install_helper's roots step), so a printed command that omits the roots can erase the install's configured roots.
+    The remedy is words that send the person to read the stored values first, never a command line."""
+    _break(tmp_path, case)
+    for host, helper in HELPERS:
         r = row(tmp_path, st(), host=host)
+        assert f"{helper} setup --slots" not in r.hint and "sudo" not in r.hint, r.hint
+        assert "roots" in r.hint, r.hint
+        assert f"{tmp_path}/policy" in r.hint, r.hint
         assert "levain upgrade" not in r.hint, r.hint
-        assert "isolation install has to be run again" in r.hint
-        assert f"{helper} setup --slots" in r.hint and "--operator" in r.hint
+        assert helper in r.hint and "setup" in r.hint, r.hint
+
+
+@pytest.mark.parametrize("case", ["missing", "malformed", "directory", "link"])
+def test_the_hint_names_every_setting_setup_rewrites(tmp_path, case):
+    _break(tmp_path, case)
+    h = row(tmp_path, st()).hint
+    for word in ("slots", "verifier slots", "roots", "BEFORE running it", "--operator", "--root"):
+        assert word in h, (word, h)
+
+
+def test_the_hint_says_what_to_do_first_for_each_kind_of_entry(tmp_path):
+    hints = {}
+    for case in ("missing", "malformed", "directory", "link"):
+        d = tmp_path / case
+        d.mkdir()
+        _break(d, case)
+        hints[case] = row(d, st()).hint
+    assert "remove" not in hints["missing"].lower() and "re-creates the record" in hints["missing"]
+    assert "malformed file must be removed as root first" in hints["malformed"]
+    assert "nothing else restores it" in hints["malformed"]
+    assert "directory, not a regular file" in hints["directory"] and "remove it as root first" in hints["directory"]
+    assert "link, not a regular file" in hints["link"] and "remove it as root first" in hints["link"]
+    assert len(set(hints.values())) == 4, hints
+
+
+@pytest.mark.parametrize("code, errname", [(errno.EIO, "EIO"), (errno.ENOTDIR, "ENOTDIR")])
+def test_a_record_read_failure_names_the_errno_and_never_setup(store, monkeypatch, code, errname):
+    """EIO / ENOTDIR on a record that is there: setup cannot fix the path, so it is not named; the person is sent to
+    fix the path and run doctor again."""
+    real = Path.read_bytes
+
+    def fail(self):
+        if self.name == "operator":
+            raise OSError(code, os.strerror(code), str(self))
+        return real(self)
+    monkeypatch.setattr(Path, "read_bytes", fail)
+    r = row(store, st())
+    assert not r.ok and not r.neutral
+    assert f"could not be read ({errname})" in r.detail, r.detail
+    assert f"could not be read ({errname}); fix the path and run `levain doctor` again" in r.hint, r.hint
+    assert "setup" not in r.hint and "levain upgrade" not in r.hint and "roots" not in r.hint, r.hint
+
+
+def test_an_unknown_host_falls_back_to_the_generic_helper_name(tmp_path):
+    """`layout.install_helper_path` indexes a table: a host it does not know must not raise inside doctor."""
+    _break(tmp_path, "missing")
+    rows = doctor._check_queue_answers(host="plan9", store=tmp_path, uid=ME, lstat=lambda p: st(),
+                                       qbroker_gid=lambda: GID, legacy_gid=lambda: OLD)
+    assert len(rows) == 1 and not rows[0].ok
+    assert "The install helper `setup`" in rows[0].hint and "/" not in rows[0].hint.split("`setup`")[0], rows[0].hint
 
 
 def test_an_unreadable_operator_record_is_neutral_and_the_detail_says_who_to_run_as(store, monkeypatch):
@@ -185,7 +255,7 @@ def test_an_operator_record_that_is_not_a_file_fails(store):
     (store / "policy" / "operator").unlink()
     (store / "policy" / "operator").mkdir()
     r = row(store, st())
-    assert not r.ok and "cannot be read" in r.detail
+    assert not r.ok and "is a directory, not a regular file" in r.detail, r.detail
 
 
 def test_a_wrong_directory_says_the_operators_answers_not_yours(store):
