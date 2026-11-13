@@ -558,10 +558,13 @@
   // (codex L3 LOW). Preserves the server's error message on a hard non-OK (e.g. the fail-closed 500 a
   // corrupt job store returns); the caller surfaces it. The token-class 403 is handled here.
   // `signal` (optional): an AbortSignal, so a caller that supersedes its own read (the topology Replay scrub) can cancel the older one.
-  async function authedReadJson(url, signal) {
+  // `opts.quiet` (optional): a read the person did not ask for by name (the List's search as they type) never opens the token prompt
+  // and never drops the stored token on a token 403; it throws the refusal (`refused`) and the caller shows its own fault.
+  async function authedReadJson(url, signal, opts) {
     const usedToken = storedToken();
     let res = await fetch(url, { cache: "no-store", headers: readHeaders(), signal: signal });
     if (res.status === 403 && await isTokenReject(res)) {
+      if (opts && opts.quiet === true) throw refusal("off-box token missing or invalid");
       // a token stored while this read was in flight (another tab, a paste, a pair claim) is newer than the one refused:
       // read again with it, never prompt over it and never drop it (a slow first 403 used to erase the token a reload had just been given)
       const newer = storedToken() !== usedToken && storedToken();
@@ -804,8 +807,9 @@
     keep_key_retired: "This item was kept before and that memory was deleted, so it cannot be kept again. Compost the item by hand."
   };
   // The band row to agenda plants the agenda first and answers the row second, and answers source_unavailable (503) from the
-  // second act too: "Nothing was added." would then be false. So for this verb that code says what is known and what is safe.
-  const AGENDA_UNSURE = "The agenda may already be planted but the row was not closed. Reload the List and check; trying again is safe.";
+  // second act too: "Nothing was added." would then be false. The second act can also record the answer and then fail its read-back,
+  // so the row may be closed too. So for this verb that code says that both are unknown, and what is safe.
+  const AGENDA_UNSURE = "The agenda may already be planted and the row may already be closed. Reload the List and check; trying again is safe.";
   const SNOOZE_REFUSALS = new Set(["pick a time after now", "pick a later day", "pick a day: that date could not be read"]);
   // The List's band row to agenda refuses a day inside the snooze window in words that say what to do instead ("<day> is within the
   // snooze window (...): snooze the row instead; an agenda is for a day after <day>"). They are composed from the day and the window

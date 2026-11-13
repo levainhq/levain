@@ -2253,9 +2253,10 @@
       const q = raw.trim().toLowerCase();
       const picked = opts && opts.pick ? opts.pick(all) : all;
       const base = opts && opts.extra ? picked.concat(opts.extra()) : picked;   // rows listed apart, filtered with the rest
-      const hit = (s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
+      const plain = (s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
                          String(s.support || "").toLowerCase().includes(q) ||
                          String(s.id || "").toLowerCase().includes(q);
+      const hit = opts && opts.match ? (s) => opts.match(s, raw) : plain;
       const rows = q ? base.filter(hit) : base;
       results.replaceChildren();
       if (rows.length === 0) {
@@ -2275,6 +2276,23 @@
   }
 
   // FILTER-EXTRACT-END
+
+  // The List's rows are matched the way the kernel matches memory (levain/cockpit/engine.py `_fold` and `_terms_match`: casefold, NFD,
+  // marks dropped; the query split on whitespace; EVERY term a substring of the row's text, support and id joined), so one query is
+  // one result set across the rows here and the "Kept in memory" group beside them. (`toLowerCase` for `casefold`: they differ only
+  // for a few letters such as the German sharp s.) Used by the List only; Open Loops and the Tray keep the plain substring above.
+  // `listQueryText` is the ONE normalisation of what is typed: control characters are spaces, at most KEPT_QUERY_MAX characters,
+  // trimmed; the rows and the memory read both take this, never the raw box.
+  const KEPT_QUERY_MAX = 200;
+  const listQueryText = (raw) => Array.from(String(raw == null ? "" : raw).replace(/[\u0000-\u001f\u007f]/g, " ")).slice(0, KEPT_QUERY_MAX).join("").trim();
+  const foldText = (t) => String(t == null ? "" : t).toLowerCase().normalize("NFD").replace(/\p{Mn}/gu, "");
+  let listTermsFor = "", listTerms = [];
+  function listRowMatches(s, raw) {
+    if (raw !== listTermsFor) { listTermsFor = raw; listTerms = foldText(listQueryText(raw)).split(/\s+/).filter(Boolean); }
+    if (!listTerms.length) return true;     // no searchable term (blank, or only marks): no query, as the kernel reads it
+    const hay = foldText([s.text, s.support, s.id].map((x) => (x == null ? "" : String(x))).join(" "));
+    return listTerms.every((t) => hay.includes(t));
+  }
 
   // The three intention projections share one renderer — same read/verb contract, different
   // source list + badge axis + empty copy. All three read their fault from the single
@@ -2296,7 +2314,15 @@
     // Tray its own source, give each its own error key here. [complement L3 LOW]
     const err = tierErr(view, "open_intentions");
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
-    if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
+    if (!list || list.length === 0) {
+      // the List with no live row still holds its search: what it kept as memory is searched from here, and the box says "no items match"
+      // beside the memory group, as it does with rows. (The other panels have nothing to filter and say only that they are empty.)
+      if (entry.kind === "tray" && view.tray_is_list === true) {
+        mountIntentionFilter(p, [], "items", entry.kind, () => {}, { empty: emptyMsg, match: listRowMatches });
+        mountListKept(p);
+      } else p.appendChild(el("p", "empty", emptyMsg));
+      return p;
+    }
     const verbs = isVerbPanel(entry);
     // the Tray's views: the kernel names each ordering and sends the row ids in it; this only picks one
     const views = entry.kind === "tray" && Array.isArray(view.tray_views) && view.tray_view_rows ? view.tray_views : [];
@@ -2362,6 +2388,8 @@
     let rebuildChips = null;   // a chosen view changes every chip's number: the chips are rebuilt with it
     let chipRow = null;     // the chips' row, drawn by controls(); the panel's own element is empty once the focus view moves its body
     const opts = views.length || isList ? {
+      // the List's rows are matched as memory is (see listRowMatches); the other panels keep the plain substring
+      match: isList ? listRowMatches : undefined,
       // a card whose due rows are all done still holds the desk's and the later ones: it says nothing is due, not that it is empty
       empty: cardHasApart ? "Nothing due for you." : emptyMsg,
       // the card's search also reads what the card leaves to the focus view, so a match there is told, never "no items match"
@@ -2472,18 +2500,25 @@
   // when there are hits, absent when there are none, read-only (no verb is offered on a memory), each row naming its own receipt
   // line ("kept as memory: episode ..."). A newer query retires the one in flight; a page with no read transport draws no group.
   const KEPT_DEBOUNCE_MS = 250;
-  const KEPT_QUERY_MAX = 200;
   function mountListKept(p) {
     const T = window.LevainCockpitTransport;
     const input = p.querySelector(".ep-search-input");
     const results = p.querySelector(".sp-results");
     if (!T || typeof T.readJson !== "function" || !input || !results) return;
+    input.maxLength = KEPT_QUERY_MAX;     // the box holds what both halves read: a longer paste is cut by the browser, not by one half
     const host = el("div", "list-kept");
     host.dataset.listKept = "1";
     host.hidden = true;
     results.after(host);
-    let seq = 0, timer = 0;
+    let seq = 0, timer = 0, flight = null;
     const clear = () => { host.hidden = true; host.replaceChildren(); };
+    // a panel redraw replaces this host: its timer and its read stop, and nothing is drawn into it (`=== false`: a fake DOM has no flag)
+    const gone = () => host.isConnected === false;
+    const stop = () => {
+      window.clearTimeout(timer);
+      seq++;                                                    // before the abort: the aborted read finds itself retired
+      if (flight) { const f = flight; flight = null; f.abort(); }
+    };
     // A fault is ONE fixed line: the server's text for it (a skipped line, a search error) and a transport's message can carry a
     // path or an OS error, which the page never shows. The kernel's own sentence about its search window is a constant, so it stays.
     const KEPT_FAULT = "memory could not be searched";
@@ -2527,23 +2562,33 @@
       host.hidden = host.children.length === 0;
       measureClauses(host);
     };
-    const run = async () => {
-      const q = input.value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, KEPT_QUERY_MAX);
+    // `mount`: the run a redrawn panel makes for the query it keeps, before its host is in the page; every later run is a key's, and
+    // a key's run finds a replaced host and stops. The read is quiet: a token 403 on a read nobody asked for by name is a kept fault
+    // (the fixed line), never the token prompt and never a dropped token.
+    const run = async (mount) => {
+      if (!mount && gone()) { stop(); return; }
+      const q = listQueryText(input.value);
       const mine = ++seq;
+      if (flight) { const f = flight; flight = null; f.abort(); }
       if (!q) { clear(); return; }
+      const ctl = typeof AbortController === "function" ? new AbortController() : null;
+      flight = ctl;
       let payload;
-      try { payload = await T.readJson("/cockpit/panel/tray.json?profile=full&q=" + encodeURIComponent(q)); }
-      catch (e) { payload = { status: "error", error: e && e.message ? e.message : String(e) }; }
-      if (mine !== seq) return;     // a newer query (or a cleared box) retired this one
-      draw(payload && typeof payload === "object" ? payload : { status: "error", error: "unreadable" });
+      try { payload = await T.readJson("/cockpit/panel/tray.json?profile=full&q=" + encodeURIComponent(q), ctl ? ctl.signal : undefined, { quiet: true }); }
+      catch (e) {
+        if (mine !== seq || (e && e.name === "AbortError")) return;     // retired by a newer key, or the panel went
+        payload = { status: "error" };
+      }
+      if (flight === ctl) flight = null;
+      if (mine !== seq || gone()) return;     // a newer query (or a cleared box) retired this one, or the panel was redrawn
+      draw(payload && typeof payload === "object" ? payload : { status: "error" });
     };
     input.addEventListener("input", () => {
-      window.clearTimeout(timer);
-      seq++;
-      if (!input.value.trim()) { clear(); return; }
-      timer = window.setTimeout(run, KEPT_DEBOUNCE_MS);
+      stop();
+      if (!listQueryText(input.value)) { clear(); return; }
+      timer = window.setTimeout(() => run(false), KEPT_DEBOUNCE_MS);
     });
-    if (input.value.trim()) run();      // a redrawn panel keeps its query: its memory part comes back with it
+    if (listQueryText(input.value)) run(true);      // a redrawn panel keeps its query: its memory part comes back with it
   }
 
   function renderIntentions(entry, view) {
@@ -3933,14 +3978,20 @@
     if (line) { intakeKept.receipt = { text: line, cls: "ok" }; paintIntakeReceipts(); }
   }
   const LIST_ROW_STALE = "this row changed: reload";
+  // The List's two irreversible writes (the Keep, the band row to agenda): a send that THROWS (the network dropped mid-request) is not
+  // a refusal; the write may have landed. The form says so in one fixed line and its buttons come back (both writes are safe to repeat).
+  const WRITE_UNSURE = "Could not tell whether that went through. Reload the List and check; trying again is safe.";
+  const unsureOnThrow = (post) => async (req) => {
+    try { return await post(req); } catch (_) { return { ok: false, error: "unsure", message: WRITE_UNSURE }; }
+  };
 
   // The Keep (intention_keep): the row's words become a memory (an anneal episode), then the item leaves the List. It is
   // irreversible from here, so the form asks once, in words, and the confirm tap sends confirm:true.
   function openKeepForm(host, s) {
-    const words = String(s.text || "");
-    const ask = "Keep \u201c" + words.slice(0, 120) + (words.length > 120 ? "\u2026" : "") + "\u201d as a memory? It leaves the List; search finds it.";
+    const chars = Array.from(String(s.text || ""));      // by character, never by UTF-16 unit: an astral character at the cut stays whole
+    const ask = "Keep \u201c" + chars.slice(0, 120).join("") + (chars.length > 120 ? "\u2026" : "") + "\u201d as a memory? It leaves the List; search finds it.";
     openRowForm(host, () => ({ nodes: [el("span", "muted keep-ask", ask)], focus: null }), () => ({}), "Keep", false,
-      async (req) => { const res = await intentionPost(s.row_id, "intention_keep", true)(req); listReceipt(res); return res; }, LIST_ROW_STALE);
+      unsureOnThrow(async (req) => { const res = await intentionPost(s.row_id, "intention_keep", true)(req); listReceipt(res); return res; }), LIST_ROW_STALE);
   }
 
   // The band row to agenda (band_agenda): a machine-filed band row he wants past the snooze window becomes a dated agenda that
@@ -3952,7 +4003,7 @@
     wrap.appendChild(verbBtn("Make an agenda", "push this row past the snooze window: it comes back on the day you pick, as an agenda", () =>
       openSurfaceForm(wrap, { next: null }, {
         label: "make agenda", dateOnly: true, min: localDayIso(1),
-        post: async (v) => { const res = await intentionPost(s.row_id, "band_agenda", true)({ day: v }); listReceipt(res); return res; },
+        post: unsureOnThrow(async (v) => { const res = await intentionPost(s.row_id, "band_agenda", true)({ day: v }); listReceipt(res); return res; }),
         back: (v) => "comes back " + dayYearWords(v) + " as an agenda; this row is answered so the stopped agent waits",
         done: (v) => "agenda for " + dayYearWords(v), stale: LIST_ROW_STALE })));
     return gateByActions(wrap, s.actions);
