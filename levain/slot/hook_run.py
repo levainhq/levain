@@ -72,7 +72,8 @@ def run(name: str, *, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] =
         load_adapter: Optional[Callable[[], Any]] = None) -> int:
     """Run the hook ``name``: 0 with the adapter's output, or a named refusal answered as :func:`_deny` answers it on
     the event ``name`` is wired under (:data:`RUN_EVENTS`): on PreToolUse exit :data:`REFUSED_EXIT` and the line on
-    stderr; on PermissionRequest (``levain_queue``) the deny decision object with the line as its message, exit 0.
+    stderr; on PermissionRequest (``levain_queue``) the deny decision object with the line as its message, exit 0,
+    except when the adapter's answer broke while being written to stdout: then :data:`FAILED_EXIT`, no second document.
     ``environ`` (default ``os.environ``) is the ONE environment: :func:`in_slot` is checked against it and the
     adapter's ``main`` is handed it, so the slot check and the adapter can never read two different environments."""
     event = RUN_EVENTS.get(name)
@@ -108,11 +109,10 @@ def run(name: str, *, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] =
     if type(code) is not int or code != 0:  # exactly the int 0: False / 0.0 / a zero-equal object is no success
         # an invalid return is described by its type: formatting an arbitrary object can raise or allocate without bound
         return no("hook-adapter-exit", "exit %r" % (code,) if type(code) is int else "exit of type %s" % type(code).__name__)
-    try:
-        stdout.write(out.getvalue())
-        stdout.flush()
-    except BaseException as exc:  # noqa: BLE001
-        return no("hook-adapter-failed", "writing the answer: %s" % type(exc).__name__)
+    failed = _write_whole(stdout, out.getvalue())
+    if failed is not None:
+        # part of the answer may be on stdout: a deny document after it would be two documents (DIOGAP-A3)
+        return _deny(event, _refusal(name, "hook-adapter-failed", "writing the answer: %s" % failed), None, err)
     return 0
 
 
@@ -400,35 +400,55 @@ def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = N
     return _deny(event, line, answer, err)
 
 
+def _write_whole(out: Any, data: str) -> Optional[str]:
+    """Write ``data`` to ``out``: None only when every byte went, else what failed. With a file descriptor beneath
+    ``out`` (the real hook's stdout), ``out`` is flushed first (what it still buffers would otherwise reach the descriptor after the
+    document, or at exit), then the bytes go to the descriptor with ``os.write``, looped over short writes; an error
+    or a zero-byte write is the failure, with no second attempt by any path. Without one (an in-process ``StringIO``),
+    one ``write`` and ``flush``; an error is the failure, likewise never retried."""
+    try:
+        fd = out.fileno()
+    except BaseException:  # noqa: BLE001 - no usable descriptor: the text layer is the one writer
+        fd = None
+    try:
+        if fd is None:
+            out.write(data)
+            out.flush()
+            return None
+        out.flush()
+        left = memoryview(data.encode("utf-8"))
+        while left:
+            n = os.write(fd, left)
+            if n <= 0:
+                return "a zero-byte write"
+            left = left[n:]
+        return None
+    except BaseException as exc:  # noqa: BLE001 - a write that broke is not whole: the caller's failure, never a retry
+        return type(exc).__name__
+
+
 def _deny(event: Optional[str], line: str, out: Any, err: Any) -> int:
     """A deny on ``event`` (:func:`repo_filter`'s, and :func:`run`'s refusals), with ``line`` as its reason.
 
     On PermissionRequest: the ``decision`` object (``hookSpecificOutput.hookEventName`` ``PermissionRequest``,
     ``decision.behavior`` ``deny``, ``decision.message`` the line, nothing else) on stdout and 0, since exit 2 is not
-    honoured there. When ``out`` cannot take it, the same document goes once, raw, to the file descriptor beneath
-    ``out`` (a broken text wrapper over an intact pipe); when that fails or is short too, :data:`FAILED_EXIT` with the
-    line on stderr: a hook failure, which the rendered ``onFailure: block`` turns into a deny on this event, where
-    exit 2 would be no answer. A stdout left holding part of a document as well is invalid JSON, itself a hook
-    failure, so every path here ends in a deny on a Claude Code that honours ``onFailure`` (2.1.295+; documented, not
-    run against a live session). On every other event: exit :data:`REFUSED_EXIT` with the line on stderr."""
+    honoured there, written as :func:`_write_whole` writes it: by ONE writer, never retried by another path, so a
+    partial write is never followed by a second document, and 0 only after every byte of the one document went. When
+    it cannot be written whole, :data:`FAILED_EXIT` with the line on stderr: a hook failure, which the rendered
+    ``onFailure: block`` turns into a deny on this event, where exit 2 would be no answer; whatever part of the
+    document reached stdout is then invalid JSON under a failure exit, a failure too. Every path here ends in a deny
+    on a Claude Code that honours ``onFailure`` (2.1.295+; documented, not run against a live session). ``out`` None
+    means stdout may already hold part of another document (:func:`run`'s answer broke while being written): no
+    document is written after it, the answer is :data:`FAILED_EXIT`. On every other event: exit :data:`REFUSED_EXIT`
+    with the line on stderr."""
     code = REFUSED_EXIT
     if event == "PermissionRequest":
         import json
 
         data = json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
                                                   "decision": {"behavior": "deny", "message": line}}})
-        try:
-            out.write(data)
-            out.flush()
+        if out is not None and _write_whole(out, data) is None:
             return 0
-        except BaseException:  # noqa: BLE001 - try the descriptor, then a failure: never no answer
-            pass
-        try:
-            raw = data.encode("utf-8")
-            if os.write(out.fileno(), raw) == len(raw):
-                return 0
-        except BaseException:  # noqa: BLE001
-            pass
         code = FAILED_EXIT
     try:
         err.write(line + "\n")
