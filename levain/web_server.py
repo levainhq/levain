@@ -6636,8 +6636,8 @@ def _build_room_serve(room: Path, host_commands: Any = None, profile: Any = None
     """The :class:`~levain.desk.room_serve.RoomServe` ``levain serve --room DIR`` hands ``make_server``, over the
     consent queue's ``dispatch.db`` (the file the cockpit's room reads). ``DIR`` is where the room's file tools see first:
     an existing directory. Built here, started by ``make_server`` after every refusal has passed. ``host_commands`` is
-    the host's :class:`~levain.desk.room_host.HostCommands` (flow's bridge passes its desk relay and replies
-    commands; levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card.
+    the host's :class:`~levain.desk.room_host.HostCommands` (the commands flow's bridge passes, see that class;
+    levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card.
     ``profile`` is the host's :class:`~levain.desk.room_profile.RoomProfile` (levain 23): None is the confined room,
     unchanged; a profile opens the host room (the vendor's default tools under bypass, the host's hooks, prompt and
     dials), and the returned serve's ``status()["profile"]`` names it. A bridge detects a levain that has this
