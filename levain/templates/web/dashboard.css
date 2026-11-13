@@ -2392,10 +2392,9 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-m b { font-size: 26px; line-height: 1.05; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
 .tv-ml { font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--label); }
 .tv-msub { font-size: var(--fs-meta); font-style: normal; color: var(--meta); }
-.tv-m.hot b { color: var(--accent); } .tv-m.warn b { color: var(--warn); }
+.tv-m.warn b { color: var(--warn); }
 .tv-m.dim b { color: var(--meta); }
 .tv-stat b { color: var(--text); font-size: var(--fs-lead); font-variant-numeric: tabular-nums; }
-.tv-stat.hot, .tv-stat.hot b { color: var(--accent); }
 .tv-stat.warn, .tv-stat.warn b { color: var(--warn); }
 .tv-stat.bad, .tv-stat.bad b { color: var(--bad); }
 .tv-stat.dim { color: var(--meta); }
