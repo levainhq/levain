@@ -6621,10 +6621,22 @@
       return null;
     }
   }
+  // THE TOP LAYER (row 1704 fix 4): the veil is a <dialog> opened with showModal(), so it sits in the browser's top layer
+  // and nothing of this page (a toast, a bar, a modal appended later, whatever its z-index) can paint over the frame. That
+  // matters to the frame's long-input gate: it hit-tests only its own document, and a node of THIS page over the frame is
+  // invisible to it (measured in Chrome: an inert cover is invisible to this page's own elementFromPoint too, so a hit test
+  // here could not see the toasts the inert set makes). The inert set and its observer stay, belt and braces. The gate in
+  // the frame counts nothing unless its frame is inside the one :modal dialog of this page (card_format.js, screenOf), so
+  // a browser without showModal gets the old div veil and a long input there can be denied, never allowed.
+  // A dialog closes itself on a close request (Escape) and Chrome lets that be cancelled only after a user activation:
+  // measured, a second Escape (or a first with no activation) fires a `cancel` that cannot be cancelled and closes it. So
+  // the Escape keydown is prevented (that stops the close request: measured), a `cancel` is prevented, and a close this
+  // page did not make reopens the dialog at once; each goes through askCloseSignSheet (a ceremony in flight stays).
   function buildSignSheet(path, version, choice, what, heading) {
     let frag = typeof version === "string" && /^[0-9a-f]{16}/.test(version) ? "v=" + version.slice(0, 16) : "";
     if (frag && typeof choice === "string" && /^[a-z0-9]{1,8}$/.test(choice)) frag += "&choice=" + choice;
-    const veil = el("div", "modal-overlay");
+    const top = typeof HTMLDialogElement === "function" && typeof HTMLDialogElement.prototype.showModal === "function";
+    const veil = el(top ? "dialog" : "div", "modal-overlay");
     veil.id = SIGN_SHEET_ID;
     veil.setAttribute("role", "dialog");
     veil.setAttribute("aria-modal", "true");
@@ -6648,8 +6660,18 @@
     if (path === "/sign/drop") { box.classList.add("modal-sheet"); frame.style.height = "auto"; }
     box.append(head, frame);
     veil.appendChild(box);
-    veil.addEventListener("keydown", (ev) => { if (ev.key === "Escape") { ev.stopPropagation(); askCloseSignSheet(); } });
+    veil.addEventListener("keydown", (ev) => { if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); askCloseSignSheet(); } });
     document.body.appendChild(veil);
+    if (top) {
+      veil.addEventListener("cancel", (ev) => { ev.preventDefault(); askCloseSignSheet(); });
+      veil.addEventListener("close", () => {
+        if (veil.dataset.closing === "1" || !veil.isConnected || document.getElementById(SIGN_SHEET_ID) !== veil) return;
+        try { veil.showModal(); } catch (e) { /* the ask below closes it within SIGN_CLOSE_ACK_MS */ }
+        askCloseSignSheet();
+      });
+      // one that cannot be made modal is shown in place, as the div veil was: its frame's gate then never opens Allow
+      try { veil.showModal(); } catch (e) { veil.setAttribute("open", ""); }
+    }
     document.body.classList.add("modal-open");
     for (const n of document.body.children) if (n !== veil && !n.inert) { n.inert = true; signSheetInerted.push(n); }
     // a board that draws again while the sheet is open adds nodes to the body: they are made inert as they arrive
@@ -6694,7 +6716,11 @@
     signSheetInerted = [];
     dropPrefillClear();      // words handed to a drop sheet that never read them are not left for the next one
     dropHandedReset();       // a handoff outlives its sheet never
-    if (veil) veil.remove();
+    if (veil) {
+      veil.dataset.closing = "1";      // its `close` event (queued) is this page's own close, never one to undo
+      if (veil.open && typeof veil.close === "function") veil.close();
+      veil.remove();
+    }
     if (!document.getElementById("levain-modal")) document.body.classList.remove("modal-open");
     if (signSheetLease) { signSheetLease = false; signBusy--; }
     signSheetOpen = null;

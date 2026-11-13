@@ -290,6 +290,140 @@ def test_the_chunked_text_copies_and_finds_as_the_original(tmp_path, monkeypatch
     assert rig.state(rid) == "pending"
 
 
+# Fix round 4. The fine observer's targets, tracked by wrapping its prototype before the block opens: answers how many
+# chunks it still observes that the gate holds as shown, how many it observes in all, and the shown count.
+TRACK_IO = ("(() => { const P = IntersectionObserver.prototype, o = P.observe, u = P.unobserve, dc = P.disconnect; "
+            "window.__obs = new Map(); "
+            "P.observe = function (t) { if (!window.__obs.has(this)) window.__obs.set(this, new Set()); window.__obs.get(this).add(t); return o.call(this, t); }; "
+            "P.unobserve = function (t) { const s = window.__obs.get(this); if (s) s.delete(t); return u.call(this, t); }; "
+            "P.disconnect = function () { window.__obs.delete(this); return dc.call(this); }; return 1; })()")
+HELD = (f"(() => {{ const sp = [...{FULL}.querySelectorAll('.long-group > span')]; const at = new Map(sp.map((c, i) => [c, i])); "
+        f"const u = new Set({INPUT}.longUnshown()); let held = 0, observed = 0; "
+        f"for (const s of window.__obs.values()) for (const t of s) {{ if (!at.has(t)) continue; observed += 1; "
+        f"if (!u.has(at.get(t))) held += 1; }} "
+        f"return JSON.stringify({{held: held, observed: observed, shown: sp.length - u.size, chunks: sp.length, "
+        f"observers: window.__obs.size, state: JSON.parse({SHEET})}}); }})()")
+
+
+@needs_browser
+@needs_ssh
+def test_a_shown_chunk_is_no_longer_observed(tmp_path, monkeypatch) -> None:
+    """(fix 4, complement + codex MED, perf) A chunk the gate has shown is let go by the fine observer: part way through
+    a read the observer holds none of the hundreds shown so far, and the read still latches at its end."""
+    rig = _ConsentRig(tmp_path, monkeypatch)
+    rid = _attack(rig)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
+            {"eval": TRACK_IO},                                                                           # 2
+            {"tap": SUMMARY},                                                                             # 3
+            {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
+            {"eval": stepped(FULL, 0.8, down=True, until=0.6)},                                           # 5
+            {"eval": f"(async () => {{ {FRAMES}; return {HELD}; }})()"},                                  # 6
+            {"eval": stepped(FULL, 0.8, down=True)},                                                      # 7
+            {"eval": f"(async () => {{ {FRAMES}; return {HELD}; }})()"},                                  # 8
+        ])
+    v = out["values"]
+    mid, end = json.loads(v[6]), json.loads(v[8])
+    print("HELD", mid, end)
+    assert mid["shown"] > 300 and mid["state"]["seen"] == "0", mid
+    assert mid["held"] == 0, mid                                    # no shown chunk is still observed
+    assert mid["observed"] < 6 * 64 < mid["shown"] + 64, mid        # only the unshown chunks of runs near the view are
+    assert end["state"]["seen"] == "1" and end["state"]["allow"] is False, end    # the read latches; Allow open
+    assert end["observed"] == 0, end                                # and everything is let go
+
+
+# a visual viewport of the test's own, put in place before the block opens: `scale`, and its height as a share of the
+# window's (an iOS keyboard shrinks it; pinch-zoom scales it)
+def _stub_vv(scale: float, share: float) -> str:
+    return ("(() => { const vv = {scale: %s, offsetLeft: 0, offsetTop: 0, width: innerWidth, height: innerHeight * %s, "
+            "addEventListener() {}, removeEventListener() {}}; "
+            "Object.defineProperty(window, 'visualViewport', {configurable: true, value: vv}); window.__vv = vv; return 1; })()"
+            % (scale, share))
+
+
+VV_TRUTH = (f"(() => {{ const f = {FULL}, pr = f.getBoundingClientRect(), vv = window.__vv; "
+            f"const top = Math.max(0, pr.top + f.clientTop), bot = Math.min(innerHeight, pr.top + f.clientTop + f.clientHeight); "
+            f"const sp = [...f.querySelectorAll('.long-group > span')]; const u = new Set({INPUT}.longUnshown()); "
+            f"let outside = 0, wrong = 0; sp.forEach((c, i) => {{ const r = c.getBoundingClientRect(); "
+            f"const inView = r.top >= top - 0.5 && r.bottom <= bot + 0.5; const inVv = r.bottom <= vv.offsetTop + vv.height + 0.5; "
+            f"if (inView && !inVv) outside += 1; if (!u.has(i) && !inVv) wrong += 1; }}); "
+            f"return JSON.stringify({{shown: sp.length - u.size, outside: outside, wrong: wrong, vvh: vv.height, block: [pr.top, pr.bottom], "
+            f"state: JSON.parse({SHEET})}}); }})()")
+
+
+@needs_browser
+@needs_ssh
+def test_under_pinch_zoom_nothing_is_shown_and_only_the_visual_viewport_counts(tmp_path, monkeypatch) -> None:
+    """(fix 4, complement + fable LOW) IntersectionObserver and the hit test work in the LAYOUT viewport. Under a visual
+    viewport scaled 2x nothing is shown; at scale 1 with the visual viewport cut to the upper part of the screen (a
+    keyboard up), no chunk below it is shown though it is inside the block's view and the layout viewport."""
+    rig = _ConsentRig(tmp_path, monkeypatch)
+    rid = _attack(rig)
+    nudge = f"(async () => {{ {FULL}.scrollTop += 2; {FRAMES}; {FRAMES}; return 1; }})()"
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
+            {"eval": _stub_vv(2, 1)},                                                                     # 2
+            {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
+            {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
+            {"eval": nudge},                                                                              # 5
+            {"eval": VV_TRUTH},                                                                           # 6
+            {"eval": f"(() => {{ const pr = {FULL}.getBoundingClientRect(); window.__vv.scale = 1; "
+                     f"window.__vv.height = Math.round((pr.top + pr.bottom) / 2); return window.__vv.height; }})()"},  # 7
+            {"eval": nudge},                                                                              # 8
+            {"eval": VV_TRUTH},                                                                           # 9
+        ])
+    v = out["values"]
+    zoomed, keyboard = json.loads(v[6]), json.loads(v[9])
+    print("ZOOM", zoomed, "KEYBOARD", keyboard)
+    assert zoomed["shown"] == 0 and zoomed["state"]["seen"] == "0", zoomed
+    assert keyboard["outside"] > 5, keyboard                       # chunks in the block's view, below the visual viewport
+    assert keyboard["shown"] > 0 and keyboard["wrong"] == 0, keyboard    # what is above it shows; nothing below does
+
+
+# window scroll listeners named `later` (the gate's), wrapped to count their calls and how many are still added
+TRACK_LATER = ("(() => { const add = window.addEventListener, rem = window.removeEventListener, m = new Map(); "
+               "window.__later = 0; window.__live = 0; "
+               "window.addEventListener = function (t, fn, o) { if (t === 'scroll' && fn && fn.name === 'later') { "
+               "const w = function (e) { window.__later += 1; return fn.call(this, e); }; m.set(fn, w); window.__live += 1; "
+               "return add.call(this, t, w, o); } return add.call(this, t, fn, o); }; "
+               "window.removeEventListener = function (t, fn, o) { if (t === 'scroll' && m.has(fn)) { window.__live -= 1; "
+               "const w = m.get(fn); m.delete(fn); return rem.call(this, t, w, o); } return rem.call(this, t, fn, o); }; "
+               "return 1; })()")
+
+
+@needs_browser
+@needs_ssh
+def test_a_box_removed_before_it_is_seen_lets_its_listeners_go(tmp_path, monkeypatch) -> None:
+    """(fix 4, complement LOW, leak) The box drawn again or removed before it was seen: at the next scroll its window
+    listener lets go of everything, and a scroll after that runs no handler of it."""
+    rig = _ConsentRig(tmp_path, monkeypatch)
+    rid = _attack(rig)
+    box = f"({INPUT}.classList.contains('long-text') ? {INPUT} : {INPUT}.querySelector('.long-text'))"
+    scroll = f"(async () => {{ window.dispatchEvent(new Event('scroll')); {FRAMES}; return JSON.stringify([window.__later, window.__live]); }})()"
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
+            {"eval": TRACK_LATER},                                                                        # 2
+            {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
+            {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
+            {"eval": scroll},                                                                             # 5
+            {"eval": f"(() => {{ const b = {box}; window.__box = b; b.remove(); return b.dataset.seen; }})()"},   # 6
+            {"eval": scroll},                                                                             # 7
+            {"eval": scroll},                                                                             # 8
+            {"eval": scroll},                                                                             # 9
+        ])
+    v = out["values"]
+    print("LATER", v[5:])
+    on = json.loads(v[5])
+    assert on[1] == 1 and on[0] >= 1, on                            # watching while in the page
+    assert v[6] == "0", v
+    first, second, third = json.loads(v[7]), json.loads(v[8]), json.loads(v[9])
+    assert first[1] == 0, first                                     # the first scroll after the removal let it go
+    assert second[0] == first[0] and third[0] == first[0], (first, second, third)   # no handler of it ran again
+
+
 @needs_browser
 @needs_ssh
 def test_in_a_frame_the_parent_pages_fold_clips_what_is_shown(tmp_path, monkeypatch) -> None:
@@ -306,12 +440,16 @@ def test_in_a_frame_the_parent_pages_fold_clips_what_is_shown(tmp_path, monkeypa
     with rig.serving():
         out = _drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
-            # the cockpit's own page frames the sheet (its modal does): a frame of ours, placed past the fold
+            # the cockpit's own page frames the sheet (its modal does): a frame of ours, placed past the fold, in a modal
+            # dialog as the cockpit's is (fix 4: a frame outside the top layer counts nothing)
             {"eval": "(() => { window.__sheet = location.pathname; location.href = '/'; return 1; })()"},       # 2
             {"until": "location.pathname === '/' && document.readyState === 'complete' && 1", "ms": 30000},
-            {"eval": f"(() => {{ const fr = document.createElement('iframe'); fr.src = '/sign/consent/{rig.enc(rid)}'; "
+            {"eval": f"(() => {{ const d = document.createElement('dialog'); "
+                     "d.style.cssText = 'position:fixed;inset:0;margin:0;padding:0;border:0;max-width:none;max-height:none;"
+                     "width:auto;height:auto;overflow:visible;background:transparent'; "
+                     f"const fr = document.createElement('iframe'); fr.src = '/sign/consent/{rig.enc(rid)}'; "
                      "fr.style.cssText = 'position:fixed;left:0;top:520px;width:390px;height:1400px;border:0;z-index:99999'; "
-                     "document.body.appendChild(fr); return 1; })()"},                                   # 4
+                     "d.appendChild(fr); document.body.appendChild(d); d.showModal(); return 1; })()"},   # 4
             {"until": f"{fd} && {f_input} && {f_input}.querySelector('.long-whole') && 1", "ms": 30000},  # 3
             {"eval": f"({f_summary}.click(), 1)"},                                                        # 4
             {"until": f"{f_input}.classList.contains('open') && 1", "ms": 10000},                         # 5

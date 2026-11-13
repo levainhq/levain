@@ -912,6 +912,15 @@
     animation: modalFade var(--dur-expand) var(--ease-out) both;
   }
   body.modal-open { overflow: hidden; }  /* lock the deck behind the focus view */
+  /* the sign sheet's veil is a <dialog> in the top layer (row 1704 fix 4): the UA's dialog box (centred, fit-content,
+     bordered, padded, its own colours, a dim ::backdrop) is undone so it looks as the .modal-overlay div did; closed, it
+     is hidden (.modal-overlay's display: flex would otherwise beat the UA's dialog:not([open]) rule) */
+  dialog#levain-sign-sheet {
+    margin: 0; border: 0; width: auto; height: auto; max-width: none; max-height: none;
+    color: inherit; overflow: visible;
+  }
+  dialog#levain-sign-sheet:not([open]) { display: none; }
+  dialog#levain-sign-sheet::backdrop { background: transparent; }
 
   .modal {
     display: flex; flex-direction: column; width: min(900px, 100%); max-height: 88vh;

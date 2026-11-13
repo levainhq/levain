@@ -444,7 +444,9 @@
   // ancestor and any outer frame. A chunk counts as SHOWN only when an entry reported it wholly inside (its
   // intersectionRect is its boundingClientRect, within FULL_EPS px) AND, while so held, a hit test finds nothing in the page
   // painted over it (document.elementFromPoint at two inset corners and the centre of each of its line boxes is the
-  // chunk: the sticky bar or a header over the block hides what is under it). Coverage is the SET of chunks shown, not
+  // chunk: the sticky bar or a header over the block hides what is under it) AND it lies in the visual viewport with no
+  // pinch-zoom (screenOf; in a frame the hit test sees only the frame's document, so an outer page is ruled out by the top
+  // layer instead: the frame must sit in that page's one modal dialog, FIX 4). Coverage is the SET of chunks shown, not
   // pixels: a reflow cannot make a chunk shown, only showing it can. The count of what is not yet shown is the code points
   // of the chunks not shown (exact, no layout read); seen is every chunk shown, and once seen a box stays seen.
   // Fails closed: no IntersectionObserver or no elementFromPoint, nothing is ever shown (Deny stays open); a chunk the
@@ -494,6 +496,44 @@
     }
     return tested || !/\S/.test(el.textContent);
   }
+  // FIX 4: where this page lies on the screen the person sees, or null when it cannot be told (then nothing is shown):
+  // { dx, dy } the offset of this window's viewport in the top page's, and `vv` the top page's visual viewport as
+  // [left, top, right, bottom] in that page's layout-viewport coordinates (null: no visualViewport in this browser, no
+  // extra condition). FRAMED: a page of the same origin painted over the frame is invisible to the hit test, which sees only
+  // this document, so a framed page counts as on screen only while every frame up the chain sits in the ONE :modal dialog
+  // of its parent (the top layer: nothing of that page paints above it; the cockpit's sign sheet is one, dashboard_core.js
+  // buildSignSheet) and no element of that page is fullscreen; a frame in a page of another origin (no frameElement), a
+  // div veil (a browser without showModal), a second modal or no :modal support at all: null. ZOOM: IntersectionObserver
+  // and the hit test work in the layout viewport, so under pinch-zoom (scale above 1.01) nothing is shown, and a chunk
+  // counts only inside the visual viewport (an iOS keyboard shrinks it).
+  function screenOf() {
+    let dx = 0, dy = 0, w = root;
+    try {
+      while (w !== w.top) {
+        const fe = w.frameElement;
+        if (!fe) return null;
+        const doc = fe.ownerDocument, dlg = fe.closest("dialog");
+        if (!dlg || !dlg.matches(":modal") || doc.querySelectorAll(":modal").length !== 1 || doc.fullscreenElement) return null;
+        const r = fe.getBoundingClientRect();
+        dx += r.left + fe.clientLeft;
+        dy += r.top + fe.clientTop;
+        w = w.parent;
+      }
+      const vv = w.visualViewport;
+      if (!vv) return { dx: dx, dy: dy, vv: null };
+      if (!(vv.scale <= 1.01)) return null;
+      return { dx: dx, dy: dy, vv: [vv.offsetLeft, vv.offsetTop, vv.offsetLeft + vv.width, vv.offsetTop + vv.height] };
+    } catch (e) {
+      return null;
+    }
+  }
+  // whether `el`'s box lies wholly inside the visual viewport `s` (screenOf) describes
+  function onScreen(el, s) {
+    if (!s.vv) return true;
+    const b = el.getBoundingClientRect(), v = s.vv;
+    return b.left + s.dx >= v[0] - FULL_EPS && b.top + s.dy >= v[1] - FULL_EPS &&
+      b.right + s.dx <= v[2] + FULL_EPS && b.bottom + s.dy <= v[3] + FULL_EPS;
+  }
   function longText(text, cls) {
     const s = String(text);
     const cps = Array.from(s);
@@ -536,33 +576,50 @@
       box.dataset.unseen = String(left);
       box.dispatchEvent(new CustomEvent("longseen", { detail: box.longState() }));
     };
+    // the top page's visual viewport, whose own scroll and resize (pinch-zoom panning, an iOS keyboard) fire on it, not
+    // on a window; null when there is none or it cannot be reached
+    let vvTarget = null;
+    // everything watching is let go: on seen, and when the box has left the document (a box redrawn or removed before it
+    // was seen would otherwise keep its window listeners and observers for the page's life); a box put back is watched
+    // again at its next open
     const stop = () => {
       if (io) io.disconnect();
       if (near) near.disconnect();
+      io = null; near = null;
+      inside.clear();
       root.removeEventListener("scroll", later, true);
       root.removeEventListener("resize", later);
+      if (vvTarget) { vvTarget.removeEventListener("scroll", later); vvTarget.removeEventListener("resize", later); vvTarget = null; }
     };
-    // the chunks the observer holds inside, hit-tested now: each uncovered one is shown
+    // the chunks the observer holds inside, hit-tested now: each uncovered one, wholly on the screen the person sees
+    // (screenOf), is shown, and the observer lets it go (a shown chunk is never observed again: a read through 256 KiB
+    // would otherwise leave every chunk it showed observed, the per-frame cost the coarse observer exists to bound)
     const probe = () => {
       queued = false;
       if (seen) return;
+      if (!box.isConnected) { stop(); return; }
       let grew = false;
-      for (const i of inside) {
-        if (shown[i] || !uncovered(chunk[i], full)) continue;
-        shown[i] = 1; todo -= 1; unshown -= parts[i][1]; grew = true;
-        inside.delete(i);
+      const s = inside.size ? screenOf() : null;
+      if (s) {
+        for (const i of inside) {
+          if (shown[i] || !onScreen(chunk[i], s) || !uncovered(chunk[i], full)) continue;
+          shown[i] = 1; todo -= 1; unshown -= parts[i][1]; grew = true;
+          inside.delete(i);
+          if (io) io.unobserve(chunk[i]);
+        }
       }
       if (grew || first) { first = false; publish(); }
       if (seen) stop();
     };
     // a scroll anywhere (the block, the page, an ancestor) or a resize can uncover a chunk the observer still holds inside
     function later() {
+      if (!box.isConnected) { stop(); return; }
       if (queued || seen || !inside.size) return;
       queued = true;
       if (typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(probe); else probe();
     }
     const watch = () => {
-      if (io || seen || typeof root.IntersectionObserver !== "function") return;
+      if (io || seen || !box.isConnected || typeof root.IntersectionObserver !== "function") return;
       io = new root.IntersectionObserver((entries) => {
         for (const e of entries) {
           const i = at.get(e.target);
@@ -578,6 +635,7 @@
       // a run that leaves it, not
       const gi = new Map(groups.map((g, k) => [g, k]));
       near = new root.IntersectionObserver((entries) => {
+        if (!io) return;
         for (const e of entries) {
           const k = gi.get(e.target);
           if (k === undefined) continue;
@@ -591,6 +649,14 @@
       for (const g of groups) near.observe(g);
       root.addEventListener("scroll", later, { capture: true, passive: true });
       root.addEventListener("resize", later);
+      try {
+        const vv = root.top.visualViewport;
+        if (vv && typeof vv.addEventListener === "function") {
+          vv.addEventListener("scroll", later, { passive: true });
+          vv.addEventListener("resize", later);
+          vvTarget = vv;
+        }
+      } catch (e) { /* a top page of another origin: screenOf counts nothing there anyway */ }
     };
     // open, the whole text stands alone (the head and the tail would repeat it); closed, they are back
     whole.addEventListener("toggle", () => {
