@@ -93,6 +93,18 @@ LIST_PROBE = """(() => { const mb = document.querySelector('#levain-modal .modal
   return JSON.stringify({ head: h ? h.textContent.trim() : null, headLines: h ? Math.round(hb.height / lh(h)) : null, rows: rows }); })()"""
 
 
+# The reload below waits until the page's change stream (cockpit_stream.js) has left "connecting". The driver's whole-board wait
+# returns the moment the board is drawn, which is the moment the page starts its stream and its activity read; a reload sent in
+# that window hung the renderer for good (the reload's document never committed, every evaluate unanswered: CI runs 43059685049,
+# 43133698406, 43188571836, 43197388187, 43247185880, 43292927761, 43304306382, and 43332959158 with the worker settled), and a
+# local rig hung 10 of 72 such reloads, 0 of 48 with a 3 s pause before the reload or before the emulate (laneHPRED_return.md).
+# Measured limit: the rig also passed 36 of 36 when this wait accepted ANY chip state (one evaluate, no real wait), so it shows
+# the window is narrow, not that "connecting" is the state that matters; leaving "connecting" is the page's own signal that the
+# start is over, chosen so the reload is past the window by construction rather than by a few milliseconds.
+STREAM_PAST_CONNECTING = ("(() => { const c = document.querySelector('.livechip'); "
+                          "return !!(c && c.dataset.state && c.dataset.state !== 'connecting'); })()")
+
+
 @needs_browser
 def test_the_lists_later_group_tag_is_one_line_on_a_phone(tmp_path: Path, monkeypatch) -> None:
     from dataclasses import replace
@@ -121,7 +133,8 @@ def test_the_lists_later_group_tag_is_one_line_on_a_phone(tmp_path: Path, monkey
     widths = (430, 390, 200)
     steps: list = []
     for w in widths:
-        steps += [{"emulate": {"w": w, "h": 844, "dpr": 2, "mobile": True}}, {"eval": "location.reload(); 1"},
+        steps += [{"emulate": {"w": w, "h": 844, "dpr": 2, "mobile": True}}, {"until": STREAM_PAST_CONNECTING, "ms": 20000},
+                  {"eval": "location.reload(); 1"},
                   {"until": "!!document.querySelector('[data-ck-panel=tray] [data-list-more]')", "ms": 30000},
                   {"eval": "document.querySelector('[data-ck-panel=tray] [data-list-more]').click(); 1"},
                   {"until": "!!document.querySelector('#levain-modal .modal-body .sp-results .row')", "ms": 20000},
