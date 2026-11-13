@@ -759,8 +759,8 @@
     WAITING: "Waiting for your signature.",
     applying: "Still saving."
   };
-  // The page never shows the server's own text for a refusal: it can carry a path or an OS error (the one exception is
-  // SNOOZE_REFUSALS, below). A code not listed here says only its code.
+  // The page never shows the server's own text for a refusal: it can carry a path or an OS error (the exceptions are
+  // SNOOZE_REFUSALS and AGENDA_DAY_REFUSAL, below). A code not listed here says only its code.
   const FAULT_WORDS = {
     stale: "That changed somewhere else first. Reload to see the new version.",
     needs_intent: "This needs a fresh confirmation. Try again.",
@@ -797,6 +797,10 @@
     credential_required: "Saving needs the write token for this page. Open the page from the link that carries it."
   };
   const SNOOZE_REFUSALS = new Set(["pick a time after now", "pick a later day", "pick a day: that date could not be read"]);
+  // The List's band row to agenda refuses a day inside the snooze window in words that say what to do instead ("<day> is within the
+  // snooze window (...): snooze the row instead; an agenda is for a day after <day>"). They are composed from the day and the window
+  // alone, so they are shown as sent, but only a message that opens the way the host's day refusals open and carries no path.
+  const AGENDA_DAY_REFUSAL = /^(?:\d{4}-\d{2}-\d{2} is (?:not after today|within the snooze window)|an agenda's day is written YYYY-MM-DD)[^/\\]{0,280}$/;
   // Only a landed state is silent; a state this page does not know speaks too (never a quiet failure). Own-property lookups:
   // a state or code named "constructor" must not index into Object.prototype.
   function resultWords(state) {
@@ -812,6 +816,8 @@
     // form says what to change. Only these exact sentences, only on that verb: any other bad_request keeps the fixed line.
     if (code === "bad_request" && r.status === 400 && what && what.verb === "intention_snooze" && typeof d.message === "string"
         && SNOOZE_REFUSALS.has(d.message)) text = d.message;
+    if (code === "bad_request" && r.status === 400 && what && what.verb === "band_agenda" && typeof d.message === "string"
+        && AGENDA_DAY_REFUSAL.test(d.message)) text = d.message;
     if (REREAD.has(code) || r.status === 501) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);

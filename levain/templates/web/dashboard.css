@@ -798,6 +798,8 @@
   .when-form .verb-date, .when-form .verb-time { flex: 1 1 7rem; min-width: 0; }
   .when-form .who-ctl { flex: 1 1 100%; }
   .when-zone { flex: 1 1 100%; }
+  /* the line under the day that says when the row comes back (and, for an agenda, what happens to the row) wraps inside the card */
+  .when-form .intention-back { flex: 1 1 100%; white-space: normal; overflow-wrap: anywhere; }
   .who-ctl { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
   .who-opt[aria-pressed="true"] { color: var(--ink); border-color: var(--label); background: var(--card-2); }
   .who-repo { min-width: 0; width: 10rem; }
@@ -3771,6 +3773,15 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
 .list-meta > * { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .list-meta > .list-support { flex: 1 1 100%; white-space: normal; line-height: var(--lh-list); }
 .list-meta > .k7-repo { flex: none; }
+/* the List's memory part, shown to a search only: a group under the rows, the way a rows group reads, a memory's receipt line beside its chip */
+.list-kept { margin-top: var(--sp-3); }
+.list-kept[hidden] { display: none; }
+.list-kept-group > summary { cursor: pointer; list-style: none; }
+.list-kept-group > summary::-webkit-details-marker { display: none; }
+.list-kept-group > summary::before { content: "\25BE "; }
+.list-kept-group:not([open]) > summary::before { content: "\25B8 "; }
+.list-kept .list-kept-note { margin: var(--sp-2) 0 0; font-size: var(--fs-micro); }
+.keep-ask { flex: 1 1 100%; overflow-wrap: anywhere; }
 @media (max-width: 720px) {
   body.ke [data-ck-panel="tray"] .panel > .more-foot, body.ke [data-ck-panel="tray"] > .more-foot { align-self: stretch; margin: 0 var(--sp-6) var(--sp-4);
     min-height: var(--hit-min); border: 1px solid var(--hair-2); border-radius: var(--r-md); text-decoration: none; }

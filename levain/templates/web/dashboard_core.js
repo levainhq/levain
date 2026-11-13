@@ -2175,6 +2175,8 @@
       }       // the footer's clock and form, never whole days from the add
       else if (s.surface !== "band" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
       if (intend) appendRowVerbs(row, buildIntentionVerbs(s.row_id, s.actions, s.intention_text), ["Done", "Snooze"], 2);
+      // a plain band row (it rings no reminder) offers the one write the kernel names on it: make it an agenda past the snooze window
+      else if (s.surface === "band" && s.row_id && hasBandAgenda(s.actions)) appendRowVerbs(row, buildBandAgendaVerb(s), ["Make an agenda"], 1);
       return row;
     }
     if (s.surface && s.time_state === "done") {
@@ -2460,7 +2462,86 @@
         box.appendChild(intentionRow(s, verbs, badgeField, entry.kind));
       }
     }, opts);
+    if (isList) mountListKept(p);
     return p;
+  }
+
+  // The List's memory part (the Keep, row 182): the List's search also reaches the entity's episodes, which the kernel sends only to
+  // a search (`q` on the panel read; a plain read carries none of them). So the box, besides filtering the rows already here, asks
+  // the kernel once the typing settles and draws the `kept` rows it sends in a "Kept in memory" group under the List rows: expanded
+  // when there are hits, absent when there are none, read-only (no verb is offered on a memory), each row naming its own receipt
+  // line ("kept as memory: episode ..."). A newer query retires the one in flight; a page with no read transport draws no group.
+  const KEPT_DEBOUNCE_MS = 250;
+  const KEPT_QUERY_MAX = 200;
+  function mountListKept(p) {
+    const T = window.LevainCockpitTransport;
+    const input = p.querySelector(".ep-search-input");
+    const results = p.querySelector(".sp-results");
+    if (!T || typeof T.readJson !== "function" || !input || !results) return;
+    const host = el("div", "list-kept");
+    host.dataset.listKept = "1";
+    host.hidden = true;
+    results.after(host);
+    let seq = 0, timer = 0;
+    const clear = () => { host.hidden = true; host.replaceChildren(); };
+    // the kernel's own sentence about its search window is a note on the read; a memory that could not be read is a skipped line
+    const keptWords = (payload) => {
+      const out = [];
+      for (const k of Array.isArray(payload.skipped) ? payload.skipped : []) if (k && typeof k.reason === "string" && /^kept memory/.test(k.reason)) out.push(k.reason);
+      const w = typeof payload.note === "string" ? /a search of memory reaches[^.]*\./.exec(payload.note) : null;
+      if (w) out.push(w[0]);
+      return out;
+    };
+    const keptRow = (r) => {
+      const f = r && r.facets && typeof r.facets === "object" ? r.facets : {};
+      const row = el("div", "row");
+      row.dataset.surface = "kept";
+      if (typeof r.id === "string") row.dataset.rowKey = r.id;
+      const meta = el("span", "list-meta");
+      const chip = tagEl("tier list-surface", "kept");
+      chip.dataset.surfaceChip = "kept";
+      meta.appendChild(chip);
+      if (typeof f.kept_line === "string" && f.kept_line) meta.appendChild(tagEl("muted list-kept-line", f.kept_line));
+      if (typeof f.kept_at === "string" && /^\d{4}-\d{2}-\d{2}/.test(f.kept_at)) meta.appendChild(tagEl("muted", shortDate(f.kept_at)));
+      // the memory's own words; a blank line inside them would clamp to an empty second line, so a run of newlines is one
+      appendClause(row, (typeof r.body === "string" && r.body ? r.body : String(r.title || "")).replace(/\n{2,}/g, "\n"));
+      row.appendChild(meta);
+      return row;
+    };
+    const draw = (payload) => {
+      host.replaceChildren();
+      const kept = (Array.isArray(payload.rows) ? payload.rows : []).filter((r) => r && r.facets && r.facets.surface === "kept");
+      const words = keptWords(payload);
+      if (payload.status === "error" || typeof payload.search_error === "string") {
+        host.appendChild(el("p", "err", "memory could not be searched — " + (payload.search_error || payload.error || "unavailable")));
+      } else if (kept.length) {
+        const g = el("details", "list-kept-group");
+        g.open = true;
+        g.appendChild(el("summary", "grp-head", "Kept in memory \u00b7 " + kept.length));
+        for (const r of kept) g.appendChild(keptRow(r));
+        host.appendChild(g);
+      }
+      for (const w of words) host.appendChild(el("p", "muted list-kept-note", w));
+      host.hidden = host.children.length === 0;
+      measureClauses(host);
+    };
+    const run = async () => {
+      const q = input.value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, KEPT_QUERY_MAX);
+      const mine = ++seq;
+      if (!q) { clear(); return; }
+      let payload;
+      try { payload = await T.readJson("/cockpit/panel/tray.json?profile=full&q=" + encodeURIComponent(q)); }
+      catch (e) { payload = { status: "error", error: e && e.message ? e.message : String(e) }; }
+      if (mine !== seq) return;     // a newer query (or a cleared box) retired this one
+      draw(payload && typeof payload === "object" ? payload : { status: "error", error: "unreadable" });
+    };
+    input.addEventListener("input", () => {
+      window.clearTimeout(timer);
+      seq++;
+      if (!input.value.trim()) { clear(); return; }
+      timer = window.setTimeout(run, KEPT_DEBOUNCE_MS);
+    });
+    if (input.value.trim()) run();      // a redrawn panel keeps its query: its memory part comes back with it
   }
 
   function renderIntentions(entry, view) {
@@ -3389,7 +3470,7 @@
   const BUTTON_VERB = { touch: "intention_touch", edit: "intention_update", park: "intention_update",
     reactivate: "intention_update", "when?": "intention_surface_at", who: "intention_retarget", "then you": "intention_then", Resolve: "intention_close", metabolize: "intention_set_disposition",
     dismiss: "intention_close", compost: "intention_close", promote: "intention_promote",
-    tombstone: "episode_tombstone" };
+    tombstone: "episode_tombstone", keep: "intention_keep", "Make an agenda": "band_agenda" };
 
   // a row tag (a disposition, a tier, a type, hashtags, a due date): plain meta text; the page's CSS decides how it
   // looks, and only a tag marked overdue may take the accent
@@ -3477,6 +3558,10 @@
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
         wrap.appendChild(verbBtn("Resolve", "resolve or compost this inbox item", () =>
           openResolveForm(wrap, "intention_close", "dismiss", s, s.descend_kinds, false)));
+      }
+      // keep: only where the cockpit offers intention_keep (a plain intention row); a row with no actions list (a legacy row) is offered none
+      if (Array.isArray(s.actions) && s.actions.some((x) => x && x.verb === "intention_keep")) {
+        wrap.appendChild(verbBtn("keep", "keep these words as a memory and take the item off the List", () => openKeepForm(wrap, s)));
       }
       return gateByActions(wrap, s.actions);
     }
@@ -3653,7 +3738,8 @@
     // an agenda (it holds a target) is undated never: flow refuses one, so "someday" is for a seed with no who chosen
     const agenda = rowTarget(s) !== "";
     if (agenda) clearBtn.hidden = true;
-    form.append(...(opts ? [] : [picksBox]), input, timeIn, zone, ...(back ? [back] : []), ...(!opts && who.node ? [who.node] : []), go, ...(opts ? [] : [clearBtn]), cancel, msg);
+    // `opts.dateOnly`: the verb takes a day and nothing finer (the band row to agenda), so the form offers no time
+    form.append(...(opts ? [] : [picksBox]), input, ...(opts && opts.dateOnly ? [] : [timeIn, zone]), ...(back ? [back] : []), ...(!opts && who.node ? [who.node] : []), go, ...(opts ? [] : [clearBtn]), cancel, msg);
     host.appendChild(form);
     // a touch screen's keyboard opens on a focused date input and covers the form: focus it only where a pointer, not a thumb, drives
     if (!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches)) input.focus();
@@ -3831,6 +3917,39 @@
       return res;
     });
   }
+
+  // The List's receipt line (under the intake box) says what a write did, in the server's own sentence: a Keep names its episode,
+  // an agenda says when it wakes. It is kept across the redraw that follows the write (intakeKept).
+  function listReceipt(res) {
+    const line = res && res.ok && res.data && typeof res.data.receipt_line === "string" ? res.data.receipt_line : "";
+    if (line) { intakeKept.receipt = { text: line, cls: "ok" }; paintIntakeReceipts(); }
+  }
+  const LIST_ROW_STALE = "this row changed: reload";
+
+  // The Keep (intention_keep): the row's words become a memory (an anneal episode), then the item leaves the List. It is
+  // irreversible from here, so the form asks once, in words, and the confirm tap sends confirm:true.
+  function openKeepForm(host, s) {
+    const words = String(s.text || "");
+    const ask = "Keep \u201c" + words.slice(0, 120) + (words.length > 120 ? "\u2026" : "") + "\u201d as a memory? It leaves the List; search finds it.";
+    openRowForm(host, () => ({ nodes: [el("span", "muted keep-ask", ask)], focus: null }), () => ({}), "Keep", false,
+      async (req) => { const res = await intentionPost(s.row_id, "intention_keep", true)(req); listReceipt(res); return res; }, LIST_ROW_STALE);
+  }
+
+  // The band row to agenda (band_agenda): a machine-filed band row he wants past the snooze window becomes a dated agenda that
+  // wakes back into the band on its day, and the row is answered so the stopped agent waits. The day form is the date alone;
+  // the server judges the day (a day inside the window is refused in its own words, shown in the form) and the confirm tap
+  // sends confirm:true.
+  function buildBandAgendaVerb(s) {
+    const wrap = el("span", "verb-actions band-agenda-actions");
+    wrap.appendChild(verbBtn("Make an agenda", "push this row past the snooze window: it comes back on the day you pick, as an agenda", () =>
+      openSurfaceForm(wrap, { next: null }, {
+        label: "make agenda", dateOnly: true, min: localDayIso(1),
+        post: async (v) => { const res = await intentionPost(s.row_id, "band_agenda", true)({ day: v }); listReceipt(res); return res; },
+        back: (v) => "comes back " + dayWords(v) + " as an agenda; this row is answered so the stopped agent waits",
+        done: (v) => "agenda for " + dayWords(v), stale: LIST_ROW_STALE })));
+    return gateByActions(wrap, s.actions);
+  }
+  const hasBandAgenda = (actions) => !!commit && Array.isArray(actions) && actions.some((a) => a && a.verb === "band_agenda");
 
   // Shared inline-form scaffold for the per-row verbs (edit / reclassify / remove): hide the
   // trigger buttons, mount a form, wire cancel + Escape (stopPropagation so it doesn't nuke an
