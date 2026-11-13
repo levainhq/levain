@@ -457,6 +457,19 @@ def _ensure_band_schema(conn: sqlite3.Connection) -> None:
     _ensure_recycling(conn)
 
 
+def _after_band_schema(require: Callable[[sqlite3.Connection], None] | None
+                       ) -> Callable[[sqlite3.Connection], None]:
+    """BAND-FIX2 (codex MED 3): the ``require`` a band answer hands :meth:`QuestionStore.answer_with_context` (which
+    runs plain statements, ``schema``, and then ``require``, in its one write): :func:`_ensure_band_schema` first, then
+    the caller's own check. An answer can be a store's first band write after an upgrade, and a check such as
+    :func:`_still_newest` reads ``band_views.lives``, a column only the prelude adds."""
+    def check(conn: sqlite3.Connection) -> None:
+        _ensure_band_schema(conn)
+        if require is not None:
+            require(conn)
+    return check
+
+
 def _next_life(conn: sqlite3.Connection) -> int:
     """The next life (BAND-FIX1), inside the caller's numbering write: the counter row only grows (its trigger aborts a
     step back), so a life is never issued twice in a store, whatever was deleted or retired."""
@@ -604,8 +617,8 @@ def _stale(conn: sqlite3.Connection, ns: Collection[int], lives: Mapping[int, in
 
 
 def _idents(store: QuestionStore, keys: Collection[tuple[str, str]]) -> dict[tuple[str, str], tuple[int, int]]:
-    """``{(source, ref): (n, life)}`` of the keys that have a row, from ONE read-only snapshot (absent store or table,
-    a busy lock: none). A caller pairs a number it read earlier with a life only when this ``n`` is that number: a life
+    """``{(source, ref): (n, life)}`` of the keys that have a row, from ONE read-only snapshot (absent store or table:
+    none; a busy lock raises, which :func:`_settle` reads as lives UNKNOWN, BAND-FIX2). A caller pairs a number it read earlier with a life only when this ``n`` is that number: a life
     belongs to one row, so a row retired and renumbered in between gives no life for the old number (stale: fail closed)."""
     if not keys or _foreign(store):
         return {}
@@ -796,7 +809,8 @@ class Rendered(NamedTuple):
     an authority source was not read (``failed``: the text then carries its ``! not read`` line), and whether an open
     item has no number yet (``pending``: the text lists it as ``new (number pending)``). ``closed`` holds
     :class:`ClosedNotice` values (ints that name their row); ``lives`` is ``((n, life), ...)`` of the shown numbers, read
-    with the numbers at render time: what the view records (BAND-FIX1)."""
+    with the numbers at render time: what the view records (BAND-FIX1); ``None`` when they could not be read (unknown,
+    BAND-FIX2: the view then records none)."""
     text: str
     closed: list[ClosedNotice]
     shown: list[int]
@@ -804,7 +818,7 @@ class Rendered(NamedTuple):
     gen: int
     failed: bool = False
     pending: bool = False
-    lives: tuple[tuple[int, int], ...] = ()
+    lives: tuple[tuple[int, int], ...] | None = ()
 
 
 def render_with_closed(store: QuestionStore | None = None) -> tuple[str, list[ClosedNotice]]:
@@ -873,15 +887,24 @@ def _settle(store: QuestionStore, keys: list[tuple[str, str]], numbers: dict[str
             extra_numbers: dict[tuple[str, str], int], extra_closed: list[ClosedNotice],
             extra_idents: dict[tuple[str, str], tuple[int, int]], new: list[tuple[str, str]], numbering: bool,
             deadline: float, gone: list[tuple[str, str]]
-            ) -> tuple[dict[str, int], dict[tuple[str, str], int], list[ClosedNotice], dict[tuple[str, str], tuple[int, int]]]:
+            ) -> tuple[dict[str, int], dict[tuple[str, str], int], list[ClosedNotice],
+                       dict[tuple[str, str], tuple[int, int]] | None]:
     """What a render shows, settled (BAND-FIX1): the numbers (the new ones numbered in one write, as before), the
     ``closed`` notices as :class:`ClosedNotice` (a question's paired with its row's life; any whose number was retired
     by the write is dropped there, :func:`_current_notices`), and ``{key: (n, life)}`` of the open items. A life is
     paired with a number only when it was read for that very number (:func:`_idents`); one that is not is left out, so
-    the view records no life for it and nothing typed against the view reaches it (fail closed)."""
+    the view records no life for it and nothing typed against the view reaches it (fail closed).
+    BAND-FIX2 (deepseek MED 2): when the questions' lives could not be read at all (a busy or failing snapshot), the
+    last element is ``None``, UNKNOWN, never ``{}`` (an empty KNOWN mapping would make the view call every number it
+    showed reissued): the view then records no lives (:func:`_stale`'s rule for that: stale only for a number ever
+    retired), and the questions' ``closed`` notices, which need their life, wait for the next render (never lost)."""
     idents: dict[tuple[str, str], tuple[int, int]] = {}
+    known = True
     if not _foreign(store):
-        idents.update(_idents(store, [k for k in keys if k[0] == "question"] + [("question", r) for _, r in closed]))
+        try:
+            idents.update(_idents(store, [k for k in keys if k[0] == "question"] + [("question", r) for _, r in closed]))
+        except sqlite3.Error:
+            known = False
     idents.update(extra_idents)
     notices = [ClosedNotice(n, "question", r, idents[("question", r)][1]) for n, r in closed
                if idents.get(("question", r), (None,))[0] == n]
@@ -894,12 +917,15 @@ def _settle(store: QuestionStore, keys: list[tuple[str, str]], numbers: dict[str
         idents.update(fresh)
         if verified is not None:              # the write may have retired a number whose notice was read above
             notices = verified
-    return numbers, extra_numbers, sorted(notices), idents
+    return numbers, extra_numbers, sorted(notices), (idents if known else None)
 
 
-def _lives_of(shown_keys: list[tuple[tuple[str, str], int]], idents: Mapping[tuple[str, str], tuple[int, int]]
-              ) -> tuple[tuple[int, int], ...]:
-    """``((n, life), ...)`` of the shown ``(key, n)``: a life only where it was read for that number."""
+def _lives_of(shown_keys: list[tuple[tuple[str, str], int]], idents: Mapping[tuple[str, str], tuple[int, int]] | None
+              ) -> tuple[tuple[int, int], ...] | None:
+    """``((n, life), ...)`` of the shown ``(key, n)``: a life only where it was read for that number. ``idents``
+    ``None`` (the lives could not be read, BAND-FIX2): ``None``, unknown, never ``()``."""
+    if idents is None:
+        return None
     return tuple((n, idents[k][1]) for k, n in shown_keys if idents.get(k, (None,))[0] == n)
 
 
@@ -1389,8 +1415,10 @@ def _answer_signed(store: QuestionStore, entries: list[dict[str, Any]], *, chann
         raise ConsentError(f"channel must be one of {', '.join(ANSWER_CHANNELS)}: {channel!r}")
     out: list[Any] = []
     with (store._write_by(deadline) if deadline is not None else store._write()) as conn:
-        for stmt in BAND_SCHEMA:
-            conn.execute(stmt)
+        # BAND-FIX2 (codex MED 3): the one migrating prelude, as every band writer runs it, never BAND_SCHEMA alone: an
+        # answer can be a store's first band write after an upgrade, and ``require`` (:func:`_still_newest`) reads
+        # ``band_views.lives``, a column only the prelude adds to a store from before it
+        _ensure_band_schema(conn)
         _ensure_sign_columns(conn)
         if require is not None:
             require(conn)
@@ -1576,8 +1604,8 @@ def apply_plan(store: QuestionStore, plan: Parse, questions: dict[int, Question]
             results: list[Any] = (_answer_signed(store, [e for _, e in todo], channel=channel, deadline=deadline,
                                                  require=require)
                                   if sign_with is not None else
-                                  store.answer_with_context([e for _, e in todo], channel=channel, schema=BAND_SCHEMA,
-                                                            deadline=deadline, require=require))
+                                  store.answer_with_context([e for _, e in todo], channel=channel, deadline=deadline,
+                                                            require=_after_band_schema(require)))
         except Exception as exc:                              # rolled back whole: nothing of it was stored
             if require is not None:                           # a surface: 409 / 503, never a per-item refusal
                 raise
@@ -1766,7 +1794,7 @@ class BandSnapshot:
     hwm: int
     gen: int
     read_only: bool
-    lives: tuple[tuple[int, int], ...] = ()
+    lives: tuple[tuple[int, int], ...] | None = ()
 
     def numbered(self) -> list[dict[str, Any]]:
         return [it for _, it in self.entries if it["n"] is not None]
@@ -1818,7 +1846,7 @@ def _extra_item(e: Extra, n: int | None) -> tuple[dict[str, str], dict[str, Any]
 
 def _finish(entries: list[tuple[dict[str, str], dict[str, Any]]], *, unread: bool, pending: bool, failed: bool,
             store_id: str | None, shown: list[int], hwm: int, gen: int, read_only: bool,
-            lives: tuple[tuple[int, int], ...] = ()) -> BandSnapshot:
+            lives: tuple[tuple[int, int], ...] | None = ()) -> BandSnapshot:
     note = _UNREAD_NOTE if unread else _PENDING_NOTE if pending else ""
     return BandSnapshot(tuple(entries), _queue_of(entries), note, pending, failed, store_id, tuple(shown), hwm, gen,
                         read_only, lives)
@@ -1887,7 +1915,8 @@ def _native_snapshot(store: QuestionStore, writable: bool, gen: int, deadline: f
             store, [k for k, _ in order_in], numbers, closed, extra_numbers, extra_closed, extra_idents, new, numbering,
             deadline, gone)
     except Exception:  # noqa: BLE001 - those items stay unnumbered and the snapshot says so, as number_for_ping does
-        closed_all, idents = [*(n for n, _ in closed), *extra_closed], {}
+        # BAND-FIX2 (deepseek MED 2): no life was read, so the lives are UNKNOWN (None), never an empty known mapping
+        closed_all, idents = [*(n for n, _ in closed), *extra_closed], None
 
     def number_of(k: tuple[str, str]) -> int | None:
         return numbers.get(k[1]) if k[0] == "question" else extra_numbers.get(k)
@@ -2098,7 +2127,7 @@ def answer_item(store: Any, subject: Mapping[str, Any], *, pick: str | None, tex
         entry["option"] = option
     else:
         entry["text"] = said
-    (result,) = store.answer_with_context([entry], channel=channel, schema=BAND_SCHEMA, require=_still_version(subject),
+    (result,) = store.answer_with_context([entry], channel=channel, require=_after_band_schema(_still_version(subject)),
                                           deadline=time.monotonic() + HOOK_BUSY_MS / 1000)
     if isinstance(result, ConsentError):
         raise result
@@ -2962,7 +2991,10 @@ def _delta_line(store: QuestionStore, prev: View | None, shown: list[int], deadl
             if ok and both:
                 if lives is not None and had is not None:
                     now_lives = dict(lives)
-                    replaced = {n for n in both if now_lives.get(n) != had.get(n)}
+                    replaced = {n for n in both if n in now_lives and now_lives[n] != had.get(n)}
+                    # BAND-FIX2 (deepseek MED 2): a number this render read no life for is not thereby "replaced": the
+                    # store's own lives decide it (:func:`_stale`), as for a render that passed none
+                    replaced |= _stale(conn, [n for n in both if n not in now_lives], had)
                 else:
                     replaced = _stale(conn, both, had)
             new = [n for n in shown if n > prev.seen_through or n not in prev.open_list or n in replaced]
@@ -3305,7 +3337,9 @@ def _stage_view(directory: Path | str, session: str, r: "Rendered", block: str, 
                  json.dumps({"session": session, "hwm": r.hwm, "shown": list(r.shown), "gen": r.gen,
                              "closed": [int(c) for c in r.closed],
                              "closed_acks": [c.ident() for c in r.closed if isinstance(c, ClosedNotice)],
-                             "lives": [list(p) for p in r.lives], "block": block, "work": work, "store_id": store_id,
+                             # BAND-FIX2: unknown lives stay unknown (null), never an empty list
+                             "lives": None if r.lives is None else [list(p) for p in r.lives],
+                             "block": block, "work": work, "store_id": store_id,
                              "intake_open": intake_open, "intake_lines": list(intake_lines)}))
     except Exception:
         pass
@@ -3328,7 +3362,7 @@ def _read_staged(directory: Path | str, session: str) -> tuple[dict, bytes] | No
         return ({"hwm": int(rec["hwm"]), "shown": [int(n) for n in rec["shown"]], "gen": int(rec["gen"]),
                  "closed": [int(n) for n in rec["closed"]],
                  "acks": [c for c in (_notice_of(x) for x in rec.get("closed_acks", [])) if c is not None],
-                 "lives": (None if "lives" not in rec else tuple((int(n), int(v)) for n, v in rec["lives"])),
+                 "lives": (None if rec.get("lives") is None else tuple((int(n), int(v)) for n, v in rec["lives"])),
                  "block": str(rec["block"]),
                  "work": int(rec.get("work", 0)), "store_id": str(rec.get("store_id") or ""),
                  "intake_open": int(rec.get("intake_open", 0)),
@@ -3881,16 +3915,29 @@ def run_band_answer(args: argparse.Namespace) -> int:
     return 0 if done.recorded or done.sheets else EXIT_REFUSED
 
 
-def question_of_band_number(store: QuestionStore, n: int) -> str:
+def question_of_band_number(store: QuestionStore, n: int, viewer: str = "cli") -> str:
     """The question id band number ``n`` was allocated to, read-only. Raises :class:`ConsentError` with the reason for
-    a number never shown, one allocated to an authority item or to a host (only a Levain question can be snoozed)."""
+    a number never shown, one allocated to an authority item or to a host (only a Levain question can be snoozed).
+    BAND-FIX2 (complement MED): a typed number binds through ``viewer``'s newest view, by the typed answer's own rule
+    (:func:`plan_for_full` and :func:`_items_read`; the CLI's viewer is ``cli``, the view ``levain band`` last printed):
+    refused when that viewer was never shown a band, when its band is another store's, when the number was not open in
+    it, or when the number's row is not the row the view showed (:func:`_stale`: its life differs, or the view recorded
+    no lives and the number was ever retired). So a number reissued since the operator looked defers nothing. One
+    snapshot reads the view, the row and its life."""
     with store._peek() as conn:
-        row = None
-        freed = None
+        row = freed = view = sid = None
+        stale = False
         if conn is not None and "band_items" in _tables(conn):
             row = conn.execute("SELECT source, ref FROM band_items WHERE n = ?", (n,)).fetchone()
             if row is None and "band_items_retired" in _tables(conn):
                 freed = conn.execute("SELECT MAX(freed_at) FROM band_items_retired WHERE n = ?", (n,)).fetchone()[0]
+            if row is not None and row[0] == "question" and "band_views" in _tables(conn):
+                top = conn.execute(_NEWEST_VIEW.replace(" lives ", f" {_lives_col(conn)} ", 1), (viewer,)).fetchone()
+                if top is not None:
+                    view = _view_of(top[1], top[2], top[3], top[4])
+                    got = conn.execute("SELECT value FROM meta WHERE key = 'store_id'").fetchone()
+                    sid = got[0] if got else None
+                    stale = n in _stale(conn, [n], _view_lives(view))
     if row is None:
         if freed is not None:
             raise ConsentError(f"band number {n} is not in use: its item closed on {freed[:10]} and the number is "
@@ -3899,6 +3946,15 @@ def question_of_band_number(store: QuestionStore, n: int) -> str:
     if row[0] != "question":
         raise ConsentError(f"band item {n} is a {row[0]} item, not a question: only a question can be snoozed "
                            "(an item that needs your signature is settled on its own sheet)")
+    if view is None:
+        raise ConsentError(f"no band was shown at this terminal yet, so band number {n} names nothing you saw: "
+                           "run `levain band` first")
+    if view.store_id != sid:
+        raise ConsentError("the band you last saw came from another question store: run `levain band` first")
+    if n not in view.open_list:
+        raise ConsentError(f"band number {n} was not open in the band you last saw: run `levain band` first")
+    if stale:
+        raise ConsentError(f"band number {n} was reissued since you last saw the band: run `levain band` first")
     return row[1]
 
 

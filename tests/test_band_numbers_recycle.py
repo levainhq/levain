@@ -4,6 +4,8 @@ typed number resolves only against OPEN rows (the TERMSIGN F1 footer view id sta
 store under ``tmp_path`` with an injected clock; none touches a real Levain home."""
 from __future__ import annotations
 
+import argparse
+import json
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -1021,3 +1023,270 @@ def test_a_host_release_frees_only_the_life_it_named_even_when_a_clock_set_back_
     band_view.release(store, "host", ["np-a"])                           # its own release, its own life
     clock.advance(timedelta(days=14))
     assert band_view.allocate(store, "host", ["np-x"]) == {"np-x": 2}
+
+
+# --- BAND-FIX2 (levain#3 L3 round 2) ----------------------------------------------------------------------------------
+# main 8d21607f2's band_views (its BAND_SCHEMA, verbatim): no ``lives`` column
+PREVIOUS_VIEWS_DDL = (
+    "CREATE TABLE IF NOT EXISTS band_views (seq INTEGER PRIMARY KEY AUTOINCREMENT, viewer TEXT NOT NULL, "
+    "seen_through INTEGER NOT NULL, open_list TEXT NOT NULL, store_id TEXT NOT NULL, at TEXT NOT NULL, "
+    "gen INTEGER NOT NULL)",
+    "CREATE TRIGGER IF NOT EXISTS band_views_frozen BEFORE UPDATE ON band_views "
+    "BEGIN SELECT RAISE(ABORT, 'band views are append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS band_views_kept BEFORE DELETE ON band_views "
+    "BEGIN SELECT RAISE(ABORT, 'band views are append-only'); END",
+    "CREATE TABLE IF NOT EXISTS band_view_blocks (viewer TEXT NOT NULL, gen INTEGER NOT NULL, block TEXT NOT NULL, "
+    "PRIMARY KEY (viewer, gen))",
+)
+PHONE = "phone:dev-1"
+
+
+def _previous_view(store, viewer, open_list, seen_through):
+    """A view as main's record_view wrote it (no lives), on a store main left (:func:`_previous_store`)."""
+    sid = band_view.QuestionStore.store_id.fget(store)
+    with sqlite3.connect(store.path) as c:
+        for stmt in PREVIOUS_VIEWS_DDL:
+            c.execute(stmt)
+        cur = c.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at, gen) VALUES "
+                        "(?, ?, ?, ?, ?, ?)", (viewer, seen_through, json.dumps(open_list), sid, band_view.utc_stamp(T0), 1))
+        seq = cur.lastrowid
+    return sid, seq
+
+
+def _has_lives(store):
+    with sqlite3.connect(store.path) as c:
+        return "lives" in [r[1] for r in c.execute("PRAGMA table_info(band_views)")]
+
+
+def test_codex_med_3_a_phone_answer_to_a_view_from_before_lives_can_be_the_first_band_write_after_the_upgrade(store,
+                                                                                                           clock):
+    """codex MED 3, reproduced on a store main left (bandfix2_scratch/repro_main_store.py f1, the old code itself
+    seeding it): the phone answers the view main recorded before this code wrote anything. The answer's view check
+    reads ``band_views.lives``; the answer's write runs the one migrating prelude first, so it lands."""
+    qs = _previous_store(store, clock)
+    sid, seq = _previous_view(store, PHONE, [1, 2, 3], 4)
+    assert not _has_lives(store)
+    done = band_view.answer_text(store, "2a", viewer=PHONE, channel="phone", store_id=sid, view_id=seq)
+    assert done.recorded and answered(store, qs[1]) and _has_lives(store)
+    with pytest.raises(band_view.StaleBand):           # and the view check still holds on the migrated store
+        band_view.answer_text(store, "3a", viewer=PHONE, channel="phone", store_id=sid, view_id=seq + 99)
+    assert not answered(store, qs[2])
+
+
+def test_codex_med_3_the_signed_answer_write_runs_the_same_prelude(store, clock):
+    """The other answer write (:func:`band_view._answer_signed`, a signed line) with the same view check, on the same
+    unmigrated store: no ``no such column``, the answer lands."""
+    qs = _previous_store(store, clock)
+    sid, seq = _previous_view(store, PHONE, [1, 2, 3], 4)
+    entry = {"ref": qs[1].id, "option": "fix", "via": "phone", "viewer": PHONE, "seen_through": 4, "note": None}
+    (res,) = band_view._answer_signed(store, [entry], channel="phone", deadline=None,
+                                      require=band_view._still_newest(PHONE, sid, seq))
+    assert not isinstance(res, Exception) and answered(store, qs[1]) and _has_lives(store)
+
+
+def test_codex_med_3_an_answer_by_subject_on_an_unmigrated_store_lands_too(store, clock):
+    qs = _previous_store(store, clock)
+    q = store.get(qs[2].id)
+    done = band_view.answer_item(store, {"kind": "question", "id": q.id, "version": band_view.subject_version(q)},
+                                 pick="a", text=None, channel="cockpit", viewer="cockpit:t")
+    assert done.recorded and answered(store, qs[2]) and _has_lives(store)
+
+
+@pytest.fixture
+def terminal(store, qdir, monkeypatch):
+    """``levain band`` / ``levain band snooze`` as the operator runs them at a plain terminal, on this store's clock."""
+    from levain.consent import band as consent_band
+    monkeypatch.setattr(consent_band, "agent_session_caller", lambda: False)
+    monkeypatch.setattr(band_view, "QuestionStore", lambda d=None: QuestionStore(qdir, clock=store._clock))
+
+    def snooze(n, until="2026-11-18"):
+        return band_view.run_band_snooze(argparse.Namespace(queue_dir=qdir, number=n, until=until, note=None,
+                                                            path=None))
+
+    def look():
+        return band_view.run_band(argparse.Namespace(queue_dir=qdir))
+    return look, snooze
+
+
+def snoozed(store, q):
+    return store.get(q.id).snoozed_until
+
+
+def test_complement_med_snooze_of_a_number_reissued_since_the_operator_looked_defers_nothing(store, clock, terminal,
+                                                                                           capsys):
+    """complement MED (bandfix2_scratch/repro_f2_f3.py f2): the operator saw 1 = A; A closed, 1 was retired and reissued
+    to B by a seat's render; `levain band snooze 1` must not defer B. A number never reissued still snoozes."""
+    look, snooze = terminal
+    a, keep = ask(store, "A"), ask(store, "keep")
+    look()
+    close(store, a)
+    clock.advance(timedelta(days=15))
+    b = ask(store, "B")
+    see(store)                                          # a seat renders: 1 is B now
+    assert number_of(store, b) == 1
+    capsys.readouterr()
+    assert snooze(1) == 2
+    assert "band number 1 was reissued since you last saw the band: run `levain band` first" in capsys.readouterr().err
+    assert snoozed(store, b) is None
+    assert snooze(2) == 0 and snoozed(store, keep) == "2026-11-18"
+    look()                                              # the operator looks again: 1 is B in the band they saw
+    assert snooze(1) == 0 and snoozed(store, b) == "2026-11-18"
+
+
+def test_a_snooze_with_no_band_shown_at_the_terminal_is_refused(store, terminal, capsys):
+    """The answer path's rule: no view, nothing to bind the number to (a seat's view is not the terminal's)."""
+    _, snooze = terminal
+    q = ask(store, "one")
+    see(store)                                          # numbered, but only a seat was shown it
+    assert snooze(1) == 2
+    assert "no band was shown at this terminal yet" in capsys.readouterr().err and snoozed(store, q) is None
+
+
+def test_a_snooze_of_a_number_not_open_in_the_band_the_operator_saw_is_refused(store, terminal, capsys):
+    look, snooze = terminal
+    ask(store, "one")
+    look()
+    q2 = ask(store, "two")
+    see(store)                                          # 2 numbered after the operator looked
+    assert number_of(store, q2) == 2
+    capsys.readouterr()
+    assert snooze(2) == 2
+    assert "band number 2 was not open in the band you last saw" in capsys.readouterr().err and snoozed(store, q2) is None
+
+
+def test_a_snooze_against_a_band_of_another_store_is_refused(store, terminal, capsys):
+    look, snooze = terminal
+    q = ask(store, "one")
+    look()
+    with sqlite3.connect(store.path) as c:             # the terminal's newest view came from another store
+        c.execute("INSERT INTO band_views (viewer, seen_through, open_list, store_id, at, gen, lives) VALUES "
+                  "('cli', 1, '[1]', 'another-store', 't', ?, ?)", (2 ** 62, json.dumps({"1": life_of(store, 1)})))
+    capsys.readouterr()
+    assert snooze(1) == 2
+    assert "came from another question store" in capsys.readouterr().err and snoozed(store, q) is None
+
+
+def test_a_snooze_against_a_view_with_no_lives_is_refused_for_a_retired_number_only(store, clock, terminal, capsys):
+    """A terminal view an older binary wrote (no lives): stale for every number ever retired (fail closed), and only
+    those."""
+    _, snooze = terminal
+    a, keep = ask(store, "A"), ask(store, "keep")
+    r = band_view.render_full(store)
+    band_view.record_view(store, "cli", r.hwm, r.shown, gen=r.gen)       # no lives
+    close(store, a)
+    clock.advance(timedelta(days=15))
+    b = ask(store, "B")
+    see(store)
+    assert number_of(store, b) == 1
+    capsys.readouterr()
+    assert snooze(1) == 2 and "was reissued since you last saw the band" in capsys.readouterr().err
+    assert snoozed(store, b) is None
+    assert snooze(2) == 0 and snoozed(store, keep) == "2026-11-18"
+
+
+@pytest.fixture
+def busy_life_read(monkeypatch):
+    """The life read (:func:`band_view._idents`) meets a held lock: its snapshot raises SQLite's busy error, through
+    the seam the store tests use (``QuestionStore._peek`` raising), and only while that read runs."""
+    busy = [False]
+    real_peek, real_idents = QuestionStore._peek, band_view._idents
+
+    def peek(self):
+        if busy[0]:
+            raise sqlite3.OperationalError("database is locked")
+        return real_peek(self)
+
+    def idents(*a, **k):
+        busy[0] = True
+        try:
+            return real_idents(*a, **k)
+        finally:
+            busy[0] = False
+    monkeypatch.setattr(QuestionStore, "_peek", peek)
+    monkeypatch.setattr(band_view, "_idents", idents)
+
+
+def test_deepseek_med_2_a_busy_life_read_records_lives_unknown_never_an_empty_set(store, busy_life_read):
+    """deepseek MED 2 (bandfix2_scratch/repro_f2_f3.py f3): the cockpit poll's life read is busy. The view records NO
+    lives (unknown), not ``{}``, so an answer to a number never retired lands instead of being refused as reissued."""
+    q1, q2 = ask(store, "one"), ask(store, "two")
+    pay = band_view.band_payload(store, PHONE)
+    with sqlite3.connect(store.path) as c:
+        assert c.execute("SELECT lives FROM band_views WHERE seq = ?", (pay["view_id"],)).fetchone() == (None,)
+    sid = band_view.QuestionStore.store_id.fget(store)
+    done = band_view.answer_text(store, "1a", viewer=PHONE, channel="phone", store_id=sid, view_id=pay["view_id"])
+    assert done.recorded and answered(store, q1)
+
+
+def test_deepseek_med_2_a_payload_whose_settle_fails_records_lives_unknown_too(store, monkeypatch):
+    """`_native_snapshot`'s own fallback (the numbering write itself failed): the same rule, lives unknown, not ``{}``."""
+    q1 = ask(store, "one")
+    band_view.render_full(store)                       # 1 numbered
+    ask(store, "two")                                  # needs a number: the poll's write fails
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(band_view, "_number_tx", boom)
+    pay = band_view.band_payload(store, PHONE)
+    with sqlite3.connect(store.path) as c:
+        assert c.execute("SELECT lives, open_list FROM band_views WHERE seq = ?", (pay["view_id"],)).fetchone() == (
+            None, "[1]")
+    sid = band_view.QuestionStore.store_id.fget(store)
+    assert band_view.answer_text(store, "1a", viewer=PHONE, channel="phone", store_id=sid,
+                                 view_id=pay["view_id"]).recorded and answered(store, q1)
+
+
+def test_deepseek_med_2_a_render_whose_life_read_is_busy_says_no_number_was_replaced_and_keeps_its_notice(
+        store, monkeypatch):
+    """The hook's render with the same busy life read: lives unknown (None), its delta names nothing replaced, and a
+    question's `closed N` notice (which needs its life) waits for the next render instead of being lost."""
+    q1, q2 = ask(store, "one"), ask(store, "two")
+    see(store)
+    prev = band_view.last_view(store, VIEWER)
+    answer_only(store, q2)
+    real_peek, real_idents, busy = QuestionStore._peek, band_view._idents, [False]
+
+    def peek(self):
+        if busy[0]:
+            raise sqlite3.OperationalError("database is locked")
+        return real_peek(self)
+
+    def idents(*a, **k):
+        busy[0] = True
+        try:
+            return real_idents(*a, **k)
+        finally:
+            busy[0] = False
+    monkeypatch.setattr(QuestionStore, "_peek", peek)
+    monkeypatch.setattr(band_view, "_idents", idents)
+    r = band_view.render_full(store)
+    assert r.lives is None and r.shown == [1] and r.closed == []
+    assert band_view._delta_line(store, prev, r.shown, lives=r.lives) == "since your last message: closed 2 (answered via cli)"
+    monkeypatch.setattr(band_view, "_idents", real_idents)
+    again = band_view.render_full(store)
+    assert again.closed == [2] and again.lives == ((1, life_of(store, 1)),)
+
+
+def test_deepseek_med_2_unknown_lives_survive_the_desk_stage_as_unknown(store, qdir, busy_life_read):
+    q1 = ask(store, "one")
+    r = band_view.render_full(store)
+    assert r.lives is None
+    band_view._stage_view(qdir, "sess-x", r, r.text)
+    st, _raw = band_view._read_staged(qdir, "sess-x")
+    assert st["lives"] is None and st["shown"] == [1]
+
+
+def test_deepseek_med_2_a_number_a_render_read_no_life_for_is_judged_by_the_store_not_called_replaced(store, clock):
+    """_delta_line: a number missing from this render's lives is decided by the store's lives (:func:`_stale`), never
+    printed as both new and closed; one the store says was reissued still is."""
+    q1, q2 = ask(store, "one"), ask(store, "two")
+    see(store)
+    prev = band_view.last_view(store, VIEWER)
+    assert band_view._delta_line(store, prev, [1, 2], lives=()) == ""
+    close(store, q1)
+    clock.advance(timedelta(days=15))
+    ask(store, "three")
+    r = band_view.render_full(store)
+    assert r.shown == [1, 2]
+    line = band_view._delta_line(store, prev, r.shown, lives=())
+    assert "new 1" in line and "closed 1 (answered via cli)" in line and "2" not in line
