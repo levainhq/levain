@@ -51,14 +51,6 @@
    }
   },
   {
-   "line": "@tomorrow 3 things to do",
-   "expect": {
-    "kind": "drop",
-    "when": "2026-11-09T09:00",
-    "text": "3 things to do"
-   }
-  },
-  {
    "line": "@mon 14:30 standup",
    "expect": {
     "kind": "drop",
@@ -233,6 +225,401 @@
   },
   {
    "line": "@09:00pm",
+   "refuse": true
+  },
+  {
+   "line": "@thu at 3pm call dentist",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-12T15:00",
+    "text": "call dentist"
+   }
+  },
+  {
+   "line": "@tomorrow at 9am x",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-09T09:00",
+    "text": "x"
+   }
+  },
+  {
+   "line": "@today 3pm x",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-08T15:00",
+    "text": "x"
+   }
+  },
+  {
+   "line": "@tonight call",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-08T20:00",
+    "text": "call"
+   }
+  },
+  {
+   "line": "@tonight 9pm x",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-08T21:00",
+    "text": "x"
+   }
+  },
+  {
+   "line": "@tomorrow noon lunch",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-09T12:00",
+    "text": "lunch"
+   }
+  },
+  {
+   "line": "@thu midnight x",
+   "expect": {
+    "kind": "drop",
+    "when": "2026-11-12T00:00",
+    "text": "x"
+   }
+  },
+  {
+   "line": "@thu 3 call dentist",
+   "refuse": true
+  },
+  {
+   "line": "@tomorrow 3 things to do",
+   "refuse": true
+  },
+  {
+   "line": "@thu at 3 call",
+   "refuse": true
+  },
+  {
+   "line": "@at 3 call",
+   "refuse": true
+  },
+  {
+   "line": "@today 9am x",
+   "refuse": true
+  },
+  {
+   "line": "@next thu call",
+   "refuse": true
+  },
+  {
+   "line": "@every sun 9pm bins",
+   "refuse": true
+  },
+  {
+   "line": "@daily 9am x",
+   "refuse": true
+  },
+  {
+   "line": "@thu at call",
+   "refuse": true
+  },
+  {
+   "line": "remind me thu 3pm call",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-12T15:00",
+    "text": "call"
+   }
+  },
+  {
+   "line": "remind thu 3pm to call Jim",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-12T15:00",
+    "text": "call Jim"
+   }
+  },
+  {
+   "line": "remind me at 3pm to call Jim",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-08T15:00",
+    "text": "call Jim"
+   }
+  },
+  {
+   "line": "REMIND ME tomorrow 9am to stretch",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-09T09:00",
+    "text": "stretch"
+   }
+  },
+  {
+   "line": "remind me to call Jim",
+   "expect": {
+    "kind": "sort",
+    "text": "remind me to call Jim"
+   }
+  },
+  {
+   "line": "remind Som about dinner",
+   "expect": {
+    "kind": "sort",
+    "text": "remind Som about dinner"
+   }
+  },
+  {
+   "line": "remind me every sun 9pm bins",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-08T21:00",
+    "text": "bins",
+    "recur": "weekly SUN 21:00"
+   }
+  },
+  {
+   "line": "remind every weekday 8am meds",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-09T08:00",
+    "text": "meds",
+    "recur": "weekly MON,TUE,WED,THU,FRI 08:00"
+   }
+  },
+  {
+   "line": "remind me daily 9pm to stretch",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-08T21:00",
+    "text": "stretch",
+    "recur": "daily 21:00"
+   }
+  },
+  {
+   "line": "remind me every day at 7:30am vitamins",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-09T07:30",
+    "text": "vitamins",
+    "recur": "daily 07:30"
+   }
+  },
+  {
+   "line": "remind me every mon and wed 9am gym",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-09T09:00",
+    "text": "gym",
+    "recur": "weekly MON,WED 09:00"
+   }
+  },
+  {
+   "line": "remind me every mon,wed 9am gym",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-09T09:00",
+    "text": "gym",
+    "recur": "weekly MON,WED 09:00"
+   }
+  },
+  {
+   "line": "remind me every other thu 10am rent",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-12T10:00",
+    "text": "rent",
+    "recur": "every 14 days 10:00"
+   }
+  },
+  {
+   "line": "remind me every 3 days 9am x",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-11T09:00",
+    "text": "x",
+    "recur": "every 3 days 09:00"
+   }
+  },
+  {
+   "line": "remind me every 2 weeks 9am x",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-22T09:00",
+    "text": "x",
+    "recur": "every 14 days 09:00"
+   }
+  },
+  {
+   "line": "remind me every month on the 15th 9am rent",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-15T09:00",
+    "text": "rent",
+    "recur": "monthly 15 09:00"
+   }
+  },
+  {
+   "line": "remind me every month 15 rent",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-15T09:00",
+    "text": "rent",
+    "recur": "monthly 15 09:00"
+   }
+  },
+  {
+   "line": "remind monthly 31 9am x",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-30T09:00",
+    "text": "x",
+    "recur": "monthly 31 09:00"
+   }
+  },
+  {
+   "line": "remind me every week x",
+   "refuse": true
+  },
+  {
+   "line": "remind me every month x",
+   "refuse": true
+  },
+  {
+   "line": "remind me every year x",
+   "refuse": true
+  },
+  {
+   "line": "remind me every weekend x",
+   "refuse": true
+  },
+  {
+   "line": "remind me every 2nd monday x",
+   "refuse": true
+  },
+  {
+   "line": "remind me thu 3 call",
+   "refuse": true
+  },
+  {
+   "line": "remind me next thu call",
+   "refuse": true
+  },
+  {
+   "line": "remind me thu 3pm",
+   "refuse": true
+  },
+  {
+   "line": "remind me every 53 weeks 9am x",
+   "refuse": true
+  },
+  {
+   "line": "remind me tomorrow 9am",
+   "refuse": true
+  },
+  {
+   "line": "remind me 3 apples",
+   "refuse": true
+  },
+  {
+   "line": "remind me every sun 9 bins",
+   "refuse": true
+  },
+  {
+   "line": "remind me today 9am x",
+   "refuse": true
+  },
+  {
+   "line": "remind me every 0 days x",
+   "refuse": true
+  },
+  {
+   "line": "remind me at the store",
+   "refuse": true
+  },
+  {
+   "line": "remind me thu 3pm. call",
+   "refuse": true
+  },
+  {
+   "line": "@thu 1530 call",
+   "refuse": true
+  },
+  {
+   "line": "@thu 930 call",
+   "refuse": true
+  },
+  {
+   "line": "remind me thu 25 x",
+   "refuse": true
+  },
+  {
+   "line": "remind me every ² days x",
+   "refuse": true
+  },
+  {
+   "line": "remind me every other mon and tue x",
+   "refuse": true
+  },
+  {
+   "line": "remind me every other mon, tue x",
+   "refuse": true
+  },
+  {
+   "line": "remind me tues 3pm x",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-10T15:00",
+    "text": "x"
+   }
+  },
+  {
+   "line": "remind, me thu 3pm call",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-12T15:00",
+    "text": "call"
+   }
+  },
+  {
+   "line": "remind me every mon and wed,9am call",
+   "refuse": true
+  },
+  {
+   "line": "remind me +1000000000d call",
+   "refuse": true
+  },
+  {
+   "line": "remind me every mon wed 9am to x",
+   "refuse": true
+  },
+  {
+   "line": "remind every other thu, to call mom",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-12T09:00",
+    "text": "call mom",
+    "recur": "every 14 days 09:00"
+   }
+  },
+  {
+   "line": "remind me, thu 3pm call",
+   "expect": {
+    "kind": "remind",
+    "when": "2026-11-12T15:00",
+    "text": "call"
+   }
+  },
+  {
+   "line": "remind me every mon sun block x",
+   "refuse": true
+  },
+  {
+   "line": "remind every mon, wed,14:30 to call",
+   "refuse": true
+  },
+  {
+   "line": "remind me every mon wed,9am x",
+   "refuse": true
+  },
+  {
+   "line": "remind me every mon and, wed 9am x",
    "refuse": true
   }
  ]
