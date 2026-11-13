@@ -7,6 +7,7 @@ reader by work and never by tip sha, and a source git cannot read is named, neve
 from __future__ import annotations
 
 import os
+import types
 from pathlib import Path
 
 import pytest
@@ -243,13 +244,115 @@ def test_a_cherry_pick_is_landed_by_patch_id_alone_with_no_trailer_to_fall_back_
     assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 0
 
 
-def test_a_squash_with_the_same_trailer_and_subject_counts_as_landed(world):
+def test_the_same_trailer_and_subject_with_a_different_diff_is_NOT_landed(world):
+    """B2 L1 F2 / L2 MED-1: item id + subject alone is no proof of landed work (a seat that reuses a subject for a
+    follow-up, or an amended commit, would hide an orphan, and the board would say 'close it')."""
     world.branch("seat/1112-40-i7-a")
     world.commit("the work", trailers=("Board-Item: levain#7",), file="a.txt", body="alpha\n")
     git(world.w, "checkout", "-q", "main")
     world.commit("the work", trailers=("Board-Item: levain#7",), file="z.txt", body="different diff\n")   # patch-id differs
     world.push_main()
+    assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 1
+
+
+def test_a_second_round_that_reuses_the_subject_is_ahead_not_absorbed_by_the_first_landing(world):
+    """L1 E2: main holds the first round (cherry-picked); round two reuses the subject on the same item with a new file."""
+    world.branch("seat/1112-40-i7-a")
+    r1 = world.commit("address review findings", trailers=("Board-Item: levain#7",), file="a.txt", body="one\n")
+    world.commit("address review findings", trailers=("Board-Item: levain#7",), file="b.txt", body="two\n")
+    git(world.w, "checkout", "-q", "main")
+    world.cherry_pick(r1)
+    world.push_main()
+    assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 1
+
+
+def test_an_empty_diff_commit_has_no_patch_id_so_it_matches_by_trailer_ids_and_subject(world):
+    """The one place the key still decides: a commit with NO diff has no patch-id to compare; its landing is recorded."""
+    world.branch("seat/1112-40-i7-a")
+    world.empty_commit("marker", trailers=("Board-Item: levain#7",))
+    git(world.w, "checkout", "-q", "main")
+    world.empty_commit("marker", trailers=("Board-Item: levain#7",), date="2026-11-12T13:00:00Z")
+    world.push_main()
+    ev, summary = read(world)
+    assert branch(ev, "seat/1112-40-i7-a")["ahead"] == 0
+    assert summary["matched_by_key"] == 1               # said out loud, not silent
+
+
+def test_each_main_commit_accounts_for_at_most_one_branch_commit_by_key_too(world):
+    world.branch("seat/1112-40-i7-a")
+    world.empty_commit("marker", trailers=("Board-Item: levain#7",))
+    world.empty_commit("marker", trailers=("Board-Item: levain#7",))
+    git(world.w, "checkout", "-q", "main")
+    world.empty_commit("marker", trailers=("Board-Item: levain#7",), date="2026-11-12T13:00:00Z")
+    world.push_main()
+    assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 1
+
+
+def test_each_main_commit_accounts_for_at_most_one_branch_commit_by_patch_id(world):
+    """c1 adds f.txt, c2 reverts it, c3 adds the identical f.txt again (same patch-id as c1). Main holds c1 once."""
+    world.branch("seat/1112-40-i7-a")
+    c1 = world.commit("add", trailers=("Board-Item: levain#7",), file="f.txt", body="alpha\n")
+    git(world.w, "revert", "--no-edit", "HEAD", date=DAY)
+    world.commit("add again", trailers=("Board-Item: levain#7",), file="f.txt", body="alpha\n")
+    git(world.w, "checkout", "-q", "main")
+    world.cherry_pick(c1)
+    world.push_main()
+    assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 2    # the revert, and the second add: main paid for one
+
+
+def test_a_revert_then_a_reland_of_the_identical_patch_is_ahead(world):
+    """L2 MED-2 (its revert.py): X lands on main, is reverted, and the branch re-forked from main re-applies X."""
+    world.branch("seat/1112-40-i7-a")
+    x = world.commit("feature", trailers=("Board-Item: levain#7",), file="feature.txt", body="feature\n")
+    git(world.w, "checkout", "-q", "main")
+    world.cherry_pick(x)
+    git(world.w, "revert", "--no-edit", "HEAD", date="2026-11-12T14:00:00Z")
+    world.push_main()
+    world.branch("seat/1112-40-i7-a", "origin/main")
+    git(world.w, "cherry-pick", x, date="2026-11-12T15:00:00Z")
+    git(world.w, "push", "-q", "-f", "origin", "seat/1112-40-i7-a:seat/1112-40-i7-a")
+    git(world.w, "fetch", "-q", "origin")
+    with pytest.raises(AssertionError):                  # the premise: the work is NOT on origin/main (the revert took it out)
+        git(world.w, "cat-file", "-e", "origin/main:feature.txt")
+    assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 1
+
+
+def test_a_branch_forked_before_the_revert_does_not_count_the_reverted_landing(world):
+    world.branch("seat/1112-40-i7-a")
+    x = world.commit("feature", trailers=("Board-Item: levain#7",), file="feature.txt", body="feature\n")
+    world.push("seat/1112-40-i7-a")
+    git(world.w, "checkout", "-q", "main")
+    world.cherry_pick(x)
+    git(world.w, "revert", "--no-edit", "HEAD", date="2026-11-12T14:00:00Z")
+    world.push_main()
+    assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 1       # the landing is in main's history but not in effect
+
+
+def test_a_revert_of_the_revert_puts_the_landing_back_in_effect(world):
+    world.branch("seat/1112-40-i7-a")
+    x = world.commit("feature", trailers=("Board-Item: levain#7",), file="feature.txt", body="feature\n")
+    world.push("seat/1112-40-i7-a")
+    git(world.w, "checkout", "-q", "main")
+    world.cherry_pick(x)
+    git(world.w, "revert", "--no-edit", "HEAD", date="2026-11-12T14:00:00Z")
+    git(world.w, "revert", "--no-edit", "HEAD", date="2026-11-12T15:00:00Z")
+    world.push_main()
     assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 0
+
+
+def test_a_real_squash_merge_of_two_commits_leaves_both_ahead_like_git_cherry(world):
+    """Known edge, pinned: a squash has ONE combined diff, which no single branch commit matches. git cherry says 2 as well."""
+    world.branch("seat/1112-40-i7-a")
+    world.commit("a1", trailers=("Board-Item: levain#7",), file="a.txt", body="alpha\n")
+    world.commit("a2", trailers=("Board-Item: levain#7",), file="b.txt", body="beta\n")
+    world.push("seat/1112-40-i7-a")
+    git(world.w, "checkout", "-q", "main")
+    git(world.w, "merge", "-q", "--squash", "origin/seat/1112-40-i7-a")
+    git(world.w, "commit", "-q", "-m", "squashed\n\nBoard-Item: levain#7", date=DAY)
+    world.push_main()
+    cherry = git(world.w, "cherry", "origin/main", "origin/seat/1112-40-i7-a").splitlines()
+    assert [line[0] for line in cherry] == ["+", "+"]
+    assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 2
 
 
 def test_commits_already_in_the_chain_are_not_ahead_by_sha_or_by_work(world):
@@ -412,3 +515,229 @@ def test_read_documents_leaves_out_a_path_it_cannot_examine(tmp_path, monkeypatc
 
     monkeypatch.setattr(Path, "is_dir", deny)
     assert be.read_documents({"a": _I("document", "x.md")}, tmp_path) == {}       # absent key: the item reads unknown, not not-done
+
+
+# ------------------------------------------------------------------------------------------------ fully qualified refs
+def test_a_tag_or_a_branch_named_origin_main_cannot_swap_mains_evidence(world):
+    """B2 L1 F1 / L2 LOW-5: `origin/main` by short name resolves a TAG first; the closing commit vanished, silently."""
+    root = git(world.w, "rev-parse", "origin/main")
+    world.commit("done", trailers=("Board-Item: levain#5", "Board-Closes: levain#5"))
+    world.push_main()
+    before = read(world)[0]["main"]
+    assert [r["closes"] for r in before] == [["levain#5"]]
+    git(world.w, "tag", "origin/main", root)
+    assert read(world)[0]["main"] == before
+    git(world.w, "tag", "-d", "origin/main")
+    git(world.w, "branch", "origin/main", root)
+    ev, _ = read(world)
+    assert ev["main"] == before and ev["unreadable"] == {}
+
+
+def test_a_ref_that_does_not_resolve_fully_qualified_is_unreadable_not_the_short_name_winner(tmp_path):
+    w = World(tmp_path)
+    root = w.commit("root", date=OLD)
+    git(w.w, "tag", "origin/main", root)                  # a tag by that name, but no refs/remotes/origin/main at all
+    ev, _ = be.read_git_evidence(w.w, repo_name="levain", since=SINCE)
+    assert "origin/main cannot be read" in ev["unreadable"]["main"] and "main" not in ev
+
+
+def test_every_revision_the_log_is_given_is_fully_qualified_or_a_sha(world, monkeypatch):
+    world.branch("queue/a/one")
+    world.commit("c1", trailers=("Board-Item: levain#1",))
+    world.push("queue/a/one")
+    world.branch("seat/1112-40-i7-a", "queue/a/one")
+    world.commit("own", trailers=("Board-Item: levain#7",))
+    seen: list[str] = []
+    real = be._git
+
+    def spy(repo, *args, **kw):
+        if args[:1] == ("log",):
+            seen.extend((kw.get("stdin") or b"").decode().split())
+        return real(repo, *args, **kw)
+
+    monkeypatch.setattr(be, "_git", spy)
+    read(world)
+    assert seen and all(r.lstrip("^").startswith("refs/") or len(r) == 40 for r in seen), seen
+    assert "^refs/remotes/origin/main" in seen and "^refs/remotes/origin/queue/a/one" in seen
+
+
+# ------------------------------------------------------------------------------------------------ the local head and origin's copy
+def _three_commit_branch(world, name="seat/1112-40-i7-a"):
+    world.branch(name)
+    a1 = world.commit("a1", trailers=("Board-Item: levain#7",), file="a.txt", body="alpha\n")
+    world.commit("a2", trailers=("Board-Item: levain#7",), file="b.txt", body="beta\n")
+    a3 = world.commit("a3", trailers=("Board-Item: levain#7",), file="c.txt", body="gamma\n")
+    world.push(name)
+    return a1, a3
+
+
+def test_a_stale_local_head_does_not_override_the_newer_remote_tip(world):
+    """B2 L2 MED-3: the local head was left at the first commit, which was cherry-picked; origin holds two more."""
+    name = "seat/1112-40-i7-a"
+    a1, a3 = _three_commit_branch(world)
+    git(world.w, "checkout", "-q", "-B", name, a1)                       # the local head is behind origin's copy
+    git(world.w, "checkout", "-q", "main")
+    world.cherry_pick(a1)
+    world.push_main()
+    ev, summary = read(world)
+    b = branch(ev, name)
+    assert b["ahead"] == 2 and b["tip"] == a3 and summary["diverged"] == []
+
+
+def test_a_local_head_and_an_origin_copy_that_diverged_are_both_read_and_named(world):
+    name = "seat/1112-40-i7-a"
+    a1, _a3 = _three_commit_branch(world)
+    git(world.w, "checkout", "-q", "-B", name, a1)
+    local = world.commit("local only", trailers=("Board-Item: levain#7",), file="l.txt", body="local\n")
+    ev, summary = read(world)
+    b = branch(ev, name)
+    assert b["ahead"] == 4                                              # a1..a3 on origin, plus the local commit: the union
+    assert summary["diverged"] == [name] and b["tip"] in (local, git(world.w, "rev-parse", f"origin/{name}"))
+
+
+# ------------------------------------------------------------------------------------------------ cut history
+def test_a_shallow_clone_names_every_source_unreadable(world, tmp_path):
+    """B2 L1 F5 / L2 LOW-3: in a --depth 1 clone a branch fully on main read `ahead` 1 and nothing said so."""
+    world.commit("w1", trailers=("Board-Item: levain#1",))
+    world.commit("w2", trailers=("Board-Item: levain#1",))
+    world.push_main()
+    world.branch("seat/1112-40-i7-a", "main~1")
+    git(world.w, "push", "-q", "origin", "seat/1112-40-i7-a")
+    clone = world.clone(tmp_path / "shallow", "--depth", "1", "--no-single-branch")
+    assert git(clone, "rev-parse", "--is-shallow-repository") == "true"
+    ev, _ = be.read_git_evidence(clone, repo_name="levain", since=SINCE)
+    assert set(ev["unreadable"]) == {"main", "chain", "branches", "refs", "unattributed"}
+    assert all("shallow clone" in why for why in ev["unreadable"].values())
+    for source in ("main", "chain", "branches", "unattributed"):
+        assert source not in ev
+
+
+def test_a_partial_clone_is_unreadable_and_the_reader_fetches_nothing(world, tmp_path):
+    """B2 L2 LOW-4: `diff-tree -p` in a blob:none clone went to the promisor remote and wrote a pack."""
+    git(world.origin, "config", "uploadpack.allowFilter", "true")
+    git(world.origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+    world.commit("w1", trailers=("Board-Item: levain#1",), file="a.txt", body="alpha\n")
+    world.push_main()
+    clone = world.clone(tmp_path / "partial", "--filter=blob:none", "--no-checkout", "--no-single-branch")
+    packs = git(clone, "count-objects", "-v")
+    ev, _ = be.read_git_evidence(clone, repo_name="levain", since=SINCE)
+    assert all("partial clone" in why for why in ev["unreadable"].values()) and "main" in ev["unreadable"]
+    assert git(clone, "count-objects", "-v") == packs                    # nothing came over the wire, nothing was written
+
+
+def test_the_reader_forbids_lazy_fetches(monkeypatch):
+    env = be._env()
+    assert env["GIT_NO_LAZY_FETCH"] == "1" and env["GIT_ALLOW_PROTOCOL"] == "" and env["GIT_PROTOCOL_FROM_USER"] == "0"
+
+
+# ------------------------------------------------------------------------------------------------ a count window, a deadline
+def test_a_commit_written_with_a_wrong_clock_does_not_hide_the_history_behind_it(world):
+    """B2 L2 LOW-1: `--since` stops at the first old-dated commit; main's earlier close was dropped, nothing unreadable."""
+    world.commit("m1 close", trailers=("Board-Closes: levain#1",), date="2026-11-12T10:00:00Z")
+    world.commit("m2 skewed", date="2026-10-01T10:00:00Z")
+    world.commit("m3", trailers=("Board-Item: levain#3",), date="2026-11-12T12:00:00Z")
+    world.commit("m4", trailers=("Board-Item: levain#4",), date="2026-11-12T13:00:00Z")
+    world.push_main()
+    ev, _ = read(world)
+    assert sorted(i for r in ev["main"] for i in r["closes"] + r["items"]) == ["levain#1", "levain#3", "levain#4"]
+
+
+def test_a_main_window_that_reaches_its_count_while_still_inside_the_epoch_is_unreadable(world, monkeypatch):
+    monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
+    for i in range(4):
+        world.commit(f"w{i}", trailers=("Board-Item: none - chore",))
+    world.push_main()
+    ev, _ = read(world)
+    assert "more than 3 commits" in ev["unreadable"]["main"] and "main" not in ev
+    assert {"chain", "branches", "unattributed"} <= set(ev["unreadable"])
+
+
+def test_a_count_that_is_reached_but_already_past_the_epoch_is_a_complete_window(world, monkeypatch):
+    monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
+    world.commit("old2", date=OLD)
+    world.commit("new", trailers=("Board-Item: levain#1",))
+    world.push_main()                                    # root (OLD), old2 (OLD), new: exactly 3, and the oldest is before the epoch
+    ev, _ = read(world)
+    assert ev["unreadable"] == {} and [r["items"] for r in ev["main"]] == [["levain#1"]]
+
+
+def test_the_overall_deadline_marks_the_remaining_stages_unreadable_not_partial(world, monkeypatch):
+    world.branch("seat/1112-40-i7-a")
+    world.commit("a1", trailers=("Board-Item: levain#7",))
+    clock = {"t": 0.0}
+    monkeypatch.setattr(be, "time", types.SimpleNamespace(monotonic=lambda: clock["t"]))
+    real = be._patch_ids
+
+    def late(repo, shas):
+        clock["t"] = float(be.READ_DEADLINE_S) + 1.0     # the chain stage runs out of time as it starts its patch-id pass
+        return real(repo, shas)
+
+    monkeypatch.setattr(be, "_patch_ids", late)
+    ev, _ = read(world)
+    assert "deadline" in ev["unreadable"]["chain"] and {"chain", "branches", "unattributed"} <= set(ev["unreadable"])
+    assert "main" not in ev["unreadable"] and "main" in ev           # what finished before the deadline is whole and stays
+
+
+def test_a_deadline_already_past_reads_nothing_not_something(world, monkeypatch):
+    monkeypatch.setattr(be, "READ_DEADLINE_S", -1)
+    ev, _ = read(world)
+    assert set(ev["unreadable"]) == {"main", "chain", "branches", "refs", "unattributed"}
+    assert all("deadline" in why for why in ev["unreadable"].values())
+
+
+# ------------------------------------------------------------------------------------------------ the trailer block
+def test_board_item_above_the_attribution_paragraph_is_not_a_trailer(world):
+    """B2 L2 MED-4, the contract line (docs/ready-schema-v2.md 6a): git reads only the LAST paragraph as trailers."""
+    msg = ("work\n\nsome body\nBoard-Item: levain#18\n\n"
+           "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_x")
+    sha = world.commit_raw(msg, file="a.txt")
+    good = ("work two\n\nsome body\n\nBoard-Item: levain#19\n"
+            "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_x")
+    ok = world.commit_raw(good, file="b.txt")
+    world.push_main()
+    ev, _ = read(world)
+    assert [r["items"] for r in ev["main"]] == [["levain#19"]]            # in the same final paragraph as the attribution: counted
+    assert [u["sha"] for u in ev["unattributed"]] == [sha] and ok not in {u["sha"] for u in ev["unattributed"]}
+
+
+# ------------------------------------------------------------------------------------------------ the merge-base, and spending a pool once per branch
+def test_a_landing_removed_by_hand_then_re_applied_on_a_fresh_fork_is_ahead(world):
+    """Only commits AFTER the branch's merge-base are compared (git cherry's upstream side): X' is in this branch's own
+    history, so it cannot account for the branch's re-application, even though no `This reverts` line says it was undone."""
+    world.branch("seat/1112-40-i7-a")
+    x = world.commit("feature", trailers=("Board-Item: levain#7",), file="feature.txt", body="feature\n")
+    git(world.w, "checkout", "-q", "main")
+    world.cherry_pick(x)
+    git(world.w, "rm", "-q", "feature.txt")
+    git(world.w, "commit", "-q", "-m", "take the feature out again, by hand", date="2026-11-12T14:00:00Z")
+    world.push_main()
+    world.branch("seat/1112-40-i7-a", "origin/main")
+    git(world.w, "cherry-pick", x, date="2026-11-12T15:00:00Z")
+    git(world.w, "push", "-q", "-f", "origin", "seat/1112-40-i7-a:seat/1112-40-i7-a")
+    git(world.w, "fetch", "-q", "origin")
+    assert branch(read(world)[0], "seat/1112-40-i7-a")["ahead"] == 1
+
+
+def _same_patch_twice(world, name_a="seat/1112-40-i7-a", name_b="seat/1112-41-i8-b"):
+    """Two branches from the root, each with a commit of the byte-identical patch (distinct shas by commit time)."""
+    for name, date in ((name_a, DAY), (name_b, "2026-11-12T11:00:00Z")):
+        world.branch(name)
+        world.commit("same work", trailers=("Board-Item: levain#7",), file="same.txt", body="alpha\n", date=date)
+        git(world.w, "checkout", "-q", "main")
+
+
+def test_two_branches_may_each_spend_the_one_main_commit_that_holds_their_work(world):
+    _same_patch_twice(world)
+    world.commit("land it", file="same.txt", body="alpha\n", date="2026-11-12T13:00:00Z")
+    world.push_main()
+    ev, _ = read(world)
+    assert branch(ev, "seat/1112-40-i7-a")["ahead"] == 0 and branch(ev, "seat/1112-41-i8-b")["ahead"] == 0
+
+
+def test_two_branches_may_each_spend_the_one_chain_commit_that_holds_their_work(world):
+    _same_patch_twice(world)
+    world.branch("queue/a/one")
+    world.commit("chained", file="same.txt", body="alpha\n", date="2026-11-12T13:00:00Z")
+    world.push("queue/a/one")
+    ev, _ = read(world)
+    assert branch(ev, "seat/1112-40-i7-a")["ahead"] == 0 and branch(ev, "seat/1112-41-i8-b")["ahead"] == 0

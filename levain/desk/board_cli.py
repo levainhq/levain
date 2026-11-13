@@ -129,3 +129,5 @@ def _print_table(doc: dict[str, Any]) -> None:
         print(f"  {s['id']:<14} {s['state']:<18} {s['reason']}")
     for a in doc["audit"]:
         print(f"  audit {a['kind']}: {a['id'] or '-'}: {a['why']}")
+    for name in doc.get("reader", {}).get("diverged", []):
+        print(f"  diverged: {name}: the local head and origin's copy each hold commits the other lacks (ahead is the union)")

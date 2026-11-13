@@ -247,3 +247,30 @@ def test_the_command_writes_neither_the_items_store_nor_the_repository(world, tm
     board(capsys, world, items, extra_file(tmp_path))
     run(capsys, "--items", str(items), "--repo", str(world.w))
     assert snapshot() == before                               # items.jsonl, the work tree, every file under .git
+
+
+def test_a_diverged_branch_is_named_in_the_reader_key_and_in_the_table(world, tmp_path, capsys):
+    name = "seat/1112-40-i7-a"
+    world.branch(name)
+    a1 = world.commit("a1", trailers=("Board-Item: levain#7",), file="a.txt", body="alpha\n")
+    world.commit("a2", trailers=("Board-Item: levain#7",), file="b.txt", body="beta\n")
+    world.push(name)
+    git(world.w, "checkout", "-q", "-B", name, a1)
+    world.commit("local only", trailers=("Board-Item: levain#7",), file="l.txt", body="local\n")
+    items, extra = write_items(tmp_path, item(7)), extra_file(tmp_path)
+    _rc, doc, _err = board(capsys, world, items, extra)
+    assert doc["reader"]["diverged"] == [name]
+    rc, out, _ = run(capsys, "--items", str(items), "--evidence-extra", str(extra), "--repo", str(world.w),
+                     "--since", "2026-11-12T00:00:00Z")
+    assert f"diverged: {name}" in out
+
+
+def test_a_shallow_checkout_is_a_board_of_unknowns_and_exit_three(world, tmp_path, capsys):
+    world.commit("w1", trailers=("Board-Item: levain#1",))
+    world.push_main()
+    clone = world.clone(tmp_path / "shallow", "--depth", "1")
+    rc, out, _ = run(capsys, "--json", "--items", str(write_items(tmp_path, item(1))), "--evidence-extra",
+                     str(extra_file(tmp_path)), "--repo", str(clone), "--since", "2026-11-12T00:00:00Z", "--now", NOW)
+    doc = json.loads(out)
+    assert rc == 3 and set(states(doc).values()) == {"unknown"}
+    assert any("shallow clone" in p for p in doc["problems"])
