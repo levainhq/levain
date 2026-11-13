@@ -36,8 +36,10 @@ EXIT_USAGE = 2
 
 
 def register(subparsers: Any) -> None:
-    board = subparsers.add_parser("board", help="The work board: derived item state from git evidence.",
-                                  description="The work board. Item state is never stored; it is derived on every read.")
+    # Hidden, as ``levain upgrade`` and ``levain session`` are (no ``help=``: ``levain --help`` and the README's "All
+    # commands" table, which tests/test_readme_commands.py holds to the listed verbs, leave it out); ``levain board state
+    # --help`` still works. Give it a ``help=`` and a README row together when it is made public.
+    board = subparsers.add_parser("board", description="The work board. Item state is never stored; it is derived on every read.")
     sub = board.add_subparsers(dest="board_cmd", required=True)
     p = sub.add_parser(
         "state", help="Print the board's derived state (READY_SCHEMA v2).",
