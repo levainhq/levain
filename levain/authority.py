@@ -2158,11 +2158,15 @@ def _unique_live_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: da
     live = [gid for gid, g in after.items() if _kind_live(g, now, kind)]
     if len(live) > 1 and any(gid in live for gid in touched):
         blockers = [g for g in live if g not in touched]
-        stopped = [w for g in blockers if (w := _stopped_blocker(state, g, revoke_cmd)) is not None]
-        if stopped and len(stopped) == len(blockers):
-            raise AuthorityError(f"one live {label} at a time: " + "; ".join(stopped))
-        others = ", ".join(repr(g[:40]) for g in blockers) or "another"
-        raise AuthorityError(f"one live {label} at a time: {others} is already live; revoke it first")
+        # each blocker in its own words: a stopped one is never called live, even beside one that is
+        said = {g: _stopped_blocker(state, g, revoke_cmd) for g in blockers}
+        parts = [w for w in said.values() if w is not None]
+        truly_live = [g for g, w in said.items() if w is None]
+        if truly_live or not parts:
+            others = ", ".join(repr(g[:40]) for g in truly_live) or "another"
+            parts.append(f"{others} is already live; revoke it first" if len(truly_live) < 2
+                         else f"{others} are already live; revoke them first")
+        raise AuthorityError(f"one live {label} at a time: " + "; ".join(parts))
 
 
 def _kind_live(grant: Any, now: datetime, kind: str) -> bool:

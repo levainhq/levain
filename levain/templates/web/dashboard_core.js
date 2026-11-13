@@ -8289,15 +8289,14 @@
     row.appendChild(head);
     const facts = el("div", "consent-facts");
     // a grant whose signing key was revoked is still in the policy, so it is listed (and can be revoked), but it answers
-    // nothing: the facts say why and how to get one that does. It has no "until <date>": the date no longer means anything
-    // a lease or a seat-egress grant allows one live at a time and a stopped one still counts, so its create is refused
-    // until it is revoked: its way back names the revoke first (a voice key keeps its own "set" words)
+    // nothing: the facts say why and how to get one that does. It has no "until <date>": the date no longer means anything.
+    // The way back is the server's words for the grant's kind (`way_back`), drawn as they come: a table of kinds here would
+    // be a second copy of those words, free to tell a different order than the terminal
     const stopped = state === "stopped";
-    const oneLive = g.kind === "seat-root-lease" || g.kind === "seat-egress";
+    const wayBack = sv(g.way_back);
     if (stopped) facts.appendChild(el("span", "ext-meta grant-stopped", "Stopped" + (sv(g.stopped_why) ? ": " + g.stopped_why : "")
-                                      + ". It answers nothing. "
-                                      + (voiceKey ? "Set it again" : oneLive ? "Revoke it, then create it again" : "Create it again")
-                                      + " to use it."));
+                                      + ". It answers nothing."
+                                      + (wayBack ? " " + wayBack.charAt(0).toUpperCase() + wayBack.slice(1) + "." : "")));
     if (sv(g.workspace)) facts.appendChild(el("span", "ext-meta", "in " + g.workspace));
     if (Array.isArray(g.postures) && g.postures.length) facts.appendChild(el("span", "ext-meta", g.postures.join(", ") + " mode"));
     // a voice key has no date: it is live until revoked, and any other state is drawn as its bare word (the head says it too)
