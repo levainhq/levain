@@ -122,8 +122,10 @@
     var room = it.kind === "vendor_agent_text";
     // the session reports its permission mode on every turn as an error-kind row (ref "error:mode:<id>"); the expected mode
     // is not an error, and a row that reads "Error" on every turn trains the eye past the one that is (any other mode is
-    // still drawn). The confined room's is dontAsk; a room the server says expects another mode hides that one by its ref
-    var modeNoise = (it.kind === "vendor_error" && it.body === "dontAsk") ||
+    // still drawn). The confined room's is dontAsk, hidden whenever the server names no other mode (an older body has no
+    // room_mode); a room the server says expects another mode hides that one by its ref and draws a dontAsk report
+    var namesMode = typeof expected === "string" && expected !== "";
+    var modeNoise = ((!namesMode || expected === "dontAsk") && it.kind === "vendor_error" && it.body === "dontAsk") ||
       (it.kind === "vendor_error" && typeof expected === "string" && expected !== "" && it.body === expected &&
        String(it.ref == null ? "" : it.ref).indexOf("error:mode:") === 0);
     var text = it.body == null ? "" : String(it.body);

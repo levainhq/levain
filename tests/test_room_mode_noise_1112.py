@@ -75,11 +75,11 @@ def _row(ref, body, gseq):
 def test_a_host_room_does_not_draw_its_own_mode_and_still_draws_any_other(tmp_path, qdir):
     rows = [_row("error:mode:u1", "bypassPermissions", 1),     # the host room's expected mode: not an error
             _row("error:mode:u2", "default", 2),               # a host room that suddenly reports `default`: drawn
-            _row("error:mode:u3", "dontAsk", 3),               # the confined mode is hidden by the page as before
+            _row("error:mode:u3", "dontAsk", 3),               # the confined mode in a host room is drift: drawn (ROOMFIX6)
             _row("error:abc:4", "bypassPermissions", 4),       # the same words from a row that is NOT a mode report: drawn
             _row("error:mode:u5", "bypassPermissions", 5)]
     kept = _hidden(tmp_path, qdir, {"room_thread": "t", "room_mode": "bypassPermissions", "stream": rows})
-    assert kept == ["error:mode:u2", "error:abc:4"]
+    assert kept == ["error:mode:u2", "error:mode:u3", "error:abc:4"]
 
 
 @needs_browser
