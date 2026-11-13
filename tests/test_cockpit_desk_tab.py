@@ -207,6 +207,39 @@ def test_a_port_that_cannot_answer_a_poll_is_unknown_and_unreadable_never_a_500(
     assert status == 200 and got["lease"]["state"] == "unknown" and got["readable"] is False, got
 
 
+def test_a_host_command_that_hangs_holds_the_desks_own_polls_never_the_cockpits_slots(tmp_path, qdir):  # noqa: F811
+    """A poll runs the host's lease command, which may take as long as the port's timeout. Polls past the desk's own gate
+    are a 503, and every cockpit slot stays free: a send (a POST on the cockpit's request gate) still goes through."""
+    entered, release = threading.Semaphore(0), threading.Event()
+
+    class Hanging(ScriptedDeskPort):
+        def lease(self):
+            entered.release()
+            release.wait(timeout=20)
+            return super().lease()
+
+    port = Hanging()
+    results: list[int] = []
+    with _serve(tmp_path, port) as base:
+        pollers = [threading.Thread(target=lambda: results.append(_get(base, READ)[0])) for _ in range(2)]
+        try:
+            for t in pollers:
+                t.start()
+            for _ in pollers:
+                assert entered.acquire(timeout=10)          # both are inside the host command now
+            req = urllib.request.Request(base + READ, headers={H: TOKEN})
+            with pytest.raises(urllib.error.HTTPError) as busy:
+                urllib.request.urlopen(req, timeout=10)  # noqa: S310 - loopback
+            assert busy.value.code == 503
+            assert send(base, "still goes", oid())[0] == 200          # the cockpit's own gate is untouched
+        finally:
+            release.set()
+            for t in pollers:
+                t.join(timeout=20)
+        assert results == [200, 200]
+        assert _get(base, READ)[0] == 200                    # and the slots come back
+
+
 @pytest.mark.parametrize("query", ["after=3", "thread=a&thread=b", "thread=a&after=1&after=2", "thread=a&since=1",
                                    "thread=" + "x" * 201])
 def test_a_bad_read_query_is_a_400(tmp_path, qdir, scripted, query):  # noqa: F811
