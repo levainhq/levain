@@ -190,7 +190,8 @@ def test_start_desk_hands_the_signing_sheet_the_fanin_words_and_starts_nothing_i
     g = _desk(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, stub="{}", shot="room_desk_1280.png")
     _bar_fits(g)
     assert g["drops"] == ["/fanin broad"], g
-    assert "Sign it there" in g["note"] and "nothing starts until you do" in g["note"], g
+    # the sheet also carries "Send words only", which wakes the desk with no limits: the line says both, never "only a signature starts it"
+    assert "Sign it there" in g["note"] and "Send words only" in g["note"] and "nothing starts until you press one of them" in g["note"], g
 
 
 @needs_browser
@@ -224,6 +225,8 @@ _UNSAFE = [
     ("bs1", r"[bs1](\\evil.example/x)"), ("bs2", r"[bs2](/\evil.example/x)"), ("bs3", r"[bs3](\/evil.example/x)"), ("bs4", r"[bs4](\evil.example/x)"),
     ("padded", "[padded](  /sign/drop)"),
     ("self", "[self](@ORIGIN@/#write_token=EVILTOKEN123)"), ("selfpath", "[selfpath](@ORIGIN@/sign/drop)"),
+    # the same host on another port or scheme is the cockpit too (L3 r1, deepseek MED): an http link to an https cockpit follows its redirect
+    ("selfport", "[selfport](http://@HOST@:9/sign/drop)"), ("selfscheme", "[selfscheme](https://@HOST@/sign/drop)"),
     ("js", "[js](javascript:window.pwned=1)"), ("data", "[data](data:text/html,x)"),
 ]
 _SAFE = [("ok", "[ok](https://example.org/x)", "https://example.org/x"), ("up", "[up](HTTPS://EXAMPLE.ORG/up)", "https://example.org/up"),
@@ -234,7 +237,7 @@ _LINK_ROWS = [{"gseq": 9100 + i, "kind": "vendor_agent_text", "source": "vendor"
 
 def _wrap(rows):
     """Reads of the room get `rows` appended; @ORIGIN@ in a body becomes the page's own origin."""
-    return ("(() => { window.__roomRows = JSON.parse(%s.split('@ORIGIN@').join(location.origin)); const real = window.fetch.bind(window);"
+    return ("(() => { window.__roomRows = JSON.parse(%s.split('@ORIGIN@').join(location.origin).split('@HOST@').join(location.hostname)); const real = window.fetch.bind(window);"
             " window.fetch = async (u, o) => { const r = await real(u, o); if (String(u).split('?')[0] !== '/cockpit/room.json') return r;"
             " const j = await r.json(); j.stream = (j.stream || []).concat(window.__roomRows);"
             " return new Response(JSON.stringify(j), {status: 200, headers: {'Content-Type': 'application/json'}}); }; return 1; })()" % json.dumps(json.dumps(rows)))
