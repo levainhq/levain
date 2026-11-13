@@ -538,8 +538,11 @@
       if (root.LevainVoiceIcons) { root.LevainVoiceIcons.set(b, kind, null, title); return; }
       b.textContent = FACE_WORDS[kind]; b.classList.add("voice-words"); b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", title || FACE_WORDS[kind]);
     }
-    var micB = null, rec = null;
+    var micB = null, rec = null, setupB = null;
     if (Speech) {
+      // the one-tap set up of the browser's on-device speech pack: drawn only while the browser says the pack can be had
+      setupB = el(doc, "button", "rv-setup", "");
+      setupB.setAttribute("type", "button"); setupB.hidden = true;
       micB = el(doc, "button", "rv-mic", "");
       micB.setAttribute("type", "button");
       face(micB, "dictate", "On-device dictation where this browser provides it, and only while this page is open");
@@ -570,7 +573,7 @@
       streamB.setAttribute("type", "button"); streamB.hidden = true;
       face(streamB, "mic", "Streaming dictation through your speech provider, only while this page is open");
     }
-    composer.appendChild(ta); if (micB) composer.appendChild(micB); if (streamB) composer.appendChild(streamB); composer.appendChild(actions);
+    composer.appendChild(ta); if (micB) { composer.appendChild(micB); composer.appendChild(setupB); } if (streamB) composer.appendChild(streamB); composer.appendChild(actions);
     dock.appendChild(openB); dock.appendChild(note); dock.appendChild(composer);
     var forceEnd = false;       // your own send always lands you at the newest line
     var flight = { send: false, stop: false, open: false };
@@ -743,19 +746,70 @@
       // probe:false skips the availability question. MEASURED 2026-11-04 (RM-G2): SpeechRecognition.available({processLocally:true})
       // froze the renderer of the installed headless Google Chrome on a bare page, so the cockpit page asks it nowhere; the mic
       // is then shown on the prototype test alone and the click-time processLocally readback and onerror stay the guard.
+      //
+      // "downloadable" / "downloading" is not a dead end: SpeechRecognition.install({langs, processLocally}) fetches the pack, and it
+      // needs a tap (transient activation) when it would start a download, so the page offers a button and calls install() only
+      // inside that tap. It resolves true (installed), false (unsupported language or failed download; no cause given) or rejects
+      // NotAllowedError (no tap, or the browser declined). The spec also lets a browser report "downloadable" for a pack that IS
+      // installed until this page has called install() once, so the same tap takes the fast path there. "downloading" has no
+      // progress events: the page re-asks available() on a timer (bounded) and never calls install() a second time on its own.
+      var setupBusy = false, setupT = 0, setupPolls = 0, SETUP_POLLS = 100;
+      var setupMs = typeof opts.setupPollMs === "number" ? opts.setupPollMs : 3000;
+      function setupWord(key, name) { var M = root.LevainMic; return M && typeof M.dictateSetup === "function" ? M.dictateSetup(key, name) : ""; }
+      function setupSay(key, name) { note.textContent = dictNote = setupWord(key, name); }
+      function paintSetup(kind) {            // "offer" | "working" | null (no button)
+        if (!kind) { setupB.hidden = true; return; }
+        setupB.hidden = false; setupB.disabled = kind === "working";
+        setupB.textContent = setupWord(kind);
+        setupB.setAttribute("title", setupWord("offerTitle")); setupB.setAttribute("aria-busy", kind === "working" ? "true" : "false");
+      }
+      function askAvailable() {
+        var a;
+        try { a = typeof Speech.available === "function" ? Speech.available({ langs: [lang], processLocally: true }) : null; } catch (e) { a = null; }
+        return Promise.resolve(a);
+      }
+      // what the browser answered: show Dictate, drop it, offer the set up, or wait for a download that is already running
+      function settleAvail(st, after) {
+        if (stopped) return;
+        clearTimeout(setupT);
+        if (st === "unavailable") { paintSetup(null); micB.remove(); if (after) setupSay("none"); }
+        else if (st === "downloadable") { setupPolls = 0; paintSetup("offer"); if (after) setupSay("stillnot"); }
+        else if (st === "downloading") {
+          paintSetup("working");
+          setupT = setTimeout(function () {
+            if (stopped || setupBusy) return;
+            if (++setupPolls > SETUP_POLLS) { setupPolls = 0; paintSetup("offer"); setupSay("slow"); return; }
+            askAvailable().then(function (s) { settleAvail(s, false); }, function () { setupPolls = 0; paintSetup("offer"); });
+          }, setupMs);
+        } else { setupPolls = 0; paintSetup(null); micB.style.display = ""; if (after) setupSay("done"); }
+      }
       if (opts.probe !== false && typeof Speech.available === "function") {
         var asked;
         try { asked = Speech.available({ langs: [lang], processLocally: true }); } catch (e) { asked = null; }
         if (asked && asked.then) {
-          asked.then(function (st) {
-            if (st === "unavailable") { micB.remove(); }
-            else if (st === "downloadable" || st === "downloading") {
-              micB.remove();
-              if (!note.textContent) note.textContent = "On-device dictation is not installed on this browser; the keyboard dictation key works.";
-            } else micB.style.display = "";
-          }, function () { micB.style.display = ""; });
+          asked.then(function (st) { settleAvail(st, false); }, function () { micB.style.display = ""; });
         } else micB.style.display = "";
       } else micB.style.display = "";
+      setupB.addEventListener("click", function () {
+        if (setupBusy || stopped) return;
+        if (typeof Speech.install !== "function") { paintSetup(null); setupSay("noinstall"); return; }
+        if (dictNote && note.textContent === dictNote) note.textContent = "";
+        dictNote = "";
+        setupBusy = true; clearTimeout(setupT); paintSetup("working");
+        var p;
+        try { p = Speech.install({ langs: [lang], processLocally: true }); } catch (e) { p = Promise.reject(e); }   // inside this tap: the call needs the tap
+        Promise.resolve(p).then(function (ok) {
+          setupBusy = false;
+          if (stopped) return;
+          if (ok !== true) { paintSetup("offer"); setupSay("failed"); return; }
+          return askAvailable().then(function (st) { settleAvail(st, true); }, function () { paintSetup(null); micB.style.display = ""; setupSay("done"); });
+        }, function (e) {
+          setupBusy = false;
+          if (stopped) return;
+          paintSetup("offer");
+          if (e && e.name === "NotAllowedError") setupSay("declined"); else setupSay("unlisted", e && e.name);
+        });
+      });
       ta.addEventListener("input", function () { if (rec) { dbase = ta.value; heard = lastHeard; } });
       micB.addEventListener("click", function () {
         voiceTap();
@@ -932,7 +986,7 @@
     paintDock();
     pull().then(loop);
     return { stop: function () {
-      stopped = true; clearTimeout(timer); endDictation(); endStream(); ta.readOnly = false; mOff.forEach(function (o) { o(); }); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
+      stopped = true; clearTimeout(timer); clearTimeout(setupT); endDictation(); endStream(); ta.readOnly = false; mOff.forEach(function (o) { o(); }); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
       if (onHidden) doc.removeEventListener("visibilitychange", onHidden);
       if (onBlur && root.removeEventListener) root.removeEventListener("blur", onBlur);
       if (vv) {

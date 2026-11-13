@@ -370,6 +370,28 @@
   // the words for an error name live here once and are exported: a dictation control asks for them, it never keeps a table of its own
   function dictateReason(name) { return Object.prototype.hasOwnProperty.call(DICTATE_REASONS, name) ? DICTATE_REASONS[name] : "Dictation stopped" + (typeof name === "string" && /^[a-z-]{1,40}$/.test(name) ? " (" + name + ")." : "."); }
 
+  // On-device set up (the Room's Dictate): the words for the one-tap install of the browser's speech pack. SpeechRecognition.install()
+  // resolves true when the pack is installed, false for an unsupported language or a failed download (the cause is not given), and
+  // rejects NotAllowedError when the call would start a download without a tap (or the browser declined to). One table, like
+  // DICTATE_REASONS; the host puts these on its own note line and button with textContent.
+  var DICTATE_SETUP = {
+    offer: "Set up on-device dictation",
+    offerTitle: "Downloads this browser's speech pack for dictation; the audio then stays on this device",
+    working: "Setting up on-device dictation...",
+    done: "On-device dictation is ready.",
+    declined: "The browser did not start the download: tap Set up on-device dictation again.",
+    failed: "On-device dictation could not be set up: this language may not be supported, or the download failed. Tap to try again.",
+    stillnot: "The browser still does not list on-device dictation as installed: tap Set up on-device dictation to try again.",
+    slow: "Setting up is taking a while: tap Set up on-device dictation to try again.",
+    none: "On-device dictation is not offered for this language; the keyboard dictation key works.",
+    noinstall: "On-device dictation is not installed on this browser; the keyboard dictation key works.",
+  };
+  // key -> words; "unlisted" (a rejection that is not NotAllowedError) carries the error name when it is a plain one
+  function dictateSetup(key, name) {
+    if (key === "unlisted") return "On-device dictation could not be set up" + (typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name) ? " (" + name + ")." : ".");
+    return Object.prototype.hasOwnProperty.call(DICTATE_SETUP, key) ? DICTATE_SETUP[key] : "";
+  }
+
   var insts = [];                          // every attach() still in use: a capture started in one box ends the others'
   var TAIL_MS = 1500;                        // how long Stop dictating waits for the engine's last phrase
   var ORPHAN_MS = 5000;                      // a box never put on the page by then is let go (a draw that landed after its card closed)
@@ -518,7 +540,7 @@
   }
 
   window.LevainMic = {
-    dictateReason: dictateReason,
+    dictateReason: dictateReason, dictateSetup: dictateSetup,
     attach: attach, localSpeech: localSpeech, available: available, probe: probe, start: start, stop: stop, active: function () { return !!S; }, closeFailed: function () { return !!(lastStopped && lastStopped.closeFailed); }, revoked: function () { return !!(lastStopped && lastStopped.revoked); }, deadlines: deadlines, limits: limits,
     onPartial: function (cb) { return on("partial", cb); }, onFinal: function (cb) { return on("final", cb); },
     onNote: function (cb) { return on("note", cb); }, onEnd: function (cb) { return on("end", cb); },

@@ -135,6 +135,36 @@ def test_conditional_matches_only_the_served_representation(tmp_path):
         assert st == 304 and body == b""
 
 
+def test_every_cockpit_asset_revalidates_or_is_never_stored(tmp_path):
+    """Row 996: a page a browser had open kept showing an old build's Dictate words. Every path in ``_ASSETS`` (the page, room_view.js,
+    mic.js and the rest) answers either ``no-cache`` with a strong ETag and a 304 on a match (the .js/.css files), or ``no-store`` with no
+    ETag (the HTML shells): none can be served from a browser's cache without asking, so a new install shows without a hard reload.
+    A new asset path joins this sweep by being in ``_ASSETS``."""
+    from levain.web_server import _ASSETS, _compressible
+
+    assert {"/", "/room_view.js", "/mic.js"} <= set(_ASSETS)
+    with _serving(tmp_path) as port:
+        for path, (_fn, ctype) in sorted(_ASSETS.items()):
+            st, h, body = _get(port, path)
+            assert st == 200 and body, (path, st)
+            cc = h["cache-control"]
+            if _compressible(ctype):
+                assert cc == "no-cache" and h["etag"].startswith('"'), (path, h)
+                st2, h2, b2 = _get(port, path, {"If-None-Match": h["etag"]})
+                assert st2 == 304 and b2 == b"" and h2["etag"] == h["etag"], (path, st2)
+            else:
+                assert "no-store" in cc and "etag" not in h, (path, h)
+
+
+def test_a_changed_asset_changes_its_validator():
+    """The ETag is the content hash: a new install's bytes never answer 304 to the old build's validator."""
+    from levain.web_server import _static_entry
+
+    old, new = b"function a(){return 1}" * 40, b"function a(){return 2}" * 40
+    assert _static_entry(old)[0] != _static_entry(new)[0] and _static_entry(old)[1] != _static_entry(new)[1]
+    assert _static_entry(old)[0] == _static_entry(bytes(bytearray(old)))[0]      # the same bytes, the same validator
+
+
 def test_slow_compression_does_not_block_a_cache_hit(monkeypatch):
     import levain.web_server as ws
 

@@ -2974,9 +2974,11 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-open[hidden] { display: none; }
 .rv .rv-desk { margin-left: auto; }
 .rv .rv-desk + .rv-rotate { margin-left: 0; }
-.rv .rv-mic, .rv .rv-rotate, .rv .rv-desk, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
+.rv .rv-mic, .rv .rv-setup, .rv .rv-rotate, .rv .rv-desk, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
 .rv .rv-mic { align-self: flex-end; border-color: transparent; color: var(--label); display: inline-flex; align-items: center; justify-content: center; flex: none; min-width: var(--hit-min, 44px); padding: 0; }
 .rv .rv-mic[hidden] { display: none; }
+.rv .rv-setup { align-self: flex-end; flex: 0 1 auto; line-height: 1.2; }
+.rv .rv-setup[hidden] { display: none; }
 .rv .rv-mic[data-voice-icon$="stop"] { color: var(--accent); }
 .rv .rv-rotate { min-width: var(--hit-min, 44px); margin-left: auto; }
 .rv button:disabled { opacity: .45; cursor: not-allowed; }
