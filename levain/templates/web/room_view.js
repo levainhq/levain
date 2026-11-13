@@ -349,12 +349,14 @@
   // page's, so an origin that is missing or not a string unwraps. The renderer itself is the byte-locked shared core, so the
   // filter sits here, after it.
   function unwrapCockpitLinks(frag) {
-    var as = frag.querySelectorAll("a"), here = root.location.origin;
+    var as = frag.querySelectorAll("a"), here = root.location.origin, hereHost = root.location.hostname;
     for (var i = 0; i < as.length; i++) {
       var a = as[i], h = (a.getAttribute("href") || "").replace(/^\s+|\s+$/g, "");
       var mail = /^mailto:/i.test(h), web = /^https?:/i.test(h);
       var o = web ? a.origin : null;
-      if (!mail && !(web && typeof o === "string" && o !== here)) {
+      // the same HOST on another scheme or port is the cockpit too (an http link to an https cockpit follows its redirect to the
+      // page's own /sign/ pages): so a web link survives only when its host differs, not only its origin
+      if (!mail && !(web && typeof o === "string" && o !== here && typeof a.hostname === "string" && a.hostname !== hereHost)) {
         while (a.firstChild) a.parentNode.insertBefore(a.firstChild, a);
         a.parentNode.removeChild(a);
       }
@@ -704,7 +706,7 @@
     if (deskB) deskB.addEventListener("click", function () {
       var S = root.LevainSignSheet, got = null;
       try { got = S && S.openDrop(DESK_WORDS); } catch (e) { got = null; }
-      note.textContent = got ? "The signing sheet is open with " + DESK_WORDS + ". Sign it there to start the desk; nothing starts until you do."
+      note.textContent = got ? "The signing sheet is open with " + DESK_WORDS + ". Sign it there to start the desk inside limits; its Send words only button starts it with no limits; nothing starts until you press one of them."
                              : "The signing sheet did not open, so no desk was started.";
     });
     if (rotB) rotB.addEventListener("click", function () {
