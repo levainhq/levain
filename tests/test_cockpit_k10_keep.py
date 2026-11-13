@@ -154,6 +154,12 @@ def test_opening_another_row_keeps_the_reading_place(tmp_path: Path) -> None:
     root, src = _long_tray(tmp_path)
     store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     store.add(type="task", text="ABOVETRAY " + PARA, disposition="seed", today=TODAY + timedelta(days=3))   # newest: above the tall one
+    # The List is time-first (10db9bc02): `_install`'s dated seed and its note are NOW rows and sort above every undated seed, and the
+    # card draws only three rows, so with them present ABOVETRAY takes the last drawn place and folds the tall row away (it is then never
+    # drawn, never has-more, and the wait below times out). This test needs ABOVETRAY and the tall row both drawn: clear the two NOW rows.
+    for r in store.list_open():
+        if r["text"] in ("a held seed", "a keep note"):
+            store.descend(r["id"], kind="composted", today=TODAY)
     above = f"[...{PANEL}.querySelectorAll('.row')].find(r => r.textContent.indexOf('ABOVETRAY') >= 0)"
     click = (f"(async () => {{ const b = {BODY}; {above}.querySelector(':scope > .clause-toggle').click();"
              " await new Promise(r => setTimeout(r, 400)); return Math.round(b.scrollTop); })()")
