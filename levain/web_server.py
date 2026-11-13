@@ -6635,8 +6635,8 @@ def _build_room_serve(room: Path, host_commands: Any = None) -> Any:
     """The :class:`~levain.desk.room_serve.RoomServe` ``levain serve --room DIR`` hands ``make_server``, over the
     consent queue's ``dispatch.db`` (the file the cockpit's room reads). ``DIR`` is where the room's file tools see first:
     an existing directory. Built here, started by ``make_server`` after every refusal has passed. ``host_commands`` is
-    the host's :class:`~levain.desk.room_host.HostCommands` (flow's bridge passes its desk relay and replies
-    commands; levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card."""
+    the host's :class:`~levain.desk.room_host.HostCommands` (the commands flow's bridge passes, see that class;
+    levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card."""
     from levain.consent.queue import default_queue_dir
     from levain.desk.envelopes import EnvelopeStore
     from levain.desk.room_launch import RoomSetting
