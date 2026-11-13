@@ -6,9 +6,10 @@ and it stays byte-for-byte what it was. A :class:`RoomProfile` is the other shap
 under ``bypassPermissions`` (one operator, one machine, the same reach as the host's other chat surface), the host's
 own pre-tool hooks, its own system prompt and dials. Levain names no host path and no host text here: the host
 supplies every script, string and number, and this module only validates them and renders them as plain data
-(:func:`host_settings_json`, :func:`host_policy`). Nothing here spawns, reads a script's bytes or opens a store. A hook
-script is meant to be copied by whoever launches the room, once per launch, and the copy's bytes hashed into the
-containment digest, so what ran is what was recorded.
+(:func:`host_settings_json`, :func:`host_policy`). Nothing here spawns or opens a store; the one read of a script's
+bytes is :meth:`HookSpec.check` hashing a PINNED script (``HookSpec.sha256``). A hook script is meant to be copied by
+whoever launches the room, once per launch, and the copy's bytes hashed into the containment digest (and, for a pinned
+script, compared with the pin), so what ran is what was recorded.
 
 Pure helpers. Stdlib only.
 """
@@ -69,22 +70,45 @@ def _int_in(label: str, value: Any, bounds: tuple[int, int]) -> int:
 class HookSpec:
     """One PreToolUse hook the host gives the room. ``script`` is the absolute path of a standard-library python
     script on the host's side; it is meant to be read once per launch and the COPY run, so what ran is what was
-    hashed. A relative or unreadable script is refused here and again by :meth:`check` (the file can vanish later)."""
+    hashed. A relative or unreadable script is refused here and again by :meth:`check` (the file can vanish later).
+    ``sha256``, when set, PINS the script: :meth:`check` refuses a file whose bytes hash to anything else, and a launcher
+    compares the bytes it copies with it, so a pinned hook either runs exactly those bytes or the room does not open."""
     matcher: str
     script: str
     timeout: int = 10
+    sha256: Optional[str] = None
 
     def __post_init__(self) -> None:
         _clean_token("hook matcher", self.matcher, limit=_MATCHER_MAX)
         _int_in("hook timeout", self.timeout, _HOOK_TIMEOUT_BOUNDS)
+        if self.sha256 is not None and not _is_sha256(self.sha256):
+            raise ValueError("a hook's pinned sha256 is 64 lowercase hex characters")
         self.check()
 
     def check(self) -> None:
-        """Raise ValueError unless the script is an absolute path to a readable regular file."""
+        """Raise ValueError unless the script is an absolute path to a readable regular file, holding the pinned bytes
+        when the spec has a pin."""
         if not isinstance(self.script, str) or not self.script or _has_control(self.script) or not os.path.isabs(self.script):
             raise ValueError("a hook script must be an absolute path")
         if not os.path.isfile(self.script) or not os.access(self.script, os.R_OK):
-            raise ValueError(f"the hook script {self.script[:120]!r} is not a readable file")
+            raise ValueError(f"the hook script {self.script[:240]!r} is not a readable file")
+        if self.sha256 is not None:
+            try:
+                with open(self.script, "rb") as f:
+                    got = hashlib.sha256(f.read()).hexdigest()
+            except OSError as exc:
+                raise ValueError(f"the hook script {self.script[:240]!r} could not be read: {exc}") from exc
+            self.matches(got)
+
+    def matches(self, sha256: str) -> None:
+        """Raise ValueError when this spec is pinned and ``sha256`` (of bytes about to run) is not its pin."""
+        if self.sha256 is not None and sha256 != self.sha256:
+            raise ValueError(f"the hook script {self.script[:240]!r} does not hold the pinned bytes (its sha256 is "
+                             f"{sha256[:16]}..., the pin is {self.sha256[:16]}...)")
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
 @dataclass(frozen=True)
@@ -183,7 +207,7 @@ def host_policy(profile: RoomProfile, *, settings_json: str, hook_sha256: Sequen
     if not isinstance(hook_sha256, (list, tuple)) or len(hook_sha256) != len(profile.hooks):
         raise ValueError("one hook sha256 per hook of the profile, in order")
     for sha in hook_sha256:
-        if not isinstance(sha, str) or len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+        if not _is_sha256(sha):
             raise ValueError("a hook sha256 is 64 lowercase hex characters")
     policy: dict[str, Any] = {
         "profile": profile.name,

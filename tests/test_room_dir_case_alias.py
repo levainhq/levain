@@ -74,7 +74,8 @@ def test_a_case_alias_in_home_still_refuses_home_and_writes_the_deny_rules_in_th
         _build_room_serve(fake_home)
     proj = fake_home / "proj"
     proj.mkdir()
-    rs = _build_room_serve(proj)
+    from levain.desk.room_default import CONFINED
+    rs = _build_room_serve(proj, profile=CONFINED)      # the deny list is the confined room's (the opt-in since ROOMFLIP)
     try:
         deny = json.loads(rs.launcher._settings_json)["permissions"]["deny"]
         real = str(fake_home.resolve())

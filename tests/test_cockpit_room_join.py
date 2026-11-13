@@ -152,7 +152,8 @@ def test_a_project_dir_is_served_and_its_launcher_denies_levains_home(fake_home)
     from levain.web_server import _build_room_serve
     proj = fake_home / "proj"
     proj.mkdir()
-    rs = _build_room_serve(proj)
+    from levain.desk.room_default import CONFINED
+    rs = _build_room_serve(proj, profile=CONFINED)      # the deny list is the confined room's (the opt-in since ROOMFLIP)
     try:
         deny = json.loads(rs.launcher._settings_json)["permissions"]["deny"]
         lv = str((fake_home / ".levain").resolve())
