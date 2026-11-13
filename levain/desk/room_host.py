@@ -209,16 +209,31 @@ def _kill_group(pid: int) -> None:
 
 def _release(dog: "subprocess.Popen[bytes]", life_w: int) -> None:
     """Tell the watchdog the door handled its command (one byte on the lifeline), then reap it. A watchdog already
-    gone (killed with its group, or past its own deadline) makes the write fail, which is fine."""
+    gone (killed with its group, or past its own deadline) makes the write fail, which is fine. Only for a command
+    :func:`_run_in` returned from: an exception goes to :func:`_abandon`."""
     try:
         os.write(life_w, b"x")
     except OSError:
         pass
     finally:
         os.close(life_w)
+    _reap(dog)
+
+
+def _abandon(dog: "subprocess.Popen[bytes]", life_w: int) -> None:
+    """The door could not finish handling its command: kill the watchdog's whole group (the command and every
+    descendant, the watchdog too) while the unreaped watchdog still holds the group id, then close the lifeline with no
+    release byte (a watchdog the kill missed reads end of file and kills its group itself) and reap it."""
+    _kill_group(dog.pid)
+    os.close(life_w)
+    _reap(dog)
+
+
+def _reap(dog: "subprocess.Popen[bytes]") -> None:
+    """Wait for the watchdog to exit, so its process and group ids are freed only once its work is done."""
     try:
         dog.wait(timeout=_REAP)
-    except subprocess.TimeoutExpired:       # it did not take the release: stop it alone, never its group
+    except subprocess.TimeoutExpired:       # it did not exit (no release taken): stop it alone, never its group
         try:
             dog.kill()
             dog.wait(timeout=_REAP)
@@ -232,15 +247,20 @@ def run(argv: tuple[str, ...], stdin_text: str = "", extra: tuple[str, ...] = ()
     appended (an already-validated thread id), never free text. The command runs in a process group of its own, led
     by a watchdog (:data:`_WATCHDOG`): on a timeout the whole group is killed, so a helper it spawned cannot deliver
     after the door gave up, and the group is killed too if the door dies first (the room's end) or cannot act by
-    the deadline plus :data:`_REAP` and :data:`_WATCH_SLACK`. Each stream is read as it comes, keeping a bounded head
-    and dropping the rest. Returns :class:`Ran`: code :data:`TIMED_OUT` for a timeout, :data:`NOT_STARTED`
-    (``started`` False) when the program could not be started; output is stdout then stderr, capped at
-    :data:`OUTPUT_MAX`."""
+    the deadline plus :data:`_REAP` and :data:`_WATCH_SLACK`; an exception out of the body after the command started
+    kills the group before it leaves here (the watchdog is released only for a command the body returned from). Each
+    stream is read as it comes, keeping a bounded head and dropping the rest. Returns :class:`Ran`: code
+    :data:`TIMED_OUT` for a timeout, :data:`NOT_STARTED` (``started`` False) when the program could not be started (no
+    descriptor for the lifeline included); output is stdout then stderr, capped at :data:`OUTPUT_MAX`."""
     try:
         data = stdin_text.encode("utf-8")
     except UnicodeEncodeError:
         return Ran(NOT_STARTED, "the host command was not started: its text holds a character UTF-8 cannot carry", False)
-    life_r, life_w = os.pipe()          # neither end is inheritable: only the watchdog's stdin gets the read end
+    try:
+        life_r, life_w = os.pipe()      # neither end is inheritable: only the watchdog's stdin gets the read end
+    except OSError as exc:              # no descriptor for the lifeline (EMFILE): nothing has started
+        return Ran(NOT_STARTED, f"the host command could not start (no descriptor for its watchdog: "
+                                f"{type(exc).__name__})", False)
     try:
         dog = subprocess.Popen([sys.executable, "-I", "-S", "-c", _WATCHDOG, f"{timeout + _REAP + _WATCH_SLACK:g}"],
                                stdin=life_r, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, process_group=0,
@@ -251,9 +271,14 @@ def run(argv: tuple[str, ...], stdin_text: str = "", extra: tuple[str, ...] = ()
     finally:
         os.close(life_r)
     try:
-        return _run_in(dog.pid, argv, data, extra, timeout)
-    finally:
-        _release(dog, life_w)
+        ran = _run_in(dog.pid, argv, data, extra, timeout)
+    except BaseException:
+        # The body failed with the command perhaps still running (an I/O thread that could not start, an interrupt):
+        # the door did NOT handle it, so the watchdog is never released. Its group is killed now, the command with it.
+        _abandon(dog, life_w)
+        raise
+    _release(dog, life_w)
+    return ran
 
 
 def _run_in(group: int, argv: tuple[str, ...], data: bytes, extra: tuple[str, ...], timeout: float) -> Ran:
