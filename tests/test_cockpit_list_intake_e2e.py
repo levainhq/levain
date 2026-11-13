@@ -5,7 +5,7 @@ tmp dirs. Nothing here touches an operator's live apps."""
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -88,3 +88,19 @@ def test_a_signed_drop_waits_and_claims_no_fire(rig: Rig, broker: Broker) -> Non
     assert out["state"] == "WAITING" and out["receipt"]["id"] is None
     assert out["receipt_line"].endswith(", awaiting your signature")
     assert json.loads(out["record"])["target"]["intake"]["when"] == out["receipt"]["fires"]
+
+
+def test_a_timed_and_a_repeating_reminder_plant_agendas_that_ring_for_him_through_the_panel(rig: Rig, broker: Broker) -> None:
+    out = _post(rig, broker, "remind me +2h to call the dentist", intent="reported", tier_seen="T2", gesture_seen="direct-reported")
+    fires = (NOW + timedelta(hours=2)).astimezone().replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M")
+    sid = out["receipt"]["id"]
+    assert out["receipt"] == {"kind": "remind", "id": sid, "fires": fires, "recur": None, "text": "call the dentist"}
+    assert out["receipt_line"] == f"reminder {sid} rings {datetime.strptime(fires, '%Y-%m-%dT%H:%M'):%a %m-%d %H:%M}"
+    store = IntentionStore(rig.root / ".levain" / "memory.spores.json", id_prefix="intention")
+    row = store.get(sid)
+    assert (row["disposition"], row["target"], row["next"]) == ("agenda", "nudge", fires)
+    rep = _post(rig, broker, "remind me every sun 9pm bins", intent="reported", tier_seen="T2", gesture_seen="direct-reported")
+    row = store.get(rep["receipt"]["id"])
+    assert (row["target"], row["recur"], row["recur_anchor"], row["next"]) == \
+        ("nudge", "weekly SUN 21:00", rep["receipt"]["fires"], rep["receipt"]["fires"])
+    assert rep["receipt_line"].endswith(", then weekly SUN 21:00")
