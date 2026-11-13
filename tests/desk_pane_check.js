@@ -45,6 +45,13 @@ check(same(D.mergeEvents([e("a")], "c1", { events: [], cursor: "c1", unreadable:
 check(same(D.mergeEvents([e("a")], null, { events: [e("a"), e("b")], cursor: null, unreadable: false }), { events: [e("a"), e("b")], cursor: null }), "a whole-thread batch with no cursor (none was held) replaces: it cannot be followed");
 check(same(D.mergeEvents([e("a"), e("b")], "c2", { events: [e("c")], cursor: null, unreadable: false }), { events: [e("a"), e("b"), e("c")], cursor: null }), "a batch with no cursor that came AFTER a held cursor appends (never replaces what is held) and drops the cursor so the next read refetches");
 
+// a thread is settled by a reply FROM THE DESK among the events held; an unreadable batch holds none, so it never settles one
+check(D.isSettled([e("a")]) === true, "a desk reply settles the thread");
+check(D.isSettled([{ by: "script", kind: "took", text: "", at: "" }, { by: "script", kind: "held", text: "", at: "" }]) === false, "took and held do not settle it");
+check(D.isSettled([{ by: "script", kind: "reply", text: "x", at: "" }, { by: "desk", kind: "note", text: "x", at: "" }]) === false, "only a reply by the desk settles it");
+check(D.isSettled([]) === false, "no events: not settled");
+check(D.isSettled(D.mergeEvents([], null, { events: [e("a")], cursor: "c1", unreadable: true }).events) === false, "an unreadable batch never settles a thread");
+
 // the send's answers
 const acc = D.sendOutcome(200, { outcome: "accepted", ref: "inbox-9", thread_id: "t9", reason: null, replayed: false });
 check(acc.status === "filed" && acc.ref === "inbox-9" && acc.thread === "t9" && acc.settle && acc.clear, "accepted is filed with the port's ref");
