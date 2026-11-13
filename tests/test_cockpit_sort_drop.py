@@ -152,7 +152,10 @@ def test_no_directory_is_store_gone_and_a_read_makes_nothing(home):
 # --- through the broker -----------------------------------------------------------------------------------------
 
 def test_the_tier_table_is_unchanged_a_sort_is_still_c1():
-    assert INTAKE_TIERS == {"drop": "T2", "talk": "T2", "sort": "C1"}
+    # the three kinds that existed before reminders keep their tiers; `remind` (row 188) is the one entry added since,
+    # and its own tier is pinned where REMIND_TIER is tested
+    assert {k: v for k, v in INTAKE_TIERS.items() if k != "remind"} == {"drop": "T2", "talk": "T2", "sort": "C1"}
+    assert set(INTAKE_TIERS) == {"drop", "talk", "sort", "remind"}
 
 
 def test_a_signed_sort_writes_exactly_one_drop_with_the_words_verbatim(world):
