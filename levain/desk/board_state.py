@@ -1122,7 +1122,11 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
     for s in states:                    # one entry per item, whatever it carries
         if s.state == "unknown":
             kind = "gate_expired" if ctx.causes.get(s.id) == "gate_expired" else "unknown"
-            audit.append(AuditEntry(kind, s.id, s.reason))
+            why = s.reason
+            gone = _landed(ctx, folded.items[s.id]) if kind == "gate_expired" else None
+            if gone:                    # landed work behind an orphan branch and this gate: rule 6 was skipped, the gate won; say both
+                why = f"{why}; {_landed_why(*gone)}"
+            audit.append(AuditEntry(kind, s.id, why))
             continue
         old = [] if s.state in ("done", "cut", "parked", "out_of_1_0") else _expired_gates(folded.items[s.id], now.date())
         landed = _landed(ctx, folded.items[s.id]) if s.state in ("blocked", "ready_with_start") else None
