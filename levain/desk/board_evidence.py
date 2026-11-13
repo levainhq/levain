@@ -51,7 +51,7 @@ from typing import Any
 
 from levain.desk.board_state import parse_timestamp
 
-__all__ = ["BOARD_EPOCH", "BRANCH_PREFIXES", "GitFailed", "MAX_MAIN_COMMITS", "MAX_OWN_COMMITS", "READ_DEADLINE_S",
+__all__ = ["BOARD_EPOCH", "BRANCH_PREFIXES", "GitFailed", "MAX_MAIN_COMMITS", "MAX_OWN_COMMITS", "MIN_PREWINDOW_TAIL", "READ_DEADLINE_S",
            "read_documents", "read_git_evidence", "repo_name_of"]
 
 REMOTE = "origin"
@@ -67,9 +67,11 @@ READ_DEADLINE_S = 300
 #: More own commits than this across the candidate branches: the branches source fails closed instead of guessing.
 MAX_OWN_COMMITS = 20000
 #: The newest main commits read (a COUNT, not a date: a commit written with a wrong clock cannot hide the history behind
-#: it). One more is asked for: a main with MORE than this many commits reachable reads unreadable, with what depends on it.
-#: By design: no commit date can prove a cut log whole.
+#: it). One more is asked for: a log with a commit past the cap is CUT, and a cut log is whole for the window only if at
+#: least MIN_PREWINDOW_TAIL of the commits read predate the window (a count of old commits, so one commit with a
+#: wrong clock proves nothing). A cut log without that tail reads unreadable, with what depends on it.
 MAX_MAIN_COMMITS = 20000
+MIN_PREWINDOW_TAIL = 50
 _NOTES_REF = "refs/notes/board"
 _RS, _US, _GS = "\x1e", "\x1f", "\x1d"
 _FMT = ("%x1e%H%x1f%P%x1f%cI%x1f%s%x1f%(trailers:key=Board-Item,valueonly,unfold,separator=%x1d)"
@@ -571,8 +573,10 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
     main_commits: dict[str, _Commit] = {}
     try:        # main: the newest MAX_MAIN_COMMITS; one more is asked for, because ONLY a log that has a commit past the cap is cut
         main_commits = _log(repo, [main_sha], limit=MAX_MAIN_COMMITS + 1)
-        if len(main_commits) > MAX_MAIN_COMMITS:               # decided by the count alone: no commit date can prove a cut log whole
-            raise GitFailed(f"more than {MAX_MAIN_COMMITS} commits reachable from {main_short}")
+        if len(main_commits) > MAX_MAIN_COMMITS:    # a log cut at the cap: whole FOR THE WINDOW only if a real tail of it is older than the window
+            tail = sum(1 for c in main_commits.values() if c.ts < window)    # a count of old commits, never one date: one skewed commit proves nothing
+            if tail < MIN_PREWINDOW_TAIL:
+                raise GitFailed(f"more than {MAX_MAIN_COMMITS} commits reachable from {main_short}, and fewer than {MIN_PREWINDOW_TAIL} of them predate the window")
         ev["main"] = _main_records(main_commits)
     except GitFailed as exc:
         main_commits = {}
