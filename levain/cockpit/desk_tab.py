@@ -6,7 +6,8 @@ only calls (``levain.desk.desk_port``); no authority, fence or delivery rule liv
   the HOST'S text (a reference, a reason, a receipt): the page draws it as text only.
 * ``POST /cockpit/desk/send {words, outbox_id}``: one line filed through the port. The owner is the CREDENTIAL'S
   (``cockpit:<name>`` or ``phone:<id>``, derived by the mount), never anything the body says. A refusal writes nothing:
-  no credential 403, a bad body 400, a stored ``outbox_id`` with other words 409, words over the cap 422 (refused,
+  no credential 403, a port with no post command 404 (and its read says not wired), a bad body (an unsendable character
+  included, whatever the length) 400, a stored ``outbox_id`` with other words 409, words over the cap 422 (refused,
   never cut). The port's own result (``accepted`` / ``ambiguous`` / ``not_delivered``, ``replayed``) is a 200: a retry
   of the same ``outbox_id`` is answered from the port's stored claim and never run twice.
 
@@ -71,7 +72,10 @@ def port_from_env(environ: Mapping[str, str], queue_dir: Path | str) -> HostComm
     if commands is None:
         return None
     path = claims_path(queue_dir)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # ``mode`` binds only the leaf, so the queue directory itself is made first: a fresh home's ``consent`` is created
+    # 0700 here (the dispatch store refuses one at the umask), and one already there is never touched
+    Path(queue_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.parent.mkdir(exist_ok=True, mode=0o700)
     return HostCommandDeskPort(commands, path)
 
 
@@ -104,9 +108,12 @@ def serve_desk(port: DeskPort | None, query: str = "") -> tuple[int, dict[str, A
         thread, after = parse_query(query)
     except DeskQueryError as exc:
         return _refusal("bad_request", str(exc), 400)
-    if port is None:
+    if port is None or not _can_post(port):
         return 200, {"wired": False}
-    caps = port.capabilities()
+    try:
+        caps: dict[str, Any] | None = dataclasses.asdict(port.capabilities())
+    except Exception:       # noqa: BLE001 - caps that cannot be asked: wired, but nothing is readable this poll
+        caps = None
     try:
         lease = port.lease()
         lease_view = {"state": lease.state, "holder": lease.holder, "age_s": lease.age_s}
@@ -122,11 +129,20 @@ def serve_desk(port: DeskPort | None, query: str = "") -> tuple[int, dict[str, A
             cursor, readable = batch.cursor, batch.readable
         except Exception:   # noqa: BLE001 - the same: unreadable, never "none yet"
             events, cursor, readable = [], None, False
-    return 200, {"wired": True, "caps": dataclasses.asdict(caps), "lease": lease_view, "thread_id": thread,
+    if caps is None:        # the page draws no cap and no slot from {}, and "could not be fetched" from readable false
+        return 200, {"wired": True, "caps": {}, "lease": lease_view, "thread_id": thread, "events": [], "cursor": None,
+                     "readable": False}
+    return 200, {"wired": True, "caps": caps, "lease": lease_view, "thread_id": thread,
                  "events": events, "cursor": cursor, "readable": readable}
 
 
 # --- the write ----------------------------------------------------------------------------------------------------------
+def _can_post(port: DeskPort) -> bool:
+    """False for a port that says it has no post command (``can_post`` is False): a desk nothing can be filed with is not
+    wired. A port that says nothing of it (the double, a host's own) is taken as able."""
+    return getattr(port, "can_post", True) is not False
+
+
 def _owner(owner: str | None) -> str | None:
     if owner is None:
         return None
@@ -143,6 +159,8 @@ def post_desk_send(port: DeskPort, owner: str | None, req: Any) -> tuple[int, di
     origin = _owner(owner)
     if origin is None:
         return _refusal("forbidden", "a send needs a named credential", 403)
+    if not _can_post(port):
+        return _refusal("not_found", "no desk is wired", 404)
     if not isinstance(req, dict):
         return _refusal("bad_request", "body must be a JSON object", 400)
     words, outbox = req.get("words"), req.get("outbox_id")
@@ -151,14 +169,20 @@ def post_desk_send(port: DeskPort, owner: str | None, req: Any) -> tuple[int, di
     if not isinstance(outbox, str) or chat._OUTBOX_ID.fullmatch(outbox) is None:
         return _refusal("bad_request", "a message carries the client's own outbox_id: 8 to 128 of A-Z a-z 0-9 . _ - "
                         "(starting with a letter or digit)", 400)
-    words_max = port.capabilities().words_max
+    try:
+        words_max = port.capabilities().words_max
+    except Exception:        # noqa: BLE001 - nothing was posted: say so, never a dropped connection
+        return _refusal("send_failed", "The desk port could not say what it takes, so nothing was filed. Sending it again "
+                        "with the same outbox_id files it once.", 500)
+    # a character the port cannot carry is refused for that, with its own words, whatever the length: only a line that is
+    # otherwise whole and over the cap is the 422 (the page draws that one as "over the limit")
+    other = check_words(words, max(words_max, len(words)))
+    if other is not None:
+        return _refusal("bad_request", other, 400)
     if len(words) > words_max:
         # refused whole, never cut: a cut instruction is a different instruction. The port's own words say how far over.
         return _refusal("words_over_cap", check_words(words, words_max) or "That message is over the cap.", 422,
                         words_max=words_max)
-    other = check_words(words, words_max)
-    if other is not None:
-        return _refusal("bad_request", other, 400)
     try:
         result = port.post(words, outbox_id=outbox, origin=origin)
     except OutboxConflict as exc:

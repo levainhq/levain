@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal, Optional, Protocol, Sequence, runtime_checkable
 
 from levain.desk import room_host
+from levain.desk.chat_lease import _CLIENT_ID
 from levain.desk.room_host import HostCommandError, THREAD_RE
 
 __all__ = ["ARMED_STATES", "Armed", "DELIVERY_OUTCOMES", "DESKCMD_ENV", "DeskCaps", "DeskCommandError", "DeskCommands",
@@ -69,7 +70,7 @@ _WAKES = ("event", "poll")
 _MODES = ("pull", "push")
 # the client's own outbox id (the Room's own shape; a test holds them equal) and the owner a credential names
 _OUTBOX_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}")
-_ORIGIN = re.compile(r"(?:cockpit|phone):[A-Za-z0-9._-]{1,64}")
+_ORIGIN = re.compile(rf"(?:cockpit|phone):{_CLIENT_ID}")     # the turn lease's own client id: a name it takes, this takes
 _CURSOR = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,63}")      # never starts with "-": it is an argv word, not a flag
 _THREAD_LINE = re.compile(r"\(thread (" + THREAD_RE.pattern + r")\)")
 # [seat] characters kept of a host's one-line reference / reason / holder / event text / event time
@@ -402,6 +403,12 @@ class HostCommandDeskPort:
             conn.close()
 
     # the port
+    @property
+    def can_post(self) -> bool:
+        """False when no ``post`` command is configured: a port nothing can be filed through is not a desk that is wired
+        (the Desk routes read it as unwired, and a send answers 404 as it does with no port at all)."""
+        return self._cmds.post is not None
+
     def capabilities(self) -> DeskCaps:
         c = self._cmds
         return DeskCaps(adapter=self._adapter, wake=self._wake, receipts=c.events is not None, lease=c.lease is not None,
