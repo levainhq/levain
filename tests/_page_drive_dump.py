@@ -13,7 +13,11 @@ What it does, all test-side:
     with an earlier hung Chrome) that is removed after;
   * ONE retry of the whole dump when an attempt times out. A retry hides a hang only if the hang is deterministic, and then both
     attempts hang and the test FAILS: the assertion message carries each attempt's wall time, stderr tail, the box load and the size of
-    ``/dev/shm``, so a repeat says what the box looked like (``[prescription: reasoned]``; see the lane return for what was measured).
+    ``/dev/shm``, so a repeat says what the box looked like (``[prescription: reasoned]``; see the lane return for what was measured);
+  * an attempt that is still running ``TREE_LEAD`` seconds before its timeout has its process tree recorded (``ps`` pid, ppid, pgid,
+    state, wait channel, command) into the same message, before the runner's group kill removes it. ``ps`` only reads: it changes nothing
+    in the Chrome under test. Next option if that is not enough, NOT added here because it changes the Chrome under test:
+    ``--enable-logging=stderr --v=1`` on the failing attempt.
 
 Flags: ``CHROME_SAFE_FLAGS`` (tests/chrome_flags.json) come first, as at every Chrome launch site.
 """
@@ -23,6 +27,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Sequence
 
@@ -31,6 +36,7 @@ from tests._page_drive_run import run as _run
 
 ATTEMPTS = 2           # one try and ONE retry; a third would turn a deterministic hang into minutes of wait
 STDERR_TAIL = 700      # bytes of each attempt's stderr kept for the failure message
+TREE_LEAD = 2.0        # seconds before an attempt's timeout at which the hung process tree is recorded
 
 
 class DumpDomHung(AssertionError):
@@ -57,6 +63,41 @@ def _box() -> str:
     return f"load {load}; /dev/shm {shm_s}"
 
 
+def _hung_tree(profile: str) -> str:
+    """``ps`` rows of the process group(s) holding this attempt's profile: pid, ppid, pgid, state, wait channel, command.
+
+    The runner's own group kill ends the tree when the attempt times out, so this is taken BEFORE that, by :func:`_watch`. A group is
+    named by any member whose command line carries the profile directory (Chrome's main process does), and every member of it is listed,
+    helpers that do not carry the path included. Read-only, bounded, and it never raises: it is a diagnostic, not part of the run."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid,ppid,pgid,stat,wchan,command", "-ww"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"(ps unavailable: {e!r})"
+    rows = out.splitlines()
+    groups: set[str] = set()
+    for row in rows[1:]:
+        cols = row.split(None, 3)
+        if len(cols) == 4 and profile in row:
+            groups.add(cols[2])
+    kept = [rows[0]] if rows else []
+    kept += [row for row in rows[1:] if len(row.split(None, 3)) == 4 and row.split(None, 3)[2] in groups]
+    if len(kept) <= 1:
+        return "(no live process carried this attempt's profile)"
+    return "\n".join(r[:240] for r in kept[:30])
+
+
+def _watch(profile: str, delay: float, stop: threading.Event, found: list[str]) -> threading.Thread:
+    """A timer thread: unless ``stop`` is set within ``delay`` seconds it records :func:`_hung_tree` into ``found``.
+
+    The caller sets ``stop`` as soon as the attempt ends, so a normal run costs one idle thread and no ``ps``."""
+    def body() -> None:
+        if not stop.wait(delay):
+            found.append(_hung_tree(profile))
+    thread = threading.Thread(target=body, daemon=True)
+    thread.start()
+    return thread
+
+
 def dump_dom(chrome: str, url: str, *, timeout: float = 60, extra: Sequence[str] = (),
              runner: Callable[..., subprocess.CompletedProcess[str]] | None = None) -> str:
     """The page's serialized DOM. ``timeout`` bounds EACH attempt. ``runner`` is ``_page_drive_run.run`` unless a test names another."""
@@ -65,13 +106,20 @@ def dump_dom(chrome: str, url: str, *, timeout: float = 60, extra: Sequence[str]
     for n in range(1, ATTEMPTS + 1):
         profile = tempfile.mkdtemp(prefix="levain-dump-profile-")
         started = time.monotonic()
+        stop, tree = threading.Event(), []
+        watcher = _watch(profile, max(timeout * 0.5, timeout - TREE_LEAD), stop, tree)
         try:
             argv = [chrome, *CHROME_SAFE_FLAGS, f"--user-data-dir={profile}", "--dump-dom", "--virtual-time-budget=8000",
                     "--window-size=1440,1000", *extra, url]
             return runner(argv, timeout=timeout).stdout
         except subprocess.TimeoutExpired as e:
+            stop.set()
+            watcher.join(10)      # a snapshot already under way finishes (ps is bounded); one not yet started is skipped
+            seen = ("\n    process tree about %gs before the kill:\n      " % min(TREE_LEAD, timeout * 0.5) + tree[0].replace("\n", "\n      ")
+                    if tree else "\n    process tree: none recorded")
             attempts.append(f"attempt {n}: no exit within {timeout:g}s (wall {time.monotonic() - started:.1f}s); "
-                            f"stdout {len(e.stdout or '')} bytes; stderr tail: {_tail(e.stderr)!r}")
+                            f"stdout {len(e.stdout or '')} bytes; stderr tail: {_tail(e.stderr)!r}{seen}")
         finally:
+            stop.set()
             shutil.rmtree(profile, ignore_errors=True)
     raise DumpDomHung("chrome --dump-dom hung on every attempt (" + _box() + "), so the retry did not hide it:\n  " + "\n  ".join(attempts))
