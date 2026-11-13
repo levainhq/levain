@@ -115,7 +115,9 @@ def test_every_slots_budget_fits_the_log_at_the_largest_record():
                                    "slot": {"class": "egress", "index": 32}, "session": "s-" + "f" * 62,
                                    "suppressed": 10**9})) + 1
     most_suppressed = qbroker.ALARM_RATE * qbroker.ALARM_BUDGET_WINDOW + qbroker.ALARM_BURST
-    # one at each doubling of the count, and at most one per ALARM_SUMMARY_INTERVAL besides
+    # one at each doubling of the count, and at most one per ALARM_SUMMARY_INTERVAL besides. The int() of the log2 is
+    # exact here only because the constant set (ALARM_RATE 0.2, ALARM_BUDGET_WINDOW 86400, ALARM_BURST 5 -> 17285) pins it
+    # (log2 = 14.08, so 14); a change to those constants is a change to this bound, read it again.
     summaries = int(math.log2(most_suppressed)) + 1 + math.ceil(qbroker.ALARM_BUDGET_WINDOW / qbroker.ALARM_SUMMARY_INTERVAL)
     per_slot = qbroker.ALARM_SLOT_BUDGET * biggest + summaries * summary
     # the newest ALARM_LOG_MAX - biggest bytes always survive a roll
@@ -455,6 +457,51 @@ def test_c1_a_cap_that_stopped_resolving_pays_the_unseen_bucket_and_rejoins_when
     assert alarm(b, reason="back-2")["ok"] is True                   # known: the dry bucket does not stop it
 
 
+@pytest.mark.parametrize("blip", ["raises", "malformed"])
+def test_c1_a_control_blip_leaves_a_known_cap_known(L, resolver, clock, blip):
+    """Only the definitive miss (``cap-unknown``) evicts; ``control-unavailable`` and ``resolve-malformed`` do not."""
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    assert alarm(b, reason="first")["ok"] is True
+    _drain_unseen_bucket(b)                                          # an unknown cap would now be stopped by the bucket
+    real = resolver.queue_resolve
+
+    def blipping(slot, digest):
+        if blip == "raises":
+            raise OSError("control socket gone")
+        return 42                                                    # neither a refusal name nor a Resolved
+    resolver.queue_resolve = blipping
+    mono["t"] += qbroker.RESOLVE_TTL + 0.1
+    assert alarm(b, reason="blip")["refused"] == ("control-unavailable" if blip == "raises" else "resolve-malformed")
+    resolver.queue_resolve = real                                    # CONTROL is back
+    mono["t"] += qbroker.RESOLVE_TTL + 0.1
+    assert alarm(b, reason="after")["ok"] is True                    # still known: it skips the empty unseen bucket
+
+
+def test_c1_a_slot_whose_last_known_cap_is_evicted_keeps_no_empty_entry(L, resolver, clock):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    assert alarm(b, reason="first")["ok"] is True
+    assert 1 in b._alarm_caps
+    resolver.caps.clear()
+    mono["t"] += qbroker.RESOLVE_TTL + 0.1
+    assert alarm(b, reason="gone")["refused"] == "cap-unknown"
+    assert 1 not in b._alarm_caps                                    # the empty set is dropped with its last cap
+
+
+def test_c1_evicting_one_cap_leaves_the_slots_other_known_caps_known(L, resolver, clock):
+    mono = {"t": 1000.0}
+    b = make_broker(L, resolver, clock, monotonic=lambda: mono["t"])
+    assert alarm(b, cap="cap-a", reason="one")["ok"] is True
+    assert alarm(b, cap="cap-a2", reason="two")["ok"] is True
+    del resolver.caps[("egress", 1, qbroker.cap_digest("cap-a"))]      # cap-a's session ended; cap-a2's did not
+    mono["t"] += qbroker.RESOLVE_TTL + 0.1
+    assert alarm(b, cap="cap-a", reason="gone")["refused"] == "cap-unknown"
+    _drain_unseen_bucket(b)
+    mono["t"] += qbroker.RESOLVE_TTL + 0.1
+    assert alarm(b, cap="cap-a2", reason="two-again")["ok"] is True    # still known: skips the dry unseen bucket
+
+
 # --- DIOGAP D3: a slot that keeps being suppressed keeps reaching the log -------------------------------------------
 
 def _flood_past_budget(b, mono, n):
@@ -525,3 +572,29 @@ def test_d3_the_row_says_what_the_count_is_and_when_it_was_last_written(L, resol
     assert row.warn and "at least 65 more suppressed" in row.detail
     assert "running count since its alarm budget began" in row.detail
     assert [r["at"] for r in _summaries(L)][-1] in row.detail
+
+
+def test_d3_two_slots_summaries_at_different_times_are_not_one_slots_time_for_the_sum(L, clock):
+    store = QueueStore(L / "queue")
+    now = clock["fn"]()
+    older = (now - timedelta(hours=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    newer = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for index, at, n in ((2, older, 5), (3, newer, 100)):
+        store.append_alarm({"format": qbroker.ALARM_FORMAT, "at": at, "slot": {"class": "egress", "index": index},
+                            "session": "s-x", "suppressed": n})
+    [row] = doctor._check_slot_alarms(store=L, now=now)
+    assert "at least 105 more suppressed" in row.detail
+    assert older in row.detail and newer in row.detail               # both ends are named: no one slot's time stands for the sum
+    assert "the last at" not in row.detail
+    # a slot's later summary replaces its own earlier one, so the oldest stamp is its latest, not its first
+    later = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.append_alarm({"format": qbroker.ALARM_FORMAT, "at": later, "slot": {"class": "egress", "index": 2},
+                        "session": "s-x", "suppressed": 9})
+    [row] = doctor._check_slot_alarms(store=L, now=now)
+    assert "at least 109 more suppressed" in row.detail and older not in row.detail and later in row.detail
+    # the ends are the oldest and the newest of the slots' latest stamps, whatever order the log wrote them in
+    newest = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.append_alarm({"format": qbroker.ALARM_FORMAT, "at": newest, "slot": {"class": "egress", "index": 2},
+                        "session": "s-x", "suppressed": 10})
+    [row] = doctor._check_slot_alarms(store=L, now=now)
+    assert f"the oldest at {newer}, the newest at {newest}" in row.detail
