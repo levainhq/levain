@@ -514,6 +514,51 @@ def test_a_dictate_start_that_gets_going_clears_the_installed_flag(tmp_path, w):
     assert got["setup"] is False and got["mic"] == "none" and got["refused"] not in got["note"], got
 
 
+# a recognizer that fires `start` and THEN ends with a pack error (a cause install() cannot fix: an insecure origin, a policy block)
+_START_THEN_REFUSE = """
+window.__refuse = true;
+class StartThenRefuse extends Setup {
+  start() { window.__started.push({live: true}); if (this.onstart) this.onstart({}); if (window.__refuse) this.onerror({error: "service-not-allowed"}); }
+}
+"""
+
+
+@needs_browser
+def test_a_start_event_before_the_refusal_does_not_reopen_the_setup_loop(tmp_path, w):
+    """DICT-FIX3 (L3 r3): probe:false, a recognizer that fires `start` and then ends service-not-allowed even after install()
+    resolved true. Red with a `start` handler that clears the installed flag: Setup is offered again (the install -> Dictate ->
+    refused -> Setup loop), and the 'installed, browser still refuses' line is missing."""
+    out, _w = _run(tmp_path, w, "StartThenRefuse", [
+        {"until": _DICTATE},
+        {"eval": "%s.click(); %s.click(); __done.res(true); 1" % (_MB, _SB)},       # fail (after start) -> Setup -> install once -> true
+        {"until": _DICTATE},
+        {"eval": "%s.click(); JSON.stringify({setup: %s.hidden, mic: %s.style.display, inst: __inst.length, recs: __recs.length,"
+                 " note: %s, want: %s('refused'), reason: LevainMic.dictateReason('service-not-allowed')})" % (_MB, _SB, _MB, _NOTE, _WORD)},
+    ], pre=_START_THEN_REFUSE, extra=_NOPROBE)
+    got = json.loads(out["values"][4])
+    assert got["recs"] == 2, got                                                          # two Dictate taps, both reached start()
+    assert got["setup"] is True and got["mic"] == "" and got["inst"] == 1, got           # Dictate stays, no second Setup, one install ever
+    assert got["want"] and got["note"] == got["reason"] + " " + got["want"], got
+
+
+@needs_browser
+def test_a_real_result_clears_the_installed_flag_even_when_start_fires_first(tmp_path, w):
+    """The other half: a recognizer that fires `start` then delivers a `result` proves audio flowed, so a later refusal is a new
+    question and Setup is offered again. Red with: a flag that is never cleared (the refusal after a good dictation says
+    'installed but refused' and offers no Setup)."""
+    out, _w = _run(tmp_path, w, "StartThenRefuse", [
+        {"until": _DICTATE},
+        {"eval": "%s.click(); %s.click(); window.__refuse = false; __done.res(true); 1" % (_MB, _SB)},
+        {"until": _DICTATE},
+        {"eval": "%s.click(); __recs[__recs.length - 1].emit('hello'); %s.click(); window.__refuse = true; %s.click();"
+                 " JSON.stringify({setup: %s.hidden, mic: %s.style.display, note: %s, refused: %s('refused'),"
+                 " text: document.querySelector('.rv-input').value})" % (_MB, _MB, _MB, _SB, _MB, _NOTE, _WORD)},
+    ], pre=_START_THEN_REFUSE, extra=_NOPROBE)
+    got = json.loads(out["values"][4])
+    assert got["text"] == "hello", got
+    assert got["setup"] is False and got["mic"] == "none" and got["refused"] not in got["note"], got
+
+
 @needs_browser
 def test_an_insecure_page_gets_neither_dictate_nor_setup_and_the_note_says_why(tmp_path, w):
     """SpeechRecognition is [SecureContext] (Web Speech spec) and the microphone is https/localhost only. Red with: Dictate or Setup

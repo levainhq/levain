@@ -814,7 +814,7 @@
       // that ends service-not-allowed / language-not-supported (the one DICTATE_REASONS sentence). That, with install() present,
       // swaps Dictate for the one Setup button below; the same tap handler serves the probe path.
       // Once install() has resolved true, the same error is not a missing pack (a non-secure page, a policy block): no Setup again,
-      // the note adds the one line saying so. A Dictate start that later gets going (a result or a start event) clears setupDone.
+      // the note adds the one line saying so. Only a real result clears setupDone (audio flowed, so the pack works); a bare start event does not, because a recognizer can fire start and then refuse.
       var setupDone = false;
       function offerSetupAfter(code) {
         if (code !== "service-not-allowed" && code !== "language-not-supported") return;
@@ -854,9 +854,8 @@
         dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
         r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
         if (r.processLocally !== true) { note.textContent = "This browser will not keep dictation on this device, so Dictate is off."; return; }
-        r.onstart = function () { if (rec === r) setupDone = false; };
         r.onresult = function (ev) {
-          if (rec !== r) return;                       // a late result from a recognizer that was ended
+          if (rec !== r) return;                     // a late result from a recognizer that was ended
           setupDone = false;                           // dictation is working: a later pack error is a new question
           var t = "";
           for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
