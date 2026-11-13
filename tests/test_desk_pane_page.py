@@ -352,11 +352,14 @@ def test_one_send_per_tap_and_one_outbox_id_per_message_kept_on_a_retry(tmp_path
                  # C: a 502 then a dropped connection, retried under the same id; then it files
                  put(script=[{"status": 502, "json": None}, {"drop": True}, accepted("inbox-C")]), typed("third line"),
                  {"eval": click1}, until("document.querySelector('.dv-failed')"), SNAP,
-                 {"eval": click1}, until("document.querySelector('.dv-failed .dv-status') && document.querySelector('.dv-failed .dv-status').innerText.indexOf('could not be reached') >= 0"),
+                 {"eval": click1}, until("[...document.querySelectorAll('.dv-failed .dv-status')].some(n => n.innerText.indexOf('could not be reached') >= 0)"),
                  {"eval": click1}, until("document.querySelectorAll('.dv-filed').length === 3"), SNAP,
                  # D: ambiguous: the Room's mark-flow words, the line is not sent again, the draft goes (the line is in the log)
                  put(script=[{"status": 200, "json": {"outcome": "ambiguous", "ref": None, "thread_id": None, "reason": None, "replayed": False}}]), typed("fourth line"),
                  {"eval": click1}, until("document.querySelector('.dv-ambiguous')"), SNAP,
+                 # D2: the same words again are the same message: the same id (the server answers the line it holds), one line in the log
+                 put(script=[{"status": 200, "json": {"outcome": "ambiguous", "ref": None, "thread_id": None, "reason": None, "replayed": True}}]), typed("fourth line"),
+                 {"eval": click1}, {"eval": "new Promise(r => setTimeout(r, 900)).then(() => 1)"}, SNAP,
                  # E: refused by the host: its one line, the draft stays, the id is spent
                  put(script=[{"status": 200, "json": {"outcome": "not_delivered", "ref": None, "thread_id": None, "reason": "the desk inbox is closed tonight", "replayed": False}}, accepted("inbox-E")]), typed("fifth line"),
                  {"eval": click1}, until("document.querySelector('.dv-refused')"), SNAP,
@@ -365,7 +368,7 @@ def test_one_send_per_tap_and_one_outbox_id_per_message_kept_on_a_retry(tmp_path
                  put(script=[{"status": 422, "json": {"error": "words_over_cap", "words_max": 2000}}]), typed("sixth line"),
                  {"eval": click1}, until("document.querySelectorAll('.dv-refused').length === 2"), SNAP]
         out = _drive(tmp_path, base + "/", steps)
-    A_flight, A_filed, C_failed, C_filed, D, E, F = (snaps(out)[i] for i in (0, 1, 2, 3, 4, 5, 6))
+    A_flight, A_filed, C_failed, C_filed, D, D2, E, F = (snaps(out)[i] for i in range(8))
     sends = stub.sends
     words = [s["words"] for s in sends]
     # A and B: ONE post each, however the button was hit
@@ -382,7 +385,10 @@ def test_one_send_per_tap_and_one_outbox_id_per_message_kept_on_a_retry(tmp_path
     assert len({v[0] for v in ids.values()}) == len(ids), ids          # every message its own id
     assert all(8 <= len(v[0]) <= 128 for v in ids.values()), ids        # the wire's bound on an outbox id
     # D: ambiguous, exactly once, with the Room's wording
-    assert words.count("fourth line") == 1 and HOLD_AMBIGUOUS in D["lines"][-1]["text"] and D["taValue"] == "", D
+    assert HOLD_AMBIGUOUS in D["lines"][-1]["text"] and D["taValue"] == "", D
+    d = [s for s in sends if s["words"] == "fourth line"]
+    assert len(d) == 2 and d[0]["outbox_id"] == d[1]["outbox_id"], d
+    assert [l["text"] for l in D2["lines"]].count(D["lines"][-1]["text"]) == 1 and D2["taValue"] == "", D2
     # E: refused: the host's line, the draft stays, a resend after a refusal is a NEW id
     e = [s for s in sends if s["words"] == "fifth line"]
     assert "the desk inbox is closed tonight" in E["lines"][-1]["text"] and E["taValue"] == "fifth line", E
