@@ -297,20 +297,22 @@ def test_every_state_of_the_wire_is_drawn_from_the_read_alone(tmp_path):
                  put(get={"status": 200, "json": wired()}), until("document.querySelector('.dv-lease-held')"), SNAP,   # 2 lease held
                  put(get={"status": 200, "json": wired(lease={"state": "none"})}), until("document.querySelector('.dv-lease-none')"), SNAP,   # 3 none
                  put(get={"status": 200, "json": wired(lease={"state": "unknown"})}), until("document.querySelector('.dv-lease-unknown')"), SNAP,  # 4 unknown
-                 put(get={"status": 200, "json": wired(thread_id="t1", cursor="c3", events=[
+                 put(get={"status": 200, "json": wired(thread_id="t1", cursor="c2", events=[
                      {"by": "script", "kind": "took", "text": "", "at": "09:01:02"},
-                     {"by": "script", "kind": "held", "text": "", "at": "09:02:00"},
+                     {"by": "script", "kind": "held", "text": "", "at": "09:02:00"}])}),
+                 until("document.querySelectorAll('.dv-zone .rv-line').length >= 2"),
+                 put(get={"status": 200, "json": wired(thread_id="t1", cursor="c2", events=[], readable=False)}),
+                 until("document.querySelector('.dv-unreadable')"), SNAP,                                          # 5 could not be fetched, held events kept
+                 put(get={"status": 200, "json": wired(thread_id="t1", cursor="c3", events=[
                      {"by": "desk", "kind": "reply", "text": "on it, back by noon", "at": "09:03:00"}])}),
-                 until("document.querySelectorAll('.dv-zone .rv-line').length >= 3"), SNAP,                      # 5 took, held, reply
-                 put(get={"status": 200, "json": wired(thread_id="t1", cursor="c3", events=[], readable=False)}),
-                 until("document.querySelector('.dv-unreadable')"), SNAP,                                          # 6 could not be fetched, held events kept
-                 put(get={"status": 500, "json": {"error": "boom"}}), until("document.querySelector('.dv-state-error')"), SNAP,   # 7 server error
+                 until("document.querySelectorAll('.dv-zone .rv-line').length >= 3 && !document.querySelector('.dv-unreadable')"), SNAP,   # 6 took, held, reply
+                 put(get={"status": 500, "json": {"error": "boom"}}), until("document.querySelector('.dv-state-error')"), SNAP,   # 7 server error (every thread settled: the desk alone is read)
                  {"eval": "JSON.stringify({kept: sessionStorage.getItem('levain.desk.threads'), legacy: sessionStorage.getItem('levain.desk.thread')})"}]
         out = _drive(tmp_path, base + "/", steps)
     kept = json.loads(out["values"][-1])
     assert kept["legacy"] is None, kept                                           # the single remembered thread is gone
     assert json.loads(kept["kept"])[0]["id"] == "t1" and json.loads(kept["kept"])[0]["cursor"] == "c3", kept
-    unwired, held, none, unknown, replies, unreadable, error = snaps(out)
+    unwired, held, none, unknown, unreadable, replies, error = snaps(out)
     for s in (unwired, held, none, unknown, replies, unreadable, error):
         _no_ban_words(s)
         assert s["on"] and not s["room"], s
@@ -323,12 +325,12 @@ def test_every_state_of_the_wire_is_drawn_from_the_read_alone(tmp_path):
     assert texts[0] == "Desk took it at 09:01:02 (script)" and texts[1] == "No desk holds the lease; held (09:02:00)", texts
     assert replies["lines"][2]["text"].startswith("Desk · 09:03:00") and "on it, back by noon" in replies["lines"][2]["text"], texts
     assert "rv-room" in replies["lines"][2]["cls"], replies["lines"]
-    assert "could not be fetched" in unreadable["text"] and "on it, back by noon" in unreadable["text"], unreadable["text"]   # never "no events yet"
+    assert "could not be fetched" in unreadable["text"] and "No desk holds the lease; held" in unreadable["text"], unreadable["text"]   # never "no events yet"
     assert "could not be reached" in error["bar"] and "500" in error["bar"], error
     # the read names its thread and cursor once it has them, and never before
     reads = [g["path"] for g in stub.gets]
     assert reads[0] == "/cockpit/desk.json?thread=t1", reads                       # the migrated thread, no cursor yet
-    assert "/cockpit/desk.json?thread=t1&after=c3" in reads, reads                 # then the cursor the answer gave
+    assert "/cockpit/desk.json?thread=t1&after=c2" in reads, reads                 # then the cursor the answer gave
 
 
 @needs_browser
@@ -520,9 +522,9 @@ def _send(text, n):
 
 
 @needs_browser
-def test_every_line_keeps_the_answers_of_its_own_thread_and_the_newest_three_are_read_and_six_are_kept(tmp_path):
-    """DESK-E M1 and codex HIGH 1: line one's took and reply stay beside it after line two (a new thread), a late reply to line
-    one is still fetched, a tick reads the newest three threads (one request each), and past six the oldest is dropped."""
+def test_every_line_keeps_the_answers_of_its_own_thread_and_six_are_kept(tmp_path):
+    """DESK-E M1 and codex HIGH 1: line one's took and reply stay beside it after line two (a new thread), and past six threads
+    the oldest is dropped (its line stays drawn, its answers go)."""
     took = lambda n: _ev("took", by="script", at=f"09:00:0{n}")   # noqa: E731
     by_thread = {f"t{n}": _fixture(f"t{n}", "c1", took(n), _ev("reply", f"reply {n}")) for n in range(1, 8)}
     with desk_page(tmp_path) as (stub, base):
@@ -531,31 +533,88 @@ def test_every_line_keeps_the_answers_of_its_own_thread_and_the_newest_three_are
                  _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
                  *_send("line 1", 1), until("document.body.innerText.indexOf('reply 1') >= 0"),
                  *_send("line 2", 2), until("document.body.innerText.indexOf('reply 2') >= 0"), SNAP,       # 0: two lines, two threads
-                 # the desk answers line one AGAIN (after the cursor c1): it must still be fetched and drawn beside line one
-                 put(by_thread={**by_thread, "t1@c1": _fixture("t1", "c2", _ev("reply", "late 1")), "t1@c2": _fixture("t1", "c2")}),   # nothing after c2
-                 until("document.body.innerText.indexOf('late 1') >= 0"), SNAP,                               # 1
                  *[s for n in range(3, 8) for s in _send(f"line {n}", n)],
-                 until("document.body.innerText.indexOf('reply 7') >= 0"), SNAP,                              # 2: seven lines sent
+                 until("document.body.innerText.indexOf('reply 7') >= 0"), SNAP,                              # 1: seven lines sent
                  {"eval": "JSON.stringify({threads: sessionStorage.getItem('levain.desk.threads')})"}]
         out = _drive(tmp_path, base + "/", steps)
-        gets = list(stub.gets)
-    two, late, seven = snaps(out)[:3]
+    two, seven = snaps(out)[:2]
     assert _heads(two) == ["line 1", "Desk took it at 09:00:01 (script)", "Desk · 09:00:00", "line 2", "Desk took it at 09:00:02 (script)", "Desk · 09:00:00"], two["lines"]
     assert [l["text"].split("\n")[1] for l in two["lines"] if "rv-room" in l["cls"]] == ["reply 1", "reply 2"], two["lines"]
-    heads = _heads(late)
-    assert heads[:4] == ["line 1", "Desk took it at 09:00:01 (script)", "Desk · 09:00:00", "Desk · 09:00:00"] and heads[4] == "line 2", late["lines"]
-    assert late["lines"][3]["text"].endswith("late 1"), late["lines"]
     # seven lines: every line stays drawn, only the last six threads keep (and draw) their answers
     texts = [l["text"] for l in seven["lines"]]
     assert [h for h in _heads(seven) if h.startswith("line ")] == [f"line {n}" for n in range(1, 8)], seven["lines"]
     assert not any("reply 1" in t for t in texts) and all(any(f"reply {n}" in t for t in texts) for n in range(2, 8)), texts
     stored = json.loads(json.loads(out["values"][-1])["threads"])
     assert [t["id"] for t in stored] == [f"t{n}" for n in range(2, 8)], stored
-    # a tick reads the newest three, one request each: after the first read of t7, t4 and older are never asked again
-    asked = [g["thread"] for g in gets if g["thread"]]
+
+
+def _held_for(label):
+    """A step that waits ~4.5 s of nudged reads (the drive nudges a read every 300 ms while a condition is false)."""
+    return until(f"(window.__{label} = (window.__{label} || 0) + 1) > 15")
+
+
+@needs_browser
+def test_a_reply_to_the_first_of_four_lines_still_reaches_it(tmp_path):
+    """DESK-F3 (complement LOW): a tick used to read only the newest three threads and every typed line is a NEW thread, so after a
+    fourth send the first line's answers never arrived. Every thread the desk has not answered is read."""
+    took = lambda n: _ev("took", by="script", at=f"09:00:0{n}")   # noqa: E731
+    by_thread = {f"t{n}": _fixture(f"t{n}", "c1", took(n)) for n in range(1, 5)}
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread=by_thread,
+                                       script=[accepted(f"inbox-{n}", thread=f"t{n}") for n in range(1, 5)]),
+                 _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 *[s for n in range(1, 5) for s in _send(f"line {n}", n)],
+                 until("document.querySelectorAll('.dv-zone .dv-took').length === 4"), _held_for("a"),
+                 put(by_thread={**by_thread, "t1@c1": _fixture("t1", "c2", _ev("reply", "late 1"))}),          # the desk answers line ONE
+                 until("document.body.innerText.indexOf('late 1') >= 0"), SNAP]
+        out = _drive(tmp_path, base + "/", steps)
+    (s,) = snaps(out)
+    assert _heads(s) == ["line 1", "Desk took it at 09:00:01 (script)", "Desk · 09:00:00", "line 2", "Desk took it at 09:00:02 (script)",
+                         "line 3", "Desk took it at 09:00:03 (script)", "line 4", "Desk took it at 09:00:04 (script)"], s["lines"]
+    assert s["lines"][2]["text"].endswith("late 1"), s["lines"]
+
+
+@needs_browser
+def test_a_thread_the_desk_has_answered_is_not_requested_again_and_the_others_are(tmp_path):
+    """DESK-F3: a thread whose held events include a reply from the desk is settled (stays drawn, never asked again). A read that
+    could not be fetched (readable false) never settles a thread, even if its body carries a reply."""
+    by_thread = {"t1": _fixture("t1", "c1", _ev("took", by="script"), _ev("reply", "reply one")),
+                 "t2": _fixture("t2", "c1", _ev("took", by="script")),
+                 "t3": {"status": 200, "json": wired(thread_id="t3", cursor="c1", events=[_ev("reply", "never held")], readable=False)}}
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread=by_thread,
+                                       script=[accepted(f"inbox-{n}", thread=f"t{n}") for n in range(1, 4)]),
+                 _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 *_send("line 1", 1), until("document.body.innerText.indexOf('reply one') >= 0"),
+                 *_send("line 2", 2), *_send("line 3", 3), _held_for("b"), SNAP]
+        out = _drive(tmp_path, base + "/", steps)
+        asked = [g["thread"] for g in stub.gets if g["thread"]]
+    (s,) = snaps(out)
+    assert asked.count("t1") == 1, asked                    # read once (it carried the desk's reply), never again
+    assert asked.count("t2") >= 3 and asked.count("t3") >= 3, asked
+    assert "reply one" in s["text"] and "never held" not in s["text"], s["text"]     # settled stays drawn; an unreadable body holds nothing
+
+
+@needs_browser
+def test_seven_lines_keep_six_threads_and_every_unanswered_one_of_them_is_read_newest_first(tmp_path):
+    """DESK-F3: after seven sends the oldest thread is gone and is not read; of the six kept, the two the desk answered are
+    settled and the other four are read each tick, newest first."""
+    by_thread = {f"t{n}": _fixture(f"t{n}", "c1", _ev("took", by="script", at=f"09:00:0{n}"), *([_ev("reply", f"reply {n}")] if n in (3, 5) else []))
+                 for n in range(1, 8)}
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread=by_thread,
+                                       script=[accepted(f"inbox-{n}", thread=f"t{n}") for n in range(1, 8)]),
+                 _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 *[s for n in range(1, 8) for s in _send(f"line {n}", n)],
+                 until("document.querySelectorAll('.dv-zone .dv-took').length === 6"), _held_for("c"),
+                 {"eval": "JSON.stringify({threads: sessionStorage.getItem('levain.desk.threads')})"}]
+        out = _drive(tmp_path, base + "/", steps)
+        asked = [g["thread"] for g in stub.gets if g["thread"]]
+    stored = json.loads(json.loads(out["values"][-1])["threads"])
+    assert [t["id"] for t in stored] == [f"t{n}" for n in range(2, 8)], stored
     after7 = asked[asked.index("t7"):]
-    assert set(after7) == {"t7", "t6", "t5"}, after7
-    assert "t1" in asked and any(g["path"] == "/cockpit/desk.json?thread=t1&after=c1" for g in gets), asked
+    assert after7[:4] == ["t7", "t6", "t4", "t2"], after7              # the first read after the seventh send: newest first, t5 and t3 settled, t1 gone
+    assert set(after7) == {"t7", "t6", "t4", "t2"} and all(after7.count(t) >= 3 for t in set(after7)), after7
 
 
 @needs_browser

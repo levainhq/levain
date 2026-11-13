@@ -19,8 +19,7 @@
   var POLL_OPEN_MS = 4000;      // while the view is open
   var POLL_HIDDEN_MS = 12000;   // while the page is hidden
   var KEEP_SENT = 30;
-  var MAX_THREADS = 6;          // threads kept and drawn
-  var POLL_THREADS = 3;         // the newest of them read on every tick, one request each
+  var MAX_THREADS = 6;          // threads kept and drawn; each one the desk has not answered yet is read on every tick, one request each
   var AMBIGUOUS_WORDS = "It may not have arrived. It is not sent again; say whether it did.";
   var UNWIRED_WORDS = "This cockpit has no desk wired.";
   var LEASE_STATES = { held: 1, none: 1, unknown: 1 };
@@ -104,6 +103,9 @@
     if (batch.cursor === cursor) return { events: held, cursor: cursor };
     return { events: held.concat(batch.events), cursor: batch.cursor };
   }
+
+  // A thread is SETTLED when the events held for it include a reply from the desk.
+  function isSettled(events) { return events.some(function (e) { return e.kind === "reply" && e.by === "desk"; }); }
 
   // The words for one answer to the send (status, parsed body). `kept` = the id stays for a retry; `draft` = the draft is
   // cleared (the line is in the log); `thread` = the thread the answer names.
@@ -340,7 +342,11 @@
       threads.forEach(function (t) { if (!own(used, t.id)) evs(t); });
       return out;
     }
-    function unreadableNow() { return threads.slice(-POLL_THREADS).some(function (t) { return t.unreadable; }); }
+    // A thread is SETTLED once the events held for it include a reply from the desk: it stays drawn and is read no more (a desk
+    // that answers a settled thread again is not followed). Only events a readable read delivered are held, so an unreadable read
+    // never settles a thread.
+    function settled(t) { return isSettled(t.events); }
+    function unreadableNow() { return threads.some(function (t) { return t.unreadable; }); }
 
     function draw() {
       var all = rows();
@@ -461,15 +467,17 @@
         draw();
       });
     }
-    // One tick: the newest threads, newest first, one request each, one after another (the route holds few poll slots, and one
-    // device's reads must not fill them); with no thread yet, the desk alone. A pull asked for while one is running is not lost: ONE
-    // follow-up runs when it ends (a send's new thread is read at once, not a tick later).
+    // One tick: every kept thread the desk has not answered yet, newest first, one request each, one after another (the route
+    // holds few poll slots, and one device's reads must not fill them); with no such thread (none sent yet, or all settled), the
+    // desk alone, so the lease line keeps living. A pull asked for while one is running is not lost: ONE follow-up runs when it
+    // ends (a send's new thread is read at once, not a tick later).
     function pull() {
       if (stopped) return Promise.resolve();
       if (reading) { again = true; return Promise.resolve(); }
       reading = true; again = false;
       var my = gen;
-      var ids = threads.length ? threads.slice(-POLL_THREADS).reverse().map(function (t) { return t.id; }) : [null];
+      var ids = threads.filter(function (t) { return !settled(t); }).reverse().map(function (t) { return t.id; });
+      if (!ids.length) ids = [null];
       function next(i) { return i >= ids.length || stopped || my !== gen ? Promise.resolve() : pullOne(ids[i], my).then(function () { return next(i + 1); }); }
       return next(0).catch(function (e) {
         if (root.console && root.console.error) root.console.error("desk view: " + (e && e.message ? e.message : e));
@@ -505,7 +513,7 @@
   }
 
   var api = {
-    deskModel: deskModel, leaseModel: leaseModel, eventModel: eventModel, mergeEvents: mergeEvents, sendOutcome: sendOutcome, filedNote: filedNote,
+    deskModel: deskModel, leaseModel: leaseModel, eventModel: eventModel, mergeEvents: mergeEvents, isSettled: isSettled, sendOutcome: sendOutcome, filedNote: filedNote,
     pollDelay: pollDelay, shown: shown, ageWords: ageWords, mount: mount,
     POLL_OPEN_MS: POLL_OPEN_MS, POLL_HIDDEN_MS: POLL_HIDDEN_MS, AMBIGUOUS_WORDS: AMBIGUOUS_WORDS, ARRIVED_WORDS: ARRIVED_WORDS, NOT_ARRIVED_WORDS: NOT_ARRIVED_WORDS,
     HOSTILE_SOURCE: HOSTILE.source
