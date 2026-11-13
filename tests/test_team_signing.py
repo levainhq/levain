@@ -331,8 +331,20 @@ def test_no_ssh_keygen_is_indeterminate_and_never_cached(repo, keys, tmp_path, m
     sigtmp = tmp_path / "sigtmp"
     sigtmp.mkdir()
     monkeypatch.setattr(tempfile, "tempdir", str(sigtmp))
+    made: list[str] = []
+    real_mkstemp = tempfile.mkstemp
+
+    def spy_mkstemp(*a, **kw):
+        fd, path = real_mkstemp(*a, **kw)
+        made.append(path)
+        return fd, path
+
+    monkeypatch.setattr(tempfile, "mkstemp", spy_mkstemp)
     _without_ssh_keygen(monkeypatch, exc)
     got = S.SigCache(cache_path).verify(repo, [sha, plain])
+    # the leftovers check below is only meaningful if the check really wrote its signature file here (it is cleaned up after)
+    sig_files = [p for p in made if Path(p).name.startswith("levain-sig-")]
+    assert sig_files and all(Path(p).parent == sigtmp for p in sig_files), made
     assert got[sha].kind == "indeterminate" and got[sha].fingerprint is None
     assert got[plain].kind == "unsigned"  # needs no ssh-keygen, so it is definitive and stored
     stored = json.loads(cache_path.read_text())
