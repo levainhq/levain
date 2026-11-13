@@ -15,12 +15,14 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
+import pytest
+
 from tests.test_cockpit_consent_sheet_page import _ConsentRig
 from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_sign_card import DESKTOP, TOK, needs_ssh
 from tests.test_consent_long_input_coverage_page import (
-    C_FULL, CARD, C_STATE, EVIL, FRAMES, FULL, INPUT, PHONE, SHEET, SUMMARY, _attack, _shots, first_view_counted, jump,
-    probed_drive, settled,
+    C_FULL, CARD, C_STATE, EVIL, FRAMES, FULL, INPUT, LATE_IO_MS, PHONE, SHEET, SUMMARY, _attack, _shots, first_view_counted,
+    io_probe, jump, probed_drive, settled,
     stepped)
 
 
@@ -263,13 +265,18 @@ def test_a_block_under_an_overlay_shows_only_what_is_not_covered(tmp_path, monke
 
 @needs_browser
 @needs_ssh
-def test_on_the_needs_card_a_jump_leaves_one_run_of_chunks_not_shown(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("late_ms", [0, LATE_IO_MS])
+def test_on_the_needs_card_a_jump_leaves_one_run_of_chunks_not_shown(tmp_path, monkeypatch, late_ms) -> None:
     """(f) The Needs-you card in the cockpit's modal: after a jump, the chunks not shown are one run (the skipped
-    middle), Allow is shut, and the line gives the count."""
+    middle), Allow is shut, and the line gives the count. The jump is made only once the gate has counted the view the
+    block opened on (`first_view_counted`): a jump made before it leaves that view uncounted for good, which is the
+    product failing closed and not a defect (CI red 11-13, `u0 == 0`). `late_ms` holds every observer callback that long
+    (the loaded box, made deterministic): at 250 the unwaited version of this drive fails every run."""
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
         out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            {"init": io_probe(late_ms)},
             DESKTOP, rig.authenticator(),
             {"until": "[...document.querySelectorAll('#ck-needs .needs-consent')].length >= 1", "ms": 30000},     # 0
             {"eval": "[...document.querySelectorAll('#ck-needs .needs-consent')].find(x => /Bash/.test(x.textContent))"
@@ -277,7 +284,7 @@ def test_on_the_needs_card_a_jump_leaves_one_run_of_chunks_not_shown(tmp_path, m
             {"until": f"{CARD}.querySelector('.long-text') && 1", "ms": 30000},                           # 2
             {"tap": f"{CARD}.querySelector('.long-whole > summary')"},                                    # 3
             {"until": f"{CARD}.querySelector('.long-text.open') && 1", "ms": 10000},                      # 4
-            {"eval": jump(C_FULL)},                                                                       # 5
+            {"eval": f"(async () => {{ await {first_view_counted(CARD)}; return await {jump(C_FULL)}; }})()"},  # 5
             {"eval": C_STATE},                                                                            # 6
             {"eval": f"(() => {{ const u = {CARD}.querySelector('.long-text').longUnshown(); "
                      f"return JSON.stringify({{n: u.length, run: u[u.length - 1] - u[0] + 1, u0: u[0], "
