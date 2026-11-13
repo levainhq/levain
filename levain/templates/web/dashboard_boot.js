@@ -794,8 +794,18 @@
     drop_refused: "The desk's store refused that line. Nothing was added.",
     bad_signature: "That signature was not accepted. Sign again.",
     sign_required: "That is sent only after your passkey signs it; nothing was sent. Send it again.",
-    credential_required: "Saving needs the write token for this page. Open the page from the link that carries it."
+    credential_required: "Saving needs the write token for this page. Open the page from the link that carries it.",
+    // the refusals of the List's two irreversible writes (the Keep, the band row to agenda): one fixed line each, true to the cause
+    // and to every place the server raises it; the server's own sentence is never shown (it can carry a raw exception)
+    needs_signature: "This row is settled by signing: sign it, or answer it on its own sheet in Decisions.",
+    rings_a_reminder: "This row rings a reminder, so it needs no agenda. Change the reminder itself.",
+    agenda_resolved: "The agenda made for this row is no longer open, so it cannot bring the row back. Answer the row in words instead.",
+    answer_refused: "The row was not answered. Reload the List and check it before trying again.",
+    keep_key_retired: "This item was kept before and that memory was deleted, so it cannot be kept again. Compost the item by hand."
   };
+  // The band row to agenda plants the agenda first and answers the row second, and answers source_unavailable (503) from the
+  // second act too: "Nothing was added." would then be false. So for this verb that code says what is known and what is safe.
+  const AGENDA_UNSURE = "The agenda may already be planted but the row was not closed. Reload the List and check; trying again is safe.";
   const SNOOZE_REFUSALS = new Set(["pick a time after now", "pick a later day", "pick a day: that date could not be read"]);
   // The List's band row to agenda refuses a day inside the snooze window in words that say what to do instead ("<day> is within the
   // snooze window (...): snooze the row instead; an agenda is for a day after <day>"). They are composed from the day and the window
@@ -818,6 +828,7 @@
         && SNOOZE_REFUSALS.has(d.message)) text = d.message;
     if (code === "bad_request" && r.status === 400 && what && what.verb === "band_agenda" && typeof d.message === "string"
         && AGENDA_DAY_REFUSAL.test(d.message)) text = d.message;
+    if (code === "source_unavailable" && what && what.verb === "band_agenda") text = AGENDA_UNSURE;
     if (REREAD.has(code) || r.status === 501) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);

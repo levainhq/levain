@@ -2484,10 +2484,12 @@
     results.after(host);
     let seq = 0, timer = 0;
     const clear = () => { host.hidden = true; host.replaceChildren(); };
-    // the kernel's own sentence about its search window is a note on the read; a memory that could not be read is a skipped line
+    // A fault is ONE fixed line: the server's text for it (a skipped line, a search error) and a transport's message can carry a
+    // path or an OS error, which the page never shows. The kernel's own sentence about its search window is a constant, so it stays.
+    const KEPT_FAULT = "memory could not be searched";
+    const keptUnread = (payload) => (Array.isArray(payload.skipped) ? payload.skipped : []).some((k) => k && typeof k.reason === "string" && /^kept memory/.test(k.reason));
     const keptWords = (payload) => {
-      const out = [];
-      for (const k of Array.isArray(payload.skipped) ? payload.skipped : []) if (k && typeof k.reason === "string" && /^kept memory/.test(k.reason)) out.push(k.reason);
+      const out = keptUnread(payload) ? [KEPT_FAULT] : [];
       const w = typeof payload.note === "string" ? /a search of memory reaches[^.]*\./.exec(payload.note) : null;
       if (w) out.push(w[0]);
       return out;
@@ -2513,7 +2515,7 @@
       const kept = (Array.isArray(payload.rows) ? payload.rows : []).filter((r) => r && r.facets && r.facets.surface === "kept");
       const words = keptWords(payload);
       if (payload.status === "error" || typeof payload.search_error === "string") {
-        host.appendChild(el("p", "err", "memory could not be searched — " + (payload.search_error || payload.error || "unavailable")));
+        host.appendChild(el("p", "err", KEPT_FAULT));
       } else if (kept.length) {
         const g = el("details", "list-kept-group");
         g.open = true;
@@ -3799,6 +3801,12 @@
     if (!Number.isFinite(d.getTime())) return iso;
     return d.toLocaleDateString([], { weekday: "short" }) + " " + d.toLocaleDateString([], { month: "short", day: "numeric" });
   }
+  // the day with its year, always: an agenda is not bound to the snooze window, so a year fat-fingered in the date box (2036) must not
+  // read like the day meant. (A snooze's day is within weeks, so its words stay yearless.)
+  function dayYearWords(iso) {
+    const d = new Date(iso.slice(0, 10) + "T00:00");
+    return Number.isFinite(d.getTime()) ? dayWords(iso) + ", " + d.getFullYear() : iso;
+  }
   // a snooze value is a day (YYYY-MM-DD) or a timed same-day-or-later pick (YYYY-MM-DDTHH:MM): the words name the minute
   // when the value carries one, so a timed pick never reads back as its date alone
   function dayTimeWords(iso) {
@@ -3945,8 +3953,8 @@
       openSurfaceForm(wrap, { next: null }, {
         label: "make agenda", dateOnly: true, min: localDayIso(1),
         post: async (v) => { const res = await intentionPost(s.row_id, "band_agenda", true)({ day: v }); listReceipt(res); return res; },
-        back: (v) => "comes back " + dayWords(v) + " as an agenda; this row is answered so the stopped agent waits",
-        done: (v) => "agenda for " + dayWords(v), stale: LIST_ROW_STALE })));
+        back: (v) => "comes back " + dayYearWords(v) + " as an agenda; this row is answered so the stopped agent waits",
+        done: (v) => "agenda for " + dayYearWords(v), stale: LIST_ROW_STALE })));
     return gateByActions(wrap, s.actions);
   }
   const hasBandAgenda = (actions) => !!commit && Array.isArray(actions) && actions.some((a) => a && a.verb === "band_agenda");
