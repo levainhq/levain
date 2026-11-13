@@ -1680,6 +1680,10 @@ def build_parser() -> argparse.ArgumentParser:
     from levain.upgrade import register as _register_upgrade
 
     _register_upgrade(subparsers)
+
+    from levain.desk.board_cli import register as _register_board
+
+    _register_board(subparsers)
     return parser
 
 
