@@ -263,39 +263,107 @@ def test_a_block_under_an_overlay_shows_only_what_is_not_covered(tmp_path, monke
     assert clear["shown"] > under["shown"] + 10, (under, clear)
 
 
+# CHUNKSREDFIX1 (1113-24, L3 r1 on CHUNKSRED). The jump drive below waits on the EXACT FACT its assertion needs, not on a
+# pipeline going quiet: before the jump, every chunk the page's own geometry puts wholly on screen is counted as shown;
+# after it, every chunk of the destination view is. Each wait is bounded INSIDE the page (a timer of its own, independent
+# of animation frames, so a throttled frame loop cannot starve it) and throws naming what never happened, with the probe's
+# counters, instead of leaving the driver's 60 s cut to say "no answer". The geometry is the test's own reading of the
+# page (the truth() rule above: inside the block's padding box and the viewport), never the gate's countability rule.
+HARSH_IO_MS = 600          # a hold well past LATE_IO_MS, the one that failed the unwaited drive every run
+COUNT_WAIT_MS = 20_000     # the in-page bound of each wait, so the named error comes before any outer cut
+VIEW = (f"const b = {CARD}.querySelector('.long-text'), f = {C_FULL}; "
+        "const whole = () => { const pr = f.getBoundingClientRect(); "
+        "const top = Math.max(0, pr.top + f.clientTop), bot = Math.min(innerHeight, pr.top + f.clientTop + f.clientHeight); "
+        "const out = []; [...f.querySelectorAll('.long-group > span')].forEach((c, i) => { const r = c.getBoundingClientRect(); "
+        "if (r.top >= top - 0.5 && r.bottom <= bot + 0.5) out.push(i); }); return out; }; "
+        # resolves with the chunks wholly on screen once they are all counted and the set held still for two polls; throws at ms
+        "const counted = async (what, ms) => { const t0 = performance.now(); let prev = ''; "
+        "for (;;) { const w = whole(), u = new Set(b.longUnshown()), miss = w.filter((i) => u.has(i)), k = w.join(','); "
+        "if (w.length > 0 && miss.length === 0 && k === prev) return w; prev = k; "
+        "if (performance.now() - t0 > ms) throw new Error('never counted: ' + what + ' ' + JSON.stringify({ms: ms, "
+        "whole: w.length, uncounted: miss.length, first_uncounted: miss.slice(0, 10), io: window.__io, "
+        "unseen: b.dataset.unseen, top: f.scrollTop})); "
+        "await new Promise((r) => setTimeout(r, 25)); } }; ")
+
+
+def first_view_chunks(ms: int = COUNT_WAIT_MS) -> str:
+    """Wait (bounded, in the page) until every chunk wholly on screen is counted as shown: the view the block opened on.
+    Keeps the set in `window.__first` and answers its size."""
+    return f"(async () => {{ {VIEW}window.__first = await counted('the view the block opened on', {ms}); return window.__first.length; }})()"
+
+
+def jump_and_destination(ms: int = COUNT_WAIT_MS) -> str:
+    """One step to the block's end, then wait (bounded, in the page) until every chunk wholly on screen there is counted.
+    Answers the two views, what is still unshown, the chunk total and how far the block scrolled."""
+    return (f"(async () => {{ {VIEW}f.scrollTop = f.scrollHeight; const last = await counted('the destination of the jump', {ms}); "
+            f"return JSON.stringify({{first: window.__first, last: last, unshown: b.longUnshown(), "
+            f"chunks: f.querySelectorAll('.long-group > span').length, top: f.scrollTop, max: f.scrollHeight - f.clientHeight}}); }})()")
+
+
+def _needs_card_open(rig, late_ms: int) -> list[dict]:
+    """The steps up to the Needs-you card's long text open in the modal, observers held `late_ms`."""
+    return [
+        {"init": io_probe(late_ms)},
+        DESKTOP, rig.authenticator(),
+        {"until": "[...document.querySelectorAll('#ck-needs .needs-consent')].length >= 1", "ms": 30000},         # 0
+        {"eval": "[...document.querySelectorAll('#ck-needs .needs-consent')].find(x => /Bash/.test(x.textContent))"
+                 ".click() || 1"},                                                                          # 1
+        {"until": f"{CARD}.querySelector('.long-text') && 1", "ms": 30000},                                  # 2
+        {"tap": f"{CARD}.querySelector('.long-whole > summary')"},                                           # 3
+        {"until": f"{CARD}.querySelector('.long-text.open') && 1", "ms": 10000},                             # 4
+    ]
+
+
 @needs_browser
 @needs_ssh
-@pytest.mark.parametrize("late_ms", [0, LATE_IO_MS])
+@pytest.mark.parametrize("late_ms", [LATE_IO_MS, HARSH_IO_MS])
 def test_on_the_needs_card_a_jump_leaves_one_run_of_chunks_not_shown(tmp_path, monkeypatch, late_ms) -> None:
-    """(f) The Needs-you card in the cockpit's modal: after a jump, the chunks not shown are one run (the skipped
-    middle), Allow is shut, and the line gives the count. The jump is made only once the gate has counted the view the
-    block opened on (`first_view_counted`): a jump made before it leaves that view uncounted for good, which is the
-    product failing closed and not a defect (CI red 11-13, `u0 == 0`). `late_ms` holds every observer callback that long
-    (the loaded box, made deterministic): at 250 the unwaited version of this drive fails every run."""
+    """(f) The Needs-you card in the cockpit's modal: after a jump, the chunks not shown are EXACTLY the skipped middle
+    (every chunk that is on screen at neither the top nor the end), one run; Allow is shut; the line gives the count.
+    The jump is made only once the view the block opened on is counted, and the assertions are read only once the
+    destination's view is: a jump made before leaves the first view uncounted for good, and a read before leaves the
+    destination uncounted, which is the product failing closed and not a defect (CI red 11-13, `u0 == 0`). `late_ms` holds
+    every observer callback that long (the loaded box, made deterministic); the unheld path is not parametrized here."""
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
         out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
-            {"init": io_probe(late_ms)},
-            DESKTOP, rig.authenticator(),
-            {"until": "[...document.querySelectorAll('#ck-needs .needs-consent')].length >= 1", "ms": 30000},     # 0
-            {"eval": "[...document.querySelectorAll('#ck-needs .needs-consent')].find(x => /Bash/.test(x.textContent))"
-                     ".click() || 1"},                                                                    # 1
-            {"until": f"{CARD}.querySelector('.long-text') && 1", "ms": 30000},                           # 2
-            {"tap": f"{CARD}.querySelector('.long-whole > summary')"},                                    # 3
-            {"until": f"{CARD}.querySelector('.long-text.open') && 1", "ms": 10000},                      # 4
-            {"eval": f"(async () => {{ await {first_view_counted(CARD)}; return await {jump(C_FULL)}; }})()"},  # 5
-            {"eval": C_STATE},                                                                            # 6
-            {"eval": f"(() => {{ const u = {CARD}.querySelector('.long-text').longUnshown(); "
-                     f"return JSON.stringify({{n: u.length, run: u[u.length - 1] - u[0] + 1, u0: u[0], "
-                     f"chunks: {C_FULL}.querySelectorAll('.long-group > span').length}}); }})()"},                                     # 7
+            *_needs_card_open(rig, late_ms),
+            {"eval": first_view_chunks()},                                                                # 5
+            {"eval": jump_and_destination()},                                                             # 6
+            {"eval": C_STATE},                                                                            # 7
         ])
     v = out["values"]
-    s = json.loads(v[6])
+    assert v[5] > 0, v[5]
+    j = json.loads(v[6])
+    assert j["top"] >= j["max"] - 1, j                                          # the jump reached the end of the block
+    first, last, unshown, chunks = j["first"], j["last"], j["unshown"], j["chunks"]
+    assert first and last and first[0] == 0 and last[-1] == chunks - 1, j      # the two views are the two ends
+    assert max(first) < min(last), j                                            # and they do not meet: there is a middle
+    middle = [i for i in range(chunks) if i not in set(first) and i not in set(last)]
+    assert unshown == middle, j                                                 # EXACTLY the middle, one run, derived from geometry
+    assert unshown == list(range(unshown[0], unshown[-1] + 1)), j
+    s = json.loads(v[7])
     assert s["allow"] is True and s["seen"] == "0" and "not yet shown" in s["line"], s
-    u = json.loads(v[7])
-    assert u["n"] == u["run"] and 0 < u["u0"] and u["n"] < u["chunks"], u
     assert rig.state(rid) == "pending"
+
+
+@needs_browser
+@needs_ssh
+def test_a_wait_on_a_count_that_never_comes_fails_named_and_bounded(tmp_path, monkeypatch) -> None:
+    """The never-arriving callback: every observer callback is held for 10**7 ms, so the gate counts nothing. The wait on
+    the first view ends at its own bound (2 s here) with an error that names what never happened and the probe's counters,
+    where an unbounded wait would sit until the driver's 60 s cut."""
+    rig = _ConsentRig(tmp_path, monkeypatch)
+    _attack(rig)
+    with rig.serving():
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            *_needs_card_open(rig, 10 ** 7),
+            {"eval": first_view_chunks(2000), "may_error": True},                                         # 5
+        ])
+    err = out["values"][5]
+    assert isinstance(err, dict) and "never counted: the view the block opened on" in err["error"], err
+    assert '"pending"' in err["error"] and '"uncounted"' in err["error"], err
 
 
 @needs_browser
