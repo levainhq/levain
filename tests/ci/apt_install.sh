@@ -66,7 +66,7 @@ if attempt "$@"; then
   exit 0
 fi
 
-echo "apt_install.sh: the update and the install of '$*' both failed, first as the runner configures apt and again on archive.ubuntu.com." >&2
+echo "apt_install.sh: the update and the install of '$*' both failed on both attempts, the second after the sources edit above (the grep lines above show which hosts the sources name now; a file that never named the Azure host was left as it was)." >&2
 if [ "$INSTALL_STATUS" -eq 124 ] || [ "$INSTALL_STATUS" -eq 137 ]; then
   echo "apt_install.sh: the install hit its time limit and was stopped (status $INSTALL_STATUS); it did not report a cause, so a stalled mirror or a stuck dpkg are both possible." >&2
 elif grep -Eqi 'Could not get lock|Unable to acquire the dpkg|dpkg was interrupted' "$INSTALL_LOG"; then

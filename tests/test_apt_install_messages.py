@@ -160,3 +160,14 @@ def test_a_held_dpkg_lock_is_named(run):
 def test_apt_output_still_reaches_the_log(run):
     r, _ = run("acl", update_rc=100, install_rc=100, install_out="E: Unable to locate package acl")
     assert "Unable to locate package acl" in (r.stdout + r.stderr)
+
+
+def test_the_closing_line_does_not_claim_the_second_attempt_ran_on_the_other_mirror(run):
+    """diogenes-20261112-021740: the sources edit may change nothing (a runner whose sources never named the Azure mirror; the stub
+    sed here is exactly that), and the script only prints what the sources name afterwards, so the closing line says what was
+    tried and observed, never that the retry ran on archive.ubuntu.com."""
+    r, calls = run("acl", update_rc=100, install_rc=100, install_out="E: Unable to locate package acl")
+    assert calls == ["update", "install", "update", "install"]
+    tail = r.stderr.split("retrying on archive.ubuntu.com", 1)[1]
+    assert "again on archive.ubuntu.com" not in tail
+    assert "both failed" in tail and "sources edit" in tail
