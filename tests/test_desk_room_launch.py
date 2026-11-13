@@ -94,6 +94,8 @@ for line in sys.stdin:
     except ValueError: continue
     if msg.get("type") != "user": continue
     text = msg["message"]["content"]
+    # a room line arrives with its context block ahead of his words; the fake reads his words
+    if text.startswith("<room-context>"): text = text.split("</room-context>\n\n", 1)[1]
     if mode == "silent": continue
     inits += 1
     if mode == "mode_flip" and inits > 1: mode = "bad_mode"
