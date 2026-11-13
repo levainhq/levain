@@ -306,23 +306,33 @@ for (const end = Date.now() + scaled(15000); Date.now() < end;) {
 const listedTarget = (t, id, extra) =>
   `listed, id=${id} type=${t.type}${extra} url=${JSON.stringify(String(t.url).slice(0, 120))} title=${JSON.stringify(String(t.title || "").slice(0, 60))}`;
 const targetState = async () => {
+  let connection = null;   // what the browser connection said when it could not answer; reported only when /json cannot answer either
   try {
     if (sharedPort && bws && ourTargetId) {
-      const r = await Promise.race([bsend("Target.getTargets"), sleep(2000).then(() => null)]);
-      if (!r) return "browser did not answer Target.getTargets within 2000ms";
-      if (r.error) return `browser answered Target.getTargets with an error: ${String(r.error.message || JSON.stringify(r.error)).slice(0, 120)}`;
-      const list = r.result?.targetInfos || [];
-      const t = list.find((x) => x.targetId === ourTargetId);
-      return t ? listedTarget(t, ourTargetId, ` attached=${t.attached}`) : `NOT LISTED (the page target is gone; the browser lists ${list.length} targets)`;
+      // a closed or never-open connection rejects the command: that arrives here as a value, so the /json path below still gets its turn
+      const r = await Promise.race([bsend("Target.getTargets").catch((e) => ({ thrown: e })), sleep(2000).then(() => null)]);
+      if (!r) connection = "browser did not answer Target.getTargets within 2000ms";
+      else if (r.thrown) connection = "browser connection failed: " + String(r.thrown && r.thrown.message || r.thrown).slice(0, 80);
+      else if (r.error) connection = `browser answered Target.getTargets with an error: ${String(r.error.message || JSON.stringify(r.error)).slice(0, 120)}`;
+      else {
+        const list = r.result?.targetInfos || [];
+        const t = list.find((x) => x.targetId === ourTargetId);
+        return t ? listedTarget(t, ourTargetId, ` attached=${t.attached}`) : `NOT LISTED (the page target is gone; the browser lists ${list.length} targets)`;
+      }
     }
     const httpPort = sharedPort || port;
     if (httpPort) {
-      const list = await (await fetch(`http://127.0.0.1:${httpPort}/json`, { signal: AbortSignal.timeout(2000) })).json();
-      const t = list.find((x) => x.id === ourTargetId);
-      return t ? listedTarget(t, ourTargetId, "") : `NOT LISTED (this drive's page target is not in the browser's list of ${list.length} targets)`;
+      try {
+        const list = await (await fetch(`http://127.0.0.1:${httpPort}/json`, { signal: AbortSignal.timeout(2000) })).json();
+        const t = list.find((x) => x.id === ourTargetId);
+        return t ? listedTarget(t, ourTargetId, "") : `NOT LISTED (this drive's page target is not in the browser's list of ${list.length} targets)`;
+      } catch (e) {
+        const why = "browser unreachable: " + String(e && e.message || e).slice(0, 80);
+        return connection ? `${connection}; /json also failed (${why})` : why;
+      }
     }
   } catch (e) { return "browser unreachable: " + String(e && e.message || e).slice(0, 80); }
-  return "no browser connection to ask";
+  return connection || "no browser connection to ask";
 };
 const timeoutBlock = async (shotPath) => {
   const quietMs = Date.now() - lastEventAt;   // taken before any await: the probe's own wait must not read as the page having spoken or being silent

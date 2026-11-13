@@ -73,7 +73,144 @@ def test_a_page_that_stops_answering_on_the_shared_chrome_is_still_listed_by_the
     assert r.returncode == 1 and "until never came true within 1500ms" in r.stderr, (r.returncode, r.stderr)
     _, _, block = r.stderr.partition("--- page state at the timeout ---")
     assert "PAGE URL: ?" in block, r.stderr                                           # the page did not answer: the premise of the test
-    assert re.search(r"TARGET: listed, id=[0-9A-F]{32} attached=\w+ url=about:blank#shared-hang-marker", block), r.stderr
+    assert re.search(r'^TARGET: listed, id=[0-9A-F]{32} type=page attached=\w+ url="about:blank#shared-hang-marker"', block, re.M), r.stderr
+
+
+class _ChromeProxy:
+    """A TCP proxy in front of the shared Chrome that fails the DRIVE's side of the browser connection when it sees Target.getTargets.
+
+    The Chrome behind it stays up and keeps the drive's context (the upstream half of the connection is only closed by `close()`), so
+    what is simulated is a browser connection that drops during a hang while the browser itself, and its /json listing, still answer.
+    mode "drop": the drive's socket is closed at once. mode "hold": the request is swallowed and the drive's socket is closed after
+    `delay` seconds, with every later browser command swallowed too, so the drive is still alive when the late close arrives.
+    `refuse_http`: once tripped, every other connection through the proxy (the /json listing included) is closed on its next bytes."""
+
+    def __init__(self, upstream: int, mode: str, delay: float = 2.5, refuse_http: bool = False) -> None:
+        self.upstream, self.mode, self.delay, self.refuse_http = upstream, mode, delay, refuse_http
+        self.tripped = False
+        self._socks: list[socket.socket] = []
+        self._srv = socket.socket()
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(16)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def close(self) -> None:
+        for s in [self._srv, *self._socks]:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                c, _ = self._srv.accept()
+            except OSError:
+                return
+            self._socks.append(c)
+            threading.Thread(target=self._serve, args=(c,), daemon=True).start()
+
+    @staticmethod
+    def _pump(src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while data := src.recv(65536):
+                dst.sendall(data)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _client_frames(buf: bytearray):
+        """The complete client-to-server websocket frames in `buf` as (raw, unmasked payload), consumed from it."""
+        while len(buf) >= 2:
+            n, off = buf[1] & 0x7F, 2
+            if n == 126 and len(buf) >= 4:
+                n, off = int.from_bytes(buf[2:4], "big"), 4
+            elif n == 127 and len(buf) >= 10:
+                n, off = int.from_bytes(buf[2:10], "big"), 10
+            elif n >= 126:
+                return
+            key = bytes(buf[off:off + 4]) if buf[1] & 0x80 else b""
+            end = off + len(key) + n
+            if len(buf) < end:
+                return
+            body = bytes(buf[off + len(key):end])
+            payload = bytes(b ^ key[i % 4] for i, b in enumerate(body)) if key else body
+            raw = bytes(buf[:end])
+            del buf[:end]
+            yield raw, payload
+
+    def _serve(self, c: socket.socket) -> None:
+        try:
+            up = socket.create_connection(("127.0.0.1", self.upstream), timeout=5)
+        except OSError:
+            c.close()
+            return
+        up.settimeout(None)
+        self._socks.append(up)
+        threading.Thread(target=self._pump, args=(up, c), daemon=True).start()
+        head, frames, browser, holding = bytearray(), bytearray(), None, False
+        try:
+            while data := c.recv(65536):
+                if browser is None:
+                    head += data
+                    end = head.find(b"\r\n\r\n")
+                    if end < 0:
+                        continue
+                    browser = b"/devtools/browser/" in bytes(head[:end])
+                    up.sendall(bytes(head[:end + 4]))
+                    data = bytes(head[end + 4:])
+                if not browser:
+                    if self.tripped and self.refuse_http:
+                        c.shutdown(socket.SHUT_RDWR)
+                        return
+                    up.sendall(data)
+                    continue
+                frames += data
+                for raw, payload in self._client_frames(frames):
+                    try:
+                        method = json.loads(payload).get("method")
+                    except ValueError:
+                        method = None
+                    if holding:
+                        continue
+                    if method == "Target.getTargets":
+                        self.tripped = True
+                        if self.mode == "drop":
+                            c.shutdown(socket.SHUT_RDWR)
+                            return
+                        holding = True
+                        threading.Timer(self.delay, lambda: self._cut(c)).start()
+                        continue
+                    up.sendall(raw)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _cut(c: socket.socket) -> None:
+        try:
+            c.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+@needs_browser
+@pytest.mark.parametrize("mode", ["drop", "hold"])
+def test_a_browser_connection_that_fails_during_a_hang_still_gets_the_target_listed_over_json(tmp_path: Path, shared_port: int, mode: str) -> None:
+    # The page is hung and the browser connection to the shared Chrome then fails (closed, or silent and closed after the diagnostic gave
+    # up on it). The browser still lists the page at /json, so the TARGET line must come from there; the protocol failure is worth
+    # reporting only when /json cannot answer either.
+    proxy = _ChromeProxy(shared_port, mode)
+    steps = [{"eval": "location.hash = '#shared-hang-marker'; setTimeout(() => { for (;;) {} }, 50); 1"}, {"until": "false", "ms": 1500}]
+    try:
+        r = _drive(tmp_path, steps, {"LEVAIN_DRIVE_CDP_PORT": str(proxy.port), "LEVAIN_TEST_WAIT_SCALE": "1"}, timeout=90)
+    finally:
+        proxy.close()
+    assert proxy.tripped, "the rig never saw Target.getTargets: the test would pass without exercising the failure"
+    assert r.returncode == 1 and "until never came true within 1500ms" in r.stderr, (r.returncode, r.stderr)
+    _, _, block = r.stderr.partition("--- page state at the timeout ---")
+    assert "PAGE URL: ?" in block, r.stderr                                           # the page did not answer: the premise of the test
+    assert re.search(r'^TARGET: listed, id=[0-9A-F]{32} type=page url="about:blank#shared-hang-marker"', block, re.M), r.stderr
 
 
 # ---- a shared Chrome that fails during setup: the drive still runs, on its own Chrome, within a bound --------------------------
@@ -261,3 +398,19 @@ def test_a_full_chrome_flag_never_starts_the_shared_chrome(monkeypatch, flag):
     calls.clear()
     monkeypatch.setenv(flag, "1")
     assert _page_drive_run._shared_env(argv) == {} and calls == []
+
+
+@needs_browser
+def test_a_browser_connection_and_a_json_listing_that_both_fail_report_both(tmp_path: Path, shared_port: int) -> None:
+    # The protocol failure is the word of last resort: when /json cannot answer either, the line names both, so a reader can tell a dead
+    # browser from a dropped connection.
+    proxy = _ChromeProxy(shared_port, "drop", refuse_http=True)
+    steps = [{"eval": "location.hash = '#shared-hang-marker'; setTimeout(() => { for (;;) {} }, 50); 1"}, {"until": "false", "ms": 1500}]
+    try:
+        r = _drive(tmp_path, steps, {"LEVAIN_DRIVE_CDP_PORT": str(proxy.port), "LEVAIN_TEST_WAIT_SCALE": "1"}, timeout=90)
+    finally:
+        proxy.close()
+    assert proxy.tripped, "the rig never saw Target.getTargets: the test would pass without exercising the failure"
+    assert r.returncode == 1 and "until never came true within 1500ms" in r.stderr, (r.returncode, r.stderr)
+    _, _, block = r.stderr.partition("--- page state at the timeout ---")
+    assert re.search(r"^TARGET: browser connection failed: .+; /json also failed \(browser unreachable: .+\)$", block, re.M), r.stderr
