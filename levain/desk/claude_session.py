@@ -80,7 +80,7 @@ ROOM_MCP_TOOL = "mcp__levain_room__propose_drop"
 ROOM_TOOLS = ("Read", "Grep", "Glob", "WebSearch")
 ROOM_DENIED_TOOLS = ("Bash", "Edit", "Write", "NotebookEdit", "WebFetch")
 # D2: the door's tool names a host may configure; the full name is what the vendor's init and --allowedTools carry
-ROOM_DOOR_NAMES = ("propose_drop", "relay_to_desk", "desk_replies")
+ROOM_DOOR_NAMES = ("propose_drop", "relay_to_desk", "desk_replies", "note_to_desk")
 
 
 def room_door_tools(names: Sequence[str] | None = None) -> tuple[str, ...]:

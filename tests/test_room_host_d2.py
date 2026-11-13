@@ -37,7 +37,26 @@ if mode == "relay":
 elif mode == "replies":
     open(rec, "a").write(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}) + "\\n")
     print("10:42 on it")
+elif mode == "note":
+    text = sys.stdin.read()
+    open(rec, "a").write(json.dumps({"argv": sys.argv[1:], "stdin": text}) + "\\n")
+    if "NOTEHANG" in text:
+        import os
+        open(rec + ".pid.tmp", "w").write(str(os.getpid()))
+        os.replace(rec + ".pid.tmp", rec + ".pid")
+        time.sleep(60)
+        open(rec + ".late", "w").write("filed after the door was gone")
+    if "NOTEFAIL" in text:
+        print("Not sent: the inbox did not take it (OSError).", file=sys.stderr)
+        sys.exit(1)
+    print("Sent to the desk; it reads it on its next poll.")
 """
+
+
+@pytest.fixture(autouse=True)
+def fresh_note_budget(monkeypatch):
+    """Each test starts with no notes counted against any launch (the count lives in the door's process)."""
+    monkeypatch.setattr(room_mcp, "_notes_sent", {}, raising=False)
 
 
 @pytest.fixture
@@ -47,7 +66,7 @@ def host(tmp_path):
     rec = tmp_path / "rec.jsonl"
     py = sys.executable
     h = HostCommands(relay=(py, str(script), "relay", str(rec)), replies=(py, str(script), "replies", str(rec), "--thread"),
-                     relay_without_tap=True)
+                     note=(py, str(script), "note", str(rec)), relay_without_tap=True)
     object.__setattr__(h, "rec", rec)      # the frozen dataclass has no slots: a plain attribute, for the test only
     return h
 
@@ -82,12 +101,16 @@ def test_no_host_is_exactly_the_old_door():
 
 
 def test_relay_without_tap_retires_the_card_tool_and_adds_replies(host):
-    assert names(host) == ["relay_to_desk", "desk_replies"]
+    assert names(host) == ["relay_to_desk", "desk_replies", "note_to_desk"]
+    assert names(HostCommands(relay=host.relay, replies=host.replies, relay_without_tap=True)) == \
+        ["relay_to_desk", "desk_replies"]
 
 
 def test_a_relay_the_host_did_not_free_of_the_tap_keeps_the_card(host):
     h = HostCommands(relay=host.relay, replies=host.replies, relay_without_tap=False)
     assert names(h) == ["propose_drop", "desk_replies"]
+    assert names(HostCommands(relay=host.relay, replies=host.replies, note=host.note)) == \
+        ["propose_drop", "desk_replies", "note_to_desk"]
     assert names(HostCommands(relay=host.relay)) == ["propose_drop"]
 
 
@@ -296,6 +319,216 @@ def test_replies_takes_no_other_argument(host, world):
     assert r["error"]["code"] == -32602
 
 
+# --- the seat-note (Room gap 3) ---------------------------------------------------------------------------------------
+PREFIX = "[from the Room] "
+
+
+def note_call(lid, host, arguments, rid=1):
+    return hcall(lid, host, arguments, "note_to_desk", rid)
+
+
+def test_the_note_tool_is_offered_only_when_the_host_gave_a_note(host, world):
+    plain = HostCommands(relay=host.relay, replies=host.replies, relay_without_tap=True)
+    assert "note_to_desk" not in names(plain)
+    r = note_call(world["launch"], plain, {"note": "hello"})
+    assert r["error"]["code"] == -32602 and "unknown tool" in r["error"]["message"]
+    assert names(HostCommands(note=host.note)) == ["propose_drop", "note_to_desk"]       # a note retires nothing
+    assert names(host)[-1] == "note_to_desk"
+
+
+def test_the_note_tool_has_one_argument_named_note_and_the_cap_leaves_room_for_the_prefix(host):
+    reply = room_mcp.handle(NOLAUNCH, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}, host)
+    (tool,) = [t for t in reply["result"]["tools"] if t["name"] == "note_to_desk"]
+    schema = tool["inputSchema"]
+    assert set(schema["properties"]) == {"note"} and schema["required"] == ["note"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["note"]["maxLength"] == room_host.NOTE_MAX - len(room_host.NOTE_PREFIX)
+    assert room_host.NOTE_MAX == 600 and room_host.NOTE_PREFIX == PREFIX
+
+
+def test_the_note_text_goes_on_stdin_with_the_room_prefix_and_never_in_argv(host, qdir, world):
+    r = note_call(world["launch"], host, {"note": "the build is green but two tests skip"})
+    assert r["result"]["isError"] is False, r
+    assert "desk" in r["result"]["content"][0]["text"]
+    (rec,) = recs(host)
+    assert rec["stdin"] == PREFIX + "the build is green but two tests skip"
+    assert rec["argv"] == ["note", str(host.rec)]            # the host's fixed argv, nothing the model named
+    assert "green" not in " ".join(rec["argv"])
+
+
+def test_the_prefixed_note_fits_the_scripts_cap_exactly(host, world):
+    """chat_to_desk.py counts the WHOLE stdin text against its 600, so prefix + note is what must fit."""
+    cap = room_host.NOTE_MAX - len(room_host.NOTE_PREFIX)
+    assert note_call(world["launch"], host, {"note": "n" * cap})["result"]["isError"] is False
+    (rec,) = recs(host)
+    assert len(rec["stdin"]) == room_host.NOTE_MAX
+
+
+def test_a_note_over_the_cap_is_refused_before_the_command_runs(host, world):
+    cap = room_host.NOTE_MAX - len(room_host.NOTE_PREFIX)
+    r = note_call(world["launch"], host, {"note": "n" * (cap + 1)})
+    assert r["error"]["code"] == -32602 and "over" in r["error"]["message"], r
+    assert not host.rec.exists()
+
+
+@pytest.mark.parametrize("key", ["text", "body", "message", "words", "content"])
+def test_the_note_tool_refuses_the_words_keys_even_beside_a_note(host, world, key):
+    for args in ({key: "mine"}, {"note": "ok", key: "mine"}):
+        r = note_call(world["launch"], host, args)
+        assert r["error"]["code"] == -32602, args
+    assert not host.rec.exists()
+
+
+@pytest.mark.parametrize("extra", [{"summary": "s"}, {"quote_ids": ["cm-x"]}, {"destination": "him"}, {"launch_id": "ln-" + "1" * 32}])
+def test_the_note_tool_takes_a_note_and_nothing_else(host, world, extra):
+    assert note_call(world["launch"], host, {"note": "ok", **extra})["error"]["code"] == -32602
+    assert not host.rec.exists()
+
+
+@pytest.mark.parametrize("bad", [None, 7, ["a"], {"a": 1}, "", "   ", " \t "])
+def test_a_note_must_be_non_empty_text(host, world, bad):
+    r = note_call(world["launch"], host, {"note": bad})
+    assert r["error"]["code"] == -32602
+    assert note_call(world["launch"], host, {})["error"]["code"] == -32602
+    assert not host.rec.exists()
+
+
+@pytest.mark.parametrize("ch", ["\x00", "\x07", "\x1b", "\n", "\r", "\t", "\x7f", "\x85", " ", " "])
+def test_a_note_with_a_control_character_is_refused(host, world, ch):
+    r = note_call(world["launch"], host, {"note": f"first{ch}second"})
+    assert r["error"]["code"] == -32602 and "control" in r["error"]["message"], r
+    assert not host.rec.exists()
+
+
+def test_a_note_needs_a_live_room_launch(host, store, qdir, world):
+    from levain.desk import lease
+
+    refused_note = lambda lid: note_call(lid, host, {"note": "x"})        # noqa: E731
+    r = refused_note(NOLAUNCH)
+    assert r["result"]["isError"] is True and "does not exist" in r["result"]["content"][0]["text"]
+    worker, _ = make_launch(store, qdir, world["thread"], role="worker", n=2)
+    r = refused_note(worker)
+    assert r["result"]["isError"] is True and "not a room launch" in r["result"]["content"][0]["text"]
+    with store._write() as (conn, now):
+        lease.end_launch(conn, now, world["launch"], "ended", "done")
+    r = refused_note(world["launch"])
+    assert r["result"]["isError"] is True and "ended, not active" in r["result"]["content"][0]["text"]
+    assert not host.rec.exists()
+
+
+def test_a_note_claims_nothing_and_repeats_are_harmless(host, qdir, world):
+    for _ in range(2):
+        assert note_call(world["launch"], host, {"note": "same note"})["result"]["isError"] is False
+    assert len(recs(host)) == 2 and relays(qdir) == []
+    # and it does not touch his messages: the relay of one still goes
+    assert hcall(world["launch"], host, {"quote_ids": [world["m1"]]}, "relay_to_desk")["result"]["isError"] is False
+    assert [x[0] for x in relays(qdir)] == ["sent"]
+
+
+def test_a_note_that_never_started_is_not_filed_and_one_that_ran_and_failed_is_unknown(host, world):
+    """L3 r1 (codex MED 2, complement LOW 5): a command that STARTED and exited non-zero may have filed the note before it
+    failed, so the door says delivery is unknown (the relay's wording), never "not filed"; only a command that never
+    started says "not filed"."""
+    r = note_call(world["launch"], host, {"note": "NOTEFAIL now"})
+    text = r["result"]["content"][0]["text"]
+    assert r["result"]["isError"] is True and "delivery unknown" in text and "inbox did not take it" in text, text
+    assert "not filed" not in text and "do not file it again" in text
+    r = note_call(world["launch"], HostCommands(note=("/nonexistent/prog",)), {"note": "x"})
+    text = r["result"]["content"][0]["text"]
+    assert r["result"]["isError"] is True and "not filed" in text and "unknown" not in text, text
+
+
+@pytest.mark.parametrize("ch", ["\ud800", "\udfff", "‮", "⁦", "​", "﻿", " ", ""])
+def test_a_note_with_a_character_he_cannot_see_is_refused(host, world, ch):
+    """L3 r1 (codex MED 3, deepseek 1 and 3, complement 3): a lone surrogate, a bidi control, a zero-width or other
+    invisible character is refused by the repo's one rule (levain.unshowable), and the refusal names it."""
+    r = note_call(world["launch"], host, {"note": f"first{ch}second"})
+    assert r["error"]["code"] == -32602, r
+    assert f"U+{ord(ch):04X}" in r["error"]["message"], r
+    assert not host.rec.exists()
+
+
+def test_an_escaped_lone_surrogate_off_the_wire_is_refused_never_sent_as_a_question_mark(host, world):
+    """REPRODUCED on db2df628d: ``{"note": "a\\uD800b"}`` passed the check and reached the command as ``a?b``."""
+    msg = json.loads('{"jsonrpc": "2.0", "id": 1, "method": "tools/call", '
+                     '"params": {"name": "note_to_desk", "arguments": {"note": "a\\ud800b"}}}')
+    r = room_mcp.handle(world["launch"], msg, host)
+    assert "error" in r and r["error"]["code"] == -32602, r
+    assert not host.rec.exists()
+
+
+def test_run_never_alters_its_input_a_text_utf8_cannot_carry_never_starts(tmp_path):
+    """The shared runner, for every tool: it encodes strictly, so a text with a lone surrogate is never sent with a
+    replacement character in its place; the command never starts, and nothing was delivered."""
+    mark = tmp_path / "ran"
+    s = tmp_path / "s.py"
+    s.write_text(f"import sys\nopen({str(mark)!r}, 'w').write(sys.stdin.read())\n")
+    code, out, started = room_host.run((sys.executable, str(s)), "a\ud800b")
+    assert (code, started) == (room_host.NOT_STARTED, False), (code, out)
+    assert not mark.exists()
+
+
+def test_a_words_key_on_the_note_tool_points_at_note_not_at_quote_ids(host, world):
+    """L3 r1 (complement LOW 2): the note tool's refusal of ``text`` names its own argument, not the relay's."""
+    msg = note_call(world["launch"], host, {"text": "mine"})["error"]["message"]
+    assert "note" in msg and "quote_ids" not in msg, msg
+    msg = hcall(world["launch"], host, {"text": "mine"}, "relay_to_desk")["error"]["message"]
+    assert "quote_ids" in msg, msg
+
+
+def test_a_room_launch_files_at_most_its_hourly_notes(host, world, monkeypatch):
+    """L3 r1 (complement MED): the host's own note budget is per SOURCE and shared with its other chat surfaces (flow: 6
+    an hour, with flowConnect), so a room seat in a loop could spend all of it. The door files at most NOTE_PER_HOUR
+    for one launch in any rolling hour and refuses the next, clearly, before the command runs."""
+    clock = [1000.0]
+    monkeypatch.setattr(room_mcp, "_clock", lambda: clock[0], raising=False)
+    for i in range(room_mcp.NOTE_PER_HOUR):
+        assert note_call(world["launch"], host, {"note": f"note {i}"})["result"]["isError"] is False
+    r = note_call(world["launch"], host, {"note": "one too many"})
+    text = r["result"]["content"][0]["text"]
+    assert r["result"]["isError"] is True and "no note was filed" in text and "hour" in text, text
+    assert len(recs(host)) == room_mcp.NOTE_PER_HOUR
+    clock[0] += 3600.5
+    assert note_call(world["launch"], host, {"note": "an hour on"})["result"]["isError"] is False
+    assert room_mcp.NOTE_PER_HOUR == 3
+
+
+def test_a_note_that_never_started_spends_none_of_the_budget(host, world):
+    gone = HostCommands(note=("/nonexistent/prog",))
+    for _ in range(room_mcp.NOTE_PER_HOUR + 1):
+        assert "not filed" in note_call(world["launch"], gone, {"note": "x"})["result"]["content"][0]["text"]
+    for i in range(room_mcp.NOTE_PER_HOUR):
+        assert note_call(world["launch"], host, {"note": f"n{i}"})["result"]["isError"] is False
+
+
+def test_the_note_argv_is_validated_like_the_others(tmp_path):
+    for bad in (("relative/prog",), (), "prog", ("/a", ""), ("/a", "b\x00")):
+        with pytest.raises(HostCommandError):
+            HostCommands(note=bad)
+    assert HostCommands(note=["/a", "b"]).note == ("/a", "b")
+
+
+def test_the_note_survives_the_environment_round_trip(host):
+    doc = json.loads(host.to_json())
+    assert doc["note"] == list(host.note)
+    assert json.loads(HostCommands(relay=host.relay).to_json())["note"] is None
+    assert room_host.from_env(json.dumps({"note": ["/a", "note"]})).note == ("/a", "note")
+
+
+def test_the_door_name_is_in_the_closed_list_and_in_the_argv():
+    assert "note_to_desk" in cs.ROOM_DOOR_NAMES
+    assert cs.room_door_tools(("propose_drop", "note_to_desk")) == ("mcp__levain_room__propose_drop",
+                                                                   "mcp__levain_room__note_to_desk")
+
+
+def test_the_digest_changes_by_itself_when_only_the_note_door_changes(host):
+    s, sha = json.dumps({"a": 1}), "0" * 64
+    without = HostCommands(relay=host.relay, replies=host.replies, relay_without_tap=True)
+    other = HostCommands(relay=host.relay, replies=host.replies, note=("/bin/other", "note"), relay_without_tap=True)
+    digests = {room_launch.containment_digest(s, sha, h) for h in (without, host, other)}
+    assert len(digests) == 3
+
+
 # --- the host's configuration -----------------------------------------------------------------------------------------
 @pytest.mark.parametrize("bad", [("relative/prog",), (), "prog", ("/a", ""), ("/a", "b\x00"), ["/a"] * 40, ("/a", 3)])
 def test_a_bad_argv_is_refused_at_construction(bad):
@@ -306,7 +539,7 @@ def test_a_bad_argv_is_refused_at_construction(bad):
 def test_the_environment_round_trip_and_a_malformed_value_is_refused(host):
     assert room_host.from_env(None) is None and room_host.from_env("") is None
     back = room_host.from_env(host.to_json())
-    assert (back.relay, back.replies, back.relay_without_tap) == (host.relay, host.replies, True)
+    assert (back.relay, back.replies, back.note, back.relay_without_tap) == (host.relay, host.replies, host.note, True)
     for bad in ("nope", "[]", '{"relay": ["/a"], "extra": 1}', '{"relay": ["rel"]}', '{"relay_without_tap": "yes"}'):
         with pytest.raises(HostCommandError):
             room_host.from_env(bad)
@@ -374,6 +607,87 @@ def test_a_program_popen_will_not_pass_never_started():
     assert (code, started) == (room_host.NOT_STARTED, False) and "could not start" in out
 
 
+def _gone(pid: int, within: float) -> bool:
+    """``pid`` is dead within ``within`` seconds: no such process, or a zombie (dead, its parent not yet reaping: a
+    stopped parent never does)."""
+    import subprocess
+    import time
+
+    end = time.monotonic() + within
+    while time.monotonic() < end:
+        stat = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        if not stat or stat.startswith("Z"):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _wait_for(path, within: float = 20.0) -> None:
+    import time
+
+    end = time.monotonic() + within
+    while not path.exists() and time.monotonic() < end:
+        time.sleep(0.05)
+    assert path.exists(), f"{path} never appeared"
+
+
+def test_a_hung_command_is_killed_at_its_bound_even_when_the_door_cannot_act(tmp_path):
+    """L3 r1 (codex HIGH 1), the shared runner (relay, replies and note all run through it): the timeout no longer lives
+    only in the door. A door that is stopped (it cannot run its own timer) still sees its command's group killed at the
+    bound plus the reaping grace. REPRODUCED on db2df628d: the command outlived the bound by the whole sleep."""
+    import os
+    import signal
+    import subprocess
+
+    pidf = tmp_path / "hang.pid"
+    hang = tmp_path / "hang.py"
+    hang.write_text(f"import os, time\nopen({str(pidf) + '.tmp'!r}, 'w').write(str(os.getpid()))\n"
+                    f"os.replace({str(pidf) + '.tmp'!r}, {str(pidf)!r})\ntime.sleep(60)\n")
+    runner = tmp_path / "runner.py"
+    runner.write_text(f"import sys\nfrom levain.desk import room_host\n"
+                      f"room_host.run((sys.executable, {str(hang)!r}), 'x', timeout=0.5)\n")
+    bound = 0.5 + room_host._REAP + room_host._WATCH_SLACK
+    door = subprocess.Popen([sys.executable, str(runner)], cwd=os.getcwd())
+    try:
+        _wait_for(pidf)
+        pid = int(pidf.read_text())
+        os.kill(door.pid, signal.SIGSTOP)
+        if not _gone(pid, bound + 4.0):
+            os.kill(pid, signal.SIGKILL)
+            pytest.fail("the hung command outlived its bound while the door could not act")
+    finally:
+        door.kill()
+        door.wait(10)
+
+
+def test_run_reaps_every_process_it_starts_and_releases_its_watchdog(tmp_path, monkeypatch):
+    """The watchdog that holds the bound is reaped on every path, and on a normal finish it is RELEASED (exit 0), never
+    left to kill a group the door already handled."""
+    import subprocess
+
+    made = []
+    real = subprocess.Popen
+
+    class Recording(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    monkeypatch.setattr(room_host.subprocess, "Popen", Recording)
+    ok = tmp_path / "ok.py"
+    ok.write_text("import sys\nprint(sys.stdin.read())\n")
+    bad = tmp_path / "bad.py"
+    bad.write_text("import sys\nsys.exit(3)\n")
+    slow = tmp_path / "slow.py"
+    slow.write_text("import time\ntime.sleep(5)\n")
+    assert room_host.run((sys.executable, str(ok)), "hi").code == 0
+    assert room_host.run((sys.executable, str(bad))).code == 3
+    assert room_host.run((sys.executable, str(slow)), timeout=0.3).code == room_host.TIMED_OUT
+    assert made and all(p.returncode is not None for p in made), [(p.args, p.returncode) for p in made]
+    dogs = [p for p in made if "-c" in p.args]
+    assert len(dogs) == 3 and [p.returncode for p in dogs[:2]] == [0, 0], [(p.args, p.returncode) for p in dogs]
+
+
 # --- containment: the argv, the probe, the digest ---------------------------------------------------------------------
 def test_argv_allows_exactly_the_hosts_door_tools(host):
     base = cs.room_argv(mcp_config="/r/m.json", settings="/r/s.json", session_id="s" * 8 + "-0000-4000-8000-" + "0" * 12)
@@ -382,7 +696,8 @@ def test_argv_allows_exactly_the_hosts_door_tools(host):
     h = cs.room_argv(mcp_config="/r/m.json", settings="/r/s.json", session_id="s" * 8 + "-0000-4000-8000-" + "0" * 12,
                      door_tools=room_host.door_tools(host))
     allowed = h[h.index("--allowedTools") + 1].split(",")
-    assert allowed == [*cs.ROOM_TOOLS, "mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies"]
+    assert allowed == [*cs.ROOM_TOOLS, "mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies",
+                       "mcp__levain_room__note_to_desk"]
     with pytest.raises(ValueError):
         cs.room_door_tools(("propose_drop", "Bash"))
     with pytest.raises(ValueError):
@@ -398,18 +713,21 @@ def _init(extra):
 
 def test_the_probe_wants_exactly_the_configured_tools(host):
     names_ = room_host.door_tools(host)
-    relay_init = _init(["mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies"])
+    relay_init = _init(["mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies",
+                        "mcp__levain_room__note_to_desk"])
     assert cs.open_probe(relay_init, names_).live
     assert not cs.open_probe(relay_init).live                                   # a door configured no host is not this one
     assert not cs.open_probe(_init([cs.ROOM_MCP_TOOL]), names_).live              # the retired card tool is EXTRA... and missing
     assert not cs.open_probe(_init(["mcp__levain_room__relay_to_desk"]), names_).live
+    assert not cs.open_probe(_init(["mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies"]), names_).live   # the note is configured, so it is wanted
     assert cs.open_probe(_init([cs.ROOM_MCP_TOOL])).live
 
 
 def test_the_tripwire_context_names_the_hosts_tools(host):
     ctx = room_launch.room_tripwire_context("/w", room_host.door_tools(host))
     tools = {t for t, _src in ctx.rule_allow}
-    assert tools == {*cs.ROOM_TOOLS, "mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies"}
+    assert tools == {*cs.ROOM_TOOLS, "mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies",
+                     "mcp__levain_room__note_to_desk"}
     assert {t for t, _src in room_launch.room_tripwire_context("/w").rule_allow} == {*cs.ROOM_TOOLS, cs.ROOM_MCP_TOOL}
 
 
@@ -474,13 +792,51 @@ def test_the_real_stdio_door_reads_the_hosts_commands_from_its_environment(host,
         tool(2, "relay_to_desk", {"quote_ids": [world["m1"]]}),
         tool(3, "desk_replies", {"thread": THREAD}),
         tool(4, "desk_replies", {"thread": "th-0abcdef-ffff00"}),
+        tool(5, "note_to_desk", {"note": "seen through the real door"}),
+        tool(6, "note_to_desk", {"note": "x", "text": "spoof"}),
     )) + "\n"
     out = subprocess.run([sys.executable, "-P", "-m", "levain.desk.room_mcp"],
                          input=msgs, capture_output=True, text=True, env=env, timeout=60)
     assert out.returncode == 0, out.stderr
     replies = [json.loads(x) for x in out.stdout.splitlines()]
-    assert [t["name"] for t in replies[0]["result"]["tools"]] == ["relay_to_desk", "desk_replies"]
+    assert [t["name"] for t in replies[0]["result"]["tools"]] == ["relay_to_desk", "desk_replies", "note_to_desk"]
     assert "relayed to the desk" in replies[1]["result"]["content"][0]["text"], replies[1]
     assert replies[2]["result"]["content"][0]["text"] == "10:42 on it"
     assert replies[3]["result"]["isError"] is True and "not a desk thread this room relayed to" in \
         replies[3]["result"]["content"][0]["text"]
+    assert replies[4]["result"]["isError"] is False, replies[4]
+    assert replies[5]["error"]["code"] == -32602
+    stdins = [json.loads(x)["stdin"] for x in host.rec.read_text().splitlines() if json.loads(x)["argv"][0] == "note"]
+    assert stdins == [PREFIX + "seen through the real door"]
+
+
+def test_a_note_command_dies_with_the_door_that_ran_it(host, qdir, world):
+    """L3 r1 (codex HIGH 1): the room ends while a note's command hangs. The room's end kills its Claude process group,
+    and the door with it; the command, in a group of its own, must not outlive the door and file the note later.
+    REPRODUCED on db2df628d: the door's timer died with the door and the command ran on."""
+    import os
+    import signal
+    import subprocess
+    from pathlib import Path
+
+    env = {**os.environ, room_host.HOSTCMD_ENV: host.to_json(), room_mcp.LAUNCH_ENV: world["launch"],
+           "PYTHONPATH": os.getcwd()}
+    call_ = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "note_to_desk", "arguments": {"note": "NOTEHANG a slow inbox"}}}
+    door = subprocess.Popen([sys.executable, "-P", "-m", "levain.desk.room_mcp"], stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    try:
+        door.stdin.write((json.dumps(call_) + "\n").encode())
+        door.stdin.flush()
+        pidf = Path(str(host.rec) + ".pid")
+        _wait_for(pidf)
+        pid = int(pidf.read_text())
+        door.kill()            # the room's end: SIGKILL, so the door runs no cleanup of its own
+        door.wait(10)
+        if not _gone(pid, 5.0):
+            os.kill(pid, signal.SIGKILL)
+            pytest.fail("the note command outlived the door that ran it")
+    finally:
+        if door.poll() is None:
+            door.kill()
+            door.wait(10)

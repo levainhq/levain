@@ -27,22 +27,33 @@ tools are ``relay_to_desk`` (which RETIRES ``propose_drop``: a call to it is "un
 operator's own messages and nothing else, CLAIMS the relay (``room_relay_claims``, committed
 before anything runs: each of his messages goes once per room, and a claim that may have delivered is never re-run), runs
 the host's argv with those words on STDIN, and records its one outcome (``room_relay_outcomes``). ``desk_replies`` reads
-only a thread a relay from this room was sent on, for a live room launch. The door runs only the host's argv; the model
-names a quote set and a thread id, never a program or an argument."""
+only a thread a relay from this room was sent on, for a live room launch. ``note_to_desk`` (any host with a ``note``
+command, independent of the relay) takes ONE argument, ``note``: the seat's own words, not his. The door checks the launch,
+refuses any character a person cannot see (:mod:`levain.unshowable`: control characters, newline and tab included,
+format characters, lone surrogates) and any text that, behind the fixed ``[from the Room] `` attribution it puts in
+front, would pass :data:`room_host.NOTE_MAX`, files at most :data:`NOTE_PER_HOUR` notes for its launch in any rolling
+hour, then runs the host's argv with that text on STDIN. A note claims nothing: it is information the seat wrote, and
+it never carries his direction; one whose command started and failed may still have landed, so the reply says delivery
+is unknown and not to file it again. The door runs only the host's argv; the model
+names a quote set and a thread id, or the text of a note, never a program or an argument."""
 from __future__ import annotations
 
 import json
 import re
 import sqlite3
 import sys
+import threading
+import time
 from typing import Any
 
+from levain import unshowable
 from levain.desk import room_host
 from levain.desk.room_host import HOSTCMD_ENV, THREAD_RE, HostCommandError, HostCommands
 from levain.consent.band_mcp import (INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
                                      _RpcError, _error, _ok)
 
-__all__ = ["TOOL", "RELAY_TOOL", "REPLIES_TOOL", "FRAME_MAX", "LAUNCH_ENV", "handle", "launch_from", "main", "serve"]
+__all__ = ["TOOL", "RELAY_TOOL", "REPLIES_TOOL", "NOTE_TOOL", "NOTE_PER_HOUR", "FRAME_MAX", "LAUNCH_ENV", "handle",
+           "launch_from", "main", "serve"]
 
 LAUNCH_ENV = "LEVAIN_ROOM_LAUNCH"
 
@@ -72,7 +83,8 @@ TOOL: dict[str, Any] = {
         "type": "object",
         "properties": {
             "quote_ids": {"type": "array", "minItems": 1, "items": {"type": "string"},
-                          "description": "Ids (cm-...) of the operator's own messages in this room, in order."},
+                          "description": "Ids (cm-...) of the operator's own messages in this room, in order. Each of "
+                                         "his messages reaches you with its id in the <room-context> block ahead of it."},
             "summary": {"type": "string", "description": "Why this is being proposed, in your own words."},
             "about": {"type": "string", "description": "Optional: a work thread id (th-...) it concerns."},
         },
@@ -106,6 +118,25 @@ REPLIES_TOOL: dict[str, Any] = {
         "type": "object",
         "properties": {"thread": {"type": "string", "description": "The thread id relay_to_desk gave (th-...)."}},
         "required": ["thread"],
+        "additionalProperties": False,
+    },
+}
+_NOTE_ARG_MAX = room_host.NOTE_MAX - len(room_host.NOTE_PREFIX)
+# [seat] notes one room launch may file in any rolling hour: half the host's own per-source budget (flow's is 6 an hour,
+# shared with flowConnect's notes), so a seat in a loop can never spend all of it
+NOTE_PER_HOUR = 3
+NOTE_TOOL: dict[str, Any] = {
+    "name": room_host.NOTE_TOOL,
+    "description": (
+        "File YOUR OWN note with the desk: analysis, context, what you saw, attributed to the Room seat and kept apart from "
+        "his words. Information only; it never carries his direction. Use it with relay_to_desk, not instead of it. One "
+        f"line of plain text, at most {_NOTE_ARG_MAX} characters; the desk is told it came from the Room. At most "
+        f"{NOTE_PER_HOUR} notes an hour."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"note": {"type": "string", "minLength": 1, "maxLength": _NOTE_ARG_MAX,
+                                "description": "Your own note, one line of plain text."}},
+        "required": ["note"],
         "additionalProperties": False,
     },
 }
@@ -159,7 +190,11 @@ def _refused(why: str) -> dict[str, Any]:
     return _text(f"levain room: refused, nothing was proposed: {why}", True)
 
 
-def _reject_spoofs_and_extras(raw: Any, allowed: frozenset) -> dict:
+_QUOTED_WORDS = "the words are the operator's quoted messages, named by quote_ids"
+
+
+def _reject_spoofs_and_extras(raw: Any, allowed: frozenset, words_are: str = _QUOTED_WORDS) -> dict:
+    """``words_are`` finishes the refusal of a words key: where this tool's words come from."""
     if not isinstance(raw, dict):
         raise _RpcError(INVALID_PARAMS, "arguments must be an object")
     spoof = sorted(k for k in raw if isinstance(k, str) and k.lower() in _IDENTITY_KEYS)
@@ -167,8 +202,7 @@ def _reject_spoofs_and_extras(raw: Any, allowed: frozenset) -> dict:
         raise _RpcError(INVALID_PARAMS, f"refused: a call never names its own launch or session ({', '.join(spoof)})")
     words = sorted(set(raw) & _WORDS_KEYS)
     if words:
-        raise _RpcError(INVALID_PARAMS, f"this door takes no words of its own ({', '.join(words)}): the words are the "
-                                        "operator's quoted messages, named by quote_ids")
+        raise _RpcError(INVALID_PARAMS, f"this tool takes no words under that name ({', '.join(words)}): {words_are}")
     extra = sorted(set(raw) - allowed)
     if extra:
         raise _RpcError(INVALID_PARAMS, f"this tool takes {', '.join(sorted(allowed))} only: not {', '.join(extra)}")
@@ -185,6 +219,35 @@ def _relay_arguments(raw: Any) -> list[str]:
     if not all(isinstance(i, str) and 0 < len(i) <= _ID_MAX and not _has_control(i) for i in ids):
         raise _RpcError(INVALID_PARAMS, "every quote id must be a short string")
     return list(ids)
+
+
+def _unseen(text: str) -> str | None:
+    """The first character in ``text`` a person cannot see, described (``U+2028 (LINE SEPARATOR) at character 3``), or
+    None. The repo's one rule (:mod:`levain.unshowable`), with nothing allowed: a control character of any kind,
+    newline and tab included, a line or paragraph separator, a format character (a bidi override, a zero-width one), a
+    lone surrogate, a private-use or unassigned code point, a space other than U+0020. A note is one line of text the
+    operator reads: nothing in it can start a line of its own, reorder or hide what he reads, or reach the command
+    altered (a lone surrogate cannot be encoded as it is)."""
+    return unshowable.describe(text, allow="")
+
+
+def _note_arguments(raw: Any) -> str:
+    """The note's text, shape-checked, trimmed of surrounding spaces. Its length counts the room's fixed attribution too,
+    because the host's command counts everything it is given."""
+    raw = _reject_spoofs_and_extras(raw, frozenset({"note"}), "a note's text is its one argument, note")
+    note = raw.get("note")
+    if not isinstance(note, str):
+        raise _RpcError(INVALID_PARAMS, "note must be a string")
+    unseen = _unseen(note)
+    if unseen is not None:
+        raise _RpcError(INVALID_PARAMS, "a note is one line of plain text: no control or invisible characters, not even a "
+                                        f"newline or tab ({unseen})")
+    note = note.strip()
+    if not note:
+        raise _RpcError(INVALID_PARAMS, "note is empty")
+    if len(note) > _NOTE_ARG_MAX:
+        raise _RpcError(INVALID_PARAMS, f"note is over {_NOTE_ARG_MAX} characters ({len(note)}); shorten it, it is never cut")
+    return note
 
 
 def _room_launch_refusal(conn: sqlite3.Connection, launch_id: str) -> str | None:
@@ -291,6 +354,69 @@ def _replies(launch_id: str, params: dict[str, Any], host: HostCommands) -> dict
     return _text(ran.out or f"No reply yet on {thread}.", False)
 
 
+def _note(launch_id: str, params: dict[str, Any], host: HostCommands) -> dict[str, Any]:
+    from levain.consent.queue import default_queue_dir
+    from levain.desk.envelopes import EnvelopeStore
+    from levain.desk.store import CoordError, StoreAbsent
+    from levain.dispatch.jobs import JobStoreError
+
+    note = _note_arguments(params.get("arguments"))
+    fail = lambda why: _text(f"levain room: refused, no note was filed: {why}", True)       # noqa: E731
+    try:
+        with EnvelopeStore(default_queue_dir())._write(create=False) as (conn, _now):
+            why = _room_launch_refusal(conn, launch_id)
+            if why is not None:
+                return fail(why)
+    except (CoordError, StoreAbsent) as exc:
+        return fail(str(exc))
+    except (sqlite3.Error, JobStoreError, OSError) as exc:
+        return fail(f"a machine fault ({type(exc).__name__}: {exc})")
+    # The launch was live when checked; it may end before the command finishes. The note still goes (it carries no
+    # direction), and the room's end kills the door and so, by its watchdog, the command (room_host.run).
+    # No claim and no outcome row: a note is the seat's own information. Only the count is kept, in this process.
+    stamp = _spend_note(launch_id)
+    if stamp is None:
+        return fail(f"this room has filed {NOTE_PER_HOUR} notes in the last hour, the most it may (the desk's note "
+                    "budget is shared with the operator's other surfaces); say the rest in the conversation, or wait")
+    ran = room_host.run(host.note, room_host.NOTE_PREFIX + note)
+    if not ran.started:
+        _refund_note(launch_id, stamp)
+        return _text(f"levain room: note not filed, nothing was delivered. {_command_fault(ran.code, ran.out)}.", True)
+    if ran.code:
+        return _text(f"levain room: delivery unknown. {_command_fault(ran.code, ran.out)}. The desk may have this note "
+                     "already; do not file it again.", True)
+    return _text(f"levain room: note filed with the desk. {' '.join(ran.out.split())[:300] or 'no output'}", False)
+
+
+_NOTE_WINDOW = 3600.0
+_clock = time.monotonic
+# launch id -> the clock readings of its notes that started a command in the last window (this door's process only: the
+# door is one per vendor session, bound to one launch)
+_notes_sent: dict[str, list[float]] = {}
+_notes_lock = threading.Lock()
+
+
+def _spend_note(launch_id: str) -> float | None:
+    """Reserve one of ``launch_id``'s notes for this hour: its stamp, or None when the hour's are spent."""
+    now = _clock()
+    with _notes_lock:
+        recent = [t for t in _notes_sent.get(launch_id, ()) if now - t < _NOTE_WINDOW]
+        if len(recent) >= NOTE_PER_HOUR:
+            _notes_sent[launch_id] = recent
+            return None
+        recent.append(now)
+        _notes_sent[launch_id] = recent
+    return now
+
+
+def _refund_note(launch_id: str, stamp: float) -> None:
+    """A note whose command never started delivered nothing: it spends nothing."""
+    with _notes_lock:
+        recent = _notes_sent.get(launch_id, [])
+        if stamp in recent:
+            recent.remove(stamp)
+
+
 def _propose(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
     from levain.consent.queue import default_queue_dir
     from levain.desk import lease, room
@@ -360,6 +486,8 @@ def handle(launch_id: str, msg: Any, host: HostCommands | None = None) -> dict[s
                 return _ok(rid, _relay(launch_id, params, host))
             if name == room_host.REPLIES_TOOL and host is not None and host.replies is not None:
                 return _ok(rid, _replies(launch_id, params, host))
+            if name == room_host.NOTE_TOOL and host is not None and host.note is not None:
+                return _ok(rid, _note(launch_id, params, host))
             raise _RpcError(INVALID_PARAMS, f"unknown tool {name[:60]!r}")
         raise _RpcError(METHOD_NOT_FOUND, f"method not found: {method[:60]}")
     except _RpcError as exc:
@@ -368,7 +496,8 @@ def handle(launch_id: str, msg: Any, host: HostCommands | None = None) -> dict[s
         return _error(rid, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
 
 
-_DEFS = {_NAME: TOOL, room_host.RELAY_TOOL: RELAY_TOOL, room_host.REPLIES_TOOL: REPLIES_TOOL}
+_DEFS = {_NAME: TOOL, room_host.RELAY_TOOL: RELAY_TOOL, room_host.REPLIES_TOOL: REPLIES_TOOL,
+         room_host.NOTE_TOOL: NOTE_TOOL}
 
 
 def _frames(stream: Any):
