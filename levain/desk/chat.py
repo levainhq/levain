@@ -2506,6 +2506,12 @@ class ChatService:
             return None
         return MessageThread(m.message_id, m.thread_id, m.launch_id, m.owner_epoch)
 
+    @property
+    def room_permission_mode(self) -> str:
+        """The permission mode a room launch of this service is expected to report (the constructor's
+        ``room_permission_mode``); the room's page hides the session's report of exactly this mode."""
+        return self._room_mode
+
     def session_meta(self, launch_id: str) -> SessionMeta | None:
         """C4: the attached session's meta as read once at :meth:`attach`, or None (no session, or a meta that could
         not be read then). No driver method runs: a poll costs one dict read."""
