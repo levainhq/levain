@@ -46,6 +46,21 @@ def test_dispatch_cannot_create_in_any_queue_directory(host):
 
 
 @pytest.mark.parametrize("host", HOSTS)
+def test_the_mode_is_set_after_the_owner_so_the_setgid_bit_survives(host):
+    """A chown clears the setgid bit of a directory it changes (Linux), so the mode step that sets 2750 must come
+    after the owner step; the other order leaves 0750 and a new answer file takes the operator's own group."""
+    from levain.slot.layout import row_steps
+
+    answers = STORE[host] / "queue" / "answers"
+    row = next(r for r in base_store_rows(host, "op") if r.path == answers)
+    why = [s.why for s in row_steps(host, [row])]
+    own = [i for i, w in enumerate(why) if w.startswith(f"own {answers} ")]
+    mode = [i for i, w in enumerate(why) if w.startswith(f"set {answers} to ")]
+    assert len(own) == 1 and len(mode) == 1, why
+    assert own[0] < mode[0], why
+
+
+@pytest.mark.parametrize("host", HOSTS)
 def test_answers_is_the_operators_to_write_and_the_brokers_to_read(host):
     row = next(r for r in base_store_rows(host, "op") if r.path == STORE[host] / "queue" / "answers")
     assert row.owner == "op"

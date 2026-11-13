@@ -2588,8 +2588,10 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
     """The ``queue answers`` row: the directory the operator's answers are written in must be the operator's, in the
     queue broker's group, mode 2750 (0750 only on macOS, where a new file takes the directory's group), so no other
     principal can create a file there. Exactly the old shape (the operator's, group levain-queue, mode 2770) works
-    and warns; any other shape fails. The mode bits do not show an ACL, and none is read. Read as the operator.
-    No row before the isolation install. ``lstat``/``qbroker_gid``/``legacy_gid``/``uid``: a test's seams."""
+    and warns; any other shape fails. The mode bits do not show an ACL, and none is read. The owner is the operator
+    the install record names (``policy/operator``), for every invoker; with no such record the row is neutral and says
+    so. No row before the isolation install. ``lstat``/``qbroker_gid``/``legacy_gid``/``uid``: a test's seams
+    (``uid`` is accepted for a caller's sake and does not change the row)."""
     name = "queue answers"
     if not hasattr(os, "getuid"):
         return []
@@ -2603,10 +2605,19 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
     store = store if store is not None else layout.STORE.get(host)
     if store is None or not (store / "policy").is_dir():
         return []
-    me = os.getuid() if uid is None else uid
-    if me == 0:
-        return [CheckResult(name, True, "not read: run as root, and the directory is the operator's to check",
-                            "Run `levain doctor` as the operator to see it.", neutral=True)]
+    # The directory belongs to the RECORDED operator, whoever runs doctor: root and an admin who is not the operator
+    # read the same row. Only an operator that cannot be established leaves the row unread, and it says why.
+    from levain.slot import Refused
+    from levain.slot.install_helper import parse_operator_record
+
+    try:
+        record = parse_operator_record((store / "policy" / "operator").read_bytes())
+    except (OSError, Refused) as exc:
+        why = "is missing" if isinstance(exc, FileNotFoundError) else "cannot be read"
+        return [CheckResult(name, True, f"not read: the operator record {store / 'policy' / 'operator'} {why}, so "
+                            "the operator whose answers directory this is cannot be established",
+                            "Run `levain upgrade`, then `levain doctor` again.", neutral=True)]
+    op_uid, op_name = int(record["uid"]), str(record["name"])  # type: ignore[call-overload]
     path = store / "queue" / "answers"
     try:
         st = (lstat or os.lstat)(path)
@@ -2617,7 +2628,7 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
         gid = (qbroker_gid or (lambda: grp.getgrnam("_levain_qbroker").gr_gid))()
     except KeyError:
         return [CheckResult(name, False, "there is no _levain_qbroker group, so no queue broker can read the "
-                            "operator's answers", f"Run `{layout.repair_line(host)}`.")]
+                            "operator's answers", "Run `levain upgrade`.")]
     try:
         legacy = (legacy_gid or (lambda: grp.getgrnam("levain-queue").gr_gid))()
     except KeyError:
@@ -2626,15 +2637,15 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
     # A new file takes the directory's group only where the directory is setgid (Linux) or always (BSD semantics).
     target_modes = (0o2750, 0o750) if host == "darwin" else (0o2750,)
     isdir = st_mod.S_ISDIR(st.st_mode)
-    if isdir and st.st_uid == me and st.st_gid == gid and mode in target_modes:
+    if isdir and st.st_uid == op_uid and st.st_gid == gid and mode in target_modes:
         acl = "the repair clears them with chmod -N" if host == "darwin" else "the repair does not remove them"
-        return [CheckResult(name, True, "only you can write the queue's answers; the queue broker reads them (ACLs "
-                            f"on the directory were not read; {acl})")]
-    if isdir and st.st_uid == me and legacy is not None and st.st_gid == legacy and mode == 0o2770:
+        return [CheckResult(name, True, f"only the operator ({op_name}) can write the queue's answers; the queue "
+                            f"broker reads them (ACLs on the directory were not read; {acl})")]
+    if isdir and st.st_uid == op_uid and legacy is not None and st.st_gid == legacy and mode == 0o2770:
         return [CheckResult(name, True, f"{path} is in the old shape (group levain-queue, 2770): it works, but dispatch "
                             "can still create files in the queue's answers directory (an answer is only ever trusted "
                             "by its signature)", "Run `levain upgrade`.", warn=True)]
-    return [CheckResult(name, False, f"{path} is not owner you, group _levain_qbroker, mode "
+    return [CheckResult(name, False, f"{path} is not owner {op_name} (the operator), group _levain_qbroker, mode "
                         f"{'2750 (or 0750)' if host == 'darwin' else '2750'}, and not the old shape either: the queue "
                         "broker may not be able to read your answers, or another principal can write them",
                         "Run `levain upgrade`.")]
