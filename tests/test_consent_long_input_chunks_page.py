@@ -19,7 +19,8 @@ from tests.test_cockpit_consent_sheet_page import _ConsentRig
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_sign_card import DESKTOP, TOK, needs_ssh
 from tests.test_consent_long_input_coverage_page import (
-    C_FULL, CARD, C_STATE, EVIL, FRAMES, FULL, INPUT, PHONE, SHEET, SUMMARY, _attack, _shots, jump, stepped)
+    C_FULL, CARD, C_STATE, EVIL, FRAMES, FULL, INPUT, PHONE, SHEET, SUMMARY, _attack, _shots, first_view_counted, jump,
+    stepped)
 
 
 # The truth, read by the test from the page itself, about which chunks are wholly on screen now: inside the block's
@@ -137,7 +138,7 @@ def test_a_jump_names_the_skipped_chunks_and_the_payload_is_among_them(tmp_path,
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"tap": SUMMARY},                                                                             # 2
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
-            {"eval": jump(FULL)},                                                                         # 4
+            {"eval": f"(async () => {{ await {first_view_counted(INPUT)}; return {jump(FULL)}; }})()"},   # 4
             {"eval": f"(async () => {{ {FRAMES}; const f = {FULL}; const sp = [...f.querySelectorAll('.long-group > span')]; "
                      f"const u = {INPUT}.longUnshown(); const at = f.textContent.indexOf({json.dumps(EVIL)}); "
                      f"let k = 0, hit = -1; sp.forEach((c, i) => {{ if (hit < 0 && at < k + c.textContent.length) hit = i; "
@@ -203,7 +204,7 @@ def test_a_block_partly_below_the_fold_shows_only_its_visible_part(tmp_path, mon
             {"eval": "(document.body.style.paddingTop = '620px', 1)"},                                   # 2
             {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
-            {"eval": f"(async () => {{ {FRAMES}; {FRAMES}; return 1; }})()"},                             # 5
+            {"eval": first_view_counted(INPUT)},                                                          # 5
             {"eval": truth(INPUT, FULL)},                                                                 # 6
             {"shot": str(shots / "fix3_2_sheet_block_below_the_fold_390.png")},                           # 7
             {"eval": f"(async () => {{ const p = {FULL}.getBoundingClientRect(); "
@@ -242,7 +243,7 @@ def test_a_block_under_an_overlay_shows_only_what_is_not_covered(tmp_path, monke
                      "document.body.appendChild(d); return 1; })()"},                                     # 2
             {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
-            {"eval": f"(async () => {{ {FRAMES}; {FRAMES}; return 1; }})()"},                             # 5
+            {"eval": first_view_counted(INPUT)},                                                          # 5
             {"eval": truth(INPUT, FULL, bar)},                                                            # 6
             {"shot": str(shots / "fix3_3_sheet_block_under_an_overlay_390.png")},                         # 7
             {"eval": f"(async () => {{ {bar}.remove(); {FULL}.scrollTop = 1; {FRAMES}; {FRAMES}; return 1; }})()"},  # 8
@@ -429,7 +430,7 @@ def test_without_a_visual_viewport_nothing_is_shown(tmp_path, monkeypatch) -> No
                      "String(window.visualViewport))"},                                                  # 2
             {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
-            {"eval": stepped(FULL, 0.8, down=True)},                                                      # 5
+            {"eval": stepped(FULL, 0.8, down=True, counts=False)},                                        # 5
             {"eval": f"(async () => {{ {FRAMES}; {FRAMES}; return JSON.stringify({{n: {INPUT}.longUnshown().length, "
                      f"state: JSON.parse({SHEET})}}); }})()"},                                              # 6
         ])

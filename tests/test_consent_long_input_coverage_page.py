@@ -38,22 +38,39 @@ SUMMARY = f"{INPUT}.querySelector('.long-whole > summary')"
 FRAMES = "await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(1))))"
 
 
-# FLAKES (1113-13): the gate learns what is on screen from an IntersectionObserver entry, delivered in a task AFTER the
-# rendering update that computed it, and probes the geometry at THAT moment (card_format.js, "a chunk the browser moved past
-# between two rendering updates ... stays not shown"). A step that sets the next scroll position after two animation frames
-# assumes the delivery lands inside them; on a loaded box it does not, and the chunks of a step the scroll left before the
-# entries arrived stay unshown for good (measured: a contiguous run of 50 chunks, 800 characters, still unseen 160 frames
-# later). The product's rule is right (it fails closed, scrolling back shows them); the test's pace was the defect. So a step
-# waits, up to 40 frames, until no chunk lying wholly in the block's view and in the window is still unshown.
-SETTLE = ("const settle = async () => { const box = f.closest('.long-text'); if (!box || !box.longUnshown) return; "
+# FLAKES (1113-13, SHEETFLAKE2 1113-19): the gate learns what is on screen from an IntersectionObserver entry, delivered in a
+# task AFTER the rendering update that computed it, and probes the geometry at THAT moment (card_format.js, "a chunk the
+# browser moved past between two rendering updates ... stays not shown"). A step that sets the next scroll position on a
+# fixed pace assumes the delivery lands inside it; on a loaded box it does not, and the chunks of a view the scroll left before
+# the entries arrived stay unshown for good (measured: a contiguous run of 50 chunks, 800 characters, still unseen 160 frames
+# later). The product's rule is right (it fails closed, scrolling back shows them); the test's pace was the defect. So a view
+# is left only once the gate has counted it: SETTLE waits until no chunk lying wholly in the block's view and in the window,
+# with nothing but the block's own text painted at its first line box's centre, is still unshown. That is the gate's own
+# count (`longUnshown()`), and it has NO early exit on "the same chunks for N frames": a late delivery looks exactly like a
+# chunk the gate never counts, so a stable count proves nothing. SETTLE_FRAMES only bounds a gate that never counts (the
+# step then throws, naming the chunks left); the opened top view is waited for before the FIRST step too. The window is the
+# block's padding box (clientTop, clientHeight): a chunk in its border or padding is clipped, and the gate never counts it.
+SETTLE_FRAMES = 300
+SETTLE = ("const settle = async () => { const box = f.closest('.long-text'); if (!box || !box.longUnshown) return 0; "
           "const sp = [...f.querySelectorAll('.long-group > span')]; "
-          "let prev = -1, still = 0; "
-          "for (let k = 0; k < 40; k++) { const fr = f.getBoundingClientRect(); "
-          "const lo = Math.max(fr.top, 0), hi = Math.min(fr.bottom, window.innerHeight); "
-          "const n = box.longUnshown().filter((i) => { const r = sp[i].getBoundingClientRect(); return r.top >= lo && r.bottom <= hi; }).length; "
-          # none left, or the same ones for 8 frames running: covered or clipped chunks the gate rightly never counts
-          "if (n === 0 || (n === prev && ++still >= 8)) return; if (n !== prev) still = 0; prev = n; "
-          f"{FRAMES}; }} }}; ")
+          "for (let k = 0; k < " + str(SETTLE_FRAMES) + "; k++) { const fr = f.getBoundingClientRect(); "
+          "const top = fr.top + f.clientTop, lo = Math.max(top, 0), hi = Math.min(top + f.clientHeight, window.innerHeight); "
+          "const n = box.longUnshown().filter((i) => { const r = sp[i].getBoundingClientRect(); if (!(r.top >= lo && r.bottom <= hi)) return false; "
+          "const q = sp[i].getClientRects()[0]; const h = q && document.elementFromPoint((q.left + q.right) / 2, (q.top + q.bottom) / 2); "
+          "return !!h && f.contains(h); }); "
+          "if (n.length === 0) return k; window.__left = n.slice(0, 3).map((i) => { const r = sp[i].getBoundingClientRect(); const q = sp[i].getClientRects()[0]; const h = document.elementFromPoint((q.left + q.right) / 2, (q.top + q.bottom) / 2); return {i: i, top: r.top, bottom: r.bottom, lo: lo, hi: hi, hit: h && (h.tagName + '.' + h.className), t: sp[i].textContent.slice(0, 20)}; }); "
+          f"{FRAMES}; }} return -1; }}; ")
+
+
+LATE_IO_MS = 250
+
+
+def late_observer(ms: int) -> str:
+    """Hold every IntersectionObserver callback the page gets by `ms` (set before the block opens: the gate makes its
+    observers at the first toggle). The entries are the browser's own, only late: the delivery a loaded box makes slow."""
+    return (f"(() => {{ const IO = window.IntersectionObserver; "
+            f"window.IntersectionObserver = class extends IO {{ constructor(cb, o) {{ "
+            f"super((es, ob) => setTimeout(() => cb(es, ob), {ms}), o); }} }}; return 1; }})()")
 
 
 def first_view_counted(root: str) -> str:
@@ -70,18 +87,26 @@ def jump(full: str) -> str:
     return f"(async () => {{ const f = {full}; f.scrollTop = f.scrollHeight; {FRAMES}; return f.scrollTop; }})()"
 
 
-def stepped(full: str, frac: float, down: bool, *, until: float | None = None) -> str:
-    """Scroll the block in steps of ``frac`` of its own height (down to its end, or up to its top), two frames between
-    steps; ``until``: stop once scrollTop passes that fraction of the scroll range. Answers {n, max, ch}: how many steps,
-    the largest one taken and the block's height, so a test can check no step jumped past a view."""
+def stepped(full: str, frac: float, down: bool, *, until: float | None = None, counts: bool = True) -> str:
+    """Scroll the block in steps of ``frac`` of its own height (down to its end, or up to its top), waiting after each step
+    (and before the first) until the gate has counted the view it is on (SETTLE). ``until``: stop once scrollTop passes that
+    fraction of the scroll range. Answers {n, max, ch, w}: how many steps, the largest one taken and the block's height,
+    so a test can check no step jumped past a view; ``w`` the most frame pairs one wait took. A wait that runs out its bound
+    with a countable chunk still unshown throws (the gate is not counting what it shows); ``counts=False`` is for a drive
+    whose gate counts nothing by construction (no visualViewport): it keeps the old pace of two frames a step."""
     stop = "" if until is None else f"if (f.scrollTop >= (f.scrollHeight - f.clientHeight) * {until}) break; "
     return (f"(async () => {{ const f = {full}; const d = Math.max(1, Math.floor(f.clientHeight * {frac})); "
             f"{SETTLE}"
-            f"let n = 0, max = 0; for (;;) {{ {stop}const t = f.scrollTop; "
+            f"let n = 0, max = 0, w = 0; "
+            f"const wait = async () => {{ {'' if counts else 'return; '}const k = await settle(); "
+            f"if (k < 0) throw new Error('stepped: the gate counted no further view in {SETTLE_FRAMES} frame pairs: ' + "
+            f"JSON.stringify({{top: f.scrollTop, unseen: f.closest('.long-text').dataset.unseen, left: window.__left}})); w = Math.max(w, k); }}; "
+            f"await wait(); "
+            f"for (;;) {{ {stop}const t = f.scrollTop; "
             f"const want = {'Math.min(f.scrollHeight - f.clientHeight, t + d)' if down else 'Math.max(0, t - d)'}; "
-            f"if (Math.abs(want - t) < 0.5 || n > 4000) break; f.scrollTop = want; {FRAMES}; await settle(); "
+            f"if (Math.abs(want - t) < 0.5 || n > 4000) break; f.scrollTop = want; {FRAMES}; await wait(); "
             f"max = Math.max(max, Math.abs(f.scrollTop - t)); n += 1; if (f.scrollTop === t) break; }} "
-            f"return JSON.stringify({{n: n, max: max, ch: f.clientHeight}}); }})()")
+            f"return JSON.stringify({{n: n, max: max, ch: f.clientHeight, w: w}}); }})()")
 
 
 def state(allow: str, line: str, root: str, full: str) -> str:
@@ -204,6 +229,31 @@ def test_a_scroll_to_the_end_in_steps_under_a_view_opens_allow_and_signs(tmp_pat
     assert end["allow"] is False and end["seen"] == "1", end
     assert str(v[11]).startswith("signed (allow)"), v[11]
     assert rig.state(rid) == "allowed"
+
+
+@needs_browser
+@needs_ssh
+def test_a_late_observer_delivery_does_not_make_a_stepped_scroll_skip_a_view(tmp_path, monkeypatch) -> None:
+    """The loaded-box race made deterministic (SHEETFLAKE2, 1113-19), no CPU load: every IntersectionObserver callback the
+    page gets is held for LATE_IO_MS. A stepped scroll that does not wait for the gate's own count leaves the top view, or a
+    step's view, for good: the sheet's Allow stays shut and the CI red (`step 12: tap found no element`) is this shape."""
+    rig = _ConsentRig(tmp_path, monkeypatch)
+    rid = _attack(rig)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
+            {"eval": late_observer(LATE_IO_MS)},                                                          # 2
+            {"tap": SUMMARY},                                                                             # 3
+            {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
+            {"eval": stepped(FULL, 0.8, down=True)},                                                      # 5
+            {"eval": SHEET},                                                                              # 6
+        ])
+    v = out["values"]
+    assert v[2] == 1, v[2]
+    s = json.loads(v[5])
+    assert s["n"] >= 1 and s["max"] <= s["ch"], s
+    end = json.loads(v[6])
+    assert end["allow"] is False and end["seen"] == "1" and end["unseen"] == 0, end
 
 
 @needs_browser
