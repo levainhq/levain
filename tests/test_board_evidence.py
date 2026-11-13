@@ -1141,3 +1141,273 @@ def test_a_chain_ref_whose_fork_point_main_does_not_hold_marks_the_chain_unreada
     ev, _ = read(world)
     assert {"chain", "branches", "unattributed"} <= set(ev["unreadable"]) and "chain" not in ev
     assert "main" in ev and "main" not in ev["unreadable"]
+
+
+# ================================================================================================ B2 L3 round 2 fixes (1113-1)
+import threading   # noqa: E402  (this section is the L3 round 2 fixes; the import rides with it)
+
+
+def _after_nth_log(monkeypatch, nth: int, act) -> None:
+    """The race of a concurrent writer: after the reader's ``nth`` `git log`, ``act(repo)`` runs."""
+    real = be._git
+    calls = {"log": 0}
+
+    def hook(repo, *args, **kw):
+        out = real(repo, *args, **kw)
+        if args[:1] == ("log",):
+            calls["log"] += 1
+            if calls["log"] == nth:
+                act(repo)
+        return out
+
+    monkeypatch.setattr(be, "_git", hook)
+
+
+# ------------------------------------------------------------------------------------------------ 1. the notes ref, once
+def _noted_branch(world, name="seat/1112-40-a"):
+    world.branch(name)
+    b = world.commit("own", file="own.txt")                        # no trailer: only the note attributes it
+    git(world.w, "notes", "--ref=board", "add", "-m", "Board-Item: levain#7", b)
+    world.push(name)
+    return b
+
+
+def test_a_notes_ref_that_moves_after_the_snapshot_is_the_same_notes_for_every_log(world, monkeypatch):
+    """codex OPEN 2: the notes ref was read by name on every log, so a notes fetch between the main log and the branch log
+    gave the two reads different notes."""
+    _noted_branch(world)
+    _after_nth_log(monkeypatch, 1, lambda repo: git(repo, "update-ref", "-d", "refs/notes/board"))
+    ev, _ = read(world)
+    assert [b["items"] for b in ev["branches"]] == [["levain#7"]]
+
+
+def test_a_notes_ref_created_after_the_snapshot_is_not_seen_by_a_later_log(world, monkeypatch):
+    """An absent notes ref stays absent for the whole read."""
+    name = "seat/1112-40-i7-a"
+    world.branch(name)
+    b = world.commit("own", trailers=("Board-Item: levain#7",), file="own.txt")
+    world.push(name)
+    _after_nth_log(monkeypatch, 1, lambda repo: git(repo, "notes", "--ref=board", "add", "-m", "Board-Item: levain#98\nBoard-Closes: levain#99", b))
+    assert branch(read(world)[0], name)["items"] == ["levain#7"]
+
+
+def test_only_the_snapshot_names_the_notes_ref(world, monkeypatch):
+    """The invariant 'every ref once, then shas only' as an observable: one call names refs/notes/board, the for-each-ref."""
+    _noted_branch(world)
+    seen: list[tuple[str, ...]] = []
+    real = be._run
+
+    def spy(repo, *args, **kw):
+        seen.append(args)
+        return real(repo, *args, **kw)
+
+    monkeypatch.setattr(be, "_run", spy)
+    ev, _ = read(world)
+    assert [a[0] for a in seen if any("refs/notes" in x for x in a)] == ["for-each-ref"]
+    assert [b["items"] for b in ev["branches"]] == [["levain#7"]]
+
+
+def test_a_fanned_out_notes_tree_is_read(world):
+    """git fans a big notes tree out into `ab/cdef...` paths; the reader reads the notes tree itself, so it must follow that."""
+    name = "seat/1112-40-a"
+    world.branch(name)
+    b = world.commit("own", file="own.txt")
+    world.push(name)
+    blob = git(world.w, "hash-object", "-w", "--stdin", stdin="Board-Item: levain#7\n")
+    sub = git(world.w, "mktree", stdin=f"100644 blob {blob}\t{b[2:]}\n")
+    root = git(world.w, "mktree", stdin=f"040000 tree {sub}\t{b[:2]}\n")
+    git(world.w, "update-ref", "refs/notes/board", git(world.w, "commit-tree", root, "-m", "notes"))
+    assert [x["items"] for x in read(world)[0]["branches"]] == [["levain#7"]]
+
+
+# ------------------------------------------------------------------------------------------------ 2. FETCH_HEAD, not through a link
+def test_a_symlinked_fetch_head_is_no_witness(world, tmp_path):
+    """codex MED: a FETCH_HEAD that is a link to a regular file with a matching line and a recent mtime read as a fresh fetch."""
+    _no_reflog_witness(world)
+    fh = world.w / ".git" / "FETCH_HEAD"
+    real = tmp_path / "real_fetch_head"
+    real.write_text(fh.read_text())
+    fh.unlink()
+    fh.symlink_to(real)
+    assert "fetched_at" not in read(world)[0]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo on this platform")
+def test_a_fifo_named_fetch_head_is_no_witness_and_does_not_block(world):
+    """complement LOW: open() on a FIFO blocks before any regular-file check."""
+    _no_reflog_witness(world)
+    fh = world.w / ".git" / "FETCH_HEAD"
+    fh.unlink()
+    os.mkfifo(fh)
+    out: dict = {}
+    t = threading.Thread(target=lambda: out.update(ev=read(world)[0]), daemon=True)
+    t.start()
+    t.join(10)
+    if t.is_alive():
+        os.close(os.open(fh, os.O_WRONLY | os.O_NONBLOCK))          # release the blocked open, so the worker thread ends
+        t.join(5)
+        pytest.fail("the reader blocked on a FIFO named FETCH_HEAD")
+    assert "fetched_at" not in out["ev"]
+
+
+# ------------------------------------------------------------------------------------------------ 3. a reverted merge
+def _merged_close(world):
+    """root -> side: c (closes levain#1) / main: m1 (closes levain#2) -> M = `git merge --no-ff side`."""
+    git(world.w, "checkout", "-q", "-b", "side")
+    c = world.commit_raw("close it\n\nBoard-Item: levain#1\nBoard-Closes: levain#1", file="c.txt", body="C\n", date="2026-11-12T11:00:00Z")
+    git(world.w, "checkout", "-q", "main")
+    m1 = world.commit("main work", trailers=("Board-Closes: levain#2",), date="2026-11-12T12:00:00Z")
+    git(world.w, "merge", "-q", "--no-ff", "-m", "merge side", "side", date="2026-11-12T13:00:00Z")
+    return c, m1, git(world.w, "rev-parse", "HEAD")
+
+
+def _closers(world) -> set[str]:
+    world.push_main()
+    return {r["sha"] for r in read(world)[0]["main"]}
+
+
+def test_the_revert_of_a_merge_takes_back_the_work_the_merge_brought_in(world):
+    """complement MED: `git revert -m 1 M` is the usual way to undo a merge; M carries no trailers, the side commit does."""
+    c, m1, merge = _merged_close(world)
+    assert _closers(world) == {c, m1}
+    git(world.w, "revert", "--no-edit", "-m", "1", merge, date="2026-11-12T14:00:00Z")
+    assert _closers(world) == {m1}
+
+
+def test_the_revert_of_the_revert_of_a_merge_puts_the_work_back(world):
+    c, m1, merge = _merged_close(world)
+    git(world.w, "revert", "--no-edit", "-m", "1", merge, date="2026-11-12T14:00:00Z")
+    git(world.w, "revert", "--no-edit", "HEAD", date="2026-11-12T15:00:00Z")
+    assert _closers(world) == {c, m1}
+
+
+def test_reverting_a_merge_against_its_second_parent_takes_back_the_other_side(world):
+    """`-m 2` keeps the side branch as the mainline: what the merge brought in is then main's own work (m1)."""
+    c, m1, merge = _merged_close(world)
+    git(world.w, "revert", "--no-edit", "-m", "2", merge, date="2026-11-12T14:00:00Z")
+    assert _closers(world) == {c}
+
+
+def test_a_branch_carrying_the_work_of_a_reverted_merge_is_ahead_not_landed(world):
+    """The same class in the matcher: a landing a merge-revert took back is not landed work."""
+    name = "seat/1112-40-i7-a"
+    root = git(world.w, "rev-parse", "HEAD")
+    _c, _m1, merge = _merged_close(world)
+    git(world.w, "checkout", "-q", "-B", name, root)
+    world.commit_raw("again\n\nBoard-Item: levain#7", file="c.txt", body="C\n", date="2026-11-12T16:00:00Z")      # the same patch as c
+    world.push(name)
+    git(world.w, "checkout", "-q", "main")
+    world.push_main()
+    assert branch(read(world)[0], name)["ahead"] == 0                                    # control: while the merge stands, c holds it
+    git(world.w, "revert", "--no-edit", "-m", "1", merge, date="2026-11-12T17:00:00Z")
+    world.push_main()
+    assert branch(read(world)[0], name)["ahead"] == 1
+
+
+# ------------------------------------------------------------------------------------------------ 4. a canonical revert marker
+@pytest.mark.parametrize("message", [
+    "docs: an example\n\nThis reverts commit <C>. This is only an example",              # prose after the sha
+    'Revert "close it"\n\nThis reverts commit <C>. This is only an example',            # the right subject, prose after the sha
+    "tidy up\n\nThis reverts commit <C>.",                                                # the generated line, not a revert subject
+    'Revert "close it"\n\nThis reverts commit <C>',                                       # no period
+    'Revert "close it"\n\nThis reverts commit <c12>.',                                    # a short sha (known edge: fails open)
+    'Revert "close it"\n\nThis reverts commit <CU>.',                                     # an upper-case sha (known edge)
+    'Revert "close it"\n\nsee: This reverts commit <C>.',                                  # not at the start of a line
+])
+def test_a_message_that_merely_says_the_phrase_is_not_a_revert(world, message):
+    """codex HIGH 1: only git's own generated line, under a Revert subject, counts."""
+    c = world.commit("close it", trailers=("Board-Closes: levain#1",))
+    world.commit_raw(message.replace("<C>", c).replace("<c12>", c[:12]).replace("<CU>", c.upper()), file="d.txt")
+    world.push_main()
+    assert [r["sha"] for r in read(world)[0]["main"]] == [c]
+
+
+@pytest.mark.parametrize("message", [
+    'Revert "close it"\n\nThis reverts commit <C>.',
+    'Revert "close it"\n\nThis reverts commit <C>.\n\nThis reverts commit <C>.',      # the same marker twice is one marker
+    'Revert "Merge branch x"\n\nThis reverts commit <C>, reversing\nchanges made to <P>.',      # the merge form git writes
+    'Revert "Merge branch x"\n\nThis reverts commit <C>, reversing changes made to <P>.',       # the same on one line
+])
+def test_the_canonical_forms_are_reverts(world, message):
+    c = world.commit("close it", trailers=("Board-Closes: levain#1",))
+    p = git(world.w, "rev-parse", f"{c}^")
+    world.commit_raw(message.replace("<C>", c).replace("<P>", p), file="d.txt")
+    world.push_main()
+    assert read(world)[0]["main"] == []
+
+
+def test_a_commit_carrying_two_revert_markers_reverts_neither(world):
+    """codex HIGH 1: a squash of reverts is ambiguous."""
+    a = world.commit("a", trailers=("Board-Closes: levain#1",))
+    b = world.commit("b", trailers=("Board-Closes: levain#2",))
+    world.commit_raw(f'Revert "a"\n\nThis reverts commit {a}.\n\nThis reverts commit {b}.\n', file="sq.txt")
+    world.push_main()
+    assert {r["sha"] for r in read(world)[0]["main"]} == {a, b}
+
+
+# ------------------------------------------------------------------------------------------------ 5. the boundary, per tip
+def _cut_main(world, monkeypatch):
+    """A main of root + old2 + old3 + new1 + new2 read with a cap of 3: the log keeps new2, new1, old3, old2 (a real old tail
+    of 2) and OMITS root, the commit a branch may have forked from."""
+    monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
+    monkeypatch.setattr(be, "MIN_PREWINDOW_TAIL", 2)
+    root = git(world.w, "rev-parse", "HEAD")
+    world.commit("old2", date=OLD)
+    world.commit("old3", date=OLD)
+    new1 = world.commit("new1", date="2026-11-12T10:00:00Z")
+    world.commit("new2", date="2026-11-12T11:00:00Z")
+    world.push_main()
+    return root, new1
+
+
+def _two_tips(world, name, origin_base, local_base):
+    """`name` with an origin copy forked from ``origin_base`` and a local head forked from ``local_base``: diverged."""
+    world.branch(name, origin_base)
+    world.commit("remote own", trailers=("Board-Item: levain#7",), file="r.txt")
+    world.push(name)
+    git(world.w, "checkout", "-q", "-B", name, local_base)
+    world.commit("local own", trailers=("Board-Item: levain#7",), file="l.txt")
+    git(world.w, "checkout", "-q", "main")
+
+
+def test_a_diverged_branch_one_of_whose_tips_forked_from_a_commit_main_does_not_hold_is_unreadable(world, monkeypatch):
+    """codex HIGH 2: one tip reaches retained history, the other forked at the omitted root: the COMBINED boundary was
+    nonempty, so the second tip was never checked and was classified against the wrong pool."""
+    root, new1 = _cut_main(world, monkeypatch)
+    _two_tips(world, "seat/1112-40-i7-a", new1, root)
+    ev, _ = read(world)
+    assert {"chain", "branches", "unattributed"} <= set(ev["unreadable"]) and "branches" not in ev
+    assert "main" in ev and "main" not in ev["unreadable"]
+
+
+def test_a_diverged_branch_both_of_whose_tips_reach_retained_history_reads(world, monkeypatch):
+    _root, new1 = _cut_main(world, monkeypatch)
+    _two_tips(world, "seat/1112-40-i7-a", new1, new1)
+    ev, summary = read(world)
+    assert ev["unreadable"] == {} and summary["diverged"] == ["seat/1112-40-i7-a"]
+
+
+def test_a_diverged_branch_whose_other_tip_is_an_orphan_root_still_reads(world, monkeypatch):
+    """An orphan tip (no history in common with main at all) is a TRUE empty boundary, not a cut."""
+    name = "seat/1112-40-i7-a"
+    _root, new1 = _cut_main(world, monkeypatch)
+    world.branch(name, new1)
+    world.commit("remote own", trailers=("Board-Item: levain#7",), file="r.txt")
+    world.push(name)
+    git(world.w, "checkout", "-q", "main")
+    world.delete_local(name)
+    git(world.w, "checkout", "-q", "--orphan", name)
+    git(world.w, "rm", "-rfq", ".")
+    world.commit("local orphan", trailers=("Board-Item: levain#7",), file="o.txt")
+    git(world.w, "checkout", "-q", "main")
+    ev, summary = read(world)
+    assert ev["unreadable"] == {} and summary["diverged"] == [name]
+
+
+def test_git_titles_the_revert_of_a_revert_reapply_and_it_still_counts(world):
+    """git >= 2.43 writes `Reapply "..."` for the revert of a revert: the canonical subject set must include it."""
+    c = world.commit("close it", trailers=("Board-Closes: levain#1",))
+    git(world.w, "revert", "--no-edit", "HEAD", date="2026-11-12T14:00:00Z")
+    git(world.w, "revert", "--no-edit", "HEAD", date="2026-11-12T15:00:00Z")
+    world.push_main()
+    assert [r["sha"] for r in read(world)[0]["main"]] == [c]

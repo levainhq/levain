@@ -23,16 +23,21 @@ Rules the readers hold, each from a measured or ruled failure:
   there (``--since`` moves it).
 * Every ref is resolved FULLY QUALIFIED (``refs/remotes/origin/main``, never ``origin/main``): a short name resolves
   through git's dwim order, where a tag or a local branch of that name would silently swap the evidence. And ONCE:
-  :func:`_snapshot` turns every ref the reader uses into a sha at the start, and every later read (``log``, ``--merged``,
-  the negatives) takes those shas, so a concurrent ``git fetch`` cannot move a ref between two reads.
+  :func:`_snapshot` turns every ref the reader uses (the notes ref included) into a sha at the start, and every later read
+  (``log``, ``--merged``, the negatives, the notes tree) takes those shas, so a concurrent ``git fetch`` cannot move a ref
+  between two reads.
 * A commit's work is "landed" only by a ONE-TO-ONE match (each main commit accounts for at most one branch commit) with
   a main commit AFTER the branch's merge-base with main (``git cherry``'s upstream side) that no later main commit
   reverted. A patch-id match is the proof; the trailer-ids + subject key is the fallback ONLY for a commit that has no
   patch-id at all (an empty diff), never for a commit whose content is known.
 * A repository whose history is cut (a shallow or a partial clone) is unreadable, never read from what is left; the
   whole read has one deadline, and a stage the deadline stops reads unreadable with the stages that depend on it.
-* A commit of main whose change a later ``This reverts commit <sha>`` took back (that revert not itself reverted) is no
-  record: it closes nothing and names nothing. The ``reader`` summary carries every field on every path, failure included.
+* A commit of main whose change a later revert took back (that revert not itself reverted) is no record: it closes
+  nothing and names nothing. A revert is only what git writes: a ``Revert "`` subject and ONE body line ``This reverts
+  commit <40 hex>.`` (a merge: ``..., reversing`` / ``changes made to <40 hex>.``); prose that merely starts with the
+  phrase, a hand-written short or upper-case sha, or a message carrying two distinct markers is not a revert. A revert of
+  a merge takes back everything the merge brought in. The ``reader`` summary carries every field on every path, failure
+  included.
 """
 from __future__ import annotations
 
@@ -75,9 +80,15 @@ MIN_PREWINDOW_TAIL = 50
 _NOTES_REF = "refs/notes/board"
 _RS, _US, _GS = "\x1e", "\x1f", "\x1d"
 _FMT = ("%x1e%H%x1f%P%x1f%cI%x1f%s%x1f%(trailers:key=Board-Item,valueonly,unfold,separator=%x1d)"
-        "%x1f%(trailers:key=Board-Closes,valueonly,unfold,separator=%x1d)%x1f%b%x1f%N")
+        "%x1f%(trailers:key=Board-Closes,valueonly,unfold,separator=%x1d)%x1f%b")
 _NOTE_LINE = re.compile(r"^[ \t]*Board-(Item|Closes):[ \t]*(.*?)[ \t]*$", re.I | re.M)
-_REVERTS = re.compile(r"^This reverts commit ([0-9a-f]{40})", re.M)
+#: A revert exactly as git writes it (`git revert`): the subject starts `Revert "` (`Reapply "` for the revert of a
+#: revert) and a body line is `This reverts commit <sha>.` (a merge: `This reverts commit <sha>, reversing` + newline +
+#: `changes made to <mainline parent sha>.`). Anything else, prose that merely starts with the phrase included, is not a
+#: revert; a hand-written short or upper-case sha is not recognised (a known edge).
+_REVERT_SUBJECTS = ('Revert "', 'Reapply "')      # git >= 2.43 titles the revert of a revert `Reapply "..."`
+_REVERT_PLAIN = re.compile(r"^This reverts commit ([0-9a-f]{40})\.$", re.M)
+_REVERT_MERGE = re.compile(r"^This reverts commit ([0-9a-f]{40}), reversing\s+changes made to ([0-9a-f]{40})\.$", re.M)
 _NONE = re.compile(r"none\b", re.I)
 _TOKEN = re.compile(r"(?:^|-)i([0-9]+)(?=-|$)")
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -156,7 +167,8 @@ class _Commit:
     items: tuple[str, ...]
     closes: tuple[str, ...]
     none: bool                                          # carries `Board-Item: none - <why>`
-    reverts: tuple[str, ...] = ()                       # the commits its message says it reverts (`This reverts commit <sha>`)
+    reverts: tuple[str, ...] = ()                       # the ONE commit its canonical revert marker names (none when it has no marker or several)
+    mainline: str | None = None                         # a revert of a merge: the parent the revert was made against (`-m`)
 
     @property
     def merge(self) -> bool:
@@ -183,15 +195,25 @@ def _utc(text: str) -> tuple[str | None, float]:
     return d.strftime("%Y-%m-%dT%H:%M:%SZ"), d.timestamp()
 
 
-def _parse_log(out: str) -> dict[str, _Commit]:
+def _revert_marker(subject: str, body: str) -> tuple[str, str | None] | None:
+    """``(reverted sha, mainline parent or None)`` when the message carries exactly ONE canonical revert marker under a
+    ``Revert "`` subject; None otherwise (no marker, or several distinct ones: a squash of reverts is ambiguous)."""
+    if not subject.startswith(_REVERT_SUBJECTS):
+        return None
+    marks = {(m.group(1), None) for m in _REVERT_PLAIN.finditer(body)} | {(m.group(1), m.group(2)) for m in _REVERT_MERGE.finditer(body)}
+    return next(iter(marks)) if len(marks) == 1 else None
+
+
+def _parse_log(out: str, notes: Mapping[str, str]) -> dict[str, _Commit]:
     commits: dict[str, _Commit] = {}
     for rec in out.split(_RS):
         if not rec.strip():
             continue
         f = rec.split(_US)
-        if len(f) != 8 or not _SHA.fullmatch(f[0].strip()):
+        if len(f) != 7 or not _SHA.fullmatch(f[0].strip()):
             raise GitFailed("git log gave a record this reader cannot parse")
-        sha, parents, when, subject, item_vals, close_vals, body, note = f
+        sha, parents, when, subject, item_vals, close_vals, body = f
+        note = notes.get(sha, "")
         items: list[str] = []
         closes: list[str] = []
         none = False
@@ -207,16 +229,51 @@ def _parse_log(out: str) -> dict[str, _Commit]:
         for v in close_values:
             closes.extend(_ids_of(v))
         date, ts = _utc(when.strip())
+        mark = _revert_marker(subject.strip(), body)
         commits[sha] = _Commit(sha, tuple(parents.split()), date, ts, subject.strip(), tuple(dict.fromkeys(items)),
-                               tuple(dict.fromkeys(closes)), none, tuple(dict.fromkeys(_REVERTS.findall(body))))
+                               tuple(dict.fromkeys(closes)), none, (mark[0],) if mark else (), mark[1] if mark else None)
     return commits
 
 
-def _log(repo: Path, revs: Iterable[str], *, negatives: Iterable[str] = (), limit: int) -> dict[str, _Commit]:
+def _log(repo: Path, revs: Iterable[str], *, negatives: Iterable[str] = (), limit: int, notes: Mapping[str, str] | None = None
+         ) -> dict[str, _Commit]:
     """The commits reachable from ``revs`` and from none of ``negatives``, newest first, at most ``limit`` of them (a count,
-    never a date: ``--since`` stops the walk at a commit dated wrong and hides the history behind it)."""
+    never a date: ``--since`` stops the walk at a commit dated wrong and hides the history behind it). ``notes`` is the
+    board's notes as read ONCE from the snapshot (:func:`_read_notes`); the log never names the notes ref, and no other
+    notes ref is shown (the format has no ``%N``)."""
     stdin = "".join(f"{r}\n" for r in revs) + "".join(f"^{n}\n" for n in negatives)
-    return _parse_log(_git(repo, "log", f"--notes={_NOTES_REF}", f"--format={_FMT}", f"-n{limit}", "--stdin", stdin=stdin.encode()))
+    return _parse_log(_git(repo, "log", f"--format={_FMT}", f"-n{limit}", "--stdin", stdin=stdin.encode()), notes or {})
+
+
+def _read_notes(repo: Path, notes_sha: str) -> dict[str, str]:
+    """``{commit sha: note text}`` of the notes tree at ``notes_sha`` (the snapshot's sha of ``refs/notes/board``; '' when
+    the ref is absent, and then there are no notes). ``git log --notes=<sha>`` takes a ref NAME (a bare sha is read as
+    ``refs/notes/<sha>`` and silently shows nothing), so the tree is read here, from the sha, once: a notes fetch between
+    two logs cannot give them different notes, and nothing is written to make a temporary ref."""
+    if not notes_sha:
+        return {}
+    blobs: dict[str, str] = {}                           # commit sha -> blob sha
+    for entry in _git(repo, "ls-tree", "-r", "-z", notes_sha).split("\0"):
+        meta, _tab, path = entry.partition("\t")
+        parts = meta.split()
+        key = path.replace("/", "")                      # a fanned-out tree: `ab/cdef...`
+        if len(parts) == 3 and parts[1] == "blob" and _SHA.fullmatch(key) and _SHA.fullmatch(parts[2]):
+            blobs[key] = parts[2]
+    if not blobs:
+        return {}
+    cp = _run(repo, "cat-file", "--batch", stdin="".join(f"{b}\n" for b in sorted(set(blobs.values()))).encode())
+    if cp.returncode != 0:
+        raise GitFailed(_fail_text(("cat-file",), cp))
+    data, pos, text_of = cp.stdout, 0, {}
+    while pos < len(data):
+        end = data.index(b"\n", pos)
+        head = data[pos:end].split()
+        if len(head) != 3 or head[1] != b"blob":
+            raise GitFailed("git cat-file gave a note this reader cannot parse")
+        size = int(head[2])
+        text_of[head[0].decode()] = data[end + 1:end + 1 + size].decode("utf-8", "replace")
+        pos = end + 1 + size + 1
+    return {c: text_of[b] for c, b in blobs.items() if b in text_of}
 
 
 def _patch_ids(repo: Path, shas: list[str]) -> dict[str, str]:
@@ -236,13 +293,24 @@ def _patch_ids(repo: Path, shas: list[str]) -> dict[str, str]:
 # ------------------------------------------------------------------------------------------------ fetch time
 def _read_stamped(path: Path) -> tuple[str, float] | None:
     """A regular file's text and its mtime, both from ONE open descriptor (a path read twice can name two different
-    files if a fetch replaces it in between). None when it is absent, not a regular file or unreadable."""
+    files if a fetch replaces it in between). None when it is absent, a link, not a regular file or unreadable: the file is
+    opened ``O_NOFOLLOW`` (a FETCH_HEAD that is a link to some other file is no witness) and ``O_NONBLOCK`` (opening a
+    FIFO named FETCH_HEAD for reading must not wait for a writer), and the regular-file check is on the descriptor."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        with open(path, "rb") as fh:
-            st = os.fstat(fh.fileno())
+        if not hasattr(os, "O_NOFOLLOW") and path.is_symlink():      # a platform without O_NOFOLLOW: the next best, a check before the open
+            return None
+        fd = os.open(path, flags)
+        try:
+            st = os.fstat(fd)
             if not stat.S_ISREG(st.st_mode):
                 return None
-            return fh.read().decode("utf-8", "replace"), st.st_mtime
+            chunks: list[bytes] = []
+            while chunk := os.read(fd, 65536):
+                chunks.append(chunk)
+            return b"".join(chunks).decode("utf-8", "replace"), st.st_mtime
+        finally:
+            os.close(fd)
     except OSError:
         return None
 
@@ -300,15 +368,49 @@ def _fetched_at(repo: Path, remote: str, main_full: str) -> str | None:
 
 
 # ------------------------------------------------------------------------------------------------ the readers
+def _ancestors(commits: Mapping[str, _Commit], start: str) -> set[str]:
+    """``start`` and every commit of ``commits`` reachable from it through ``commits``."""
+    seen: set[str] = set()
+    todo = [start]
+    while todo:
+        sha = todo.pop()
+        c = commits.get(sha)
+        if c is None or sha in seen:
+            continue
+        seen.add(sha)
+        todo.extend(c.parents)
+    return seen
+
+
+def _takes_back(commits: Mapping[str, _Commit]) -> dict[str, set[str]]:
+    """``{reverting commit: the commits its revert takes back}``, for the commits of ``commits`` whose canonical marker names
+    a commit of ``commits``. A revert of an ordinary commit takes back that commit. A revert of a MERGE, made against a
+    mainline parent P (``git revert -m <n>``; the first parent when the marker names none that is a parent), takes back the
+    merge and everything it brought in: what is reachable from the merge and not from P."""
+    out: dict[str, set[str]] = {}
+    for c in commits.values():
+        for r in c.reverts:
+            target = commits.get(r)
+            if target is None:
+                continue
+            gone = {r}
+            if target.merge:
+                mainline = c.mainline if c.mainline in target.parents else target.parents[0]
+                gone |= _ancestors(commits, r) - _ancestors(commits, mainline)
+            out.setdefault(c.sha, set()).update(gone)
+    return out
+
+
 def _in_effect(commits: Mapping[str, _Commit]) -> set[str]:
     """The commits of ``commits`` whose change is still on main: not taken back by a ``This reverts commit <sha>`` of
     a commit that is itself in effect (so a revert of the revert puts the first one back). Independent of log order (a
-    commit dated wrong can sit before its own parent); a revert always follows its target, so the walk ends."""
+    commit dated wrong can sit before its own parent); a revert always follows its target, so the walk ends. A revert of a
+    MERGE takes back every commit the merge brought in (see :func:`_takes_back`), not the merge alone: the merge itself
+    carries no trailers, the commits on its side do."""
     taken_by: dict[str, list[str]] = {}
-    for c in commits.values():
-        for r in c.reverts:
-            if r in commits:
-                taken_by.setdefault(r, []).append(c.sha)
+    for reverter, gone in _takes_back(commits).items():
+        for sha in gone:
+            taken_by.setdefault(sha, []).append(reverter)
     state: dict[str, bool] = {}
     for root in commits:
         stack = [root]
@@ -355,12 +457,12 @@ _Snapshot = dict[str, tuple[str, float, str | None]]     # fully qualified ref n
 
 
 def _snapshot(repo: Path, remote: str) -> _Snapshot:
-    """EVERY ref the reader will use, as shas, in one ``for-each-ref``: the remote-tracking refs and the seat/lane local
-    heads. Everything after reads this and shas, never a ref by name: a ``git fetch`` that moves a ref between two of the
-    reader's reads (the desk and the seats fetch every few minutes) must not leave one read's negatives excluding commits
-    that another read never saw."""
+    """EVERY ref the reader will use, as shas, in one ``for-each-ref``: the remote-tracking refs, the seat/lane local
+    heads and the board's notes ref. Everything after reads this and shas, never a ref by name: a ``git fetch`` that moves
+    a ref between two of the reader's reads (the desk and the seats fetch every few minutes) must not leave one read's
+    negatives excluding commits that another read never saw, nor one log reading other notes than another."""
     out: _Snapshot = {}
-    pats = [f"refs/remotes/{remote}", *(f"refs/heads/{p.rstrip('/')}" for p in BRANCH_PREFIXES)]
+    pats = [f"refs/remotes/{remote}", *(f"refs/heads/{p.rstrip('/')}" for p in BRANCH_PREFIXES), _NOTES_REF]
     text = _git(repo, "for-each-ref", "--format=%(refname)%1f%(objectname)%1f%(committerdate:iso-strict)", *pats)
     for line in text.splitlines():
         ref, sha, when = (line.split("\x1f") + ["", ""])[:3]
@@ -468,7 +570,7 @@ class _Matcher:
 
     def __init__(self, main: Mapping[str, _Commit], others: Mapping[str, _Commit], window: float) -> None:
         self.main, self.others, self.window = main, others, window
-        reverted = {r for c in main.values() for r in c.reverts if r in main}     # landings a later main commit took back
+        reverted = {x for gone in _takes_back(main).values() for x in gone}      # landings a later main commit took back (a merge's, too)
         self.candidates = [c.sha for c in main.values() if not c.merge and c.ts >= window and c.sha not in reverted]
         self._pools: dict[frozenset[str], tuple[str, ...]] = {}
 
@@ -542,7 +644,11 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
         if shallow not in ("true", "false"):            # an old git echoes a flag it does not know and exits 0
             raise GitFailed("git cannot say whether this is a shallow clone")
         partial = _git_yes_no(repo, "config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$")
-        fetched = _fetched_at(repo, remote, main_full)  # BEFORE the snapshot: a fetch landing after it makes the stamp older, never newer, than the refs
+        # The stamp is read BEFORE the snapshot, so a fetch that completes after the stamp was read can only leave the refs newer
+        # than the stamp (the stamp errs stale). It does not close the window of a fetch already in flight: that writes
+        # FETCH_HEAD BEFORE it moves the refs, so for milliseconds the stamp can be fresh while the snapshot still holds the
+        # old refs (a known edge, docs/ready-schema-v2.md section 9). Nothing here claims otherwise.
+        fetched = _fetched_at(repo, remote, main_full)
         snap = _snapshot(repo, remote)                  # the one read of the refs; everything below uses these shas
         main_sha = snap.get(main_full, ("", 0.0, None))[0]
         if not main_sha:
@@ -554,6 +660,11 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
     if shallow == "true" or partial:
         fail(every, ("a shallow clone" if shallow == "true" else "a partial clone")
              + ": its history is not whole, so no count of commits can be trusted")
+        return ev, summary
+    try:
+        notes = _read_notes(repo, snap.get(_NOTES_REF, ("", 0.0, None))[0])      # the snapshot's sha, read once; every log below is given these
+    except (GitFailed, ValueError) as exc:
+        fail(every, f"{_NOTES_REF} cannot be read ({exc})")
         return ev, summary
     if fetched is not None:
         ev["fetched_at"] = fetched
@@ -572,7 +683,7 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
 
     main_commits: dict[str, _Commit] = {}
     try:        # main: the newest MAX_MAIN_COMMITS; one more is asked for, because ONLY a log that has a commit past the cap is cut
-        main_commits = _log(repo, [main_sha], limit=MAX_MAIN_COMMITS + 1)
+        main_commits = _log(repo, [main_sha], limit=MAX_MAIN_COMMITS + 1, notes=notes)
         if len(main_commits) > MAX_MAIN_COMMITS:    # a log cut at the cap: whole FOR THE WINDOW only if a real tail of it is older than the window
             tail = sum(1 for c in main_commits.values() if c.ts < window)    # a count of old commits, never one date: one skewed commit proves nothing
             if tail < MIN_PREWINDOW_TAIL:
@@ -594,7 +705,7 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
     if not any(s in unreadable for s in ("main", "refs")):
         try:
             chain_rows, branch_rows, extra = _chain_and_branches(repo, remote, main_sha, snap, set(merged), main_commits,
-                                                                 repo_name, since_ts, window, note_unattributed)
+                                                                 repo_name, since_ts, window, note_unattributed, notes)
             ev["chain"], ev["branches"] = chain_rows, branch_rows
         except GitFailed as exc:
             fail(("chain", "branches", "unattributed"), f"the chain and the seat branches cannot be read ({exc})")
@@ -627,7 +738,7 @@ def read_git_evidence(repo: Path, *, repo_name: str | None = None, since: str = 
 
 def _chain_and_branches(repo: Path, remote: str, main_sha: str, snap: _Snapshot, merged: set[str],
                         main_commits: Mapping[str, _Commit], repo_name: str | None, since_ts: float, window: float,
-                        note_unattributed: Any
+                        note_unattributed: Any, notes: Mapping[str, str]
                         ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """The live chain refs and the attributed seat branches, classified against ONE patch-id pass.
 
@@ -638,8 +749,8 @@ def _chain_and_branches(repo: Path, remote: str, main_sha: str, snap: _Snapshot,
     queue = {n: v[0][0] for n, v in _tips(snap, remote, (CHAIN_PREFIX,), since_ts, heads=False).items() if n not in merged}
     picks = {n: _pick(repo, t) for n, t in _tips(snap, remote, BRANCH_PREFIXES, since_ts, heads=True).items()}
     cap = MAX_OWN_COMMITS + 1
-    chain_log = _log(repo, sorted(set(queue.values())), negatives=[main_sha], limit=cap) if queue else {}
-    branch_log = (_log(repo, sorted({s for p in picks.values() for s in p.shas}), limit=cap,
+    chain_log = _log(repo, sorted(set(queue.values())), negatives=[main_sha], limit=cap, notes=notes) if queue else {}
+    branch_log = (_log(repo, sorted({s for p in picks.values() for s in p.shas}), limit=cap, notes=notes,
                        negatives=[main_sha, *sorted(set(queue.values()))]) if picks else {})   # shas only: the snapshot's, not whatever a ref names now
     if len(chain_log) + len(branch_log) > MAX_OWN_COMMITS:
         raise GitFailed(f"more than {MAX_OWN_COMMITS} commits beyond main on the chain and the candidate branches")
@@ -651,11 +762,11 @@ def _chain_and_branches(repo: Path, remote: str, main_sha: str, snap: _Snapshot,
     chain_own = {n: [c for c in _own(chain_log, tip).values() if in_window(c)] for n, tip in queue.items()}
     chain_bound = {n: matcher.boundary([tip]) for n, tip in queue.items()}
     branch_bound = {n: matcher.boundary(p.shas) for n, p in picks.items()}
-    for tips, bound in (*((tuple([queue[n]]), b) for n, b in chain_bound.items()), *((p.shas, branch_bound[n]) for n, p in picks.items())):
-        if not bound and not any(s in main_commits for s in tips):          # main's log does not hold the fork point (cut, or mis-dated)
-            for s in tips:
-                if _git_yes_no(repo, "merge-base", main_sha, s):            # exit 1 = no common ancestor at all: a true empty boundary
-                    raise GitFailed("main's history read does not reach where a chain ref or a branch forked from it")
+    every_tip = {*queue.values(), *(s for p in picks.values() for s in p.shas)}
+    for s in sorted(every_tip):                                             # PER TIP: one tip that reaches retained main must not vouch for another
+        if not matcher.boundary([s]):                                       # main's log does not hold where this tip forked (cut, or mis-dated)
+            if _git_yes_no(repo, "merge-base", main_sha, s):                # exit 1 = no common ancestor at all: a true empty boundary
+                raise GitFailed("main's history read does not reach where a chain ref or a branch forked from it")
     needed = {s for b in {*chain_bound.values(), *branch_bound.values()} for s in matcher.pool(b)}
     work = [c for c in (*chain_log.values(), *branch_log.values()) if in_window(c)]
     pids = _patch_ids(repo, sorted(needed | {c.sha for c in work}))
