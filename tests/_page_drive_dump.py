@@ -14,6 +14,9 @@ What it does, all test-side:
   * ONE retry of the whole dump when an attempt times out. A retry hides a hang only if the hang is deterministic, and then both
     attempts hang and the test FAILS: the assertion message carries each attempt's wall time, stderr tail, the box load and the size of
     ``/dev/shm``, so a repeat says what the box looked like (``[prescription: reasoned]``; see the lane return for what was measured);
+  * Chrome exiting non-zero with NO DOM printed is a launch failure, raised at once as ``DumpDomFailed`` with the exit code and the
+    stderr tail (not retried); a non-zero exit with the DOM already printed is a success (macOS full Chrome without a fresh profile
+    prints the DOM and exits 2 on its teardown watchdog);
   * an attempt that is still running ``TREE_LEAD`` seconds before its timeout has its process tree recorded (``ps`` pid, ppid, pgid,
     state, wait channel, command) into the same message, before the runner's group kill removes it. ``ps`` only reads: it changes nothing
     in the Chrome under test. Next option if that is not enough, NOT added here because it changes the Chrome under test:
@@ -43,6 +46,15 @@ class DumpDomHung(AssertionError):
     """Every attempt timed out. An AssertionError so the test FAILS (a deterministic hang is not retried away)."""
 
 
+class DumpDomFailed(AssertionError):
+    """Chrome exited non-zero and printed no DOM: a launch or startup failure, not a hang. Not retried (a retry would hide the cause)."""
+
+
+def _snapshot_delay(timeout: float) -> float:
+    """Seconds into an attempt at which its process tree is recorded: ``TREE_LEAD`` before the timeout, never before half of it."""
+    return max(timeout * 0.5, timeout - TREE_LEAD)
+
+
 def _tail(text: object) -> str:
     if isinstance(text, bytes):
         text = text.decode("utf-8", "replace")
@@ -70,8 +82,10 @@ def _hung_tree(profile: str) -> str:
     named by any member whose command line carries the profile directory (Chrome's main process does), and every member of it is listed,
     helpers that do not carry the path included. Read-only, bounded, and it never raises: it is a diagnostic, not part of the run."""
     try:
-        out = subprocess.run(["ps", "-axo", "pid,ppid,pgid,stat,wchan,command", "-ww"], capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError) as e:
+        # another process's argv may hold bytes that are not UTF-8: replace them, a diagnostic must not die on a stranger's command line
+        out = subprocess.run(["ps", "-axo", "pid,ppid,pgid,stat,wchan,command", "-ww"], capture_output=True, encoding="utf-8",
+                             errors="replace", timeout=5).stdout
+    except (OSError, subprocess.SubprocessError, UnicodeError) as e:
         return f"(ps unavailable: {e!r})"
     rows = out.splitlines()
     groups: set[str] = set()
@@ -107,19 +121,27 @@ def dump_dom(chrome: str, url: str, *, timeout: float = 60, extra: Sequence[str]
         profile = tempfile.mkdtemp(prefix="levain-dump-profile-")
         started = time.monotonic()
         stop, tree = threading.Event(), []
-        watcher = _watch(profile, max(timeout * 0.5, timeout - TREE_LEAD), stop, tree)
+        delay = _snapshot_delay(timeout)
+        watcher = _watch(profile, delay, stop, tree)
         try:
             argv = [chrome, *CHROME_SAFE_FLAGS, f"--user-data-dir={profile}", "--dump-dom", "--virtual-time-budget=8000",
                     "--window-size=1440,1000", *extra, url]
-            return runner(argv, timeout=timeout).stdout
+            done = runner(argv, timeout=timeout)
+            if done.returncode != 0 and not done.stdout.strip():
+                # a non-zero exit WITH the DOM is a success (macOS full Chrome prints it, then exits 2 on its teardown watchdog); one
+                # with nothing printed is a launch failure, and its stderr is the only thing that says why
+                raise DumpDomFailed(f"chrome --dump-dom exited {done.returncode} and printed no DOM (attempt {n}; {_box()}); "
+                                    f"stderr tail: {_tail(done.stderr)!r}")
+            return done.stdout
         except subprocess.TimeoutExpired as e:
             stop.set()
             watcher.join(10)      # a snapshot already under way finishes (ps is bounded); one not yet started is skipped
-            seen = ("\n    process tree about %gs before the kill:\n      " % min(TREE_LEAD, timeout * 0.5) + tree[0].replace("\n", "\n      ")
+            seen = ("\n    process tree about %gs before the kill:\n      " % (timeout - delay) + tree[0].replace("\n", "\n      ")
                     if tree else "\n    process tree: none recorded")
             attempts.append(f"attempt {n}: no exit within {timeout:g}s (wall {time.monotonic() - started:.1f}s); "
                             f"stdout {len(e.stdout or '')} bytes; stderr tail: {_tail(e.stderr)!r}{seen}")
         finally:
             stop.set()
+            watcher.join(10)      # on every way out, so no watcher outlives the call (a no-op after the timeout path's own join)
             shutil.rmtree(profile, ignore_errors=True)
     raise DumpDomHung("chrome --dump-dom hung on every attempt (" + _box() + "), so the retry did not hide it:\n  " + "\n  ".join(attempts))

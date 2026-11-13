@@ -109,22 +109,66 @@ def _alive(pid: int) -> bool:
     return bool(out) and not out.startswith("Z")
 
 
+def _wait_for_lines(path: Path, n: int, limit: float = 30.0) -> None:
+    """Block until ``path`` holds ``n`` lines: the fake chrome's own signal that it is up. Not a sleep for a guessed time: it ends the
+    moment the file is ready, and the bound only keeps a broken fake from hanging the suite."""
+    ready, waited = threading.Event(), 0.0
+    while waited < limit:
+        if path.exists() and len(path.read_text().split()) >= n:
+            return
+        ready.wait(0.02)
+        waited += 0.02
+    raise AssertionError(f"{path} never reached {n} lines")
+
+
 @pytest.mark.skipif(os.name != "posix", reason="process groups")
-def test_a_hung_attempt_records_its_process_tree_before_the_kill_removes_it(tmp_path: Path) -> None:
+def test_a_hung_attempt_records_its_process_tree_before_the_kill_removes_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The fake ``chrome`` and its ``sleep`` helper are alive when the snapshot is taken (so it is taken BEFORE the group kill),
-    and the message names the group's columns, the profile-carrying main process and the helper that carries no profile path."""
+    and the message names the group's columns, the profile-carrying main process and the helper that carries no profile path.
+
+    Deterministic: the snapshot delay is injected as zero and the snapshot itself waits for the fake's own "I am up" lines, so what is
+    left to a stalled box is only the attempt's whole bound (4 s), not a guess about how long ``sh`` takes to start."""
     pids = tmp_path / "pids"
     fake = tmp_path / "chrome"
     fake.write_text('#!/bin/sh\nfor a; do last=$a; done\nsleep 301 &\necho $! >> "$last"\necho $$ >> "$last"\nsleep 301\n')
     fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    real_tree = dd._hung_tree
+
+    def gated_tree(profile: str) -> str:
+        _wait_for_lines(pids, 2)
+        return real_tree(profile)
+
+    monkeypatch.setattr(dd, "_snapshot_delay", lambda timeout: 0)
+    monkeypatch.setattr(dd, "_hung_tree", gated_tree)
+    monkeypatch.setattr(dd, "ATTEMPTS", 1)
     with pytest.raises(dd.DumpDomHung) as raised:
-        dd.dump_dom(str(fake), str(pids), timeout=1.5)
+        dd.dump_dom(str(fake), str(pids), timeout=4)
     msg = str(raised.value)
-    assert msg.count("process tree about") == 2, "one snapshot per hung attempt"
+    assert msg.count("process tree about") == 1, "one snapshot per hung attempt"
     assert "PGID" in msg and "WCHAN" in msg and "COMMAND" in msg, "the ps header is not in the message"
     assert "/bin/sh " in msg, "the main process (the fake chrome is a sh script; its path may be cut by the column cap) is not in the tree"
     assert "sleep 301" in msg, "the helper, which carries no profile path, is not in the tree"
     assert "process tree: none recorded" not in msg
+
+
+def test_the_snapshot_delay_is_the_lead_before_the_timeout_and_never_under_half_of_it() -> None:
+    assert dd._snapshot_delay(90) == 90 - dd.TREE_LEAD
+    assert dd._snapshot_delay(1.5) == 0.75, "a short bound is snapshotted at half of it, not at a negative lead"
+    assert dd._snapshot_delay(0.2) == pytest.approx(0.1)
+
+
+def test_the_message_names_the_lead_the_delay_implies(monkeypatch: pytest.MonkeyPatch) -> None:
+    taken = threading.Event()
+    monkeypatch.setattr(dd, "_hung_tree", lambda profile: taken.set() or "a tree")
+    monkeypatch.setattr(dd, "_snapshot_delay", lambda timeout: 0)       # the snapshot is taken at once and the attempt then times out
+
+    def runner(argv, *, timeout):
+        assert taken.wait(10), "the zero-delay snapshot never ran"
+        return _hang(argv, timeout=timeout)
+
+    with pytest.raises(dd.DumpDomHung) as raised:
+        dd.dump_dom("/x/chrome", "http://h/", timeout=10, runner=runner)
+    assert "process tree about 10s before the kill" in str(raised.value), "the lead in the message is not timeout minus the delay"
 
 
 def test_no_live_process_with_the_profile_is_said_plainly() -> None:
@@ -142,17 +186,40 @@ def test_the_watcher_records_only_when_the_attempt_outlives_the_delay(monkeypatc
     assert calls == ["/p2"] and found == ["tree of /p2"]
 
 
-def test_a_normal_run_takes_no_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The watcher thread is joined here (the delay is 0.1 s), so a watcher that was never told to stop would show as a ps call."""
+class _Recorded:
+    """A watcher thread that records the joins made on it (``dump_dom`` must join it on every way out, not only on a timeout)."""
+    def __init__(self, inner: threading.Thread) -> None:
+        self.inner, self.joins = inner, []
+
+    def join(self, timeout: float | None = None) -> None:
+        self.joins.append(timeout)
+        self.inner.join(timeout)
+
+    def is_alive(self) -> bool:
+        return self.inner.is_alive()
+
+
+def test_a_normal_run_takes_no_snapshot_and_leaves_no_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deterministic: the snapshot delay is a day, so no clock decides this. A watcher that was never told to stop is still alive when
+    ``dump_dom`` returns; one that was told but not joined has no recorded join."""
     calls: list[str] = []
     monkeypatch.setattr(dd, "_hung_tree", lambda profile: calls.append(profile) or "tree")
-    watchers: list[threading.Thread] = []
+    monkeypatch.setattr(dd, "_snapshot_delay", lambda timeout: 86400)
+    watchers: list[_Recorded] = []
+    delays: list[float] = []
     real = dd._watch
-    monkeypatch.setattr(dd, "_watch", lambda *a: watchers.append(real(*a)) or watchers[-1])
+
+    def recording_watch(profile, delay, *rest):
+        delays.append(delay)
+        watchers.append(_Recorded(real(profile, delay, *rest)))
+        return watchers[-1]
+
+    monkeypatch.setattr(dd, "_watch", recording_watch)
     assert dd.dump_dom("/x/chrome", "http://h/", timeout=0.2, runner=_ok("<html/>")) == "<html/>"
-    assert len(watchers) == 1
-    watchers[0].join(5)
-    assert not watchers[0].is_alive() and calls == [], "ps ran for a run that finished"
+    assert len(watchers) == 1 and delays == [86400], "the watcher was not given the snapshot delay"
+    assert watchers[0].joins, "the watcher was not joined on the success path"
+    assert not watchers[0].is_alive(), "a watcher outlived the call"
+    assert calls == [], "ps ran for a run that finished"
 
 
 def test_a_snapshot_under_way_when_the_attempt_times_out_is_waited_for(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,3 +239,75 @@ def test_a_snapshot_under_way_when_the_attempt_times_out_is_waited_for(monkeypat
     with pytest.raises(dd.DumpDomHung) as raised:
         dd.dump_dom("/x/chrome", "http://h/", timeout=0.2, runner=runner)
     assert "the slow tree" in str(raised.value), "the snapshot under way was not waited for"
+
+
+def _fake_chrome(tmp_path: Path, body: str) -> Path:
+    fake = tmp_path / "chrome"
+    fake.write_text("#!/bin/sh\nfor a; do last=$a; done\necho run >> \"$last\"\n" + body)
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    return fake
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a fake chrome script")
+def test_chrome_exiting_nonzero_with_no_dom_is_a_launch_failure_that_says_why_and_is_not_retried(tmp_path: Path) -> None:
+    runs = tmp_path / "runs"
+    fake = _fake_chrome(tmp_path, 'echo "FATAL: cannot init the profile" >&2\nexit 7\n')
+    with pytest.raises(AssertionError) as raised:
+        dd.dump_dom(str(fake), str(runs), timeout=30)
+    assert isinstance(raised.value, dd.DumpDomFailed) and not isinstance(raised.value, dd.DumpDomHung)
+    msg = str(raised.value)
+    assert "exited 7" in msg, "the exit code is not in the message"
+    assert "cannot init the profile" in msg, "the stderr tail is not in the message"
+    assert runs.read_text().split() == ["run"], "a launch failure was retried"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a fake chrome script")
+def test_chrome_exiting_nonzero_with_the_dom_already_printed_is_a_success(tmp_path: Path) -> None:
+    """macOS full Chrome 157 without a fresh profile prints the DOM, then exits rc 2 on its teardown watchdog."""
+    runs = tmp_path / "runs"
+    fake = _fake_chrome(tmp_path, 'echo "<html>the dom</html>"\necho "Teardown watchdog expired; recording dump and terminating." >&2\nexit 2\n')
+    assert dd.dump_dom(str(fake), str(runs), timeout=30).strip() == "<html>the dom</html>"
+    assert runs.read_text().split() == ["run"]
+
+
+def test_a_nonzero_exit_with_only_whitespace_on_stdout_is_still_no_dom() -> None:
+    runner = lambda argv, *, timeout: subprocess.CompletedProcess(argv, 3, "  \n", "boom")
+    with pytest.raises(dd.DumpDomFailed) as raised:
+        dd.dump_dom("/x/chrome", "http://h/", runner=runner)
+    assert "exited 3" in str(raised.value) and "boom" in str(raised.value)
+
+
+def test_a_zero_exit_with_an_empty_stdout_is_returned_as_it_always_was() -> None:
+    assert dd.dump_dom("/x/chrome", "http://h/", runner=_ok("")) == ""
+
+
+def _fake_ps(tmp_path: Path, profile: str) -> Path:
+    """A directory holding only a ``ps`` that prints the profile-carrying main process with bytes that are not UTF-8 in its argv."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    ps = bindir / "ps"
+    ps.write_text("#!/bin/sh\n"
+                  "printf '  PID  PPID  PGID STAT WCHAN COMMAND\\n'\n"
+                  f"printf '  100     1   100 S    -     /x/chrome --user-data-dir={profile} \\377\\376 bad\\n'\n"
+                  "printf '  101   100   100 S    -     the-helper\\n'\n"
+                  "printf '  200     1   200 S    -     unrelated\\n'\n")
+    ps.chmod(ps.stat().st_mode | stat.S_IXUSR)
+    return bindir
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a fake ps script")
+def test_ps_output_with_bytes_that_are_not_utf8_still_gives_the_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = "/tmp/levain-dump-profile-fake"
+    monkeypatch.setenv("PATH", str(_fake_ps(tmp_path, profile)))
+    tree = dd._hung_tree(profile)
+    assert "ps unavailable" not in tree, tree
+    assert "PGID" in tree and "the-helper" in tree and "unrelated" not in tree
+    assert "�" in tree, "the invalid bytes were not replaced"
+
+
+def test_a_decode_error_out_of_ps_is_a_line_in_the_tree_never_a_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*a, **k):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(dd.subprocess, "run", broken)
+    assert dd._hung_tree("/p").startswith("(ps unavailable")
