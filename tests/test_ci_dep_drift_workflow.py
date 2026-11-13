@@ -344,6 +344,259 @@ def test_every_gh_call_names_its_repository_because_the_reporter_has_no_git_remo
     assert calls and set(repos) == {"levainhq/levain"}, (calls, repos)
 
 
+# --- the body is bounded, built whole, and fenced safely ------------------------------------------------------------------
+
+GITHUB_BODY_LIMIT = 65536  # characters; a longer issue or comment body is refused with HTTP 422
+MARK = "(truncated)"
+CHANGED_ONE = '"changed": ["foo 1.0 -> 1.1"]'
+
+
+def _script_constant(name):
+    m = re.search(rf"^{name} = (\d+)", _step("report", ISSUE_STEP_NAME)["run"], re.M)
+    assert m, f"the reporter's script no longer defines {name} as a plain integer"
+    return int(m[1])
+
+
+def _one_body(raw):
+    """The stub gh appends a separator after each body it is handed; the reporter hands over exactly one."""
+    assert raw.count("-----\n") == 1 and raw.endswith("-----\n"), raw[-200:]
+    return raw[:-len("-----\n")]
+
+
+def _filed(tmp_path, *, log_lines, code="1", drift_result="failure", **kw):
+    rc, calls, raw, err, repos = _run_issue_step(tmp_path, code=code, drift_result=drift_result, log_lines=log_lines, **kw)
+    assert rc == 0, err
+    assert any(c.startswith("gh issue create") for c in calls), (calls, err)
+    return _one_body(raw)
+
+
+def test_the_body_cap_is_named_and_well_under_githubs_limit():
+    cap = _script_constant("BODY_MAX")
+    assert 0 < cap <= GITHUB_BODY_LIMIT - 4096, cap
+    assert _script_constant("TAIL_LINES") == 60
+
+
+HUGE = {
+    "one-huge-log-line-last": lambda: ["start", "z" * 200_000],
+    "one-huge-log-line-then-a-readable-result": lambda: ["x" * 200_000, RESULT_LINE],
+    "a-huge-malformed-result-line": lambda: ["DEP_DRIFT " + "y" * 300_000],
+    "a-huge-valid-result-line": lambda: ["DEP_DRIFT " + '{"result": "red", "stage": "suite", "changed": ["%s"], "failed_tests": ["%s"]}'
+                                         % ("p" * 300_000, "t" * 300_000)],
+    "both-at-once": lambda: ["w" * 200_000, "DEP_DRIFT " + "y" * 300_000, "v" * 200_000],
+    "sixty-fat-lines": lambda: ["L%02d " % i + "m" * 5000 for i in range(70)] + [RESULT_LINE],
+}
+
+
+@needs_bash
+@pytest.mark.parametrize("name", sorted(HUGE))
+def test_an_oversized_log_still_files_an_issue_whose_body_is_under_the_cap_and_says_it_was_cut(tmp_path, name):
+    body = _filed(tmp_path, log_lines=HUGE[name]())
+    cap = _script_constant("BODY_MAX")
+    assert len(body) <= cap < GITHUB_BODY_LIMIT, len(body)
+    assert body.endswith("\n" + MARK + "\n"), body[-120:]
+    assert "Red on" in body and "Log tail:" in body
+
+
+@needs_bash
+def test_a_cut_log_line_keeps_its_first_characters_and_no_more(tmp_path):
+    """Truncating a tail line is not dropping it: the line's head stays, to the named length."""
+    n = _script_constant("TAIL_LINE_MAX")
+    body = _filed(tmp_path, log_lines=["start", "z" * 200_000])
+    assert "z" * n in body and "z" * (n + 1) not in body
+
+
+@needs_bash
+def test_a_cut_result_line_keeps_its_first_characters_and_no_more(tmp_path):
+    n = _script_constant("LINE_MAX")
+    body = _filed(tmp_path, log_lines=["DEP_DRIFT " + "y" * 300_000])
+    assert UNREADABLE in body
+    assert "y" * (n - len("DEP_DRIFT ")) in body and "y" * n not in body.split("Log tail:")[0]
+
+
+@needs_bash
+def test_one_oversized_package_entry_is_shown_cut_not_replaced_by_a_count(tmp_path):
+    n = _script_constant("ITEM_MAX")
+    line = 'DEP_DRIFT {"result": "red", "stage": "suite", "changed": ["%s"], "failed_tests": ["%s"]}' % ("p" * 300_000, "t" * 300_000)
+    body = _filed(tmp_path, log_lines=[line])
+    assert "- " + "p" * n + "\n" in body and "- " + "t" * n + "\n" in body
+    assert "... and" not in body and body.endswith("\n" + MARK + "\n")
+
+
+@needs_bash
+def test_a_huge_list_of_changed_packages_is_cut_with_a_count_not_dropped_silently(tmp_path):
+    items = ", ".join('"pkg%d %s"' % (i, "q" * 600) for i in range(5000))
+    line = 'DEP_DRIFT {"result": "red", "stage": "suite", "changed": [%s]}' % items
+    body = _filed(tmp_path, log_lines=["tail", line])
+    assert "- pkg0 " in body and "- ... and " in body and "more" in body
+    assert body.endswith("\n" + MARK + "\n")
+    assert len(body) <= _script_constant("BODY_MAX")
+
+
+@needs_bash
+def test_the_tail_gives_way_to_the_sections_and_keeps_the_newest_lines(tmp_path):
+    """Both lists at their caps leave the log tail only what is left of the body cap: the oldest tail lines go first."""
+    items = ", ".join('"pkg%d %s"' % (i, "q" * 600) for i in range(5000))
+    tests = ", ".join('"tests/t%d.py::%s"' % (i, "r" * 600) for i in range(5000))
+    line = 'DEP_DRIFT {"result": "red", "stage": "suite", "changed": [%s], "failed_tests": [%s]}' % (items, tests)
+    log = [line] + ["L%02d " % i + "z" * 1000 for i in range(1, 60)]
+    body = _filed(tmp_path, log_lines=log)
+    assert len(body) <= _script_constant("BODY_MAX")
+    assert "L59 " in body, "the newest line is the one that matters"
+    assert "L01 " not in body, "the oldest tail lines are what gives way"
+    assert body.endswith("\n" + MARK + "\n")
+
+
+@needs_bash
+def test_an_oversized_log_comments_on_the_open_issue_within_the_cap(tmp_path):
+    rc, calls, raw, err, repos = _run_issue_step(tmp_path, code="1", drift_result="failure",
+                                                 log_lines=["x" * 200_000, "DEP_DRIFT " + "y" * 300_000], existing="7")
+    assert rc == 0, err
+    assert [c for c in calls if c.startswith("gh issue comment 7")], calls
+    assert len(_one_body(raw)) <= _script_constant("BODY_MAX")
+
+
+NORMAL_RED = (
+    'Red on 2026-11-13: the suite does not pass on a freshly re-resolved lock.\n\n'
+    'Run: https://github.com/levainhq/levain/actions/runs/42\n\n'
+    'Result line: `' + RESULT_LINE + '`\n\n'
+    'Packages whose version changed against the committed uv.lock (old -> new):\n\n- foo 1.0 -> 1.1\n\n'
+    'Failing tests:\n\n- tests/test_a.py::t\n\n'
+    'Log tail:\n```\nnoise\n' + RESULT_LINE + '\n```\n')
+NORMAL_DID_NOT_FINISH = (
+    'Did not finish on 2026-11-13: the job ended (job status: cancelled) before the drift check wrote an exit code.\n'
+    'That is a timeout, a cancel or a failed setup step. It says nothing about whether the dependencies drifted.\n\n'
+    'Run: https://github.com/levainhq/levain/actions/runs/42\n\n'
+    'Result line: `none (the script died before printing one)`\n\n'
+    'Packages whose version changed: unknown.\n\n'
+    'Log tail:\n```\ncollecting ...\ntests/test_x.py ...\n```\n')
+NORMAL_DIED = (
+    'Red on 2026-11-13: the suite does not pass on a freshly re-resolved lock.\n\n'
+    'Run: https://github.com/levainhq/levain/actions/runs/42\n\n'
+    'Result line: `none (the script died before printing one)`\n\n'
+    'Packages whose version changed: unknown.\n\n'
+    'Log tail:\n```\nTraceback ...\n```\n')
+
+
+@needs_bash
+@pytest.mark.parametrize("kw, want", [
+    (dict(code="1", drift_result="failure", log_lines=["noise", RESULT_LINE]), NORMAL_RED),
+    (dict(code="", drift_result="cancelled", log_lines=["collecting ...", "tests/test_x.py ..."]), NORMAL_DID_NOT_FINISH),
+    (dict(code="2", drift_result="failure", log_lines=["Traceback ..."]), NORMAL_DIED),
+], ids=["red", "did-not-finish", "script-died"])
+def test_a_normal_small_log_makes_the_same_body_byte_for_byte_with_no_marker(tmp_path, kw, want):
+    # these three bodies were captured from the reporter as it was before the cap; the bound must change nothing below it
+    body = _filed(tmp_path, **kw)
+    assert body == want
+    assert MARK not in body
+
+
+@needs_bash
+@pytest.mark.parametrize("line", [
+    'DEP_DRIFT {"result": "red", "stage": "suite", "failed_tests": ["tests/a.py::x"]}',               # no `changed`
+    'DEP_DRIFT {"result": "red", "changed": "oops", "failed_tests": ["tests/a.py::x", "tests/b.py::y"]}',  # `changed` not a list
+    'DEP_DRIFT {"result": "red", "changed": null, "failed_tests": ["tests/a.py::x"]}',
+], ids=["no-changed", "changed-a-string", "changed-null"])
+def test_the_failing_tests_are_listed_even_when_the_changed_field_is_unreadable(tmp_path, line):
+    body = _filed(tmp_path, log_lines=[line])
+    assert UNREADABLE in body
+    assert "Failing tests:" in body and "- tests/a.py::x" in body
+
+
+@needs_bash
+def test_a_line_nested_deeper_than_the_parser_allows_is_one_unreadable_line_not_a_crash(tmp_path):
+    """json raises RecursionError, not ValueError: the old reporter died here and the fallback filed a body saying the parser failed."""
+    body = _filed(tmp_path, log_lines=["the last log line", "DEP_DRIFT " + "[" * 200_000])
+    assert body.count(UNREADABLE) == 1
+    assert "the parser failed" not in body and "Packages whose version changed" not in body
+    assert "the last log line" in body and "Red on" in body
+
+
+@needs_bash
+def test_a_string_the_output_cannot_encode_does_not_leave_half_a_section(tmp_path):
+    r"""A lone surrogate (JSON ``\ud800``) makes ``print`` raise UnicodeEncodeError after the section's first line was out."""
+    line = 'DEP_DRIFT {"result": "red", "stage": "suite", "changed": ["bad \\ud800 pkg", "ok 1 -> 2"]}'
+    body = _filed(tmp_path, log_lines=[line])
+    assert "the parser failed" not in body and UNREADABLE not in body
+    assert body.count("Packages whose version changed") == 1
+    assert "- ok 1 -> 2" in body and "- bad " in body
+
+
+def _code_span_inner(text):
+    """CommonMark's reading of an inline code span that fills ``text``: the content, or None when it is not one span."""
+    n = len(text) - len(text.lstrip("`"))
+    if n == 0:
+        return None
+    rest = text[n:]
+    for m in re.finditer(r"`+", rest):
+        if len(m[0]) == n:  # the first run exactly as long as the opener closes the span
+            if m.end() != len(rest):
+                return None
+            inner = rest[:m.start()]
+            if inner.startswith(" ") and inner.endswith(" ") and inner.strip(" "):
+                inner = inner[1:-1]
+            return inner
+    return None
+
+
+def test_the_code_span_reader_used_below_rejects_a_span_a_stray_backtick_would_close():
+    assert _code_span_inner("`abc`") == "abc"
+    assert _code_span_inner("``a`b``") == "a`b"
+    assert _code_span_inner("`` `a ``") == "`a"
+    assert _code_span_inner("`a``b`") == "a``b"
+    assert _code_span_inner("`a`b`") is None
+    assert _code_span_inner("``a`") is None
+
+
+def _result_span(body):
+    return next(l for l in body.splitlines() if l.startswith("Result line: "))[len("Result line: "):]
+
+
+@needs_bash
+@pytest.mark.parametrize("line", [
+    'DEP_DRIFT {"result": "red", "changed": ["a`b"]}',
+    'DEP_DRIFT {"result": "red", "note": "``two", "changed": ["x 1 -> 2"]}',
+    'DEP_DRIFT {oops`',
+    'DEP_DRIFT {"a": "```fence```", "changed": []}',
+], ids=["one", "two", "ends-with-one", "three"])
+def test_a_backtick_in_the_result_line_does_not_close_its_code_span(tmp_path, line):
+    body = _filed(tmp_path, log_lines=["x", line])
+    assert _code_span_inner(_result_span(body)) == line
+
+
+def _fenced_tail(body):
+    tail = body.split("Log tail:\n", 1)[1]
+    lines = tail.split("\n")
+    opening = lines[0]
+    assert re.fullmatch(r"`{3,}", opening), opening
+    close = lines.index(opening, 1)
+    return opening, lines[1:close]
+
+
+@needs_bash
+def test_a_backtick_fence_inside_the_log_does_not_close_the_tails_fence(tmp_path):
+    log = ["before", "```", "inside", "``````", "```python", "after"]
+    body = _filed(tmp_path, log_lines=log + [RESULT_LINE])
+    opening, inner = _fenced_tail(body)
+    assert inner == log + [RESULT_LINE]
+    assert len(opening) > max(len(r) for l in inner for r in re.findall(r"`+", l))
+
+
+@needs_bash
+def test_a_log_with_no_backticks_keeps_the_plain_three_backtick_fence(tmp_path):
+    opening, inner = _fenced_tail(_filed(tmp_path, log_lines=["a", "b"]))
+    assert opening == "```" and inner == ["a", "b"]
+
+
+@needs_bash
+def test_the_fallback_body_is_bounded_and_backtick_free_when_the_renderer_itself_dies(tmp_path):
+    log = ["x" * 200_000, "```", "DEP_DRIFT " + "y" * 300_000]
+    body = _filed(tmp_path, log_lines=log, python3_broken=True)
+    assert UNREADABLE in body and len(body) < GITHUB_BODY_LIMIT // 2
+    opening, inner = _fenced_tail(body)
+    assert opening == "```" and not any("`" in l for l in inner)
+    assert [l for l in body.splitlines() if "`" in l] == ["```", "```"], "the log's own ``` line must not survive into the fallback"
+
+
 # --- every workflow file, .yml and .yaml ----------------------------------------------------------------------------------
 
 def _workflow_files(root=WORKFLOWS):
