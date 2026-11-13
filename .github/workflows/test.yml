@@ -200,8 +200,9 @@ jobs:
       - name: Install h11 for the runner's /usr/bin/python3
         # tests/test_routemaps.py runs keys under /usr/bin/python3 too (the root-py param) and fails under CI when that
         # interpreter cannot import h11, so the root run cannot quietly become a skip. pip, not apt, so the version is
-        # the floor root vendors (root_tree.H11_MIN) and not whatever the distro packages.
-        run: sudo /usr/bin/python3 -m pip install --break-system-packages "$(python tests/ci/root_closure.py h11-spec)"
+        # the lock's and not whatever the distro packages; hash-checked from requirements-ci-root-h11.txt, which a test
+        # holds equal to uv.lock's h11 and at or above the floor root vendors (root_tree.H11_MIN).
+        run: sudo /usr/bin/python3 -m pip install --break-system-packages --require-hashes --no-deps -r requirements-ci-root-h11.txt
 
       - name: Run pytest shard ${{ matrix.shard }} of ${{ env.TEST_SHARDS }}
         # Collect under THIS Python with the repo's real config, then pick this shard's files: shard.py fails on no
@@ -307,7 +308,7 @@ jobs:
         # The keys process tests (tests/test_broker_keys_process.py, tests/test_control_keys_attach.py) also run keys
         # under /usr/bin/python3, the interpreter the root run names (ROOT_PYTHON), and b2_keys_rig.require_h11 fails
         # under CI when it cannot import h11. Same step, same floor, as the `test` job.
-        run: sudo /usr/bin/python3 -m pip install --break-system-packages "$(python tests/ci/root_closure.py h11-spec)"
+        run: sudo /usr/bin/python3 -m pip install --break-system-packages --require-hashes --no-deps -r requirements-ci-root-h11.txt
 
       - name: Byte-compile the root-run import closure
         run: python tests/ci/root_closure.py compile

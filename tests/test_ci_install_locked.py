@@ -173,6 +173,11 @@ def test_drift_says_a_red_with_no_changed_package_is_likely_flaky():
 
 # --- uv.lock against pyproject.toml -------------------------------------------------------------------------------------
 
+def _pinned_uv():
+    """The one uv pin: the install script's default (tests/test_ci_dep_drift_workflow.py holds every workflow to it)."""
+    return re.search(r'^UV_VERSION="\$\{UV_VERSION:-([0-9.]+)\}"$', SCRIPT.read_text(), re.M)[1]
+
+
 @pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv on PATH (the lock is checked with `uv lock --check`)")
 def test_uv_lock_agrees_with_pyproject_toml(tmp_path):
     """Every CI install reads uv.lock and never resolves, so a pyproject.toml change (a moved pin, a new extra) that
@@ -183,5 +188,5 @@ def test_uv_lock_agrees_with_pyproject_toml(tmp_path):
     proc = subprocess.run(["uv", "lock", "--check", "--offline", "--directory", str(ROOT)], env=env,
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, (
-        "uv.lock is stale against pyproject.toml; regenerate it with the uv the workflows pin (`uv==0.13.5`: "
-        f"`uvx uv@0.13.5 lock`) and commit it.\n{proc.stdout}{proc.stderr}")
+        f"uv.lock is stale against pyproject.toml; regenerate it with the uv the workflows pin (`uv=={_pinned_uv()}`: "
+        f"`uvx uv@{_pinned_uv()} lock`) and commit it.\n{proc.stdout}{proc.stderr}")

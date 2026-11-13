@@ -24,7 +24,10 @@ jobs:
     if: github.repository == 'levainhq/levain'
     # Pinned because ubuntu-latest moved to ubuntu-26.04, whose sudo/bash/python differ; revisit when the tests are made to pass on it.
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Not the 60 the sharded jobs get: this one runs the WHOLE suite on one runner, which test.yml's own comment puts at
+    # ~55-67 min unsharded, before the install and the re-resolve. A cap under that cancels the job with no result line
+    # (the issue step below still runs on a cancel, and says the job did not finish). Revisit if the suite grows past it.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v6
 
@@ -37,7 +40,8 @@ jobs:
         run: sudo chmod o+rx /run/podman || true
 
       - name: Install h11 for the runner's /usr/bin/python3
-        run: sudo /usr/bin/python3 -m pip install --break-system-packages "$(python tests/ci/root_closure.py h11-spec)"
+        # Hash-checked from requirements-ci-root-h11.txt (h11 as uv.lock pins it), never resolved live as root.
+        run: sudo /usr/bin/python3 -m pip install --break-system-packages --require-hashes --no-deps -r requirements-ci-root-h11.txt
 
       - name: Install uv
         # The pins here are the ones scripts/ci_install_locked.sh installs into the drift venv; this step only puts
@@ -54,9 +58,13 @@ jobs:
           LEVAIN_TEST_WAIT_SCALE: "2"
 
       - name: File, update or close the one dep-drift issue
+        # always(): a timeout, a cancel or a failed setup step ends the job before the drift step writes its exit
+        # code, and those are the nights that must not pass in silence. DRIFT_CODE is empty exactly then.
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           DRIFT_CODE: ${{ steps.drift.outputs.code }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           set -euo pipefail
           day="$(date -u +%F)"
@@ -70,9 +78,16 @@ jobs:
             fi
             exit 0
           fi
-          line="$(grep '^DEP_DRIFT ' "$RUNNER_TEMP/drift.log" | tail -1 || true)"
+          log="$RUNNER_TEMP/drift.log"
+          [ -f "$log" ] || : > "$log"
+          line="$(grep '^DEP_DRIFT ' "$log" | tail -1 || true)"
           {
-            echo "Red on ${day}: the suite does not pass on a freshly re-resolved lock."
+            if [ -z "$DRIFT_CODE" ]; then
+              echo "Did not finish on ${day}: the job ended (job status: ${JOB_STATUS:-unknown}) before the drift check wrote an exit code."
+              echo "That is a timeout, a cancel or a failed setup step. It says nothing about whether the dependencies drifted."
+            else
+              echo "Red on ${day}: the suite does not pass on a freshly re-resolved lock."
+            fi
             echo
             echo "Run: ${run_url}"
             echo
@@ -100,7 +115,7 @@ jobs:
             echo
             echo "Log tail:"
             echo '```'
-            tail -n 60 "$RUNNER_TEMP/drift.log"
+            tail -n 60 "$log"
             echo '```'
           } > "$RUNNER_TEMP/body.md"
           if [ -n "$existing" ]; then
@@ -110,5 +125,5 @@ jobs:
           fi
 
       - name: Fail the run when the drift was red
-        if: steps.drift.outputs.code != '0'
+        if: always() && steps.drift.outputs.code != '0'
         run: exit 1
