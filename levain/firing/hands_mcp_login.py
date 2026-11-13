@@ -476,41 +476,50 @@ def status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None) 
     """One ``(ok, line)`` per finding and the exit code. Every read that fails is its own line, never silence.
     Read-only, for both callers (``list`` and the doctor): its reads run with ``sweep=False``, so one that runs out
     kills only its own child and never the hands account's other processes (there is no sweeping variant)."""
+    rows = _status_rows(entity_dir, cockpit_root)
+    return [(ok, line) for ok, line, _clear in rows], 0 if all(ok for ok, _line, _clear in rows) else 1
+
+
+def _status_rows(entity_dir: Path | str, cockpit_root: Path | str | None = None) -> list[tuple[bool, str, str | None]]:
+    """:func:`status_rows`' rows, each with the command that clears a STOPPED entry (None on every other row), so the
+    doctor can tell that row apart without reading its words."""
     from levain.authority import HANDS_MCP_KIND
     from levain.consent.grants import stopped_line
 
     root = cockpit_root if cockpit_root is not None else cockpit_root_of(entity_dir)
-    rows: list[tuple[bool, str]] = []
+    rows: list[tuple[bool, str, str | None]] = []
     try:
         hands = hl.load_hands_identity(entity_dir)
     except hl.HandsRefused as exc:
-        return [(False, f"hands mcp: {exc}")], 1
+        return [(False, f"hands mcp: {exc}", None)]
     try:
         live, skipped = load_registry(root)
     except HandsMcpError as exc:
         live, skipped = [], []
-        rows.append((False, f"hands mcp registry: unknown ({exc})"))
+        rows.append((False, f"hands mcp registry: unknown ({exc})", None))
     try:
         record = read_record(entity_dir)
     except HandsMcpError as exc:
         record = {}
-        rows.append((False, f"hands mcp record: unknown ({exc})"))
+        rows.append((False, f"hands mcp record: unknown ({exc})", None))
     try:
         held: dict[str, dict[str, str]] | None = vendor_servers(hands, entity_dir, sweep=False)
     except (hl.HandsLoginError, OSError, subprocess.SubprocessError) as exc:
         held = None
-        rows.append((False, f"hands mcp config: unknown (the hands account's server list could not be read: {exc})"))
+        rows.append((False, f"hands mcp config: unknown (the hands account's server list could not be read: {exc})",
+                     None))
     live_names = {e["name"]: e for e in live}
     for gid, why in skipped:
-        # a stopped entry is a failing row: it answers nothing and no renew brings it back, so it is not health
+        # a stopped entry is a failing row here: it answers nothing and no renew brings it back, so it is not health
         if why in STOP_REASONS:
-            rows.append((False, f"hands mcp entry {gid}: {stopped_line(why, HANDS_MCP_KIND)}: `{_revoke_cmd(gid)}`"))
+            clear = _revoke_cmd(gid)
+            rows.append((False, f"hands mcp entry {gid}: {stopped_line(why, HANDS_MCP_KIND)}: `{clear}`", clear))
         else:
-            rows.append((True, f"hands mcp entry {gid}: not live ({why})"))
+            rows.append((True, f"hands mcp entry {gid}: not live ({why})", None))
     if held is not None:
         for name in sorted(set(record) | set(held) | set(live_names)):
-            rows.append(server_status(name, record.get(name), held.get(name), live_names.get(name)))
-    return rows, 0 if all(ok for ok, _ in rows) else 1
+            rows.append((*server_status(name, record.get(name), held.get(name), live_names.get(name)), None))
+    return rows
 
 
 def server_status(name: str, rec: dict[str, Any] | None, vend: dict[str, str] | None,
@@ -545,7 +554,8 @@ def server_status(name: str, rec: dict[str, Any] | None, vend: dict[str, str] | 
 
 def doctor_rows(install: Path) -> list[tuple[str, bool, str, str | None, bool]]:
     """``(name, ok, detail, hint, warn)`` for the doctor. Silent without a hands account. With one: the registry,
-    record and config comparison (a fault reading any is a failing row), and the credential file's owner and mode
+    record and config comparison (a fault reading any is a failing row; an entry a revoked key stopped is a warning
+    whose hint is the revoke that clears it), and the credential file's owner and mode
     (read by ``stat`` as the hands user; wider than 0600 fails, and so does a stat that cannot be told). No file
     says only that no login is held IN THAT FILE: a Keychain-held login is not checked, and the row warns when the
     record says a server signed in."""
@@ -554,8 +564,14 @@ def doctor_rows(install: Path) -> list[tuple[str, bool, str, str | None, bool]]:
     except Exception:  # noqa: BLE001 - no hands account (the confinement rows report a broken config)
         return []
     out: list[tuple[str, bool, str, str | None, bool]] = []
-    rows, _ = status_rows(install)
-    for ok, line in rows:
+    rows = _status_rows(install)
+    for ok, line, clear in rows:
+        if clear is not None:
+            # a stopped entry is the operator's own revoke at work, the same stop the doctor warns of for every other
+            # kind, so here it warns and leaves the exit code alone; `levain hands mcp list` still fails on it. The hint
+            # is the revoke that clears it, not a pointer back to a list that shows this same line
+            out.append(("hands mcp", True, line, f"`{clear}`", True))
+            continue
         out.append(("hands mcp", ok, line, None if ok else "`levain hands mcp list` shows the same read",
                     ok and "not live" in line))
     if not rows:

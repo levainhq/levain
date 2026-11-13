@@ -222,7 +222,9 @@ STOPPED_WHY = "the key that signed it was revoked"
 
 
 def _stopped(row: dict, why: str = STOPPED_WHY) -> dict:
-    return {**row, "state": "stopped", "stopped_why": why}
+    """A stopped row as grant_view sends it: the reason, and the way back in the server's own words for its kind."""
+    from levain.consent.grants import way_back
+    return {**row, "state": "stopped", "stopped_why": why, "way_back": way_back(row["kind"])}
 
 
 @needs_browser
@@ -263,16 +265,58 @@ def test_a_row_stopped_for_its_last_renewer_says_that(world, tmp_path, monkeypat
 
 
 @needs_browser
-def test_a_stopped_voice_key_says_to_set_it_again_and_is_not_live_until_revoked(world, tmp_path, monkeypatch):
-    """A voice key has no renew and its recovery is a new set, so its line says set. Red with the voice branch printing
-    "Live until you revoke it" or the bare state word beside the stopped line."""
+def test_a_stopped_voice_key_says_what_the_terminal_says_and_is_not_live_until_revoked(world, tmp_path, monkeypatch):
+    """A voice key allows one per provider and a stopped one still counts, so a plain `levain voice key add` is refused
+    while it is held: its line names the revoke first, the words `levain voice key list` prints (it said "Set it again",
+    which that add refuses). Red with the voice branch printing "Live until you revoke it" or the bare state word."""
     gid = "vk-0000000000aa"
     got = _drive_cards(tmp_path, world, monkeypatch, [_stopped(_voice_row("openai", gid))])
     html, text = got[gid]
     assert "OpenAI voice key" in text and "standing grant · stopped" in text, text
-    assert f"Stopped: {STOPPED_WHY}. It answers nothing. Set it again to use it." in text, text
-    assert "Live until you revoke it" not in text, text
+    assert f"Stopped: {STOPPED_WHY}. It answers nothing. Revoke it, then create it again to use it." in text, text
+    assert "Set it again" not in text and "Live until you revoke it" not in text, text
     assert '<span class="ext-meta">stopped</span>' not in html, html
+
+
+@needs_browser
+def test_a_stopped_row_draws_the_servers_way_back_as_it_comes(world, tmp_path, monkeypatch):
+    """The page keeps no table of kinds: whatever clause the server sends is the line, and a row with none says only that
+    it answers nothing. Red with the page choosing the words from ``kind`` (this lease would say "Revoke it, then create
+    it again" whatever the server sent)."""
+    rows = [{**_stopped({**_consent_row("sl-0000000000aa"), "kind": "seat-root-lease"}), "way_back": "probe clause"},
+            {**_stopped(_consent_row("cg-0000000000aa")), "way_back": ""}]
+    got = _drive_cards(tmp_path, world, monkeypatch, rows)
+    assert f"Stopped: {STOPPED_WHY}. It answers nothing. Probe clause." in got["sl-0000000000aa"][1], got["sl-0000000000aa"][1]
+    text = got["cg-0000000000aa"][1]
+    assert f"Stopped: {STOPPED_WHY}. It answers nothing." in text and "again" not in text, text
+
+
+@needs_browser
+def test_the_stopped_rows_shots(world, tmp_path, monkeypatch):
+    """A stopped lease, egress grant and voice key beside a stopped consent grant, at 1280 and at a phone's 390.
+    ``LEVAIN_GRANTPAGE_SHOTS=<dir>`` says where the PNGs go and ``LEVAIN_GRANTPAGE_PREFIX`` names them (before or after);
+    else they land in the tmp dir and the test only proves the page draws."""
+    out_dir = Path(os.environ.get("LEVAIN_GRANTPAGE_SHOTS") or tmp_path)
+    prefix = os.environ.get("LEVAIN_GRANTPAGE_PREFIX") or "after"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = [_stopped({**_consent_row("sl-0000000000aa"), "kind": "seat-root-lease"}),
+            _stopped({**_consent_row("se-0000000000aa"), "kind": "seat-egress"}),
+            _stopped(_voice_row("openai", "vk-0000000000aa")), _stopped(_consent_row("cg-0000000000aa"))]
+    monkeypatch.setenv("LEVAIN_HOME", str(world.qdir.parent))
+    _root, src, _ids = _install(tmp_path)
+    look = ("(() => { const h = [...document.querySelectorAll('#levain-modal .ext-grouphead')].find(e => /standing grants/"
+            ".test(e.textContent)); if (!h) return 'missing'; h.scrollIntoView({block: 'start'}); return 'ok'; })()")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        open_steps = [{"until": TILE}, {"eval": _stub(rows)}, {"eval": OPEN_DECISIONS},
+                      {"until": f"{_CARDS}.length === {len(rows)}", "ms": 30000}, SETTLE, {"eval": look}, SETTLE]
+        phone = drive_touch(tmp_path, f"{url}/#write_token=T",
+                            [*PHONE_TOUCH, *open_steps, {"shot": str(out_dir / f"{prefix}_stopped_390.png"), "full": False}])
+        desk = _drive(tmp_path, f"{url}/#write_token=T",
+                      [{"emulate": {"w": 1280, "h": 900, "dpr": 1}}, *open_steps,
+                       {"shot": str(out_dir / f"{prefix}_stopped_1280.png"), "full": False}])
+    assert "missing" not in phone["values"] and "missing" not in desk["values"]
+    for name in ("390", "1280"):
+        assert (out_dir / f"{prefix}_stopped_{name}.png").stat().st_size > 1000, name
 
 
 @needs_browser
@@ -290,4 +334,7 @@ def test_the_served_page_carries_the_stopped_sentence():
     """Where no browser is available the renderer's source still carries the words the stopped row draws (the running-page
     look is a person's to take)."""
     js = (Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "dashboard_core.js").read_text()
-    assert '"Stopped"' in js and '". It answers nothing. "' in js and '"Create it again"' in js
+    assert '"Stopped"' in js and '". It answers nothing."' in js and "g.way_back" in js
+    # the way back is the server's (grants.way_back): no second copy of any kind's words lives in the page
+    for words in ("create it again", "set it again", "revoke it, then", "revoke it to clear"):
+        assert words not in js.lower(), words
