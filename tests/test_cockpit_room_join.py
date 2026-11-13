@@ -511,6 +511,9 @@ def test_the_dashboard_never_asks_the_browser_whether_dictation_is_available(tmp
     from tests.test_room_phone import _FAKE, _assets
     js = __import__("pathlib").Path(cockpit_room.__file__).resolve().parents[1] / "templates" / "web" / "dashboard_boot.js"
     assert "probe: false" in js.read_text()
+    # pinned on the mount call itself: the Setup offer (room_view.js, test_room_phone) is reachable on THIS mount only from a failed
+    # Dictate start, so a flip to the default probe would silently change which path the live cockpit takes
+    assert __import__("re").search(r"LevainRoomView\.mount\([^\n]*probe: false\s*\}\)", js.read_text())
     boot = (_FAKE + ' window.__asked = 0; Installed.available = () => { window.__asked++; return Promise.resolve("available"); };'
             ' window.__rv = LevainRoomView.mount(document.getElementById("host"), {pollMs: 0, storage: null, speech: Installed,'
             ' probe: PROBE, headers: () => ({"X-Levain-Write-Token": "%s"})});' % TOKEN)

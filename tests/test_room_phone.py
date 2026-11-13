@@ -57,6 +57,15 @@ class Setup extends Live {
   static available() { window.__asks++; return Promise.resolve(window.__state); }
   static install(o) { window.__inst.push(JSON.stringify(o)); return new Promise((res, rej) => { window.__done = {res, rej}; }); }
 }
+// the browser masks the pack: start() ends window.__code (service-not-allowed) until install() has resolved true
+window.__code = "service-not-allowed"; window.__ok = false;
+class Masked extends Setup {
+  start() { window.__started.push({live: true}); if (!window.__ok) this.onerror({error: window.__code}); }
+}
+// a poll that fails
+class FlakyPoll extends Setup {
+  static available() { window.__asks++; return window.__asks === 1 ? Promise.resolve("downloading") : Promise.reject(new Error("x")); }
+}
 """
 
 
@@ -177,15 +186,14 @@ def test_a_recognizer_that_ignores_processlocally_never_starts(tmp_path, w):
 def test_the_mic_follows_availability_not_capability(tmp_path, w):
     out, _w = _run(tmp_path, w, "Unavailable", [{"eval": "document.querySelectorAll('.rv-mic:not(.rv-mic-stream)').length"}])
     assert out["values"][1] == 0
-    # a pack the browser can fetch is offered, not mourned: Dictate stays hidden (never started) and a button offers the set up;
-    # a browser that lists the pack but has no install() says so in the one table's words, and the button goes
+    # a pack the browser can fetch is offered, not mourned (see the Setup tests below); a browser that lists the pack but has no
+    # install() cannot fetch it from this page: no dead button, Dictate gone, the one table's words up front
     out, _w = _run(tmp_path, w, "Downloadable", [
-        {"until": "document.querySelector('.rv-setup') && !document.querySelector('.rv-setup').hidden"},
-        {"eval": "document.querySelector('.rv-setup').click(); JSON.stringify({mic: document.querySelector('.rv-mic:not(.rv-mic-stream)').style.display,"
-                 " started: __started.length, hidden: document.querySelector('.rv-setup').hidden,"
+        {"until": "document.querySelectorAll('.rv-mic:not(.rv-mic-stream)').length === 0 && document.querySelector('.rv-sendnote').textContent"},
+        {"eval": "JSON.stringify({hidden: document.querySelector('.rv-setup').hidden, started: __started.length,"
                  " note: document.querySelector('.rv-sendnote').textContent, want: LevainMic.dictateSetup('noinstall')})"}])
     got = json.loads(out["values"][2])
-    assert got["mic"] == "none" and got["started"] == 0 and got["hidden"] and got["note"] == got["want"] != "", got
+    assert got["hidden"] and got["started"] == 0 and got["note"] == got["want"] != "", got
     out, _w = _run(tmp_path, w, "Installed", [
         {"until": "document.querySelector('.rv-mic:not(.rv-mic-stream)') && document.querySelector('.rv-mic:not(.rv-mic-stream)').style.display !== 'none'"},
         {"eval": "document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); __recs[0].lang"}])
@@ -366,3 +374,92 @@ def test_a_pack_the_browser_cannot_offer_stays_gone(tmp_path, w):
         {"eval": "JSON.stringify({mic: document.querySelectorAll('.rv-mic:not(.rv-mic-stream)').length, setup: %s.hidden})" % _SB}],
         pre="window.__state = 'unavailable';")
     assert json.loads(out["values"][2]) == {"mic": 0, "setup": True}
+
+
+# --- the production mount: probe:false (dashboard_boot.js; available() froze the renderer, RM-G2) -------------------------------
+# With the probe off the page cannot ask whether the pack is there, so a Dictate start that ends service-not-allowed is the signal.
+
+_NOPROBE = " probe: false,"
+
+
+@needs_browser
+def test_with_the_probe_off_a_masked_pack_swaps_dictate_for_setup_and_a_tap_makes_dictate_work(tmp_path, w):
+    """THE integration test, with the production mount options (probe:false): Dictate is shown, a start ends service-not-allowed
+    -> Dictate is hidden and Setup appears; one tap -> install() once (page language, processLocally); true -> Dictate again,
+    and it works. available() is never asked (it froze the renderer). Red with: no offer after the error, Dictate left beside
+    Setup, a second install site, or the success path asking available()."""
+    out, _w = _run(tmp_path, w, "Masked", [
+        {"until": _DICTATE},
+        {"eval": "JSON.stringify({asks: __asks, inst: __inst.length, setup: %s.hidden})" % _SB},
+        {"eval": "%s.click(); JSON.stringify({offer: %s, mic: %s.style.display, inst: __inst.length, text: %s.textContent, want: %s('offer'),"
+                 " note: %s, started: __started.length})" % (_MB, _OFFER, _MB, _SB, _WORD, _NOTE)},
+        {"eval": "%s.click(); %s.dispatchEvent(new MouseEvent('click', {bubbles: true}));"
+                 " JSON.stringify({inst: __inst, working: %s, mic: %s.style.display, want: %s('working'), text: %s.textContent})" % (_SB, _SB, _WORKING, _MB, _WORD, _SB)},
+        {"eval": "window.__ok = true; __done.res(true); 1"},
+        {"until": _DICTATE},
+        {"eval": "JSON.stringify({asks: __asks, inst: __inst.length, note: %s, want: %s('done')})" % (_NOTE, _WORD)},
+        {"eval": "%s.click(); __recs[__recs.length - 1].emit('hello there'); JSON.stringify({recs: __recs.length, started: __started.length,"
+                 " text: document.querySelector('.rv-input').value, setup: %s.hidden, mic: %s.style.display})" % (_MB, _SB, _MB)},
+    ], extra=_NOPROBE)
+    v = out["values"]
+    assert json.loads(v[2]) == {"asks": 0, "inst": 0, "setup": True}, v[2]          # nothing asked and nothing installed on its own
+    fail = json.loads(v[3])
+    assert fail["offer"] is True and fail["mic"] == "none" and fail["inst"] == 0 and fail["started"] == 1, fail
+    assert fail["text"] == fail["want"] == "Set up on-device dictation" and "pack may be missing" in fail["note"], fail
+    tap = json.loads(v[4])
+    assert len(tap["inst"]) == 1 and tap["working"] is True and tap["mic"] == "none" and tap["text"] == tap["want"], tap
+    opts = json.loads(tap["inst"][0])
+    assert opts["processLocally"] is True and len(opts["langs"]) == 1 and opts["langs"][0], opts
+    done = json.loads(v[7])
+    assert done == {"asks": 0, "inst": 1, "note": done["want"], "want": done["want"]} and done["want"], done
+    end = json.loads(v[8])
+    assert end == {"recs": 2, "started": 2, "text": "hello there", "setup": True, "mic": ""}, end
+
+
+@needs_browser
+def test_a_failed_start_offers_setup_only_for_a_pack_error_and_only_when_install_exists(tmp_path, w):
+    """language-not-supported is the same cause in the one table; not-allowed (the microphone) is not a pack problem; a browser
+    with no install() has nothing to offer."""
+    def once(speech, code):
+        out, _w = _run(tmp_path, w, speech, [
+            {"until": _DICTATE},
+            {"eval": "%s.click(); JSON.stringify({setup: %s.hidden, mic: %s.style.display, note: %s})" % (_MB, _SB, _MB, _NOTE)}],
+            pre="window.__code = %r; window.__err = %r;" % (code, code), extra=_NOPROBE)
+        return json.loads(out["values"][2])
+    assert once("Masked", "language-not-supported")["setup"] is False
+    mic = once("Masked", "not-allowed")
+    assert mic["setup"] is True and mic["mic"] == "" and "microphone" in mic["note"], mic
+    bare = once("Live", "service-not-allowed")
+    assert bare["setup"] is True and bare["mic"] == "" and "pack may be missing" in bare["note"], bare
+
+
+def test_the_dashboard_boot_still_mounts_the_room_with_the_probe_off_and_the_room_never_asks_available_on_that_path():
+    """Pins the premise the test above stands on: the cockpit mounts with probe:false (its renderer-freeze reason in
+    test_cockpit_room_join), so the Setup offer must be reachable from a failed start alone."""
+    boot = (WEB / "dashboard_boot.js").read_text()
+    assert re.search(r"LevainRoomView\.mount\([^\n]*probe: false\s*\}\)", boot)
+    js = (WEB / "room_view.js").read_text()
+    assert "if (!probing) { settleAvail(" in js and "offerSetupAfter(ev && ev.error)" in js
+
+
+# --- smaller fixes from the L3 pass --------------------------------------------------------------------------------------
+
+@needs_browser
+def test_a_button_with_no_words_is_not_drawn(tmp_path, w):
+    """mic.js missing its set up words must not leave a blank tappable button: the plain note takes over."""
+    out, _w = _run(tmp_path, w, "Setup", [
+        {"until": "__asks >= 1"},
+        {"eval": "new Promise(r => setTimeout(() => r(JSON.stringify({setup: %s.hidden, mics: document.querySelectorAll('.rv-mic:not(.rv-mic-stream)').length})), 150))" % _SB}],
+        pre="LevainMic.dictateSetup = undefined;")
+    assert json.loads(out["values"][2]) == {"setup": True, "mics": 0}
+
+
+@needs_browser
+def test_a_poll_that_fails_counts_toward_the_limit_and_ends_in_the_slow_note(tmp_path, w):
+    """Red with: a failed poll that resets the count and drops to a bare button (the limit is never reached)."""
+    out, _w = _run(tmp_path, w, "FlakyPoll", [
+        {"until": "%s && %s === %s('slow')" % (_OFFER, _NOTE, _WORD)},
+        {"eval": "JSON.stringify({asks: __asks, inst: __inst.length})"}],
+        extra=" setupPollMs: 2,")
+    got = json.loads(out["values"][2])
+    assert got["inst"] == 0 and got["asks"] >= 100, got

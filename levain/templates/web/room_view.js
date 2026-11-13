@@ -757,12 +757,19 @@
       var setupMs = typeof opts.setupPollMs === "number" ? opts.setupPollMs : 3000;
       function setupWord(key, name) { var M = root.LevainMic; return M && typeof M.dictateSetup === "function" ? M.dictateSetup(key, name) : ""; }
       function setupSay(key, name) { note.textContent = dictNote = setupWord(key, name); }
+      // true when the button is drawn. Dictate is hidden while Setup is shown (one control for one state); a button with no words
+      // (mic.js missing) is not drawn at all, so the caller falls back to the plain note
       function paintSetup(kind) {            // "offer" | "working" | null (no button)
-        if (!kind) { setupB.hidden = true; return; }
-        setupB.hidden = false; setupB.disabled = kind === "working";
-        setupB.textContent = setupWord(kind);
+        var w = kind ? setupWord(kind) : "";
+        if (!w) { setupB.hidden = true; return false; }
+        setupB.hidden = false; setupB.disabled = kind === "working"; micB.style.display = "none";
+        setupB.textContent = w;
         setupB.setAttribute("title", setupWord("offerTitle")); setupB.setAttribute("aria-busy", kind === "working" ? "true" : "false");
+        return true;
       }
+      function canInstall() { return typeof Speech.install === "function"; }
+      // no install() here (or no words for the button): the pack cannot be fetched from this page, so say so and drop Dictate
+      function noSetup() { paintSetup(null); micB.remove(); if (!note.textContent) setupSay("noinstall"); }
       function askAvailable() {
         var a;
         try { a = typeof Speech.available === "function" ? Speech.available({ langs: [lang], processLocally: true }) : null; } catch (e) { a = null; }
@@ -773,26 +780,36 @@
         if (stopped) return;
         clearTimeout(setupT);
         if (st === "unavailable") { paintSetup(null); micB.remove(); if (after) setupSay("none"); }
-        else if (st === "downloadable") { setupPolls = 0; paintSetup("offer"); if (after) setupSay("stillnot"); }
-        else if (st === "downloading") {
-          paintSetup("working");
+        else if (st === "downloadable") {
+          if (!canInstall() || !paintSetup("offer")) return noSetup();
+          setupPolls = 0; if (after) setupSay("stillnot");
+        } else if (st === "downloading") {
+          if (!canInstall() || !paintSetup("working")) return noSetup();
           setupT = setTimeout(function () {
             if (stopped || setupBusy) return;
             if (++setupPolls > SETUP_POLLS) { setupPolls = 0; paintSetup("offer"); setupSay("slow"); return; }
-            askAvailable().then(function (s) { settleAvail(s, false); }, function () { setupPolls = 0; paintSetup("offer"); });
+            // a poll that fails counts toward the same limit: it waits again instead of dropping to a button with no words
+            askAvailable().then(function (s) { settleAvail(s, false); }, function () { settleAvail("downloading", false); });
           }, setupMs);
         } else { setupPolls = 0; paintSetup(null); micB.style.display = ""; if (after) setupSay("done"); }
       }
-      if (opts.probe !== false && typeof Speech.available === "function") {
+      var probing = opts.probe !== false && typeof Speech.available === "function";
+      if (probing) {
         var asked;
         try { asked = Speech.available({ langs: [lang], processLocally: true }); } catch (e) { asked = null; }
         if (asked && asked.then) {
           asked.then(function (st) { settleAvail(st, false); }, function () { micB.style.display = ""; });
         } else micB.style.display = "";
       } else micB.style.display = "";
+      // With probe:false (the cockpit) available() is never asked, so the first sign of a missing or masked pack is a Dictate start
+      // that ends service-not-allowed / language-not-supported (the one DICTATE_REASONS sentence). That, with install() present,
+      // swaps Dictate for the one Setup button below; the same tap handler serves the probe path.
+      function offerSetupAfter(code) {
+        if ((code === "service-not-allowed" || code === "language-not-supported") && canInstall() && !setupBusy) paintSetup("offer");
+      }
       setupB.addEventListener("click", function () {
         if (setupBusy || stopped) return;
-        if (typeof Speech.install !== "function") { paintSetup(null); setupSay("noinstall"); return; }
+        if (!canInstall()) { paintSetup(null); setupSay("noinstall"); return; }
         if (dictNote && note.textContent === dictNote) note.textContent = "";
         dictNote = "";
         setupBusy = true; clearTimeout(setupT); paintSetup("working");
@@ -802,7 +819,8 @@
           setupBusy = false;
           if (stopped) return;
           if (ok !== true) { paintSetup("offer"); setupSay("failed"); return; }
-          return askAvailable().then(function (st) { settleAvail(st, true); }, function () { paintSetup(null); micB.style.display = ""; setupSay("done"); });
+          if (!probing) { settleAvail("available", true); return; }   // never ask available() here: it froze the renderer (RM-G2)
+          return askAvailable().then(function (st) { settleAvail(st, true); }, function () { if (!stopped) { paintSetup(null); micB.style.display = ""; } });
         }, function (e) {
           setupBusy = false;
           if (stopped) return;
@@ -835,6 +853,7 @@
           if (rec !== r) return;
           endDictation();
           dictSay(ev && ev.error);
+          offerSetupAfter(ev && ev.error);
         };
         rec = r; face(micB, "dictate-stop");
         try { r.start(); } catch (e) { endDictation(); dictSay("start"); }
