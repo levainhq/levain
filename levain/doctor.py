@@ -2583,16 +2583,71 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
                         "sessions are checked on every tool call.")]
 
 
+def _operator_record_failure(name: str, rec_path: Path, store: Path, host: str, exc: BaseException) -> CheckResult:
+    """The FAIL row for an operator record that is missing, malformed, not a regular file, or unreadable. Only the
+    entry's ``lstat`` and the read's own exception decide which; the contents are not read again. The remedy is
+    WORDS, never a command line: the install helper's ``setup`` re-creates the record but rewrites the install's
+    settings (slots, verifier slots, roots) from its own arguments, so a printed command that left one out would erase
+    it. An unreadable path (EIO, ENOTDIR) is not ``setup``'s to fix, so it does not mention ``setup``."""
+    import errno
+    import stat as st_mod
+
+    from levain.slot import Refused, layout
+
+    try:
+        helper = f"The install helper ({layout.install_helper_path(host)})"  # type: ignore[arg-type]
+    except KeyError:      # a host the layout table does not know: the generic name, never a raise inside doctor
+        helper = "The install helper"
+    setup_words = (f"Neither this check nor the upgrade verb can repair it. {helper} `setup`, run as root, "
+                   "re-creates the record, but it rewrites the install's settings (slots, verifier slots, roots) from "
+                   f"its own arguments: read the current values from {store}/policy/ (pool holds the slots, roots the "
+                   "--root paths) BEFORE running it, and pass every one of them: --slots, --verifier-slots, "
+                   "--operator and each --root.")
+    read_fail: OSError | None = None
+    try:
+        mode: int | None = os.lstat(rec_path).st_mode
+    except FileNotFoundError:
+        mode = None
+        kind = "missing"
+    except OSError as lerr:
+        mode, kind, read_fail = None, "unreadable", lerr
+    else:
+        if not st_mod.S_ISREG(mode):
+            kind = "not-file"
+        elif isinstance(exc, Refused):
+            kind = "malformed"
+        else:
+            kind, read_fail = "unreadable", exc if isinstance(exc, OSError) else None
+    if kind == "missing":
+        what, hint = "is missing, so the install has no operator record", setup_words
+    elif kind == "malformed":
+        what = "is not a valid operator record (it must name an operator who is not root)"
+        hint = ("The malformed file must be removed as root first (setup cannot read past it, and nothing else "
+                f"restores it). {setup_words}")
+    elif kind == "not-file":
+        shape = ("directory" if st_mod.S_ISDIR(mode or 0) else "link" if st_mod.S_ISLNK(mode or 0) else "special file")
+        what = f"is a {shape}, not a regular file"
+        hint = (f"The entry is a {shape}, not a regular file: remove it as root first (setup cannot read past it). "
+                f"{setup_words}")
+    else:
+        errname = errno.errorcode.get(read_fail.errno or 0, type(read_fail).__name__) if read_fail else "unknown"
+        what = f"could not be read ({errname})"
+        hint = f"The record could not be read ({errname}); fix the path and run `levain doctor` again."
+    return CheckResult(name, False, f"the operator record {rec_path} {what}, so no one can be named as owner of the "
+                       "answers directory", hint)
+
+
 def _check_queue_answers(*, host: str | None = None, store: Path | None = None, uid: int | None = None,
                          lstat: Any = None, qbroker_gid: Any = None, legacy_gid: Any = None) -> list[CheckResult]:
     """The ``queue answers`` row: the directory the operator's answers are written in must be the operator's, in the
     queue broker's group, mode 2750 (0750 only on macOS, where a new file takes the directory's group), so no other
     principal can create a file there. Exactly the old shape (the operator's, group levain-queue, mode 2770) works
     and warns; any other shape fails. The mode bits do not show an ACL, and none is read. The owner is the operator
-    the install record names (``policy/operator``), for every invoker. A record that is missing or malformed fails
-    the row (nobody can be named owner; the remedy is the isolation install again); a record this invoker cannot open
-    leaves the row neutral, with the reason in the detail. No row before the isolation install. ``lstat``/``qbroker_gid``/``legacy_gid``/``uid``: a test's seams
-    (``uid`` is accepted for a caller's sake and does not change the row)."""
+    the install record names (``policy/operator``), for every invoker. A record that is missing, malformed, not a
+    regular file or unreadable for a reason other than permission fails the row (nobody can be named owner; the
+    words in ``_operator_record_failure`` say what to do); a record this invoker may not open leaves the row neutral,
+    with the reason in the detail. No row before the isolation install. ``lstat``/``qbroker_gid``/``legacy_gid``/
+    ``uid``: a test's seams (``uid`` is accepted for a caller's sake and does not change the row)."""
     name = "queue answers"
     if not hasattr(os, "getuid"):
         return []
@@ -2621,20 +2676,7 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
                             "answers directory this is cannot be established from here. Run `levain doctor` as the "
                             "operator or root.", neutral=True)]
     except (OSError, Refused) as exc:
-        # No operator record: nobody can be named owner of the answers directory. `levain upgrade` refuses this state
-        # (and sends the person back here), so the remedy is the isolation install itself.
-        if isinstance(exc, FileNotFoundError):
-            what = "is missing, so the install has no operator record"
-        elif isinstance(exc, Refused):
-            what = "is not a valid operator record (it must name an operator who is not root)"
-        else:
-            what = f"cannot be read ({type(exc).__name__})"
-        helper = layout.install_helper_path(host)  # type: ignore[arg-type]
-        return [CheckResult(name, False, f"the operator record {rec_path} {what}, so no one can be named as owner of "
-                            "the answers directory", "The isolation install has to be run again: "
-                            f"`sudo {helper} setup --slots <N> --verifier-slots <M> --operator <you>` with the "
-                            "values of the first install (setup writes this record last; if the file exists but is "
-                            "malformed, no Levain verb can read past it, so remove it as root first).")]
+        return [_operator_record_failure(name, rec_path, store, host, exc)]
     op_uid, op_name = int(record["uid"]), str(record["name"])  # type: ignore[call-overload]
     path = store / "queue" / "answers"
     try:
