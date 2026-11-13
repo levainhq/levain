@@ -2349,6 +2349,16 @@ def _apply_intention_set_disposition(
     snapshot = _client_snapshot(req, current, intention_id)   # a moved row is stale, ahead of the confirm gate
     if set_next and next_value:
         _refuse_date_on_event_agenda(current)             # a part waits on an event or a date, never both
+    if current is not None:
+        from levain import split
+        from levain.intentions import event_anchor
+
+        named = event_anchor(current)
+        # a someday second part going back to an agenda waits on its first part again: refused when that can no longer be done
+        if named is not None and split.becomes_waiting(current, disposition):
+            why = split.reagenda_refusal(current, store.get(named))
+            if why is not None:
+                raise EditError("bad_verb_arg", 422, why)
     prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit
     # The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a Keep note CAN now be re-routed OUT —
     # note→loop (activate) / note→Tray (promote) — the mirror of the Tray's seed→loop

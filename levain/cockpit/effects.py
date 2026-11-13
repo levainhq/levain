@@ -509,6 +509,14 @@ class IntentionEffectStore:
         except _read_faults() as exc:
             raise TransientApplyFault.of(exc) from exc
 
+    def first_part(self, anchor_id: str) -> dict[str, Any] | None:
+        """The row ``anchor_id`` names as stored (open or resolved), or None when there is none: a read, the way germinate reads
+        the first part a second part waits on."""
+        try:
+            return self._store.get(anchor_id) if self.path.exists() else None
+        except _read_faults() as exc:
+            raise TransientApplyFault.of(exc) from exc
+
     def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:
         return [ApplyUnit(INTENTIONS, (i,), (e,)) for i, e in effects]
 
@@ -912,6 +920,30 @@ def retarget_strands_refusal(params: Mapping[str, Any], pre: Mapping[str, Any] |
     return (f"{pre.get('id')} waits to be marked done by you: {names} waits on it. Handed to the desk or a board it would be "
             "closed when handed off, so nothing could mark it done and that part would never wake. Finish or drop what waits "
             "on it first, or keep it yours.")
+
+
+def reagenda_strands_refusal(verb: str, params: Mapping[str, Any], pre: Mapping[str, Any] | None,
+                             first_part: Callable[[str], Mapping[str, Any] | None]) -> str | None:
+    """Why ``verb`` may not make an agenda of ``pre`` (a second part moved to a someday, its ``on_event`` kept) while the first
+    part it names can no longer be marked done; ``None`` when it may. The other side of :func:`retarget_strands_refusal`: that
+    guard holds a first part for a second part that is waiting, and a someday second part is not, so the first part may have
+    been handed to the desk since. ``first_part`` reads the named row; it is called only for a write that makes an agenda of a
+    row holding an event. The check is ``levain.split.reagenda_refusal``, built on ``anchor_problem``, the test ``create_then`` makes at link time."""
+    from levain.intentions import event_anchor
+    from levain.split import becomes_waiting, reagenda_refusal
+
+    if pre is None:
+        return None
+    if verb == "intention_set_disposition":
+        disposition = params.get("disposition")
+    elif verb == "intention_retarget":
+        disposition = "agenda"               # a target makes an agenda of a someday or a seed
+    else:
+        return None
+    named = event_anchor(pre)
+    if named is None or not becomes_waiting(pre, disposition):
+        return None
+    return reagenda_refusal(pre, first_part(named))
 
 
 def _ce_set_disposition(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *,

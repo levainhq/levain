@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import date, datetime, timedelta
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,9 @@ from levain.intentions import (
     DEFAULT_CHECK_BY_DAYS,
     TRAY_WRITE_DISPOSITIONS,
     done_event,
+    event_anchor,
     executor_of,
+    finished_by_completion,
     guarded_intention_store,
     is_event_agenda,
     list_open_readonly,
@@ -36,7 +39,8 @@ from levain.intentions import (
     valid_check_by,
 )
 
-__all__ = ["ThenRefused", "WakeFailed", "create_then", "followers_of", "then_origin_key", "wake_after"]
+__all__ = ["ThenRefused", "WakeFailed", "anchor_problem", "becomes_waiting", "create_then", "followers_of", "reagenda_refusal",
+           "then_origin_key", "wake_after"]
 
 THEN_KEY_PREFIX = "levain-then:"
 
@@ -73,6 +77,48 @@ def followers_of(items: list[dict[str, Any]], anchor_id: str) -> list[dict[str, 
     return [s for s in items if is_event_agenda(s) and norm_event(s.get("on_event")) == key]
 
 
+def anchor_problem(anchor: Mapping[str, Any] | None) -> tuple[str, int, str, str] | None:
+    """Why ``anchor`` (a row as stored, or None for no such row) cannot be the first part of a split, or None when it can:
+    ``(code, status, message, short)``, the message in the words of a refusal to file a then-part and ``short`` the same
+    reason as a clause. The one check :func:`create_then` makes at link time and a second part makes again when it becomes an
+    agenda (:func:`reagenda_refusal`), so a link cannot be made in a state it would be refused in."""
+    if not isinstance(anchor, Mapping) or anchor.get("status") == "resolved":
+        return ("stale", 409, "the item was resolved or removed since it was read", "it has ended or is gone")
+    disposition = anchor.get("disposition")
+    if not isinstance(disposition, str) or disposition.strip().casefold() not in TRAY_WRITE_DISPOSITIONS:
+        return ("bad_verb_arg", 422, "a then-part follows a someday or an agenda on the List, not a loop",
+                "it is a loop, not a someday or an agenda on the List")
+    if executor_of(anchor.get("target")) == "machine":
+        return ("bad_verb_arg", 422, "this part is handed to the desk or a board, and it is closed when it is handed "
+                "off, so nothing could mark it done: a then-part follows a part you do yourself",
+                "it is handed to the desk or a board, and is closed when handed off, so nothing could mark it done")
+    return None
+
+
+def becomes_waiting(pre: Mapping[str, Any], disposition: Any) -> bool:
+    """Whether giving ``pre`` (a row as stored) ``disposition`` makes an event agenda of a row that is not one now: it names an
+    event it has not woken on, is open, and the new disposition is an agenda (a someday that kept its ``on_event`` going back)."""
+    return (isinstance(disposition, str) and disposition.strip().casefold() == "agenda" and bool(pre.get("on_event"))
+            and not pre.get("germinated") and pre.get("status", "open") == "open" and not is_event_agenda(pre))
+
+
+def reagenda_refusal(follower: Mapping[str, Any], anchor: Mapping[str, Any] | None) -> str | None:
+    """Why ``follower`` (a row as stored, moved off the agenda with its ``on_event`` kept) may not become an agenda again, or
+    None when it may: the part it names (``anchor``, read the way germinate reads it) is no longer a first part that can be
+    marked done, by :func:`anchor_problem`. A first part already finished is no problem: the wake reaches the follower at its
+    next run. Asked of a write that makes the row an agenda, since the retarget guard cannot hold a first part for a part that
+    was not waiting when the first part was handed off."""
+    named = event_anchor(follower)
+    if named is None or finished_by_completion(anchor):
+        return None
+    problem = anchor_problem(anchor)
+    if problem is None:
+        return None
+    fid = follower.get("id")
+    return (f"{fid} waits on {named} being marked done, and that can no longer happen: {problem[3]}. Link a fresh then-part to a "
+            f"part you do yourself, or leave {fid} a someday.")
+
+
 def create_then(intentions_json: Path | str, anchor_id: str, text: str, *, check_by: str | None = None,
                 today: date | None = None) -> dict[str, Any]:
     """File the second part of a split: a new agenda for the operator (target ``band``) that wakes when ``anchor_id`` is done,
@@ -93,14 +139,9 @@ def create_then(intentions_json: Path | str, anchor_id: str, text: str, *, check
         raise ThenRefused("bad_verb_arg", 422, f"check_by {check_by} is already past: it would ring at once")
     store = guarded_intention_store(intentions_json)
     anchor = store.get(anchor_id)
-    if not isinstance(anchor, dict) or anchor.get("status") == "resolved":
-        raise ThenRefused("stale", 409, "the item was resolved or removed since it was read")
-    disposition = anchor.get("disposition")
-    if not isinstance(disposition, str) or disposition.strip().casefold() not in TRAY_WRITE_DISPOSITIONS:
-        raise ThenRefused("bad_verb_arg", 422, "a then-part follows a someday or an agenda on the List, not a loop")
-    if executor_of(anchor.get("target")) == "machine":
-        raise ThenRefused("bad_verb_arg", 422, "this part is handed to the desk or a board, and it is closed when it is handed "
-                          "off, so nothing could mark it done: a then-part follows a part you do yourself")
+    problem = anchor_problem(anchor)
+    if problem is not None:
+        raise ThenRefused(*problem[:3])
     key = then_origin_key(anchor, words)
     prior = store.get_by_origin_key(key)
     if prior is not None and prior.get("status") == "resolved":

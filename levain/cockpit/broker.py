@@ -88,6 +88,7 @@ from levain.cockpit.effects import (
     read_recorded_verb,
     registration_refusals,
     resolve_effect,
+    reagenda_strands_refusal,
     retarget_strands_refusal,
     retarget_to_machine,
     settle,
@@ -851,6 +852,12 @@ class Broker:
             # the split's invariant (a machine part is closed at hand-off, so nothing marks it done) holds after the link too.
             # Asked of a handed-to-the-machine target only, and asked unconditionally: a store that cannot answer is a fault, never "nothing waits"
             why = retarget_strands_refusal(params, snap.row, es.waiting_on(str(snap.row.get("id"))))
+            if why is not None:
+                raise ValueError(why)
+        if verb in ("intention_set_disposition", "intention_retarget") and snap.row is not None:
+            # the other side of that guard: a second part moved to a someday waits on nothing, so its first part may have been
+            # handed off since; making the second part an agenda again is refused when what it waits on can no longer be done
+            why = reagenda_strands_refusal(verb, params, snap.row, lambda aid: es.first_part(aid))
             if why is not None:
                 raise ValueError(why)
         eff = canonical_effect(verb, params, snap.row, version_of=es.version_of)

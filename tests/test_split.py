@@ -6,7 +6,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -405,11 +405,44 @@ def test_the_list_gives_the_first_part_no_then_for_a_second_part_moved_to_a_some
 
     r = Rig(tmp_path, band=False, board=False)
     a = r.ids["agenda_old"]
-    day = (LIST_TODAY.replace(day=LIST_TODAY.day + 5)).isoformat()
+    day = (LIST_TODAY + timedelta(days=5)).isoformat()
     live = r.sp.add(type="task", text="live then", disposition="agenda", target="band", on_event=f"done:{a}", check_by=day, today=LIST_TODAY)
     dead = r.sp.add(type="task", text="dead then", disposition="agenda", target="band", on_event=f"done:{a}", check_by=day, today=LIST_TODAY)
     r.sp.update(dead["id"], disposition="someday")
     assert _list_rows(r.panel())[f"intention:{a}"]["facets"]["then"] == [live["id"]]
+
+
+def test_a_second_part_back_on_the_agenda_is_asked_what_create_then_asks_of_a_first_part(tmp_path):
+    """L3 round 1 of row 1711: one check, two askers. Each way a row cannot be a first part refuses ``create_then`` and refuses the
+    move of a second part back to an agenda; a finished first part, or a second part that names none, is no problem."""
+    root = _install(tmp_path)
+    st = guarded_intention_store(_intentions(root))
+    follower = _follower(root, _anchor(root)["id"], text="x")
+    for make in (lambda: st.add(type="task", text="a loop", tier="hot", today=TODAY),
+                 lambda: st.add(type="task", text="desk", disposition="agenda", target="desk", next="2031-01-07", today=TODAY)):
+        row = make()
+        with pytest.raises(split.ThenRefused) as exc:
+            split.create_then(_intentions(root), row["id"], "after", today=TODAY)
+        why = split.reagenda_refusal({**follower, "on_event": f"done:{row['id']}"}, st.get(row["id"]))
+        assert why is not None and follower["id"] in why and row["id"] in why
+        assert split.anchor_problem(st.get(row["id"]))[:3] == (exc.value.code, exc.value.status, str(exc.value))
+    ended = st.add(type="task", text="ended", disposition="agenda", target="band", next="2031-01-07", today=TODAY)
+    st.descend(ended["id"], kind="composted", today=TODAY)
+    assert split.reagenda_refusal({**follower, "on_event": f"done:{ended['id']}"}, st.get(ended["id"])) is not None
+    assert split.reagenda_refusal({**follower, "on_event": "done:intention-9999"}, None) is not None       # gone
+    done = st.add(type="task", text="done", disposition="agenda", target="desk", next="2031-01-07", today=TODAY)
+    st.descend(done["id"], kind="done", today=TODAY)
+    assert split.reagenda_refusal({**follower, "on_event": f"done:{done['id']}"}, st.get(done["id"])) is None
+    assert split.reagenda_refusal({**follower, "on_event": "landed:np-1"}, None) is None                    # no first part to check
+
+
+def test_only_a_row_that_keeps_an_event_and_has_not_woken_becomes_waiting():
+    f = {"id": "intention-1", "status": "open", "disposition": "someday", "on_event": "done:intention-2"}
+    assert split.becomes_waiting(f, "agenda") and not split.becomes_waiting(f, "someday") and not split.becomes_waiting(f, None)
+    assert not split.becomes_waiting({**f, "disposition": "agenda"}, "agenda")              # already waiting: not a move
+    assert not split.becomes_waiting({**f, "germinated": {"on": "2026-11-10"}}, "agenda")   # already woken
+    assert not split.becomes_waiting({**f, "on_event": None}, "agenda")
+    assert not split.becomes_waiting({**f, "status": "resolved"}, "agenda")
 
 
 def test_the_verb_binds_the_row_version_and_audits(tmp_path, qdir):

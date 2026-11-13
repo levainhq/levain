@@ -321,6 +321,71 @@ def test_a_second_part_moved_to_a_someday_no_longer_holds_its_first_part_and_mov
     assert store.get(a)["target"] == "desk"
 
 
+def test_a_someday_second_part_is_not_made_an_agenda_again_on_a_first_part_that_can_no_longer_be_marked_done(tmp_path: Path) -> None:
+    """L3 round 1 of row 1711 (all three seats). F agenda -> someday -> A to the desk (allowed, nothing waits) -> F agenda again
+    left F waiting on a ``done:A`` that nothing could mark: the state ``create_then`` refuses at link time. The move back is
+    refused by the same check, with the first part named; a first part that is still the operator's own, or already done, is not."""
+    root, src, _ids = _install(tmp_path)
+    a, f = _split_pair(root)
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        st, body = _set_disposition(base, f, {"disposition": "someday"})
+        assert st == 200, body
+        st, body = _retarget(base, a, {"target": "desk"})
+        assert st == 200, body                                                            # nothing waits on it: allowed
+        st, body = _set_disposition(base, f, {"disposition": "agenda"})
+        assert st == 409 and body["error"] == "refused", (st, body)                       # the neighbours' answer, not a 500
+        assert a in str(body) and "handed to the desk" in str(body) and "someday" in str(body), (st, body)   # names the part, why, what to do
+    assert store.get(f)["disposition"] == "someday" and store.get(f)["on_event"] == f"done:{a}"      # refused: nothing written
+
+
+def test_the_other_door_to_an_agenda_asks_the_same_question(tmp_path: Path) -> None:
+    """A someday second part given a who and a when through ``intention_retarget`` also becomes an agenda: the same refusal."""
+    root, src, _ids = _install(tmp_path)
+    a, f = _split_pair(root)
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        assert _set_disposition(base, f, {"disposition": "someday"})[0] == 200
+        assert _retarget(base, a, {"target": "board:levain"})[0] == 200
+        st, body = _retarget(base, f, {"target": "band", "surface_at": "2031-02-03"})
+        assert st == 409 and a in str(body), (st, body)
+    assert store.get(f)["disposition"] == "someday"
+
+
+@pytest.mark.parametrize("first_part", ["open", "done", "composted"])
+def test_a_second_part_comes_back_to_an_agenda_only_while_its_first_part_can_still_be_done(tmp_path: Path, first_part: str) -> None:
+    """Still open and the operator's own: it waits again (and holds the first part). Already done: it is an agenda the wake
+    reaches at its next run. Ended without being done: refused, since nothing can mark it."""
+    root, src, _ids = _install(tmp_path)
+    a, f = _split_pair(root)
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        assert _set_disposition(base, f, {"disposition": "someday"})[0] == 200
+        if first_part != "open":
+            store.descend(a, kind="done" if first_part == "done" else "composted", today=TODAY)
+        st, body = _set_disposition(base, f, {"disposition": "agenda"})
+    assert (st == 200) == (first_part != "composted"), (first_part, st, body)
+    assert store.get(f)["disposition"] == ("someday" if first_part == "composted" else "agenda")
+
+
+def test_the_legacy_write_door_asks_the_same_question(tmp_path: Path) -> None:
+    """``apply_edit``'s ``intention_set_disposition`` (the terminal UI and the CLI) refuses the same move, with the same words."""
+    from levain.writes import EditError, apply_edit
+
+    root, src, _ids = _install(tmp_path)
+    a, f = _split_pair(root)
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    apply_edit(src.write_scope, {"kind": "intention_set_disposition", "intention_id": f, "disposition": "someday"})
+    store.update(a, target="desk", today=TODAY)                                            # the first part went to the desk meanwhile
+    with pytest.raises(EditError, match="handed to the desk") as exc:
+        apply_edit(src.write_scope, {"kind": "intention_set_disposition", "intention_id": f, "disposition": "agenda"})
+    assert a in str(exc.value) and "someday" in str(exc.value)
+    assert store.get(f)["disposition"] == "someday"
+    store.update(a, target="band", today=TODAY)                                            # the operator's own again: allowed
+    apply_edit(src.write_scope, {"kind": "intention_set_disposition", "intention_id": f, "disposition": "agenda"})
+    assert store.get(f)["disposition"] == "agenda"
+
+
 # --- the guard's own edges (L3 round 1 of the diogenes-20261113-020650 fix) ------------------------------------------------
 import sqlite3  # noqa: E402
 
