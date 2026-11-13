@@ -4227,11 +4227,33 @@ def _check_keep_migration(install: Path) -> list[CheckResult]:
                         warn=True)]
 
 
+def _check_by_ring_open(item: dict[str, Any], day: Any, rung: list[set[str]]) -> bool:
+    """Whether germinate has filed this part's check-by question for ``day`` and the operator has not answered it yet. Germinate
+    leaves such a part unstamped on purpose (the event may still wake it), so it is a pending answer, not a missed run. An
+    answered row is not counted: its effect (a later check-by, or the part dropped) either landed, and the part is no longer late
+    or gone, or did not, and a run is owed. ``rung`` is the caller's one-slot cache of the open rows' keys. A band that cannot be
+    read answers False: the doctor then reports the part, as it did before it asked."""
+    from levain.consent.queue import default_queue_dir
+    from levain.consent.questions import QuestionStore
+    from levain.germinate import KEY_PREFIX
+
+    okey = item.get("origin_key")
+    if not isinstance(okey, str) or not okey:
+        return False        # germinate rings a part only by its origin key: with none it never filed a row
+    if not rung:
+        try:
+            rung.append({q.agent_session_id for q in QuestionStore(default_queue_dir()).open_questions()})
+        except Exception:  # noqa: BLE001 - a doctor check reports, it never crashes the run
+            rung.append(set())
+    return f"{KEY_PREFIX}checkby:{okey}:{day.isoformat()}" in rung[0]
+
+
 def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]:
     """``intentions: overdue-agenda`` (TS-3): an open agenda whose ``next`` day is before today and that was never
     germinated is a defect (the session-start, 06:10 and minute runs all missed it). So is an agenda that waits on an event
-    (a split's second part) whose first part has finished, or whose check-by day has come, and that was never germinated. Report
-    only, no gate: a warning row, never a failure. Silent with no intentions file, no agenda or none overdue."""
+    (a split's second part) whose first part has finished, or whose check-by day has come, and that was never germinated; except
+    a part past its check-by whose question germinate filed and the operator has not answered, which germinate leaves unstamped
+    by design. Report only, no gate: a warning row, never a failure. Silent with no intentions file, no agenda or none overdue."""
     from datetime import date as _date
 
     from levain.germinate import _check_by_day, _is_agenda
@@ -4249,12 +4271,13 @@ def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]
         return [CheckResult(name, False, f"could not read .levain/memory.spores.json ({type(e).__name__}: {e})",
                             "The intention store is unreadable; restore it from a backup or git.")]
     late = []
+    rung: list[set[str]] = []      # the check-by rows open in the band, read once and only when a part past its check-by asks
     for s in items:
         try:   # one malformed intention is skipped, never the row (known edge, closed: a stamped-but-uncomposed agenda is the 06:10 run's)
             if is_event_agenda(s):
                 due_by = _check_by_day(s)
                 anchor = event_anchor(s)
-                if (due_by is not None and due_by <= day) or (
+                if (due_by is not None and due_by <= day and not _check_by_ring_open(s, due_by, rung)) or (
                         anchor is not None and finished_by_completion(guarded_intention_store(intentions).get(anchor))):
                     late.append(s)
                 continue

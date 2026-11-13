@@ -797,3 +797,61 @@ def test_who_on_a_waiting_part_hands_it_off_by_target_alone_and_it_still_wakes_o
     _done(root, a["id"])
     res = _run(root, qdir)
     assert [o["intention_id"] for o in res["due"]] == [f["id"]] and not res["errors"]          # and the event wakes it as the desk's
+
+
+# --- the doctor row and the check-by ring: a part germinate leaves unstamped on purpose is not a defect --------------
+def test_doctor_does_not_flag_a_part_whose_check_by_question_is_waiting_for_its_answer(tmp_path, qdir, pings, monkeypatch):
+    """diogenes-20261113-020557: germinate files "Still waiting on ..." for a part past its check-by and leaves it unstamped on
+    purpose (the event may still wake it), so the doctor, which could not tell that from a run that never happened, reported a
+    defect on every run until the operator answered. Run through the real germinate: warned before it, silent once it filed the
+    row, warning again if the row is gone."""
+    from levain import doctor
+
+    monkeypatch.setenv("LEVAIN_HOME", str(qdir.parent))
+    root = _install(tmp_path)
+    a = _anchor(root)
+    f = _follower(root, a["id"], check_by="2026-11-10")
+    assert f["id"] in doctor._check_overdue_agenda(root, today=TODAY)[0].detail            # germinate never ran: a real defect
+    res = _run(root, qdir)
+    assert [c["via"] for c in res["checkby"]] == ["ringing"] and _intention(root, f["id"]).get("germinated") is None
+    assert doctor._check_overdue_agenda(root, today=TODAY) == []                           # it ran; the answer is pending
+    QuestionStore(qdir).close_open(f"{g.KEY_PREFIX}checkby:{f['origin_key']}", text="gone", channel="cli")
+    assert f["id"] in doctor._check_overdue_agenda(root, today=TODAY)[0].detail            # no open row: not a pending answer
+
+
+def test_doctor_still_flags_a_finished_first_part_whatever_the_check_by_question_says(tmp_path, qdir, pings, monkeypatch):
+    """The ring is no excuse for a part whose first part finished: germinate wakes that one, so a run is still owed."""
+    from levain import doctor
+
+    monkeypatch.setenv("LEVAIN_HOME", str(qdir.parent))
+    root = _install(tmp_path)
+    a = _anchor(root)
+    f = _follower(root, a["id"], check_by="2026-11-10")
+    _run(root, qdir)                                                                        # the ring is filed
+    _done(root, a["id"])
+    assert f["id"] in doctor._check_overdue_agenda(root, today=TODAY)[0].detail
+
+
+def test_doctor_counts_only_the_ring_for_the_parts_own_check_by_day(tmp_path, qdir, pings, monkeypatch):
+    """A row filed for another check-by day is not this day's pending answer (germinate's key names the day)."""
+    from levain import doctor
+
+    monkeypatch.setenv("LEVAIN_HOME", str(qdir.parent))
+    root = _install(tmp_path)
+    a = _anchor(root)
+    f = _follower(root, a["id"], check_by="2026-11-10")
+    _run(root, qdir)
+    assert doctor._check_overdue_agenda(root, today=TODAY) == []
+    guarded_intention_store(_intentions(root)).update(f["id"], check_by="2026-11-09")     # moved: yesterday's row is not its row
+    assert f["id"] in doctor._check_overdue_agenda(root, today=TODAY)[0].detail
+
+
+def test_doctor_reports_the_part_when_the_band_cannot_be_read(tmp_path, qdir, monkeypatch):
+    """No readable band means the doctor cannot tell a pending answer from a missed run: it reports, never crashes, never excuses."""
+    from levain import doctor
+
+    monkeypatch.setenv("LEVAIN_HOME", str(qdir.parent))
+    (qdir / "questions.db").write_bytes(b"this is not a sqlite file" * 40)
+    root = _install(tmp_path)
+    f = _follower(root, _anchor(root)["id"], check_by="2026-11-10")
+    assert f["id"] in doctor._check_overdue_agenda(root, today=TODAY)[0].detail
