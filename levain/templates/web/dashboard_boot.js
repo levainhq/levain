@@ -283,6 +283,26 @@
 
   // K2a: `levain serve` opens the page with the write token in the URL FRAGMENT (never sent to the server).
   // Take it, keep it, and strip it from the address bar, leaving any chat_token for the chat panel.
+  // A token this browser already holds is replaced only once the server has accepted the new one: a link that arrives by a
+  // redirect from another origin carries whatever it likes, and storing that first would force the owner to pair again.
+  // With nothing held there is nothing to lose, so a first pairing stores at once. The first board read waits (bounded) for
+  // the answer, so it never runs on the old token while the new one is being checked.
+  const FRAGMENT_TOKEN_CHECK_MS = 8000;
+  let fragmentTokenPending = null;
+  // Whether the server takes `tok` as a credential: its manifest names the class of the credential it read (a refused or
+  // unknown key answers 200 with class "none", pair.js M1). Anything but a clear yes is a no.
+  async function serverTakesToken(tok) {
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), FRAGMENT_TOKEN_CHECK_MS) : 0;
+    try {
+      const res = await fetch("/cockpit/manifest.json", { method: "GET", headers: { "X-Levain-Write-Token": tok }, cache: "no-store",
+        referrerPolicy: "no-referrer", signal: ctl ? ctl.signal : undefined });
+      if (res.status !== 200) return false;
+      const m = await res.json();
+      return !!(m && m.credential && m.credential.class === "token");
+    } catch (_) { return false; }
+    finally { if (timer) clearTimeout(timer); }
+  }
   (function takeFragmentWriteToken() {
     try {
       const params = new URLSearchParams((location.hash || "").replace(/^#/, ""));
@@ -292,12 +312,18 @@
       const rest = params.toString();
       history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
       // a token is printable ASCII without spaces (it travels in a request header)
-      if (/^[\x21-\x7e]+$/.test(tok)) {
+      if (!/^[\x21-\x7e]+$/.test(tok)) { console.warn("levain: the write token in the link is not a header-safe string; not stored"); return; }
+      const take = () => {
         window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
         window.localStorage.removeItem(PAIRED_MARK_KEY);   // the owner's own link: this browser holds the owner's key now
         announceTokenChange();
-      }
-      else console.warn("levain: the write token in the link is not a header-safe string; not stored");
+      };
+      const held = window.localStorage.getItem(WRITE_TOKEN_KEY) || "";
+      if (!held || held === tok) { take(); return; }
+      fragmentTokenPending = serverTakesToken(tok).then((ok) => {
+        if (ok) take();
+        else console.warn("levain: the write token in the link was not accepted by the server; the token this browser holds is kept");
+      }).catch(() => { /* no storage: the prompt still works */ }).finally(() => { fragmentTokenPending = null; });
     } catch (_) { /* no history or storage: the prompt still works */ }
   })();
 
@@ -1244,6 +1270,7 @@
     let landed = false;
     if (btn) btn.disabled = true;
     try {
+      if (fragmentTokenPending) await fragmentTokenPending;   // a link's token is being checked: read with the token that settles
       if (useManifest) {
         // the first board draws as its panels land: the cold "connecting..." line goes with the first useful content
         const drawView = (mview) => {
