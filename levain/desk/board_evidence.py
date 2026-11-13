@@ -26,6 +26,9 @@ Rules the readers hold, each from a measured or ruled failure:
   :func:`_snapshot` turns every ref the reader uses (the notes ref included) into a sha at the start, and every later read
   (``log``, ``--merged``, the negatives, the notes tree) takes those shas, so a concurrent ``git fetch`` cannot move a ref
   between two reads.
+* The notes are read BOUNDED (:class:`_Notes`): the notes tree's names are listed (at most :data:`MAX_NOTES_ENTRIES`), and
+  the text is read only for commits a log returned, at most :data:`MAX_NOTES_BYTES` of it; past either cap, or for a notes
+  ref git cannot list, every source reads unreadable and the reason names the cap.
 * A commit's work is "landed" only by a ONE-TO-ONE match (each main commit accounts for at most one branch commit) with
   a main commit AFTER the branch's merge-base with main (``git cherry``'s upstream side) that no later main commit
   reverted. A patch-id match is the proof; the trailer-ids + subject key is the fallback ONLY for a commit that has no
@@ -36,7 +39,8 @@ Rules the readers hold, each from a measured or ruled failure:
   nothing and names nothing. A revert is only what git writes: a ``Revert "`` subject and ONE body line ``This reverts
   commit <40 hex>.`` (a merge: ``..., reversing`` / ``changes made to <40 hex>.``); prose that merely starts with the
   phrase, a hand-written short or upper-case sha, or a message carrying two distinct markers is not a revert. A revert of
-  a merge takes back everything the merge brought in. The ``reader`` summary carries every field on every path, failure
+  a merge (the merge form, its mainline sha a parent of the merge) takes back everything the merge brought in, except on a
+  cut main log, where it takes back the merge alone. The ``reader`` summary carries every field on every path, failure
   included.
 """
 from __future__ import annotations
@@ -56,8 +60,8 @@ from typing import Any
 
 from levain.desk.board_state import parse_timestamp
 
-__all__ = ["BOARD_EPOCH", "BRANCH_PREFIXES", "GitFailed", "MAX_MAIN_COMMITS", "MAX_OWN_COMMITS", "MIN_PREWINDOW_TAIL", "READ_DEADLINE_S",
-           "read_documents", "read_git_evidence", "repo_name_of"]
+__all__ = ["BOARD_EPOCH", "BRANCH_PREFIXES", "GitFailed", "MAX_MAIN_COMMITS", "MAX_NOTES_BYTES", "MAX_NOTES_ENTRIES", "MAX_OWN_COMMITS",
+           "MIN_PREWINDOW_TAIL", "READ_DEADLINE_S", "read_documents", "read_git_evidence", "repo_name_of"]
 
 REMOTE = "origin"
 MAIN_BRANCH = "main"
@@ -77,6 +81,11 @@ MAX_OWN_COMMITS = 20000
 #: wrong clock proves nothing). A cut log without that tail reads unreadable, with what depends on it.
 MAX_MAIN_COMMITS = 20000
 MIN_PREWINDOW_TAIL = 50
+#: The board's notes are read BOUNDED: at most this many entries in the notes tree (its names are listed, nothing more), and
+#: at most this many bytes of note text over the whole read (the sizes are asked of git first, so a note is never loaded to
+#: find out it is too big). Past either the read fails closed: every source reads unreadable and the reason names the cap.
+MAX_NOTES_ENTRIES = 100000
+MAX_NOTES_BYTES = 8 * 1024 * 1024
 _NOTES_REF = "refs/notes/board"
 _RS, _US, _GS = "\x1e", "\x1f", "\x1d"
 _FMT = ("%x1e%H%x1f%P%x1f%cI%x1f%s%x1f%(trailers:key=Board-Item,valueonly,unfold,separator=%x1d)"
@@ -85,10 +94,11 @@ _NOTE_LINE = re.compile(r"^[ \t]*Board-(Item|Closes):[ \t]*(.*?)[ \t]*$", re.I |
 #: A revert exactly as git writes it (`git revert`): the subject starts `Revert "` (`Reapply "` for the revert of a
 #: revert) and a body line is `This reverts commit <sha>.` (a merge: `This reverts commit <sha>, reversing` + newline +
 #: `changes made to <mainline parent sha>.`). Anything else, prose that merely starts with the phrase included, is not a
-#: revert; a hand-written short or upper-case sha is not recognised (a known edge).
+#: revert; a hand-written short or upper-case sha is not recognised (a known edge). A line may end `\r` (CRLF bodies from some
+#: web tooling).
 _REVERT_SUBJECTS = ('Revert "', 'Reapply "')      # git >= 2.43 titles the revert of a revert `Reapply "..."`
-_REVERT_PLAIN = re.compile(r"^This reverts commit ([0-9a-f]{40})\.$", re.M)
-_REVERT_MERGE = re.compile(r"^This reverts commit ([0-9a-f]{40}), reversing\s+changes made to ([0-9a-f]{40})\.$", re.M)
+_REVERT_PLAIN = re.compile(r"^This reverts commit ([0-9a-f]{40})\.\r?$", re.M)
+_REVERT_MERGE = re.compile(r"^This reverts commit ([0-9a-f]{40}), reversing\s+changes made to ([0-9a-f]{40})\.\r?$", re.M)
 _NONE = re.compile(r"none\b", re.I)
 _TOKEN = re.compile(r"(?:^|-)i([0-9]+)(?=-|$)")
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -235,45 +245,80 @@ def _parse_log(out: str, notes: Mapping[str, str]) -> dict[str, _Commit]:
     return commits
 
 
-def _log(repo: Path, revs: Iterable[str], *, negatives: Iterable[str] = (), limit: int, notes: Mapping[str, str] | None = None
+class _Notes(dict[str, str]):
+    """The board's notes (``{commit sha: note text}``), read from the notes tree at the SNAPSHOT's sha, once, and BOUNDED.
+
+    ``git log --notes=<sha>`` takes a ref NAME (a bare sha is read as ``refs/notes/<sha>`` and silently shows nothing), so
+    the tree is read here, from the sha: a notes fetch between two logs cannot give them different notes, and nothing is
+    written to make a temporary ref. Construction lists the tree's NAMES only (``ls-tree -r -z --name-only``; '' for an
+    absent ref: no notes). :meth:`load` then reads the blobs of just the commits a log returned, lazily, asking git their
+    sizes first. A tree over :data:`MAX_NOTES_ENTRIES`, a notes ref git cannot list (not a tree or a commit) or a
+    construction failure raises :class:`GitFailed`; a failure while loading sets :attr:`error` instead (the log being
+    parsed goes on, and the reader discards the whole read: fail closed, never partial)."""
+
+    def __init__(self, repo: Path, tree: str) -> None:
+        super().__init__()
+        self.repo, self.tree = repo, tree
+        self.bytes = 0                                   # note text asked of git so far
+        self.error: str | None = None
+        self._path: dict[str, str] = {}                  # commit sha -> its path in the tree (`ab/cdef...` when fanned out)
+        if not tree:
+            return
+        names = [n for n in _git(repo, "ls-tree", "-r", "-z", "--name-only", tree).split("\0") if n]
+        if len(names) > MAX_NOTES_ENTRIES:
+            raise GitFailed(f"more than {MAX_NOTES_ENTRIES} notes on {_NOTES_REF} (MAX_NOTES_ENTRIES)")
+        for name in names:
+            key = name.replace("/", "")                  # a fanned-out tree: `ab/cdef...`
+            if _SHA.fullmatch(key):
+                self._path[key] = name
+
+    def load(self, shas: Iterable[str]) -> None:
+        """Read the notes of ``shas`` that exist and are not read yet: one size query, then one read."""
+        if self.error is not None or not self._path:
+            return
+        want = [s for s in dict.fromkeys(shas) if s in self._path and s not in self]
+        if not want:
+            return
+        specs = [f"{self.tree}:{self._path[s]}" for s in want]
+        try:
+            sizes = _git(self.repo, "cat-file", "--batch-check=%(objecttype) %(objectsize)", stdin="".join(f"{x}\n" for x in specs).encode()
+                         ).splitlines()
+            if len(sizes) != len(specs):
+                raise GitFailed("git cat-file gave a note size this reader cannot parse")
+            total = self.bytes + sum(int(line.split()[1]) for line in sizes if line.startswith("blob "))
+            if total > MAX_NOTES_BYTES:
+                raise GitFailed(f"more than {MAX_NOTES_BYTES} bytes of notes on {_NOTES_REF} (MAX_NOTES_BYTES)")
+            self.bytes = total
+            cp = _run(self.repo, "cat-file", "--batch", stdin="".join(f"{x}\n" for x in specs).encode())
+            if cp.returncode != 0:
+                raise GitFailed(_fail_text(("cat-file",), cp))
+            data, pos = cp.stdout, 0
+            for sha in want:
+                end = data.index(b"\n", pos)
+                head = data[pos:end].split()
+                if len(head) == 2 and head[1] == b"missing":          # not a note (it cannot be read): no attribution, never a guess
+                    self[sha], pos = "", end + 1
+                    continue
+                if len(head) != 3:
+                    raise GitFailed("git cat-file gave a note this reader cannot parse")
+                size = int(head[2])
+                self[sha] = data[end + 1:end + 1 + size].decode("utf-8", "replace") if head[1] == b"blob" else ""
+                pos = end + 1 + size + 1
+        except (GitFailed, ValueError, IndexError) as exc:
+            self.error = str(exc)
+
+
+def _log(repo: Path, revs: Iterable[str], *, negatives: Iterable[str] = (), limit: int, notes: _Notes | None = None
          ) -> dict[str, _Commit]:
     """The commits reachable from ``revs`` and from none of ``negatives``, newest first, at most ``limit`` of them (a count,
     never a date: ``--since`` stops the walk at a commit dated wrong and hides the history behind it). ``notes`` is the
-    board's notes as read ONCE from the snapshot (:func:`_read_notes`); the log never names the notes ref, and no other
-    notes ref is shown (the format has no ``%N``)."""
+    board's notes (:class:`_Notes`): the notes of exactly the commits this log returns are read, once; the log never names
+    the notes ref, and no other notes ref is shown (the format has no ``%N``)."""
     stdin = "".join(f"{r}\n" for r in revs) + "".join(f"^{n}\n" for n in negatives)
-    return _parse_log(_git(repo, "log", f"--format={_FMT}", f"-n{limit}", "--stdin", stdin=stdin.encode()), notes or {})
-
-
-def _read_notes(repo: Path, notes_sha: str) -> dict[str, str]:
-    """``{commit sha: note text}`` of the notes tree at ``notes_sha`` (the snapshot's sha of ``refs/notes/board``; '' when
-    the ref is absent, and then there are no notes). ``git log --notes=<sha>`` takes a ref NAME (a bare sha is read as
-    ``refs/notes/<sha>`` and silently shows nothing), so the tree is read here, from the sha, once: a notes fetch between
-    two logs cannot give them different notes, and nothing is written to make a temporary ref."""
-    if not notes_sha:
-        return {}
-    blobs: dict[str, str] = {}                           # commit sha -> blob sha
-    for entry in _git(repo, "ls-tree", "-r", "-z", notes_sha).split("\0"):
-        meta, _tab, path = entry.partition("\t")
-        parts = meta.split()
-        key = path.replace("/", "")                      # a fanned-out tree: `ab/cdef...`
-        if len(parts) == 3 and parts[1] == "blob" and _SHA.fullmatch(key) and _SHA.fullmatch(parts[2]):
-            blobs[key] = parts[2]
-    if not blobs:
-        return {}
-    cp = _run(repo, "cat-file", "--batch", stdin="".join(f"{b}\n" for b in sorted(set(blobs.values()))).encode())
-    if cp.returncode != 0:
-        raise GitFailed(_fail_text(("cat-file",), cp))
-    data, pos, text_of = cp.stdout, 0, {}
-    while pos < len(data):
-        end = data.index(b"\n", pos)
-        head = data[pos:end].split()
-        if len(head) != 3 or head[1] != b"blob":
-            raise GitFailed("git cat-file gave a note this reader cannot parse")
-        size = int(head[2])
-        text_of[head[0].decode()] = data[end + 1:end + 1 + size].decode("utf-8", "replace")
-        pos = end + 1 + size + 1
-    return {c: text_of[b] for c, b in blobs.items() if b in text_of}
+    out = _git(repo, "log", f"--format={_FMT}", f"-n{limit}", "--stdin", stdin=stdin.encode())
+    if notes is not None:
+        notes.load(rec.split(_US, 1)[0].strip() for rec in out.split(_RS) if rec.strip())
+    return _parse_log(out, notes if notes is not None else {})
 
 
 def _patch_ids(repo: Path, shas: list[str]) -> dict[str, str]:
@@ -382,21 +427,36 @@ def _ancestors(commits: Mapping[str, _Commit], start: str) -> set[str]:
     return seen
 
 
+def _is_cut(commits: Mapping[str, _Commit]) -> bool:
+    """Whether ``commits`` (main's log) is a log cut at the cap: one commit past :data:`MAX_MAIN_COMMITS` was read. The one
+    place that says so (the reader's whole-for-the-window rule and :func:`_takes_back` both ask here)."""
+    return len(commits) > MAX_MAIN_COMMITS
+
+
 def _takes_back(commits: Mapping[str, _Commit]) -> dict[str, set[str]]:
-    """``{reverting commit: the commits its revert takes back}``, for the commits of ``commits`` whose canonical marker names
-    a commit of ``commits``. A revert of an ordinary commit takes back that commit. A revert of a MERGE, made against a
-    mainline parent P (``git revert -m <n>``; the first parent when the marker names none that is a parent), takes back the
-    merge and everything it brought in: what is reachable from the merge and not from P."""
+    """``{reverting commit: the commits its revert takes back}``, for the commits of ``commits`` (main's log) whose canonical
+    marker names a commit of ``commits``. A revert of an ordinary commit takes back that commit, and its marker is the plain
+    one. A revert of a MERGE is the merge form, and its mainline sha must be a PARENT of the merge (``git revert -m <n>``
+    writes exactly that): it takes back the merge and everything it brought in, what is reachable from the merge and not from
+    that parent. A marker of the other form for its target (a plain line naming a merge, a merge line naming an ordinary
+    commit, a mainline that is no parent) is not what git writes and reverts nothing. On a CUT log the ancestor sets are
+    computed over what is left of the history, so a commit connected to the mainline only through an omitted commit would
+    read as brought in by the merge: there a merge revert takes back the merge alone."""
+    whole = not _is_cut(commits)
     out: dict[str, set[str]] = {}
     for c in commits.values():
         for r in c.reverts:
             target = commits.get(r)
             if target is None:
                 continue
-            gone = {r}
             if target.merge:
-                mainline = c.mainline if c.mainline in target.parents else target.parents[0]
-                gone |= _ancestors(commits, r) - _ancestors(commits, mainline)
+                if c.mainline not in target.parents:
+                    continue
+            elif c.mainline is not None:
+                continue
+            gone = {r}
+            if target.merge and whole and c.mainline is not None:
+                gone |= _ancestors(commits, r) - _ancestors(commits, c.mainline)
             out.setdefault(c.sha, set()).update(gone)
     return out
 
@@ -405,8 +465,8 @@ def _in_effect(commits: Mapping[str, _Commit]) -> set[str]:
     """The commits of ``commits`` whose change is still on main: not taken back by a ``This reverts commit <sha>`` of
     a commit that is itself in effect (so a revert of the revert puts the first one back). Independent of log order (a
     commit dated wrong can sit before its own parent); a revert always follows its target, so the walk ends. A revert of a
-    MERGE takes back every commit the merge brought in (see :func:`_takes_back`), not the merge alone: the merge itself
-    carries no trailers, the commits on its side do."""
+    MERGE takes back every commit the merge brought in (see :func:`_takes_back`, which also says what a cut log changes), not
+    the merge alone: the merge itself carries no trailers, the commits on its side do."""
     taken_by: dict[str, list[str]] = {}
     for reverter, gone in _takes_back(commits).items():
         for sha in gone:
@@ -564,14 +624,14 @@ class _Tally:
 
 class _Matcher:
     """Which main commits a branch (or a queue ref) may be compared with: those AFTER its merge-base with main (the
-    commits main holds that the branch's history does not: ``git cherry``'s upstream side), in the window, and not
-    reverted by a later main commit. (A reverted landing that is applied again, by a revert of the revert, matches through
-    that second commit's own patch-id.)"""
+    commits main holds that the branch's history does not: ``git cherry``'s upstream side), in the window, and IN EFFECT
+    (:func:`_in_effect`: not taken back by a revert that is itself in effect, so a revert of the revert puts the landing
+    back among the candidates)."""
 
     def __init__(self, main: Mapping[str, _Commit], others: Mapping[str, _Commit], window: float) -> None:
         self.main, self.others, self.window = main, others, window
-        reverted = {x for gone in _takes_back(main).values() for x in gone}      # landings a later main commit took back (a merge's, too)
-        self.candidates = [c.sha for c in main.values() if not c.merge and c.ts >= window and c.sha not in reverted]
+        live = _in_effect(main)                                                  # the landings no live revert took back (a merge's, too)
+        self.candidates = [c.sha for c in main.values() if not c.merge and c.ts >= window and c.sha in live]
         self._pools: dict[frozenset[str], tuple[str, ...]] = {}
 
     def boundary(self, tips: Iterable[str]) -> frozenset[str]:
@@ -662,10 +722,20 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
              + ": its history is not whole, so no count of commits can be trusted")
         return ev, summary
     try:
-        notes = _read_notes(repo, snap.get(_NOTES_REF, ("", 0.0, None))[0])      # the snapshot's sha, read once; every log below is given these
-    except (GitFailed, ValueError) as exc:
+        notes = _Notes(repo, snap.get(_NOTES_REF, ("", 0.0, None))[0])      # the snapshot's sha: the tree's names now, the notes of each log's commits as it is read
+    except GitFailed as exc:
         fail(every, f"{_NOTES_REF} cannot be read ({exc})")
         return ev, summary
+
+    def notes_failed() -> bool:
+        """A note the caps or git refused while a log was read: the read is discarded whole (the same fail-closed answer as a
+        notes tree that cannot be listed), never kept with some attributions missing."""
+        if notes.error is None:
+            return False
+        for key in [k for k in ev if k not in ("evidence_v", "unreadable")]:
+            del ev[key]
+        fail(every, f"{_NOTES_REF} cannot be read ({notes.error})")
+        return True
     if fetched is not None:
         ev["fetched_at"] = fetched
 
@@ -684,7 +754,7 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
     main_commits: dict[str, _Commit] = {}
     try:        # main: the newest MAX_MAIN_COMMITS; one more is asked for, because ONLY a log that has a commit past the cap is cut
         main_commits = _log(repo, [main_sha], limit=MAX_MAIN_COMMITS + 1, notes=notes)
-        if len(main_commits) > MAX_MAIN_COMMITS:    # a log cut at the cap: whole FOR THE WINDOW only if a real tail of it is older than the window
+        if _is_cut(main_commits):                   # a log cut at the cap: whole FOR THE WINDOW only if a real tail of it is older than the window
             tail = sum(1 for c in main_commits.values() if c.ts < window)    # a count of old commits, never one date: one skewed commit proves nothing
             if tail < MIN_PREWINDOW_TAIL:
                 raise GitFailed(f"more than {MAX_MAIN_COMMITS} commits reachable from {main_short}, and fewer than {MIN_PREWINDOW_TAIL} of them predate the window")
@@ -692,6 +762,8 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
     except GitFailed as exc:
         main_commits = {}
         fail(("main", "chain", "branches", "unattributed"), f"{main_short} history cannot be read ({exc})")
+    if notes_failed():
+        return ev, summary
 
     unattributed: dict[str, dict[str, str]] = {}
 
@@ -713,6 +785,8 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
         for c in main_commits.values():
             note_unattributed(c)
         ev["unattributed"] = sorted(unattributed.values(), key=lambda u: u["sha"])
+    if notes_failed():
+        return ev, summary
     summary.update(main_commits=len(main_commits), main_records=len(ev.get("main", ())), chain_refs=len(chain_rows),
                    chain_commits=sum(len(r["commits"]) for r in chain_rows), branches=len(branch_rows), refs=len(refs),
                    merged=len(merged), unattributed=len(ev.get("unattributed", ())), **extra)
@@ -738,7 +812,7 @@ def read_git_evidence(repo: Path, *, repo_name: str | None = None, since: str = 
 
 def _chain_and_branches(repo: Path, remote: str, main_sha: str, snap: _Snapshot, merged: set[str],
                         main_commits: Mapping[str, _Commit], repo_name: str | None, since_ts: float, window: float,
-                        note_unattributed: Any, notes: Mapping[str, str]
+                        note_unattributed: Any, notes: _Notes
                         ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """The live chain refs and the attributed seat branches, classified against ONE patch-id pass.
 
