@@ -178,7 +178,7 @@ def _run_guard(payload: str):
 
 def test_the_shipped_guard_is_the_new_pin():
     assert hashlib.sha256(GUARD_PATH.read_bytes()).hexdigest() == ROOM_TURN_GUARD_SHA256 == (
-        "58aac7f3845409af089a7047fef9f2af6692c9a2ad0a5a819f2f6abdb84c1f03")
+        "f5006d6a473cefec4337bd730e182197dab080ff48ad4079f7ed3f8b9ded2cd8")
 
 
 @pytest.mark.parametrize("tool_input", [[1], "echo hi", 7, ["nohup", "x"]])
@@ -213,7 +213,7 @@ def test_a_recursion_error_deciding_bash_denies(monkeypatch, capsys):
 def test_the_guard_still_allows_a_plain_bash_call_and_refuses_a_background_one():
     assert _run_guard(json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})).returncode == 0
     assert _run_guard(json.dumps({"tool_name": "Bash", "tool_input": {"command": "sleep 9 &"}})).returncode == 2
-    assert _run_guard("not json").returncode == 0
+    assert _run_guard("not json").returncode == 2          # ROOMFIX6: an unreadable event is denied
 
 
 # --- 2. a changed system prompt never resumes -------------------------------------------------------------------------
