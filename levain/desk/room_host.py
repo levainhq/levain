@@ -18,7 +18,8 @@ never infers it). ``replies`` alone adds a read-only tool and retires nothing.
 **What the model cannot do.** The relay tool takes ids of the operator's own messages in the open room, never words (the
 room's words-by-id rule, :func:`levain.desk.room.quoted_words`); each of his messages is relayed once per room
 thread (claimed before the command runs: :func:`levain.desk.room.claim_relay`); and the door runs only the argv
-the host gave, with ``shell=False``, in its own process group (killed whole on the timeout) and a capped output. The argv
+the host gave, with ``shell=False``, in its own process group (killed whole on the timeout, and by its watchdog when
+the door dies first: :func:`run`) and a capped output. The argv
 reaches the door through the room's own mcp-config file (0700 run directory, written per launch), not through anything
 the model can name.
 
@@ -30,6 +31,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -149,6 +151,20 @@ _RETAIN = OUTPUT_MAX * 4
 _CHUNK = 64 * 1024
 # [seat] seconds to reap a killed command's group and readers
 _REAP = 2.0
+# [seat] seconds past the timeout and the reaping grace before the watchdog kills the group itself (the door's own
+# timer, alive, always acts first)
+_WATCH_SLACK = 1.0
+# The watchdog: a separate process that LEADS the command's process group and holds the read end of a lifeline pipe
+# whose write end only the door holds. One byte on it is the door's release (it handled the command; the watchdog exits
+# and kills nothing). End of file means the door is gone however it died (SIGKILL included: the kernel closes a dead
+# process's descriptors), as when the room's end signals the Claude process group the door runs in: it kills its whole
+# group, the command and every descendant with it. Past its deadline (the door alive but unable to act) it does the
+# same. As the group's leader it keeps the group's id in use, so the id it kills can name no other process.
+_WATCHDOG = ("import os, select, signal, sys\n"
+             "ready = select.select([0], [], [], float(sys.argv[1]))[0]\n"
+             "if ready and os.read(0, 1):\n"
+             "    sys.exit(0)\n"
+             "os.killpg(os.getpgrp(), signal.SIGKILL)\n")
 
 
 def _drain(stream: Any, keep: bytearray) -> None:
@@ -191,21 +207,65 @@ def _kill_group(pid: int) -> None:
         pass
 
 
+def _release(dog: "subprocess.Popen[bytes]", life_w: int) -> None:
+    """Tell the watchdog the door handled its command (one byte on the lifeline), then reap it. A watchdog already
+    gone (killed with its group, or past its own deadline) makes the write fail, which is fine."""
+    try:
+        os.write(life_w, b"x")
+    except OSError:
+        pass
+    finally:
+        os.close(life_w)
+    try:
+        dog.wait(timeout=_REAP)
+    except subprocess.TimeoutExpired:       # it did not take the release: stop it alone, never its group
+        try:
+            dog.kill()
+            dog.wait(timeout=_REAP)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def run(argv: tuple[str, ...], stdin_text: str = "", extra: tuple[str, ...] = (), *, timeout: float = TIMEOUT) -> Ran:
-    """Run the host's command. ``stdin_text`` goes to its STDIN; ``extra`` are fixed-shape arguments appended (an
-    already-validated thread id), never free text. The command starts in its OWN session (process group): on a timeout
-    the whole group is killed, so a helper it spawned cannot deliver after the door gave up. Each stream is read as it
-    comes, keeping a bounded head and dropping the rest. Returns :class:`Ran`: code :data:`TIMED_OUT` for a timeout,
-    :data:`NOT_STARTED` (``started`` False) when the program could not be started; output is stdout then stderr, capped
-    at :data:`OUTPUT_MAX`."""
+    """Run the host's command. ``stdin_text`` goes to its STDIN, encoded strictly (a text UTF-8 cannot carry, such as
+    one with a lone surrogate, is never sent altered: the command does not start); ``extra`` are fixed-shape arguments
+    appended (an already-validated thread id), never free text. The command runs in a process group of its own, led
+    by a watchdog (:data:`_WATCHDOG`): on a timeout the whole group is killed, so a helper it spawned cannot deliver
+    after the door gave up, and the group is killed too if the door dies first (the room's end) or cannot act by
+    the deadline plus :data:`_REAP` and :data:`_WATCH_SLACK`. Each stream is read as it comes, keeping a bounded head
+    and dropping the rest. Returns :class:`Ran`: code :data:`TIMED_OUT` for a timeout, :data:`NOT_STARTED`
+    (``started`` False) when the program could not be started; output is stdout then stderr, capped at
+    :data:`OUTPUT_MAX`."""
+    try:
+        data = stdin_text.encode("utf-8")
+    except UnicodeEncodeError:
+        return Ran(NOT_STARTED, "the host command was not started: its text holds a character UTF-8 cannot carry", False)
+    life_r, life_w = os.pipe()          # neither end is inheritable: only the watchdog's stdin gets the read end
+    try:
+        dog = subprocess.Popen([sys.executable, "-I", "-S", "-c", _WATCHDOG, f"{timeout + _REAP + _WATCH_SLACK:g}"],
+                               stdin=life_r, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, process_group=0,
+                               env=child_env())
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        os.close(life_w)
+        return Ran(NOT_STARTED, f"the host command could not start (its watchdog did not: {type(exc).__name__})", False)
+    finally:
+        os.close(life_r)
+    try:
+        return _run_in(dog.pid, argv, data, extra, timeout)
+    finally:
+        _release(dog, life_w)
+
+
+def _run_in(group: int, argv: tuple[str, ...], data: bytes, extra: tuple[str, ...], timeout: float) -> Ran:
+    """:func:`run`'s body: the command joins the watchdog's process ``group`` (alive, so the group exists)."""
     try:
         proc = subprocess.Popen([*argv, *extra], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                shell=False, start_new_session=True,
+                                shell=False, process_group=group,
                                 env=child_env())    # the allowlist, never the whole parent environment (test_launch's invariant)
-    except (OSError, ValueError) as exc:     # ValueError: an argument Popen will not pass (it never ran either way)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:  # ValueError: an argument Popen will not pass
         return Ran(NOT_STARTED, f"the host command could not start ({type(exc).__name__})", False)
     out_b, err_b = bytearray(), bytearray()
-    workers = [threading.Thread(target=_feed, args=(proc.stdin, stdin_text.encode("utf-8", "replace")), daemon=True),
+    workers = [threading.Thread(target=_feed, args=(proc.stdin, data), daemon=True),
                threading.Thread(target=_drain, args=(proc.stdout, out_b), daemon=True),
                threading.Thread(target=_drain, args=(proc.stderr, err_b), daemon=True)]
     for w in workers:
@@ -220,7 +280,7 @@ def run(argv: tuple[str, ...], stdin_text: str = "", extra: tuple[str, ...] = ()
     for w in workers[1:]:
         w.join(max(0.0, deadline - time.monotonic()))
     if timed_out or any(w.is_alive() for w in workers):
-        _kill_group(proc.pid)
+        _kill_group(group)
         try:
             proc.wait(timeout=_REAP)
         except subprocess.TimeoutExpired:
