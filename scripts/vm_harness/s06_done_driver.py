@@ -202,11 +202,9 @@ def read_facts(cfg: S06Config) -> Facts:
         details["policy"] = "(not probed: no guest)"
         return facts
     _stage_paths(cfg.profile)
-    try:
-        import tests.test_agents_launch  # noqa: F401
-        facts.tests_importable = True
-    except Exception as exc:  # noqa: BLE001
-        details["tests"] = f"{type(exc).__name__}"
+    # The policy and repo are read BEFORE the tests tree is imported: importing `tests.*` pulls in pytest, which makes this a
+    # "test run" to levain.home_guard, and the guard then refuses (RealHomeReached) the real ~/.levain that the signed policy
+    # lives in. Found at the 11-13 sitting: the order below was the reverse and S06 REFUSED on a policy S07 read fine.
     try:
         from levain.dispatch import stager
         stager._control_policy()
@@ -216,6 +214,11 @@ def read_facts(cfg: S06Config) -> Facts:
     except Exception as exc:  # noqa: BLE001
         which = "repo" if facts.policy_ok else "policy"
         details[which] = f"({type(exc).__name__}: {exc})"[:200]
+    try:
+        import tests.test_agents_launch  # noqa: F401
+        facts.tests_importable = True
+    except Exception as exc:  # noqa: BLE001
+        details["tests"] = f"{type(exc).__name__}"
     return facts
 
 
