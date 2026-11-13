@@ -12,8 +12,9 @@ Three entry points, all pure (no file, no clock, no environment: ``now`` is a pa
   cannot be trusted marks the whole file torn, so every item reads unknown; a clean record that merely names an
   unknown id is reported in ``problems`` only.
 * :func:`derive_state` is one item's state. Checks that give ``unknown`` run first (an unreadable or stale source, a
-  dependency cycle, a link that names nothing, an expired gate, evidence that contradicts itself), then the closed
-  rule table :data:`_RULES` runs in order and the first rule that fires wins.
+  dependency cycle, a link that names nothing, evidence that contradicts itself), then the closed
+  rule table :data:`_RULES` runs in order and the first rule that fires wins. A gate past its recheck date is the one
+  unknown cause that lives in the table (rule 7): it makes only an item whose wait rests on the gate unknown.
 * :func:`derive_all` is the whole :class:`Board`, with the audit list the pace gate and the desk fail closed on.
 
 The state, column and audit-kind sets each have ONE definition here (:data:`STATE_COLUMN`, :data:`AUDIT_KINDS`):
@@ -786,11 +787,6 @@ def _expired_gates(item: Item, today: _date) -> list[Link]:
     return [l for l in item.depends_on if l.kind == "gate" and _date.fromisoformat(l.recheck or "") < today]
 
 
-def _chk_gate_expired(ctx: _Ctx, item: Item):
-    old = _expired_gates(item, ctx.now.date())          # ctx.now is UTC, so the date is the UTC date
-    return (f"gate \"{old[0].words}\" past its recheck {old[0].recheck}", ()) if old else None
-
-
 def _trailer_close(ctx: _Ctx, item: Item) -> MainCommit | None:
     return ctx.idx.closes.get(item.id)
 
@@ -830,7 +826,6 @@ _UNKNOWN_CHECKS: tuple[tuple[str, Callable[[_Ctx, Item], Any]], ...] = (
     ("dangling_band", _chk_dangling_band),
     ("dangling_link", _chk_dangling_link),
     ("unchecked_document", _chk_unchecked_document),
-    ("gate_expired", _chk_gate_expired),
     ("conflict_closed_seat", _chk_conflict_closed_seat),
     ("conflict_closed_band", _chk_conflict_closed_band),
     ("conflict_chain_orphan", _chk_conflict_chain_orphan),
@@ -925,6 +920,13 @@ def _rule_blocked(ctx: _Ctx, item: Item) -> State | None:
     unmet = _unmet(ctx, item)
     if not unmet:
         return None
+    # A gate past its recheck date (the UTC date of ``now``) makes the item unknown ONLY here, where the item's state
+    # would rest on the gate: a not-done item waiting on it. A done or decided item never reaches this rule, and one
+    # already needs_you, landing, in flight or landed keeps that state (derive_all audits the gate for it).
+    old = _expired_gates(item, ctx.now.date())
+    if old:
+        ctx.causes[item.id] = "gate_expired"
+        return ctx.make(item, "unknown", f"gate \"{old[0].words}\" past its recheck {old[0].recheck}", ())
     ref, label, why = unmet[0]
     more = f" (+{len(unmet) - 1} more)" if len(unmet) > 1 else ""
     return ctx.make(item, "blocked", f"waits on {label}: {why}{more}", [u[0] for u in unmet])
@@ -1039,6 +1041,10 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
             audit.append(AuditEntry(kind, s.id, s.reason))
         elif s.state == "landed_not_closed":
             audit.append(AuditEntry("landed_not_closed", s.id, s.reason))
+        if s.state not in ("unknown", "done", "cut", "parked", "out_of_1_0"):     # a live state beside an expired gate
+            old = _expired_gates(folded.items[s.id], now.date())
+            if old:
+                audit.append(AuditEntry("gate_expired", s.id, f"gate \"{old[0].words}\" past its recheck {old[0].recheck}"))
     unattributed = tuple(sorted(evidence.unattributed, key=lambda u: (u.sha, u.subject)))
     for u in unattributed:
         audit.append(AuditEntry("unattributed_work", None, f"{_short(u.sha)} {u.subject}".strip()))

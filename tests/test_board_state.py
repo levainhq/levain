@@ -320,8 +320,9 @@ def test_property_derive_all_never_raises_and_stays_inside_the_closed_set():
                 assert s.reason.strip()
         for a in board.audit:
             assert a.kind in bs.AUDIT_KINDS and a.why
-        listed = [a.id for a in board.audit if a.kind in ("unknown", "gate_expired") and a.id]
-        assert sorted(listed, key=bs._id_key) == [s.id for s in board.items if s.state == "unknown"]      # once each
+        unknown_ids = [s.id for s in board.items if s.state == "unknown"]
+        listed = [a.id for a in board.audit if a.kind in ("unknown", "gate_expired") and a.id in unknown_ids]
+        assert sorted(listed, key=bs._id_key) == unknown_ids                                              # once each
 
 
 # ------------------------------------------------------------------------------------------------ order independence

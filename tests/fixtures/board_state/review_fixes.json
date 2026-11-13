@@ -2087,6 +2087,307 @@
    "now": "2026-11-12T20:00:00-05:00"
   },
   {
+   "audit": [],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [
+       "levain#1"
+      ],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "done",
+     "reason_contains": "closed by",
+     "state": "done"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a done item is never touched by an expired gate (no unknown, no audit entry)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "off",
+     "reason_contains": "",
+     "state": "cut"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"date\": \"2026-11-12\", \"decision\": \"cut\", \"id\": \"levain#1\", \"op\": \"decide\", \"v\": 1, \"words\": \"Phill: ruled\"}"
+   ],
+   "name": "gate ruling: a cut item is never touched by an expired gate",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "gate_expired",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {
+      "np-aaaaaaaa": [
+       "levain#1"
+      ]
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "needs_you",
+     "reason_contains": "band np-aaaaaaaa",
+     "state": "needs_you"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a needs_you item keeps needs_you and gets ONE gate_expired audit entry",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "gate_expired",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [
+     {
+      "branch": null,
+      "items": [
+       "levain#1"
+      ],
+      "name": "s",
+      "since": null
+     }
+    ],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "running",
+     "reason_contains": "seat s",
+     "state": "in_flight"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: an in-flight item keeps in_flight and gets one gate_expired audit entry",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "gate_expired",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [
+     {
+      "branch": null,
+      "items": [
+       "levain#2"
+      ],
+      "name": "s",
+      "since": null
+     }
+    ],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "gate \"VM sitting\" past its recheck 2026-11-01",
+     "state": "unknown"
+    },
+    "levain#2": {
+     "column": "running",
+     "reason_contains": "",
+     "state": "in_flight"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#2\"}, {\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a not-done item whose wait rests on the gate reads unknown, even with another unmet dependency",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "gate_expired",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "past its recheck",
+     "state": "unknown"
+    },
+    "levain#2": {
+     "column": "backlog",
+     "reason_contains": "waits on levain#1: unknown",
+     "state": "blocked"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#1\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a dependent of an item that is unknown on its gate reads blocked on that unknown",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [],
+   "evidence": {
+    "band": {
+     "open": {
+      "np-aaaaaaaa": [
+       "levain#1"
+      ]
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "needs_you",
+     "reason_contains": "",
+     "state": "needs_you"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-12\", \"words\": \"g\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a gate whose recheck is today is still live for a needs_you item (no audit entry)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
    "evidence": {
     "band": {
      "open": {},
