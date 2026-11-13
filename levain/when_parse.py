@@ -199,8 +199,8 @@ def _all_days(tok: str) -> bool:
 
 def _take_days(tokens: List[str], i: int) -> Tuple[List[int], int]:
     """A day list at ``tokens[i]``: ``mon``, ``mon,wed``, ``mon, wed``, ``mon and wed``. A further day needs a comma or
-    ``and`` before it (``mon wed`` leaves ``wed`` in the words, so prose that starts with a day name stays words); a stray
-    ``and`` or an unseparated day refuses. ``([], i)`` when no day is there."""
+    ``and`` before it: a stray ``and`` or an unseparated day (``mon wed``) REFUSES with the fix, as flow's parser does (so prose
+    such as ``every mon thursday brunch`` is refused, never read as a repeat plus words). ``([], i)`` when no day is there."""
     days: List[int] = []
     more = True
     j = i
@@ -341,7 +341,7 @@ def _read_one(tokens: List[str], now: datetime, allow_recur: bool) -> Tuple[When
     if m:
         n = int(m.group(1))
         try:
-            delta = {"m": timedelta(minutes=n), "h": timedelta(hours=n), "d": timedelta(days=n)}[m.group(2)]
+            delta = timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[m.group(2)]: n})   # only the typed unit is built
             return When((now + delta).replace(second=0, microsecond=0)), 1
         except OverflowError:
             raise WhenRefused(f"{tokens[0]!r} runs past the supported dates")

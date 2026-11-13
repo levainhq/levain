@@ -96,15 +96,26 @@ class Outcome:
     ref: str             # the q-… id or the drop id
     filed: bool          # this run created the row or drop
     pinged: bool
-    done: bool           # stamped and composted (False on a dry run)
+    done: bool           # stamped and composted (False on a dry run, and False for a repeating agenda that advanced)
     event: str = ""      # the event key that woke it (a split's second part), "" for a dated wake
+    advanced: str = ""   # a repeating agenda's next occurrence (it stays open; via "advanced"), "" otherwise
 
     def as_dict(self) -> dict[str, Any]:
         out = {"intention_id": self.intention_id, "origin_key": self.origin_key, "target": self.target, "via": self.via,
                "ref": self.ref, "filed": self.filed, "pinged": self.pinged, "done": self.done}
         if self.event:
             out["event"] = self.event
+        if self.advanced:
+            out["advanced"] = self.advanced
         return out
+
+
+def _row_key(item: dict[str, Any], okey: str) -> str:
+    """The band row's idempotency key. A repeating agenda's row is keyed by its occurrence (``next``) too: an ANSWERED row
+    still holds its key, so one key for every occurrence meant the second occurrence found the first's answered row and filed
+    nothing. A retry of one occurrence keeps the same ``next`` and so reuses its row."""
+    from levain.recur import rule_of
+    return KEY_PREFIX + okey + (f":{item.get('next')}" if rule_of(item) else "")
 
 
 def outbox_id_for(origin_key: str) -> str:
@@ -273,12 +284,14 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
             stamp = item["germinated"] if isinstance(item["germinated"], dict) else {}
             out = Outcome(str(sid), str(okey or ""), str(stamp.get("target") or item.get("target") or ""),
                           "finished", str(stamp.get("ref") or ""), False, False, False)
+            handed_off = str(stamp.get("ref") or "").startswith("dr-") or not stamp.get("ref")
+            advance = None if handed_off else advance_changes(item, now)
+            if advance is not None:      # it stays open: say so (a dry run says it too), never "closed"
+                out = Outcome(**{**out.__dict__, "via": "advanced", "advanced": advance["next"]})
             if not dry_run:
                 try:
                     # an answered question closes the intention as done by type; a handed-off drop composts, as before.
                     # A REPEATING agenda whose question was answered advances to its next occurrence instead (levain.recur)
-                    handed_off = str(stamp.get("ref") or "").startswith("dr-") or not stamp.get("ref")
-                    advance = None if handed_off else advance_changes(item, now)
                     if advance is not None:
                         store.update(sid, expect_disposition="agenda", expected_version=intention_version(item),
                                      today=today, **advance)
@@ -292,7 +305,8 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
                     result["skipped"].append({"intention_id": sid, "origin_key": okey, "ref": str(stamp.get("ref") or ""),
                                               "reason": f"changed while finishing ({exc}); left open"})
                     continue
-                out = Outcome(**{**out.__dict__, "done": True})
+                if advance is None:
+                    out = Outcome(**{**out.__dict__, "done": True})
             result["finish"].append(out.as_dict())
         except Exception as exc:  # noqa: BLE001 - one bad intention never stops the others
             _err(sid, okey, exc)
@@ -360,7 +374,7 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
                     elif target == TARGET_DESK:
                         blocks += " (desk: no desk here, so it is on the band)"
                     q, filed = questions.file_once(
-                        agent=agent, key=KEY_PREFIX + okey,
+                        agent=agent, key=_row_key(item, okey),
                         what=(f"After {anchor_id} was done: {title} ({sid})" if anchor_id
                               else f"Due {(nxt or today).strftime('%m-%d')}: {title} ({sid})" + repeats_words(item)),
                         options=[("done", "Done")], rec="done", blocks=_line(blocks, 600), cwd=str(install.resolve()),
@@ -517,7 +531,10 @@ def run_germinate(args: argparse.Namespace, out: Any = None) -> int:
         live = " (stamped, live)" if o["done"] and o["via"] in ("adopted", "band", "nudge", "band-fallback") else ""
         print(f"{verb} {o['intention_id']} ({o['target']}) via {o['via']}" + (f" -> {o['ref']}" if o["ref"] else "") + live, file=out)
     for o in res["finish"]:
-        print(f"{'would finish' if args.dry_run else 'finished'} {o['intention_id']} (stamped, now closed)", file=out)
+        if o.get("advanced"):
+            print(f"{'would advance' if args.dry_run else 'advanced'} {o['intention_id']} to its next occurrence {o['advanced']} (stays open)", file=out)
+        else:
+            print(f"{'would finish' if args.dry_run else 'finished'} {o['intention_id']} (stamped, now closed)", file=out)
     for c in res.get("checkby", []):
         print(f"{c['intention_id']} woke on {c['event']}; its check-by question {c['ref']} was closed" if c["via"] == "superseded"
               else f"{c['intention_id']} still waits on {c['event']}; its check-by {c['check_by']} has come ({c['via']})", file=out)

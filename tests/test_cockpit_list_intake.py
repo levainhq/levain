@@ -449,5 +449,5 @@ def test_a_repeat_the_store_cannot_ring_is_refused_never_stored_without_its_seri
 
 
 def test_the_remind_tier_is_one_named_constant_the_tier_table_reads():
-    """The open call (P2): T2 now, behind REMIND_TIER; changing that one constant is the whole of going lighter."""
+    """The open call (P2): T2 now, behind REMIND_TIER. A lighter tier is NOT built: the constant alone does not switch it."""
     assert REMIND_TIER == "T2" and INTAKE_TIERS["remind"] is REMIND_TIER

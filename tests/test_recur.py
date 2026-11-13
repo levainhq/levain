@@ -206,3 +206,48 @@ def test_a_plain_agenda_still_resolves_on_an_answered_row(tmp_path):
 def test_the_band_row_a_repeating_agenda_files_says_it_repeats(tmp_path):
     root, intentions, qdir, sp, sid, qs, q = _ringing_series(tmp_path)
     assert q.what == f"Due 11-06: bins ({sid}) (repeats weekly SUN 21:00)"
+
+
+def test_a_series_answered_on_the_band_keeps_ringing_for_three_occurrences(tmp_path):
+    """Row 188 L3 r1 HIGH: the band row's key was the intention's origin key for EVERY occurrence, and an answered row holds its
+    key, so the second occurrence found the first's answered row, filed nothing, rang nothing, and the series went silent. Each
+    occurrence files its own new question; the answered ones stay answered."""
+    root, intentions, qdir, sp, sid, qs, q1 = _ringing_series(tmp_path)
+    ping = lambda *a, **k: True  # noqa: E731
+    seen = [q1.id]
+    for answered_at, due_at in ((datetime(2026, 11, 8, 12, 0), datetime(2026, 11, 8, 21, 1)),
+                                (datetime(2026, 11, 9, 8, 0), datetime(2026, 11, 15, 21, 1))):
+        qs.answer(seen[-1], text="did it", channel="cli")
+        adv = g.germinate(intentions, qdir, install=root, today=answered_at.date(), now=answered_at, ping=ping)
+        assert adv["errors"] == [] and [o["intention_id"] for o in adv["finish"]] == [sid]
+        res = g.germinate(intentions, qdir, install=root, today=due_at.date(), now=due_at, ping=ping)
+        assert res["errors"] == [] and [(o["intention_id"], o["filed"]) for o in res["due"]] == [(sid, True)], res
+        (new,) = qs.open_questions()
+        assert new.id not in seen and new.answer is None
+        seen.append(new.id)
+    assert len(set(seen)) == 3
+
+
+def test_a_retry_of_one_occurrence_reuses_its_row(tmp_path):
+    """The per-occurrence key is stable across a retry: a second run on an already-filed occurrence files nothing new."""
+    root, intentions, qdir, sp, sid, qs, q1 = _ringing_series(tmp_path)
+    sp.update(sid, germinated={}, expect_disposition="agenda", expected_version=intention_version(sp.get(sid)))
+    res = g.germinate(intentions, qdir, install=root, today=date(2026, 11, 7), now=datetime(2026, 11, 7, 12, 0), ping=lambda *a, **k: True)
+    assert [(o["filed"], o["ref"]) for o in res["due"]] == [(False, q1.id)]
+
+
+def test_an_advanced_series_says_it_advanced_and_names_the_time_never_closed(tmp_path):
+    """Row 188 L3 r1 MED: the finish result said `done: true` and the CLI said "now closed" for a series that stays open."""
+    import argparse
+    import io
+    root, intentions, qdir, sp, sid, qs, q = _ringing_series(tmp_path)
+    qs.answer(q.id, text="did it", channel="cli")
+    now = datetime(2026, 11, 8, 12, 0)
+    args = argparse.Namespace(path=str(root), queue_dir=qdir, agent="claude_code", dry_run=True, timed=False, as_json=False)
+    dry = io.StringIO()
+    assert g.run_germinate(args, dry) == 0
+    assert "would advance" in dry.getvalue() and "closed" not in dry.getvalue() and sp.get(sid)["status"] == "open"
+    res = g.germinate(intentions, qdir, install=root, today=now.date(), now=now, ping=lambda *a, **k: True)
+    nxt = recur.next_occurrence("weekly SUN 21:00", now).strftime(_FMT)
+    (o,) = res["finish"]
+    assert (o["via"], o["advanced"], o["done"]) == ("advanced", nxt, False)
