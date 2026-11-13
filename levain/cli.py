@@ -1092,12 +1092,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIR",
         help=(
-            "Serve the cockpit's one Claude room (needs --write). DIR is where the room's file tools see first (an "
-            "existing directory). The room is a Claude child (read and search tools, no shell) started when you open it from the cockpit, "
-            "kept by this server, and ended when it stops; nothing starts it before you ask. Its record lives in the "
-            "consent queue's dispatch.db. DIR may not be your home, a directory above it, or one holding levain's home. "
-            "The room can search the web: it can send search queries built from what it has read, so a file in DIR or a "
-            "search result can reach a search provider's query log."
+            "Serve the cockpit's one Claude room (needs --write). DIR is the room's working directory (an existing "
+            "directory). The room is a Claude child started when you open it from the cockpit, kept by this server, "
+            "and ended when it stops; nothing starts it before you ask. By default it has Claude's own tools, a shell "
+            "and writes included, with no permission prompts, as your own user, and reads DIR's project settings: "
+            "levain's turn guard refuses background and long-running work in a turn, and the room does not open "
+            "when that guard is missing or changed. Pass --room-confined for the no-shell room instead. Its record "
+            "lives in the consent queue's dispatch.db. DIR may not be your home, a directory above it, or one "
+            "holding levain's home. The room can reach the web: what it has read can reach a search provider's "
+            "query log or any site it fetches."
+        ),
+    )
+    web_p.add_argument(
+        "--room-confined",
+        action="store_true",
+        default=False,
+        help=(
+            "With --room: open the confined room instead of the default one: read and search tools only, no shell, "
+            "no writes and no web fetch, its file tools denied your credential paths and kept to DIR. WebSearch "
+            "stays: queries built from what it has read can reach a search provider's query log."
         ),
     )
     stt_g = web_p.add_mutually_exclusive_group()
@@ -4955,6 +4968,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         sign_host=args.sign_host,
         room=args.room,
         premium_stt=args.premium_stt,
+        room_confined=args.room_confined,
     )
 
 

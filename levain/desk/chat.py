@@ -1259,12 +1259,13 @@ def _is_mode_line(e: Any) -> bool:
         and e.vendor_id.startswith(MODE)
 
 
-def _room_mode_trip(permission_mode: Any) -> Trip | None:
-    """``mode_changed`` for a room: anything but :data:`ROOM_PERMISSION_MODE` latches, an unreadable report too."""
-    if permission_mode == ROOM_PERMISSION_MODE:
+def _room_mode_trip(permission_mode: Any, expected: str = ROOM_PERMISSION_MODE) -> Trip | None:
+    """``mode_changed`` for a room: anything but ``expected`` (the service's room mode, :data:`ROOM_PERMISSION_MODE`
+    unless a host named another) latches, an unreadable report too."""
+    if permission_mode == expected:
         return None
     return Trip("mode_changed", f"the room reports permission mode {str(permission_mode)[:60]!r}, not "
-                                f"{ROOM_PERMISSION_MODE!r}")
+                                f"{expected!r}")
 
 
 def _read_meta(session: Any) -> tuple[SessionMeta | None, bool]:
@@ -1639,15 +1640,23 @@ class ChatService:
     launch, the service files each item its latches owe (:func:`_owed_items`) that this process has not filed yet.
     The filer runs after the latch commits, never inside it, so a filer that fails costs nothing but the item, and the
     next sweep files it again. It may run with the launch's mutex held (a pump step), so like ``route`` it must not
-    call back into the service for that launch."""
+    call back into the service for that launch.
+
+    ``room_permission_mode`` is the permission mode a room launch must report (default
+    :data:`ROOM_PERMISSION_MODE`, the confined room's); a room that reports any other mode latches ``mode_changed``.
+    It is never read for a worker launch, which is judged against ``default``."""
 
     def __init__(self, store: ChatStore, *, fault: Callable[[str], None] | None = None,
                  probe: Callable[[str, LivenessEvidence], Verdict] | None = None,
                  route: Callable[[str, tuple[str, ...]], None] | None = None,
                  sleep: Callable[[float], None] = time.sleep,
                  tripwires: Callable[[str], TripwireContext | None] | None = None,
-                 seat_item: Callable[[str, dict[str, Any]], Any] | None = None) -> None:
+                 seat_item: Callable[[str, dict[str, Any]], Any] | None = None,
+                 room_permission_mode: str = ROOM_PERMISSION_MODE) -> None:
+        if not isinstance(room_permission_mode, str) or not room_permission_mode:
+            raise ValueError("room_permission_mode is the permission mode a room launch is expected to report")
         self._chat = store
+        self._room_mode = room_permission_mode          # a room launch's expected mode (a worker's is always default)
         self._sessions: dict[str, Any] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._pins: dict[int, int] = {}               # id(session) -> interrupts in flight on it
@@ -2525,12 +2534,13 @@ class ChatService:
         early += [mode] if mode is not None else []
         new = [(i, raw, e) for i, (raw, e, old, f) in enumerate(zip(raws, seen, backfill, fresh)) if f and not old]
         if room:
-            # a room runs dontAsk (DESIGN_ROOM §2.4): its own mode reports are judged here and never reach the
-            # worker rule (which accepts only 'default'); every other line goes through the window as a worker's
+            # a room runs its own mode (dontAsk, DESIGN_ROOM §2.4, unless the host named another): its own mode
+            # reports are judged here and never reach the worker rule (which accepts only 'default'); every other
+            # line goes through the window as a worker's
             kept = []
             for i, raw, e in new:
                 if _is_mode_line(raw):
-                    trip = _room_mode_trip(raw.body)
+                    trip = _room_mode_trip(raw.body, self._room_mode)
                     (at[i] if crossed is None else early).extend([trip] if trip is not None else [])
                 else:
                     kept.append((i, raw, e))
@@ -2579,7 +2589,7 @@ class ChatService:
     def _mode(self, launch_id: str, session: Any, room: bool = False) -> Trip | None:
         """``mode_changed`` from the session's meta (its init, or a later line that reported a change), bounded by
         :data:`READ_DEADLINE`; a meta that cannot be read trips it too (an overdue one also wedges the session). A
-        room's mode is :data:`ROOM_PERMISSION_MODE` (or none reported yet)."""
+        room's mode is the service's ``room_permission_mode`` (or none reported yet)."""
         try:
             meta = _bounded(session.meta, READ_DEADLINE)
         except _Overdue:
@@ -2590,7 +2600,7 @@ class ChatService:
         if type(meta) is not SessionMeta:
             return Trip("mode_changed", "could not read the session's permission mode: the session returned no meta")
         if room:
-            return None if meta.permission_mode is None else _room_mode_trip(meta.permission_mode)
+            return None if meta.permission_mode is None else _room_mode_trip(meta.permission_mode, self._room_mode)
         return mode_trip(meta.permission_mode)
 
     def _answer_controls(self, launch_id: str, session: Any, controls: Sequence[_Control]) -> list[str]:

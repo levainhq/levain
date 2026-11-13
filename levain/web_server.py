@@ -6415,6 +6415,7 @@ def run_web_server(
     sign_host: str | None = None,
     room: "Path | None" = None,
     premium_stt: "bool | None" = None,
+    room_confined: bool = False,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -6512,14 +6513,21 @@ def run_web_server(
             return 1
 
     room_serve = None
+    if room_confined and room is None:
+        print("refusing --room-confined: it picks the no-shell room for --room DIR; pass --room DIR with it",
+              file=sys.stderr)
+        return 2
     if room is not None:
-        # the cockpit's one Claude room (RM-G2): opt-in, because the room's child reads the operator's tree
+        # the cockpit's one Claude room (RM-G2): opt-in, because the room's child works in the operator's tree. Its
+        # default is the host profile (np-97fa3dd6 (a)); --room-confined is the no-shell room
         if not write:
             print("refusing --room: the room takes writes (its lines, stop and drop), which need the write token; "
                   "pass --write", file=sys.stderr)
             return 1
         try:
-            room_serve = _build_room_serve(room)
+            from levain.desk.room_default import CONFINED
+
+            room_serve = _build_room_serve(room, profile=CONFINED if room_confined else None)
         except (ValueError, OSError, RuntimeError) as exc:
             print(f"refusing --room: {exc}", file=sys.stderr)
             return 1
@@ -6631,16 +6639,34 @@ def run_web_server(
     return 0
 
 
-def _build_room_serve(room: Path, host_commands: Any = None) -> Any:
+def _build_room_serve(room: Path, host_commands: Any = None, profile: Any = None) -> Any:
     """The :class:`~levain.desk.room_serve.RoomServe` ``levain serve --room DIR`` hands ``make_server``, over the
     consent queue's ``dispatch.db`` (the file the cockpit's room reads). ``DIR`` is where the room's file tools see first:
     an existing directory. Built here, started by ``make_server`` after every refusal has passed. ``host_commands`` is
     the host's :class:`~levain.desk.room_host.HostCommands` (flow's bridge passes its desk relay and replies
-    commands; levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card."""
+    commands; levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card.
+    ``profile`` picks the room (np-97fa3dd6 (a): the room's default is the host profile): None is
+    :func:`~levain.desk.room_default.default_host_profile` (the vendor's default tools under bypass, levain's pinned turn
+    guard; a guard that is missing or not the pinned bytes raises ValueError, with no fallback); a
+    :class:`~levain.desk.room_profile.RoomProfile` is the host's own (its hooks, prompt and dials);
+    :data:`~levain.desk.room_default.CONFINED` (``--room-confined``) is the confined room, no shell and no writes. The
+    returned serve's ``status()["profile"]`` names the profile, None for the confined room."""
     from levain.consent.queue import default_queue_dir
     from levain.desk.envelopes import EnvelopeStore
+    from levain.desk.room_default import CONFINED, default_host_profile
     from levain.desk.room_launch import RoomSetting
+    from levain.desk.room_profile import RoomProfile
     from levain.desk.room_serve import RoomServe
+
+    if isinstance(profile, str) and profile == CONFINED:
+        setting_profile = None
+    elif profile is None:
+        setting_profile = default_host_profile()
+    elif isinstance(profile, RoomProfile):
+        setting_profile = profile
+    else:
+        raise ValueError(f"the room's profile is a RoomProfile, None (the default host profile) or {CONFINED!r} "
+                         f"(the confined room), not {type(profile).__name__}")
 
     cwd = _canonical_path(Path(room).expanduser())
     if not cwd.is_dir():
@@ -6648,7 +6674,8 @@ def _build_room_serve(room: Path, host_commands: Any = None) -> Any:
     queue = _canonical_path(Path(default_queue_dir()))
     _room_dir_refusal(cwd, queue)
     # the deny rules are written from these spellings: the canonical ones the refusal checked (roomfix2 K1)
-    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd), host=host_commands), run_dir=str(queue / "room-run"),
+    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd), host=host_commands, profile=setting_profile),
+                     run_dir=str(queue / "room-run"),
                      launcher_kw={"home": str(_canonical_path(Path.home())), "levain_home": str(queue.parent)})
 
 

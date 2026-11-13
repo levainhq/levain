@@ -1,11 +1,14 @@
 """levain.desk.room_host: the commands a HOST gives the room (1106-16 Room D2).
 
-A host (flow's bridge is the one today) may hand the room up to two commands as room tools. Levain names no script and
+A host (flow's bridge is the one today) may hand the room up to three commands as room tools. Levain names no script and
 no path: the host passes an argv for each, and the room's MCP door runs it. The commands, by role:
 
 * ``relay``: files the operator's words with the host's desk. The text arrives on STDIN, never in argv. Its output's
   ``(thread <id>)`` is the id the room reads replies by.
 * ``replies``: reads the desk's replies to one thread. Read-only. The thread id is the only argument the door appends.
+* ``note``: files the room seat's OWN note with the desk, apart from his words. The text arrives on STDIN, never in argv,
+  behind the fixed :data:`NOTE_PREFIX` (the host's label for a note is shared with other chat surfaces, so the prefix is
+  what says the Room wrote it). It claims nothing and retires nothing: a note is information, never his direction.
 
 **Degrading.** With no host commands the room is exactly what it was: one door tool, ``propose_drop``, and his tap on
 the card commits a drop. The proposed-drop path is retired only when ``relay`` is present AND the host set
@@ -15,7 +18,8 @@ never infers it). ``replies`` alone adds a read-only tool and retires nothing.
 **What the model cannot do.** The relay tool takes ids of the operator's own messages in the open room, never words (the
 room's words-by-id rule, :func:`levain.desk.room.quoted_words`); each of his messages is relayed once per room
 thread (claimed before the command runs: :func:`levain.desk.room.claim_relay`); and the door runs only the argv
-the host gave, with ``shell=False``, in its own process group (killed whole on the timeout) and a capped output. The argv
+the host gave, with ``shell=False``, in its own process group (killed whole on the timeout, and by its watchdog when
+the door dies first: :func:`run`) and a capped output. The argv
 reaches the door through the room's own mcp-config file (0700 run directory, written per launch), not through anything
 the model can name.
 
@@ -27,6 +31,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -34,8 +39,9 @@ from typing import Any, NamedTuple, Optional
 
 from levain.launch import child_env
 
-__all__ = ["HOSTCMD_ENV", "NOT_STARTED", "OUTPUT_MAX", "TIMED_OUT", "TIMEOUT", "HostCommands", "HostCommandError",
-           "RELAY_TOOL", "REPLIES_TOOL", "Ran", "THREAD_RE", "door_tools", "from_env", "run"]
+__all__ = ["HOSTCMD_ENV", "NOT_STARTED", "NOTE_MAX", "NOTE_PREFIX", "NOTE_TOOL", "OUTPUT_MAX", "TIMED_OUT", "TIMEOUT",
+           "HostCommands", "HostCommandError", "RELAY_TOOL", "REPLIES_TOOL", "Ran", "THREAD_RE", "door_tools", "from_env",
+           "run"]
 
 HOSTCMD_ENV = "LEVAIN_ROOM_HOST_COMMANDS"
 # [seat] seconds a host command may run before the door gives up on it
@@ -46,6 +52,11 @@ _ARGV_MAX = 32
 _ARG_MAX = 1024
 RELAY_TOOL = "relay_to_desk"
 REPLIES_TOOL = "desk_replies"
+NOTE_TOOL = "note_to_desk"
+# the Room's attribution on every note, put in FRONT of the seat's text by the door (never by the seat)
+NOTE_PREFIX = "[from the Room] "
+# [seat] characters the host's note command accepts in all (it counts the stdin text it is given, so the prefix is inside it)
+NOTE_MAX = 600
 # the id a relay prints as "(thread <id>)": a conservative id shape, never the host's own format
 THREAD_RE = re.compile(r"th-[0-9a-z]{1,16}(?:-[0-9a-f]{1,16})?")
 
@@ -67,14 +78,16 @@ def _check_argv(name: str, argv: Any) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class HostCommands:
-    """``relay`` and ``replies`` are argvs (program absolute); either may be None. ``relay_without_tap`` is the host's
-    word that a relay on the model's call needs no tap (False: ``relay`` is accepted but not offered, the card stays)."""
+    """``relay``, ``replies`` and ``note`` are argvs (program absolute); each may be None. ``relay_without_tap`` is the
+    host's word that a relay on the model's call needs no tap (False: ``relay`` is accepted but not offered, the card
+    stays)."""
     relay: Optional[tuple[str, ...]] = None
     replies: Optional[tuple[str, ...]] = None
     relay_without_tap: bool = False
+    note: Optional[tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
-        for name in ("relay", "replies"):
+        for name in ("relay", "replies", "note"):
             v = getattr(self, name)
             if v is not None:
                 object.__setattr__(self, name, _check_argv(name, v))
@@ -89,12 +102,13 @@ class HostCommands:
     def to_json(self) -> str:
         return json.dumps({"relay": list(self.relay) if self.relay else None,
                            "replies": list(self.replies) if self.replies else None,
+                           "note": list(self.note) if self.note else None,
                            "relay_without_tap": self.relay_without_tap}, sort_keys=True)
 
 
 def door_tools(host: Optional[HostCommands]) -> tuple[str, ...]:
     """The door's tool names (short, as ``tools/list`` names them) for ``host``: ``propose_drop`` unless the relay
-    retires it, then the relay, then the replies reader. No host: ``("propose_drop",)``, as before D2."""
+    retires it, then the relay, then the replies reader, then the note. No host: ``("propose_drop",)``, as before D2."""
     if host is None:
         return ("propose_drop",)
     out = [] if host.relays else ["propose_drop"]
@@ -102,6 +116,8 @@ def door_tools(host: Optional[HostCommands]) -> tuple[str, ...]:
         out.append(RELAY_TOOL)
     if host.replies is not None:
         out.append(REPLIES_TOOL)
+    if host.note is not None:       # a note retires nothing, so it does not depend on the relay
+        out.append(NOTE_TOOL)
     return tuple(out)
 
 
@@ -114,9 +130,9 @@ def from_env(value: Optional[str]) -> Optional[HostCommands]:
         doc = json.loads(value)
     except ValueError:
         raise HostCommandError("the host commands are not JSON") from None
-    if not isinstance(doc, dict) or set(doc) - {"relay", "replies", "relay_without_tap"}:
-        raise HostCommandError("the host commands are an object of relay, replies, relay_without_tap")
-    return HostCommands(doc.get("relay"), doc.get("replies"), doc.get("relay_without_tap", False))
+    if not isinstance(doc, dict) or set(doc) - {"relay", "replies", "relay_without_tap", "note"}:
+        raise HostCommandError("the host commands are an object of relay, replies, relay_without_tap, note")
+    return HostCommands(doc.get("relay"), doc.get("replies"), doc.get("relay_without_tap", False), doc.get("note"))
 
 
 class Ran(NamedTuple):
@@ -135,6 +151,20 @@ _RETAIN = OUTPUT_MAX * 4
 _CHUNK = 64 * 1024
 # [seat] seconds to reap a killed command's group and readers
 _REAP = 2.0
+# [seat] seconds past the timeout and the reaping grace before the watchdog kills the group itself (the door's own
+# timer, alive, always acts first)
+_WATCH_SLACK = 1.0
+# The watchdog: a separate process that LEADS the command's process group and holds the read end of a lifeline pipe
+# whose write end only the door holds. One byte on it is the door's release (it handled the command; the watchdog exits
+# and kills nothing). End of file means the door is gone however it died (SIGKILL included: the kernel closes a dead
+# process's descriptors), as when the room's end signals the Claude process group the door runs in: it kills its whole
+# group, the command and every descendant with it. Past its deadline (the door alive but unable to act) it does the
+# same. As the group's leader it keeps the group's id in use, so the id it kills can name no other process.
+_WATCHDOG = ("import os, select, signal, sys\n"
+             "ready = select.select([0], [], [], float(sys.argv[1]))[0]\n"
+             "if ready and os.read(0, 1):\n"
+             "    sys.exit(0)\n"
+             "os.killpg(os.getpgrp(), signal.SIGKILL)\n")
 
 
 def _drain(stream: Any, keep: bytearray) -> None:
@@ -177,21 +207,90 @@ def _kill_group(pid: int) -> None:
         pass
 
 
+def _release(dog: "subprocess.Popen[bytes]", life_w: int) -> None:
+    """Tell the watchdog the door handled its command (one byte on the lifeline), then reap it. A watchdog already
+    gone (killed with its group, or past its own deadline) makes the write fail, which is fine. Only for a command
+    :func:`_run_in` returned from: an exception goes to :func:`_abandon`."""
+    try:
+        os.write(life_w, b"x")
+    except OSError:
+        pass
+    finally:
+        os.close(life_w)
+    _reap(dog)
+
+
+def _abandon(dog: "subprocess.Popen[bytes]", life_w: int) -> None:
+    """The door could not finish handling its command: kill the watchdog's whole group (the command and every
+    descendant, the watchdog too) while the unreaped watchdog still holds the group id, then close the lifeline with no
+    release byte (a watchdog the kill missed reads end of file and kills its group itself) and reap it."""
+    _kill_group(dog.pid)
+    os.close(life_w)
+    _reap(dog)
+
+
+def _reap(dog: "subprocess.Popen[bytes]") -> None:
+    """Wait for the watchdog to exit, so its process and group ids are freed only once its work is done."""
+    try:
+        dog.wait(timeout=_REAP)
+    except subprocess.TimeoutExpired:       # it did not exit (no release taken): stop it alone, never its group
+        try:
+            dog.kill()
+            dog.wait(timeout=_REAP)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def run(argv: tuple[str, ...], stdin_text: str = "", extra: tuple[str, ...] = (), *, timeout: float = TIMEOUT) -> Ran:
-    """Run the host's command. ``stdin_text`` goes to its STDIN; ``extra`` are fixed-shape arguments appended (an
-    already-validated thread id), never free text. The command starts in its OWN session (process group): on a timeout
-    the whole group is killed, so a helper it spawned cannot deliver after the door gave up. Each stream is read as it
-    comes, keeping a bounded head and dropping the rest. Returns :class:`Ran`: code :data:`TIMED_OUT` for a timeout,
-    :data:`NOT_STARTED` (``started`` False) when the program could not be started; output is stdout then stderr, capped
-    at :data:`OUTPUT_MAX`."""
+    """Run the host's command. ``stdin_text`` goes to its STDIN, encoded strictly (a text UTF-8 cannot carry, such as
+    one with a lone surrogate, is never sent altered: the command does not start); ``extra`` are fixed-shape arguments
+    appended (an already-validated thread id), never free text. The command runs in a process group of its own, led
+    by a watchdog (:data:`_WATCHDOG`): on a timeout the whole group is killed, so a helper it spawned cannot deliver
+    after the door gave up, and the group is killed too if the door dies first (the room's end) or cannot act by
+    the deadline plus :data:`_REAP` and :data:`_WATCH_SLACK`; an exception out of the body after the command started
+    kills the group before it leaves here (the watchdog is released only for a command the body returned from). Each
+    stream is read as it comes, keeping a bounded head and dropping the rest. Returns :class:`Ran`: code
+    :data:`TIMED_OUT` for a timeout, :data:`NOT_STARTED` (``started`` False) when the program could not be started (no
+    descriptor for the lifeline included); output is stdout then stderr, capped at :data:`OUTPUT_MAX`."""
+    try:
+        data = stdin_text.encode("utf-8")
+    except UnicodeEncodeError:
+        return Ran(NOT_STARTED, "the host command was not started: its text holds a character UTF-8 cannot carry", False)
+    try:
+        life_r, life_w = os.pipe()      # neither end is inheritable: only the watchdog's stdin gets the read end
+    except OSError as exc:              # no descriptor for the lifeline (EMFILE): nothing has started
+        return Ran(NOT_STARTED, f"the host command could not start (no descriptor for its watchdog: "
+                                f"{type(exc).__name__})", False)
+    try:
+        dog = subprocess.Popen([sys.executable, "-I", "-S", "-c", _WATCHDOG, f"{timeout + _REAP + _WATCH_SLACK:g}"],
+                               stdin=life_r, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, process_group=0,
+                               env=child_env())
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        os.close(life_w)
+        return Ran(NOT_STARTED, f"the host command could not start (its watchdog did not: {type(exc).__name__})", False)
+    finally:
+        os.close(life_r)
+    try:
+        ran = _run_in(dog.pid, argv, data, extra, timeout)
+    except BaseException:
+        # The body failed with the command perhaps still running (an I/O thread that could not start, an interrupt):
+        # the door did NOT handle it, so the watchdog is never released. Its group is killed now, the command with it.
+        _abandon(dog, life_w)
+        raise
+    _release(dog, life_w)
+    return ran
+
+
+def _run_in(group: int, argv: tuple[str, ...], data: bytes, extra: tuple[str, ...], timeout: float) -> Ran:
+    """:func:`run`'s body: the command joins the watchdog's process ``group`` (alive, so the group exists)."""
     try:
         proc = subprocess.Popen([*argv, *extra], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                shell=False, start_new_session=True,
+                                shell=False, process_group=group,
                                 env=child_env())    # the allowlist, never the whole parent environment (test_launch's invariant)
-    except (OSError, ValueError) as exc:     # ValueError: an argument Popen will not pass (it never ran either way)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:  # ValueError: an argument Popen will not pass
         return Ran(NOT_STARTED, f"the host command could not start ({type(exc).__name__})", False)
     out_b, err_b = bytearray(), bytearray()
-    workers = [threading.Thread(target=_feed, args=(proc.stdin, stdin_text.encode("utf-8", "replace")), daemon=True),
+    workers = [threading.Thread(target=_feed, args=(proc.stdin, data), daemon=True),
                threading.Thread(target=_drain, args=(proc.stdout, out_b), daemon=True),
                threading.Thread(target=_drain, args=(proc.stderr, err_b), daemon=True)]
     for w in workers:
@@ -206,7 +305,7 @@ def run(argv: tuple[str, ...], stdin_text: str = "", extra: tuple[str, ...] = ()
     for w in workers[1:]:
         w.join(max(0.0, deadline - time.monotonic()))
     if timed_out or any(w.is_alive() for w in workers):
-        _kill_group(proc.pid)
+        _kill_group(group)
         try:
             proc.wait(timeout=_REAP)
         except subprocess.TimeoutExpired:
