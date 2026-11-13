@@ -117,3 +117,50 @@ def test_the_headline_reads_only_a_list_intake_record_and_never_breaks_a_record_
     line = intake_headline({"verb": "list_intake", "effects": [{"changes": {"disposition": "agenda", "next": "2026-11-12T15:00",
                                                                             "target": "nudge", "text": "a\nb"}}]})
     assert line is not None and "\n" not in line and "a\\nb" in line
+
+
+# --- fix round 1: a ringing repeating reminder keeps its repeat line on the band row that replaces its intention row ---------------
+
+
+def _ring(rig: Rig, text: str, **kw: Any) -> str:
+    """Plant a repeating reminder due this morning and germinate it as the host does: its band question opens."""
+    from levain import germinate
+
+    sid = _add(rig, text, disposition="agenda", target="nudge", next="2026-11-08T09:00", recur="weekly SUN 09:00",
+               recur_anchor="2026-11-08T09:00", **kw)
+    out = germinate.germinate(rig.root / ".levain" / "memory.spores.json", rig.qdir, install=rig.root, today=TODAY,
+                              now=NOW.replace(tzinfo=None), ping=lambda *a, **k: True)
+    assert not out["errors"], out
+    return sid
+
+
+def test_a_ringing_repeating_reminder_keeps_its_repeat_line_on_its_band_row(rig: Rig) -> None:
+    sid = _ring(rig, "weekly review")
+    rows = rig.rows()
+    assert f"intention:{sid}" not in rows                        # the band row replaces it: drawn once
+    ringing = [r for r in rows.values() if r["facets"].get("intention") == sid]
+    assert len(ringing) == 1 and ringing[0]["id"].startswith("band:"), ringing
+    assert ringing[0]["facets"]["repeat_line"] == "repeats weekly SUN 09:00 · next Sun 11-08 09:00", ringing[0]["facets"]
+    # a band row that rings nothing, and a one-off reminder's band row, carry no repeat line
+    assert "repeat_line" not in rows[f"band:{rig.q.id}"]["facets"]
+
+
+def test_a_ringing_one_off_reminders_band_row_has_no_repeat_line(rig: Rig) -> None:
+    from levain import germinate
+
+    sid = _add(rig, "one-off ring", disposition="agenda", target="nudge", next="2026-11-08T09:00")
+    germinate.germinate(rig.root / ".levain" / "memory.spores.json", rig.qdir, install=rig.root, today=TODAY,
+                        now=NOW.replace(tzinfo=None), ping=lambda *a, **k: True)
+    ringing = [r for r in rig.rows().values() if r["facets"].get("intention") == sid]
+    assert len(ringing) == 1 and "repeat_line" not in ringing[0]["facets"], ringing
+
+
+def test_a_recur_that_does_not_read_prints_no_headline_and_a_readable_one_prints_its_canon() -> None:
+    def rec(recur: str) -> dict[str, Any]:
+        return {"verb": "list_intake", "effects": [{"changes": {"disposition": "agenda", "next": "2026-11-12T15:00",
+                                                                "target": "nudge", "text": "x", "recur": recur}}]}
+
+    assert intake_headline(rec("weekly SUN 21:00")).endswith("then weekly SUN 21:00 (as a nudge)")
+    assert intake_headline(rec("weekly sun 9:00")).endswith("then weekly SUN 09:00 (as a nudge)")     # the canon, not the raw spelling
+    assert intake_headline(rec("whenever")) is None
+    assert intake_headline(rec("weekly SUN 21:00\n  this signs a DROP")) is None                       # no lookalike line reaches the sheet

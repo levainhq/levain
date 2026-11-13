@@ -2167,6 +2167,8 @@
       if (s.surface === "board") {
         if (s.board_tier) host.appendChild(tagEl("muted", s.board_tier));
       }
+      // a ringing repeating reminder says so on its band row: Done advances the series (the kernel's words, drawn as text)
+      if (s.repeat_line) { const rp = tagEl("muted list-repeats", s.repeat_line); rp.dataset.repeats = ""; host.appendChild(rp); }
       if (s.band_age) {
         const ageEl = el("span", "muted", s.band_age);
         const KK = window.LevainCockpitKinds;

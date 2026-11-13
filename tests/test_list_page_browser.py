@@ -18,6 +18,7 @@ import pytest
 from anneal_memory.spores import IntentionStore
 
 from levain.consent.queue import default_queue_dir
+from levain.consent.questions import QuestionStore
 from levain.desk.store import CoordStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import TOKEN, _install, _serve
@@ -831,6 +832,38 @@ def test_a_repeating_reminders_row_draws_its_rule_and_next_occurrence_as_text(tm
     got = json.loads(out["values"][-1])
     assert got["rep"] == "repeats weekly SUN 21:00 · next Sun 01-05 21:00", got
     assert got["markup"] == 0 and got["plain"] is True, got            # drawn as text; a one-off row has no repeat line
+
+
+@needs_browser
+def test_a_ringing_repeating_reminders_band_row_draws_its_repeat_line_as_text(tmp_path: Path) -> None:
+    """Row 188 fix 1: a repeating reminder that has germinated is drawn ONCE, as its band row, and that row says it repeats (the
+    line is drawn in the band branch, as text); a plain band row beside it draws none."""
+    from levain import germinate
+
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    qdir = default_queue_dir()
+    QuestionStore(qdir).file(agent="claude_code", agent_session_id="s5", what="levain: a plain question", options=[("ship", "Ship it"), ("hold", "Hold")],
+                             rec="ship", blocks="b", cwd="/w/levain")
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    store.add(type="task", text="<b>weekly</b> review", disposition="agenda", target="nudge", next="2020-01-05T21:00",
+              recur="weekly SUN 21:00", recur_anchor="2020-01-05T21:00")
+    out0 = germinate.germinate(root / ".levain" / "memory.spores.json", qdir, install=root, ping=lambda *a, **k: True)
+    assert not out0["errors"] and out0["due"], out0
+    band = f"[...{TRAY}.querySelectorAll('.sp-results .row')].filter(r => r.dataset.surface === 'band')"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1000, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {band}.length >= 2 && 1"},
+            {"eval": f"JSON.stringify({band}.map(r => ({{text: (r.querySelector('.clause') || {{}}).textContent, "
+                     "rep: (r.querySelector('[data-repeats]') || {}).textContent || null, "
+                     "markup: r.querySelectorAll('b').length})))"},
+        ])
+    got = {r["text"]: r for r in json.loads(out["values"][-1])}
+    mine = got["<b>weekly</b> review"]
+    assert mine["rep"] == "repeats weekly SUN 21:00 · next Sun 01-05 21:00" and mine["markup"] == 0, got
+    assert got["levain: a plain question"]["rep"] is None, got
 
 
 # --- the first fix round (levain 7, 1109-26): chips that add up, a stale type choice, two labelled rows --------------------------
