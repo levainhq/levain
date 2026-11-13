@@ -438,7 +438,7 @@ def test_without_a_visual_viewport_nothing_is_shown(tmp_path, monkeypatch) -> No
     end = json.loads(v[6])
     print("NO VISUAL VIEWPORT", end)
     assert end["state"]["allow"] is True and end["state"]["seen"] == "0", end    # Allow DISABLED
-    assert end["state"]["unseen"] > 16_000, end                                   # nothing counted shown
+    assert end["state"]["unseen"] == end["state"]["total"] > 0, end               # nothing counted shown: every character unseen
 
 
 # window scroll listeners named `later` (the gate's), wrapped to count their calls and how many are still added

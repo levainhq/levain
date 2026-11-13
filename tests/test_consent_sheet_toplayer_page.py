@@ -285,7 +285,7 @@ def test_escape_a_close_request_and_a_close_never_take_the_sheet_out_of_the_top_
     assert closed["close"] == req["close"] + 1 and closed["here"] and closed["open"] and closed["modal"], closed
 
 
-HIDDEN = "​‮⁦‍­﻿"
+HIDDEN = "\u200b\u202e\u2066\u200d\u00ad\ufeff"
 # what the frame's long block holds: the most child nodes of any chunk, how many chunks hold an element, how many of the
 # hidden characters arrived as themselves (raw), and how many visible marks (the server's "⟨U+200B⟩") the text holds
 _KIDS = (f"(() => {{ const sp = [...{F_FULL}.querySelectorAll('.long-group > span')]; const t = {F_FULL}.textContent; "
