@@ -3,7 +3,8 @@ store in the scratch home (the conftest isolates HOME: nothing here touches an o
 
 Pinned: the intake box submits ONE line and prints the server's receipt sentence verbatim (a plain line, a ``?`` talk, an ``@`` drop
 that commits, an ``@`` drop that waits for a signature); a refusal prints the server's reason in words; a 501 prints plainly; the
-surface chips filter the rows; Open loops is off the default Board tab and on Build; a band or board row offers no verb.
+surface chips filter the rows; Open loops is off the default Board tab and on Build; a board row offers no verb and a band row only
+``band_agenda`` (the page half is tests/test_list_page_keep_agenda.py).
 ``LEVAIN_LIST_SHOTS=<dir>`` keeps the desktop 1280 and phone 390 screenshots there."""
 from __future__ import annotations
 
@@ -148,7 +149,7 @@ def test_the_surface_chips_filter_and_no_band_or_board_row_has_a_verb(tmp_path: 
             {"eval": f"JSON.stringify({{surfaces: {rows}.map(r => r.dataset.surface), "
                      f"pressed: {TRAY}.querySelector('.list-surface-chip[aria-pressed=true]').dataset.surface}})"},
             {"eval": f"{TRAY}.querySelector('.list-surface-chip[data-surface=\"\"]').click(); {rows}.length"},
-            {"eval": f"JSON.stringify({{foreignVerbs: {rows}.filter(r => ['band','board'].includes(r.dataset.surface) && r.querySelector('.verb-btn')).length}})"},
+            {"eval": f"JSON.stringify({{foreignVerbs: {rows}.filter(r => ['band','board'].includes(r.dataset.surface) && [...r.querySelectorAll('.verb-btn')].some(b => b.dataset.verb !== 'band_agenda')).length}})"},
         ])
     v = out["values"]
     first = json.loads(next(x for x in v if isinstance(x, str) and x.startswith('{"chips"')))

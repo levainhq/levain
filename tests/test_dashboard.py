@@ -1500,11 +1500,13 @@ class TestListPagePins:
         row = self._fn(core, "  function intentionRow(", "  // The filter bar the intention panels share")
         foreign = row[row.index("if (foreign) {"):]
         foreign = foreign[:foreign.index("return row;")]
-        # no intention verb, ever; the one thing a band row may draw is the four intention controls, and only when the row carries
-        # an intention the kernel offered them on
+        # no intention verb, ever; a band row may draw the four intention controls, only when the row carries an intention the
+        # kernel offered them on, or (a plain band row) the one verb it has of its own, band_agenda, only where the kernel offered it
         assert "buildPlainIntentionVerbs" not in foreign
         calls = [ln for ln in foreign.splitlines() if "appendRowVerbs(" in ln]
-        assert all("buildIntentionVerbs(" in ln and "if (intend)" in ln for ln in calls), calls
+        agenda = [ln for ln in calls if "buildBandAgendaVerb(" in ln]
+        assert all("buildIntentionVerbs(" in ln and "if (intend)" in ln for ln in calls if ln not in agenda), calls
+        assert len(agenda) == 1 and "hasBandAgenda(s.actions)" in agenda[0] and 's.surface === "band"' in agenda[0], agenda
         assert 'const intend = s.surface === "band" && s.intention && s.row_id && hasIntentionControls(s.actions);' in foreign
 
     def test_the_frozen_payload_offers_band_and_board_rows_no_verb_and_the_panel_offers_the_intake(self) -> None:
