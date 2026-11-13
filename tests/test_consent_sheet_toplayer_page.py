@@ -285,6 +285,52 @@ def test_escape_a_close_request_and_a_close_never_take_the_sheet_out_of_the_top_
     assert closed["close"] == req["close"] + 1 and closed["here"] and closed["open"] and closed["modal"], closed
 
 
+HIDDEN = "​‮⁦‍­﻿"
+# what the frame's long block holds: the most child nodes of any chunk, how many chunks hold an element, how many of the
+# hidden characters arrived as themselves (raw), and how many visible marks (the server's "⟨U+200B⟩") the text holds
+_KIDS = (f"(() => {{ const sp = [...{F_FULL}.querySelectorAll('.long-group > span')]; const t = {F_FULL}.textContent; "
+         f"return JSON.stringify({{chunks: sp.length, most: Math.max(...sp.map(c => c.childNodes.length)), "
+         f"elems: sp.filter(c => c.children.length).length, "
+         f"raw: [...{json.dumps(HIDDEN)}].filter(c => t.includes(c)).length, "
+         f"marked: (t.match(/\\u27e8U\\+[0-9A-F]{{4,6}}\\u27e9/g) || []).length}}); }})()")
+
+
+@needs_browser
+@needs_ssh
+def test_a_long_input_with_hidden_characters_reads_through_to_allow(tmp_path, monkeypatch) -> None:
+    """(deepseek MED on fix 5, run) A long input holding zero-width, bidi, joiner, soft-hyphen and BOM characters (several
+    times, so they fall inside chunks): fix 5's hit test reads a chunk's ONE text node, and a chunk holding a child element
+    (a mark drawn as a span) would never latch. It did not reproduce (run 11-13): the server marks each hidden character
+    as visible TEXT ("⟨U+200B⟩", 24 marks here, none raw), and longText builds every chunk from text alone (textContent),
+    so no chunk holds an element. Pinned: the marks arrive as text, every chunk is one text node, and a read-through in
+    the cockpit's top-layer frame opens Allow."""
+    from datetime import timedelta
+
+    from tests.test_consent_long_input import _long_command
+
+    rig = _ConsentRig(tmp_path, monkeypatch)
+    command = _long_command(16_489)
+    for at in (3_000, 3_007, 8_000, 12_345):
+        command = command[:at] + HIDDEN + command[at + len(HIDDEN):]
+    rid = rig.queue.file(agent="claude_code", agent_session_id="s1", tool_name="Bash", tool_input={"command": command},
+                         cwd="/w", hold=timedelta(minutes=30), tier="T2").id
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+            DESKTOP, rig.authenticator(), *_open(rid),                                                  # 0 1 2
+            {"tap": f"{F_INPUT}.querySelector('.long-whole > summary')"},                               # 3
+            {"until": f"{F_INPUT}.classList.contains('open') && 1", "ms": 10000},                       # 4
+            {"eval": _KIDS},                                                                            # 5
+            {"eval": stepped(F_FULL, 0.8, down=True)},                                                  # 6
+            {"eval": f"(async () => {{ {FRAMES}; {FRAMES}; return {F_STATE}; }})()"},                   # 7
+        ])
+    v = out["values"]
+    kids, after = json.loads(v[5]), json.loads(v[7])
+    print("HIDDEN", kids, after)
+    assert kids["raw"] == 0 and kids["marked"] == 4 * len(HIDDEN), kids    # every hidden character is a visible mark, in text
+    assert kids["most"] == 1 and kids["elems"] == 0, kids          # every chunk is one text node
+    assert after["allow"] is False and after["seen"] == "1" and after["unseen"] == 0, after
+
+
 def test_nothing_else_in_the_web_templates_enters_the_top_layer() -> None:
     """The top layer's only residual is another top-layer entry painted above the sheet (a second modal dialog, a popover,
     a fullscreen element). The web templates make none: the only showModal calls are the sign sheet's own two (open, and

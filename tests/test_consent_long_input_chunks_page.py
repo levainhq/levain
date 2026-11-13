@@ -415,6 +415,32 @@ def test_under_pinch_zoom_nothing_is_shown_and_only_the_visual_viewport_counts(t
     assert keyboard["shown"] > 0 and keyboard["wrong"] == 0, keyboard    # what is above it shows; nothing below does
 
 
+@needs_browser
+@needs_ssh
+def test_without_a_visual_viewport_nothing_is_shown(tmp_path, monkeypatch) -> None:
+    """(fix 6, codex on fix 5) A browser with no visualViewport cannot say whether the page is pinch-zoomed nor where the
+    visual viewport lies, so the gate counts nothing shown: read through to the end, Allow stays shut and Deny open."""
+    rig = _ConsentRig(tmp_path, monkeypatch)
+    rid = _attack(rig)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
+            {"eval": "(Object.defineProperty(window, 'visualViewport', {configurable: true, value: undefined}), "
+                     "String(window.visualViewport))"},                                                  # 2
+            {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
+            {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
+            {"eval": stepped(FULL, 0.8, down=True)},                                                      # 5
+            {"eval": f"(async () => {{ {FRAMES}; {FRAMES}; return JSON.stringify({{n: {INPUT}.longUnshown().length, "
+                     f"state: JSON.parse({SHEET})}}); }})()"},                                              # 6
+        ])
+    v = out["values"]
+    assert v[2] == "undefined", v
+    end = json.loads(v[6])
+    print("NO VISUAL VIEWPORT", end)
+    assert end["state"]["allow"] is True and end["state"]["seen"] == "0", end    # Allow DISABLED
+    assert end["state"]["unseen"] > 16_000, end                                   # nothing counted shown
+
+
 # window scroll listeners named `later` (the gate's), wrapped to count their calls and how many are still added
 TRACK_LATER = ("(() => { const add = window.addEventListener, rem = window.removeEventListener, m = new Map(); "
                "window.__later = 0; window.__live = 0; "

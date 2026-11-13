@@ -449,8 +449,8 @@
   // layer instead: the frame must sit in that page's one modal dialog, FIX 4). Coverage is the SET of chunks shown, not
   // pixels: a reflow cannot make a chunk shown, only showing it can. The count of what is not yet shown is the code points
   // of the chunks not shown (exact, no layout read); seen is every chunk shown, and once seen a box stays seen.
-  // Fails closed: no IntersectionObserver or no elementFromPoint, nothing is ever shown (Deny stays open); a chunk the
-  // browser moved past between two rendering updates (a fast fling, the End key) gets no wholly-inside entry and stays
+  // Fails closed: no IntersectionObserver, no elementFromPoint or no visualViewport, nothing is ever shown (Deny stays
+  // open); a chunk the browser moved past between two rendering updates (a fast fling, the End key) gets no wholly-inside entry and stays
   // not shown until it is scrolled back over; a chunk taller than the visible part of the block (a block narrowed to a
   // few characters) can never be wholly inside and keeps Allow shut.
   // THE LIMIT, said plainly: this proves each chunk was wholly shown in the browser's viewport, uncovered, at some moment;
@@ -517,8 +517,9 @@
   }
   // FIX 4: where this page lies on the screen the person sees, or null when it cannot be told (then nothing is shown):
   // { dx, dy } the offset of this window's viewport in the top page's, and `vv` the top page's visual viewport as
-  // [left, top, right, bottom] in that page's layout-viewport coordinates (null: no visualViewport in this browser, no
-  // extra condition). FRAMED: a page of the same origin painted over the frame is invisible to the hit test, which sees only
+  // [left, top, right, bottom] in that page's layout-viewport coordinates. A browser with no visualViewport cannot say
+  // whether the page is pinch-zoomed nor where the visual viewport lies: null (fix 6; every browser with showModal has
+  // one). FRAMED: a page of the same origin painted over the frame is invisible to the hit test, which sees only
   // this document, so a framed page counts as on screen only while every frame up the chain sits in the ONE :modal dialog
   // of its parent (the top layer: nothing of that page paints above it; the cockpit's sign sheet is one, dashboard_core.js
   // buildSignSheet) and no element of that page is fullscreen; a frame in a page of another origin (no frameElement), a
@@ -539,8 +540,7 @@
         w = w.parent;
       }
       const vv = w.visualViewport;
-      if (!vv) return { dx: dx, dy: dy, vv: null };
-      if (!(vv.scale <= 1.01)) return null;
+      if (!vv || !(vv.scale <= 1.01)) return null;
       return { dx: dx, dy: dy, vv: [vv.offsetLeft, vv.offsetTop, vv.offsetLeft + vv.width, vv.offsetTop + vv.height] };
     } catch (e) {
       return null;
@@ -548,7 +548,6 @@
   }
   // whether `el`'s box lies wholly inside the visual viewport `s` (screenOf) describes
   function onScreen(el, s) {
-    if (!s.vv) return true;
     const b = el.getBoundingClientRect(), v = s.vv;
     return b.left + s.dx >= v[0] - FULL_EPS && b.top + s.dy >= v[1] - FULL_EPS &&
       b.right + s.dx <= v[2] + FULL_EPS && b.bottom + s.dy <= v[3] + FULL_EPS;
