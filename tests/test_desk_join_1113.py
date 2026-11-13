@@ -211,6 +211,22 @@ def test_it_did_not_arrive_sends_the_same_words_again_under_a_new_id_once_per_ta
 
 
 @needs_browser
+def test_it_did_not_arrive_never_overwrites_words_already_in_the_box(tmp_path, qdir):  # noqa: F811
+    port = ScriptedDeskPort()
+    port.script_lease("held", "desk 25", 190)
+    port.script_post("ambiguous", reason="the host command timed out")
+    with join_page(tmp_path, port) as base:
+        out = _go(tmp_path, base, [
+            until("document.querySelector('.dv-lease-held')"), typed("line one"), {"tap": SEND},
+            until("document.querySelector('.dv-zone .dv-ambiguous .dv-mark')"), typed("something else I was typing"),
+            {"eval": "[...document.querySelectorAll('.dv-zone .dv-mark')].find(b => /did not arrive/i.test(b.innerText)).click(); 1"},
+            until("document.querySelector('.dv-zone .dv-notarrived')"), SNAP])
+    (s,) = snaps(out)
+    assert s["taValue"] == "something else I was typing", s
+    assert "line one" in s["lines"][0]["text"] and len(port.posts) == 1, (s, port.posts)
+
+
+@needs_browser
 def test_it_arrived_settles_the_line_and_nothing_is_sent(tmp_path, qdir):  # noqa: F811
     port = ScriptedDeskPort()
     port.script_lease("held", "desk 25", 190)
