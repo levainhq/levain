@@ -1157,15 +1157,22 @@ def _check_by_late(s: dict, today) -> bool:
     return day is not None and day <= today
 
 
-def due_agendas(intentions: list, now: datetime | None = None, ringed: tuple | set | frozenset = ()) -> list[dict]:
+_ring_pending: list[str] = []     # the check-by-only ids of the last `due_agendas` call: `start_germinate` records them once it spawns
+
+
+def due_agendas(intentions: list, now: datetime | None = None, ringed: tuple | set | frozenset | None = None) -> list[dict]:
     """Open AGENDA intentions that have come due and are not yet germinated (TS-3): a date-only `next` on or before
     today, a timed `next` (YYYY-MM-DDTHH:MM, local) from that minute; no `next`, a malformed one or a stamped
     `germinated` is never due. An agenda that waits on an event (`on_event`) is never due by a date: it is due when
-    `_event_due` says so, except that a part due ONLY by its check-by whose id is in `ringed` (a run already started for it
-    today, see `note_germinate_ringed`) is not due again today: its run files the band question once and the part stays
-    unstamped until the operator answers, so a second run the same day is a no-op. Mirrors levain.germinate.is_due (this file
-    is stranger-side and imports nothing of it)."""
+    `_event_due` says so, except that a part due ONLY by its check-by whose id is in `ringed` (default: today's record,
+    `germinate_ringed`, written by `start_germinate` when it spawns) is not due again today: its run files the band question
+    once and the part stays unstamped until the operator answers, so a second run the same day is a no-op. The ids this call
+    found due only by their check-by are left in `_ring_pending` for `start_germinate`. Mirrors levain.germinate.is_due (this
+    file is stranger-side and imports nothing of it)."""
+    global _ring_pending
     now = now or datetime.now()
+    if ringed is None:
+        ringed = germinate_ringed(now)
     open_ids = {str(s.get("id")).partition("-")[2] for s in intentions if isinstance(s, dict)}
     due = []
     for s in intentions:
@@ -1187,6 +1194,7 @@ def due_agendas(intentions: list, now: datetime | None = None, ringed: tuple | s
             continue
         if now >= when:
             due.append(s)
+    _ring_pending = ring_only_ids(due, intentions)
     return due
 
 
@@ -1276,11 +1284,13 @@ def start_germinate(agent: str = "claude_code") -> str:
     try:
         rc = proc.wait(timeout=0.4)
     except subprocess.TimeoutExpired:
+        note_germinate_ringed(_ring_pending)
         return "started"
     except Exception:
         _drop()
         return "failed"
     if rc == 0:
+        note_germinate_ringed(_ring_pending)
         return "started"
     _drop()
     return "failed"

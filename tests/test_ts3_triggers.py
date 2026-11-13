@@ -399,3 +399,14 @@ def test_due_agendas_default_still_counts_every_due_part(agent, tmp_path):
     due = h.due_agendas(rows, now=now)
     assert {s["id"] for s in due} == {follower, dated}
     assert h.ring_only_ids(due, rows) == []          # a finished first part and a dated agenda are woken by a run, never held back
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_run_that_finished_at_once_cleanly_is_recorded_too(agent, monkeypatch, capsys, tmp_path):
+    mod = _load(agent)
+    root, st, anchor, follower, an_hour_later = _ring_rig(tmp_path)
+    s1, c1 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path, rc=0)       # the child exited 0 inside the grace
+    assert len(s1) == 1 and "germination started" in c1
+    an_hour_later()
+    s2, c2 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert s2 == [] and "[germinate]" not in c2
