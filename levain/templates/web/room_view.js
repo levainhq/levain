@@ -651,6 +651,11 @@
     });
     // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
     var dbase = "", heard = "", lastHeard = "";
+    // the reason a failed dictation put in the note; a new attempt takes it back (only if the note still holds it: the note is
+    // shared with Send's own words). The words come from mic.js, once, for every dictation control.
+    var dictNote = "";
+    function dictWhy(code) { var M = root.LevainMic; return M && typeof M.dictateReason === "function" ? M.dictateReason(code) : "Dictation stopped."; }
+    function dictSay(code) { note.textContent = dictNote = dictWhy(code); }
     function endDictation() {
       var r = rec; rec = null;
       if (micB) face(micB, "dictate", DICT_TITLE);
@@ -680,6 +685,8 @@
         voiceTap();
         if (live) return;                              // the streaming mic holds the box and the microphone: Stop mic first
         if (rec) { endDictation(); return; }
+        if (dictNote && note.textContent === dictNote) note.textContent = "";
+        dictNote = "";
         var r = new Speech();
         dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
         r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
@@ -697,15 +704,10 @@
         r.onerror = function (ev) {
           if (rec !== r) return;
           endDictation();
-          var c = ev && ev.error;
-          note.textContent = c === "language-not-supported" ? "On-device dictation is not installed for this language; the keyboard's dictation key works here."
-            : (c === "not-allowed" || c === "service-not-allowed") ? "Dictation needs permission to use the microphone; allow it in the browser's site settings."
-            : c === "audio-capture" ? "No microphone was found for dictation."
-            : c === "no-speech" ? "Heard nothing."
-            : "Dictation stopped.";
+          dictSay(ev && ev.error);
         };
         rec = r; face(micB, "dictate-stop");
-        try { r.start(); } catch (e) { endDictation(); }
+        try { r.start(); } catch (e) { endDictation(); dictSay("start"); }
       });
       // foreground only: leaving the page ends dictation
       var leave = function () { if (rec) endDictation(); };
