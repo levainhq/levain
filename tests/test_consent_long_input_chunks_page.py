@@ -157,6 +157,39 @@ def test_a_jump_names_the_skipped_chunks_and_the_payload_is_among_them(tmp_path,
 
 @needs_browser
 @needs_ssh
+def test_at_the_desktop_cockpits_width_a_read_through_opens_allow(tmp_path, monkeypatch) -> None:
+    """Fix 5: at the size the desktop cockpit gives the sheet's frame (898 x 680), the block's lines wrap at spaces inside
+    chunks. Chrome hit-tests the white space a line wraps at, and the right part of the glyph before it, to the PRE, so
+    fixes 3 and 4 never counted such a chunk uncovered: a read-through in the cockpit's frame left 99 of its 1,106
+    chunks unshown (measured on fix 4) and Allow shut. Stepped through, every chunk is shown, Allow opens and the count line says so."""
+    rig = _ConsentRig(tmp_path, monkeypatch)
+    rid = _attack(rig)
+    with rig.serving():
+        out = _drive(tmp_path, f"{rig.origin}/nope", [
+            {"emulate": {"w": 898, "h": 680, "dpr": 1}}, rig.authenticator(), *rig.open_top(rid),        # 0 1
+            {"tap": SUMMARY},                                                                             # 2
+            {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
+            {"eval": f"(async () => {{ {FULL}.scrollIntoView({{block: 'center'}}); {FRAMES}; {FRAMES}; "
+                     f"const f = {FULL}, r = f.getBoundingClientRect(); return JSON.stringify({{block: [r.top, r.bottom], "
+                     f"vh: innerHeight, w: f.clientWidth, ws: getComputedStyle(f).whiteSpace}}); }})()"},           # 4
+            {"eval": stepped(FULL, 0.8, down=True)},                                                      # 5
+            {"eval": f"(async () => {{ {FRAMES}; {FRAMES}; return JSON.stringify({{n: {INPUT}.longUnshown().length, "
+                     f"state: JSON.parse({SHEET})}}); }})()"},                                              # 6
+        ])
+    v = out["values"]
+    at = json.loads(v[4])
+    print("DESKTOP WIDTH", at, v[5], v[6])
+    assert 0 <= at["block"][0] and at["block"][1] <= at["vh"] and at["ws"] == "pre-wrap", at    # the whole view on screen
+    s = json.loads(v[5])
+    assert s["max"] <= s["ch"], s                                                # no step skipped a view
+    end = json.loads(v[6])
+    assert end["n"] == 0, end                                                    # every chunk shown
+    assert end["state"]["seen"] == "1" and end["state"]["allow"] is False, end   # Allow OPEN
+    assert end["state"]["unseen"] == 0 and "Allow is open" in end["state"]["line"], end
+
+
+@needs_browser
+@needs_ssh
 def test_a_block_partly_below_the_fold_shows_only_its_visible_part(tmp_path, monkeypatch) -> None:
     """(e, complement LOW) The page pushed down so the open block runs past the bottom of the screen: the part of the
     block's own view that is below the fold is NOT shown, nor a chunk the fold cuts; scrolling the page up to it shows

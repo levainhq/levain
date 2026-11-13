@@ -443,7 +443,7 @@
   // reflow, font load or zoom, whether a chunk is inside every clip at once: the block's own scrollport, the page's viewport, any clipping
   // ancestor and any outer frame. A chunk counts as SHOWN only when an entry reported it wholly inside (its
   // intersectionRect is its boundingClientRect, within FULL_EPS px) AND, while so held, a hit test finds nothing in the page
-  // painted over it (document.elementFromPoint at two inset corners and the centre of each of its line boxes is the
+  // painted over it (document.elementFromPoint at two inset corners and the centre of each line box of its text is the
   // chunk: the sticky bar or a header over the block hides what is under it) AND it lies in the visual viewport with no
   // pinch-zoom (screenOf; in a frame the hit test sees only the frame's document, so an outer page is ruled out by the top
   // layer instead: the frame must sit in that page's one modal dialog, FIX 4). Coverage is the SET of chunks shown, not
@@ -482,17 +482,36 @@
   // across the block (a sticky header or action bar) over any part of a line meets one of them. Three points, not more:
   // a hit test in a block of thousands of lines is the gate's main cost per frame. A chunk with no line box wide enough
   // to test (blank lines only) passes when its text is only white space.
+  // FIX 5, the line boxes tested are those of the chunk's runs of non-white-space text (a Range over each), and the right
+  // point is a glyph and a quarter in from a box's right end, measured in Chrome at a soft wrap: the white space a line
+  // wraps at hangs past the line as a box of its own that hit-tests to the PRE, and so does the right part (about 4 px,
+  // more than half) of the last glyph before the wrap; a chunk holding a wrap at a space was never uncovered, and at the
+  // desktop cockpit's width a read-through left 99 of 1,106 chunks unshown (measured) and Allow shut. A box under three glyphs
+  // wide is tested at its left quarter only (top and bottom). White space is not tested: hidden, it hides nothing.
   function uncovered(el, pre) {
     const doc = el.ownerDocument;
-    if (!doc || typeof doc.elementFromPoint !== "function") return false;
+    if (!doc || typeof doc.elementFromPoint !== "function" || typeof doc.createRange !== "function") return false;
     const own = (h) => h === el || (!!h && h.tagName === "SPAN" && h !== pre && pre.contains(h));
-    let tested = false;
-    for (const b of Array.from(el.getClientRects())) {
-      if (!(b.width > 2 && b.height > 2)) continue;
-      tested = true;
-      const k = Math.min(3, b.width / 4), l = b.left + k, r = b.right - k, t = b.top + 1, u = b.bottom - 1;
-      const pts = [[l, t], [(b.left + b.right) / 2, (b.top + b.bottom) / 2], [r, u]];
-      for (const [x, y] of pts) if (!own(doc.elementFromPoint(x, y))) return false;
+    const node = el.firstChild;
+    if (!node || node.nodeType !== 3 || node.nextSibling) return false;
+    const rg = doc.createRange(), re = /\S+/g;
+    let tested = false, m;
+    while ((m = re.exec(node.data))) {
+      rg.setStart(node, m.index);
+      rg.setEnd(node, m.index + m[0].length);
+      const boxes = Array.from(rg.getClientRects());
+      let wide = 0;
+      for (const b of boxes) wide += b.width;
+      const cw = wide / Array.from(m[0]).length;     // one glyph's width, on average over the run
+      for (const b of boxes) {
+        if (!(b.width > 2 && b.height > 2)) continue;
+        tested = true;
+        const l = b.left + Math.min(3, b.width / 4), t = b.top + 1, u = b.bottom - 1;
+        const pts = b.width >= 3 * cw
+          ? [[l, t], [(b.left + b.right) / 2, (b.top + b.bottom) / 2], [b.right - 1.25 * cw, u]]
+          : [[l, t], [l, u]];
+        for (const [x, y] of pts) if (!own(doc.elementFromPoint(x, y))) return false;
+      }
     }
     return tested || !/\S/.test(el.textContent);
   }
