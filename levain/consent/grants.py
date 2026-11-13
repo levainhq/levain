@@ -39,7 +39,7 @@ from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, 
 
 __all__ = ["INERT_NOTE", "ConsentGrant", "GrantChanged", "append_revoke", "create_grant", "grant_instance",
            "grant_listing", "grant_view", "list_grants", "list_inert_grants", "prepare_revoke", "revoke_command",
-           "revoke_grant", "stopped_by_key", "stopped_line", "stopped_notice"]
+           "revoke_grant", "stopped_by_key", "stopped_line", "stopped_notice", "way_back", "ways_back"]
 
 _log = logging.getLogger(__name__)
 
@@ -253,7 +253,8 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     is created. Every string a grant's creator or an agent wrote is shown through ``visible``; ``id`` is also given
     as is, the name a revoke route takes, and ``instance`` is what that route's challenge names. A row's ``state`` is
     ``stopped`` (with ``stopped_why``, one of two fixed sentences) when a key that signed the grant was revoked, ahead of
-    ``expired`` and ``live``; ``stopped_why`` is "" on every other row."""
+    ``expired`` and ``live``, and ``way_back`` (:func:`way_back` of its kind) says how to use it again; both are "" on
+    every other row."""
     from levain.cockpit.display_safe import visible
     from levain.consent.answering import hook_roots
     from levain.consent.listing import read_grant_evidence
@@ -331,6 +332,10 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         rows.append({**common(gid, SEAT_EGRESS_KIND, str(g["expires_at"]), None if link is None else link[0]),
                      "state": state_of(gid, str(g["expires_at"])), "agent": visible(str(g["agent"])),
                      "tools": [], "workspace": visible(str(g["push_remote"])), "postures": []})
+    # a stopped row carries its way back in the terminal's words (way_back, from the RAW kind), so a reader of these rows
+    # needs no table of kinds of its own that could say otherwise
+    for row in rows:
+        row["way_back"] = way_back(state.policy.grants[row["id"]].get("kind")) if row["state"] == "stopped" else ""
     return {"root": visible(str(root)), "note": "", "grants": rows, "inert_note": INERT_NOTE}
 
 
@@ -411,12 +416,31 @@ def _stopped_tail(grant: Mapping[str, Any]) -> str:
     return f"{field('kind')} grant"
 
 
+def way_back(kind: Any) -> str:
+    """The way back for a stopped grant of ``kind`` as one clause (:func:`levain.authority.stopped_way`, with "to use
+    it" after a way that makes one again): what a list line and the cockpit page's row both say."""
+    way = stopped_way(kind)
+    return way if kind == HANDS_MCP_KIND else way + " to use it"
+
+
 def stopped_line(why: str, kind: Any = None) -> str:
     """How a list line says a grant is stopped: the reason (:func:`levain.authority.grant_stop_reason`'s sentence), what
-    that means for the grant and the way back for its ``kind`` (:func:`levain.authority.stopped_way`: a kind with a
-    one-live rule is revoked first)."""
-    way = stopped_way(kind)
-    return f"stopped: {why} (answers nothing; {way if kind == HANDS_MCP_KIND else way + ' to use it'})"
+    that means for the grant and the way back for its ``kind`` (:func:`way_back`: a kind with a one-live rule is
+    revoked first)."""
+    return f"stopped: {why} (answers nothing; {way_back(kind)})"
+
+
+def ways_back(stopped: Iterable[tuple[str, Any]]) -> list[tuple[str, list[str]]]:
+    """The ways back for stopped grants ``(id, kind)``, grouped: one ``(words, ids)`` per way, in the order that works
+    (create-only first, then revoke-then-create, then the hands entry, which can only be cleared). ``words`` is
+    :func:`levain.authority.stopped_way`'s, with "with a key you still hold" after a way that makes one again; the
+    ids keep their given order."""
+    ways: dict[str, list[str]] = {}
+    for gid, kind in stopped:
+        ways.setdefault(stopped_way(kind), []).append(gid)
+    rank = {stopped_way(None): 0, stopped_way(SEAT_LEASE_KIND): 1}
+    return [(way if way == stopped_way(HANDS_MCP_KIND) else f"{way} with a key you still hold", ways[way])
+            for way in sorted(ways, key=lambda w: rank.get(w, 2))]
 
 
 def stopped_by_key(data_root: Path | str, fingerprint: str, *, now: datetime,
@@ -450,15 +474,11 @@ def stopped_notice(stopped: list[tuple[str, str, str]]) -> list[str]:
              f"{'It answers' if n == 1 else 'They answer'} nothing from now on, though "
              f"{'it has' if n == 1 else 'they have'} not expired:"]
     lines += [f"  {gid}  {words}" for gid, _kind, words in stopped]
-    ways: dict[str, list[str]] = {}                  # first seen first: the rows come sorted by id, the ways by rank
-    for gid, kind, _words in stopped:
-        ways.setdefault(stopped_way(kind), []).append(gid)
     it = "it" if n == 1 else "one"
     lines.append(f"A renew does not bring {it} back. To use {it} again:")
-    rank = {stopped_way(None): 0, stopped_way(SEAT_LEASE_KIND): 1}   # create-only first, revoke-then-create, the rest
-    for way in sorted(ways, key=lambda w: rank.get(w, 2)):
-        shown = way if way == stopped_way(HANDS_MCP_KIND) else f"{way} with a key you still hold"
-        lines.append(f"  {shown}: {', '.join(ways[way])}")
+    # the rows come sorted by id, so each way's ids do too; the ways come in the order that works
+    for shown, ids in ways_back((gid, kind) for gid, kind, _words in stopped):
+        lines.append(f"  {shown}: {', '.join(ids)}")
     lines.append("To revoke one: levain consent grant revoke --signing-key <key> -- <id>")
     if any(kind == EGRESS_KEY_KIND for _gid, kind, _words in stopped):
         lines.append("A chat key revokes with: levain chat key revoke --signing-key <key> <id>")
