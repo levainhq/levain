@@ -428,12 +428,89 @@
   // without scrolling the whole text. Text up to LONG_AT code points is one block of class `cls`, as before: LONG_AT is the old
   // display cut, so an input that used to show whole still does and needs no gate. Counted in code points, so no cut splits a
   // surrogate pair.
-  // A long box keeps whether its whole text has been SEEN: opened, and its block scrolled to its end (or fitting without a
-  // scroll). Pages gate an Allow on it (seenGate): the head and the tail are a summary, and a payload in the middle of a long
-  // command must not be one tap from being allowed unopened. The gate proves the text was opened and scrolled past, not that
-  // it was read; it is the most a page can know.
-  const LONG_AT = 2000, LONG_END = 400;
+  // A long box keeps whether its whole text has been SEEN: opened, and every part of its block exposed in the block's view.
+  // Pages gate an Allow on it (seenGate): the head and the tail are a summary, and a payload in the middle of a long command
+  // must not be one tap from being allowed unopened, nor one jump to the end away (row 1704 fix 2: fix 1 latched on the
+  // scroll END, so dragging the scrollbar to the bottom, or the End key, enabled Allow over a middle never on screen).
+  // COVERAGE: each view [scrollTop, scrollTop + clientHeight] the block shows is sampled (on open, on every scroll event and
+  // on each animation frame while a scroll is moving) and joined into a union of exposed intervals; seen is the union
+  // covering the whole [0, scrollHeight] with no gap (gaps under COVER_SLACK px, scroll rounding, are joined). A jump leaves
+  // a gap, and Allow stays shut until the gap is scrolled back over. The count of what is not yet shown is the characters
+  // whose painted boxes reach into a gap (a line half in view counts as not shown), read from the layout, not estimated
+  // from the scroll fraction. A reflow (a new scrollHeight or width: a resize, a font arriving) moves the text under the
+  // pixels, so coverage starts again for the new layout until seen; once seen, a box stays seen. A block not laid out
+  // (clientHeight 0) records nothing: fails closed.
+  // THE LIMIT, said plainly: coverage proves the text was EXPOSED in the block's view, not that it was read. A view the
+  // browser paints but reports in no scroll event or sampled frame is not counted, so a fast fling that skips a band in
+  // one frame leaves a gap: that gap stays gated (counted as not shown), never counted as seen. The page's own script can
+  // set scrollTop; that is not a threat model here.
+  const LONG_AT = 2000, LONG_END = 400, COVER_SLACK = 2;
   const count = (n) => Number(n).toLocaleString("en-US");
+  // the union of exposed intervals, kept sorted and merged (a gap under COVER_SLACK px is joined); returns whether it grew
+  function coverAdd(spans, a, b) {
+    const before = JSON.stringify(spans);
+    spans.push([a, b]);
+    spans.sort((x, y) => x[0] - y[0]);
+    const out = [];
+    for (const s of spans) {
+      const last = out[out.length - 1];
+      if (last && s[0] <= last[1] + COVER_SLACK) last[1] = Math.max(last[1], s[1]);
+      else out.push([s[0], s[1]]);
+    }
+    spans.length = 0;
+    for (const s of out) spans.push(s);
+    return JSON.stringify(spans) !== before;
+  }
+  // the parts of [0, height] the union does not cover
+  function coverGaps(spans, height) {
+    const gaps = [];
+    let at = 0;
+    for (const [a, b] of spans) {
+      if (a > at + COVER_SLACK) gaps.push([at, a]);
+      at = Math.max(at, b);
+    }
+    if (at < height - COVER_SLACK) gaps.push([at, height]);
+    return gaps;
+  }
+  // how many characters of `pre`'s text (one text node, `s`) have a painted box reaching into any of `gaps` (content px,
+  // 0 = the top of the block's scrolled content), read from the layout by a binary search over the text, which a
+  // wrapping pre lays out top to bottom. A character that paints no box (a newline) takes the next one's. Any doubt counts
+  // characters as NOT shown: a text that cannot be read from the layout is wholly not shown.
+  function uncoveredChars(pre, s, gaps) {
+    const tn = pre.firstChild;
+    const all = Array.from(s).length;
+    if (!gaps.length) return 0;
+    if (!tn || tn.nodeType !== 3 || tn.data !== s) return all;
+    const doc = pre.ownerDocument, r = doc.createRange(), n = s.length;
+    const base = pre.getBoundingClientRect().top + pre.clientTop - pre.scrollTop;
+    const box = (k) => {
+      for (let j = k; j < n && j < k + 16; j++) {
+        r.setStart(tn, j);
+        r.setEnd(tn, j + 1);
+        const b = r.getBoundingClientRect();
+        if (b.height > 0 || b.width > 0) return { top: b.top - base, bottom: b.bottom - base };
+      }
+      return null;
+    };
+    // the first index whose box passes `y` on `edge`; a character with no box is taken as passed (`low`) or not, whichever
+    // widens the range counted as not shown
+    const first = (y, edge, low) => {
+      let lo = 0, hi = n;
+      while (lo < hi) {
+        const m = (lo + hi) >> 1;
+        const b = box(m);
+        if (b === null ? low : b[edge] > y) hi = m; else lo = m + 1;
+      }
+      return lo;
+    };
+    let total = 0;
+    for (const [a, b] of gaps) {
+      const i = first(a, "bottom", true), j = first(b - 0.5, "top", false);
+      if (j > i) total += Array.from(s.slice(i, j)).length;
+    }
+    // a gap is never reported as nothing: one that falls between two lines' boxes still keeps Allow shut, so it counts one
+    return Math.min(all, Math.max(1, total));
+  }
   function longText(text, cls) {
     const s = String(text);
     const cps = Array.from(s);
@@ -451,23 +528,45 @@
     full.tabIndex = 0;                                   // its own scroll: reachable by keyboard
     full.setAttribute("aria-label", "the whole input, " + count(total) + " characters");
     whole.appendChild(full);
-    // seen: latched once the open block has been scrolled to its end; `reached` is how far down it has been (0 to 1)
-    let seen = false, reached = 0;
-    const unseen = () => (seen ? 0 : reached <= 0 ? middle : Math.min(middle, Math.round(total * (1 - reached))));
+    // seen: latched once the union of the views the open block has shown covers it whole (see COVERAGE above). `spans` is
+    // that union for the layout `layout` names; `left` the characters not yet shown, as last read from the layout (before
+    // the block is first open: the middle, the part the head and the tail leave out)
+    let seen = false, spans = [], layout = "", left = middle;
     box.dataset.seen = "0";
     box.dataset.unseen = String(middle);
-    box.longState = () => ({ seen: seen, unseen: unseen(), total: total });
+    box.longState = () => ({ seen: seen, unseen: seen ? 0 : left, total: total });
     const measure = () => {
       if (!whole.open || seen) return;
       const sh = full.scrollHeight, ch = full.clientHeight;
       if (!(ch > 0)) return;                            // not laid out: nothing is on screen yet
-      reached = Math.max(reached, Math.min(1, (full.scrollTop + ch) / sh));
-      if (full.scrollTop + ch >= sh - 2) { seen = true; reached = 1; }   // the end is in view (a fitting block is at once)
+      const now = sh + "x" + full.clientWidth;
+      if (now !== layout) { layout = now; spans = []; }  // a reflow: the old pixels are other text now
+      const top = Math.max(0, full.scrollTop);
+      if (!coverAdd(spans, top, Math.min(sh, top + ch))) return;   // a view already covered: nothing moved
+      const gaps = coverGaps(spans, sh);
+      if (!gaps.length) { seen = true; left = 0; }       // the whole block has been in view (a fitting block is at once)
+      else left = uncoveredChars(full, s, gaps);
       box.dataset.seen = seen ? "1" : "0";
-      box.dataset.unseen = String(unseen());
+      box.dataset.unseen = String(seen ? 0 : left);
       box.dispatchEvent(new CustomEvent("longseen", { detail: box.longState() }));
     };
-    full.addEventListener("scroll", measure, { passive: true });
+    // while a scroll moves, each animation frame is sampled too, until the view has stood still for three frames
+    let moving = false, still = 0, lastTop = -1;
+    const frame = () => {
+      measure();
+      if (full.scrollTop === lastTop) still += 1; else { still = 0; lastTop = full.scrollTop; }
+      if (still < 3 && whole.open && !seen && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(frame);
+      else moving = false;
+    };
+    full.addEventListener("scroll", () => {
+      measure();
+      if (!moving && !seen && typeof root.requestAnimationFrame === "function") {
+        moving = true; still = 0; lastTop = full.scrollTop;
+        root.requestAnimationFrame(frame);
+      }
+    }, { passive: true });
+    // a resize (the window, the block's own box) is measured at once: a reflow starts the coverage again
+    if (typeof root.ResizeObserver === "function") new root.ResizeObserver(() => measure()).observe(full);
     // open, the whole text stands alone (the head and the tail would repeat it); closed, they are back
     whole.addEventListener("toggle", () => { box.classList.toggle("open", whole.open); measure(); });
     box.appendChild(whole);
@@ -487,7 +586,7 @@
       unseen: () => sum("unseen"),
       total: () => sum("total"),
       line: () => (g.seen() ? "All " + count(g.total()) + " characters of the input shown: Allow is open."
-        : count(g.unseen()) + " of " + count(g.total()) + " characters not yet shown: Allow opens once the whole input is opened and scrolled to its end. Deny is open now."),
+        : count(g.unseen()) + " of " + count(g.total()) + " characters not yet shown: Allow opens once the whole input is opened and scrolled through, no part skipped. Deny is open now."),
       on: (fn) => { for (const b of boxes) b.addEventListener("longseen", fn); },
     };
     return g;

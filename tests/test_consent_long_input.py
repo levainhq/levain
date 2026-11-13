@@ -228,6 +228,7 @@ def test_on_a_phone_a_20kb_input_shows_its_head_and_tail_expands_whole_and_signs
     and the queue holds the answer over the digest of the exact input. ``LEVAIN_LONG_SHOTS`` names where the
     screenshots go (default: the test's tmp dir)."""
     from tests.test_cockpit_consent_sheet_page import NOTE, _ConsentRig
+    from tests.test_consent_long_input_coverage_page import stepped
 
     rig = _ConsentRig(tmp_path, monkeypatch)
     command = _long_command(20_000)
@@ -256,7 +257,8 @@ def test_on_a_phone_a_20kb_input_shows_its_head_and_tail_expands_whole_and_signs
                      f"head_shown: !!{INPUT}.querySelector('.long-head').offsetParent, actions: {ACTIONS_TOP}, "
                      f"vh: window.innerHeight, sw: document.documentElement.scrollWidth, w: window.innerWidth}})"},  # 10
             {"shot": str(shots / "3_expanded_390.png")},                                                      # 11
-            {"eval": f"({FULL}.scrollTop = {FULL}.scrollHeight, {FULL}.scrollTop > 0)"},                      # 12
+            # in steps under a view (fix 2: a jump to the end leaves the middle unshown, and Allow shut)
+            {"eval": f"({stepped(FULL, 0.8, down=True)}).then(() => {FULL}.scrollTop > 0)"},                  # 12
             {"shot": str(shots / "4_expanded_390_scrolled_to_the_tail.png")},                                 # 13
             {"tap": "document.querySelector('#sheet-actions [data-choice=\"allow\"]')"},                      # 14
             {"until": f"/^signed/.test({NOTE}) && {NOTE}", "ms": 30000},                                      # 15

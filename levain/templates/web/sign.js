@@ -559,8 +559,8 @@
     acts.hidden = false;
     const controls = [];          // every button and the write-in: frozen together for the whole ceremony
     // a consent request's long input gates its allow (row 1704 fix 1): an allow button stays disabled until the whole input
-    // has been opened and scrolled to its end (card_format seenGate); a deny is never gated. The count of what is not yet
-    // shown sits beside the buttons. A short input has no gate.
+    // has been opened and every part of it exposed in its block's view, no part jumped over (card_format seenGate, fix 2); a
+    // deny is never gated. The count of what is not yet shown sits beside the buttons. A short input has no gate.
     const CF = window.LevainCardFormat;
     const gate = consent && CF && typeof CF.seenGate === "function" ? CF.seenGate($("sheet-input")) : null;
     const gated = new Set();
@@ -684,8 +684,11 @@
       miss.id = "sheet-pick-miss";
       $("sheet-body").insertBefore(miss, $("sheet-body").firstChild);
     }
-    // a dispatch job is only ever signed through an act its row offers: no options, no button (never a bare "Sign")
-    if (!options.length && !dispatch) acts.appendChild(button("Sign with your passkey", po ? "" : "dev-primary", () => run(undefined, undefined)));
+    // a dispatch job is only ever signed through an act its row offers: no options, no button (never a bare "Sign"). Nor a
+    // consent request (row 1704 fix 2): its challenge takes exactly {decision, signer_fp}, so the bare button's run, with no
+    // decision, is refused 400 and signs nothing; a consent row always offers deny when it is open here, and a bare button
+    // would sit outside the long input's gate
+    if (!options.length && !dispatch && !consent) acts.appendChild(button("Sign with your passkey", po ? "" : "dev-primary", () => run(undefined, undefined)));
     for (const o of options) {
       if (!o || typeof o.key !== "string") continue;
       const isPre = !!pre && o.key === pre.key;
@@ -720,7 +723,9 @@
       acts.appendChild(row);
     };
     if (reasonBox) inRow(reasonBox, reasonMic);
-    const wi = options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
+    // a consent request takes no write-in (row 1704 fix 2): its answer is allow or deny, signed as {decision: <the key>},
+    // so a write-in keyed "allow" would sign an allow outside the long input's gate; the server's consent row has none
+    const wi = !consent && options.length && r.write_in && typeof r.write_in === "object" ? r.write_in : null;
     if (wi) {
       const box = el("input", "sheet-write-in");
       box.type = "text";
