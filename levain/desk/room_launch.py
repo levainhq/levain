@@ -75,7 +75,9 @@ launch of a room that rotated. The service's own ``recover()`` settles lines in 
 ``ensure`` after a restart.
 
 **The host profile** (levain 23, ROOM-P1C; design page ``1112-36_c7/design_room_profile.md``). ``RoomSetting.profile`` is
-None for the confined room above, which this module opens exactly as before. A :class:`~levain.desk.room_profile.RoomProfile`
+None for the confined room above, which this module opens exactly as before (the PRODUCT default is not None:
+``levain serve --room`` opens :func:`levain.desk.room_default.default_host_profile` unless ``--room-confined``, ruling
+np-97fa3dd6 (a)). A :class:`~levain.desk.room_profile.RoomProfile`
 there opens the other room: the vendor's default tools under ``--dangerously-skip-permissions``
 (:func:`~levain.desk.claude_session.room_host_argv`), a ``--settings`` document holding only the host's hook entries (the
 host's script is READ ONCE per launch, its bytes copied to ``run_dir/room_hook-<sha256[:16]>.py`` (0600) and that copy
@@ -86,7 +88,9 @@ guards a Read next to a shell that has none to guard: the scope refusal, the sco
 exemption and the canary Reads (the activation still carries a passed :class:`RoomCanary`, because the service requires
 one on a Claude ``live`` row). The tripwire context is built with ``open_tools=True`` and the chat service is expected to
 be built with ``room_permission_mode=profile.permission_mode``. :meth:`HookSpec.check` runs at the construction of the
-launcher AND at every open (the file can vanish in between), the copied bytes are re-hashed right before the spawn, and
+launcher AND at every open (the file can vanish in between), a PINNED hook's bytes as read for the copy must hash to its
+pin (``HookSpec.sha256``; the product default's turn guard is pinned, :mod:`levain.desk.room_default`), the copied bytes
+are re-hashed right before the spawn, and
 the containment digest is taken over :func:`~levain.desk.room_profile.host_policy` (the profile's fields, the sha256 of
 each hook's copied bytes and the system prompt's sha256), so a changed profile, hook or prompt is another policy.
 
@@ -902,6 +906,12 @@ class RoomLauncher:
             except OSError as exc:
                 raise RoomLaunchError(f"the room profile's hook script {spec.script[:160]!r} could not be read: "
                                       f"{_one_line(str(exc))}") from exc
+            try:
+                # a pinned hook (the default profile's turn guard): the bytes copied for the child are the pinned ones,
+                # whatever the file held when HookSpec.check ran; anything else refuses the open, never a guardless room
+                spec.matches(hashlib.sha256(data).hexdigest())
+            except ValueError as exc:
+                raise RoomLaunchError(f"the room profile's hook script cannot be used: {_one_line(str(exc))}") from exc
             path, sha = self._put_script(data, _hook_name(hashlib.sha256(data).hexdigest()), ".room_hook")
             hook_files.append((path, sha))
             commands.append(room_hook_command(self._python, path))
