@@ -539,6 +539,14 @@
       b.textContent = FACE_WORDS[kind]; b.classList.add("voice-words"); b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", title || FACE_WORDS[kind]);
     }
     var micB = null, rec = null, setupB = null;
+    // SpeechRecognition is [SecureContext] in the Web Speech spec and the microphone is https/localhost only: on an insecure page
+    // the on-device Dictate and its Setup are not offered at all, and the note says why (the keyboard's dictation key still works).
+    // Only the on-device path: the streaming Mic below is untouched. `=== false`: a host that does not report it keeps the old behaviour.
+    if (Speech && root.isSecureContext === false) {
+      Speech = null;
+      var insecureWords = root.LevainMic && typeof root.LevainMic.dictateSetup === "function" ? root.LevainMic.dictateSetup("insecure") : "";
+      if (insecureWords) note.textContent = insecureWords;
+    }
     if (Speech) {
       // the one-tap set up of the browser's on-device speech pack: drawn only while the browser says the pack can be had
       setupB = el(doc, "button", "rv-setup", "");
@@ -770,10 +778,11 @@
       function canInstall() { return typeof Speech.install === "function"; }
       // no install() here (or no words for the button): the pack cannot be fetched from this page, so say so and drop Dictate
       function noSetup() { paintSetup(null); micB.remove(); if (!note.textContent) setupSay("noinstall"); }
+      // a synchronous throw from available() is a settled failure like a rejection (a poll counts it toward the limit; an ask after
+      // install says nothing is "done"), never an apparent success
       function askAvailable() {
-        var a;
-        try { a = typeof Speech.available === "function" ? Speech.available({ langs: [lang], processLocally: true }) : null; } catch (e) { a = null; }
-        return Promise.resolve(a);
+        try { return Promise.resolve(typeof Speech.available === "function" ? Speech.available({ langs: [lang], processLocally: true }) : null); }
+        catch (e) { return Promise.reject(e); }
       }
       // what the browser answered: show Dictate, drop it, offer the set up, or wait for a download that is already running
       function settleAvail(st, after) {
@@ -804,8 +813,13 @@
       // With probe:false (the cockpit) available() is never asked, so the first sign of a missing or masked pack is a Dictate start
       // that ends service-not-allowed / language-not-supported (the one DICTATE_REASONS sentence). That, with install() present,
       // swaps Dictate for the one Setup button below; the same tap handler serves the probe path.
+      // Once install() has resolved true, the same error is not a missing pack (a non-secure page, a policy block): no Setup again,
+      // the note adds the one line saying so. A Dictate start that later gets going (a result or a start event) clears setupDone.
+      var setupDone = false;
       function offerSetupAfter(code) {
-        if ((code === "service-not-allowed" || code === "language-not-supported") && canInstall() && !setupBusy) paintSetup("offer");
+        if (code !== "service-not-allowed" && code !== "language-not-supported") return;
+        if (setupDone) { var w = setupWord("refused"); if (w) note.textContent = dictNote = (note.textContent ? note.textContent + " " : "") + w; return; }
+        if (canInstall() && !setupBusy) paintSetup("offer");
       }
       setupB.addEventListener("click", function () {
         if (setupBusy || stopped) return;
@@ -819,6 +833,7 @@
           setupBusy = false;
           if (stopped) return;
           if (ok !== true) { paintSetup("offer"); setupSay("failed"); return; }
+          setupDone = true;
           if (!probing) { settleAvail("available", true); return; }   // never ask available() here: it froze the renderer (RM-G2)
           return askAvailable().then(function (st) { settleAvail(st, true); }, function () { if (!stopped) { paintSetup(null); micB.style.display = ""; } });
         }, function (e) {
@@ -839,8 +854,10 @@
         dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
         r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
         if (r.processLocally !== true) { note.textContent = "This browser will not keep dictation on this device, so Dictate is off."; return; }
+        r.onstart = function () { if (rec === r) setupDone = false; };
         r.onresult = function (ev) {
           if (rec !== r) return;                       // a late result from a recognizer that was ended
+          setupDone = false;                           // dictation is working: a later pack error is a new question
           var t = "";
           for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
           lastHeard = t;

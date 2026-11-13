@@ -463,3 +463,86 @@ def test_a_poll_that_fails_counts_toward_the_limit_and_ends_in_the_slow_note(tmp
         extra=" setupPollMs: 2,")
     got = json.loads(out["values"][2])
     assert got["inst"] == 0 and got["asks"] >= 100, got
+
+
+# --- L3 r2: a pack error that install() cannot fix (a non-secure page, a policy block) must not loop -----------------------------
+# available() that throws synchronously
+_SYNC_THROW = """
+class SyncPoll extends Setup {
+  static available() { window.__asks++; if (window.__asks === 1) return Promise.resolve("downloading"); throw new Error("sync"); }
+}
+class SyncAfterInstall extends Setup {
+  static available() { window.__asks++; if (window.__asks === 1) return Promise.resolve("downloadable"); throw new Error("sync"); }
+}
+"""
+_INSECURE = "Object.defineProperty(window, 'isSecureContext', {value: false, configurable: true});"
+
+
+def _run_x(tmp_path, w, speech, steps, pre="", extra=""):
+    return _run(tmp_path, w, speech, steps, pre=_SYNC_THROW + pre, extra=extra)
+
+
+@needs_browser
+def test_after_a_successful_install_the_same_pack_error_gets_the_refused_line_and_no_setup(tmp_path, w):
+    """The loop: probe:false, start fails service-not-allowed -> Setup -> install true -> Dictate -> start fails the SAME way. Red
+    with: Setup offered again (every lap one more install()), or the 'installed, browser still refuses' line missing."""
+    out, _w = _run(tmp_path, w, "Masked", [
+        {"until": _DICTATE},
+        {"eval": "%s.click(); %s.click(); __done.res(true); 1" % (_MB, _SB)},       # fail -> Setup -> tap (the pack is NOT the cause: __ok stays false)
+        {"until": _DICTATE},
+        {"eval": "%s.click(); JSON.stringify({setup: %s.hidden, mic: %s.style.display, inst: __inst.length, note: %s, want: %s('refused'),"
+                 " reason: LevainMic.dictateReason('service-not-allowed')})" % (_MB, _SB, _MB, _NOTE, _WORD)},
+    ], extra=_NOPROBE)
+    got = json.loads(out["values"][4])
+    assert got["setup"] is True and got["mic"] == "" and got["inst"] == 1, got           # Dictate stays, no second Setup, one install ever
+    assert got["want"] and got["note"] == got["reason"] + " " + got["want"], got
+    assert "https" in got["want"] and "localhost" in got["want"] and "microphone" in got["want"], got
+
+
+@needs_browser
+def test_a_dictate_start_that_gets_going_clears_the_installed_flag(tmp_path, w):
+    """Red with: a flag that is never reset (after a good dictation a later pack error would still be called 'installed but
+    refused' and never offer Setup)."""
+    out, _w = _run(tmp_path, w, "Masked", [
+        {"until": _DICTATE},
+        {"eval": "%s.click(); %s.click(); window.__ok = true; __done.res(true); 1" % (_MB, _SB)},
+        {"until": _DICTATE},
+        {"eval": "%s.click(); __recs[__recs.length - 1].emit('hello'); %s.click(); window.__ok = false; %s.click();"
+                 " JSON.stringify({setup: %s.hidden, mic: %s.style.display, note: %s, refused: %s('refused')})" % (_MB, _MB, _MB, _SB, _MB, _NOTE, _WORD)},
+    ], extra=_NOPROBE)
+    got = json.loads(out["values"][4])
+    assert got["setup"] is False and got["mic"] == "none" and got["refused"] not in got["note"], got
+
+
+@needs_browser
+def test_an_insecure_page_gets_neither_dictate_nor_setup_and_the_note_says_why(tmp_path, w):
+    """SpeechRecognition is [SecureContext] (Web Speech spec) and the microphone is https/localhost only. Red with: Dictate or Setup
+    drawn on an insecure page, or no words. The secure page (headless Chrome on 127.0.0.1) is unchanged."""
+    for probe in ("", _NOPROBE):
+        out, _w = _run(tmp_path, w, "Setup", [
+            {"eval": "new Promise(r => setTimeout(() => r(JSON.stringify({mic: document.querySelectorAll('.rv-mic:not(.rv-mic-stream)').length,"
+                     " setup: document.querySelectorAll('.rv-setup').length, asks: __asks, note: %s, want: %s('insecure')})), 150))" % (_NOTE, _WORD)}],
+            pre=_INSECURE + "window.__state = 'available';", extra=probe)
+        got = json.loads(out["values"][1])
+        assert got["mic"] == 0 and got["setup"] == 0 and got["asks"] == 0 and got["note"] == got["want"] != "", got
+        assert "secure address" in got["note"] and "https" in got["note"] and "localhost" in got["note"] and "insecure" in got["note"], got
+    out, _w = _run(tmp_path, w, "Setup", [{"until": _DICTATE}, {"eval": "JSON.stringify({note: %s})" % _NOTE}], pre="window.__state = 'available';")
+    assert json.loads(out["values"][2]) == {"note": ""}
+
+
+@needs_browser
+def test_available_that_throws_synchronously_is_a_failed_ask_not_an_apparent_success(tmp_path, w):
+    """Red with: a synchronous throw turned into a fulfilled null (the poll ends 'done' with Dictate shown, or install() then says
+    'ready'). A poll that throws counts toward the limit like a rejection; an ask after a good install says nothing is ready."""
+    out, _w = _run_x(tmp_path, w, "SyncPoll", [
+        {"until": "%s && %s === %s('slow')" % (_OFFER, _NOTE, _WORD)},
+        {"eval": "JSON.stringify({asks: __asks, inst: __inst.length})"}], extra=" setupPollMs: 2,")
+    got = json.loads(out["values"][2])
+    assert got["inst"] == 0 and got["asks"] >= 100, got
+    out, _w = _run_x(tmp_path, w, "SyncAfterInstall", [
+        {"until": _OFFER},
+        {"eval": "%s.click(); __done.res(true); 1" % _SB},
+        {"until": "__asks >= 2"},
+        {"eval": "new Promise(r => setTimeout(() => r(JSON.stringify({note: %s, done: %s('done')})), 100))" % (_NOTE, _WORD)}])
+    after = json.loads(out["values"][4])
+    assert after["done"] and after["note"] != after["done"], after

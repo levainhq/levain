@@ -385,6 +385,8 @@
     slow: "Setting up is taking a while: tap Set up on-device dictation to try again.",
     none: "On-device dictation is not offered for this language; the keyboard dictation key works.",
     noinstall: "On-device dictation is not installed on this browser; the keyboard dictation key works.",
+    refused: "The on-device pack is installed and the browser still refuses dictation. Check that this page's address starts with https (or is localhost), and the browser's own microphone and speech settings.",
+    insecure: "Dictation needs a secure address (https or localhost), and this page is on an insecure one, so Dictate is off. The keyboard dictation key works.",
   };
   // key -> words; "unlisted" (a rejection that is not NotAllowedError) carries the error name when it is a plain one
   function dictateSetup(key, name) {
