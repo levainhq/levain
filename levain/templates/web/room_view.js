@@ -690,7 +690,7 @@
         var r = new Speech();
         dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
         r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
-        if (r.processLocally !== true) { note.textContent = "This browser will not keep dictation on this device, so it is off; the keyboard dictation key works."; return; }
+        if (r.processLocally !== true) { note.textContent = "This browser will not keep dictation on this device, so Dictate is off."; return; }
         r.onresult = function (ev) {
           if (rec !== r) return;                       // a late result from a recognizer that was ended
           var t = "";
