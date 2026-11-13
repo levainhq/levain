@@ -1999,10 +1999,13 @@ class ChatService:
             # under activation's probing (H9) writes none (stage 2 gives that launch its verdict)
             first = _first_send_open(conn, m.launch_id)
             role, _state, harness = _launch_state(conn, m.launch_id)
-            # built before the attempt row commits, so a stamp that cannot be read leaves the message pending
-            prefix = _room_context(m.message_id, now) if role == "room" else ""
-            outbox_step(conn, now, m.message_id, "attempted", cause="attempt", op_id=op_id, vendor_anchor=anchor)
             claude = harness == "claude"
+            # built before the attempt row commits, so a stamp that cannot be read leaves the message pending until the
+            # next recovery. Only on Claude: its stream child echoes no user line (measured), so nothing in the vendor's
+            # read can differ from the stored body's digest; a harness that echoes the line it was handed would make an
+            # ambiguous send look absent, so any other harness is handed the bare body
+            prefix = _room_context(m.message_id, now) if role == "room" and claude else ""
+            outbox_step(conn, now, m.message_id, "attempted", cause="attempt", op_id=op_id, vendor_anchor=anchor)
             if not first and claude:
                 _boundary(conn, now, m.launch_id, "send")
         if claude:
@@ -2756,10 +2759,11 @@ class ChatService:
 
 
 def _room_context(message_id: str, now: str) -> str:
-    """The block a ROOM seat is handed ahead of his words: the serve's local time, where the line came from, and the
-    message's own id (the one ``relay_to_desk`` and a proposal name his words by). It is code-written and goes only
-    into the bytes handed to the driver: the stored message, its digest and every quote of it stay his words alone, and
-    an imitation of this block inside his words is just his words (it follows the real block, after a blank line)."""
+    """The block a ROOM seat is handed ahead of his words: the attempt's time (``now``, the instant its row commits,
+    not the instant the bytes reach the vendor) in the serve's zone, where the line came from, and the message's own
+    id (the one ``relay_to_desk`` and a proposal name his words by). It is code-written and goes only into the bytes
+    handed to the driver: the stored message, its digest and every quote of it stay his words alone, and an imitation
+    of this block inside his words is just his words (it follows the real block, after a blank line)."""
     clock = parse_stamp(now).astimezone().strftime("%I:%M %p %a %b %d")
     return f"<room-context>\n[{clock} \u00b7 via the Room (cockpit chat) \u00b7 message {message_id}]\n</room-context>\n\n"
 
