@@ -221,8 +221,10 @@ def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
     ``composer`` (None when it has no launch or the record cannot say), ``model``, ``room_mode`` (the permission mode
     the room is expected to report, or None), ``gap``, ``stream`` and
     ``proposals``. A store missing a table degrades only the part that table feeds."""
-    empty: dict[str, Any] = {"room_thread": None, "launch_id": None, "composer": None, "model": None, "gap": False,
-                             "stream": [], "proposals": []}
+    # room_mode is the service's whatever the store holds (it is not read from the store), so the body's shape never
+    # depends on whether a room is open
+    empty: dict[str, Any] = {"room_thread": None, "launch_id": None, "composer": None, "model": None,
+                             "room_mode": _expected_mode(service), "gap": False, "stream": [], "proposals": []}
     conn = threads._open(directory)
     if conn is None:
         return empty
