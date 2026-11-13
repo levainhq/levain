@@ -211,6 +211,8 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "after": ("intention id|null", _opt(lambda v: _is_intention_id(v))),
     "after_text": ("str|null", _opt(_is_str)),
     "then": ("list[str]", _is_str_list),
+    # a repeating reminder's series in plain words ("repeats weekly SUN 21:00 · next Sun 11-15 21:00"), on its List row (row 188)
+    "repeat_line": ("str", _is_str),
 }
 
 

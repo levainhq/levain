@@ -62,7 +62,7 @@ LIST_FACETS = INTENTION_FACETS | frozenset({
     "source", "repo", "held_until", "intention", "intention_text", "band_section", "band_carried", "band_age", "band_since", "band_later_words",
     "agenda_blocked", "time_state", "wake_day", "wake_bucket", "wake_line", "done_on", "done_kind",
     "kept_line", "kept_at", "kept_type", "kept_source",
-    "on_event", "check_by", "after", "after_text", "then",
+    "on_event", "check_by", "after", "after_text", "then", "repeat_line",
 })
 SURFACES = ("band", "board", "intention", "talk", "drop", "kept")
 KEPT_PREFIX = "kept:"             # a kept row's id (an episode id behind it): never an ``intention:`` id, so no intention verb applies
@@ -135,6 +135,25 @@ def _lands(surface: str, target: Any, disposition: str = "someday") -> str:
             return "board · " + t[6:]
         return "band"           # band and nudge both file a band row; an unknown word falls back to the band (germinate's rule)
     return "band" if disposition == "agenda" else "list"
+
+
+def _repeat_line(raw: dict[str, Any], nxt: Any) -> str | None:
+    """The plain words of a repeating agenda's series for its List row: ``repeats weekly SUN 21:00 · next Sun 11-15 21:00``. The
+    rule is the stored canon (``levain.recur.rule_of``: a rule that does not read is no rule, so a hand-edited one draws nothing);
+    ``next`` is the open row's own next occurrence (a done on the series moves it, so it is the one that rings next). None for
+    a row that does not repeat."""
+    if raw.get("disposition") != "agenda":
+        return None
+    from levain import recur
+
+    rule = recur.rule_of(raw)
+    if rule is None:
+        return None
+    if intentions.is_timed(nxt):
+        when = intentions._parse_when(nxt)
+        return f"repeats {rule} · next {when:%a %m-%d %H:%M}" if when is not None else f"repeats {rule}"
+    d = parse_date(nxt)
+    return f"repeats {rule} · next {d:%a %m-%d}" if d else f"repeats {rule}"
 
 
 def _wake_facets(day: date, today: date, surface: str, target: Any, disposition: str = "someday") -> dict[str, Any]:
@@ -218,6 +237,9 @@ def _intention_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool],
         fires, overdue = _timing(s.next, now, ctx.today)
         extra: dict[str, Any] = {"surface": surface, "fires": fires, "overdue": overdue, "target": target,
                                  "attention": raw.get("attention") if isinstance(raw.get("attention"), str) else None}
+        repeat = _repeat_line(raw, s.next) if raw else None
+        if repeat:
+            extra["repeat_line"] = repeat      # the series' rule and its next occurrence, drawn on the row (row 188)
         waits = waiting_on.get(intentions.norm_event(intentions.done_event(s.id)), [])
         if waits:
             extra["then"] = waits      # the second parts that wait on this item finishing

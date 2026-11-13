@@ -2197,6 +2197,8 @@
         host.appendChild(od);
       }
       if (!s.wake_line && s.next && !s.fires) host.appendChild(tagEl("muted", "due " + shortDate(s.next)));
+      // a repeating reminder says so: the kernel's words (the series' rule and its next occurrence), drawn as text
+      if (s.repeat_line) { const rp = tagEl("muted list-repeats", s.repeat_line); rp.dataset.repeats = ""; host.appendChild(rp); }
       // who does it, derived from the target; the cockpit never stores it
       const exec = executorOf(rowTarget(s));
       if (exec && s.disposition === "agenda") { const w = tagEl("muted list-who", exec); w.dataset.who = exec; w.title = "who does it, from its target"; host.appendChild(w); }

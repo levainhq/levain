@@ -808,6 +808,31 @@ def test_a_snooze_moves_the_row_to_later_at_once_with_its_wake_line(tmp_path: Pa
     assert mine["t"] == "later" and mine["line"].startswith("wakes ") and mine["line"].endswith("→ desk"), mine
 
 
+@needs_browser
+def test_a_repeating_reminders_row_draws_its_rule_and_next_occurrence_as_text(tmp_path: Path) -> None:
+    """Row 188: the List row of a repeating reminder says it repeats (the server's ``repeat_line`` drawn with textContent); a
+    one-off row beside it draws no such line."""
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    store.add(type="task", text="<b>weekly</b> review", disposition="agenda", target="nudge", next="2020-01-05T21:00",
+              recur="weekly SUN 21:00", recur_anchor="2020-01-05T21:00")
+    pick = lambda text: (f"[...{TRAY}.querySelectorAll('.sp-results .row')].find(r => "     # noqa: E731
+                         f"(r.querySelector('.clause') || {{}}).textContent === {json.dumps(text)})")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1000, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {pick('<b>weekly</b> review')} && {pick('call the dentist')} && 1"},
+            {"eval": f"JSON.stringify({{rep: ({pick('<b>weekly</b> review')}.querySelector('[data-repeats]') || {{}}).textContent || null, "
+                     f"markup: {pick('<b>weekly</b> review')}.querySelectorAll('b').length, "
+                     f"plain: {pick('call the dentist')}.querySelector('[data-repeats]') === null}})"},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got["rep"] == "repeats weekly SUN 21:00 · next Sun 01-05 21:00", got
+    assert got["markup"] == 0 and got["plain"] is True, got            # drawn as text; a one-off row has no repeat line
+
+
 # --- the first fix round (levain 7, 1109-26): chips that add up, a stale type choice, two labelled rows --------------------------
 
 _CHIP_SWEEP = f"""(async () => {{
