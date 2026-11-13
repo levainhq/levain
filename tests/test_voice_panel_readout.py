@@ -236,6 +236,29 @@ def test_a_provider_whose_key_was_stopped_reads_stopped_with_its_reason(tmp_path
     assert (rows["openai"]["key"], rows["openai"]["stopped_why"]) == ("not_set", "")
 
 
+def test_a_stopped_providers_row_carries_the_terminals_way_back(tmp_path, monkeypatch):
+    """L3 r3 (the class of the grant page's second copy): the panel said "Set it again to use it" of its own, and a plain
+    `levain voice key add` is refused while the stopped record is held. The row now carries ``way_back``, the very clause
+    `levain voice key list` prints for a stopped voice key (``stopped_line``), and "" on every row that is not stopped.
+    Red with the field left off or with words of the readout's own."""
+    from levain.authority import VOICE_KEY_KIND
+    from levain.consent.grants import stopped_line
+
+    monkeypatch.setattr(cv, "_stopped_voice_keys", lambda root: {"inworld": STOPPED})
+    rows = {r["name"]: r for r in _body(tmp_path, monkeypatch, {"deepgram": ["stt", "tts"]})["providers"]}
+    assert stopped_line(STOPPED, VOICE_KEY_KIND) == f"stopped: {STOPPED} (answers nothing; {rows['inworld']['way_back']})"
+    assert rows["inworld"]["way_back"] == "revoke it, then create it again to use it"
+    assert rows["deepgram"]["way_back"] == rows["openai"]["way_back"] == ""            # control: set, and never set
+
+
+def test_the_panel_script_draws_the_servers_way_back_and_keeps_no_words_of_its_own():
+    """The browser-free half of the panel check below: the script reads the row's ``way_back`` and holds no sentence of
+    its own for a stopped key. Red with the old "Set it again to use it" restored."""
+    src = (Path(cv.__file__).parent.parent / "templates" / "web" / "devices_panel.js").read_text(encoding="utf-8")
+    assert "p.way_back" in src
+    assert "Set it again" not in src and "create it again" not in src.lower()
+
+
 def test_the_stop_is_not_asked_for_when_the_log_could_not_be_read(tmp_path, monkeypatch):
     """``authority`` != ok says the log is unreadable in its own words; the rows do not guess a stop from it."""
     monkeypatch.setattr(cv, "_grants_for", lambda root: ({}, "unreadable"))
@@ -261,4 +284,6 @@ def test_the_panel_says_a_stopped_key_is_stopped(tmp_path, monkeypatch):
     assert "inworld: key stopped" in got["keys"] and "inworld: no key" not in got["keys"], got
     assert "deepgram: key set" in got["keys"], got
     (inworld,) = [s for s in got["spend"] if s.startswith("Inworld")]
-    assert f"key stopped: {STOPPED}. Set it again to use it" in inworld and "no key now" not in inworld, got
+    # the server's way back, drawn as it comes (it said "Set it again", which a plain add refuses)
+    assert f"key stopped: {STOPPED}. Revoke it, then create it again to use it" in inworld, got
+    assert "Set it again" not in inworld and "no key now" not in inworld, got
