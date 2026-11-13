@@ -2627,7 +2627,8 @@ def _operator_record_failure(name: str, rec_path: Path, store: Path, host: str, 
     elif kind == "not-file":
         shape = ("directory" if st_mod.S_ISDIR(mode or 0) else "link" if st_mod.S_ISLNK(mode or 0) else "special file")
         what = f"is a {shape}, not a regular file"
-        hint = (f"The entry is a {shape}, not a regular file: remove it as root first (setup cannot read past it). "
+        hint = (f"The entry is a {shape}, not a regular file: move it aside as root first, after checking it holds nothing you need "
+                "(setup cannot read past it). "
                 f"{setup_words}")
     else:
         errname = errno.errorcode.get(read_fail.errno or 0, type(read_fail).__name__) if read_fail else "unknown"

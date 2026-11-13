@@ -206,8 +206,11 @@ def test_the_hint_says_what_to_do_first_for_each_kind_of_entry(tmp_path):
     assert "remove" not in hints["missing"].lower() and "re-creates the record" in hints["missing"]
     assert "malformed file must be removed as root first" in hints["malformed"]
     assert "nothing else restores it" in hints["malformed"]
-    assert "directory, not a regular file" in hints["directory"] and "remove it as root first" in hints["directory"]
-    assert "link, not a regular file" in hints["link"] and "remove it as root first" in hints["link"]
+    for case in ("directory", "link"):
+        # a stray directory may hold data: the hint says move it aside after checking, never remove it
+        assert f"{case}, not a regular file" in hints[case], hints[case]
+        assert "move it aside as root first, after checking it holds nothing you need" in hints[case], hints[case]
+        assert "remove" not in hints[case].lower(), hints[case]
     assert len(set(hints.values())) == 4, hints
 
 
