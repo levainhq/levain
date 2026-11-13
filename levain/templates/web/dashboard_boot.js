@@ -290,18 +290,21 @@
   const FRAGMENT_TOKEN_CHECK_MS = 8000;
   let fragmentTokenPending = null;
   // Whether the server takes `tok` as a credential: its manifest names the class of the credential it read (a refused or
-  // unknown key answers 200 with class "none", pair.js M1). Anything but a clear yes is a no.
+  // unknown key answers 200 with class "none", pair.js M1). Anything but a clear yes is a no. The bound is a timer raced
+  // against the read, so it holds in a browser without AbortController (the abort, where there is one, only frees the request).
   async function serverTakesToken(tok) {
     const ctl = typeof AbortController === "function" ? new AbortController() : null;
-    const timer = ctl ? setTimeout(() => ctl.abort(), FRAGMENT_TOKEN_CHECK_MS) : 0;
-    try {
+    let timer = 0;
+    const answer = (async () => {
       const res = await fetch("/cockpit/manifest.json", { method: "GET", headers: { "X-Levain-Write-Token": tok }, cache: "no-store",
         referrerPolicy: "no-referrer", signal: ctl ? ctl.signal : undefined });
       if (res.status !== 200) return false;
       const m = await res.json();
       return !!(m && m.credential && m.credential.class === "token");
-    } catch (_) { return false; }
-    finally { if (timer) clearTimeout(timer); }
+    })().catch(() => false);
+    const bound = new Promise((resolve) => { timer = setTimeout(() => { if (ctl) { try { ctl.abort(); } catch (_) { /* ignore */ } } resolve(false); }, FRAGMENT_TOKEN_CHECK_MS); });
+    try { return await Promise.race([answer, bound]); }
+    finally { clearTimeout(timer); }
   }
   (function takeFragmentWriteToken() {
     try {
@@ -312,18 +315,28 @@
       const rest = params.toString();
       history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
       // a token is printable ASCII without spaces (it travels in a request header)
-      if (!/^[\x21-\x7e]+$/.test(tok)) { console.warn("levain: the write token in the link is not a header-safe string; not stored"); return; }
-      const take = () => {
-        window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
-        window.localStorage.removeItem(PAIRED_MARK_KEY);   // the owner's own link: this browser holds the owner's key now
-        announceTokenChange();
-      };
-      const held = window.localStorage.getItem(WRITE_TOKEN_KEY) || "";
-      if (!held || held === tok) { take(); return; }
-      fragmentTokenPending = serverTakesToken(tok).then((ok) => {
-        if (ok) take();
-        else console.warn("levain: the write token in the link was not accepted by the server; the token this browser holds is kept");
-      }).catch(() => { /* no storage: the prompt still works */ }).finally(() => { fragmentTokenPending = null; });
+      if (/^[\x21-\x7e]+$/.test(tok)) {
+        const take = () => {
+          window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
+          window.localStorage.removeItem(PAIRED_MARK_KEY);   // the owner's own link: this browser holds the owner's key now
+          announceTokenChange();
+        };
+        const held = window.localStorage.getItem(WRITE_TOKEN_KEY) || "";
+        const marked = !!window.localStorage.getItem(PAIRED_MARK_KEY);
+        // nothing held AND no paired mark: a first pairing, nothing to lose. A mark with no token is a paired browser that dropped
+        // its key; its link token is checked like any other, so a bad one cannot clear the mark and the recovery path.
+        if ((!held && !marked) || held === tok) take();
+        else {
+          fragmentTokenPending = serverTakesToken(tok).then((ok) => {
+            if (!ok) { console.warn("levain: the write token in the link was not accepted by the server; the token this browser holds is kept"); return; }
+            // the check took time: another tab may have stored its own token meanwhile, which is newer than this link's and stays
+            const now = window.localStorage.getItem(WRITE_TOKEN_KEY) || "";
+            if (now && now !== held) { console.warn("levain: this browser's token changed while the link's was checked; the newer one is kept"); return; }
+            take();
+          }).catch(() => { /* no storage: the prompt still works */ }).finally(() => { fragmentTokenPending = null; });
+        }
+      }
+      else console.warn("levain: the write token in the link is not a header-safe string; not stored");
     } catch (_) { /* no history or storage: the prompt still works */ }
   })();
 

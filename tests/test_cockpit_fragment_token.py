@@ -30,6 +30,38 @@ READ = (f"JSON.stringify({{token: localStorage.getItem('{TOKEN_KEY}'), mark: loc
         "hash: location.hash, search: location.search})")
 
 
+# Page-side stubs, installed by the driver's `init` step (before the page's own scripts on every later load): a prompt that counts
+# and declines, and a console.warn that keeps what it was told (the intake's refusal line is the sign that a check has ended).
+INIT_BASE = (
+    "window.__warns = []; window.__prompted = 0;"
+    "const __cw = console.warn.bind(console);"
+    "console.warn = function () { try { window.__warns.push(Array.prototype.join.call(arguments, ' ')); } catch (e) {} return __cw.apply(console, arguments); };"
+    "window.prompt = function () { window.__prompted++; return ''; };"
+)
+
+
+def _manifest_stub(token: str, body: str) -> str:
+    """A fetch wrapper: a manifest read that carries `token` goes to `body` (JS, with u, o, of in scope); every other read passes."""
+    return (
+        "(function () { const of = window.fetch;"
+        "window.fetch = function (u, o) { try {"
+        f"if (String(u).indexOf('/cockpit/manifest.json') >= 0 && o && o.headers && o.headers['X-Levain-Write-Token'] === '{token}') {{ {body} }}"
+        "} catch (e) {} return of.apply(window, arguments); }; })();"
+    )
+
+
+def _hold_manifest_for(token: str) -> str:
+    """The FIRST manifest read for `token` (the intake's check; a later board read with that token must pass) is held until
+    `window.__release()`, then goes to the real server."""
+    return "window.__held = 0;" + _manifest_stub(
+        token, "if (window.__held === 0) { window.__held++; return new Promise((res) => { window.__release = () => res(of.call(window, u, o)); }); }")
+
+
+def _silent_manifest_for(token: str) -> str:
+    """The manifest read for `token` never answers and ignores any abort signal."""
+    return "window.__silent = 0;" + _manifest_stub(token, "window.__silent++; return new Promise(() => {});")
+
+
 def _drive(tmp_path: Path, url: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
     f = tmp_path / "steps.json"
     f.write_text(json.dumps(steps))
@@ -70,11 +102,81 @@ def test_an_accepted_fragment_token_replaces_the_stored_one_and_clears_the_paire
 
 @needs_browser
 def test_an_accepted_fragment_token_replaces_a_stored_one_the_server_no_longer_knows(tmp_path: Path) -> None:
-    """The common case: a server restarted with a fresh per-launch token, and its link arrives in a browser holding the last one."""
+    """The common case: a server restarted with a fresh per-launch token, and its link arrives in a browser holding the last one.
+    The page is loaded with a valid token, then the stored value is set to OLD (which the server does not know) in the same step
+    that navigates to the link, so the intake meets OLD as the held token, and no prompt may appear on the way."""
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}) as (url, _httpd):
-        got = _arrive(tmp_path, url, "OLD", "T")
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": WHOLE},
+            {"init": INIT_BASE},
+            {"eval": f"localStorage.setItem('{MARK_KEY}', '1'); localStorage.setItem('{TOKEN_KEY}', 'OLD'); "
+                     "location.assign('/?arrived=1#write_token=T'); 1"},
+            {"until": f"location.search === '?arrived=1' && {WHOLE} && 1", "ms": 40000},
+            {"eval": READ},
+            {"eval": "window.__prompted"},
+        ])
+    got = json.loads(out["values"][-2])
     assert got == {"token": "T", "mark": None, "hash": "", "search": "?arrived=1"}, got
+    assert out["values"][-1] == 0, f"the page prompted for a token {out['values'][-1]} time(s)"
+
+
+@needs_browser
+def test_a_token_stored_by_another_tab_during_the_check_is_not_overwritten(tmp_path: Path) -> None:
+    """Token B is checked (the manifest answer is held back), another tab pairs and stores C with the paired mark, then B is
+    accepted: B must not replace C, and C's mark stays."""
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "A", "second": "B", "third": "C"}) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=A", [
+            {"until": WHOLE},
+            {"init": INIT_BASE + _hold_manifest_for("B")},
+            {"eval": f"localStorage.setItem('{MARK_KEY}', '1'); location.assign('/?arrived=1#write_token=B'); 1"},
+            {"until": "location.search === '?arrived=1' && window.__held > 0 && 1", "ms": 40000, "partial": True},
+            {"eval": f"localStorage.setItem('{TOKEN_KEY}', 'C'); localStorage.setItem('{MARK_KEY}', '1'); 1", "partial": True},
+            {"eval": "window.__release(); 1", "partial": True},
+            {"until": f"{WHOLE} && 1", "ms": 40000},
+            {"eval": READ},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got == {"token": "C", "mark": "1", "hash": "", "search": "?arrived=1"}, got
+
+
+@needs_browser
+def test_a_retained_paired_mark_with_no_token_still_validates_the_link_token_first(tmp_path: Path) -> None:
+    """A paired browser that dropped its token keeps `levain_paired_device`; a bad link token must not be stored at once
+    (which would clear the mark), it is checked like any other."""
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", [
+            {"until": WHOLE},
+            {"init": INIT_BASE},
+            {"eval": f"localStorage.setItem('{MARK_KEY}', '1'); localStorage.removeItem('{TOKEN_KEY}'); "
+                     "location.assign('/?arrived=1#write_token=BAD'); 1"},
+            {"until": "location.search === '?arrived=1' && window.__warns.some((w) => /not accepted/.test(w)) && 1",
+             "ms": 40000, "partial": True},
+            {"eval": READ, "partial": True},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got["token"] is None and got["mark"] == "1" and got["search"] == "?arrived=1", got
+
+
+@needs_browser
+def test_the_check_is_bounded_without_abortcontroller_and_the_old_token_is_kept(tmp_path: Path) -> None:
+    """No AbortController and a manifest that never answers: the link's token is given up on after the 8 s bound, the held
+    token and mark stay, and the first board still draws."""
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "A"}) as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=A", [
+            {"until": WHOLE},
+            {"init": INIT_BASE + "window.AbortController = undefined;" + _silent_manifest_for("B")},
+            {"eval": f"localStorage.setItem('{MARK_KEY}', '1'); location.assign('/?arrived=1#write_token=B'); 1"},
+            {"until": "location.search === '?arrived=1' && window.__silent > 0 && 1", "ms": 40000, "partial": True},
+            {"until": "window.__warns.some((w) => /not accepted/.test(w)) && 1", "ms": 40000, "partial": True},
+            {"until": f"{WHOLE} && typeof AbortController === 'undefined' && 1", "ms": 40000},
+            {"eval": READ},
+        ])
+    got = json.loads(out["values"][-1])
+    assert got == {"token": "A", "mark": "1", "hash": "", "search": "?arrived=1"}, got
 
 
 @needs_browser
