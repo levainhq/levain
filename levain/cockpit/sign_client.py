@@ -207,7 +207,14 @@ def intake_headline(rec: Any) -> str | None:
             return f"a SCHEDULED DROP to the desk: {words}, fires {at}"
         if ch.get("target") not in ("nudge", "band"):
             return None                       # not a shape the List box writes: the record below says what it is
-        repeat = f", then {ch['recur']}" if isinstance(ch.get("recur"), str) and ch["recur"] else ""
+        repeat = ""
+        if "recur" in ch:                     # printed in its canon form, never as typed: a rule that does not read gets no headline
+            from levain import recur
+
+            try:
+                repeat = f", then {recur.parse_recur(ch['recur'])['canon']}"
+            except ValueError:
+                return None
         return f"a REMINDER for you: {words}, rings {at}{repeat} (as a {ch['target']})"
     if isinstance(ch, dict) and ch.get("attention") == "talk":
         return f"a TALK seed: {_dump(ch.get('text'))}"
