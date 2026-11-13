@@ -499,8 +499,8 @@ class IntentionEffectStore:
             raise TransientApplyFault.of(exc) from exc
 
     def waiting_on(self, anchor_id: str) -> list[str]:
-        """The ids of the open second parts (``on_event: done:<anchor_id>``) that wait on ``anchor_id`` finishing: a read, never
-        a write (``levain.split.followers_of`` over the store's open intentions)."""
+        """The ids of the open second parts (``on_event: done:<anchor_id>``, still an agenda the wake can reach) that wait on
+        ``anchor_id`` finishing: a read, never a write (``levain.split.followers_of`` over the store's open intentions)."""
         from levain.intentions import list_open_readonly
         from levain.split import followers_of
 

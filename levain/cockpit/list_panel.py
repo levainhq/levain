@@ -204,7 +204,7 @@ def _intention_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool],
     later: list[RowIn] = []
     waiting_on: dict[str, list[str]] = {}      # the first part's event key -> the ids of the parts that wait on it
     for i, r in steer.items():
-        if r.get("on_event"):
+        if intentions.is_event_agenda(r):      # the predicate germinate and split.followers_of read: a someday that kept its event waits on nothing
             waiting_on.setdefault(intentions.norm_event(r["on_event"]), []).append(i)
     for s in items:
         raw = steer.get(s.id, {})

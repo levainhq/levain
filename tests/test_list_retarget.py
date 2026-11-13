@@ -290,6 +290,37 @@ def test_a_first_part_can_still_change_hands_to_the_operator_or_when_nothing_wai
     assert store.get(a)["target"] == "desk"
 
 
+def _set_disposition(base: str, sid: str, params: dict[str, Any]) -> tuple[int, dict]:
+    r = _row(base, sid)
+    return _post(f"{base}/cockpit/verb", {"verb": "intention_set_disposition", "panel_id": "tray", "row_id": r["id"],
+                                          "row_version": r["version"], "params": params, "intent": "reported", "tier_seen": "T2",
+                                          "gesture_seen": "direct-reported"}, TOKEN)
+
+
+def test_a_second_part_moved_to_a_someday_no_longer_holds_its_first_part_and_moving_it_back_does(tmp_path: Path) -> None:
+    """Row 1711. A second part moved to a someday keeps its ``on_event`` but the wake (``is_event_agenda``) never reaches it, so
+    nothing waits: the first part may be handed to the desk, which the old guard refused in words naming a part that could not
+    wake. Moved back to an agenda it waits on its event again and the refusal returns. Driven through the real dispatch."""
+    root, src, _ids = _install(tmp_path)
+    a, f = _split_pair(root)
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
+        st, body = _retarget(base, a, {"target": "desk"})
+        assert st == 409 and f in str(body), (st, body)                                   # live: the guard holds
+        st, body = _set_disposition(base, f, {"disposition": "someday"})
+        assert st == 200, body
+        assert store.get(f)["disposition"] == "someday" and store.get(f)["on_event"] == f"done:{a}"   # the event is kept, unreachable
+        st, body = _set_disposition(base, f, {"disposition": "agenda"})
+        assert st == 200, body
+        st, body = _retarget(base, a, {"target": "desk"})
+        assert st == 409 and f in str(body), (st, body)                                   # waiting again: the link was never cleared
+        st, body = _set_disposition(base, f, {"disposition": "someday"})
+        assert st == 200, body
+        st, body = _retarget(base, a, {"target": "desk"})
+        assert st == 200, body                                                            # dead follower: nothing is stranded
+    assert store.get(a)["target"] == "desk"
+
+
 # --- the guard's own edges (L3 round 1 of the diogenes-20261113-020650 fix) ------------------------------------------------
 import sqlite3  # noqa: E402
 

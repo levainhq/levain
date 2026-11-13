@@ -30,6 +30,7 @@ from levain.intentions import (
     done_event,
     executor_of,
     guarded_intention_store,
+    is_event_agenda,
     list_open_readonly,
     norm_event,
     valid_check_by,
@@ -64,9 +65,12 @@ def then_origin_key(anchor: dict[str, Any], text: str) -> str:
 
 
 def followers_of(items: list[dict[str, Any]], anchor_id: str) -> list[dict[str, Any]]:
-    """The open agendas among ``items`` that wait on ``anchor_id`` finishing (either spelling of its id)."""
+    """The open agendas among ``items`` that wait on ``anchor_id`` finishing (either spelling of its id) AND that the wake can
+    still reach: the same :func:`is_event_agenda` germinate reads, so "waits on it" here and "wakes on it" there are one
+    answer. A part moved off the agenda (to a someday) keeps its ``on_event`` but is never woken or rung at its check-by, so it
+    is not waiting on anything and does not hold the first part."""
     key = norm_event(done_event(anchor_id))
-    return [s for s in items if norm_event(s.get("on_event")) == key and s.get("status", "open") == "open"]
+    return [s for s in items if is_event_agenda(s) and norm_event(s.get("on_event")) == key]
 
 
 def create_then(intentions_json: Path | str, anchor_id: str, text: str, *, check_by: str | None = None,

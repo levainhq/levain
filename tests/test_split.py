@@ -375,6 +375,43 @@ def test_then_you_keys_the_link_with_the_stored_id_and_followers_match_either_sp
     assert [f["id"] for f in split.followers_of(items, a["id"])] == [f["id"] for f in split.followers_of(items, other)] == [made["intention_id"]]
 
 
+def test_a_follower_is_only_a_part_the_wake_can_reach_and_the_list_and_the_wake_agree(tmp_path, qdir, pings):
+    """Row 1711. ``followers_of`` is ``is_event_agenda`` plus the key, the predicate germinate wakes by: a second part moved to a
+    someday (event kept), one already woken (stamped) and an ended one are not followers; the wake gate and the List's ``then``
+    list read the same answer."""
+    root = _install(tmp_path)
+    a = _anchor(root)
+    live = _follower(root, a["id"], text="live part")
+    dead = _follower(root, a["id"], text="moved to someday")
+    woken = _follower(root, a["id"], text="already woken")
+    gone = _follower(root, a["id"], text="ended")
+    st = guarded_intention_store(_intentions(root))
+    st.update(dead["id"], disposition="someday")
+    st.update(woken["id"], germinated={"on": "2026-11-10", "target": "band", "ref": "q-1"})
+    st.descend(gone["id"], kind="dropped")
+    items = IntentionStore(_intentions(root), id_prefix="intention").list_open()
+    assert {x["id"] for x in items} >= {live["id"], dead["id"], woken["id"]}
+    assert [s["id"] for s in split.followers_of(items, a["id"])] == [live["id"]]
+    assert all(bool(g.is_event_agenda(s)) == (s["id"] == live["id"]) for s in items if s.get("on_event"))
+    st.descend(live["id"], kind="dropped")
+    items = IntentionStore(_intentions(root), id_prefix="intention").list_open()
+    assert split.followers_of(items, a["id"]) == []
+    _done(root, a["id"])
+    assert split.wake_after(_intentions(root), a["id"], queue_dir=qdir) == [] and pings == []     # nothing reachable: nothing opened
+
+
+def test_the_list_gives_the_first_part_no_then_for_a_second_part_moved_to_a_someday(tmp_path):
+    from tests.test_cockpit_list_panel import Rig, TODAY as LIST_TODAY
+
+    r = Rig(tmp_path, band=False, board=False)
+    a = r.ids["agenda_old"]
+    day = (LIST_TODAY.replace(day=LIST_TODAY.day + 5)).isoformat()
+    live = r.sp.add(type="task", text="live then", disposition="agenda", target="band", on_event=f"done:{a}", check_by=day, today=LIST_TODAY)
+    dead = r.sp.add(type="task", text="dead then", disposition="agenda", target="band", on_event=f"done:{a}", check_by=day, today=LIST_TODAY)
+    r.sp.update(dead["id"], disposition="someday")
+    assert _list_rows(r.panel())[f"intention:{a}"]["facets"]["then"] == [live["id"]]
+
+
 def test_the_verb_binds_the_row_version_and_audits(tmp_path, qdir):
     root = _install(tmp_path)
     a = _anchor(root)
