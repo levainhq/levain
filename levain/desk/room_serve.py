@@ -74,8 +74,11 @@ class RoomServe:
         self._store = store
         self._setting = setting
         self.chat_store = ChatStore(store)
-        skw: dict[str, Any] = {"probe": make_probe(self.chat_store, door_names=setting.door_names),
-               "tripwires": make_tripwires(self.chat_store, door_names=setting.door_names)}
+        profile = getattr(setting, "profile", None)
+        skw: dict[str, Any] = {"probe": make_probe(self.chat_store, door_names=setting.door_names, profile=profile),
+               "tripwires": make_tripwires(self.chat_store, door_names=setting.door_names, profile=profile)}
+        if profile is not None:                      # the host profile runs under its own mode (bypass), not the room's dontAsk
+            skw["room_permission_mode"] = profile.permission_mode
         skw.update(service_kw or {})                 # a test's own probe replaces the room's
         self.service = ChatService(self.chat_store, **skw)
         if launcher is None:
@@ -260,8 +263,12 @@ class RoomServe:
         the launcher's open, so every poll stalled and held a request slot until it ended). One attribute read each,
         so it never blocks; it never raises."""
         host = getattr(self._setting, "host", None)
+        profile = getattr(self._setting, "profile", None)
+        # "profile": the host profile's name, or None for the confined room (a host that fell back to the confined room
+        # shows here, to the desk's check and to the live verification)
         return {"last_error": self.last_error, "running": self._started and not self._stopped,
-                "drops_via": "desk" if host is not None and host.relays else "card"}
+                "drops_via": "desk" if host is not None and host.relays else "card",
+                "profile": None if profile is None else profile.name}
 
     def interrupt(self, launch_id: str) -> Any:
         """His Stop: the service's unfenced interrupt of ``launch_id`` (the room's newest launch, which the route reads
