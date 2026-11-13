@@ -287,7 +287,7 @@ def test_r1_f2_both_or_neither_of_pick_and_text_is_refused_before_any_store_acce
 
 def test_r1_f3_the_summary_says_number_pending_as_the_payload_does(store, monkeypatch):
     ask(store)
-    monkeypatch.setattr(band_view, "_number", lambda *a, **k: {})        # the lock was busy: nothing numbered
+    monkeypatch.setattr(band_view, "_number_tx", lambda *a, **k: ({}, {}, None))   # the lock was busy: nothing numbered
     assert band_view.summary(store)["note"] == band_view._PENDING_NOTE
 
 

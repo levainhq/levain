@@ -399,18 +399,22 @@ def test_every_entry_that_takes_now_refuses_a_naive_one_before_any_read(world, e
         calls[entry](NOW)
 
 
-def test_render_full_with_now_numbers_from_now_and_reads_no_store_clock(world):
+def test_render_full_with_now_judges_at_now_and_numbers_from_the_store_clock_read_inside_the_write(world):
+    """BAND-FIX1 (levain#3 L3, complement MED 1): ``now`` judges the render (expiry, the LATER day); a number's stamp is
+    the store clock read ONCE inside the numbering write, never a render's start ``now``."""
     st, qs, qdir = world
+    reads: list[int] = []
+    inside = datetime(2026, 11, 2, 9, 30, tzinfo=timezone.utc)
 
-    def boom():
-        raise AssertionError("the store clock was read")
+    def clock():
+        reads.append(1)
+        return inside
 
-    qs._clock = boom
+    qs._clock = clock
     r = band_view.render_full(qs, now=NOW)                  # numbering left at its default (True)
-    assert r.shown == [1]
+    assert r.shown == [1] and reads                         # the write read the store clock
     c = sqlite3.connect(qs.path)
     try:
-        assert [x[0] for x in c.execute("SELECT numbered_at FROM band_items")] == ["2026-10-31T12:00:00Z"] \
-            or [x[0] for x in c.execute("SELECT numbered_at FROM band_items")][0].startswith("2026-10-31T12:00:00")
+        assert [x[0] for x in c.execute("SELECT numbered_at FROM band_items")] == [band_view.utc_stamp(inside)]
     finally:
         c.close()
