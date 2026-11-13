@@ -22,9 +22,8 @@ import pytest
 from levain.cockpit import Cockpit, Fault, ProviderSpec, Read, RowIn, register_ordering
 from levain.cockpit.registry import Ordering
 from levain.cockpit.text import render_lines, snapshot, visible
-from tests._chrome_flags import CHROME_SAFE_FLAGS
 from tests._shared_chrome import _session_chrome, chrome_skip_reason
-from tests._page_drive_run import run as run_driver
+from tests._page_drive_dump import dump_dom
 
 WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 NODE = shutil.which("node")
@@ -568,8 +567,8 @@ class TestManifestMapperParses:
 
 
 def _dump_dom(url: str) -> str:
-    return run_driver([CHROME, *CHROME_SAFE_FLAGS, "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],
-                      timeout=60).stdout
+    # one bounded retry, a fresh profile per attempt and a failure message that says what the box looked like: tests/_page_drive_dump.py
+    return dump_dom(CHROME, url, timeout=60)
 
 
 @needs_browser

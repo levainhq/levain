@@ -9,9 +9,8 @@ from pathlib import Path
 from levain.cockpit.effects import DownstreamEffect
 from levain.writes import ActionVerb
 from tests._inbox_fake import FakeInbox
-from tests._chrome_flags import CHROME_SAFE_FLAGS
 from tests._shared_chrome import _session_chrome, chrome_skip_reason
-from tests._page_drive_run import run as run_driver
+from tests._page_drive_dump import dump_dom
 from tests.test_cockpit_k2a import _get, _install, _post, _serve
 from tests.test_cockpit_r1_write import INBOX_PANELS, _inbox_panel
 
@@ -79,8 +78,7 @@ needs_browser = pytest.mark.skipif(chrome_skip_reason() is not None, reason=chro
 
 
 def _dump(url: str) -> str:
-    return run_driver([CHROME, *CHROME_SAFE_FLAGS, "--dump-dom", "--virtual-time-budget=8000",
-                       "--window-size=1440,1000", url], timeout=90).stdout
+    return dump_dom(CHROME, url, timeout=90)   # one bounded retry, a fresh profile per attempt: tests/_page_drive_dump.py
 
 
 def _bare_install(tmp_path: Path, texts: list[str]):
