@@ -218,7 +218,7 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
     from levain.consent.questions import ANSWER_CHANNELS, DB_NAME, QuestionStore, later_date
     from levain.desk.store import CoordStore
     from levain.intentions import answered_descend_kind, guarded_intention_store, ringing_ref
-    from levain.recur import advance_changes
+    from levain.recur import advance_changes, repeats_words
 
     now = now or datetime.now()
     today = today or now.date()
@@ -362,7 +362,7 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
                     q, filed = questions.file_once(
                         agent=agent, key=KEY_PREFIX + okey,
                         what=(f"After {anchor_id} was done: {title} ({sid})" if anchor_id
-                              else f"Due {(nxt or today).strftime('%m-%d')}: {title} ({sid})"),
+                              else f"Due {(nxt or today).strftime('%m-%d')}: {title} ({sid})" + repeats_words(item)),
                         options=[("done", "Done")], rec="done", blocks=_line(blocks, 600), cwd=str(install.resolve()),
                         held_by=ANSWER_CHANNELS)
                     ref = q.id

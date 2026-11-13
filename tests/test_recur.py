@@ -201,3 +201,8 @@ def test_a_plain_agenda_still_resolves_on_an_answered_row(tmp_path):
     qs.answer(q.id, text="did it", channel="cli")
     g.germinate(intentions, qdir, install=root, today=date(2026, 11, 8), now=datetime(2026, 11, 8, 12, 0), ping=lambda *a, **k: True)
     assert sp.get(sid)["status"] != "open"
+
+
+def test_the_band_row_a_repeating_agenda_files_says_it_repeats(tmp_path):
+    root, intentions, qdir, sp, sid, qs, q = _ringing_series(tmp_path)
+    assert q.what == f"Due 11-06: bins ({sid}) (repeats weekly SUN 21:00)"
