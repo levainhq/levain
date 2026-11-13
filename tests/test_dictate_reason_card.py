@@ -34,7 +34,7 @@ REPLY_NOTE_SEL = ".edit-msg"
 
 def shown(note_sel: str) -> str:
     """What the card shows for its note: the words, whether it is drawn, and whether its edges are visible: inside the screen
-    sideways, inside the card on every side, and not cut by any ancestor whose overflow clips (the modal's scroller included).
+    sideways, inside the card on every side, and not cut by any ancestor whose overflow clips (the modal's scroller included) or by its own overflow.
     The note is scrolled into view first, so a card that scrolls is judged on what the person reaches, not on what is below the
     fold. The bottom edge is deliberately not compared with the window: under headless emulation the phone sheet is sized by
     100dvh of the real window while innerHeight is the emulated one, so the sheet's own bottom can sit past innerHeight whatever
@@ -50,7 +50,7 @@ def shown(note_sel: str) -> str:
             " return JSON.stringify({ text: n.textContent, shown: s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0,"
             " onScreen: r.left >= 0 && r.right <= window.innerWidth + 0.5,"
             " inCard: r.left >= c.left - 0.5 && r.right <= c.right + 0.5 && r.top >= c.top - 0.5 && r.bottom <= c.bottom + 0.5,"
-            " cut, vw: window.innerWidth, edge: [Math.round(r.top), Math.round(r.bottom), window.innerHeight] }); })()") % (json.dumps(CARD), json.dumps(note_sel))
+            " cut, selfCut: n.scrollHeight > n.clientHeight + 1 || n.scrollWidth > n.clientWidth + 1, vw: window.innerWidth, edge: [Math.round(r.top), Math.round(r.bottom), window.innerHeight] }); })()") % (json.dumps(CARD), json.dumps(note_sel))
 
 
 def tap_and_fail(error: str) -> dict:
@@ -99,7 +99,7 @@ def reply_card(tmp_path: Path, monkeypatch, device: dict, error: str, shot: str 
 
 
 def whole(got: dict, width: int) -> None:
-    assert got["text"] == REASON and got["shown"] and got["onScreen"] and got["inCard"] and got["cut"] == [] and got["vw"] == width, json.dumps(got)
+    assert got["text"] == REASON and got["shown"] and got["onScreen"] and got["inCard"] and got["cut"] == [] and not got["selfCut"] and got["vw"] == width, json.dumps(got)
 
 
 @needs_browser
