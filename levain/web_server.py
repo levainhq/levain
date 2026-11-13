@@ -120,6 +120,7 @@ from levain.cockpit import stream as cockpit_stream
 from levain.cockpit import board as cockpit_board
 from levain.cockpit import threads as cockpit_threads
 from levain.cockpit import room as cockpit_room
+from levain.cockpit import desk_tab as cockpit_desk
 from levain.cockpit import voice as cockpit_voice
 from levain.voice import custody as voice_custody
 from levain.voice import meter as voice_meter
@@ -1492,6 +1493,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/action",
     "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH, _SIGN_LIST_PATH,
     _BAND_PATH, _GRANT_LIST_PATH, cockpit_threads.THREADS_LIST_PATH, cockpit_room.ROOM_PATH, _COORD_LIST, _DESK_LIST, _COORD_SHEET,
+    cockpit_desk.DESK_PATH, cockpit_desk.SEND_PATH,
     cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE,
     cockpit_voice.VOICE_JSON, *cockpit_voice.VOICE_PATHS, *cockpit_voice.STREAM_PATHS,
     _PAIR_OFFER, _PAIR_REVOKE, _PAIR_REVOKE_PREVIEW, _PAIR_LIST, _PAIR_CLAIM,
@@ -2032,6 +2034,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     room_host: "cockpit_room.RoomHost | None" = None
     # the RoomServe make_server started (RM-G2); server_close stops it. None: this server holds no room
     room_serve: "Any" = None
+    # the Desk view's port (levain.desk.desk_port.DeskPort): its two routes are served only beside one, and only with a
+    # surface token (make_server refuses it without). None: GET /cockpit/desk.json says wired false, the send is a 404
+    desk_port: "Any" = None
     # premium voice (V1-4), served only beside a room host and a broker. voice_gate bounds the voice POSTs on their own
     # (they never take request_gate: a stalled upload holds a voice slot, never a cockpit slot); voice_transport is the
     # providers' HTTP (a test replays responses through it); voice_last_read is each provider's last key-read or call
@@ -4207,6 +4212,34 @@ class _Handler(GuardedHandler):
             status, payload = cockpit_room.post_room_rotate(host, directory, owner, req)
         return payload, status
 
+    def _serve_desk(self, *, head: bool) -> None:
+        """``GET /cockpit/desk.json``: the Desk view's read (lease, capabilities, the named thread's receipts), behind the
+        room record's gate (a surface token on every bind). The port asks the host's commands, so the read holds a
+        ``request_gate`` slot for as long as they take and answers 503 when none is free. A server with no port answers
+        ``{"wired": false}`` (after the gate: whether this cockpit has a desk is not public)."""
+        if not self._off_box_token_valid():
+            self._gated_read_403("the desk view needs", head=head)
+            return
+        query = urllib.parse.urlsplit(self.path).query
+        if not self.server.request_gate.acquire(blocking=False):
+            self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+            return
+        try:
+            status, payload = cockpit_desk.serve_desk(self.server.desk_port, query)
+        finally:
+            self.server.request_gate.release()
+        self._send(cockpit_desk.encode(payload), "application/json; charset=utf-8", status=status, head=head,
+                   headers=[("Vary", _WRITE_TOKEN_HEADER)], cache_control="private, no-store")
+
+    def _desk_tab_post(self, req: Any) -> tuple[dict[str, Any], int]:
+        """``POST /cockpit/desk/send``, reached only past ``do_POST``'s write gate (a surface token on every bind). The
+        owner is derived from the credential here and never from the body."""
+        port = self.server.desk_port
+        if port is None:
+            return {"error": "not_found", "message": "no desk is wired"}, 404
+        status, payload = cockpit_desk.post_desk_send(port, self._thread_owner(), req)
+        return payload, status
+
     # --- premium voice (V1-4; levain.cockpit.voice holds the logic, these methods the gates) ---------------------------
 
     def _voice_meter(self, directory: Any) -> Any:
@@ -4871,6 +4904,9 @@ class _Handler(GuardedHandler):
         if cockpit_room.is_room_path(path):
             self._serve_room(path, head=head)
             return
+        if cockpit_desk.is_desk_path(path):
+            self._serve_desk(head=head)
+            return
         if path == cockpit_voice.VOICE_JSON:
             self._serve_voice(head=head)
             return
@@ -5256,13 +5292,16 @@ class _Handler(GuardedHandler):
                   if self.server.chat_service is not None and self.server.threads else None)   # threads=False: its writes are unknown routes too
         # and the room's write routes (RM-F): the same gate; served only beside a room host
         room = cockpit_room.post_route(route) if self.server.room_host is not None else None
+        # and the Desk view's send: the same gate; served only beside a desk port (and so only with a surface token)
+        desk_tab = cockpit_desk.is_send_path(route) and self.server.desk_port is not None
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
         if push:
             if not self._push_gate_ok(route):
                 return self._token_403("credential_required")
         elif (sign is not None or compose or grant is not None or envelope is not None or consent is not None or dispatch is not None
-                or coord is not None or key_line or desk or thread is not None or room is not None) and not self._off_box_token_valid():
+                or coord is not None or key_line or desk or thread is not None or room is not None
+                or desk_tab) and not self._off_box_token_valid():
             return self._token_403("credential_required")
         if self._write_token_required() and not (self._push_gate_ok(route) if push else self._off_box_token_valid()):
             return self._token_403("forbidden")
@@ -5279,7 +5318,7 @@ class _Handler(GuardedHandler):
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
                 and envelope is None
                 and consent is None and dispatch is None and coord is None and not push and not key_line
-                and not desk and thread is None and room is None):
+                and not desk and thread is None and room is None and not desk_tab):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -5441,6 +5480,17 @@ class _Handler(GuardedHandler):
                 # authority and the owner is derived from it; no read-only refusal applies (it acts through the floor)
                 try:
                     payload, status = self._room_post(room, req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if desk_tab:
+                # the operator's own typed line through the desk port: the credential is the authority and the owner is
+                # derived from it; no read-only refusal applies (it files through the host's command, as the room's line does)
+                try:
+                    payload, status = self._desk_tab_post(req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -5738,6 +5788,7 @@ def make_server(
     chat_service: "ChatService | None" = None,
     room_host: "cockpit_room.RoomHost | None" = None,
     room_serve: "Any" = None,
+    desk_port: "Any" = None,
     premium_stt: "bool | None" = None,
     threads: bool = True,
     watch_paths: "Iterable[str | Path] | None" = None,
@@ -5787,6 +5838,13 @@ def make_server(
 
     ``work_board=False`` draws no Work board of levain's own: an embedder with no board of its own gets none (a board a
     provider registers still draws; the built-in is only the default when none does).
+
+    ``desk_port`` is the Desk view's :class:`levain.desk.desk_port.DeskPort` (``levain.cockpit.desk_tab`` holds its two
+    routes): ``GET /cockpit/desk.json`` and ``POST /cockpit/desk/send``, each behind the write gate on every bind. A
+    send is a write that wakes a desk, so this server refuses a port without a surface token (a read-only source given no
+    write_token or surface_tokens), as it refuses a signer. Without one the read answers ``{"wired": false}`` and the send
+    is a 404. A port filing through a host command needs a DURABLE claims file, or idempotency does not survive a restart
+    (``desk_tab.port_from_env`` places one).
 
     ``threads=False`` offers no Threads zone: ``GET /cockpit/threads.json`` and ``/cockpit/thread/<id>.json`` answer 404 and
     the manifest's ``transport`` carries ``threads: false`` (absent by default), which the page reads to draw no zone.
@@ -6112,6 +6170,15 @@ def make_server(
         raise ValueError("refusing signer: this server has no surface token for its sign routes to require (a "
                          "read-only source given no write_token or surface_tokens); pass a write_token")
 
+    if desk_port is not None:
+        from levain.desk.desk_port import DeskPort
+
+        if not isinstance(desk_port, DeskPort):
+            raise ValueError("refusing desk_port: it is not a DeskPort (capabilities, lease, post and events)")
+        if not tokens:
+            # every desk route needs a surface token, so a port here would be a permanent 403
+            raise ValueError("refusing desk_port: this server has no surface token for its desk routes to require (a "
+                             "read-only source given no write_token or surface_tokens); pass a write_token")
     if room_serve is not None:
         if chat_service is not None or room_host is not None:
             raise ValueError("refusing room_serve: it brings its own ChatService and room host (ONE service serves the "
@@ -6165,6 +6232,7 @@ def make_server(
     httpd.chat_service = chat_service
     httpd.room_host = room_host
     httpd.room_serve = None         # set only once the RoomServe has started, at the very end
+    httpd.desk_port = desk_port
     httpd.verb_registry = verb_registry
     httpd._cockpit_lock = threading.Lock()
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
@@ -6513,6 +6581,21 @@ def run_web_server(
             print(chat_err, file=sys.stderr)
             return 1
 
+    desk_port = None
+    if cockpit_desk.DESKCMD_ENV in os.environ and os.environ[cockpit_desk.DESKCMD_ENV]:
+        # the Desk view (levain#2): its argvs come from the HOST's environment, never from the room's model (the room's
+        # child gets an allowlisted environment that does not carry this name). Mounted only with the write token, as
+        # the room is; a malformed value refuses the serve, so a desk wired wrongly never serves as one not wired.
+        if write:
+            try:
+                desk_port = _build_desk_serve()
+            except Exception as exc:    # noqa: BLE001 - DeskCommandError, or an OSError placing the claims file
+                print(f"refusing {cockpit_desk.DESKCMD_ENV}: {exc}", file=sys.stderr)
+                return 1
+        else:
+            print(f"note: {cockpit_desk.DESKCMD_ENV} is set but this serve is read-only; the Desk view is not mounted "
+                  "(its send is a write: pass --write)", file=sys.stderr)
+
     room_serve = None
     if room_confined and room is None:
         print("refusing --room-confined: it picks the no-shell room for --room DIR; pass --room DIR with it",
@@ -6539,6 +6622,8 @@ def run_web_server(
     sign_kw: dict[str, Any] = {} if signer is None else {"signer": signer, "extra_hosts": frozenset({sign_host})}
     if room_serve is not None:
         sign_kw["room_serve"] = room_serve
+    if desk_port is not None:
+        sign_kw["desk_port"] = desk_port
     if isinstance(premium_stt, bool):
         sign_kw["premium_stt"] = premium_stt    # a bool forces the switch; anything else leaves AUTO (levain.cockpit.voice.premium_stt_on)
     try:
@@ -6581,6 +6666,8 @@ def run_web_server(
     if room_serve is not None:
         print(f"  room: one Claude room · its tools see {Path(room).expanduser().resolve()} first · recovered "
               f"{room_serve.recovered or 'nothing'}")
+    if desk_port is not None:
+        print(f"  desk: the Desk view is wired ({desk_port.capabilities().adapter}) · claims kept under the consent queue")
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
@@ -6678,6 +6765,18 @@ def _build_room_serve(room: Path, host_commands: Any = None, profile: Any = None
     return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd), host=host_commands, profile=setting_profile),
                      run_dir=str(queue / "room-run"),
                      launcher_kw={"home": str(_canonical_path(Path.home())), "levain_home": str(queue.parent)})
+
+
+def _build_desk_serve(environ: "Mapping[str, str] | None" = None) -> Any:
+    """The Desk view's :class:`~levain.desk.desk_port.HostCommandDeskPort` ``levain serve --write`` hands ``make_server``,
+    from the host's commands in ``LEVAIN_DESK_PORT_COMMANDS`` (flow's bridge passes its filing, lease and receipts
+    commands; levain names no script), or None when it is unset. Its claims file sits under the consent queue's directory
+    (as the room's ``room-run`` does), durable, so a restart keeps every claim and a stored ``outbox_id`` is still
+    answered from the record. Raises ``DeskCommandError`` on a malformed value."""
+    from levain.consent.queue import queue_dir_for
+
+    env = os.environ if environ is None else environ
+    return cockpit_desk.port_from_env(env, queue_dir_for(env))
 
 
 def _canonical_path(p: Path) -> Path:
