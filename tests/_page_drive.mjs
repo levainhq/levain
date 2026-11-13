@@ -363,7 +363,8 @@ const shotOnTimeoutInner = async (n, setPath) => {
     if (typeof t.value === "string") writeFileSync(p.replace(/\.png$/, ".txt"), "PAGE STATE: " + (typeof st.value === "string" ? st.value : JSON.stringify(st)) + "\nREFUSALS AND PROMPTS: " + JSON.stringify(trail) + "\n" + t.value);
   } catch {}
 };
-let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)// The cockpit draws its first board in parts and the whole draw then REPLACES every node (S4): a step that taps or tags a node on a part loses
+let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)
+// The cockpit draws its first board in parts and the whole draw then REPLACES every node (S4): a step that taps or tags a node on a part loses
 // it. The page says when its board is the one that stays with a POSITIVE signal, html[data-board-whole] (dashboard_boot.js: set only by the
 // code that has just drawn the whole board, or by a terminal failure; absent is the default); a page with no #board is not the cockpit board
 // and has nothing to wait for. The wait is bounded and not fatal (a page that never says gets its step after the bound, as every step did
