@@ -185,6 +185,7 @@ def _run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> 
     core.extend(_guarded(_BROKERED, lambda: _check_brokered_launcher(install)))
     core.extend(_check_slot_services())
     core.extend(_guarded("agent fence", lambda: _check_agent_fence(install=path)))
+    core.extend(_guarded("queue answers", _check_queue_answers))
     for r in core:
         _emit(r)
     print(spend_cap_note())
@@ -2580,6 +2581,135 @@ def _check_agent_fence(*, host: str | None = None, store: Path | None = None, ru
                             "runs as you and names this install's store and cockpit root.")]
     return [CheckResult(name, True, f"running (store {show(val['store'])}, authority seq {val['seq']}). Dispatch "
                         "sessions are checked on every tool call.")]
+
+
+def _operator_record_failure(name: str, rec_path: Path, store: Path, host: str, exc: BaseException) -> CheckResult:
+    """The FAIL row for an operator record that is missing, malformed, not a regular file, or unreadable. Only the
+    entry's ``lstat`` and the read's own exception decide which; the contents are not read again. The remedy is
+    WORDS, never a command line: the install helper's ``setup`` re-creates the record but rewrites the install's
+    settings (slots, verifier slots, roots) from its own arguments, so a printed command that left one out would erase
+    it. An unreadable path (EIO, ENOTDIR) is not ``setup``'s to fix, so it does not mention ``setup``."""
+    import errno
+    import stat as st_mod
+
+    from levain.slot import Refused, layout
+
+    try:
+        helper = f"The install helper ({layout.install_helper_path(host)})"  # type: ignore[arg-type]
+    except KeyError:      # a host the layout table does not know: the generic name, never a raise inside doctor
+        helper = "The install helper"
+    setup_words = (f"Neither this check nor the upgrade verb can repair it. {helper} `setup`, run as root, "
+                   "re-creates the record, but it rewrites the install's settings (slots, verifier slots, roots) from "
+                   f"its own arguments: read the current values from {store}/policy/ (pool holds the slots, roots the "
+                   "--root paths) BEFORE running it, and pass every one of them: --slots, --verifier-slots, "
+                   "--operator and each --root.")
+    read_fail: OSError | None = None
+    try:
+        mode: int | None = os.lstat(rec_path).st_mode
+    except FileNotFoundError:
+        mode = None
+        kind = "missing"
+    except OSError as lerr:
+        mode, kind, read_fail = None, "unreadable", lerr
+    else:
+        if not st_mod.S_ISREG(mode):
+            kind = "not-file"
+        elif isinstance(exc, Refused):
+            kind = "malformed"
+        else:
+            kind, read_fail = "unreadable", exc if isinstance(exc, OSError) else None
+    if kind == "missing":
+        what, hint = "is missing, so the install has no operator record", setup_words
+    elif kind == "malformed":
+        what = "is not a valid operator record (it must name an operator who is not root)"
+        hint = ("The malformed file must be removed as root first (setup cannot read past it, and nothing else "
+                f"restores it). {setup_words}")
+    elif kind == "not-file":
+        shape = ("directory" if st_mod.S_ISDIR(mode or 0) else "link" if st_mod.S_ISLNK(mode or 0) else "special file")
+        what = f"is a {shape}, not a regular file"
+        hint = (f"The entry is a {shape}, not a regular file: move it aside as root first, after checking it holds nothing you need "
+                "(setup cannot read past it). "
+                f"{setup_words}")
+    else:
+        errname = errno.errorcode.get(read_fail.errno or 0, type(read_fail).__name__) if read_fail else "unknown"
+        what = f"could not be read ({errname})"
+        hint = f"The record could not be read ({errname}); fix the path and run `levain doctor` again."
+    return CheckResult(name, False, f"the operator record {rec_path} {what}, so no one can be named as owner of the "
+                       "answers directory", hint)
+
+
+def _check_queue_answers(*, host: str | None = None, store: Path | None = None, uid: int | None = None,
+                         lstat: Any = None, qbroker_gid: Any = None, legacy_gid: Any = None) -> list[CheckResult]:
+    """The ``queue answers`` row: the directory the operator's answers are written in must be the operator's, in the
+    queue broker's group, mode 2750 (0750 only on macOS, where a new file takes the directory's group), so no other
+    principal can create a file there. Exactly the old shape (the operator's, group levain-queue, mode 2770) works
+    and warns; any other shape fails. The mode bits do not show an ACL, and none is read. The owner is the operator
+    the install record names (``policy/operator``), for every invoker. A record that is missing, malformed, not a
+    regular file or unreadable for a reason other than permission fails the row (nobody can be named owner; the
+    words in ``_operator_record_failure`` say what to do); a record this invoker may not open leaves the row neutral,
+    with the reason in the detail. No row before the isolation install. ``lstat``/``qbroker_gid``/``legacy_gid``/
+    ``uid``: a test's seams (``uid`` is accepted for a caller's sake and does not change the row)."""
+    name = "queue answers"
+    if not hasattr(os, "getuid"):
+        return []
+    import grp
+    import stat as st_mod
+
+    from levain.slot import layout
+
+    if host is None:
+        host = "darwin" if sys.platform == "darwin" else "linux"
+    store = store if store is not None else layout.STORE.get(host)
+    if store is None or not (store / "policy").is_dir():
+        return []
+    # The directory belongs to the RECORDED operator, whoever runs doctor: root and an admin who is not the operator
+    # read the same row. Only an operator that cannot be established leaves the row unread, and it says why.
+    from levain.slot import Refused
+    from levain.slot.install_helper import parse_operator_record
+
+    rec_path = store / "policy" / "operator"
+    try:
+        record = parse_operator_record(rec_path.read_bytes())
+    except PermissionError:
+        # This invoker cannot open the record (it is not world-readable): the row cannot judge from here. The detail
+        # always prints; a neutral row's hint does not.
+        return [CheckResult(name, True, f"not read: {rec_path} cannot be opened by this user, so the operator whose "
+                            "answers directory this is cannot be established from here. Run `levain doctor` as the "
+                            "operator or root.", neutral=True)]
+    except (OSError, Refused) as exc:
+        return [_operator_record_failure(name, rec_path, store, host, exc)]
+    op_uid, op_name = int(record["uid"]), str(record["name"])  # type: ignore[call-overload]
+    path = store / "queue" / "answers"
+    try:
+        st = (lstat or os.lstat)(path)
+    except OSError as exc:
+        return [CheckResult(name, False, f"{path} cannot be read ({type(exc).__name__}); the queue broker has no "
+                            "place to find the operator's answers", "Run `levain upgrade`.")]
+    try:
+        gid = (qbroker_gid or (lambda: grp.getgrnam("_levain_qbroker").gr_gid))()
+    except KeyError:
+        return [CheckResult(name, False, "there is no _levain_qbroker group, so no queue broker can read the "
+                            "operator's answers", "Run `levain upgrade`.")]
+    try:
+        legacy = (legacy_gid or (lambda: grp.getgrnam("levain-queue").gr_gid))()
+    except KeyError:
+        legacy = None
+    mode = st_mod.S_IMODE(st.st_mode)
+    # A new file takes the directory's group only where the directory is setgid (Linux) or always (BSD semantics).
+    target_modes = (0o2750, 0o750) if host == "darwin" else (0o2750,)
+    isdir = st_mod.S_ISDIR(st.st_mode)
+    if isdir and st.st_uid == op_uid and st.st_gid == gid and mode in target_modes:
+        acl = "the repair clears them with chmod -N" if host == "darwin" else "the repair does not remove them"
+        return [CheckResult(name, True, f"only the operator ({op_name}) can write the queue's answers; the queue "
+                            f"broker reads them (ACLs on the directory were not read; {acl})")]
+    if isdir and st.st_uid == op_uid and legacy is not None and st.st_gid == legacy and mode == 0o2770:
+        return [CheckResult(name, True, f"{path} is in the old shape (group levain-queue, 2770): it works, but dispatch "
+                            "can still create files in the queue's answers directory (an answer is only ever trusted "
+                            "by its signature)", "Run `levain upgrade`.", warn=True)]
+    return [CheckResult(name, False, f"{path} is not owner {op_name} (the operator), group _levain_qbroker, mode "
+                        f"{'2750 (or 0750)' if host == 'darwin' else '2750'}, and not the old shape either: the queue "
+                        "broker may not be able to read the operator's answers, or another principal can write them",
+                        "Run `levain upgrade`.")]
 
 
 def _check_host_awake() -> list[CheckResult]:
