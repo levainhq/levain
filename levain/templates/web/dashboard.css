@@ -3796,3 +3796,19 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
 .sign-lines-disc > summary::after { content: ""; flex: none; width: 7px; height: 7px; margin-right: var(--sp-2); border-right: 2px solid var(--label); border-bottom: 2px solid var(--label); transform: rotate(-45deg); }
 .sign-lines-disc[open] > summary::after { transform: rotate(45deg); }
 .sign-lines-disc > summary:hover::after, .sign-lines-disc[open] > summary::after { border-color: var(--text); }
+/* a long consent input (row 1704, card_format.js longText): its head and tail, the gap between them said, and the WHOLE text
+   behind a disclosure in a block that scrolls on its own (never a second cut), so the answers below stay near on a phone */
+.long-text { margin: 0 0 var(--sp-4); min-width: 0; }
+.long-text > pre.long-head, .long-text > pre.long-tail { margin: 0; max-height: none; }
+.long-text > .long-gap { margin: var(--sp-2) 0; color: var(--label); font: italic var(--fw-regular) var(--fs-meta)/1.4 var(--sans); }
+.long-text.open > .long-head, .long-text.open > .long-gap, .long-text.open > .long-tail { display: none; }
+.long-whole > summary { cursor: pointer; min-height: var(--hit-min, 44px); display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); list-style: none; color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--sans); }
+.long-whole > summary::-webkit-details-marker { display: none; }
+.long-whole > summary::after { content: ""; flex: none; width: 7px; height: 7px; margin-right: var(--sp-2); border-right: 2px solid var(--label); border-bottom: 2px solid var(--label); transform: rotate(-45deg); }
+.long-whole[open] > summary::after { transform: rotate(45deg); }
+.long-whole > summary:hover, .long-whole[open] > summary { color: var(--text); }
+.long-whole > summary:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+.long-whole > pre.long-full { margin: 0; max-height: 50vh; overflow: auto; padding: var(--sp-2) var(--sp-3); white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: var(--r-sm); }
+.long-whole > pre.long-full:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+.consent-kv dd > .long-text { margin: 0; }
+.consent-kv-long { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }

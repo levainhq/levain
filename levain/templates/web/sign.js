@@ -402,6 +402,13 @@
     cardView = card;
     $("sheet-actions").classList.toggle("card-rows", !!card);
     if (card) drawCardHead(body, card, msg);
+    // a consent request's input is shown whole however long (row 1704): a long one as its head and tail, the whole of it one
+    // tap away in its own scrolling block, so the answers below stay near
+    else if (consent && F && typeof F.longText === "function") {
+      const shown = F.longText(typeof r.message === "string" ? r.message : "", "sheet-message");
+      shown.id = "sheet-input";
+      body.appendChild(shown);
+    }
     else body.appendChild(msg);
     // a card's headline IS the title: the header above it drops the request's title, so it is said once
     { const t = $("sheet-title"); if (t) t.hidden = !!card; }

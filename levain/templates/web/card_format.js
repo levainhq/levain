@@ -423,6 +423,32 @@
     box.appendChild(raw);
     return box;
   }
+  // A long input (row 1704: a consent request's whole input, up to the queue's display bound) drawn as its head and its tail with
+  // the WHOLE text one tap away in a block that scrolls on its own, never a second cut: the signer can read all of what is
+  // signed, and the answer buttons below stay near without scrolling the whole text. Text up to LONG_AT code points is one
+  // block of class `cls`, as before. Counted in code points, so no cut splits a surrogate pair.
+  const LONG_AT = 1200, LONG_END = 400;
+  function longText(text, cls) {
+    const s = String(text);
+    const cps = Array.from(s);
+    if (cps.length <= LONG_AT) return node("pre", cls, s);
+    const with_ = (extra) => (cls ? cls + " " : "") + extra;
+    const box = node("div", "long-text");
+    box.dataset.chars = String(cps.length);
+    box.appendChild(node("pre", with_("long-head"), cps.slice(0, LONG_END).join("")));
+    box.appendChild(node("p", "long-gap", "… " + (cps.length - 2 * LONG_END) + " more characters here: the whole input is below …"));
+    box.appendChild(node("pre", with_("long-tail"), cps.slice(cps.length - LONG_END).join("")));
+    const whole = node("details", "long-whole");
+    whole.appendChild(node("summary", "", "Show the whole input (" + cps.length + " characters)"));
+    const full = node("pre", with_("long-full"), s);
+    full.tabIndex = 0;                                   // its own scroll: reachable by keyboard
+    full.setAttribute("aria-label", "the whole input, " + cps.length + " characters");
+    whole.appendChild(full);
+    // open, the whole text stands alone (the head and the tail would repeat it); closed, they are back
+    whole.addEventListener("toggle", () => box.classList.toggle("open", whole.open));
+    box.appendChild(whole);
+    return box;
+  }
   // "WHAT" -> "What": a section's label as a heading
   const titleCase = (l) => String(l).toLowerCase().replace(/(^|[ /-])([a-z])/g, (m, a, b) => a + b.toUpperCase());
   // a paragraph that is a " · " run of two or more items is a list (R2); every word stays, only the separators go
@@ -636,7 +662,7 @@
     return { dt, shown: cut.map((i) => all[i]), total: pick.length, tags: cut.map((i) => dt.tags[i]) };
   }
 
-  const api = { deskTabPage, getDeskTab, setDeskTab, deskTabs, preferFull, usesFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody };
+  const api = { deskTabPage, getDeskTab, setDeskTab, deskTabs, preferFull, usesFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody, longText, LONG_AT };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);

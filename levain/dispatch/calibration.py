@@ -32,8 +32,9 @@ The honest limit is stated once, in :data:`CAVEAT`, and repeated by every report
 Known edges, by design here: a late ruling is pooled with the answers given at the gate, though it is a judgment made
 with more time and the outcome in view; the action class is (agent, tool, tier), which can be wider than the grant the
 M17 card would propose, so check the class against the grant before the card consumes ``eligible``; requests whose
-display was cut at its limit are left out and counted, since neither a judge nor the operator could see their whole
-input.
+input is not shown whole (over the queue's display bound, or filed under the old display cut) are left out and
+counted, since neither a judge nor the operator could see their whole input. A shown display is the whole input, so a
+judge handed one may receive up to the queue's display bound.
 """
 from __future__ import annotations
 
@@ -82,8 +83,8 @@ class LabelSet:
     (see the module docstring), how many rows the reader skipped because they did not check out, and whether the set
     is ``incomplete``: the queue listing overflowed its cap (more undecided requests than it reads, or more pending,
     which it does not tell apart), so some requests were not read at all. Every report built from an incomplete set
-    says so, and :func:`proposal_eligible` refuses it. ``excluded_cut`` counts requests left out because their display
-    was cut at its limit. ``contexts`` maps a request id to what a judge may see of it (:class:`JudgeContext`)."""
+    says so, and :func:`proposal_eligible` refuses it. ``excluded_cut`` counts requests left out because their input
+    is not shown whole. ``contexts`` maps a request id to what a judge may see of it (:class:`JudgeContext`)."""
     labels: tuple[Label, ...] = ()
     excluded_grants: int = 0
     skipped: int = 0

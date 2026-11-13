@@ -313,8 +313,9 @@ def card_display(tool_input: Any) -> str:
     from levain.consent.record import DISPLAY_MAX
 
     text = f"{EGRESS_TOOL} {json.dumps(_check(tool_input), ensure_ascii=False, separators=(', ', ': '))}"
-    if len(text) > DISPLAY_MAX:
-        raise CardError(f"a card's display is {len(text)} characters, over the queue's {DISPLAY_MAX}")
+    size = len(text.encode("utf-8", "surrogatepass"))     # the queue's bound is in UTF-8 bytes
+    if size > DISPLAY_MAX:
+        raise CardError(f"a card's display is {size} bytes, over the queue's {DISPLAY_MAX}")
     return text
 
 

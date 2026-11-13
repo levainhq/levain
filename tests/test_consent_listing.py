@@ -11,6 +11,7 @@ import pytest
 from levain.consent.listing import (TOO_LONG, UNSHOWN, audit_line, consent_targets, entry_body, filed_input, find_entry,
                                     read_listing)
 from levain.consent.queue import ConsentQueue, QueueStoreError, authority_source
+from levain.consent.record import DISPLAY_MAX
 from tests._h4 import h4_home
 
 T0 = datetime(2026, 10, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -86,21 +87,27 @@ def test_the_shared_readers_show_the_targets_and_an_unreadable_display(tmp_path)
     r = _file(q, "e1")
     assert filed_input(r) == {"file_path": "/w/a.txt", "content": "hi"}
     assert consent_targets(r) == "/w/a.txt"
+    long = q.file(agent="claude_code", agent_session_id="s", tool_name="Write",
+                  tool_input={"file_path": "/w/b", "content": "x" * 50000}, cwd="/w", hold=timedelta(minutes=5),
+                  event_id="e8")
+    assert filed_input(long) == {"file_path": "/w/b", "content": "x" * 50000}      # row 1704: shown whole
     big = q.file(agent="claude_code", agent_session_id="s", tool_name="Write",
-                 tool_input={"file_path": "/w/b", "content": "x" * 50000}, cwd="/w", hold=timedelta(minutes=5),
-                 event_id="e9")
+                 tool_input={"file_path": "/w/b", "content": "x" * (DISPLAY_MAX + 1)}, cwd="/w",
+                 hold=timedelta(minutes=5), event_id="e9")
     assert filed_input(big) is UNSHOWN
+    assert consent_targets(big).startswith("(not answered here: its input is ")
 
 
 def test_a_request_whose_display_is_cut_offers_no_commands(tmp_path):
     q = _queue(tmp_path, lambda: T0)
     short = _file(q, "e1")
     big = q.file(agent="claude_code", agent_session_id="s", tool_name="Write",
-                 tool_input={"file_path": "/w/b", "content": "x" * 50000}, cwd="/w", hold=timedelta(minutes=5),
-                 event_id="e9")
+                 tool_input={"file_path": "/w/b", "content": "x" * (DISPLAY_MAX + 1)}, cwd="/w",
+                 hold=timedelta(minutes=5), event_id="e9")
     got = read_listing(q.directory, now=T0 + timedelta(minutes=1))
     cut = entry_body(find_entry(got, big.id))
-    assert cut["answer_allow"] is None and cut["answer_deny"] is None and cut["note"] == TOO_LONG
+    assert cut["answer_allow"] is None and cut["answer_deny"] is None and cut["note"].endswith(TOO_LONG)
+    assert f"over the {DISPLAY_MAX}-byte bound" in cut["note"]
     whole = entry_body(find_entry(got, short.id))
     assert whole["answer_deny"] == f"levain consent answer {short.id} deny --signing-key <key>" and whole["note"] == ""
     assert find_entry(got, "pend-unknown") is None

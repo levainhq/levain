@@ -31,7 +31,7 @@ ANSWER_ROW_FORMAT = "levain-queue-answer/1"
 # the broker's allow under a signed contract's typed grant: never an answer row, never a consent grant answer
 GRANT_ROW_FORMAT = "levain-queue-grant-allow/1"
 _GRANT_PREFIX = "grant-"
-# a row holds one request (its display is bounded by levain.consent.record.DISPLAY_MAX) or one signed answer
+# a row holds one request (its display is bounded by levain.consent.broker_client.GATE_DISPLAY_MAX) or one signed answer
 ROW_MAX = 64 * 1024
 ROW_MODE = 0o640
 _QUEUE_ID = "queue-id"

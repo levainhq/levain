@@ -2953,8 +2953,9 @@ def _add_consent_answer_parser(cs_sub: argparse._SubParsersAction) -> None:
                     "hand it to the queue, which verifies it against a fresh replay of the authority log (an "
                     "enrolled, unrevoked key; for an allow, a key class that covers the request's tier) and "
                     "records it. The hook waiting on the request then delivers it to the agent. One request, "
-                    "one signature; a deny is signed too. A request whose input is too long to show here in "
-                    "full is not signed: the agent's own dialog stands.")
+                    "one signature; a deny is signed too. The input is shown whole, however long; a request "
+                    "whose input is over the queue's display bound (its size is said) or was filed under the old "
+                    "display cut is not signed: the agent's own dialog stands.")
     cs_answer.add_argument("request_id", help="The request's id, as `levain consent pending` shows it.")
     cs_answer.add_argument("decision", choices=("allow", "deny"))
     cs_answer.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
