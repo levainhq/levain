@@ -60,11 +60,18 @@ def make_ssh(vm: str, askpass_dir: Path, profile: HostProfile = DARWIN):
         # OpenSSH joins its trailing args with spaces and the remote shell re-parses them: send ONE quoted command
         return [shlex.join(str(a) for a in argv)]
 
+    def run(argv, timeout=60) -> tuple[int, str, str]:
+        """The guest command's ``(rc, stdout, stderr)``, whatever the rc (a command whose rc is the datum)."""
+        r = subprocess.run([SSH, *SSH_OPTS, f"{profile.ssh_user}@{ip()}", *remote(argv)], capture_output=True, text=True,
+                           errors="replace", timeout=timeout, env=env)
+        return r.returncode, r.stdout, r.stderr
+
     def guest(argv, timeout=60) -> str:
-        r = subprocess.run([SSH, *SSH_OPTS, f"{profile.ssh_user}@{ip()}", *remote(argv)], capture_output=True, text=True, timeout=timeout, env=env)
-        if r.returncode:
-            raise GuestError(r.returncode, f"guest {list(argv)[:7]}: {r.stderr.strip()[-300:]}")
-        return r.stdout
+        rc, out, err = run(argv, timeout)
+        if rc:
+            raise GuestError(rc, f"guest {list(argv)[:7]}: {err.strip()[-300:]}")
+        return out
+    guest.run = run
 
     def spawn(argv):
         return subprocess.Popen([SSH, *SSH_OPTS, f"{profile.ssh_user}@{ip()}", *remote(argv)], stdout=subprocess.DEVNULL,
@@ -84,11 +91,16 @@ def make_tart_exec(vm: str):
     ``vend-*`` clone is ever addressed."""
     _clone_guard(vm)
 
+    def run(argv, timeout=60) -> tuple[int, str, str]:
+        r = subprocess.run(tart_exec_argv(vm, argv), capture_output=True, text=True, errors="replace", timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+
     def guest(argv, timeout=60) -> str:
-        r = subprocess.run(tart_exec_argv(vm, argv), capture_output=True, text=True, timeout=timeout)
-        if r.returncode:
-            raise GuestError(r.returncode, f"guest {list(argv)[:7]}: {r.stderr.strip()[-300:]}")
-        return r.stdout
+        rc, out, err = run(argv, timeout)
+        if rc:
+            raise GuestError(rc, f"guest {list(argv)[:7]}: {err.strip()[-300:]}")
+        return out
+    guest.run = run
 
     def script(text: str, timeout=300) -> str:
         r = subprocess.run(tart_exec_argv(vm, SCRIPT_ARGV, stdin=True), input=text, capture_output=True, text=True, timeout=timeout)
