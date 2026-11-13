@@ -38,6 +38,33 @@ SUMMARY = f"{INPUT}.querySelector('.long-whole > summary')"
 FRAMES = "await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(1))))"
 
 
+# FLAKES (1113-13): the gate learns what is on screen from an IntersectionObserver entry, delivered in a task AFTER the
+# rendering update that computed it, and probes the geometry at THAT moment (card_format.js, "a chunk the browser moved past
+# between two rendering updates ... stays not shown"). A step that sets the next scroll position after two animation frames
+# assumes the delivery lands inside them; on a loaded box it does not, and the chunks of a step the scroll left before the
+# entries arrived stay unshown for good (measured: a contiguous run of 50 chunks, 800 characters, still unseen 160 frames
+# later). The product's rule is right (it fails closed, scrolling back shows them); the test's pace was the defect. So a step
+# waits, up to 40 frames, until no chunk lying wholly in the block's view and in the window is still unshown.
+SETTLE = ("const settle = async () => { const box = f.closest('.long-text'); if (!box || !box.longUnshown) return; "
+          "const sp = [...f.querySelectorAll('.long-group > span')]; "
+          "let prev = -1, still = 0; "
+          "for (let k = 0; k < 40; k++) { const fr = f.getBoundingClientRect(); "
+          "const lo = Math.max(fr.top, 0), hi = Math.min(fr.bottom, window.innerHeight); "
+          "const n = box.longUnshown().filter((i) => { const r = sp[i].getBoundingClientRect(); return r.top >= lo && r.bottom <= hi; }).length; "
+          # none left, or the same ones for 8 frames running: covered or clipped chunks the gate rightly never counts
+          "if (n === 0 || (n === prev && ++still >= 8)) return; if (n !== prev) still = 0; prev = n; "
+          f"{FRAMES}; }} }}; ")
+
+
+def first_view_counted(root: str) -> str:
+    """Wait (up to 60 frames) until the gate has counted the view the block opened on: its entries come two rendering
+    updates after the toggle (the coarse observer, then the fine one), so a fixed one- or two-frame wait after `open` is a
+    race on a slow box, and a jump made before it leaves the top view uncounted for good (CI red, 11-13)."""
+    return (f"(async () => {{ const b = {root}.classList.contains('long-text') ? {root} : {root}.querySelector('.long-text'); "
+            f"for (let k = 0; k < 60 && !(Number(b.dataset.unseen) < Number(b.dataset.chars)); k++) {{ {FRAMES}; }} "
+            f"{FRAMES}; return 1; }})()")
+
+
 def jump(full: str) -> str:
     """One step to the block's end: the attack (the scrollbar dragged to the bottom, the End key)."""
     return f"(async () => {{ const f = {full}; f.scrollTop = f.scrollHeight; {FRAMES}; return f.scrollTop; }})()"
@@ -49,9 +76,10 @@ def stepped(full: str, frac: float, down: bool, *, until: float | None = None) -
     the largest one taken and the block's height, so a test can check no step jumped past a view."""
     stop = "" if until is None else f"if (f.scrollTop >= (f.scrollHeight - f.clientHeight) * {until}) break; "
     return (f"(async () => {{ const f = {full}; const d = Math.max(1, Math.floor(f.clientHeight * {frac})); "
+            f"{SETTLE}"
             f"let n = 0, max = 0; for (;;) {{ {stop}const t = f.scrollTop; "
             f"const want = {'Math.min(f.scrollHeight - f.clientHeight, t + d)' if down else 'Math.max(0, t - d)'}; "
-            f"if (Math.abs(want - t) < 0.5 || n > 4000) break; f.scrollTop = want; {FRAMES}; "
+            f"if (Math.abs(want - t) < 0.5 || n > 4000) break; f.scrollTop = want; {FRAMES}; await settle(); "
             f"max = Math.max(max, Math.abs(f.scrollTop - t)); n += 1; if (f.scrollTop === t) break; }} "
             f"return JSON.stringify({{n: n, max: max, ch: f.clientHeight}}); }})()")
 
@@ -113,7 +141,7 @@ def test_a_jump_to_the_end_leaves_allow_shut_until_the_skipped_middle_is_scrolle
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"tap": SUMMARY},                                                                             # 2
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
-            {"eval": f"(async () => {{ {FRAMES}; return {SHEET}; }})()"},                                 # 4
+            {"eval": f"(async () => {{ await {first_view_counted(INPUT)}; return {SHEET}; }})()"},        # 4
             {"eval": jump(FULL)},                                                                         # 5
             {"eval": SHOWN},                                                                              # 6
             {"shot": str(shots / "fix2_1_sheet_jumped_to_end_allow_shut_390.png")},                       # 7
@@ -254,7 +282,7 @@ def test_on_the_needs_card_a_jump_to_the_end_leaves_allow_shut(tmp_path, monkeyp
             {"until": f"{C_ALLOW} && {CARD}.querySelector('.long-text') && 1", "ms": 30000},              # 2
             {"tap": f"{CARD}.querySelector('.long-whole > summary')"},                                    # 3
             {"until": f"{CARD}.querySelector('.long-text.open') && 1", "ms": 10000},                      # 4
-            {"eval": jump(C_FULL)},                                                                       # 5
+            {"eval": f"(async () => {{ await {first_view_counted(CARD)}; return await {jump(C_FULL)}; }})()"},  # 5
             {"eval": C_STATE},                                                                            # 6
             {"shot": str(shots / "fix2_5_card_jumped_allow_shut.png")},                                   # 7
             {"eval": stepped(C_FULL, 0.9, down=False)},                                                   # 8
