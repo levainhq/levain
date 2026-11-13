@@ -5,7 +5,7 @@
 ## 1. What changes from v1
 
 - **No stored lifecycle for board items.** v1 kept a category a writer set and a journal of the moves. v2 stores the *item* (what was asked, in whose words, what closes it, what it waits on as typed links, where it came from) and never where the work stands. State is computed on every read from git, the live seats, the band and the land waiters.
-- **New states:** `landing`, `landed_not_closed`, `unknown`, and the three off-board decision states. `needs_you`, `ready`, `done` and the column names carry over.
+- **New states:** `landing`, `landed_not_closed`, `unknown`, and the three off-board decision states. `ready` and `done` carry over by name, and the six board columns are v1's six categories, except that `needs-you` (v1's hyphen) is `needs_you` here; `off` and `unknown` are the two columns v2 adds.
 - **Unknown is a state, with a reason.** Missing, stale or contradictory evidence never falls back to a default column.
 - **A decision replaces a move.** `cut`, `parked` and `out-of-1.0` are the only lifecycle-like facts that are stored, because a ruling cannot be derived from git; each carries its words and a date, and `reopen` is a new record.
 
@@ -40,9 +40,9 @@ The first rule that fires wins. The checks in section 4 run before this table, s
 | 3 | needs_you | an open band row names the id (or a `band`-kind item's np row is still open) |
 | 4 | landing | commits carrying the id are in a live `queue/*` ref beyond origin/main, or a land waiter names the id |
 | 5 | in_flight | a live seat names the id or holds a branch carrying it |
-| 6 | landed_not_closed | commits carrying the id are on origin/main, none closes it, and no orphan branch carries more |
+| 6 | landed_not_closed | commits carrying the id are on origin/main and rule 2 did not close it by the item's own `done_kind` (a closing trailer closes only a `merged` item; for `document`, `run` and `band` the file or the np row closes it), and no orphan branch carries more |
 | 7 | blocked | a `depends_on` link is unmet |
-| 8 | ready_with_start | a branch carries the id, with commits of its own, no live seat holds it, and its tip is on neither main nor the chain |
+| 8 | ready_with_start | an orphan branch carries the id: `ahead` > 0 (section 6) and no live seat holds it |
 | 9 | needs_grooming | no `done`, or a tier outside `sonnet`/`opus`/`haiku` |
 | 10 | ready | none of the above |
 
@@ -53,13 +53,13 @@ A dependency is met when: an `item:` link's own state is `done`; a `band:` link'
 Checked in this order; the first that applies is the reason line.
 
 1. the items file is torn (a line that is not JSON, not an object, of an unknown version or op, or missing a required field): every item reads unknown, decided ones included. A clean record that merely names an unknown id is reported in `problems` and nothing else.
-2. a source the item's rule needs is unreadable, malformed or not supplied (`evidence`, `main`, `chain`, `branches`, `seats`, `band`, `waiters`, plus `refs` for a `link:` dependency and `documents` for a `document`/`run` item). `git` stands for the four git sources and `notes` for the trailers in `refs/notes/board`.
+2. a source the item's rule needs is unreadable, malformed or not supplied (`evidence`, `main`, `chain`, `branches`, `seats`, `band`, `waiters`, plus `refs` for a `link:` dependency and `documents` for a `document`/`run` item). `git` stands for the four git sources and `notes` for the trailers in `refs/notes/board`. An `unreadable` value that is not an object of source to reason fails closed: `evidence` is unreadable (every item unknown), and any source it names stays unreadable.
 3. the evidence is older than `MAX_EVIDENCE_AGE_S` (6 h) or carries no fetch time.
 4. the item is in a `depends_on` cycle (`cycle a -> b -> a`).
 5. a typed link names nothing: `item:` not in the store, `band:` not in the band, `link:` not a ref on origin and not merged.
 6. a `document`/`run` item's path was never checked.
-7. a `gate:` is past its `recheck` date.
-8. evidence contradicts itself, neither side winning: closed on main and a live seat names the id · closed on main and an open band row names it · in the chain and an orphan branch with commits the chain lacks.
+7. a `gate:` is past its `recheck` date, judged against the UTC date of `now`.
+8. evidence contradicts itself, neither side winning: closed on main and a live seat names the id · closed on main and an open band row names it · in the chain and an orphan branch (`ahead` > 0) with commits the chain lacks.
 
 ## 5. The item store record (`items.jsonl`, one JSON object per line, append-only)
 
@@ -73,12 +73,12 @@ Common: `{"v": 1, "op": "add"|"amend"|"decide", "id": "<repo>#<n>", "at": "<UTC 
 
 ## 6. The evidence object (`"evidence_v": 1`)
 
-`fetched_at`, `unreadable` ({source: reason}), `main` ([{sha, date, items, closes}]), `chain` ([{ref, tip, commits:[{sha, items}]}]), `refs` and `merged` (ref names), `branches` ([{name, tip, date, ahead, items}]), `seats` ([{name, items, since, branch}]), `band` ({open: {np: [ids]}, resolved: {np: by}}), `waiters` ([{branch, items}]), `documents` ({path: bool}), `unattributed` ([{sha, subject}]). A source that is missing is not an empty one: it is unreadable.
+`fetched_at`, `unreadable` ({source: reason}), `main` ([{sha, date, items, closes}]), `chain` ([{ref, tip, commits:[{sha, items}]}]), `refs` and `merged` (ref names), `branches` ([{name, tip, date, ahead, items}]), `seats` ([{name, items, since, branch}]), `band` ({open: {np: [ids]}, resolved: {np: by}}), `waiters` ([{branch, items}]), `documents` ({path: bool}), `unattributed` ([{sha, subject}]). A source that is missing is not an empty one: it is unreadable, `unattributed` included. `ahead` is the number of the branch's own commits whose work is on neither origin/main nor any chain ref, counted by the reader (patch-id first, then the `Board-Item` trailer and subject), never by tip sha; a branch is an orphan exactly when `ahead` > 0 and no live seat holds it, so a branch that was cherry-picked or re-chained and never deleted (`ahead` 0) is invisible to every rule. `unreadable` is an object of source to reason; `now` is a timezone-aware datetime (a naive one is a TypeError); every other timestamp in the evidence without a zone is read as UTC.
 
 ## 7. The board and the audit
 
-`{"schema": "ready-v2", "as_of", "items": [{id, repo, title, tier, state, column, reason, refs, as_of}], "audit": [{kind, id, why}], "unattributed", "problems"}`. Items are ordered by repo, then item number. The audit kinds are `unknown`, `landed_not_closed`, `gate_expired`, `unattributed_work` and `unknown_id_in_trailer`; a non-empty audit fails the pace gate's no-ready verdict.
+`{"schema": "ready-v2", "as_of", "items": [{id, repo, title, tier, state, column, reason, refs, as_of}], "audit": [{kind, id, why}], "unattributed", "problems"}`. Items are ordered by repo, then item number. Every unreadable source is reported on the board itself, whether or not an item needed it: one audit `unknown` entry (no id) and one `problems` line, `<source> unreadable: <why>`, so an empty store or an unread `unattributed` scan is never a clean board. An item appears in the audit once: an item that reads unknown because its gate expired is listed as `gate_expired`, any other unknown item as `unknown`. Where evidence ties (equal dates, several seats, refs or rows), the choice is made by sha, name or ref, never by list position, so two readers print one line for one world. The audit kinds are `unknown`, `landed_not_closed`, `gate_expired`, `unattributed_work` and `unknown_id_in_trailer`; a non-empty audit fails the pace gate's no-ready verdict.
 
 ## 8. Versioning
 
-`schema: 2` for the board. Additive fields do not bump it. A new state or column, a removed or retyped field, or a changed rule is a version, announced by a needs-phill and never made by one repo alone.
+The board carries `"schema": "ready-v2"`; the integer `schema: 2` is the fixture file's (`ready_v2.json`) own version. Additive fields do not bump it. A new state or column, a removed or retyped field, or a changed rule is a version, announced by a needs-phill and never made by one repo alone.

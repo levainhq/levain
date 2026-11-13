@@ -230,14 +230,18 @@ def _common(rec: Mapping[str, Any]) -> tuple[str, str, str, str]:
 def _apply(rec: Mapping[str, Any], items: dict[str, Item]) -> None:
     op, iid, at, by = _common(rec)
     if op == "add":
-        if iid in items:
-            raise _Soft(f"{iid}: added twice (the first add stands)")
-        items[iid] = Item(
-            id=iid, repo=_req_str(rec, "repo"), title=_field_value("title", rec.get("title")),
+        repo = _req_str(rec, "repo")
+        if repo != iid.rpartition("#")[0]:
+            raise _Bad(f"repo {repo!r} disagrees with the id prefix of {iid}")
+        item = Item(                                    # validate first: a malformed duplicate is a torn line, not a soft one
+            id=iid, repo=repo, title=_field_value("title", rec.get("title")),
             words=_field_value("words", rec.get("words", "")), origin=_req_str(rec, "origin"),
             done=_field_value("done", rec.get("done")), done_kind=_field_value("done_kind", rec.get("done_kind", "merged")),
             tier=_field_value("tier", rec.get("tier")), depends_on=_field_value("depends_on", rec.get("depends_on", [])),
             added_at=at, added_by=by)
+        if iid in items:
+            raise _Soft(f"{iid}: added twice (the first add stands)")
+        items[iid] = item
         return
     if op == "amend":
         fields = rec.get("fields")
@@ -269,7 +273,11 @@ def fold(lines: Iterable[str]) -> Folded:
     problems: list[str] = []
     torn_why = ""
     for n, raw in enumerate(lines, 1):
-        line = raw.strip() if isinstance(raw, str) else ""
+        if not isinstance(raw, str):                    # a file read in binary mode must not look like an empty store
+            problems.append(f"line {n}: torn: not text ({type(raw).__name__})")
+            torn_why = torn_why or f"line {n}: not text ({type(raw).__name__})"
+            continue
+        line = raw.strip()
         if not line:
             continue
         try:
@@ -422,8 +430,10 @@ def _p_unattributed(raw: Any) -> tuple[Unattributed, ...]:
 @dataclass(frozen=True)
 class Evidence:
     """The merged evidence object (``evidence_v`` 1), parsed. Built by :meth:`from_dict`, which never raises: a source
-    that is missing or malformed lands in ``unreadable`` with its reason, and every item whose rule needs that source
-    reads unknown. A missing source is NOT an empty one: absence of a signal is never rendered as health."""
+    that is missing or malformed lands in ``unreadable`` with its reason, every item whose rule needs that source
+    reads unknown, and :func:`derive_all` reports every unreadable source on the board itself (an empty store, or a
+    source no item needs, is not a clean board). A missing source is NOT an empty one: absence of a signal is never
+    rendered as health."""
     fetched_at: str | None
     fetched_ts: datetime | None
     unreadable: Mapping[str, str]
@@ -438,11 +448,9 @@ class Evidence:
     waiters: tuple[Waiter, ...]
     documents: Mapping[str, bool]
     unattributed: tuple[Unattributed, ...]
-    problems: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, obj: Any) -> "Evidence":
-        problems: list[str] = []
         unreadable: dict[str, str] = {}
         if not isinstance(obj, Mapping):
             unreadable["evidence"] = "not an object"
@@ -450,12 +458,16 @@ class Evidence:
         elif type(obj.get("evidence_v")) is not int or obj["evidence_v"] != 1:
             unreadable["evidence"] = f"evidence_v {obj.get('evidence_v')!r} is not 1"
         given = obj.get("unreadable")
-        if isinstance(given, Mapping):
-            unreadable.update({str(k): str(v or "unreadable") for k, v in given.items()})
-        elif isinstance(given, (list, tuple)):
-            unreadable.update({str(k): "unreadable" for k in given})
-        elif given is not None:
-            problems.append("evidence.unreadable is neither an object nor a list")
+        if given is not None:                           # {source: reason} or nothing: any other shape fails closed
+            pairs = given.items() if isinstance(given, Mapping) else [(n, "") for n in given] if isinstance(given, (list, tuple)) else []
+            malformed = not isinstance(given, Mapping)
+            for k, v in pairs:
+                named = isinstance(k, str) and bool(k)
+                malformed = malformed or not named or not isinstance(v, str)
+                if named:                               # a source that was NAMED stays unreadable even if its reason is junk
+                    unreadable[k] = v if isinstance(v, str) and v else "unreadable"
+            if malformed:
+                unreadable["evidence"] = "malformed unreadable (expected an object of source -> reason)"
 
         def src(name: str, parse: Callable[[Any], Any], empty: Any, keys: Sequence[str] | None = None) -> Any:
             keys = keys or (name,)
@@ -477,19 +489,11 @@ class Evidence:
         band = src("band", _p_band, ({}, {}))
         waiters = src("waiters", _p_waiters, ())
         documents = src("documents", _p_documents, {})
-        if "unattributed" in obj:
-            try:
-                unattributed = _p_unattributed(obj["unattributed"])
-            except _Bad as e:
-                unattributed = ()
-                problems.append(f"evidence.unattributed is malformed: {e}")
-        else:
-            unattributed = ()
-            problems.append("evidence.unattributed was not supplied: unattributed work is not audited")
+        unattributed = src("unattributed", _p_unattributed, ())    # no item needs it, so the BOARD reports it unread
         raw_fetched = obj.get("fetched_at")
         fetched_at = raw_fetched if isinstance(raw_fetched, str) and raw_fetched.strip() else None
         return cls(fetched_at, parse_timestamp(fetched_at), unreadable, main, chain, branches, refs_merged[0],
-                   refs_merged[1], seats, band[0], band[1], waiters, documents, unattributed, tuple(problems))
+                   refs_merged[1], seats, band[0], band[1], waiters, documents, unattributed)
 
     def unreadable_reason(self, source: str) -> str | None:
         """Why ``source`` cannot be trusted, or None. ``git`` stands for the four git-derived sources and ``notes`` for
@@ -509,31 +513,39 @@ def _ts_key(text: str | None) -> float:
     return d.timestamp() if d else float("-inf")
 
 
+def _commit_key(c: MainCommit) -> tuple[float, str]:
+    """Latest wins; a tie in time is broken by sha, so a reason never depends on the order the evidence was listed in."""
+    return _ts_key(c.date), c.sha
+
+
+def _branch_key(b: Branch) -> tuple[float, str]:
+    return _ts_key(b.date), b.name
+
+
 class _Index:
-    """The evidence keyed by item id, built once per evidence object."""
+    """The evidence keyed by item id, built once per evidence object. Where a rule takes the first of several (chain
+    refs, waiters, band rows) the list is sorted here; seats are sorted by :meth:`live_seats` and branches are picked
+    with ``max`` on :func:`_branch_key`, so what a reason names never depends on the order the evidence was listed in."""
 
     def __init__(self, ev: Evidence) -> None:
         self.closes: dict[str, MainCommit] = {}
         self.touched: dict[str, list[MainCommit]] = {}
-        self.main_shas = {c.sha for c in ev.main}
         for c in ev.main:
             for iid in dict.fromkeys(c.items + c.closes):
                 self.touched.setdefault(iid, []).append(c)
             for iid in c.closes:
-                if iid not in self.closes or _ts_key(c.date) > _ts_key(self.closes[iid].date):
+                if iid not in self.closes or _commit_key(c) > _commit_key(self.closes[iid]):
                     self.closes[iid] = c
         self.chain: dict[str, list[tuple[str, int]]] = {}
-        self.chain_shas: set[str] = set()
         for ch in ev.chain:
             counts: dict[str, int] = {}
             for cc in ch.commits:
-                self.chain_shas.add(cc.sha)
                 for iid in dict.fromkeys(cc.items):
                     counts[iid] = counts.get(iid, 0) + 1
-            if ch.tip:
-                self.chain_shas.add(ch.tip)
             for iid, n in counts.items():
                 self.chain.setdefault(iid, []).append((ch.ref, n))
+        for rows in self.chain.values():
+            rows.sort()
         self.branches: dict[str, list[Branch]] = {}
         for b in ev.branches:
             for iid in dict.fromkeys(b.items):
@@ -546,29 +558,29 @@ class _Index:
             if s.branch:
                 self.seats_on_branch.setdefault(s.branch, []).append(s)
         self.waiters: dict[str, list[Waiter]] = {}
-        for w in ev.waiters:
+        for w in sorted(ev.waiters, key=lambda x: x.branch):
             for iid in dict.fromkeys(w.items):
                 self.waiters.setdefault(iid, []).append(w)
         self.band_naming: dict[str, list[str]] = {}
-        for np_id, ids in ev.band_open.items():
+        for np_id, ids in sorted(ev.band_open.items()):
             for iid in dict.fromkeys(ids):
                 self.band_naming.setdefault(iid, []).append(np_id)
 
     def live_seats(self, iid: str) -> list[Seat]:
-        """Seats that name the id, or hold a branch that carries it."""
+        """Seats that name the id, or hold a branch that carries it, by name."""
         out = list(self.seats_named.get(iid, ()))
         for b in self.branches.get(iid, ()):
             for s in self.seats_on_branch.get(b.name, ()):
                 if s not in out:
                     out.append(s)
-        return out
+        return sorted(out, key=lambda s: s.name)
 
     def orphans(self, iid: str) -> list[Branch]:
-        """Branches carrying the id with commits of their own that no live seat holds and that are on neither main nor
-        the landing chain."""
-        return [b for b in self.branches.get(iid, ())
-                if b.ahead > 0 and b.name not in self.seats_on_branch
-                and b.tip not in self.main_shas and b.tip not in self.chain_shas]
+        """Branches carrying the id with commits of their own that no live seat holds. ``ahead`` is the READER's count
+        of the branch's own commits whose work is on neither origin/main nor any chain ref (patch-id first, then
+        trailer and subject), so a branch that was cherry-picked or re-chained and never deleted has ``ahead`` 0 and is
+        no orphan: this function never judges by tip sha, which a replay changes."""
+        return [b for b in self.branches.get(iid, ()) if b.ahead > 0 and b.name not in self.seats_on_branch]
 
 
 # ------------------------------------------------------------------------------------------------ the derived state
@@ -615,8 +627,12 @@ class Board:
                 "problems": list(self.problems)}
 
 
-def _aware(now: datetime) -> datetime:
-    return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+def _utc(now: datetime) -> datetime:
+    """``now`` in UTC. A naive clock reading is refused: it could be any zone, and the evidence and the gate dates are
+    judged in UTC, so guessing would give two boards for one instant."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise TypeError("now must be a timezone-aware datetime: a naive clock reading cannot be compared with UTC evidence")
+    return now.astimezone(timezone.utc)
 
 
 def _short(sha: str) -> str:
@@ -628,10 +644,11 @@ class _Ctx:
         self.items = items
         self.ev = ev
         self.idx = ev.index
-        self.now = _aware(now)
+        self.now = _utc(now)
         self.torn = torn
         self.memo: dict[str, State] = {}
         self.stack: set[str] = set()
+        self.causes: dict[str, str] = {}      # item id -> the name of the check that made it unknown
         self._cycles: dict[str, tuple[str, ...] | None] = {}
 
     def make(self, item: Item, state: str, reason: str, refs: Iterable[str] = ()) -> State:
@@ -639,10 +656,34 @@ class _Ctx:
                      STATE_COLUMN[state], reason, tuple(refs), self.ev.fetched_at)
 
     def state_of(self, iid: str) -> State:
+        if iid not in self.memo:
+            self._prime(iid)
+        return self._one(iid)
+
+    def _prime(self, iid: str) -> None:
+        """Compute every dependency of ``iid`` BEFORE it, iteratively (an explicit stack, post-order), so that reading
+        a dependency in :func:`_compute` is a memo hit and a wait chain of any length never recurses."""
+        seen = {iid}
+        todo = [(iid, iter(self._deps(iid)))]
+        order: list[str] = []
+        while todo:
+            node, deps = todo[-1]
+            for dep in deps:
+                if dep not in seen and dep not in self.memo:
+                    seen.add(dep)
+                    todo.append((dep, iter(self._deps(dep))))
+                    break
+            else:
+                todo.pop()
+                order.append(node)
+        for node in order:
+            self._one(node)
+
+    def _one(self, iid: str) -> State:
         if iid in self.memo:
             return self.memo[iid]
         item = self.items[iid]
-        if iid in self.stack:               # a guard behind the cycle check: recursion can never run away
+        if iid in self.stack:               # a guard behind the cycle check: a cycle member never reads a dependency
             return self.make(item, "unknown", f"cycle through {iid}", (iid,))
         self.stack.add(iid)
         try:
@@ -662,7 +703,7 @@ class _Ctx:
         it = self.items.get(iid)
         if it is None or it.decision is not None:
             return []
-        return [l.ref for l in it.depends_on if l.kind == "item" and l.ref in self.items]
+        return [l.ref for l in it.depends_on if l.kind == "item" and l.ref is not None and l.ref in self.items]
 
     def _find_cycle(self, start: str) -> tuple[str, ...] | None:
         parent: dict[str, str | None] = {start: None}
@@ -746,7 +787,7 @@ def _expired_gates(item: Item, today: _date) -> list[Link]:
 
 
 def _chk_gate_expired(ctx: _Ctx, item: Item):
-    old = _expired_gates(item, ctx.now.date())
+    old = _expired_gates(item, ctx.now.date())          # ctx.now is UTC, so the date is the UTC date
     return (f"gate \"{old[0].words}\" past its recheck {old[0].recheck}", ()) if old else None
 
 
@@ -758,7 +799,7 @@ def _chk_conflict_closed_seat(ctx: _Ctx, item: Item):
     closed, seats = _trailer_close(ctx, item), ctx.idx.live_seats(item.id)
     if closed and seats:
         return (f"conflict: closed by {_short(closed.sha)} on main vs live seat {seats[0].name}"
-                f"{f' since {seats[0].since}' if seats[0].since else ''}", (closed.sha, seats[0].name))
+                f"{f' since {seats[0].since}' if seats[0].since else ''}", (closed.sha, seats[0].name))   # seats: by name
     return None
 
 
@@ -772,7 +813,7 @@ def _chk_conflict_closed_band(ctx: _Ctx, item: Item):
 def _chk_conflict_chain_orphan(ctx: _Ctx, item: Item):
     chain, orphans = ctx.idx.chain.get(item.id), ctx.idx.orphans(item.id)
     if chain and orphans:
-        b = orphans[0]
+        b = max(orphans, key=_branch_key)
         return (f"conflict: in chain {chain[0][0]} vs orphan branch {b.name} {_short(b.tip)} "
                 f"({b.ahead} commits the chain lacks)", (chain[0][0], b.name))
     return None
@@ -820,7 +861,7 @@ def _rule_needs_you(ctx: _Ctx, item: Item) -> State | None:
     rows = list(ctx.idx.band_naming.get(item.id, ()))
     if item.done_kind == "band" and item.done and item.done.strip() in ctx.ev.band_open:
         rows.append(item.done.strip())
-    rows = list(dict.fromkeys(rows))
+    rows = sorted(set(rows))
     return ctx.make(item, "needs_you", f"band {', '.join(rows)}", rows) if rows else None
 
 
@@ -844,11 +885,14 @@ def _rule_in_flight(ctx: _Ctx, item: Item) -> State | None:
 
 
 def _rule_landed_not_closed(ctx: _Ctx, item: Item) -> State | None:
-    # chain and seat evidence were ruled out by the rules above; a branch with commits of its own is not (rule 8)
+    # Chain and seat evidence were ruled out by the rules above; a branch with commits of its own is not (rule 8).
+    # There is NO test for a closing trailer here, on purpose: a ``merged`` item that a trailer closed was taken by rule 2,
+    # and for ``document``/``run``/``band`` the trailer is not what closes it (the file or the np row is), so commits
+    # on main that name it while its own evidence is absent are landed work nobody closed.
     touched = ctx.idx.touched.get(item.id)
-    if not touched or item.id in ctx.idx.closes or ctx.idx.orphans(item.id):
+    if not touched or ctx.idx.orphans(item.id):
         return None
-    last = max(touched, key=lambda c: _ts_key(c.date))
+    last = max(touched, key=_commit_key)
     return ctx.make(item, "landed_not_closed",
                     f"{len(touched)} commits on main, last {_short(last.sha)}; close it or name what remains",
                     [last.sha])
@@ -890,7 +934,7 @@ def _rule_ready_with_start(ctx: _Ctx, item: Item) -> State | None:
     orphans = ctx.idx.orphans(item.id)
     if not orphans:
         return None
-    b = max(orphans, key=lambda x: _ts_key(x.date))
+    b = max(orphans, key=_branch_key)
     return ctx.make(item, "ready_with_start",
                     f"orphan branch {b.name} {_short(b.tip)} ({b.date or 'no date'}), {b.ahead} own commits",
                     [b.name, b.tip])
@@ -932,6 +976,7 @@ def _compute(ctx: _Ctx, item: Item) -> State:
             continue
         found = check(ctx, item)
         if found:
+            ctx.causes[item.id] = name
             return ctx.make(item, "unknown", found[0], found[1])
     for _name, rule in _RULES:
         st = rule(ctx, item)
@@ -945,9 +990,9 @@ def derive_state(item: Item, evidence: Evidence, items: Mapping[str, Item], *, n
     return _Ctx({**items, item.id: item}, evidence, now, None).state_of(item.id)
 
 
-def _id_key(iid: str) -> tuple[str, int]:
+def _id_key(iid: str) -> tuple[str, int, str]:
     repo, _, n = iid.rpartition("#")
-    return repo, int(n) if n.isdigit() else 0
+    return repo, int(n) if n.isdigit() else 0, iid           # the id itself breaks a tie (levain#01 against levain#1)
 
 
 def _trailer_ids(ev: Evidence) -> dict[str, list[str]]:
@@ -973,29 +1018,33 @@ def _trailer_ids(ev: Evidence) -> dict[str, list[str]]:
 
 
 def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
-    """The whole board: every item's state, the audit list, and whatever could not be read."""
-    now = _aware(now)
+    """The whole board: every item's state, the audit list, and everything that could not be read. ``now`` must be
+    timezone-aware (a naive one is a TypeError). Every unreadable source is reported on the board itself, an audit
+    ``unknown`` entry and a problem line each, whether or not an item needed it: an empty store or a source no item
+    reads (the unattributed scan) is never a clean board. An item is listed in the audit once."""
+    now = _utc(now)
     ctx = _Ctx(folded.items, evidence, now, folded.torn_why or ("torn" if folded.torn else None))
     states = [ctx.state_of(i) for i in sorted(folded.items, key=_id_key)]
     audit: list[AuditEntry] = []
+    problems = list(folded.problems)
     if folded.torn:
         audit.append(AuditEntry("unknown", None, f"items file torn: {folded.torn_why}"))
+    for source in sorted(evidence.unreadable):
+        why = f"{source} unreadable: {evidence.unreadable[source]}"
+        audit.append(AuditEntry("unknown", None, why))
+        problems.append(why)
     for s in states:
         if s.state == "unknown":
-            audit.append(AuditEntry("unknown", s.id, s.reason))
+            kind = "gate_expired" if ctx.causes.get(s.id) == "gate_expired" else "unknown"
+            audit.append(AuditEntry(kind, s.id, s.reason))
         elif s.state == "landed_not_closed":
             audit.append(AuditEntry("landed_not_closed", s.id, s.reason))
-    for iid in sorted(folded.items, key=_id_key):
-        item = folded.items[iid]
-        if item.decision is None:
-            for g in _expired_gates(item, now.date()):
-                audit.append(AuditEntry("gate_expired", iid, f"gate \"{g.words}\" past its recheck {g.recheck}"))
-    for u in evidence.unattributed:
+    unattributed = tuple(sorted(evidence.unattributed, key=lambda u: (u.sha, u.subject)))
+    for u in unattributed:
         audit.append(AuditEntry("unattributed_work", None, f"{_short(u.sha)} {u.subject}".strip()))
     if not folded.torn:                 # with a torn store most ids would look unknown for a reason already reported
         for iid, where in sorted(_trailer_ids(evidence).items(), key=lambda kv: _id_key(kv[0])):
             if iid not in folded.items:
-                audit.append(AuditEntry("unknown_id_in_trailer", iid, f"named by {', '.join(dict.fromkeys(where))}; the store does not hold it"))
+                audit.append(AuditEntry("unknown_id_in_trailer", iid, f"named by {', '.join(sorted(set(where)))}; the store does not hold it"))
     audit.sort(key=lambda a: AUDIT_KINDS.index(a.kind))
-    return Board(SCHEMA, evidence.fetched_at, tuple(states), tuple(audit), evidence.unattributed,
-                 (*folded.problems, *evidence.problems))
+    return Board(SCHEMA, evidence.fetched_at, tuple(states), tuple(audit), unattributed, tuple(problems))

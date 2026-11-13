@@ -718,7 +718,7 @@
     },
     "branches": [
      {
-      "ahead": 2,
+      "ahead": 0,
       "date": "2026-11-11T09:00:00Z",
       "items": [
        "levain#41"
@@ -762,7 +762,7 @@
    "items_lines": [
     "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#41\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
    ],
-   "name": "no conflict: a branch whose tip is the chain tip is the chain's own",
+   "name": "no conflict: a branch with nothing of its own beyond the chain (ahead 0) is the chain's own",
    "now": "2026-11-12T20:00:00Z"
   },
   {
@@ -1159,10 +1159,6 @@
   },
   {
    "audit": [
-    [
-     "unknown",
-     "levain#62"
-    ],
     [
      "gate_expired",
      "levain#62"
