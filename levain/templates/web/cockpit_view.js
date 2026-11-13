@@ -217,6 +217,7 @@
       // the List's time-state, as the kernel computed it: the page draws these and derives none of them
       time_state: ["now", "later", "someday", "done"].indexOf(f.time_state) >= 0 ? f.time_state : null,
       wake_line: typeof f.wake_line === "string" && f.wake_line ? f.wake_line : null,
+      repeat_line: typeof f.repeat_line === "string" && f.repeat_line ? f.repeat_line : null,
       wake_bucket: ["tomorrow", "week", "later"].indexOf(f.wake_bucket) >= 0 ? f.wake_bucket : null,
       done_on: typeof f.done_on === "string" && f.done_on ? f.done_on : null,
       done_kind: typeof f.done_kind === "string" && f.done_kind ? f.done_kind : null,
