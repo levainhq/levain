@@ -102,6 +102,7 @@ _REVERT_MERGE = re.compile(r"^This reverts commit ([0-9a-f]{40}), reversing\s+ch
 _NONE = re.compile(r"none\b", re.I)
 _TOKEN = re.compile(r"(?:^|-)i([0-9]+)(?=-|$)")
 _SHA = re.compile(r"[0-9a-f]{40}")
+_BLOB_SIZE = re.compile(r"blob [0-9]+")                  # one `cat-file --batch-check=%(objecttype) %(objectsize)` reply for a note that can be read
 _deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar("board_evidence_deadline", default=None)
 
 
@@ -285,7 +286,10 @@ class _Notes(dict[str, str]):
                          ).splitlines()
             if len(sizes) != len(specs):
                 raise GitFailed("git cat-file gave a note size this reader cannot parse")
-            total = self.bytes + sum(int(line.split()[1]) for line in sizes if line.startswith("blob "))
+            for sha, line in zip(want, sizes):                   # THE one validation point: a wanted note is a blob, or the read fails
+                if not _BLOB_SIZE.fullmatch(line):
+                    raise GitFailed(f"the note for {sha} on {_NOTES_REF} is not a readable blob (git says {line!r})")
+            total = self.bytes + sum(int(line.split()[1]) for line in sizes)
             if total > MAX_NOTES_BYTES:
                 raise GitFailed(f"more than {MAX_NOTES_BYTES} bytes of notes on {_NOTES_REF} (MAX_NOTES_BYTES)")
             self.bytes = total
@@ -296,13 +300,10 @@ class _Notes(dict[str, str]):
             for sha in want:
                 end = data.index(b"\n", pos)
                 head = data[pos:end].split()
-                if len(head) == 2 and head[1] == b"missing":          # not a note (it cannot be read): no attribution, never a guess
-                    self[sha], pos = "", end + 1
-                    continue
                 if len(head) != 3:
                     raise GitFailed("git cat-file gave a note this reader cannot parse")
                 size = int(head[2])
-                self[sha] = data[end + 1:end + 1 + size].decode("utf-8", "replace") if head[1] == b"blob" else ""
+                self[sha] = data[end + 1:end + 1 + size].decode("utf-8", "replace")
                 pos = end + 1 + size + 1
         except (GitFailed, ValueError, IndexError) as exc:
             self.error = str(exc)
