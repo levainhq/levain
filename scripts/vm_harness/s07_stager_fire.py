@@ -546,7 +546,7 @@ def verdict_table(cfg: S07Config) -> list[tuple[str, str, str, str]]:
         ("G3", "the copied signed policy reads (13 patterns, gen 2)", rf"S07-POLICY never={e.never} hash={re.escape(e.policy_hash)}", r"^S07-POLICY "),
         ("J1", "the stager judges the test repo", rf"S07-JUDGE head={e.head} clean=yes manifest={e.manifest} objects={e.objects} "
                                                   rf"commit={e.commit} bundle=[0-9]+", r"^S07-JUDGE "),
-        ("F1", "render passes and the run starts (LAUNCH carries a session)", r"S07-LAUNCH launched=true session=s-\S+", r"^S07-LAUNCH "),
+        ("F1", "render passes and the run starts (LAUNCH carries a session)", r"S07-LAUNCH launched=true session=s-\S+(?: key=s-\S+)?", r"^S07-LAUNCH "),
         ("F2", "the server's run record", rf"S07-RECORD state=(?!refused\b)\S+ head={e.head} manifest_digest={sha} "
                                           rf"withhold_digest={sha} auth=passthrough", r"^S07-RECORD "),
         ("F3", "the staged bundle is the stager's", r"S07-BUNDLE size=([0-9]+) stager=\1", r"^S07-BUNDLE "),
