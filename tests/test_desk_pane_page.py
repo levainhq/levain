@@ -521,10 +521,19 @@ def _send(text, n):
     return [typed(text), CLICK_SEND, until(f"document.querySelectorAll('.dv-zone .dv-filed').length === {n}")]
 
 
+RELOAD = {"eval": "window.__pre = 1; location.reload(); 1"}
+BACK = [{"until": "!window.__pre && document.querySelector('.dv-zone') && document.querySelector('[data-phone-jump=desk]')"}, _TAP_DESK, _OPEN]
+STORED = {"eval": "JSON.stringify({stored: 1, threads: sessionStorage.getItem('levain.desk.threads'), sent: sessionStorage.getItem('levain.desk.sent')})"}
+
+
+def stored_reads(out) -> list[dict]:
+    return [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith('{"stored"')]
+
+
 @needs_browser
-def test_every_line_keeps_the_answers_of_its_own_thread_and_six_are_kept(tmp_path):
-    """DESK-E M1 and codex HIGH 1: line one's took and reply stay beside it after line two (a new thread), and past six threads
-    the oldest is dropped (its line stays drawn, its answers go)."""
+def test_every_line_keeps_the_answers_of_its_own_thread_even_at_the_seventh_line_and_after_a_reload(tmp_path):
+    """DESK-E M1 and codex HIGH 1: line one's took and reply stay beside it after line two (a new thread). DESK-F4 (M7): and still
+    after a seventh line and after a reload: a thread is kept as long as its line is in the log, not only the newest six."""
     took = lambda n: _ev("took", by="script", at=f"09:00:0{n}")   # noqa: E731
     by_thread = {f"t{n}": _fixture(f"t{n}", "c1", took(n), _ev("reply", f"reply {n}")) for n in range(1, 8)}
     with desk_page(tmp_path) as (stub, base):
@@ -535,17 +544,64 @@ def test_every_line_keeps_the_answers_of_its_own_thread_and_six_are_kept(tmp_pat
                  *_send("line 2", 2), until("document.body.innerText.indexOf('reply 2') >= 0"), SNAP,       # 0: two lines, two threads
                  *[s for n in range(3, 8) for s in _send(f"line {n}", n)],
                  until("document.body.innerText.indexOf('reply 7') >= 0"), SNAP,                              # 1: seven lines sent
-                 {"eval": "JSON.stringify({threads: sessionStorage.getItem('levain.desk.threads')})"}]
+                 STORED, RELOAD, *BACK, until("document.body.innerText.indexOf('reply 1') >= 0"), SNAP]       # 2: after a reload
         out = _drive(tmp_path, base + "/", steps)
-    two, seven = snaps(out)[:2]
+    two, seven, again = snaps(out)
     assert _heads(two) == ["line 1", "Desk took it at 09:00:01 (script)", "Desk · 09:00:00", "line 2", "Desk took it at 09:00:02 (script)", "Desk · 09:00:00"], two["lines"]
     assert [l["text"].split("\n")[1] for l in two["lines"] if "rv-room" in l["cls"]] == ["reply 1", "reply 2"], two["lines"]
-    # seven lines: every line stays drawn, only the last six threads keep (and draw) their answers
-    texts = [l["text"] for l in seven["lines"]]
-    assert [h for h in _heads(seven) if h.startswith("line ")] == [f"line {n}" for n in range(1, 8)], seven["lines"]
-    assert not any("reply 1" in t for t in texts) and all(any(f"reply {n}" in t for t in texts) for n in range(2, 8)), texts
-    stored = json.loads(json.loads(out["values"][-1])["threads"])
-    assert [t["id"] for t in stored] == [f"t{n}" for n in range(2, 8)], stored
+    for label, s in (("after the seventh line", seven), ("after a reload", again)):
+        texts = [l["text"] for l in s["lines"]]
+        assert [h for h in _heads(s) if h.startswith("line ")] == [f"line {n}" for n in range(1, 8)], (label, s["lines"])
+        assert all(any(f"reply {n}" in t for t in texts) for n in range(1, 8)), (label, texts)       # line one's reply too
+        assert sum(1 for h in _heads(s) if h.startswith("Desk took it")) == 7, (label, _heads(s))
+        assert _heads(s)[:3] == ["line 1", "Desk took it at 09:00:01 (script)", "Desk · 09:00:00"], (label, s["lines"])
+    stored = json.loads(stored_reads(out)[0]["threads"])
+    assert [t["id"] for t in stored] == [f"t{n}" for n in range(1, 8)], stored
+
+
+@needs_browser
+def test_thirty_one_lines_drop_the_oldest_line_and_its_thread_together(tmp_path):
+    """DESK-F4: the drawn cap is the log's own cap (30 lines). At the thirty-first line the oldest line and its thread (id, cursor,
+    held events) go together, in the page and in the store, and again after a reload; the second line keeps its answers."""
+    by_thread = {f"t{n}": _fixture(f"t{n}", "c1", _ev("took", by="script", at="09:00:00"), *([_ev("reply", f"reply {n}")] if n in (1, 2) else []))
+                 for n in range(1, 32)}
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread=by_thread,
+                                       script=[accepted(f"inbox-{n}", thread=f"t{n}") for n in range(1, 32)]),
+                 _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 *[s for n in range(1, 31) for s in _send(f"line {n}", n)],
+                 until("document.body.innerText.indexOf('reply 2') >= 0"), SNAP,                              # 0: thirty lines, line one still there
+                 typed("line 31"), CLICK_SEND, until("document.body.innerText.indexOf('Filed: inbox-31') >= 0"), STORED, SNAP,                                        # (thirty lines drawn: the thirty-first pushes the first out)
+                                                                         # 1: the thirty-first
+                 RELOAD, *BACK, until("document.body.innerText.indexOf('reply 2') >= 0"), STORED, SNAP]       # 2: after a reload
+        out = _drive(tmp_path, base + "/", steps)
+    thirty, thirty_one, again = snaps(out)
+    assert [h for h in _heads(thirty) if h.startswith("line ")][0] == "line 1" and "reply 1" in thirty["text"], _heads(thirty)[:4]
+    for label, s in (("at the thirty-first line", thirty_one), ("after a reload", again)):
+        lines = [h for h in _heads(s) if h.startswith("line ")]
+        assert lines == [f"line {n}" for n in range(2, 32)], (label, lines[:3], len(lines))
+        assert "reply 1" not in s["text"] and "reply 2" in s["text"], label                              # line one and its answers went together
+    reads = stored_reads(out)
+    assert len(reads) == 2, reads
+    for st in reads:
+        assert [t["id"] for t in json.loads(st["threads"])] == [f"t{n}" for n in range(2, 32)], st["threads"]
+        assert [x["thread"] for x in json.loads(st["sent"])] == [f"t{n}" for n in range(2, 32)], st["sent"]
+
+
+@needs_browser
+def test_the_events_stored_for_a_thread_are_bounded(tmp_path):
+    """DESK-F4: storage must not grow past what thirty lines can hold, so the events held (and stored) for one thread are the
+    newest fifty."""
+    many = [_ev("held", f"e{n}", by="script", at="09:00:00") for n in range(60)]
+    with desk_page(tmp_path) as (stub, base):
+        steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread={"t1": _fixture("t1", "c1", *many)},
+                                       script=[accepted("inbox-1", thread="t1")]),
+                 _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
+                 *_send("line 1", 1), until("document.querySelectorAll('.dv-zone .dv-held').length >= 1"), _held_for("d"), STORED,
+                 RELOAD, *BACK, until("document.querySelector('.dv-zone .rv-line')"), SNAP]
+        out = _drive(tmp_path, base + "/", steps)
+    (t,) = json.loads(stored_reads(out)[0]["threads"])
+    assert len(t["events"]) == 50 and t["events"][0]["text"] == "e10" and t["events"][-1]["text"] == "e59", [e["text"] for e in t["events"]]
 
 
 def _held_for(label):
@@ -596,25 +652,25 @@ def test_a_thread_the_desk_has_answered_is_not_requested_again_and_the_others_ar
 
 
 @needs_browser
-def test_seven_lines_keep_six_threads_and_every_unanswered_one_of_them_is_read_newest_first(tmp_path):
-    """DESK-F3: after seven sends the oldest thread is gone and is not read; of the six kept, the two the desk answered are
-    settled and the other four are read each tick, newest first."""
-    by_thread = {f"t{n}": _fixture(f"t{n}", "c1", _ev("took", by="script", at=f"09:00:0{n}"), *([_ev("reply", f"reply {n}")] if n in (3, 5) else []))
-                 for n in range(1, 8)}
+def test_eight_lines_only_the_unanswered_of_the_newest_six_threads_are_read_newest_first(tmp_path):
+    """DESK-F3 and DESK-F4: the polled cap is six and the drawn cap is the log's. After eight sends all eight threads stay kept, but
+    a tick reads only the unanswered ones among the newest six (t3..t8; t4 and t7 are answered), newest first, one at a time. The
+    two older threads are no longer read (a known edge: a reply to them is never drawn)."""
+    by_thread = {f"t{n}": _fixture(f"t{n}", "c1", _ev("took", by="script", at=f"09:00:0{n}"), *([_ev("reply", f"reply {n}")] if n in (4, 7) else []))
+                 for n in range(1, 9)}
     with desk_page(tmp_path) as (stub, base):
         steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread=by_thread,
-                                       script=[accepted(f"inbox-{n}", thread=f"t{n}") for n in range(1, 8)]),
+                                       script=[accepted(f"inbox-{n}", thread=f"t{n}") for n in range(1, 9)]),
                  _TAP_DESK, _OPEN, until("document.querySelector('.dv-lease-held')"),
-                 *[s for n in range(1, 8) for s in _send(f"line {n}", n)],
-                 until("document.querySelectorAll('.dv-zone .dv-took').length === 6"), _held_for("c"),
-                 {"eval": "JSON.stringify({threads: sessionStorage.getItem('levain.desk.threads')})"}]
+                 *[s for n in range(1, 9) for s in _send(f"line {n}", n)],
+                 until("document.querySelectorAll('.dv-zone .dv-took').length === 8"), _held_for("c"), STORED]
         out = _drive(tmp_path, base + "/", steps)
         asked = [g["thread"] for g in stub.gets if g["thread"]]
-    stored = json.loads(json.loads(out["values"][-1])["threads"])
-    assert [t["id"] for t in stored] == [f"t{n}" for n in range(2, 8)], stored
-    after7 = asked[asked.index("t7"):]
-    assert after7[:4] == ["t7", "t6", "t4", "t2"], after7              # the first read after the seventh send: newest first, t5 and t3 settled, t1 gone
-    assert set(after7) == {"t7", "t6", "t4", "t2"} and all(after7.count(t) >= 3 for t in set(after7)), after7
+    stored = json.loads(stored_reads(out)[0]["threads"])
+    assert [t["id"] for t in stored] == [f"t{n}" for n in range(1, 9)], stored
+    after8 = asked[asked.index("t8"):]
+    assert after8[:4] == ["t8", "t6", "t5", "t3"], after8              # newest first; t7 and t4 settled; t2 and t1 are older than the newest six
+    assert set(after8) == {"t8", "t6", "t5", "t3"} and all(after8.count(t) >= 3 for t in set(after8)), after8
 
 
 @needs_browser
