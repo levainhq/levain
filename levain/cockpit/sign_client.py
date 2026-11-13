@@ -187,6 +187,33 @@ def _dump(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(", ", ": "))
 
 
+def intake_headline(rec: Any) -> str | None:
+    """One plain line saying WHAT a signed ``list_intake`` record writes, read from the record's own effect (the ``changes`` of
+    its intention create), never from the unsigned journal. A reminder says it is a reminder with its minute and its repeat; a
+    drop and a talk say their own kind, so none reads as another (a plain sort line plants nothing and is never signed). None
+    for any other verb, or a record this does not read (the full record is printed below it regardless)."""
+    if not isinstance(rec, dict) or rec.get("verb") != "list_intake":
+        return None
+    effects = rec.get("effects")
+    first = effects[0] if isinstance(effects, list) and effects and isinstance(effects[0], dict) else None
+    ch = first.get("changes") if first else None
+    if isinstance(ch, dict) and ch.get("disposition") == "agenda" and isinstance(ch.get("next"), str):
+        try:
+            at = f"{datetime.strptime(ch['next'], '%Y-%m-%dT%H:%M'):%a %m-%d %H:%M}"
+        except ValueError:
+            return None
+        words = _dump(ch.get("text"))         # escaped like the record's own lines: a newline in the words stays on this line
+        if ch.get("target") == "desk":
+            return f"a SCHEDULED DROP to the desk: {words}, fires {at}"
+        if ch.get("target") not in ("nudge", "band"):
+            return None                       # not a shape the List box writes: the record below says what it is
+        repeat = f", then {ch['recur']}" if isinstance(ch.get("recur"), str) and ch["recur"] else ""
+        return f"a REMINDER for you: {words}, rings {at}{repeat} (as a {ch['target']})"
+    if isinstance(ch, dict) and ch.get("attention") == "talk":
+        return f"a TALK seed: {_dump(ch.get('text'))}"
+    return None
+
+
 def render(view: OpView, *, signer_fp: str, signer_class: str | None) -> list[str]:
     """The record ``sign`` will sign, rendered from the very bytes (``view.record_bytes``): every key of
     the decoded record, in its stored order, nothing dropped (a list of objects, like ``effects``, one key
@@ -194,8 +221,11 @@ def render(view: OpView, *, signer_fp: str, signer_class: str | None) -> list[st
     signed. The caller makes each line terminal-safe."""
     rec = json.loads(view.record_bytes)
     rec = rec if isinstance(rec, dict) else {"record": rec}
-    lines = [f"signing {view.pending_id}: {rec.get('verb')} ({rec.get('intent')}, {rec.get('tier')})",
-             "  signed record (the bytes signed):"]
+    lines = [f"signing {view.pending_id}: {rec.get('verb')} ({rec.get('intent')}, {rec.get('tier')})"]
+    headline = intake_headline(rec)
+    if headline is not None:
+        lines.append(f"  this signs {headline}  (read from the record below)")
+    lines.append("  signed record (the bytes signed):")
     for key, value in rec.items():
         if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
             for i, item in enumerate(value):
