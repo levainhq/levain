@@ -246,6 +246,8 @@
   // (window.LevainMD, from dashboard_core.js) a reply is drawn by it instead, with headings, lists, quotes and links (see
   // drawMarkdown), and these functions draw it only when the renderer is absent, throws or declines.
   var LONG_LINE = 20000;
+  // the bounds on a whole reply drawn by the markdown renderer: total characters and line count (a longer one is drawn plain)
+  var MAX_TOTAL = 200000, MAX_LINES = 4000;
   // the words the Start desk control hands the signing sheet (the relay reads the first word and an optional shape)
   var DESK_WORDS = "/fanin broad";
   function closeBold(s, from) {
@@ -312,17 +314,21 @@
   // The room's reply as markdown: headings, lists, quotes, code, links and emphasis drawn as elements by the cockpit's one
   // reviewed renderer, which sets every word with textContent, allow-lists link schemes and paints raw HTML as text. A body is
   // untrusted (the seat reads web pages), so nothing here may turn it into markup by any other route. Returns false, and draws
-  // nothing, when the page has no such renderer, when the document is not the renderer's own, when a line is past LONG_LINE (a
-  // conservative bound, kept so one pasted blob cannot make the page build a huge tree: the renderer takes 7 ms on a 20,000-
-  // character line) or when the renderer throws: the caller then draws the plain way.
+  // nothing, when the page has no such renderer, when the document is not the renderer's own, when the reply is past a size bound
+  // (a line past LONG_LINE, the whole text past MAX_TOTAL characters, or more than MAX_LINES lines: conservative bounds, kept so
+  // one pasted blob or a flood of short lines cannot make the page build a huge tree, and a streaming reply re-draw it on every
+  // update; the renderer takes 7 ms on a 20,000-character line), or when the renderer or the link filter throws: the caller then
+  // draws the plain way. The filter runs inside the same try, so an exception in it can only mean the plain draw, never a room
+  // that fails to render; nothing is appended to the node until both have finished.
   function drawMarkdown(doc, node, text) {
     var md = root.LevainMD;
     if (!md || typeof md.renderMarkdown !== "function" || doc !== root.document) return false;
+    if (text.length > MAX_TOTAL) return false;
     var lines = text.split("\n");
+    if (lines.length > MAX_LINES) return false;
     for (var i = 0; i < lines.length; i++) if (lines[i].length > LONG_LINE) return false;
     var frag;
-    try { frag = md.renderMarkdown(text); } catch (e) { return false; }
-    unwrapCockpitLinks(frag);
+    try { frag = md.renderMarkdown(text); unwrapCockpitLinks(frag); } catch (e) { return false; }
     node.appendChild(frag);
     node.className += " rv-md";
     return true;
@@ -331,13 +337,16 @@
   // `/sign/...` its signing pages: a link the seat wrote after reading a hostile page must not reach any of them. So only an
   // http(s) or mailto link survives, and never one that resolves to this page's own origin; the rest (a relative path, a
   // `//host`, a backslash form such as `\\host` or `/\host` that a browser reads as offsite, a fragment or a query) keeps its words
-  // and loses its anchor. The renderer itself is the byte-locked shared core, so the filter sits here, after it.
+  // and loses its anchor. It fails CLOSED: an http(s) anchor survives only when its origin is a string that differs from this
+  // page's, so an origin that is missing or not a string unwraps. The renderer itself is the byte-locked shared core, so the
+  // filter sits here, after it.
   function unwrapCockpitLinks(frag) {
-    var as = frag.querySelectorAll("a");
+    var as = frag.querySelectorAll("a"), here = root.location.origin;
     for (var i = 0; i < as.length; i++) {
       var a = as[i], h = (a.getAttribute("href") || "").replace(/^\s+|\s+$/g, "");
       var mail = /^mailto:/i.test(h), web = /^https?:/i.test(h);
-      if (!mail && !(web && a.origin !== root.location.origin)) {
+      var o = web ? a.origin : null;
+      if (!mail && !(web && typeof o === "string" && o !== here)) {
         while (a.firstChild) a.parentNode.insertBefore(a.firstChild, a);
         a.parentNode.removeChild(a);
       }
