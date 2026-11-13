@@ -808,7 +808,10 @@ INTAKE_VERB = "list_intake"
 # governed install; a REPORTED install fires a token's T2 as reported (``gesture_for``), as it does every intention_seed,
 # which is that install class's declared trade. A standing raise of intention_seed governs a drop and a talk too
 # (``verbs._intake_policy_also``). Pinned by the tests
-REMIND_TIER = "T2"          # OPEN, Phill's call (row 188 P2): T2 keeps the signature as the confirm step; a lighter tier is his to rule
+# OPEN, Phill's call (row 188 P2): T2 keeps the signature as the confirm step. A LIGHTER tier is NOT BUILT: changing this constant
+# alone does not work (a C1 reminder would route into verbs._intake_fire, which accepts only a `sort`, and the verb manifest keeps
+# list_intake's T2 floor), so going lighter needs a C1 creation path and a manifest that follows the table. The constant is kept.
+REMIND_TIER = "T2"
 REMIND_TARGET = "nudge"     # where a reminder rings (row 188 P1, a default and not a ruling): a nudge reaches his phone at its minute
 INTAKE_TIERS = {"drop": "T2", "talk": "T2", "remind": REMIND_TIER, "sort": "C1"}
 
@@ -894,6 +897,12 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
     disposition = str(pre.get("disposition") or "").strip().casefold()
     if disposition not in ("someday", "seed", "agenda"):
         raise ValueError("a target steers a seed or an agenda; this intention is neither")
+    from levain.recur import RECURRING_TARGETS, rule_of
+    rule = rule_of(pre)
+    if rule is not None and target not in RECURRING_TARGETS:
+        # a desk or board drop is delivered once and the intention composts, which would end the series without a clear
+        raise ValueError(f"this reminder repeats {rule}: a repeating reminder rings as {' or '.join(RECURRING_TARGETS)}; "
+                         "clear it first to hand it to the desk or a board")
     stamp = pre.get("germinated")
     if stamp:
         # germinate never reads a stamped agenda's target again: a new one would change the record and nothing else

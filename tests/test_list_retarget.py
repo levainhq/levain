@@ -528,3 +528,17 @@ def test_snapshot_and_waiting_on_answer_the_same_read_faults(intentions: Path, m
     monkeypatch.setattr(store._store, "get_by_origin_key", boom)
     with pytest.raises(TransientApplyFault):
         store.snapshot("intention:k.a")
+
+
+def test_a_repeating_reminder_is_never_handed_to_a_machine_target() -> None:
+    """Row 188 L3 r1 MED: retarget kept `recur` but took `desk`/`board:<repo>`, and germination delivers ONE drop and composts the
+    intention, so every later occurrence vanished. The refusal says why; band and nudge still retarget, and a one-off still goes."""
+    ver = lambda row: "v"                                      # noqa: E731
+    rep = {"id": "intention-1", "origin_key": "k", "status": "open", "disposition": "agenda", "text": "t", "type": "task",
+           "next": "2031-02-03T09:00", "target": "nudge", "recur": "weekly SUN 21:00", "recur_anchor": "2031-02-03T09:00"}
+    for machine in ("desk", "board:levain"):
+        with pytest.raises(ValueError, match="repeats weekly SUN 21:00"):
+            canonical_effect("intention_retarget", {"target": machine}, rep, version_of=ver)
+    assert canonical_effect("intention_retarget", {"target": "band"}, rep, version_of=ver).changes["target"] == "band"
+    once = {k: v for k, v in rep.items() if k not in ("recur", "recur_anchor")}
+    assert canonical_effect("intention_retarget", {"target": "desk"}, once, version_of=ver).changes["target"] == "desk"
