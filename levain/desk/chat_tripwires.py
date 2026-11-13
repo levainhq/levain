@@ -353,6 +353,11 @@ class TripwireWindow:
     def _deficit(self, tool: str) -> Trip | None:
         if self.ctx is None:
             return Trip("deficit", "no tripwire context for this launch: the expected PreToolUse count is unknown")
+        if self.ctx.open_tools is True:
+            # a host room names no tool, so it owes no PreToolUse count (under bypass none reaches the stream): a shape
+            # :meth:`_ruled` did not skip falls to the decision branches, which latch it under its own name
+            # (accepted_without_host, unexpected_rule, unexpected_hook), not as a "count unknown" deficit (L3 deploy r1)
+            return None
         try:
             per_call = self.ctx.expected_pre_hooks(tool)
         except Exception as exc:  # noqa: BLE001 - an unknown count never reads as enough

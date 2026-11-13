@@ -90,8 +90,9 @@ LATCHING = [
 
 @pytest.mark.parametrize("decision", LATCHING)
 def test_open_tools_still_latches_every_other_shape(decision):
+    """Latched under the decision's own branch (ROOMFIX4): an open room owes no PreToolUse count, so not ``deficit``."""
     trip = _call_and_result(TripwireWindow(_ctx(open_tools=True)), "Bash", decision)
-    assert trip is not None and trip.name == "deficit"
+    assert trip is not None and trip.name in ("accepted_without_host", "unexpected_rule")
 
 
 @pytest.mark.parametrize("flag", [False, 1, "yes", None])

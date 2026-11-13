@@ -11,6 +11,10 @@ bytes is :meth:`HookSpec.check` hashing a PINNED script (``HookSpec.sha256``). A
 whoever launches the room, once per launch, and the copy's bytes hashed into the containment digest (and, for a pinned
 script, compared with the pin), so what ran is what was recorded.
 
+The spend dials ``turn_budget_usd`` and ``recycle_at_usd`` are accepted and validated here, but the spend RECYCLE they
+describe (replace a child between turns once it has spent ``recycle_at_usd``) is NOT BUILT (item P2): no launcher reads
+a launch's spend yet, so the vendor's cumulative cap can still be reached mid-turn (:class:`RoomProfile`).
+
 Pure helpers. Stdlib only.
 """
 from __future__ import annotations
@@ -119,7 +123,10 @@ class RoomProfile:
     reach, and any other mode would stop on a prompt nobody answers). ``setting_sources``: which vendor config
     chains the child reads; the confined profile reads ``user`` only. ``turn_budget_usd`` and ``recycle_at_usd``: the
     vendor's budget flag is cumulative per PROCESS, so the argv carries their sum; ``recycle_at_usd`` is the spend at
-    which a child is meant to be replaced between turns, so a long conversation never reaches the cap mid-turn.
+    which a child is MEANT to be replaced between turns, so a long conversation never reaches the cap mid-turn. THAT
+    RECYCLE IS NOT BUILT (item P2): both fields are accepted, validated, put in the argv and recorded in the digest,
+    but nothing yet reads a launch's spend or replaces its child at ``recycle_at_usd`` (the launcher recycles an idle
+    child only), so a long conversation CAN reach the cap mid-turn today.
     ``required_tools``: the open probe's FLOOR (the vendor's default set drifts by CLI version; a profile that is
     silently not the expected one lacks one of these)."""
     name: str = "host"
@@ -191,8 +198,10 @@ def host_settings_json(profile: RoomProfile, commands: Sequence[str]) -> str:
     for spec, command in zip(profile.hooks, commands):
         if not isinstance(command, str) or not command.strip() or _has_control(command):
             raise ValueError("a hook command must be a non-empty single-line string")
+        # onFailure "block": a hook that cannot start, times out or exits other than 0/2 BLOCKS the call (the vendor's
+        # default is to let it run; hooks reference, "Block the action when a hook fails", Claude Code v2.1.295+)
         entries.append({"matcher": spec.matcher, "hooks": [
-            {"type": "command", "command": command, "timeout": spec.timeout}]})
+            {"type": "command", "command": command, "timeout": spec.timeout, "onFailure": "block"}]})
     doc: dict[str, Any] = {"hooks": {"PreToolUse": entries}} if entries else {}
     return json.dumps(doc, sort_keys=True)
 
@@ -223,6 +232,7 @@ def host_policy(profile: RoomProfile, *, settings_json: str, hook_sha256: Sequen
         "max_turns": profile.max_turns,
         "max_budget_usd": profile.max_budget_usd,
         "recycle_at_usd": profile.recycle_at_usd,
+        "required_tools": list(profile.required_tools),   # the open probe's floor: another floor is another policy
         "strict_mcp": True,
         "door": list(door),
     }

@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import test_room_host_launch as H  # noqa: E402 - the host-launch rig (fake claude child, store, launcher)
 
 # The guard's sha256 as this release pins it. A re-sync from flowConnect changes it here AND in room_default, on purpose.
-PINNED_GUARD_SHA256 = "f74b43b35d1458449b665db94415c41035f37fb93e1eb2b22595d267a66b680e"
+PINNED_GUARD_SHA256 = "58aac7f3845409af089a7047fef9f2af6692c9a2ad0a5a819f2f6abdb84c1f03"
 GUARD_MATCHER = "Bash|Agent|Task|CronCreate|Monitor|ScheduleWakeup|Workflow"
 
 
@@ -399,7 +399,7 @@ def test_levain_serve_room_builds_the_host_default_and_room_confined_builds_the_
 
 def test_room_confined_without_a_room_is_refused(tmp_path, monkeypatch, capsys):
     rc, asked = _run_serve(tmp_path, monkeypatch, room_confined=True)
-    assert rc == 2 and asked == []
+    assert rc == 1 and asked == []                         # 1, as every other --room refusal (ROOMFIX4)
     assert "--room-confined" in capsys.readouterr().err
 
 

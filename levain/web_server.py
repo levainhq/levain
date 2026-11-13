@@ -6516,7 +6516,7 @@ def run_web_server(
     if room_confined and room is None:
         print("refusing --room-confined: it picks the no-shell room for --room DIR; pass --room DIR with it",
               file=sys.stderr)
-        return 2
+        return 1                                    # as every other --room refusal below
     if room is not None:
         # the cockpit's one Claude room (RM-G2): opt-in, because the room's child works in the operator's tree. Its
         # default is the host profile (np-97fa3dd6 (a)); --room-confined is the no-shell room
@@ -6528,7 +6528,7 @@ def run_web_server(
             from levain.desk.room_default import CONFINED
 
             room_serve = _build_room_serve(room, profile=CONFINED if room_confined else None)
-        except (ValueError, OSError, RuntimeError) as exc:
+        except (ValueError, OSError, RuntimeError, ImportError) as exc:   # ImportError: a broken room module
             print(f"refusing --room: {exc}", file=sys.stderr)
             return 1
         except Exception as exc:    # noqa: BLE001 - a CoordError (a store that will not open, a launcher that refuses its setting)
