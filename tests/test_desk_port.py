@@ -103,6 +103,28 @@ def test_the_outbox_id_shape_is_the_rooms_own():
     assert desk_port._OUTBOX_ID.pattern == chat._OUTBOX_ID.pattern
 
 
+def test_the_origin_name_limit_is_the_turn_leases_own():
+    """A credential name the lease accepts as an owner is one the port accepts as an origin (a valid 65-128 character
+    name once passed ``check_owner`` and 400'd every send); both refuse one past the lease's limit."""
+    from levain.desk import chat_lease
+    for surface in ("cockpit", "phone"):
+        for n in (1, 64, 65, 128):
+            owner = f"{surface}:" + "a" * n
+            assert chat_lease.check_owner(owner) == owner
+            desk_port._check_ids(oid(), owner)
+        too_long = f"{surface}:" + "a" * 129
+        with pytest.raises(chat_lease.TurnRefused):
+            chat_lease.check_owner(too_long)
+        with pytest.raises(DeskPortError):
+            desk_port._check_ids(oid(), too_long)
+    assert desk_port._ORIGIN.pattern.endswith(chat_lease._CLIENT_ID)
+
+
+def test_a_port_with_no_post_command_says_it_cannot_post(rig):
+    assert HostCommandDeskPort(DeskCommands(lease=rig.cmds.lease), rig.claims).can_post is False
+    assert rig.port().can_post is True
+
+
 def test_the_enum_fields_refuse_a_value_outside_their_set():
     for build in (lambda: LeaseView("maybe"), lambda: PostResult("sent"), lambda: DeskEvent("flow", "took", "x", "t"),
                   lambda: DeskEvent("script", "read", "x", "t"), lambda: Delivery("ok"), lambda: Armed("yes"),

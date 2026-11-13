@@ -301,6 +301,20 @@ def test_words_over_the_cap_are_refused_whole_with_a_422_never_cut(tmp_path, qdi
     assert [p.words for p in port.posts] == ["y" * 20]
 
 
+@pytest.mark.parametrize("bad, said", [("\x00", "character that cannot be sent"), ("\ud800", "cannot be sent as UTF-8")])
+def test_an_over_cap_line_with_an_unsendable_character_is_a_400_for_the_character_not_a_422(tmp_path, qdir, bad, said):  # noqa: F811
+    """The page draws a 422 as "over the limit": a line that is also over the cap but holds a NUL or a lone surrogate is
+    refused for the character first (its own message), and a plain over-cap line is still the 422."""
+    port = ScriptedDeskPort(caps=DeskCaps("scripted", "event", True, True, True, 20))
+    with _serve(tmp_path, port) as base:
+        status, body = send(base, "x" * 21 + bad, oid(1))
+        assert status == 400 and body["error"] == "bad_request" and said in body["message"], body
+        assert "words_max" not in body
+        status, body = send(base, "x" * 21, oid(2))
+        assert status == 422 and body["error"] == "words_over_cap" and body["words_max"] == 20, body
+    assert port.posts == []
+
+
 @pytest.mark.parametrize("body", [
     [], "words", 7, False,
     {}, {"outbox_id": "desk-outbox-0001"}, {"words": "hi"},
@@ -427,12 +441,77 @@ def test_a_restart_keeps_the_claim_so_a_retry_is_never_a_second_filing(tmp_path,
     assert len([r for r in host.runs() if r["argv"][0] == "post"]) == 1
 
 
-def test_a_port_with_no_post_command_files_nothing_and_says_so(tmp_path, qdir, host):  # noqa: F811
-    port = HostCommandDeskPort(DeskCommands(lease=host.cmds.lease), host.claims)
+def test_a_port_with_no_post_command_is_not_wired_on_the_read_and_a_404_on_the_send(tmp_path, qdir, host):  # noqa: F811
+    """``LEVAIN_DESK_PORT_COMMANDS`` with a lease or events command and no post mounted a port that read ``wired: true``
+    (so the page enabled Send) and then refused every line. A desk that cannot be posted to is not wired."""
+    port = HostCommandDeskPort(DeskCommands(lease=host.cmds.lease, events=host.cmds.events), host.claims)
     with _serve(tmp_path, port) as base:
+        assert _get(base, f"{READ}?thread={THREAD}") == (200, {"wired": False})
         status, body = send(base)
-    assert status == 200 and body["outcome"] == "not_delivered" and "no desk wired" in body["reason"], body
-    assert host.runs() == [] or all(r["argv"][0] != "post" for r in host.runs())
+        assert status == 404 and body["error"] == "not_found", body
+    assert host.runs() == []                 # neither route asked the host anything
+    # the port itself still refuses a direct post in its own words (the door is never opened without a command)
+    assert port.post("hi", outbox_id=oid(), origin="cockpit:browser").outcome == "not_delivered"
+
+
+def test_a_port_with_a_post_command_is_still_wired(tmp_path, qdir, host):  # noqa: F811
+    with _serve(tmp_path, HostCommandDeskPort(DeskCommands(post=host.cmds.post), host.claims)) as base:
+        status, body = _get(base, READ)
+        assert status == 200 and body["wired"] is True, body
+        assert send(base)[1]["outcome"] == "accepted"
+
+
+def test_a_port_whose_capabilities_raise_answers_json_never_a_dropped_connection(tmp_path, qdir):  # noqa: F811
+    class Flaky(ScriptedDeskPort):
+        broken = True
+
+        def capabilities(self):
+            if self.broken:
+                raise RuntimeError("the caps are gone")
+            return super().capabilities()
+
+    port = Flaky()
+    with _serve(tmp_path, port) as base:
+        status, got = _get(base, f"{READ}?thread={THREAD}")
+        assert status == 200 and got["wired"] is True and got["readable"] is False, got
+        assert got["events"] == [] and got["cursor"] is None and got["caps"] == {}, got
+        assert got["lease"]["state"] == "unknown", got
+        status, got = send(base)                       # the send asks the caps too: a structured answer, nothing filed
+        assert status == 500 and got["error"] == "send_failed" and port.posts == [], got
+        port.broken = False
+        assert _get(base, READ)[1]["caps"]["adapter"] == "scripted"        # the next poll is whole again
+        assert send(base, "again", oid(2))[0] == 200
+
+
+def test_a_fresh_home_with_no_consent_directory_gets_one_the_dispatch_store_accepts(tmp_path, monkeypatch, host):
+    """``mkdir(parents=True, mode=0o700)`` binds the mode only to the leaf, so the missing ``consent`` parent of the
+    claims directory came out at the umask (755) and the dispatch store refused it: every panel read "Could not read"."""
+    from levain.dispatch.jobs import JobStore
+    home = tmp_path / "fresh-lh"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    old = os.umask(0o022)
+    try:
+        port = _build_desk_serve({**os.environ, DESKCMD_ENV: host.cmds.to_json()})
+        consent = home / "consent"
+        assert port is not None and (consent / desk_tab.CLAIMS_DIR / desk_tab.CLAIMS_NAME).is_file()
+        assert (consent.stat().st_mode & 0o777) == 0o700, oct(consent.stat().st_mode)
+        assert JobStore(consent).list() == []            # the real store opens it (it raised JobStoreError at 755)
+    finally:
+        os.umask(old)
+
+
+def test_an_existing_consent_directory_is_never_changed(tmp_path, monkeypatch, host):
+    """A directory that is already there is the operator's: a 0755 one stays 0755 (the store then refuses it, loudly)
+    and a 0700 one is untouched."""
+    for mode in (0o755, 0o700):
+        home = tmp_path / f"lh-{mode:o}"
+        consent = home / "consent"
+        consent.mkdir(parents=True)
+        consent.chmod(mode)
+        monkeypatch.setenv("LEVAIN_HOME", str(home))
+        _build_desk_serve({**os.environ, DESKCMD_ENV: host.cmds.to_json()})
+        assert (consent.stat().st_mode & 0o777) == mode
 
 
 # --- where the port comes from -------------------------------------------------------------------------------------------
