@@ -264,8 +264,9 @@ class RoomServe:
         so it never blocks; it never raises."""
         host = getattr(self._setting, "host", None)
         profile = getattr(self._setting, "profile", None)
-        # "profile": the host profile's name, or None for the confined room (a host that fell back to the confined room
-        # shows here, to the desk's check and to the live verification)
+        # "profile": the host profile's name, or None for the confined room, so the desk's check and the live
+        # verification can see which room this serve opens (there is no fallback between the two: _build_room_serve
+        # refuses rather than open the other one)
         return {"last_error": self.last_error, "running": self._started and not self._stopped,
                 "drops_via": "desk" if host is not None and host.relays else "card",
                 "profile": None if profile is None else profile.name}
