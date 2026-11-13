@@ -8,6 +8,8 @@ around that call, and nothing else:
 
 - the snapshot: a missing or unverifiable one makes no answer authority.
 - the row: its stored request must be the seal of its fields, and its hold must not have ended.
+- the display: a request whose input is not shown whole (:func:`unshown`) takes no answer, as every signing surface
+  refuses to sign one.
 - namespaces: a snapshot signer lists the namespaces it may sign in; one that may not sign in
   ``levain-consent-answer`` is refused here, before the shared check (which has no such step).
 
@@ -34,11 +36,11 @@ from typing import Any
 
 from levain.cockpit.consent import ConsentError, utc_stamp
 from levain.consent import queue as consent_queue
-from levain.consent.record import ANSWER_NAMESPACE, GRANT_ANSWER_FORMAT, ExternalGateRequest
+from levain.consent.record import ANSWER_NAMESPACE, GRANT_ANSWER_FORMAT, ExternalGateRequest, unshown_why
 from levain.qbroker.signers import SignersSnapshot
 from levain.qbroker.store import GRANT_ROW_FORMAT
 
-__all__ = ["GRANT_ROW_KEYS", "answer_refusal", "grant_allow_refusal", "request_of"]
+__all__ = ["GRANT_ROW_KEYS", "answer_refusal", "grant_allow_refusal", "request_of", "unshown"]
 
 GRANT_ROW_KEYS = frozenset({"format", "request_id", "contract_digest", "paths", "signer_fp", "at"})
 # formats that are some other authority's: never read as a queue answer
@@ -58,6 +60,16 @@ def request_of(fields: Any) -> ExternalGateRequest | None:
         return None
 
 
+def unshown(request: ExternalGateRequest) -> str | None:
+    """Why no answer to ``request`` is authority because its input is not shown whole (over the slot path's display
+    bound, or filed under the old cut: :func:`levain.consent.record.unshown_why`, the reason every signing surface
+    gives), else None. A signer cannot have read what such an answer would cover, so the broker neither mints, writes
+    nor delivers one, whatever its decision; its hold ends unanswered."""
+    why = unshown_why(request.tool_name, request.display)
+    return None if why is None else (f"request {request.id}: {why}, so no answer to it is signed or delivered by the "
+                                     "broker; its hold ends unanswered")
+
+
 def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers: SignersSnapshot | None,
                    now: datetime, *, ssh_keygen: Path | str | None = None) -> str | None:
     """Why ``payload``/``signature`` is not authority for the request ``row`` holds; ``None`` when it is. The hold is
@@ -71,6 +83,9 @@ def answer_refusal(row: Mapping[str, Any], payload: Any, signature: Any, signers
         return "the request row's seal does not match its fields"
     if isinstance(payload, Mapping) and payload.get("format") in _NOT_ANSWERS:
         return f"a {payload.get('format')} record is not a queue answer"
+    why = unshown(request)
+    if why is not None:
+        return why
     if isinstance(payload, Mapping):
         payload = dict(payload)         # one copy: the namespace check and the shared check read the same record
         signer = signers.key(payload.get("signer_fp"))

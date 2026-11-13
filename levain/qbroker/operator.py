@@ -14,7 +14,8 @@ them) and writes only ``answers/<request_id>.json``:
   run's signed contract reads ``allowed`` from its grant's own receipt (head ruling 1020+49): settled, never offered
   as a question, and refused by :func:`answer_payload` and :func:`write_answer` like any settled request.
 - :func:`answer_payload`: the record to sign, over the broker's current receipts head (never one of size 0), for a
-  ``pending`` request only.
+  ``pending`` request whose input is shown whole only (:func:`levain.qbroker.seam.unshown`; the write and the
+  broker's delivery refuse the same request through the seam).
 - :func:`write_answer`: the signed answer row, for a ``pending`` request only, checked first with
   :func:`levain.qbroker.seam.answer_refusal` and the head against the receipts as they stand (reaching the request's
   filing receipt), then linked no-replace, mode 0640: an answer that fails any check is never written, since nothing
@@ -48,7 +49,7 @@ from levain.contracts.canon import canonical_bytes, parse
 from levain.qbroker.broker import (ALARM_FORMAT, RUN_CALLS_KIND, RUN_DEADLINE_KIND, RUN_STATE_FORMAT, _calls_ok,
                                    _deadline_ok, answer_row_refusal, run_state_path, stored_request)
 from levain.qbroker.receipts import Receipts, ReceiptsError
-from levain.qbroker.seam import answer_refusal
+from levain.qbroker.seam import answer_refusal, unshown
 from levain.qbroker.signers import SignersSnapshot
 from levain.qbroker.store import (ALARM_LOG, ALARM_LOG_MAX, ANSWER_ROW_FORMAT, ROW_MAX, QueueStore, _parsed,
                                   _read_untrusted, fsync_dir,
@@ -212,6 +213,9 @@ def answer_payload(root: Path | str, request_id: str, decision: str, signer_fp: 
     _, request = _request(store, request_id)
     stamp = utc_stamp(_now(now))
     _pending(receipts, request, stamp)
+    why = unshown(request)            # what a signer cannot have read, no record is offered to sign
+    if why is not None:
+        raise OperatorError(why)
     try:
         head = receipts.head()
     except ReceiptsError as exc:

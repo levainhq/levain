@@ -7279,33 +7279,31 @@
   function consentRequest(display, tool) {
     let t = String(display || "");
     const head = tool && t.replace(/^\s+/, "").startsWith(tool) ? t.replace(/^\s+/, "").slice(tool.length) : t;
-    // row 1704: the input is the whole of it however long; a long value is its head and tail with the whole one tap away
+    // row 1704: the input is the whole of it however long. Past the long mark IN ALL (its whole display, so many short values
+    // count as one long input) it is one block, head and tail with the whole one tap away, which the card's Allow is gated on
+    // (drawConsentCard); under it, the key/value list as before
     const F = window.LevainCardFormat;
-    const long = F && typeof F.longText === "function";
+    if (F && typeof F.longText === "function" && Array.from(t).length > F.LONG_AT) return F.longText(t, "consent-display");
     try {
       const o = JSON.parse(head.trim());
       if (o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).length) {
         const dl = el("dl", "consent-kv");
         for (const [k, v] of Object.entries(o)) {
           dl.appendChild(el("dt", null, k));
-          const s = typeof v === "string" ? v : JSON.stringify(v);
-          const big = long && Array.from(s).length > F.LONG_AT;
-          const dd = el("dd", null, big ? null : s);
-          if (big) dd.appendChild(F.longText(s, "consent-kv-long"));
-          dl.appendChild(dd);
+          dl.appendChild(el("dd", null, typeof v === "string" ? v : JSON.stringify(v)));
         }
         return dl;
       }
     } catch (e) { /* not a JSON payload: the text below */ }
-    return long ? F.longText(t, "consent-display") : el("pre", "consent-display", t);
+    return el("pre", "consent-display", t);
   }
   function drawConsentCard(card, slot, b) {
     const sv = (x) => (typeof x === "string" ? x : "");
     if (b.error) { slot.replaceChildren(el("div", "consent-note ext-meta", b.error)); return; }
     const label = (t) => el("div", "needs-sec-label", t);
     const egress = egressParts(b);
-    const parts = egress ? [label("Request"), egress.state, egress.rows]
-      : [label("Request"), consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool)];
+    const shown = egress ? null : consentRequest(sv(b.display), card._needsItem && card._needsItem.c.tool);
+    const parts = egress ? [label("Request"), egress.state, egress.rows] : [label("Request"), shown];
     parts.push(label("Where"));
     const facts = el("div", "consent-facts");
     // the server's home shortens a path under it to ~/..., the full path stays as the title (never the browser's home)
@@ -7324,6 +7322,11 @@
     // terminal line and never opens a sheet that offers only Deny). The terminal commands stay under the card's details.
     const acts = el("div", "needs-actions");
     const cmds = [];
+    // a long input gates Allow here as on the sign sheet (row 1704 fix 1): disabled until the whole input has been opened
+    // and scrolled to its end, the count of what is not yet shown beside the buttons; Deny is never gated
+    const CF = window.LevainCardFormat;
+    const gate = shown && CF && typeof CF.seenGate === "function" ? CF.seenGate(shown) : null;
+    let allowBtn = null;
     const cid = card._needsItem && card._needsItem.c ? card._needsItem.c.id : "";
     const choices = b.sheet === true && typeof cid === "string" && cid && Array.isArray(b.sheet_choices)
       ? b.sheet_choices.filter((k) => k === "allow" || k === "deny") : [];
@@ -7333,14 +7336,16 @@
       btn.type = "button";
       btn.dataset.label = label;
       const code = el("code", "consent-code", cmd);
+      const shut = () => gate && label === "Allow" && !gate.seen();
       if (choices.includes(label.toLowerCase())) {
         btn.title = label.toLowerCase() + " with your passkey, in the sign sheet";
         btn.dataset.consentSheet = label.toLowerCase();
-        btn.addEventListener("click", () => openConsentSheet(cid, sv(b.sheet_v), label.toLowerCase()));
+        btn.addEventListener("click", () => { if (!shut()) openConsentSheet(cid, sv(b.sheet_v), label.toLowerCase()); });
       } else {
         btn.title = "copy the " + label.toLowerCase() + " command for a terminal; this page signs nothing, sign on your phone with Face ID";
-        btn.addEventListener("click", () => copyText(cmd, code, btn));
+        btn.addEventListener("click", () => { if (!shut()) copyText(cmd, code, btn); });
       }
+      if (label === "Allow") allowBtn = btn;
       acts.appendChild(btn);
       const line = el("div", "consent-cmd");
       line.appendChild(code);
@@ -7352,6 +7357,14 @@
     slot.replaceChildren(...parts);
     // the actions and the one-line footer are the card's own rows, pinned below the body so cards in a row end alike
     if (acts.childElementCount) card.appendChild(acts);
+    if (gate && allowBtn) {
+      const line = el("div", "ext-meta needs-unseen");
+      line.setAttribute("role", "status");
+      const show = () => { line.textContent = gate.line(); line.dataset.seen = gate.seen() ? "1" : "0"; allowBtn.disabled = !gate.seen(); };
+      gate.on(show);
+      show();
+      card.appendChild(line);
+    }
     const here = choices.length === 2 ? "signs with your passkey here"
       : choices.length ? choices[0] + " signs with your passkey here" : "signs on your phone";
     card.appendChild(needsDetails(more, here));

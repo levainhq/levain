@@ -26,7 +26,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from levain.cockpit.consent import parse_stamp, utc_stamp
-from levain.consent.record import ExternalGateRequest
+from levain.consent.record import UNSHOWN, ExternalGateRequest, read_back
+from levain.consent.record import unshown_why as _unshown_why
 
 __all__ = ["ConsentEntry", "ConsentListing", "HISTORY", "KeyEvidence", "PENDING_CAP", "RECENT", "RECENT_CAP",
            "UNSHOWN", "audit_line", "consent_targets", "entry_body", "filed_input", "find_entry", "read_evidence",
@@ -37,7 +38,6 @@ RECENT = timedelta(hours=24)        # how long a terminal request stays in the l
 RECENT_CAP = 50
 HISTORY = timedelta(days=14)        # how far back the standing-rule proposals read decided requests
 PENDING_CAP = 200                   # pending rows read per listing; past it, flagged, never drawn
-UNSHOWN = object()
 # the note on a pending request that is not answerable here, after unshown_why's clause
 TOO_LONG = "not answered from the terminal or the phone: answer in the agent's own dialog"
 
@@ -47,32 +47,16 @@ _ACCESS_BY_OTHERS = 0o077
 
 
 def filed_input(request: object) -> object:
-    """The tool input as filed, parsed back from the request's sealed display (``<tool_name> <json>``, secret-
-    named keys masked); :data:`UNSHOWN` when the display is not that whole: an over-bound display
-    (``record.OVER_BOUND``'s words) is no JSON, and a display filed under the old cut never parses (the cut left the
-    JSON unterminated, or trailed by the ellipsis)."""
-    prefix = f"{request.tool_name} "
-    if not request.display.startswith(prefix):
-        return UNSHOWN
-    try:
-        return json.loads(request.display[len(prefix):])
-    except (ValueError, RecursionError):            # a display nested too deep to read back is not shown either
-        return UNSHOWN
+    """The tool input as filed, parsed back from the request's sealed display (``record.read_back``, the one reader
+    the broker's answer path shares); :data:`UNSHOWN` when the display is not that whole."""
+    return read_back(request.tool_name, request.display)
 
 
 def unshown_why(request: object) -> str | None:
     """Why ``request``'s input is not shown whole (a clause: "its input is 300000 bytes, over ..."), or None when it
-    is (:func:`filed_input` reads it back). Every signing surface refuses an UNSHOWN request in these words."""
-    from levain.consent.record import LEGACY_DISPLAY_CUT, over_bound
-
-    if filed_input(request) is not UNSHOWN:
-        return None
-    over = over_bound(request.tool_name, request.display)
-    if over is not None:
-        return (f"its input is {over[0]} bytes, over the {over[1]}-byte bound a signer is shown whole, so it is not "
-                "shown")
-    return (f"it was filed under the old display cut (its input was kept only to {LEGACY_DISPLAY_CUT} characters), "
-            "so its whole input is not shown")
+    is (:func:`filed_input` reads it back): ``record.unshown_why``. Every signing surface refuses an UNSHOWN request
+    in these words, then says what follows."""
+    return _unshown_why(request.tool_name, request.display)
 
 
 def consent_targets(request: object) -> str:
@@ -208,6 +192,7 @@ def entry_body(entry: ConsentEntry, settled_lookup: Callable[[str, str], tuple[A
     pending = entry.state == "pending"
     shown = filed_input(r)
     answerable = pending and shown is not UNSHOWN
+    why = unshown_why(r)
     from levain.cockpit.hintview import hints_for, visible     # rendering only: what a shell command looks like (Q16)
 
     try:
@@ -220,7 +205,7 @@ def entry_body(entry: ConsentEntry, settled_lookup: Callable[[str, str], tuple[A
             "targets": visible(consent_targets(r)),
             "answer_allow": f"levain consent answer {r.id} allow --signing-key <key>" if answerable else None,
             "answer_deny": f"levain consent answer {r.id} deny --signing-key <key>" if answerable else None,
-            "note": f"{unshown_why(r)}: {TOO_LONG}" if pending and not answerable else "",
+            "note": f"{why}: {TOO_LONG}" if pending and why is not None else "",
             # Q12: the two values the terminal prints before signing; Q16: hints, which inform and never authorise
             "tool_input_digest": r.tool_input_digest, "digest": r.digest,
             "hints": hints,

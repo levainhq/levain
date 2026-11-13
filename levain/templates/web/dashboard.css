@@ -3821,5 +3821,6 @@ body.ke [data-ck-panel="tray"] .row > .list-meta > [data-ck-tag][data-ck-tag-sta
 .long-whole > summary:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
 .long-whole > pre.long-full { margin: 0; max-height: 50vh; overflow: auto; padding: var(--sp-2) var(--sp-3); white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: var(--r-sm); }
 .long-whole > pre.long-full:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
-.consent-kv dd > .long-text { margin: 0; }
-.consent-kv-long { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+/* what of a long input is not yet shown, beside the answers: Allow opens once it is all seen (card_format.js seenGate) */
+.sheet-unseen, .needs-unseen { margin: var(--sp-2) 0; }
+.sheet-unseen[data-seen="0"], .needs-unseen[data-seen="0"] { color: var(--text); font-weight: var(--fw-semibold); }

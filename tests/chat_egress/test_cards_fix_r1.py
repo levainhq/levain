@@ -35,7 +35,9 @@ from levain.chat_egress.lifecycle import EGRESS_CARD_HOLD_S, Effect, Settled, Ve
 from levain.cockpit.consent import ConsentError
 from levain.consent.listing import ConsentEntry, entry_body, filed_input
 from levain.consent.queue import ConsentQueue, authority_source
+from levain.consent.broker_client import GATE_DISPLAY_MAX
 from levain.consent.record import DISPLAY_MAX
+from tests.chat_egress.test_cards import CARD_DESIGN_CHARS
 from levain.desk.lease import LAUNCH_KINDS, _launch_event
 from levain.desk.store import CoordStore
 from tests.chat_egress.test_classify import frame, route_for
@@ -237,6 +239,8 @@ def test_quotes_and_backslashes_cannot_push_a_valid_card_over_the_display_limit(
                    launch_id="L" * cards.LAUNCH_MAX)
     display = card_display(c)
     assert len(display) <= DISPLAY_MAX, len(display)
+    # the card's own bounds keep it to its design size and under the slot path's smaller bound (test_cards pins why)
+    assert len(display) <= CARD_DESIGN_CHARS and len(display.encode()) < GATE_DISPLAY_MAX, len(display)
     assert filed_input(type("R", (), {"tool_name": cards.EGRESS_TOOL, "display": display})()) == c
     for k, limit in cards._LIMIT.items():
         for s in (c[k][:cards.NAMES_SHOWN] if isinstance(c[k], list) else [c[k]]):

@@ -558,8 +558,15 @@
     const acts = $("sheet-actions");
     acts.hidden = false;
     const controls = [];          // every button and the write-in: frozen together for the whole ceremony
+    // a consent request's long input gates its allow (row 1704 fix 1): an allow button stays disabled until the whole input
+    // has been opened and scrolled to its end (card_format seenGate); a deny is never gated. The count of what is not yet
+    // shown sits beside the buttons. A short input has no gate.
+    const CF = window.LevainCardFormat;
+    const gate = consent && CF && typeof CF.seenGate === "function" ? CF.seenGate($("sheet-input")) : null;
+    const gated = new Set();
+    const shut = (b) => !!gate && gated.has(b) && !gate.seen();
     // the mics lock through their own lock(on), which never disables a live capture's Stop
-    const lock = (on) => { for (const b of controls) b.disabled = on; for (const m of mics) m.lock(on); };
+    const lock = (on) => { for (const b of controls) b.disabled = on || shut(b); for (const m of mics) m.lock(on); };
     // the mic on a write-in or reason box (board row 140): drawn only where the server offers streaming and the browser offers
     // on-device dictation. A tap that SIGNS a box's words is refused while its mic is open or still closing (micOpen), so a
     // partial is never signed: the words are the box's once the mic has ended, taken at the click as ever.
@@ -637,6 +644,8 @@
     // what an option's tap runs: a cancel takes the reason box's words as typed now
     const tap = (o) => () => {
       if (busy) return;
+      // the disabled button is the gate; this refuses a tap that reached it anyway (a stale enable, a script)
+      if (gate && o.key === "allow" && !gate.seen()) return say(gate.line(), "bad");
       if (o.key === "cancel" && reasonBox) {
         if (micOpen(reasonMic)) return;
         const w = reasonBox.value.trim();
@@ -654,6 +663,7 @@
       $("sheet-body").insertBefore(top, $("sheet-body").firstChild);
       const pb = button("Sign (" + po.key + ")", "dev-primary", tap(po));
       pb.id = "sheet-picked";
+      if (po.key === "allow") gated.add(pb);
       acts.appendChild(pb);
     } else if (pick) {
       const miss = el("p", "sheet-pick-miss", !pickV ? "The link does not say which version of this item you tapped: read it and pick below."
@@ -684,7 +694,23 @@
       if (cardView) b.replaceChildren(el("span", "card-key", "(" + o.key + ")"), " " + String(o.text));      // same text, the key set off
       b.title = "signs: " + String(o.line);
       b.dataset.choice = o.key;
+      if (consent && o.key === "allow") gated.add(b);
       acts.appendChild(b);
+    }
+    // the gate's state, set now and on every move of the long input's view; a ceremony in flight keeps its lock
+    { const old = $("sheet-unseen"); if (old) old.remove(); }        // a redraw's line is its own
+    if (gate && gated.size) {
+      const line = el("p", "ext-meta sheet-unseen");
+      line.id = "sheet-unseen";
+      line.setAttribute("role", "status");
+      acts.before(line);
+      const show = () => {
+        line.textContent = gate.line();
+        line.dataset.seen = gate.seen() ? "1" : "0";
+        if (!busy) for (const b of gated) b.disabled = shut(b);
+      };
+      gate.on(show);
+      show();
     }
     // a box and its mic controls share one row, so the mic never drops under the box as a ragged line of its own
     const inRow = (box, m) => {

@@ -309,7 +309,12 @@ def _check(tool_input: Any) -> dict[str, Any]:
 
 def card_display(tool_input: Any) -> str:
     """What the queue seals as the request's display: `levain_egress <the card as JSON, in its order>`. Raises
-    CardError for anything that is not a card, or a card whose display would pass the queue's display limit."""
+    CardError for anything that is not a card, or a card whose display would pass the queue's display limit.
+
+    That limit is the consent queue's own (`DISPLAY_MAX`, UTF-8 bytes) because a card is filed only by
+    `ConsentQueue.file`, into the queue's own row: never through a slot's broker frame, whose smaller bound
+    (`broker_client.GATE_DISPLAY_MAX`) is for a slot hook's request. The check is a backstop: the card's own field
+    bounds keep its worst case far smaller, under the slot bound too, and the card tests pin that worst case."""
     from levain.consent.record import DISPLAY_MAX
 
     text = f"{EGRESS_TOOL} {json.dumps(_check(tool_input), ensure_ascii=False, separators=(', ', ': '))}"

@@ -267,7 +267,7 @@ def test_on_a_phone_a_20kb_input_shows_its_head_and_tail_expands_whole_and_signs
     parts = json.loads(v[3])
     assert parts["head"] == filed.display[:400] and parts["tail"] == filed.display[-400:], parts
     assert parts["tail"].endswith('# the decisive end", "description": "append the fan-in log"}'), parts["tail"][-80:]
-    assert "more characters here" in parts["gap"] and f"({len(filed.display)} characters)" in parts["summary"], parts
+    assert "more characters here" in parts["gap"] and f"({len(filed.display):,} characters)" in parts["summary"], parts
     assert v[4] == filed.display                                    # the whole input as filed: no second cut
     closed = json.loads(v[5])
     assert closed["sw"] <= closed["w"], closed                      # no sideways scroll at phone width

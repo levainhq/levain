@@ -31,9 +31,10 @@ from levain.consent.receipt_log import head_problem
 __all__ = ["AGENTS", "ANSWER_FORMAT", "ANSWER_FORMAT_UNCHAINED", "ANSWER_NAMESPACE", "AWAY_LEAVE_FORMAT",
            "AWAY_NAMESPACE", "DECISIONS", "DISPLAY_MAX", "GRANT_ANSWER_FORMAT", "LEGACY_DISPLAY_CUT", "OVER_BOUND",
            "POSTURE", "RULING_FORMAT",
-           "RULING_FORMAT_UNCHAINED", "RULING_NAMESPACE", "UNCHAINED_FORMATS", "ExternalGateRequest",
+           "RULING_FORMAT_UNCHAINED", "RULING_NAMESPACE", "UNCHAINED_FORMATS", "UNSHOWN", "ExternalGateRequest",
            "answer_message", "answer_payload", "away_leave_message", "away_leave_payload", "grant_answer_payload",
-           "over_bound", "redact_display", "ruling_message", "ruling_payload", "tool_input_digest"]
+           "over_bound", "read_back", "redact_display", "ruling_message", "ruling_payload", "tool_input_digest",
+           "unshown_why"]
 
 AGENTS: tuple[str, ...] = ("claude_code", "codex")
 DECISIONS: tuple[str, ...] = ("allow", "deny")
@@ -73,8 +74,12 @@ DISPLAY_MAX = 256 * 1024
 # filed then is still refused for signing (what it shows is not all it binds); only the refusal's words use this.
 LEGACY_DISPLAY_CUT = 2000
 OVER_BOUND = "[not shown: the input is {size} bytes, over the {limit}-byte bound a signer is shown whole]"
-_OVER_BOUND = re.compile(r"\[not shown: the input is ([0-9]+) bytes, over the ([0-9]+)-byte bound a signer is shown "
-                         r"whole\]")
+# the sizes as redact_display writes them: a decimal with no leading zero, never longer than a size can be; anything
+# else in the words' shape is a display that cannot be read back, never a raise
+_OVER_BOUND = re.compile(r"\[not shown: the input is ([1-9][0-9]{0,14}) bytes, over the ([1-9][0-9]{0,14})-byte bound a "
+                         r"signer is shown whole\]")
+# what every signing surface reads: the input parsed back from a display, or this when it is not shown whole
+UNSHOWN = object()
 # A key is secret-named when one of these words occurs inside one of its tokens, or inside two adjacent tokens
 # joined. Tokens: the key split at ``_``, ``-``, any other non-alphanumeric and camelCase (``apiKey``, ``APIKey``,
 # ``x-api-key`` -> api, key), lower-cased. Inside a token, so a run-together ``accesstoken`` or ``secretkey`` is
@@ -170,15 +175,50 @@ def redact_display(tool_name: str, tool_input: Any, limit: int = DISPLAY_MAX) ->
     parse a command (K3)."""
     body = json.dumps(_mask(tool_input), sort_keys=True, ensure_ascii=False, default=str)
     text = f"{tool_name} {body}"
-    size = len(text.encode("utf-8", "surrogatepass"))   # a lone surrogate is counted, never a raise here
+    # a lone surrogate is counted here (surrogatepass) rather than raising; the request's seal encodes strictly, so
+    # such a display is refused there (UnicodeEncodeError) and never filed
+    size = len(text.encode("utf-8", "surrogatepass"))
     return text if size <= limit else f"{tool_name} " + OVER_BOUND.format(size=size, limit=limit)
 
 
 def over_bound(tool_name: str, display: str) -> tuple[int, int] | None:
-    """``(size, limit)`` when ``display`` is :func:`redact_display`'s over-bound words for ``tool_name``, else None."""
+    """``(size, limit)`` when ``display`` is :func:`redact_display`'s over-bound words for ``tool_name``, else None:
+    words with a size that is not past its limit, or a figure no display could carry, are not those words."""
     prefix = f"{tool_name} "
     m = _OVER_BOUND.fullmatch(display[len(prefix):]) if display.startswith(prefix) else None
-    return None if m is None else (int(m.group(1)), int(m.group(2)))
+    if m is None:
+        return None
+    size, limit = int(m.group(1)), int(m.group(2))
+    return (size, limit) if 0 < limit < size else None
+
+
+def read_back(tool_name: str, display: str) -> Any:
+    """The tool input as filed, parsed back from a sealed display (``<tool_name> <json>``, secret-named keys
+    masked); :data:`UNSHOWN` when the display is not that whole: over-bound words are no JSON, and a display filed
+    under the old cut never parses (the cut left the JSON unterminated, or trailed by the ellipsis)."""
+    prefix = f"{tool_name} "
+    if not display.startswith(prefix):
+        return UNSHOWN
+    try:
+        return json.loads(display[len(prefix):])
+    except (ValueError, RecursionError):            # a display nested too deep to read back is not shown either
+        return UNSHOWN
+
+
+def unshown_why(tool_name: str, display: str) -> str | None:
+    """Why a display does not show its input whole, as a clause every signing surface completes with what follows
+    ("..., so it is not signed from the terminal"), or None when :func:`read_back` reads it. The reasons: over the
+    bound (its size said); filed under the old cut (only a display of exactly the old cut's length ending in its
+    ellipsis); otherwise it could not be read back."""
+    if read_back(tool_name, display) is not UNSHOWN:
+        return None
+    over = over_bound(tool_name, display)
+    if over is not None:
+        return f"its input is {over[0]} bytes, over the {over[1]}-byte bound a signer is shown whole"
+    if len(display) == LEGACY_DISPLAY_CUT and display.endswith("…"):
+        return (f"it was filed under the old display cut (its input was kept only to {LEGACY_DISPLAY_CUT} "
+                "characters)")
+    return "its input could not be read back"
 
 
 def _need(name: str, value: Any) -> str:

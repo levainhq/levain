@@ -26,12 +26,15 @@ from levain.cockpit.consent import ConsentError
 from levain.consent import queue as queue_mod
 from levain.consent.listing import UNSHOWN, entry_body, filed_input, read_listing
 from levain.consent.queue import ConsentQueue, authority_source
+from levain.consent.broker_client import GATE_DISPLAY_MAX
 from levain.consent.record import DISPLAY_MAX, _secret_named
 from tests.chat_egress.test_classify import frame, route_for
 from tests._h4 import h4_home
 
 LAUNCH = "launch-7f3a"
 SHA = "ab" * 32
+# the display size, in code points, the card's field bounds were designed to (the queue's display cut when they were set)
+CARD_DESIGN_CHARS = 2000
 
 
 def _card(fr, *, keyed=False, mode=classify.GATED, body_len=0, body_sha256=None, verdict=None, parsed=None, **kw):
@@ -92,7 +95,11 @@ def test_the_worst_case_card_is_still_under_the_display_limit():
                             reattached="r" * 300, why="override:" + "⁦" * 40)
     c = card_input(p, v, [f"cookie-{i}" + "​" * 30 for i in range(190)], body_len=1 << 30, body_sha256=SHA,
                    launch_id="L" * cards.LAUNCH_MAX)
-    assert len(card_display(c)) <= DISPLAY_MAX
+    display = card_display(c)
+    assert len(display) <= DISPLAY_MAX
+    # the card's own bounds, not the queue's backstop, keep it small: the size it was designed to (CARD_DESIGN_CHARS
+    # code points) and under the smallest display bound any consent path has (a slot's, through the broker)
+    assert len(display) <= CARD_DESIGN_CHARS and len(display.encode()) < GATE_DISPLAY_MAX, len(display)
     assert c["stripped"][-1] == f"(+{190 - cards.NAMES_SHOWN} more)" and len(c["stripped"]) == cards.NAMES_SHOWN + 1
     assert c["header_names"][-1].startswith("(+") and c["query_keys"][-1].startswith("(+")
 

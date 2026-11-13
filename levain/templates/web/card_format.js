@@ -424,30 +424,73 @@
     return box;
   }
   // A long input (row 1704: a consent request's whole input, up to the queue's display bound) drawn as its head and its tail with
-  // the WHOLE text one tap away in a block that scrolls on its own, never a second cut: the signer can read all of what is
-  // signed, and the answer buttons below stay near without scrolling the whole text. Text up to LONG_AT code points is one
-  // block of class `cls`, as before. Counted in code points, so no cut splits a surrogate pair.
-  const LONG_AT = 1200, LONG_END = 400;
+  // the WHOLE text one tap away in a block that scrolls on its own, never a second cut, and the answer buttons below stay near
+  // without scrolling the whole text. Text up to LONG_AT code points is one block of class `cls`, as before: LONG_AT is the old
+  // display cut, so an input that used to show whole still does and needs no gate. Counted in code points, so no cut splits a
+  // surrogate pair.
+  // A long box keeps whether its whole text has been SEEN: opened, and its block scrolled to its end (or fitting without a
+  // scroll). Pages gate an Allow on it (seenGate): the head and the tail are a summary, and a payload in the middle of a long
+  // command must not be one tap from being allowed unopened. The gate proves the text was opened and scrolled past, not that
+  // it was read; it is the most a page can know.
+  const LONG_AT = 2000, LONG_END = 400;
+  const count = (n) => Number(n).toLocaleString("en-US");
   function longText(text, cls) {
     const s = String(text);
     const cps = Array.from(s);
     if (cps.length <= LONG_AT) return node("pre", cls, s);
     const with_ = (extra) => (cls ? cls + " " : "") + extra;
     const box = node("div", "long-text");
-    box.dataset.chars = String(cps.length);
+    const total = cps.length, middle = total - 2 * LONG_END;
+    box.dataset.chars = String(total);
     box.appendChild(node("pre", with_("long-head"), cps.slice(0, LONG_END).join("")));
-    box.appendChild(node("p", "long-gap", "… " + (cps.length - 2 * LONG_END) + " more characters here: the whole input is below …"));
+    box.appendChild(node("p", "long-gap", "… " + count(middle) + " more characters here, not yet shown: open the whole input below …"));
     box.appendChild(node("pre", with_("long-tail"), cps.slice(cps.length - LONG_END).join("")));
     const whole = node("details", "long-whole");
-    whole.appendChild(node("summary", "", "Show the whole input (" + cps.length + " characters)"));
+    whole.appendChild(node("summary", "", "Show the whole input (" + count(total) + " characters)"));
     const full = node("pre", with_("long-full"), s);
     full.tabIndex = 0;                                   // its own scroll: reachable by keyboard
-    full.setAttribute("aria-label", "the whole input, " + cps.length + " characters");
+    full.setAttribute("aria-label", "the whole input, " + count(total) + " characters");
     whole.appendChild(full);
+    // seen: latched once the open block has been scrolled to its end; `reached` is how far down it has been (0 to 1)
+    let seen = false, reached = 0;
+    const unseen = () => (seen ? 0 : reached <= 0 ? middle : Math.min(middle, Math.round(total * (1 - reached))));
+    box.dataset.seen = "0";
+    box.dataset.unseen = String(middle);
+    box.longState = () => ({ seen: seen, unseen: unseen(), total: total });
+    const measure = () => {
+      if (!whole.open || seen) return;
+      const sh = full.scrollHeight, ch = full.clientHeight;
+      if (!(ch > 0)) return;                            // not laid out: nothing is on screen yet
+      reached = Math.max(reached, Math.min(1, (full.scrollTop + ch) / sh));
+      if (full.scrollTop + ch >= sh - 2) { seen = true; reached = 1; }   // the end is in view (a fitting block is at once)
+      box.dataset.seen = seen ? "1" : "0";
+      box.dataset.unseen = String(unseen());
+      box.dispatchEvent(new CustomEvent("longseen", { detail: box.longState() }));
+    };
+    full.addEventListener("scroll", measure, { passive: true });
     // open, the whole text stands alone (the head and the tail would repeat it); closed, they are back
-    whole.addEventListener("toggle", () => box.classList.toggle("open", whole.open));
+    whole.addEventListener("toggle", () => { box.classList.toggle("open", whole.open); measure(); });
     box.appendChild(whole);
     return box;
+  }
+  // The gate a page puts on an Allow over `root` (a longText box, or an element holding some): null when it holds no long box
+  // (nothing to gate); else { seen(), unseen(), total(), line(), on(fn) }, `on` calling fn whenever any box's state moves.
+  function seenGate(root) {
+    if (!root || typeof root.querySelectorAll !== "function") return null;
+    const boxes = (root.classList && root.classList.contains("long-text") ? [root] : [])
+      .concat(Array.from(root.querySelectorAll(".long-text")))
+      .filter((b) => typeof b.longState === "function");
+    if (!boxes.length) return null;
+    const sum = (k) => boxes.reduce((a, b) => a + b.longState()[k], 0);
+    const g = {
+      seen: () => boxes.every((b) => b.longState().seen),
+      unseen: () => sum("unseen"),
+      total: () => sum("total"),
+      line: () => (g.seen() ? "All " + count(g.total()) + " characters of the input shown: Allow is open."
+        : count(g.unseen()) + " of " + count(g.total()) + " characters not yet shown: Allow opens once the whole input is opened and scrolled to its end. Deny is open now."),
+      on: (fn) => { for (const b of boxes) b.addEventListener("longseen", fn); },
+    };
+    return g;
   }
   // "WHAT" -> "What": a section's label as a heading
   const titleCase = (l) => String(l).toLowerCase().replace(/(^|[ /-])([a-z])/g, (m, a, b) => a + b.toUpperCase());
@@ -662,7 +705,7 @@
     return { dt, shown: cut.map((i) => all[i]), total: pick.length, tags: cut.map((i) => dt.tags[i]) };
   }
 
-  const api = { deskTabPage, getDeskTab, setDeskTab, deskTabs, preferFull, usesFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody, longText, LONG_AT };
+  const api = { deskTabPage, getDeskTab, setDeskTab, deskTabs, preferFull, usesFull, setCommandBlock, linkRuns, installFieldGrow, grow, FREE_TEXT, collapse, sections, headline, optionRows, words, repeatsRows, fullOptions, parseMessage, looseCard, openUntil, drawHead, drawDetail, drawBody, longText, LONG_AT, seenGate };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.LevainCardFormat = api;
 })(typeof window !== "undefined" ? window : this);
