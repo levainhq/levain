@@ -198,7 +198,7 @@ def file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[Any
 
 def _file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[Any], push: bool,
                deadline: float | None) -> CardResult:
-    from levain.band_view import BAND_SCHEMA
+    from levain.band_view import _ensure_band_schema
     from levain.cockpit.consent import utc_stamp
     from levain.consent.cockpit_origin import read_origin
     from levain.consent.questions import HOOK_BUSY_MS
@@ -223,8 +223,8 @@ def _file_card(store: Any, card: Mapping[str, Any] | None, recorded: Sequence[An
     by = deadline if deadline is not None else time.monotonic() + HOOK_BUSY_MS / 1000
     store.ready_by(by)
     with store._write_by(by) as conn:
-        for stmt in BAND_SCHEMA:
-            conn.execute(stmt)
+        # BAND-FIX2 (codex MED 3, the class): the one migrating prelude every band writer runs, never BAND_SCHEMA alone
+        _ensure_band_schema(conn)
         for e in entries:
             conn.execute("INSERT OR IGNORE INTO answer_countersign (question_id, request_id, message_sha256, "
                          "row_version, filed_at) VALUES (?, ?, ?, ?, ?)",
