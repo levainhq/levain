@@ -688,6 +688,67 @@ def test_run_reaps_every_process_it_starts_and_releases_its_watchdog(tmp_path, m
     assert len(dogs) == 3 and [p.returncode for p in dogs[:2]] == [0, 0], [(p.args, p.returncode) for p in dogs]
 
 
+def test_a_command_that_started_dies_when_run_fails_before_it_could_handle_it(tmp_path, monkeypatch):
+    """L3 r2 (codex HIGH, introduced by r1's fix): ``run()`` released its watchdog in a ``finally``, so when the body
+    raised AFTER the command had started (an I/O thread that cannot start, under thread exhaustion) the watchdog was
+    told the door had handled a command that was still running, and the command could outlive the room. Now an
+    exception kills the command's group before it leaves ``run()``. REPRODUCED on eff1a9a96: the command lived on."""
+    import os
+    import signal
+    import threading
+
+    pidf = tmp_path / "hang.pid"
+    hang = tmp_path / "hang.py"
+    hang.write_text(f"import os, time\nopen({str(pidf) + '.tmp'!r}, 'w').write(str(os.getpid()))\n"
+                    f"os.replace({str(pidf) + '.tmp'!r}, {str(pidf)!r})\ntime.sleep(60)\n")
+
+    class NoThreads(threading.Thread):
+        def start(self):
+            _wait_for(pidf)         # the command is running before the first I/O thread fails to start
+            raise RuntimeError("can't start new thread")
+
+    with monkeypatch.context() as m:
+        m.setattr(room_host.threading, "Thread", NoThreads)
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            room_host.run((sys.executable, str(hang)), "x")
+    pid = int(pidf.read_text())
+    if not _gone(pid, 3.0):
+        os.kill(pid, signal.SIGKILL)
+        pytest.fail("the command outlived a run() that raised after starting it")
+
+
+def test_no_descriptor_for_the_lifeline_is_a_command_that_never_started(monkeypatch):
+    """L3 r2 (codex MED, deepseek LOW): ``os.pipe()`` sat outside the guarded spawn, so descriptor exhaustion raised
+    out of ``run()`` instead of the clean NOT_STARTED every other start failure returns. REPRODUCED on eff1a9a96."""
+    import errno
+
+    def no_fds():
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(room_host.os, "pipe", no_fds)
+    code, out, started = room_host.run(("/bin/echo", "x"))
+    assert (code, started) == (room_host.NOT_STARTED, False) and "could not start" in out, out
+
+
+def test_notes_that_could_not_get_a_lifeline_spend_none_of_the_budget(host, world, monkeypatch):
+    """L3 r2 (codex MED): the door charges a note before the command runs and refunds only a returned never-started
+    ``Ran``. A lifeline the door could not open raised past the refund, so three of them used up the hour although no
+    command started. REPRODUCED on eff1a9a96: the fourth note, with descriptors back, was refused."""
+    import errno
+
+    def no_fds():
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    with monkeypatch.context() as m:
+        m.setattr(room_host.os, "pipe", no_fds)
+        for _ in range(room_mcp.NOTE_PER_HOUR + 1):
+            r = note_call(world["launch"], host, {"note": "x"})
+            assert "not filed, nothing was delivered" in json.dumps(r), r
+    for i in range(room_mcp.NOTE_PER_HOUR):
+        assert note_call(world["launch"], host, {"note": f"n{i}"})["result"]["isError"] is False
+    assert len(recs(host)) == room_mcp.NOTE_PER_HOUR
+
+
 # --- containment: the argv, the probe, the digest ---------------------------------------------------------------------
 def test_argv_allows_exactly_the_hosts_door_tools(host):
     base = cs.room_argv(mcp_config="/r/m.json", settings="/r/s.json", session_id="s" * 8 + "-0000-4000-8000-" + "0" * 12)
