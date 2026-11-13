@@ -1,11 +1,14 @@
 """levain.desk.room_host: the commands a HOST gives the room (1106-16 Room D2).
 
-A host (flow's bridge is the one today) may hand the room up to two commands as room tools. Levain names no script and
+A host (flow's bridge is the one today) may hand the room up to three commands as room tools. Levain names no script and
 no path: the host passes an argv for each, and the room's MCP door runs it. The commands, by role:
 
 * ``relay``: files the operator's words with the host's desk. The text arrives on STDIN, never in argv. Its output's
   ``(thread <id>)`` is the id the room reads replies by.
 * ``replies``: reads the desk's replies to one thread. Read-only. The thread id is the only argument the door appends.
+* ``note``: files the room seat's OWN note with the desk, apart from his words. The text arrives on STDIN, never in argv,
+  behind the fixed :data:`NOTE_PREFIX` (the host's label for a note is shared with other chat surfaces, so the prefix is
+  what says the Room wrote it). It claims nothing and retires nothing: a note is information, never his direction.
 
 **Degrading.** With no host commands the room is exactly what it was: one door tool, ``propose_drop``, and his tap on
 the card commits a drop. The proposed-drop path is retired only when ``relay`` is present AND the host set
@@ -34,8 +37,9 @@ from typing import Any, NamedTuple, Optional
 
 from levain.launch import child_env
 
-__all__ = ["HOSTCMD_ENV", "NOT_STARTED", "OUTPUT_MAX", "TIMED_OUT", "TIMEOUT", "HostCommands", "HostCommandError",
-           "RELAY_TOOL", "REPLIES_TOOL", "Ran", "THREAD_RE", "door_tools", "from_env", "run"]
+__all__ = ["HOSTCMD_ENV", "NOT_STARTED", "NOTE_MAX", "NOTE_PREFIX", "NOTE_TOOL", "OUTPUT_MAX", "TIMED_OUT", "TIMEOUT",
+           "HostCommands", "HostCommandError", "RELAY_TOOL", "REPLIES_TOOL", "Ran", "THREAD_RE", "door_tools", "from_env",
+           "run"]
 
 HOSTCMD_ENV = "LEVAIN_ROOM_HOST_COMMANDS"
 # [seat] seconds a host command may run before the door gives up on it
@@ -46,6 +50,11 @@ _ARGV_MAX = 32
 _ARG_MAX = 1024
 RELAY_TOOL = "relay_to_desk"
 REPLIES_TOOL = "desk_replies"
+NOTE_TOOL = "note_to_desk"
+# the Room's attribution on every note, put in FRONT of the seat's text by the door (never by the seat)
+NOTE_PREFIX = "[from the Room] "
+# [seat] characters the host's note command accepts in all (it counts the stdin text it is given, so the prefix is inside it)
+NOTE_MAX = 600
 # the id a relay prints as "(thread <id>)": a conservative id shape, never the host's own format
 THREAD_RE = re.compile(r"th-[0-9a-z]{1,16}(?:-[0-9a-f]{1,16})?")
 
@@ -67,14 +76,16 @@ def _check_argv(name: str, argv: Any) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class HostCommands:
-    """``relay`` and ``replies`` are argvs (program absolute); either may be None. ``relay_without_tap`` is the host's
-    word that a relay on the model's call needs no tap (False: ``relay`` is accepted but not offered, the card stays)."""
+    """``relay``, ``replies`` and ``note`` are argvs (program absolute); each may be None. ``relay_without_tap`` is the
+    host's word that a relay on the model's call needs no tap (False: ``relay`` is accepted but not offered, the card
+    stays)."""
     relay: Optional[tuple[str, ...]] = None
     replies: Optional[tuple[str, ...]] = None
     relay_without_tap: bool = False
+    note: Optional[tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
-        for name in ("relay", "replies"):
+        for name in ("relay", "replies", "note"):
             v = getattr(self, name)
             if v is not None:
                 object.__setattr__(self, name, _check_argv(name, v))
@@ -89,12 +100,13 @@ class HostCommands:
     def to_json(self) -> str:
         return json.dumps({"relay": list(self.relay) if self.relay else None,
                            "replies": list(self.replies) if self.replies else None,
+                           "note": list(self.note) if self.note else None,
                            "relay_without_tap": self.relay_without_tap}, sort_keys=True)
 
 
 def door_tools(host: Optional[HostCommands]) -> tuple[str, ...]:
     """The door's tool names (short, as ``tools/list`` names them) for ``host``: ``propose_drop`` unless the relay
-    retires it, then the relay, then the replies reader. No host: ``("propose_drop",)``, as before D2."""
+    retires it, then the relay, then the replies reader, then the note. No host: ``("propose_drop",)``, as before D2."""
     if host is None:
         return ("propose_drop",)
     out = [] if host.relays else ["propose_drop"]
@@ -102,6 +114,8 @@ def door_tools(host: Optional[HostCommands]) -> tuple[str, ...]:
         out.append(RELAY_TOOL)
     if host.replies is not None:
         out.append(REPLIES_TOOL)
+    if host.note is not None:       # a note retires nothing, so it does not depend on the relay
+        out.append(NOTE_TOOL)
     return tuple(out)
 
 
@@ -114,9 +128,9 @@ def from_env(value: Optional[str]) -> Optional[HostCommands]:
         doc = json.loads(value)
     except ValueError:
         raise HostCommandError("the host commands are not JSON") from None
-    if not isinstance(doc, dict) or set(doc) - {"relay", "replies", "relay_without_tap"}:
-        raise HostCommandError("the host commands are an object of relay, replies, relay_without_tap")
-    return HostCommands(doc.get("relay"), doc.get("replies"), doc.get("relay_without_tap", False))
+    if not isinstance(doc, dict) or set(doc) - {"relay", "replies", "relay_without_tap", "note"}:
+        raise HostCommandError("the host commands are an object of relay, replies, relay_without_tap, note")
+    return HostCommands(doc.get("relay"), doc.get("replies"), doc.get("relay_without_tap", False), doc.get("note"))
 
 
 class Ran(NamedTuple):
