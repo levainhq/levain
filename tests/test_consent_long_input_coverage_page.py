@@ -38,75 +38,115 @@ SUMMARY = f"{INPUT}.querySelector('.long-whole > summary')"
 FRAMES = "await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(1))))"
 
 
-# FLAKES (1113-13, SHEETFLAKE2 1113-19): the gate learns what is on screen from an IntersectionObserver entry, delivered in a
-# task AFTER the rendering update that computed it, and probes the geometry at THAT moment (card_format.js, "a chunk the
-# browser moved past between two rendering updates ... stays not shown"). A step that sets the next scroll position on a
-# fixed pace assumes the delivery lands inside it; on a loaded box it does not, and the chunks of a view the scroll left before
-# the entries arrived stay unshown for good (measured: a contiguous run of 50 chunks, 800 characters, still unseen 160 frames
-# later). The product's rule is right (it fails closed, scrolling back shows them); the test's pace was the defect. So a view
-# is left only once the gate has counted it: SETTLE waits until no chunk lying wholly in the block's view and in the window,
-# with nothing but the block's own text painted at its first line box's centre, is still unshown. That is the gate's own
-# count (`longUnshown()`), and it has NO early exit on "the same chunks for N frames": a late delivery looks exactly like a
-# chunk the gate never counts, so a stable count proves nothing. SETTLE_FRAMES only bounds a gate that never counts (the
-# step then throws, naming the chunks left); the opened top view is waited for before the FIRST step too. The window is the
-# block's padding box (clientTop, clientHeight): a chunk in its border or padding is clipped, and the gate never counts it.
-SETTLE_FRAMES = 300
-SETTLE = ("const settle = async () => { const box = f.closest('.long-text'); if (!box || !box.longUnshown) return 0; "
-          "const sp = [...f.querySelectorAll('.long-group > span')]; "
-          "for (let k = 0; k < " + str(SETTLE_FRAMES) + "; k++) { const fr = f.getBoundingClientRect(); "
-          "const top = fr.top + f.clientTop, lo = Math.max(top, 0), hi = Math.min(top + f.clientHeight, window.innerHeight); "
-          "const n = box.longUnshown().filter((i) => { const r = sp[i].getBoundingClientRect(); if (!(r.top >= lo && r.bottom <= hi)) return false; "
-          "const q = sp[i].getClientRects()[0]; const h = q && document.elementFromPoint((q.left + q.right) / 2, (q.top + q.bottom) / 2); "
-          "return !!h && f.contains(h); }); "
-          "if (n.length === 0) return k; window.__left = n.slice(0, 3).map((i) => { const r = sp[i].getBoundingClientRect(); const q = sp[i].getClientRects()[0]; const h = document.elementFromPoint((q.left + q.right) / 2, (q.top + q.bottom) / 2); return {i: i, top: r.top, bottom: r.bottom, lo: lo, hi: hi, hit: h && (h.tagName + '.' + h.className), t: sp[i].textContent.slice(0, 20)}; }); "
-          f"{FRAMES}; }} return -1; }}; ")
+# FLAKES (1113-13, SHEETFLAKE2 / SHEETFLAKE3 1113-19): the gate learns what is on screen from an IntersectionObserver entry,
+# delivered in a task AFTER the rendering update that computed it, and probes the geometry at THAT moment (card_format.js, "a
+# chunk the browser moved past between two rendering updates ... stays not shown"). A step that sets the next scroll position
+# on a fixed pace assumes the delivery lands inside it; on a loaded box it does not, and the chunks of a view the scroll left
+# before the entries arrived stay unshown for good. The product's rule is right (it fails closed, scrolling back shows them);
+# the test's pace was the defect.
+#
+# THE MECHANISM, and why it is this one: a step may leave a view only once the gate's observers have delivered what the
+# step produced and the gate has acted on it. The gate's own countability test (`uncovered`, card_format.js) is private to the
+# page, and an earlier settle here hit-tested one point per chunk to guess which chunks the gate would count: a second, weaker
+# copy of the gate's three-points-per-line-box rule, which waited forever on a chunk the gate refuses (a small cover over an
+# inset glyph point) and was vacuous in the cockpit's framed sheet (`document` was the top page, the text is in the frame).
+# So this file asks the page nothing about WHICH chunks count. It instruments the observers instead: `io_probe` wraps the
+# window's IntersectionObserver (in every frame, before the page's own scripts), counting each real delivery (`raw`), each
+# callback the gate ran (`ran`) and each callback still held back (`pending`). `PIPE`'s wait ends when a minimum of frame pairs
+# has passed, the pipeline is quiet (no delivery, no callback run, nothing pending, and the gate's published `dataset.unseen` /
+# `seen` unchanged for QUIET_MS) and at least one real delivery came since the step (or a no-delivery bound passed: a step that
+# changes no chunk's visibility has none to wait for). Whatever the gate counts it has counted by then; whatever it refuses
+# stays unshown, and nothing here waits on it, so a refused chunk can never turn the wait into a throw. The late-delivery drive
+# holds every callback LATE_IO_MS: `pending` is what makes that wait exact, with no assumption about the delay.
+IO_MARK = "/*io-probe*/"
+QUIET_MS = 150          # a quiet pipeline must stay quiet this long
+PIPE_MIN_FRAMES = 4     # frame pairs a wait lasts at least
+PIPE_NO_DELIVERY = 12   # frame pairs after which a step with no real delivery at all is let go
+PIPE_MAX_FRAMES = 300   # a pipeline that never goes quiet is a defect: the wait throws
+PIPE = (IO_MARK + "const pipe = async (box) => { const io = box.ownerDocument.defaultView.__io; "
+        "if (!io) throw new Error('pipe: no IntersectionObserver probe in this page: drive it through probed_drive'); "
+        "const raw0 = io.raw, ran0 = io.ran; const key = () => [io.raw, io.ran, io.pending, box.dataset.unseen, box.dataset.seen].join('/'); "
+        "let last = key(), act = performance.now(); "
+        f"for (let k = 1; k <= {PIPE_MAX_FRAMES}; k++) {{ {FRAMES}; const now = performance.now(), cur = key(); "
+        "if (cur !== last || io.pending > 0) { last = cur; act = now; continue; } "
+        f"if (k >= {PIPE_MIN_FRAMES} && now - act >= {QUIET_MS} && (io.raw > raw0 || k >= {PIPE_NO_DELIVERY})) "
+        "return {frames: k, raw: io.raw - raw0, ran: io.ran - ran0}; } "
+        "throw new Error('pipe: the gate never went quiet in " + str(PIPE_MAX_FRAMES) + " frame pairs: ' + "
+        "JSON.stringify({key: key(), pending: io.pending, unseen: box.dataset.unseen})); }; ")
+
+
+def io_probe(late_ms: int = 0) -> str:
+    """An `init` script (it runs in every frame before the page's own scripts): the IntersectionObserver is wrapped so the
+    page's callbacks are counted, and held `late_ms` when that is above 0 (the observer's entries are the browser's own,
+    only late: the delivery a loaded box makes slow). State in ``window.__io``: made, raw (deliveries), ran (callbacks run),
+    late (callbacks run after a hold), pending (held, not run yet)."""
+    return (f"(() => {{ const IO = window.IntersectionObserver; if (!IO || window.__io) return; "
+            f"const st = window.__io = {{made: 0, raw: 0, ran: 0, late: 0, pending: 0, ms: {int(late_ms)}}}; "
+            f"window.IntersectionObserver = class extends IO {{ constructor(cb, o) {{ st.made += 1; "
+            f"super((es, ob) => {{ st.raw += 1; st.pending += 1; "
+            f"const run = () => {{ st.pending -= 1; st.ran += 1; if (st.ms > 0) st.late += 1; cb(es, ob); }}; "
+            f"if (st.ms > 0) setTimeout(run, st.ms); else run(); }}, o); }} }}; }})()")
+
+
+def probed_drive(tmp_path: Path, url: str, steps: list[dict]) -> dict:
+    """`_drive`, with the IntersectionObserver probe installed first when any step waits through `PIPE` (a step that
+    already carries its own `io_probe` init, the late-delivery drive's, keeps it). `init` collects no value, so the steps'
+    indexes in `values` do not move."""
+    uses = any(IO_MARK in str(s.get("eval", "")) for s in steps)
+    own = any("__io" in str(s.get("init", "")) for s in steps)
+    return _drive(tmp_path, url, steps if (own or not uses) else [{"init": io_probe()}, *steps])
 
 
 LATE_IO_MS = 250
 
 
-def late_observer(ms: int) -> str:
-    """Hold every IntersectionObserver callback the page gets by `ms` (set before the block opens: the gate makes its
-    observers at the first toggle). The entries are the browser's own, only late: the delivery a loaded box makes slow."""
-    return (f"(() => {{ const IO = window.IntersectionObserver; "
-            f"window.IntersectionObserver = class extends IO {{ constructor(cb, o) {{ "
-            f"super((es, ob) => setTimeout(() => cb(es, ob), {ms}), o); }} }}; return 1; }})()")
-
-
 def first_view_counted(root: str) -> str:
-    """Wait (up to 60 frames) until the gate has counted the view the block opened on: its entries come two rendering
-    updates after the toggle (the coarse observer, then the fine one), so a fixed one- or two-frame wait after `open` is a
-    race on a slow box, and a jump made before it leaves the top view uncounted for good (CI red, 11-13)."""
+    """Wait until the gate has acted on everything its observers delivered for the view the block opened on (PIPE), then
+    require that it counted something: its entries come two rendering updates after the toggle (the coarse observer, then
+    the fine one), so a fixed wait after `open` is a race on a slow box, and a jump made before it leaves the top view
+    uncounted for good (CI red, 11-13). Throws, naming the state, when the pipeline is quiet and nothing was counted."""
     return (f"(async () => {{ const b = {root}.classList.contains('long-text') ? {root} : {root}.querySelector('.long-text'); "
-            f"for (let k = 0; k < 60 && !(Number(b.dataset.unseen) < Number(b.dataset.chars)); k++) {{ {FRAMES}; }} "
-            f"{FRAMES}; return 1; }})()")
+            f"{PIPE}const r = await pipe(b); "
+            f"if (!(Number(b.dataset.unseen) < Number(b.dataset.chars))) throw new Error('first view: the pipeline went quiet "
+            f"and the gate counted nothing: ' + JSON.stringify({{r: r, unseen: b.dataset.unseen, chars: b.dataset.chars, "
+            f"unshown: b.longUnshown ? b.longUnshown().length : null}})); return 1; }})()")
+
+
+def settled(full: str, action: str) -> str:
+    """Run `action` (JS statements; ``f`` is the scroll block), then wait as a step does (PIPE). Answers the wait as JSON."""
+    return (f"(async () => {{ const f = {full}; {PIPE}{action}; "
+            f"return JSON.stringify(await pipe(f.closest('.long-text'))); }})()")
 
 
 def jump(full: str) -> str:
     """One step to the block's end: the attack (the scrollbar dragged to the bottom, the End key)."""
-    return f"(async () => {{ const f = {full}; f.scrollTop = f.scrollHeight; {FRAMES}; return f.scrollTop; }})()"
+    return (f"(async () => {{ const f = {full}; {PIPE}f.scrollTop = f.scrollHeight; "
+            f"await pipe(f.closest('.long-text')); return f.scrollTop; }})()")
 
 
 def stepped(full: str, frac: float, down: bool, *, until: float | None = None, counts: bool = True) -> str:
     """Scroll the block in steps of ``frac`` of its own height (down to its end, or up to its top), waiting after each step
-    (and before the first) until the gate has counted the view it is on (SETTLE). ``until``: stop once scrollTop passes that
-    fraction of the scroll range. Answers {n, max, ch, w}: how many steps, the largest one taken and the block's height,
-    so a test can check no step jumped past a view; ``w`` the most frame pairs one wait took. A wait that runs out its bound
-    with a countable chunk still unshown throws (the gate is not counting what it shows); ``counts=False`` is for a drive
-    whose gate counts nothing by construction (no visualViewport): it keeps the old pace of two frames a step."""
+    (and before the first) until the gate has acted on what the step delivered (PIPE). ``until``: stop once scrollTop passes
+    that fraction of the scroll range. Answers {n, max, ch, w, io, ran, ms}: how many steps, the largest one taken and the
+    block's height, so a test can check no step jumped past a view; ``w`` the most frame pairs one wait took, ``io`` the
+    real observer deliveries and ``ran`` the gate callbacks run during the waits (a framed drive's proof the wait was not
+    vacuous: it reads the frame's own window), ``ms`` the whole call's time. ``counts=False`` is for a drive whose gate counts nothing by construction
+    (no visualViewport, no modal): it keeps a two-frame pace a step and needs no probe."""
     stop = "" if until is None else f"if (f.scrollTop >= (f.scrollHeight - f.clientHeight) * {until}) break; "
+    wait = ("const r = await pipe(f.closest('.long-text')); w = Math.max(w, r.frames); io += r.raw; ran += r.ran; "
+            if counts else FRAMES + "; ")
     return (f"(async () => {{ const f = {full}; const d = Math.max(1, Math.floor(f.clientHeight * {frac})); "
-            f"{SETTLE}"
-            f"let n = 0, max = 0, w = 0; "
-            f"const wait = async () => {{ {'' if counts else 'return; '}const k = await settle(); "
-            f"if (k < 0) throw new Error('stepped: the gate counted no further view in {SETTLE_FRAMES} frame pairs: ' + "
-            f"JSON.stringify({{top: f.scrollTop, unseen: f.closest('.long-text').dataset.unseen, left: window.__left}})); w = Math.max(w, k); }}; "
-            f"await wait(); "
+            f"{PIPE if counts else ''}"
+            f"const t0 = performance.now(); let n = 0, max = 0, w = 0, io = 0, ran = 0; "
+            f"const wait = async () => {{ {wait if counts else ''}}}; "
+            f"{'await wait(); ' if counts else ''}"
             f"for (;;) {{ {stop}const t = f.scrollTop; "
             f"const want = {'Math.min(f.scrollHeight - f.clientHeight, t + d)' if down else 'Math.max(0, t - d)'}; "
-            f"if (Math.abs(want - t) < 0.5 || n > 4000) break; f.scrollTop = want; {FRAMES}; await wait(); "
+            f"if (Math.abs(want - t) < 0.5 || n > 4000) break; f.scrollTop = want; "
+            f"{'await wait(); ' if counts else FRAMES + '; '}"
             f"max = Math.max(max, Math.abs(f.scrollTop - t)); n += 1; if (f.scrollTop === t) break; }} "
-            f"return JSON.stringify({{n: n, max: max, ch: f.clientHeight, w: w}}); }})()")
+            f"return JSON.stringify({{n: n, max: max, ch: f.clientHeight, w: w, io: io, ran: ran, "
+            f"ms: Math.round(performance.now() - t0)}}); }})()")
 
 
 def state(allow: str, line: str, root: str, full: str) -> str:
@@ -162,7 +202,7 @@ def test_a_jump_to_the_end_leaves_allow_shut_until_the_skipped_middle_is_scrolle
     rid = _attack(rig)
     shots = _shots(tmp_path)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"tap": SUMMARY},                                                                             # 2
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
@@ -205,7 +245,7 @@ def test_a_scroll_to_the_end_in_steps_under_a_view_opens_allow_and_signs(tmp_pat
     rid = _attack(rig)
     shots = _shots(tmp_path)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"tap": SUMMARY},                                                                             # 2
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
@@ -235,25 +275,74 @@ def test_a_scroll_to_the_end_in_steps_under_a_view_opens_allow_and_signs(tmp_pat
 @needs_ssh
 def test_a_late_observer_delivery_does_not_make_a_stepped_scroll_skip_a_view(tmp_path, monkeypatch) -> None:
     """The loaded-box race made deterministic (SHEETFLAKE2, 1113-19), no CPU load: every IntersectionObserver callback the
-    page gets is held for LATE_IO_MS. A stepped scroll that does not wait for the gate's own count leaves the top view, or a
-    step's view, for good: the sheet's Allow stays shut and the CI red (`step 12: tap found no element`) is this shape."""
+    page gets is held for LATE_IO_MS (the `io_probe` init). A stepped scroll that does not wait for the gate's own count
+    leaves the top view, or a step's view, for good: the sheet's Allow stays shut and the CI red (`step 12: tap found no
+    element`) is this shape. The wait is shown to have happened: callbacks really were held (`late`), the steps saw real
+    deliveries, and nothing is still pending at the end. Its cost is the held callbacks, twice a step (the coarse observer,
+    then the fine one): the step's own `ms` is returned and must sit well inside the driver's 60 s evaluate bound."""
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
+            {"init": io_probe(LATE_IO_MS)},
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
-            {"eval": late_observer(LATE_IO_MS)},                                                          # 2
-            {"tap": SUMMARY},                                                                             # 3
-            {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
-            {"eval": stepped(FULL, 0.8, down=True)},                                                      # 5
-            {"eval": SHEET},                                                                              # 6
+            {"tap": SUMMARY},                                                                             # 2
+            {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
+            {"eval": stepped(FULL, 0.8, down=True)},                                                      # 4
+            {"eval": SHEET},                                                                              # 5
+            {"eval": "JSON.stringify(window.__io)"},                                                      # 6
         ])
     v = out["values"]
-    assert v[2] == 1, v[2]
-    s = json.loads(v[5])
+    s = json.loads(v[4])
     assert s["n"] >= 1 and s["max"] <= s["ch"], s
-    end = json.loads(v[6])
+    print("LATE", s, v[6])
+    assert s["io"] > 0 and s["ran"] > 0, s                                 # the steps waited on real deliveries
+    assert s["ms"] < 45_000, s                                             # inside the driver's 60 s evaluate bound
+    end = json.loads(v[5])
     assert end["allow"] is False and end["seen"] == "1" and end["unseen"] == 0, end
+    probe = json.loads(v[6])
+    assert probe["ms"] == LATE_IO_MS and probe["late"] > 0 and probe["pending"] == 0, probe    # callbacks WERE held, none left
+
+
+# A tiny cover over one inset glyph point of one chunk (not its centre): the gate's hit test (three points per line box)
+# refuses that chunk for good. The cover is a child of the scrolling block, so it scrolls with the text.
+COVER_ONE_GLYPH = ("(() => { const f = " + FULL + ", sp = [...f.querySelectorAll('.long-group > span')]; "
+                   "const fr = f.getBoundingClientRect(); const bottom = fr.top + f.clientTop + f.clientHeight; "
+                   "f.style.position = 'relative'; "
+                   "for (let i = 0; i < sp.length; i++) { const rs = sp[i].getClientRects(); if (rs.length !== 1) continue; "
+                   "const q = rs[0]; if (!(q.top > bottom + 20) || q.width < 40 || !/^\\S{6,}/.test(sp[i].textContent)) continue; "
+                   "const o = document.createElement('div'); o.id = 'test-glyph-cover'; "
+                   "o.style.cssText = 'position:absolute;width:6px;height:4px;left:' + (q.left - fr.left - f.clientLeft + f.scrollLeft) "
+                   "+ 'px;top:' + (q.top - fr.top - f.clientTop + f.scrollTop) + 'px'; f.appendChild(o); "
+                   "return JSON.stringify({i: i, cps: Array.from(sp[i].textContent).length}); } return 'none'; })()")
+
+
+@needs_browser
+@needs_ssh
+def test_a_chunk_the_gate_refuses_does_not_make_a_stepped_scroll_throw(tmp_path, monkeypatch) -> None:
+    """SHEETFLAKE3: the wait never asks which chunks the gate will count, so a chunk the gate refuses (a cover over its
+    first inset glyph point, not its centre: the one point a centre hit test misses) cannot make `stepped` wait out its bound
+    and throw. The scroll reaches the end, that one chunk is the only one left unshown, and Allow stays shut."""
+    rig = _ConsentRig(tmp_path, monkeypatch)
+    rid = _attack(rig)
+    with rig.serving():
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
+            PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
+            {"tap": SUMMARY},                                                                             # 2
+            {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
+            {"eval": COVER_ONE_GLYPH},                                                                    # 4
+            {"eval": stepped(FULL, 0.8, down=True)},                                                      # 5
+            {"eval": SHEET},                                                                              # 6
+            {"eval": f"JSON.stringify({INPUT}.longUnshown())"},                                           # 7
+        ])
+    v = out["values"]
+    assert v[4] != "none", v[4]
+    cover = json.loads(v[4])
+    s = json.loads(v[5])
+    assert s["n"] > 2 and s["max"] <= s["ch"] and s["io"] > 0, s
+    assert json.loads(v[7]) == [cover["i"]], (v[7], cover)                 # exactly the covered chunk is not counted
+    end = json.loads(v[6])
+    assert end["allow"] is True and end["seen"] == "0" and end["unseen"] == cover["cps"], (end, cover)
 
 
 @needs_browser
@@ -265,7 +354,7 @@ def test_a_reflow_while_open_keeps_what_was_shown_and_nothing_more(tmp_path, mon
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"tap": SUMMARY},                                                                             # 2
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
@@ -296,7 +385,7 @@ def test_an_input_just_past_the_long_mark_that_fits_its_block_is_seen_when_opene
     assert len(fit.display) == 2_001
     tall = {"emulate": {"w": 1280, "h": 2400, "dpr": 1}}
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             tall, rig.authenticator(), *rig.open_top(fit.id),                                             # 0 1
             {"eval": SHEET},                                                                              # 2
             {"tap": SUMMARY},                                                                             # 3
@@ -324,7 +413,7 @@ def test_on_the_needs_card_a_jump_to_the_end_leaves_allow_shut(tmp_path, monkeyp
     rid = _attack(rig)
     shots = _shots(tmp_path)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
             {"until": "[...document.querySelectorAll('#ck-needs .needs-consent')].length >= 1", "ms": 30000},     # 0
             {"eval": "[...document.querySelectorAll('#ck-needs .needs-consent')].find(x => /Bash/.test(x.textContent))"
@@ -371,11 +460,11 @@ def test_a_consent_sheet_draws_no_bare_sign_button_and_no_write_in(tmp_path, mon
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        bare = _drive(tmp_path, f"{rig.origin}/nope", [
+        bare = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, _rewrite_sheet("q.options = [];"), rig.authenticator(), *rig.open_top(rid),            # 0 1
             {"eval": ACTS},                                                                               # 2
         ])
-        wi = _drive(tmp_path, f"{rig.origin}/nope", [
+        wi = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, _rewrite_sheet("q.write_in = { key: 'allow', line: 'answer allow: ' + q.id, max: 200 };"),
             rig.authenticator(), *rig.open_top(rid),                                                      # 0 1
             {"eval": ACTS},                                                                               # 2

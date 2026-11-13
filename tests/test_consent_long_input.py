@@ -228,7 +228,7 @@ def test_on_a_phone_a_20kb_input_shows_its_head_and_tail_expands_whole_and_signs
     and the queue holds the answer over the digest of the exact input. ``LEVAIN_LONG_SHOTS`` names where the
     screenshots go (default: the test's tmp dir)."""
     from tests.test_cockpit_consent_sheet_page import NOTE, _ConsentRig
-    from tests.test_consent_long_input_coverage_page import stepped
+    from tests.test_consent_long_input_coverage_page import probed_drive, stepped
 
     rig = _ConsentRig(tmp_path, monkeypatch)
     command = _long_command(20_000)
@@ -238,7 +238,7 @@ def test_on_a_phone_a_20kb_input_shows_its_head_and_tail_expands_whole_and_signs
     shots = Path(os.environ.get("LEVAIN_LONG_SHOTS") or tmp_path)
     shots.mkdir(parents=True, exist_ok=True)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(filed.id),
             {"eval": f"{INPUT}.className"},                                                                   # 2
             {"eval": f"JSON.stringify({{head: {INPUT}.querySelector('.long-head').textContent, "

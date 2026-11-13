@@ -23,9 +23,9 @@ import zlib
 from pathlib import Path
 
 from tests.test_cockpit_consent_sheet_page import FRAME, IN, _ConsentRig
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_sign_card import DESKTOP, TOK, needs_ssh
-from tests.test_consent_long_input_coverage_page import FRAMES, _attack, _shots, stepped
+from tests.test_consent_long_input_coverage_page import FRAMES, _attack, _shots, probed_drive, stepped
 
 WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 VEIL = "document.getElementById('levain-sign-sheet')"
@@ -118,7 +118,7 @@ def test_a_cover_on_the_cockpit_page_never_paints_over_the_sheets_frame(tmp_path
     shots = _shots(tmp_path)
     one, two = shots / "fix4_1_cockpit_cover_not_inert_frame_on_top.png", shots / "fix4_2_cockpit_cover_inert_frame_on_top.png"
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *_open(rig.rid),                                              # 0 1 2
             {"eval": _cover(inert=False)},                                                              # 3
             {"shot": str(one)},                                                                         # 4
@@ -145,7 +145,7 @@ def test_in_the_cockpits_sheet_a_long_input_read_through_opens_allow(tmp_path, m
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *_open(rid),                                                  # 0 1 2
             {"tap": f"{F_INPUT}.querySelector('.long-whole > summary')"},                               # 3
             {"until": f"{F_INPUT}.classList.contains('open') && 1", "ms": 10000},                 # 4
@@ -156,6 +156,9 @@ def test_in_the_cockpits_sheet_a_long_input_read_through_opens_allow(tmp_path, m
     v = out["values"]
     before, after = json.loads(v[5]), json.loads(v[7])
     print("TOP LAYER", before, after)
+    # the step's wait read the FRAME's own observers (it is not vacuous here): deliveries came and the gate ran its callbacks
+    waited = json.loads(v[6])
+    assert waited["io"] > 0 and waited["ran"] > 0 and waited["n"] > 1, waited
     assert before["veil"] == "DIALOG" and before["modal"] is True, before
     assert before["allow"] is True and before["seen"] == "0", before
     assert after["allow"] is False and after["seen"] == "1" and after["unseen"] == 0, after
@@ -169,14 +172,14 @@ def test_without_show_modal_the_sheet_opens_and_a_long_input_stays_deny_only(tmp
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
             {"until": "window.LevainSignSheet && 1", "ms": 30000},                                     # 0
             {"eval": "(delete HTMLDialogElement.prototype.showModal, typeof HTMLDialogElement.prototype.showModal)"},  # 1
             *_open(rid)[1:],                                                                            # 2 3
             {"tap": f"{F_INPUT}.querySelector('.long-whole > summary')"},                               # 4
             {"until": f"{F_INPUT}.classList.contains('open') && 1", "ms": 10000},                 # 5
-            {"eval": stepped(F_FULL, 0.8, down=True)},                                                  # 6
+            {"eval": stepped(F_FULL, 0.8, down=True, counts=False)},                                                  # 6
             {"eval": f"(async () => {{ {FRAMES}; {FRAMES}; return {F_STATE}; }})()"},                   # 7
         ])
     v = out["values"]
@@ -196,14 +199,14 @@ def test_a_show_modal_that_throws_leaves_the_dialog_in_place_and_a_long_input_de
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
             {"until": "window.LevainSignSheet && 1", "ms": 30000},                                     # 0
             {"eval": "(HTMLDialogElement.prototype.showModal = function () { throw new DOMException('no', 'InvalidStateError'); }, 1)"},  # 1
             *_open(rid)[1:],                                                                            # 2 3
             {"tap": f"{F_INPUT}.querySelector('.long-whole > summary')"},                               # 4
             {"until": f"{F_INPUT}.classList.contains('open') && 1", "ms": 10000},                       # 5
-            {"eval": stepped(F_FULL, 0.8, down=True)},                                                  # 6
+            {"eval": stepped(F_FULL, 0.8, down=True, counts=False)},                                                  # 6
             {"eval": f"(async () => {{ {FRAMES}; {FRAMES}; return JSON.stringify({{...JSON.parse({F_STATE}), open: {VEIL}.open}}); }})()"},  # 7
         ])
     s = json.loads(out["values"][7])
@@ -222,7 +225,7 @@ def test_another_modal_dialog_on_the_page_does_not_stand_in_for_the_sheets(tmp_p
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
             {"until": "window.LevainSignSheet && 1", "ms": 30000},                                     # 0
             {"eval": "(() => { const sm = HTMLDialogElement.prototype.showModal; HTMLDialogElement.prototype.showModal = "
@@ -233,7 +236,7 @@ def test_another_modal_dialog_on_the_page_does_not_stand_in_for_the_sheets(tmp_p
                      "document.body.appendChild(d); d.showModal(); return document.querySelectorAll(':modal').length; })()"},  # 4
             {"eval": f"({F_INPUT}.querySelector('.long-whole > summary').click(), 1)"},                 # 5
             {"until": f"{F_INPUT}.classList.contains('open') && 1", "ms": 10000},                       # 6
-            {"eval": stepped(F_FULL, 0.8, down=True)},                                                  # 7
+            {"eval": stepped(F_FULL, 0.8, down=True, counts=False)},                                                  # 7
             {"eval": f"(async () => {{ {FRAMES}; {FRAMES}; return JSON.stringify({{...JSON.parse({F_STATE}), "
                      f"other: document.getElementById('test-other').matches(':modal')}}); }})()"},       # 8
         ])
@@ -264,7 +267,7 @@ def test_escape_a_close_request_and_a_close_never_take_the_sheet_out_of_the_top_
     is undone at once: the dialog is open and modal again. Each asks the sheet to close (the frame here never answers)."""
     rig = _ConsentRig(tmp_path, monkeypatch)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *_open(rig.rid),                                              # 0 1 2
             {"eval": _TRACE},                                                                           # 3
             {"key": "Escape", "vk": 27},
@@ -315,7 +318,7 @@ def test_a_long_input_with_hidden_characters_reads_through_to_allow(tmp_path, mo
     rid = rig.queue.file(agent="claude_code", agent_session_id="s1", tool_name="Bash", tool_input={"command": command},
                          cwd="/w", hold=timedelta(minutes=30), tier="T2").id
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(), *_open(rid),                                                  # 0 1 2
             {"tap": f"{F_INPUT}.querySelector('.long-whole > summary')"},                               # 3
             {"until": f"{F_INPUT}.classList.contains('open') && 1", "ms": 10000},                       # 4

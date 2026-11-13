@@ -16,10 +16,11 @@ import json
 from datetime import timedelta
 
 from tests.test_cockpit_consent_sheet_page import _ConsentRig
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import needs_browser
 from tests.test_cockpit_sign_card import DESKTOP, TOK, needs_ssh
 from tests.test_consent_long_input_coverage_page import (
     C_FULL, CARD, C_STATE, EVIL, FRAMES, FULL, INPUT, PHONE, SHEET, SUMMARY, _attack, _shots, first_view_counted, jump,
+    probed_drive, settled,
     stepped)
 
 
@@ -87,7 +88,7 @@ def test_a_reflow_that_keeps_scroll_height_and_width_does_not_make_unshown_text_
                          cwd="/w", hold=timedelta(minutes=30), tier="T2").id
     shots = _shots(tmp_path)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"tap": SUMMARY},                                                                             # 2
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
@@ -134,7 +135,7 @@ def test_a_jump_names_the_skipped_chunks_and_the_payload_is_among_them(tmp_path,
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"tap": SUMMARY},                                                                             # 2
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
@@ -166,7 +167,7 @@ def test_at_the_desktop_cockpits_width_a_read_through_opens_allow(tmp_path, monk
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             {"emulate": {"w": 898, "h": 680, "dpr": 1}}, rig.authenticator(), *rig.open_top(rid),        # 0 1
             {"tap": SUMMARY},                                                                             # 2
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
@@ -199,7 +200,7 @@ def test_a_block_partly_below_the_fold_shows_only_its_visible_part(tmp_path, mon
     rid = _attack(rig)
     shots = _shots(tmp_path)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"eval": "(document.body.style.paddingTop = '620px', 1)"},                                   # 2
             {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
@@ -234,7 +235,7 @@ def test_a_block_under_an_overlay_shows_only_what_is_not_covered(tmp_path, monke
     shots = _shots(tmp_path)
     bar = "document.getElementById('test-bar')"
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             # the bar goes up BEFORE the block is opened (screen y 400 to 700: the open block's lower half), so the
             # browser never painted that half uncovered
@@ -246,7 +247,7 @@ def test_a_block_under_an_overlay_shows_only_what_is_not_covered(tmp_path, monke
             {"eval": first_view_counted(INPUT)},                                                          # 5
             {"eval": truth(INPUT, FULL, bar)},                                                            # 6
             {"shot": str(shots / "fix3_3_sheet_block_under_an_overlay_390.png")},                         # 7
-            {"eval": f"(async () => {{ {bar}.remove(); {FULL}.scrollTop = 1; {FRAMES}; {FRAMES}; return 1; }})()"},  # 8
+            {"eval": settled(FULL, f"{bar}.remove(); f.scrollTop = 1")},                                  # 8
             {"eval": truth(INPUT, FULL)},                                                                 # 9
         ])
     v = out["values"]
@@ -268,7 +269,7 @@ def test_on_the_needs_card_a_jump_leaves_one_run_of_chunks_not_shown(tmp_path, m
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
+        out = probed_drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
             {"until": "[...document.querySelectorAll('#ck-needs .needs-consent')].length >= 1", "ms": 30000},     # 0
             {"eval": "[...document.querySelectorAll('#ck-needs .needs-consent')].find(x => /Bash/.test(x.textContent))"
@@ -299,7 +300,7 @@ def test_the_chunked_text_copies_and_finds_as_the_original(tmp_path, monkeypatch
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"tap": SUMMARY},                                                                             # 2
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 3
@@ -347,7 +348,7 @@ def test_a_shown_chunk_is_no_longer_observed(tmp_path, monkeypatch) -> None:
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"eval": TRACK_IO},                                                                           # 2
             {"tap": SUMMARY},                                                                             # 3
@@ -396,7 +397,7 @@ def test_under_pinch_zoom_nothing_is_shown_and_only_the_visual_viewport_counts(t
     rid = _attack(rig)
     nudge = f"(async () => {{ {FULL}.scrollTop += 2; {FRAMES}; {FRAMES}; return 1; }})()"
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"eval": _stub_vv(2, 1)},                                                                     # 2
             {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
@@ -424,7 +425,7 @@ def test_without_a_visual_viewport_nothing_is_shown(tmp_path, monkeypatch) -> No
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"eval": "(Object.defineProperty(window, 'visualViewport', {configurable: true, value: undefined}), "
                      "String(window.visualViewport))"},                                                  # 2
@@ -463,7 +464,7 @@ def test_a_box_removed_before_it_is_seen_lets_its_listeners_go(tmp_path, monkeyp
     box = f"({INPUT}.classList.contains('long-text') ? {INPUT} : {INPUT}.querySelector('.long-text'))"
     scroll = f"(async () => {{ window.dispatchEvent(new Event('scroll')); {FRAMES}; return JSON.stringify([window.__later, window.__live]); }})()"
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             {"eval": TRACK_LATER},                                                                        # 2
             {"eval": f"({SUMMARY}.click(), 1)"},                                                          # 3
@@ -498,7 +499,7 @@ def test_in_a_frame_the_parent_pages_fold_clips_what_is_shown(tmp_path, monkeypa
     f_full = FULL.replace("document.", fd + ".")
     f_summary = SUMMARY.replace("document.", fd + ".")
     with rig.serving():
-        out = _drive(tmp_path, f"{rig.origin}/nope", [
+        out = probed_drive(tmp_path, f"{rig.origin}/nope", [
             PHONE, rig.authenticator(), *rig.open_top(rid),                                               # 0 1
             # the cockpit's own page frames the sheet (its modal does): a frame of ours, placed past the fold, in a modal
             # dialog as the cockpit's is (fix 4: a frame outside the top layer counts nothing)
