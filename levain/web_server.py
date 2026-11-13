@@ -6632,12 +6632,16 @@ def run_web_server(
     return 0
 
 
-def _build_room_serve(room: Path, host_commands: Any = None) -> Any:
+def _build_room_serve(room: Path, host_commands: Any = None, profile: Any = None) -> Any:
     """The :class:`~levain.desk.room_serve.RoomServe` ``levain serve --room DIR`` hands ``make_server``, over the
     consent queue's ``dispatch.db`` (the file the cockpit's room reads). ``DIR`` is where the room's file tools see first:
     an existing directory. Built here, started by ``make_server`` after every refusal has passed. ``host_commands`` is
     the host's :class:`~levain.desk.room_host.HostCommands` (flow's bridge passes its desk relay and replies
-    commands; levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card."""
+    commands; levain names no script): None keeps the room as it was, ``propose_drop`` and his tap on the card.
+    ``profile`` is the host's :class:`~levain.desk.room_profile.RoomProfile` (levain 23): None is the confined room,
+    unchanged; a profile opens the host room (the vendor's default tools under bypass, the host's hooks, prompt and
+    dials), and the returned serve's ``status()["profile"]`` names it. A bridge detects a levain that has this
+    parameter with ``inspect.signature`` and falls back to the confined room, loudly, when it has not."""
     from levain.consent.queue import default_queue_dir
     from levain.desk.envelopes import EnvelopeStore
     from levain.desk.room_launch import RoomSetting
@@ -6649,7 +6653,8 @@ def _build_room_serve(room: Path, host_commands: Any = None) -> Any:
     queue = _canonical_path(Path(default_queue_dir()))
     _room_dir_refusal(cwd, queue)
     # the deny rules are written from these spellings: the canonical ones the refusal checked (roomfix2 K1)
-    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd), host=host_commands), run_dir=str(queue / "room-run"),
+    return RoomServe(EnvelopeStore(queue), RoomSetting(str(cwd), host=host_commands, profile=profile),
+                     run_dir=str(queue / "room-run"),
                      launcher_kw={"home": str(_canonical_path(Path.home())), "levain_home": str(queue.parent)})
 
 
