@@ -11,8 +11,10 @@ the band (the Needs strip) is the one place that lives, and a second copy read b
 with it. A REPLAY (``read_at``) is the one place the old marks remain, as the history of an instant: the consent queue and
 the question store at T, a session waiting on a request filed by T and not decided by T, the record being the task it
 waits on, a dispatch contract waiting on a signature or an authorisation. STALLED (a node) and STUCK (a task) are
-silence with no record behind it: a session whose last logged event is a prompt or a tool call and that has said nothing
-for ``STALL_S``. An open loop nobody is working is neither: it is OPEN, a record with an age and a heat (the Open loops
+silence: a session whose last logged event is a prompt or a tool call and that has said nothing for ``STALL_S``. A live
+read looks up no request record, so a session blocked on a pending request reads RUNNING while its last event is recent
+and STALLED once it has been silent that long, the same as one that merely went quiet; the two never merge in a replay,
+where the record is looked up and the node is WAITING. An open loop nobody is working is neither: it is OPEN, a record with an age and a heat (the Open loops
 panel's own words), not silence; a dispatch contract the live graph draws as waiting on a signature is OPEN the same way.
 
 "Lost if closed" is per live session, read by ``activity.git_worktree_state`` (its status read runs on a private git
@@ -303,8 +305,9 @@ def _edit_paths(install_root: Path, stem: str, cwd: str, now: datetime, window_s
 
 
 def _node_state(waiting: bool, age_s: float, last_kind: str | None) -> str:
-    """WAITING (a record) > STALLED (mid-turn and silent) > RUNNING > IDLE (quiet past the Sessions panel's Active
-    line, or its turn ended in a reply). Silence with no log is never STALLED: nothing says the turn is open. A
+    """WAITING (a record; only a replay passes one) > STALLED (mid-turn and silent) > RUNNING > IDLE (quiet past the
+    Sessions panel's Active line, or its turn ended in a reply). A live session blocked on a request is therefore
+    RUNNING or STALLED by its silence alone. Silence with no log is never STALLED: nothing says the turn is open. A
     desk wake (``wake``) opens a turn as a prompt does, and its ``wake_reply`` ends it."""
     from levain.cockpit.providers import SESSION_ACTIVE_S
 

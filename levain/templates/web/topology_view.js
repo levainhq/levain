@@ -9,7 +9,7 @@
 //   Work lens: two columns as drawn. LEFT, the tasks as compact cards, loudest state first; waiting-orange is a
 //   border and a tag, stuck is dashed amber, done is quiet. RIGHT, each task's outcomes on the task's own row. A line joins a
 //   task to its outcomes (the lines are ornament: the columns are the grammar). The lens lists no pending consent or question
-//   (the Needs strip does, organized): its "waiting on you" figure is the one way there, a button that goes to the first waiting card.
+//   (the Needs strip does, organized) and carries no figure or button for what waits on the operator.
 //   Agents are small chips on the task they work. A session with no task object sits in an "unattached work" block, never a
 //   guessed task. Waiting (a pending record the operator can answer) and stuck (silence, no record) never merge. In a
 //   narrow card the columns stack: tasks, each task's outcomes beneath it.
@@ -399,8 +399,8 @@
     const tasks = arr(v.tasks).filter(drawnTask);
     const n = (st) => tasks.filter((t) => t.state === st).length;
     const row = el("div", "tv-strip");
-    const stat = (k, num, word, cls, tag) => {
-      const s = el(tag || "span", "tv-stat" + (cls ? " " + cls : ""));
+    const stat = (k, num, word, cls) => {
+      const s = el("span", "tv-stat" + (cls ? " " + cls : ""));
       s.dataset.k = k;
       s.append(el("b", null, num), " " + word);
       return s;
