@@ -154,8 +154,9 @@ READERS: dict[str, tuple[int, str, str]] = {
         (1, "display", "lists graduation policies and who signed them; whether one covers anything is "
                        "graduation_policies' answer"),
     "levain/consent/grants.py::grant_view":
-        (7, "display", "the page and the phone list every grant the policy holds, each with its state "
-                       "(stopped wins over expired and live) and its revoke line"),
+        (8, "display", "the page and the phone list every grant the policy holds, each with its state "
+                       "(stopped wins over expired and live), the way back of a stopped one (its kind, read raw) and "
+                       "its revoke line"),
     "levain/consent/grants.py::_split":
         (1, "display", "the listing partition; each grant carries why it is stopped"),
     "levain/consent/grants.py::stopped_by_key":

@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 import shlex
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -258,10 +259,45 @@ def test_the_doctor_row_says_revoke_first_when_a_one_live_kind_is_stopped(world)
     world.lease(LEASE, by="c")
     world.revoke_key("c", by="b")
     (row,) = D._check_standing_grants(world.entity)
-    assert row.hint == ("Revoke them to clear the list (levain consent grant revoke --signing-key <key> -- <id>); a "
-                        "seat-root lease, seat-egress grant, chat key, voice key or hands entry must be revoked before "
-                        "it is created again.")
+    assert row.hint == ("Revoke them to clear the list (levain consent grant revoke --signing-key <key> -- <id>). "
+                        "cg-A: create it again with a key you still hold. "
+                        f"{LEASE}: revoke it, then create it again with a key you still hold.")
     _parses(_doctor_cmd(row.hint))
+
+
+def test_the_doctor_hint_never_tells_a_hands_entry_to_be_created_again(world) -> None:
+    """L3 r3 (three lineages): the hint said every one-live kind, a hands entry among them, "must be revoked before it is
+    created again", but no verb creates a hands entry. Each kind now gets its own way back, the revoke notice's words, and a
+    hands entry is told it can only be cleared. Red with the one-sentence hint."""
+    world.consent("cg-A")
+    world.lease(LEASE)
+    world.entry(ENTRY, "files")
+    world.revoke_key("a", by="b")
+    (row,) = D._check_standing_grants(world.entity)
+    assert row.hint == ("Revoke them to clear the list (levain consent grant revoke --signing-key <key> -- <id>). "
+                        "cg-A: create it again with a key you still hold. "
+                        f"{LEASE}: revoke it, then create it again with a key you still hold. "
+                        f"{ENTRY}: revoke it to clear it; no levain verb registers a hands entry yet.")
+    assert "created again" not in row.hint and "hands entry must" not in row.hint
+    _parses(_doctor_cmd(row.hint))
+
+
+def test_the_doctor_hint_says_the_same_ways_as_the_revoke_notice(world) -> None:
+    """One source for both: each way the hint gives is a way the notice lists, for the same ids."""
+    world.consent("cg-A")
+    world.lease(LEASE)
+    world.egress(EGRESS)
+    world.entry(ENTRY, "files")
+    world.revoke_key("a", by="b")
+    (row,) = D._check_standing_grants(world.entity)
+    notice = G.stopped_notice(sorted([(LEASE, auth.SEAT_LEASE_KIND, "x"), (EGRESS, auth.SEAT_EGRESS_KIND, "x"),
+                                      (ENTRY, auth.HANDS_MCP_KIND, "x"), ("cg-A", auth.CONSENT_GRANT_KIND, "x")]))
+    start = next(i for i, line in enumerate(notice) if line.startswith("A renew does not bring"))
+    end = next(i for i, line in enumerate(notice) if line.startswith("To revoke one: "))
+    ways = [line.strip().rsplit(": ", 1) for line in notice[start + 1:end]]
+    assert len(ways) == 3
+    said = row.hint.split("). ", 1)[1]
+    assert said == " ".join(f"{ids}: {way}." for way, ids in ways), (said, ways)
 
 
 def _doctor_cmd(hint: str) -> str:
@@ -312,3 +348,141 @@ def test_the_sign_in_refusal_for_a_stopped_entry_names_the_revoke_verb(world, tm
                     "entry yet. Nothing was changed")
     (cmd,) = _quoted(said)
     assert _parses(cmd)[-1] == ENTRY
+
+
+# --- L3 r3: the doctor's tier for a stopped hands entry, and its hint -----------------------------------------------
+
+def _doctor_hands(world, monkeypatch, record=None):
+    """The doctor's hands-mcp rows over ``world``'s log: a stand-in hands account whose config holds nothing and whose
+    credential file reads as its own, 0600, so only the registry decides the rows."""
+    hands = SimpleNamespace(user="handsuser")
+    monkeypatch.setattr(hml.hl, "load_hands_identity", lambda entity: hands)
+    monkeypatch.setattr(hml, "read_record", record or (lambda entity: {}))
+    monkeypatch.setattr(hml, "vendor_servers", lambda hands, entity, sweep=False: {})
+    monkeypatch.setattr(hml.hl, "credential_state", lambda *a, **k: "handsuser 600")
+    return D._check_hands_mcp(world.entity)
+
+
+def test_a_stopped_hands_entry_warns_in_the_doctor_and_still_fails_the_list(world, monkeypatch) -> None:
+    """L3 r3 (three lineages): the operator stopped the entry by revoking a key, and the standing-grants row beside it
+    already warns of that stop, so the doctor's hands row WARNS (ok, so it adds nothing to the doctor's failures and
+    exit code) while `levain hands mcp list` keeps exit 1. Its hint is the revoke that clears it, not "`levain hands mcp
+    list` shows the same read" (that list shows this same line). Red with doctor_rows copying status_rows' ok."""
+    world.entry(ENTRY, "files")
+    world.revoke_key("a", by="b")
+    rows = _doctor_hands(world, monkeypatch)
+    (row,) = [r for r in rows if r.detail.startswith("hands mcp entry")]
+    assert (row.name, row.ok, row.warn) == ("hands mcp", True, True)
+    assert row.detail.startswith(f"hands mcp entry {ENTRY}: stopped: {BORN}")
+    assert row.hint == f"`levain consent grant revoke --signing-key <key> -- {ENTRY}`"
+    (cmd,) = _quoted(row.hint)
+    assert _parses(cmd)[-1] == ENTRY
+    assert [r for r in rows if not r.ok] == []                       # nothing here fails the doctor run
+    (grants,) = D._check_standing_grants(world.entity)                # the row beside it: the same stop, the same tier
+    assert (grants.ok, grants.warn) == (True, True) and ENTRY in grants.detail
+    _list_rows, code = hml.status_rows(world.entity, world.root)      # the focused list still fails on it
+    assert code == 1
+
+
+def test_a_hands_row_that_is_not_a_stop_keeps_its_failure_and_its_hint(world, monkeypatch) -> None:
+    """Control: only the stopped entry is translated; a read that fails is still a FAIL with the list as its hint."""
+    world.entry(ENTRY, "files")
+    world.revoke_key("a", by="b")
+
+    def broken(entity):
+        raise hml.HandsMcpError("probe fault")
+    rows = _doctor_hands(world, monkeypatch, record=broken)
+    (bad,) = [r for r in rows if r.detail.startswith("hands mcp record")]
+    assert (bad.ok, bad.warn, bad.hint) == (False, False, "`levain hands mcp list` shows the same read")
+    (stopped,) = [r for r in rows if r.detail.startswith("hands mcp entry")]
+    assert (stopped.ok, stopped.warn) == (True, True)
+
+
+def test_a_live_hands_entry_gives_no_warn_row(world, monkeypatch) -> None:
+    """Control: an entry whose signers are active is no stop and draws no entry row."""
+    world.entry(ENTRY, "files")
+    rows = _doctor_hands(world, monkeypatch)
+    assert [r for r in rows if r.detail.startswith("hands mcp entry")] == []
+    assert all(r.ok and not r.warn for r in rows), rows
+
+
+# --- L3 r3: a one-live refusal with one stopped and one live blocker ------------------------------------------------
+
+def _two_live_leases(world, monkeypatch) -> None:
+    """A log holding two live leases (the state a log signed before the one-live rule can hold): A's, then B's, written
+    with the append rule lifted for the second; then A is revoked, so the first is stopped and the second is live."""
+    world.lease(LEASE)
+    with monkeypatch.context() as m:
+        m.setattr(auth, "_seat_lease_unique_check", lambda *a, **k: None)
+        world.lease("sl-bbbbbbbbbbbb", by="b")
+    world.revoke_key("a", by="b")
+
+
+def test_a_refusal_with_a_stopped_and_a_live_blocker_says_each_as_it_is(world, monkeypatch) -> None:
+    """L3 r3: with one stopped and one live blocker the refusal called both "already live". Each is now said as it is,
+    the stopped one with its revoke verb. Red with the all-or-nothing branch."""
+    _two_live_leases(world, monkeypatch)
+    said = _refused(lambda: world.lease("sl-cccccccccccc", by="b"))
+    assert f"{LEASE!r} was stopped ({BORN}) and answers nothing, but it still counts here until it is revoked" in said
+    assert "'sl-bbbbbbbbbbbb' is already live; revoke it first" in said
+    assert f"{LEASE!r} is already live" not in said and f"{LEASE!r}, " not in said
+    (cmd,) = _quoted(said)
+    argv = _parses(cmd)
+    assert argv[1:4] == ["seat", "lease", "revoke"] and argv[-1] == LEASE
+
+
+def test_a_refusal_with_two_live_blockers_names_both_live(world, monkeypatch) -> None:
+    """Control: two live blockers, none stopped, are both named live (in the plural)."""
+    world.lease(LEASE)
+    with monkeypatch.context() as m:
+        m.setattr(auth, "_seat_lease_unique_check", lambda *a, **k: None)
+        world.lease("sl-bbbbbbbbbbbb", by="b")
+    said = _refused(lambda: world.lease("sl-cccccccccccc", by="b"))
+    assert f"{LEASE!r}, 'sl-bbbbbbbbbbbb' are already live; revoke them first" in said and "stopped" not in said
+
+
+# --- L3 r3: the cockpit page's way back is the server's, per kind ---------------------------------------------------
+
+def test_the_page_rows_carry_the_way_back_the_terminal_lists_print(world, monkeypatch) -> None:
+    """Every kind the cockpit page draws as a row carries ``way_back``, the very clause its terminal list line prints
+    (``stopped_line``), so the page has no second copy to disagree. Red with the ``way_back`` field left off the rows."""
+    world.consent("cg-A")
+    world.shell("sh-A")
+    world.lease(LEASE)
+    world.egress(EGRESS)
+    world.inert("pg-0123456789ab", monkeypatch)
+    world.consent("cg-B", by="b")                                    # control: B's grant stays live
+    world.revoke_key("a", by="b")
+    rows = {r["id"]: r for r in G.grant_view(world.qdir, now=_now())["grants"]}
+    kinds = {"cg-A": auth.CONSENT_GRANT_KIND, "sh-A": auth.CONSENT_CONTAINED_SHELL_KIND, LEASE: auth.SEAT_LEASE_KIND,
+             EGRESS: auth.SEAT_EGRESS_KIND, "pg-0123456789ab": "push"}
+    for gid, kind in kinds.items():
+        assert rows[gid]["state"] == "stopped"
+        assert G.stopped_line(BORN, kind) == f"stopped: {BORN} (answers nothing; {rows[gid]['way_back']})", gid
+    assert rows[LEASE]["way_back"] == rows[EGRESS]["way_back"] == "revoke it, then create it again to use it"
+    assert rows["cg-A"]["way_back"] == "create it again to use it"
+    assert rows["cg-B"]["way_back"] == ""                            # a live row has none
+
+
+def test_a_stopped_voice_key_row_carries_the_terminal_words(voice) -> None:
+    voice.add("b")
+    voice.revoke_key("b")
+    (row,) = G.grant_view(voice.qdir, now=_now())["grants"]
+    assert (row["kind"], row["state"]) == (auth.VOICE_KEY_KIND, "stopped")
+    assert G.stopped_line(BORN, auth.VOICE_KEY_KIND) == f"stopped: {BORN} (answers nothing; {row['way_back']})"
+
+
+def test_the_voice_words_are_true_a_plain_add_is_refused_and_revoke_then_add_lands(voice) -> None:
+    """The fact the page's voice words rest on: while a stopped voice key is held a plain add is refused (so the page's
+    old "Set it again" sent the operator into a refusal), and the terminal's way (revoke it, then add one) lands. The
+    one-step ``--replace`` lands too (``tests/test_revoked_signer_voice.py``)."""
+    from levain.voice.custody import VoiceKeyRefused
+
+    old, _ = voice.add("b")
+    voice.revoke_key("b")
+    with pytest.raises(VoiceKeyRefused, match="already has a voice key"):
+        voice.add("a", value="sk-OTHERVALUE-0123456789", source="levain-voice-openai-again")
+    from levain.voice import custody
+    custody.revoke_key(voice.root, old["id"], signer_fp=voice.keys["a"][1], sign=voice.sign_as("a"), clock=_now)
+    new, _ = voice.add("a", value="sk-OTHERVALUE-0123456789", source="levain-voice-openai-again2")
+    assert new["id"] != old["id"] and voice.read() == "sk-OTHERVALUE-0123456789"
