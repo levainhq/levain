@@ -354,13 +354,25 @@ def test_anything_but_a_deny_becomes_no_decision(tmp_path, event, obj):
                                            "permissionDecisionReason": "lint says no",
                                            "updatedInput": {"command": "x"}}}, "lint says no"),
     ("PreToolUse", {"decision": "block", "reason": "blocked by policy"}, "blocked by policy"),
-    ("PermissionRequest", {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
-        "behavior": "deny", "message": "not on main", "interrupt": True}}}, "not on main"),
-    ("PermissionRequest", {"decision": "block", "reason": 7}, None),
 ])
 def test_a_deny_passes_as_exit_2_with_its_reason_and_nothing_else(tmp_path, event, obj, why):
     code, out, err = run_filter(tmp_path, event, emit(obj))
     assert (code, out) == (hook_run.REFUSED_EXIT, "") and err == (why or hook_run.REPO_DENY_DEFAULT) + "\n"
+
+
+@pytest.mark.parametrize("obj,why", [
+    ({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
+        "behavior": "deny", "message": "not on main", "interrupt": True}}}, "not on main"),
+    ({"decision": "block", "reason": 7}, None),
+])
+def test_a_permission_request_deny_passes_as_the_decision_object_with_its_reason_and_nothing_else(tmp_path, obj, why):
+    """DIOGAP X1: Claude Code does not honour exit 2 on PermissionRequest (hooks reference: "Deny through the
+    ``decision`` object instead"), so the filter's deny there is that object on stdout and exit 0: the reason as its
+    ``message``, and nothing the repo printed besides (its ``interrupt`` included)."""
+    code, out, err = run_filter(tmp_path, "PermissionRequest", emit(obj))
+    assert (code, err) == (0, "")
+    assert json.loads(out) == {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
+        "behavior": "deny", "message": why or hook_run.REPO_DENY_DEFAULT}}}
 
 
 def test_an_exit_2_passes_with_its_stderr(tmp_path):
