@@ -46,6 +46,7 @@ class Live {
 }
 Object.defineProperty(Live.prototype, "processLocally", {get() { return this._pl === true; }, set(v) { this._pl = v; }, configurable: true});
 class Ignores extends Live {}
+class Thrower extends Live { start() { throw new DOMException("x", "InvalidStateError"); } }
 Object.defineProperty(Ignores.prototype, "processLocally", {get() { return false; }, set(v) {}, configurable: true});
 class Unavailable extends Live { static available() { return Promise.resolve("unavailable"); } }
 class Downloadable extends Live { static available() { return Promise.resolve("downloadable"); } }
@@ -79,6 +80,7 @@ def test_voice_never_names_a_cloud_recognizer_or_a_transcribe_route():
     for word in ("getUserMedia", "MediaRecorder", "audio/transcriptions", "api.openai.com"):
         assert word not in js, word
     assert 'LevainMic.localSpeech(Speech)' in js and "r.processLocally = true" in js   # the on-device test is mic.js's one function
+    assert "dictateReason" in js and "Heard nothing" not in js and "not installed for this language" not in js   # the words come from mic.js's one table
 
 
 @needs_browser
@@ -181,16 +183,48 @@ def test_the_mic_follows_availability_not_capability(tmp_path, w):
     assert out["values"][2] != ""            # lang is set explicitly from the document / browser language
 
 
+# what the room says for each error name: the same words the card boxes say (mic.js holds the one table), pinned here by the
+# distinctive phrase of each so a room that kept its own table, or lost the shared one, reads red
+ROOM_WORDS = {"not-allowed": "allow it for this site in the address bar", "service-not-allowed": "on-device pack may be missing",
+              "language-not-supported": "on-device pack may be missing", "audio-capture": "No microphone was found",
+              "no-speech": "No speech was heard; tap Dictate and try again.", "network": "Speech recognition failed; tap Dictate to try again.",
+              "aborted": "Dictation was interrupted; tap Dictate to try again.", "something-new": "Dictation stopped (something-new)."}
+
+
 @needs_browser
 def test_dictation_errors_read_by_code(tmp_path, w):
-    want = {"not-allowed": "permission", "service-not-allowed": "permission", "audio-capture": "No microphone",
-            "no-speech": "Heard nothing", "language-not-supported": "not installed for this language", "network": "Dictation stopped."}
-    for code, words in want.items():
+    """Red with: the room keeping its own error table (the old words for network and aborted, no reason for a throwing start())."""
+    for code, words in ROOM_WORDS.items():
         out, _w = _run(tmp_path, w, "Live", [
             {"eval": "window.__err = '%s'; document.querySelector('.rv-mic:not(.rv-mic-stream)').click();"
-                     " JSON.stringify({n: document.querySelector('.rv-sendnote').textContent, l: document.querySelector('.rv-mic:not(.rv-mic-stream)').getAttribute('aria-label')})" % code}])
+                     " JSON.stringify({n: document.querySelector('.rv-sendnote').textContent, l: document.querySelector('.rv-mic:not(.rv-mic-stream)').getAttribute('aria-label'),"
+                     " same: document.querySelector('.rv-sendnote').textContent === LevainMic.dictateReason('%s')})" % (code, code)}])
         got = json.loads(out["values"][1])
-        assert words in got["n"] and got["l"] == "Dictate", (code, got)
+        assert words in got["n"] and got["l"] == "Dictate" and got["same"], (code, got)
+
+
+@needs_browser
+def test_a_dictation_start_that_throws_says_so_in_the_room(tmp_path, w):
+    """Red with: the start() catch freeing the control with no note (the tap does nothing, silently)."""
+    out, _w = _run(tmp_path, w, "Thrower", [
+        {"eval": "document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); JSON.stringify({n: document.querySelector('.rv-sendnote').textContent,"
+                 " l: document.querySelector('.rv-mic:not(.rv-mic-stream)').getAttribute('aria-label'), recs: __recs.length})"}])
+    assert json.loads(out["values"][1]) == {"n": "Dictation could not start; tap Dictate again.", "l": "Dictate", "recs": 1}
+
+
+@needs_browser
+def test_a_new_dictation_attempt_takes_back_its_own_last_reason_and_nobody_elses(tmp_path, w):
+    """Red with: the tap never clearing the last reason (the note says "No speech was heard" while dictation works); or clearing
+    a note that is not the dictation's own (the note is shared with Send)."""
+    out, _w = _run(tmp_path, w, "Live", [
+        {"eval": "window.__err = 'no-speech'; document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); document.querySelector('.rv-sendnote').textContent"},
+        {"eval": "window.__err = ''; document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); document.querySelector('.rv-sendnote').textContent"},
+        {"eval": "document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); document.querySelector('.rv-sendnote').textContent = 'Sent.';"
+                 " document.querySelector('.rv-mic:not(.rv-mic-stream)').click(); document.querySelector('.rv-sendnote').textContent"},
+    ])
+    assert out["values"][1] == ROOM_WORDS["no-speech"]
+    assert out["values"][2] == ""
+    assert out["values"][3] == "Sent."
 
 
 @needs_browser
