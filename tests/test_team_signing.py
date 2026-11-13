@@ -326,6 +326,11 @@ def test_no_ssh_keygen_is_indeterminate_and_never_cached(repo, keys, tmp_path, m
     sha = commit(repo, "signed", key=keys["ed25519"])
     plain = commit(repo, "plain")
     cache_path = tmp_path / "cache" / "sigcache.json"
+    # the signature temp files go to a directory of this test's own: the shared system temp is also written by every other
+    # signing check running in a parallel worker, so asserting it empty failed on another test's file (land CI, t1a, 11-13)
+    sigtmp = tmp_path / "sigtmp"
+    sigtmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(sigtmp))
     _without_ssh_keygen(monkeypatch, exc)
     got = S.SigCache(cache_path).verify(repo, [sha, plain])
     assert got[sha].kind == "indeterminate" and got[sha].fingerprint is None
@@ -333,7 +338,7 @@ def test_no_ssh_keygen_is_indeterminate_and_never_cached(repo, keys, tmp_path, m
     stored = json.loads(cache_path.read_text())
     assert stored["schema"] == S.CACHE_SCHEMA
     assert sha not in stored["entries"] and plain in stored["entries"]
-    leftovers = [p for p in Path(tempfile.gettempdir()).glob("levain-sig-*")]
+    leftovers = [p for p in sigtmp.glob("levain-sig-*")]
     monkeypatch.undo()
     got2 = S.SigCache(cache_path).verify(repo, [sha])
     assert got2[sha].kind == "signed" and got2[sha].fingerprint == S.fingerprint(pub_line(keys["ed25519"]))
