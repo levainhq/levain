@@ -627,9 +627,9 @@ class _Index:
 
     def orphans(self, iid: str) -> list[Branch]:
         """Branches carrying the id with commits of their own that no live seat holds. ``ahead`` is the READER's count
-        of the branch's own commits whose work is on neither origin/main nor any chain ref (patch-id first, then
-        trailer and subject), so a branch that was cherry-picked or re-chained and never deleted has ``ahead`` 0 and is
-        no orphan: this function never judges by tip sha, which a replay changes."""
+        of the branch's own commits whose work is on neither origin/main nor any chain ref (a one-to-one patch-id match,
+        the trailer and subject only for an empty diff), so a branch that was cherry-picked or re-chained and never
+        deleted has ``ahead`` 0 and is no orphan: this function never judges by tip sha, which a replay changes."""
         return [b for b in self.branches.get(iid, ()) if b.ahead > 0 and b.name not in self.seats_on_branch]
 
 

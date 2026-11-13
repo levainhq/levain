@@ -45,6 +45,27 @@ class World:
         git(self.w, "commit", "-q", "-m", msg, date=date)
         return git(self.w, "rev-parse", "HEAD")
 
+    def commit_raw(self, message: str, *, file: str, body: str = "x\n", date: str = DAY) -> str:
+        """A commit with the message exactly as given (the shape of a seat's real message, trailer block or not)."""
+        self.n += 1
+        (self.w / file).write_text(body, encoding="utf-8")
+        git(self.w, "add", "-A")
+        git(self.w, "commit", "-q", "-m", message, date=date)
+        return git(self.w, "rev-parse", "HEAD")
+
+    def empty_commit(self, subject: str, *, trailers: tuple[str, ...] = (), date: str = DAY) -> str:
+        """A commit with no diff at all (no patch-id exists for it)."""
+        self.n += 1
+        msg = subject + ("\n\nbody\n\n" + "\n".join(trailers) if trailers else "")
+        git(self.w, "commit", "-q", "--allow-empty", "-m", msg, date=date)
+        return git(self.w, "rev-parse", "HEAD")
+
+    def clone(self, dest: Path, *flags: str) -> Path:
+        """A second clone of ``origin`` (``--depth 1`` for a shallow one, ``--filter=...`` for a partial one)."""
+        subprocess.run(["git", "clone", "-q", *flags, f"file://{self.origin}", str(dest)], check=True, capture_output=True,
+                       env={**os.environ, **_ENV})
+        return dest
+
     def push_main(self) -> None:
         git(self.w, "push", "-q", "origin", "main")
         git(self.w, "fetch", "-q", "origin")
