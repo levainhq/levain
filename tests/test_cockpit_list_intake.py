@@ -349,8 +349,8 @@ def test_a_raise_of_intention_seed_governs_a_drop_and_a_talk_never_a_sort():
     spec = VerbRegistry().get(INTAKE_VERB)
     today = NOW_LOCAL.date()
     pol = _Raise(intention_seed="T3")
-    assert [spec.tier({"line": l}, None, "verified", today, policy=pol) for l in ("@+1h x", "? y", "z")] == \
-        ["T3", "T3", "C1"]
+    assert [spec.tier({"line": l}, None, "verified", today, policy=pol) for l in ("@+1h x", "? y", "z", "remind me +1h x")] == \
+        ["T3", "T3", "C1", "T3"]
     assert spec.rendered_tier(None, "verified", today, policy=pol) == "T3"
     assert spec.head("sign", policy=pol)["tier"] == "T3"
     # its own raise still governs every kind
