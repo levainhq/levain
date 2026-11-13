@@ -1667,3 +1667,48 @@ def test_a_cut_log_takes_back_only_the_merge_it_cannot_tell_what_the_merge_broug
     ev, _ = read(world)
     assert ev["unreadable"] == {}
     assert {r["sha"] for r in ev["main"]} == {s, x, a}
+
+
+# ------------------------------------------------------------------------------------------------ 6. a wanted note that is not a blob
+def _notes_tree_lines(world, lines: list[str]) -> None:
+    """refs/notes/board = a tree of exactly ``lines`` (mktree input; ``--missing``: an entry may name an object that is absent)."""
+    tree = git(world.w, "mktree", "--missing", stdin="\n".join(lines) + "\n")
+    git(world.w, "update-ref", "refs/notes/board", git(world.w, "commit-tree", tree, "-m", "notes"))
+
+
+_ALL_FIVE = {"main", "chain", "branches", "refs", "unattributed"}
+
+
+def _logged_commit(world) -> str:
+    world.branch("seat/1112-40-a")
+    b = world.commit("own", file="own.txt")
+    world.push("seat/1112-40-a")
+    return b
+
+
+def test_a_wanted_note_whose_object_is_missing_makes_every_source_unreadable(world, monkeypatch):
+    """codex + deepseek MED: the notes tree names a logged commit but the blob is gone (a pruned or corrupt tree). `cat-file`
+    says `missing`; reading that as an empty note silently drops a `Board-Closes` attribution. It is a failed read."""
+    b = _logged_commit(world)
+    _notes_tree_lines(world, [f"100644 blob {1:040x}\t{b}"])
+    asked = _spy_cat_file(monkeypatch)
+    ev, _ = read(world)
+    assert set(ev["unreadable"]) == _ALL_FIVE
+    assert all(b in why for why in ev["unreadable"].values())              # it names the entry
+    assert not _ALL_FIVE & set(ev)
+    assert asked == []                                                      # decided from the sizes: no blob load
+
+
+def test_a_wanted_note_that_is_not_a_blob_is_not_loaded_past_the_byte_cap(world, monkeypatch):
+    """codex MED: a non-blob leaf (a gitlink onto a commit that exists: ls-tree -r lists it as a leaf, and a tree entry is flattened away) named for a logged commit
+    was left out of the byte total but still loaded by `cat-file --batch`, so a 1-byte cap loaded a whole object. Any
+    wanted entry that is not `blob <size>` fails the read before the load, naming the entry."""
+    b = _logged_commit(world)
+    obj = git(world.w, "rev-parse", "HEAD")
+    _notes_tree_lines(world, [f"160000 commit {obj}\t{b}"])
+    monkeypatch.setattr(be, "MAX_NOTES_BYTES", 1)
+    asked = _spy_cat_file(monkeypatch)
+    ev, _ = read(world)
+    assert set(ev["unreadable"]) == _ALL_FIVE
+    assert all(b in why for why in ev["unreadable"].values())
+    assert asked == []                                                      # nothing was loaded
