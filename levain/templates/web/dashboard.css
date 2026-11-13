@@ -3034,6 +3034,33 @@ body.rv-on.rv-kb .rv .rv-dock { padding-bottom: 12px; }   /* the home indicator 
 @media (max-width: 720px) { body.rv-on.rv-kb .deck > .masthead, body.rv-on.rv-kb .deck > .ck-phonetabs { display: none; } }
 body.rv-on .ck-phonetabs button[data-phone-jump="room"] { color: var(--text); background: var(--card-2); }
 
+/* The Desk tab (dashboard_boot.js sets body.dv-on; levain 33): a second full tab beside the Room with the Room's own box and look (the
+   view's wrapper carries .rv, so every .rv rule above draws it). Same deck rules as body.rv-on; desk_tab_view.js keeps --rv-vvh /
+   --rv-vvt for the phone's keyboard and sets dv-kb. */
+.dv-zone { display: none; }
+body.dv-on { overflow: hidden; }
+body.dv-on .deck { position: fixed; left: 0; right: 0; top: var(--rv-vvt, 0px); height: var(--rv-vvh, 100dvh); min-height: 0; max-width: none; margin: 0; padding-bottom: 0; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; }
+body.dv-on .deck > :not(.masthead):not(.ck-phonetabs):not(.dv-zone) { display: none !important; }
+body.dv-on .deck > .masthead, body.dv-on .deck > .ck-phonetabs { flex: none; }
+body.dv-on .dv-zone { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; margin: 0; padding: 0; }
+body.dv-on .dv-zone[hidden] { display: none; }
+body.dv-on .dv-zone .dv-body-host { position: relative; flex: 1 1 0; min-height: 0; }
+body.dv-on .dv-zone .dv-body-host > .rv { position: absolute; inset: 0; height: auto; }
+body.dv-on.dv-kb .rv .rv-dock { padding-bottom: 12px; }
+@media (max-width: 720px) { body.dv-on.dv-kb .deck > .masthead, body.dv-on.dv-kb .deck > .ck-phonetabs { display: none; } }
+body.dv-on .ck-phonetabs button[data-phone-jump="desk"] { color: var(--text); background: var(--card-2); }
+/* the lease line under the title: the server's words, wrapped; with no lease the signed Drop is one tap away */
+.rv .dv-state { flex: none; display: flex; flex-direction: column; gap: var(--sp-2); box-sizing: border-box; padding: var(--sp-3) var(--rv-pr) var(--sp-3) var(--rv-pl); border-bottom: 1px solid var(--hair); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); color: var(--label); overflow-wrap: anywhere; }
+.rv .dv-state:empty { display: none; }
+.rv .dv-state-unwired, .rv .dv-state-error { background: var(--card-2); color: var(--text); }
+.rv .dv-lease-none { border-left: 3px solid var(--warn); }
+.rv .dv-droplink { align-self: flex-start; min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; background: none; color: var(--text); border: 1px solid var(--hair-2); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+.rv .dv-you .dv-status { margin-top: var(--sp-1); text-align: right; }
+.rv .dv-sending { opacity: .55; }
+.rv .dv-refused .dv-status, .rv .dv-failed .dv-status { color: var(--text); border-right: 2px solid var(--bad); padding-right: var(--sp-2); }
+.rv .dv-ambiguous .dv-status { color: var(--text); border-right: 2px solid var(--warn); padding-right: var(--sp-2); }
+.rv .dv-took, .rv .dv-held, .rv .dv-other { border-left: 2px solid var(--hair-2); padding: var(--sp-1) var(--sp-4); }
+
 /* C12: the board kind's painters (board_view.js, bd-*). The panel lists cards grouped under column headings; the six columns (one on a narrow page) are the ⤢ modal's. */
 .bd-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--sp-4); align-items: start; }
 .bd-col { min-width: 0; }

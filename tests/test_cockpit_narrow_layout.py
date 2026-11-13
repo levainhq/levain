@@ -13,7 +13,7 @@ from tests.test_cockpit_narrow_layout_rig import (DESKTOP, NEEDS, PHONE_TOUCH, S
 CSS = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.css"
 HTML = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "dashboard.html"
 
-TABS = ["needs", "board", "notifications", "grants", "drop", "room"]
+TABS = ["needs", "board", "notifications", "grants", "drop", "room", "desk"]
 
 # where things sit and how the strip draws, as one JSON string
 LAYOUT = """(() => { const q = (s) => document.querySelector(s);
