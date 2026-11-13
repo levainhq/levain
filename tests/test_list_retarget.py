@@ -268,7 +268,8 @@ def test_a_first_part_with_a_waiting_second_part_is_not_handed_to_the_machine(tm
     store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
         st, body = _retarget(base, a, {"target": target})
-    assert st >= 400 and f in str(body) and "waits on" in str(body), (st, body)           # refused, naming the waiting part
+    assert st == 409 and body["error"] == "refused", (st, body)                            # the neighbours' answer, not a 500
+    assert f in str(body) and "waits on" in str(body), (st, body)                          # naming the waiting part
     assert store.get(a)["target"] == "band"
 
 
@@ -287,3 +288,128 @@ def test_a_first_part_can_still_change_hands_to_the_operator_or_when_nothing_wai
         st, body = _retarget(base, a, {"target": "desk"})
         assert st == 200, body
     assert store.get(a)["target"] == "desk"
+
+
+# --- the guard's own edges (L3 round 1 of the diogenes-20261113-020650 fix) ------------------------------------------------
+import sqlite3  # noqa: E402
+
+from levain.cockpit.broker import Broker, BrokerError  # noqa: E402
+from levain.cockpit.effects import IntentionEffectStore, TransientApplyFault  # noqa: E402
+from tests.test_cockpit_k2b_broker import BROWSER, _target, home, intentions  # noqa: E402,F401 - fixtures
+
+
+def _pair_in(intentions: Path) -> tuple[str, str, str]:
+    """In the broker tests' store: a first part (band, key ``k.a``), a second part waiting on it, and a lone agenda (key ``k.b``)."""
+    from levain.intentions import guarded_intention_store
+
+    store = guarded_intention_store(intentions)
+    a = store.add(type="task", text="call Jim", disposition="agenda", target="band", next="2031-01-07", origin_key="k.a",
+                  today=TODAY)["id"]
+    f = store.add(type="task", text="send the invoice", disposition="agenda", target="band", on_event=f"done:{a}",
+                  check_by="2031-01-14", origin_key="k.f", today=TODAY)["id"]
+    store.add(type="task", text="a lone agenda", disposition="agenda", target="band", next="2031-01-07", origin_key="k.b", today=TODAY)
+    return a, f, "k.b"
+
+
+def _retarget_via(b: Broker, intentions: Path, key: str, params: dict[str, Any]) -> dict[str, Any]:
+    return b.issue(verb="intention_retarget", params=params, target=_target(intentions, key), credential=BROWSER, tier="T2",
+                   intent="reported")
+
+
+def _target_of(intentions: Path, key: str) -> Any:
+    from anneal_memory.spores import IntentionStore as _S
+
+    return _S(intentions, id_prefix="intention").get_by_origin_key(key).get("target")
+
+
+class _NoWaitingOn(IntentionEffectStore):
+    """A store of the right protocol that cannot say what waits on a row: the guard must not read that as "nothing waits"."""
+
+    @property
+    def waiting_on(self) -> Any:                                     # hasattr() is False; a call is an AttributeError
+        raise AttributeError("waiting_on")
+
+
+class _Counting(IntentionEffectStore):
+    calls = 0
+    fault: Exception | None = None
+
+    def waiting_on(self, anchor_id: str) -> list[str]:
+        type(self).calls += 1
+        if self.fault is not None:
+            raise self.fault
+        return super().waiting_on(anchor_id)
+
+
+def test_a_store_that_cannot_say_what_waits_is_not_a_way_past_the_guard(home: Path, intentions: Path) -> None:
+    from tests.test_cockpit_k2b_broker import _broker
+
+    _pair_in(intentions)
+    b = _broker(home, intentions, _NoWaitingOn(intentions))
+    try:
+        with pytest.raises(Exception):                                # fails closed (loudly), never "nothing waits"
+            _retarget_via(b, intentions, "k.a", {"target": "desk"})
+    finally:
+        b.stop()
+    assert _target_of(intentions, "k.a") == "band"
+
+
+def test_the_stranding_read_is_for_a_machine_target_only(home: Path, intentions: Path) -> None:
+    """A retarget to the band or a nudge never reads the store for followers, so a store fault cannot refuse it; a machine target does."""
+    from tests.test_cockpit_k2b_broker import _broker
+
+    _pair_in(intentions)
+    _Counting.calls = 0
+    store = _Counting(intentions)
+    b = _broker(home, intentions, store)
+    try:
+        store.fault = TransientApplyFault("OSError", "store down")
+        for tgt in ("nudge", "band"):
+            assert _retarget_via(b, intentions, "k.a", {"target": tgt})["state"].upper() == "COMMITTED"
+        assert _Counting.calls == 0                                    # no read for an operator target
+        with pytest.raises(BrokerError) as ei:
+            _retarget_via(b, intentions, "k.a", {"target": "desk"})
+        assert (ei.value.code, ei.value.status) == ("source_unavailable", 503), (ei.value.code, ei.value.status)
+        assert _Counting.calls == 1
+        store.fault = None
+        with pytest.raises(BrokerError) as ei:
+            _retarget_via(b, intentions, "k.a", {"target": "board:levain"})
+        assert (ei.value.code, ei.value.status) == ("refused", 409) and "waits on" in str(ei.value)
+        assert _Counting.calls == 2
+    finally:
+        b.stop()
+
+
+@pytest.mark.parametrize("params", [{"target": " Desk "}, {"target": "mars"}, {"target": 5}, {"target": "board:"}, {}])
+def test_a_target_the_verb_does_not_allow_gets_its_own_answer_with_or_without_a_waiting_part(
+        home: Path, intentions: Path, params: dict[str, Any]) -> None:
+    """An invalid or missing target is answered by ``_ce_retarget`` (its own words), identically for a first part with a waiting
+    second part and for a lone agenda, and costs no read of the store."""
+    from tests.test_cockpit_k2b_broker import _broker
+
+    _pair_in(intentions)
+    _Counting.calls = 0
+    b = _broker(home, intentions, _Counting(intentions))
+    try:
+        answers = []
+        for key in ("k.a", "k.b"):
+            with pytest.raises(BrokerError) as ei:
+                _retarget_via(b, intentions, key, params)
+            answers.append((ei.value.code, ei.value.status, str(ei.value)))
+    finally:
+        b.stop()
+    assert answers[0] == answers[1], answers
+    assert answers[0][:2] == ("refused", 409) and "waits on" not in answers[0][2], answers[0]
+    assert _Counting.calls == 0
+
+
+@pytest.mark.parametrize("exc", [OSError("x"), ValueError("x"), TypeError("x"), RuntimeError("x"), KeyError("x"), AttributeError("x")])
+def test_waiting_on_reports_any_read_fault_as_a_transient_fault(intentions: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    import levain.intentions as li
+
+    def boom(path: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(li, "list_open_readonly", boom)
+    with pytest.raises(TransientApplyFault):
+        IntentionEffectStore(intentions).waiting_on("intention-001")

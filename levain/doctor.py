@@ -4232,7 +4232,9 @@ def _check_by_ring_open(item: dict[str, Any], day: Any, rung: list[set[str]]) ->
     leaves such a part unstamped on purpose (the event may still wake it), so it is a pending answer, not a missed run. An
     answered row is not counted: its effect (a later check-by, or the part dropped) either landed, and the part is no longer late
     or gone, or did not, and a run is owed. ``rung`` is the caller's one-slot cache of the open rows' keys. A band that cannot be
-    read answers False: the doctor then reports the part, as it did before it asked."""
+    read, or anything that raises in asking, answers False: the doctor then reports the part, as it did before it asked. The band
+    is the levain home's (``default_queue_dir``, which is what the other rows' ``_consent_queue_dir`` returns and germinate's own default:
+    one band per home, not a directory of this install) and is read READ-ONLY: a doctor run creates neither ``questions.db`` nor its directory."""
     from levain.consent.queue import default_queue_dir
     from levain.consent.questions import QuestionStore
     from levain.germinate import KEY_PREFIX
@@ -4240,12 +4242,14 @@ def _check_by_ring_open(item: dict[str, Any], day: Any, rung: list[set[str]]) ->
     okey = item.get("origin_key")
     if not isinstance(okey, str) or not okey:
         return False        # germinate rings a part only by its origin key: with none it never filed a row
-    if not rung:
-        try:
+    try:
+        if not rung:
             rung.append({q.agent_session_id for q in QuestionStore(default_queue_dir()).open_questions()})
-        except Exception:  # noqa: BLE001 - a doctor check reports, it never crashes the run
-            rung.append(set())
-    return f"{KEY_PREFIX}checkby:{okey}:{day.isoformat()}" in rung[0]
+        return f"{KEY_PREFIX}checkby:{okey}:{day.isoformat()}" in rung[0]
+    except Exception:  # noqa: BLE001 - a doctor check reports, it never crashes the run
+        if not rung:
+            rung.append(set())        # one failed read per run, not one per part
+        return False
 
 
 def _check_overdue_agenda(install: Path, today: Any = None) -> list[CheckResult]:

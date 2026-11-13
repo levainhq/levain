@@ -66,13 +66,22 @@ if attempt "$@"; then
   exit 0
 fi
 
-echo "apt_install.sh: the update and the install of '$*' both failed on both attempts, the second after the sources edit above (the grep lines above show which hosts the sources name now; a file that never named the Azure host was left as it was)." >&2
+# What the control flow guarantees here: the first update failed (else the retry was not reached) and BOTH installs failed. The
+# second attempt's update is the one thing it may not have: UPDATE_FAILED now holds that attempt's own status.
+if [ "$UPDATE_FAILED" -eq 1 ]; then
+  SECOND_UPDATE="failed too"
+  INDEX_NOTE=" The index update also failed, so a package that does exist may be missing from a partial index."
+else
+  SECOND_UPDATE="succeeded"
+  INDEX_NOTE=""
+fi
+echo "apt_install.sh: the install of '$*' failed on both attempts, the second after the sources edit above (the grep lines above show which hosts the sources name now; a file that never named the Azure host was left as it was). The first update failed; the second update $SECOND_UPDATE." >&2
 if [ "$INSTALL_STATUS" -eq 124 ] || [ "$INSTALL_STATUS" -eq 137 ]; then
   echo "apt_install.sh: the install hit its time limit and was stopped (status $INSTALL_STATUS); it did not report a cause, so a stalled mirror or a stuck dpkg are both possible." >&2
 elif grep -Eqi 'Could not get lock|Unable to acquire the dpkg|dpkg was interrupted' "$INSTALL_LOG"; then
   echo "apt_install.sh: another process holds the dpkg or apt lock, or dpkg was left interrupted (apt's message above names it); that is the runner's state." >&2
 elif grep -Eqi 'Unable to locate package|Couldn.t find any package|has no installation candidate' "$INSTALL_LOG"; then
-  echo "apt_install.sh: apt does not know the package name in '$*' (check the spelling and that its repository is configured); the index update also failed, so a package that does exist may be missing from a partial index." >&2
+  echo "apt_install.sh: apt does not know the package name in '$*' (check the spelling and that its repository is configured).$INDEX_NOTE" >&2
 elif grep -Eqi 'Temporary failure resolving|Could not resolve|Failed to fetch|Connection (timed out|failed|refused)|Unable to connect|Could not connect|Network is unreachable|Cannot initiate the connection' "$INSTALL_LOG"; then
   echo "apt_install.sh: apt reported a fetch failure (name resolution, connection or mirror error); that points at the runner's network or the mirror (read apt's message above), not at the code under test." >&2
 else

@@ -24,6 +24,10 @@ for a in "$@"; do
 done
 echo "$verb" >> "$STUB_CALLS"
 if [ "$verb" = update ]; then
+  # the second update takes STUB_UPDATE_RC2 when it is set (a retry whose update succeeds)
+  if [ "$(grep -c '^update$' "$STUB_CALLS")" -ge 2 ] && [ -n "${STUB_UPDATE_RC2:-}" ]; then
+    exit "$STUB_UPDATE_RC2"
+  fi
   exit "${STUB_UPDATE_RC:-0}"
 fi
 if [ -n "${STUB_INSTALL_OUT:-}" ]; then
@@ -52,7 +56,7 @@ def run(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
 
-    def go(*pkgs, update_rc=0, install_rc=0, install_out=""):
+    def go(*pkgs, update_rc=0, update_rc2=None, install_rc=0, install_out=""):
         env = {
             "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}",
             "HOME": str(home),
@@ -60,6 +64,7 @@ def run(tmp_path):
             "TMPDIR": str(tmp_path),
             "STUB_CALLS": str(calls),
             "STUB_UPDATE_RC": str(update_rc),
+            "STUB_UPDATE_RC2": "" if update_rc2 is None else str(update_rc2),
             "STUB_INSTALL_RC": str(install_rc),
             "STUB_INSTALL_OUT": install_out,
         }
@@ -170,4 +175,18 @@ def test_the_closing_line_does_not_claim_the_second_attempt_ran_on_the_other_mir
     assert calls == ["update", "install", "update", "install"]
     tail = r.stderr.split("retrying on archive.ubuntu.com", 1)[1]
     assert "again on archive.ubuntu.com" not in tail
-    assert "both failed" in tail and "sources edit" in tail
+    assert "failed on both attempts" in tail and "sources edit" in tail
+    assert "the second update failed too" in tail
+
+
+def test_the_closing_line_does_not_claim_the_second_update_failed_when_it_succeeded(run):
+    """codex L3: the first update fails, the retry's update succeeds, only its install fails. The closing line states the second
+    update's own result, and the unknown-package line does not say the index update failed."""
+    r, calls = run("no-such-pkg", update_rc=100, update_rc2=0, install_rc=100,
+                   install_out="E: Unable to locate package no-such-pkg")
+    assert r.returncode == 1
+    assert calls == ["update", "install", "update", "install"]
+    tail = r.stderr.split("retrying on archive.ubuntu.com", 1)[1]
+    assert "the second update succeeded" in tail
+    assert "update and the install" not in tail and "update also failed" not in tail
+    assert "network" not in tail and "mirror" not in tail

@@ -855,3 +855,51 @@ def test_doctor_reports_the_part_when_the_band_cannot_be_read(tmp_path, qdir, mo
     root = _install(tmp_path)
     f = _follower(root, _anchor(root)["id"], check_by="2026-11-10")
     assert f["id"] in doctor._check_overdue_agenda(root, today=TODAY)[0].detail
+
+
+def test_a_doctor_run_creates_neither_the_band_store_nor_its_directory(tmp_path, monkeypatch):
+    """L3 round 1: the check-by ring is read for a part past its check-by, and a read-only check must not leave a ``questions.db``
+    (or the consent directory) behind in a home that never had a band. Both the empty directory and the absent one."""
+    from levain import doctor
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("LEVAIN_HOME", str(home))
+    root = _install(tmp_path)
+    f = _follower(root, _anchor(root)["id"], check_by="2026-11-10")
+    for make_dir in (False, True):
+        if make_dir:
+            (home / "consent").mkdir(parents=True, mode=0o700)
+        assert f["id"] in doctor._check_overdue_agenda(root, today=TODAY)[0].detail        # nothing filed: the part is reported
+        assert not (home / "consent" / "questions.db").exists()
+        assert (home / "consent").is_dir() == make_dir
+
+
+def test_the_ring_check_reports_the_part_when_asking_itself_raises():
+    """A raise anywhere in the ring check (here a ``day`` that is not a date, after the band was read) answers False, so the
+    doctor reports the part: the safe direction. One failed read is cached, not retried per part."""
+    from levain import doctor
+
+    rung: list[set[str]] = [set()]
+    assert doctor._check_by_ring_open({"origin_key": "k"}, None, rung) is False
+    rung = []
+    assert doctor._check_by_ring_open({"origin_key": "k"}, None, rung) is False and len(rung) == 1
+
+
+def test_an_unreadable_band_is_read_once_for_the_whole_run_not_once_per_part(tmp_path, monkeypatch):
+    from levain import doctor
+
+    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home"))
+    calls = []
+
+    def boom(self, agent=None):
+        calls.append(1)
+        raise RuntimeError("band down")
+
+    monkeypatch.setattr(QuestionStore, "open_questions", boom)
+    root = _install(tmp_path)
+    a = _anchor(root)
+    f1 = _follower(root, a["id"], text="one", check_by="2026-11-10")
+    f2 = _follower(root, a["id"], text="two", check_by="2026-11-10")
+    detail = doctor._check_overdue_agenda(root, today=TODAY)[0].detail
+    assert f1["id"] in detail and f2["id"] in detail                                       # both reported
+    assert len(calls) == 1

@@ -499,7 +499,7 @@ class IntentionEffectStore:
 
         try:
             return [str(s.get("id")) for s in followers_of(list_open_readonly(self.path), anchor_id)] if self.path.exists() else []
-        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        except (OSError, ValueError, TypeError, RuntimeError, KeyError, AttributeError) as exc:
             raise TransientApplyFault.of(exc) from exc
 
     def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:
@@ -884,14 +884,22 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
     return _existing_effect(pre, changes, version_of)
 
 
+def retarget_to_machine(params: Mapping[str, Any]) -> bool:
+    """Whether ``intention_retarget`` is asked to hand the row to the machine (the desk or a board) with a target the verb allows. Asked
+    BEFORE anything is read for the stranding rule, so a retarget to the band or a nudge, or one the verb itself refuses, never
+    reads the store for waiting parts."""
+    from levain.intentions import executor_of, valid_retarget
+
+    target = params.get("target")
+    return valid_retarget(target) and executor_of(target) == "machine"
+
+
 def retarget_strands_refusal(params: Mapping[str, Any], pre: Mapping[str, Any] | None, waiting: Sequence[str]) -> str | None:
     """Why ``intention_retarget`` may not hand ``pre`` to the desk or a board while ``waiting`` (the ids of the open second parts
     that wait on it finishing) is not empty; ``None`` when it may. The split's one invariant, which ``levain.split.create_then``
     holds at link time: a machine part is closed when it is handed off, so nothing could mark it done and the part waiting on it
     would never wake. The effect sees only the one row, so the caller that holds the store reads ``waiting`` and asks."""
-    from levain.intentions import executor_of
-
-    if not waiting or pre is None or executor_of(params.get("target")) != "machine":
+    if not waiting or pre is None or not retarget_to_machine(params):
         return None
     names = ", ".join(waiting[:3]) + (" ..." if len(waiting) > 3 else "")
     return (f"{pre.get('id')} waits to be marked done by you: {names} waits on it. Handed to the desk or a board it would be "

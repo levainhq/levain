@@ -89,6 +89,7 @@ from levain.cockpit.effects import (
     registration_refusals,
     resolve_effect,
     retarget_strands_refusal,
+    retarget_to_machine,
     settle,
     intention_resource_key,
 )
@@ -846,8 +847,9 @@ class Broker:
         snap = es.snapshot(intention_resource_key(ok))
         if at_issue and target.get("row_version") is not None and snap.version != target["row_version"]:
             raise BrokerError("stale", 409, f"row {target.get('row_id')!r} changed since it was rendered")
-        if verb == "intention_retarget" and snap.row is not None and hasattr(es, "waiting_on"):
-            # the split's invariant (a machine part is closed at hand-off, so nothing marks it done) holds after the link too
+        if verb == "intention_retarget" and snap.row is not None and retarget_to_machine(params):
+            # the split's invariant (a machine part is closed at hand-off, so nothing marks it done) holds after the link too.
+            # Asked of a handed-to-the-machine target only, and asked unconditionally: a store that cannot answer is a fault, never "nothing waits"
             why = retarget_strands_refusal(params, snap.row, es.waiting_on(str(snap.row.get("id"))))
             if why is not None:
                 raise ValueError(why)
