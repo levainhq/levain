@@ -134,13 +134,14 @@ def test_the_agenda_key_is_the_question_id_alone_in_anneals_grammar() -> None:
 
 
 @pytest.mark.parametrize("offset", [1, SNOOZE_MAX_DAYS])
-def test_a_day_inside_the_snooze_window_is_refused_with_the_rule_and_the_remedy(rig: Rig, offset: int) -> None:
+def test_a_day_inside_the_snooze_window_is_refused_with_the_rule_and_no_pointer_to_a_snooze_the_List_does_not_offer(rig: Rig, offset: int) -> None:
     day = (TODAY + timedelta(days=offset)).isoformat()
     with pytest.raises(EditError) as ei:
         _fire(rig, _row(rig), day)
     words = str(ei.value)
     assert (ei.value.code, ei.value.http_status) == ("bad_agenda_day", 422)
-    assert f"{SNOOZE_MAX_DAYS} days" in words and "snooze the row instead" in words
+    assert f"{SNOOZE_MAX_DAYS} days" in words and "snooze" in words and "an agenda is for a day after" in words
+    assert "snooze the row instead" not in words      # the List offers no Snooze on a row this verb applies to: nowhere to send the reader
     assert (TODAY + timedelta(days=SNOOZE_MAX_DAYS)).isoformat() in words
     assert _agendas(rig) == [] and rig.qs.get(rig.q.id).answer is None and _audit(rig) == []
 
@@ -165,16 +166,17 @@ def test_a_day_that_is_not_a_date_is_refused(rig: Rig, day: Any) -> None:
     assert _agendas(rig) == [] and rig.qs.get(rig.q.id).answer is None
 
 
-def test_the_day_refusal_sentences_are_unchanged_byte_for_byte(rig: Rig) -> None:
-    """The page branch still matches the sentence by regex until it switches to the code, so the code moves and the words do not.
-    Literals, written out here, so a reworded sentence fails this test and not only the page's."""
+def test_the_day_refusal_sentences_are_pinned_byte_for_byte(rig: Rig) -> None:
+    """The List page shows the host's sentence as sent when it matches the page's day-sentence pattern, so the sentences are pinned
+    as literals, written out here: a reworded sentence fails this test and not only the page's. (The snooze pointer is gone from
+    the within-window sentence: the List offers no Snooze on a row this verb applies to.)"""
     latest = (TODAY + timedelta(days=SNOOZE_MAX_DAYS)).isoformat()
     inside = (TODAY + timedelta(days=1)).isoformat()
     cases = {
         "next week": "an agenda's day is written YYYY-MM-DD: 'next week' is not a date",
         TODAY.isoformat(): f"{TODAY.isoformat()} is not after today ({TODAY.isoformat()}): an agenda is for a day after {latest}",
         inside: (f"{inside} is within the snooze window (a snooze is at most {SNOOZE_MAX_DAYS} days, so {latest} at the latest): "
-                 f"snooze the row instead; an agenda is for a day after {latest}"),
+                 f"an agenda is for a day after {latest}"),
     }
     for day, sentence in cases.items():
         with pytest.raises(EditError) as ei:

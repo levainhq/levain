@@ -252,7 +252,8 @@ def test_a_plain_band_row_makes_an_agenda_through_a_day_form_and_the_server_judg
     form = json.loads(next(x for x in v if isinstance(x, str) and x.startswith('{"time"')))
     assert form["time"] is False and form["go"], form
     refusal = next((x for x in v if isinstance(x, str) and "snooze window" in x), None)
-    assert refusal and refusal.startswith(inside) and "snooze the row instead" in refusal, v    # the server's own words, not a fixed line
+    assert refusal and refusal.startswith(inside) and "an agenda is for a day after" in refusal, v    # the server's own words, not a fixed line
+    assert "snooze the row instead" not in refusal, refusal            # no pointer to a Snooze the List does not offer on this row
     fit = json.loads(next(x for x in v if isinstance(x, str) and x.startswith('{"formOver"')))
     assert fit == {"formOver": []}, fit                               # at 390 nothing in the form passes the card's edge
     fired = [p for p in _posts(out) if p.get("verb") == "band_agenda"]
@@ -288,14 +289,27 @@ def test_only_the_plain_band_row_offers_an_agenda_button(tmp_path: Path, monkeyp
 #
 # Each test below was run against the build as it stood (13ccd657d) first and failed there for the reason its comment names.
 
-def _year_words(day: date) -> str:
-    """``dayYearWords`` as the page writes it for the en-US test browser: ``Mon Nov 23, 2026``."""
-    return day.strftime("%a %b ") + str(day.day) + day.strftime(", %Y")
+def _day_words_step(*days: date) -> dict[str, Any]:
+    """Asks the page how it words each day (``dayYearWords``, the function the line is composed with): the browser's locale
+    decides the order and the punctuation, so the test reads the words from the page and does not rebuild them."""
+    return {"eval": "JSON.stringify({words: " + json.dumps([d.isoformat() for d in days])
+                    + ".map(d => window.LevainDashboard.dayYearWords(d))})"}
 
 
-def _planted_line(day: date) -> str:
-    """The agenda_planted_unanswered line when the server names the day the agenda stands on."""
-    return f"The agenda for {_year_words(day)} is planted, but the row may still be open. Reload the List and check; trying again is safe."
+def _day_words(out: dict[str, Any], *days: date) -> list[str]:
+    """The words the page gave for ``days``, each pinned by literal facts that hold in any locale: the year and the day of the
+    month are in it, and it is not the raw ISO day (a function that returned its argument would pass a derived-only test)."""
+    got = next(json.loads(x)["words"] for x in out["values"] if isinstance(x, str) and x.startswith('{"words"'))
+    assert len(got) == len(days), got
+    for day, words in zip(days, got):
+        assert isinstance(words, str) and words != day.isoformat() and day.isoformat() not in words, (day, words)
+        assert str(day.year) in words and str(day.day) in words, (day, words)
+    return got
+
+
+def _planted_line(words: str) -> str:
+    """The agenda_planted_unanswered line when the server names the day the agenda stands on (``words``: the page's wording of it)."""
+    return f"The agenda for {words} is planted, but the row may still be open. Reload the List and check; trying again is safe."
 
 
 GENERIC_STORE_LINE = "The store behind that is unavailable right now. Nothing was added."
@@ -368,6 +382,7 @@ def test_a_store_fault_after_the_agenda_is_planted_does_not_say_nothing_was_adde
             {"emulate": {"w": 1280, "h": 1100, "dpr": 1}},
             *_reload(),
             {"until": f"{TRAY} && {row} && {btn} && 1"},
+            _day_words_step(past_day),
             {"eval": f"{btn}.click(); 1"},
             {"until": f"{_day_input(row)} && 1"},
             _pick(row, past),
@@ -377,7 +392,7 @@ def test_a_store_fault_after_the_agenda_is_planted_does_not_say_nothing_was_adde
         ])
     v = out["values"]
     shown = v[-2]
-    assert shown == _planted_line(past_day), v                           # the server's code names the day the agenda stands on
+    assert shown == _planted_line(_day_words(out, past_day)[0]), v                           # the server's code names the day the agenda stands on
     assert "Nothing was added" not in shown and A_PATH not in shown and "locked" not in shown
     assert '{"again":true}' in v                                         # the form is live again: a retry is safe
     agendas = [s for s in IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").list_open()
@@ -863,6 +878,7 @@ BAD_DAY_LINE = "That day cannot be used for an agenda. Pick a later day."
 PLANTED_NO_DAY_LINE = "The agenda is planted, but the row may still be open. Reload the List and check; trying again is safe."
 KEPT_503_TAIL = ", but the item could not be closed here and is still on the List. Keeping it again is safe: it writes the memory once."
 KEPT_409_TAIL = ", but the item changed before it could be closed. Reload the List to see where it stands."
+KEPT_OTHER_TAIL = ", and its current state could not be confirmed."
 WIDTHS = [pytest.param(1280, 1100, 1, False, id="1280"), pytest.param(390, 844, 2, True, id="390")]
 
 
@@ -881,7 +897,7 @@ def _open_keep(seed: str) -> list[dict[str, Any]]:
 
 def _texts(out: dict[str, Any]) -> list[str]:
     """The line reads of a run in order: the strings that are not an overflow measurement."""
-    return [x for x in out["values"] if isinstance(x, str) and not x.startswith(('{"formOver"', '{"gets"'))]
+    return [x for x in out["values"] if isinstance(x, str) and not x.startswith(('{"formOver"', '{"gets"', '{"words"'))]
 
 
 def _no_overflow(out: dict[str, Any]) -> list[dict[str, Any]]:
@@ -920,6 +936,7 @@ def test_the_real_servers_new_codes_each_read_their_own_line_with_the_extras_it_
             {"emulate": {"w": w, "h": h, "dpr": dpr, **({"mobile": True} if mobile else {})}},
             *_reload(),
             {"until": f"{TRAY} && {seed} && {row} && {btn} && 1"},
+            _day_words_step(past_day),
             {"eval": f"{btn}.click(); 1"},
             {"until": f"{_day_input(row)} && 1"},
             _pick(row, inside), _confirm(row), _failed(row), _form_overflow(row),             # a day in the snooze window: bad_agenda_day
@@ -928,7 +945,7 @@ def test_the_real_servers_new_codes_each_read_their_own_line_with_the_extras_it_
         ])
     day_refusal, planted, kept = _texts(out)[-3:]
     assert day_refusal.startswith(inside) and "snooze window" in day_refusal, day_refusal      # the server's day sentence, by its code
-    assert planted == _planted_line(past_day), planted
+    assert planted == _planted_line(_day_words(out, past_day)[0]), planted
     kept_id = next(i for i, c in _keep_episodes(src) if c.startswith(SEED + "\n"))
     assert kept == f"Kept as a memory (episode {kept_id}){KEPT_503_TAIL}", kept                # the real episode, in the receipt's shape
     for text in (day_refusal, planted, kept):
@@ -956,6 +973,7 @@ def test_each_shape_the_new_codes_can_arrive_in_reads_one_fixed_line_and_a_moved
     _refuse_in_order(monkeypatch, band_agenda, "defer", [
         ("bad_agenda_day", 422, raw),                                                          # not the host's own sentence: the fixed line
         ("bad_agenda_day", 422, own_sentence),                                                 # the host's own sentence: shown as sent
+        ("bad_agenda_day", 400, own_sentence),                                                 # the same sentence under another status: the fixed line
         ("agenda_planted_unanswered", 503, "agenda intention-009 is planted. " + raw, {"agenda": "intention-009", "day": far.isoformat()}),
         ("agenda_planted_unanswered", 503, raw, {"agenda": "intention-009", "day": "not a day " + A_PATH}),
         ("agenda_planted_unanswered", 503, raw),
@@ -964,6 +982,7 @@ def test_each_shape_the_new_codes_can_arrive_in_reads_one_fixed_line_and_a_moved
         ("kept_not_closed", 503, raw, {"episode_id": "ep-503"}),
         ("kept_not_closed", 503, raw, {"episode_id": "bad id " + A_PATH}),
         ("kept_not_closed", 503, raw),
+        ("kept_not_closed", 500, raw, {"episode_id": "ep-500"}),                               # neither status the server sends: no outcome promised
         ("kept_not_closed", 409, raw, {"episode_id": "ep-409"})])
     seed = _row_of(SEED)
     row = _row_of("levain: pick the release date")
@@ -972,37 +991,50 @@ def test_each_shape_the_new_codes_can_arrive_in_reads_one_fixed_line_and_a_moved
         {"emulate": {"w": w, "h": h, "dpr": dpr, **({"mobile": True} if mobile else {})}},
         *_reload(),
         {"until": f"{TRAY} && {seed} && {row} && {btn} && 1"},
+        _day_words_step(far),
         {"eval": f"{btn}.click(); 1"},
         {"until": f"{_day_input(row)} && 1"},
         _pick(row, (date.today() + timedelta(days=9)).isoformat())]
-    for _ in range(6):
+    for _ in range(7):
         steps += [_confirm(row), _failed(row), _form_overflow(row)]
     steps += [                                    # the agenda form is closed first: an open form with a day in it holds every re-read
         {"eval": f"{row}.querySelector('.verb-form .verb-cancel').click(); 1"},
         {"until": f"!{row}.querySelector('.verb-form') && 1"},
-        {"eval": "window.__gets = []; const f = window.fetch.bind(window); window.fetch = (u, o) => { if (/\\/cockpit\\/manifest\\.json/.test(String(u))) window.__gets.push(String(u)); return f(u, o); }; 1"},
+        # every manifest read is counted when it STARTS and, while `__hold` is a promise, waits for it: the 409 starts a re-read at once
+        # (the Keep's form holds no text, so nothing holds it off) and the redraw replaces the form, so the old form's lines can only be
+        # read deterministically if the read is held until they have been
+        {"eval": "window.__gets = []; window.__hold = null; const f = window.fetch.bind(window); window.fetch = (u, o) => { "
+                 "if (/\\/cockpit\\/manifest\\.json/.test(String(u))) { window.__gets.push(String(u)); "
+                 "if (window.__hold) return window.__hold.then(() => f(u, o)); } return f(u, o); }; 1"},
         *_open_keep(seed)]
-    for _ in range(3):                                                                      # the three 503s: the form stays, nothing re-reads
+    for _ in range(4):                                                                      # the 503s and the 500: the form stays, nothing re-reads
         steps += [_confirm(seed), _failed(seed), _form_overflow(seed)]
     cancel = {"eval": f"{seed}.querySelector('.verb-form .verb-cancel').click(); 1"}
-    # a re-read waits while a form is open (it never discards one): it runs once the form is closed, so the count is read after the cancel
     steps += [cancel, {"until": f"!{seed}.querySelector('.verb-form') && 1"},
               {"eval": "new Promise(r => setTimeout(() => r(JSON.stringify({gets: window.__gets.length, urls: window.__gets})), 900))"},
-              *_open_keep(seed), _confirm(seed), _failed(seed), _form_overflow(seed),       # the 409: the item moved
-              cancel,
+              {"eval": "window.__hold = new Promise(r => { window.__release = r; }); 1"},
+              *_open_keep(seed), _confirm(seed), _failed(seed), _form_overflow(seed),       # the 409: the item moved; its re-read is held
               {"until": "window.__gets.length > 0"},
-              {"eval": "JSON.stringify({gets: window.__gets.length, urls: window.__gets})"}]
+              {"eval": f"JSON.stringify({{gets: window.__gets.length, urls: window.__gets, formStillOpen: !!{seed}.querySelector('.verb-form')}})"},
+              {"eval": "window.__release(); window.__hold = null; 1"},
+              {"until": f"!{seed}.querySelector('.verb-form') && 1"},                       # the redraw replaced the form ...
+              {"eval": f"JSON.stringify({{gets: window.__gets.length, urls: window.__gets, "
+                       f"noticeOnRow: !!{seed} && {seed}.textContent.includes('Kept as a memory (episode ep-409)')}})"}]   # ... the notice stays
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", steps)
     seen = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"gets"')]
     gets = [g["gets"] for g in seen]
-    lines = _texts(out)[-10:]
+    lines = _texts(out)[-12:]
     assert lines == [
-        BAD_DAY_LINE, own_sentence, _planted_line(far), PLANTED_NO_DAY_LINE, PLANTED_NO_DAY_LINE, GENERIC_STORE_LINE,
+        BAD_DAY_LINE, own_sentence, BAD_DAY_LINE, _planted_line(_day_words(out, far)[0]), PLANTED_NO_DAY_LINE, PLANTED_NO_DAY_LINE,
+        GENERIC_STORE_LINE,
         "Kept as a memory (episode ep-503)" + KEPT_503_TAIL, "Kept as a memory" + KEPT_503_TAIL, "Kept as a memory" + KEPT_503_TAIL,
+        "Kept as a memory (episode ep-500)" + KEPT_OTHER_TAIL,
         "Kept as a memory (episode ep-409)" + KEPT_409_TAIL], lines
     assert not any("RAW-SERVER-TEXT" in x or A_PATH in x for x in lines)
-    assert "Nothing was added" in lines[5] and "planted" not in lines[5]                    # nothing was planted: the plain line is the true one
-    assert gets[0] == 0, seen                                                              # a 503 Keep (the item stays) did not re-read
-    assert gets[1] >= 1, gets                                                              # a 409 Keep (the item moved) reads the page again
+    assert "Nothing was added" in lines[6] and "planted" not in lines[6]                    # nothing was planted: the plain line is the true one
+    assert "safe" not in lines[10] and "still on the List" not in lines[10] and "Reload" not in lines[10]   # no outcome promised
+    assert len(seen) == 3 and gets[0] == 0, seen                                           # a 503 or 500 Keep (the item stays) did not re-read
+    assert gets[1] >= 1 and seen[1]["formStillOpen"], seen                                 # the 409's re-read started while the old form was read
+    assert gets[2] >= 1 and seen[2]["noticeOnRow"] is True, seen                           # the redraw came, and the notice is on the row
     _no_overflow(out)

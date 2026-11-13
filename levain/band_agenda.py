@@ -126,7 +126,7 @@ def agenda_origin_key(question_id: str) -> str:
 
 def day_refusal(day: Any, today: date) -> str | None:
     """Why ``day`` cannot be the agenda's day, in the words the operator reads, or None: a real ``YYYY-MM-DD`` strictly after
-    the snooze window's last day. A nearer day is a snooze's, and the words say so."""
+    the snooze window's last day. A nearer day is a snooze's, and the words give the window's rule."""
     parsed = _day_of(day)
     if parsed is None:
         return f"an agenda's day is written YYYY-MM-DD: {day!r} is not a date"
@@ -136,7 +136,7 @@ def day_refusal(day: Any, today: date) -> str | None:
         return (f"{day} is not after today ({today.isoformat()}): an agenda is for a day after {latest.isoformat()}")
     if parsed <= latest:
         return (f"{day} is within the snooze window (a snooze is at most {SNOOZE_MAX_DAYS} days, so {latest.isoformat()} at "
-                f"the latest): snooze the row instead; an agenda is for a day after {latest.isoformat()}")
+                f"the latest): an agenda is for a day after {latest.isoformat()}")
     return None
 
 
