@@ -11253,5 +11253,5 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, canGoFirst: needsCanGoFirst, goFirst: needsGoFirst, history: openDecisionsHistory };
   window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
-  window.LevainDashboard = { render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { dayYearWords, render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

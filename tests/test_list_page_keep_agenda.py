@@ -288,8 +288,16 @@ def test_only_the_plain_band_row_offers_an_agenda_button(tmp_path: Path, monkeyp
 #
 # Each test below was run against the build as it stood (13ccd657d) first and failed there for the reason its comment names.
 
-AGENDA_PLANTED_LINE = ("The agenda may already be planted and the row may already be closed. Reload the List and check; "
-                       "trying again is safe.")
+def _year_words(day: date) -> str:
+    """``dayYearWords`` as the page writes it for the en-US test browser: ``Mon Nov 23, 2026``."""
+    return day.strftime("%a %b ") + str(day.day) + day.strftime(", %Y")
+
+
+def _planted_line(day: date) -> str:
+    """The agenda_planted_unanswered line when the server names the day the agenda stands on."""
+    return f"The agenda for {_year_words(day)} is planted, but the row may still be open. Reload the List and check; trying again is safe."
+
+
 GENERIC_STORE_LINE = "The store behind that is unavailable right now. Nothing was added."
 FAULT_LINES = {
     "needs_signature": "This row is settled by signing: sign it, or answer it on its own sheet in Decisions.",
@@ -325,16 +333,17 @@ def _failed(row: str) -> dict[str, Any]:
                      "return !!m && m.classList.contains('err') && m.textContent; })()"}
 
 
-def _refuse_in_order(monkeypatch: pytest.MonkeyPatch, module: Any, name: str, refusals: list[tuple[str, int, str]]) -> None:
+def _refuse_in_order(monkeypatch: pytest.MonkeyPatch, module: Any, name: str, refusals: list[tuple[Any, ...]]) -> None:
     """Replaces ``module.name`` with a function raising the real :class:`EditError` the server raises, one per call, in order.
-    The cockpit's verb route, the JSON it sends, the page's transport and its `fault` are all the real ones."""
+    The cockpit's verb route, the JSON it sends, the page's transport and its `fault` are all the real ones. A refusal may carry a
+    fourth member: the ``extra`` fields the server sends beside ``error`` and ``message``."""
     from levain.writes import EditError
 
     calls = iter(refusals)
 
     def raiser(*_a: Any, **_k: Any) -> Any:
-        code, status, words = next(calls)
-        raise EditError(code, status, words)
+        code, status, words, *extra = next(calls)
+        raise EditError(code, status, words, extra[0] if extra else None)
 
     monkeypatch.setattr(module, name, raiser)
 
@@ -345,7 +354,8 @@ def test_a_store_fault_after_the_agenda_is_planted_does_not_say_nothing_was_adde
     """RED on 13ccd657d: the form read "The store behind that is unavailable right now. Nothing was added." while the
     agenda stood in the store (the server raises this 503 after act 1)."""
     root, src, _ids, (qs, q, delivered) = _world(tmp_path, monkeypatch)
-    past = (date.today() + timedelta(days=9)).isoformat()
+    past_day = date.today() + timedelta(days=9)
+    past = past_day.isoformat()
 
     def locked(*_a: Any, **_k: Any) -> Any:           # the real shape: the question store is a sqlite file the hooks write too
         raise sqlite3.OperationalError(f"database is locked: {A_PATH}")
@@ -367,7 +377,7 @@ def test_a_store_fault_after_the_agenda_is_planted_does_not_say_nothing_was_adde
         ])
     v = out["values"]
     shown = v[-2]
-    assert shown == AGENDA_PLANTED_LINE, v
+    assert shown == _planted_line(past_day), v                           # the server's code names the day the agenda stands on
     assert "Nothing was added" not in shown and A_PATH not in shown and "locked" not in shown
     assert '{"again":true}' in v                                         # the form is live again: a retry is safe
     agendas = [s for s in IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").list_open()
@@ -842,3 +852,157 @@ def test_the_keep_form_cuts_its_quoted_line_on_a_whole_character(tmp_path: Path,
                      "cut: t.includes('\\u2026')}); })()"},
         ])
     assert json.loads(out["values"][-1]) == {"lone": False, "rocket": True, "cut": True}, out["values"]
+
+
+# --- the three result codes the server added (levain 26, key 1113-3): what the page says for each --------------------------------
+#
+# Each test below was run first against the page as merged from the list-page branch (the boot code keys the day refusal on
+# bad_request/400 and the unsure-agenda line on source_unavailable) with the new server under it, and failed there as its comment says.
+
+BAD_DAY_LINE = "That day cannot be used for an agenda. Pick a later day."
+PLANTED_NO_DAY_LINE = "The agenda is planted, but the row may still be open. Reload the List and check; trying again is safe."
+KEPT_503_TAIL = ", but the item could not be closed here and is still on the List. Keeping it again is safe: it writes the memory once."
+KEPT_409_TAIL = ", but the item changed before it could be closed. Reload the List to see where it stands."
+WIDTHS = [pytest.param(1280, 1100, 1, False, id="1280"), pytest.param(390, 844, 2, True, id="390")]
+
+
+def _form_overflow(row: str) -> dict[str, Any]:
+    """What passes the card's edge in the row's open form (the day, the words under it, the refusal line)."""
+    return {"eval": f"(() => {{ {row}.querySelector('.verb-form').scrollIntoView({{block: 'center'}}); const card = {TRAY}.getBoundingClientRect(); "
+                    f"const over = [{row}, ...{row}.querySelectorAll('.verb-form, .verb-form *')]"
+                    ".filter(n => { const r = n.getBoundingClientRect(); return r.width > 0 && (r.right > card.right + 0.5 || r.left < card.left - 0.5); })"
+                    ".map(n => n.className || n.tagName); return JSON.stringify({formOver: over}); })()"}
+
+
+def _open_keep(seed: str) -> list[dict[str, Any]]:
+    return [{"eval": f"{seed}.querySelector('.verb-more').click(); {seed}.querySelector('[data-verb=intention_keep]').click(); 1"},
+            {"until": f"{seed}.querySelector('.verb-form .verb-confirm') && 1"}]
+
+
+def _texts(out: dict[str, Any]) -> list[str]:
+    """The line reads of a run in order: the strings that are not an overflow measurement."""
+    return [x for x in out["values"] if isinstance(x, str) and not x.startswith(('{"formOver"', '{"gets"'))]
+
+
+def _no_overflow(out: dict[str, Any]) -> list[dict[str, Any]]:
+    got = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"formOver"')]
+    assert got and all(g == {"formOver": []} for g in got), got
+    return got
+
+
+@needs_browser
+@pytest.mark.parametrize("w,h,dpr,mobile", WIDTHS)
+def test_the_real_servers_new_codes_each_read_their_own_line_with_the_extras_it_sends(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, w: int, h: int, dpr: int, mobile: bool) -> None:
+    """RED on the page as merged: the day refusal (bad_agenda_day, 422) read "That did not go through (bad_agenda_day).", the
+    planted-unanswered 503 the same with its own code, and the Keep's kept_not_closed 503 the same: three raw code strings, and no
+    word of the day the agenda stands on or the episode that was kept. Real server, real faults (the answer act locked at the seam
+    after the plant; the compost down after the episode landed)."""
+    from levain import writes
+
+    root, src, _ids, (qs, q, delivered) = _world(tmp_path, monkeypatch)
+    inside = (date.today() + timedelta(days=2)).isoformat()
+    past_day = date.today() + timedelta(days=9)
+
+    def locked(*_a: Any, **_k: Any) -> Any:
+        raise sqlite3.OperationalError(f"database is locked: {A_PATH}")
+
+    def compost_down(*_a: Any, **_k: Any) -> Any:
+        raise OSError(f"disk I/O error at {A_PATH}")
+
+    monkeypatch.setattr(band_agenda, "_answer_deferred", locked)
+    monkeypatch.setattr(writes, "_keep_compost", compost_down)
+    seed = _row_of(SEED)
+    row = _row_of("levain: pick the release date")
+    btn = f"{row}.querySelector('[data-verb=band_agenda]')"
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": w, "h": h, "dpr": dpr, **({"mobile": True} if mobile else {})}},
+            *_reload(),
+            {"until": f"{TRAY} && {seed} && {row} && {btn} && 1"},
+            {"eval": f"{btn}.click(); 1"},
+            {"until": f"{_day_input(row)} && 1"},
+            _pick(row, inside), _confirm(row), _failed(row), _form_overflow(row),             # a day in the snooze window: bad_agenda_day
+            _pick(row, past_day.isoformat()), _confirm(row), _failed(row), _form_overflow(row),   # past it, the answer act locked
+            *_open_keep(seed), _confirm(seed), _failed(seed), _form_overflow(seed),           # the Keep, the compost down
+        ])
+    day_refusal, planted, kept = _texts(out)[-3:]
+    assert day_refusal.startswith(inside) and "snooze window" in day_refusal, day_refusal      # the server's day sentence, by its code
+    assert planted == _planted_line(past_day), planted
+    kept_id = next(i for i, c in _keep_episodes(src) if c.startswith(SEED + "\n"))
+    assert kept == f"Kept as a memory (episode {kept_id}){KEPT_503_TAIL}", kept                # the real episode, in the receipt's shape
+    for text in (day_refusal, planted, kept):
+        assert A_PATH not in text and "locked" not in text and "disk I/O" not in text and "bad_agenda_day" not in text, text
+        assert "kept_not_closed" not in text and "agenda_planted_unanswered" not in text, text
+    _no_overflow(out)
+    agendas = [s for s in IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").list_open()
+               if str(s.get("origin_key", "")).startswith(band_agenda.KEY_PREFIX)]
+    assert len(agendas) == 1 and qs.get(q.id).answer is None                      # planted once, the row still open (what the line says)
+
+
+@needs_browser
+@pytest.mark.parametrize("w,h,dpr,mobile", WIDTHS)
+def test_each_shape_the_new_codes_can_arrive_in_reads_one_fixed_line_and_a_moved_keep_reads_again(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, w: int, h: int, dpr: int, mobile: bool) -> None:
+    """RED on the page as merged: every one read "That did not go through (<code>)." except source_unavailable, which read the
+    unsure-agenda line although nothing was planted. The server's own words (they can carry a raw exception) never show; an
+    extra that is not in the shape the page expects (a day, an episode id) is left out of the line, never printed."""
+    from levain import writes
+
+    _root, src, _ids, _band = _world(tmp_path, monkeypatch)
+    far = date(2036, 2, 29)
+    raw = "RAW-SERVER-TEXT " + A_PATH
+    own_sentence = "an agenda's day is written YYYY-MM-DD: 'x' is not a date"
+    _refuse_in_order(monkeypatch, band_agenda, "defer", [
+        ("bad_agenda_day", 422, raw),                                                          # not the host's own sentence: the fixed line
+        ("bad_agenda_day", 422, own_sentence),                                                 # the host's own sentence: shown as sent
+        ("agenda_planted_unanswered", 503, "agenda intention-009 is planted. " + raw, {"agenda": "intention-009", "day": far.isoformat()}),
+        ("agenda_planted_unanswered", 503, raw, {"agenda": "intention-009", "day": "not a day " + A_PATH}),
+        ("agenda_planted_unanswered", 503, raw),
+        ("source_unavailable", 503, "the row's store cannot be read, nothing was planted " + raw)])
+    _refuse_in_order(monkeypatch, writes, "_apply_intention_keep", [
+        ("kept_not_closed", 503, raw, {"episode_id": "ep-503"}),
+        ("kept_not_closed", 503, raw, {"episode_id": "bad id " + A_PATH}),
+        ("kept_not_closed", 503, raw),
+        ("kept_not_closed", 409, raw, {"episode_id": "ep-409"})])
+    seed = _row_of(SEED)
+    row = _row_of("levain: pick the release date")
+    btn = f"{row}.querySelector('[data-verb=band_agenda]')"
+    steps: list[dict[str, Any]] = [
+        {"emulate": {"w": w, "h": h, "dpr": dpr, **({"mobile": True} if mobile else {})}},
+        *_reload(),
+        {"until": f"{TRAY} && {seed} && {row} && {btn} && 1"},
+        {"eval": f"{btn}.click(); 1"},
+        {"until": f"{_day_input(row)} && 1"},
+        _pick(row, (date.today() + timedelta(days=9)).isoformat())]
+    for _ in range(6):
+        steps += [_confirm(row), _failed(row), _form_overflow(row)]
+    steps += [                                    # the agenda form is closed first: an open form with a day in it holds every re-read
+        {"eval": f"{row}.querySelector('.verb-form .verb-cancel').click(); 1"},
+        {"until": f"!{row}.querySelector('.verb-form') && 1"},
+        {"eval": "window.__gets = []; const f = window.fetch.bind(window); window.fetch = (u, o) => { if (/\\/cockpit\\/manifest\\.json/.test(String(u))) window.__gets.push(String(u)); return f(u, o); }; 1"},
+        *_open_keep(seed)]
+    for _ in range(3):                                                                      # the three 503s: the form stays, nothing re-reads
+        steps += [_confirm(seed), _failed(seed), _form_overflow(seed)]
+    cancel = {"eval": f"{seed}.querySelector('.verb-form .verb-cancel').click(); 1"}
+    # a re-read waits while a form is open (it never discards one): it runs once the form is closed, so the count is read after the cancel
+    steps += [cancel, {"until": f"!{seed}.querySelector('.verb-form') && 1"},
+              {"eval": "new Promise(r => setTimeout(() => r(JSON.stringify({gets: window.__gets.length, urls: window.__gets})), 900))"},
+              *_open_keep(seed), _confirm(seed), _failed(seed), _form_overflow(seed),       # the 409: the item moved
+              cancel,
+              {"until": "window.__gets.length > 0"},
+              {"eval": "JSON.stringify({gets: window.__gets.length, urls: window.__gets})"}]
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", steps)
+    seen = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"gets"')]
+    gets = [g["gets"] for g in seen]
+    lines = _texts(out)[-10:]
+    assert lines == [
+        BAD_DAY_LINE, own_sentence, _planted_line(far), PLANTED_NO_DAY_LINE, PLANTED_NO_DAY_LINE, GENERIC_STORE_LINE,
+        "Kept as a memory (episode ep-503)" + KEPT_503_TAIL, "Kept as a memory" + KEPT_503_TAIL, "Kept as a memory" + KEPT_503_TAIL,
+        "Kept as a memory (episode ep-409)" + KEPT_409_TAIL], lines
+    assert not any("RAW-SERVER-TEXT" in x or A_PATH in x for x in lines)
+    assert "Nothing was added" in lines[5] and "planted" not in lines[5]                    # nothing was planted: the plain line is the true one
+    assert gets[0] == 0, seen                                                              # a 503 Keep (the item stays) did not re-read
+    assert gets[1] >= 1, gets                                                              # a 409 Keep (the item moved) reads the page again
+    _no_overflow(out)

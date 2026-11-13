@@ -804,12 +804,34 @@
     rings_a_reminder: "This row rings a reminder, so it needs no agenda. Change the reminder itself.",
     agenda_resolved: "The agenda made for this row is no longer open, so it cannot bring the row back. Answer the row in words instead.",
     answer_refused: "The row was not answered. Reload the List and check it before trying again.",
-    keep_key_retired: "This item was kept before and that memory was deleted, so it cannot be kept again. Compost the item by hand."
+    keep_key_retired: "This item was kept before and that memory was deleted, so it cannot be kept again. Compost the item by hand.",
+    // the band row to agenda refuses a day with its own code (422). Only a day sentence of the shape below is shown as the host
+    // sent it (see fault); any other message under this code reads this line
+    bad_agenda_day: "That day cannot be used for an agenda. Pick a later day.",
+    // the code the server answers AFTER the plant (see fault: the line names the day when the server sends one)
+    agenda_planted_unanswered: "The agenda is planted, but the row may still be open. Reload the List and check; trying again is safe."
   };
-  // The band row to agenda plants the agenda first and answers the row second, and answers source_unavailable (503) from the
-  // second act too: "Nothing was added." would then be false. The second act can also record the answer and then fail its read-back,
-  // so the row may be closed too. So for this verb that code says that both are unknown, and what is safe.
-  const AGENDA_UNSURE = "The agenda may already be planted and the row may already be closed. Reload the List and check; trying again is safe.";
+  // The band row to agenda plants the agenda first and answers the row second. A failure BEFORE the plant is source_unavailable
+  // (503): the plain "Nothing was added." line is true for it. A failure after the plant is agenda_planted_unanswered (503), which
+  // carries the day the agenda stands on (an earlier plant's day stands, so it can differ from the day asked); the row may or may
+  // not be answered (the host can record the answer and then fail its read-back), so the line promises no more than reload, check,
+  // and that a retry is safe (true for both of the server's messages: a retry finishes an open row, and on an answered row it is
+  // refused "stale", which the page reloads on).
+  function plantedLine(day) {
+    if (typeof day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return FAULT_WORDS.agenda_planted_unanswered;
+    const D = window.LevainDashboard;
+    const words = D && typeof D.dayYearWords === "function" ? D.dayYearWords(day) : day;
+    return "The agenda for " + words + " is planted, but the row may still be open. Reload the List and check; trying again is safe.";
+  }
+  // The Keep writes the memory first and closes the item second. The code is raised only after the memory landed, so it is kept
+  // either way: 409 = the item moved before it could be closed (look at the List), 503 = the store could not close it (the item
+  // stays, and keeping it again writes the memory once). The episode id is shown only in the shape the receipt line shows it.
+  function keptNotClosedLine(status, episodeId) {
+    const named = typeof episodeId === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(episodeId);
+    const lead = named ? "Kept as a memory (episode " + episodeId + ")" : "Kept as a memory";
+    if (status === 409) return lead + ", but the item changed before it could be closed. Reload the List to see where it stands.";
+    return lead + ", but the item could not be closed here and is still on the List. Keeping it again is safe: it writes the memory once.";
+  }
   const SNOOZE_REFUSALS = new Set(["pick a time after now", "pick a later day", "pick a day: that date could not be read"]);
   // The List's band row to agenda refuses a day inside the snooze window in words that say what to do instead ("<day> is within the
   // snooze window (...): snooze the row instead; an agenda is for a day after <day>"). They are composed from the day and the window
@@ -830,10 +852,12 @@
     // form says what to change. Only these exact sentences, only on that verb: any other bad_request keeps the fixed line.
     if (code === "bad_request" && r.status === 400 && what && what.verb === "intention_snooze" && typeof d.message === "string"
         && SNOOZE_REFUSALS.has(d.message)) text = d.message;
-    if (code === "bad_request" && r.status === 400 && what && what.verb === "band_agenda" && typeof d.message === "string"
+    if (code === "bad_agenda_day" && what && what.verb === "band_agenda" && typeof d.message === "string"
         && AGENDA_DAY_REFUSAL.test(d.message)) text = d.message;
-    if (code === "source_unavailable" && what && what.verb === "band_agenda") text = AGENDA_UNSURE;
-    if (REREAD.has(code) || r.status === 501) {
+    if (code === "agenda_planted_unanswered") text = plantedLine(d.day);
+    if (code === "kept_not_closed") text = keptNotClosedLine(r.status, d.episode_id);
+    // a Keep whose item moved (409) leaves the page holding a row that is gone or changed: it reads again, as for a stale write
+    if (REREAD.has(code) || r.status === 501 || (code === "kept_not_closed" && r.status === 409)) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
       rereadLatched();   // a re-read that never discards an open form: it defers while one is dirty, and stays owed
