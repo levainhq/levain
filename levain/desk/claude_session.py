@@ -62,7 +62,7 @@ __all__ = [
     "CLOSE_BOUND", "CONN_MAX", "ROOM_DENIED_TOOLS", "ROOM_MCP_SERVER", "ROOM_MCP_TOOL", "ROOM_TOOLS", "SEQ_MAX", "CanaryVerdict",
     "ClaudeSession", "NotLive", "PipeTransport", "Probe", "Transport", "TransportClosed", "canary_denied",
     "default_deny_paths", "open_probe", "room_argv", "room_door_tools", "ROOM_DOOR_NAMES", "room_hook_command", "room_settings_json",
-    "ROOM_READ_REFUSAL", "host_probe", "room_host_argv",
+    "ROOM_READ_REFUSAL", "host_probe", "room_host_argv", "ONFAILURE_BLOCK_MIN_CC",
 ]
 
 CONN_MAX = 10 ** 8 - 1
@@ -1226,7 +1226,8 @@ def host_probe(init: Mapping[str, Any] | None, profile: RoomProfile, door_tools:
     profile's, the MCP servers are exactly the room's one door and connected, and the tool list holds the profile's
     ``required_tools`` and the door's tools, each name once. EXTRA tools are not a refusal: the vendor's default set
     is the profile and drifts by CLI version; the floor is what shows a child that is silently not the expected one.
-    The full list stays in the evidence for whoever wants to compare."""
+    The full list stays in the evidence for whoever wants to compare. A profile that carries hooks is also held to
+    :data:`ONFAILURE_BLOCK_MIN_CC`: an older, missing or unparseable ``claude_code_version`` is not live."""
     if not isinstance(init, Mapping):
         return Probe(False, "no init has been read")
     tools = init.get("tools")
@@ -1246,7 +1247,28 @@ def host_probe(init: Mapping[str, Any] | None, profile: RoomProfile, door_tools:
         return Probe(False, f"the room's MCP door is {_str(servers[0].get('status'))[:40]!r}, not connected")
     if init.get("permissionMode") != profile.permission_mode:
         return Probe(False, f"permissionMode is {_str(init.get('permissionMode'))[:40]!r}, not {profile.permission_mode!r}")
+    if profile.hooks:
+        found = init.get("claude_code_version")
+        if _cc_version(found) is None or _cc_version(found) < ONFAILURE_BLOCK_MIN_CC:
+            shown = "none" if found is None else repr(found)[:40]
+            return Probe(False, f"this Claude Code reports version {shown}; the room's hooks need "
+                                f"{'.'.join(map(str, ONFAILURE_BLOCK_MIN_CC))} or later, the first that honours "
+                                f"\"onFailure\": \"block\" (on an older one a guard that fails lets the call run); "
+                                f"upgrade Claude Code")
     return Probe(True, f"the profile's required tools, its one connected MCP door, {profile.permission_mode}")
+
+
+# The first Claude Code whose hooks honour ``"onFailure": "block"``; the host profile's guard entries carry it (origin:
+# the vendor hooks reference, https://code.claude.com/docs/en/hooks, "Block the action when a hook fails": "Requires
+# Claude Code v2.1.295 or later"). A host room with hooks opens only on this version or later.
+ONFAILURE_BLOCK_MIN_CC = (2, 1, 295)
+_CC_VERSION = re.compile(r"(\d{1,6})\.(\d{1,6})\.(\d{1,6})", re.ASCII)
+
+
+def _cc_version(value: Any) -> tuple[int, int, int] | None:
+    """``claude_code_version`` as three integers, or None for anything that is not exactly ``N.N.N`` (fail closed)."""
+    m = _CC_VERSION.fullmatch(value) if isinstance(value, str) else None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
 class CanaryVerdict(NamedTuple):
