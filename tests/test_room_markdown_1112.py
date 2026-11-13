@@ -318,3 +318,56 @@ def test_a_document_that_is_not_the_renderers_own_gets_the_plain_pass(tmp_path, 
     # reply is drawn by the small pass (so the guard in drawMarkdown is reachable, and kept)
     g = _run(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, [], _GUARD_LOOK, "guardlook", 0)
     assert g["ownerIsOther"] and "rv-md" not in g["cls"] and g["mdEls"] == 0 and g["anchors"] == 0 and g["strong"] == 1, g
+
+
+# --- the link filter fails closed, and a reply's total size is bounded (L3 r1 complement, ROOMC-FIX2) ------------------------------------
+
+_ORIGIN_STUB = ("(() => { const real = window.LevainMD.renderMarkdown; window.__stubbed = 0;"
+                " window.LevainMD.renderMarkdown = function (t) { const f = real.call(this, t); window.__stubbed++;"
+                " f.querySelectorAll('a').forEach(a => { const w = a.textContent; Object.defineProperty(a, 'origin', {configurable: true, get: () => {"
+                " if (%s) throw new Error('no origin'); return w === 'undef' ? undefined : w === 'num' ? 5 : w === 'str' ? 'https://example.org' : a.href; }}); });"
+                " return f; }; return 1; })()")
+_ORIGIN_ROW = [{"gseq": 9301, "kind": "vendor_agent_text", "source": "vendor", "ref": "agent_text:9301", "launch_id": "L1", "status": None,
+                "body": "see [undef](https://example.org/u) [num](https://example.org/n) [str](https://example.org/s) and **bold**",
+                "at": "2026-11-12T10:03:00+00:00"}]
+_ORIGIN_LOOK = """(() => { const t = document.querySelector('.rv-room .rv-text');
+  return JSON.stringify({stubbed: window.__stubbed, cls: t.className, links: [...t.querySelectorAll('a')].map(a => a.getAttribute('href')),
+    strong: [...t.querySelectorAll('strong')].map(s => s.textContent), mdEls: t.querySelectorAll('[class^=md-], [class*=" md-"]').length, rows: document.querySelectorAll('.rv-line').length,
+    text: t.textContent, probe: 'originlook'}); })()"""
+
+
+@needs_browser
+def test_a_link_whose_origin_cannot_be_read_as_a_string_is_unwrapped(tmp_path, qdir):
+    # fail CLOSED: an anchor survives only when its origin is a string that differs from the cockpit's; undefined or a number unwraps
+    g = _run(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, _ORIGIN_ROW, _ORIGIN_LOOK, "originlook", 1, pre=[_ORIGIN_STUB % "false"])
+    assert g["stubbed"] >= 1 and "rv-md" in g["cls"], g                                  # the stub ran and the renderer drew it
+    assert g["links"] == ["https://example.org/s"], g                                      # a string origin that differs: kept; undefined and 5: words only
+    assert "undef" in g["text"] and "num" in g["text"] and g["strong"] == ["bold"], g
+
+
+@needs_browser
+def test_a_filter_that_throws_leaves_the_reply_drawn_the_plain_way(tmp_path, qdir):
+    # the unwrap pass runs inside the renderer's try: an exception in it falls back to the small pass, with no half-drawn tree
+    g = _run(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, _ORIGIN_ROW, _ORIGIN_LOOK, "originlook", 1, pre=[_ORIGIN_STUB % "true"])
+    assert g["stubbed"] >= 1 and g["rows"] >= 1, g                                       # the branch was taken and the room still rendered
+    assert "rv-md" not in g["cls"] and g["mdEls"] == 0 and g["links"] == [], g
+    assert g["strong"] == ["bold"] and "[str](https://example.org/s)" in g["text"], g    # the small pass drew it: markers stay literal
+
+
+_BIG = [{"gseq": 9400 + i, "kind": "vendor_agent_text", "source": "vendor", "ref": "agent_text:%d" % (9400 + i), "launch_id": "L1", "status": None,
+         "body": body, "at": "2026-11-12T10:04:%02d+00:00" % i} for i, body in enumerate([
+             "## ok\n" + "- **b** item\n" * 100,                  # under both bounds: drawn as markdown
+             "x\n" * 50000,                                       # 50,000 short lines, 100,000 characters: past the line cap only
+             ("y" * 10000 + "\n") * 25,                           # 250,000 characters in 26 lines: past the total-size cap only
+         ])]
+_BIG_LOOK = """(() => { const rows = [...document.querySelectorAll('.rv-room .rv-text')];
+  return JSON.stringify({rows: rows.map(r => ({cls: r.className, mdEls: r.querySelectorAll('[class^=md-], [class*=" md-"]').length, len: r.textContent.length})), probe: 'biglook'}); })()"""
+
+
+@needs_browser
+def test_a_reply_past_the_total_size_or_line_bound_is_drawn_plain(tmp_path, qdir):
+    g = _run(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, _BIG, _BIG_LOOK, "biglook", 3)
+    ok, many, wide = g["rows"]
+    assert "rv-md" in ok["cls"] and ok["mdEls"] > 100, g                                   # the control is drawn by the renderer
+    assert "rv-md" not in many["cls"] and many["mdEls"] == 0 and many["len"] >= 100000, g  # 50,000 lines: the plain draw, text intact
+    assert "rv-md" not in wide["cls"] and wide["mdEls"] == 0 and wide["len"] >= 250000, g  # 250,000 characters: the plain draw, text intact
