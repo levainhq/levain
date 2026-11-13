@@ -14,7 +14,8 @@ import pytest
 from levain.slot import hook_run
 from levain.slot import render as rd
 from levain.slot import runtime_helper as H
-from levain.slot.hook_templates import EVENTS, body, hook_templates
+from levain.slot.hook_templates import ENTRIES, EVENTS, body, hook_templates
+from levain.slot.render import REPO_FILTER
 from levain.slot.root_tree import PY_FLAGS, ROOT_PYTHON
 from tests.test_slot_s2b_render import egress
 
@@ -136,6 +137,91 @@ def test_the_body_passes_0_and_2_through(tmp_path):
     _tree(tmp_path, "import sys\ndef run(name):\n    sys.stdout.write('ok')\n    return 0\n")
     p = _run_body(tmp_path)
     assert (p.returncode, p.stdout) == (0, "ok")
+
+
+# ---- DIOGAP-A2 item 3: the body's own fallback on PermissionRequest is the decision object, else exit 1 -------------
+
+def _run_body_on(tmp_path, name, args=(), stdout=subprocess.PIPE):
+    text = body("darwin", name).decode()
+    script = tmp_path / "hook.py"
+    script.write_text(text.replace("/usr/local/lib/levain-root/current", str(tmp_path)).split("\n", 1)[1])
+    return subprocess.run([sys.executable, "-I", "-S", str(script), *args], input="{}", stdout=stdout,
+                          stderr=subprocess.PIPE, text=True, cwd=str(tmp_path), env={"PATH": os.environ.get("PATH", "")},
+                          timeout=30)
+
+
+#: every entry a body imports (run, config_guard, repo_filter) is the same stub
+_ALIASES = "config_guard = repo_filter = run\n"
+_PR_FAILURES = [s + _ALIASES for s in ("def run(*a):\n    raise RuntimeError('x')\n", "def run(*a):\n    return None\n",
+                                       "def run(*a):\n    return 3\n")]
+
+
+@pytest.mark.parametrize("src", _PR_FAILURES)
+@pytest.mark.parametrize("name, args", [("levain_queue", ()),
+                                        (REPO_FILTER, ("PermissionRequest", "5", "true"))])
+def test_the_body_answers_its_failure_on_permission_request_with_the_decision_object(tmp_path, src, name, args):
+    """Exit 2 is not honoured on PermissionRequest (Claude Code's hooks reference), so the body's own fallback there
+    is the decision object, exit 0, with the named refusal as its message."""
+    import json
+    _tree(tmp_path, src)
+    p = _run_body_on(tmp_path, name, args)
+    assert (p.returncode, p.stderr) == (0, ""), (p.returncode, p.stderr)
+    doc = json.loads(p.stdout)
+    message = doc["hookSpecificOutput"]["decision"]["message"]
+    assert doc == {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                          "decision": {"behavior": "deny", "message": message}}}
+    assert message.startswith("levain hook %s: refused: hook-run-" % name)
+
+
+def test_the_body_answers_a_failed_import_on_permission_request_with_the_decision_object(tmp_path):
+    p = _run_body_on(tmp_path, "levain_queue")       # no tree at all: the import fails
+    assert p.returncode == 0 and "refused: hook-adapter-unavailable (" in p.stdout and '"deny"' in p.stdout
+
+
+def test_the_body_whose_decision_cannot_be_written_is_a_hook_failure_exit_1(tmp_path):
+    """onFailure block turns a failure (any exit but 0 or 2) on PermissionRequest into a deny; exit 2 there would be no
+    answer. The body exits 1; Python's own flush of the broken stdout at exit then fails again and makes it 120, a
+    failure all the same (measured here)."""
+    _tree(tmp_path, _PR_FAILURES[0])
+    r, w = os.pipe()
+    os.close(r)
+    try:
+        p = _run_body_on(tmp_path, "levain_queue", stdout=w)
+    finally:
+        os.close(w)
+    assert p.returncode not in (0, 2), p.returncode
+    assert "levain hook levain_queue: refused: hook-run-failed" in p.stderr
+
+
+def test_the_body_whose_stdout_is_closed_exits_exactly_1(tmp_path):
+    """The body's own code, seen without Python's exit flush in the way: a closed stdout is not flushed at exit."""
+    _tree(tmp_path, "import sys\ndef run(*a):\n    sys.stdout.close()\n    raise RuntimeError('x')\n" + _ALIASES)
+    p = _run_body_on(tmp_path, "levain_queue")
+    assert p.returncode == 1 and "levain hook levain_queue: refused: hook-run-failed (RuntimeError)" in p.stderr
+
+
+def test_the_body_passes_an_entrys_exit_1_through_on_permission_request_only(tmp_path):
+    """The entry answers 1 on PermissionRequest only when its own decision could not be written (hook_run._deny):
+    passed through, its reason already on stderr. On PreToolUse a 1 stays a refusal, exit 2."""
+    _tree(tmp_path, "def run(*a):\n    return 1\n" + _ALIASES)
+    assert (_run_body_on(tmp_path, "levain_queue").returncode, _run_body_on(tmp_path, "levain_queue").stdout) == (1, "")
+    assert _run_body_on(tmp_path, REPO_FILTER, ("PermissionRequest", "5", "true")).returncode == 1
+    assert _run_body_on(tmp_path, REPO_FILTER, ("PreToolUse", "5", "true")).returncode == 2
+    assert _run_body_on(tmp_path, "levain_gate").returncode == 2
+
+
+@pytest.mark.parametrize("name, args", [("levain_gate", ()), ("levain_config", ()),
+                                        (REPO_FILTER, ("PreToolUse", "5", "true")), (REPO_FILTER, ())])
+def test_the_body_off_permission_request_still_refuses_with_exit_2(tmp_path, name, args):
+    _tree(tmp_path, _PR_FAILURES[0])
+    p = _run_body_on(tmp_path, name, args)
+    assert (p.returncode, p.stdout) == (2, "") and "refused: hook-run-failed" in p.stderr
+
+
+def test_run_events_are_the_templates_events_for_every_run_hook():
+    """hook_run.run() answers by the event its hook is wired under; the map it reads is the templates' (equal by test,
+    not imported: hook_templates imports hook_run)."""
+    assert hook_run.RUN_EVENTS == {n: e for n, e in EVENTS.items() if ENTRIES.get(n, "run") == "run"}
 
 
 # ---- fail closed ----------------------------------------------------------------------------------------------

@@ -9,11 +9,11 @@ The script :mod:`levain.slot.hook_templates` renders into ``<S>/root/hooks/<name
 **FAIL CLOSED.** The operator's hook (``templates/activation/hooks/consent_claude_code.py``) exits 0 with no output
 when its adapter will not import, so the call passes. That is right on the operator's own machine and wrong for a
 gate inside an unattended slot: a gate that opens when it breaks is not a gate. Here every way the adapter cannot
-answer is exit 2 with a NAMED refusal on stderr, never exit 0 with no output. Claude Code blocks a PreToolUse on exit
-2; on a PermissionRequest its hooks reference says exit 2 is NOT honoured (the permission flow proceeds unchanged and
-the stderr is discarded; a deny there is a ``decision`` object on stdout), so on that event (``levain_queue``) a
-refusal here leaves the call to the session's mode: the prompt, or in a session that cannot prompt Claude Code's own
-deny. :func:`repo_filter` answers a PermissionRequest deny with the decision object; :func:`run` does not (yet):
+answer is a deny with a NAMED refusal, never exit 0 with no output. Claude Code blocks a PreToolUse on exit 2, so on
+that event (``levain_gate``) the refusal is exit 2 and the line on stderr. On a PermissionRequest its hooks reference
+says exit 2 is NOT honoured (the permission flow proceeds unchanged and the stderr is discarded; a deny there is a
+``decision`` object on stdout), so on that event (``levain_queue``) the refusal is that object, exit 0, as
+:func:`_deny` answers it (and :func:`repo_filter`'s deny on the same event). The refusals:
 
 * ``hook-not-in-slot``: the slot's broker socket variable is not in the environment. The adapter would then take its
   operator path (a local queue under the home directory), which a slot must never reach.
@@ -33,13 +33,26 @@ import sys
 from typing import Any, BinaryIO, Callable, Mapping, Optional, Sequence, TextIO
 
 REFUSED_EXIT = 2
+#: a hook FAILURE (any exit but 0 or 2): what a PermissionRequest deny answers when its decision object cannot be
+#: written. Claude Code's hooks reference: with ``"onFailure": "block"`` (render wires it on every slot hook) "a failure
+#: does what exit code 2 does on that event, except on ``PermissionRequest``, where it denies the request"; without
+#: it (a Claude Code before 2.1.295) it is a non-blocking error, no worse there than the exit 2 it replaces.
+FAILED_EXIT = 1
 
 ADAPTER_MODULE = "levain.consent.adapters.claude_code"
+
+#: the event each hook :func:`run` serves is wired under (equal by test to ``hook_templates.EVENTS``; not imported:
+#: hook_templates imports this module). A refusal is answered as :func:`_deny` answers it on that event.
+RUN_EVENTS = {"levain_gate": "PreToolUse", "levain_queue": "PermissionRequest"}
+
+
+def _refusal(name: str, why: str, detail: str) -> str:
+    return "levain hook %s: refused: %s (%s)" % (name, why, detail[:200])
 
 
 def refuse(name: str, why: str, detail: str, stderr: TextIO) -> int:
     try:
-        stderr.write("levain hook %s: refused: %s (%s)\n" % (name, why, detail[:200]))
+        stderr.write(_refusal(name, why, detail) + "\n")
         stderr.flush()
     except BaseException:  # noqa: BLE001 - a refusal that cannot be written is still a refusal
         pass
@@ -57,10 +70,17 @@ def _load_adapter() -> Any:
 def run(name: str, *, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] = None,
         stderr: Optional[TextIO] = None, environ: Optional[Mapping[str, str]] = None,
         load_adapter: Optional[Callable[[], Any]] = None) -> int:
-    """Run the hook ``name``: 0 with the adapter's output, or :data:`REFUSED_EXIT` with a named refusal. ``environ``
-    (default ``os.environ``) is the ONE environment: :func:`in_slot` is checked against it and the adapter's ``main``
-    is handed it, so the slot check and the adapter can never read two different environments."""
+    """Run the hook ``name``: 0 with the adapter's output, or a named refusal answered as :func:`_deny` answers it on
+    the event ``name`` is wired under (:data:`RUN_EVENTS`): on PreToolUse exit :data:`REFUSED_EXIT` and the line on
+    stderr; on PermissionRequest (``levain_queue``) the deny decision object with the line as its message, exit 0.
+    ``environ`` (default ``os.environ``) is the ONE environment: :func:`in_slot` is checked against it and the
+    adapter's ``main`` is handed it, so the slot check and the adapter can never read two different environments."""
+    event = RUN_EVENTS.get(name)
     err: Any = stderr
+
+    def no(why: str, detail: str) -> int:
+        return _deny(event, _refusal(name, why, detail), stdout if stdout is not None else sys.stdout, err)
+
     try:
         err = stderr if stderr is not None else sys.stderr
         stdin = stdin if stdin is not None else sys.stdin
@@ -68,32 +88,31 @@ def run(name: str, *, stdin: Optional[TextIO] = None, stdout: Optional[TextIO] =
         env = os.environ if environ is None else environ
         from levain.consent.broker_client import in_slot
     except BaseException as exc:  # noqa: BLE001 - fail closed
-        return refuse(name, "hook-broker-client-unavailable", "%s: %s" % (type(exc).__name__, exc), err)
+        return no("hook-broker-client-unavailable", "%s: %s" % (type(exc).__name__, exc))
     try:
         adapter = (load_adapter or _load_adapter)()
         main = adapter.main
     except BaseException as exc:  # noqa: BLE001 - fail closed: nothing that cannot import is a gate
-        return refuse(name, "hook-adapter-unavailable", "%s: %s" % (type(exc).__name__, exc), err)
-    stderr = err
+        return no("hook-adapter-unavailable", "%s: %s" % (type(exc).__name__, exc))
     try:
         slot = in_slot(env)
     except BaseException as exc:  # noqa: BLE001
-        return refuse(name, "hook-adapter-failed", "%s: %s" % (type(exc).__name__, exc), stderr)
+        return no("hook-adapter-failed", "%s: %s" % (type(exc).__name__, exc))
     if not slot:
-        return refuse(name, "hook-not-in-slot", "no broker socket in the environment", stderr)
+        return no("hook-not-in-slot", "no broker socket in the environment")
     out = io.StringIO()
     try:
         code = main([], stdin=stdin, stdout=out, environ=env)
     except BaseException as exc:  # noqa: BLE001 - SystemExit included: an adapter that exits is not an answer
-        return refuse(name, "hook-adapter-failed", "%s: %s" % (type(exc).__name__, exc), stderr)
+        return no("hook-adapter-failed", "%s: %s" % (type(exc).__name__, exc))
     if type(code) is not int or code != 0:  # exactly the int 0: False / 0.0 / a zero-equal object is no success
         # an invalid return is described by its type: formatting an arbitrary object can raise or allocate without bound
-        return refuse(name, "hook-adapter-exit", "exit %r" % (code,) if type(code) is int else "exit of type %s" % type(code).__name__, stderr)
+        return no("hook-adapter-exit", "exit %r" % (code,) if type(code) is int else "exit of type %s" % type(code).__name__)
     try:
         stdout.write(out.getvalue())
         stdout.flush()
     except BaseException as exc:  # noqa: BLE001
-        return refuse(name, "hook-adapter-failed", "writing the answer: %s" % type(exc).__name__, stderr)
+        return no("hook-adapter-failed", "writing the answer: %s" % type(exc).__name__)
     return 0
 
 
@@ -324,9 +343,20 @@ def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = N
 
     err: Any = stderr if stderr is not None else sys.stderr
     answer: Any = stdout if stdout is not None else sys.stdout
-    if len(argv) != 3 or argv[0] not in REPO_FILTERED_EVENTS or not (argv[1].isascii() and argv[1].isdigit()) \
-            or not 1 <= int(argv[1]) <= REPO_TIMEOUT_MAX or not argv[2]:
-        why_argv = "%d argument(s)" % len(argv)
+    # the reason is the FIRST check that fails (DIOGAP-A2 item 4: it used to say the count whatever failed)
+    if len(argv) != 3:
+        why_argv: Optional[str] = "%d argument(s)" % len(argv)
+    elif argv[0] not in REPO_FILTERED_EVENTS:
+        why_argv = "event %r" % (argv[0][:40],)
+    elif not (argv[1].isascii() and argv[1].isdigit()):
+        why_argv = "timeout %r" % (argv[1][:40],)
+    elif not 1 <= int(argv[1]) <= REPO_TIMEOUT_MAX:
+        why_argv = "timeout out of range"
+    elif not argv[2]:
+        why_argv = "empty command"
+    else:
+        why_argv = None
+    if why_argv is not None:
         if argv and argv[0] == "PermissionRequest":
             return _deny("PermissionRequest", "levain hook %s: refused: repo-filter-argv (%s)" % (name, why_argv),
                          answer, err)
@@ -370,30 +400,43 @@ def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = N
     return _deny(event, line, answer, err)
 
 
-def _deny(event: str, line: str, out: Any, err: Any) -> int:
-    """The filter's deny on ``event``, with ``line`` as its reason. On PermissionRequest: the ``decision`` object
-    (``hookSpecificOutput.hookEventName`` ``PermissionRequest``, ``decision.behavior`` ``deny``, ``decision.message``
-    the line, nothing else) on stdout and 0, since exit 2 is not honoured there; if that cannot be written whole, exit
-    2 with the line on stderr, the one answer left. On every other event: exit :data:`REFUSED_EXIT` with the line on
-    stderr."""
+def _deny(event: Optional[str], line: str, out: Any, err: Any) -> int:
+    """A deny on ``event`` (:func:`repo_filter`'s, and :func:`run`'s refusals), with ``line`` as its reason.
+
+    On PermissionRequest: the ``decision`` object (``hookSpecificOutput.hookEventName`` ``PermissionRequest``,
+    ``decision.behavior`` ``deny``, ``decision.message`` the line, nothing else) on stdout and 0, since exit 2 is not
+    honoured there. When ``out`` cannot take it, the same document goes once, raw, to the file descriptor beneath
+    ``out`` (a broken text wrapper over an intact pipe); when that fails or is short too, :data:`FAILED_EXIT` with the
+    line on stderr: a hook failure, which the rendered ``onFailure: block`` turns into a deny on this event, where
+    exit 2 would be no answer. A stdout left holding part of a document as well is invalid JSON, itself a hook
+    failure, so every path here ends in a deny on a Claude Code that honours ``onFailure`` (2.1.295+; documented, not
+    run against a live session). On every other event: exit :data:`REFUSED_EXIT` with the line on stderr."""
+    code = REFUSED_EXIT
     if event == "PermissionRequest":
         import json
 
-        doc = {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-                                      "decision": {"behavior": "deny", "message": line}}}
+        data = json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                                  "decision": {"behavior": "deny", "message": line}}})
         try:
-            out.write(json.dumps(doc))
+            out.write(data)
             out.flush()
             return 0
-        except BaseException:  # noqa: BLE001 - fall through to exit 2: a deny is never turned into no answer
+        except BaseException:  # noqa: BLE001 - try the descriptor, then a failure: never no answer
             pass
+        try:
+            raw = data.encode("utf-8")
+            if os.write(out.fileno(), raw) == len(raw):
+                return 0
+        except BaseException:  # noqa: BLE001
+            pass
+        code = FAILED_EXIT
     try:
         err.write(line + "\n")
         err.flush()
     except BaseException:  # noqa: BLE001 - a deny whose reason cannot be written is still a deny
         pass
-    return REFUSED_EXIT
+    return code
 
 
-__all__ = ["ADAPTER_MODULE", "REFUSED_EXIT", "REPO_DENY_DEFAULT", "REPO_FAILED", "REPO_FILTERED_EVENTS",
+__all__ = ["ADAPTER_MODULE", "FAILED_EXIT", "REFUSED_EXIT", "REPO_DENY_DEFAULT", "RUN_EVENTS", "REPO_FAILED", "REPO_FILTERED_EVENTS",
            "REPO_TIMEOUT_MAX", "ALARM_TIMEOUT", "config_guard", "refuse", "repo_filter", "run"]
