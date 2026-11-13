@@ -93,6 +93,11 @@ pin (``HookSpec.sha256``; the product default's turn guard is pinned, :mod:`leva
 are re-hashed right before the spawn, and
 the containment digest is taken over :func:`~levain.desk.room_profile.host_policy` (the profile's fields, the sha256 of
 each hook's copied bytes and the system prompt's sha256), so a changed profile, hook or prompt is another policy.
+Two host-only rules (L3 deploy r1): an open whose profile has hooks REFUSES while a settings file the child loads turns
+hooks off (:func:`hooks_off_refusal`), and ``ensure`` does NOT resume a conversation whose first system prompt is not
+the profile's (the vendor keeps a resumed conversation's first prompt): a fresh launch records its prompt's sha256 in
+``run_dir/room-prompts/<session id>``, and a resume is made only when that record matches; a missing record counts as
+changed. Such a launch starts fresh, and its probing row and the handle's ``prompt_changed`` name the id it left.
 
 Stdlib plus levain. The spawn is a seam (``spawn``) so a test can supply a child of its own."""
 from __future__ import annotations
@@ -262,6 +267,58 @@ def settings_scope_refusal(environ: Mapping[str, str], home: str,
     return None
 
 
+def hooks_off_refusal(environ: Mapping[str, str], home: str, cwd: str, setting_sources: tuple) -> Optional[str]:
+    """Why a host-profile room's PreToolUse hooks (its turn guard, the room's one enforcement) would not run, or None
+    (L3 deploy r1 codex HIGH 1). Claude Code skips every hook while the settings it loads say
+    ``"disableAllHooks": true``, and skips every hook but the managed ones (the room's come from ``--settings``) while
+    managed settings say ``"allowManagedHooksOnly": true`` (hooks reference; settings reference). So the open refuses,
+    naming the file and the key, when ``disableAllHooks`` is true in a file the child loads: the user settings
+    (``$CLAUDE_CONFIG_DIR`` or ``<home>/.claude``, when ``user`` is a source), a ``.claude/settings.json`` (``project``)
+    or ``.claude/settings.local.json`` (``local``) in ``cwd`` or any ancestor (Claude Code reads the local file at the
+    repository root; reading more files only refuses more), or the managed settings (managed-settings.json, its
+    managed-settings.d drop-ins, and the macOS profile: :func:`_loaded_settings`); or when ``allowManagedHooksOnly`` is
+    true in a managed file. A file that is absent, unreadable or not a JSON object is passed over: it cannot set either
+    key (and the vendor refuses to start on a managed file it cannot parse). Precedence is not modelled: a lower
+    ``false`` that a higher ``true`` would lose to, or the reverse, refuses all the same."""
+    config = environ.get("CLAUDE_CONFIG_DIR") or os.path.join(home, ".claude")
+    if not os.path.isabs(config):
+        config = os.path.join(cwd, config)           # the child runs in cwd, so that is where a relative one points
+    files: list = []
+    if "user" in setting_sources:
+        files.append((os.path.join(config, "settings.json"), False))
+    names = [n for src, n in (("project", "settings.json"), ("local", "settings.local.json")) if src in setting_sources]
+    for start in dict.fromkeys((os.path.abspath(cwd), os.path.realpath(cwd))):
+        p = Path(start)
+        for d in (p, *p.parents):
+            files += [(str(d / ".claude" / n), False) for n in names]
+    try:
+        managed = _loaded_settings("")[1:]
+    except Exception:  # noqa: BLE001 - the listing failed: nothing to read, as an absent file
+        managed = []
+    files += [(path, True) for path in managed]
+    for path, is_managed in dict.fromkeys(files):
+        try:
+            if path.endswith(".plist"):
+                with open(path, "rb") as fb:
+                    doc = plistlib.load(fb)
+            else:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+        except Exception:  # noqa: BLE001 - absent or unreadable: it sets nothing the child would act on
+            continue
+        if not isinstance(doc, dict):
+            continue
+        keys = ("disableAllHooks", "allowManagedHooksOnly") if is_managed else ("disableAllHooks",)
+        for key in keys:
+            if doc.get(key) is True:
+                what = ("no hook runs" if key == "disableAllHooks"
+                        else "only managed hooks run, and the room's guard is not one")
+                return _one_line(f"the settings file {path} the room's child loads sets {key}: true, so {what}: the "
+                                 "room's turn guard, its one enforcement, would not run. The room does not open while "
+                                 "it is set; remove it", 400)
+    return None
+
+
 def _loaded_settings(user: str) -> list:
     """The path of every settings file the room's child loads: ``user``, the owner's managed files
     (:func:`levain.consent.adapters.claude_code.managed_settings_files`: managed-settings.json then its
@@ -358,12 +415,16 @@ class RoomCanary:
 class RoomHandle(NamedTuple):
     """``resumed``: the launch was opened with ``--resume``. ``resume_failed``: the session id whose resume exited
     before its open check ended (or was gone at its first write), so this launch is a fresh start in its place (None
-    otherwise). Both describe the launch, whichever :meth:`RoomLauncher.ensure` call returns it."""
+    otherwise). ``prompt_changed``: the session id a host-profile launch did NOT resume because the profile's system
+    prompt is not the one that conversation was started with (the vendor keeps a resumed conversation's first prompt),
+    so this launch is a fresh start in its place (None otherwise). All describe the launch, whichever
+    :meth:`RoomLauncher.ensure` call returns it."""
     launch_id: str
     room_thread: str
     harness_session_id: str
     resumed: bool
     resume_failed: Optional[str] = None
+    prompt_changed: Optional[str] = None
 
 
 def _sweep_group(pid: Any) -> None:
@@ -557,6 +618,13 @@ def containment_digest(settings_json: str, readguard_sha256: str, host: Optional
     return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _prompt_mark(profile: RoomProfile) -> str:
+    """What a host conversation's first system prompt is recorded as: its sha256, or ``none`` for a profile with none."""
+    if profile.system_prompt is None:
+        return "none"
+    return hashlib.sha256(profile.system_prompt.encode("utf-8")).hexdigest()
+
+
 def _spawn(argv: list, *, cwd: str, env: dict, stderr: Any) -> Any:
     return subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
                             text=True, encoding="utf-8", errors="replace", start_new_session=True)
@@ -566,10 +634,12 @@ class _Live:
     """What the launcher holds for one running room launch."""
 
     def __init__(self, launch_id: str, session: RoomSession, proc: Any, workdir: Path, *, room_thread: str,
-                 session_id: str, resumed: bool, resume_failed: Optional[str]) -> None:
+                 session_id: str, resumed: bool, resume_failed: Optional[str],
+                 prompt_changed: Optional[str] = None) -> None:
         self.launch_id, self.session, self.proc, self.workdir = launch_id, session, proc, workdir
         self.room_thread, self.session_id, self.resumed, self.resume_failed = (room_thread, session_id, resumed,
                                                                                resume_failed)
+        self.prompt_changed = prompt_changed
 
 
 class RoomLauncher:
@@ -711,11 +781,19 @@ class RoomLauncher:
                 elif self._store._read(lambda conn: liveness(conn, newest[0])).latched:
                     why = "room latched not live"
                 if held is not None and why is None and newest[1] == "active":
-                    return RoomHandle(newest[0], room_thread, held.session_id, held.resumed, held.resume_failed)
+                    return RoomHandle(newest[0], room_thread, held.session_id, held.resumed, held.resume_failed,
+                                      held.prompt_changed)
                 self.end(newest[0], why or "room launch replaced")
             resume = None if fresh else self._resume_id(room_thread)
+            prompt_changed = None
+            if resume is not None and self._profile is not None \
+                    and self._born_prompt(resume) != _prompt_mark(self._profile):
+                # the vendor resumes a conversation under the system prompt it STARTED with, so resuming it under a
+                # changed prompt would record (digest, argv) a prompt the model is not running: start fresh, as the
+                # desk's own rotation does (L3 deploy r1 codex HIGH 3). An unknown first prompt counts as changed
+                prompt_changed, resume = resume, None
             try:
-                return self._open(room_thread, resume)
+                return self._open(room_thread, resume, prompt_changed=prompt_changed)
             except _ChildExited:
                 if resume is None:
                     raise
@@ -735,7 +813,39 @@ class RoomLauncher:
         self._conn += 1
         return self._conn
 
-    def _open(self, room_thread: str, resume: Optional[str], *, resume_failed: Optional[str] = None) -> RoomHandle:
+    def _prompt_path(self, sid: str) -> Optional[Path]:
+        """Where the first-prompt mark of conversation ``sid`` is kept (``run_dir/room-prompts/<sid>``), or None for
+        an id that is not a plain token (it is never made into a path)."""
+        if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid):
+            return None
+        return self._run_dir / "room-prompts" / sid
+
+    def _born_prompt(self, sid: str) -> Optional[str]:
+        """The :func:`_prompt_mark` conversation ``sid`` was started with, or None when it is not known."""
+        path = self._prompt_path(sid)
+        try:
+            return path.read_text(encoding="utf-8").strip() if path is not None else None
+        except (OSError, ValueError):
+            return None
+
+    def _record_prompt(self, sid: str) -> None:
+        """Record the profile's :func:`_prompt_mark` as conversation ``sid``'s first prompt (a fresh host launch, once
+        it is active). A write that fails leaves the mark unknown, so the next open starts fresh: never a wrong resume."""
+        path = self._prompt_path(sid)
+        if path is None or self._profile is None:
+            return
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            tmp = path.with_name(f".{sid}.{secrets.token_hex(6)}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(_prompt_mark(self._profile))
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def _open(self, room_thread: str, resume: Optional[str], *, resume_failed: Optional[str] = None,
+              prompt_changed: Optional[str] = None) -> RoomHandle:
         profile = self._profile
         # the host profile's own model wins over the setting's (the argv and the launch row say the same one)
         model = profile.model if profile is not None and profile.model else self._setting.model
@@ -757,6 +867,10 @@ class RoomLauncher:
                 # room's open applies. The hook scripts are re-checked here (they can vanish after construction)
                 for spec in profile.hooks:
                     self._check_hook(spec)
+                if profile.hooks:
+                    off = hooks_off_refusal(env, self._home, self._setting.cwd, profile.setting_sources)
+                    if off is not None:
+                        raise RoomLaunchError(off)
                 argv, stderr_path, settings_json, hook_files = self._write_host_files(workdir, launch_id, resume, sid)
                 decoy = scope = guard_sha = ""
                 for path, sha in hook_files:        # fail closed, as the read guard's check below
@@ -783,9 +897,16 @@ class RoomLauncher:
             session = RoomSession(PipeTransport(proc), conn=self._next_conn(), session_id=sid,
                                   live=room_live.Sink(launch_id))
             self._live[launch_id] = _Live(launch_id, session, proc, workdir, room_thread=room_thread, session_id=sid,
-                                          resumed=resume is not None, resume_failed=resume_failed)
-            self._svc.activate(launch_id, "probing", "room spawned" if resume_failed is None else _one_line(
-                f"room spawned as a fresh session after the resume of {resume_failed} exited", 200), spawn_nonce=nonce)
+                                          resumed=resume is not None, resume_failed=resume_failed,
+                                          prompt_changed=prompt_changed)
+            if resume_failed is not None:
+                detail = _one_line(f"room spawned as a fresh session after the resume of {resume_failed} exited", 200)
+            elif prompt_changed is not None:
+                detail = _one_line(f"room spawned as a fresh session: the room's system prompt is not the one "
+                                   f"conversation {prompt_changed} started with (a resume keeps the old one)", 200)
+            else:
+                detail = "room spawned"
+            self._svc.activate(launch_id, "probing", detail, spawn_nonce=nonce)
             if profile is not None:
                 init = self._open_check_host(session, proc, stderr_path, sid, profile)
                 canary = RoomCanary(True, "", "host profile: open turn ended")
@@ -818,7 +939,9 @@ class RoomLauncher:
                 got, why = lease.activate_room(conn, now, launch_id, harness_session_id=sid, argv_sha256=digest)
             if why is not None:
                 raise RoomLaunchError(f"the room launch could not be activated: {why}")
-            return RoomHandle(launch_id, room_thread, sid, resume is not None, resume_failed)
+            if profile is not None and resume is None:
+                self._record_prompt(sid)                 # the prompt this conversation starts with (ensure's check)
+            return RoomHandle(launch_id, room_thread, sid, resume is not None, resume_failed, prompt_changed)
         except BaseException as exc:
             if proc is not None and launch_id not in self._live:
                 _stop_child(proc)                        # spawned, but not yet held: nothing else will stop it

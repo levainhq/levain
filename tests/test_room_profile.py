@@ -115,7 +115,7 @@ def test_host_settings_json_has_the_hook_entry_and_no_permissions_block(script):
     assert set(doc) == {"hooks"}
     assert "permissions" not in doc
     assert doc["hooks"] == {"PreToolUse": [{"matcher": MATCHER, "hooks": [
-        {"type": "command", "command": "/py -I /run/room_hook-abc.py", "timeout": 10}]}]}
+        {"type": "command", "command": "/py -I /run/room_hook-abc.py", "timeout": 10, "onFailure": "block"}]}]}
     assert "blockReadsOutsideWorkingDirectories" not in json.dumps(doc) and "deny" not in json.dumps(doc)
 
 

@@ -223,8 +223,11 @@ def _release(dog: "subprocess.Popen[bytes]", life_w: int) -> None:
 def _abandon(dog: "subprocess.Popen[bytes]", life_w: int) -> None:
     """The door could not finish handling its command: kill the watchdog's whole group (the command and every
     descendant, the watchdog too) while the unreaped watchdog still holds the group id, then close the lifeline with no
-    release byte (a watchdog the kill missed reads end of file and kills its group itself) and reap it."""
-    _kill_group(dog.pid)
+    release byte (a watchdog the kill missed reads end of file and kills its group itself) and reap it. A watchdog that
+    has already exited (past its own deadline it killed its group itself) is reaped by the ``poll`` and its group is
+    NOT signalled: once reaped, its id could name another process group (L3 deploy r1 deepseek LOW)."""
+    if dog.poll() is None:
+        _kill_group(dog.pid)
     os.close(life_w)
     _reap(dog)
 

@@ -8,10 +8,14 @@ only, and a change to this file is a deliberate re-pin.
 
 PROVENANCE. A port of flow's ``scripts/room_turn_guard.py`` at flow commit e54ce5fc0 (2026-11-12), itself the Room-wording
 fork of flowConnect's ``server/chat_turn_guard.py`` (flowConnect commit 9857570, file sha256 55d9f08be102...). The code
-below this docstring is flow's, byte-for-byte, but for one change in REFUSAL: "tell Phill he can" reads "tell the user
-they can" (levain is not one operator's); only that and this docstring are levain's. flowConnect's lane 6 (11-12) fixes
-bypasses in that guard: when it lands, this copy is owed a re-sync from flowConnect (keep the "Room turn" refusal
-wording and the "user" change), then a new pin.
+below this docstring is flow's, byte-for-byte, but for two changes, both levain's: (1) in REFUSAL, "tell Phill he can"
+reads "tell the user they can" (levain is not one operator's); (2) ``main()`` DENIES a Bash call when deciding it
+raises (:data:`CRASH_REFUSAL`; L3 deploy r1, 1112-40 ROOMFIX4), where flow's guard lets the traceback out and the
+vendor treats that exit as a non-blocking error, so the Bash call ran unguarded. Here the guard is the room's one
+enforcement, so a crash must never become an allow for the one tool it exists for; any other tool still runs. FOR THE
+RE-SYNC OWNER: flowConnect's lane 6 (11-12) fixes bypasses in that guard; when it lands, this copy is owed a re-sync
+from flowConnect that keeps the "Room turn" refusal wording, the "user" change AND the crash-deny in ``main()``, then a
+new pin (:data:`levain.desk.room_default.ROOM_TURN_GUARD_SHA256`).
 
 What it refuses (flowConnect's rule, kept as written): work that cannot finish inside one chat turn. A Bash, Agent or
 Task call with ``run_in_background``; CronCreate, Monitor, Workflow and ScheduleWakeup; and a Bash command that,
@@ -19,8 +23,8 @@ scanned as shell tokens (quotes, comments, heredoc data and ``$((...))`` kept as
 lone ``&``, runs ``nohup``/``setsid``/``disown``, or runs one of the long review scripts named in ``_LONG_SCRIPTS``
 directly, through python, a wrapper, ``<shell> -c``, ``eval`` or a substitution. Those two names are flowConnect's
 own scripts and are kept so the port stays identical; for any other host they simply never match. It prints a deny
-decision and exits 2; anything else, including a payload it cannot parse, exits 0 (a hook crash must not brick the
-chat). SCOPE: a model's own slip, not deliberate evasion (tmux, at, launchctl, a script it wrote, a long foreground
+decision and exits 2. A Bash call whose decision raises is denied the same way (levain's change 2 above). Anything
+else, including a payload it cannot parse as a JSON object, exits 0 (a hook crash must not brick the chat). SCOPE: a model's own slip, not deliberate evasion (tmux, at, launchctl, a script it wrote, a long foreground
 command are not guarded).
 """
 import json
@@ -32,6 +36,11 @@ REFUSAL = (
     "back here yet, and a review run here would hold the chat. Do not promise a later action. Hand it to a "
     "seat or the desk: tell the user they can drop it in the cockpit's Desk thread, or ask you to relay it to the desk, "
     "or open a seat for it."
+)
+# levain's (header, change 2): the reason for a Bash call the guard could not decide
+CRASH_REFUSAL = (
+    "Refused: the room's turn guard could not check this Bash call ({error}), so it does not run. Try the command "
+    "again written more simply; if it still fails, hand it to a seat or the desk."
 )
 
 _LATER_TOOLS = {"CronCreate", "Monitor", "Workflow", "ScheduleWakeup"}
@@ -319,7 +328,12 @@ def main() -> int:
             return 0
     except (ValueError, OSError):
         return 0
-    reason = refusal_for(event)
+    try:
+        reason = refusal_for(event)
+    except Exception as exc:   # levain: a crash deciding a Bash call denies it (header, change 2); other tools run
+        if event.get("tool_name") != "Bash":
+            return 0
+        reason = CRASH_REFUSAL.format(error=type(exc).__name__)
     if reason is None:
         return 0
     sys.stdout.write(json.dumps({"hookSpecificOutput": {
