@@ -616,7 +616,14 @@ def test_build_room_serve_passes_the_profile_into_the_setting(tmp_path, monkeypa
         assert rs.status()["profile"] == "host" and rs.service._room_mode == BYPASS
     finally:
         rs.stop()
+    # np-97fa3dd6 (a): the PRODUCT default is the host profile; the confined room is the explicit opt-in (ROOMFLIP)
     rs = web_server._build_room_serve(proj)
+    try:
+        assert rs.status()["profile"] == "host" and rs.service._room_mode == BYPASS
+    finally:
+        rs.stop()
+    from levain.desk.room_default import CONFINED
+    rs = web_server._build_room_serve(proj, profile=CONFINED)
     try:
         assert rs.status()["profile"] == CONFINED_DEFAULT_STATUS_PROFILE and rs.service._room_mode == CONFINED_DEFAULT_MODE
     finally:
