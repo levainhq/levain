@@ -1,11 +1,15 @@
-"""The room's MCP door (DESIGN_ROOM §4.3, §4.6): a stdio MCP server with ONE tool, ``propose_drop``, on the question
+"""The room's MCP door (DESIGN_ROOM §4.3, §4.6): a stdio MCP server on the question
 band's door pattern (:mod:`levain.consent.band_mcp`: JSON-RPC 2.0, one message per line, its error shape). Stdlib plus
-levain. Run as ``<python> -P -m levain.desk.room_mcp [--launch <launch id>]``.
+levain. Run as ``<python> -P -m levain.desk.room_mcp [--launch <launch id>]``. Its tools are the ``*_TOOL`` tables below,
+chosen by the host's commands (:func:`levain.desk.room_host.door_tools`; see "Host tools"); with no host, ``propose_drop``
+alone.
 
-The door carries no authority. It never commits, never writes a drop, and takes no words from the model: a drop's words
-are the operator's own quoted messages, named by id and copied from the store by :func:`levain.desk.room.propose`
-(the tool has no field for words, and a call that carries one is refused). The room's own phrasing is the ``summary``,
-which only ever rides beside a drop as a labelled note. The reply says a card is waiting for his tap and nothing more.
+The door carries no authority. It never commits and never writes a drop. ``propose_drop`` takes no words from the model: a
+drop's words are the operator's own quoted messages, named by id and copied from the store by
+:func:`levain.desk.room.propose` (the tool has no field for words, and a call that carries one is refused). The room's
+own phrasing is the ``summary``, which only ever rides beside a drop as a labelled note. The reply says a card is waiting
+for his tap and nothing more. The host-command tools below say which of them take words from the model (the note tool
+does, and only as a labelled note that is never his direction).
 
 The launch is bound PER PROCESS, never per call: Claude starts one stdio door per vendor session and a ``tools/call``
 carries no session id, so the launcher names the launch once, in the server's mcp-config entry (``LEVAIN_ROOM_LAUNCH``
@@ -31,8 +35,8 @@ only a thread a relay from this room was sent on, for a live room launch. ``note
 command, independent of the relay) takes ONE argument, ``note``: the seat's own words, not his. The door checks the launch,
 refuses any character a person cannot see (:mod:`levain.unshowable`: control characters, newline and tab included,
 format characters, lone surrogates) and any text that, behind the fixed ``[from the Room] `` attribution it puts in
-front, would pass :data:`room_host.NOTE_MAX`, files at most :data:`NOTE_PER_HOUR` notes for its launch in any rolling
-hour, then runs the host's argv with that text on STDIN. A note claims nothing: it is information the seat wrote, and
+front, would pass :data:`room_host.NOTE_MAX`, starts at most :data:`NOTE_PER_HOUR` note commands for its launch in any
+rolling hour (an attempt that failed counts: it may have landed), then runs the host's argv with that text on STDIN. A note claims nothing: it is information the seat wrote, and
 it never carries his direction; one whose command started and failed may still have landed, so the reply says delivery
 is unknown and not to file it again. The door runs only the host's argv; the model
 names a quote set and a thread id, or the text of a note, never a program or an argument."""
@@ -376,7 +380,7 @@ def _note(launch_id: str, params: dict[str, Any], host: HostCommands) -> dict[st
     # No claim and no outcome row: a note is the seat's own information. Only the count is kept, in this process.
     stamp = _spend_note(launch_id)
     if stamp is None:
-        return fail(f"this room has filed {NOTE_PER_HOUR} notes in the last hour, the most it may (the desk's note "
+        return fail(f"this room has attempted {NOTE_PER_HOUR} notes in the last hour, the most it may (the desk's note "
                     "budget is shared with the operator's other surfaces); say the rest in the conversation, or wait")
     ran = room_host.run(host.note, room_host.NOTE_PREFIX + note)
     if not ran.started:
