@@ -1,7 +1,7 @@
 """levain.dream.start (D1-M): ``levain dream start``, the one verb that starts a dream by hand.
 
 It is not a second way in. A hand start goes through the SAME three gates a scheduled window meets, in the same
-order, and every one of them is the controller's own code:
+order, and none of them is a second copy written for this verb:
 
 * **the link.** The agent must be armed: :func:`levain.agents.tick_driver.binding_of_factory`, the function the tick
   arms a window with, finds the highest-born LIVE signed link of the dream's current spec on the authority log. No
@@ -11,8 +11,8 @@ order, and every one of them is the controller's own code:
 * **the ceiling.** The launch reserves under the link's SIGNED ``run_ceiling`` and budgets (``accounting.reserve``),
   counting what ``accounting.count_span`` of now names: inside 22:00-05:00 that night's scheduled runs and hand starts,
   either side of midnight; outside it the daytime's hand starts (one signed limit covers both kinds). On top of it the day-ready check 1 stops at :data:`levain.dream.ready.RUN_CEILING` launched runs.
-* **the admission.** The occurrence is ``kind = 'manual'``, so the dream's own input hook
-  (:func:`levain.dream.agent.install_on_input`, via ``controller.launch``'s default hook) runs
+* **the admission.** The occurrence is ``kind = 'manual'``, and the dream's own input hook
+  (:func:`levain.dream.agent.install_on_input`) is what judges it: it runs
   :func:`levain.dream.ready.evaluate` with ``manual=True``: check 6 (the window's one attempt) is waived, because a
   hand start is the catch-up for exactly that failure, and every other check, a wrap open and a baton held elsewhere
   included, refuses as it does at night.
