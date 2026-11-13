@@ -554,6 +554,48 @@ def test_b10_a_picked_key_is_asked_for_by_its_id_even_after_a_refusal(world, tmp
     assert not [s for s in rec.steps if s[1] == "revoke"], rec.steps        # the OS's list never signed with the other key
 
 
+_HOLD_GET = ("(() => { window.__getCalled = false; navigator.credentials.get = () => new Promise((_ok, no) => {"
+             " window.__getCalled = true; window.__release = () => no(new DOMException('declined', 'NotAllowedError')); }); return 1; })()")
+
+
+@needs_browser
+@needs_ssh
+def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_the_card_mid_ceremony(
+        world, tmp_path, monkeypatch) -> None:
+    """An open Decisions view is drawn again on every board read, and a read that lands while the passkey prompt is up replaces
+    the card the revoke was tapped on. The ceremony's word ("nothing was revoked") and the end of its lock belong to the card
+    a person is looking at then, the way a sign card's note is kept: the live card is locked while the ceremony runs, and says
+    the refusal, with its Revoke button back, once it ends. The prompt is held (one `navigator.credentials.get` that stays
+    pending until released) so the redraw is placed exactly in the ceremony."""
+    port, src, signer, older, newer = _grant_rig(world, tmp_path, monkeypatch)
+    record = {newer.key.fingerprint: _b64u(b"cred-new")}
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        rec = _Verifying(httpd.grant_phone, [older, newer])
+        httpd.grant_phone = rec
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _auth(newer, b"cred-new"), {"until": TILE},
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
+            {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
+            {"eval": _HOLD_GET},
+            {"eval": f"window.__tapped = {_CARD}; 1"},
+            {"tap": _REVOKE},
+            {"until": "window.__getCalled === true && 1", "ms": 30000},
+            # a board read (Sync) while the prompt is up: the card is replaced, and the one the tap was on is off the page
+            {"eval": "document.querySelector('#refresh').click(); 1"},
+            {"until": f"!!{_CARD} && {_CARD} !== window.__tapped && !window.__tapped.isConnected && 1", "ms": 30000},
+            {"eval": f"{_REVOKE}.disabled"},
+            {"eval": "window.__release(); 1"},
+            {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
+            {"eval": f"{_CARD}.querySelector('.sign-note').className"},
+        ])
+    v = out["values"]
+    assert v[-4] is True, v[-4]                     # the card drawn mid-ceremony is locked, as the tapped one was
+    assert "the passkey did not sign (NotAllowedError); nothing was revoked" in v[-2], v[-2]
+    assert "sign-bad" in v[-1], v[-1]
+    assert not [s for s in rec.steps if s[1] == "revoke"], rec.steps
+
+
 @needs_browser
 @needs_ssh
 def test_b8s_the_sheets_plain_sign_after_a_refused_remembered_key_forgets_it(tmp_path: Path, monkeypatch) -> None:

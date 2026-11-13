@@ -8333,13 +8333,15 @@
                                   && Array.isArray(x.signers) && x.signers.length) : null;
     if (signed) {
       const line = el("div", "consent-cmd grant-sign");
+      line.dataset.grantKey = grantKey(g);
       const btn = el("button", "undo-btn grant-revoke", "revoke");
       btn.type = "button";
       btn.title = "revoke with your passkey";
       const note = el("span", "sign-note ext-meta");
-      const say = (text, kind) => { note.textContent = text; note.className = "sign-note ext-meta" + (kind ? " sign-" + kind : ""); };
+      const say = (text, kind) => grantSay(line, text, kind);
       btn.addEventListener("click", () => grantRevoke(g, signed, signList, btn, line, say));
       line.append(btn, note);
+      grantPaint(line, true);       // a card drawn while a revoke runs, or after one, shows where it stands
       row.appendChild(line);
     }
     const cmd = sv(g.revoke);
@@ -8364,6 +8366,29 @@
   // the line and head it is sent and puts only that to the passkey, so what the prompt signs is the link shown
   const GRANT_SIGN_LIST = "/cockpit/grant/list.json";
   let grantSaid = "";          // what the last revoke said, kept across the slot's redraw (a revoked grant leaves it)
+  // The sign card's pair (signNotes, signInFlight), for a grant card: an open Decisions view is drawn again on every board
+  // read, which replaces the card a revoke was tapped on while its ceremony runs. The note and the in-flight lock are kept
+  // by grant (its id and instance), and whichever card is on the page when the ceremony speaks or ends is painted from them
+  const grantNotes = new Map();     // grant key -> [text, kind]: what the last revoke ceremony said, kept across redraws
+  const grantInFlight = new Set();  // grant keys with a revoke ceremony running: a card drawn meanwhile is drawn locked
+  const grantKey = (g) => g.id + "\n" + g.instance;
+  function grantPaint(line, drawn) {
+    const key = line.dataset.grantKey;
+    const btn = line.querySelector(".grant-revoke"), note = line.querySelector(".sign-note");
+    btn.disabled = grantInFlight.has(key);
+    const k = grantNotes.get(key);
+    // a card drawn after the ceremony does not repeat what the slot's own line (grantSaid) already says
+    if (k && !(drawn && k[0] === grantSaid)) { note.textContent = k[0]; note.className = "sign-note ext-meta" + (k[1] ? " sign-" + k[1] : ""); }
+  }
+  // paint `own` (the card the ceremony was tapped on) and every card of that grant that is on the page now
+  function grantPaintLive(own) {
+    grantPaint(own, false);
+    for (const l of document.querySelectorAll(".grant-sign")) if (l !== own && l.dataset.grantKey === own.dataset.grantKey) grantPaint(l, false);
+  }
+  function grantSay(own, text, kind) {
+    grantNotes.set(own.dataset.grantKey, [text, kind || ""]);
+    grantPaintLive(own);
+  }
   function grantSignList() {
     const headers = signHeaders(false);
     if (!SIGN_USABLE || !headers["X-Levain-Write-Token"]) return Promise.resolve(null);
@@ -8389,6 +8414,7 @@
   function grantRevoke(g, signed, listing, btn, host, say) {
     if (signBusy) { say(SIGN_BUSY.replace("signed", "revoked"), "bad"); return; }
     signBusy++;
+    grantInFlight.add(host.dataset.grantKey);
     btn.disabled = true;
     const base = "/cockpit/grant/" + encodeURIComponent(g.id) + "/";
     const slot = host.closest(".grant-slot");     // at the click: a redraw during the ceremony detaches this card
@@ -8444,7 +8470,8 @@
       say(sent ? grantSaid : "the page failed (" + name + "); nothing was revoked", "bad");
     }).finally(() => {
       signBusy--;
-      btn.disabled = false;
+      grantInFlight.delete(host.dataset.grantKey);
+      grantPaintLive(host);
       if (!sent && !revoked) return;
       // the grants again: a revoked grant leaves the slot, and the slot keeps what the revoke said
       grantRead = null;
