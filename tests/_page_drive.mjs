@@ -300,19 +300,26 @@ for (const end = Date.now() + scaled(15000); Date.now() < end;) {
 // the diagnostic block a timeout prints AFTER its named failure line: page state through one probe that cannot throw, the
 // last 20 console messages / page errors, and the screenshot path; capped at 4000 characters, never able to change the exit
 // does the BROWSER still list this drive's page, and what does it say it is showing? (the page's own channel is the one in doubt, so ask the browser's)
+// The browser answers from its own process, so an empty url here is a navigation that never committed, not a page that is merely busy:
+// the url and title are quoted so an empty one reads as empty. The shared browser is asked over its connection when it has one and
+// over /json otherwise; the drive's own page is found by its target id on either path.
+const listedTarget = (t, id, extra) =>
+  `listed, id=${id} type=${t.type}${extra} url=${JSON.stringify(String(t.url).slice(0, 120))} title=${JSON.stringify(String(t.title || "").slice(0, 60))}`;
 const targetState = async () => {
   try {
     if (sharedPort && bws && ourTargetId) {
       const r = await Promise.race([bsend("Target.getTargets"), sleep(2000).then(() => null)]);
       if (!r) return "browser did not answer Target.getTargets within 2000ms";
       if (r.error) return `browser answered Target.getTargets with an error: ${String(r.error.message || JSON.stringify(r.error)).slice(0, 120)}`;
-      const t = (r.result?.targetInfos || []).find((x) => x.targetId === ourTargetId);
-      return t ? `listed, id=${ourTargetId} attached=${t.attached} url=${String(t.url).slice(0, 120)} title=${String(t.title).slice(0, 60)}` : "NOT LISTED (the page target is gone)";
+      const list = r.result?.targetInfos || [];
+      const t = list.find((x) => x.targetId === ourTargetId);
+      return t ? listedTarget(t, ourTargetId, ` attached=${t.attached}`) : `NOT LISTED (the page target is gone; the browser lists ${list.length} targets)`;
     }
-    if (port) {
-      const list = await (await fetch(`http://127.0.0.1:${port}/json`, { signal: AbortSignal.timeout(2000) })).json();
+    const httpPort = sharedPort || port;
+    if (httpPort) {
+      const list = await (await fetch(`http://127.0.0.1:${httpPort}/json`, { signal: AbortSignal.timeout(2000) })).json();
       const t = list.find((x) => x.id === ourTargetId);
-      return t ? `listed, id=${ourTargetId} url=${String(t.url).slice(0, 120)} title=${String(t.title).slice(0, 60)}` : "NOT LISTED (this drive's page target is not in the browser's list)";
+      return t ? listedTarget(t, ourTargetId, "") : `NOT LISTED (this drive's page target is not in the browser's list of ${list.length} targets)`;
     }
   } catch (e) { return "browser unreachable: " + String(e && e.message || e).slice(0, 80); }
   return "no browser connection to ask";
@@ -323,20 +330,13 @@ const timeoutBlock = async (shotPath) => {
     const probe = await evaluateOutcome("(() => { try { const m = document.querySelector('#levain-modal'); return JSON.stringify({ url: location.href, ready: document.readyState, modal: !!m, rows: m ? m.querySelectorAll('[data-question-row]').length : null, text: String((document.body && document.body.innerText) || '').slice(0, 600) }); } catch (e) { return JSON.stringify({ probe_error: String(e) }); } })()", 3000);
     let o = {}; try { o = JSON.parse(probe.value); } catch { o = { probe_error: probe.error || "no answer" }; }
     // What the page's evaluation cannot say when the page does not answer: how the service-worker waits before reloads ended, how many
-    // navigation / load events this connection saw, and the url the BROWSER holds for this page's target (the /json endpoint answers
-    // from the browser process, so an empty url there is a navigation that never committed, not a page that is merely busy).
+    // navigation / load events this connection saw, and (targetState) what the BROWSER holds for this page's target.
     const waits = workerWaits.length
       ? workerWaits.map((w) => `${w.how} after ${w.ms}ms/${w.polls} polls (last ${w.last}, ${Math.max(0, Date.now() - w.at)}ms ago)`).join("; ")
       : "none run";
-    let target = "unknown";
-    try {
-      const list = await (await fetch(`http://127.0.0.1:${sharedPort || port}/json`, { signal: AbortSignal.timeout(3000) })).json();
-      const mine = list.find((t) => pageWsUrl && String(t.webSocketDebuggerUrl || "").endsWith("/" + String(pageWsUrl).split("/").pop()));
-      target = mine ? `${mine.type} url=${JSON.stringify(String(mine.url).slice(0, 120))} title=${JSON.stringify(String(mine.title || "").slice(0, 40))}` : `not listed among ${list.length} targets`;
-    } catch (e) { target = `/json failed: ${String((e && e.message) || e).slice(0, 80)}`; }
     const lines = ["--- page state at the timeout ---",
       `PAGE URL: ${o.url ?? "?"}`, `READY STATE: ${o.ready ?? "?"}`,
-      `WORKER WAITS: ${waits}`, `NAVIGATION: events=${navStarts} loads=${loads}`, `TARGET (browser's /json): ${target}`,
+      `WORKER WAITS: ${waits}`, `NAVIGATION: events=${navStarts} loads=${loads}`,
       `MODAL: #levain-modal exists=${o.modal ?? "?"} [data-question-row] count=${o.rows ?? "?"}` + (o.probe_error ? ` (probe error: ${o.probe_error})` : ""),
       `TARGET: ${await targetState()}`, `LAST PAGE EVENT: ${quietMs}ms ago; NAV TRAIL: ${navTrail.join(", ") || "none"}`,
       `CONSOLE (last 20 of ${consoleLog.length}):`, ...consoleLog.slice(-20).map((c) => "  " + c),
