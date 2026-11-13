@@ -127,51 +127,128 @@ jobs:
             mkdir -p "$RUNNER_TEMP/drift-log"
             : > "$log"
           fi
-          line="$(grep '^DEP_DRIFT ' "$log" | tail -1 || true)"
-          {
-            if [ -z "$DRIFT_CODE" ]; then
-              echo "Did not finish on ${day}: the job ended (job status: ${JOB_STATUS:-unknown}) before the drift check wrote an exit code."
-              echo "That is a timeout, a cancel or a failed setup step. It says nothing about whether the dependencies drifted."
-            else
-              echo "Red on ${day}: the suite does not pass on a freshly re-resolved lock."
-            fi
-            echo
-            echo "Run: ${run_url}"
-            echo
-            echo "Result line: \`${line:-none (the script died before printing one)}\`"
-            echo
-            if [ -n "$line" ]; then
-              printf '%s' "${line#DEP_DRIFT }" | python3 -c '
-          import json, sys
-          try:
-              d = json.load(sys.stdin)
-          except ValueError:
-              d = None
-          changed = d.get("changed") if isinstance(d, dict) else None
-          if not isinstance(changed, list):
-              print("The result line could not be read (it is not a JSON object with a list under changed); the log tail below is the evidence.")
-              sys.exit(0)
-          if changed:
-              print("Packages whose version changed against the committed uv.lock (old -> new):\n")
-              print("\n".join("- " + str(c) for c in changed))
-          elif d.get("stage") == "suite":
-              print("red with no version change: likely flaky test, not drift")
+          # The body is built by one script that prints nothing until the whole body exists, and that bounds every part of it:
+          # GitHub rejects an issue or comment body over 65,536 characters (HTTP 422), and the step would then end red with no issue.
+          render="$RUNNER_TEMP/render_body.py"
+          cat > "$render" <<'PY'
+          import json
+          import os
+          import sys
+
+          BODY_MAX = 60000      # characters in the whole body; GitHub refuses 65,536, so this stays well under it
+          LINE_MAX = 500        # the result line as shown in the body
+          ITEM_MAX = 400        # one package or one failing test
+          LIST_MAX = 15000      # one bulleted list (changed packages, failing tests)
+          TAIL_LINES = 60       # log lines kept at the end
+          TAIL_LINE_MAX = 800   # characters kept of one of those lines
+          MARK = "(truncated)"  # the last line of the body when anything was cut
+
+          day, run_url, log_path = sys.argv[1:4]
+          code = os.environ.get("DRIFT_CODE", "")
+          status = os.environ.get("JOB_STATUS", "") or "unknown"
+          cut = False
+
+
+          def clip(text, limit):
+              global cut
+              if len(text) > limit:
+                  cut = True
+                  return text[:limit]
+              return text
+
+
+          def longest_backtick_run(text):
+              best = run = 0
+              for ch in text:
+                  run = run + 1 if ch == "`" else 0
+                  best = max(best, run)
+              return best
+
+
+          def bullets(seq):
+              global cut
+              lines, used = [], 0
+              for i, c in enumerate(seq):
+                  b = "- " + clip(str(c), ITEM_MAX)
+                  if used + len(b) + 1 > LIST_MAX:
+                      lines.append("- ... and %d more" % (len(seq) - i))
+                      cut = True
+                      break
+                  lines.append(b)
+                  used += len(b) + 1
+              return "\n".join(lines)
+
+
+          def section(payload):
+              """What the result line says, as text; nothing is printed from here, so a failure leaves no half section."""
+              try:
+                  d = json.loads(payload)
+              except Exception:  # ValueError, and RecursionError from a deeply nested line
+                  d = None
+              out = []
+              changed = d.get("changed") if isinstance(d, dict) else None
+              if not isinstance(changed, list):
+                  out.append("The result line could not be read (it is not a JSON object with a list under changed); the log tail below is the evidence.\n")
+              elif changed:
+                  out.append("Packages whose version changed against the committed uv.lock (old -> new):\n\n")
+                  out.append(bullets(changed) + "\n")
+              elif d.get("stage") == "suite":
+                  out.append("red with no version change: likely flaky test, not drift\n")
+              else:
+                  out.append("no version change recorded; result: " + clip(str(d.get("result")), ITEM_MAX) + ", stage: " + clip(str(d.get("stage")), ITEM_MAX) + "\n")
+              failed = d.get("failed_tests") if isinstance(d, dict) else None
+              if failed and isinstance(failed, list):
+                  out.append("\nFailing tests:\n\n")
+                  out.append(bullets(failed) + "\n")
+              return "".join(out)
+
+
+          with open(log_path, "rb") as fh:
+              log_lines = fh.read().decode("utf-8", "replace").split("\n")
+          if log_lines and log_lines[-1] == "":
+              log_lines.pop()
+          marked = [ln for ln in log_lines if ln.startswith("DEP_DRIFT ")]
+          line = marked[-1] if marked else None
+
+          if code == "":
+              head = ("Did not finish on %s: the job ended (job status: %s) before the drift check wrote an exit code.\n"
+                      "That is a timeout, a cancel or a failed setup step. It says nothing about whether the dependencies drifted.\n" % (day, status))
           else:
-              print("no version change recorded; result: " + str(d.get("result")) + ", stage: " + str(d.get("stage")))
-          failed = d.get("failed_tests")
-          if failed and isinstance(failed, list):
-              print("\nFailing tests:\n")
-              print("\n".join("- " + str(t) for t in failed))
-          ' || echo "The result line could not be read (the parser failed); the log tail below is the evidence."
-            else
-              echo "Packages whose version changed: unknown."
-            fi
-            echo
-            echo "Log tail:"
-            echo '```'
-            tail -n 60 "$log"
-            echo '```'
-          } > "$RUNNER_TEMP/body.md"
+              head = "Red on %s: the suite does not pass on a freshly re-resolved lock.\n" % day
+
+          # The result line sits in an inline code span: its delimiter is one backtick longer than the longest run inside it.
+          shown = clip(line, LINE_MAX) if line is not None else "none (the script died before printing one)"
+          span = "`" * (longest_backtick_run(shown) + 1)
+          pad = " " if shown.startswith("`") or shown.endswith("`") else ""
+          # Anything this script cannot foresee ends it with a non-zero status before it has written a byte, and the shell below files the fallback body.
+          text = section(line[len("DEP_DRIFT "):]) if line is not None else "Packages whose version changed: unknown.\n"
+          prefix = "%s\nRun: %s\n\nResult line: %s%s%s%s%s\n\n%s\nLog tail:\n" % (head, run_url, span, pad, shown, pad, span, text)
+
+          # The tail takes what is left of BODY_MAX (room kept for both fences and the marker), newest lines first.
+          budget = BODY_MAX - len(prefix) - 2 * (TAIL_LINE_MAX + 2) - len(MARK) - 4
+          kept, used = [], 0
+          for ln in reversed([clip(ln, TAIL_LINE_MAX) for ln in log_lines[-TAIL_LINES:]]):
+              if used + len(ln) + 1 > budget:
+                  cut = True
+                  break
+              kept.insert(0, ln)
+              used += len(ln) + 1
+          fence = "`" * max(3, longest_backtick_run("\n".join(kept)) + 1)
+          body = prefix + fence + "\n" + "".join(ln + "\n" for ln in kept) + fence + "\n" + (MARK + "\n" if cut else "")
+          sys.stdout.buffer.write(body.encode("utf-8", "replace"))
+          PY
+          if ! python3 "$render" "$day" "$run_url" "$log" > "$RUNNER_TEMP/body.md"; then
+            {
+              echo "Dependency drift did not pass on ${day}; the report could not be rendered. Run: ${run_url}"
+              echo
+              echo "The result line could not be read (the parser failed); the log tail below is the evidence."
+              echo
+              echo "Log tail:"
+              echo '```'
+              tail -n 60 "$log" | cut -c1-400 | tr -d '`' | tail -c 20000 || true
+              echo '```'
+            } > "$RUNNER_TEMP/body.md"
+          fi
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body-file "$RUNNER_TEMP/body.md"
           else
