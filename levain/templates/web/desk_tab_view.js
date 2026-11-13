@@ -19,7 +19,12 @@
   var POLL_OPEN_MS = 4000;      // while the view is open
   var POLL_HIDDEN_MS = 12000;   // while the page is hidden
   var KEEP_SENT = 30;
-  var MAX_THREADS = 6;          // threads kept and drawn; each one the desk has not answered yet is read on every tick, one request each
+  // Two caps, each one saying what it caps. The threads KEPT and drawn are the log's own: a thread stays as long as its line is in
+  // the log (KEEP_SENT lines), and goes with the line when that ages out. The threads READ are the newest MAX_POLLED: each tick
+  // reads the ones among them the desk has not answered yet, one request each. A thread older than the newest MAX_POLLED and still
+  // unanswered is no longer read (a known edge: a reply to it is never drawn). MAX_EVENTS bounds what is held, and stored, per thread.
+  var MAX_POLLED = 6;
+  var MAX_EVENTS = 50;
   var AMBIGUOUS_WORDS = "It may not have arrived. It is not sent again; say whether it did.";
   var UNWIRED_WORDS = "This cockpit has no desk wired.";
   var LEASE_STATES = { held: 1, none: 1, unknown: 1 };
@@ -205,7 +210,7 @@
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
     var stopped = false, timer = 0, gen = 0, reading = false, again = false;
     // `threads` is the ordered list of the threads this page's sends returned (the host files each typed line under a NEW
-    // thread): {id, cursor, events} each, oldest first, at most MAX_THREADS. There is no "current thread": a read names the
+    // thread): {id, cursor, events} each, oldest first, one per line still in the log (at most KEEP_SENT). There is no "current thread": a read names the
     // thread it asked for and is applied to that thread alone. `log` holds the lines this page sent.
     var current = null, threads = [], log = [], lastKey = "", note = "";
     var flight = { send: false };
@@ -269,7 +274,18 @@
       return id;
     }
     function settle(id) { var p = kept("levain.desk.send"); if (p && p.id === id) keep("levain.desk.send", null); }
+    // A line past the log's cap ages out, and its thread (id, cursor, held events) goes with it unless a line still kept names it.
+    function trimLog() {
+      if (log.length <= KEEP_SENT) return;
+      var gone = log.splice(0, log.length - KEEP_SENT), dropped = false;
+      gone.forEach(function (x) {
+        if (!x.thread || log.some(function (y) { return y.thread === x.thread; })) return;
+        for (var i = 0; i < threads.length; i++) if (threads[i].id === x.thread) { threads.splice(i, 1); dropped = true; break; }
+      });
+      if (dropped) saveThreads();
+    }
     function saveLog() {
+      trimLog();
       var sent = log.filter(function (x) { return x.status !== "sending"; }).slice(-KEEP_SENT);
       keep("levain.desk.sent", sent);
     }
@@ -291,19 +307,17 @@
       priorThreads.forEach(function (x) {
         if (!x || typeof x !== "object" || typeof x.id !== "string" || !x.id || threadById(x.id)) return;
         var evs = Array.isArray(x.events) ? x.events.filter(function (e) { return e && typeof e === "object"; }).map(function (e) { return { by: str(e.by), kind: str(e.kind), text: str(e.text), at: str(e.at) }; }) : [];
-        threads.push({ id: x.id, cursor: typeof x.cursor === "string" && x.cursor ? x.cursor : null, events: evs, unreadable: false });
+        threads.push({ id: x.id, cursor: typeof x.cursor === "string" && x.cursor ? x.cursor : null, events: evs.slice(-MAX_EVENTS), unreadable: false });
       });
-      threads = threads.slice(-MAX_THREADS);
     } else {
       var t0 = kept("levain.desk.thread");
       if (typeof t0 === "string" && t0) { threads.push({ id: t0, cursor: null, events: [], unreadable: false }); saveThreads(); }
     }
     keep("levain.desk.thread", null);
-    // a send's thread joins the end of the list (a thread already kept stays where it is); the oldest past the limit go
+    // a send's thread joins the end of the list (a thread already kept stays where it is); its line's age, not a count of threads, ends it
     function addThread(id) {
       if (!id || threadById(id)) return;
       threads.push({ id: id, cursor: null, events: [], unreadable: false });
-      threads = threads.slice(-MAX_THREADS);
       saveThreads();
     }
 
@@ -462,12 +476,12 @@
         if (t && m.kind === "wired") {
           t.unreadable = m.unreadable;
           var merged = mergeEvents(t.events, t.cursor, m);
-          if (merged.events !== t.events || merged.cursor !== t.cursor) { t.events = merged.events; t.cursor = merged.cursor; saveThreads(); }
+          if (merged.events !== t.events || merged.cursor !== t.cursor) { t.events = merged.events.slice(-MAX_EVENTS); t.cursor = merged.cursor; saveThreads(); }
         }
         draw();
       });
     }
-    // One tick: every kept thread the desk has not answered yet, newest first, one request each, one after another (the route
+    // One tick: every one of the newest MAX_POLLED threads the desk has not answered yet, newest first, one request each, one after another (the route
     // holds few poll slots, and one device's reads must not fill them); with no such thread (none sent yet, or all settled), the
     // desk alone, so the lease line keeps living. A pull asked for while one is running is not lost: ONE follow-up runs when it
     // ends (a send's new thread is read at once, not a tick later).
@@ -476,7 +490,7 @@
       if (reading) { again = true; return Promise.resolve(); }
       reading = true; again = false;
       var my = gen;
-      var ids = threads.filter(function (t) { return !settled(t); }).reverse().map(function (t) { return t.id; });
+      var ids = threads.slice(-MAX_POLLED).filter(function (t) { return !settled(t); }).reverse().map(function (t) { return t.id; });
       if (!ids.length) ids = [null];
       function next(i) { return i >= ids.length || stopped || my !== gen ? Promise.resolve() : pullOne(ids[i], my).then(function () { return next(i + 1); }); }
       return next(0).catch(function (e) {
