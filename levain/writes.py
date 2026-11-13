@@ -2040,6 +2040,7 @@ def _apply_intention_then(
 # the episode a Keep writes: its source label (never caller-chosen) and its tag
 KEEP_EPISODE_SOURCE = "levain-list-keep"
 KEEP_EPISODE_TAG = "list-keep"
+KEPT_NOT_CLOSED = "kept_not_closed"      # the Keep's episode landed and the compost did not (503: a fault; 409: the row moved)
 
 
 def keep_origin_key(intention: Mapping[str, Any]) -> str:
@@ -2082,7 +2083,9 @@ def _apply_intention_keep(
     deleted from anneal (a key is never reused: that retry is refused as ``keep_key_retired`` and the intention is composted
     by hand), and (c) the intention keeps its origin key. Whatever the intention's words are on the retry, an episode already
     holding this key means the Keep happened, so the retry goes on to the compost and the receipt says the earlier words were
-    kept. The audit line lands after BOTH acts, so a crash between them leaves no line and the retry writes it."""
+    kept. The audit line lands after BOTH acts, so a crash between them leaves no line and the retry writes it. A fault of act 2
+    after act 1 landed is :data:`KEPT_NOT_CLOSED` (503 a store fault, 409 the row moved), never ``store_unavailable`` / ``stale``:
+    those codes tell the page nothing was written."""
     from anneal_memory import AnnealMemoryError, Store
     from anneal_memory.spores import IntentionError
     from anneal_memory.store import OriginKeyConflict
@@ -2136,12 +2139,21 @@ def _apply_intention_keep(
         raise EditError("verb_failed", 422, f"the episode could not be written: {exc}") from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"episodic store unavailable: {exc}") from exc
+    # From here the irreversible act is DONE: the episode is in memory. A fault of the second act must not read as "nothing was
+    # written" (store_unavailable) or "the row changed, re-read" (stale): both are wire codes of a write that left no trace.
     try:
         _keep_compost(store, intention_id, expect, guard)
     except IntentionError as exc:
-        raise _intention_refusal(guard, exc, store, intention_id, expect) from exc
+        inner = _intention_refusal(guard, exc, store, intention_id, expect)
+        raise EditError(
+            KEPT_NOT_CLOSED, 409,
+            f"the item's memory may already be kept, but the item was not closed here ({inner}): reload the List to see where it "
+            "stands; keeping it again is safe and writes the memory once") from exc
     except OSError as exc:
-        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
+        raise EditError(
+            KEPT_NOT_CLOSED, 503,
+            f"the item's memory may already be kept, but the item could not be closed ({exc}): the item stays on the List; "
+            "keeping it again is safe and writes the memory once") from exc
     edit_id = _audit_verb(
         scope.ledger_root, kind="intention_keep", action="keep", target=f"intention:{intention_id}", now=now,
         extra={"episode_id": ep.id, "origin_key": key},

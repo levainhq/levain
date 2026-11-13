@@ -235,6 +235,66 @@ def test_a_retry_whose_episode_was_deleted_is_refused_with_the_remedy(rig: Rig, 
     assert sid in _open_ids(rig) and _keep_episodes(rig) == []
 
 
+# --- LISTSRV1: the episode landed and the compost did not: a code of its own, never store_unavailable / stale ---------
+
+
+def test_a_store_fault_on_the_compost_after_the_episode_says_kept_not_closed_503(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """codex MED (List page L3 r1): the 503 used to be ``store_unavailable`` ("intention store unavailable"), which the page reads as
+    "nothing was written" although the episode is down."""
+    sid = rig.ids["plain"]
+    with monkeypatch.context() as m:
+        _fail_compost(m)
+        with pytest.raises(EditError) as ei:
+            _keep(rig, sid)
+    assert (ei.value.code, ei.value.http_status) == ("kept_not_closed", 503)
+    words = str(ei.value)
+    assert "may already be kept" in words and "stays on the List" in words and "writes the memory once" in words
+    [ep] = _keep_episodes(rig)                              # the irreversible act the code is about
+    assert sid in _open_ids(rig)
+    out = _keep(rig, sid)                                   # the retry the message promises: one memory, row closed
+    assert out["ok"] and out["episode_id"] == ep.id and [e.id for e in _keep_episodes(rig)] == [ep.id]
+    assert sid not in _open_ids(rig)
+
+
+def test_a_row_that_moved_between_the_episode_and_the_compost_says_kept_not_closed_409(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CAS race: the request carries the disposition the operator saw; another writer moves the row after act 1."""
+    sid = rig.ids["plain"]
+    real = writes._keep_compost
+
+    def moved_then_compost(store: Any, intention_id: str, expect: Any, guard: Any) -> None:
+        rig.sp.update(intention_id, disposition="someday")      # the row moves in the window
+        real(store, intention_id, expect, guard)
+
+    with monkeypatch.context() as m:
+        m.setattr(writes, "_keep_compost", moved_then_compost)
+        with pytest.raises(EditError) as ei:
+            _keep(rig, sid, expect_disposition="seed")
+    assert (ei.value.code, ei.value.http_status) == ("kept_not_closed", 409)
+    assert "may already be kept" in str(ei.value) and "reload" in str(ei.value)
+    [ep] = _keep_episodes(rig)
+    assert sid in _open_ids(rig)                            # the row was not composted
+    out = _keep(rig, sid)                                   # a fresh read of the moved row: one memory, row closed
+    assert out["ok"] and out["episode_id"] == ep.id and len(_keep_episodes(rig)) == 1 and sid not in _open_ids(rig)
+
+
+def test_a_refusal_before_the_episode_keeps_its_own_code(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """kept_not_closed is only for a fault AFTER the episode: a stale row and a failed episode write keep stale / the store code."""
+    sid = rig.ids["plain"]
+    with pytest.raises(EditError) as ei:
+        _keep(rig, sid, expect_disposition="agenda")
+    assert ei.value.code == "stale"
+
+    def boom(self: Any, *_a: Any, **_k: Any) -> None:
+        raise OSError("injected: the episode store went away")
+    with monkeypatch.context() as m:
+        m.setattr(Store, "record", boom)
+        with pytest.raises(EditError) as ei2:
+            _keep(rig, sid)
+    assert (ei2.value.code, ei2.value.http_status) == ("store_unavailable", 503) and _keep_episodes(rig) == []
+
+
 def test_keep_needs_confirm_as_the_resolve_does(rig: Rig) -> None:
     rows = rig.rows()
     sid = rig.ids["plain"]

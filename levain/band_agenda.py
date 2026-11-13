@@ -30,6 +30,11 @@ from levain.consent.questions import SNOOZE_MAX_DAYS, valid_date, valid_intentio
 
 KEY_PREFIX = "band-agenda:"
 AGENDA_TYPE = "task"
+# wire codes: the page maps by CODE, never by the sentence beside it
+BAD_AGENDA_DAY = "bad_agenda_day"                      # 422: the day is not a date, or not past the snooze window
+PLANTED_UNANSWERED = "agenda_planted_unanswered"       # 503: an agenda IS planted and the row is not (known to be) answered;
+#                                                        source_unavailable stays the refusals BEFORE the plant ("nothing was planted")
+PLANTED_UNANSWERED_WORDS = "the agenda is planted but the row is not answered yet: trying again finishes it"
 AGENDA_TARGET = "band"
 
 # why a band row is not offered the verb (the List row's ``agenda_blocked`` facet)
@@ -243,7 +248,7 @@ def defer(*, questions: Any, intentions_json: Path, ledger_root: Path, question_
     today = _date_of(today)
     refused = day_refusal(day, today)
     if refused:
-        raise EditError("bad_request", 400, refused)
+        raise EditError(BAD_AGENDA_DAY, 422, refused)
     cannot = answer_refusal(questions)
     if cannot:
         raise EditError("not_built", 501, f"{cannot}: nothing was planted")
@@ -295,22 +300,21 @@ def defer(*, questions: Any, intentions_json: Path, ledger_root: Path, question_
     state, found = _row_state(questions, q.id, words)
     after = _After(store=store, key=key, aid=aid, created=created, version=version, q_id=q.id, planted=planted, today=today,
                    ledger_root=ledger_root, now=now)
+    # every refusal from here on is AFTER the plant: PLANTED_UNANSWERED, never source_unavailable (which says nothing was planted)
+    down = {"agenda": aid, "day": planted}
     if state is None:
         if raised is None:      # the host took the answer; the read-back failed, so the deferral is not claimed
             after.audit("unconfirmed", None)
-            raise EditError("source_unavailable", 503,
+            raise EditError(PLANTED_UNANSWERED, 503,
                             f"agenda {aid} is planted for {planted} and the host took the deferral answer, but the row could "
-                            "not be read back to confirm it: reload the List (if the row is gone, the deferral landed)")
-        raise EditError("source_unavailable", 503,
-                        f"agenda {aid} is planted for {planted}; the answer failed ({raised}) and whether the row closed "
-                        "cannot be read now: retry") from None
+                            "not be read back to confirm it: reload the List (if the row is gone, the deferral landed)", down)
+        raise EditError(PLANTED_UNANSWERED, 503, PLANTED_UNANSWERED_WORDS, down) from raised
     if state in (ROW_OTHER, ROW_GONE):
         why = (f"the row was answered otherwise ({_said(found)})" if state == ROW_OTHER else "the row is gone")
         after.refuse("stale", f"{why}, so this deferral did not land", why)
     if state == ROW_OPEN:
         if isinstance(raised, (QuestionStoreError, OSError, sqlite3.Error)):     # a crash's shape: the retry finishes it
-            raise EditError("source_unavailable", 503,
-                            f"agenda {aid} is planted for {planted} but the row was not answered ({raised}): retry") from None
+            raise EditError(PLANTED_UNANSWERED, 503, PLANTED_UNANSWERED_WORDS, down) from raised
         why = str(raised) if raised is not None else "the host returned, but the row is still open"
         after.refuse("answer_refused", f"the row was not answered ({why})", why)
     _deliver(questions, q.id)                 # ROW_OURS: the deferral landed (its host may still have raised after it)

@@ -22,6 +22,7 @@ from tests.test_intention_controls import HostStore
 
 PAST = (TODAY + timedelta(days=SNOOZE_MAX_DAYS + 1)).isoformat()      # the first day past the snooze window
 LATER = (TODAY + timedelta(days=9)).isoformat()
+PLANTED_UNANSWERED = "the agenda is planted but the row is not answered yet: trying again finishes it"
 
 
 @pytest.fixture
@@ -138,7 +139,8 @@ def test_a_day_inside_the_snooze_window_is_refused_with_the_rule_and_the_remedy(
     with pytest.raises(EditError) as ei:
         _fire(rig, _row(rig), day)
     words = str(ei.value)
-    assert ei.value.http_status == 400 and f"{SNOOZE_MAX_DAYS} days" in words and "snooze the row instead" in words
+    assert (ei.value.code, ei.value.http_status) == ("bad_agenda_day", 422)
+    assert f"{SNOOZE_MAX_DAYS} days" in words and "snooze the row instead" in words
     assert (TODAY + timedelta(days=SNOOZE_MAX_DAYS)).isoformat() in words
     assert _agendas(rig) == [] and rig.qs.get(rig.q.id).answer is None and _audit(rig) == []
 
@@ -149,7 +151,8 @@ def test_a_day_not_after_today_is_refused_without_pointing_at_a_snooze_that_refu
     with pytest.raises(EditError) as ei:
         _fire(rig, _row(rig), day)
     words = str(ei.value)
-    assert ei.value.http_status == 400 and "snooze" not in words and TODAY.isoformat() in words
+    assert (ei.value.code, ei.value.http_status) == ("bad_agenda_day", 422)
+    assert "snooze" not in words and TODAY.isoformat() in words
     assert (TODAY + timedelta(days=SNOOZE_MAX_DAYS)).isoformat() in words
     assert _agendas(rig) == [] and rig.qs.get(rig.q.id).answer is None and _audit(rig) == []
 
@@ -158,8 +161,25 @@ def test_a_day_not_after_today_is_refused_without_pointing_at_a_snooze_that_refu
 def test_a_day_that_is_not_a_date_is_refused(rig: Rig, day: Any) -> None:
     with pytest.raises(EditError) as ei:
         _fire(rig, _row(rig), day)
-    assert ei.value.http_status == 400 and "YYYY-MM-DD" in str(ei.value)
+    assert (ei.value.code, ei.value.http_status) == ("bad_agenda_day", 422) and "YYYY-MM-DD" in str(ei.value)
     assert _agendas(rig) == [] and rig.qs.get(rig.q.id).answer is None
+
+
+def test_the_day_refusal_sentences_are_unchanged_byte_for_byte(rig: Rig) -> None:
+    """The page branch still matches the sentence by regex until it switches to the code, so the code moves and the words do not.
+    Literals, written out here, so a reworded sentence fails this test and not only the page's."""
+    latest = (TODAY + timedelta(days=SNOOZE_MAX_DAYS)).isoformat()
+    inside = (TODAY + timedelta(days=1)).isoformat()
+    cases = {
+        "next week": "an agenda's day is written YYYY-MM-DD: 'next week' is not a date",
+        TODAY.isoformat(): f"{TODAY.isoformat()} is not after today ({TODAY.isoformat()}): an agenda is for a day after {latest}",
+        inside: (f"{inside} is within the snooze window (a snooze is at most {SNOOZE_MAX_DAYS} days, so {latest} at the latest): "
+                 f"snooze the row instead; an agenda is for a day after {latest}"),
+    }
+    for day, sentence in cases.items():
+        with pytest.raises(EditError) as ei:
+            _fire(rig, _row(rig), day)
+        assert ei.value.code == "bad_agenda_day" and str(ei.value) == sentence
 
 
 def test_a_day_far_ahead_has_no_cap(rig: Rig) -> None:
@@ -217,7 +237,8 @@ def test_a_failure_after_the_agenda_leaves_the_row_open_and_the_retry_lands_one_
         _fail(m, "_answer_deferred")
         with pytest.raises(EditError) as ei:
             _fire(rig, _row(rig), PAST)
-        assert ei.value.http_status == 503 and "planted" in str(ei.value) and "retry" in str(ei.value)
+        assert ei.value.http_status == 503 and ei.value.code == "agenda_planted_unanswered"
+        assert str(ei.value) == PLANTED_UNANSWERED
     [first] = _agendas(rig)                                # the agenda is down ...
     assert rig.qs.get(rig.q.id).answer is None             # ... and the row is still open (agenda FIRST, answer after)
     assert _audit(rig) == []                               # the audit line waits for both acts
@@ -226,6 +247,75 @@ def test_a_failure_after_the_agenda_leaves_the_row_open_and_the_retry_lands_one_
     assert again["id"] == first["id"] and out["agenda"] == first["id"]
     assert rig.qs.get(rig.q.id).answer.value.endswith("do not proceed before then")
     assert len(_audit(rig)) == 1
+
+
+def test_a_locked_store_at_the_seam_between_the_plant_and_the_answer_is_agenda_planted_unanswered(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """complement finding 1: the real shape the page lane reproduced, a sqlite lock raised by the answer act, with the agenda down."""
+    import sqlite3
+
+    def locked(*_a: Any, **_k: Any) -> None:
+        raise sqlite3.OperationalError("database is locked: /Users/someone/.levain/consent/questions.db")
+
+    with monkeypatch.context() as m:
+        m.setattr(band_agenda, "_answer_deferred", locked)
+        with pytest.raises(EditError) as ei:
+            _fire(rig, _row(rig), PAST)
+    assert (ei.value.code, ei.value.http_status, str(ei.value)) == ("agenda_planted_unanswered", 503, PLANTED_UNANSWERED)
+    [agenda] = _agendas(rig)
+    assert ei.value.extra == {"agenda": agenda["id"], "day": PAST}
+    assert "locked" not in str(ei.value) and "/Users" not in str(ei.value)       # the cause stays out of the sentence
+    assert rig.qs.get(rig.q.id).answer is None
+
+
+def test_an_answer_that_failed_and_a_row_that_cannot_be_read_back_is_still_planted_unanswered(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as m:
+        _fail(m, "_answer_deferred")
+        m.setattr(band_agenda, "_row_state", lambda *_a, **_k: (None, None))
+        with pytest.raises(EditError) as ei:
+            _fire(rig, _row(rig), PAST)
+    assert (ei.value.code, ei.value.http_status, str(ei.value)) == ("agenda_planted_unanswered", 503, PLANTED_UNANSWERED)
+    assert len(_agendas(rig)) == 1
+
+
+def test_a_host_that_took_the_answer_but_cannot_be_read_back_keeps_the_code_with_its_own_honest_words(
+        rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The answer may have landed here, so "not answered yet" would be false: same code (an agenda is planted), other words."""
+    with monkeypatch.context() as m:
+        m.setattr(band_agenda, "_row_state", lambda *_a, **_k: (None, None))
+        with pytest.raises(EditError) as ei:
+            _fire(rig, _row(rig), PAST)
+    assert (ei.value.code, ei.value.http_status) == ("agenda_planted_unanswered", 503)
+    assert "took the deferral answer" in str(ei.value) and "reload the List" in str(ei.value)
+    assert str(ei.value) != PLANTED_UNANSWERED and len(_agendas(rig)) == 1
+
+
+@pytest.mark.parametrize("fault", ["get_raises", "no_id", "listing_unreadable"])
+def test_every_failure_before_the_plant_keeps_source_unavailable_and_plants_nothing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str) -> None:
+    """The split the page needs: ``source_unavailable`` says nothing was planted; ``agenda_planted_unanswered`` says an agenda is down."""
+    host = AnsweringHost()
+    rig = _host_rig(tmp_path, monkeypatch, host)
+
+    def get(_ref: Any) -> Any:
+        if fault == "get_raises":
+            raise OSError("injected: the question store is gone")
+        return object()                                   # no_id: no id, no answer, no words
+
+    def listing(_agent: Any = None) -> Any:
+        raise ValueError("1 unparseable needs_phill line(s)")
+
+    if fault != "listing_unreadable":
+        host.get = get                                    # type: ignore[method-assign]
+    else:
+        host.open_questions = listing                     # type: ignore[method-assign]
+    with pytest.raises(EditError) as ei:
+        _defer(rig, host, "np-plain002")
+    assert (ei.value.code, ei.value.http_status) == ("source_unavailable", 503)
+    if fault != "get_raises":
+        assert "nothing was planted" in str(ei.value)
+    assert _keyed(rig, "np-plain002") is None and host.rows[1].answer is None
 
 
 def test_a_retry_with_a_different_day_keeps_the_day_already_planted_and_says_so(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
