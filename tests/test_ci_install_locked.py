@@ -4,6 +4,7 @@ The script runs here under /bin/bash (the oldest bash a CI runner can put first 
 that only record their arguments, so what is checked is the script's own argument handling and install order."""
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -168,3 +169,19 @@ def test_the_build_group_carries_the_common_backends_beside_setuptools():
 
 def test_drift_says_a_red_with_no_changed_package_is_likely_flaky():
     assert "red with no version change: likely flaky test, not drift" in DRIFT
+
+
+# --- uv.lock against pyproject.toml -------------------------------------------------------------------------------------
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv on PATH (the lock is checked with `uv lock --check`)")
+def test_uv_lock_agrees_with_pyproject_toml(tmp_path):
+    """Every CI install reads uv.lock and never resolves, so a pyproject.toml change (a moved pin, a new extra) that
+    leaves the lock behind installs the OLD versions with every other test in this file green. `--offline` keeps this
+    a pure comparison of the two files: a fresh lock needs no fetch, a stale one cannot be re-resolved without one."""
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
+           "UV_PYTHON_DOWNLOADS": "never", "UV_NO_CONFIG": "1"}
+    proc = subprocess.run(["uv", "lock", "--check", "--offline", "--directory", str(ROOT)], env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, (
+        "uv.lock is stale against pyproject.toml; regenerate it with the uv the workflows pin (`uv==0.13.5`: "
+        f"`uvx uv@0.13.5 lock`) and commit it.\n{proc.stdout}{proc.stderr}")
