@@ -207,7 +207,7 @@ def test_drift_issue_title_has_no_date_and_one_open_label_is_the_dedupe_key():
 
 def test_drift_calls_a_flake_only_at_the_suite_stage_and_names_result_and_stage_otherwise():
     flaky = DRIFT.index("likely flaky test, not drift")
-    assert DRIFT.rindex('elif d.get("stage") == "suite":', 0, flaky) > DRIFT.rindex("if d[", 0, flaky)
+    assert DRIFT.rindex('elif d.get("stage") == "suite":', 0, flaky) > DRIFT.rindex("if changed:", 0, flaky)
     assert 'str(d.get("result"))' in DRIFT and 'str(d.get("stage"))' in DRIFT
 
 

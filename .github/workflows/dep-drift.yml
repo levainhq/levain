@@ -84,12 +84,13 @@ jobs:
     needs: drift
     # always(): this job runs whatever became of `drift` (green, red, cancelled by its timeout, a failed setup step).
     # The repository guard is the drift job's own: always() would otherwise also run it on a fork, where drift is skipped.
+    # A cancelled run is reported as did-not-finish by design, because `!cancelled()` would also stop the reporter after a timeout-cancel.
     if: ${{ always() && github.repository == 'levainhq/levain' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # issues: write and nothing else: no checkout here, and an artifact of this same run downloads without a token scope.
     permissions:
       issues: write
-      contents: read
     steps:
       - name: Fetch the drift log
         # No checkout in this job (it must not depend on the thing that may have failed), so no step needs the repo.
@@ -142,19 +143,26 @@ jobs:
             if [ -n "$line" ]; then
               printf '%s' "${line#DEP_DRIFT }" | python3 -c '
           import json, sys
-          d = json.load(sys.stdin)
-          if d["changed"]:
+          try:
+              d = json.load(sys.stdin)
+          except ValueError:
+              d = None
+          changed = d.get("changed") if isinstance(d, dict) else None
+          if not isinstance(changed, list):
+              print("The result line could not be read (it is not a JSON object with a list under changed); the log tail below is the evidence.")
+              sys.exit(0)
+          if changed:
               print("Packages whose version changed against the committed uv.lock (old -> new):\n")
-              print("\n".join("- " + c for c in d["changed"]))
+              print("\n".join("- " + str(c) for c in changed))
           elif d.get("stage") == "suite":
               print("red with no version change: likely flaky test, not drift")
           else:
               print("no version change recorded; result: " + str(d.get("result")) + ", stage: " + str(d.get("stage")))
-          failed = d.get("failed_tests") or []
-          if failed:
+          failed = d.get("failed_tests")
+          if failed and isinstance(failed, list):
               print("\nFailing tests:\n")
-              print("\n".join("- " + t for t in failed))
-          '
+              print("\n".join("- " + str(t) for t in failed))
+          ' || echo "The result line could not be read (the parser failed); the log tail below is the evidence."
             else
               echo "Packages whose version changed: unknown."
             fi
