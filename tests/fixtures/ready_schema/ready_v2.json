@@ -3,6 +3,7 @@
  "about": "READY_SCHEMA v2 contract sets: the closed state/column set, the audit kinds, the rule order, the board shape. The derivation cases are tests/fixtures/board_state/*.json. v1 stays in ready_v1.json until the readers switch.",
  "board_schema": "ready-v2",
  "max_evidence_age_s": 21600,
+ "future_skew_s": 300,
  "states": [
   {"state": "cut", "column": "off"},
   {"state": "parked", "column": "off"},
