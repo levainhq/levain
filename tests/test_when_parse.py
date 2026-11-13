@@ -72,7 +72,7 @@ def test_prose_and_near_misses_are_not_a_remind(line):
 
 @pytest.mark.parametrize("line", ["remind me thu 3pm call", "Remind Me Thu 3pm call", "REMIND thu 3pm call",
                                   "remind me at 3pm call", "remind me noon call", "remind me +2h call", "remind me 11-20 x",
-                                  "remind me tonight x", "remind me daily x", "remind me every mon x", "remind me weekly mon x",
+                                  "remind me tonight x", "remind me daily x", "remind me every mon x", "remind me at the store",
                                   "remind me monthly 15 x", "remind me next thu x", "remind me today x", "remind me 3 x"])
 def test_a_time_word_right_after_remind_makes_it_a_remind(line):
     assert is_remind(line) is True
@@ -90,11 +90,33 @@ def test_the_tier_shape_test_and_the_parse_agree_on_a_corpus():
         assert is_remind(line) == (parsed is not None), line
 
 
-def test_at_without_a_time_is_words_not_a_remind():
-    assert is_remind("remind me at the office") is False
+def test_at_after_remind_is_a_remind_and_a_missing_time_refuses():
+    """flow's shape test lets `at` open a remind and its reading refuses it (vector 'remind me at the store')."""
+    assert is_remind("remind me at the office") is True
+    assert "needs a time" in refused("remind me at the office")
+
+
+def test_there_is_no_typed_weekly_head():
+    """The design's repeat forms are `every ...`, `daily` and `monthly`; flow reads `weekly` as no reminder at all."""
+    assert is_remind("remind me weekly mon x") is False
+    assert remind("remind me weekly mon x") is None
 
 
 # --- one-off readings (fixed clock: Tue 2026-11-10 14:00) ---------------------------------------------------------------
+
+@pytest.mark.parametrize("body", ["thu 45 widgets", "tomorrow 2026 plan", "thu 1530 call", "thu 930 call", "thu 3pm. call",
+                                  "thu at call", "thu at", "at the store", "thu 3 x"])
+def test_a_digit_led_word_in_the_time_slot_refuses_never_stays_in_the_words(body):
+    """A day word's time slot reads a time or refuses: '45' after thu once fired 09:00 with '45' left in the words."""
+    with pytest.raises(WhenRefused):
+        read_when_text(body, NOW)
+
+
+def test_a_superscript_digit_is_a_word_not_a_number():
+    """str.isdigit() is True for U+00B2 and int() raises on it: a crash, not a refusal (flow vector 'every ² days')."""
+    refused("remind me every \u00b2 days x")
+    assert read_when_text("thu \u00b2 x", NOW)[1] == "\u00b2 x"
+
 
 @pytest.mark.parametrize("body,when,words", [
     ("9am x", "2026-11-11T09:00", "x"),                  # a time already past today is tomorrow's
@@ -127,8 +149,6 @@ def test_at_without_a_time_is_words_not_a_remind():
     ("+2h x", "2026-11-10T16:00", "x"),
     ("+3d x", "2026-11-13T14:00", "x"),
     ("thu 9am 2 tickets", "2026-11-12T09:00", "2 tickets"),   # a bare number after the time stays a word
-    ("thu 45 widgets", "2026-11-12T09:00", "45 widgets"),     # too big to be an hour: a word
-    ("tomorrow 2026 plan", "2026-11-11T09:00", "2026 plan"),
 ])
 def test_one_off_forms(body, when, words):
     reading, got = read_when_text(body, NOW)
@@ -222,7 +242,6 @@ def test_a_bare_hour_after_a_repeat_day_is_refused_too():
     ("remind me every mon, wed and fri 8am x", "2026-11-11T08:00", "weekly MON,WED,FRI 08:00", "x"),
     ("remind me every fri and mon x", "2026-11-13T09:00", "weekly MON,FRI 09:00", "x"),
     ("remind me every mon and mon x", "2026-11-16T09:00", "weekly MON 09:00", "x"),
-    ("remind me weekly tue 5pm x", "2026-11-10T17:00", "weekly TUE 17:00", "x"),
     ("remind me every tue 9am x", "2026-11-17T09:00", "weekly TUE 09:00", "x"),
     ("remind me every other thu 10am x", "2026-11-12T10:00", "every 14 days 10:00", "x"),
     ("remind me every 3 days 6pm x", "2026-11-10T18:00", "every 3 days 18:00", "x"),
@@ -270,7 +289,6 @@ def test_a_daylight_saving_week_keeps_the_wall_clock_hour(now):
 @pytest.mark.parametrize("line,word", [
     ("remind me every week x", "which day"),
     ("remind me every month x", "which day of the month"),
-    ("remind me weekly x", "which day"),
     ("remind me monthly x", "which day of the month"),
     ("remind me monthly 32 x", "not a day of the month"),
     ("remind me monthly 0 x", "not a day of the month"),
@@ -450,3 +468,41 @@ def test_every_other_weekday_keeps_the_fortnight_through_the_anchor():
     assert first.weekday() == 3
     # the writer stores recur_anchor == the first minute; flow's anchored arithmetic then lands a fortnight on
     assert flow.next_occurrence(got["recur"], first, prev_next=got["when"]) == first + timedelta(days=14)
+
+
+def test_the_whole_line_reading_equals_flows_over_a_generated_corpus():
+    """Parity beyond the vendored vectors: every prefix x head x time slot x tail below, at four clocks, reads the same here and
+    in flow (same dict, or both refuse). Skipped where flow is not on the machine; the vectors in test_intake.py are the pinned
+    contract and this is the sweep that found the divergences once (the run printed 15 vector misses and a crash on U+00B2)."""
+    import itertools
+
+    from levain.intake import IntakeRefused, parse_intake
+
+    flow = _flow_module()
+    prefixes = ["@", "remind me ", "remind ", "remind me, ", "REMIND "]
+    heads = ["thu", "thurs", "tues", "weds", "mon", "monday", "tomorrow", "today", "tonight", "noon", "midnight", "9am", "3pm",
+             "15:00", "at 3pm", "at 3", "at", "at noon", "+30m", "+1d", "11-20", "2027-01-02", "02-29", "next thu", "next",
+             "every day", "every weekday", "every mon", "every mon,wed", "every mon, wed", "every mon and wed", "every other thu",
+             "every 3 days", "every 2 weeks", "every month 15", "every month on the 15th", "monthly 31", "monthly", "daily",
+             "weekly mon", "every week", "every", "3", "25", "1530", "every ² days"]
+    slots = ["", " 3pm", " at 3pm", " 3", " 9am 2", " at", " noon", " 25:00", " 3 pm", " 3.30pm", " 1530"]
+    tails = [" x", " to x", "", " and then", " mon x", " 2 tickets"]
+    nows = [datetime(2026, 11, 8, 12, 0), datetime(2026, 11, 10, 14, 0), datetime(2026, 12, 31, 23, 59), datetime(2027, 3, 1, 12, 0)]
+    differ = []
+    kinds = set()
+    for pre, h, sl, t in itertools.product(prefixes, heads, slots, tails):
+        line = pre + h + sl + t
+        for now in nows:
+            try:
+                want = flow.parse_intake(line, now)
+            except flow.IntakeError:
+                want = "refused"
+            try:
+                got = parse_intake(line, now)
+            except IntakeRefused:
+                got = "refused"
+            kinds.add(got if got == "refused" else got["kind"])
+            if got != want:
+                differ.append((line, str(now), want, got))
+    assert not differ, differ[:5]
+    assert kinds == {"refused", "remind", "drop", "sort"}, kinds      # the corpus reaches every outcome, so agreement means something

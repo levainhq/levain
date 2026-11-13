@@ -12,7 +12,7 @@ import pytest
 from levain.intake import IntakeRefused, parse_intake, receipt, receipt_line
 
 VECTORS = Path(__file__).parent / "vectors" / "list_intake_vectors.json"
-VECTORS_SHA256 = "25b2e8ca3776689a4c0c3425eec57e7a9bd4ac61a9726638e763feeb5d965334"
+VECTORS_SHA256 = "6fc0b3a91c935f334104c1672296280fee3828205ba68991b85ab5995fcea246"
 _DATA = json.loads(VECTORS.read_text(encoding="utf-8"))
 _NOW = datetime.fromisoformat(_DATA["now"])
 

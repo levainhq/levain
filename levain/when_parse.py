@@ -12,7 +12,7 @@ Row 188 (``project_memory/1110-19_row188_grammar_design.md``). Two entry points 
 ``tomorrow|today|tonight [time]`` · ``mon..sun`` or a full weekday ``[time]`` (the coming one, today if its time is still
 ahead) · ``MM-DD [time]`` · ``YYYY-MM-DD [time]`` · ``+Nm`` / ``+Nh`` / ``+Nd``; an ``at`` before a time is dropped. No time
 means 09:00 (``tonight`` alone means 20:00). Only for ``remind``: ``every day|weekday|<days>|other <day>|N days|N weeks|month
-[on the] D``, ``daily``, ``weekly <days>``, ``monthly D``, each with an optional time. A repeating phrase compiles to one of
+[on the] D``, ``daily``, ``monthly D``, each with an optional time. A repeating phrase compiles to one of
 the four canon strings the agenda store reads (``daily HH:MM`` · ``weekly MON[,WED] HH:MM`` · ``monthly D HH:MM`` ·
 ``every N days HH:MM``) and ``when`` is its first occurrence strictly after ``now``.
 
@@ -39,12 +39,13 @@ _DAY_FULL = {"mon": "monday", "tue": "tuesday", "wed": "wednesday", "thu": "thur
 _DAY_CANON = [d.upper() for d in _DAYS]
 _CLOCK_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?(am|pm)?$", re.I)
 _BARE_RE = re.compile(r"^\d{1,2}$")
+_DIGIT_LED = re.compile(r"[0-9]")
 _ORDINAL_RE = re.compile(r"^(\d{1,2})(?:st|nd|rd|th)?$", re.I)
-_HEADS = frozenset({"today", "tonight", "tomorrow", "every", "daily", "weekly", "monthly", "next", "noon", "midnight"})
+_HEADS = frozenset({"today", "tonight", "tomorrow", "every", "daily", "monthly", "next", "noon", "midnight", "at"})
 FORMS = ("HH:MM, 9am, noon, today|tonight|tomorrow [time], mon..sun [time], MM-DD [time], YYYY-MM-DD [time], "
          "+30m, +2h, +3d (no time means 09:00)")
 REPEAT_FORMS = ("every day|weekday|mon,wed|other thu|N days|N weeks [time], every month on the 15th [time], "
-                "daily [time], weekly mon [time], monthly 15 [time]")
+                "daily [time], monthly 15 [time]")
 
 
 class WhenRefused(ValueError):
@@ -72,8 +73,11 @@ def _low(tok: str) -> str:
     return tok.lower().rstrip(",")
 
 
+_DAY_ALIAS = {"tues": "tue", "weds": "wed", "thur": "thu", "thurs": "thu"}
+
+
 def _day_index(tok: str) -> Optional[int]:
-    t = _low(tok)
+    t = _DAY_ALIAS.get(_low(tok), _low(tok))
     for i, d in enumerate(_DAYS):
         if t in (d, _DAY_FULL[d]):
             return i
@@ -83,7 +87,7 @@ def _day_index(tok: str) -> Optional[int]:
 def _timeish(tok: str) -> bool:
     """A token that begins a time of day: a digit-led token, or noon / midnight."""
     t = _low(tok)
-    return bool(t[:1].isdigit()) or t in ("noon", "midnight")
+    return bool(_DIGIT_LED.match(t)) or t in ("noon", "midnight")
 
 
 def _bare_hour_refusal(tok: str) -> WhenRefused:
@@ -112,7 +116,7 @@ def _take_clock(tokens: List[str], i: int, *, after_at: bool = False) -> Optiona
         if after_at:
             raise WhenRefused(f"'at {tok}' does not read as a time of day (use 14:30 or 2:30pm)")
         return None
-    if not (low[:1].isdigit() and (":" in low or low.endswith(("am", "pm")))):
+    if not (_DIGIT_LED.match(low) and (":" in low or low.endswith(("am", "pm")))):
         if after_at:
             raise WhenRefused(f"'at {tok}' does not read as a time of day (use 14:30 or 2:30pm)")
         return None
@@ -130,12 +134,25 @@ def _take_clock(tokens: List[str], i: int, *, after_at: bool = False) -> Optiona
 
 
 def _clock_after(tokens: List[str], i: int) -> Tuple[Optional[Tuple[int, int]], int]:
-    """The time slot after a day word: an optional ``at``, then a time. ``(None, i)`` when there is none."""
-    if i < len(tokens) and _low(tokens[i]) == "at" and i + 1 < len(tokens) and _timeish(tokens[i + 1]):
-        got = _take_clock(tokens, i + 1, after_at=True)
-        return got[0], got[1]
+    """The time slot after a day word or an ``every`` phrase: an optional ``at``, then a time. ``(None, i)`` when the slot is
+    empty. A digit-led token that is not a time (``thu 3``, ``thu 1530``, ``3pm.``) and an ``at`` with no time after it are
+    REFUSED: a bare number there fired 09:00 with the number left in the words."""
+    if i < len(tokens) and _low(tokens[i]) == "at":
+        if i + 1 < len(tokens) and _timeish(tokens[i + 1]):
+            got = _take_clock(tokens, i + 1, after_at=True)
+            assert got is not None
+            return got[0], got[1]
+        hint = tokens[i + 1] if i + 1 < len(tokens) else ""
+        raise WhenRefused(f"'at {hint}' does not read as a time of day: write at 3pm or at 15:00" if hint
+                          else "'at' needs a time of day: write at 3pm or at 15:00")
     got = _take_clock(tokens, i)
-    return (got[0], got[1]) if got else (None, i)
+    if got:
+        return got[0], got[1]
+    if i < len(tokens) and _DIGIT_LED.match(tokens[i]):
+        tok = tokens[i].rstrip(",")
+        raise WhenRefused(f"{tok!r} here is not a time of day I can read: write 3pm, 3:30pm or 15:00 "
+                          f"(or no time for {DEFAULT_HOUR:02d}:00)")
+    return None, i
 
 
 def _at(day: date, hm: Tuple[int, int]) -> datetime:
@@ -172,21 +189,32 @@ def _coming_day(now: datetime, weekday: int, hm: Tuple[int, int]) -> datetime:
     return when if when > now else when + timedelta(days=7)
 
 
+def _all_days(tok: str) -> bool:
+    """True when every comma-separated piece of the token is a weekday (``mon,wed``, not ``wed,9am``)."""
+    parts = tok.lower().split(",")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    return bool(parts) and all(_day_index(x) is not None for x in parts)
+
+
 def _take_days(tokens: List[str], i: int) -> Tuple[List[int], int]:
-    """A day list at ``tokens[i]``: ``mon``, ``mon,wed``, ``mon, wed``, ``mon and wed``. ``([], i)`` when none."""
+    """A day list at ``tokens[i]``: ``mon``, ``mon,wed``, ``mon, wed``, ``mon and wed``. A further day needs a comma or
+    ``and`` before it (``mon wed`` leaves ``wed`` in the words, so prose that starts with a day name stays words); a stray
+    ``and`` or an unseparated day refuses. ``([], i)`` when no day is there."""
     days: List[int] = []
+    more = True
     j = i
     while j < len(tokens):
-        parts = [p for p in tokens[j].lower().split(",") if p]
-        idx = [_day_index(p) for p in parts]
-        if not parts or any(x is None for x in idx):
-            break
-        days += [x for x in idx if x is not None]
-        trailing_comma = tokens[j].endswith(",")
-        j += 1
-        if j + 1 < len(tokens) and tokens[j].lower() in ("and", "&") and _day_index(tokens[j + 1].split(",")[0]) is not None:
+        if more and _all_days(tokens[j]):
+            days += [d for d in (_day_index(p) for p in tokens[j].lower().split(",") if p) if d is not None]
+            more = tokens[j].endswith(",")
             j += 1
-        elif not (trailing_comma and j < len(tokens) and _day_index(tokens[j].split(",")[0]) is not None):
+        elif tokens[j].lower() == "and" and j + 1 < len(tokens) and _all_days(tokens[j + 1]):
+            j += 1
+            more = True
+        else:
+            if _low(tokens[j]) == "and" or _day_index(tokens[j].split(",")[0]) is not None:
+                raise WhenRefused("separate days with a comma or 'and' (every mon, wed 9am)")
             break
     return days, j
 
@@ -235,12 +263,6 @@ def _read_repeat(tokens: List[str], now: datetime) -> Tuple[When, int]:
         return When(_first_after("daily", now, hm), f"daily {hm[0]:02d}:{hm[1]:02d}"), used
     if head == "monthly":
         return _monthly(tokens, 1, now)
-    if head == "weekly":
-        days, j = _take_days(tokens, 1)
-        if not days:
-            raise WhenRefused("weekly on which day? Write 'weekly mon 9am' or 'every mon 9am'")
-        hm, used = _time_or_default(tokens, j)
-        return _weekly(days, hm, now), used
     if len(tokens) < 2:
         raise WhenRefused(f"every what? Forms: {REPEAT_FORMS}")
     sec = _low(tokens[1])
@@ -264,7 +286,7 @@ def _read_repeat(tokens: List[str], now: datetime) -> Tuple[When, int]:
         days, j = _take_days(tokens, 1)
         hm, used = _time_or_default(tokens, j)
         return _weekly(days, hm, now), used
-    if sec.isdigit():
+    if re.fullmatch(r"[0-9]{1,4}", sec):
         if len(tokens) < 3:
             raise WhenRefused(f"every {sec} what? Write 'every {sec} days [time]' or 'every {sec} weeks [time]'")
         unit = _low(tokens[2])
@@ -279,7 +301,7 @@ def _read_repeat(tokens: List[str], now: datetime) -> Tuple[When, int]:
             raise WhenRefused(f"every {step} days is out of range: 1 to {MAX_EVERY_DAYS} days")
         hm, used = _time_or_default(tokens, 3)
         return _every_n(step, hm, now), used
-    if _ORDINAL_RE.match(sec) and not sec.isdigit():
+    if _ORDINAL_RE.match(sec) and not re.fullmatch(r"[0-9]+", sec):
         raise _unsupported(f"'every {tokens[1]}' (an nth weekday)")
     raise _unsupported(f"'every {tokens[1]}'")
 
@@ -311,7 +333,7 @@ def _read_date(head: str, tokens: List[str], now: datetime) -> Optional[Tuple[da
 
 def _read_one(tokens: List[str], now: datetime, allow_recur: bool) -> Tuple[When, int]:
     head = _low(tokens[0])
-    if head in ("every", "daily", "weekly", "monthly"):
+    if head in ("every", "daily", "monthly"):
         if not allow_recur:
             raise WhenRefused("a repeating line is a reminder: write 'remind every sun 9pm ...'; a desk drop cannot repeat")
         return _read_repeat(tokens, now)
@@ -328,7 +350,9 @@ def _read_one(tokens: List[str], now: datetime, allow_recur: bool) -> Tuple[When
             raise WhenRefused(f"'next {tokens[1]}' is read two ways: write '{_DAYS[_day_index(tokens[1]) or 0]}' (the coming one) "
                               f"or a date")
         raise WhenRefused(f"'next' is not a time. Forms: {FORMS}")
-    if head == "at" and len(tokens) > 1 and _timeish(tokens[1]):
+    if head == "at":
+        if not (len(tokens) > 1 and _timeish(tokens[1])):
+            raise WhenRefused("'at' needs a time of day: write at 3pm or at 15:00")
         got = _take_clock(tokens, 1, after_at=True)
         assert got is not None
         when = _at(now.date(), got[0])
@@ -400,8 +424,7 @@ def _remind_body(line: str) -> Optional[str]:
     if i >= len(tokens):
         return None
     head = _low(tokens[i])
-    shaped = (head[:1].isdigit() or head.startswith("+") or head in _HEADS or _day_index(head) is not None
-              or (head == "at" and i + 1 < len(tokens) and _timeish(tokens[i + 1])))
+    shaped = bool(_DIGIT_LED.match(head)) or head.startswith("+") or head in _HEADS or _day_index(head) is not None
     return line[spans[i][0]:] if shaped else None
 
 
