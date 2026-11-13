@@ -30,7 +30,7 @@ CONFINED = "confined"
 
 GUARD_PATH = Path(__file__).resolve().parent / "room_turn_guard.py"
 # the sha256 of room_turn_guard.py as this release ships it; a re-sync of the guard re-pins it here, on purpose
-ROOM_TURN_GUARD_SHA256 = "f74b43b35d1458449b665db94415c41035f37fb93e1eb2b22595d267a66b680e"
+ROOM_TURN_GUARD_SHA256 = "58aac7f3845409af089a7047fef9f2af6692c9a2ad0a5a819f2f6abdb84c1f03"
 # the tools the guard refuses by name, plus Bash: the hook is loaded for exactly these (the guard's own HOOK_MATCHER)
 GUARD_MATCHER = "Bash|Agent|Task|CronCreate|Monitor|ScheduleWakeup|Workflow"
 GUARD_TIMEOUT = 10
