@@ -177,11 +177,12 @@ def test_a_timeout_prints_the_page_state_after_its_named_line_and_keeps_the_exit
     head, _, block = r.stderr.partition("--- page state at the timeout ---")
     assert block, r.stderr                                           # the block follows the unchanged line, never replaces it
     for label in ("PAGE URL:", "READY STATE: complete", "MODAL: #levain-modal exists=true [data-question-row] count=2",
-                  "WORKER WAITS: none run", "NAVIGATION: events=", "TARGET (browser's /json): page url=\"data:text/html",
+                  "WORKER WAITS: none run", "NAVIGATION: events=", "TARGET: listed, id=", " type=page", " url=\"data:text/html",
                   "CONSOLE (last 20", "console.log: hello-from-the-page", "page error: Error: late-page-error", "BODY TEXT (first 600):", "SCREENSHOT: ",
                   "--- end page state ---"):
         assert label in block, (label, r.stderr)
     assert len(block) < 4100, len(block)
+    assert block.count("TARGET") == 1, r.stderr                          # the browser's word on the page target is printed once
 
 
 _SLOW_WORKER = "self.addEventListener('install', () => self.skipWaiting());\nself.addEventListener('activate', (e) => e.waitUntil(new Promise((r) => setTimeout(r, 2000)).then(() => self.clients.claim())));\n"
@@ -242,7 +243,7 @@ def test_a_timeout_after_a_reload_says_how_the_worker_wait_ended_and_where_the_t
     _, _, block = r.stderr.partition("--- page state at the timeout ---")
     assert re.search(r"WORKER WAITS: settled after \d+ms/\d+ polls \(last settled, \d+ms ago\)", block), r.stderr
     assert re.search(r"NAVIGATION: events=\d+ loads=\d+", block), r.stderr
-    assert f'TARGET (browser\'s /json): page url="{url}"' in block, r.stderr
+    assert f' type=page url="{url}"' in block, r.stderr
 
 
 @needs_browser
