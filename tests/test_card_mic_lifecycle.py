@@ -6,6 +6,7 @@ and the Needs card run on the real cockpit page. Each test names the line whose 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from levain.consent.questions import QuestionStore
@@ -16,6 +17,7 @@ from tests.test_cockpit_sign_card import DESKTOP, QRID, TOK, _Rig, needs_ssh
 from tests.test_cockpit_threads_mount import qdir  # noqa: F401  (fixture)
 from tests.test_mic_page import _fake
 
+MIC_JS = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "mic.js"
 FEED = {"eval": "window.__feed(12000)"}
 
 # a recognizer the page can watch: the on-device kind (processLocally lives on the prototype) that records its life, and
@@ -398,17 +400,37 @@ def test_a_cockpit_ceremony_drops_dictates_tail_so_the_write_in_is_not_written_a
 
 # --- 11-10 (row 185): a Dictate error says its own reason on the card ----------------------------------------------
 
+SERVICE_LANG = "Speech recognition could not run for this language: its on-device pack may be missing, or this browser blocks it."
 DICTATE_WORDS = {
-    "not-allowed": "Dictation needs permission to use the microphone.",
-    "service-not-allowed": "This browser is not allowing dictation here (speech recognition is blocked or turned off for it).",
-    "language-not-supported": "This browser has no on-device dictation pack for this language yet, so Dictate cannot run; the keyboard dictation key works.",
+    "not-allowed": "Dictation needs the microphone: allow it for this site in the address bar, then tap Dictate again.",
+    "service-not-allowed": SERVICE_LANG,
+    "language-not-supported": SERVICE_LANG,
     "audio-capture": "No microphone was found, or it could not be opened.",
-    "network": "Dictation could not reach its speech service.",
+    "network": "Speech recognition failed; tap Dictate to try again.",
     "no-speech": "No speech was heard; tap Dictate and try again.",
-    "aborted": "Dictation was interrupted.",
+    "aborted": "Dictation was interrupted; tap Dictate to try again.",
     "bad-grammar": "Dictation could not use its settings.",
     "phrases-not-supported": "Dictation could not use its hint phrases in this browser.",
 }
+START_WORDS = "Dictation could not start; tap Dictate again."
+# the widest sentence the table held before the words were corrected: the card's note must not grow past what 390 was shown to hold
+WIDEST_OLD = 124
+
+
+def test_the_word_table_keys_and_widths_match_the_js_table() -> None:
+    """Red with: a reason added to (or dropped from) mic.js's DICTATE_REASONS without this file's table moving; a JS sentence
+    wider than the widest the card was shown to hold at 390; a phrase the words were corrected to lose coming back."""
+    js = MIC_JS.read_text()
+    block = js[js.index("var DICTATE_REASONS = {"):js.index("};", js.index("var DICTATE_REASONS = {"))]
+    table = dict(re.findall(r'^\s+"([a-z-]+)": "((?:[^"\\]|\\.)*)",', block, re.M))
+    assert set(table) == set(DICTATE_WORDS) | {"start"}, sorted(table)
+    for name, words in table.items():
+        assert len(words) <= WIDEST_OLD, (name, len(words))
+        assert " yet" not in words and "keyboard dictation key" not in words and "turned off" not in words, (name, words)
+
+
+LAST = "window.__srs[window.__srs.length - 1]"
+LAST_NOTE = "window.__notes[window.__notes.length - 1]"
 
 
 @needs_browser
@@ -416,8 +438,8 @@ def test_each_dictate_error_event_says_its_own_reason(tmp_path, w) -> None:
     """Red with: onerror folding every error but not-allowed into "Dictation stopped." (language-not-supported hidden)."""
     names = list(DICTATE_WORDS) + ["something-new"]
     steps = [*_boxes("a")]
-    for i, n in enumerate(names):
-        steps.append({"eval": f"{_dict()}.click(); window.__srs[{i}].onerror({{ error: {json.dumps(n)} }}); JSON.stringify([window.__notes[window.__notes.length - 1], window.__m.a.busy()])"})
+    for n in names:
+        steps.append({"eval": f"{_dict()}.click(); {LAST}.onerror({{ error: {json.dumps(n)} }}); JSON.stringify([{LAST_NOTE}, window.__m.a.busy()])"})
     out = _page(tmp_path, w, steps)
     got = [json.loads(v) for v in out["values"][-len(names):]]
     for n, (note, busy) in zip(names, got):
@@ -432,6 +454,53 @@ def test_a_dictate_start_that_throws_says_so(tmp_path, w) -> None:
     thrower = RECOG + "\n(() => { const C = window.SpeechRecognition; window.SpeechRecognition = class extends C { start() { throw new DOMException('x', 'InvalidStateError'); } abort() { window.__aborts = (window.__aborts || 0) + 1; } }; })();"
     out = _page(tmp_path, w, [
         *_boxes("a"),
-        {"eval": f"{_dict()}.click(); JSON.stringify([window.__notes[window.__notes.length - 1], window.__m.a.busy(), window.__aborts || 0])"},
+        {"eval": f"{_dict()}.click(); JSON.stringify([{LAST_NOTE}, window.__m.a.busy(), window.__aborts || 0])"},
     ], init=thrower)
-    assert json.loads(out["values"][-1]) == ["Dictation could not start; tap Dictate again.", False, 1], out["values"]
+    assert json.loads(out["values"][-1]) == [START_WORDS, False, 1], out["values"]
+
+
+@needs_browser
+def test_a_start_that_throws_says_one_thing_even_when_abort_answers_at_once(tmp_path, w) -> None:
+    """Red with: the start() catch aborting before it detaches (abort() answers with an error and an end event on the spot, and
+    the box says "interrupted" and then "could not start"); or with no abort() at all."""
+    answers = RECOG + ("\n(() => { const C = window.SpeechRecognition; window.SpeechRecognition = class extends C { start() { throw new DOMException('x', 'InvalidStateError'); }"
+                      " abort() { window.__aborts = (window.__aborts || 0) + 1; this.onerror && this.onerror({ error: 'aborted' }); this.onend && this.onend(); } }; })();")
+    out = _page(tmp_path, w, [
+        *_boxes("a"),
+        {"eval": f"{_dict()}.click(); JSON.stringify([window.__notes, window.__m.a.busy(), window.__aborts || 0, document.getElementById('a').readOnly])"},
+    ], init=answers)
+    notes, busy, aborts, readonly = json.loads(out["values"][-1])
+    assert notes == [START_WORDS] and busy is False and aborts == 1 and readonly is False, out["values"]
+
+
+@needs_browser
+def test_a_new_dictate_attempt_clears_the_last_reason_and_only_dictates_own(tmp_path, w) -> None:
+    """Red with: the click path never clearing the previous reason (the box says "No speech was heard" while dictation works); or
+    clearing the note line blind (a first tap, with nothing of Dictate's on it, would wipe a message that is the host's)."""
+    out = _page(tmp_path, w, [
+        *_boxes("a"),
+        {"eval": f"{_dict()}.click(); window.__notes.length"},
+        {"eval": f"{LAST}.onerror({{ error: 'no-speech' }}); {LAST_NOTE}"},
+        {"eval": f"{_dict()}.click(); JSON.stringify([window.__srs.length, {LAST_NOTE}, window.__m.a.busy(), window.__notes.length])"},
+        {"eval": f"{_dict()}.click(); {_dict()}.click(); window.__notes.length"},
+    ])
+    assert out["values"][-4] == 0, out["values"]                                  # a first tap says nothing: no blind clear
+    assert out["values"][-3] == DICTATE_WORDS["no-speech"], out["values"]
+    assert json.loads(out["values"][-2]) == [2, "", True, 2], out["values"]       # the reason, then its clearing
+    assert out["values"][-1] == 2, out["values"]                                  # the clearing is said once, not on every tap
+
+
+@needs_browser
+def test_an_error_after_the_operators_own_stop_stays_silent_for_no_speech_and_aborted_only(tmp_path, w) -> None:
+    """Red with: the stop-tail guard dropped (Stop answered with no-speech reads as a failure the operator did not cause), or
+    widened to every error name (a real failure after Stop goes unsaid). INFERRED browser behaviour, not measured."""
+    def after_stop(name: str) -> dict:
+        return {"eval": f"(() => {{ {_dict()}.click(); {_dict()}.click(); const n = window.__notes.length; {LAST}.onerror({{ error: {json.dumps(name)} }});"
+                        f" return JSON.stringify([window.__notes.length - n, {LAST_NOTE}, window.__m.a.busy()]); }})()"}
+    names = ["no-speech", "aborted", "network", "not-allowed", "audio-capture", "service-not-allowed"]
+    out = _page(tmp_path, w, [*_boxes("a"), *[after_stop(n) for n in names]])
+    got = dict(zip(names, (json.loads(v) for v in out["values"][-len(names):])))
+    for n in ("no-speech", "aborted"):
+        assert got[n][0] == 0 and got[n][2] is False, (n, got[n])      # nothing said, the box freed
+    for n in names[2:]:
+        assert got[n][0] == 1 and got[n][1] == DICTATE_WORDS[n] and got[n][2] is False, (n, got[n])
