@@ -209,9 +209,17 @@ def _without_open_check(rows: list, room_launches: "set[str] | None" = None) -> 
     return out
 
 
+def _expected_mode(service: Any) -> str | None:
+    """The permission mode a room launch of ``service`` is expected to report, or None (no service, or one that names
+    none). The page hides the session's per-turn report of exactly this mode and draws any other (``room_mode``)."""
+    mode = getattr(service, "room_permission_mode", None)
+    return mode if isinstance(mode, str) and mode else None
+
+
 def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
     """The open room as one body: ``room_thread`` (None when no room is open), ``launch_id`` (its newest room launch),
-    ``composer`` (None when it has no launch or the record cannot say), ``model``, ``gap``, ``stream`` and
+    ``composer`` (None when it has no launch or the record cannot say), ``model``, ``room_mode`` (the permission mode
+    the room is expected to report, or None), ``gap``, ``stream`` and
     ``proposals``. A store missing a table degrades only the part that table feeds."""
     empty: dict[str, Any] = {"room_thread": None, "launch_id": None, "composer": None, "model": None, "gap": False,
                              "stream": [], "proposals": []}
@@ -238,7 +246,7 @@ def room_read(directory: Path | str, service: Any = None) -> dict[str, Any]:
             facts, gap = threads._event_facts(conn, launches)
             done = {(lid, f[0]) for (lid, k), f in facts.items() if k.startswith("tool_result:") and f[0]}
             return {"room_thread": room_thread, "launch_id": launch, "composer": _composer(conn, launch, service),
-                    "model": threads.model_in_use(service, launch), "gap": gap,
+                    "model": threads.model_in_use(service, launch), "room_mode": _expected_mode(service), "gap": gap,
                     "stream": [threads._item(r, facts, done) for r in _without_open_check(merged, room_launches)],
                     "proposals": _proposals(conn, room_thread)}
         finally:

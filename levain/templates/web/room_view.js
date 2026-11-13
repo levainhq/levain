@@ -115,12 +115,17 @@
     return lines.join("\n");
   }
 
-  function lineModel(it) {
+  // ``expected`` is the mode this room is expected to report (the body's ``room_mode``; a host room's is bypassPermissions);
+  // only a string counts, since lineModel is also handed to Array.map
+  function lineModel(it, expected) {
     var you = it.kind === "message" && it.source === "operator";
     var room = it.kind === "vendor_agent_text";
-    // the session reports its permission mode on every turn as an error-kind row; the expected mode is not an error, and a
-    // row that reads "Error" on every turn trains the eye past the one that is (any other mode is still drawn)
-    var modeNoise = it.kind === "vendor_error" && it.body === "dontAsk";
+    // the session reports its permission mode on every turn as an error-kind row (ref "error:mode:<id>"); the expected mode
+    // is not an error, and a row that reads "Error" on every turn trains the eye past the one that is (any other mode is
+    // still drawn). The confined room's is dontAsk; a room the server says expects another mode hides that one by its ref
+    var modeNoise = (it.kind === "vendor_error" && it.body === "dontAsk") ||
+      (it.kind === "vendor_error" && typeof expected === "string" && expected !== "" && it.body === expected &&
+       String(it.ref == null ? "" : it.ref).indexOf("error:mode:") === 0);
     var text = it.body == null ? "" : String(it.body);
     // a tool's result arrives wrapped in its vendor's tag (e.g. <tool_use_error>...</tool_use_error>); the tag is read for
     // the head's words and the text is drawn without it, as text like every other word here
@@ -193,7 +198,8 @@
     var thread = typeof body.room_thread === "string" ? body.room_thread : null;
     var running = turnRunning(body.stream || [], body.launch_id, body.gap === true);
     var replies = thread === null ? [] : repliesOf(body.stream || [], thread);
-    var stream = (body.stream || []).map(lineModel).filter(function (l) { return !l.hidden; });
+    var expected = typeof body.room_mode === "string" ? body.room_mode : "";
+    var stream = (body.stream || []).map(function (it) { return lineModel(it, expected); }).filter(function (l) { return !l.hidden; });
     replies.forEach(function (r) {
       for (var i = 0; i < stream.length; i++) if (stream[i].gseq === r.foot && stream[i].kind === "vendor_agent_text") stream[i].voice = r;
     });
