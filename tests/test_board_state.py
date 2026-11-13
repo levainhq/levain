@@ -155,12 +155,12 @@ def test_state_column_audit_sets_are_the_declared_ones():
     assert set(bs.STATE_COLUMN.values()) == set(bs.COLUMNS)
     assert bs.COLUMNS == ("off", "done", "needs_you", "waiting", "running", "backlog", "ready", "unknown")
     assert bs.AUDIT_KINDS == ("unknown", "landed_not_closed", "gate_expired", "unattributed_work", "unknown_id_in_trailer")
-    assert bs.MAX_EVIDENCE_AGE_S == 21600
+    assert bs.MAX_EVIDENCE_AGE_S == 21600 and bs.FUTURE_SKEW_S == 300
 
 
 def test_the_board_serialises_with_the_schema_word():
     folded, board = None, None
-    case = CASES[0]
+    case = next(c for c in CASES if c["expect"])               # a board with at least one item, whatever file sorts first
     folded = bs.fold(case["items_lines"])
     board = bs.derive_all(folded, bs.Evidence.from_dict(case["evidence"]), now=NOW)
     d = json.loads(json.dumps(board.to_dict()))
@@ -323,6 +323,9 @@ def test_property_derive_all_never_raises_and_stays_inside_the_closed_set():
         unknown_ids = [s.id for s in board.items if s.state == "unknown"]
         listed = [a.id for a in board.audit if a.kind in ("unknown", "gate_expired") and a.id in unknown_ids]
         assert sorted(listed, key=bs._id_key) == unknown_ids                                              # once each
+        stored = {s.id for s in board.items}
+        per_item = [a.id for a in board.audit if a.id in stored]
+        assert len(per_item) == len(set(per_item)), board.audit                                           # one entry per item, any kind
 
 
 # ------------------------------------------------------------------------------------------------ order independence
@@ -435,3 +438,130 @@ def test_what_a_reason_names_among_tied_evidence_does_not_depend_on_the_listing_
     assert by["levain#6"]["state"] == "ready_with_start" and "orphan branch o-b" in by["levain#6"]["reason"]   # same date: the name decides
     assert by["levain#7"]["state"] == "in_flight" and "seat t-a" in by["levain#7"]["reason"]
     assert [u["sha"] for u in first["unattributed"]] == ["9" * 40, "f" * 40]
+
+
+# ------------------------------------------------------------------------------------------------ L3 round 1 (levain 22)
+def _ev_dict(**over):
+    ev = {"evidence_v": 1, "fetched_at": "2026-11-12T19:30:00Z", "unreadable": {}, "main": [], "chain": [], "refs": [],
+          "merged": [], "branches": [], "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [],
+          "documents": {}, "unattributed": []}
+    ev.update(over)
+    return ev
+
+
+def test_the_id_sort_key_never_raises_and_orders_numerically():
+    big, huge = "levain#" + "1" * 4301, "levain#" + "9" * 5000
+    ids = ["levain#10", "levain#2", "levain#007", "levain#7", "levain#0", "levain#²", huge, big, "flow#3", "levain#x"]
+    order = sorted(ids, key=bs._id_key)
+    pos = order.index
+    assert pos("flow#3") < pos("levain#0") < pos("levain#2") < pos("levain#7") < pos("levain#10") < pos(big) < pos(huge)
+    assert abs(pos("levain#007") - pos("levain#7")) == 1 and pos("levain#x") < pos("levain#2")      # equal numbers: the id breaks the tie
+
+
+def test_a_store_with_a_huge_item_id_boards_and_sorts_after_the_small_ones():
+    lines = [_line(iid="levain#" + "9" * 5000), _line(iid="levain#10"), _line(iid="levain#2")]
+    board = bs.derive_all(bs.fold(lines), bs.Evidence.from_dict(_ev_dict()), now=NOW)
+    assert [s.id for s in board.items] == ["levain#2", "levain#10", "levain#" + "9" * 5000]
+
+
+#: (source, a record missing or breaking one signal-bearing field, the field the unreadable reason must name)
+STRICT = [
+    ("branches", [{"name": "b", "tip": "t", "items": []}], "ahead"),
+    ("branches", [{"name": "b", "tip": "t", "ahead": -1, "items": []}], "ahead"),
+    ("branches", [{"name": "b", "tip": "t", "ahead": "2", "items": []}], "ahead"),
+    ("branches", [{"name": "b", "tip": "t", "ahead": True, "items": []}], "ahead"),
+    ("branches", [{"name": "b", "tip": "t", "ahead": 1.0, "items": []}], "ahead"),
+    ("branches", [{"name": "b", "tip": "t", "ahead": 1}], "items"),
+    ("seats", [{"name": "s"}], "items"),
+    ("waiters", [{"branch": "b"}], "items"),
+    ("main", [{"sha": "a", "closes": []}], "items"),
+    ("main", [{"sha": "a", "items": []}], "closes"),
+    ("chain", [{"ref": "q", "tip": "t"}], "commits"),
+    ("chain", [{"ref": "q", "commits": [{"sha": "a"}]}], "items"),
+]
+
+
+@pytest.mark.parametrize("source,value,field", STRICT, ids=[f"{s}-{f}-{i}" for i, (s, _, f) in enumerate(STRICT)])
+def test_a_signal_bearing_field_that_is_missing_or_wrong_makes_its_source_unreadable_never_empty(source, value, field):
+    ev = bs.Evidence.from_dict(_ev_dict(**{source: value}))
+    assert ev.unreadable.get(source, "").startswith("malformed:") and field in ev.unreadable[source], ev.unreadable
+
+
+#: the fields the interface spec leaves optional: a source that omits only these stays readable
+OPTIONAL = [
+    ("branches", [{"name": "b", "tip": "t", "ahead": 0, "items": []}]),               # no date
+    ("seats", [{"name": "s", "items": []}]),                                           # no since, no branch
+    ("main", [{"sha": "a", "items": [], "closes": []}]),                               # no date
+    ("chain", [{"ref": "q", "commits": []}]),                                          # no tip
+    ("chain", [{"ref": "q", "commits": [{"sha": "a", "items": []}]}]),
+    ("unattributed", [{"sha": "a"}]),                                                  # no subject
+]
+
+
+@pytest.mark.parametrize("source,value", OPTIONAL, ids=[f"{s}-{i}" for i, (s, _) in enumerate(OPTIONAL)])
+def test_the_fields_the_spec_leaves_optional_stay_optional(source, value):
+    assert bs.Evidence.from_dict(_ev_dict(**{source: value})).unreadable == {}
+
+
+def test_a_branch_without_ahead_is_not_read_as_ahead_zero():
+    ev = bs.Evidence.from_dict(_ev_dict(branches=[{"name": "seat/x", "tip": "t", "items": ["levain#1"]}]))
+    s = bs.derive_all(bs.fold([_line()]), ev, now=NOW).items[0]
+    assert s.state == "unknown" and "ahead is required" in s.reason
+
+
+@pytest.mark.parametrize("at", ["x", "2026-11-12", "2026-11-12T10:00:00", "2026-11-12T10:00:00+01:00", "2026-13-12T10:00:00Z",
+                                "2026-11-12T25:00:00Z", "2026-11-12t10:00:00Z", "2026-11-12T10:00:00z", "2026-11-12T10:00:00ZZ"])
+def test_a_decide_at_that_is_not_an_aware_utc_stamp_tears_the_file(at):
+    f = bs.fold([_line(), _line("decide", decision="cut", words="w", date="2026-11-12", at=at)])
+    assert f.torn and "decide at" in f.torn_why and f.items["levain#1"].decision is None
+
+
+@pytest.mark.parametrize("date", ["x", "2026-13-01", "2026-02-30", "26-11-12", "2026-11-12T00:00:00Z", "not-a-date",
+                                  "２０２６-１１-１２"])
+def test_a_decide_date_that_is_not_a_calendar_date_tears_the_file(date):
+    f = bs.fold([_line(), _line("decide", decision="cut", words="w", date=date)])
+    assert f.torn and "decision date" in f.torn_why and f.items["levain#1"].decision is None
+
+
+@pytest.mark.parametrize("at", ["2026-11-12T10:00:00Z", "2026-11-12T10:00:00.5Z", "2026-11-12T10:00:00.123456Z", "2026-11-12T10:00:00+00:00"])
+def test_a_utc_stamp_in_any_of_the_written_forms_does_not_tear(at):
+    f = bs.fold([_line(), _line("decide", decision="cut", words="w", date="2026-11-12", at=at)])
+    assert not f.torn and f.items["levain#1"].decision is not None
+
+
+@pytest.mark.parametrize("deep", ["[" * 100000, '{"a":' * 100000, "[" * 100000 + "]" * 100000], ids=["open-arrays", "open-objects", "balanced"])
+def test_a_line_nested_beyond_the_parser_tears_the_file_instead_of_raising(deep):
+    f = bs.fold([_line(), deep])
+    assert f.torn and "line 2" in f.torn_why and "nested" in f.torn_why
+
+
+def test_the_future_skew_is_one_named_constant():
+    assert bs.FUTURE_SKEW_S == 300 and bs.FUTURE_SKEW_S < bs.MAX_EVIDENCE_AGE_S
+
+
+@pytest.mark.parametrize("stamp", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-12:00", "9999-12-31T23:59:59.999999Z"])
+def test_extreme_fetch_times_read_unknown_and_never_raise(stamp):
+    board = bs.derive_all(bs.fold([_line()]), bs.Evidence.from_dict(_ev_dict(fetched_at=stamp)), now=NOW)
+    assert board.items[0].state == "unknown" and any(p.startswith("stale_evidence:") for p in board.problems)
+    json.dumps(board.to_dict())
+
+
+def test_sources_that_alias_one_failure_are_named_once_and_different_failures_stay_apart():
+    f = bs.fold([_line()])
+    one = bs.derive_all(f, bs.Evidence.from_dict(_ev_dict(unreadable={"git": "fetch failed"})), now=NOW).items[0].reason
+    assert one.count("fetch failed") == 1 and "(also chain, branches)" in one
+    two = bs.derive_all(f, bs.Evidence.from_dict(_ev_dict(unreadable={"git": "G", "chain": "C"})), now=NOW).items[0].reason
+    assert two == "main unreadable: git: G (also branches); chain unreadable: C"
+
+
+def test_each_audited_item_id_appears_in_the_audit_exactly_once_per_world():
+    """One entry per item whatever combination of landed work, orphan branch, gate and unknown cause it carries."""
+    lines = [_line(iid="levain#1", done="d", tier="sonnet", depends_on=[{"kind": "gate", "words": "g", "recheck": "2026-11-01"}]),
+             _line(iid="levain#2", done="d", tier="sonnet", depends_on=[{"kind": "item", "ref": "levain#3"}]),
+             _line(iid="levain#3", done="d", tier="sonnet")]
+    ev = bs.Evidence.from_dict(_ev_dict(
+        main=[{"sha": "a" * 40, "date": "2026-11-11T00:00:00Z", "items": ["levain#1", "levain#2", "levain#3"], "closes": []}],
+        branches=[{"name": "seat/x", "tip": "b" * 40, "date": None, "ahead": 1, "items": ["levain#2"]}]))
+    board = bs.derive_all(bs.fold(lines), ev, now=NOW)
+    ids = [a.id for a in board.audit if a.id]
+    assert sorted(ids) == ["levain#1", "levain#2", "levain#3"], board.audit

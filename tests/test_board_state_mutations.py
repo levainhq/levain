@@ -10,11 +10,21 @@ from tests._board_state_cases import case_problems, load_cases
 
 CASES = load_cases()
 BY_NAME = {c["name"]: c for c in CASES}
+LIVE_SEAT_CASE = "precedence 5 over 6: a live seat beats commits on main"
+LIVE_SEAT_ID = "levain#24"
+
+
+def _case(name: str) -> dict:
+    """The fixture called ``name``; a missing one fails here by name, not as a KeyError or a misleading 'left green'."""
+    assert name in BY_NAME, f"fixture {name!r} is missing from tests/fixtures/board_state/*.json: this test depends on it by name"
+    return BY_NAME[name]
 
 
 def _red(names_prefix: str) -> list[str]:
     """The names of the cases whose name starts with ``names_prefix`` that no longer conform."""
-    return [c["name"] for c in CASES if c["name"].startswith(names_prefix) and case_problems(bs, c)]
+    named = [c for c in CASES if c["name"].startswith(names_prefix)]
+    assert named, f"no fixture name starts with {names_prefix!r}: the mutation it names has nothing to turn red"
+    return [c["name"] for c in named if case_problems(bs, c)]
 
 
 def _all_red() -> list[str]:
@@ -84,8 +94,18 @@ def test_removing_an_unknown_check_turns_its_fixture_red(monkeypatch, check, cas
 
 @pytest.mark.parametrize("source", ["git", "seats", "notes", "band", "waiters"])
 def test_each_unreadable_source_is_noticed_by_the_unreadable_check(source):
-    ev = dict(BY_NAME["precedence 5 over 6: a live seat beats commits on main"]["evidence"])
+    case = _case(LIVE_SEAT_CASE)
+    assert LIVE_SEAT_ID in case["expect"], f"{LIVE_SEAT_CASE!r} no longer expects {LIVE_SEAT_ID}"
+    ev = dict(case["evidence"])
     ev["unreadable"] = {source: "gone"}
-    folded = bs.fold(BY_NAME["precedence 5 over 6: a live seat beats commits on main"]["items_lines"])
+    folded = bs.fold(case["items_lines"])
     board = bs.derive_all(folded, bs.Evidence.from_dict(ev), now=bs.parse_timestamp("2026-11-12T20:00:00Z"))
-    assert board.items[0].state == "unknown" and f"{'main' if source in ('git', 'notes') else source} unreadable" in board.items[0].reason
+    item = {s.id: s for s in board.items}[LIVE_SEAT_ID]                            # by id: a second item never moves the assertion
+    assert item.state == "unknown" and f"{'main' if source in ('git', 'notes') else source} unreadable" in item.reason
+
+
+def test_a_missing_fixture_fails_by_name_not_as_a_key_error_or_a_misleading_green():
+    with pytest.raises(AssertionError, match="is missing from tests/fixtures/board_state"):
+        _case("no such fixture")
+    with pytest.raises(AssertionError, match="no fixture name starts with"):
+        _red("no such fixture either")

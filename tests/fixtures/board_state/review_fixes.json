@@ -670,7 +670,12 @@
    "now": "2026-11-12T20:00:00Z"
   },
   {
-   "audit": [],
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
    "evidence": {
     "band": {
      "open": {},
@@ -1204,6 +1209,16 @@
    "now": "2026-11-12T20:00:00Z"
   },
   {
+   "audit": [
+    [
+     "unknown",
+     null
+    ],
+    [
+     "unknown",
+     "levain#1"
+    ]
+   ],
    "evidence": {
     "band": {
      "open": {},

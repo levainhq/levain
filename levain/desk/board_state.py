@@ -35,7 +35,7 @@ from typing import Any, Callable
 
 __all__ = [
     "AUDIT_KINDS", "AuditEntry", "Amendment", "Board", "COLUMNS", "DECISIONS", "DONE_KINDS", "Decision", "Evidence",
-    "Folded", "Item", "Link", "MAX_EVIDENCE_AGE_S", "SCHEMA", "STATES", "STATE_COLUMN", "State", "TIERS",
+    "FUTURE_SKEW_S", "Folded", "Item", "Link", "MAX_EVIDENCE_AGE_S", "SCHEMA", "STATES", "STATE_COLUMN", "State", "TIERS",
     "derive_all", "derive_state", "fold", "parse_timestamp",
 ]
 
@@ -43,6 +43,9 @@ SCHEMA = "ready-v2"
 #: Evidence older than this reads unknown (6 h: judged in the design page, to be set by the land waiter's own fetch
 #: cadence; one named constant so the line moves in one place).
 MAX_EVIDENCE_AGE_S = 21600
+#: Evidence fetched MORE than this far ahead of ``now`` reads unknown ("fetched_at is in the future"): a fetcher with a
+#: wrong clock must not keep every item fresh for ever. A smaller lead is ordinary clock skew between two machines.
+FUTURE_SKEW_S = 300
 TIERS = ("sonnet", "opus", "haiku")
 DONE_KINDS = ("merged", "document", "band", "run")
 DECISIONS = ("cut", "parked", "out-of-1.0")
@@ -71,7 +74,9 @@ AUDIT_KINDS = ("unknown", "landed_not_closed", "gate_expired", "unattributed_wor
 _DECISION_STATE = {"cut": "cut", "parked": "parked", "out-of-1.0": "out_of_1_0"}
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*#[0-9]+")
-_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_UTC_STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)")
+_DIGITS = re.compile(r"[0-9]+")
 _GIT_SOURCES = ("main", "chain", "branches", "refs")
 
 
@@ -174,6 +179,28 @@ def _opt_str(v: Any, what: str) -> str | None:
     return v.strip() or None
 
 
+def _calendar_date(text: str, what: str) -> str:
+    """``text`` if it is a real calendar date written YYYY-MM-DD (ASCII digits), else a :class:`_Bad`."""
+    if not _DATE.fullmatch(text):
+        raise _Bad(f"{what} must be a date written YYYY-MM-DD, not {text[:40]!r}")
+    try:
+        _date.fromisoformat(text)
+    except ValueError:
+        raise _Bad(f"{what} {text!r} is not a calendar date") from None
+    return text
+
+
+def _utc_stamp(text: str, what: str) -> str:
+    """``text`` if it is an ISO-8601 UTC timestamp (``...Z`` or ``...+00:00``) naming a real date and time."""
+    if not _UTC_STAMP.fullmatch(text):
+        raise _Bad(f"{what} must be an ISO-8601 UTC timestamp like 2026-11-12T10:00:00Z, not {text[:40]!r}")
+    try:
+        datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+    except ValueError:
+        raise _Bad(f"{what} {text!r} is not a real date and time") from None
+    return text
+
+
 def _link(raw: Any) -> Link:
     if not isinstance(raw, Mapping):
         raise _Bad("a depends_on entry must be an object")
@@ -182,13 +209,9 @@ def _link(raw: Any) -> Link:
         raise _Bad(f"unknown link kind {kind!r}")
     if kind == "gate":
         recheck = raw.get("recheck")
-        if not isinstance(recheck, str) or not _DATE.fullmatch(recheck):
+        if not isinstance(recheck, str):
             raise _Bad("a gate needs a recheck date (YYYY-MM-DD)")
-        try:
-            _date.fromisoformat(recheck)
-        except ValueError:
-            raise _Bad("a gate's recheck is not a calendar date") from None
-        return Link("gate", words=_req_str(raw, "words", "gate words"), recheck=recheck)
+        return Link("gate", words=_req_str(raw, "words", "gate words"), recheck=_calendar_date(recheck, "a gate's recheck"))
     return Link(kind, ref=_req_str(raw, "ref", f"{kind} link ref"))
 
 
@@ -261,7 +284,8 @@ def _apply(rec: Mapping[str, Any], items: dict[str, Item]) -> None:
     decision = rec.get("decision")
     if decision not in (*DECISIONS, "reopen"):
         raise _Bad(f"decision {decision!r} is not one of {(*DECISIONS, 'reopen')}")
-    words, when = _req_str(rec, "words"), _req_str(rec, "date")
+    words, when = _req_str(rec, "words"), _calendar_date(_req_str(rec, "date"), "decision date")
+    _utc_stamp(at, "decide at")                         # a ruling carries WHEN it was made: a stamp that is not one tears the file
     if iid not in items:
         raise _Soft(f"{iid}: decided but never added")
     items[iid] = replace(items[iid], decision=None if decision == "reopen" else Decision(decision, words, when, at, by))
@@ -284,6 +308,8 @@ def fold(lines: Iterable[str]) -> Folded:
         try:
             try:
                 rec = json.loads(line)
+            except RecursionError:                      # a line of 100,000 brackets overflows the parser's stack: torn, not a crash
+                raise _Bad("not JSON (nested too deeply)") from None
             except ValueError as e:
                 raise _Bad(f"not JSON ({e})") from None
             if not isinstance(rec, Mapping):
@@ -367,40 +393,63 @@ def _strs(raw: Any, what: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _need(obj: Mapping[str, Any], key: str, what: str) -> Any:
+    """A field the interface spec makes REQUIRED: absent is a malformed source, never an empty value (an item must not
+    read ready because a record forgot to say what it carries)."""
+    if key not in obj:
+        raise _Bad(f"{what}: {key} is required")
+    return obj[key]
+
+
 def _p_main(raw: Any) -> tuple[MainCommit, ...]:
-    return tuple(MainCommit(_req_str(c := _obj(r, "a main commit"), "sha"), _opt_str(c.get("date"), "date"),
-                            _strs(c.get("items", []), "items"), _strs(c.get("closes", []), "closes"))
-                 for r in _seq(raw, "main"))
+    out = []
+    for r in _seq(raw, "main"):
+        c = _obj(r, "a main commit")
+        out.append(MainCommit(_req_str(c, "sha"), _opt_str(c.get("date"), "date"),
+                              _strs(_need(c, "items", "a main commit"), "items"),
+                              _strs(_need(c, "closes", "a main commit"), "closes")))
+    return tuple(out)
 
 
 def _p_chain(raw: Any) -> tuple[Chain, ...]:
-    return tuple(Chain(_req_str(c := _obj(r, "a chain link"), "ref"), _opt_str(c.get("tip"), "tip"),
-                       tuple(ChainCommit(_req_str(k := _obj(cc, "a chain commit"), "sha"), _strs(k.get("items", []), "items"))
-                             for cc in _seq(c.get("commits", []), "commits")))
-                 for r in _seq(raw, "chain"))
+    out = []
+    for r in _seq(raw, "chain"):
+        c = _obj(r, "a chain link")
+        commits = []
+        for cc in _seq(_need(c, "commits", "a chain link"), "commits"):
+            k = _obj(cc, "a chain commit")
+            commits.append(ChainCommit(_req_str(k, "sha"), _strs(_need(k, "items", "a chain commit"), "items")))
+        out.append(Chain(_req_str(c, "ref"), _opt_str(c.get("tip"), "tip"), tuple(commits)))
+    return tuple(out)
 
 
 def _p_branches(raw: Any) -> tuple[Branch, ...]:
     out = []
     for r in _seq(raw, "branches"):
         b = _obj(r, "a branch")
-        ahead = b.get("ahead", 0)
+        ahead = _need(b, "ahead", "a branch")
         if type(ahead) is not int or ahead < 0:
-            raise _Bad("ahead must be a non-negative integer")
+            raise _Bad("a branch: ahead must be a non-negative integer")
         out.append(Branch(_req_str(b, "name"), _req_str(b, "tip"), _opt_str(b.get("date"), "date"), ahead,
-                          _strs(b.get("items", []), "items")))
+                          _strs(_need(b, "items", "a branch"), "items")))
     return tuple(out)
 
 
 def _p_seats(raw: Any) -> tuple[Seat, ...]:
-    return tuple(Seat(_req_str(s := _obj(r, "a seat"), "name"), _strs(s.get("items", []), "items"),
-                      _opt_str(s.get("since"), "since"), _opt_str(s.get("branch"), "branch"))
-                 for r in _seq(raw, "seats"))
+    out = []
+    for r in _seq(raw, "seats"):
+        s = _obj(r, "a seat")
+        out.append(Seat(_req_str(s, "name"), _strs(_need(s, "items", "a seat"), "items"),
+                        _opt_str(s.get("since"), "since"), _opt_str(s.get("branch"), "branch")))
+    return tuple(out)
 
 
 def _p_waiters(raw: Any) -> tuple[Waiter, ...]:
-    return tuple(Waiter(_req_str(w := _obj(r, "a waiter"), "branch"), _strs(w.get("items", []), "items"))
-                 for r in _seq(raw, "waiters"))
+    out = []
+    for r in _seq(raw, "waiters"):
+        w = _obj(r, "a waiter")
+        out.append(Waiter(_req_str(w, "branch"), _strs(_need(w, "items", "a waiter"), "items")))
+    return tuple(out)
 
 
 def _p_band(raw: Any) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
@@ -738,17 +787,30 @@ def _chk_torn(ctx: _Ctx, item: Item):
 
 
 def _chk_unreadable(ctx: _Ctx, item: Item):
-    bad = [f"{s} unreadable: {r}" for s in _needs(item) if (r := ctx.ev.unreadable_reason(s))]
+    why: dict[str, list[str]] = {}                      # one cause, one phrase: sources that alias a failure ("git") name it once
+    for s in _needs(item):
+        if r := ctx.ev.unreadable_reason(s):
+            why.setdefault(r, []).append(s)
+    bad = [f"{srcs[0]} unreadable: {r}" + (f" (also {', '.join(srcs[1:])})" if len(srcs) > 1 else "") for r, srcs in why.items()]
     return ("; ".join(bad), ()) if bad else None
 
 
-def _chk_stale(ctx: _Ctx, item: Item):
-    ev = ctx.ev
+def _evidence_problem(ev: Evidence, now: datetime) -> str | None:
+    """Why the evidence's fetch time cannot be trusted (unknown, too old, or in the future), or None. The ONE place the
+    age is judged: an item's unknown reason and the board-level ``stale_evidence`` line both read it."""
     if ev.fetched_ts is None:
-        return "origin/main as of unknown (no fetch time in the evidence)", ()
-    if (ctx.now - ev.fetched_ts).total_seconds() > MAX_EVIDENCE_AGE_S:
-        return f"origin/main as of {ev.fetched_at} (older than {MAX_EVIDENCE_AGE_S // 3600} h)", ()
+        return "origin/main as of unknown (no fetch time in the evidence)"
+    age = (now - ev.fetched_ts).total_seconds()
+    if age > MAX_EVIDENCE_AGE_S:
+        return f"origin/main as of {ev.fetched_at} (older than {MAX_EVIDENCE_AGE_S // 3600} h)"
+    if age < -FUTURE_SKEW_S:
+        return f"origin/main as of {ev.fetched_at}: fetched_at is in the future (more than {FUTURE_SKEW_S // 60} min ahead of now)"
     return None
+
+
+def _chk_stale(ctx: _Ctx, item: Item):
+    why = _evidence_problem(ctx.ev, ctx.now)
+    return (why, ()) if why else None
 
 
 def _chk_cycle(ctx: _Ctx, item: Item):
@@ -788,7 +850,10 @@ def _expired_gates(item: Item, today: _date) -> list[Link]:
 
 
 def _trailer_close(ctx: _Ctx, item: Item) -> MainCommit | None:
-    return ctx.idx.closes.get(item.id)
+    """The commit whose ``Board-Closes`` trailer closes the item, and only for a ``merged`` item: that trailer IS its
+    closure. For ``document``/``run``/``band`` the closure is the item's own evidence (the file, the np row), so a
+    trailer beside a file that is absent closes nothing and contradicts nothing (rule 6 reads it as landed work)."""
+    return ctx.idx.closes.get(item.id) if item.done_kind == "merged" else None
 
 
 def _chk_conflict_closed_seat(ctx: _Ctx, item: Item):
@@ -842,7 +907,7 @@ def _rule_decision(ctx: _Ctx, item: Item) -> State | None:
 def _rule_done(ctx: _Ctx, item: Item) -> State | None:
     kind, ev = item.done_kind, ctx.ev
     if kind == "merged":
-        c = ctx.idx.closes.get(item.id)
+        c = _trailer_close(ctx, item)
         return ctx.make(item, "done", f"closed by {_short(c.sha)} ({c.date or 'no date'})", (c.sha,)) if c else None
     path = (item.done or "").strip()
     if kind in ("document", "run"):
@@ -884,13 +949,21 @@ def _rule_landed_not_closed(ctx: _Ctx, item: Item) -> State | None:
     # There is NO test for a closing trailer here, on purpose: a ``merged`` item that a trailer closed was taken by rule 2,
     # and for ``document``/``run``/``band`` the trailer is not what closes it (the file or the np row is), so commits
     # on main that name it while its own evidence is absent are landed work nobody closed.
-    touched = ctx.idx.touched.get(item.id)
-    if not touched or ctx.idx.orphans(item.id):
+    landed = _landed(ctx, item)
+    if landed is None or ctx.idx.orphans(item.id):
         return None
-    last = max(touched, key=_commit_key)
-    return ctx.make(item, "landed_not_closed",
-                    f"{len(touched)} commits on main, last {_short(last.sha)}; close it or name what remains",
-                    [last.sha])
+    count, last = landed
+    return ctx.make(item, "landed_not_closed", _landed_why(count, last), [last.sha])
+
+
+def _landed(ctx: _Ctx, item: Item) -> tuple[int, MainCommit] | None:
+    """``(how many commits on origin/main name the item, the latest of them)``, or None when none does."""
+    touched = ctx.idx.touched.get(item.id)
+    return (len(touched), max(touched, key=_commit_key)) if touched else None
+
+
+def _landed_why(count: int, last: MainCommit) -> str:
+    return f"{count} commits on main, last {_short(last.sha)}; close it or name what remains"
 
 
 def _unmet(ctx: _Ctx, item: Item) -> list[tuple[str, str, str]]:
@@ -992,9 +1065,14 @@ def derive_state(item: Item, evidence: Evidence, items: Mapping[str, Item], *, n
     return _Ctx({**items, item.id: item}, evidence, now, None).state_of(item.id)
 
 
-def _id_key(iid: str) -> tuple[str, int, str]:
+def _id_key(iid: str) -> tuple[str, int, str, str]:
+    """Sort key: repo, then the number. The number is compared as digits (length, then text, leading zeros stripped) and
+    never converted to an int: a trailer id comes from evidence and may be 5,000 digits or carry a non-ASCII digit
+    (``levain#²``), which ``int`` refuses. Anything that is not ASCII digits sorts first; the id breaks a tie
+    (levain#01 against levain#1)."""
     repo, _, n = iid.rpartition("#")
-    return repo, int(n) if n.isdigit() else 0, iid           # the id itself breaks a tie (levain#01 against levain#1)
+    digits = n.lstrip("0") if _DIGITS.fullmatch(n) else ""
+    return repo, len(digits), digits, iid
 
 
 def _trailer_ids(ev: Evidence) -> dict[str, list[str]]:
@@ -1023,7 +1101,8 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
     """The whole board: every item's state, the audit list, and everything that could not be read. ``now`` must be
     timezone-aware (a naive one is a TypeError). Every unreadable source is reported on the board itself, an audit
     ``unknown`` entry and a problem line each, whether or not an item needed it: an empty store or a source no item
-    reads (the unattributed scan) is never a clean board. An item is listed in the audit once."""
+    reads (the unattributed scan) is never a clean board, and neither is evidence too old, undated or fetched in the
+    future (``stale_evidence``). An item is listed in the audit once."""
     now = _utc(now)
     ctx = _Ctx(folded.items, evidence, now, folded.torn_why or ("torn" if folded.torn else None))
     states = [ctx.state_of(i) for i in sorted(folded.items, key=_id_key)]
@@ -1035,16 +1114,24 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
         why = f"{source} unreadable: {evidence.unreadable[source]}"
         audit.append(AuditEntry("unknown", None, why))
         problems.append(why)
-    for s in states:
+    stale = _evidence_problem(evidence, now)
+    if stale:                           # with nothing to read (or only decided items) an old fetch would otherwise be a clean board
+        why = f"stale_evidence: {stale}"
+        audit.append(AuditEntry("unknown", None, why))
+        problems.append(why)
+    for s in states:                    # one entry per item, whatever it carries
         if s.state == "unknown":
             kind = "gate_expired" if ctx.causes.get(s.id) == "gate_expired" else "unknown"
             audit.append(AuditEntry(kind, s.id, s.reason))
+            continue
+        old = [] if s.state in ("done", "cut", "parked", "out_of_1_0") else _expired_gates(folded.items[s.id], now.date())
+        landed = _landed(ctx, folded.items[s.id]) if s.state in ("blocked", "ready_with_start") else None
+        if old:                         # a live state beside an expired gate keeps its state; the gate is the one entry
+            audit.append(AuditEntry("gate_expired", s.id, f"gate \"{old[0].words}\" past its recheck {old[0].recheck}"))
         elif s.state == "landed_not_closed":
             audit.append(AuditEntry("landed_not_closed", s.id, s.reason))
-        if s.state not in ("unknown", "done", "cut", "parked", "out_of_1_0"):     # a live state beside an expired gate
-            old = _expired_gates(folded.items[s.id], now.date())
-            if old:
-                audit.append(AuditEntry("gate_expired", s.id, f"gate \"{old[0].words}\" past its recheck {old[0].recheck}"))
+        elif landed:                    # rule 6 was ruled out only by an orphan branch: the state follows rules 7-8, the audit still says it
+            audit.append(AuditEntry("landed_not_closed", s.id, f"{_landed_why(*landed)}; reads {s.state} because an orphan branch carries more"))
     unattributed = tuple(sorted(evidence.unattributed, key=lambda u: (u.sha, u.subject)))
     for u in unattributed:
         audit.append(AuditEntry("unattributed_work", None, f"{_short(u.sha)} {u.subject}".strip()))

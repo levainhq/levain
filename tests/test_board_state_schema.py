@@ -45,11 +45,11 @@ def test_the_v2_fixture_states_columns_and_kinds_are_the_functions():
     assert tuple(V2["columns"]) == bs.COLUMNS
     assert tuple(V2["audit_kinds"]) == bs.AUDIT_KINDS
     assert tuple(V2["precedence"]) == tuple(n for n, _ in bs._RULES)
-    assert V2["max_evidence_age_s"] == bs.MAX_EVIDENCE_AGE_S
+    assert V2["max_evidence_age_s"] == bs.MAX_EVIDENCE_AGE_S and V2["future_skew_s"] == bs.FUTURE_SKEW_S
 
 
 def test_the_board_and_state_shapes_are_the_fixtures():
-    case = load_cases()[0]
+    case = next(c for c in load_cases() if c["expect"])        # a board with at least one item, whatever file sorts first
     _folded, board = run_case(bs, case)
     d = board.to_dict()
     assert list(d) == V2["board_keys"] and list(d["items"][0]) == V2["state_keys"]
