@@ -1132,6 +1132,17 @@ def _event_due(s: dict, open_ids: set, today) -> bool:
     (`check_by`, or seven days after `created` when it has none or a bad one), or the `done:<id>` first part it names is no
     longer among the open intentions (resolved or gone; the run itself tells a completion from a compost). The two spellings of
     an id (`spore-N`, `intention-N`) name one first part. Mirrors levain.germinate (this file imports nothing of it)."""
+    return _check_by_late(s, today) or _event_fired(s, open_ids)
+
+
+def _event_fired(s: dict, open_ids: set) -> bool:
+    """True when the `done:<id>` first part an agenda waits on is no longer among the open intentions."""
+    m = _EVENT_DONE_RE.fullmatch(s.get("on_event")) if isinstance(s.get("on_event"), str) else None
+    return m is not None and m.group(1).partition("-")[2] not in open_ids
+
+
+def _check_by_late(s: dict, today) -> bool:
+    """True when the agenda's check-by day has come (`check_by`, or seven days after `created` when it has none or a bad one)."""
     raw, day = s.get("check_by"), None
     if isinstance(raw, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
         try:
@@ -1143,17 +1154,17 @@ def _event_due(s: dict, open_ids: set, today) -> bool:
             day = datetime.strptime(s["created"][:10], "%Y-%m-%d").date() + timedelta(days=7)
         except ValueError:
             pass
-    if day is not None and day <= today:
-        return True
-    m = _EVENT_DONE_RE.fullmatch(s.get("on_event")) if isinstance(s.get("on_event"), str) else None
-    return m is not None and m.group(1).partition("-")[2] not in open_ids
+    return day is not None and day <= today
 
 
-def due_agendas(intentions: list, now: datetime | None = None) -> list[dict]:
+def due_agendas(intentions: list, now: datetime | None = None, ringed: tuple | set | frozenset = ()) -> list[dict]:
     """Open AGENDA intentions that have come due and are not yet germinated (TS-3): a date-only `next` on or before
     today, a timed `next` (YYYY-MM-DDTHH:MM, local) from that minute; no `next`, a malformed one or a stamped
     `germinated` is never due. An agenda that waits on an event (`on_event`) is never due by a date: it is due when
-    `_event_due` says so. Mirrors levain.germinate.is_due (this file is stranger-side and imports nothing of it)."""
+    `_event_due` says so, except that a part due ONLY by its check-by whose id is in `ringed` (a run already started for it
+    today, see `note_germinate_ringed`) is not due again today: its run files the band question once and the part stays
+    unstamped until the operator answers, so a second run the same day is a no-op. Mirrors levain.germinate.is_due (this file
+    is stranger-side and imports nothing of it)."""
     now = now or datetime.now()
     open_ids = {str(s.get("id")).partition("-")[2] for s in intentions if isinstance(s, dict)}
     due = []
@@ -1163,7 +1174,7 @@ def due_agendas(intentions: list, now: datetime | None = None) -> list[dict]:
         if s.get("germinated"):
             continue
         if s.get("on_event"):
-            if _event_due(s, open_ids, now.date()):
+            if _event_fired(s, open_ids) or (_check_by_late(s, now.date()) and str(s.get("id")) not in ringed):
                 due.append(s)
             continue
         raw = s.get("next")
@@ -1177,6 +1188,45 @@ def due_agendas(intentions: list, now: datetime | None = None) -> list[dict]:
         if now >= when:
             due.append(s)
     return due
+
+
+def ring_only_ids(due: list, intentions: list) -> list[str]:
+    """The ids among `due` that are due ONLY by their check-by (their `done:<id>` first part is still open): the parts a run
+    answers with a band question, not a wake. `intentions` is the open list `due` was taken from."""
+    open_ids = {str(s.get("id")).partition("-")[2] for s in intentions if isinstance(s, dict)}
+    return [str(s.get("id")) for s in due if isinstance(s, dict) and s.get("on_event") and not _event_fired(s, open_ids)]
+
+
+def _germinate_ringed_path() -> Path:
+    return Path(install_root()) / ".levain" / ".germinate-ringed"
+
+
+def germinate_ringed(now: datetime | None = None) -> set[str]:
+    """The ids a germinate run was started for today by their check-by alone (`note_germinate_ringed`). Empty when there is no
+    record, it is from another day or it cannot be read: the hook then asks for the run, as it did before the record existed."""
+    try:
+        doc = json.loads(_germinate_ringed_path().read_text(encoding="utf-8"))
+        ids = doc.get("ids") if isinstance(doc, dict) and doc.get("day") == (now or datetime.now()).date().isoformat() else None
+        return {i for i in ids if isinstance(i, str)} if isinstance(ids, list) else set()
+    except (OSError, ValueError, AttributeError):
+        return set()
+
+
+def note_germinate_ringed(ids: list, now: datetime | None = None) -> None:
+    """Record today that a run was started for these check-by-only parts, so their next session starts of the day do not spawn
+    another no-op run (germinate files the part's band question once; it is idempotent by origin key). One record per day
+    (the day rolls it over: a question still unanswered tomorrow gets one run tomorrow). Best effort: a failed write costs
+    only the redundant run it would have spared."""
+    if not ids:
+        return
+    try:
+        day = (now or datetime.now()).date().isoformat()
+        path = _germinate_ringed_path()
+        merged = sorted(germinate_ringed(now) | {str(i) for i in ids})
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"day": day, "ids": merged}), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def open_agendas(timeout: float = 2.0) -> list[dict]:

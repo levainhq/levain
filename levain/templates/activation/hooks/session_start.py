@@ -180,9 +180,15 @@ def main() -> int:
             try:
                 # Agenda germination (TS-3): a dated agenda that has come due is put in front of him by a detached,
                 # fail-soft `levain intentions germinate`; spawned ONLY when one is due, one spawn per session start.
-                n = len(hook.due_agendas(hook.open_agendas()))
+                # A part due only by its check-by is asked about once a day: its run files the band question and leaves the part
+                # unstamped until he answers, so a second run the same day does nothing (the day's record is the hook's own).
+                agendas = hook.open_agendas()
+                due_now = hook.due_agendas(agendas, ringed=hook.germinate_ringed())
+                n = len(due_now)
                 if n:
                     st = hook.start_germinate('claude_code')
+                    if st == 'started':
+                        hook.note_germinate_ringed(hook.ring_only_ids(due_now, agendas))
                     plural = 's' if n != 1 else ''
                     if st == 'started':
                         sections.append(f"[germinate] {n} agenda{plural} came due; germination started")

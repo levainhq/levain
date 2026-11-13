@@ -294,3 +294,108 @@ def test_the_hooks_event_pattern_is_levains(agent):
     from levain import intentions
 
     assert _load(agent).hook._EVENT_DONE_RE.pattern == intentions._EVENT_DONE.pattern
+
+
+# --- a part past its check-by whose first part is still open: one run a day, not one per session start -------------------
+def _ring_rig(tmp_path):
+    """An open first part and a second part waiting on it whose check-by is past: the run files the band question and leaves the
+    follower unstamped (the shape the session-start hook used to spawn for at every start)."""
+    import os
+    import time
+
+    root = _install(tmp_path)
+    st = guarded_intention_store(root / ".levain" / "memory.spores.json")
+    kw = dict(type="task", disposition="agenda", target="band")
+    anchor = st.add(text="call Jim", **kw)["id"]
+    follower = st.add(text="send the invoice", on_event=f"done:{anchor}", check_by=_PAST, **kw)["id"]
+
+    def an_hour_later():     # the busy marker spares only starts within a minute: the next start is past it
+        marker = root / ".levain" / ".germinate-spawn"
+        if marker.exists():
+            os.utime(marker, (time.time() - 3600, time.time() - 3600))
+    return root, st, anchor, follower, an_hour_later
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_check_by_only_part_is_spawned_for_once_a_day(agent, monkeypatch, capsys, tmp_path):
+    mod = _load(agent)
+    root, st, anchor, follower, an_hour_later = _ring_rig(tmp_path)
+    s1, c1 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert len(s1) == 1 and "[germinate] 1 agenda came due; germination started" in c1
+    an_hour_later()
+    s2, c2 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert s2 == [] and "[germinate]" not in c2          # the run for it already ran today; it filed the one question
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_the_next_day_asks_for_one_more_run(agent, monkeypatch, capsys, tmp_path):
+    mod = _load(agent)
+    root, st, anchor, follower, an_hour_later = _ring_rig(tmp_path)
+    _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    rec = root / ".levain" / ".germinate-ringed"
+    doc = json.loads(rec.read_text())
+    assert doc["ids"] == [follower] and doc["day"] == date.today().isoformat()
+    rec.write_text(json.dumps({**doc, "day": (date.today() - timedelta(days=1)).isoformat()}))
+    an_hour_later()
+    s2, c2 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert len(s2) == 1 and "[germinate] 1 agenda came due" in c2     # a question still open tomorrow is a pending answer, asked once
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_finished_first_part_is_never_held_back_by_the_days_record(agent, monkeypatch, capsys, tmp_path):
+    mod = _load(agent)
+    root, st, anchor, follower, an_hour_later = _ring_rig(tmp_path)
+    _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    st.descend(anchor, kind="done")
+    an_hour_later()
+    s2, c2 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert len(s2) == 1 and "[germinate] 1 agenda came due" in c2     # a genuinely due part: the wake must happen today
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_start_that_failed_records_nothing_and_is_retried(agent, monkeypatch, capsys, tmp_path):
+    mod = _load(agent)
+    root, st, anchor, follower, an_hour_later = _ring_rig(tmp_path)
+    s1, c1 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path, rc=1)
+    assert len(s1) == 1 and "did not start" in c1 and not (root / ".levain" / ".germinate-ringed").exists()
+    s2, c2 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert len(s2) == 1 and "germination started" in c2
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_an_unreadable_record_asks_for_the_run_as_before(agent, monkeypatch, capsys, tmp_path):
+    mod = _load(agent)
+    root, st, anchor, follower, an_hour_later = _ring_rig(tmp_path)
+    _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    (root / ".levain" / ".germinate-ringed").write_text("{not json")
+    an_hour_later()
+    s2, c2 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert len(s2) == 1
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_a_dated_agenda_still_spawns_beside_a_held_back_part(agent, monkeypatch, capsys, tmp_path):
+    mod = _load(agent)
+    root, st, anchor, follower, an_hour_later = _ring_rig(tmp_path)
+    _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    dated = st.add(type="task", text="renew the domain", disposition="agenda", target="band", next=_PAST)["id"]
+    an_hour_later()
+    s2, c2 = _run(mod, monkeypatch, capsys, st.list_open(), tmp_path)
+    assert len(s2) == 1 and "[germinate] 1 agenda came due" in c2       # the dated one only: the held-back part is not counted
+
+
+@pytest.mark.parametrize("agent", ["claude_code", "codex"])
+def test_due_agendas_default_still_counts_every_due_part(agent, tmp_path):
+    h = _load(agent).hook
+    root, st, anchor, follower, _ = _ring_rig(tmp_path)
+    rows = st.list_open()
+    now = datetime.now()
+    assert {s["id"] for s in h.due_agendas(rows, now=now)} == {follower}
+    assert h.due_agendas(rows, now=now, ringed={follower}) == []
+    assert h.ring_only_ids(h.due_agendas(rows, now=now), rows) == [follower]
+    st.descend(anchor, kind="done")
+    dated = st.add(type="task", text="renew the domain", disposition="agenda", target="band", next=_PAST)["id"]
+    rows = st.list_open()
+    due = h.due_agendas(rows, now=now)
+    assert {s["id"] for s in due} == {follower, dated}
+    assert h.ring_only_ids(due, rows) == []          # a finished first part and a dated agenda are woken by a run, never held back

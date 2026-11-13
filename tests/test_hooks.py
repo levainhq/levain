@@ -300,7 +300,8 @@ _PORTED_FNS = (
     "format_wrap_blocked", "_config_dict", "configured_scope",
     "open_intentions", "_is_loop", "_tokens", "intentions_colliding", "due_dormant_intentions",
     # the germinate trigger: a dated agenda and one that waits on an event (a split's second part)
-    "due_agendas", "_event_due",
+    "due_agendas", "_event_due", "_event_fired", "_check_by_late",
+    "ring_only_ids", "_germinate_ringed_path", "germinate_ringed", "note_germinate_ringed",
     "_format_intention_lines", "format_intention_collisions", "format_due_intentions",
     # compatibility-manifest drift surface — byte-identical across both copies
     "read_manifest_lock", "_is_migrate_check", "compat_drift",
