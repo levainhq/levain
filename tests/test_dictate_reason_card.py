@@ -34,16 +34,20 @@ REPLY_NOTE_SEL = ".edit-msg"
 
 def shown(note_sel: str) -> str:
     """What the card shows for its note: the words, whether it is drawn, and whether its edges are visible: inside the screen
-    sideways, inside the card on every side, and not cut by any ancestor whose overflow clips (the modal's scroller included) or by its own overflow.
-    The note is scrolled into view first, so a card that scrolls is judged on what the person reaches, not on what is below the
-    fold. The bottom edge is deliberately not compared with the window: under headless emulation the phone sheet is sized by
-    100dvh of the real window while innerHeight is the emulated one, so the sheet's own bottom can sit past innerHeight whatever
-    the note does; the clipping ancestor walk is the vertical check that means something here (a real phone is Phill's look)."""
+    sideways, inside the card on every side, not cut by any ancestor whose overflow clips (the modal's scroller included) and not
+    cut by its own overflow. The note is scrolled into view first, so a card that scrolls is judged on what the person reaches,
+    not on what is below the fold; an ancestor that clips without letting the person scroll (hidden, clip) is put back to its
+    origin first, because a script's scrollIntoView moves such a box and would hide the very cut the walk exists to find. The
+    bottom edge is deliberately not compared with the window: under headless emulation the phone sheet is sized by 100dvh of the
+    real window while innerHeight is the emulated one, so the sheet's own bottom can sit past innerHeight whatever the note does;
+    the clipping walk is the vertical check that means something here (a real phone is Phill's look)."""
     return ("(() => { const card = document.querySelector(%s), n = card && card.querySelector(%s);"
             " if (!n) return JSON.stringify(null);"
             " n.scrollIntoView({ block: 'nearest' });"
+            " const up = []; for (let p = n.parentElement; p && p !== document.documentElement; p = p.parentElement) up.push(p);"
+            " for (const p of up) { const o = getComputedStyle(p); if (/hidden|clip/.test(o.overflowX + o.overflowY)) { p.scrollTop = 0; p.scrollLeft = 0; } }"
             " const r = n.getBoundingClientRect(), c = card.getBoundingClientRect(), s = getComputedStyle(n), cut = [];"
-            " for (let p = n.parentElement; p && p !== document.documentElement; p = p.parentElement) {"
+            " for (const p of up) {"
             "   const o = getComputedStyle(p); if (o.overflowX === 'visible' && o.overflowY === 'visible') continue;"
             "   const b = p.getBoundingClientRect();"
             "   if (r.left < b.left - 0.5 || r.right > b.right + 0.5 || r.top < b.top - 0.5 || r.bottom > b.bottom + 0.5) cut.push(p.className || p.tagName); }"
