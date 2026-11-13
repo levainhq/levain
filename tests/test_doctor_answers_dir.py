@@ -136,15 +136,62 @@ def test_an_owner_mismatch_names_the_operator_not_you(store):
     assert f"owner {OPERATOR}" in r.detail and "owner you" not in r.detail
 
 
-@pytest.mark.parametrize("write", [None, b"", b"not an operator record", b'{"format":"levain-operator/1","name":"x","uid":0}'])
-def test_no_established_operator_is_neutral_and_says_why(tmp_path, write):
+MALFORMED = [b"", b"not an operator record", b'{"format":"levain-operator/1","name":"x","uid":0}']
+
+
+@pytest.mark.parametrize("write", [None, *MALFORMED])
+def test_a_missing_or_malformed_operator_record_fails_for_every_invoker(tmp_path, write):
+    """No record, no operator to name as owner: a FAIL (a neutral row hides its hint and exits 0, and nothing else
+    reads the record). A record naming uid 0 is rejected by the parser, so it is the malformed case."""
     (tmp_path / "policy").mkdir()
     if write is not None:
         (tmp_path / "policy" / "operator").write_bytes(write)
     for uid in (0, ME):
         r = row(tmp_path, st(), uid=uid)
-        assert r.neutral and r.ok and not r.warn
-        assert "operator" in r.detail and "record" in r.detail, r.detail
+        assert not r.ok and not r.neutral and not r.warn
+        assert str(tmp_path / "policy" / "operator") in r.detail, r.detail
+        assert "no one can be named as owner" in r.detail, r.detail
+
+
+@pytest.mark.parametrize("write", [None, *MALFORMED])
+def test_the_operator_record_failure_names_a_remedy_that_exists(tmp_path, write):
+    """`levain upgrade` refuses this state and points back at doctor, so it is never the remedy; the isolation install
+    (the helper's `setup`, which writes the record last) is."""
+    (tmp_path / "policy").mkdir()
+    if write is not None:
+        (tmp_path / "policy" / "operator").write_bytes(write)
+    for host, helper in (("darwin", "/usr/local/libexec/levain/install-helper"),
+                         ("linux", "/usr/libexec/levain/install-helper")):
+        r = row(tmp_path, st(), host=host)
+        assert "levain upgrade" not in r.hint, r.hint
+        assert "isolation install has to be run again" in r.hint
+        assert f"{helper} setup --slots" in r.hint and "--operator" in r.hint
+
+
+def test_an_unreadable_operator_record_is_neutral_and_the_detail_says_who_to_run_as(store, monkeypatch):
+    real = Path.read_bytes
+
+    def deny(self):
+        if self.name == "operator":
+            raise PermissionError(13, "denied", str(self))
+        return real(self)
+    monkeypatch.setattr(Path, "read_bytes", deny)
+    r = row(store, st(), uid=ME + 1)
+    assert r.ok and r.neutral and not r.warn
+    assert "Run `levain doctor` as the operator or root." in r.detail, r.detail
+
+
+def test_an_operator_record_that_is_not_a_file_fails(store):
+    (store / "policy" / "operator").unlink()
+    (store / "policy" / "operator").mkdir()
+    r = row(store, st())
+    assert not r.ok and "cannot be read" in r.detail
+
+
+def test_a_wrong_directory_says_the_operators_answers_not_yours(store):
+    r = row(store, st(uid=ME + 1))
+    assert not r.ok
+    assert "the operator's answers" in r.detail and "your answers" not in r.detail
 
 
 def test_the_missing_group_hint_is_the_upgrade_verb(store):
