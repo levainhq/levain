@@ -260,7 +260,9 @@ def test_a_tab_that_drew_a_rotated_room_is_refused_and_the_new_room_takes_the_ne
         r = rs.send(author_surface="cockpit", client_id="tab-b", outbox_id="ob-00000003", body="fresh", room_thread=new)
         assert r.state == "accepted" and launcher.handle.room_thread == new
         assert len(old_session.written) == written                    # the stale line wrote nothing to the vendor
-        assert [w["text"] for w in launcher.session.written] == ["fresh"] and launcher.session is not old_session
+        # the line reaches the vendor behind its context block, which names this very message
+        assert [w["text"].split("</room-context>\n\n", 1)[1] for w in launcher.session.written] == ["fresh"]
+        assert r.message_id in launcher.session.written[0]["text"] and launcher.session is not old_session
     finally:
         rs.stop()
 
