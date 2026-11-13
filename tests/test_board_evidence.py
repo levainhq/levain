@@ -980,6 +980,7 @@ def test_a_partial_clone_still_carries_every_reader_field(world, tmp_path):
 
 def test_a_main_that_cannot_be_read_inside_the_run_still_carries_every_reader_field(world, monkeypatch):
     monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 1)
+    monkeypatch.setattr(be, "MIN_PREWINDOW_TAIL", 5)
     world.commit("w1")
     world.push_main()
     ev, summary = read(world)
@@ -988,13 +989,25 @@ def test_a_main_that_cannot_be_read_inside_the_run_still_carries_every_reader_fi
 
 
 # ------------------------------------------------------------------------------------------------ 5. a cut main history
-def test_a_history_longer_than_the_cap_is_unreadable_even_when_the_older_commits_are_old(world, monkeypatch):
-    """The date of what was read can never prove the log complete: the cap alone decides."""
+def test_a_cut_history_with_a_real_old_tail_is_whole_for_the_window(world, monkeypatch):
+    """The board must not go dark when main outgrows the cap: a log cut at the cap is whole for the window when enough of what was read predates it."""
     monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
+    monkeypatch.setattr(be, "MIN_PREWINDOW_TAIL", 3)
     world.commit("old2", date=OLD)
     world.commit("old3", date=OLD)
     world.commit("new", trailers=("Board-Item: levain#1",))
-    world.push_main()                                    # root, old2, old3, new: 4 commits, the cap is 3
+    world.push_main()                                    # root, old2, old3 (all OLD), new: 4 commits, the cap is 3, 3 predate the window
+    ev, _ = read(world)
+    assert ev["unreadable"] == {} and [r["items"] for r in ev["main"]] == [["levain#1"]]
+
+
+def test_a_cut_history_without_a_real_old_tail_is_unreadable(world, monkeypatch):
+    monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
+    monkeypatch.setattr(be, "MIN_PREWINDOW_TAIL", 4)
+    world.commit("old2", date=OLD)
+    world.commit("old3", date=OLD)
+    world.commit("new", trailers=("Board-Item: levain#1",))
+    world.push_main()                                    # 3 commits predate the window, the tail asked for is 4
     ev, _ = read(world)
     assert "more than 3 commits" in ev["unreadable"]["main"] and "main" not in ev
     assert {"chain", "branches", "unattributed"} <= set(ev["unreadable"])
@@ -1003,11 +1016,12 @@ def test_a_history_longer_than_the_cap_is_unreadable_even_when_the_older_commits
 def test_one_commit_with_a_wrong_clock_cannot_make_a_cut_history_look_whole(world, monkeypatch):
     """codex 5 / deepseek MED-1: the skewed commit is inside the 3 newest, so `min(ts) < window` called the cut log complete."""
     monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
+    monkeypatch.setattr(be, "MIN_PREWINDOW_TAIL", 3)
     world.commit("the close, past the cap", trailers=("Board-Closes: levain#1",))
     world.commit("skewed", date=OLD)
     world.commit("w2")
     world.commit("w3")
-    world.push_main()
+    world.push_main()                                    # root and the skewed commit predate the window: 2 old commits, the tail asked for is 3
     ev, _ = read(world)
     assert "more than 3 commits" in ev["unreadable"]["main"] and "main" not in ev
 
