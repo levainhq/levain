@@ -588,12 +588,96 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
             {"eval": "window.__release(); 1"},
             {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
             {"eval": f"{_CARD}.querySelector('.sign-note').className"},
+            # complement MED 1 / LOW 6: the ceremony has ended and the live card has said it; a later board read draws the
+            # card plain, never the old refusal again
+            {"eval": f"window.__shown = {_CARD}; document.querySelector('#refresh').click(); 1"},
+            {"until": f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
+            {"eval": _GRANT_NOTE},
         ])
     v = out["values"]
-    assert v[-4] is True, v[-4]                     # the card drawn mid-ceremony is locked, as the tapped one was
-    assert "the passkey did not sign (NotAllowedError); nothing was revoked" in v[-2], v[-2]
-    assert "sign-bad" in v[-1], v[-1]
+    assert v[-7] is True, v[-7]                     # the card drawn mid-ceremony is locked, as the tapped one was
+    assert "the passkey did not sign (NotAllowedError); nothing was revoked" in v[-5], v[-5]
+    assert "sign-bad" in v[-4], v[-4]
+    assert v[-1] == "", v[-1]                       # the redraw after the ceremony ended does not repaint its word
     assert not [s for s in rec.steps if s[1] == "revoke"], rec.steps
+
+
+GID2 = "cg-0000000000d8"
+_CARD2 = f"document.querySelector('#levain-modal [data-consent-grant=\"{GID2}\"]')"
+_REVOKE2 = f"{_CARD2}.querySelector('.grant-revoke')"
+_GRANT_NOTE2 = f"((({_CARD2}) || document).querySelector('.sign-note') || {{}}).textContent"
+
+
+@needs_browser
+@needs_ssh
+def test_b12_a_tap_refused_because_another_ceremony_holds_the_passkey_is_said_once_never_kept(
+        world, tmp_path, monkeypatch) -> None:
+    """complement LOW 2, deepseek MED 1, codex LOW 5: while grant A's passkey prompt is up, a tap on grant B's Revoke is
+    refused ("a signature is already being asked for") on B's card. That word belongs to the tap, not to a ceremony of B:
+    once A's ceremony has ended, a board read draws B plain."""
+    port, src, signer, older, newer = _grant_rig(world, tmp_path, monkeypatch)
+    _grant(world, GID2, "Edit")
+    record = {newer.key.fingerprint: _b64u(b"cred-new")}
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        rec = _Verifying(httpd.grant_phone, [older, newer])
+        httpd.grant_phone = rec
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _auth(newer, b"cred-new"), {"until": TILE},
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
+            {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && !!{_REVOKE} && !!{_CARD2} && !!{_REVOKE2} && 1"},
+            {"eval": _HOLD_GET},
+            {"tap": _REVOKE},
+            {"until": "window.__getCalled === true && 1", "ms": 30000},
+            {"tap": _REVOKE2},
+            {"until": f"/already being asked for/.test({_GRANT_NOTE2}) && {_GRANT_NOTE2}", "ms": 30000},
+            {"eval": "window.__release(); 1"},
+            {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
+            {"eval": f"window.__shown = {_CARD2}; document.querySelector('#refresh').click(); 1"},
+            {"until": f"!!{_CARD2} && {_CARD2} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
+            {"eval": _GRANT_NOTE2},
+            {"eval": f"{_REVOKE2}.disabled"},
+        ])
+    v = out["values"]
+    assert "a signature is already being asked for" in v[-7], v[-7]
+    assert v[-2] == "", v[-2]                       # the refused tap's word was never kept for B
+    assert v[-1] is False, v[-1]
+    assert [(g, a) for g, a, _r in rec.steps] == [(GID, "revoke-challenge")], rec.steps   # B's tap sent nothing
+
+
+# the next call of Array.isArray throws (signWho's first statement calls it): a throw inside the ceremony before any await
+_THROW_ONCE = ("(() => { const real = Array.isArray; window.__threw = false; Array.isArray = (x) => {"
+               " if (!window.__threw) { window.__threw = true; Array.isArray = real; throw new TypeError('thrown once'); }"
+               " return real(x); }; return 1; })()")
+
+
+@needs_browser
+@needs_ssh
+def test_b13_a_throw_at_the_start_of_the_ceremony_is_said_and_releases_the_card_and_the_passkey(
+        world, tmp_path, monkeypatch) -> None:
+    """deepseek MED 3: the lease (signBusy) and the card's lock are taken before the ceremony's first step; a throw there
+    that escapes the chain whose finally gives them back would leave Revoke disabled and every passkey tap refused until a
+    reload. The throw is the chain's failure: said on the card, and the next tap runs the ceremony."""
+    port, src, signer, older, newer = _grant_rig(world, tmp_path, monkeypatch)
+    record = {newer.key.fingerprint: _b64u(b"cred-new")}
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        rec = _Verifying(httpd.grant_phone, [older, newer])
+        httpd.grant_phone = rec
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _auth(newer, b"cred-new"), {"until": TILE},
+            {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
+            {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
+            {"eval": f"{_THROW_ONCE} && ({_REVOKE}.click(), 1)"},
+            {"until": f"window.__threw && !{_REVOKE}.disabled && /page failed/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", "ms": 15000},
+            {"tap": _REVOKE},
+            {"until": f"/^revoked|^not revoked|^result unknown/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", "ms": 30000},
+        ])
+    v = out["values"]
+    assert v[-3] == "the page failed (TypeError); nothing was revoked", v[-3]
+    assert v[-1].startswith("revoked"), v[-1]       # the lease was given back: the next tap ran the whole ceremony
+    assert [a for _g, a, _r in rec.steps] == ["revoke-challenge", "revoke"], rec.steps
+
 
 
 @needs_browser

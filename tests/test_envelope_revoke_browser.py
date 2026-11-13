@@ -322,3 +322,51 @@ def test_a_failed_grants_read_still_marks_its_slot_filled_so_the_jump_lands(worl
             {"eval": "document.querySelector('#levain-modal .grant-slot').dataset.filled"},
         ])
     assert out["values"][-1] == "1", out["values"]
+
+
+# --- the flip-parity fix round: the envelope card keeps its ceremony across a board read (the grant card's mechanism) ---
+
+# one passkey prompt held open until released (declined then), so a board read can be placed inside the ceremony
+_HOLD_GET = ("(() => { window.__getCalled = false; navigator.credentials.get = () => new Promise((_ok, no) => {"
+             " window.__getCalled = true; window.__release = () => no(new DOMException('declined', 'NotAllowedError')); }); return 1; })()")
+_REVOKE = f"{_CARD}.querySelector('.envelope-revoke')"
+_NOTE = f"((({_CARD}) || document).querySelector('.sign-note') || {{}}).textContent"
+
+
+@needs_browser
+def test_a_refusal_lands_on_the_live_envelope_card_when_a_board_read_replaced_the_card_mid_ceremony(world, tmp_path) -> None:
+    """complement MED 3, codex MED 2: a board read (Sync) while the passkey prompt is up replaces the envelope card the revoke
+    was tapped on. The live card is drawn locked while the ceremony runs; when the prompt is declined, the refusal ("nothing
+    was revoked") lands on the live card and its Revoke comes back. A board read after that draws the card plain."""
+    _seed(world.qdir)
+    port = _free_port()
+    pk, src, signer = _served(world, tmp_path, port)
+    with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
+        rec = _Recording(httpd.envelope_revoke, pk.key.fingerprint)
+        httpd.envelope_revoke = rec
+        out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
+            _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
+            {"until": f"!!{_CARD} && {_REVOKE}.title === 'revoke with your passkey'"},
+            {"eval": _HOLD_GET},
+            {"eval": f"window.__tapped = {_CARD}; 1"},
+            {"tap": _REVOKE},
+            {"until": "window.__getCalled === true && 1", "ms": 30000},
+            {"eval": "document.querySelector('#refresh').click(); 1"},
+            {"until": f"!!{_CARD} && {_CARD} !== window.__tapped && !window.__tapped.isConnected && 1", "ms": 30000},
+            {"eval": f"{_REVOKE}.disabled"},
+            {"eval": _NOTE},
+            {"eval": "window.__release(); 1"},
+            {"until": f"/nothing was revoked/.test({_NOTE}) && !{_REVOKE}.disabled && {_NOTE}", "ms": 30000},
+            {"eval": f"{_CARD}.querySelector('.sign-note').className"},
+            {"eval": f"window.__shown = {_CARD}; document.querySelector('#refresh').click(); 1"},
+            {"until": f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
+            {"eval": _NOTE},
+            {"eval": f"{_REVOKE}.disabled"},
+        ])
+    v = out["values"]
+    assert v[-9] is True, v                         # the card drawn mid-ceremony is locked
+    assert v[-8].startswith("confirm with your passkey"), v[-8]     # and says where the ceremony stands
+    assert "the passkey did not sign (NotAllowedError); nothing was revoked" in v[-6], v[-6]
+    assert "sign-bad" in v[-5], v[-5]
+    assert v[-2] == "" and v[-1] is False, v[-2:]  # the board read after the ceremony ended draws the card plain
+    assert [a for _e, a, _r in rec.steps] == ["revoke-challenge"], rec.steps

@@ -8333,15 +8333,14 @@
                                   && Array.isArray(x.signers) && x.signers.length) : null;
     if (signed) {
       const line = el("div", "consent-cmd grant-sign");
-      line.dataset.grantKey = grantKey(g);
       const btn = el("button", "undo-btn grant-revoke", "revoke");
       btn.type = "button";
       btn.title = "revoke with your passkey";
       const note = el("span", "sign-note ext-meta");
-      const say = (text, kind) => grantSay(line, text, kind);
-      btn.addEventListener("click", () => grantRevoke(g, signed, signList, btn, line, say));
+      const say = (text, kind) => grantCeremony.say(line, text, kind);
+      btn.addEventListener("click", () => grantRevoke(g, signed, signList, line, say));
       line.append(btn, note);
-      grantPaint(line, true);       // a card drawn while a revoke runs, or after one, shows where it stands
+      grantCeremony.draw(line, grantKey(g));    // a card drawn while a revoke runs, or after one, shows where it stands
       row.appendChild(line);
     }
     const cmd = sv(g.revoke);
@@ -8366,29 +8365,60 @@
   // the line and head it is sent and puts only that to the passkey, so what the prompt signs is the link shown
   const GRANT_SIGN_LIST = "/cockpit/grant/list.json";
   let grantSaid = "";          // what the last revoke said, kept across the slot's redraw (a revoked grant leaves it)
-  // The sign card's pair (signNotes, signInFlight), for a grant card: an open Decisions view is drawn again on every board
-  // read, which replaces the card a revoke was tapped on while its ceremony runs. The note and the in-flight lock are kept
-  // by grant (its id and instance), and whichever card is on the page when the ceremony speaks or ends is painted from them
-  const grantNotes = new Map();     // grant key -> [text, kind]: what the last revoke ceremony said, kept across redraws
-  const grantInFlight = new Set();  // grant keys with a revoke ceremony running: a card drawn meanwhile is drawn locked
+  // The sign card's pair (signNotes, signInFlight), for a revoke card (a grant's, an envelope's): an open Decisions view is
+  // drawn again on every board read, which replaces the card a revoke was tapped on while its ceremony runs. The note and
+  // the in-flight lock are kept by key (a grant's id and instance, an envelope's id), and whichever card is on the page when
+  // the ceremony speaks or ends is painted from them. A note is the word OF a ceremony, not of the card: once the ceremony
+  // has ended and a card on the page has shown it, it is dropped, so a later redraw draws the card plain (the sign card
+  // drops its notes when the request's version changes; a revoke card has no version, so the ceremony's end is the edge).
+  // `cardSel` names a card's sign line, `btnSel` its button, and `slotSays` what the slot's own line says now (a card drawn
+  // with a note that line already says does not say it twice). One per card kind
+  function revokeCeremonies(cardSel, btnSel, slotSays) {
+    const notes = new Map();      // key -> [text, kind]: what the ceremony said, kept across redraws until a card has shown it
+    const inFlight = new Set();   // keys with a ceremony running: a card drawn meanwhile is drawn locked
+    function paint(line, drawn) {
+      const key = line.dataset.ceremonyKey;
+      const btn = line.querySelector(btnSel), note = line.querySelector(".sign-note");
+      btn.disabled = inFlight.has(key);
+      const k = notes.get(key);
+      if (!k) return;
+      if (!(drawn && k[0] === slotSays())) { note.textContent = k[0]; note.className = "sign-note ext-meta" + (k[1] ? " sign-" + k[1] : ""); }
+      // a card drawn after the ceremony ended has taken its word: the next one is drawn plain
+      if (drawn && !inFlight.has(key)) notes.delete(key);
+    }
+    // paint `own` (the card the ceremony was tapped on) and every card of its key on the page now; true when one of them
+    // is on the page (a person can see what was painted)
+    function paintLive(own) {
+      paint(own, false);
+      let seen = own.isConnected;
+      for (const l of document.querySelectorAll(cardSel)) {
+        if (l !== own && l.dataset.ceremonyKey === own.dataset.ceremonyKey) { paint(l, false); seen = true; }
+      }
+      return seen;
+    }
+    return {
+      // a card being drawn: keyed, then painted with where its ceremony stands
+      draw(line, key) { line.dataset.ceremonyKey = key; paint(line, true); },
+      say(own, text, kind) { notes.set(own.dataset.ceremonyKey, [text, kind || ""]); paintLive(own); },
+      // a tap refused before any ceremony starts (another one holds the passkey): said on the tapped card, never kept
+      refuse(own, text, kind) {
+        const note = own.querySelector(".sign-note");
+        note.textContent = text;
+        note.className = "sign-note ext-meta" + (kind ? " sign-" + kind : "");
+      },
+      begin(own) { inFlight.add(own.dataset.ceremonyKey); paint(own, false); },
+      // the ceremony is over: the cards of its key unlock, and a note a card on the page has now shown is not kept
+      end(own) {
+        const key = own.dataset.ceremonyKey;
+        inFlight.delete(key);
+        if (paintLive(own)) notes.delete(key);
+      },
+      // the board as read: a key no card is drawn for and no ceremony holds keeps nothing
+      prune(keys) { for (const key of [...notes.keys()]) if (!keys.has(key) && !inFlight.has(key)) notes.delete(key); },
+    };
+  }
+  const grantCeremony = revokeCeremonies(".grant-sign", ".grant-revoke", () => grantSaid);
   const grantKey = (g) => g.id + "\n" + g.instance;
-  function grantPaint(line, drawn) {
-    const key = line.dataset.grantKey;
-    const btn = line.querySelector(".grant-revoke"), note = line.querySelector(".sign-note");
-    btn.disabled = grantInFlight.has(key);
-    const k = grantNotes.get(key);
-    // a card drawn after the ceremony does not repeat what the slot's own line (grantSaid) already says
-    if (k && !(drawn && k[0] === grantSaid)) { note.textContent = k[0]; note.className = "sign-note ext-meta" + (k[1] ? " sign-" + k[1] : ""); }
-  }
-  // paint `own` (the card the ceremony was tapped on) and every card of that grant that is on the page now
-  function grantPaintLive(own) {
-    grantPaint(own, false);
-    for (const l of document.querySelectorAll(".grant-sign")) if (l !== own && l.dataset.grantKey === own.dataset.grantKey) grantPaint(l, false);
-  }
-  function grantSay(own, text, kind) {
-    grantNotes.set(own.dataset.grantKey, [text, kind || ""]);
-    grantPaintLive(own);
-  }
   function grantSignList() {
     const headers = signHeaders(false);
     if (!SIGN_USABLE || !headers["X-Levain-Write-Token"]) return Promise.resolve(null);
@@ -8411,15 +8441,16 @@
   }
   // One revoke: which passkey (signWho), the challenge, the passkey prompt (the gesture), the revoke, then the grants
   // read again. As the phone says it: only the server's own 4xx after the assertion was sent is "not revoked"
-  function grantRevoke(g, signed, listing, btn, host, say) {
-    if (signBusy) { say(SIGN_BUSY.replace("signed", "revoked"), "bad"); return; }
-    signBusy++;
-    grantInFlight.add(host.dataset.grantKey);
-    btn.disabled = true;
+  function grantRevoke(g, signed, listing, host, say) {
+    if (signBusy) { grantCeremony.refuse(host, SIGN_BUSY.replace("signed", "revoked"), "bad"); return; }
     const base = "/cockpit/grant/" + encodeURIComponent(g.id) + "/";
     const slot = host.closest(".grant-slot");     // at the click: a redraw during the ceremony detaches this card
     let sent = false, revoked = false;
-    signWho({ signers: signed.signers, origin: listing.origin, credentials: listing.credentials }, host, say).then((who) => {
+    // the lease and the lock are taken only with the chain whose finally gives them back: everything after them runs inside it,
+    // so a throw there is the chain's failure (said, and released), never a card locked for the page's life
+    signBusy++;
+    grantCeremony.begin(host);
+    Promise.resolve().then(() => signWho({ signers: signed.signers, origin: listing.origin, credentials: listing.credentials }, host, say)).then((who) => {
       if (!who) { say("nothing was revoked"); return; }
       say("asking for the revoke to sign…");
       return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: g.instance }).then((c) => {
@@ -8470,8 +8501,8 @@
       say(sent ? grantSaid : "the page failed (" + name + "); nothing was revoked", "bad");
     }).finally(() => {
       signBusy--;
-      grantInFlight.delete(host.dataset.grantKey);
-      grantPaintLive(host);
+      // known edge: a sent or unknown result unlocks here, before the read below draws the card away (as the button did before)
+      grantCeremony.end(host);
       if (!sent && !revoked) return;
       // the grants again: a revoked grant leaves the slot, and the slot keeps what the revoke said
       grantRead = null;
@@ -8497,6 +8528,7 @@
       if (!b) return;
       // sort is stable: the server's order holds among grants with and among grants without a refused call
       const rows = b.grants.slice().sort((x, y) => (grantRefused(y) ? 1 : 0) - (grantRefused(x) ? 1 : 0));
+      grantCeremony.prune(new Set(rows.map(grantKey)));
       const note = typeof b.note === "string" ? b.note : "";
       // a page whose consent hook names no cockpit (root "") and that holds no grant gets no slot, as with no proposals;
       // a named cockpit that cannot be read is said
@@ -8597,9 +8629,10 @@
     if (signers.length && !signElsewhere(listing)) {
       btn.title = "revoke with your passkey";
       const note = el("span", "sign-note ext-meta");
-      const say = (text, kind) => { note.textContent = text; note.className = "sign-note ext-meta" + (kind ? " sign-" + kind : ""); };
-      btn.addEventListener("click", () => envelopeRevoke(e, signers, listing, btn, line, say));
+      const say = (text, kind) => envelopeCeremony.say(line, text, kind);
+      btn.addEventListener("click", () => envelopeRevoke(e, signers, listing, line, say));
       line.append(btn, note);
+      envelopeCeremony.draw(line, e.id);      // a card drawn while a revoke runs, or after one, shows where it stands
     } else {
       const cmd = "levain envelope kill " + sv(e.id);
       const code = el("code", "consent-code", cmd);
@@ -8611,14 +8644,15 @@
     row.appendChild(line);
     return row;
   }
-  function envelopeRevoke(e, signers, listing, btn, host, say) {
-    if (signBusy) { say(SIGN_BUSY.replace("signed", "revoked"), "bad"); return; }
-    signBusy++;
-    btn.disabled = true;
+  function envelopeRevoke(e, signers, listing, host, say) {
+    if (signBusy) { envelopeCeremony.refuse(host, SIGN_BUSY.replace("signed", "revoked"), "bad"); return; }
     const base = "/cockpit/envelope/" + encodeURIComponent(e.id) + "/";
     const slot = host.closest(".envelope-slot");
     let sent = false, revoked = false;
-    signWho({ signers: signers, origin: listing.origin, credentials: listing.credentials }, host, say).then((who) => {
+    // the lease and the lock are taken only with the chain whose finally gives them back (grantRevoke's order)
+    signBusy++;
+    envelopeCeremony.begin(host);
+    Promise.resolve().then(() => signWho({ signers: signers, origin: listing.origin, credentials: listing.credentials }, host, say)).then((who) => {
       if (!who) { say("nothing was revoked"); return; }
       say("asking for the revoke to sign…");
       return signCall(base + "revoke-challenge", { signer_fp: who.fp, instance: e.instance }).then((c) => {
@@ -8670,7 +8704,7 @@
       say(sent ? envelopeSaid : "the page failed (" + name + "); nothing was revoked", "bad");
     }).finally(() => {
       signBusy--;
-      btn.disabled = false;
+      envelopeCeremony.end(host);
       if (!sent && !revoked) return;
       setTimeout(() => {
         const live = slot && slot.isConnected ? slot : document.querySelector(".envelope-slot");
@@ -8684,9 +8718,12 @@
     return slot;
   }
   let envelopeFillSeq = 0;     // the newest fill wins
+  let envelopeSaidShown = "";  // what the slot's said line shows since the last fill drew it ("" for none)
+  const envelopeCeremony = revokeCeremonies(".envelope-sign", ".envelope-revoke", () => envelopeSaidShown);
   // what the last revoke said, taken once: whichever fill draws next shows it and clears it, so it is never repeated stale
   function envelopeSaidOnce() {
     const said = envelopeSaid ? [el("div", "consent-note ext-meta envelope-said", envelopeSaid)] : [];
+    envelopeSaidShown = envelopeSaid;
     envelopeSaid = "";
     return said;
   }
@@ -8705,6 +8742,7 @@
       if (!b) { unavailable(); return; }
       const open = b.envelopes.filter((e) => e && ENVELOPE_REVOCABLE.includes(e.state));
       const ended = b.envelopes.length - open.length;
+      envelopeCeremony.prune(new Set(open.map((e) => e.id)));
       const said = envelopeSaidOnce();
       const why = typeof b.note === "string" && b.note ? [el("div", "consent-note ext-meta envelope-why", b.note)] : [];
       slot.replaceChildren(el("div", "ext-grouphead", "Envelopes"), ...said, ...why,
