@@ -80,6 +80,7 @@ class _Part:
     note: str = ""
     fault: str | None = None
     entity: Any = None
+    ring_repeat: dict[str, str] = field(default_factory=dict)      # a ringing band row's question id -> its reminder's repeat line
 
 
 def _steering(source: SubstrateSource, today: date) -> tuple[dict[str, dict[str, Any]], str | None]:
@@ -227,7 +228,11 @@ def _intention_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool],
             waiting_on.setdefault(intentions.norm_event(r["on_event"]), []).append(i)
     for s in items:
         raw = steer.get(s.id, {})
-        if ringing and intentions.ringing_ref(raw, ringing):
+        ring = intentions.ringing_ref(raw, ringing) if ringing else None
+        if ring:
+            repeat = _repeat_line(raw, s.next)
+            if repeat:
+                out.ring_repeat[ring] = repeat      # the band row that replaces this one carries the line (row 188)
             continue
         surface = _surface(raw, s.disposition) if raw else "intention"
         d = next_date(s.next)
@@ -471,7 +476,9 @@ def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext],
         sp = _intention_part(source, ctx, seen, ringing=ringing)
         dn = _done_part(source, ctx) if not sp.fault else _Part()
         kp = _kept_part(source, ctx)
-        rows = [*bd.rows, *sp.rows]
+        band_rows = [replace(r, facets={**r.facets, "repeat_line": sp.ring_repeat[r.id[len("band:"):]]})
+                     if r.id.startswith("band:") and r.id[len("band:"):] in sp.ring_repeat else r for r in bd.rows]
+        rows = [*band_rows, *sp.rows]
         skipped = [*sp.skipped, *bd.skipped, *dn.skipped]
         if sp.fault:
             if not rows and not sp.later:
