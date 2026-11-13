@@ -70,7 +70,8 @@ def test_a_permission_request_deny_whose_answer_cannot_be_written_is_a_hook_fail
 
 
 def test_a_permission_request_deny_whose_stream_breaks_is_written_raw_to_its_descriptor():
-    """DIOGAP-A2 item 1: a broken text wrapper over an intact fd still delivers the decision, by one raw write."""
+    """DIOGAP-A2 item 1: a broken text wrapper over an intact fd still delivers the decision. DIOGAP-A3: the raw write
+    is now the ONE writer whenever there is a descriptor, so the broken text layer is never used at all."""
     import os
     r, w = os.pipe()
     try:
@@ -107,15 +108,24 @@ def test_a_permission_request_deny_whose_descriptor_is_broken_too_is_exit_1():
     assert code == 1 and "nope" in err.getvalue()
 
 
-def test_a_short_raw_write_of_the_decision_is_exit_1(monkeypatch):
-    """The raw write counts only when the whole document went (the argv refusal: no repo command, no subprocess)."""
+def test_a_zero_byte_raw_write_of_the_decision_is_exit_1_and_not_retried(monkeypatch):
+    """The raw write counts only when the whole document went (the argv refusal: no repo command, no subprocess).
+    DIOGAP-A3: a short write is now looped (test_short_raw_writes_are_looped_to_one_whole_document); a write that
+    takes nothing is the failure at once, never spun on."""
     import os
     r, w = os.pipe()
+    calls = []
+
+    def nothing(fd, b):
+        calls.append(len(b))
+        if len(calls) > 3:
+            raise OSError("spun")
+        return 0
     try:
         class BrokenOverFd(_Broken):
             def fileno(self):
                 return w
-        monkeypatch.setattr(hook_run.os, "write", lambda fd, b: len(b) - 1)
+        monkeypatch.setattr(hook_run.os, "write", nothing)
         err = io.StringIO()
         code = hook_run.repo_filter("levain_repo_filter", ["PermissionRequest", "5"], stdin=io.BytesIO(b"{}"),
                                     stdout=BrokenOverFd(), stderr=err)
@@ -123,7 +133,160 @@ def test_a_short_raw_write_of_the_decision_is_exit_1(monkeypatch):
         monkeypatch.undo()
         os.close(r)
         os.close(w)
-    assert code == 1 and "repo-filter-argv (2 argument(s))" in err.getvalue()
+    assert code == 1 and len(calls) == 1 and "repo-filter-argv (2 argument(s))" in err.getvalue()
+
+
+# --- DIOGAP-A3 (complement MED, verify r2): a partial write is never followed by a second document -----------------
+# The shape: one writer per document. With a descriptor beneath ``out``, ``out`` is flushed and the document goes raw,
+# looped until every byte is written; any error or a zero-byte write is FAILED_EXIT, never a retry by another path.
+# Without one (a StringIO), one ``write`` + ``flush``. Exit 0 only follows a whole document, and stdout holds one.
+
+def _pipe_run(make_out, call):
+    """Run ``call(out)`` with ``out = make_out(w)`` over a real pipe; return (code, what the pipe got)."""
+    import os
+    r, w = os.pipe()
+    try:
+        code = call(make_out(w))
+        os.close(w)
+        w = -1
+        got = b""
+        while True:
+            chunk = os.read(r, 65536)
+            if not chunk:
+                break
+            got += chunk
+    finally:
+        os.close(r)
+        if w != -1:
+            os.close(w)
+    return code, got.decode("utf-8", "replace")
+
+
+def _argv_refusal(out, err=None):
+    return hook_run.repo_filter("levain_repo_filter", ["PermissionRequest", "5"], stdin=io.BytesIO(b"{}"),
+                                stdout=out, stderr=err if err is not None else io.StringIO())
+
+
+class _HalfThenRaise(io.StringIO):
+    """A text stream over a live descriptor whose ``write`` puts half of what it is given into the pipe, then raises
+    (an EAGAIN/EINTR in the middle of a flush)."""
+    def __init__(self, fd):
+        super().__init__()
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+    def write(self, s):
+        import os
+        os.write(self._fd, s[:len(s) // 2].encode("utf-8"))
+        raise BlockingIOError(11, "EAGAIN")
+
+
+def test_a_stream_that_breaks_after_half_the_decision_leaves_one_whole_document_and_exit_0():
+    """The MED: the text write put half the document into the pipe and raised; the old raw retry then wrote the whole
+    document after it (invalid JSON, exit 0: the deny lost). Now the document goes raw only, once: one whole
+    document, exit 0."""
+    code, got = _pipe_run(_HalfThenRaise, _argv_refusal)
+    assert code == 0
+    assert _decision(got)["behavior"] == "deny" and got.count("hookSpecificOutput") == 1
+
+
+class _FlushFails(io.StringIO):
+    """A buffered stream over a live descriptor whose flush fails and keeps its data."""
+    def __init__(self, fd):
+        super().__init__()
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+    def flush(self):
+        raise BlockingIOError(11, "EAGAIN")
+
+
+def test_a_stream_whose_flush_fails_is_exit_1_and_nothing_is_written_raw_past_its_buffer():
+    """What ``out`` still buffers would reach the pipe after a raw document (at exit, or never): when it cannot be
+    flushed first, nothing goes raw and the answer is the failure exit."""
+    err = io.StringIO()
+    code, got = _pipe_run(_FlushFails, lambda out: _argv_refusal(out, err))
+    assert (code, got) == (1, "") and "repo-filter-argv" in err.getvalue()
+
+
+class _OverFd(io.StringIO):
+    """A stream over a live descriptor whose own ``write`` must never be used."""
+    def __init__(self, fd):
+        super().__init__()
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+    def write(self, s):
+        raise AssertionError("the text layer was written over a live descriptor")
+
+
+def test_short_raw_writes_are_looped_to_one_whole_document(monkeypatch):
+    import os
+    real = os.write
+    monkeypatch.setattr(hook_run.os, "write", lambda fd, b: real(fd, bytes(b[:10])))
+    code, got = _pipe_run(_OverFd, _argv_refusal)
+    assert code == 0 and _decision(got)["behavior"] == "deny" and got.count("hookSpecificOutput") == 1
+
+
+def test_a_raw_write_that_breaks_after_half_is_exit_1_and_never_rewritten(monkeypatch):
+    import os
+    real = os.write
+    calls = []
+
+    def half_then_raise(fd, b):
+        calls.append(len(b))
+        if len(calls) == 1:
+            return real(fd, bytes(b[:len(b) // 2]))
+        raise BlockingIOError(11, "EAGAIN")
+    monkeypatch.setattr(hook_run.os, "write", half_then_raise)
+    code, got = _pipe_run(_OverFd, _argv_refusal)
+    assert code == 1 and len(calls) == 2 and got.count("hookSpecificOutput") == 1
+    with pytest.raises(ValueError):
+        json.loads(got)
+
+
+class _AnswerHalfThenRaise(io.StringIO):
+    """The queue's answer stream, with no descriptor of its own to offer: its FIRST write puts half of the adapter's
+    answer into the pipe and raises (an EAGAIN); a later write would succeed whole."""
+    def __init__(self, fd):
+        super().__init__()
+        self._fd = fd
+        self._broke = False
+
+    def write(self, s):
+        import os
+        if not self._broke:
+            self._broke = True
+            os.write(self._fd, s[:len(s) // 2].encode("utf-8"))
+            raise BlockingIOError(11, "EAGAIN")
+        os.write(self._fd, s.encode("utf-8"))
+        return len(s)
+
+
+class _HalfAnswer:
+    @staticmethod
+    def main(argv, stdin=None, stdout=None, environ=None):
+        stdout.write('{"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {}}}\n')
+        return 0
+
+
+def test_a_queue_answer_broken_half_way_is_exit_1_and_no_deny_document_follows_it():
+    """run(): when the adapter's answer broke after part of it reached stdout, a deny document written after it would
+    be invalid JSON with exit 0. The answer is the failure exit, nothing more on stdout."""
+    err = io.StringIO()
+
+    def call(out):
+        return hook_run.run("levain_queue", stdin=io.StringIO("{}"), stdout=out, stderr=err,
+                            environ={"LEVAIN_QUEUE_SOCKET": "/x/q.sock"}, load_adapter=lambda: _HalfAnswer)
+    code, got = _pipe_run(_AnswerHalfThenRaise, call)
+    assert code == 1 and "behavior" not in got and "deny" not in got
+    assert "refused: hook-adapter-failed (writing the answer" in err.getvalue()
 
 
 def test_pre_tool_use_with_a_broken_stdout_is_still_exit_2():
