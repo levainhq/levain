@@ -55,6 +55,7 @@ check(D.sendOutcome(200, { outcome: "not_delivered", reason: null }).words === "
 const cap = D.sendOutcome(422, { error: "words_over_cap", words_max: 2000 });
 check(cap.status === "refused" && /2000 characters/.test(cap.words) && /nothing was cut/i.test(cap.words) && !cap.clear, "over the cap: refused, never cut, the draft stays");
 check(D.sendOutcome(404, null).status === "refused" && D.sendOutcome(403, { error: "x" }).status === "refused" && D.sendOutcome(400, { error: "bad outbox_id" }).words === "Not sent: bad outbox_id", "4xx are refusals with the server's line");
+check(D.sendOutcome(400, { error: "bad_request", message: "There is nothing to send." }).words === "Not sent: There is nothing to send." && D.sendOutcome(409, { error: "outbox_conflict", message: "that outbox_id was already used for different words" }).words === "Not sent: that outbox_id was already used for different words", "a refusal draws the server's message, not its code");
 const f5 = D.sendOutcome(502, null);
 check(f5.status === "failed" && !f5.settle && !f5.clear && /will not duplicate/.test(f5.words), "a 5xx keeps the id and the draft: a resend does not duplicate");
 check(D.sendOutcome(200, { outcome: "banana" }).status === "failed" && !D.sendOutcome(200, { outcome: "banana" }).settle, "an outcome the page does not know is not claimed");
@@ -70,7 +71,7 @@ check(D.shown("e‍") === "e‍" && D.shown("⠀") === "<U+2800>", "the joiner s
 
 // nothing in the page's words says what the server cannot observe
 const drawn = [D.deskModel(200, { wired: false }).words, D.deskModel(0, null).words, held.lease.words, none.lease.words, unk.lease.words, acc.words, amb.words, nd.words, cap.words, f5.words,
-  D.sendOutcome(403, null).words, D.sendOutcome(404, null).words, D.eventModel({ by: "script", kind: "took", at: "t" }).words, D.eventModel({ by: "script", kind: "held" }).words, D.AMBIGUOUS_WORDS].join(" | ");
+  D.sendOutcome(403, null).words, D.sendOutcome(404, null).words, D.eventModel({ by: "script", kind: "took", at: "t" }).words, D.eventModel({ by: "script", kind: "held" }).words, D.AMBIGUOUS_WORDS, D.ARRIVED_WORDS, D.NOT_ARRIVED_WORDS].join(" | ");
 check(!/\b(fenced|read|acted on)\b/i.test(drawn), "no drawn word says fenced, read or acted on");
 
 console.log(failures === 0 ? "ALL PASS" : failures + " FAILED");

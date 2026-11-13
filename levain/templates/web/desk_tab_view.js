@@ -124,11 +124,17 @@
     if (status === 404) return { status: "refused", words: "Not sent: " + UNWIRED_WORDS.toLowerCase(), ref: "", thread: null, settle: true, clear: false };
     if (status === 403) return { status: "refused", words: "Not sent: the cockpit did not accept this device's credential.", ref: "", thread: null, settle: true, clear: false };
     if (status >= 400 && status < 500) {
-      return { status: "refused", words: "Not sent: " + (body && typeof body.error === "string" && body.error ? body.error : "the server answered " + status + "."), ref: "", thread: null, settle: true, clear: false };
+      // the server's refusals are {error: <code>, message: <one line>}: the line is the words, the code is only a fallback
+      var line = body && typeof body.message === "string" && body.message ? body.message : (body && typeof body.error === "string" && body.error ? body.error : "the server answered " + status + ".");
+      return { status: "refused", words: "Not sent: " + line, ref: "", thread: null, settle: true, clear: false };
     }
     return { status: "failed", words: "The server answered " + status + "; the line may or may not have been filed. Sending again will not duplicate it.", ref: "", thread: null, settle: false, clear: false };
   }
-  var UNREACHED_WORDS = "The server could not be reached; the line may or may not have been filed. Sending again will not duplicate it.";
+  // The two marks an ambiguous line offers, drawn by the page alone (no route): the server never re-sends an ambiguous claim by
+  // itself, and what the person says here is theirs, never the desk's.
+  var ARRIVED_WORDS = "It arrived (your word; the desk has not confirmed it).";
+  var NOT_ARRIVED_WORDS = "It did not arrive (your word). Send the same words again to file them as a new line.";
+  var UNREACHED_WORDS ="The server could not be reached; the line may or may not have been filed. Sending again will not duplicate it.";
 
   // how long to wait before the next read, from the page's visibility
   function pollDelay(visibility, openMs, hiddenMs) {
@@ -148,7 +154,7 @@
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
   // One log entry as a row. `you` entries are lines this page sent; `ev` entries are what the host filed back.
-  function renderEntry(doc, it) {
+  function renderEntry(doc, it, onMark) {
     if (it.k === "you") {
       var row = el(doc, "div", "rv-line rv-you dv-you dv-" + it.status);
       row.appendChild(el(doc, "div", "rv-text", shown(it.text)));
@@ -156,6 +162,16 @@
         (it.status === "filed" ? "Filed" + (it.ref ? ": " + shown(it.ref) : "") : shown(it.words)));
       note.setAttribute("role", "status");
       row.appendChild(note);
+      if (it.status === "ambiguous" && it.id && onMark) {
+        var marks = el(doc, "div", "rv-mark dv-marks");
+        [["It arrived", true], ["It did not arrive", false]].forEach(function (m) {
+          var b = el(doc, "button", m[1] ? "rv-mark-yes dv-mark" : "rv-mark-no dv-mark", m[0]);
+          b.setAttribute("type", "button");
+          b.addEventListener("click", function () { onMark(it, m[1]); });
+          marks.appendChild(b);
+        });
+        row.appendChild(marks);
+      }
       return row;
     }
     var m = eventModel(it);
@@ -295,7 +311,7 @@
       clear(body);
       var stream = el(doc, "div", "rv-stream");
       if (!log.length) stream.appendChild(el(doc, "div", "rv-note", current && current.kind === "wired" ? "Nothing here yet. A line you send is filed for the desk; what it files back shows here." : ""));
-      log.forEach(function (it) { stream.appendChild(renderEntry(doc, it)); });
+      log.forEach(function (it) { stream.appendChild(renderEntry(doc, it, mark)); });
       body.appendChild(stream);
       if (stick) toEnd();
       wasEnd = atEnd();
@@ -337,6 +353,25 @@
     }
     sendB.addEventListener("click", doSend);
 
+    // The person's word on an ambiguous line. Either way its outbox id is spent: "arrived" settles the line as filed-unconfirmed
+    // (nothing is sent), "did not arrive" puts the same words back in an EMPTY draft box, and the next tap sends them under a
+    // NEW id (the server answers an old id from the claim it holds and never re-sends it by itself).
+    function mark(entry, arrived) {
+      if (stopped || entry.status !== "ambiguous") return;
+      settle(entry.id);
+      if (arrived) {
+        entry.status = "arrived"; entry.words = ARRIVED_WORDS;
+      } else {
+        entry.status = "notarrived"; entry.words = NOT_ARRIVED_WORDS;
+        if (!flight.send && !ta.value.trim()) {
+          ta.value = entry.text;
+          try { if (store) store.setItem("levain.desk.draft", ta.value); } catch (e) { /* no storage */ }
+          grow();
+        }
+      }
+      saveLog(); draw();
+    }
+
     function url() {
       return DESK_PATH + (thread ? "?thread=" + encodeURIComponent(thread) + (cursor ? "&after=" + encodeURIComponent(cursor) : "") : "");
     }
@@ -349,6 +384,9 @@
       }).catch(function () { return { status: 0, json: null }; }).then(function (r) {
         reading = false;
         if (stopped || my !== gen) return;
+        // 503 is the desk's poll gate being full (another device's poll, a slow host command): try again at the next interval and
+        // keep what is on the page. It is never a state, so the error line is not drawn for it.
+        if (r.status === 503) return;
         var m = deskModel(r.status, r.json);
         if (m.kind === "wired" && thread && m.thread === null) m.thread = thread;
         current = m;
@@ -391,7 +429,8 @@
   var api = {
     deskModel: deskModel, leaseModel: leaseModel, eventModel: eventModel, mergeEvents: mergeEvents, sendOutcome: sendOutcome,
     pollDelay: pollDelay, shown: shown, ageWords: ageWords, mount: mount,
-    POLL_OPEN_MS: POLL_OPEN_MS, POLL_HIDDEN_MS: POLL_HIDDEN_MS, AMBIGUOUS_WORDS: AMBIGUOUS_WORDS, HOSTILE_SOURCE: HOSTILE.source
+    POLL_OPEN_MS: POLL_OPEN_MS, POLL_HIDDEN_MS: POLL_HIDDEN_MS, AMBIGUOUS_WORDS: AMBIGUOUS_WORDS, ARRIVED_WORDS: ARRIVED_WORDS, NOT_ARRIVED_WORDS: NOT_ARRIVED_WORDS,
+    HOSTILE_SOURCE: HOSTILE.source
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LevainDeskView = api;

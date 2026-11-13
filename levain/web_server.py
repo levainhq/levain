@@ -1342,6 +1342,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/thread_view.js": ("thread_view.js", "text/javascript; charset=utf-8"),
     # The room view (RM-F): the cockpit's one Claude room, over GET /cockpit/room.json and POST /cockpit/room/*.
     "/room_view.js": ("room_view.js", "text/javascript; charset=utf-8"),
+    # The Desk view: a second full tab beside the room, over GET /cockpit/desk.json and POST /cockpit/desk/send.
+    "/desk_tab_view.js": ("desk_tab_view.js", "text/javascript; charset=utf-8"),
     # The board painters (C12): the board-kind panel's grouped tab and its six columns draw with these. GET /cockpit/board.json
     # is served for external readers; no page zone reads it.
     "/board_view.js": ("board_view.js", "text/javascript; charset=utf-8"),
