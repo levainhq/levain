@@ -73,6 +73,7 @@ class View:
     seen_through: int
     open_list: tuple[int, ...]
     store_id: str
+    at: str | None = field(default=None, compare=False)        # the view row's own stamp: a recycled number numbered after it meant another item here
 
 
 @dataclass(frozen=True)
