@@ -969,8 +969,14 @@ class Broker:
         if isinstance(who, str):
             now = self._monotonic()
             with self._alarm_lock:
-                if known:   # a cap that no longer resolves stops being known: its next frame pays the unseen bucket
-                    self._alarm_caps.get(slot, {}).pop(digest, None)
+                # a cap CONTROL says is gone ("cap-unknown", its definitive miss) stops being known: its next frame pays the
+                # unseen bucket. A CONTROL blip ("control-unavailable", "resolve-malformed") says nothing of the cap.
+                if known and who == "cap-unknown":
+                    caps = self._alarm_caps.get(slot)
+                    if caps is not None:
+                        caps.pop(digest, None)
+                        if not caps:
+                            del self._alarm_caps[slot]
                 last = self._alarm_unresolved_logged.get(slot)
                 if last is None or now - last >= ALARM_DEDUPE_WINDOW:
                     self._alarm_unresolved_logged[slot] = now
