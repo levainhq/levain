@@ -2973,7 +2973,9 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-stop { background: var(--text); color: var(--base); border: 1px solid var(--text); }
 .rv .rv-open { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-body)/1 var(--sans); }
 .rv .rv-open[hidden] { display: none; }
-.rv .rv-mic, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
+.rv .rv-desk { margin-left: auto; }
+.rv .rv-desk + .rv-rotate { margin-left: 0; }
+.rv .rv-mic, .rv .rv-rotate, .rv .rv-desk, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
 .rv .rv-mic { align-self: flex-end; border-color: transparent; color: var(--label); display: inline-flex; align-items: center; justify-content: center; flex: none; min-width: var(--hit-min, 44px); padding: 0; }
 .rv .rv-mic[hidden] { display: none; }
 .rv .rv-mic[data-voice-icon$="stop"] { color: var(--accent); }
@@ -2999,6 +3001,23 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-text strong { font-weight: var(--fw-semibold); }
 .rv .rv-ic { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
 .rv .rv-text strong .rv-ic { font-weight: var(--fw-regular); }
+/* The room's reply drawn by the shared markdown renderer (md-* elements, room_view.js drawMarkdown): the blocks carry their own breaks, so the
+   box stops preserving source newlines; headings stay at reading size or above (the page's own md-h sizes are panel-scale), code is mono, a wide
+   code block or link scrolls or wraps inside the column and never widens the page. */
+.rv .rv-text.rv-md { white-space: normal; }
+.rv .rv-md > :first-child { margin-top: 0; }
+.rv .rv-md > :last-child { margin-bottom: 0; }
+.rv .rv-md .md-p, .rv .rv-md .md-ul, .rv .rv-md .md-ol, .rv .rv-md .md-quote, .rv .rv-md .md-pre { margin-bottom: var(--sp-3); }
+.rv .rv-md .md-h { margin: var(--sp-4) 0 var(--sp-2); color: var(--text); line-height: 1.35; text-transform: none; letter-spacing: normal; }
+.rv .rv-md .md-h1 { font-size: 1.3em; }
+.rv .rv-md .md-h2 { font-size: 1.15em; }
+.rv .rv-md .md-h3, .rv .rv-md .md-h4, .rv .rv-md .md-h5, .rv .rv-md .md-h6 { font-size: 1em; }
+.rv .rv-md .md-b { color: inherit; font-weight: var(--fw-semibold); }
+.rv .rv-md .md-code-i { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+.rv .rv-md .md-pre { margin-top: var(--sp-2); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); }
+.rv .rv-md .md-code-b { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); }
+.rv .rv-md .md-link { overflow-wrap: anywhere; }
+.rv .rv-md .md-quote { color: var(--label); }
 
 /* The Room tab (dashboard_boot.js sets body.rv-on): the room owns the whole viewport below the app's own header and views strip. The deck
    is one fixed box of the visual viewport's height (room_view.js keeps --rv-vvh / --rv-vvt), so the page itself never scrolls and the

@@ -134,3 +134,14 @@ def test_the_room_has_no_history_list_or_card_in_the_markup_and_keeps_its_one_as
     assert "history" not in js.lower() and 'el("section", "rv-zone")' in boot
     assert "ck-zgrid th-grid" not in boot[boot.index("function buildRoom"):boot.index("function roomOn")]
     assert "visualViewport" in js and "100dvh" in css
+
+
+def test_the_room_draws_replies_with_the_shared_renderer_and_keeps_the_plain_way_as_the_fallback():
+    """1112-36 gap 9: one renderer for the page. room_view.js takes the dashboard's (window.LevainMD) for the room's own
+    replies only, declines past the plain-text bound, and never reaches for markup of its own."""
+    js = (WEB / "room_view.js").read_text()
+    assert "root.LevainMD" in js and "renderMarkdown" in js
+    assert "l.rich && drawMarkdown(" in js and "fillText(doc, pre, l.text, l.rich)" in js     # only the room's replies; the rest and the fallback as before
+    assert "lines[i].length > LONG_LINE" in js
+    for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
+        assert banned not in js, banned
