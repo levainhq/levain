@@ -541,7 +541,7 @@ def test_a_ref_that_does_not_resolve_fully_qualified_is_unreadable_not_the_short
     assert "origin/main cannot be read" in ev["unreadable"]["main"] and "main" not in ev
 
 
-def test_every_revision_the_log_is_given_is_fully_qualified_or_a_sha(world, monkeypatch):
+def test_every_revision_the_log_is_given_is_a_sha_resolved_once_at_the_start(world, monkeypatch):
     world.branch("queue/a/one")
     world.commit("c1", trailers=("Board-Item: levain#1",))
     world.push("queue/a/one")
@@ -557,8 +557,9 @@ def test_every_revision_the_log_is_given_is_fully_qualified_or_a_sha(world, monk
 
     monkeypatch.setattr(be, "_git", spy)
     read(world)
-    assert seen and all(r.lstrip("^").startswith("refs/") or len(r) == 40 for r in seen), seen
-    assert "^refs/remotes/origin/main" in seen and "^refs/remotes/origin/queue/a/one" in seen
+    assert seen and all(len(r.lstrip("^")) == 40 for r in seen), seen        # shas only: refs are resolved once, at the start
+    assert f"^{git(world.w, 'rev-parse', 'refs/remotes/origin/main')}" in seen
+    assert f"^{git(world.w, 'rev-parse', 'refs/remotes/origin/queue/a/one')}" in seen
 
 
 # ------------------------------------------------------------------------------------------------ the local head and origin's copy
@@ -652,11 +653,11 @@ def test_a_main_window_that_reaches_its_count_while_still_inside_the_epoch_is_un
     assert {"chain", "branches", "unattributed"} <= set(ev["unreadable"])
 
 
-def test_a_count_that_is_reached_but_already_past_the_epoch_is_a_complete_window(world, monkeypatch):
+def test_a_history_of_exactly_the_count_is_a_complete_window(world, monkeypatch):
     monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
     world.commit("old2", date=OLD)
     world.commit("new", trailers=("Board-Item: levain#1",))
-    world.push_main()                                    # root (OLD), old2 (OLD), new: exactly 3, and the oldest is before the epoch
+    world.push_main()                                    # root (OLD), old2 (OLD), new: exactly 3 commits, none cut off
     ev, _ = read(world)
     assert ev["unreadable"] == {} and [r["items"] for r in ev["main"]] == [["levain#1"]]
 
@@ -741,3 +742,388 @@ def test_two_branches_may_each_spend_the_one_chain_commit_that_holds_their_work(
     world.push("queue/a/one")
     ev, _ = read(world)
     assert branch(ev, "seat/1112-40-i7-a")["ahead"] == 0 and branch(ev, "seat/1112-41-i8-b")["ahead"] == 0
+
+
+# ================================================================================================ B2 L3 round 1 fixes (1112-44)
+from datetime import datetime   # noqa: E402  (this section is the L3 round 1 fixes; the import rides with it)
+
+READER_KEYS = {"repo", "since", "main_ref", "main_commits", "main_records", "chain_refs", "chain_commits", "branches", "refs",
+               "merged", "unattributed", "diverged", "matched_by_key"}
+
+
+def _iso_to_epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _no_reflog_witness(w: World) -> None:
+    (w.w / ".git" / "logs" / "refs" / "remotes" / "origin" / "main").unlink(missing_ok=True)
+
+
+# ------------------------------------------------------------------------------------------------ 1. a reverted close
+def _revert_head(world: World, n: int) -> None:
+    for i in range(n):
+        git(world.w, "revert", "--no-edit", "HEAD", date=f"2026-11-12T{14 + i}:00:00Z")
+
+
+@pytest.mark.parametrize("reverts, in_effect", [(0, True), (1, False), (2, True), (3, False), (4, True)])
+def test_a_closing_commit_closes_only_while_its_last_revert_is_itself_reverted(world, reverts, in_effect):
+    """codex 1: C closes levain#1; `git revert C` takes the close back; a revert of that revert puts it back; and so on."""
+    c = world.commit("close it", trailers=("Board-Item: levain#1", "Board-Closes: levain#1"))
+    _revert_head(world, reverts)
+    world.push_main()
+    ev, _ = read(world)
+    assert [(r["sha"], r["items"], r["closes"]) for r in ev["main"]] == ([(c, ["levain#1"], ["levain#1"])] if in_effect else [])
+
+
+def test_a_revert_only_takes_back_the_commit_it_names(world):
+    keep = world.commit("keep", trailers=("Board-Closes: levain#2",))
+    gone = world.commit("gone", trailers=("Board-Closes: levain#1",))
+    _revert_head(world, 1)
+    world.push_main()
+    assert [r["sha"] for r in read(world)[0]["main"]] == [keep] and gone != keep
+
+
+# ------------------------------------------------------------------------------------------------ 2. one ref snapshot
+def _advance_ref_after_log(monkeypatch, nth: int, ref: str, to: str) -> None:
+    """The race of a concurrent `git fetch`: after the reader's ``nth`` `git log`, ``ref`` is moved to ``to``."""
+    real = be._git
+    calls = {"log": 0}
+
+    def hook(repo, *args, **kw):
+        out = real(repo, *args, **kw)
+        if args[:1] == ("log",):
+            calls["log"] += 1
+            if calls["log"] == nth:
+                git(repo, "update-ref", ref, to)
+        return out
+
+    monkeypatch.setattr(be, "_git", hook)
+
+
+def test_a_fetch_that_moves_origin_main_between_the_reads_cannot_hide_a_branchs_work(world, monkeypatch):
+    """complement 2 / codex 3: main was read at M0; a fetch moves it onto the branch's tip; the branch log then excluded it."""
+    name = "seat/1112-40-i7-a"
+    world.branch(name)
+    b = world.commit("own", trailers=("Board-Item: levain#7",), file="own.txt")
+    world.push(name)
+    _advance_ref_after_log(monkeypatch, 1, "refs/remotes/origin/main", b)
+    assert branch(read(world)[0], name)["ahead"] == 1
+
+
+def test_a_fetch_that_moves_a_queue_ref_between_the_reads_cannot_hide_a_branchs_work(world, monkeypatch):
+    name = "seat/1112-40-i7-a"
+    world.branch("queue/a/one")
+    world.commit("q1", trailers=("Board-Item: levain#1",), file="q.txt")
+    world.push("queue/a/one")
+    world.branch(name, "queue/a/one")
+    b = world.commit("own", trailers=("Board-Item: levain#7",), file="own.txt")
+    world.push(name)
+    _advance_ref_after_log(monkeypatch, 2, "refs/remotes/origin/queue/a/one", b)       # after the chain log, before the branch log
+    assert branch(read(world)[0], name)["ahead"] == 1
+
+
+def test_a_ref_that_moves_before_the_snapshot_is_simply_the_snapshot(world, monkeypatch):
+    """No log has run yet: the move is not a race, it is the state the reader reads (and reads whole)."""
+    name = "seat/1112-40-i7-a"
+    world.branch(name)
+    b = world.commit("own", trailers=("Board-Item: levain#7",), file="own.txt")
+    world.push(name)
+    git(world.w, "update-ref", "refs/remotes/origin/main", b)
+    assert [b["name"] for b in read(world)[0]["branches"]] == [name] and branch(read(world)[0], name)["ahead"] == 0
+
+
+# ------------------------------------------------------------------------------------------------ 3. the freshness witness
+def test_a_fetch_inside_a_linked_worktree_is_the_witness_even_when_the_common_dir_has_none(world, tmp_path):
+    """complement 1: git writes FETCH_HEAD to the per-worktree git dir; a quiet main read permanently stale."""
+    wt = world.linked_worktree(tmp_path / "wt")
+    (world.w / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+    _no_reflog_witness(world)
+    git(wt, "fetch", "-q", "origin")
+    assert not (world.w / ".git" / "FETCH_HEAD").exists() and (world.w / ".git" / "worktrees" / "wt" / "FETCH_HEAD").is_file()
+    ev, _ = be.read_git_evidence(wt, repo_name="levain", since=SINCE)
+    assert ev["fetched_at"].endswith("Z") and ev["unreadable"] == {}
+
+
+@pytest.mark.parametrize("worktree_newer", [True, False])
+def test_the_newer_of_the_two_fetch_heads_is_the_witness(world, tmp_path, worktree_newer):
+    wt = world.linked_worktree(tmp_path / "wt")
+    _no_reflog_witness(world)
+    git(wt, "fetch", "-q", "origin")
+    common, own = world.w / ".git" / "FETCH_HEAD", world.w / ".git" / "worktrees" / "wt" / "FETCH_HEAD"
+    old, new = "2026-11-12T10:00:00Z", "2026-11-12T11:00:00Z"
+    for path, iso in ((own, new if worktree_newer else old), (common, old if worktree_newer else new)):
+        os.utime(path, (_iso_to_epoch(iso),) * 2)
+    ev, _ = be.read_git_evidence(wt, repo_name="levain", since=SINCE)
+    assert ev["fetched_at"] == new
+
+
+def test_a_fetch_from_another_remote_does_not_stamp_origin_main_fresh(world, tmp_path):
+    """complement 1 / codex 2: `git fetch upstream main` writes a line that also says `branch 'main' of`, of another url."""
+    world.second_remote("upstream", tmp_path / "upstream.git")
+    (world.w / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+    _no_reflog_witness(world)
+    git(world.w, "fetch", "-q", "upstream", "main")
+    text = (world.w / ".git" / "FETCH_HEAD").read_text()
+    assert "branch 'main' of" in text and "upstream" in text            # the premise: the old reader would have accepted it
+    ev, _ = read(world)
+    assert "fetched_at" not in ev
+
+
+def test_a_fetch_head_that_carries_both_remotes_counts_for_the_origin_line(world, tmp_path):
+    world.second_remote("upstream", tmp_path / "upstream.git")
+    _no_reflog_witness(world)
+    git(world.w, "fetch", "-q", "--all")                                  # one FETCH_HEAD, lines for both urls
+    text = (world.w / ".git" / "FETCH_HEAD").read_text()
+    assert "origin" in text and "upstream" in text
+    assert read(world)[0]["fetched_at"].endswith("Z")
+
+
+@pytest.mark.parametrize("url_form", ["trailing-slash", "file-scheme"])
+def test_the_origin_url_matches_however_git_prints_it(world, tmp_path, url_form):
+    origin = str(world.origin)
+    git(world.w, "remote", "set-url", "origin", origin + "/" if url_form == "trailing-slash" else f"file://{origin}")
+    (world.w / ".git" / "FETCH_HEAD").unlink(missing_ok=True)
+    _no_reflog_witness(world)
+    git(world.w, "fetch", "-q", "origin")
+    assert "branch 'main' of" in (world.w / ".git" / "FETCH_HEAD").read_text()
+    assert read(world)[0]["fetched_at"].endswith("Z")
+
+
+def test_fetch_head_is_read_through_one_open_file_not_by_path_twice(world, monkeypatch):
+    """codex 6: text and mtime from two path lookups can come from two different files. Pin the single descriptor."""
+    real_stat, real_read = Path.stat, Path.read_text
+
+    def no_stat(self, *a, **kw):
+        assert self.name != "FETCH_HEAD", "FETCH_HEAD stat'd by path"
+        return real_stat(self, *a, **kw)
+
+    def no_read(self, *a, **kw):
+        assert self.name != "FETCH_HEAD", "FETCH_HEAD read by path"
+        return real_read(self, *a, **kw)
+
+    _no_reflog_witness(world)
+    monkeypatch.setattr(Path, "stat", no_stat)
+    monkeypatch.setattr(Path, "read_text", no_read)
+    assert read(world)[0]["fetched_at"].endswith("Z")
+
+
+def test_an_absurd_mtime_is_an_absent_witness_not_a_traceback(world, monkeypatch):
+    """deepseek LOW-2: `datetime.fromtimestamp` of a year past 9999 raises OverflowError/ValueError."""
+    url = git(world.w, "remote", "get-url", "origin").removesuffix(".git")
+    line = f"{'a' * 40}\t\tbranch 'main' of {url}\n"
+    _no_reflog_witness(world)
+    for absurd in (1e18, 2.0 ** 40, float("inf"), float("nan"), -1e18):
+        monkeypatch.setattr(be, "_read_stamped", lambda path, a=absurd: (line, a))
+        ev, _ = read(world)
+        assert "fetched_at" not in ev and ev["unreadable"] == {}, absurd
+
+
+def test_a_far_future_mtime_on_disk_never_raises(world):
+    _no_reflog_witness(world)
+    fh = world.w / ".git" / "FETCH_HEAD"
+    try:
+        os.utime(fh, (_iso_to_epoch("2900-01-01T00:00:00Z"),) * 2)
+    except (OSError, OverflowError, ValueError):
+        pytest.skip("this filesystem refuses a far-future mtime")
+    ev, _ = read(world)
+    assert "unreadable" in ev and ev["unreadable"] == {}                # a stamp (the board calls it future) or none; never a traceback
+
+
+# ------------------------------------------------------------------------------------------------ 4. a failure board's reader
+def _whole(summary: dict) -> None:
+    assert set(summary) == READER_KEYS, set(summary) ^ READER_KEYS
+    for k in READER_KEYS - {"repo", "since", "main_ref", "diverged"}:
+        assert summary[k] == 0, k
+    assert summary["diverged"] == []
+
+
+def test_a_successful_read_carries_every_reader_field(world):
+    assert set(read(world)[1]) == READER_KEYS
+
+
+def test_an_invalid_since_still_carries_every_reader_field(world):
+    _, summary = be.read_git_evidence(world.w, repo_name="levain", since="last week")
+    _whole(summary)
+    assert summary["since"] == "last week" and summary["main_ref"] == "origin/main" and summary["repo"] == "levain"
+
+
+def test_a_missing_main_ref_still_carries_every_reader_field(tmp_path):
+    w = World(tmp_path)
+    w.commit("root", date=OLD)
+    _, summary = be.read_git_evidence(w.w, repo_name="levain", since=SINCE)
+    _whole(summary)
+
+
+def test_a_path_that_is_not_a_repository_still_carries_every_reader_field(tmp_path):
+    _, summary = be.read_git_evidence(tmp_path / "nowhere", repo_name="levain", since=SINCE)
+    _whole(summary)
+
+
+def test_a_shallow_clone_still_carries_every_reader_field(world, tmp_path):
+    world.commit("w1")
+    world.commit("w2")
+    world.push_main()
+    clone = world.clone(tmp_path / "shallow", "--depth", "1")
+    _, summary = be.read_git_evidence(clone, repo_name="levain", since=SINCE)
+    _whole(summary)
+
+
+def test_a_partial_clone_still_carries_every_reader_field(world, tmp_path):
+    git(world.origin, "config", "uploadpack.allowFilter", "true")
+    git(world.origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+    world.commit("w1", file="a.txt", body="alpha\n")
+    world.push_main()
+    clone = world.clone(tmp_path / "partial", "--filter=blob:none", "--no-checkout")
+    _, summary = be.read_git_evidence(clone, repo_name="levain", since=SINCE)
+    _whole(summary)
+
+
+def test_a_main_that_cannot_be_read_inside_the_run_still_carries_every_reader_field(world, monkeypatch):
+    monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 1)
+    world.commit("w1")
+    world.push_main()
+    ev, summary = read(world)
+    assert "main" in ev["unreadable"]
+    assert set(summary) == READER_KEYS
+
+
+# ------------------------------------------------------------------------------------------------ 5. a cut main history
+def test_a_history_longer_than_the_cap_is_unreadable_even_when_the_older_commits_are_old(world, monkeypatch):
+    """The date of what was read can never prove the log complete: the cap alone decides."""
+    monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
+    world.commit("old2", date=OLD)
+    world.commit("old3", date=OLD)
+    world.commit("new", trailers=("Board-Item: levain#1",))
+    world.push_main()                                    # root, old2, old3, new: 4 commits, the cap is 3
+    ev, _ = read(world)
+    assert "more than 3 commits" in ev["unreadable"]["main"] and "main" not in ev
+    assert {"chain", "branches", "unattributed"} <= set(ev["unreadable"])
+
+
+def test_one_commit_with_a_wrong_clock_cannot_make_a_cut_history_look_whole(world, monkeypatch):
+    """codex 5 / deepseek MED-1: the skewed commit is inside the 3 newest, so `min(ts) < window` called the cut log complete."""
+    monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
+    world.commit("the close, past the cap", trailers=("Board-Closes: levain#1",))
+    world.commit("skewed", date=OLD)
+    world.commit("w2")
+    world.commit("w3")
+    world.push_main()
+    ev, _ = read(world)
+    assert "more than 3 commits" in ev["unreadable"]["main"] and "main" not in ev
+
+
+def test_a_history_of_exactly_the_cap_is_whole(world, monkeypatch):
+    monkeypatch.setattr(be, "MAX_MAIN_COMMITS", 3)
+    world.commit("a", trailers=("Board-Item: levain#1",))
+    world.commit("b", trailers=("Board-Item: levain#2",))
+    world.push_main()                                    # root + 2 = exactly 3: nothing is cut off
+    ev, _ = read(world)
+    assert ev["unreadable"] == {} and sorted(i for r in ev["main"] for i in r["items"]) == ["levain#1", "levain#2"]
+
+
+def _toggle_world(world: World):
+    """root(t.txt=base) -> M0 (adds X) -> F (removes X) -> branch b (adds X again, the same patch as M0) / M1 on main."""
+    (world.w / "t.txt").write_text("base\n")
+    git(world.w, "add", "-A")
+    git(world.w, "commit", "-q", "-m", "base", date=OLD)
+    git(world.w, "push", "-q", "origin", "main")
+    world.commit_raw("m0 adds X", file="t.txt", body="base\nX\n", date="2026-11-12T10:00:00Z")
+    fork = world.commit_raw("f removes X", file="t.txt", body="base\n", date="2026-11-12T11:00:00Z")
+    world.commit("m1", date="2026-11-12T13:00:00Z")
+    world.push_main()
+    git(world.w, "checkout", "-q", "-B", "seat/1112-40-i7-a", fork)
+    world.commit_raw("b adds X again\n\nBoard-Item: levain#7", file="t.txt", body="base\nX\n", date="2026-11-12T12:00:00Z")
+    world.push("seat/1112-40-i7-a")
+    git(world.w, "checkout", "-q", "main")
+    return fork
+
+
+def test_the_toggle_world_reads_ahead_one_when_main_is_whole(world):
+    """The control for the next test: M0's patch is the same as the branch's, but M0 is behind the fork."""
+    _toggle_world(world)
+    ev, _ = read(world)
+    assert branch(ev, "seat/1112-40-i7-a")["ahead"] == 1 and ev["unreadable"] == {}
+
+
+def test_a_fork_point_main_does_not_hold_marks_the_branches_unreadable_not_the_whole_pool(world, monkeypatch):
+    """deepseek MED-1: main's log lost the fork commit F (it is truncated, or F is mis-dated), so the boundary is empty and
+    the pool would be everything: the older M0, which carries the branch's patch, would read the branch as landed."""
+    fork = _toggle_world(world)
+    real = be._log
+    calls = {"n": 0}
+
+    def cut(repo, revs, **kw):
+        out = real(repo, revs, **kw)
+        calls["n"] += 1
+        if calls["n"] == 1:                              # the main log
+            out.pop(fork)
+        return out
+
+    monkeypatch.setattr(be, "_log", cut)
+    ev, _ = read(world)
+    assert {"chain", "branches", "unattributed"} <= set(ev["unreadable"]) and "main" not in ev["unreadable"]
+    assert "branches" not in ev
+
+
+def test_a_branch_with_no_history_in_common_with_main_still_reads(world):
+    """The empty boundary that is TRUE (an orphan root): the pool is everything, and that is right. Not an error."""
+    git(world.w, "checkout", "-q", "--orphan", "seat/1112-40-i7-a")
+    git(world.w, "rm", "-rfq", ".")
+    world.commit("own root", trailers=("Board-Item: levain#7",), file="own.txt")
+    world.push("seat/1112-40-i7-a")
+    ev, _ = read(world)
+    assert ev["unreadable"] == {} and branch(ev, "seat/1112-40-i7-a")["ahead"] == 1
+
+
+def test_a_queue_ref_that_moves_after_the_snapshot_is_not_read_as_merged(world, monkeypatch):
+    """The snapshot's sha is the truth: a ref `for-each-ref --merged` finds merged only because a fetch moved it since is
+    not merged, and its unlanded commit stays on the chain."""
+    world.branch("queue/a/one")
+    world.commit("q1", trailers=("Board-Item: levain#1",), file="q.txt")
+    world.push("queue/a/one")
+    real = be._git
+
+    def hook(repo, *args, **kw):
+        if args[:1] == ("for-each-ref",) and any(a.startswith("--merged=") for a in args):
+            git(repo, "update-ref", "refs/remotes/origin/queue/a/one", git(repo, "rev-parse", "refs/remotes/origin/main"))
+        return real(repo, *args, **kw)
+
+    monkeypatch.setattr(be, "_git", hook)
+    ev, _ = read(world)
+    assert [r["ref"] for r in ev["chain"]] == ["queue/a/one"] and "queue/a/one" not in ev["merged"]
+
+
+def test_a_revert_dated_before_its_target_still_takes_it_back(world):
+    """`git log` order is not parent-after-child under clock skew: the closing commit can be listed BEFORE the revert that
+    takes it back, so the effect must not depend on the order of the log."""
+    c = world.commit("close it", trailers=("Board-Item: levain#1", "Board-Closes: levain#1"), date="2026-11-12T12:00:00Z")
+    world.commit("x", date="2026-11-12T13:00:00Z")
+    git(world.w, "checkout", "-q", "-b", "side", c)
+    git(world.w, "revert", "--no-edit", c, date="2026-11-12T11:00:00Z")           # dated BEFORE the commit it reverts
+    git(world.w, "checkout", "-q", "main")
+    git(world.w, "merge", "-q", "--no-ff", "-m", "merge side", "side", date="2026-11-12T14:00:00Z")
+    world.push_main()
+    assert read(world)[0]["main"] == []
+
+
+def test_a_chain_ref_whose_fork_point_main_does_not_hold_marks_the_chain_unreadable(world, monkeypatch):
+    """The same guard on a queue ref (deepseek MED-1 names chain/branches/unattributed): main's log lost the fork commit."""
+    fork = world.commit("fork point", date="2026-11-12T10:00:00Z")
+    world.push_main()
+    world.branch("queue/a/one", "origin/main")
+    world.commit("c1", trailers=("Board-Item: levain#1",), file="c.txt", date="2026-11-12T11:00:00Z")
+    world.push("queue/a/one")
+    real = be._log
+    calls = {"n": 0}
+
+    def cut(repo, revs, **kw):
+        out = real(repo, revs, **kw)
+        calls["n"] += 1
+        if calls["n"] == 1:                              # the main log
+            out.pop(fork)
+        return out
+
+    monkeypatch.setattr(be, "_log", cut)
+    ev, _ = read(world)
+    assert {"chain", "branches", "unattributed"} <= set(ev["unreadable"]) and "chain" not in ev
+    assert "main" in ev and "main" not in ev["unreadable"]

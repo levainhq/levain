@@ -10,7 +10,8 @@ file (or an explicit ``--evidence-extra``/``--now``) is unreadable or unusable. 
 every source it feeds reads unreadable, every item reads unknown, the audit says so, exit 3.
 
 The JSON is the board (``schema``, ``as_of``, ``items``, ``audit``, ``unattributed``, ``problems``) plus one additive key,
-``reader``: ``{repo, since, main_ref, <counts>}``, for a human checking what was read.
+``reader``: ``{repo, since, main_ref, <counts>}`` (every field on every path, a failure board included), for a human
+checking what was read. ``--evidence-extra`` may carry only :data:`EXTRA_KEYS`; anything else is exit 2.
 """
 from __future__ import annotations
 
@@ -25,12 +26,14 @@ from typing import Any
 from levain.desk import board_evidence as be
 from levain.desk.board_state import Evidence, derive_all, fold, parse_timestamp
 
-__all__ = ["ITEMS_ENV", "READ_BY_CLI", "register", "run_state"]
+__all__ = ["EXTRA_KEYS", "ITEMS_ENV", "READ_BY_CLI", "register", "run_state"]
 
 ITEMS_ENV = "LEVAIN_BOARD_ITEMS"
 #: Sources this CLI reads from git (or by stat). An extra object may not name them: two writers for one source is how
 #: a stale hand-made file would silently outvote git.
 READ_BY_CLI = ("fetched_at", "main", "chain", "refs", "merged", "branches", "unattributed")
+#: The keys an extra object may carry: the sources only FLOW can supply, the ones this process cannot stat, and the version.
+EXTRA_KEYS = ("evidence_v", "seats", "band", "waiters", "documents", "unreadable")
 EXIT_AUDIT = 3
 EXIT_USAGE = 2
 
@@ -66,12 +69,17 @@ def _fail(message: str) -> int:
 
 
 def _merge_extra(evidence: dict[str, Any], extra: Any) -> str | None:
-    """Fold the extra object into ``evidence``; the reason it cannot be used, or None."""
+    """Fold the extra object into ``evidence``; the reason it cannot be used, or None. Only the keys flow supplies are
+    accepted (``EXTRA_KEYS``): an unknown key would land in the evidence object unexamined, and a reason that is not a
+    string would crash whatever reads it later."""
     if not isinstance(extra, dict):
         return "the extra evidence must be a JSON object"
     clash = sorted(k for k in extra if k in READ_BY_CLI)
     if clash:
         return f"the extra evidence names {', '.join(clash)}, which this command reads itself"
+    unknown = sorted(str(k) for k in extra if k not in EXTRA_KEYS)
+    if unknown:
+        return f"the extra evidence names {', '.join(unknown)}, which flow does not supply (the keys are {', '.join(EXTRA_KEYS)})"
     for key, value in extra.items():
         if key == "evidence_v":
             if value != 1:
@@ -80,6 +88,10 @@ def _merge_extra(evidence: dict[str, Any], extra: Any) -> str | None:
             if not isinstance(value, dict):
                 return "the extra unreadable must be an object of source to reason"
             for src, why in value.items():
+                if src in READ_BY_CLI:                  # the nested form of the clash above: a stale file must not outvote git
+                    return f"the extra unreadable names {src}, which this command reads itself"
+                if not isinstance(why, str) or not why.strip():
+                    return f"the extra unreadable[{src}] must be a string that says why"
                 evidence["unreadable"].setdefault(src, why)
         elif key == "documents":
             if not isinstance(value, dict):

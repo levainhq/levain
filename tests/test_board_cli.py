@@ -274,3 +274,57 @@ def test_a_shallow_checkout_is_a_board_of_unknowns_and_exit_three(world, tmp_pat
     doc = json.loads(out)
     assert rc == 3 and set(states(doc).values()) == {"unknown"}
     assert any("shallow clone" in p for p in doc["problems"])
+
+
+# ================================================================================================ B2 L3 round 1 fixes (1112-44)
+def test_a_closing_commit_that_was_later_reverted_leaves_the_item_open(world, tmp_path, capsys):
+    """codex 1, end to end: the item read `done` while its closing work had been taken back."""
+    world.commit("land one", trailers=("Board-Item: levain#1", "Board-Closes: levain#1"))
+    world.push_main()
+    items, extra = write_items(tmp_path, item(1)), extra_file(tmp_path)
+    assert states(board(capsys, world, items, extra)[1]) == {"levain#1": "done"}
+    git(world.w, "revert", "--no-edit", "HEAD", date="2026-11-12T14:00:00Z")
+    world.push_main()
+    assert states(board(capsys, world, items, extra)[1]) == {"levain#1": "ready"}
+    git(world.w, "revert", "--no-edit", "HEAD", date="2026-11-12T15:00:00Z")     # the revert of the revert: closed again
+    world.push_main()
+    assert states(board(capsys, world, items, extra)[1]) == {"levain#1": "done"}
+
+
+def test_a_failure_board_prints_the_whole_reader_key(world, tmp_path, capsys):
+    world.commit("w1")
+    world.push_main()
+    clone = world.clone(tmp_path / "shallow", "--depth", "1")
+    rc, out, _ = run(capsys, "--json", "--items", str(write_items(tmp_path, item(1))), "--evidence-extra",
+                     str(extra_file(tmp_path)), "--repo", str(clone), "--since", "2026-11-12T00:00:00Z", "--now", NOW)
+    reader = json.loads(out)["reader"]
+    assert rc == 3 and set(reader) == {"repo", "since", "main_ref", "main_commits", "main_records", "chain_refs", "chain_commits",
+                                       "branches", "refs", "merged", "unattributed", "diverged", "matched_by_key"}
+    assert reader["main_commits"] == 0 and reader["diverged"] == [] and reader["matched_by_key"] == 0
+
+
+@pytest.mark.parametrize("body, why", [
+    ('{"unreadable": {"seats": 42}}', "unreadable[seats] must be a string"),
+    ('{"unreadable": {"seats": null}}', "unreadable[seats] must be a string"),
+    ('{"unreadable": {"seats": ["x"]}}', "unreadable[seats] must be a string"),
+    ('{"unreadable": {"seats": "  "}}', "unreadable[seats] must be a string"),
+    ('{"unreadable": {"main": "stale"}}', "reads itself"),
+    ('{"unreadable": {"branches": "stale"}}', "reads itself"),
+    ('{"reader": "evil"}', "reader"),
+    ('{"surprise": 1}', "surprise"),
+    ('{"seats": [], "typo_band": {}}', "typo_band"),
+])
+def test_a_wrong_typed_or_unknown_extra_is_refused_with_a_clear_message(world, tmp_path, capsys, body, why):
+    """deepseek LOW-3 + codex 9: a non-string reason, an unknown key or an `unreadable` entry that names a source the CLI
+    reads itself never reaches Evidence.from_dict."""
+    p = tmp_path / "x.json"
+    p.write_text(body)
+    rc, out, err = run(capsys, "--json", "--items", str(write_items(tmp_path, item(3))), "--evidence-extra", str(p), "--repo", str(world.w))
+    assert rc == 2 and out == "" and why in err and "Traceback" not in err
+
+
+def test_the_keys_flow_supplies_are_still_accepted(world, tmp_path, capsys):
+    extra = extra_file(tmp_path, unreadable={"seats": "the roster could not be read"}, documents={"x.md": True}, evidence_v=1)
+    rc, doc, err = board(capsys, world, write_items(tmp_path, item(3)), extra)
+    assert rc == 3 and err == "" and states(doc) == {"levain#3": "unknown"}
+    assert any("seats unreadable: the roster could not be read" in p for p in doc["problems"])
