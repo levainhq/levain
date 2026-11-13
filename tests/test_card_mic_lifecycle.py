@@ -429,6 +429,17 @@ def test_the_word_table_keys_and_widths_match_the_js_table() -> None:
         assert " yet" not in words and "keyboard dictation key" not in words and "turned off" not in words, (name, words)
 
 
+def test_the_on_device_refusal_sentence_outside_the_table_loses_the_removed_claim() -> None:
+    """Red with: the processLocally refusal in the click handler (spoken through tell(), outside DICTATE_REASONS) telling the
+    operator the keyboard dictation key works (Dictate shows only on desktop browsers) or that dictation is 'off' in a way the
+    browser never said. The table scan above cannot see this sentence."""
+    js = MIC_JS.read_text()
+    line = next(ln for ln in js.splitlines() if "processLocally !== true" in ln and "tell(" in ln)
+    words = re.search(r'tell\("((?:[^"\\]|\\.)*)"\)', line).group(1)
+    assert "keyboard dictation key" not in words and " yet" not in words, words
+    assert words.endswith("so Dictate is off."), words
+
+
 LAST = "window.__srs[window.__srs.length - 1]"
 LAST_NOTE = "window.__notes[window.__notes.length - 1]"
 

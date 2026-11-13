@@ -462,7 +462,7 @@
         if (spoke) { spoke = false; say(""); }           // a new attempt: what Dictate last said is no longer true
         var r = new SR();
         r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
-        if (r.processLocally !== true) { tell("This browser will not keep dictation on this device, so it is off; the keyboard dictation key works."); return; }
+        if (r.processLocally !== true) { tell("This browser will not keep dictation on this device, so Dictate is off."); return; }
         r.onresult = function (ev) {
           if (rec !== r) return;
           var all = "", done = "";
