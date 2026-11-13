@@ -2589,8 +2589,9 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
     queue broker's group, mode 2750 (0750 only on macOS, where a new file takes the directory's group), so no other
     principal can create a file there. Exactly the old shape (the operator's, group levain-queue, mode 2770) works
     and warns; any other shape fails. The mode bits do not show an ACL, and none is read. The owner is the operator
-    the install record names (``policy/operator``), for every invoker; with no such record the row is neutral and says
-    so. No row before the isolation install. ``lstat``/``qbroker_gid``/``legacy_gid``/``uid``: a test's seams
+    the install record names (``policy/operator``), for every invoker. A record that is missing or malformed fails
+    the row (nobody can be named owner; the remedy is the isolation install again); a record this invoker cannot open
+    leaves the row neutral, with the reason in the detail. No row before the isolation install. ``lstat``/``qbroker_gid``/``legacy_gid``/``uid``: a test's seams
     (``uid`` is accepted for a caller's sake and does not change the row)."""
     name = "queue answers"
     if not hasattr(os, "getuid"):
@@ -2610,13 +2611,30 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
     from levain.slot import Refused
     from levain.slot.install_helper import parse_operator_record
 
+    rec_path = store / "policy" / "operator"
     try:
-        record = parse_operator_record((store / "policy" / "operator").read_bytes())
+        record = parse_operator_record(rec_path.read_bytes())
+    except PermissionError:
+        # This invoker cannot open the record (it is not world-readable): the row cannot judge from here. The detail
+        # always prints; a neutral row's hint does not.
+        return [CheckResult(name, True, f"not read: {rec_path} cannot be opened by this user, so the operator whose "
+                            "answers directory this is cannot be established from here. Run `levain doctor` as the "
+                            "operator or root.", neutral=True)]
     except (OSError, Refused) as exc:
-        why = "is missing" if isinstance(exc, FileNotFoundError) else "cannot be read"
-        return [CheckResult(name, True, f"not read: the operator record {store / 'policy' / 'operator'} {why}, so "
-                            "the operator whose answers directory this is cannot be established",
-                            "Run `levain upgrade`, then `levain doctor` again.", neutral=True)]
+        # No operator record: nobody can be named owner of the answers directory. `levain upgrade` refuses this state
+        # (and sends the person back here), so the remedy is the isolation install itself.
+        if isinstance(exc, FileNotFoundError):
+            what = "is missing, so the install has no operator record"
+        elif isinstance(exc, Refused):
+            what = "is not a valid operator record (it must name an operator who is not root)"
+        else:
+            what = f"cannot be read ({type(exc).__name__})"
+        helper = layout.install_helper_path(host)  # type: ignore[arg-type]
+        return [CheckResult(name, False, f"the operator record {rec_path} {what}, so no one can be named as owner of "
+                            "the answers directory", "The isolation install has to be run again: "
+                            f"`sudo {helper} setup --slots <N> --verifier-slots <M> --operator <you>` with the "
+                            "values of the first install (setup writes this record last; if the file exists but is "
+                            "malformed, no Levain verb can read past it, so remove it as root first).")]
     op_uid, op_name = int(record["uid"]), str(record["name"])  # type: ignore[call-overload]
     path = store / "queue" / "answers"
     try:
@@ -2647,7 +2665,7 @@ def _check_queue_answers(*, host: str | None = None, store: Path | None = None, 
                             "by its signature)", "Run `levain upgrade`.", warn=True)]
     return [CheckResult(name, False, f"{path} is not owner {op_name} (the operator), group _levain_qbroker, mode "
                         f"{'2750 (or 0750)' if host == 'darwin' else '2750'}, and not the old shape either: the queue "
-                        "broker may not be able to read your answers, or another principal can write them",
+                        "broker may not be able to read the operator's answers, or another principal can write them",
                         "Run `levain upgrade`.")]
 
 
