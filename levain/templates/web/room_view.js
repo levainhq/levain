@@ -248,11 +248,11 @@
   // still streaming) stays plain text, backticks and all.
   // The room's own replies (and only those) also get an inline pass over their non-code text, built as elements and never as
   // markup: **bold** (which may hold `code`) and `code`, each within one line. A marker with no partner on its line stays
-  // literal, a line longer than LONG_LINE is drawn plain (the pass is quadratic in a line's length), and nothing else is
-  // parsed (no links, no images, no HTML, no lists); the words of tools and of the operator get no inline pass at all.
-  // That small pass is the fallback: where the page carries the cockpit's reviewed markdown renderer (window.LevainMD, from
-  // dashboard_core.js) the room's replies are drawn by it instead (see drawMarkdown), and these functions draw them only when
-  // it is absent or declines.
+  // literal, a line longer than LONG_LINE is drawn plain, and nothing else is parsed (no links, no images, no HTML, no lists);
+  // the words of tools and of the operator get no inline pass at all.
+  // This small pass is the FALLBACK for the room's replies: where the page carries the cockpit's reviewed markdown renderer
+  // (window.LevainMD, from dashboard_core.js) a reply is drawn by it instead, with headings, lists, quotes and links (see
+  // drawMarkdown), and these functions draw it only when the renderer is absent, throws or declines.
   var LONG_LINE = 20000;
   // the words the Start desk control hands the signing sheet (the relay reads the first word and an optional shape)
   var DESK_WORDS = "/fanin broad";
@@ -320,8 +320,9 @@
   // The room's reply as markdown: headings, lists, quotes, code, links and emphasis drawn as elements by the cockpit's one
   // reviewed renderer, which sets every word with textContent, allow-lists link schemes and paints raw HTML as text. A body is
   // untrusted (the seat reads web pages), so nothing here may turn it into markup by any other route. Returns false, and draws
-  // nothing, when the page has no such renderer, when the document is not the renderer's own, when a line is past LONG_LINE (the
-  // same bound the small pass keeps, for the same reason) or when the renderer throws: the caller then draws the plain way.
+  // nothing, when the page has no such renderer, when the document is not the renderer's own, when a line is past LONG_LINE (a
+  // conservative bound, kept so one pasted blob cannot make the page build a huge tree: the renderer takes 7 ms on a 20,000-
+  // character line) or when the renderer throws: the caller then draws the plain way.
   function drawMarkdown(doc, node, text) {
     var md = root.LevainMD;
     if (!md || typeof md.renderMarkdown !== "function" || doc !== root.document) return false;
@@ -329,9 +330,26 @@
     for (var i = 0; i < lines.length; i++) if (lines[i].length > LONG_LINE) return false;
     var frag;
     try { frag = md.renderMarkdown(text); } catch (e) { return false; }
+    unwrapCockpitLinks(frag);
     node.appendChild(frag);
     node.className += " rv-md";
     return true;
+  }
+  // The renderer keeps a cockpit-relative link, and on the cockpit's own origin `/#write_token=X` is the page's token intake and
+  // `/sign/...` its signing pages: a link the seat wrote after reading a hostile page must not reach any of them. So only an
+  // http(s) or mailto link survives, and never one that resolves to this page's own origin; the rest (a relative path, a
+  // `//host`, a backslash form such as `\\host` or `/\host` that a browser reads as offsite, a fragment or a query) keeps its words
+  // and loses its anchor. The renderer itself is the byte-locked shared core, so the filter sits here, after it.
+  function unwrapCockpitLinks(frag) {
+    var as = frag.querySelectorAll("a");
+    for (var i = 0; i < as.length; i++) {
+      var a = as[i], h = (a.getAttribute("href") || "").replace(/^\s+|\s+$/g, "");
+      var mail = /^mailto:/i.test(h), web = /^https?:/i.test(h);
+      if (!mail && !(web && a.origin !== root.location.origin)) {
+        while (a.firstChild) a.parentNode.insertBefore(a.firstChild, a);
+        a.parentNode.removeChild(a);
+      }
+    }
   }
 
   // hooks: onMark(ref, delivered, note, done), onCommit(card, words, note, buttons), onDismiss(card, note, buttons); ui.open keyed by gseq

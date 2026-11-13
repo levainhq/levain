@@ -3016,7 +3016,7 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-md .md-code-i { padding: 0 var(--sp-1); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
 .rv .rv-md .md-pre { margin-top: var(--sp-2); font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); padding: var(--sp-3) var(--sp-4); background: var(--card); border: 1px solid var(--hair-2); border-radius: var(--r-sm); }
 .rv .rv-md .md-code-b { font: var(--fw-regular) var(--fs-micro)/1.5 var(--mono); color: var(--text); }
-.rv .rv-md .md-link { overflow-wrap: anywhere; }
+.rv .rv-md .md-link { overflow-wrap: anywhere; unicode-bidi: isolate; }          /* a bidi control in a seat's link text cannot reorder the words after it */
 .rv .rv-md .md-quote { color: var(--label); }
 
 /* The Room tab (dashboard_boot.js sets body.rv-on): the room owns the whole viewport below the app's own header and views strip. The deck
