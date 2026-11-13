@@ -73,7 +73,7 @@ def init():
     if mode == "wrong_cwd": cwd = os.path.dirname(cwd)
     pm = {{"dont_ask": "dontAsk", "bad_mode": "default"}}.get(mode, "bypassPermissions")
     out({{"type": "system", "subtype": "init", "cwd": cwd, "tools": tools, "mcp_servers": servers, "model": "fake-model",
-         "permissionMode": pm, "claude_code_version": "2.1.323"}})
+         "permissionMode": pm, "claude_code_version": {{"old_cc": "2.1.294"}}.get(mode, "2.1.323")}})
 def tool(tid, name, inp, body, decision):
     out({{"type": "assistant", "message": {{"role": "assistant", "content": [
         {{"type": "tool_use", "id": tid, "name": name, "input": inp}}]}}}})
@@ -461,7 +461,7 @@ def test_a_host_digest_needs_one_hook_sha_per_hook(world):
 # --- the probe, the tripwire context, the mode ------------------------------------------------------------------------
 BYPASS_INIT = {"permissionMode": BYPASS, "cwd": "/w", "tools": ["Bash", "Read", "Edit", "Write", "Glob", "TodoWrite",
                                                                "mcp__levain_room__propose_drop"],
-               "mcp_servers": [{"name": "levain_room", "status": "connected"}]}
+               "mcp_servers": [{"name": "levain_room", "status": "connected"}], "claude_code_version": "2.1.323"}
 
 
 def test_room_probe_takes_the_profile_and_judges_the_bypass_init(tmp_path):

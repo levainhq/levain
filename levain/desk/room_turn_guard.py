@@ -8,14 +8,18 @@ only, and a change to this file is a deliberate re-pin.
 
 PROVENANCE. A port of flow's ``scripts/room_turn_guard.py`` at flow commit e54ce5fc0 (2026-11-12), itself the Room-wording
 fork of flowConnect's ``server/chat_turn_guard.py`` (flowConnect commit 9857570, file sha256 55d9f08be102...). The code
-below this docstring is flow's, byte-for-byte, but for two changes, both levain's: (1) in REFUSAL, "tell Phill he can"
+below this docstring is flow's, byte-for-byte, but for three changes, all levain's: (1) in REFUSAL, "tell Phill he can"
 reads "tell the user they can" (levain is not one operator's); (2) ``main()`` DENIES a Bash call when deciding it
 raises (:data:`CRASH_REFUSAL`; L3 deploy r1, 1112-40 ROOMFIX4), where flow's guard lets the traceback out and the
 vendor treats that exit as a non-blocking error, so the Bash call ran unguarded. Here the guard is the room's one
-enforcement, so a crash must never become an allow for the one tool it exists for; any other tool still runs. FOR THE
-RE-SYNC OWNER: flowConnect's lane 6 (11-12) fixes bypasses in that guard; when it lands, this copy is owed a re-sync
-from flowConnect that keeps the "Room turn" refusal wording, the "user" change AND the crash-deny in ``main()``, then a
-new pin (:data:`levain.desk.room_default.ROOM_TURN_GUARD_SHA256`).
+enforcement, so a crash must never become an allow for the one tool it exists for; any other tool still runs.
+(3) ``main()`` DENIES an event it cannot read as a JSON object (:data:`PARSE_REFUSAL`; L3 deploy r2, 1112-40
+ROOMFIX6): any exception reading or parsing stdin (a deeply nested payload raises RecursionError), or a parsed value
+that is not an object, where flow's guard exits 0 (allow) or lets the traceback out. The tool name is unknown then,
+but the hook is loaded only for the tools in :data:`HOOK_MATCHER`, each one the guard exists for, so the deny can
+only fall on one of those. FOR THE RE-SYNC OWNER: flowConnect's lane 6 (11-12) fixes bypasses in that guard; when it
+lands, this copy is owed a re-sync from flowConnect that keeps the "Room turn" refusal wording, the "user" change, the
+crash-deny AND the parse-deny in ``main()``, then a new pin (:data:`levain.desk.room_default.ROOM_TURN_GUARD_SHA256`).
 
 What it refuses (flowConnect's rule, kept as written): work that cannot finish inside one chat turn. A Bash, Agent or
 Task call with ``run_in_background``; CronCreate, Monitor, Workflow and ScheduleWakeup; and a Bash command that,
@@ -23,8 +27,8 @@ scanned as shell tokens (quotes, comments, heredoc data and ``$((...))`` kept as
 lone ``&``, runs ``nohup``/``setsid``/``disown``, or runs one of the long review scripts named in ``_LONG_SCRIPTS``
 directly, through python, a wrapper, ``<shell> -c``, ``eval`` or a substitution. Those two names are flowConnect's
 own scripts and are kept so the port stays identical; for any other host they simply never match. It prints a deny
-decision and exits 2. A Bash call whose decision raises is denied the same way (levain's change 2 above). Anything
-else, including a payload it cannot parse as a JSON object, exits 0 (a hook crash must not brick the chat). SCOPE: a model's own slip, not deliberate evasion (tmux, at, launchctl, a script it wrote, a long foreground
+decision and exits 2. A Bash call whose decision raises is denied the same way (levain's change 2 above), and so is
+an event it cannot read as a JSON object (levain's change 3). Anything else exits 0. SCOPE: a model's own slip, not deliberate evasion (tmux, at, launchctl, a script it wrote, a long foreground
 command are not guarded).
 """
 import json
@@ -41,6 +45,11 @@ REFUSAL = (
 CRASH_REFUSAL = (
     "Refused: the room's turn guard could not check this Bash call ({error}), so it does not run. Try the command "
     "again written more simply; if it still fails, hand it to a seat or the desk."
+)
+# levain's (header, change 3): the reason for an event the guard could not read as a JSON object
+PARSE_REFUSAL = (
+    "Refused: the room's turn guard could not read this call ({error}), so it does not run. Try the call again; if it "
+    "still fails, hand the work to a seat or the desk."
 )
 
 _LATER_TOOLS = {"CronCreate", "Monitor", "Workflow", "ScheduleWakeup"}
@@ -322,18 +331,20 @@ def _fallback(command: str) -> str | None:
 
 
 def main() -> int:
-    try:
+    try:   # levain: an event it cannot read as a JSON object is denied, whatever reading it raised (header, change 3)
         event = json.load(sys.stdin)
-        if not isinstance(event, dict):
-            return 0
-    except (ValueError, OSError):
-        return 0
-    try:
-        reason = refusal_for(event)
-    except Exception as exc:   # levain: a crash deciding a Bash call denies it (header, change 2); other tools run
-        if event.get("tool_name") != "Bash":
-            return 0
-        reason = CRASH_REFUSAL.format(error=type(exc).__name__)
+        unread = None if isinstance(event, dict) else "a JSON " + type(event).__name__ + ", not an object"
+    except Exception as exc:
+        event, unread = None, type(exc).__name__
+    if unread is not None:
+        reason = PARSE_REFUSAL.format(error=unread)
+    else:
+        try:
+            reason = refusal_for(event)
+        except Exception as exc:   # levain: a crash deciding a Bash call denies it (header, change 2); other tools run
+            if event.get("tool_name") != "Bash":
+                return 0
+            reason = CRASH_REFUSAL.format(error=type(exc).__name__)
     if reason is None:
         return 0
     sys.stdout.write(json.dumps({"hookSpecificOutput": {
