@@ -29,7 +29,8 @@ from typing import Any, NamedTuple
 from levain import pathid
 
 __all__ = [
-    "CONTROL_REPLIES", "MODE", "MODE_ALLOWED_SHAPE", "TRIPWIRES", "UNPARSEABLE", "ControlReply", "Trip",
+    "CONTROL_REPLIES", "MODE", "MODE_ALLOWED_SHAPE", "OPEN_REASONS", "OPEN_SOURCES", "TRIPWIRES", "UNPARSEABLE",
+    "ControlReply", "Trip",
     "TripwireContext", "TripwireWindow", "control_line", "launch_roots", "mode_trip", "read_exempt",
     "read_target_within", "reported_mode_trip",
 ]
@@ -53,6 +54,11 @@ CONTROL = "control:"
 UNPARSEABLE = "unparseable:"
 MODE = "mode:"
 _APPROVAL = "can_use_tool"
+# a host room's (``TripwireContext.open_tools``) expected accept: decided by the argv's own config or the operator's
+# user allow list, by rule or by mode. The session's own source is NOT in it: a grant made inside the session is not
+# a decision the launch's argv rendered
+OPEN_SOURCES = frozenset(("config", "user_permanent"))
+OPEN_REASONS = frozenset(("rule", "mode"))
 
 
 class TripwireContext(NamedTuple):
@@ -69,11 +75,20 @@ class TripwireContext(NamedTuple):
     the launch's own argv: its ``accept`` decisions of reason ``rule`` from a listed source are expected (no
     ``unexpected_rule``), and no PreToolUse count is owed for those or for a deny (the stream carries no PreToolUse
     event, so a count could never be met). Every other decision for it owes the count and so latches as a ``deficit``;
-    every other tool is judged as a worker's is."""
+    every other tool is judged as a worker's is.
+
+    ``open_tools`` is a host room's: its tool set is the vendor's own under ``bypassPermissions``, so no tool can be
+    named ahead of time, and every accepted call arrives as ``accept`` / ``config`` / ``mode`` with no PreToolUse event
+    in the stream. When it is exactly ``True``, an ``accept`` of reason ``rule`` or ``mode`` from source ``config`` or
+    ``user_permanent`` is expected for ANY tool, and so is a deny (see :data:`OPEN_SOURCES`, :data:`OPEN_REASONS`).
+    Nothing else changes: an accept from any other source or reason, a hook that decided after its host request was
+    cancelled, a control request, a turn boundary with a call open and a gap read latch as they always do. ``False``
+    (the default) leaves every decision judged as it was before the field existed."""
     cwd: str
     expected_pre_hooks: Callable[[str], int]
     gate_allowed: Callable[[str, Any], bool]
     rule_allow: frozenset = frozenset()
+    open_tools: bool = False
 
 
 class Trip(NamedTuple):
@@ -289,6 +304,8 @@ class TripwireWindow:
             return None                                   # a deny is never refused
         if decision != "accept":
             return Trip("accepted_without_host", f"a {tool[:60]} tool_result with decision {str(decision)[:40]!r}")
+        if self._open_accept(d):
+            return None                                   # a host room's own config or user rule/mode answered
         if reason == "rule":
             if self.ctx is not None and isinstance(source, str) and (tool, source) in self.ctx.rule_allow:
                 return None                               # the room's own allow list answered, as its argv says
@@ -307,14 +324,31 @@ class TripwireWindow:
         """No PreToolUse count is owed for this result: ``tool`` is in the room's ``rule_allow`` AND the decision is an
         ``accept`` of reason ``rule`` from a source listed for it, or a deny. Any other decision for a listed tool owes
         the count, which the room never meets, so it latches as a ``deficit`` before any later branch is read
-        (L3_rme_r1 complement 6: a skip decided by the tool alone left those shapes to the branches after it)."""
-        if self.ctx is None or not isinstance(d, Mapping) or not any(t == tool for t, _s in self.ctx.rule_allow):
+        (L3_rme_r1 complement 6: a skip decided by the tool alone left those shapes to the branches after it).
+        A context with ``open_tools`` names no tool: for it the same skip holds for ANY tool, on a deny or on an
+        expected accept (:meth:`_open_accept`), and every other decision owes the count as before."""
+        if self.ctx is None or not isinstance(d, Mapping):
+            return False
+        if self.ctx.open_tools is True:
+            # a host room names no tool ahead of time: a deny, or an expected accept (:meth:`_open_accept`), of ANY tool
+            return d.get("decision") == "reject" or self._open_accept(d)
+        if not any(t == tool for t, _s in self.ctx.rule_allow):
             return False
         if d.get("decision") == "reject":
             return True
         source = d.get("source")
         return d.get("decision") == "accept" and d.get("reason_type") == "rule" and isinstance(source, str) \
             and (tool, source) in self.ctx.rule_allow
+
+    def _open_accept(self, d: Any) -> bool:
+        """A host room's expected accept: ``open_tools`` is exactly True and the decision is an ``accept`` of a reason in
+        :data:`OPEN_REASONS` from a source in :data:`OPEN_SOURCES`. A source or reason that is not a string (an
+        unhashable report included) is never one."""
+        if self.ctx is None or self.ctx.open_tools is not True or not isinstance(d, Mapping):
+            return False
+        source, reason = d.get("source"), d.get("reason_type")
+        return d.get("decision") == "accept" and isinstance(source, str) and source in OPEN_SOURCES \
+            and isinstance(reason, str) and reason in OPEN_REASONS
 
     def _deficit(self, tool: str) -> Trip | None:
         if self.ctx is None:
