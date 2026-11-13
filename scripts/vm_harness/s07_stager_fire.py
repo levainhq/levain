@@ -425,6 +425,10 @@ def guest_fire(repo: str, bundle_size: int, *, release: bool, sock: str | None =
     if world.exists():
         print(f"S07-FIRE refused=a fire world already exists at {world}: the server's authority replica is stale; reset it first")
         return 2
+    # Importing the `tests` tree below loads pytest, which makes this process a "test run" to levain.home_guard; the stager's
+    # policy read in launcher.spawn then refuses the implicit ~/.levain (RealHomeReached, seen at the 11-13 sitting). Naming
+    # LEVAIN_HOME explicitly to that SAME directory satisfies the guard and changes nothing about which policy is read.
+    os.environ.setdefault("LEVAIN_HOME", str(Path.home() / ".levain"))
     from levain.agents import session_client as C
     from levain.agents.role import add_role, parse_role
     from levain.agents.session import SessionLaunch
