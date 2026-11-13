@@ -5,7 +5,8 @@ survived as "open, jump, Allow".
 
 Reproduced red on fix 1 (821b81db2): after the one-step jump Allow was ENABLED, the line read "All 17,694 characters of
 the input shown: Allow is open.", and a click on that Allow signed (the sheet's actions were gone, signed).
-The gate now needs COVERAGE: the union of the views the block has shown must cover it whole, no gap. These drives never
+Fix 2 gated on COVERAGE (the union of the views the block had shown, no gap); fix 3 replaced that pixel arithmetic with
+chunks the browser reports shown (``test_consent_long_input_chunks_page.py``), and every drive here still holds. These never
 scroll on their own before an Allow assertion; every scroll is a step of the test's own, and a stepped scroll never moves
 more than the block's own height at a time (each step's size is returned and checked).
 
@@ -179,9 +180,10 @@ def test_a_scroll_to_the_end_in_steps_under_a_view_opens_allow_and_signs(tmp_pat
 
 @needs_browser
 @needs_ssh
-def test_a_reflow_while_open_starts_the_coverage_again(tmp_path, monkeypatch) -> None:
-    """A narrower window rewraps the text into a taller block: the old pixels are other characters now, so what was
-    covered before does not count for the new layout."""
+def test_a_reflow_while_open_keeps_what_was_shown_and_nothing_more(tmp_path, monkeypatch) -> None:
+    """A narrower window rewraps the text into a taller block (fix 3: coverage is the set of chunks the browser showed,
+    not pixels). What was shown before stays shown, because it really was; the rewrap shows nothing new beyond the one
+    view on screen, so the lower part stays counted and Allow shut."""
     rig = _ConsentRig(tmp_path, monkeypatch)
     rid = _attack(rig)
     with rig.serving():
@@ -198,8 +200,10 @@ def test_a_reflow_while_open_starts_the_coverage_again(tmp_path, monkeypatch) ->
     before, after = json.loads(v[5]), json.loads(v[6])
     assert before["unseen"] < 0.5 * before["total"], before
     assert after["sh"] > before["sh"], (before, after)                # taller
-    # only the view showing now counts: nearly the whole text is not shown again
-    assert after["unseen"] > 0.8 * after["total"] and after["allow"] is True and after["seen"] == "0", (before, after)
+    # the shown part is kept (the count does not go back up); at most the one view on screen now is added to it
+    view = after["ch"] / after["sh"] * after["total"]
+    assert before["unseen"] - view - 200 <= after["unseen"] <= before["unseen"], (before, after)
+    assert after["unseen"] > 0.3 * after["total"] and after["allow"] is True and after["seen"] == "0", (before, after)
 
 
 @needs_browser

@@ -428,88 +428,71 @@
   // without scrolling the whole text. Text up to LONG_AT code points is one block of class `cls`, as before: LONG_AT is the old
   // display cut, so an input that used to show whole still does and needs no gate. Counted in code points, so no cut splits a
   // surrogate pair.
-  // A long box keeps whether its whole text has been SEEN: opened, and every part of its block exposed in the block's view.
-  // Pages gate an Allow on it (seenGate): the head and the tail are a summary, and a payload in the middle of a long command
-  // must not be one tap from being allowed unopened, nor one jump to the end away (row 1704 fix 2: fix 1 latched on the
-  // scroll END, so dragging the scrollbar to the bottom, or the End key, enabled Allow over a middle never on screen).
-  // COVERAGE: each view [scrollTop, scrollTop + clientHeight] the block shows is sampled (on open, on every scroll event and
-  // on each animation frame while a scroll is moving) and joined into a union of exposed intervals; seen is the union
-  // covering the whole [0, scrollHeight] with no gap (gaps under COVER_SLACK px, scroll rounding, are joined). A jump leaves
-  // a gap, and Allow stays shut until the gap is scrolled back over. The count of what is not yet shown is the characters
-  // whose painted boxes reach into a gap (a line half in view counts as not shown), read from the layout, not estimated
-  // from the scroll fraction. A reflow (a new scrollHeight or width: a resize, a font arriving) moves the text under the
-  // pixels, so coverage starts again for the new layout until seen; once seen, a box stays seen. A block not laid out
-  // (clientHeight 0) records nothing: fails closed.
-  // THE LIMIT, said plainly: coverage proves the text was EXPOSED in the block's view, not that it was read. A view the
-  // browser paints but reports in no scroll event or sampled frame is not counted, so a fast fling that skips a band in
-  // one frame leaves a gap: that gap stays gated (counted as not shown), never counted as seen. The page's own script can
-  // set scrollTop; that is not a threat model here.
-  const LONG_AT = 2000, LONG_END = 400, COVER_SLACK = 2;
+  // A long box keeps whether its whole text has been SEEN: opened, and every part of it shown on screen. Pages gate an Allow
+  // on it (seenGate): the head and the tail are a summary, and a payload in the middle of a long command must not be one
+  // tap from being allowed unopened, nor one jump to the end away (row 1704 fix 2), nor made "seen" by a reflow (fix 3).
+  // HISTORY: fix 1 latched on the scroll END (a jump to the end enabled Allow); fix 2 kept a union of scroll-view pixel
+  // intervals per layout key scrollHeight x clientWidth, and a typography reflow that kept both numbers moved unshown
+  // characters into covered pixels. Each round re-derived from the page's own geometry what the BROWSER already knows.
+  // CHUNKS (fix 3): the whole text is laid out as inline chunks (spans of at most CHUNK_MAX code points and CHUNK_LINES line
+  // breaks; the text, its selection, copy and find-in-page are unchanged) and ONE IntersectionObserver, its root the
+  // viewport, is told about the chunks near the block's view (a second, coarse observer on runs of CHUNK_GROUP chunks
+  // inside the block says which runs are within a view of it: observing every chunk of a 256 KiB input measured about
+  // 22 ms a frame while scrolling, against about 17 with the coarse one, on a laptop; a run the coarse one never reports
+  // keeps its chunks not shown, so it fails closed). The browser reports, on each rendering update and through any
+  // reflow, font load or zoom, whether a chunk is inside every clip at once: the block's own scrollport, the page's viewport, any clipping
+  // ancestor and any outer frame. A chunk counts as SHOWN only when an entry reported it wholly inside (its
+  // intersectionRect is its boundingClientRect, within FULL_EPS px) AND, while so held, a hit test finds nothing in the page
+  // painted over it (document.elementFromPoint at two inset corners and the centre of each of its line boxes is the
+  // chunk: the sticky bar or a header over the block hides what is under it). Coverage is the SET of chunks shown, not
+  // pixels: a reflow cannot make a chunk shown, only showing it can. The count of what is not yet shown is the code points
+  // of the chunks not shown (exact, no layout read); seen is every chunk shown, and once seen a box stays seen.
+  // Fails closed: no IntersectionObserver or no elementFromPoint, nothing is ever shown (Deny stays open); a chunk the
+  // browser moved past between two rendering updates (a fast fling, the End key) gets no wholly-inside entry and stays
+  // not shown until it is scrolled back over; a chunk taller than the visible part of the block (a block narrowed to a
+  // few characters) can never be wholly inside and keeps Allow shut.
+  // THE LIMIT, said plainly: this proves each chunk was wholly shown in the browser's viewport, uncovered, at some moment;
+  // not that it was read. IntersectionObserver v2 (isVisible) would also see opacity and transforms, but is Chromium-only,
+  // so the hit test stands in for it everywhere; an overlay with pointer-events: none is invisible to a hit test, and the
+  // hit test samples three points per line box, so a cover over only another part of a line is missed. The page's own
+  // script can scroll the block; that is not a threat model here.
+  // a chunk is short (under half a line at phone width, so it lies on at most two lines unless a line around it is shorter
+  // still): one no taller than the overlap of two successive views is shown whole in one of them, so a scroll that keeps
+  // at least two lines of the last view in the next skips none
+  const LONG_AT = 2000, LONG_END = 400, CHUNK_MAX = 16, CHUNK_LINES = 2, CHUNK_GROUP = 64, FULL_EPS = 0.5;
   const count = (n) => Number(n).toLocaleString("en-US");
-  // the union of exposed intervals, kept sorted and merged (a gap under COVER_SLACK px is joined); returns whether it grew
-  function coverAdd(spans, a, b) {
-    const before = JSON.stringify(spans);
-    spans.push([a, b]);
-    spans.sort((x, y) => x[0] - y[0]);
+  // `cps` (code points) cut into chunks: [text, code points]; a cut never splits a code point
+  function chunksOf(cps) {
     const out = [];
-    for (const s of spans) {
-      const last = out[out.length - 1];
-      if (last && s[0] <= last[1] + COVER_SLACK) last[1] = Math.max(last[1], s[1]);
-      else out.push([s[0], s[1]]);
+    let cur = "", n = 0, lines = 0;
+    for (const c of cps) {
+      cur += c;
+      n += 1;
+      if (c === "\n") lines += 1;
+      if (n >= CHUNK_MAX || lines >= CHUNK_LINES) { out.push([cur, n]); cur = ""; n = 0; lines = 0; }
     }
-    spans.length = 0;
-    for (const s of out) spans.push(s);
-    return JSON.stringify(spans) !== before;
+    if (n) out.push([cur, n]);
+    return out;
   }
-  // the parts of [0, height] the union does not cover
-  function coverGaps(spans, height) {
-    const gaps = [];
-    let at = 0;
-    for (const [a, b] of spans) {
-      if (a > at + COVER_SLACK) gaps.push([at, a]);
-      at = Math.max(at, b);
+  // whether nothing in the page is painted over `el` now: every line box of it hit-tests to it, or to another chunk of
+  // the same block (line boxes can overlap their neighbours': that is the block's own text, not a cover), at its top-left
+  // and bottom-right corners (in by 1 px, and from each end by a quarter of a narrow box or 3 px) and its centre: a bar
+  // across the block (a sticky header or action bar) over any part of a line meets one of them. Three points, not more:
+  // a hit test in a block of thousands of lines is the gate's main cost per frame. A chunk with no line box wide enough
+  // to test (blank lines only) passes when its text is only white space.
+  function uncovered(el, pre) {
+    const doc = el.ownerDocument;
+    if (!doc || typeof doc.elementFromPoint !== "function") return false;
+    const own = (h) => h === el || (!!h && h.tagName === "SPAN" && h !== pre && pre.contains(h));
+    let tested = false;
+    for (const b of Array.from(el.getClientRects())) {
+      if (!(b.width > 2 && b.height > 2)) continue;
+      tested = true;
+      const k = Math.min(3, b.width / 4), l = b.left + k, r = b.right - k, t = b.top + 1, u = b.bottom - 1;
+      const pts = [[l, t], [(b.left + b.right) / 2, (b.top + b.bottom) / 2], [r, u]];
+      for (const [x, y] of pts) if (!own(doc.elementFromPoint(x, y))) return false;
     }
-    if (at < height - COVER_SLACK) gaps.push([at, height]);
-    return gaps;
-  }
-  // how many characters of `pre`'s text (one text node, `s`) have a painted box reaching into any of `gaps` (content px,
-  // 0 = the top of the block's scrolled content), read from the layout by a binary search over the text, which a
-  // wrapping pre lays out top to bottom. A character that paints no box (a newline) takes the next one's. Any doubt counts
-  // characters as NOT shown: a text that cannot be read from the layout is wholly not shown.
-  function uncoveredChars(pre, s, gaps) {
-    const tn = pre.firstChild;
-    const all = Array.from(s).length;
-    if (!gaps.length) return 0;
-    if (!tn || tn.nodeType !== 3 || tn.data !== s) return all;
-    const doc = pre.ownerDocument, r = doc.createRange(), n = s.length;
-    const base = pre.getBoundingClientRect().top + pre.clientTop - pre.scrollTop;
-    const box = (k) => {
-      for (let j = k; j < n && j < k + 16; j++) {
-        r.setStart(tn, j);
-        r.setEnd(tn, j + 1);
-        const b = r.getBoundingClientRect();
-        if (b.height > 0 || b.width > 0) return { top: b.top - base, bottom: b.bottom - base };
-      }
-      return null;
-    };
-    // the first index whose box passes `y` on `edge`; a character with no box is taken as passed (`low`) or not, whichever
-    // widens the range counted as not shown
-    const first = (y, edge, low) => {
-      let lo = 0, hi = n;
-      while (lo < hi) {
-        const m = (lo + hi) >> 1;
-        const b = box(m);
-        if (b === null ? low : b[edge] > y) hi = m; else lo = m + 1;
-      }
-      return lo;
-    };
-    let total = 0;
-    for (const [a, b] of gaps) {
-      const i = first(a, "bottom", true), j = first(b - 0.5, "top", false);
-      if (j > i) total += Array.from(s.slice(i, j)).length;
-    }
-    // a gap is never reported as nothing: one that falls between two lines' boxes still keeps Allow shut, so it counts one
-    return Math.min(all, Math.max(1, total));
+    return tested || !/\S/.test(el.textContent);
   }
   function longText(text, cls) {
     const s = String(text);
@@ -524,51 +507,98 @@
     box.appendChild(node("pre", with_("long-tail"), cps.slice(cps.length - LONG_END).join("")));
     const whole = node("details", "long-whole");
     whole.appendChild(node("summary", "", "Show the whole input (" + count(total) + " characters)"));
-    const full = node("pre", with_("long-full"), s);
+    const full = node("pre", with_("long-full"));
+    const parts = chunksOf(cps);
+    // the chunks in runs of CHUNK_GROUP (inline spans of class long-group), the coarse observer's targets
+    const pieces = root.document.createDocumentFragment(), groups = [];
+    const chunk = parts.map(([t], i) => {
+      if (i % CHUNK_GROUP === 0) groups.push(pieces.appendChild(node("span", "long-group")));
+      return groups[groups.length - 1].appendChild(node("span", "", t));
+    });
+    full.appendChild(pieces);
     full.tabIndex = 0;                                   // its own scroll: reachable by keyboard
     full.setAttribute("aria-label", "the whole input, " + count(total) + " characters");
     whole.appendChild(full);
-    // seen: latched once the union of the views the open block has shown covers it whole (see COVERAGE above). `spans` is
-    // that union for the layout `layout` names; `left` the characters not yet shown, as last read from the layout (before
-    // the block is first open: the middle, the part the head and the tail leave out)
-    let seen = false, spans = [], layout = "", left = middle;
+    // seen: latched once every chunk has been shown (see CHUNKS above). `shown[i]` chunk i was shown; `inside` the chunks the
+    // observer holds wholly inside now (shown or not: a covered one is tested again on the next scroll); `left` the code
+    // points not yet shown (before the block is first open: the middle, the part the head and the tail leave out)
+    const shown = new Uint8Array(parts.length), at = new Map(chunk.map((c, i) => [c, i])), inside = new Set();
+    let seen = false, left = middle, todo = parts.length, unshown = total, io = null, near = null, queued = false, first = true;
     box.dataset.seen = "0";
     box.dataset.unseen = String(middle);
     box.longState = () => ({ seen: seen, unseen: seen ? 0 : left, total: total });
-    const measure = () => {
-      if (!whole.open || seen) return;
-      const sh = full.scrollHeight, ch = full.clientHeight;
-      if (!(ch > 0)) return;                            // not laid out: nothing is on screen yet
-      const now = sh + "x" + full.clientWidth;
-      if (now !== layout) { layout = now; spans = []; }  // a reflow: the old pixels are other text now
-      const top = Math.max(0, full.scrollTop);
-      if (!coverAdd(spans, top, Math.min(sh, top + ch))) return;   // a view already covered: nothing moved
-      const gaps = coverGaps(spans, sh);
-      if (!gaps.length) { seen = true; left = 0; }       // the whole block has been in view (a fitting block is at once)
-      else left = uncoveredChars(full, s, gaps);
+    // the chunks not yet shown, by index into the block's spans (for a page or a test to point at them)
+    box.longUnshown = () => (seen ? [] : parts.map((_, i) => i).filter((i) => !shown[i]));
+    const publish = () => {
+      seen = todo === 0;
+      left = seen ? 0 : unshown;
       box.dataset.seen = seen ? "1" : "0";
-      box.dataset.unseen = String(seen ? 0 : left);
+      box.dataset.unseen = String(left);
       box.dispatchEvent(new CustomEvent("longseen", { detail: box.longState() }));
     };
-    // while a scroll moves, each animation frame is sampled too, until the view has stood still for three frames
-    let moving = false, still = 0, lastTop = -1;
-    const frame = () => {
-      measure();
-      if (full.scrollTop === lastTop) still += 1; else { still = 0; lastTop = full.scrollTop; }
-      if (still < 3 && whole.open && !seen && typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(frame);
-      else moving = false;
+    const stop = () => {
+      if (io) io.disconnect();
+      if (near) near.disconnect();
+      root.removeEventListener("scroll", later, true);
+      root.removeEventListener("resize", later);
     };
-    full.addEventListener("scroll", () => {
-      measure();
-      if (!moving && !seen && typeof root.requestAnimationFrame === "function") {
-        moving = true; still = 0; lastTop = full.scrollTop;
-        root.requestAnimationFrame(frame);
+    // the chunks the observer holds inside, hit-tested now: each uncovered one is shown
+    const probe = () => {
+      queued = false;
+      if (seen) return;
+      let grew = false;
+      for (const i of inside) {
+        if (shown[i] || !uncovered(chunk[i], full)) continue;
+        shown[i] = 1; todo -= 1; unshown -= parts[i][1]; grew = true;
+        inside.delete(i);
       }
-    }, { passive: true });
-    // a resize (the window, the block's own box) is measured at once: a reflow starts the coverage again
-    if (typeof root.ResizeObserver === "function") new root.ResizeObserver(() => measure()).observe(full);
+      if (grew || first) { first = false; publish(); }
+      if (seen) stop();
+    };
+    // a scroll anywhere (the block, the page, an ancestor) or a resize can uncover a chunk the observer still holds inside
+    function later() {
+      if (queued || seen || !inside.size) return;
+      queued = true;
+      if (typeof root.requestAnimationFrame === "function") root.requestAnimationFrame(probe); else probe();
+    }
+    const watch = () => {
+      if (io || seen || typeof root.IntersectionObserver !== "function") return;
+      io = new root.IntersectionObserver((entries) => {
+        for (const e of entries) {
+          const i = at.get(e.target);
+          if (i === undefined || shown[i]) continue;
+          const b = e.boundingClientRect, r = e.intersectionRect;
+          const whole_ = e.isIntersecting && b.height - r.height <= FULL_EPS && b.width - r.width <= FULL_EPS;
+          if (whole_) inside.add(i); else inside.delete(i);
+        }
+        probe();
+      }, { root: null, rootMargin: "0px", threshold: [0, 0.999, 1] });
+      // a run within a whole view of the block's view has its chunks observed (a whole view ahead: a chunk is told to
+      // the fine observer a rendering update after its run comes near, so it must be told before it can be in view);
+      // a run that leaves it, not
+      const gi = new Map(groups.map((g, k) => [g, k]));
+      near = new root.IntersectionObserver((entries) => {
+        for (const e of entries) {
+          const k = gi.get(e.target);
+          if (k === undefined) continue;
+          for (let i = k * CHUNK_GROUP; i < Math.min(parts.length, (k + 1) * CHUNK_GROUP); i++) {
+            if (shown[i]) continue;
+            if (e.isIntersecting) io.observe(chunk[i]);
+            else { io.unobserve(chunk[i]); inside.delete(i); }
+          }
+        }
+      }, { root: full, rootMargin: "100% 0px", threshold: 0 });
+      for (const g of groups) near.observe(g);
+      root.addEventListener("scroll", later, { capture: true, passive: true });
+      root.addEventListener("resize", later);
+    };
     // open, the whole text stands alone (the head and the tail would repeat it); closed, they are back
-    whole.addEventListener("toggle", () => { box.classList.toggle("open", whole.open); measure(); });
+    whole.addEventListener("toggle", () => {
+      box.classList.toggle("open", whole.open);
+      if (!whole.open || seen) return;
+      if (first) { first = false; publish(); }          // open: every chunk is counted until the browser reports it shown
+      watch();
+    });
     box.appendChild(whole);
     return box;
   }
