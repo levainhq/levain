@@ -1118,6 +1118,15 @@ class QuestionStore:
                 self._rings_seen = None
             return f"edited {sid}"
         words = {"snooze": f"snoozed to {until}", "done": "done", "clear": "dropped"}[action]
+        advance = None
+        if action == "done":
+            # DONE on a repeating agenda moves it to its next occurrence instead of resolving it (``levain.recur``); CLEAR
+            # always ends the series. A rule that does not read, or whose next occurrence cannot be computed, resolves as before
+            from levain.recur import advance_changes
+
+            advance = advance_changes(item, _now_utc(self._clock).astimezone().replace(tzinfo=None))      # local wall clock, as every stored minute is
+            if advance is not None:
+                words = f"done; next {advance['next']}"
         moved = False
         try:
             with self._write() as conn:
@@ -1128,6 +1137,8 @@ class QuestionStore:
                     if action == "snooze":
                         intentions.update(sid, next=until, germinated={}, expect_disposition="agenda",
                                       expected_version=intention_version(item))
+                    elif advance is not None:
+                        intentions.update(sid, expect_disposition="agenda", expected_version=intention_version(item), **advance)
                     else:
                         kind = (answered_descend_kind(item.get("type")) if action == "done"
                                 else dropped_descend_kind(item.get("type")))

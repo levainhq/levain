@@ -38,6 +38,8 @@ def parse_intake(line, now):
         raise IntakeRefused("an empty line")
     try:
         if line.startswith("@"):
+            if not line[1:].strip():
+                raise IntakeRefused("no time after '@'. Try @09:00, @tomorrow 9am, @mon 14:30, @11-09 19:30 or @+2h")
             when, words = read_when_text(line[1:], now, allow_recur=False)
             if not words:
                 raise IntakeRefused("no words after the time: say what the drop should tell the desk")
@@ -59,8 +61,9 @@ def receipt(parsed, id=None):
     """The intake receipt for a parsed line: ``(line, dict)``.
 
     dict is ``{kind, id, fires, text}`` (``id`` is the intention id the caller planted, or None;
-    ``fires`` is the ISO minute for a drop, else None). line is the one-line form:
-    ``scheduled drop <id> fires Mon 11-09 09:00`` · ``talk <id>`` (``<id>`` is ``intention-N``, or ``spore-N`` on a row made before anneal 1.0.7) · ``sent to the desk to sort``.
+    ``fires`` is the ISO minute for a drop or a reminder, else None; a reminder's dict also carries ``recur``, its canon rule or
+    None). line is the one-line form:
+    ``scheduled drop <id> fires Mon 11-09 09:00`` · ``reminder <id> rings Thu 11-12 15:00[, then weekly SUN 21:00]`` · ``talk <id>`` (``<id>`` is ``intention-N``, or ``spore-N`` on a row made before anneal 1.0.7) · ``sent to the desk to sort``.
     """
     kind = parsed["kind"]
     if kind == "drop":
@@ -68,6 +71,9 @@ def receipt(parsed, id=None):
         return f"scheduled drop {id} fires {datetime.strptime(r['fires'], _FMT):%a %m-%d %H:%M}", r
     if kind == "talk":
         return f"talk {id}", {"kind": "talk", "id": id, "fires": None, "text": parsed["text"]}
+    if kind == "remind":
+        r = {"kind": "remind", "id": id, "fires": parsed["when"], "recur": parsed.get("recur"), "text": parsed["text"]}
+        return receipt_line(r), r
     return "sent to the desk to sort", {"kind": "sort", "id": None, "fires": None, "text": parsed["text"]}
 
 
@@ -75,6 +81,9 @@ def receipt_line(r):
     """One-line receipt from the receipt dict."""
     if r["kind"] == "drop":
         return f"scheduled drop {r['id']} fires {datetime.strptime(r['fires'], _FMT):%a %m-%d %H:%M}"
+    if r["kind"] == "remind":
+        return (f"reminder {r['id']} rings {datetime.strptime(r['fires'], _FMT):%a %m-%d %H:%M}"
+                + (f", then {r['recur']}" if r.get("recur") else ""))
     if r["kind"] == "talk":
         return f"talk {r['id']}"
     return "sent to the desk to sort"

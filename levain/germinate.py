@@ -218,6 +218,7 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
     from levain.consent.questions import ANSWER_CHANNELS, DB_NAME, QuestionStore, later_date
     from levain.desk.store import CoordStore
     from levain.intentions import answered_descend_kind, guarded_intention_store, ringing_ref
+    from levain.recur import advance_changes
 
     now = now or datetime.now()
     today = today or now.date()
@@ -274,11 +275,17 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
                           "finished", str(stamp.get("ref") or ""), False, False, False)
             if not dry_run:
                 try:
-                    # an answered question closes the intention as done by type; a handed-off drop composts, as before
-                    kind = "composted" if str(stamp.get("ref") or "").startswith("dr-") or not stamp.get("ref") \
-                        else answered_descend_kind(item.get("type"))
-                    store.descend(sid, kind=kind, expect_disposition="agenda",
-                                  expected_version=intention_version(item), today=today)
+                    # an answered question closes the intention as done by type; a handed-off drop composts, as before.
+                    # A REPEATING agenda whose question was answered advances to its next occurrence instead (levain.recur)
+                    handed_off = str(stamp.get("ref") or "").startswith("dr-") or not stamp.get("ref")
+                    advance = None if handed_off else advance_changes(item, now)
+                    if advance is not None:
+                        store.update(sid, expect_disposition="agenda", expected_version=intention_version(item),
+                                     today=today, **advance)
+                    else:
+                        kind = "composted" if handed_off else answered_descend_kind(item.get("type"))
+                        store.descend(sid, kind=kind, expect_disposition="agenda",
+                                      expected_version=intention_version(item), today=today)
                 except IntentionError as exc:
                     if "changed since read" not in str(exc) and "disposition changed" not in str(exc):
                         raise

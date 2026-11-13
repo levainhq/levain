@@ -959,13 +959,13 @@ def _band_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, An
 
 
 def _intake_tier(params: dict[str, Any], row: dict[str, Any] | None, prov: str, today: date) -> Tier:
-    """The List intake's tier by the line's kind (``effects.INTAKE_TIERS``), read from its prefix: a scheduled drop
-    and a talk seed are T2 (signed), a plain line to sort is C1. A line that is not a string is T2 (refused later)."""
+    """The List intake's tier by the line's kind (``effects.INTAKE_TIERS``), read from its prefix: a scheduled drop,
+    a reminder and a talk seed are T2 (signed), a plain line to sort is C1. A line that is not a string is T2 (refused later)."""
     return INTAKE_TIERS.get(intake_kind_of(params.get("line")) or "", "T2")  # type: ignore[return-value]
 
 
 def _intake_policy_also(params: dict[str, Any]) -> tuple[str, ...]:
-    """A drop or a talk plants a ``intention_seed`` effect, so a standing raise of ``intention_seed`` governs it too; a sort
+    """A drop, a reminder or a talk plants a ``intention_seed`` effect, so a standing raise of ``intention_seed`` governs it too; a sort
     plants none. With no line (the rendered tier, the manifest head) the answer is the one that governs most."""
     return () if intake_kind_of(params.get("line")) == "sort" else ("intention_seed",)
 
@@ -1079,12 +1079,13 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              applies_to=_PLAIN_INTENTION_ROW, options=_resolve_kinds("ascend")),
     VerbSpec("intention_seed", "capture", "adds a new item that agents will read", "create",
              # next/target/attention: THE LIST's scheduled drop and talk seed (task_surfaces_1107.md); a target
-             # wakes an agent with these words, so a create stays T2 whatever it carries
-             fields=("text", "type", "disposition", "next", "target", "attention"), floor="T2", tier_fn=_const("T2"),
+             # wakes an agent with these words, so a create stays T2 whatever it carries. recur: a repeating reminder
+             fields=("text", "type", "disposition", "next", "target", "attention", "recur"), floor="T2", tier_fn=_const("T2"),
              fire=_unbuilt_fire("intention_seed fires through the broker (K2b)"), legacy_kind="intention_seed",
              device_ok=True),
     VerbSpec(INTAKE_VERB, "add", "adds one line to the List: '@<when> words' schedules a drop that wakes the desk "
-             "at that minute, '? words' queues a talk, anything else goes to the desk to sort", "create",
+             "at that minute, 'remind me <when or every ...> words' makes a reminder that rings for you (repeating if it "
+             "says every), '? words' queues a talk, anything else goes to the desk to sort", "create",
              fields=("line",), floor="T2", tier_fn=_intake_tier, fire=_intake_fire, device_ok=True,
              # at-most-once: a sort's key names its desk drop's outbox id, so a resend after a lost reply
              # writes nothing (a drop and a talk are broker pendings, keyed as every pending is)

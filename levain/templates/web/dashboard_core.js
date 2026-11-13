@@ -2717,9 +2717,9 @@
     return row;
   }
 
-  // The List's INTAKE box: ONE line, posted as list_intake {line}. The page holds no grammar: `@when words`, `? words` and a
-  // plain line all go to the server, which reads the line, decides the tier (a plain line is answered at once; `@` and `?` lines are
-  // signed on a device) and returns the receipt sentence, printed here verbatim under the box. A refusal prints the server's reason.
+  // The List's INTAKE box: ONE line, posted as list_intake {line}. The page holds no grammar: `@when words`, `remind me when words`,
+  // `? words` and a plain line all go to the server, which reads the line, decides the tier (a plain line is answered at once; `@`,
+  // `remind` and `?` lines are signed on a device) and returns the receipt sentence, printed here verbatim under the box. A refusal prints the server's reason.
   // The idempotency key is minted per submit by the page's one write path (postVerb): fresh for each submit, kept across a retry.
   function paintIntakeReceipts() {
     for (const n of document.querySelectorAll("[data-list-receipt]")) {
@@ -2767,7 +2767,7 @@
     noContactFill(input);
     input.setAttribute("enterkeyhint", "send");      // overrides the helper's default: this box sends on Enter
     input.setAttribute("aria-label", "add a line to the List");
-    narrowPlaceholder(input, "@mon 9am call X  ·  ? talk about Y  ·  or a plain line", "@mon 9am call · ? talk Y");
+    narrowPlaceholder(input, "remind thu 3pm call X  ·  @mon 9am desk  ·  ? talk Y", "remind thu 3pm call · ? talk");
     input.value = intakeKept.draft;
     input.maxLength = 500;
     const go = el("button", "tray-dump-btn list-intake-btn", "add");
