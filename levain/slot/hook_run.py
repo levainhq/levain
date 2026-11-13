@@ -9,8 +9,11 @@ The script :mod:`levain.slot.hook_templates` renders into ``<S>/root/hooks/<name
 **FAIL CLOSED.** The operator's hook (``templates/activation/hooks/consent_claude_code.py``) exits 0 with no output
 when its adapter will not import, so the call passes. That is right on the operator's own machine and wrong for a
 gate inside an unattended slot: a gate that opens when it breaks is not a gate. Here every way the adapter cannot
-answer is exit 2 with a NAMED refusal on stderr (Claude Code blocks a PreToolUse and denies a PermissionRequest on
-exit 2), never exit 0 with no output:
+answer is exit 2 with a NAMED refusal on stderr, never exit 0 with no output. Claude Code blocks a PreToolUse on exit
+2; on a PermissionRequest its hooks reference says exit 2 is NOT honoured (the permission flow proceeds unchanged and
+the stderr is discarded; a deny there is a ``decision`` object on stdout), so on that event (``levain_queue``) a
+refusal here leaves the call to the session's mode: the prompt, or in a session that cannot prompt Claude Code's own
+deny. :func:`repo_filter` answers a PermissionRequest deny with the decision object; :func:`run` does not (yet):
 
 * ``hook-not-in-slot``: the slot's broker socket variable is not in the environment. The adapter would then take its
   operator path (a local queue under the home directory), which a slot must never reach.
@@ -234,7 +237,13 @@ def _run_repo(command: str, payload: bytes, timeout: int, environ: Optional[Mapp
     import tempfile
     import time
 
-    with tempfile.TemporaryFile() as in_f:
+    # Everything that can fail on its own is made BEFORE the command starts, and the start is the try's first act, so
+    # nothing between the start and the cleanup below can leave the command running (X4/C3).
+    sel = selectors.DefaultSelector()
+    in_f: Any = None
+    proc: Any = None
+    try:
+        in_f = tempfile.TemporaryFile()
         in_f.write(payload)
         in_f.seek(0)
         try:
@@ -245,9 +254,7 @@ def _run_repo(command: str, payload: bytes, timeout: int, environ: Optional[Mapp
                                     start_new_session=True, close_fds=True)
         except OSError as exc:
             raise _RepoFailed("it could not start: %s" % type(exc).__name__) from None
-    bufs = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}   # type: ignore[union-attr]
-    sel = selectors.DefaultSelector()
-    try:
+        bufs = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
         for fd in bufs:
             sel.register(fd, selectors.EVENT_READ)
         deadline = time.monotonic() + timeout
@@ -274,20 +281,24 @@ def _run_repo(command: str, payload: bytes, timeout: int, environ: Optional[Mapp
             code = proc.wait(timeout=max(left, 0.001))
         except subprocess.TimeoutExpired:
             raise _RepoFailed("it ran past its timeout of %d s" % timeout) from None
-        return code, bytes(bufs[proc.stdout.fileno()]), bytes(bufs[proc.stderr.fileno()])   # type: ignore[union-attr]
+        return code, bytes(bufs[proc.stdout.fileno()]), bytes(bufs[proc.stderr.fileno()])
     finally:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=REPO_REAP_GRACE)
-        except subprocess.TimeoutExpired:
-            pass                # unkillable for now (an uninterruptible sleep): never wait on it without bound
-        sel.close()
-        for f in (proc.stdout, proc.stderr):
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=REPO_REAP_GRACE)
+            except subprocess.TimeoutExpired:
+                pass            # unkillable for now (an uninterruptible sleep): never wait on it without bound
+        # a close that raises never replaces the cause the run is already leaving with (D5)
+        for f in (sel, in_f) + ((proc.stdout, proc.stderr) if proc is not None else ()):
             if f is not None:
-                f.close()
+                try:
+                    f.close()
+                except Exception:   # noqa: BLE001
+                    pass
 
 
 def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = None,
@@ -302,17 +313,24 @@ def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = N
     cannot find) is the command's non-blocking error: no decision. A FAILURE OF THE FILTER is a deny with the fixed
     :data:`REPO_FAILED` and what failed: the shell cannot start, the command runs past its timeout, a payload past
     :data:`REPO_PAYLOAD_MAX`, output past :data:`REPO_OUTPUT_MAX`, the filter stopped by a signal, or the filter
-    breaking. Either deny is exit :data:`REFUSED_EXIT` with one line on stderr. A deny on PreToolUse is measured; on
-    PermissionRequest it is Claude Code's documented exit 2 (not run). No decision (an allow, ask or defer, a rewrite,
-    text that is not JSON, a non-blocking error) is exit 0 with nothing written, so the gate and the session's mode
-    decide. Nothing the repo command prints reaches Claude Code but a deny's reason. An ``argv`` render never makes is
-    a named refusal."""
+    breaking. Either deny is answered as :func:`_deny` answers it on the event: on PreToolUse exit
+    :data:`REFUSED_EXIT` with one line on stderr (measured); on PermissionRequest, where Claude Code's hooks reference
+    says exit 2 is not honoured, the ``decision`` object with ``behavior`` ``deny`` and the same line as its
+    ``message`` on stdout, exit 0 (the documented form; not run against a live session). No decision (an allow, ask or
+    defer, a rewrite, text that is not JSON, a non-blocking error) is exit 0 with nothing written, so the gate and the
+    session's mode decide. Nothing the repo command prints reaches Claude Code but a deny's reason. An ``argv`` render
+    never makes is a named refusal, answered as a deny on PermissionRequest when that is its first argument."""
     import signal
 
     err: Any = stderr if stderr is not None else sys.stderr
+    answer: Any = stdout if stdout is not None else sys.stdout
     if len(argv) != 3 or argv[0] not in REPO_FILTERED_EVENTS or not (argv[1].isascii() and argv[1].isdigit()) \
             or not 1 <= int(argv[1]) <= REPO_TIMEOUT_MAX or not argv[2]:
-        return refuse(name, "repo-filter-argv", "%d argument(s)" % len(argv), err)
+        why_argv = "%d argument(s)" % len(argv)
+        if argv and argv[0] == "PermissionRequest":
+            return _deny("PermissionRequest", "levain hook %s: refused: repo-filter-argv (%s)" % (name, why_argv),
+                         answer, err)
+        return refuse(name, "repo-filter-argv", why_argv, err)
     event, timeout, command = argv[0], int(argv[1]), argv[2]
 
     def stop(signum: int, _frame: Any) -> None:
@@ -349,6 +367,26 @@ def repo_filter(name: str, argv: Sequence[str], *, stdin: Optional[BinaryIO] = N
     if failed is None and why is None:
         return 0
     line = "%s (%s)" % (REPO_FAILED, failed) if failed is not None else (why[:REPO_REASON_MAX] or REPO_DENY_DEFAULT)
+    return _deny(event, line, answer, err)
+
+
+def _deny(event: str, line: str, out: Any, err: Any) -> int:
+    """The filter's deny on ``event``, with ``line`` as its reason. On PermissionRequest: the ``decision`` object
+    (``hookSpecificOutput.hookEventName`` ``PermissionRequest``, ``decision.behavior`` ``deny``, ``decision.message``
+    the line, nothing else) on stdout and 0, since exit 2 is not honoured there; if that cannot be written whole, exit
+    2 with the line on stderr, the one answer left. On every other event: exit :data:`REFUSED_EXIT` with the line on
+    stderr."""
+    if event == "PermissionRequest":
+        import json
+
+        doc = {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                      "decision": {"behavior": "deny", "message": line}}}
+        try:
+            out.write(json.dumps(doc))
+            out.flush()
+            return 0
+        except BaseException:  # noqa: BLE001 - fall through to exit 2: a deny is never turned into no answer
+            pass
     try:
         err.write(line + "\n")
         err.flush()
