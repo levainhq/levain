@@ -27,7 +27,8 @@ Positions are ``"<conn %08d>:<seq %012d>"``: ``seq`` is allocated as the session
 one turn boundary and ends on it. No hook's ``output`` and no ``thinking`` block is ever copied into an event: a hook
 event carries its name and outcome only.
 
-The helpers (:func:`room_settings_json`, :func:`room_argv`, :func:`open_probe`, :func:`canary_denied`) are pure.
+The helpers (:func:`room_settings_json`, :func:`room_argv`, :func:`open_probe`, :func:`canary_denied`, and the host
+profile's :func:`room_host_argv` and :func:`host_probe`) are pure.
 Stdlib only.
 """
 from __future__ import annotations
@@ -51,6 +52,7 @@ from pathlib import Path
 from typing import Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
 from levain import pathid
+from levain.desk.room_profile import RoomProfile
 from levain.desk.room_readguard import HOOK_MATCHER, ROOM_READ_REFUSAL
 from levain.desk.driver import (APPROVAL_SUBTYPE, ApprovalAnswer, Capabilities, CommandResult, Event,
                                        InterruptCommand, LivenessEvidence, NotSent, ReadBatch, SendCommand,
@@ -60,7 +62,7 @@ __all__ = [
     "CLOSE_BOUND", "CONN_MAX", "ROOM_DENIED_TOOLS", "ROOM_MCP_SERVER", "ROOM_MCP_TOOL", "ROOM_TOOLS", "SEQ_MAX", "CanaryVerdict",
     "ClaudeSession", "NotLive", "PipeTransport", "Probe", "Transport", "TransportClosed", "canary_denied",
     "default_deny_paths", "open_probe", "room_argv", "room_door_tools", "ROOM_DOOR_NAMES", "room_hook_command", "room_settings_json",
-    "ROOM_READ_REFUSAL",
+    "ROOM_READ_REFUSAL", "host_probe", "room_host_argv",
 ]
 
 CONN_MAX = 10 ** 8 - 1
@@ -1153,6 +1155,42 @@ def room_argv(*, mcp_config: str | os.PathLike[str], settings: str | os.PathLike
     return argv
 
 
+def room_host_argv(profile: RoomProfile, *, mcp_config: str | os.PathLike[str], settings: str | os.PathLike[str],
+                   model: str | None = None, session_id: str | None = None, resume: str | None = None,
+                   claude_bin: str = "claude") -> list[str]:
+    """The host profile's argv (a sibling of :func:`room_argv`, which stays the confined room's). The vendor's own
+    default tool set under ``--dangerously-skip-permissions`` and nothing that narrows it: NO ``--tools``,
+    ``--allowedTools``, ``--disallowedTools``, ``--permission-mode`` or ``--add-dir``. What the profile does carry is
+    the one MCP server (``--strict-mcp-config``: the door is the only server, whatever the operator's user config
+    names), the setting sources the profile names, ``--settings`` (the profile's hook entries,
+    :func:`levain.desk.room_profile.host_settings_json`) and its dials, each only when set. The profile's own
+    ``model`` wins over ``model`` (the setting's). ``--append-system-prompt`` rides on ``--resume`` too: the vendor
+    keeps the first prompt of a conversation, so it is a harmless repeat there. Exactly one of ``session_id`` and
+    ``resume``."""
+    if (session_id is None) == (resume is None):
+        raise ValueError("exactly one of session_id and resume")
+    for name, p in (("mcp_config", mcp_config), ("settings", settings)):
+        if not os.path.isabs(str(p)):
+            raise ValueError(f"{name} must be an absolute path")
+    argv = [claude_bin, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+            "--include-partial-messages", "--dangerously-skip-permissions"]
+    if profile.model or model:
+        argv += ["--model", profile.model or model or ""]
+    if profile.effort:
+        argv += ["--effort", profile.effort]
+    if profile.max_turns is not None:
+        argv += ["--max-turns", str(profile.max_turns)]
+    if profile.max_budget_usd is not None:
+        argv += ["--max-budget-usd", f"{profile.max_budget_usd:.2f}"]
+    argv += ["--strict-mcp-config", "--mcp-config", str(mcp_config),
+             "--setting-sources", ",".join(profile.setting_sources),
+             "--settings", str(settings)]
+    if profile.system_prompt is not None:
+        argv += ["--append-system-prompt", profile.system_prompt]
+    argv += ["--session-id", session_id] if session_id is not None else ["--resume", resume or ""]
+    return argv
+
+
 class Probe(NamedTuple):
     live: bool
     reason: str
@@ -1181,6 +1219,34 @@ def open_probe(init: Mapping[str, Any] | None, door_tools: Sequence[str] | None 
     if init.get("permissionMode") != "dontAsk":
         return Probe(False, f"permissionMode is {_str(init.get('permissionMode'))[:40]!r}, not 'dontAsk'")
     return Probe(True, "exactly the room's tools, its one connected MCP door, dontAsk")
+
+
+def host_probe(init: Mapping[str, Any] | None, profile: RoomProfile, door_tools: Sequence[str] | None = None) -> Probe:
+    """Judge one ``init`` for a host-profile room (the sibling of :func:`open_probe`): live when the mode is the
+    profile's, the MCP servers are exactly the room's one door and connected, and the tool list holds the profile's
+    ``required_tools`` and the door's tools, each name once. EXTRA tools are not a refusal: the vendor's default set
+    is the profile and drifts by CLI version; the floor is what shows a child that is silently not the expected one.
+    The full list stays in the evidence for whoever wants to compare."""
+    if not isinstance(init, Mapping):
+        return Probe(False, "no init has been read")
+    tools = init.get("tools")
+    if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+        return Probe(False, "the init names no tool list")
+    if len(set(tools)) != len(tools):
+        return Probe(False, "the init's tool list repeats a name")
+    want = frozenset((*profile.required_tools, *room_door_tools(door_tools)))
+    if not want <= set(tools):
+        return Probe(False, f"the tool set lacks what the profile requires (missing {sorted(want - set(tools))[:6]})")
+    servers = init.get("mcp_servers")
+    if not isinstance(servers, list) or len(servers) != 1 or not isinstance(servers[0], Mapping):
+        return Probe(False, "the init does not name exactly one MCP server")
+    if servers[0].get("name") != ROOM_MCP_SERVER:
+        return Probe(False, f"the one MCP server is {_str(servers[0].get('name'))[:60]!r}, not {ROOM_MCP_SERVER!r}")
+    if servers[0].get("status") != "connected":
+        return Probe(False, f"the room's MCP door is {_str(servers[0].get('status'))[:40]!r}, not connected")
+    if init.get("permissionMode") != profile.permission_mode:
+        return Probe(False, f"permissionMode is {_str(init.get('permissionMode'))[:40]!r}, not {profile.permission_mode!r}")
+    return Probe(True, f"the profile's required tools, its one connected MCP door, {profile.permission_mode}")
 
 
 class CanaryVerdict(NamedTuple):
