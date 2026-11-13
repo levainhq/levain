@@ -66,6 +66,20 @@ class World:
                        env={**os.environ, **_ENV})
         return dest
 
+    def linked_worktree(self, dest: Path) -> Path:
+        """A linked worktree of ``w`` at origin/main (a fetch run inside it writes ITS OWN ``FETCH_HEAD``, in the
+        per-worktree git dir, not in the common dir)."""
+        git(self.w, "worktree", "add", "-q", "--detach", str(dest), "origin/main")
+        return dest
+
+    def second_remote(self, name: str, bare: Path) -> Path:
+        """A different remote, a bare repository that holds its own ``main`` (a fetch from it writes a ``FETCH_HEAD`` line
+        that also says ``branch 'main' of ...``, but of another url)."""
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True, env={**os.environ, **_ENV})
+        git(self.w, "remote", "add", name, str(bare))
+        git(self.w, "push", "-q", name, "main")
+        return bare
+
     def push_main(self) -> None:
         git(self.w, "push", "-q", "origin", "main")
         git(self.w, "fetch", "-q", "origin")

@@ -22,19 +22,24 @@ Rules the readers hold, each from a measured or ruled failure:
 * Nothing before :data:`BOARD_EPOCH` can carry a trailer, so the ``unattributed`` scan and the branch candidates start
   there (``--since`` moves it).
 * Every ref is resolved FULLY QUALIFIED (``refs/remotes/origin/main``, never ``origin/main``): a short name resolves
-  through git's dwim order, where a tag or a local branch of that name would silently swap the evidence.
+  through git's dwim order, where a tag or a local branch of that name would silently swap the evidence. And ONCE:
+  :func:`_snapshot` turns every ref the reader uses into a sha at the start, and every later read (``log``, ``--merged``,
+  the negatives) takes those shas, so a concurrent ``git fetch`` cannot move a ref between two reads.
 * A commit's work is "landed" only by a ONE-TO-ONE match (each main commit accounts for at most one branch commit) with
   a main commit AFTER the branch's merge-base with main (``git cherry``'s upstream side) that no later main commit
   reverted. A patch-id match is the proof; the trailer-ids + subject key is the fallback ONLY for a commit that has no
   patch-id at all (an empty diff), never for a commit whose content is known.
 * A repository whose history is cut (a shallow or a partial clone) is unreadable, never read from what is left; the
   whole read has one deadline, and a stage the deadline stops reads unreadable with the stages that depend on it.
+* A commit of main whose change a later ``This reverts commit <sha>`` took back (that revert not itself reverted) is no
+  record: it closes nothing and names nothing. The ``reader`` summary carries every field on every path, failure included.
 """
 from __future__ import annotations
 
 import contextvars
 import os
 import re
+import stat
 import subprocess
 import time
 from collections import Counter, deque
@@ -62,7 +67,8 @@ READ_DEADLINE_S = 300
 #: More own commits than this across the candidate branches: the branches source fails closed instead of guessing.
 MAX_OWN_COMMITS = 20000
 #: The newest main commits read (a COUNT, not a date: a commit written with a wrong clock cannot hide the history behind
-#: it). If the count is reached while the oldest commit read is still inside the window, main reads unreadable.
+#: it). One more is asked for: a main with MORE than this many commits reachable reads unreadable, with what depends on it.
+#: By design: no commit date can prove a cut log whole.
 MAX_MAIN_COMMITS = 20000
 _NOTES_REF = "refs/notes/board"
 _RS, _US, _GS = "\x1e", "\x1f", "\x1d"
@@ -226,19 +232,58 @@ def _patch_ids(repo: Path, shas: list[str]) -> dict[str, str]:
 
 
 # ------------------------------------------------------------------------------------------------ fetch time
-def _fetched_at(repo: Path, main_full: str) -> str | None:
-    """When origin was last fetched, as the newer of two witnesses: FETCH_HEAD's mtime (only when that fetch carried
-    main: a fetch of one other branch writes the same file and says nothing about main) and the last reflog entry of
-    the remote main ref (a floor, so it errs toward stale). None when neither can be read."""
+def _read_stamped(path: Path) -> tuple[str, float] | None:
+    """A regular file's text and its mtime, both from ONE open descriptor (a path read twice can name two different
+    files if a fetch replaces it in between). None when it is absent, not a regular file or unreadable."""
+    try:
+        with open(path, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            return fh.read().decode("utf-8", "replace"), st.st_mtime
+    except OSError:
+        return None
+
+
+def _fetch_head_sources(url: str) -> set[str]:
+    """The ways git may print a remote's url after ``branch 'main' of `` in FETCH_HEAD: as configured, and with trailing
+    slashes, a ``.git`` suffix and a ``user@`` prefix removed (git anonymises and trims the url it writes there)."""
+    forms = {url}
+    trimmed = url.rstrip("/").removesuffix(".git")
+    forms.add(trimmed)
+    m = re.match(r"^((?:[A-Za-z][A-Za-z0-9+.-]*://)?)[^/@]*@(.*)$", trimmed)
+    if m:
+        forms.add(m.group(1) + m.group(2))
+    return forms
+
+
+def _fetched_at(repo: Path, remote: str, main_full: str) -> str | None:
+    """When ``remote`` was last fetched, as the newest of these witnesses: the mtime of a FETCH_HEAD (the worktree's own
+    and the common dir's: a fetch run inside a linked worktree writes only the first) that holds a line for
+    ``branch 'main' of <this remote's url>`` (a fetch of one other branch, or from another remote, says nothing about
+    this main), and the last reflog entry of the remote main ref (a floor, so it errs toward stale). None when none can
+    be read; an mtime that is not a time is no witness."""
     stamps: list[datetime] = []
     try:
-        common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
-        fh = common / "FETCH_HEAD"
-        text = fh.read_text("utf-8", "replace") if fh.is_file() else ""
-        if f"branch '{MAIN_BRANCH}' of" in text:
-            stamps.append(datetime.fromtimestamp(fh.stat().st_mtime, timezone.utc))
-    except (GitFailed, OSError):
-        pass
+        url = _git(repo, "remote", "get-url", remote).strip()
+        dirs = _git(repo, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir").split("\n")
+    except GitFailed:
+        url, dirs = "", []
+    prefix = f"branch '{MAIN_BRANCH}' of "
+    sources = _fetch_head_sources(url) if url else set()
+    for d in dict.fromkeys(x.strip() for x in dirs if x.strip()):
+        got = _read_stamped(Path(d) / "FETCH_HEAD")
+        if got is None:
+            continue
+        text, mtime = got
+        carried = any(len(f) == 3 and f[2].startswith(prefix) and f[2][len(prefix):].strip() in sources
+                      for f in (line.split("\t", 2) for line in text.splitlines()))
+        if not carried:
+            continue
+        try:
+            stamps.append(datetime.fromtimestamp(mtime, timezone.utc))
+        except (OverflowError, ValueError, OSError):
+            continue
     try:
         entry = _git(repo, "reflog", "show", "-n1", "--date=iso-strict", "--format=%gd", main_full).strip()
         m = re.search(r"@\{(.+)\}$", entry)                 # the reflog ENTRY's time, not the commit's (%cI is the commit's)
@@ -253,9 +298,38 @@ def _fetched_at(repo: Path, main_full: str) -> str | None:
 
 
 # ------------------------------------------------------------------------------------------------ the readers
+def _in_effect(commits: Mapping[str, _Commit]) -> set[str]:
+    """The commits of ``commits`` whose change is still on main: not taken back by a ``This reverts commit <sha>`` of
+    a commit that is itself in effect (so a revert of the revert puts the first one back). Independent of log order (a
+    commit dated wrong can sit before its own parent); a revert always follows its target, so the walk ends."""
+    taken_by: dict[str, list[str]] = {}
+    for c in commits.values():
+        for r in c.reverts:
+            if r in commits:
+                taken_by.setdefault(r, []).append(c.sha)
+    state: dict[str, bool] = {}
+    for root in commits:
+        stack = [root]
+        while stack:
+            sha = stack[-1]
+            if sha in state:
+                stack.pop()
+                continue
+            pending = [r for r in taken_by.get(sha, ()) if r not in state]
+            if pending:
+                stack.extend(pending)
+                continue
+            state[sha] = not any(state[r] for r in taken_by.get(sha, ()))
+            stack.pop()
+    return {sha for sha, live in state.items() if live}
+
+
 def _main_records(commits: Mapping[str, _Commit]) -> list[dict[str, Any]]:
+    """A record for every trailer-bearing commit of main that is still in effect: a closing commit that was reverted
+    closes nothing (until the revert is itself reverted)."""
+    live = _in_effect(commits)
     return [{"sha": c.sha, "date": c.date, "items": list(c.items), "closes": list(c.closes)}
-            for c in commits.values() if c.items or c.closes]
+            for c in commits.values() if (c.items or c.closes) and c.sha in live]
 
 
 def _token_ids(name: str, repo_name: str | None) -> list[str]:
@@ -275,25 +349,39 @@ class _Pick:
     diverged: bool
 
 
-def _tips(repo: Path, remote: str, prefixes: tuple[str, ...], since_ts: float, *, heads: bool
+_Snapshot = dict[str, tuple[str, float, str | None]]     # fully qualified ref name -> (sha, commit time, UTC date)
+
+
+def _snapshot(repo: Path, remote: str) -> _Snapshot:
+    """EVERY ref the reader will use, as shas, in one ``for-each-ref``: the remote-tracking refs and the seat/lane local
+    heads. Everything after reads this and shas, never a ref by name: a ``git fetch`` that moves a ref between two of the
+    reader's reads (the desk and the seats fetch every few minutes) must not leave one read's negatives excluding commits
+    that another read never saw."""
+    out: _Snapshot = {}
+    pats = [f"refs/remotes/{remote}", *(f"refs/heads/{p.rstrip('/')}" for p in BRANCH_PREFIXES)]
+    text = _git(repo, "for-each-ref", "--format=%(refname)%1f%(objectname)%1f%(committerdate:iso-strict)", *pats)
+    for line in text.splitlines():
+        ref, sha, when = (line.split("\x1f") + ["", ""])[:3]
+        date, ts = _utc(when)
+        if ref and _SHA.fullmatch(sha):
+            out[ref] = (sha, ts, date)
+    return out
+
+
+def _tips(snap: _Snapshot, remote: str, prefixes: tuple[str, ...], since_ts: float, *, heads: bool
           ) -> dict[str, list[tuple[str, float, str | None]]]:
     """``{short name: [(tip sha, tip time, tip date), ...]}`` of the remote-tracking branches under ``prefixes`` and, when
     ``heads``, the local heads too: the remote-tracking tip first, then the local one when it differs. A tip older than
     the epoch cannot be on the board and is left out."""
     out: dict[str, list[tuple[str, float, str | None]]] = {}
-    bases = [(f"refs/remotes/{remote}", f"refs/remotes/{remote}/")] + ([("refs/heads", "refs/heads/")] if heads else [])
-    for base, strip in bases:
-        for pfx in prefixes:
-            text = _git(repo, "for-each-ref", "--format=%(refname)%1f%(objectname)%1f%(committerdate:iso-strict)",
-                        f"{base}/{pfx.rstrip('/')}")
-            for line in text.splitlines():
-                ref, sha, when = (line.split("\x1f") + ["", ""])[:3]
-                name = ref[len(strip):]
-                date, ts = _utc(when)
-                if _SHA.fullmatch(sha) and name.startswith(pfx) and ts >= since_ts:
-                    seen = out.setdefault(name, [])
-                    if all(t[0] != sha for t in seen):
-                        seen.append((sha, ts, date))
+    bases = [f"refs/remotes/{remote}/"] + (["refs/heads/"] if heads else [])
+    for strip in bases:
+        for ref, (sha, ts, date) in sorted(snap.items()):
+            name = ref[len(strip):]
+            if ref.startswith(strip) and any(name.startswith(p) for p in prefixes) and ts >= since_ts:
+                seen = out.setdefault(name, [])
+                if all(t[0] != sha for t in seen):
+                    seen.append((sha, ts, date))
     return out
 
 
@@ -429,7 +517,9 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
     main_full = f"refs/remotes/{main_short}"            # fully qualified: a tag or a branch named `origin/main` must not win
     unreadable: dict[str, str] = {}
     ev: dict[str, Any] = {"evidence_v": 1, "unreadable": unreadable}
-    summary: dict[str, Any] = {"repo": repo_name, "since": since, "main_ref": main_short}
+    summary: dict[str, Any] = {"repo": repo_name, "since": since, "main_ref": main_short, "main_commits": 0, "main_records": 0,
+                               "chain_refs": 0, "chain_commits": 0, "branches": 0, "refs": 0, "merged": 0, "unattributed": 0,
+                               "diverged": [], "matched_by_key": 0}      # whole on every path: a failure board keeps its shape
     every = ("main", "chain", "branches", "refs", "unattributed")
 
     def fail(sources: Iterable[str], why: str) -> None:
@@ -450,7 +540,12 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
         if shallow not in ("true", "false"):            # an old git echoes a flag it does not know and exits 0
             raise GitFailed("git cannot say whether this is a shallow clone")
         partial = _git_yes_no(repo, "config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$")
-        _git(repo, "rev-parse", "--verify", "--quiet", f"{main_full}^{{commit}}")
+        fetched = _fetched_at(repo, remote, main_full)  # BEFORE the snapshot: a fetch landing after it makes the stamp older, never newer, than the refs
+        snap = _snapshot(repo, remote)                  # the one read of the refs; everything below uses these shas
+        main_sha = snap.get(main_full, ("", 0.0, None))[0]
+        if not main_sha:
+            raise GitFailed("no such ref")
+        _git(repo, "rev-parse", "--verify", "--quiet", f"{main_sha}^{{commit}}")
     except GitFailed as exc:
         fail(every, f"{main_short} cannot be read ({exc})")
         return ev, summary
@@ -458,27 +553,26 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
         fail(every, ("a shallow clone" if shallow == "true" else "a partial clone")
              + ": its history is not whole, so no count of commits can be trusted")
         return ev, summary
-    fetched = _fetched_at(repo, main_full)
     if fetched is not None:
         ev["fetched_at"] = fetched
 
     refs: list[str] = []
     merged: list[str] = []
     try:                                                                # origin's refs, and which are already on main
-        fmt = "--format=%(refname:strip=3)"
-        base = f"refs/remotes/{remote}"
-        refs = sorted(r for r in _git(repo, "for-each-ref", fmt, base).split("\n") if r and r != "HEAD")
-        merged = sorted(r for r in _git(repo, "for-each-ref", fmt, f"--merged={main_full}", base).split("\n")
-                        if r and r != "HEAD")
+        remote_pfx = f"refs/remotes/{remote}/"
+        refs = sorted(r[len(remote_pfx):] for r in snap if r.startswith(remote_pfx) and r != remote_pfx + "HEAD")
+        on_main = _git(repo, "for-each-ref", "--format=%(refname)%1f%(objectname)", f"--merged={main_sha}", f"refs/remotes/{remote}")
+        merged = sorted(r[len(remote_pfx):] for r, sha in (line.split("\x1f") for line in on_main.splitlines() if "\x1f" in line)
+                        if r in snap and snap[r][0] == sha and r != remote_pfx + "HEAD")     # a ref that moved since the snapshot is not "merged"
         ev["refs"], ev["merged"] = refs, merged
     except GitFailed as exc:
         fail(("refs", "chain", "branches", "unattributed"), f"origin's refs cannot be listed ({exc})")
 
     main_commits: dict[str, _Commit] = {}
-    try:                                                                # main: the newest MAX_MAIN_COMMITS, a count and not a date
-        main_commits = _log(repo, [main_full], limit=MAX_MAIN_COMMITS)
-        if len(main_commits) >= MAX_MAIN_COMMITS and min(c.ts for c in main_commits.values()) >= window:
-            raise GitFailed(f"more than {MAX_MAIN_COMMITS} commits inside the window")
+    try:        # main: the newest MAX_MAIN_COMMITS; one more is asked for, because ONLY a log that has a commit past the cap is cut
+        main_commits = _log(repo, [main_sha], limit=MAX_MAIN_COMMITS + 1)
+        if len(main_commits) > MAX_MAIN_COMMITS:               # decided by the count alone: no commit date can prove a cut log whole
+            raise GitFailed(f"more than {MAX_MAIN_COMMITS} commits reachable from {main_short}")
         ev["main"] = _main_records(main_commits)
     except GitFailed as exc:
         main_commits = {}
@@ -495,7 +589,7 @@ def _read_git_evidence(repo: Path, remote: str, main: str, since: str, repo_name
     extra: dict[str, Any] = {"diverged": [], "matched_by_key": 0}
     if not any(s in unreadable for s in ("main", "refs")):
         try:
-            chain_rows, branch_rows, extra = _chain_and_branches(repo, remote, main_full, set(merged), main_commits,
+            chain_rows, branch_rows, extra = _chain_and_branches(repo, remote, main_sha, snap, set(merged), main_commits,
                                                                  repo_name, since_ts, window, note_unattributed)
             ev["chain"], ev["branches"] = chain_rows, branch_rows
         except GitFailed as exc:
@@ -527,8 +621,9 @@ def read_git_evidence(repo: Path, *, repo_name: str | None = None, since: str = 
         _deadline.reset(token)
 
 
-def _chain_and_branches(repo: Path, remote: str, main_full: str, merged: set[str], main_commits: Mapping[str, _Commit],
-                        repo_name: str | None, since_ts: float, window: float, note_unattributed: Any
+def _chain_and_branches(repo: Path, remote: str, main_sha: str, snap: _Snapshot, merged: set[str],
+                        main_commits: Mapping[str, _Commit], repo_name: str | None, since_ts: float, window: float,
+                        note_unattributed: Any
                         ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     """The live chain refs and the attributed seat branches, classified against ONE patch-id pass.
 
@@ -536,12 +631,12 @@ def _chain_and_branches(repo: Path, remote: str, main_full: str, merged: set[str
     re-chained after a cherry-pick keeps its old commits, which main holds by patch-id). A branch's ``ahead`` counts its
     own commits (on neither main nor any chain ref by sha) whose work is on neither by patch-id, one main or chain commit
     for one branch commit."""
-    queue = {n: v[0][0] for n, v in _tips(repo, remote, (CHAIN_PREFIX,), since_ts, heads=False).items() if n not in merged}
-    picks = {n: _pick(repo, t) for n, t in _tips(repo, remote, BRANCH_PREFIXES, since_ts, heads=True).items()}
+    queue = {n: v[0][0] for n, v in _tips(snap, remote, (CHAIN_PREFIX,), since_ts, heads=False).items() if n not in merged}
+    picks = {n: _pick(repo, t) for n, t in _tips(snap, remote, BRANCH_PREFIXES, since_ts, heads=True).items()}
     cap = MAX_OWN_COMMITS + 1
-    chain_log = _log(repo, sorted(set(queue.values())), negatives=[main_full], limit=cap) if queue else {}
+    chain_log = _log(repo, sorted(set(queue.values())), negatives=[main_sha], limit=cap) if queue else {}
     branch_log = (_log(repo, sorted({s for p in picks.values() for s in p.shas}), limit=cap,
-                       negatives=[main_full, *(f"refs/remotes/{remote}/{n}" for n in queue)]) if picks else {})
+                       negatives=[main_sha, *sorted(set(queue.values()))]) if picks else {})   # shas only: the snapshot's, not whatever a ref names now
     if len(chain_log) + len(branch_log) > MAX_OWN_COMMITS:
         raise GitFailed(f"more than {MAX_OWN_COMMITS} commits beyond main on the chain and the candidate branches")
 
@@ -552,6 +647,11 @@ def _chain_and_branches(repo: Path, remote: str, main_full: str, merged: set[str
     chain_own = {n: [c for c in _own(chain_log, tip).values() if in_window(c)] for n, tip in queue.items()}
     chain_bound = {n: matcher.boundary([tip]) for n, tip in queue.items()}
     branch_bound = {n: matcher.boundary(p.shas) for n, p in picks.items()}
+    for tips, bound in (*((tuple([queue[n]]), b) for n, b in chain_bound.items()), *((p.shas, branch_bound[n]) for n, p in picks.items())):
+        if not bound and not any(s in main_commits for s in tips):          # main's log does not hold the fork point (cut, or mis-dated)
+            for s in tips:
+                if _git_yes_no(repo, "merge-base", main_sha, s):            # exit 1 = no common ancestor at all: a true empty boundary
+                    raise GitFailed("main's history read does not reach where a chain ref or a branch forked from it")
     needed = {s for b in {*chain_bound.values(), *branch_bound.values()} for s in matcher.pool(b)}
     work = [c for c in (*chain_log.values(), *branch_log.values()) if in_window(c)]
     pids = _patch_ids(repo, sorted(needed | {c.sha for c in work}))
