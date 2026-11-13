@@ -1,0 +1,2473 @@
+{
+ "about": "Conformance for the board-state function: the cases the L1 and L2 reviews of levain 22 (key 1112-36) showed unprotected or wrong. Same shape as states.json.",
+ "cases": [
+  {
+   "audit": [
+    [
+     "unknown",
+     null
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {
+     "unattributed": "git log failed"
+    },
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "",
+     "state": "ready"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "unreadable: an unattributed scan that failed surfaces on the board though no item needs it",
+   "now": "2026-11-12T20:00:00Z",
+   "problems_contain": [
+    "unattributed unreadable: git log failed"
+   ]
+  },
+  {
+   "audit": [
+    [
+     "unknown",
+     null
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "",
+     "state": "ready"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "unreadable: an unattributed source the evidence never supplied is unreadable, not empty",
+   "now": "2026-11-12T20:00:00Z",
+   "problems_contain": [
+    "unattributed unreadable: not supplied"
+   ]
+  },
+  {
+   "audit": [
+    [
+     "unknown",
+     null
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": {
+     "sha": "x"
+    },
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "",
+     "state": "ready"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "unreadable: an unattributed source that is malformed is unreadable, not empty",
+   "now": "2026-11-12T20:00:00Z",
+   "problems_contain": [
+    "unattributed unreadable: malformed"
+   ]
+  },
+  {
+   "audit": [
+    [
+     "unknown",
+     null
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {
+     "git": "fetch failed"
+    },
+    "waiters": []
+   },
+   "expect": {},
+   "items_lines": [],
+   "name": "unreadable: an empty store with git unreadable is not a clean board",
+   "now": "2026-11-12T20:00:00Z",
+   "problems_contain": [
+    "git unreadable: fetch failed"
+   ]
+  },
+  {
+   "audit": [
+    [
+     "unknown",
+     null
+    ],
+    [
+     "unknown",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {
+     "seats": "roster gone"
+    },
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "seats unreadable: roster gone",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "unreadable: a source an item does need surfaces on the board as well as on the item",
+   "now": "2026-11-12T20:00:00Z",
+   "problems_contain": [
+    "seats unreadable: roster gone"
+   ]
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": "git exploded",
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "evidence unreadable: malformed unreadable",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "unknown: a malformed unreadable (a string) fails closed, never read as nothing unreadable",
+   "now": "2026-11-12T20:00:00Z",
+   "problems_contain": [
+    "evidence unreadable: malformed unreadable"
+   ]
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": [
+     1,
+     2
+    ],
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "evidence unreadable: malformed unreadable",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "unknown: a malformed unreadable (a list of numbers) fails closed, never read as nothing unreadable",
+   "now": "2026-11-12T20:00:00Z",
+   "problems_contain": [
+    "evidence unreadable: malformed unreadable"
+   ]
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {
+     "git": 5
+    },
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "evidence unreadable: malformed unreadable",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "unknown: a malformed unreadable (a non-string reason) fails closed, never read as nothing unreadable",
+   "now": "2026-11-12T20:00:00Z",
+   "problems_contain": [
+    "evidence unreadable: malformed unreadable"
+   ]
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": 7,
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "evidence unreadable: malformed unreadable",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "unknown: a malformed unreadable (a number) fails closed, never read as nothing unreadable",
+   "now": "2026-11-12T20:00:00Z",
+   "problems_contain": [
+    "evidence unreadable: malformed unreadable"
+   ]
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 0,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/old-i1",
+      "tip": "0000000000000000000000000000000000000009"
+     }
+    ],
+    "chain": [
+     {
+      "commits": [
+       {
+        "items": [
+         "levain#1"
+        ],
+        "sha": "0000000000000000000000000000000000000002"
+       }
+      ],
+      "ref": "queue/a",
+      "tip": "0000000000000000000000000000000000000002"
+     }
+    ],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "waiting",
+     "reason_contains": "queue/a",
+     "state": "landing"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "orphan: a branch re-chained under new shas (ahead 0) beside the chain commits reads landing, not a conflict",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 0,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/old-i1",
+      "tip": "0000000000000000000000000000000000000009"
+     }
+    ],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "1 commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "orphan: work on main under new shas with the old branch at ahead 0 reads landed_not_closed, not ready_with_start",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 0,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/old-i1",
+      "tip": "0000000000000000000000000000000000000009"
+     }
+    ],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "no evidence of work",
+     "state": "ready"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "orphan: a branch with nothing of its own (ahead 0) is no starting point, the item reads ready",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 2,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/x-i1",
+      "tip": "0000000000000000000000000000000000000009"
+     }
+    ],
+    "chain": [
+     {
+      "commits": [
+       {
+        "items": [
+         "levain#1"
+        ],
+        "sha": "0000000000000000000000000000000000000002"
+       }
+      ],
+      "ref": "queue/a",
+      "tip": "0000000000000000000000000000000000000002"
+     }
+    ],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "conflict: in chain queue/a vs orphan branch seat/x-i1",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "orphan: ahead 2 still conflicts with the chain exactly as before",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 2,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/x-i1",
+      "tip": "0000000000000000000000000000000000000002"
+     }
+    ],
+    "chain": [
+     {
+      "commits": [
+       {
+        "items": [
+         "levain#1"
+        ],
+        "sha": "0000000000000000000000000000000000000002"
+       }
+      ],
+      "ref": "queue/a",
+      "tip": "0000000000000000000000000000000000000002"
+     }
+    ],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "conflict: in chain queue/a vs orphan branch seat/x-i1",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "orphan: a branch with ahead 2 whose tip is the chain's own tip sha is still an orphan (the reader counted, not the sha)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 2,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/x-i1",
+      "tip": "0000000000000000000000000000000000000007"
+     }
+    ],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000007"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "orphan branch seat/x-i1",
+     "state": "ready_with_start"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "orphan: a branch with ahead 2 whose tip sha happens to be on main is still an orphan (the reader counted, not the sha)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 2,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/x-i1",
+      "tip": "0000000000000000000000000000000000000009"
+     }
+    ],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "orphan branch seat/x-i1",
+     "state": "ready_with_start"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "precedence 6 over 8: commits on main with an orphan branch beside them read ready_with_start",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "1 commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "precedence 6 over 8: the same commits on main without the orphan branch read landed_not_closed",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "out/p.md": false
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [
+       "levain#1"
+      ],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "1 commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"out/p.md\", \"done_kind\": \"document\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "landed_not_closed: a document item whose closing trailer is on main but whose file is absent",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "out/p.md": false
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "1 commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"out/p.md\", \"done_kind\": \"document\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "landed_not_closed: the document item without the closing trailer reads the same (a trailer never weakens the signal)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "out/p.md": false
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [
+       "levain#1"
+      ],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "1 commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"out/p.md\", \"done_kind\": \"run\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "landed_not_closed: a run item whose closing trailer is on main but whose file is absent",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "out/p.md": false
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "1 commits on main",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"out/p.md\", \"done_kind\": \"run\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "landed_not_closed: the run item without the closing trailer reads the same (a trailer never weakens the signal)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {
+     "out/p.md": true
+    },
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [
+       "levain#1"
+      ],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "done",
+     "reason_contains": "document out/p.md exists",
+     "state": "done"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"out/p.md\", \"done_kind\": \"document\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "done: a document item whose closing trailer is on main and whose file exists",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "off",
+     "reason_contains": "",
+     "state": "cut"
+    },
+    "levain#2": {
+     "column": "backlog",
+     "reason_contains": "waits on levain#1: cut (",
+     "state": "blocked"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"date\": \"2026-11-12\", \"decision\": \"cut\", \"id\": \"levain#1\", \"op\": \"decide\", \"v\": 1, \"words\": \"Phill: ruled\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#1\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "blocked: a dependency that is cut is never met",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "off",
+     "reason_contains": "",
+     "state": "parked"
+    },
+    "levain#2": {
+     "column": "backlog",
+     "reason_contains": "waits on levain#1: parked (",
+     "state": "blocked"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"date\": \"2026-11-12\", \"decision\": \"parked\", \"id\": \"levain#1\", \"op\": \"decide\", \"v\": 1, \"words\": \"Phill: ruled\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#1\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "blocked: a dependency that is parked is never met",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "off",
+     "reason_contains": "",
+     "state": "out_of_1_0"
+    },
+    "levain#2": {
+     "column": "backlog",
+     "reason_contains": "waits on levain#1: out_of_1_0 (",
+     "state": "blocked"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"date\": \"2026-11-12\", \"decision\": \"out-of-1.0\", \"id\": \"levain#1\", \"op\": \"decide\", \"v\": 1, \"words\": \"Phill: ruled\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#1\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "blocked: a dependency that is out_of_1_0 is never met",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "waits on levain#2: cut (",
+     "state": "blocked"
+    },
+    "levain#2": {
+     "column": "off",
+     "reason_contains": "",
+     "state": "cut"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#2\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#1\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"date\": \"2026-11-12\", \"decision\": \"cut\", \"id\": \"levain#2\", \"op\": \"decide\", \"v\": 1, \"words\": \"Phill: ruled\"}"
+   ],
+   "name": "blocked: an item waiting on a decided item that waits back on it is blocked, not in a cycle",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T14:00:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "",
+     "state": "ready"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "fresh: evidence exactly 6 h old (21600 s) is still fresh",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "unknown",
+     null
+    ],
+    [
+     "unknown",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T13:59:59Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "origin/main as of 2026-11-12T13:59:59Z (older than 6 h)",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "unknown: evidence 6 h and one second old is stale",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 1,
+      "date": "2026-11-10T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/a-older-i1",
+      "tip": "00000000000000000000000000000000000000a1"
+     },
+     {
+      "ahead": 1,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/b-newer-i1",
+      "tip": "00000000000000000000000000000000000000a2"
+     }
+    ],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "orphan branch seat/b-newer-i1",
+     "state": "ready_with_start"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "ready_with_start: two orphan branches name the latest (alphabetical first is the older, oldest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 1,
+      "date": "2026-11-10T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/a-older-i1",
+      "tip": "00000000000000000000000000000000000000a1"
+     },
+     {
+      "ahead": 1,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/b-newer-i1",
+      "tip": "00000000000000000000000000000000000000a2"
+     }
+    ],
+    "chain": [
+     {
+      "commits": [
+       {
+        "items": [
+         "levain#1"
+        ],
+        "sha": "0000000000000000000000000000000000000002"
+       }
+      ],
+      "ref": "queue/a",
+      "tip": "0000000000000000000000000000000000000002"
+     }
+    ],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "vs orphan branch seat/b-newer-i1",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "conflict: the chain conflict names the latest orphan (alphabetical first is the older, oldest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 1,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/b-newer-i1",
+      "tip": "00000000000000000000000000000000000000a2"
+     },
+     {
+      "ahead": 1,
+      "date": "2026-11-10T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/a-older-i1",
+      "tip": "00000000000000000000000000000000000000a1"
+     }
+    ],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "orphan branch seat/b-newer-i1",
+     "state": "ready_with_start"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "ready_with_start: two orphan branches name the latest (alphabetical first is the older, newest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 1,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/b-newer-i1",
+      "tip": "00000000000000000000000000000000000000a2"
+     },
+     {
+      "ahead": 1,
+      "date": "2026-11-10T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/a-older-i1",
+      "tip": "00000000000000000000000000000000000000a1"
+     }
+    ],
+    "chain": [
+     {
+      "commits": [
+       {
+        "items": [
+         "levain#1"
+        ],
+        "sha": "0000000000000000000000000000000000000002"
+       }
+      ],
+      "ref": "queue/a",
+      "tip": "0000000000000000000000000000000000000002"
+     }
+    ],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "vs orphan branch seat/b-newer-i1",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "conflict: the chain conflict names the latest orphan (alphabetical first is the older, newest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 1,
+      "date": "2026-11-10T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/z-older-i1",
+      "tip": "00000000000000000000000000000000000000a1"
+     },
+     {
+      "ahead": 1,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/m-newer-i1",
+      "tip": "00000000000000000000000000000000000000a2"
+     }
+    ],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "orphan branch seat/m-newer-i1",
+     "state": "ready_with_start"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "ready_with_start: two orphan branches name the latest (alphabetical first is the newer, oldest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 1,
+      "date": "2026-11-10T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/z-older-i1",
+      "tip": "00000000000000000000000000000000000000a1"
+     },
+     {
+      "ahead": 1,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/m-newer-i1",
+      "tip": "00000000000000000000000000000000000000a2"
+     }
+    ],
+    "chain": [
+     {
+      "commits": [
+       {
+        "items": [
+         "levain#1"
+        ],
+        "sha": "0000000000000000000000000000000000000002"
+       }
+      ],
+      "ref": "queue/a",
+      "tip": "0000000000000000000000000000000000000002"
+     }
+    ],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "vs orphan branch seat/m-newer-i1",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "conflict: the chain conflict names the latest orphan (alphabetical first is the newer, oldest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 1,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/m-newer-i1",
+      "tip": "00000000000000000000000000000000000000a2"
+     },
+     {
+      "ahead": 1,
+      "date": "2026-11-10T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/z-older-i1",
+      "tip": "00000000000000000000000000000000000000a1"
+     }
+    ],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "ready",
+     "reason_contains": "orphan branch seat/m-newer-i1",
+     "state": "ready_with_start"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "ready_with_start: two orphan branches name the latest (alphabetical first is the newer, newest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [
+     {
+      "ahead": 1,
+      "date": "2026-11-11T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/m-newer-i1",
+      "tip": "00000000000000000000000000000000000000a2"
+     },
+     {
+      "ahead": 1,
+      "date": "2026-11-10T09:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "name": "seat/z-older-i1",
+      "tip": "00000000000000000000000000000000000000a1"
+     }
+    ],
+    "chain": [
+     {
+      "commits": [
+       {
+        "items": [
+         "levain#1"
+        ],
+        "sha": "0000000000000000000000000000000000000002"
+       }
+      ],
+      "ref": "queue/a",
+      "tip": "0000000000000000000000000000000000000002"
+     }
+    ],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "vs orphan branch seat/m-newer-i1",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "conflict: the chain conflict names the latest orphan (alphabetical first is the newer, newest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {
+      "np-aaaaaaaa": [
+       "levain#1"
+      ],
+      "np-bbbbbbbb": [],
+      "np-cccccccc": [
+       "levain#1"
+      ]
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "needs_you",
+     "reason_contains": "band np-aaaaaaaa, np-bbbbbbbb, np-cccccccc",
+     "state": "needs_you"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"np-bbbbbbbb\", \"done_kind\": \"band\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "needs_you: a band-kind item's own row and the rows naming it are listed sorted and once",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-10T00:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "ffffffffffffffffffffffffffffffffffffffff"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-11T00:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "1111111111111111111111111111111111111111"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "2 commits on main, last 111111111;",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "landed_not_closed: the last commit on main is named by date (oldest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "landed_not_closed",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-11T00:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "1111111111111111111111111111111111111111"
+     },
+     {
+      "closes": [],
+      "date": "2026-11-10T00:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "ffffffffffffffffffffffffffffffffffffffff"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "2 commits on main, last 111111111;",
+     "state": "landed_not_closed"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "landed_not_closed: the last commit on main is named by date (newest listed first)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "unknown",
+     "levain#2"
+    ],
+    [
+     "landed_not_closed",
+     "levain#1"
+    ],
+    [
+     "gate_expired",
+     "levain#3"
+    ],
+    [
+     "unattributed_work",
+     null
+    ],
+    [
+     "unknown_id_in_trailer",
+     "levain#77"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1",
+       "levain#77"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [
+     {
+      "sha": "abc",
+      "subject": "no item"
+     }
+    ],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "backlog",
+     "reason_contains": "",
+     "state": "landed_not_closed"
+    },
+    "levain#2": {
+     "column": "unknown",
+     "reason_contains": "",
+     "state": "unknown"
+    },
+    "levain#3": {
+     "column": "unknown",
+     "reason_contains": "",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#99\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"g\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#3\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "audit: the entries come out grouped by kind, in the declared kind order",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "unknown",
+     null
+    ],
+    [
+     "unknown",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#77"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "items file torn",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{"
+   ],
+   "name": "audit: a torn items file does not also audit trailer ids (they would all look unknown for a reported reason)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "gate_expired",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "gate \"VM sitting\" past its recheck 2026-11-01",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "audit: an expired gate lists its item once, as gate_expired",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "unknown",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "item:levain#99 is not in the store",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#99\"}, {\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"g\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "audit: an item unknown for an earlier cause is listed once, as unknown, even with an expired gate",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "past its recheck 2026-11-12",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-12\", \"words\": \"g\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate: the recheck date is compared in UTC (20:00 at UTC-5 on 11-12 is already 11-13 in UTC)",
+   "now": "2026-11-12T20:00:00-05:00"
+  },
+  {
+   "audit": [],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [
+     {
+      "closes": [
+       "levain#1"
+      ],
+      "date": "2026-11-12T12:00:00Z",
+      "items": [
+       "levain#1"
+      ],
+      "sha": "0000000000000000000000000000000000000003"
+     }
+    ],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "done",
+     "reason_contains": "closed by",
+     "state": "done"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a done item is never touched by an expired gate (no unknown, no audit entry)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "off",
+     "reason_contains": "",
+     "state": "cut"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"date\": \"2026-11-12\", \"decision\": \"cut\", \"id\": \"levain#1\", \"op\": \"decide\", \"v\": 1, \"words\": \"Phill: ruled\"}"
+   ],
+   "name": "gate ruling: a cut item is never touched by an expired gate",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "gate_expired",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {
+      "np-aaaaaaaa": [
+       "levain#1"
+      ]
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "needs_you",
+     "reason_contains": "band np-aaaaaaaa",
+     "state": "needs_you"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a needs_you item keeps needs_you and gets ONE gate_expired audit entry",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "gate_expired",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [
+     {
+      "branch": null,
+      "items": [
+       "levain#1"
+      ],
+      "name": "s",
+      "since": null
+     }
+    ],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "running",
+     "reason_contains": "seat s",
+     "state": "in_flight"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: an in-flight item keeps in_flight and gets one gate_expired audit entry",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "gate_expired",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [
+     {
+      "branch": null,
+      "items": [
+       "levain#2"
+      ],
+      "name": "s",
+      "since": null
+     }
+    ],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "gate \"VM sitting\" past its recheck 2026-11-01",
+     "state": "unknown"
+    },
+    "levain#2": {
+     "column": "running",
+     "reason_contains": "",
+     "state": "in_flight"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#2\"}, {\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a not-done item whose wait rests on the gate reads unknown, even with another unmet dependency",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [
+    [
+     "gate_expired",
+     "levain#1"
+    ]
+   ],
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "past its recheck",
+     "state": "unknown"
+    },
+    "levain#2": {
+     "column": "backlog",
+     "reason_contains": "waits on levain#1: unknown",
+     "state": "blocked"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-01\", \"words\": \"VM sitting\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"item\", \"ref\": \"levain#1\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a dependent of an item that is unknown on its gate reads blocked on that unknown",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "audit": [],
+   "evidence": {
+    "band": {
+     "open": {
+      "np-aaaaaaaa": [
+       "levain#1"
+      ]
+     },
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "needs_you",
+     "reason_contains": "",
+     "state": "needs_you"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [{\"kind\": \"gate\", \"recheck\": \"2026-11-12\", \"words\": \"g\"}], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "gate ruling: a gate whose recheck is today is still live for a needs_you item (no audit entry)",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#2": {
+     "column": "unknown",
+     "reason_contains": "items file torn: line 2: repo 'flow' disagrees with the id prefix",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#2\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"flow\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "fold: a record whose repo disagrees with its id prefix tears the file",
+   "now": "2026-11-12T20:00:00Z"
+  },
+  {
+   "evidence": {
+    "band": {
+     "open": {},
+     "resolved": {}
+    },
+    "branches": [],
+    "chain": [],
+    "documents": {},
+    "evidence_v": 1,
+    "fetched_at": "2026-11-12T19:30:00Z",
+    "main": [],
+    "merged": [],
+    "refs": [],
+    "seats": [],
+    "unattributed": [],
+    "unreadable": {},
+    "waiters": []
+   },
+   "expect": {
+    "levain#1": {
+     "column": "unknown",
+     "reason_contains": "items file torn",
+     "state": "unknown"
+    }
+   },
+   "items_lines": [
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"merged\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}",
+    "{\"at\": \"2026-11-12T10:00:00Z\", \"by\": \"desk 17\", \"depends_on\": [], \"done\": \"merged with a closing trailer\", \"done_kind\": \"eventually\", \"id\": \"levain#1\", \"op\": \"add\", \"origin\": \"desk 17\", \"repo\": \"levain\", \"tier\": \"sonnet\", \"title\": \"a row\", \"v\": 1, \"words\": \"\"}"
+   ],
+   "name": "fold: a malformed duplicate add tears the file (it is a malformed line, not a clean one)",
+   "now": "2026-11-12T20:00:00Z"
+  }
+ ],
+ "schema": 1
+}

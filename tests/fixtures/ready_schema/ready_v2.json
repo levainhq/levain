@@ -1,0 +1,28 @@
+{
+ "schema": 2,
+ "about": "READY_SCHEMA v2 contract sets: the closed state/column set, the audit kinds, the rule order, the board shape. The derivation cases are tests/fixtures/board_state/*.json. v1 stays in ready_v1.json until the readers switch.",
+ "board_schema": "ready-v2",
+ "max_evidence_age_s": 21600,
+ "future_skew_s": 300,
+ "states": [
+  {"state": "cut", "column": "off"},
+  {"state": "parked", "column": "off"},
+  {"state": "out_of_1_0", "column": "off"},
+  {"state": "done", "column": "done"},
+  {"state": "needs_you", "column": "needs_you"},
+  {"state": "landing", "column": "waiting"},
+  {"state": "in_flight", "column": "running"},
+  {"state": "landed_not_closed", "column": "backlog"},
+  {"state": "blocked", "column": "backlog"},
+  {"state": "ready_with_start", "column": "ready"},
+  {"state": "needs_grooming", "column": "backlog"},
+  {"state": "ready", "column": "ready"},
+  {"state": "unknown", "column": "unknown"}
+ ],
+ "columns": ["off", "done", "needs_you", "waiting", "running", "backlog", "ready", "unknown"],
+ "audit_kinds": ["unknown", "landed_not_closed", "gate_expired", "unattributed_work", "unknown_id_in_trailer"],
+ "precedence": ["decision", "done", "needs_you", "landing", "in_flight", "landed_not_closed", "blocked", "ready_with_start", "needs_grooming", "ready"],
+ "board_keys": ["schema", "as_of", "items", "audit", "unattributed", "problems"],
+ "state_keys": ["id", "repo", "title", "tier", "state", "column", "reason", "refs", "as_of"],
+ "audit_entry_keys": ["kind", "id", "why"]
+}
