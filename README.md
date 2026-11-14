@@ -115,8 +115,7 @@ Your week 1 will look like the first snapshot. That's the right starting place, 
 
 This is why Levain exists instead of just installing a memory library. Raw memory libraries quietly rot, because episodes pile up but you only recall what you happen to remember to query. A library can't fix that without hooking your session, and hooking every prompt would cost it the neutrality that lets it run under any harness. So that's the harness's job, and it's what Levain wires:
 
-- **Proven patterns surface on collision.** A crystallized pattern drops into context when your prompt touches its domain.
-- **Crystallized patterns recall per turn.** Your proven, stable wisdom is held out of the always-loaded context and surfaced when what you're doing calls for it. Useful without clogging the window.
+- **Crystallized patterns recall per turn.** A crystallized pattern drops into context when your prompt touches its domain. Your proven, stable wisdom is held out of the always-loaded context and surfaced when what you're doing calls for it. Useful without clogging the window.
 
 The store is universal; the *firing* is the harness's job. (Under Codex there's a platform caveat on whether hooks fire at all — see *Boundaries, kept honest*. `levain verify-hooks` proves your wiring is correct regardless.)
 
