@@ -52,6 +52,8 @@ try:
 except ImportError:                              # pragma: no cover - Windows: guarded writes are refused anyway
     fcntl = None  # type: ignore[assignment]
 
+_NO_LOCK_REASON = "this platform has no file locking, which the compare-and-set needs"
+
 from levain.intention_legacy import STORE_DOC_KEY_OPEN, STORE_DOC_KEY_OPEN_V1
 
 __all__ = ["BACKUP_SUBDIR", "LEDGER_PREFIX", "LoopMigrationReport", "LoopPlan", "LoopRevertReport", "MigrationReport",
@@ -121,7 +123,7 @@ def migrate_seed_to_someday(paths: Any, *, now: datetime | None = None,
     if not ids:
         return report
     if fcntl is None:                            # pragma: no cover - the guarded writes below need the POSIX lock
-        report.refused = "this platform has no file locking, which the compare-and-set needs"
+        report.refused = _NO_LOCK_REASON
         return report
     # The anneal names the rewrite needs come BEFORE the backup (1111-32 L1 MED-1): an anneal-memory older than the pin has
     # no schema-2 open key (the store guard refuses it), and finding that out after the copy left a raw ImportError mid-update and one
@@ -449,15 +451,12 @@ def migrate_loop_to_someday(paths: Any, *, now: datetime | None = None,
         report.refused = f"the store {store_path} cannot be read ({exc})"
         return report
     report.unknown = unknown
-    if not targets:
-        if keyless and store_path.parent.is_dir():   # read fine (a store not yet made reads as empty): close the window before the entity's first add
-            try:                                 # the ledger holds ids only, no store bytes: no .gitignore change for it
-                report.ledger = _write_ledger(dest_dir, now or datetime.now(timezone.utc), report, store_path)
-            except OSError as exc:
-                report.ledger_error = str(exc)
+    # a no-op run closes the window only when it is open and the store's directory exists (a store not yet made reads as empty)
+    closes_window = not targets and keyless and store_path.parent.is_dir()
+    if not targets and not closes_window:
         return report                            # no pin check, no copy, no store write (idempotent)
     if fcntl is None:                            # pragma: no cover - the guarded writes below need the POSIX lock
-        report.refused = "this platform has no file locking, which the compare-and-set needs"
+        report.refused = _NO_LOCK_REASON
         return report
     try:                                         # the anneal names and the pin check come BEFORE the copy, as the seed rewrite's do
         from anneal_memory.spores import IntentionError
@@ -470,6 +469,12 @@ def migrate_loop_to_someday(paths: Any, *, now: datetime | None = None,
                           f"pip install -U 'anneal-memory>=2.0.0,<2.1'; {exc}); nothing was copied or rewritten")
         return report
     when = now or datetime.now(timezone.utc)
+    if closes_window:                            # nothing to rewrite: the ledger holds ids only, no store copy, no .gitignore change
+        try:
+            report.ledger = _write_ledger(dest_dir, when, report, store_path)
+        except OSError as exc:
+            report.ledger_error = str(exc)
+        return report
     if backup_dir is None:
         from levain.install import _ensure_gitignored
 
@@ -575,8 +580,12 @@ def _read_ledger(path: Path | str, store_path: Path) -> dict[str, Any] | str:
     if not isinstance(unmigrated, int) or isinstance(unmigrated, bool):
         return "has no unmigrated count"
     named = doc.get("store")
-    if not isinstance(named, str) or os.path.realpath(named) != os.path.realpath(store_path):
-        return f"was written for another store ({named!r})"
+    try:                                         # a NUL byte or an over-long name makes realpath raise: not this store's ledger
+        same = isinstance(named, str) and os.path.realpath(named) == os.path.realpath(store_path)
+    except Exception:
+        same = False
+    if not same:
+        return f"was written for another store ({named!r:.80})"
     if "reverted" in doc:
         return "was already reverted"
     return doc
@@ -623,6 +632,9 @@ def revert_loop_migration(paths: Any, ledger: Path | str) -> LoopRevertReport:
     key-absent window and a second revert of it refuses."""
     report = LoopRevertReport()
     store_path = Path(paths.intentions_json)
+    if fcntl is None:                            # the mark below needs the lock: refuse before a row is restored
+        report.refused = f"{_NO_LOCK_REASON}; nothing was changed"
+        return report
     doc = _read_ledger(ledger, store_path)
     if isinstance(doc, str):
         report.refused = f"the ledger {ledger} {doc}; nothing was changed"
