@@ -16,7 +16,7 @@
   // The kernel's own built-in panel ids and the native component each feeds. A panel with any other
   // id (or kind) is a downstream's and takes the generic path. A Map: ids come from the wire, and an
   // id like "constructor" or "__proto__" must never reach an object's prototype.
-  const NATIVE = new Map([["tray", "tray"], ["loops", "intentions"], ["episodes", "episodes"],
+  const NATIVE = new Map([["tray", "tray"], ["episodes", "episodes"],
     ["edits", "edits"], ["health", "health"], ["graph", "graph"], ["crystals", "crystals"], ["wraps", "wraps"]]);
   // The /1 kind names the kernel normalises to the /2 ones; a payload from an older kernel may still carry them.
   const ALIAS = { "triage-list": "list", metric: "status-dots", visual: "ambient", prose: "brief" };
@@ -471,7 +471,7 @@
       const head1 = typeof v.headline === "string" && v.headline ? v.headline : "";
       if (typeof v.markdown === "string" && v.markdown) out.markdown = v.markdown;   // the card's own head carries the title: a bold copy of it above the text read as a second title
       else { out.typed = true; out.brief = { headline: head1, lines: lines, title: typeof v.title === "string" ? v.title : "", source: typeof v.source === "string" ? v.source : "",
-        threads: Array.isArray(v.threads) ? v.threads : null, overnight: isObj(v.overnight) ? v.overnight : null }; }
+        overnight: isObj(v.overnight) ? v.overnight : null }; }
     } else if (kind === "reading") {
       need(isNum(v.value) || (typeof v.value === "string" && v.value), "reading value");
       need(v.sub === undefined || (Array.isArray(v.sub) && v.sub.every((s) => isObj(s) && typeof s.label === "string")), "reading sub");
@@ -547,8 +547,8 @@
     return t;
   }
 
-  // Which of the four tabs show a panel (F3). Morning is the intake (Today, the glance, the Tray), Board the work (Tray, loops, Now,
-  // episodes, Team), Build the live agents (the sessions, hot loops, edits, results), Memory the mind (the six sections,
+  // Which of the four tabs show a panel (F3). Morning is the intake (Today, the glance, the Tray), Board the work (Tray, Now,
+  // episodes, Team), Build the live agents (the sessions, edits, results), Memory the mind (the six sections,
   // crystals, cognition, identity). The hero is the page's header and is in all four. A panel the table does not name takes its
   // region's tabs: a glance tile on Morning and Board, the brief on Morning, a work card on Board, a mind or identity card on Memory.
   const ALL_TABS = "morning board build memory";
@@ -556,8 +556,7 @@
   // rather than an inherited function.
   const tableOf = (o) => Object.assign(Object.create(null), o);
   const TABS_OF_ID = tableOf({
-    // Open loops is machine-side (Phill 11-07: the Tray BECOMES the List, Open loops stays machine-side): off the default Board tab, on Build
-    tray: "morning board", loops: "build", episodes: "board", "team-status": "board",
+    tray: "morning board", episodes: "board", "team-status": "board",
     edits: "build", jobs: "build", sessions: "morning board", "coord-morning": "morning board", "review-queue": "morning board", topology: "build", agents: "build", health: "memory",
     graph: "memory", wraps: "memory", crystals: "memory"
   });
@@ -836,10 +835,9 @@
       for (const r of rows) if (r && typeof r.id === "string" && Array.isArray(r.actions) && r.actions.length) {
         view.targets.rows[r.id] = targetOf(pid, r);
       }
-      if ((rowsAct || pActions.length) && (nat === "tray" || nat === "loops" || nat === "episodes")) entry.edit_class = "B";
-      const lists = { tray: "tray", loops: "open_intentions" };
-      if ((nat === "tray" || nat === "loops") && (panel.kind === "triage-list" || panel.kind === "list")) {
-        view[lists[pid]] = rows.map((r) => intentionOf(pid, r, groupTitles, hiddenRows, panel.today));
+      if ((rowsAct || pActions.length) && (nat === "tray" || nat === "episodes")) entry.edit_class = "B";
+      if (nat === "tray" && (panel.kind === "triage-list" || panel.kind === "list")) {
+        view.tray = rows.map((r) => intentionOf(pid, r, groupTitles, hiddenRows, panel.today));
         if (nat === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
           // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
           const named = head.views.filter((v) => isObj(v) && typeof v.id === "string" && Array.isArray(panel.view_rows[v.id]));
@@ -1449,37 +1447,13 @@
   // the rest read as the card's body. The first-seen order is kept; nothing is sorted.
   const BRIEF_SIDE_LINES = 6;
   // Where to begin, as the mock draws it: a head (title, what it reads from), the lead in large type with what comes after it,
-  // the overnight line, and a Threads column: the open loops grouped by the repo each one names (the row tags' own reading), a
-  // loop naming none under its domain, else "other". Loudest first: most loops, then the hottest tier.
-  const THREADS_SHOWN = 5;
-  const TIER_RANK = { hot: 0, warm: 1, cold: 2, parked: 3 };
-  function groupThreads(threads) {
-    const sky = root.LevainSky;
-    const matchers = matchersOf(sky);
-    const groups = new Map();
-    for (const t of threads) {
-      if (!isObj(t) || typeof t.text !== "string") continue;
-      const text = visible(t.text);
-      const dom = typeof t.domain === "string" ? visible(t.domain).trim() : "";
-      // the repo a row's tag shows: its domain when that is a repo the sky knows (Build's Open loops chip), else the repo its words name
-      const hit = (dom && matchers.find(([n]) => n.toLowerCase() === dom.toLowerCase())) || matchers.find(([, re]) => re.test(text));
-      const key = hit ? "r:" + hit[0] : "d:" + (dom || "other");
-      let g = groups.get(key);
-      if (!g) { g = { repo: hit ? hit[0] : "", label: hit ? "" : (dom || "other"), top: text, n: 0, rank: 9, order: groups.size }; groups.set(key, g); }
-      g.n++;
-      const r = t.tier in TIER_RANK ? TIER_RANK[t.tier] : 9;
-      if (r < g.rank) { g.rank = r; g.top = text; }   // the group is named by its hottest loop
-    }
-    return Array.from(groups.values()).sort((a, b) => b.n - a.n || a.rank - b.rank || a.order - b.order);
-  }
+  // and the overnight line.
   function paintBriefCard(host, b) {
     const head = el("div", "brief-head");
     // levain's own card is named for what it holds: the Tray's next items (the data's "Where to begin" would read twice beside flow's plan card)
     head.appendChild(el("h3", "", b.title === "Where to begin" ? "Next from the List" : b.title));
     head.appendChild(el("span", "sp"));
-    const hasThreads = Array.isArray(b.threads) && groupThreads(b.threads).length > 0;
-    // where the card has a lower heading (the loops column) the "from ..." caption sits under it, not floating in the head
-    if (b.source && !hasThreads) head.appendChild(el("span", "stamp", b.source));
+    if (b.source) head.appendChild(el("span", "stamp", b.source));
     host.appendChild(head);
     const body = el("div", "brief-cols");
     const lead = el("div", "brief-lead");
@@ -1508,28 +1482,6 @@
       }
     }
     body.appendChild(lead);
-    const groups = Array.isArray(b.threads) ? groupThreads(b.threads) : [];
-    if (groups.length) {
-      const col = el("div", "brief-threads");
-      col.appendChild(el("div", "k", "Loops by thread"));
-      if (b.source) col.appendChild(el("div", "brief-src", b.source));
-      for (const g of groups.slice(0, THREADS_SHOWN)) {
-        const row = el("div", "thread");
-        row.appendChild(el("span", "t", g.repo ? g.top : g.label));
-        row.appendChild(el("span", "pill", g.n + (g.n === 1 ? " loop" : " loops")));
-        if (g.repo) {
-          const sky = root.LevainSky;
-          const tag = el("span", "rp-tag", g.repo);
-          const key = sky && typeof sky.hueKey === "function" ? sky.hueKey(g.repo) : "";
-          if (key) tag.dataset.repo = key;
-          row.appendChild(tag);
-        }
-        col.appendChild(row);
-      }
-      if (groups.length > THREADS_SHOWN) col.appendChild(el("p", "xnote", "+" + (groups.length - THREADS_SHOWN) + " more"));
-      body.appendChild(col);
-    }
-    body.classList.toggle("has-threads", groups.length > 0);
     host.appendChild(body);
   }
   function paintBrief(host, b, region) {
@@ -2226,9 +2178,9 @@
     }
     return repoMatchers;
   }
-  // The work lists' rows (Tray, Open loops, Now) carry the repo tag in the meta line, after the id, the date and the age, as the
+  // The work lists' rows (Tray, Now) carry the repo tag in the meta line, after the id, the date and the age, as the
   // mock draws it; every other row keeps it at the head of its text. `tagHome` is where that tag lives for a row.
-  const META_TAG_PANELS = ["tray", "loops"];
+  const META_TAG_PANELS = ["tray"];
   function tagHome(row, clause) {
     const panel = row.closest("[data-ck-panel]");
     const inMeta = !!panel && META_TAG_PANELS.indexOf(panel.dataset.ckPanel) >= 0 && row.classList.contains("row");
@@ -2242,7 +2194,7 @@
       if (!clause) continue;
       if (row.dataset.surface) continue;   // a List row names its own origin (a pill the page drew); its words never choose one
       const home = tagHome(row, clause);
-      if (home.inMeta && row.querySelector(":scope > .k7-repo")) continue;   // a chip already names the repo (Build's loops)
+      if (home.inMeta && row.querySelector(":scope > .k7-repo")) continue;   // a chip already names the repo
       // decided again on every pass, on the row's words without its own tag: a repo noted later can be the longer name
       // the row means, or move a hue slot
       const had = home.host.querySelector(":scope > .rp-tag:not(.k7-repo)");
@@ -2274,7 +2226,7 @@
       // the tag changes the clause's length after the clause toggles were measured: measure this row again
       if (clause.clientHeight && clause.classList.contains("clampable") && !row.classList.contains("row-expanded")) row.classList.toggle("has-more", clause.scrollHeight > clause.clientHeight);
     }
-    // Build's repo chips (session rows, Open loops rows) take the sky's hue for a repo its registry knows, and stay neutral otherwise
+    // Build's repo chips (session rows) take the sky's hue for a repo its registry knows, and stay neutral otherwise
     for (const c of document.querySelectorAll(".k7-repo[data-repo-facet]")) {
       const facet = (c.dataset.repoFacet || "").toLowerCase();
       const known = facet ? matchers.find(([n]) => n.toLowerCase() === facet) : undefined;
@@ -2405,20 +2357,6 @@
     if (N && N.history()) mark(12);
     else applyMode("board", true);
   }
-  // The Work lens's open loop: its row in the Open loops panel (on the tab that shows that panel), scrolled to and lit.
-  // Finds the row first: with no such row on the page nothing moves and the caller says so (false); null when an unsaved edit would not let it unfold; "hidden" for any other failure.
-  function openLoop(intentionId) {
-    const L = root.LevainLoops;
-    if (!L) return false;
-    const row = L.find(intentionId);
-    if (!row) return false;
-    const panel = row.closest(".panel");
-    if (panel) revealTab(panel);
-    if (L.go(intentionId)) return true;
-    // null = an unsaved edit refused the unfold; "hidden" = the row is there but could not be shown; false = not in the panel
-    const why = typeof L.why === "function" ? L.why() : "";
-    return why === "edit" ? null : why === "absent" ? false : "hidden";
-  }
   // The topology panel's state, read once for the header lens and the Sessions card alike. The panel is hidden on the page (the header draws it), so a
   // fault is the header's to say, three ways: a failed fetch (ts.fault), an error record the kernel sent (data.error), or the page's own
   // "unavailable" card (an external panel, no state of its own).
@@ -2490,7 +2428,7 @@
     if (I.tv) {
       // the Replay strip rides the page's own read path (LevainCockpitTransport.readJson: its auth headers and token handling); resume re-reads the live topology
       const replay = I.canReplay ? { readJson: root.LevainCockpitTransport.readJson, resume: () => refetchPanel("topology") } : undefined;
-      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, openLoop, replay }); } catch (e) { fail = true; }
+      try { body = TV.render(I.tv, { lens, lensSeg: toggle, repaint, openCard: openNeedsYouCard, replay }); } catch (e) { fail = true; }
     }
     if (body) { host.replaceChildren(body); return; }
     // a fault, or a throw while drawing: said in words with the switch beside it, so the Event graph is one click away

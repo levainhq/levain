@@ -35,7 +35,6 @@
     running: ["Running", "a worker or a live job is on it"],
     done: ["Done", "finished"],
   };
-  const ROW_PREFIX = "intention:";   // the cockpit's id of an intention row; the open-loop id is what follows it
   const NODE_WORDS = { waiting: "waiting on you", errored: "errored", stalled: "stalled", running: "running", idle: "idle" };
   const KIND_WORDS = { dispatch: "dispatch", intention: "open loop", consent: "consent", question: "question", unattached: "unattached" };
   const CARD_WORDS = { consent: "a consent request", question: "a question", dispatch: "a dispatch contract" };
@@ -469,31 +468,6 @@
     }
     return c;
   }
-  // an open loop opens its row in the page's Open loops panel, through the page's own callback (this file knows no page DOM)
-  function openLoopCard(node, t, opts) {
-    if (!opts || typeof opts.openLoop !== "function" || typeof t.id !== "string" || t.id.indexOf(ROW_PREFIX) !== 0 || t.id.length <= ROW_PREFIX.length) return;
-    const sid = t.id.slice(ROW_PREFIX.length);
-    const title = node.querySelector(".tv-task-t");
-    node.classList.add("tv-open");
-    node.dataset.loop = sid;
-    const said = "open this loop in Open loops";
-    node.title = said;
-    // the title is the one focusable control (a card that is itself a button would hold the worker chips inside a button); a tap anywhere else
-    // on the card still opens it. The page says whether the row was there: false = not in Open loops now, null = an unsaved edit kept it shut, any other value = it could not be shown.
-    const go = () => {
-      const r = opts.openLoop(sid);
-      node.title = r === false ? "not in Open loops now" : r === null ? "finish the open edit first" : r === true || r === undefined ? said : "could not open it in Open loops";
-    };
-    if (title) {
-      title.setAttribute("role", "button");
-      title.tabIndex = 0;
-      title.addEventListener("keydown", (ev) => { if (ev.repeat) return; if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); ev.stopPropagation(); go(); } });
-    }
-    node.addEventListener("click", (ev) => {
-      const hit = ev.target.closest && ev.target.closest(".tv-chip, a, button, [role=button]");
-      if (!hit || hit === title || hit === node || !node.contains(hit)) go();
-    });
-  }
   function taskCard(t, byId, lost, opts, v) {
     const c = el("article", "tv-task " + t.state + (t.kind === "unattached" ? " tv-loose" : ""));
     c.dataset.task = t.id;
@@ -525,7 +499,6 @@
     if (t.kind !== "unattached") foot.appendChild(el("span", "tv-cost" + (costText(t.cost) === "cost not tracked" ? " dim" : ""), costText(t.cost)));
     if (foot.children.length) c.appendChild(foot);
     if (t.state === "waiting") openable(c, t.card, opts);
-    else if (t.kind === "intention") openLoopCard(c, t, opts);
     return c;
   }
   function outcomeList(t) {
@@ -1966,7 +1939,7 @@
   }
 
   // ---- the body ----
-  // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to, openLoop(intentionId): open an open loop's row,
+  // v: the topology value. opts: {repaint(): redraw the card, openCard(id): open the Needs-you row a waiting item links to,
   // replay: {readJson(url, signal), resume()} when the panel head says `replay: true`}
   function render(v, opts) {
     const o0 = opts || {};

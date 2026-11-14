@@ -242,17 +242,14 @@
     board.appendChild(p);
   }
 
-  // NOTE (Slice 3, 2026-06-18): this PARKED MCP-App variant renders only `open_intentions`
-  // (now loops-only). The Tray projection (view.tray) is NOT ported
-  // here — the live surface is web/dashboard_core.js. When this app un-parks, port the
-  // Tray panel from there (renderTray) so it doesn't silently hide them.
+  // NOTE: this PARKED MCP-App variant draws the List (view.tray) as plain rows. The live surface is web/dashboard_core.js (renderTray).
   function renderIntentions(view) {
-    const list = view.open_intentions || [];
-    const p = panel(`Open loops (${list.length})`);
-    if (list.length === 0) { p.appendChild(el("p", "empty", "no open prospective loops")); board.appendChild(p); return; }
+    const list = view.tray || [];
+    const p = panel(`List (${list.length})`);
+    if (list.length === 0) { p.appendChild(el("p", "empty", "nothing on the List")); board.appendChild(p); return; }
     for (const s of list) {
       const row = el("div", "row");
-      if (s.tier) row.appendChild(el("span", "tier", `[${s.tier}]`));
+      if (s.tier === "parked") row.appendChild(el("span", "tier", "[parked]"));
       row.appendChild(el("span", "clause", s.text));
       if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
       p.appendChild(row);
