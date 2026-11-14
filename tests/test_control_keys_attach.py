@@ -399,8 +399,23 @@ def test_short_lived_attachments_back_off(monkeypatch):
     # L3 r1 (codex MED 4, complement LOW 2): a CONTROL that answers KEYS-ATTACH ok and closes at once sees GROWING gaps
     # between keys' connects (the backoff applies after a short-lived attachment, not only after a failed open); one
     # healthy attachment (a SESSIONS answered) resets it, so the connect after that one comes at once.
-    monkeypatch.setattr(K, "ATTACH_RETRY_FIRST_S", 0.05)
-    monkeypatch.setattr(K, "ATTACH_RETRY_MAX_S", 0.8)
+    # The assertion is about what the loop REQUESTS (the `asyncio.sleep` arguments), not about wall-clock ratios: a gap
+    # is the requested sleep plus per-attachment overhead the machine decides, so a ratio between gaps flakes on a
+    # loaded runner. Wall-clock appears only as a lower bound (load only lengthens a gap). Unusual constants make the
+    # backoff sleeps distinguishable from every other sleep in the process.
+    first, cap = 0.0501, 0.8
+    monkeypatch.setattr(K, "ATTACH_RETRY_FIRST_S", first)
+    monkeypatch.setattr(K, "ATTACH_RETRY_MAX_S", cap)
+    want = [first, first * 2, first * 4, first * 8, cap, cap]    # 16 * first is past the cap
+    asked: list = []                                             # (loop time of the request, requested seconds)
+    real_sleep = asyncio.sleep
+
+    async def recording_sleep(delay, *a, **kw):
+        if delay in set(want):
+            asked.append((asyncio.get_running_loop().time(), delay))
+        return await real_sleep(delay, *a, **kw)
+
+    monkeypatch.setattr(K.asyncio, "sleep", recording_sleep)
 
     async def body(k, srv):
         srv.close_after_attach = True
@@ -410,16 +425,26 @@ def test_short_lived_attachments_back_off(monkeypatch):
         gaps = [b - a for a, b in zip(at, at[1:])]
         srv.close_after_attach, srv.answer_sessions = False, True
         n = len(srv.conns)
-        await R3.aio_until(lambda: len(srv.conns) >= n + 2, timeout=15, what="a healthy attachment, then the next")
-        reset_gap = srv.conns[n + 1]["at"] - srv.conns[n]["at"]
-        return {"gaps": gaps, "reset_gap": reset_gap}
+        await R3.aio_until(lambda: len(srv.conns) > n and srv.conns[n]["sessions"] >= 1, timeout=15,
+                           what="a healthy attachment (its SESSIONS answered)")
+        srv.close_after_attach, srv.answer_sessions = True, False    # the attachment after it is short-lived again
+        await R3.aio_until(lambda: len(srv.conns) >= n + 2 and [1 for t, _ in asked if t > srv.conns[n]["at"]],
+                           timeout=15, what="the next attachment, then the sleep asked after it")
+        return {"gaps": gaps, "asked": list(asked), "healthy_at": srv.conns[n]["at"],
+                "next_at": srv.conns[n + 1]["at"]}
 
     out = _with_keys(body)
-    gaps = out["gaps"]
-    assert all(g >= 0.04 for g in gaps), out
-    assert all(b > a * 1.5 for a, b in zip(gaps, gaps[1:4])), out   # doubling from 0.05 s
-    # the healthy attachment lasted ~0.1 s past its SESSIONS answer; the connect after it does not wait the backoff
-    assert out["reset_gap"] < 0.4, out
+    requested = [d for _, d in out["asked"]]
+    # the sequence of requested sleeps: doubling from the first, held at the cap (one more may already be asked when
+    # the sixth connect is seen: it is the cap as well)
+    assert requested[:6] == want and all(d == cap for d in requested[6:7]), out
+    # connect i+1 follows sleep i+1 (connect 1 follows the first): every measured gap is at least its requested sleep
+    assert all(g >= d - 0.001 for g, d in zip(out["gaps"], want[1:])), out
+    # a healthy attachment resets the backoff: no backoff sleep is asked between its connect and the next one
+    assert not [t for t, _ in out["asked"] if out["healthy_at"] < t <= out["next_at"]], out
+    # ... and the first sleep asked after it is the FIRST one again, not the cap the backoff had reached
+    after = [d for t, d in out["asked"] if t > out["healthy_at"]]
+    assert after[0] == first, out
 
 
 OVERRUN = {"session": S1, "route": "r", "model": "m1", "ref": ["a" * 32, "b" * 32, 7], "overrun": 5,
