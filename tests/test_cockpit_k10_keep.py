@@ -9,17 +9,18 @@ served cockpit with a long Tray: a tall intention at the top and thirty more und
 from __future__ import annotations
 
 import threading
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from anneal_memory.spores import IntentionStore
 from tests.test_cockpit_flip_parity import _drive, needs_browser
-from tests.test_cockpit_k2a import TODAY, _install
+from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_k4a_needs import DESKTOP
 from tests.test_cockpit_scroll_keep_page import _serve_plain
 
-PARA = "The whole situation, what was tried, what failed, who owns it and what would close it. " * 6
+TODAY = date.today()   # the rows' own dates come from the clock the page reads, never a fixed day
+PARA ="The whole situation, what was tried, what failed, who owns it and what would close it. " * 6
 GIANT = "GIANTTRAY " + "\n\n".join(f"{i}. {PARA}" for i in range(8))
 PANEL = "document.querySelector('[data-ck-panel=tray]')"
 BODY = f"{PANEL}.querySelector('.pbody')"
@@ -44,6 +45,12 @@ def _long_tray(tmp_path: Path) -> tuple[Path, Any]:
     for i in range(30):
         store.add(type="task", text=f"TRAYBULK {i:02d} a note " + PARA, disposition="seed", today=TODAY - timedelta(days=i % 5))
     store.add(type="task", text=GIANT, disposition="seed", today=TODAY + timedelta(days=2))   # newest: the first row of the Tray
+    # `_install` pins its own dates to k2a's fixed 2026-10-10 (a held seed due 10-15, a dated seed): once the real clock passes them the
+    # List draws them as NOW rows above every undated seed, the card draws three rows, and the tall row is folded away for good (never
+    # drawn, never has-more). These tests need the tall row drawn on any day: clear the install's NOW rows, whatever today is.
+    for r in store.list_open():
+        if r["text"] in ("a held seed", "a keep note", "a tray seed", "a loop", "a parked loop"):
+            store.descend(r["id"], kind="composted", today=TODAY)
     return root, src
 
 
@@ -154,12 +161,6 @@ def test_opening_another_row_keeps_the_reading_place(tmp_path: Path) -> None:
     root, src = _long_tray(tmp_path)
     store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     store.add(type="task", text="ABOVETRAY " + PARA, disposition="seed", today=TODAY + timedelta(days=3))   # newest: above the tall one
-    # The List is time-first (10db9bc02): `_install`'s dated seed and its note are NOW rows and sort above every undated seed, and the
-    # card draws only three rows, so with them present ABOVETRAY takes the last drawn place and folds the tall row away (it is then never
-    # drawn, never has-more, and the wait below times out). This test needs ABOVETRAY and the tall row both drawn: clear the two NOW rows.
-    for r in store.list_open():
-        if r["text"] in ("a held seed", "a keep note"):
-            store.descend(r["id"], kind="composted", today=TODAY)
     above = f"[...{PANEL}.querySelectorAll('.row')].find(r => r.textContent.indexOf('ABOVETRAY') >= 0)"
     click = (f"(async () => {{ const b = {BODY}; {above}.querySelector(':scope > .clause-toggle').click();"
              " await new Promise(r => setTimeout(r, 400)); return Math.round(b.scrollTop); })()")
