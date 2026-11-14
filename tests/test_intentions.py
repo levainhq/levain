@@ -79,6 +79,14 @@ def test_disposition_of_defaults_and_falsy_read_as_someday():
     assert disposition_of({"disposition": "GARBAGE"}) == "GARBAGE"  # an unknown value is shown by name
 
 
+@pytest.mark.parametrize("bad", [0, False, [], {}, 7])
+def test_disposition_of_passes_a_malformed_value_through_as_unknown(bad):
+    """Only None, "" and the literal `loop` default; a falsy non-string is NOT someday (the migration reports it unknown, so
+    the read must not disagree and let it into the Tray-only transitions)."""
+    assert disposition_of({"disposition": bad}) == bad
+    assert not is_tray({"disposition": bad})
+
+
 def test_is_loop_is_false_for_every_intention():
     """No class flows into the entity's own cognition any more (Phill np-10262267 (a), np-c3029a8a (a)): the name
     stays as the drift-contract twin."""

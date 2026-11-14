@@ -254,14 +254,14 @@ BUCKET_TRAY = "tray"   # every intention row, parked ones included, and a legacy
 
 def disposition_of(item: Mapping[str, Any]) -> str:
     """The disposition an intention READS as. An absent, empty or ``None`` value and the literal ``loop`` (a retired
-    name) all read as :data:`DEFAULT_DISPOSITION` (``someday``); any other string is returned as stored, so an
-    unknown value is still shown by name.
+    name) all read as :data:`DEFAULT_DISPOSITION` (``someday``); any other value (a string or not) is returned as
+    stored, so an unknown value is still shown by name.
 
     The default lives at READ because the entity's own write, anneal's ``intention_add``, cannot carry a disposition:
     a key-absent row is created after any migration. A client that snapshots ``someday`` for such a row is mapped to the
     raw compare-and-set value by the write seams (``levain.writes._client_snapshot``)."""
     d = item.get("disposition")
-    if not d or d == LOOP_DISPOSITION:
+    if d is None or d == "" or d == LOOP_DISPOSITION:
         return DEFAULT_DISPOSITION
     return d
 
