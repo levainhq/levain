@@ -93,10 +93,10 @@ from anneal_memory import (  # the SHARED cross-process continuity lock
 
 from levain.idempotency import StoreCorruptError  # the at-most-once dedup keystore's corrupt sentinel
 from levain.intentions import (  # the operator-I/O disposition vocabulary (anneal stays blind)
-    LOOP_DISPOSITION,
-    NON_COGNITION_DISPOSITIONS,
+    DEFAULT_DISPOSITION,
     RETIRED_HANDOFF_MSG,
     RETIRED_KEEP_NOTE_MSG,
+    RETIRED_LOOP_MSG,
     RETIRED_DISPOSITIONS,
     TRAY_WRITE_DISPOSITIONS,
     WRITE_DISPOSITIONS,
@@ -105,7 +105,6 @@ from levain.intentions import (  # the operator-I/O disposition vocabulary (anne
     guarded_intention_store,
     refuse_retired_disposition,
     disposition_of,
-    is_loop,
     is_note,
     is_tray,
 )
@@ -1681,31 +1680,21 @@ def _audit_verb(
     return edit_id
 
 
-def _normalize_expect_disposition(value: Any) -> str | None:
-    """Map a client SNAPSHOT disposition (the rendered row's value) → anneal's RAW
-    compare-and-set value. A plain loop RENDERS as ``LOOP_DISPOSITION`` ('loop') but is
-    STORED key-absent (``None``), so 'loop'/null/'' → ``None``; an operator-I/O tag passes
-    through. Mirrors ``anneal_disposition = None if d == LOOP_DISPOSITION else d`` in
-    ``_apply_intention_set_disposition`` — one translation point so the wire→store mapping can't
-    drift. The CALLER owns PRESENCE: it threads the CAS ONLY when the request carries a
-    snapshot (``"expect_disposition" in req``); absent ⇒ no CAS (back-compat for callers that
-    don't render-snapshot, e.g. the flow CLI, which is already single-flock-atomic).
-
-    PRECONDITION (the loop sentinel is KEY-ABSENT, owned by THIS vocabulary layer — anneal
-    stays blind to the taxonomy): every governed writer clears ``loop``→``None`` at write time
-    (``_apply_intention_seed`` refuses it; ``_apply_intention_set_disposition`` maps it), so the store
-    never holds a literal ``'loop'`` string. A raw-anneal-API caller that BYPASSES this layer and
-    stores ``'loop'`` verbatim would make this mapping (``'loop'``→``None``) mismatch the raw
-    stored ``'loop'`` → the CAS fails CLOSED (a false REJECT on a valid loop, the safe direction;
-    never a false match). [L3 converged LOW: codex/complement/nemotron, intention-173.]"""
-    if value in (None, "", LOOP_DISPOSITION):
-        return None
-    if not isinstance(value, str):
+def _normalize_expect_disposition(value: Any) -> str:
+    """Map a client SNAPSHOT disposition (the rendered row's value) → the value it READS as
+    (:func:`levain.intentions.disposition_of`): null / '' / the retired ``loop`` → ``someday``,
+    anything else as it is. The snapshot is what the row RENDERED, and a key-absent row renders
+    ``someday`` while it is STORED with no disposition, so the snapshot is never anneal's raw
+    compare-and-set value by itself: :func:`_anneal_cas` turns it into the raw one against the row
+    just read (:func:`_client_snapshot`: loop fold, design 2c). The CALLER owns PRESENCE: it threads the CAS ONLY when the
+    request carries a snapshot (``"expect_disposition" in req``); absent ⇒ no CAS (back-compat for
+    callers that don't render-snapshot, e.g. the flow CLI, which is already single-flock-atomic)."""
+    if value is not None and not isinstance(value, str):
         raise EditError(
             "bad_verb_arg", 422,
             f"expect_disposition must be a string or null (got {value!r})",
         )
-    return value
+    return disposition_of({"disposition": value})
 
 
 def _client_snapshot(req: dict[str, Any], current: dict[str, Any] | None, intention_id: str) -> Any:
@@ -1714,9 +1703,11 @@ def _client_snapshot(req: dict[str, Any], current: dict[str, Any] | None, intent
     The precondition is the one the CLIENT rendered, never the server's own fresh read: a
     server-read CAS closes only the server's read→write window, not the operator's
     render→click window. When the request carries ``expect_disposition`` it is normalized and
-    compared with the RAW disposition of the first store read; a difference raises ``stale``
-    (409) here, before any note gate or demote-confirm gate can answer for a row that has since
-    moved. Returns the value to hand anneal as its CAS, or ``_NO_CAS`` when the request carries
+    compared with what the first store read READS as (a key-absent row reads ``someday``, which is
+    what it rendered); a difference raises ``stale`` (409) here, before any note gate can answer
+    for a row that has since moved. Returns the value to hand anneal as its CAS: the row's RAW
+    stored value (``None`` for a key-absent row), so anneal's compare under its lock still catches
+    a re-route landing after this read (loop fold, design 2c), or ``_NO_CAS`` when the request carries
     no snapshot (old callers, the CLI: behaviour unchanged). An id the store does not hold is
     left to the write's own refusal."""
     if "expect_disposition" not in req:
@@ -1724,14 +1715,14 @@ def _client_snapshot(req: dict[str, Any], current: dict[str, Any] | None, intent
     expect = _normalize_expect_disposition(req["expect_disposition"])
     if current is not None:
         raw = current.get("disposition")
-        found = raw or None   # a stored "" is a loop, as the render reads it
+        found = disposition_of(current)   # a stored "" or a key-absent row reads as the row renders it
         if found != expect:
             raise EditError(
                 "stale", 409,
                 f"disposition changed since read (expected {expect!r}, found {found!r}); "
                 "re-read the intention and retry.",
             )
-        return raw   # anneal's CAS compares the stored value itself
+        return raw   # anneal's CAS compares the stored value itself (the snapshot matched what the raw value reads as)
     return expect
 
 
@@ -1880,16 +1871,19 @@ def _apply_intention_verb(
 
     paths = scope.anneal
     if not paths.intentions_json.is_file():
-        raise EditError("not_found", 404, "no intention store yet — the entity has no open loops")
+        raise EditError("not_found", 404, "no intention store yet")
     store = guarded_intention_store(paths.intentions_json)
     _refuse_if_ringing(scope, store, intention_id)
     ascend_expect: str | None = None  # the raw disposition read for the ascend CAS (below)
     # The descend CAS uses the CLIENT render-time SNAPSHOT (intention-173) — validated + normalized up
     # front (a non-string raises bad_verb_arg BEFORE the store touch). Presence is the gate: an
     # absent key ⇒ no CAS (back-compat). Hoisted so the audit trail can record it too [L1 #5].
+    # The snapshot is what the row RENDERED (a key-absent row renders ``someday``), so it is compared with what the row
+    # just read reads as, and anneal's own compare is handed the row's RAW value (loop fold, design 2c): a re-route
+    # landing between this read and the resolve still fails closed under anneal's lock.
     descend_has_snapshot = verb == "descend" and "expect_disposition" in req
     descend_expect = (
-        _normalize_expect_disposition(req["expect_disposition"]) if descend_has_snapshot else None
+        _client_snapshot(req, store.get(intention_id), intention_id) if descend_has_snapshot else None
     )
     if verb == "ascend":
         # A note is durable operator REFERENCE, not a prospective loop that BECAME memory —
@@ -1955,11 +1949,12 @@ def _apply_intention_verb(
     # Record the disposition that was RESOLVED — the forensic "which Keep note / Tray item / loop
     # did this remove" the sibling set_disposition audit already keeps [L1 #5]. descend: the client
     # snapshot (present when the surface render-snapshots); ascend: the server-read value. Normalize
-    # None→LOOP_DISPOSITION for a readable trail (matches set_disposition's `prior_disposition`).
+    # the raw value read as what it reads as (a key-absent row is ``someday``) for a readable trail (matches
+    # set_disposition's `prior_disposition`).
     if verb == "ascend":
-        extra["prior_disposition"] = ascend_expect or LOOP_DISPOSITION
+        extra["prior_disposition"] = disposition_of({"disposition": ascend_expect})
     elif descend_has_snapshot:
-        extra["prior_disposition"] = descend_expect or LOOP_DISPOSITION
+        extra["prior_disposition"] = disposition_of({"disposition": descend_expect})
     edit_id = _audit_verb(
         scope.ledger_root, kind=_AUDIT_KINDS[verb], action=verb,
         target=f"intention:{intention_id}", now=now, extra=extra,
@@ -2004,7 +1999,7 @@ def _apply_intention_then(
     intention_id = _require_str(req, "intention_id")
     paths = scope.anneal
     if not paths.intentions_json.is_file():
-        raise EditError("not_found", 404, "no intention store yet: the entity has no open loops")
+        raise EditError("not_found", 404, "no intention store yet")
     store = guarded_intention_store(paths.intentions_json)
     intention = store.get(intention_id)
     if not isinstance(intention, dict) or intention.get("status") == "resolved":
@@ -2096,7 +2091,7 @@ def _apply_intention_keep(
     intention_id = _require_str(req, "intention_id")
     paths = scope.anneal
     if not paths.intentions_json.is_file():
-        raise EditError("not_found", 404, "no intention store yet: the entity has no open loops")
+        raise EditError("not_found", 404, "no intention store yet")
     store = guarded_intention_store(paths.intentions_json)
     _refuse_if_ringing(scope, store, intention_id)
     intention = store.get(intention_id)
@@ -2182,11 +2177,9 @@ def _apply_intention_seed(
     scope: WriteScope, req: dict[str, Any], now: str | None
 ) -> dict[str, Any]:
     """Capture a freeform operator-I/O item (the in-GUI dump). Creates a NEW intention carrying
-    an operator-I/O ``disposition`` — a Tray inbox item (default ``seed``) OR a Keep
-    durable reference (``note``) — so it lands in the operator surface and is held OUT of
-    the entity's cognition (``is_loop``=False) regardless of tier. Never a plain cognition
-    loop: loops are born from a Tray item metabolizing, or the CLI. Creates the store if
-    absent.
+    a Tray ``disposition`` (default ``someday``, or ``agenda``) so it lands on the operator's
+    List. There is no loop kind since the fold, so every intention is a List row. Creates the
+    store if absent.
 
     ``type`` defaults to ``thought`` (the catch-all for an un-sorted dump — the freeform
     drop supplies no type), settable when known (the type dropdown / an AI capture). A Tray
@@ -2221,16 +2214,12 @@ def _apply_intention_seed(
         raise EditError(
             "bad_verb_arg", 422,
             f"a captured item's disposition must be a Tray value "
-            f"({list(TRAY_WRITE_DISPOSITIONS)}; got {disposition!r}) — a someday or an agenda, "
-            f"never a plain cognition loop (those come from metabolize or the CLI)",
+            f"({list(TRAY_WRITE_DISPOSITIONS)}; got {disposition!r}) — a someday or an agenda",
         )
 
     store = guarded_intention_store(scope.anneal.intentions_json)
     try:
-        # No explicit tier → anneal's default (`warm`). Harmless: an operator-I/O disposition
-        # is cognition-EXCLUDED (is_loop=False) regardless of tier, so tier has no
-        # salience/germination effect until a Tray item metabolizes to a loop — at which
-        # point `warm` is the right neutral default for a freshly-promoted loop.
+        # No explicit tier → anneal's default (`warm`).
         created = store.add(type=stype, text=text, disposition=disposition)
     except ValueError as exc:  # anneal arg validation (e.g. empty text)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
@@ -2261,30 +2250,23 @@ def _refuse_retired_disposition(disposition: Any, current: Any = None) -> None:
 def _apply_intention_set_disposition(
     scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
-    """Re-route an OPEN intention across the operator-I/O classes (the AI's triage verb, AND the
-    Keep-note promote). ``disposition`` ∈ loop / someday / agenda (a retired seed / handoff / note is
-    accepted only as an echo of the row's own value): ``loop``
-    METABOLIZES an operator-I/O item into a cognition loop (clears the tag → key-free); a Tray
-    value moves it within / into the Tray inbox; ``note`` routes it to durable Keep reference.
-    An optional ``surface_at`` (``YYYY-MM-DD`` / null / '') rides the re-route atomically — the
-    "remind me" tickler: promote a note to a Tray seed AND schedule its resurface in one write.
+    """Re-route an OPEN intention within the List (the AI's triage verb, AND the legacy
+    Keep-note promote). ``disposition`` ∈ someday / agenda (a retired loop / seed / handoff / note is
+    accepted only as an echo of the row's own value, and refused as a change: ``loop`` answers 422
+    with ``RETIRED_LOOP_MSG``, since there is no loop kind since the fold). An optional ``surface_at``
+    (``YYYY-MM-DD`` / null / '') rides the re-route atomically — the "remind me" tickler: promote a
+    note to a someday AND schedule its resurface in one write.
 
-    The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a Keep ``note`` CAN be re-routed OUT
-    (note→loop / note→Tray) — the former note-terminal refusal is RELAXED (it was right for a
-    true reference, wrong for a deferred someday/maybe that had no path out but delete+recreate).
-    The note-ascend lock is preserved as a deliberate TWO-STEP, not lost: a note still can't
-    ``ascend`` DIRECTLY (``_apply_intention_verb``'s guard), so a reference can't resolve into a false
-    lineage in one move — you activate it to a loop first, then ascend the loop. Lineage is
-    preserved (same intention; mutation, not re-create).
+    A legacy Keep ``note`` CAN be re-routed OUT (note→someday / agenda). The note-ascend lock stays a
+    deliberate TWO-STEP: a note still can't ``ascend`` DIRECTLY (``_apply_intention_verb``'s guard),
+    so a reference can't resolve into a false lineage in one move. Lineage is preserved (same
+    intention; mutation, not re-create).
 
-    ONE boundary is confirm-guarded: **demoting a LIVE cognition loop into operator I/O**
-    (current = loop, target ∈ NON_COGNITION — Tray OR note) removes it from salience / digest /
-    Top of Mind with no other signal — the silent-cognition-loss the fail-open read-predicate
-    exists to prevent — so it is confirm-gated, like ``descend``/``ascend``. The gate reads only
-    CAS-/transaction-guarded fields (disposition + status), NOT tier (that was a TOCTOU).
-    Everything else — loop→loop, Tray↔Tray, filing INTO Keep, AND promoting a note OUT (a gain
-    into cognition / a lateral move into the Tray) — is non-destructive → no confirm. The prior
-    disposition is always audited so any move stays reconstructable."""
+    There is NO confirm gate on a re-route since the fold: the "demoting a live loop" boundary (a
+    loop leaving the entity's cognition) is gone with the loop kind, and no re-route moves anything
+    out of or into cognition. The prior disposition is always audited (what the row READ as) so any
+    move stays reconstructable. The compare-and-set is the client's render-time snapshot, mapped to
+    the row's RAW stored value (:func:`_client_snapshot`: a key-absent row reads ``someday``)."""
     from anneal_memory.spores import IntentionError  # lazy
 
     intention_id = _require_str(req, "intention_id")
@@ -2359,45 +2341,12 @@ def _apply_intention_set_disposition(
             why = split.reagenda_refusal(current, store.get(named))
             if why is not None:
                 raise EditError("bad_verb_arg", 422, why)
-    prior = disposition_of(current) if current else LOOP_DISPOSITION  # normalized, for audit
-    # The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a Keep note CAN now be re-routed OUT —
-    # note→loop (activate) / note→Tray (promote) — the mirror of the Tray's seed→loop
-    # metabolize. The former note-terminal guard here was the OVER-correction: terminal is right
-    # for a true reference, WRONG for a deferred someday/maybe (which had no path out but
-    # delete+recreate — friction + lost lineage). The note-ascend lock is NOT lost — it MOVES to
-    # the deliberate two-step: a note still can't `ascend` DIRECTLY (`_apply_intention_verb`'s H2
-    # guard STAYS), so promoting note→loop here does NOT let a reference ascend in one move — the
-    # now-loop must be ascended as a SECOND explicit, audited verb. A pure reference note simply
-    # never gets promoted (reference-vs-someday stays emergent). LINEAGE preserved (same intention id
-    # + history; mutation, not re-create). Promotion is a GAIN into cognition (or a lateral move
-    # into the Tray), never the silent-loss direction, so it needs no confirm — `demoting_live_loop`
-    # below is False for a note (is_loop(note) is False); only DEMOTING a live loop confirms.
-    #
-    # Gate ANY demotion of a live cognition loop into operator I/O — the Tray inbox OR a Keep
-    # note (NON_COGNITION, not just TRAY). loop→note is the same silent-cognition-loss and is
-    # even STICKIER (a note is durable + resolve-exempt), so it must confirm too [L1+L2 L3].
-    # loop→loop / I/O→anywhere stay un-gated (no loss, or a gain into cognition). The gate reads
-    # ONLY CAS-guarded `disposition` + transaction-guarded `status` — NOT `tier`: a `tier`-based
-    # exemption was a TOCTOU (the CAS at the write doesn't cover tier, so a concurrent re-tier
-    # between this read and the write defeated the confirm — codex L3 reproduced `warm seed`).
-    demoting_live_loop = (
-        current is not None
-        and current.get("status", "open") == "open"
-        and is_loop(current)
-        and disposition in NON_COGNITION_DISPOSITIONS
-    )
-    if demoting_live_loop:
-        dest = "a Keep note" if disposition in ("note",) else "the Tray"
-        _require_confirm(
-            req,
-            f"move loop {intention_id} into {dest}? it leaves the entity's active cognition "
-            "(salience / digest / Top of Mind) until it's re-triaged",
-        )
-
-    # ``loop`` → clear the tag (metabolize to a key-free loop); a Tray value → set it.
-    anneal_disposition = None if disposition == LOOP_DISPOSITION else disposition
+    prior = disposition_of(current) if current else DEFAULT_DISPOSITION  # what the row read as, for audit
+    # A legacy Keep note CAN be re-routed OUT (note→someday / agenda; lineage is preserved: same
+    # intention, a mutation). The note-ascend lock stays a deliberate two-step (`_apply_intention_verb`'s
+    # guard). Since the loop fold no re-route is a boundary of the entity's cognition, so none confirms.
     update_kwargs: dict[str, Any] = {
-        "disposition": anneal_disposition,
+        "disposition": disposition,
         "expect_disposition": prior_raw if snapshot is _NO_CAS else snapshot,
     }
     if disposition in RETIRED_DISPOSITIONS:
@@ -2489,7 +2438,7 @@ def _apply_intention_surface_at(
     surface_at = _validate_surface_at(req.get("surface_at"))
     paths = scope.anneal
     if not paths.intentions_json.is_file():
-        raise EditError("not_found", 404, "no intention store yet — the entity has no open loops")
+        raise EditError("not_found", 404, "no intention store yet")
     store = guarded_intention_store(paths.intentions_json)
     _refuse_if_ringing(scope, store, intention_id)
     if surface_at:
@@ -2567,21 +2516,22 @@ def _apply_intention_update(
 
     paths = scope.anneal
     if not paths.intentions_json.is_file():
-        raise EditError("not_found", 404, "no intention store yet — the entity has no open loops")
+        raise EditError("not_found", 404, "no intention store yet")
     store = guarded_intention_store(paths.intentions_json)
     _refuse_if_ringing(scope, store, intention_id)
     current = store.get(intention_id)
     prior_raw = cast("str | None", current.get("disposition")) if current else None
     tier_snapshot = _client_snapshot(req, current, intention_id) if has_tier else _NO_CAS
 
-    # RECLASSIFY GATE — type is plastic ONLY while forming (a Tray item). A committed loop
-    # or a Keep note has a LOCKED type; the immune property binds at the cognition boundary,
-    # not at capture. (A missing id falls through to update's own IntentionError, not 409.)
+    # RECLASSIFY GATE — type is plastic ONLY while forming (a Tray item). Since the loop fold every
+    # intention a someday reads as is a Tray item (a key-absent row included); a legacy Keep note
+    # (or an unknown disposition) has a LOCKED type. (A missing id falls through to update's own
+    # IntentionError, not 409.)
     if has_type and current is not None and not is_tray(current):
         raise EditError(
             "type_locked", 409,
-            "type is only reclassifiable while an item is forming in the Tray; a committed "
-            "loop / a Keep note has a locked type (dismiss + re-capture to change it)",
+            "type is only reclassifiable while an item is forming in the Tray; a legacy "
+            "Keep note has a locked type (dismiss + re-capture to change it)",
         )
 
     kwargs: dict[str, Any] = {}

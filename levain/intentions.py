@@ -1,32 +1,27 @@
 """levain.intentions — the intention *disposition* vocabulary (control-plane Slice 3).
 
-An intention's ``disposition`` routes it across THREE operator-facing classes:
-  - ``loop`` (the default, absent/``loop``) — the entity's OWN prospective loop; belongs in
-    its cognition (recall / salience / digest / Top of Mind).
-  - the **Tray** inbox (``someday`` / ``handoff`` / ``agenda``) — operator session-I/O that
-    should NOT pollute cognition; a ``someday`` metabolizes into a ``loop`` (or resolves). It
-    FORMS, then resolves. ``seed`` is the retired spelling of ``someday``: resolved records
-    keep it for good, so it still reads, and no write sets it.
-  - legacy **note** reference (``note``) — durable operator reference; persists until removed,
-    resolve-EXEMPT (never germinates, never ascends; removed via descend). There is no Keep
-    panel any more: a note still in a store renders in the Tray, and a pinned-dormant loop
-    (the ``parked`` TIER) renders in Open loops, marked parked.
-Tray + note are both ``NON_COGNITION``; lineage rides the existing ``pointer``.
+An intention's ``disposition`` routes it on the operator's List (loop fold, board item levain#4: there is NO loop
+kind in Levain 1.0):
+  - the **Tray** inbox (``someday`` / ``agenda``, plus a legacy ``handoff`` and the retired spelling ``seed``) —
+    every open intention. A ``someday`` is the default: an intention with NO ``disposition`` key (what the entity's
+    own ``intention_add`` writes, which cannot carry one) and the literal ``loop`` of an older release both READ as
+    ``someday`` (:func:`disposition_of`). Nothing was stored for them, so a read-time default classifies the rows
+    a write after any migration still creates; ``levain update`` also rewrites the open ones
+    (:mod:`levain.intention_migrate`).
+  - legacy **note** reference (``note``) — a note still in a store renders in the Tray, badged.
+``loop`` is a retired write value (:data:`RETIRED_LOOP_MSG`) but stays in the READ set: a raw store holding the literal
+still reads, as someday. A pinned-dormant row is the ``parked`` TIER, not a disposition; it stays on the List and
+ranks last. ``seed`` resolved records keep that spelling for good, so it still reads, and no write sets it.
 
-The field is ADDITIVE: every pre-Slice-3 intention has no ``disposition`` key and reads as a
-``loop`` (no migration; anneal round-trips an unknown ``disposition`` untouched — the
-Slice-3 de-risk, proven empirically, is exactly why anneal needs NO change).
+The field is ADDITIVE: anneal round-trips an unknown ``disposition`` untouched, which is why anneal needs NO change.
 
-This module is the dashboard's render half: it CLASSIFIES an intention dict into the three
-operator-facing projections — Open Loops / Tray — via :func:`bucket_of`.
+This module is the dashboard's render half: :func:`bucket_of` classifies an intention dict into the operator-facing
+projection, and since the fold every row lands in the one Tray bucket.
 
-⚠ **Scope of the "keep operator-I/O OUT of cognition" invariant.** ``is_loop`` is the
-PREDICATE; who ENFORCES it depends on the surface. The embedder's own store enforces it at its
-cognition reads (``scripts/intentions.py`` + flow_state/constellation — the embedder's layer 2). A bare
-LEVAIN install's cognition surfaces are its activation hooks
-(``templates/activation/hooks/*`` — session-start dormant-surface + per-prompt collision):
-3b ports ``is_loop`` there (the standalone hook copies filter on
-``_NON_COGNITION_DISPOSITIONS``), so the boundary holds for a stranger too.
+⚠ **The "keep operator-I/O OUT of cognition" invariant, after the fold.** ``is_loop`` is the PREDICATE and it is now
+False for every row: no class of intention flows into the entity's own cognition (collision recall was retired with the
+loop kind, Phill np-c3029a8a (a); crystallized-pattern recall is the collision feature). The name and the byte-equal
+``NON_COGNITION_DISPOSITIONS`` tuple stay for the drift contract below.
 
 ⚠ **Drift contract (load-bearing).** The taxonomy is duplicated in FOUR places BY DESIGN —
 this module, the embedder's ``scripts/intentions.py``, and the TWO standalone hook copies (Claude +
@@ -52,10 +47,12 @@ from levain.intention_legacy import OLD_ID_PREFIX, STORE_DOC_KEY_OPEN, STORE_DOC
 
 __all__ = [
     "LOOP_DISPOSITION",
+    "DEFAULT_DISPOSITION",
     "TRAY_DISPOSITIONS",
     "TRAY_WRITE_DISPOSITIONS",
     "RETIRED_HANDOFF_MSG",
     "RETIRED_KEEP_NOTE_MSG",
+    "RETIRED_LOOP_MSG",
     "RETIRED_SEED_MSG",
     "RetiredDisposition",
     "retired_message",
@@ -96,25 +93,28 @@ __all__ = [
     "finished_by_completion",
 ]
 
-LOOP_DISPOSITION = "loop"
+LOOP_DISPOSITION = "loop"                            # RETIRED (the fold): read as someday, never written; the name stays for embedders
+DEFAULT_DISPOSITION = "someday"                      # what an absent / empty / literal-loop disposition reads as
 TRAY_DISPOSITIONS = ("someday", "seed", "handoff", "agenda")   # operator INBOX — the READ set (a legacy handoff still reads)
 TRAY_WRITE_DISPOSITIONS = ("someday", "agenda")                # the Tray values a NEW write may take
-# RETIRED: legacy rows still carry these. They stay in the READ sets (a legacy handoff, Keep note
-# or seed still renders, closes, and re-dispositions to someday/agenda) but are OUT of the WRITE
-# set (WRITE_DISPOSITIONS): a new handoff, Keep note or seed is refused at the write seam. A
-# resolved record keeps ``seed`` for good (anneal's update cannot edit a resolved record).
-RETIRED_DISPOSITIONS = ("handoff", "note", "seed")
+# RETIRED: legacy rows still carry these. They stay in the READ sets (a legacy handoff, Keep note,
+# seed or a literal ``loop`` still renders, closes, and re-dispositions to someday/agenda) but are
+# OUT of the WRITE set (WRITE_DISPOSITIONS): a new handoff, Keep note, seed or loop is refused at
+# the write seam. A resolved record keeps ``seed`` / ``loop`` for good (anneal's update cannot edit
+# a resolved record).
+RETIRED_DISPOSITIONS = ("handoff", "note", "seed", "loop")
 KEEP_DISPOSITIONS = ("note",)                        # legacy operator REFERENCE — read-only vocabulary
-# Everything the operator authored as I/O — all excluded from the entity's OWN cognition.
-# The retired names STAY: ``is_loop`` fails OPEN on an unknown value, so dropping them would
-# flood every legacy note and handoff into the agent's collision surface. The order is the
-# hook copies' tuple order (drift contract: byte-equal to ``_NON_COGNITION_DISPOSITIONS``).
+# Everything the operator authored as I/O. The tuple is a drift-contract value (byte-equal to the
+# hooks' ``_NON_COGNITION_DISPOSITIONS`` and the embedder's), so it stays as it was; the retired
+# names stay in it too (a legacy note or handoff is still a known value).
 NON_COGNITION_DISPOSITIONS = ("someday", "seed", "handoff", "agenda", "note")
 # Two sets, two names. VALID: every value a row may HOLD (the read set; byte-equal to the embedder's
-# ``VALID_DISPOSITIONS``, a drift-contract tuple). WRITE: every value a write may SET.
+# ``VALID_DISPOSITIONS``, a drift-contract tuple: a raw store holding the literal ``loop`` still reads, FRAME.md D-5).
+# WRITE: every value a write may SET.
 VALID_DISPOSITIONS = (LOOP_DISPOSITION,) + NON_COGNITION_DISPOSITIONS
-WRITE_DISPOSITIONS = (LOOP_DISPOSITION,) + TRAY_WRITE_DISPOSITIONS
+WRITE_DISPOSITIONS = TRAY_WRITE_DISPOSITIONS
 
+RETIRED_LOOP_MSG = "loops are folded into the List: write someday, or agenda with a date"
 RETIRED_HANDOFF_MSG = (
     "handoff is retired: ask the operator now with `levain ask`, "
     "or record a someday, or an agenda with a date, in the Tray"
@@ -127,7 +127,7 @@ RETIRED_SEED_MSG = "seed is now called someday: write the disposition `someday`"
 
 
 class RetiredDisposition(ValueError):
-    """A write tried to SET a disposition outside the write set: a retired handoff / Keep note / seed (any
+    """A write tried to SET a disposition outside the write set: a retired handoff / Keep note / seed / loop (any
     spelling anneal would persist as one), or a value nothing reads."""
 
 
@@ -151,6 +151,8 @@ def retired_message(value: Any) -> str | None:
         return RETIRED_KEEP_NOTE_MSG
     if key == "seed":
         return RETIRED_SEED_MSG
+    if key == LOOP_DISPOSITION:
+        return RETIRED_LOOP_MSG
     return None
 
 
@@ -238,69 +240,58 @@ def _build_guarded_class() -> Any:
 
 
 # The tier value that means *deliberate dormancy* (anneal's own ``Tier`` literal — see
-# ``anneal_memory.spores.VALID_TIERS``). A parked LOOP is pinned-dormant (shown in Open loops, marked parked), exempt
+# ``anneal_memory.spores.VALID_TIERS``). A parked row is pinned-dormant (shown on the List, ranked last), exempt
 # from the dormancy→compost prompt — NOT a disposition. Kept as a literal (not an anneal
 # import) so this render-vocab module stays import-light; anneal owns the tier taxonomy.
 PARKED_TIER = "parked"
 
-# The two operator-facing render buckets (the capture-UX (A) projection: ONE Tray, not
-# three disposition panels — seed/handoff/agenda all land in Tray). There is no Keep panel
-# (task surfaces TS-5a, Phill 11-07): a parked loop shows in Open loops with a parked marker,
-# and a legacy ``note`` row still in a store shows in the Tray as legacy, never dropped.
-BUCKET_LOOP = "loop"   # the entity's prospective loops, parked ones marked (Open Loops panel)
-BUCKET_TRAY = "tray"   # the operator inbox awaiting AI triage + legacy notes (Tray panel)
+# The operator-facing render buckets. Since the loop fold ``bucket_of`` returns ``BUCKET_TRAY`` for EVERY row: one List.
+# ``BUCKET_LOOP`` stays exported, NEVER RETURNED since the fold, for the embedder's reads through 1.0 (flow's memory tile
+# imports it; removing it would fault that tile).
+BUCKET_LOOP = "loop"   # never returned since the fold (the Open loops panel is gone)
+BUCKET_TRAY = "tray"   # every intention row, parked ones included, and a legacy ``note``
 
 
 def disposition_of(item: Mapping[str, Any]) -> str:
-    """An intention with no ``disposition`` key is a normal prospective loop (the default
-    for every pre-Slice-3 intention)."""
-    return item.get("disposition") or LOOP_DISPOSITION
+    """The disposition an intention READS as. An absent, empty or ``None`` value and the literal ``loop`` (a retired
+    name) all read as :data:`DEFAULT_DISPOSITION` (``someday``); any other string is returned as stored, so an
+    unknown value is still shown by name.
+
+    The default lives at READ because the entity's own write, anneal's ``intention_add``, cannot carry a disposition:
+    a key-absent row is created after any migration. A client that snapshots ``someday`` for such a row is mapped to the
+    raw compare-and-set value by the write seams (``levain.writes._client_snapshot``)."""
+    d = item.get("disposition")
+    if not d or d == LOOP_DISPOSITION:
+        return DEFAULT_DISPOSITION
+    return d
 
 
 def is_loop(item: Mapping[str, Any]) -> bool:
-    """True iff the intention flows into the entity's OWN cognition (salience / Top of Mind /
-    digest / constellation agent seeds). The operator-I/O dispositions — the Tray inbox
-    (someday/handoff/agenda, and the retired spelling seed) AND Keep reference (note) — are the
-    complement, kept OUT of cognition.
+    """False for every intention: there is no loop kind, so nothing flows into the entity's OWN cognition (salience /
+    Top of Mind / digest / constellation agent seeds, collision recall). Loop fold, Phill np-10262267 (a) and
+    np-c3029a8a (a).
 
-    Fail-OPEN on the unknown: only an EXPLICITLY known operator-I/O disposition is
-    excluded; a falsy/absent value (every pre-Slice-3 intention) OR an unrecognized string
-    reads as in-cognition. The exclusion axis is the silent-harm one — an operator-I/O
-    item leaking into a render is visible text, but a real loop wrongly bucketed out
-    vanishes from the Open-Loops panel with no signal. An unknown value is almost always
-    a typo / corruption / version-skew on a real loop — fail it toward the visible loop.
-    (Byte-for-byte twin of the embedder's ``scripts/intentions.py:is_loop``; keeping them identical
-    is the drift contract above.)"""
-    return disposition_of(item) not in NON_COGNITION_DISPOSITIONS
+    The function stays, with its name, as the drift-contract twin (the embedder's ``scripts/intentions.py:is_loop``, both
+    hooks' ``_is_loop`` and this one change together); ``NON_COGNITION_DISPOSITIONS`` keeps its byte-equal tuple."""
+    return False
 
 
 def is_tray(item: Mapping[str, Any]) -> bool:
-    """The operator session-I/O INBOX set (someday/agenda, plus a legacy handoff or seed row) — EXPLICIT membership,
-    NOT ``not is_loop``: a ``note`` is also non-cognition but it is Keep reference, not
-    the Tray, so the three classes (loop / tray / keep) are distinct."""
+    """The operator session-I/O INBOX set (someday/agenda, plus a legacy handoff or seed row) — EXPLICIT membership. A
+    key-absent row reads ``someday``, so it is Tray; a ``note`` is Keep reference and is not."""
     return disposition_of(item) in TRAY_DISPOSITIONS
 
 
 def is_note(item: Mapping[str, Any]) -> bool:
-    """The operator durable-REFERENCE set (Keep notes) — resolve-exempt, agent-queryable,
-    cognition-excluded. Explicit membership, the complement-within-Keep of a parked loop."""
+    """The legacy durable-REFERENCE set (a ``note`` still in a store). Explicit membership."""
     return disposition_of(item) in KEEP_DISPOSITIONS
 
 
 def bucket_of(item: Mapping[str, Any]) -> str:
-    """Classify an intention into its operator-facing render bucket — a TOTAL partition (every
-    intention lands in exactly one):
-
-    - ``BUCKET_TRAY`` — a Tray inbox disposition (someday/seed/handoff/agenda), ANY tier, or a legacy
-      ``note`` row (the Keep is gone; a note still in a store is shown, badged ``note``, never
-      dropped). Disposition wins over tier.
-    - ``BUCKET_LOOP`` — a loop on any tier, a ``parked`` one included (pinned-dormant, exempt
-      from the dormancy→compost prompt; its row carries the parked marker).
-    """
-    d = disposition_of(item)
-    if d in TRAY_DISPOSITIONS or d in KEEP_DISPOSITIONS:   # legacy handoff (in TRAY_DISPOSITIONS) and legacy note both render in the Tray
-        return BUCKET_TRAY
-    return BUCKET_LOOP
+    """The operator-facing render bucket: ``BUCKET_TRAY`` for EVERY intention (total onto the List: a loop, a someday, an
+    agenda, a legacy note or handoff, an unknown disposition, any tier, a ``parked`` one included). ``BUCKET_LOOP`` is
+    never returned since the loop fold; it stays exported for the embedder's reads through 1.0."""
+    return BUCKET_TRAY
 
 
 # --- THE LIST contract (task_surfaces_1107.md, np-7c5c8752 (a)): a timed ``next``, the ``desk`` target, talk seeds ----
@@ -450,7 +441,7 @@ def is_talk_seed(item: Mapping[str, Any]) -> bool:
     Such a seed does not go stale silently. Levain's own intention code has no TTL expiry or resurface step of its own
     (anneal's ``list_open`` ranks and ``germination_tier`` classifies; nothing in levain expires or resurfaces a seed),
     so this predicate is the contract hook for a caller that adds one."""
-    d = item.get("disposition")
+    d = disposition_of(item)   # a key-absent row reads someday (the loop fold)
     return (isinstance(d, str) and d.strip().casefold() in ("someday", "seed")
             and isinstance(item.get("attention"), str) and item["attention"].strip() == "talk")
 

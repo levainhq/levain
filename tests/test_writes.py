@@ -1023,15 +1023,12 @@ class TestTrayWriteKinds:
 
     def test_seed_accepts_an_explicit_type_so_a_todo_can_be_done(self, install: Path) -> None:
         # H1: a dumped TASK must be able to descend 'done' — which a 'thought' cannot.
-        # A typed capture → metabolize to a loop → the task lifecycle is intact.
+        # A typed capture is a someday on the List (the loop fold: there is no metabolize step), and it can
+        # be marked done as it stands.
         sid = apply_edit(_scope(install), {
             "kind": "intention_seed", "text": "call the dentist", "type": "task",
         })["intention_id"]
         assert _intention_store(install).get(sid)["type"] == "task"
-        # metabolize the task-seed into a cognition loop, then mark it done
-        apply_edit(_scope(install), {
-            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop",
-        })
         res = apply_edit(_scope(install), {
             "kind": "intention_close", "intention_id": sid, "intention_kind": "done", "confirm": True,
         })
@@ -1052,14 +1049,19 @@ class TestTrayWriteKinds:
         rec = recent_edits(install / ".levain")[0]
         assert rec["kind"] == "intention_set_disposition" and rec["disposition"] == "agenda"
 
-    def test_set_disposition_loop_metabolizes_to_a_keyfree_loop(self, install: Path) -> None:
-        # the triage that pulls a Tray seed INTO cognition: disposition cleared entirely
+    def test_set_disposition_loop_is_refused_since_the_fold(self, install: Path) -> None:
+        # was `..._loop_metabolizes_to_a_keyfree_loop` (the triage that pulled a Tray seed INTO cognition by clearing
+        # the tag): there is no loop kind in Levain 1.0, so the verb answers 422 with the retirement words and the
+        # row is left as it was
+        from levain.writes import RETIRED_LOOP_MSG
+
         sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "real loop"})["intention_id"]
-        apply_edit(_scope(install), {
-            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop",
-        })
-        intention = _intention_store(install).get(sid)
-        assert "disposition" not in intention  # key-free → back in cognition
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop",
+            })
+        assert ei.value.http_status == 422 and RETIRED_LOOP_MSG in str(ei.value)
+        assert _intention_store(install).get(sid)["disposition"] == "someday"
 
     def test_set_disposition_reroute_within_tray_needs_no_confirm(self, install: Path) -> None:
         # seed → agenda is inbox shuffling, not a cognition demotion → no confirm
@@ -1070,62 +1072,85 @@ class TestTrayWriteKinds:
         assert res["ok"]
         assert any(s["id"] == sid for s in _intention_store(install).list_open())
 
-    # -- M1: demoting a LIVE cognition loop into the Tray is the guarded direction --
-    def test_set_disposition_demote_live_loop_requires_confirm(self, install: Path) -> None:
-        sid = _add_intention(install, tier="hot", salience=3)  # a live, high-salience loop
-        with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {
-                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
-            })
-        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
-        # refused → the loop is untouched (still a key-free cognition loop)
-        assert "disposition" not in _intention_store(install).get(sid)
+    # -- the loop fold: the `demoting_live_loop` confirm gate is gone (no re-route leaves the entity's cognition) --
+    # -- these three were `..._demote_live_loop_requires_confirm`, `..._with_confirm` and `..._parked_loop_to_tray_now_requires_confirm`
+    def test_set_disposition_on_a_key_absent_row_needs_no_confirm(self, install: Path) -> None:
+        sid = _add_intention(install, tier="hot", salience=3)  # the entity's own plant: key-absent, reads someday
+        res = apply_edit(_scope(install), {
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda",
+        })
+        assert res["ok"]
+        assert _intention_store(install).get(sid)["disposition"] == "agenda"
 
-    def test_set_disposition_demote_live_loop_with_confirm(self, install: Path) -> None:
+    def test_set_disposition_audit_records_a_key_absent_row_as_someday(self, install: Path) -> None:
         sid = _add_intention(install, tier="hot")
         res = apply_edit(_scope(install), {
             "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
-            "confirm": True,
         })
         assert res["ok"]
         assert _intention_store(install).get(sid)["disposition"] == "someday"
         rec = recent_edits(install / ".levain")[0]
-        assert rec["prior_disposition"] == "loop" and rec["disposition"] == "someday"
+        assert rec["prior_disposition"] == "someday" and rec["disposition"] == "someday"
 
-    def test_set_disposition_parked_loop_to_tray_now_requires_confirm(self, install: Path) -> None:
-        # C (codex L3 MED, reproduced `warm seed`): the confirm gate previously EXEMPTED
-        # parked loops (tier != "parked"). But the CAS at the write guards `disposition`, NOT
-        # `tier` — so a parked read that skipped confirm could be re-tiered to warm by a
-        # concurrent writer before the write landed, demoting a live loop with no confirm. The
-        # gate now reads only CAS-/transaction-guarded fields (disposition + status); a parked
-        # loop demotion is rare and confirming it costs nothing.
+    def test_set_disposition_parked_row_keeps_its_tier_and_needs_no_confirm(self, install: Path) -> None:
         sid = _add_intention(install, tier="parked")
+        res = apply_edit(_scope(install), {
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
+        })
+        assert res["ok"]
+        rec = _intention_store(install).get(sid)
+        assert rec["disposition"] == "someday" and rec["tier"] == "parked"
+
+    def test_set_disposition_snapshot_someday_on_a_key_absent_row_succeeds(self, install: Path) -> None:
+        """Design 2c: a key-absent row RENDERS someday, so a client snapshots `someday`; anneal's raw compare is handed the
+        row's own (absent) value, not the snapshot."""
+        sid = _add_intention(install)
+        assert "disposition" not in _intention_store(install).get(sid)
+        res = apply_edit(_scope(install), {
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda",
+            "expect_disposition": "someday"})
+        assert res["ok"] and _intention_store(install).get(sid)["disposition"] == "agenda"
+
+    def test_set_disposition_concurrent_reroute_after_the_read_still_fails_closed(self, install: Path, monkeypatch) -> None:
+        """The snapshot matched the first read (key-absent, reads someday); a writer re-routes the row to an agenda before the
+        write lands. anneal's compare under its lock sees the absent raw value differ, so nothing is overwritten."""
+        from anneal_memory.spores import IntentionStore
+
+        sid = _add_intention(install)
+        real_get = IntentionStore.get
+        calls = {"n": 0}
+
+        def reroute_after_first_read(self, sid_):
+            d = real_get(self, sid_)
+            calls["n"] += 1
+            if calls["n"] == 2:           # the seam's own read (the ringing check read first)
+                IntentionStore.update(self, sid_, disposition="agenda")   # a writer lands between the read and the write
+            return d
+
+        monkeypatch.setattr(IntentionStore, "get", reroute_after_first_read)
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
-            })
-        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
-        # with confirm it goes through
-        res = apply_edit(_scope(install), {
-            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
-            "confirm": True,
-        })
-        assert res["ok"]
+                "expect_disposition": "someday"})
+        monkeypatch.undo()
+        assert ei.value.code == "stale" and ei.value.http_status == 409
+        assert _intention_store(install).get(sid)["disposition"] == "agenda"      # the other writer's value stands
 
     # -- A: the KEEP-NOTE PROMOTE lifecycle — a note CAN be re-routed OUT (relaxed 2026-06-23) --
     def _seed_note(self, install: Path) -> str:
         return _legacy_seed(install, "docker: levain init", "note")
 
-    def test_set_disposition_note_to_loop_promotes(self, install: Path) -> None:
-        # note→loop ACTIVATES a note into a key-free cognition loop (was refused as note-terminal
-        # pre-2026-06-23). Lineage preserved — same intention id, the tag cleared (metabolized).
+    def test_set_disposition_note_to_loop_is_refused_since_the_fold(self, install: Path) -> None:
+        # was `..._note_to_loop_promotes` (note→loop ACTIVATED a note into a key-free cognition loop): there is no
+        # loop kind in Levain 1.0, so the verb answers 422 with the retirement words; the note stays a note
+        from levain.writes import RETIRED_LOOP_MSG
+
         sid = self._seed_note(install)
-        res = apply_edit(_scope(install), {
-            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
-        assert res["ok"]
-        sp = _intention_store(install).get(sid)
-        assert sp["id"] == sid  # lineage: same intention, not delete+recreate
-        assert sp.get("disposition") in (None, "loop")  # key-free loop
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
+        assert ei.value.http_status == 422 and RETIRED_LOOP_MSG in str(ei.value)
+        assert _intention_store(install).get(sid)["disposition"] == "note"
 
     def test_set_disposition_note_to_tray_promotes(self, install: Path) -> None:
         # note→Tray (seed): the note moves to the inbox for triage. No confirm — promoting a note
@@ -1138,9 +1163,10 @@ class TestTrayWriteKinds:
 
     def test_note_promote_then_ascend_is_the_deliberate_two_step(self, install: Path) -> None:
         # The note-ascend lock MOVED, it wasn't lost. A DIRECT ascend of a note stays refused;
-        # the someday→memory path is the deliberate, audited TWO-STEP — activate (note→loop),
-        # THEN ascend the loop. Both legs verified end-to-end (the chain the old guard blocked
-        # whole is now gated only at its first dangerous move — the direct ascend).
+        # the someday→memory path is the deliberate, audited TWO-STEP — promote (note→someday),
+        # THEN ascend the someday. Both legs verified end-to-end (the chain the old guard blocked
+        # whole is now gated only at its first dangerous move — the direct ascend). Since the loop fold the
+        # first leg is note→someday (note→loop is refused).
         sid = self._seed_note(install)
         # (1) a direct ascend of the note is STILL refused (the H2 guard stays)
         with pytest.raises(EditError) as ei:
@@ -1148,20 +1174,20 @@ class TestTrayWriteKinds:
                 "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
                 "ref": "x", "confirm": True})
         assert ei.value.code == "not_ascendable"
-        # (2) activate it to a loop, THEN ascend the loop — now sanctioned, the deliberate step
+        # (2) promote it to a someday, THEN ascend it — now sanctioned, the deliberate step
         apply_edit(_scope(install), {
-            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday"})
         res = apply_edit(_scope(install), {
             "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
             "ref": "projects/x", "confirm": True})
         assert res["ok"]
 
     def test_set_disposition_promote_note_needs_no_confirm(self, install: Path) -> None:
-        # The confirm gate fires ONLY on demoting a LIVE loop into operator-I/O. A note is not a
-        # loop (is_loop False), so promoting it OUT lands WITHOUT a confirm (no EditError raised).
+        # There is no confirm gate on a re-route since the fold (it only ever fired on demoting a LIVE loop);
+        # promoting a note OUT lands without one (no EditError raised).
         sid = self._seed_note(install)
         res = apply_edit(_scope(install), {
-            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday"})
         assert res["ok"]
 
     # -- A': "remind me" — promote + schedule the resurface ATOMICALLY (optional surface_at) --
@@ -1241,15 +1267,15 @@ class TestTrayWriteKinds:
         rec = recent_edits(install / ".levain")[0]
         assert rec["prior_disposition"] == "someday" and rec["disposition"] == "agenda"
 
-    def test_set_disposition_demote_unknown_disposition_also_gated(self, install: Path) -> None:
-        # H1 (codex L3): is_loop treats an UNKNOWN disposition as in-cognition (fail-open),
-        # so the demote guard must fire for it too — not only for the literal "loop".
+    def test_set_disposition_unknown_disposition_is_re_routed_without_a_confirm(self, install: Path) -> None:
+        # was `..._demote_unknown_disposition_also_gated` (H1, codex L3: is_loop failed OPEN on an unknown value, so
+        # the demote gate fired for it too). is_loop is False for every row now and the gate is gone: an unknown
+        # value is shown by name on the List and re-routes to a someday like any other.
         sid = _add_intention(install, disposition="bogus", tier="hot")
-        with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {
-                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
-            })
-        assert ei.value.code == "confirm_required" and ei.value.http_status == 409
+        res = apply_edit(_scope(install), {
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "someday",
+        })
+        assert res["ok"] and _intention_store(install).get(sid)["disposition"] == "someday"
 
     def test_set_disposition_cas_rejects_a_stale_read(self, install: Path, monkeypatch) -> None:
         # H2 (codex L3): the get→update window. Force get() to return a STALE disposition
@@ -1389,13 +1415,13 @@ class TestIntentionUpdate:
         apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "task"})
         assert _intention_store(install).get(sid)["type"] == "task"
 
-    def test_reclassify_then_metabolize_grants_the_new_terminal_kinds(self, install: Path) -> None:
+    def test_reclassify_grants_the_new_terminal_kinds(self, install: Path) -> None:
         # M2(b): the reclassify→terminal-kind contract, end-to-end through the seam. A dump
-        # defaults to `thought` (can't descend 'done'); reclassify→task WHILE forming, then
-        # metabolize → the loop now descends 'done' (the task lifecycle the dump needed).
+        # defaults to `thought` (can't descend 'done'); reclassify→task, then the someday
+        # descends 'done' (the task lifecycle the dump needed). Was `..._then_metabolize_...`:
+        # there is no metabolize step since the loop fold.
         sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "ship the thing"})["intention_id"]
         apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "task"})
-        apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
         res = apply_edit(_scope(install), {
             "kind": "intention_close", "intention_id": sid, "intention_kind": "done", "confirm": True})
         assert res["ok"]  # 'done' valid because the retype-while-forming took
@@ -1423,19 +1449,31 @@ class TestIntentionUpdate:
         assert ei.value.code == "stale" and ei.value.http_status == 409
         assert _intention_store(install).get(sid)["disposition"] == "note"
 
-    def test_ascend_with_a_stale_snapshot_does_not_resolve_a_loop_that_left_cognition(self, install: Path) -> None:
-        # the r1 HIGH: rendered as a loop, re-routed to the Tray; the server's own fresh read used to pass.
+    def test_ascend_with_a_stale_snapshot_does_not_resolve_a_row_that_was_re_routed(self, install: Path) -> None:
+        # the r1 HIGH: rendered as a someday, re-routed to an agenda; the server's own fresh read used to pass.
+        # (Since the loop fold a key-absent row renders someday, so the re-route that makes the snapshot stale is a
+        # move to ANOTHER value.)
         sid = _add_intention(install)
-        _intention_store(install).update(sid, disposition="someday")
+        _intention_store(install).update(sid, disposition="agenda")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "intention_promote", "intention_id": sid, "intention_kind": "pattern",
-                "ref": "p", "confirm": True, "expect_disposition": "loop"})
+                "ref": "p", "confirm": True, "expect_disposition": "someday"})
         assert ei.value.code == "stale"
         assert any(r["id"] == sid for r in _intention_store(install).list_open())
 
-    def test_a_loop_stored_as_an_empty_disposition_takes_a_loop_snapshot(self, install: Path) -> None:
-        # L3 r2 LOW: a stored "" renders as a loop; its snapshot must match and the write must land, not
+    def test_a_snapshot_loop_reads_as_someday_for_a_row_that_was_made_someday(self, install: Path) -> None:
+        # a page rendered before the fold said `loop` for a key-absent row; the row is now an explicit someday. Both
+        # read someday, so the snapshot still matches (the fold's one value) and the ascend lands
+        sid = _add_intention(install)
+        _intention_store(install).update(sid, disposition="someday")
+        res = apply_edit(_scope(install), {
+            "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
+            "ref": "p", "confirm": True, "expect_disposition": "loop"})
+        assert res["ok"]
+
+    def test_a_row_stored_as_an_empty_disposition_takes_a_someday_snapshot(self, install: Path) -> None:
+        # L3 r2 LOW: a stored "" renders as someday (was: as a loop); its snapshot must match and the write must land, not
         # answer stale on every re-read
         sid = _add_intention(install)
         # anneal clears "" itself, so only a hand-edited store holds one: write it as a hand would
@@ -1468,22 +1506,22 @@ class TestIntentionUpdate:
         assert ei.value.code == "not_ascendable"
 
     def test_set_disposition_stale_snapshot_beats_confirm_required(self, install: Path) -> None:
-        # rendered as a Keep note, activated to a loop elsewhere: "-> tray" used to answer confirm_required
-        # (never a re-read). It is stale, and nothing is written.
+        # rendered as a Keep note, promoted elsewhere (to an agenda): the click answers stale (a re-read), and nothing
+        # is written. (The `confirm_required` it used to beat is gone with the loop fold's gate.)
         sid = _legacy_seed(install, "n", "note")
-        apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
+        apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda"})
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid,
                                          "disposition": "someday", "expect_disposition": "note"})
         assert ei.value.code == "stale" and ei.value.http_status == 409
-        assert "disposition" not in _intention_store(install).get(sid)
+        assert _intention_store(install).get(sid)["disposition"] == "agenda"
 
     def test_set_disposition_stale_snapshot_between_two_tray_values_does_not_overwrite(self, install: Path) -> None:
         sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "t", "disposition": "someday"})["intention_id"]
         _intention_store(install).update(sid, disposition="handoff")
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid,
-                                         "disposition": "loop", "expect_disposition": "someday"})
+                                         "disposition": "agenda", "expect_disposition": "someday"})
         assert ei.value.code == "stale"
         assert _intention_store(install).get(sid)["disposition"] == "handoff"
 
@@ -1491,7 +1529,7 @@ class TestIntentionUpdate:
         sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "t", "disposition": "someday"})["intention_id"]
         _intention_store(install).update(sid, disposition="handoff")
         assert apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid,
-                                            "disposition": "loop"})["ok"]
+                                            "disposition": "agenda"})["ok"]
 
     def test_note_can_be_removed_via_descend(self, install: Path) -> None:
         # the legitimate resolution for reference: remove = descend composted.
@@ -1501,12 +1539,14 @@ class TestIntentionUpdate:
         assert res["ok"]
         assert not any(s["id"] == nid for s in _intention_store(install).list_open())
 
-    def test_reclassify_locked_on_a_committed_loop(self, install: Path) -> None:
-        sid = _add_intention(install, stype="thought")  # a loop (no disposition) = committed
-        with pytest.raises(EditError) as ei:
-            apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "task"})
-        assert ei.value.code == "type_locked" and ei.value.http_status == 409
-        assert _intention_store(install).get(sid)["type"] == "thought"  # untouched
+    def test_reclassify_a_key_absent_row_is_allowed_since_the_fold(self, install: Path) -> None:
+        # was `..._locked_on_a_committed_loop`: a key-absent row (the entity's own plant) was a committed loop with a
+        # LOCKED type. It reads someday now, a Tray row, so its type is reclassifiable like any forming item.
+        sid = _add_intention(install, stype="thought")
+        res = apply_edit(_scope(install), {"kind": "intention_update", "intention_id": sid, "type": "task"})
+        assert res["ok"]
+        rec = _intention_store(install).get(sid)
+        assert rec["type"] == "task" and "disposition" not in rec     # retyped; the stored row still carries no disposition
 
     def test_reclassify_locked_on_a_note(self, install: Path) -> None:
         sid = _legacy_seed(install, "ref", "note")
@@ -1609,7 +1649,7 @@ class TestIntentionUpdate:
         with pytest.raises(EditError) as ei:
             apply_edit(_scope(install), {
                 "kind": "intention_update", "intention_id": sid, "type": "task", "tier": "warm",
-                "expect_disposition": "loop"})  # snapshot disagrees with the server-read "someday"
+                "expect_disposition": "agenda"})  # snapshot disagrees with the server-read "someday"
         assert ei.value.code == "stale" and "changed since read" in str(ei.value)
         rec = _intention_store(install).get(sid)
         assert rec["type"] == "thought" and rec["disposition"] == "someday"  # fail-closed: untouched
@@ -1624,6 +1664,24 @@ class TestIntentionUpdate:
         assert res["ok"]
         rec = _intention_store(install).get(sid)
         assert rec["type"] == "task" and rec["tier"] == "hot"
+
+    def test_descend_snapshot_someday_on_a_key_absent_row_lands_and_a_moved_row_is_stale(self, install: Path) -> None:
+        """The descend site reads the row first (design 2c): a key-absent row renders someday, so its snapshot is `someday`;
+        a row re-routed since the render answers stale and stays open."""
+        sid = _add_intention(install)                     # key-absent
+        res = apply_edit(_scope(install), {
+            "kind": "intention_close", "intention_id": sid, "intention_kind": "composted",
+            "confirm": True, "expect_disposition": "someday"})
+        assert res["ok"]
+        assert recent_edits(install / ".levain")[0]["prior_disposition"] == "someday"   # was "loop" before the fold
+        moved = _add_intention(install)
+        _intention_store(install).update(moved, disposition="agenda")
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "intention_close", "intention_id": moved, "intention_kind": "composted",
+                "confirm": True, "expect_disposition": "someday"})
+        assert ei.value.code == "stale" and ei.value.http_status == 409
+        assert any(r["id"] == moved for r in _intention_store(install).list_open())
 
     def test_descend_audit_records_resolved_disposition(self, install: Path) -> None:
         # L1 #5: the forensic trail records WHICH disposition was resolved (the snapshot, normalized

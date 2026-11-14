@@ -64,7 +64,14 @@ def test_the_effect_refuses_what_it_may_not_write() -> None:
         with pytest.raises(ValueError, match=why):
             canonical_effect("intention_retarget", bad, pre, version_of=ver)
     with pytest.raises(ValueError, match="neither"):
-        canonical_effect("intention_retarget", {"target": "band"}, {**pre, "disposition": None, "next": "2031-02-03"}, version_of=ver)
+        canonical_effect("intention_retarget", {"target": "band"}, {**pre, "disposition": "note", "next": "2031-02-03"}, version_of=ver)
+    # the loop fold: a key-absent row (the entity's own plant, a loop before the fold) reads someday, so it takes a target
+    # and becomes an agenda; this was refused as "neither a seed nor an agenda"
+    bare = {k: v for k, v in pre.items() if k != "disposition"}
+    plant = canonical_effect("intention_retarget", {"target": "band"}, {**bare, "next": "2031-02-03"}, version_of=ver)
+    assert plant.changes == {"target": "band", "disposition": "agenda"}
+    plant = canonical_effect("intention_retarget", {"target": "band"}, {**bare, "disposition": "loop", "next": "2031-02-03"}, version_of=ver)
+    assert plant.changes == {"target": "band", "disposition": "agenda"}
     held = {**pre, "disposition": "agenda", "next": "2031-02-03T09:00", "attention": "talk"}
     with pytest.raises(ValueError, match="attention"):                                    # steering's own rule: no ping on a desk drop
         canonical_effect("intention_retarget", {"target": "desk"}, held, version_of=ver)
@@ -210,16 +217,16 @@ def test_a_timed_held_row_snoozed_earlier_the_same_day_is_signed(tmp_path: Path)
     assert store.get(ids["seed"])["next"] == "2031-02-03T21:05"
 
 
-def test_a_timed_held_row_on_open_loops_reads_its_stored_minute(tmp_path: Path) -> None:
-    """Open loops builds its rows with the provider's own intention row, not the List's: that row carries the stored minute too, so a
-    later minute on the held day stays C1 there and an earlier one is T2."""
+def test_a_timed_held_row_that_was_a_loop_reads_its_stored_minute_on_the_list(tmp_path: Path) -> None:
+    """Was ``..._on_open_loops_...``: the Open loops panel built its rows with the provider's own intention row. Since the loop fold a
+    key-absent row (what was a loop) reads someday and is a Tray row, so the same row now comes from the tray panel: it carries the
+    stored minute too, so a later minute on the held day stays C1 there and an earlier one is T2."""
     root, src, ids = _install(tmp_path)
     store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     store.update(ids["loop"], next="2031-02-03T21:05", today=TODAY)
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
-        rows = _get(f"{base}/cockpit/panel/loops.json", TOKEN)["rows"]
-        r = next(x for x in rows if x["id"] == f"intention:{ids['loop']}")
-        later ={"verb": "intention_surface_at", "panel_id": "loops", "row_id": r["id"], "row_version": r["version"],
+        r = _row(base, ids["loop"])
+        later ={"verb": "intention_surface_at", "panel_id": "tray", "row_id": r["id"], "row_version": r["version"],
                  "params": {"surface_at": "2031-02-03T22:00"}, "dry_run": True}
         st, body = _post(f"{base}/cockpit/verb", later, TOKEN)
         assert st == 200 and body.get("tier") == "C1", (st, body)
