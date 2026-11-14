@@ -70,8 +70,12 @@ _ALLOW = frozenset({
 _ALLOW_PREFIXES = ("LC_", "XDG_", "PYTHON", "LEVAIN_", "VAGUS_", "ANNEAL_", "CONDA_", "PIPX_")
 _TOKEN_SHAPED = re.compile(r"(^|_)(KEY|KEYS|TOKEN|TOKENS|SECRET|SECRETS|PASSWORD|PASSWD|PASS|PWD|"
                            r"CREDENTIAL|CREDENTIALS|AUTH|COOKIE|SESSION)(_|$)")
+# The live marker (levain.home_guard.LIVE_ENV, spelled here so this module adds no import to the root tree): a
+# property of ONE process, which every levain entry sets on itself. Never inherited: a child that held it would hand
+# it to a model, and a script the model writes would resolve the real home with no warning.
+LIVE_ENV = "LEVAIN_LIVE"
 # Names in an allowed namespace that are secrets or plumbing, never allowed.
-_NEVER = frozenset({API_KEY_ENV, CARRY_FD_ENV})
+_NEVER = frozenset({API_KEY_ENV, CARRY_FD_ENV, LIVE_ENV})
 # Where the macOS carry file is made: a directory under the floor's own crown jewel
 # (``~/.levain-runtime/floor``, denied to every entity), so no confined shell can open it by name.
 CARRY_DIR = Path("~/.levain-runtime/floor/carry")
@@ -139,7 +143,7 @@ def child_env(*names: str, prefixes: tuple[str, ...] = (), seat: str | None = No
     ``LEVAIN_SEAT`` (the NEEDS YOU band's D4 marker); None leaves any marker the operator set on this process."""
     env = allowed_env(os.environ)
     env.update({k: v for k, v in os.environ.items()
-                if k in names or (prefixes and k.startswith(prefixes))})
+                if k != LIVE_ENV and (k in names or (prefixes and k.startswith(prefixes)))})
     if seat is not None:
         if seat not in SEATS:
             raise ValueError(f"seat is one of {', '.join(SEATS)}")
@@ -270,6 +274,7 @@ def reexec_if_needed() -> None:
     args, key = _lift_api_key(sys.argv[1:])
     keep = allowed_env(os.environb)
     carry = {k: v for k, v in os.environb.items() if k not in keep}
+    carry.pop(os.fsencode(LIVE_ENV), None)     # the marker is this image's own: the re-executed image marks itself
     if not carry and key is None:
         return
     head = sys.orig_argv[: len(sys.orig_argv) - len(sys.argv) + 1]
@@ -326,7 +331,10 @@ def set_not_dumpable() -> bool:
 
 
 def main() -> int:
+    from levain import home_guard
+
     reexec_if_needed()
+    home_guard.mark_live()      # after the re-exec: the marker never crosses an exec, so the image that runs marks itself
     set_not_dumpable()
     if sys.platform.startswith("linux"):
         try:   # a crashed session's floor placeholders (see levain.firing.confinement)

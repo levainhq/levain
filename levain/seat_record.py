@@ -111,4 +111,9 @@ def main(argv: Sequence[str]) -> int:
 
 
 if __name__ == "__main__":
+    try:     # also run by file path, with no levain or a broken one on sys.path (a record is never a gate: exit 0)
+        from levain.home_guard import mark_live
+        mark_live()
+    except Exception:  # noqa: BLE001
+        pass
     sys.exit(main(sys.argv[1:]))

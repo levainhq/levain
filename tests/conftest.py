@@ -276,8 +276,8 @@ def _install_session_home() -> None:
     # root; a script the suite did not start has no voucher, and a root that holds the account's own home vouches for
     # nothing.
     os.environ[home_guard.TEST_SCRATCH_ROOT_ENV] = str(Path(tempfile.gettempdir()).resolve())
-    for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "CODEX_HOME"):
-        os.environ.pop(name, None)
+    for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "CODEX_HOME", home_guard.LIVE_ENV):
+        os.environ.pop(name, None)     # the live marker too: a shell that holds it never opens the real home to a test
 
 
 def pytest_configure(config):

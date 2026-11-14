@@ -60,3 +60,18 @@ def test_script_entry_pre_via_subprocess(tmp_path):
 
 def test_bound_main_never_raises(tmp_path):
     assert sr.bound_main(io.StringIO("garbage")) == 0
+
+
+def test_script_entry_exits_0_when_the_marker_import_breaks(tmp_path):
+    """Run by path beside a levain whose ``home_guard`` fails with something other than ImportError (a partial upgrade,
+    an older interpreter's SyntaxError): still exit 0 and record, since a record is never a gate (L3 r1 complement L18)."""
+    fake = tmp_path / "fake" / "levain"
+    fake.mkdir(parents=True)
+    (fake / "__init__.py").write_text("")
+    (fake / "home_guard.py").write_text("raise RuntimeError('half-upgraded')\n")
+    r = subprocess.run([sys.executable, "-B", sr.__file__, "pre", str(tmp_path / "r3")],
+                       input=json.dumps({"tool_name": "Edit", "tool_input": {}, "cwd": "/c"}),
+                       env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(tmp_path / "fake")},
+                       capture_output=True, text=True, timeout=60)
+    assert (r.returncode, r.stdout, r.stderr) == (0, "", "")
+    assert sr.read_rows(tmp_path / "r3")[0]["tool"] == "Edit"

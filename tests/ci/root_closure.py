@@ -117,6 +117,7 @@ LAZY_SITES = {
     # operator: ``cmd_setup_isolation`` <- ``cli.py`` (the one caller)
     'levain/firing/hands.py::cmd_setup_isolation::from levain.firing.ws_git import LIVENESS_TIMEOUT, WsGitError, entity_session_live': 'operator',
     # operator: the console script ``levain = levain.launch:main`` (pyproject.toml): the operator's interpreter, never a root helper
+    'levain/launch.py::main::from levain import home_guard': 'operator',
     'levain/launch.py::main::from levain.firing.confinement import sweep_floor_placeholders': 'operator',
     # operator: the console script ``levain = levain.launch:main`` (pyproject.toml): the operator's interpreter, never a root helper
     'levain/launch.py::main::from levain.cli import main as cli_main': 'operator',

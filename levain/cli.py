@@ -5195,7 +5195,7 @@ def _cmd_daemon_restart(args: argparse.Namespace) -> int:
 
 
 if __name__ == "__main__":
-    # Through the console entry, so `python -m levain.cli` gets the launch re-exec too.
+    # Through the console entry, so `python -m levain.cli` gets the launch re-exec and is marked after it.
     from levain.launch import main as _launch_main
 
     sys.exit(_launch_main())

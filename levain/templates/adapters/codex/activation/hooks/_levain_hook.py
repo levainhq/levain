@@ -57,6 +57,17 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# Every hook script beside this module is a levain entry and imports it first, whichever way it was started (the
+# rendered `-m levain.hookrun <script>`, which marks already, or `python <script>` from an install rendered before
+# hookrun, or an operator by hand): so the process is marked here. Fail open like everything else in this file (no
+# levain on the path, or a broken one, is not the hook's problem).
+try:
+    from levain.home_guard import mark_live as _mark_live
+
+    _mark_live()
+except Exception:  # noqa: BLE001
+    pass
+
 
 def install_root() -> Path:
     """The Levain install directory (the operator's partnership working dir).

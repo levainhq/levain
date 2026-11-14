@@ -253,4 +253,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from levain.home_guard import mark_live
+    mark_live()
     raise SystemExit(main())

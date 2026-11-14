@@ -309,4 +309,6 @@ __all__ = ["BACKOFF_FIRST_S", "BACKOFF_MAX_S", "EX_INSTANCE_HELD", "FollowRunner
 
 
 if __name__ == "__main__":
+    from levain.home_guard import mark_live
+    mark_live()
     sys.exit(main())

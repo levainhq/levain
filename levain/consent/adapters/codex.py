@@ -932,7 +932,10 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
     and ``PreToolUse`` (:func:`gate`). Always exits 0 (any other exit fails open on Codex). A PermissionRequest
     prints a decision only when the core verified one; a PreToolUse whose gate raised prints :func:`gate_failed`. In
     a slot session (:func:`levain.consent.broker_client.in_slot`) it is :func:`_slot_main` instead, and opens no
-    queue."""
+    queue. The installed hook script imports this function and never reaches the ``__main__`` block, so the live marker
+    is set here."""
+    from levain.home_guard import mark_live
+    mark_live()
     stdin = stdin if stdin is not None else sys.stdin
     stdout = stdout if stdout is not None else sys.stdout
     event: Any = None
@@ -1568,4 +1571,6 @@ def gate_trust(hooks_path: Path, script: Path, *, home: Path | None = None, code
 
 
 if __name__ == "__main__":
+    from levain.home_guard import mark_live
+    mark_live()
     sys.exit(main())

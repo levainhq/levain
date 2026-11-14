@@ -627,7 +627,10 @@ def read_token_stdin(stream: Any = None) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """``credential-helper --home <dir> <get|store|erase>`` (git's helper protocol). git runs it through
-    :func:`_helper_command`'s bootstrap; ``python -m levain.seat_gh`` reaches the same entry."""
+    :func:`_helper_command`'s bootstrap; ``python -m levain.seat_gh`` reaches the same entry. The bootstrap never
+    reaches the ``__main__`` block, so the live marker is set here (the helper resolves no home today: it is handed one)."""
+    from levain.home_guard import mark_live
+    mark_live()
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) == 4 and args[0] == "credential-helper" and args[1] == "--home":
         return credential_helper(args[3], sys.stdin.read(65536), args[2], sys.stdout)
@@ -635,4 +638,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    from levain.home_guard import mark_live
+    mark_live()
     sys.exit(main())
