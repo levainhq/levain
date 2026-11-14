@@ -698,3 +698,64 @@ def test_a_failed_hook_write_holds_every_remaining_hook_whichever_file_fails(old
     for rel in COUPLED:
         assert receipt_after[rel] == receipt_before[rel], rel
     _coherent(old_install, scratch)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# the loop fold (levain#4): an install made by the release just BEFORE the fold, whose entry points call the helpers the fold
+# deleted from `_levain_hook.py` (`intentions_colliding`, `open_intentions`)
+# ---------------------------------------------------------------------------------------------------------------------
+
+PREFOLD_REV = "93b65592f"  # the last commit before the loop fold
+
+
+@pytest.fixture(scope="module")
+def prefold_tree(tmp_path_factory) -> Path:
+    probe = subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", f"{PREFOLD_REV}^{{commit}}"], capture_output=True)
+    if probe.returncode != 0:
+        pytest.skip(f"git has no {PREFOLD_REV}, so the pre-fold release cannot be extracted")
+    root = tmp_path_factory.mktemp("prefold_release")
+    blob = subprocess.run(["git", "-C", str(REPO), "archive", PREFOLD_REV, "levain", "pyproject.toml"],
+                          capture_output=True, check=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+        tar.extractall(root, filter="data") if hasattr(tarfile, "data_filter") else tar.extractall(root)
+    return root
+
+
+@pytest.fixture
+def prefold_install(prefold_tree, answers_file, tmp_path, monkeypatch) -> Path:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home" / "codex-home"))
+    install = tmp_path / "entity"
+    _init(prefold_tree, install, answers_file, tmp_path / "home")
+    return install.resolve()
+
+
+def test_an_edited_prefold_prompt_hook_holds_the_refreshed_helper_so_it_never_calls_a_deleted_one(prefold_install, scratch):
+    """The skew the fold could cause: the package refreshes `_levain_hook.py` (the intention helpers gone) while the operator's
+    edited entry point, which still calls them, is held. The hooks swallow the AttributeError, so the whole prompt hook would go
+    dark. The coupled hold keeps the helper back with the edited file, and the set still works as the pre-fold generation."""
+    hooks = prefold_install / "activation" / "hooks"
+    assert b"intentions_colliding" in (hooks / "user_prompt_submit.py").read_bytes()      # the old entry point does call it
+    before = {n: (hooks / n).read_bytes() for n in HOOK_FILES}
+    (hooks / "user_prompt_submit.py").write_bytes(before["user_prompt_submit.py"] + b"\n# my own edit\n")
+    edited = (hooks / "user_prompt_submit.py").read_bytes()
+
+    out, text = _update(prefold_install)
+
+    assert (hooks / "user_prompt_submit.py").read_bytes() == edited
+    assert (hooks / "_levain_hook.py").read_bytes() == before["_levain_hook.py"], "the helper moved under an entry point that calls it"
+    assert (hooks / "session_start.py").read_bytes() == before["session_start.py"]
+    for n in HOOK_FILES:
+        assert f"activation/hooks/{n}" in out.review, (n, out.review)
+    assert "intentions_colliding" in text and "together" in text
+    assert _CRYSTAL in _probe(prefold_install, scratch)["prompt"]                          # the held set ran whole
+
+
+def test_an_unedited_prefold_hook_set_moves_together_and_runs_whole(prefold_install, scratch):
+    out, _text = _update(prefold_install)
+    hooks = prefold_install / "activation" / "hooks"
+    for n in HOOK_FILES:
+        assert b"intentions_colliding" not in (hooks / n).read_bytes(), n
+    assert out.review == []
+    got = _probe(prefold_install, scratch)
+    assert _CRYSTAL in got["prompt"] and "[open loops" not in got["prompt"]
