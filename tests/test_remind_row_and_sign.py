@@ -86,7 +86,7 @@ def _shown(broker: Broker, rig: Rig, line: str) -> list[str]:
     assert out["state"] == "WAITING", out
     with broker._admitted() as db:
         view = db.load(out["pending_id"])
-    return render(view, signer_fp="SHA256:test", signer_class="laptop-presence")
+    return render(view, signer_fp="SHA256:test", signer_class="laptop-presence", now=NOW)
 
 
 def test_the_sign_sheet_for_a_repeating_reminder_says_a_reminder_with_its_minute_and_repeat(rig: Rig, broker: Broker) -> None:
@@ -164,3 +164,12 @@ def test_a_recur_that_does_not_read_prints_no_headline_and_a_readable_one_prints
     assert intake_headline(rec("weekly sun 9:00")).endswith("then weekly SUN 09:00 (as a nudge)")     # the canon, not the raw spelling
     assert intake_headline(rec("whenever")) is None
     assert intake_headline(rec("weekly SUN 21:00\n  this signs a DROP")) is None                       # no lookalike line reaches the sheet
+
+
+def test_the_sign_sheet_names_the_year_of_a_yearless_date_that_landed_next_year_and_only_then(broker: Broker, rig: Rig) -> None:
+    """Row 1729: a date with no year means its next occurrence, so a past 11-05 (the rig's clock is 11-08) is 2027's; the sheet
+    says so instead of reading as a date already passed this year. A date still ahead this year shows no year."""
+    past = _shown(broker, rig, "remind 11-05 3pm call X")[1]
+    assert past.startswith('  this signs a REMINDER for you: "call X", rings Fri 2027-11-05 15:00 (as a nudge)'), past
+    ahead = _shown(broker, rig, "remind 11-20 3pm call X")[1]
+    assert ahead.startswith('  this signs a REMINDER for you: "call X", rings Fri 11-20 15:00 (as a nudge)'), ahead
