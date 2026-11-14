@@ -152,16 +152,22 @@ def test_an_unknown_kind_classifies_generically(tmp_path):
     assert auth.classify(_policy(pg=g), _policy()) == auth.GRANT_REVOKE
 
 
+#: the link's own time for the envelope test below. ``_push`` stamps its expiry from the REAL clock (two hours ahead), so a
+#: fixed link day (it was 2026-10-17) put that expiry past the 30-day bound from 2026-11-15 UTC on, and every case that
+#: reaches the check after the bound's (the finite-JSON one) failed; the link time and the over-long expiry follow the clock.
+_LINK_AT = datetime.now(timezone.utc)
+
+
 @pytest.mark.parametrize("over, said", [
     ({"kind": "Push"}, "grant kind name"), ({"kind": ""}, "grant kind name"), ({"kind": 7}, "grant kind name"),
     ({"id": ""}, ".id"), ({"expires_at": "soon"}, "not a timestamp"),
-    ({"expires_at": utc_stamp(datetime(2026, 12, 1, tzinfo=timezone.utc))}, "at most 30 days"),
+    ({"expires_at": utc_stamp(_LINK_AT + timedelta(days=31))}, "at most 30 days"),
     ({"branches": [float("nan")]}, "finite JSON"),
 ])
 def test_an_inert_grant_s_envelope_is_checked(tmp_path, over, said):
     g = dict(_push(tmp_path), **over)
     with pytest.raises(auth.AuthorityError, match=said):
-        auth._validate_grant(g, "grant", at=datetime(2026, 10, 17, tzinfo=timezone.utc))
+        auth._validate_grant(g, "grant", at=_LINK_AT)
 
 
 def test_a_known_kind_stays_closed(tmp_path):
