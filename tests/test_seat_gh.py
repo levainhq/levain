@@ -336,7 +336,9 @@ def test_status_prints_no_token(home):
     for owner in g.OWNERS:
         line = g.token_status(home, owner, NOW)
         assert "live" in line and "fingerprint" in line and TOKEN_L not in line and TOKEN_P not in line
-    assert "EXPIRED" in g.token_status(home, "levainhq", NOW + timedelta(days=400))
+    # probe one day past the stored expiry, wherever FUTURE sits on the real clock
+    past_expiry = datetime.fromisoformat(FUTURE).replace(tzinfo=timezone.utc) + timedelta(days=1)
+    assert "EXPIRED" in g.token_status(home, "levainhq", past_expiry)
 
 
 def test_the_token_is_read_from_stdin_only():
