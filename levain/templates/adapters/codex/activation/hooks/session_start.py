@@ -11,10 +11,10 @@ per hooks.json). Injects, at primacy position:
   2. Operator-local date and time — models have no clock.
   3. On a genuinely fresh session (source ∈ {"startup", "clear"}) only: a
      wrap-check flag if the previous session left episodes unwrapped, AND the
-     time-based prospective surface — open intentions that have gone dormant or
-     whose `next` date has arrived, surfaced once so nothing rots silently.
-     `resume` and `compact` carry ongoing work, not a fresh start — they get
-     posture re-injection but skip the wrap-check and the due-intention surface.
+     due-agenda germination (a dated agenda that has come due starts `levain
+     intentions germinate`; there is no dormant-intention surface, since Levain 1.0
+     has no loop kind). `resume` and `compact` carry ongoing work, not a fresh start
+     — they get posture re-injection but skip the wrap-check and the germination.
 
 Codex SessionStart `source` vocabulary per Codex 0.133 schema: `startup`,
 `resume`, `clear`, `compact`. (`clear` and `compact` mirror Claude Code's
@@ -165,18 +165,6 @@ def main() -> int:
                             f"into continuity. They are not lost: prepare_wrap still "
                             f"sees them."
                         )
-            except Exception:
-                pass
-
-            try:
-                # Time-based intention germination — open loops that have gone dormant
-                # or whose `next` date has arrived, surfaced once on a fresh session
-                # so nothing rots silently. Growing/resting/parked stay out of the
-                # way. Fires only on a fresh session (with the wrap-check), not on
-                # resume/compact mid-flow.
-                due = hook.due_dormant_intentions(hook.open_intentions())
-                if due:
-                    sections.append(hook.format_due_intentions(due))
             except Exception:
                 pass
 
