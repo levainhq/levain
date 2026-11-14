@@ -191,15 +191,6 @@ def test_a_link_to_a_good_file_warns_with_the_helpers_bad_root(world):
     assert "bad-root" in r.detail
 
 
-def test_a_corrupt_authority_log_is_a_warning_not_a_healthy_signers_row(world):
-    write_root(world, "laptop")
-    (world.root / "journal.db" if (world.root / "journal.db").exists() else
-     next(world.root.glob("*.db"))).write_bytes(b"not a database" * 100)
-    out = rows(world)
-    assert [r.name for r in out] == ["authority signers", "authority log"]
-    assert out[1].warn and out[1].ok and out[1].detail.startswith("could not check the authority log:")
-
-
 def test_nothing_in_the_check_can_abort_doctor(world, monkeypatch):
     write_root(world, "laptop")
     from levain.autonomic import coverage as cov
@@ -209,29 +200,6 @@ def test_nothing_in_the_check_can_abort_doctor(world, monkeypatch):
     monkeypatch.setattr(cov, "authority_keys", boom)
     [r] = rows(world)
     assert r.name == "authority signers" and r.warn and "could not check" in r.detail and "boom" in r.detail
-
-
-def test_a_journal_path_with_uri_metacharacters_still_reads_the_log(world, tmp_path):
-    write_root(world, "phone")
-    inst = tmp_path / "in?st#x"
-    (inst / ".levain").mkdir(parents=True)
-    (inst / ".levain" / "cockpit").mkdir()
-    for f in world.root.iterdir():
-        os.symlink(f, inst / ".levain" / "cockpit" / f.name)
-    out = _check_authority_signers(inst, signers=signers(world), now=world.clock.now)
-    assert [r.name for r in out] == ["authority signers"]
-
-
-def test_a_missing_anchor_on_an_initialised_log_is_a_warning_not_silence(world, monkeypatch):
-    from levain import authority as auth
-
-    write_root(world, "laptop")
-
-    def gone(*a, **k):
-        raise auth.NotInitialised("anchor gone")
-    monkeypatch.setattr(auth, "check_anchor", gone)
-    out = rows(world)
-    assert out and any(r.warn and "anchor" in r.detail for r in out)
 
 
 def test_a_file_that_goes_between_the_lstat_and_the_read_is_the_missing_files_pass(world, monkeypatch):

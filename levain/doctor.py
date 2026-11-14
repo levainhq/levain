@@ -4058,12 +4058,12 @@ def _check_authority_signers(install: Path, *, signers: Path | None = None, now:
     this levain signs no graduation policy, so the row is informational. The root ``levain-authority`` signers verbs
     stay.
 
-    Only for an install with a cockpit authority log (no journal, or an uninitialised log, gives no row). A file
+    Only for an install with a cockpit journal file (no journal gives no row); the log is not replayed here. A file
     that is not one :func:`levain.trust_anchor.trust_anchor_problem` trusts, or that the install helper's own
     reader (:func:`levain.slot.install_helper._read_signers`: a link, past its size bound, not UTF-8 throughout,
     unreadable) refuses, is a WARNING: it is a file to remove or fix, and the helper will not write over it. A
-    missing file, or one listing no key for ``levain-authority``, is a plain pass. It is read-only: the journal opens
-    read-only and root's file is only read. Nothing here can abort doctor: any other failure is a WARNING ``could not
+    missing file, or one listing no key for ``levain-authority``, is a plain pass. It is read-only: root's file is
+    only read. Nothing here can abort doctor: any other failure is a WARNING ``could not
     check``. ``signers`` and ``now`` are test seams (``now`` is unused since the policies row went)."""
     try:
         return _authority_signers_rows(install, signers, now)
@@ -4073,42 +4073,20 @@ def _check_authority_signers(install: Path, *, signers: Path | None = None, now:
 
 
 def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> list[CheckResult]:
-    from urllib.parse import quote
-
-    from levain import authority as auth
     from levain.autonomic import coverage as cov
-    from levain.autonomic.confirm import _SIGNERS_FILE_OWNERS, DEFAULT_SSH_KEYGEN
+    from levain.autonomic.confirm import _SIGNERS_FILE_OWNERS
     from levain.cockpit.firejournal import DB_NAME
     from levain.slot import Refused, root_tree
     from levain.slot.install_helper import _read_signers
     from levain.trust_anchor import trust_anchor_problem
 
     root = install / ".levain" / "cockpit"
-    journal = root / DB_NAME
-    if not journal.is_file():
+    if not (root / DB_NAME).is_file():
         return []
     host = "darwin" if sys.platform == "darwin" else "linux"
     path = signers if signers is not None else root_tree.authority_signers_path(host)   # type: ignore[arg-type]
     name = "authority signers"
     rows: list[CheckResult] = []
-    log_problem: str | None = None
-    try:
-        pinned = auth.read_anchor(auth.anchor_path(root))              # before the replay's first SELECT
-        # a read-only replay: the log is verified, never written, and never created here
-        conn = sqlite3.connect(f"file:{quote(str(journal))}?mode=ro", uri=True, isolation_level=None, timeout=2.0)
-        try:
-            state = auth.snapshot(conn, cache=auth.ReplayCache(), ssh_keygen=DEFAULT_SSH_KEYGEN)
-        finally:
-            conn.close()
-        try:
-            auth.check_anchor(state, pinned, path=auth.anchor_path(root))
-        except auth.NotInitialised as exc:             # the log replayed, so it is initialised: its anchor is the gap
-            rows.append(CheckResult("authority anchor", True, f"the anchor check could not run: {exc}",
-                                    "The cockpit authority row has the log's state.", warn=True))
-    except auth.NotInitialised:
-        return []
-    except Exception as exc:  # noqa: BLE001 - a log that cannot be replayed is a row of its own, never a quiet pass
-        log_problem = f"{type(exc).__name__}: {exc}"
     unused = "this levain signs no graduation policy for it to anchor"
     missing = CheckResult(name, True, f"no enrolled authority signer ({path} does not exist); {unused}")
     try:
@@ -4147,9 +4125,6 @@ def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> li
             else:
                 row = CheckResult(name, True, f"{path} lists no key for levain-authority; {unused}")
     rows.append(row)
-    if log_problem is not None:
-        rows.append(CheckResult("authority log", True, f"could not check the authority log: {log_problem}",
-                                "The cockpit authority row says whether the log itself is readable.", warn=True))
     return rows
 
 
