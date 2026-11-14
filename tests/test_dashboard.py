@@ -434,6 +434,20 @@ class TestIntentionProjections:
         assert [s.id for s in v.tray if s.tier == "parked"] == ["parked1"]
         assert v.open_intentions == []
 
+    def test_a_fresh_capture_is_not_starved_by_a_full_live_cap(self, tmp_path: Path) -> None:
+        from datetime import date
+        # S2 item 4: the Tray had its own cap before the loop fold; folded into one pool a fresh capture (ranked below 50
+        # hot rows) dropped from every surface that reads the default 50 (TUI, app_server, `levain dashboard`).
+        db = tmp_path / "memory.db"
+        day = date(2026, 11, 12)
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}", created="2026-10-01T00:00:00Z") for i in range(60)]
+        rows.append(self._row(id="fresh", text="fresh capture", disposition="someday", created="2026-11-12T09:00:00Z"))
+        rows.append(self._row(id="stale", text="old capture", disposition="someday", created="2026-09-01T00:00:00Z"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        v = build_substrate_view(AnnealPaths.from_db(db), today=day)  # default max_intentions=50
+        ids = [s.id for s in v.tray]
+        assert "fresh" in ids and "stale" not in ids and len(ids) == 51
+
     def test_parked_rows_have_their_own_cap(self, tmp_path: Path) -> None:
         db = tmp_path / "memory.db"
         rows = [self._row(id=f"live{i}", tier="hot", text=f"live {i}") for i in range(5)]

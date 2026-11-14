@@ -605,7 +605,8 @@ class OpenIntention:
     # between a write's guard and its write stales the write instead of passing under it
     germinated: dict[str, Any] | None = None
     # the disposition the store HOLDS (None for a key-absent row), where ``disposition`` is what the List reads (someday
-    # for that row). What a version and a cockpit label key are taken over; a row built without one holds what it reads
+    # for that row). What a cockpit label key is taken over (the row version takes the pre-fold projection of it,
+    # ``cockpit.providers.intention_version_disposition``); a row built without one holds what it reads
     stored_disposition: str | None = _AS_READ
 
     def __post_init__(self) -> None:
@@ -1779,6 +1780,19 @@ _SUMMARY_SECTIONS = frozenset({"State", "Active Threads"})
 # The builder
 # ---------------------------------------------------------------------------
 
+CAPTURE_RESERVE = 10   # live-pool overflow slots for fresh captures (non-parked rows created within CAPTURE_DAYS)
+CAPTURE_DAYS = 7
+
+
+def _is_fresh_capture(s: Mapping[str, Any], today: date) -> bool:
+    """A row created within CAPTURE_DAYS of ``today`` (an unparseable or missing ``created`` is not fresh)."""
+    try:
+        made = date.fromisoformat(str(s.get("created") or "")[:10])
+    except ValueError:
+        return False
+    return today - timedelta(days=CAPTURE_DAYS) <= made <= today
+
+
 def build_substrate_view(
     paths: AnnealPaths,
     *,
@@ -2003,6 +2017,9 @@ def build_substrate_view(
             # a bucket this code does not know falls to the Tray too (view.open_intentions stays empty)
             bucket_target = {BUCKET_TRAY: view.tray}
             parked_n = 0   # parked rows in view.tray (their cap is separate)
+            capture_n = 0  # fresh captures held past the live cap (their reserve is separate, a fifth of the cap, at most CAPTURE_RESERVE)
+            capture_cap = min(CAPTURE_RESERVE, max_intentions // 5)
+            cap_today = today or date.today()
             for s in IntentionStore(paths.intentions_json, id_prefix="intention").list_open(today=today):
                 # The WHOLE per-row pipeline (status-skip → route → cap → construct) lives
                 # in ONE try, so a fault on ANY phase drops just that row — the "one
@@ -2018,9 +2035,14 @@ def build_substrate_view(
                         continue
                     target = bucket_target.get(bucket_of(s), view.tray)
                     parked = s.get("tier") == PARKED_TIER
-                    held = parked_n if parked else len(target) - parked_n
+                    held = parked_n if parked else len(target) - parked_n - capture_n
                     if held >= max_intentions:
-                        continue  # this pool is full — keep scanning for the others
+                        # the live pool is full. A capture (a non-parked row created in the last CAPTURE_DAYS days)
+                        # has a small reserve of its own: it ranks below a busy install's hot rows, and the Tray's
+                        # old separate cap kept it on the surface the operator reads [S2 L3 follow-up]
+                        if parked or capture_n >= capture_cap or not _is_fresh_capture(s, cap_today):
+                            continue
+                        capture_n += 1
                     target.append(open_intention_from(s))
                     if parked:
                         parked_n += 1
