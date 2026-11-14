@@ -33,7 +33,7 @@ class TestDefaultLayout:
 
     def test_brief_holds_the_state_line(self, regions) -> None:
         r, _ = regions
-        assert r["brief"] == ["state", "begin"]      # the state line, then Where to begin (read from the List and Open loops)
+        assert r["brief"] == ["state", "begin"]      # the state line, then Where to begin (read from the List)
 
     def test_health_is_a_widget(self, regions) -> None:
         r, heads = regions
@@ -44,8 +44,8 @@ class TestDefaultLayout:
     def test_work_zone_order(self, regions) -> None:
         r, _ = regions
         ids = [c["panels"][0] for c in _zone(r, "operate")["cards"]]
-        assert ids[:2] == ["tray", "loops"]
-        assert ids.index("loops") < ids.index("episodes") < ids.index("edits")
+        assert ids[:2] == ["tray", "episodes"] and "loops" not in ids      # the loop fold: no Open loops card
+        assert ids.index("episodes") < ids.index("edits")
         assert "keep" not in ids      # TS-5a: no Keep card
         assert all(c["span"] == 1 and c["tabs"] is None for c in _zone(r, "operate")["cards"])
 
@@ -66,16 +66,16 @@ class TestDefaultLayout:
         assert last["size"] == "short" and last["span"] == 1
         assert not any(c["size"] == "short" for c in cards[:-1])
 
-    def test_tray_and_loops_are_tall_the_rest_of_the_work_zone_medium(self, regions) -> None:
+    def test_tray_is_tall_the_rest_of_the_work_zone_medium(self, regions) -> None:
         r, _ = regions
         sizes = {c["panels"][0]: c["size"] for c in _zone(r, "operate")["cards"]}
-        assert sizes["tray"] == "tall" and sizes["loops"] == "tall"
+        assert sizes["tray"] == "tall"
         assert sizes["episodes"] == "medium" and "keep" not in sizes
 
-    def test_ranks_leave_the_embedder_gap_and_loops_clears_it(self, regions) -> None:
+    def test_ranks_leave_the_embedder_gap_and_the_list_clears_it(self, regions) -> None:
         _, heads = regions
-        assert heads["tray"]["rank"] == 10 and heads["loops"]["rank"] == 15
-        assert heads["loops"]["rank"] < 16 <= 39 < heads["episodes"]["rank"]
+        assert heads["tray"]["rank"] == 10
+        assert heads["tray"]["rank"] < 16 <= 39 < heads["episodes"]["rank"] and "loops" not in heads
         assert heads["graph"]["rank"] == 200 and heads["wraps"]["rank"] == 210
 
     def test_every_panel_is_placed_exactly_once(self, regions) -> None:

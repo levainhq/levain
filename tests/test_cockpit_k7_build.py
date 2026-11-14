@@ -226,7 +226,7 @@ def test_results_are_worded_and_ordered_by_when_the_job_finished_not_when_it_was
     assert done == ["long check done", "short check done"], done
 
 
-def test_the_open_days_chip_reads_the_integer_the_kernel_sends_not_the_badge_words(tmp_path, monkeypatch):
+def test_a_list_row_carries_its_age_as_the_integer_the_kernel_sends_not_the_badge_words(tmp_path, monkeypatch):
     """The "open N d" chip once parsed the badge text ("3d old"), whose producer is cockpit_view.js `badgeText`; it now
     reads the row's integer `age_days` facet, which the intentions provider computes from the intention's own created date."""
     from anneal_memory.spores import IntentionStore
@@ -234,7 +234,7 @@ def test_the_open_days_chip_reads_the_integer_the_kernel_sends_not_the_badge_wor
     root, src, _ids = _install(tmp_path)
     IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="aged loop", tier="hot", domain="ledgerline",
                                                             today=datetime.now().astimezone().date() - timedelta(days=3))
-    rows = build_default_cockpit(src).panel("loops", credential_class="none")["rows"]
+    rows = build_default_cockpit(src).panel("tray", credential_class="none")["rows"]
     mine = [r for r in rows if "aged loop" in (r["body"] or r["title"])]
     assert mine and mine[0]["facets"]["age_days"] == 3 and mine[0]["facets"]["domain"] == "ledgerline"
     js = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "cockpit_view.js").read_text()
@@ -413,33 +413,27 @@ def test_results_are_the_job_stores_finished_jobs_with_an_outcome_dot(tmp_path, 
 
 
 @needs_browser
-def test_build_places_results_left_and_edits_over_loops_right_with_loops_carrying_open_days_and_repo(tmp_path, monkeypatch):
+def test_build_places_results_left_and_edits_right_and_the_open_loops_card_is_gone(tmp_path, monkeypatch):
     from levain.jobs import JobRuntime, JobStore
-    from anneal_memory.spores import IntentionStore
 
     root, src, _ids = _install(tmp_path)
-    IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="loop with a repo", tier="hot", domain="ledgerline",
-                                                            today=datetime.now().astimezone().date() - timedelta(days=3))
     store = JobStore(root / ".levain" / "jobs.json")
     t = datetime.now(timezone.utc).isoformat()
     store.create("j1", "consult review", t)
     store.claim_running("j1", t)
     store.finish("j1", "done", {"ok": True}, None, t)
-    probe = ("(() => { const r = (s) => { const e = document.querySelector(s); const b = e.getBoundingClientRect(); return [Math.round(b.left), Math.round(b.top), Math.round(b.width)]; };"
-             "const row = [...document.querySelectorAll('[data-ck-panel=loops] .row')].find(x => /loop with a repo/.test(x.innerText));"
-             "return JSON.stringify({jobs: r('[data-ck-panel=jobs]'), edits: r('[data-ck-panel=edits]'), loops: r('[data-ck-panel=loops]'), "
+    probe = ("(() => { const r = (s) => { const e = document.querySelector(s); const b = e.getBoundingClientRect(); return [Math.round(b.left), Math.round(b.top), Math.round(b.width), Math.round(b.height)]; };"
+             "return JSON.stringify({jobs: r('[data-ck-panel=jobs]'), edits: r('[data-ck-panel=edits]'), loops: !!document.querySelector('[data-ck-panel=loops]'), "
              "zone: document.querySelector('.ck-zone[data-zone=operate] .zone-head').innerText.replace(/\\s+/g, ' '), "
-             "open: row.querySelector('.k7-opend').textContent, chip: row.querySelector('.k7-repo').textContent, "
-             "bar: getComputedStyle(row).borderLeftWidth, edits_text: document.querySelector('[data-ck-panel=edits]').innerText}); })()")
+             "edits_text: document.querySelector('[data-ck-panel=edits]').innerText}); })()")
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported", job_runtime=JobRuntime(store)) as (url, _httpd):
-        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('[data-ck-panel=jobs] .row')"}, {"until": "document.querySelector('[data-ck-panel=loops] .row')"},
+        out = _drive(tmp_path, f"{url}/{BUILD}", [DESKTOP, {"until": "document.querySelector('[data-ck-panel=jobs] .row')"},
                      {"eval": "new Promise(r => setTimeout(r, 400))"}, {"eval": probe}])["values"]
     g = json.loads(out[-1])
     assert g["zone"].startswith("Results & edits") and "What the sessions produced." in g["zone"], g
-    assert g["jobs"][0] < g["edits"][0] == g["loops"][0], g                       # Results is the left column; edits and loops share the right
-    assert g["edits"][1] < g["loops"][1], g                                       # edits over loops
+    assert g["loops"] is False, g                                                  # the loop fold: no Open loops card
+    assert g["jobs"][0] < g["edits"][0] and g["jobs"][1] == g["edits"][1], g       # Results is the left column, edits the right, on one row (no hole below edits)
     assert abs(g["jobs"][2] - g["edits"][2]) <= 8, g                              # two halves
-    assert g["open"] == "open 3 d" and g["chip"] == "ledgerline" and g["bar"] == "3px", g
     assert "Edits appear here once a session writes a file." in g["edits_text"], g
 
 

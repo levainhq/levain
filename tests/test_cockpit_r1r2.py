@@ -662,9 +662,9 @@ console.log("OK");
         assert r.returncode == 0, r.stderr
         assert "OK" in r.stdout
 
-    def test_tray_and_loops_projections_mount_the_filter_by_panel_kind(self) -> None:
+    def test_the_tray_projection_mounts_the_filter_by_panel_kind(self) -> None:
         core = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
-        body = core[core.index("function renderIntentionProjection"):core.index("function renderIntentions(")]
+        body = core[core.index("function renderIntentionProjection"):core.index("function renderTray(")]
         assert "mountIntentionFilter(p, list" in body and "entry.kind" in body
         assert "const intentionQueries = Object.create(null)" in core            # a kind named "constructor" is data
         assert "try { return renderPanel(entry, view, opts); }" in core      # a panel that cannot be drawn degrades alone

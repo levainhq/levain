@@ -30,7 +30,7 @@ const bootSrc = fs.readFileSync(process.argv[3], "utf8");
 const only = process.argv[4] || null;
 
 const ROW = (verb, tier, gesture, escalates, extra) => Object.assign({ verb, tier, gesture, escalates: escalates || [],
-  target: { panel_id: "loops", row_id: "intention:intention-1", row_version: "v1" } }, extra || {});
+  target: { panel_id: "tray", row_id: "intention:intention-1", row_version: "v1" } }, extra || {});
 const UPDATE_ESC = [{ param: "text", op: "present", tier: "T2" }, { param: "domain", op: "present", tier: "T2" }];
 const HEADS = {
   intention_touch: { label: "touch", tier: "C1", confirm: false, idempotent: false, fields: [], effect: "marks seen", gesture: "direct" },
@@ -50,13 +50,13 @@ function fixture(over) {
     ROW("intention_close", "C1", "direct", [], { options: { intention_kind: ["composted", "completed"] } })];
   const head = (id, kind) => ({ id, kind, title: id, status: "ok", as_of: "2026-10-11T12:00:00+00:00" });
   const manifest = { schema: "levain.cockpit/1", entity: { name: "t", governance: "reported", brand: {} },
-    generated_at: "2026-10-11T12:00:00+00:00", regions: { header: ["state"], zones: [{ id: "operate", title: "Operate", panels: ["loops", "decisions", "inbox"] }] },
-    panels: { state: head("state", "line"), loops: head("loops", "triage-list"), decisions: head("decisions", "triage-list"), inbox: head("inbox", "triage-list") },
+    generated_at: "2026-10-11T12:00:00+00:00", regions: { header: ["state"], zones: [{ id: "operate", title: "Operate", panels: ["tray", "decisions", "inbox"] }] },
+    panels: { state: head("state", "line"), tray: head("tray", "triage-list"), decisions: head("decisions", "triage-list"), inbox: head("inbox", "triage-list") },
     verbs: HEADS, errors: [], transport: over.transport || { writable: true, write_token_required: false } };
   const panels = {
     state: Object.assign(head("state", "line"), { value: { lines: [{ label: "state", text: "hi", at: "2026-10-11T11:00:00.000Z", source: "web" }], value_version: "sv1" },
       actions: [{ verb: "operator_state", tier: "C1", gesture: "direct", escalates: [], target: { panel_id: "state", panel_version: "sv1" } }] }),
-    loops: Object.assign(head("loops", "triage-list"), { rows: [{ id: "intention:intention-1", version: "v1", title: "one", body: "one", group: null,
+    tray: Object.assign(head("tray", "triage-list"), { rows: [{ id: "intention:intention-1", version: "v1", title: "one", body: "one", group: null,
       facets: { disposition: "loop", domain: "apps", tier: "hot", intention_type: "task" }, actions: acts }], actions: [] }),
     decisions: Object.assign(head("decisions", "triage-list"), { groups: [{ id: "waiting", title: "Waiting on a signature", count: 1 }],
       rows: [{ id: "pend:cp1", version: "pv", title: "move on intention:intention-1", group: "waiting", facets: { pending_tier: "T2" },
@@ -118,13 +118,13 @@ const cases = {};
 cases.mapper_carries_the_write_surface = async () => {
   const env = await makeEnv().start();
   const v = env.view();
-  const s = v.open_intentions[0];
-  ok(s.panel_id === "loops" && s.row_id === "intention:intention-1" && s.row_version === "v1", "row target kept");
+  const s = v.tray[0];
+  ok(s.panel_id === "tray" && s.row_id === "intention:intention-1" && s.row_version === "v1", "row target kept");
   ok(Array.isArray(s.actions) && s.actions.length === 5, "row actions kept");
   ok(s.domain === "apps", "domain kept");
   ok(JSON.stringify(s.descend_kinds) === '["composted","completed"]' && s.ascend_kinds.length === 0, "kind options from the action");
   ok(v.writable === true && v.write_token_required === false, "writable from transport");
-  ok(v.layout.find((e) => e.id === "loops").edit_class === "B", "edit_class B where rows carry actions");
+  ok(v.layout.find((e) => e.id === "tray").edit_class === "B", "edit_class B where rows carry actions");
   ok(v.state.version === "sv1" && v.state.can_edit === true, "state keeps its panel version");
   ok(typeof env.opts().commit === "function", "a writable transport renders with a commit");
 };
@@ -143,7 +143,7 @@ cases.direct_c1_with_no_escalation_fires_once_with_no_intent = async () => {
   ok(r.ok === true, "touch landed");
   ok(env.posts.length === 1 && env.posts[0].url === "/cockpit/verb", "one post to /cockpit/verb");
   const b = env.posts[0].body;
-  ok(b.verb === "intention_touch" && b.panel_id === "loops" && b.row_id === "intention:intention-1" && b.row_version === "v1", "target named");
+  ok(b.verb === "intention_touch" && b.panel_id === "tray" && b.row_id === "intention:intention-1" && b.row_version === "v1", "target named");
   ok(!("intent" in b) && !("tier_seen" in b) && !("idempotency_key" in b) && !("dry_run" in b), "no intent, no key, no dry run");
   ok(!env.posts.some((p) => p.url === "/edit" || p.url === "/action"), "never the legacy routes");
 };
@@ -460,18 +460,18 @@ cases.a_token_required_manifest_read_without_a_token_prompts_then_rereads = asyn
 
 cases.a_hidden_character_row_offers_no_inline_text_edit = async () => {
   const env = makeEnv();
-  env.fx.panels.loops.rows[0].body = "one​two";
-  env.fx.panels.loops.rows[0].text_hidden = true;           // as the server's levain.unshowable flags it
-  env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0],
+  env.fx.panels.tray.rows[0].body = "one​two";
+  env.fx.panels.tray.rows[0].text_hidden = true;           // as the server's levain.unshowable flags it
+  env.fx.panels.tray.rows.push(Object.assign({}, env.fx.panels.tray.rows[0],
     { id: "intention:intention-2", body: "plain", text_hidden: false }));
   // a leading combining mark: the page's escape keeps it, the server's predicate calls it hidden
-  env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0],
+  env.fx.panels.tray.rows.push(Object.assign({}, env.fx.panels.tray.rows[0],
     { id: "intention:intention-3", body: "̀x", text_hidden: true }));
   // the page never judges: an escape it would make does not lock a row the server did not flag
-  env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0],
+  env.fx.panels.tray.rows.push(Object.assign({}, env.fx.panels.tray.rows[0],
     { id: "intention:intention-4", body: "a​b", text_hidden: false }));
   await env.start();
-  const [a, b, c, d] = env.view().open_intentions;
+  const [a, b, c, d] = env.view().tray;
   ok(/hidden characters/.test(a.text_locked || ""), "the flagged row is locked with a reason");
   ok(a.text.indexOf("<U+200B>") >= 0, "and still shows the marker");
   ok(b.text_locked === undefined, "a plain row is not");
