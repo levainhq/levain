@@ -423,3 +423,25 @@ def test_only_a_complete_post_to_the_model_endpoint_is_the_anchor():
           b"POST /v1/messages/count_tokens HTTP/1.1\r\n", b"", b"\x16\x03\x01garbage\r\n"]
     assert all(ssc._is_model_request(h) for h in yes)
     assert not any(ssc._is_model_request(h) for h in no)
+
+
+def test_the_verdict_table_is_pinned_both_sides(tmp_path):
+    """Row 1719a changed this row's verdict for a readable, differing version from WARN to OK-with-a-note when the live
+    probe held; a caller gating on the warn flag sees that. Pin both sides of the change in one place."""
+    pin = host_guard.SETTING_SOURCES_MEASURED_VERSION
+    older = ".".join(map(str, (pin[0], pin[1], pin[2] - 1)))
+    held, _ = _row(tmp_path, older, "held")
+    assert held.ok and not held.warn and "older than" in held.detail and "probe re-run holds" in held.detail
+    for version, verdict in ((None, "held"), (older, "inconclusive"), (None, "inconclusive")):
+        row, _ = _row(tmp_path, version, verdict)
+        assert row.ok and row.warn, (version, verdict, row)
+    for version in (older, None):
+        row, _ = _row(tmp_path, version, "leaked")
+        assert not row.ok, (version, row)
+
+
+def test_a_prerelease_version_is_not_a_readable_one(tmp_path):
+    """`2.1.320-beta` is not a version the pin or a probe hold speaks for: it stays on the unreadable (warn) path."""
+    for text in ("2.1.320-beta", "2.1.320-rc.1 (Claude Code)"):
+        row, calls = _row(tmp_path, text, "held")
+        assert calls == ["/x/claude"] and row.ok and row.warn and "not readable" in row.detail, (text, row)
