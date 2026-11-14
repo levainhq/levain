@@ -363,7 +363,9 @@ def test_measured_version_does_not_rerun_the_probe(tmp_path):
 
 def test_a_different_version_reruns_the_probe_and_says_so(tmp_path):
     row, calls = _row(tmp_path, "9.9.9")
-    assert calls == ["/x/claude"] and row.ok and row.warn and "9.9.9" in row.detail and "measured" in row.detail
+    # row 1719a: a readable, differing version with the live probe holding is information (a pass with a note)
+    assert calls == ["/x/claude"] and row.ok and not row.warn and "9.9.9" in row.detail and "measured" in row.detail
+    assert "probe re-run holds" in row.detail
 
 
 def test_the_row_says_which_side_moved(tmp_path):
@@ -372,9 +374,9 @@ def test_the_row_says_which_side_moved(tmp_path):
     i = next(k for k, c in enumerate(pin) if c > 0)
     older = ".".join(map(str, tuple(c - 1 if k == i else c for k, c in enumerate(pin))))
     row, _ = _row(tmp_path, newer)
-    assert row.warn and "newer than" in row.detail and "levain's pin has not moved" in row.detail, row.detail
+    assert row.ok and not row.warn and "newer than" in row.detail and "levain's pin has not moved" in row.detail, row.detail
     row, _ = _row(tmp_path, older)
-    assert row.warn and "older than" in row.detail and "levain's pin" in row.detail, row.detail
+    assert row.ok and not row.warn and "older than" in row.detail and "levain's pin" in row.detail, row.detail
 
 
 def test_a_leak_on_a_new_version_fails(tmp_path):
