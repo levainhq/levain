@@ -22,7 +22,7 @@ An intention is one **open cognitive item**. Its `type` names *what kind of open
 - **question** — open *not-knowing*. ("shard the database or add read replicas?")
 - **thought** — open *idea*. (an essay seed; a "what if" design-sketch you mean to chase)
 
-All three share one lifecycle; the type only changes how it can resolve. Questions and thoughts have nowhere else to live — they leak into to-do lists or get lost. The typed intention gives them a real home with a real exit. Plant one with `intention_add` the moment it opens — don't carry it in your head, and don't bury it in your continuity. It lands as a `someday` on your operator's **List**, the one surface where they see what is open; there is no separate loop kind.
+All three share one lifecycle; the type only changes how it can resolve. Questions and thoughts have nowhere else to live — they leak into to-do lists or get lost. The typed intention gives them a real home with a real exit. Plant one with `intention_add` the moment it opens — don't carry it in your head, and don't bury it in your continuity. With no disposition it lands as a `someday` on your operator's **List**, the one surface where they see what is open; there is no separate loop kind.
 
 ## The lifecycle — plant, grow, resolve
 
@@ -40,24 +40,24 @@ An intention that never resolves is a leak. Tend the garden: close intentions as
 
 ## Germination — how an intention ages
 
-The "grow" phase is observed, never nagged. Germination is **computed** from when you last touched an intention (`seen`) and any "surface me again on" date (`next`) — never stored:
+The "grow" phase is observed, never nagged. Germination is **computed** from when you last touched an intention (`seen`) and any `next` date (a marker the List shows, not a wake-up) — never stored:
 
 - **growing** — touched recently; has momentum, leave it be.
 - **resting** — quiet a few days; mention gently if it's relevant, no pressure.
-- **dormant** — quiet too long, or its `next` date has arrived; "still alive, or ready to compost?"
+- **dormant** — quiet too long, or its `next` date has arrived. A marker you see when you pull `intention_list` or `intention_surface`; it wakes nobody. "Still alive, or ready to compost?"
 - **parked** — *deliberately* set aside, distinct from neglect. A parked intention stays on the List, marked parked.
 
 **No hook injects intentions into your turns, and you do not need one.** The List is where your operator sees them; you reach them yourself, on purpose:
 
 1. **On demand.** The whole open list is one `intention_list` away (`intention_surface` gives the salience-ranked view). Pull it when you deliberately want the full picture, at the start of work that may touch something you planted, or before you plant a near-duplicate. Polling it compulsively mid-task is noise that competes with the work.
-2. **By date.** A return on a day is a dated agenda: `levain ask --what ... --on YYYY-MM-DD`. At session start the harness germinates any agenda whose day has come; you do not poll for it.
-3. **By cue, from memory.** What surfaces on its own when your prompt touches a domain is a *crystallized pattern* (see your memory seed), not an intention. If something must come back to you when a condition hits, it is a finding or a pattern, not an intention you hope collides.
+2. **By date, for your operator.** `levain ask --what ... --blocks ... --on YYYY-MM-DD` files an agenda that reaches your **operator** on that day (a band row, or a ping with `--attention talk`). Use it only for a return the operator must answer; it is not a reminder to yourself. Where the harness fires session-start hooks, germinate files each due agenda at session start; where it does not, run `levain intentions germinate`. Nothing pushes a date back to *you*: put it where you will read it, e.g. on the List with `next`, and pull `intention_list` at the start of work.
+3. **By cue, from memory.** Only a *crystallized pattern* (see your memory seed) surfaces by itself when your prompt touches its domain. A fresh one-off condition has no mechanism behind it; see the trap paragraph under "Somedays and agendas" (a trap with a match condition) and do what it says.
 
 **What is open and alive outranks what is merely recent.** An unresolved intention earns attention independent of how recently you touched it; when you choose what to do or mention, weight what is *open and alive* above what is merely recent.
 
 ## Touch and update
 
-When you re-engage an intention, `intention_touch` it — that resets its germination clock; it's growing again. Use `intention_update` to change its text, its tier (`hot` / `warm` / `cold` / `parked`), or its `next` date as your sense of it shifts. Setting `next` marks a date to come back to it — "surface me again then," **not** a deadline. A dated return the operator must answer is `levain ask --on`, below.
+When you re-engage an intention, `intention_touch` it — that resets its germination clock; it's growing again. Use `intention_update` to change its text, its tier (`hot` / `warm` / `cold` / `parked`), or its `next` date as your sense of it shifts. Setting `next` on a someday only marks a date: it turns the computed germination state `dormant`, which you see when you pull `intention_list` or `intention_surface`. It never brings the intention back to anyone, and it is **not** a deadline. A date that fires is an agenda, and an agenda reaches your operator: `levain ask --on`, named in the band section below.
 
 ## What belongs here vs in memory
 
@@ -70,7 +70,7 @@ When in doubt, ask: *does this close?* If yes, it's an intention. If it only acc
 
 Everything above is *your* prospective memory: intentions you plant and resolve. Your operator's side of the work has its own surfaces, and they split on one question: *what is the item waiting on?* The model is three places: the band, intentions and memory.
 
-**The band — what the machine is stopped on that only the operator can give.** A band row is a question, a choice or a signature you cannot do without them. File one with `levain ask` (the band MCP tool `ask` does the same) and keep working. Every row names what waits on the answer (`--blocks`): that is the stopped test. If you can do the next step yourself, it is not a band row, it is work. If nothing is stopped yet because the date has not come, it is not a band row either; it is a dated intention (below). The band is for what is waiting now, not for what will wait later.
+**The band — what the machine is stopped on that only the operator can give.** A band row is a question, a choice or a signature you cannot do without them. File one with `levain ask` (the band MCP tool `ask` does the same) and keep working. For a date that will need their answer, `levain ask --what ... --blocks ... --on YYYY-MM-DD` files the agenda that becomes a band row on that day. Every row names what waits on the answer (`--blocks`): that is the stopped test. If you can do the next step yourself, it is not a band row, it is work. If nothing is stopped yet because the date has not come, it is not a band row either; it is a dated agenda, filed with `levain ask --on`. The band is for what is waiting now, not for what will wait later.
 
 **Somedays and agendas — intentions that are not live yet.** Two dispositions the operator reaches you with:
 
