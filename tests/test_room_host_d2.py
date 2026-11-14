@@ -771,7 +771,7 @@ def test_no_descriptor_for_the_lifeline_is_a_command_that_never_started(monkeypa
     assert (code, started) == (room_host.NOT_STARTED, False) and "could not start" in out, out
 
 
-def test_notes_that_could_not_get_a_lifeline_spend_none_of_the_budget(host, world, monkeypatch):
+def test_a_note_whose_lifeline_could_not_be_opened_is_reported_not_filed(host, world, monkeypatch):
     """L3 r2 (codex MED): the door charges a note before the command runs and refunds only a returned never-started
     ``Ran``. A lifeline the door could not open raised past the refund, so three of them used up the hour although no
     command started. REPRODUCED on eff1a9a96: the fourth note, with descriptors back, was refused."""
