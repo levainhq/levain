@@ -2120,7 +2120,7 @@ def _resolve_store(path: Path) -> AnnealPaths:
 
 def render_text(view: SubstrateView) -> str:
     """A terminal glance: the operator's memory health, association graph,
-    crystallized wisdom, open loops, recent episodes, the neocortex sections, and
+    crystallized wisdom, the intention Tray, recent episodes, the neocortex sections, and
     the seed/config surface — from outside a session. Degraded tiers are named at
     the bottom, never silently dropped."""
     title = view.entity_name or view.paths.episodic_db.stem
