@@ -38,7 +38,8 @@ from typing import Any
 
 from levain import pathid
 from levain.authority import (VOICE_KEY_KIND, VOICE_KEY_PROVIDERS, VOICE_KEY_USES, AuthorityError, _thaw, anchor_path,
-                              append, grant_stop_reason, grants_in_force, prepare, voice_key_for, voice_key_record)
+                              append, grant_stop_reason, grants_in_force, prepare, stopped_way, voice_key_for,
+                              voice_key_record)
 from levain.authority_sig import VerifierUnavailable
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.chat_egress.key_setup import KeychainItems, SetupDeclined, SetupRefused
@@ -237,7 +238,8 @@ def read_key(provider: str, use: str, *, authority: AuthoritySource, store: Any 
         held = voice_key_for(state.policy.grants, provider)      # the policy still holds a stopped record
         why = None if held is None else grant_stop_reason(state, held["id"])
         if why is not None:
-            raise VoiceKeyUnavailable("not_set", f"the {provider} voice key stopped: {why}; set it again")
+            # the way back is the shared words (authority.stopped_way): a plain add is refused while the stopped record is held
+            raise VoiceKeyUnavailable("not_set", f"the {provider} voice key stopped: {why}; {stopped_way(VOICE_KEY_KIND)} to use it")
         raise VoiceKeyUnavailable("not_set", f"no voice key is set for {provider}")
     if use not in record["uses"]:
         raise VoiceKeyUnavailable("use_not_granted", f"the {provider} key is not set for {use}")

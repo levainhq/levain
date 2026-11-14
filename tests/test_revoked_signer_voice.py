@@ -33,7 +33,7 @@ from tests.test_voice_custody import ACCOUNT, OTHER, VALUE, FakeSecurity
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
-STOPPED = "the openai voice key stopped: the key that signed it was revoked; set it again"
+STOPPED = "the openai voice key stopped: the key that signed it was revoked; revoke it, then create it again to use it"
 
 
 def _now() -> datetime:
