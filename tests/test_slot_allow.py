@@ -454,7 +454,44 @@ def test_a_not_retained_refusal_after_a_retained_end_is_said_once_as_expected(qd
     s, said = _ending_supervisor(qdir, gone)
     s._file_allow_rows("S9")
     assert len(said) == 1 and "expected end of a retained run" in said[0] and "root refused" not in said[0]
-    assert "not-retained" in seen[0]["hush"]
+    assert seen[0]["hush"] == ("not-retained:absent",)
+
+
+def test_a_not_retained_trash_refusal_is_echoed_and_not_called_expected(qdir):
+    from levain.slot import Refused
+
+    def trashed(*a, **k):
+        raise Refused("not-retained:trash", "S9")
+
+    s, said = _ending_supervisor(qdir, trashed)
+    s._file_allow_rows("S9")
+    assert len(said) == 1 and "expected end" not in said[0] and "not-retained:trash" in said[0], said
+
+
+def test_helper_echoes_stderr_when_the_answer_line_is_malformed(qdir, monkeypatch):
+    class _P:
+        stdin = stdout = stderr = None
+
+        def poll(self):
+            return 0
+
+    seams = sup.Seams(host="linux", helper=("x",), client_factory=lambda p: None, control_socket=Path("/x"),
+                      store=Path("/x"), base_map=Path("/x"), allow_dir=qdir, spawn=lambda argv, **kw: _P())
+    said = []
+    s = sup.Supervisor.__new__(sup.Supervisor)
+    s.s, s.say = seams, said.append
+    s._lease_fds = lambda: ()
+
+    def drive(p, verb, data, err, stoppable):
+        err.extend(b"levain runtime-helper: skewed protocol\n")
+        return bytearray(b"{not json\n")
+    s._drive = drive
+    def boom(data, verb):
+        raise ValueError("pathological answer")
+    monkeypatch.setattr(sup, "parse_helper_line", boom)
+    with pytest.raises(ValueError):
+        s.helper("read-allow", "S9", stdin=None, hush=("not-retained:absent",))
+    assert any("skewed protocol" in m for m in said), said
 
 
 def test_helper_hushes_only_the_named_refusal_echo(qdir):
@@ -483,9 +520,10 @@ def test_helper_hushes_only_the_named_refusal_echo(qdir):
             s.helper("read-allow", "S9", stdin=None, hush=hush)
         return said
 
-    assert run("not-retained:absent", ("not-retained",)) == []
+    assert run("not-retained:absent", ("not-retained:absent",)) == []
     assert len(run("not-retained:absent", ())) == 1
-    assert len(run("allow-unreadable", ("not-retained",))) == 1
+    assert len(run("allow-unreadable", ("not-retained:absent",))) == 1
+    assert len(run("not-retained:trash", ("not-retained:absent",))) == 1
 
 
 def test_a_refused_or_malformed_read_is_said_and_files_nothing(qdir):

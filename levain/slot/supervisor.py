@@ -1396,7 +1396,7 @@ class Supervisor:
         escaped (root's refusal detail may quote a slot-made name). The pipes are driven in a bounded select loop that also watches the wake pipe:
         a stop signal (``stoppable``; for teardown, which runs AFTER the first stop, only a later one) or the verb's
         :attr:`Seams.helper_deadline_s` ends the helper (TERM, then KILL, reaped) and refuses ``stopped`` /
-        ``helper-timeout``. An OS failure to run or talk to it is ``helper-unrunnable``, never a traceback. A root refusal whose name starts with one of ``hush`` is not echoed from stderr: the caller
+        ``helper-timeout``. An OS failure to run or talk to it is ``helper-unrunnable``, never a traceback. A root refusal whose name is exactly one of ``hush`` is not echoed from stderr: the caller
         says it once, in its own words."""
         verb = args[0]
         argv = [*self.s.helper, *args]                                                  # type: ignore[misc]
@@ -1427,8 +1427,11 @@ class Supervisor:
         try:
             answer = parse_helper_line(bytes(out), verb)
         except Refused as e:
-            if not (hush and e.name.startswith(hush)):
+            if e.name not in hush:
                 self._echo_helper_err(err)
+            raise
+        except BaseException:
+            self._echo_helper_err(err)
             raise
         self._echo_helper_err(err)
         return answer
@@ -1730,9 +1733,9 @@ class Supervisor:
         from levain.slot.slot_allow import AllowRefused
 
         try:
-            out = self.helper("read-allow", session, stdin=None, stoppable=False, hush=("not-retained",))
+            out = self.helper("read-allow", session, stdin=None, stoppable=False, hush=("not-retained:absent",))
         except Refused as e:
-            if e.name.startswith("not-retained"):
+            if e.name == "not-retained:absent":
                 # the read follows an `ended RETAINED` line: root holding no retained clone to read from is how a
                 # retained run ends, not a second failure
                 self.say("no slot allow rules to read: root keeps no retained clone of this session to read them "

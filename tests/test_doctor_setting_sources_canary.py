@@ -369,7 +369,8 @@ def test_a_different_version_reruns_the_probe_and_says_so(tmp_path):
 def test_the_row_says_which_side_moved(tmp_path):
     pin = host_guard.SETTING_SOURCES_MEASURED_VERSION
     newer = ".".join(map(str, pin[:2] + (pin[2] + 4,)))
-    older = ".".join(map(str, pin[:2] + (pin[2] - 1,)))
+    i = next(k for k, c in enumerate(pin) if c > 0)
+    older = ".".join(map(str, tuple(c - 1 if k == i else c for k, c in enumerate(pin))))
     row, _ = _row(tmp_path, newer)
     assert row.warn and "newer than" in row.detail and "levain's pin has not moved" in row.detail, row.detail
     row, _ = _row(tmp_path, older)
