@@ -375,7 +375,7 @@ def _run_update(
 # Steps
 # ---------------------------------------------------------------------------
 
-_SEEDS_REFUSED_TAIL = ("The open `seed` intentions were NOT rewritten to `someday` (the reason is listed above): "
+_SEEDS_REFUSED_TAIL = ("The open `seed` and loop intentions were NOT all rewritten to `someday` (the reason is listed above): "
                        "fix that, then re-run `levain update`.")
 
 
@@ -385,55 +385,62 @@ def _install_intention_paths(install: Path):
     return AnnealPaths.from_db(install / ".levain" / "memory.db")
 
 
-def _held_line(n: int, *, plan: bool) -> str:
-    return (f"intentions: {n} open seed record(s) {'would be' if plan else 'are'} left for the next `levain update`, not "
+def _held_line(n: int, *, plan: bool, kind: str = "seed") -> str:
+    return (f"intentions: {n} open {kind} record(s) {'would be' if plan else 'are'} left for the next `levain update`, not "
             f"rewritten to someday: levain's files {'would be' if plan else 'were'} held for review (listed above), so "
             f"the installed hooks may still be ones that do not know `someday`")
 
 
 def _unreadable_line(paths, exc: Exception) -> str:
     return (f"intentions: the store {paths.intentions_json} cannot be read ({exc}), so levain cannot tell whether open "
-            f"seed records need rewriting to someday")
+            f"seed or loop records need rewriting to someday")
 
 
 def _migrate_intentions(install: Path, emit: Emit, *, held: bool = False) -> bool:
-    """Rewrite the store's open ``seed`` records to ``someday`` (ruling H8, :mod:`levain.intention_migrate`): copied
-    first, idempotent, one compare-and-set per record. Every line the migration reports is printed. True when the
-    migration REFUSED (an unwritable backup, an unreadable store, an anneal-memory older than ``manifest.KNOWN_GOOD_ANNEAL``) or left an open ``seed``
+    """Rewrite the store's open ``seed`` records to ``someday`` (ruling H8), then its open loop records (an absent, empty or
+    ``loop`` disposition: the loop fold, levain#4), both through :mod:`levain.intention_migrate`: copied first, idempotent,
+    one compare-and-set per record. Every line the migrations report is printed. True when either REFUSED (an unwritable backup,
+    an unreadable store, an anneal-memory older than ``manifest.KNOWN_GOOD_ANNEAL``) or left an open ``seed`` or loop
     behind because the store failed on it (a record that merely moved since it was read is not a failure): the caller
     ends the update non-zero, so neither is swallowed.
 
     ``held``: the adapter refresh held files for review (``AdapterRefresh.review``), so the hooks may not have moved, and
-    an older hook reads ``someday`` as an unknown disposition (1111-32 G2). The migration is then left for the next
-    update and one line says so: every read keeps ``seed`` and the migration is idempotent, so waiting changes nothing.
+    an older hook reads ``someday`` as an unknown disposition (1111-32 G2). The migrations are then left for the next
+    update and one line each says so: every read keeps its value and the migrations are idempotent, so waiting changes nothing.
     Not a refusal (False): the held files already end the update non-zero."""
-    from levain.intention_migrate import migrate_seed_to_someday, open_seed_ids
+    from levain.intention_migrate import migrate_loop_to_someday, migrate_seed_to_someday, open_loop_ids, open_seed_ids
 
     paths = _install_intention_paths(install)
     if held:
         try:
-            ids = open_seed_ids(paths)
+            seeds, loops = open_seed_ids(paths), open_loop_ids(paths)
         except (OSError, ValueError) as exc:
             emit(_unreadable_line(paths, exc))
             return False
-        if ids:
-            emit(_held_line(len(ids), plan=False))
+        if seeds:
+            emit(_held_line(len(seeds), plan=False))
+        if loops:
+            emit(_held_line(len(loops), plan=False, kind="loop"))
         return False
-    report = migrate_seed_to_someday(paths)
-    for line in report.lines():
-        emit(line)
-    return report.failed
+    failed = False
+    for migrate in (migrate_seed_to_someday, migrate_loop_to_someday):
+        report = migrate(paths)
+        for line in report.lines():
+            emit(line)
+        failed = report.failed or failed
+    return failed
 
 
 def _plan_intention_migration(install: Path, emit: Emit, *, held: bool = False) -> bool:
     """The ``--dry-run`` plan of :func:`_migrate_intentions`, read-only. True when it WOULD rewrite something (``held``:
     it would wait, so the line says that and it is still True: the plan is not empty). A store it cannot read is True too,
-    with a line saying it cannot tell: an unknown is not "nothing to reconcile"."""
-    from levain.intention_migrate import open_seed_ids
+    with a line saying it cannot tell: an unknown is not "nothing to reconcile". The loop plan names every past-dated row
+    (its ``next`` has passed: it keeps it, and shows as Overdue; :func:`levain.intention_migrate.q2_past_next_policy`)."""
+    from levain.intention_migrate import open_seed_ids, plan_loop_migration
 
     paths = _install_intention_paths(install)
     try:
-        ids = open_seed_ids(paths)
+        ids, loops = open_seed_ids(paths), plan_loop_migration(paths)
     except (OSError, ValueError) as exc:
         emit(_unreadable_line(paths, exc))
         return True
@@ -442,7 +449,14 @@ def _plan_intention_migration(install: Path, emit: Emit, *, held: bool = False) 
     elif ids:
         emit(f"intentions: {len(ids)} open seed record(s) would be rewritten to someday "
              f"({', '.join(ids)}); the store is copied first")
-    return bool(ids)
+    if loops.ids and held:
+        emit(_held_line(len(loops.ids), plan=True, kind="loop"))
+    else:
+        for line in loops.rewrite_lines():
+            emit(line)
+    if loops.unknown_line():
+        emit(loops.unknown_line())
+    return bool(ids) or bool(loops.ids)
 
 def _reconcile_anneal(
     target: str, *, no_pip: bool, confirm: Callable[[str], bool], emit: Emit
