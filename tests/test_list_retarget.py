@@ -133,7 +133,7 @@ def test_a_seed_stored_with_other_casing_is_still_offered_who(tmp_path: Path) ->
     sid = store.add(type="task", text="a capital seed", disposition="Seed", today=TODAY)["id"]
     assert store.get(sid)["disposition"] == "Seed"
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (base, _h):
-        shown = {r["id"] for p in ("tray", "loops") for r in _get(f"{base}/cockpit/panel/{p}.json", TOKEN)["rows"]}
+        shown = {r["id"] for r in _get(f"{base}/cockpit/panel/tray.json", TOKEN)["rows"]}   # the List is the one panel; the loops panel is retired
     assert f"intention:{sid}" not in shown
 
 
