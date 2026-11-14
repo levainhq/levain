@@ -20,6 +20,8 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from tests.test_cockpit_consent_sheet_page import NOTE, _ConsentRig
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_sign_card import DESKTOP, TOK, needs_ssh
@@ -375,7 +377,8 @@ def test_a_reflow_while_open_keeps_what_was_shown_and_nothing_more(tmp_path, mon
 
 @needs_browser
 @needs_ssh
-def test_an_input_just_past_the_long_mark_that_fits_its_block_is_seen_when_opened(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("late_ms", [0, LATE_IO_MS])
+def test_an_input_just_past_the_long_mark_that_fits_its_block_is_seen_when_opened(tmp_path, monkeypatch, late_ms) -> None:
     rig = _ConsentRig(tmp_path, monkeypatch)
     probe = rig.queue.file(agent="claude_code", agent_session_id="s1", tool_name="Bash",
                            tool_input={"command": "echo " + "w" * 1_900}, cwd="/w", hold=timedelta(minutes=30), tier="T2")
@@ -386,14 +389,19 @@ def test_an_input_just_past_the_long_mark_that_fits_its_block_is_seen_when_opene
     tall = {"emulate": {"w": 1280, "h": 2400, "dpr": 1}}
     with rig.serving():
         out = probed_drive(tmp_path, f"{rig.origin}/nope", [
+            {"init": io_probe(late_ms)},
             tall, rig.authenticator(), *rig.open_top(fit.id),                                             # 0 1
             {"eval": SHEET},                                                                              # 2
             {"tap": SUMMARY},                                                                             # 3
             {"until": f"{INPUT}.classList.contains('open') && 1", "ms": 10000},                           # 4
-            {"eval": f"(async () => {{ {FRAMES}; return {SHEET}; }})()"},                                 # 5
+            # the gate counts the view it opened on two rendering updates after the toggle (coarse observer, then the fine one),
+            # and a loaded box delivers them late: wait for the page's own state, not for a count of frames (CI red 11-14)
+            {"until": f"({INPUT}.classList.contains('long-text') ? {INPUT} : {INPUT}.querySelector('.long-text')).dataset.seen === '1' "
+                      f"&& {ALLOW} && !{ALLOW}.disabled && 1", "ms": 15000},                                                                              # 5
+            {"eval": SHEET},                                                                              # 6
         ])
     v = out["values"]
-    closed, opened = json.loads(v[2]), json.loads(v[5])
+    closed, opened = json.loads(v[2]), json.loads(v[6])
     assert closed["allow"] is True and closed["total"] == 2_001, closed
     assert opened["sh"] <= opened["ch"] + 1, opened                   # it fits: no scroll to make
     assert opened["allow"] is False and opened["seen"] == "1" and opened["line"].startswith("All 2,001 characters"), opened
