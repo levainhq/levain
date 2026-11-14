@@ -515,12 +515,13 @@ def test_a_snoozed_woken_part_is_not_woken_again_and_comes_back_as_a_dated_agend
     f = _follower(root, a["id"])
     _done(root, a["id"])
     _run(root, qdir)
-    QuestionStore(qdir).intention_act(f["id"], "snooze", until="2026-11-14", channel="cockpit")
+    until = (date.today() + timedelta(days=2)).isoformat()      # judged against the REAL clock by the snooze: never a fixed day
+    QuestionStore(qdir).intention_act(f["id"], "snooze", until=until, channel="cockpit")
     again = _run(root, qdir)
     assert again["due"] == [] and QuestionStore(qdir).open_questions() == []        # the snooze holds
     part = _intention(root, f["id"])
-    assert part["next"] == "2026-11-14" and not part.get("on_event")
-    back = _run(root, qdir, today=date(2026, 11, 14))
+    assert part["next"] == until and not part.get("on_event")
+    back = _run(root, qdir, today=date.fromisoformat(until))
     assert [o["intention_id"] for o in back["due"]] == [f["id"]] and "event" not in back["due"][0]   # an ordinary dated wake now
 
 
