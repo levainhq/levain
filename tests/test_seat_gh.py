@@ -365,7 +365,10 @@ def test_the_cli_installs_clears_and_reports_from_stdin(home, fake, monkeypatch,
         def isatty(self):
             return False
     monkeypatch.setattr(sys, "stdin", Pipe(TOKEN_L + "\n"))
-    rc = cli.main(["seat", "gh-token", "set", "--owner", "levainhq", "--expires", FUTURE])
+    # the CLI judges the expiry against the REAL clock (no `now` seam), so a fixed day ("2026-12-31") became "already expired"
+    # on 2026-12-31 UTC: the day is thirty days ahead of the clock
+    ahead = (datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat()
+    rc = cli.main(["seat", "gh-token", "set", "--owner", "levainhq", "--expires", ahead])
     out = capsys.readouterr()
     assert rc == 0 and "installed: levainhq" in out.out and TOKEN_L not in out.out + out.err
     assert cli.main(["seat", "gh-token", "status"]) == 0
