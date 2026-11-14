@@ -144,7 +144,8 @@ def revoke_grant(data_root: Path | str, grant_id: str, *, signer_fp: str, sign: 
                  clock: Callable[[], datetime], ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                  marker_directory: Path | None = None) -> tuple[int, str | None]:
     """Sign a ``revoke_grant`` link removing the consent grant ``grant_id``, one of a kind this levain does not
-    know (:func:`list_inert_grants`), a graduation policy or the graduation opt-in; any enrolled key may. From the
+    know (:func:`list_inert_grants`), or a graduation policy or opt-in an earlier levain signed (this levain signs neither:
+    revoke is all it does with them); any enrolled key may. From the
     next decision on it answers nothing, and an answer it already gave is no longer delivered. Returns
     ``(seq, warning)``."""
     db, _state = _revocable(data_root, grant_id, clock, ssh_keygen, marker_directory)

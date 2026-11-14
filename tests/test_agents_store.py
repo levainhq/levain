@@ -73,7 +73,7 @@ def test_a_3_store_is_refused_by_name_and_nothing_is_created(tmp_path):
     before = master(d / DB_NAME)
     with pytest.raises(AgentStoreRefused) as e:
         open_agent_store(d)
-    assert str(e.value) == "agents need the /3 agent-proof slice (R15-5)"
+    assert str(e.value) == "a /3 store is from a build this levain does not support"
     after = master(d / DB_NAME)
     assert after == before
     assert not any(r[1] in at.AGENT_TABLES or r[1] in at.AGENT_TRIGGERS for r in after)
@@ -199,7 +199,7 @@ def test_levain_agents_refuses_a_3_store(tmp_path, capsys):
         pass
     rc, out, err = run_cli(capsys, "--store-dir", str(d))
     assert rc == 1 and out == ""
-    assert err.strip() == "levain agents: agents need the /3 agent-proof slice (R15-5)"
+    assert err.strip() == "levain agents: a /3 store is from a build this levain does not support"
 
 
 def test_levain_agents_refuses_a_tampered_store_with_the_way_out(tmp_path, capsys):

@@ -937,7 +937,7 @@ def test_t_upload_a_body_that_never_arrives_still_gets_the_413_at_once(rig):
     assert rig.rows() == []
 
 
-_WRITERS = ("prepare", "append", "sign_and_append", "add_key", "revoke_key", "_append", "_signed_append",
+_WRITERS = ("prepare", "append", "sign_and_append", "add_key", "revoke_key", "_append",
             "append_revoke", "prepare_revoke", "setup_key")
 
 

@@ -120,14 +120,25 @@ def test_an_interrupted_effect_is_recorded_unknown_and_raised(j, exc):
 
 
 # ---- O-a1c1d-3: a record whose bookkeeping does not load is never made live -------------------------------------------
-def test_a_hand_corrupted_record_is_refused_by_every_way_back_to_active(tmp_path, capsys):
+def test_a_hand_corrupted_record_is_refused_by_every_way_back_to_active(tmp_path):
     import json
     import sqlite3
 
-    import levain.cli as cli
     from levain.autonomic import BindingStatus, BindingStore, Posture
     from levain.autonomic import db as vdb
-    from tests.test_binding_pause_cli import _binding
+    from levain.autonomic.binding import Binding, Guard, SubGoal, TriggerSpec
+    from tests.test_autonomic_journal_wiring import TIGHT
+
+    kill = Guard(rationale="spoofed sender", dissent_author="codex",
+                 kill_predicate={"op": "==", "field": "dmarc", "value": "fail"},
+                 kill_drill={"dmarc": "fail"}, kill_authored_by="operator")
+
+    def _binding(posture):
+        return Binding.create(
+            created_by="operator", created_at="2026-10-07T09:00:00g",
+            trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+            goal=(SubGoal(goal="summarize", tools=("mail.read",), output="doc:s"),), tightness=TIGHT,
+            posture=posture, guard=(kill,), one_shot=False, status=BindingStatus.PAUSED)
 
     d = tmp_path / "store"
     st = BindingStore(d)
@@ -138,8 +149,6 @@ def test_a_hand_corrupted_record_is_refused_by_every_way_back_to_active(tmp_path
     rec["graduation"]["fire_count"] = "x"
     c.execute("UPDATE bindings SET record = ? WHERE binding_id = ?", (json.dumps(rec, sort_keys=True), b.binding_id))
     status = lambda: json.loads(c.execute("SELECT record FROM bindings").fetchone()[0])["status"]  # noqa: E731
-    assert cli.main(["binding", "resume", b.binding_id, "--store-dir", str(d)]) == 1   # ratify: _load refuses it
-    assert "malformed" in capsys.readouterr().err
     with pytest.raises(ValueError, match="does not load"):
         st.set_status(b.binding_id, BindingStatus.ACTIVE)
     assert status() == "paused"

@@ -12,6 +12,8 @@ The older-binary cases run a levain checkout from before ``levain-authority/2`` 
 ``LEVAIN_OLDER_CHECKOUT`` to that checkout's path."""
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import json
 import os
 import shutil
@@ -20,6 +22,8 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
+from unittest import mock
 
 import pytest
 
@@ -45,6 +49,20 @@ V1, V2, V3 = "levain-authority/1", "levain-authority/2", "levain-authority/3"
 OLDER = os.environ.get("LEVAIN_OLDER_CHECKOUT")
 older = pytest.mark.skipif(not OLDER, reason="set LEVAIN_OLDER_CHECKOUT to a levain checkout from before "
                                              "levain-authority/2")
+
+
+@contextlib.contextmanager
+def before_the_cut():
+    """The authority log as a levain from before the binding cut (1114) wrote it: the append rules that now refuse a
+    graduation create, a graduation renew and the opt-in (and a passkey's renew or create) are off, so a test can build
+    the log an earlier levain signed. The REPLAY rules are untouched: they are what these tests are about."""
+    kinds = dict(auth._GRANT_KINDS)
+    for kind in (auth.GRADUATION_KIND, auth.GRADUATION_PHONE_KIND):
+        kinds[kind] = dataclasses.replace(kinds[kind], append_checks=(), renew_checks=())
+    real = auth._passkey_act
+    with mock.patch.object(auth, "_GRANT_KINDS", MappingProxyType(kinds)), \
+            mock.patch.object(auth, "_passkey_act", lambda rec, policy, fp, *, new_link=False: real(rec, policy, fp)):
+        yield
 
 
 class Clock:
@@ -88,20 +106,23 @@ class World:
     def fp(self, name: str) -> str:
         return self.keys[name][0]
 
-    def link(self, op, signer: str = "laptop") -> auth.AuthoritySnapshot:
+    def link(self, op, signer: str = "laptop", *, today: bool = False) -> auth.AuthoritySnapshot:
+        """One link through the real append. By default as a levain from before the binding cut wrote it
+        (:func:`before_the_cut`); ``today=True``: under the rules this levain appends by."""
         self.clock.now += timedelta(minutes=1)
         fp, sign = self.keys[signer]
         conn = sqlite3.connect(self.db, isolation_level=None)
         try:
-            return auth.sign_and_append(conn, op, signer_fp=fp, sign=sign, clock=self.clock, cache=ReplayCache(),
-                                        anchor=anchor_path(self.root))
+            with contextlib.nullcontext() if today else before_the_cut():
+                return auth.sign_and_append(conn, op, signer_fp=fp, sign=sign, clock=self.clock, cache=ReplayCache(),
+                                            anchor=anchor_path(self.root))
         finally:
             conn.close()
 
-    def refused(self, op, signer: str = "laptop") -> str:
+    def refused(self, op, signer: str = "laptop", *, today: bool = False) -> str:
         """The refusal of ``op`` signed by ``signer`` through the real append (the log is left as it was)."""
         with pytest.raises(auth.AuthorityError) as exc:
-            self.link(op, signer)
+            self.link(op, signer, today=today)
         return str(exc.value)
 
     def state(self, db: Path | None = None) -> auth.AuthoritySnapshot:

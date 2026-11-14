@@ -3687,10 +3687,10 @@ _INVARIANT_MEANS = {
 
 def _check_autonomic_store(store_dir: Path | None = None) -> list[CheckResult]:
     """The autonomic store's own consistency read (R15-5 S3). The store is this user's, not the install's: the one
-    ``default_store_dir()`` names (``$LEVAIN_HOME/autonomic``, else ``~/.levain/autonomic``), the default of every
-    ``levain binding`` command's ``--store-dir``; ``store_dir`` reads another.
-      - No row without a database, for an empty one, or for a ``levain-autonomic/1`` or ``/2`` store (those are the
-        ``levain binding`` commands' to report).
+    ``default_store_dir()`` names (``$LEVAIN_HOME/autonomic``, else ``~/.levain/autonomic``); ``store_dir`` reads
+    another.
+      - No row without a database, for an empty one, or for a ``levain-autonomic/1`` or ``/2`` store (this levain has
+        no command that reports on those).
       - A ``levain-autonomic/3`` store: one FAIL row per row of its INVARIANT (``schema3.invariant``), else one row
         naming its legacy rows (``schema3.census``) and the receipts not yet copied to the receipt file.
       - Any other database there (a newer format, tables with no marker, a schema not this levain's): a FAIL row
@@ -4047,24 +4047,24 @@ def _authority_signers_hint(host: str, *, why: str | None = None) -> str:
     refusals = "; ".join(f"{n}: {m}" for n, m in AUTHORITY_SIGNER_REFUSALS.items())
     lead = f"{why} " if why else ""
     return (f"{lead}Run `{authority_signer_sudo_line(host)}`: the laptop key is its .pub file's `<type> <base64>`, "
-            "each phone passkey (the opt-in names) its own --passkey, and `levain cockpit keys` lists the "
+            "each phone passkey its own --passkey, and `levain cockpit keys` lists the "
             "fingerprints the helper prints back, to compare. To take a key out again, "
             f"`sudo {helper} remove-authority-signer --key SHA256:...`. If the helper refuses, its answer names "
             f"why. {refusals}.")
 
 
 def _check_authority_signers(install: Path, *, signers: Path | None = None, now: Any = None) -> list[CheckResult]:
-    """Root's authority-signers file and the graduation policies it anchors (14b DESIGN_REV2 S5, rows 1 and 2).
+    """Root's authority-signers file (14b DESIGN_REV2 S5, row 1). In 1.0 the file anchors nothing: only a graduation
+    policy and the efferent gate's approvals read it, and both are cut (the binding cut of 1114), so the row is
+    informational. The root ``levain-authority`` signers verbs stay.
 
-    Only for an install with a cockpit authority log (no journal, or an uninitialised log, gives no row: there is
-    nothing yet to graduate). ``authority signers`` is a WARNING, never a failure, while nothing can graduate: the
-    file is missing, is not a file :func:`levain.trust_anchor.trust_anchor_problem` trusts, is refused by the install
-    helper's own reader (:func:`levain.slot.install_helper._read_signers`: a link, past its size bound, not UTF-8
-    throughout, unreadable), or lists no key for ``levain-authority``. ``graduation policies`` is a WARNING naming
-    the live policies :func:`levain.autonomic.coverage.live` (the gate's predicate) says root's keys do not anchor,
-    each with the signer that is missing. It is read-only: the journal opens read-only and root's file is only read.
-    Nothing here can abort doctor: any other failure is a WARNING ``could not check``. ``signers`` and ``now`` are
-    test seams."""
+    Only for an install with a cockpit authority log (no journal, or an uninitialised log, gives no row). A file
+    that is not one :func:`levain.trust_anchor.trust_anchor_problem` trusts, or that the install helper's own
+    reader (:func:`levain.slot.install_helper._read_signers`: a link, past its size bound, not UTF-8 throughout,
+    unreadable) refuses, is a WARNING: it is a file to remove or fix, and the helper will not write over it. A
+    missing file, or one listing no key for ``levain-authority``, is a plain pass. It is read-only: the journal opens
+    read-only and root's file is only read. Nothing here can abort doctor: any other failure is a WARNING ``could not
+    check``. ``signers`` and ``now`` are test seams (``now`` is unused since the policies row went)."""
     try:
         return _authority_signers_rows(install, signers, now)
     except Exception as exc:  # noqa: BLE001 - a doctor check reports, it never crashes the run
@@ -4073,13 +4073,12 @@ def _check_authority_signers(install: Path, *, signers: Path | None = None, now:
 
 
 def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> list[CheckResult]:
-    from datetime import datetime, timezone
+    from urllib.parse import quote
 
     from levain import authority as auth
     from levain.autonomic import coverage as cov
-    from levain.autonomic.confirm import _SIGNERS_FILE_OWNERS
+    from levain.autonomic.confirm import _SIGNERS_FILE_OWNERS, DEFAULT_SSH_KEYGEN
     from levain.cockpit.firejournal import DB_NAME
-    from levain.graduation_policy import AuthorityCoverage, graduation_policies
     from levain.slot import Refused, root_tree
     from levain.slot.install_helper import _read_signers
     from levain.trust_anchor import trust_anchor_problem
@@ -4092,30 +4091,29 @@ def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> li
     path = signers if signers is not None else root_tree.authority_signers_path(host)   # type: ignore[arg-type]
     name = "authority signers"
     rows: list[CheckResult] = []
-    state: Any = None
     log_problem: str | None = None
     try:
         pinned = auth.read_anchor(auth.anchor_path(root))              # before the replay's first SELECT
-        # the gate's own read-only replay; the store id is the gate's autonomic store's, which a doctor row never uses
-        state = AuthorityCoverage(root, allowed_signers=path, store_id="doctor").replay(check_anchor=False)
+        # a read-only replay: the log is verified, never written, and never created here
+        conn = sqlite3.connect(f"file:{quote(str(journal))}?mode=ro", uri=True, isolation_level=None, timeout=2.0)
+        try:
+            state = auth.snapshot(conn, cache=auth.ReplayCache(), ssh_keygen=DEFAULT_SSH_KEYGEN)
+        finally:
+            conn.close()
         try:
             auth.check_anchor(state, pinned, path=auth.anchor_path(root))
         except auth.NotInitialised as exc:             # the log replayed, so it is initialised: its anchor is the gap
-            state = None
             rows.append(CheckResult("authority anchor", True, f"the anchor check could not run: {exc}",
                                     "The cockpit authority row has the log's state.", warn=True))
     except auth.NotInitialised:
         return []
     except Exception as exc:  # noqa: BLE001 - a log that cannot be replayed is a row of its own, never a quiet pass
-        state = None
         log_problem = f"{type(exc).__name__}: {exc}"
-    keys: frozenset[str] | None = None
+    unused = "it anchors nothing in 1.0"
     try:
         st = os.lstat(path)
     except FileNotFoundError:
-        row = CheckResult(
-            name, True, f"nothing can graduate: no enrolled authority signer ({path} does not exist)",
-            _authority_signers_hint(host), warn=True)
+        row = CheckResult(name, True, f"no enrolled authority signer ({path} does not exist); {unused}")
     except OSError as exc:
         row = CheckResult(name, True, f"{path} cannot be read (authority-signers-unreadable): "
                                       f"{exc.strerror or exc}", _authority_signers_hint(host), warn=True)
@@ -4124,7 +4122,7 @@ def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> li
         raw: bytes | None = None
         if problem is not None:
             row = CheckResult(
-                name, True, f"nothing can graduate: {problem}",
+                name, True, f"{problem}; {unused}",
                 _authority_signers_hint(host, why="The helper will not write over it (authority-signers-unsafe), so "
                                                   "remove the file as root first, or fix its owner and mode."),
                 warn=True)
@@ -4140,63 +4138,17 @@ def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> li
                                   _authority_signers_hint(host, why=f"The helper's answer is {refusal.name}."),
                                   warn=True)
         if raw is None and problem is None and row is None:
-            row = CheckResult(
-                name, True, f"nothing can graduate: no enrolled authority signer ({path} does not exist)",
-                _authority_signers_hint(host), warn=True)
+            row = CheckResult(name, True, f"no enrolled authority signer ({path} does not exist); {unused}")
         if raw is not None:
             keys = cov.authority_keys(cov.parse_root_signers(raw))
             if keys:
-                row = CheckResult(name, True, f"{len(keys)} key(s) root lists for levain-authority ({path})")
+                row = CheckResult(name, True, f"{len(keys)} key(s) root lists for levain-authority ({path}); {unused}")
             else:
-                keys = frozenset()
-                row = CheckResult(name, True, f"nothing can graduate: {path} lists no key for levain-authority",
-                                  _authority_signers_hint(host), warn=True)
+                row = CheckResult(name, True, f"{path} lists no key for levain-authority; {unused}")
     rows.append(row)
     if log_problem is not None:
         rows.append(CheckResult("authority log", True, f"could not check the authority log: {log_problem}",
                                 "The cockpit authority row says whether the log itself is readable.", warn=True))
-    if state is None:
-        return rows
-    when = now if now is not None else datetime.now(timezone.utc)
-    key_of = cov._key_of
-    stale: list[tuple[str, tuple[str, ...]]] = []
-    for p in graduation_policies(state):
-        # live by the gate's own predicate with the policy's own signers listed (time only), not with root's
-        if not cov.live(p, when, frozenset(k for k in (key_of(p.born_signer), key_of(p.current_signer)) if k)):
-            continue
-        if keys is not None and cov.live(p, when, keys):
-            continue
-        if keys is None:
-            stale.append((p.grant_id, ()))
-            continue
-        born, cur = key_of(p.born_signer), key_of(p.current_signer)
-        gaps = tuple(label for label, k in (("born signer", born), ("current signer", cur if cur != born else None))
-                     if k is not None and k not in keys)
-        if gaps:
-            stale.append((p.grant_id, gaps))
-    if stale:
-        ids = ", ".join(g for g, _ in sorted(stale))
-        if keys is None:
-            rows.append(CheckResult(
-                "graduation policies", True,
-                f"{len(stale)} live policy(ies) ({ids}); root's signers file could not be read, so which of them "
-                "its keys anchor is not checked",
-                "Fix the authority signers row first.", warn=True))
-        else:
-            why = "; ".join(f"{g}: {' and '.join(w)} unlisted" for g, w in sorted(stale))
-            born = any("born signer" in w for _, w in stale)
-            cur = any("current signer" in w for _, w in stale)
-            parts = []
-            if born:
-                parts.append("A missing born signer is not repaired by a renewal: enrol that key (the authority "
-                             "signers row has the one sudo line), or revoke the policy and create it again with a "
-                             "key root lists.")
-            if cur:
-                parts.append("A missing current signer is repaired by renewing: sign it again with a key root lists.")
-            rows.append(CheckResult(
-                "graduation policies", True,
-                f"{len(stale)} live policy(ies) root's keys do not anchor ({why}); each covers nothing",
-                " ".join(parts), warn=True))
     return rows
 
 

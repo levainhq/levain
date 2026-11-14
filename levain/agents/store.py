@@ -7,7 +7,7 @@ the ``_no_replace`` triggers on any connection; the pragma is what makes a REPLA
 the agent schema MARKER is read inside every transaction of an opened store (K2a), so a store moved to another marker
 under a held object is refused at that object's next transaction. The refusals:
 
-- a ``levain-autonomic/3`` store: agents run on ``/2`` until the agent-proof slice (R15-5) lands; the store is read
+- a ``levain-autonomic/3`` store (from a build this levain does not support): the store is read
   through a read-only connection and nothing is created or changed;
 - a store whose agent schema is not the one this binary writes (:func:`check_agent_schema`): the operator is told
   the way out. There is no repair verb in this build.
@@ -32,7 +32,7 @@ __all__ = ["AgentStore", "AgentStoreRefused", "AgentStoreView", "open_agent_stor
            "STORE_V3_REASON", "valid_zone", "canonical_zone", "get_default_zone", "set_default_zone"]
 
 STORE_V3 = "levain-autonomic/3"
-STORE_V3_REASON = "agents need the /3 agent-proof slice (R15-5)"
+STORE_V3_REASON = "a /3 store is from a build this levain does not support"
 
 
 class AgentStoreRefused(RuntimeError):

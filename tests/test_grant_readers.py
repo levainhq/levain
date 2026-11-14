@@ -126,8 +126,6 @@ READERS: dict[str, tuple[int, str, str]] = {
     "levain/chat_egress/renew.py::renew_due":
         (1, "display", "names a launch's keyed records near expiry so a renew can be offered; attaches no credential, and "
                        "a renew of a stopped record is refused at append"),
-    "levain/cli.py::_signed_append":
-        (1, "write", "refuses a graduation op naming an id that is no graduation policy; signing, not answering"),
     "levain/consent/grants.py::create_grant":
         (1, "write", "returns the grant the create just made"),
     "levain/consent/grants.py::_revocable":
@@ -150,9 +148,8 @@ READERS: dict[str, tuple[int, str, str]] = {
         (1, "display", "`seat lease list` names the stopped lease (seat_lease.stopped_lease) when no live one reads"),
     "levain/cli.py::_cmd_seat_egress":
         (1, "display", "`seat egress list` names the stopped grant (seat_push.stopped_egress) when no live one reads"),
-    "levain/cli.py::_cmd_binding_policy_list":
-        (1, "display", "lists graduation policies and who signed them; whether one covers anything is "
-                       "graduation_policies' answer"),
+    "levain/cli.py::_cmd_consent_grant_list":
+        (1, "display", "names a graduation policy or opt-in an earlier levain signed, for its revoke; it covers nothing"),
     "levain/consent/grants.py::grant_view":
         (8, "display", "the page and the phone list every grant the policy holds, each with its state "
                        "(stopped wins over expired and live), the way back of a stopped one (its kind, read raw) and "

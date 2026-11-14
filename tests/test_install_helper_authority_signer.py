@@ -3,8 +3,8 @@
 
 Real ``ssh-keygen`` keys and WebAuthn passkey stand-ins; a scratch L standing for the store, under the account home
 (``tests/autonomic_confirm_keys.anchor_scratch``) so the written file passes ``trust_anchor_problem`` under the
-test-only owner override (``tests/conftest.py``). The journey at the end is S4's (``tests/test_graduation_journey``)
-with the file this verb writes as the gate's signers file."""
+test-only owner override (``tests/conftest.py``). (The journey that ran a graduation policy through these verbs went with the binding cut of 1114.)
+"""
 from __future__ import annotations
 
 import atexit
@@ -457,90 +457,6 @@ def test_the_production_path_is_beside_the_qbrokers_signers():
     for host in ("darwin", "linux"):
         p = root_tree.authority_signers_path(host)
         assert p.parent == root_tree.STORE[host] / "policy" and p.name == "authority_signers"
-
-
-# --- the RUN: S4's journey with this verb's file as the gate's signers file ---------------------------------------------
-
-@pytest.fixture
-def jv(tmp_path, monkeypatch, test_only_confined_executor):
-    """S4's :class:`tests.test_graduation_journey.Journey` whose root file is the one this verb writes: the journey's
-    ``write_root(world, *names)`` becomes ``enrol-authority-signer`` with the first name as ``--public-key`` and the
-    rest as ``--passkey`` (the act under the owner override, never sudo). Confinement is replaced as the journey's own
-    tests replace it."""
-    pytest.importorskip("cryptography")
-    import tests.test_graduation_journey as GJ
-    L = _scratch() / "L"
-    (L / "policy").mkdir(parents=True)
-    (L / "policy" / "operator").write_text(operator_record_text(MY_NAME, ME))
-
-    def by_the_verb(world, *names, namespaces=AUTHORITY_NAMESPACE):
-        assert namespaces == AUTHORITY_NAMESPACE
-        pub = [world.state().keys[world.fp(n)].public_key for n in names]
-        got = _act(L, _enrol_argv("laptop", pub[0], *pub[1:]))
-        assert [s["fingerprint"] for s in got["signers"]] == [world.fp(n) for n in names]
-        return _path(L)
-    monkeypatch.setattr(GJ, "write_root", by_the_verb)
-    j = GJ.Journey(tmp_path, monkeypatch)
-    assert j.signers == _path(L)
-    j.L = L
-    return j
-
-
-def test_run_a_policy_the_enrolled_key_signed_covers(jv):
-    from levain.autonomic import Posture
-    print("\nS5a RUN: the verb's file as the gate's signers file; policy create, then a fire")
-    jv.fire.mint(Posture.ON_LOOP)
-    jv.create()
-    o = jv.dispatch("enrolled laptop key")
-    assert o.fired and o.posture is Posture.ON_LOOP
-
-
-def test_run_remove_authority_signer_uncovers(jv):
-    from levain.autonomic import Posture
-    print("\nS5a RUN: policy create, then remove-authority-signer of its signer, then a fire")
-    jv.fire.mint(Posture.ON_LOOP)
-    jv.create()
-    assert jv.dispatch("enrolled").fired
-    _act(jv.L, [REMOVE, "--key", jv.auth.fp("laptop")])
-    o = jv.dispatch("its signer removed by root")
-    assert not o.fired and o.posture is Posture.CONFIRM
-
-
-def test_run_a_policy_an_unlisted_key_signed_covers_nothing(jv, tmp_path):
-    """Another laptop key (enrolled in its own log, never in root's file) signs the same policy into a fresh log that
-    replaces the cockpit's (S4 scenario 5's substitution): it covers nothing until the verb enrols that key."""
-    import sqlite3
-    from levain.autonomic import Posture
-    from tests.test_authority_graduation_kind import World, grad
-    from tests.test_graduation_journey import LOW_DICT
-    print("\nS5a RUN: a policy signed by a key root's file does not list")
-    jv.fire.mint(Posture.ON_LOOP)
-    (tmp_path / "other").mkdir()
-    other = World(tmp_path / "other")
-    other.clock.now = jv.auth.clock.now
-    other.link({"op": "create_grant", "grant": grad(other, actions={"link0": dict(LOW_DICT)}, store_id=jv.store_id)})
-    src, dst = sqlite3.connect(other.db), sqlite3.connect(jv.auth.db)
-    try:
-        src.backup(dst)
-    finally:
-        src.close()
-        dst.close()
-    anchor = authority.anchor_path(jv.auth.root)
-    anchor.rename(anchor.with_name(anchor.name + ".aside"))     # the substituted log now replays
-    view = jv.coverage.refresh()
-    assert len(view.policies) == 1                               # the other laptop's policy is in the replay
-    o = jv.dispatch("policy signed by an unlisted key")
-    assert not o.fired and o.posture is Posture.CONFIRM
-    jv.clear()
-    # the control: the same policy covers once root lists its signer (so the CONFIRM above was the root file's)
-    _act(jv.L, _enrol_argv("other", other.state().keys[other.fp("laptop")].public_key))
-    assert jv.dispatch("its signer enrolled by the verb").fired
-
-
-def test_run_a_passkey_born_policy_covers_only_with_its_passkey_line(jv):
-    """S4 scenario 8 through the verb: ``write_root(laptop, pk)`` is ``--passkey`` here."""
-    import tests.test_graduation_journey as GJ
-    GJ.test_scenario_8_a_passkey_born_policy_covers_only_with_its_root_line(jv)
 
 
 @pytest.mark.parametrize("name", ["a", "ec", "rsa", "pk"])

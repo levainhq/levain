@@ -114,18 +114,3 @@ def test_direct_mint_fires_on_loop_then_holds_at_confirm_after_revoke(tmp_path):
     assert not second.fired and second.pending and second.posture is Posture.CONFIRM
     assert [line.count("write_document") for line in (work / "outbox.jsonl").read_text().splitlines()] == [1]
 
-
-def test_a_policys_min_clean_fires_governs_the_engine_through_authority_coverage(tmp_path, monkeypatch):
-    # DESIGN r2.6 (R5): the pin, green on main. The leaf's GraduationPolicy carries no min_clean_fires, but the
-    # production coverage source wraps each policy with its signed one, and graduate_due reads it from there.
-    from tests.test_graduation_journey import GP as JGP
-    from tests.test_graduation_journey import Journey
-    j = Journey(tmp_path, monkeypatch)
-    assert j.cli("policy", "create", "--action", "link0", "--lowest", "ON_LOOP", "--days", "30", "--id", JGP,
-                 "--min-clean", "2") == 0
-    b = j.fire.mint(Posture.COOLING_OFF)
-    j.fire.store.record_fire(b.binding_id, clean=True, fired_at="2026-10-25T00:00:01")
-    assert [s.outcome for s in j.engine(apply=False)] == []
-    j.fire.store.record_fire(b.binding_id, clean=True, fired_at="2026-10-25T00:00:02")
-    [step] = j.engine(apply=False)
-    assert step.outcome == "preview" and step.uncovered == ()

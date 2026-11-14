@@ -484,7 +484,7 @@ _RENEW_SKEW = timedelta(minutes=10)
 # its own. Created at the laptop (GRADUATION_CREATE_RANK), or by a passkey the live opt-in names
 # (GRADUATION_OPT_IN_RANK); renewed by any rank-2 key, a passkey included; revoked by any enrolled key.
 # Its ``guard`` (autogrant DESIGN D68, D75, D83) is optional in the record, so a log signed before it replays; this
-# levain signs no policy without a complete one (:func:`_graduation_guard_check`), and renews none.
+# levain signs no policy at all now and renews none (:func:`_graduation_create_refused`); the kind replays whole.
 GRADUATION_KIND = "graduation"
 _GRADUATION_FIELDS = frozenset({"id", "kind", "actions", "lowest_posture", "expires_at", "triggers", "families",
                                 "store_id", "min_clean_fires"})
@@ -1644,33 +1644,31 @@ def _graduation_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: dateti
     raise AuthorityError(_GRADUATION_FIXED)
 
 
-def _graduation_guard_problem(grant: Mapping[str, Any]) -> str | None:
-    # the gate's own rule for a signed guard, imported at use (only an append reaches it, never a replay)
-    from levain.autonomic.coverage import guard_problem
-    if "guard" not in grant:
-        return "it carries no guard (every graduation policy is signed with one: its kill and its drill)"
-    return guard_problem(_thaw(grant["guard"]))
+_GRADUATION_RETIRED = ("a binding does not graduate: this levain signs no graduation policy and renews "
+                       "none (a policy already signed still replays, covers nothing, lapses at its expiry and is "
+                       "revoked with `levain consent grant revoke`)")
 
 
-def _graduation_guard_check(grants: list[Any]) -> None:
-    """At append (DESIGN D83, 1026-20 RULINGS R13-11): a graduation policy a create or a loosen brings in carries a
-    complete guard, whatever rung it names (the rung an effect runs at is the binding's and the policy's together, so
-    only the fire knows whether it is confirm-class), every entry within the sign-time caps. Never at replay: a planted
-    policy without one replays and covers nothing."""
+def _graduation_create_refused(grants: list[Any]) -> None:
+    """At append: no graduation policy is created, by create_grant or inside a loosen (the binding cut of 1114:
+    every autonomous act has a full-context reader). Never at replay:
+    a policy already in the log replays whole."""
     for grant in grants:
-        why = _graduation_guard_problem(grant)
-        if why is not None:
-            raise AuthorityError(f"graduation policy {str(grant.get('id'))[:80]!r} is refused at sign: {why}")
+        raise AuthorityError(f"graduation policy {str(grant.get('id') if isinstance(grant, Mapping) else '')[:80]!r} "
+                             f"is refused at sign: {_GRADUATION_RETIRED}")
 
 
-def _graduation_renew_check(grants: list[Any], after: str) -> None:
-    """At append: a renew extends only a policy signed with a complete guard. One signed before the guard covers
-    nothing (``levain.autonomic.coverage.live``), and a renew cannot add one (its terms are fixed)."""
+def _graduation_renew_refused(grants: list[Any], after: str) -> None:
+    """At append: no graduation policy is renewed (it lapses at its expiry; revoke it to clear it sooner)."""
     for grant in grants:
-        why = _graduation_guard_problem(grant)
-        if why is not None:
-            raise AuthorityError(f"graduation policy {str(grant.get('id'))[:80]!r} is not renewed: {why}; it covers "
-                                 "nothing, so revoke it and create another with a guard")
+        raise AuthorityError(f"graduation policy {str(grant.get('id') if isinstance(grant, Mapping) else '')[:80]!r} "
+                             f"is not renewed: {_GRADUATION_RETIRED}")
+
+
+def _graduation_opt_in_refused(grants: list[Any]) -> None:
+    """At append: no graduation opt-in is signed (it named the passkeys that could create a policy, and none can)."""
+    for grant in grants:
+        raise AuthorityError(f"the graduation opt-in is refused at sign: {_GRADUATION_RETIRED}")
 
 
 def _graduation_phone_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime | None,
@@ -2323,9 +2321,11 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
                                              append_checks=(lambda g: _consent_home_check(g),),
                                              passkey_revocable=True),
     GRADUATION_KIND: _GrantKind(validate=_validate_graduation, change=_graduation_change,
-                                append_checks=(_graduation_guard_check,), renew_checks=(_graduation_renew_check,),
+                                append_checks=(_graduation_create_refused,),
+                                renew_checks=(_graduation_renew_refused,),
                                 passkey_revocable=True, max_life=GRADUATION_GRANT_MAX, fixed=_GRADUATION_FIXED),
     GRADUATION_PHONE_KIND: _GrantKind(validate=_validate_graduation_phone, change=_graduation_phone_change,
+                                      append_checks=(_graduation_opt_in_refused,),
                                       passkey_revocable=True, expires=False, fixed=_GRADUATION_PHONE_FIXED),
     HANDS_MCP_KIND: _GrantKind(validate=_validate_hands_mcp, change=_hands_mcp_change,
                                append_checks=(_hands_mcp_check,), renew_checks=(_hands_mcp_check,),
@@ -2482,15 +2482,20 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
     return AuthorityKey(fp, public_key, cls, seq, legacy_enrolled_at=legacy, enrolled_at=rec["at"], custody=custody)
 
 
-def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: str) -> None:
+def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: str, *, new_link: bool = False) -> None:
     """Refuse a link a passkey signs unless it is one act of the allow-list (DESIGN_REV3 §7). A passkey signs consent
     answers (its own namespace, the consent queue's check), since K8 a cockpit pending of T2 at most in the phone
     namespace (the broker's check), and, in this log, exactly one of: the revoke of a grant :func:`passkey_revocable`
-    takes (which only narrows); the renew of a graduation policy (Phill's Q2 ruling: the phone keeps a policy alive);
-    the create of one graduation policy while the live opt-in names it. Every other op is refused, whatever its
-    class's rank would allow, and a ``loosen`` with it, so no passkey link carries more than one act. The rule is the
-    replay's, so a link built past the phone's ceremonies is held to it."""
+    takes (which only narrows). A link ALREADY in the log may also be the renew of a graduation policy (Phill's Q2
+    ruling: the phone kept a policy alive) or the create of one while the live opt-in named it: the replay keeps both
+    so a log that holds them still replays. A NEW link (``new_link``) is never either (the binding cut of 1114).
+    Every other op is refused, whatever its class's rank would allow, and a
+    ``loosen`` with it, so no passkey link carries more than one act. The rule is the replay's, so a link built past
+    the phone's ceremonies is held to it."""
     op = rec["op"]
+    if new_link and op in ("renew", "create_grant"):
+        raise AuthorityError(f"a {PASSKEY} key signs consent answers and grant revokes only: it no longer renews or "
+                             f"creates a graduation policy ({_GRADUATION_RETIRED})")
     if op in ("revoke_grant", "renew"):
         gid = rec["grant_id"]
         target = policy.grants.get(gid) if isinstance(gid, str) else None
@@ -2680,7 +2685,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             # known edge, kept: a quarantined key's links already in the log meet UV + origin only, not the op rule
             # below (stored custody fido/unstated), since holding them to it refuses existing logs (Phill's (a))
             if signer.custody == PASSKEY:
-                _passkey_act(rec, policy, signer.fingerprint)
+                _passkey_act(rec, policy, signer.fingerprint, new_link=new_link)
             need = _apply_op(rec, seq, state, keys, ssh_keygen, new_link=new_link)
             if isinstance(need, StandingPolicy):
                 delta = classify(policy, need)

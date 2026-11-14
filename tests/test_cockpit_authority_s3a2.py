@@ -798,7 +798,6 @@ def _key_setup_callers(tree: ast.AST) -> bool:
 # The appenders allowlisted for their per-act shape, with the append calls each makes (_check_per_act_append).
 PER_ACT_APPENDERS = {
     ("cockpit/keys.py", "_append"): ("sign_and_append",),
-    ("cli.py", "_signed_append"): ("append", "prepare"),
     # agents.signing._sign_op (P5a-2a): prepare and append in two separate autocommit blocks of one journal it opens
     # per act, the signature taken between them OUTSIDE any transaction (_check_the_signing_module holds that)
     ("agents/signing.py", "_sign_op"): ("append", "prepare"),
@@ -806,7 +805,7 @@ PER_ACT_APPENDERS = {
     # autocommit block of a journal it opens per act, like key_setup.setup_key
     ("voice/custody.py", "add_key"): ("append", "prepare"),
     # seat_lease.renew_lease (Z1d): a seat-root lease's renew, prepared and appended in two separate autocommit blocks of a
-    # journal it opens per act, the signature taken between them outside any transaction, the shape of cli._signed_append
+    # journal it opens per act, the signature taken between them outside any transaction, the shape of keys._append
     ("seat_lease.py", "renew_lease"): ("append", "prepare"),
 }
 
@@ -986,8 +985,8 @@ def _check_the_appenders(root: Path) -> None:
             continue
         for name, fn, _line in _uses(path, ("append", "sign_and_append", "prepare")):
             appenders.append((str(path.relative_to(root)), fn, name))
-    # cli._signed_append (append + prepare): the `levain binding policy create|renew|revoke` verbs, a short-lived CLI
-    # act that opens its journal per act, the same shape as keys._append; PER_ACT_APPENDERS holds both to it below.
+    # keys._append (sign_and_append): a short-lived CLI
+    # act that opens its journal per act; PER_ACT_APPENDERS holds it to that below.
     # agents.bars._r2 appends a bar's stored signature through the cockpit connection recover hands it; it opens none
     # and is held to that by HANDED_APPENDERS below.
     # agent_authority._prepare_onto and revoke_agent_finish prepare and append the agent revoke through the cockpit
@@ -1001,8 +1000,6 @@ def _check_the_appenders(root: Path) -> None:
                                  ("agents/signing.py", "_sign_op", "prepare"),
                                  ("chat_egress/key_setup.py", "setup_key", "append"),
                                  ("chat_egress/key_setup.py", "setup_key", "prepare"),
-                                 ("cli.py", "_signed_append", "append"),
-                                 ("cli.py", "_signed_append", "prepare"),
                                  ("cockpit/keys.py", "_append", "sign_and_append"),
                                  ("consent/grants.py", "append_revoke", "append"),
                                  ("consent/grants.py", "prepare_revoke", "prepare"),
@@ -1089,8 +1086,6 @@ def test_the_appender_guard_sees_a_planted_second_caller_of_setup_key(tmp_path):
 
 @pytest.mark.static_guard
 @pytest.mark.parametrize("rel, old, new, why", [
-    ("cli.py", "            return append(conn, link,", "            return append(HELD, link,", "_signed_append:.* outside"),
-    ("cli.py", "    db = _journal(_cockpit_root(args))\n", "    db = _JOURNAL\n", "_signed_append: db is not a journal"),
     ("cockpit/keys.py", "        with db.autocommit() as conn:\n            return sign_and_append(",
      "        with _HELD as conn:\n            return sign_and_append(", "_append:.* outside"),
 ])
