@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from levain.intentions import BUCKET_TRAY, NON_COGNITION_DISPOSITIONS, bucket_of, is_loop
-from levain.writes import RETIRED_HANDOFF_MSG, RETIRED_KEEP_NOTE_MSG, EditError, apply_edit
+from levain.writes import RETIRED_HANDOFF_MSG, RETIRED_KEEP_NOTE_MSG, RETIRED_LOOP_MSG, EditError, apply_edit
 
 from tests.test_writes import _add_intention, _legacy_seed, _scope, _intention_store, install  # noqa: F401
 
@@ -21,20 +21,37 @@ def test_retired_message_texts() -> None:
     assert "Keep" in RETIRED_KEEP_NOTE_MSG
 
 
-@pytest.mark.parametrize("disp,msg", [("handoff", RETIRED_HANDOFF_MSG), ("note", RETIRED_KEEP_NOTE_MSG)])
+_RETIRED_CASES = [("handoff", RETIRED_HANDOFF_MSG), ("note", RETIRED_KEEP_NOTE_MSG), ("loop", RETIRED_LOOP_MSG)]
+
+
+def test_the_loop_message_text() -> None:
+    assert RETIRED_LOOP_MSG == "loops are folded into the List: write someday, or agenda with a date"
+
+
+@pytest.mark.parametrize("disp,msg", _RETIRED_CASES)
 def test_seed_refuses_retired(install: Path, disp: str, msg: str) -> None:
     with pytest.raises(EditError) as ei:
         apply_edit(_scope(install), {"kind": "intention_seed", "text": "x", "disposition": disp})
     assert ei.value.code == "bad_verb_arg" and ei.value.http_status == 422 and msg in str(ei.value)
 
 
-@pytest.mark.parametrize("disp,msg", [("handoff", RETIRED_HANDOFF_MSG), ("note", RETIRED_KEEP_NOTE_MSG)])
+@pytest.mark.parametrize("disp,msg", _RETIRED_CASES)
 def test_set_disposition_refuses_retired(install: Path, disp: str, msg: str) -> None:
     sid = _add_intention(install, disposition="someday")
     with pytest.raises(EditError) as ei:
         apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid, "disposition": disp})
     assert ei.value.http_status == 422 and msg in str(ei.value)
     assert _intention_store(install).get(sid)["disposition"] == "someday"   # nothing written
+
+
+def test_set_disposition_to_loop_on_a_key_absent_row_answers_422_with_the_retirement_message(install: Path) -> None:
+    """The entity's own plant (no disposition key) is the row an old Open loops button would have metabolized: it now
+    answers the retirement words, and the row is left as it was (key-absent, reading someday)."""
+    sid = _add_intention(install)           # key-absent
+    with pytest.raises(EditError) as ei:
+        apply_edit(_scope(install), {"kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
+    assert ei.value.http_status == 422 and RETIRED_LOOP_MSG in str(ei.value)
+    assert "disposition" not in _intention_store(install).get(sid)
 
 
 def test_capture_still_takes_someday_and_agenda(install: Path) -> None:
@@ -63,19 +80,25 @@ def test_legacy_row_reads_descends_and_redispositions(install: Path, disp: str) 
     assert res["ok"]
 
 
-def test_is_loop_still_false_for_legacy_note() -> None:
+def test_is_loop_is_false_for_legacy_note_and_for_every_other_row() -> None:
     assert is_loop({"disposition": "note"}) is False
     assert is_loop({"disposition": "handoff"}) is False
+    assert is_loop({}) is False and is_loop({"disposition": "loop"}) is False     # the fold: no row is a loop
 
 
 def test_cockpit_effects_refuse_retired() -> None:
     from levain.cockpit.effects import _ce_set_disposition
 
     pre = {"id": "intention-001", "origin_key": "ok-1", "status": "open", "disposition": "someday", "text": "x", "type": "thought"}
-    for d, msg in (("note", RETIRED_KEEP_NOTE_MSG), ("handoff", RETIRED_HANDOFF_MSG)):
+    for d, msg in (("note", RETIRED_KEEP_NOTE_MSG), ("handoff", RETIRED_HANDOFF_MSG), ("loop", RETIRED_LOOP_MSG)):
         with pytest.raises(ValueError) as ei:
             _ce_set_disposition({"disposition": d}, pre, origin_key=None, version_of=lambda *a, **k: "v")
         assert msg in str(ei.value)
+    # a key-absent row (the entity's own plant) is refused the same way: it reads someday, `loop` is no write value
+    bare = {k: v for k, v in pre.items() if k != "disposition"}
+    with pytest.raises(ValueError) as ei:
+        _ce_set_disposition({"disposition": "loop"}, bare, origin_key=None, version_of=lambda *a, **k: "v")
+    assert RETIRED_LOOP_MSG in str(ei.value)
 
 
 def test_legacy_echo_passes_cockpit_update_and_new_retired_change_refused() -> None:
@@ -493,5 +516,6 @@ def test_disposition_sets_read_vs_write() -> None:
     from levain.intentions import RETIRED_DISPOSITIONS, VALID_DISPOSITIONS, WRITE_DISPOSITIONS
 
     assert VALID_DISPOSITIONS == ("loop", "someday", "seed", "handoff", "agenda", "note")
-    assert WRITE_DISPOSITIONS == ("loop", "someday", "agenda")
+    assert WRITE_DISPOSITIONS == ("someday", "agenda")          # `loop` left the write set with the fold
     assert set(RETIRED_DISPOSITIONS) <= set(VALID_DISPOSITIONS) and not set(RETIRED_DISPOSITIONS) & set(WRITE_DISPOSITIONS)
+    assert "loop" in RETIRED_DISPOSITIONS
