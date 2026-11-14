@@ -970,9 +970,10 @@ class Broker:
                 sid = None if row is None else row.get("id")
             except (BrokerError, TransientApplyFault):
                 sid = None
-        line, out = intake.receipt(dict(reading), id=sid, now=self._clock())
+        now = self._clock()
+        line, out = intake.receipt(dict(reading), id=sid, now=now)
         if sid is None:
-            fires = (intake.when_text(out["fires"], self._clock())
+            fires = (intake.when_text(out["fires"], now)
                      if out["kind"] in ("drop", "remind") else "")
             what = (f"scheduled drop fires {fires}" if out["kind"] == "drop"
                     else f"reminds you {fires}" + (f", then {out['recur']}" if out.get("recur") else "")

@@ -193,7 +193,7 @@ def test_a_scheduled_drop_plants_an_agenda_for_the_desk_at_the_resolved_minute(b
     assert (row["text"], row["disposition"], row["target"], row["next"]) == \
         ("call the dentist", "agenda", "desk", want)
     assert out["receipt"] == {"kind": "drop", "id": row["id"], "fires": want, "text": "call the dentist"}
-    assert out["receipt_line"] == intake.receipt_line(out["receipt"])
+    assert out["receipt_line"] == intake.receipt_line(out["receipt"], NOW_LOCAL)
     assert out["receipt_line"].startswith(f"scheduled drop {row['id']} fires ")
 
 
@@ -380,7 +380,7 @@ def test_a_timed_reminder_plants_an_agenda_for_him_at_its_minute(broker, intenti
         ("call the dentist", "agenda", REMIND_TARGET, want)
     assert not row.get("recur") and not row.get("recur_anchor")
     assert out["receipt"] == {"kind": "remind", "id": row["id"], "fires": want, "recur": None, "text": "call the dentist"}
-    assert out["receipt_line"] == intake.receipt_line(out["receipt"])
+    assert out["receipt_line"] == intake.receipt_line(out["receipt"], NOW_LOCAL)
     assert out["receipt_line"].startswith(f"reminder {row['id']} rings ") and "then" not in out["receipt_line"]
 
 
