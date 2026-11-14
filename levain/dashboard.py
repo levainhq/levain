@@ -2,7 +2,7 @@
 
 The v2 spine is *the substrate escapes the session*. Today a Levain partnership
 entity only exists INSIDE a live Claude Code / Codex session — to see your memory,
-your open loops, the health of your memory store, who the entity is and how it
+your intentions, the health of your memory store, who the entity is and how it
 thinks, you have to be mid-conversation. This module is the first move out:
 assemble the entity's WHOLE substrate — the anneal stores AND the install's
 seed/config surface — into a single ``SubstrateView`` that renders from outside
@@ -56,7 +56,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 from levain.intentions import (
     BUCKET_TRAY,
-    LOOP_DISPOSITION,
+    DEFAULT_DISPOSITION,
     PARKED_TIER,
     bucket_of,
     disposition_of,
@@ -565,6 +565,9 @@ class CrystalEntry:
         return self.__dict__.copy()
 
 
+_AS_READ: Any = object()   # OpenIntention.stored_disposition when the caller names none: the stored value is the one read
+
+
 @dataclass
 class OpenIntention:
     """An open prospective loop — the entity's unfinished intentions. ``tier`` /
@@ -579,11 +582,9 @@ class OpenIntention:
     seen: str
     next: str | None
     pointer: str | None
-    # The operator-I/O disposition (control-plane Slice 3): ``loop`` (default — the
-    # entity's own prospective loop) vs ``seed``/``handoff``/``agenda`` (the operator Tray).
-    # Drives the Open-Loops / Tray render split; absent/falsy → ``loop`` (every
-    # pre-Slice-3 intention). See ``levain.intentions`` for the vocab + the bucketing partition.
-    disposition: str = LOOP_DISPOSITION
+    # The disposition as the List reads it: ``someday`` (default: a key-absent row, or the retired
+    # ``loop``), ``agenda``, or a legacy name. See ``levain.intentions`` for the vocab.
+    disposition: str = DEFAULT_DISPOSITION
     # The valid Class-B resolve kinds for THIS intention's type, derived from anneal's
     # own DESCEND_BY_TYPE / ASCEND_BY_TYPE (Slice 2b-ii). Schema-driven from the
     # substrate so the plane's verb affordances can't drift from anneal's taxonomy
@@ -603,9 +604,17 @@ class OpenIntention:
     # the stamp germinate leaves (``{on, target, ref}``) as stored, a copy; None when absent. Versioned: a stamp landing
     # between a write's guard and its write stales the write instead of passing under it
     germinated: dict[str, Any] | None = None
+    # the disposition the store HOLDS (None for a key-absent row), where ``disposition`` is what the List reads (someday
+    # for that row). What a version and a cockpit label key are taken over; a row built without one holds what it reads
+    stored_disposition: str | None = _AS_READ
+
+    def __post_init__(self) -> None:
+        if self.stored_disposition is _AS_READ:
+            self.stored_disposition = self.disposition
 
     def to_dict(self) -> dict[str, Any]:
-        return self.__dict__.copy()
+        # the stored form is for versions and label keys, not the wire
+        return {k: v for k, v in self.__dict__.items() if k != "stored_disposition"}
 
 
 def open_intention_from(s: Mapping[str, Any]) -> "OpenIntention":
@@ -636,6 +645,7 @@ def open_intention_from(s: Mapping[str, Any]) -> "OpenIntention":
         # str-coerce for parity (a corrupted store could carry a non-str
         # disposition); disposition_of itself stays the pure twin of the embedder's.
         disposition=str(disposition_of(s)),
+        stored_disposition=(str(sd) if (sd := s.get("disposition")) else None),
         descend_kinds=sorted(DESCEND_BY_TYPE.get(stype, frozenset())),
         ascend_kinds=sorted(ASCEND_BY_TYPE.get(stype, frozenset())),
         origin_key=ok if isinstance(ok := s.get("origin_key"), str) else "",
@@ -1224,12 +1234,10 @@ class SubstrateView:
     health: Health | None = None
     graph: AssociationGraph | None = None
     crystal_index: list[CrystalEntry] = field(default_factory=list)
-    # The intention layer, split into its three operator-facing projections (Slice 3). The
-    # FULL list_open result is bucketed via ``levain.intentions.bucket_of`` — a total
-    # partition, so an intention lands in exactly one. ``open_intentions`` (named ``open_spores``
-    # before the rename, with no alias) holds the active prospective loops — the entity's live
-    # cognition (parked loops included, marked by their tier); ``tray`` (the
-    # operator session-I/O inbox, plus any legacy note) is new. Each is independently capped at ``max_intentions``.
+    # The intention layer. The FULL list_open result is bucketed via ``levain.intentions.bucket_of`` — a total
+    # partition that sends every row to ``tray`` (the List's intention rows, a parked one included, marked by its
+    # tier), capped at ``max_intentions``. ``open_intentions`` stays as a field, always empty: embedders read it
+    # (flow through ``levain_compat.open_rows_of``), and its error key still names a fault of the intention read.
     open_intentions: list[OpenIntention] = field(default_factory=list)
     tray: list[OpenIntention] = field(default_factory=list)
     episodes: list[EpisodeRow] = field(default_factory=list)
@@ -1271,23 +1279,15 @@ class SubstrateView:
                 }
             )
 
-        # --- Operate: the inputs/loops you steer -----------------------------
-        # The two intention projections, adjacent: the entity's loops (parked ones marked), the operator
-        # session-I/O inbox (Slice 3 capture-UX (A) — ONE Tray, not three disposition panels;
-        # the Keep panel is gone, TS-5a). Both are Class B: Open Loops gets
-        # the lifecycle verbs; Tray (Slice 3b) gets the freeform dump box + per-row triage
-        # verbs (metabolize / schedule / dismiss).
-        # Honesty floor: the two projections share ONE intention read; when it FAULTS the
-        # count is meaningless, so the header must show "(unavailable)" — never "(0)" over
-        # an unreadable store (that would contradict the body's "unavailable" and read as a
-        # false zero on a header-only glance). [no_data != no_event; header/body parity]
+        # --- Operate: the inputs you steer -----------------------------------
+        # The operator session-I/O inbox (Slice 3 capture-UX (A) — ONE Tray, not three disposition panels;
+        # the Keep panel is gone, TS-5a, and the Open loops panel with the loop fold). Class B: the freeform
+        # dump box + per-row triage verbs.
+        # Honesty floor: when the intention read FAULTS the count is meaningless, so the header must show
+        # "(unavailable)" — never "(0)" over an unreadable store (that would contradict the body's
+        # "unavailable" and read as a false zero on a header-only glance). [no_data != no_event; header/body parity]
         _intention_err = "open_intentions" in self.errors
-        _oc = "unavailable" if _intention_err else len(self.open_intentions)
         _tc = "unavailable" if _intention_err else len(self.tray)
-        panels.append(
-            {"kind": "intentions", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
-             "title": f"Open loops ({_oc})"}
-        )
         panels.append(
             {"kind": "tray", "zone": ZONE_OPERATE, "edit_class": CLASS_B,
              "title": f"Tray ({_tc})"}
@@ -1505,7 +1505,7 @@ _CONSTITUTION = (
     ("partnership.md", "Constitution · how we work"),
     ("memory.md", "Constitution · your memory"),
     ("memory_workflow.md", "Constitution · your memory's wrap"),
-    ("intention_instructions.md", "Constitution · open loops"),
+    ("intention_instructions.md", "Constitution · intentions"),
 )
 
 # Bound the one operator-unbounded config tier: every other tier is capped
@@ -1987,22 +1987,22 @@ def build_substrate_view(
     except store_faults as exc:
         view.errors["crystal_index"] = f"{type(exc).__name__}: {exc}"
 
-    # --- open intentions → the three operator-facing projections (Slice 3) ------
-    #     Open Loops (cognition, parked loops marked) / Tray (operator session-I/O inbox,
-    #     legacy notes included), bucketed via levain.intentions.bucket_of. Bucket the
-    #     FULL ranked list_open result (NOT a pre-sliced head): an inbox row must not be
-    #     starved out of the Tray by loops ahead of it in the rank. Each bucket is independently capped at
-    #     max_intentions (parked loops under their own cap inside Open loops: they rank LAST) — keeping each bucket's TOP max_intentions BY RANK, which is meaningful
-    #     ONLY because list_open is pre-ranked (a future refactor that feeds an UNRANKED
-    #     list here would make each bucket's cap arbitrary). Defensive per-row: one
+    # --- open intentions → the Tray bucket, via levain.intentions.bucket_of ------
+    #     Bucket the FULL ranked list_open result (NOT a pre-sliced head). The cap is max_intentions
+    #     for the live rows, and parked rows have their OWN cap of the same size: they rank LAST, so
+    #     a shared cap would drop every one of them on a busy install (the starvation the old
+    #     separate Keep bucket existed to prevent) [TS-5a L3]. Each pool keeps its TOP rows BY RANK,
+    #     which is meaningful ONLY because list_open is pre-ranked (a future refactor that feeds an
+    #     UNRANKED list here would make each cap arbitrary). Defensive per-row: one
     #     malformed row skipped, the tier survives.
     try:
         from anneal_memory.spores import IntentionStore
 
         if paths.intentions_json.exists():
-            # bucket name → its destination list; the BUCKET_LOOP default is open_intentions
+            # bucket name → its destination list; bucket_of is total and names the Tray for every row, and
+            # a bucket this code does not know falls to the Tray too (view.open_intentions stays empty)
             bucket_target = {BUCKET_TRAY: view.tray}
-            parked_n = 0   # parked loops in view.open_intentions (their cap is separate)
+            parked_n = 0   # parked rows in view.tray (their cap is separate)
             for s in IntentionStore(paths.intentions_json, id_prefix="intention").list_open(today=today):
                 # The WHOLE per-row pipeline (status-skip → route → cap → construct) lives
                 # in ONE try, so a fault on ANY phase drops just that row — the "one
@@ -2013,15 +2013,12 @@ def build_substrate_view(
                     # Defensive (codex L3 MED): anneal MOVES a resolved intention to the
                     # `resolved` array AND sets status=resolved, so a status=resolved row
                     # still in the `intentions` array is store drift. list_open does NOT filter
-                    # status — skip it so it can't render as an open loop carrying verbs.
+                    # status — skip it so it can't render as an open row carrying verbs.
                     if s.get("status") == "resolved":
                         continue
-                    target = bucket_target.get(bucket_of(s), view.open_intentions)
-                    # A parked loop rides in Open loops but under its OWN cap: it ranks LAST, so a
-                    # shared cap would drop every one of them on a busy install (the starvation the
-                    # old separate Keep bucket existed to prevent) [TS-5a L3].
-                    parked = target is view.open_intentions and s.get("tier") == PARKED_TIER
-                    held = parked_n if parked else len(target) - (parked_n if target is view.open_intentions else 0)
+                    target = bucket_target.get(bucket_of(s), view.tray)
+                    parked = s.get("tier") == PARKED_TIER
+                    held = parked_n if parked else len(target) - parked_n
                     if held >= max_intentions:
                         continue  # this pool is full — keep scanning for the others
                     target.append(open_intention_from(s))
@@ -2182,13 +2179,6 @@ def render_text(view: SubstrateView) -> str:
             out.append(f"  - {c.name} ({c.level}x) — {c.one_clause}")
         out.append("")
 
-    if view.open_intentions:
-        out.append(f"Open loops ({len(view.open_intentions)})")
-        for s in view.open_intentions:
-            nxt = f" → next {s.next}" if s.next else ""
-            out.append(f"  - [{s.tier}] {s.text}{nxt}")
-        out.append("")
-
     # Tray — the operator session-I/O inbox (badged by disposition; a legacy note shows as "note").
     if view.tray:
         out.append(f"Tray ({len(view.tray)})")
@@ -2278,7 +2268,6 @@ def render_summary(view: SubstrateView) -> str:
         lines.append(f"Health: unavailable — {view.errors['store']}")
 
     lines.append(f"Crystallized patterns: {len(view.crystal_index)}")
-    lines.append(f"Open loops: {len(view.open_intentions)}")
     if view.tray:
         lines.append(f"Tray (operator inbox): {len(view.tray)}")
     lines.append(f"Recent episodes: {len(view.episodes)}")
