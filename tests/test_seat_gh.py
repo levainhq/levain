@@ -24,7 +24,8 @@ from levain import seat_gh_mcp as mcp
 TOKEN_L = "github_pat_" + "L" * 40          # fake
 TOKEN_P = "github_pat_" + "P" * 40          # fake
 NOW = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
-FUTURE = "2026-12-31"
+# Ahead of the real clock: the subprocess tests (git's helper, the stdio server) read tokens with no pinned ``now``.
+FUTURE = (datetime.now(timezone.utc) + timedelta(days=30)).date().isoformat()
 PAST = "2026-11-01"
 
 
