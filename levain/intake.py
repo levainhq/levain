@@ -12,7 +12,7 @@ The ``<when>`` grammar (and the repeating phrases only a ``remind`` may use) is 
 not read, a moment not in the future, an empty line, or no words after the prefix raises :class:`IntakeRefused` with the
 reason: a parser informs the human, it never guesses and never authorises.
 
-Pure grammar: no store writes, no clock reads (``now`` is a parameter), no cockpit.
+Pure grammar: no store writes, no cockpit; the parse reads no clock (``now`` is a parameter). A receipt names the year of a moment outside ``now``'s year, and reads the local clock only when no ``now`` is given.
 """
 
 from __future__ import annotations
@@ -57,7 +57,21 @@ def parse_intake(line, now):
     return {"kind": "sort", "text": line}
 
 
-def receipt(parsed, id=None):
+def when_text(fires, now=None):
+    """A stored minute (``YYYY-MM-DDTHH:MM`` or a datetime) as ``Mon 11-09 09:00``; the year is named (``Sun 2027-11-14 09:00``)
+    when it is not ``now``'s year. Why: a date typed without a year means its next occurrence, so one typed at 09:01 for 09:00
+    today lands next year, and a receipt that omits the year reads as set for today (levain#1729). ``now`` defaults to the
+    local clock: a receipt is shown at the moment it is made."""
+    dt = fires if isinstance(fires, datetime) else datetime.strptime(fires, _FMT)
+    now = now or datetime.now()
+    if now.tzinfo is not None:
+        now = now.astimezone()              # the stored minute is local time: so is the year it is compared with
+    if dt.year != now.year:
+        return f"{dt:%a %Y-%m-%d %H:%M}"
+    return f"{dt:%a %m-%d %H:%M}"
+
+
+def receipt(parsed, id=None, now=None):
     """The intake receipt for a parsed line: ``(line, dict)``.
 
     dict is ``{kind, id, fires, text}`` (``id`` is the intention id the caller planted, or None;
@@ -68,21 +82,21 @@ def receipt(parsed, id=None):
     kind = parsed["kind"]
     if kind == "drop":
         r = {"kind": "drop", "id": id, "fires": parsed["when"], "text": parsed["text"]}
-        return f"scheduled drop {id} fires {datetime.strptime(r['fires'], _FMT):%a %m-%d %H:%M}", r
+        return f"scheduled drop {id} fires {when_text(r['fires'], now)}", r
     if kind == "talk":
         return f"talk {id}", {"kind": "talk", "id": id, "fires": None, "text": parsed["text"]}
     if kind == "remind":
         r = {"kind": "remind", "id": id, "fires": parsed["when"], "recur": parsed.get("recur"), "text": parsed["text"]}
-        return receipt_line(r), r
+        return receipt_line(r, now), r
     return "sent to the desk to sort", {"kind": "sort", "id": None, "fires": None, "text": parsed["text"]}
 
 
-def receipt_line(r):
+def receipt_line(r, now=None):
     """One-line receipt from the receipt dict."""
     if r["kind"] == "drop":
-        return f"scheduled drop {r['id']} fires {datetime.strptime(r['fires'], _FMT):%a %m-%d %H:%M}"
+        return f"scheduled drop {r['id']} fires {when_text(r['fires'], now)}"
     if r["kind"] == "remind":
-        return (f"reminder {r['id']} rings {datetime.strptime(r['fires'], _FMT):%a %m-%d %H:%M}"
+        return (f"reminder {r['id']} rings {when_text(r['fires'], now)}"
                 + (f", then {r['recur']}" if r.get("recur") else ""))
     if r["kind"] == "talk":
         return f"talk {r['id']}"

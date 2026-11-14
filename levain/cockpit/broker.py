@@ -956,7 +956,7 @@ class Broker:
                     drop_id = None if row is None else row.get("drop_id")
                 except (BrokerError, TransientApplyFault):
                     drop_id = None
-            line, out = intake.receipt(dict(reading))
+            line, out = intake.receipt(dict(reading), now=self._clock())
             if state != "COMMITTED":
                 line = {"WAITING": "to be sent to the desk to sort, awaiting your signature",
                         "applying": "being sent to the desk to sort",
@@ -970,9 +970,9 @@ class Broker:
                 sid = None if row is None else row.get("id")
             except (BrokerError, TransientApplyFault):
                 sid = None
-        line, out = intake.receipt(dict(reading), id=sid)
+        line, out = intake.receipt(dict(reading), id=sid, now=self._clock())
         if sid is None:
-            fires = (f"{datetime.strptime(out['fires'], '%Y-%m-%dT%H:%M'):%a %m-%d %H:%M}"
+            fires = (intake.when_text(out["fires"], self._clock())
                      if out["kind"] in ("drop", "remind") else "")
             what = (f"scheduled drop fires {fires}" if out["kind"] == "drop"
                     else f"reminds you {fires}" + (f", then {out['recur']}" if out.get("recur") else "")

@@ -1014,7 +1014,7 @@ def _intake_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, 
         raise EditError("drop_refused", 409, str(exc)) from None
     except (OSError, sqlite3.Error, DispatchError) as exc:
         raise EditError("source_unavailable", 503, f"the desk store cannot take a drop now: {exc}") from None
-    line_out, rec = intake.receipt(parsed)
+    line_out, rec = intake.receipt(parsed, now=datetime.now())
     return {"ok": True, "state": "COMMITTED", "receipt": rec, "receipt_line": line_out, "drop_id": drop.drop_id,
             "replay": not created}
 
