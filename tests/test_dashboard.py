@@ -448,6 +448,54 @@ class TestIntentionProjections:
         ids = [s.id for s in v.tray]
         assert "fresh" in ids and "stale" not in ids and len(ids) == 51
 
+    def test_reserve_membership_follows_the_supplied_day_not_a_wall_clock(self, tmp_path: Path) -> None:
+        from datetime import date
+        # S2 r2: one store, two supplied days: the capture is in at day 7 and out at day 8, by the 7-day rule alone
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}", created="2026-01-01T00:00:00Z") for i in range(60)]
+        rows.append(self._row(id="cap", text="capture", disposition="someday", created="2026-11-05T09:00:00Z"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        paths = AnnealPaths.from_db(db)
+        assert "cap" in [s.id for s in build_substrate_view(paths, today=date(2026, 11, 12)).tray]
+        assert "cap" not in [s.id for s in build_substrate_view(paths, today=date(2026, 11, 13)).tray]
+        assert [s.id for s in build_substrate_view(paths, today=date(2026, 11, 12)).tray] == \
+            [s.id for s in build_substrate_view(paths, today=date(2026, 11, 12)).tray]
+
+    def test_reserve_day_comes_from_the_supplied_now(self, tmp_path: Path) -> None:
+        from datetime import datetime, timezone
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}", created="2026-01-01T00:00:00Z") for i in range(60)]
+        rows.append(self._row(id="cap", text="capture", disposition="someday", created="2026-11-05T09:00:00Z"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        paths = AnnealPaths.from_db(db)
+        noon = lambda d: datetime(2026, 11, d, 12, 0, tzinfo=timezone.utc)
+        assert "cap" in [s.id for s in build_substrate_view(paths, now=noon(12)).tray]
+        assert "cap" not in [s.id for s in build_substrate_view(paths, now=noon(20)).tray]
+
+    def test_a_capture_dated_tomorrow_by_utc_survives_a_full_cap(self, tmp_path: Path) -> None:
+        from datetime import date
+        # S2 r2: a US evening makes the UTC created date a day ahead of the local day; the capture is still fresh
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}", created="2026-01-01T00:00:00Z") for i in range(60)]
+        rows.append(self._row(id="cap", text="capture", disposition="someday", created="2026-11-13T02:00:00Z"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        v = build_substrate_view(AnnealPaths.from_db(db), today=date(2026, 11, 12))
+        assert "cap" in [s.id for s in v.tray]
+
+    def test_a_malformed_fresh_row_costs_no_reserve_slot(self, tmp_path: Path) -> None:
+        from datetime import date
+        # S2 r2: the reserve counts a row only once it is in the view, so malformed fresh rows do not let an old row in
+        db = tmp_path / "memory.db"
+        day = date(2026, 11, 12)
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}", created="2026-01-01T00:00:00Z") for i in range(50)]
+        rows += [self._row(id=f"bad{i}", tier="warm", salience="x", text="bad", created="2026-11-11T00:00:00Z") for i in range(10)]
+        # the old row ranks after the malformed ones (salience -1 under their coerced 0), so only the count can admit it
+        rows.append(self._row(id="old", tier="warm", salience=-1, text="old", created="2026-01-02T00:00:00Z"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        v = build_substrate_view(AnnealPaths.from_db(db), today=day)
+        ids = [s.id for s in v.tray]
+        assert "old" not in ids and not any(i.startswith("bad") for i in ids) and len(ids) == 50
+
     def test_parked_rows_have_their_own_cap(self, tmp_path: Path) -> None:
         db = tmp_path / "memory.db"
         rows = [self._row(id=f"live{i}", tier="hot", text=f"live {i}") for i in range(5)]

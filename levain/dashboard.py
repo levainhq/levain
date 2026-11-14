@@ -1790,7 +1790,7 @@ def _is_fresh_capture(s: Mapping[str, Any], today: date) -> bool:
         made = date.fromisoformat(str(s.get("created") or "")[:10])
     except ValueError:
         return False
-    return today - timedelta(days=CAPTURE_DAYS) <= made <= today
+    return today - timedelta(days=CAPTURE_DAYS) <= made  # no upper bound: a UTC date a day ahead of the local one is just made
 
 
 def build_substrate_view(
@@ -1811,6 +1811,9 @@ def build_substrate_view(
     sections: tuple[str, ...] = _ALL_SECTIONS,
 ) -> SubstrateView:
     """Assemble the full read-only substrate view from the operator's stores.
+
+    Fresh captures admitted past the live cap are appended after the live rows: the Tray list is complete, not
+    rank-ordered across the reserve.
 
     PURE READ — the episodic Store is opened ``read_only=True`` and a missing
     store is REPORTED, never fabricated (no db/dir creation, no wrap contention).
@@ -2019,8 +2022,10 @@ def build_substrate_view(
             parked_n = 0   # parked rows in view.tray (their cap is separate)
             capture_n = 0  # fresh captures held past the live cap (their reserve is separate, a fifth of the cap, at most CAPTURE_RESERVE)
             capture_cap = min(CAPTURE_RESERVE, max_intentions // 5)
-            cap_today = today or date.today()
-            for s in IntentionStore(paths.intentions_json, id_prefix="intention").list_open(today=today):
+            # one date for the ranking and the freshness test, taken from the supplied day or instant, so tray
+            # membership follows the store and the caller's clock, never a second read of the wall clock
+            view_today = today if today is not None else _now.astimezone().date()
+            for s in IntentionStore(paths.intentions_json, id_prefix="intention").list_open(today=view_today):
                 # The WHOLE per-row pipeline (status-skip → route → cap → construct) lives
                 # in ONE try, so a fault on ANY phase drops just that row — the "one
                 # malformed row skipped, the tier survives" guarantee holds for routing,
@@ -2040,12 +2045,13 @@ def build_substrate_view(
                         # the live pool is full. A capture (a non-parked row created in the last CAPTURE_DAYS days)
                         # has a small reserve of its own: it ranks below a busy install's hot rows, and the Tray's
                         # old separate cap kept it on the surface the operator reads [S2 L3 follow-up]
-                        if parked or capture_n >= capture_cap or not _is_fresh_capture(s, cap_today):
+                        if parked or capture_n >= capture_cap or not _is_fresh_capture(s, view_today):
                             continue
-                        capture_n += 1
                     target.append(open_intention_from(s))
                     if parked:
                         parked_n += 1
+                    elif held >= max_intentions:
+                        capture_n += 1  # counted only once the row is in the view, so a malformed row costs no slot
                 except (ValueError, TypeError):
                     continue  # one malformed row skipped; the tier survives
     except store_faults as exc:
