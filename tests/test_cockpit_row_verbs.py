@@ -13,10 +13,16 @@ ROW = ('[...document.querySelectorAll("[data-ck-panel=tray] .row")].find(r => r.
        'r.querySelector(".verb-actions"))')   # a visible List row: the fold shows the first few rows only
 
 
+# The List's Tray row is a container-query box (the inline verbs' copies show in the menu at <= 340px). At the 1440 default its
+# content is ~368px, only 28px over that line, so a browser whose window is a little narrower (CI's headless Chrome on Linux)
+# reads the row as narrow. Size the window explicitly, far from the line (1600 -> ~422px).
+WIDE = {"emulate": {"w": 1600, "h": 1000, "dpr": 1}}
+
+
 def _page(tmp_path: Path, steps: list[dict]) -> list:
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
-        return _drive(tmp_path, f"{url}/#write_token=T", [{"until": f"{ROW} && {ROW}.querySelector('.verb-btn')"}, *steps])["values"]
+        return _drive(tmp_path, f"{url}/#write_token=T", [WIDE, {"until": f"{ROW} && {ROW}.querySelector('.verb-btn')"}, *steps])["values"]
 
 
 @needs_browser
