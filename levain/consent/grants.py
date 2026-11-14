@@ -32,7 +32,7 @@ from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, 
                               UnsignedLink, VerifierUnavailable, anchor_path, append,
                               consent_grant, consent_grant_tool_problem, consent_resolved_workspace,
                               contained_shell_grant, grant_stop_reason, grants_stopped_by, inert_grant,
-                              passkey_revocable, prepare, stopped_way, voice_key_record)
+                              passkey_revocable, prepare, stopped_clears_only, stopped_way, voice_key_record)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
@@ -144,7 +144,7 @@ def revoke_grant(data_root: Path | str, grant_id: str, *, signer_fp: str, sign: 
                  clock: Callable[[], datetime], ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                  marker_directory: Path | None = None) -> tuple[int, str | None]:
     """Sign a ``revoke_grant`` link removing the consent grant ``grant_id``, one of a kind this levain does not
-    know (:func:`list_inert_grants`), or a graduation policy or opt-in an earlier levain signed (this levain signs neither:
+    know (:func:`list_inert_grants`), or a graduation policy or opt-in the log holds (this levain signs neither:
     revoke is all it does with them); any enrolled key may. From the
     next decision on it answers nothing, and an answer it already gave is no longer delivered. Returns
     ``(seq, warning)``."""
@@ -281,7 +281,7 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     lease = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == SEAT_LEASE_KIND]
     # a seat-egress grant (levain.seat_push, Z2a) is listed the same way, for the same revoke
     egress = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == SEAT_EGRESS_KIND]
-    # a graduation policy or opt-in an earlier levain signed (the retired rows) is passkey-revocable, so it is listed for
+    # a graduation policy or opt-in the log holds (the retired rows) is passkey-revocable, so it is listed for
     # its revoke; it answers no consent request, so no evidence is read for it
     old = [r[0] for r in retired]
     links = {gid: state.grant_link(gid)
@@ -305,7 +305,7 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
 
     def state_of(gid: str, expires_at: str) -> str:
         """``stopped`` wins over ``expired`` and ``live``: the stop explains why it answers nothing, and the way out
-        (create it again with a key you hold) is the same whether or not it would also have expired."""
+        (the kind's own way back, :func:`way_back`) is the same whether or not it would also have expired."""
         return "stopped" if gid in stopped else "live" if expires_at > stamp else "expired"
 
     for g in consent:
@@ -376,7 +376,7 @@ def grant_listing_all(data_root: Path | str, *, now: datetime, ssh_keygen: Path 
                       ) -> tuple[list[ConsentGrant], list[tuple[str, str, str, int | None, str]],
                                  list[tuple[str, str, str | None]]]:
     """:func:`grant_listing` plus the retired rows, ``(id, kind, expires_at or None)`` of a graduation policy or opt-in
-    an earlier levain signed: all three from the ONE capture and snapshot, so `consent grant list` never reads twice."""
+    the log holds: all three from the ONE capture and snapshot, so `consent grant list` never reads twice."""
     db = _journal(data_root, marker_directory=marker_directory)
     return _split(_signing_authority(_capture(db, now, ssh_keygen)))
 
@@ -444,7 +444,7 @@ def way_back(kind: Any) -> str:
     """The way back for a stopped grant of ``kind`` as one clause (:func:`levain.authority.stopped_way`, with "to use
     it" after a way that makes one again): what a list line and the cockpit page's row both say."""
     way = stopped_way(kind)
-    return way if kind == HANDS_MCP_KIND else way + " to use it"
+    return way if stopped_clears_only(kind) else way + " to use it"
 
 
 def stopped_line(why: str, kind: Any = None) -> str:
@@ -463,7 +463,8 @@ def ways_back(stopped: Iterable[tuple[str, Any]]) -> list[tuple[str, list[str]]]
     for gid, kind in stopped:
         ways.setdefault(stopped_way(kind), []).append(gid)
     rank = {stopped_way(None): 0, stopped_way(SEAT_LEASE_KIND): 1}
-    return [(way if way == stopped_way(HANDS_MCP_KIND) else f"{way} with a key you still hold", ways[way])
+    clears_only = {stopped_way(k) for k in (HANDS_MCP_KIND, GRADUATION_KIND, GRADUATION_PHONE_KIND)}
+    return [(way if way in clears_only else f"{way} with a key you still hold", ways[way])
             for way in sorted(ways, key=lambda w: rank.get(w, 2))]
 
 

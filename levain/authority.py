@@ -481,8 +481,8 @@ _RENEW_SKEW = timedelta(minutes=10)
 # and ``store_id`` narrow what the honest engine reads (writable rows), and ``min_clean_fires`` is advisory (the
 # honest engine's walk). Its terms are fixed under its id: the one change is a renew (only a later expiry); anything
 # else is a revoke and a new id. It lasts at most GRADUATION_GRANT_MAX past its link, and a renew at most that past
-# its own. An earlier levain created it at the laptop (GRADUATION_CREATE_RANK), or by a passkey the live opt-in
-# names (GRADUATION_OPT_IN_RANK), and renewed it by any rank-2 key, a passkey included; this levain only replays
+# its own. The replay admits its create at the laptop (GRADUATION_CREATE_RANK) or by a passkey the live opt-in
+# names (GRADUATION_OPT_IN_RANK), and its renew by any rank-2 key, a passkey included; this levain appends none of
 # those links. Revoked by any enrolled key.
 # Its ``guard`` (autogrant DESIGN D68, D75, D83) is optional in the record, so a log signed before it replays; this
 # levain signs no policy at all now and renews none (:func:`_graduation_create_refused`); the kind replays whole.
@@ -506,7 +506,7 @@ GRADUATION_CREATE_RANK = 3
 GRADUATION_OPT_IN_RANK = 2
 _GRADUATION_FIXED = "a graduation policy's terms are fixed: revoke it and create another"
 _GRADUATION_EXPIRY = ("a graduation policy's expiry moves only by its own renew link, never inside another op "
-                      "(this levain appends no renew of one: it lapses at its expiry, or revoke it)")
+                      "(this levain appends no renew of one; revoke it to clear it)")
 # The opt-in (DESIGN_REV3 §7): signed once at the laptop, naming the passkeys (each an active passkey key when it is
 # signed) whose create_grant of one graduation policy the replay takes at GRADUATION_OPT_IN_RANK. No expiry, no
 # change, at most one in the policy; a revoke removes it, and a revoked or quarantined passkey signs nothing.
@@ -1326,6 +1326,12 @@ def grant_stop_reason(state: AuthoritySnapshot, grant_id: str) -> str | None:
     return None
 
 
+def stopped_clears_only(kind: Any) -> bool:
+    """Whether a stopped grant of ``kind`` can only be revoked, never made again (a hands entry no verb registers; a
+    graduation policy or opt-in this levain signs none of)."""
+    return kind in (HANDS_MCP_KIND, GRADUATION_KIND, GRADUATION_PHONE_KIND)
+
+
 def stopped_way(kind: Any) -> str:
     """How a stopped grant of ``kind`` is used again, in words every surface shares (the revoke notice, a list line, the
     renew refusal). A kind with a one-live rule (the seat-root lease, the seat-egress grant, a chat key per host, a
@@ -1334,6 +1340,8 @@ def stopped_way(kind: Any) -> str:
     entry, so for one revoking only clears it."""
     if kind == HANDS_MCP_KIND:
         return "revoke it to clear it; no levain verb registers a hands entry yet"
+    if kind in (GRADUATION_KIND, GRADUATION_PHONE_KIND):
+        return "revoke it to clear it; this levain signs none, so it cannot be created again"
     if kind in (SEAT_LEASE_KIND, SEAT_EGRESS_KIND, EGRESS_KEY_KIND, VOICE_KEY_KIND):
         return "revoke it, then create it again"
     return "create it again"
@@ -1646,7 +1654,7 @@ def _graduation_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: dateti
 
 
 _GRADUATION_RETIRED = ("a binding does not graduate: this levain signs no graduation policy and renews "
-                       "none (a policy already signed still replays, covers nothing, lapses at its expiry and is "
+                       "none (a policy or opt-in already signed still replays, covers nothing and is "
                        "revoked with `levain consent grant revoke`)")
 
 
@@ -1660,7 +1668,7 @@ def _graduation_create_refused(grants: list[Any]) -> None:
 
 
 def _graduation_renew_refused(grants: list[Any], after: str) -> None:
-    """At append: no graduation policy is renewed (it lapses at its expiry; revoke it to clear it sooner)."""
+    """At append: no graduation policy is renewed (revoke it to clear it)."""
     for grant in grants:
         raise AuthorityError(f"graduation policy {str(grant.get('id') if isinstance(grant, Mapping) else '')[:80]!r} "
                              f"is not renewed: {_GRADUATION_RETIRED}")
@@ -2487,10 +2495,9 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
     """Refuse a link a passkey signs unless it is one act of the allow-list (DESIGN_REV3 §7). A passkey signs consent
     answers (its own namespace, the consent queue's check), since K8 a cockpit pending of T2 at most in the phone
     namespace (the broker's check), and, in this log, exactly one of: the revoke of a grant :func:`passkey_revocable`
-    takes (which only narrows). A link ALREADY in the log may also be the renew of a graduation policy (Phill's Q2
-    ruling: the phone kept a policy alive) or the create of one while the live opt-in named it: the replay keeps both
-    so a log that holds them still replays. A NEW link (``new_link``) is never a renew and never a create, of any
-    kind. Every other op is refused, whatever its class's rank would allow, and a
+    takes (which only narrows). The replay (``new_link`` false) also admits the renew of a graduation policy or the
+    create of one while the live opt-in named it, so a log that holds them still replays. An appended link
+    (``new_link``) is never a renew and never a create, of any kind. Every other op is refused, whatever its class's rank would allow, and a
     ``loosen`` with it, so no passkey link carries more than one act. The rule is the replay's, so a link built past
     the phone's ceremonies is held to it."""
     op = rec["op"]
@@ -2502,7 +2509,7 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
             target = policy.grants.get(gid) if isinstance(gid, str) else None
         # the graduation words only where a graduation policy is what was asked for: a passkey's create of a consent
         # grant is refused as any other non-revoke is
-        tail = f" (of a graduation policy, {_GRADUATION_RETIRED})" if graduation_grant(target) else ""
+        tail = f" ({_GRADUATION_RETIRED})" if graduation_grant(target) else ""
         raise AuthorityError(f"a {PASSKEY} key signs consent answers and grant revokes only, never another authority link: a new "
                              f"link of it is never a renew and never a create{tail}")
     if op in ("revoke_grant", "renew"):
@@ -2585,7 +2592,7 @@ def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody:
     after ``policy``: :data:`FORMAT_V5` for a link that brings in a voice key, tested before every other;
     else :data:`FORMAT_V4` for a link that brings in an agent link or carries ``revoke_agent``, tested
     before the rest; else :data:`FORMAT_V3` for a link that brings in a graduation policy carrying a ``guard`` (by
-    create_grant or loosen, whoever signs it: a link an earlier levain signed, since this one appends none); else :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a
+    create_grant or loosen, whoever signs it; this levain appends none); else :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a
     link that brings in a graduation opt-in; :data:`FORMAT` for every other. :func:`prepare` writes it and the replay
     holds every link to it. A guard enters the log only by a ``/3`` link and never changes after it (a graduation
     policy's terms are fixed), so a replay that stops at ``/3`` never reads a link that carries or alters a guard.
@@ -3111,7 +3118,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
         stopped_kind = grant.get("kind") if isinstance(grant, Mapping) else None
         raise AuthorityError(f"grant {str(rec['grant_id'])[:80]} stopped when {stopped}; a renew does not bring it "
                              f"back: {stopped_way(stopped_kind)}"
-                             + ("" if stopped_kind == HANDS_MCP_KIND else " with a key you hold"))
+                             + ("" if stopped_clears_only(stopped_kind) else " with a key you hold"))
     kind = _renewable_kind(grant, rec["grant_id"])
     after = (f"; grant {str(rec['grant_id'])[:80]!r} was signed before this rule: revoke it "
              "(levain consent grant revoke) and create a new one")

@@ -338,3 +338,20 @@ def test_the_served_page_carries_the_stopped_sentence():
     # the way back is the server's (grants.way_back): no second copy of any kind's words lives in the page
     for words in ("create it again", "set it again", "revoke it, then", "revoke it to clear"):
         assert words not in js.lower(), words
+
+
+@needs_browser
+def test_live_until_revoked_is_said_of_the_opt_in_and_the_voice_key_only(world, tmp_path, monkeypatch):
+    """The words follow the kind: the graduation opt-in (no expiry) says it is live until revoked, a graduation policy
+    draws its date, and a row of another kind with an empty expiry says neither (it draws an empty "until", as a malformed
+    row always did, never a claim). Red with the gate on an empty expiry instead of the opt-in's kind."""
+    base = {**_voice_row("openai", "x"), "kind": "graduation-phone", "provider": ""}
+    opt_in = {**base, "id": "gp-0000000000aa", "id_shown": "gp-0000000000aa"}
+    policy = {**base, "id": "gr-0000000000bb", "id_shown": "gr-0000000000bb", "kind": "graduation",
+              "expires_at": "2026-12-01T00:00:00Z"}
+    odd = {**base, "id": "cg-0000000000cc", "id_shown": "cg-0000000000cc", "kind": "consent"}
+    got = _drive_cards(tmp_path, world, monkeypatch, [opt_in, policy, odd])
+    assert "Live until you revoke it" in got["gp-0000000000aa"][1], got["gp-0000000000aa"][1]
+    assert "until 2026-12-01T00:00:00Z" in got["gr-0000000000bb"][1], got["gr-0000000000bb"][1]
+    assert "Live until you revoke it" not in got["gr-0000000000bb"][1]
+    assert "Live until you revoke it" not in got["cg-0000000000cc"][1], got["cg-0000000000cc"][1]

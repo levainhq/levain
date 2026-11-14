@@ -130,3 +130,14 @@ def test_either_kind_can_still_be_revoked(world):
     assert GP not in after.policy.grants
     after = world.link({"op": "revoke_grant", "grant_id": OPT}, "pk", today=True)   # a passkey may revoke too
     assert OPT not in after.policy.grants
+
+
+@pytest.mark.parametrize("kind", [auth.GRADUATION_KIND, auth.GRADUATION_PHONE_KIND])
+def test_a_stopped_retired_row_is_never_told_to_create_it_again(kind):
+    """A stopped policy or opt-in cannot be created again (this levain refuses both), so every surface that tells a
+    stopped grant's way back says revoke only. Red with the default words (`create it again to use it`)."""
+    from levain.consent.grants import stopped_line, way_back, ways_back
+
+    for words in (way_back(kind), stopped_line("a key was revoked", kind), ways_back([("x-1", kind)])[0][0]):
+        assert "cannot be created again" in words and "revoke it" in words, words
+        assert "create it again" not in words and "key you" not in words and "to use it" not in words, words

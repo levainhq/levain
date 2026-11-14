@@ -8133,8 +8133,9 @@
     if (sv(g.workspace)) facts.appendChild(el("span", "ext-meta", "in " + g.workspace));
     if (Array.isArray(g.postures) && g.postures.length) facts.appendChild(el("span", "ext-meta", g.postures.join(", ") + " mode"));
     // a voice key has no date: it is live until revoked, and any other state is drawn as its bare word (the head says it too)
-    // and neither has the graduation opt-in an earlier levain signed (its expires_at is "")
-    const untilText = stopped ? "" : voiceKey || !sv(g.expires_at) ? (state === "live" ? "Live until you revoke it" : state)
+    // and neither has the graduation opt-in (kind graduation-phone); a dated row of any other kind draws its date
+    const noExpiry = voiceKey || sv(g.kind) === "graduation-phone";
+    const untilText = stopped ? "" : noExpiry ? (state === "live" ? "Live until you revoke it" : state)
                                : (state === "expired" ? "expired " : "until ") + sv(g.expires_at);
     if (untilText) facts.appendChild(el("span", "ext-meta", untilText));
     facts.appendChild(el("span", "ext-meta", sv(g.kind) + " " + sv(g.id_shown)));

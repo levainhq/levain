@@ -3759,15 +3759,15 @@ def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     except _cockpit_refusals() as exc:
         print(f"grants: {exc}", file=sys.stderr)
         return 1
-    # `retired`: a graduation policy or opt-in an earlier levain signed (the binding cut of 1114), read off the same
+    # `retired`: a graduation policy or opt-in the log holds (the binding cut of 1114), read off the same
     # snapshot as the rest; this levain signs neither, so the listing names them for their revoke
     if not grants and not inert and not retired:
         print("no consent grants")
     stamp = utc_stamp(now)
     for gid, kind, expires in retired:
         state = "no expiry" if expires is None else "expired" if expires <= stamp else f"until {expires}"
-        print(f"{gid!r}  kind {kind}  {state}: signed by an earlier levain, which this levain no longer "
-              "signs: it covers nothing here (`levain consent grant revoke` removes it)")
+        print(f"{gid!r}  kind {kind}  {state}: this levain signs none, "
+              "so it covers nothing here (`levain consent grant revoke` removes it)")
     for g in grants:
         state = (stopped_line(g.stopped_why, g.kind) if g.stopped_why else
                  "expired" if g.expires_at <= stamp else f"until {g.expires_at}")
