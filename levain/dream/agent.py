@@ -903,24 +903,28 @@ def renewal_check(link: Mapping[str, Any], *, now: datetime, review_store: Any, 
 
 @dataclass
 class DrillTick:
-    action: str          # no-snapshot | not-due | ok | skipped | failed | deferred | unhandled
+    action: str          # no-snapshot | not-due | ok | failed | deferred | no-drillable | unhandled
     detail: str = ""
+
+
+#: why a drill that proved nothing is overdue, for the row's text
+_HELD_WHY = "a dream or another consolidate held the store each time it was due"
 
 
 def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None = None,
                attention: Callable[[str, str], None], resolve: Callable[[str], None] | None = None,
                drill: Callable[..., Any] | None = None, dream_running: bool = False) -> DrillTick:
     """Run the restore drill when 7 days have passed since the last one, and only while a snapshot exists. A failed
-    drill raises one attention row (F12). A drill that cannot run because a writer holds the store records nothing,
-    stays due, and raises the row only when the last recorded drill is more than two cadences old (or none exists and
-    a snapshot does). ``dream_running`` (the dream has a ``launched`` occurrence) is the same deferral, taken before the
-    drill reaches for ``wrap.lock``, so on the tick path the drill does not make the fire's lock fail ``lock-held`` (F8).
-    Known edge: a hand ``levain dream start`` in another process during the drill's store copy is not covered (the
-    guard reads the rows once, at the top of the tick). A drill whose restore step was skipped (``skipped``) is not a
-    pass: it resolves no row for a failure on the restore or open step, which stays open (and is re-raised from the
-    record if its row was lost) until a drill really restores (F10); a failure on a step the skipped drill re-proved
-    (setup, hash, copy, integrity) is resolved by it. Every outcome ``drill`` can return is handled by name; one this
-    function does not know (``unhandled``) changes no state and is reported in the returned detail."""
+    drill raises one attention row (F12). A drill that proved nothing records nothing and stays due: it is
+    ``deferred`` (a writer holds the store) or ``no-drillable`` (no snapshot holds a dream's kept saved text). Either
+    raises the row only when the last recorded drill is more than two cadences old (or none exists and the first
+    snapshot is that old); the row's text names the date and which of the two it was, and holds no count that moves
+    each day, so the feed sees one item. ``dream_running`` (the dream has a ``launched`` occurrence) is the same
+    deferral, taken before the drill reaches for ``wrap.lock``, so on the tick path the drill does not make the fire's
+    lock fail ``lock-held`` (F8). Known edge: a hand ``levain dream start`` in another process during the drill's
+    store copy is not covered (the guard reads the rows once, at the top of the tick). Every outcome ``drill`` can
+    return is handled by name; one this function does not know (``unhandled``) changes no state and is reported in the
+    returned detail."""
     run = drill or _snap.drill
     key = "dream-drill"
     ref = now or datetime.now(timezone.utc)
@@ -948,7 +952,8 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
     except OSError as exc:
         raise_row(f"the dream snapshot root cannot be read: {type(exc).__name__}: {exc}")
         return DrillTick("failed", f"snapshot root unreadable: {type(exc).__name__}")
-    if not _snap.snapshots(root):
+    snaps = _snap.snapshots(root)
+    if not snaps:
         return DrillTick("no-snapshot")
     if not _snap.drill_due(root, ref):
         # the state transition a drill owes (its row raised, or resolved) is re-derived from its record, so a callback
@@ -956,26 +961,36 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
         last = _snap.last_drill(root) or {}
         if last.get("outcome") == "failed":
             raise_row(f"the dream restore drill failed: {_snap.failed_steps_text(last.get('steps'))}")
-        elif last.get("outcome") == "skipped" and last.get("carried_failure"):
-            raise_row(f"the dream restore drill failed: {last['carried_failure']}")
         elif last.get("outcome") == "ok":
             settle()
         return DrillTick("not-due")
 
-    def defer(why: str, *, first_drill_waits: bool = False) -> DrillTick:
-        # ``first_drill_waits``: a dream's snapshot exists from its start, so a drill that has never run is not yet
-        # overdue just because that dream is still launched
+    def stamp(raw: Any) -> datetime | None:
+        try:
+            at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return at if at.tzinfo else at.astimezone()
+
+    def nothing_proved(action: str, why: str, detail: str) -> DrillTick:
+        # the row ages from the last real verdict, or from the first snapshot when no drill has ever run
         last = _snap.last_drill(root)
-        overdue = (not first_drill_waits) if last is None else _snap.drill_due(root, ref, 2 * _snap.DRILL_CADENCE_S)
-        if overdue:
-            raise_row("no dream restore drill has run in two cadences: a writer held the store each time")
-        return DrillTick("deferred", why)
+        since = stamp(last.get("at")) if last else stamp(snaps[0][1].get("taken_at"))
+        if since is None or (ref - since).total_seconds() >= 2 * _snap.DRILL_CADENCE_S:
+            where = shlex.quote(str(Path(store_path).parent))
+            if last and since is not None:
+                lead = f"the dream restore drill has not restored a snapshot since {since.date().isoformat()}"
+            elif since is not None:
+                lead = f"no dream restore drill has run since the first snapshot ({since.date().isoformat()})"
+            else:
+                lead = "no dream restore drill has run in two cadences"
+            raise_row(f"{lead} (it is due every {_snap.DRILL_CADENCE_S // 86400} days): {why}. "
+                      f"See it with: levain dream drill --store-dir {where}")
+        return DrillTick(action, detail)
 
     if dream_running:
-        return defer("a dream run is launched; the drill would take the wrap lock the fire wants",
-                     first_drill_waits=True)
-    prior = _snap.last_drill(root) or {}
-    had_failure = prior.get("outcome") == "failed" or bool(prior.get("carried_failure"))
+        return nothing_proved("deferred", _HELD_WHY,
+                              "a dream run is launched; the drill would take the wrap lock the fire wants")
     try:
         res = run(store_path, root)
     except Exception as exc:  # noqa: BLE001 - a drill that raised proved nothing
@@ -986,15 +1001,9 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
         raise_row(f"the dream restore drill failed: {bad}")
         return DrillTick("failed", bad)
     if res.outcome == "deferred":
-        return defer("")
-    if res.outcome == "skipped":
-        carried = getattr(res, "carried_failure", None)
-        if carried:
-            raise_row(f"the dream restore drill failed: {carried}")
-        elif had_failure:
-            settle()    # what the last drill found failed was setup, hash, copy or integrity, and this one just passed them
-        why = next((str(s.get("detail"))[:160] for s in res.steps if s.get("name") == "restore"), "")
-        return DrillTick("skipped", f"no restore ran: {why}")
+        return nothing_proved("deferred", _HELD_WHY, "")
+    if res.outcome == "no-drillable":
+        return nothing_proved("no-drillable", _snap.NO_DRILLABLE_WHY, _snap.NO_DRILLABLE_WHY)
     if res.outcome == "ok":
         settle()
         return DrillTick("ok")
