@@ -46,7 +46,7 @@ def _plant_open_seed(install: Path) -> str:
 
 def _backups(install: Path) -> list[Path]:
     d = install / ".levain" / Path(*BACKUP_SUBDIR)
-    return sorted(d.iterdir()) if d.is_dir() else []
+    return sorted(p for p in d.iterdir() if not p.name.startswith("loopfold-")) if d.is_dir() else []   # store copies; the loop ledgers are not
 
 
 def _hold_a_hook(monkeypatch) -> None:
