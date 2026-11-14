@@ -274,6 +274,16 @@ def show_command(store_dir: Path | str, agent: str, *, python: str) -> list[str]
     return [python, "-m", "levain", "agents", "--store-dir", str(store_dir), "show", agent, "--json"]
 
 
+def anchor_clock(rig: Any) -> None:
+    """Put the rig's clock on the wall clock (the rig's own ``now()`` adds 30 s, taken back here so ``rig.now()`` IS wall-now).
+    The rig's world starts at a fixed past instant, so the launch lease it stamps (``LEASE_S`` 900 s from there) is long
+    lapsed by real time; the fire entry judges the lease on the REAL clock (``claim_fire``: ``lease_until > now``), claims
+    nothing, and exits 0 silently with the row ``launched`` and no session ever made. Found at the 11-14 diagnosis of the
+    11-13 sitting's S06 FAIL (levain 41); ``test_the_fire_entry_claims_once_and_a_second_fire_does_nothing`` does the same."""
+    from datetime import datetime, timezone
+    rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
+
+
 def real_fire_once(cfg: S06Config) -> tuple[int, str, dict]:
     """Build the world and the occurrence, fire it, read it back. ``(fire rc, occurrence id, the show document)``."""
     profile = cfg.profile
@@ -281,6 +291,7 @@ def real_fire_once(cfg: S06Config) -> tuple[int, str, dict]:
     from tests.test_agents_launch import Rig
     cfg.world.mkdir(parents=True, mode=0o700)
     rig = Rig(cfg.world)
+    anchor_clock(rig)       # BEFORE prepare: the occurrence's link, claim and launch are all stamped from this clock
     oid, agent = prepare(rig, cfg.workspace_repo, (cfg.world / "episodes.db") if cfg.episodes else None)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in (root, PYLIB) if p)}
     fired = subprocess.run(fire_command(rig.store.directory, oid, python=profile.python), env=env, timeout=cfg.fire_timeout_s)

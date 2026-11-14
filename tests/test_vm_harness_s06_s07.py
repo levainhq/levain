@@ -829,3 +829,32 @@ def test_neither_file_names_a_private_key_path_as_a_source():
     for name in ("plan_pack", "build_pack"):
         lits = [c.value for c in ast.walk(fn[name]) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
         assert not any(".levain-sign" in v or "/keys" in v for v in lits), name
+
+
+# --- the 11-13 sitting's S06 FAIL: a fire on a lapsed lease claims nothing and exits 0 (levain 41 diagnosis) ----------------
+
+def _fire_entry_world(tmp_path, *, anchored: bool):
+    from tests.test_agents_launch import ENV, Rig
+    from levain.agents import controller as ctl
+    r = Rig(tmp_path)
+    if anchored:
+        S6.anchor_clock(r)
+    oid, _agent = S6.prepare(r, str(tmp_path), None)
+    proc = ctl.spawn_fire(r.store.directory, oid, env=ENV)
+    return r, oid, proc, proc.wait(120)
+
+
+def test_a_fire_on_the_rigs_fixed_past_clock_claims_nothing_and_exits_zero_silently(tmp_path):
+    # the reproduction: the driver as it was. The lease is stamped from the rig's past clock, the real-clock fire entry finds it
+    # lapsed, writes its identity record, claims nothing, runs no body: rc 0, the row launched with no pid, nothing printed.
+    r, oid, proc, rc = _fire_entry_world(tmp_path, anchored=False)
+    assert rc == 0
+    row = r.row(oid)
+    assert row["state"] == "launched" and row["pid"] is None
+    assert (Path(r.store.directory) / "fires" / f"{oid}.log").read_text() == ""
+
+
+def test_anchor_clock_lets_the_fire_claim_its_row(tmp_path):
+    # the fix: with the clock on the wall the same fire claims (its pid is on the row) and goes on to the run body
+    r, oid, proc, rc = _fire_entry_world(tmp_path, anchored=True)
+    assert r.row(oid)["pid"] == proc.pid
