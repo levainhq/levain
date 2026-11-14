@@ -160,3 +160,62 @@ def test_the_plan_skips_a_row_the_policy_cannot_read_instead_of_raising(tmp_path
     monkeypatch.setattr(m, "q2_past_next_policy", flaky)
     plan = m.plan_loop_migration(paths, now=NOW)
     assert ids["plain"] in plan.ids and ids["past"] in [r for r, _n, _w in plan.past_dated]
+
+
+# --- an unusable `store` field is "not this store's ledger", never a raise (L3 r3) ---
+
+@pytest.mark.parametrize("named", ["a\u0000b", "x" * 5000], ids=["nul-byte", "5000-chars"])
+def test_a_ledger_naming_an_unusable_store_is_ignored_by_the_window_and_refused_by_the_revert(tmp_path: Path, named) -> None:
+    from levain.intention_migrate import revert_loop_migration
+
+    paths, ids = _old_store(tmp_path)
+    d = tmp_path / ".levain" / Path(*BACKUP_SUBDIR)
+    d.mkdir(parents=True)
+    stray = d / f"{LEDGER_PREFIX}stray.json"
+    stray.write_text(json.dumps({"migrated": [], "prior": {}, "unmigrated": 0, "store": named}), encoding="utf-8")
+    before = paths.intentions_json.read_bytes()
+    back = revert_loop_migration(paths, stray)
+    assert back.refused and back.restored == [] and paths.intentions_json.read_bytes() == before
+    assert ids["plain"] in _migrate(paths).migrated                          # the window stayed open and the run proceeded
+
+
+# --- the revert refuses without POSIX locking before it restores or marks anything ---
+
+def test_the_revert_refuses_when_posix_locking_is_absent_and_changes_nothing(tmp_path: Path, monkeypatch) -> None:
+    import levain.intention_migrate as m
+
+    paths, ids, report = _complete_first_run(tmp_path)
+    store_before, ledger_before = paths.intentions_json.read_bytes(), report.ledger.read_bytes()
+    monkeypatch.setattr(m, "fcntl", None)
+    back = m.revert_loop_migration(paths, report.ledger)
+    assert back.refused and "file locking" in back.refused and back.restored == [] and back.ledger_error is None
+    assert paths.intentions_json.read_bytes() == store_before and report.ledger.read_bytes() == ledger_before
+    assert "reverted" not in _ledger_doc(report.ledger)
+
+
+# --- the forward path's refusals come BEFORE the no-op ledger write ---
+
+def test_a_no_op_run_without_posix_locking_refuses_and_writes_no_ledger(tmp_path: Path, monkeypatch) -> None:
+    import levain.intention_migrate as m
+
+    (tmp_path / ".levain").mkdir()
+    paths = AnnealPaths.from_db(tmp_path / ".levain" / "memory.db")
+    _store(paths).add(type="thought", text="a someday", disposition="someday")
+    monkeypatch.setattr(m, "fcntl", None)
+    report = _migrate(paths)
+    assert report.refused and report.ledger is None and _ledgers(tmp_path) == []
+
+
+def test_a_no_op_run_with_an_unusable_anneal_pin_refuses_and_writes_no_ledger(tmp_path: Path, monkeypatch) -> None:
+    import levain.intentions as intentions
+
+    (tmp_path / ".levain").mkdir()
+    paths = AnnealPaths.from_db(tmp_path / ".levain" / "memory.db")
+    _store(paths).add(type="thought", text="a someday", disposition="someday")
+
+    def _refuse(_path):
+        raise RuntimeError("anneal-memory is too old")
+
+    monkeypatch.setattr(intentions, "guarded_intention_store", _refuse)
+    report = _migrate(paths)
+    assert report.refused and report.ledger is None and _ledgers(tmp_path) == []
