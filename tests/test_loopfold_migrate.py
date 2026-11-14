@@ -232,7 +232,7 @@ def test_a_store_with_no_open_loop_is_left_untouched_and_unbacked(tmp_path: Path
     before = paths.intentions_json.read_bytes()
     report = _migrate(paths)
     assert report.count == 0 and report.backup is None and report.lines() == []
-    assert paths.intentions_json.read_bytes() == before and not (tmp_path / ".levain" / "backups").exists()
+    assert paths.intentions_json.read_bytes() == before and _backups(tmp_path) == []       # no copy; only the completed ledger is written
 
 
 def test_no_store_at_all_is_not_an_error(tmp_path: Path) -> None:
