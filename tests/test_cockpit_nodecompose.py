@@ -5,7 +5,9 @@ Real page in headless Chrome over the real kernel, the same serve the seat-messa
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
+from tests.test_cockpit_sessions import _put
 
 from tests.test_cockpit_f12b_topology_view import NARROW, _paint, _value
 from tests.test_cockpit_flip_parity import _drive, _verb_posts, needs_browser
@@ -136,6 +138,9 @@ def _seat_card(enum):
 def test_the_box_on_a_signed_verb_signs_through_the_passkey_and_the_door_applies_it_to_the_seat(tmp_path, monkeypatch):
     monkeypatch.setattr(_sign, "_compose_card", _seat_card)
     rig = _Rig(tmp_path, monkeypatch)
+    # the header lens draws only while the topology has work (levain#4: the retired loops used to give this install some); two live sessions are the work
+    for agent, sid, ago in (("claude_code", "np-s1", timedelta(minutes=3)), ("codex", "np-s2", timedelta(seconds=20))):
+        _put(tmp_path / "entity", agent, sid, str(tmp_path / "work"), ago)
     with rig.serving() as (_url, _httpd):
         out = _drive(tmp_path, f"{rig.origin}/#write_token={TOK}", [
             DESKTOP, rig.authenticator(),
