@@ -246,9 +246,11 @@ def _card(kind: str, reason: str, occ: str, *, his: list[str] | None = None) -> 
             "dedupe_key": f"dream:{occ}"}      # the remedy is added by :func:`_with_remedy`, which knows the store
 
 
-def _consolidated_card(reason: str, occ: str, occ_dir: Path) -> dict[str, Any]:
-    """The consolidated card spec, its reason followed by the sentence naming what anneal's save changed in the durable
-    section (put back or removed lines) when the post record proved it; the manifest is read as it stands."""
+def _consolidated_card(reason: str, occ: str, occ_dir: Path, res: RecoverResult | None = None) -> dict[str, Any]:
+    """The consolidated card spec. Its ``reason`` stays the constant (a consumer may match on it); the sentence naming
+    what anneal's save changed in the durable section (put back or removed lines), when the post record proved it, is
+    its ``detail``, which ``card.from_spec`` files after the reason, and a note on ``res``, which the recover verb
+    prints. The manifest is read as it stands."""
     from levain.dream import card as _cd
 
     card = _card("consolidated", reason, occ)
@@ -257,7 +259,9 @@ def _consolidated_card(reason: str, occ: str, occ_dir: Path) -> dict[str, Any]:
     except Exception:  # noqa: BLE001 - a card without the sentence is still a card
         said = ""
     if said:
-        card["reason"] = f"{reason}. {said}"
+        card["detail"] = said
+        if res is not None and said not in res.notes:
+            res.notes.append(said)
     return card
 
 
@@ -524,14 +528,17 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
         res.reason, res.settled = (COMMITTED_AFTER_STOP if stopped else COMMITTED_NOT_RECORDED), False
         return res
     res.ending, res.reason = ("stopped" if stopped else "done"), reason
-    res.card = _consolidated_card(reason, occ, occ_dir)
+    res.card = _consolidated_card(reason, occ, occ_dir, res)
     return _record(occ_dir, res)
 
 
 def _ours_by_identity(pair_id: str | None, token: Any) -> bool:
     """Is this wrap's commit identity ours: anneal's pair id starts with the first 12 of the wrap token. A row with no
-    pair id (a legacy store) is not."""
-    return bool(token and pair_id) and str(pair_id).startswith(f"{str(token)[:12]}-")
+    pair id (a legacy store) is not, nor is a token that is not a string of at least 12 characters or a pair id that
+    is not a string (a corrupt or truncated journal would otherwise shrink the prefix to almost nothing)."""
+    if not (isinstance(token, str) and len(token) >= 12 and isinstance(pair_id, str)):
+        return False
+    return pair_id.startswith(f"{token[:12]}-")
 
 
 def _durable_changes(db: Path, occ_dir: Path, wrap_id: int, composed: Any) -> dict[str, list[str]] | None:
@@ -576,7 +583,7 @@ def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverRe
                 if not (again and again.get("post_files")):
                     reason = COMMITTED_AFTER_STOP if stopped else DIED_BEFORE_CARD
                     res.ending, res.reason = ("stopped" if stopped else "done"), reason
-                    res.card = None if card_filed else _consolidated_card(reason, occ, occ_dir)
+                    res.card = None if card_filed else _consolidated_card(reason, occ, occ_dir, res)
                     res.settled = False
                     return res
             except Exception as exc:  # noqa: BLE001
@@ -585,5 +592,5 @@ def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverRe
                 return res
     reason = COMMITTED_AFTER_STOP if stopped else DIED_BEFORE_CARD
     res.ending, res.reason = ("stopped" if stopped else "done"), reason
-    res.card = None if card_filed else _consolidated_card(reason, occ, occ_dir)
+    res.card = None if card_filed else _consolidated_card(reason, occ, occ_dir, res)
     return _record(occ_dir, res)

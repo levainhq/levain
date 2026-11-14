@@ -476,7 +476,8 @@ def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, store_dir: Path |
               agent_id: str = "dream") -> Card:
     """A card from the spec recovery (``RecoverResult.card``) or a rollback (``RollbackResult.card``) returned, plus
     the occurrence's own files: the snapshot's prior text, the text the dream saved (when ``db_path`` is given) and
-    ``usage.json``. The spec's ``his`` lines (``unknown-commit``) are his. A spec with no ``remedy`` gets
+    ``usage.json``. The spec's ``his`` lines (``unknown-commit``) are his. A spec's ``detail`` (recovery's sentence of
+    the durable lines anneal's save put back or removed) is filed after its ``reason``. A spec with no ``remedy`` gets
     :func:`remedy_for`'s, carrying ``store_dir``, which is REQUIRED (no default, and no guess from ``db_path``);
     ``None`` is legal only for a spec that carries its own ``remedy``."""
     occ = Path(occ_dir)
@@ -485,6 +486,9 @@ def from_spec(spec: Mapping[str, Any], *, occ_dir: Path | str, store_dir: Path |
     if kind == "consolidated" and db_path is not None:
         prior, saved = texts_for(db_path, occ)
     reason = str(spec.get("reason") or "")
+    detail = str(spec.get("detail") or "").strip()
+    if detail:   # recovery's sentence of what anneal's save changed: filed after the reason, which stays the constant
+        reason = f"{reason.rstrip('.')}. {detail}" if reason else detail
     if kind == "rolled-back":
         reason = f"rolled back by {spec.get('who', '?')} at {spec.get('at', '?')}; restored: " \
                  f"{', '.join(spec.get('files') or []) or 'nothing'}. {spec.get('limit', '')}".strip()
