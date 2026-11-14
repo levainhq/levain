@@ -532,6 +532,14 @@ def test_b10_a_picked_key_is_asked_for_by_its_id_even_after_a_refusal(world, tmp
     record = {newer.key.fingerprint: _b64u(b"cred-new")}
     pick_newer = (f"[...{_CARD}.querySelectorAll('.sign-pick')].find(b => b.title === {json.dumps(newer.key.fingerprint)})"
                   ".click() || 1")
+    # A refusal's word is the ceremony's, not the card's: once the ceremony ends the open Decisions view is drawn again on the
+    # next board read and the card is drawn plain (dashboard_core.js revokeCeremonies: "a later redraw draws the card plain").
+    # A poll every 100 ms can fall wholly outside the window the word is on the card (reproduced: 8/20 under load), so a
+    # MutationObserver tapes every distinct word the card's note ever shows and the waits read the tape, not the live note.
+    tape = ("(() => { window.__tape = []; let last = ''; new MutationObserver(() => { const t = " + _GRANT_NOTE + " || '';"
+            " if (t && t !== last) window.__tape.push(t); last = t; })"
+            ".observe(document.body, {subtree: true, childList: true, characterData: true}); return 1; })()")
+    said = "window.__tape.find(t => /nothing was revoked|^revoked|^not revoked/.test(t))"
     with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
         rec = _Verifying(httpd.grant_phone, [older, newer])
         httpd.grant_phone = rec
@@ -540,13 +548,14 @@ def test_b10_a_picked_key_is_asked_for_by_its_id_even_after_a_refusal(world, tmp
             {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
+            {"eval": tape},
             {"tap": _REVOKE},
-            {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
-            {"eval": f"{_CARD}.querySelector('.sign-note').textContent = ''; 1"},
+            {"until": f"!!{said} && !{_REVOKE}.disabled && {said}", "ms": 30000},
+            {"eval": f"window.__tape.length = 0; {_CARD}.querySelector('.sign-note').textContent = ''; 1"},
             {"tap": _REVOKE},
             {"until": f"{_GRANT_PICKS} === 3 && 1", "ms": 30000},
             {"tap": pick_newer.replace(".click() || 1", "")},
-            {"until": f"/nothing was revoked|^revoked|^not revoked/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", "ms": 30000},
+            {"until": f"{said} || false", "ms": 30000},
         ])
     assert "the passkey did not sign (NotAllowedError); nothing was revoked" in out["values"][-1], out["values"][-1]
     asked = [r["signer_fp"] for _g, a, r in rec.steps if a == "revoke-challenge"]
