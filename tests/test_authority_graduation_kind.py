@@ -360,7 +360,7 @@ def test_the_opt_in_is_a_v2_laptop_link_naming_active_passkeys(world):
     assert world.record(snap.seq)["format"] == V2
     assert "a display-phone key cannot sign this create_grant" in world.refused(
         {"op": "create_grant", "grant": opt_in(world, "pk2", gid="gpo-ba9876543210")}, "phone")
-    assert "one graduation act per link" in world.refused(
+    assert "never another authority link" in world.refused(
         {"op": "create_grant", "grant": opt_in(world, "pk2", gid="gpo-ba9876543210")}, "pk")
     assert "at most one graduation opt-in" in world.refused(
         {"op": "create_grant", "grant": opt_in(world, "pk2", gid="gpo-ba9876543210")})
@@ -402,7 +402,7 @@ def test_a_passkey_create_is_refused_without_the_opt_in_naming_it(world):
     assert "the live graduation opt-in names it" in world.refused({"op": "create_grant", "grant": grad(world)}, "pk")
     world.link({"op": "create_grant", "grant": opt_in(world, "pk")})
     assert "the live graduation opt-in names it" in world.refused({"op": "create_grant", "grant": grad(world)}, "pk2")
-    assert "one graduation act per link" in world.refused(
+    assert "never another authority link" in world.refused(
         {"op": "create_grant", "grant": consent(world)}, "pk")
 
 
@@ -463,7 +463,7 @@ def test_every_other_passkey_act_is_refused(world):
                {"op": "raise", "verb": "intention_touch", "tier": "T3"},
                {"op": "timeouts", "timeouts": {"x": 1}},
                {"op": "revoke_key", "fingerprint": world.fp("pk2")}):
-        assert "one graduation act per link" in world.refused(op, "pk")
+        assert "never another authority link" in world.refused(op, "pk")
 
 
 # --- the format: one form per link, held by the replay ---------------------------------------------------------------

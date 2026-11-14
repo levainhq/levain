@@ -148,8 +148,6 @@ READERS: dict[str, tuple[int, str, str]] = {
         (1, "display", "`seat lease list` names the stopped lease (seat_lease.stopped_lease) when no live one reads"),
     "levain/cli.py::_cmd_seat_egress":
         (1, "display", "`seat egress list` names the stopped grant (seat_push.stopped_egress) when no live one reads"),
-    "levain/cli.py::_cmd_consent_grant_list":
-        (1, "display", "names a graduation policy or opt-in an earlier levain signed, for its revoke; it covers nothing"),
     "levain/consent/grants.py::grant_view":
         (8, "display", "the page and the phone list every grant the policy holds, each with its state "
                        "(stopped wins over expired and live), the way back of a stopped one (its kind, read raw) and "

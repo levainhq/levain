@@ -233,7 +233,7 @@ def renew_lease(cockpit_root: Path | str, lease_id: str, *, signer_fp: str, sign
 
     A renew's ``signed_at`` must equal its link's ``at``, so the link is prepared at the SAME clock reading the op
     carries, and appended at a fresh reading taken after the signature (a lease that lapsed during the touch is
-    refused), the shape of ``levain.cli._signed_append``."""
+    refused)."""
     from levain.authority import AuthorityError, VerifierUnavailable, anchor_path, append, prepare
     from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
     from levain.cockpit.consent import utc_stamp

@@ -215,13 +215,16 @@ def test_one_grant_list_is_one_snapshot(log, monkeypatch):
     g.list_grants(log.root, now=datetime.now(timezone.utc))
     g.list_inert_grants(log.root, now=datetime.now(timezone.utc))
     assert len(calls) == 2                                # each public function is one capture of its own
+    calls.clear()
+    g.grant_listing_all(log.root, now=datetime.now(timezone.utc))
+    assert len(calls) == 1                                # the retired rows come off the same capture
 
 
 def test_an_inert_grant_id_is_printed_as_a_repr(log, monkeypatch, capsys):
     from levain.consent import grants as g
-    real = g.grant_listing
-    monkeypatch.setattr("levain.consent.grants.grant_listing", lambda *a, **k: (
-        lambda c, i: (c, [("bad\x1b[31mid", *i[0][1:])]))(*real(*a, **k)))
+    real = g.grant_listing_all
+    monkeypatch.setattr("levain.consent.grants.grant_listing_all", lambda *a, **k: (
+        lambda c, i, r: (c, [("bad\x1b[31mid", *i[0][1:])], r))(*real(*a, **k)))
     assert main(["consent", "grant", "list", "--data-root", str(log.root)]) == 0
     out = capsys.readouterr().out
     assert "\x1b" not in out and "'bad\\x1b[31mid'" in out

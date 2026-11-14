@@ -481,8 +481,9 @@ _RENEW_SKEW = timedelta(minutes=10)
 # and ``store_id`` narrow what the honest engine reads (writable rows), and ``min_clean_fires`` is advisory (the
 # honest engine's walk). Its terms are fixed under its id: the one change is a renew (only a later expiry); anything
 # else is a revoke and a new id. It lasts at most GRADUATION_GRANT_MAX past its link, and a renew at most that past
-# its own. Created at the laptop (GRADUATION_CREATE_RANK), or by a passkey the live opt-in names
-# (GRADUATION_OPT_IN_RANK); renewed by any rank-2 key, a passkey included; revoked by any enrolled key.
+# its own. An earlier levain created it at the laptop (GRADUATION_CREATE_RANK), or by a passkey the live opt-in
+# names (GRADUATION_OPT_IN_RANK), and renewed it by any rank-2 key, a passkey included; this levain only replays
+# those links. Revoked by any enrolled key.
 # Its ``guard`` (autogrant DESIGN D68, D75, D83) is optional in the record, so a log signed before it replays; this
 # levain signs no policy at all now and renews none (:func:`_graduation_create_refused`); the kind replays whole.
 GRADUATION_KIND = "graduation"
@@ -1001,8 +1002,8 @@ def _graduation_names(items: Any, pattern: re.Pattern[str], where: str) -> None:
 def _validate_graduation(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
     """A graduation policy's shape (:data:`GRADUATION_KIND`). ``at``: the link's own time; the policy lasts at most
     :data:`GRADUATION_GRANT_MAX` past it. A ``guard`` is held here only to be a list of objects: what its entries
-    must say is an append rule (:func:`_graduation_guard_check`), so a replay never refuses the log over a guard's
-    contents, and a replayed policy whose guard is not one the gate can evaluate covers nothing
+    must say is no replay rule (this levain appends no policy, so no append rule judges it), so a replay never
+    refuses the log over a guard's contents, and a replayed policy whose guard is not one the gate can evaluate covers nothing
     (``levain.autonomic.coverage``)."""
     if not _GRADUATION_FIELDS <= set(grant) or set(grant) - _GRADUATION_FIELDS - _GRADUATION_OPTIONAL:
         raise AuthorityError(f"{what} (a graduation policy) must carry exactly {', '.join(sorted(_GRADUATION_FIELDS))}"
@@ -2494,8 +2495,8 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
     the phone's ceremonies is held to it."""
     op = rec["op"]
     if new_link and op in ("renew", "create_grant"):
-        raise AuthorityError(f"a {PASSKEY} key signs consent answers and grant revokes only: it no longer renews or "
-                             f"creates a graduation policy ({_GRADUATION_RETIRED})")
+        raise AuthorityError(f"a {PASSKEY} key signs consent answers and grant revokes only, never another authority link: a new "
+                             f"link of it is never a renew and never a create (of a graduation policy, {_GRADUATION_RETIRED})")
     if op in ("revoke_grant", "renew"):
         gid = rec["grant_id"]
         target = policy.grants.get(gid) if isinstance(gid, str) else None
@@ -2518,9 +2519,8 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
         if not all(passkey_revocable(g) for g in mine):
             raise AuthorityError(f"a {PASSKEY} key revokes only links of a kind that takes a passkey revoke")
         return
-    refusal = (f"a {PASSKEY} key signs consent answers and grant revokes only, never another authority link, but for "
-               "one graduation act per link: a graduation policy's renew, or, named by the live opt-in, one graduation "
-               "policy's create")
+    refusal = (f"a {PASSKEY} key signs consent answers and grant revokes only, never another authority link (a "
+               "graduation renew or create already in a log still replays)")
     if op == "create_grant":
         grant = rec["grant"]
         if not (isinstance(grant, Mapping) and grant.get("kind") == GRADUATION_KIND):
@@ -2577,7 +2577,7 @@ def _link_format(policy: StandingPolicy, rec: Mapping[str, Any], signer_custody:
     after ``policy``: :data:`FORMAT_V5` for a link that brings in a voice key, tested before every other;
     else :data:`FORMAT_V4` for a link that brings in an agent link or carries ``revoke_agent``, tested
     before the rest; else :data:`FORMAT_V3` for a link that brings in a graduation policy carrying a ``guard`` (by
-    create_grant or loosen, whoever signs it); else :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a
+    create_grant or loosen, whoever signs it: a link an earlier levain signed, since this one appends none); else :data:`FORMAT_V2` for a passkey's renew or create_grant, and for a
     link that brings in a graduation opt-in; :data:`FORMAT` for every other. :func:`prepare` writes it and the replay
     holds every link to it. A guard enters the log only by a ``/3`` link and never changes after it (a graduation
     policy's terms are fixed), so a replay that stops at ``/3`` never reads a link that carries or alters a guard.

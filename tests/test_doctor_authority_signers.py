@@ -200,15 +200,6 @@ def test_a_corrupt_authority_log_is_a_warning_not_a_healthy_signers_row(world):
     assert out[1].warn and out[1].ok and out[1].detail.startswith("could not check the authority log:")
 
 
-def test_a_file_gone_between_the_stat_and_the_read_is_the_does_not_exist_row(world, monkeypatch):
-    from levain.slot import install_helper
-
-    write_root(world, "laptop")
-    monkeypatch.setattr(install_helper, "_read_signers", lambda *a, **k: None)
-    [r] = rows(world)
-    assert r.name == "authority signers" and r.ok and not r.warn and "does not exist" in r.detail
-
-
 def test_nothing_in_the_check_can_abort_doctor(world, monkeypatch):
     write_root(world, "laptop")
     from levain.autonomic import coverage as cov

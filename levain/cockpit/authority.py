@@ -273,7 +273,7 @@ UPGRADE_ORDER_LINE = (
     "Upgrade order: the first agent link you sign is a levain-authority/4 link. From then on an OLDER levain "
     "cannot read this log: its replay refuses at that link, so its consent queue, grants, dispatch signers, chat "
     "egress keys and cockpit views each answer nothing and allow nothing (all refuse, none falls back to earlier "
-    "authority); its graduation coverage drops to none; and it can sign no link at all, a revoke included. Every "
+    "authority); and it can sign no link at all, a revoke included. Every "
     "levain process on this machine that reads this cockpit must be the new build before you sign: stop each older "
     "desk and daemon first.")
 

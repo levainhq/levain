@@ -3751,33 +3751,22 @@ def _cmd_consent_grant_revoke(args: argparse.Namespace) -> int:
 
 def _cmd_consent_grant_list(args: argparse.Namespace) -> int:
     from levain.cockpit.consent import utc_stamp
-    from levain.consent.grants import grant_listing, stopped_line
+    from levain.consent.grants import grant_listing_all, stopped_line
 
     try:
         now = _utc_now()
-        grants, inert = grant_listing(_cockpit_root(args), now=now)
+        grants, inert, retired = grant_listing_all(_cockpit_root(args), now=now)
     except _cockpit_refusals() as exc:
         print(f"grants: {exc}", file=sys.stderr)
         return 1
-    # a graduation policy or opt-in an earlier levain signed (the binding cut of 1114): neither a consent grant nor a
-    # kind this levain does not know, so the listing names them here, for their revoke (this levain signs neither)
-    from levain.authority import GRADUATION_KIND, GRADUATION_PHONE_KIND
-    from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
-    from levain.cockpit.keys import _capture, _journal, _signing_authority
-    try:
-        old_state = _signing_authority(_capture(_journal(_cockpit_root(args)), now, DEFAULT_SSH_KEYGEN))
-    except _cockpit_refusals():
-        old_state = None
-    retired = [] if old_state is None else [
-        (gid, g) for gid, g in sorted(old_state.policy.grants.items())
-        if g.get("kind") in (GRADUATION_KIND, GRADUATION_PHONE_KIND)]
+    # `retired`: a graduation policy or opt-in an earlier levain signed (the binding cut of 1114), read off the same
+    # snapshot as the rest; this levain signs neither, so the listing names them for their revoke
     if not grants and not inert and not retired:
         print("no consent grants")
     stamp = utc_stamp(now)
-    for gid, g in retired:
-        expires = g.get("expires_at")
+    for gid, kind, expires in retired:
         state = "no expiry" if expires is None else "expired" if expires <= stamp else f"until {expires}"
-        print(f"{gid!r}  kind {g['kind']}  {state}: signed by an earlier levain, which this levain no longer "
+        print(f"{gid!r}  kind {kind}  {state}: signed by an earlier levain, which this levain no longer "
               "signs: it covers nothing here (`levain consent grant revoke` removes it)")
     for g in grants:
         state = (stopped_line(g.stopped_why, g.kind) if g.stopped_why else

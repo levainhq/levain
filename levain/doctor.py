@@ -4137,8 +4137,6 @@ def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> li
                                               f"{refusal.detail}",
                                   _authority_signers_hint(host, why=f"The helper's answer is {refusal.name}."),
                                   warn=True)
-        if raw is None and problem is None and row is None:
-            row = CheckResult(name, True, f"no enrolled authority signer ({path} does not exist); {unused}")
         if raw is not None:
             keys = cov.authority_keys(cov.parse_root_signers(raw))
             if keys:

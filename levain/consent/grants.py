@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, EGRESS_KEY_KIND,
-                              HANDS_MCP_KIND, SEAT_EGRESS_KIND, SEAT_LEASE_KIND, VOICE_KEY_KIND, AuthorityError, StaleHead,
+                              GRADUATION_KIND, GRADUATION_PHONE_KIND, HANDS_MCP_KIND, SEAT_EGRESS_KIND, SEAT_LEASE_KIND, VOICE_KEY_KIND, AuthorityError, StaleHead,
                               UnsignedLink, VerifierUnavailable, anchor_path, append,
                               consent_grant, consent_grant_tool_problem, consent_resolved_workspace,
                               contained_shell_grant, grant_stop_reason, grants_stopped_by, inert_grant,
@@ -270,7 +270,7 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         state = _signing_authority(_capture(_journal(root), now, ssh_keygen))
     except KeyError_ as exc:        # no journal there, a governed root, a log that does not replay: said, not raised
         return {"root": visible(str(root)), "grants": [], "inert_note": INERT_NOTE, "note": visible(str(exc))}
-    consent, inert = _split(state)
+    consent, inert, _retired = _split(state)
     # a voice key (levain.voice.custody) is passkey-revocable too, so it is listed for its revoke; it answers no consent
     # request, so no evidence is read for it. Its row names the provider and the record id only: the keychain item the
     # record names (source, account) is not shown, and the record holds no value to show.
@@ -359,22 +359,36 @@ def grant_listing(data_root: Path | str, *, now: datetime, ssh_keygen: Path | st
                   ) -> tuple[list[ConsentGrant], list[tuple[str, str, str, int | None, str]]]:
     """``(consent grants, inert grants)`` from ONE capture and one snapshot, so a grant is in exactly one of them
     even while a link lands (two separate captures could show it twice or not at all)."""
+    return grant_listing_all(data_root, now=now, ssh_keygen=ssh_keygen, marker_directory=marker_directory)[:2]
+
+
+def grant_listing_all(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                      marker_directory: Path | None = None
+                      ) -> tuple[list[ConsentGrant], list[tuple[str, str, str, int | None, str]],
+                                 list[tuple[str, str, str | None]]]:
+    """:func:`grant_listing` plus the retired rows, ``(id, kind, expires_at or None)`` of a graduation policy or opt-in
+    an earlier levain signed: all three from the ONE capture and snapshot, so `consent grant list` never reads twice."""
     db = _journal(data_root, marker_directory=marker_directory)
     return _split(_signing_authority(_capture(db, now, ssh_keygen)))
 
 
-def _split(state: Any) -> tuple[list[ConsentGrant], list[tuple[str, str, str, int | None, str]]]:
-    """:func:`grant_listing` of one snapshot, each grant carrying why it is stopped ("" while it may answer)."""
+def _split(state: Any) -> tuple[list[ConsentGrant], list[tuple[str, str, str, int | None, str]],
+                                list[tuple[str, str, str | None]]]:
+    """:func:`grant_listing_all` of one snapshot, each grant carrying why it is stopped ("" while it may answer)."""
     consent: list[ConsentGrant] = []
     inert: list[tuple[str, str, str, int | None, str]] = []
+    retired: list[tuple[str, str, str | None]] = []
     for gid, g in sorted(state.policy.grants.items()):
+        if g.get("kind") in (GRADUATION_KIND, GRADUATION_PHONE_KIND):
+            retired.append((gid, str(g["kind"]), g.get("expires_at")))
+            continue
         link = state.grant_link(gid)
         why = grant_stop_reason(state, gid) or ""
         if consent_grant(g) or contained_shell_grant(g):
             consent.append(ConsentGrant.of(g, link, why))
         elif inert_grant(g):
             inert.append((gid, str(g["kind"]), str(g["expires_at"]), None if link is None else link[0], why))
-    return consent, inert
+    return consent, inert, retired
 
 
 # --- what a key revoke stopped (the words `levain cockpit keys revoke` adds) --------------------------------------------

@@ -32,6 +32,28 @@ def test_the_opt_in_is_refused_at_append(world):
         {"op": "create_grant", "grant": opt_in(world, "pk")}, today=True)
 
 
+def test_the_opt_in_inside_a_loosen_is_refused_at_append(world):
+    policy = world.state().policy.as_dict()
+    policy["grants"][OPT] = opt_in(world, "pk")
+    assert "the graduation opt-in is refused at sign" in world.refused({"op": "loosen", "policy": policy}, today=True)
+
+
+def test_a_passkey_loosen_carrying_a_policy_is_refused_at_append(world):
+    policy = world.state().policy.as_dict()
+    policy["grants"][GP] = grad(world)
+    assert "never another authority link" in world.refused({"op": "loosen", "policy": policy}, "pk", today=True)
+
+
+def test_an_old_policy_without_a_guard_replays_covers_nothing_new_and_is_revoked(world):
+    from tests.autonomic_test_only_coverage import NO_GUARD
+    # a policy from before the guard existed: a /1 link no append of today could write, planted
+    world.plant({"op": "create_grant", "grant": grad(world, guard=NO_GUARD)}, db=world.db)
+    state = world.state()
+    assert GP in state.policy.grants and "guard" not in state.policy.grants[GP]
+    after = world.link({"op": "revoke_grant", "grant_id": GP}, today=True)
+    assert GP not in after.policy.grants
+
+
 def test_a_graduation_renew_is_refused_at_append(world):
     world.link({"op": "create_grant", "grant": grad(world)})            # signed by an earlier levain
     assert "is not renewed" in world.refused(renew(world), today=True)
@@ -40,8 +62,8 @@ def test_a_graduation_renew_is_refused_at_append(world):
 def test_a_passkey_no_longer_renews_or_creates_a_graduation_policy(world):
     world.link({"op": "create_grant", "grant": opt_in(world, "pk")})
     world.link({"op": "create_grant", "grant": grad(world)})
-    assert "no longer renews or creates" in world.refused(renew(world), "pk", today=True)
-    assert "no longer renews or creates" in world.refused(
+    assert "never a renew and never a create" in world.refused(renew(world), "pk", today=True)
+    assert "never a renew and never a create" in world.refused(
         {"op": "create_grant", "grant": grad(world, GP2)}, "pk", today=True)
 
 
@@ -60,7 +82,7 @@ def test_the_two_kinds_must_stay_known_or_a_log_holding_an_opt_in_stops_replayin
     kinds = {k: v for k, v in auth._GRANT_KINDS.items() if k != auth.GRADUATION_PHONE_KIND}
     monkeypatch.setattr(auth, "_GRANT_KINDS", kinds)
     # an unknown kind is read as inert, whose shape needs expires_at, which the opt-in has none of
-    with pytest.raises(auth.AuthorityError):
+    with pytest.raises(auth.AuthorityError, match="grant.expires_at is not a timestamp"):
         world.state()
 
 
