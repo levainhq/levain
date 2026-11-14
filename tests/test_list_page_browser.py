@@ -240,6 +240,22 @@ _PHONE_PROBE = f"""(() => {{
 }})()"""
 
 
+# Each placeholder's text width against the room its input has. The width is measured in THIS machine's font; CI's chrome falls back to a
+# wider sans (run 43553474831: 220.25 px where this machine measures 194.77 for the same text, x1.131), so the fit must hold with a
+# FALLBACK_FONT margin, not bare.
+FALLBACK_FONT = 1.15
+
+_PH_PROBE = f"""(() => {{
+  const out = [];
+  for (const sel of ['.list-intake-input', '.ep-search-input']) {{
+    const i = {TRAY}.querySelector(sel); if (!i) continue; const cs = getComputedStyle(i); const c = document.createElement('canvas').getContext('2d');
+    c.font = cs.font;
+    out.push({{sel, w: c.measureText(i.placeholder).width, room: i.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight), ph: i.placeholder}});
+  }}
+  return JSON.stringify({{phs: out, hs: document.documentElement.scrollWidth <= window.innerWidth + 1}});
+}})()"""
+
+
 @needs_browser
 def test_the_list_fits_a_390_phone_with_real_shaped_rows(tmp_path: Path) -> None:
     root, src, _ids = _install(tmp_path)
@@ -255,12 +271,26 @@ def test_the_list_fits_a_390_phone_with_real_shaped_rows(tmp_path: Path) -> None
             {"eval": f"{TRAY}.scrollIntoView(); 1"},
             {"eval": _PHONE_PROBE},
             {"shot": str(shots / "phone_390.png")},
+            {"emulate": {"w": 360, "h": 740, "dpr": 3, "mobile": True}},      # the narrower phones
+            {"until": f"{TRAY}.querySelector('.list-intake-input').clientWidth < 300 && 1"},
+            {"eval": _PH_PROBE},
+            {"shot": str(shots / "phone_360.png")},
+            {"emulate": {"w": 1000, "h": 844, "dpr": 1}},                      # and a desktop width (the wide placeholder)
+            {"until": f"{TRAY}.querySelector('.list-intake-input').placeholder.startsWith('remind thu 3pm call X  ') && 1"},
+            {"eval": _PH_PROBE},
         ])
     got = json.loads(next(x for x in out["values"] if isinstance(x, str) and x.startswith('{"rows"')))
     assert got["over"] == [], got["over"]                              # nothing overlaps the detail line or passes the card's edge
     assert got["hs"] is True, got                                      # and the page does not scroll sideways
     for ph in got["ph"]:
-        assert ph["w"] <= ph["room"] + 0.5, ph                         # neither placeholder is cut at 390
+        assert ph["w"] * FALLBACK_FONT <= ph["room"], ph               # neither placeholder is cut at 390, even in a wider fallback font
+    probes = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"phs"')]
+    assert len(probes) == 2, probes                                    # the 360 read and the desktop read
+    for probe in probes:
+        assert probe["hs"] is True, probe                              # no sideways scroll at 360 or at desktop width
+        assert len(probe["phs"]) == 2, probe
+        for ph in probe["phs"]:
+            assert ph["w"] * FALLBACK_FONT <= ph["room"], ph           # 360 (narrow text) and 1000 (wide text) both fit
     by = {r["t"]: r for r in got["rows"]}
     desk = next(r for t, r in by.items() if t.startswith("desk:"))
     assert desk["pills"] in ([], ["desk"]), desk                       # a "desk:" row names desk or nothing, never the band's store
@@ -330,7 +360,7 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
             {"until": f"{ph}.startsWith('remind thu 3pm call X  ') && 1"},
             {"eval": f"JSON.stringify({{ph: {ph}}})"},
             {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
-            {"until": f"{ph} === 'remind thu 3pm call · ? talk' && 1"},
+            {"until": f"{ph} === 'remind thu 3pm call' && 1"},
         ])
     vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
     rows = vals[0]["rows"]
@@ -351,7 +381,7 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
         bad.append(f"B: expected exactly one media listener after the first build, got {first}")
     if after != first:
         bad.append(f"B: the media listener count grew {first} -> {after}")        # B: no listener per rebuild
-    assert vals[3]["ph"].startswith("remind thu 3pm call · "), vals[3]                 # narrow at 390
+    assert vals[3]["ph"] == "remind thu 3pm call", vals[3]                 # narrow at 390
     assert vals[4]["ph"].startswith("remind thu 3pm call X  ·  "), vals[4]               # wide again after the width change
     assert not bad, bad
 
