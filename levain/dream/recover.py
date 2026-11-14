@@ -246,6 +246,21 @@ def _card(kind: str, reason: str, occ: str, *, his: list[str] | None = None) -> 
             "dedupe_key": f"dream:{occ}"}      # the remedy is added by :func:`_with_remedy`, which knows the store
 
 
+def _consolidated_card(reason: str, occ: str, occ_dir: Path) -> dict[str, Any]:
+    """The consolidated card spec, its reason followed by the sentence naming what anneal's save changed in the durable
+    section (put back or removed lines) when the post record proved it; the manifest is read as it stands."""
+    from levain.dream import card as _cd
+
+    card = _card("consolidated", reason, occ)
+    try:
+        said = _cd.durable_sentence(occ_dir)
+    except Exception:  # noqa: BLE001 - a card without the sentence is still a card
+        said = ""
+    if said:
+        card["reason"] = f"{reason}. {said}"
+    return card
+
+
 def _record(occ_dir: Path, res: RecoverResult) -> RecoverResult:
     """Write the settled result. It is the idempotency record, so a result that could not be written, or that leaves a
     compose child not seen ended, is NOT settled: a rerun repeats the cleanup instead of returning a stale record."""
@@ -452,7 +467,18 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
         res.notes.append("no wrap token was recorded: a completed wrap is never adopted without one")
         return res
     composed = prog.get("composed_sha256")
-    ours = [w for w, h, pid in moved if _is_ours(h, pid, composed, token)]
+    changes: dict[str, list[str]] | None = None
+    ours = []
+    for w, h, pid in moved:
+        if _is_ours(h, pid, composed, token):
+            ours.append(w)
+        elif len(moved) == 1 and _ours_by_identity(pid, token):
+            # our commit identity but not the composed text: ours only if anneal's own durable-facts step on this
+            # dream's inputs reproduces the live bytes, which are the wrap's. Identity alone is never enough, nor is
+            # the proof alone; anything short of both keeps the failed ending below
+            changes = _durable_changes(db, occ_dir, w, composed)
+            if changes is not None:
+                ours.append(w)
     if len(ours) > 1:
         res.reason, res.settled = UNKNOWN_COMMIT, False
         res.card = _card("failed", UNKNOWN_COMMIT, occ, his=[
@@ -472,7 +498,7 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
     wrap_id = ours[-1]
     live = _sn.sha256_file(_sn.text_tier(db)["continuity"])
     reason = COMMITTED_AFTER_STOP if stopped else COMMITTED_NOT_RECORDED
-    if live != composed:
+    if live != composed and changes is None:
         tmps = _orphan_tmp(db)
         res.ending, res.reason = ("stopped" if stopped else "done"), reason
         res.notes.append(f"anneal committed wrap #{wrap_id} but the live continuity text is not the composed text. "
@@ -498,17 +524,34 @@ def _recover_saving(store: Any, db: Path, occ_dir: Path, prog: dict[str, Any], r
         res.reason, res.settled = (COMMITTED_AFTER_STOP if stopped else COMMITTED_NOT_RECORDED), False
         return res
     res.ending, res.reason = ("stopped" if stopped else "done"), reason
-    res.card = _card("consolidated", reason, occ)
+    res.card = _consolidated_card(reason, occ, occ_dir)
     return _record(occ_dir, res)
 
 
+def _ours_by_identity(pair_id: str | None, token: Any) -> bool:
+    """Is this wrap's commit identity ours: anneal's pair id starts with the first 12 of the wrap token. A row with no
+    pair id (a legacy store) is not."""
+    return bool(token and pair_id) and str(pair_id).startswith(f"{str(token)[:12]}-")
+
+
+def _durable_changes(db: Path, occ_dir: Path, wrap_id: int, composed: Any) -> dict[str, list[str]] | None:
+    """``snapshot.reinsertion_proof`` of the live text against this wrap, or None when there is no proof for any
+    reason (no manifest, no composed hash, a refusal, a check that could not run): None keeps the fail-closed ending."""
+    m = _sn.read_manifest(occ_dir)
+    if not (m and isinstance(composed, str) and composed):
+        return None
+    try:
+        live = _sn.sha256_file(_sn.text_tier(db)["continuity"])
+        return _sn.reinsertion_proof(db, occ_dir, m, wrap_id, composed, live)
+    except Exception:  # noqa: BLE001 - SnapshotRefused or a proof that could not run: both are "not proved"
+        return None
+
+
 def _is_ours(content_hash: str | None, pair_id: str | None, composed: Any, token: Any) -> bool:
-    """Is this completed wrap this dream's commit? Its text hash must be the composed hash, AND its commit identity must
-    be ours: anneal's pair id starts with the first 12 of the wrap token. A hash alone is never identity (another
-    writer can save the same text), so a row with no pair id (a legacy store) is not adopted either."""
-    if not (composed and content_hash == composed and token and pair_id):
-        return False
-    return str(pair_id).startswith(f"{str(token)[:12]}-")
+    """Is this completed wrap this dream's commit by the exact text? Its text hash must be the composed hash, AND its
+    commit identity must be ours. A hash alone is never identity (another writer can save the same text). A save whose
+    text anneal changed is recognised separately, by identity AND ``reinsertion_proof``, both."""
+    return bool(composed and content_hash == composed) and _ours_by_identity(pair_id, token)
 
 
 def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverResult, stopped: bool,
@@ -533,7 +576,7 @@ def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverRe
                 if not (again and again.get("post_files")):
                     reason = COMMITTED_AFTER_STOP if stopped else DIED_BEFORE_CARD
                     res.ending, res.reason = ("stopped" if stopped else "done"), reason
-                    res.card = None if card_filed else _card("consolidated", reason, occ)
+                    res.card = None if card_filed else _consolidated_card(reason, occ, occ_dir)
                     res.settled = False
                     return res
             except Exception as exc:  # noqa: BLE001
@@ -542,5 +585,5 @@ def _recover_saved(db: Path, occ_dir: Path, prog: dict[str, Any], res: RecoverRe
                 return res
     reason = COMMITTED_AFTER_STOP if stopped else DIED_BEFORE_CARD
     res.ending, res.reason = ("stopped" if stopped else "done"), reason
-    res.card = None if card_filed else _card("consolidated", reason, occ)
+    res.card = None if card_filed else _consolidated_card(reason, occ, occ_dir)
     return _record(occ_dir, res)

@@ -400,6 +400,39 @@ def build_card(kind: str, *, occurrence: str, store_dir: Path | str | None, agen
 
 # ------------------------------------------------------------------------------------------------- from the pieces
 
+#: A durable-change sentence shows this many lines, each cut to this many characters; the manifest keeps all.
+DURABLE_SHOWN_LINES = 3
+DURABLE_LINE_CHARS = 120
+_BULLET_LEAD = re.compile(r"^[ \t]*(?:[-*]|\d+\.)[ \t]+")
+
+
+def _durable_lines(lines: Sequence[Any]) -> str:
+    shown = []
+    for raw in lines[:DURABLE_SHOWN_LINES]:
+        one = " / ".join(part.strip() for part in str(raw).split("\n") if part.strip())
+        one = _BULLET_LEAD.sub("", one)
+        shown.append(one if len(one) <= DURABLE_LINE_CHARS else one[:DURABLE_LINE_CHARS - 1] + "…")
+    more = len(lines) - len(shown)
+    return "; ".join(shown) + (f"; and {more} more" if more > 0 else "")
+
+
+def durable_sentence(occ_dir: Path | str) -> str:
+    """Plain sentences for a consolidated card when the save put back durable lines the compose left out or removed
+    lines through drop markers (the snapshot manifest's ``reinserted`` and ``dropped``, recorded only after the post
+    record proved them anneal's); else "". The run's own card words these the same way (a test holds the two equal)."""
+    from levain.dream import snapshot as sn
+
+    m = sn.read_manifest(Path(occ_dir)) or {}
+    out = []
+    for key, what in (("reinserted", "put back {n} line{s} the compose left out"),
+                      ("dropped", "removed {n} line{s} through drop markers")):
+        lines = m.get(key) or []
+        if isinstance(lines, list) and lines:
+            n = len(lines)
+            out.append(f"The save {what.format(n=n, s='s' if n != 1 else '')}: {_durable_lines(lines)}.")
+    return " ".join(out)
+
+
 def texts_for(db_path: Path | str, occ_dir: Path | str) -> tuple[str, str]:
     """``(prior, saved)`` continuity text of one dream: the snapshot's copy, and the text the dream saved. The saved
     text is the occurrence's own ``composed.continuity.md`` when its sha256 is the one the manifest recorded after the
