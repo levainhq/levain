@@ -26,7 +26,7 @@ TOP_MAX = 80
 
 def memory_glance_reader(view: Callable[[Any], Any]) -> Callable[[Any], Result]:
     """``read(ctx)`` over the cycle's substrate view (``view(ctx)``): the store's episode counts and the open
-    intentions (the List's own and Open loops), with the first open loop named."""
+    intentions (the List's), with the first of them named."""
     def read(ctx: Any) -> Result:
         v = view(ctx)
         for k in ("store", "health"):
@@ -45,10 +45,10 @@ def memory_glance_reader(view: Callable[[Any], Any]) -> Callable[[Any], Result]:
         if "open_intentions" in v.errors:
             out["note"] = "open intentions unreadable"
         else:
-            # a parked loop is dormant by design (TS-5a: it shows in Open loops, marked): not live cognition
-            live = [s for s in v.open_intentions if s.tier != "parked"]
-            numbers.append({"label": "open intentions", "value": len(v.tray) + len(live), "unit": None})
-            top = (v.tray or live or [None])[0]
+            # a parked intention is dormant by design: it stays on the List, marked, and is not live cognition
+            live = [s for s in v.tray if s.tier != "parked"]
+            numbers.append({"label": "open intentions", "value": len(live), "unit": None})
+            top = (live or [None])[0]
             if top is not None:
                 text = " ".join(str(top.text).split())
                 out["top"] = text if len(text) <= TOP_MAX else text[:TOP_MAX - 1] + "…"

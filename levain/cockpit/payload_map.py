@@ -30,13 +30,13 @@ def _add(payload: str, disposition: str, target: str, literal: bool, *patterns: 
 B = "board"
 _add(B, "map", "manifest generated_at", True, "generated")
 _add(B, "map", "manifest errors entry with the count", True, "skipped")
-_add(B, "map", "panel status/error", True, "decisions.ok", "loops.ok", "tray.ok")
+_add(B, "map", "panel status/error", True, "decisions.ok", "tray.ok")
 _add(B, "map", "decisions panel rows: title / Row.id / facets repo,seat,stopped / due", True,
      "decisions.items[].what", "decisions.items[].id", "decisions.items[].repo",
      "decisions.items[].seat", "decisions.items[].stopped", "decisions.items[].dated")
 _add(B, "map", "at (decisions row)", True, "decisions.items[].ts")
 _add(B, "drop", "same instant as ts / fold state", True, "decisions.items[].iso", "decisions.items[].event")
-for panel in ("loops", "tray"):
+for panel in ("tray",):
     _add(B, "map", f"{panel} panel Row.id / title / body / truncated", True,
          f"{panel}.items[].id", f"{panel}.items[].title", f"{panel}.items[].body", f"{panel}.items[].truncated")
     _add(B, "map", f"{panel} row facets of the same name", True,
@@ -53,7 +53,7 @@ _add(S, "map", "regions.zones[].panels + PanelHead", True,
 _add(S, "map", "Row.id / title / body / facets (open_intentions, tray rows)", True,
      "open_intentions[].type", "open_intentions[].salience", "open_intentions[].text",
      "tray[].type", "tray[].salience", "tray[].text")
-_add(S, "map", "intention row facets / Row.id of the tray and loops panels", False,
+_add(S, "map", "intention row facets / Row.id of the tray panel", False,
      *(f"{b}[].{f}" for b in ("open_intentions", "tray")
        for f in ("id", "tier", "domain", "disposition", "next", "seen", "pointer")))
 _add(S, "drop", "derived from the intention type by anneal; verbs and their kinds arrive with K2a's registry", False,
