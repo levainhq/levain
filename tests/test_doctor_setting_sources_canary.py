@@ -428,8 +428,7 @@ def test_only_a_complete_post_to_the_model_endpoint_is_the_anchor():
 def test_the_verdict_table_is_pinned_both_sides(tmp_path):
     """Row 1719a changed this row's verdict for a readable, differing version from WARN to OK-with-a-note when the live
     probe held; a caller gating on the warn flag sees that. Pin both sides of the change in one place."""
-    pin = host_guard.SETTING_SOURCES_MEASURED_VERSION
-    older = ".".join(map(str, (pin[0], pin[1], pin[2] - 1)))
+    older = "0.0.1"          # below any pin, so a re-pin to an X.Y.0 release cannot make it unreadable
     held, _ = _row(tmp_path, older, "held")
     assert held.ok and not held.warn and "older than" in held.detail and "probe re-run holds" in held.detail
     for version, verdict in ((None, "held"), (older, "inconclusive"), (None, "inconclusive")):
