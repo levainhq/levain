@@ -45,7 +45,6 @@ from levain.tui import (
     build_config_edit_req,
     build_descend_req,
     build_seed_req,
-    build_set_disposition_req,
     build_intention_update_req,
     build_state_edit_req,
     build_surface_at_req,
@@ -263,8 +262,8 @@ def _active_verbs(model: TuiModel) -> list[Verb]:
         verbs = [v for v in verbs if v.kind != "intention_close"]
     if not getattr(row, "ascend_kinds", None):
         verbs = [v for v in verbs if v.kind != "intention_promote"]
-    if kind == "intentions" and getattr(row, "tier", None) == PARKED_TIER:
-        verbs = [Verb("p", "[p] un-park", "intention_unpark") if v.kind == "intention_park" else v for v in verbs]
+    if getattr(row, "tier", None) != PARKED_TIER:
+        verbs = [v for v in verbs if v.kind != "intention_unpark"]  # un-park is offered only on a parked row
     if kind == "tray" and getattr(row, "disposition", None) == "note":
         verbs = [v for v in verbs if v.kind != "intention_reclassify"]
     return verbs
@@ -405,13 +404,6 @@ def _handle_verb(
         return _apply(model, source, build_intention_update_req(s.id, intention_type=chosen),
                       f"reclassified {s.id} → {chosen}")
 
-    if kind == "intention_metabolize":  # Tray seed → live cognition loop (gain direction, no confirm)
-        s = current_row(model)
-        if s is None:
-            return replace(model, status="no item selected")
-        return _apply(model, source, build_set_disposition_req(s.id, "loop", expect_disposition=s.disposition),
-                      f"metabolized {s.id} → loop")
-
     if kind == "intention_schedule":  # surface_at on a loop/Tray item ('-' clears the alarm)
         s = current_row(model)
         if s is None:
@@ -425,18 +417,7 @@ def _handle_verb(
         ok = f"cleared schedule on {s.id}" if value == "" else f"scheduled {s.id} → {date}"
         return _apply(model, source, build_surface_at_req(s.id, value), ok)
 
-    if kind == "intention_park":  # pin a loop dormant (hide from cognition, stays open, shown parked)
-        s = current_row(model)
-        if s is None:
-            return replace(model, status="no loop selected")
-        # CAS the snapshot (intention-173): park is offered only on a loop; the snapshot rides the
-        # tier update so a concurrent re-route before the write fails closed (not tier-parks a note).
-        return _apply(model, source,
-                      build_intention_update_req(s.id, tier="parked", expect_disposition=s.disposition,
-                                             expected_version=intention_view_version(s)),
-                      f"parked {s.id}")
-
-    if kind == "intention_unpark":  # a parked Open loop → back into active cognition
+    if kind == "intention_unpark":  # a parked List row → back to warm
         s = current_row(model)
         if s is None:
             return replace(model, status="no item selected")
@@ -840,10 +821,8 @@ _HELP_LINES = [
     "",
     "  verbs (only where the SELECTED panel + row affords them)",
     "    config / sections   e            edit a Class-A input ($EDITOR): State / world.md",
-    "    Open Loops          t e s p d a  touch · edit · schedule · park (un-park on a parked",
-    "                                     loop) · descend · ascend",
-    "    List (inbox)        n e c m s d  new-dump · edit · re(c)lassify · metabolize→loop ·",
-    "                                     schedule · dismiss",
+    "    List                n e c s p d  new-dump · edit · re(c)lassify · schedule ·",
+    "                                     un-park (a parked row only) · dismiss",
     "    Episodes / Edits    x · u        tombstone an episode · undo a Class-A file edit",
     "    n (new-dump) works on an EMPTY List too — it's a panel-level capture.",
     "",

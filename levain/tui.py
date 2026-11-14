@@ -46,6 +46,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from levain.intentions import PARKED_TIER
 from levain.dashboard import (
     CLASS_A,
     CLASS_B,
@@ -72,7 +73,6 @@ __all__ = [
     "select_panel",
     "move_in_panel",
     "with_view",
-    "current_intention",
     "current_row",
     "current_episode",
     "current_edit_record",
@@ -113,8 +113,8 @@ ZONES: tuple[tuple[str, str], ...] = (
 # including the Class-C crystals/wraps lists — is a text panel that scrolls as one
 # body (no verb, so no cursor needed). Tray + Keep joined the list when their
 # Class-B operator-I/O verbs landed (the curses peer of the web's Slice-3b verbs).
-# There is no Keep list: a parked loop is an Open loops row, a legacy note a Tray row.
-_LIST_KINDS = frozenset({"intentions", "tray", "episodes", "edits"})
+# There is one intention list, the List (the "tray" panel): a parked someday and a legacy note are List rows.
+_LIST_KINDS = frozenset({"tray", "episodes", "edits"})
 
 # Audit-record kinds that are NOT file-undoable — verb-mediated lifecycle ops
 # whose reversibility is anneal's, not this layer's. Mirrors writes._VERB_KINDS
@@ -182,11 +182,9 @@ def panels_for_zone(view: SubstrateView, zone: str) -> list[dict[str, Any]]:
 
 def panel_item_count(view: SubstrateView, panel: dict[str, Any]) -> int:
     """How many SELECTABLE rows a panel has — only the verb-navigable list panels
-    (intentions/episodes/edits); 0 for a text/scroll panel (incl. crystals/wraps, which
+    (tray/episodes/edits); 0 for a text/scroll panel (incl. crystals/wraps, which
     render rich and scroll but carry no per-item verb)."""
     kind = panel.get("kind")
-    if kind == "intentions":
-        return len(view.open_intentions)
     if kind == "tray":
         return len(view.tray)
     if kind == "episodes":
@@ -249,12 +247,11 @@ def panel_verbs(panel: dict[str, Any] | None, *, read_only: bool = False) -> lis
     web's Slice-3b verb affordances. A Class-C panel offers none (glass). Class-A
     config/section panels offer ``[e]dit``. The Class-B operator-I/O panels:
 
-    - **Open Loops** (intentions): touch / edit-text / schedule / park / descend / ascend.
-    - **Tray** (operator inbox): new-dump (panel-level) / edit / reclassify / metabolize
-      (→ loop) / schedule / dismiss.
-    There is no Keep panel (TS-5a): a parked loop is an Open Loops row whose ``[p]ark``
-    becomes ``un-park`` (``_active_verbs`` shapes it by the selected row), and a legacy note
-    is a Tray row.
+    - **List** (tray, the one intention list): new-dump (panel-level) / edit / reclassify /
+      schedule / dismiss, plus ``[p] un-park`` on a parked row (``_active_verbs`` keeps it
+      only on a row whose tier is parked).
+    There is no Open Loops panel and no Keep panel: a parked someday and a legacy note are
+    List rows.
 
     Episodes offer tombstone; the edits panel offers ``[u]ndo`` of a file-undoable
     record. Returns ``[]`` for a panel that affords nothing — the footer then shows
@@ -276,22 +273,13 @@ def panel_verbs(panel: dict[str, Any] | None, *, read_only: bool = False) -> lis
     # that mistagged a panel can't leak a mutation key — codex/kimi L3).
     if edit_class == CLASS_A and kind in {"config", "section"}:
         return [Verb("e", "[e]dit", "edit")]
-    if kind == "intentions" and edit_class == CLASS_B:  # the entity's live cognition loops
-        return [
-            Verb("t", "[t]ouch", "intention_touch"),
-            Verb("e", "[e]dit", "plain_intention_edit"),
-            Verb("s", "[s]chedule", "intention_schedule"),
-            Verb("p", "[p]ark", "intention_park"),
-            Verb("d", "[d]escend", "intention_close", destructive=True, needs_kind=True),
-            Verb("a", "[a]scend", "intention_promote", destructive=True, needs_kind=True),
-        ]
     if kind == "tray" and edit_class == CLASS_B:  # the operator session-I/O inbox
         return [
             Verb("n", "[n]ew", "intention_capture", row_scoped=False),
             Verb("e", "[e]dit", "plain_intention_edit"),
             Verb("c", "re[c]lassify", "intention_reclassify"),
-            Verb("m", "[m]etabolize", "intention_metabolize"),
             Verb("s", "[s]chedule", "intention_schedule"),
+            Verb("p", "[p] un-park", "intention_unpark"),
             Verb("d", "[d]ismiss", "intention_close", destructive=True, needs_kind=True),
         ]
     if kind == "episodes" and edit_class == CLASS_B:
@@ -479,8 +467,6 @@ def render_panel_lines(view: SubstrateView, panel: dict[str, Any]) -> list[str]:
         return _render_config(view, panel)
     if kind == "section":
         return _render_section(view, panel)
-    if kind == "intentions":
-        return _render_intentions(view)
     if kind == "tray":
         return _render_tray(view)
     if kind == "episodes":
@@ -520,26 +506,6 @@ def _render_section(view: SubstrateView, panel: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _render_intentions(view: SubstrateView) -> list[str]:
-    """ONE line per loop (the item cursor maps 1:1 to a line). The resolve-kinds
-    surface in the descend/ascend picker at verb time, not the scan view."""
-    # Honesty floor (no_data != no_event): an intention-store fault is recorded under the
-    # single "open_intentions" key (the ONE read fills all three projections). Surface it
-    # as DEGRADED — never a false "(no open loops)" over an unreadable store [the web
-    # path already does this via tierErr; the TUI must match].
-    err = view.errors.get("open_intentions")
-    if err:
-        return [f"(unavailable — {err})"]
-    if not view.open_intentions:
-        return ["(no open loops)"]
-    return [
-        f"[{s.tier}·{s.salience}] {_oneline(s.text)}"
-        + (f" → {_oneline(s.next)}" if s.next else "")
-        + f"  · {s.id}"
-        for s in view.open_intentions
-    ]
-
-
 def _render_tray(view: SubstrateView) -> list[str]:
     """ONE line per Tray item — the operator session-I/O inbox, badged by disposition
     (seed/handoff/agenda). Read-only display in 3a (the governed dump/sort verbs are 3b)."""
@@ -549,7 +515,7 @@ def _render_tray(view: SubstrateView) -> list[str]:
     if not view.tray:
         return ["(List clear)"]
     return [
-        f"[{s.disposition}] {_oneline(s.text)}"
+        f"[{s.disposition}{'·parked' if s.tier == PARKED_TIER else ''}] {_oneline(s.text)}"
         + (f" → surface {_oneline(s.next)}" if s.next else "")
         + f"  · {s.id}"
         for s in view.tray
@@ -711,33 +677,16 @@ def with_view(model: TuiModel, view: SubstrateView, status: str = "") -> TuiMode
     return replace(new, item_idx=item_idx)
 
 
-def current_intention(model: TuiModel) -> Any | None:
-    """The selected OPEN-LOOP row specifically (the intentions panel only). The driver uses
-    the broader ``current_row`` (which spans Open Loops / Tray); ``current_intention``
-    remains the narrower public accessor for an intentions-panel-only consumer."""
-    panel = model.current_panel()
-    if panel is None or panel.get("kind") != "intentions":
-        return None
-    if model.item_idx >= len(model.view.open_intentions):
-        return None
-    return model.view.open_intentions[model.item_idx]
-
-
 def current_row(model: TuiModel) -> Any | None:
-    """The selected intention-like item for whichever of the TWO intention projections is
-    active — Open Loops (``view.open_intentions``) or Tray (``view.tray``). Each maps the item
-    cursor 1:1 onto its own list, so the shared lifecycle verbs (touch/edit/descend/…) act
-    on the right row across both. Returns ``None`` off an intention panel or past the list end."""
+    """The selected List row (``view.tray``): the cursor maps 1:1 onto it, so the lifecycle
+    verbs (touch/edit/descend/…) act on the right row. ``None`` off the List or past the end."""
     panel = model.current_panel()
     if panel is None:
         return None
     kind = panel.get("kind")
     if not isinstance(kind, str):
         return None
-    src = {
-        "intentions": model.view.open_intentions,
-        "tray": model.view.tray,
-    }.get(kind)
+    src = model.view.tray if kind == "tray" else None
     if src is None or model.item_idx >= len(src):
         return None
     return src[model.item_idx]
