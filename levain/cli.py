@@ -321,7 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read-only glance at the substrate from outside a session.",
         description=(
             "Render the install's anneal substrate — memory health, the "
-            "association graph, crystallized patterns, open loops, and the "
+            "association graph, crystallized patterns, the List, and the "
             "State / Active Threads narrative — without opening a Claude Code "
             "or Codex session. Read-only: acts on nothing. --json emits the "
             "machine-readable SubstrateView (the shape the v2 MCP-App control-"

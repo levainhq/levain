@@ -180,8 +180,8 @@ def build_app(paths: AnnealPaths, *, name: str = "Levain substrate") -> "FastMCP
         description=(
             "Render this partnership entity's whole anneal substrate — memory "
             "health (has the store committed a wrap, and when was the last?), the "
-            "association graph, the crystallized-pattern index, open prospective "
-            "loops (intentions), and the State / Active-Threads narrative — as an "
+            "association graph, the crystallized-pattern index, the intentions "
+            "on the List, and the State / Active-Threads narrative — as an "
             "in-host dashboard. Read-only: it inspects, it never changes anything."
         ),
         meta=_ui_resource_meta(),
