@@ -265,7 +265,7 @@ const send = (method, params = {}) => new Promise((res, rej) => {
 await send("Page.enable"); await send("Network.enable");
 for (const m of ["Runtime.enable", "Log.enable", "Inspector.enable"]) { try { await Promise.race([send(m), sleep(3000)]); } catch {} }   // console capture is best-effort: never a reason to fail a drive
 await send("Page.navigate", { url });
-const values = [];
+const values = [], repressed = [];
 // an act-until re-run's own result key, and whether a `do` source parses as one expression (compiled here in node, never run)
 const GUARD_KEY = "__pageDriveGuard";
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
@@ -523,42 +523,51 @@ for (const s of steps) {
       await shotOnTimeout(steps.indexOf(s));
       done(1); await sleep(10000);
     }
-    const press = async ([x, y]) => {
+    // `n` presses at the one point, back to back (`times`: a double tap on a control the first press may disable; a re-press is one)
+    const press = async ([x, y], n) => {
       await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-      // `times`: that many presses at the one point, back to back (a double tap on a control the first press may disable)
-      for (let i = 0; i < (s.times || 1); i++) {
+      for (let i = 0; i < n; i++) {
         await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
         await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
       }
     };
-    await press(xy);
-    // "until": the tap's effect is the step's assertion. A press whose node a repaint replaced between its two halves is lost without a
-    // word (no click is made), so the condition is polled every 100 ms and the element is pressed AGAIN every `every` ms (default 1500)
-    // while it is false, until the deadline, which FAILS as a wait does (or collects {"timeout"} with "may_timeout"). The condition's value
-    // is collected in place of the 1. Only for a press that is safe to repeat (one whose effect the condition shows, and a second press of it
-    // is refused or does nothing)
+    await press(xy, s.times || 1);
+    // "until": the tap's effect is the step's assertion, polled every 100 ms and collected in place of the 1, with its own deadline
+    // that starts after the press (the find above has its own). A press whose node a repaint replaced between its two halves is lost
+    // without a word (no click is made); "retry_if" is the page's own statement that the press WAS lost (the ceremony it starts has
+    // neither begun nor ended). While it is true the element is pressed AGAIN, once, every `every` ms (default 1500); the condition is
+    // checked in the same page evaluation that resolves the target, so a press is never made on a check that has gone stale. Without
+    // "retry_if" nothing is re-pressed. A press that did land and failed is never retried: the wait runs to its deadline, which FAILS as
+    // a wait does (or collects {"timeout"} with "may_timeout") and prints the page's "report" expression, the product's own text. Every
+    // re-press is counted on stderr and in the output's "repressed" (step, count) list, so a masked failure shows
     if (s.until !== undefined) {
-      const every = s.every || 1500;
-      let v = null, nextPress = Date.now() + every, lastError = null;
+      const every = s.every || 1500, n = steps.indexOf(s), untilDeadline = Date.now() + waitMs;
+      const slice = () => Math.min(Math.max(untilDeadline - Date.now(), 250), 3000);
+      const guarded = s.retry_if === undefined ? null :
+        `(() => { try { if (!(${s.retry_if}\n)) return null; } catch (e) { return null; } return (${at}); })()`;
+      let v = null, nextPress = Date.now() + every, lastError = null, k = 0;
       for (;;) {
-        const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, Math.min(Math.max(deadline - Date.now(), 250), 3000));
+        const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, slice());
         if ("error" in o) lastError = o.error; else if (o.value) { v = o.value; break; }
-        if (Date.now() >= deadline) break;
-        if (Date.now() >= nextPress) {
+        if (Date.now() >= untilDeadline) break;
+        if (guarded && Date.now() >= nextPress) {
           nextPress = Date.now() + every;
-          const r = await evaluateOutcome(at, Math.min(Math.max(deadline - Date.now(), 250), 3000));
-          if (!("error" in r) && r.value) await press(r.value);
+          const r = await evaluateOutcome(guarded, slice());
+          if (!("error" in r) && r.value && Date.now() < untilDeadline) { await press(r.value, 1); k++; }
         }
         await sleep(100);
       }
+      if (k) { console.error(`step ${n}: re-pressed ${k} times`); repressed.push([n, k]); }
       if (!v && !s.may_timeout) {
-        console.error(`step ${steps.indexOf(s)}: until never came true within ${waitMs}ms after the tap: ${s.until}` + (lastError ? ` (last error: ${lastError})` : ""));
-        await shotOnTimeout(steps.indexOf(s));
+        let said = "";
+        if (s.report !== undefined) { const rp = await evaluateOutcome(s.report, 3000); said = " (page says: " + JSON.stringify("error" in rp ? "error " + rp.error : rp.value) + ")"; }
+        console.error(`step ${n}: until never came true within ${waitMs}ms after the tap: ${s.until}` + (lastError ? ` (last error: ${lastError})` : "") + said);
+        await shotOnTimeout(n);
         done(1); await sleep(10000);
       }
       tapResult = v || { timeout: s.until };
     }
-    // `after` runs once right after the presses (a confirm the press drew), and its value is not collected
+    // `after` runs once the presses are made and, with an `until`, once its wait has ended (not right after the first press); its value is not collected
     if (s.after !== undefined) {
       const a = await evaluateOutcome(s.after);
       if ("error" in a) {
@@ -711,5 +720,5 @@ for (const s of steps) {
     values.push("error" in o ? { error: o.error } : o.value);
   }
 }
-process.stdout.write(JSON.stringify({ values, posts, dialogs }));
+process.stdout.write(JSON.stringify({ values, posts, dialogs, repressed }));
 ws.close(); done(0);

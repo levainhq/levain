@@ -554,8 +554,20 @@ def test_b10_a_picked_key_is_asked_for_by_its_id_even_after_a_refusal(world, tmp
     assert not [s for s in rec.steps if s[1] == "revoke"], rec.steps        # the OS's list never signed with the other key
 
 
-_HOLD_GET = ("(() => { window.__getCalled = false; navigator.credentials.get = () => new Promise((_ok, no) => {"
-             " window.__getCalled = true; window.__release = () => no(new DOMException('declined', 'NotAllowedError')); }); return 1; })()")
+_HOLD_GET = ("(() => { window.__getCalls = 0; navigator.credentials.get = () => new Promise((_ok, no) => {"
+             " window.__getCalls = (window.__getCalls | 0) + 1; window.__release = () => no(new DOMException('declined', 'NotAllowedError')); }); return 1; })()")
+
+# The Revoke tap of b11/b12: the page's own board reads can split a press (a lost press makes no click), so it is pressed again, but
+# ONLY while the ceremony has neither begun (the stub's call count is 0) nor ended (the grant note is still empty); a ceremony that
+# ran and failed ("nothing was revoked", a 5xx) is never pressed again and fails the wait with the card's own text. The retry's
+# count is in the run's output, and the test asserts it stayed small
+_TAP_UNTIL = {"until": "window.__getCalls >= 1 && 1", "retry_if": f"!(window.__getCalls >= 1) && !{_GRANT_NOTE}",
+              "report": _GRANT_NOTE, "ms": 30000}
+
+
+def _few_repressed(out) -> None:
+    n = sum(k for _step, k in out["repressed"])
+    assert n <= 3, out["repressed"]               # a masked failure (a press that kept being lost) shows here
 
 
 @needs_browser
@@ -578,8 +590,9 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
             {"eval": _HOLD_GET},
-            {"eval": f"window.__tapped = {_CARD}; 1"},
-            {"tap": _REVOKE, "until": "window.__getCalled === true && 1", "ms": 30000},
+            # the card the ceremony runs on is taken once the stub's get has been called (the card whose Revoke started the prompt),
+            # never before the tap: a repaint during the tap would leave a card that is off the page already
+            {"tap": _REVOKE, **{**_TAP_UNTIL, "until": f"window.__getCalls >= 1 && (window.__tapped = {_CARD}) && 1"}},
             # a board read (Sync) while the prompt is up: the card is replaced, and the one the tap was on is off the page. The card's
             # lock is read in the same evaluation that sees the replacement (a read of the page's own may land between two steps)
             {"do": "document.querySelector('#refresh').click(); 1",
@@ -593,12 +606,15 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
             {"do": "document.querySelector('#refresh').click(); 1",
              "until": f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
             {"eval": _GRANT_NOTE},
+            {"eval": "window.__getCalls"},
         ])
     v = out["values"]
-    assert v[-7] == "locked", v[-7]                 # the card drawn mid-ceremony is locked, as the tapped one was
-    assert "the passkey did not sign (NotAllowedError); nothing was revoked" in v[-5], v[-5]
-    assert "sign-bad" in v[-4], v[-4]
-    assert v[-1] == "", v[-1]                       # the redraw after the ceremony ended does not repaint its word
+    assert v[-8] == "locked", v[-8]                 # the card drawn mid-ceremony is locked, as the tapped one was
+    assert "the passkey did not sign (NotAllowedError); nothing was revoked" in v[-6], v[-6]
+    assert "sign-bad" in v[-5], v[-5]
+    assert v[-2] == "", v[-2]                       # the redraw after the ceremony ended does not repaint its word
+    assert v[-1] == 1, v[-1]                        # one ceremony: the re-press never started a second get
+    _few_repressed(out)
     assert not [s for s in rec.steps if s[1] == "revoke"], rec.steps
 
 
@@ -627,7 +643,7 @@ def test_b12_a_tap_refused_because_another_ceremony_holds_the_passkey_is_said_on
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && !!{_CARD2} && !!{_REVOKE2} && 1"},
             {"eval": _HOLD_GET},
-            {"tap": _REVOKE, "until": "window.__getCalled === true && 1", "ms": 30000},
+            {"tap": _REVOKE, **_TAP_UNTIL},
             {"tap": _REVOKE2},
             {"until": f"/already being asked for/.test({_GRANT_NOTE2}) && {_GRANT_NOTE2}", "ms": 30000},
             {"eval": "window.__release(); 1"},
@@ -637,11 +653,14 @@ def test_b12_a_tap_refused_because_another_ceremony_holds_the_passkey_is_said_on
              "until": f"!!{_CARD2} && {_CARD2} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
             {"eval": _GRANT_NOTE2},
             {"eval": f"{_REVOKE2}.disabled"},
+            {"eval": "window.__getCalls"},
         ])
     v = out["values"]
-    assert "a signature is already being asked for" in v[-7], v[-7]
-    assert v[-2] == "", v[-2]                       # the refused tap's word was never kept for B
-    assert v[-1] is False, v[-1]
+    assert "a signature is already being asked for" in v[-8], v[-8]
+    assert v[-3] == "", v[-3]                       # the refused tap's word was never kept for B
+    assert v[-2] is False, v[-2]
+    assert v[-1] == 1, v[-1]                        # one ceremony: B's refused tap and the re-press never reached get
+    _few_repressed(out)
     assert [(g, a) for g, a, _r in rec.steps] == [(GID, "revoke-challenge")], rec.steps   # B's tap sent nothing
 
 
