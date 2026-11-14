@@ -78,9 +78,6 @@ def test_the_removed_keep_ordering_id_still_resolves_to_the_loops_ordering() -> 
     assert ORDERINGS["intention.keep"].key is ORDERINGS["intention.loops"].key
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "needs loop fold S4b: this reads the TUI's Open loops panel, which the substrate layout no longer emits, and the TUI offers "
-    "no un-park on a List row yet; S4b re-points the test at the List row and removes this mark."))
 def test_the_tui_unpark_is_bound_to_the_version_it_rendered(tmp_path: Path) -> None:
     # TS-5a L3 MED (codex): the TUI un-park CASed only the disposition, so a tier changed elsewhere
     # (parked -> hot) was overwritten with warm and reported "reactivated". It is version-bound now.
@@ -92,9 +89,9 @@ def test_the_tui_unpark_is_bound_to_the_version_it_rendered(tmp_path: Path) -> N
     model = tui.TuiModel(view=view, zone_idx=0, panel_idx=0, read_only=False)
     for zi, (zone, _l) in enumerate(tui.ZONES):
         for pi, p in enumerate(tui.panels_for_zone(view, zone)):
-            if p.get("kind") == "intentions":
+            if p.get("kind") == "tray":
                 model = replace(model, zone_idx=zi, panel_idx=pi)
-    idx = next(i for i, s in enumerate(view.open_intentions) if s.id == ids["parked"])
+    idx = next(i for i, s in enumerate(view.tray) if s.id == ids["parked"])
     model = replace(model, item_idx=idx)
     IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").update(ids["parked"], tier="hot")   # another process moved it
     out = _tui_curses._handle_verb(None, model, src, tui.Verb("p", "[p] un-park", "intention_unpark"))
