@@ -468,16 +468,17 @@ MEMORY_LOAD_SEED: tuple[str, ...] = ("memory_workflow.md",)
 # summary FAILS rather than quietly emitting a bare pointer.
 ON_DEMAND_SUMMARY: dict[str, str] = {
     "intention_instructions.md": (
-        "**Your open loops are a real layer of your mind** — prospective memory, "
+        "**Your intentions are a real layer of your mind** — prospective memory, "
         "the sibling of anneal-memory. Your memory holds what happened and never "
         "completes; an intention holds what is OPEN and must close. Plant one with "
-        "`intention_add` the moment a loop opens, rather than carrying it in your head "
-        "or burying it in your continuity. Every intention resolves exactly one of two "
-        "ways: `intention_close` (it composted) or `intention_promote` (it grew into "
-        "memory or work). An intention that never resolves is a leak. **Read this file "
-        "before you plant, resolve, or reason about an open loop** — it holds the "
-        "typed lifecycle, the germination surface, and the ascend membrane into "
-        "your retrospective memory."
+        "`intention_add` the moment it opens, rather than carrying it in your head "
+        "or burying it in your continuity; it lands as a someday on your operator's "
+        "List. A return on a date is `levain ask --on`. Every intention resolves "
+        "exactly one of two ways: `intention_close` (it composted) or "
+        "`intention_promote` (it grew into memory or work). An intention that never "
+        "resolves is a leak. **Read this file before you plant, resolve, or reason "
+        "about an intention** — it holds the typed lifecycle, how an intention ages, "
+        "and the ascend membrane into your retrospective memory."
     ),
     "memory_workflow.md": (
         "**Every session ends with a wrap: `prepare_wrap` -> compress -> "

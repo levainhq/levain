@@ -330,6 +330,15 @@ def test_nothing_that_is_not_the_disposition_word_changed_in_those_files(both_in
             assert "spores" not in b.lower().replace("spores_json", ""), rel
             assert a.count("seed/") == b.count("seed/"), rel
             continue
+        # The same fold (levain#4, S3) rewrote the seed doctrine (and one sentence of seed/memory.md, which no longer says
+        # a hook surfaces intentions): the "Germination ... By collision" section and the
+        # "promote it to an open `loop`" line went, and the intention is now a someday on the List. That rewrite has no
+        # rename word in it either, so the line-level rule cannot hold for this one file. What survives is the retired
+        # noun staying out of the new copy and every `seed/` path surviving (checked below).
+        if rel in DOC_RENAME.values() or rel == "seed/memory.md":
+            assert "spore" not in b.lower(), rel
+            assert a.count("seed/") == b.count("seed/"), rel
+            continue
         # The germinate-trigger helper gained a feature after the old release (row 178, the split: an agenda that waits on an
         # event), which is ADDED code with no rename word in it. For that one file the rename guard is therefore on what the
         # old release wrote: every line the old copy had and the new one lost must be about the rename (or be the
