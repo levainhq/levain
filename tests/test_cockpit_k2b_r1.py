@@ -37,7 +37,7 @@ def _spy_held(monkeypatch):
 
 
 def _row(rig):
-    return next((p, r) for p in ("loops", "tray", "keep") for r in (rig.ck.panel(p)["rows"] or []))
+    return next((p, r) for p in ("tray",) for r in (rig.ck.panel(p)["rows"] or []))
 
 
 def test_dispatch_tiers_on_the_snapshots_date_not_a_second_clock_read(rig_broker, monkeypatch) -> None:
