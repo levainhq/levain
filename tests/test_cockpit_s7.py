@@ -76,6 +76,20 @@ def test_where_to_begin_does_not_offer_an_undated_or_a_parked_someday():
     assert [ln["label"] for ln in mixed["lines"]] == ["set"] and "threads" not in mixed
 
 
+def test_a_parked_row_never_leads_where_to_begin_whatever_its_date_or_disposition():
+    # L3 S2 r1 (codex + deepseek MED): a parked row is in the tray since the fold, so the late/due path must skip it too
+    for disposition in ("agenda", "someday", "handoff"):
+        for nxt in ((TODAY - timedelta(days=1)).isoformat(), TODAY.isoformat(), (TODAY + timedelta(days=1)).isoformat()):
+            got = _begin(tray=[_sp("intention-p", "dormant", tier="parked", disposition=disposition, nxt=nxt)])
+            assert [ln["label"] for ln in got["lines"]] == ["set"], (disposition, nxt)
+            beside = _begin(tray=[_sp("intention-p", "dormant", tier="parked", disposition=disposition, nxt=nxt),
+                                  _due("intention-d", "due today")])
+            assert [(ln["label"], ln["text"]) for ln in beside["lines"]] == [("first", "due today")], (disposition, nxt)
+    # an undated parked handoff inside its claim does not lead either
+    got = _begin(tray=[_sp("intention-p", "dormant", tier="parked", disposition="handoff", seen=TODAY.isoformat())])
+    assert [ln["label"] for ln in got["lines"]] == ["set"]
+
+
 def test_where_to_begin_with_nothing_has_one_empty_line_and_no_threads():
     got = _begin()
     assert got["headline"] == "Nothing set for today yet" and "threads" not in got and "overnight" not in got
