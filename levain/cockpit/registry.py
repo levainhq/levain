@@ -254,6 +254,9 @@ class Ordering:
     groups: tuple[tuple[str, str], ...] = ()
     urgent: frozenset[str] = frozenset()
     uncounted: frozenset[str] = frozenset()
+    # a row-level exception inside a counted group: a finished row (its ``facets`` and ``group``) this returns True for is
+    # carried and listed but not counted, as an uncounted group's rows are
+    uncounted_row: Callable[[dict[str, Any]], bool] | None = None
 
 
 KERNEL_PREFIXES = frozenset({"intention", "time", "decision", "exposure", "crystal", "legacy"})
@@ -389,6 +392,15 @@ def _queue_group(row: RowIn, today: date) -> str:
     if row.id.startswith(OUTCOME_ROW_PREFIX):
         return "outcomes"
     return "open"
+
+
+def _desk_owed_question(row: dict[str, Any]) -> bool:
+    """An open question the desk alone owes is not waiting on him: the footer's NEEDS YOU rule, which
+    ``band_view.desk_owed`` states once. A row with no section facet is his, as it is there."""
+    from levain.band_view import desk_owed
+    f = row.get("facets") or {}
+    return (str(row.get("id", "")).startswith(QUESTION_ROW_PREFIX) and f.get("question_state") == "open"
+            and desk_owed(f.get("question_section"), f.get("question_carried")))
 
 
 def _queue_key(row: RowIn, today: date) -> tuple:
@@ -544,6 +556,7 @@ register_ordering(
          ("notes", "Notes for you"), ("later", "Later"), ("resolved", "Resolved"), ("outcomes", "Outcomes")),
         # a note waits on nothing: it never counts as a decision waiting on him
         uncounted=frozenset({"notes", "later", "resolved", "outcomes"}),
+        uncounted_row=_desk_owed_question,
     ),
     builtin=True,
 )
@@ -595,8 +608,10 @@ register_ordering(Ordering("legacy.source", lambda row, today: ()), builtin=True
 def counted_rows(order: str | None, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The rows of ``rows`` (finished rows, each with its ``group``) outside the ordering's uncounted
     groups: what ``count``, ``empty`` and the ``now`` view see (K2b-3b §3)."""
-    uncounted = ORDERINGS[order].uncounted if order in ORDERINGS else frozenset()
-    return [r for r in rows if r.get("group") not in uncounted] if uncounted else list(rows)
+    o = ORDERINGS.get(order) if order else None
+    uncounted = o.uncounted if o else frozenset()
+    skip = o.uncounted_row if o else None
+    return [r for r in rows if r.get("group") not in uncounted and not (skip and skip(r))]
 
 
 def apply_ordering(name: str, rows: list[RowIn], today: date) -> list[tuple[RowIn, str | None]]:
