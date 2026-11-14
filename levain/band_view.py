@@ -635,11 +635,12 @@ def _idents(store: QuestionStore, keys: Collection[tuple[str, str]]) -> dict[tup
 
 
 def _number_tx(store: QuestionStore, refs: list[Any], deadline: float, gone: Collection[tuple[str, str]] = (),
-               verify: Sequence[ClosedNotice] = ()
+               verify: Sequence[ClosedNotice] = (), read: Collection[tuple[str, str]] = ()
                ) -> tuple[dict[Any, int], dict[tuple[str, str], tuple[int, int]], list[ClosedNotice] | None]:
-    """:func:`_number`, and from the same write: ``{(source, ref): (n, life)}`` of every ref, and which of ``verify``
-    still name their row after this write's retirements (:func:`_current_notices`). Busy past the deadline:
-    ``({}, {}, None)`` (nothing written, so nothing retired by this call)."""
+    """:func:`_number`, and from the same write: ``{(source, ref): (n, life)}`` of every ref and of every ``read`` key
+    that has a row (F2: the lives :func:`_settle`'s own snapshot could not read), and which of ``verify`` still name
+    their row after this write's retirements (:func:`_current_notices`). Busy past the deadline: ``({}, {}, None)``
+    (nothing written, so nothing retired by this call)."""
     try:
         # no question was ever filed here: the store is set up for the first number, inside the same deadline
         store.ready_by(deadline)
@@ -670,6 +671,12 @@ def _number_tx(store: QuestionStore, refs: list[Any], deadline: float, gone: Col
                                        (source, ref)).fetchone()
                 got[key] = row[0]
                 idents[(source, ref)] = (int(row[0]), int(row[1]))
+            for key in dict.fromkeys(read):      # F2: the lives a busy snapshot could not read, read under this lock
+                if key not in idents:
+                    row = conn.execute("SELECT n, COALESCE(life, 0) FROM band_items WHERE source = ? AND ref = ?",
+                                       key).fetchone()
+                    if row is not None:
+                        idents[key] = (int(row[0]), int(row[1]))
             return got, idents, _current_notices(conn, verify)
     except sqlite3.OperationalError as exc:
         if _busy(exc):
@@ -756,9 +763,12 @@ def release(store: QuestionStore, source: str, refs: Sequence[str], *, deadline:
         raise
 
 
-def _host_numbers(store: QuestionStore, ns: set[int]) -> set[int] | None:
+def _host_numbers(store: QuestionStore, ns: set[int], view: View | None = None) -> set[int] | None:
     """Which of ``ns`` are allocated to ``host`` (one read-only snapshot; absent store or table: none). ``None``: the
-    read failed (a held lock past the read bound, an I/O error), so whose numbers they are is not known."""
+    read failed (a held lock past the read bound, an I/O error), so whose numbers they are is not known.
+    F1 (codex MED, L3 on the re-cut): with ``view``, a number that view SHOWED and whose life is not the one it recorded
+    (:func:`_stale`: it was another item then, reissued to the host since) is not counted as the host's: the view saw
+    it as a Levain item, so a reply typed against that view is refused, never dropped as another surface's."""
     if not ns:
         return set()
     try:
@@ -772,6 +782,8 @@ def _host_numbers(store: QuestionStore, ns: set[int]) -> set[int] | None:
                 part = todo[i:i + 500]
                 got.update(r[0] for r in conn.execute("SELECT n FROM band_items WHERE source = 'host' AND n IN "
                                                       f"({','.join('?' * len(part))})", part))
+            if view is not None and got:
+                got -= _stale(conn, got & set(view.open_list), _view_lives(view))
             return got
     except sqlite3.Error:
         return None
@@ -897,12 +909,16 @@ def _settle(store: QuestionStore, keys: list[tuple[str, str]], numbers: dict[str
     BAND-FIX2 (deepseek MED 2): when the questions' lives could not be read at all (a busy or failing snapshot), the
     last element is ``None``, UNKNOWN, never ``{}`` (an empty KNOWN mapping would make the view call every number it
     showed reissued): the view then records no lives (:func:`_stale`'s rule for that: stale only for a number ever
-    retired), and the questions' ``closed`` notices, which need their life, wait for the next render (never lost)."""
+    retired), and the questions' ``closed`` notices, which need their life, wait for the next render (never lost).
+    F2 (gemini MED, L3 on the re-cut): "could not be read" means by this render at all. A render that numbers something
+    reads every question's life inside that write (:func:`_number_tx` ``read``), so a number the write just issued is
+    never recorded with lives unknown and refused as reissued; a render with no write reads the snapshot once more."""
     idents: dict[tuple[str, str], tuple[int, int]] = {}
     known = True
+    qkeys = [k for k in keys if k[0] == "question"] + [("question", r) for _, r in closed]
     if not _foreign(store):
         try:
-            idents.update(_idents(store, [k for k in keys if k[0] == "question"] + [("question", r) for _, r in closed]))
+            idents.update(_idents(store, qkeys))
         except sqlite3.Error:
             known = False
     idents.update(extra_idents)
@@ -910,13 +926,23 @@ def _settle(store: QuestionStore, keys: list[tuple[str, str]], numbers: dict[str
                if idents.get(("question", r), (None,))[0] == n]
     notices.extend(extra_closed)
     if new and numbering:
+        # F2 (gemini MED): a busy life read above does not cost the lives: the write reads them under its own lock
         got, fresh, verified = _number_tx(store, [k[1] if k[0] == "question" else k for k in new], deadline, gone,
-                                          notices)
+                                          notices, read=() if known else qkeys)
         numbers = {**numbers, **{k: v for k, v in got.items() if isinstance(k, str)}}
         extra_numbers = {**extra_numbers, **{k: v for k, v in got.items() if isinstance(k, tuple)}}
         idents.update(fresh)
         if verified is not None:              # the write may have retired a number whose notice was read above
             notices = verified
+            known = True                      # the write ran: every question's life was read under its lock
+    if not known:
+        # F2: no write read them: the snapshot is tried once more (a retry, never a wrong "reissued" refusal); busy
+        # again, the lives stay UNKNOWN (None), never a partial set
+        try:
+            idents.update(_idents(store, qkeys))
+            known = True
+        except sqlite3.Error:
+            pass
     return numbers, extra_numbers, sorted(notices), (idents if known else None)
 
 
@@ -1232,7 +1258,7 @@ def _plan_on(store: QuestionStore, view: View | None, text: str
     infos = {n: _info_of(q) for n, q in questions.items()}
     infos.update({n: _info_of_extra(e) for n, e in extras.items()})
     plan = parse(text, view, infos, _store_id_of(store))
-    plan = _without_host(store, plan, text)
+    plan = _without_host(store, plan, text, view)
     if unknown and any(r.n in unknown for r in plan.refused):
         plan = dataclasses.replace(plan, refused=tuple(
             Refusal(r.n, f"{r.n}: its source could not be read just now, so Levain cannot tell it is still open; "
@@ -1245,14 +1271,15 @@ _HOST_PROBE = View(0, (), "")        # a view nothing is open in: parse names ev
 _ABOUT_THE_NUMBER = ("was filed after the band you saw", "was not open in the band you saw")   # what a host number gets
 
 
-def _without_host(store: QuestionStore, plan: Parse, text: str) -> Parse:
+def _without_host(store: QuestionStore, plan: Parse, text: str, view: View | None = None) -> Parse:
     """TERMSIGN L3: a number allocated to ``host`` belongs to another surface's footer, so the parse drops its refusal
     without a word; nothing is left to say and nothing recorded: the prompt is no band answer (parse's own ``rest`` and
     ``hint`` are kept).
 
     Parse's early exits (no band shown to this viewer, a band from another store) refuse the line as a whole, with no
     number. For those the line is parsed once more against an empty view to learn the numbers it typed: a line that
-    named only host numbers, and no sweep, is silent too."""
+    named only host numbers, and no sweep, is silent too. ``view`` (the view the line was parsed against): a number it
+    showed as a Levain item that the host holds now (reissued since) keeps its refusal (F1, :func:`_host_numbers`)."""
     if not plan.refused:
         return plan
     named = {r.n for r in plan.refused if r.n is not None}
@@ -1263,7 +1290,9 @@ def _without_host(store: QuestionStore, plan: Parse, text: str) -> Parse:
             whole = {r.n for r in probe.refused if r.n is not None}
     if not (named or whole):
         return plan
-    host = _host_numbers(store, named | whole)           # the one read this adds, and only when something was refused
+    # the one read this adds, and only when something was refused; a number ``view`` showed as another item, reissued
+    # to the host since, is not the host's for this line (F1: its refusal stays)
+    host = _host_numbers(store, named | whole, view)
     if host is None:
         # Unknown is not "none": reading every number as Levain's would resurrect the wrong refusal ("filed after",
         # "no band was shown") at exactly the moment the store is busy. Say instead what is true, and record nothing.
