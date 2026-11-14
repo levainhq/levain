@@ -442,6 +442,52 @@ def test_no_file_filed_nothing_and_a_root_tree_without_the_verb_is_said_once(qdi
     assert len(said) == 1 and "predates read-allow" in said[0]
 
 
+def test_a_not_retained_refusal_after_a_retained_end_is_said_once_as_expected(qdir):
+    from levain.slot import Refused
+
+    seen = []
+
+    def gone(*a, **k):
+        seen.append(k)
+        raise Refused("not-retained:absent", "S9")
+
+    s, said = _ending_supervisor(qdir, gone)
+    s._file_allow_rows("S9")
+    assert len(said) == 1 and "expected end of a retained run" in said[0] and "root refused" not in said[0]
+    assert "not-retained" in seen[0]["hush"]
+
+
+def test_helper_hushes_only_the_named_refusal_echo(qdir):
+    from levain.slot import Refused
+
+    class _P:
+        stdin = stdout = stderr = None
+
+        def poll(self):
+            return 0
+
+    def run(refusal, hush):
+        seams = sup.Seams(host="linux", helper=("x",), client_factory=lambda p: None, control_socket=Path("/x"),
+                          store=Path("/x"), base_map=Path("/x"), allow_dir=qdir, spawn=lambda argv, **kw: _P())
+        said = []
+        s = sup.Supervisor.__new__(sup.Supervisor)
+        s.s, s.say = seams, said.append
+        s._lease_fds = lambda: ()
+        line = b'{"ok":false,"refused":"%s"}\n' % refusal.encode()
+
+        def drive(p, verb, data, err, stoppable):
+            err.extend(b"levain runtime-helper: refused %s: 'S9'\n" % refusal.encode())
+            return bytearray(line)
+        s._drive = drive
+        with pytest.raises(Refused):
+            s.helper("read-allow", "S9", stdin=None, hush=hush)
+        return said
+
+    assert run("not-retained:absent", ("not-retained",)) == []
+    assert len(run("not-retained:absent", ())) == 1
+    assert len(run("allow-unreadable", ("not-retained",))) == 1
+
+
 def test_a_refused_or_malformed_read_is_said_and_files_nothing(qdir):
     from levain.slot import Refused
 

@@ -1390,12 +1390,14 @@ class Supervisor:
         if self.stop_signal is not None:
             raise Refused("stopped", signal.Signals(self.stop_signal).name)
 
-    def helper(self, *args: str, stdin: Optional[bytes] = b"", stoppable: bool = True) -> Dict[str, object]:
+    def helper(self, *args: str, stdin: Optional[bytes] = b"", stoppable: bool = True,
+               hush: Tuple[str, ...] = ()) -> Dict[str, object]:
         """One verb off the pty: stdin (``None``: ``/dev/null``) and stdout are pipes, stderr is read and shown
         escaped (root's refusal detail may quote a slot-made name). The pipes are driven in a bounded select loop that also watches the wake pipe:
         a stop signal (``stoppable``; for teardown, which runs AFTER the first stop, only a later one) or the verb's
         :attr:`Seams.helper_deadline_s` ends the helper (TERM, then KILL, reaped) and refuses ``stopped`` /
-        ``helper-timeout``. An OS failure to run or talk to it is ``helper-unrunnable``, never a traceback."""
+        ``helper-timeout``. An OS failure to run or talk to it is ``helper-unrunnable``, never a traceback. A root refusal whose name starts with one of ``hush`` is not echoed from stderr: the caller
+        says it once, in its own words."""
         verb = args[0]
         argv = [*self.s.helper, *args]                                                  # type: ignore[misc]
         err = bytearray()
@@ -1419,11 +1421,22 @@ class Supervisor:
                             f.close()
                         except OSError:
                             pass
-        finally:
-            for line in err.decode("utf-8", "replace").splitlines()[-5:]:
-                if line.strip():
-                    self.say("  " + line.strip())
-        return parse_helper_line(bytes(out), verb)
+        except BaseException:
+            self._echo_helper_err(err)
+            raise
+        try:
+            answer = parse_helper_line(bytes(out), verb)
+        except Refused as e:
+            if not (hush and e.name.startswith(hush)):
+                self._echo_helper_err(err)
+            raise
+        self._echo_helper_err(err)
+        return answer
+
+    def _echo_helper_err(self, err: bytearray) -> None:
+        for line in err.decode("utf-8", "replace").splitlines()[-5:]:
+            if line.strip():
+                self.say("  " + line.strip())
 
     def _drive(self, p: "subprocess.Popen[bytes]", verb: str, data: bytes, err: bytearray,
                stoppable: bool) -> bytearray:
@@ -1717,8 +1730,14 @@ class Supervisor:
         from levain.slot.slot_allow import AllowRefused
 
         try:
-            out = self.helper("read-allow", session, stdin=None, stoppable=False)
+            out = self.helper("read-allow", session, stdin=None, stoppable=False, hush=("not-retained",))
         except Refused as e:
+            if e.name.startswith("not-retained"):
+                # the read follows an `ended RETAINED` line: root holding no retained clone to read from is how a
+                # retained run ends, not a second failure
+                self.say("no slot allow rules to read: root keeps no retained clone of this session to read them "
+                         "from (the expected end of a retained run, not a second failure)")
+                return None
             if e.name == "unknown-verb" or e.name.startswith("verb-unbuilt"):
                 if not getattr(self, "_allow_old_root_said", False):
                     self._allow_old_root_said = True

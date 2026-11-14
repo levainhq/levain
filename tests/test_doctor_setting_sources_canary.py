@@ -366,6 +366,16 @@ def test_a_different_version_reruns_the_probe_and_says_so(tmp_path):
     assert calls == ["/x/claude"] and row.ok and row.warn and "9.9.9" in row.detail and "measured" in row.detail
 
 
+def test_the_row_says_which_side_moved(tmp_path):
+    pin = host_guard.SETTING_SOURCES_MEASURED_VERSION
+    newer = ".".join(map(str, pin[:2] + (pin[2] + 4,)))
+    older = ".".join(map(str, pin[:2] + (pin[2] - 1,)))
+    row, _ = _row(tmp_path, newer)
+    assert row.warn and "newer than" in row.detail and "levain's pin has not moved" in row.detail, row.detail
+    row, _ = _row(tmp_path, older)
+    assert row.warn and "older than" in row.detail and "levain's pin" in row.detail, row.detail
+
+
 def test_a_leak_on_a_new_version_fails(tmp_path):
     row, _ = _row(tmp_path, "9.9.9", "leaked")
     assert not row.ok and "9.9.9" in row.detail

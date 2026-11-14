@@ -5553,7 +5553,11 @@ def _check_setting_sources(*, claude_bin: str | None = None, version: str | None
                                 "Run `claude --version`.", warn=True)]
     else:
         seen = ".".join(map(str, parsed))
-        where = f"Claude Code {seen}; the empty source list was measured on {measured}"
+        side = "newer" if parsed > measured_t else "older"
+        moved = ("the vendor moved ahead of levain's pin; levain's pin has not moved" if parsed > measured_t
+                 else "the installed vendor is behind levain's pin")
+        where = (f"Claude Code {seen} is {side} than {measured}, the version the empty source list was measured on "
+                 f"({moved})")
         if res.verdict == "held":
             return [CheckResult(name, True, f"{where}; the probe re-run holds ({res.detail})",
                                 f"Set SETTING_SOURCES_MEASURED_VERSION in levain/host_guard.py to {seen} once "
