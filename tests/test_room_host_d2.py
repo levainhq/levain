@@ -53,12 +53,6 @@ elif mode == "note":
 """
 
 
-@pytest.fixture(autouse=True)
-def fresh_note_budget(monkeypatch):
-    """Each test starts with no notes counted against any launch (the count lives in the door's process)."""
-    monkeypatch.setattr(room_mcp, "_notes_sent", {}, raising=False)
-
-
 @pytest.fixture
 def host(tmp_path):
     script = tmp_path / "fake_desk.py"
@@ -476,29 +470,20 @@ def test_a_words_key_on_the_note_tool_points_at_note_not_at_quote_ids(host, worl
     assert "quote_ids" in msg, msg
 
 
-def test_a_room_launch_files_at_most_its_hourly_notes(host, world, monkeypatch):
-    """L3 r1 (complement MED): the host's own note budget is per SOURCE and shared with its other chat surfaces (flow: 6
-    an hour, with flowConnect), so a room seat in a loop could spend all of it. The door files at most NOTE_PER_HOUR
-    for one launch in any rolling hour and refuses the next, clearly, before the command runs."""
-    clock = [1000.0]
-    monkeypatch.setattr(room_mcp, "_clock", lambda: clock[0], raising=False)
-    for i in range(room_mcp.NOTE_PER_HOUR):
+def test_the_door_never_limits_how_many_notes_a_launch_files(host, world):
+    """Phill 11-14: a channel whose purpose is to funnel what the seat finds to the desk is not limited by the door. A
+    launch files a dozen notes in a row and every one reaches the host's command."""
+    for i in range(12):
         assert note_call(world["launch"], host, {"note": f"note {i}"})["result"]["isError"] is False
-    r = note_call(world["launch"], host, {"note": "one too many"})
-    text = r["result"]["content"][0]["text"]
-    assert r["result"]["isError"] is True and "no note was filed" in text and "hour" in text, text
-    assert "attempted" in text and "has filed" not in text, text       # an attempt that failed may not have filed (L1 F4)
-    assert len(recs(host)) == room_mcp.NOTE_PER_HOUR
-    clock[0] += 3600.5
-    assert note_call(world["launch"], host, {"note": "an hour on"})["result"]["isError"] is False
-    assert room_mcp.NOTE_PER_HOUR == 3
+    assert len(recs(host)) == 12
+    assert not hasattr(room_mcp, "NOTE_PER_HOUR")
 
 
-def test_a_note_that_never_started_spends_none_of_the_budget(host, world):
+def test_a_note_that_never_started_is_reported_not_filed(host, world):
     gone = HostCommands(note=("/nonexistent/prog",))
-    for _ in range(room_mcp.NOTE_PER_HOUR + 1):
+    for _ in range(4):
         assert "not filed" in note_call(world["launch"], gone, {"note": "x"})["result"]["content"][0]["text"]
-    for i in range(room_mcp.NOTE_PER_HOUR):
+    for i in range(3):
         assert note_call(world["launch"], host, {"note": f"n{i}"})["result"]["isError"] is False
 
 
@@ -797,12 +782,12 @@ def test_notes_that_could_not_get_a_lifeline_spend_none_of_the_budget(host, worl
 
     with monkeypatch.context() as m:
         m.setattr(room_host.os, "pipe", no_fds)
-        for _ in range(room_mcp.NOTE_PER_HOUR + 1):
+        for _ in range(4):
             r = note_call(world["launch"], host, {"note": "x"})
             assert "not filed, nothing was delivered" in json.dumps(r), r
-    for i in range(room_mcp.NOTE_PER_HOUR):
+    for i in range(3):
         assert note_call(world["launch"], host, {"note": f"n{i}"})["result"]["isError"] is False
-    assert len(recs(host)) == room_mcp.NOTE_PER_HOUR
+    assert len(recs(host)) == 3
 
 
 # --- containment: the argv, the probe, the digest ---------------------------------------------------------------------
