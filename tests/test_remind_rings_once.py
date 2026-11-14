@@ -144,3 +144,18 @@ def test_a_repeating_reminder_rings_once_per_occurrence_and_a_retry_of_one_rings
     assert two["ref"] != one["ref"] and two["pinged"] and len(pings) == 2
     assert _tick(path, qdir, second + timedelta(minutes=1))["due"] == [] and len(pings) == 2
     assert len(QuestionStore(qdir).recent(100)) == 2
+
+
+def test_a_rung_file_that_is_not_utf8_reads_as_empty_and_the_reminder_still_rings(tmp_path, qdir, pings):
+    """An unreadable rung file repeats a ring rather than losing it: the reminder is filed, pinged and stamped."""
+    (qdir / g._RUNG_FILE).write_bytes(b"\xff\xfe\x00bad")
+    path, _ = _reminder(tmp_path, DUE.strftime("%Y-%m-%dT%H:%M"))
+    out = _tick(path, qdir, DUE + timedelta(minutes=1))
+    assert out["errors"] == [] and len(pings) == 1 and out["due"][0]["done"]
+
+
+def test_a_torn_rung_line_does_not_glue_to_the_next_id(qdir):
+    """A write torn before its newline leaves an id with none; the next mark must start its own line."""
+    (qdir / g._RUNG_FILE).write_text("q-aaaa", encoding="utf-8")
+    g._mark_rung(qdir, "q-bbbb")
+    assert "q-bbbb" in g._rung_ids(qdir)

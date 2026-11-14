@@ -10,9 +10,10 @@ is due from that minute; an agenda with no ``next`` is never due) it does, in or
    (``germinate_rung.txt`` in the queue dir records the ones that did), so a ping that failed (returned False or raised)
    leaves the intention open and due and the next run retries it (``ping_failed`` in the result, non-zero exit); only a
    ping that went out is followed by the stamp. A stamp that is lost after the ping (an edit between the read and the
-   stamp) leaves the intention due, and the next run finds the held row already rung and does not ring it again. Only a
-   crash between the ping and its mark pings again on the re-run (at-least-once: a lost nudge is the failure this
-   exists to prevent), still into the ONE row;
+   stamp) leaves the intention due, and the next run finds the held row already rung and does not ring it again. A second
+   ring is still possible in two cases: a crash between the ping and its mark, and a mark that fails with an OS error
+   followed by a lost stamp; both ping again on the re-run (at-least-once: a lost nudge is the failure this exists to
+   prevent), still into the ONE row;
 4. ``board:<repo>`` / ``desk``: a desk drop (``outbox_id`` derived from the intention, words always checked against
    the intention as it is now), or, with no desk store that can take a drop (``desk_present``), the band
    filing with the reason in ``blocks``. ``desk`` files the intention's words verbatim and uncut (an intention too long for a
@@ -126,18 +127,18 @@ _RUNG_FILE = "germinate_rung.txt"
 def _rung_ids(qdir: Path) -> set[str]:
     """The ids of the rows a nudge ping has already gone out for (one id per line). A held row that is in this set is not
     pinged again when its stamp was lost (an edit between the read and the stamp), so that retry files nothing and rings
-    nothing; a ping that FAILED is never in it, so the retry still rings. Unreadable reads as empty (a ring is repeated
-    rather than lost)."""
+    nothing; a ping that FAILED is never in it, so the retry still rings. Unreadable (an OS error, or bytes that are not
+    UTF-8) reads as empty (a ring is repeated rather than lost)."""
     try:
         return set((qdir / _RUNG_FILE).read_text(encoding="utf-8").split())
-    except OSError:
+    except (OSError, ValueError):
         return set()
 
 
 def _mark_rung(qdir: Path, qid: str) -> None:
     try:
         with open(qdir / _RUNG_FILE, "a", encoding="utf-8") as fh:
-            fh.write(qid + "\n")
+            fh.write("\n" + qid + "\n")     # the leading newline keeps a torn earlier line from gluing to this id
     except OSError:
         pass            # the ring went out; a lost mark can only repeat it, which is the at-least-once side
 
