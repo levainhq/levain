@@ -258,7 +258,9 @@ def _backup(store_path: Path, dest_dir: Path, when: datetime) -> Path:
 # on the List). A resolved record is never addressed (anneal cannot edit one).
 #
 # The run's ledger, ``<store dir>/backups/intentions/loopfold-<UTC>.json``, lists the migrated ids and what each held before
-# (``prior``: null for an absent key), so the rewrite can be undone row by row (:func:`revert_loop_migration`), or all at once
+# (``prior``: null for an absent key), the store it was written for and how many rows the run left unmigrated. Once a ledger
+# with none unmigrated exists, a later run leaves a KEY-ABSENT row alone (the entity's own add writes one; it reads as someday
+# already) and rewrites only a row that carries a literal ``loop`` or an empty / null disposition key; so the rewrite can be undone row by row (:func:`revert_loop_migration`), or all at once
 # by restoring the backup copy, which also discards every write made since.
 
 LEDGER_PREFIX = "loopfold-"
@@ -291,6 +293,7 @@ def _has_passed(value: Any, now: datetime) -> bool:
     when = _parse_when(value)
     if when is None:
         return False
+    now = _local_now(now)                        # one naive local basis, whatever zone the caller's clock carries
     return now >= when if is_timed(value) else when.date() < now.date()
 
 
@@ -301,10 +304,33 @@ def _local_now(now: datetime | None) -> datetime:
     return now.astimezone().replace(tzinfo=None) if now.tzinfo is not None else now
 
 
-def _classify_open_loops(store_path: Path) -> tuple[list[dict[str, Any]], list[tuple[str, Any]]]:
+def _fold_done(dest_dir: Path) -> bool:
+    """True once a loop rewrite has completed under ``dest_dir``: a ledger whose run left nothing unmigrated. From then on a
+    key-absent row is what the entity's own add writes and already reads as someday, so it is no longer a loop to rewrite."""
+    try:
+        names = sorted(dest_dir.glob(f"{LEDGER_PREFIX}*.json"))
+    except OSError:
+        return False
+    for p in names:
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict) and doc.get("unmigrated") == 0:
+            return True
+    return False
+
+
+def _default_dest(store_path: Path, backup_dir: Path | str | None) -> Path:
+    return Path(backup_dir) if backup_dir is not None else store_path.parent.joinpath(*BACKUP_SUBDIR)
+
+
+def _classify_open_loops(store_path: Path, *, keyless: bool = True
+                         ) -> tuple[list[dict[str, Any]], list[tuple[str, Any]]]:
     """``(rows to rewrite, rows with an unknown disposition)`` among the OPEN rows, read raw. A row to rewrite holds no
-    disposition key (or None / "") or exactly ``loop``. An unknown one holds anything else that is not a name this release reads
-    (``levain.intentions.VALID_DISPOSITIONS``), the value included. Raises like :func:`_read_open_rows`."""
+    disposition key (only while ``keyless``: the first run, before a completed ledger exists) or a None / "" or exactly ``loop``.
+    An unknown one holds anything else that is not a name this release reads (``levain.intentions.VALID_DISPOSITIONS``), the
+    value included. Raises like :func:`_read_open_rows`."""
     from levain.intentions import VALID_DISPOSITIONS
 
     targets: list[dict[str, Any]] = []
@@ -314,7 +340,8 @@ def _classify_open_loops(store_path: Path) -> tuple[list[dict[str, Any]], list[t
             continue
         d = row.get("disposition")
         if d in _LOOP_READS:
-            targets.append(row)
+            if keyless or "disposition" in row:
+                targets.append(row)
         elif not isinstance(d, str) or d not in VALID_DISPOSITIONS:
             unknown.append((row["id"], d))
     return targets, unknown
@@ -350,11 +377,12 @@ class LoopPlan:
         return _unknown_line(self.unknown) if self.unknown else None
 
 
-def plan_loop_migration(paths: Any, *, now: datetime | None = None) -> LoopPlan:
+def plan_loop_migration(paths: Any, *, now: datetime | None = None, backup_dir: Path | str | None = None) -> LoopPlan:
     """The dry run of :func:`migrate_loop_to_someday`: nothing is written, copied or locked. A missing store plans nothing; an
     unreadable or malformed one RAISES (OSError or ValueError), because an empty answer would read as "nothing to do" about a
     store nobody could read."""
-    targets, unknown = _classify_open_loops(Path(paths.intentions_json))
+    store_path = Path(paths.intentions_json)
+    targets, unknown = _classify_open_loops(store_path, keyless=not _fold_done(_default_dest(store_path, backup_dir)))
     local = _local_now(now)
     plan = LoopPlan(ids=[str(r["id"]) for r in targets], unknown=unknown)
     for r in targets:
@@ -364,9 +392,11 @@ def plan_loop_migration(paths: Any, *, now: datetime | None = None) -> LoopPlan:
     return plan
 
 
-def open_loop_ids(paths: Any) -> list[str]:
+def open_loop_ids(paths: Any, *, backup_dir: Path | str | None = None) -> list[str]:
     """The ids :func:`migrate_loop_to_someday` would rewrite (a held update names them), read without writing anything."""
-    return [str(r["id"]) for r in _classify_open_loops(Path(paths.intentions_json))[0]]
+    store_path = Path(paths.intentions_json)
+    keyless = not _fold_done(_default_dest(store_path, backup_dir))
+    return [str(r["id"]) for r in _classify_open_loops(store_path, keyless=keyless)[0]]
 
 
 @dataclass
@@ -410,8 +440,10 @@ def migrate_loop_to_someday(paths: Any, *, now: datetime | None = None,
     past-``next`` test; ``backup_dir`` overrides where the copy and the ledger go."""
     store_path = Path(paths.intentions_json)
     report = LoopMigrationReport()
+    dest_dir = _default_dest(store_path, backup_dir)
+    keyless = not _fold_done(dest_dir)
     try:
-        targets, unknown = _classify_open_loops(store_path)
+        targets, unknown = _classify_open_loops(store_path, keyless=keyless)
     except (OSError, ValueError) as exc:
         report.refused = f"the store {store_path} cannot be read ({exc})"
         return report
@@ -432,7 +464,6 @@ def migrate_loop_to_someday(paths: Any, *, now: datetime | None = None,
                           f"pip install -U 'anneal-memory>=2.0.0,<2.1'; {exc}); nothing was copied or rewritten")
         return report
     when = now or datetime.now(timezone.utc)
-    dest_dir = Path(backup_dir) if backup_dir is not None else store_path.parent.joinpath(*BACKUP_SUBDIR)
     if backup_dir is None:
         from levain.install import _ensure_gitignored
 
@@ -447,8 +478,8 @@ def migrate_loop_to_someday(paths: Any, *, now: datetime | None = None,
     for row in targets:
         rid = str(row["id"])
         raw = row.get("disposition")
-        extra, note = q2_past_next_policy(row, local)
         try:
+            extra, note = q2_past_next_policy(row, local)
             store.update(rid, disposition=_NEW, expect_disposition=raw, **extra)
         except IntentionError as exc:            # resolved, re-routed or ambiguous since the read: its writer wins
             report.skipped.append((rid, str(exc)))
@@ -465,23 +496,23 @@ def migrate_loop_to_someday(paths: Any, *, now: datetime | None = None,
         # told apart as the seed rewrite's are: a skipped row still an open loop was not rewritten (a store fault, the run is
         # incomplete); one that moved is its writer's
         try:
-            still = {str(r["id"]) for r in _classify_open_loops(store_path)[0]}
+            still = {str(r["id"]) for r in _classify_open_loops(store_path, keyless=keyless)[0]}
         except (OSError, ValueError):
             still = {rid for rid, _why in report.skipped}
         report.unmigrated = [rid for rid, _why in report.skipped if rid in still]
     if report.migrated:
         try:
-            report.ledger = _write_ledger(dest_dir, when, report)
+            report.ledger = _write_ledger(dest_dir, when, report, store_path)
         except OSError as exc:
             report.ledger_error = str(exc)
     return report
 
 
-def _write_ledger(dest_dir: Path, when: datetime, report: LoopMigrationReport) -> Path:
+def _write_ledger(dest_dir: Path, when: datetime, report: LoopMigrationReport, store_path: Path) -> Path:
     """``loopfold-<UTC>.json`` beside the backup: the ids this run migrated and what each held (a new name each run)."""
     stem = f"{LEDGER_PREFIX}{when.astimezone(timezone.utc):%Y%m%dT%H%M%SZ}"
     doc = {"migrated": list(report.migrated), "prior": dict(report.prior), "backup": str(report.backup),
-           "at": when.astimezone(timezone.utc).isoformat()}
+           "unmigrated": len(report.unmigrated), "store": str(store_path), "at": when.astimezone(timezone.utc).isoformat()}
     n = 0
     while True:
         dest = dest_dir / (f"{stem}.json" if n == 0 else f"{stem}-{n}.json")
@@ -512,17 +543,47 @@ class LoopRevertReport:
     refused: str | None = None
 
 
+def _ledger_problem(doc: Any, store_path: Path) -> str | None:
+    """Why ``doc`` is not a usable ledger for ``store_path``, or None."""
+    if not isinstance(doc, dict):
+        return "it is not a JSON object"
+    migrated, prior = doc.get("migrated"), doc.get("prior")
+    if not isinstance(migrated, list) or not all(isinstance(i, str) for i in migrated):
+        return "its migrated list is not a list of ids"
+    if not isinstance(prior, dict) or len(prior) != len(migrated) or set(prior) != set(migrated):
+        return "its prior does not agree with its migrated ids"
+    named = doc.get("store")
+    if not isinstance(named, str) or os.path.realpath(named) != os.path.realpath(store_path):
+        return f"it was written for another store ({named!r})"
+    return None
+
+
 def revert_loop_migration(paths: Any, ledger: Path | str) -> LoopRevertReport:
     """Undo a loop rewrite from its ledger, row by row: each migrated id still holding ``someday`` has its disposition key
     CLEARED (``update(disposition=None, expect_disposition="someday")``: a clear passes the write guard, and the compare-and-set
     leaves a row that moved since to its writer). A row that held the literal ``loop`` comes back key-absent, which reads the
-    same; restore the backup copy for the exact bytes (it discards every write made since). A past ``next`` was never touched."""
+    same; restore the backup copy for the exact bytes (it discards every write made since). A past ``next`` was never touched.
+    A row someone set to ``someday`` on purpose after the rewrite is cleared too: it reads the same, and the explicit value is
+    not kept (the intent is a rollback to what the rows read as).
+
+    The ledger must be a well-formed one written for THIS store (it records the store's path): another store's ledger, a
+    malformed one or an unreadable store REFUSES, and nothing is changed."""
     report = LoopRevertReport()
     try:
         doc = json.loads(Path(ledger).read_text(encoding="utf-8"))
-        ids = [str(i) for i in doc["migrated"]]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError) as exc:
         report.refused = f"the ledger {ledger} cannot be read ({exc})"
+        return report
+    store_path = Path(paths.intentions_json)
+    problem = _ledger_problem(doc, store_path)
+    if problem:
+        report.refused = f"the ledger {ledger} cannot be used ({problem}); nothing was changed"
+        return report
+    ids = list(doc["migrated"])
+    try:
+        _read_open_rows(store_path)              # an unreadable store refuses here, as the forward path does
+    except (OSError, ValueError) as exc:
+        report.refused = f"the store {store_path} cannot be read ({exc}); nothing was changed"
         return report
     try:
         from anneal_memory.spores import IntentionError
