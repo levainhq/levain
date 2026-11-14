@@ -61,6 +61,7 @@ class DeskStub:
         self.script: list[dict] = []
         self.sends: list[dict] = []
         self.gets: list[dict] = []
+        self.held_first: set = set()
         self.httpd: ThreadingHTTPServer | None = None
 
     def set(self, state: dict) -> None:
@@ -115,6 +116,11 @@ class DeskStub:
                         fixture = (stub.by_thread.get(f"{asked}@{(q.get('after') or [''])[0]}") or stub.by_thread.get(asked) or stub.get) if asked else stub.get
                     if fixture.get("delay"):
                         time.sleep(fixture["delay"])
+                    with stub.lock:      # `delay_first`: only the first read of this thread is held (a slow read in flight while sends arrive)
+                        hold = fixture.get("delay_first") if asked not in stub.held_first else 0
+                        stub.held_first.add(asked)
+                    if hold:
+                        time.sleep(hold)
                     self._json(fixture["status"], fixture["json"])
                     return
                 self._proxy(b"")
@@ -651,12 +657,10 @@ def test_a_thread_the_desk_has_answered_is_not_requested_again_and_the_others_ar
     assert "reply one" in s["text"] and "never held" not in s["text"], s["text"]     # settled stays drawn; an unreadable body holds nothing
 
 
-@needs_browser
-def test_eight_lines_only_the_unanswered_of_the_newest_six_threads_are_read_newest_first(tmp_path):
-    """DESK-F3 and DESK-F4: the polled cap is six and the drawn cap is the log's. After eight sends all eight threads stay kept, but
-    a tick reads only the unanswered ones among the newest six (t3..t8; t4 and t7 are answered), newest first, one at a time. The
-    two older threads are no longer read (a known edge: a reply to them is never drawn)."""
-    by_thread = {f"t{n}": _fixture(f"t{n}", "c1", _ev("took", by="script", at=f"09:00:0{n}"), *([_ev("reply", f"reply {n}")] if n in (4, 7) else []))
+def _eight_lines(tmp_path, slow_first_read_of=None):
+    """Eight lines sent (t4 and t7 answered), then ~4.5 s of ticks. Returns (the threads asked in order, the stored threads). `slow_first_read_of` holds the first read of that thread for 6 s, so later sends land while it is in flight."""
+    by_thread = {f"t{n}": _fixture(f"t{n}", "c1", _ev("took", by="script", at=f"09:00:0{n}"), *([_ev("reply", f"reply {n}")] if n in (4, 7) else []),
+                                   **({"delay_first": 6.0} if f"t{n}" == slow_first_read_of else {}))
                  for n in range(1, 9)}
     with desk_page(tmp_path) as (stub, base):
         steps = [PHONE, *_TOKENED, put(get={"status": 200, "json": wired()}, by_thread=by_thread,
@@ -666,11 +670,37 @@ def test_eight_lines_only_the_unanswered_of_the_newest_six_threads_are_read_newe
                  until("document.querySelectorAll('.dv-zone .dv-took').length === 8"), _held_for("c"), STORED]
         out = _drive(tmp_path, base + "/", steps)
         asked = [g["thread"] for g in stub.gets if g["thread"]]
-    stored = json.loads(stored_reads(out)[0]["threads"])
+    return asked, json.loads(stored_reads(out)[0]["threads"])
+
+
+def _assert_steady_ticks(asked, stored):
     assert [t["id"] for t in stored] == [f"t{n}" for n in range(1, 9)], stored
-    after8 = asked[asked.index("t8"):]
+    # A send's follow-up read is queued behind the pull in flight and a pull reads the threads it counted unanswered when it began,
+    # so t7 (and t4) can be read once more after the first t8 read: that is a send's read, not a polled tick. The settle point is
+    # the last read of either answered thread; the ticks are the pulls that begin (at a t8 read) after it.
+    last_answered = max(i for i, t in enumerate(asked) if t in ("t4", "t7"))
+    after8 = asked[last_answered + 1:]
+    after8 = after8[after8.index("t8"):]
     assert after8[:4] == ["t8", "t6", "t5", "t3"], after8              # newest first; t7 and t4 settled; t2 and t1 are older than the newest six
     assert set(after8) == {"t8", "t6", "t5", "t3"} and all(after8.count(t) >= 3 for t in set(after8)), after8
+    assert not {"t7", "t4", "t2", "t1"} & set(after8), after8           # never read again once settled or once older than the newest six
+
+
+@needs_browser
+def test_eight_lines_only_the_unanswered_of_the_newest_six_threads_are_read_newest_first(tmp_path):
+    """DESK-F3 and DESK-F4: the polled cap is six and the drawn cap is the log's. After eight sends all eight threads stay kept, but
+    a tick reads only the unanswered ones among the newest six (t3..t8; t4 and t7 are answered), newest first, one at a time. The
+    two older threads are no longer read (a known edge: a reply to them is never drawn)."""
+    _assert_steady_ticks(*_eight_lines(tmp_path))
+
+
+@needs_browser
+def test_the_tick_order_holds_when_sends_land_while_a_read_is_in_flight(tmp_path):
+    """The race behind the CI flake, made likely: the first read of t6 is held for 6 s, so lines seven and eight are sent meanwhile and
+    ONE queued follow-up pull then reads t8, t7 (answered by that very read), t6, t5, t3. That t7 is a send's read, not a tick; the
+    steady ticks after it are asserted as above. (How the sends interleave with the held read is timing; the assertion holds either
+    way, and the first-t8-slice version of it failed on most runs of this drive.)"""
+    _assert_steady_ticks(*_eight_lines(tmp_path, slow_first_read_of="t6"))
 
 
 @needs_browser
