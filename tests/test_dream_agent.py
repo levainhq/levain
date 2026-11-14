@@ -565,9 +565,8 @@ def test_1112_1_f8_a_launched_dream_row_makes_the_drill_tick_skip_without_taking
     r = da.drill_tick(db, root, attention=lambda k, t: seen.append(k), drill=drill, dream_running=True)
     assert r.action == "deferred" and "launched" in r.detail and called == [] and seen == []   # a first drill just waits
     assert sn.last_drill(root) is None and sn.drill_due(root)                    # nothing recorded: it stays due
-    # once a drill record exists, a launched row that never ends cannot hide the drill for good: the two-cadence row
-    # is raised as for any deferral. With NO record the first drill just waits, so a stuck launched row hides a
-    # never-run drill until the row is reaped (the reaper and the row's own notices own that)
+    # a launched row that never ends cannot hide the drill for good: the two-cadence row is raised as for any
+    # deferral, aged from the last record, or from the first snapshot when no drill has run
     sn._write_json(root / sn.DRILL_RECORD, {"outcome": "ok", "at": (datetime.now(timezone.utc)
                                                                     - timedelta(days=15)).isoformat()})
     da.drill_tick(db, root, attention=lambda k, t: seen.append(k), drill=drill, dream_running=True)
@@ -592,6 +591,94 @@ def test_a_deferred_drill_raises_the_row_only_after_two_cadences(tmp_path):
     sn._write_json(root / sn.DRILL_RECORD, {"outcome": "ok", "at": (now - timedelta(days=15)).isoformat()})
     da.drill_tick(db, root, now=now, attention=lambda k, t: seen.append(k), drill=lambda *a, **k: Res)
     assert seen == ["dream-drill"]
+
+
+def _drop_kept_text(root):
+    import shutil
+    for p in root.glob(f"*/snap/{sn.POST_DIR}"):
+        shutil.rmtree(p)
+
+
+def test_t9_a_store_with_nothing_to_drill_raises_a_row_by_the_second_cadence_that_says_why(scratch_store):
+    db = scratch_store
+    root = db.parent / "dream"
+    seen, resolved = [], []
+    kw = dict(attention=lambda k, t: seen.append((k, t)), resolve=resolved.append)
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    _drop_kept_text(root)                                         # a snapshot taken before the text was kept
+    t0 = datetime.now(timezone.utc)
+    first = sn.read_manifest(root / "o1")["taken_at"][:10]
+    got = [da.drill_tick(db, root, now=t0 + timedelta(days=d), **kw) for d in (0, 8)]
+    assert [g.action for g in got] == ["no-drillable", "no-drillable"] and seen == []
+    assert da.drill_tick(db, root, now=t0 + timedelta(days=15), **kw).action == "no-drillable"
+    assert [k for k, _ in seen] == ["dream-drill"], seen
+    text = seen[0][1]
+    assert sn.NO_DRILLABLE_WHY in text and f"since the first snapshot ({first})" in text
+    assert "levain dream drill --store-dir" in text and "a writer held the store" not in text
+    assert not (root / sn.DRILL_RECORD).exists() and sn.drill_due(root)       # nothing recorded: the clock did not move
+    # the same text on every later tick, so the feed's dedupe (a hash of the text) sees one item, not one a day
+    da.drill_tick(db, root, now=t0 + timedelta(days=16), **kw)
+    assert seen[1][1] == text and resolved == []
+
+
+def test_t9b_the_row_after_a_real_verdict_names_the_date_of_the_last_restore(scratch_store):
+    db = scratch_store
+    root = db.parent / "dream"
+    seen = []
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    now = datetime.now(timezone.utc)
+    assert da.drill_tick(db, root, now=now, attention=lambda k, t: seen.append(t)).action == "ok"
+    _drop_kept_text(root)
+    r = da.drill_tick(db, root, now=now + timedelta(days=13), attention=lambda k, t: seen.append(t))
+    assert r.action == "no-drillable" and seen == [] and sn.last_drill(root)["outcome"] == "ok"
+    da.drill_tick(db, root, now=now + timedelta(days=15), attention=lambda k, t: seen.append(t))
+    assert len(seen) == 1 and "has not restored a snapshot since " in seen[0] and sn.NO_DRILLABLE_WHY in seen[0]
+    assert "due every 7" in seen[0]
+
+
+def test_t10_a_store_a_writer_held_each_time_says_that_in_the_row(tmp_path):
+    seen = []
+
+    class Res:
+        outcome, steps = "deferred", []
+
+    db = tmp_path / "s" / "memory.db"
+    root = tmp_path / "s" / "dream"
+    (root / "o1" / "snap").mkdir(parents=True)
+    sn._write_json(root / "o1" / "snap" / sn.MANIFEST, {"occurrence": "o1", "taken_at": "2026-10-01T00:00:00Z",
+                                                        "post_files": {"continuity": "a" * 64}, "files": {}})
+    now = datetime(2026, 11, 3, tzinfo=timezone.utc)
+    sn._write_json(root / sn.DRILL_RECORD, {"outcome": "ok", "at": (now - timedelta(days=15)).isoformat()})
+    da.drill_tick(db, root, now=now, attention=lambda k, t: seen.append(t), drill=lambda *a, **k: Res)
+    assert len(seen) == 1 and "held the store each time it was due" in seen[0] and "since 2026-10-19" in seen[0]
+    assert sn.NO_DRILLABLE_WHY not in seen[0]
+
+
+def test_t12_a_restore_failure_row_is_resolved_by_a_drill_that_restores_on_a_store_past_the_dream(
+        scratch_store, monkeypatch):
+    db = scratch_store
+    root = db.parent / "dream"
+    seen, resolved = [], []
+    kw = dict(attention=lambda k, t: seen.append((k, t)), resolve=resolved.append)
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    now = datetime.now(timezone.utc)
+    with monkeypatch.context() as mp:
+        mp.setattr(sn, "rollback", lambda *a, **k: _Refused())
+        assert da.drill_tick(db, root, now=now, **kw).action == "failed"
+    assert len(seen) == 1 and "restore: boom" in seen[0][1] and resolved == []
+    (db.parent / "memory.crystal.json").write_text('{"x": 1}')                   # the live store is past the dream
+    assert da.drill_tick(db, root, now=now + timedelta(days=8), **kw).action == "ok"
+    assert resolved == ["dream-drill"]
+
+
+def test_t11_a_record_the_retired_skipped_outcome_wrote_does_not_hold_the_drill_off(scratch_store):
+    db = scratch_store
+    root = db.parent / "dream"
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    sn._write_json(root / sn.DRILL_RECORD, {"outcome": "skipped", "at": datetime.now(timezone.utc).isoformat()})
+    seen, resolved = [], []
+    r = da.drill_tick(db, root, attention=lambda k, t: seen.append(t), resolve=resolved.append)
+    assert r.action == "ok" and sn.last_drill(root)["outcome"] == "ok"
 
 
 @pytest.fixture
