@@ -31,7 +31,6 @@ from levain.dashboard import (
     CLASS_A,
     CLASS_B,
     CLASS_C,
-    LOOP_DISPOSITION,
     SubstrateSource,
     SubstrateView,
     OpenIntention,
@@ -333,7 +332,11 @@ def _intention_row(s: Any, today: date) -> RowIn:
 def intention_stored(s: OpenIntention) -> dict[str, Any]:
     """An intention row's stored record: what its version covers (``INTENTION_VERSION_FIELDS``)."""
     # getattr with a default: INTENTION_STORED may name a steering field (target, attention) the OpenIntention does not carry yet
-    return {f: getattr(s, f, None) for f in INTENTION_STORED}
+    out = {f: getattr(s, f, None) for f in INTENTION_STORED}
+    # the disposition the store holds, not the one the view reads (a key-absent row reads as someday): what the version
+    # and the label key are taken over
+    out["disposition"] = getattr(s, "stored_disposition", out["disposition"])
+    return out
 
 
 def intention_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
@@ -342,11 +345,9 @@ def intention_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
     ok = stored.get("origin_key")
     if not isinstance(ok, str) or not ok:
         return None
+    # the disposition is the raw stored value (intention_stored): a key-absent row reads as someday on the List but the
+    # store holds none, and the label is hashed over what the store holds
     values = {f: _stored_authority(stored, f) for f in INTENTION_AUTHORITY_FIELDS}
-    if values["disposition"] == LOOP_DISPOSITION:
-        # the view names a plain loop's absent disposition LOOP_DISPOSITION; the store, and so the label,
-        # hold it as absent (None), so the hash is taken over None
-        values["disposition"] = None
     return LabelKey(intention_resource_key(ok), values)
 
 
@@ -374,7 +375,6 @@ def intention_view_version(intention: Any) -> str:
 # a fresh install has no intention store until something is dropped: each panel says what fills it
 INTENTION_EMPTY = {
     "tray": "Nothing yet. Drop a line in the box above and {entity} sorts it.",
-    "loops": "Nothing yet. What stays open after {entity} sorts the List is listed here.",
 }
 # what the Tray's capture box says when the install has no name for its entity (dashboard_core.js ``buildTrayDump`` says the same)
 INTENTION_EMPTY_ENTITY = "the assistant"
@@ -387,9 +387,9 @@ def intention_empty(bucket: str, entity: Any) -> str:
 
 
 def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
-    """The Morning card's "Where to begin": read from the install's own List and Open loops, never set by anything else. What is late
-    leads (earliest first), then what is due today or a handoff still inside its claim, then the hottest open loop. With nothing in
-    either it says so and names the two real ways to fill it: a thought dropped on the List, and ``levain state``."""
+    """The Morning card's "Where to begin": read from the install's own List, never set by anything else. What is late
+    leads (earliest first), then what is due today or a handoff still inside its claim. With nothing there it says so and
+    names the two real ways to fill it: a thought dropped on the List, and ``levain state``."""
     def clip(text: Any) -> str:
         t = " ".join(str(text).split())
         return t if len(t) <= TOP_MAX_BEGIN else t[:TOP_MAX_BEGIN - 1] + "…"
@@ -411,30 +411,19 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
                 due.append(s)
         late.sort(key=lambda t: t[0])
         first = [s for _d, s in late] + due
-        # a parked loop is dormant by design (TS-5a: it shows in Open loops, marked): never a place to begin
-        loops = sorted((s for s in v.open_intentions if s.tier != "parked"), key=lambda s: {"hot": 0, "warm": 1, "cold": 2, "parked": 3}.get(s.tier, 9))
         lines: list[dict[str, str]] = []
         for i, s in enumerate(first[:3]):
             lines.append({"label": ("first", "then", "after that")[i], "text": clip(s.text)})
-        if loops:
-            lines.append({"label": "loop", "text": clip(loops[0].text)})
         if not lines:
-            return Read(value={"headline": "Nothing set for today yet", "title": "Where to begin", "source": "from the List and Open loops",
+            return Read(value={"headline": "Nothing set for today yet", "title": "Where to begin", "source": "from the List",
                                "lines": [{"label": "set", "text": "Drop a thought on the List, or say what you are on with `levain state \"...\"`."}]})
         value: dict[str, Any] = {"headline": "", "lines": lines, "title": "Where to begin",
-                                 "source": "from the List and Open loops"}
-        if loops:
-            # the open loops, hottest first, for the card's Threads column: the page groups them by the repo each one names (the
-            # same reading the row tags use), because only the page knows the sky's repos. Capped: the column shows few.
-            value["threads"] = [{"text": clip(s.text), "domain": s.domain or "", "tier": s.tier} for s in loops[:THREADS_MAX_LOOPS]]
+                                 "source": "from the List"}
         overnight = _overnight(v)
         if overnight:
             value["overnight"] = overnight
         return Read(value=value)
     return read
-
-
-THREADS_MAX_LOOPS = 40
 
 
 def _overnight(v: Any) -> dict[str, Any] | None:
@@ -482,7 +471,7 @@ def _intention_provider(
             return bad
         if not path.exists():           # removed while the view was being built
             return Absent(f"no intention store at {path}")
-        items = {"tray": view.tray, "loops": view.open_intentions}[bucket]
+        items = {"tray": view.tray}[bucket]
         rows = [_intention_row(s, ctx.today) for s in items]
         view_full = len(items) >= VIEW_INTENTION_LIMIT
         over = max(0, len(rows) - INTENTION_CAP) if apply_hold else 0
@@ -1667,23 +1656,13 @@ def build_default_cockpit(
     ck.register(ProviderSpec("begin", "brief", "Where to begin", "gauge", _where_to_begin(source),
                              region="brief", rank=5, empty="Nothing set for today yet.", edit_class=CLASS_C))
     # mock-e's default layout (design 1011, "mock-e: what it decides"). The WORK zone (`operate`) is a
-    # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops (row a, tall) / [Inbox, Fleet,
-    # Stream: downstream-only] / Recent episodes, Recent edits. Ranks leave gaps so a downstream's
-    # Inbox, Fleet and Stream slot in 16-39, between Open loops and Recent episodes without renumbering the kernel's.
+    # 3-column grid whose cards flow in rank order, `now` first: Now, the List / [Inbox, Fleet, Stream: downstream-only] /
+    # Recent episodes, Recent edits. Ranks leave gaps so a downstream's Inbox, Fleet and Stream slot in 16-39, between the
+    # List and Recent episodes without renumbering the kernel's.
     # THE LIST takes the Tray's place (id `tray`, a code name): a view over band + board + intentions, levain.cockpit.list_panel
     from levain.cockpit.list_panel import register_list
 
     register_list(ck, source, intention_common)
-    for pid, title, bucket, prio, order, rank, views, size in (
-        ("loops", "Open loops", "loops", "feed", "intention.loops", 15, (), "tall"),
-    ):
-        ck.register(ProviderSpec(
-            pid, "triage-list", title, prio, _intention_provider(source, bucket), region="operate", rank=rank, size=size,
-            order=order, views=views, rowset=f"intention:{bucket}", read_one=_intention_read_one(source, bucket),
-            label_key=intention_label_key,
-            # the registered text is the fallback only: a store that does not exist yet answers per read with the view's name
-            empty=intention_empty(bucket, _configured_entity_name(source)), absent_is_empty=True, verbs=INTENTION_ROW_VERBS + (("intention_seed",) if bucket == "tray" else ()),
-            **intention_common))
     ck.register(ProviderSpec(
         "episodes", "triage-list", "Recent episodes", "feed", _episodes(source, feeds), region="operate", rank=40,
         # a write's read: the entity's own rows only (a feed row is never a tombstone target)
@@ -1737,14 +1716,6 @@ def build_default_cockpit(
         # F12a: the live topology (Build tab): sessions, the work they are on, what closing one would lose
         from levain.cockpit.topology import topology_reader
 
-        def open_loops(ctx: ReadContext) -> list[Any]:
-            if not source.anneal.intentions_json.exists():
-                return []
-            v = _view(source, ctx)
-            if "open_intentions" in v.errors or "store" in v.errors:
-                raise RuntimeError("the intention store did not read")
-            return [s for s in v.open_intentions if s.tier != "parked"]   # a parked loop is dormant (TS-5a)
-
         def hub_label(ctx: ReadContext) -> str:
             try:
                 return _view(source, ctx).entity_name or "Levain"
@@ -1754,7 +1725,7 @@ def build_default_cockpit(
         ck.register(ProviderSpec(
             "topology", "topology", "Topology", "gauge",
             topology_reader(install_root=source.install_root, consent=lambda: ck.consent_reader,
-                            questions=lambda: ck.question_store, hub_label=hub_label, intentions=open_loops,
+                            questions=lambda: ck.question_store, hub_label=hub_label,
                             dispatch_dir=lambda: _dispatch_dir(ck.consent_reader)),
             region="operate", rank=80, size="tall", optional=True,
             timeout_s=ACTIVITY_GIT_DEADLINE_S + 6.0, edit_class=CLASS_C,

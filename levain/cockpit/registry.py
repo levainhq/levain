@@ -530,6 +530,8 @@ register_ordering(
     ),
     builtin=True,
 )
+# the removed Open loops panel's ordering id (the loop fold): kept registered, as `intention.keep` is below, so a downstream
+# manifest that still names it keeps registering (an unknown ordering id refuses the whole registration)
 register_ordering(Ordering("intention.loops", _loops_key), builtin=True)
 # the removed Keep panel's ordering id (TS-5a): its key was identical to the loops key, so a downstream manifest that still
 # names it keeps registering and sorting the same way (an unknown ordering id refuses the whole registration)
