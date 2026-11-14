@@ -2028,7 +2028,11 @@ def build_substrate_view(
             # (the instant's day is the List's own: band_view._today_of, the one rule for the store's local day)
             from levain.band_view import _today_of
             view_today = today if today is not None else date.fromisoformat(_today_of(None, _now))
-            for s in IntentionStore(paths.intentions_json, id_prefix="intention").list_open(today=view_today):
+            # a supplied day ranks at day granularity (anneal reads today-without-now that way); with no day
+            # supplied the ranking keeps the minute: a timed `next` later today is not yet elapsed, as on main
+            rank_clock = ({"today": today} if today is not None
+                          else {"now": _now.astimezone().replace(tzinfo=None)})
+            for s in IntentionStore(paths.intentions_json, id_prefix="intention").list_open(**rank_clock):
                 # The WHOLE per-row pipeline (status-skip → route → cap → construct) lives
                 # in ONE try, so a fault on ANY phase drops just that row — the "one
                 # malformed row skipped, the tier survives" guarantee holds for routing,
