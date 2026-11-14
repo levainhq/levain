@@ -286,8 +286,8 @@ def test_a_row_that_moved_mid_run_is_skipped_and_named_not_overwritten(tmp_path:
     real = mig._classify_open_loops
     calls = {"n": 0}
 
-    def stale_read(path):
-        found = real(path)
+    def stale_read(path, **kw):
+        found = real(path, **kw)
         calls["n"] += 1
         if calls["n"] == 1:                                           # between the read and the writes
             plain.update(ids["plain"], disposition="agenda")          # a writer re-routes one
@@ -549,3 +549,175 @@ def test_the_seed_rewrite_and_the_loop_rewrite_both_run_in_one_update(install) -
     assert "1 open seed record(s) rewritten to someday" in text and "1 open loop record(s) rewritten to someday" in text
     d = install / ".levain" / Path(*BACKUP_SUBDIR)
     assert len([p for p in d.iterdir() if not p.name.startswith(LEDGER_PREFIX)]) == 2      # one copy per rewrite
+
+
+# --- after the first completed run, a key-absent row is no longer a loop (L3 r1: every update re-selected the entity's own adds) ---
+
+def _snapshot_dir(tmp_path: Path) -> list[str]:
+    d = tmp_path / ".levain" / Path(*BACKUP_SUBDIR)
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def test_a_key_absent_row_planted_after_a_completed_run_is_left_alone_and_costs_no_backup(tmp_path: Path) -> None:
+    from levain.intention_migrate import plan_loop_migration
+
+    paths, ids = _old_store(tmp_path)
+    first = _migrate(paths)
+    assert first.migrated and first.ledger is not None and not first.incomplete       # the first run rewrites the key-absent legacy loops
+    assert json.loads(first.ledger.read_text(encoding="utf-8"))["unmigrated"] == 0
+    late = _store(paths).add(type="task", text="the entity's own add after the fold")["id"]     # key-absent, as anneal writes it
+    assert "disposition" not in _open(paths, late)
+    names, before = _snapshot_dir(tmp_path), paths.intentions_json.read_bytes()
+
+    plan = plan_loop_migration(paths, now=NOW)
+    again = _migrate(paths)
+
+    assert plan.ids == [] and plan.rewrite_lines() == []                              # the dry run reaches "nothing to reconcile"
+    assert again.migrated == [] and again.backup is None and again.ledger is None and not again.failed
+    assert _snapshot_dir(tmp_path) == names and paths.intentions_json.read_bytes() == before
+    assert "disposition" not in _open(paths, late)
+
+
+def test_a_literal_loop_or_an_empty_key_planted_by_an_old_client_is_still_rewritten_after_a_completed_run(tmp_path: Path) -> None:
+    paths, ids = _old_store(tmp_path)
+    assert _migrate(paths).ledger is not None
+    old_literal = _store(paths).add(type="task", text="an old client's loop", disposition="loop")["id"]
+    old_empty = _store(paths).add(type="task", text="an old client's empty")["id"]
+    absent = _store(paths).add(type="task", text="the entity's add")["id"]
+    _hand_set(paths, old_empty, disposition="")
+
+    again = _migrate(paths)
+
+    assert sorted(again.migrated) == sorted([old_literal, old_empty]) and again.backup is not None
+    assert _open(paths, old_literal)["disposition"] == "someday" and _open(paths, old_empty)["disposition"] == "someday"
+    assert "disposition" not in _open(paths, absent)
+
+
+def test_an_incomplete_first_run_does_not_close_the_key_absent_window(tmp_path: Path, monkeypatch) -> None:
+    paths, ids = _old_store(tmp_path)
+    _fail_updates_of(monkeypatch, {ids["plain"]}, OSError("disk"))
+    first = _migrate(paths)
+    assert first.incomplete and json.loads(first.ledger.read_text(encoding="utf-8"))["unmigrated"] == 1
+    monkeypatch.undo()
+    second = _migrate(paths)                                                          # no completed ledger yet: the absent row is still a loop
+    assert second.migrated == [ids["plain"]]
+
+
+@pytest.mark.usefixtures("cc_local_layout")
+def test_update_on_an_active_install_takes_no_backup_for_the_entitys_own_adds(install) -> None:
+    from levain.update import run_update
+
+    _iplant(install)
+    assert run_update(install, no_pip=True, emit=lambda s: None) == 0
+    _store(_ipaths(install)).add(type="task", text="the entity's own add")
+    d = install / ".levain" / Path(*BACKUP_SUBDIR)
+    names, before = sorted(p.name for p in d.iterdir()), _ipaths(install).intentions_json.read_bytes()
+    lines: list[str] = []
+    assert run_update(install, dry_run=True, no_pip=True, emit=lines.append) == 0
+    assert "nothing to reconcile" in "\n".join(lines)
+    assert run_update(install, no_pip=True, emit=lambda s: None) == 0
+    assert sorted(p.name for p in d.iterdir()) == names and _ipaths(install).intentions_json.read_bytes() == before
+
+
+# --- the revert validates its ledger and its store (L3 r1) ---
+
+def _ledger_doc(ledger: Path) -> dict:
+    return json.loads(ledger.read_text(encoding="utf-8"))
+
+
+def _rewrite_ledger(ledger: Path, **changes) -> None:
+    doc = _ledger_doc(ledger)
+    doc.update(changes)
+    ledger.write_text(json.dumps(doc), encoding="utf-8")
+
+
+@pytest.mark.parametrize("migrated", ["intention-001", {"intention-001": 1}, [1, 2], None])
+def test_the_revert_refuses_a_ledger_whose_migrated_is_not_a_list_of_ids(tmp_path: Path, migrated) -> None:
+    from levain.intention_migrate import revert_loop_migration
+
+    paths, ids = _old_store(tmp_path)
+    report = _migrate(paths)
+    _rewrite_ledger(report.ledger, migrated=migrated)
+    before = paths.intentions_json.read_bytes()
+    back = revert_loop_migration(paths, report.ledger)
+    assert back.refused and back.restored == [] and back.skipped == [] and paths.intentions_json.read_bytes() == before
+
+
+def test_the_revert_refuses_a_ledger_whose_prior_disagrees_and_one_that_is_not_an_object(tmp_path: Path) -> None:
+    from levain.intention_migrate import revert_loop_migration
+
+    paths, ids = _old_store(tmp_path)
+    report = _migrate(paths)
+    before = paths.intentions_json.read_bytes()
+    _rewrite_ledger(report.ledger, prior={"intention-001": None})
+    assert revert_loop_migration(paths, report.ledger).refused
+    report.ledger.write_text("[1, 2]", encoding="utf-8")
+    assert revert_loop_migration(paths, report.ledger).refused
+    assert paths.intentions_json.read_bytes() == before
+
+
+def test_the_revert_refuses_a_ledger_written_for_another_store(tmp_path: Path) -> None:
+    from levain.intention_migrate import revert_loop_migration
+
+    paths, ids = _old_store(tmp_path)
+    report = _migrate(paths)
+    other_root = tmp_path / "other"
+    (other_root / ".levain").mkdir(parents=True)
+    other = AnnealPaths.from_db(other_root / ".levain" / "memory.db")
+    kept = _store(other).add(type="task", text="B's own row", disposition="someday")["id"]       # both stores hold an `intention-001`
+    before = other.intentions_json.read_bytes()
+    back = revert_loop_migration(other, report.ledger)
+    assert back.refused and "another store" in back.refused and back.restored == []
+    assert other.intentions_json.read_bytes() == before and _open(other, kept)["disposition"] == "someday"
+    assert revert_loop_migration(paths, report.ledger).restored                               # its own store still reverts
+
+
+def test_the_revert_of_a_corrupt_store_refuses_instead_of_raising(tmp_path: Path) -> None:
+    from levain.intention_migrate import revert_loop_migration
+
+    paths, ids = _old_store(tmp_path)
+    report = _migrate(paths)
+    paths.intentions_json.write_text("{not json", encoding="utf-8")
+    back = revert_loop_migration(paths, report.ledger)
+    assert back.refused and "cannot be read" in back.refused and back.restored == []
+    assert paths.intentions_json.read_text(encoding="utf-8") == "{not json"
+
+
+# --- the Q2 policy never takes the run down (L3 r1) ---
+
+def test_a_timezone_aware_next_is_not_a_past_date_and_does_not_break_the_run(tmp_path: Path) -> None:
+    from levain.intention_migrate import q2_past_next_policy
+
+    paths, ids = _old_store(tmp_path)
+    _hand_set(paths, ids["plain"], next="2026-11-13T12:00+05:00")
+    assert q2_past_next_policy({"next": "2026-11-13T12:00+05:00"}, datetime(2031, 1, 1)) == ({}, None)
+    report = _migrate(paths)
+    assert not report.skipped and ids["plain"] in report.migrated and _open(paths, ids["plain"])["disposition"] == "someday"
+
+
+def test_the_policy_reads_an_aware_clock_on_the_local_basis() -> None:
+    from levain.intention_migrate import q2_past_next_policy
+
+    aware = datetime(2031, 1, 1, tzinfo=timezone.utc)
+    assert q2_past_next_policy({"next": "2020-01-01T09:30"}, aware) == ({}, "shows as Overdue on the List")
+    assert q2_past_next_policy({"next": "2020-01-01"}, aware)[1] == "shows as Overdue on the List"
+    assert q2_past_next_policy({"next": "2040-01-01"}, aware) == ({}, None)
+
+
+def test_a_row_the_policy_raises_on_is_skipped_and_named_and_the_ledger_still_lists_the_rest(tmp_path: Path, monkeypatch) -> None:
+    import levain.intention_migrate as im
+
+    paths, ids = _old_store(tmp_path)
+    real = im.q2_past_next_policy
+
+    def policy(row, now):
+        if row["id"] == ids["plain"]:
+            raise TypeError("a bad row")
+        return real(row, now)
+
+    monkeypatch.setattr(im, "q2_past_next_policy", policy)
+    report = _migrate(paths)
+    assert [r for r, _why in report.skipped] == [ids["plain"]] and "TypeError" in report.skipped[0][1]
+    assert ids["plain"] in report.unmigrated and report.incomplete
+    assert sorted(report.migrated) == sorted(ids[k] for k in LOOP_ROWS if k != "plain")
+    assert report.ledger is not None and sorted(_ledger_doc(report.ledger)["migrated"]) == sorted(report.migrated)
