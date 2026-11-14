@@ -510,7 +510,7 @@ for (const s of steps) {
       + `for (let w = e.ownerDocument.defaultView; w && w !== window; w = w.parent) { const f = w.frameElement; `
       + `if (!f) return null; const fr = f.getBoundingClientRect(); x += fr.left + f.clientLeft; y += fr.top + f.clientTop; } `
       + `return [x, y]; })()`;
-    let xy = null, lastError = null;
+    let xy = null, lastError = null, tapResult = 1;
     for (;;) {
       const o = await evaluateOutcome(at, Math.min(Math.max(deadline - Date.now(), 250), 3000));
       if ("error" in o) { lastError = o.error; xy = null; } else xy = o.value;
@@ -523,12 +523,40 @@ for (const s of steps) {
       await shotOnTimeout(steps.indexOf(s));
       done(1); await sleep(10000);
     }
-    const [x, y] = xy;
-    await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-    // `times`: that many presses at the one point, back to back (a double tap on a control the first press may disable)
-    for (let i = 0; i < (s.times || 1); i++) {
-      await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
-      await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+    const press = async ([x, y]) => {
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      // `times`: that many presses at the one point, back to back (a double tap on a control the first press may disable)
+      for (let i = 0; i < (s.times || 1); i++) {
+        await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 });
+        await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 });
+      }
+    };
+    await press(xy);
+    // "until": the tap's effect is the step's assertion. A press whose node a repaint replaced between its two halves is lost without a
+    // word (no click is made), so the condition is polled every 100 ms and the element is pressed AGAIN every `every` ms (default 1500)
+    // while it is false, until the deadline, which FAILS as a wait does (or collects {"timeout"} with "may_timeout"). The condition's value
+    // is collected in place of the 1. Only for a press that is safe to repeat (one whose effect the condition shows, and a second press of it
+    // is refused or does nothing)
+    if (s.until !== undefined) {
+      const every = s.every || 1500;
+      let v = null, nextPress = Date.now() + every, lastError = null;
+      for (;;) {
+        const o = await evaluateOutcome(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`, Math.min(Math.max(deadline - Date.now(), 250), 3000));
+        if ("error" in o) lastError = o.error; else if (o.value) { v = o.value; break; }
+        if (Date.now() >= deadline) break;
+        if (Date.now() >= nextPress) {
+          nextPress = Date.now() + every;
+          const r = await evaluateOutcome(at, Math.min(Math.max(deadline - Date.now(), 250), 3000));
+          if (!("error" in r) && r.value) await press(r.value);
+        }
+        await sleep(100);
+      }
+      if (!v && !s.may_timeout) {
+        console.error(`step ${steps.indexOf(s)}: until never came true within ${waitMs}ms after the tap: ${s.until}` + (lastError ? ` (last error: ${lastError})` : ""));
+        await shotOnTimeout(steps.indexOf(s));
+        done(1); await sleep(10000);
+      }
+      tapResult = v || { timeout: s.until };
     }
     // `after` runs once right after the presses (a confirm the press drew), and its value is not collected
     if (s.after !== undefined) {
@@ -539,7 +567,7 @@ for (const s of steps) {
         done(1); await sleep(10000);
       }
     }
-    values.push(1);
+    values.push(tapResult);
   } else if (s.sw !== undefined) {
     // the service worker of the page's origin: a target of its own, listed by the browser at /json beside the pages
     const origin = await evaluate("location.origin");
