@@ -138,12 +138,20 @@ def test_t7_a_dream_rolled_back_by_hand_still_proves_the_mechanism(scratch):
 
 # ---------------------------------------------------------------------------------------------- no-drillable (T8)
 
+def _predate_kept_text(db, name):
+    """Make a snapshot look like one taken before the text was kept: no post record and no kept directory."""
+    shutil.rmtree(kept(db, name))
+    m = sn.read_manifest(occ(db, name))
+    m["post_files"], m["wrap_id"] = None, None
+    sn._write_manifest(occ(db, name), m)
+
+
 def test_t8_snapshots_without_kept_text_are_no_drillable_and_record_nothing(scratch):
     two_dreams(scratch)
     root = scratch.parent / "dream"
     assert sn.drill(scratch, root).outcome == "ok"
     for n in ("o1", "o2"):
-        shutil.rmtree(kept(scratch, n))
+        _predate_kept_text(scratch, n)
     before = (root / sn.DRILL_RECORD).read_bytes()
     res = sn.drill(scratch, root)
     assert res.outcome == "no-drillable"
@@ -184,10 +192,29 @@ def test_t13_the_verb_says_ok_and_says_the_live_store_is_past_the_dream(scratch,
 def test_t13_the_verb_on_a_store_with_nothing_to_drill_exits_4_with_the_words(scratch, capsys):
     two_dreams(scratch)
     for n in ("o1", "o2"):
-        shutil.rmtree(kept(scratch, n))
+        _predate_kept_text(scratch, n)
     capsys.readouterr()
     code = dcli.run_dream_drill(_args(store_dir=str(scratch.parent), root=None, json=False))
     first = capsys.readouterr().out.splitlines()[0]
     assert code == 4 and first.startswith("levain dream drill: nothing to drill") and sn.NO_DRILLABLE_WHY in first
     assert "nothing was proved" in first and "stays due" in first
     assert dcli.run_dream_drill(_args(store_dir=str(scratch.parent), root=None, json=True)) == 4
+
+
+def test_r1694_a_deleted_kept_directory_on_the_newest_dream_fails_the_post_step_not_a_quiet_older_pass(scratch):
+    import shutil
+    two_dreams(scratch)
+    shutil.rmtree(kept(scratch, "o2"))
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "failed" and res.snapshot == "o2"
+    assert [s["name"] for s in res.steps if s["status"] == "failed"] == ["post"]
+
+
+def test_r1694_a_kept_file_the_post_record_says_was_absent_fails_the_post_step(scratch):
+    two_dreams(scratch)
+    m = sn.read_manifest(occ(scratch, "o2"))
+    key = next(iter(m["post_files"]))
+    m["post_files"][key] = None
+    sn._write_manifest(occ(scratch, "o2"), m)
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "failed" and [s["name"] for s in res.steps if s["status"] == "failed"] == ["post"]

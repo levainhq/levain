@@ -917,8 +917,8 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
     """Run the restore drill when 7 days have passed since the last one, and only while a snapshot exists. A failed
     drill raises one attention row (F12). A drill that proved nothing records nothing and stays due: it is
     ``deferred`` (a writer holds the store) or ``no-drillable`` (no snapshot holds a dream's kept saved text). Either
-    raises the row only when the last recorded drill is more than two cadences old (or none exists and the first
-    snapshot is that old); the row's text names the date and which of the two it was, and holds no count that moves
+    raises the row only when the last restore is more than two cadences old (or none exists and the tick first found
+    nothing proved that long ago); a last drill that failed keeps its own failure row instead. The row's text names the date and which of the two it was, and holds no count that moves
     each day, so the feed sees one item. ``dream_running`` (the dream has a ``launched`` occurrence) is the same
     deferral, taken before the drill reaches for ``wrap.lock``, so on the tick path the drill does not make the fire's
     lock fail ``lock-held`` (F8). Known edge: a hand ``levain dream start`` in another process during the drill's
@@ -973,15 +973,23 @@ def drill_tick(store_path: Path | str, root: Path | str, *, now: datetime | None
         return at if at.tzinfo else at.astimezone()
 
     def nothing_proved(action: str, why: str, detail: str) -> DrillTick:
-        # the row ages from the last real verdict, or from the first snapshot when no drill has ever run
         last = _snap.last_drill(root)
-        since = stamp(last.get("at")) if last else stamp(snaps[0][1].get("taken_at"))
+        if last and last.get("outcome") == "failed":
+            # a failed drill stays a failure, with its own text, until a drill restores: not an overdue row, and its
+            # date is not a restore date
+            raise_row(f"the dream restore drill failed: {_snap.failed_steps_text(last.get('steps'))}")
+            return DrillTick(action, detail)
+        # the row ages from the last real restore, or from the instant the tick first found nothing proved when none
+        # has run (not from a snapshot's date, which pruning moves, and not at the first tick after an upgrade)
+        since = stamp(last.get("at")) if last else _snap.drill_clock(root, ref)
+        if since is None and not last:
+            since = stamp(snaps[0][1].get("taken_at"))   # the clock could not be kept: the oldest snapshot is the best left
         if since is None or (ref - since).total_seconds() >= 2 * _snap.DRILL_CADENCE_S:
             where = shlex.quote(str(Path(store_path).parent))
             if last and since is not None:
                 lead = f"the dream restore drill has not restored a snapshot since {since.date().isoformat()}"
             elif since is not None:
-                lead = f"no dream restore drill has run since the first snapshot ({since.date().isoformat()})"
+                lead = f"no dream restore drill has restored a snapshot since the check first looked ({since.date().isoformat()})"
             else:
                 lead = "no dream restore drill has run in two cadences"
             raise_row(f"{lead} (it is due every {_snap.DRILL_CADENCE_S // 86400} days): {why}. "

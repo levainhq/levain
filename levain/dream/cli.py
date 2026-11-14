@@ -620,7 +620,7 @@ def run_dream_drill(args: argparse.Namespace) -> int:
                   + (": the snapshot restores and the result opens." if res.outcome == "ok" else ""))
             for st in res.steps:
                 print(f"  {st['name']:10s} {st['status']:8s} {st['detail']}")
-            if res.live_past_dream:
+            if res.outcome == "ok" and res.live_past_dream:
                 print(f"  the live store is past this dream ({', '.join(res.live_past_dream)} changed since it saved): "
                       f"levain dream rollback would refuse it today (foreign-write); the drill proves the restore, "
                       f"not that today's store can take it.")

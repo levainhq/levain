@@ -44,6 +44,9 @@ NO_DRILLABLE_WHY = ("no snapshot holds a dream's saved text to restore from (the
 UNDO_DIR = "reverted-from"
 ROLLBACK_RECORD = "rollback.json"
 DRILL_RECORD = "drill.json"
+#: the instant the weekly tick first found nothing proved and no verdict on record, written once: the overdue clock of a
+#: drill that never ran cannot hang on the oldest snapshot, which pruning moves
+DRILL_CLOCK = "drill_clock.json"
 #: Snapshots kept for occurrences that consolidated. Only the newest can be rolled back; the one before it is kept for
 #: the drill and for reading by hand.
 KEEP_SNAPSHOTS = 2
@@ -335,8 +338,8 @@ def reinsertion_proof(db: Path, occ_dir: Path, m: Mapping[str, Any], wrap_id: An
     Known edges: any other rewrite anneal's save makes to the composed text is still refused. The proof reads the store's CURRENT schema and does not compare the manifest's ``anneal_version``,
     so a schema edit or an anneal upgrade between the save and a recovery can only refuse a save, never admit one.
     This acceptance covers the in-process post record and recovery from the ``saved`` phase only: a crash between
-    anneal's commit and the post record (the ``saving`` phase) on such a save still ends ``unknown-commit``, a failed
-    card with no rollback offered and nothing lost. No copy of a re-inserted or dropped save's text is kept beside
+    anneal's commit and the post record (the ``saving`` phase) on such a save is adopted by recovery only when its
+    proof holds, and any doubt keeps ``failed/unknown-commit`` (a failed card with no rollback offered, nothing lost). No copy of a re-inserted or dropped save's text is kept beside
     ``composed.continuity.md``, a known edge for a card replayed after a later write.
     """
     try:
@@ -358,9 +361,9 @@ def _keep_post_text(db: Path, occ_dir: Path, post: Mapping[str, str | None]) -> 
     that landed between the read and the copy refuses the record, as :func:`take` refuses a changed file. The copy sits
     inside ``snap/``, so :func:`prune_snapshots` removes it with the snapshot."""
     dest = occ_dir / SNAP_DIR / POST_DIR
-    shutil.rmtree(dest, ignore_errors=True)
-    dest.mkdir(parents=True)
     try:
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True)
         for key, src in text_tier(db).items():
             if src.is_file():
                 shutil.copy2(src, dest / src.name)
@@ -713,7 +716,9 @@ def _step(res: DrillResult, name: str, status: str, detail: str) -> str:
 
 def _drillable(m: Mapping[str, Any], occ_dir: Path) -> bool:
     """A snapshot the drill can restore from: the dream consolidated (a post record) and kept its saved text."""
-    return bool(m.get("post_files")) and (occ_dir / SNAP_DIR / POST_DIR).is_dir()
+    # the kept directory is not asked for here: a manifest with a post record whose directory is gone is a damaged
+    # snapshot, which the drill's ``post`` step must fail on, not a snapshot to skip in favour of an older one
+    return bool(m.get("post_files"))
 
 
 def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True) -> DrillResult:
@@ -775,7 +780,8 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
             res.snapshot, res.outcome = name, "ok"
             snap = occ / SNAP_DIR
             pre = {k: e["sha256"] for k, e in m["files"].items()}
-            post_want = {k: v for k, v in (m.get("post_files") or {}).items() if v is not None}
+            post_all = m.get("post_files") or {}
+            post_want = {k: v for k, v in post_all.items() if v is not None}
             live = tier_hashes(db)
             res.live_past_dream = sorted(text_tier(db)[k].name for k in live
                                          if k in pre and live[k] not in (pre[k], (m.get("post_files") or {}).get(k)))
@@ -806,6 +812,9 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
                         copy_and_check(kept_file, sdir / fname, want, fname, post_bad)
                     else:
                         post_bad.append(f"{fname} (not kept)")
+                for key, want in post_all.items():       # a file the post record says was absent must be absent
+                    if want is None and (snap / POST_DIR / text_tier(db)[key].name).is_file():
+                        post_bad.append(f"{text_tier(db)[key].name} (kept, but the post record has no such file)")
             except OSError as exc:
                 copy_err = f"{type(exc).__name__}: {exc}"
             if copy_err is None and not corrupt and not bad_copy and not post_bad:
@@ -905,11 +914,33 @@ def last_drill(root: Path | str) -> dict[str, Any] | None:
     ``ok`` with a skipped ``restore`` step) restored nothing, so it is no verdict and reads as no record. The file is
     not rewritten."""
     rec = _read_json(Path(root) / DRILL_RECORD)
+    if isinstance(rec, dict) and rec.get("outcome") == "skipped" and rec.get("carried_failure"):
+        # a skipped drill that replaced a failed one kept the failure only here; it stays a failure until a drill restores
+        name, _, detail = str(rec["carried_failure"]).partition(": ")
+        return {"outcome": "failed", "at": rec.get("at"), "steps": [{"name": name, "status": "failed", "detail": detail}]}
     if isinstance(rec, dict) and (rec.get("outcome") == "skipped" or (rec.get("outcome") == "ok" and any(
             isinstance(s, dict) and s.get("name") == "restore" and s.get("status") == "skipped"
             for s in rec.get("steps") or []))):
         return None
     return rec
+
+
+def drill_clock(root: Path | str, now: _dt.datetime) -> _dt.datetime | None:
+    """When the weekly tick first found nothing proved with no verdict on record: read from ``<root>/drill_clock.json``,
+    or written there as ``now`` the first time. None when it can be neither read nor written."""
+    path = Path(root) / DRILL_CLOCK
+    rec = _read_json(path)
+    if isinstance(rec, dict):
+        try:
+            at = _dt.datetime.fromisoformat(str(rec.get("since")).replace("Z", "+00:00"))
+            return at if at.tzinfo else at.astimezone()
+        except ValueError:
+            pass
+    try:
+        _write_json(path, {"since": now.isoformat()})
+    except OSError:
+        return None
+    return now
 
 
 def drill_due(root: Path | str, now: _dt.datetime | None = None, cadence_s: float = DRILL_CADENCE_S) -> bool:

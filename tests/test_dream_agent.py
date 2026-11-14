@@ -594,9 +594,15 @@ def test_a_deferred_drill_raises_the_row_only_after_two_cadences(tmp_path):
 
 
 def _drop_kept_text(root):
+    """Make every snapshot look like one taken before the text was kept: no post record, no kept directory."""
     import shutil
     for p in root.glob(f"*/snap/{sn.POST_DIR}"):
         shutil.rmtree(p)
+    for p in root.iterdir():
+        m = sn.read_manifest(p) if p.is_dir() else None
+        if m is not None:
+            m["post_files"], m["wrap_id"] = None, None
+            sn._write_manifest(p, m)
 
 
 def test_t9_a_store_with_nothing_to_drill_raises_a_row_by_the_second_cadence_that_says_why(scratch_store):
@@ -607,13 +613,13 @@ def test_t9_a_store_with_nothing_to_drill_raises_a_row_by_the_second_cadence_tha
     assert dream(db, "o1", text_n(1)).outcome == "saved"
     _drop_kept_text(root)                                         # a snapshot taken before the text was kept
     t0 = datetime.now(timezone.utc)
-    first = sn.read_manifest(root / "o1")["taken_at"][:10]
+    first = t0.date().isoformat()
     got = [da.drill_tick(db, root, now=t0 + timedelta(days=d), **kw) for d in (0, 8)]
     assert [g.action for g in got] == ["no-drillable", "no-drillable"] and seen == []
     assert da.drill_tick(db, root, now=t0 + timedelta(days=15), **kw).action == "no-drillable"
     assert [k for k, _ in seen] == ["dream-drill"], seen
     text = seen[0][1]
-    assert sn.NO_DRILLABLE_WHY in text and f"since the first snapshot ({first})" in text
+    assert sn.NO_DRILLABLE_WHY in text and f"since the check first looked ({first})" in text
     assert "levain dream drill --store-dir" in text and "a writer held the store" not in text
     assert not (root / sn.DRILL_RECORD).exists() and sn.drill_due(root)       # nothing recorded: the clock did not move
     # the same text on every later tick, so the feed's dedupe (a hash of the text) sees one item, not one a day
@@ -1303,3 +1309,86 @@ def test_a_changed_time_is_a_re_sign_the_old_signed_link_no_longer_covers_the_ne
     rig.link()                                                  # a new link, over the new spec_hash
     oid_next = rig.claim("k-0316")
     assert rig.launch(oid_next, on_input=None).outcome == "launched"
+
+
+# ------------------------------------------------------------ r1694 L3 round 1: a failure stays a failure, the clock stays put
+
+def _failed_then(scratch_store, monkeypatch, outcome_after):
+    db = scratch_store
+    root = db.parent / "dream"
+    seen, resolved = [], []
+    kw = dict(attention=lambda k, t: seen.append((k, t)), resolve=resolved.append)
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    t0 = datetime.now(timezone.utc)
+    with monkeypatch.context() as mp:
+        mp.setattr(sn, "rollback", lambda *a, **k: _Refused())
+        assert da.drill_tick(db, root, now=t0, **kw).action == "failed"
+    original = seen[0][1]
+    if outcome_after == "no-drillable":
+        _drop_kept_text(root)
+    return db, root, seen, resolved, kw, t0, original
+
+
+@pytest.mark.parametrize("after", ["no-drillable", "deferred"])
+def test_r1694_a_failed_drill_stays_a_failure_through_weeks_that_prove_nothing(scratch_store, monkeypatch, after):
+    db, root, seen, resolved, kw, t0, original = _failed_then(scratch_store, monkeypatch, after)
+    seen.clear()
+    for d in (8, 15, 22):
+        r = da.drill_tick(db, root, now=t0 + timedelta(days=d), dream_running=(after == "deferred"), **kw)
+        assert r.action == after
+    assert seen and {t for _, t in seen} == {original} and "has not restored" not in original
+    assert resolved == [] and sn.last_drill(root)["outcome"] == "failed"
+
+
+def test_r1694_a_legacy_skipped_record_carrying_a_failure_is_still_that_failure(scratch_store):
+    db = scratch_store
+    root = db.parent / "dream"
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    _drop_kept_text(root)
+    t0 = datetime.now(timezone.utc)
+    sn._write_json(root / sn.DRILL_RECORD, {"outcome": "skipped", "at": (t0 - timedelta(days=20)).isoformat(),
+                                            "carried_failure": "restore: boom"})
+    assert sn.last_drill(root)["outcome"] == "failed"
+    seen = []
+    r = da.drill_tick(db, root, now=t0, attention=lambda k, t: seen.append(t))
+    assert r.action == "no-drillable" and seen == ["the dream restore drill failed: restore: boom"]
+
+
+def test_r1694_an_ok_then_failed_then_nothing_proved_week_does_not_claim_a_restore_on_the_failed_date(
+        scratch_store, monkeypatch):
+    db, root, seen, resolved, kw, t0, original = _failed_then(scratch_store, monkeypatch, "no-drillable")
+    seen.clear()
+    da.drill_tick(db, root, now=t0 + timedelta(days=30), **kw)
+    assert [t for _, t in seen] == [original]
+
+
+def test_r1694_a_store_with_a_never_run_drill_gets_no_row_on_the_first_tick_after_an_upgrade(scratch_store):
+    db = scratch_store
+    root = db.parent / "dream"
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    _drop_kept_text(root)
+    m = sn.read_manifest(root / "o1")
+    m["taken_at"] = "2026-01-01T00:00:00Z"                      # a snapshot far older than two cadences
+    sn._write_manifest(root / "o1", m)
+    seen = []
+    t0 = datetime.now(timezone.utc)
+    r = da.drill_tick(db, root, now=t0, attention=lambda k, t: seen.append(t))
+    assert r.action == "no-drillable" and seen == []
+
+
+def test_r1694_the_never_run_clock_does_not_move_when_the_oldest_snapshot_is_pruned(scratch_store):
+    import shutil
+    db = scratch_store
+    root = db.parent / "dream"
+    seen = []
+    kw = dict(attention=lambda k, t: seen.append(t))
+    assert dream(db, "o1", text_n(1)).outcome == "saved"
+    add_episode(db, "two")
+    assert dream(db, "o2", text_n(2)).outcome == "saved"
+    _drop_kept_text(root)
+    t0 = datetime.now(timezone.utc)
+    da.drill_tick(db, root, now=t0, **kw)
+    shutil.rmtree(root / "o1")                                   # the oldest snapshot goes, as prune would
+    da.drill_tick(db, root, now=t0 + timedelta(days=14, hours=1), **kw)
+    da.drill_tick(db, root, now=t0 + timedelta(days=15), **kw)
+    assert len(seen) == 2 and seen[0] == seen[1] and t0.date().isoformat() in seen[0]
