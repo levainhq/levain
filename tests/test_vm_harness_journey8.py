@@ -315,3 +315,68 @@ def test_capture_tolerates_output_with_no_trailing_newline_and_a_blank_line():
     assert RB.capture(real, ["printf", "tail"]) == (["tail"], 0)        # glued to the marker before the fix
     assert RB.capture(real, ["/bin/sh", "-c", "echo a; exit 7"]) == (["a"], 7)
     assert RB.capture(lambda a, timeout=60: f"x\n\n{RB.RC_MARK} 0\n", ["q"]) == (["x"], 0)
+
+
+# ---- 1114 j06diag: the probe's argv against the product's own argparse; the observer leaves .git/index alone ----------
+
+def _adopt_argv(profile):
+    probe = J.ADOPT
+    rendered = RB.render_placeholders(probe.argv, session=SID, repo=REPO)
+    argv = J.levain_argv(profile, rendered)
+    return list(argv[argv.index("levain") + 1:])
+
+
+@pytest.mark.parametrize("profile", [DARWIN, LINUX])
+def test_the_adopt_probe_argv_parses_under_the_products_own_argparse(profile):
+    words = _adopt_argv(profile)
+    assert words[:2] == ["session", "adopt"]
+    ns = adopt_view._parser("adopt").parse_args(words[2:])
+    assert ns.session == SID and str(ns.repo) == REPO and ns.take == "head"
+
+
+@pytest.mark.parametrize("bad", [[SID], [SID, "--repo", REPO]])
+def test_the_form_the_1113_hand_run_sent_does_not_parse_or_is_not_noninteractive(bad):
+    """The reproduced failure of L6hand/adopt.txt (no --repo) and adopt2.txt (no --take): the first is a parse error, the
+    second parses with take=None, which the verb refuses off a terminal."""
+    p = adopt_view._parser("adopt")
+    if "--repo" not in bad:
+        with pytest.raises(Exception):
+            p.parse_args(bad)
+    else:
+        assert p.parse_args(bad).take is None
+
+
+def _git(repo, *a):
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=a@b", "-c", "user.name=n", *a], check=True,
+                   capture_output=True)
+
+
+def _index_digest(repo):
+    return hashlib.sha256((repo / ".git" / "index").read_bytes()).hexdigest()
+
+
+def test_readonly_status_leaves_git_index_unchanged_where_plain_status_rewrites_it(tmp_path):
+    import os
+    from scripts.vm_harness import readonly_observe as RO
+
+    def stale_repo(name):
+        r = tmp_path / name
+        r.mkdir()
+        _git(r, "init", "-q")
+        (r / "a.txt").write_text("hello\n")
+        _git(r, "add", "a.txt")
+        _git(r, "commit", "-qm", "one")
+        os.utime(r / "a.txt", (1_000_000_000, 1_000_000_000))      # stat data now differs from the index: status refreshes
+        return r
+
+    plain = stale_repo("plain")
+    before = _index_digest(plain)
+    subprocess.run(["git", "-C", str(plain), "status", "--short"], check=True, capture_output=True)
+    assert _index_digest(plain) != before                             # the reproduced defect: the observer rewrites the index
+
+    ro = stale_repo("ro")
+    before = _index_digest(ro)
+    out = RO.readonly_status("git", ro)
+    assert out == "" and _index_digest(ro) == before                  # same reading, index byte-identical
+    (ro / "a.txt").write_text("changed\n")
+    assert RO.readonly_status("git", ro).strip() == "M a.txt" and _index_digest(ro) == before
