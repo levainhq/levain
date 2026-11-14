@@ -233,24 +233,25 @@ _PHONE_PROBE = f"""(() => {{
   for (const sel of ['.list-intake-input', '.ep-search-input']) {{
     const i = T.querySelector(sel); const cs = getComputedStyle(i); const c = document.createElement('canvas').getContext('2d');
     c.font = cs.font; const w = c.measureText(i.placeholder).width;
-    out.ph.push({{sel, w, room: i.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight), ph: i.placeholder}});
+    out.ph.push({{sel, vw: window.innerWidth, old: c.measureText('remind thu 3pm call · ? talk').width, w, room: i.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight), ph: i.placeholder}});
   }}
   out.hs = document.documentElement.scrollWidth <= window.innerWidth + 1;
   return JSON.stringify(out);
 }})()"""
 
 
-# Each placeholder's text width against the room its input has. The width is measured in THIS machine's font; CI's chrome falls back to a
-# wider sans (run 43553474831: 220.25 px where this machine measures 194.77 for the same text, x1.131), so the fit must hold with a
-# FALLBACK_FONT margin, not bare.
-FALLBACK_FONT = 1.15
+# Each placeholder's text width against the room its input has, BARE (w <= room). The width is measured by the browser under test, in ITS
+# font, so CI's wider fallback sans (run 43553474831: 220.25 px where this machine measures 194.77, x1.131) is already inside w; a further
+# margin would compound it (x1.30 in CI). Measured here (px, w / room): 390: 143.8 / 204; 360: 143.8 / 174; 1000: 313.7 / 806 (wide text).
+# In CI's x1.131 font the narrow text is ~162.6 against ~171 at 360, so it still fits there. The OLD narrow text (194.8 here, ~220 in CI)
+# does not fit at 360 in either font, so the 360 read bites on it; at 390 it fits locally (194.8 in 204), so 390 alone would not.
 
 _PH_PROBE = f"""(() => {{
   const out = [];
   for (const sel of ['.list-intake-input', '.ep-search-input']) {{
     const i = {TRAY}.querySelector(sel); if (!i) continue; const cs = getComputedStyle(i); const c = document.createElement('canvas').getContext('2d');
     c.font = cs.font;
-    out.push({{sel, w: c.measureText(i.placeholder).width, room: i.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight), ph: i.placeholder}});
+    out.push({{sel, vw: window.innerWidth, old: c.measureText('remind thu 3pm call · ? talk').width, w: c.measureText(i.placeholder).width, room: i.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight), ph: i.placeholder}});
   }}
   return JSON.stringify({{phs: out, hs: document.documentElement.scrollWidth <= window.innerWidth + 1}});
 }})()"""
@@ -272,25 +273,28 @@ def test_the_list_fits_a_390_phone_with_real_shaped_rows(tmp_path: Path) -> None
             {"eval": _PHONE_PROBE},
             {"shot": str(shots / "phone_390.png")},
             {"emulate": {"w": 360, "h": 740, "dpr": 3, "mobile": True}},      # the narrower phones
-            {"until": f"{TRAY}.querySelector('.list-intake-input').clientWidth < 300 && 1"},
+            {"until": "window.innerWidth === 360 && 1"},
             {"eval": _PH_PROBE},
             {"shot": str(shots / "phone_360.png")},
             {"emulate": {"w": 1000, "h": 844, "dpr": 1}},                      # and a desktop width (the wide placeholder)
-            {"until": f"{TRAY}.querySelector('.list-intake-input').placeholder.startsWith('remind thu 3pm call X  ') && 1"},
+            {"until": f"window.innerWidth === 1000 && {TRAY}.querySelector('.list-intake-input').placeholder.startsWith('remind thu 3pm call X  ') && 1"},
             {"eval": _PH_PROBE},
         ])
     got = json.loads(next(x for x in out["values"] if isinstance(x, str) and x.startswith('{"rows"')))
     assert got["over"] == [], got["over"]                              # nothing overlaps the detail line or passes the card's edge
     assert got["hs"] is True, got                                      # and the page does not scroll sideways
     for ph in got["ph"]:
-        assert ph["w"] * FALLBACK_FONT <= ph["room"], ph               # neither placeholder is cut at 390, even in a wider fallback font
+        assert ph["vw"] == 390 and ph["w"] <= ph["room"], ph           # neither placeholder is cut at 390
     probes = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith('{"phs"')]
     assert len(probes) == 2, probes                                    # the 360 read and the desktop read
-    for probe in probes:
+    for probe, vw in zip(probes, (360, 1000)):
         assert probe["hs"] is True, probe                              # no sideways scroll at 360 or at desktop width
         assert len(probe["phs"]) == 2, probe
         for ph in probe["phs"]:
-            assert ph["w"] * FALLBACK_FONT <= ph["room"], ph           # 360 (narrow text) and 1000 (wide text) both fit
+            assert ph["vw"] == vw, ph                                  # the read is of the viewport it names, not a stale one
+            assert ph["w"] <= ph["room"], ph                           # 360 (narrow text) and 1000 (wide text) both fit
+    intake_360 = next(p for p in probes[0]["phs"] if p["sel"] == ".list-intake-input")
+    assert intake_360["old"] > intake_360["room"], intake_360          # the retired narrow text would not fit at 360: this read bites on it
     by = {r["t"]: r for r in got["rows"]}
     desk = next(r for t, r in by.items() if t.startswith("desk:"))
     assert desk["pills"] in ([], ["desk"]), desk                       # a "desk:" row names desk or nothing, never the band's store
@@ -334,7 +338,8 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
     from datetime import date, timedelta
     IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="plain domain row zz", domain="life", disposition="seed",
                                                             next=(date.today() + timedelta(days=30)).isoformat())   # held: the path that draws a trailing chip
-    ph = f"{TRAY}.querySelector('.list-intake-input').placeholder"
+    inp = f"{TRAY}.querySelector('.list-intake-input')"
+    ph = f"{inp}.placeholder"
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
@@ -357,10 +362,11 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
             {"eval": "JSON.stringify({adds: window.__mqAdds})"},
             {"eval": f"JSON.stringify({{ph: {ph}}})"},
             {"emulate": {"w": 1000, "h": 844, "dpr": 1}},
-            {"until": f"{ph}.startsWith('remind thu 3pm call X  ') && 1"},
+            {"until": f"window.innerWidth === 1000 && {ph} === {inp}.getAttribute('data-ph-wide') && 1"},
             {"eval": f"JSON.stringify({{ph: {ph}}})"},
             {"emulate": {"w": 390, "h": 844, "dpr": 3, "mobile": True}},
-            {"until": f"{ph} === 'remind thu 3pm call' && 1"},
+            {"until": f"window.innerWidth === 390 && {ph} === {inp}.getAttribute('data-ph-narrow') && 1"},
+            {"eval": f"JSON.stringify({{ph: {ph}, narrow: {inp}.getAttribute('data-ph-narrow'), wide: {inp}.getAttribute('data-ph-wide')}})"},
         ])
     vals = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
     rows = vals[0]["rows"]
@@ -381,8 +387,11 @@ def test_listfix2_one_pill_one_listener_and_known_origins_only(tmp_path: Path) -
         bad.append(f"B: expected exactly one media listener after the first build, got {first}")
     if after != first:
         bad.append(f"B: the media listener count grew {first} -> {after}")        # B: no listener per rebuild
-    assert vals[3]["ph"] == "remind thu 3pm call", vals[3]                 # narrow at 390
-    assert vals[4]["ph"].startswith("remind thu 3pm call X  ·  "), vals[4]               # wide again after the width change
+    narrow, wide = vals[5]["narrow"], vals[5]["wide"]                      # the literals come from the page's own attributes
+    assert narrow and wide and narrow != wide and len(narrow) < len(wide), vals[5]
+    assert vals[3]["ph"] == narrow, vals[3]                                # narrow at 390
+    assert vals[4]["ph"] == wide, vals[4]                                  # wide again after the width change
+    assert vals[5]["ph"] == narrow, vals[5]                                # and narrow again at 390
     assert not bad, bad
 
 
