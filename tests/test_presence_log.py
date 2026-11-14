@@ -22,6 +22,10 @@ def said(at: float) -> Match:
 
 
 def test_each_word_a_setter_replaces_stays_on_record_and_the_card_names_the_setter(tmp_path):
+    # the card below reads the REAL clock, so the rows are stamped at test time: the module's T is taken at
+    # collection, and a suite that runs longer than the last word's default quiet (the dep-drift run took 61
+    # minutes) would find the standing word already expired (found by the 11-14 dep-drift run, issue #4)
+    T = time.time() - 1800.0
     set_word(tmp_path, "quiet", duration="2h", now=T)
     set_word(tmp_path, "away", by=SEAT, said="anything at all", now=T + 60, match=said(T + 30))
     set_word(tmp_path, "sleep", now=T + 120)
