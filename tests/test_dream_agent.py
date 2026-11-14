@@ -594,14 +594,15 @@ def test_a_deferred_drill_raises_the_row_only_after_two_cadences(tmp_path):
 
 
 def _drop_kept_text(root):
-    """Make every snapshot look like one taken before the text was kept: no post record, no kept directory."""
+    """Make every snapshot look like one the released code took: the post record stays (it was written before the text
+    was kept), the kept-text marker and the kept directory are gone."""
     import shutil
     for p in root.glob(f"*/snap/{sn.POST_DIR}"):
         shutil.rmtree(p)
     for p in root.iterdir():
         m = sn.read_manifest(p) if p.is_dir() else None
         if m is not None:
-            m["post_files"], m["wrap_id"] = None, None
+            m.pop("post_kept", None)
             sn._write_manifest(p, m)
 
 
@@ -1387,6 +1388,7 @@ def test_r1694_the_never_run_clock_does_not_move_when_the_oldest_snapshot_is_pru
     assert dream(db, "o2", text_n(2)).outcome == "saved"
     _drop_kept_text(root)
     t0 = datetime.now(timezone.utc)
+    sn._write_manifest(root / "o2", {**sn.read_manifest(root / "o2"), "taken_at": (t0 + timedelta(days=7)).isoformat()})
     da.drill_tick(db, root, now=t0, **kw)
     shutil.rmtree(root / "o1")                                   # the oldest snapshot goes, as prune would
     da.drill_tick(db, root, now=t0 + timedelta(days=14, hours=1), **kw)

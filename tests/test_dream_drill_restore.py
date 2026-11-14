@@ -139,10 +139,11 @@ def test_t7_a_dream_rolled_back_by_hand_still_proves_the_mechanism(scratch):
 # ---------------------------------------------------------------------------------------------- no-drillable (T8)
 
 def _predate_kept_text(db, name):
-    """Make a snapshot look like one taken before the text was kept: no post record and no kept directory."""
+    """Make a snapshot look like one the released code took: the post record is there (it was written before the text
+    was kept), the kept-text marker and the kept directory are not."""
     shutil.rmtree(kept(db, name))
     m = sn.read_manifest(occ(db, name))
-    m["post_files"], m["wrap_id"] = None, None
+    m.pop("post_kept", None)
     sn._write_manifest(occ(db, name), m)
 
 
@@ -215,6 +216,33 @@ def test_r1694_a_kept_file_the_post_record_says_was_absent_fails_the_post_step(s
     m = sn.read_manifest(occ(scratch, "o2"))
     key = next(iter(m["post_files"]))
     m["post_files"][key] = None
+    sn._write_manifest(occ(scratch, "o2"), m)
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "failed" and [s["name"] for s in res.steps if s["status"] == "failed"] == ["post"]
+
+
+def test_r1694_a_snapshot_from_before_the_upgrade_is_no_drillable_and_records_no_failure(scratch):
+    two_dreams(scratch)
+    root = scratch.parent / "dream"
+    for n in ("o1", "o2"):
+        _predate_kept_text(scratch, n)
+        m = sn.read_manifest(occ(scratch, n))
+        assert m["post_files"] and "post_kept" not in m          # what the released code left: a post record, no marker
+    res = sn.drill(scratch, root)
+    assert res.outcome == "no-drillable" and not (root / sn.DRILL_RECORD).exists()
+
+
+def test_r1694_a_pre_upgrade_newest_falls_to_an_older_snapshot_that_kept_its_text(scratch):
+    two_dreams(scratch)
+    _predate_kept_text(scratch, "o2")
+    res = sn.drill(scratch, scratch.parent / "dream")
+    assert res.outcome == "ok" and res.snapshot == "o1", res
+
+
+def test_r1694_a_manifest_tier_key_the_build_no_longer_has_is_a_post_failure_not_a_crash(scratch):
+    two_dreams(scratch)
+    m = sn.read_manifest(occ(scratch, "o2"))
+    m["post_files"]["retired_tier"] = None
     sn._write_manifest(occ(scratch, "o2"), m)
     res = sn.drill(scratch, scratch.parent / "dream")
     assert res.outcome == "failed" and [s["name"] for s in res.steps if s["status"] == "failed"] == ["post"]

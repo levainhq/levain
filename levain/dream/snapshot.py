@@ -404,6 +404,7 @@ def record_post_for(db_path: Path | str, occ_dir: Path | str, wrap_id: Any, *, c
         changes = reinsertion_proof(db, occ_dir, m, wrap_id, composed_sha256, post["continuity"])
     _keep_post_text(db, occ_dir, post)
     m["post_files"] = post
+    m["post_kept"] = True      # after the text is kept: ``post_files`` alone is not proof, the released code wrote it first
     m["wrap_id"] = wrap_id
     for key in ("reinserted", "dropped"):
         if changes.get(key):
@@ -716,9 +717,10 @@ def _step(res: DrillResult, name: str, status: str, detail: str) -> str:
 
 def _drillable(m: Mapping[str, Any], occ_dir: Path) -> bool:
     """A snapshot the drill can restore from: the dream consolidated (a post record) and kept its saved text."""
-    # the kept directory is not asked for here: a manifest with a post record whose directory is gone is a damaged
-    # snapshot, which the drill's ``post`` step must fail on, not a snapshot to skip in favour of an older one
-    return bool(m.get("post_files"))
+    # the marker, not the directory: a snapshot the released code took has a post record and never kept the text, so it
+    # is not drillable and not damaged; a marked one whose directory is gone is damaged, which the drill's ``post`` step
+    # must fail on, not a snapshot to skip in favour of an older one
+    return bool(m.get("post_files")) and m.get("post_kept") is True
 
 
 def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True) -> DrillResult:
@@ -783,7 +785,8 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
             post_all = m.get("post_files") or {}
             post_want = {k: v for k, v in post_all.items() if v is not None}
             live = tier_hashes(db)
-            res.live_past_dream = sorted(text_tier(db)[k].name for k in live
+            tiers = text_tier(db)
+            res.live_past_dream = sorted(tiers[k].name for k in live
                                          if k in pre and live[k] not in (pre[k], (m.get("post_files") or {}).get(k)))
             # under the lock: copy every snapshot file, the db backup and the kept saved text to scratch and hash each
             # COPY against the manifest. A copy that mismatches is compared with its original (still under the lock,
@@ -806,15 +809,19 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
                         copy_and_check(snap / e["name"], socc / SNAP_DIR / e["name"], e["sha256"], e["name"], corrupt)
                 copy_and_check(snap / DB_BACKUP, bdir / DB_BACKUP, m.get("db_backup_sha256"), DB_BACKUP, corrupt)
                 for key, want in post_want.items():
-                    fname = (m["files"].get(key) or {}).get("name") or text_tier(db)[key].name
+                    tier_path = tiers.get(key)
+                    fname = (m["files"].get(key) or {}).get("name") or (tier_path.name if tier_path else key)
                     kept_file = snap / POST_DIR / fname
                     if kept_file.is_file():
                         copy_and_check(kept_file, sdir / fname, want, fname, post_bad)
                     else:
                         post_bad.append(f"{fname} (not kept)")
                 for key, want in post_all.items():       # a file the post record says was absent must be absent
-                    if want is None and (snap / POST_DIR / text_tier(db)[key].name).is_file():
-                        post_bad.append(f"{text_tier(db)[key].name} (kept, but the post record has no such file)")
+                    tier_path = tiers.get(key)
+                    if want is None and tier_path is None:
+                        post_bad.append(f"{key} (the post record names a text file this build does not have)")
+                    elif want is None and (snap / POST_DIR / tier_path.name).is_file():
+                        post_bad.append(f"{tier_path.name} (kept, but the post record has no such file)")
             except OSError as exc:
                 copy_err = f"{type(exc).__name__}: {exc}"
             if copy_err is None and not corrupt and not bad_copy and not post_bad:
