@@ -605,12 +605,12 @@ def test_a_safe_directory_entry_covering_the_workspace_is_found(tmp_path: Path, 
 
 
 def test_the_e2e_wildcard_row_brings_its_own_wildcard_not_the_images(tmp_path: Path, monkeypatch) -> None:
-    """Row 1719c: the control's "doctor warns that the runner's git trusts every repository" row passed only on an
+    """Row 1719c: the control's "doctor warns about a wildcard safe.directory in a gitconfig it is handed" row passed only on an
     image that ships ``safe.directory = *`` (the CI runner); a stock Ubuntu guest has none and ended CONTROL_EXIT=2.
     The row now hands doctor a config of its own that carries the wildcard (as the explicit-bareRepository row does
     its own), so it holds on any host; the doctor read it exercises is pinned here."""
     e2e = (Path(__file__).parent / "ci" / "isolation_e2e.sh").read_text()
-    line = next(ln for ln in e2e.splitlines() if "doctor warns that the runner's git trusts every repository" in ln)
+    line = next(ln for ln in e2e.splitlines() if "doctor warns about a wildcard safe.directory in a gitconfig it is handed" in ln)
     assert "GIT_CONFIG_GLOBAL=" in line and "GIT_CONFIG_NOSYSTEM=1" in line, line
     assert "directory = *" in e2e and "levain-iso-wildcard-gitconfig" in e2e
     cfg = tmp_path / "wild"

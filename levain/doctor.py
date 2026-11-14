@@ -5541,6 +5541,8 @@ def _check_setting_sources(*, claude_bin: str | None = None, version: str | None
     if version is ...:
         version = agent_version("claude_code", binary=claude, timeout=10.0)
     parsed = parse_cc_version(version or "")
+    if re.search(r"\d+\.\d+\.\d+-", version or ""):
+        parsed = None  # a prerelease is neither the measured version nor comparable to it: the unreadable (warn) path
     if parsed == measured_t:
         return [CheckResult(name, True, f'`--setting-sources ""` loads no project settings (measured on {measured}, the '
                             "installed version)")]
