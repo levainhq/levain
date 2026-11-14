@@ -392,6 +392,8 @@ LAZY_SITES = {
     # operator: a ``FACETS`` validator, run by ``validate_facets``, whose one caller is ``levain/cockpit/engine.py`` (the ``Cockpit``)
     'levain/cockpit/registry.py::_is_sign_facet::from levain.sign_request_id import request_id_ok': 'operator',
     'levain/cockpit/registry.py::_is_intention_id::from levain.consent.questions import valid_intention_id': 'operator',
+    # operator: the ``decision.queue`` ordering's ``uncounted_row`` predicate, run by the Decisions count in the operator's cockpit
+    'levain/cockpit/registry.py::_desk_owed_question::from levain.band_view import desk_owed': 'operator',
     # the queue broker (``levain.slot.services.qbroker``, ROOT_PYTHON as ``_levain_qbroker``): its GATE runs ``consent.limits.count_call`` -> ``_count``
     'levain/consent/limits.py::_count::from levain.cockpit.session_context import spend_step': 'root',
     # operator: the hook's limits path: ``consent.limits.check`` (called by the agent hooks ``consent/adapters/{claude_code,codex}.py`` only) -> ``_hold`` -> ``_resolve`` -> ``_filed_for`` / ``verified_allow``, ``release_if_extended``, and ``consent/limits_cli.py``; the queue broker runs ``count_call`` only
