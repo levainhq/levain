@@ -387,7 +387,7 @@ def test_the_drill_proves_a_restore_on_a_copy_and_never_touches_the_store(scratc
     before = (sn.tier_hashes(scratch), sn.sha256_file(scratch), sn.read_manifest(occ(scratch, "o2")))
     res = sn.drill(scratch, scratch.parent / "dream")
     assert res.outcome == "ok" and res.snapshot == "o2"
-    assert [(s["name"], s["status"]) for s in res.steps] == [("hash", "ok"), ("integrity", "ok"),
+    assert [(s["name"], s["status"]) for s in res.steps] == [("hash", "ok"), ("post", "ok"), ("integrity", "ok"),
                                                              ("restore", "ok"), ("open", "ok")]
     assert (sn.tier_hashes(scratch), sn.sha256_file(scratch), sn.read_manifest(occ(scratch, "o2"))) == before
     assert sn.last_drill(scratch.parent / "dream")["outcome"] == "ok"
@@ -417,16 +417,6 @@ def test_the_drill_catches_a_backup_that_hashes_right_but_is_corrupt(scratch):
     assert res.outcome == "failed" and [s["name"] for s in res.steps if s["status"] == "failed"] == ["integrity"]
 
 
-def test_the_drill_skips_the_restore_when_the_live_store_is_past_the_dream(scratch):
-    two_dreams(scratch)
-    (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')
-    res = sn.drill(scratch, scratch.parent / "dream")
-    # 1112-1 (F10): a drill whose restore was skipped is not a pass; it is its own outcome
-    assert res.outcome == "skipped" and [s["status"] for s in res.steps] == ["ok", "ok", "skipped", "skipped"]
-    assert "foreign-write" in res.steps[2]["detail"]
-    assert sn.last_drill(scratch.parent / "dream")["outcome"] == "skipped"
-
-
 def test_a_fresh_install_has_no_snapshot_yet_which_is_not_a_failure(scratch):
     res = sn.drill(scratch, scratch.parent / "dream")
     assert res.outcome == "no-snapshot" and res.steps == []
@@ -442,85 +432,6 @@ def test_drill_due_reads_the_cadence(tmp_path):
     assert not sn.drill_due(root, now + dt.timedelta(days=6)) and sn.drill_due(root, now + dt.timedelta(days=7, seconds=1))
     sn._write_json(root / sn.DRILL_RECORD, {"outcome": "ok", "at": "garbage"})
     assert sn.drill_due(root)
-
-
-def test_1112_1_a_snapshot_with_no_post_save_record_is_a_skipped_drill_not_a_pass(scratch):
-    two_dreams(scratch)
-    m = sn.read_manifest(occ(scratch, "o2"))
-    m["post_files"], m["wrap_id"] = None, None
-    sn._write_manifest(occ(scratch, "o2"), m)
-    res = sn.drill(scratch, scratch.parent / "dream")
-    assert res.outcome == "skipped" and [s["status"] for s in res.steps] == ["ok", "ok", "skipped", "skipped"]
-
-
-def test_1112_1_a_skipped_drill_after_a_failed_one_carries_the_failure_forward(scratch):
-    two_dreams(scratch)
-    root = scratch.parent / "dream"
-    bk = occ(scratch, "o2") / "snap" / sn.DB_BACKUP
-    good = bk.read_bytes()
-    bk.write_bytes(good[:-100] + b"\0" * 100)
-    assert sn.drill(scratch, root).outcome == "failed"
-    bk.write_bytes(good)
-    (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')              # a seat wrote since the dream
-    res = sn.drill(scratch, root)
-    assert res.outcome == "skipped"
-    # 1112-1 round 2: the hash step passed in THIS skipped drill, so the failure it found is not carried (it was a
-    # false red: the record said "hash: ..." while the same record's own steps said hash ok)
-    assert "carried_failure" not in sn.last_drill(root) and res.steps[0] == {
-        "name": "hash", "status": "ok", "detail": res.steps[0]["detail"]}
-    (scratch.parent / "memory.crystal.json").unlink()
-    assert sn.drill(scratch, root).outcome == "ok"
-
-
-class _Refused:
-    """A rollback that fails on the copy for a reason that is not the guard's: the restore step itself failed."""
-    outcome, code, message, restored = "failed", "x", "boom: the restore wrote the wrong files", []
-    ok = False
-
-
-def test_1112_1_r2_a_failure_on_the_restore_step_stays_carried_through_skipped_drills(scratch, monkeypatch):
-    two_dreams(scratch)
-    root = scratch.parent / "dream"
-    with monkeypatch.context() as mp:
-        mp.setattr(sn, "rollback", lambda *a, **k: _Refused())
-        assert sn.drill(scratch, root).outcome == "failed"
-    (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')                # a seat wrote since the dream
-    res = sn.drill(scratch, root)
-    assert res.outcome == "skipped" and "restore: boom" in sn.last_drill(root)["carried_failure"]
-    assert sn.drill(scratch, root).as_dict()["carried_failure"] == sn.last_drill(root)["carried_failure"]
-    (scratch.parent / "memory.crystal.json").unlink()                              # and a real pass drops it
-    assert sn.drill(scratch, root).outcome == "ok" and "carried_failure" not in sn.last_drill(root)
-
-
-def test_1112_1_r2_only_restore_and_open_failures_are_carried_by_a_skip(scratch):
-    two_dreams(scratch)
-    root = scratch.parent / "dream"
-    steps = lambda *names: [{"name": n, "status": "failed", "detail": f"{n} broke"} for n in names]   # noqa: E731
-    for name, carried in (("setup", False), ("hash", False), ("copy", False), ("integrity", False),
-                          ("restore", True), ("open", True)):
-        sn._write_json(root / sn.DRILL_RECORD, {"outcome": "failed", "snapshot": "o2", "steps": steps(name),
-                                                "at": "2026-01-01T00:00:00+00:00"})
-        (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')
-        rec = sn.drill(scratch, root).as_dict()
-        assert rec["outcome"] == "skipped" and ("carried_failure" in rec) is carried, (name, rec)
-        if carried:
-            assert rec["carried_failure"] == sn.failed_steps_text(steps(name))
-    (scratch.parent / "memory.crystal.json").unlink()
-
-
-def test_1112_1_r2_a_record_written_before_this_change_with_a_skipped_restore_reads_as_skipped(tmp_path):
-    root = tmp_path / "r"
-    root.mkdir()
-    old = {"outcome": "ok", "snapshot": "o2", "at": "2026-11-01T00:00:00+00:00",
-           "steps": [{"name": "hash", "status": "ok", "detail": ""}, {"name": "integrity", "status": "ok", "detail": ""},
-                     {"name": "restore", "status": "skipped", "detail": "foreign-write: ..."},
-                     {"name": "open", "status": "skipped", "detail": "no restored copy"}]}
-    sn._write_json(root / sn.DRILL_RECORD, old)
-    assert sn.last_drill(root)["outcome"] == "skipped"                            # was "ok"
-    assert json.loads((root / sn.DRILL_RECORD).read_text())["outcome"] == "ok"   # the file is not rewritten: a read-time view
-    real = {**old, "steps": [{**s, "status": "ok"} for s in old["steps"]]}
-    sn._write_json(root / sn.DRILL_RECORD, real)
-    assert sn.last_drill(root)["outcome"] == "ok"                                 # a real pass is untouched
 
 
 def test_1112_1_r2_a_drill_that_finds_no_snapshot_does_not_overwrite_the_last_record(scratch):
@@ -552,16 +463,6 @@ def test_the_verbs_roll_back_and_drill_a_store_copy(scratch, capsys):
     assert dcli.run_dream_rollback(_args(occurrence="o2", store_dir=d, who="cli", json=False)) == 0
     assert "already-reverted" in capsys.readouterr().out
     assert dcli.run_dream_rollback(_args(occurrence="nope", store_dir=d, who="cli", json=False)) == 2
-
-
-def test_1112_1_the_drill_verb_says_skipped_and_exits_non_zero_when_the_restore_was_not_exercised(scratch, capsys):
-    two_dreams(scratch)
-    (scratch.parent / "memory.crystal.json").write_text('{"x": 1}')
-    capsys.readouterr()
-    assert dcli.run_dream_drill(_args(store_dir=str(scratch.parent), root=None, json=False)) == 3
-    out = capsys.readouterr().out
-    assert out.splitlines()[0].startswith("levain dream drill: skipped") and "not a pass" in out.splitlines()[0]
-    assert "levain dream drill: ok" not in out
 
 
 def test_1112_1_r2_the_drill_verb_exits_4_and_names_the_holder_when_the_wrap_lock_is_held(scratch, capsys):
@@ -663,14 +564,6 @@ def test_m2_a_card_that_was_not_filed_is_refiled_by_a_rerun_with_the_same_record
     assert sn.read_manifest(occ(scratch, "o2"))["reverted_at"] == at
 
 
-def test_m5_the_drill_after_a_real_rollback_skips_instead_of_failing(scratch):
-    two_dreams(scratch)
-    assert sn.rollback(scratch, occ(scratch, "o2")).ok
-    res = sn.drill(scratch, scratch.parent / "dream")
-    assert res.outcome == "skipped" and [s["status"] for s in res.steps] == ["ok", "ok", "skipped", "skipped"]
-    assert "already-reverted" in res.steps[2]["detail"]
-
-
 def test_m5_the_drill_defers_while_a_wrap_is_open_and_records_nothing(scratch):
     from anneal_memory.continuity import prepare_wrap
     two_dreams(scratch)
@@ -684,9 +577,8 @@ def test_m5_the_drill_defers_while_a_wrap_is_open_and_records_nothing(scratch):
 
 def test_m6_the_drill_copies_under_the_wrap_lock_and_defers_when_it_is_held(scratch, monkeypatch):
     from levain import wrap as w
-    from levain.dream import executor as ex_
     two_dreams(scratch)
-    monkeypatch.setattr(ex_, "_copy_store", lambda *a: pytest.fail("the live store was copied without the lock"))
+    monkeypatch.setattr(sn, "_backup_db", lambda *a: pytest.fail("the live store was copied without the lock"))
     fd = w._lock_wrap_file(scratch.parent / "wrap.lock")
     try:
         res = sn.drill(scratch, scratch.parent / "dream")
@@ -698,9 +590,8 @@ def test_m6_the_drill_copies_under_the_wrap_lock_and_defers_when_it_is_held(scra
 
 def test_m6_the_drill_holds_the_lock_while_it_copies(scratch, monkeypatch):
     from levain import wrap as w
-    from levain.dream import executor as ex_
     two_dreams(scratch)
-    real = ex_._copy_store
+    real = sn._backup_db
     held = []
 
     def probe(src, dest):
@@ -709,7 +600,7 @@ def test_m6_the_drill_holds_the_lock_while_it_copies(scratch, monkeypatch):
         if h is not w._ANOTHER_WRAP_RUNNING:
             w._unlock_wrap(h)
         return real(src, dest)
-    monkeypatch.setattr(ex_, "_copy_store", probe)
+    monkeypatch.setattr(sn, "_backup_db", probe)
     assert sn.drill(scratch, scratch.parent / "dream").outcome == "ok"
     assert held == [True]
 
@@ -936,12 +827,11 @@ def lock_ledger(monkeypatch):
 
 @pytest.mark.parametrize("exc", [OSError("disk full"), sqlite3.OperationalError("locked"), KeyError("boom")])
 def test_j1_a_copy_that_raises_never_leaves_the_wrap_lock_held(scratch, monkeypatch, lock_ledger, exc):
-    from levain.dream import executor as ex_
     two_dreams(scratch)
 
     def boom(*a, **k):
         raise exc
-    monkeypatch.setattr(ex_, "_copy_store", boom)
+    monkeypatch.setattr(sn, "_backup_db", boom)
     try:
         res = sn.drill(scratch, scratch.parent / "dream")
         assert res.outcome == "failed" and res.steps[-1]["name"] == "restore"
@@ -964,12 +854,11 @@ def test_j1_a_failure_in_the_snapshot_copy_loop_releases_the_lock_too(scratch, m
 
 
 def test_j1_the_restore_copy_failing_still_hashes_and_checks_the_snapshot(scratch, monkeypatch):
-    from levain.dream import executor as ex_
     two_dreams(scratch)
-    monkeypatch.setattr(ex_, "_copy_store", lambda *a, **k: (_ for _ in ()).throw(OSError("full")))
+    monkeypatch.setattr(sn, "_backup_db", lambda *a, **k: (_ for _ in ()).throw(OSError("full")))
     res = sn.drill(scratch, scratch.parent / "dream")
     names = [(s["name"], s["status"]) for s in res.steps]
-    assert names[:2] == [("hash", "ok"), ("integrity", "ok")] and names[-1] == ("restore", "failed")
+    assert names[:3] == [("hash", "ok"), ("post", "ok"), ("integrity", "ok")] and names[-1] == ("restore", "failed")
 
 
 def test_j2_a_short_copy_is_never_reported_as_a_corrupt_snapshot(scratch, monkeypatch):

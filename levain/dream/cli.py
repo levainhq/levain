@@ -611,16 +611,23 @@ def run_dream_drill(args: argparse.Namespace) -> int:
             held = next((str(st["detail"]) for st in res.steps if st["name"] == "restore"), "a writer holds the store")
             print(f"levain dream drill: deferred ({held.removeprefix('deferred: ')}): nothing was proved and nothing "
                   f"was recorded, so the drill stays due; run it again when the writer is done")
+        elif res.outcome == "no-drillable":
+            print(f"levain dream drill: nothing to drill ({snap.NO_DRILLABLE_WHY}): nothing was proved and nothing "
+                  f"was recorded, so the drill stays due")
         else:
             print(f"levain dream drill: {res.outcome}" + (f" (snapshot {res.snapshot})" if res.snapshot else
                                                            " (no snapshot yet: not a failure)")
-                  + (": no restore ran, so this is not a pass" if res.outcome == "skipped" else ""))
+                  + (": the snapshot restores and the result opens." if res.outcome == "ok" else ""))
             for st in res.steps:
                 print(f"  {st['name']:10s} {st['status']:8s} {st['detail']}")
+            if res.live_past_dream:
+                print(f"  the live store is past this dream ({', '.join(res.live_past_dream)} changed since it saved): "
+                      f"levain dream rollback would refuse it today (foreign-write); the drill proves the restore, "
+                      f"not that today's store can take it.")
     # 0 a pass, or a fresh install (no snapshot yet); 1 a failed step; 2 an unusable --store-dir/--root (above);
-    # 3 skipped (the restore did not run: nothing was proved); 4 deferred (a writer holds the wrap lock: nothing was
-    # looked at).
-    return {"failed": 1, "skipped": 3, "deferred": 4}.get(res.outcome, 0)
+    # 4 nothing proved and nothing recorded, so the drill stays due: deferred (a writer holds the wrap lock) or
+    # no-drillable (no snapshot holds a dream's kept saved text).
+    return {"failed": 1, "deferred": 4, "no-drillable": 4}.get(res.outcome, 0)
 
 
 def _host_zone() -> str | None:
