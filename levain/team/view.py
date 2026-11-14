@@ -357,7 +357,7 @@ JS = """\
   measureAll(); window.addEventListener("resize", measureAll);
 
   // In Force filter: client-side over the rendered rows, case-insensitive substring over path + text, like the
-  // cockpit's Open Loops filter (same bar, same status line).
+  // cockpit's List filter (same bar, same status line).
   var q = document.getElementById("inforce-q"), st = document.getElementById("inforce-q-status");
   var res = document.getElementById("inforce-results");
   if (q && res) {

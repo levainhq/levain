@@ -147,11 +147,9 @@
   // its Esc, its Tab trap and its focus return are the one implementation every focus view uses.
   let modalCustom = null;
   let modalEpisodeQuery = "";
-  // Open-Loops filter query — CLIENT-side (the loops all ride the wire), persisted across
-  // re-renders (a verb fires → the board rebuilds → you stay in your filter) and into the
+  // The Tray filter query — CLIENT-side, persisted across re-renders (a verb fires, the board rebuilds, you stay in your filter) and into the
   // focus modal. Empty = show all. Matches intention text OR intention-id.
-  let openLoopsQuery = "";
-  const intentionQueries = Object.create(null);  // Tray / Open loops filter queries, keyed by panel kind
+  const intentionQueries = Object.create(null);  // the Tray filter query, keyed by panel kind
   // The Tray's chosen view ("" = the kernel's own order, else a view id) and the Episodes agent filter
   // ("" = all). Both are display choices that survive a refresh re-render in the same page.
   let trayView = "";
@@ -440,7 +438,7 @@
   // reflow), short panels render at natural height (no wasted space, no scrollbar).
   // Replaces the clamp+fade+click-to-expand model (Slice 1.5): bounded overview +
   // details-on-demand (the search box + the Slice-2 modal).
-  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "intentions", "tray", "external", "edits"]);
+  const CLAMP_KINDS = new Set(["config", "section", "episodes", "wraps", "crystals", "tray", "external", "edits"]);
 
   // Measure whether a bounded body overflows its cap; set the overflow SCENT (.has-overflow)
   // AND a keyboard scroll affordance accordingly. RE-RUNNABLE — clears the state when content
@@ -450,7 +448,7 @@
   // The work lists draw whole rows and say how many they leave out: a list that does not fit its card folds the rows below the fold
   // (display none, never a half row) and ends in an "N more" link that opens the panel's focus view. Re-runnable: a redraw, a filter
   // or a resize unfolds first and measures again.
-  const FOLD_PANELS = ["tray", "loops", "episodes", "inbox", "roster", "stream", "flow-episodes", "flow-intentions"];
+  const FOLD_PANELS = ["tray", "episodes", "inbox", "roster", "stream", "flow-episodes", "flow-intentions"];
   // what a folding list is made of: its rows (a work row, a roster row, a log line) and the headings that group them
   const FOLD_ROW = ".row, .rrow, .lrow", FOLD_HEAD = ".grp-head, .grp-h";
   function foldRows(body) {
@@ -1052,13 +1050,13 @@
     h2.after(pill);
   }
 
-  // The Board is two independent stacks, not rows that pair: Tray down the left, Open loops down the right, each as
+  // The Board is two independent stacks, not rows that pair: Tray down the left (the side table holds room for a second stack), each as
   // tall as its own cards, so the shorter card of a pair never leaves a hole. Other tabs lay the same cards out as plain grid items
   // (the stacks are display: contents there). Only a zone that holds both sides is stacked; a card the table does not name stays a
   // direct, full-width child.
-  const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0, loops: 1 });
+  const CK_STACK_SIDE = Object.assign(Object.create(null), { tray: 0 });
   // Top to bottom inside a side when nothing is saved (the CSS used to draw this with `order`, which would override a saved order).
-  const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0, loops: 0 });
+  const CK_STACK_RANK = Object.assign(Object.create(null), { tray: 0 });
   // ---- K5: collapse and reorder the cards of a zone, saved per browser (cockpit_view.js holds the storage). Reorder is within a zone and,
   // on the Board's two stacks, within a side. The Memory and Identity zones are composed by composeMemory (their own rows and sections),
   // so the layout does not reach them; the now band, sky, widgets, brief and Needs-you strip are not zone cards and have no controls.
@@ -1094,7 +1092,7 @@
   // A card whose place CSS `order` pins (a fold line, a dashed line, Recent episodes on the Board, the Build jobs / edits / loops rows) takes
   // a move as a no-op: it gets no move buttons and is never a neighbour. One set of keys here, never a CSS selector list beside it.
   const CK_PIN_BOARD = new Set(["episodes"]);
-  const CK_PIN_BUILD = new Set(["jobs", "jobs-none", "edits", "loops"]);
+  const CK_PIN_BUILD = new Set(["jobs", "jobs-none", "edits"]);
   function ckPinned(zone, key, nodes) {
     if (nodes.some((n) => n.classList.contains("ck-fold") || n.classList.contains("ck-dash"))) return true;
     const mode = document.body && document.body.dataset ? document.body.dataset.mode : "";
@@ -1619,7 +1617,6 @@
       case "health": return renderHealth(entry, view);
       case "graph": return renderGraph(entry, view);
       case "crystals": return renderCrystals(entry, view);
-      case "intentions": return renderIntentions(entry, view);
       case "tray": return renderTray(entry, view, opts);
       case "episodes": return renderEpisodes(entry, view, opts);
       case "wraps": return renderWraps(entry, view);
@@ -1993,10 +1990,10 @@
     return clause;
   }
 
-  // One intention row, shared by the two projections (Open Loops / Tray). The
+  // One intention row, shared by the two projections (the Tray, which is the List). The
   // leading chip is the panel's salient axis: Tray badges the `disposition` (the
-  // operator-I/O class — seed/handoff/agenda), Open Loops badges the `tier` (a parked loop badges "parked"). `verbs`
-  // rides only on a Class-B panel (Open Loops in 3a; Tray renders read-only until 3b
+  // operator-I/O class — seed/handoff/agenda), a parked List row also badges "parked". `verbs`
+  // rides only on a Class-B panel (the Tray renders read-only until 3b
   // turns on the governed dump/sort/park verbs — edit_class "" → isVerbPanel false → none).
   // The ONE place a verb-bearing row takes its verbs: every row kind (intention, episode, pending cancel) passes through
   // here. On the KE page the verbs are clipped until the row is hovered or has focus, so the row itself must be
@@ -2142,8 +2139,8 @@
       originDrawn = !!origin;
       if (origin) { const pill = el("span", "k7-repo", String(origin)); pill.dataset.repoFacet = String(origin); pill.dataset.originPill = "1"; host.appendChild(pill); }
     }
-    if (s.id && !foreign) { host.appendChild(el("span", "sid", s.id)); row.dataset.intention = String(s.id); }   // the Work lens finds a loop's row by this
-    // Tray badges the disposition (a legacy note badges "note"); Open Loops the tier (a parked loop badges "parked").
+    if (s.id && !foreign) { host.appendChild(el("span", "sid", s.id)); row.dataset.intention = String(s.id); }   // a row's handle
+    // Tray badges the disposition (a legacy note badges "note"); a List row wears its surface chip, and a parked someday also says "parked".
     let badge;
     if (badgeField === "disposition") badge = s.disposition;
     else badge = s.tier;
@@ -2152,6 +2149,13 @@
       chip.dataset.surfaceChip = s.surface;
       host.appendChild(chip);
     } else if (badge) host.appendChild(tagEl("tier", badge));
+    if (s.surface && !foreign && s.tier === "parked") {
+      const pk = tagEl("tier list-parked", "parked");
+      pk.dataset.parked = "1";
+      pk.title = "parked: it ranks last and stays quiet until you reactivate it";
+      row.dataset.parked = "1";
+      host.appendChild(pk);
+    }
     appendClause(row, s.text);  // FULL text + per-item expand (no truncation, no edit data-loss)
     if (host !== row) row.appendChild(host);
     if (foreign) {
@@ -2223,17 +2227,13 @@
         host.appendChild(tagEl("muted", late === 0 ? "due today" : "due " + shortDate(s.next)));
       }
     }
-    if (panelKind !== "tray" && s.tier) row.dataset.heat = String(s.tier);   // Open loops: a stripe per heat
     if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
-    // Build's Open loops draw "open N d" and the repo chip under the title (cockpit.css hides both elsewhere)
-    // the integer the kernel sends (the intention's own created date), never the badge words parsed back
-    if (Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "k7-opend", "open " + s.age_days + " d"));
     if (s.domain && !originDrawn) { const rc = el("span", "k7-repo", String(s.domain)); rc.dataset.repoFacet = String(s.domain); host.appendChild(rc); }
     if (verbs && s.id) appendRowVerbs(row, buildPlainIntentionVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
     return row;
   }
 
-  // The filter bar the intention panels share (Open Loops / Tray): CLIENT-side over the
+  // The filter bar the intention panels share (the Tray): CLIENT-side over the
   // loaded list, text (case-insensitive substring) OR intention-id. The query persists per panel
   // kind in `intentionQueries`, so a verb that rebuilds the board leaves you in your filter.
   // FILTER-EXTRACT-START (a node test lifts this block)
@@ -2284,7 +2284,7 @@
   // The List's rows are matched the way the kernel matches memory (levain/cockpit/engine.py `_fold` and `_terms_match`: casefold, NFD,
   // marks dropped; the query split on whitespace; EVERY term a substring of the row's text, support and id joined), so one query is
   // one result set across the rows here and the "Kept in memory" group beside them. (`toLowerCase` for `casefold`: they differ only
-  // for a few letters such as the German sharp s.) Used by the List only; Open Loops and the Tray keep the plain substring above.
+  // for a few letters such as the German sharp s.) Used by the List only; the Tray keeps the plain substring above.
   // `listQueryText` is the ONE normalisation of what is typed: control characters are spaces, at most KEPT_QUERY_MAX characters,
   // trimmed; the rows and the memory read both take this, never the raw box.
   const KEPT_QUERY_MAX = 200;
@@ -2312,7 +2312,7 @@
   const DESK_OWES_TITLE = "Desk owes (the desk is on these; nothing for you)";
   function renderIntentionProjection(entry, view, list, emptyMsg, badgeField, ropts) {
     const p = panel(entry);
-    // Both projections (Open Loops / Tray) come from ONE dashboard intention read,
+    // Both projections (the Tray) come from ONE dashboard intention read,
     // whose fault is recorded under the single "open_intentions" key — so every projection
     // reads its error from there BY DESIGN (not a copy-paste slip). If a future split gives
     // Tray its own source, give each its own error key here. [complement L3 LOW]
@@ -2593,52 +2593,6 @@
       timer = window.setTimeout(() => run(false), KEPT_DEBOUNCE_MS);
     });
     if (listQueryText(input.value)) run(true);      // a redrawn panel keeps its query: its memory part comes back with it
-  }
-
-  function renderIntentions(entry, view) {
-    const p = panel(entry);
-    const err = tierErr(view, "open_intentions");
-    if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
-    const all = view.open_intentions || [];
-    const verbs = isVerbPanel(entry);
-    // CLIENT-side filter over the loaded loops (they all ride the wire — no server round-trip,
-    // unlike the episode keyword search). Matches the intention TEXT (case-insensitive substring)
-    // OR the id ("intention-103", "spore-103" or "103"), so you can jump straight to a loop by handle or
-    // content [2026-06-19]. Reuses the .ep-search sticky bar for visual parity.
-    const bar = el("div", "ep-search");
-    const input = el("input", "ep-search-input");
-    input.type = "search";
-    input.placeholder = "filter loops by text or id…";
-    input.setAttribute("aria-label", "filter open loops by text or intention id");
-    const status = el("span", "ep-search-status", "");
-    bar.append(input, status);
-    p.appendChild(bar);
-    const results = el("div", "sp-results");
-    p.appendChild(results);
-    const render = (raw) => {
-      const q = raw.trim().toLowerCase();
-      const rows = q
-        ? all.filter((s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
-                            String(s.id || "").toLowerCase().includes(q))
-        : all;
-      results.replaceChildren();
-      if (rows.length === 0) {
-        results.appendChild(el("p", "empty",
-          q ? "no loops match “" + raw.trim() + "”" : "Nothing yet. What stays open after " + (view.entity_name || "the assistant") + " sorts the Tray is listed here."));
-      } else {
-        for (const s of rows) results.appendChild(intentionRow(s, verbs, "tier", entry.kind));
-      }
-      status.textContent = q ? (rows.length + (rows.length === 1 ? " match" : " matches") + " · ⌫ to clear") : "";
-      // result set changed → recompute the panel scent + the per-item expand toggles. .pbody
-      // is null on the initial render (finalizePanels reparents later, then measures) — no-op
-      // then, live on every input-driven re-render.
-      const b = results.closest(".pbody"); if (b) measureOverflow(b);
-      measureClauses(results);
-    };
-    input.addEventListener("input", () => { openLoopsQuery = input.value; render(input.value); });
-    if (openLoopsQuery) { input.value = openLoopsQuery; render(openLoopsQuery); }
-    else render("");
-    return p;
   }
 
   // Tray — the operator session-I/O inbox (seed/handoff/agenda dumps awaiting AI triage);
@@ -3522,7 +3476,7 @@
   // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
   // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
   const BUTTON_VERB = { touch: "intention_touch", edit: "intention_update", park: "intention_update",
-    reactivate: "intention_update", "when?": "intention_surface_at", who: "intention_retarget", "then you": "intention_then", Resolve: "intention_close", metabolize: "intention_set_disposition",
+    reactivate: "intention_update", "when?": "intention_surface_at", who: "intention_retarget", "then you": "intention_then", Resolve: "intention_close",
     dismiss: "intention_close", compost: "intention_close", promote: "intention_promote",
     tombstone: "episode_tombstone", keep: "intention_keep", "Make an agenda": "band_agenda" };
 
@@ -3592,17 +3546,17 @@
     // first-class — the item isn't ready for the lifecycle verbs yet. Then the route levers.
     if (panelKind === "tray") {
       wrap.appendChild(editBtn(wrap, s));
-      // metabolize — promote into cognition as a live loop (Tray->loop is never the
-      // silent-loss direction, so no confirm); the type LOCKS at this boundary.
-      wrap.appendChild(verbBtn("metabolize", "promote into cognition as a live loop", async (ev) => {
-        const b = ev.currentTarget; b.disabled = true;
-        const res = await commit({ kind: "intention_set_disposition", intention_id: s.id, disposition: "loop",
-          expect_disposition: s.disposition });
-        if (res && res.ok) return;  // re-rendered
-        b.disabled = false;
-        verbErr(wrap, res);
-      }));
       wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
+      // a parked someday offers the one way back: un-park (a tier change, not a resolve, so no confirm); the CAS holds the kind the page saw
+      if (s.tier === "parked") {
+        wrap.appendChild(verbBtn("reactivate", "un-park: back to a plain someday", async (ev) => {
+          const b = ev.currentTarget; b.disabled = true;
+          const res = await commit({ kind: "intention_update", intention_id: s.id, tier: "warm", expect_disposition: s.disposition });
+          if (res && res.ok) return;  // re-rendered
+          b.disabled = false;
+          verbErr(wrap, res);
+        }));
+      }
       // an agenda holds a target, so it has a who to change (a seed is given one through when?)
       if (rowTarget(s)) wrap.appendChild(verbBtn("who", "who does it: you or the machine", () => openWhoForm(wrap, s)));
       // only where the cockpit offers intention_then (an agenda); a row with no actions list (a legacy row) is offered none
@@ -3618,52 +3572,6 @@
         wrap.appendChild(verbBtn("keep", "keep these words as a memory and take the item off the List", () => openKeepForm(wrap, s)));
       }
       return gateByActions(wrap, s.actions);
-    }
-
-    // OPEN LOOPS — the entity's live cognition: the lifecycle verbs (+ edit + schedule).
-    wrap.appendChild(verbBtn("touch", "mark seen — reset its clock", async (ev) => {
-      const b = ev.currentTarget; b.disabled = true;
-      const res = await commit({ kind: "intention_touch", intention_id: s.id });
-      if (res && res.ok) return;  // shim re-fetched + re-rendered → this DOM is gone
-      b.disabled = false;
-      verbErr(wrap, res);
-    }));
-    wrap.appendChild(editBtn(wrap, s));
-    wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
-    // park — pin dormant: hide from active cognition but the loop stays OPEN (exempt from the
-    // dormancy→compost prompt), resurfaceable, and shown HERE with a parked marker (the Keep panel is gone).
-    // A parked row offers the inverse, "reactivate" (un-park, back to warm). A tier change
-    // (intention_update{tier}), NON-destructive (the loop isn't resolved), so no confirm.
-    // intention-173: both are offered only on a loop (this Open-Loops branch) → CAS the snapshot so a
-    // concurrent re-route before the write fails closed instead of tiering a now-note.
-    if (s.tier === "parked") {
-      wrap.appendChild(verbBtn("reactivate", "un-park → back into active cognition", async (ev) => {
-        const b = ev.currentTarget; b.disabled = true;
-        const res = await commit({ kind: "intention_update", intention_id: s.id, tier: "warm",
-                                   expect_disposition: s.disposition });
-        if (res && res.ok) return;  // re-rendered
-        b.disabled = false;
-        verbErr(wrap, res);
-      }));
-    } else {
-      wrap.appendChild(verbBtn("park", "pin dormant — hide from cognition, stays open (reactivate to restore)", async (ev) => {
-        const b = ev.currentTarget; b.disabled = true;
-        const res = await commit({ kind: "intention_update", intention_id: s.id, tier: "parked",
-                                   expect_disposition: s.disposition });
-        if (res && res.ok) return;  // re-rendered
-        b.disabled = false;
-        verbErr(wrap, res);
-      }));
-    }
-    // compost (descend) / promote (ascend) — destructive; kind comes from the
-    // intention's own type taxonomy (server-emitted, so the UI can't offer an invalid kind).
-    if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
-      wrap.appendChild(verbBtn("compost", "resolve this loop downward", () =>
-        openResolveForm(wrap, "intention_close", "compost", s, s.descend_kinds, false)));
-    }
-    if (Array.isArray(s.ascend_kinds) && s.ascend_kinds.length) {
-      wrap.appendChild(verbBtn("promote", "transmute into memory / project", () =>
-        openResolveForm(wrap, "intention_promote", "promote", s, s.ascend_kinds, true)));
     }
     return gateByActions(wrap, s.actions);
   }
@@ -7981,88 +7889,6 @@
     return true;
   }
 
-  // The Open loops panel on the PAGE: the focus view (a .modal) draws a copy of the same rows, which is not where the Work lens means to go.
-  function loopsPanel() {
-    return Array.prototype.find.call(document.querySelectorAll('.panel[data-ck-panel="loops"]'), (p) => !p.closest(".modal")) || null;
-  }
-  function loopRowIn(panel, id) {
-    return Array.prototype.find.call(panel.querySelectorAll(".row[data-intention]"), (n) => n.dataset.intention === id && !n.closest(".modal")) || null;
-  }
-  // The page's row for a loop, or null. A filter typed into the panel's bar hides rows by not drawing them, so a row that is missing under a
-  // query is looked for again with the query cleared through the bar's own input path; when it is not there either, the person's query is put back.
-  function loopFind(id) {
-    if (!id) return null;
-    const panel = loopsPanel();
-    if (!panel) return null;
-    let row = loopRowIn(panel, id);
-    if (row) return row;
-    const input = panel.querySelector(".ep-search-input");
-    if (!input || !input.value) return null;
-    const kept = input.value;
-    input.value = "";
-    // the bar applies its query synchronously on this event, so the second lookup needs no frame's wait
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    row = loopRowIn(panel, id);
-    if (!row) { input.value = kept; input.dispatchEvent(new Event("input", { bubbles: true })); }
-    else loopCleared = { id, kept, input };
-    return row;
-  }
-  // the query a successful lookup cleared, for a jump that then fails to put it back; and why the last jump failed ("absent", "edit", "hidden")
-  let loopCleared = null;
-  let loopWhy = "";
-  function loopRestore(id) {
-    const c = loopCleared;
-    loopCleared = null;
-    if (c && c.id === id && c.input.isConnected && !c.input.value) { c.input.value = c.kept; c.input.dispatchEvent(new Event("input", { bubbles: true })); }
-  }
-  // one highlight at a time: a second tap re-arms the same timer instead of racing the first one's end
-  let loopLitTimer = 0;
-  // An open loop the Work lens names goes to its row in the Open loops panel: a collapsed card is expanded through its own control, a row the
-  // list folded away is shown through the fold's own pin, and the row is scrolled to, focused and outlined (tv-lit) for a moment.
-  // True only when the row is on screen afterwards; false (nothing lit) when the page has no such row or the panel refused to unfold.
-  function loopGo(id) {
-    loopWhy = "";
-    const row = loopFind(id);
-    if (!row) { loopWhy = "absent"; return false; }
-    const panel = row.closest(".panel[data-ck-panel]");
-    if (!panel) { loopRestore(id); loopWhy = "hidden"; return false; }
-    if (panel.classList.contains("ck-collapsed")) {
-      const f = panel.querySelector(".ck-lay-fold");
-      if (f && !f.disabled) f.click();
-      // an unsaved edit refuses the fold: the card stays shut, and a row inside it is not lit
-      if (panel.classList.contains("ck-collapsed")) { loopRestore(id); loopWhy = "edit"; return false; }
-    }
-    const body = row.closest(".pbody");
-    if (row.dataset.folded || row.style.display === "none") {
-      // the fold keeps every row down to the one the reader opened: opening this one is the fold's own way of showing it
-      setExpanded(row, true);
-      if (body) measureOverflow(body);
-    }
-    if (!row.getClientRects().length) { loopRestore(id); loopWhy = "hidden"; return false; }
-    loopCleared = null;
-    for (const n of document.querySelectorAll(".tv-lit[data-intention]")) n.classList.remove("tv-lit");
-    row.classList.add("tv-lit");
-    window.clearTimeout(loopLitTimer);
-    loopLitTimer = window.setTimeout(() => row.classList.remove("tv-lit"), 2600);
-    // a row that already has a tab stop (the writable page's verbs) keeps it; one without gets a temporary -1 that blur takes away
-    if (!row.hasAttribute("tabindex")) {
-      row.tabIndex = -1;
-      row.addEventListener("blur", () => { if (row.getAttribute("tabindex") === "-1") row.removeAttribute("tabindex"); }, { once: true });
-    }
-    if (typeof row.focus === "function") row.focus({ preventScroll: true });
-    const calm = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-    const scroll = () => { if (typeof row.scrollIntoView === "function") row.scrollIntoView({ block: "center", behavior: calm ? "auto" : "smooth" }); };
-    const raf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window) : (f) => window.setTimeout(f, 16);
-    const at = () => row.getBoundingClientRect().top + window.scrollY;
-    // the unfold and the tab switch settle layout over a frame: scroll after it, and again when the row's place moved meanwhile
-    raf(() => {
-      const first = at();
-      scroll();
-      raf(() => { if (Math.abs(at() - first) > 1) scroll(); });
-    });
-    return true;
-  }
-
   // A session's transcript (Q8): the Sessions modal's row button fetches /cockpit/session/<stem>.json with the token this
   // page holds, as the consent details do, and draws it as text only (textContent, never HTML: the prompts and replies are
   // whatever an agent said). The record shows the events the hooks kept (cut ones marked) with the session's consent
@@ -11379,6 +11205,5 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, canGoFirst: needsCanGoFirst, goFirst: needsGoFirst, history: openDecisionsHistory };
-  window.LevainLoops = { find: loopFind, go: loopGo, why: () => loopWhy };
   window.LevainDashboard = { dayYearWords, render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();
