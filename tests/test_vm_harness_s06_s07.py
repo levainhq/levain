@@ -841,7 +841,12 @@ def _fire_entry_world(tmp_path, *, anchored: bool):
         S6.anchor_clock(r)
     oid, _agent = S6.prepare(r, str(tmp_path), None)
     proc = ctl.spawn_fire(r.store.directory, oid, env=ENV)
-    return r, oid, proc, proc.wait(120)
+    try:
+        return r, oid, proc, proc.wait(120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(10)
+        raise
 
 
 def test_a_fire_on_the_rigs_fixed_past_clock_claims_nothing_and_exits_zero_silently(tmp_path):
@@ -858,3 +863,15 @@ def test_anchor_clock_lets_the_fire_claim_its_row(tmp_path):
     # the fix: with the clock on the wall the same fire claims (its pid is on the row) and goes on to the run body
     r, oid, proc, rc = _fire_entry_world(tmp_path, anchored=True)
     assert r.row(oid)["pid"] == proc.pid
+
+
+def test_prepare_stamps_the_launch_at_the_wall(tmp_path):
+    """Codex L3 r1 MED, REPRODUCED: anchoring at wall-now stamped ``launched_at`` 60 s ahead of the wall (``prepare``
+    advances the rig's clock), so a vendor run shorter than that could end before it launched."""
+    from datetime import datetime, timezone
+    from tests.test_agents_launch import Rig
+    r = Rig(tmp_path)
+    S6.anchor_clock(r)
+    oid, _agent = S6.prepare(r, str(tmp_path), None)
+    launched = datetime.strptime(r.row(oid)["launched_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    assert abs((launched - datetime.now(timezone.utc)).total_seconds()) < 10, launched

@@ -274,14 +274,22 @@ def show_command(store_dir: Path | str, agent: str, *, python: str) -> list[str]
     return [python, "-m", "levain", "agents", "--store-dir", str(store_dir), "show", agent, "--json"]
 
 
+#: What ``prepare`` moves the rig's clock by before it stamps the launch (the signed link advances it; measured 11-14 by
+#: reading ``launched_at`` back after ``anchor_clock`` + ``prepare``, see ``test_prepare_stamps_the_launch_at_the_wall``).
+PREPARE_CLOCK_ADVANCE_S = 60
+
+
 def anchor_clock(rig: Any) -> None:
-    """Put the rig's clock on the wall clock (the rig's own ``now()`` adds 30 s, taken back here so ``rig.now()`` IS wall-now).
+    """Put the rig's clock so the launch is STAMPED at the wall clock: the rig's own ``now()`` adds 30 s and ``prepare``
+    advances the clock by :data:`PREPARE_CLOCK_ADVANCE_S` before it stamps, both taken back here.
     The rig's world starts at a fixed past instant, so the launch lease it stamps (``LEASE_S`` 900 s from there) is long
     lapsed by real time; the fire entry judges the lease on the REAL clock (``claim_fire``: ``lease_until > now``), claims
     nothing, and exits 0 silently with the row ``launched`` and no session ever made. Found at the 11-14 diagnosis of the
-    11-13 sitting's S06 FAIL (levain 41); ``test_the_fire_entry_claims_once_and_a_second_fire_does_nothing`` does the same."""
-    from datetime import datetime, timezone
-    rig.world.clock.now = datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
+    11-13 sitting's S06 FAIL (levain 41). A launch stamped ahead of the wall would let a short vendor run end BEFORE its
+    own ``launched_at``."""
+    from datetime import datetime, timedelta, timezone
+    rig.world.clock.now = (datetime.now(timezone.utc) - (rig.now() - rig.world.clock.now)
+                           - timedelta(seconds=PREPARE_CLOCK_ADVANCE_S))
 
 
 def real_fire_once(cfg: S06Config) -> tuple[int, str, dict]:
