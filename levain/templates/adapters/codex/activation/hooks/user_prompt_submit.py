@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Levain activation — UserPromptSubmit hook (Codex adapter).
 
-Layer B (recency) + the event-based prospective surface + Layer D (the
+Layer B (recency) + crystallized-pattern recall + Layer D (the
 ambient-nudge half).
 
 Wired to Codex's UserPromptSubmit event. Injects, at recency position
@@ -10,10 +10,9 @@ Wired to Codex's UserPromptSubmit event. Injects, at recency position
   1. One directive selected at random from activation/recency_directives.md —
      the within-session-durability layer. Selecting across differently-framed
      directives fights attention habituation.
-  2. Open intentions (prospective layer) whose content COLLIDES with this prompt —
-     the event-based germination surface: an open loop surfaces when the current
-     work touches it. Precision-biased and capped, so an unrelated prompt
-     injects nothing (the effortful full-list poll stays opt-in, per the seed).
+  2. Crystallized patterns whose domain this prompt touches — the collision
+     feature. (There is no per-prompt intention surface: Levain 1.0 has no loop
+     kind; a dated return is an agenda, rung by germinate at session start.)
   3. When episodes recorded since the last wrap reach WRAP_NUDGE_THRESHOLD, a
      one-line wrap nudge — the ambient half of Layer D.
 
@@ -73,12 +72,11 @@ except Exception:
 # substantial session, before the upper bound, without nagging a short one.
 WRAP_NUDGE_THRESHOLD = 12
 
-# Per-attempt timeout for the anneal-memory queries (wrap-count + open intentions).
+# Per-attempt timeout for the anneal-memory queries (wrap-count + crystal recall).
 # Tight because this hook runs before EVERY prompt — a slow or hung
 # anneal-memory must not stall the turn. (session_start.py uses the 5s default:
 # it fires once per session and is not latency-sensitive.)
 WRAP_CHECK_TIMEOUT = 2.0
-INTENTION_CHECK_TIMEOUT = 2.0
 CRYSTAL_CHECK_TIMEOUT = 2.0
 
 
@@ -152,26 +150,16 @@ def main() -> int:
         except Exception:
             pending_sig = None
 
-        # Event-based intention germination — open loops whose content collides with
-        # this prompt surface on their own (the intelligent prospective surface;
-        # the effortful full-list poll stays opt-in, per the seed). Precision-
-        # biased + capped, so an irrelevant prompt injects nothing. Prompt-key
-        # ("prompt") verified vs codex-cli 0.133.0 source (see module docstring);
-        # fail-open if a future Codex re-keys it.
-        prompt = payload.get("prompt")
-        if isinstance(prompt, str) and prompt.strip():
-            hits = hook.intentions_colliding(
-                prompt, hook.open_intentions(timeout=INTENTION_CHECK_TIMEOUT)
-            )
-            if hits:
-                sections.append(hook.format_intention_collisions(hits))
-
-        # Crystallized-pattern recall — the on-demand graduated-wisdom tier.
+        # Crystallized-pattern recall — the on-demand graduated-wisdom tier, and the collision
+        # feature (Levain 1.0 has no loop kind, so no intention is injected per prompt: loop
+        # fold, np-c3029a8a (a); a dated return is an agenda, which germinate rings).
         # A Proven pattern crystallized OUT of the always-loaded working set is
         # recalled here the moment this prompt touches its domain (the read-side
-        # twin of wrap-time crystallization routing). Independent of the intention
-        # surface above; fail-silent on an empty/absent crystal store. Same tight
-        # per-prompt timeout.
+        # twin of wrap-time crystallization routing). Fail-silent on an empty/absent
+        # crystal store. Tight per-prompt timeout. Prompt-key ("prompt") verified vs
+        # codex-cli 0.133.0 source (see module docstring); fail-open if a future
+        # Codex re-keys it.
+        prompt = payload.get("prompt")
         if isinstance(prompt, str) and prompt.strip():
             patterns = hook.crystal_recall(prompt, timeout=CRYSTAL_CHECK_TIMEOUT)
             if patterns:

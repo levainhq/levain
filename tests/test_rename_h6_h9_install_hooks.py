@@ -249,6 +249,7 @@ RENAMED_FILES = {
     "CLAUDE.md", "seed/memory.md",
     "activation/hooks/_levain_hook.py", "activation/hooks/session_start.py", "activation/hooks/user_prompt_submit.py",
 }
+HOOK_REL = {"activation/hooks/_levain_hook.py", "activation/hooks/session_start.py", "activation/hooks/user_prompt_submit.py"}
 DOC_RENAME = {"seed/spore_instructions.md": "seed/intention_instructions.md"}
 # A changed line must be about the rename: a changed line without one of these words is an unrelated change (a `seed`
 # directory or a sampling parameter swept up by a quoted-word rewrite would be exactly that).
@@ -320,6 +321,15 @@ def test_nothing_that_is_not_the_disposition_word_changed_in_those_files(both_in
     t_new = _tree(new)
     for rel in sorted(RENAMED_FILES | set(DOC_RENAME.values())):
         a, b = t_old[rel].decode(), t_new[rel].decode()
+        # The loop fold (levain#4, Phill np-c3029a8a (a)) deleted both intention arms from the three hooks: the collision
+        # helpers, their tokenizer and formatters, and the two arms in the entry points. That is a deletion with no rename
+        # word in it, so the line-level rule cannot hold for those three files any more. What survives for them is the part
+        # of the H7 guard that matters: the install's `seed/` paths (checked below for every file) and the retired noun
+        # staying out of the new copy.
+        if rel in HOOK_REL:
+            assert "spores" not in b.lower().replace("spores_json", ""), rel
+            assert a.count("seed/") == b.count("seed/"), rel
+            continue
         # The germinate-trigger helper gained a feature after the old release (row 178, the split: an agenda that waits on an
         # event), which is ADDED code with no rename word in it. For that one file the rename guard is therefore on what the
         # old release wrote: every line the old copy had and the new one lost must be about the rename (or be the
@@ -386,6 +396,10 @@ _ITEMS = [
     {"id": "intention-2", "text": "phone the vet about the cat", "type": "task", "germination": "growing",
      "disposition": "agenda", "next": "2020-01-01"},
 ]
+# one crystallized pattern: the per-prompt collision feature that STAYS after the loop fold (levain#4), and so the marker that the
+# prompt hook ran whole (the intention arms the matrix used to read, `[open loops — ...]`, are retired in the new hooks)
+_CRYSTAL = "stub_pattern_name"
+_CRYSTAL_ROWS = [{"name": _CRYSTAL, "level": 3, "explanation": "a stub pattern"}]
 _ANNEAL_STUB = f"""#!{sys.executable}
 import json, sys
 args = sys.argv[1:]
@@ -393,6 +407,9 @@ if args[:1] == ["--db"]:
     args = args[2:]
 if args[:2] in (["intention", "list"], ["spore", "list"]) and "--json" in args:
     print(json.dumps({_ITEMS!r}))
+    sys.exit(0)
+if args[:2] == ["crystal", "recall"]:
+    print(json.dumps({_CRYSTAL_ROWS!r}))
     sys.exit(0)
 sys.exit(1)
 """
@@ -405,10 +422,6 @@ if sys.argv[1:2] == [os.environ["LEVAIN_STUB_REFUSES"]]:
     sys.exit(2)
 sys.exit(0)
 """
-_DORMANT = "[open loops — due or gone quiet]"
-_COLLISION = "[open loops — relevant to what you're doing]"
-
-
 def _additional_context(stdout: str) -> str:
     for line in stdout.splitlines():
         try:
@@ -471,7 +484,12 @@ def test_an_old_hook_set_and_a_new_one_each_work_whole_and_a_mixed_set_goes_dark
     """The matrix: old/new for each of the three hook files of a real install (eight installs). A set is coherent when
     all three are one generation, and then both entry points show the surfaces; a mixed set raises an AttributeError the
     hooks swallow, so the surface that crosses the generation goes dark with nothing said. This is why the three move in
-    one step (see the `levain update` tests below), and what an old hook looks like next to this package."""
+    one step (see the `levain update` tests below), and what an old hook looks like next to this package.
+
+    Since the loop fold (levain#4) the new hooks have no intention arms, so the surfaces that crossed the generation are
+    different ones: the old prompt hook calls the renamed collision helper the new `_levain_hook.py` no longer has, and the
+    whole hook goes dark (crystal recall, the band and all) when that pair meets; the new prompt hook calls nothing the old
+    helper lacks. The old session-start hook's dormant arm is its own try, so it never takes the agenda surface with it."""
     old, new = old_and_new_installs
     for gens in itertools.product(("old", "new"), repeat=3):
         install = tmp_path / ("combo-" + "-".join(gens)) / "entity"
@@ -481,8 +499,7 @@ def test_an_old_hook_set_and_a_new_one_each_work_whole_and_a_mixed_set_goes_dark
                 shutil.copy2(old / "activation" / "hooks" / name, install / "activation" / "hooks" / name)
         got = _probe(install, scratch)
         hook_gen, start_gen, prompt_gen = gens
-        assert (_DORMANT in got["start"]) == (start_gen == hook_gen), (gens, got["start"])
-        assert (_COLLISION in got["prompt"]) == (prompt_gen == hook_gen), (gens, got["prompt"])
+        assert (_CRYSTAL in got["prompt"]) == (not (prompt_gen == "old" and hook_gen == "new")), (gens, got["prompt"])
         # the agenda surface survives every mixed set: what it spawns is the noun of the generation of `_levain_hook.py`, and
         # what it prints on a refusal is the noun of the generation of `session_start.py`. A NEW `session_start.py` over an
         # OLD `_levain_hook.py` (a package upgrade whose hook copies were not yet re-installed) must not go dark: it falls back
@@ -525,7 +542,7 @@ def test_the_parser_refuses_what_the_old_hook_spawns_and_accepts_what_the_new_on
 
 def _coherent(install: Path, scratch: Path) -> None:
     got = _probe(install, scratch)
-    assert _DORMANT in got["start"] and _COLLISION in got["prompt"], got
+    assert "[germinate]" in got["start"] and _CRYSTAL in got["prompt"], got
 
 
 def test_update_moves_all_three_hooks_together_when_none_is_edited(old_install, scratch):
@@ -549,6 +566,17 @@ def test_one_edited_hook_holds_the_other_two_so_the_set_never_mixes(old_install,
     (hooks / edited).write_bytes(before[edited] + b"\n# my own edit\n")
     edited_bytes = (hooks / edited).read_bytes()
     out, text = _update(old_install)
+    if edited == "_levain_hook.py":
+        # The loop fold (levain#4) took the renamed helper calls out of both entry points: the new `session_start.py` and
+        # `user_prompt_submit.py` call nothing an old helper lacks (the matrix test above runs that pair for real), so an
+        # edited OLD helper no longer holds them back. The edited helper itself is still kept and still listed for review.
+        assert (hooks / edited).read_bytes() == edited_bytes
+        assert "activation/hooks/_levain_hook.py" in out.review, out.review
+        for n in HOOK_FILES:
+            if n != edited:
+                assert (hooks / n).read_bytes() != before[n], f"{n} should have moved: it calls no renamed helper"
+        _coherent(old_install, scratch)
+        return
     # nothing of the three moved: the edited one is kept as it is, the others are the old generation still
     assert (hooks / edited).read_bytes() == edited_bytes
     for n in HOOK_FILES:
@@ -598,8 +626,9 @@ def test_once_the_edited_hook_is_merged_the_set_moves(old_install, scratch):
     (hooks / "session_start.py").write_bytes(merged)
     out, text = _update(old_install)
     assert (hooks / "session_start.py").read_bytes() == merged
+    assert b"intentions germinate" in (hooks / "_levain_hook.py").read_bytes()    # the new generation's spawn noun
     for n in ("_levain_hook.py", "user_prompt_submit.py"):
-        assert b"open_intentions" in (hooks / n).read_bytes() and b"open_spores" not in (hooks / n).read_bytes()
+        assert b"open_spores" not in (hooks / n).read_bytes()
     assert out.review == [], (out.review, text)
     _coherent(old_install, scratch)
 
@@ -622,7 +651,7 @@ def test_a_hook_that_cannot_be_written_puts_the_others_back(old_install, scratch
     real = install_mod._atomic_write_bytes
 
     def failing(target, data, *, like=None):
-        if Path(target).name == "user_prompt_submit.py" and b"open_intentions" in data:
+        if Path(target).name == "user_prompt_submit.py" and b"open_spores" not in data:   # the NEW generation's copy
             raise OSError(28, "No space left on device")
         return real(target, data, like=like)
 
