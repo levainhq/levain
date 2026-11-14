@@ -133,7 +133,8 @@ def test_a_source_the_past_read_could_not_rebuild_is_drawn_as_unknown_never_as_n
     out = _run(tmp_path, src, [{"until": STRIP}, {"eval": _scrub(0.4)}, {"until": "document.querySelector('#ck-hlens .tv-rbadge')"},
                                {"until": "document.querySelector('#ck-hlens .tv-unk')"}, {"eval": PROBE}])
     got = json.loads(out[-1])
-    assert any(u.startswith("open loops: not kept for the past") for u in got["unk"]), got
+    assert any(u.startswith("model and tokens: not kept for the past") for u in got["unk"]), got
+    assert not any(u.startswith("open loops") for u in got["unk"]), got       # the fold: the provider no longer reads intentions, so a replay no longer names them
     # a literal replay value: every unreadable name is said, in words, with the same reason
     v = _value()
     v["replay"] = True

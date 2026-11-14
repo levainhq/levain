@@ -1601,10 +1601,10 @@ class TestListPagePins:
         a = src.index(head)
         return src[a:src.index(tail, a)]
 
-    def test_open_loops_is_on_build_only_and_the_list_keeps_morning_and_board(self) -> None:
+    def test_there_is_no_open_loops_tab_entry_and_the_list_keeps_morning_and_board(self) -> None:
         view = self._js("cockpit_view.js")
-        assert 'tray: "morning board", loops: "build",' in view
-        assert 'loops: "board build"' not in view
+        assert 'tray: "morning board",' in view
+        assert "loops:" not in view      # the loop fold: no Open loops panel to place
 
     def test_the_intake_box_posts_one_line_and_holds_no_grammar(self) -> None:
         core = self._js("dashboard_core.js")
