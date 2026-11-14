@@ -236,12 +236,14 @@ class TestBuildView:
 
         db = tmp_path / "memory.db"
         IntentionStore(tmp_path / "memory.spores.json", id_prefix="intention").add(
-            type="task", text="an open loop", tier="hot", salience=2
+            type="task", text="an open intention", tier="hot", salience=2
         )
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert len(v.open_intentions) == 1
-        assert v.open_intentions[0].text == "an open loop"
-        assert v.open_intentions[0].tier == "hot"
+        # since the loop fold every intention row is a Tray row; the old bucket stays as a field, empty
+        assert v.open_intentions == []
+        assert len(v.tray) == 1
+        assert v.tray[0].text == "an open intention"
+        assert v.tray[0].tier == "hot"
 
     def test_long_intention_text_rides_full_and_raw_on_the_wire(self, tmp_path: Path) -> None:
         # DATA-SAFETY regression: the wire MUST carry the FULL, RAW intention text — not a
@@ -258,7 +260,7 @@ class TestBuildView:
             type="task", text=long_text, tier="hot", salience=2
         )
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert v.open_intentions[0].text == long_text  # FULL + RAW, byte-for-byte
+        assert v.tray[0].text == long_text  # FULL + RAW, byte-for-byte
 
     def test_long_episode_content_rides_full_on_the_wire(self, tmp_path: Path) -> None:
         # Same data-safety contract for episode content (was capped at 280). Read-only, so
@@ -289,9 +291,9 @@ class TestBuildView:
             intentions.add(type="task", text=f"loop {i}", tier="hot", salience=2)
         anneal = AnnealPaths.from_db(db)
         capped = SubstrateSource(anneal=anneal, max_intentions=2).build()  # source-level cap
-        assert len(capped.open_intentions) == 2
+        assert len(capped.tray) == 2
         uncapped = SubstrateSource(anneal=anneal).build()  # no cap → all three
-        assert len(uncapped.open_intentions) == 3
+        assert len(uncapped.tray) == 3
 
     def test_max_intentions_cap(self, tmp_path: Path) -> None:
         from anneal_memory.spores import IntentionStore
@@ -301,7 +303,7 @@ class TestBuildView:
         for i in range(5):
             store.add(type="task", text=f"loop {i}", tier="warm")
         v = build_substrate_view(AnnealPaths.from_db(db), max_intentions=3)
-        assert len(v.open_intentions) == 3
+        assert len(v.tray) == 3
 
     def test_corrupt_crystal_is_failsoft(self, tmp_path: Path) -> None:
         """A corrupt crystal store degrades VISIBLY (errors) without blanking the
@@ -326,10 +328,10 @@ class TestBuildView:
 
 
 class TestIntentionProjections:
-    """Slice 3: the open-intention layer splits into Open Loops / Tray / Keep by disposition
-    + tier (``levain.intentions.bucket_of``). Tests write spores.json DIRECTLY — anneal's
-    ``IntentionStore.add`` is disposition-blind by design (the de-risk: anneal round-trips an
-    unknown ``disposition`` untouched), so a disposition can only be set out-of-band."""
+    """The open-intention layer is ONE bucket since the loop fold: ``levain.intentions.bucket_of`` sends every
+    row to the Tray (the List's intention rows) and ``view.open_intentions`` stays as an empty field. Tests write
+    spores.json DIRECTLY — anneal's ``IntentionStore.add`` is disposition-blind by design (the de-risk: anneal
+    round-trips an unknown ``disposition`` untouched), so a disposition can only be set out-of-band."""
 
     @staticmethod
     def _write(path: Path, rows: list[dict]) -> None:
@@ -359,36 +361,47 @@ class TestIntentionProjections:
             self._row(id="s7", type="thought", text="legacy note", disposition="note"),
         ])
         v = build_substrate_view(AnnealPaths.from_db(db), max_intentions=1000)
-        # TS-5a: a parked loop stays in Open loops (its tier is the parked marker) ...
-        assert {s.id for s in v.open_intentions} == {"s1", "s5"}
-        assert next(s for s in v.open_intentions if s.id == "s5").tier == "parked"
-        # ... disposition WINS over the parked tier: s6 (parked seed) is an un-triaged Tray
-        # item, and a legacy note (s7) is shown in the Tray, never dropped.
-        assert {s.id for s in v.tray} == {"s2", "s3", "s4", "s6", "s7"}
+        # one bucket: every row is a Tray row, the old bucket is empty, nothing is lost
+        assert v.open_intentions == []
+        assert {s.id for s in v.tray} == {"s1", "s2", "s3", "s4", "s5", "s6", "s7"}
+        # a parked row keeps its tier (the marker the List draws); disposition and tier are independent
+        assert next(s for s in v.tray if s.id == "s5").tier == "parked"
+        assert next(s for s in v.tray if s.id == "s6").disposition == "seed"
+        # a legacy note is shown, never dropped
         assert next(s for s in v.tray if s.id == "s7").disposition == "note"
         assert not hasattr(v, "keep")
-        # TOTAL partition — every intention lands in exactly one bucket, nothing lost.
-        assert len(v.open_intentions) + len(v.tray) == 7
 
-    def test_disposition_defaults_to_loop(self, tmp_path: Path) -> None:
+    def test_disposition_defaults_to_someday(self, tmp_path: Path) -> None:
         db = tmp_path / "memory.db"
         self._write(tmp_path / "memory.spores.json",
                     [self._row(id="s1", tier="hot", text="no disposition key")])
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert v.open_intentions[0].disposition == "loop"
+        assert v.open_intentions == []
+        assert v.tray[0].disposition == "someday"
+        # what the store holds is kept apart from what the List reads: a key-absent row holds none
+        assert v.tray[0].stored_disposition is None
 
-    def test_unknown_disposition_fails_open_to_loop(self, tmp_path: Path) -> None:
-        # is_loop fails OPEN: an unknown/typo disposition reads as an in-cognition loop (a
-        # real loop wrongly hidden is the silent-harm class) → it stays in Open Loops, not
-        # silently swallowed into the Tray.
+    def test_a_literal_loop_reads_someday_and_keeps_what_the_store_holds(self, tmp_path: Path) -> None:
+        db = tmp_path / "memory.db"
+        self._write(tmp_path / "memory.spores.json",
+                    [self._row(id="s1", text="a raw-api loop", disposition="loop"),
+                     self._row(id="s2", text="an explicit someday", disposition="someday")])
+        v = build_substrate_view(AnnealPaths.from_db(db))
+        by = {s.id: s for s in v.tray}
+        assert (by["s1"].disposition, by["s1"].stored_disposition) == ("someday", "loop")
+        assert (by["s2"].disposition, by["s2"].stored_disposition) == ("someday", "someday")
+        assert "stored_disposition" not in by["s1"].to_dict()      # a version and label detail, never the wire
+
+    def test_unknown_disposition_is_a_tray_row_shown_by_name(self, tmp_path: Path) -> None:
+        # bucket_of is total: an unknown/typo disposition is a Tray row, read as stored, never swallowed
         db = tmp_path / "memory.db"
         self._write(tmp_path / "memory.spores.json",
                     [self._row(id="s1", tier="hot", text="typo", disposition="sed")])
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert [s.id for s in v.open_intentions] == ["s1"]
-        assert v.tray == []
+        assert v.open_intentions == []
+        assert [(s.id, s.disposition) for s in v.tray] == [("s1", "sed")]
 
-    def test_each_bucket_capped_independently(self, tmp_path: Path) -> None:
+    def test_the_tray_is_capped_and_the_old_bucket_stays_empty(self, tmp_path: Path) -> None:
         db = tmp_path / "memory.db"
         rows: list[dict] = []
         for i in range(4):
@@ -397,29 +410,38 @@ class TestIntentionProjections:
             rows.append(self._row(id=f"note{i}", text=f"note {i}", disposition="note"))
         self._write(tmp_path / "memory.spores.json", rows)
         v = build_substrate_view(AnnealPaths.from_db(db), max_intentions=2)
-        assert len(v.open_intentions) == 2 and len(v.tray) == 2
+        assert len(v.tray) == 2 and v.open_intentions == []
 
-    def test_tray_not_starved_by_loop_heavy_store(self, tmp_path: Path) -> None:
-        # Bucketing the FULL ranked list (not a pre-sliced head) keeps inbox rows alive when
-        # loops ahead of them in the rank exceed the cap; each bucket takes its own top N.
+    def test_tray_keeps_every_live_row_up_to_the_cap(self, tmp_path: Path) -> None:
+        # Bucketing the FULL ranked list (not a pre-sliced head): the cap keeps the top N by rank.
         db = tmp_path / "memory.db"
         rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}") for i in range(60)]
-        rows.append(self._row(id="dump", text="must survive", disposition="seed"))
+        rows.append(self._row(id="dump", text="late in the rank", disposition="seed"))
         self._write(tmp_path / "memory.spores.json", rows)
         v = build_substrate_view(AnnealPaths.from_db(db))  # default max_intentions=50
-        assert len(v.open_intentions) == 50
-        assert [s.id for s in v.tray] == ["dump"]
+        assert len(v.tray) == 50 and v.open_intentions == []
 
-    def test_parked_loops_not_starved_by_a_busy_install(self, tmp_path: Path) -> None:
-        # TS-5a L3 HIGH: parked sorts LAST in the rank, so a shared Open-loops cap dropped every
-        # parked loop once max_intentions live loops existed. Parked loops keep their own cap.
+    def test_parked_rows_not_starved_by_a_busy_install(self, tmp_path: Path) -> None:
+        # TS-5a L3 HIGH: parked sorts LAST in the rank, so one shared cap dropped every parked row once
+        # max_intentions live rows existed. The parked cap moved to the Tray bucket with the loop fold: a parked
+        # someday survives a full cap of live rows, under its own cap of the same size.
         db = tmp_path / "memory.db"
         rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}") for i in range(60)]
-        rows.append(self._row(id="parked1", tier="parked", text="dormant"))
+        rows.append(self._row(id="parked1", tier="parked", text="dormant", disposition="someday"))
         self._write(tmp_path / "memory.spores.json", rows)
         v = build_substrate_view(AnnealPaths.from_db(db))  # default max_intentions=50
-        assert len([s for s in v.open_intentions if s.tier != "parked"]) == 50
-        assert [s.id for s in v.open_intentions if s.tier == "parked"] == ["parked1"]
+        assert len([s for s in v.tray if s.tier != "parked"]) == 50
+        assert [s.id for s in v.tray if s.tier == "parked"] == ["parked1"]
+        assert v.open_intentions == []
+
+    def test_parked_rows_have_their_own_cap(self, tmp_path: Path) -> None:
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"live{i}", tier="hot", text=f"live {i}") for i in range(5)]
+        rows += [self._row(id=f"parked{i}", tier="parked", text=f"parked {i}") for i in range(5)]
+        self._write(tmp_path / "memory.spores.json", rows)
+        v = build_substrate_view(AnnealPaths.from_db(db), max_intentions=3)
+        assert len([s for s in v.tray if s.tier != "parked"]) == 3
+        assert len([s for s in v.tray if s.tier == "parked"]) == 3
 
     def test_resolved_status_drift_row_is_skipped(self, tmp_path: Path) -> None:
         # A status=resolved row left in the `intentions` array is store drift (anneal MOVES
@@ -433,6 +455,7 @@ class TestIntentionProjections:
         v = build_substrate_view(AnnealPaths.from_db(db), max_intentions=1000)
         all_ids = ([s.id for s in v.open_intentions]
                    + [s.id for s in v.tray])
+        assert v.open_intentions == []
         assert all_ids == ["s1"]  # the drift row excluded from EVERY bucket
 
     def test_non_str_next_is_coerced_not_crashed(self, tmp_path: Path) -> None:
@@ -442,7 +465,7 @@ class TestIntentionProjections:
         self._write(tmp_path / "memory.spores.json",
                     [self._row(id="s1", tier="hot", text="loop", next=20260626)])
         v = build_substrate_view(AnnealPaths.from_db(db))
-        assert v.open_intentions[0].next == "20260626"
+        assert v.tray[0].next == "20260626"
 
     def test_to_dict_and_render_text_carry_tray_and_parked(self, tmp_path: Path) -> None:
         from levain.dashboard import render_text
@@ -456,12 +479,13 @@ class TestIntentionProjections:
         ])
         v = build_substrate_view(AnnealPaths.from_db(db))
         d = v.to_dict()
-        assert [s["id"] for s in d["tray"]] == ["s2", "s6"]
+        assert {s["id"] for s in d["tray"]} == {"s1", "s2", "s5", "s6"}
         assert "keep" not in d
-        assert {s["id"] for s in d["open_intentions"]} == {"s1", "s5"}
+        assert d["open_intentions"] == []          # the field stays, empty
         text = render_text(v)
-        assert "Tray (2)" in text and "[seed] a fresh dump" in text and "[note] legacy note" in text
-        assert "Open loops (2)" in text and "[parked] parked loop" in text
+        assert "Tray (4)" in text and "[seed] a fresh dump" in text and "[note] legacy note" in text
+        assert "[someday] parked loop" in text
+        assert "Open loops" not in text
         assert "Keep" not in text
 
 
@@ -550,7 +574,7 @@ class TestCLISurface:
         text = render_text(build_substrate_view(AnnealPaths.from_db(db)))
         assert "LIVE" in text and "last wrap" in text  # a committed wrap reads live
         assert "Hebbian" not in text and "0 links" not in text
-        assert "Open loops" in text
+        assert "Open loops" not in text and "Tray (" in text
         assert "State" in text
 
 
@@ -726,8 +750,9 @@ class TestSlice15Surfaces:
         layout = v.layout()
         kinds = [e["kind"] for e in layout]
         assert "keep" not in kinds   # TS-5a: no Keep panel in the layout
+        assert "intentions" not in kinds   # the loop fold: no Open loops panel in the layout either
         # every panel kind is represented
-        for k in ("config", "intentions", "tray", "episodes", "edits", "health",
+        for k in ("config", "tray", "episodes", "edits", "health",
                   "graph", "crystals", "section", "wraps"):
             assert k in kinds
         # zones appear in IA order: identity → operate → mind (no interleaving)
@@ -750,7 +775,6 @@ class TestSlice15Surfaces:
         # verb-mediated lifecycle data — intentions AND episodes are Class B (episode
         # mutation = tombstone verb), NOT direct-edit. [L4 HIGH]
         by_kind = {e["kind"]: e for e in layout}
-        assert by_kind["intentions"]["edit_class"] == "B"
         assert by_kind["episodes"]["edit_class"] == "B"
         # Tray (Slice 3b): now Class B in the Operate zone (dump/triage/park verbs).
         for k in ("tray",):

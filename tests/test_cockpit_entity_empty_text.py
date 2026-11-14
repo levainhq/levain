@@ -1,4 +1,4 @@
-"""The empty Tray and Open loops sentences name the install's own entity, never a fixed name."""
+"""The empty List sentence names the install's own entity, never a fixed name (the Open loops panel and its sentence are gone with the loop fold)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ OLD = "Sage"      # the name the fixture install and the old fixed text carried
 
 
 def _install(tmp_path: Path, *, store: bool, config: bool) -> SubstrateSource:
-    """An install whose entity is NAME, with a Tray and Open loops that hold nothing (a store whose only intention is done, or no store at all; a legacy note now renders in the Tray)."""
+    """An install whose entity is NAME, with a List that holds nothing (a store whose only intention is done, or no store at all; a legacy note now renders in the Tray)."""
     root = _make_levain_install(tmp_path)
     (root / "seed" / "origin.md").write_text(f"# Who You Are — {NAME}\n\nYou are {NAME}.\n", encoding="utf-8")
     if config:
@@ -32,7 +32,7 @@ def _install(tmp_path: Path, *, store: bool, config: bool) -> SubstrateSource:
 
 def test_the_wording_names_the_entity_and_falls_back_to_the_capture_boxs_name() -> None:
     assert intention_empty("tray", NAME) == f"Nothing yet. Drop a line in the box above and {NAME} sorts it."
-    assert intention_empty("loops", NAME) == f"Nothing yet. What stays open after {NAME} sorts the List is listed here."
+    assert set(providers.INTENTION_EMPTY) == {"tray"}                     # no sentence for a panel that no longer exists
     for blank in (None, "", "   ", 3):
         assert INTENTION_EMPTY_ENTITY in intention_empty("tray", blank)
     assert OLD not in "".join(providers.INTENTION_EMPTY.values())
@@ -40,7 +40,7 @@ def test_the_wording_names_the_entity_and_falls_back_to_the_capture_boxs_name() 
 
 def test_an_empty_store_names_the_entity_the_install_resolves(tmp_path: Path) -> None:
     ck = build_default_cockpit(_install(tmp_path, store=True, config=False))
-    for pid in ("tray", "loops"):
+    for pid in ("tray",):
         p = ck.panel(pid, credential_class="token")
         assert p["status"] == "empty", p["status"]
         assert NAME in p["empty"] and OLD not in p["empty"], p["empty"]
@@ -48,14 +48,14 @@ def test_an_empty_store_names_the_entity_the_install_resolves(tmp_path: Path) ->
 
 def test_a_store_that_does_not_exist_yet_names_the_configured_entity(tmp_path: Path) -> None:
     ck = build_default_cockpit(_install(tmp_path, store=False, config=True))
-    for pid in ("tray", "loops"):
+    for pid in ("tray",):
         p = ck.panel(pid, credential_class="token")
         assert NAME in p["empty"] and OLD not in p["empty"], p["empty"]
 
 
 def test_a_store_that_does_not_exist_yet_names_the_origin_h1_entity(tmp_path: Path) -> None:
     ck = build_default_cockpit(_install(tmp_path, store=False, config=False))
-    for pid in ("tray", "loops"):
+    for pid in ("tray",):
         p = ck.panel(pid, credential_class="token")
         assert p["status"] == "empty", p["status"]
         assert NAME in p["empty"] and OLD not in p["empty"], p["empty"]
@@ -71,7 +71,7 @@ def test_a_rename_with_no_store_shows_on_the_next_read(tmp_path: Path) -> None:
 
 
 @needs_browser
-def test_the_page_names_the_entity_in_the_empty_tray_and_loops(tmp_path: Path) -> None:
+def test_the_page_names_the_entity_in_the_empty_list(tmp_path: Path) -> None:
     # no store at all: a store holding one done intention makes the List card say "Nothing due for you." instead (a done row is
     # the focus view's, levain/templates/web/dashboard_core.js `apart`), which is that card's own text and not the entity-named empty
     src = _install(tmp_path, store=False, config=True)
@@ -83,5 +83,5 @@ def test_the_page_names_the_entity_in_the_empty_tray_and_loops(tmp_path: Path) -
             {"eval": texts},
         ])
     got = out["values"][1]
-    assert len(got) == 2, got
+    assert len(got) == 1, got
     assert all(NAME in t and OLD not in t for t in got), got
