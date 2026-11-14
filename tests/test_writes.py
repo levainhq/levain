@@ -1485,8 +1485,42 @@ class TestIntentionUpdate:
         assert _intention_store(install).get(sid).get("disposition") == ""
         res = apply_edit(_scope(install), {
             "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
+            "ref": "p", "confirm": True, "expect_disposition": "someday"})
+        assert res["ok"]
+
+    def test_a_loop_snapshot_on_a_row_stored_as_an_empty_disposition_still_lands(self, install: Path) -> None:
+        # `loop` and `someday` read the same since the fold: an older client's `loop` snapshot is the same snapshot
+        sid = _add_intention(install)
+        path = _scope(install).anneal.intentions_json
+        data = json.loads(path.read_text(encoding="utf-8"))
+        rows = data["intentions"] if isinstance(data, dict) else data
+        next(r for r in rows if r["id"] == sid)["disposition"] = ""
+        path.write_text(json.dumps(data), encoding="utf-8")
+        res = apply_edit(_scope(install), {
+            "kind": "intention_promote", "intention_id": sid, "intention_kind": "project",
             "ref": "p", "confirm": True, "expect_disposition": "loop"})
         assert res["ok"]
+
+    def test_a_loop_snapshot_on_a_row_that_reads_someday_lands_since_the_two_are_one_kind(self, install: Path) -> None:
+        # the fold's intent (L3 r1, declared): the compare-and-set collapses loop and someday, so a client that rendered the
+        # row as `loop` before the rewrite is not answered stale after it
+        sid = apply_edit(_scope(install), {"kind": "intention_seed", "text": "x"})["intention_id"]
+        assert _intention_store(install).get(sid)["disposition"] == "someday"
+        res = apply_edit(_scope(install), {
+            "kind": "intention_set_disposition", "intention_id": sid, "disposition": "agenda",
+            "expect_disposition": "loop"})
+        assert res["ok"] and _intention_store(install).get(sid)["disposition"] == "agenda"
+
+    def test_set_disposition_loop_on_a_key_absent_row_is_refused_and_writes_nothing(self, install: Path) -> None:
+        from levain.writes import RETIRED_LOOP_MSG
+
+        sid = _add_intention(install)
+        assert "disposition" not in _intention_store(install).get(sid)
+        with pytest.raises(EditError) as ei:
+            apply_edit(_scope(install), {
+                "kind": "intention_set_disposition", "intention_id": sid, "disposition": "loop"})
+        assert ei.value.http_status == 422 and RETIRED_LOOP_MSG in str(ei.value)
+        assert "disposition" not in _intention_store(install).get(sid)
 
     def test_ascend_with_a_matching_snapshot_and_without_one_both_land(self, install: Path) -> None:
         a, b = _add_intention(install), _add_intention(install)
