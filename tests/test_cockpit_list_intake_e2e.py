@@ -77,7 +77,7 @@ def test_a_timed_drop_plants_an_agenda_for_the_desk_through_the_panel(rig: Rig, 
     fires = (NOW + timedelta(hours=2)).astimezone().replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M")
     sid = out["receipt"]["id"]
     assert out["receipt"] == {"kind": "drop", "id": sid, "fires": fires, "text": "call the dentist"}
-    assert out["receipt_line"] == intake.receipt_line(out["receipt"], NOW.astimezone().replace(tzinfo=None))
+    assert out["receipt_line"] == intake.receipt_line(out["receipt"])
     assert out["receipt_line"].startswith(f"scheduled drop {sid} fires ")
     row = IntentionStore(rig.root / ".levain" / "memory.spores.json", id_prefix="intention").get(sid)
     assert (row["disposition"], row["target"], row["next"]) == ("agenda", "desk", fires)
