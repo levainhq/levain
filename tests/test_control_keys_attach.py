@@ -244,9 +244,10 @@ class AttachServer:
 
     def __init__(self, path: str) -> None:
         self.path = path
-        self.conns: list = []      # per connection: {"at", "sessions", "overruns", "eof_after"}
+        self.conns: list = []      # per connection: {"at", "sessions", "overruns", "eof_after", "short"}
         self.close_after_attach = False
         self.answer_sessions = False
+        self.healthy_hold = 0.1    # how long a connection that answered SESSIONS stays open before it closes
         self.overrun_ignore = -1
         self.overrun_refuse = False
 
@@ -254,7 +255,7 @@ class AttachServer:
         self.server = await asyncio.start_unix_server(self._on, self.path)
 
     async def _on(self, r: asyncio.StreamReader, w: asyncio.StreamWriter) -> None:
-        me = {"at": asyncio.get_running_loop().time(), "sessions": 0, "overruns": [], "eof_after": None}
+        me = {"at": asyncio.get_running_loop().time(), "sessions": 0, "overruns": [], "eof_after": None, "short": False}
         self.conns.append(me)
         try:
             while True:
@@ -264,13 +265,14 @@ class AttachServer:
                     w.write(K.encode_admin({"id": req["id"], "ok": True, "attach": len(self.conns)}))
                     await w.drain()
                     if self.close_after_attach:
+                        me["short"] = True      # the decision to close was taken on THIS connection
                         break
                 elif req["op"] == "SESSIONS":
                     me["sessions"] += 1
                     if self.answer_sessions:
                         w.write(K.encode_admin({"id": req["id"], "ok": True, "drop": []}))
                         await w.drain()
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(self.healthy_hold)
                         break
                 elif req["op"] == "SPEND-OVERRUN":
                     me["overruns"].append({k: v for k, v in req.items() if k != "id"})
@@ -419,8 +421,10 @@ def test_short_lived_attachments_back_off(monkeypatch):
 
     async def body(k, srv):
         srv.close_after_attach = True
+        srv.healthy_hold = 0.5     # the healthy attachment stays open long enough for keys to read its SESSIONS answer under load
         k._attach_close(k.attached)
-        await R3.aio_until(lambda: len(srv.conns) >= 7, timeout=15, what="six short-lived attachments")
+        await R3.aio_until(lambda: len(srv.conns) >= 7 and srv.conns[6]["short"], timeout=15,
+                           what="six short-lived attachments, the seventh already told to close")
         at = [c["at"] for c in srv.conns[1:7]]
         gaps = [b - a for a, b in zip(at, at[1:])]
         srv.close_after_attach, srv.answer_sessions = False, True
