@@ -1240,7 +1240,7 @@
   function stackColumns(grid) {
     const kids = Array.from(grid.children);
     const side = (n) => CK_STACK_SIDE[n.dataset.ckPanel];
-    if (!kids.some((k) => side(k) === 0) || !kids.some((k) => side(k) === 1)) return;
+    if (!kids.some((k) => side(k) === 0)) return;   // the right stack is empty since the loop fold: it is still made (hidden), so the Board keeps its three-up grid
     const first = kids.find((k) => side(k) !== undefined);
     const cols = [el("div", "ck-col"), el("div", "ck-col")];
     cols[0].dataset.side = "left"; cols[1].dataset.side = "right";

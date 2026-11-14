@@ -3,7 +3,7 @@ store in the scratch home (the conftest isolates HOME: nothing here touches an o
 
 Pinned: the intake box submits ONE line and prints the server's receipt sentence verbatim (a plain line, a ``?`` talk, an ``@`` drop
 that commits, an ``@`` drop that waits for a signature); a refusal prints the server's reason in words; a 501 prints plainly; the
-surface chips filter the rows; Open loops is off the default Board tab and on Build; a board row offers no verb and a band row only
+surface chips filter the rows; there is no Open loops panel on any tab, and a parked someday wears a "parked" badge; a board row offers no verb and a band row only
 ``band_agenda`` (the page half is tests/test_list_page_keep_agenda.py).
 ``LEVAIN_LIST_SHOTS=<dir>`` keeps the desktop 1280 and phone 390 screenshots there."""
 from __future__ import annotations
@@ -162,11 +162,10 @@ def test_the_surface_chips_filter_and_no_band_or_board_row_has_a_verb(tmp_path: 
 
 
 @needs_browser
-def test_open_loops_is_off_the_board_tab_and_on_build(tmp_path: Path) -> None:
+def test_there_is_no_open_loops_panel_and_a_parked_someday_wears_a_badge(tmp_path: Path) -> None:
     root, src, _ids = _install(tmp_path)
     _seed_more(root)
     loops = "document.querySelector('[data-ck-panel=loops]')"
-    shown = f"(() => {{ const p = {loops}; return !!p && p.getClientRects().length > 0 && getComputedStyle(p).display !== 'none'; }})()"
     with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
             {"emulate": {"w": 1280, "h": 1000, "dpr": 1}},
@@ -174,19 +173,22 @@ def test_open_loops_is_off_the_board_tab_and_on_build(tmp_path: Path) -> None:
             {"eval": "location.hash = '#board'; 1"},
             {"until": "document.body.dataset.mode === 'board' && 1"},
             {"until": f"{TRAY} && {TRAY}.getClientRects().length > 0 && 1"},
-            {"eval": f"JSON.stringify({shown})"},
-            {"eval": "JSON.stringify({cols: document.querySelector('.ck-zgrid.ck-twocol') ? document.querySelector('.ck-zgrid.ck-twocol').dataset.cols : null, "
-                     f"tray: {TRAY}.getBoundingClientRect().width, vw: window.innerWidth, hs: document.documentElement.scrollWidth <= window.innerWidth + 1}})"},
+            {"eval": f"JSON.stringify({{loops: !!{loops}, hs: document.documentElement.scrollWidth <= window.innerWidth + 1}})"},
+            # the filter narrows the List to the two loops the fixture holds: the parked one wears its badge and its stripe marker
+            {"eval": f"(() => {{ const i = {TRAY}.querySelector('.ep-search-input'); i.value = 'loop'; i.dispatchEvent(new Event('input', {{bubbles: true}})); return 1; }})()"},
+            {"eval": f"JSON.stringify({{parked: [...{TRAY}.querySelectorAll('.row[data-parked]')].map(r => r.textContent), "
+                     f"chips: [...{TRAY}.querySelectorAll('.list-parked')].map(c => c.textContent), "
+                     f"plain: {TRAY}.querySelectorAll('.row:not([data-parked]) .list-parked').length}})"},
             {"eval": "location.hash = '#build'; 1"},
             {"until": "document.body.dataset.mode === 'build' && 1"},
-            {"until": f"{shown} && 1"},
-            {"eval": f"JSON.stringify({shown})"},
+            {"eval": f"JSON.stringify({{loops: !!{loops}}})"},
         ])
-    v = out["values"]
-    shown_values = [x == "true" for x in v if x in ("true", "false")]
-    assert shown_values == [False, True], v                            # absent on Board, present on Build
-    board = json.loads(next(x for x in v if isinstance(x, str) and x.startswith('{"cols"')))
-    assert board["hs"] is True and board["cols"] in (None, "1"), board  # the right column is gone, not a hole
+    v = [json.loads(x) for x in out["values"] if isinstance(x, str) and x.startswith("{")]
+    board, badge, build = v[-3], v[-2], v[-1]
+    assert board["loops"] is False and board["hs"] is True, board       # no Open loops panel on the Board
+    assert build["loops"] is False, build                               # nor on Build
+    assert len(badge["parked"]) == 1 and "a parked loop" in badge["parked"][0], badge
+    assert badge["chips"] == ["parked"] and badge["plain"] == 0, badge  # one badge, on the parked row only
 
 
 # --- the List at a true phone width, with real-shaped rows (levain 72, key 1108-34, lane listmobile) ---------------------------
@@ -579,11 +581,8 @@ def _carried_install(tmp_path: Path, monkeypatch: Any, *, all_desk: bool = False
             options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the plan", cwd="/w/bje")
     if not intentions:       # nothing but band rows is left on the card
         store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
-        for sp in store.list_open():
-            store.update(sp["id"], disposition="loop")
-        for key in ("seed", "held", "note"):
-            if store.get(ids[key]):
-                store.update(ids[key], disposition="loop")
+        for sp in store.list_open():   # the loop fold: a "loop" disposition is a someday on the List now, so the rows are removed instead
+            store.descend(sp["id"], kind="dropped")
     _host_band(monkeypatch, all_desk=all_desk)
     return src
 
@@ -648,7 +647,7 @@ def test_lpr3_one_carried_desk_row_only_is_counted_in_the_control_and_listed_und
     root, src, ids = _install(tmp_path)
     store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
     for sp in store.list_open():
-        store.update(sp["id"], disposition="loop")
+        store.descend(sp["id"], kind="dropped")
     from levain.consent.questions import QuestionStore
     QuestionStore(default_queue_dir()).file(agent="claude_code", agent_session_id="s8", what="desk: carried Launch the TAOSERV upgrade seat.",
                                             options=[("ship", "Ship it"), ("hold", "Hold")], rec="hold", blocks="the upgrade", cwd="/w/taoserv")

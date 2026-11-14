@@ -8,8 +8,9 @@ from pathlib import Path
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_cockpit_k2a import _install, _serve
 
-ROW = ('[...document.querySelectorAll(".row")].find(r => r.querySelector(".clause") && '
-       'r.querySelector(".clause").textContent === "a tray seed" && r.querySelector(".verb-actions"))')
+
+ROW = ('[...document.querySelectorAll("[data-ck-panel=tray] .row")].find(r => r.querySelector(".clause") && r.getClientRects().length > 0 && '
+       'r.querySelector(".verb-actions"))')   # a visible List row: the fold shows the first few rows only
 
 
 def _page(tmp_path: Path, steps: list[dict]) -> list:
@@ -44,8 +45,8 @@ def test_at_most_three_verbs_show_and_the_rest_sit_in_the_overflow_menu(tmp_path
     got = vals[1]
     assert got["vis"] == ["when?", "Resolve", "···"]      # DOM order; CSS draws Resolve first, got
     # no reclassify: the type is the entity's to sort. "keep" is the List's Keep verb (intention_keep, offered on a plain
-    # intention row by dashboard_core.js; rows 182/183), which a plain intention row's menu carries after metabolize
-    assert got["menu"] == ["edit", "metabolize", "keep"], got
+    # intention row by dashboard_core.js; rows 182/183), which a plain intention row's menu carries after edit (metabolize went with the loop fold)
+    assert got["menu"] == ["edit", "keep"], got
     # a copy of each inline verb waits in the menu for a narrow row (container query); it shows nowhere on a wide one
     assert got["dups"] == ["Resolve:none", "when?:none"], got
     assert (got["haspopup"], got["expanded"], got["menuHidden"]) == ("menu", "false", True), got
@@ -64,7 +65,7 @@ def test_the_overflow_menu_opens_and_closes_by_keyboard(tmp_path: Path) -> None:
                  "return [v.querySelector('.verb-more').getAttribute('aria-expanded'), v.querySelector('.verb-menu').hidden, document.activeElement.textContent]; })()"},
     ])
     assert vals[1] == ["true", False, "edit"], vals
-    assert vals[2] == "metabolize", vals
+    assert vals[2] == "keep", vals
     assert vals[3] == ["false", True, "···"], vals
 
 

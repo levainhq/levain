@@ -128,7 +128,7 @@ class TestSubstrateJson:
             assert key in data
         assert data["health"]["total_episodes"] == 2
         assert data["health"]["write_path_live"] is True
-        assert len(data["open_intentions"]) == 1
+        assert data["open_intentions"] == [] and len(data["tray"]) == 1      # the loop fold: one bucket, the List
         assert data["sections"][0]["heading"] == "State"
 
     def test_extra_panels_merge_into_layout_and_data(self, tmp_path: Path) -> None:
@@ -386,7 +386,7 @@ class TestSubstrateJson:
         assert headers["Content-Type"] == "application/json; charset=utf-8"
         data = json.loads(body)
         assert data["health"]["total_episodes"] == 2
-        assert len(data["open_intentions"]) == 1
+        assert data["open_intentions"] == [] and len(data["tray"]) == 1
 
     def test_endpoint_ignores_query_string(self, tmp_path: Path) -> None:
         with _serving(_store_with_data(tmp_path)) as (base, _):
@@ -526,8 +526,8 @@ class TestAssets:
         boot = load_web_asset("dashboard_boot.js")
         for m in re.finditer(r'kind: "intention_set_disposition"[^}]*\}', core):
             assert "expect_disposition: s.disposition" in m.group(0), m.group(0)
-        # one route-dependent write is left (metabolize); the Keep's to-tray / activate / remind-me went with the panel (TS-5a)
-        assert len(re.findall(r'kind: "intention_set_disposition"', core)) == 1
+        # none is left: metabolize went with the Open loops panel (the loop fold), and the Keep's to-tray / activate / remind-me went with its panel (TS-5a)
+        assert len(re.findall(r'kind: "intention_set_disposition"', core)) == 0
         assert "req.expect_disposition = s.disposition;" in core
         assert 'if (kind === "intention_close") req.expect_disposition' not in core
         assert "retireStaleForm(form)" in core and "levain:editor-closed" in core
@@ -632,9 +632,9 @@ console.log("OK");
             assert token in core, f"dashboard_core.js missing {token!r} (per-item expand)"
         # park = pin an OPEN loop to Keep via a tier change (mirror of reactivate) — NOT a
         # compost/descend kind (park is pause-not-resolve) [Phill 2026-06-19].
-        assert '"park"' in core and 'tier: "parked"' in core, "Open-Loops 'park' verb missing"
-        # Open-Loops client-side filter (text OR intention-id), persisted across re-renders
-        assert "openLoopsQuery" in core, "Open-Loops filter (openLoopsQuery) missing"
+        assert "reactivate" in core and "intention_update" in core, "the parked List row's reactivate verb is missing"
+        # the Open-Loops filter and its verbs went with the panel (the loop fold)
+        assert "openLoopsQuery" not in core and '"metabolize"' not in core and 'tier: "parked"' not in core
         assert "ta.value = s.text" in core, "openTextEdit must seed the editor from the full s.text"
         assert "-webkit-line-clamp" in css, "dashboard.css missing the clause line-clamp"
         # the clamp is SCOPED to .clampable (only toggle-backed clauses) so a bare .clause
