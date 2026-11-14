@@ -7,27 +7,27 @@ import threading
 from types import SimpleNamespace
 
 from levain.autonomic import ActionManifest, ActionRisk, Posture, RiskClass
-from levain.autonomic.binding import binding_family
-from levain.cockpit.graduation_cards import CARD_DAYS, card_of, graduation_view, policy_create_line, read_steps
+from levain.authority import GRADUATION_KIND, stopped_way
+from levain.cockpit.graduation_cards import card_of, graduation_view, read_steps
 from tests.autonomic_test_only_coverage import TestOnlyCoverage
 from tests.test_autonomic_graduation_due import LATER, LOW, _binding, _due, _store, policy
 
 HIGH = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, financial=False)
 
 
-def test_an_uncovered_step_gets_one_line_narrowed_to_its_family_at_the_target_rung(tmp_path):
+def test_an_uncovered_step_gets_a_card_with_no_command_and_the_way_back_in_the_shared_words(tmp_path):
+    # S-A removed the `levain binding` verbs: the card prints no command, and its note is the shared sentence
     b = _binding()
     s = _store(tmp_path, b)
     [step] = _due(s, TestOnlyCoverage([]))
     card = card_of(step)
-    fam = binding_family(b)
-    assert card["command"] == (f"levain binding policy create --action deliver=LOW --lowest ON_LOOP --days {CARD_DAYS} "
-                               f"--family {fam} --store-dir {s.path} --guard <guard.json> --signing-key <key>")
+    assert card["command"] is None and stopped_way(GRADUATION_KIND) in card["note"]
+    assert "levain binding" not in json.dumps(card)
     assert card["from"] == "COOLING_OFF" and card["to"] == "ON_LOOP" and card["clean_count"] == 20
     assert card["actions"] == [{"link": 0, "action": "deliver", "risk": {"cls": 1, "reversible": True,
                                                                           "external": False, "financial": False},
                                 "covered": False}]
-    assert "no live policy" in card["why"] and "lets deliver run at ON_LOOP" in card["note"]
+    assert "no live policy" in card["why"]
 
 
 def test_no_line_is_offered_for_an_action_no_policy_may_sign_or_the_manifest_does_not_declare(tmp_path):
@@ -90,30 +90,9 @@ def test_the_proposals_route_carries_the_graduations_beside_the_proposals(tmp_pa
                                           graduation_engine=lambda apply: _due(s, TestOnlyCoverage([]), apply=apply)))
     assert status == 200 and body["proposals"] == []
     [card] = body["graduations"]["cards"]
-    assert card["to"] == Posture.ON_LOOP.name and card["command"].startswith("levain binding policy create ")
+    assert card["to"] == Posture.ON_LOOP.name and card["command"] is None
     status, body = _route(SimpleNamespace(request_gate=threading.Lock(), consent_reader=SimpleNamespace()))
     assert body == {"proposals": []}                       # nothing wired: the payload as it was
-
-
-def test_the_line_names_a_store_that_is_not_the_default_and_none_that_is(tmp_path, monkeypatch):
-    # RULINGS_R1 item 5: copying the line signs the store the engine runs in
-    import shlex
-
-    s = _store(tmp_path, _binding())
-    [step] = _due(s, TestOnlyCoverage([]))
-    assert f"--store-dir {shlex.quote(str(s.path))}" in card_of(step)["command"]
-    monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "home"))
-    from levain.autonomic.db import default_store_dir
-    home = _store_at(default_store_dir(), _binding())
-    [step] = _due(home, TestOnlyCoverage([]))
-    assert "--store-dir" not in card_of(step)["command"]
-
-
-def _store_at(path, b):
-    from levain.autonomic import BindingStore
-    st = BindingStore(path)
-    st.add(b)
-    return st
 
 
 def test_a_slow_engine_does_not_hold_the_request_gate(tmp_path):
@@ -141,13 +120,3 @@ def test_read_steps_with_no_room_reads_nothing(tmp_path):
     _due(s, TestOnlyCoverage([policy("gp-1", {"deliver": LOW}, expires_at=LATER)]))
     assert len(read_steps(s.path)) == 1
     assert read_steps(s.path, limit=0) == [] and read_steps(s.path, limit=-1) == []
-
-
-def test_the_line_names_its_paths_absolute_whatever_the_engine_was_given(tmp_path, monkeypatch):
-    # RULINGS_R2 item 3: a line copied to another directory signs the same store into the same cockpit
-    import shlex
-
-    monkeypatch.chdir(tmp_path)
-    line = policy_create_line({"deliver": LOW}, "ON_LOOP", 30, ["fam"], store_dir="st/store", data_root="ck")
-    assert f"--store-dir {shlex.quote(str((tmp_path / 'st' / 'store').resolve()))}" in line
-    assert f"--data-root {shlex.quote(str((tmp_path / 'ck').resolve()))}" in line

@@ -206,7 +206,7 @@ def test_the_step_the_card_and_the_replace_judge_the_promoted_bindings_actions(t
     [step] = _due(s, TestOnlyCoverage([policy("gp-1", {"deliver": LOW}, expires_at=LATER)]), link_action=link_action)
     assert step.outcome == "uncovered" and [l.action_name for l in step.uncovered] == ["file.note"]
     from levain.cockpit.graduation_cards import card_of
-    assert "--action file.note=LOW" in card_of(step)["command"]
+    assert "file.note" in card_of(step)["why"] and card_of(step)["command"] is None
     p1, p2 = policy("gp-1", {"deliver": LOW}, expires_at=LATER), policy("gp-2", {"file.note": LOW}, expires_at=LATER)
     both = TestOnlyCoverage([p1, p2])
     [step] = _due(s, both, link_action=link_action)
