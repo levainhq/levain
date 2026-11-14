@@ -2,8 +2,8 @@
 
 One value over what the install already holds: the session records its hooks write (the NODES: one per session,
 grouped by the repository its working directory is in, a linked worktree folded into its main repository), the
-dispatch job store and the F7 outcome ledger (a contract is a task, its ledger labels its outcomes), and the entity's
-open loops (an intention is a task). A session that no task names is a worker of the one ``unattached`` task, never of
+dispatch job store and the F7 outcome ledger (a contract is a task, its ledger labels its outcomes), and, for an
+embedder that hands one over, the intentions it wants drawn as tasks (the kernel hands none: they live on the List). A session that no task names is a worker of the one ``unattached`` task, never of
 a guessed one.
 
 WHAT WAITS ON THE OPERATOR IS THE BAND'S, NOT THE GRAPH'S. A live read marks no session, task or count "waiting on you":
@@ -14,8 +14,8 @@ waits on, a dispatch contract waiting on a signature or an authorisation. STALLE
 silence: a session whose last logged event is a prompt or a tool call and that has said nothing for ``STALL_S``. A live
 read looks up no request record, so a session blocked on a pending request reads RUNNING while its last event is recent
 and STALLED once it has been silent that long, the same as one that merely went quiet; the two never merge in a replay,
-where the record is looked up and the node is WAITING. An open loop nobody is working is neither: it is OPEN, a record with an age and a heat (the Open loops
-panel's own words), not silence; a dispatch contract the live graph draws as waiting on a signature is OPEN the same way.
+where the record is looked up and the node is WAITING. An intention nobody is working is neither: it is OPEN, a record with an age and a heat (the tier's own word),
+not silence; a dispatch contract the live graph draws as waiting on a signature is OPEN the same way.
 
 "Lost if closed" is per live session, read by ``activity.git_worktree_state`` (its status read runs on a private git
 dir the cockpit owns, which takes only allow-listed, shape-checked settings from the repository's config and
@@ -31,7 +31,7 @@ Not tracked on this branch, sent as null (never a zero, never an estimate): a se
 log holds it only inside text this token-free panel must not carry), tokens today, every task's cost (no dispatch spend key and no ledger cost column exist yet), uncaptured
 episodes (episodes carry no session) and running children (no hook records a subagent). What does reach the wire is
 display-safe: a consent task is its agent and tool, a question its number, a dispatch contract its goal's first
-line (``_wire``'d; else its template), never a request's body; but a file name, a branch name, a repository or directory basename and an open loop's
+line (``_wire``'d; else its template), never a request's body; but a file name, a branch name, a repository or directory basename and an intention's
 text (all agent- or repository-controlled) are carried, each through ``_wire`` (display-safe, a basename without a
 path, at most ``LABEL_MAX`` characters).
 
@@ -59,7 +59,7 @@ __all__ = ["LOST_CACHE_S", "LOST_WORKTREES_MAX", "NOT_KEPT", "INTENTIONS_MAX", "
 
 STALL_S = 5 * 60                   # a session mid-turn (last event a prompt or a tool) silent this long is STALLED
 RATE_WINDOW_S = 5 * 60             # a node's rate: logged events per minute over this window
-INTENTIONS_MAX = 20                    # open loops shown as tasks, in the store's order
+INTENTIONS_MAX = 20                    # intentions shown as tasks, in the store's order (kept for embedders)
 DISPATCH_DONE_H = 14               # a finished contract stays on the board this long (the sky's window)
 LOST_WORKTREES_MAX = act.ACTIVITY_REPOS_MAX
 LOST_CACHE_S = 30.0
@@ -559,13 +559,13 @@ def _dispatch_tasks(directory: Path, now: datetime, *, past: bool = False) -> tu
     return tasks, errors
 
 
-#: the heat an open loop carries, as the intention store's own tier names it (the Open loops panel's word for it)
+#: the heat an intention carries, as the intention store's own tier names it
 HEATS = ("hot", "warm", "cold", "parked")
 
 
 def _opened(created: Any, now: datetime) -> str | None:
-    """When an intention was opened, as an instant: its own ISO stamp, or its date taken as local midnight (the Open loops
-    panel counts calendar days in the install's own clock, so the age the renderer draws agrees with it). None when
+    """When an intention was opened, as an instant: its own ISO stamp, or its date taken as local midnight (calendar
+    days count in the install's own clock, so the age the renderer draws agrees with it). None when
     the store has no usable date: unknown, never a guess."""
     t = act._parse(created) if isinstance(created, str) else None
     if t is not None:
@@ -577,8 +577,7 @@ def _opened(created: Any, now: datetime) -> str | None:
 
 
 def _age_days(created: Any, now: datetime) -> int | None:
-    """Whole calendar days from the day an intention was opened to the provider's own day (the install's local day, the one the
-    Open loops panel counts in): the number the page draws, so no browser clock or zone decides it. None when the store has no
+    """Whole calendar days from the day an intention was opened to the provider's own day (the install's local day): the number the page draws, so no browser clock or zone decides it. None when the store has no
     usable date."""
     opened = opened_day(created)
     if opened is None:
@@ -587,10 +586,11 @@ def _age_days(created: Any, now: datetime) -> int | None:
 
 
 def _intention_tasks(intentions: list[Any], now: datetime | None = None) -> list[dict[str, Any]]:
-    """The first ``INTENTIONS_MAX`` open loops as tasks. The intention store links no loop to a session or a record, so a
-    loop is never WAITING, and RUNNING only if a worker is on it (``workers`` is empty today). A loop nobody is on is
+    """The first ``INTENTIONS_MAX`` intentions as tasks. Kept, pure, for embedders that still hand a topology reader an
+    intention source (the kernel hands none). The intention store links no intention to a session or a record, so one
+    is never WAITING, and RUNNING only if a worker is on it (``workers`` is empty today). One nobody is on is
     OPEN, not STUCK: STUCK is a live worker gone silent. It carries ``opened`` (its created time) and ``heat`` (its
-    tier, the Open loops panel's own value), each null when the store does not say. A recent touch is not a worker."""
+    tier), each null when the store does not say. A recent touch is not a worker."""
     now = now or datetime.now(timezone.utc)
     tasks = []
     for s in intentions[:INTENTIONS_MAX]:
@@ -668,13 +668,13 @@ def topology_reader(*, install_root: Path | None,
                     ) -> Callable[[Any], Result]:
     """The ``topology`` provider's read: ``read(ctx)``. ``consent`` and ``questions`` are looked up at each read
     (the server attaches them after the cockpit is built); ``dispatch_dir`` names the directory holding the
-    dispatch and outcome stores (the consent queue's directory; this read creates neither store), ``intentions`` the entity's open
-    loops (raising for a store that cannot be read), ``hub_label`` the entity's name. ``scan`` is the worktree
+    dispatch and outcome stores (the consent queue's directory; this read creates neither store), ``intentions`` an embedder's intentions
+    (raising for a store that cannot be read; the kernel passes none), ``hub_label`` the entity's name. ``scan`` is the worktree
     scan (a test's seam).
 
     ``read.read_at(ctx, iso)`` is the same read at a past instant T (F12 Replay): ONE reader with its clock pinned at
     T and every source bounded to what was known at T (events, filings, decisions, answers and transitions stamped at
-    or before T). A source that cannot be rebuilt for T (the open loops, lost-if-closed, a node's model and tokens, a
+    or before T). A source that cannot be rebuilt for T (an embedder's intentions, lost-if-closed, a node's model and tokens, a
     log the hooks rotated past T, a listing cut before T) is named in ``unreadable`` with the reason ``NOT_KEPT`` and
     its fields are null; it is never drawn as empty. T is checked by the engine's ``check_replay_at``: minute-aligned
     ISO inside the replay window, refused (a Fault), never clamped. The value carries ``as_of`` = T and ``replay``."""
@@ -863,11 +863,11 @@ def topology_reader(*, install_root: Path | None,
             except Exception as exc:  # noqa: BLE001 - an unread store is named, never shown as no contracts
                 blind("dispatch", f"unreadable ({type(exc).__name__})")
         if intentions is None:
-            blind("intentions", "no intention store is attached")
+            pass                # no intention source asked for (the kernel's own): nothing to read, nothing unread
         elif past:
-            # the store dates a loop's opening by DAY (a loop opened on T's day cannot be placed before or after T),
-            # and this read is handed only the loops open now (one resolved since T is not among them)
-            blind("intentions", f"{NOT_KEPT} (a loop is dated by day, and only the loops open now are read)")
+            # the store dates an intention's opening by DAY (one opened on T's day cannot be placed before or after T),
+            # and this read is handed only the intentions open now (one resolved since T is not among them)
+            blind("intentions", f"{NOT_KEPT} (an intention is dated by day, and only the ones open now are read)")
         else:
             try:
                 tasks += _intention_tasks(list(intentions(ctx)), now)
