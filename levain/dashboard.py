@@ -1790,7 +1790,8 @@ def _is_fresh_capture(s: Mapping[str, Any], today: date) -> bool:
         made = date.fromisoformat(str(s.get("created") or "")[:10])
     except ValueError:
         return False
-    return today - timedelta(days=CAPTURE_DAYS) <= made  # no upper bound: a UTC date a day ahead of the local one is just made
+    # a UTC date is at most a day ahead of the local one; two days is slack, so a clock-skewed or hand-edited future stamp is not fresh forever
+    return today - timedelta(days=CAPTURE_DAYS) <= made <= today + timedelta(days=2)
 
 
 def build_substrate_view(
@@ -2024,7 +2025,9 @@ def build_substrate_view(
             capture_cap = min(CAPTURE_RESERVE, max_intentions // 5)
             # one date for the ranking and the freshness test, taken from the supplied day or instant, so tray
             # membership follows the store and the caller's clock, never a second read of the wall clock
-            view_today = today if today is not None else _now.astimezone().date()
+            # (the instant's day is the List's own: band_view._today_of, the one rule for the store's local day)
+            from levain.band_view import _today_of
+            view_today = today if today is not None else date.fromisoformat(_today_of(None, _now))
             for s in IntentionStore(paths.intentions_json, id_prefix="intention").list_open(today=view_today):
                 # The WHOLE per-row pipeline (status-skip → route → cap → construct) lives
                 # in ONE try, so a fault on ANY phase drops just that row — the "one
