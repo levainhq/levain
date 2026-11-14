@@ -715,7 +715,7 @@
   /* ── TRAY + KEEP (Slice 3b) — the capture boxes + per-row edit affordances ──
      The capture-UX: the Tray dump (label-above + type dropdown) is the human's freeform
      drop (a `seed` is born). Per-row verbs
-     (edit/reclassify/metabolize/schedule/dismiss · note edit/remove · loop reactivate)
+     (edit/reclassify/metabolize/schedule/dismiss · note edit/remove)
      share the metal/glass operate-zone language of the lifecycle verbs above. */
   .tray-dump {
     display: flex; flex-direction: column; gap: var(--sp-2);
@@ -1265,7 +1265,7 @@ body.ke .ck-briefcard { padding: var(--sp-6); }
 .brief-side { grid-column: 2; grid-row: 1 / span 6; border-left: 1px solid var(--hair); padding-left: var(--sp-6); display: flex; flex-direction: column; gap: var(--sp-3); align-self: start; }
 .brief-side .side-line { margin: 0; font-size: var(--fs-body); line-height: var(--lh-list); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
 
-/* Where to begin as a card with a head: the lead and what follows it on the left, the Threads column on the right */
+/* Where to begin as a card with a head: the lead and what follows it on the left, nothing beside it (the loops column went with the Open loops panel) */
 body.ke .ck-briefcard:has(.brief-card) { padding-top: var(--sp-5); }
 body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
 .brief-card .brief-head { display: flex; align-items: center; gap: var(--sp-4); margin-bottom: var(--sp-5); }
@@ -1273,8 +1273,6 @@ body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
 .brief-card .brief-head .sp { flex: 1; }
 .brief-card .brief-head .stamp { color: var(--meta); font-size: var(--fs-micro); }
 .brief-card .brief-cols { display: grid; grid-template-columns: minmax(0, 1fr); column-gap: var(--sp-7); align-items: start; }
-.brief-card .brief-threads .brief-src { margin: calc(-1 * var(--sp-2)) 0 var(--sp-3); color: var(--meta); font-size: var(--fs-micro); }
-.brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr) minmax(280px, 360px); }
 .brief-card .lead-first { margin: 0; font: var(--fw-bold) 17px/1.4 var(--round); letter-spacing: var(--track-tight); overflow-wrap: anywhere; }
 .brief-card .lead-then { margin: var(--sp-3) 0 0; font-size: var(--fs-body); line-height: var(--lh-list); color: var(--label); }
 .brief-card .lead-then .k { margin-right: var(--sp-2); }
@@ -1283,15 +1281,7 @@ body.ke .ck-briefcard .ck-brief-body:has(.brief-card) { margin-top: 0; }
 .brief-card .lead-item .k { margin-right: var(--sp-2); }
 .brief-card .brief-overnight { margin-top: var(--sp-4); display: flex; gap: var(--sp-4); align-items: baseline; flex-wrap: wrap; font-size: var(--fs-meta); color: var(--meta); }
 .brief-card .brief-overnight .mono { font-family: var(--mono); font-size: var(--fs-micro); color: var(--label); }
-.brief-card .brief-threads .k { margin-bottom: var(--sp-3); }
-/* F3 one rail: the levain column carries the same divider and inset as the flow brief's side column above it, so both right
-   columns start their text on one x and read as one rail down the card */
-@media (min-width: 721px) { .brief-card .brief-cols.has-threads > .brief-threads { border-left: 1px solid var(--hair); padding-left: var(--sp-6); } }
-.brief-card .thread { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) 0; }
-.brief-card .thread .t { flex: 1; min-width: 0; font-size: var(--fs-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.brief-card .thread .pill { flex: none; color: var(--meta); font: var(--fw-regular) var(--fs-micro) var(--mono); }
-.brief-card .thread .rp-tag { flex: none; margin-right: 0; }
-@media (max-width: 720px) { .brief-card .brief-head .stamp { display: none; } .brief-card .brief-cols.has-threads { grid-template-columns: minmax(0, 1fr); row-gap: var(--sp-5); } }
+@media (max-width: 720px) { .brief-card .brief-head .stamp { display: none; } }
 
 /* WIDGETS: one answer each, equal widths in one row */
 body.ke .ck-widgets[hidden] { display: none; }
@@ -1682,9 +1672,9 @@ html {
 html { --stripe-memory: var(--hue-2); --stripe-decisions: var(--hue-1); --stripe-work: var(--hue-3); }
 html :is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"], [data-ck-panel="wraps"], [data-ck-panel^="section:"], [data-ck-panel^="config:"])::before { background: var(--stripe-memory); }
 html :is([data-ck-panel="decisions"], [data-ck-panel="edits"])::before { background: var(--stripe-decisions); }
-html :is([data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
+html :is([data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"])::before { background: var(--stripe-work); }
 html :is(.ck-card.w, .ck-zgrid .panel:not(.ck-dash), .ck-mem-row > .panel:not(.ck-dash)):is([data-ck-panel="memory_glance"], [data-ck-panel="health"], [data-ck-panel="doctor"], [data-ck-panel="crystals"], [data-ck-panel="graph"], [data-ck-panel="episodes"],
-  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="loops"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"]):not(.ck-mem-nest)::before {
+  [data-ck-panel="decisions"], [data-ck-panel="edits"], [data-ck-panel="sessions"], [data-ck-panel="topology"], [data-ck-panel="tray"], [data-ck-panel="jobs"], [data-ck-panel="ext:inbox"], [data-ck-panel^="section:"]):not(.ck-mem-nest)::before {
   content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; pointer-events: none; z-index: 1; }
 html :is(.ck-card.w, .ck-zgrid .panel):is([data-ck-panel]) { position: relative; }
 /* a card alone in a column takes the column's width even when empty (the empty rule above sets align-self: start for the grid) */
@@ -2014,7 +2004,7 @@ body.ke[data-mode="memory"] .ck-zgrid [data-ck-panel="graph"], body.ke[data-mode
 body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="graph"], body.ke[data-mode="memory"] .ck-zgrid .ck-mem-row > [data-ck-panel="wraps"] { align-self: stretch; }   /* beside Crystallized patterns the pair is one height */
 body.ke .ck-zgrid[data-ck-zone="identity"] { align-items: stretch; }
 body.ke .ck-zgrid[data-ck-zone="identity"] .panel:last-child:nth-child(odd) { grid-column: 1 / -1; }
-/* the Board: two independent stacks. Left: Tray, Now. Right: Open loops. Each is as tall as its own cards. */
+/* the Board: two independent stacks. Left: the List, Now. Each is as tall as its own cards. */
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col { display: flex; flex-direction: column; gap: var(--gap); min-width: 0; align-self: start; }
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col.ck-col-off { display: none; }
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol[data-cols="1"] { grid-template-columns: minmax(0, 1fr); }
@@ -2039,11 +2029,11 @@ body.ke[data-mode="board"] .ck-zgrid [data-ck-panel="episodes"] { order: 5; }
      card inside a dissolved stack is told its row again here */
   body.ke[data-mode="board"] .ck-zgrid.ck-twocol:is([data-cols="1"], [data-cols="2"]) > .ck-col > .panel:is(.ck-fold, .ck-dash) { grid-column: 1 / -1; }
 }
-/* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now, Open loops until a saved layout says otherwise) */
+/* the order inside a stack is the DOM's (dashboard_core.js ckArrange: Tray over Now until a saved layout says otherwise) */
 
 /* K7: the Build tab. Sessions is a large card of its own (cockpit_view.js paintBuildSessions into #k7-sessions); Results sits left and
-   Recent edits over Open loops right. The headings are Build's own: the Work zone's heading is shown here only. */
-.k7-sess, .k7-zt, .k7-zg, .k7-opend, .row > .k7-repo { display: none; }
+   Recent edits right. The headings are Build's own: the Work zone's heading is shown here only. */
+.k7-sess, .k7-zt, .k7-zg, .row > .k7-repo { display: none; }
 body.ke[data-mode="build"] .k7-sess:not([hidden]) { display: block; margin-top: var(--sec); }
 .k7-head { display: flex; align-items: baseline; gap: var(--sp-4); margin: 0 0 var(--sp-4); }
 .k7-head h3 { margin: 0; font: var(--fw-bold) var(--fs-h)/1.2 var(--round); letter-spacing: -.02em; color: var(--text); }
@@ -2102,11 +2092,9 @@ body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zt { dis
 body.ke[data-mode="build"] .ck-zone[data-zone="operate"] .zone-head .k7-zg { display: inline; }
 body.ke[data-mode="build"] .ck-zone[data-zone="operate"] { margin-top: var(--sec); }
 @media (min-width: 721px) {
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] { grid-template-rows: auto 1fr; }
   body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"],
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { grid-column: 1; grid-row: 1 / span 2; align-self: start; }
+  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { grid-column: 1; grid-row: 1; align-self: start; }
   body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { grid-column: 2; grid-row: 1; }
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] { grid-column: 2; grid-row: 2; align-self: start; }
 }
 body.ke .ck-zgrid .panel.k7-results-none { flex-direction: row; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); height: auto; max-height: none;
   background: none; border: 1px dashed var(--hair-2); border-radius: var(--r-lg); padding: var(--sp-4) var(--sp-5); }
@@ -2116,19 +2104,10 @@ body.ke .row.k7-res { position: relative; padding-left: var(--sp-5); }
 @media (max-width: 720px) {
   body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs"], body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="jobs-none"] { order: 1; }
   body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] > .panel[data-ck-panel="edits"] { order: 2; }
-  body.ke[data-mode="build"] .ck-zgrid[data-ck-zone="operate"] .panel[data-ck-panel="loops"] { order: 3; }
 }
 body.ke .row.k7-res > .k7-rdot { grid-row: 2 !important; grid-column: 1 !important; justify-self: start; align-self: start; margin: .55em 0 0 calc(-1 * var(--sp-5)); position: relative; z-index: 1; width: 8px; height: 8px; border-radius: 50%; background: var(--meta); }
 body.ke .row.k7-res > .k7-rdot.ok { background: var(--ok); }
 body.ke .row.k7-res > .k7-rdot.bad { background: var(--bad); }
-/* Open loops on Build: an accent bar, the title, then the intention id, how long it has been open and its repo */
-body.ke[data-mode="build"] [data-ck-panel="loops"] .row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); border-left: 3px solid var(--heat, var(--accent)); border-radius: 0; padding-left: var(--sp-5); margin-block: var(--sp-3); }
-body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause { order: -1; flex: 1 1 calc(100% - var(--sp-8)); min-width: 0; }
-/* the fold chevron rides the title line's right edge (as on the Board), never the meta row beneath it */
-body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .clause-toggle { order: -1; align-self: start; margin-left: auto; }
-body.ke[data-mode="build"] [data-ck-panel="loops"] .row > [data-ck-tag].tier { display: none; }
-body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
-body.ke[data-mode="build"] [data-ck-panel="loops"] .row > .k7-opend { display: inline; color: var(--meta); font-size: var(--fs-meta); }
 
 /* F7: an empty provider is its header line, one sentence and its action: a single dashed row (Team without a ledger, an Inbox with no
    source). Never a card with a body gap, never an empty box. The action opens the compose box under the line. */
@@ -2448,7 +2427,6 @@ body.ke .panel:focus-within .phead .ck-lay-up, body.ke .panel:focus-within .phea
 .tv-task-t[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (pointer: coarse) { .tv-chip.tv-open { min-height: var(--hit-min); } }
 /* a loop row the Work lens jumps to stops under the sticky strip, never behind it */
-body.ke .panel[data-ck-panel="loops"] .row[data-intention] { scroll-margin-top: calc(var(--hit-min) + var(--sp-4)); }
 .tv-task-h { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; }
 .tv-task-t { flex: 0 1 auto; min-width: 0; font: var(--fw-bold) var(--fs-body) var(--round); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tv-loose-h { font: var(--fw-semibold) var(--fs-micro)/1.4 var(--sans); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); }
@@ -2642,13 +2620,11 @@ body.ke .panel[data-ck-panel="loops"] .row[data-intention] { scroll-margin-top: 
 .tv-more:hover { background: var(--card-2); color: var(--text); }
 
 /* ═══════════════════════════ BOARD WORK LISTS TO THE MOCK (K10 S4) ═══════════════════════════
-   Open loops: a left stripe per heat (hot orange, warm violet, parked grey), the intention id, "open N d" and the repo, on Board as on Build.
-   Tray: what is late reads first, with a red stripe and "overdue N d" in red; the row's verbs are always shown, never hover-only. */
-body.ke [data-ck-panel="loops"] .row[data-heat] { --heat: var(--meta); }
-body.ke [data-ck-panel="loops"] .row[data-heat="hot"] { --heat: var(--accent); }
-body.ke [data-ck-panel="loops"] .row[data-heat="warm"] { --heat: var(--violet); }
-body.ke:not([data-mode="build"]) [data-ck-panel="loops"] .row[data-heat] { border-left: 3px solid var(--heat); padding-left: var(--sp-5); border-radius: 0; }
-body.ke [data-ck-panel="loops"] .row > .k7-opend { display: inline; color: var(--meta); font-size: var(--fs-meta); }
+   The List: a parked someday wears a grey "parked" chip and a grey left stripe, and reads quieter than the rows around it.
+   what is late reads first, with a red stripe and "overdue N d" in red; the row's verbs are always shown, never hover-only. */
+body.ke [data-ck-panel="tray"] .row[data-parked] { border-left: 3px solid var(--meta); padding-left: var(--sp-5); border-radius: 0; }
+body.ke [data-ck-panel="tray"] .row[data-parked] > .clause { opacity: .72; }
+body.ke [data-ck-panel="tray"] .row > .list-meta > .list-parked { color: var(--meta); font-style: italic; text-transform: none; }
 body.ke [data-ck-panel="tray"] .row[data-band="overdue"] { border-left: 3px solid var(--bad); padding-left: var(--sp-5); border-radius: 0; }
 body.ke [data-ck-panel="tray"] .row[data-band="overdue"] > [data-ck-tag][data-ck-tag-state="overdue"] { color: var(--bad); font-weight: var(--fw-semibold); }
 body.ke [data-ck-panel="tray"] .row .verb-actions { opacity: 1; }
@@ -2663,9 +2639,9 @@ body.ke [data-ck-panel="tray"] .more-foot[data-list-more] { min-height: var(--hi
 body.ke .ck-zgrid .ck-mem-crys > .more-foot { padding-inline: var(--sp-6); margin-bottom: var(--sp-4); }
 
 /* Board work lists: the repo chip sits in the meta line (the mock; every long panel keeps its filter box: Phill 10-11) */
-body.ke [data-ck-panel="tray"] .row > .k7-repo, body.ke [data-ck-panel="loops"] .row > .k7-repo { display: inline-block; }
-/* the Board's work lists show their rows whole before they fold: room for a full Tray and Open loops */
-body.ke[data-mode="board"] .ck-zgrid .panel:is([data-ck-panel="tray"], [data-ck-panel="loops"]) { max-height: 700px; }
+body.ke [data-ck-panel="tray"] .row > .k7-repo { display: inline-block; }
+/* the Board's work lists show their rows whole before they fold: room for a full List */
+body.ke[data-mode="board"] .ck-zgrid .panel[data-ck-panel="tray"] { max-height: 700px; }
 /* the taller Board stack's last card ends the two stacks together (dashboard_core.js balanceStacks sets the cap) */
 body.ke[data-mode="board"] .ck-zgrid.ck-twocol > .ck-col > .panel[data-stack-cap] { max-height: var(--stack-cap); }
 .grp-col { display: contents; }
