@@ -57,7 +57,7 @@ def _dispositions(install: Path) -> dict[str, str]:
 
 def _backups(install: Path) -> list[Path]:
     d = install / ".levain" / Path(*BACKUP_SUBDIR)
-    return sorted(d.iterdir()) if d.is_dir() else []
+    return sorted(p for p in d.iterdir() if not p.name.startswith("loopfold-")) if d.is_dir() else []   # store copies; the loop ledgers are not
 
 
 def test_update_rewrites_open_seeds_to_someday_with_a_backup_and_says_so(install):

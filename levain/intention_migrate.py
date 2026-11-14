@@ -451,11 +451,7 @@ def migrate_loop_to_someday(paths: Any, *, now: datetime | None = None,
     report.unknown = unknown
     if not targets:
         if keyless and store_path.parent.is_dir():   # read fine (a store not yet made reads as empty): close the window before the entity's first add
-            if backup_dir is None:
-                from levain.install import _ensure_gitignored
-
-                _ensure_gitignored(store_path.parent, BACKUP_SUBDIR[0] + "/")
-            try:
+            try:                                 # the ledger holds ids only, no store bytes: no .gitignore change for it
                 report.ledger = _write_ledger(dest_dir, now or datetime.now(timezone.utc), report, store_path)
             except OSError as exc:
                 report.ledger_error = str(exc)
