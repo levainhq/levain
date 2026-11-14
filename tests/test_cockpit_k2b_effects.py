@@ -355,3 +355,60 @@ def test_registration_declarations(path):
     assert registration_refusals(object(), {"x": object()}) == ["no EffectStore adapter"]
     assert "no canonical_effect" in registration_refusals(es, {})
     assert set(es.authority_fields) <= set(es.version_fields)
+
+
+# --- the row version across the loop fold (L3 S2 r1 codex HIGH) ------------------------------------------------------
+# The versions the PRE-FOLD levain computed (93b65592f, the deployed base: its ``intention_row_version`` run on these rows by
+# that code, pinned here). A T2/T3 effect signed before the upgrade carries one of these; after the upgrade the same unchanged
+# row must still produce it, or recovery reads PRECONDITION_LOST and the consented write never lands.
+_PIN_BASE = {"id": "intention-007", "text": "a pinned row", "tier": "hot", "type": "task", "domain": "levain",
+             "next": None, "pointer": None, "salience": 3, "seen": "2026-11-01", "origin_key": "k.pin",
+             "status": "open", "created": "2026-10-01T00:00:00Z"}
+_PREFOLD_VERSIONS = [
+    ({}, "0e93410278ba49ac"),
+    ({"disposition": None}, "0e93410278ba49ac"),
+    ({"disposition": ""}, "0e93410278ba49ac"),
+    ({"disposition": "loop"}, "0e93410278ba49ac"),
+    ({"disposition": "someday"}, "1b1737af7aa3f3ec"),
+    ({"disposition": "agenda"}, "6ba0442f98c26dfa"),
+    ({"disposition": "seed"}, "d2e71bee2460852f"),
+    ({"disposition": "note"}, "91f93404bd8eb8bf"),
+    ({"disposition": 5}, "efe3a08ad9850812"),
+    ({"disposition": 0}, "0e93410278ba49ac"),
+]
+_PREFOLD_FIXTURE_LOOP = "5ff0e868fee6875b"   # the same, for the ``path`` fixture's key-absent ``k.loop`` row
+
+
+@pytest.mark.parametrize("shape,old", _PREFOLD_VERSIONS, ids=[repr(s) for s, _v in _PREFOLD_VERSIONS])
+def test_the_row_version_is_the_prefold_version_for_every_disposition_shape(shape, old):
+    from levain.cockpit.providers import intention_row_version
+
+    assert intention_row_version({**_PIN_BASE, **shape}) == old
+
+
+def test_an_effect_signed_before_the_fold_still_applies_on_recovery(path):
+    from levain.cockpit.providers import intention_row_version
+
+    es = IntentionEffectStore(path)
+    pre = es.snapshot(intention_resource_key("k.loop")).row
+    assert pre is not None and "disposition" not in pre
+    # the effect as the pre-fold code built it: its expect.version is the pinned pre-fold version of this unchanged row
+    eff = canonical_effect("intention_update", {"text": "signed before the upgrade"}, pre,
+                           version_of=lambda _row: _PREFOLD_FIXTURE_LOOP)
+    assert eff.expect == {"version": _PREFOLD_FIXTURE_LOOP}
+    assert intention_row_version(pre) == _PREFOLD_FIXTURE_LOOP
+    out = _settle(es, eff)
+    assert out.status is EffectStatus.APPLIED, out
+    assert _row(path, "k.loop")["text"] == "signed before the upgrade"
+
+
+def test_the_label_key_hashes_the_raw_disposition_and_the_version_does_not():
+    from levain.cockpit.providers import intention_label_key, intention_stored, intention_view_version
+    from levain.dashboard import open_intention_from
+
+    absent, literal = open_intention_from(_PIN_BASE), open_intention_from({**_PIN_BASE, "disposition": "loop"})
+    # one version for both (they read the same, and the pre-fold code versioned them the same) ...
+    assert intention_view_version(absent) == intention_view_version(literal) == "0e93410278ba49ac"
+    # ... and the label over what each store row holds (design 2c): an absent key, and the literal
+    assert intention_label_key(intention_stored(absent)).values["disposition"] is None
+    assert intention_label_key(intention_stored(literal)).values["disposition"] == "loop"

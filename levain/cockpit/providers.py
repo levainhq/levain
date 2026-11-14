@@ -27,6 +27,7 @@ from levain.cockpit.engine import PANEL_READ_DEADLINE_S, Cockpit, ProviderSpec, 
 from levain.cockpit.registry import opened_day, parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.intention_legacy import OLD_ROW_KIND, OLD_VERB_TO_NEW
+from levain.intentions import LOOP_DISPOSITION, PARKED_TIER
 from levain.dashboard import (
     CLASS_A,
     CLASS_B,
@@ -63,10 +64,11 @@ HANDOFF_FRESH_DAYS = 7
 INTENTION_ROW_VERBS = ("intention_touch", "intention_close", "intention_surface_at", "intention_update", "intention_retarget", "intention_then",
                    "intention_set_disposition", "intention_promote")
 INTENTION_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen",
-                "origin_key", "target", "attention", "germinated")
+                "origin_key", "target", "attention", "germinated", "stored_disposition")
 # seen alone never stales a write (a touch that clears an elapsed next does); origin_key is store-assigned
-# once and names the label resource, so it is carried, not versioned
-INTENTION_VERSION_EXCLUDED = ("seen", "origin_key")
+# once and names the label resource, so it is carried, not versioned; stored_disposition is the raw value the
+# label key is taken over, carried beside ``disposition`` (the versioned projection, ``intention_version_disposition``)
+INTENTION_VERSION_EXCLUDED = ("seen", "origin_key", "stored_disposition")
 INTENTION_VERSION_FIELDS = tuple(f for f in INTENTION_STORED if f not in INTENTION_VERSION_EXCLUDED)
 INTENTION_FACETS = frozenset({
     "disposition", "domain", "tier", "salience", "intention_type", "due", "fires", "overdue_days",
@@ -333,10 +335,19 @@ def intention_stored(s: OpenIntention) -> dict[str, Any]:
     """An intention row's stored record: what its version covers (``INTENTION_VERSION_FIELDS``)."""
     # getattr with a default: INTENTION_STORED may name a steering field (target, attention) the OpenIntention does not carry yet
     out = {f: getattr(s, f, None) for f in INTENTION_STORED}
-    # the disposition the store holds, not the one the view reads (a key-absent row reads as someday): what the version
-    # and the label key are taken over
-    out["disposition"] = getattr(s, "stored_disposition", out["disposition"])
+    # the disposition the store holds (None for a key-absent row), for the label key; a row object with no stored form
+    # holds what it reads
+    out["stored_disposition"] = getattr(s, "stored_disposition", out["disposition"])
+    out["disposition"] = intention_version_disposition(out["stored_disposition"])
     return out
+
+
+def intention_version_disposition(stored: Any) -> str:
+    """The disposition a row VERSION is taken over, from the stored one: the projection the pre-fold code versioned
+    (absent, empty, falsy and a literal ``loop`` all ``loop``; any other value str-coerced). A version is what a signed
+    T2/T3 effect carries and recovery compares, so it stays byte-identical across the fold: an effect signed before the
+    upgrade still applies to the unchanged row. It is never shown (the List reads such a row as someday)."""
+    return str(stored or LOOP_DISPOSITION)
 
 
 def intention_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
@@ -345,9 +356,11 @@ def intention_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
     ok = stored.get("origin_key")
     if not isinstance(ok, str) or not ok:
         return None
-    # the disposition is the raw stored value (intention_stored): a key-absent row reads as someday on the List but the
-    # store holds none, and the label is hashed over what the store holds
     values = {f: _stored_authority(stored, f) for f in INTENTION_AUTHORITY_FIELDS}
+    if "stored_disposition" in stored:
+        # the label is hashed over what the store holds (design 2c), never the version's projection: a key-absent row
+        # holds none, a literal ``loop`` row holds ``loop``
+        values["disposition"] = _stored_authority({"disposition": stored["stored_disposition"]}, "disposition")
     return LabelKey(intention_resource_key(ok), values)
 
 
@@ -402,6 +415,8 @@ def _where_to_begin(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         today = ctx.today
         late, due = [], []
         for s in v.tray:
+            if s.tier == PARKED_TIER:
+                continue                                    # dormant: on the List, marked, never a place to begin
             d = next_date(s.next)
             if d and d > today:
                 continue                                    # held until its surface date
@@ -445,62 +460,6 @@ def _overnight(v: Any) -> dict[str, Any] | None:
 
 
 TOP_MAX_BEGIN = 110
-
-
-def _intention_provider(
-    source: SubstrateSource, bucket: str, *, apply_hold: bool = True
-) -> Callable[[ReadContext], Result]:
-    seen = [False]      # the store has existed on a read: a later absence stays a fault, as the engine reads it
-
-    def read(ctx: ReadContext) -> Result:
-        path = source.anneal.intentions_json
-        if not path.exists():
-            if seen[0]:
-                return Absent(f"no intention store at {path}")
-            # never present: the panel is empty, and its sentence names the entity as the view resolves it on THIS read
-            # (config name, else the origin.md H1), so a rename shows without a restart
-            try:
-                name = _view(source, ctx).entity_name
-            except Exception:       # noqa: BLE001 — a view that cannot be built still leaves an empty panel
-                name = _configured_entity_name(source)
-            return Read(rows=(), empty=intention_empty(bucket, name))
-        seen[0] = True
-        view = _view(source, ctx)
-        bad = _view_fault(view, "open_intentions")
-        if bad:
-            return bad
-        if not path.exists():           # removed while the view was being built
-            return Absent(f"no intention store at {path}")
-        items = {"tray": view.tray}[bucket]
-        rows = [_intention_row(s, ctx.today) for s in items]
-        view_full = len(items) >= VIEW_INTENTION_LIMIT
-        over = max(0, len(rows) - INTENTION_CAP) if apply_hold else 0
-        rows = rows[:INTENTION_CAP] if apply_hold else rows
-        skipped = ()
-        if over:
-            skipped += ((over, f"over the display cap of {INTENTION_CAP}"),)
-        if view_full:
-            skipped += ((1, f"the substrate view stopped at {VIEW_INTENTION_LIMIT} rows; at least this many more exist"),)
-        return Read(rows=tuple(rows), skipped=skipped, empty=intention_empty(bucket, view.entity_name))
-    return read
-
-
-def _intention_read_one(source: SubstrateSource, bucket: str) -> Callable[[ReadContext, str], Result]:
-    def read_one(ctx: ReadContext, row_id: str) -> Result:
-        # a fresh read of the SOURCE: ``ctx`` is the write's own (``Cockpit.read_one`` makes one per
-        # read, never the render cycle's), passed through so it keeps the request's authority (§8d row 6).
-        # The row by its id, NOT through the list's visibility rules: a row rescheduled into the
-        # future since the render still exists, and a write must find it
-        res = _intention_provider(source, bucket, apply_hold=False)(ctx)
-        if not isinstance(res, Read):
-            return res
-        for r in res.rows or ():
-            if r.id == row_id:
-                return Read(rows=(r,))
-        if res.skipped:    # the scan was truncated: not finding the row proves nothing
-            return Fault(f"row {row_id!r} not found, but the scan was truncated")
-        return Absent(f"row {row_id!r} is gone")
-    return read_one
 
 
 def _ts(v: Any) -> str:

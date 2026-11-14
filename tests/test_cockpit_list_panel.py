@@ -299,6 +299,14 @@ def test_the_panel_is_registered_where_the_tray_was_and_no_loops_panel_exists(ri
     assert "loops" not in rig.ck.panel_ids                      # the loop fold took the Open loops panel out of the manifest
 
 
+def test_the_per_bucket_intention_provider_is_gone() -> None:
+    # L3 S2 r1 (deepseek MED): with one bucket left its bucket lookup was a KeyError for anything but "tray"; the List's own
+    # reader (list_panel.list_reader / list_read_one) is the one intention read, so the per-bucket pair is removed
+    from levain.cockpit import providers
+
+    assert not hasattr(providers, "_intention_provider") and not hasattr(providers, "_intention_read_one")
+
+
 def test_a_key_absent_row_and_a_parked_one_are_list_rows_in_someday_the_parked_one_last(rig: Rig) -> None:
     # what was an Open loops row (a key-absent intention, a parked one) is a Someday row on the List, placed by the List's own rules
     plain = rig.sp.add(type="task", text="a plain intention", tier="hot", today=TODAY)["id"]
