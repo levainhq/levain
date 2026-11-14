@@ -42,15 +42,15 @@ COUNT_RENDERS = ("window.__r = 0; const L = window.LevainDashboard, o = L.render
 def _long_tray(tmp_path: Path) -> tuple[Path, Any]:
     root, src, _ids = _install(tmp_path)
     store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    installed = [r["id"] for r in store.list_open()]   # everything `_install` made, by id: no list of its texts to go stale
     for i in range(30):
         store.add(type="task", text=f"TRAYBULK {i:02d} a note " + PARA, disposition="seed", today=TODAY - timedelta(days=i % 5))
     store.add(type="task", text=GIANT, disposition="seed", today=TODAY + timedelta(days=2))   # newest: the first row of the Tray
     # `_install` pins its own dates to k2a's fixed 2026-10-10 (a held seed due 10-15, a dated seed): once the real clock passes them the
     # List draws them as NOW rows above every undated seed, the card draws three rows, and the tall row is folded away for good (never
     # drawn, never has-more). These tests need the tall row drawn on any day: clear the install's NOW rows, whatever today is.
-    for r in store.list_open():
-        if r["text"] in ("a held seed", "a keep note", "a tray seed", "a loop", "a parked loop"):
-            store.descend(r["id"], kind="composted", today=TODAY)
+    for rid in installed:
+        store.descend(rid, kind="composted", today=TODAY)
     return root, src
 
 
