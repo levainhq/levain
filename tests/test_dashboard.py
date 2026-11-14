@@ -468,9 +468,38 @@ class TestIntentionProjections:
         rows.append(self._row(id="cap", text="capture", disposition="someday", created="2026-11-05T09:00:00Z"))
         self._write(tmp_path / "memory.spores.json", rows)
         paths = AnnealPaths.from_db(db)
-        noon = lambda d: datetime(2026, 11, d, 12, 0, tzinfo=timezone.utc)
+        # noon in the PROCESS zone, so the List's local day is the stated day on any host
+        noon = lambda d: datetime(2026, 11, d, 12, 0).astimezone()
         assert "cap" in [s.id for s in build_substrate_view(paths, now=noon(12)).tray]
         assert "cap" not in [s.id for s in build_substrate_view(paths, now=noon(20)).tray]
+
+    def test_a_timed_next_later_today_is_not_elapsed_in_the_capped_ranking(self, tmp_path: Path) -> None:
+        from datetime import datetime
+        # S2 r4: with only a `now` supplied the ranking keeps the minute. A `next` at 18:00 is still ahead at 09:00,
+        # so that row stays growing and takes the one slot; a day-granular read would call it elapsed (dormant) and
+        # hand the slot to the resting rival
+        db = tmp_path / "memory.db"
+        rows = [self._row(id="timed", text="later today", seen="2026-11-12", next="2026-11-12T18:00",
+                          created="2026-01-01T00:00:00Z"),
+                self._row(id="rival", text="resting", seen="2026-11-08", created="2026-01-01T00:00:00Z")]
+        self._write(tmp_path / "memory.spores.json", rows)
+        paths = AnnealPaths.from_db(db)
+        morning = datetime(2026, 11, 12, 9, 0).astimezone()
+        evening = datetime(2026, 11, 12, 19, 0).astimezone()
+        assert [s.id for s in build_substrate_view(paths, now=morning, max_intentions=1).tray] == ["timed"]
+        assert [s.id for s in build_substrate_view(paths, now=evening, max_intentions=1).tray] == ["rival"]
+
+    def test_fifty_live_rows_then_fresh_captures_keep_the_full_reserve(self, tmp_path: Path) -> None:
+        from datetime import date
+        from levain.dashboard import CAPTURE_RESERVE
+        # the row that fills the pool saw held=max-1 and is not counted: all of the reserve stays open for captures
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}", created="2026-01-01T00:00:00Z") for i in range(50)]
+        rows += [self._row(id=f"cap{i}", tier="cold", text=f"cap {i}", disposition="someday",
+                           created="2026-11-12T00:00:00Z") for i in range(12)]
+        self._write(tmp_path / "memory.spores.json", rows)
+        v = build_substrate_view(AnnealPaths.from_db(db), today=date(2026, 11, 12))
+        assert len([s for s in v.tray if s.id.startswith("cap")]) == min(CAPTURE_RESERVE, 50 // 5)
 
     def test_a_capture_dated_tomorrow_by_utc_survives_a_full_cap(self, tmp_path: Path) -> None:
         from datetime import date
