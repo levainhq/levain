@@ -409,10 +409,17 @@ def no_filesystem():
     straight to the real function: that thread is not the code under test, and tripping it fired FileTouched
     inside logging/threading/linecache on a background thread."""
     owner = threading.get_ident()
+    before = {t.ident for t in threading.enumerate()}   # threads that existed before this context: not the code under test
+
+    def guarded() -> bool:
+        """The owner, or any thread started since entry (a worker the code under test spawned): both are the code under
+        test. A thread that was already running (stdlib logging, pytest hooks, a leaked daemon) is not."""
+        me = threading.get_ident()
+        return me == owner or me not in before
 
     def tripwire(orig):
         def guard(*a, **k):
-            if threading.get_ident() == owner:
+            if guarded():
                 raise FileTouched(repr(a)[:80])
             return orig(*a, **k)
         return guard
@@ -421,7 +428,7 @@ def no_filesystem():
         """For a pathlib.Path attribute read statically (plain function, classmethod or staticmethod): the
         patched slot is a plain function, so ``a[0]`` is the instance (absent for a bare class call)."""
         def guard(*a, **k):
-            if threading.get_ident() == owner:
+            if guarded():
                 raise FileTouched(repr(a)[:80])
             inst = a[0] if a else None
             return orig.__get__(inst, type(inst) if a else pathlib.Path)(*a[1:], **k)
@@ -432,9 +439,15 @@ def no_filesystem():
     class ScopedEnviron:
         """``os.environ`` is None for the owner thread; every other thread sees the real mapping."""
         def __getattr__(self, name):
-            if threading.get_ident() == owner:
+            if guarded():
                 raise FileTouched("os.environ." + name)
             return getattr(real_environ, name)
+
+        def __setitem__(self, k, v):
+            self.__getattr__("__setitem__")(k, v)
+
+        def __delitem__(self, k):
+            self.__getattr__("__delitem__")(k)
 
         def __getitem__(self, k):
             return self.__getattr__("__getitem__")(k)
@@ -618,3 +631,51 @@ def test_random_stdin_never_crashes_and_never_touches_files():
 def test_corpus_is_json_clean():
     """The argv corpus is plain strings (no bytes smuggled in by accident)."""
     json.dumps(ARGV_CORPUS + DISPATCH_CORPUS)
+
+
+def _on_new_thread(fn):
+    """Run ``fn`` on a fresh thread, return what it raised (or None)."""
+    box: list = []
+
+    def run():
+        try:
+            fn()
+        except BaseException as e:   # noqa: BLE001 - the tripwire is a BaseException
+            box.append(e)
+    t = threading.Thread(target=run)
+    t.start()
+    t.join(5)
+    return box[0] if box else None
+
+
+def test_the_tripwire_ignores_a_thread_that_was_already_running():
+    """A thread alive before the context (stdlib logging, pytest's own hooks, a leaked daemon) is not the code under test:
+    it opens a file and os.environ keeps working for it, while the entering thread is still refused."""
+    go, done, got = threading.Event(), threading.Event(), []
+
+    def bystander():
+        go.wait(5)
+        try:
+            open(os.devnull).close()
+            os.environ["LEVAIN_TRIPWIRE_PROBE"] = "1"
+            del os.environ["LEVAIN_TRIPWIRE_PROBE"]
+        except BaseException as e:   # noqa: BLE001
+            got.append(e)
+        done.set()
+
+    t = threading.Thread(target=bystander, daemon=True)
+    t.start()
+    with no_filesystem():
+        go.set()
+        assert done.wait(5)
+        with pytest.raises(FileTouched):
+            open(os.devnull)
+    t.join(5)
+    assert got == []
+
+
+def test_the_tripwire_still_catches_a_worker_the_code_under_test_starts():
+    """A thread STARTED while the context is open is the code under test: a file it touches is refused."""
+    with no_filesystem():
+        err = _on_new_thread(lambda: open(os.devnull))
+    assert isinstance(err, FileTouched), err
