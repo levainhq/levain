@@ -157,6 +157,20 @@ def test_norm_disposition_missing_or_corrupt_still_invalid() -> None:
     assert _norm_disposition("note ", "note") == "note"         # in any spelling anneal persists as the row's value
 
 
+def test_norm_disposition_refuses_a_loop_on_a_key_absent_row_and_lets_a_literal_loop_row_echo() -> None:
+    """The retired `loop` is never written back: a key-absent row (current None) is a CHANGE into it and is refused with the
+    retirement words; only a row that literally holds `loop` may echo it."""
+    from levain.cockpit.effects import _norm_disposition
+    from levain.intentions import RETIRED_LOOP_MSG
+
+    with pytest.raises(ValueError, match="loops are folded into the List") as ei:
+        _norm_disposition("loop", None)
+    assert RETIRED_LOOP_MSG in str(ei.value)
+    with pytest.raises(ValueError, match="loops are folded into the List"):
+        _norm_disposition("loop", "someday")
+    assert _norm_disposition("loop", "loop") == "loop"
+
+
 def test_set_disposition_effect_missing_disposition_refused() -> None:
     from levain.cockpit.effects import _ce_set_disposition
 
