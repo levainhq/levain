@@ -28,6 +28,7 @@ from typing import Any
 from levain.intentions import (
     DEFAULT_CHECK_BY_DAYS,
     TRAY_WRITE_DISPOSITIONS,
+    disposition_of,
     done_event,
     event_anchor,
     executor_of,
@@ -84,10 +85,10 @@ def anchor_problem(anchor: Mapping[str, Any] | None) -> tuple[str, int, str, str
     agenda (:func:`reagenda_refusal`), so a link cannot be made in a state it would be refused in."""
     if not isinstance(anchor, Mapping) or anchor.get("status") == "resolved":
         return ("stale", 409, "the item was resolved or removed since it was read", "it has ended or is gone")
-    disposition = anchor.get("disposition")
+    disposition = disposition_of(anchor)   # a key-absent row (the entity's own plant) reads someday since the loop fold
     if not isinstance(disposition, str) or disposition.strip().casefold() not in TRAY_WRITE_DISPOSITIONS:
-        return ("bad_verb_arg", 422, "a then-part follows a someday or an agenda on the List, not a loop",
-                "it is a loop, not a someday or an agenda on the List")
+        return ("bad_verb_arg", 422, "a then-part follows a someday or an agenda on the List",
+                "it is not a someday or an agenda on the List")
     if executor_of(anchor.get("target")) == "machine":
         return ("bad_verb_arg", 422, "this part is handed to the desk or a board, and it is closed when it is handed "
                 "off, so nothing could mark it done: a then-part follows a part you do yourself",

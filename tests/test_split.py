@@ -332,16 +332,29 @@ def test_then_you_refuses_what_it_cannot_make(tmp_path, words, check_by, why):
         split.create_then(_intentions(root), a["id"], words, check_by=check_by, today=TODAY)
 
 
-def test_then_you_refuses_a_resolved_or_a_loop_first_part(tmp_path):
+def test_then_you_refuses_a_resolved_or_a_legacy_note_first_part(tmp_path):
+    from anneal_memory.spores import IntentionStore
+
     root = _install(tmp_path)
     a = _anchor(root)
-    loop = guarded_intention_store(_intentions(root)).add(type="task", text="a loop")
+    note = IntentionStore(_intentions(root), id_prefix="intention").add(type="task", text="a legacy note", disposition="note")
     _done(root, a["id"])
     with pytest.raises(split.ThenRefused) as gone:
         split.create_then(_intentions(root), a["id"], "next", today=TODAY)
     assert gone.value.status == 409
-    with pytest.raises(split.ThenRefused, match="not a loop"):
-        split.create_then(_intentions(root), loop["id"], "next", today=TODAY)
+    with pytest.raises(split.ThenRefused, match="a someday or an agenda on the List"):
+        split.create_then(_intentions(root), note["id"], "next", today=TODAY)
+
+
+def test_a_key_absent_row_is_a_first_part_since_the_loop_fold(tmp_path):
+    """Was refused as "not a loop" (the entity's own plant had no disposition, which read as a loop). It reads someday now, so
+    it is a someday on the List and a then-part follows it; a literal `loop` reads the same."""
+    root = _install(tmp_path)
+    plant = guarded_intention_store(_intentions(root)).add(type="task", text="the entity's own plant")
+    assert "disposition" not in plant and split.anchor_problem(plant) is None
+    assert split.anchor_problem({**plant, "disposition": "loop"}) is None
+    made = split.create_then(_intentions(root), plant["id"], "after it", today=TODAY)
+    assert made is not None
 
 
 @pytest.mark.parametrize("target", ["desk", "board:levain"])
@@ -418,7 +431,11 @@ def test_a_second_part_back_on_the_agenda_is_asked_what_create_then_asks_of_a_fi
     root = _install(tmp_path)
     st = guarded_intention_store(_intentions(root))
     follower = _follower(root, _anchor(root)["id"], text="x")
-    for make in (lambda: st.add(type="task", text="a loop", tier="hot", today=TODAY),
+    from anneal_memory.spores import IntentionStore
+
+    legacy = IntentionStore(_intentions(root), id_prefix="intention")        # the guarded store no longer writes a note
+    # (was a key-absent row, "a loop": it reads someday since the loop fold, so it is a good first part; see the test below)
+    for make in (lambda: legacy.add(type="task", text="a legacy note", disposition="note", today=TODAY),
                  lambda: st.add(type="task", text="desk", disposition="agenda", target="desk", next="2031-01-07", today=TODAY)):
         row = make()
         with pytest.raises(split.ThenRefused) as exc:

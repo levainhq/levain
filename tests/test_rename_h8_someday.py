@@ -72,11 +72,12 @@ def test_someday_is_written_and_seed_is_only_read() -> None:
 
 
 def test_a_resolved_seed_never_reads_as_a_loop() -> None:
-    """The read set keeps ``seed``: is_loop fails open on an unknown value, so dropping it would put every resolved
-    (and every not-yet-migrated) seed into the entity's cognition."""
+    """The read set keeps ``seed``: a resolved (and a not-yet-migrated) seed still reads as the Tray spelling it is. (Before
+    the loop fold ``is_loop`` failed open on an unknown value, so dropping it would have put every such seed into the entity's
+    cognition; ``is_loop`` is False for every row now.)"""
     for row in ({"disposition": "seed"}, {"disposition": "seed", "status": "resolved"}):
         assert not is_loop(row) and is_tray(row) and bucket_of(row) == BUCKET_TRAY
-    assert is_loop({"disposition": "sed"})      # the fail-open class this guards against stays what it is
+    assert not is_loop({"disposition": "sed"}) and not is_tray({"disposition": "sed"})   # a typo is shown by name, not a Tray row
 
 
 def test_the_standalone_hooks_still_filter_seed() -> None:

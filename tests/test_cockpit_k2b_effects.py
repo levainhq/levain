@@ -65,8 +65,10 @@ KINDS = [
     ("text", "intention_update", {"text": "edited\r\n"}, "k.loop", lambda r: r["text"] == "edited"),
     ("domain", "intention_update", {"domain": "levain"}, "k.loop", lambda r: r["domain"] == "levain"),
     ("type", "intention_update", {"type": "question"}, "k.seed", lambda r: r["type"] == "question"),
-    ("disposition", "intention_set_disposition", {"disposition": "loop", "surface_at": "2026-12-01"}, "k.seed",
-     lambda r: "disposition" not in r and r["next"] == "2026-12-01"),
+    # (was a re-route to `loop`, which cleared the tag; `loop` is no write value since the fold, so this one moves a retired
+    # seed to someday, which is the same one-field write plus its schedule)
+    ("disposition", "intention_set_disposition", {"disposition": "someday", "surface_at": "2026-12-01"}, "k.seed",
+     lambda r: r["disposition"] == "someday" and r["next"] == "2026-12-01"),
     ("pull_forward", "intention_surface_at", {"surface_at": "2026-10-11"}, "k.loop",
      lambda r: r["next"] == "2026-10-11"),
     ("ascend", "intention_promote", {"intention_kind": "project", "ref": "commit abc"}, "k.loop",

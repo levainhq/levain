@@ -441,8 +441,8 @@ def _origin_key_of(resource_key: str) -> str:
 
 
 def _stored_authority(row: Mapping[str, Any], f: str) -> Any:
-    """An authority field as anneal stores it: a cleared domain is ``""``, a plain loop's
-    disposition an absent key (None here)."""
+    """An authority field as anneal stores it: a cleared domain is ``""``, a key-absent row's
+    disposition an absent key (None here; it READS as someday, but the stored form is what is hashed and compared)."""
     if f == "domain":
         return row.get("domain") or ""
     if f == "disposition":
@@ -635,7 +635,6 @@ def _norm_disposition(value: Any, current: Any = None) -> str | None:
     ``IntentionEffectStore.intention_apply`` leaves it out of the write. Any other invalid value (None
     included) is refused as not one of the write set (``WRITE_DISPOSITIONS``)."""
     from levain.intentions import (
-        LOOP_DISPOSITION,
         WRITE_DISPOSITIONS,
         RetiredDisposition,
         refuse_retired_disposition,
@@ -649,7 +648,9 @@ def _norm_disposition(value: Any, current: Any = None) -> str | None:
         raise ValueError(str(exc)) from exc
     if value not in WRITE_DISPOSITIONS and not (stored_disposition(value) == current and retired_message(value) is not None):
         raise ValueError(f"disposition must be one of {list(WRITE_DISPOSITIONS)} (got {value!r})")
-    return None if value == LOOP_DISPOSITION else _norm(value)
+    # the loop fold: ``loop`` is a retired write value, so it only gets here as the echo of a literal ``loop`` row, which
+    # rides as that row's own raw value (the CAS compares it); it no longer maps to a cleared tag
+    return _norm(value)
 
 
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -858,7 +859,7 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
     write, which needs a date (``surface_at``, or the one the row already holds; a part that waits on an event needs none and
     is refused one). Only a value flow's germinate also accepts
     is written (the two halves read one store)."""
-    from levain.intentions import check_steering, is_event_agenda, valid_next, valid_retarget
+    from levain.intentions import check_steering, disposition_of, is_event_agenda, valid_next, valid_retarget
 
     pre = _require_open(pre)
     stray = sorted(set(params) - {"target", "surface_at"})
@@ -867,7 +868,7 @@ def _ce_retarget(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, or
     target = params["target"]
     if not valid_retarget(target):
         raise ValueError(f"target must be band, nudge, desk or board:<repo> (got {target!r})")
-    disposition = str(pre.get("disposition") or "").strip().casefold()
+    disposition = str(disposition_of(pre)).strip().casefold()   # a key-absent row reads someday (the loop fold)
     if disposition not in ("someday", "seed", "agenda"):
         raise ValueError("a target steers a seed or an agenda; this intention is neither")
     stamp = pre.get("germinated")
