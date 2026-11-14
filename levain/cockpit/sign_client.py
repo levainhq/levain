@@ -187,7 +187,7 @@ def _dump(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(", ", ": "))
 
 
-def intake_headline(rec: Any) -> str | None:
+def intake_headline(rec: Any, now: datetime | None = None) -> str | None:
     """One plain line saying WHAT a signed ``list_intake`` record writes, read from the record's own effect (the ``changes`` of
     its intention create), never from the unsigned journal. A reminder says it is a reminder with its minute and its repeat; a
     drop and a talk say their own kind, so none reads as another (a plain sort line plants nothing and is never signed). None
@@ -199,7 +199,9 @@ def intake_headline(rec: Any) -> str | None:
     ch = first.get("changes") if first else None
     if isinstance(ch, dict) and ch.get("disposition") == "agenda" and isinstance(ch.get("next"), str):
         try:
-            at = f"{datetime.strptime(ch['next'], '%Y-%m-%dT%H:%M'):%a %m-%d %H:%M}"
+            from levain import intake
+
+            at = intake.when_text(ch["next"], now)
         except ValueError:
             return None
         words = _dump(ch.get("text"))         # escaped like the record's own lines: a newline in the words stays on this line
@@ -221,7 +223,7 @@ def intake_headline(rec: Any) -> str | None:
     return None
 
 
-def render(view: OpView, *, signer_fp: str, signer_class: str | None) -> list[str]:
+def render(view: OpView, *, signer_fp: str, signer_class: str | None, now: datetime | None = None) -> list[str]:
     """The record ``sign`` will sign, rendered from the very bytes (``view.record_bytes``): every key of
     the decoded record, in its stored order, nothing dropped (a list of objects, like ``effects``, one key
     per line). What the journal keeps beside the record follows under its own heading, because it is not
@@ -229,7 +231,7 @@ def render(view: OpView, *, signer_fp: str, signer_class: str | None) -> list[st
     rec = json.loads(view.record_bytes)
     rec = rec if isinstance(rec, dict) else {"record": rec}
     lines = [f"signing {view.pending_id}: {rec.get('verb')} ({rec.get('intent')}, {rec.get('tier')})"]
-    headline = intake_headline(rec)
+    headline = intake_headline(rec, now)
     if headline is not None:
         lines.append(f"  this signs {headline}  (read from the record below)")
     lines.append("  signed record (the bytes signed):")

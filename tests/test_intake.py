@@ -38,7 +38,7 @@ def test_refusal_is_a_valueerror_with_reason():
 
 
 def test_receipts():
-    line, d = receipt(parse_intake("@tomorrow check backups", _NOW), "intention-7")
+    line, d = receipt(parse_intake("@tomorrow check backups", _NOW), "intention-7", now=_NOW)
     assert line == "scheduled drop intention-7 fires Mon 11-09 09:00"
     assert d == {"kind": "drop", "id": "intention-7", "fires": "2026-11-09T09:00", "text": "check backups"}
     line, d = receipt(parse_intake("? flow's future", _NOW), "intention-8")
@@ -83,3 +83,24 @@ def test_a_bad_time_after_a_date_is_named_as_the_time_not_the_date():
 def test_a_leap_day_finds_the_next_leap_year():
     assert parse_intake("@02-29 leap", datetime(2026, 11, 8, 12, 0))["when"] == "2028-02-29T09:00"
     assert parse_intake("@02-29 leap", datetime(2028, 3, 1, 12, 0))["when"] == "2032-02-29T09:00"
+
+
+def test_a_yearless_date_that_lands_next_year_has_a_receipt_that_names_the_year():
+    """Row 1729, reproduced: typed at 09:01 on 11-14 for '11-14 9am', the parser reads the NEXT occurrence (2027-11-14) and the
+    receipt used to say ``Sun 11-14 09:00``, which reads as set for today. The receipt names the year when it is not this year's."""
+    now = datetime(2026, 11, 14, 9, 1)
+    parsed = parse_intake("remind me 11-14 9am call Jim", now)
+    assert parsed["when"] == "2027-11-14T09:00"                      # the resolution rule is unchanged
+    line, d = receipt(parsed, "intention-9", now=now)
+    assert line == "reminder intention-9 rings Sun 2027-11-14 09:00", line
+    assert receipt_line(d, now) == line
+    drop_line, _ = receipt(parse_intake("@11-14 9am x", now), "intention-10", now=now)
+    assert drop_line == "scheduled drop intention-10 fires Sun 2027-11-14 09:00", drop_line
+
+
+def test_a_same_year_date_has_a_receipt_without_a_year():
+    now = datetime(2026, 11, 14, 9, 1)
+    line, _ = receipt(parse_intake("remind me 11-14 10am call Jim", now), "intention-9", now=now)
+    assert line == "reminder intention-9 rings Sat 11-14 10:00", line
+    line, _ = receipt(parse_intake("remind me 12-31 call Jim", now), "intention-9", now=now)
+    assert line == "reminder intention-9 rings Thu 12-31 09:00", line
