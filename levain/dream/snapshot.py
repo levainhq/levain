@@ -36,6 +36,11 @@ from typing import Any, Callable, Mapping
 SNAP_DIR = "snap"
 MANIFEST = "manifest.json"
 DB_BACKUP = "memory.db.backup"
+#: the text the dream saved, kept inside ``snap/`` so the drill can restore from it whatever was written since
+POST_DIR = "post"
+#: why a drill had nothing to drill; the drill verb and the overdue row both say it
+NO_DRILLABLE_WHY = ("no snapshot holds a dream's saved text to restore from (the newest nights did not consolidate, "
+                    "or were taken before this version)")
 UNDO_DIR = "reverted-from"
 ROLLBACK_RECORD = "rollback.json"
 DRILL_RECORD = "drill.json"
@@ -347,9 +352,35 @@ def reinsertion_proof(db: Path, occ_dir: Path, m: Mapping[str, Any], wrap_id: An
             f"own durable-facts step on this dream's save ({proved}); it is not recorded as the dream's")
     return proved
 
+def _keep_post_text(db: Path, occ_dir: Path, post: Mapping[str, str | None]) -> None:
+    """Copy each text-tier file the save wrote into ``snap/post/``, so the drill can restore from the dream's own text
+    whatever is written to the live store later. The copies must hash to ``post`` (the live hashes just read): a write
+    that landed between the read and the copy refuses the record, as :func:`take` refuses a changed file. The copy sits
+    inside ``snap/``, so :func:`prune_snapshots` removes it with the snapshot."""
+    dest = occ_dir / SNAP_DIR / POST_DIR
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True)
+    try:
+        for key, src in text_tier(db).items():
+            if src.is_file():
+                shutil.copy2(src, dest / src.name)
+                if sha256_file(dest / src.name) != post.get(key):
+                    raise SnapshotRefused(f"{src.name} changed while it was copied")
+        changed = sorted(p.name for k, p in text_tier(db).items() if sha256_file(p) != post.get(k))
+        if changed:
+            raise SnapshotRefused(f"{', '.join(changed)} changed while it was copied")
+    except OSError as exc:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise SnapshotRefused(f"the saved text could not be kept: {type(exc).__name__}: {exc}") from exc
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+
 def record_post_for(db_path: Path | str, occ_dir: Path | str, wrap_id: Any, *, composed_sha256: str | None = None,
                     prune: bool = True) -> dict[str, str | None]:
-    """Record the text tier the dream's save wrote (``post_files``) and the wrap id in the manifest. Refuses (raises
+    """Record the text tier the dream's save wrote (``post_files``) and the wrap id in the manifest, and keep the text
+    itself in ``snap/post/`` (:func:`_keep_post_text`). Refuses (raises
     :class:`SnapshotRefused`) when there is no snapshot, a post record already exists (a second could bless a later
     wrap's text as the dream's), the tier is unchanged since the snapshot, or ``composed_sha256`` is given and the
     live continuity text is not it (the live text would not be the dream's) UNLESS :func:`reinsertion_proof` proves
@@ -368,6 +399,7 @@ def record_post_for(db_path: Path | str, occ_dir: Path | str, wrap_id: Any, *, c
     changes: dict[str, list[str]] = {}
     if composed_sha256 and post["continuity"] != composed_sha256:
         changes = reinsertion_proof(db, occ_dir, m, wrap_id, composed_sha256, post["continuity"])
+    _keep_post_text(db, occ_dir, post)
     m["post_files"] = post
     m["wrap_id"] = wrap_id
     for key in ("reinserted", "dropped"):
@@ -654,25 +686,23 @@ def _finish(occ_dir: Path, m: dict[str, Any], who: str, restored: list[str],
 
 @dataclass
 class DrillResult:
-    """``outcome``: ``ok`` (every applicable step passed), ``failed`` (a step failed: an attention row) or
-    ``skipped`` (the checks that ran passed, but the restore step did not run, so no restore was proved: it is
-    recorded, so the drill is next due in a cadence, but it is not a pass and clears nothing), ``no-snapshot`` (a fresh
-    install: not a failure) or ``deferred`` (a dream or another writer holds the store, so the live store could not be
-    copied consistently; nothing is recorded and the drill stays due). A step is ``ok``, ``failed`` or ``skipped`` (with
-    why). ``carried_failure`` is set only on a ``skipped`` result: the text of the ``restore`` or ``open`` failure the
-    last recorded drill found, kept until a drill really restores. A skipped drill re-proved setup, hash, copy and
-    integrity, so a failure on one of those is superseded by it, not carried; a failure on a step it did not run is
-    neither cleared nor lost by a week with no restore."""
+    """``outcome``: ``ok`` (every step passed), ``failed`` (a step failed: an attention row), ``no-snapshot`` (a fresh
+    install: not a failure), ``no-drillable`` (snapshots exist but none holds a dream's kept saved text: nothing was
+    proved, nothing is recorded, the drill stays due) or ``deferred`` (a dream or another writer holds the store, so
+    the live db could not be copied consistently; nothing is recorded and the drill stays due). A step is ``ok``,
+    ``failed`` or ``skipped`` (with why). ``live_past_dream`` names the live text files that are neither what the dream
+    saved nor what it replaced: the real rollback would refuse the live store today, and the drill, which restores
+    from the kept text, proves the restore and not that."""
     outcome: str
     snapshot: str | None = None
     steps: list[dict[str, str]] = field(default_factory=list)
     at: str = ""
-    carried_failure: str | None = None
+    live_past_dream: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"outcome": self.outcome, "snapshot": self.snapshot, "steps": self.steps, "at": self.at}
-        if self.carried_failure:
-            out["carried_failure"] = self.carried_failure
+        if self.live_past_dream:
+            out["live_past_dream"] = self.live_past_dream
         return out
 
 
@@ -681,17 +711,22 @@ def _step(res: DrillResult, name: str, status: str, detail: str) -> str:
     return status
 
 
+def _drillable(m: Mapping[str, Any], occ_dir: Path) -> bool:
+    """A snapshot the drill can restore from: the dream consolidated (a post record) and kept its saved text."""
+    return bool(m.get("post_files")) and (occ_dir / SNAP_DIR / POST_DIR).is_dir()
+
+
 def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True) -> DrillResult:
-    """The restore drill (§3.4): it never touches the live store. On the latest snapshot under ``root``: (1) hash every
-    snapshot file and the db backup against the manifest; (2) ``PRAGMA integrity_check`` on the backup; (3) copy the live
-    store to a scratch dir and run the real :func:`rollback` against the copy, then check each restored file hashes to
-    the manifest's ``pre``; (4) open the restored copy with anneal and read its status. Step 3 is skipped (not failed)
-    when the snapshot is not the one the live text matches (a later write, a finished rollback) or has no post-save
-    record, because the rollback's own guard is then doing its job; the outcome is then ``skipped``, never ``ok``,
-    since nothing was restored. The result is written to ``<root>/drill.json``, read by :func:`last_drill` (the weekly
-    tick and the next drill); no gauge reads it. ``deferred`` and ``no-snapshot`` write nothing."""
+    """The restore drill (§3.4): it never touches the live store, and it does not depend on what has been written to it
+    since the dream. On the newest snapshot under ``root`` that holds a dream's kept saved text (:func:`_drillable`):
+    (1) hash every snapshot file and the db backup against the manifest; (2) hash each kept saved file against the
+    manifest's ``post_files``; (3) ``PRAGMA integrity_check`` on the backup; (4) build a scratch store from an online
+    backup of the live db plus the kept saved text, run the real :func:`rollback` against it, and check each restored
+    file hashes to the manifest's ``pre``; (5) open the restored copy with anneal and read its status. The scratch
+    manifest has its revert markers cleared, so a dream rolled back by hand still proves the mechanism. The result is
+    written to ``<root>/drill.json``, read by :func:`last_drill` (the weekly tick and the next drill); no gauge reads
+    it. ``deferred``, ``no-drillable`` and ``no-snapshot`` write nothing."""
     from anneal_memory import Store
-    from levain.dream.executor import _copy_store
 
     from levain import wrap as _w
 
@@ -709,8 +744,8 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
         except OSError as exc:
             _step(res, "setup", "failed", f"no scratch directory: {type(exc).__name__}: {exc}")
             return _drill_done(res, root, write_result, failed=True)
-        # one lock covers choosing the snapshot, reading its manifest, and copying both the snapshot files and the
-        # live store: a dream finishing between any two of those would otherwise leave the drill checking a stale one
+        # one lock covers choosing the snapshot, reading its manifest, and copying the snapshot files, the kept text and
+        # the live db: a dream finishing between any two of those would otherwise leave the drill checking a stale one
         try:
             handle = _w._lock_wrap_file(db.parent / "wrap.lock")
         except OSError as exc:
@@ -732,40 +767,62 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
             snaps = snapshots(root)
             if not snaps:
                 return res     # nothing to prove, so nothing is recorded: the last record (a failure) must stand
-            name, m = snaps[-1]
+            chosen = [(n, mm) for n, mm in snaps if _drillable(mm, root / n)]
+            if not chosen:
+                return _no_drillable(res)
+            name, m = chosen[-1]
             occ = root / name
             res.snapshot, res.outcome = name, "ok"
             snap = occ / SNAP_DIR
-            # under the lock: copy every snapshot file and the db backup to scratch and hash each COPY against the
-            # manifest. A copy that mismatches is compared with its original (still under the lock, so it cannot be
-            # pruned): the original matching means the copy is bad, the original mismatching means the snapshot is.
-            # Everything after the release reads only these verified copies.
+            pre = {k: e["sha256"] for k, e in m["files"].items()}
+            post_want = {k: v for k, v in (m.get("post_files") or {}).items() if v is not None}
+            live = tier_hashes(db)
+            res.live_past_dream = sorted(text_tier(db)[k].name for k in live
+                                         if k in pre and live[k] not in (pre[k], (m.get("post_files") or {}).get(k)))
+            # under the lock: copy every snapshot file, the db backup and the kept saved text to scratch and hash each
+            # COPY against the manifest. A copy that mismatches is compared with its original (still under the lock,
+            # so it cannot be pruned): the original matching means the copy is bad, the original mismatching means
+            # the snapshot is. Everything after the release reads only these verified copies.
             socc = scratch / "occs" / name
             corrupt: list[str] = []
+            post_bad: list[str] = []
             bad_copy: list[str] = []
 
-            def copy_and_check(src: Path, dst: Path, want: str | None, label: str) -> None:
+            def copy_and_check(src: Path, dst: Path, want: str | None, label: str, bad: list[str]) -> None:
                 shutil.copy2(src, dst)
                 if sha256_file(dst) != want:
-                    (bad_copy if sha256_file(src) == want else corrupt).append(label)
+                    (bad_copy if sha256_file(src) == want else bad).append(label)
 
             try:
                 (socc / SNAP_DIR).mkdir(parents=True)
                 for e in m["files"].values():
                     if e["sha256"] is not None:
-                        copy_and_check(snap / e["name"], socc / SNAP_DIR / e["name"], e["sha256"], e["name"])
-                copy_and_check(snap / DB_BACKUP, bdir / DB_BACKUP, m.get("db_backup_sha256"), DB_BACKUP)
+                        copy_and_check(snap / e["name"], socc / SNAP_DIR / e["name"], e["sha256"], e["name"], corrupt)
+                copy_and_check(snap / DB_BACKUP, bdir / DB_BACKUP, m.get("db_backup_sha256"), DB_BACKUP, corrupt)
+                for key, want in post_want.items():
+                    fname = (m["files"].get(key) or {}).get("name") or text_tier(db)[key].name
+                    kept_file = snap / POST_DIR / fname
+                    if kept_file.is_file():
+                        copy_and_check(kept_file, sdir / fname, want, fname, post_bad)
+                    else:
+                        post_bad.append(f"{fname} (not kept)")
             except OSError as exc:
                 copy_err = f"{type(exc).__name__}: {exc}"
-            if copy_err is None and not corrupt and not bad_copy and m.get("post_files"):
+            if copy_err is None and not corrupt and not bad_copy and not post_bad:
                 try:
-                    copy_db = _copy_store(db, sdir)
+                    copy_db = sdir / db.name
+                    _backup_db(db, copy_db)
                 except (OSError, sqlite3.Error) as exc:
+                    copy_db = None
                     restore_err = f"the live store could not be copied: {type(exc).__name__}: {exc}"
         finally:
             release()
         if _step(res, "hash", "failed" if corrupt else "ok", f"does not match the manifest: {corrupt}" if corrupt
                  else "every snapshot file and the db backup match their manifest hashes") == "failed":
+            return _drill_done(res, root, write_result, failed=True)
+        if _step(res, "post", "failed" if post_bad else "ok",
+                 f"the kept saved text does not hash to the dream's post record: {post_bad}" if post_bad
+                 else "every kept saved file matches the manifest's post record") == "failed":
             return _drill_done(res, root, write_result, failed=True)
         if copy_err is not None or bad_copy:
             _step(res, "copy", "failed", f"the scratch copy failed: {copy_err}" if copy_err
@@ -782,33 +839,22 @@ def drill(store_path: Path | str, root: Path | str, *, write_result: bool = True
         ok = verdict == ["ok"]
         if _step(res, "integrity", "ok" if ok else "failed", "integrity_check: ok" if ok else f"{verdict[:3]}") == "failed":
             return _drill_done(res, root, write_result, failed=True)
-        if restore_err is not None:
-            _step(res, "restore", "failed", restore_err)
+        if restore_err is not None or copy_db is None:
+            _step(res, "restore", "failed", restore_err or "no scratch store was built")
             return _drill_done(res, root, write_result, failed=True)
-        if not m.get("post_files") or copy_db is None:
-            _step(res, "restore", "skipped", "the snapshot has no post-save record, so a rollback of it is refused by design")
-            _step(res, "open", "skipped", "no restored copy")
-            return _drill_done(res, root, write_result, skipped=True)
-        # the revert markers stay as the real manifest has them: a finished rollback then refuses on the copy as
-        # ``already-reverted`` (skipped), instead of the copy reading "nothing to roll back" (a false failure)
-        _write_manifest(socc, {**m, "store_db": str(copy_db)})
+        # the revert markers are cleared on the scratch manifest: a dream rolled back by hand still proves the mechanism
+        _write_manifest(socc, {**m, "store_db": str(copy_db), "revert_started_at": None, "reverted_at": None})
         rb = rollback(copy_db, socc, who="drill")
         if rb.outcome == "refused" and rb.code in ("wrap-open", "lock-held"):
             return _deferred(res, f"{rb.code}: a dream is running on the store")
-        if rb.code in ("foreign-write", "later-dream", "already-reverted"):
-            _step(res, "restore", "skipped", f"{rb.code}: the live store is past this dream, and the rollback guard "
-                                             f"refused it on the copy (as designed). {rb.message}")
-            _step(res, "open", "skipped", "no restored copy")
-            return _drill_done(res, root, write_result, skipped=True)
-        if not rb.ok or rb.outcome == "nothing":
+        if not rb.ok or rb.outcome in ("nothing", "already-reverted"):
             _step(res, "restore", "failed", rb.message)
             return _drill_done(res, root, write_result, failed=True)
         now = tier_hashes(copy_db)
-        pre = {k: e["sha256"] for k, e in m["files"].items()}
         wrong = sorted(k for k in pre if now[k] != pre[k])
         if _step(res, "restore", "failed" if wrong else "ok",
                  f"restored files do not hash to the manifest's pre: {wrong}" if wrong
-                 else f"rolled back on a copy; {len(rb.restored)} file(s) restored, each hashes to pre") == "failed":
+                 else f"rolled back on a scratch store; {len(rb.restored)} file(s) restored, each hashes to pre") == "failed":
             return _drill_done(res, root, write_result, failed=True)
         try:
             with Store(str(copy_db), section_schema=None) as s:
@@ -830,37 +876,23 @@ def _deferred(res: DrillResult, why: str) -> DrillResult:
     return res
 
 
+def _no_drillable(res: DrillResult) -> DrillResult:
+    """Snapshots exist but none can be restored from: nothing was proved, so nothing is recorded and the drill stays due."""
+    res.outcome = "no-drillable"
+    res.steps.append({"name": "restore", "status": "skipped", "detail": f"no-drillable: {NO_DRILLABLE_WHY}"})
+    return res
+
+
 def failed_steps_text(steps: Any) -> str:
     """The failed steps of a drill result as one line (the attention row's cause). The ONE place this text is made: the
-    row's dedupe key is a hash of it, so the row, its re-raise from the record and the carried copy must be identical."""
+    row's dedupe key is a hash of it, so the row and its re-raise from the record must be identical."""
     return "; ".join(f"{s.get('name')}: {s.get('detail')}" for s in steps or [] if s.get("status") == "failed") \
         or "a step failed"
 
 
-#: the steps a ``skipped`` drill does NOT prove: it reaches the skip only after setup, hash, copy and integrity passed,
-#: but never ran the restore or the open. A carried failure on any other step is superseded by that skipped drill.
-UNPROVEN_BY_A_SKIP = ("restore", "open")
-
-
-def _carried_text(steps: Any) -> str | None:
-    """The part of a prior failure a skipped drill cannot have re-proved, as the row text, or None."""
-    kept = [s for s in steps or [] if s.get("status") == "failed" and s.get("name") in UNPROVEN_BY_A_SKIP]
-    return failed_steps_text(kept) if kept else None
-
-
-def _drill_done(res: DrillResult, root: Path, write: bool, *, failed: bool = False,
-                skipped: bool = False) -> DrillResult:
+def _drill_done(res: DrillResult, root: Path, write: bool, *, failed: bool = False) -> DrillResult:
     if failed:
         res.outcome = "failed"
-    elif skipped:
-        # the restore did not run, so this is not a pass; the failure the last recorded drill found is carried
-        # forward (a drill that really restores drops it), so the skip neither clears it nor loses it
-        res.outcome = "skipped"
-        prior = last_drill(root) or {}
-        if prior.get("outcome") == "failed":
-            res.carried_failure = _carried_text(prior.get("steps"))
-        elif prior.get("outcome") == "skipped" and prior.get("carried_failure"):
-            res.carried_failure = str(prior["carried_failure"])
     if write:
         with contextlib.suppress(OSError):
             root.mkdir(parents=True, exist_ok=True)
@@ -869,13 +901,14 @@ def _drill_done(res: DrillResult, root: Path, write: bool, *, failed: bool = Fal
 
 
 def last_drill(root: Path | str) -> dict[str, Any] | None:
-    """The last drill result under ``root``, or None. A record written before ``skipped`` existed (``outcome: ok`` with a
-    skipped ``restore`` step) reads as ``skipped``: nothing was restored, so it was never a pass. The file is not rewritten."""
+    """The last drill verdict under ``root``, or None. A record the retired ``skipped`` outcome wrote (``skipped``, or
+    ``ok`` with a skipped ``restore`` step) restored nothing, so it is no verdict and reads as no record. The file is
+    not rewritten."""
     rec = _read_json(Path(root) / DRILL_RECORD)
-    if isinstance(rec, dict) and rec.get("outcome") == "ok" and any(
+    if isinstance(rec, dict) and (rec.get("outcome") == "skipped" or (rec.get("outcome") == "ok" and any(
             isinstance(s, dict) and s.get("name") == "restore" and s.get("status") == "skipped"
-            for s in rec.get("steps") or []):
-        rec = {**rec, "outcome": "skipped"}
+            for s in rec.get("steps") or []))):
+        return None
     return rec
 
 
