@@ -484,17 +484,44 @@ class TestIntentionProjections:
 
     def test_a_malformed_fresh_row_costs_no_reserve_slot(self, tmp_path: Path) -> None:
         from datetime import date
-        # S2 r2: the reserve counts a row only once it is in the view, so malformed fresh rows do not let an old row in
+        # S2 r3: the reserve counts a row only once it is in the view. capture_cap malformed fresh rows rank before a
+        # non-fresh rival; if they were counted (counter moved before the append) the live count would read short and
+        # let the rival in past the full cap
         db = tmp_path / "memory.db"
         day = date(2026, 11, 12)
         rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}", created="2026-01-01T00:00:00Z") for i in range(50)]
         rows += [self._row(id=f"bad{i}", tier="warm", salience="x", text="bad", created="2026-11-11T00:00:00Z") for i in range(10)]
-        # the old row ranks after the malformed ones (salience -1 under their coerced 0), so only the count can admit it
-        rows.append(self._row(id="old", tier="warm", salience=-1, text="old", created="2026-01-02T00:00:00Z"))
+        # the rival ranks after the malformed ones (salience -1 under their coerced 0), so only the count can shut it out
+        rows.append(self._row(id="rival", tier="warm", salience=-1, text="rival", created="2026-01-02T00:00:00Z"))
         self._write(tmp_path / "memory.spores.json", rows)
         v = build_substrate_view(AnnealPaths.from_db(db), today=day)
         ids = [s.id for s in v.tray]
-        assert "old" not in ids and not any(i.startswith("bad") for i in ids) and len(ids) == 50
+        assert "rival" not in ids and not any(i.startswith("bad") for i in ids) and len(ids) == 50
+
+    def test_a_far_future_created_is_not_fresh(self, tmp_path: Path) -> None:
+        from datetime import date
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}", created="2026-01-01T00:00:00Z") for i in range(60)]
+        rows.append(self._row(id="skew", text="a month ahead", disposition="someday", created="2026-12-12T00:00:00Z"))
+        rows.append(self._row(id="utc", text="a day ahead", disposition="someday", created="2026-11-13T02:00:00Z"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        ids = [s.id for s in build_substrate_view(AnnealPaths.from_db(db), today=date(2026, 11, 12)).tray]
+        assert "skew" not in ids and "utc" in ids
+
+    def test_reserve_day_of_a_foreign_zone_now_is_the_lists_own_day(self, tmp_path: Path) -> None:
+        from datetime import date, datetime, timedelta, timezone
+        from levain.band_view import _today_of
+        # an aware now in another zone near midnight: the reserve judges the same day the List's `later` logic does
+        db = tmp_path / "memory.db"
+        rows = [self._row(id=f"loop{i}", tier="hot", text=f"loop {i}", created="2026-01-01T00:00:00Z") for i in range(60)]
+        rows.append(self._row(id="cap", text="capture", disposition="someday", created="2026-11-05T09:00:00Z"))
+        self._write(tmp_path / "memory.spores.json", rows)
+        paths = AnnealPaths.from_db(db)
+        for hours in (-12, -5, 0, 8, 14):
+            now = datetime(2026, 11, 12, 23, 30, tzinfo=timezone(timedelta(hours=hours)))
+            listed_day = date.fromisoformat(_today_of(None, now))
+            fresh = listed_day <= date(2026, 11, 12)  # created 11-05 is fresh through day 7
+            assert ("cap" in [s.id for s in build_substrate_view(paths, now=now).tray]) is fresh
 
     def test_parked_rows_have_their_own_cap(self, tmp_path: Path) -> None:
         db = tmp_path / "memory.db"
