@@ -1,9 +1,11 @@
 """G2 (levain#21): a reminder at a time rings ONCE per (item, time), on the real germinate path over a real file store.
 
-Row 188's reminder is a nudge agenda with a timed ``next``; the path that rings it is ``germinate`` (``is_due`` then
-``file_once`` keyed by the origin key and the minute, then the stamp). Nothing here mocks that logic: only the ping
-seam is replaced (it would reach a phone), and the clock is the ``now`` germinate takes, except the last test, which
-leaves ``now`` unset so the host's own clock decides."""
+Row 188's reminder is a nudge agenda with a timed ``next``; the path that rings it is ``germinate`` (``is_due``, then
+``file_once``, then the ping, then the stamp). Nothing here mocks that logic: only the ping seam is replaced (it would
+reach a phone), and the clock is the ``now`` germinate takes, except the host-clock test, which leaves ``now`` and
+``today`` unset so germinate reads one clock for both. What is tested for the key: one reminder rings once however many
+times it ticks or its stamp is lost, two reminders at one minute ring once each, and a repeating reminder rings once per
+occurrence."""
 from __future__ import annotations
 
 import json
@@ -34,12 +36,12 @@ def pings(monkeypatch):
     return sent
 
 
-def _reminder(tmp_path, when: str, target: str = "nudge") -> tuple[Path, str]:
+def _reminder(tmp_path, when: str, target: str = "nudge", text: str = "call the dentist", **extra) -> tuple[Path, str]:
     root = tmp_path / "a"
-    (root / ".levain").mkdir(parents=True)
+    (root / ".levain").mkdir(parents=True, exist_ok=True)
     path = root / ".levain" / "memory.spores.json"
-    s = guarded_intention_store(path).add(type="thought", text="call the dentist", disposition="agenda",
-                                          next="2026-11-14", target=target)
+    s = guarded_intention_store(path).add(type="thought", text=text, disposition="agenda", next="2026-11-14",
+                                          target=target, **extra)
     data = json.loads(path.read_text())     # anneal writes a date-only next; the List's writer places the minute
     for row in data["intentions"]:
         if row["id"] == s["id"]:
@@ -49,7 +51,8 @@ def _reminder(tmp_path, when: str, target: str = "nudge") -> tuple[Path, str]:
 
 
 def _tick(path: Path, qdir: Path, now: datetime | None) -> dict:
-    return g.germinate(path, qdir, install=path.parent.parent, today=(now or datetime.now()).date(), now=now)
+    today = now.date() if now is not None else None     # unset: germinate takes one clock for both, no midnight split
+    return g.germinate(path, qdir, install=path.parent.parent, today=today, now=now)
 
 
 @pytest.mark.parametrize("late", [timedelta(minutes=1), timedelta(minutes=30), timedelta(hours=3), timedelta(days=1),
@@ -60,8 +63,11 @@ def test_a_reminder_rings_once_at_its_minute_and_at_any_lateness_and_never_twice
     for _ in range(2):                                          # one minute early, twice: nothing
         assert _tick(path, qdir, DUE - timedelta(minutes=1))["due"] == []
     assert rows() == [] and pings == []
-    for at in (DUE, DUE + late, DUE + late):                    # on the minute, then later, then again: one ring
-        _tick(path, qdir, at)
+    first = _tick(path, qdir, DUE + late)                       # the first tick at or after the minute rings it
+    (out,) = first["due"]
+    assert out["filed"] and out["pinged"] and out["done"] and first["errors"] == [] and first["skipped"] == []
+    for at in (DUE + late, DUE + late + timedelta(minutes=1)):  # again: nothing more
+        assert _tick(path, qdir, at)["due"] == []
     assert len(rows()) == 1 and len(pings) == 1
     for at in (DUE + late + timedelta(minutes=5), DUE + timedelta(days=30)):
         assert _tick(path, qdir, at)["due"] == []
@@ -74,6 +80,7 @@ def test_the_first_tick_after_the_minute_rings_it_whatever_the_gap_so_there_is_n
     path, _ = _reminder(tmp_path, "2026-11-14T10:00")
     (out,) = _tick(path, qdir, DUE + timedelta(days=7))["due"]
     assert out["filed"] and out["pinged"] and len(pings) == 1
+    assert _tick(path, qdir, DUE + timedelta(days=7, minutes=1))["due"] == [] and len(pings) == 1
 
 
 def test_the_host_clock_decides_when_no_now_is_given(tmp_path, qdir, pings):
@@ -86,3 +93,54 @@ def test_the_host_clock_decides_when_no_now_is_given(tmp_path, qdir, pings):
     other.mkdir()
     path2, _ = _reminder(other, far)
     assert _tick(path2, qdir, None)["due"] == [] and len(pings) == 1
+
+
+def test_a_stamp_that_fails_once_does_not_ring_the_held_row_again(tmp_path, qdir, pings, monkeypatch):
+    """The stamp fails ("changed since read") after the row is filed and rung; the item stays due, and the next tick finds
+    the row held. That tick files nothing, so it rings nothing: one ring for the one (item, time)."""
+    path, sid = _reminder(tmp_path, "2026-11-14T10:00")
+    real = QuestionStore.file_once
+    hit: list[int] = []
+
+    def file_then_bump(self, **kw):
+        out = real(self, **kw)
+        if not hit:                                     # a concurrent writer moves the item after it was read
+            hit.append(1)
+            guarded_intention_store(path).update(sid, text="call the dentist today")
+        return out
+
+    monkeypatch.setattr(QuestionStore, "file_once", file_then_bump)
+    first = _tick(path, qdir, DUE)
+    assert first["due"] == [] and len(first["skipped"]) == 1 and len(pings) == 1
+    second = _tick(path, qdir, DUE + timedelta(minutes=1))
+    assert len(QuestionStore(qdir).recent(100)) == 1 and len(pings) == 1, second
+    assert len(second["due"]) == 1 and second["due"][0]["done"]      # the retry still stamps it
+    assert _tick(path, qdir, DUE + timedelta(minutes=2))["due"] == [] and len(pings) == 1
+
+
+def test_two_reminders_at_one_minute_each_ring_once_into_their_own_row(tmp_path, qdir, pings):
+    path, a = _reminder(tmp_path, "2026-11-14T10:00", text="call the dentist")
+    b = guarded_intention_store(path).add(type="thought", text="water the plants", disposition="agenda",
+                                          next="2026-11-14", target="nudge")["id"]
+    data = json.loads(path.read_text())
+    for row in data["intentions"]:
+        row["next"] = "2026-11-14T10:00"
+    path.write_text(json.dumps(data))
+    out = _tick(path, qdir, DUE)["due"]
+    assert {o["intention_id"] for o in out} == {a, b} and len({o["ref"] for o in out}) == 2 and len(pings) == 2
+    assert _tick(path, qdir, DUE + timedelta(minutes=1))["due"] == [] and len(pings) == 2
+
+
+def test_a_repeating_reminder_rings_once_per_occurrence_and_a_retry_of_one_rings_nothing_more(tmp_path, qdir, pings):
+    first, second = datetime(2026, 11, 8, 21, 0), datetime(2026, 11, 15, 21, 0)       # a Sunday and the next
+    path, sid = _reminder(tmp_path, first.strftime("%Y-%m-%dT%H:%M"), recur="weekly SUN 21:00",
+                          recur_anchor=first.strftime("%Y-%m-%dT%H:%M"))
+    (one,) = _tick(path, qdir, first)["due"]
+    assert _tick(path, qdir, first + timedelta(minutes=1))["due"] == [] and len(pings) == 1
+    QuestionStore(qdir).answer(one["ref"], option="done", channel="cli")
+    moved = _tick(path, qdir, first + timedelta(hours=1))                             # the answer moves it to the next Sunday
+    assert moved["finish"] and moved["finish"][0]["via"] == "advanced" and moved["due"] == [] and len(pings) == 1
+    (two,) = _tick(path, qdir, second)["due"]
+    assert two["ref"] != one["ref"] and two["pinged"] and len(pings) == 2
+    assert _tick(path, qdir, second + timedelta(minutes=1))["due"] == [] and len(pings) == 2
+    assert len(QuestionStore(qdir).recent(100)) == 2

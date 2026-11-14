@@ -129,7 +129,7 @@ def test_nudge_stamps_and_never_composts_so_a_compost_crash_is_never_reached_and
     assert len(pings) == 1 and len(_rows(qdir)) == 1 and s["id"] in _open_ids(root)
 
 
-def test_nudge_crash_between_filing_and_stamp_reruns_into_one_row_and_pings_again(tmp_path, qdir, pings, monkeypatch):
+def test_nudge_crash_between_ping_and_stamp_reruns_into_one_row_and_does_not_ring_it_again(tmp_path, qdir, pings, monkeypatch):
     root = _install(tmp_path)
     s = _add(root, "call the clinic", target="nudge")
     cls = type(guarded_intention_store(_intentions(root)))
@@ -138,9 +138,9 @@ def test_nudge_crash_between_filing_and_stamp_reruns_into_one_row_and_pings_agai
     assert "crash" in _run(root, qdir)["errors"][0]["error"]      # isolated: recorded, never raised
     monkeypatch.setattr(cls, "update", real)
     assert len(pings) == 1 and s["id"] in _open_ids(root)
-    (o,) = _run(root, qdir)["due"]         # due again: the held row is returned (filed False); the ping is at-least-once
-    assert not o["filed"] and o["pinged"] and o["done"]
-    assert len(pings) == 2 and len(_rows(qdir)) == 1
+    (o,) = _run(root, qdir)["due"]         # due again: the held row is returned (filed False), already rung, so not rung again
+    assert not o["filed"] and not o["pinged"] and o["done"]
+    assert len(pings) == 1 and len(_rows(qdir)) == 1
 
 
 # --- board ------------------------------------------------------------------------------------------------------
