@@ -5525,8 +5525,8 @@ def _check_setting_sources(*, claude_bin: str | None = None, version: str | None
                            probe: Any = None) -> list[CheckResult]:
     """The ``setting-sources`` row: terminal seats rely on ``--setting-sources ""`` loading nothing, a value the vendor
     does not document, measured on one version. On that version the row is a plain OK and nothing is launched; on any
-    other it re-runs the no-model probe (:mod:`levain.setting_sources_canary`): a hold is a WARN telling the operator
-    the version differs from the measured one, a leak FAILS, an inconclusive probe WARNs. An unreadable version is not
+    other it re-runs the no-model probe (:mod:`levain.setting_sources_canary`): a hold on a readable version is an OK
+    that says which side moved (the pin is never widened silently), a leak FAILS, an inconclusive probe WARNs. An unreadable version is not
     the measured one, so it runs the probe too and keeps the unreadable-version warning beside its verdict."""
     from levain import setting_sources_canary as ssc
     from levain.consent.canary import agent_version
@@ -5559,9 +5559,11 @@ def _check_setting_sources(*, claude_bin: str | None = None, version: str | None
         where = (f"Claude Code {seen} is {side} than {measured}, the version the empty source list was measured on "
                  f"({moved})")
         if res.verdict == "held":
-            return [CheckResult(name, True, f"{where}; the probe re-run holds ({res.detail})",
-                                f"Set SETTING_SOURCES_MEASURED_VERSION in levain/host_guard.py to {seen} once "
-                                "reviewed.", warn=True)]
+            # a pass with a note, not a fault: the pin is the measurement (kept, never widened silently) and the live
+            # probe on this very binary held, so the seat's empty source list works here (row 1719a)
+            return [CheckResult(name, True, f"{where}; the probe re-run holds ({res.detail}), so this is a note, not a "
+                                f"fault; to re-pin, set SETTING_SOURCES_MEASURED_VERSION in levain/host_guard.py to "
+                                f"{seen} once reviewed")]
     if res.verdict == "leaked":
         return [CheckResult(name, False, f"{where}; the probe re-run FAILED: {res.detail}",
                             "Terminal seats on this Claude Code load project settings. Pin an older Claude Code or fix "

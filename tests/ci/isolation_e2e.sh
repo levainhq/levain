@@ -191,7 +191,10 @@ rm -rf /tmp/levain-iso-opbare
 if [ -n "$(sudo find "$WS" ! -user "$HID" -print -quit)" ]; then fail "something in the workspace is not the hands user's"; else pass "still nothing in the workspace that is not the hands user's"; fi
 if grep -qx "$ME" "$CANARY_LOG"; then fail "entity-planted code ran as the operator"; else pass "no entity-planted code ran as the operator"; fi
 if grep -qx "$H" "$CANARY_LOG"; then info "planted code ran as the hands user under ws-git"; else pass "no planted code ran at all under ws-git"; fi
-check "doctor warns that the runner's git trusts every repository" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'EVERY repository'"
+# The row brings its own wildcard: the CI runner image ships `safe.directory = *` in /etc/gitconfig, a stock Ubuntu
+# guest does not (and doctor rightly stays quiet there), so reading the host's would end CONTROL_EXIT=2 on a clean guest.
+printf '[safe]\n\tdirectory = *\n' > /tmp/levain-iso-wildcard-gitconfig
+check "doctor warns that the runner's git trusts every repository" bash -c "GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/tmp/levain-iso-wildcard-gitconfig \"$LEVAIN\" doctor --path \"$E\" | grep -q 'EVERY repository'"
 check "doctor warns while safe.bareRepository is not explicit" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'safe.bareRepository is not'"
 printf '[safe]\n\tbareRepository = explicit\n' > /tmp/levain-iso-explicit-gitconfig
 if GIT_CONFIG_GLOBAL=/tmp/levain-iso-explicit-gitconfig "$LEVAIN" doctor --path "$E" | grep -q 'safe.bareRepository is not'; then fail "doctor warns although it is explicit"; else pass "doctor does not warn once it is explicit"; fi
@@ -279,6 +282,8 @@ refused "operator git reads the entity's repository after undo" opgit -C "$WS/re
 refused "sudo git reads it after undo (git checks SUDO_UID, the operator)" sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$WS/repo-h" status --short
 refused "root's own git reads it after undo" sudo env -u SUDO_UID GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$WS/repo-h" status --short
 check "operator can clone it to keep the work" bash -c "opgit -c safe.directory='$WS/repo-h' -c safe.directory='$WS/repo-h/.git' -c core.hooksPath=/dev/null clone -q --no-local -- '$WS/repo-h' /tmp/levain-iso-kept && test -e /tmp/levain-iso-kept/a"
+# a failure of the row above says why (the check itself discards the output): git's own words, once
+test -e /tmp/levain-iso-kept/a || info "the keep-the-work clone said: $(opgit -c safe.directory="$WS/repo-h" -c safe.directory="$WS/repo-h/.git" -c core.hooksPath=/dev/null clone -q --no-local -- "$WS/repo-h" /tmp/levain-iso-kept2 2>&1 | tr '\n' ' ')"
 if grep -qx "$ME" "$CANARY_LOG"; then fail "entity-planted code ran as the operator after undo"; else pass "no entity-planted code ran as the operator after undo"; fi
 if [ "$(uname)" = Darwin ]; then
   if ls -leR "$(dirname "$WS")" 2>/dev/null | grep -qE '^ [0-9]+: '; then fail "ACL entries left in the workspace"; else pass "no ACL entries left in the workspace"; fi
