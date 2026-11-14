@@ -579,23 +579,23 @@ def test_b11_a_refusal_lands_on_the_live_grant_card_when_a_board_read_replaced_t
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
             {"eval": _HOLD_GET},
             {"eval": f"window.__tapped = {_CARD}; 1"},
-            {"tap": _REVOKE},
-            {"until": "window.__getCalled === true && 1", "ms": 30000},
-            # a board read (Sync) while the prompt is up: the card is replaced, and the one the tap was on is off the page
-            {"eval": "document.querySelector('#refresh').click(); 1"},
-            {"until": f"!!{_CARD} && {_CARD} !== window.__tapped && !window.__tapped.isConnected && 1", "ms": 30000},
-            {"eval": f"{_REVOKE}.disabled"},
+            {"tap": _REVOKE, "until": "window.__getCalled === true && 1", "ms": 30000},
+            # a board read (Sync) while the prompt is up: the card is replaced, and the one the tap was on is off the page. The card's
+            # lock is read in the same evaluation that sees the replacement (a read of the page's own may land between two steps)
+            {"do": "document.querySelector('#refresh').click(); 1",
+             "until": f"!!{_CARD} && {_CARD} !== window.__tapped && !window.__tapped.isConnected && ({_REVOKE}.disabled ? 'locked' : 'unlocked')", "ms": 30000},
             {"eval": "window.__release(); 1"},
             {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
             {"eval": f"{_CARD}.querySelector('.sign-note').className"},
             # complement MED 1 / LOW 6: the ceremony has ended and the live card has said it; a later board read draws the
             # card plain, never the old refusal again
-            {"eval": f"window.__shown = {_CARD}; document.querySelector('#refresh').click(); 1"},
-            {"until": f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
+            {"eval": f"window.__shown = {_CARD}; 1"},
+            {"do": "document.querySelector('#refresh').click(); 1",
+             "until": f"!!{_CARD} && {_CARD} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
             {"eval": _GRANT_NOTE},
         ])
     v = out["values"]
-    assert v[-7] is True, v[-7]                     # the card drawn mid-ceremony is locked, as the tapped one was
+    assert v[-7] == "locked", v[-7]                 # the card drawn mid-ceremony is locked, as the tapped one was
     assert "the passkey did not sign (NotAllowedError); nothing was revoked" in v[-5], v[-5]
     assert "sign-bad" in v[-4], v[-4]
     assert v[-1] == "", v[-1]                       # the redraw after the ceremony ended does not repaint its word
@@ -627,14 +627,14 @@ def test_b12_a_tap_refused_because_another_ceremony_holds_the_passkey_is_said_on
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && !!{_CARD2} && !!{_REVOKE2} && 1"},
             {"eval": _HOLD_GET},
-            {"tap": _REVOKE},
-            {"until": "window.__getCalled === true && 1", "ms": 30000},
+            {"tap": _REVOKE, "until": "window.__getCalled === true && 1", "ms": 30000},
             {"tap": _REVOKE2},
             {"until": f"/already being asked for/.test({_GRANT_NOTE2}) && {_GRANT_NOTE2}", "ms": 30000},
             {"eval": "window.__release(); 1"},
             {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
-            {"eval": f"window.__shown = {_CARD2}; document.querySelector('#refresh').click(); 1"},
-            {"until": f"!!{_CARD2} && {_CARD2} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
+            {"eval": f"window.__shown = {_CARD2}; 1"},
+            {"do": "document.querySelector('#refresh').click(); 1",
+             "until": f"!!{_CARD2} && {_CARD2} !== window.__shown && !window.__shown.isConnected && 1", "ms": 30000},
             {"eval": _GRANT_NOTE2},
             {"eval": f"{_REVOKE2}.disabled"},
         ])
