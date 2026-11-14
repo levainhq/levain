@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -489,21 +490,21 @@ def test_a_newline_inside_a_list_entry_cannot_make_extra_markdown_lines(tmp_path
 
 
 NORMAL_RED = (
-    'Red on 2026-11-13: the suite does not pass on a freshly re-resolved lock.\n\n'
+    'Red on @DAY@: the suite does not pass on a freshly re-resolved lock.\n\n'
     'Run: https://github.com/levainhq/levain/actions/runs/42\n\n'
     'Result line: `' + RESULT_LINE + '`\n\n'
     'Packages whose version changed against the committed uv.lock (old -> new):\n\n- foo 1.0 -> 1.1\n\n'
     'Failing tests:\n\n- tests/test_a.py::t\n\n'
     'Log tail:\n```\nnoise\n' + RESULT_LINE + '\n```\n')
 NORMAL_DID_NOT_FINISH = (
-    'Did not finish on 2026-11-13: the job ended (job status: cancelled) before the drift check wrote an exit code.\n'
+    'Did not finish on @DAY@: the job ended (job status: cancelled) before the drift check wrote an exit code.\n'
     'That is a timeout, a cancel or a failed setup step. It says nothing about whether the dependencies drifted.\n\n'
     'Run: https://github.com/levainhq/levain/actions/runs/42\n\n'
     'Result line: `none (the script died before printing one)`\n\n'
     'Packages whose version changed: unknown.\n\n'
     'Log tail:\n```\ncollecting ...\ntests/test_x.py ...\n```\n')
 NORMAL_DIED = (
-    'Red on 2026-11-13: the suite does not pass on a freshly re-resolved lock.\n\n'
+    'Red on @DAY@: the suite does not pass on a freshly re-resolved lock.\n\n'
     'Run: https://github.com/levainhq/levain/actions/runs/42\n\n'
     'Result line: `none (the script died before printing one)`\n\n'
     'Packages whose version changed: unknown.\n\n'
@@ -518,8 +519,12 @@ NORMAL_DIED = (
 ], ids=["red", "did-not-finish", "script-died"])
 def test_a_normal_small_log_makes_the_same_body_byte_for_byte_with_no_marker(tmp_path, kw, want):
     # these three bodies were captured from the reporter as it was before the cap; the bound must change nothing below it
+    # the workflow stamps the REAL UTC day (`date -u +%F` in a child process, which no clock pin reaches): the day is read
+    # from the clock on both sides of the run, so a UTC midnight inside it cannot fail the test
+    before = datetime.now(timezone.utc).date().isoformat()
     body = _filed(tmp_path, **kw)
-    assert body == want
+    after = datetime.now(timezone.utc).date().isoformat()
+    assert body in {want.replace("@DAY@", day) for day in (before, after)}, body
     assert MARK not in body
 
 
