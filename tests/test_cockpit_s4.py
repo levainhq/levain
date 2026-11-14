@@ -1,4 +1,4 @@
-"""S4 of the shared cockpit: Open loops before the Tray, the Tray's "by age" view, and the federated
+"""S4 of the shared cockpit: the List leads the operate zone, the Tray's "by age" view, and the federated
 Episodes source (kernel commit daefa83). Each class names the claim it holds."""
 
 from __future__ import annotations
@@ -80,13 +80,15 @@ def _ids(panel: dict[str, Any]) -> list[str]:
 
 
 class TestOperateOrder:
-    def test_the_tray_leads_open_loops(self, rig) -> None:
-        # mock-e (KE1b) reverses the 10-10 order: Tray, then Open loops
+    def test_the_list_leads_the_operate_zone_and_no_open_loops_panel_follows(self, rig) -> None:
+        # mock-e (KE1b) put the Tray first; the loop fold removed the Open loops panel that followed it
         _src, _ids_, ck = rig
         zone = next(z for z in ck.manifest(CRED)["regions"]["zones"] if z["id"] == "operate")
-        assert zone["panels"].index("tray") < zone["panels"].index("loops")
+        assert "loops" not in zone["panels"]
+        assert zone["panels"].index("tray") < zone["panels"].index("episodes")
         heads = ck.manifest(CRED)["panels"]
-        assert heads["tray"]["rank"] < heads["loops"]["rank"]
+        assert "loops" not in heads
+        assert heads["tray"]["rank"] < heads["episodes"]["rank"]
 
 
 class TestTrayAgeView:
@@ -94,16 +96,18 @@ class TestTrayAgeView:
         _src, _i, ck = rig
         heads = ck.manifest(CRED)["panels"]
         assert heads["tray"]["views"] == [{"id": "age", "title": "By age", "order": "intention.age"}]
-        for pid in ("loops", "episodes", "edits"):
+        for pid in ("episodes", "edits"):
             assert heads[pid]["views"] is None
 
     def test_view_rows_oldest_first_undated_last(self, rig) -> None:
         _src, ids, ck = rig
         age = _tray(ck)["view_rows"]["age"]
         sid = lambda k: f"intention:{ids[k]}"  # noqa: E731
-        assert age[:3] == [sid("old"), sid("mid"), sid("new")]
-        assert set(age[3:]) == {sid("undated"), sid("future"), sid("junk")}
-        assert age[3:] == sorted(age[3:])
+        # the key-absent row ("loop", made today) is a List row since the fold, as old as "new"
+        assert age[:2] == [sid("old"), sid("mid")]
+        assert set(age[2:4]) == {sid("new"), sid("loop")}
+        assert set(age[4:]) == {sid("undated"), sid("future"), sid("junk")}
+        assert age[4:] == sorted(age[4:])
 
     def test_default_rows_keep_the_tray_order(self, rig) -> None:
         _src, _i, ck = rig

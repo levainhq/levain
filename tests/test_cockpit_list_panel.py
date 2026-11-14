@@ -92,7 +92,6 @@ class Rig:
                                      next="2026-11-10T09:00", today=TODAY)["id"]
         self.ids["agenda_old"] = add(type=t, text="an agenda from last week", disposition="agenda", next="2026-11-01",
                                      today=TODAY - timedelta(days=9))["id"]
-        self.ids["loop"] = add(type=t, text="a machine-side loop", tier="hot", today=TODAY)["id"]
 
     def panel(self, cred: str = "token") -> dict[str, Any]:
         return self.ck.panel("tray", credential_class=cred)
@@ -120,7 +119,6 @@ def test_the_three_stores_are_one_panel_titled_list_and_each_row_names_its_surfa
     assert sorted(by_surface["board"]) == ["board:levain:a", "board:levain:b"]       # the ready column; backlog is not the List's
     assert sorted(by_surface["talk"]) == sorted(f"intention:{rig.ids[k]}" for k in ("talk_old", "talk_new"))
     assert sorted(by_surface["drop"]) == sorted(f"intention:{rig.ids[k]}" for k in ("drop_late", "drop_soon", "drop_later"))
-    assert f"intention:{rig.ids['loop']}" not in {r["id"] for r in p["rows"]}            # Open loops stays machine-side
     assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also", "someday", "done", "kept"]
     assert p["note"] == list_panel.LIST_NOTE
 
@@ -294,13 +292,26 @@ def test_an_empty_install_is_empty_with_the_entity_sentence_not_a_fault(tmp_path
 # --- the registered shape ----------------------------------------------------------------------------------------
 
 
-def test_the_panel_is_registered_where_the_tray_was_and_loops_is_untouched(rig: Rig) -> None:
+def test_the_panel_is_registered_where_the_tray_was_and_no_loops_panel_exists(rig: Rig) -> None:
     spec = rig.ck.spec("tray")
     assert spec.title == "List" and spec.order == "intention.list" and spec.rank == 10 and spec.region == "operate"
     assert "list_intake" in spec.verbs and "intention_seed" in spec.verbs
-    loops = rig.ck.spec("loops")
-    assert loops.title == "Open loops" and loops.order == "intention.loops"
-    assert {r["id"] for r in rig.ck.panel("loops", credential_class="token")["rows"]} == {f"intention:{rig.ids['loop']}"}
+    assert "loops" not in rig.ck.panel_ids                      # the loop fold took the Open loops panel out of the manifest
+
+
+def test_a_key_absent_row_and_a_parked_one_are_list_rows_in_someday_the_parked_one_last(rig: Rig) -> None:
+    # what was an Open loops row (a key-absent intention, a parked one) is a Someday row on the List, placed by the List's own rules
+    plain = rig.sp.add(type="task", text="a plain intention", tier="hot", today=TODAY)["id"]
+    warm = rig.sp.add(type="task", text="a warm intention", tier="warm", today=TODAY)["id"]
+    parked = rig.sp.add(type="task", text="a parked intention", tier="parked", today=TODAY)["id"]
+    p = rig.panel()
+    by = {r["id"]: r for r in p["rows"]}
+    for sid in (plain, warm, parked):
+        assert by[f"intention:{sid}"]["group"] == "someday", sid
+        assert by[f"intention:{sid}"]["facets"]["disposition"] == "someday"
+    assert by[f"intention:{parked}"]["facets"]["tier"] == "parked"
+    someday = [r["id"] for r in p["rows"] if r["group"] == "someday"]
+    assert someday.index(f"intention:{parked}") == len(someday) - 1      # a parked row ranks last
 
 
 # --- the frozen fixture the page lane renders against ------------------------------------------------------------

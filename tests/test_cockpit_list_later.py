@@ -54,7 +54,8 @@ def test_the_count_is_what_is_due_and_later_is_not_counted(tmp_path: Path) -> No
     _two_later(rig)
     p = _panel(rig)
     assert p["filtered"] == []
-    assert p["count"] == 2 and p["title"] == "List (2)"    # the undated seed (Someday) and the legacy note count; later does not
+    # the undated seed, the key-absent row and the parked row (all Someday) and the legacy note count; later does not
+    assert p["count"] == 4 and p["title"] == "List (4)"
     assert {g["id"]: g["count"] for g in p["groups"]}["later"] == 2
 
 
@@ -72,7 +73,7 @@ def test_a_later_row_carries_the_verbs_any_row_carries(tmp_path: Path) -> None:
 
 def test_the_held_key_is_on_no_panel(tmp_path: Path) -> None:
     rig = Rig(tmp_path)
-    assert "held" not in rig.ck.panel("loops", credential_class="token")
+    assert rig.ck.panel("loops", credential_class="token") is None      # the Open loops panel is gone with the fold
     assert "held" not in _panel(rig)
 
 
@@ -165,16 +166,19 @@ def _served(tmp_path: Path, *, keep_seed: bool = True):
     _root, src, ids = _install(tmp_path)
     store = IntentionStore(_root / ".levain" / "memory.spores.json", id_prefix="intention")
     real = date.today()
-    store.update(ids["note"], disposition="loop")    # the fixture's legacy note would show in the Tray (the Keep is gone)
+    # the fixture's legacy note, key-absent row and parked row are List rows too (the Keep and Open loops are gone): done, so the
+    # card holds only the rows this test adds
+    for key in ("note", "loop", "parked"):
+        store.descend(ids[key], kind="done")
     later_ids = [
         store.add(type="task", text="a sooner later seed", disposition="seed", next=(real + timedelta(days=3)).isoformat())["id"],
         store.add(type="task", text="a farther later seed", disposition="seed", next=(real + timedelta(days=10)).isoformat())["id"],
     ]
     if not keep_seed:
-        # only later rows are left in the List: the due seed and the fixture's now-due dated seed move to Open loops
+        # only later rows are left in the List: the due seed and the fixture's now-due dated seed are done
         for key in ("seed", "held"):
             assert store.get(ids[key])
-            store.update(ids[key], disposition="loop")
+            store.descend(ids[key], kind="done")
     served = _Served(src, surface_tokens={"browser": "T"}, install_class="reported")
     served.store, served.later_ids = store, later_ids + [ids["held"]]  # type: ignore[attr-defined]
     return real, served
@@ -212,7 +216,8 @@ def test_the_card_hides_the_later_rows_and_names_them_in_one_control_and_the_foc
             {"eval": f"[...{FOCUS}.querySelectorAll('.grp-sub')].map(h => h.textContent)"},
         ])
     v = out["values"]
-    assert v[1][0] == 0 and v[1][1] == "later 2", v          # the card draws no later row, and names them
+    # the card draws no later row, and names them (the rows the fixture closed are named after: "· done N")
+    assert v[1][0] == 0 and v[1][1].startswith("later 2"), v
     rows = v[-2]
     assert len(rows) == 2 and "a sooner later seed" in rows[0] and "a farther later seed" in rows[1], v
     assert f"wakes " in rows[0] and "\u2192 list" in rows[0], v                # each says where it lands
@@ -245,7 +250,8 @@ def test_a_list_with_only_later_rows_still_offers_them(tmp_path: Path) -> None:
             *_open_later(),
             {"eval": f"{FOCUS_LATER}.length"},
         ])
-    assert out["values"][1] == ["later 2", 0] and out["values"][-1] == 2, out
+    control, drawn = out["values"][1]
+    assert control.startswith("later 2") and drawn == 0 and out["values"][-1] == 2, out
 
 
 @needs_browser
