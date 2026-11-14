@@ -186,11 +186,15 @@ ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "TZ", 
             "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
             "LEVAIN_HOME", "PYTHONPATH", "VIRTUAL_ENV")
 ENV_KEEP_PREFIXES = ("LC_", "ANTHROPIC_")
+# the room's seat names its access method to flow's hooks (session_init's `Access:` line, the inbox action gate): the
+# Room emulates flowConnect exactly, so the value is flowConnect's own. A constant the launcher sets, never read from the
+# serve's environment or a caller's ``keep``, so nothing upstream can widen or change it.
+ACCESS_ENV, ACCESS_VALUE = "FLOW_ACCESS_METHOD", "flowconnect"
 
 
 def room_env(environ: Mapping[str, str], keep: tuple = ()) -> dict:
     """The room child's environment: the names in :data:`ENV_KEEP`, those starting with :data:`ENV_KEEP_PREFIXES`, and
-    ``keep``, taken from ``environ``; then ``LEVAIN_ROOM=1``. Every other variable of the serve (a token, a key, a
+    ``keep``, taken from ``environ``; then ``LEVAIN_ROOM=1`` and ``FLOW_ACCESS_METHOD=flowconnect`` (fixed). Every other variable of the serve (a token, a key, a
     path to another store) stays out of the child and the processes it starts."""
     names = set(ENV_KEEP) | set(keep)
     env = {k: v for k, v in environ.items() if k in names or k.startswith(ENV_KEEP_PREFIXES)}
@@ -207,6 +211,7 @@ def room_env(environ: Mapping[str, str], keep: tuple = ()) -> dict:
             else:
                 del env[name]
     env[ROOM_ENV] = "1"
+    env[ACCESS_ENV] = ACCESS_VALUE
     return env
 
 

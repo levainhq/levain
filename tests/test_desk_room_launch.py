@@ -1347,7 +1347,8 @@ def test_c3_the_child_gets_an_allowlisted_environment(world):
     assert {"PATH", "LEVAIN_ROOM", "FAKE_DIR", "LC_ALL"} <= got
     env = room_launch.room_env({"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "k", "OPENAI_API_KEY": "o",
                                 "LEVAIN_HOME": "/lv", "LEVAIN_WRITE_TOKEN": "t"})
-    assert env == {"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "k", "LEVAIN_HOME": "/lv", "LEVAIN_ROOM": "1"}
+    assert env == {"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "k", "LEVAIN_HOME": "/lv", "LEVAIN_ROOM": "1",
+                   "FLOW_ACCESS_METHOD": "flowconnect"}
 
 
 # --- 1105-49: the room's own read-guard hook ---------------------------------------------------------------------
@@ -1578,3 +1579,28 @@ def test_the_scope_decoy_through_an_injected_case_fold_is_refused_inside_a_deny_
     lr._deny = [str(world["run"].parent / "GUARDEDX")]
     d, _path = lr._scope_decoy()
     shutil.rmtree(d)
+
+
+# --- 1114-19: the room's seat names its access method, the one flowConnect uses ----------------------------------
+@pytest.mark.parametrize("hostile", [None, "cli", "scheduler", "flowconnect", "", "relay"])
+def test_1114_19_the_child_carries_flowconnect_as_its_access_method_whatever_the_serve_has(hostile):
+    serve = {"PATH": "/bin", "HOME": "/h"}
+    if hostile is not None:
+        serve["FLOW_ACCESS_METHOD"] = hostile
+    env = room_launch.room_env(serve, keep=("FLOW_ACCESS_METHOD",))     # not even a caller's keep can change it
+    assert env["FLOW_ACCESS_METHOD"] == "flowconnect"
+    assert room_launch.room_env(serve)["FLOW_ACCESS_METHOD"] == "flowconnect"
+
+
+def test_1114_19_the_spawned_child_gets_it_and_gains_no_other_name(world):
+    envs, spawn = _env_spy()
+    lr = RoomLauncher(world["cs"], world["svc"], RoomSetting(str(world["cwd"]), claude_bin=str(world["script"])),
+                      run_dir=str(world["run"]), home=str(world["home"]), env_keep=("FAKE_DIR", "FLOW_ACCESS_METHOD"),
+                      environ={**os.environ, "FAKE_DIR": str(world["fake"]), "FLOW_ACCESS_METHOD": "scheduler"},
+                      spawn=spawn)
+    world["launchers"].append(lr)
+    lr.ensure()
+    [got] = envs
+    assert got["FLOW_ACCESS_METHOD"] == "flowconnect"
+    base = room_launch.room_env({"PATH": "/bin"})
+    assert set(base) == {"PATH", "LEVAIN_ROOM", "FLOW_ACCESS_METHOD"}
