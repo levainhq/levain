@@ -505,8 +505,8 @@ GRADUATION_CREATE_RANK = 3
 # the rank the live opt-in lends a passkey it names, for a create_grant of one graduation policy
 GRADUATION_OPT_IN_RANK = 2
 _GRADUATION_FIXED = "a graduation policy's terms are fixed: revoke it and create another"
-_GRADUATION_EXPIRY = ("a graduation policy's expiry moves only by its own renew link, never inside another op: "
-                      "renew it, or revoke it and create another")
+_GRADUATION_EXPIRY = ("a graduation policy's expiry moves only by its own renew link, never inside another op "
+                      "(this levain appends no renew of one: it lapses at its expiry, or revoke it)")
 # The opt-in (DESIGN_REV3 §7): signed once at the laptop, naming the passkeys (each an active passkey key when it is
 # signed) whose create_grant of one graduation policy the replay takes at GRADUATION_OPT_IN_RANK. No expiry, no
 # change, at most one in the policy; a revoke removes it, and a revoked or quarantined passkey signs nothing.
@@ -2489,14 +2489,22 @@ def _passkey_act(rec: Mapping[str, Any], policy: StandingPolicy, fingerprint: st
     namespace (the broker's check), and, in this log, exactly one of: the revoke of a grant :func:`passkey_revocable`
     takes (which only narrows). A link ALREADY in the log may also be the renew of a graduation policy (Phill's Q2
     ruling: the phone kept a policy alive) or the create of one while the live opt-in named it: the replay keeps both
-    so a log that holds them still replays. A NEW link (``new_link``) is never either (the binding cut of 1114).
-    Every other op is refused, whatever its class's rank would allow, and a
+    so a log that holds them still replays. A NEW link (``new_link``) is never a renew and never a create, of any
+    kind. Every other op is refused, whatever its class's rank would allow, and a
     ``loosen`` with it, so no passkey link carries more than one act. The rule is the replay's, so a link built past
     the phone's ceremonies is held to it."""
     op = rec["op"]
     if new_link and op in ("renew", "create_grant"):
+        if op == "create_grant":
+            target = rec.get("grant")
+        else:
+            gid = rec.get("grant_id")
+            target = policy.grants.get(gid) if isinstance(gid, str) else None
+        # the graduation words only where a graduation policy is what was asked for: a passkey's create of a consent
+        # grant is refused as any other non-revoke is
+        tail = f" (of a graduation policy, {_GRADUATION_RETIRED})" if graduation_grant(target) else ""
         raise AuthorityError(f"a {PASSKEY} key signs consent answers and grant revokes only, never another authority link: a new "
-                             f"link of it is never a renew and never a create (of a graduation policy, {_GRADUATION_RETIRED})")
+                             f"link of it is never a renew and never a create{tail}")
     if op in ("revoke_grant", "renew"):
         gid = rec["grant_id"]
         target = policy.grants.get(gid) if isinstance(gid, str) else None

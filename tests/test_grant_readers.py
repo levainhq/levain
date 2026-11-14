@@ -75,7 +75,8 @@ READERS: dict[str, tuple[int, str, str]] = {
     "levain/authority.py::_unique_live_check":
         (3, "rule", "the one-live append rule for the seat kinds: counts the raw policy (R-C)"),
     "levain/authority.py::_passkey_act":
-        (2, "replay", "the replay's rule for what a passkey link may do: judged against the policy the log holds"),
+        (3, "replay", "the replay's rule for what a passkey link may do: judged against the policy the log holds "
+                      "(the third read picks only the refusal's words for a new renew: a graduation policy's or not)"),
     "levain/authority.py::_link_format":
         (1, "replay", "the format a link needs, from the policy the replay holds"),
     "levain/authority.py::_step":

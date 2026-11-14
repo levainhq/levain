@@ -7,7 +7,7 @@ import pytest
 
 import levain.authority as auth
 from levain.cli import main
-from tests.test_authority_graduation_kind import GP, GP2, OPT, World, grad, opt_in, renew
+from tests.test_authority_graduation_kind import GP, GP2, OPT, World, consent, grad, opt_in, renew
 
 
 @pytest.fixture
@@ -59,12 +59,42 @@ def test_a_graduation_renew_is_refused_at_append(world):
     assert "is not renewed" in world.refused(renew(world), today=True)
 
 
+def test_a_loosen_that_moves_only_the_expiry_does_not_renew_a_graduation_policy(world):
+    # S-A L3 r1 finding 1 (deepseek HIGH): the link is a loosen carrying the old policy with only expires_at later
+    world.link({"op": "create_grant", "grant": grad(world, days=5)})   # signed by an earlier levain
+    before = world.state().policy.grants[GP]["expires_at"]
+    policy = world.state().policy.as_dict()
+    policy["grants"][GP] = {**policy["grants"][GP], "expires_at": grad(world, days=20)["expires_at"]}
+    # refused by the replay's own op/delta rule, so no earlier levain could append it either: no old log holds one
+    assert "a loosen link computes to a renew change" in world.refused({"op": "loosen", "policy": policy}, today=True)
+    assert "a loosen link computes to a renew change" in world.refused({"op": "loosen", "policy": policy})
+    assert world.state().policy.grants[GP]["expires_at"] == before
+
+
+def test_a_loosen_that_adds_a_grant_and_moves_the_expiry_does_not_renew_a_graduation_policy(world):
+    # the same loosen with a grant added computes to LOOSEN; the replay's graduation step check refuses it
+    world.link({"op": "create_grant", "grant": grad(world, days=5)})
+    before = world.state().policy.grants[GP]["expires_at"]
+    policy = world.state().policy.as_dict()
+    policy["grants"][GP] = {**policy["grants"][GP], "expires_at": grad(world, days=20)["expires_at"]}
+    policy["grants"]["cg-0123456789ab"] = consent(world)
+    for today in (True, False):
+        assert "expiry moves only by its own renew link" in world.refused({"op": "loosen", "policy": policy},
+                                                                           today=today)
+    assert world.state().policy.grants[GP]["expires_at"] == before
+
+
 def test_a_passkey_no_longer_renews_or_creates_a_graduation_policy(world):
     world.link({"op": "create_grant", "grant": opt_in(world, "pk")})
     world.link({"op": "create_grant", "grant": grad(world)})
     assert "never a renew and never a create" in world.refused(renew(world), "pk", today=True)
     assert "never a renew and never a create" in world.refused(
         {"op": "create_grant", "grant": grad(world, GP2)}, "pk", today=True)
+
+
+def test_a_passkeys_create_of_a_consent_grant_carries_no_graduation_words(world):
+    why = world.refused({"op": "create_grant", "grant": consent(world)}, "pk", today=True)
+    assert "never a renew and never a create" in why and "graduation" not in why
 
 
 def test_a_log_holding_both_kinds_and_the_passkey_links_replays_whole(world):

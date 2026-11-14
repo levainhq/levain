@@ -4054,9 +4054,9 @@ def _authority_signers_hint(host: str, *, why: str | None = None) -> str:
 
 
 def _check_authority_signers(install: Path, *, signers: Path | None = None, now: Any = None) -> list[CheckResult]:
-    """Root's authority-signers file (14b DESIGN_REV2 S5, row 1). In 1.0 the file anchors nothing: only a graduation
-    policy and the efferent gate's approvals read it, and both are cut (the binding cut of 1114), so the row is
-    informational. The root ``levain-authority`` signers verbs stay.
+    """Root's authority-signers file (14b DESIGN_REV2 S5, row 1). The file named a graduation policy's signers, and
+    this levain signs no graduation policy, so the row is informational. The root ``levain-authority`` signers verbs
+    stay.
 
     Only for an install with a cockpit authority log (no journal, or an uninitialised log, gives no row). A file
     that is not one :func:`levain.trust_anchor.trust_anchor_problem` trusts, or that the install helper's own
@@ -4109,11 +4109,12 @@ def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> li
         return []
     except Exception as exc:  # noqa: BLE001 - a log that cannot be replayed is a row of its own, never a quiet pass
         log_problem = f"{type(exc).__name__}: {exc}"
-    unused = "it anchors nothing in 1.0"
+    unused = "this levain signs no graduation policy for it to anchor"
+    missing = CheckResult(name, True, f"no enrolled authority signer ({path} does not exist); {unused}")
     try:
         st = os.lstat(path)
     except FileNotFoundError:
-        row = CheckResult(name, True, f"no enrolled authority signer ({path} does not exist); {unused}")
+        row = missing
     except OSError as exc:
         row = CheckResult(name, True, f"{path} cannot be read (authority-signers-unreadable): "
                                       f"{exc.strerror or exc}", _authority_signers_hint(host), warn=True)
@@ -4131,7 +4132,9 @@ def _authority_signers_rows(install: Path, signers: Path | None, now: Any) -> li
                 # the helper's own bounded reader, with the owner the trust-anchor check above accepted: the same
                 # size bound, strict UTF-8 of the whole file and link refusal the enrol and remove verbs apply
                 raw = _read_signers(path, owner=st.st_uid)
-                row = None   # type: ignore[assignment]   # set below, once the bytes parse
+                # None: the file went between the lstat above and this read (the helper's reader answers None
+                # for an absent file), which is the missing file's pass, never a row left unset
+                row = missing
             except Refused as refusal:
                 row = CheckResult(name, True, f"{path} is refused by the install helper ({refusal.name}): "
                                               f"{refusal.detail}",

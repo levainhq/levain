@@ -3899,7 +3899,7 @@ def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
                              key_fingerprint, refusal="authority-signer-verifier")) -> dict[str, object]:
     """``enrol-authority-signer`` / ``remove-authority-signer`` (14b DESIGN_REV2 S5, DESIGN_REV3 §7): root's
     allowed-signers file (:func:`levain.slot.root_tree.authority_signers_path`): a line per key in namespace
-    ``levain-authority`` (it anchors nothing in 1.0: the graduation policy that read it is cut), the laptop key's line
+    ``levain-authority`` (it named a graduation policy's signers, and this levain signs no graduation policy), the laptop key's line
     naming ``levain-confirm`` too with ``--confirm`` (the namespace of a person's signed approval).
 
     Root reads no operator-uid file: every key comes from argv, typed at the operator's terminal under one ``sudo``.

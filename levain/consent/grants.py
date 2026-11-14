@@ -242,7 +242,8 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
                ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> dict[str, Any]:
     """Every grant the cockpit the consent hooks of ``queue_dir`` name holds (expired and inert ones included, and each
     voice key: ``kind`` ``voice-key``, ``state`` ``live`` (``stopped`` when a key that signed it was revoked),
-    ``expires_at`` empty, ``provider`` and nothing of its keychain item), each with what it answered and the line that revokes it: ``{"root", "note", "grants",
+    ``expires_at`` empty, ``provider`` and nothing of its keychain item; and each graduation policy or opt-in an earlier
+    levain signed, ``kind`` as stored, the opt-in's ``expires_at`` empty and its ``state`` ``live`` until revoked), each with what it answered and the line that revokes it: ``{"root", "note", "grants",
     "inert_note"}``. ``root`` is the ONE cockpit those hooks verify against (the log the queue finds a grant in at
     decision time); none or more than one is a ``note`` and no rows. A voice-key row that cannot be built is left
     out and logged by its fault's type name, so one bad record never takes the page (and every other revoke) down.
@@ -270,7 +271,7 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         state = _signing_authority(_capture(_journal(root), now, ssh_keygen))
     except KeyError_ as exc:        # no journal there, a governed root, a log that does not replay: said, not raised
         return {"root": visible(str(root)), "grants": [], "inert_note": INERT_NOTE, "note": visible(str(exc))}
-    consent, inert, _retired = _split(state)
+    consent, inert, retired = _split(state)
     # a voice key (levain.voice.custody) is passkey-revocable too, so it is listed for its revoke; it answers no consent
     # request, so no evidence is read for it. Its row names the provider and the record id only: the keychain item the
     # record names (source, account) is not shown, and the record holds no value to show.
@@ -280,10 +281,14 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     lease = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == SEAT_LEASE_KIND]
     # a seat-egress grant (levain.seat_push, Z2a) is listed the same way, for the same revoke
     egress = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == SEAT_EGRESS_KIND]
-    links = {gid: state.grant_link(gid) for gid in [g.id for g in consent] + [i[0] for i in inert] + voice + lease + egress}
+    # a graduation policy or opt-in an earlier levain signed (the retired rows) is passkey-revocable, so it is listed for
+    # its revoke; it answers no consent request, so no evidence is read for it
+    old = [r[0] for r in retired]
+    links = {gid: state.grant_link(gid)
+             for gid in [g.id for g in consent] + [i[0] for i in inert] + voice + lease + egress + old}
     evidence = read_grant_evidence(queue_dir, [(gid, *link) for gid, link in links.items()
                                                if link is not None and gid not in voice and gid not in lease
-                                               and gid not in egress], recent=recent)
+                                               and gid not in egress and gid not in old], recent=recent)
     stamp = utc_stamp(now)
     # every grant this snapshot stops, by id (kind-blind: a voice key, a lease and an inert grant are stopped too)
     stopped = {gid: why for gid in state.policy.grants if (why := grant_stop_reason(state, gid)) is not None}
@@ -333,6 +338,10 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         rows.append({**common(gid, SEAT_EGRESS_KIND, str(g["expires_at"]), None if link is None else link[0]),
                      "state": state_of(gid, str(g["expires_at"])), "agent": visible(str(g["agent"])),
                      "tools": [], "workspace": visible(str(g["push_remote"])), "postures": []})
+    for gid, kind, expires_at in retired:   # the opt-in has no expiry: live until it is revoked
+        link = links[gid]
+        rows.append({**common(gid, kind, expires_at or "", None if link is None else link[0]),
+                     "state": state_of(gid, expires_at) if expires_at else "stopped" if gid in stopped else "live"})
     # a stopped row carries its way back in the terminal's words (way_back, from the RAW kind), so a reader of these rows
     # needs no table of kinds of its own that could say otherwise
     for row in rows:

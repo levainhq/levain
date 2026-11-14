@@ -1,5 +1,5 @@
-"""The doctor's authority-signers row (14b DESIGN_REV2 S5 row 1): root's signers file, which anchors nothing in 1.0
-(the binding cut of 1114 removed what read it, and with it the graduation policies row). Over a real authority log
+"""The doctor's authority-signers row (14b DESIGN_REV2 S5 row 1): root's signers file; this levain signs
+no graduation policy for it to anchor, and doctor has no graduation policies row. Over a real authority log
 (``tests/test_authority_graduation_kind.World``) and a real file this uid owns under the test-only owner override
 (``tests/conftest.py``)."""
 from __future__ import annotations
@@ -79,14 +79,14 @@ def test_no_journal_gives_no_row(tmp_path):
 def test_a_missing_file_is_a_plain_pass_that_says_it_anchors_nothing(world):
     [r] = rows(world)
     assert r.name == "authority signers" and r.ok and not r.warn
-    assert "no enrolled authority signer" in r.detail and "anchors nothing in 1.0" in r.detail
+    assert "no enrolled authority signer" in r.detail and "signs no graduation policy for it to anchor" in r.detail
 
 
 def test_a_file_another_account_can_write_is_unsafe_and_the_hint_names_the_refusal(world):
     path = write_root(world, "laptop")
     path.chmod(0o666)
     [r] = rows(world)
-    assert r.warn and "anchors nothing in 1.0" in r.detail
+    assert r.warn and "signs no graduation policy for it to anchor" in r.detail
     assert "authority-signers-unsafe" in r.hint
     assert authority_signer_sudo_line("darwin" if doctor.sys.platform == "darwin" else "linux") in r.hint
     assert all(n in r.hint for n in AUTHORITY_SIGNER_REFUSALS)
@@ -97,14 +97,14 @@ def test_a_file_another_account_can_write_is_unsafe_and_the_hint_names_the_refus
 def test_a_file_listing_no_authority_key_is_a_plain_pass(world):
     write_root(world, "laptop", namespaces="levain-confirm")
     [r] = rows(world)
-    assert r.ok and not r.warn and "lists no key for levain-authority" in r.detail and "anchors nothing" in r.detail
+    assert r.ok and not r.warn and "lists no key for levain-authority" in r.detail and "for it to anchor" in r.detail
 
 
 def test_a_listed_key_is_a_pass_that_says_it_anchors_nothing(world):
     write_root(world, "laptop")
     [r] = rows(world)
     assert r.ok and not r.warn and r.detail.startswith("1 key(s) root lists for levain-authority")
-    assert "anchors nothing in 1.0" in r.detail
+    assert "signs no graduation policy for it to anchor" in r.detail
 
 
 def test_a_graduation_policy_an_earlier_levain_signed_gives_no_policy_row(world):
@@ -179,7 +179,7 @@ def test_a_dangling_link_there_warns_and_does_not_abort(world):
     d = signers(world).parent
     signers(world).symlink_to(d / "nowhere")
     r, _ = _warn_one(world)
-    assert "anchors nothing in 1.0" in r.detail
+    assert "signs no graduation policy for it to anchor" in r.detail
 
 
 def test_a_link_to_a_good_file_warns_with_the_helpers_bad_root(world):
@@ -232,3 +232,20 @@ def test_a_missing_anchor_on_an_initialised_log_is_a_warning_not_silence(world, 
     monkeypatch.setattr(auth, "check_anchor", gone)
     out = rows(world)
     assert out and any(r.warn and "anchor" in r.detail for r in out)
+
+
+def test_a_file_that_goes_between_the_lstat_and_the_read_is_the_missing_files_pass(world, monkeypatch):
+    # S-A L3 r1 finding 3: the helper's reader answers None for a file gone after doctor's lstat, which left the row
+    # unset (None in the rows, and run_doctor's AttributeError on it)
+    from levain.slot import install_helper
+
+    path = write_root(world, "laptop")
+    real = install_helper._read_signers
+
+    def vanish(p, **kw):
+        os.unlink(path)
+        return real(p, **kw)
+    monkeypatch.setattr(install_helper, "_read_signers", vanish)
+    out = rows(world)
+    assert [r.name for r in out] == ["authority signers"]
+    assert out[0].ok and not out[0].warn and "does not exist" in out[0].detail
