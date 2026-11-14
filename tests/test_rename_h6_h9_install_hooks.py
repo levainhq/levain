@@ -712,7 +712,8 @@ PREFOLD_REV = "93b65592f"  # the last commit before the loop fold
 def prefold_tree(tmp_path_factory) -> Path:
     probe = subprocess.run(["git", "-C", str(REPO), "cat-file", "-e", f"{PREFOLD_REV}^{{commit}}"], capture_output=True)
     if probe.returncode != 0:
-        pytest.skip(f"git has no {PREFOLD_REV}, so the pre-fold release cannot be extracted")
+        pytest.skip(f"SKIPPED, NOT PASSED: git has no {PREFOLD_REV} (a shallow clone or a pruned history), so the pre-fold "
+                    "release cannot be extracted and the hook-skew guard did NOT run here")
     root = tmp_path_factory.mktemp("prefold_release")
     blob = subprocess.run(["git", "-C", str(REPO), "archive", PREFOLD_REV, "levain", "pyproject.toml"],
                           capture_output=True, check=True).stdout
