@@ -647,7 +647,7 @@ Levain layers on [`anneal-memory`](https://pypi.org/project/anneal-memory/) (pin
 
 ## Build on it
 
-Writing your own surface over a substrate? `levain.kernel` is the published seam: the data model, the terminal and web drivers, and the governed write and action dispatch. Import one namespace instead of reaching into internals. Register extra read-only panels or extra governed verbs through `make_server(...)` and they ride the same auth, confirm, and audit envelope as the built-in edits. It's a pure re-export; the governance lives in the substrate, not the surface.
+Writing your own surface over a substrate? `levain.kernel` is the published seam: the data model, the terminal and web drivers, and the governed write and action dispatch. Import one namespace instead of reaching into internals. Register extra read-only panels or extra governed verbs through `make_server(...)`. A governed verb rides the same auth, confirm, and audit envelope as the built-in edits; a read-only panel only shows data in the cockpit and has no confirm or audit step, because it writes nothing. It's a pure re-export; the governance lives in the substrate, not the surface.
 
 ### Working on levain itself — run this once per clone
 
