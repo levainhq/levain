@@ -1187,8 +1187,9 @@ def test_a_snooze_against_a_view_with_no_lives_is_refused_for_a_retired_number_o
 @pytest.fixture
 def busy_life_read(monkeypatch):
     """The life read (:func:`band_view._idents`) meets a held lock: its snapshot raises SQLite's busy error, through
-    the seam the store tests use (``QuestionStore._peek`` raising), and only while that read runs."""
-    busy = [False]
+    the seam the store tests use (``QuestionStore._peek`` raising), and only while that read runs. Returns the switch
+    (``[True]``): a test sets it ``[False]`` to set the store up, then back on for the render under test."""
+    busy, on = [False], [True]
     real_peek, real_idents = QuestionStore._peek, band_view._idents
 
     def peek(self):
@@ -1197,19 +1198,24 @@ def busy_life_read(monkeypatch):
         return real_peek(self)
 
     def idents(*a, **k):
-        busy[0] = True
+        busy[0] = on[0]
         try:
             return real_idents(*a, **k)
         finally:
             busy[0] = False
     monkeypatch.setattr(QuestionStore, "_peek", peek)
     monkeypatch.setattr(band_view, "_idents", idents)
+    return on
 
 
 def test_deepseek_med_2_a_busy_life_read_records_lives_unknown_never_an_empty_set(store, busy_life_read):
     """deepseek MED 2 (bandfix2_scratch/repro_f2_f3.py f3): the cockpit poll's life read is busy. The view records NO
-    lives (unknown), not ``{}``, so an answer to a number never retired lands instead of being refused as reissued."""
+    lives (unknown), not ``{}``, so an answer to a number never retired lands instead of being refused as reissued.
+    (Both items are numbered first: a poll that numbers something reads the lives under its own write, F2.)"""
     q1, q2 = ask(store, "one"), ask(store, "two")
+    busy_life_read[0] = False
+    band_view.render_full(store)
+    busy_life_read[0] = True
     pay = band_view.band_payload(store, PHONE)
     with sqlite3.connect(store.path) as c:
         assert c.execute("SELECT lives FROM band_views WHERE seq = ?", (pay["view_id"],)).fetchone() == (None,)
@@ -1269,6 +1275,9 @@ def test_deepseek_med_2_a_render_whose_life_read_is_busy_says_no_number_was_repl
 
 def test_deepseek_med_2_unknown_lives_survive_the_desk_stage_as_unknown(store, qdir, busy_life_read):
     q1 = ask(store, "one")
+    busy_life_read[0] = False
+    band_view.render_full(store)                       # numbered first (a numbering write reads the lives itself, F2)
+    busy_life_read[0] = True
     r = band_view.render_full(store)
     assert r.lives is None
     band_view._stage_view(qdir, "sess-x", r, r.text)
@@ -1290,3 +1299,88 @@ def test_deepseek_med_2_a_number_a_render_read_no_life_for_is_judged_by_the_stor
     assert r.shown == [1, 2]
     line = band_view._delta_line(store, prev, r.shown, lives=())
     assert "new 1" in line and "closed 1 (answered via cli)" in line and "2" not in line
+
+
+# --- L3 on the re-cut (bandrecut_l3_r1): F1 codex MED, F2 gemini MED ---------------------------------------------------
+@pytest.mark.parametrize("keep_open", [False, True])
+def test_codex_med_f1_a_stale_reply_to_a_number_reissued_to_a_host_item_is_refused_not_dropped_silently(
+        store, env, clock, keep_open):
+    """codex MED (bandrecut_l3_r1 F1): an idle viewer saw 1 = A; A closed, 1 was retired and reissued to a HOST item.
+    The viewer types '1a' against its old view. The host-number silence (TERMSIGN L3) is for a number that belongs to
+    another surface's footer; this one was shown to the viewer as A, so the refusal stays: nothing recorded, and said."""
+    a = ask(store, "A")
+    keep = ask(store, "keep") if keep_open else None
+    see(store, OTHER)                                   # the idle viewer's newest view: 1 = A
+    close(store, a)
+    clock.advance(timedelta(days=15))
+    assert band_view.allocate(store, "host", ["np-h"]) == {"np-h": 1}     # 1 retired from A, reissued to a host item
+    echo = band_view._seat_answer(store, OTHER, "1a", env, None)
+    assert "refused: 1 " in echo and "recorded: nothing" in echo
+    if keep is not None:
+        assert not answered(store, keep)
+
+
+def test_codex_med_f1_a_host_number_never_in_the_viewers_band_is_still_silent(store, env, clock):
+    """The TERMSIGN L3 silence is kept for what it is for: a host number the viewer was never shown as a Levain item."""
+    ask(store, "A")
+    see(store, OTHER)                                   # 1 = A
+    assert band_view.allocate(store, "host", ["np-h"]) == {"np-h": 2}
+    assert band_view._seat_answer(store, OTHER, "2a", env, None) == ""
+
+
+def test_gemini_med_f2_a_busy_life_read_does_not_make_the_number_the_same_render_issued_unanswerable(
+        store, env, clock, busy_life_read):
+    """gemini MED (bandrecut_l3_r1 F2): 1 was retired; a new question takes 1 in a render whose life read met a held
+    lock. The numbering write knows every life it reads under its own lock, so the view records them and '1a' against
+    the very band that issued 1 lands (it used to record lives NULL and be refused as reissued)."""
+    busy_life_read[0] = False
+    a = ask(store, "A")
+    see(store)
+    close(store, a)
+    clock.advance(timedelta(days=15))
+    b = ask(store, "B")
+    busy_life_read[0] = True
+    r, _seq = see(store)                                # the life read is busy; the write retires 1 and numbers B 1
+    assert number_of(store, b) == 1 and r.lives == ((1, life_of(store, 1)),)
+    echo = band_view._seat_answer(store, VIEWER, "1a", env, None)
+    assert "recorded: 1a" in echo and answered(store, b)
+
+
+def test_gemini_med_f2_an_unanswered_question_keeps_its_life_when_the_write_numbers_another(store, env, clock,
+                                                                                          busy_life_read):
+    """The same busy read with an already-numbered open question beside the new one: both lives come from the write."""
+    busy_life_read[0] = False
+    a, keep = ask(store, "A"), ask(store, "keep")
+    see(store)
+    close(store, a)
+    clock.advance(timedelta(days=15))
+    b = ask(store, "B")
+    busy_life_read[0] = True
+    r, _seq = see(store)
+    assert sorted(r.shown) == [1, 2] and number_of(store, b) == 1
+    assert dict(r.lives) == {1: life_of(store, 1), 2: life_of(store, 2)}
+    echo = band_view._seat_answer(store, VIEWER, "1a 2b", env, None)
+    assert "recorded: 1a" in echo and "2b" in echo and "refused" not in echo
+    assert answered(store, b) and answered(store, keep)
+
+
+def test_gemini_med_f2_a_life_read_busy_once_is_read_again_before_lives_are_called_unknown(store, clock, monkeypatch):
+    """With nothing new to number there is no write to read the lives under: one busy read is retried once (a retry,
+    never a wrong refusal); a read busy both times still records unknown (None), never a partial set."""
+    a, keep = ask(store, "A"), ask(store, "keep")
+    see(store)
+    real_idents, calls = band_view._idents, []
+
+    def busy_first(*args, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_idents(*args, **kw)
+    monkeypatch.setattr(band_view, "_idents", busy_first)
+    r = band_view.render_full(store)
+    assert len(calls) == 2 and dict(r.lives) == {1: life_of(store, 1), 2: life_of(store, 2)}
+
+    def busy(*args, **kw):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(band_view, "_idents", busy)
+    assert band_view.render_full(store).lives is None
