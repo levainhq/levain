@@ -84,18 +84,6 @@ def _view() -> SubstrateView:
         Section("Context", "context line", CLASS_C, ZONE_MIND),
         Section("Understanding", "understanding line", CLASS_C, ZONE_MIND),
     ]
-    intentions = [
-        OpenIntention(
-            id="intention-099", type="task", tier="growing", salience=3, domain="levain",
-            text="give Levain a canonical [tool.mypy]", seen="2026-06-15", next=None, pointer=None,
-            descend_kinds=["done", "dropped"], ascend_kinds=["pattern"],
-        ),
-        OpenIntention(
-            id="intention-093", type="task", tier="resting", salience=2, domain="anneal",
-            text="content-store v1", seen="2026-06-14", next="2026-06-26", pointer="next.md",
-            descend_kinds=["done"], ascend_kinds=[],
-        ),
-    ]
     tray = [
         OpenIntention(
             id="intention-110", type="task", tier="warm", salience=2, domain="ops",
@@ -108,10 +96,10 @@ def _view() -> SubstrateView:
             pointer=None, disposition="handoff",
         ),
     ]
-    # TS-5a: no Keep. The parked loop is an Open loop (marked by its tier), the legacy note a Tray row.
-    intentions.append(OpenIntention(
+    # Loop fold: ONE list. A parked someday (a migrated parked loop) and a legacy note are both List rows.
+    tray.append(OpenIntention(
         id="intention-029", type="task", tier="parked", salience=1, domain="ops",
-        text="open-model partner laptop", seen="2026-06-10", next=None, pointer=None,
+        text="open-model partner laptop", seen="2026-06-10", next=None, pointer=None, disposition="someday",
     ))
     tray.append(OpenIntention(
         id="intention-030", type="thought", tier="warm", salience=1, domain="ops",
@@ -138,7 +126,7 @@ def _view() -> SubstrateView:
     ]
     return SubstrateView(
         paths=paths, entity_name="flow", health=health, graph=graph,
-        crystal_index=crystals, open_intentions=intentions, tray=tray, episodes=episodes,
+        crystal_index=crystals, tray=tray, episodes=episodes,
         sections=sections, config_docs=config_docs, wraps=wraps, recent_edits=recent_edits,
     )
 
@@ -156,13 +144,11 @@ def test_panels_for_zone_identity_is_config_docs():
 def test_panels_for_zone_operate_order():
     v = _view()
     panels = tui.panels_for_zone(v, ZONE_OPERATE)
-    # the two intention projections are adjacent (Open Loops · Tray; no Keep, TS-5a), then episodes,
-    # then the edit log (Slice 3 capture-UX (A) ordering).
-    assert [p["kind"] for p in panels] == ["intentions", "tray", "episodes", "edits"]
+    # ONE intention list (the List), then episodes, then the edit log. No Open loops panel, no Keep.
+    assert [p["kind"] for p in panels] == ["tray", "episodes", "edits"]
     by_kind = {p["kind"]: p for p in panels}
-    # intentions + episodes are Class B (verb-mediated); Tray FLIPs to Class B in 3b
-    # (the governed dump/triage/park verbs); only the edit log carries no chip.
-    assert by_kind["intentions"]["edit_class"] == CLASS_B
+    # episodes + the List are Class B (verb-mediated); only the edit log carries no chip.
+    assert "intentions" not in by_kind
     assert by_kind["episodes"]["edit_class"] == CLASS_B
     assert by_kind["edits"]["edit_class"] == ""
     assert by_kind["tray"]["edit_class"] == CLASS_B
@@ -185,7 +171,7 @@ def test_panels_for_zone_mind_has_sections_and_state_is_class_a():
 def test_panel_item_count_only_verb_lists_are_selectable():
     v = _view()
     by_kind = {p["kind"]: p for p in v.layout()}
-    assert tui.panel_item_count(v, by_kind["intentions"]) == 3
+    assert tui.panel_item_count(v, by_kind["tray"]) == 4
     assert tui.panel_item_count(v, by_kind["episodes"]) == 2
     assert tui.panel_item_count(v, by_kind["edits"]) == 2
     # crystals + wraps render rich and scroll, but carry no per-item verb → 0
@@ -196,10 +182,11 @@ def test_panel_item_count_only_verb_lists_are_selectable():
 
 def test_is_item_list():
     v = _view()
-    intentions = next(p for p in v.layout() if p["kind"] == "intentions")
+    tray = next(p for p in v.layout() if p["kind"] == "tray")
     health = next(p for p in v.layout() if p["kind"] == "health")
     crystals = next(p for p in v.layout() if p["kind"] == "crystals")
-    assert tui.is_item_list(intentions) is True
+    assert tui.is_item_list(tray) is True
+    assert tui.is_item_list({"kind": "intentions"}) is False  # the Open loops panel is gone
     assert tui.is_item_list(health) is False
     assert tui.is_item_list(crystals) is False  # rich list, but no per-item verb
     assert tui.is_item_list(None) is False
@@ -223,23 +210,11 @@ def test_class_a_config_and_section_offer_edit():
     assert [x.kind for x in tui.panel_verbs(state)] == ["edit"]
 
 
-def test_intention_panel_verbs():
+def test_open_loops_panel_is_gone_and_a_stray_kind_affords_nothing():
     v = _view()
-    intentions = next(p for p in v.layout() if p["kind"] == "intentions")
-    verbs = tui.panel_verbs(intentions)
-    assert [x.kind for x in verbs] == [
-        "intention_touch", "plain_intention_edit", "intention_schedule", "intention_park",
-        "intention_close", "intention_promote",
-    ]
-    descend = next(x for x in verbs if x.kind == "intention_close")
-    assert descend.destructive and descend.needs_kind
-    ascend = next(x for x in verbs if x.kind == "intention_promote")
-    assert ascend.destructive and ascend.needs_kind
-    # the metadata verbs (touch/edit/schedule/park) are non-destructive — no confirm gate
-    for k in ("intention_touch", "plain_intention_edit", "intention_schedule", "intention_park"):
-        assert not next(x for x in verbs if x.kind == k).destructive
-    # every Open-Loops verb acts on the selected row (no panel-level capture here)
-    assert all(x.row_scoped for x in verbs)
+    assert not any(p["kind"] == "intentions" for p in v.layout())
+    assert tui.panel_verbs({"kind": "intentions", "edit_class": CLASS_B}) == []
+    assert tui.render_panel_lines(v, {"kind": "intentions"}) == ["(no renderer for this panel)"]
 
 
 def test_tray_panel_verbs():
@@ -248,8 +223,9 @@ def test_tray_panel_verbs():
     verbs = tui.panel_verbs({"kind": "tray", "edit_class": CLASS_B}, read_only=False)
     assert [x.kind for x in verbs] == [
         "intention_capture", "plain_intention_edit", "intention_reclassify",
-        "intention_metabolize", "intention_schedule", "intention_close",
+        "intention_schedule", "intention_unpark", "intention_close",
     ]
+    assert "intention_metabolize" not in [x.kind for x in verbs]  # the loop disposition is retired (422)
     cap = next(x for x in verbs if x.kind == "intention_capture")
     assert cap.row_scoped is False  # the dump works on an EMPTY Tray
     dismiss = next(x for x in verbs if x.kind == "intention_close")
@@ -357,12 +333,12 @@ def test_panel_verbs_read_only_suppresses_all_affordances():
     # advertises navigation only and no verb key dispatches (NO THEATER — never
     # advertise a write with no governed target behind it).
     v = _view()
-    for kind in ("config", "section", "intentions", "episodes", "edits"):
+    for kind in ("config", "section", "tray", "episodes", "edits"):
         panels = [p for p in v.layout() if p["kind"] == kind]
         for p in panels:
             assert tui.panel_verbs(p, read_only=True) == [], (kind, p.get("edit_class"))
     # and the would-be-metal Class-A/B panels in isolation
-    assert tui.panel_verbs({"kind": "intentions", "edit_class": CLASS_B}, read_only=True) == []
+    assert tui.panel_verbs({"kind": "tray", "edit_class": CLASS_B}, read_only=True) == []
     assert tui.panel_verbs({"kind": "section", "edit_class": CLASS_A}, read_only=True) == []
 
 
@@ -390,12 +366,11 @@ def test_active_verbs_threads_read_only_to_panel_verbs():
     from levain import _tui_curses
 
     v = _view()
-    rw = _model_on(v, "intentions", read_only=False)
+    rw = _model_on(v, "tray", read_only=False)  # row 0: a seed with no resolve kinds, not parked
     assert [x.kind for x in _tui_curses._active_verbs(rw)] == [
-        "intention_touch", "plain_intention_edit", "intention_schedule", "intention_park",
-        "intention_close", "intention_promote",
+        "intention_capture", "plain_intention_edit", "intention_reclassify", "intention_schedule",
     ]
-    ro = _model_on(v, "intentions", read_only=True)
+    ro = _model_on(v, "tray", read_only=True)
     assert _tui_curses._active_verbs(ro) == []
 
 
@@ -419,11 +394,11 @@ def test_apply_backstop_refuses_write_in_read_only(monkeypatch):
 def test_panel_verbs_require_class_b_for_lifecycle():
     # The manifest's edit_class owns the affordance: a mistagged Class-C intentions/
     # episodes panel must offer NO mutation verb.
-    for kind in ("intentions", "tray", "episodes"):
+    for kind in ("tray", "episodes"):
         assert tui.panel_verbs({"kind": kind, "edit_class": CLASS_C}) == []
-    assert [v.kind for v in tui.panel_verbs({"kind": "intentions", "edit_class": CLASS_B})] == [
-        "intention_touch", "plain_intention_edit", "intention_schedule", "intention_park",
-        "intention_close", "intention_promote",
+    assert [v.kind for v in tui.panel_verbs({"kind": "tray", "edit_class": CLASS_B})] == [
+        "intention_capture", "plain_intention_edit", "intention_reclassify",
+        "intention_schedule", "intention_unpark", "intention_close",
     ]
     assert [v.kind for v in tui.panel_verbs({"kind": "episodes", "edit_class": CLASS_B})] == [
         "episode_tombstone",
@@ -458,9 +433,9 @@ def test_select_zone_clamps_and_resets():
 
 
 def test_select_panel_clamps_within_zone():
-    m = tui.TuiModel(view=_view(), zone_idx=1)  # Operate: 4 panels (intentions·tray·episodes·edits)
+    m = tui.TuiModel(view=_view(), zone_idx=1)  # Operate: 3 panels (tray·episodes·edits)
     assert tui.select_panel(m, +1).panel_idx == 1
-    assert tui.select_panel(m, +99).panel_idx == 3
+    assert tui.select_panel(m, +99).panel_idx == 2
     assert tui.select_panel(m, -99).panel_idx == 0
     # moving panel resets item + scroll
     m2 = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=0, item_idx=1, scroll=3)
@@ -469,10 +444,10 @@ def test_select_panel_clamps_within_zone():
 
 
 def test_move_in_panel_selects_items_in_list_panel():
-    # Operate zone, intentions panel (3 items) → j/k moves item cursor, clamped.
+    # Operate zone, the List panel (4 items) → j/k moves item cursor, clamped.
     m = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=0)
     assert tui.move_in_panel(m, +1).item_idx == 1
-    assert tui.move_in_panel(m, +5).item_idx == 2  # clamped to last
+    assert tui.move_in_panel(m, +5).item_idx == 3  # clamped to last
     assert tui.move_in_panel(m, -5).item_idx == 0
 
 
@@ -487,7 +462,7 @@ def test_move_in_panel_scrolls_text_panel_and_floors():
 
 def test_with_view_clamps_cursors_when_data_shrinks():
     v = _view()
-    m = tui.TuiModel(view=v, zone_idx=1, panel_idx=0, item_idx=1)  # intentions, item 1
+    m = tui.TuiModel(view=v, zone_idx=1, panel_idx=0, item_idx=1)  # the List, item 1
     # rebuild with an empty-intentions view → item cursor clamps to 0
     shrunk = SubstrateView(paths=v.paths, entity_name="flow", health=v.health)
     m2 = tui.with_view(m, shrunk, status="refreshed")
@@ -497,19 +472,19 @@ def test_with_view_clamps_cursors_when_data_shrinks():
 
 def test_current_item_helpers():
     m = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=0, item_idx=1)
-    assert tui.current_intention(m).id == "intention-093"
-    # off the intentions panel → None
+    assert tui.current_row(m).id == "intention-111"
+    # off the List → None
     assert tui.current_episode(m) is None
-    # Operate panels: 0=intentions, 1=tray, 2=episodes, 3=edits.
-    me = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=2, item_idx=0)
+    # Operate panels: 0=tray, 1=episodes, 2=edits.
+    me = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=1, item_idx=0)
     assert tui.current_episode(me).id == "ep1"
-    med = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=3, item_idx=0)
+    med = tui.TuiModel(view=_view(), zone_idx=1, panel_idx=2, item_idx=0)
     assert tui.current_edit_record(med)["id"] == "edit1"
 
 
 # --- per-kind detail renderers (smoke + key content) -----------------------
 
-@pytest.mark.parametrize("kind", ["config", "section", "intentions", "tray",
+@pytest.mark.parametrize("kind", ["config", "section", "tray",
                                   "episodes", "edits", "health", "graph", "crystals", "wraps"])
 def test_render_panel_lines_nonempty_per_kind(kind):
     v = _view()
@@ -533,14 +508,13 @@ def test_render_graph_names_when_links_stopped():
     assert "Association graph: 2 nodes, 1 edges · no new links since wrap 50" in text
 
 
-def test_render_intentions_one_line_per_loop_with_id():
+def test_render_parked_list_row_is_marked():
     v = _view()
-    panel = next(p for p in v.layout() if p["kind"] == "intentions")
+    panel = next(p for p in v.layout() if p["kind"] == "tray")
     lines = tui.render_panel_lines(v, panel)
-    assert len(lines) == 3  # one line per open loop, the parked one included
-    assert "intention-099" in lines[0] and "give Levain a canonical" in lines[0]
     parked = [l for l in lines if "intention-029" in l]
-    assert len(parked) == 1 and "[parked" in parked[0]  # the parked marker rides the tier badge
+    assert len(parked) == 1 and "[someday·parked]" in parked[0]
+    assert sum("parked" in l for l in lines) == 1  # only the parked row carries the mark
 
 
 def test_render_tray_badges_disposition():
@@ -549,11 +523,11 @@ def test_render_tray_badges_disposition():
     v = _view()
     panel = next(p for p in v.layout() if p["kind"] == "tray")
     lines = tui.render_panel_lines(v, panel)
-    assert len(lines) == 3
+    assert len(lines) == 4
     assert "[seed]" in lines[0] and "intention-110" in lines[0]
     assert "[handoff]" in lines[1] and "surface 2026-06-19" in lines[1]
     # a legacy note still in a store is shown, badged "note", never dropped
-    assert "[note]" in lines[2] and "intention-030" in lines[2]
+    assert "[note]" in lines[3] and "intention-030" in lines[3]
 
 
 def test_render_tray_empty_state_and_no_keep_panel():
@@ -570,7 +544,7 @@ def test_intention_panels_degraded_on_store_fault_not_false_zero():
     # web path already degraded — caught by codex L3 on the trust audit.)
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
                       errors={"open_intentions": "IntentionError: spores.json is not valid JSON"})
-    for kind in ("intentions", "tray"):
+    for kind in ("tray",):
         panel = next(p for p in v.layout() if p["kind"] == kind)
         lines = tui.render_panel_lines(v, panel)
         assert len(lines) == 1
@@ -584,13 +558,13 @@ def test_intention_panel_titles_degraded_not_zero_count_on_fault():
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
                       errors={"open_intentions": "IntentionError: bad"})
     titles = {p["kind"]: p["title"] for p in v.layout() if p["kind"] in ("intentions", "tray", "keep")}
-    assert titles["intentions"] == "Open loops (unavailable)", titles
+    assert "intentions" not in titles, titles
     assert titles["tray"] == "Tray (unavailable)", titles
     assert "keep" not in titles, titles
     # control: a healthy (empty) store still shows the honest "(0)" count, not a false degrade
     ok = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
     ok_titles = {p["kind"]: p["title"] for p in ok.layout() if p["kind"] in ("intentions", "tray", "keep")}
-    assert ok_titles["intentions"] == "Open loops (0)", ok_titles
+    assert "intentions" not in ok_titles and ok_titles["tray"] == "Tray (0)", ok_titles
 
 
 def test_tray_is_verb_navigable():
@@ -603,7 +577,7 @@ def test_tray_is_verb_navigable():
         assert tui.is_item_list(panel)
 
 
-@pytest.mark.parametrize("kind", ["intentions", "tray", "episodes", "edits"])
+@pytest.mark.parametrize("kind", ["tray", "episodes", "edits"])
 def test_verb_list_panels_render_one_line_per_item(kind):
     # The driver's cursor highlight + auto-scroll depend on 1 line == 1 item.
     v = _view()
@@ -635,8 +609,8 @@ def test_render_sanitizes_embedded_newlines():
         text="line one\nline two", seen="2026-06-15", next="a\nb", pointer=None,
     )
     ep = EpisodeRow("e1", "2026-06-15T00:00:00", "finding", "src", "multi\nline\ncontent", [])
-    v = SubstrateView(paths=paths, open_intentions=[intention], episodes=[ep])
-    sp = next(p for p in v.layout() if p["kind"] == "intentions")
+    v = SubstrateView(paths=paths, tray=[intention], episodes=[ep])
+    sp = next(p for p in v.layout() if p["kind"] == "tray")
     epp = next(p for p in v.layout() if p["kind"] == "episodes")
     sp_lines = tui.render_panel_lines(v, sp)
     ep_lines = tui.render_panel_lines(v, epp)
@@ -646,7 +620,7 @@ def test_render_sanitizes_embedded_newlines():
 
 def test_render_empty_collections_degrade_gracefully():
     empty = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")))
-    for kind in ["intentions", "episodes", "edits", "crystals", "wraps"]:
+    for kind in ["tray", "episodes", "edits", "crystals", "wraps"]:
         panel = next(p for p in empty.layout() if p["kind"] == kind)
         lines = tui.render_panel_lines(empty, panel)
         assert lines and "(" in lines[0]  # a "(no ...)" placeholder, never a crash
@@ -715,10 +689,8 @@ def test_current_row_selects_from_the_active_projection():
 
     v = SubstrateView(
         paths=AnnealPaths.from_db(Path("/x/memory.db")),
-        open_intentions=[_intention("intention-1")],
         tray=[_intention("intention-2", disposition="seed")],
     )
-    assert tui.current_row(_model_on(v, "intentions", read_only=False)).id == "intention-1"
     assert tui.current_row(_model_on(v, "tray", read_only=False)).id == "intention-2"
     # out of range -> None; a non-intention panel -> None
     m = _model_on(v, "tray", read_only=False)
@@ -728,16 +700,17 @@ def test_current_row_selects_from_the_active_projection():
 
 # --- _active_verbs: row-aware park / legacy note + panel-level capture on empty lists ------
 
-def test_active_verbs_parked_loop_offers_unpark_not_park():
+def test_active_verbs_parked_list_row_offers_unpark_and_only_there():
     from levain import _tui_curses
-    v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
-                      open_intentions=[_intention("intention-p", tier="parked"), _intention("intention-w")])
-    kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, "intentions", read_only=False))]
-    assert "intention_unpark" in kinds and "intention_park" not in kinds
-    m = _model_on(v, "intentions", read_only=False)
     from dataclasses import replace as _r
+    v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
+                      tray=[_intention("intention-p", tier="parked", disposition="someday"),
+                            _intention("intention-w", disposition="someday")])
+    m = _model_on(v, "tray", read_only=False)
+    kinds = [x.kind for x in _tui_curses._active_verbs(m)]
+    assert "intention_unpark" in kinds and "intention_park" not in kinds
     kinds2 = [x.kind for x in _tui_curses._active_verbs(_r(m, item_idx=1))]
-    assert "intention_park" in kinds2 and "intention_unpark" not in kinds2
+    assert "intention_unpark" not in kinds2 and "intention_park" not in kinds2  # NO THEATER: nothing to un-park
 
 
 def test_active_verbs_legacy_note_in_tray_drops_reclassify():
@@ -745,7 +718,7 @@ def test_active_verbs_legacy_note_in_tray_drops_reclassify():
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
                       tray=[_intention("intention-n", disposition="note"), _intention("intention-s", disposition="seed")])
     kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, "tray", read_only=False))]
-    assert "intention_reclassify" not in kinds and "intention_metabolize" in kinds
+    assert "intention_reclassify" not in kinds and "intention_metabolize" not in kinds and "intention_schedule" in kinds
     from dataclasses import replace as _r
     m = _model_on(v, "tray", read_only=False)
     assert "intention_reclassify" in [x.kind for x in _tui_curses._active_verbs(_r(m, item_idx=1))]
@@ -754,13 +727,14 @@ def test_active_verbs_legacy_note_in_tray_drops_reclassify():
 def test_active_verbs_empty_list_keeps_only_panel_level_capture():
     from levain import _tui_curses
     v = SubstrateView(paths=AnnealPaths.from_db(Path("/x/memory.db")),
-                      open_intentions=[], tray=[])
+                      tray=[])
     # empty Tray -> only the panel-level dump survives (you capture INTO an empty inbox)...
     for kind in ("tray",):
         kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, kind, read_only=False))]
         assert kinds == ["intention_capture"]
-    # ...but Open Loops has no panel-level verb -> an empty list advertises nothing.
-    assert _tui_curses._active_verbs(_model_on(v, "intentions", read_only=False)) == []
+    # ...and there is no Open loops panel to seat on.
+    with pytest.raises(AssertionError):
+        _model_on(v, "intentions", read_only=False)
 
 
 # --- _handle_verb dispatch routing (the driver decides WHICH builder runs per row) ----
@@ -792,17 +766,25 @@ def test_handle_verb_unpark_updates_tier_with_cas(monkeypatch):
     from levain import _tui_curses
     cap = _capture_apply(monkeypatch)
     p = AnnealPaths.from_db(Path("/x/memory.db"))
-    # a parked LOOP in Open loops → un-park (intention_update{tier:warm}). The rendered snapshot
-    # ('loop' — a parked plain loop) rides as expect_disposition (intention-173): a concurrent
-    # re-route to a note fails closed server-side instead of tier-warming a note.
-    vpark = SubstrateView(paths=p, open_intentions=[_intention("intention-p", tier="parked")])
-    _tui_curses._handle_verb(None, _model_on(vpark, "intentions", read_only=False), None,
+    # a parked someday on the List -> un-park (intention_update{tier:warm}). The rendered snapshot
+    # ('someday') rides as expect_disposition (intention-173): a concurrent re-route fails closed server-side.
+    vpark = SubstrateView(paths=p, tray=[_intention("intention-p", tier="parked", disposition="someday")])
+    _tui_curses._handle_verb(None, _model_on(vpark, "tray", read_only=False), None,
                              tui.Verb("p", "[p] un-park", "intention_unpark"))
     # ...and the rendered row's version rides too (TS-5a L3): a tier changed elsewhere refuses as stale
     from levain.cockpit.providers import intention_view_version
     assert cap["req"] == {"kind": "intention_update", "intention_id": "intention-p", "tier": "warm",
-                          "expect_disposition": "loop",
-                          "expected_version": intention_view_version(vpark.open_intentions[0])}
+                          "expect_disposition": "someday",
+                          "expected_version": intention_view_version(vpark.tray[0])}
+
+
+def test_tui_source_never_sends_the_retired_loop_disposition():
+    import inspect
+    from levain import _tui_curses
+    src = inspect.getsource(_tui_curses)
+    assert '"loop"' not in src and "build_set_disposition_req" not in src and "intention_metabolize" not in src
+    assert not any("Open Loops" in l or "metabolize" in l for l in _tui_curses._HELP_LINES)
+    assert any("un-park" in l for l in _tui_curses._HELP_LINES)
 
 
 def test_handle_verb_descend_is_panel_aware(monkeypatch):
@@ -811,14 +793,13 @@ def test_handle_verb_descend_is_panel_aware(monkeypatch):
     monkeypatch.setattr(_tui_curses, "_confirm", lambda stdscr, msg: True)
     monkeypatch.setattr(_tui_curses, "_choose", lambda stdscr, label, opts: opts[0])
     p = AnnealPaths.from_db(Path("/x/memory.db"))
-    # Open Loops: a kind picker (_choose → first), then confirm. The rendered snapshot ('loop')
-    # rides as expect_disposition (intention-173) so the descend CASes it — a concurrent re-route in
-    # the confirm window fails closed instead of composting a now-different intention.
-    vlo = SubstrateView(paths=p, open_intentions=[_intention("intention-1", descend_kinds=["done", "dropped"])])
-    _tui_curses._handle_verb(None, _model_on(vlo, "intentions", read_only=False), None,
-                             _verb_of("intentions", "intention_close"))
+    # List "dismiss" of a someday: a kind picker (_choose → first), then confirm. The rendered snapshot
+    # rides as expect_disposition (intention-173) so the descend CASes it.
+    vlo = SubstrateView(paths=p, tray=[_intention("intention-1", disposition="someday", descend_kinds=["done", "dropped"])])
+    _tui_curses._handle_verb(None, _model_on(vlo, "tray", read_only=False), None,
+                             _verb_of("tray", "intention_close"))
     assert cap["req"] == {"kind": "intention_close", "intention_id": "intention-1",
-                          "intention_kind": "done", "confirm": True, "expect_disposition": "loop"}
+                          "intention_kind": "done", "confirm": True, "expect_disposition": "someday"}
     # Tray "dismiss" of a legacy note: the note snapshot rides so the descend CASes 'note'.
     cap.clear()
     vk = SubstrateView(paths=p, tray=[_intention("intention-k", disposition="note",
@@ -833,9 +814,9 @@ def test_handle_verb_schedule_dash_clears_the_alarm(monkeypatch):
     cap = _capture_apply(monkeypatch)
     monkeypatch.setattr(_tui_curses, "_prompt_line", lambda stdscr, label: "-")
     p = AnnealPaths.from_db(Path("/x/memory.db"))
-    v = SubstrateView(paths=p, open_intentions=[_intention("intention-1", next="2026-07-01")])
-    _tui_curses._handle_verb(None, _model_on(v, "intentions", read_only=False), None,
-                             _verb_of("intentions", "intention_schedule"))
+    v = SubstrateView(paths=p, tray=[_intention("intention-1", next="2026-07-01", disposition="someday")])
+    _tui_curses._handle_verb(None, _model_on(v, "tray", read_only=False), None,
+                             _verb_of("tray", "intention_schedule"))
     assert cap["req"] == {"kind": "intention_surface_at", "intention_id": "intention-1", "surface_at": ""}
 
 
@@ -856,15 +837,15 @@ def test_active_verbs_prunes_resolve_verbs_when_row_has_no_kinds():
     # [d]/[a] — the web gates these; the TUI footer now does too.
     from levain import _tui_curses
     p = AnnealPaths.from_db(Path("/x/memory.db"))
-    v = SubstrateView(paths=p, open_intentions=[_intention("intention-x", descend_kinds=[], ascend_kinds=[])])
-    kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, "intentions", read_only=False))]
+    v = SubstrateView(paths=p, tray=[_intention("intention-x", disposition="someday", descend_kinds=[], ascend_kinds=[])])
+    kinds = [x.kind for x in _tui_curses._active_verbs(_model_on(v, "tray", read_only=False))]
     assert "intention_close" not in kinds and "intention_promote" not in kinds
-    assert "intention_touch" in kinds and "plain_intention_edit" in kinds  # the kind-independent verbs stay
+    assert "plain_intention_edit" in kinds and "intention_schedule" in kinds  # the kind-independent verbs stay
     # a row WITH kinds advertises them
     v2 = SubstrateView(paths=p,
-                       open_intentions=[_intention("intention-y", descend_kinds=["done"], ascend_kinds=["pattern"])])
-    kinds2 = [x.kind for x in _tui_curses._active_verbs(_model_on(v2, "intentions", read_only=False))]
-    assert "intention_close" in kinds2 and "intention_promote" in kinds2
+                       tray=[_intention("intention-y", disposition="someday", descend_kinds=["done"], ascend_kinds=["pattern"])])
+    kinds2 = [x.kind for x in _tui_curses._active_verbs(_model_on(v2, "tray", read_only=False))]
+    assert "intention_close" in kinds2
 
 
 def test_verb_mediated_kinds_mirror_writes():
