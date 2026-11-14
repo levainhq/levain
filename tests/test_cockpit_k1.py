@@ -109,7 +109,7 @@ def _cases(root: Path):
     edits, ctxj, jobs = lv / "edits.jsonl", lv / "context.json", lv / "jobs.json"
     cont = lv / "memory.continuity.md"
     out = []
-    for pid in ("tray", "loops"):
+    for pid in ("tray",):
         out.append((pid, "intentions", _rm(intentions), _garble(intentions)))
     for pid in ("episodes", "health", "graph", "wraps"):
         out.append((pid, "db", _rm(db), _garble(db)))
@@ -513,8 +513,8 @@ class TestProfilesAndSearch:
     def test_compact_gate_rows_feed_pointer_and_gauge_value(self, env) -> None:
         _r, _s, ck = env
         assert ck.panel("tray", profile="compact")["rows"] is not None          # gate: every row
-        loops = ck.panel("loops", profile="compact")                            # feed: count + pointer
-        assert loops["rows"] is None and loops["count"] == 1 and "profile=full" in loops["next"]
+        feed = ck.panel("episodes", profile="compact")                          # feed: count + pointer
+        assert feed["rows"] is None and feed["count"] >= 1 and "profile=full" in feed["next"]
         assert ck.panel("health", profile="compact")["value"]["metrics"]        # gauge: the metric
         assert "data" not in ck.panel("graph", profile="compact")["value"]      # visual: its text projection
 
@@ -545,11 +545,13 @@ class TestOrderingAndGroups:
         _r, _s, ck = env
         p = ck.panel("tray")
         by_group = {r["id"]: r["group"] for r in p["rows"]}
-        # intention-004 is the fixture's legacy note: shown in the Tray (the Keep is gone), undated -> "also"
-        assert by_group == {"intention:intention-003": "today", "intention:intention-002": "overdue", "intention:intention-004": "also"}
+        # intention-004 is the fixture's legacy note: shown in the Tray (the Keep is gone), undated -> "also"; intention-001
+        # is a key-absent row (the old plain loop): it reads someday and sits in the Someday group
+        assert by_group == {"intention:intention-003": "today", "intention:intention-002": "overdue", "intention:intention-004": "also",
+                            "intention:intention-001": "someday"}
         assert [g["id"] for g in p["groups"]] == ["band", "desk", "later", "overdue", "today", "board", "talk", "also", "someday", "done", "kept"]   # THE LIST's groups
-        assert [r["group"] for r in p["rows"]] == ["overdue", "today", "also"]  # group order leads
-        assert all(r["band"] == "now" for r in p["rows"] if r["group"] != "also")
+        assert [r["group"] for r in p["rows"]] == ["overdue", "today", "also", "someday"]  # group order leads
+        assert all(r["band"] == "now" for r in p["rows"] if r["group"] not in ("also", "someday"))
 
     def test_overdue_is_ordered_most_overdue_first_and_providers_do_not_sort(self) -> None:
         ck = Cockpit()
@@ -578,7 +580,7 @@ class TestOrderingAndGroups:
         IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").add(type="task", text="later", disposition="seed", next="2999-01-01")
         p = ck.panel("tray")
         assert p["status"] == "ok" and p["filtered"] == []                      # a future date is the Later group, not a filtered row
-        assert p["count"] == 3 and [r["group"] for r in p["rows"]].count("later") == 1
+        assert p["count"] == 4 and [r["group"] for r in p["rows"]].count("later") == 1
 
 
 # --- the JobStore list -----------------------------------------------------------------------------
@@ -798,12 +800,13 @@ class TestL3R1Fixes:
 
     def test_exactly_the_cap_is_not_reported_as_truncated(self, env, monkeypatch) -> None:
         import levain.cockpit.providers as prov
-        monkeypatch.setattr(prov, "INTENTION_CAP", 3)
         _r, _s, ck = env
-        got = ck.panel("loops")   # one loop, cap 3
-        assert got["status"] == "ok" and got["skipped"] == []
+        n = len(ck.panel("tray")["rows"])
+        monkeypatch.setattr(prov, "INTENTION_CAP", n)
+        got = ck.panel("tray")   # the List's intention rows, exactly the cap
+        assert got["status"] == "ok" and got["skipped"] == [] and len(got["rows"]) == n
         monkeypatch.setattr(prov, "INTENTION_CAP", 0)
-        assert ck.panel("loops")["skipped"]
+        assert ck.panel("tray")["skipped"]
 
 
 # --- L3 round 2 fixes -----------------------------------------------------------------------------
@@ -1090,7 +1093,7 @@ class TestSession2Gaps:
         _r, _s, ck = env
         heads = ck.manifest(NONE_CRED)["panels"]
         assert {k: v["edit_class"] for k, v in heads.items() if not k.startswith(("section:", "config:"))} == {
-            "state": None, "begin": "C", "tray": "B", "loops": "B",
+            "state": None, "begin": "C", "tray": "B",
             "episodes": "B", "edits": None, "jobs": None, "health": "C", "graph": "C",
             "crystals": "C", "wraps": "C", "team-status": None, "sessions": None,
             "activity": "C", "memory_glance": "C", "doctor": "C", "topology": "C",

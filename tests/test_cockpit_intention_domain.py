@@ -52,7 +52,7 @@ def test_a_cockpit_domain_edit_lands_and_with_text_and_disposition_labels_the_ro
 
 def test_the_legacy_intention_update_refuses_a_domain_rather_than_dropping_it(rig_broker) -> None:
     rig, _b, _db = rig_broker
-    row = next(r for p in ("tray", "loops") for r in (rig.ck.panel(p)["rows"] or []))
+    row = next(r for p in ("tray",) for r in (rig.ck.panel(p)["rows"] or []))
     sid = row["id"].split(":", 1)[1]
     store = IntentionStore(rig.root / ".levain" / "memory.spores.json", id_prefix="intention")
     before = store.get(sid)
@@ -64,7 +64,7 @@ def test_the_legacy_intention_update_refuses_a_domain_rather_than_dropping_it(ri
 
 def _keep_row(rig):
     # a legacy note (shown in the Tray since the Keep left) or a loop: a row whose type is not Tray-plastic
-    return next((p, r) for p in ("tray", "loops") for r in (rig.ck.panel(p)["rows"] or [])
+    return next((p, r) for p in ("tray",) for r in (rig.ck.panel(p)["rows"] or [])
                 if r["facets"]["disposition"] != "seed")
 
 

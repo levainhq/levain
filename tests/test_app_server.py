@@ -65,13 +65,14 @@ class TestRenderSummary:
         s = render_summary(build_substrate_view(AnnealPaths.from_db(db)))
         assert "no wraps yet" in s and "DARK" not in s
         assert "Crystallized patterns: 0" in s
-        assert "Open loops: 0" in s
+        assert "Open loops" not in s
 
     def test_live_write_path_and_headlines(self, tmp_path: Path) -> None:
         s = render_summary(build_substrate_view(_store_with_data(tmp_path)))
         assert "LIVE" in s
         assert "Hebbian" not in s
-        assert "Open loops: 1" in s
+        assert "Open loops" not in s
+        assert "Tray (operator inbox): 1" in s            # the intention is a Tray row since the loop fold
         # the entity's own State headline surfaces, not the whole dump
         assert "current state line" in s
         assert "Active Threads:" in s
@@ -202,7 +203,7 @@ class TestBuildApp:
                     "sections", "errors"):
             assert key in sc
         assert sc["health"]["total_episodes"] == 2
-        assert len(sc["open_intentions"]) == 1
+        assert sc["open_intentions"] == [] and len(sc["tray"]) == 1      # the field stays, empty; the row is the Tray's
 
         # _meta points the host at the resource for hydration — both wire forms
         assert result.meta is not None

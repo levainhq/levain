@@ -33,9 +33,9 @@ def _rendered(rig: Any, verb: str, panel: str, key: str, params: dict[str, Any],
 
 def test_a_intention_moved_after_render_reads_stale_on_every_route(rig_broker) -> None:
     rig, b, _db = rig_broker
-    ascend = _rendered(rig, "intention_promote", "loops", "loop", {"intention_kind": "project", "ref": "x"}, "o5-1")
+    ascend = _rendered(rig, "intention_promote", "tray", "loop", {"intention_kind": "project", "ref": "x"}, "o5-1")
     retype = _rendered(rig, "intention_update", "tray", "seed", {"type": "question"}, "o5-2")
-    rig.store.update(rig.ids["loop"], disposition="note")      # the loop became a Keep note
+    rig.store.update(rig.ids["loop"], disposition="note")      # the key-absent row became a Keep note
     rig.store.update(rig.ids["seed"], disposition=None)        # the seed left the Tray
     assert _code(rig, b, ascend, "cockpit") == "stale"
     assert _code(rig, b, retype, "cockpit") == "stale"

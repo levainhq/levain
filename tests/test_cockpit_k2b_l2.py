@@ -1,5 +1,5 @@
 """K2b-3b L2 findings, each from a reproduced failure (L2 probes, 1011+20): the render key and the
-store agree on a plain loop's disposition; a ``fire:`` edits row carries no label; an unknown install
+store agree on a key-absent row's disposition; a ``fire:`` edits row carries no label; an unknown install
 class never labels ``verified``."""
 
 from __future__ import annotations
@@ -19,15 +19,10 @@ def _intentions(rig):
     return IntentionStore(rig.root / ".levain" / "memory.spores.json", id_prefix="intention")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "needs loop fold S2: levain/cockpit/providers.py intention_label_key hashes the view's disposition, which "
-    "reads someday for a key-absent row since the fold, while the store holds none; S2 hashes the RAW stored "
-    "value (design 2c). Until then the label of such a row reads unverified (the safe direction). Remove this "
-    "mark in S2."))
 def test_a_key_absent_rows_label_key_hashes_what_the_store_holds(rig_broker) -> None:
     # reproduced: the view named a plain loop's absent disposition "loop" and the store holds None, so
-    # no fire could ever label an Open Loops row. Since the loop fold that row is a Tray row (the loops panel
-    # holds none), reading someday, and the key must still hash what the store holds
+    # no fire could ever label an Open Loops row. Since the loop fold that row is a List row, reading someday,
+    # and the key must still hash what the store holds (none), never the rendered default
     rig, _b, _db = rig_broker
     rig.ck.panel("tray")
     keys = rig.ck._state["tray"].snap.label_keys
@@ -40,6 +35,9 @@ def test_a_key_absent_rows_label_key_hashes_what_the_store_holds(rig_broker) -> 
         assert dict(key.values) == {f: _stored_authority(raw, f) for f in INTENTION_AUTHORITY_FIELDS}
         checked += 1
     assert checked
+    # at least one key-absent row was checked, or the test would pass over explicit dispositions alone
+    assert any(_intentions(rig).get(r.split(":", 1)[1]).get("disposition") is None
+               for r, k in keys.items() if k is not None)
 
 
 def test_a_fire_edits_row_carries_no_label_and_the_resource_row_tracks_the_store(rig_broker) -> None:
@@ -47,7 +45,7 @@ def test_a_fire_edits_row_carries_no_label_and_the_resource_row_tracks_the_store
     rig, b, _db = rig_broker
     rig.ck.attach_labeller(b.labels)
     rig.ck.attach_edits_reader(b.edits)
-    pid, row = next((p, r) for p in ("loops", "tray", "keep") for r in (rig.ck.panel(p)["rows"] or []))
+    pid, row = next((p, r) for p in ("tray",) for r in (rig.ck.panel(p)["rows"] or []))
     req = {"verb": "intention_update", "panel_id": pid, "row_id": row["id"], "row_version": row["version"],
            "params": {"text": "fired text"}, "intent": "reported", "idempotency_key": "l2-1", "confirm": True,
            "tier_seen": "T2", "gesture_seen": "direct-reported"}

@@ -117,7 +117,7 @@ def test_the_transport_is_in_the_manifest_etag(rig) -> None:
 def test_a_resolve_row_action_names_the_kinds_its_rows_type_takes(rig) -> None:
     from anneal_memory.spores import ASCEND_BY_TYPE, DESCEND_BY_TYPE
 
-    rows = rig.ck.panel("loops", credential_class="token")["rows"]
+    rows = rig.ck.panel("tray", credential_class="token")["rows"]
     seen = set()
     for row in rows:
         stype = row["facets"]["intention_type"]

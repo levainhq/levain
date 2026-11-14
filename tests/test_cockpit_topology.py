@@ -294,8 +294,9 @@ def test_stalled_is_silence_and_unattached_work_is_never_a_guessed_task(tmp_path
     # every cost is "not tracked" on this branch, never a guess
     assert all(t["cost"] == {"usd": None, "tokens": None, "source": None} for t in v["tasks"])
     assert v["conflicts"] == [] and v["counts"]["tokens_today"] is None and v["counts"]["tokens_read"] == 0   # no transcript on this install: unknown, named
-    # the open loop from the install is a task
-    assert any(t["kind"] == "intention" and t["label"] == "a loop" for t in v["tasks"])
+    # the install's key-absent intention is a List row since the loop fold, not a task: the kernel hands the topology no intention source
+    assert not any(t["kind"] == "intention" for t in v["tasks"])
+    assert "intentions" not in v["unreadable"]
     assert {g["label"] for g in v["groups"] if g["id"].startswith("dir:")} >= {"wait", "stall"}
     wire = json.dumps(v)
     assert "SECRET-WORDS" not in wire and "rm -rf" not in wire and "SECRET-LOG-WORDS" not in wire
@@ -691,6 +692,16 @@ def test_detached_and_unborn_heads_read_as_the_real_repository_has_them(tmp_path
     common, gitdir, top = act.find_worktree(str(fresh), str(tmp_path))[0]
     assert act.git_worktree_state(common, gitdir, top, 3.0) == \
         {"dirty": 1, "dirty_names": ["n.txt"], "branch": None, "unpushed": 0}
+
+
+def test_the_kept_intention_helper_is_importable_and_the_kernel_hands_the_reader_no_source(tmp_path, monkeypatch):
+    # kept for embedders until flow F3 stops calling it: pure, importable, still bounded
+    from levain.cockpit.topology import INTENTIONS_MAX, _intention_tasks    # noqa: F401
+
+    assert INTENTIONS_MAX == 20 and callable(_intention_tasks)
+    ck, _root, _src, _cdir, _work = _rig(tmp_path, monkeypatch)
+    v = ck.panel("topology", credential_class="none")["value"]
+    assert [t for t in v["tasks"] if t["kind"] == "intention"] == [] and "intentions" not in v["unreadable"]
 
 
 def test_an_open_loop_is_running_only_with_a_worker_never_by_recent_touch():
