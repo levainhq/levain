@@ -214,9 +214,9 @@ class TestCredentialAndTiers:
         """'no T2 or T3 ever fires from the POST handler (before K2b lands they are refused with
         "needs the broker")'"""
         before = rig.store.get(rig.ids["loop"])
-        cases = [("intention_set_disposition", "loops", "loop", {"disposition": "agenda"}),
-                 ("intention_promote", "loops", "loop", {"intention_kind": "x", "ref": "r"}),
-                 ("intention_update", "loops", "loop", {"text": "new"}),
+        cases = [("intention_set_disposition", "tray", "loop", {"disposition": "agenda"}),
+                 ("intention_promote", "tray", "loop", {"intention_kind": "x", "ref": "r"}),
+                 ("intention_update", "tray", "loop", {"text": "new"}),
                  ("intention_seed", "tray", None, {"text": "planted"})]
         for verb, panel, key, params in cases:
             e = _refused("needs_broker", rig.post, verb, panel, key, params, confirm=True, intent="reported",
@@ -271,7 +271,7 @@ class TestCredentialAndTiers:
     def test_dry_run_returns_tier_and_gesture_and_writes_nothing(self, rig: Rig) -> None:
         """'a dry_run POST returns the tier and gesture and creates no pending'"""
         before = rig.intention("loop")
-        out = rig.post("intention_update", "loops", "loop", {"text": "x"}, dry_run=True)
+        out = rig.post("intention_update", "tray", "loop", {"text": "x"}, dry_run=True)
         assert (out["tier"], out["gesture"], out["dry_run"]) == ("T2", "direct-reported", True)
         assert rig.intention("loop") == before
         assert not (rig.root / ".levain" / "edits.jsonl").exists() or "intention_update" not in \
@@ -344,7 +344,7 @@ class TestBinding:
     def test_a_verb_on_a_panel_that_does_not_offer_it_is_refused(self, rig: Rig) -> None:
         """'a verb on a panel that does not offer it → refused'"""
         _refused("not_offered", rig.post, "intention_touch", "episodes")
-        _refused("not_offered", rig.post, "intention_seed", "loops", None, {"text": "x"})
+        _refused("not_offered", rig.post, "intention_seed", "episodes", None, {"text": "x"})
 
     def test_removing_a_panel_removes_its_verb(self, rig: Rig) -> None:
         """'removing a panel removes its verb (404)'"""
@@ -363,14 +363,14 @@ class TestBinding:
 class TestTierLadder:
     def test_every_row_provenance_is_null(self, rig: Rig) -> None:
         """'every row's provenance is null (no label is claimed before K2b's journal exists)'"""
-        for pid in ("tray", "loops", "episodes", "edits"):
+        for pid in ("tray", "episodes", "edits"):
             for r in (rig.ck.panel(pid, credential_class="token") or {}).get("rows") or []:
                 assert r["provenance"] is None
 
     def test_update_carrying_tier_and_text_reports_t2(self, rig: Rig) -> None:
         """'an intention_update carrying tier and text reports T2'"""
-        assert rig.tier("intention_update", "loops", "loop", {"tier": "warm", "text": "x"}) == "T2"
-        assert rig.tier("intention_update", "loops", "loop", {"tier": "warm"}) == "C1"
+        assert rig.tier("intention_update", "tray", "loop", {"tier": "warm", "text": "x"}) == "T2"
+        assert rig.tier("intention_update", "tray", "loop", {"tier": "warm"}) == "C1"
 
     def test_on_an_unverified_tray_row_a_later_snooze_and_a_retier_fire_as_c1(self, rig: Rig) -> None:
         """'on an UNVERIFIED Tray row a later-dated snooze and a re-tier fire as C1 (RULED Q4)'"""
@@ -408,23 +408,23 @@ class TestTierLadder:
 
     def test_set_disposition_reports_t2_for_every_target_on_every_row(self, rig: Rig) -> None:
         """'intention_set_disposition reports T2 for every target on every row'"""
-        for key, panel in (("seed", "tray"), ("held", "tray"), ("loop", "loops"), ("note", "tray"), ("parked", "loops")):
+        for key, panel in (("seed", "tray"), ("held", "tray"), ("loop", "tray"), ("note", "tray"), ("parked", "tray")):
             for target in ("seed", "handoff", "agenda", "note", "loop"):
                 assert rig.tier("intention_set_disposition", panel, key, {"disposition": target}) == "T2"
 
     def test_a_retier_of_an_unverified_parked_loop_to_hot_reports_t2(self, rig: Rig) -> None:
         """'a re-tier of an unverified parked loop to hot reports T2'"""
-        panel = "loops"
-        assert f"intention:{rig.ids['parked']}" in rig.panel_ids("loops")   # a parked loop is an Open loops row
+        panel = "tray"
+        assert f"intention:{rig.ids['parked']}" in rig.panel_ids("tray")   # a parked row is a List row
         r = rig.ck.read_one(panel, f"intention:{rig.ids['parked']}")
         assert r.value["facets"]["tier"] == "parked"
         assert rig.tier("intention_update", panel, "parked", {"tier": "hot"}) == "T2"
-        assert rig.tier("intention_update", "loops", "loop", {"tier": "parked"}) == "T2"
+        assert rig.tier("intention_update", "tray", "loop", {"tier": "parked"}) == "T2"
 
     def test_salience_and_free_text_descend_fields_are_refused(self, rig: Rig) -> None:
         """'an intention_update carrying salience → refused'; 'a intention_close carrying a free-text field → refused'"""
-        _refused("field_not_allowed", rig.post, "intention_update", "loops", "loop", {"salience": 9})
-        _refused("field_not_allowed", rig.post, "intention_close", "loops", "loop",
+        _refused("field_not_allowed", rig.post, "intention_update", "tray", "loop", {"salience": 9})
+        _refused("field_not_allowed", rig.post, "intention_close", "tray", "loop",
                  {"intention_kind": "x", "note": "free text"}, confirm=True)
 
     def test_an_escalating_snooze_without_intent_is_refused_needs_intent(self, rig: Rig) -> None:
@@ -463,10 +463,10 @@ class TestRenderedActions:
 
     def test_past_midnight_a_passed_held_date_changes_the_etag_and_the_snooze_tier(self, rig: Rig) -> None:
         """'past midnight, a row whose held date passed returns a new panel etag and the snooze's new tier'"""
-        before = rig.ck.panel("loops", credential_class="token")["etag"]
+        before = rig.ck.panel("tray", credential_class="token")["etag"]
         assert rig.tier("intention_surface_at", "tray", "held", {"surface_at": None}) == "T2"
         rig.clock.advance(6)    # the held date (TODAY+5) has passed
-        assert rig.ck.panel("loops", credential_class="token")["etag"] != before
+        assert rig.ck.panel("tray", credential_class="token")["etag"] != before
         assert rig.tier("intention_surface_at", "tray", "held", {"surface_at": None}) == "C1"
 
     def test_a_policy_change_changes_the_panel_etag_with_rows_unchanged(self, rig: Rig) -> None:
@@ -527,10 +527,10 @@ class TestRound1:
         seen: list[dict] = []
         real = v.apply_edit
         monkeypatch.setattr(v, "apply_edit", lambda scope, req, **kw: seen.append({**req, **kw}) or real(scope, req, **kw))
-        rig_row_version = rig.row("loops", "loop")["version"]
+        rig_row_version = rig.row("tray", "loop")["version"]
         rig.edit({"kind": "intention_close", "intention_id": rig.ids["loop"], "intention_kind": "dropped", "confirm": True,
-                  "expect_disposition": None})        # the rendered snapshot, compared normalised (loop = null)
-        assert seen and seen[0]["expect_disposition"] == "loop"   # the row's own, normalised by the handler
+                  "expect_disposition": None})        # a key-absent row's snapshot, compared normalised (null = someday)
+        assert seen and seen[0]["expect_disposition"] == "someday"   # the row's own, normalised by the handler
         assert seen[0]["expected_version"] == rig_row_version          # and its version (S2)
 
     def test_operator_state_source_comes_from_the_credential(self, rig: Rig) -> None:
@@ -554,8 +554,8 @@ class TestRound1:
     def test_intention_update_refuses_fields_its_handler_cannot_write(self, rig: Rig) -> None:
         """L1 M3 / L2 L1: next and domain were allowlisted and silently dropped. domain is now a field
         (Phill 10-11): always T2, so with no broker it refuses rather than reach the legacy write."""
-        _refused("field_not_allowed", rig.post, "intention_update", "loops", "loop", {"tier": "warm", "next": "2030-01-01"})
-        _refused("needs_broker", rig.post, "intention_update", "loops", "loop", {"tier": "warm", "domain": "x"},
+        _refused("field_not_allowed", rig.post, "intention_update", "tray", "loop", {"tier": "warm", "next": "2030-01-01"})
+        _refused("needs_broker", rig.post, "intention_update", "tray", "loop", {"tier": "warm", "domain": "x"},
                  intent="reported", confirm=True, idempotency_key="dom", tier_seen="T2", gesture_seen="direct-reported")
         assert rig.intention("loop").get("domain") != "x"
 
@@ -762,13 +762,13 @@ class TestL1Round2:
         """complement #6 (r1): WRITE_READ_CAP was global, so one hung source starved every write."""
         import levain.cockpit.engine as eng
         gate = threading.Event()
-        spec = rig.ck.spec("tray")
+        spec = rig.ck.spec("episodes")
         monkeypatch.setattr(spec, "read_one", lambda ctx, rid: (gate.wait(5), Absent("x"))[1])
         monkeypatch.setattr(spec, "timeout_s", 0.05)
-        outs = [rig.ck.read_one("tray", "intention:x") for _ in range(eng.WRITE_READ_CAP + 1)]
+        outs = [rig.ck.read_one("episodes", "episode:x") for _ in range(eng.WRITE_READ_CAP + 1)]
         try:
-            assert "reads of panel 'tray' are still running" in outs[-1].message
-            assert rig.tier("intention_touch", "loops", "loop") == "C1"      # another source still reads
+            assert "reads of panel 'episodes' are still running" in outs[-1].message
+            assert rig.tier("intention_touch", "tray", "loop") == "C1"      # another source still reads
         finally:
             gate.set()
 
@@ -942,9 +942,9 @@ class TestL3Round2:
 class TestIntentionCas:
     @pytest.mark.parametrize("verb,panel,key,params,env", [
         ("intention_touch", "tray", "seed", {}, {}),
-        ("intention_surface_at", "loops", "loop", {"surface_at": "2030-01-01"}, {}),
-        ("intention_update", "loops", "loop", {"tier": "warm"}, {}),
-        ("intention_close", "loops", "loop", {"intention_kind": "dropped"}, {"confirm": True}),
+        ("intention_surface_at", "tray", "loop", {"surface_at": "2030-01-01"}, {}),
+        ("intention_update", "tray", "loop", {"tier": "warm"}, {}),
+        ("intention_close", "tray", "loop", {"intention_kind": "dropped"}, {"confirm": True}),
     ])
     def test_a_write_landing_between_read_one_and_the_fire_is_409_on_every_c1_intention_verb(
             self, rig: Rig, monkeypatch, verb: str, panel: str, key: str, params: dict, env: dict) -> None:
@@ -973,7 +973,7 @@ class TestIntentionCas:
         odd.pop("next", None)
         data["intentions"].append(odd)
         p.write_text(json.dumps(data))
-        rows = {r["id"]: r for pid in ("tray", "loops")
+        rows = {r["id"]: r for pid in ("tray",)
                 for r in (rig.ck.panel(pid, credential_class="token") or {}).get("rows") or []}
         stored = {sp["id"]: sp for sp in json.loads(p.read_text())["intentions"]}
         assert set(rows) == {f"intention:{i}" for i in stored}   # a later row is in view too
@@ -1001,7 +1001,7 @@ class TestIntentionCas:
     def test_the_t2_intention_writes_are_guarded_too(self, rig: Rig, req: dict) -> None:
         """The broker (K2b) fires these; the guard is already on their store call (L1 #5)."""
         from levain.writes import apply_edit
-        v = rig.row("loops", "loop")["version"]
+        v = rig.row("tray", "loop")["version"]
         rig.store.update(rig.ids["loop"], text="moved on")
         e = _refused("stale", apply_edit, rig.src.write_scope, {**req, "intention_id": rig.ids["loop"]}, expected_version=v)
         assert e.http_status == 409 and rig.intention("loop")["text"] == "moved on"
@@ -1132,3 +1132,33 @@ class TestL3Round5:
             assert _time.monotonic() - t0 < 2
         finally:
             os.close(fd)
+
+
+# --- the loop fold (levain#4): the Open loops panel is gone, its rows are List rows ------------------------------
+
+
+class TestLoopFold:
+    def test_the_manifest_has_no_loops_panel_and_the_panel_url_answers_404(self, tmp_path: Path) -> None:
+        _root, src, _ids = _install(tmp_path)
+        with _serve(src, write_token=TOKEN) as (base, _h):
+            assert "loops" not in _get(f"{base}/cockpit/manifest.json", TOKEN)["panels"]
+            with pytest.raises(urllib.error.HTTPError) as ei:
+                _get(f"{base}/cockpit/panel/loops.json", TOKEN)
+            assert ei.value.code == 404 and json.loads(ei.value.read())["error"] == "not_found"
+            assert _get(f"{base}/cockpit/panel/tray.json", TOKEN)["rows"]       # the List is where the rows went
+
+    def test_the_loops_ordering_id_still_resolves_for_a_downstream_manifest(self, rig: Rig) -> None:
+        from levain.cockpit.registry import ORDERINGS
+        assert "intention.loops" in ORDERINGS
+        rig.ck.register(ProviderSpec(
+            id="ext:aged", kind="triage-list", title="x", priority="feed", read=lambda c: Read(rows=()), order="intention.loops",
+            facets=frozenset({"tier"}), version_fields=("id",)))
+        assert rig.ck.panel("ext:aged")["status"] in ("ok", "empty")
+
+    def test_a_parked_row_is_on_the_list_and_survives_a_full_view_cap(self, rig: Rig, monkeypatch) -> None:
+        import levain.cockpit.providers as prov
+        for i in range(8):
+            rig.store.add(type="task", text=f"live {i}", tier="hot", disposition="someday", today=TODAY)
+        monkeypatch.setattr(prov, "VIEW_INTENTION_LIMIT", 6)
+        ids = {r["id"] for r in rig.ck.panel("tray", credential_class="token")["rows"]}
+        assert f"intention:{rig.ids['parked']}" in ids         # parked ranks last: a shared cap would have dropped it

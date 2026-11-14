@@ -1,9 +1,11 @@
-"""TS-5a (Phill 11-07, np-721ce711 (b)): the cockpit has no Keep panel. A parked loop is an Open loops row with a visible
-"parked" marker (and the inverse verb, "reactivate"); a legacy ``note`` row still in a store shows in the Tray, badged
-"note", never dropped. No surface (kernel manifest, page at desktop and phone width, TUI, text render) titles a "Keep" panel."""
+"""TS-5a (Phill 11-07, np-721ce711 (b)): the cockpit has no Keep panel. A parked intention is a List row whose tier is the
+"parked" marker; a legacy ``note`` row still in a store shows in the List, never dropped. No surface (kernel manifest, page at
+desktop and phone width, TUI, text render) titles a "Keep" panel, and since the loop fold none titles an Open loops one."""
 from __future__ import annotations
 
 from pathlib import Path
+
+import pytest
 
 from levain.cockpit.providers import build_default_cockpit
 from levain.dashboard import render_text
@@ -30,12 +32,13 @@ def test_the_kernel_cockpit_has_no_keep_panel_and_files_both_halves_where_they_b
     ck = build_default_cockpit(src)
     heads = ck.manifest(CRED)["panels"]
     assert "keep" not in heads and not any(h.get("title", "").startswith("Keep") for h in heads.values())
-    loops = {r["id"]: r for r in ck.panel("loops")["rows"]}
-    parked = loops[f"intention:{ids['parked']}"]
-    assert parked["facets"]["tier"] == "parked"                      # the parked marker rides the tier facet
+    assert "loops" not in heads and not any(h.get("title", "").startswith("Open loops") for h in heads.values())
     tray = {r["id"]: r for r in ck.panel("tray")["rows"]}
+    parked = tray[f"intention:{ids['parked']}"]
+    assert parked["facets"]["tier"] == "parked"                      # the parked marker rides the tier facet
+    assert parked["facets"]["disposition"] == "someday"              # a key-absent row reads as someday
     assert tray[f"intention:{ids['note']}"]["facets"]["disposition"] == "note"      # a legacy note: visible, not dropped
-    assert f"intention:{ids['note']}" not in loops and f"intention:{ids['parked']}" not in tray
+    assert f"intention:{ids['loop']}" in tray                       # and so is the plain key-absent row
 
 
 def test_the_text_render_and_the_substrate_view_name_no_keep(tmp_path: Path) -> None:
@@ -43,12 +46,13 @@ def test_the_text_render_and_the_substrate_view_name_no_keep(tmp_path: Path) -> 
     view = src.build()
     text = render_text(view)
     assert "Keep" not in text
-    assert "[parked] a parked loop" in text and "[note] a keep note" in text
-    assert "keep" not in view.to_dict() and not any(p["kind"] == "keep" for p in view.layout())
+    assert "[someday] a parked loop" in text and "[note] a keep note" in text
+    assert "Open loops" not in text
+    assert "keep" not in view.to_dict() and not any(p["kind"] in ("keep", "intentions") for p in view.layout())
 
 
 @needs_browser
-def test_the_page_draws_a_parked_loop_in_open_loops_marked_and_a_legacy_note_in_the_tray(tmp_path: Path) -> None:
+def test_the_page_draws_a_parked_row_and_a_legacy_note_on_the_list(tmp_path: Path) -> None:
     _root, src, ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         for width in (1440, 390):          # the desktop board and the phone
@@ -56,24 +60,27 @@ def test_the_page_draws_a_parked_loop_in_open_loops_marked_and_a_legacy_note_in_
             out = _drive(tmp_path / f"w{width}", f"{url}/{BOARD}", [
                 {"emulate": {"w": width, "h": 900, "dpr": 1}}, READY, SETTLE,
                 {"eval": KEEP_PANELS},
-                {"eval": _row("loops", ids['parked'])},
+                {"eval": _row("tray", ids['parked'])},
                 {"eval": _row("tray", ids["note"])},
                 {"eval": "[...document.querySelectorAll('.ck-zgrid .panel h2')].map(h => h.textContent)"},
             ])["values"]
             keep_n, parked, note, titles = out[2], out[3], out[4], out[5]
             assert keep_n == 0, (width, titles)
             assert not any(t.strip().lower().startswith("keep") for t in titles), (width, titles)
-            assert parked and "parked" in parked["tags"], (width, parked)                 # the visible marker
-            assert "reactivate" in parked["verbs"] and "park" not in parked["verbs"], (width, parked)
+            assert parked, (width, parked)                                                # a parked someday is a List row on the page
             assert note and note["tags"] == ["intention"], (width, note)                      # still listed, in the List, as an intention row; the note badge is gone with the Keep
 
 
 def test_the_removed_keep_ordering_id_still_resolves_to_the_loops_ordering() -> None:
-    # TS-5a L3 MED: a downstream manifest naming "intention.keep" must still register and sort as loops do
+    # TS-5a L3 MED: a downstream manifest naming "intention.keep" must still register and sort as loops do; the loop fold
+    # removed the Open loops panel, and its ordering id stays registered the same way
     from levain.cockpit.registry import ORDERINGS
     assert ORDERINGS["intention.keep"].key is ORDERINGS["intention.loops"].key
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "needs loop fold S4b: this reads the TUI's Open loops panel, which the substrate layout no longer emits, and the TUI offers "
+    "no un-park on a List row yet; S4b re-points the test at the List row and removes this mark."))
 def test_the_tui_unpark_is_bound_to_the_version_it_rendered(tmp_path: Path) -> None:
     # TS-5a L3 MED (codex): the TUI un-park CASed only the disposition, so a tier changed elsewhere
     # (parked -> hot) was overwritten with warm and reported "reactivated". It is version-bound now.

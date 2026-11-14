@@ -612,7 +612,7 @@ class TestTheDashboardPageFromTheManifest:
             httpd.shutdown()
             httpd.server_close()
             t.join(timeout=5)
-        assert "Open loops" in dom and "loop one" in dom
+        assert "Open loops" not in dom and "loop one" in dom           # the intention is a Tray row since the loop fold
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
