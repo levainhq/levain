@@ -1069,7 +1069,7 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              # nothing could mark it done
              applies_to=lambda r: (_PLAIN_INTENTION_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() == "agenda"
                                    and not _machine_part(r))),
-    VerbSpec("intention_set_disposition", "move", "moves the item to another list (Tray, loops)", "row",
+    VerbSpec("intention_set_disposition", "move", "moves the item between someday and agenda", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
              fire=_plain_intention_fire("intention_set_disposition"), legacy_kind="intention_set_disposition", device_ok=True,
              applies_to=_PLAIN_INTENTION_ROW),
@@ -1813,7 +1813,7 @@ def _require_confirm(verb: VerbSpec, req: dict[str, Any]) -> None:
         raise _refuse("confirm_required", 409, f"{verb.name!r} requires confirm:true")
 
 
-_ROW_KEYS = {"intention_id": ("intention:", ("tray", "loops")), "edit_id": ("edit:", ("edits",)),
+_ROW_KEYS = {"intention_id": ("intention:", ("tray",)), "edit_id": ("edit:", ("edits",)),
              "episode_id": ("episode:", ("episodes",))}
 
 
