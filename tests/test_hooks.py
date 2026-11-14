@@ -8,6 +8,8 @@ import inspect
 import sys
 from pathlib import Path
 
+import pytest
+
 _HOOKS = (
     Path(__file__).resolve().parents[1]
     / "levain" / "templates" / "activation" / "hooks"
@@ -49,76 +51,98 @@ def _intention(**kw):
     return base
 
 
-class TestTokens:
-    def test_drops_stopwords_and_short_tokens(self):
-        # "the"/"are" are stopwords; "ok" is < 3 chars — only api/keys survive.
-        assert hook._tokens("the API keys are ok") == {"api", "keys"}
-
-    def test_lowercases(self):
-        assert "restrict" in hook._tokens("Restrict the Keys")
-
-
-class TestIntentionsColliding:
-    def test_collides_on_two_shared_tokens(self):
-        s = _intention(text="restrict the api keys", id="intention-007")
-        hits = hook.intentions_colliding("can we restrict the api keys now", [s])
-        assert len(hits) == 1 and hits[0]["id"] == "intention-007"
-
-    def test_below_threshold_no_match(self):
-        # Only "keys" overlaps (1) — below the 2-token precision floor.
-        s = _intention(text="restrict the api keys")
-        assert hook.intentions_colliding("where are my house keys", [s]) == []
-
-    def test_empty_prompt(self):
-        assert hook.intentions_colliding("", [_intention(text="restrict api keys")]) == []
-
-    def test_ranks_by_overlap_and_caps(self):
-        intentions = [
-            _intention(id="a", text="restrict api keys vault"),     # 4 overlap
-            _intention(id="b", text="restrict api"),                # 2 overlap
-            _intention(id="c", text="rotate api keys vault token"), # 4 overlap
-            _intention(id="d", text="unrelated grocery list"),      # 0
-        ]
-        hits = hook.intentions_colliding(
-            "restrict rotate the api keys vault", intentions, limit=2
-        )
-        assert {h["id"] for h in hits} == {"a", "c"}  # the two highest-overlap
-
-    def test_skips_non_str_text(self):
-        assert hook.intentions_colliding("api keys", [_intention(text=None)]) == []
+# The loop fold (board item levain#4; Phill np-c3029a8a (a)): both intention arms are RETIRED in both adapters, the per-prompt
+# collision arm and the session-start dormant arm. The classes that tested their matchers, tokenizer and formatters
+# (TestTokens, TestIntentionsColliding, TestDueDormant, TestFormatting, and the two tokenizer pins below them) are replaced
+# by the tests of the retirement, which also pin what must NOT go: crystal recall (the collision feature) and open_agendas.
+_RETIRED_HOOK_NAMES = (
+    "open_intentions", "intentions_colliding", "due_dormant_intentions", "format_intention_collisions",
+    "format_due_intentions", "_format_intention_lines", "_tokens", "_STOPWORDS", "_WORD_RE",
+)
 
 
-class TestDueDormant:
-    def test_only_dormant(self):
-        intentions = [
-            _intention(id="a", germination="dormant"),
-            _intention(id="b", germination="growing"),
-            _intention(id="c", germination="resting"),
-            _intention(id="d", germination="parked"),
-            _intention(id="e", germination="dormant"),
-        ]
-        assert {s["id"] for s in hook.due_dormant_intentions(intentions)} == {"a", "e"}
+class TestIntentionArmsRetired:
+    def test_the_helpers_are_gone_from_both_adapters(self):
+        for mod, label in ((hook, "claude"), (codex_hook, "codex")):
+            for name in _RETIRED_HOOK_NAMES:
+                assert not hasattr(mod, name), f"{label}: {name} should be retired"
 
-    def test_caps(self):
-        intentions = [_intention(id=str(i), germination="dormant") for i in range(10)]
-        assert len(hook.due_dormant_intentions(intentions, limit=3)) == 3
+    def test_what_stays(self):
+        # crystal recall is the per-prompt collision feature; open_agendas is germinate's unfiltered read; the cap
+        # constant is crystal recall's; _is_loop and the vocab tuple are the drift-contract twins
+        for mod in (hook, codex_hook):
+            for name in ("crystal_recall", "format_crystal_recall", "open_agendas", "due_agendas", "start_germinate",
+                         "_MAX_TOKENIZE_CHARS", "_is_loop", "_NON_COGNITION_DISPOSITIONS"):
+                assert hasattr(mod, name), name
+
+    def test_open_agendas_still_reads_every_row_unfiltered(self, monkeypatch):
+        rows = [_intention(id="a", disposition="agenda"), _intention(id="b"), _intention(id="c", disposition="someday"),
+                _intention(id="d", disposition="note")]
+        for mod in (hook, codex_hook):
+            monkeypatch.setattr(mod, "_anneal_json", lambda *a, **k: rows)
+            assert [s["id"] for s in mod.open_agendas()] == ["a", "b", "c", "d"]
+
+    def test_crystal_recall_caps_the_prompt_it_sends(self, monkeypatch):
+        seen = {}
+
+        def fake(args, timeout, validator=None):
+            seen["args"] = args
+            return []
+
+        for mod in (hook, codex_hook):
+            monkeypatch.setattr(mod, "_anneal_json", fake)
+            mod.crystal_recall("api keys " * 100000)
+            assert len(seen["args"][-1]) == mod._MAX_TOKENIZE_CHARS == 4000
 
 
-class TestFormatting:
-    def test_collisions_format(self):
-        s = _intention(text="restrict api keys", id="intention-007", type="task")
-        out = hook.format_intention_collisions([s])
-        assert "restrict api keys" in out and "intention-007" in out
-        assert "relevant" in out.lower()
+def _prompt_and_start_output(adapter_dir, tmp_path, monkeypatch, capsys, rows):
+    """Drive both entry-point hooks end to end with an anneal that lists ``rows`` (every intention verb of the old arms
+    would have been fed them) and a crystal recall that answers one pattern; return what each hook tells the entity."""
+    import io, json as _json
+    out = {}
+    for script, payload in (("session_start.py", {"source": "startup"}),
+                            ("user_prompt_submit.py", {"prompt": "restrict the api keys now please"})):
+        spec = importlib.util.spec_from_file_location(f"_arms_{adapter_dir.parent.parent.name}_{script}", adapter_dir / script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        install = tmp_path / f"i_{adapter_dir.parent.parent.name}_{script}"
+        (install / "activation").mkdir(parents=True, exist_ok=True)
+        (install / "activation" / "posture.md").write_text("# p\n## Posture\nBE PRESENT.\n", encoding="utf-8")
+        (install / "activation" / "recency_directives.md").write_text("# r\n## Recency\nSTAY SHARP.\n", encoding="utf-8")
+        helper = mod.hook
 
-    def test_due_format_includes_next(self):
-        s = _intention(
-            text="schedule the panel", id="intention-009", type="task",
-            next="2026-06-10",
-        )
-        out = hook.format_due_intentions([s])
-        assert "schedule the panel" in out and "intention-009" in out
-        assert "2026-06-10" in out
+        def fake_json(args, timeout, validator=None, _rows=rows):
+            if args[:2] == ["crystal", "recall"]:
+                return [{"name": "api_key_hygiene", "level": 3, "explanation": "rotate keys"}]
+            if args[:2] == ["intention", "list"]:
+                return _rows
+            return None
+
+        monkeypatch.setattr(helper, "install_root", lambda i=install: i, raising=False)
+        monkeypatch.setattr(helper, "should_fire", lambda: True, raising=False)
+        monkeypatch.setattr(helper, "_anneal_json", fake_json, raising=False)
+        monkeypatch.setattr(helper, "wrap_state", lambda timeout=None: (0, False), raising=False)
+        for opt in ("compat_drift", "pack_drift"):
+            monkeypatch.setattr(helper, opt, lambda *a, **k: None, raising=False)
+        monkeypatch.setattr("sys.stdin", io.StringIO(_json.dumps(payload)))
+        capsys.readouterr()
+        assert mod.main() == 0
+        text = capsys.readouterr().out.strip()
+        out[script] = _json.loads(text)["hookSpecificOutput"]["additionalContext"] if text else ""
+    return out
+
+
+@pytest.mark.parametrize("adapter", ["claude", "codex"])
+def test_no_intention_is_injected_at_session_start_or_per_prompt_but_crystal_recall_still_is(adapter, tmp_path, monkeypatch, capsys):
+    """The dormant arm and the collision arm read the store through ``open_intentions``; with no loop kind they would show
+    nothing, and now they are not there. An open row that collides with the prompt and one that has gone dormant
+    inject NOTHING, and the per-prompt collision feature, crystallized-pattern recall, still does."""
+    rows = [_intention(id="loop1", text="restrict the api keys vault", germination="dormant", next="2026-01-01"),
+            _intention(id="some1", text="restrict the api keys", disposition="someday", germination="dormant")]
+    got = _prompt_and_start_output(TestWrapAdviceRoutingThroughMain.ADAPTERS[adapter], tmp_path, monkeypatch, capsys, rows)
+    for script, text in got.items():
+        assert "[open loops" not in text and "loop1" not in text and "some1" not in text, (script, text[:300])
+    assert "api_key_hygiene" in got["user_prompt_submit.py"]      # crystal recall is the collision feature that stays
 
 
 class TestAnnealJsonRobustness:
@@ -153,53 +177,29 @@ class TestAnnealJsonRobustness:
         assert out == []  # skipped the dict candidate, returned the list one
 
 
-def test_tokens_capped_for_huge_input():
-    # A pathological huge input must not blow up tokenization (MEDIUM).
-    huge = ("api keys " * 100000)
-    toks = hook._tokens(huge)
-    assert "api" in toks and "keys" in toks  # still works, just bounded
+class TestIsLoopTwin:
+    """Slice 3b: the stranger-side cognition predicate, a drift-contract twin of ``levain.intentions.is_loop`` and the
+    embedder's. Since the loop fold it is False for every row (was: True for an absent / ``loop`` / unknown disposition,
+    the complement of the Tray + Keep names); the retired `open_intentions` chokepoint it fed is gone."""
 
-
-def test_generic_work_tokens_dont_false_collide():
-    # Two generic work tokens shared with an unrelated intention are NOT a match.
-    s = _intention(text="review the test file for the parser")
-    assert hook.intentions_colliding("please review the test file i sent", [s]) == []
-
-
-class TestOpenIntentionsTrayExclusion:
-    """Slice 3b: the stranger-side cognition-exclude. open_intentions is the SINGLE chokepoint
-    both germination surfaces (dormant + collision) read; operator-I/O dispositions (Tray
-    inbox + Keep notes) must be filtered OUT so they can't leak into a Levain install's
-    cognition."""
-
-    def test_filters_operator_io_dispositions(self, monkeypatch):
-        rows = [
-            _intention(id="loop1"),                          # no disposition → a loop
-            _intention(id="loop2", disposition="loop"),      # explicit loop
-            _intention(id="seed1", disposition="seed"),
-            _intention(id="handoff1", disposition="handoff"),
-            _intention(id="agenda1", disposition="agenda"),
-            _intention(id="note1", disposition="note"),      # Keep reference — also excluded
-        ]
-        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: rows)
-        assert [s["id"] for s in hook.open_intentions()] == ["loop1", "loop2"]
-
-    def test_unknown_disposition_fails_open_as_a_loop(self, monkeypatch):
-        # a typo'd/unknown disposition is NOT silently dropped (the silent-loss direction)
-        monkeypatch.setattr(hook, "_anneal_json", lambda *a, **k: [_intention(id="x", disposition="bogus")])
-        assert [s["id"] for s in hook.open_intentions()] == ["x"]
+    ROWS = ({}, {"disposition": "loop"}, {"disposition": ""}, {"disposition": None}, {"disposition": "bogus"},
+            {"disposition": "someday"}, {"disposition": "seed"}, {"disposition": "handoff"}, {"disposition": "agenda"},
+            {"disposition": "note"}, {"tier": "parked"})
 
     def test_is_loop_predicate(self):
-        assert hook._is_loop({"disposition": "loop"}) is True
-        assert hook._is_loop({}) is True
-        assert hook._is_loop({"disposition": "seed"}) is False
-        assert hook._is_loop({"disposition": "note"}) is False  # Keep reference excluded
-        assert hook._is_loop({"disposition": ""}) is True  # falsy → loop
+        for mod in (hook, codex_hook):
+            for row in self.ROWS:
+                assert mod._is_loop(row) is False, (mod.__name__, row)
+
+    def test_both_copies_agree_with_levain_is_loop(self):
+        import levain.intentions as lv
+        for row in self.ROWS:
+            assert hook._is_loop(row) is codex_hook._is_loop(row) is lv.is_loop(row) is False
 
     def test_hook_vocab_matches_canonical_levain_intentions(self):
-        # DRIFT GUARD: the standalone hook copy must equal the canonical taxonomy.
+        # DRIFT GUARD: the standalone hook copy must equal the canonical taxonomy (the fold left the tuple as it was).
         import levain.intentions as lv
-        assert hook._NON_COGNITION_DISPOSITIONS == lv.NON_COGNITION_DISPOSITIONS
+        assert hook._NON_COGNITION_DISPOSITIONS == lv.NON_COGNITION_DISPOSITIONS == ("someday", "seed", "handoff", "agenda", "note")
 
 
 class TestCrystalRecall:
@@ -298,11 +298,10 @@ _PORTED_FNS = (
     # in_install_session is NOT here: its BODY is shared but its docstring is
     # adapter-specific by design, so it gets its own body-parity test below.
     "format_wrap_blocked", "_config_dict", "configured_scope",
-    "open_intentions", "_is_loop", "_tokens", "intentions_colliding", "due_dormant_intentions",
+    "_is_loop",
     # the germinate trigger: a dated agenda and one that waits on an event (a split's second part)
     "due_agendas", "_event_due", "_event_fired", "_check_by_late",
     "ring_only_ids", "_germinate_ringed_path", "germinate_ringed", "note_germinate_ringed",
-    "_format_intention_lines", "format_intention_collisions", "format_due_intentions",
     # compatibility-manifest drift surface — byte-identical across both copies
     "read_manifest_lock", "_is_migrate_check", "compat_drift",
     # pack-drift surface — byte-identical across both copies AND vs levain.manifest
@@ -326,9 +325,6 @@ class TestCodexParity:
                 f"{name} drifted between the shared and Codex _levain_hook.py — "
                 f"re-sync the Codex adapter's germination surface."
             )
-
-    def test_tokenizer_constants_match(self):
-        assert codex_hook._STOPWORDS == hook._STOPWORDS
 
     def test_pack_hash_constants_match(self):
         # The pack-hash functions reference this — it must match across both copies
@@ -359,7 +355,6 @@ class TestCodexParity:
         assert not any("__pycache__" in k for k in result)  # derived dir excluded
         assert hook._hash_pack_source(pack) == result
         assert codex_hook._hash_pack_source(pack) == result
-        assert codex_hook._WORD_RE.pattern == hook._WORD_RE.pattern
         assert codex_hook._MAX_TOKENIZE_CHARS == hook._MAX_TOKENIZE_CHARS
 
     def test_tray_disposition_vocab_matches(self):
@@ -388,20 +383,6 @@ class TestCodexParity:
         out = codex_hook.state_notice()
         assert out is not None and out.startswith("[state]")
         assert "shipping the release" in out and "1h ago" in out
-
-    def test_codex_collision_surface_works(self):
-        # Not just identical text — the Codex module actually imports and runs
-        # (guards a codex-only import/typo that source-identity wouldn't catch).
-        s = _intention(text="restrict the api keys", id="intention-007")
-        hits = codex_hook.intentions_colliding("can we restrict the api keys now", [s])
-        assert len(hits) == 1 and hits[0]["id"] == "intention-007"
-
-    def test_codex_due_dormant_surface_works(self):
-        intentions = [
-            _intention(id="a", germination="dormant"),
-            _intention(id="b", germination="growing"),
-        ]
-        assert {s["id"] for s in codex_hook.due_dormant_intentions(intentions)} == {"a"}
 
     def test_codex_crystal_surface_works(self, monkeypatch):
         # the Codex copy actually imports + runs the crystal surface (guards a
@@ -1170,8 +1151,7 @@ class TestPreO42HelperCompat:
             monkeypatch.setattr(helper, "wrap_state",
                                 lambda timeout=None: (31, True), raising=False)
             monkeypatch.delattr(helper, "format_wrap_blocked", raising=False)
-            for opt in ("open_intentions", "due_dormant_intentions", "intentions_colliding",
-                        "crystal_recall", "compat_drift", "pack_drift"):
+            for opt in ("crystal_recall", "compat_drift", "pack_drift"):
                 monkeypatch.setattr(helper, opt, lambda *a, **k: [], raising=False)
 
             payload = {"source": "startup"} if "session" in name else {"prompt": "hi"}
@@ -1313,8 +1293,7 @@ class TestWrapBlockedDoesNotUnderstateTheRisk:
                                 lambda timeout=None: 40, raising=False)
             monkeypatch.delattr(helper, "wrap_state", raising=False)
             monkeypatch.delattr(helper, "format_wrap_blocked", raising=False)
-            for opt in ("open_intentions", "due_dormant_intentions", "intentions_colliding",
-                        "crystal_recall", "compat_drift", "pack_drift"):
+            for opt in ("crystal_recall", "compat_drift", "pack_drift"):
                 monkeypatch.setattr(helper, opt, lambda *a, **k: [], raising=False)
 
             payload = {"source": "startup"} if "session" in name else {"prompt": "hi"}
@@ -1384,8 +1363,7 @@ class TestWrapAdviceRoutingThroughMain:
             lambda *a, **k: {"episodes_since_wrap": episodes,
                              "wrap_in_progress": in_progress},
             raising=False)
-        for opt in ("open_intentions", "due_dormant_intentions", "intentions_colliding",
-                    "crystal_recall", "compat_drift", "pack_drift"):
+        for opt in ("crystal_recall", "compat_drift", "pack_drift"):
             monkeypatch.setattr(helper, opt, lambda *a, **k: [], raising=False)
 
         payload = {"source": "startup"} if "session" in script else {"prompt": "hi"}

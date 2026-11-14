@@ -1070,44 +1070,25 @@ def pack_drift() -> str | None:
 # ---- Prospective layer (intentions) — the germination surfaces ----
 
 # Operator-I/O dispositions (control-plane Slice 3): the Tray inbox (seed/handoff/agenda)
-# + Keep durable reference (note). An intention carrying one is operator I/O, NOT one of the
-# entity's own prospective loops — so it stays OUT of the activation surfaces that feed the
-# entity's cognition (the session-start dormant-surface + the per-prompt collision), exactly
-# as the embedder's own layer-2 keeps operator I/O out of salience / digest / Top of Mind.
+# + Keep durable reference (note).
 #
 # DRIFT CONTRACT (load-bearing): this tuple MUST equal levain.intentions.NON_COGNITION_DISPOSITIONS
 # (and the embedder's scripts/intentions.py) — anneal stays disposition-blind, so every interpreter of the
 # taxonomy carries the vocab. This hook is a STANDALONE template (stdlib only, no levain import
 # on a stranger install), so it carries its own copy; keep it byte-identical. (levain's test
 # suite asserts this copy == levain.intentions.)
-# "handoff" and "note" are RETIRED (TS-1: no new ones are written) but legacy rows carry them, so they STAY here:
-# is_loop fails open on an unknown value, and dropping them would flood the collision surface.
+# "handoff" and "note" are RETIRED (TS-1: no new ones are written) but legacy rows carry them, so they STAY here.
 _NON_COGNITION_DISPOSITIONS = ("someday", "seed", "handoff", "agenda", "note")
 
 
 def _is_loop(intention: dict) -> bool:
-    """True iff the intention flows into the entity's OWN cognition (the complement of operator
-    I/O — the Tray inbox + Keep notes). Fail-OPEN on the unknown: only an EXPLICITLY-known
-    operator-I/O disposition is excluded — a typo'd/unknown value reads as a visible loop,
-    never silently dropped (the silent-loss direction the whole slice guards). Mirrors
-    levain.intentions.is_loop / the embedder's scripts/intentions.is_loop."""
-    return (intention.get("disposition") or "loop") not in _NON_COGNITION_DISPOSITIONS
+    """False for every intention: there is no loop kind in Levain 1.0 (the loop fold, Phill np-10262267 (a)), so no
+    intention flows into the entity's OWN cognition here. The per-prompt collision arm and the session-start dormant
+    arm that read it were retired with the kind (np-c3029a8a (a)): crystallized-pattern recall is the collision
+    feature, and a dated return is an agenda (`levain ask --on`, germinate). The name stays as the drift-contract
+    twin of levain.intentions.is_loop / the embedder's scripts/intentions.is_loop."""
+    return False
 
-
-def open_intentions(timeout: float = 2.0) -> list[dict]:
-    """The entity's own open prospective loops, via anneal-memory's `intention list --json`.
-    Tray dispositions (the operator inbox) are filtered OUT here — the SINGLE chokepoint
-    both germination surfaces (dormant-surface + collision) read, so the Tray can't leak
-    into a Levain install's cognition (the stranger-side twin of the embedder's layer-2).
-    Returns [] on any failure (an anneal too old to have intentions, no store yet, an error)
-    — the prospective surfaces then show nothing. Tight default timeout: the collision
-    surface runs before every prompt."""
-    data = _anneal_json(
-        ["intention", "list", "--json"], timeout, validator=lambda d: isinstance(d, list)
-    )
-    if isinstance(data, list):
-        return [s for s in data if isinstance(s, dict) and _is_loop(s)]
-    return []
 
 _WHEN_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?")
 
@@ -1232,7 +1213,7 @@ def note_germinate_ringed(ids: list, now: datetime | None = None) -> None:
 
 
 def open_agendas(timeout: float = 2.0) -> list[dict]:
-    """Every open intention as anneal lists it, unfiltered (open_intentions drops the agenda disposition by design)."""
+    """Every open intention as anneal lists it, unfiltered (germinate reads the agendas among them)."""
     data = _anneal_json(["intention", "list", "--json"], timeout, validator=lambda d: isinstance(d, list))
     return [s for s in data if isinstance(s, dict)] if isinstance(data, list) else []
 
@@ -1291,100 +1272,9 @@ def start_germinate(agent: str = "codex", ring_ids: list | tuple = ()) -> str:
     return "failed"
 
 
-# Tokens of 3+ word-chars; common words that would create false collisions are
-# dropped so a >=2-token overlap means genuine content kinship, not "the"/"and".
-# The set includes generic *work* words (code/test/file/review/…) because two
-# such shared tokens between a prompt and an unrelated intention would be noise, not
-# kinship (codex L3 LOW — precision).
-_WORD_RE = re.compile(r"[A-Za-z0-9_]{3,}")
-_STOPWORDS = frozenset({
-    "the", "and", "for", "this", "that", "with", "from", "into", "your", "you",
-    "are", "was", "were", "have", "has", "had", "will", "would", "should", "can",
-    "could", "but", "not", "all", "any", "out", "now", "how", "what", "why",
-    "who", "when", "where", "lets", "let", "get", "got", "use", "using", "need",
-    "want", "about", "just", "like", "make", "made", "one", "two", "its", "our",
-    # generic work/dev words — shared, but not evidence of content kinship.
-    "code", "test", "tests", "file", "files", "review", "fix", "fixes", "change",
-    "changes", "update", "updates", "run", "check", "build", "thing", "things",
-    "stuff", "item", "items", "look", "see", "try", "done", "next", "more",
-})
-
-
-# Cap on the characters fed to the regex/set-build, so a pasted huge prompt or
-# a pathological intention text can't burn CPU before the result cap applies
-# (codex L3 MEDIUM). Collision matches on the gist; the first few KB suffice.
+# Cap on the characters fed to the recall query, so a pasted huge prompt can't burn CPU
+# or blow the argv (codex L3 MEDIUM). Recall matches on the gist; the first few KB suffice.
 _MAX_TOKENIZE_CHARS = 4000
-
-
-def _tokens(text: str) -> set[str]:
-    return {t.lower() for t in _WORD_RE.findall(text[:_MAX_TOKENIZE_CHARS])} - _STOPWORDS
-
-
-def intentions_colliding(
-    prompt: str, intentions: list[dict], min_overlap: int = 2, limit: int = 3
-) -> list[dict]:
-    """Open intentions whose text collides with `prompt` by >= `min_overlap`
-    distinct, non-trivial shared tokens — the EVENT-based germination surface
-    (an open loop surfaces when the current work touches it). Precision-biased:
-    a 2-token floor and a small result cap keep this "better nothing than
-    noise." Returns the top `limit` by overlap; [] on an empty prompt or no
-    real collisions."""
-    p = _tokens(prompt)
-    if not p:
-        return []
-    scored: list[tuple[int, dict]] = []
-    for s in intentions:
-        text = s.get("text")
-        if not isinstance(text, str):
-            continue
-        overlap = len(p & _tokens(text))
-        if overlap >= min_overlap:
-            scored.append((overlap, s))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [s for _, s in scored[:limit]]
-
-
-def due_dormant_intentions(intentions: list[dict], limit: int = 5) -> list[dict]:
-    """Open intentions that have gone DORMANT — quiet too long, or their `next`
-    surface-date has arrived (anneal computes the `germination` tier). This is
-    the TIME-based germination surface, shown once at session start. Growing,
-    resting, and parked intentions stay out of the way. Capped at `limit`."""
-    due = [s for s in intentions if s.get("germination") == "dormant"]
-    return due[:limit]
-
-
-def _format_intention_lines(intentions: list[dict], *, with_next: bool) -> list[str]:
-    lines: list[str] = []
-    for s in intentions:
-        stype = s.get("type", "?")
-        text = s.get("text", "")
-        sid = s.get("id", "?")
-        tail = ""
-        if with_next and s.get("next"):
-            tail = f", next {s['next']}"
-        lines.append(f"  - ({stype}) {text}  [{sid}{tail}]")
-    return lines
-
-
-def format_intention_collisions(intentions: list[dict]) -> str:
-    """The recency-position injection for the event-based surface."""
-    return "\n".join([
-        "[open loops — relevant to what you're doing]",
-        *_format_intention_lines(intentions, with_next=False),
-        "These open loops touch the current work. Advance, resolve "
-        "(intention_close / intention_promote), or set aside as fits — don't let a "
-        "relevant one go unattended.",
-    ])
-
-
-def format_due_intentions(intentions: list[dict]) -> str:
-    """The primacy-position injection for the time-based surface."""
-    return "\n".join([
-        "[open loops — due or gone quiet]",
-        *_format_intention_lines(intentions, with_next=True),
-        "These have gone quiet or their time has come. For each: still alive "
-        "(intention_touch to keep it), or ready to compost (intention_close)?",
-    ])
 
 
 # ---- Crystallized-pattern recall — the on-demand graduated-wisdom tier ----
@@ -1402,10 +1292,10 @@ def crystal_recall(prompt: str, timeout: float = 2.0) -> list[dict]:
     until a measurement earns it back). The query is passed after a
     `--` options terminator (so a prompt that itself looks like a flag — `--json`,
     `-h` — is still parsed as the query, not silently swallowed as an option) and
-    capped to the same bound as the tokenizer so a pasted huge prompt can't burn
+    capped to `_MAX_TOKENIZE_CHARS` so a pasted huge prompt can't burn
     time before anneal answers. Returns [] on an empty/absent crystal store, a
     too-old anneal lacking the subcommand, or any failure — the surface then
-    injects nothing (fail-silent, exactly like the intention surfaces). Tight default
+    injects nothing (fail-silent, like every recall surface). Tight default
     timeout: this runs before every prompt."""
     if not prompt.strip():
         return []
