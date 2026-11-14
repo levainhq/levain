@@ -6,11 +6,13 @@ from __future__ import annotations
 import base64
 import builtins
 import contextlib
+import inspect
 import io
 import json
 import os
 import pathlib
 import random
+import threading
 
 import pytest
 
@@ -401,9 +403,51 @@ class FileTouched(BaseException):
 
 @contextlib.contextmanager
 def no_filesystem():
-    """Every file entry point raises while the parser runs."""
-    def boom(*a, **k):
-        raise FileTouched(repr(a)[:80])
+    """Every file entry point raises while the parser runs, ON THE THREAD THAT ENTERED THIS CONTEXT. The patches
+    are process-wide (they have to be: the parser may reach a file through any module), so each wrapper checks
+    ``threading.get_ident()`` and hands any other thread (stdlib logging, pytest's own hooks, a leaked daemon)
+    straight to the real function: that thread is not the code under test, and tripping it fired FileTouched
+    inside logging/threading/linecache on a background thread."""
+    owner = threading.get_ident()
+
+    def tripwire(orig):
+        def guard(*a, **k):
+            if threading.get_ident() == owner:
+                raise FileTouched(repr(a)[:80])
+            return orig(*a, **k)
+        return guard
+
+    def tripwire_attr(orig):
+        """For a pathlib.Path attribute read statically (plain function, classmethod or staticmethod): the
+        patched slot is a plain function, so ``a[0]`` is the instance (absent for a bare class call)."""
+        def guard(*a, **k):
+            if threading.get_ident() == owner:
+                raise FileTouched(repr(a)[:80])
+            inst = a[0] if a else None
+            return orig.__get__(inst, type(inst) if a else pathlib.Path)(*a[1:], **k)
+        return guard
+
+    real_environ = os.environ
+
+    class ScopedEnviron:
+        """``os.environ`` is None for the owner thread; every other thread sees the real mapping."""
+        def __getattr__(self, name):
+            if threading.get_ident() == owner:
+                raise FileTouched("os.environ." + name)
+            return getattr(real_environ, name)
+
+        def __getitem__(self, k):
+            return self.__getattr__("__getitem__")(k)
+
+        def __contains__(self, k):
+            return self.__getattr__("__contains__")(k)
+
+        def __iter__(self):
+            return self.__getattr__("__iter__")()
+
+        def __len__(self):
+            return self.__getattr__("__len__")()
+
     with pytest.MonkeyPatch.context() as mp:
         for mod, names in ((builtins, ("open",)), (io, ("open", "open_code")),
                            (os, ("open", "stat", "lstat", "listdir", "scandir", "readlink", "access", "walk",
@@ -414,13 +458,13 @@ def no_filesystem():
                                       "abspath", "getsize", "samefile"))):
             for n in names:
                 if hasattr(mod, n):
-                    mp.setattr(mod, n, boom)
+                    mp.setattr(mod, n, tripwire(getattr(mod, n)))
         for n in ("open", "stat", "lstat", "exists", "is_dir", "is_file", "is_symlink", "iterdir", "resolve",
                   "read_bytes", "read_text", "write_bytes", "write_text", "touch", "mkdir", "unlink",
                   "readlink", "absolute", "cwd", "home", "glob", "rglob"):
             if hasattr(pathlib.Path, n):
-                mp.setattr(pathlib.Path, n, boom)
-        mp.setattr(os, "environ", None)
+                mp.setattr(pathlib.Path, n, tripwire_attr(inspect.getattr_static(pathlib.Path, n)))
+        mp.setattr(os, "environ", ScopedEnviron())
         yield
 
 
