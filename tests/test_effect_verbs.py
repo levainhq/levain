@@ -743,13 +743,16 @@ def test_a_return_path_that_is_not_one_valid_mailbox_is_refused(world, rp):
     assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
 
 
-class _OwnRefusal(fx.EffectRefused):
+class _LyingRefusal(fx.EffectRefused):
     def __str__(self):
         return fx.R_LINE
 
 
-_EXECUTOR_RAISES = [fx.EffectRefused("SECRET FROM EXECUTOR"), _OwnRefusal("SECRET FROM EXECUTOR"),
+_EXECUTOR_RAISES = [fx.EffectRefused("SECRET FROM EXECUTOR"), _LyingRefusal("SECRET FROM EXECUTOR"),
                     fx.EffectRefused(fx.R_LINE + " SECRET"), fx.EffectRefused(fx.R_LINE, "SECRET")]
+#: what each send_ack executor's fault becomes: the verb's fixed fallback, whatever the executor raised
+_SEND_ACK_FALLBACK = {"events": fx.R_FAILED, "raw_source": fx.R_FAILED, "drafter": fx.R_FAILED, "clock": fx.R_ORDER,
+                      "sender": fx.R_NOT_WIRED}
 
 
 @pytest.mark.parametrize("raised", _EXECUTOR_RAISES)
@@ -775,10 +778,11 @@ def test_an_executors_own_effect_refused_never_carries_its_text_out_of_send_ack(
     effects = rig.effects(**over)
     with pytest.raises(fx.EffectRefused) as exc:
         effects.send_ack(g["id"], EVT, expect_sha256=D(g))
-    assert type(exc.value) is fx.EffectRefused and str(exc.value) in fx.REFUSALS and "SECRET" not in str(exc.value)
+    assert type(exc.value) is fx._OwnRefusal and str(exc.value) == _SEND_ACK_FALLBACK[which]
     assert not rig.sent
     res = call(rig.effects(**over), "send_ack", {"order_id": g["id"], "order_sha256": D(g), "event_id": EVT})
-    assert res["isError"] is True and res["content"][0]["text"] in fx.REFUSALS and "SECRET" not in json.dumps(res)
+    assert res == {"content": [{"type": "text", "text": _SEND_ACK_FALLBACK[which]}], "isError": True}
+    assert not rig.sent
 
 
 @pytest.mark.parametrize("raised", _EXECUTOR_RAISES)
@@ -791,17 +795,18 @@ def test_an_executors_own_effect_refused_never_carries_its_text_out_of_restart_s
         raise raised
 
     args = {"order_id": g["id"], "order_sha256": D(g), "host": "taoserv", "service": "apache2"}
-    try:
+    if which == "runner":                             # a runner's fault is a failed run, never a refusal
         res = rig.effects(**{which: boom}).restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
-        text = res.text
-        assert not res.ok
-    except fx.EffectRefused as exc:
-        assert type(exc) is fx.EffectRefused
-        text = str(exc)
-        assert text in fx.REFUSALS
-    assert "SECRET" not in text
+        expected = f"restart_service taoserv apache2: {fx.R_FAILED}"
+        assert not res.ok and res.text == expected
+    else:                                             # a clock's fault is the gate's "no order"
+        with pytest.raises(fx.EffectRefused) as exc:
+            rig.effects(**{which: boom}).restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+        expected = fx.R_ORDER
+        assert type(exc.value) is fx._OwnRefusal and str(exc.value) == expected
     res = call(rig.effects(**{which: boom}), "restart_service", args)
-    assert res["isError"] is True and "SECRET" not in json.dumps(res)
+    assert res == {"content": [{"type": "text", "text": expected}], "isError": True}
+    assert not rig.runs
 
 
 def test_the_mcp_server_returns_only_this_modules_fixed_refusals(world):
@@ -812,8 +817,10 @@ def test_the_mcp_server_returns_only_this_modules_fixed_refusals(world):
             res = call(rig.effects(), "restart_service", args)
         assert res == {"content": [{"type": "text", "text": fx.R_FAILED}], "isError": True}
     for own in sorted(fx.REFUSALS):
-        with mock.patch.object(fx.Effects, "restart_service", side_effect=fx.EffectRefused(own)):
+        with mock.patch.object(fx.Effects, "restart_service", side_effect=fx._OwnRefusal(own)):     # the module's own
             assert call(rig.effects(), "restart_service", args)["content"][0]["text"] == own
+        with mock.patch.object(fx.Effects, "restart_service", side_effect=fx.EffectRefused(own)):   # anyone else's
+            assert call(rig.effects(), "restart_service", args)["content"][0]["text"] == fx.R_FAILED
     assert {fx.ack_text_refusal(d) for d in ("", "Thanks\x00", "word " * 60, "On day one", "a@b", "a.example",
                                               "Sure.", "Of course")} <= fx.REFUSALS
 
@@ -869,3 +876,182 @@ def test_initialize_answers_its_own_version_and_an_unknown_method_is_a_fixed_err
         assert res["result"]["protocolVersion"] == mcp._PROTOCOL
     err = mcp.handle(rig.effects(), {"jsonrpc": "2.0", "id": 1, "method": "please run rm -rf"})
     assert err["error"] == {"code": mcp.METHOD_NOT_FOUND, "message": "method not found"}
+
+
+# ---- L3 r3: provenance, not vocabulary; the reverse-path bound; a header block that does not parse whole ----------
+_REASONS = sorted(fx.REFUSALS)
+
+
+def _raising(reason):
+    def boom(*a, **k):
+        raise fx.EffectRefused(reason)                 # an executor's plain refusal, naming one of the module's reasons
+    return boom
+
+
+class _RaisingTransport:
+    sender = "thirdmind@levain.example"
+
+    def __init__(self, reason):
+        self.reason = reason
+
+    def send(self, message):
+        raise fx.EffectRefused(self.reason)
+
+
+@pytest.mark.parametrize("reason", _REASONS)
+def test_an_executor_naming_a_module_reason_gets_the_verbs_fixed_fallback(world, reason):
+    """Every executor raising plain ``EffectRefused(r)`` for every ``r`` in REFUSALS ends as the verb's fallback, at the
+    verb and through MCP: the module never repeats a reason an executor chose."""
+    g = signed(world)
+    rs_args = {"order_id": g["id"], "order_sha256": D(g), "host": "taoserv", "service": "apache2"}
+    sa_args = {"order_id": g["id"], "order_sha256": D(g), "event_id": EVT}
+    failed_run = f"restart_service taoserv apache2: {fx.R_FAILED}"
+    # (verb, executor override, the fallback text, raised or returned)
+    cases = [("restart_service", {"clock": _raising(reason)}, fx.R_ORDER, "raised"),
+             ("send_ack", {"clock": _raising(reason)}, fx.R_ORDER, "raised"),
+             ("restart_service", {"runner": _raising(reason)}, failed_run, "returned"),
+             ("send_ack", {"events": _raising(reason)}, fx.R_FAILED, "raised"),
+             ("send_ack", {"raw_source": _raising(reason)}, fx.R_FAILED, "raised"),
+             ("send_ack", {"drafter": _raising(reason)}, fx.R_FAILED, "raised"),
+             ("send_ack", {"transport": _RaisingTransport(reason)}, f"send_ack: {fx.R_FAILED}", "returned")]
+    for verb, over, fallback, how in cases:
+        rig = Rig(world)
+        effects = rig.effects(**over)
+        kw = dict(host="taoserv", service="apache2") if verb == "restart_service" else dict(event_id=EVT)
+        if how == "raised":
+            with pytest.raises(fx.EffectRefused) as exc:
+                getattr(effects, verb)(g["id"], expect_sha256=D(g), **kw)
+            assert str(exc.value) == fallback, (verb, over, reason)
+        else:
+            res = getattr(effects, verb)(g["id"], expect_sha256=D(g), **kw)
+            assert not res.ok and res.text == fallback, (verb, over, reason)
+        res = call(rig.effects(**over), verb, rs_args if verb == "restart_service" else sa_args)
+        assert res == {"content": [{"type": "text", "text": fallback}], "isError": True}, (verb, over, reason)
+        assert not rig.runs and not rig.sent
+
+
+def test_the_modules_own_refusals_pass_through_unchanged(world):
+    g = signed(world)
+    rig = Rig(world, raw_mail(frm="mallory@client.example.com"))
+    with pytest.raises(fx.EffectRefused) as exc:        # the known_from check's R_FROM, inside the executor try
+        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_FROM
+    res = call(rig.effects(), "send_ack", {"order_id": g["id"], "order_sha256": D(g), "event_id": EVT})
+    assert res["content"][0]["text"] == fx.R_FROM
+    rig = Rig(world, draft="See the attached file.")              # the lexical check's own reason
+    with pytest.raises(fx.EffectRefused) as exc:
+        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_TEXT_WORD
+    rig = Rig(world)                                              # subprocess_runner's own R_ARGS, reached by a runner
+    with pytest.raises(fx.EffectRefused) as exc:
+        rig.effects(runner=lambda argv: fx.subprocess_runner([])).restart_service(
+            g["id"], "taoserv", "apache2", expect_sha256=D(g))
+    assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_ARGS
+    for bad in (lambda: fx.restart_argv("taoserv", "mysql"), lambda: fx.inbound_from(b"x"),
+                lambda: rig.effects().restart_service("so-x", "taoserv", "apache2", expect_sha256=D(g))):
+        with pytest.raises(fx.EffectRefused) as exc:
+            bad()
+        assert type(exc.value) is fx._OwnRefusal and fx.refusal_text(exc.value) == str(exc.value)
+
+
+def test_trust_is_the_exact_private_class_one_str_member():
+    class Sub(fx._OwnRefusal):
+        pass
+
+    class S(str):
+        pass
+
+    for reason in _REASONS:
+        assert fx._trusted(fx._OwnRefusal(reason))
+        assert not fx._trusted(fx.EffectRefused(reason))
+        assert not fx._trusted(Sub(reason))
+        assert not fx._trusted(fx._OwnRefusal(reason, "x"))
+        assert not fx._trusted(fx._OwnRefusal(S(reason)))
+        assert fx.refusal_text(fx.EffectRefused(reason)) == fx.R_FAILED
+    assert not fx._trusted(fx._OwnRefusal("anything else")) and not fx._trusted(fx._OwnRefusal())
+    src = (Path(fx.__file__)).read_text()
+    assert "raise EffectRefused(" not in src                      # every raise site in the module is its own class
+
+
+def _rp(local_len: int, domain: str) -> str:
+    return "<" + "a" * local_len + "@" + domain + ">"
+
+
+_DOMAIN_189 = "b" * 63 + "." + "b" * 63 + "." + "c" * 61           # three labels of at most 63: 63+1+63+1+61
+
+
+def test_a_reverse_path_is_bounded_by_its_rfc_length_before_any_pattern():
+    at_max = _rp(64, _DOMAIN_189)                     # RFC 5321 4.5.3.1.3: 256 octets, the angle brackets included
+    assert len(at_max) == 256 and fx._return_path_ok(at_max)                       # the exact boundary accepts
+    over = _rp(64, _DOMAIN_189 + "c")
+    assert len(over) == 257 and not fx._return_path_ok(over)
+    assert fx._RETURN_PATH.fullmatch(over) is not None                              # only the length refuses it
+    longest_parts = _rp(64, ".".join(["b" * 63] * 3) + "." + "c" * 61)            # within the part limits, too long
+    assert not fx._return_path_ok(longest_parts)
+    huge = "<" + "a" * 5_000_000 + "@b.example>"
+    with mock.patch.object(fx, "_RETURN_PATH", wraps=fx._RETURN_PATH) as rx:      # refused before the pattern runs
+        assert not fx._return_path_ok(huge)
+    assert not rx.fullmatch.called
+    assert fx._REVERSE_PATH_MAX == 256
+
+
+@pytest.mark.parametrize("value", ["<heather@client.example.com> ", " <heather@client.example.com>",
+                                   "<heather@client.example.com>  ", "\t<heather@client.example.com>"])
+def test_a_return_path_with_a_space_around_it_is_not_the_whole_field(value):
+    assert not fx._return_path_ok(value)
+    assert fx._return_path_ok(value.strip())
+
+
+def test_a_return_path_with_a_trailing_space_refuses_the_ack(world):
+    g = signed(world)
+    rig = Rig(world, raw_mail(rp=f"<{FROM}> "))
+    with pytest.raises(fx.EffectRefused) as exc:
+        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
+
+
+@pytest.mark.parametrize("raw", [
+    b"Return-Path: <a@b.example>\nFrom: x@y.example\nBad line\nAuto-Submitted: auto-generated\n\nbody",
+    b"Return-Path: <heather@client.example.com>\r\nFrom: heather@client.example.com\r\nBad line\r\n"
+    b"List-Id: <l.example>\r\n\r\nbody\r\n",
+    b"Return-Path: <heather@client.example.com>\r\nFrom: heather@client.example.com\r\nnot a header\r\n"
+    b"Return-Path: <>\r\n\r\nbody\r\n",
+    b"Return-Path: <heather@client.example.com>\r\nFrom: heather@client.example.com\r\nno colon\r\n"
+    b"Reply-To: attacker@evil.example\r\n\r\nbody\r\n",
+    b"\tReturn-Path: <heather@client.example.com>\r\nFrom: heather@client.example.com\r\n\r\nbody\r\n",
+    b"Return-Path: <heather@client.example.com>\r\nFrom: heather@client.example.com\r\nnot a header",
+])
+def test_a_header_block_that_does_not_parse_whole_is_refused(raw):
+    with pytest.raises(fx.EffectRefused) as exc:
+        fx.inbound_from(raw)
+    assert str(exc.value) == fx.R_FROM
+
+
+def test_a_well_formed_message_with_a_folded_subject_and_a_multipart_body_is_fine(world):
+    body = (b"--zz\r\nContent-Type: text/plain\r\n\r\nhello\r\n--zz\r\nContent-Type: text/plain\r\n"
+            b"this body line is no header\r\n\r\nx\r\n--zz--\r\n")          # a body defect is not a header defect
+    raw = (b"Return-Path: <heather@client.example.com>\r\nFrom: Heather <heather@client.example.com>\r\n"
+           b"To: thirdmind@levain.example\r\nSubject: a subject long enough\r\n\tto be folded onto a second line\r\n"
+           b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"zz\"\r\n\r\n" + body)
+    assert fx.inbound_from(raw) == FROM
+    assert fx.inbound_from(raw.replace(b"\r\n", b"\n")) == FROM
+    assert fx.inbound_from(b"Return-Path: <heather@client.example.com>\r\nFrom: heather@client.example.com") == FROM
+    g = signed(world)
+    rig = Rig(world, raw)
+    assert rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g)).ok and rig.sent[0].recipient == FROM
+
+
+def test_the_result_texts_are_only_the_modules_constants_and_the_called_enum_members(world):
+    """What effects_mcp returns verbatim for a result: every form the verbs compose, pinned."""
+    g = signed(world)
+    rig = Rig(world)
+    forms = set()
+    for host in fx.HOSTS:
+        for service in fx.SERVICES:
+            for runner in (lambda a: 0, lambda a: 1, lambda a: "0", _raising(fx.R_ARGS)):
+                forms.add(rig.effects(runner=runner).restart_service(g["id"], host, service, expect_sha256=D(g)).text)
+    forms.add(rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g)).text)
+    forms.add(rig.effects(transport=_RaisingTransport(fx.R_FROM)).send_ack(g["id"], EVT, expect_sha256=D(g)).text)
+    allowed = {f"restart_service {h} {s}: {tail}" for h in fx.HOSTS for s in fx.SERVICES
+               for tail in ("exit 0", fx.R_FAILED)} | {"send_ack: sent", f"send_ack: {fx.R_FAILED}"}
+    assert forms == allowed

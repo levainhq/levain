@@ -114,18 +114,31 @@ REFUSALS = frozenset({R_ARGS, R_ORDER, R_LINE, R_VERSION, R_NOT_WIRED, R_EVENT, 
 
 
 class EffectRefused(Exception):
-    """A verb refused. ``str`` is one of :data:`REFUSALS`: never an argument. An executor can raise this class too, so
-    the class alone proves nothing: only :func:`refusal_text` decides what a refusal may say."""
+    """A verb refused: the public base class callers catch. This module itself raises only :class:`_OwnRefusal` (a
+    subclass), whose ``str`` is one member of :data:`REFUSALS` and never an argument. An executor can raise this class,
+    or a subclass of it, with any text, even a member of :data:`REFUSALS`: that is never trusted (:func:`_trusted`), so
+    the verb answers its fixed fallback instead (the clock, in the gate: :data:`R_ORDER`; the event lookup, raw source
+    or drafter: :data:`R_FAILED`; the runner or ``transport.send``: a failed :class:`EffectResult`). Only
+    :func:`refusal_text` decides what a refusal may say outside this module."""
+
+
+class _OwnRefusal(EffectRefused):
+    """A refusal raised by a raise site in this module (gate, argument shape, argv, :func:`inbound_from`,
+    :func:`subprocess_runner`, the lexical check's reason, the verbs). Module-private: it marks where a refusal came
+    from, so an executor's ``EffectRefused(<a member of REFUSALS>)`` is not mistaken for the module's own. It is a
+    provenance marker against a wrong or forged reason, not a capability: in-process code that imports this name on
+    purpose can raise it, and even then only a member of :data:`REFUSALS` is carried out."""
 
 
 def _trusted(exc: BaseException) -> bool:
-    """True only for a refusal this module's own gate and shape code raised: exactly :class:`EffectRefused` (no
-    subclass, which could carry its own ``__str__``) holding exactly one ``str`` (no subclass) that is a member of
-    :data:`REFUSALS`. An executor (runner, transport, event lookup, raw source, drafter, clock) that raises
-    ``EffectRefused(<its own text>)`` is not trusted: its text is never carried out."""
+    """True only for a refusal raised by this module's own code: exactly :class:`_OwnRefusal` (not the public base an
+    executor can raise, and no further subclass, which could carry its own ``__str__``) holding exactly one ``str``
+    (no subclass) that is a member of :data:`REFUSALS`. An executor (runner, transport, event lookup, raw source,
+    drafter, clock) that raises :class:`EffectRefused` with any text, a member of :data:`REFUSALS` included, is not
+    trusted: neither its text nor its choice of reason is carried out."""
     try:
         args = exc.args
-        return (type(exc) is EffectRefused and type(args) is tuple and len(args) == 1 and type(args[0]) is str
+        return (type(exc) is _OwnRefusal and type(args) is tuple and len(args) == 1 and type(args[0]) is str
                 and args[0] in REFUSALS)
     except Exception:                                       # noqa: BLE001 - a fault is "not ours"
         return False
@@ -168,7 +181,7 @@ def restart_argv(host: str, service: str) -> list[str]:
     """The hard-coded argv of a restart: the ssh program, fixed options, the host's fixed alias, the one remote word
     and the service. Only members of the enums reach it (anything else raises here, the last line of defence)."""
     if type(host) is not str or host not in HOSTS or type(service) is not str or service not in SERVICES:
-        raise EffectRefused(R_ARGS)
+        raise _OwnRefusal(R_ARGS)
     return _night_argv(host, "restart_service", service)
 
 
@@ -177,12 +190,12 @@ def diagnosis_argv(host: str, word: str, service: str | None = None) -> list[str
     Not a verb the seat can call here: it is listed so the forced command and the verbs' argv are one table."""
     allowed = DIAGNOSIS_WORDS.get(word) if type(word) is str else None
     if type(host) is not str or host not in HOSTS or allowed is None:
-        raise EffectRefused(R_ARGS)
+        raise _OwnRefusal(R_ARGS)
     if allowed:
         if type(service) is not str or service not in allowed:
-            raise EffectRefused(R_ARGS)
+            raise _OwnRefusal(R_ARGS)
     elif service is not None:
-        raise EffectRefused(R_ARGS)
+        raise _OwnRefusal(R_ARGS)
     return _night_argv(host, word, service)
 
 
@@ -201,7 +214,7 @@ def subprocess_runner(argv: Sequence[str]) -> int:
     import os
 
     if not isinstance(argv, (list, tuple)) or not argv or any(type(a) is not str for a in argv):
-        raise EffectRefused(R_ARGS)
+        raise _OwnRefusal(R_ARGS)
     try:
         done = subprocess.run(list(argv), shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=_REMOTE_TIMEOUT, check=False,
@@ -224,20 +237,25 @@ _ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
 _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 _RETURN_PATH = re.compile(r"<(" + _ATEXT + r"(?:\." + _ATEXT + r")*)@(" + _LABEL + r"(?:\." + _LABEL + r")+)>",
                           re.ASCII)
+#: RFC 5321 4.5.3.1.3: a reverse-path is at most this many octets, the ``<`` and ``>`` included
+_REVERSE_PATH_MAX = 256
+_LOCAL_PART_MAX = 64                    # RFC 5321 4.5.3.1.1
+_DOMAIN_MAX = 253                       # RFC 1035 2.3.4's 255 octets on the wire, written as text
 
 
 def _return_path_ok(value: Any) -> bool:
-    """The one Return-Path field holds exactly one nonempty mailbox. No lenient parser runs: any control character
-    (NUL, CR, LF, TAB, DEL: so a folded or smuggled field), any byte outside printable ASCII, or anything outside
-    :data:`_RETURN_PATH` refuses."""
+    """The one Return-Path field holds exactly one nonempty mailbox, the WHOLE field and nothing else (no space before
+    or after it). No lenient parser runs: a field longer than :data:`_REVERSE_PATH_MAX` refuses before any pattern
+    does; then any control character (NUL, CR, LF, TAB, DEL: so a folded or smuggled field), any byte outside printable
+    ASCII, or anything outside :data:`_RETURN_PATH` refuses."""
     try:
         text = str(value)
     except Exception:                                       # noqa: BLE001 - an undecodable field is no path
         return False
-    if any(not " " <= c <= "~" for c in text):
+    if len(text) > _REVERSE_PATH_MAX or any(not " " <= c <= "~" for c in text):
         return False
-    m = _RETURN_PATH.fullmatch(text.strip(" "))
-    return m is not None and len(m.group(1)) <= 64 and len(m.group(2)) <= 253
+    m = _RETURN_PATH.fullmatch(text)
+    return m is not None and len(m.group(1)) <= _LOCAL_PART_MAX and len(m.group(2)) <= _DOMAIN_MAX
 
 
 def inbound_from(raw: bytes) -> str:
@@ -246,45 +264,51 @@ def inbound_from(raw: bytes) -> str:
     no auto-reply or list marker (``Auto-Submitted`` other than ``no``, ``Precedence`` bulk/list/junk/auto_reply, any
     ``List-*``, ``X-Autoreply``/``X-Autorespond``/``X-Auto-Response-Suppress``, a ``multipart/report``); and EXACTLY
     ONE ``Return-Path`` header holding exactly one nonempty mailbox (:func:`_return_path_ok`): none, two or more, or a
-    null path in any form refuses. Raises :class:`EffectRefused` (:data:`R_FROM`) otherwise.
+    null path in any form refuses; and a header block that parses whole, with no defect, up to the blank line or the
+    end of input. Raises :class:`EffectRefused` (this module's own, :data:`R_FROM`) otherwise.
 
     WHAT THE RAW STORE MUST GUARANTEE (ND-4): ``raw`` is the message exactly as final delivery handed it over, with
     the one ``Return-Path`` the delivering MTA stamped from the SMTP envelope sender (RFC 5321 4.4), so a bounce or a
     DSN shows as ``<>``. A store that drops that header, never receives it, or lets a second one through makes every
     ack refuse: fail closed, never an ack to a message whose envelope sender is unknown."""
     if not isinstance(raw, (bytes, bytearray)):
-        raise EffectRefused(R_FROM)
+        raise _OwnRefusal(R_FROM)
     msg = BytesHeaderParser().parsebytes(bytes(raw))
+    # A headers-only parse records a defect only for the header block itself (the body is never parsed): a line that is
+    # not a header before the blank line ends the block there and the rest reads as body, so a later Auto-Submitted,
+    # List-Id, Reply-To or second Return-Path would be invisible. Any defect refuses: the block must parse whole.
+    if msg.defects:
+        raise _OwnRefusal(R_FROM)
     names = [str(k).lower() for k in msg.keys()]
     froms = msg.get_all("From") or []
     if len(froms) != 1:
-        raise EffectRefused(R_FROM)
+        raise _OwnRefusal(R_FROM)
     found = getaddresses([str(froms[0])])
     if len(found) != 1 or not found[0][1]:
-        raise EffectRefused(R_FROM)
+        raise _OwnRefusal(R_FROM)
     sender = found[0][1].strip().lower()
     if _ADDR.fullmatch(sender) is None:
-        raise EffectRefused(R_FROM)
+        raise _OwnRefusal(R_FROM)
     reply_to = msg.get_all("Reply-To") or []
     if reply_to:
         if len(reply_to) != 1:
-            raise EffectRefused(R_FROM)
+            raise _OwnRefusal(R_FROM)
         rt = getaddresses([str(reply_to[0])])
         if len(rt) != 1 or rt[0][1].strip().lower() != sender:
-            raise EffectRefused(R_FROM)
+            raise _OwnRefusal(R_FROM)
     if any(n.startswith("list-") or n in _AUTO_MARKERS for n in names):
-        raise EffectRefused(R_FROM)
+        raise _OwnRefusal(R_FROM)
     for value in msg.get_all("Auto-Submitted") or []:
         if str(value).strip().lower() != "no":
-            raise EffectRefused(R_FROM)
+            raise _OwnRefusal(R_FROM)
     for value in msg.get_all("Precedence") or []:
         if str(value).strip().lower() in ("bulk", "list", "junk", "auto_reply", "auto-reply"):
-            raise EffectRefused(R_FROM)
+            raise _OwnRefusal(R_FROM)
     return_paths = msg.get_all("Return-Path") or []
     if len(return_paths) != 1 or not _return_path_ok(return_paths[0]):     # absent is refused: no envelope sender
-        raise EffectRefused(R_FROM)
+        raise _OwnRefusal(R_FROM)
     if str(msg.get_content_type()).lower() == "multipart/report":
-        raise EffectRefused(R_FROM)
+        raise _OwnRefusal(R_FROM)
     return sender
 
 
@@ -341,18 +365,18 @@ def ack_text_refusal(text: Any) -> str | None:
 # --- the verbs --------------------------------------------------------------------------------------------------------
 def _exact(args: Mapping[str, Any], names: tuple[str, ...]) -> None:
     if not isinstance(args, Mapping) or set(args) != set(names):
-        raise EffectRefused(R_ARGS)
+        raise _OwnRefusal(R_ARGS)
 
 
 def _enum(value: Any, allowed: Sequence[str]) -> str:
     if type(value) is not str or value not in allowed:         # exact str: no subclass, no coercion, no normalising
-        raise EffectRefused(R_ARGS)
+        raise _OwnRefusal(R_ARGS)
     return value
 
 
 def _shaped(value: Any, rule: re.Pattern[str]) -> str:
     if type(value) is not str or rule.fullmatch(value) is None:
-        raise EffectRefused(R_ARGS)
+        raise _OwnRefusal(R_ARGS)
     return value
 
 
@@ -382,20 +406,20 @@ class Effects:
             _require_aware(now)
             state = standing_orders.read_state(self.data_root)
             if state is None:
-                raise EffectRefused(R_ORDER)
+                raise _OwnRefusal(R_ORDER)
             order = next((o for o in standing_orders.orders_in_force(state, now) if o["id"] == order_id), None)
             if order is None:
-                raise EffectRefused(R_ORDER)
+                raise _OwnRefusal(R_ORDER)
             if type(expect_sha256) is not str or not hmac.compare_digest(standing_orders.order_sha256(order),
                                                                          expect_sha256):
-                raise EffectRefused(R_VERSION)
+                raise _OwnRefusal(R_VERSION)
             lines = [ln for ln in order["effect_lines"] if ln["verb"] == verb]
         except Exception as exc:                            # noqa: BLE001 - any fault reading the log is "no order"
-            if _trusted(exc):                               # ours; a clock's own EffectRefused is a fault like any
+            if _trusted(exc):                               # ours; a clock's EffectRefused, any reason, is a fault
                 raise
-            raise EffectRefused(R_ORDER) from None
+            raise _OwnRefusal(R_ORDER) from None
         if not lines:
-            raise EffectRefused(R_LINE)
+            raise _OwnRefusal(R_LINE)
         return order, lines
 
     def _still(self, order_id: str, verb: str, sha: str, first: Mapping[str, Any]) -> None:
@@ -410,7 +434,7 @@ class Effects:
         except Exception:                                   # noqa: BLE001 - a fault is "not the same order"
             same = False
         if not same:
-            raise EffectRefused(R_VERSION)
+            raise _OwnRefusal(R_VERSION)
 
     def restart_service(self, order_id: Any, host: Any, service: Any, *, expect_sha256: Any) -> EffectResult:
         """Restart ``service`` on ``host`` under order ``order_id`` at version ``expect_sha256`` (the digest the
@@ -420,16 +444,16 @@ class Effects:
         sha = _shaped(expect_sha256, _SHA)
         order, lines = self.gate(order_id, "restart_service", expect_sha256=sha)
         if not any(host in ln["args"]["host"] and service in ln["args"]["service"] for ln in lines):
-            raise EffectRefused(R_LINE)
+            raise _OwnRefusal(R_LINE)
         if self.runner is None:
-            raise EffectRefused(R_NOT_WIRED)
+            raise _OwnRefusal(R_NOT_WIRED)
         argv = restart_argv(host, service)
         self._still(order_id, "restart_service", sha, order)
         try:
             code = self.runner(argv)
         except Exception as exc:                            # noqa: BLE001 - the runner's fault never carries text out
-            if _trusted(exc):                               # e.g. subprocess_runner's own R_ARGS
-                raise
+            if _trusted(exc):                               # e.g. subprocess_runner's own R_ARGS; a runner's
+                raise                                       # EffectRefused, any reason, is a failed run
             return EffectResult("restart_service", False, f"restart_service {host} {service}: {R_FAILED}")
         ok = type(code) is int and code == 0
         return EffectResult("restart_service", ok, f"restart_service {host} {service}: "
@@ -444,23 +468,23 @@ class Effects:
         sha = _shaped(expect_sha256, _SHA)
         order, lines = self.gate(order_id, "send_ack", expect_sha256=sha)
         if self.events is None or self.raw_source is None or self.drafter is None or self.transport is None:
-            raise EffectRefused(R_NOT_WIRED)
+            raise _OwnRefusal(R_NOT_WIRED)
         try:
             sender = getattr(self.transport, "sender", None)
         except Exception:                                   # noqa: BLE001 - a faulting property says nothing either
             sender = None
         if type(sender) is not str or _SENDER.fullmatch(sender) is None:
-            raise EffectRefused(R_NOT_WIRED)                # the transport speaks only as thirdmind@
+            raise _OwnRefusal(R_NOT_WIRED)                # the transport speaks only as thirdmind@
         try:
             recipient, voice = self._recipient(event_id, lines)
             draft = self.drafter(event_id)
         except Exception as exc:                            # noqa: BLE001 - an executor's fault never carries text out
-            if _trusted(exc):                               # only this module's own fixed refusals pass through
-                raise
-            raise EffectRefused(R_FAILED) from None
+            if _trusted(exc):                               # only this module's own refusals (inbound_from, the
+                raise                                       # event checks) pass; an executor's is R_FAILED
+            raise _OwnRefusal(R_FAILED) from None
         why = ack_text_refusal(draft)
         if why is not None:
-            raise EffectRefused(why)
+            raise _OwnRefusal(why)
         message = AckMessage(sender=sender, recipient=recipient, subject=ACK_SUBJECT,
                              body=draft.strip() + "\n\n" + _DISCLOSURE[voice],
                              headers={"Auto-Submitted": "auto-replied"})
@@ -468,6 +492,8 @@ class Effects:
         try:
             self.transport.send(message)
         except Exception:                                   # noqa: BLE001 - a transport fault says nothing it was told
+            # KNOWN EDGE: a fault after the message was delivered (a timeout on the reply) also reads as not sent, so a
+            # retry could send twice; the once-per-event guard is ND-3b's attempts journal, not this verb.
             return EffectResult("send_ack", False, f"send_ack: {R_FAILED}")
         return EffectResult("send_ack", True, "send_ack: sent")
 
@@ -478,21 +504,21 @@ class Effects:
                 or event.trust != "authenticated" or event.fields.get("auth") != "pass"
                 or event.fields.get("sender_class") != "known" or type(event.body_ref) is not str
                 or _BODY_REF.fullmatch(event.body_ref) is None):
-            raise EffectRefused(R_EVENT)
+            raise _OwnRefusal(R_EVENT)
         raw = self.raw_source(event.body_ref)
         if not isinstance(raw, (bytes, bytearray)) or not hmac.compare_digest(
                 "sha256:" + hashlib.sha256(bytes(raw)).hexdigest(), event.body_ref):
-            raise EffectRefused(R_EVENT)                    # the bytes are not the ones the event's digest names
+            raise _OwnRefusal(R_EVENT)                    # the bytes are not the ones the event's digest names
         recipient = inbound_from(bytes(raw))
         voices: set[Any] = set()
         for ln in lines:
             if recipient in {a.strip().lower() for a in ln["args"]["known_from"]}:
                 named = ln["args"]["voice"]
                 if not isinstance(named, (list, tuple)) or len(named) != 1:
-                    raise EffectRefused(R_LINE)
+                    raise _OwnRefusal(R_LINE)
                 voices.add(named[0])
         if not voices:
-            raise EffectRefused(R_FROM)
+            raise _OwnRefusal(R_FROM)
         if len(voices) != 1 or next(iter(voices)) not in _DISCLOSURE:   # one voice, or the disclosure could be false
-            raise EffectRefused(R_LINE)
+            raise _OwnRefusal(R_LINE)
         return recipient, next(iter(voices))

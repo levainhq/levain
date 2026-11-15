@@ -9,8 +9,10 @@ is the only path to :mod:`levain.desk.effects`. Two tools and no others, with FI
 ``order_sha256`` is the digest the desk brief prints beside each order: a call binds the version the desk read, so an
 order revoked and signed again differently under the same id refuses rather than answering.
 
-A refusal is a fixed sentence returned as a tool error: only a member of :data:`levain.desk.effects.REFUSALS` raised
-by that module itself is returned (:func:`levain.desk.effects.refusal_text`); anything else answers ``R_FAILED``. Any
+A refusal is a fixed sentence returned as a tool error: a member of :data:`levain.desk.effects.REFUSALS`, and only
+when that module's own code raised it (:func:`levain.desk.effects.refusal_text`); any other exception, an executor's
+``EffectRefused`` with a member of ``REFUSALS`` included, answers ``R_FAILED``. A verb's result text is returned as
+it is: the verbs compose it only from their own constants and the enum members the call already passed. Any
 argument outside its shape or enum, a missing or an extra one, is refused by :mod:`levain.desk.effects` before the order
 is even read. ``main`` wires NO executor yet (the night
 key is ND-8, the mail credential O8, the drafter ND-4, the budgets ND-3b): every call that passes the order gate then
@@ -83,6 +85,12 @@ def _text(text: str, *, error: bool = False) -> dict[str, Any]:
 
 
 def _call(effects: fx.Effects, params: dict[str, Any]) -> dict[str, Any]:
+    """One tool call. Returns, as text: :data:`fx.R_ARGS` for a wrong argument set; for a raised refusal, its fixed
+    sentence if :mod:`levain.desk.effects` itself raised it, else :data:`fx.R_FAILED` (:func:`fx.refusal_text`; never
+    ``str(exc)``); for a result, its ``text`` verbatim, ``ok`` or not (``"restart_service <host> <service>: ..."``,
+    ``"send_ack: ..."``), which the verbs compose only from their own constants and the host and service enum
+    members the call passed (validated before the order is read); anything that is not an ``EffectResult``,
+    :data:`fx.R_FAILED`."""
     name = params.get("name")
     args = params.get("arguments")
     if name not in TOOL_NAMES:
@@ -93,7 +101,7 @@ def _call(effects: fx.Effects, params: dict[str, Any]) -> dict[str, Any]:
         verb = getattr(effects, name)
         result = verb(**{param: args[arg] for arg, param in _PARAMS[name].items()})
     except Exception as exc:                            # noqa: BLE001 - a fault never carries its text out
-        return _text(fx.refusal_text(exc), error=True)  # a fixed sentence of fx.REFUSALS, or R_FAILED: never str(exc)
+        return _text(fx.refusal_text(exc), error=True)  # effects' own fixed sentence, or R_FAILED: never str(exc)
     if type(result) is not fx.EffectResult or type(result.text) is not str or type(result.ok) is not bool:
         return _text(fx.R_FAILED, error=True)
     return _text(result.text, error=not result.ok)
