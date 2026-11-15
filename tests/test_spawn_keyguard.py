@@ -72,6 +72,14 @@ def test_unparsable_shell_text_fails_open_and_structured_argv_is_never_parsed(ho
     assert G.judge(7, env={})                                                     # a spawn that cannot be read at all: refused
 
 
+def test_a_nul_byte_spawn_can_never_start_so_it_is_allowed_but_unreadable_still_refuses(home):
+    assert G.judge(["x", "/no/such\0dir/file"], env={}) is None                   # argv element
+    assert G.judge(["x"], executable="/no/such\0exe", env={}) is None             # executable
+    assert G.judge("cat a\0b", env={}) is None                                    # shell text
+    assert G.judge(7, env={})                                                     # a plain unreadable one still refuses
+    assert G.judge([7], env={})
+
+
 def test_a_provider_library_is_data_not_a_key(home):
     assert G.judge(["ls", "/usr/lib/ssh-keychain.dylib"], env={}) is None
     assert G.judge(["cat", "/usr/libexec/ssh-sk-helper"], env={}) is None

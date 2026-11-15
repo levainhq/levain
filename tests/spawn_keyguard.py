@@ -109,9 +109,21 @@ def _flatten(toks: list[str], depth: int = 0) -> list[str]:
     return out
 
 
-def judge(args, executable=None, env=None, cwd=None, shell: bool = False) -> str | None:
+def _holds_nul(args, executable) -> bool:
+    """True when the executable or any argv element holds a NUL byte (a spawn that can never start). Unreadable input is False."""
+    try:
+        parts = [executable] if executable is not None else []
+        parts += [args] if isinstance(args, (str, bytes, os.PathLike)) else list(args)
+        return any("\0" in os.fsdecode(p) for p in parts)
+    except Exception:                                       # noqa: BLE001 -- not readable here: the judge below fails closed on it
+        return False
+
+
+def judge(args,executable=None, env=None, cwd=None, shell: bool = False) -> str | None:
     """Why this spawn may not start (a sentence), or None."""
     try:
+        if _holds_nul(args, executable):                    # Popen itself raises ValueError: this spawn can never start, so it cannot reach a key
+            return None
         e = {os.fsdecode(k): os.fsdecode(v) for k, v in dict(os.environ if env is None else env).items()}
         c = os.fsdecode(cwd) if cwd is not None else None
         exe = os.fsdecode(executable) if executable is not None else None
