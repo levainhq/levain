@@ -17,7 +17,9 @@ from tests.autonomic_test_only_confinement import test_only_confined_executor  #
 from tests.autonomic_test_only_coverage import test_only_every_effect_covered  # noqa: F401
 
 # TEST ONLY: the spawn-level keyguard (a DENY on the operator's real key; see the module).
-from tests.spawn_keyguard import _a_refused_spawn_fails_its_test, _no_signing_spawn_in_tests, keyguard_cleanup  # noqa: F401
+from tests.spawn_keyguard import (  # noqa: F401
+    _a_refused_spawn_fails_its_test, _no_signing_spawn_in_tests, keyguard_cleanup, pytest_sessionfinish,
+    pytest_terminal_summary, pytest_testnodedown)
 
 
 @pytest.fixture(autouse=True)

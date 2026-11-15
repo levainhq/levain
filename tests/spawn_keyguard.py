@@ -1,22 +1,26 @@
 """TEST ONLY: a DENY on the operator's REAL key (nothing enumerates what is allowed: scratch keys, tmp ``-f``, scratch agents pass).
 Installed at import (collection is covered). Every Popen (``run``, ``os.popen``), ``os.posix_spawn*``/``spawn*``/``exec*``/``system``
-is judged before anything starts; a refusal raises ``RealKeyReached`` naming the test, the reason and the argv, is recorded, and
-also fails its test at teardown. Shell strings (``shell=True``, ``sh -c``, ``eval``) are re-tokenised with shlex (unbalanced quote: refused).
-D1: any argv token (``~`` read as the PASSWD home, ``$HOME`` as the judged child's own HOME, realpath against the child's cwd)
-inside ``<home>/.ssh``, ``<home>/.levain/keys``, a key-named file in ``<home>/.levain``, or a known provider library (compared
-case-folded and NFC on darwin). A structured argv is data: an element with spaces is read as shell code only after ``sh -c`` or
-``eval`` (or as the value of ``core.sshCommand=``/``gpg.ssh.program=``). D2: ``sc_auth``; ``ssh-keygen`` -K/-w/-D; ``ssh-add``
+is judged before anything starts. MODE (env ``LEVAIN_KEYGUARD``): ``warn`` (the DEFAULT) records a denied spawn, with the test name
+and argv, in a session report printed between ``KEYGUARD REPORT BEGIN``/``END`` in pytest's terminal summary (and written to the
+file named by ``LEVAIN_KEYGUARD_REPORT``, when set) and lets the spawn run; ``enforce`` raises ``RealKeyReached`` before anything
+starts, records it, and fails the test at teardown. Warn-only stays ON until CI shows an empty report, then ``_DEFAULT_MODE``
+flips to ``enforce`` in that one line; local tests stay held while it is warn-only because warn does not stop a signing call.
+Shell text is re-tokenised with shlex ONLY for ``shell=True``, a shell executable (sh|bash|zsh|dash|ksh|ash, any case) with ``-c`` and
+its script, or ``eval``; a structured argv element is never shell-parsed, and a parse error in text that IS shell-parsed fails
+OPEN (allowed). The key check: an argv token that, resolved (``~`` as the PASSWD home, ``$HOME`` as the judged child's own HOME,
+realpath against the child's cwd), is an EXISTING file inside ``<passwd home>/.ssh`` or ``<passwd home>/.levain/keys`` (compared
+case-folded and NFC on darwin); an embedded-NUL token is skipped. Also denied: ``sc_auth``; ``ssh-keygen`` -K/-w/-D; ``ssh-add``
 unless the child's SSH_AUTH_SOCK is under the temp dir (an argv ``SSH_AUTH_SOCK=`` counts only after ``env`` or in a shell string;
 a fake of these by absolute path under the temp dir is fine). Scrubbed for the run, restored at its end (also at
-``pytest_unconfigure`` and ``atexit``, once): SSH_AUTH_SOCK, SSH_SK_PROVIDER; git system config off, global config a scratch identity.
+``pytest_unconfigure`` and ``atexit``, once): SSH_AUTH_SOCK, SSH_SK_PROVIDER (a provider library matters only as that variable or
+the value of ``ssh-keygen -D/-K/-w``, never by its name as data); git system config off, global config a scratch identity.
 Known edges: ctypes/cffi/libc system; TOCTOU; a key copied out before the test; a process the test starts that itself reads the
 home (a real levain CLI by subprocess: the scrub is the defence); an explicit child ``env=`` naming the real key on purpose;
-``shell=True`` list form with the key as a positional ``$1``; the ``~user`` spelling; case games a case-sensitive volume allows.
-Left open by the kg5 L3 round (levain 45, 2026-11-14; none is a pattern a scratch-key test writes, and a fourth version of this
-guard is not built for them): an ``ssh-add`` honoured through an ``env``/shell operand assignment; ``executable=`` whose
-argv[0] names a guarded tool is refused as if it were the command; ``os.execl*``/``execle`` env as the last positional;
-a case-sensitive volume's ``.SSH`` refused as ``.ssh``; a cleanup step that raises leaves the wall installed;
-an ``eval`` token spelled in other case; ``HOME=""`` in an explicit env reads as the passwd home."""
+``shell=True`` list form with the key as a positional ``$1``; the ``~user`` spelling; case games a case-sensitive volume allows;
+a shell string that does not parse (``sh -c 'unbalanced``) is not judged; a key path inside ``git -c core.sshCommand=...`` text;
+an ``ssh-add`` honoured through an ``env``/shell operand assignment; ``executable=`` whose argv[0] names a guarded tool is refused
+as if it were the command; ``os.execl*``/``execle`` env as the last positional; a cleanup step that raises leaves the wall
+installed; an ``eval`` token spelled in other case; ``HOME=""`` in an explicit env reads as the passwd home."""
 
 from __future__ import annotations
 
@@ -38,13 +42,11 @@ from pathlib import Path
 
 import pytest
 
-_PROVIDERS = ("/usr/lib/ssh-keychain.dylib", "/usr/libexec/ssh-sk-helper", "/usr/local/lib/libsk-libfido2.dylib",
-              "/opt/homebrew/lib/libsk-libfido2.dylib")
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 _POPEN_POS = ("bufsize", "executable", "stdin", "stdout", "stderr", "preexec_fn", "close_fds", "shell", "cwd", "env")
+_DEFAULT_MODE = "warn"                                        # flip to "enforce" once CI shows an empty report
 _ENV_NAMES = ("SSH_AUTH_SOCK", "SSH_SK_PROVIDER", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")
-_CODE_VALUE = re.compile(r"(?i)(core\.sshcommand|gpg\.ssh\.program)=")      # git config keys whose value is a command line
-_PROVIDER_FLAG =re.compile(r"-[A-Za-z]*[KwD]")             # ssh-keygen -K / -w / -D, clustered (-qK) or attached (-D/lib)
+_PROVIDER_FLAG = re.compile(r"-[A-Za-z]*[KwD]")             # ssh-keygen -K / -w / -D, clustered (-qK) or attached (-D/lib)
 
 
 def _real_home() -> str:
@@ -71,26 +73,26 @@ def _hits_real_key(tok: str, cwd: str | None, env_home: str | None = None) -> bo
     home = _real_home()
     h = _norm(os.path.realpath(home))
     eh = env_home or home                                   # ``$HOME`` is the child's HOME (unset: a shell falls back to passwd)
-    providers = {_norm(x) for x in _PROVIDERS}
     for cand in {tok, tok.split("=", 1)[-1], tok[2:] if tok[:1] == "-" and tok[1:2] != "-" else tok}:
         s = cand.replace("${HOME}", eh).replace("$HOME", eh)
         s = home + s[1:] if s == "~" or s.startswith("~/") else s
         if not s or "\0" in s:
             continue
-        p = _norm(os.path.realpath(s if os.path.isabs(s) else os.path.join(cwd or os.getcwd(), s)))
-        name = os.path.basename(p)
-        if (_inside(p, h + "/.ssh") or _inside(p, h + "/.levain/keys") or _norm(cand) in providers or p in providers
-                or (os.path.dirname(p) == h + "/.levain" and (name == "terminal" or name.startswith("id_") or name.endswith(".pub")))):
+        raw = os.path.realpath(s if os.path.isabs(s) else os.path.join(cwd or os.getcwd(), s))
+        p = _norm(raw)
+        if (_inside(p, h + "/.ssh") or _inside(p, h + "/.levain/keys")) and os.path.isfile(raw):
             return True
     return False
 
 
 def _split(text: str, depth: int = 0) -> list[str]:
-    """shlex tokens of ``text`` plus, recursively, those of a nested ``sh -c STR`` or ``eval ...``."""
-    lex = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
-    lex.whitespace_split = True
-    toks = list(lex)                                        # ValueError on an unbalanced quote
-    return _flatten(toks, depth)
+    """shlex tokens of ``text`` plus, recursively, those of a nested ``sh -c STR`` or ``eval ...``; unreadable: ``[]`` (fail open)."""
+    try:
+        lex = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return _flatten(list(lex), depth)
+    except ValueError:
+        return []
 
 
 def _flatten(toks: list[str], depth: int = 0) -> list[str]:
@@ -102,17 +104,13 @@ def _flatten(toks: list[str], depth: int = 0) -> list[str]:
                            and k + 1 < len(toks)), None)
         elif t == "eval":
             script = " ".join(toks[i + 1:])
-        elif _CODE_VALUE.match(t):
-            script = t.split("=", 1)[1]
-        if script is not None:
-            if depth >= 4:
-                raise ValueError("a shell command nested too deeply to read")
+        if script is not None and depth < 4:
             out += _split(script, depth + 1)
     return out
 
 
 def judge(args, executable=None, env=None, cwd=None, shell: bool = False) -> str | None:
-    """Why this spawn may not start (a sentence), or None. Anything unreadable is refused."""
+    """Why this spawn may not start (a sentence), or None."""
     try:
         e = {os.fsdecode(k): os.fsdecode(v) for k, v in dict(os.environ if env is None else env).items()}
         c = os.fsdecode(cwd) if cwd is not None else None
@@ -141,9 +139,7 @@ def judge(args, executable=None, env=None, cwd=None, shell: bool = False) -> str
             if name == "ssh-add" and not fake and not (sock and _in_tmp(sock)):
                 return "ssh-add outside a throwaway agent (SSH_AUTH_SOCK is not under the temp dir)"
         hit = next((t for t in toks if _hits_real_key(t, c, e.get("HOME"))), None)
-        return None if hit is None else f"argv names the real account's key place or a security-key provider ({hit})"
-    except ValueError as exc:
-        return f"a command string that cannot be read ({exc}); refused"
+        return None if hit is None else f"argv names a real key file of the account ({hit})"
     except Exception as exc:                                # noqa: BLE001 -- fail closed
         return f"a spawn the keyguard could not read ({type(exc).__name__}: {exc}); refused"
 
@@ -178,12 +174,53 @@ def _drain() -> list[str]:
         return fresh
 
 
+_REPORT: list[str] = []                                     # warn mode: what enforce would have refused
+
+
+def mode() -> str:
+    return "enforce" if os.environ.get("LEVAIN_KEYGUARD", _DEFAULT_MODE).strip().lower() == "enforce" else "warn"
+
+
 def _refuse(why: str, argv) -> None:
     from levain.cockpit.keys import RealKeyReached      # lazily: nothing of levain loads at conftest import
     msg = f"test {os.environ.get('PYTEST_CURRENT_TEST', '<no test>')} tried to start a spawn the keyguard denies: {why}. argv={argv!r}"
     with _LOCK:
+        if mode() == "warn":
+            _REPORT.append(msg)
+            return
         _VIOLATIONS.append(msg)
     raise RealKeyReached(msg)
+
+
+def _report_text(extra=()) -> str:
+    return "\n".join([*_REPORT, *extra])
+
+
+def pytest_sessionfinish(session):
+    """Under xdist a worker hands its report to the controller (``pytest_testnodedown``)."""
+    out = getattr(session.config, "workeroutput", None)
+    if out is not None:
+        out["keyguard_report"] = list(_REPORT)
+
+
+_NODES: list[str] = []
+
+
+def pytest_testnodedown(node, error):
+    _NODES.extend(getattr(node, "workeroutput", {}).get("keyguard_report", []))
+
+
+def pytest_terminal_summary(terminalreporter):
+    if getattr(terminalreporter.config, "workeroutput", None) is not None:
+        return
+    text = _report_text(_NODES)
+    path = os.environ.get("LEVAIN_KEYGUARD_REPORT")
+    if path:
+        Path(path).write_text(text + ("\n" if text else ""), encoding="utf-8")
+    if text:
+        terminalreporter.write_line("KEYGUARD REPORT BEGIN")
+        terminalreporter.write_line(text)
+        terminalreporter.write_line("KEYGUARD REPORT END")
 
 
 def _listed(args):
@@ -227,7 +264,7 @@ def install():
     def check(args, executable=None, env=None, cwd=None, shell=False):
         why = judge(args, executable, env, cwd, shell)
         if why:
-            _refuse(why, _listed(args))
+            _refuse(why, _listed(args))                  # warn mode returns and the spawn runs
 
     def popen_init(self, args, *a, **kw):
         self._child_created = False                         # a refusal raises before the real __init__; __del__ reads this

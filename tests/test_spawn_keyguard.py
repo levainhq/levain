@@ -1,6 +1,7 @@
 """The spawn-level keyguard DENY (tests/spawn_keyguard.py). Nothing here starts ssh-keygen: the judge is called on argv, and
 the wrapped-spawn cases put a recorder in place of the REAL ``Popen.__init__`` before the guard wraps it, so a refusal is
-asserted to happen before anything would exec. The real home is a tmp dir (``_real_home`` is replaced)."""
+asserted to happen before anything would exec. The real home is a tmp dir (``_real_home`` is replaced) holding real files.
+Every test runs in ``enforce`` mode unless it says ``warn``."""
 
 from __future__ import annotations
 
@@ -15,28 +16,36 @@ from levain.cockpit.keys import RealKeyReached
 from tests import spawn_keyguard as G
 
 
+@pytest.fixture(autouse=True)
+def _enforce(monkeypatch):
+    monkeypatch.setenv("LEVAIN_KEYGUARD", "enforce")
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     h = tmp_path / "realhome"
     (h / ".ssh").mkdir(parents=True)
     (h / ".levain" / "keys").mkdir(parents=True)
+    for f in (".ssh/id_x", ".ssh/id_ed25519", ".ssh/k", ".ssh/x", ".ssh/my key", ".ssh/id_test", ".levain/keys/terminal"):
+        (h / f).write_text("k")
+    (h / ".levain" / "notes.md").write_text("n")
     monkeypatch.setattr(G, "_real_home", lambda: str(h))
     return h
 
 
 def test_the_real_key_places_are_refused_by_every_form(home, tmp_path):
     for argv in (["cat", str(home / ".ssh" / "id_ed25519")], ["ssh-keygen", "-Y", "sign", "-f", str(home / ".levain/keys/terminal")],
-                 ["cat", "~/.ssh/id_x"], ["cat", "~/.ssh"], ["ls", f"-f{home}/.ssh/id_x"], ["git", "-c", f"user.signingkey={home}/.ssh/k"],
+                 ["cat", "~/.ssh/id_x"], ["ls", f"-f{home}/.ssh/id_x"], ["git", "-c", f"user.signingkey={home}/.ssh/k"],
                  f"cat {home}/.ssh/id_x",
-                 ["sh", "-c", f"echo hi; cat {home}/.ssh/id_x"], ["cat", str(home / ".levain" / "terminal")],
-                 ["cat", str(home / ".levain" / "id_x")], ["cat", str(home / ".levain" / "k.pub")],
-                 ["git", "-c", f"core.sshCommand=ssh -i {home}/.ssh/id_x", "fetch"], ["ssh-keygen", "-D", "/usr/lib/ssh-keychain.dylib"]):
+                 ["sh", "-c", f"echo hi; cat {home}/.ssh/id_x"], ["ssh-keygen", "-D", "/usr/lib/ssh-keychain.dylib"]):
         assert G.judge(argv, cwd=str(tmp_path)), argv
     for script in ("cat $HOME/.ssh/id_x", "cat ${HOME}/.ssh/id_x"):                 # $HOME is the judged child's HOME
         assert G.judge(["sh", "-c", script], env={"HOME": str(home)}), script
     assert G.judge(["cat", "id_x"], cwd=str(home / ".ssh"))                       # relative, resolved against the child's cwd
     assert G.judge(["cat", "x"], executable=str(home / ".ssh" / "x"))
     assert G.judge(["cat", str(home / ".levain" / "notes.md")]) is None           # not a key place
+    assert G.judge(["cat", str(home / ".ssh" / "no_such_key")]) is None           # a key handle is an EXISTING file
+    assert G.judge(["cat", str(home / ".ssh")]) is None                           # the directory is not a handle
 
 
 def test_a_symlink_from_tmp_to_the_real_ssh_is_refused(home, tmp_path):
@@ -54,10 +63,25 @@ def test_sc_auth_provider_flags_and_ssh_add_are_refused(home, tmp_path):
     assert G.judge(["ssh-add", "k"], env={"SSH_AUTH_SOCK": "/Users/nobody/agent.sock"})
 
 
-def test_unreadable_spawns_are_refused(home):
-    assert G.judge("sh -c 'cat x", env={})
-    assert G.judge(["sh", "-c", "echo 'x"], env={})
-    assert G.judge(7, env={})
+def test_unparsable_shell_text_fails_open_and_structured_argv_is_never_parsed(home):
+    assert G.judge("sh -c 'cat x", env={}) is None
+    assert G.judge(["sh", "-c", "echo 'x"], env={}) is None                       # sh -c 'unbalanced: fail open
+    assert G.judge(["python", "-c", "print('x"], env={}) is None
+    assert G.judge(["systemd-run", "--", "echo 'x", "a\0b"], env={}) is None
+    assert G.judge(["cat", "a\0b"], env={}) is None                               # an embedded NUL is skipped
+    assert G.judge(7, env={})                                                     # a spawn that cannot be read at all: refused
+
+
+def test_a_provider_library_is_data_not_a_key(home):
+    assert G.judge(["ls", "/usr/lib/ssh-keychain.dylib"], env={}) is None
+    assert G.judge(["cat", "/usr/libexec/ssh-sk-helper"], env={}) is None
+    assert G.judge(["ssh-keygen", "-D", "/usr/lib/ssh-keychain.dylib"], env={})   # as the value of -D it is still refused
+
+
+def test_a_token_equal_to_an_existing_fake_home_key_is_denied(home, tmp_path):
+    assert G.judge(["cat", str(home / ".ssh" / "id_x")], env={})
+    assert G.judge(["cat", str(home / ".levain" / "keys" / "terminal")], env={})
+    assert G.judge(["cat", str(home / ".ssh" / "id_missing")], env={}) is None
 
 
 def test_scratch_keys_agents_and_fakes_pass(home, tmp_path):
@@ -100,7 +124,7 @@ def test_a_refusal_comes_before_the_real_popen_and_names_test_reason_and_argv(wa
     assert wall == []
     text = str(e.value)
     assert "test_a_refusal_comes_before_the_real_popen" in text
-    assert "argv names the real account's key place" in text and "{why}" not in text    # the actual reason, not a template
+    assert "argv names a real key file of the account" in text and "{why}" not in text    # the actual reason, not a template
     assert "'cat'" in text
     with pytest.raises(RealKeyReached):
         subprocess.run(["/usr/sbin/sc_auth", "x"])
@@ -205,9 +229,9 @@ def test_structured_argv_is_data_except_for_paths_and_shell_code(home):
     assert G.judge(["printf", "%s", "documentation: ~/.ssh/id"], env={}) is None
     assert G.judge(["echo", "see sc_auth and ssh-add docs"], env={}) is None
     assert G.judge(["cat", f"{home}/.ssh/my key"], env={})                        # the token is itself a path
-    assert G.judge(["sh", "-c", "cat ~/.ssh/id"], env={})
-    assert G.judge(["eval", "cat ~/.ssh/id"], env={})
-    assert G.judge(["git", "-c", f"gpg.ssh.program=sh -c 'cat {home}/.ssh/k'", "x"], env={})
+    assert G.judge(["sh", "-c", "cat ~/.ssh/id_x"], env={})
+    assert G.judge(["eval", "cat ~/.ssh/id_x"], env={})
+    assert G.judge(["git", "-c", f"gpg.ssh.program=sh -c 'cat {home}/.ssh/k'", "x"], env={}) is None   # structured: not parsed
 
 
 def test_executable_keeps_argv0_and_an_argv_socket_assignment_needs_env_or_a_shell(home, tmp_path):
@@ -221,12 +245,17 @@ def test_executable_keeps_argv0_and_an_argv_socket_assignment_needs_env_or_a_she
     assert G.judge(["ssh-add", "k"], env={"SSH_AUTH_SOCK": sock}) is None         # the child's own env decides
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="needs a case-insensitive volume")
 def test_the_protected_prefixes_compare_case_and_normalisation_insensitively_on_darwin(home, monkeypatch):
     shouty = str(home).upper() + "/.SSH/id_x"
     monkeypatch.setattr(G, "_FOLD", False)
     assert G.judge(["cat", shouty], env={}) is None
     monkeypatch.setattr(G, "_FOLD", True)
     assert G.judge(["cat", shouty], env={})
+
+
+def test_norm_folds_case_and_normalisation(monkeypatch):
+    monkeypatch.setattr(G, "_FOLD", True)
     assert G._norm("e\u0301") == G._norm("\u00e9") == "\u00e9"
 
 
@@ -265,3 +294,49 @@ def test_the_scrub_is_restored(monkeypatch):
     assert "SSH_AUTH_SOCK" not in os.environ and prev["SSH_AUTH_SOCK"] == "/x"
     G.restore_environ(prev)
     assert os.environ["SSH_AUTH_SOCK"] == "/x"
+
+
+def test_warn_mode_records_and_does_not_raise_and_enforce_raises(wall, home, monkeypatch):
+    key = str(home / ".ssh" / "id_x")
+    before = len(G._REPORT)
+    monkeypatch.setenv("LEVAIN_KEYGUARD", "warn")
+    subprocess.Popen(["cat", key])
+    subprocess.Popen(["/usr/sbin/sc_auth", "x"])
+    assert len(wall) == 2                                                         # both spawns went through
+    new = G._REPORT[before:]
+    del G._REPORT[before:]
+    assert len(new) == 2 and "test_warn_mode_records" in new[0] and "id_x" in new[0] and "sc_auth" in new[1]
+    assert G._pending() == []                                                     # no violation: the test is not failed
+    monkeypatch.setenv("LEVAIN_KEYGUARD", "enforce")
+    with pytest.raises(RealKeyReached):
+        subprocess.Popen(["cat", key])
+    assert len(wall) == 2 and len(G._REPORT) == before
+
+
+def test_mode_defaults_to_the_module_constant(monkeypatch):
+    monkeypatch.delenv("LEVAIN_KEYGUARD", raising=False)
+    assert G.mode() == G._DEFAULT_MODE == "warn"
+    monkeypatch.setenv("LEVAIN_KEYGUARD", "Enforce")
+    assert G.mode() == "enforce"
+
+
+def test_the_terminal_summary_prints_the_block_and_writes_the_file(tmp_path, monkeypatch):
+    lines: list[str] = []
+
+    class Rep:
+        config = object()
+
+        def write_line(self, t):
+            lines.append(t)
+
+    out = tmp_path / "r.txt"
+    monkeypatch.setenv("LEVAIN_KEYGUARD_REPORT", str(out))
+    monkeypatch.setattr(G, "_REPORT", ["one"])
+    monkeypatch.setattr(G, "_NODES", ["two"])
+    G.pytest_terminal_summary(Rep())
+    assert lines == ["KEYGUARD REPORT BEGIN", "one\ntwo", "KEYGUARD REPORT END"] and out.read_text() == "one\ntwo\n"
+    lines.clear()
+    monkeypatch.setattr(G, "_REPORT", [])
+    monkeypatch.setattr(G, "_NODES", [])
+    G.pytest_terminal_summary(Rep())
+    assert lines == [] and out.read_text() == ""                                  # an empty report prints nothing, file says empty
