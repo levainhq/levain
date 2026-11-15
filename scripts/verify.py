@@ -81,7 +81,7 @@ HAIKU_MODEL = "claude-haiku-5-5"
 DIAG_MAX_TOKENS = 1500
 DIAG_PROMPT_CAP = 24000
 STARTING_GRACE = 120.0          # seconds a freshly started run may have no lock yet
-FINAL_STATES = ("passed", "red", "partial")
+FINAL_STATES = ("passed", "red", "partial", "refused")
 REQUIRED_PLATFORMS = ("macos", "linux")
 LEG_PLATFORM = {"mac": "macos", "linux": "linux"}          # leg name -> the platform it must run on
 PLATFORM_SYSTEM = {"macos": "Darwin", "linux": "Linux"}    # platform -> what platform.system() reports there
@@ -321,8 +321,12 @@ def verdict_of(legs: list[dict]) -> tuple[str, list[str]]:
     for leg in legs:
         plat = leg.get("platform")
         ran_on = (leg.get("host_fingerprint") or {}).get("system")
-        if PLATFORM_SYSTEM.get(plat) is None or ran_on != PLATFORM_SYSTEM[plat]:
-            why.append(f"{plat}: the leg ran on {ran_on or 'an unrecorded system'}, not on {PLATFORM_SYSTEM.get(plat, plat)}")
+        if plat is None:
+            why.append("a leg recorded no platform")
+        elif PLATFORM_SYSTEM.get(plat) is None or ran_on != PLATFORM_SYSTEM[plat]:
+            why.append(f"{plat}: the leg ran on {ran_on or 'an unrecorded system'}"
+                       + (" (a receipt written before host_fingerprint existed records none, so it reads red on a re-verdict)"
+                          if not ran_on else "") + f", not on {PLATFORM_SYSTEM.get(plat, plat)}")
         want_py, got_py = REQUIRED_PYTHON_MINOR.get(plat), _python_minor(leg.get("python"))
         if want_py is not None and got_py != want_py:
             why.append(f"{plat}: the leg ran Python {leg.get('python')!r}, the {plat} leg is Python {want_py}")
@@ -434,15 +438,32 @@ _CHILDREN: set = set()
 _CHILD_LOCK = threading.RLock()
 
 
+def _leader_exited(p: subprocess.Popen) -> bool:
+    """True once the group leader has exited, WITHOUT reaping it: while it is an unreaped zombie its pid (the group id)
+    cannot be handed to anyone else, so a killpg of it still reaches only this child's own group."""
+    if p.returncode is not None:
+        return True
+    try:
+        return os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        return True
+
+
 def _kill_group(p: subprocess.Popen, grace: float = 5.0) -> None:
-    """TERM the child's process group, give it `grace` seconds, then KILL whatever is left in the group."""
+    """TERM the child's process group, give it `grace` seconds, then KILL whatever is left in the group.  Never signals
+    a group whose leader was already reaped (its id may by now be an unrelated process's); it never reaps the leader
+    itself, the caller's wait does."""
+    if p.returncode is not None:
+        return
     try:
         os.killpg(p.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         return
     end = time.time() + grace
-    while time.time() < end and p.poll() is None:
+    while time.time() < end and not _leader_exited(p):
         time.sleep(0.1)
+    if p.returncode is not None:
+        return
     try:
         os.killpg(p.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -605,15 +626,21 @@ def _spawn(cmd: list[str], *, cwd, env, stdout, stdin=subprocess.DEVNULL, stderr
     return p
 
 
-def _kill_leftovers(p: subprocess.Popen) -> None:
-    """After the group leader exited on its own: SIGKILL whatever it left in its process group (a daemonised helper a
-    test started, a stray worker), so nothing from a finished command outlives it.  An empty group is ESRCH.  Known
-    edge: once the group is empty its id is a free pid, so a brand-new session leader handed that pid in the moment
-    between the leader's reaping and this call would be signalled."""
-    try:
-        os.killpg(p.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+def _wait_leader(p: subprocess.Popen, timeout: float | None) -> int:
+    """Wait for the group leader to exit, then SIGKILL whatever it left in its process group (a daemonised helper a
+    test started, a stray worker) BEFORE reaping the leader, so nothing from a finished command outlives it and the
+    signal can never reach a group id that was recycled after the reap.  Raises TimeoutExpired like Popen.wait."""
+    end = None if timeout is None else time.monotonic() + timeout
+    while not _leader_exited(p):
+        if end is not None and time.monotonic() >= end:
+            raise subprocess.TimeoutExpired(p.args, timeout)
+        time.sleep(0.02)
+    if p.returncode is None:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return p.wait()
 
 
 def _wait_killed(p: subprocess.Popen, lf) -> None:
@@ -637,9 +664,7 @@ def _run(cmd: list[str], *, cwd: Path, env: dict, log: Path, timeout: float | No
                 sf.close()
             raise
         try:
-            rc = p.wait(timeout=timeout)
-            _kill_leftovers(p)
-            return rc
+            return _wait_leader(p, timeout)
         except subprocess.TimeoutExpired:
             _kill_group(p)
             _wait_killed(p, lf)
@@ -662,25 +687,24 @@ def _capture(cmd: list[str], *, cwd: Path, env: dict, log: Path, timeout: float 
     with open(log, "ab") as lf:
         lf.write(f"\n$ {' '.join(cmd)}\n".encode())
         lf.flush()
-        p = _spawn(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=lf)
-        try:
-            out, _ = p.communicate(timeout=timeout)
-            _kill_leftovers(p)
-            return p.returncode, out.decode("utf-8", errors="replace")
-        except subprocess.TimeoutExpired:
-            _kill_group(p)
-            _wait_killed(p, lf)
-            lf.write(b"\n[verify] TIMEOUT\n")
-            return 124, ""
-        except BaseException:
-            _kill_group(p)
-            _wait_killed(p, lf)
-            raise
-        finally:
-            with _CHILD_LOCK:
-                _CHILDREN.discard(p)
-            if p.stdout is not None:
-                p.stdout.close()
+        with tempfile.TemporaryFile() as of:
+            p = _spawn(cmd, cwd=cwd, env=env, stdout=of, stderr=lf)
+            try:
+                rc = _wait_leader(p, timeout)
+                of.seek(0)
+                return rc, of.read().decode("utf-8", errors="replace")
+            except subprocess.TimeoutExpired:
+                _kill_group(p)
+                _wait_killed(p, lf)
+                lf.write(b"\n[verify] TIMEOUT\n")
+                return 124, ""
+            except BaseException:
+                _kill_group(p)
+                _wait_killed(p, lf)
+                raise
+            finally:
+                with _CHILD_LOCK:
+                    _CHILDREN.discard(p)
 
 
 # ---------------------------------------------------------------- kill safety: signals, sweep, reap
@@ -1371,8 +1395,11 @@ def provision_h11(ctx: Ctx, py: Path, src: Path, env: dict) -> tuple[Path | None
         return None, "h11 for /usr/bin/python3 not provisioned: tests/ci/root_closure.py h11-spec gave no requirement"
     if _run([str(py), "-m", "pip", "install", "--no-deps", "--target", str(site), spec], cwd=src, env=env, log=ctx.log, timeout=900):
         return None, f"h11 for /usr/bin/python3 not provisioned: pip install --target of {spec} failed (see log)"
-    probe = subprocess.run([SYSTEM_PYTHON, "-c", "import h11"], capture_output=True, text=True, timeout=60,
-                           env={**env, "PYTHONPATH": str(site)}) if os.path.exists(SYSTEM_PYTHON) else None
+    try:
+        probe = subprocess.run([SYSTEM_PYTHON, "-c", "import h11"], capture_output=True, text=True, timeout=60,
+                               env={**env, "PYTHONPATH": str(site)}) if os.path.exists(SYSTEM_PYTHON) else None
+    except subprocess.TimeoutExpired:
+        return None, f"h11 for /usr/bin/python3 not provisioned: {SYSTEM_PYTHON} timed out importing it from the run dir"
     if probe is None:
         return None, f"h11 for /usr/bin/python3 not provisioned: {SYSTEM_PYTHON} does not exist on this host"
     if probe.returncode != 0:
@@ -1850,16 +1877,19 @@ def _run_legs(a, top: Path, sha: str, run: Path, run_id: str, ledger: Ledger, st
             if getattr(out.get("linux_err"), "verify_remote_unstopped", False):
                 # the leg failed and its own stop of the remote runner was not confirmed: try once more, keeping the
                 # remote logs
-                stop_remote_run(a.host, run_id, remove_dir=False)
-                remote["stopped"] = True
-            # the remote leg ended on its own: it cleaned up after success and stopped itself after a failure
-            remote["done"] = True
+                if stop_remote_run(a.host, run_id, remove_dir=False):
+                    remote["stopped"] = True
+                else:
+                    print(f"verify: the remote run on {a.host} could not be confirmed stopped (verify_remote_unstopped)",
+                          file=sys.stderr)
+            # the remote leg ended on its own: it cleaned up after success and stopped itself after a failure; one whose
+            # stop failed twice is not done, so a later kill signal tries the stop again
+            remote["done"] = not getattr(out.get("linux_err"), "verify_remote_unstopped", False) or remote.get("stopped", False)
     except BaseException:
         terminate_children()
         if t and not remote.get("done"):
             t.join(30)
-            stop_remote_run(a.host, run_id)
-            remote["stopped"] = True
+            remote["stopped"] = stop_remote_run(a.host, run_id)
         raise
     if "linux_err" in out:
         raise out["linux_err"]
@@ -2129,7 +2159,7 @@ def cmd_reverdict(a) -> int:
             raise ValueError(f"the receipt {rp} is not run {a.run}'s (its run_id is "
                              f"{old.get('run_id') if isinstance(old, dict) else None!r}); nothing was re-judged")
         new = reverdict_receipt(old, led)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RuntimeError) as e:
         print(f"verify: {e}", file=sys.stderr)
         return 2
     write_receipt(new, rp.parent, path=rp)

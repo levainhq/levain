@@ -1097,7 +1097,7 @@ def test_v8_a_failed_remote_step_stops_the_remote_run_and_keeps_its_logs(repo, t
 
 def test_v8_a_laptop_kill_during_both_legs_stops_the_remote_run(monkeypatch, tmp_path):
     stopped = []
-    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid: stopped.append((host, rid)))
+    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid: stopped.append((host, rid)) or True)
     monkeypatch.setattr(verify, "terminate_children", lambda *a, **k: None)
 
     def local(*a, **k):
@@ -1398,7 +1398,7 @@ def test_r1_v7_a_newline_terminated_bad_last_record_fails_closed(tmp_path, capsy
 
 def _kill_in_join(monkeypatch, tmp_path, leg):
     stopped, released, mac_done = [], threading.Event(), threading.Event()
-    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid: stopped.append((host, rid)))
+    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid: stopped.append((host, rid)) or True)
     monkeypatch.setattr(verify, "terminate_children", lambda *a, **k: released.set())
 
     def local(*a, **k):
@@ -1449,7 +1449,7 @@ def test_r1_v8_a_kill_that_escapes_the_leg_runner_is_still_stopped_by_the_run(re
     r, sha = repo
     stopped = []
     monkeypatch.setattr(verify, "Tools", FakeTools)
-    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid: stopped.append((host, rid)))
+    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid: stopped.append((host, rid)) or True)
 
     def legs(*a, remote=None, **k):
         remote["started"] = True                       # the remote leg is live and nothing below stopped it
@@ -1899,7 +1899,7 @@ def test_rc3_an_unconfirmed_remote_stop_is_flagged_and_the_run_stops_it_again(re
                               script=ROOT / "scripts" / "verify.py")
     assert getattr(bad.value, "verify_remote_unstopped", False) is True
     stopped = []
-    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid, remove_dir=True: stopped.append((host, rid, remove_dir)))
+    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid, remove_dir=True: stopped.append((host, rid, remove_dir)) or True)
 
     def remote(*a, **k):
         raise bad.value
@@ -1932,6 +1932,8 @@ def test_rc3_the_pytest_timeout_reaches_the_remote_run_and_sizes_its_outer_timeo
 def test_rc3_a_killed_child_that_never_exits_does_not_hang_the_run(tmp_path, monkeypatch):
     class Stuck:                                                   # SIGKILL cannot reap it (uninterruptible sleep)
         pid = 2 ** 22 + 7
+        returncode = None
+        args = ["x"]
 
         def wait(self, timeout=None):
             if timeout is None:
@@ -1939,6 +1941,7 @@ def test_rc3_a_killed_child_that_never_exits_does_not_hang_the_run(tmp_path, mon
             raise subprocess.TimeoutExpired("x", timeout)
 
     monkeypatch.setattr(verify, "_spawn", lambda *a, **k: Stuck())
+    monkeypatch.setattr(verify, "_leader_exited", lambda p: False)       # a leader in uninterruptible sleep never reports an exit
     monkeypatch.setattr(verify, "_kill_group", lambda p, grace=5.0: None)
     monkeypatch.setattr(verify, "REAP_WAIT", 0.01, raising=False)
     log = tmp_path / "log"
@@ -1995,3 +1998,123 @@ def test_rc3_a_red_with_no_failure_text_is_never_the_same_failure_as_main(tmp_pa
                           run_id="r", sha="s", touched=set(), rerun=lambda n: False,
                           baseline=lambda n: {"tests/a.py::t": {"state": "red", "sig": ["", ""]}})[0]
     assert rec["class"] == "regression" and "no failure text" in rec["evidence"] and rec["ledger_id"] is None
+
+
+# ---- L3 verifyrc r2 fixes
+
+def test_r2_a_group_is_never_signalled_after_its_leader_was_reaped(tmp_path, monkeypatch):
+    """The group id of a reaped leader may be a recycled pid: every killpg must happen while the leader is unreaped,
+    and a child a finished command left behind is still killed."""
+    spawned, calls = [], []
+    real_spawn, real_killpg = verify._spawn, os.killpg
+
+    def spawn(*a, **k):
+        p = real_spawn(*a, **k)
+        spawned.append(p)
+        return p
+
+    def killpg(pgid, sig):
+        calls.append((pgid, sig, [p.returncode for p in spawned if p.pid == pgid]))
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(verify, "_spawn", spawn)
+    monkeypatch.setattr(verify.os, "killpg", killpg)
+    pidf = tmp_path / "pid"
+    rc = verify._run(["/bin/sh", "-c", f"sleep 60 & echo $! > {pidf}; exit 0"], cwd=tmp_path, env={"PATH": "/usr/bin:/bin"},
+                     log=tmp_path / "log", timeout=30)
+    pid = int(pidf.read_text())
+    try:
+        end = time.time() + 5
+        while time.time() < end:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the leftover child survived")
+        assert rc == 0 and calls, "no group kill happened"
+        assert all(rcs == [None] for _, _, rcs in calls), f"killpg after the leader was reaped: {calls}"
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_r2_a_timed_out_group_is_not_signalled_after_the_reap(tmp_path, monkeypatch):
+    spawned, calls = [], []
+    real_spawn, real_killpg = verify._spawn, os.killpg
+
+    def spawn(*a, **k):
+        p = real_spawn(*a, **k)
+        spawned.append(p)
+        return p
+
+    def killpg(pgid, sig):
+        calls.append((sig, [p.returncode for p in spawned if p.pid == pgid]))
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(verify, "_spawn", spawn)
+    monkeypatch.setattr(verify.os, "killpg", killpg)
+    assert verify._run(["/bin/sleep", "60"], cwd=tmp_path, env={"PATH": "/usr/bin:/bin"}, log=tmp_path / "log", timeout=0.3) == 124
+    assert calls and all(rcs == [None] for _, rcs in calls), calls
+
+
+def test_r2_a_failed_remote_stop_retry_is_not_recorded_as_stopped(tmp_path, monkeypatch, capsys):
+    err = RuntimeError("linux leg failed")
+    err.verify_remote_unstopped = True
+    monkeypatch.setattr(verify, "run_leg_remote", lambda *a, **k: (_ for _ in ()).throw(err))
+    a = types.SimpleNamespace(leg="linux", host="argushub", here=False, workers=None, linux_workers=None, python=None, pytest_timeout=5.0)
+    for ok in (True, False):
+        monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid, remove_dir=True, ok=ok: ok)
+        with pytest.raises(RuntimeError):
+            verify._run_legs(a, tmp_path, SHA40, tmp_path, RUN_ID, verify.Ledger(tmp_path / "l"), verify.Status(tmp_path))
+        assert ("verify_remote_unstopped" in capsys.readouterr().err) is (not ok)
+        assert err.verify_remote_unstopped is True
+
+
+def test_r2_a_refused_run_is_final_and_a_sweep_keeps_it(tmp_path):
+    assert "refused" in verify.FINAL_STATES
+    state = tmp_path / "state"
+    d = state / "runs" / "refused-run"
+    d.mkdir(parents=True)
+    verify.Status(d).update(state="refused", note="x")
+    past = time.time() - verify.KEPT_LOG_TTL - 100
+    os.utime(d / "status.json", (past, past))
+    assert verify.sweep_runs(state, tmp_path, FakeTools(), current="c", say=lambda *_: None) == []
+    assert d.exists()
+
+
+def test_r2_the_red_message_says_a_platformless_leg_recorded_no_platform_and_a_pre_fingerprint_receipt_says_so():
+    why = verify.verdict_of([{"platform": None, "jobs": []}])[1]
+    assert any("recorded no platform" in w for w in why) and not any(w.startswith("None:") for w in why)
+    leg = _leg([], platform="mac", rc=0)
+    leg.pop("host_fingerprint", None)
+    why = verify.verdict_of([leg])[1]
+    assert any("before host_fingerprint existed" in w for w in why), why
+
+
+def test_r2_a_timeout_probing_system_python_is_a_not_provisioned_reason_not_a_traceback(tmp_path, monkeypatch):
+    ctx = _prov_ctx(tmp_path)
+    monkeypatch.setattr(verify, "_capture", lambda cmd, **k: (0, "h11>=0.16.0\n"))
+    monkeypatch.setattr(verify, "_run", lambda cmd, **k: 0)
+    monkeypatch.setattr(verify.os.path, "exists", lambda p: True)
+
+    def boom(*a, **k):
+        raise subprocess.TimeoutExpired("x", 60)
+
+    monkeypatch.setattr(verify.subprocess, "run", boom)
+    site, why = verify.provision_h11(ctx, Path("/venv/bin/python"), tmp_path, {})
+    assert site is None and "not provisioned" in why and "timed out" in why
+
+
+def test_r2_a_malformed_ledger_makes_reverdict_print_a_message_not_a_traceback(tmp_path, monkeypatch, capsys):
+    state = tmp_path / "state"
+    mac = _leg([], platform="mac", rc=0)
+    receipt = verify.build_receipt(SHA40, RID, {}, "blob", [mac, _leg([], platform="linux", rc=0)], True)
+    rpath = verify.write_receipt(receipt, tmp_path / "receipts")
+    verify.Status(state / "runs" / RID).update(state="red", receipt=str(rpath), verdict="red")
+    monkeypatch.setattr(verify, "reverdict_receipt", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ledger line 3 is malformed")))
+    assert verify.main(["reverdict", "--run", RID, "--state-dir", str(state)]) == 2
+    assert "malformed" in capsys.readouterr().err
