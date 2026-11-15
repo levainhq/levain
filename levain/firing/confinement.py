@@ -9439,18 +9439,27 @@ def ports(args):
         if not (a.isascii() and a.isdigit() and 0 < int(a) < 65536):
             raise ValueError("not a port: %r" % a)
     return [int(a) for a in args]
-def run(listeners, sig):
-    # sig is held (blocked) in this thread before any relay thread starts, so every thread holds it and
-    # one sent at any moment stays pending until sigwait takes it. A handler and signal.pause() lost one
-    # that landed between Python's check for it and the pause (CI 132956252372, levain#30).
+def run(listeners, sig, woke=None):
+    # Returns once sig came. sig is held (blocked) in this thread before any relay thread starts, so
+    # every thread holds it and one sent from then on stays pending until sigwait takes it. A handler and
+    # signal.pause() lost one that landed between Python's check for it and the pause (CI 132956252372).
+    # One sent before the block went to the caller's handler; if that has not run yet, its C half has
+    # written the signal to woke (signal.set_wakeup_fd), read here, since sigwait would never see it.
     # No sig: nothing in this process handles a signal, so it runs until one kills it.
     if sig is not None:
         signal.pthread_sigmask(signal.SIG_BLOCK, {sig})
+        if woke is not None:
+            try:
+                if bytes([sig]) in os.read(woke, 4096):
+                    return
+            except BlockingIOError:
+                pass
     for s, connect in listeners:
         threading.Thread(target=serve, args=(s, connect), daemon=True).start()
     if sig is None:
         threading.Event().wait()
-    signal.sigwait({sig})
+    else:
+        signal.sigwait({sig})
 mode, d = sys.argv[1], sys.argv[2]
 if mode == "out":
     made = []
@@ -9466,8 +9475,16 @@ if mode == "out":
                 os.rmdir(d)
             except OSError:
                 pass
-    # SIGTERM is held from here: one sent during the setup waits for run(), which then stops.
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    def stop(*_):
+        tidy()
+        os._exit(0)
+    # During the (single-threaded) setup a SIGTERM stops the relay at once, so a setup that stalls (a
+    # slow home) is still tidied by levain's TERM before its KILL. run() then holds it (see there).
+    woke, wake = os.pipe()
+    os.set_blocking(woke, False)
+    os.set_blocking(wake, False)
+    signal.set_wakeup_fd(wake)
+    signal.signal(signal.SIGTERM, stop)
     os.umask(0o077)
     def maker_gone(name):
         parts = name[len(".levain-relay-"):].split("-")
@@ -9539,9 +9556,8 @@ if mode == "out":
     n = os.open(os.devnull, os.O_RDWR)
     os.dup2(n, 1)
     os.dup2(n, 2)
-    run(listeners, signal.SIGTERM)
-    tidy()
-    os._exit(0)
+    run(listeners, signal.SIGTERM, woke)
+    stop()
 elif mode == "in":
     i = sys.argv.index("--")
     try:
