@@ -161,17 +161,47 @@ def test_a_log_written_under_a_laxer_append_rule_still_replays(world):
     assert g["id"] in world.state().policy.grants
 
 
+def widening(world: World, n: int, base: dict, days: int = 1, **over) -> dict:
+    return order(world, n, widens=base["id"], widens_sha256=auth.standing_order_sha256(base), days=days, **over)
+
+
 def test_a_widening_names_a_live_order_that_widens_nothing(world):
     base = order(world, 1)
     create(world, base)
-    create(world, order(world, 2, widens=base["id"], days=1))
-    assert "which is not a standing order that widens nothing" in refused(world, order(world, 3, widens="so-" + "f" * 12))
-    assert "widens nothing" in refused(world, order(world, 4, widens="so-" + "0" * 11 + "2"))
-    assert "cannot widen itself" in refused(world, order(world, 5, widens="so-" + "0" * 11 + "5"))
+    wide = widening(world, 2, base)
+    create(world, wide)
+    assert "which is not a standing order that widens nothing" in refused(
+        world, order(world, 3, widens="so-" + "f" * 12, widens_sha256="0" * 64))
+    assert "widens nothing" in refused(world, widening(world, 4, wide))
+    assert "cannot widen itself" in refused(world, order(world, 5, widens="so-" + "0" * 11 + "5",
+                                                         widens_sha256="0" * 64))
 
 
 def test_a_widening_of_an_expired_base_is_refused(world):
     base = order(world, 1, days=1)
     create(world, base)
     world.clock.now += timedelta(days=2)
-    assert "not live" in refused(world, order(world, 2, widens=base["id"], days=1))
+    assert "not live" in refused(world, widening(world, 2, base))
+
+
+def test_a_widening_carries_its_base_digest_and_one_naming_another_record_is_refused(world):
+    """L3 r1 on ND-2 (codex HIGH): a widening binds to its base's whole record, not its id alone."""
+    base = order(world, 1)
+    create(world, base)
+    assert "widens_sha256" in refused(world, order(world, 2, widens=base["id"], days=1))      # no digest: the shape
+    assert "its sha256 differs" in refused(world, order(world, 3, widens=base["id"], widens_sha256="0" * 64, days=1))
+    create(world, widening(world, 4, base))
+
+
+def test_a_widening_of_a_stopped_base_is_refused_at_append(world):
+    """L3 r1 on ND-2 (codex #2): a base whose signing key was revoked answers nothing, so no widening of it is signed."""
+    from tests.test_consent_queue import Key
+
+    second = Key(world.tmp / "keys", "laptop2")
+    world.link({"op": "enrol", "fingerprint": second.fp, "public_key": second.public_key, "class": "laptop-presence",
+                "custody": "passphrase"})
+    world.keys["laptop2"] = (second.fp, lambda m: second.sign(m, auth.NAMESPACE))
+    base = order(world, 1)
+    create(world, base, "laptop2")
+    world.link({"op": "revoke_key", "fingerprint": second.fp})
+    assert "answers nothing" in refused(world, widening(world, 2, base))

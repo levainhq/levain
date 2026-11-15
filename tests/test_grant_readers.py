@@ -132,7 +132,11 @@ READERS: dict[str, tuple[int, str, str]] = {
     "levain/consent/grants.py::_revocable":
         (1, "write", "a stopped grant must still be revocable"),
     "levain/authority.py::_standing_order_widen_check":
-        (4, "rule", "an append rule: a widening names a standing order the policy (or the loosen) holds, live and widening nothing"),
+        (5, "rule", "an append rule: a widening names a standing order the policy (or the loosen) holds, live, widening "
+                    "nothing, by its record's sha256, and (when the policy already held it) not stopped"),
+    "levain/desk/standing_orders.py::order_status":
+        (1, "display", "`desk order list`'s label for one order (in force, stopped, expired, a lapsed widening); the "
+                       "in-force answer is the caller's from orders_in_force, which reads grants_in_force"),
     "levain/desk/standing_orders.py::sign_order":
         (1, "write", "refuses a second create of an id the policy already holds, before anything is signed"),
     "levain/desk/cli.py::run_order":

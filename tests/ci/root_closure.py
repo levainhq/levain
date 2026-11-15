@@ -311,7 +311,7 @@ LAZY_SITES = {
     # operator: _agent_link_card has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
     'levain/cockpit/authority.py::_agent_link_card::from levain.autonomic.coverage import guard_problem': 'operator',
     # operator: standing_order_card is the signing card of a standing order (night desk ND-2); only `levain desk order sign` (the operator's terminal) and standing_orders.sign_order call it, never a root process
-    'levain/cockpit/authority.py::standing_order_card::from levain.authority import STANDING_ORDER_KIND, AuthorityError, _standing_order_check, _thaw, _validate_standing_order': 'operator',
+    'levain/cockpit/authority.py::standing_order_card::from levain.authority import STANDING_ORDER_KIND, AuthorityError, _standing_order_check, _thaw, _validate_standing_order, standing_order_sha256': 'operator',
     # operator: open_bar_problem has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process
     'levain/cockpit/authority.py::open_bar_problem::from levain.agent_authority import OPEN_BAR_REFUSAL, AgentAuthorityError, open_bar_for': 'operator',
     # operator: sign_card has no caller in levain/ (git grep: only tests/test_cockpit_agent_card.py); it is the cockpit's agent-link signing card, run only when the operator signs a link, never by a root process

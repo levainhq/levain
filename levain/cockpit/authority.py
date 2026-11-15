@@ -411,7 +411,7 @@ def standing_order_card(grant: Mapping[str, Any]) -> dict[str, Any]:
     line, every kill, what it widens, and until when. ``sheet`` is that layout as one text (:func:`standing_order_sheet`
     renders it). Raises :class:`CardRefused` for a record that is not a standing order, one the log's own shape and
     append rules would refuse (a card is never offered for an order the log would not carry), and never anything else."""
-    from levain.authority import STANDING_ORDER_KIND, AuthorityError, _standing_order_check, _thaw, _validate_standing_order
+    from levain.authority import STANDING_ORDER_KIND, AuthorityError, _standing_order_check, _thaw, _validate_standing_order, standing_order_sha256
 
     if not isinstance(grant, Mapping) or grant.get("kind") != STANDING_ORDER_KIND:
         raise CardRefused(f"only a {STANDING_ORDER_KIND} has this card")
@@ -442,7 +442,10 @@ def standing_order_card(grant: Mapping[str, Any]) -> dict[str, Any]:
         "judgement": list(fields["judgement_lines"]),
         "kills": [f"{k['when']} -> {k['then']}" for k in fields["kills"]],
         "widens": fields.get("widens"),
+        "widens_sha256": fields.get("widens_sha256"),
         "until": f"expires {fields['expires_at']}",
+        # the whole record's sha256: the brief quotes the order beside this same digest, so he can match the two
+        "sha256": standing_order_sha256(fields),
     }
     card["sheet"] = standing_order_sheet(card)
     return card
@@ -461,8 +464,10 @@ def standing_order_sheet(card: Mapping[str, Any]) -> str:
     out += block("Judgement lines (reading only):", card["judgement"])
     out += block("Kills:", card["kills"])
     if card.get("widens"):
-        out.append(f"Widens {card['widens']}; it lapses to that order at its own expiry.")
+        out.append(f"Widens {card['widens']} (that order's sha256 {card.get('widens_sha256')}); it lapses to that order "
+                   "at its own expiry, and answers nothing if that order is revoked or signed again.")
     out.append(str(card["until"]))
+    out.append(f"The whole order's sha256 (the desk brief prints it beside the order): {card['sha256']}")
     return "\n".join(out)
 
 

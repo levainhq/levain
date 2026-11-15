@@ -65,7 +65,7 @@ __all__ = [
     "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3", "FORMAT_V4",
     "FORMAT_V5", "VOICE_KEY_KIND", "VOICE_KEY_PROVIDERS", "VOICE_KEY_USES", "voice_key_for", "voice_key_record",
     "GRADUATION_CREATE_RANK",
-    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "STANDING_ORDER_KIND", "STANDING_ORDER_MAX", "STANDING_ORDER_VOICES", "standing_order", "SEAT_LEASE_KIND", "SEAT_LEASE_MAX", "SEAT_EGRESS_KIND", "SEAT_EGRESS_MAX", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
+    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "STANDING_ORDER_KIND", "STANDING_ORDER_MAX", "STANDING_ORDER_VOICES", "standing_order", "standing_order_sha256", "standing_order_widens","SEAT_LEASE_KIND", "SEAT_LEASE_MAX", "SEAT_EGRESS_KIND", "SEAT_EGRESS_MAX", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
@@ -2201,7 +2201,10 @@ STANDING_ORDER_KIND = "standing-order"
 STANDING_ORDER_MAX = timedelta(days=14)
 _SO_REQUIRED = frozenset({"id", "kind", "words", "words_sha256", "restatement", "effect_lines", "judgement_lines",
                           "kills", "expires_at"})
-_SO_FIELDS = _SO_REQUIRED | {"widens"}
+# a widening names its base by id AND by the sha256 of the base's whole signed record (``widens_sha256``,
+# :func:`standing_order_sha256`): a base revoked and signed again under the same id is another order, which the old
+# widening never widens (L3 r1 on ND-2, codex HIGH)
+_SO_FIELDS = _SO_REQUIRED | {"widens", "widens_sha256"}
 _SO_ID = re.compile(r"so-[0-9a-f]{12}")
 _SO_WORDS_MAX = 4096
 _SO_LINE_MAX = 512
@@ -2249,7 +2252,7 @@ def _validate_standing_order(grant: Mapping[str, Any], what: str, at: datetime |
     (:func:`_standing_order_check`), not replay rules, so no later rule change refuses the log."""
     if set(grant) not in (_SO_REQUIRED, _SO_FIELDS):
         raise AuthorityError(f"{what} (a standing order) must carry exactly {', '.join(sorted(_SO_REQUIRED))}, "
-                             "and may carry widens")
+                             "and may carry widens with widens_sha256")
     if grant["kind"] != STANDING_ORDER_KIND:
         raise AuthorityError(f"{what}.kind must be {STANDING_ORDER_KIND!r}")
     for name in ("id",) + (("widens",) if "widens" in grant else ()):
@@ -2257,6 +2260,9 @@ def _validate_standing_order(grant: Mapping[str, Any], what: str, at: datetime |
             raise AuthorityError(f"{what}.{name} must be so- and 12 lowercase hex digits")
     if grant.get("widens") == grant["id"]:
         raise AuthorityError(f"{what} cannot widen itself")
+    if "widens" in grant and not (isinstance(grant["widens_sha256"], str)
+                                  and _SHA256_HEX.fullmatch(grant["widens_sha256"])):
+        raise AuthorityError(f"{what}.widens_sha256 must be the sha256 (64 lowercase hex digits) of the order it widens")
     words = _so_text(grant["words"], f"{what}.words", _SO_WORDS_MAX, newlines=True)
     sha = grant["words_sha256"]
     if not isinstance(sha, str) or not _SHA256_HEX.fullmatch(sha) or sha != hashlib.sha256(words.encode()).hexdigest():
@@ -2315,6 +2321,34 @@ def standing_order(grant: Any) -> bool:
         and _grant_kind(grant) is _GRANT_KINDS.get(STANDING_ORDER_KIND)
 
 
+def standing_order_sha256(grant: Mapping[str, Any]) -> str:
+    """The sha256 of a standing order's whole record as the log holds it (its canonical JSON): what the sign sheet
+    shows, what the desk brief quotes beside the order, and what a widening names its base by (``widens_sha256``)."""
+    return hashlib.sha256(_canonical(_thaw(grant)).encode()).hexdigest()
+
+
+def standing_order_widens(state: AuthoritySnapshot, grant: Mapping[str, Any], pool: Mapping[str, Any]) -> str | None:
+    """Why widening ``grant`` does not bind to its base in ``pool`` (the grants that answer, or the policy an append
+    would leave), or None when it does: the base is a standing order that widens nothing, its whole record is the
+    one ``widens_sha256`` names, and it was not brought in after the widening (``grant_born``, so a base revoked and
+    signed again byte for byte is not the base it was). Expiry and signers are the caller's to judge."""
+    base_id = grant.get("widens")
+    base = pool.get(base_id) if isinstance(base_id, str) else None
+    if not (isinstance(base, Mapping) and base.get("kind") == STANDING_ORDER_KIND) or "widens" in base:
+        return "which is not a standing order that widens nothing"
+    try:
+        digest = standing_order_sha256(base)
+    except (TypeError, ValueError, RecursionError):
+        return "which has no canonical form"
+    if grant.get("widens_sha256") != digest:
+        return "but not the order of that id the log holds now (its sha256 differs: it was revoked and signed again)"
+    gid = grant.get("id")
+    born_base, born_self = state.grant_born.get(base_id), state.grant_born.get(gid) if isinstance(gid, str) else None
+    if born_base is not None and born_self is not None and born_base > born_self:
+        return "but the order of that id the log holds now was signed after this widening"
+    return None
+
+
 def _standing_order_check(grants: list[Any], after: str = "") -> None:
     """At append: each standing order a create or a loosen brings in is a whole order. The verbs are the closed list
     (:data:`_SO_VERBS`) and each takes exactly its own arguments, every value in its enum (a ``send_ack`` names its
@@ -2368,8 +2402,9 @@ def _standing_order_renew_refused(grants: list[Any], after: str = "") -> None:
 
 def _standing_order_widen_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
     """At append: a standing order that ``widens`` another names a standing order the policy holds, live at ``now``,
-    that does not itself widen (no chains). The reader gives a widening no force when its base is not in force
-    (:func:`levain.desk.standing_orders.orders_in_force`), so this only refuses what could never be one."""
+    that does not itself widen (no chains), by its whole record's sha256 (:func:`standing_order_widens`), and that is
+    not stopped (both its signers active, :func:`grant_stop_reason`): a widening of a base that answers nothing could
+    never answer. The reader holds the same binding (:func:`levain.desk.standing_orders.orders_in_force`)."""
     op = rec["op"]
     if op == "create_grant":
         brought = [rec["grant"]]
@@ -2385,13 +2420,18 @@ def _standing_order_widen_check(state: AuthoritySnapshot, rec: Mapping[str, Any]
     for grant in brought:
         if not (isinstance(grant, Mapping) and grant.get("kind") == STANDING_ORDER_KIND and "widens" in grant):
             continue
-        base = pool.get(grant["widens"])
-        if not (isinstance(base, Mapping) and base.get("kind") == STANDING_ORDER_KIND) or "widens" in base:
-            raise AuthorityError(f"standing order {str(grant.get('id'))[:40]!r} widens "
-                                 f"{str(grant['widens'])[:40]!r}, which is not a standing order that widens nothing")
+        said = f"standing order {str(grant.get('id'))[:40]!r} widens {str(grant['widens'])[:40]!r}, "
+        why = standing_order_widens(state, grant, pool)
+        if why is not None:
+            raise AuthorityError(said + why)
+        base_id, base = grant["widens"], pool[grant["widens"]]
         if not _kind_live(base, now, STANDING_ORDER_KIND):
-            raise AuthorityError(f"standing order {str(grant.get('id'))[:40]!r} widens "
-                                 f"{str(grant['widens'])[:40]!r}, which is not live")
+            raise AuthorityError(said + "which is not live")
+        held = state.policy.grants.get(base_id)
+        if held is not None and _canonical(_thaw(held)) == _canonical(_thaw(base)):
+            stopped = grant_stop_reason(state, base_id)
+            if stopped is not None:
+                raise AuthorityError(said + f"which answers nothing: {stopped}")
 
 
 #: kind -> (the way back for a stopped grant of that kind, whether it can only be cleared). THE ONLY place a kind's

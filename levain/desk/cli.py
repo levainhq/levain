@@ -486,6 +486,23 @@ def _order_spec(path: Path) -> dict[str, Any]:
             <= set(spec) <= _ORDER_SPEC_KEYS:
         raise CoordError("the order file is one JSON object of words, will, will_not, effect_lines, judgement_lines, "
                          "kills, and optionally widens and days")
+    # the nested shape, so a malformed file is refused in words (never a traceback, never a string read as a list of
+    # one-character lines); the values themselves are the log's rules, judged on the card
+    if not isinstance(spec["words"], str):
+        raise CoordError("the order file's words is text")
+    for name in ("will", "will_not", "judgement_lines"):
+        if not isinstance(spec[name], list) or not all(isinstance(v, str) for v in spec[name]):
+            raise CoordError(f"the order file's {name} is a list of text lines")
+    lines = spec["effect_lines"]
+    if not isinstance(lines, list) or not all(
+            isinstance(e, dict) and set(e) == {"verb", "args", "per_incident", "per_night"}
+            and isinstance(e["args"], dict) and all(isinstance(v, list) for v in e["args"].values()) for e in lines):
+        raise CoordError("the order file's effect_lines is a list of objects of exactly verb, args (names to lists), "
+                         "per_incident, per_night")
+    if not isinstance(spec["kills"], list) or not all(isinstance(k, dict) for k in spec["kills"]):
+        raise CoordError("the order file's kills is a list of objects of when and then")
+    if "widens" in spec and not isinstance(spec["widens"], str):
+        raise CoordError("the order file's widens is an order id")
     return spec
 
 
@@ -510,8 +527,7 @@ def run_order(args: argparse.Namespace, out: Any = None) -> int:
             rows = []
             for gid in held:
                 g = state.policy.grants[gid]
-                why = so.stop_reason(state, gid)
-                status = "stopped: " + why if why else "in force" if gid in live else "expired"
+                status = so.order_status(state, gid, now, live)
                 rows.append({"id": gid, "status": status, "expires_at": g["expires_at"],
                              "widens": g.get("widens"), "words_sha256": g["words_sha256"]})
             _emit(out, args.json, {"orders": rows},
@@ -527,20 +543,37 @@ def run_order(args: argparse.Namespace, out: Any = None) -> int:
         days = spec.get("days", 14)
         if type(days) is not int or not 1 <= days <= 14:
             raise CoordError("days is a whole number from 1 to 14")
-        grant = so.build_order(words=spec["words"], will=spec["will"], will_not=spec["will_not"],
-                               effect_lines=spec["effect_lines"], judgement_lines=spec["judgement_lines"],
-                               kills=spec["kills"], now=now, life=timedelta(days=days), widens=spec.get("widens"))
+        widens, widens_sha256 = spec.get("widens"), None
+        if widens is not None:
+            # a widening names its base by the base's whole record, read from the log now (refused unless it is in force)
+            state = so.read_state(root)
+            if state is None:
+                raise CoordError(f"order {widens[:40]} is not in force: the authority log holds no order")
+            widens_sha256 = so.base_sha256(state, widens, now)
         try:
+            grant = so.build_order(words=spec["words"], will=spec["will"], will_not=spec["will_not"],
+                                   effect_lines=spec["effect_lines"], judgement_lines=spec["judgement_lines"],
+                                   kills=spec["kills"], now=now, life=timedelta(days=days), widens=widens,
+                                   widens_sha256=widens_sha256)
             card = standing_order_card(grant)
         except CardRefused as exc:
             raise CoordError(f"{exc}: nothing was signed") from None
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise CoordError(f"the order file is malformed ({type(exc).__name__}: {str(exc)[:120]}): nothing was "
+                             "signed") from None
+        # ONE snapshot: the sheet is the card's, and the card's own fields (never the record built above) are what is
+        # signed, held to the digest the sheet printed
+        fields = card["fields"]
         print(card["sheet"], file=sys.stderr if args.json else out, flush=True)
         _need_terminal(args, "signing")
         signer_fp, sign = dcli._signer(args, NAMESPACE, "order sign")
-        _confirm(args, "signing", f"Sign standing order {card['id']} as {signer_fp}, the whole of it as shown above")
-        new = so.sign_order(root, grant, signer_fp=signer_fp, sign=sign, clock=lambda: datetime.now(timezone.utc))
-        _emit(out, args.json, {"id": card["id"], "expires_at": grant["expires_at"], "head": new.seq},
-              f"signed: {card['id']} until {grant['expires_at']}")
+        _confirm(args, "signing", f"Sign standing order {card['id']} (sha256 {card['sha256']}) as {signer_fp}, the "
+                                  "whole of it as shown above")
+        new = so.sign_order(root, fields, signer_fp=signer_fp, sign=sign, clock=lambda: datetime.now(timezone.utc),
+                            expect_sha256=card["sha256"])
+        _emit(out, args.json, {"id": card["id"], "expires_at": fields["expires_at"], "head": new.seq,
+                               "sha256": card["sha256"]},
+              f"signed: {card['id']} until {fields['expires_at']} (sha256 {card['sha256']})")
     except (*_faults(), OSError, KeyError_) as exc:
         print(f"levain desk order {cmd}: {exc}", file=sys.stderr)
         return 1
