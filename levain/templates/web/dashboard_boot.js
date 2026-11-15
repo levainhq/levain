@@ -1547,7 +1547,7 @@
     if (deskSection && wantDesk && !deskView) {
       deskHost.replaceChildren();
       const T = window.LevainCockpitTransport;
-      deskView = window.LevainDeskView.mount(deskHost, { headers: () => (T ? T.headers() : {}) });
+      deskView = window.LevainDeskView.mount(deskHost, { headers: () => (T ? T.headers() : {}), probe: false });
     }
   }
 

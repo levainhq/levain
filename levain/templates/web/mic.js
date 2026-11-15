@@ -541,8 +541,252 @@
     return api;
   }
 
+  // The voice controls of a chat view's composer (levain#23): the on-device Dictate (with its one-tap Setup of the browser's speech
+  // pack) and the streaming Mic, drawn into `cfg.composer` before `cfg.before`. ONE implementation: the Room's view and the Desk's
+  // view both call it, and neither holds a copy. The view hands over only what is its own:
+  //   cfg = { doc, root, ta, composer, before, note, store, draftKey, speech, mic, probe, setupPollMs, onValue(), onTap(), stopped() }
+  // ta is the draft box, note the line under the box (shared with the view's own words), draftKey the store key the draft lives under,
+  // speech/mic override the page's recognizer / LevainMic (undefined = the page's own), onValue() runs after the box's value was set
+  // from a transcript (a set value fires no input event), onTap() runs inside the operator's own tap on a control, stopped() says
+  // the view was stopped. Returns { endDictation(), endStream(), live(), settle(), destroy() }: settle() is what a Send awaits.
+  function dock(cfg) {
+    var doc = cfg.doc, root = cfg.root, ta = cfg.ta, note = cfg.note, store = cfg.store, composer = cfg.composer;
+    var onValue = cfg.onValue || function () {}, onTap = cfg.onTap || function () {}, stopped = cfg.stopped || function () { return false; };
+    function mk(cls) { var b = doc.createElement("button"); b.className = cls; b.setAttribute("type", "button"); return b; }
+    var Speech = cfg.speech === undefined ? (root.SpeechRecognition || root.webkitSpeechRecognition) : cfg.speech;
+    // Dictation is on-device or absent: a browser whose recognizer cannot be told to stay local (it would send the audio to
+    // the browser vendor's cloud) gets no control, and the keyboard's own dictation key fills the draft box instead.
+    if (Speech) Speech = root.LevainMic && typeof root.LevainMic.localSpeech === "function" ? root.LevainMic.localSpeech(Speech) : null;
+    // the words come from the page's LevainMic at the time they are wanted (a page that replaced or removed one gets the plain fallback)
+    function words(fn, a, b) { var M = root.LevainMic; return M && typeof M[fn] === "function" ? M[fn](a, b) : ""; }
+    var DICT_TITLE = "On-device dictation where this browser provides it, and only while this page is open";
+    var STREAM_TITLE = "Streaming dictation through your speech provider, only while this page is open";
+    function dface(b, kind, title) {
+      if (root.LevainVoiceIcons) { root.LevainVoiceIcons.set(b, kind, null, title); return; }
+      b.textContent = FACE_WORDS[kind]; b.classList.add("voice-words"); b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", title || FACE_WORDS[kind]);
+    }
+    var micB = null, rec = null, setupB = null, onHidden = null, onBlur = null, setupT = 0;
+    // SpeechRecognition is [SecureContext] in the Web Speech spec and the microphone is https/localhost only: on an insecure page
+    // the on-device Dictate and its Setup are not offered at all, and the note says why (the keyboard's dictation key still works).
+    // Only the on-device path: the streaming Mic below is untouched. `=== false`: a host that does not report it keeps the old behaviour.
+    if (Speech && root.isSecureContext === false) {
+      Speech = null;
+      var insecureWords = words("dictateSetup", "insecure");
+      if (insecureWords) note.textContent = insecureWords;
+    }
+    if (Speech) {
+      // the one-tap set up of the browser's on-device speech pack: drawn only while the browser says the pack can be had
+      setupB = mk("rv-setup"); setupB.hidden = true;
+      micB = mk("rv-mic");
+      dface(micB, "dictate", DICT_TITLE);
+    }
+    var LM = cfg.mic === undefined ? (root.LevainMic || null) : cfg.mic;
+    var streamB = null, live = false, sbase = "", mOff = [];
+    if (LM && typeof LM.probe === "function") {
+      streamB = mk("rv-mic rv-mic-stream"); streamB.hidden = true;
+      dface(streamB, "mic", STREAM_TITLE);
+    }
+    var before = cfg.before || null;
+    function put(n) { if (before) composer.insertBefore(n, before); else composer.appendChild(n); }
+    if (micB) { put(micB); put(setupB); }
+    if (streamB) put(streamB);
+    function saveDraft() { try { if (store) store.setItem(cfg.draftKey, ta.value); } catch (e) { /* no storage */ } }
+    function endStream() { return live && LM.active() ? Promise.resolve(LM.stop()).then(null, function () {}) : Promise.resolve(); }
+
+    // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
+    var dbase = "", heard = "", lastHeard = "";
+    // the reason a failed dictation put in the note; a new attempt takes it back (only if the note still holds it: the note is
+    // shared with Send's own words). The words come from this file, once, for every dictation control.
+    var dictNote = "";
+    function dictSay(code) { note.textContent = dictNote = words("dictateReason", code) || "Dictation stopped."; }
+    function endDictation() {
+      var r = rec; rec = null;
+      if (micB) dface(micB, "dictate", DICT_TITLE);
+      if (r) { r.onresult = null; r.onend = null; r.onerror = null; try { r.stop(); } catch (e) { /* already stopped */ } }
+    }
+    if (micB) {
+      var lang = doc.documentElement.lang || (root.navigator && root.navigator.language) || "en-US";
+      micB.style.display = "none";                     // shown only once the browser says on-device dictation is available
+      // probe:false skips the availability question. MEASURED 2026-11-04 (RM-G2): SpeechRecognition.available({processLocally:true})
+      // froze the renderer of the installed headless Google Chrome on a bare page, so the cockpit page asks it nowhere; the mic
+      // is then shown on the prototype test alone and the click-time processLocally readback and onerror stay the guard.
+      //
+      // "downloadable" / "downloading" is not a dead end: SpeechRecognition.install({langs, processLocally}) fetches the pack, and it
+      // needs a tap (transient activation) when it would start a download, so the page offers a button and calls install() only
+      // inside that tap. It resolves true (installed), false (unsupported language or failed download; no cause given) or rejects
+      // NotAllowedError (no tap, or the browser declined). The spec also lets a browser report "downloadable" for a pack that IS
+      // installed until this page has called install() once, so the same tap takes the fast path there. "downloading" has no
+      // progress events: the page re-asks available() on a timer (bounded) and never calls install() a second time on its own.
+      var setupBusy = false, setupPolls = 0, SETUP_POLLS = 100;
+      var setupMs = typeof cfg.setupPollMs === "number" ? cfg.setupPollMs : 3000;
+      function setupWord(key, name) { return words("dictateSetup", key, name); }
+      function setupSay(key, name) { note.textContent = dictNote = setupWord(key, name); }
+      // true when the button is drawn. Dictate is hidden while Setup is shown (one control for one state); a button with no words
+      // (the words table missing) is not drawn at all, so the caller falls back to the plain note
+      function paintSetup(kind) {            // "offer" | "working" | null (no button)
+        var w = kind ? setupWord(kind) : "";
+        if (!w) { setupB.hidden = true; return false; }
+        setupB.hidden = false; setupB.disabled = kind === "working"; micB.style.display = "none";
+        setupB.textContent = w;
+        setupB.setAttribute("title", setupWord("offerTitle")); setupB.setAttribute("aria-busy", kind === "working" ? "true" : "false");
+        return true;
+      }
+      function canInstall() { return typeof Speech.install === "function"; }
+      // no install() here (or no words for the button): the pack cannot be fetched from this page, so say so and drop Dictate
+      function noSetup() { paintSetup(null); micB.remove(); if (!note.textContent) setupSay("noinstall"); }
+      // a synchronous throw from available() is a settled failure like a rejection (a poll counts it toward the limit; an ask after
+      // install says nothing is "done"), never an apparent success
+      function askAvailable() {
+        try { return Promise.resolve(typeof Speech.available === "function" ? Speech.available({ langs: [lang], processLocally: true }) : null); }
+        catch (e) { return Promise.reject(e); }
+      }
+      // what the browser answered: show Dictate, drop it, offer the set up, or wait for a download that is already running
+      function settleAvail(st, after) {
+        if (stopped()) return;
+        clearTimeout(setupT);
+        if (st === "unavailable") { paintSetup(null); micB.remove(); if (after) setupSay("none"); }
+        else if (st === "downloadable") {
+          if (!canInstall() || !paintSetup("offer")) return noSetup();
+          setupPolls = 0; if (after) setupSay("stillnot");
+        } else if (st === "downloading") {
+          if (!canInstall() || !paintSetup("working")) return noSetup();
+          setupT = setTimeout(function () {
+            if (stopped() || setupBusy) return;
+            if (++setupPolls > SETUP_POLLS) { setupPolls = 0; paintSetup("offer"); setupSay("slow"); return; }
+            // a poll that fails counts toward the same limit: it waits again instead of dropping to a button with no words
+            askAvailable().then(function (s) { settleAvail(s, false); }, function () { settleAvail("downloading", false); });
+          }, setupMs);
+        } else { setupPolls = 0; paintSetup(null); micB.style.display = ""; if (after) setupSay("done"); }
+      }
+      var probing = cfg.probe !== false && typeof Speech.available === "function";
+      if (probing) {
+        var asked;
+        try { asked = Speech.available({ langs: [lang], processLocally: true }); } catch (e) { asked = null; }
+        if (asked && asked.then) {
+          asked.then(function (st) { settleAvail(st, false); }, function () { micB.style.display = ""; });
+        } else micB.style.display = "";
+      } else micB.style.display = "";
+      // With probe:false (the cockpit) available() is never asked, so the first sign of a missing or masked pack is a Dictate start
+      // that ends service-not-allowed / language-not-supported (the one DICTATE_REASONS sentence). That, with install() present,
+      // swaps Dictate for the one Setup button below; the same tap handler serves the probe path.
+      // Once install() has resolved true, the same error is not a missing pack (a non-secure page, a policy block): no Setup again,
+      // the note adds the one line saying so. Only a real result clears setupDone (audio flowed, so the pack works); a bare start event does not, because a recognizer can fire start and then refuse.
+      var setupDone = false;
+      function offerSetupAfter(code) {
+        if (code !== "service-not-allowed" && code !== "language-not-supported") return;
+        if (setupDone) { var w = setupWord("refused"); if (w) note.textContent = dictNote = (note.textContent ? note.textContent + " " : "") + w; return; }
+        if (canInstall() && !setupBusy) paintSetup("offer");
+      }
+      setupB.addEventListener("click", function () {
+        if (setupBusy || stopped()) return;
+        if (!canInstall()) { paintSetup(null); setupSay("noinstall"); return; }
+        if (dictNote && note.textContent === dictNote) note.textContent = "";
+        dictNote = "";
+        setupBusy = true; clearTimeout(setupT); paintSetup("working");
+        var p;
+        try { p = Speech.install({ langs: [lang], processLocally: true }); } catch (e) { p = Promise.reject(e); }   // inside this tap: the call needs the tap
+        Promise.resolve(p).then(function (ok) {
+          setupBusy = false;
+          if (stopped()) return;
+          if (ok !== true) { paintSetup("offer"); setupSay("failed"); return; }
+          setupDone = true;
+          if (!probing) { settleAvail("available", true); return; }   // never ask available() here: it froze the renderer (RM-G2)
+          return askAvailable().then(function (st) { settleAvail(st, true); }, function () { if (!stopped()) { paintSetup(null); micB.style.display = ""; } });
+        }, function (e) {
+          setupBusy = false;
+          if (stopped()) return;
+          paintSetup("offer");
+          if (e && e.name === "NotAllowedError") setupSay("declined"); else setupSay("unlisted", e && e.name);
+        });
+      });
+      ta.addEventListener("input", function () { if (rec) { dbase = ta.value; heard = lastHeard; } });
+      micB.addEventListener("click", function () {
+        onTap();
+        if (live) return;                              // the streaming mic holds the box and the microphone: Stop mic first
+        if (rec) { endDictation(); return; }
+        if (dictNote && note.textContent === dictNote) note.textContent = "";
+        dictNote = "";
+        var r = new Speech();
+        dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
+        r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
+        if (r.processLocally !== true) { note.textContent = "This browser will not keep dictation on this device, so Dictate is off."; return; }
+        r.onresult = function (ev) {
+          if (rec !== r) return;                     // a late result from a recognizer that was ended
+          setupDone = false;                           // dictation is working: a later pack error is a new question
+          var t = "";
+          for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
+          lastHeard = t;
+          ta.value = dbase + (heard && t.indexOf(heard) === 0 ? t.slice(heard.length) : t);
+          saveDraft();
+          onValue();                                   // a set value fires no input event: Send and the box follow it here
+        };
+        r.onend = function () { if (rec === r) endDictation(); };
+        r.onerror = function (ev) {
+          if (rec !== r) return;
+          endDictation();
+          dictSay(ev && ev.error);
+          offerSetupAfter(ev && ev.error);
+        };
+        rec = r; dface(micB, "dictate-stop");
+        try { r.start(); } catch (e) { endDictation(); dictSay("start"); }
+      });
+      // foreground only: leaving the page ends dictation
+      var leave = function () { if (rec) endDictation(); };
+      onHidden = function () { if (doc.visibilityState === "hidden") leave(); };
+      onBlur = leave;
+      doc.addEventListener("visibilitychange", onHidden);
+      root.addEventListener && root.addEventListener("blur", onBlur);
+    }
+
+    if (streamB) {
+      var drawStream = function (txt) {
+        if (stopped() || !live) return;
+        ta.value = sbase + txt;
+        saveDraft();
+        onValue();
+      };
+      mOff.push(LM.onPartial(drawStream));
+      mOff.push(LM.onFinal(function (txt) { drawStream(txt); live = false; }));
+      mOff.push(LM.onNote(function (s) { if (!stopped() && live) note.textContent = s; }));
+      mOff.push(LM.onEnd(function () { live = false; ta.readOnly = false; dface(streamB, "mic", STREAM_TITLE); }));
+      Promise.resolve().then(function () { return LM.probe(); }).then(function (ok) { if (!stopped() && ok === true && LM.available()) streamB.hidden = false; }, function () {});
+      streamB.addEventListener("click", function () {
+        onTap();
+        if (live) { dface(streamB, "mic", STREAM_TITLE); endStream(); return; }
+        if (LM.active()) return;                         // the last session is still closing
+        endDictation();
+        sbase = ta.value ? ta.value.replace(/\s*$/, " ") : "";
+        live = true; ta.readOnly = true; dface(streamB, "mic-stop");     // locked while streaming: a partial redraws the whole box
+        LM.start();                                     // inside this tap: the permission and the audio context are asked for here
+        if (!LM.active()) { live = false; ta.readOnly = false; dface(streamB, "mic", STREAM_TITLE); }
+      });
+    }
+
+    return {
+      endDictation: endDictation, endStream: endStream, live: function () { return live; },
+      // What a Send awaits when the streaming mic is open: the session finalises (its text is drawn by onFinal) and THEN the box is
+      // sent, so a truncated transcript is never sent silently. null = nothing to wait for. Resolves {ok, words}: !ok = send nothing, say words.
+      settle: function () {
+        if (!(live && LM.active())) return null;
+        // never a rejection: a Send waiting on this must always be told ok or not ok, or it stays waiting for ever
+        return Promise.resolve().then(function () { return endStream(); }).then(function () {
+          if (LM.closeFailed && LM.closeFailed()) return { ok: false, words: "The dictation could not be finished, so nothing was sent. Your words so far are in the box; tap Send again." };
+          if (LM.revoked && LM.revoked()) return { ok: false, words: "Premium voice was turned off, so nothing was sent. Your words so far are in the box; tap Send again." };
+          return { ok: true, words: "" };
+        }).catch(function () {
+          return { ok: false, words: "The dictation could not be finished, so nothing was sent. Your words so far are in the box; tap Send again." };
+        });
+      },
+      destroy: function () {
+        clearTimeout(setupT); endDictation(); endStream(); ta.readOnly = false; mOff.forEach(function (o) { o(); });
+        if (onHidden) doc.removeEventListener("visibilitychange", onHidden);
+        if (onBlur && root.removeEventListener) root.removeEventListener("blur", onBlur);
+      },
+    };
+  }
+
   window.LevainMic = {
-    dictateReason: dictateReason, dictateSetup: dictateSetup,
+    dictateReason: dictateReason, dictateSetup: dictateSetup, dock: dock,
     attach: attach, localSpeech: localSpeech, available: available, probe: probe, start: start, stop: stop, active: function () { return !!S; }, closeFailed: function () { return !!(lastStopped && lastStopped.closeFailed); }, revoked: function () { return !!(lastStopped && lastStopped.revoked); }, deadlines: deadlines, limits: limits,
     onPartial: function (cb) { return on("partial", cb); }, onFinal: function (cb) { return on("final", cb); },
     onNote: function (cb) { return on("note", cb); }, onEnd: function (cb) { return on("end", cb); },

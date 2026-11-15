@@ -478,11 +478,6 @@
     var f = opts.fetch || root.fetch.bind(root);
     var headers = opts.headers || function () { return {}; };
     var pollMs = opts.pollMs == null ? 2000 : opts.pollMs;
-    var Speech = opts.speech === undefined ? (root.SpeechRecognition || root.webkitSpeechRecognition) : opts.speech;
-    // Dictation is on-device or absent: a browser whose recognizer cannot be told to stay local (it would send the audio to
-    // the browser vendor's cloud) gets no control, and the keyboard's own dictation key fills the draft box instead.
-    // the test is mic.js's one function (the card boxes use it too); without mic.js on the page there is no dictation control
-    if (Speech) Speech = root.LevainMic && typeof root.LevainMic.localSpeech === "function" ? root.LevainMic.localSpeech(Speech) : null;
     var store = opts.storage === undefined ? (function () { try { return root.sessionStorage; } catch (e) { return null; } })() : opts.storage;
     var stopped = false, timer = 0, gen = 0, last = "", thread = null, current = null, ui = { open: {} }, drafts = {};
     var wrap = el(doc, "div", "rv"), top = el(doc, "div", "rv-top"), stage = el(doc, "div", "rv-stage"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock"),
@@ -500,7 +495,6 @@
     body.addEventListener("scroll", function () { wasEnd = atEnd(); paintJump(); });
     // kept by name so stop() can remove it: a stopped mount left its listener, and the detached tree it held, on the window
     var onResize = function () { if (!stopped && wasEnd) toEnd(); paintJump(); };
-    var onHidden = null, onBlur = null;   // the dictation guards, kept by name so stop() can remove them
     if (root.addEventListener) root.addEventListener("resize", onResize);
     // The phone: the page's height is the VISUAL viewport's (the keyboard shrinks it), so the composer stays above the keyboard.
     // --rv-vvh / --rv-vvt are read by dashboard.css (body.rv-on); rv-kb marks an open keyboard (the app's header yields room to the
@@ -530,31 +524,6 @@
     note.setAttribute("role", "status");
     actions.className = "rv-actions rv-slot";           // Send and Stop share this one slot (Stop while a reply runs and the draft is empty)
     actions.appendChild(stopB); actions.appendChild(sendB);
-    // the voice controls' state: the icon and its accessible name from voice_icons.js; without that file the words are the button
-    var DICT_TITLE = "On-device dictation where this browser provides it, and only while this page is open";
-    var STREAM_TITLE = "Streaming dictation through your speech provider, only while this page is open";
-    var FACE_WORDS = { dictate: "Dictate", "dictate-stop": "Stop dictating", mic: "Mic", "mic-stop": "Stop mic" };
-    function face(b, kind, title) {
-      if (root.LevainVoiceIcons) { root.LevainVoiceIcons.set(b, kind, null, title); return; }
-      b.textContent = FACE_WORDS[kind]; b.classList.add("voice-words"); b.setAttribute("aria-label", FACE_WORDS[kind]); b.setAttribute("title", title || FACE_WORDS[kind]);
-    }
-    var micB = null, rec = null, setupB = null;
-    // SpeechRecognition is [SecureContext] in the Web Speech spec and the microphone is https/localhost only: on an insecure page
-    // the on-device Dictate and its Setup are not offered at all, and the note says why (the keyboard's dictation key still works).
-    // Only the on-device path: the streaming Mic below is untouched. `=== false`: a host that does not report it keeps the old behaviour.
-    if (Speech && root.isSecureContext === false) {
-      Speech = null;
-      var insecureWords = root.LevainMic && typeof root.LevainMic.dictateSetup === "function" ? root.LevainMic.dictateSetup("insecure") : "";
-      if (insecureWords) note.textContent = insecureWords;
-    }
-    if (Speech) {
-      // the one-tap set up of the browser's on-device speech pack: drawn only while the browser says the pack can be had
-      setupB = el(doc, "button", "rv-setup", "");
-      setupB.setAttribute("type", "button"); setupB.hidden = true;
-      micB = el(doc, "button", "rv-mic", "");
-      micB.setAttribute("type", "button");
-      face(micB, "dictate", "On-device dictation where this browser provides it, and only while this page is open");
-    }
     // Start the desk: the room cannot sign, and a room-committed card is unsigned by construction, so a desk is started only from the
     // cockpit's own signing sheet. This control opens that sheet (the page's LevainSignSheet.openDrop) with the start words filled in;
     // the passkey tap there is the signature, and the words stay his to edit (the other shape is one word away). Drawn only where the
@@ -572,16 +541,14 @@
       rotB.setAttribute("type", "button"); rotB.setAttribute("aria-label", "New conversation"); rotB.setAttribute("title", "Start a new conversation");
       top.appendChild(rotB);
     }
-    // Streaming dictation (mic.js, cockpit mic S4): a second control beside Dictate, drawn only when LevainMic says the server
-    // offers it. Its words reach the box through textContent-safe .value writes; the page sends the server audio, never text.
-    var LM = opts.mic === undefined ? (root.LevainMic || null) : opts.mic;
-    var streamB = null, live = false, sbase = "", mOff = [];
-    if (LM && typeof LM.probe === "function") {
-      streamB = el(doc, "button", "rv-mic rv-mic-stream", "");
-      streamB.setAttribute("type", "button"); streamB.hidden = true;
-      face(streamB, "mic", "Streaming dictation through your speech provider, only while this page is open");
-    }
-    composer.appendChild(ta); if (micB) { composer.appendChild(micB); composer.appendChild(setupB); } if (streamB) composer.appendChild(streamB); composer.appendChild(actions);
+    composer.appendChild(ta); composer.appendChild(actions);
+    // the voice controls (Dictate, its Setup, the streaming Mic) are mic.js's one implementation, shared with the Desk's view; without
+    // mic.js on the page there are none. The playback controls are voice.js's tracker, the same for both views.
+    var vdock = root.LevainMic && typeof root.LevainMic.dock === "function" ? root.LevainMic.dock({
+      doc: doc, root: root, ta: ta, composer: composer, before: actions, note: note, store: store, draftKey: "levain.room.draft",
+      speech: opts.speech, mic: opts.mic, probe: opts.probe, setupPollMs: opts.setupPollMs,
+      onValue: function () { grow(); paintSend(); }, onTap: function () { voiceTap(); }, stopped: function () { return stopped; },
+    }) : null;
     dock.appendChild(openB); dock.appendChild(note); dock.appendChild(composer);
     var forceEnd = false;       // your own send always lands you at the newest line
     var flight = { send: false, stop: false, open: false };
@@ -663,16 +630,18 @@
     // Send while the mic is open waits for the session to finalise (the close's text is drawn by onFinal), then sends THAT text:
     // a truncated transcript is never sent silently.
     var sendWait = false;
-    function endStream() { return live && LM.active() ? Promise.resolve(LM.stop()).then(null, function () {}) : Promise.resolve(); }
     sendB.addEventListener("click", function () {
-      endDictation();
+      if (vdock) vdock.endDictation();
       if (sendWait) return;
-      if (live && LM.active()) { sendWait = true; endStream().then(function () {
+      var w = vdock ? vdock.settle() : null;
+      if (w) { sendWait = true; w.then(function (r) {
         sendWait = false;
         if (stopped) return;
-        if (LM.closeFailed && LM.closeFailed()) { note.textContent = "The dictation could not be finished, so nothing was sent. Your words so far are in the box; tap Send again."; return; }
-        if (LM.revoked && LM.revoked()) { note.textContent = "Premium voice was turned off, so nothing was sent. Your words so far are in the box; tap Send again."; return; }
+        if (!r.ok) { note.textContent = r.words; return; }
         doSend();
+      }).catch(function (e) {
+        sendWait = false;                                // whatever went wrong, Send is not left waiting
+        if (root.console && root.console.error) root.console.error("room view: " + (e && e.message ? e.message : e));
       }); return; }
       doSend();
     });
@@ -722,7 +691,7 @@
     });
     if (rotB) rotB.addEventListener("click", function () {
       if (rotB.disabled) return;
-      var V = voice(); if (V) V.stop();
+      var T = vt(); if (T) T.halt();
       gen++; voiceHold = true;          // a poll already out, or sent before the answer, names the OLD room: it reads nothing
       rotB.disabled = true; note.textContent = "Starting a new conversation...";
       post("rotate", { room_thread_id: current && current.thread }).then(function (r) {
@@ -732,220 +701,23 @@
         if (r.status === 200 && current && current.error) hushed = { thread: current.thread, error: current.error };
         // the next body is backlog: a reply that finished on the old thread during the click (a failed rotate, a pull that still
         // names the old thread) must not be read as new
-        last = ""; voiceHold = false; voiceThread = null; return pull();
-      }).catch(function () { note.textContent = "The server could not be reached."; voiceHold = false; voiceThread = null; })
+        last = ""; voiceHold = false; voiceRearm(); return pull();
+      }).catch(function () { note.textContent = "The server could not be reached."; voiceHold = false; voiceRearm(); })
         .then(function () { voiceHold = false; paintDock(); });
     });
-    // dictation state: dbase = the text before the transcript, heard = the transcript already placed in the box
-    var dbase = "", heard = "", lastHeard = "";
-    // the reason a failed dictation put in the note; a new attempt takes it back (only if the note still holds it: the note is
-    // shared with Send's own words). The words come from mic.js, once, for every dictation control.
-    var dictNote = "";
-    function dictWhy(code) { var M = root.LevainMic; return M && typeof M.dictateReason === "function" ? M.dictateReason(code) : "Dictation stopped."; }
-    function dictSay(code) { note.textContent = dictNote = dictWhy(code); }
-    function endDictation() {
-      var r = rec; rec = null;
-      if (micB) face(micB, "dictate", DICT_TITLE);
-      if (r) { r.onresult = null; r.onend = null; r.onerror = null; try { r.stop(); } catch (e) { /* already stopped */ } }
+    // Voice (V1-5 room hook). voice.js is optional: a page without it draws no control and reads nothing. Its tracker decides every
+    // autoplay question (setting, backlog, hidden, unlocked, the one-waiting queue) and is the same one the Desk's view uses; this
+    // view only reports what the record shows: the finished replies, which of them were already there at mount, and the operator's own taps.
+    var vtrack = null, voiceHold = false;
+    function vt() {
+      if (!vtrack && root.LevainVoice && typeof root.LevainVoice.tracker === "function") vtrack = root.LevainVoice.tracker();
+      return vtrack;
     }
-    if (micB) {
-      var lang = doc.documentElement.lang || (root.navigator && root.navigator.language) || "en-US";
-      micB.style.display = "none";                     // shown only once the browser says on-device dictation is available
-      // probe:false skips the availability question. MEASURED 2026-11-04 (RM-G2): SpeechRecognition.available({processLocally:true})
-      // froze the renderer of the installed headless Google Chrome on a bare page, so the cockpit page asks it nowhere; the mic
-      // is then shown on the prototype test alone and the click-time processLocally readback and onerror stay the guard.
-      //
-      // "downloadable" / "downloading" is not a dead end: SpeechRecognition.install({langs, processLocally}) fetches the pack, and it
-      // needs a tap (transient activation) when it would start a download, so the page offers a button and calls install() only
-      // inside that tap. It resolves true (installed), false (unsupported language or failed download; no cause given) or rejects
-      // NotAllowedError (no tap, or the browser declined). The spec also lets a browser report "downloadable" for a pack that IS
-      // installed until this page has called install() once, so the same tap takes the fast path there. "downloading" has no
-      // progress events: the page re-asks available() on a timer (bounded) and never calls install() a second time on its own.
-      var setupBusy = false, setupT = 0, setupPolls = 0, SETUP_POLLS = 100;
-      var setupMs = typeof opts.setupPollMs === "number" ? opts.setupPollMs : 3000;
-      function setupWord(key, name) { var M = root.LevainMic; return M && typeof M.dictateSetup === "function" ? M.dictateSetup(key, name) : ""; }
-      function setupSay(key, name) { note.textContent = dictNote = setupWord(key, name); }
-      // true when the button is drawn. Dictate is hidden while Setup is shown (one control for one state); a button with no words
-      // (mic.js missing) is not drawn at all, so the caller falls back to the plain note
-      function paintSetup(kind) {            // "offer" | "working" | null (no button)
-        var w = kind ? setupWord(kind) : "";
-        if (!w) { setupB.hidden = true; return false; }
-        setupB.hidden = false; setupB.disabled = kind === "working"; micB.style.display = "none";
-        setupB.textContent = w;
-        setupB.setAttribute("title", setupWord("offerTitle")); setupB.setAttribute("aria-busy", kind === "working" ? "true" : "false");
-        return true;
-      }
-      function canInstall() { return typeof Speech.install === "function"; }
-      // no install() here (or no words for the button): the pack cannot be fetched from this page, so say so and drop Dictate
-      function noSetup() { paintSetup(null); micB.remove(); if (!note.textContent) setupSay("noinstall"); }
-      // a synchronous throw from available() is a settled failure like a rejection (a poll counts it toward the limit; an ask after
-      // install says nothing is "done"), never an apparent success
-      function askAvailable() {
-        try { return Promise.resolve(typeof Speech.available === "function" ? Speech.available({ langs: [lang], processLocally: true }) : null); }
-        catch (e) { return Promise.reject(e); }
-      }
-      // what the browser answered: show Dictate, drop it, offer the set up, or wait for a download that is already running
-      function settleAvail(st, after) {
-        if (stopped) return;
-        clearTimeout(setupT);
-        if (st === "unavailable") { paintSetup(null); micB.remove(); if (after) setupSay("none"); }
-        else if (st === "downloadable") {
-          if (!canInstall() || !paintSetup("offer")) return noSetup();
-          setupPolls = 0; if (after) setupSay("stillnot");
-        } else if (st === "downloading") {
-          if (!canInstall() || !paintSetup("working")) return noSetup();
-          setupT = setTimeout(function () {
-            if (stopped || setupBusy) return;
-            if (++setupPolls > SETUP_POLLS) { setupPolls = 0; paintSetup("offer"); setupSay("slow"); return; }
-            // a poll that fails counts toward the same limit: it waits again instead of dropping to a button with no words
-            askAvailable().then(function (s) { settleAvail(s, false); }, function () { settleAvail("downloading", false); });
-          }, setupMs);
-        } else { setupPolls = 0; paintSetup(null); micB.style.display = ""; if (after) setupSay("done"); }
-      }
-      var probing = opts.probe !== false && typeof Speech.available === "function";
-      if (probing) {
-        var asked;
-        try { asked = Speech.available({ langs: [lang], processLocally: true }); } catch (e) { asked = null; }
-        if (asked && asked.then) {
-          asked.then(function (st) { settleAvail(st, false); }, function () { micB.style.display = ""; });
-        } else micB.style.display = "";
-      } else micB.style.display = "";
-      // With probe:false (the cockpit) available() is never asked, so the first sign of a missing or masked pack is a Dictate start
-      // that ends service-not-allowed / language-not-supported (the one DICTATE_REASONS sentence). That, with install() present,
-      // swaps Dictate for the one Setup button below; the same tap handler serves the probe path.
-      // Once install() has resolved true, the same error is not a missing pack (a non-secure page, a policy block): no Setup again,
-      // the note adds the one line saying so. Only a real result clears setupDone (audio flowed, so the pack works); a bare start event does not, because a recognizer can fire start and then refuse.
-      var setupDone = false;
-      function offerSetupAfter(code) {
-        if (code !== "service-not-allowed" && code !== "language-not-supported") return;
-        if (setupDone) { var w = setupWord("refused"); if (w) note.textContent = dictNote = (note.textContent ? note.textContent + " " : "") + w; return; }
-        if (canInstall() && !setupBusy) paintSetup("offer");
-      }
-      setupB.addEventListener("click", function () {
-        if (setupBusy || stopped) return;
-        if (!canInstall()) { paintSetup(null); setupSay("noinstall"); return; }
-        if (dictNote && note.textContent === dictNote) note.textContent = "";
-        dictNote = "";
-        setupBusy = true; clearTimeout(setupT); paintSetup("working");
-        var p;
-        try { p = Speech.install({ langs: [lang], processLocally: true }); } catch (e) { p = Promise.reject(e); }   // inside this tap: the call needs the tap
-        Promise.resolve(p).then(function (ok) {
-          setupBusy = false;
-          if (stopped) return;
-          if (ok !== true) { paintSetup("offer"); setupSay("failed"); return; }
-          setupDone = true;
-          if (!probing) { settleAvail("available", true); return; }   // never ask available() here: it froze the renderer (RM-G2)
-          return askAvailable().then(function (st) { settleAvail(st, true); }, function () { if (!stopped) { paintSetup(null); micB.style.display = ""; } });
-        }, function (e) {
-          setupBusy = false;
-          if (stopped) return;
-          paintSetup("offer");
-          if (e && e.name === "NotAllowedError") setupSay("declined"); else setupSay("unlisted", e && e.name);
-        });
-      });
-      ta.addEventListener("input", function () { if (rec) { dbase = ta.value; heard = lastHeard; } });
-      micB.addEventListener("click", function () {
-        voiceTap();
-        if (live) return;                              // the streaming mic holds the box and the microphone: Stop mic first
-        if (rec) { endDictation(); return; }
-        if (dictNote && note.textContent === dictNote) note.textContent = "";
-        dictNote = "";
-        var r = new Speech();
-        dbase = ta.value ? ta.value.replace(/\s*$/, " ") : ""; heard = ""; lastHeard = "";
-        r.interimResults = true; r.continuous = false; r.processLocally = true; r.lang = lang;
-        if (r.processLocally !== true) { note.textContent = "This browser will not keep dictation on this device, so Dictate is off."; return; }
-        r.onresult = function (ev) {
-          if (rec !== r) return;                     // a late result from a recognizer that was ended
-          setupDone = false;                           // dictation is working: a later pack error is a new question
-          var t = "";
-          for (var i = 0; i < ev.results.length; i++) t += ev.results[i][0].transcript;
-          lastHeard = t;
-          ta.value = dbase + (heard && t.indexOf(heard) === 0 ? t.slice(heard.length) : t);
-          try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ }
-          grow(); paintSend();                         // a set value fires no input event: Send and the box follow it here
-        };
-        r.onend = function () { if (rec === r) endDictation(); };
-        r.onerror = function (ev) {
-          if (rec !== r) return;
-          endDictation();
-          dictSay(ev && ev.error);
-          offerSetupAfter(ev && ev.error);
-        };
-        rec = r; face(micB, "dictate-stop");
-        try { r.start(); } catch (e) { endDictation(); dictSay("start"); }
-      });
-      // foreground only: leaving the page ends dictation
-      var leave = function () { if (rec) endDictation(); };
-      onHidden = function () { if (doc.visibilityState === "hidden") leave(); };
-      onBlur = leave;
-      doc.addEventListener("visibilitychange", onHidden);
-      root.addEventListener && root.addEventListener("blur", onBlur);
-    }
-
-    if (streamB) {
-      var drawStream = function (txt) {
-        if (stopped || !live) return;
-        ta.value = sbase + txt;
-        try { if (store) store.setItem("levain.room.draft", ta.value); } catch (e) { /* no storage */ }
-        grow(); paintSend();
-      };
-      mOff.push(LM.onPartial(drawStream));
-      mOff.push(LM.onFinal(function (txt) { drawStream(txt); live = false; }));
-      mOff.push(LM.onNote(function (s) { if (!stopped && live) note.textContent = s; }));
-      mOff.push(LM.onEnd(function () { live = false; ta.readOnly = false; face(streamB, "mic", STREAM_TITLE); }));
-      Promise.resolve().then(function () { return LM.probe(); }).then(function (ok) { if (!stopped && ok === true && LM.available()) streamB.hidden = false; }, function () {});
-      streamB.addEventListener("click", function () {
-        voiceTap();
-        if (live) { face(streamB, "mic", STREAM_TITLE); endStream(); return; }
-        if (LM.active()) return;                         // the last session is still closing
-        endDictation();
-        sbase = ta.value ? ta.value.replace(/\s*$/, " ") : "";
-        live = true; ta.readOnly = true; face(streamB, "mic-stop");     // locked while streaming: a partial redraws the whole box
-        LM.start();                                     // inside this tap: the permission and the audio context are asked for here
-        if (!LM.active()) { live = false; ta.readOnly = false; face(streamB, "mic", STREAM_TITLE); }
-      });
-    }
-
-    // Voice (V1-5 room hook). voice.js is optional: a page without it draws no control and reads nothing. The module decides
-    // every autoplay question (setting, backlog, hidden, unlocked, the one-waiting queue); this view only reports what the
-    // record shows: the finished replies, which of them were already there at mount, and the operator's own taps.
-    function voice() { return root.LevainVoice || null; }
-    var wraps = {}, voiceThread = null, voiceBase = 0, voiceHold = false;
-    function voiceKey(r) { return r.thread + ":" + r.gseq; }
-    function voiceTap() { var V = voice(); if (V) { V.unlock(); V.stop(); } }     // inside the operator's own tap
-    function voiceBtn(r) {
-      var V = voice(), k = voiceKey(r);
-      if (!V) return null;
-      if (!own(wraps, k)) { var b = V.button(r); if (b) wraps[k] = b; return b || null; }       // a falsy button is not kept
-      return wraps[k];
-    }
-    // after a draw: drop the controls of replies that are gone, then hand the module each reply that finished after mount
-    function voiceSync(m) {
-      var V = voice(), live = {};
-      m.replies.forEach(function (r) { live[voiceKey(r)] = true; });
-      Object.keys(wraps).forEach(function (k) {
-        if (!own(live, k)) { var w = wraps[k]; delete wraps[k]; if (!w) return; if (w.parentNode) w.parentNode.removeChild(w); if (w._unbind) w._unbind(); }
-      });
-      if (m.thread === null) {                              // no open room: nothing plays on, and the next room is backlog again
-        if (voiceThread !== null) { voiceThread = null; voiceBase = 0; if (V) V.stop(); }
-        return;
-      }
-      if (!V) return;
-      if (voiceThread !== m.thread) {                       // the first body of this mount, or a new conversation
-        if (voiceThread !== null) V.stop();
-        voiceThread = m.thread;
-        voiceBase = m.replies.reduce(function (a, r) { return r.gseq > a ? r.gseq : a; }, 0);
-        V.arm(voiceBase);
-        return;
-      }
-      if (voiceHold) return;                                // a New is pending: the old room's replies are not read
-      m.replies.forEach(function (r) { if (r.gseq > voiceBase) V.replyFinished(r); });
-    }
-    function voiceEnd() {
-      var V = voice();
-      Object.keys(wraps).forEach(function (k) { var w = wraps[k]; delete wraps[k]; if (w && w._unbind) w._unbind(); });
-      if (V) V.stop();
-    }
+    function voiceTap() { var T = vt(); if (T) T.tap(); }     // inside the operator's own tap
+    function voiceBtn(r) { var T = vt(); return T ? T.button(r) : null; }
+    function voiceSync(m) { var T = vt(); if (T) T.sync({ thread: m.thread, replies: m.replies, hold: voiceHold }); }
+    function voiceRearm() { var T = vt(); if (T) T.rearm(); }
+    function voiceEnd() { var T = vt(); if (T) T.end(); }
 
     var hooks = {
       voiceBtn: voiceBtn,
@@ -1021,9 +793,7 @@
     paintDock();
     pull().then(loop);
     return { stop: function () {
-      stopped = true; clearTimeout(timer); clearTimeout(setupT); endDictation(); endStream(); ta.readOnly = false; mOff.forEach(function (o) { o(); }); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
-      if (onHidden) doc.removeEventListener("visibilitychange", onHidden);
-      if (onBlur && root.removeEventListener) root.removeEventListener("blur", onBlur);
+      stopped = true; clearTimeout(timer); if (vdock) vdock.destroy(); voiceEnd(); if (root.removeEventListener) root.removeEventListener("resize", onResize);
       if (vv) {
         vv.removeEventListener("resize", fitViewport); vv.removeEventListener("scroll", fitViewport);
         rootEl.style.removeProperty("--rv-vvh"); rootEl.style.removeProperty("--rv-vvt"); if (doc.body) doc.body.classList.remove("rv-kb");

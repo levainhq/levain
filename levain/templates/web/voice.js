@@ -349,8 +349,9 @@
     messages.delete(key(reply)); tapNeeded.delete(key(reply));
     changed();
     try {
-      if (s.blocked) say(reply, s.blocked);                      // the stored provider has no key: nothing is read, nothing is sent
-      else if (s.tier === "premium") await playPremium(reply, me, s);
+      if (reply.deviceOnly) await speakDevice(reply, reply.text || "", me, s.speed);   // words the server cannot rebuild (the Desk's): this device's voice alone, whatever the stored provider's key says
+      else if (s.blocked) say(reply, s.blocked);                   // the stored provider has no key: nothing is read, nothing is sent
+      else if (s.tier === "premium" && !reply.deviceOnly) await playPremium(reply, me, s);   // deviceOnly: words the server cannot rebuild (the Desk's), read by this device alone
       else await speakDevice(reply, reply.text || "", me, s.speed);
     } catch (_) {
       if (me === runId) {
@@ -426,6 +427,55 @@
     return wrap;
   }
 
+  // The reply controls of ONE chat view (the Room's, the Desk's): the view reports what its record shows and this keeps the rest, so
+  // no view holds its own copy of the rule. The module decides every autoplay question (setting, backlog, hidden, unlocked, the one
+  // waiting reply); the view reports the finished replies, which of them were already there when it mounted, and the operator's taps.
+  //   tap()                      inside the operator's own tap (Send, a mic tap, a Play tap): unlock, and stop what is being read
+  //   button(r)                  the speaker control of reply r, the same element across redraws until the reply is gone
+  //   sync({thread, replies, hold})   after a draw: drop the controls of replies that are gone, arm the first body of a conversation
+  //                              (its replies are backlog), hand each later finished reply to replyFinished. thread null = no
+  //                              conversation open (nothing plays on; the next one is backlog again); hold = a New is pending
+  //   end()                      unmount: release the controls and stop
+  function tracker() {
+    const wraps = {};
+    let thread = null, base = 0;
+    const k = (r) => r.thread + ":" + r.gseq;
+    return {
+      tap() { unlock(); stop(); },
+      halt() { stop(); },                                    // stop what is being read, with no unlock (a New is pressed)
+      rearm() { thread = null; },                            // the next body is a first body again: its replies are backlog
+      button(r) {
+        const key_ = k(r);
+        if (!Object.prototype.hasOwnProperty.call(wraps, key_)) { const b = button(r); if (b) wraps[key_] = b; return b || null; }       // a falsy button is not kept
+        return wraps[key_];
+      },
+      sync(m) {
+        const live = {};
+        m.replies.forEach((r) => { live[k(r)] = true; });
+        Object.keys(wraps).forEach((key_) => {
+          if (!Object.prototype.hasOwnProperty.call(live, key_)) { const w = wraps[key_]; delete wraps[key_]; if (!w) return; if (w.parentNode) w.parentNode.removeChild(w); if (w._unbind) w._unbind(); }
+        });
+        if (m.thread === null) {
+          if (thread !== null) { thread = null; base = 0; stop(); }
+          return;
+        }
+        if (thread !== m.thread) {                          // the first body of this mount, or a new conversation
+          if (thread !== null) stop();
+          thread = m.thread;
+          base = m.replies.reduce((a, r) => (r.gseq > a ? r.gseq : a), 0);
+          arm(base);
+          return;
+        }
+        if (m.hold) return;                                 // a New is pending: the old conversation's replies are not read
+        m.replies.forEach((r) => { if (r.gseq > base) replyFinished(r); });
+      },
+      end() {
+        Object.keys(wraps).forEach((key_) => { const w = wraps[key_]; delete wraps[key_]; if (w && w._unbind) w._unbind(); });
+        stop();
+      },
+    };
+  }
+
   // A hidden page reads nothing and locks: the room view unmounts then, and a playing reply would otherwise carry on unseen.
   // Coming back, the first reply asks for a tap.
   document.addEventListener("visibilitychange", () => { if (document.hidden) lock(); });
@@ -434,7 +484,7 @@
   window.LevainVoice = {
     SAMPLE, WORDS, DEFAULTS,
     settings: readSettings, saveSettings: writeSettings, effective, offer, blockedWords,
-    unlock, stop, play, arm, replyFinished, button, face,
+    unlock, stop, play, arm, replyFinished, button, face, tracker,
     isUnlocked: () => unlocked,
     noteFor: (reply) => messages.get(key(reply)) || "",
     held: () => liveUtt !== null,

@@ -125,8 +125,8 @@ def test_a_real_round_trip_speaks_the_reply_after_send_and_the_backlog_after_a_r
 @needs_browser
 def test_two_replies_finishing_in_one_poll_queue_one_behind_the_playing_reply_and_the_later_one_wins(tmp_path, qdir) -> None:
     """A is playing (tapped). B and C finish inside one poll: ONE waits behind A, and it is C (B is replaced, never read).
-    Red with: the `r.gseq > voiceBase` filter removed (the backlog A is offered again: harmless) is NOT this test; red with:
-    voiceSync not handing replies to V.replyFinished (nothing queued, C never read); handing only the first (B read)."""
+    Red with: the `r.gseq > base` filter in voice.js's tracker.sync removed (the backlog A is offered again: harmless) is NOT this test; red with:
+    the Room's voiceSync not handing replies to the tracker (nothing reaches replyFinished: nothing queued, C never read); handing only the first (B read)."""
     b = _room("t1", *A, _op(4, "again"), _item(5, "vendor_agent_text", "B reply"), _item(6, "vendor_turn_ended"),
               _op(7, "and again"), _item(8, "vendor_agent_text", "C reply"), _item(9, "vendor_turn_ended"))
     v = _run(tmp_path, qdir, [
@@ -196,8 +196,16 @@ def test_the_dashboard_loads_voice_js_and_the_hook_is_wired() -> None:
     html = (web / "dashboard.html").read_text()
     assert html.count('<script src="/voice.js"></script>') == 1
     js = (web / "room_view.js").read_text()
-    for needle in ("V.arm(voiceBase)", "V.replyFinished(r)", "V.unlock(); V.stop();", "V.button(r)", "w._unbind()", "if (V) V.stop();"):
+    # the Room's view reports to voice.js's tracker (shared with the Desk's view); the rule itself lives in voice.js
+    for needle in ("LevainVoice.tracker()", "T.tap()", "T.button(r)", "T.sync({", "T.end()", "T.halt()", "T.rearm()"):
         assert needle in js, needle
+    vjs = (web / "voice.js").read_text()
+    # each needle is looked for only inside the tracker's own body, not anywhere in voice.js
+    tracker = vjs[vjs.index("function tracker()"):vjs.index("window.LevainVoice = {")]
+    for needle in ("arm(base)", "replyFinished(r)", "tap() { unlock(); stop(); }", "button(r) {", "w._unbind()"):
+        assert needle in tracker, needle
+    end = tracker[tracker.index("end() {"):]
+    assert "w._unbind()" in end and "stop();" in end        # unmount releases the controls and stops what is being read
 
 
 # --- L3 round 1 fixes ---------------------------------------------------------------------------------------------------
@@ -247,7 +255,7 @@ def test_a_whitespace_only_agent_text_is_not_a_reply(tmp_path, qdir) -> None:
 
 @needs_browser
 def test_a_room_that_goes_away_stops_the_reading_and_a_later_room_is_backlog_again(tmp_path, qdir) -> None:
-    """Red with: the `m.thread === null` branch of voiceSync (V.stop(), voiceThread = null) removed: the audio keeps playing
+    """Red with: the `m.thread === null` branch of voice.js's tracker.sync (stop(), thread = null, base = 0) removed: the audio keeps playing
     and, when t1 comes back with a newer reply, it is read as if it were new."""
     v = _run(tmp_path, qdir, [
         *PLAYING_A,
@@ -336,7 +344,7 @@ def test_a_falsy_voice_button_leaving_the_room_does_not_break_the_poll(tmp_path,
 def test_a_failed_new_click_does_not_read_the_reply_that_finished_during_it(tmp_path, qdir) -> None:
     """The rotate is held, reply B finishes on the OLD thread meanwhile, then the rotate fails (500). The pull after it still
     names t1 with B: the hold is gone, so without a re-baseline B is read as new.
-    Red with: `voiceThread = null` removed from the rotate settle in the New click."""
+    Red with: `voiceRearm()` (tracker.rearm) removed from the rotate settle in the New click."""
     v = _run(tmp_path, qdir, [
         *PLAYING_A,
         {"eval": "window.__holdRot = true; document.querySelector('.rv-rotate').click(); 1"},
@@ -352,7 +360,7 @@ def test_a_failed_new_click_does_not_read_the_reply_that_finished_during_it(tmp_
 @needs_browser
 def test_a_new_click_answered_before_the_poll_names_the_new_room_does_not_read_the_old_rooms_reply(tmp_path, qdir) -> None:
     """The rotate answers 200 but the next poll still names t1 (the server catching up) and carries B, which finished during
-    the click. Red with: `voiceThread = null` removed from the rotate settle in the New click."""
+    the click. Red with: `voiceRearm()` (tracker.rearm) removed from the rotate settle in the New click."""
     v = _run(tmp_path, qdir, [
         *PLAYING_A,
         {"eval": "window.__holdRot = true; document.querySelector('.rv-rotate').click(); 1"},

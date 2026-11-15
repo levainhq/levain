@@ -94,8 +94,17 @@ def test_voice_never_names_a_cloud_recognizer_or_a_transcribe_route():
     js = (WEB / "room_view.js").read_text()
     for word in ("getUserMedia", "MediaRecorder", "audio/transcriptions", "api.openai.com"):
         assert word not in js, word
-    assert 'LevainMic.localSpeech(Speech)' in js and "r.processLocally = true" in js   # the on-device test is mic.js's one function
-    assert "dictateReason" in js and "Heard nothing" not in js and "not installed for this language" not in js   # the words come from mic.js's one table
+    # the dictation controls are mic.js's ONE implementation (LevainMic.dock), shared with the Desk's view: the Room holds no copy
+    assert "LevainMic.dock(" in js and "SpeechRecognition" not in js and "processLocally" not in js
+    mic = (WEB / "mic.js").read_text()
+    dock = mic[mic.index("function dock(cfg)"):]
+    # the dictation code now lives in mic.js's dock and the Desk's view: both are scanned for a cloud recognizer or a transcribe route
+    desk = (WEB / "desk_tab_view.js").read_text()
+    for word in ("MediaRecorder", "audio/transcriptions", "api.openai.com"):
+        assert word not in dock and word not in desk, word
+    assert "getUserMedia" not in desk
+    assert 'LevainMic.localSpeech(Speech)' in dock and "r.processLocally = true" in dock   # the on-device test is mic.js's one function
+    assert "dictateReason" in dock and "Heard nothing" not in js and "not installed for this language" not in js   # the words come from mic.js's one table
 
 
 @needs_browser
@@ -280,7 +289,8 @@ _WORD = "LevainMic.dictateSetup"
 def test_install_is_called_in_one_place_and_the_words_live_in_mic_js():
     """Red with: a second install() call site (a call outside the tap), or the room keeping its own set up sentences."""
     js = (WEB / "room_view.js").read_text()
-    assert js.count("Speech.install(") == 1 and "dictateSetup" in js
+    mic = (WEB / "mic.js").read_text()
+    assert js.count("Speech.install(") == 0 and mic.count("Speech.install(") == 1 and "dictateSetup" in mic[mic.index("function dock(cfg)"):]
     assert "Set up on-device dictation" not in js and "Setting up" not in js and "could not be set up" not in js
     mic = (WEB / "mic.js").read_text()
     assert "Set up on-device dictation" in mic and "dictateSetup: dictateSetup" in mic
@@ -438,8 +448,8 @@ def test_the_dashboard_boot_still_mounts_the_room_with_the_probe_off_and_the_roo
     test_cockpit_room_join), so the Setup offer must be reachable from a failed start alone."""
     boot = (WEB / "dashboard_boot.js").read_text()
     assert re.search(r"LevainRoomView\.mount\([^\n]*probe: false\s*\}\)", boot)
-    js = (WEB / "room_view.js").read_text()
-    assert "if (!probing) { settleAvail(" in js and "offerSetupAfter(ev && ev.error)" in js
+    mic = (WEB / "mic.js").read_text()
+    assert "if (!probing) { settleAvail(" in mic and "offerSetupAfter(ev && ev.error)" in mic
 
 
 # --- smaller fixes from the L3 pass --------------------------------------------------------------------------------------

@@ -11,6 +11,10 @@
 // message and re-sent unchanged on a retry, so the server answers the line it already holds instead of filing it twice.
 // A typed line never starts a desk: with no lease it is held for the next one, and the page points at the signed Drop tab.
 // This page never says what the desk did with a line beyond the server's own words: it cannot observe that.
+//
+// Voice (levain#23): the same controls as the Room's, from the same code, never a second copy. The composer's Dictate and Mic are
+// mic.js's LevainMic.dock (the one the Room's view calls); the desk's replies carry a speaker control from voice.js's tracker
+// (the one the Room's view uses). A desk reply is read by this device's own voice: the server holds no record it could rebuild.
 (function (root) {
   "use strict";
 
@@ -26,8 +30,16 @@
   var MAX_POLLED = 6;
   var MAX_EVENTS = 50;
   var AMBIGUOUS_WORDS = "It may not have arrived. It is not sent again; say whether it did.";
+  var CLEAR_TITLE = "Clears the lines the desk has answered. A line still waiting for an answer, or not yet confirmed, stays. The desk's own record is not touched.";
+  var CLEAR_HELD_WORDS = "Nothing settled to clear: a line still waiting for an answer, or not yet confirmed, stays.";
+  var CLEARED_STAY_WORDS = "Cleared. A line still waiting for an answer, or not yet confirmed, stays.";
   var UNWIRED_WORDS = "This cockpit has no desk wired.";
   var LEASE_STATES = { held: 1, none: 1, unknown: 1 };
+
+  // The numbers voice.js is given for desk replies. voice.js remembers which numbers it has already decided on for the life of the
+  // PAGE, so the numbering lives that long too (not per mount): a view mounted again after a Clear must not number its first new
+  // reply 1 again and have it taken for one already read. Replies are numbered in the order they first reach this page.
+  var VSEQ = {}, vnext = 0;
 
   function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 
@@ -171,7 +183,7 @@
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
   // One log entry as a row. `you` entries are lines this page sent; `ev` entries are what the host filed back.
-  function renderEntry(doc, it, onMark) {
+  function renderEntry(doc, it, onMark, voiceBtn) {
     if (it.k === "you") {
       var row = el(doc, "div", "rv-line rv-you dv-you dv-" + it.status);
       row.appendChild(el(doc, "div", "rv-text", shown(it.text)));
@@ -196,10 +208,11 @@
     if (m.who) r.appendChild(el(doc, "div", "rv-who", shown(m.who) + (m.at ? " · " + shown(m.at) : "")));
     if (m.words) r.appendChild(el(doc, "div", "rv-note", shown(m.words)));
     if (m.text) r.appendChild(el(doc, "div", "rv-text", shown(m.text)));
+    if (it.kind === "reply" && it.text && voiceBtn) { var vb = voiceBtn(it); if (vb) r.appendChild(vb); }
     return r;
   }
 
-  // mount(host, {fetch, headers, pollMs, hiddenPollMs, storage}): returns {stop, refresh, model, log}. Reads while mounted (every
+  // mount(host, {fetch, headers, pollMs, hiddenPollMs, storage, speech, mic, probe, setupPollMs}): returns {stop, refresh, model, log}. Reads while mounted (every
   // 4 s open, 12 s hidden) and redraws only when something changed. The dock lives OUTSIDE the redrawn body, so a read never
   // takes the draft.
   function mount(host, opts) {
@@ -218,6 +231,14 @@
     var wrap = el(doc, "div", "rv dv"), top = el(doc, "div", "rv-top"), bar = el(doc, "div", "dv-state"),
       stage = el(doc, "div", "rv-stage"), body = el(doc, "div", "rv-body"), dock = el(doc, "div", "rv-dock");
     top.appendChild(el(doc, "h2", "rv-title", "Desk"));
+    // Clear empties what this page DRAWS, and only what is settled (levain#24). It makes no request: the desk's record (the fanin log, the
+    // episodes, the thread history in the store) is on the host and is never touched from here. What is drawn is this tab's own
+    // memory (the lines it sent and the threads it reads, kept in this tab's session storage), and the page has no route that lists
+    // the host's threads: so a cleared view stays cleared across a reload, and shows only what comes after it.
+    var clearB = el(doc, "button", "rv-rotate dv-clear", "Clear");
+    clearB.setAttribute("type", "button"); clearB.setAttribute("aria-label", "Clear the conversation shown here");
+    clearB.setAttribute("title", CLEAR_TITLE);
+    top.appendChild(clearB);
     bar.setAttribute("role", "status");
     stage.appendChild(body);
     wrap.appendChild(top); wrap.appendChild(bar); wrap.appendChild(stage); wrap.appendChild(dock); host.appendChild(wrap);
@@ -248,6 +269,38 @@
     sendNote.setAttribute("role", "status");
     actions.appendChild(sendB); composer.appendChild(ta); composer.appendChild(actions);
     dock.appendChild(sendNote); dock.appendChild(composer);
+    // The voice controls are the Room's own, from the one implementation (mic.js: Dictate, its Setup, the streaming Mic; voice.js:
+    // the tracker behind the speaker controls). Without those files on the page there are none, as in the Room.
+    var vdock = root.LevainMic && typeof root.LevainMic.dock === "function" ? root.LevainMic.dock({
+      doc: doc, root: root, ta: ta, composer: composer, before: actions, note: sendNote, store: store, draftKey: "levain.desk.draft",
+      speech: opts.speech, mic: opts.mic, probe: opts.probe, setupPollMs: opts.setupPollMs,
+      onValue: function () { grow(); paintDock(); }, onTap: function () { voiceTap(); }, stopped: function () { return stopped; },
+    }) : null;
+    var vtrack = null;
+    function vt() {
+      if (!vtrack && root.LevainVoice && typeof root.LevainVoice.tracker === "function") vtrack = root.LevainVoice.tracker();
+      return vtrack;
+    }
+    function voiceTap() { var T = vt(); if (T) T.tap(); }
+    // A desk reply as voice.js knows a reply: one conversation ("desk"), a number that grows as replies are first seen (the order
+    // they reached this page, which is the order autoplay needs), the words to read. deviceOnly: read by this device's voice.
+    function textHash(s) { var h = 5381, i; s = String(s || ""); for (i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36) + ":" + s.length; }
+    function voiceReply(it) {
+      // keyed by what the event IS (its time and a hash of its words), never by its place in the held list: that place shifts
+      // when older events are trimmed, and an old reply must not take a new number and be read again.
+      var key = it.thread + "@" + (it.at || "") + "|" + textHash(it.text);
+      if (!own(VSEQ, key)) VSEQ[key] = ++vnext;
+      return { thread: "desk", gseq: VSEQ[key], text: it.text, deviceOnly: true };
+    }
+    function voiceBtn(it) { var T = vt(); return T ? T.button(voiceReply(it)) : null; }
+    function voiceSync(all) {
+      var T = vt();
+      // A read that failed says nothing about the conversation: it is no sync at all. (thread null stops what is being read and makes
+      // the next body backlog, which is for "no conversation", not for a dropped poll.)
+      if (!T || (current && current.kind === "error")) return;
+      var replies = all.filter(function (it) { return it.k === "ev" && it.kind === "reply" && it.text; }).map(voiceReply);
+      T.sync({ thread: current && current.kind === "wired" ? "desk" : null, replies: replies, hold: false });
+    }
 
     // The draft, the outbox id a line was last tried under and the lines sent are kept beside each other: this mount may be
     // replaced (the page left and come back) between a try and its answer, and a replacement that minted a new id would file
@@ -321,14 +374,23 @@
       saveThreads();
     }
 
+    // The line under the box is SHARED with the dock (mic.js writes its dictation errors, Setup sentences and the insecure-context
+    // words to the same element), so the view writes it only where it has its own words to say (as the Room does), never on a
+    // repaint: a repaint would wipe the dock's.
+    function setNote(words) { note = words; sendNote.textContent = words; }
     function grow() { ta.style.height = "auto"; if (ta.scrollHeight) ta.style.height = (ta.scrollHeight + ta.offsetHeight - ta.clientHeight) + "px"; }
     function canSend() { return !!current && current.kind === "wired"; }
     function paintDock() {
       sendB.disabled = !canSend() || flight.send;
       ta.disabled = !canSend();
-      ta.readOnly = flight.send;
+      ta.readOnly = flight.send || !!(vdock && vdock.live());
       if (ta.value.trim()) sendB.removeAttribute("aria-disabled"); else sendB.setAttribute("aria-disabled", "true");
-      sendNote.textContent = note;
+      var can = clearable();
+      clearB.disabled = flight.send || !can;               // a line still going out is not cleared from under its answer
+      var held = !can && (log.length > 0 || threads.some(function (t) { return t.events.length > 0; }));
+      clearB.textContent = held ? "Nothing to clear" : "Clear";
+      clearB.setAttribute("aria-label", held ? CLEAR_HELD_WORDS : "Clear the conversation shown here");
+      clearB.setAttribute("title", held ? CLEAR_HELD_WORDS : CLEAR_TITLE);
     }
     ta.addEventListener("input", function () {
       try { if (store) store.setItem("levain.desk.draft", ta.value); } catch (e) { /* no storage */ }
@@ -347,7 +409,7 @@
     // whose line has aged out of the log) comes last.
     function rows() {
       var out = [], used = {};
-      function evs(t) { t.events.forEach(function (e) { out.push({ k: "ev", by: e.by, kind: e.kind, text: e.text, at: e.at }); }); }
+      function evs(t) { t.events.forEach(function (e, i) { out.push({ k: "ev", by: e.by, kind: e.kind, text: e.text, at: e.at, thread: t.id, n: i }); }); }
       log.forEach(function (it) {
         out.push(it);
         var t = it.thread && !own(used, it.thread) ? threadById(it.thread) : null;
@@ -361,6 +423,35 @@
     // never settles a thread.
     function settled(t) { return isSettled(t.events); }
     function unreadableNow() { return threads.some(function (t) { return t.unreadable; }); }
+
+    // What Clear may remove: only what is SETTLED. A line that is `ambiguous` is the only copy on the page of words whose "did not
+    // arrive" mark gives them back, and a line whose thread has no desk reply yet is the page's only handle on that reply (the
+    // thread is what is read); neither is ever removed, so Clear never costs a person words or an answer.
+    // The default is KEEP: a line goes only when it is POSITIVELY settled, either a refused one (a known-terminal outcome of this
+    // page's own: nothing was filed, or the person said "did not arrive" and the words went back to the box) or one whose thread is held here and already holds the desk's reply. Ambiguous, arrived (no
+    // thread to read), failed, sending, a filed line with no thread, a line whose thread is absent or not yet read: all stay.
+    function keepLine(it) {
+      if (it.status === "refused" || it.status === "notarrived") return false;
+      var t = it.thread ? threadById(it.thread) : null;
+      return !(t && settled(t));
+    }
+    function clearPlan() {
+      var keepL = log.filter(keepLine), named = {};
+      keepL.forEach(function (x) { if (x.thread) named[x.thread] = 1; });
+      return { log: keepL, threads: threads.filter(function (t) { return !settled(t) || own(named, t.id); }) };
+    }
+    function clearable() { var p = clearPlan(); return p.log.length < log.length || p.threads.length < threads.length; }
+    clearB.addEventListener("click", function () {
+      if (stopped || flight.send || clearB.disabled) return;
+      var T = vt(); if (T) T.halt();                  // a reply being read is stopped: the control that would stop it is going
+      var p = clearPlan();
+      log.length = 0; threads.length = 0;
+      p.log.forEach(function (x) { log.push(x); }); p.threads.forEach(function (t) { threads.push(t); });
+      saveLog(); saveThreads();
+      setNote(log.length ? CLEARED_STAY_WORDS : "Cleared.");
+      lastKey = "";
+      try { draw(); } finally { paintDock(); }       // the button's own state is repainted whatever the draw did
+    });
 
     function draw() {
       var all = rows();
@@ -385,8 +476,9 @@
       clear(body);
       var stream = el(doc, "div", "rv-stream");
       if (!all.length) stream.appendChild(el(doc, "div", "rv-note", current && current.kind === "wired" ? "Nothing here yet. A line you send is filed for the desk; what it files back shows here." : ""));
-      all.forEach(function (it) { stream.appendChild(renderEntry(doc, it, mark)); });
+      all.forEach(function (it) { stream.appendChild(renderEntry(doc, it, mark, voiceBtn)); });
       body.appendChild(stream);
+      voiceSync(all);
       if (stick) toEnd();
       wasEnd = atEnd();
       lastKey = key;       // only a draw that finished is remembered: one that threw is drawn again by the next
@@ -411,11 +503,12 @@
     function doSend() {
       var text = ta.value;
       if (!canSend() || !text.trim() || flight.send) return;
+      voiceTap();
       var id = tryId(text);
       var entry = entryFor(id);
       if (!entry) { entry = { k: "you", id: id, text: text, status: "sending", words: "", ref: "", thread: "" }; log.push(entry); }
       entry.status = "sending";
-      flight.send = true; note = "";
+      flight.send = true; setNote("");
       try { draw(); toEnd(); } catch (e) { /* the line still goes; the next draw repaints */ }
       // The failure path is the POST's alone: once the server has answered, nothing the page does with the answer (a draw, a
       // save, the follow-up read) can turn a filed line into one marked unreached.
@@ -435,7 +528,29 @@
         if (root.console && root.console.error) root.console.error("desk view: " + (e && e.message ? e.message : e));
       }).then(function () { flight.send = false; paintDock(); });
     }
-    sendB.addEventListener("click", doSend);
+    // Send while the streaming mic is open waits for its session to finalise, then sends THAT text (a truncated transcript is never
+    // sent silently); a Dictate in progress ends first. The same rule as the Room's Send.
+    var sendWait = false;
+    sendB.addEventListener("click", function () {
+      if (vdock) vdock.endDictation();
+      if (sendWait) return;
+      var w = vdock ? vdock.settle() : null;
+      if (w) {
+        sendWait = true;
+        w.then(function (r) {
+          sendWait = false;
+          if (stopped) return;
+          if (!r.ok) { setNote(r.words); paintDock(); return; }
+          doSend();
+        }).catch(function (e) {
+          sendWait = false;                              // whatever went wrong, Send is not left waiting
+          if (root.console && root.console.error) root.console.error("desk view: " + (e && e.message ? e.message : e));
+          if (!stopped) paintDock();
+        });
+        return;
+      }
+      doSend();
+    });
 
     // The person's word on an ambiguous line. Either way its outbox id is spent: "arrived" settles the line as filed-unconfirmed
     // (nothing is sent), "did not arrive" puts the same words back in an EMPTY draft box, and the next tap sends them under a
@@ -513,6 +628,8 @@
     return {
       stop: function () {
         stopped = true; gen++; clearTimeout(timer);
+        if (vdock) vdock.destroy();
+        var T = vt(); if (T) T.end();
         doc.removeEventListener("visibilitychange", onVisible);
         body.removeEventListener("scroll", onBodyScroll);
         if (vv) {
