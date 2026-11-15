@@ -372,3 +372,14 @@ def test_the_cli_signs_a_widening_against_its_base_and_lists_a_lapsed_one_by_why
     assert run("sign", {**SPEC, "widens": base, "days": 1}) == 1          # a base not in force: refused before a sheet
     err = capsys.readouterr().err
     assert "is not in force" in err
+
+
+def test_a_deeply_nested_order_file_is_refused_in_words_not_a_traceback(tmp_path):
+    """L3 r2 on ND-2 (codex #3, complement #2): ~20,000 nested arrays fit the byte cap and made json.loads raise
+    RecursionError, which escaped the ValueError handler."""
+    from levain.desk import cli as desk_cli
+    from levain.desk.store import CoordError
+    f = tmp_path / "deep.json"
+    f.write_text("[" * 20_000 + "]" * 20_000)
+    with pytest.raises(CoordError, match="not JSON"):
+        desk_cli._order_spec(f)

@@ -65,7 +65,7 @@ __all__ = [
     "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3", "FORMAT_V4",
     "FORMAT_V5", "VOICE_KEY_KIND", "VOICE_KEY_PROVIDERS", "VOICE_KEY_USES", "voice_key_for", "voice_key_record",
     "GRADUATION_CREATE_RANK",
-    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "STANDING_ORDER_KIND", "STANDING_ORDER_MAX", "STANDING_ORDER_VOICES", "standing_order", "standing_order_sha256", "standing_order_widens","SEAT_LEASE_KIND", "SEAT_LEASE_MAX", "SEAT_EGRESS_KIND", "SEAT_EGRESS_MAX", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
+    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "STANDING_ORDER_KIND", "STANDING_ORDER_MAX", "STANDING_ORDER_VOICES", "standing_order", "standing_order_sha256", "standing_order_widens", "SEAT_LEASE_KIND", "SEAT_LEASE_MAX", "SEAT_EGRESS_KIND", "SEAT_EGRESS_MAX", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
@@ -2331,7 +2331,8 @@ def standing_order_widens(state: AuthoritySnapshot, grant: Mapping[str, Any], po
     """Why widening ``grant`` does not bind to its base in ``pool`` (the grants that answer, or the policy an append
     would leave), or None when it does: the base is a standing order that widens nothing, its whole record is the
     one ``widens_sha256`` names, and it was not brought in after the widening (``grant_born``, so a base revoked and
-    signed again byte for byte is not the base it was). Expiry and signers are the caller's to judge."""
+    signed again byte for byte is not the base it was; that born-after test runs where the widening already has a birth
+    seq, the reader's, not at append). Expiry and signers are the caller's to judge."""
     base_id = grant.get("widens")
     base = pool.get(base_id) if isinstance(base_id, str) else None
     if not (isinstance(base, Mapping) and base.get("kind") == STANDING_ORDER_KIND) or "widens" in base:

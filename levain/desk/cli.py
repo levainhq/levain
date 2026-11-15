@@ -480,7 +480,7 @@ def _order_spec(path: Path) -> dict[str, Any]:
     text = _read_file(path, _ORDER_SPEC_BYTES, "the order file")
     try:
         spec = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise CoordError("the order file is not JSON") from None
     if not isinstance(spec, dict) or not {"words", "will", "will_not", "effect_lines", "judgement_lines", "kills"} \
             <= set(spec) <= _ORDER_SPEC_KEYS:

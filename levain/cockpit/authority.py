@@ -423,7 +423,7 @@ def standing_order_card(grant: Mapping[str, Any]) -> dict[str, Any]:
         _standing_order_check([fields])
     except AuthorityError as exc:
         raise CardRefused(f"the order is refused: {exc}") from exc
-    except (TypeError, AttributeError, ValueError, KeyError) as exc:
+    except (TypeError, AttributeError, ValueError, KeyError, RecursionError) as exc:
         raise CardRefused(f"the order record is malformed: {type(exc).__name__}: {exc}") from exc
     rest = fields["restatement"]
     effects = []
