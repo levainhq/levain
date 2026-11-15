@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import subprocess
-import types
 from pathlib import Path
 
 import pytest
@@ -22,6 +21,14 @@ from tests.spawn_keyguard import (  # noqa: F401
     _a_refused_spawn_fails_its_test, _no_signing_spawn_in_tests, keyguard_cleanup, pytest_sessionfinish,
     pytest_terminal_summary)
 from tests.spawn_keyguard import pytest_testnodedown as _keyguard_testnodedown
+
+
+class _KeyguardXdist:
+    """The keyguard's controller-side xdist hook as a plugin object (a plugin must be hashable)."""
+
+    @staticmethod
+    def pytest_testnodedown(node, error):
+        _keyguard_testnodedown(node, error)
 
 
 @pytest.fixture(autouse=True)
@@ -304,7 +311,7 @@ def pytest_configure(config):
     # ``pytest_testnodedown`` is an xdist hook: a module-level one makes a plain-pytest run (no pytest-xdist) fail with
     # "unknown hook" at startup, which is why the keyguard's controller-side hook is registered only when xdist is loaded
     if config.pluginmanager.hasplugin("xdist") and not config.pluginmanager.has_plugin("levain-keyguard-xdist"):
-        config.pluginmanager.register(types.SimpleNamespace(pytest_testnodedown=_keyguard_testnodedown), "levain-keyguard-xdist")
+        config.pluginmanager.register(_KeyguardXdist(), "levain-keyguard-xdist")
     if not _SESSION_HOME:
         _install_session_home(getattr(config.option, "basetemp", None))
 
