@@ -17,7 +17,7 @@ from tests.autonomic_test_only_confinement import test_only_confined_executor  #
 from tests.autonomic_test_only_coverage import test_only_every_effect_covered  # noqa: F401
 
 # TEST ONLY: the spawn-level keyguard (a DENY on the operator's real key; see the module).
-from tests.spawn_keyguard import _a_refused_spawn_fails_its_test, _no_signing_spawn_in_tests  # noqa: F401
+from tests.spawn_keyguard import _a_refused_spawn_fails_its_test, _no_signing_spawn_in_tests, keyguard_cleanup  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
@@ -289,6 +289,7 @@ def pytest_configure(config):
 
 
 def pytest_unconfigure(config):
+    keyguard_cleanup()          # the keyguard's wall and scrub end here too (idempotent; a run with no test never starts its fixture)
     os.environ.pop(home_guard.TEST_SCRATCH_ROOT_ENV, None)
     while _SESSION_HOME:
         shutil.rmtree(_SESSION_HOME.pop(), ignore_errors=True)

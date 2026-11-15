@@ -4,8 +4,10 @@ asserted to happen before anything would exec. The real home is a tmp dir (``_re
 
 from __future__ import annotations
 
+import gc
 import os
 import subprocess
+import sys
 
 import pytest
 
@@ -25,11 +27,13 @@ def home(tmp_path, monkeypatch):
 def test_the_real_key_places_are_refused_by_every_form(home, tmp_path):
     for argv in (["cat", str(home / ".ssh" / "id_ed25519")], ["ssh-keygen", "-Y", "sign", "-f", str(home / ".levain/keys/terminal")],
                  ["cat", "~/.ssh/id_x"], ["cat", "~/.ssh"], ["ls", f"-f{home}/.ssh/id_x"], ["git", "-c", f"user.signingkey={home}/.ssh/k"],
-                 ["sh", "-c", "cat $HOME/.ssh/id_x"], ["sh", "-c", "cat ${HOME}/.ssh/id_x"], f"cat {home}/.ssh/id_x",
+                 f"cat {home}/.ssh/id_x",
                  ["sh", "-c", f"echo hi; cat {home}/.ssh/id_x"], ["cat", str(home / ".levain" / "terminal")],
                  ["cat", str(home / ".levain" / "id_x")], ["cat", str(home / ".levain" / "k.pub")],
                  ["git", "-c", f"core.sshCommand=ssh -i {home}/.ssh/id_x", "fetch"], ["ssh-keygen", "-D", "/usr/lib/ssh-keychain.dylib"]):
         assert G.judge(argv, cwd=str(tmp_path)), argv
+    for script in ("cat $HOME/.ssh/id_x", "cat ${HOME}/.ssh/id_x"):                 # $HOME is the judged child's HOME
+        assert G.judge(["sh", "-c", script], env={"HOME": str(home)}), script
     assert G.judge(["cat", "id_x"], cwd=str(home / ".ssh"))                       # relative, resolved against the child's cwd
     assert G.judge(["cat", "x"], executable=str(home / ".ssh" / "x"))
     assert G.judge(["cat", str(home / ".levain" / "notes.md")]) is None           # not a key place
@@ -117,26 +121,131 @@ def test_popen_positionals_and_keywords_are_judged(wall, home, tmp_path):
     assert len(wall) == 1
 
 
-def test_os_exec_spawn_posix_spawn_and_system_are_judged(wall, home, tmp_path, monkeypatch):
+_ENV = {"A": "b"}
+
+
+def _positional(n, argv, env):
+    """The positional arguments of ``os.<n>`` for ``argv`` (and ``env`` where the function takes one)."""
+    if n == "system":
+        return (" ".join(argv),)
+    if n.startswith("spawnl"):
+        return (os.P_NOWAIT, argv[0], *argv, *((env,) if n.endswith("e") else ()))
+    head = (os.P_NOWAIT,) if n.startswith("spawn") else ()
+    return (*head, argv[0], argv, *((env,) if (n.endswith("e") or n.startswith("posix")) else ()))
+
+
+def test_every_wrapped_os_function_is_judged_positionally_and_by_keyword(home, tmp_path, monkeypatch):
+    names = ("posix_spawn", "posix_spawnp", "execv", "execve", "execvp", "execvpe", "system", "spawnl", "spawnle", "spawnlp",
+             "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe")
+    names = [n for n in names if hasattr(os, n)]
+    sigs = {n: G.real_signature(getattr(os, n), n) for n in names}                # the REAL signatures, through the wrapper
     calls: list = []
-    real = {n: getattr(os, n) for n in ("execv", "posix_spawn", "spawnv", "spawnl", "system")}
-    for n in real:
-        monkeypatch.setattr(os, n, lambda *a, _n=n, **k: calls.append(_n))
+    for n in names:
+        def rec(*a, _n=n, **k):
+            calls.append(_n)
+        rec.__signature__ = sigs[n]
+        monkeypatch.setattr(os, n, rec)
     key = str(home / ".ssh" / "id_x")
+    before = len(G._VIOLATIONS)
     gen = G.install()                                                             # over the recorders just set
     next(gen)
     try:
-        for call in (lambda: os.execv("/bin/cat", ["cat", key]), lambda: os.posix_spawn("/bin/cat", ["cat", key], {}),
-                     lambda: os.spawnv(os.P_NOWAIT, "/bin/cat", ["cat", key]), lambda: os.spawnl(os.P_NOWAIT, "/bin/cat", "cat", key),
-                     lambda: os.system(f"cat {key}"), lambda: os.posix_spawn("/usr/sbin/sc_auth", ["sc_auth"], env={})):
-            with pytest.raises(RealKeyReached):
-                call()
-        assert calls == []
-        os.execv("/bin/true", ["true"])
-        os.system("true")
-        assert calls == ["execv", "system"]
+        for n in names:
+            for argv, refused in ((["cat", str(tmp_path / "fine")], False), (["cat", key], True)):
+                pos = _positional(n, argv, _ENV)
+                forms = [dict(args=pos)]
+                params = list(sigs[n].parameters.values())
+                if not any(p.kind in (p.POSITIONAL_ONLY, p.VAR_POSITIONAL) for p in params):
+                    forms.append(dict(kwargs=dict(zip((p.name for p in params), pos))))
+                for form in forms:
+                    seen = len(calls)
+                    call = (lambda: getattr(os, n)(*form["args"])) if "args" in form else (lambda: getattr(os, n)(**form["kwargs"]))
+                    if refused:
+                        with pytest.raises(RealKeyReached):
+                            call()
+                        assert len(calls) == seen, (n, form)
+                    else:
+                        call()
+                        assert calls[-1] == n and len(calls) == seen + 1, (n, form)
+        with pytest.raises(RealKeyReached):
+            os.posix_spawn("/usr/sbin/sc_auth", ["sc_auth"], {})
     finally:
         gen.close()
+        G.acknowledge(before)
+
+
+def test_a_refused_popen_leaves_no_unraisable_del(wall, home):
+    p = subprocess.Popen.__new__(subprocess.Popen)
+    with pytest.raises(RealKeyReached):
+        p.__init__(["cat", str(home / ".ssh" / "id_x")])
+    assert p._child_created is False
+    p.__del__()                                                                   # AttributeError before the attribute was set
+    seen: list = []
+    old, sys.unraisablehook = sys.unraisablehook, seen.append
+    try:
+        with pytest.raises(RealKeyReached):
+            subprocess.Popen(["cat", str(home / ".ssh" / "id_x")])
+        gc.collect()
+    finally:
+        sys.unraisablehook = old
+    assert seen == []
+
+
+def test_dollar_home_follows_the_judged_childs_home(home, tmp_path):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    for script in ("cat $HOME/.ssh/id_test", "cat ${HOME}/.ssh/id_test"):
+        assert G.judge(["sh", "-c", script], env={"HOME": str(scratch)}) is None
+        assert G.judge(["sh", "-c", script], env={"HOME": str(home)})
+    assert G.judge(["cat", "$HOME/.ssh/id_test"], env={"HOME": str(home)})
+    assert G.judge(["sh", "-c", "cat $HOME/.ssh/id_test"], env={})                # unset HOME: a shell falls back to passwd
+
+
+def test_structured_argv_is_data_except_for_paths_and_shell_code(home):
+    assert G.judge(["printf", "%s", "documentation: ~/.ssh/id"], env={}) is None
+    assert G.judge(["echo", "see sc_auth and ssh-add docs"], env={}) is None
+    assert G.judge(["cat", f"{home}/.ssh/my key"], env={})                        # the token is itself a path
+    assert G.judge(["sh", "-c", "cat ~/.ssh/id"], env={})
+    assert G.judge(["eval", "cat ~/.ssh/id"], env={})
+    assert G.judge(["git", "-c", f"gpg.ssh.program=sh -c 'cat {home}/.ssh/k'", "x"], env={})
+
+
+def test_executable_keeps_argv0_and_an_argv_socket_assignment_needs_env_or_a_shell(home, tmp_path):
+    sock = str(tmp_path / "s")
+    assert G.judge([str(home / ".ssh" / "id_x"), "ok"], executable="/bin/cat", env={})
+    assert G.judge(["ssh-add", "k"], executable="/bin/echo", env={})
+    assert G.judge(["ssh-add", f"SSH_AUTH_SOCK={sock}"], env={"SSH_AUTH_SOCK": "/Users/nobody/a"})   # not an env assignment
+    assert G.judge(["printf", f"SSH_AUTH_SOCK={sock}", "ssh-add"], env={})
+    assert G.judge(["env", f"SSH_AUTH_SOCK={sock}", "ssh-add", "k"], env={}) is None
+    assert G.judge(["sh", "-c", f"SSH_AUTH_SOCK={sock} ssh-add k"], env={}) is None
+    assert G.judge(["ssh-add", "k"], env={"SSH_AUTH_SOCK": sock}) is None         # the child's own env decides
+
+
+def test_the_protected_prefixes_compare_case_and_normalisation_insensitively_on_darwin(home, monkeypatch):
+    shouty = str(home).upper() + "/.SSH/id_x"
+    monkeypatch.setattr(G, "_FOLD", False)
+    assert G.judge(["cat", shouty], env={}) is None
+    monkeypatch.setattr(G, "_FOLD", True)
+    assert G.judge(["cat", shouty], env={})
+    assert G._norm("e\u0301") == G._norm("\u00e9") == "\u00e9"
+
+
+def test_cleanup_is_idempotent_and_reachable_from_unconfigure_and_atexit(monkeypatch):
+    closed, restored = [], []
+    monkeypatch.setattr(G, "restore_environ", restored.append)
+
+    class Session:
+        def close(self):
+            closed.append(1)
+
+    prev = {"SSH_AUTH_SOCK": None}
+    done = G.make_cleanup(prev, Session())
+    done(), done(), done()
+    assert closed == [1] and restored == [prev]
+    calls: list = []
+    monkeypatch.setattr(G, "cleanup", lambda: calls.append(1))
+    G.keyguard_cleanup()
+    assert calls == [1]
 
 
 def test_the_session_wall_and_scrub_are_in_force_for_this_run():

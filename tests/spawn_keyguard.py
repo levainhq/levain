@@ -2,23 +2,32 @@
 Installed at import (collection is covered). Every Popen (``run``, ``os.popen``), ``os.posix_spawn*``/``spawn*``/``exec*``/``system``
 is judged before anything starts; a refusal raises ``RealKeyReached`` naming the test, the reason and the argv, is recorded, and
 also fails its test at teardown. Shell strings (``shell=True``, ``sh -c``, ``eval``) are re-tokenised with shlex (unbalanced quote: refused).
-D1: any argv token (``~`` and ``$HOME`` read as the PASSWD home, realpath against the child's cwd) inside ``<home>/.ssh``,
-``<home>/.levain/keys``, a key-named file in ``<home>/.levain``, or a known provider library. D2: ``sc_auth``; ``ssh-keygen``
--K/-w/-D; ``ssh-add`` unless SSH_AUTH_SOCK is under the temp dir (a fake of these by absolute path under the temp dir is fine).
-Scrubbed for the run, restored at its end: SSH_AUTH_SOCK, SSH_SK_PROVIDER; git system config off, global config a scratch identity.
+D1: any argv token (``~`` read as the PASSWD home, ``$HOME`` as the judged child's own HOME, realpath against the child's cwd)
+inside ``<home>/.ssh``, ``<home>/.levain/keys``, a key-named file in ``<home>/.levain``, or a known provider library (compared
+case-folded and NFC on darwin). A structured argv is data: an element with spaces is read as shell code only after ``sh -c`` or
+``eval`` (or as the value of ``core.sshCommand=``/``gpg.ssh.program=``). D2: ``sc_auth``; ``ssh-keygen`` -K/-w/-D; ``ssh-add``
+unless the child's SSH_AUTH_SOCK is under the temp dir (an argv ``SSH_AUTH_SOCK=`` counts only after ``env`` or in a shell string;
+a fake of these by absolute path under the temp dir is fine). Scrubbed for the run, restored at its end (also at
+``pytest_unconfigure`` and ``atexit``, once): SSH_AUTH_SOCK, SSH_SK_PROVIDER; git system config off, global config a scratch identity.
 Known edges: ctypes/cffi/libc system; TOCTOU; a key copied out before the test; a process the test starts that itself reads the
-home (a real levain CLI by subprocess: the scrub is the defence)."""
+home (a real levain CLI by subprocess: the scrub is the defence); an explicit child ``env=`` naming the real key on purpose;
+``shell=True`` list form with the key as a positional ``$1``; the ``~user`` spelling; case games a case-sensitive volume allows."""
 
 from __future__ import annotations
 
 import atexit
+import functools
+import inspect
 import os
 import pwd
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+import unicodedata
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -29,7 +38,8 @@ _PROVIDERS = ("/usr/lib/ssh-keychain.dylib", "/usr/libexec/ssh-sk-helper", "/usr
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 _POPEN_POS = ("bufsize", "executable", "stdin", "stdout", "stderr", "preexec_fn", "close_fds", "shell", "cwd", "env")
 _ENV_NAMES = ("SSH_AUTH_SOCK", "SSH_SK_PROVIDER", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")
-_PROVIDER_FLAG = re.compile(r"-[A-Za-z]*[KwD]")             # ssh-keygen -K / -w / -D, clustered (-qK) or attached (-D/lib)
+_CODE_VALUE = re.compile(r"(?i)(core\.sshcommand|gpg\.ssh\.program)=")      # git config keys whose value is a command line
+_PROVIDER_FLAG =re.compile(r"-[A-Za-z]*[KwD]")             # ssh-keygen -K / -w / -D, clustered (-qK) or attached (-D/lib)
 
 
 def _real_home() -> str:
@@ -45,24 +55,33 @@ def _in_tmp(p: str) -> bool:
     return _inside(os.path.realpath(p), os.path.realpath(tempfile.gettempdir()))
 
 
-def _hits_real_key(tok: str, cwd: str | None) -> bool:
+_FOLD = sys.platform == "darwin"                            # APFS/HFS+ are case-insensitive and normalisation-insensitive
+
+
+def _norm(s: str) -> str:
+    return unicodedata.normalize("NFC", s).casefold() if _FOLD else s
+
+
+def _hits_real_key(tok: str, cwd: str | None, env_home: str | None = None) -> bool:
     home = _real_home()
-    h = os.path.realpath(home)
+    h = _norm(os.path.realpath(home))
+    eh = env_home or home                                   # ``$HOME`` is the child's HOME (unset: a shell falls back to passwd)
+    providers = {_norm(x) for x in _PROVIDERS}
     for cand in {tok, tok.split("=", 1)[-1], tok[2:] if tok[:1] == "-" and tok[1:2] != "-" else tok}:
-        s = cand.replace("${HOME}", home).replace("$HOME", home)
+        s = cand.replace("${HOME}", eh).replace("$HOME", eh)
         s = home + s[1:] if s == "~" or s.startswith("~/") else s
         if not s or "\0" in s:
             continue
-        p = os.path.realpath(s if os.path.isabs(s) else os.path.join(cwd or os.getcwd(), s))
+        p = _norm(os.path.realpath(s if os.path.isabs(s) else os.path.join(cwd or os.getcwd(), s)))
         name = os.path.basename(p)
-        if (_inside(p, h + "/.ssh") or _inside(p, h + "/.levain/keys") or cand in _PROVIDERS or p in _PROVIDERS
+        if (_inside(p, h + "/.ssh") or _inside(p, h + "/.levain/keys") or _norm(cand) in providers or p in providers
                 or (os.path.dirname(p) == h + "/.levain" and (name == "terminal" or name.startswith("id_") or name.endswith(".pub")))):
             return True
     return False
 
 
 def _split(text: str, depth: int = 0) -> list[str]:
-    """shlex tokens of ``text`` plus, recursively, those of a nested ``sh -c STR``, ``eval ...`` or a token holding spaces."""
+    """shlex tokens of ``text`` plus, recursively, those of a nested ``sh -c STR`` or ``eval ...``."""
     lex = shlex.shlex(text.replace("\n", " ; "), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     toks = list(lex)                                        # ValueError on an unbalanced quote
@@ -74,12 +93,12 @@ def _flatten(toks: list[str], depth: int = 0) -> list[str]:
     for i, t in enumerate(toks):
         script = None
         if os.path.basename(t).lower() in _SHELLS:
-            script = next((toks[k + 1] for k, a in enumerate(toks[i + 1:], i) if a[:1] == "-" and a[1:2] != "-" and "c" in a
+            script = next((toks[k + 1] for k, a in enumerate(toks[i + 1:], i + 1) if a[:1] == "-" and a[1:2] != "-" and "c" in a
                            and k + 1 < len(toks)), None)
         elif t == "eval":
             script = " ".join(toks[i + 1:])
-        elif i and any(c.isspace() for c in t):
-            script = t
+        elif _CODE_VALUE.match(t):
+            script = t.split("=", 1)[1]
         if script is not None:
             if depth >= 4:
                 raise ValueError("a shell command nested too deeply to read")
@@ -92,14 +111,21 @@ def judge(args, executable=None, env=None, cwd=None, shell: bool = False) -> str
     try:
         e = {os.fsdecode(k): os.fsdecode(v) for k, v in dict(os.environ if env is None else env).items()}
         c = os.fsdecode(cwd) if cwd is not None else None
+        exe = os.fsdecode(executable) if executable is not None else None
         if isinstance(args, (str, bytes)):
-            toks = _split(os.fsdecode(args))
+            toks, shelly = _split(os.fsdecode(args)), True
+            toks = [exe, *toks] if exe else toks
         else:
-            toks = [os.fsdecode(a) for a in ([args] if isinstance(args, os.PathLike) else args)]
-            toks = _split(toks[0]) if shell and toks else _flatten(toks)
-        if executable is not None and not shell:
-            toks = [os.fsdecode(executable), *toks[1:]]
-        sock = ([t.split("=", 1)[1] for t in toks if t.startswith("SSH_AUTH_SOCK=")] or [e.get("SSH_AUTH_SOCK", "")])[-1]
+            raw = [os.fsdecode(a) for a in ([args] if isinstance(args, os.PathLike) else args)]
+            if shell:
+                toks, shelly = (_split(raw[0]) if raw else []), True
+                toks = [exe, *toks] if exe else toks
+            else:
+                toks, shelly = _flatten([exe, *raw] if exe else raw), False     # the executable AND every argv element
+        honour = shelly or os.path.basename(toks[0]) == "env" if toks else False
+        honour = honour or any(os.path.basename(t).lower() in _SHELLS or t == "eval" for t in toks)
+        assigned = [t.split("=", 1)[1] for t in toks if t.startswith("SSH_AUTH_SOCK=")] if honour else []
+        sock = (assigned or [e.get("SSH_AUTH_SOCK", "")])[-1]
         for i, t in enumerate(toks):
             name = os.path.basename(t).lower()
             fake = os.path.isabs(t) and _in_tmp(t)
@@ -109,7 +135,7 @@ def judge(args, executable=None, env=None, cwd=None, shell: bool = False) -> str
                 return "ssh-keygen -K/-w/-D reaches a security-key provider"
             if name == "ssh-add" and not fake and not (sock and _in_tmp(sock)):
                 return "ssh-add outside a throwaway agent (SSH_AUTH_SOCK is not under the temp dir)"
-        hit = next((t for t in toks if _hits_real_key(t, c)), None)
+        hit = next((t for t in toks if _hits_real_key(t, c, e.get("HOME"))), None)
         return None if hit is None else f"argv names the real account's key place or a security-key provider ({hit})"
     except ValueError as exc:
         return f"a command string that cannot be read ({exc}); refused"
@@ -125,30 +151,65 @@ class AppendOnly(list):
 _VIOLATIONS: AppendOnly = AppendOnly()
 _ACKNOWLEDGED: set[int] = set()
 _SEEN = [0]
+_LOCK = threading.RLock()                                   # worker threads may refuse while a teardown drains
 
 
 def acknowledge(since: int) -> None:
     """A test that provokes a refusal on purpose marks the entries from index ``since`` as expected."""
-    _ACKNOWLEDGED.update(range(since, len(_VIOLATIONS)))
+    with _LOCK:
+        _ACKNOWLEDGED.update(range(since, len(_VIOLATIONS)))
 
 
 def _pending() -> list[str]:
-    return [_VIOLATIONS[i] for i in range(_SEEN[0], len(_VIOLATIONS)) if i not in _ACKNOWLEDGED]
+    with _LOCK:
+        return [_VIOLATIONS[i] for i in range(_SEEN[0], len(_VIOLATIONS)) if i not in _ACKNOWLEDGED]
+
+
+def _drain() -> list[str]:
+    """The refusals nobody judged yet, marked as seen, under one lock."""
+    with _LOCK:
+        fresh = _pending()
+        _SEEN[0] = len(_VIOLATIONS)
+        return fresh
 
 
 def _refuse(why: str, argv) -> None:
     from levain.cockpit.keys import RealKeyReached      # lazily: nothing of levain loads at conftest import
     msg = f"test {os.environ.get('PYTEST_CURRENT_TEST', '<no test>')} tried to start a spawn the keyguard denies: {why}. argv={argv!r}"
-    _VIOLATIONS.append(msg)
+    with _LOCK:
+        _VIOLATIONS.append(msg)
     raise RealKeyReached(msg)
 
 
-def spawn_args(n: str, rest: Sequence, kw: Mapping) -> tuple[list, object]:
-    """(argv, env) of ``os.<n>(mode, file, *rest, **kw)``; env None where inherited (the ``e`` forms take it last or by keyword)."""
-    rest, e = list(rest), n.endswith("e")
-    if "v" in n:
-        return list(rest[0] if rest else kw["args"]), ((rest[1] if len(rest) > 1 else kw["env"]) if e else None)
-    return (rest[:-1], rest[-1]) if e else (rest, None)
+def _listed(args):
+    if isinstance(args, (str, bytes, os.PathLike)):
+        return args
+    try:
+        return list(args)
+    except TypeError:
+        return args
+
+
+def _posix_spawn_signature(path, argv, env, /, **keywords):         # the C signature of ``os.posix_spawn*`` (inspect cannot read it)
+    """Stand-in for the builtin's ``(path, argv, env, /, *, file_actions=..., ...)``."""
+
+
+def real_signature(fn, name: str):
+    """``inspect.signature(fn)``; the posix_spawn builtins have ``<unrepresentable>`` defaults and fall back to a stand-in; None if
+    nothing can be read (the caller refuses the call)."""
+    try:
+        return inspect.signature(fn)
+    except (TypeError, ValueError):
+        return inspect.signature(_posix_spawn_signature) if name.startswith("posix_spawn") else None
+
+
+def call_parts(n: str, bound: Mapping) -> tuple[object, object, object]:
+    """(file, argv, env) of a call of ``os.<n>`` already bound to the real signature; env None where inherited."""
+    file = bound.get("path", bound.get("file"))
+    if n.startswith("spawnl"):                              # spawnl*(mode, file, *args): the ``e`` forms take env as the last arg
+        args = list(bound.get("args", ()))
+        return file, (args[:-1] if n.endswith("e") else args), (args[-1] if n.endswith("e") and args else None)
+    return file, bound.get("argv", bound.get("args")), (bound.get("env") if (n.endswith("e") or n.startswith("posix")) else None)
 
 
 def install():
@@ -161,24 +222,31 @@ def install():
     def check(args, executable=None, env=None, cwd=None, shell=False):
         why = judge(args, executable, env, cwd, shell)
         if why:
-            _refuse(why, args if isinstance(args, (str, bytes, os.PathLike)) else list(args))
+            _refuse(why, _listed(args))
 
     def popen_init(self, args, *a, **kw):
+        self._child_created = False                         # a refusal raises before the real __init__; __del__ reads this
         args = args if isinstance(args, (str, bytes, os.PathLike)) else list(args)      # an iterator is read once
         b = {**dict(zip(_POPEN_POS, a)), **kw}
         check(args, b.get("executable"), b.get("env"), b.get("cwd"), bool(b.get("shell")))
         return real_init(self, args, *a, **kw)
 
     def wrap(n, real):
+        sig = real_signature(real, n)
+
+        @functools.wraps(real)
         def run(*a, **kw):
+            if sig is None:
+                _refuse("a spawn function whose signature cannot be read", [n])
+            try:
+                bound = sig.bind(*a, **kw).arguments        # judged from the REAL signature, positional or keyword
+            except TypeError:
+                return real(*a, **kw)                       # a malformed call: the real function raises, nothing starts
             if n == "system":
-                check(a[0], shell=True)
-            elif n.startswith("spawn"):
-                argv, env = spawn_args(n, a[2:], kw)
-                check(argv, a[1], env)
+                check(bound["command"], shell=True)
             else:
-                env = (a[2] if len(a) > 2 else kw.get("env")) if n.endswith("e") or n.startswith("posix") else None
-                check(a[1], a[0], env)
+                file, argv, env = call_parts(n, bound)
+                check(argv, file, env)
             return real(*a, **kw)
         return run
 
@@ -218,9 +286,29 @@ def restore_environ(previous: Mapping[str, str | None]) -> None:
         os.environ.pop(n, None) if v is None else os.environ.__setitem__(n, v)
 
 
+def make_cleanup(previous, session):
+    """The one end-of-run act (close the wall, restore the environment), idempotent: the session fixture, ``pytest_unconfigure``
+    (a run that collected nothing, or failed collection, never starts the fixture) and ``atexit`` may all call it."""
+    done: list[bool] = []
+
+    def cleanup() -> None:
+        if done:
+            return
+        done.append(True)
+        restore_environ(previous)
+        session.close()
+    return cleanup
+
+
 _ORIGINAL_ENV = scrub_environ()
 _SESSION = install()
 next(_SESSION)
+cleanup = make_cleanup(_ORIGINAL_ENV, _SESSION)
+atexit.register(lambda: cleanup())
+
+
+def keyguard_cleanup() -> None:
+    cleanup()
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -231,8 +319,7 @@ def _no_signing_spawn_in_tests():
     try:
         yield
     finally:
-        restore_environ(_ORIGINAL_ENV)
-        _SESSION.close()
+        cleanup()
     if _pending():
         pytest.fail("the keyguard refused a spawn that no test judged:\n" + "\n".join(_pending()), pytrace=False)
 
@@ -242,7 +329,6 @@ def _a_refused_spawn_fails_its_test():
     """A caller that catches the refusal still fails here. Judged by index, so a refusal in a wider-scoped fixture fails the
     first test to finish after it."""
     yield
-    fresh = _pending()
-    _SEEN[0] = len(_VIOLATIONS)
+    fresh = _drain()
     if fresh:
         pytest.fail("the keyguard refused a spawn during this test (the code under test caught it):\n" + "\n".join(fresh), pytrace=False)
