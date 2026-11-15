@@ -359,12 +359,13 @@ def test_concurrent_signs_with_different_bounds_do_not_see_each_other(tmp_path):
     assert set(seen) == {2.0, 7.0} and set(seen.values()) == {ckeys._SIGN_TIMEOUT}
 
 
-def test_default_factory_is_ssh_signer_in_our_namespace(monkeypatch):
+def test_default_factory_is_ssh_signer_in_our_namespace(monkeypatch, tmp_path):
     monkeypatch.undo()
     calls = []
     monkeypatch.setattr(ckeys, "ssh_signer", lambda p, **kw: calls.append((p, kw)) or ("fp", None))
-    assert ts.default_signer_factory(Path("/k"), 4.0) == ("fp", None)
-    assert calls == [(Path("/k"), {"namespace": ts.NAMESPACE, "timeout": 4.0})]
+    key = tmp_path / "k"                         # a key path must lie in the scratch root: the key guard is an allowlist
+    assert ts.default_signer_factory(key, 4.0) == ("fp", None)
+    assert calls == [(key.resolve(), {"namespace": ts.NAMESPACE, "timeout": 4.0})]
 
 
 def test_is_remote():
