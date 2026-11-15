@@ -112,8 +112,16 @@ def refuse_real_key_in_tests(path: Path | str | None, what: str = "the key") -> 
     except (OSError, RuntimeError) as exc:
         raise RealKeyReached(f"a test reached {what} ({path}), which cannot be resolved ({type(exc).__name__}: {exc}); "
                              "under a test run that is refused. Pass a temp key_dir and a fake signer") from None
-    extra = [r for r in os.environ.get(TEST_KEY_ROOTS_ENV, "").split(os.pathsep) if r]
-    if not (vouched_scratch(target) or any(vouched_scratch(target, {TEST_SCRATCH_ROOT_ENV: r}) for r in extra)):
+    extra = [r for r in os.environ.get(TEST_KEY_ROOTS_ENV, "").split(os.pathsep) if os.path.isabs(r)]
+    try:
+        real = pwd_key_dir().resolve()
+    except (OSError, RuntimeError, KeyError):
+        real = None
+    # the one thing no named root may do: hold the operator's real key directory (a scratch root that is a link to
+    # ~/.levain would otherwise vouch for it); an unnameable real directory is refused, fail closed
+    holds_real = real is None or target == real or real in target.parents
+    if holds_real or not (vouched_scratch(target)
+                          or any(vouched_scratch(target, {TEST_SCRATCH_ROOT_ENV: str(Path(r).resolve())}) for r in extra)):
         raise RealKeyReached(f"a test reached {what} ({target}), which is not inside the scratch root the test run names: "
                              "a test may only use a key it made there, never the operator's (a Touch ID sheet would "
                              "open on the live laptop); pass a temp key_dir and a fake signer")

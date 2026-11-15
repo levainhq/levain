@@ -262,7 +262,7 @@ def _isolate_levain_home(monkeypatch, tmp_path_factory):
 _SESSION_HOME: list = []
 
 
-def _install_session_home() -> None:
+def _install_session_home(basetemp=None) -> None:
     """TEST ONLY: ``$HOME`` is one scratch directory for the whole run, set before any test module is collected, so
     a module-level constant bound from ``Path.home()`` at import (``levain.firing.anneal.DEFAULT_CRYSTAL_PATH``, a
     test's own ``REAL_CRYSTAL``) and a module-scoped fixture see it too, and a test's ``monkeypatch.undo()``
@@ -286,20 +286,28 @@ def _install_session_home() -> None:
     import pwd
     from tests.autonomic_confirm_keys import SCRATCH_PARENT
     from levain.cockpit.keys import TEST_KEY_ROOTS_ENV
-    os.environ[TEST_KEY_ROOTS_ENV] = str(Path(pwd.getpwuid(os.getuid()).pw_dir) / SCRATCH_PARENT)
+    roots = []
+    try:
+        roots.append(str((Path(pwd.getpwuid(os.getuid()).pw_dir) / SCRATCH_PARENT).resolve()))
+    except (KeyError, OSError):
+        pass        # no passwd entry (a container uid): no anchor scratch either, and the guard refuses what it cannot name
+    if basetemp:    # ``pytest --basetemp=DIR`` puts every tmp_path outside the system temp root
+        roots.append(str(Path(basetemp).resolve()))
+    os.environ[TEST_KEY_ROOTS_ENV] = os.pathsep.join(roots)
     for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "CODEX_HOME", home_guard.LIVE_ENV):
         os.environ.pop(name, None)     # the live marker too: a shell that holds it never opens the real home to a test
 
 
 def pytest_configure(config):
     if not _SESSION_HOME:
-        _install_session_home()
+        _install_session_home(getattr(config.option, "basetemp", None))
 
 
 def pytest_unconfigure(config):
     keyguard_cleanup()          # the keyguard's wall and scrub end here too (idempotent; a run with no test never starts its fixture)
     os.environ.pop(home_guard.TEST_SCRATCH_ROOT_ENV, None)
-    os.environ.pop("LEVAIN_TEST_KEY_ROOTS", None)
+    from levain.cockpit.keys import TEST_KEY_ROOTS_ENV
+    os.environ.pop(TEST_KEY_ROOTS_ENV, None)
     while _SESSION_HOME:
         shutil.rmtree(_SESSION_HOME.pop(), ignore_errors=True)
     from tests import _shared_chrome

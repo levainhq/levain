@@ -195,3 +195,24 @@ def test_temp_key_dir_is_untouched(tmp_path):
 def test_refusal_is_a_key_error_and_an_assertion_error(fixture_bypassed):
     with pytest.raises(AssertionError, match="scratch root"):
         ts.default_signer_factory(K.pwd_key_dir() / ts.KEY_LABEL, 1.0)
+
+
+def test_a_named_root_that_holds_the_real_key_directory_vouches_for_nothing(monkeypatch):
+    # L3 r2 (codex, deepseek, complement): a scratch root that is, or links to, ~/.levain must not open ~/.levain/keys
+    real = K.pwd_key_dir()
+    for root in (real.parent, real, real.parent.parent):
+        monkeypatch.setenv(K.TEST_KEY_ROOTS_ENV, str(root))
+        with pytest.raises(K.RealKeyReached):
+            K.refuse_real_key_in_tests(real / ts.KEY_LABEL)
+
+
+def test_a_named_extra_root_admits_a_key_inside_it_and_a_relative_one_is_ignored(monkeypatch, tmp_path):
+    from levain import home_guard
+    monkeypatch.delenv(home_guard.TEST_SCRATCH_ROOT_ENV, raising=False)     # only the extra root can vouch now
+    root = tmp_path / "anchors"
+    root.mkdir()
+    monkeypatch.setenv(K.TEST_KEY_ROOTS_ENV, str(root))
+    assert K.refuse_real_key_in_tests(root / "k" / ts.KEY_LABEL) == (root / "k" / ts.KEY_LABEL).resolve()
+    monkeypatch.setenv(K.TEST_KEY_ROOTS_ENV, "anchors")
+    with pytest.raises(K.RealKeyReached):
+        K.refuse_real_key_in_tests(root / "k" / ts.KEY_LABEL)
