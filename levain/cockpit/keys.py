@@ -281,6 +281,38 @@ def _append(db: CockpitDB, op: Mapping[str, Any], *, signer_fp: str, sign: Signe
         raise KeyError_(str(exc)) from None
 
 
+def _append_at(db: CockpitDB, op: Mapping[str, Any], checked: AuthoritySnapshot, *, signer_fp: str, sign: Signer,
+               clock: Callable[[], datetime], ssh_keygen: Path | str, what: str) -> AuthoritySnapshot:
+    """:func:`_append`, bound to the snapshot ``checked`` that the caller judged the link against (leg 6 L3 r1, codex
+    HIGH): the link is prepared, and refused unless it follows ``checked``'s head exactly; it is signed; and it is
+    appended only on that same head (:func:`levain.authority.append` raises ``StaleHead`` otherwise). A revoke checked
+    against one incarnation of a grant id therefore never lands on a later one made under the same id, nor on a
+    renewed one. Refused before the signature when the head moved during the check, after it when it moved during the
+    signature; either way nothing is written, and the refusal says to run ``what`` again."""
+    moved = (f"the authority log moved since {what} was checked (another writer appended); nothing was written: "
+             f"look again and run {what} again")
+    try:
+        with db.autocommit() as conn:
+            link = _authority.prepare(conn, op, signer_fp=signer_fp, now=_now(clock), ssh_keygen=ssh_keygen)
+    except VerifierUnavailable:
+        raise
+    except AuthorityError as exc:
+        raise KeyError_(str(exc)) from None
+    if (link.seq - 1, link.prev_hash) != (checked.seq, checked.head_hash):
+        raise KeyError_(moved)
+    signature = sign(link.message)
+    try:
+        with db.autocommit() as conn:
+            return _authority.append(conn, link, signature, now=_now(clock), anchor=anchor_path(db.data_root),
+                                     ssh_keygen=ssh_keygen)
+    except VerifierUnavailable:
+        raise
+    except _authority.StaleHead:
+        raise KeyError_(moved) from None
+    except AuthorityError as exc:
+        raise KeyError_(str(exc)) from None
+
+
 def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signer_fp: str, sign: Signer,
            clock: Callable[[], datetime], custody: str = UNSTATED, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
            marker_directory: Path | None = None, attested: bytes | None = None) -> tuple[KeyRow, bool, str | None]:

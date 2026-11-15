@@ -150,7 +150,7 @@ READERS: dict[str, tuple[int, str, str]] = {
     "levain/cli.py::_cmd_seat_egress":
         (1, "display", "`seat egress list` names the stopped grant (seat_push.stopped_egress) when no live one reads"),
     "levain/consent/grants.py::grant_view":
-        (8, "display", "the page and the phone list every grant the policy holds, each with its state "
+        (10, "display", "the page and the phone list every grant the policy holds, each with its state "
                        "(stopped wins over expired and live), the way back of a stopped one (its kind, read raw) and "
                        "its revoke line"),
     "levain/consent/grants.py::_split":
@@ -171,6 +171,9 @@ READERS: dict[str, tuple[int, str, str]] = {
         (1, "display", "the doctor row that names the stopped grants"),
     "levain/firing/hands_mcp_login.py::load_registry":
         (1, "display", "names the entries grants_in_force left out, as skipped with the reason `signer`"),
+    "levain/hands_mcp_verbs.py::_log_entries":
+        (1, "rule", "register and revoke find a hands-mcp entry of any state by id or name: register refuses a name the log "
+                    "holds live or stopped, revoke clears a stopped one; neither answers or arms anything"),
     "levain/firing/hands_mcp_login.py::_grants_named":
         (1, "display", "every entry of a name, live or not, so a sign-in refusal can say why"),
     "levain/seat_lease.py::stopped_lease":

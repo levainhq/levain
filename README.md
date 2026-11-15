@@ -609,7 +609,7 @@ Every top-level `levain` verb, each with the one line `levain --help` gives it. 
 | `levain adopt-answers` | Make your hand-edited seed files the interview record (.levain/answers.json). |
 | `levain intentions` | Intention verbs for an install (germinate, keep-migrate). |
 | `levain setup-isolation` | Create a dedicated unprivileged user for an entity's bash (one-time, needs sudo). |
-| `levain hands` | Sign the entity's own user in to Claude Code or Codex (its own login, never a copy of yours). |
+| `levain hands` | Sign the entity's own user in to Claude Code or Codex (its own login, never a copy of yours). `levain hands launch claude\|codex` (macOS) starts a chat AS that user with only the registered MCP servers, on a terminal of its own that levain relays (never yours); revoking a server it carries ends it (exit 77). `levain hands mcp register <name> --url ...` and `levain hands mcp revoke <id or name>` sign a hands MCP entry in and out; the cockpit's Grants tab and the phone list each entry by name, and the phone's passkey can revoke it. |
 | `levain ws-git` | Run git in the entity's workspace as the entity's user, with hooks and the like off. |
 | `levain ws-adopt` | Import one of your repositories into the entity's workspace, owned by the entity's user. |
 | `levain ws-put` | Copy one file of yours into the entity's workspace, written by the entity's user. |

@@ -1562,7 +1562,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "`levain hands login claude|codex` runs the vendor's own login AS the entity's user (the account "
             "`levain setup-isolation` made), with the vendor's config home inside that user's home; "
-            "`levain hands logout claude|codex` ends it (locally; the provider's page revokes); `levain hands status [claude|codex]` shows who each is signed in as. Your own ~/.claude and "
+            "`levain hands logout claude|codex` ends it (locally; the provider's page revokes); `levain hands status [claude|codex]` shows who each is signed in as; `levain hands launch claude|codex` starts the hands-uid chat. Your own ~/.claude and "
             "~/.codex are never read or copied. Anything that runs as the entity's user can use the login, "
             "and a logout is local to this machine."
         ),
@@ -1584,14 +1584,65 @@ def build_parser() -> argparse.ArgumentParser:
     hm_sub = hm_p.add_subparsers(dest="hands_mcp_cmd", required=True)
     for _verb, _help in (("signin", "Sign in to one registered remote MCP server as the entity's user."),
                          ("remove", "Log out of and remove a server `signin` added (local only)."),
-                         ("list", "Show registered servers against what the entity's user holds (read-only).")):
+                         ("list", "Show registered servers against what the entity's user holds (read-only)."),
+                         ("prepare", "Write the registry's servers into the entity's user's Claude and Codex launch "
+                                     "files (what a hands chat launch reads).")):
         _p = hm_sub.add_parser(_verb, help=_help)
-        if _verb != "list":
+        if _verb not in ("list", "prepare"):
             _p.add_argument("name", help="The registered server's name.")
         _p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
         if _verb != "remove":
             _p.add_argument("--data-root", type=Path, default=None, help="The cockpit data root holding the authority "
                                                                           "log (default: <path>/.levain/cockpit).")
+    hmr_p = hm_sub.add_parser(
+        "register", help="Register a hands-MCP server: sign one create_grant link for the entry.",
+        description=("Builds the registry entry from these arguments and appends ONE signed create_grant link, signed "
+                     "by --signing-key (an enrolled laptop-presence key; a passphrase or touch key asks on the "
+                     "terminal for each signature and nothing caches it). Refuses a name the log already holds in any "
+                     "state, an id it already holds, and anything the log's append rules refuse. Writes the authority "
+                     "log only. --id re-creates the SAME id after a revoke."))
+    hmr_p.add_argument("name", help="The server's name (lower case letters, digits, - and _; at most 32).")
+    hmr_p.add_argument("--transport", choices=("remote", "stdio"), default="remote")
+    hmr_p.add_argument("--url", default=None, help="A remote server's https url (no secret in it).")
+    hmr_p.add_argument("--command", default=None, help="A stdio server's command (resolved to a trusted absolute path).")
+    hmr_p.add_argument("--arg", action="append", default=[], help="A stdio argument; repeatable.")
+    hmr_p.add_argument("--identity-kind", dest="identity_kind", choices=("dedicated", "operator"), default="dedicated")
+    hmr_p.add_argument("--id", dest="entry_id", default=None, help="The entry id (hm-<12 hex>) to create again after a "
+                                                                  "revoke (default: a new one).")
+    hmr_p.add_argument("--days", type=int, default=30, help="The lease in days (default 30).")
+    hmv_p = hm_sub.add_parser(
+        "revoke", help="Revoke a hands-MCP entry: sign one revoke_grant link for it.",
+        description=("Appends ONE signed revoke_grant link, only for a grant of kind hands-mcp (named by its id, or by "
+                     "its name when exactly one entry has it). Any enrolled key may sign. Never revokes a consent "
+                     "grant, a lease or a key. Writes the authority log only."))
+    hmv_p.add_argument("target", help="The entry's id (hm-...) or its name.")
+    for _p in (hmr_p, hmv_p):
+        _p.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                        help="An enrolled key that signs the link (its private key file, or the .pub of a key an "
+                             "agent holds).")
+        _p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+        _p.add_argument("--data-root", type=Path, default=None, help="The cockpit data root holding the authority "
+                                                                      "log (default: <path>/.levain/cockpit).")
+    hc_p = hands_sub.add_parser(
+        "launch",
+        help="Start the hands-uid chat: a Claude Code or Codex chat running AS the entity's own user, with only "
+             "the registry's MCP servers. Not the cockpit room (which runs as you, with no hands).",
+        description=(
+            "The hands-uid chat. Takes the entity's session locks, stops anything the entity's user left running, "
+            "rewrites both MCP launch files from the live registry (`levain hands mcp prepare`), and only then starts "
+            "the vendor as the entity's user (Claude with --strict-mcp-config). Any refusal starts nothing; there "
+            "is no fallback to files an earlier prepare wrote. Revoking a server the chat carries ends "
+            "the chat and the command exits 77. The authority log is re-read every 5 s, each read bounded to 5 s; a "
+            "log that cannot be read for 30 s ends the chat the same way (a read that succeeds starts the 30 s "
+            "again, and it is the read that would see a revoke). Stopping the vendor, sweeping the entity's user, printing a line "
+            "here and filing a cockpit note are each attempted; processes left after the stop are named in that line "
+            "and note when they can be. This is not `levain chat` and not the cockpit room."
+        ),
+    )
+    hc_p.add_argument("vendor", choices=("claude", "codex"))
+    hc_p.add_argument("--path", type=Path, default=argparse.SUPPRESS, help="Entity directory (default: cwd).")
+    hc_p.add_argument("--data-root", type=Path, default=None, help="The cockpit data root holding the authority "
+                                                                   "log (default: <path>/.levain/cockpit).")
     hands_p.set_defaults(func=_cmd_hands)
 
     wsg_p = subparsers.add_parser(
@@ -5149,11 +5200,20 @@ def _cmd_hands(args: argparse.Namespace) -> int:
 
     if args.hands_cmd == "mcp":
         from levain.firing import hands_mcp_login
+        if args.hands_mcp_cmd in ("register", "revoke"):
+            from levain import hands_mcp_verbs
+            return (hands_mcp_verbs.cmd_register if args.hands_mcp_cmd == "register"
+                    else hands_mcp_verbs.cmd_revoke)(args)
         if args.hands_mcp_cmd == "signin":
             return hands_mcp_login.cmd_signin(args.path, args.name, args.data_root)
         if args.hands_mcp_cmd == "remove":
             return hands_mcp_login.cmd_remove(args.path, args.name)
+        if args.hands_mcp_cmd == "prepare":
+            return hands_mcp_login.cmd_prepare(args.path, args.data_root)
         return hands_mcp_login.cmd_list(args.path, args.data_root)
+    if args.hands_cmd == "launch":
+        from levain.firing import hands_chat
+        return hands_chat.cmd_hands_chat(args.path, args.vendor, args.data_root)
     if args.hands_cmd == "login":
         return hands_login.cmd_hands_login(args.path, args.vendor)
     if args.hands_cmd == "logout":

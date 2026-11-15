@@ -1336,10 +1336,10 @@ def stopped_way(kind: Any) -> str:
     """How a stopped grant of ``kind`` is used again, in words every surface shares (the revoke notice, a list line, the
     renew refusal). A kind with a one-live rule (the seat-root lease, the seat-egress grant, a chat key per host, a
     voice key per provider, a hands-mcp entry per name) still counts a stopped grant at append (ruling R-C, so an older
-    levain on the same log counts it too), so it is revoked before it is created again; no verb registers a hands-mcp
-    entry, so for one revoking only clears it."""
+    levain on the same log counts it too), so it is revoked before it is created again; a hands-mcp entry is created
+    again by ``levain hands mcp register`` (leg 6)."""
     if kind == HANDS_MCP_KIND:
-        return "revoke it to clear it; no levain verb registers a hands entry yet"
+        return "revoke it, then register it again (levain hands mcp register)"
     if kind in (GRADUATION_KIND, GRADUATION_PHONE_KIND):
         return "revoke it to clear it; this levain signs none, so it cannot be created again"
     if kind in (SEAT_LEASE_KIND, SEAT_EGRESS_KIND, EGRESS_KEY_KIND, VOICE_KEY_KIND):

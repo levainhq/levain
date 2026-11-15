@@ -338,14 +338,13 @@ def test_t16_hands_mcp_list_and_the_sign_in_refusal_say_stopped(world, tmp_path,
     monkeypatch.setattr(hml, "vendor_servers", lambda hands, entity, sweep=False: {})
     rows, _code = hml.status_rows(world.entity, world.root)
     lines = [line for _ok, line in rows if line.startswith("hands mcp entry")]
-    assert lines == [f"hands mcp entry hm-000000000001: stopped: {BORN} (answers nothing; revoke it to clear it; no "
-                     "levain verb registers a hands entry yet): `levain consent grant revoke --signing-key <key> -- "
+    assert lines == [f"hands mcp entry hm-000000000001: stopped: {BORN} (answers nothing; revoke it, then register it "
+                     "again (levain hands mcp register)): `levain consent grant revoke --signing-key <key> -- "
                      "hm-000000000001`"]
     with pytest.raises(hml.HandsMcpRefused) as exc:
         hml.entry_for_signin(world.entity, world.root, "files")
-    assert str(exc.value) == (f"'files' is registered but stopped: {BORN}; revoke it to clear it (`levain consent grant "
-                              "revoke --signing-key <key> -- hm-000000000001`); no levain verb registers a hands entry "
-                              "yet. Nothing was changed")
+    assert str(exc.value) == (f"'files' is registered but stopped: {BORN}; revoke it (`levain consent grant "
+                              "revoke --signing-key <key> -- hm-000000000001`), then register it again (levain hands mcp register). Nothing was changed")
     assert "renew" not in str(exc.value)
 
 
@@ -360,14 +359,14 @@ def test_t16_an_entry_whose_last_renewer_was_revoked_says_renewed_not_signed(wor
     monkeypatch.setattr(hml, "vendor_servers", lambda hands, entity, sweep=False: {})
     rows, _code = hml.status_rows(world.entity, world.root)
     lines = [line for _ok, line in rows if line.startswith("hands mcp entry")]
-    assert lines == [f"hands mcp entry hm-000000000001: stopped: {CURRENT} (answers nothing; revoke it to clear it; no "
-                     "levain verb registers a hands entry yet): `levain consent grant revoke --signing-key <key> -- "
+    assert lines == [f"hands mcp entry hm-000000000001: stopped: {CURRENT} (answers nothing; revoke it, then register it "
+                     "again (levain hands mcp register)): `levain consent grant revoke --signing-key <key> -- "
                      "hm-000000000001`"]
     with pytest.raises(hml.HandsMcpRefused) as exc:
         hml.entry_for_signin(world.entity, world.root, "files")
-    assert str(exc.value) == (f"'files' is registered but stopped: {CURRENT}; revoke it to clear it (`levain consent "
-                              "grant revoke --signing-key <key> -- hm-000000000001`); no levain verb registers a hands "
-                              "entry yet. Nothing was changed")
+    assert str(exc.value) == (f"'files' is registered but stopped: {CURRENT}; revoke it (`levain consent "
+                              "grant revoke --signing-key <key> -- hm-000000000001`), then register it again "
+                              "(levain hands mcp register). Nothing was changed")
     assert BORN not in str(exc.value)
 
 
@@ -456,7 +455,7 @@ def test_t17_the_revoke_names_each_grant_the_key_signed_with_what_it_is(world, c
         "A renew does not bring one back. To use one again:",
         "  create it again with a key you still hold: cg-1a2b3c4d5e6f, cg-sh0000000001",
         "  revoke it, then create it again with a key you still hold: ek-000000000001, se-000000000001, sl-9f8e7d6c5b4a",
-        "  revoke it to clear it; no levain verb registers a hands entry yet: hm-000000000001",
+        "  revoke it, then register it again (levain hands mcp register): hm-000000000001",
         "To revoke one: levain consent grant revoke --signing-key <key> -- <id>",
         "A chat key revokes with: levain chat key revoke --signing-key <key> <id>"]
 

@@ -140,12 +140,12 @@ def test_a_stopped_entry_that_has_also_expired_is_reported_as_stopped(world) -> 
 
 def test_signin_refuses_a_stopped_entry_and_says_why(world, tmp_path: Path) -> None:
     """The verb that signs a server in reads the same registry: a stopped entry is refused in the stopped words, and the
-    way named is the revoke that clears it (a renew does not bring it back, and no verb registers one)."""
+    way named is the revoke that clears it (a renew does not bring it back; `levain hands mcp register` makes it again after)."""
     world.entry("hm-000000000001", "files", "a")
     world.revoke_key("a", "b")
     with pytest.raises(hml.HandsMcpRefused) as exc:
         hml.entry_for_signin(tmp_path / "entity", world.root, "files")
-    assert str(exc.value) == ("'files' is registered but stopped: the key that signed it was revoked; revoke it to "
-                              "clear it (`levain consent grant revoke --signing-key <key> -- hm-000000000001`); no "
-                              "levain verb registers a hands entry yet. Nothing was changed")
+    assert str(exc.value) == ("'files' is registered but stopped: the key that signed it was revoked; revoke it "
+                              "(`levain consent grant revoke --signing-key <key> -- hm-000000000001`), then register "
+                              "it again (levain hands mcp register). Nothing was changed")
     assert "renew" not in str(exc.value)

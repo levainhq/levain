@@ -798,6 +798,10 @@ def _key_setup_callers(tree: ast.AST) -> bool:
 # The appenders allowlisted for their per-act shape, with the append calls each makes (_check_per_act_append).
 PER_ACT_APPENDERS = {
     ("cockpit/keys.py", "_append"): ("sign_and_append",),
+    # cockpit.keys._append_at (leg 6): a revoke bound to the head the caller checked; prepare and append in two separate
+    # autocommit blocks of the journal its caller's CLI act opened, the signature taken between them outside any
+    # transaction, the shape of agents.signing._sign_op; it is not _append (which signs and appends in one call)
+    ("cockpit/keys.py", "_append_at"): ("append", "prepare"),
     # agents.signing._sign_op (P5a-2a): prepare and append in two separate autocommit blocks of one journal it opens
     # per act, the signature taken between them OUTSIDE any transaction (_check_the_signing_module holds that)
     ("agents/signing.py", "_sign_op"): ("append", "prepare"),
@@ -987,6 +991,8 @@ def _check_the_appenders(root: Path) -> None:
             appenders.append((str(path.relative_to(root)), fn, name))
     # keys._append (sign_and_append): a short-lived CLI
     # act that opens its journal per act; PER_ACT_APPENDERS holds it to that below.
+    # keys._append_at (prepare, append): the same CLI act's head-bound form, two autocommit blocks with the signature
+    # between them; PER_ACT_APPENDERS holds it to the per-act shape too.
     # agents.bars._r2 appends a bar's stored signature through the cockpit connection recover hands it; it opens none
     # and is held to that by HANDED_APPENDERS below.
     # agent_authority._prepare_onto and revoke_agent_finish prepare and append the agent revoke through the cockpit
@@ -1001,6 +1007,8 @@ def _check_the_appenders(root: Path) -> None:
                                  ("chat_egress/key_setup.py", "setup_key", "append"),
                                  ("chat_egress/key_setup.py", "setup_key", "prepare"),
                                  ("cockpit/keys.py", "_append", "sign_and_append"),
+                                 ("cockpit/keys.py", "_append_at", "append"),
+                                 ("cockpit/keys.py", "_append_at", "prepare"),
                                  ("consent/grants.py", "append_revoke", "append"),
                                  ("consent/grants.py", "prepare_revoke", "prepare"),
                                  ("seat_lease.py", "renew_lease", "append"),

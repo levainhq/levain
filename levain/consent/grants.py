@@ -35,7 +35,7 @@ from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, 
                               passkey_revocable, prepare, stopped_clears_only, stopped_way, voice_key_record)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
-from levain.cockpit.keys import KeyError_, Signer, _append, _capture, _journal, _now, _signing_authority
+from levain.cockpit.keys import KeyError_, Signer, _append, _append_at, _capture, _journal, _now, _signing_authority
 
 __all__ = ["INERT_NOTE", "ConsentGrant", "GrantChanged", "append_revoke", "create_grant", "grant_instance",
            "grant_listing", "grant_view", "list_grants", "list_inert_grants", "prepare_revoke", "revoke_command",
@@ -148,9 +148,11 @@ def revoke_grant(data_root: Path | str, grant_id: str, *, signer_fp: str, sign: 
     revoke is all it does with them); any enrolled key may. From the
     next decision on it answers nothing, and an answer it already gave is no longer delivered. Returns
     ``(seq, warning)``."""
-    db, _state = _revocable(data_root, grant_id, clock, ssh_keygen, marker_directory)
-    new = _append(db, {"op": "revoke_grant", "grant_id": grant_id}, signer_fp=signer_fp, sign=sign, clock=clock,
-                  ssh_keygen=ssh_keygen)
+    db, state = _revocable(data_root, grant_id, clock, ssh_keygen, marker_directory)
+    # bound to the head _revocable judged (leg 6 L3 r1, codex HIGH): a grant revoked and made again under this id,
+    # or renewed, after that check is never the one revoked here
+    new = _append_at(db, {"op": "revoke_grant", "grant_id": grant_id}, state, signer_fp=signer_fp, sign=sign,
+                     clock=clock, ssh_keygen=ssh_keygen, what="the revoke")
     return new.seq, new.anchor_warning
 
 
@@ -281,14 +283,18 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     lease = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == SEAT_LEASE_KIND]
     # a seat-egress grant (levain.seat_push, Z2a) is listed the same way, for the same revoke
     egress = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == SEAT_EGRESS_KIND]
+    # a hands MCP entry (levain.hands_mcp, kind hands-mcp) is passkey-revocable too, and its revoke ends a running hands
+    # chat (levain.firing.hands_chat watches the registry), so it is listed by its name; it answers no consent request
+    hands = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == HANDS_MCP_KIND]
     # a graduation policy or opt-in the log holds (the retired rows) is passkey-revocable, so it is listed for
     # its revoke; it answers no consent request, so no evidence is read for it
     old = [r[0] for r in retired]
     links = {gid: state.grant_link(gid)
-             for gid in [g.id for g in consent] + [i[0] for i in inert] + voice + lease + egress + old}
+             for gid in [g.id for g in consent] + [i[0] for i in inert] + voice + lease + egress + hands + old}
     evidence = read_grant_evidence(queue_dir, [(gid, *link) for gid, link in links.items()
                                                if link is not None and gid not in voice and gid not in lease
-                                               and gid not in egress and gid not in old], recent=recent)
+                                               and gid not in egress and gid not in hands and gid not in old],
+                                   recent=recent)
     stamp = utc_stamp(now)
     # every grant this snapshot stops, by id (kind-blind: a voice key, a lease and an inert grant are stopped too)
     stopped = {gid: why for gid in state.policy.grants if (why := grant_stop_reason(state, gid)) is not None}
@@ -338,6 +344,11 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         rows.append({**common(gid, SEAT_EGRESS_KIND, str(g["expires_at"]), None if link is None else link[0]),
                      "state": state_of(gid, str(g["expires_at"])), "agent": visible(str(g["agent"])),
                      "tools": [], "workspace": visible(str(g["push_remote"])), "postures": []})
+    for gid in hands:               # named by the server's name; its url or command is shown as its workspace
+        g, link = state.policy.grants[gid], links[gid]
+        rows.append({**common(gid, HANDS_MCP_KIND, str(g["expires_at"]), None if link is None else link[0]),
+                     "state": state_of(gid, str(g["expires_at"])), "agent": visible(f"hands server {g['name']}"),
+                     "tools": [], "workspace": visible(str(g.get("url") or g.get("command") or "")), "postures": []})
     for gid, kind, expires_at in retired:   # the opt-in has no expiry: live until it is revoked
         link = links[gid]
         rows.append({**common(gid, kind, expires_at or "", None if link is None else link[0]),
