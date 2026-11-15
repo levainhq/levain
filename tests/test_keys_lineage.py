@@ -733,7 +733,10 @@ def test_a_4096_record_resend_on_attach_open_keeps_the_sessions_ticks_alive():
     assert sum(calls[i][2] for i in appends) == K.LINEAGE_OUTBOX_MAX
     assert all(calls[i][2] <= 64 and calls[i][1] <= K.LINEAGE_ENVELOPE_BYTES for i in appends)
     assert len(appends) <= K.LINEAGE_OUTBOX_MAX // 32
-    assert all(c[3] is not None and c[3]["ok"] for c in calls), [c[:3] for c in calls if c[3] is None or not c[3]["ok"]]
+    # every call up to the LAST envelope is answered; a tick sent after it can be cut off by the test's own end (the
+    # outbox drains, fn returns, the attachment is torn down mid-tick: nightly dep-drift 11-15, `('SESSIONS', None, None)`)
+    answered = calls[:appends[-1] + 1]
+    assert all(c[3] is not None and c[3]["ok"] for c in answered), [c[:3] for c in answered if c[3] is None or not c[3]["ok"]]
     gaps = [any(calls[j][0] == "SESSIONS" for j in range(a + 1, b)) for a, b in zip(appends, appends[1:])]
     assert sum(gaps) >= len(gaps) // 2, gaps       # the ticks go between envelopes, not behind the resend
     assert len(rows) == K.LINEAGE_OUTBOX_MAX and len({json.dumps(r["source"]) for r in rows}) == len(rows)
