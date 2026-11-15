@@ -66,6 +66,7 @@ class Rig:
         self.world = world
         self.raw = raw if raw is not None else raw_mail()
         self.draft = draft
+        self.voice = "stand_in"                       # the voice the sealed drafter names (ND-4)
         self.runs: list[list[str]] = []
         self.sent: list[fx.AckMessage] = []
         self.looked: list[str] = []
@@ -92,7 +93,7 @@ class Rig:
 
         def drafter(event_id):
             self.drafts.append(event_id)
-            return self.draft
+            return fx.Draft(self.draft, self.voice)
 
         kw = dict(data_root=self.world.root, clock=lambda: self.world.clock.now, runner=runner,
                   transport=self.transport, events=events, raw_source=lambda ref: self.raw, drafter=drafter)
@@ -402,6 +403,7 @@ def test_the_order_lists_the_addresses_and_the_voice_the_disclosure_follows(worl
     flow_line = {**ACK_LINE, "args": {"voice": ["flow"], "known_from": [FROM]}}
     g = signed(world, flow_line)
     rig = Rig(world)
+    rig.voice = "flow"
     rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
     assert "written automatically by flow, an AI assistant" in rig.sent[0].body
 
@@ -639,6 +641,7 @@ def test_an_order_revoked_and_signed_again_differently_under_its_id_refuses_the_
                                                                                   "known_from": [FROM]}}])
     sign(world, g2)
     assert D(g2) != old
+    rig.voice = "flow"
     effects = rig.effects()
     for name, args in (("restart_service", {"order_id": g["id"], "order_sha256": old, "host": "taoserv",
                                             "service": "apache2"}),
@@ -656,7 +659,7 @@ def test_send_ack_replays_the_order_again_after_the_drafter_and_before_the_send(
 
     def slow_drafter(event_id):                       # the order is revoked while the drafter works
         world.link({"op": "revoke_grant", "grant_id": g["id"]}, today=True)
-        return GOOD_DRAFT
+        return fx.Draft(GOOD_DRAFT, "stand_in")
 
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects(drafter=slow_drafter).send_ack(g["id"], EVT, expect_sha256=D(g))
@@ -670,7 +673,7 @@ def test_send_ack_refuses_when_the_order_was_signed_again_under_its_id_meanwhile
     def slow_drafter(event_id):                       # revoked and the SAME record signed again: a new incarnation
         world.link({"op": "revoke_grant", "grant_id": g["id"]}, today=True)
         sign(world, g)
-        return GOOD_DRAFT
+        return fx.Draft(GOOD_DRAFT, "stand_in")
 
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects(drafter=slow_drafter).send_ack(g["id"], EVT, expect_sha256=D(g))

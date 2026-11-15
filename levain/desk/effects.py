@@ -8,8 +8,9 @@ module is the ONLY place an effect runs, and it runs two verbs and no others:
   with ``shell=False`` (:func:`subprocess_runner`); the verb returns the exit code and never the server's output.
 * ``send_ack(order_id, event_id, expect_sha256=...)``: the recipient is NEVER an argument. It is derived here, from
   the raw message the event's ``body_ref`` digest names (:func:`inbound_from`), and must be an address the order's ``known_from`` lists.
-  The sealed drafter's text (ND-4) is not an argument either: it is fetched inside the verb after every gate has
-  passed, and a lexical check (:func:`ack_text_refusal`) runs inside the verb that holds the transport.
+  The sealed drafter's :class:`Draft` (ND-4) is not an argument either: it is fetched inside the verb after every gate
+  has passed; its voice is checked here against the voice the order names, a lexical check (:func:`ack_text_refusal`)
+  runs on its text, and only then the fixed disclosure line for the voice (:data:`DISCLOSURES`) is appended.
 
 NO VERB ACCEPTS FREE TEXT AS AN ARGUMENT. Every argument is an exact member of an enum (a ``str`` that IS in a closed
 tuple) or an id of a fixed shape (``so-`` and 12 hex; ``evt-`` and 32 hex; a digest of 64 hex); anything else is
@@ -26,7 +27,7 @@ the same incarnation as the first.
 
 NOT HERE (the next rows): the per-incident and per-night budgets, the arm record, ``NIGHT_ARMING_CLEARED`` and the
 ``effect_attempts`` journal are ND-3b; the night key and its forced-command list are ND-8 (:data:`FORCED_WORDS` names
-the words it must accept); the live mail credential is open (ND_BUILD_PLAN O8) and the sealed drafter is ND-4. Until
+the words it must accept); the live mail credential is open (ND_BUILD_PLAN O8). Until
 those land the executors are injected: an :class:`Effects` with no runner, transport, event lookup, raw source or
 drafter refuses with :data:`R_NOT_WIRED`. This module imports no mail library and holds no credential.
 """
@@ -42,15 +43,16 @@ from datetime import datetime
 from email.parser import BytesHeaderParser
 from email.utils import getaddresses
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from levain.authority import _SO_VERBS, STANDING_ORDER_VOICES, _require_aware
 from levain.desk import standing_orders
 from levain.desk.events import Event
 
-__all__ = ["ACK_FROM_LOCAL", "ACK_SUBJECT", "ACK_WORDS_MAX", "AckMessage", "AckTransport", "DIAGNOSIS_WORDS",
-           "EffectRefused", "EffectResult", "Effects", "FORCED_WORDS", "HOSTS", "NIGHT_ALIAS", "NIGHT_SSH", "REFUSALS",
-           "SERVICES", "ack_text_refusal", "diagnosis_argv", "inbound_from", "refusal_text", "restart_argv",
+__all__ = ["ACK_FROM_LOCAL", "ACK_SUBJECT", "ACK_WORDS_MAX", "AckMessage", "AckTransport", "DIAGNOSIS_WORDS", "DISCLOSURES",
+           "Draft", "EffectRefused", "EffectResult", "Effects", "FORCED_WORDS", "HOSTS", "NIGHT_ALIAS", "NIGHT_SSH", "REFUSALS",
+           "SERVICES", "VOICES", "ack_text_refusal", "diagnosis_argv", "inbound_from", "refusal_text", "restart_argv",
            "subprocess_runner"]
 
 # --- the enums: the log's own verb table and this module's are the same closed sets (checked at import) -------------
@@ -81,10 +83,14 @@ _SENDER = re.compile(ACK_FROM_LOCAL + r"@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?
 ACK_SUBJECT = "Your message arrived"
 ACK_WORDS_MAX = 60                      # "under 60 words" (O9): at most 59
 _ACK_CHARS_MAX = 600
-_DISCLOSURE = {
-    "stand_in": "This acknowledgement was written automatically on his behalf. He has been alerted to your message.",
-    "flow": "This acknowledgement was written automatically by flow, an AI assistant. He has been alerted to your message.",
-}
+#: the fixed disclosure line the send tool appends for each VOICE (ND-4); the drafter names a voice, never the wording
+DISCLOSURES: Mapping[str, str] = MappingProxyType({
+    "stand_in": "This acknowledgement was written automatically on his behalf by an AI assistant. He has been alerted "
+                "to your message.",
+    "flow": "This acknowledgement was written automatically by flow, an AI assistant. He has been alerted to your "
+            "message.",
+})
+VOICES = tuple(DISCLOSURES)
 _REMOTE_TIMEOUT = 60
 
 # --- fixed refusal sentences: nothing an argument, an event or a server said is ever echoed ----------------------------
@@ -97,6 +103,8 @@ R_EVENT = "the event is not an authenticated mail from a known sender with its m
 R_FROM = "the message's sender cannot be derived, is not on the order's list, or the message is an auto-reply, a list " \
          "mail or has a Reply-To that differs: nothing was done"
 R_DRAFT = "there is no draft to send: nothing was done"
+R_VOICE = "the draft's voice is missing, is not a known voice, or is not the voice the order names: nothing was done"
+R_DISCLOSURE = "the draft holds the disclosure line itself, which only the send tool writes: nothing was done"
 R_FAILED = "the effect did not complete"
 # the lexical check's fixed reasons (:func:`ack_text_refusal`)
 R_TEXT_SHAPE = "the draft is not one short text"
@@ -108,7 +116,7 @@ R_TEXT_DOTTED = "the draft holds a dotted name (a link or address)"
 R_TEXT_WORD = "the draft holds a date, time, price, commitment, attachment or link word"
 R_TEXT_PHRASE = "the draft holds a commitment phrase"
 #: every sentence this module refuses with, and the only text a refusal may carry out (:func:`refusal_text`)
-REFUSALS = frozenset({R_ARGS, R_ORDER, R_LINE, R_VERSION, R_NOT_WIRED, R_EVENT, R_FROM, R_DRAFT, R_FAILED,
+REFUSALS = frozenset({R_ARGS, R_ORDER, R_LINE, R_VERSION, R_NOT_WIRED, R_EVENT, R_FROM, R_DRAFT, R_VOICE, R_DISCLOSURE, R_FAILED,
                       R_TEXT_SHAPE, R_TEXT_CHARS, R_TEXT_WORDS, R_TEXT_DIGIT, R_TEXT_SYMBOL, R_TEXT_DOTTED,
                       R_TEXT_WORD, R_TEXT_PHRASE})
 
@@ -154,6 +162,15 @@ class EffectResult:
     verb: str
     ok: bool
     text: str
+
+
+@dataclass(frozen=True)
+class Draft:
+    """What the sealed drafter returns (ND-4): one short text and a typed VOICE (a member of :data:`VOICES`). The
+    send tool checks the voice itself and appends the fixed disclosure for it; the text is checked by
+    :func:`ack_text_refusal` before that line is added."""
+    text: str
+    voice: str
 
 
 @dataclass(frozen=True)
@@ -367,6 +384,17 @@ def ack_text_refusal(text: Any) -> str | None:
     return None
 
 
+def _squash(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _holds_disclosure(text: str) -> bool:
+    """True when the drafter's text carries, in any case or spacing, the first sentence of any disclosure line: the
+    line is the send tool's alone, so a draft that writes it would duplicate it or pre-empt its wording."""
+    squashed = _squash(text)
+    return any(_squash(line).split(". ")[0] in squashed for line in DISCLOSURES.values())
+
+
 # --- the verbs --------------------------------------------------------------------------------------------------------
 def _exact(args: Mapping[str, Any], names: tuple[str, ...]) -> None:
     if not isinstance(args, Mapping) or set(args) != set(names):
@@ -391,14 +419,14 @@ class Effects:
     ``data_root`` is the cockpit whose authority log the verbs replay at every call. ``runner`` runs an argv;
     ``transport`` sends one :class:`AckMessage`; ``events`` returns the :class:`Event` for an id (or None);
     ``raw_source`` returns the raw message bytes for a ``body_ref`` (ND-4's store); ``drafter`` returns the sealed
-    drafter's text for an event id. A missing executor refuses (:data:`R_NOT_WIRED`) after the gate, never acts."""
+    drafter's :class:`Draft` (text and voice) for an event id; a bare ``str`` has no voice and is refused. A missing executor refuses (:data:`R_NOT_WIRED`) after the gate, never acts."""
     data_root: Path
     clock: Callable[[], datetime]
     runner: Runner | None = None
     transport: AckTransport | None = None
     events: Callable[[str], Event | None] | None = None
     raw_source: Callable[[str], bytes | None] | None = None
-    drafter: Callable[[str], str] | None = None
+    drafter: Callable[[str], Draft] | None = None
 
     def gate(self, order_id: str, verb: str, *, expect_sha256: str) -> tuple[Mapping[str, Any], list[Any]]:
         """Replay the authority log NOW and return (the order, its effect lines for ``verb``). Refuses unless the
@@ -487,11 +515,16 @@ class Effects:
             if _trusted(exc):                               # only this module's own refusals (inbound_from, the
                 raise                                       # event checks) pass; an executor's is R_FAILED
             raise _OwnRefusal(R_FAILED) from None
-        why = ack_text_refusal(draft)
+        if (type(draft) is not Draft or type(draft.voice) is not str or draft.voice not in DISCLOSURES
+                or draft.voice != voice):                   # the voice the order signed is the only one disclosed
+            raise _OwnRefusal(R_VOICE)
+        why = ack_text_refusal(draft.text)                  # on the drafter's text alone, before any disclosure is added
         if why is not None:
             raise _OwnRefusal(why)
+        if _holds_disclosure(draft.text):
+            raise _OwnRefusal(R_DISCLOSURE)
         message = AckMessage(sender=sender, recipient=recipient, subject=ACK_SUBJECT,
-                             body=draft.strip() + "\n\n" + _DISCLOSURE[voice],
+                             body=draft.text.strip() + "\n\n" + DISCLOSURES[voice],
                              headers={"Auto-Submitted": "auto-replied"})
         self._still(order_id, "send_ack", sha, order)
         try:
@@ -524,6 +557,6 @@ class Effects:
                 voices.add(named[0])
         if not voices:
             raise _OwnRefusal(R_FROM)
-        if len(voices) != 1 or next(iter(voices)) not in _DISCLOSURE:   # one voice, or the disclosure could be false
+        if len(voices) != 1 or next(iter(voices)) not in DISCLOSURES:   # one voice, or the disclosure could be false
             raise _OwnRefusal(R_LINE)
         return recipient, next(iter(voices))
