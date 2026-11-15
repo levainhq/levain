@@ -26,10 +26,11 @@ the gate runs AGAIN immediately before the process or the send, which go ahead o
 the same incarnation as the first.
 
 EXECUTION-TIME BUDGETS AND THE JOURNAL (ND-3b, board levain#12, :mod:`levain.desk.effect_attempts`): an effect is
-reserved on the journal BEFORE it runs, in one transaction that also counts and consumes the order line's per-incident
-and per-night budgets (never check-then-act); the reservation is written ``unknown``, so a process that dies mid-effect
-leaves one ``unknown`` row, never retried and never sent twice. A retry of a settled or unknown effect (the same order,
-event, verb and arguments) answers the recorded status and runs nothing; a transport or runner fault, a timeout, and a
+reserved on the journal BEFORE it runs, in one transaction that also checks the order line's per-incident and per-night
+budgets against every order's attempts in that incident or night, and consumes them (never check-then-act); the
+reservation is written ``unknown``, so a process that dies mid-effect leaves one ``unknown`` row, never retried and
+never sent twice. A retry of a settled or unknown effect (the same event, verb and arguments, under any order) answers
+the recorded status and runs nothing; a transport or runner fault, a timeout, and a
 runner that returns no exit code record ``unknown``. After the reservation the order is replayed one more time and the
 effect runs only if it is the same version. ``restart_service`` takes the monitor event it answers (its incident is
 derived from it); every event must be within :data:`EVENT_MAX_AGE`; a retry of an ack whose recorded recipient is not the
@@ -605,7 +606,7 @@ class Effects:
                         event_id: Any) -> EffectResult:
         """Restart ``service`` on ``host`` under order ``order_id`` at version ``expect_sha256`` (the digest the
         desk's brief prints beside the order), answering the incident of the monitor event ``event_id`` (the incident is
-        derived from the event, never an argument). Idempotent on (order, event, verb, host, service)."""
+        derived from the event, never an argument). Idempotent on (event, verb, host, service), whichever order asks."""
         order_id = _shaped(order_id, _ORDER_ID)
         host, service = _enum(host, HOSTS), _enum(service, SERVICES)
         sha, event_id = _shaped(expect_sha256, _SHA), _shaped(event_id, _EVENT_ID)
@@ -622,7 +623,7 @@ class Effects:
         argv = restart_argv(host, service)
         incident = self._incident(event_id)
         args_digest = hashlib.sha256(f"{host}|{service}".encode()).hexdigest()
-        key = idem_key(order_id, event_id, "restart_service", args_digest)
+        key = idem_key(event_id, "restart_service", args_digest)
         label = f"restart_service {host} {service}"
         ok_text = f"{label}: exit 0"
         night = night_key(self._now(), self.night_cut_hour_utc)
@@ -661,7 +662,7 @@ class Effects:
         """Send the ack for ``event_id`` under order ``order_id`` at version ``expect_sha256``. The recipient is
         derived here (never an argument) from the raw message the event's digest names, and must be on the order
         line's ``known_from``. The order is replayed again after the reservation and immediately before the send.
-        Idempotent on the order and the event: a retry returns the recorded result and never sends twice."""
+        Idempotent on the event, whichever order asks: a retry returns the recorded result and never sends twice."""
         order_id, event_id = _shaped(order_id, _ORDER_ID), _shaped(event_id, _EVENT_ID)
         sha = _shaped(expect_sha256, _SHA)
         return self._noted(order_id, "send_ack", event_id, lambda: self._ack(order_id, event_id, sha))
@@ -683,7 +684,7 @@ class Effects:
             if _trusted(exc):                               # only this module's own refusals (inbound_from, the
                 raise                                       # event checks) pass; an executor's is R_FAILED
             raise _OwnRefusal(R_FAILED) from None
-        key = idem_key(order_id, event_id, "send_ack", hashlib.sha256(b"").hexdigest())
+        key = idem_key(event_id, "send_ack", hashlib.sha256(b"").hexdigest())
         done = self.journal.lookup(key)                     # a settled or unknown effect answers before any drafting
         if done is not None and done.status != "refused":
             if done.recipient != recipient:

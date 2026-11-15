@@ -195,7 +195,7 @@ def test_the_budget_is_claimed_atomically_under_a_race(world, tmp_path):
     def one(i: int) -> None:
         barrier.wait()
         try:
-            row, fresh = journal.reserve(key=idem_key("so-" + "a" * 12, f"evt-{i:032x}", "restart_service", "x"), order_id="so-" + "a" * 12,
+            row, fresh = journal.reserve(key=idem_key(f"evt-{i:032x}", "restart_service", "x"), order_id="so-" + "a" * 12,
                                          order_sha256="0" * 64, incarnation=1, verb="restart_service",
                                          event_id=f"evt-{i:032x}", args_digest="x", recipient=None,
                                          incident_scope=f"apache2|inc-{i}", night_scope="n", per_incident=1, per_night=2,
@@ -216,7 +216,7 @@ def test_the_budget_is_claimed_atomically_under_a_race(world, tmp_path):
 
 def test_two_racing_requests_for_one_effect_are_one_attempt(tmp_path):
     journal = Journal(tmp_path / "same.db")
-    key = idem_key("so-" + "a" * 12, EVR, "restart_service", "x")
+    key = idem_key(EVR, "restart_service", "x")
     fresh_flags = []
     barrier = threading.Barrier(8)
 
@@ -367,7 +367,7 @@ def test_the_sender_in_the_journal_row_must_be_the_derived_pinned_recipient(worl
     g = signed(world)
     rig = Rig(world)
     empty = hashlib.sha256(b"").hexdigest()
-    key = idem_key(g["id"], EVT, "send_ack", empty)
+    key = idem_key(EVT, "send_ack", empty)
     rig.journal.reserve(key=key, order_id=g["id"], order_sha256=D(g), incarnation=1, verb="send_ack", event_id=EVT,
                         args_digest=empty, recipient="mallory@evil.example",
                         incident_scope="x", night_scope="y", per_incident=9, per_night=9, now="2026-11-15T00:00:00Z")
@@ -499,12 +499,62 @@ def test_a_second_settle_writes_nothing_and_says_so(tmp_path):
     assert journal.lookup("k1").status == "ok"
 
 
-def test_an_event_answered_under_another_order_is_its_own_attempt(world):
+def test_one_effect_per_event_whichever_order_asks(world):
+    """Two orders covering the same event: the first acts, the second answers the recorded row and acts on nothing (a
+    double restart or a double ack is the worse failure)."""
     g, h = signed(world), signed(world)
     rig = Rig(world)
-    assert restart(rig, g).ok and restart(rig, h).ok
-    assert len(rig.runs) == 2 and sorted(r.order_id for r in rig.journal.rows()) == sorted([g["id"], h["id"]])
-    assert idem_key(g["id"], EVR, "restart_service", "x") != idem_key(h["id"], EVR, "restart_service", "x")
+    first = restart(rig, g)
+    second = restart(rig, h)
+    assert first.ok and second == first and len(rig.runs) == 1
+    assert rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g)).ok
+    rig.drafts.clear()
+    assert rig.effects().send_ack(h["id"], EVT, expect_sha256=D(h)).text == "send_ack: sent"
+    assert len(rig.sent) == 1 and rig.drafts == []
+    assert [(r.verb, r.order_id) for r in rig.journal.rows()] == [("restart_service", g["id"]), ("send_ack", g["id"])]
+
+
+def test_two_orders_cannot_double_the_night_budget(world):
+    """The budget bounds the box and the address, not the order (design 3.1: 2 restarts per night across all incidents;
+    3.2: 1 send per address per night): a second order covering the same effect shares the count."""
+    g, h = signed(world), signed(world)
+    rig = Rig(world)
+    by = {EVR2: monitor_event(event_id=EVR2, incident_id=INC2), EVR3: monitor_event(event_id=EVR3, incident_id=INC3)}
+    ev = serve_events(rig, **by)
+    assert restart(rig, g, EVR, events=ev).ok
+    assert restart(rig, h, EVR2, events=ev).ok
+    assert refused(lambda: restart(rig, h, EVR3, events=ev)) == fx.R_BUDGET_NIGHT
+    assert refused(lambda: restart(rig, g, EVR3, events=ev)) == fx.R_BUDGET_NIGHT
+    assert len(rig.runs) == 2
+    second = event_for(rig.raw, event_id=EVT2, received_at=utc_stamp(world.clock.now))
+    ev = serve_events(rig, **{EVT2: second})
+    assert rig.effects(events=ev).send_ack(g["id"], EVT, expect_sha256=D(g)).ok
+    assert refused(lambda: rig.effects(events=ev).send_ack(h["id"], EVT2, expect_sha256=D(h))) == fx.R_BUDGET_NIGHT
+    assert len(rig.sent) == 1
+
+
+def test_two_orders_cannot_double_the_incident_budget(world):
+    g, h = signed(world), signed(world)
+    rig = Rig(world)
+    ev = serve_events(rig, **{EVR2: monitor_event(event_id=EVR2)})       # a second event, the SAME incident
+    assert restart(rig, g, EVR, events=ev).ok
+    assert refused(lambda: restart(rig, h, EVR2, events=ev)) == fx.R_BUDGET_INCIDENT
+    assert len(rig.runs) == 1
+
+
+def test_a_refused_row_taken_again_by_another_order_runs_under_that_order(tmp_path):
+    journal = Journal(tmp_path / "other.db")
+    row, _ = _reserve(journal, "k1", "n", "2026-11-15T00:00:00Z")
+    journal.settle(row.attempt_id, "refused", "2026-11-15T00:00:01Z")
+    again, fresh = journal.reserve(key="k1", order_id="so-" + "b" * 12, order_sha256="1" * 64, incarnation=1,
+                                   verb="restart_service", event_id=EVR, args_digest="x", recipient=None,
+                                   incident_scope="apache2|inc-1", night_scope="n", per_incident=9, per_night=9,
+                                   now="2026-11-15T00:00:02Z")
+    assert fresh and again.attempt_id == row.attempt_id and again.order_id == "so-" + "b" * 12
+    conn = sqlite3.connect(journal.path)
+    with pytest.raises(sqlite3.DatabaseError):               # outside the retake edge the order never moves
+        conn.execute("UPDATE effect_attempts SET order_id = 'so-cccccccccccc'")
+    conn.close()
 
 
 @pytest.mark.parametrize("code", [None, True, False, "0", 0.0])
