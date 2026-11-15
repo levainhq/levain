@@ -141,6 +141,7 @@ def test_a_path_outside_the_scratch_root_is_refused_whatever_its_spelling(where)
 def test_guard_fails_closed_when_no_scratch_root_is_named(monkeypatch, tmp_path):
     from levain import home_guard
     monkeypatch.delenv(home_guard.TEST_SCRATCH_ROOT_ENV, raising=False)
+    monkeypatch.delenv(K.TEST_KEY_ROOTS_ENV, raising=False)
     with pytest.raises(K.RealKeyReached, match="scratch root"):
         K.refuse_real_key_in_tests(tmp_path / "keys")
 
