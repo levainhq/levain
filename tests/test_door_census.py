@@ -17,6 +17,8 @@ _EXPECTED = frozenset({
     ("desk", "handoff", "worker"), ("desk", "log"),
     ("desk", "open"), ("desk", "close"), ("desk", "handoff", "show"),
     ("desk", "ready", "show"), ("desk", "ready", "add"), ("desk", "ready", "move"), ("desk", "ready", "correct"),
+    # ND-1: the desk reads sensor events and writes its own decision on one; the sensor-side and operator-side event verbs stay out
+    ("desk", "event", "list"), ("desk", "event", "ack"),
     ("drops", "list"), ("drops", "show"), ("drops", "split"), ("drops", "note"),
     ("thread", "list"), ("thread", "show"), ("thread", "state"), ("thread", "merge"), ("thread", "detach"),
     ("thread", "add"), ("thread", "set"),

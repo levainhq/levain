@@ -17,9 +17,9 @@ its life (``pending`` -> ``active``, or ``failed`` / ``expired``; ``active`` -> 
 ``active`` only if its latest event is that ``pending`` row, the clock is before its ``until`` and its token is still
 the live lease's, all in one transaction (:func:`activate`); a takeover voids every pending launch.
 
-WAKES (:func:`wake`, run inside every new drop's transaction): with no live lease and no pending desk launch,
-the drop's transaction writes a ``pending`` desk launch and a ``bootstrap`` claim held by its ``session_key``,
-whose token the launch is then activated against; otherwise the drop only queues. The launch is the one the DESK
+WAKES (:func:`wake`, run inside the writing transaction of whatever asks for a desk, every new drop's among them):
+with no live lease and no pending desk launch, that transaction writes a ``pending`` desk launch and a ``bootstrap``
+claim held by its ``session_key``, whose token the launch is then activated against; otherwise the asker only queues. The launch is the one the DESK
 SETTING names (``coord_settings``, yours only: the agent, its model, the directory it runs in, set by ``levain desk
 agent``); with no setting, or agent ``none``, a drop only queues (``unset``): no launch is asked for and none can die. A
 desk launch that dies before ``active`` (failed, expired) after a process claimed its spawn, or ends at 0 turns,
@@ -84,7 +84,8 @@ BUDGET_CROSSED = "budget crossed"
 # activation (C6 L3 r1 B1): C0 §3.4 gives such a launch no envelope authority, so no budget can meter it, and nothing
 # launches past a crossed budget. A refusal, never a death
 SEVERAL_THREADS = "a worker holds one thread"
-# a done desk the watcher (a drop it never saw waits) or your `levain desk wake` ended so a fresh one starts:
+# a done desk the watcher (something it never saw waits: :func:`replace_done` says what counts) or your
+# `levain desk wake` ended so a fresh one starts:
 # a stop, never a death, so the wake in the same transaction is never put into backoff by it (1030-42 L3 r1)
 REPLACED = "replaced while done"
 # a spawned worker whose one turn finished (its session listed done): ended so it no longer counts as a live spawn
@@ -1034,10 +1035,14 @@ def replace_done(conn: sqlite3.Connection, now: str, launch_id: str, *, asked: b
     """A desk whose session is ``done`` (a finished turn, listed, not working; the caller read the listing)
     is written ``ended``, cause :data:`REPLACED` (no death), its lease released if it still held one, so the caller's
     :func:`wake` in this transaction asks for a fresh desk. The watcher replaces it only while
-    :func:`unseen_drop` names a drop; ``asked`` (your ``levain desk wake``) needs none. None, nothing written, when
-    the launch is no longer an active desk, or no unseen drop waits and you did not ask."""
+    :func:`unseen_drop` names a drop or :func:`levain.desk.events.unseen_event` names a sensor event; ``asked`` (your
+    ``levain desk wake``) needs none. None, nothing written, when the launch is no longer an active desk, or nothing
+    unseen waits and you did not ask."""
+    from levain.desk import events
+
     ln = launch(conn, launch_id)
-    if ln is None or ln.state != "active" or ln.role != ROLE_DESK or not asked and unseen_drop(conn, ln) is None:
+    if ln is None or ln.state != "active" or ln.role != ROLE_DESK or not asked and unseen_drop(conn, ln) is None \
+            and events.unseen_event(conn, ln) is None:
         return None
     _launch_event(conn, now, launch_id, "ended", REPLACED)
     held = lease(conn, now)
@@ -1540,8 +1545,8 @@ def _deaths(conn: sqlite3.Connection) -> tuple[int, str | None]:
 
 
 def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
-    """What a drop arriving now would do, without writing: ``(state, why)``, state one of ``held`` (a live lease),
-    ``launching`` (a pending desk launch), ``idle`` (a desk still running without the lease),
+    """What :func:`wake` asked for now would do, without writing: ``(state, why)``, state one of ``held`` (a live
+    lease), ``launching`` (a pending desk launch), ``idle`` (a desk still running without the lease),
     ``unset`` (no desk setting, agent none, or a codex setting written before the Codex desk's removal:
     a drop only queues), ``backoff``, ``stopped`` (you look), or ``wake``."""
     held = lease(conn, now)
@@ -1560,7 +1565,7 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
         return "idle", (f"desk launch {waited.launch_id} is running without the lease; it claims again "
                         f"(levain desk claim) by {_idle_until(conn, waited)}, or the next drop after that ends it "
                         "and asks for a fresh desk; once its session is done, `levain desk wake` replaces "
-                        "it, and `levain desk watch` does at its next pass when a drop it never saw waits")
+                        "it, and `levain desk watch` does at its next pass when something it never saw waits")
     for ln in _in_state(conn, "pending", ROLE_DESK):
         if now < ln.until:
             return "launching", f"desk launch {ln.launch_id} is pending until {ln.until}"
@@ -1582,9 +1587,10 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
 
 
 def wake(conn: sqlite3.Connection, now: str) -> Launch | None:
-    """Inside a new drop's transaction: with no live lease, no pending desk launch and no backoff, write a
-    ``pending`` desk launch and its ``bootstrap`` claim (writer 3) under the CAS "no live lease" this one
-    ``BEGIN IMMEDIATE`` holds. Returns the launch written, or None when the drop only queues."""
+    """Inside the caller's writing transaction (whatever asks for a desk: a new drop's among them): with no live
+    lease, no pending desk launch and no backoff, write a ``pending`` desk launch and its ``bootstrap`` claim (writer
+    3) under the CAS "no live lease" this one ``BEGIN IMMEDIATE`` holds. Returns the launch written, or None when
+    what asked only queues."""
     _lapse_if_past(conn, now)
     _expire_pending(conn, now)
     if lease(conn, now) is None:

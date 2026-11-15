@@ -106,7 +106,7 @@ def _board_store(args: argparse.Namespace) -> EnvelopeStore:
 # the verbs that act on the desk itself (its lease, launches, setting, seams and ready queue): each opens the
 # store its desk is in (:func:`_desk_dir`), so one desk's whole family stays in one dispatch.db
 _FOLLOWS_DESK = frozenset({"take", "release", "beat", "claim", "wake", "launch", "agent", "status", "ready",
-                                  "watch", "close", "open", "handoff"})
+                                  "watch", "close", "open", "handoff", "event"})
 
 
 def _opens_board(args: argparse.Namespace) -> bool:
@@ -367,6 +367,93 @@ def _launch_woken(store: EnvelopeStore, drop: Drop) -> None:
         print(f"desk launch {launch_id}: not started ({exc})", file=sys.stderr)
         return
     print(_outcome_text(got, _again_to(store)), file=sys.stderr)
+
+
+def _event_row_text(e: Any) -> str:
+    extra = f"; {e.note}" if e.note else ""
+    return (f"{e.event_id}  {e.state}  {e.trust}  sensor {e.sensor_id} seq {e.sensor_seq}  {e.kind} "
+            f"{json.dumps(e.fields, sort_keys=True)}  {e.received_at}{extra}")
+
+
+def run_event(args: argparse.Namespace, out: Any = None) -> int:
+    """``levain desk event register|retire|post|list|ack|progress``: the sensors' door and the desk's reading of what
+    they reported. An event is never a drop."""
+    from levain.desk import events as ev
+
+    out = out or sys.stdout
+    cmd = args.event_cmd
+    try:
+        store = _coord_store(args)
+        if cmd == "register":
+            ev.register(store, args.sensor, args.trust, args.credential_file, authserv_id=args.authserv_id)
+            _emit(out, args.json, {"sensor": args.sensor, "trust": args.trust, "credential_file": str(args.credential_file)},
+                  f"sensor {args.sensor} registered ({args.trust}); its credential is in {args.credential_file}")
+        elif cmd == "retire":
+            ev.retire(store, args.sensor)
+            _emit(out, args.json, {"sensor": args.sensor, "retired": True}, f"sensor {args.sensor} retired")
+        elif cmd in ("post", "mail"):
+            text = _text_input(args, None, "--text")
+            if cmd == "mail":
+                try:
+                    with open(args.raw_file, "rb") as fh:
+                        raw = fh.read(ev.MAIL_RAW_MAX + 1)
+                except OSError as exc:
+                    raise CoordError(f"{args.raw_file} could not be read ({exc.strerror})") from None
+                posted = ev.post_mail(store, args.sensor, args.seq, raw,
+                                      credential=ev.read_credential(args.credential_file), subject=args.subject,
+                                      category=args.category, known_from=args.known_from, untrusted_text=text)
+            else:
+                fields: dict[str, object] = {}
+                for item in args.field:
+                    name, sep, value = item.partition("=")
+                    if not sep or name in fields:
+                        raise CoordError(f"--field is NAME=VALUE, once per name (got {item[:40]!r})")
+                    fields[name] = value
+                posted = ev.post(store, args.sensor, args.seq, args.kind, fields,
+                                 credential=ev.read_credential(args.credential_file), untrusted_text=text,
+                                 body_ref=args.body_ref)
+            line = (f"event {posted.event.event_id} {'stored' if posted.created else 'already stored (replay, nothing written)'}"
+                    f": {posted.event.state}, {posted.event.trust}")
+            _emit(out, args.json, {**ev.row(posted.event), "created": posted.created, "launch_id": posted.launch_id}, line)
+            for ping in posted.pings:
+                print(ping, file=sys.stderr)
+            note = ev.alert_untrusted(store, posted)
+            if note:
+                print(note, file=sys.stderr)
+            if posted.launch_id is not None:
+                from levain.desk.launch import launch_session
+
+                try:
+                    print(_outcome_text(launch_session(store, posted.launch_id), _again_to(store)), file=sys.stderr)
+                except _REFUSED as exc:
+                    print(f"desk launch {posted.launch_id}: not started ({exc})", file=sys.stderr)
+        elif cmd == "list":
+            rows = ev.listing(store, state=args.state, limit=args.limit)
+            payload: Any = [ev.row(e) for e in rows]
+            if args.audit:
+                payload = {"audit": ev.audit(store), "events": payload}
+                text = json.dumps(payload["audit"], sort_keys=True) + "\n" + "\n".join(_event_row_text(e) for e in rows)
+            else:
+                text = "\n".join(_event_row_text(e) for e in rows) or "no events"
+            _emit(out, args.json, payload, text)
+        elif cmd == "ack":
+            why = _text_input(args, args.why, "--why")
+            if why is None:
+                raise CoordError("say what the desk decided: --why TEXT, --text-file PATH or --stdin")
+            e = ev.ack(store, args.event_id, why, token=args.token)
+            _emit(out, args.json, ev.row(e), f"event {e.event_id} acknowledged")
+        else:        # progress
+            lines, launch_id = ev.progress(store)
+            if launch_id is not None:
+                from levain.desk.launch import launch_session
+
+                got = launch_session(store, launch_id)
+                lines.append(_outcome_text(got, _again_to(store)))
+            _emit(out, args.json, {"lines": lines, "launch_id": launch_id}, "\n".join(lines) or "nothing to do")
+    except (*_REFUSED, ValueError) as exc:
+        print(f"levain desk event {cmd}: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _outcome_text(got: Any, again: str = "") -> str:
@@ -2432,6 +2519,73 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         if getattr(_act, "dest", None) == "desk":
             _act.metavar = "desk"
     c_sub = c.add_subparsers(dest="coord_cmd", required=True)
+
+    # sensor events (ND-1): never drops. The sensors' verbs (register, retire, post, progress) are not the desk's; it
+    # reads (list) and writes its decision (ack) through the door, under its lease token
+    evp = c_sub.add_parser("event", help="Sensor events: reports from registered sensors, never his words.")
+    ev_sub = evp.add_subparsers(dest="event_cmd", required=True)
+    evr = ev_sub.add_parser("register", help="Register a sensor with a trust ceiling; writes its credential file (yours).")
+    evr.add_argument("--sensor", required=True, help="The sensor's id: a-z 0-9 . _ -")
+    evr.add_argument("--trust", required=True, choices=("first_party", "authenticated", "untrusted"),
+                     help="The most trust any event of this sensor can have; an event's own fields can only lower it.")
+    evr.add_argument("--credential-file", dest="credential_file", type=Path, required=True, metavar="PATH",
+                     help="Where to write the new credential (mode 0600, never overwritten).")
+    evr.add_argument("--authserv-id", dest="authserv_id", default=None, metavar="HOST",
+                     help="A mail sensor: the receiving provider's authserv-id, whose topmost Authentication-Results "
+                          "header alone says whether a message passed DMARC.")
+    common(evr)
+    evr.set_defaults(func=run_event)
+    evt = ev_sub.add_parser("retire", help="Retire a sensor: its credential is refused from now on (yours).")
+    evt.add_argument("--sensor", required=True)
+    common(evt)
+    evt.set_defaults(func=run_event)
+    evo = ev_sub.add_parser("post", help="A sensor posts one event (its credential file proves who).")
+    evo.add_argument("--sensor", required=True)
+    evo.add_argument("--seq", type=int, required=True, help="The sensor's own sequence number; a replay is one row.")
+    evo.add_argument("--kind", required=True, help="site_status, heartbeat or report. A mail message is posted with "
+                     "`event mail` (its auth fields are derived from the raw bytes), never here.")
+    evo.add_argument("--field", action="append", default=[], metavar="NAME=VALUE",
+                     help="A typed field of the kind (an enum or a bounded identifier). Repeatable.")
+    evo.add_argument("--credential-file", dest="credential_file", type=Path, required=True, metavar="PATH")
+    evo.add_argument("--body-ref", dest="body_ref", default=None, metavar="sha256:HEX",
+                     help="The digest of a body kept elsewhere; never the body.")
+    _text_flags(evo)
+    common(evo)
+    evo.set_defaults(func=run_event)
+    evm = ev_sub.add_parser("mail", help="A mail sensor posts one message: its auth fields are derived from the raw bytes.")
+    evm.add_argument("--sensor", required=True)
+    evm.add_argument("--seq", type=int, required=True, help="The sensor's own sequence number; a replay is one row.")
+    evm.add_argument("--raw-file", dest="raw_file", type=Path, required=True, metavar="PATH",
+                     help="The raw message as received (only its digest is kept).")
+    evm.add_argument("--subject", required=True, help="A bounded identifier for the message (never its text).")
+    evm.add_argument("--category", required=True, help="The mail kind's category enum (the library checks it).")
+    evm.add_argument("--known-from", dest="known_from", action="append", default=[], metavar="ADDRESS",
+                     help="An address whose authenticated mail is from a known sender. Repeatable.")
+    evm.add_argument("--credential-file", dest="credential_file", type=Path, required=True, metavar="PATH")
+    _text_flags(evm)
+    common(evm)
+    evm.set_defaults(func=run_event)
+    evl = ev_sub.add_parser("list", help="Events, newest first (with --audit, the morning count first).")
+    evl.add_argument("--state", default=None, choices=("received", "claimed", "delivered", "acked", "suppressed",
+                                                         "alerted", "retried"))
+    evl.add_argument("--limit", type=int, default=50)
+    evl.add_argument("--audit", action="store_true")
+    common(evl)
+    evl.set_defaults(func=run_event)
+    eva = ev_sub.add_parser("ack", help="Write the desk's decision against an event (the desk's door).")
+    eva.add_argument("event_id")
+    eva.add_argument("--why", default=None, metavar="ONE_LINE", help="What the desk decided.")
+    _text_flags(eva)
+    eva.add_argument("--by", default=ROLE_DESK, type=by_word, choices=by_choices(ROLE_DESK))
+    token(eva)
+    common(eva)
+    eva.set_defaults(func=run_event)
+    evg = ev_sub.add_parser("progress", help="Run the delivery pass once: claims, retries, pings, the wake.")
+    common(evg)
+    evg.set_defaults(func=run_event)
+    door_ok(evl, eva)
+    not_door(evr, evt, evo, evm, evg)
+
     cs = c_sub.add_parser("status", help="Who holds the lease, what the next drop would do, the latest launches.")
     ct = c_sub.add_parser("take", help="Hold the desk role yourself (voids every pending launch).")
     ct.add_argument("--for", dest="hold", default=None, metavar="DURATION",

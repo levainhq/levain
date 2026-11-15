@@ -18,6 +18,7 @@ from levain.desk import room
 from levain.desk import seam_classes as sc
 from levain.desk.chat import CHAT_SCHEMA, ChatStore
 from levain.desk.envelopes import ENVELOPE_SCHEMA, EnvelopeStore
+from levain.desk.events import EVENT_SCHEMA
 from levain.desk.first_reader import FIRST_READER_SCHEMA
 from levain.desk.intake import INTAKE_SCHEMA
 from levain.desk.lease import LAUNCH_KINDS, LEASE_KINDS, LEASE_SCHEMA
@@ -74,10 +75,12 @@ def test_the_classes_do_not_overlap() -> None:
 def test_every_table_of_the_maximal_database_is_in_exactly_one_class(maximal: Path) -> None:
     tables = _tables(maximal)
     assert "sqlite_sequence" in tables and sc.EXEMPT["sqlite_sequence"] == "SQLite's own"
-    assert len(tables) == 78 and len(set(tables)) == 78           # the census's 54, SQLite's, S0, S1, S2b's five, P3, S5, CH-H2's three, the room's four, H1-1's two (envelope_drafts, envelope_draft_withdrawals: each row takes a gseq, so COUNTED), the room relay's two (room_relay_claims, room_relay_outcomes: no gseq, so INFRASTRUCTURE), the board store's two (worker_attach, report_refusals: INFRASTRUCTURE, a decision recorded in seam_classes) and its sessions_seen (the service's sightings, INFRASTRUCTURE)
+    known = sc.COUNTED | sc.INFRASTRUCTURE | set(sc.EXEMPT)
+    # the count is the classes' own size, not a number kept here: the two set differences below name any table
+    # a class lacks or a class entry the database lacks, so the one count that can drift is a table made twice
+    assert len(tables) == len(set(tables)) == len(known)
     # `_r4` is the transient name of the review events' rebuild: gone by commit, so a finished store holds none
     assert not [t for t in tables if t.endswith("_r4")]
-    known = sc.COUNTED | sc.INFRASTRUCTURE | set(sc.EXEMPT)
     assert sorted(set(tables) - known) == [], "a table with no class: add it to seam_classes with S0_CLASSES.md's ruling"
     assert sorted(known - set(tables)) == [], "a class entry for a table the maximal database does not hold"
     for t in tables:
@@ -91,6 +94,16 @@ def test_every_counted_table_has_a_gseq_column(maximal: Path) -> None:
     assert set(GSEQ_TABLES) <= sc.COUNTED
     for t in GSEQ_TABLES:
         assert "gseq" in _columns(maximal, t)
+
+
+def test_the_night_desk_tables_are_classed_as_seam_classes_says(maximal: Path) -> None:
+    from levain.desk.seam import DETAIL_FIELDS
+    assert {"events", "event_states", "incident_closes"} <= sc.COUNTED
+    assert {"sensors", "sensor_retirements", "mail_sensors", "incidents"} <= sc.INFRASTRUCTURE
+    # incidents is INFRASTRUCTURE because it has no gseq column (its opened_gseq is not what the brief reads)
+    assert "gseq" not in _columns(maximal, "incidents") and "opened_gseq" in _columns(maximal, "incidents")
+    # Since names an event row by its table alone: no detail entry, so an event's untrusted_text never reaches the brief
+    assert not {"events", "event_states", "incident_closes"} & set(DETAIL_FIELDS)
 
 
 def test_the_migrated_tables_are_the_counted_tables_that_lacked_a_gseq() -> None:
@@ -149,6 +162,7 @@ _DISPATCH_DB_LISTS = {
     "seam_handoffs.SEAM_HANDOFF_SCHEMA": SEAM_HANDOFF_SCHEMA, "seam_open.OPEN_SCHEMA": OPEN_SCHEMA, "intake.INTAKE_SCHEMA": INTAKE_SCHEMA,
     "envelopes.ENVELOPE_SCHEMA": ENVELOPE_SCHEMA, "chat.CHAT_SCHEMA": CHAT_SCHEMA,
     "chat_egress.EGRESS_SCHEMA": EGRESS_SCHEMA,
+    "events.EVENT_SCHEMA": EVENT_SCHEMA,
 }
 
 
@@ -171,7 +185,8 @@ def test_the_name_scan_reads_every_statement_and_catches_a_seeded_duplicate() ->
         "work_delta.OPERATOR_VIEWS_SCHEMA": (4, 4), "store.SEAM_SCHEMA": (4, 4),
         "seam_handoffs.SEAM_HANDOFF_SCHEMA": (8, 8), "seam_open.OPEN_SCHEMA": (21, 21),
         "intake.INTAKE_SCHEMA": (4, 4), "work_attach.WORK_SCHEMA": (14, 14),
-        "envelopes.ENVELOPE_SCHEMA": (12, 12), "chat.CHAT_SCHEMA": (52, 52), "chat_egress.EGRESS_SCHEMA": (6, 6)}
+        "envelopes.ENVELOPE_SCHEMA": (12, 12), "chat.CHAT_SCHEMA": (52, 52), "chat_egress.EGRESS_SCHEMA": (6, 6),
+        "events.EVENT_SCHEMA": (30, 30)}
     # IF NOT EXISTS hides a second declaration from the database: the scan must see it in the source
     assert _declared(("CREATE TABLE IF NOT EXISTS replies (a)", "CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a)",
                       "CREATE TRIGGER x BEFORE INSERT ON t BEGIN SELECT 1; END")) == [

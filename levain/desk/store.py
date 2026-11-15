@@ -546,6 +546,7 @@ class CoordStore:
         ``lifecycle=False`` leaves out the additive tables, C13's, the operator's work cursor, S0's migration bounds and the
         missions'
         (:meth:`_schema_current`'s reader gate)."""
+        from levain.desk.events import EVENT_SCHEMA
         from levain.desk.lease import LEASE_SCHEMA
         from levain.desk.missions import MISSION_SCHEMA
         from levain.desk.first_reader import FIRST_READER_SCHEMA
@@ -562,7 +563,7 @@ class CoordStore:
         # tables (ready items + their journal) are additive, IF NOT EXISTS, like every statement here
         return (*(SCHEMA if base else self._SCHEMA), *LEASE_SCHEMA, *DRAFT_SCHEMA, *REVIEW_SCHEMA, *FIRST_READER_SCHEMA,
                 *((*LIFECYCLE_SCHEMA, *OPERATOR_VIEWS_SCHEMA, *SEAM_SCHEMA, *SEAM_HANDOFF_SCHEMA, *OPEN_SCHEMA,
-                  *INTAKE_SCHEMA, *MISSION_SCHEMA, *WORK_SCHEMA)
+                  *INTAKE_SCHEMA, *MISSION_SCHEMA, *WORK_SCHEMA, *EVENT_SCHEMA)
                 if lifecycle else ()))
 
     def _connect(self, *, create: bool = True) -> sqlite3.Connection:
@@ -1400,8 +1401,8 @@ class CoordStore:
 
     def launch_replace_done(self, launch_id: str, *, asked: bool = False) -> Any:
         """``launch_id``'s session was listed done (:func:`levain.desk.lease.replace_done`; ``asked``: your
-        ``levain desk wake``, which needs no unseen drop): ``(ended launch, the fresh desk launch the same
-        transaction asked for or None)``, or None when nothing was replaced. The unseen-drop check, the end and the
+        ``levain desk wake``, which needs nothing unseen): ``(ended launch, the fresh desk launch the same
+        transaction asked for or None)``, or None when nothing was replaced. The unseen check, the end and the
         wake are one transaction, so a split or a second drop cannot slip between them."""
         from levain.desk import lease
 

@@ -1,5 +1,7 @@
 index drops_gseq
 CREATE UNIQUE INDEX drops_gseq ON drops (gseq);
+index event_states_by_event
+CREATE INDEX event_states_by_event ON event_states (event_id, seq);
 index first_reads_gseq
 CREATE UNIQUE INDEX first_reads_gseq ON first_reads (gseq);
 index job_envelopes_envelope
@@ -52,6 +54,10 @@ table envelopes
 CREATE TABLE envelopes (envelope_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, origin TEXT NOT NULL CHECK (origin IN ('structured', 'worded')), drop_id TEXT NOT NULL REFERENCES drops(drop_id), body TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL, signature TEXT NOT NULL, signer_fp TEXT NOT NULL, signer_class TEXT NOT NULL, supersedes TEXT, stop_at TEXT NOT NULL, accepted_at TEXT NOT NULL);
 table event_cursor
 CREATE TABLE event_cursor (one INTEGER PRIMARY KEY CHECK (one = 1), journal_id TEXT NOT NULL, seq INTEGER NOT NULL CHECK (seq >= 0));
+table event_states
+CREATE TABLE event_states (seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL REFERENCES events(event_id), gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK (kind IN ('received', 'claimed', 'delivered', 'acked', 'suppressed', 'alerted', 'retried', 'pinging', 'pinged', 'ping_failed', 'ping_abandoned')), launch_id TEXT, claim_until TEXT, note TEXT, at TEXT NOT NULL);
+table events
+CREATE TABLE events (event_id TEXT PRIMARY KEY, sensor_id TEXT NOT NULL REFERENCES sensors(sensor_id), sensor_seq INTEGER NOT NULL, kind TEXT NOT NULL, trust TEXT NOT NULL CHECK (trust IN ('untrusted', 'authenticated', 'first_party')), fields TEXT NOT NULL, untrusted_text TEXT, body_ref TEXT, content_sha256 TEXT NOT NULL, incident_id TEXT REFERENCES incidents(incident_id), received_at TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, UNIQUE (sensor_id, sensor_seq));
 table first_reads
 CREATE TABLE first_reads (question_id TEXT PRIMARY KEY, outcome TEXT NOT NULL CHECK (outcome IN ('know', 'escalated')), reply_id TEXT NOT NULL REFERENCES replies(reply_id), at TEXT NOT NULL, gseq INTEGER);
 table gseq
@@ -64,6 +70,10 @@ table held_ping_releases
 CREATE TABLE held_ping_releases (question_id TEXT PRIMARY KEY REFERENCES held_pings(question_id), cause TEXT NOT NULL CHECK (cause IN ('unread', 'escalated', 'answered')), at TEXT NOT NULL);
 table held_pings
 CREATE TABLE held_pings (question_id TEXT PRIMARY KEY, lease_token INTEGER NOT NULL, at TEXT NOT NULL);
+table incident_closes
+CREATE TABLE incident_closes (incident_id TEXT PRIMARY KEY REFERENCES incidents(incident_id), cause TEXT NOT NULL CHECK (cause IN ('recovered', 'acked', 'stale')), gseq INTEGER NOT NULL UNIQUE, at TEXT NOT NULL);
+table incidents
+CREATE TABLE incidents (incident_id TEXT PRIMARY KEY, incident_key TEXT NOT NULL, sensor_id TEXT NOT NULL REFERENCES sensors(sensor_id), kind TEXT NOT NULL, trust TEXT NOT NULL CHECK (trust IN ('untrusted', 'authenticated', 'first_party')), opened_gseq INTEGER NOT NULL UNIQUE, opened_at TEXT NOT NULL);
 table intake_views
 CREATE TABLE intake_views (open_id INTEGER PRIMARY KEY REFERENCES open_builds(open_id), via TEXT NOT NULL CHECK (via IN ('terminal', 'drop_reply')), ref TEXT NOT NULL CHECK (length(ref) > 0), at TEXT NOT NULL);
 table job_envelopes
@@ -90,6 +100,8 @@ table launches
 CREATE TABLE launches (launch_id TEXT PRIMARY KEY, gseq INTEGER NOT NULL UNIQUE, session_key TEXT NOT NULL UNIQUE, harness TEXT NOT NULL CHECK (harness IN ('claude', 'codex')), role TEXT NOT NULL CHECK (role IN ('coordinator', 'worker', 'room')), threads TEXT NOT NULL, model TEXT, cwd TEXT, token INTEGER NOT NULL, placement TEXT NOT NULL, at TEXT NOT NULL, user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), role_ref TEXT);
 table lease_events
 CREATE TABLE lease_events (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, kind TEXT NOT NULL CHECK (kind IN ('claim', 'beat', 'release', 'lapse', 'takeover')), token INTEGER, holder TEXT NOT NULL, until TEXT, cause TEXT NOT NULL, by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator', 'service')), at TEXT NOT NULL);
+table mail_sensors
+CREATE TABLE mail_sensors (sensor_id TEXT PRIMARY KEY REFERENCES sensors(sensor_id), authserv_id TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, at TEXT NOT NULL);
 table meta
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 table mission_acceptances
@@ -126,6 +138,10 @@ table run_records
 CREATE TABLE run_records (job_id TEXT NOT NULL REFERENCES jobs(id), run INTEGER NOT NULL, record TEXT NOT NULL, digest TEXT NOT NULL, envelope_digest TEXT NOT NULL, at TEXT NOT NULL, ticket TEXT, PRIMARY KEY (job_id, run));
 table seam_handoffs
 CREATE TABLE seam_handoffs (handoff_id INTEGER PRIMARY KEY AUTOINCREMENT, close_key TEXT NOT NULL UNIQUE, seam_kind TEXT NOT NULL, written_at TEXT NOT NULL, writer TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, covers_gseq INTEGER NOT NULL CHECK (covers_gseq >= 0), prev_handoff_id INTEGER, request_digest TEXT NOT NULL, body TEXT NOT NULL);
+table sensor_retirements
+CREATE TABLE sensor_retirements (sensor_id TEXT PRIMARY KEY REFERENCES sensors(sensor_id), gseq INTEGER NOT NULL UNIQUE, at TEXT NOT NULL);
+table sensors
+CREATE TABLE sensors (sensor_id TEXT PRIMARY KEY, trust TEXT NOT NULL CHECK (trust IN ('untrusted', 'authenticated', 'first_party')), credential_sha256 TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, at TEXT NOT NULL);
 table sessions_seen
 CREATE TABLE sessions_seen (session_id TEXT PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 200), first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, CHECK (last_seen >= first_seen));
 table signatures
@@ -224,6 +240,20 @@ trigger envelopes_kept
 CREATE TRIGGER envelopes_kept BEFORE DELETE ON envelopes BEGIN SELECT RAISE(ABORT, 'an envelope is append-only'); END;
 trigger envelopes_no_replace
 CREATE TRIGGER envelopes_no_replace BEFORE INSERT ON envelopes WHEN EXISTS (SELECT 1 FROM envelopes WHERE envelope_id = NEW.envelope_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'an envelope is never replaced'); END;
+trigger event_states_edges
+CREATE TRIGGER event_states_edges BEFORE INSERT ON event_states WHEN NEW.kind IN ('received', 'claimed', 'delivered', 'acked', 'suppressed', 'alerted', 'retried') AND (SELECT kind FROM event_states WHERE event_id = NEW.event_id AND kind IN ('received', 'claimed', 'delivered', 'acked', 'suppressed', 'alerted', 'retried') ORDER BY seq DESC LIMIT 1) IN ('acked', 'suppressed', 'alerted') BEGIN SELECT RAISE(ABORT, 'an event in a terminal state takes no further state'); END;
+trigger event_states_frozen
+CREATE TRIGGER event_states_frozen BEFORE UPDATE ON event_states BEGIN SELECT RAISE(ABORT, 'an event state is append-only'); END;
+trigger event_states_kept
+CREATE TRIGGER event_states_kept BEFORE DELETE ON event_states BEGIN SELECT RAISE(ABORT, 'an event state is append-only'); END;
+trigger event_states_no_replace
+CREATE TRIGGER event_states_no_replace BEFORE INSERT ON event_states WHEN EXISTS (SELECT 1 FROM event_states WHERE seq = NEW.seq OR gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'an event state is never replaced'); END;
+trigger events_frozen
+CREATE TRIGGER events_frozen BEFORE UPDATE ON events BEGIN SELECT RAISE(ABORT, 'an event is append-only'); END;
+trigger events_kept
+CREATE TRIGGER events_kept BEFORE DELETE ON events BEGIN SELECT RAISE(ABORT, 'an event is append-only'); END;
+trigger events_no_replace
+CREATE TRIGGER events_no_replace BEFORE INSERT ON events WHEN EXISTS (SELECT 1 FROM events WHERE event_id = NEW.event_id OR gseq = NEW.gseq OR rowid = NEW.rowid OR (sensor_id = NEW.sensor_id AND sensor_seq = NEW.sensor_seq)) BEGIN SELECT RAISE(ABORT, 'an event is never replaced'); END;
 trigger first_reads_frozen
 CREATE TRIGGER first_reads_frozen BEFORE UPDATE ON first_reads BEGIN SELECT RAISE(ABORT, 'a first read is written once is append-only'); END;
 trigger first_reads_gseq_no_replace
@@ -262,6 +292,18 @@ trigger held_pings_kept
 CREATE TRIGGER held_pings_kept BEFORE DELETE ON held_pings BEGIN SELECT RAISE(ABORT, 'a held ping is written once is append-only'); END;
 trigger held_pings_no_replace
 CREATE TRIGGER held_pings_no_replace BEFORE INSERT ON held_pings WHEN EXISTS (SELECT 1 FROM held_pings WHERE question_id = NEW.question_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a ping is held once'); END;
+trigger incident_closes_frozen
+CREATE TRIGGER incident_closes_frozen BEFORE UPDATE ON incident_closes BEGIN SELECT RAISE(ABORT, 'an incident close is append-only'); END;
+trigger incident_closes_kept
+CREATE TRIGGER incident_closes_kept BEFORE DELETE ON incident_closes BEGIN SELECT RAISE(ABORT, 'an incident close is append-only'); END;
+trigger incident_closes_no_replace
+CREATE TRIGGER incident_closes_no_replace BEFORE INSERT ON incident_closes WHEN EXISTS (SELECT 1 FROM incident_closes WHERE incident_id = NEW.incident_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'an incident closes once'); END;
+trigger incidents_frozen
+CREATE TRIGGER incidents_frozen BEFORE UPDATE ON incidents BEGIN SELECT RAISE(ABORT, 'an incident is append-only'); END;
+trigger incidents_kept
+CREATE TRIGGER incidents_kept BEFORE DELETE ON incidents BEGIN SELECT RAISE(ABORT, 'an incident is append-only'); END;
+trigger incidents_no_replace
+CREATE TRIGGER incidents_no_replace BEFORE INSERT ON incidents WHEN EXISTS (SELECT 1 FROM incidents WHERE incident_id = NEW.incident_id OR opened_gseq = NEW.opened_gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'an incident is never replaced'); END;
 trigger intake_views_frozen
 CREATE TRIGGER intake_views_frozen BEFORE UPDATE ON intake_views BEGIN SELECT RAISE(ABORT, 'an intake view is append-only'); END;
 trigger intake_views_kept
@@ -344,6 +386,12 @@ trigger lease_events_kept
 CREATE TRIGGER lease_events_kept BEFORE DELETE ON lease_events BEGIN SELECT RAISE(ABORT, 'a lease event is append-only'); END;
 trigger lease_events_no_replace
 CREATE TRIGGER lease_events_no_replace BEFORE INSERT ON lease_events WHEN EXISTS (SELECT 1 FROM lease_events WHERE seq = NEW.seq OR gseq = NEW.gseq) BEGIN SELECT RAISE(ABORT, 'a lease event is never replaced'); END;
+trigger mail_sensors_frozen
+CREATE TRIGGER mail_sensors_frozen BEFORE UPDATE ON mail_sensors BEGIN SELECT RAISE(ABORT, 'a mail sensor registration is append-only'); END;
+trigger mail_sensors_kept
+CREATE TRIGGER mail_sensors_kept BEFORE DELETE ON mail_sensors BEGIN SELECT RAISE(ABORT, 'a mail sensor registration is append-only'); END;
+trigger mail_sensors_no_replace
+CREATE TRIGGER mail_sensors_no_replace BEFORE INSERT ON mail_sensors WHEN EXISTS (SELECT 1 FROM mail_sensors WHERE sensor_id = NEW.sensor_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a mail sensor is registered once'); END;
 trigger meta_frozen
 CREATE TRIGGER meta_frozen BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'store metadata is written once'); END;
 trigger meta_kept
@@ -492,6 +540,18 @@ trigger seam_handoffs_size
 CREATE TRIGGER seam_handoffs_size BEFORE INSERT ON seam_handoffs WHEN length(CAST(NEW.body AS BLOB)) > 16384 OR CASE WHEN json_valid(NEW.body) THEN COALESCE(json_array_length(NEW.body, '$.in_flight'), 0) > 50 OR COALESCE(json_array_length(NEW.body, '$.contingencies'), 0) > 50 ELSE 0 END BEGIN SELECT RAISE(ABORT, 'a seam handoff body is over its size cap'); END;
 trigger seam_handoffs_state_line
 CREATE TRIGGER seam_handoffs_state_line BEFORE INSERT ON seam_handoffs WHEN CASE WHEN json_valid(NEW.body) THEN COALESCE(json_type(NEW.body, '$.state_line'), '') != 'text' OR length(trim(json_extract(NEW.body, '$.state_line'), ' ' || char(9, 10, 11, 12, 13))) = 0 ELSE 1 END BEGIN SELECT RAISE(ABORT, 'a seam handoff needs a state_line'); END;
+trigger sensor_retirements_frozen
+CREATE TRIGGER sensor_retirements_frozen BEFORE UPDATE ON sensor_retirements BEGIN SELECT RAISE(ABORT, 'a sensor retirement is append-only'); END;
+trigger sensor_retirements_kept
+CREATE TRIGGER sensor_retirements_kept BEFORE DELETE ON sensor_retirements BEGIN SELECT RAISE(ABORT, 'a sensor retirement is append-only'); END;
+trigger sensor_retirements_no_replace
+CREATE TRIGGER sensor_retirements_no_replace BEFORE INSERT ON sensor_retirements WHEN EXISTS (SELECT 1 FROM sensor_retirements WHERE sensor_id = NEW.sensor_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a sensor is retired once'); END;
+trigger sensors_frozen
+CREATE TRIGGER sensors_frozen BEFORE UPDATE ON sensors BEGIN SELECT RAISE(ABORT, 'a sensor is append-only'); END;
+trigger sensors_kept
+CREATE TRIGGER sensors_kept BEFORE DELETE ON sensors BEGIN SELECT RAISE(ABORT, 'a sensor is append-only'); END;
+trigger sensors_no_replace
+CREATE TRIGGER sensors_no_replace BEFORE INSERT ON sensors WHEN EXISTS (SELECT 1 FROM sensors WHERE sensor_id = NEW.sensor_id OR gseq = NEW.gseq OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a sensor is never replaced'); END;
 trigger sessions_seen_forward
 CREATE TRIGGER sessions_seen_forward BEFORE UPDATE ON sessions_seen WHEN NEW.session_id IS NOT OLD.session_id OR NEW.first_seen IS NOT OLD.first_seen OR NEW.last_seen < OLD.last_seen BEGIN SELECT RAISE(ABORT, 'a seen session only moves its last sighting forward'); END;
 trigger sessions_seen_kept_recent

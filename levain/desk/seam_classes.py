@@ -33,6 +33,12 @@ COUNTED: frozenset[str] = frozenset({
     # the room (RM-A): each of these rows takes a gseq from next_gseq in its own transaction (room.py), so by the rule that
     # classified the drafts' tables it is counted: an opened or rotated room, a proposed drop, a drop note
     "room_events", "drop_proposals", "drop_notes",
+    # the night desk's events (ND-1, events.py): an event a sensor posted, a step of its delivery, an incident's close.
+    # Each row takes a gseq from next_gseq in its own transaction, so by the rule that classified the room's tables it is
+    # counted: things that happened since the operator left. event_states counts its ping annotations (pinging, pinged,
+    # ping_failed, ping_abandoned) with its lifecycle rows; counting it by kind is a later head call. Since names these
+    # rows by table alone (no seam.DETAIL_FIELDS entry), so an event's untrusted_text never reaches the brief
+    "events", "event_states", "incident_closes",
 })
 
 #: bookkeeping the brief never reports (``lease_events`` kinds claim, beat, release and ``launch_events`` kinds pending,
@@ -57,6 +63,16 @@ INFRASTRUCTURE: frozenset[str] = frozenset({
     # the board store's sightings (row 156 L2 F6): one row per session the service's listing showed, its first and last
     # sighting, no gseq. Evidence the applier reads, never something that happened since the operator left
     "sessions_seen",
+    # the night desk's sensors (ND-1, events.py): a registration, a retirement, a mail sensor's provider. Each takes a gseq
+    # in its own transaction, but a sensor enrolled or retired is configuration the operator or an installer made, read
+    # by the events' own views, not something that happened since the operator left; promoting any to COUNTED is the
+    # head's call
+    "sensors", "sensor_retirements", "mail_sensors",
+    # the night desk's incidents (ND-1): the row holds opened_gseq, not a gseq column, and the brief's counted head and
+    # Since read `gseq` from every COUNTED table, so it cannot be counted as it stands. Its opening is counted anyway: the
+    # event that opened it is an events row with its own gseq, and its close is counted in incident_closes. Promoting it
+    # (which needs a gseq column) is a later head call
+    "incidents",
 })
 
 _DISPATCH = ("ordered by dispatch's own transitions; the open brief does not report dispatch jobs (the board and the "

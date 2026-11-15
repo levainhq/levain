@@ -106,6 +106,7 @@ from typing import Any
 
 from levain import unshowable
 from levain.contracts.canon import canonical_bytes
+from levain.desk import events as events_mod
 from levain.desk import lease as lease_mod
 from levain.desk.lease import LEASE_TTL, LeaseRefused
 from levain.desk.store import CoordError, CoordStore
@@ -752,7 +753,10 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         lines.append(f"- `{d.drop_id}` ({d.surface}, {d.received_at}, {where}): {words}")
     lines.append("")
     lines.append(f"More: `{lv} drops list {tail}`.")
-    return "\n".join(lines) + "\n"
+    lines.append("")
+    # events are never drops: their own section, after the drops, written by the events module (it claims them)
+    lines.extend(events_mod.brief_lines(store, launch, lv, tail))
+    return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def _brief_dir(launch: Any) -> Path:
@@ -1516,6 +1520,12 @@ def _watch_pass(store: CoordStore, lines: list[str]) -> None:
     # outright stays pending until someone writes it expired, and only then does (d) stop the session it left
     _retire_removed(store, lines)
     store.coord_status()
+    # sensor events: claims move on, a stale one is retried then pinged, and a wake the rules allow is asked for here, so
+    # the launch it writes is started by the loop below in this same pass
+    try:
+        lines.extend(events_mod.progress(store)[0])
+    except Exception as exc:        # noqa: BLE001 - one bad row never halts the launches, slots and stops below
+        lines.append(f"events: the delivery pass could not run ({type(exc).__name__}: {exc})")
     lines.extend(_sweep_slots(store))          # a launch that ended between passes frees its slot before a start needs it
     for ln in store.launches_unspawned():
         if ln.harness != "claude":
@@ -1872,13 +1882,13 @@ def _replace_done(store: CoordStore, active: list[Any], listed: dict[str, dict[s
         try:
             got = store.launch_replace_done(ln.launch_id)
         except (CoordError, sqlite3.Error) as exc:
-            lines.append(f"launch {ln.launch_id}: done, and whether a drop it never saw waits could not be settled "
+            lines.append(f"launch {ln.launch_id}: done, and whether a drop or event it never saw waits could not be settled "
                          f"({exc})")
             continue
         if got is None:
             continue
         ended, new = got
-        lines.append(f"launch {ended.launch_id} ended: {cause_word(ended.cause)} (its session is done and a drop it never saw "
+        lines.append(f"launch {ended.launch_id} ended: {cause_word(ended.cause)} (its session is done and a drop or event it never saw "
                      "waits)")
         if new is None:
             continue
@@ -1892,7 +1902,7 @@ def _replace_done(store: CoordStore, active: list[Any], listed: dict[str, dict[s
 def wake_idle(store: CoordStore) -> tuple[Outcome | None, str]:
     """``levain desk wake`` when the store answered ``idle`` (a desk still running without the lease): the
     same ``claude agents --json`` listing the watcher reads; a desk whose row is ``done`` is ended (cause
-    :data:`levain.desk.lease.REPLACED`; you asked, so no unseen drop is needed), its session stopped and the
+    :data:`levain.desk.lease.REPLACED`; you asked, so nothing unseen is needed), its session stopped and the
     fresh desk the same transaction asked for started. ``(outcome, line)``: the outcome None and the line why
     when nothing was replaced (a row not done, a listing that cannot be read)."""
     way_out = "`levain desk release` ends it"

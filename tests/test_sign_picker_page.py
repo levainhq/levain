@@ -698,12 +698,15 @@ def test_b13_a_throw_at_the_start_of_the_ceremony_is_said_and_releases_the_card_
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
             {"eval": f"{_THROW_ONCE} && ({_REVOKE}.click(), 1)"},
             {"until": f"window.__threw && !{_REVOKE}.disabled && /page failed/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", "ms": 15000},
-            {"tap": _REVOKE},
-            {"until": f"/^revoked|^not revoked|^result unknown/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", "ms": 30000},
+            # the next tap's press can be lost to a board read's repaint (no click is made); it is pressed again only while the card
+            # still says the throw's word with its Revoke enabled, i.e. the ceremony has neither begun nor ended
+            {"tap": _REVOKE, "until": f"/^revoked|^not revoked|^result unknown/.test({_GRANT_NOTE}) && {_GRANT_NOTE}",
+             "retry_if": f"/page failed/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled", "report": _GRANT_NOTE, "ms": 30000},
         ])
     v = out["values"]
-    assert v[-3] == "the page failed (TypeError); nothing was revoked", v[-3]
+    assert v[-2] == "the page failed (TypeError); nothing was revoked", v[-2]
     assert v[-1].startswith("revoked"), v[-1]       # the lease was given back: the next tap ran the whole ceremony
+    _few_repressed(out)
     assert [a for _g, a, _r in rec.steps] == ["revoke-challenge", "revoke"], rec.steps
 
 
