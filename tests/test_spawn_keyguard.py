@@ -321,7 +321,9 @@ def test_warn_mode_records_and_does_not_raise_and_enforce_raises(wall, home, mon
 
 def test_mode_defaults_to_the_module_constant(monkeypatch):
     monkeypatch.delenv("LEVAIN_KEYGUARD", raising=False)
-    assert G.mode() == G._DEFAULT_MODE == "warn"
+    assert G.mode() == G._DEFAULT_MODE == "enforce"          # flipped from warn after CI showed an empty report (run 43668900872)
+    monkeypatch.setenv("LEVAIN_KEYGUARD", "Warn")
+    assert G.mode() == "warn"
     monkeypatch.setenv("LEVAIN_KEYGUARD", "Enforce")
     assert G.mode() == "enforce"
 
