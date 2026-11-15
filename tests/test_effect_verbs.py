@@ -33,7 +33,10 @@ pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="need
 FROM = "heather@client.example.com"
 ACK_LINE = {"verb": "send_ack", "args": {"voice": ["stand_in"], "known_from": [FROM, "gordley@client.example.com"]},
             "per_incident": 1, "per_night": 1}
+ARRIVED = [""]
 EVT = "evt-" + "a" * 32
+EVR = "evt-" + "b" * 32                 # a monitor event, the one a restart answers
+INC = "inc-" + "c" * 32
 GOOD_DRAFT = "Thank you for your message. It arrived and has been passed on."
 
 
@@ -42,6 +45,8 @@ def world(tmp_path) -> World:
     from levain.cockpit.firejournal import CockpitDB
     w = World(tmp_path)
     CockpitDB(w.root).set_install_class("reported")
+    from levain.cockpit.consent import utc_stamp
+    ARRIVED[0] = utc_stamp(w.clock.now)              # an event built without a time arrived when the world began
     return w
 
 
@@ -55,13 +60,22 @@ def event_for(raw: bytes, **over) -> Event:
     kw = dict(event_id=EVT, sensor_id="mail-1", sensor_seq=1, kind="mail", trust="authenticated",
               fields={"subject": "hi", "auth": "pass", "sender_class": "known", "category": "client"},
               untrusted_text=None, body_ref="sha256:" + hashlib.sha256(raw).hexdigest(), incident_id=None,
-              received_at="2026-11-15T00:00:00Z", state="received")
+              received_at=ARRIVED[0], state="received")
+    kw.update(over)
+    return Event(**kw)
+
+
+def monitor_event(**over) -> Event:
+    kw = dict(event_id=EVR, sensor_id="mon-1", sensor_seq=1, kind="site_status", trust="first_party",
+              fields={"subject": "taoserv", "state": "down"}, untrusted_text=None, body_ref=None, incident_id=INC,
+              received_at=ARRIVED[0], state="received")
     kw.update(over)
     return Event(**kw)
 
 
 class Rig:
     """The injected executors, recording every call."""
+    count = 0
 
     def __init__(self, world: World, raw: bytes | None = None, draft: str = GOOD_DRAFT) -> None:
         self.world = world
@@ -72,7 +86,13 @@ class Rig:
         self.sent: list[fx.AckMessage] = []
         self.looked: list[str] = []
         self.drafts: list[str] = []
-        self.event = event_for(self.raw)
+        from levain.cockpit.consent import utc_stamp
+        arrived = utc_stamp(world.clock.now)                 # the clock is the world's: an event arrives "now"
+        self.event = event_for(self.raw, received_at=arrived)
+        self.monitor = monitor_event(received_at=arrived)
+        from levain.desk.effect_attempts import Journal
+        Rig.count += 1                                        # a Rig is a fresh journal: a new process with no memory
+        self.journal = Journal(world.tmp / f"effect_attempts-{Rig.count}.db")
         rig = self
 
         class Transport:
@@ -90,14 +110,14 @@ class Rig:
 
         def events(event_id):
             self.looked.append(event_id)
-            return self.event
+            return self.monitor if event_id == EVR else self.event
 
         def drafter(event_id):
             self.drafts.append(event_id)
             return fx.Draft(self.draft, self.voice)
 
         kw = dict(data_root=self.world.root, clock=lambda: self.world.clock.now, runner=runner,
-                  transport=self.transport, events=events, raw_source=lambda ref: self.raw, drafter=drafter)
+                  transport=self.transport, events=events, raw_source=lambda ref: self.raw, drafter=drafter, journal=self.journal)
         kw.update(over)
         return fx.Effects(**kw)
 
@@ -120,13 +140,13 @@ def D(g: dict) -> str:
 def test_restart_service_runs_the_one_hard_coded_argv(world):
     g = signed(world)
     rig = Rig(world)
-    res = rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+    res = rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert res.ok and res.text == "restart_service taoserv apache2: exit 0"
     assert rig.runs == [["/usr/bin/ssh", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o",
                          "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=yes", "taoserv-night",
                          "restart_service", "apache2"]]
     rig.runs.clear()
-    rig.effects().restart_service(g["id"], "taoserv", "php8.1-fpm", expect_sha256=D(g))
+    rig.effects().restart_service(g["id"], "taoserv", "php8.1-fpm", event_id=EVR, expect_sha256=D(g))
     assert rig.runs[0][-2:] == ["restart_service", "php8.1-fpm"] and len(rig.runs[0]) == 13
 
 
@@ -179,7 +199,7 @@ def test_an_argument_outside_the_enum_is_refused_before_anything_runs(world, hos
     g = signed(world)
     rig = Rig(world)
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service(g["id"], host, service, expect_sha256=D(g))
+        rig.effects().restart_service(g["id"], host, service, event_id=EVR, expect_sha256=D(g))
     assert str(exc.value) == fx.R_ARGS and rig.untouched()
     if isinstance(service, str) and len(service) > 3:
         assert service not in str(exc.value)                   # the argument is never echoed
@@ -195,7 +215,7 @@ def test_a_str_subclass_is_not_an_enum_member(world):
     g = signed(world)
     rig = Rig(world)
     with pytest.raises(fx.EffectRefused):
-        rig.effects().restart_service(g["id"], "taoserv", Sneaky("mysql"), expect_sha256=D(g))
+        rig.effects().restart_service(g["id"], "taoserv", Sneaky("mysql"), event_id=EVR, expect_sha256=D(g))
     assert rig.untouched()
 
 
@@ -205,12 +225,12 @@ def test_an_order_id_of_the_wrong_shape_is_refused(world, order_id):
     signed(world)
     rig = Rig(world)
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service(order_id, "taoserv", "apache2", expect_sha256="0" * 64)
+        rig.effects().restart_service(order_id, "taoserv", "apache2", event_id=EVR, expect_sha256="0" * 64)
     assert str(exc.value) == fx.R_ARGS and rig.untouched()
 
 
 def test_no_verb_takes_free_text_or_a_recipient_as_an_argument():
-    allowed = {"restart_service": {"order_id", "host", "service", "expect_sha256"},
+    allowed = {"restart_service": {"order_id", "host", "service", "expect_sha256", "event_id"},
                "send_ack": {"order_id", "event_id", "expect_sha256"}}
     for name, names in allowed.items():
         params = set(inspect.signature(getattr(fx.Effects, name)).parameters) - {"self"}
@@ -225,7 +245,7 @@ def test_no_verb_takes_free_text_or_a_recipient_as_an_argument():
         for prop in schema["properties"].values():                 # every property is an enum or a fixed pattern
             assert "enum" in prop or "pattern" in prop
     assert set(mcp.TOOLS[1]["inputSchema"]["properties"]) == {"order_id", "order_sha256", "event_id"}
-    assert set(mcp.TOOLS[0]["inputSchema"]["properties"]) == {"order_id", "order_sha256", "host", "service"}
+    assert set(mcp.TOOLS[0]["inputSchema"]["properties"]) == {"order_id", "order_sha256", "host", "service", "event_id"}
 
 
 def test_the_enums_are_the_logs_own(world):
@@ -251,9 +271,9 @@ def test_an_order_that_covers_only_one_service_refuses_the_other(world):
     one = {**LINE, "args": {"host": ["taoserv"], "service": ["apache2"]}}
     g = signed(world, one)
     rig = Rig(world)
-    rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+    rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service(g["id"], "taoserv", "php8.1-fpm", expect_sha256=D(g))
+        rig.effects().restart_service(g["id"], "taoserv", "php8.1-fpm", event_id=EVR, expect_sha256=D(g))
     assert str(exc.value) == fx.R_LINE and len(rig.runs) == 1
 
 
@@ -261,7 +281,7 @@ def test_an_order_with_no_line_for_the_verb_refuses(world):
     g = signed(world, ACK_LINE)
     rig = Rig(world)
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+        rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert str(exc.value) == fx.R_LINE and rig.untouched()
     g2 = signed(world, LINE)
     with pytest.raises(fx.EffectRefused) as exc:
@@ -273,21 +293,21 @@ def test_an_unknown_expired_or_revoked_order_answers_nothing_before_any_effect(w
     g = signed(world)
     rig = Rig(world)
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service("so-" + "0" * 12, "taoserv", "apache2", expect_sha256="0" * 64)          # never signed
+        rig.effects().restart_service("so-" + "0" * 12, "taoserv", "apache2", event_id=EVR, expect_sha256="0" * 64)          # never signed
     assert str(exc.value) == fx.R_ORDER
-    ok = rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+    ok = rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert ok.ok and len(rig.runs) == 1
     world.link({"op": "revoke_grant", "grant_id": g["id"]}, today=True)                # revoked between two calls
-    for call in (lambda: rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g)),
+    for call in (lambda: rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g)),
                  lambda: rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))):
         with pytest.raises(fx.EffectRefused) as exc:
             call()
         assert str(exc.value) == fx.R_ORDER
-    assert len(rig.runs) == 1 and not (rig.sent or rig.looked or rig.drafts)
+    assert len(rig.runs) == 1 and not (rig.sent or rig.drafts) and rig.looked == [EVR]      # only the first call read an event
     g2 = signed(world)
     world.clock.now += timedelta(days=14, minutes=5)                                    # expired
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service(g2["id"], "taoserv", "apache2", expect_sha256=D(g2))
+        rig.effects().restart_service(g2["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g2))
     assert str(exc.value) == fx.R_ORDER and len(rig.runs) == 1
 
 
@@ -301,10 +321,10 @@ def test_a_revoked_signing_key_stops_the_verb(world):
     g = make(world, effect_lines=[LINE])
     sign(world, g, "laptop2")
     rig = Rig(world)
-    assert rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g)).ok
+    assert rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g)).ok
     world.link({"op": "revoke_key", "fingerprint": second.fp})
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+        rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert str(exc.value) == fx.R_ORDER and len(rig.runs) == 1
 
 
@@ -314,10 +334,10 @@ def test_a_widening_whose_own_expiry_passed_no_longer_adds_its_lines(world):
                 effect_lines=[LINE], life=timedelta(days=1))
     sign(world, wide)
     rig = Rig(world)
-    assert rig.effects().restart_service(wide["id"], "taoserv", "apache2", expect_sha256=D(wide)).ok
+    assert rig.effects().restart_service(wide["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(wide)).ok
     world.clock.now += timedelta(days=1, minutes=5)
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service(wide["id"], "taoserv", "apache2", expect_sha256=D(wide))
+        rig.effects().restart_service(wide["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(wide))
     assert str(exc.value) == fx.R_ORDER and len(rig.runs) == 1
 
 
@@ -325,10 +345,10 @@ def test_the_log_is_replayed_at_every_call_not_cached(world):
     g = signed(world)
     rig = Rig(world)
     effects = rig.effects()                                  # one Effects object across the revoke
-    assert effects.restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g)).ok
+    assert effects.restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g)).ok
     world.link({"op": "revoke_grant", "grant_id": g["id"]}, today=True)
     with pytest.raises(fx.EffectRefused):
-        effects.restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+        effects.restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert len(rig.runs) == 1
 
 
@@ -336,14 +356,14 @@ def test_a_log_that_cannot_be_read_and_a_naive_clock_refuse(world, tmp_path):
     g = signed(world)
     rig = Rig(world)
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects(data_root=tmp_path / "no-cockpit").restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+        rig.effects(data_root=tmp_path / "no-cockpit").restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert str(exc.value) == fx.R_ORDER
     with mock.patch.object(so, "read_state", side_effect=RuntimeError("boom")):
         with pytest.raises(fx.EffectRefused) as exc:
-            rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+            rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert str(exc.value) == fx.R_ORDER and "boom" not in str(exc.value)
     with pytest.raises(fx.EffectRefused):
-        rig.effects(clock=lambda: world.clock.now.replace(tzinfo=None)).restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+        rig.effects(clock=lambda: world.clock.now.replace(tzinfo=None)).restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert rig.untouched()
 
 
@@ -352,18 +372,18 @@ def test_the_order_version_asked_for_must_be_the_one_in_force(world):
     rig = Rig(world)
     state = world.state()
     digest = so.order_sha256(next(o for o in so.orders_in_force(state, world.clock.now) if o["id"] == g["id"]))
-    assert rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=digest).ok
+    assert rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=digest).ok
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256="0" * 64)
+        rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256="0" * 64)
     assert str(exc.value) == fx.R_VERSION and len(rig.runs) == 1
     with pytest.raises(fx.EffectRefused):
-        rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256="not a digest")
+        rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256="not a digest")
 
 
 def test_without_an_injected_runner_a_verb_does_nothing(world):
     g = signed(world)
     with pytest.raises(fx.EffectRefused) as exc:
-        fx.Effects(world.root, lambda: world.clock.now).restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+        fx.Effects(world.root, lambda: world.clock.now).restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert str(exc.value) == fx.R_NOT_WIRED
 
 
@@ -374,9 +394,10 @@ def test_a_runner_failure_returns_a_fixed_sentence_with_no_output(world):
     def boom(argv):
         raise RuntimeError("ssh said: password is hunter2")
 
-    res = rig.effects(runner=boom).restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
-    assert not res.ok and "hunter2" not in res.text and fx.R_FAILED in res.text
-    assert not rig.effects(runner=lambda a: 255).restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g)).ok
+    res = rig.effects(runner=boom).restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
+    assert not res.ok and "hunter2" not in res.text and fx.R_UNKNOWN in res.text        # it may have run: unknown
+    assert not rig.effects(runner=lambda a: 255).restart_service(g["id"], "taoserv", "php8.1-fpm", event_id=EVR,
+                                                                  expect_sha256=D(g)).ok
 
 
 # ---- send_ack: the recipient is pinned inside the tool -------------------------------------------------------------
@@ -586,7 +607,7 @@ def test_the_mcp_server_lists_two_tools_and_runs_them_through_the_verbs(world):
     listed = mcp.handle(effects, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
     assert [t["name"] for t in listed] == ["restart_service", "send_ack"]
     ok = call(effects, "restart_service", {"order_id": g["id"], "order_sha256": D(g), "host": "taoserv",
-                                           "service": "apache2"})
+                                           "service": "apache2", "event_id": EVR})
     assert ok["isError"] is False and "exit 0" in ok["content"][0]["text"] and len(rig.runs) == 1
     sent = call(effects, "send_ack", {"order_id": g["id"], "order_sha256": D(g), "event_id": EVT})
     assert sent["isError"] is False and rig.sent[0].recipient == FROM
@@ -596,15 +617,15 @@ _SO, _SHA0 = "so-" + "a" * 12, "a" * 64
 
 
 @pytest.mark.parametrize("name,arguments", [
-    ("restart_service", {"order_sha256": _SHA0, "host": "taoserv", "service": "apache2"}),
+    ("restart_service", {"order_sha256": _SHA0, "host": "taoserv", "service": "apache2", "event_id": EVR}),
     ("restart_service", {"order_id": _SO, "order_sha256": _SHA0, "host": "taoserv", "service": "apache2",
                          "command": "id"}),
     ("restart_service", {"order_id": _SO, "order_sha256": _SHA0, "host": "taoserv", "service": "mysql"}),
-    ("restart_service", {"order_id": _SO, "host": "taoserv", "service": "apache2"}),          # no version: refused
-    ("restart_service", {"order_id": _SO, "order_sha256": "A" * 64, "host": "taoserv", "service": "apache2"}),
-    ("restart_service", {"order_id": _SO, "order_sha256": _SHA0 + "\n", "host": "taoserv", "service": "apache2"}),
-    ("restart_service", {"order_id": _SO, "order_sha256": None, "host": "taoserv", "service": "apache2"}),
-    ("restart_service", {"order_id": _SO, "expect_sha256": _SHA0, "host": "taoserv", "service": "apache2"}),
+    ("restart_service", {"order_id": _SO, "host": "taoserv", "service": "apache2", "event_id": EVR}),          # no version: refused
+    ("restart_service", {"order_id": _SO, "order_sha256": "A" * 64, "host": "taoserv", "service": "apache2", "event_id": EVR}),
+    ("restart_service", {"order_id": _SO, "order_sha256": _SHA0 + "\n", "host": "taoserv", "service": "apache2", "event_id": EVR}),
+    ("restart_service", {"order_id": _SO, "order_sha256": None, "host": "taoserv", "service": "apache2", "event_id": EVR}),
+    ("restart_service", {"order_id": _SO, "expect_sha256": _SHA0, "host": "taoserv", "service": "apache2", "event_id": EVR}),
     ("send_ack", {"order_id": _SO, "order_sha256": _SHA0, "event_id": EVT, "to": "attacker@evil.example"}),
     ("send_ack", {"order_id": _SO, "order_sha256": _SHA0, "event_id": EVT, "text": "hello"}),
     ("send_ack", {"order_id": _SO, "order_sha256": _SHA0}),
@@ -628,7 +649,7 @@ def test_the_mcp_server_has_no_other_tool_and_a_fault_is_a_fixed_sentence(world)
     assert err["error"]["code"] == mcp.INVALID_PARAMS and rig.untouched()
     with mock.patch.object(fx.Effects, "restart_service", side_effect=RuntimeError("secret detail")):
         res = call(rig.effects(), "restart_service", {"order_id": _SO, "order_sha256": _SHA0, "host": "taoserv",
-                                                      "service": "apache2"})
+                                                      "service": "apache2", "event_id": EVR})
     assert res["content"][0]["text"] == fx.R_FAILED and "secret" not in json.dumps(res)
 
 
@@ -637,7 +658,7 @@ def test_serve_answers_line_by_line_and_main_wires_no_executor(world):
     frames = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
               {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                "params": {"name": "restart_service", "arguments": {"order_id": g["id"], "order_sha256": D(g),
-                                                                   "host": "taoserv", "service": "apache2"}}}]
+                                                                   "host": "taoserv", "service": "apache2", "event_id": EVR}}}]
     out = io.StringIO()
     mcp.serve(fx.Effects(world.root, lambda: world.clock.now), io.StringIO("\n".join(json.dumps(f) for f in frames) + "\nnot json\n"), out)
     replies = [json.loads(line) for line in out.getvalue().splitlines()]
@@ -655,7 +676,7 @@ def test_every_verb_call_must_name_the_orders_version(world):
         rig.effects().send_ack(g["id"], EVT)
     for sha in (None, "A" * 64, "sha256:" + D(g), D(g)[:63], 7):
         with pytest.raises(fx.EffectRefused) as exc:
-            rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=sha)
+            rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=sha)
         assert str(exc.value) == fx.R_ARGS
     assert rig.untouched()
 
@@ -672,7 +693,7 @@ def test_an_order_revoked_and_signed_again_differently_under_its_id_refuses_the_
     rig.voice = "flow"
     effects = rig.effects()
     for name, args in (("restart_service", {"order_id": g["id"], "order_sha256": old, "host": "taoserv",
-                                            "service": "apache2"}),
+                                            "service": "apache2", "event_id": EVR}),
                        ("send_ack", {"order_id": g["id"], "order_sha256": old, "event_id": EVT})):
         res = call(effects, name, args)
         assert res["isError"] is True and res["content"][0]["text"] == fx.R_VERSION
@@ -719,7 +740,7 @@ def test_restart_service_replays_the_order_again_immediately_before_the_process(
 
     with mock.patch.object(fx, "restart_argv", side_effect=revoke_then_argv):
         with pytest.raises(fx.EffectRefused) as exc:
-            rig.effects().restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+            rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert str(exc.value) == fx.R_ORDER and not rig.runs
 
 
@@ -825,14 +846,14 @@ def test_an_executors_own_effect_refused_never_carries_its_text_out_of_restart_s
     def boom(*a):
         raise raised
 
-    args = {"order_id": g["id"], "order_sha256": D(g), "host": "taoserv", "service": "apache2"}
+    args = {"order_id": g["id"], "order_sha256": D(g), "host": "taoserv", "service": "apache2", "event_id": EVR}
     if which == "runner":                             # a runner's fault is a failed run, never a refusal
-        res = rig.effects(**{which: boom}).restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
-        expected = f"restart_service taoserv apache2: {fx.R_FAILED}"
+        res = rig.effects(**{which: boom}).restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
+        expected = f"restart_service taoserv apache2: {fx.R_UNKNOWN}"      # it may have run: recorded unknown
         assert not res.ok and res.text == expected
     else:                                             # a clock's fault is the gate's "no order"
         with pytest.raises(fx.EffectRefused) as exc:
-            rig.effects(**{which: boom}).restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+            rig.effects(**{which: boom}).restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
         expected = fx.R_ORDER
         assert type(exc.value) is fx._OwnRefusal and str(exc.value) == expected
     res = call(rig.effects(**{which: boom}), "restart_service", args)
@@ -842,7 +863,7 @@ def test_an_executors_own_effect_refused_never_carries_its_text_out_of_restart_s
 
 def test_the_mcp_server_returns_only_this_modules_fixed_refusals(world):
     rig = Rig(world)
-    args = {"order_id": _SO, "order_sha256": _SHA0, "host": "taoserv", "service": "apache2"}
+    args = {"order_id": _SO, "order_sha256": _SHA0, "host": "taoserv", "service": "apache2", "event_id": EVR}
     for raised in _EXECUTOR_RAISES:                   # the verb itself raising, past every check inside it
         with mock.patch.object(fx.Effects, "restart_service", side_effect=raised):
             res = call(rig.effects(), "restart_service", args)
@@ -934,9 +955,9 @@ def test_an_executor_naming_a_module_reason_gets_the_verbs_fixed_fallback(world,
     """Every executor raising plain ``EffectRefused(r)`` for every ``r`` in REFUSALS ends as the verb's fallback, at the
     verb and through MCP: the module never repeats a reason an executor chose."""
     g = signed(world)
-    rs_args = {"order_id": g["id"], "order_sha256": D(g), "host": "taoserv", "service": "apache2"}
+    rs_args = {"order_id": g["id"], "order_sha256": D(g), "host": "taoserv", "service": "apache2", "event_id": EVR}
     sa_args = {"order_id": g["id"], "order_sha256": D(g), "event_id": EVT}
-    failed_run = f"restart_service taoserv apache2: {fx.R_FAILED}"
+    failed_run = f"restart_service taoserv apache2: {fx.R_UNKNOWN}"      # an executor fault may have run: unknown
     # (verb, executor override, the fallback text, raised or returned)
     cases = [("restart_service", {"clock": _raising(reason)}, fx.R_ORDER, "raised"),
              ("send_ack", {"clock": _raising(reason)}, fx.R_ORDER, "raised"),
@@ -944,11 +965,11 @@ def test_an_executor_naming_a_module_reason_gets_the_verbs_fixed_fallback(world,
              ("send_ack", {"events": _raising(reason)}, fx.R_FAILED, "raised"),
              ("send_ack", {"raw_source": _raising(reason)}, fx.R_FAILED, "raised"),
              ("send_ack", {"drafter": _raising(reason)}, fx.R_FAILED, "raised"),
-             ("send_ack", {"transport": _RaisingTransport(reason)}, f"send_ack: {fx.R_FAILED}", "returned")]
+             ("send_ack", {"transport": _RaisingTransport(reason)}, f"send_ack: {fx.R_UNKNOWN}", "returned")]
     for verb, over, fallback, how in cases:
         rig = Rig(world)
         effects = rig.effects(**over)
-        kw = dict(host="taoserv", service="apache2") if verb == "restart_service" else dict(event_id=EVT)
+        kw = dict(host="taoserv", service="apache2", event_id=EVR) if verb == "restart_service" else dict(event_id=EVT)
         if how == "raised":
             with pytest.raises(fx.EffectRefused) as exc:
                 getattr(effects, verb)(g["id"], expect_sha256=D(g), **kw)
@@ -976,10 +997,10 @@ def test_the_modules_own_refusals_pass_through_unchanged(world):
     rig = Rig(world)                                              # subprocess_runner's own R_ARGS, reached by a runner
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects(runner=lambda argv: fx.subprocess_runner([])).restart_service(
-            g["id"], "taoserv", "apache2", expect_sha256=D(g))
+            g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_ARGS
     for bad in (lambda: fx.restart_argv("taoserv", "mysql"), lambda: fx.inbound_from(b"x"),
-                lambda: rig.effects().restart_service("so-x", "taoserv", "apache2", expect_sha256=D(g))):
+                lambda: rig.effects().restart_service("so-x", "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))):
         with pytest.raises(fx.EffectRefused) as exc:
             bad()
         assert type(exc.value) is fx._OwnRefusal and fx.refusal_text(exc.value) == str(exc.value)
@@ -1075,14 +1096,16 @@ def test_a_well_formed_message_with_a_folded_subject_and_a_multipart_body_is_fin
 def test_the_result_texts_are_only_the_modules_constants_and_the_called_enum_members(world):
     """What effects_mcp returns verbatim for a result: every form the verbs compose, pinned."""
     g = signed(world)
-    rig = Rig(world)
     forms = set()
     for host in fx.HOSTS:
         for service in fx.SERVICES:
-            for runner in (lambda a: 0, lambda a: 1, lambda a: "0", _raising(fx.R_ARGS)):
-                forms.add(rig.effects(runner=runner).restart_service(g["id"], host, service, expect_sha256=D(g)).text)
+            for runner in (lambda a: 0, lambda a: 1, lambda a: "0", lambda a: -1, _raising(fx.R_ARGS)):
+                rig = Rig(world)                                  # a fresh journal each: a retry would answer the record
+                forms.add(rig.effects(runner=runner).restart_service(g["id"], host, service, event_id=EVR, expect_sha256=D(g)).text)
+    rig = Rig(world)
     forms.add(rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g)).text)
+    rig = Rig(world)
     forms.add(rig.effects(transport=_RaisingTransport(fx.R_FROM)).send_ack(g["id"], EVT, expect_sha256=D(g)).text)
     allowed = {f"restart_service {h} {s}: {tail}" for h in fx.HOSTS for s in fx.SERVICES
-               for tail in ("exit 0", fx.R_FAILED)} | {"send_ack: sent", f"send_ack: {fx.R_FAILED}"}
+               for tail in ("exit 0", fx.R_FAILED, fx.R_UNKNOWN)} | {"send_ack: sent", f"send_ack: {fx.R_UNKNOWN}"}
     assert forms == allowed

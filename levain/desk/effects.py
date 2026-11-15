@@ -25,8 +25,17 @@ that cannot be read, or any fault, refuses. Refusals come before any event read,
 the gate runs AGAIN immediately before the process or the send, which go ahead only if it finds the same record and
 the same incarnation as the first.
 
-NOT HERE (the next rows): the per-incident and per-night budgets, the arm record, ``NIGHT_ARMING_CLEARED`` and the
-``effect_attempts`` journal are ND-3b; the night key and its forced-command list are ND-8 (:data:`FORCED_WORDS` names
+EXECUTION-TIME BUDGETS AND THE JOURNAL (ND-3b, board levain#12, :mod:`levain.desk.effect_attempts`): an effect is
+reserved on the journal BEFORE it runs, in one transaction that also counts and consumes the order line's per-incident
+and per-night budgets (never check-then-act); the reservation is written ``unknown``, so a process that dies mid-effect
+leaves one ``unknown`` row, never retried and never sent twice. A retry of a settled or unknown effect (the same event,
+verb and arguments) answers the recorded status and runs nothing; a transport or runner fault, and a timeout, record
+``unknown``. After the reservation the order is replayed one more time and the effect runs only if it is the same
+version. ``restart_service`` takes the monitor event it answers (its incident is derived from it); every event must be
+within :data:`EVENT_MAX_AGE`; the sender the journal row holds must equal the message's recipient and be on the order's
+list. A refusal this module raises is recorded with its fixed reason.
+
+NOT HERE (the next rows): the arm record (O1) and ``NIGHT_ARMING_CLEARED`` (ND-11); the night key and its forced-command list are ND-8 (:data:`FORCED_WORDS` names
 the words it must accept); the live mail credential is open (ND_BUILD_PLAN O8). Until
 those land the executors are injected: an :class:`Effects` with no runner, transport, event lookup, raw source or
 drafter refuses with :data:`R_NOT_WIRED`. This module imports no mail library and holds no credential.
@@ -39,7 +48,7 @@ import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.parser import BytesHeaderParser
 from email.utils import getaddresses
 from pathlib import Path
@@ -47,11 +56,13 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 from levain.authority import _SO_VERBS, STANDING_ORDER_VOICES, _require_aware
+from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.desk import standing_orders
+from levain.desk.effect_attempts import BudgetSpent, Journal, idem_key, night_key
 from levain.desk.events import Event
 
 __all__ = ["ACK_FROM_LOCAL", "ACK_SUBJECT", "ACK_WORDS_MAX", "AckMessage", "AckTransport", "DIAGNOSIS_WORDS", "DISCLOSURES",
-           "Draft", "EffectRefused", "EffectResult", "Effects", "FORCED_WORDS", "HOSTS", "NIGHT_ALIAS", "NIGHT_SSH", "REFUSALS",
+           "Draft", "EVENT_FUTURE_SKEW", "EVENT_MAX_AGE", "EffectRefused", "EffectResult", "Effects", "FORCED_WORDS", "HOSTS", "NIGHT_ALIAS", "NIGHT_CUT_HOUR_UTC", "NIGHT_SSH", "REFUSALS",
            "SERVICES", "VOICES", "ack_text_refusal", "diagnosis_argv", "inbound_from", "refusal_text", "restart_argv",
            "subprocess_runner"]
 
@@ -75,6 +86,7 @@ _ORDER_ID = re.compile(r"so-[0-9a-f]{12}")
 _EVENT_ID = re.compile(r"evt-[0-9a-f]{32}")
 _SHA = re.compile(r"[0-9a-f]{64}")
 _BODY_REF = re.compile(r"sha256:[0-9a-f]{64}")
+_INCIDENT_ID = re.compile(r"inc-[0-9a-f]{32}")
 #: an address, stricter than the log's (ND-2 L3 recorded the log's domain class admits a leading dot or dash): labels of
 #: letters, digits and inner hyphens, no empty label, no dot or hyphen at a label edge in the local part.
 _ADDR = re.compile(r"[a-z0-9](?:[a-z0-9._%+-]{0,62}[a-z0-9])?@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}")
@@ -95,6 +107,15 @@ DISCLOSURES: Mapping[str, str] = MappingProxyType({
 })
 VOICES = tuple(DISCLOSURES)
 _REMOTE_TIMEOUT = 60
+#: the oldest an event may be when an effect runs for it (the night's length, the same bound an incident stays open), and
+#: the most it may be in the future (clock skew): an event outside either is refused. The order's own window is the arm
+#: record's (O1); until that lands this is the window.
+EVENT_MAX_AGE = timedelta(hours=12)
+EVENT_FUTURE_SKEW = timedelta(minutes=5)
+#: a night's budget counts from one cut to the next (UTC hour); see :func:`levain.desk.effect_attempts.night_key`
+NIGHT_CUT_HOUR_UTC = 12
+#: the kinds of event a restart may answer: a monitor's own report on an incident, never mail
+_RESTART_KINDS = ("site_status", "heartbeat", "report")
 
 # --- fixed refusal sentences: nothing an argument, an event or a server said is ever echoed ----------------------------
 R_ARGS = "an argument is not one of the verb's allowed values, or one is missing or extra: nothing was done"
@@ -109,6 +130,11 @@ R_DRAFT = "there is no draft to send: nothing was done"
 R_VOICE = "the draft's voice is missing, is not a known voice, or is not the voice the order names: nothing was done"
 R_DISCLOSURE = "the draft holds the disclosure line itself, which only the send tool writes: nothing was done"
 R_FAILED = "the effect did not complete"
+R_UNKNOWN = "the effect may have run; its outcome is unknown and it is not retried"
+R_BUDGET_INCIDENT = "the order's budget for this incident is spent: nothing was done"
+R_BUDGET_NIGHT = "the order's budget for this night is spent: nothing was done"
+R_EVENT_AGE = "the event is older than the order's window, or from the future: nothing was done"
+R_SENDER = "the sender recorded for this effect is not the order's pinned recipient: nothing was done"
 # the lexical check's fixed reasons (:func:`ack_text_refusal`)
 R_TEXT_SHAPE = "the draft is not one short text"
 R_TEXT_CHARS = "the draft holds a character outside printable ASCII"
@@ -121,6 +147,7 @@ R_TEXT_WORD = "the draft holds a date, time, price, commitment, attachment or li
 R_TEXT_PHRASE = "the draft holds a commitment phrase"
 #: every sentence this module refuses with, and the only text a refusal may carry out (:func:`refusal_text`)
 REFUSALS = frozenset({R_ARGS, R_ORDER, R_LINE, R_VERSION, R_NOT_WIRED, R_EVENT, R_FROM, R_DRAFT, R_VOICE, R_DISCLOSURE, R_FAILED,
+                      R_UNKNOWN, R_BUDGET_INCIDENT, R_BUDGET_NIGHT, R_EVENT_AGE, R_SENDER,
                       R_TEXT_SHAPE, R_TEXT_CHARS, R_TEXT_LINES, R_TEXT_WORDS, R_TEXT_DIGIT, R_TEXT_SYMBOL, R_TEXT_DOTTED,
                       R_TEXT_WORD, R_TEXT_PHRASE})
 
@@ -429,7 +456,8 @@ class Effects:
     ``data_root`` is the cockpit whose authority log the verbs replay at every call. ``runner`` runs an argv;
     ``transport`` sends one :class:`AckMessage`; ``events`` returns the :class:`Event` for an id (or None);
     ``raw_source`` returns the raw message bytes for a ``body_ref`` (ND-4's store); ``drafter`` returns the sealed
-    drafter's :class:`Draft` (text and voice) for an event id; a bare ``str`` has no voice and is refused. A missing executor refuses (:data:`R_NOT_WIRED`) after the gate, never acts."""
+    drafter's :class:`Draft` (text and voice) for an event id; a bare ``str`` has no voice and is refused; ``journal`` is the
+    :class:`~levain.desk.effect_attempts.Journal` every effect is reserved on before it runs. A missing executor or journal refuses (:data:`R_NOT_WIRED`) after the gate, never acts."""
     data_root: Path
     clock: Callable[[], datetime]
     runner: Runner | None = None
@@ -437,6 +465,8 @@ class Effects:
     events: Callable[[str], Event | None] | None = None
     raw_source: Callable[[str], bytes | None] | None = None
     drafter: Callable[[str], Draft] | None = None
+    journal: Journal | None = None
+    night_cut_hour_utc: int = NIGHT_CUT_HOUR_UTC
 
     def gate(self, order_id: str, verb: str, *, expect_sha256: str) -> tuple[Mapping[str, Any], list[Any]]:
         """Replay the authority log NOW and return (the order, its effect lines for ``verb``). Refuses unless the
@@ -466,10 +496,9 @@ class Effects:
         return order, lines
 
     def _still(self, order_id: str, verb: str, sha: str, first: Mapping[str, Any]) -> None:
-        """The gate once more, immediately before the effect: the order must still answer, as the same record (the
-        same digest) and the same incarnation (not revoked and signed again under its id meanwhile) as the first
-        replay found. A second replay narrows the window to the dispatch itself; the reservation that closes it is
-        ND-3b's attempts journal."""
+        """The gate once more, AFTER the reservation and immediately before the effect: the order must still answer,
+        as the same record (the same digest) and the same incarnation (not revoked and signed again under its id
+        meanwhile) as the first replay found. The effect is bound to the version it was requested under."""
         again, _lines = self.gate(order_id, verb, expect_sha256=sha)
         try:
             same = (standing_orders.order_sha256(again) == standing_orders.order_sha256(first)
@@ -479,38 +508,167 @@ class Effects:
         if not same:
             raise _OwnRefusal(R_VERSION)
 
-    def restart_service(self, order_id: Any, host: Any, service: Any, *, expect_sha256: Any) -> EffectResult:
+    # --- the journal: refusals are recorded, a reservation is written before any effect --------------------------
+    def _now(self) -> datetime:
+        now = self.clock()
+        _require_aware(now)
+        return now
+
+    def _noted(self, order_id: str, verb: str, event_id: str, call: Callable[[], EffectResult]) -> EffectResult:
+        """Run ``call``; a refusal this module raised is recorded (order, verb, event, its fixed sentence) and re-raised
+        unchanged. Recording is best effort and never changes the refusal."""
+        try:
+            return call()
+        except EffectRefused as exc:
+            if _trusted(exc) and self.journal is not None:
+                try:
+                    self.journal.note_refusal(order_id, verb, event_id, exc.args[0], utc_stamp(self._now()))
+                except Exception:                           # noqa: BLE001 - a clock or file fault changes nothing
+                    pass
+            raise
+
+    def _event_age(self, event: Event) -> None:
+        """An event older than :data:`EVENT_MAX_AGE`, or more than :data:`EVENT_FUTURE_SKEW` ahead of the clock, or whose
+        arrival time cannot be read, is refused: an old event is not a reason to act now."""
+        try:
+            age = self._now() - parse_stamp(event.received_at)
+        except Exception:                                   # noqa: BLE001 - an unreadable stamp is no age
+            raise _OwnRefusal(R_EVENT_AGE) from None
+        if age > EVENT_MAX_AGE or -age > EVENT_FUTURE_SKEW:
+            raise _OwnRefusal(R_EVENT_AGE)
+
+    @staticmethod
+    def _recorded(label: str, ok_text: str, status: str) -> EffectResult:
+        """What an attempt already on the journal answers: its recorded status, in this module's own words (a settled or
+        unknown effect is never run again)."""
+        if status == "ok":
+            return EffectResult(label, True, ok_text)
+        return EffectResult(label, False, f"{ok_text.split(':')[0]}: " + (R_UNKNOWN if status == "unknown" else R_FAILED))
+
+    def _reserve(self, *, key: str, order: Mapping[str, Any], verb: str, event_id: str, args_digest: str,
+                 recipient: str | None, incident_scope: str, night_scope: str, covering: Sequence[Any]) -> Any:
+        """The atomic reservation: the budgets are counted and the ``unknown`` row written in ONE transaction. Returns
+        ``(attempt, fresh)``; a spent budget refuses, and any fault in the journal refuses (nothing runs on an
+        effect that could not be recorded)."""
+        assert self.journal is not None
+        try:
+            per_incident = min(int(ln["per_incident"]) for ln in covering)
+            per_night = min(int(ln["per_night"]) for ln in covering)
+            return self.journal.reserve(
+                key=key, order_id=order["id"], order_sha256=standing_orders.order_sha256(order),
+                incarnation=int(order.get("incarnation", 0)), verb=verb, event_id=event_id, args_digest=args_digest,
+                recipient=recipient, incident_scope=incident_scope, night_scope=night_scope, per_incident=per_incident,
+                per_night=per_night, now=utc_stamp(self._now()))
+        except BudgetSpent as spent:
+            raise _OwnRefusal(R_BUDGET_INCIDENT if spent.which == "incident" else R_BUDGET_NIGHT) from None
+        except Exception as exc:                            # noqa: BLE001 - an unrecorded effect never runs
+            if _trusted(exc):
+                raise
+            raise _OwnRefusal(R_FAILED) from None
+
+    def _settle(self, attempt: Any, status: str) -> None:
+        """Write the result. Best effort: a fault here leaves the row ``unknown``, the safe reading (never a retry)."""
+        assert self.journal is not None
+        try:
+            self.journal.settle(attempt.attempt_id, status, utc_stamp(self._now()))
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def _dispatch(self, attempt: Any, order_id: str, verb: str, sha: str, order: Mapping[str, Any],
+                  go: Callable[[], str]) -> str:
+        """After the reservation: replay the order ONE more time (a revoke, a widening's lapse or a new signing between
+        the request and now refuses, the attempt settled ``refused``: nothing ran), then ``go()``, which runs the effect
+        and returns ``ok``, ``failed`` or ``unknown``. A fault escaping ``go`` is ``unknown``. An :class:`EffectRefused`
+        this module raised before the effect left the process is ``refused`` and propagates."""
+        try:
+            self._still(order_id, verb, sha, order)
+        except EffectRefused:
+            self._settle(attempt, "refused")
+            raise
+        try:
+            status = go()
+        except EffectRefused as exc:
+            if _trusted(exc):                               # our own refusal, raised before anything was sent
+                self._settle(attempt, "refused")
+                raise
+            status = "unknown"
+        except Exception:                                   # noqa: BLE001 - may have run: unknown, never retried
+            status = "unknown"
+        if status not in ("ok", "failed"):
+            status = "unknown"
+        self._settle(attempt, status)
+        return status
+
+    # --- the verbs --------------------------------------------------------------------------------------------
+    def restart_service(self, order_id: Any, host: Any, service: Any, *, expect_sha256: Any,
+                        event_id: Any) -> EffectResult:
         """Restart ``service`` on ``host`` under order ``order_id`` at version ``expect_sha256`` (the digest the
-        desk's brief prints beside the order)."""
+        desk's brief prints beside the order), answering the incident of the monitor event ``event_id`` (the incident is
+        derived from the event, never an argument). Idempotent on (event, verb, host, service)."""
         order_id = _shaped(order_id, _ORDER_ID)
         host, service = _enum(host, HOSTS), _enum(service, SERVICES)
-        sha = _shaped(expect_sha256, _SHA)
+        sha, event_id = _shaped(expect_sha256, _SHA), _shaped(event_id, _EVENT_ID)
+        return self._noted(order_id, "restart_service", event_id,
+                           lambda: self._restart(order_id, host, service, sha, event_id))
+
+    def _restart(self, order_id: str, host: str, service: str, sha: str, event_id: str) -> EffectResult:
         order, lines = self.gate(order_id, "restart_service", expect_sha256=sha)
-        if not any(host in ln["args"]["host"] and service in ln["args"]["service"] for ln in lines):
+        covering = [ln for ln in lines if host in ln["args"]["host"] and service in ln["args"]["service"]]
+        if not covering:
             raise _OwnRefusal(R_LINE)
-        if self.runner is None:
+        if self.runner is None or self.events is None or self.journal is None:
             raise _OwnRefusal(R_NOT_WIRED)
         argv = restart_argv(host, service)
-        self._still(order_id, "restart_service", sha, order)
-        try:
+        incident = self._incident(event_id)
+        args_digest = hashlib.sha256(f"{host}|{service}".encode()).hexdigest()
+        key = idem_key(event_id, "restart_service", args_digest)
+        label = f"restart_service {host} {service}"
+        ok_text = f"{label}: exit 0"
+        night = night_key(self._now(), self.night_cut_hour_utc)
+        attempt, fresh = self._reserve(key=key, order=order, verb="restart_service", event_id=event_id,
+                                       args_digest=args_digest, recipient=None, incident_scope=f"{service}|{incident}",
+                                       night_scope=night, covering=covering)
+        if not fresh:
+            return self._recorded(label, ok_text, attempt.status)
+
+        def go() -> str:
+            assert self.runner is not None
             code = self.runner(argv)
-        except Exception as exc:                            # noqa: BLE001 - the runner's fault never carries text out
-            if _trusted(exc):                               # e.g. subprocess_runner's own R_ARGS; a runner's
-                raise                                       # EffectRefused, any reason, is a failed run
-            return EffectResult("restart_service", False, f"restart_service {host} {service}: {R_FAILED}")
-        ok = type(code) is int and code == 0
-        return EffectResult("restart_service", ok, f"restart_service {host} {service}: "
-                            + ("exit 0" if ok else R_FAILED))
+            if type(code) is int and code == 0:
+                return "ok"
+            return "unknown" if code == -1 else "failed"     # -1: a timeout or no start: it may have run
+
+        status = self._dispatch(attempt, order_id, "restart_service", sha, order, go)
+        return self._recorded(label, ok_text, status)
+
+    def _incident(self, event_id: str) -> str:
+        """The incident of the monitor event ``event_id``: a non-mail event of a monitor's own, authenticated or first
+        party, in an incident, not older than the window. Anything else refuses."""
+        assert self.events is not None
+        try:
+            event = self.events(event_id)
+        except Exception:                                   # noqa: BLE001 - an executor's fault never carries text out
+            raise _OwnRefusal(R_FAILED) from None
+        if (not isinstance(event, Event) or event.event_id != event_id or event.kind not in _RESTART_KINDS
+                or event.trust not in ("authenticated", "first_party") or type(event.incident_id) is not str
+                or _INCIDENT_ID.fullmatch(event.incident_id) is None):
+            raise _OwnRefusal(R_EVENT)
+        self._event_age(event)
+        return event.incident_id
 
     def send_ack(self, order_id: Any, event_id: Any, *, expect_sha256: Any) -> EffectResult:
         """Send the ack for ``event_id`` under order ``order_id`` at version ``expect_sha256``. The recipient is
         derived here (never an argument) from the raw message the event's digest names, and must be on the order
-        line's ``known_from``. The order is replayed again after the slow part (event, message, drafter) and
-        immediately before the send."""
+        line's ``known_from``. The order is replayed again after the reservation and immediately before the send.
+        Idempotent on the event: a retry returns the recorded result and never sends twice."""
         order_id, event_id = _shaped(order_id, _ORDER_ID), _shaped(event_id, _EVENT_ID)
         sha = _shaped(expect_sha256, _SHA)
+        return self._noted(order_id, "send_ack", event_id, lambda: self._ack(order_id, event_id, sha))
+
+    def _ack(self, order_id: str, event_id: str, sha: str) -> EffectResult:
         order, lines = self.gate(order_id, "send_ack", expect_sha256=sha)
-        if self.events is None or self.raw_source is None or self.drafter is None or self.transport is None:
+        if (self.events is None or self.raw_source is None or self.drafter is None or self.transport is None
+                or self.journal is None):
             raise _OwnRefusal(R_NOT_WIRED)
         try:
             sender = getattr(self.transport, "sender", None)
@@ -519,11 +677,22 @@ class Effects:
         if type(sender) is not str or _SENDER.fullmatch(sender) is None:
             raise _OwnRefusal(R_NOT_WIRED)                # the transport speaks only as thirdmind@
         try:
-            recipient, voice = self._recipient(event_id, lines)
-            draft = self.drafter(event_id)
+            recipient, voice, covering, incident = self._recipient(event_id, lines)
         except Exception as exc:                            # noqa: BLE001 - an executor's fault never carries text out
             if _trusted(exc):                               # only this module's own refusals (inbound_from, the
                 raise                                       # event checks) pass; an executor's is R_FAILED
+            raise _OwnRefusal(R_FAILED) from None
+        key = idem_key(event_id, "send_ack", hashlib.sha256(b"").hexdigest())
+        done = self.journal.lookup(key)                     # a settled or unknown effect answers before any drafting
+        if done is not None and done.status != "refused":
+            if done.recipient != recipient:
+                raise _OwnRefusal(R_SENDER)
+            return self._recorded("send_ack", "send_ack: sent", done.status)
+        try:
+            draft = self.drafter(event_id)
+        except Exception as exc:                            # noqa: BLE001
+            if _trusted(exc):
+                raise
             raise _OwnRefusal(R_FAILED) from None
         if draft is None:                                   # the drafter wrote nothing; any other non-Draft has no voice
             raise _OwnRefusal(R_DRAFT)
@@ -538,16 +707,27 @@ class Effects:
         message = AckMessage(sender=sender, recipient=recipient, subject=ACK_SUBJECT,
                              body=draft.text.strip() + "\n\n" + DISCLOSURES[voice],
                              headers={"Auto-Submitted": "auto-replied"})
-        self._still(order_id, "send_ack", sha, order)
-        try:
-            self.transport.send(message)
-        except Exception:                                   # noqa: BLE001 - a transport fault says nothing it was told
-            # KNOWN EDGE: a fault after the message was delivered (a timeout on the reply) also reads as not sent, so a
-            # retry could send twice; the once-per-event guard is ND-3b's attempts journal, not this verb.
-            return EffectResult("send_ack", False, f"send_ack: {R_FAILED}")
-        return EffectResult("send_ack", True, "send_ack: sent")
+        night = night_key(self._now(), self.night_cut_hour_utc)
+        attempt, fresh = self._reserve(key=key, order=order, verb="send_ack", event_id=event_id,
+                                       args_digest=hashlib.sha256(b"").hexdigest(), recipient=recipient,
+                                       incident_scope=f"{recipient}|{incident or event_id}",
+                                       night_scope=f"{recipient}|{night}", covering=covering)
+        if not fresh:
+            return self._recorded("send_ack", "send_ack: sent", attempt.status)
+        known = {a.strip().lower() for ln in covering for a in ln["args"]["known_from"]}
 
-    def _recipient(self, event_id: str, lines: list[Any]) -> tuple[str, str]:
+        def go() -> str:
+            assert self.transport is not None
+            # the journal row's sender is the order's pinned recipient: the row, the message and the order's list agree
+            if attempt.recipient != message.recipient or message.recipient not in known:
+                raise _OwnRefusal(R_SENDER)
+            self.transport.send(message)                    # a fault here (a timeout) may have delivered: unknown
+            return "ok"
+
+        status = self._dispatch(attempt, order_id, "send_ack", sha, order, go)
+        return self._recorded("send_ack", "send_ack: sent", status)
+
+    def _recipient(self, event_id: str, lines: list[Any]) -> tuple[str, str, list[Any], str | None]:
         assert self.events is not None and self.raw_source is not None
         event = self.events(event_id)
         if (not isinstance(event, Event) or event.event_id != event_id or event.kind != "mail"
@@ -555,20 +735,24 @@ class Effects:
                 or event.fields.get("sender_class") != "known" or type(event.body_ref) is not str
                 or _BODY_REF.fullmatch(event.body_ref) is None):
             raise _OwnRefusal(R_EVENT)
+        self._event_age(event)
         raw = self.raw_source(event.body_ref)
         if not isinstance(raw, (bytes, bytearray)) or not hmac.compare_digest(
                 "sha256:" + hashlib.sha256(bytes(raw)).hexdigest(), event.body_ref):
             raise _OwnRefusal(R_EVENT)                    # the bytes are not the ones the event's digest names
         recipient = inbound_from(bytes(raw))
         voices: set[Any] = set()
+        covering: list[Any] = []
         for ln in lines:
             if recipient in {a.strip().lower() for a in ln["args"]["known_from"]}:
                 named = ln["args"]["voice"]
                 if not isinstance(named, (list, tuple)) or len(named) != 1:
                     raise _OwnRefusal(R_LINE)
                 voices.add(named[0])
+                covering.append(ln)
         if not voices:
             raise _OwnRefusal(R_FROM)
         if len(voices) != 1 or next(iter(voices)) not in DISCLOSURES:   # one voice, or the disclosure could be false
             raise _OwnRefusal(R_LINE)
-        return recipient, next(iter(voices))
+        incident = event.incident_id if type(event.incident_id) is str and _INCIDENT_ID.fullmatch(event.incident_id) else None
+        return recipient, next(iter(voices)), covering, incident

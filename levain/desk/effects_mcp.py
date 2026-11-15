@@ -43,14 +43,15 @@ _ORDER_SHA = {"type": "string", "pattern": "^[0-9a-f]{64}$",
 RESTART_SERVICE: dict[str, Any] = {
     "name": "restart_service",
     "description": ("Restart one allowed service on the monitored host under a standing order that allows it. Takes "
-                    "only the order id and its sha256, the host and the service, each from its fixed list. Returns "
-                    "the exit code only."),
+                    "only the order id and its sha256, the host and the service, each from its fixed list, and the "
+                    "monitor event it answers (its incident is derived in code). Returns the exit code only."),
     "inputSchema": {
         "type": "object",
         "properties": {"order_id": _ORDER_ID, "order_sha256": _ORDER_SHA,
                        "host": {"type": "string", "enum": list(fx.HOSTS)},
-                       "service": {"type": "string", "enum": list(fx.SERVICES)}},
-        "required": ["order_id", "order_sha256", "host", "service"],
+                       "service": {"type": "string", "enum": list(fx.SERVICES)},
+                       "event_id": {"type": "string", "pattern": "^evt-[0-9a-f]{32}$"}},
+        "required": ["order_id", "order_sha256", "host", "service", "event_id"],
         "additionalProperties": False,
     },
 }
@@ -71,7 +72,7 @@ TOOLS = [RESTART_SERVICE, SEND_ACK]
 TOOL_NAMES = frozenset(t["name"] for t in TOOLS)
 #: tool argument -> the verb's parameter (every one passed by name; each is shape- or enum-checked in the verb)
 _PARAMS = {"restart_service": {"order_id": "order_id", "order_sha256": "expect_sha256", "host": "host",
-                               "service": "service"},
+                               "service": "service", "event_id": "event_id"},
            "send_ack": {"order_id": "order_id", "order_sha256": "expect_sha256", "event_id": "event_id"}}
 
 
