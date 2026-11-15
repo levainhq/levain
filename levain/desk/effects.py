@@ -3,8 +3,8 @@
 TRUST-BOUNDARY CODE. A standing order (:mod:`levain.desk.standing_orders`) says which effects the desk may use; this
 module is the ONLY place an effect runs, and it runs two verbs and no others:
 
-* ``restart_service(order_id, host, service, expect_sha256=...)``: ``host`` is one of :data:`HOSTS` and ``service``
-  one of :data:`SERVICES`. The command is a HARD-CODED argv (:func:`restart_argv`) built from those two enum members and run
+* ``restart_service(order_id, host, service, expect_sha256=..., event_id=...)``: ``host`` is one of :data:`HOSTS` and
+  ``service`` one of :data:`SERVICES`; ``event_id`` is the monitor event it answers. The command is a HARD-CODED argv (:func:`restart_argv`) built from those two enum members and run
   with ``shell=False`` (:func:`subprocess_runner`); the verb returns the exit code and never the server's output.
 * ``send_ack(order_id, event_id, expect_sha256=...)``: the recipient is NEVER an argument. It is derived here, from
   the raw message the event's ``body_ref`` digest names (:func:`inbound_from`), and must be an address the order's ``known_from`` lists.
@@ -28,12 +28,12 @@ the same incarnation as the first.
 EXECUTION-TIME BUDGETS AND THE JOURNAL (ND-3b, board levain#12, :mod:`levain.desk.effect_attempts`): an effect is
 reserved on the journal BEFORE it runs, in one transaction that also counts and consumes the order line's per-incident
 and per-night budgets (never check-then-act); the reservation is written ``unknown``, so a process that dies mid-effect
-leaves one ``unknown`` row, never retried and never sent twice. A retry of a settled or unknown effect (the same event,
-verb and arguments) answers the recorded status and runs nothing; a transport or runner fault, and a timeout, record
-``unknown``. After the reservation the order is replayed one more time and the effect runs only if it is the same
-version. ``restart_service`` takes the monitor event it answers (its incident is derived from it); every event must be
-within :data:`EVENT_MAX_AGE`; the sender the journal row holds must equal the message's recipient and be on the order's
-list. A refusal this module raises is recorded with its fixed reason.
+leaves one ``unknown`` row, never retried and never sent twice. A retry of a settled or unknown effect (the same order,
+event, verb and arguments) answers the recorded status and runs nothing; a transport or runner fault, a timeout, and a
+runner that returns no exit code record ``unknown``. After the reservation the order is replayed one more time and the
+effect runs only if it is the same version. ``restart_service`` takes the monitor event it answers (its incident is
+derived from it); every event must be within :data:`EVENT_MAX_AGE`; a retry of an ack whose recorded recipient is not the
+one derived again now refuses (:data:`R_SENDER`). A refusal this module raises is recorded with its fixed reason.
 
 NOT HERE (the next rows): the arm record (O1) and ``NIGHT_ARMING_CLEARED`` (ND-11); the night key and its forced-command list are ND-8 (:data:`FORCED_WORDS` names
 the words it must accept); the live mail credential is open (ND_BUILD_PLAN O8). Until
@@ -157,8 +157,9 @@ class EffectRefused(Exception):
     subclass), whose ``str`` is one member of :data:`REFUSALS` and never an argument. An executor can raise this class,
     or a subclass of it, with any text, even a member of :data:`REFUSALS`: that is never trusted (:func:`_trusted`), so
     the verb answers its fixed fallback instead (the clock, in the gate: :data:`R_ORDER`; the event lookup, raw source
-    or drafter: :data:`R_FAILED`; the runner or ``transport.send``: a failed :class:`EffectResult`). Only
-    :func:`refusal_text` decides what a refusal may say outside this module."""
+    or drafter: :data:`R_FAILED`; the runner or ``transport.send``: an :class:`EffectResult` that answers
+    :data:`R_UNKNOWN`, the attempt recorded ``unknown``, since the effect may have run). Only :func:`refusal_text`
+    decides what a refusal may say outside this module."""
 
 
 class _OwnRefusal(EffectRefused):
@@ -604,7 +605,7 @@ class Effects:
                         event_id: Any) -> EffectResult:
         """Restart ``service`` on ``host`` under order ``order_id`` at version ``expect_sha256`` (the digest the
         desk's brief prints beside the order), answering the incident of the monitor event ``event_id`` (the incident is
-        derived from the event, never an argument). Idempotent on (event, verb, host, service)."""
+        derived from the event, never an argument). Idempotent on (order, event, verb, host, service)."""
         order_id = _shaped(order_id, _ORDER_ID)
         host, service = _enum(host, HOSTS), _enum(service, SERVICES)
         sha, event_id = _shaped(expect_sha256, _SHA), _shaped(event_id, _EVENT_ID)
@@ -621,7 +622,7 @@ class Effects:
         argv = restart_argv(host, service)
         incident = self._incident(event_id)
         args_digest = hashlib.sha256(f"{host}|{service}".encode()).hexdigest()
-        key = idem_key(event_id, "restart_service", args_digest)
+        key = idem_key(order_id, event_id, "restart_service", args_digest)
         label = f"restart_service {host} {service}"
         ok_text = f"{label}: exit 0"
         night = night_key(self._now(), self.night_cut_hour_utc)
@@ -634,9 +635,9 @@ class Effects:
         def go() -> str:
             assert self.runner is not None
             code = self.runner(argv)
-            if type(code) is int and code == 0:
-                return "ok"
-            return "unknown" if code == -1 else "failed"     # -1: a timeout or no start: it may have run
+            if type(code) is not int or code == -1:         # no exit code, a timeout or no start: it may have run
+                return "unknown"
+            return "ok" if code == 0 else "failed"
 
         status = self._dispatch(attempt, order_id, "restart_service", sha, order, go)
         return self._recorded(label, ok_text, status)
@@ -660,7 +661,7 @@ class Effects:
         """Send the ack for ``event_id`` under order ``order_id`` at version ``expect_sha256``. The recipient is
         derived here (never an argument) from the raw message the event's digest names, and must be on the order
         line's ``known_from``. The order is replayed again after the reservation and immediately before the send.
-        Idempotent on the event: a retry returns the recorded result and never sends twice."""
+        Idempotent on the order and the event: a retry returns the recorded result and never sends twice."""
         order_id, event_id = _shaped(order_id, _ORDER_ID), _shaped(event_id, _EVENT_ID)
         sha = _shaped(expect_sha256, _SHA)
         return self._noted(order_id, "send_ack", event_id, lambda: self._ack(order_id, event_id, sha))
@@ -682,7 +683,7 @@ class Effects:
             if _trusted(exc):                               # only this module's own refusals (inbound_from, the
                 raise                                       # event checks) pass; an executor's is R_FAILED
             raise _OwnRefusal(R_FAILED) from None
-        key = idem_key(event_id, "send_ack", hashlib.sha256(b"").hexdigest())
+        key = idem_key(order_id, event_id, "send_ack", hashlib.sha256(b"").hexdigest())
         done = self.journal.lookup(key)                     # a settled or unknown effect answers before any drafting
         if done is not None and done.status != "refused":
             if done.recipient != recipient:
@@ -714,13 +715,9 @@ class Effects:
                                        night_scope=f"{recipient}|{night}", covering=covering)
         if not fresh:
             return self._recorded("send_ack", "send_ack: sent", attempt.status)
-        known = {a.strip().lower() for ln in covering for a in ln["args"]["known_from"]}
 
         def go() -> str:
             assert self.transport is not None
-            # the journal row's sender is the order's pinned recipient: the row, the message and the order's list agree
-            if attempt.recipient != message.recipient or message.recipient not in known:
-                raise _OwnRefusal(R_SENDER)
             self.transport.send(message)                    # a fault here (a timeout) may have delivered: unknown
             return "ok"
 

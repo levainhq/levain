@@ -195,7 +195,7 @@ def test_the_budget_is_claimed_atomically_under_a_race(world, tmp_path):
     def one(i: int) -> None:
         barrier.wait()
         try:
-            row, fresh = journal.reserve(key=idem_key(f"evt-{i:032x}", "restart_service", "x"), order_id="so-" + "a" * 12,
+            row, fresh = journal.reserve(key=idem_key("so-" + "a" * 12, f"evt-{i:032x}", "restart_service", "x"), order_id="so-" + "a" * 12,
                                          order_sha256="0" * 64, incarnation=1, verb="restart_service",
                                          event_id=f"evt-{i:032x}", args_digest="x", recipient=None,
                                          incident_scope=f"apache2|inc-{i}", night_scope="n", per_incident=1, per_night=2,
@@ -216,7 +216,7 @@ def test_the_budget_is_claimed_atomically_under_a_race(world, tmp_path):
 
 def test_two_racing_requests_for_one_effect_are_one_attempt(tmp_path):
     journal = Journal(tmp_path / "same.db")
-    key = idem_key(EVR, "restart_service", "x")
+    key = idem_key("so-" + "a" * 12, EVR, "restart_service", "x")
     fresh_flags = []
     barrier = threading.Barrier(8)
 
@@ -367,30 +367,12 @@ def test_the_sender_in_the_journal_row_must_be_the_derived_pinned_recipient(worl
     g = signed(world)
     rig = Rig(world)
     empty = hashlib.sha256(b"").hexdigest()
-    key = idem_key(EVT, "send_ack", empty)
+    key = idem_key(g["id"], EVT, "send_ack", empty)
     rig.journal.reserve(key=key, order_id=g["id"], order_sha256=D(g), incarnation=1, verb="send_ack", event_id=EVT,
                         args_digest=empty, recipient="mallory@evil.example",
                         incident_scope="x", night_scope="y", per_incident=9, per_night=9, now="2026-11-15T00:00:00Z")
     assert refused(lambda: rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))) == fx.R_SENDER
     assert rig.sent == [] and rig.drafts == []
-
-
-def test_the_sender_check_refuses_when_the_row_and_the_message_differ_after_the_reservation(world):
-    """The reservation's recipient is checked against the message at the send: a journal whose reserve writes another
-    address (a fault or a tamper between the two) never sends."""
-    g = signed(world)
-    rig = Rig(world)
-    real = Journal.reserve
-
-    def tampered(self, **kw):
-        return real(self, **{**kw, "recipient": "mallory@evil.example"})
-
-    Journal.reserve = tampered
-    try:
-        assert refused(lambda: rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))) == fx.R_SENDER
-    finally:
-        Journal.reserve = real
-    assert rig.sent == [] and [r.status for r in rig.journal.rows()] == ["refused"]
 
 
 # ---- what a restart may answer, and the journal itself ----------------------------------------------------------------------
@@ -454,6 +436,84 @@ def test_the_mcp_restart_names_its_event_and_is_idempotent(world):
     args = {"order_id": g["id"], "order_sha256": D(g), "host": "taoserv", "service": "apache2", "event_id": EVR}
     one, two = call(rig.effects(), "restart_service", args), call(rig.effects(), "restart_service", args)
     assert one == two and one["isError"] is False and len(rig.runs) == 1
+
+
+# ---- review fixes (ND-3b fix 1) -----------------------------------------------------------------------------------------
+def _reserve(journal: Journal, key: str, night: str, now: str, *, per_night: int = 1, event_id: str = EVR,
+             incident: str = "apache2|inc-1"):
+    return journal.reserve(key=key, order_id="so-" + "a" * 12, order_sha256="0" * 64, incarnation=1,
+                           verb="restart_service", event_id=event_id, args_digest="x", recipient=None,
+                           incident_scope=incident, night_scope=night, per_incident=9, per_night=per_night, now=now)
+
+
+def test_a_refused_row_retaken_in_the_next_night_is_charged_to_that_night(tmp_path):
+    """A row refused before the cut and taken again after it is an effect of the NEW night: it is counted there (a second
+    effect that night is over a budget of one) and no longer in the old night."""
+    journal = Journal(tmp_path / "retake.db")
+    row, _ = _reserve(journal, "k1", "2026-11-14", "2026-11-15T11:50:00Z")
+    journal.settle(row.attempt_id, "refused", "2026-11-15T11:51:00Z")
+    again, fresh = _reserve(journal, "k1", "2026-11-15", "2026-11-15T12:10:00Z")
+    assert fresh and again.attempt_id == row.attempt_id and again.status == "unknown"
+    with pytest.raises(BudgetSpent):
+        _reserve(journal, "k2", "2026-11-15", "2026-11-15T12:20:00Z", event_id=EVR2, incident="apache2|inc-2")
+    _reserve(journal, "k3", "2026-11-14", "2026-11-15T11:55:00Z", event_id=EVR3, incident="apache2|inc-3")
+    nights = sqlite3.connect(journal.path).execute("SELECT idem_key, night_scope FROM effect_attempts ORDER BY 1").fetchall()
+    assert nights == [("k1", "2026-11-15"), ("k3", "2026-11-14")]
+
+
+def test_the_night_scope_moves_only_on_a_retake(tmp_path):
+    """The trigger still refuses any other rewrite of the night: a settled row, or an unknown one, keeps its night."""
+    journal = Journal(tmp_path / "edges.db")
+    row, _ = _reserve(journal, "k1", "2026-11-14", "2026-11-15T11:50:00Z")
+    conn = sqlite3.connect(journal.path)
+    with pytest.raises(sqlite3.DatabaseError):               # unknown -> unknown with a new night
+        conn.execute("UPDATE effect_attempts SET night_scope = 'x'")
+    with pytest.raises(sqlite3.DatabaseError):               # unknown -> ok with a new night
+        conn.execute("UPDATE effect_attempts SET night_scope = 'x', status = 'ok'")
+    with pytest.raises(sqlite3.DatabaseError):               # the incident never moves, even on a retake
+        conn.execute("UPDATE effect_attempts SET status = 'refused'")
+        conn.execute("UPDATE effect_attempts SET status = 'unknown', incident_scope = 'x'")
+    conn.close()
+
+
+def test_a_flood_of_refusals_never_blinds_the_record(tmp_path, monkeypatch):
+    """Past the cap the record rolls: the oldest refusal is dropped, so the newest is always kept and the table stays
+    at the cap."""
+    from levain.desk import effect_attempts as ea
+    monkeypatch.setattr(ea, "_REFUSALS_MAX", 20)
+    journal = Journal(tmp_path / "flood.db")
+    for i in range(30):
+        journal.note_refusal("so-" + "a" * 12, "send_ack", f"evt-{i:032x}", fx.R_ORDER, f"2026-11-15T00:00:{i:02d}Z")
+    journal.note_refusal("so-" + "a" * 12, "send_ack", EVT, fx.R_BUDGET_NIGHT, "2026-11-15T00:01:00Z")
+    kept = journal.refusals()
+    assert len(kept) == 20
+    assert ("so-" + "a" * 12, "send_ack", EVT, fx.R_BUDGET_NIGHT, 1) in kept
+    assert ("so-" + "a" * 12, "send_ack", f"evt-{0:032x}", fx.R_ORDER, 1) not in kept     # the oldest went first
+
+
+def test_a_second_settle_writes_nothing_and_says_so(tmp_path):
+    journal = Journal(tmp_path / "settle.db")
+    row, _ = _reserve(journal, "k1", "n", "2026-11-15T00:00:00Z")
+    assert journal.settle(row.attempt_id, "ok", "2026-11-15T00:00:01Z") is True
+    assert journal.settle(row.attempt_id, "failed", "2026-11-15T00:00:02Z") is False
+    assert journal.lookup("k1").status == "ok"
+
+
+def test_an_event_answered_under_another_order_is_its_own_attempt(world):
+    g, h = signed(world), signed(world)
+    rig = Rig(world)
+    assert restart(rig, g).ok and restart(rig, h).ok
+    assert len(rig.runs) == 2 and sorted(r.order_id for r in rig.journal.rows()) == sorted([g["id"], h["id"]])
+    assert idem_key(g["id"], EVR, "restart_service", "x") != idem_key(h["id"], EVR, "restart_service", "x")
+
+
+@pytest.mark.parametrize("code", [None, True, False, "0", 0.0])
+def test_a_runner_that_returns_no_exit_code_is_unknown(world, code):
+    g = signed(world)
+    rig = Rig(world)
+    res = restart(rig, g, runner=lambda a: code)
+    assert res.text == f"restart_service taoserv apache2: {fx.R_UNKNOWN}"
+    assert [r.status for r in rig.journal.rows()] == ["unknown"]
 
 
 def test_night_key_cuts_at_the_hour_not_at_midnight():

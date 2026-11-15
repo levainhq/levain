@@ -2,7 +2,8 @@
 2.0, one message per line, stdlib only), the shape of :mod:`levain.seat_gh_mcp`: it runs outside the seat's sandbox and
 is the only path to :mod:`levain.desk.effects`. Two tools and no others, with FIXED schemas:
 
-* ``restart_service``: ``order_id``, ``order_sha256``, ``host`` (enum), ``service`` (enum).
+* ``restart_service``: ``order_id``, ``order_sha256``, ``host`` (enum), ``service`` (enum), ``event_id`` (the monitor
+  event it answers).
 * ``send_ack``: ``order_id``, ``order_sha256``, ``event_id``. There is no recipient and no text field: the recipient is
   derived inside the verb and the text comes from the sealed drafter inside it.
 
@@ -14,8 +15,8 @@ when that module's own code raised it (:func:`levain.desk.effects.refusal_text`)
 ``EffectRefused`` with a member of ``REFUSALS`` included, answers ``R_FAILED``. A verb's result text is returned as
 it is: the verbs compose it only from their own constants and the enum members the call already passed. Any
 argument outside its shape or enum, a missing or an extra one, is refused by :mod:`levain.desk.effects` before the order
-is even read. ``main`` wires NO executor yet (the night
-key is ND-8, the mail credential O8, the budgets ND-3b; the sealed drafter's argv and output parser exist
+is even read. ``main`` wires NO executor and no effect journal yet (the night
+key is ND-8, the mail credential O8; the sealed drafter's argv and output parser exist
 (:mod:`levain.desk.sealed`) but the launcher that runs it is not built, so no drafter is wired here either): every call
 that passes the order gate then answers "not wired". Wiring is done by constructing :class:`~levain.desk.effects.Effects` in the process that owns the
 credentials, not by anything a seat says."""
