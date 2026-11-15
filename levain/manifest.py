@@ -141,6 +141,9 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # 1.0.2 (AM-FORMATION-OFF, 2026-10-24): anneal forms no association links and ignores affect. A removal entry:
 # memory_workflow.md no longer says `prepare_wrap` returns association context; the seed already taught no affect
 # tag and no link forming. Guarded by the retired-claims list in test_seed_templates_carry_the_reconciled_guidance.
+# 2.0.1 (AM-SPORE-SCHEMA-V2, 2026-11-15): the intention store keeps its open rows under `intentions`; a store written by an older anneal is
+# converted once by `intention migrate-key` (`levain update` runs it) and the 1.0.2 / allow_unlinked removals wait for a later major. No seed
+# edit (the seed carries no "removed in 2.0" text); allowlisted no-edit in tests/test_compat_integration.py.
 TEMPLATES_RECONCILED_ANNEAL = "2.0.1"
 
 # The install's recorded-set lockfile, a sibling of the anneal store under the
