@@ -12,7 +12,9 @@ unusable command line (argparse) exits 2.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -136,6 +138,8 @@ def check_text(text: str, *, repo_name: str | None = None,
             bad(n, "criteria", f"{m.group(1)} repeats line {seen[m.group(1)]}")
         seen[m.group(1)] = n
         tags = _TAGS_ANY.findall(ln)
+        if not _TAG.sub("", m.group(2)).strip():
+            bad(n, "criteria", f"{m.group(1)} has no statement, only a tag")
         if _TAG.search(ln) is None or len(tags) != 1:
             bad(n, "criteria", f"{m.group(1)} needs exactly one [check: ...], [item: ...] or [judged: <who>] at the end "
                                "(an unenforced criterion is advice)")
@@ -166,7 +170,10 @@ def check_text(text: str, *, repo_name: str | None = None,
         if m is None:
             bad(n, "plan", f"a Plan line is a board item id and nothing else (`- <repo>#<n>`): {ln.strip()[:60]!r}")
             continue
-        plan_ids.append((n, f"{m.group(1)}#{m.group(2)}", m.group(1)))
+        pid = f"{m.group(1)}#{m.group(2)}"
+        if any(pid == q for _, q, _ in plan_ids):
+            warnings.append(f"line {n}: {pid} is listed in the Plan more than once")
+        plan_ids.append((n, pid, m.group(1)))
     if "Plan" in body and not plan_ids and not any(p.rule == "plan" for p in problems):
         bad(headings[-1][0] if headings else 1, "plan", "Plan needs at least one `- <repo>#<n>` line")
 
@@ -210,51 +217,81 @@ def invalid_text(repo: str, where: str, problems: list[Problem], repo_arg: str) 
             f"Run `levain charter check --repo {repo_arg}` for every problem, fix them, commit, and push.")
 
 
+#: What git says when the charter is simply not at the ref: the path is not in it, or the ref itself is not there.
+_GIT_ABSENT = ("does not exist in", "exists on disk, but not in", "invalid object name", "unknown revision", "bad revision",
+               "not a valid object name")
+MAX_BYTES = 1 << 20       # a charter is at most 200 lines; a file past this is refused before it is decoded
+
+
+def _decode(raw: bytes) -> tuple[str | None, str]:
+    """UTF-8 (a BOM stripped) with CRLF and CR read as LF, the same on every path."""
+    try:
+        return raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n"), ""
+    except UnicodeDecodeError:
+        return None, "unreadable (not UTF-8)"
+
+
 def _read_ref(repo: Path, ref: str) -> tuple[str | None, str]:
-    """``(text, why)``: the file at ``ref``, or None and why: ``absent`` (git has no such file there) or ``unreadable (..)``."""
+    """``(text, why)``: the file at ``ref``, or None and why: ``absent`` (the ref has no such file) or ``unreadable (..)``.
+    A ref that starts with ``-`` is refused, so it can never reach git as an option."""
     if ref.startswith("-"):
         return None, "unreadable (a ref cannot start with '-')"
     from levain.desk.board_evidence import _env
     try:
-        cp = subprocess.run(["git", "-C", str(repo), "show", "--end-of-options", f"{ref}:CHARTER.md"],
-                            capture_output=True, timeout=30, env=_env())
-    except (OSError, subprocess.SubprocessError) as exc:      # git missing from PATH, or it hung: a warning, never a traceback
+        cp = subprocess.run(["git", "-C", str(repo), "show", f"{ref}:CHARTER.md"], capture_output=True, timeout=30, env=_env())
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:   # git missing from PATH, or it hung: a warning, never a traceback
         return None, f"unreadable (git: {type(exc).__name__})"
     if cp.returncode != 0:
-        return None, "absent"
-    try:
-        return cp.stdout.decode("utf-8"), ""
-    except UnicodeDecodeError:
-        return None, "unreadable (not UTF-8)"
+        err = cp.stderr.decode("utf-8", "replace")
+        if any(k in err for k in _GIT_ABSENT):
+            return None, "absent"
+        first = (err.strip().splitlines() or ["no message"])[0][:120]
+        return None, f"unreadable (git exit {cp.returncode}: {first})"
+    if len(cp.stdout) > MAX_BYTES:
+        return None, f"unreadable (larger than {MAX_BYTES} bytes)"
+    return _decode(cp.stdout)
 
 
 def _read_path(path: Path) -> tuple[str | None, str]:
     try:
-        return path.expanduser().read_text("utf-8"), ""
+        with path.expanduser().open("rb") as fh:
+            raw = fh.read(MAX_BYTES + 1)
     except FileNotFoundError:
         return None, "absent"
-    except UnicodeDecodeError:
-        return None, "unreadable (not UTF-8)"
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:      # RuntimeError: `~nouser` and a symlink loop
         return None, f"unreadable ({type(exc).__name__})"
+    if len(raw) > MAX_BYTES:
+        return None, f"unreadable (larger than {MAX_BYTES} bytes)"
+    return _decode(raw)
 
 
-def _store(path: Path) -> dict[str, tuple[str, str | None]]:
+def _store(path: Path) -> tuple[dict[str, tuple[str, str | None]] | None, str]:
+    """``(items, why)``: the store folded, or None and why the store checks are skipped. A torn store or one with
+    problems is not complete, so it is skipped like an unreadable one, never trusted."""
     from levain.desk.board_state import fold
-    folded = fold(path.expanduser().read_text("utf-8").splitlines())
-    return {i.id: (i.repo, i.decision.decision if i.decision else None) for i in folded.items.values()}
+    try:
+        folded = fold(path.expanduser().read_text("utf-8").splitlines())
+    except (OSError, ValueError, RuntimeError, RecursionError) as exc:
+        return None, f"cannot be read ({type(exc).__name__})"
+    if folded.torn or folded.problems:
+        return None, f"is not a whole store ({'torn: ' + folded.torn_why if folded.torn else folded.problems[0]})"
+    return {i.id: (i.repo, i.decision.decision if i.decision else None) for i in folded.items.values()}, ""
 
 
 def run_check(args: Any) -> int:
-    repo = Path(args.repo).expanduser()
+    repo = Path(args.repo)
     repo_name = args.repo_name
     if repo_name is None:
         from levain.desk.board_evidence import repo_name_of
         try:
-            repo_name = repo_name_of(repo)
-        except (OSError, subprocess.SubprocessError):
+            repo_name = repo_name_of(repo.expanduser())
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             repo_name = None
-        repo_name = repo_name or repo.resolve().name
+        repo_name = repo_name or os.path.basename(os.path.abspath(str(repo))) or "repo"
+    try:
+        repo = repo.expanduser()
+    except RuntimeError:                                    # `~nouser`: left as typed, git will say it is not a repository
+        pass
     if args.file is not None:
         where, label = str(args.file), "the file"
         text, why = _read_path(Path(args.file))
@@ -266,30 +303,31 @@ def run_check(args: Any) -> int:
         where = "origin/main" if ref == DEFAULT_REF else ref
         label = where
         text, why = _read_ref(repo, ref)
-    items = None
+    items, store_note = None, ""
     if args.items is not None:
-        try:
-            items = _store(args.items)
-        except (OSError, UnicodeDecodeError) as exc:
-            print(f"levain charter check: the items file {args.items} cannot be read ({type(exc).__name__}); "
-                  "the store checks are skipped.", file=sys.stderr)
+        items, store_note = _store(args.items)
+        if items is None:
+            print(f"levain charter check: the items file {args.items} {store_note}; the store checks are skipped.",
+                  file=sys.stderr)
+    problems: list[Problem] = []
+    warnings: list[str] = []
+    if text is not None:
+        problems, warnings = check_text(text, repo_name=repo_name, items=items)
+    if args.json:       # exactly one document on stdout, the same keys on every path
+        print(json.dumps({"repo": repo_name, "source": where, "present": text is not None or why != "absent",
+                          "readable": text is not None, "why": why, "valid": text is not None and not problems,
+                          "store_checked": items is not None, "store_note": store_note,
+                          "problems": [p.to_dict() for p in problems], "warnings": warnings}, indent=2))
+        return 0
     if text is None:
         if why == "absent":
             print(missing_text(repo_name, label))
         else:
             print(f"{WARN_PREFIX}{repo_name}'s CHARTER.md ({label}) could not be read: {why}. "
                   "Fix that and run `levain charter check` again.")
-        if args.json:
-            print(json.dumps({"repo": repo_name, "source": where, "present": why != "absent", "valid": False,
-                              "readable": False, "why": why, "problems": [], "warnings": []}))
-        return 0
-    problems, warnings = check_text(text, repo_name=repo_name, items=items)
-    if args.json:
-        print(json.dumps({"repo": repo_name, "source": where, "present": True, "valid": not problems,
-                          "problems": [p.to_dict() for p in problems], "warnings": warnings}, indent=2))
         return 0
     if problems:
-        print(invalid_text(repo_name, where, problems, str(args.repo)))
+        print(invalid_text(repo_name, where, problems, shlex.quote(str(args.repo))))
         for p in problems[:MAX_PRINTED]:
             print(f"  line {p.line}: [{p.rule}] {p.text}")
         if len(problems) > MAX_PRINTED:
