@@ -98,9 +98,9 @@ EXEMPT: dict[str, str] = {
     "open_unsequenced_cuts": "the per-table rowid an open showed of the unsequenced class (C15 S2b), the cut's own "
                              "bookkeeping",
     **{name: _DISPATCH for name in (
-        "artifact_take_failures", "artifact_takes", "authorise_signatures", "cancel_signatures", "event_cursor",
+        "artifact_failures", "artifact_take_failures", "artifact_takes", "authorise_signatures", "cancel_signatures", "event_cursor",
         "handoffs", "job_envelopes", "job_filers", "job_threads", "jobs", "meta", "run_records", "signatures",
-        "transitions", "verifier_refusals")},
+        "stop_requests", "transitions", "verifier_refusals")},
 }
 
 #: a table counted by kind: table -> class -> the kinds in it. Together the kinds are exactly the table's kind CHECK

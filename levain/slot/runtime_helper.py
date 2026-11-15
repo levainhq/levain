@@ -2318,6 +2318,58 @@ def open_slot_owned_dir(parent: int, name: str, owner_uid: int, where: str) -> i
         raise
 
 
+#: §5.6: the refusals of a verifier's staged bytes that are also terminal EVENT names (CONTROL carries them as
+#: ``verifier_report_refused``): the bundle is not the ticket's, the driver input is not the ticket's.
+VERIFIER_STAGE_REFUSALS = frozenset({"input-bundle-mismatch", "driver-input-mismatch"})
+
+
+def verifier_digests(a: R.Alloc) -> Tuple[str, str]:
+    """A verifier session's two pinned digests from alloc's ticket facts (``input_bundle_digest``,
+    ``driver_input_digest``). Fails closed: a verifier whose alloc names either is not rendered."""
+    facts = a.ticket_facts or {}
+    got = (facts.get("input_bundle_digest"), facts.get("driver_input_digest"))
+    if not all(type(d) is str for d in got):
+        raise Refused("bad-root", f"alloc {a.session} names no verifier input digests")
+    return got  # type: ignore[return-value]
+
+
+def refuse_verifier_report(run: RenderRun, name: str) -> None:
+    """S14 A1: before a verifier render answers a staging refusal, a FIELD-ONLY CAS (RENDERING -> RENDERING) of
+    ``verifier_report_refused: <name>`` (CONTROL's own rule admits it there), so the terminal event names why. Best
+    effort: a CAS that fails leaves the render's own refusal and its REVOKE, as a front cleanup does."""
+    try:
+        ans = run.ctx.call("CAS", session=run.alloc.session, generation=run.generation,
+                           **{"from": R.RENDERING, "to": R.RENDERING}, fields={"verifier_report_refused": name})
+        run.generation = int(ans["generation"])
+    except Refused:
+        pass
+
+
+def stage_verifier_driver_input(run: RenderRun, driver_input_digest: str) -> None:
+    """S14 A1 (§5.6): ``staging/driver_input.json`` -> ``<S>/driver/input.json`` (root : the driver's group 0440),
+    its digest held to the ticket's. ``<S>/driver/`` is the DRIVER's 0700 dir, so it is opened from root's ``<S>``
+    with :func:`open_slot_owned_dir` (its owner checked against alloc's) and the file is created O_EXCL there."""
+    ctx, a = run.ctx, run.alloc
+    seams = ctx.seams
+    where = f"live/{a.session}/driver"
+    try:
+        with ctx.store.dir("live", a.session) as sfd:
+            dfd = open_slot_owned_dir(sfd, "driver", seams.chowned_uid(a.slot_uid), where)
+        try:
+            with ctx.store.dir("staging", a.session, trusted=False) as staging:
+                ST.stage_driver_input(staging, dfd, staging_uid=a.staging_uid,
+                                      staging_gid=seams.user_gid(a.staging_uid), dest_gid=a.slot_gid,
+                                      driver_input_digest=driver_input_digest, run_as=seams.stage_run_as,
+                                      fsync=seams.fsync,
+                                      chown=lambda fd, u, g: seams.chown(fd, u, g, f"{where}/input.json"))
+        finally:
+            os.close(dfd)
+    except Refused as e:
+        if e.name in VERIFIER_STAGE_REFUSALS:
+            refuse_verifier_report(run, e.name)
+        raise
+
+
 def render_step3_files(run: RenderRun) -> None:
     """(3) The staging bundle -> a FRESH ``<S>/in/repo.bundle`` (§5.4: the reader runs as alloc ``staging_uid``),
     its header parsed in the copy (§5a); then ``<S>/root/*`` and the onboarding pre-seed from ``render.render``, each
@@ -2337,12 +2389,20 @@ def render_step3_files(run: RenderRun) -> None:
     # §5a: the header is parsed by bundlefmt as the bytes are copied (an incremental observer, never the whole body
     # in memory); a header off the grammar or the base rule refuses inside the copy, so the staged file is removed.
     obs = BF.HeaderObserver(check=BF.base_of)
+    verifier = a.kind == "verifier"
+    pinned = verifier_digests(a) if verifier else None       # §5.6: the ticket's two digests, before any byte is staged
     with ctx.store.dir("staging", a.session, trusted=False) as staging, ctx.store.dir(*S, "in") as dest:
-        staged = ST.stage_bundle(staging, dest, staging_uid=a.staging_uid,
-                                 staging_gid=seams.user_gid(a.staging_uid), dest_gid=facts.slot_gid,
-                                 run_as=seams.stage_run_as, fsync=seams.fsync, observe=obs.feed,
-                                 chown=lambda fd, u, g: seams.chown(fd, u, g,
-                                                                    f"live/{a.session}/in/{ST.BUNDLE_NAME}"))
+        try:
+            staged = ST.stage_bundle(staging, dest, staging_uid=a.staging_uid,
+                                     staging_gid=seams.user_gid(a.staging_uid), dest_gid=facts.slot_gid,
+                                     input_bundle_digest=pinned[0] if pinned is not None else None,
+                                     run_as=seams.stage_run_as, fsync=seams.fsync, observe=obs.feed,
+                                     chown=lambda fd, u, g: seams.chown(fd, u, g,
+                                                                        f"live/{a.session}/in/{ST.BUNDLE_NAME}"))
+        except Refused as e:
+            if verifier and e.name == "input-bundle-mismatch":
+                refuse_verifier_report(run, e.name)
+            raise
         # p71 S8 D1: an executor's brief, staged by the same path as the bundle (a fresh root inode, the ticket's
         # digest checked before the content). check_ticket refused an executor on claude without the digest before
         # anything rendered, so a session without it never gets here and stages no brief.
@@ -2353,6 +2413,8 @@ def render_step3_files(run: RenderRun) -> None:
                            dest_gid=facts.slot_gid, brief_digest=brief_digest, run_as=seams.stage_run_as,
                            fsync=seams.fsync,
                            chown=lambda fd, u, g: seams.chown(fd, u, g, f"live/{a.session}/in/{ST.BRIEF_NAME}"))
+    if pinned is not None:
+        stage_verifier_driver_input(run, pinned[1])
     header = obs.finish()
     oid, ref = BF.base_of(header)
     owner = session_owner_uid(a)
@@ -2382,10 +2444,12 @@ def render_step3_files(run: RenderRun) -> None:
             run.front_policy = front_policy_bytes(ctx.store, a, run.blob.routes)
         write_front_policy(seams, a.slot, run.front_uid, run.front_policy)
         prepare_front_log(ctx.store, a.slot, run.front_uid)
-    # DECISION: only the names this render staged are removed (the verifier's driver_input.json is session 2f's to
-    # stage, so it is never removed here unstaged); the dir itself is END's ("staging deleted").
+    # DECISION: only the names this render staged are removed (a verifier's driver_input.json too, once it is staged
+    # into <S>/driver/); the dir itself is END's ("staging deleted").
     with ctx.store.dir("staging", a.session, trusted=False) as staging:
         os.unlink(ST.BUNDLE_NAME, dir_fd=staging)
+        if pinned is not None:
+            os.unlink(ST.DRIVER_INPUT_NAME, dir_fd=staging)
         if brief_staged:        # DECISION: the brief is removed only when this render staged it, like the bundle
             os.unlink(ST.BRIEF_NAME, dir_fd=staging)
         seams.fsync(staging)
@@ -2769,6 +2833,10 @@ class AdoptFront:
     manifest_bytes: int
     deepest_git_path: int
     deadline: float
+    #: ``object.json``'s ``manifest_digest`` as END wrote it (root's fact; the dispatch record's). None when the
+    #: object carries none or a malformed one (retained before row 165): the operator's adopt never reads it, and
+    #: :func:`artifact_record_bytes` refuses ``not-retained:absent`` rather than invent one.
+    manifest_digest: Optional[str] = None
 
 
 def adopt_walk_caps(front: AdoptFront, adopt: AdoptSeams):   # -> walker.WalkCaps
@@ -2783,6 +2851,7 @@ def adopt_walk_caps(front: AdoptFront, adopt: AdoptSeams):   # -> walker.WalkCap
 BASE_KEYS = frozenset({"oid", "ref_b64", "object_format", "bundle_sha256", "bundle_bytes"})
 _OID_HEX = {"sha1": 40, "sha256": 64}
 _HEX_RE = re.compile(r"[0-9a-f]+")
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
 
 
 def _check_base(base: object, session: str) -> Mapping[str, object]:
@@ -2903,9 +2972,11 @@ def adopt_step3_root_facts(ctx: Ctx, a: R.Alloc, adopt: AdoptSeams, *, deadline:
     for v in (entries, nbytes):
         if not isinstance(v, int) or isinstance(v, bool) or v < 0:
             raise Refused("not-retained:absent", f"{a.session}: object.json entries / bytes")
+    md = obj.get("manifest_digest")
     return AdoptFront(alloc=a, base=base, retained=facts.retained, depth=depth, legacy_depth=legacy,
                       entries=entries, nbytes=nbytes, manifest_bytes=msize, deepest_git_path=deepest_git,
-                      deadline=deadline)
+                      deadline=deadline,
+                      manifest_digest=md if isinstance(md, str) and _DIGEST_RE.fullmatch(md) else None)
 
 
 #: The adopt-lock fds this process holds. A forked child (the importer runs through a fork with no exec, and
@@ -2948,11 +3019,9 @@ def flock_until(fd: int, deadline: float, seams: Seams) -> bool:
     return True
 
 
-@contextmanager
-def adopt_lock_wait(ctx: Ctx, deadline: float) -> Iterator[None]:
-    """(4) The machine-wide adopt lock ``L/export/adopt.lock`` (root 0600, never unlinked), taken AFTER the session
-    lock: ``LOCK_NB`` retries until V7's absolute ``deadline`` (``adopt-busy`` past it), so an operator adopt
-    waits behind a running import and takes the lock when it releases."""
+def _open_adopt_lock(ctx: Ctx) -> int:
+    """The adopt lock's descriptor, registered in :data:`_ADOPT_LOCK_FDS` from the open and checked (a regular file,
+    root's); the caller owns the fd and its release. A link or non-file is ``bad-root``."""
     with ctx.store.dir("export") as efd:
         try:
             fd = os.open("adopt.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600,
@@ -2966,12 +3035,41 @@ def adopt_lock_wait(ctx: Ctx, deadline: float) -> Iterator[None]:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or not ctx.seams.trusted(st):
             raise Refused("bad-root", "export/adopt.lock")
+    except BaseException:
+        _ADOPT_LOCK_FDS.discard(fd)
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextmanager
+def adopt_lock_wait(ctx: Ctx, deadline: float) -> Iterator[None]:
+    """(4) The machine-wide adopt lock ``L/export/adopt.lock`` (root 0600, never unlinked), taken AFTER the session
+    lock: ``LOCK_NB`` retries until V7's absolute ``deadline`` (``adopt-busy`` past it), so an operator adopt
+    waits behind a running import and takes the lock when it releases."""
+    fd = _open_adopt_lock(ctx)
+    try:
         if not flock_until(fd, deadline, ctx.seams):
             raise Refused("adopt-busy", "an import or verify held the adopt lock past the wait")
         yield
     finally:
         _ADOPT_LOCK_FDS.discard(fd)
         os.close(fd)   # the only descriptor: a forked child closed its copy after the fork
+
+
+@contextmanager
+def adopt_lock_try(ctx: Ctx) -> Iterator[None]:
+    """(4), for a caller that must never wait (the reaper's artifact step, S14 D1): ONE ``LOCK_NB`` try of the same
+    lock, taken after the session lock. Held by another = ``adopt-busy`` at once, with no sleep and no clock read
+    (:func:`adopt_lock_wait` with a deadline of now refuses before it ever tries). The caller's skip is not a failure."""
+    fd = _open_adopt_lock(ctx)
+    try:
+        if not try_flock(fd):
+            raise Refused("adopt-busy", "the adopt lock is held by another import or verify")
+        yield
+    finally:
+        _ADOPT_LOCK_FDS.discard(fd)
+        os.close(fd)
 
 
 def adopt_step5_precaps(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams) -> None:
@@ -3247,7 +3345,40 @@ def importer_args(session: str, base: Mapping[str, object], adopt: AdoptSeams) -
             "--max-input-size", str(adopt.max_bytes))
 
 
-def adopt_answer(ctx: Ctx, front: AdoptFront, result: str, pub: object, export_class: str) -> Dict[str, object]:
+#: The dispatch export's record: its name and format, and the bound the follower's reader holds it to (a test pins
+#: the bound against ``levain.dispatch.export.MAX_BYTES``; root never imports that module).
+ARTIFACT_FILE = "dispatch-artifact.json"
+ARTIFACT_FORMAT = "levain-dispatch-artifact/1"
+ARTIFACT_MAX_BYTES = 16 * 1024
+
+
+def artifact_record_bytes(front: AdoptFront, digests: Mapping[str, str]) -> bytes:
+    """CONTRACT §2.1 ``dispatch-artifact.json``, canonical, built from ROOT's facts only (S14 D1, D3): ``session`` and
+    ``ticket`` from the alloc, ``manifest_digest``, ``files`` (``object.json`` ``entries``) and ``bytes`` from END's
+    retained object (``front``), ``bundle`` / ``bundle_digest`` from the digest transact computed while copying
+    (None for an ``adopt-nothing-new`` run: no bundle). Nothing here is read from the importer's ``report.json``. Fails
+    CLOSED: no ticket, no well-formed ``manifest_digest`` (an object retained before row 165) or a record over the
+    reader's bound is a refusal, never a default."""
+    a = front.alloc
+    if not isinstance(a.ticket, str) or not a.ticket or a.kind not in ("dispatch", "planner"):
+        raise Refused("artifact-record:ticket", f"{a.session}: no ticket on a dispatch alloc")
+    if front.manifest_digest is None:
+        raise Refused("not-retained:absent", f"{a.session}: object.json carries no well-formed manifest_digest")
+    bundle = digests.get("bundle")
+    if bundle is not None and not (isinstance(bundle, str) and re.fullmatch(r"[0-9a-f]{64}", bundle)):
+        raise Refused("artifact-record:digest", a.session)
+    data = canon.canonical_bytes({
+        "format": ARTIFACT_FORMAT, "session": a.session, "ticket": a.ticket,
+        "manifest_digest": front.manifest_digest, "bundle": "bundle" if bundle is not None else None,
+        "bundle_digest": ("sha256:" + bundle) if bundle is not None else None,
+        "files": front.entries, "bytes": front.nbytes})
+    if len(data) > ARTIFACT_MAX_BYTES:
+        raise Refused("artifact-record:size", f"{a.session}: {len(data)} bytes")
+    return data
+
+
+def adopt_answer(ctx: Ctx, front: AdoptFront, result: str, pub: object, export_class: str,
+                 artifact_digest: Optional[str] = None) -> Dict[str, object]:
     """§4.5: ``result`` and ``refs`` from root's own header parse (never the importer's line), ``base_oid`` and
     ``object_format`` from ``alloc.base``, the digests of the bytes root copied; head ruling A2: the transaction's
     ``warnings`` (a class-dir fsync that failed after the commit) ride beside ``ok: true`` when there are any."""
@@ -3262,8 +3393,11 @@ def adopt_answer(ctx: Ctx, front: AdoptFront, result: str, pub: object, export_c
     out: Dict[str, object] = {
         "result": result, "repo": str(ctx.seams.L / "export" / export_class / s),
         "bundle_digest": ("sha256:" + digests["bundle"]) if "bundle" in digests else None,
-        "report_digest": "sha256:" + digests["report.json"],
         "base_oid": front.base["oid"], "object_format": front.base["object_format"], "refs": refs}
+    if "report.json" in digests:                    # the dispatch class copies none (S14 D1): no key, not a guess
+        out["report_digest"] = "sha256:" + digests["report.json"]
+    if artifact_digest is not None:
+        out["artifact_digest"] = artifact_digest    # sha256 of the dispatch-artifact.json root wrote
     warnings = tuple(getattr(pub, "warnings", ()))
     if warnings:
         out["warnings"] = list(warnings)
@@ -3290,17 +3424,34 @@ def detach_before_commit(run: object, seal: object, work_dfd: int) -> Callable[[
 
 
 def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: AdoptRunSeams,
-                     export_class: str = ADOPT_CLASS) -> Dict[str, object]:
+                     export_class: str = ADOPT_CLASS,
+                     artifact: Optional[Callable[[AdoptFront, Mapping[str, str]], bytes]] = None) -> Dict[str, object]:
     """Steps 6-12 inside both locks. Seal-in (``SealedRun.seal_in``) -> the skeleton and its owners -> (macOS) the
     importer profile written -> spawn -> the watchdog -> the walk into the frame pipe, whose write end is CLOSED as
     soon as the walker returns or refuses (the importer sees EOF at once, never its trailing wait) -> the result line
     and the reap -> seal-out ALWAYS (it kills anything the importer left) -> the ONE classification -> the publish
     (``before_commit`` = the image released) -> the §4.5 answer; teardown in a ``finally``. A walker refusal (head
     ruling Q5): seal-out still runs, ``export-domain-unproven`` from it wins, else the walker's own name; nothing is
-    published. The locks are the caller's (:func:`adopt_open_front`), released after this returns."""
+    published. The locks are the caller's (:func:`adopt_open_front`), released after this returns.
+
+    ``artifact`` (S14 D1) is the DISPATCH class's: ``artifact_record_bytes``-shaped, ``(front, digests) -> bytes``,
+    called inside the publish transaction so the record commits in the same rename as the bundle. The class and the
+    callable go together (fail closed: ``dispatch`` without one, or one under any other class, is refused before a
+    seal-in). The dispatch class copies the bundle only: ``report.json`` is still produced and checked, never
+    published (CONTRACT §2.1), so its answer has no ``report_digest`` and names ``artifact_digest`` instead."""
     from levain.slot import export_run as ER
     from levain.slot import importer as IM
     from levain.slot import walker as WK
+
+    if (export_class == "dispatch") != (artifact is not None):
+        raise Refused("artifact-record:class", "the dispatch class publishes with its record, and no other class does")
+    record_digest: List[str] = []
+    root_files = None
+    if artifact is not None:
+        def root_files(digests: Mapping[str, str]) -> Sequence[Tuple[str, bytes]]:
+            data = artifact(front, digests)
+            record_digest[:] = ["sha256:" + hashlib.sha256(data).hexdigest()]
+            return ((ARTIFACT_FILE, data),)
 
     at, host, s = ctx.seams.at, ctx.seams.host, front.alloc.session
     export_dir = str(ctx.seams.L / "export")
@@ -3379,9 +3530,11 @@ def adopt_sealed_run(ctx: Ctx, front: AdoptFront, adopt: AdoptSeams, run_seams: 
             result, pub = ER.publish_if_success(
                 outcome, work_dfd, class_dfd, s, object_format=str(front.base["object_format"]), owner_uid=uid,
                 caps={"bundle": image_bytes, "report.json": IM.REPORT_CAP}, seams=seal.publish,  # type: ignore[attr-defined]
-                gid=gid, before_commit=detach_before_commit(run, seal, work_dfd))
+                gid=gid, before_commit=detach_before_commit(run, seal, work_dfd),
+                copy=("bundle",) if artifact is not None else None,
+                root_files=root_files)
             at("adopt:12")
-            return adopt_answer(ctx, front, result, pub, export_class)
+            return adopt_answer(ctx, front, result, pub, export_class, record_digest[0] if record_digest else None)
         finally:
             try:
                 if not sealed_out:

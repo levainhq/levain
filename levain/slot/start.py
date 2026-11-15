@@ -8,7 +8,8 @@ CONTROL checks, never as a fact root acts on.
 
 ``start``, in §5.1's order, each step named for ``seams.at`` (tests observe the order and inject faults there):
 
-1. ``kind``: kind ``verifier`` answers ``verb-unbuilt:verifier`` (§5.6, session 2f). A ``login`` session proceeds
+1. ``kind``: kind ``verifier`` goes to :mod:`levain.slot.verifier_session` (§5.6: the clone, then each ticket step; no
+   vendor runs). A ``login`` session proceeds
    with no ``keep/`` return: its credential is the one the vendor's login writes. An interactive passthrough
    session (or a ticketed one, c7.14) runs :func:`_identity_gate` at the start of step 4, under the same lock: the slot's baseline read, the
    parked credential returned from ``keep/`` into the session tree, the vendor's identity call recorded in the state
@@ -85,6 +86,7 @@ from levain.slot import proc as PR
 from levain.slot import records as R
 from levain.slot import render as RD
 from levain.slot import runtime_helper as H
+from levain.slot import verifier_session as VS
 from levain.slot.runtime_grammar import RenderBlob, RuntimeRequest
 
 _SECRET_CAP = 512                 # DECISION: a handle is opaque printable ASCII up to this many bytes
@@ -900,7 +902,11 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         raise Refused("not-rendered", a.session)
     seams.at("kind")
     if a.kind == "verifier":
-        raise Refused("verb-unbuilt:verifier", "a verifier session's start is §5.6, session 2f's")
+        # §5.6: no vendor binary runs, so no vendor argv, install or ready check; discovery stays (the read-set kind's
+        # clone is checked like any other)
+        seams.at("discovery")
+        check_discovery(ctx, a)
+        return VS.run(ctx, a, _verifier_hooks(ctx, a))
     # p71 S8 D4: a dispatch session whose ticket facts are absent is refused here, before any clone or spawn
     vendor_argv(seams.host, a.vendor, a.session, kind=a.kind, ticket_kind=(a.ticket_facts or {}).get("kind"))
     seams.at("vendor")
@@ -1012,31 +1018,11 @@ def _park_back(facts: E.EndFacts, es: E.EndSeams, a: R.Alloc) -> None:
         _note(f"{a.session}: identity gate: the credential was not parked back: {_why(e)}")
 
 
-def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -> int:
-    """``start`` from the repo step through the ACTIVE CAS, under the session END lock (``L/alloc/<session>.lock``,
-    the one render takes and END waits on; reaper DESIGN RH1, the spawn fence). Every spawn into the slot (the
-    clone, its check children, the forwarder, the vendor) and every kill this start makes run under it, so an END
-    cannot prove, and SCRUB cannot release the slot, while a launch is in flight or being abandoned; and a start that
-    takes the lock after an END re-reads what END changed and refuses. Released right after the CAS's answer: the
-    vendor wait never holds it. Returns the vendor's pid."""
+def _clone_repo(ctx: H.Ctx, a: R.Alloc) -> None:
+    """The clone as the slot's (or a verifier's child) principal into ``<S>/repo``, the post-clone check for the read-set
+    kinds, and root's clone marker; under the session END lock. Shared by every kind's start: ``dispatch`` and
+    ``planner`` and ``verifier`` take the same steps (§5.4 step 3)."""
     seams = ctx.seams
-    egress = a.slot.slot_class == "egress"
-    if H.read_alloc(ctx, a.session) != a:                  # END or the reaper ran between the unlocked read and here
-        raise Refused("not-rendered", f"{a.session}: the alloc changed")
-    rec = read_record(ctx, a.session)
-    if E.cloned_path(ctx.store.path, a.session).exists() or (rec is not None and rec.state in (R.ACTIVE, R.BRAKED)):
-        # DECISION: a second start never clones twice. "Started" is what root and CONTROL recorded (ACTIVE or
-        # BRAKED, or root's clone marker: a repo a vendor may already have worked in), never the dir's existence.
-        raise Refused("already-started", a.session)
-    if rec is None or rec.state != R.RENDERED:
-        raise Refused("not-rendered", f"{a.session}: {rec.state if rec else 'no record'}")   # SECRETS' own rule
-    if H.identity_gated(a):
-        # c7.14: a ticketed passthrough session (alloc auth passthrough only exists on one CONTROL bound to a
-        # passthrough ticket: ATTACH compares the two) takes the same keep/ return and identity compare
-        _identity_gate(ctx, a)
-    with ctx.store.dir("live", a.session) as sfd:
-        _fresh_repo(ctx, a, sfd)
-
     seams.at("clone")
     spec = _spec(ctx, a, "clone")
     argv, cgroup = launch(ctx, a, spec)
@@ -1071,6 +1057,70 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -
             raise Refused("clone-failed",
                           detail[:512] if why is None else f"{detail[:448]}; <S>/repo not emptied ({why})")
     E.mark_cloned(ctx.store.path, a.session)
+
+
+def _verifier_guards(ctx: H.Ctx, a: R.Alloc) -> None:
+    """A verifier's start guards, under the lock: a second start never clones twice (ACTIVE or BRAKED, root's clone
+    marker, or a report field already set) and the record is RENDERED."""
+    rec = read_record(ctx, a.session)
+    if E.cloned_path(ctx.store.path, a.session).exists() or (rec is not None and rec.state in (R.ACTIVE, R.BRAKED)) \
+            or (rec is not None and any(f in rec.fields for f in VS.REPORT_FIELDS)):
+        raise Refused("already-started", a.session)
+    if rec is None or rec.state != R.RENDERED:
+        raise Refused("not-rendered", f"{a.session}: {rec.state if rec else 'no record'}")
+
+
+def _verifier_hooks(ctx: H.Ctx, a: R.Alloc) -> "VS.Hooks":
+    """What :mod:`levain.slot.verifier_session` takes from this module: the record, the guarded clone, and the launch
+    of one target (``step`` or ``driver``) in its own cgroup leaf (Linux)."""
+    seams = ctx.seams
+
+    def clone() -> None:
+        _verifier_guards(ctx, a)
+        with ctx.store.dir("live", a.session) as sfd:
+            _fresh_repo(ctx, a, sfd)
+        _clone_repo(ctx, a)
+
+    def launch_target(target: str, argv: Sequence[str], leaf: Optional[str]
+                      ) -> Tuple[Tuple[str, ...], bytes, Optional[str]]:
+        spec = _spec(ctx, a, target, argv=tuple(argv))
+        if seams.host == "darwin":
+            return wall.macos_launch_argv(spec), spec.to_json(), None
+        ll = wall.linux_launch_argv(spec, slot=a.slot, session=a.session, kind=a.kind, queue_grant=False,
+                                    netns_names=seams.netns_names, host_links=seams.host_links(), cgroup_leaf=leaf)
+        return ll.argv, spec.to_json(), ll.cgroup
+
+    return VS.Hooks(state=lambda: read_record(ctx, a.session), clone=clone, launch=launch_target,
+                    wake=lambda: _wake(seams))
+
+
+
+def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -> int:
+    """``start`` from the repo step through the ACTIVE CAS, under the session END lock (``L/alloc/<session>.lock``,
+    the one render takes and END waits on; reaper DESIGN RH1, the spawn fence). Every spawn into the slot (the
+    clone, its check children, the forwarder, the vendor) and every kill this start makes run under it, so an END
+    cannot prove, and SCRUB cannot release the slot, while a launch is in flight or being abandoned; and a start that
+    takes the lock after an END re-reads what END changed and refuses. Released right after the CAS's answer: the
+    vendor wait never holds it. Returns the vendor's pid."""
+    seams = ctx.seams
+    egress = a.slot.slot_class == "egress"
+    if H.read_alloc(ctx, a.session) != a:                  # END or the reaper ran between the unlocked read and here
+        raise Refused("not-rendered", f"{a.session}: the alloc changed")
+    rec = read_record(ctx, a.session)
+    if E.cloned_path(ctx.store.path, a.session).exists() or (rec is not None and rec.state in (R.ACTIVE, R.BRAKED)):
+        # DECISION: a second start never clones twice. "Started" is what root and CONTROL recorded (ACTIVE or
+        # BRAKED, or root's clone marker: a repo a vendor may already have worked in), never the dir's existence.
+        raise Refused("already-started", a.session)
+    if rec is None or rec.state != R.RENDERED:
+        raise Refused("not-rendered", f"{a.session}: {rec.state if rec else 'no record'}")   # SECRETS' own rule
+    if H.identity_gated(a):
+        # c7.14: a ticketed passthrough session (alloc auth passthrough only exists on one CONTROL bound to a
+        # passthrough ticket: ATTACH compares the two) takes the same keep/ return and identity compare
+        _identity_gate(ctx, a)
+    with ctx.store.dir("live", a.session) as sfd:
+        _fresh_repo(ctx, a, sfd)
+
+    _clone_repo(ctx, a)
 
     if egress and seams.host == "linux":
         seams.at("forwarder")
@@ -1313,7 +1363,13 @@ def end_seams(ctx: H.Ctx, a: R.Alloc) -> E.EndSeams:
         ctx.call("CAS", session=a.session, generation=rec.generation, **{"from": rec.state, "to": target},
                  fields=dict(fields))
 
-    es = E.EndSeams(cas=cas, freeze=freeze, kill=kill, no_process=no_process, note=_note)
+    def report_set() -> bool:
+        """S14 A3: whether the record holds a verifier report field NOW (END reads this once, when it starts). A record
+        that cannot be read counts as set: END then sends none (fail closed)."""
+        rec = read_record(ctx, a.session)
+        return rec is None or any(k in rec.fields for k in (E.REPORT_DIGEST, E.REPORT_REFUSED))
+
+    es = E.EndSeams(cas=cas, freeze=freeze, kill=kill, no_process=no_process, note=_note, report_set=report_set)
     return replace(es, **seams.end_overrides) if seams.end_overrides else es
 
 
@@ -1518,6 +1574,7 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     seams = ctx.seams
     a = H.read_alloc(ctx, req.session)
     seams.at("revoke")
+    first = read_record(ctx, a.session)     # S14 A3: the state END started from, for a verifier's no-report:<state>
     revoke(ctx, a.session)
     seams.at("end")
     rec = read_record(ctx, a.session)
@@ -1526,7 +1583,8 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     try:
         out = E.end_session(end_facts(ctx, a), end_seams(ctx, a), record_state=rec.state,
                             failed_step=rec.fields.get("failed_step"),            # type: ignore[arg-type]
-                            held_attempts=rec.fields.get("held_attempts"))        # type: ignore[arg-type]
+                            held_attempts=rec.fields.get("held_attempts"),        # type: ignore[arg-type]
+                            report_from=first.state if first is not None else rec.state)
     except E.CasNotSent as e:
         raise Refused("end-cas-not-sent", str(e)[:256]) from None
     if out != R.RETAINED:

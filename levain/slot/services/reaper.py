@@ -31,6 +31,7 @@ import sys
 import time
 from typing import Callable, List, Optional
 
+from levain.slot import artifact_step as AS
 from levain.slot import reaper as RP
 from levain.slot import runtime_helper as H
 
@@ -170,6 +171,33 @@ def worker_loop(reaper: RP.Reaper, wake_fd: int, *, passes: Optional[int] = None
         _wait(wake_fd, last + tick_s - mono())
 
 
+def artifact_loop(worker: AS.ArtifactWorker, wake_fd: int, *, ticks: Optional[int] = None,
+                  tick_s: float = AS.ARTIFACT_TICK_S, log: Callable[[str], None] = _log) -> int:
+    """The artifact child (§7.7 3b, design D1 b): :meth:`levain.slot.artifact_step.ArtifactWorker.tick` on every tick and
+    on a wake. One import is bounded by V7 + its result grace, and the pass worker never waits on it. A tick that raises
+    is logged and the next one runs; the line is logged only when it changes."""
+    log(f"artifact pid {os.getpid()} parent {os.getppid()}")
+    n = 0
+    last_line = None
+    while True:
+        if not _drain(wake_fd):
+            log("artifact: the main process is gone; exiting")
+            return 0
+        n += 1
+        try:
+            rep = worker.tick()
+        except Exception as e:   # noqa: BLE001 - one bad tick is logged; the next runs
+            log(f"artifact tick failed: {type(e).__name__}: {e}")
+        else:
+            line = f"exported {rep['exported']} failed {rep['artifact_failed']} held {rep['held']} skipped {rep['skipped']}"
+            if line != last_line and any(rep.values()):
+                log(f"artifact tick {n}: {line}")
+            last_line = line
+        if ticks is not None and n >= ticks:
+            return 0
+        _wait(wake_fd, tick_s)
+
+
 def revoker_loop(revoker: RP.Revoker, wake_fd: int, *, wakes: Optional[int] = None, tick_s: float = RP.V11_S,
                  log: Callable[[str], None] = _log) -> int:
     log(f"revoker pid {os.getpid()} parent {os.getppid()}")
@@ -231,7 +259,7 @@ class _Child:
 
 
 def serve(seams: H.Seams, *, tuning: RP.Tuning = RP.Tuning(), worker_passes: Optional[int] = None,
-          revoker_wakes: Optional[int] = None, tick_s: float = RP.V11_S,
+          revoker_wakes: Optional[int] = None, artifact_ticks: Optional[int] = None, tick_s: float = RP.V11_S,
           chown_path: Callable[[str, int, int], None] = os.chown, log: Callable[[str], None] = _log,
           netns: Optional[Callable[[list], None]] = None) -> int:
     """The main process. ``worker_passes`` / ``revoker_wakes`` bound a child for a host smoke run (a child that ran
@@ -284,11 +312,13 @@ def serve(seams: H.Seams, *, tuning: RP.Tuning = RP.Tuning(), worker_passes: Opt
         sock = bind_wake(seams, chown_path=chown_path)
         reaper = RP.Reaper(seams, tuning=tuning, log=log, netns=netns)
         revoker = RP.Revoker(seams, log=log, tick_s=tick_s)
+        artifact = AS.ArtifactWorker(seams, log=log)
         children[:] = [
             _Child("worker", lambda fd: worker_loop(reaper, fd, passes=worker_passes, tick_s=tick_s, log=log),
                    worker_passes),
             _Child("revoker", lambda fd: revoker_loop(revoker, fd, wakes=revoker_wakes, tick_s=tick_s, log=log),
                    revoker_wakes),
+            _Child("artifact", lambda fd: artifact_loop(artifact, fd, ticks=artifact_ticks, log=log), artifact_ticks),
         ]
         for s in (signal.SIGTERM, signal.SIGINT):
             old[s] = signal.signal(s, on_term)

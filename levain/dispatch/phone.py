@@ -483,7 +483,7 @@ class DispatchPhone:
     def _answer(self, store: Any, job: Any, req: dict[str, Any], cancel: bool) -> dict[str, Any]:
         from levain.consent.passkey import b64url_decode, to_sshsig
         from levain.dispatch import sign as dsign
-        from levain.dispatch.jobs import TERMINAL, SignatureRefused, TransitionRefused
+        from levain.dispatch.jobs import TERMINAL, SignatureRefused, StopRequested, TransitionRefused
 
         if cancel and job.state in TERMINAL:
             raise DispatchRefused(409, "conflict", f"job {job.id} is {job.state}, which is final")
@@ -501,6 +501,16 @@ class DispatchPhone:
                 out = store.cancel_by_human(job.id, payload, signature, self._authority())
             else:
                 out = store.sign(job.id, payload, signature, self._authority())
+        except StopRequested as exc:
+            # the signature verified and the cancel is KEPT as a stop request: a success that is not yet a cancel. The
+            # signer and reason are the KEPT request's (the one recorded), which a second cancel does not replace
+            if exc.already_kept:
+                return {"job_id": job.id, "state": "running", "already_kept": True,
+                        "outcome": "a cancel was already kept; it stands, not yet stopped", "message": str(exc),
+                        "signer_fp": exc.signer_fp, "reason": exc.reason}
+            return {"job_id": job.id, "state": "running", "already_kept": False,
+                    "outcome": "stop requested, not yet stopped", "message": str(exc), "signer_fp": exc.signer_fp,
+                    "signed_at": payload["signed_at"], "reason": exc.reason}
         except (SignatureRefused, TransitionRefused) as exc:
             # a job another writer moved while this one verified is a conflict, never "not your signature"
             now = store.get(job.id)

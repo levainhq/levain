@@ -584,11 +584,19 @@ def test_every_door_but_stop_recorded_refuses_to_end_a_running_job(store, repo, 
     assert json.loads(out.history[-1].evidence) == {"stopped": True, "why": "killed at the cap"}
 
 
-@pytest.mark.parametrize("cause", ["planner_cancel", "human_cancel"])
-def test_stop_recorded_records_a_cancel_as_cancelled(store, repo, env, cause):
-    job, _ = running_job(store, repo, env)
-    out = store.stop_recorded(job.id, cause)
-    assert (out.state, out.history[-1].cause) == ("cancelled", cause)
+def test_stop_recorded_records_a_cancel_only_from_its_kept_request(store, repo, env):
+    # s14fix2 (codex L221, complement L22): the store, not the caller, holds the cancel's authority
+    from levain.dispatch.jobs import StopRequested
+    job, cap = running_job(store, repo, env)
+    for cause in ("planner_cancel", "human_cancel"):
+        with pytest.raises(TransitionRefused, match="kept"):
+            store.stop_recorded(job.id, cause)
+    with pytest.raises(StopRequested):
+        store.cancel_by_planner(job.id, cap)
+    with pytest.raises(TransitionRefused, match="human"):
+        store.stop_recorded(job.id, "human_cancel")                      # a planner's request is no human's signature
+    out = store.stop_recorded(job.id, "planner_cancel")
+    assert (out.state, out.history[-1].cause) == ("cancelled", "planner_cancel")
 
 
 def test_stop_recorded_lease_lapsed_past_the_lease(store, repo, env):

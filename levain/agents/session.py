@@ -65,7 +65,7 @@ from levain.agents.store import AgentStore
 from levain.agents.supervise import STOP_DEADLINE_S as _STOP_DEADLINE_S   # the reaper's stop deadline, reused
 
 __all__ = ["S1_DISPATCH", "AUTH_FOR_BILLING", "EFFECT_ID", "BRIEF_MAX_BYTES", "RECALL_MAX_BYTES", "Workspace",
-           "WORKSPACE_REPO_MAX", "WORKSPACE_WITHHOLD_MAX", "WORKSPACE_BRANCH_MAX", "WORKSPACE_REFUSED", "branch_problem", "SessionLaunch",
+           "WORKSPACE_REPO_MAX", "WORKSPACE_WITHHOLD_MAX", "WORKSPACE_BRANCH_MAX", "WORKSPACE_REFUSED", "branch_problem", "DispatchBinding", "SessionLaunch",
            "SessionLauncher", "UnwiredLauncher", "Reserved", "SessionExecutor", "SessionReport", "BriefRefused",
            "render_brief", "new_session_key", "reserved_terms", "launch_refusal", "run_session", "make_run",
            "SessionEnder", "RowSessionExecutor", "session_executor_of"]
@@ -149,6 +149,30 @@ class Workspace:
             raise ValueError("workspace.branch is not a branch name")
 
 
+_BINDING_JOB_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}")
+_BINDING_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+@dataclass(frozen=True)
+class DispatchBinding:
+    """The dispatch identity of a BROKERED run (S14 R1): which job, which run of it, and the job's own contract digest.
+    ``RealLauncher._facts`` mints the executor ticket with exactly these three, in place of the three it derives from
+    an agent occurrence, because the follower reads a run back by them (``ticket_for(job_id, run_index)``). Only the
+    dispatch runner builds one, from a job's STORED row (never a wire member: ``session_client`` fills none), and the
+    shape is checked here so a malformed binding never exists to be minted."""
+    job_id: str
+    run_index: int
+    contract_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.job_id) is not str or _BINDING_JOB_RE.fullmatch(self.job_id) is None:
+            raise ValueError("binding.job_id is not a job id")
+        if type(self.run_index) is not int or not 0 <= self.run_index < 64:
+            raise ValueError("binding.run_index is not a run index")
+        if type(self.contract_digest) is not str or _BINDING_DIGEST_RE.fullmatch(self.contract_digest) is None:
+            raise ValueError("binding.contract_digest is not a sha256 digest")
+
+
 @dataclass(frozen=True)
 class SessionLaunch:
     """What the launcher is asked to start: the occurrence, the key the supervisor recorded, the role's harness and
@@ -169,6 +193,8 @@ class SessionLaunch:
     #: can only refuse a launch, never price one, and a keys cap is never above what the window holds (wave-3 RETURN
     #: finding 1: S-B1 admits an exposure BELOW the figure). None for a passthrough launch, which must send none.
     usd_micros: int | None = None
+    #: a DISPATCH run's identity (S14 R1): None for an agent occurrence's launch, which is every launch before the runner
+    binding: DispatchBinding | None = None
 
 
 @runtime_checkable

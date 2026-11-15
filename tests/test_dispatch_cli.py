@@ -1086,3 +1086,62 @@ def test_agent_config_paths_reach_the_nested_files_the_agents_load_from_a_subdir
               "pkg/.claude/rules/r.md", "pkg/.Claude/skills/s/SKILL.md"]
     assert agent_config_paths(nested + ["src/a.py", "docs/claude.txt", "pkg/.mcp.json", "pkg/.codex/c.toml",
                                         "pkg/.agents/s.md"]) == sorted(nested)
+
+
+def test_a_planner_cancel_of_a_running_job_says_the_request_is_kept_not_refused(capsys, ddir, contract_file):
+    # L1 F2: the store keeps the request (StopRequested); the door must not say "refused, nothing changed"
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    store = JobStore(ddir)
+    store._transition(job_id, "signed", "signature")
+    store._transition(job_id, "running", "slot_taken")
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
+                       "sess-1")
+    # s14fix2 (head decision): "kept, not yet stopped" is its own nonzero exit, 4 (never 0, which a script reads as
+    # cancelled while the job still writes; never 3, nothing faulted)
+    assert code == dcli.EXIT_KEPT == 4
+    assert "KEPT as a stop request, not yet stopped" in out and "nothing changed" not in out
+    assert store.get(job_id).state == "running" and store.stop_requested(job_id) == "planner_cancel"
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
+                       "sess-1", "--json")
+    assert code == 4 and json.loads(out)["already_kept"] is True                # a second request kept nothing new
+
+
+def test_the_cancel_help_names_exit_4_for_kept_not_yet_stopped(capsys):
+    import pytest as _pytest
+    with _pytest.raises(SystemExit):
+        main(["dispatch", "cancel", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "4 the job is RUNNING: the cancel is KEPT as a stop request and not yet stopped" in text
+    assert "4 a cancel of a RUNNING job KEPT as a stop request" in " ".join(dcli.__doc__.split())
+
+
+def test_a_store_read_fault_after_a_kept_planner_request_still_says_kept(capsys, ddir, contract_file, monkeypatch):
+    # L3 codex L227 / deepseek M2, run through the real CLI: StopRequested is a TransitionRefused, and the planner
+    # branch's TransitionRefused handler read the job again; a fault on that read turned a KEPT request into "NOT
+    # cancelled" (exit 3). The request is kept either way, so the door says so
+    import sqlite3
+    from levain.dispatch.jobs import StopRequested
+    job_id = file_one(capsys, ddir, contract_file)["id"]
+    store = JobStore(ddir)
+    store._transition(job_id, "signed", "signature")
+    store._transition(job_id, "running", "slot_taken")
+    real_cancel, real_get, armed = JobStore.cancel_by_planner, JobStore.get, []
+
+    def cancel(self, *a, **k):
+        try:
+            return real_cancel(self, *a, **k)
+        except StopRequested:
+            armed.append(1)
+            raise
+
+    def get(self, jid):
+        if armed:
+            raise sqlite3.OperationalError("database is locked")
+        return real_get(self, jid)
+    monkeypatch.setattr(JobStore, "cancel_by_planner", cancel)
+    monkeypatch.setattr(JobStore, "get", get)
+    code, out, _ = run(capsys, "cancel", job_id, "--dispatch-dir", str(ddir), "--agent", "claude_code", "--session",
+                       "sess-1")
+    assert code == 4 and armed and "KEPT as a stop request" in out and "NOT cancelled" not in out, out
+    monkeypatch.undo()
+    assert store.stop_requested(job_id) == "planner_cancel"

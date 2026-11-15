@@ -388,6 +388,17 @@ def _prefix_problem(fd: int, E: str, N: int) -> str | None:
     return None
 
 
+def handoff_prefix_problem(fd: int, contract_bytes: bytes, D: str) -> str | None:
+    """The cheap pre-take check on a handoff ``fd`` (from :func:`open_handoff`): ``None`` when its first bytes are the
+    bundle header and pack header :func:`readset_commit` derives from (``contract_bytes``, ``D``), else ``header`` or
+    ``pack``. It reads no more than the prefix, so it proves nothing about the rest; :func:`verify_readset` does."""
+    E, _tree, N = readset_commit(contract_bytes, D)
+    try:
+        return _prefix_problem(fd, E, N)
+    except (OSError, TypeError) as exc:
+        raise ReadSetRefused("readset-handoff", f"the handoff fd cannot be read ({type(exc).__name__})") from None
+
+
 #: Slack over the handoff cap for the bundle writer's file-size limit: a bundle past the cap stops a MiB later, not at
 #: whatever the disk holds.
 BUNDLE_FSIZE_SLACK = 1 << 20

@@ -694,7 +694,8 @@ def _describe(body: dict[str, Any], store: EnvelopeStore | None = None, *, binds
         return f"{shown} allowed" if v else "0 allowed (none named: new steps stop at once)"
     L += [f"    tool calls: {_allowed(b['tool_calls'], str(b['tool_calls']))}",
           f"    tokens: {_allowed(b['tokens'], str(b['tokens']))}",
-          f"    dollars: {_money(b['dollars_cents'])} (not metered: Levain counts no dollars, so this never stops a step)",
+          f"    dollars: {_money(b['dollars_cents'])} (the thread's dollars are not metered and never stop a step; "
+          "each dispatch job's dollars are capped per run at the gateway)",
           f"    hours: {_allowed(b['hours'], str(b['hours']))}"]
     stop = (f"was to stop {_clock(parse_stamp(body['stop_at']))}" if ended else _stops(body['stop_at'], now))
     L.append(f"  issued {_clock(parse_stamp(body['issued_at']))}; {stop}")
@@ -2950,7 +2951,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     ee.add_argument("--stop", default="2h", metavar="DURATION", help="When it stops: 2h, 90m, 1h30m (at most 24h).")
     ee.add_argument("--budget", default=None, metavar="K=N,...",
                     help="tool_calls=N,tokens=N,hours=N, each named (K=0 means none), and dollars_cents=N if you "
-                         "want it (not metered; left out is 0). Without --budget every key is 0.")
+                         "want it (the thread's dollars are not metered; a dispatch job's are capped "
+                         "per run at the gateway; left out is 0). Without --budget every key is 0.")
     ee.add_argument("-o", "--output", type=Path, default=None, metavar="FILE",
                     help="Write the canonical body here (default: print it).")
     ee.add_argument("--force", action="store_true", help="Replace an existing -o file.")

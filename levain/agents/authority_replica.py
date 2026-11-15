@@ -58,6 +58,7 @@ SYNC_MAX_ROWS = 1024
 #: how long an append waits for the replica's own readers before it answers transient ``ledger-busy``
 APPEND_BUSY_TIMEOUT_S = 5.0
 LOCK_NAME = ".append.lock"
+_META_SCHEMA = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
 #: what the replica keeps in its root, and in ``<root>/anchor``
 _ROOT_FILES = (DB_NAME, DB_NAME + "-journal", DB_NAME + "-wal", DB_NAME + "-shm", LOCK_NAME)
 _ANCHOR_FILES = (_auth.ANCHOR_NAME, _auth.ANCHOR_NAME + ".lock")
@@ -251,6 +252,10 @@ class AuthorityReplica:
     def _txn(self, conn: sqlite3.Connection, path: Path, rows: "list[ReplicaRow]") -> Head:
         try:
             _auth.create_schema(conn)
+            # the cockpit's own `meta` table, empty: `RequestAuthority.capture` (so `authority_source`, so a
+            # `ControlStore` verifying against this replica) reads its `uninitialised` marker, and a database with no
+            # `meta` table raises there. Empty means no marker; the replica sets none.
+            conn.execute(_META_SCHEMA)
             conn.execute("BEGIN IMMEDIATE")
         except sqlite3.OperationalError:
             raise ReplicaRefused("ledger-busy", "the replica is busy", "transient") from None

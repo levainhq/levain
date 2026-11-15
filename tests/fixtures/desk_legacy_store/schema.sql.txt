@@ -30,6 +30,8 @@ index threads_gseq
 CREATE UNIQUE INDEX threads_gseq ON threads (gseq);
 table arrival_signals
 CREATE TABLE arrival_signals (signal_id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT NOT NULL CHECK (length(agent) > 0), mark_id TEXT NOT NULL CHECK (length(mark_id) > 0), queue_id TEXT NOT NULL, ingested_at TEXT NOT NULL, gseq INTEGER NOT NULL UNIQUE, UNIQUE (agent, mark_id));
+table artifact_failures
+CREATE TABLE artifact_failures (session TEXT NOT NULL, ticket TEXT NOT NULL, name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 128), at TEXT NOT NULL, PRIMARY KEY (session, ticket));
 table artifact_take_failures
 CREATE TABLE artifact_take_failures (session TEXT NOT NULL, ticket TEXT NOT NULL, failures INTEGER NOT NULL CHECK (failures >= 1), reason TEXT NOT NULL, parked INTEGER NOT NULL CHECK (parked IN (0, 1)), at TEXT NOT NULL, PRIMARY KEY (session, ticket));
 table artifact_takes
@@ -148,6 +150,8 @@ table signatures
 CREATE TABLE signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL, signature TEXT NOT NULL, signer_fp TEXT NOT NULL, at TEXT NOT NULL);
 table sqlite_sequence
 CREATE TABLE sqlite_sequence(name,seq);
+table stop_requests
+CREATE TABLE stop_requests (job_id TEXT NOT NULL REFERENCES jobs(id), cause TEXT NOT NULL CHECK (cause IN ('planner_cancel', 'human_cancel')), signer TEXT NOT NULL, payload TEXT NOT NULL, signature TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (job_id, cause));
 table team_draft_events
 CREATE TABLE team_draft_events (draft_id TEXT NOT NULL REFERENCES team_drafts(draft_id), seq INTEGER NOT NULL, event TEXT NOT NULL CHECK (event IN ('drafted', 'promoting', 'withdrawn', 'promoted')), ledger_id TEXT, by TEXT NOT NULL CHECK (by IN ('operator', 'coordinator', 'service')), at TEXT NOT NULL, owner TEXT CHECK ((owner IS NOT NULL) = (event = 'promoting')), gseq INTEGER, PRIMARY KEY (draft_id, seq));
 table team_drafts
@@ -170,6 +174,10 @@ trigger arrival_signals_kept
 CREATE TRIGGER arrival_signals_kept BEFORE DELETE ON arrival_signals BEGIN SELECT RAISE(ABORT, 'an arrival signal is append-only'); END;
 trigger arrival_signals_no_replace
 CREATE TRIGGER arrival_signals_no_replace BEFORE INSERT ON arrival_signals WHEN EXISTS (SELECT 1 FROM arrival_signals WHERE signal_id = NEW.signal_id OR gseq = NEW.gseq OR (agent = NEW.agent AND mark_id = NEW.mark_id)) BEGIN SELECT RAISE(ABORT, 'an arrival signal is never replaced'); END;
+trigger artifact_failures_frozen
+CREATE TRIGGER artifact_failures_frozen BEFORE UPDATE ON artifact_failures BEGIN SELECT RAISE(ABORT, 'an artifact failure is recorded once'); END;
+trigger artifact_failures_kept
+CREATE TRIGGER artifact_failures_kept BEFORE DELETE ON artifact_failures BEGIN SELECT RAISE(ABORT, 'an artifact failure is recorded once'); END;
 trigger artifact_takes_frozen
 CREATE TRIGGER artifact_takes_frozen BEFORE UPDATE ON artifact_takes BEGIN SELECT RAISE(ABORT, 'a taken artifact is recorded once'); END;
 trigger artifact_takes_kept
@@ -562,6 +570,10 @@ trigger signatures_kept
 CREATE TRIGGER signatures_kept BEFORE DELETE ON signatures BEGIN SELECT RAISE(ABORT, 'a signature is written once'); END;
 trigger signatures_no_replace
 CREATE TRIGGER signatures_no_replace BEFORE INSERT ON signatures WHEN EXISTS (SELECT 1 FROM signatures WHERE job_id = NEW.job_id OR rowid = NEW.rowid) BEGIN SELECT RAISE(ABORT, 'a signature is never replaced'); END;
+trigger stop_requests_frozen
+CREATE TRIGGER stop_requests_frozen BEFORE UPDATE ON stop_requests BEGIN SELECT RAISE(ABORT, 'a stop request is written once'); END;
+trigger stop_requests_kept
+CREATE TRIGGER stop_requests_kept BEFORE DELETE ON stop_requests BEGIN SELECT RAISE(ABORT, 'a stop request is written once'); END;
 trigger team_draft_events_final
 CREATE TRIGGER team_draft_events_final BEFORE INSERT ON team_draft_events WHEN EXISTS (SELECT 1 FROM team_draft_events WHERE draft_id = NEW.draft_id AND event IN ('withdrawn', 'promoted')) BEGIN SELECT RAISE(ABORT, 'a withdrawn or promoted draft is final'); END;
 trigger team_draft_events_frozen

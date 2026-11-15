@@ -13,6 +13,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -118,9 +119,16 @@ def setup_verifier(store, repo, rig, *, refused=None):  # noqa: F811
     for frm, to in END_CHAIN[:-1]:
         cas(rig, frm, to, SESSION_V)
     field = {"verifier_report_refused": refused} if refused else {"verifier_report_digest": d.digest}
-    cas(rig, R.CREDENTIAL_PARKED, R.CREDENTIAL_PARKED, SESSION_V, **field)
-    cas(rig, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V)
+    # A0: the report field rides the move into RETAINED (END's own CAS), never a field-only CAS on CREDENTIAL_PARKED
+    cas(rig, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V, **field)
     return d
+
+
+def tamper(rig, session: str, **fields) -> None:
+    """Overwrite report/artifact fields on CONTROL's record directly: CONTROL's own set-once rule (A0, D0) refuses a
+    CAS that names a different value, so a record that diverges from its event can only be made by writing the store."""
+    rec = rig.control.store.get(session)
+    rig.control.store.put(dataclasses.replace(rec, fields={**rec.fields, **fields}))
 
 
 def acked(rig) -> bool:
@@ -154,8 +162,7 @@ def test_a_live_event_reaches_the_follower(store, repo, served):  # noqa: F811
     assert root(served, "REVOKE", session=SESSION_V)["ok"]
     for frm, to in END_CHAIN[:-1]:
         cas(served, frm, to, SESSION_V)
-    cas(served, R.CREDENTIAL_PARKED, R.CREDENTIAL_PARKED, SESSION_V, verifier_report_digest=d.digest)
-    cas(served, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V)
+    cas(served, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V, verifier_report_digest=d.digest)
     assert f.step().outcome == CC.DEADLINE
     assert [r.run for r in store.run_records(d.job.id)] == [0] and acked(served)
     f.close()
@@ -248,7 +255,7 @@ def test_a_refused_ack_stops_the_follower_by_name_with_the_cursor_unmoved(store,
     """CONTROL's record now carries another report digest than the event dispatch recorded from: the ACK is
     `artifact-not-published`, the follower stops naming it, and the cursor stays before the event."""
     d = setup_verifier(store, repo, served)
-    cas(served, R.RETAINED, R.RETAINED, SESSION_V, verifier_report_digest="sha256:" + "b" * 64)
+    tamper(served, SESSION_V, verifier_report_digest="sha256:" + "b" * 64)
     f = d.follower()
     with pytest.raises(F.FollowStopped) as e:
         f.step()
@@ -327,8 +334,7 @@ def test_a_byte_copy_of_another_tickets_stored_envelope_stops_the_follower_unack
     assert root(served, "REVOKE", session=SESSION_V)["ok"]
     for frm, to in END_CHAIN[:-1]:
         cas(served, frm, to, SESSION_V)
-    cas(served, R.CREDENTIAL_PARKED, R.CREDENTIAL_PARKED, SESSION_V, verifier_report_digest=d.digest)
-    cas(served, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V)
+    cas(served, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V, verifier_report_digest=d.digest)
     f = d.follower()
     with pytest.raises(F.FollowStopped) as exc:
         f.step()
@@ -529,6 +535,21 @@ BUNDLE_DIGEST = "sha256:" + hashlib.sha256(BUNDLE).hexdigest()
 ART_DIGEST = "sha256:" + "a" * 64
 
 
+@pytest.fixture(autouse=True)
+def _lax_placeholder_digest():
+    """These rows predate D3's binding: their events carry the placeholder ART_DIGEST, not the digest of the file the
+    row writes. The placeholder alone skips the check; any other digest is bound to the file's bytes exactly as in
+    production (the D3 rows are in test_dispatch_s14d3_artifact.py)."""
+    real = F.read_artifact
+
+    def lax(export_dir, session, *, expect_digest=None):
+        return real(export_dir, session, expect_digest=None if expect_digest == ART_DIGEST else expect_digest)
+
+    # not the monkeypatch fixture: a row that calls monkeypatch.undo() would take this patch with it
+    with mock.patch.object(F, "read_artifact", lax):
+        yield
+
+
 def exported(tmp_path, session, ticket, named=None, content=BUNDLE, **over):
     """Root's published directory for ``session`` under a fresh export dir: `dispatch-artifact.json` and, unless the
     artifact names no bundle, the bundle file it digests."""
@@ -558,6 +579,21 @@ def published(served, **fields):
     ev = served.kept()[-1]
     assert ev["kind"] == "artifact"
     return SESSION, ev["ticket"], ev["seq"]
+
+
+def published_for(served, export_of):
+    """A retained executor session whose artifact event names the digest of the file ``export_of(session, ticket)``
+    wrote (the ticket is minted first, then the file, then the CAS carrying its digest): the event binds the file as
+    in production. Returns (session, ticket, seq, export dir)."""
+    from tests.test_tickets import SESSION
+    ticket, _run, _att = bound_session(served)
+    to_retained(served)
+    export = export_of(SESSION, ticket)
+    digest = "sha256:" + hashlib.sha256((export / SESSION / "dispatch-artifact.json").read_bytes()).hexdigest()
+    cas(served, R.RETAINED, R.RETAINED, SESSION, artifact_digest=digest)
+    ev = served.kept()[-1]
+    assert ev["kind"] == "artifact" and ev["ticket"] == ticket
+    return SESSION, ticket, ev["seq"], export
 
 
 def test_a_read_artifact_is_acked_and_the_cursor_moves(store, repo, served, tmp_path):  # noqa: F811
@@ -652,7 +688,7 @@ def test_an_ack_control_refuses_stops_the_follower_by_name_with_the_cursor_unmov
     d = Dispatch(store, repo, served)
     session, ticket, seq = published(served)
     export = exported(tmp_path, session, ticket)
-    cas(served, R.RETAINED, R.RETAINED, session, artifact_digest="sha256:" + "e" * 64)
+    tamper(served, session, artifact_digest="sha256:" + "e" * 64)
     f = artifact_follower(d, export)
     with pytest.raises(F.FollowStopped) as e:
         f.step()
@@ -1149,4 +1185,107 @@ def test_a_follower_records_the_route_maps_backend_not_the_resolves_label(store,
     [rec] = store.run_records(d.job.id)
     assert rec.model == {"requested": "glm-5", "answered": "label-x", "backend_identity": "backend-0",
                          "identity_source": "routemap"}
+    f.close()
+
+
+# --- S14 fix 1 (L2 H1 / L1 F1): a report with no tree fails its job and is acked; it never wedges the stream ---------
+
+class ListStream:
+    """A SESSION-EVENTS stream of the given frames, then CLOSED; the follower's own ACK still goes to the real CONTROL."""
+
+    def __init__(self, frames) -> None:
+        self.frames, self.outcome = list(frames), None
+
+    def __iter__(self):
+        yield from self.frames
+        self.outcome = CC.CLOSED
+
+    def close(self) -> None:
+        pass
+
+
+def _then_an_ordinary_event(rig):
+    """CONTROL's kept events (the verifier's RETAINED report event among them) and one ordinary event after them: a
+    stream factory replaying both past the cursor, and the ordinary event's seq."""
+    kept = rig.kept()
+    nxt = kept[-1]["seq"] + 1
+    events = [CC.Event(e["seq"], e["kind"], e) for e in kept] + [CC.Event(nxt, "pool", {"kind": "pool", "seq": nxt})]
+
+    def stream(after, jid):
+        return ListStream([CC.Hello(rig.events.journal_id, kept[0]["seq"], nxt, None)]
+                          + [e for e in events if e.seq > after])
+    return stream, nxt
+
+
+def test_a_report_with_no_tree_fails_its_job_acks_and_the_next_event_is_consumed(store, repo, served):  # noqa: F811
+    """HEAD DEFAULT (S14 fix 1): until the tree builder (A6) exists the production tree reader answers None. Asserts: the
+    verifier report event is consumed (job failed verifier_refused / verifier-tree-unavailable, no run record, ARTIFACT-ACK
+    sent) AND the ordinary event after it is consumed (the cursor reaches its seq). RED on the old code: the resolve
+    answered None for a None tree, so the follower stopped `ticket-unresolved` at the report with the cursor before it and
+    never read the second event; a resolve that did pass None reached `adopt.ArtifactRecord.problem()` with a None tree
+    (DispatchError -> FollowStopped `record-refused`), the same wedge."""
+    from levain.dispatch import jobs as J
+
+    d = setup_verifier(store, repo, served)
+    plain = d.resolve
+    d.resolve = lambda ev: (lambda call: None if call is None else dataclasses.replace(call, tree=None))(plain(ev))
+    stream, nxt = _then_an_ordinary_event(served)
+    f = F.EventFollower(store, stream, lambda: CC.ControlClient(served.path), d.resolve, fault=d.fault,
+                        routemap=tvr.routemap, ticket_for=tvr.ticket_for)
+    assert f.step().outcome == CC.CLOSED
+    job = store.get(d.job.id)
+    assert (job.state, job.history[-1].cause, job.history[-1].evidence) == ("failed", "verifier_refused",
+                                                                           J.TREE_UNAVAILABLE)
+    assert store.run_records(d.job.id) == []
+    assert acked(served)
+    assert store.event_cursor() == (served.events.journal_id, nxt)
+    f.close()
+
+
+def test_a_report_with_no_envelope_fails_its_job_acks_and_the_next_event_is_consumed(store, repo, served):  # noqa: F811
+    """S14 L3 F1: a report event whose envelope reads None (absent, retention-expired, a link, over the cap) and which
+    the resolve now passes on as envelope None. Asserts: the job fails verifier_refused / report-missing with no run
+    record, ARTIFACT-ACK is sent, and the ordinary event after it is consumed (the cursor reaches its seq). Pins the
+    store and follower half of F1 (test_dispatch_run_jobs_verify pins the resolve's pass-through, which is the RED
+    half: the old resolve answered None and the follower stopped `ticket-unresolved` here for ever)."""
+    d = setup_verifier(store, repo, served)
+    plain = d.resolve
+    d.resolve = lambda ev: (lambda call: None if call is None else dataclasses.replace(call, envelope=None))(plain(ev))
+    stream, nxt = _then_an_ordinary_event(served)
+    f = F.EventFollower(store, stream, lambda: CC.ControlClient(served.path), d.resolve, fault=d.fault,
+                        routemap=tvr.routemap, ticket_for=tvr.ticket_for)
+    assert f.step().outcome == CC.CLOSED
+    job = store.get(d.job.id)
+    assert (job.state, job.history[-1].cause, job.history[-1].evidence) == ("failed", "verifier_refused",
+                                                                           "report-missing")
+    assert store.run_records(d.job.id) == []
+    assert acked(served)
+    assert store.event_cursor() == (served.events.journal_id, nxt)
+    f.close()
+
+
+def test_a_crash_after_the_tree_unavailable_write_re_delivers_acks_and_moves_on(store, repo, served):  # noqa: F811
+    """The same report, a crash after the store's write and before the ACK: the re-delivery is a repeat (the
+    verifier_refusals row holds this ticket and this digest), so it is acked, the job is not failed twice, and the
+    ordinary event behind it is consumed. RED on the old code: the first step stopped before any write (see above)."""
+    from levain.dispatch import jobs as J
+
+    d = setup_verifier(store, repo, served)
+    plain = d.resolve
+    d.resolve = lambda ev: (lambda call: None if call is None else dataclasses.replace(call, tree=None))(plain(ev))
+    stream, nxt = _then_an_ordinary_event(served)
+    d.faults["written"] = True
+    f = F.EventFollower(store, stream, lambda: CC.ControlClient(served.path), d.resolve, fault=d.fault,
+                        routemap=tvr.routemap, ticket_for=tvr.ticket_for)
+    with pytest.raises(Crash):
+        f.step()
+    assert not acked(served) and store.get(d.job.id).history[-1].evidence == J.TREE_UNAVAILABLE
+    seen: list = []
+    d.fault = lambda where, seq: seen.append(where)
+    f = F.EventFollower(store, stream, lambda: CC.ControlClient(served.path), d.resolve, fault=d.fault,
+                        routemap=tvr.routemap, ticket_for=tvr.ticket_for)
+    assert f.step().outcome == CC.CLOSED
+    assert "repeat" in seen and "written" not in seen and acked(served)
+    assert [t.cause for t in store.get(d.job.id).history].count("verifier_refused") == 1
+    assert store.event_cursor() == (served.events.journal_id, nxt)
     f.close()

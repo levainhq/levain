@@ -12,6 +12,7 @@ verifier, model), which the verifier's report writes; this file names the sessio
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import re
 import stat
@@ -68,12 +69,17 @@ class ExportedArtifact:
     bytes: int
 
 
-def read_artifact(export_dir: str | os.PathLike[str], session: str) -> ExportedArtifact:
+def read_artifact(export_dir: str | os.PathLike[str], session: str, *,
+                  expect_digest: str | None = None) -> ExportedArtifact:
     """The artifact of ``session`` under ``export_dir``; raises :class:`ArtifactUnreadable` for anything short of a
-    whole, well-formed one."""
+    whole, well-formed one. ``expect_digest`` (``sha256:<hex>``, the digest CONTROL's event carries) must equal the
+    sha256 of the bytes read, else ``artifact-digest-mismatch``: the event names exactly one file, so a file root
+    published again since is never taken under the older event."""
     if not isinstance(session, str) or SESSION_RE.fullmatch(session) is None:
         raise ArtifactUnreadable("bad-session", "not a session id")
     text = _read(os.fspath(export_dir), session)
+    if expect_digest is not None and "sha256:" + hashlib.sha256(text).hexdigest() != expect_digest:
+        raise ArtifactUnreadable("artifact-digest-mismatch", f"{FILE} is not the bytes the event names")
     try:
         obj = parse(text)
     except ContractError as e:

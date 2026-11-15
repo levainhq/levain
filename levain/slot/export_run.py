@@ -552,7 +552,8 @@ class Published:
 
 def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], role: Role, seams: PublishSeams, *,
              gid: Optional[int] = None, bundle_check: Optional[Callable[[BF.BundleHeader], None]] = None,
-             before_commit: Optional[Callable[[], None]] = None) -> Published:
+             before_commit: Optional[Callable[[], None]] = None,
+             root_files: Optional[Callable[[Mapping[str, str]], Sequence[Tuple[str, bytes]]]] = None) -> Published:
     """The PUBLISH TRANSACTION, entered only after SUCCESS (DESIGN §1 step 11, r11 S14-1): the copy into a fresh
     ``<s>.new`` (root, ``gid``, files 0640 ``O_CREAT|O_EXCL``), the fsyncs, the commit. ENOSPC or EDQUOT before the
     commit = ``role.space``; any other errno = ``role.failed:publish`` (detail: the errno name; ``exists`` for the
@@ -562,7 +563,14 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
     Order (r12 S15-3), asserted by the log: ``fsync <name>`` per file, ``fsync staged``, ``exchange`` or
     ``noreplace``, ``fsync class``, ``delete older``. ``before_commit`` runs between ``fsync staged`` and the commit
     (5c-ii-b's detach); a :class:`Refused` it raises is a pre-commit refusal like any other (``<s>.new`` removed,
-    ``<s>`` as it was): adopt-open's raises ``export-image-unavailable`` when the detach failed. After the commit call returns, the run is COMMITTED: a
+    ``<s>`` as it was): adopt-open's raises ``export-image-unavailable`` when the detach failed.
+
+    ``root_files`` (S14 D1, CONTRACT §10.2 "in the same publish transaction"): called ONCE after every source copy,
+    with the digests (name -> sha256 hex) root just computed, it returns ``(name, bytes)`` files ROOT authors; each is
+    written ``O_EXCL``, 0640, the class gid, and fsynced into ``<s>.new`` before ``fsync staged``, so the record and
+    the bytes it names commit in one rename. A name that is not one plain leaf, or that repeats a source's or another
+    root file's, or a callable that raises anything, is a pre-commit refusal (``<s>.new`` removed): it fails closed.
+    After the commit call returns, the run is COMMITTED: a
     failed class-dir fsync or older-tree delete is logged and does not withhold the answer (an older tree left at
     ``<s>.new`` is the next seal-in's stale delete); the failed fsync also puts a warning in ``warnings`` (A2) and
     skips the older-tree delete, so a crash that reverts the exchange still finds the older tree whole (B-7)."""
@@ -605,6 +613,8 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
             finally:
                 os.close(dst)
             digests[name] = h.hexdigest()
+        if root_files is not None:
+            _write_root_files(new_dfd, root_files, dict(digests), role, seams, gid)
         seams.fault("fsync:staged")
         seams.fsync(new_dfd)
         seams.log("fsync staged")
@@ -679,6 +689,37 @@ def transact(class_dfd: int, session: str, sources: Sequence[Tuple[str, int]], r
     return Published(digests, header, exchanged, tuple(warnings))
 
 
+def _write_root_files(new_dfd: int, root_files: Callable[[Mapping[str, str]], Sequence[Tuple[str, bytes]]],
+                      digests: Mapping[str, str], role: Role, seams: PublishSeams, gid: Optional[int]) -> None:
+    """The files root authors into ``<s>.new`` (:func:`transact`'s ``root_files``). Fail CLOSED: whatever the callable
+    raises that is not a :class:`Refused` is ``<role.failed>:publish``, and a bad name never reaches the disk."""
+    try:
+        files = list(root_files(digests))
+    except (Refused, OSError):
+        raise
+    except Exception as e:      # noqa: BLE001
+        raise _publish_refusal(role, f"root-file:{type(e).__name__}") from e
+    seen = set(digests)
+    for name, data in files:
+        if (not isinstance(name, str) or not name or name in (".", "..") or "/" in name or "\0" in name
+                or name in seen or not isinstance(data, (bytes, bytearray))):
+            raise _publish_refusal(role, "root-file:name")
+        seen.add(name)
+    for name, data in files:
+        seams.fault(f"copy:{name}")
+        dst = os.open(name, _NEW_FILE, 0o640, dir_fd=new_dfd)
+        try:
+            if gid is not None:
+                os.fchown(dst, 0, gid)
+            os.fchmod(dst, 0o640)
+            write_all(dst, bytes(data))
+            seams.fault(f"fsync:{name}")
+            seams.fsync(dst)
+            seams.log(f"fsync {name}")
+        finally:
+            os.close(dst)
+
+
 def _remove_staged(class_dfd: int, staged: str, made: bool, seams: PublishSeams) -> None:
     if not made:
         return
@@ -692,7 +733,9 @@ def _remove_staged(class_dfd: int, staged: str, made: bool, seams: PublishSeams)
 def publish_if_success(outcome: Outcome, work_dfd: int, class_dfd: int, session: str, *, object_format: str,
                        owner_uid: int, caps: Mapping[str, int], seams: PublishSeams, gid: Optional[int] = None,
                        before_commit: Optional[Callable[[], None]] = None,
-                       role: Role = IMPORTER) -> Tuple[str, Published]:
+                       role: Role = IMPORTER, copy: Optional[Sequence[str]] = None,
+                       root_files: Optional[Callable[[Mapping[str, str]], Sequence[Tuple[str, bytes]]]] = None
+                       ) -> Tuple[str, Published]:
     """Seal-out's ONE gate into the publish (DESIGN §1 step 11, r10 S13-1): a DENIAL raises its name and touches
     nothing in the class dir; SUCCESS runs the output checks and the transaction. Returns ``(result, published)``,
     ``result`` derived from the copied header (prerequisites = ``delta``, none = ``unrelated``; root never
@@ -703,7 +746,12 @@ def publish_if_success(outcome: Outcome, work_dfd: int, class_dfd: int, session:
     :data:`VERIFIER_OUTPUTS`, all required (one absent = ``verifier-failed:output-missing``), no header check; the
     result is the line's. The output fds (files inside the image) are closed before ``before_commit``, the detach, so
     DESIGN step 11's detach-then-commit order holds on Linux too, where an ``umount`` with an open file is EBUSY
-    (D2)."""
+    (D2).
+
+    ``copy`` (S14 D1): the output names root MAY copy, applied to this run's checked outputs (default: all of them;
+    ``bundle`` must be listed whenever the run has one). A name left out is still checked (``check_outputs``) and its descriptor closed, and is never published: the
+    dispatch class does not publish ``report.json`` (CONTRACT §2.1). ``root_files`` is :func:`transact`'s: root's own
+    record, written into the same transaction. Neither applies to the verifier."""
     if not outcome.success or outcome.line is None:
         raise Refused(outcome.name or f"{role.failed}:exit", outcome.detail)
     verifier = role == VERIFIER                    # by value: a copy of a role is that role (L3 s2 r1 LOW 3)
@@ -731,10 +779,21 @@ def publish_if_success(outcome: Outcome, work_dfd: int, class_dfd: int, session:
         if before_commit is not None:
             before_commit()
 
+    if verifier and (copy is not None or root_files is not None):
+        close_outputs()
+        raise _publish_refusal(role, "verifier-copy-list")
+    if copy is None:
+        copied = names
+    else:
+        # the names root may copy, applied to this run's outputs (a nothing-new run has no bundle to copy)
+        if not set(copy) <= {"bundle", "report.json"} or ("bundle" in names and "bundle" not in copy):
+            close_outputs()
+            raise _publish_refusal(role, "copy-list")
+        copied = tuple(n for n in names if n in copy)
     try:
-        pub = transact(class_dfd, session, [(n, fds[n]) for n in names], role, seams, gid=gid,
+        pub = transact(class_dfd, session, [(n, fds[n]) for n in copied], role, seams, gid=gid,
                        bundle_check=None if verifier else importer_bundle_check(session, object_format),
-                       before_commit=close_then_detach)
+                       before_commit=close_then_detach, root_files=root_files)
     finally:
         close_outputs()
     if verifier:

@@ -16,7 +16,8 @@ asks for a SIGN to extend; the stop time is the hard edge, the budget is not.
   ``mode=ro``: this module never writes ``limits.db``, so the gate is exactly what it was. Mapping, envelope key -> Q13
   count: ``tool_calls`` -> ``calls``; ``tokens`` -> ``fresh_tokens``; ``hours`` -> ``active_hours`` (Q13's active time,
   not wall clock). ``dollars_cents`` is NOT METERED: Q13 counts no dollars (its F1d), so it never crosses and every view
-  says so. [judged by c6 lane, 10-22, against limits.py's own KINDS; question C6-1 in the lane's RETURN]
+  says so (the thread gauge's; a dispatch contract's dollars are capped per run at the gateway,
+  ``levain.dispatch.run_jobs``). [judged by c6 lane, 10-22, against limits.py's own KINDS; question C6-1 in the lane's RETURN]
 - **Usage is the thread's total**, across its whole chain of envelopes: an extension states a new total, it does not
   refill. [judged by c6 lane; question C6-2]
 - **Crossed** when a metered count is AT OR PAST its budget (a budget of 0 is crossed at once: the echo says "0

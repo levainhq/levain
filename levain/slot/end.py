@@ -287,6 +287,10 @@ UNOWNED = "unowned"
 CAPTURE_DIR = "run"
 CAPTURE_LOGS = ("vendor.out", "vendor.err")
 _CAPTURE_PATHS = frozenset(os.fsencode(f"{CAPTURE_DIR}/{n}") for n in CAPTURE_LOGS)
+#: S14 A3 (P9): the verifier report file END recomputes a digest from, and the two record fields it may carry.
+REPORT_EXPORT = ("export", "dispatch")
+REPORT_FILE = "verifier-report.json"
+REPORT_DIGEST, REPORT_REFUSED = "verifier_report_digest", "verifier_report_refused"
 #: The session-uid reader's answer for a file its uid may not open (EACCES / EPERM), END's own name beside
 #: stage's ``staging-missing`` (ENOENT) and ``staging-not-regular`` (ELOOP, not a regular file).
 LINK_UNREADABLE = "link-unreadable"
@@ -407,6 +411,11 @@ class EndFacts:
     def lock(self) -> Path:
         """DECISION: root's per-session END lock beside the journal (L2 M7); never unlinked."""
         return self.intent.with_name(f"{self.session}.lock")
+
+    @property
+    def report_dir(self) -> Path:
+        """S14 A3: ``L/export/dispatch/<session>/``, where START's verifier envelope is written (A2b)."""
+        return self.store / REPORT_EXPORT[0] / REPORT_EXPORT[1] / self.session
 
     @property
     def keep(self) -> Path:
@@ -1774,10 +1783,80 @@ class EndSeams:
     #: identseed: the owner rule for the session's config file the seed is read from; None = ``st_uid`` is alloc's slot
     #: uid (tests whose files the slot never owns inject theirs).
     seed_owner_ok: "Callable[[os.stat_result], bool] | None" = None
+    #: S14 A3 (P9): whether the session's record ALREADY holds a verifier report field, read once when END starts.
+    #: FAIL CLOSED: the default says yes, so a caller that never reads the record sends no field (CONTROL's set-once
+    #: rule would otherwise refuse a different value and wedge END with :class:`CasNotSent`).
+    report_set: Callable[[], bool] = lambda: True
 
     @property
     def retry(self) -> Callable[[Callable[[], None]], None]:
         return self.reserve.retry if self.reserve is not None else (lambda fn: fn())
+
+
+# --- S14 A3: the verifier report fallback (P9) -------------------------------------------------------------------
+
+
+_O_REPORT_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_CLOEXEC
+_O_REPORT = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+
+
+def report_file_digest(facts: EndFacts, seams: EndSeams) -> "str | None":
+    """``sha256:<hex>`` of ``L/export/dispatch/<session>/verifier-report.json``, or ``None`` for anything but root's
+    own file: every component below the store is opened ``O_NOFOLLOW`` from its parent's fd, each directory must be
+    root's (``seams.owner_ok``) with no group / other write bit, and the file a regular, root-owned, single-link file
+    with no setid and no group / other write bit. The bytes hashed are those of the fd checked (CONTRACT: END
+    recomputes the digest from the file). ``None`` is never an error: the caller records ``no-report``."""
+    names = (*REPORT_EXPORT, facts.session, REPORT_FILE)
+    fds: list[int] = []
+    try:
+        cur = os.open(facts.store, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fds.append(cur)
+        for name in names[:-1]:
+            cur = os.open(name, _O_REPORT_DIR, dir_fd=cur)
+            fds.append(cur)
+            st = os.fstat(cur)
+            if not (seams.owner_ok(st) and stat.S_IMODE(st.st_mode) & 0o022 == 0):
+                return None
+        fd = os.open(names[-1], _O_REPORT, dir_fd=cur)
+        fds.append(fd)
+        st = os.fstat(fd)
+        if not (stat.S_ISREG(st.st_mode) and seams.owner_ok(st) and st.st_nlink == 1
+                and stat.S_IMODE(st.st_mode) & (0o022 | _SETID) == 0):
+            return None
+        h = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, _CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+        return "sha256:" + h.hexdigest()
+    except OSError:
+        return None
+    finally:
+        for f in fds:
+            try:
+                os.close(f)
+            except OSError:
+                pass
+
+
+def report_fields(facts: EndFacts, seams: EndSeams, started_from: str) -> "dict[str, object]":
+    """The field END's CAS into RETAINED or HELD carries for a VERIFIER session, decided once when END starts: nothing
+    for any other kind, nothing when the record already holds a report field (:attr:`EndSeams.report_set`; CONTROL
+    merges it), else ``verifier_report_digest`` when :func:`report_file_digest` finds root's file (a crash after the
+    write and before START's CAS), else ``verifier_report_refused: no-report:<started_from>``, the state END started
+    from. ``started_from`` must fit CONTROL's reason token; anything else is named ``unknown``."""
+    if facts.kind != "verifier" or seams.report_set():
+        return {}
+    digest = report_file_digest(facts, seams)
+    if digest is not None:
+        return {REPORT_DIGEST: digest}
+    state = started_from if isinstance(started_from, str) and re.fullmatch(r"[A-Z_]{1,32}", started_from) else "unknown"
+    return {REPORT_REFUSED: f"no-report:{state}"}
+
+
+def _with_report(report: Mapping[str, object], target: str, fields: Mapping[str, object]) -> Mapping[str, object]:
+    return {**fields, **report} if report and target in (RETAINED, HELD) else fields
 
 
 # --- CONTROL's CAS (L2 M5) --------------------------------------------------------------------------
@@ -2976,8 +3055,10 @@ def _plan_for(facts: EndFacts, seams: EndSeams, caps: Caps) -> Callable[[RootInt
     return plan_for
 
 
-def _reconcile(facts: EndFacts, seams: EndSeams, caps: Caps) -> RootIntent | None:
-    return reconcile(facts.intent, _plan_for(facts, seams, caps), cas=lambda t, f: send_cas(seams, t, f),
+def _reconcile(facts: EndFacts, seams: EndSeams, caps: Caps,
+               report: Mapping[str, object] = {}) -> RootIntent | None:
+    return reconcile(facts.intent, _plan_for(facts, seams, caps),
+                     cas=lambda t, f: send_cas(seams, t, _with_report(report, t, f)),
                      fault=seams.fault, retry=seams.retry, owner_ok=seams.owner_ok)
 
 
@@ -2996,7 +3077,7 @@ PROVEN_PHASES: Mapping[str, tuple[str, ...]] = {
 
 
 def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps(),
-                      held_attempts: int | None = None) -> RootIntent | None:
+                      held_attempts: int | None = None, report_from: str | None = None) -> RootIntent | None:
     """The reaper's step 2 / helper start for one session: finish its journal, from the journal and
     the filesystem only, under the slot lock then root's per-session lock (:func:`slot_lock`). A journal
     at one of its intent's :data:`PROVEN_PHASES` is finished only after the proofs END runs (the slot ours,
@@ -3006,6 +3087,7 @@ def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps(),
     :func:`end_session` does, and raises its refusal: nothing is reconciled. Raises :class:`PhaseFailed`
     (journal left at the phase), ``Refused`` (``end-busy`` and ``slot-locked`` included) or
     :class:`CasNotSent`."""
+    report = report_fields(facts, seams, report_from or "")
     with slot_lock(facts, seams) as locked, end_lock(facts, seams):
         ri = read_root_intent(facts.intent, owner_ok=seams.owner_ok)
         if ri is not None and ri.phase in PROVEN_PHASES.get(ri.intent, ()):
@@ -3021,11 +3103,11 @@ def reconcile_session(facts: EndFacts, seams: EndSeams, *, caps: Caps = Caps(),
             except Exception as e:   # noqa: BLE001 - an unproven step is HELD
                 seams.note(f"reconcile {facts.session}: {step} not proven: {e}")
                 attempts = held_attempts if isinstance(held_attempts, int) and held_attempts >= 0 else 0
-                send_cas(seams, HELD, {"failed_step": step, "held_attempts": attempts + 1,
-                                       "held_reason": held_reason_of(e)})
+                send_cas(seams, HELD, _with_report(report, HELD, {"failed_step": step, "held_attempts": attempts + 1,
+                                                                  "held_reason": held_reason_of(e)}))
                 raise
         try:
-            return _reconcile(facts, seams, caps)
+            return _reconcile(facts, seams, caps, report)
         except PhaseFailed as e:
             if isinstance(e.cause, CasNotSent):
                 raise e.cause from None
@@ -3064,13 +3146,15 @@ def _prove_dead(facts: EndFacts, seams: EndSeams) -> None:
 
 
 def end_session(facts: EndFacts, seams: EndSeams, *, record_state: str, failed_step: str | None = None,
-                held_attempts: int | None = None, caps: Caps = Caps()) -> str:
+                held_attempts: int | None = None, caps: Caps = Caps(), report_from: str | None = None) -> str:
     """Drive one session through END from ``record_state`` (and ``failed_step`` for HELD); returns the
     state it leaves the record in (RETAINED or HELD). Every proof and idempotent act runs every call;
     the record's state only chooses which CAS edges are sent (see the module docstring). A landing in
     HELD sends ``held_attempts`` one past the record's (§7.3: the reaper's backoff and doctor read it).
     Raises ``end-busy`` (another END or reconciliation holds the session), ``slot-locked`` and
-    :class:`CasNotSent`. A RETAINED record is taken at its word only with root's own retained object whole
+    :class:`CasNotSent`. ``report_from``: the state END started from for a verifier's ``no-report:<state>`` (default
+    ``record_state``; a teardown that revoked first passes the state it read before the revoke), see
+    :func:`report_fields`. A RETAINED record is taken at its word only with root's own retained object whole
     (:func:`retained_whole`); otherwise END starts as from REVOKED (codex r1 1): the proofs run, and CONTROL
     refuses the FROZEN edge out of RETAINED (:class:`CasNotSent`), so teardown never reaches SCRUBBED."""
     if record_state == RETAINED:
@@ -3083,13 +3167,15 @@ def end_session(facts: EndFacts, seams: EndSeams, *, record_state: str, failed_s
     if start is None:
         raise Refused("not-ending", f"{record_state} / {failed_step}")
     attempts = held_attempts if isinstance(held_attempts, int) and held_attempts >= 0 else 0
+    report = report_fields(facts, seams, report_from or record_state)
     with slot_lock(facts, seams) as locked, end_lock(facts, seams):
-        return _end_locked(facts, seams, start, attempts + 1, caps, locked)
+        return _end_locked(facts, seams, start, attempts + 1, caps, locked, report)
 
 
-def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, caps: Caps, locked: bool) -> str:
+def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, caps: Caps, locked: bool,
+                report: Mapping[str, object] = {}) -> str:
     def cas(target: str, fields: Mapping[str, object]) -> None:
-        send_cas(seams, target, fields)
+        send_cas(seams, target, _with_report(report, target, fields))
 
     step = "slot-not-ours"
     try:
@@ -3115,7 +3201,7 @@ def _end_locked(facts: EndFacts, seams: EndSeams, start: int, attempts: int, cap
         pending = read_root_intent(facts.intent, owner_ok=seams.owner_ok)
         if pending is not None:
             try:
-                _reconcile(facts, seams, caps)
+                _reconcile(facts, seams, caps, report)
             except PhaseFailed as e:
                 step = _held_name(pending.intent, e)
                 raise
@@ -3169,7 +3255,7 @@ __all__ = ["BUDGET_REFUSALS", "NOT_AN_ATTEMPT", "PERMANENT_HELD", "PERMANENT_HEL
            "Caps", "HASH_ONLY_CAP", "LINK_UNREADABLE", "OUTSIDE", "PROVEN_PHASES", "SLOT_LOCK_WAIT_S", "UNOWNED",
            "UNREAD_ANSWERS", "WALK_OPEN_DIRS", "WALK_PEAK_FDS", "classify", "read_classes", "retained_whole",
            "stored_classification", "session_reader", "slot_lock", "sync_tree",
-           "CasNotSent", "DEAD", "END_STEPS", "EndFacts", "EndSeams", "Entry", "FROZEN", "HELD", "LINKCOPY",
+           "REPORT_DIGEST", "REPORT_FILE", "REPORT_REFUSED", "report_fields", "report_file_digest", "CasNotSent", "DEAD", "END_STEPS", "EndFacts", "EndSeams", "Entry", "FROZEN", "HELD", "LINKCOPY",
            "LINK_COPY_BYTES", "MANIFEST_FORMAT", "META_FORMAT", "OBJECT_FORMAT", "REVOKED", "RETAINED", "Reserve",
            "UNREAD", "V12_SECONDS", "V14_BYTES", "V17_MANIFEST_BYTES", "V17_META_BYTES", "V1_INODES", "V2_SECONDS",
            "V5_FLOOR_BYTES", "VAR_FOLDERS_NAME", "VAR_FOLDERS_SKELETON", "VFCOPY", "VFKEYS",

@@ -17,7 +17,7 @@ from levain.dispatch import jobs as djobs
 from levain.dispatch import sign as dsign
 from levain.dispatch.jobs import (
     CAUSES, EDGES, FORMAT, STATES, TERMINAL, UNSIGNED_LEASE, CapabilityRefused, JobStore, JobStoreError,
-    SignatureRefused, TransitionRefused,
+    SignatureRefused, StopRequested, TransitionRefused,
 )
 from tests.test_dispatch_contract import NOW, POLICY, WRITE_SET, make_repo, registry, resolve, submission, template
 from tests.test_dispatch_sign import Clock, keys, log, snapshot  # noqa: F401  (module fixtures)
@@ -238,17 +238,30 @@ def test_every_allowed_edge_is_taken(tmp_path, clock, repo, from_state, to_state
 
 
 @pytest.mark.parametrize("from_state, to_state, cause", STOP_CASES)
-def test_every_edge_out_of_running_but_runs_exited_is_stop_recorded_alone(tmp_path, clock, repo, from_state, to_state,
-                                                                          cause):
+def test_every_edge_out_of_running_but_runs_exited_is_stop_recorded_alone(tmp_path, clock, repo, keys, log, from_state,
+                                                                          to_state, cause):
     store = new_store(tmp_path, clock)
-    job, _ = at_state(store, repo, from_state)
+    job, cap = at_state(store, repo, from_state)
     clock.now = NOW + timedelta(hours=2)                                     # past the lease: lease_lapsed holds
     with pytest.raises(TransitionRefused, match="stop_recorded"):
         store._transition(job.id, to_state, cause, evidence="e")
     assert store.get(job.id).state == "running"
+    want = {"stopped": True, "why": "reaped"}
+    if cause in ("planner_cancel", "human_cancel"):
+        # s14fix2 (codex L221): a cancel is recorded only from that party's kept request, read in stop_recorded itself
+        with pytest.raises(TransitionRefused, match="kept"):
+            store.stop_recorded(job.id, cause, why="reaped")
+        if cause == "planner_cancel":
+            with pytest.raises(StopRequested):
+                store.cancel_by_planner(job.id, cap)
+        else:
+            payload, sig = cancel_item(job, keys["laptop"], at=clock.now)
+            with pytest.raises(StopRequested):
+                store.cancel_by_human(job.id, payload, sig, log.source)
+            want.update(signer_fp=keys["laptop"].fp, reason=payload["reason"])
     moved = store.stop_recorded(job.id, cause, why="reaped")
     assert (moved.state, moved.history[-1].cause) == (to_state, cause)
-    assert json.loads(moved.history[-1].evidence) == {"stopped": True, "why": "reaped"}
+    assert json.loads(moved.history[-1].evidence) == want
 
 
 @pytest.mark.parametrize("from_state", STATES)

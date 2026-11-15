@@ -24,6 +24,7 @@ V1 = "levain-dispatch-jobs/1"
 V2 = "levain-dispatch-jobs/2"
 V3 = "levain-dispatch-jobs/3"
 V4 = "levain-dispatch-jobs/4"
+V5 = "levain-dispatch-jobs/5"        # /6 (S14 R2) added a cause and nothing else: a /5 store has the current tables
 # the envelope binding (F11-C) is /4's: 0.11.10, 0.11.12 and 0.11.13 had none of it
 F11C = ("job_envelopes", "job_threads")
 # the handoff rows (W-C) are /5's: every Levain through 0.11.14 had none
@@ -78,7 +79,7 @@ def test_a_0_11_10_store_is_migrated_in_place_and_keeps_its_jobs(tmp_path, clock
     again = store.get(job.id)
     assert again is not None and again.state == "verified" and again.digest == job.digest
     names, fmt = tables(path)
-    assert fmt == djobs.FORMAT == "levain-dispatch-jobs/5" and {"authorise_signatures", "run_records", "handoffs"} <= names
+    assert fmt == djobs.FORMAT == "levain-dispatch-jobs/6" and {"authorise_signatures", "run_records", "handoffs"} <= names
     # the migrated job takes /2's edges
     assert store._transition(job.id, "failed", "base_moved").state == "failed"
     # and opening it again changes nothing
@@ -120,6 +121,21 @@ def test_a_0_11_13_store_is_migrated_in_place_and_gains_the_envelope_binding(tmp
     assert fmt == djobs.FORMAT and set(F11C) | {"handoffs"} <= names and store.handoff_row(job.id) is None
 
 
+def test_a_5_store_is_migrated_in_place_to_6_and_its_running_job_takes_run_failed(tmp_path, clock, monkeypatch, repo):
+    # /6 (S14 R2) added the cause `run_failed` and no table: the /5 store is the current schema under the old marker
+    d, job = old_store(tmp_path, clock, monkeypatch, repo, V5, djobs._SCHEMA, state="running")
+    path = d / djobs.DB_NAME
+    assert tables(path)[1] == V5
+    store = JobStore(d, clock=clock)
+    again = store.get(job.id)
+    assert again is not None and again.state == "running" and again.history == job.history
+    assert tables(path)[1] == djobs.FORMAT == "levain-dispatch-jobs/6"
+    out = store.stop_recorded(job.id, "run_failed", run=1, name="mint-refused:ticket-ceiling")
+    assert (out.state, out.history[-1].cause) == ("failed", "run_failed")
+    # the one new cause is a run's failure only: it takes no verifying or later job to failed
+    assert {f for (f, t), c in djobs.EDGES.items() if t == "failed" and "run_failed" in c} == {"signed", "queued", "running"}
+
+
 def test_the_migration_leaves_meta_written_once(tmp_path, clock, monkeypatch, repo):
     d, _job = v1_store(tmp_path, clock, monkeypatch, repo)
     JobStore(d, clock=clock).list()
@@ -134,7 +150,7 @@ def test_the_migration_leaves_meta_written_once(tmp_path, clock, monkeypatch, re
 
 
 @pytest.mark.parametrize("known, migrates", [(V1, frozenset()), (V2, frozenset({V1})), (V3, frozenset({V1, V2})),
-                                            (V4, frozenset({V1, V2, V3}))])
+                                            (V4, frozenset({V1, V2, V3})), (V5, frozenset({V1, V2, V3, V4}))])
 def test_a_levain_that_knows_only_an_older_format_refuses_a_current_store(tmp_path, clock, monkeypatch, repo, known,
                                                                      migrates):
     store = new_store(tmp_path, clock)
@@ -143,7 +159,7 @@ def test_a_levain_that_knows_only_an_older_format_refuses_a_current_store(tmp_pa
     # is refused, naming both
     monkeypatch.setattr(djobs, "FORMAT", known)
     monkeypatch.setattr(djobs, "_MIGRATES_FROM", migrates)
-    with pytest.raises(JobStoreError, match=rf"store format 'levain-dispatch-jobs/5' is not '{known}'"):
+    with pytest.raises(JobStoreError, match=rf"store format 'levain-dispatch-jobs/6' is not '{known}'"):
         JobStore(store.directory, clock=clock).list()
 
 

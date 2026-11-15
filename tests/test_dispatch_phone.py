@@ -624,3 +624,23 @@ def test_a_failed_agent_config_check_is_the_cards_problem_line_not_a_crash(lwp, 
     got = card(lwp, recommended(lwp, {".claude/settings.json": b"{}\n"}, onto="main").id)
     assert got["agent_config"] == [] and got["agent_config_problem"] == "ImportError: gone", got
     assert got["problem"] is None and got["onto"] == "main"
+
+
+def test_a_passkey_cancel_of_a_running_job_is_kept_as_a_stop_request_not_a_422(world) -> None:
+    # L1 F2: a verified signature whose cancel is kept as a stop request is a success that is not yet a cancel
+    job = file_job(world)
+    dp = phone_for(world)
+    sign_job(dp, world["phone"], job.id)
+    store = JobStore(world["qdir"])
+    store._transition(job.id, "running", "slot_taken")
+    c = dp.step(job.id, "cancel-challenge", {"signer_fp": world["phone"].fp, "reason": "wrong files"})
+    done = dp.step(job.id, "cancel", {"payload": c["payload"], **world["phone"].assertion(c["challenge"])})
+    assert (done["state"], done["outcome"]) == ("running", "stop requested, not yet stopped")
+    assert done["signer_fp"] == world["phone"].fp and done["reason"] == "wrong files"
+    assert done["already_kept"] is False
+    assert store.get(job.id).state == "running" and store.stop_requested(job.id) == "human_cancel"
+    # L2 F3: a second signed cancel keeps nothing; the receipt names the KEPT reason, never this call's
+    c2 = dp.step(job.id, "cancel-challenge", {"signer_fp": world["phone"].fp, "reason": "another reason"})
+    again = dp.step(job.id, "cancel", {"payload": c2["payload"], **world["phone"].assertion(c2["challenge"])})
+    assert again["already_kept"] is True and again["reason"] == "wrong files", again
+    assert again["signer_fp"] == world["phone"].fp and "already kept" in again["outcome"]

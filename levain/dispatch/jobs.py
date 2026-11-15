@@ -130,7 +130,7 @@ __all__ = [
 log = logging.getLogger("levain.dispatch.jobs")
 
 DB_NAME = "dispatch.db"
-FORMAT = "levain-dispatch-jobs/5"
+FORMAT = "levain-dispatch-jobs/6"
 # the formats a store is migrated from IN PLACE when this code opens it, each by tables and triggers added beside
 # the old ones (CREATE ... IF NOT EXISTS), the one column /5 adds, and its marker rewritten in the same transaction;
 # no row is rewritten.
@@ -144,9 +144,12 @@ FORMAT = "levain-dispatch-jobs/5"
 # named by id and size, written in the job's own filing transaction; a Levain that knows only /4 would delete no
 # terminal job's bundle and collect no orphan, so it refuses the store instead. /5 also added the jobs' writer
 # format, so a writer that opened the store at an older format before another process migrated it is refused at its
-# insert (it never re-reads the marker)
+# insert (it never re-reads the marker). /6 added the cause ``run_failed`` (S14 R2: a run that could not start or left
+# no artifact; the edges ``signed``/``queued``/``running -> failed``) and the additive ``stop_requests`` table (a running
+# job's kept cancel requests, S14 R3): no column, a cause a /5 Levain has no edge for and a table it would never read,
+# so it refuses the /6 store instead of misreading a failed job or running a cancelled one to its lease
 _MIGRATES_FROM = frozenset({"levain-dispatch-jobs/1", "levain-dispatch-jobs/2", "levain-dispatch-jobs/3",
-                            "levain-dispatch-jobs/4"})
+                            "levain-dispatch-jobs/4", "levain-dispatch-jobs/5"})
 # how long an unsigned contract holds its write files before it lapses
 UNSIGNED_LEASE = timedelta(minutes=30)
 # how far a signature's signed_at may run ahead of the store's clock (the signer's clock is its own)
@@ -173,6 +176,11 @@ ENTRY_REFUSED = "verifier-entry"
 # record is written for that run, so the consumer's contrast finds the run missing and escalates; a guessed or
 # placeholder identity could instead pair with a real one and pass as "distinct"
 BACKEND_UNRESOLVED = "backend-unresolved"
+# the verifier_refused evidence when a report that checks reaches the writer with no artifact tree (S14 review fix:
+# the follower's tree reader answers None until the tree builder exists). Dispatch's own verifier infrastructure
+# failed, so the job fails at once (the head's ruling: such a failure FAILS the job, it is not retried) and the event
+# is acked like any refusal, never left to wedge the follower's cursor
+TREE_UNAVAILABLE = "verifier-tree-unavailable"
 # a run record's ``model.identity_source`` when its ``backend_identity`` was read from the gateway's route map (F9a);
 # the landing contrast trusts no other source (a record without it predates F9a, so a human vouches for it)
 IDENTITY_SOURCE = "routemap"
@@ -191,10 +199,17 @@ BEFORE_AUTHORISED = ("filed", "signed", "queued", "running", "verifying", "verif
 # the states the sweep lapses: a running job is the supervisor's to stop first (kill-then-record)
 _SWEPT = tuple(s for s in BEFORE_AUTHORISED if s != "running")
 _SERVICE_FAILURES = frozenset({"lease_lapsed", "budget_cap", "floor_refused"})
+# what a cancel of a RUNNING job says (:class:`StopRequested`): refused as a transition, kept as a request
+_RUNNING_CANCEL = ("job {job} is running: its process may still write, so the cancel is kept as a request and the run "
+                   "supervisor stops it, then records it (stop_recorded)")
 # the causes that take a job out of ``running`` other than ``runs_exited``, each written only by
-# :meth:`JobStore.stop_recorded`, after the supervisor stopped and reaped the process: before that, the process may
-# still write the files the job holds, so no other door ends a running job
-_STOP_CAUSES = frozenset(_SERVICE_FAILURES | {"planner_cancel", "human_cancel", "envelope_ended"})
+# :meth:`JobStore.stop_recorded` after the supervisor stopped and reaped the process (a kept cancel is also recorded by
+# ``runs_exited`` once the runs are over): before that, the process may still write the files the job holds, so no
+# other door ends a running job
+_STOP_CAUSES = frozenset(_SERVICE_FAILURES | {"planner_cancel", "human_cancel", "envelope_ended", "run_failed"})
+# the states a run can fail out of (S14 R2): not yet taken (a standing preflight refusal) or running. Never a verifying
+# or later job: its runs are over, and the verifier's own causes name its failures
+_RUN_FAILABLE = ("signed", "queued", "running")
 _FILED = "filed"
 
 
@@ -226,6 +241,10 @@ def _edges() -> dict[tuple[str, str], frozenset[str]]:
         ("recommended", "failed"): {"base_moved"},
         ("authorised", "failed"): {"base_moved"},
     }
+    for state in _RUN_FAILABLE:
+        # two different failures never share one cause: ``floor_refused`` names the queue floor, ``run_failed`` a run
+        # that could not start or left no artifact (the evidence names which run, and the refusal)
+        edges.setdefault((state, "failed"), set()).add("run_failed")
     for state in BEFORE_AUTHORISED:
         # an ended envelope stops every job bound to it that is not yet authorised (C0 §5)
         edges.setdefault((state, "failed"), set()).update(_SERVICE_FAILURES | {"envelope_ended"})
@@ -244,6 +263,21 @@ class JobStoreError(DispatchError):
 
 class TransitionRefused(DispatchError):
     """A transition the edge table does not allow from the job's current state, or a job that does not exist."""
+
+
+class StopRequested(TransitionRefused):
+    """A cancel of a RUNNING job: the transition is refused (its process may still write), but the cancel WAS kept as a
+    stop request (:meth:`JobStore.stop_requested`) the run supervisor acts on. A door says "stop requested, not yet
+    stopped", never "nothing changed". ``cause`` is the cancel this caller asked for (``planner_cancel`` /
+    ``human_cancel``). ``already_kept``: this party's request was kept before, so this call kept nothing new (a request
+    is written once). For ``human_cancel``, ``signer_fp`` and ``reason`` are the KEPT request's, the one the supervisor
+    records, which is not this caller's when ``already_kept``; a door echoes these, never the caller's payload."""
+
+    def __init__(self, job_id: str, cause: str, *, already_kept: bool = False, signer_fp: str | None = None,
+                 reason: str | None = None) -> None:
+        super().__init__(_RUNNING_CANCEL.format(job=job_id))
+        self.job_id, self.cause = job_id, cause
+        self.already_kept, self.signer_fp, self.reason = already_kept, signer_fp, reason
 
 
 class AlreadyRecorded(TransitionRefused):
@@ -451,6 +485,15 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS cancel_signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL, "
     "signature TEXT NOT NULL, signer_fp TEXT NOT NULL, at TEXT NOT NULL)",
     *_append_only("cancel_signatures", "a cancel is written once"),
+    # a cancel the store refused for a RUNNING job (its process may still write) leaves this row first: the run supervisor
+    # reads it (`stop_requested`), stops the runs, then records the cancel (`stop_recorded`). Additive: no new cause, and a
+    # store without the table reads as no request. One row per party: a human's signed cancel is always kept, even
+    # behind a planner's request, and it is the one the supervisor records; a party's second request is a no-op.
+    "CREATE TABLE IF NOT EXISTS stop_requests (job_id TEXT NOT NULL REFERENCES jobs(id), "
+    "cause TEXT NOT NULL CHECK (cause IN ('planner_cancel', 'human_cancel')), "
+    "signer TEXT NOT NULL, payload TEXT NOT NULL, signature TEXT NOT NULL, at TEXT NOT NULL, "
+    "PRIMARY KEY (job_id, cause))",
+    *_append_only("stop_requests", "a stop request is written once"),
     # the human authorise item (F11 (A)): the operator's signature over one run's ARTIFACT digest and its landing
     # branch, kept beside the contract signature and the cancel, never in their tables; a job is authorised once
     "CREATE TABLE IF NOT EXISTS authorise_signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), "
@@ -526,6 +569,11 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS artifact_take_failures (session TEXT NOT NULL, ticket TEXT NOT NULL, "
     "failures INTEGER NOT NULL CHECK (failures >= 1), reason TEXT NOT NULL, parked INTEGER NOT NULL "
     "CHECK (parked IN (0, 1)), at TEXT NOT NULL, PRIMARY KEY (session, ticket))",
+    # the name root's artifact step gave a ticket whose export it could not make (an `artifact_failed` event,
+    # levain.dispatch.follow): once per (session, ticket), the first name stands; the runner fails the job by it
+    "CREATE TABLE IF NOT EXISTS artifact_failures (session TEXT NOT NULL, ticket TEXT NOT NULL, "
+    "name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 128), at TEXT NOT NULL, PRIMARY KEY (session, ticket))",
+    *_append_only("artifact_failures", "an artifact failure is recorded once"),
     # dispatch's SESSION-EVENTS cursor (CONTRACT §3.6 "dispatch persists its cursor"): at most one row, the journal
     # the cursor belongs to and the last seq the follower finished (levain.dispatch.follow); rewritten, never appended
     "CREATE TABLE IF NOT EXISTS event_cursor (one INTEGER PRIMARY KEY CHECK (one = 1), journal_id TEXT NOT NULL, "
@@ -1028,6 +1076,27 @@ class JobStore:
                          "at = excluded.at", (session, ticket, n, reason, int(parked), self._stamp()))
             return n, reason, parked
 
+    def artifact_failure(self, session: str, ticket: str) -> str | None:
+        """The name root gave the failed export of (``session``, ``ticket``); None if no failure was noted."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT name FROM artifact_failures WHERE session = ? AND ticket = ?",
+                               (session, ticket)).fetchone()
+        finally:
+            conn.close()
+        return None if row is None else row[0]
+
+    def note_artifact_failed(self, session: str, ticket: str, name: str) -> bool:
+        """Record that root's artifact step failed (``session``, ``ticket``) with ``name``: True when written now,
+        False when the pair already holds a failure (a replayed event; the first name stands, never replaced)."""
+        if (type(session) is not str or type(ticket) is not str or type(name) is not str or not session or not ticket
+                or not 1 <= len(name) <= 128):
+            raise DispatchError("an artifact failure is a session, a ticket and a name of 1 to 128 characters")
+        with self._write() as conn:
+            cur = conn.execute("INSERT OR IGNORE INTO artifact_failures (session, ticket, name, at) "
+                               "VALUES (?, ?, ?, ?)", (session, ticket, name, self._stamp()))
+            return cur.rowcount == 1
+
     @contextmanager
     def _swept(self) -> Iterator[tuple[sqlite3.Connection, str]]:
         """The sweep committed in its own write transaction, then the operation's write transaction, swept again so
@@ -1167,7 +1236,8 @@ class JobStore:
                stopped: bool = False) -> int:
         """Move ``job_id`` to ``to_state`` for ``cause`` if :data:`EDGES` allows it from the state read HERE, in the
         caller's write transaction; returns the new seq. Out of ``running`` only ``runs_exited`` passes, unless
-        ``stopped`` (:meth:`stop_recorded` alone sets it): every write goes through here, so no door can release a
+        ``stopped`` (:meth:`stop_recorded` sets it, and :meth:`runs_exited` for a cancel kept while the runs were live,
+        recorded only once they are over): every write goes through here, so no door can release a
         running job's write files while its process may still write them."""
         if not isinstance(evidence, str) or len(evidence) > _EVIDENCE_MAX:
             raise TransitionRefused(f"evidence is text of at most {_EVIDENCE_MAX} characters")
@@ -1528,16 +1598,28 @@ class JobStore:
     def cancel_by_planner(self, job_id: str, capability: str) -> Job:
         """The filing planner cancels its job (its capability), at any state before authorised but ``running``:
         cancelling only removes authority, so the planner may always do it before a human has authorised. A running
-        job is refused (its process may still write): the run supervisor stops it, then records the cancel
-        (:meth:`stop_recorded`)."""
-        return self._planner(job_id, capability, "cancelled", "planner_cancel")
+        job is refused (its process may still write) AFTER its request is kept (:meth:`stop_requested`): the run supervisor
+        stops it, then records the cancel (:meth:`stop_recorded`)."""
+        with self._swept() as (conn, stamp):
+            job = self._must_load(conn, job_id)
+            self._capability_problem(conn, job, capability)
+            if job.state != "running":
+                self._apply(conn, job.id, "cancelled", "planner_cancel", stamp, "")
+                out = self._load(conn, job.id)
+                assert out is not None
+                return out
+            new = self._request_stop(conn, job.id, "planner_cancel", "planner", stamp)
+        raise StopRequested(job.id, "planner_cancel", already_kept=not new)    # after the commit: the request stays
 
     def cancel_by_human(self, job_id: str, payload: Any, signature: Any, authority: AuthoritySource) -> Job:
         """The operator's signed cancel (:func:`levain.dispatch.sign.cancel_payload`) of a job in any non-terminal
-        state, authorised included: store the signed item and move the job to ``cancelled`` (cause
-        ``human_cancel``) in one write transaction. ``authority`` is replayed afresh inside that transaction, as
-        :meth:`sign` replays it. A terminal job is a :class:`TransitionRefused`, and so is a running one (its process
-        may still write: the run supervisor stops it, then records the cancel, :meth:`stop_recorded`); a cancel that
+        state, authorised included: store the signed item in ``cancel_signatures`` and move the job to ``cancelled``
+        (cause ``human_cancel``) in one write transaction. ``authority`` is replayed afresh inside that transaction, as
+        :meth:`sign` replays it. A terminal job is a :class:`TransitionRefused`. A RUNNING job (its process may still
+        write) is not moved: once the signature verifies, the signed item is kept as its stop request (``stop_requests``,
+        not yet ``cancel_signatures``) and :class:`StopRequested` is raised after the commit; the run supervisor stops
+        the runs, then records the cancel (:meth:`stop_recorded`, which copies the signed item into
+        ``cancel_signatures``). A cancel that
         is not the operator's, or one signed before the job's latest human-signed transition (a stale cancel), is a
         :class:`SignatureRefused` saying why; an authority log that cannot be read and a verifier that cannot run
         are raised as themselves, as :meth:`sign` raises them. Cancelled is terminal, so an authorised job cancelled
@@ -1561,16 +1643,97 @@ class JobStore:
                                "new cancel")
             if problem is not None:
                 raise SignatureRefused(problem)
-            conn.execute("INSERT INTO cancel_signatures (job_id, payload, signature, signer_fp, at) "
-                         "VALUES (?, ?, ?, ?, ?)",
-                         (job.id, dsign.sign_message(payload).decode("utf-8"), signature, payload["signer_fp"],
-                          stamp))
-            self._apply(conn, job.id, "cancelled", "human_cancel", stamp,
-                        json.dumps({"signer_fp": payload["signer_fp"], "reason": payload["reason"]},
-                                   sort_keys=True))
+            if job.state != "running":
+                conn.execute("INSERT INTO cancel_signatures (job_id, payload, signature, signer_fp, at) "
+                             "VALUES (?, ?, ?, ?, ?)",
+                             (job.id, dsign.sign_message(payload).decode("utf-8"), signature, payload["signer_fp"],
+                              stamp))
+            kept: tuple[bool, str, str] | None = None
+            if job.state == "running":
+                # the signed cancel verified: keep it and the request (the supervisor stops, then records), and refuse
+                # the transition itself after the commit. A human request is written once: a second signed cancel
+                # keeps nothing, and the receipt names the KEPT one (its signer and reason), the one recorded
+                new = self._request_stop(conn, job.id, "human_cancel", payload["signer_fp"], stamp,
+                                         proof=(dsign.sign_message(payload).decode("utf-8"), signature))
+                signer_fp, reason = self._kept_human(conn, job.id)
+                kept = (not new, signer_fp, reason)
+            else:
+                self._apply(conn, job.id, "cancelled", "human_cancel", stamp,
+                            json.dumps({"signer_fp": payload["signer_fp"], "reason": payload["reason"]},
+                                       sort_keys=True))
             out = self._load(conn, job.id)
         assert out is not None
+        if kept is not None:
+            raise StopRequested(job.id, "human_cancel", already_kept=kept[0], signer_fp=kept[1],
+                                reason=kept[2])                         # after the commit: the request stays
         return out
+
+    def _request_stop(self, conn: sqlite3.Connection, job_id: str, cause: str, signer: str, stamp: str, *,
+                      proof: tuple[str, str] = ("", "")) -> bool:
+        """Keep ``cause``'s request to stop running job ``job_id``: one per party (that party's second is a no-op), so a
+        human's signed cancel is kept even after a planner's request, and :meth:`stop_requested` then names the
+        human's. ``proof`` is a human cancel's signed message and signature, kept as the request's evidence (the
+        planner's is its capability, already checked, and is never stored). True when this call wrote the request."""
+        if conn.execute("SELECT 1 FROM stop_requests WHERE job_id = ? AND cause = ?", (job_id, cause)).fetchone() is None:
+            conn.execute("INSERT INTO stop_requests (job_id, cause, signer, payload, signature, at) "
+                         "VALUES (?, ?, ?, ?, ?, ?)", (job_id, cause, str(signer)[:128], proof[0], proof[1], stamp))
+            return True
+        return False
+
+    @staticmethod
+    def _kept_human(conn: sqlite3.Connection, job_id: str) -> tuple[str, str]:
+        """The kept human request's ``(signer_fp, reason)`` for ``job_id``, read on ``conn`` (the caller knows one is
+        kept). The reason is read from the kept signed message (canonical JSON)."""
+        signer, payload = conn.execute("SELECT signer, payload FROM stop_requests WHERE job_id = ? AND "
+                                       "cause = 'human_cancel'", (job_id,)).fetchone()
+        try:
+            reason = json.loads(payload).get("reason", "")
+        except (ValueError, AttributeError):
+            reason = ""
+        return str(signer), str(reason)
+
+    def stop_requested(self, job_id: str) -> str | None:
+        """The cause (``planner_cancel`` / ``human_cancel``) a cancel of RUNNING job ``job_id`` was requested with, the
+        human's when both parties asked, else None. The planner's was kept after its capability checked, the human's
+        after its signature verified, so a row here is that party's own: the run supervisor's ``cancel_for``
+        (:func:`levain.dispatch.run_jobs.store_cancel_for`) reads it, stops every run, and only then records the cancel
+        with :meth:`stop_recorded`. A store with no such table reads None; any other store error (locked, corrupt) is
+        raised, never read as "no request" (the runner's hook logs it and retries next tick)."""
+        conn = self._connect()
+        try:
+            return self._kept_request(conn, job_id)
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return None
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _keep_human_cancel(conn: sqlite3.Connection, job_id: str, stamp: str) -> dict[str, str]:
+        """As a running job's ``human_cancel`` is recorded: copy the human's kept stop request (its signed message and
+        signature) into ``cancel_signatures``, as a cancel of a job that was not running writes it, and answer the
+        evidence members ``signer_fp`` / ``reason``. No human request kept (a ``cancel_for`` hook that checked the cancel
+        itself): nothing is copied and nothing is answered."""
+        row = conn.execute("SELECT payload, signature, signer FROM stop_requests WHERE job_id = ? AND "
+                           "cause = 'human_cancel'", (job_id,)).fetchone()
+        if row is None:
+            return {}
+        payload, signature, signer_fp = row
+        conn.execute("INSERT INTO cancel_signatures (job_id, payload, signature, signer_fp, at) VALUES (?, ?, ?, ?, ?)",
+                     (job_id, payload, signature, signer_fp, stamp))
+        try:
+            reason = json.loads(payload).get("reason", "")
+        except (ValueError, AttributeError):
+            reason = ""
+        return {"signer_fp": signer_fp, "reason": str(reason)}
+
+    @staticmethod
+    def _kept_request(conn: sqlite3.Connection, job_id: str) -> str | None:
+        """The kept stop request's cause for ``job_id`` read on ``conn`` (a human's before a planner's), else None."""
+        row = conn.execute("SELECT cause FROM stop_requests WHERE job_id = ? AND cause IN ('planner_cancel', "
+                           "'human_cancel') ORDER BY cause = 'human_cancel' DESC LIMIT 1", (job_id,)).fetchone()
+        return None if row is None else row[0]
 
     def authorise(self, job_id: str, *, cause: str, evidence: str,
                   human: tuple[Any, Any, AuthoritySource, Callable[..., str | None]] | None = None,
@@ -1618,7 +1781,7 @@ class JobStore:
         return out
 
     def record_verification(self, run: VerifierRun, *, envelope: bytes | None, event: Mapping[str, Any], repo: str,
-                            tree: str, model: Mapping[str, str],
+                            tree: str | None, model: Mapping[str, str],
                             routemap: Callable[[int], Any] | None = None,
                             ticket_for: TicketFor | None = None) -> Job:
         """Record the end of run ``run.run``'s verifier session on its verifying job. ``event`` is the session's
@@ -1643,7 +1806,8 @@ class JobStore:
 
         A refused event, a minted run that is not a contract entry and its steps (:data:`ENTRY_REFUSED`), a minted
         verifier entry that is not the template's (:data:`NOT_THE_TEMPLATES`), both checked before anything is
-        staged, or an envelope :func:`levain.dispatch.verifier_report.check_envelope` refuses fails
+        staged, an envelope :func:`levain.dispatch.verifier_report.check_envelope` refuses, or a report that checks
+        with ``tree`` None (:data:`TREE_UNAVAILABLE`: no tree to stage the run's commit on) fails
         the job with cause ``verifier_refused``, the evidence the refusal's name, keeps the ticket and the event's
         own report field beside it (what a repeat is matched on), and writes no run record. A report that
         checks: the run's commit is staged (:func:`levain.dispatch.adopt.stage_commit`, ``verified_at`` the event's
@@ -1690,6 +1854,10 @@ class JobStore:
                 report = check_envelope(envelope, expected=run, event_digest=report_digest)
             except ReportRefused as exc:
                 name = exc.name
+            if name is None and tree is None:
+                # the envelope checked but dispatch holds no tree to stage the run on: its own infrastructure
+                # failed, named, and the job fails here rather than the event waiting for a reader that answers
+                name = TREE_UNAVAILABLE
             if name is None:
                 routed = _routed_model(run, model, facts)
                 if routed is None:
@@ -1851,21 +2019,122 @@ class JobStore:
                 self._apply(conn, job_id, "failed", "envelope_ended", stamp, evidence)
         return EnvelopeEnd(failed=failed, to_stop=tuple(job_id for job_id, state in rows if state == "running"))
 
-    def stop_recorded(self, job_id: str, cause: str, *, why: str = "") -> Job:
+    def runs_exited(self, job_id: str, runs: Mapping[int, tuple[str, str]]) -> Job:
+        """``running -> verifying`` (cause ``runs_exited``): every run of the job has ended AND its artifact is taken. The
+        door is the store's, and it checks what it can read itself, in the one write transaction: ``runs`` maps each run
+        index ``0..k-1`` (the template's k, exactly) to the ``(session, ticket)`` of the run, and every one must have a
+        taken artifact (:meth:`taken_artifact`'s table) or the call is a :class:`TransitionRefused` and nothing is
+        written. That each run's process is over (S1 END proved the slot uid's group gone) is the supervisor's to have
+        proven before it calls; that no run overran its dollar share is its to have read. The evidence names, per run,
+        the session, ticket and manifest digest it took. A cancel kept for the job while it ran (:meth:`stop_requested`)
+        wins in the same transaction: the job goes ``running -> cancelled`` with the request's cause instead, the runs
+        named under ``"runs"`` in the evidence beside ``"stopped": true``."""
+        if not isinstance(runs, Mapping):
+            raise TransitionRefused("runs_exited names each run's session and ticket")
+        with self._swept() as (conn, stamp):
+            job = self._must_load(conn, job_id)
+            if job.state != "running":
+                raise TransitionRefused(f"job {job.id} is {job.state}; only a running job's runs exit")
+            k = job.contract.template.k
+            if sorted(runs) != list(range(k)):
+                raise TransitionRefused(f"job {job.id} has {k} runs; runs_exited names runs {sorted(runs)[:8]}")
+            evidence: dict[str, Any] = {}
+            for i in range(k):
+                pair = runs[i]
+                if type(pair) is not tuple or len(pair) != 2 or not all(type(x) is str and x for x in pair):
+                    raise TransitionRefused(f"run {i}'s session and ticket are two non-empty strings")
+                row = conn.execute("SELECT manifest_digest FROM artifact_takes WHERE session = ? AND ticket = ?",
+                                   pair).fetchone()
+                if row is None:
+                    raise TransitionRefused(f"run {i} of job {job.id} has no taken artifact; a job whose runs left "
+                                            "none is stopped (run_failed), never verified")
+                evidence[str(i)] = {"session": pair[0], "ticket": pair[1], "manifest_digest": row[0]}
+            requested = self._kept_request(conn, job.id)
+            if requested is None:
+                self._apply(conn, job.id, "verifying", "runs_exited", stamp, json.dumps(evidence, sort_keys=True))
+            else:
+                # a cancel kept while the job ran (the runner read none before it landed, or the runner was down):
+                # the runs are over, so the cancel is recorded here and the job never verifies
+                record = {"stopped": True, "why": "cancel requested while running; the runs had exited",
+                          "runs": evidence}
+                if requested == "human_cancel":
+                    record.update(self._keep_human_cancel(conn, job.id, stamp))
+                self._apply(conn, job.id, "cancelled", requested, stamp, json.dumps(record, sort_keys=True),
+                            stopped=True)
+            out = self._load(conn, job.id)
+        assert out is not None
+        return out
+
+    def fail_untaken(self, job_id: str, *, name: str, why: str = "") -> Job:
+        """``signed``/``queued`` -> ``failed`` (cause ``run_failed``): the runner refused the job for a STANDING reason
+        BEFORE taking it (its preflight: no route, no verifier, a bad contract), so nothing of it ever ran and there is
+        no process to stop. A running job goes through :meth:`stop_recorded`, after the supervisor proved its runs'
+        END. Evidence ``{"name", "why", "taken": false}``."""
+        record = {"name": _label("name", name, 128), "why": str(why)[:500], "taken": False}
+        with self._swept() as (conn, stamp):
+            job = self._must_load(conn, job_id)
+            if job.state not in ("signed", "queued"):
+                raise TransitionRefused(f"job {job.id} is {job.state}; only a signed or queued job is failed untaken "
+                                        "(a running one is stopped, then recorded)")
+            self._apply(conn, job.id, "failed", "run_failed", stamp, json.dumps(record, sort_keys=True))
+            out = self._load(conn, job.id)
+        assert out is not None
+        return out
+
+    def fail_verifier_closed(self, job_id: str, run: int, state: str) -> Job:
+        """``verifying`` -> ``failed`` (cause ``verifier_refused``, evidence ``ticket-closed:<state>``): run ``run``'s
+        verifier ticket closed (``cancelled`` or ``expired``) before any session bound it, and its attempt id is
+        deterministic, so a remint is the same ticket: the job can never reach ``verified`` (S14 design A D7). A job
+        that is not verifying is a :class:`TransitionRefused` and nothing is written."""
+        with self._swept() as (conn, stamp):
+            job = self._must_load(conn, job_id)
+            if job.state != "verifying":
+                raise TransitionRefused(f"job {job.id} is {job.state}; only a verifying job fails on a closed ticket")
+            self._apply(conn, job.id, "failed", "verifier_refused", stamp,
+                        f"ticket-closed:{_label('state', state, 32)}")
+            out = self._load(conn, job.id)
+        assert out is not None
+        return out
+
+    def defer_untaken(self, job_id: str, *, name: str) -> Job:
+        """``signed`` -> ``queued`` (cause ``slot_wait``) for a TRANSIENT preflight refusal; a job already ``queued``
+        stays as it is (the edge exists once). The lease bounds the wait: the sweep lapses a queued job past it."""
+        with self._swept() as (conn, stamp):
+            job = self._must_load(conn, job_id)
+            if job.state == "queued":
+                return job
+            if job.state != "signed":
+                raise TransitionRefused(f"job {job.id} is {job.state}; only a signed job waits for a slot")
+            self._apply(conn, job.id, "queued", "slot_wait", stamp,
+                        json.dumps({"name": _label("name", name, 128)}, sort_keys=True))
+            out = self._load(conn, job.id)
+        assert out is not None
+        return out
+
+    def stop_recorded(self, job_id: str, cause: str, *, why: str = "", run: int | None = None,
+                      name: str | None = None) -> Job:
         """The run supervisor stopped and reaped running job ``job_id``'s process; record why: ``running ->
         cancelled`` for ``planner_cancel``/``human_cancel``, ``running -> failed`` for ``lease_lapsed``,
-        ``budget_cap``, ``floor_refused`` or ``envelope_ended``, in one write transaction, releasing its write files.
+        ``budget_cap``, ``floor_refused``, ``run_failed`` or ``envelope_ended``, in one write transaction, releasing its
+        write files. ``run`` and ``name`` (the run that failed and the refusal's name) join the evidence when given.
         Besides ``runs_exited``, this is the ONE way a job leaves ``running`` (:meth:`_apply` refuses the rest), and
         it is called only AFTER the process is stopped (kill-then-record, C0 §5): recording first would free the
         files while the process could still write them. Callable only from ``running`` (anything else is a
         :class:`TransitionRefused`). The store checks what it can: ``lease_lapsed`` only past the job's lease,
         ``envelope_ended`` only for a job filed inside an envelope. That the envelope ended (it was in
-        :meth:`end_envelope`'s ``to_stop``) and that the cancel was the planner's or the human's are the
-        supervisor's to have checked before it stopped the process."""
+        :meth:`end_envelope`'s ``to_stop``) is the supervisor's to have checked.
+
+        The cancel's AUTHORITY is decided here, in this one write transaction, from the store's kept requests
+        (:meth:`stop_requested`), never from what the caller read before its END proof: a ``planner_cancel`` is
+        recorded only with a kept request, and a ``human_cancel`` only with a kept HUMAN request (its signature verified
+        when it was kept), else :class:`TransitionRefused` and nothing is written. A kept human request outranks
+        whatever ``cause`` the caller names (a planner's cancel, a lapsed lease, an overrun, a failed run, an ended
+        envelope, read before the human's signed cancel landed): the job is recorded ``cancelled`` / ``human_cancel``
+        and the caller's cause is named ``superseded`` in the evidence. A recorded ``human_cancel`` copies the kept
+        signed item into ``cancel_signatures`` and names ``signer_fp`` / ``reason`` in the evidence."""
         if cause not in _STOP_CAUSES:
             raise TransitionRefused(f"{str(cause)[:40]!r} is not a cause that stops a running job "
                                     f"(only {sorted(_STOP_CAUSES)})")
-        to_state = "cancelled" if cause in ("planner_cancel", "human_cancel") else "failed"
         with self._swept() as (conn, stamp):
             job = self._must_load(conn, job_id)
             if job.state != "running":
@@ -1874,9 +2143,28 @@ class JobStore:
                 raise TransitionRefused(f"job {job.id} was not filed inside an envelope")
             if cause == "lease_lapsed" and job.expires_at > stamp:
                 raise TransitionRefused(f"job {job.id}'s lease runs to {job.expires_at}; it has not lapsed")
+            kept = self._kept_request(conn, job.id)
+            if cause in ("planner_cancel", "human_cancel") and kept is None:
+                raise TransitionRefused(f"job {job.id} has no kept cancel request; a cancel of a running job is recorded "
+                                        "only from the party's own kept request (stop_requested)")
+            if cause == "human_cancel" and kept != "human_cancel":
+                raise TransitionRefused(f"job {job.id} has no kept human-signed cancel; human_cancel is recorded only "
+                                        "from one")
+            superseded = None
+            if kept == "human_cancel" and cause != "human_cancel":
+                superseded, cause = cause, "human_cancel"
+            to_state = "cancelled" if cause in ("planner_cancel", "human_cancel") else "failed"
             record: dict[str, Any] = {"stopped": True, "why": str(why)[:500]}
+            if superseded is not None:
+                record["superseded"] = superseded
+            if run is not None:
+                record["run"] = run if type(run) is int and 0 <= run < 4096 else None
+            if name is not None:
+                record["name"] = str(name)[:128]
             if cause == "envelope_ended":
                 record["envelope_id"] = job.envelope_id
+            if cause == "human_cancel":
+                record.update(self._keep_human_cancel(conn, job.id, stamp))
             self._apply(conn, job.id, to_state, cause, stamp, json.dumps(record, sort_keys=True), stopped=True)
             out = self._load(conn, job.id)
         assert out is not None

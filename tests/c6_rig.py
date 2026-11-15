@@ -134,20 +134,23 @@ class World:
     for the gate's event and SIGKILLs keys there; `rows()` is CONTROL's sink as on disk; `received` every triple
     CONTROL was sent, in order."""
 
-    def __init__(self, py: str, hold: bool = False) -> None:
-        self.py, self.hold = py, hold
+    def __init__(self, py: str, hold: bool = False, routes: Optional[List[Dict[str, Any]]] = None,
+                 hosts: Optional[List[str]] = None) -> None:
+        # `routes` / `hosts`: the signed generation-1 map's routes and the credential's hosts (S14 R1: a map of two
+        # brokered routes); the default is the one `glm` route on `api.z.ai`
+        self.py, self.hold, self.routes, self.hosts = py, hold, routes, hosts
 
     async def __aenter__(self) -> "World":
         self.d = Path(tempfile.mkdtemp(prefix="c6", dir="/tmp"))
         try:
             self.st = Store(self.d, Signer(self.d, "op"))
-            self.one, sig = self.st.signed(item(1, [ROUTE]))
+            self.one, sig = self.st.signed(item(1, self.routes or [ROUTE]))
             submit(RM.ControlRoutes(self.st.routes), self.one, sig)
             write_ceiling(self.st.L)
             cred = self.d / "keys" / "cred"
             cred.mkdir(mode=0o700, exist_ok=True)
             (cred / "or-key.json").write_text(json.dumps(
-                {"format": CR.FORMAT, "name": "or-key", "rev": "0" * 32, "hosts": [HOST],
+                {"format": CR.FORMAT, "name": "or-key", "rev": "0" * 32, "hosts": self.hosts or [HOST],
                  "inject": {"header": "authorization", "scheme": "Bearer"}, "kind": "static",
                  "secret": B2.SECRET}))
             self.lineage = self.d / "lineage"

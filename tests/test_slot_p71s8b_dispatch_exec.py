@@ -505,12 +505,15 @@ def test_11_the_kind_matrix_of_vendor_argv_is_unchanged_but_for_the_executor():
     assert SS.EXECUTOR_PROMPT == "Execute the task in your system prompt."
 
 
-def test_11b_a_verifier_alloc_start_is_still_unbuilt(tmp_path):
+def test_11b_an_executor_rendered_session_rewritten_to_verifier_is_refused_not_rendered(tmp_path):
+    """The verifier start is built (S14 A3, ``verifier_session``): the old ``verb-unbuilt:verifier`` answer is gone.
+    An alloc rewritten to kind ``verifier`` over an executor render is refused ``not-rendered`` before any clone
+    or spawn."""
     w, la, _ = _world(tmp_path)
     s = _rendered(w)
     p = w.L / "alloc" / f"{s}.json"
     p.write_bytes(R.alloc_bytes(replace(R.parse_alloc(p.read_bytes()), kind="verifier")))
-    assert w.main(["start", s])[1]["refused"] == "verb-unbuilt:verifier"
+    assert w.main(["start", s])[1]["refused"] == "not-rendered"
     assert la.spawns == []
 
 

@@ -671,6 +671,11 @@ def test_base_recorded_only_when_step3_completes(world):
     assert world.alloc(s).base is None
 
 
+#: the driver input the verifier render test stages, and the digest the ticket pins for it (S14 A1: render checks it)
+DRIVER_INPUT = b"{}"
+DRIVER_INPUT_DIGEST = "sha256:" + hashlib.sha256(DRIVER_INPUT).hexdigest()
+
+
 def test_none_class_no_front_no_handle(world, request):
     """A verifier (none class) render: no front started, no FRONT-ARM, MINT claims with no front, no handle.
 
@@ -694,7 +699,8 @@ def test_none_class_no_front_no_handle(world, request):
                            "kind": "verifier", "egress_routes": [], "reserved_microdollars": 0,
                            "verifier_generation": 1, "verifier_id": "pytest-report",
                            "verifier_steps": [{"argv": ["pytest", "-q"], "wall_s": 60}],
-                           "input_bundle_digest": "sha256:" + "2" * 64, "driver_input_digest": "sha256:" + "3" * 64})
+                           "input_bundle_digest": "sha256:" + hashlib.sha256(BUNDLE).hexdigest(),
+                           "driver_input_digest": DRIVER_INPUT_DIGEST})
     ticket = tickets.mint("a-verifier-1", facts, C.new_handle, resolved=VERIFIER_ENTRY).ticket
     tickets.bind(ticket, s)                                              # what ATTACH of the ticket-bound lease journals
     a = R.Alloc(session=s, slot=slot, lease_seq=1, slot_rev=1, slot_uid=893, slot_gid=893, kind="verifier",
@@ -715,7 +721,7 @@ def test_none_class_no_front_no_handle(world, request):
     H.make_session_dirs(ctx, s, H.session_dir_rows(slot, {"_levain_v0": 893, "_levain_c0": 892}))
     (world.L / "staging" / s).mkdir()
     world.stage(s)
-    (world.L / "staging" / s / "driver_input.json").write_bytes(b"{}")
+    (world.L / "staging" / s / "driver_input.json").write_bytes(DRIVER_INPUT)
     blob = _blob(routes=[], verifier_steps=[{"argv": ["pytest", "-q"], "wall_s": 60}], driver="output_compare")
     code, line = world.main(["render", s], blob, uid=DISPATCH_UID)
     assert line == {"ok": True}, world.last_err
@@ -726,7 +732,8 @@ def test_none_class_no_front_no_handle(world, request):
     assert world.alloc(s).policy.front is None and world.state(s).state == R.RENDERED
     assert world.chown_of(f"live/{s}/root") == (0, 0) and world.mode(f"live/{s}/root") == 0o755
     assert world.chown_of(f"live/{s}/in/repo.bundle") == (0, 892)
-    assert os.listdir(world.L / "staging" / s) == ["driver_input.json"]   # unstaged here (2f's): never removed
+    assert os.listdir(world.L / "staging" / s) == []                    # S14 A1: both staged files are removed
+    assert (world.L / "live" / s / "driver" / "input.json").read_bytes() == DRIVER_INPUT
 
 
 #: a resolved verifier entry (§3.5 VERIFIER IDENTITY) as CONTROL adds it to a verifier ticket's facts, which alloc
@@ -740,7 +747,7 @@ VERIFIER_ENTRY = {"verifier_generation": 1, "verifier_id": "pytest-report",
                       RD.read_driver_template("output_compare") or b"").hexdigest(),
                   "steps_digest": "sha256:" + hashlib.sha256(canon.canonical_bytes(
                       [{"argv": ["pytest", "-q"], "wall_s": 60}])).hexdigest(),
-                  "driver_input_digest": "sha256:" + "3" * 64}
+                  "driver_input_digest": DRIVER_INPUT_DIGEST}
 
 
 def test_render_refused_for_another_callers_session(world):

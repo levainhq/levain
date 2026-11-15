@@ -33,7 +33,9 @@ it there, ``bind_stdin``: ``ticket-required``), and into no log line, refusal de
 from __future__ import annotations
 
 import collections
+import hashlib
 import logging
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -45,11 +47,13 @@ from levain.agents.session_launcher import (HOOKS, LauncherRefused, SlotHandle, 
 from levain.contracts import canon
 from levain.slot import Refused, layout
 from levain.slot.control_client import ControlClient
+from levain.slot.grammar import SESSION_RE
+from levain.slot.ids import SlotId
 from levain.slot.runtime_grammar import RENDER_FORMAT, parse_stdin
 from levain.slot.supervisor import (HELPER_DEADLINE_DEFAULT_S, HELPER_DEADLINE_S, KILL_GRACE_S, SUDO, _host,
                                     parse_helper_line, pick_routes, prepare_answer, read_base_map, spawn)
 
-__all__ = ["PORT_OPS", "DispatchControlPort", "HelperSlotRuntime", "StreamDrain"]
+__all__ = ["PORT_OPS", "DispatchControlPort", "HelperSlotRuntime", "HelperVerifierRuntime", "StreamDrain"]
 
 _log = logging.getLogger(__name__)
 
@@ -370,3 +374,261 @@ class HelperSlotRuntime:
                 lease.close()
             except Exception:  # noqa: BLE001 - one failing close must not leave the rest open
                 _log.warning("closing a lease failed at shutdown")
+
+
+# -- the verifier session (S14 A4, design A D1 a and D3 a) -------------------------------------------------------------
+
+#: the driver's own wall (V26), the clone's and the slack the waiter adds. DECISION: dispatch cannot import root's
+#: ``verifier_session`` (the closure runs the other way), so the V26 figure is written here and a test pins it equal.
+DRIVER_WALL_S = 600
+CLONE_WALL_S = 300
+WAIT_SLACK_S = 120
+#: root's per-spawn costs beside a wall (S14 fix 5, L2 M2), written here for the same reason and each pinned equal by a
+#: test: the session END lock waited for up to ``verifier_session.LOCK_WAIT_S`` before a spawn and again before its
+#: kill-and-prove, the proof itself up to ``proc.V12_SECONDS`` (Linux) / ``proc.V12K_SECONDS`` (macOS), and the reap
+#: of a timed-out child up to ``verifier_session._REAP_GRACE_S``
+ROOT_LOCK_WAIT_S = 30
+ROOT_KILL_PROOF_S = 10
+ROOT_REAP_GRACE_S = 5
+#: one spawn's worst case beside its wall: two lock waits, a kill proof and a reap
+SPAWN_OVERHEAD_S = 2 * ROOT_LOCK_WAIT_S + ROOT_KILL_PROOF_S + ROOT_REAP_GRACE_S
+_COPY_CHUNK = 1 << 20
+_BUNDLE_NAME = "repo.bundle"
+_DRIVER_INPUT_NAME = "driver_input.json"
+#: ``runtime_helper.PREPARE_RESULT_FORMAT``, written here so this module takes no import of the helper (a test pins them equal)
+_PREPARE_RESULT_FORMAT = "levain-prepare-result/1"
+_PREPARE_NONE_KEYS = frozenset({"format", "session", "slot", "staging"})
+
+
+def verifier_wait_bound(steps: "Sequence[Mapping[str, Any]]") -> float:
+    """How long the waiter gives the helper's ``start`` for a verifier session: every step's wall, the driver's, the
+    clone's, root's worst case beside each wall for the k steps and the driver (:data:`SPAWN_OVERHEAD_S` each: two
+    lock waits, a kill proof, a reap), one lock wait each for the clone and the envelope write, and a slack. Past it the
+    helper is ended and the session ENDed anyway, so a bound short of root's real worst case would end a long ticket
+    early as ``no-report:ACTIVE``."""
+    walls = sum(int(st["wall_s"]) for st in steps)
+    return float(walls + DRIVER_WALL_S + CLONE_WALL_S + (len(steps) + 1) * SPAWN_OVERHEAD_S + 2 * ROOT_LOCK_WAIT_S
+                 + WAIT_SLACK_S)
+
+
+def _prepare_none_answer(prep: "Mapping[str, object]", *, store: Path) -> str:
+    """``prepare none verifier``'s answer checked whole: a none-class slot has no gateway, so the answer holds no
+    ``gwport`` (``supervisor.prepare_answer`` is the egress shape and refuses it). Returns the session id."""
+    def bad(what: str) -> Refused:
+        return Refused("prepare-answer-malformed", what)
+
+    if set(prep) != _PREPARE_NONE_KEYS:
+        raise bad("keys: " + ",".join(sorted(set(prep) ^ _PREPARE_NONE_KEYS))[:128])
+    if prep["format"] != _PREPARE_RESULT_FORMAT:
+        raise bad("format")
+    session = prep["session"]
+    if type(session) is not str or not SESSION_RE.fullmatch(session):
+        raise bad("session")
+    sl = prep["slot"]
+    if type(sl) is not dict or set(sl) != {"class", "index"} or sl["class"] != "none" or type(sl["index"]) is not int:
+        raise bad("slot")
+    try:
+        SlotId("none", sl["index"])
+    except Refused:
+        raise bad("slot") from None
+    if prep["staging"] != str(Path(store) / "staging" / session):
+        raise bad("staging")
+    return session
+
+
+def _write_new(dfd: int, name: str, data: bytes) -> None:
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    except FileExistsError:
+        raise Refused("staging-dest-exists", name) from None
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def stage_verifier_inputs(staging: "Path | str", bundle_path: "Path | str", bundle_digest: str, driver_input: bytes) -> None:
+    """``L/staging/<session>/repo.bundle`` (copied from ``bundle_path``, hashed as it is copied) and
+    ``driver_input.json``. Both are fresh files (``O_EXCL|O_NOFOLLOW``, 0600, the lease peer's own, which root's
+    reader opens as the staging uid). A copy whose digest is not ``bundle_digest`` is removed and refused
+    ``verifier-bundle-mismatch``; a source that cannot be read as a regular file is ``verifier-bundle-unreadable``.
+    Both are refused BEFORE render, so root never sees a bundle the ticket does not name."""
+    dfd = os.open(os.fspath(staging), os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        try:
+            src = os.open(os.fspath(bundle_path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as e:
+            raise Refused("verifier-bundle-unreadable", f"open: {e.strerror or e}") from None
+        try:
+            import stat as _stat
+            if not _stat.S_ISREG(os.fstat(src).st_mode):
+                raise Refused("verifier-bundle-unreadable", "not a regular file")
+            try:
+                dst = os.open(_BUNDLE_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600,
+                              dir_fd=dfd)
+            except FileExistsError:
+                raise Refused("staging-dest-exists", _BUNDLE_NAME) from None
+            h = hashlib.sha256()
+            try:
+                os.fchmod(dst, 0o600)
+                while True:
+                    try:
+                        chunk = os.read(src, _COPY_CHUNK)
+                    except OSError as e:
+                        raise Refused("verifier-bundle-unreadable", f"read: {e.strerror or e}") from None
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(dst, view):]
+                os.fsync(dst)
+            except BaseException:
+                os.close(dst)
+                dst = -1
+                try:
+                    os.unlink(_BUNDLE_NAME, dir_fd=dfd)
+                except FileNotFoundError:
+                    pass
+                raise
+            finally:
+                if dst >= 0:
+                    os.close(dst)
+        finally:
+            os.close(src)
+        if "sha256:" + h.hexdigest() != bundle_digest:
+            os.unlink(_BUNDLE_NAME, dir_fd=dfd)
+            raise Refused("verifier-bundle-mismatch", "the bundle copied is not the one the ticket was minted against")
+        _write_new(dfd, _DRIVER_INPUT_NAME, driver_input)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+class HelperVerifierRuntime:
+    """The production ``VerifierRuntime`` (S14 A4): a verifier session's start through the runtime helper, in the order
+    ``LEASE-OPEN{ticket}``, ``prepare none verifier claude none`` (stdin ``{lease_nonce, ticket}``; the vendor token
+    is the grammar's and no vendor binary runs), the bundle copied into staging (hashed as it copies) and
+    ``driver_input.json`` written, ``render`` (blob ``{format, vendor, routes: [], verifier_steps, driver}``, checked
+    by the helper's own grammar first), then the helper's ``start`` holding the lease, and a return.
+
+    ``slot`` is the executor's :class:`HelperSlotRuntime`: its helper, socket, store, client factory, lease table and
+    ``end`` are this runtime's, so ``slot.close()`` closes verifier leases too, and one END proof per session.
+
+    Design A D3 (a): a verifier session is ENDed by THIS runtime. One waiter thread per session waits for the helper's
+    ``start`` to exit (bounded by :func:`verifier_wait_bound`; past it the helper is ended), then calls ``slot.end``
+    and closes the lease only on a proven END (the executor's rule). An unproven END leaves the lease open and logs
+    it: the lease's EOF at shutdown (CONTROL revokes) and the root reaper are the backstop. A start that fails after
+    the session is known ENDs it once, as the executor's does. The ticket is written nowhere: it goes to CONTROL in
+    the LEASE-OPEN frame and to ``prepare``'s stdin, never into an argv, a log line, a refusal detail or a file."""
+
+    def __init__(self, slot: HelperSlotRuntime) -> None:
+        self._slot = slot
+        self._mu = threading.Lock()
+        self._waiters: "list[threading.Thread]" = []
+
+    # -- the render blob ---------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _render_blob(steps: "Sequence[Mapping[str, Any]]", driver_template: str) -> bytes:
+        blob = {"format": RENDER_FORMAT, "vendor": "claude", "routes": [], "verifier_steps": [dict(s) for s in steps],
+                "driver": driver_template}
+        data = canon.canonical_bytes(blob)
+        parse_stdin("render", data)               # the helper's own grammar, before anything is allocated
+        return data
+
+    # -- start -------------------------------------------------------------------------------------------------------
+
+    def start(self, ticket: str, inputs: Any) -> None:
+        slot = self._slot
+        blob = self._render_blob(inputs.steps, inputs.driver_template)
+        lease = slot._factory(slot._socket)
+        try:
+            ans = lease.call("LEASE-OPEN", ticket=ticket)
+            nonce = ans.get("lease_nonce")
+            if type(nonce) is not str or not nonce:
+                raise Refused("lease-nonce-missing", "LEASE-OPEN")
+            prep = slot._run("prepare", "none", "verifier", "claude", "none",
+                             stdin=canon.canonical_bytes({"lease_nonce": nonce, "ticket": ticket}), lease=lease)
+            session = _prepare_none_answer(prep, store=slot._store)
+        except BaseException:
+            try:
+                lease.close()
+            except Exception:  # noqa: BLE001 - never mask the refusal that is being raised
+                _log.warning("closing the lease failed")
+            raise                                 # the session is not known: CONTROL revokes on EOF, the reaper ENDs
+        with slot._mu:
+            shut = slot._closed
+            if not shut:
+                slot._leases[session] = lease
+        if shut:
+            try:
+                slot.end(session)
+                lease.close()
+            except Exception:  # noqa: BLE001 - never mask the refusal below
+                _log.warning("ending a session refused at shutdown failed")
+            raise LauncherRefused("runtime-closed", "the dispatch runtime is shutting down", reason_class="transient")
+        child = None
+        try:
+            stage_verifier_inputs(slot._store / "staging" / session, inputs.bundle_path, inputs.bundle_digest,
+                                  inputs.driver_input)
+            slot._run("render", session, stdin=blob, lease=lease)
+            child = _ctl.GatedChild([*slot._helper, "start", session], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env=slot._env)
+            drains = (StreamDrain(child.process.stdout).start(), StreamDrain(child.process.stderr, keep=_ERR_TAIL).start())
+            with slot._mu:
+                slot._drains[session] = drains
+            child.release()
+            waiter = threading.Thread(target=self._wait, args=(session, child, verifier_wait_bound(inputs.steps)),
+                                      name="levain-verifier-wait", daemon=True)
+            with self._mu:
+                self._waiters = [t for t in self._waiters if t.is_alive()] + [waiter]
+            waiter.start()
+        except BaseException:
+            if child is not None:
+                try:
+                    child.abort()
+                except Exception:  # noqa: BLE001 - END below is the proof; the gate is closed best effort
+                    pass
+            slot.end(session)
+            raise
+
+    # -- the waiter (D3 a) ---------------------------------------------------------------------------------------------
+
+    def _wait(self, session: str, child: Any, bound: float) -> None:
+        """Wait for the helper's ``start`` to answer, reap it, then END the session. Never raises."""
+        slot = self._slot
+        try:
+            try:
+                child.process.wait(timeout=bound)
+            except subprocess.TimeoutExpired:
+                _log.warning("the verifier start of session %s ran past %ss; ending it", session, bound)
+            try:
+                child.abort()
+            except Exception:  # noqa: BLE001 - END below is the proof
+                _log.warning("reaping the verifier start of session %s failed", session)
+            with slot._mu:
+                drains = slot._drains.get(session)
+            if drains is not None and drains[1].tail.strip():
+                _log.info("verifier start %s stderr: %s", session, _safe(drains[1].tail))
+            if not slot.end(session):
+                _log.warning("END of verifier session %s is not proven; its lease stays open (shutdown revokes it, the "
+                             "root reaper ENDs it)", session)
+        except Exception as exc:  # noqa: BLE001 - a waiter that dies leaves the lease and the reaper to END
+            _log.warning("the waiter of verifier session %s failed: %s", session, type(exc).__name__)
+
+    def join_waiters(self, timeout: float = 10.0) -> bool:
+        """Wait for every waiter to finish (a test's and a shutdown's seam). True when none is left running."""
+        with self._mu:
+            threads = list(self._waiters)
+        for t in threads:
+            t.join(timeout)
+        return not any(t.is_alive() for t in threads)
+
+    def close(self) -> None:
+        """The shared lease table's close (:meth:`HelperSlotRuntime.close`): every lease still held is closed."""
+        self._slot.close()

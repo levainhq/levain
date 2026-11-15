@@ -287,3 +287,16 @@ def test_dispatch_recommend_carries_the_proposal_and_an_integer_is_never_a_boole
     assert out["isError"] is False and out["structuredContent"]["result"]["onto"] == "main"
     assert json.loads(lw.jstore.get(job.id).history[-1].evidence) == {"onto": "main", "run": 1}
 
+
+
+def test_a_planner_cancel_of_a_running_job_says_the_request_is_kept(ddir, repo):
+    # L1 F2: the request is kept (StopRequested), so the reply is not "Refused, nothing changed"
+    job = call(ddir, "dispatch_file", {"contract": contract(repo)})["result"]["structuredContent"]["result"]
+    store = JobStore(ddir)
+    store._transition(job["id"], "signed", "signature")
+    store._transition(job["id"], "running", "slot_taken")
+    out = call(ddir, "dispatch_cancel", {"job": job["id"], "capability": job["capability"]})["result"]
+    text = out["content"][0]["text"]
+    assert out["isError"] is False and text.startswith("Stop requested, not yet stopped") and "nothing changed" not in text
+    assert out["structuredContent"]["result"] == {"id": job["id"], "state": "running", "stop_requested": "planner_cancel"}
+    assert store.stop_requested(job["id"]) == "planner_cancel"

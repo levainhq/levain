@@ -92,7 +92,7 @@ PEER_VERBS: Mapping[str, frozenset[str]] = {
     "qbroker": frozenset({"QUEUE-RESOLVE"}),
     "keys": frozenset({"TOKEN-RESOLVE", "KEYS-ATTACH", "FRONT-LOST", "SPEND-OVERRUN", "SESSIONS", "LINEAGE-APPEND"}),
     "dispatch": frozenset({"LEASE-OPEN", "ROUTE-SUBMIT", "ROUTE-RESOLVE", "RUN-TICKET-MINT", "RUN-TICKET-CANCEL",
-                           "RUN-TICKET-STATUS", "RUN-TICKET-FACTS", "ROUTEMAP-ACTIVE",
+                           "RUN-TICKET-STATUS", "RUN-TICKET-FACTS", "RUN-TICKET-VERIFIER", "ROUTEMAP-ACTIVE",
                            "POOL", "CONFIG-SUBMIT", "SESSION-EVENTS", "ARTIFACT-ACK"}),
     "foreign": frozenset(),
 }
@@ -133,6 +133,7 @@ _ARGS: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
     "ROUTE-RESOLVE": (frozenset({"model"}),) * 2,             # dispatch wave 3 (S-B2): read-only, the brokered mint's route facts
     # PRE-W: read-only, the F9a follower's supervisor readers (a run's executor ticket facts; the active route map)
     "RUN-TICKET-FACTS": (frozenset({"job_id", "run_index"}),) * 2,
+    "RUN-TICKET-VERIFIER": (frozenset({"ticket"}),) * 2,      # S14 R3: a verifier ticket's facts and entry, by handle
     "ROUTEMAP-ACTIVE": (frozenset(), frozenset()),
 }
 
@@ -157,6 +158,15 @@ SPEND_OVERRUN_REFS_MAX = 4096
 #: L3 r1 Q5: the one ``reason`` SPEND-OVERRUN may carry: keys stopped the session because a response said another
 #: model ran than the checked one (it may then be charged no more than its hold: overrun 0)
 SPEND_OVERRUN_REASONS = frozenset({"model-mismatch"})
+
+#: S14 A0: the verifier-report pair (CAS-writable, but only under :meth:`Control._check_report_fields`'s rule), the
+#: states a CAS may move INTO while carrying it, and the states where start's own FIELD-ONLY write may carry it
+#: (plus RENDERED for ``verifier_report_refused`` alone, in :meth:`Control.cas`).
+REPORT_FIELDS = frozenset({"verifier_report_digest", "verifier_report_refused"})
+#: S14 D0: the claims kinds whose record may carry an artifact field (see :meth:`Control._check_artifact_fields`).
+ARTIFACT_KINDS = frozenset({"dispatch", "planner"})
+REPORT_INTO_STATES = frozenset({R.RETAINED, R.HELD})
+REPORT_FIELD_ONLY_STATES = frozenset({R.RENDERING, R.ACTIVE})
 #: DECISION: the token digests one SESSIONS may carry; keys sends more as several (a test pins its chunk below this).
 SESSIONS_DIGESTS_MAX = 512
 
@@ -1862,6 +1872,30 @@ class Control:
         return {"generation": self.cas(args["session"], args["generation"], args["from"], args["to"],
                                        args["fields"])}
 
+    @staticmethod
+    def _check_report_fields(rec: R.SessionState, checked: dict) -> None:
+        """S14 A0 (fail closed): a report field is accepted only on a record whose ``claims.kind`` is exactly
+        ``verifier``; once either of the pair is set, the CAS may repeat that value (a retry) but may not change it,
+        remove it, or set the other member."""
+        if rec.claims.get("kind") != "verifier":
+            raise Refused("report-not-verifier", "a verifier report field on a record that is not a verifier's")
+        if any(n in rec.fields for n in REPORT_FIELDS):
+            for name in sorted(REPORT_FIELDS & set(checked)):
+                if checked[name] != rec.fields.get(name):
+                    raise Refused("report-immutable", name)
+
+    @staticmethod
+    def _check_artifact_fields(rec: R.SessionState, checked: dict) -> None:
+        """S14 D0 (fail closed): an artifact field is accepted only on a record whose ``claims.kind`` is exactly
+        ``dispatch`` (the executor) or ``planner`` (and, by the caller, only on a field-only RETAINED CAS); once either of the pair
+        is set, the CAS may repeat that value (a retry) but may not change it, remove it, or set the other member."""
+        if rec.claims.get("kind") not in ARTIFACT_KINDS:
+            raise Refused("artifact-not-executor", "an artifact field on a record that is not an executor's or planner's")
+        if any(n in rec.fields for n in R.ARTIFACT_FIELDS):
+            for name in sorted(R.ARTIFACT_FIELDS & set(checked)):
+                if checked[name] != rec.fields.get(name):
+                    raise Refused("artifact-immutable", name)
+
     def cas(self, session: object, generation: object, frm: object, to: object,
             fields: object) -> int:
         """§7.2 CAS. Static checks first (no lock): states named, the edge in :data:`records.EDGES` (or
@@ -1893,11 +1927,24 @@ class Control:
             # DECISION: §3.6 stores ONE event_kind per generation; a CAS that moved the state AND set an
             # artifact field would owe two events. The 3b CAS is field-only (RETAINED -> RETAINED).
             raise Refused("edge-not-allowed", "an artifact field moves with no state change")
+        artifact_named = R.ARTIFACT_FIELDS & set(checked)
+        if artifact_named and not (frm == to == R.RETAINED):
+            raise Refused("edge-not-allowed", f"{frm} -> {to} carrying an artifact field")   # S14 D0: field-only RETAINED
+        report_named = REPORT_FIELDS & set(checked)
+        if report_named and not (to in REPORT_INTO_STATES or (frm == to and to in REPORT_FIELD_ONLY_STATES)
+                                 or (frm == to == R.RENDERED and set(checked) == {"verifier_report_refused"})):
+            # S14 A0: the pair rides only start's own field-only write or the move into RETAINED / HELD; on RENDERED
+            # (a verifier clone failure) only the refusal name, alone in the CAS: never the digest, never both
+            raise Refused("edge-not-allowed", f"{frm} -> {to} carrying a verifier report field")
         revoked = False
         with self.store.lock(session):
             rec = self.store.get(session)
             if rec is None:
                 raise Refused("no-session")
+            if report_named:
+                self._check_report_fields(rec, checked)
+            if artifact_named:
+                self._check_artifact_fields(rec, checked)
             live_to = to in R.LIVE_STATES and to != R.ALLOCATED
             if (frm != to and rec.state == to and rec.generation == generation + 1
                     and all(_current(rec, k) == v for k, v in checked.items())):
@@ -2718,6 +2765,13 @@ class Control:
         job_id = T._text(args["job_id"], "job_id", T._NAME)
         run_index = T._uint(args["run_index"], "run_index")
         return {"facts": self._ticket_store().executor_facts(job_id, run_index)}
+
+    def _op_run_ticket_verifier(self, conn: Conn, args: dict) -> dict[str, object]:
+        """``RUN-TICKET-VERIFIER {ticket}`` -> ``{facts, verifier, state, session?}`` (S14 R3): the facts and the resolved
+        entry of the VERIFIER ticket of that handle, from THIS journal (:meth:`levain.slot.tickets.TicketStore.
+        verifier_facts`; ``ticket-unknown`` for any other kind). Read-only, CONTROL's own record echoed back: the follower's
+        production ``resolve`` reads a verifier run's job, run and entry here, never from a file dispatch wrote."""
+        return self._ticket_store().verifier_facts(_handle(args["ticket"], "ticket"))
 
     def _op_routemap_active(self, conn: Conn, args: dict) -> dict[str, object]:
         """``ROUTEMAP-ACTIVE`` -> ``{generation, routes: {id: {backends}}, digests}`` (PRE-W): the ACTIVE dispatch

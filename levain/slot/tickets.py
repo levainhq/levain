@@ -1098,6 +1098,21 @@ class TicketStore:
                 raise Refused("ticket-unknown", "the run's facts aged out past the retention margin")
             return dict(found[0].facts)
 
+    def verifier_facts(self, ticket: str) -> Dict[str, object]:
+        """S14 R3 (the follower's verifier reader, ``RUN-TICKET-VERIFIER``): the facts of the VERIFIER ticket ``ticket``
+        as minted and journaled, the entry CONTROL resolved at its mint (``verifier``), its state and, once a lease bound
+        it, its ``session``. ``ticket-unknown`` for a handle never minted or minted for another kind (an executor
+        ticket's facts are :meth:`executor_facts`'s; never answered here). Read-only: nothing is appended."""
+        with self.lock:
+            self._live()
+            t = self._by_ticket.get(ticket)
+            if t is None or t.facts.get("kind") != "verifier" or t.resolved is None:
+                raise Refused("ticket-unknown", "no verifier ticket of that handle")
+            out: Dict[str, object] = {"facts": dict(t.facts), "verifier": dict(t.resolved), "state": self._state(t)}
+            if t.session is not None:
+                out["session"] = t.session
+            return out
+
     def counts(self) -> Dict[str, int]:
         """The rebuilt counts (doctor / tests): open tickets and the current UTC day's mints."""
         with self.lock:

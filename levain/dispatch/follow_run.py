@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import logging
 import os
 import signal
+import stat
 import sys
 import threading
 from pathlib import Path
@@ -33,9 +35,11 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from levain.dispatch.follow import PERMANENT_TAKES, EventFollower, FollowStopped, VerifierCall
 from levain.dispatch.jobs import JobStore
+from levain.dispatch.verifier_report import MAX_ENVELOPE_BYTES
 from levain.slot import Refused
 from levain.slot import control_client as CC
 from levain.slot.layout import RUN, STORE, dispatch_store_dir
+from levain.slot.lineage import SINK
 
 log = logging.getLogger("levain.dispatch.follow_run")
 
@@ -223,13 +227,170 @@ def _parser(host: str) -> argparse.ArgumentParser:
                     help="the dispatch job store's directory (dispatch.db)")
     ap.add_argument("--socket", default=str(R / "control" / "control.sock"), help="the socket CONTROL serves")
     ap.add_argument("--export-dir", default=str(L / "export" / "dispatch"), help="root's export/dispatch directory")
+    ap.add_argument("--lineage-sink", default=str(L / "lineage" / SINK),
+                    help="CONTROL's lineage sink (the answered model of a run is read from it)")
     return ap
 
 
-def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str, Any]], Optional[VerifierCall]]
-         = no_minted_runs, routemap: Any = None, ticket_for: Any = None,
-         supervisor: Any = "socket") -> int:
-    """Run the follower until SIGTERM/SIGINT. ``routemap`` and ``ticket_for`` (F9a) default to the SUPERVISOR's own
+#: the CONTROL verbs the production ``resolve`` asks, read-only, as the dispatch peer (S14 R3)
+RESOLVE_OPS = frozenset({"RUN-TICKET-VERIFIER", "RUN-TICKET-STATUS"})
+
+
+def control_resolve(socket_path: "Path | str", jobs: JobStore, readers: Any = None) -> Any:
+    """The PRODUCTION ``resolve`` (S14 R3): :class:`levain.dispatch.verify_stage.ControlResolve` on CONTROL's socket at
+    ``socket_path``, so a verifier event's run, entry and steps are CONTROL's own record of its ticket and never a file the
+    runner writes. ``readers`` supply what CONTROL does not hold (the artifact tree, the verifier envelope bytes, the
+    executor's answered model); the default :func:`unsourced_readers` answers nothing for them, so a report event (no
+    envelope) fails its job ``report-missing`` and is acked (S14 L3 F1: never a wedge of the events behind it)."""
+    from levain.dispatch.verify_stage import ControlResolve
+    from levain.slot.dispatch_runtime import DispatchControlPort
+    return ControlResolve(DispatchControlPort(socket_path, ops=RESOLVE_OPS), jobs,
+                          readers if readers is not None else unsourced_readers())
+
+
+def unsourced_readers() -> Any:
+    """:class:`levain.dispatch.verify_stage.Readers` that answer nothing: no S1 code writes the verifier's envelope yet,
+    and no source of an artifact's tree or an executor's answered model is built into the follower. Honest, not a stub of
+    success: a report event fails its job ``report-missing``."""
+    from levain.dispatch.verify_stage import Readers
+    return Readers(tree=lambda _job, _run: None, envelope=lambda _session, _ticket: None,
+                   answered=lambda _job, _run: None)
+
+
+#: the verifier envelope root writes under ``<export>/<session>/``
+ENVELOPE_NAME = "verifier-report.json"
+
+
+def _read_envelope(export_dir: "Path | str", session: object) -> Optional[bytes]:
+    """``<export_dir>/<session>/verifier-report.json``'s bytes, or None. Every component is opened ``O_NOFOLLOW`` from
+    its parent's fd (a link at any depth reads as None), the file must be a regular file (a fifo is never opened for
+    blocking: ``O_NONBLOCK``), and at most ``MAX_ENVELOPE_BYTES + 1`` bytes are read, an over-cap file reading as None.
+    ``session`` must be one plain name."""
+    if type(session) is not str or not session or session in (".", "..") or "/" in session or "\0" in session:
+        return None
+    root = str(export_dir)
+    if not os.path.isabs(root) or "\0" in root:
+        return None
+    parts = [p for p in root.split("/") if p] + [session]
+    dflags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    cur = -1
+    try:
+        cur = os.open("/", dflags)
+        for p in parts:
+            nxt = os.open(p, dflags, dir_fd=cur)
+            os.close(cur)
+            cur = nxt
+        fd = os.open(ENVELOPE_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=cur)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            data = b""
+            while len(data) <= MAX_ENVELOPE_BYTES:
+                chunk = os.read(fd, MAX_ENVELOPE_BYTES + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+    finally:
+        if cur >= 0:
+            os.close(cur)
+    return data if len(data) <= MAX_ENVELOPE_BYTES else None
+
+
+#: DECISION (S14 fix 4): the largest lineage sink :func:`_read_answered` reads; a larger one answers None (the model
+#: is optional, D5: the record then says "answering model unknown"), so a long-lived sink never costs the follower
+#: its size in memory per event
+ANSWERED_SINK_MAX = 128 << 20
+#: DECISION: the read size, and the longest line considered (a longer one is skipped to its newline, never held)
+_ANSWERED_CHUNK = 1 << 20
+_ANSWERED_LINE_MAX = 1 << 20
+
+
+def _answered_of(raw: bytes, needle: bytes, job_id: str, run_index: int) -> Optional[str]:
+    """One sink line's ``model_answered`` for ``(job_id, run_index)`` when it names one, else None."""
+    if not raw or needle not in raw:
+        return None
+    try:
+        row = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(row, dict) or row.get("job_id") != job_id or type(row.get("run_index")) is not int \
+            or row["run_index"] != run_index:
+        return None
+    m = row.get("model_answered")
+    return m if isinstance(m, str) and m and m != "unknown" else None
+
+
+def _read_answered(sink: "Path | str", job_id: object, run_index: object) -> Optional[str]:
+    """The last ``model_answered`` of the lineage sink's rows for ``(job_id, run_index)`` that is a non-empty string and
+    not ``"unknown"``, else None (the model is optional, D5). FAIL CLOSED to None: the sink is opened ``O_NOFOLLOW |
+    O_NONBLOCK`` (a link is not followed, a fifo never blocks the follower), it must be a regular file of at most
+    :data:`ANSWERED_SINK_MAX` bytes, and it is read in bounded chunks (a sink that grows past the cap while read is
+    None too), never whole. A line that does not parse is skipped, as is a torn last one and a line longer than
+    :data:`_ANSWERED_LINE_MAX`; no state is kept."""
+    if type(job_id) is not str or not job_id or type(run_index) is not int:
+        return None
+    try:
+        fd = os.open(os.fspath(sink), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except (OSError, TypeError, ValueError):
+        return None
+    needle = job_id.encode("utf-8")
+    answered: Optional[str] = None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > ANSWERED_SINK_MAX:
+            return None
+        tail, total, skipping = b"", 0, False
+        while True:
+            chunk = os.read(fd, _ANSWERED_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > ANSWERED_SINK_MAX:
+                return None
+            lines = (tail + chunk).split(b"\n")
+            tail = lines.pop()                          # the part after the last newline: a line still being read
+            if skipping and lines:
+                lines.pop(0)                            # the rest of an over-long line, up to its newline
+                skipping = False
+            for raw in lines:
+                m = _answered_of(raw, needle, job_id, run_index)
+                if m is not None:
+                    answered = m
+            if len(tail) > _ANSWERED_LINE_MAX:
+                tail, skipping = b"", True
+        if tail and not skipping:
+            m = _answered_of(tail, needle, job_id, run_index)    # a torn last line does not parse: skipped
+            if m is not None:
+                answered = m
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return answered
+
+
+def production_readers(export_dir: "Path | str", sink: "Path | str") -> Any:
+    """S14 A5: :class:`levain.dispatch.verify_stage.Readers` for two of the three sources. ``envelope(session, ticket)``
+    is root's exported envelope (:func:`_read_envelope`; ``check_envelope`` later binds it to the event's digest, session
+    and ticket); ``answered(job, run)`` is the lineage sink's last named model for the run (:func:`_read_answered`);
+    ``tree`` stays unsourced (None) until the artifact tree is built (A6), so until then a report event fails its job
+    ``verifier-tree-unavailable`` and is acked (HEAD DEFAULT, S14 fix 1: never a wedge of the events behind it)."""
+    from levain.dispatch.verify_stage import Readers
+    return Readers(tree=lambda _job, _run: None,
+                   envelope=lambda session, _ticket: _read_envelope(export_dir, session),
+                   answered=lambda job, run: _read_answered(sink, getattr(job, "id", None), run))
+
+
+def main(argv: Optional[Sequence[str]] = None, *, resolve: Optional[Callable[[Mapping[str, Any]], Optional[VerifierCall]]]
+         = None, routemap: Any = None, ticket_for: Any = None,
+         supervisor: Any = "socket", readers: Any = None) -> int:
+    """Run the follower until SIGTERM/SIGINT. ``resolve`` defaults, in production, to :func:`control_resolve` on
+    ``--socket`` (S14 R3; :func:`no_minted_runs` is no longer the production resolve, it stays for an install that wants
+    to refuse every verifier event). ``routemap`` and ``ticket_for`` (F9a) default to the SUPERVISOR's own
     readers on ``--socket`` (:func:`supervisor_facts`, PRE-W) when ``supervisor`` is ``"socket"``; ``supervisor=None``
     wires none (every run unresolved), and an explicit reader replaces its default. Never anything ``resolve`` says."""
     if os.geteuid() == 0:
@@ -237,7 +398,8 @@ def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str
         return EX_USAGE
     ap = _parser(_host())
     a = ap.parse_args(sys.argv[1:] if argv is None else list(argv))
-    for flag, v in (("--store-dir", a.store_dir), ("--socket", a.socket), ("--export-dir", a.export_dir)):
+    for flag, v in (("--store-dir", a.store_dir), ("--socket", a.socket), ("--export-dir", a.export_dir),
+                    ("--lineage-sink", a.lineage_sink)):
         if not os.path.isabs(v):
             ap.error(f"{flag} must be an absolute path")
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
@@ -256,6 +418,9 @@ def main(argv: Optional[Sequence[str]] = None, *, resolve: Callable[[Mapping[str
             facts = supervisor_facts(a.socket)
             routemap = facts.routemap if routemap is None else routemap
             ticket_for = facts.ticket_for if ticket_for is None else ticket_for
+        if resolve is None:
+            resolve = control_resolve(a.socket, jobs,
+                                      readers if readers is not None else production_readers(a.export_dir, a.lineage_sink))
         runner = FollowRunner(EventFollower.at(jobs, a.socket, resolve, export_dir=a.export_dir, routemap=routemap,
                                                ticket_for=ticket_for))
         requested: list[int] = []
@@ -305,7 +470,7 @@ def _run_into(runner: FollowRunner, failed: list[BaseException]) -> None:
 
 
 __all__ = ["BACKOFF_FIRST_S", "BACKOFF_MAX_S", "EX_INSTANCE_HELD", "FollowRunner", "LASTING_S", "RETRYABLE", "main",
-           "no_minted_runs", "take_instance_lock", "SUPERVISOR_OPS", "SupervisorFacts", "supervisor_facts"]
+           "no_minted_runs", "production_readers", "take_instance_lock", "SUPERVISOR_OPS", "SupervisorFacts", "supervisor_facts"]
 
 
 if __name__ == "__main__":

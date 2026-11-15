@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from levain.dispatch import DispatchError
-from levain.dispatch.export import ArtifactIOError, ArtifactUnreadable, read_artifact
+from levain.dispatch.export import ArtifactIOError, ArtifactUnreadable, ExportedArtifact, read_artifact
 from levain.dispatch.jobs import (_SESSION_TERMINAL, AlreadyRecorded, JobStore, RecordConflict, TicketFor,
                                   TransitionRefused, report_of)
 from levain.dispatch.take import TakeFailed, take_artifact
@@ -88,11 +88,12 @@ class FollowStopped(DispatchError):
 
 @dataclass(frozen=True)
 class VerifierCall:
-    """What :meth:`JobStore.record_verification` takes beside the event, for one verifier ticket."""
+    """What :meth:`JobStore.record_verification` takes beside the event, for one verifier ticket. ``tree`` None: no
+    tree reader answered, and the store fails the job ``verifier-tree-unavailable`` (acked, never a wedge)."""
     run: VerifierRun
     envelope: bytes | None
     repo: str
-    tree: str
+    tree: str | None
     model: Mapping[str, str]
 
 
@@ -231,20 +232,31 @@ class EventFollower:
         if ("artifact_digest" in body) == ("artifact_failed" in body):
             raise FollowStopped("event-shape", f"event {ev.seq}: an artifact event carries exactly one of "
                                                "artifact_digest and artifact_failed")
+        session, ticket = body.get("session"), body.get("ticket")
+        if not isinstance(session, str) or not isinstance(ticket, str):
+            raise FollowStopped("event-shape", f"event {ev.seq}: an artifact event names a session and a ticket, each "
+                                               "a string")
         digest = body.get("artifact_digest")
         if digest is None:
-            log.info("artifact event %d (session %s) passed unacked: the artifact step failed", ev.seq,
-                     body.get("session"))
+            # root's artifact step gave up on this export: the name is the job's failure (the runner reads it), and
+            # nothing is acked, so retention falls back to dispatch_retain_days
+            name = body.get("artifact_failed")
+            if not isinstance(name, str) or not 1 <= len(name) <= 128:
+                raise FollowStopped("event-shape", f"event {ev.seq}: artifact_failed is a string of 1 to 128 characters")
+            try:
+                fresh = self.jobs.note_artifact_failed(session, ticket, name)
+            except DispatchError as e:
+                raise FollowStopped("record-refused", f"event {ev.seq}: {e}") from None
+            log.info("artifact event %d (session %s) passed unacked: the artifact step failed (%s)%s", ev.seq, session,
+                     name, "" if fresh else ", already recorded")
             return
+        if not isinstance(digest, str):
+            raise FollowStopped("event-shape", f"event {ev.seq}: an artifact event's digest is a string")
         if self._export_dir is None:
-            log.info("artifact event %d (session %s) passed unacked: no export dir", ev.seq, body.get("session"))
+            log.info("artifact event %d (session %s) passed unacked: no export dir", ev.seq, session)
             return
-        session, ticket = body.get("session"), body.get("ticket")
-        if not isinstance(session, str) or not isinstance(ticket, str) or not isinstance(digest, str):
-            raise FollowStopped("event-shape", f"event {ev.seq}: an artifact event names a session, a ticket and a "
-                                               "digest, each a string")
         try:
-            art = read_artifact(self._export_dir, session)
+            art = read_artifact(self._export_dir, session, expect_digest=digest)
         except ArtifactUnreadable as e:
             log.warning("artifact event %d (session %s) passed unacked: %s", ev.seq, session, e)
             return
@@ -266,8 +278,14 @@ class EventFollower:
                       "retention falls back to dispatch_retain_days", ev.seq, session, ticket, count, e.name, e)
             return
         self._hit("taken", ev.seq)
+        self._before_ack(ev, art)
         self._ack(ev.seq, {"ticket": ticket, "artifact_digest": digest})
         self._hit("acked", ev.seq)
+
+    def _before_ack(self, ev: CC.Event, art: ExportedArtifact) -> None:
+        """A6's insertion point: the artifact is TAKEN and the session is still RETAINED, because the ACK is what lets
+        the reaper trash it. A step that must see the retained session (A6's adopt-verify) runs here; one that raises
+        :class:`FollowStopped` leaves the event unacked and the cursor before it. Nothing runs here yet."""
 
     def _verifier_done(self, ev: CC.Event) -> None:
         body = ev.body

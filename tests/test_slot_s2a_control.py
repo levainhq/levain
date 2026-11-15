@@ -4,6 +4,7 @@ each client's bound socket path to the uid it plays (root / the operator / a for
 the kernel's reader as-is. Cross-uid peer checks themselves are the VM's (session 2g)."""
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import socket
@@ -48,6 +49,8 @@ SESSION2 = {"operator": {"LEASE-OPEN", "STATUS", "KEYS-STATUS", "REVOKE-OWN"},
                          "ROUTE-RESOLVE",
                          # PRE-W: the F9a follower's read-only supervisor readers
                          "RUN-TICKET-FACTS", "ROUTEMAP-ACTIVE",
+                         # S14 R3: the follower's production resolve reads a verifier ticket's facts by handle
+                         "RUN-TICKET-VERIFIER",
                          # S1 3c-5 session 2: a ticket-bound lease (CONTRACT §3.1 step 1)
                          "LEASE-OPEN",
                          # S1 3c-7: the pool count (CONTRACT §3.3 dispatch row, §3.5 Pool)
@@ -463,11 +466,16 @@ def test_cas_field_only_and_event_kind(env):
     assert "failed_step" not in env.record(S1).fields
     for frm, to in (("HELD", "RETAINED"),):
         g = cas(root, S1, g, frm, to)["generation"]
+    # S14 D0: artifact fields ride only a dispatch/planner record; this one is an interactive session's
+    assert cas(root, S1, g, "RETAINED", "RETAINED", artifact_digest="sha256:" + "a" * 64)["refused"] == "artifact-not-executor"
+    with env.store.lock(S1):
+        rec = env.store.get(S1)
+        env.store.put(dataclasses.replace(rec, claims={**rec.claims, "kind": "dispatch"}))
     g = cas(root, S1, g, "RETAINED", "RETAINED", artifact_digest="sha256:" + "a" * 64)["generation"]
     assert env.record(S1).event_kind == "artifact"
     assert cas(root, S1, g, "RETAINED", "TRASH", artifact_failed="x")["refused"] == "edge-not-allowed"
     assert cas(root, S1, g, "RETAINED", "RETAINED")["refused"] == "edge-not-allowed"   # nothing to write
-    assert cas(root, S1, g, "RETAINED", "RETAINED", artifact_failed="cap")["refused"] == "bad-value"
+    assert cas(root, S1, g, "RETAINED", "RETAINED", artifact_failed="cap")["refused"] == "artifact-immutable"
 
 
 def test_cas_field_values_checked(env):

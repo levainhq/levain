@@ -12,7 +12,7 @@ The pass (§4.3), in this fixed order; each step try-locks and skips what is bus
 and named in the heartbeat, never the end of the pass:
 0 the ``*.new`` sweep · 1 dead-holder REVOKE · 2 journal reconciliation · 3 END, the HELD retry, and SCRUB again for a
 RETAINED session whose slot is still leased to it (RH5) · 3a the orphan ``leased`` revert · 3c dispatch retention
-(:meth:`Reaper.dispatch_retention`) · 3b, 5 seams · 4 BRAKE below V5 · 6 reserve refill · 7 pool health and ``SLOT-SYNC`` · 8 the heartbeat. With CONTROL down only the local steps
+(:meth:`Reaper.dispatch_retention`) · 3b the artifact worker's own child (:mod:`levain.slot.artifact_step`) · 5 seam · 4 BRAKE below V5 · 6 reserve refill · 7 pool health and ``SLOT-SYNC`` · 8 the heartbeat. With CONTROL down only the local steps
 run (0, 6, 8).
 Lock order: pool -> slot -> session END lock; the reaper never takes the install lock.
 """
@@ -351,8 +351,9 @@ class Reaper:
             if up:
                 steps += [("1", self.revoke_dead_holders), ("2", self.reconcile_journals),
                           ("3", self.end_and_scrub), ("3a", self.revert_orphans), ("3c", self.dispatch_retention)]
-            for name in ("3b", "5"):
-                rep["skipped"].append(f"step{name}:seam-unbuilt")     # type: ignore[union-attr]
+            # 3b is the artifact worker's own child (levain.slot.artifact_step, S14 D2): never a pass step, so a long
+            # import cannot hold BRAKE, END or SCRUB.
+            rep["skipped"].append("step5:seam-unbuilt")                # type: ignore[union-attr]
             if up:
                 steps += [("4", self.brake_below_floor)]
             steps += [("6", self.refill_reserve)]

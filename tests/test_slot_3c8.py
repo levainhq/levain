@@ -22,6 +22,7 @@ from levain.slot import records as R
 from levain.slot import render as RD
 from levain.slot import tickets as T
 from tests.test_pool import F2_DISPATCH, dispatch  # noqa: F401 - fixture
+from tests.test_slot_s2f2_runtime_helper import BUNDLE
 from tests.test_slot_3c7_fix_r1 import F2_FACTS, VER_FACTS, _blob, _mint, _prepared, _render
 from tests.test_slot_3c7_fix_r1 import pinning_stand_in  # noqa: F401 - fixture
 
@@ -530,11 +531,14 @@ def _verifier_session(d, entry: dict) -> str:
     d.w.control.verifiers = v
     sync_free(d.w.control)
     ans = d.w.control.handle(C.Conn(F2_DISPATCH), {"v": 1, "op": "RUN-TICKET-MINT", "id": 1, **_vargs(
-        attempt_id=f"v-{d.n}", driver_input_digest=entry["driver_input_digest"])})
+        attempt_id=f"v-{d.n}", driver_input_digest=entry["driver_input_digest"],
+        input_bundle_digest="sha256:" + hashlib.sha256(BUNDLE).hexdigest())})
     d.n += 1
     line = d.prepare(ticket_of(ans), "none", "verifier", "claude", "none")
     assert line["ok"], (line, d.w.last_err)
-    d.w.stage(line["session"])
+    d.w.stage(line["session"])         # the bundle the ticket's input_bundle_digest names (render holds it to that)
+    (d.w.L / "staging" / line["session"] / "driver_input.json").write_bytes(
+        canon.canonical_bytes(entry["driver_input"]))      # ... and the driver input the entry's digest names
     return line["session"]
 
 

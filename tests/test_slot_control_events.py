@@ -111,16 +111,39 @@ def test_every_ticket_generation_appends_its_event_before_the_verb_answers(erig)
     assert oct((erig.sdir / EV.META).stat().st_mode & 0o777) == "0o600"
 
 
-def test_a_verifier_report_rides_the_state_event(erig):
+def test_a_verifier_report_rides_the_state_event(st):  # noqa: F811
     """§3.6: the verifier report digest (or refusal) CAS'd before the terminal move rides that `state` event."""
-    bound_session(erig)
-    cas(erig, R.ALLOCATED, R.RENDERING)
-    assert root(erig, "REVOKE", session=SESSION)["ok"]
+    from tests.test_slot_3c8 import SESSION_V, VRig, vitem
+
+    class VERig(VRig):
+        """The verifier rig with CONTROL's event journal in the session store."""
+
+        def restart(self, *, fault=None, attach: bool = True) -> None:
+            if self.control is not None:
+                self.control.stop()
+            self.tickets = T.TicketStore(self.sdir / T.JOURNAL, self.st.L / "policy" / "dispatch_ceiling",
+                                         clock=self.clock, ceiling_uid=os.getuid())
+            self.cr = RM.ControlRoutes(self.st.routes)
+            self.cv = RM.ControlVerifiers(self.st.routes)
+            self.events = EV.EventJournal(self.sdir, clock=self.clock)
+            self.control = C.Control(C.StateStore(self.sdir), OP_UID, dispatch_uid=DISPATCH_UID, keys_uid=KEYS_UID,
+                                     routes=self.cr, tickets=self.tickets, clock=self.clock, verifiers=self.cv,
+                                     events=self.events)
+            self.control.start()
+            sync_free(self.control)
+            if attach:
+                self.attach(self.cr.head())
+
+    rig = VERig(st, Clock())
+    assert rig.submit_v(vitem(1))["ok"]
+    ticket = ticket_of(rig.vmint())
+    assert rig.vattach(ticket)["ok"]
+    cas(rig, R.ALLOCATED, R.RENDERING, SESSION_V)
+    assert root(rig, "REVOKE", session=SESSION_V)["ok"]
     for frm, to in END_CHAIN[:-1]:
-        cas(erig, frm, to)
-    cas(erig, R.CREDENTIAL_PARKED, R.CREDENTIAL_PARKED, verifier_report_digest=DIG)
-    cas(erig, R.CREDENTIAL_PARKED, R.RETAINED)
-    last = erig.session_events()[-1]
+        cas(rig, frm, to, SESSION_V)
+    cas(rig, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V, verifier_report_digest=DIG)
+    last = [e for e in rig.events.kept() if e.get("session") == SESSION_V][-1]
     assert last["state"] == R.RETAINED and last["verifier_report_digest"] == DIG
 
 
@@ -590,8 +613,7 @@ def test_verifier_ticket_acks_its_report(st, refusal):  # noqa: F811
     for frm, to in END_CHAIN[:-1]:
         cas(rig, frm, to, SESSION_V)
     field = {"verifier_report_refused": "verifier-failed:exit"} if refusal else {"verifier_report_digest": DIG}
-    cas(rig, R.CREDENTIAL_PARKED, R.CREDENTIAL_PARKED, SESSION_V, **field)
-    cas(rig, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V)
+    cas(rig, R.CREDENTIAL_PARKED, R.RETAINED, SESSION_V, **field)
     assert refused(ack(rig, ticket=ticket, artifact_digest=DIG)) == "artifact-not-published"
     if refusal:
         assert refused(ack(rig, ticket=ticket, verifier_report_digest=DIG)) == "artifact-not-published"

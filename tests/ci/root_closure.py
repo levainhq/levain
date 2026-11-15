@@ -500,6 +500,12 @@ LAZY_SITES = {
     'levain/slot/services/dispatch_run.py::build_server::from levain.slot.lineage import SINK': 'root',
     # root: ``supervisor_facts`` runs in the dispatch follower's own process (``follow_run.main``, ``_levain_dispatch``), which is a service entry (PRE-W)
     'levain/dispatch/follow_run.py::supervisor_facts::from levain.slot.dispatch_runtime import DispatchControlPort': 'root',
+    # root: ``control_resolve`` and ``unsourced_readers`` run in the dispatch follower's own process (``follow_run.main``, ``_levain_dispatch``), which is a service entry (S14 R3: the production ``resolve``)
+    'levain/dispatch/follow_run.py::control_resolve::from levain.dispatch.verify_stage import ControlResolve': 'root',
+    'levain/dispatch/follow_run.py::control_resolve::from levain.slot.dispatch_runtime import DispatchControlPort': 'root',
+    'levain/dispatch/follow_run.py::unsourced_readers::from levain.dispatch.verify_stage import Readers': 'root',
+    # root: ``production_readers`` runs in the dispatch follower's own process (``follow_run.main``, ``_levain_dispatch``), which is a service entry (S14 A5: the envelope and answered-model readers)
+    'levain/dispatch/follow_run.py::production_readers::from levain.dispatch.verify_stage import Readers': 'root',
     # root: ``_parser`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry (PRE-W: the setting's path)
     'levain/slot/services/dispatch_run.py::_parser::from levain.slot.layout import policy_dispatch_auth_path': 'root',
     # root: ``main`` runs in the dispatch run server's own process (``_levain_dispatch``, never the operator's), which is a service entry

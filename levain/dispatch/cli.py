@@ -33,7 +33,8 @@ and ``list`` sweep the staged refs of the jobs of that repository that ended (fa
 branch that contains the landed commit; :func:`levain.dispatch.adopt.sweep_staged`). A land's outcome is its exit:
 adopted 0; a merge for the operator to run 0, the command alone on the last line; refused 2; failed (MOVED BASE) 1.
 
-Exit codes: 0 done; 1 a land that FAILED its job (MOVED BASE); 2 the input or a refusal (the contract, the transition, the signature, the capability or the
+Exit codes: 0 done; 1 a land that FAILED its job (MOVED BASE); 4 a cancel of a RUNNING job KEPT as a stop request
+and not yet stopped (the job still runs and may still write; the run supervisor stops it, then records it); 2 the input or a refusal (the contract, the transition, the signature, the capability or the
 command line was refused: the message says why, and nothing changed); 3 a fault on this machine, told apart by its
 CLASS, never by its text: git could not run (:class:`levain.dispatch.contract.GitUnavailable`,
 :class:`levain.dispatch.adopt.GitFault`), a store, record or
@@ -100,7 +101,7 @@ from levain.dispatch import sign as dsign
 from levain.dispatch.contract import CONTRACT_MAX as _CONTRACT_MAX
 from levain.dispatch.contract import NEW, GitUnavailable, ResolvedTemplate
 from levain.dispatch.jobs import (
-    TERMINAL, CapabilityRefused, Job, JobStore, JobStoreError, SignatureRefused, TransitionRefused,
+    TERMINAL, CapabilityRefused, Job, JobStore, JobStoreError, SignatureRefused, StopRequested, TransitionRefused,
 )
 from levain.dispatch.policy import ProviderPolicy
 
@@ -109,6 +110,9 @@ __all__ = ["EXIT_FAILED", "EXIT_FAULT", "EXIT_OK", "EXIT_REFUSED", "CockpitUnnam
            "planner_capability", "render", "resolvers", "run_dispatch"]
 
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED, EXIT_FAULT = 0, 1, 2, 3
+#: a cancel of a running job KEPT as a stop request, not yet stopped: never 0 (a script gating on 0 as "cancelled"
+#: would go on while the job still writes), never 3 (nothing faulted)
+EXIT_KEPT = 4
 NO_REGISTRY = "no template registry is set up; every contract is R2, which is never dispatched"
 NO_LAND = "no dispatch configuration is set up, so nothing can land"
 
@@ -166,11 +170,14 @@ class _ActiveConfiguration:
         return self._items
 
 
-def _control_read(directory: Path | None, data_root: Path | None, *, nothing: str) -> _ActiveConfiguration | None:
+def _control_read(directory: Path | None, data_root: Path | None, *, nothing: str,
+                  authority: Any = None) -> _ActiveConfiguration | None:
     """ONE verified read of the control store in ``directory`` (default: the dispatch directory), every kind with
-    the adoption rules, against the cockpit ``data_root`` names (default: the one the consent hooks there name).
-    ``None`` when there is no control store. A store that cannot be trusted or read raises
-    :class:`levain.dispatch.control.ControlStateUnavailable` saying ``nothing was <nothing>``."""
+    the adoption rules, against the cockpit ``data_root`` names (default: the one the consent hooks there name), or
+    against ``authority`` (a :func:`levain.consent.queue.authority_source`) when the caller passes one: then no
+    cockpit is named from ``directory``'s consent hooks and ``data_root`` is not consulted (the runner's read, which
+    takes nothing from its environment). ``None`` when there is no control store. A store that cannot be trusted or
+    read raises :class:`levain.dispatch.control.ControlStateUnavailable` saying ``nothing was <nothing>``."""
     from levain.dispatch.jobs import default_dispatch_dir
 
     d = Path(directory) if directory is not None else default_dispatch_dir()
@@ -178,7 +185,8 @@ def _control_read(directory: Path | None, data_root: Path | None, *, nothing: st
         return None
     root = Path(data_root) if data_root is not None else None
     try:
-        items = dctl.ControlStore(d, authority=_authority_source(d, root))._verified_items()
+        source = authority if authority is not None else _authority_source(d, root)
+        items = dctl.ControlStore(d, authority=source)._verified_items()
     except (dctl.ControlStateUnavailable, sqlite3.Error, OSError, ValueError) as exc:
         raise dctl.ControlStateUnavailable(f"the configuration could not be read ({type(exc).__name__}: "
                                            f"{str(exc)[:200]}); nothing was {nothing}") from None
@@ -1438,6 +1446,10 @@ def _run(args: argparse.Namespace, out: Any) -> int:
             if cap is not None:
                 try:
                     return store.cancel_by_planner(args.job, cap), "planner"
+                except StopRequested:
+                    # the request IS kept (a running job): straight to the success handler, no read that could fault
+                    # it into "NOT cancelled"
+                    raise
                 except TransitionRefused as exc:
                     now = store.get(args.job)
                     if now is None or now.state != "authorised":
@@ -1458,7 +1470,25 @@ def _run(args: argparse.Namespace, out: Any) -> int:
                       file=sys.stderr if args.json else out, flush=True)
             return _signed_cancel(args, store, seen, out), "human"
 
-        job, by = _guarded(store, args.job, "cancel", cancel_it)
+        try:
+            job, by = _guarded(store, args.job, "cancel", cancel_it)
+        except StopRequested as exc:
+            # the cancel WAS kept as a stop request (a running job): not "refused, nothing changed"
+            view = {"id": exc.job_id, "state": "running", "as": "planner" if exc.cause == "planner_cancel" else "human",
+                    "stop_requested": exc.cause, "already_kept": exc.already_kept}
+            kept = "the cancel is KEPT as a stop request, not yet stopped"
+            if exc.cause == "human_cancel":
+                # the KEPT request's signer and reason (the one recorded), never this call's when one was kept before
+                view.update(signer_fp=exc.signer_fp, reason=exc.reason)
+                if exc.already_kept:
+                    kept = (f"a signed cancel was already KEPT (signer {_safe(exc.signer_fp)}, reason "
+                            f"{_safe(exc.reason)!r}); it stands and is the one recorded, this one kept nothing new; "
+                            "not yet stopped")
+            elif exc.already_kept:
+                kept = "the planner's cancel was already KEPT as a stop request (this one kept nothing new); not yet stopped"
+            emit(view, f"levain dispatch: job {exc.job_id} is RUNNING: {kept}; the run supervisor stops its runs, then "
+                       "records it cancelled (`levain dispatch show` reads it).")
+            return EXIT_KEPT
         if by == "planner":
             emit({"id": job.id, "state": job.state, "as": "planner"},
                  f"levain dispatch: cancelled job {job.id} as the PLANNER (its capability).")
@@ -1471,7 +1501,8 @@ def _run(args: argparse.Namespace, out: Any) -> int:
 
 
 def run_dispatch(args: argparse.Namespace, out: Any = None) -> int:
-    """``levain dispatch <verb>``: exit 0, 2 (input or refusal) or 3 (a machine fault, by class)."""
+    """``levain dispatch <verb>``: exit 0, 2 (input or refusal), 3 (a machine fault, by class) or, for ``cancel``, 4
+    (kept as a stop request, not yet stopped)."""
     out = out if out is not None else sys.stdout
     try:
         return _run(args, out)
@@ -1495,7 +1526,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
         description="A planner files a task contract; the operator reads it resolved and signs its digest once. "
                     "Filing creates a contract the operator must sign on their own device before anything runs; a "
                     "recommend confers no authority. Exit 0 done, 2 refused (nothing changed), 3 a fault on this "
-                    "machine.")
+                    "machine, 4 a cancel of a running job kept as a stop request, not yet stopped.")
     sub = d.add_subparsers(dest="dispatch_cmd", required=True)
     dhelp = "The dispatch directory (default: the consent directory, beside questions.db)."
 
@@ -1542,7 +1573,11 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     sg = sub.add_parser("sign", help="Sign a filed job's digest (the operator), after reading it resolved.")
     sg.add_argument("job")
     signer(sg)
-    cn = sub.add_parser("cancel", help="Cancel a job: as its planner (capability), else as the operator (signed).")
+    cn = sub.add_parser("cancel", help="Cancel a job: as its planner (capability), else as the operator (signed).",
+                        description="Cancel a job: as its planner (capability), else as the operator (signed). Exit 0 "
+                                    "cancelled, 2 refused (nothing changed), 3 a fault on this machine, 4 the job is "
+                                    "RUNNING: the cancel is KEPT as a stop request and not yet stopped (it still "
+                                    "runs; `levain dispatch show` reads it cancelled once the supervisor stopped it).")
     cn.add_argument("job")
     cn.add_argument("--reason", default="", help="One line kept with a signed cancel (may be empty).")
     cn.add_argument("--capability", default=None,

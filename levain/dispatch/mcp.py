@@ -36,7 +36,7 @@ from levain.dispatch.cli import CockpitUnnamed, file_job, job_view, land_job, pl
 from levain.dispatch.contract import GitUnavailable
 from levain.dispatch.control import ControlStateUnavailable
 from levain.dispatch.jobs import (
-    TERMINAL, CapabilityRefused, JobStore, JobStoreError, SignatureRefused, TransitionRefused,
+    TERMINAL, CapabilityRefused, JobStore, JobStoreError, SignatureRefused, StopRequested, TransitionRefused,
 )
 
 __all__ = ["TOOLS", "handle", "main", "serve"]
@@ -195,7 +195,13 @@ def _call(agent: str, directory: Path | None, params: dict[str, Any], data_root:
             word = (f"Failed ({landing.job.history[-1].cause if landing.job.history else 'unknown cause'})"
                     if landing.outcome == "failed" else "Not landed, refused")
             return _text(f"{word}: {landing.message}", data, error=True)
-        job = store.cancel_by_planner(args["job"], cap)
+        try:
+            job = store.cancel_by_planner(args["job"], cap)
+        except StopRequested as exc:
+            # the request WAS kept: never "nothing changed"
+            return _text(f"Stop requested, not yet stopped: {exc}. The request is kept; the job reads cancelled once "
+                         "the supervisor has stopped its runs.",
+                         {"id": exc.job_id, "state": "running", "stop_requested": exc.cause})
         return _text(f"Cancelled job {job.id} as its planner.", {"id": job.id, "state": job.state})
     except CockpitUnnamed as exc:
         # the CLI's wording names --data-root, which this door's caller cannot pass: say it as the operator's fix

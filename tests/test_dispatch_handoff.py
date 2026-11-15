@@ -131,7 +131,7 @@ def test_a_writer_that_opened_the_store_before_another_process_migrated_it_files
         # another process moves the store to a newer format, as a migration does (the marker alone)
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("DROP TRIGGER meta_frozen")
-        conn.execute("UPDATE meta SET value = 'levain-dispatch-jobs/6' WHERE key = 'format'")
+        conn.execute("UPDATE meta SET value = 'levain-dispatch-jobs/7' WHERE key = 'format'")
         conn.execute(djobs._append_only("meta", "store metadata is written once")[0])
         conn.execute("COMMIT")
     finally:

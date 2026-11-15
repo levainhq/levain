@@ -19,7 +19,8 @@ from levain.dispatch import follow as F
 from levain.dispatch import follow_run as FR
 from levain.slot import control as C
 from levain.slot import control_client as CC
-from tests.test_dispatch_follow import (Dispatch, acked, artifact_follower, exported, published,  # noqa: F401
+from tests.test_dispatch_follow import (Dispatch, _lax_placeholder_digest, acked, artifact_follower, exported,  # noqa: F401
+                                        published, published_for,
                                         served, setup_verifier)
 from tests import test_dispatch_verifier_report as tvr
 from tests.test_dispatch_jobs import at_state, base_tree, clock, model, repo, store  # noqa: F401 - fixtures
@@ -328,9 +329,9 @@ def test_main_takes_an_artifact_acks_it_and_ends_on_sigterm(store, served, tmp_p
 def test_the_module_run_as_a_program_acks_and_exits_0_on_sigterm(store, served, tmp_path):  # noqa: F811
     """``python -m levain.dispatch.follow_run`` as its own process (this worktree's levain on PYTHONPATH, so not
     ``-I``): it follows this process's served CONTROL, takes and acks the artifact, and exits 0 on SIGTERM."""
-    session, ticket, seq = published(served)
     (tmp_path / "export").mkdir()
-    export = exported(tmp_path / "export", session, ticket)
+    # a real digest: the program is its own process, which the in-process placeholder shim does not reach
+    session, ticket, seq, export = published_for(served, lambda s, t: exported(tmp_path / "export", s, t))
     root = Path(FR.__file__).resolve().parents[2]
     env = {**os.environ, "PYTHONPATH": str(root)}
     proc = subprocess.Popen([sys.executable, "-m", "levain.dispatch.follow_run", "--store-dir", str(store.directory),
@@ -349,9 +350,9 @@ def test_the_module_run_as_a_program_acks_and_exits_0_on_sigterm(store, served, 
 
 
 def test_two_sigterms_in_a_row_still_end_the_program_with_0(store, served, tmp_path):  # noqa: F811
-    session, ticket, seq = published(served)
     (tmp_path / "export").mkdir()
-    export = exported(tmp_path / "export", session, ticket)
+    # a real digest: the program is its own process, which the in-process placeholder shim does not reach
+    session, ticket, seq, export = published_for(served, lambda s, t: exported(tmp_path / "export", s, t))
     root = Path(FR.__file__).resolve().parents[2]
     env = {**os.environ, "PYTHONPATH": str(root)}
     proc = subprocess.Popen([sys.executable, "-m", "levain.dispatch.follow_run", "--store-dir", str(store.directory),

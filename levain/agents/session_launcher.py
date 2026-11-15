@@ -112,6 +112,20 @@ _TRANSIENT_WHOLE = frozenset({"ticket-field:routemap_generation", "ticket-field:
 _ROUTE_FIELDS = ("route", "routemap_generation", "route_policy_digest")
 
 
+@dataclass(frozen=True)
+class RunPhase:
+    """:meth:`RealLauncher.run_phase`'s answer: the index ``state`` (``none``, ``unreadable`` or the record's), CONTROL's
+    ticket facts for the key, and the record's own ``run_id``, ``ended_s`` and refusal ``reason``/``reason_class``."""
+    state: str
+    ticket_state: str | None = None
+    session: str | None = None
+    ticket: str | None = None
+    run_id: str | None = None
+    ended_s: float | None = None
+    reason: str | None = None
+    reason_class: str | None = None
+
+
 def _reason_class(name: str) -> str:
     return "transient" if name in _TRANSIENT_WHOLE or name.split(":", 1)[0] in _TRANSIENT else "standing"
 
@@ -598,7 +612,7 @@ class RealLauncher:
         # carried by every write of the spawn (a ``put`` replaces the whole record): the workspace facts and the auth
         # this launcher mints with, which ``usage`` checks against its own (PRE-W L1 W1)
         carried = {**self._workspace_record(launch), "auth": self.auth}
-        if not self.index.claim(key, "pending", lambda rec: self._retakable(rec, launch.occurrence_id),
+        if not self.index.claim(key, "pending", lambda rec: self._retakable(rec, str(facts["job_id"])),
                                 occurrence_id=launch.occurrence_id, created_s=self.clock(), **carried):
             raise LauncherRefused("session-key-already-used", f"the index already holds state {self._existing(key)!r}")
         # AUTHORITY: whoever builds a launcher can mint for any occurrence_id and caps; run_session is the guard,
@@ -697,6 +711,8 @@ class RealLauncher:
             why = ("auth-not-launchable", f"a session launcher mints passthrough or brokered tickets only, not {self.auth!r}")
         elif launch.auth != self.auth:
             why = ("launch-auth-not-the-launchers", f"launch {launch.auth!r}, launcher {self.auth!r}")
+        elif launch.binding is not None and self.auth != "brokered":
+            why = ("binding-on-a-passthrough-launch", "a dispatch run is a priced, brokered ticket")
         elif launch.harness != VENDOR:
             why = ("harness-not-claude", str(launch.harness))
         elif type(launch.model) is not str or _RENDER_MODEL_RE.fullmatch(launch.model) is None:
@@ -768,11 +784,18 @@ class RealLauncher:
 
     def _facts(self, launch: SessionLaunch) -> dict[str, object]:
         """The mint request, checked by CONTROL's own shape function before anything is sent."""
-        digest = hashlib.sha256(json.dumps({"occurrence_id": launch.occurrence_id, "brief": launch.brief},
-                                           sort_keys=True).encode("utf-8")).hexdigest()
+        bind = launch.binding
+        if bind is not None:
+            # a DISPATCH run (S14 R1): the ticket carries the job's own id, this run's index and the job's signed digest,
+            # the three the follower reads a run back by; nothing here is derived from the brief or the occurrence
+            who: tuple[str, int, str] = (bind.job_id, bind.run_index, bind.contract_digest)
+        else:
+            digest = hashlib.sha256(json.dumps({"occurrence_id": launch.occurrence_id, "brief": launch.brief},
+                                               sort_keys=True).encode("utf-8")).hexdigest()
+            who = (launch.occurrence_id, 0, f"sha256:{digest}")
         fields: dict[str, object] = {
-            "attempt_id": launch.session_key, "job_id": launch.occurrence_id, "run_index": 0,
-            "contract_digest": f"sha256:{digest}", "kind": "executor", "egress_routes": [],
+            "attempt_id": launch.session_key, "job_id": who[0], "run_index": who[1],
+            "contract_digest": who[2], "kind": "executor", "egress_routes": [],
             "auth": self.auth, "model_requested": launch.model,
             "brief_digest": stage.brief_digest(stage.brief_bytes(launch.brief))}
         if self.auth == "brokered":
@@ -782,7 +805,7 @@ class RealLauncher:
                 fields.update(self._resolve(launch.model))
             except LauncherRefused as exc:
                 self._tombstone(launch.session_key, "refused", exc.name, new=True, reason_class=exc.reason_class,
-                                occurrence_id=launch.occurrence_id)
+                                occurrence_id=who[0])
                 raise
         else:
             exp = launch.exposure
@@ -796,6 +819,11 @@ class RealLauncher:
             self._tombstone(launch.session_key, "refused", exc.name, new=True)
             raise LauncherRefused(f"mint-facts:{exc.name}", exc.detail) from None
         return fields
+
+    def resolve_route(self, model: str) -> dict[str, object]:
+        """The route facts CONTROL resolves for ``model`` (:meth:`_resolve`, read-only: a refusal here minted nothing);
+        the dispatch runner's preflight reads them before it takes a job."""
+        return self._resolve(model)
 
     def _resolve(self, model: str) -> dict[str, object]:
         """``ROUTE-RESOLVE {model}``: the three route facts of the one brokered route of CONTROL's active map that serves
@@ -1039,6 +1067,115 @@ class RealLauncher:
             return _count(fn(arg))
         except Exception:  # noqa: BLE001
             return None
+
+    def _status_answer(self, key: str) -> tuple[str, dict[str, Any]]:
+        """``RUN-TICKET-STATUS`` by attempt id, with what its failure means: ``("ok", answer)``, ``("unknown", {})`` when
+        CONTROL says the attempt was never minted (``attempt-unknown``: an authoritative no), ``("error", {})`` for
+        anything that proves nothing (a refusal, CONTROL down, a malformed answer)."""
+        try:
+            ans = self.control.call("RUN-TICKET-STATUS", attempt_id=key)
+        except Refused as exc:
+            return ("unknown", {}) if exc.name == "attempt-unknown" else ("error", {})
+        except Exception:  # noqa: BLE001
+            return "error", {}
+        if type(ans) is not dict or type(ans.get("state")) is not str:
+            return "error", {}
+        return "ok", ans
+
+    def run_phase(self, key: str) -> "RunPhase":
+        """READ-ONLY: where the run under ``key`` stands, for a supervisor that decides what to do and acts through
+        :meth:`settle_run` or its own child. ``state`` is the index state, ``none`` for no record and ``unreadable`` for a
+        record that does not read; ``ticket_state``, ``ticket`` and ``session`` are CONTROL's (``RUN-TICKET-STATUS``),
+        None where STATUS says nothing (a refused or undone record, a refusal, CONTROL down, an attempt never minted).
+        Nothing is written, nothing is ended."""
+        try:
+            rec = self.index.get(key)
+        except ValueError:
+            return RunPhase("unreadable")
+        if rec is None:
+            return RunPhase("none")
+        fields = {"reason": rec.get("reason"), "reason_class": rec.get("reason_class"), "run_id": rec.get("run_id"),
+                  "ended_s": rec.get("ended_s")}
+        if rec["state"] in _ZERO_STATES:
+            return RunPhase(str(rec["state"]), **fields)
+        kind, ans = self._status_answer(key)
+        session = ans.get("session") if kind == "ok" else None
+        if not (type(session) is str and session):
+            rs = rec.get("session")
+            session = rs if type(rs) is str and rs else None
+        ticket = ans.get("ticket") if kind == "ok" else None
+        return RunPhase(str(rec["state"]), ticket_state=ans.get("state") if kind == "ok" else None, session=session,
+                        ticket=ticket if type(ticket) is str and ticket else None, **fields)
+
+    def settle_run(self, key: str) -> str:
+        """Stop the run under ``key`` and PROVE it over; the one thing a supervisor needs before it records a job's stop.
+        Answers ``none`` (no record: nothing was ever allocated), ``zero`` (nothing ran: a ``refused``/``undone`` record,
+        or a minted-but-never-bound ticket this call cancelled and recorded ``undone``), ``ended`` (S1 END proved the
+        session's group gone, and the record says so), or ``unproven`` (nothing proved: the caller records nothing and
+        asks again). Never raises; never claims ``zero`` or ``ended`` it did not read from CONTROL or from END's own
+        proof.
+
+        The cases a restart meets: a ``pending`` record whose attempt CONTROL never minted (``attempt-unknown``: the
+        runner died between the claim and the mint, or CONTROL refused it) is a zero record; a ``minted`` one whose
+        ticket is still ``unbound`` (died between the mint and the start) has its ticket CANCELLED, and only when
+        CONTROL took the cancel is the run recorded ``undone``; a ticket bound to a session is ended through the slot's
+        END, as :meth:`stop` does."""
+        try:
+            rec = self.index.get(key)
+        except ValueError:
+            return "unproven"
+        if rec is None:
+            return "none"
+        if rec["state"] in _ZERO_STATES:
+            return "zero"
+        if rec["state"] == "ended":
+            return "ended"
+        kind, ans = self._status_answer(key)
+        if kind == "error":
+            return "unproven"
+        if kind == "unknown":
+            # the attempt was never minted: only a record that never reached `minted` can say so
+            if rec["state"] != "pending":
+                return "unproven"
+            self._tombstone(key, "undone", "never-minted")
+            return "zero" if self._zero_on_record(key) else "unproven"
+        state, ticket = ans.get("state"), ans.get("ticket")
+        session = ans.get("session") if type(ans.get("session")) is str else rec.get("session")
+        if type(session) is str and session:
+            return "ended" if self._end_run(key, rec, session) else "unproven"
+        if state == T.UNBOUND:
+            if type(ticket) is not str or not ticket:
+                return "unproven"
+            try:
+                self.control.call("RUN-TICKET-CANCEL", ticket=ticket)
+            except Exception:  # noqa: BLE001 - a refused cancel (it bound meanwhile) or a CONTROL fault proves nothing
+                return "unproven"
+            self._tombstone(key, "undone", "stopped-before-start")
+            return "zero" if self._zero_on_record(key) else "unproven"
+        if state in (T.CANCELLED, T.EXPIRED):
+            self._tombstone(key, "undone", "closed-before-start")
+            return "zero" if self._zero_on_record(key) else "unproven"
+        return "unproven"          # bound or released with no session named: nothing to END, nothing proven
+
+    def _zero_on_record(self, key: str) -> bool:
+        """Whether the record under ``key`` now says nothing ran (``refused``/``undone``)."""
+        try:
+            rec = self.index.get(key)
+        except ValueError:
+            return False
+        return rec is not None and rec["state"] in _ZERO_STATES
+
+    def _end_run(self, key: str, rec: Mapping[str, Any], session: str) -> bool:
+        """S1 END for the run's session, recorded ``ended``; True only on END's own proof (or a record that says it)."""
+        if self._ended_on_record(key):
+            return True
+        if not self.runtime_end(session):
+            return False
+        run_id = rec.get("run_id")
+        known: dict[str, Any] = {"session": session}
+        if type(run_id) is str and run_id:
+            known["run_id"] = run_id
+        return self._mark_ended(key, **known) and self._ended_on_record(key)
 
     def stop(self, session_key: str, deadline_s: float = 0.0) -> StopResult:
         """Stop the session recorded under ``session_key`` by S1 END: terminated only on END's proof (recorded, so a
