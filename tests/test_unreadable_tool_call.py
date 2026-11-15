@@ -442,18 +442,26 @@ def test_the_pair_is_searched_once_per_reply():
     # Graded by SCALING, not by wall time (board 1733: a hard 5 s bound read 6.18 s on a loaded CI shard while the
     # function is linear): doubling the input must cost well under the 4x a quadratic search pays. Best of three per
     # size filters a one-off stall; a loaded runner slows both sizes alike, so the ratio holds.
+    import gc
     import time
+
+    from levain.firing.agent_reply import MAX_CLASSIFIED_BYTES
 
     def best(text):
         runs = []
-        for _ in range(3):
-            t = time.perf_counter()
-            unreadable_tool_call(text, TOOLS)
-            runs.append(time.perf_counter() - t)
+        gc.disable()                      # a collection landing in one size and not the other skews the ratio
+        try:
+            for _ in range(3):
+                t = time.perf_counter()
+                unreadable_tool_call(text, TOOLS)
+                runs.append(time.perf_counter() - t)
+        finally:
+            gc.enable()
         return max(min(runs), 1e-4)
 
     for unit in ("<arg_key>x\n", "<tool_call> \n"):
-        small, big = best(unit * 4_500), best(unit * 9_000)
+        assert len((unit * 14_000).encode()) < MAX_CLASSIFIED_BYTES      # past the bound the call returns early and times nothing
+        small, big = best(unit * 7_000), best(unit * 14_000)
         assert big < 3 * small, (unit, small, big)
 
 

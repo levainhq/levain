@@ -35,7 +35,7 @@ def test_a_graduation_policy_can_only_be_cleared_and_names_no_key():
 def test_two_kinds_that_share_words_share_a_class():
     """ways_back groups by words, so a way written for two kinds must classify them the same."""
     by_way: dict[str, set[bool]] = {}
-    for way, clears in A._STOPPED_WAYS.values():
+    for way, clears in [*A._STOPPED_WAYS.values(), A._STOPPED_WAY_DEFAULT]:
         by_way.setdefault(way, set()).add(clears)
     assert all(len(classes) == 1 for classes in by_way.values()), by_way
 
@@ -52,4 +52,5 @@ def test_no_second_copy_of_a_way_back_is_written_outside_the_table():
         if path.name == "authority.py" and path.parent == ROOT:
             continue
         text = path.read_text(encoding="utf-8")
-        assert not [w for w in words if w in text], path
+        hit = [w for w in words if w in text]
+        assert not hit, f"{path} writes a way back the authority table owns: {hit}"

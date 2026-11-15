@@ -32,7 +32,7 @@ from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, 
                               UnsignedLink, VerifierUnavailable, anchor_path, append,
                               consent_grant, consent_grant_tool_problem, consent_resolved_workspace,
                               contained_shell_grant, grant_stop_reason, grants_stopped_by, inert_grant,
-                              passkey_revocable, prepare, stopped_way, stopped_way_with, voice_key_record)
+                              passkey_revocable, prepare, stopped_clears_only, stopped_way, stopped_way_with, voice_key_record)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _append_at, _capture, _journal, _now, _signing_authority
@@ -469,14 +469,14 @@ def ways_back(stopped: Iterable[tuple[str, Any]]) -> list[tuple[str, list[str]]]
     (create-only first, then revoke-then-create, then any other way). ``words`` is
     :func:`levain.authority.stopped_way_with`'s, with "with a key you still hold" after a way that makes one again; the
     ids keep their given order. Which kind is clears-only, and its wording, is read off the authority's one table."""
-    ways: dict[str, list[str]] = {}
-    shown: dict[str, str] = {}
+    ways: dict[tuple[str, bool], list[str]] = {}
+    shown: dict[tuple[str, bool], str] = {}
     for gid, kind in stopped:
-        way = stopped_way(kind)
-        ways.setdefault(way, []).append(gid)
-        shown.setdefault(way, stopped_way_with(kind, "with a key you still hold"))
+        group = (stopped_way(kind), stopped_clears_only(kind))      # the class is part of the key: one way, one class
+        ways.setdefault(group, []).append(gid)
+        shown.setdefault(group, stopped_way_with(kind, "with a key you still hold"))
     rank = {stopped_way(None): 0, stopped_way(SEAT_LEASE_KIND): 1}
-    return [(shown[way], ways[way]) for way in sorted(ways, key=lambda w: rank.get(w, 2))]
+    return [(shown[g], ways[g]) for g in sorted(ways, key=lambda g: rank.get(g[0], 2))]
 
 
 def stopped_by_key(data_root: Path | str, fingerprint: str, *, now: datetime,
