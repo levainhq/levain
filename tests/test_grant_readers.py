@@ -131,6 +131,12 @@ READERS: dict[str, tuple[int, str, str]] = {
         (1, "write", "returns the grant the create just made"),
     "levain/consent/grants.py::_revocable":
         (1, "write", "a stopped grant must still be revocable"),
+    "levain/authority.py::_standing_order_widen_check":
+        (4, "rule", "an append rule: a widening names a standing order the policy (or the loosen) holds, live and widening nothing"),
+    "levain/desk/standing_orders.py::sign_order":
+        (1, "write", "refuses a second create of an id the policy already holds, before anything is signed"),
+    "levain/desk/cli.py::run_order":
+        (3, "display", "`desk order list` shows every standing order the policy holds with its status (in force, expired or stopped); the in-force answer itself comes from orders_in_force, which reads grants_in_force"),
     "levain/seat_lease.py::create_lease":
         (1, "write", "returns the lease the create just made"),
     "levain/seat_push.py::create_egress":
@@ -150,7 +156,7 @@ READERS: dict[str, tuple[int, str, str]] = {
     "levain/cli.py::_cmd_seat_egress":
         (1, "display", "`seat egress list` names the stopped grant (seat_push.stopped_egress) when no live one reads"),
     "levain/consent/grants.py::grant_view":
-        (10, "display", "the page and the phone list every grant the policy holds, each with its state "
+        (12, "display", "the page and the phone list every grant the policy holds, each with its state "
                        "(stopped wins over expired and live), the way back of a stopped one (its kind, read raw) and "
                        "its revoke line"),
     "levain/consent/grants.py::_split":

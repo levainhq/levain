@@ -65,7 +65,7 @@ __all__ = [
     "CUSTODIES", "DISPLAY_PHONE", "EGRESS_KEY_KIND", "FIDO_ATTESTED", "FORMAT", "FORMAT_V2", "FORMAT_V3", "FORMAT_V4",
     "FORMAT_V5", "VOICE_KEY_KIND", "VOICE_KEY_PROVIDERS", "VOICE_KEY_USES", "voice_key_for", "voice_key_record",
     "GRADUATION_CREATE_RANK",
-    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "SEAT_LEASE_KIND", "SEAT_LEASE_MAX", "SEAT_EGRESS_KIND", "SEAT_EGRESS_MAX", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
+    "GRADUATION_GRANT_MAX", "GRADUATION_KIND", "HANDS_MCP_KIND", "STANDING_ORDER_KIND", "STANDING_ORDER_MAX", "STANDING_ORDER_VOICES", "standing_order", "SEAT_LEASE_KIND", "SEAT_LEASE_MAX", "SEAT_EGRESS_KIND", "SEAT_EGRESS_MAX", "GRADUATION_OPT_IN_RANK", "GRADUATION_PHONE_KIND", "PASSKEY",
     "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "ForeignAnchor", "KEY_WORD", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead", "StandingPolicy",
@@ -2188,6 +2188,212 @@ _SEAT_EGRESS_FIXED = "a seat-egress grant's terms are fixed: revoke it and sign 
 _SEAT_EGRESS_DOMAIN = re.compile(r"(?=.{1,253}\Z)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
 _SEAT_EGRESS_DOMAINS_MAX = 16
 
+# A standing order (night desk ND-2, board levain#9; ``levain.desk.standing_orders``): the signed authority under which
+# the night desk may act on judgement. It carries his plain words verbatim and by hash, the desk's restatement of what
+# it will and will NOT do, typed effect lines (a closed verb list, each with a per-incident and a per-night budget),
+# judgement lines (read-only), kills, an optional ``widens`` (a time-boxed widening of another order: it lapses to its
+# base at its own expiry) and an expiry at most STANDING_ORDER_MAX past the link. Created by a laptop-presence key only
+# (a passkey signs no create: :func:`_passkey_act`); a passkey revokes it. Its terms are fixed under its id and it is
+# never renewed (a renew is refused at append: sign another, so the whole restatement is read again). The log holds the
+# shape only; the effect verb replays the live order at execution time (ND-3b). A kind this levain does not know is
+# inert and answers nothing, so an older levain reading such a log grants nothing.
+STANDING_ORDER_KIND = "standing-order"
+STANDING_ORDER_MAX = timedelta(days=14)
+_SO_REQUIRED = frozenset({"id", "kind", "words", "words_sha256", "restatement", "effect_lines", "judgement_lines",
+                          "kills", "expires_at"})
+_SO_FIELDS = _SO_REQUIRED | {"widens"}
+_SO_ID = re.compile(r"so-[0-9a-f]{12}")
+_SO_WORDS_MAX = 4096
+_SO_LINE_MAX = 512
+_SO_LIST_MAX = 16
+_SO_ARG_MAX = 16
+_SO_BUDGET_MAX = 10**6
+_SO_KILL_THEN = ("ping", "stop_effects")
+_SO_ADDRESS = re.compile(r"[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,190}\.[a-z]{2,24}")
+#: the voice a ``send_ack`` speaks in (ND-4): a stand-in for him, or flow's own name, disclosed in the message itself
+STANDING_ORDER_VOICES = ("stand_in", "flow")
+#: verb -> argument name -> (the values it may take, or None for a list of addresses, and whether exactly one)
+_SO_VERBS: Mapping[str, Mapping[str, tuple[Any, bool]]] = MappingProxyType({
+    "restart_service": MappingProxyType({"host": (("taoserv",), False), "service": (("apache2", "php8.1-fpm"), False)}),
+    "send_ack": MappingProxyType({"voice": (STANDING_ORDER_VOICES, True), "known_from": (None, False)}),
+})
+_STANDING_ORDER_FIXED = "a standing order's terms are fixed: revoke it and sign another"
+_STANDING_ORDER_NO_RENEW = ("a standing order is never renewed: sign another, so the whole restatement is read again "
+                            "before it is signed")
+
+
+def _so_text(value: Any, what: str, high: int, *, newlines: bool = False) -> str:
+    """One piece of showable text of 1 to ``high`` characters (the sheet shows these bytes, so no hidden one). Only
+    ``words`` may hold line breaks."""
+    from levain import unshowable
+    if not isinstance(value, str) or not 1 <= len(value) <= high:
+        raise AuthorityError(f"{what} must be text of 1 to {high} characters")
+    if unshowable.first_hidden(value, allow="\n" if newlines else "", selectors=False) is not None:
+        raise AuthorityError(f"{what} must be showable text" + ("" if newlines else " on one line"))
+    return value
+
+
+def _so_lines(value: Any, what: str) -> list[str]:
+    if not isinstance(value, (list, tuple)) or len(value) > _SO_LIST_MAX:
+        raise AuthorityError(f"{what} must be a list of at most {_SO_LIST_MAX} lines")
+    return [_so_text(v, what, _SO_LINE_MAX) for v in value]
+
+
+def _validate_standing_order(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
+    """A standing order's shape (:data:`STANDING_ORDER_KIND`): exactly its fields (``widens`` optional), its id and
+    ``widens`` in their form, ``words`` showable text whose utf-8 sha256 is ``words_sha256``, a restatement of exactly
+    ``will`` and ``will_not`` lines, effect lines each a ``verb`` token, an ``args`` map of short lists and two integer
+    budgets, judgement lines, kills each a ``when`` and a ``then`` of the closed pair, and an expiry at most
+    :data:`STANDING_ORDER_MAX` past the link's ``at``. That a verb is in the closed list, that its arguments are
+    in its enums, that budgets are positive and that a kill exists are append rules
+    (:func:`_standing_order_check`), not replay rules, so no later rule change refuses the log."""
+    if set(grant) not in (_SO_REQUIRED, _SO_FIELDS):
+        raise AuthorityError(f"{what} (a standing order) must carry exactly {', '.join(sorted(_SO_REQUIRED))}, "
+                             "and may carry widens")
+    if grant["kind"] != STANDING_ORDER_KIND:
+        raise AuthorityError(f"{what}.kind must be {STANDING_ORDER_KIND!r}")
+    for name in ("id",) + (("widens",) if "widens" in grant else ()):
+        if not isinstance(grant[name], str) or not _SO_ID.fullmatch(grant[name]):
+            raise AuthorityError(f"{what}.{name} must be so- and 12 lowercase hex digits")
+    if grant.get("widens") == grant["id"]:
+        raise AuthorityError(f"{what} cannot widen itself")
+    words = _so_text(grant["words"], f"{what}.words", _SO_WORDS_MAX, newlines=True)
+    sha = grant["words_sha256"]
+    if not isinstance(sha, str) or not _SHA256_HEX.fullmatch(sha) or sha != hashlib.sha256(words.encode()).hexdigest():
+        raise AuthorityError(f"{what}.words_sha256 must be the sha256 (64 lowercase hex digits) of words")
+    rest = grant["restatement"]
+    if not isinstance(rest, Mapping) or set(rest) != {"will", "will_not"}:
+        raise AuthorityError(f"{what}.restatement must carry exactly will, will_not")
+    _so_lines(rest["will"], f"{what}.restatement.will")
+    _so_lines(rest["will_not"], f"{what}.restatement.will_not")
+    _so_lines(grant["judgement_lines"], f"{what}.judgement_lines")
+    lines = grant["effect_lines"]
+    if not isinstance(lines, (list, tuple)) or len(lines) > _SO_LIST_MAX:
+        raise AuthorityError(f"{what}.effect_lines must be a list of at most {_SO_LIST_MAX} lines")
+    for i, line in enumerate(lines):
+        if not isinstance(line, Mapping) or set(line) != {"verb", "args", "per_incident", "per_night"}:
+            raise AuthorityError(f"{what}.effect_lines[{i}] must carry exactly args, per_incident, per_night, verb")
+        _so_text(line["verb"], f"{what}.effect_lines[{i}].verb", 64)
+        args = line["args"]
+        if not isinstance(args, Mapping) or len(args) > _SO_ARG_MAX:
+            raise AuthorityError(f"{what}.effect_lines[{i}].args must be a map of at most {_SO_ARG_MAX} names")
+        for name, values in args.items():
+            _so_text(name, f"{what}.effect_lines[{i}].args name", 64)
+            if not isinstance(values, (list, tuple)) or len(values) > _SO_ARG_MAX:
+                raise AuthorityError(f"{what}.effect_lines[{i}].args.{name[:40]} must be a list of at most "
+                                     f"{_SO_ARG_MAX} values")
+            for v in values:
+                _so_text(v, f"{what}.effect_lines[{i}].args.{name[:40]}", 254)
+        for name in ("per_incident", "per_night"):
+            if type(line[name]) is not int or not 0 <= line[name] <= _SO_BUDGET_MAX:
+                raise AuthorityError(f"{what}.effect_lines[{i}].{name} must be an integer from 0 to {_SO_BUDGET_MAX}")
+    kills = grant["kills"]
+    if not isinstance(kills, (list, tuple)) or len(kills) > _SO_LIST_MAX:
+        raise AuthorityError(f"{what}.kills must be a list of at most {_SO_LIST_MAX} kills")
+    for i, kill in enumerate(kills):
+        if not isinstance(kill, Mapping) or set(kill) != {"when", "then"}:
+            raise AuthorityError(f"{what}.kills[{i}] must carry exactly then, when")
+        _so_text(kill["when"], f"{what}.kills[{i}].when", _SO_LINE_MAX)
+        if kill["then"] not in _SO_KILL_THEN or type(kill["then"]) is not str:
+            raise AuthorityError(f"{what}.kills[{i}].then must be one of {', '.join(_SO_KILL_THEN)}")
+    expires = _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    if at is not None and expires - at > STANDING_ORDER_MAX:
+        raise AuthorityError(f"{what} may last at most {STANDING_ORDER_MAX.days} days past its link's time")
+    if not _finite_json(grant):
+        raise AuthorityError(f"{what} must be finite JSON (no NaN or Infinity)")
+    return _thaw(grant)
+
+
+def _standing_order_change(o: Mapping[str, Any], n: Mapping[str, Any], o_exp: datetime, n_exp: datetime) -> str:
+    """A standing order has no change, a renew included: every one is refused."""
+    raise AuthorityError(_STANDING_ORDER_FIXED)
+
+
+def standing_order(grant: Any) -> bool:
+    """Whether ``grant`` is a standing order this levain knows (:data:`STANDING_ORDER_KIND`)."""
+    return isinstance(grant, Mapping) and grant.get("kind") == STANDING_ORDER_KIND \
+        and _grant_kind(grant) is _GRANT_KINDS.get(STANDING_ORDER_KIND)
+
+
+def _standing_order_check(grants: list[Any], after: str = "") -> None:
+    """At append: each standing order a create or a loosen brings in is a whole order. The verbs are the closed list
+    (:data:`_SO_VERBS`) and each takes exactly its own arguments, every value in its enum (a ``send_ack`` names its
+    voice and the authenticated addresses it may answer); the budgets are positive and a per-incident one is not above
+    the per-night one; there is at least one will line, one will-not line, one kill, and one judgement or effect line.
+    A renew of one is refused (:data:`_STANDING_ORDER_NO_RENEW`)."""
+    for grant in grants:
+        if not (isinstance(grant, Mapping) and grant.get("kind") == STANDING_ORDER_KIND):
+            continue
+        problems: list[str] = []
+        rest, lines = grant.get("restatement"), grant.get("effect_lines")
+        if not rest["will"] or not rest["will_not"]:
+            problems.append("the restatement needs at least one will line and one will-not line")
+        if not lines and not grant.get("judgement_lines"):
+            problems.append("an order with no judgement line and no effect line says nothing the desk may do")
+        if not grant.get("kills"):
+            problems.append("an order carries at least one kill")
+        seen: set[str] = set()
+        for i, line in enumerate(lines):
+            verb, args = line["verb"], line["args"]
+            spec = _SO_VERBS.get(verb)
+            if spec is None:
+                problems.append(f"effect_lines[{i}].verb {str(verb)[:40]!r} is not one of {', '.join(sorted(_SO_VERBS))}")
+                continue
+            if set(args) != set(spec):
+                problems.append(f"effect_lines[{i}] ({verb}) takes exactly the arguments {', '.join(sorted(spec))}")
+                continue
+            for name, (allowed, one) in spec.items():
+                values = list(args[name])
+                if not values or (one and len(values) != 1) or len(set(values)) != len(values):
+                    problems.append(f"effect_lines[{i}].args.{name} names {'one value' if one else 'distinct values'}")
+                elif allowed is None:
+                    bad = [v for v in values if not _SO_ADDRESS.fullmatch(v)]
+                    if bad:
+                        problems.append(f"effect_lines[{i}].args.{name} holds {bad[0][:40]!r}: a lowercase address")
+                elif any(v not in allowed for v in values):
+                    problems.append(f"effect_lines[{i}].args.{name} is outside {', '.join(allowed)}")
+            if not 1 <= line["per_incident"] <= line["per_night"]:
+                problems.append(f"effect_lines[{i}] needs budgets 1 <= per_incident <= per_night")
+            key = _canonical({"verb": verb, "args": {k: sorted(v) for k, v in args.items()}})
+            if key in seen:
+                problems.append(f"effect_lines[{i}] repeats another line")
+            seen.add(key)
+        if problems:
+            raise AuthorityError(f"standing order {str(grant.get('id'))[:40]!r}: " + "; ".join(problems) + after)
+
+
+def _standing_order_renew_refused(grants: list[Any], after: str = "") -> None:
+    raise AuthorityError(_STANDING_ORDER_NO_RENEW)
+
+
+def _standing_order_widen_check(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
+    """At append: a standing order that ``widens`` another names a standing order the policy holds, live at ``now``,
+    that does not itself widen (no chains). The reader gives a widening no force when its base is not in force
+    (:func:`levain.desk.standing_orders.orders_in_force`), so this only refuses what could never be one."""
+    op = rec["op"]
+    if op == "create_grant":
+        brought = [rec["grant"]]
+        pool = {**state.policy.grants, rec["grant"].get("id"): rec["grant"]} if isinstance(rec["grant"], Mapping) \
+            else dict(state.policy.grants)
+    elif op == "loosen":
+        policy = rec["policy"]
+        pool = dict(policy.get("grants", {})) if isinstance(policy, Mapping) else {}
+        brought = [g for gid, g in pool.items()
+                   if gid not in state.policy.grants or _canonical(_thaw(state.policy.grants[gid])) != _canonical(_thaw(g))]
+    else:
+        return
+    for grant in brought:
+        if not (isinstance(grant, Mapping) and grant.get("kind") == STANDING_ORDER_KIND and "widens" in grant):
+            continue
+        base = pool.get(grant["widens"])
+        if not (isinstance(base, Mapping) and base.get("kind") == STANDING_ORDER_KIND) or "widens" in base:
+            raise AuthorityError(f"standing order {str(grant.get('id'))[:40]!r} widens "
+                                 f"{str(grant['widens'])[:40]!r}, which is not a standing order that widens nothing")
+        if not _kind_live(base, now, STANDING_ORDER_KIND):
+            raise AuthorityError(f"standing order {str(grant.get('id'))[:40]!r} widens "
+                                 f"{str(grant['widens'])[:40]!r}, which is not live")
+
+
 #: kind -> (the way back for a stopped grant of that kind, whether it can only be cleared). THE ONLY place a kind's
 #: way-back wording and its clears-only class are written: ``stopped_way``, ``stopped_clears_only``,
 #: ``stopped_way_with`` and every surface that prints a way back (the revoke notice, a list line, the renew refusal,
@@ -2202,6 +2408,7 @@ _STOPPED_WAYS: dict[str, tuple[str, bool]] = {
     SEAT_EGRESS_KIND: ("revoke it, then create it again", False),
     EGRESS_KEY_KIND: ("revoke it, then create it again", False),
     VOICE_KEY_KIND: ("revoke it, then create it again", False),
+    STANDING_ORDER_KIND: ("revoke it, then sign it again (levain desk order sign)", False),
 }
 _STOPPED_WAY_DEFAULT = ("create it again", False)
 
@@ -2364,6 +2571,11 @@ _GRANT_KINDS: Mapping[str | None, _GrantKind] = MappingProxyType({
                                 renew_signer_class=LAPTOP),
     AGENT_LINK_KIND: _GrantKind(validate=_validate_agent_link, change=_agent_link_change, passkey_revocable=True,
                                 max_life=AGENT_LINK_MAX, fixed=_AGENT_LINK_FIXED, renew_signer_class=LAPTOP),
+    STANDING_ORDER_KIND: _GrantKind(validate=_validate_standing_order, change=_standing_order_change,
+                                    append_checks=(_standing_order_check,),
+                                    renew_checks=(_standing_order_renew_refused,),
+                                    passkey_revocable=True, max_life=STANDING_ORDER_MAX,
+                                    fixed=_STANDING_ORDER_FIXED, renew_signer_class=LAPTOP),
 })
 
 
@@ -3113,6 +3325,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     _hands_mcp_unique_check(state, rec, now)
     _seat_lease_unique_check(state, rec, now)
     _seat_egress_unique_check(state, rec, now)
+    _standing_order_widen_check(state, rec, now)
     if rec["op"] == "create_grant":
         _grant_append_checks([rec["grant"]])
     elif rec["op"] == "loosen":

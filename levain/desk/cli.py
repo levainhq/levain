@@ -106,7 +106,7 @@ def _board_store(args: argparse.Namespace) -> EnvelopeStore:
 # the verbs that act on the desk itself (its lease, launches, setting, seams and ready queue): each opens the
 # store its desk is in (:func:`_desk_dir`), so one desk's whole family stays in one dispatch.db
 _FOLLOWS_DESK = frozenset({"take", "release", "beat", "claim", "wake", "launch", "agent", "status", "ready",
-                                  "watch", "close", "open", "handoff", "event"})
+                                  "watch", "close", "open", "handoff", "event", "order"})
 
 
 def _opens_board(args: argparse.Namespace) -> bool:
@@ -452,6 +452,97 @@ def run_event(args: argparse.Namespace, out: Any = None) -> int:
             _emit(out, args.json, {"lines": lines, "launch_id": launch_id}, "\n".join(lines) or "nothing to do")
     except (*_REFUSED, ValueError) as exc:
         print(f"levain desk event {cmd}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+_ORDER_SPEC_KEYS = frozenset({"words", "will", "will_not", "effect_lines", "judgement_lines", "kills", "widens", "days"})
+_ORDER_SPEC_BYTES = 64 * 1024
+
+
+def _order_root(args: argparse.Namespace, store: EnvelopeStore) -> Path:
+    """The cockpit data root whose authority log holds the orders: ``--data-root``, else the one cockpit the consent
+    hooks in the desk's store directory name (refused when that is not one)."""
+    from levain.consent.answering import hook_roots
+
+    if args.data_root is not None:
+        return args.data_root.expanduser()
+    roots = hook_roots(store.directory)
+    if len(roots) != 1:
+        raise CoordError("name the cockpit data root with --data-root (the consent hooks here name "
+                         + ("none" if not roots else f"{len(roots)}") + ")")
+    return roots[0]
+
+
+def _order_spec(path: Path) -> dict[str, Any]:
+    """The order file: one JSON object of exactly the order's authored fields (the id, the hash and the expiry are
+    made here, never taken from the file). A file with anything else is refused whole."""
+    text = _read_file(path, _ORDER_SPEC_BYTES, "the order file")
+    try:
+        spec = json.loads(text)
+    except ValueError:
+        raise CoordError("the order file is not JSON") from None
+    if not isinstance(spec, dict) or not {"words", "will", "will_not", "effect_lines", "judgement_lines", "kills"} \
+            <= set(spec) <= _ORDER_SPEC_KEYS:
+        raise CoordError("the order file is one JSON object of words, will, will_not, effect_lines, judgement_lines, "
+                         "kills, and optionally widens and days")
+    return spec
+
+
+def run_order(args: argparse.Namespace, out: Any = None) -> int:
+    """``levain desk order sign|list``: a standing order is signed by his laptop key, on his terminal, after the whole
+    restatement is printed; ``list`` reads what the log holds. A passkey revokes one (``levain consent grant revoke``
+    or the phone); nothing here revokes."""
+    from levain.cockpit.keys import KeyError_
+    from levain.desk import standing_orders as so
+
+    out = out or sys.stdout
+    cmd = args.order_cmd
+    try:
+        store = _coord_store(args)
+        root = _order_root(args, store)
+        if cmd == "list":
+            state = so.read_state(root)
+            now = datetime.now(timezone.utc)
+            held = [] if state is None else sorted(g for g in state.policy.grants
+                                                   if so.standing_order(state.policy.grants[g]))
+            live = {} if state is None else {g["id"]: g for g in so.orders_in_force(state, now)}
+            rows = []
+            for gid in held:
+                g = state.policy.grants[gid]
+                why = so.stop_reason(state, gid)
+                status = "stopped: " + why if why else "in force" if gid in live else "expired"
+                rows.append({"id": gid, "status": status, "expires_at": g["expires_at"],
+                             "widens": g.get("widens"), "words_sha256": g["words_sha256"]})
+            _emit(out, args.json, {"orders": rows},
+                  "\n".join(f"{r['id']}  {r['status']}  until {r['expires_at']}"
+                            + (f"  widens {r['widens']}" if r["widens"] else "") for r in rows) or "no standing order")
+            return 0
+        from levain.authority import NAMESPACE
+        from levain.cockpit.authority import CardRefused, standing_order_card
+        from levain.dispatch import cli as dcli
+
+        spec = _order_spec(args.file)
+        now = datetime.now(timezone.utc)
+        days = spec.get("days", 14)
+        if type(days) is not int or not 1 <= days <= 14:
+            raise CoordError("days is a whole number from 1 to 14")
+        grant = so.build_order(words=spec["words"], will=spec["will"], will_not=spec["will_not"],
+                               effect_lines=spec["effect_lines"], judgement_lines=spec["judgement_lines"],
+                               kills=spec["kills"], now=now, life=timedelta(days=days), widens=spec.get("widens"))
+        try:
+            card = standing_order_card(grant)
+        except CardRefused as exc:
+            raise CoordError(f"{exc}: nothing was signed") from None
+        print(card["sheet"], file=sys.stderr if args.json else out, flush=True)
+        _need_terminal(args, "signing")
+        signer_fp, sign = dcli._signer(args, NAMESPACE, "order sign")
+        _confirm(args, "signing", f"Sign standing order {card['id']} as {signer_fp}, the whole of it as shown above")
+        new = so.sign_order(root, grant, signer_fp=signer_fp, sign=sign, clock=lambda: datetime.now(timezone.utc))
+        _emit(out, args.json, {"id": card["id"], "expires_at": grant["expires_at"], "head": new.seq},
+              f"signed: {card['id']} until {grant['expires_at']}")
+    except (*_faults(), OSError, KeyError_) as exc:
+        print(f"levain desk order {cmd}: {exc}", file=sys.stderr)
         return 1
     return 0
 
@@ -2586,6 +2677,27 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     evg.set_defaults(func=run_event)
     door_ok(evl, eva)
     not_door(evr, evt, evo, evm, evg)
+
+    # standing orders (ND-2): his signed authority for the night desk. The operator's verbs, never the desk's door:
+    # the desk reads its orders quoted in its brief, and signs nothing
+    orp = c_sub.add_parser("order", help="Standing orders: what he signed the night desk to do on judgement.")
+    or_sub = orp.add_subparsers(dest="order_cmd", required=True)
+    ors = or_sub.add_parser("sign", help="Show the whole restatement of an order and sign it with a laptop key.")
+    ors.add_argument("--file", type=Path, required=True, metavar="ORDER_JSON",
+                     help="The order: JSON of words, will, will_not, effect_lines, judgement_lines, kills (and "
+                          "optionally widens, days). The id, the words' hash and the expiry are made here.")
+    ors.add_argument("--signing-key", dest="signing_key", type=Path, default=None,
+                     help="An enrolled laptop-presence key (its private key file, or the .pub of a key an agent holds).")
+    ors.add_argument("--data-root", dest="data_root", type=Path, default=None,
+                     help="The cockpit data root whose authority log takes the order.")
+    ors.add_argument("--yes", action="store_true", help="Do not ask y/N; the whole restatement is still printed.")
+    common(ors)
+    ors.set_defaults(func=run_order)
+    orl = or_sub.add_parser("list", help="The standing orders the log holds and whether each is in force.")
+    orl.add_argument("--data-root", dest="data_root", type=Path, default=None)
+    common(orl)
+    orl.set_defaults(func=run_order)
+    not_door(ors, orl)
 
     cs = c_sub.add_parser("status", help="Who holds the lease, what the next drop would do, the latest launches.")
     ct = c_sub.add_parser("take", help="Hold the desk role yourself (voids every pending launch).")

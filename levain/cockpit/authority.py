@@ -403,6 +403,69 @@ def sign_card(data_root: Any, grant: Mapping[str, Any], **signing: Any) -> Any:
     return sign_agent_link(data_root, card["fields"], **signing)
 
 
+def standing_order_card(grant: Mapping[str, Any]) -> dict[str, Any]:
+    """The signing card for a ``standing-order`` record (night desk ND-2): the WHOLE of what the signature covers, in
+    order, none summarised or cut. ``fields`` is the record as it will be signed (a snapshot, so a later change to
+    ``grant`` cannot reach the signature); the rest is the same bytes laid out for reading: his words in full, the
+    restatement (what it will and will NOT do), every effect line with its arguments and budgets, every judgement
+    line, every kill, what it widens, and until when. ``sheet`` is that layout as one text (:func:`standing_order_sheet`
+    renders it). Raises :class:`CardRefused` for a record that is not a standing order, one the log's own shape and
+    append rules would refuse (a card is never offered for an order the log would not carry), and never anything else."""
+    from levain.authority import STANDING_ORDER_KIND, AuthorityError, _standing_order_check, _thaw, _validate_standing_order
+
+    if not isinstance(grant, Mapping) or grant.get("kind") != STANDING_ORDER_KIND:
+        raise CardRefused(f"only a {STANDING_ORDER_KIND} has this card")
+    try:
+        thawed = _thaw(dict(grant))
+        _only_string_keys(thawed)
+        fields = json.loads(json.dumps(thawed))
+        _validate_standing_order(fields, "the order", None)
+        _standing_order_check([fields])
+    except AuthorityError as exc:
+        raise CardRefused(f"the order is refused: {exc}") from exc
+    except (TypeError, AttributeError, ValueError, KeyError) as exc:
+        raise CardRefused(f"the order record is malformed: {type(exc).__name__}: {exc}") from exc
+    rest = fields["restatement"]
+    effects = []
+    for line in fields["effect_lines"]:
+        args = "; ".join(f"{k} in {{{', '.join(v)}}}" for k, v in sorted(line["args"].items()))
+        effects.append(f"{line['verb']}({args}): at most {line['per_incident']} per incident, "
+                       f"{line['per_night']} per night")
+    card = {
+        "fields": fields,
+        "id": fields["id"],
+        "words": fields["words"],
+        "words_sha256": fields["words_sha256"],
+        "will": list(rest["will"]),
+        "will_not": list(rest["will_not"]),
+        "effects": effects,
+        "judgement": list(fields["judgement_lines"]),
+        "kills": [f"{k['when']} -> {k['then']}" for k in fields["kills"]],
+        "widens": fields.get("widens"),
+        "until": f"expires {fields['expires_at']}",
+    }
+    card["sheet"] = standing_order_sheet(card)
+    return card
+
+
+def standing_order_sheet(card: Mapping[str, Any]) -> str:
+    """The whole of ``card`` as the text he reads before he signs: every line, in the order the record holds them."""
+    def block(title: str, rows: Any) -> list[str]:
+        return [title, *(f"  - {r}" for r in rows)] if rows else [title, "  (none)"]
+
+    out = [f"STANDING ORDER {card['id']}", f"His words (sha256 {card['words_sha256']}):",
+           *(f"  | {line}" for line in str(card["words"]).split("\n"))]
+    out += block("The desk WILL:", card["will"])
+    out += block("The desk will NOT:", card["will_not"])
+    out += block("Effect lines (each runs only through its typed verb, replayed against this order):", card["effects"])
+    out += block("Judgement lines (reading only):", card["judgement"])
+    out += block("Kills:", card["kills"])
+    if card.get("widens"):
+        out.append(f"Widens {card['widens']}; it lapses to that order at its own expiry.")
+    out.append(str(card["until"]))
+    return "\n".join(out)
+
+
 # The outer boundary's authority for the reads it makes through ``Cockpit.read_one`` /
 # ``read_value_head`` (verbs' ``dispatch`` and ``retier``): bound for the request, read by the engine
 # when no ``authority=`` is passed, so a read inside a write never takes a second snapshot.

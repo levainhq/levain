@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, CONSENT_MCP_GRANT_KIND, EGRESS_KEY_KIND,
-                              GRADUATION_KIND, GRADUATION_PHONE_KIND, HANDS_MCP_KIND, SEAT_EGRESS_KIND, SEAT_LEASE_KIND, VOICE_KEY_KIND, AuthorityError, StaleHead,
+                              GRADUATION_KIND, GRADUATION_PHONE_KIND, HANDS_MCP_KIND, SEAT_EGRESS_KIND, SEAT_LEASE_KIND, STANDING_ORDER_KIND, VOICE_KEY_KIND, AuthorityError, StaleHead,
                               UnsignedLink, VerifierUnavailable, anchor_path, append,
                               consent_grant, consent_grant_tool_problem, consent_resolved_workspace,
                               contained_shell_grant, grant_stop_reason, grants_stopped_by, inert_grant,
@@ -286,14 +286,18 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
     # a hands MCP entry (levain.hands_mcp, kind hands-mcp) is passkey-revocable too, and its revoke ends a running hands
     # chat (levain.firing.hands_chat watches the registry), so it is listed by its name; it answers no consent request
     hands = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == HANDS_MCP_KIND]
+    # a standing order (levain.desk.standing_orders, kind standing-order) is passkey-revocable too, so it is listed for
+    # its revoke; it answers no consent request. Its row names the order and shows the first line of his words
+    orders = [gid for gid, g in sorted(state.policy.grants.items()) if g.get("kind") == STANDING_ORDER_KIND]
     # a graduation policy or opt-in the log holds (the retired rows) is passkey-revocable, so it is listed for
     # its revoke; it answers no consent request, so no evidence is read for it
     old = [r[0] for r in retired]
     links = {gid: state.grant_link(gid)
-             for gid in [g.id for g in consent] + [i[0] for i in inert] + voice + lease + egress + hands + old}
+             for gid in [g.id for g in consent] + [i[0] for i in inert] + voice + lease + egress + hands + orders + old}
     evidence = read_grant_evidence(queue_dir, [(gid, *link) for gid, link in links.items()
                                                if link is not None and gid not in voice and gid not in lease
-                                               and gid not in egress and gid not in hands and gid not in old],
+                                               and gid not in egress and gid not in hands and gid not in orders
+                                               and gid not in old],
                                    recent=recent)
     stamp = utc_stamp(now)
     # every grant this snapshot stops, by id (kind-blind: a voice key, a lease and an inert grant are stopped too)
@@ -349,6 +353,12 @@ def grant_view(queue_dir: Path | str, *, now: datetime, recent: int = 5,
         rows.append({**common(gid, HANDS_MCP_KIND, str(g["expires_at"]), None if link is None else link[0]),
                      "state": state_of(gid, str(g["expires_at"])), "agent": visible(f"hands server {g['name']}"),
                      "tools": [], "workspace": visible(str(g.get("url") or g.get("command") or "")), "postures": []})
+    for gid in orders:              # the order's id and the start of his words show; the whole order is `levain desk order list`
+        g, link = state.policy.grants[gid], links[gid]
+        first = str(g.get("words", "")).split("\n")[0][:120]
+        rows.append({**common(gid, STANDING_ORDER_KIND, str(g["expires_at"]), None if link is None else link[0]),
+                     "state": state_of(gid, str(g["expires_at"])), "agent": visible("night desk standing order"),
+                     "tools": [], "workspace": visible(first), "postures": []})
     for gid, kind, expires_at in retired:   # the opt-in has no expiry: live until it is revoked
         link = links[gid]
         rows.append({**common(gid, kind, expires_at or "", None if link is None else link[0]),
@@ -417,7 +427,7 @@ def _split(state: Any) -> tuple[list[ConsentGrant], list[tuple[str, str, str, in
 _STOPPED_LABELS = {CONSENT_GRANT_KIND: "consent grant", CONSENT_MCP_GRANT_KIND: "consent grant",
                    CONSENT_CONTAINED_SHELL_KIND: "contained-shell grant", SEAT_LEASE_KIND: "seat-root lease",
                    SEAT_EGRESS_KIND: "seat-egress grant", EGRESS_KEY_KIND: "chat key", VOICE_KEY_KIND: "voice key",
-                   HANDS_MCP_KIND: "hands-mcp entry"}
+                   HANDS_MCP_KIND: "hands-mcp entry", STANDING_ORDER_KIND: "standing order"}
 
 
 def _stopped_tail(grant: Mapping[str, Any]) -> str:
@@ -448,6 +458,8 @@ def _stopped_tail(grant: Mapping[str, Any]) -> str:
         return f"{NAMES.get(provider, visible(provider))} voice key"
     if kind == HANDS_MCP_KIND:
         return f"hands server {field('name')}"
+    if kind == STANDING_ORDER_KIND:
+        return f"night desk order {field('id')}: {field('words').splitlines()[0][:80] if field('words') else ''}"
     return f"{field('kind')} grant"
 
 

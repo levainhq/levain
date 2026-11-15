@@ -447,6 +447,16 @@ def _queued(store: CoordStore) -> list[Any]:
     return out[::-1]
 
 
+def _standing_orders_section(store: CoordStore, launch: Any) -> list[str]:
+    """The desk's standing orders, each quoted as its signed bytes (ND-2): a desk-only section, read from the cockpit's
+    authority log when this brief is built, and failing closed to "no order in force" in words when it cannot be read."""
+    from levain.desk import standing_orders
+
+    if launch.role != ROLE_DESK:
+        return []
+    return standing_orders.brief_section(store.directory, store._clock())
+
+
 def _open_section(store: CoordStore, launch: Any, lv: str, tail: str) -> list[str]:
     """The cold start's open, embedded: built for THIS pending launch by :func:`seam_build.starter_build`, with the
     acknowledgement as the first act. A desk-only section; a refusal (a degraded store, a launch not claimed by
@@ -650,6 +660,7 @@ def _brief_text(store: CoordStore, launch: Any) -> str:
         f"`{launch.session_key}`). Your directory is `{launch.cwd}`.",
         "",
         *_open_section(store, launch, lv, tail),
+        *_standing_orders_section(store, launch),
         "## The lease",
         "",
         "One session holds the desk role at a time. Every thread write you make carries the lease token, and is "
