@@ -11,7 +11,12 @@ a fake of these by absolute path under the temp dir is fine). Scrubbed for the r
 ``pytest_unconfigure`` and ``atexit``, once): SSH_AUTH_SOCK, SSH_SK_PROVIDER; git system config off, global config a scratch identity.
 Known edges: ctypes/cffi/libc system; TOCTOU; a key copied out before the test; a process the test starts that itself reads the
 home (a real levain CLI by subprocess: the scrub is the defence); an explicit child ``env=`` naming the real key on purpose;
-``shell=True`` list form with the key as a positional ``$1``; the ``~user`` spelling; case games a case-sensitive volume allows."""
+``shell=True`` list form with the key as a positional ``$1``; the ``~user`` spelling; case games a case-sensitive volume allows.
+Left open by the kg5 L3 round (levain 45, 2026-11-14; none is a pattern a scratch-key test writes, and a fourth version of this
+guard is not built for them): an ``ssh-add`` honoured through an ``env``/shell operand assignment; ``executable=`` whose
+argv[0] names a guarded tool is refused as if it were the command; ``os.execl*``/``execle`` env as the last positional;
+a case-sensitive volume's ``.SSH`` refused as ``.ssh``; a cleanup step that raises leaves the wall installed;
+an ``eval`` token spelled in other case; ``HOME=""`` in an explicit env reads as the passwd home."""
 
 from __future__ import annotations
 
