@@ -470,9 +470,8 @@ def test_the_night_scope_moves_only_on_a_retake(tmp_path):
         conn.execute("UPDATE effect_attempts SET night_scope = 'x'")
     with pytest.raises(sqlite3.DatabaseError):               # unknown -> ok with a new night
         conn.execute("UPDATE effect_attempts SET night_scope = 'x', status = 'ok'")
-    with pytest.raises(sqlite3.DatabaseError):               # the incident never moves, even on a retake
-        conn.execute("UPDATE effect_attempts SET status = 'refused'")
-        conn.execute("UPDATE effect_attempts SET status = 'unknown', incident_scope = 'x'")
+    with pytest.raises(sqlite3.DatabaseError):               # nor the incident outside the retake edge (fix 2: it
+        conn.execute("UPDATE effect_attempts SET incident_scope = 'x'")      # moves with the row on a retake)
     conn.close()
 
 
@@ -574,3 +573,228 @@ def test_night_key_cuts_at_the_hour_not_at_midnight():
     assert a == b and a != c
     with pytest.raises(ValueError):
         night_key(datetime(2026, 11, 15, 12, 0), 12)
+
+
+# ---- review fixes (ND-3b fix 2) -----------------------------------------------------------------------------------------
+def test_a_refusal_of_our_own_raised_inside_the_runner_is_unknown_and_never_run_again(world):
+    """The runner may have started before it raised (``subprocess_runner`` itself raises this module's refusal): the
+    attempt is ``unknown``, not ``refused``, so it is never taken again and run a second time."""
+    g = signed(world)
+    rig = Rig(world)
+
+    def runner(argv):
+        rig.runs.append(list(argv))
+        raise fx._OwnRefusal(fx.R_ARGS)
+
+    first = restart(rig, g, runner=runner)
+    assert not first.ok and first.text == f"restart_service taoserv apache2: {fx.R_UNKNOWN}"
+    assert restart(rig, g) == first and len(rig.runs) == 1
+    assert [r.status for r in rig.journal.rows()] == ["unknown"]
+
+
+def test_a_refusal_of_our_own_raised_inside_the_transport_is_unknown_and_never_resent(world):
+    g = signed(world)
+    rig = Rig(world)
+
+    class Raising:
+        sender = "thirdmind@levain.example"
+
+        def send(self, message):
+            rig.sent.append(message)
+            raise fx._OwnRefusal(fx.R_FAILED)
+
+    first = rig.effects(transport=Raising()).send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert first.text == f"send_ack: {fx.R_UNKNOWN}"
+    assert rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g)) == first and len(rig.sent) == 1
+
+
+def test_a_result_the_journal_could_not_write_is_never_answered_ok(world):
+    """The effect ran, then the settle failed: the row stays ``unknown`` and the caller is told ``unknown`` too (a
+    retry would answer it), never ``ok``."""
+    g = signed(world)
+    rig = Rig(world)
+
+    def broken_settle(attempt_id, status, now):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    rig.journal.settle = broken_settle
+    res = restart(rig, g)
+    assert not res.ok and res.text == f"restart_service taoserv apache2: {fx.R_UNKNOWN}" and len(rig.runs) == 1
+    assert [r.status for r in rig.journal.rows()] == ["unknown"]
+    rig.journal.settle = lambda attempt_id, status, now: False             # settled by no one: still not ok
+    ack = rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert not ack.ok and ack.text == f"send_ack: {fx.R_UNKNOWN}"
+
+
+def _mallory_row(rig: Rig, g: dict, status: str):
+    empty = hashlib.sha256(b"").hexdigest()
+    row, _ = rig.journal.reserve(key=idem_key(EVT, "send_ack", empty), order_id=g["id"], order_sha256=D(g),
+                                 incarnation=1, verb="send_ack", event_id=EVT, args_digest=empty,
+                                 recipient="mallory@evil.example", incident_scope="x", night_scope="y",
+                                 per_incident=9, per_night=9, now="2026-11-15T00:00:00Z")
+    if status != "unknown":
+        rig.journal.settle(row.attempt_id, status, "2026-11-15T00:00:01Z")
+
+
+def test_a_refused_row_for_another_sender_is_never_taken_again_for_this_one(world):
+    g = signed(world)
+    rig = Rig(world)
+    _mallory_row(rig, g, "refused")
+    assert refused(lambda: rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))) == fx.R_SENDER
+    assert rig.sent == [] and rig.drafts == []
+    assert [(r.status, r.recipient) for r in rig.journal.rows()] == [("refused", "mallory@evil.example")]
+
+
+def test_a_racer_that_missed_the_lookup_still_checks_the_recorded_sender(world):
+    """The lookup ran before the other process reserved (simulated: the lookup sees nothing); the reservation then
+    returns that process's row, whose recipient is checked too."""
+    g = signed(world)
+    rig = Rig(world)
+    _mallory_row(rig, g, "unknown")
+    rig.journal.lookup = lambda key: None
+    assert refused(lambda: rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))) == fx.R_SENDER
+    assert rig.sent == [] and rig.drafts == []
+
+
+def test_of_two_racing_acks_only_the_one_holding_the_reservation_drafts(world):
+    """The second call arrives while the first is drafting: it answers the first's reservation and drafts nothing."""
+    g = signed(world)
+    rig = Rig(world)
+    inner = []
+
+    def drafter(event_id):
+        rig.drafts.append(event_id)
+        if len(rig.drafts) == 1:
+            inner.append(rig.effects(drafter=drafter).send_ack(g["id"], EVT, expect_sha256=D(g)))
+        return fx.Draft("Thank you for your message. It arrived and has been passed on.", "stand_in")
+
+    assert rig.effects(drafter=drafter).send_ack(g["id"], EVT, expect_sha256=D(g)).ok
+    assert rig.drafts == [EVT] and len(rig.sent) == 1
+    assert inner[0].text == f"send_ack: {fx.R_UNKNOWN}"                    # the first was still in flight
+
+
+def test_a_looser_order_never_lifts_a_stricter_orders_ceiling(world):
+    """Order A allows one restart a night and order B two: after A's restart, B's is over A's ceiling for the box."""
+    strict = {**LINE, "per_night": 1}
+    a, b = signed(world, strict), signed(world)
+    rig = Rig(world)
+    ev = serve_events(rig, **{EVR2: monitor_event(event_id=EVR2, incident_id=INC2)})
+    assert restart(rig, a, EVR, events=ev).ok
+    assert refused(lambda: restart(rig, b, EVR2, events=ev)) == fx.R_BUDGET_NIGHT
+    assert len(rig.runs) == 1
+
+
+def test_a_retake_moves_the_incident_with_the_row(tmp_path):
+    """A row first reserved under one incident scope and taken again under another is charged to the new one: a second
+    effect there is over a budget of one (before, the row kept the old scope and the new incident counted it nowhere)."""
+    journal = Journal(tmp_path / "inc.db")
+    row, _ = _reserve(journal, "k1", "n", "2026-11-15T00:00:00Z", incident="a|evt-x")
+    journal.settle(row.attempt_id, "refused", "2026-11-15T00:00:01Z")
+    again, fresh = journal.reserve(key="k1", order_id="so-" + "a" * 12, order_sha256="0" * 64, incarnation=1,
+                                   verb="restart_service", event_id=EVR, args_digest="x", recipient=None,
+                                   incident_scope="a|inc-b", night_scope="n", per_incident=1, per_night=9,
+                                   now="2026-11-15T00:00:02Z")
+    assert fresh
+    with pytest.raises(BudgetSpent):
+        journal.reserve(key="k2", order_id="so-" + "a" * 12, order_sha256="0" * 64, incarnation=1,
+                        verb="restart_service", event_id=EVR2, args_digest="x", recipient=None,
+                        incident_scope="a|inc-b", night_scope="n", per_incident=1, per_night=9,
+                        now="2026-11-15T00:00:03Z")
+
+
+def test_an_event_that_ages_out_while_the_ack_is_drafted_is_not_sent(world):
+    g = signed(world)
+    rig = Rig(world)
+    rig.event = event_for(rig.raw, received_at=utc_stamp(world.clock.now - timedelta(hours=11, minutes=59)))
+
+    def drafter(event_id):                                   # a slow drafter: the event passes the window meanwhile
+        rig.drafts.append(event_id)
+        world.clock.now += timedelta(minutes=2)
+        return fx.Draft("Thank you for your message. It arrived and has been passed on.", "stand_in")
+
+    assert refused(lambda: rig.effects(drafter=drafter).send_ack(g["id"], EVT, expect_sha256=D(g))) == fx.R_EVENT_AGE
+    assert rig.sent == [] and [r.status for r in rig.journal.rows()] == ["refused"]
+
+
+def test_an_event_that_ages_out_before_the_restart_runs_is_not_run(world):
+    g = signed(world)
+    rig = Rig(world)
+    rig.monitor = monitor_event(received_at=utc_stamp(world.clock.now - timedelta(hours=11, minutes=59)))
+    real = fx.Effects.gate
+    seen = {"n": 0}
+
+    def gate_then_wait(self, order_id, verb, *, expect_sha256):
+        seen["n"] += 1
+        if seen["n"] == 2:                                   # the replay after the reservation: time has passed
+            world.clock.now += timedelta(minutes=2)
+        return real(self, order_id, verb, expect_sha256=expect_sha256)
+
+    fx.Effects.gate = gate_then_wait
+    try:
+        assert refused(lambda: restart(rig, g)) == fx.R_EVENT_AGE
+    finally:
+        fx.Effects.gate = real
+    assert rig.runs == [] and [r.status for r in rig.journal.rows()] == ["refused"]
+
+
+def test_a_recorded_result_is_answered_with_nothing_wired_to_act(world):
+    g = signed(world)
+    rig = Rig(world)
+    first = restart(rig, g)
+    assert restart(rig, g, runner=None) == first and first.ok
+    assert rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g)).ok
+    again = rig.effects(drafter=None, transport=None).send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert again.ok and again.text == "send_ack: sent"
+    assert len(rig.runs) == 1 and len(rig.sent) == 1
+
+
+def test_a_result_names_the_verb_alone(world):
+    g = signed(world)
+    rig = Rig(world)
+    res = restart(rig, g)
+    assert res.verb == "restart_service" and res.text == "restart_service taoserv apache2: exit 0"
+    assert restart(rig, g, EVR, "php8.1-fpm", runner=lambda a: 3).verb == "restart_service"
+
+
+@pytest.mark.parametrize("code", [-9, -15, -2])
+def test_a_signal_death_is_unknown_not_failed(world, code):
+    g = signed(world)
+    rig = Rig(world)
+    assert restart(rig, g, runner=lambda a: code).text == f"restart_service taoserv apache2: {fx.R_UNKNOWN}"
+    assert [r.status for r in rig.journal.rows()] == ["unknown"]
+
+
+@pytest.mark.parametrize("column,value", [("order_sha256", "'f'"), ("incarnation", "99"), ("per_night", "99"),
+                                          ("per_incident", "99"), ("incident_scope", "'x'")])
+def test_the_version_incarnation_and_limits_move_only_on_a_retake(tmp_path, column, value):
+    journal = Journal(tmp_path / "ver.db")
+    row, _ = _reserve(journal, "k1", "n", "2026-11-15T00:00:00Z")
+    conn = sqlite3.connect(journal.path)
+    with pytest.raises(sqlite3.DatabaseError):               # unknown -> unknown
+        conn.execute(f"UPDATE effect_attempts SET {column} = {value}")
+    with pytest.raises(sqlite3.DatabaseError):               # unknown -> ok
+        conn.execute(f"UPDATE effect_attempts SET {column} = {value}, status = 'ok'")
+    conn.close()
+    assert journal.lookup("k1").status == "unknown"
+
+
+def test_a_journal_file_from_before_the_limits_gets_them(tmp_path):
+    """A file whose table predates the per-row limits is given the columns; its old rows count with no limit of
+    their own (the caller's applies)."""
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE effect_attempts (attempt_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "idem_key TEXT NOT NULL UNIQUE, order_id TEXT NOT NULL, order_sha256 TEXT NOT NULL, "
+                "incarnation INTEGER NOT NULL, verb TEXT NOT NULL, event_id TEXT NOT NULL, args_digest TEXT NOT NULL, "
+                "recipient TEXT, incident_scope TEXT NOT NULL, night_scope TEXT NOT NULL, "
+                "status TEXT NOT NULL CHECK (status IN ('unknown', 'ok', 'failed', 'refused')), "
+                "reserved_at TEXT NOT NULL, settled_at TEXT)")
+    old.execute("INSERT INTO effect_attempts (idem_key, order_id, order_sha256, incarnation, verb, event_id, "
+                "args_digest, incident_scope, night_scope, status, reserved_at) "
+                "VALUES ('k0', 'so-aaaaaaaaaaaa', 's', 1, 'restart_service', 'e', 'x', 'i0', 'n', 'ok', 't')")
+    old.commit()
+    old.close()
+    journal = Journal(path)
+    _reserve(journal, "k1", "n", "2026-11-15T00:00:00Z", per_night=2)
+    with pytest.raises(BudgetSpent):
+        _reserve(journal, "k2", "n", "2026-11-15T00:00:01Z", per_night=2, event_id=EVR2, incident="apache2|inc-2")

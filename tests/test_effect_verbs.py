@@ -994,11 +994,10 @@ def test_the_modules_own_refusals_pass_through_unchanged(world):
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
     assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_TEXT_WORD
-    rig = Rig(world)                                              # subprocess_runner's own R_ARGS, reached by a runner
-    with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects(runner=lambda argv: fx.subprocess_runner([])).restart_service(
-            g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
-    assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_ARGS
+    rig = Rig(world)                                              # subprocess_runner's own R_ARGS, reached by a runner:
+    res = rig.effects(runner=lambda argv: fx.subprocess_runner([])).restart_service(   # the runner may have started,
+        g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))               # so it is unknown (ND-3b fix 2)
+    assert not res.ok and res.text == f"restart_service taoserv apache2: {fx.R_UNKNOWN}"
     for bad in (lambda: fx.restart_argv("taoserv", "mysql"), lambda: fx.inbound_from(b"x"),
                 lambda: rig.effects().restart_service("so-x", "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))):
         with pytest.raises(fx.EffectRefused) as exc:

@@ -13,18 +13,20 @@ nothing has to run for it to read ``unknown``. The result is a later, single tra
 ``failed`` (the effect was settled), or to ``refused`` (the order stopped answering between the reservation and the run:
 nothing ran). A retry of an ``ok``, ``failed`` or ``unknown`` attempt is answered with its recorded status and runs
 nothing; only a ``refused`` row can be taken again (``refused`` to ``unknown``), and then it is a fresh reservation,
-counted and charged in the night it is taken in, under the order that takes it (that edge alone may move the row's
-night scope and order id).
+counted and charged in the incident and night it is taken in, under the order that takes it (that edge alone may move
+the row's scopes, order id, version, incarnation and limits).
 
 BUDGETS are checked and consumed in the same ``BEGIN IMMEDIATE`` transaction that inserts the reservation (never
 check-then-act): the count of the verb's rows holding the same incident scope, or the same night scope, that are not
-``refused``, under ANY order, must be under the calling order line's budget, or the reservation is not written. The
-budget bounds the box and the address, not the order (night desk design 3.1: "2 restarts per night across all
-incidents"; 3.2: "1 send per address per night"), so a second order, or a widening, cannot double it. A row consumes budget whatever its outcome (a failed or an
-unknown attempt may have done its work).
+``refused``, under ANY order, must be under the calling order line's budget AND under the lowest budget any of those
+rows was reserved under (each row keeps its line's limits), or the reservation is not written. The budget bounds the
+box and the address, not the order (night desk design 3.1: "2 restarts per night across all incidents"; 3.2: "1 send
+per address per night"), so a second order, or a widening, cannot double it, and a looser order cannot lift the
+ceiling a stricter order's effects were held to. A row consumes budget whatever its outcome (a failed or an unknown
+attempt may have done its work).
 
-The triggers refuse DELETE, an UPDATE that changes any identity column (the night scope too, except on the retake
-edge), and every status edge but the ones above.
+The triggers refuse DELETE, an UPDATE that changes any identity column (the scopes, order id, version, incarnation and
+limits too, except on the retake edge), and every status edge but the ones above.
 Stdlib only.
 """
 from __future__ import annotations
@@ -45,21 +47,23 @@ SCHEMA: tuple[str, ...] = (
     "verb TEXT NOT NULL, event_id TEXT NOT NULL, args_digest TEXT NOT NULL, recipient TEXT, "
     "incident_scope TEXT NOT NULL, night_scope TEXT NOT NULL, "
     "status TEXT NOT NULL CHECK (status IN ('unknown', 'ok', 'failed', 'refused')), "
-    "reserved_at TEXT NOT NULL, settled_at TEXT)",
+    "reserved_at TEXT NOT NULL, settled_at TEXT, per_incident INTEGER, per_night INTEGER)",
     "DROP INDEX IF EXISTS effect_attempts_incident",
     "DROP INDEX IF EXISTS effect_attempts_night",
     "CREATE INDEX IF NOT EXISTS effect_attempts_verb_incident ON effect_attempts (verb, incident_scope)",
     "CREATE INDEX IF NOT EXISTS effect_attempts_verb_night ON effect_attempts (verb, night_scope)",
     "CREATE TRIGGER IF NOT EXISTS effect_attempts_no_delete BEFORE DELETE ON effect_attempts "
     "BEGIN SELECT RAISE(ABORT, 'an effect attempt is never deleted'); END",
-    # dropped and created again in the schema's one transaction, so a file made before the retake edge moved the night
-    # gets this trigger and never keeps the older one
+    # dropped and created again in the schema's one transaction, so a file made before this version of the edges gets
+    # this trigger and never keeps the older one
     "DROP TRIGGER IF EXISTS effect_attempts_edges",
     "CREATE TRIGGER effect_attempts_edges BEFORE UPDATE ON effect_attempts WHEN "
     "NEW.attempt_id IS NOT OLD.attempt_id OR NEW.idem_key IS NOT OLD.idem_key OR "
     "NEW.verb IS NOT OLD.verb OR NEW.event_id IS NOT OLD.event_id OR NEW.args_digest IS NOT OLD.args_digest OR "
-    "NEW.incident_scope IS NOT OLD.incident_scope OR "
-    "((NEW.night_scope IS NOT OLD.night_scope OR NEW.order_id IS NOT OLD.order_id) "
+    "((NEW.incident_scope IS NOT OLD.incident_scope OR NEW.night_scope IS NOT OLD.night_scope OR "
+    "NEW.order_id IS NOT OLD.order_id OR NEW.order_sha256 IS NOT OLD.order_sha256 OR "
+    "NEW.incarnation IS NOT OLD.incarnation OR NEW.per_incident IS NOT OLD.per_incident OR "
+    "NEW.per_night IS NOT OLD.per_night) "
     "AND NOT (OLD.status = 'refused' AND NEW.status = 'unknown')) OR "
     "NEW.recipient IS NOT OLD.recipient OR NOT ((OLD.status = 'unknown' AND NEW.status IN ('ok', 'failed', 'refused')) "
     "OR (OLD.status = 'refused' AND NEW.status = 'unknown')) "
@@ -71,6 +75,8 @@ SCHEMA: tuple[str, ...] = (
 #: the most refusal rows kept; past it the least recently seen row is dropped for the new one, so a caller varying the
 #: event id can neither grow the file without bound nor stop a later refusal being recorded
 _REFUSALS_MAX = 5000
+#: the budget each row was reserved under (the calling line's), kept so a later reservation is held to the strictest
+_LIMIT_COLUMNS = ("per_incident", "per_night")
 
 
 class BudgetSpent(Exception):
@@ -124,7 +130,12 @@ class Journal:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         with write_transaction(self._connect) as conn:
-            for statement in SCHEMA:
+            conn.execute(SCHEMA[0])
+            have = {r[1] for r in conn.execute("PRAGMA table_info(effect_attempts)")}
+            for column in _LIMIT_COLUMNS:                   # a file made before the rows carried their limits
+                if column not in have:
+                    conn.execute(f"ALTER TABLE effect_attempts ADD COLUMN {column} INTEGER")
+            for statement in SCHEMA[1:]:
                 conn.execute(statement)
 
     def _connect(self) -> sqlite3.Connection:
@@ -143,37 +154,40 @@ class Journal:
                 args_digest: str, recipient: str | None, incident_scope: str, night_scope: str, per_incident: int,
                 per_night: int, now: str) -> tuple[Attempt, bool]:
         """ONE transaction: the existing row for ``key`` (returned as ``(row, False)`` with nothing written, unless it is
-        ``refused``, which is taken again as ``unknown`` in ``night_scope`` under ``order_id``), else a new ``unknown``
-        row. A new or re-taken reservation first counts the verb's non-refused rows, under every order, in its incident
-        scope and in its night scope; a count at or over the budget raises :class:`BudgetSpent` and writes nothing.
+        ``refused``, which is taken again as ``unknown`` in ``incident_scope`` and ``night_scope`` under ``order_id``),
+        else a new ``unknown`` row. A new or re-taken reservation first counts the verb's non-refused rows, under every
+        order, in its incident scope and in its night scope; a count at or over the budget (the lower of the caller's
+        and the lowest a counted row was reserved under) raises :class:`BudgetSpent` and writes nothing.
         Returns ``(row, True)`` when THIS call holds the reservation (and so may run the effect), ``(row, False)`` when
         an earlier one does."""
         with write_transaction(self._connect) as conn:
             row = conn.execute(f"SELECT {_COLUMNS} FROM effect_attempts WHERE idem_key = ?", (key,)).fetchone()
             if row is not None and row[8] != "refused":
                 return _attempt(row), False
-            used_incident = conn.execute(
-                "SELECT count(*) FROM effect_attempts WHERE verb = ? AND incident_scope = ? "
-                "AND status != 'refused'", (verb, incident_scope)).fetchone()[0]
-            if used_incident >= per_incident:
-                raise BudgetSpent("incident")
-            used_night = conn.execute(
-                "SELECT count(*) FROM effect_attempts WHERE verb = ? AND night_scope = ? "
-                "AND status != 'refused'", (verb, night_scope)).fetchone()[0]
-            if used_night >= per_night:
-                raise BudgetSpent("night")
+            # the limit is the calling line's or, when lower, the lowest any counted row was reserved under: a looser
+            # order never lifts the ceiling a stricter order's effects in the same scope were held to
+            for which, column, scope, limit in (("incident", "incident_scope", incident_scope, per_incident),
+                                                ("night", "night_scope", night_scope, per_night)):
+                used, lowest = conn.execute(
+                    f"SELECT count(*), min(per_{which}) FROM effect_attempts WHERE verb = ? AND {column} = ? "
+                    "AND status != 'refused'", (verb, scope)).fetchone()
+                if used >= (limit if lowest is None else min(limit, lowest)):
+                    raise BudgetSpent(which)
             if row is None:
                 conn.execute("INSERT INTO effect_attempts (idem_key, order_id, order_sha256, incarnation, verb, "
-                             "event_id, args_digest, recipient, incident_scope, night_scope, status, reserved_at) "
-                             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?)",
+                             "event_id, args_digest, recipient, incident_scope, night_scope, status, reserved_at, "
+                             "per_incident, per_night) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?)",
                              (key, order_id, order_sha256, incarnation, verb, event_id, args_digest, recipient,
-                              incident_scope, night_scope, now))
+                              incident_scope, night_scope, now, per_incident, per_night))
             else:
-                # the night the budget was just counted in is the night the row is charged to (a retake after the cut
-                # is the new night's effect), and the order that takes it is the order it runs under
+                # the scopes the budget was just counted in are the scopes the row is charged to (a retake after the
+                # cut is the new night's effect; an event since grouped into an incident is that incident's), and the
+                # order that takes it, with its line's limits, is the order it runs under
                 conn.execute("UPDATE effect_attempts SET status = 'unknown', order_id = ?, order_sha256 = ?, "
-                             "incarnation = ?, night_scope = ?, reserved_at = ?, settled_at = NULL WHERE attempt_id = ?",
-                             (order_id, order_sha256, incarnation, night_scope, now, row[0]))
+                             "incarnation = ?, incident_scope = ?, night_scope = ?, per_incident = ?, per_night = ?, "
+                             "reserved_at = ?, settled_at = NULL WHERE attempt_id = ?",
+                             (order_id, order_sha256, incarnation, incident_scope, night_scope, per_incident,
+                              per_night, now, row[0]))
             fresh = conn.execute(f"SELECT {_COLUMNS} FROM effect_attempts WHERE idem_key = ?", (key,)).fetchone()
         return _attempt(fresh), True
 
