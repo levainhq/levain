@@ -283,9 +283,7 @@ def test_the_session_wall_and_scrub_are_in_force_for_this_run():
         subprocess.run(["ssh-keygen", "-K"])
     G.acknowledge(before)
     assert "SSH_AUTH_SOCK" not in os.environ and "SSH_SK_PROVIDER" not in os.environ
-    assert os.environ["GIT_CONFIG_SYSTEM"] == "/dev/null" and os.environ["GIT_CONFIG_NOSYSTEM"] == "1"
-    cfg = open(os.environ["GIT_CONFIG_GLOBAL"], encoding="utf-8").read()
-    assert "Levain Test" in cfg and "signingkey" not in cfg and "gpgsign" not in cfg
+    assert "GIT_CONFIG_GLOBAL" not in os.environ            # the conftest's hermetic-home rule stands: the guard never sets it
 
 
 def test_the_scrub_is_restored(monkeypatch):
@@ -339,4 +337,5 @@ def test_the_terminal_summary_prints_the_block_and_writes_the_file(tmp_path, mon
     monkeypatch.setattr(G, "_REPORT", [])
     monkeypatch.setattr(G, "_NODES", [])
     G.pytest_terminal_summary(Rep())
-    assert lines == [] and out.read_text() == ""                                  # an empty report prints nothing, file says empty
+    # an empty report still prints (CI must tell "empty" from "missing"); the file says empty
+    assert lines == ["KEYGUARD REPORT BEGIN", "KEYGUARD REPORT: 0 denied spawns", "KEYGUARD REPORT END"] and out.read_text() == ""

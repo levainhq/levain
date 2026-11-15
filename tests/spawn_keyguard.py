@@ -13,7 +13,8 @@ case-folded and NFC on darwin); an embedded-NUL token is skipped. Also denied: `
 unless the child's SSH_AUTH_SOCK is under the temp dir (an argv ``SSH_AUTH_SOCK=`` counts only after ``env`` or in a shell string;
 a fake of these by absolute path under the temp dir is fine). Scrubbed for the run, restored at its end (also at
 ``pytest_unconfigure`` and ``atexit``, once): SSH_AUTH_SOCK, SSH_SK_PROVIDER (a provider library matters only as that variable or
-the value of ``ssh-keygen -D/-K/-w``, never by its name as data); git system config off, global config a scratch identity.
+the value of ``ssh-keygen -D/-K/-w``, never by its name as data). The git environment is NOT touched: tests/conftest.py removes
+GIT_CONFIG_GLOBAL and XDG_CONFIG_HOME on purpose (a hermetic-home test asserts it), and git then reads the scratch HOME's config.
 Known edges: ctypes/cffi/libc system; TOCTOU; a key copied out before the test; a process the test starts that itself reads the
 home (a real levain CLI by subprocess: the scrub is the defence); an explicit child ``env=`` naming the real key on purpose;
 ``shell=True`` list form with the key as a positional ``$1``; the ``~user`` spelling; case games a case-sensitive volume allows;
@@ -31,13 +32,12 @@ import os
 import pwd
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -45,7 +45,7 @@ import pytest
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 _POPEN_POS = ("bufsize", "executable", "stdin", "stdout", "stderr", "preexec_fn", "close_fds", "shell", "cwd", "env")
 _DEFAULT_MODE = "warn"                                        # flip to "enforce" once CI shows an empty report
-_ENV_NAMES = ("SSH_AUTH_SOCK", "SSH_SK_PROVIDER", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM")
+_ENV_NAMES = ("SSH_AUTH_SOCK", "SSH_SK_PROVIDER")
 _PROVIDER_FLAG = re.compile(r"-[A-Za-z]*[KwD]")             # ssh-keygen -K / -w / -D, clustered (-qK) or attached (-D/lib)
 
 
@@ -217,10 +217,9 @@ def pytest_terminal_summary(terminalreporter):
     path = os.environ.get("LEVAIN_KEYGUARD_REPORT")
     if path:
         Path(path).write_text(text + ("\n" if text else ""), encoding="utf-8")
-    if text:
-        terminalreporter.write_line("KEYGUARD REPORT BEGIN")
-        terminalreporter.write_line(text)
-        terminalreporter.write_line("KEYGUARD REPORT END")
+    terminalreporter.write_line("KEYGUARD REPORT BEGIN")
+    terminalreporter.write_line(text if text else "KEYGUARD REPORT: 0 denied spawns")
+    terminalreporter.write_line("KEYGUARD REPORT END")
 
 
 def _listed(args):
@@ -306,20 +305,11 @@ def install():
                 setattr(os, n, r)
 
 
-_GITCONFIG: list[str] = []
-
-
 def scrub_environ() -> dict[str, str | None]:
     """Delete the ambient signing capability and point git at an identity-only config; returns the previous values."""
     previous = {n: os.environ.get(n) for n in _ENV_NAMES}
-    if not _GITCONFIG:
-        d = tempfile.mkdtemp(prefix="levain-kg-")
-        atexit.register(shutil.rmtree, d, True)
-        Path(d, ".gitconfig").write_text("[user]\n\tname = Levain Test\n\temail = test@invalid\n", encoding="utf-8")
-        _GITCONFIG.append(str(Path(d, ".gitconfig")))
     for n in ("SSH_AUTH_SOCK", "SSH_SK_PROVIDER"):
         os.environ.pop(n, None)
-    os.environ.update(GIT_CONFIG_GLOBAL=_GITCONFIG[0], GIT_CONFIG_SYSTEM="/dev/null", GIT_CONFIG_NOSYSTEM="1")
     return previous
 
 
