@@ -1747,6 +1747,10 @@ def build_parser() -> argparse.ArgumentParser:
     from levain.desk.board_cli import register as _register_board
 
     _register_board(subparsers)
+
+    from levain.desk.charter import register as _register_charter
+
+    _register_charter(subparsers)
     return parser
 
 
