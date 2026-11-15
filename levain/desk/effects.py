@@ -211,17 +211,22 @@ def subprocess_runner(argv: Sequence[str]) -> int:
     """Run ``argv`` with ``shell=False``, no stdin, no output kept (a server's output is untrusted text this module
     never returns), a minimal environment (no agent socket, no inherited variable) and a timeout. Returns the exit
     code; -1 for a timeout or a program that could not start."""
-    import os
-
     if not isinstance(argv, (list, tuple)) or not argv or any(type(a) is not str for a in argv):
         raise _OwnRefusal(R_ARGS)
     try:
         done = subprocess.run(list(argv), shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=_REMOTE_TIMEOUT, check=False,
-                              env={"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/")})
+                              stderr=subprocess.DEVNULL, timeout=_REMOTE_TIMEOUT, check=False, env=_runner_env())
     except (OSError, subprocess.SubprocessError):
         return -1
     return done.returncode
+
+
+def _runner_env() -> dict[str, str]:
+    """The ssh child's whole environment: a fixed PATH and HOME (ssh finds its pinned config there). Not
+    :func:`levain.launch.child_env`, whose allowlist carries ``SSH_AUTH_SOCK``: this child must reach no agent."""
+    import os
+
+    return {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/")}
 
 
 # --- send_ack: the sender, derived by code, and the lexical check ----------------------------------------------------
