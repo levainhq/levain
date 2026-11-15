@@ -64,6 +64,7 @@ STUB = textwrap.dedent('''\
     D="$STUB_DIR"
     n=$(cat "$D/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$D/n"
     printf '%s\\n' "$@" > "$D/argv-$n"
+    env > "$D/env-$n"
     cat > "$D/stdin-$n"
     occ=""; prev=""
     for a in "$@"; do [ "$prev" = "--add-dir" ] && occ="$a"; prev="$a"; done
@@ -175,6 +176,18 @@ def test_a_run_writes_the_phases_and_the_child_keys_while_the_child_lives(scratc
     assert final["phase"] == "saved" and final["wrap_id"] == 1 and final["last_wrap_before"] == 0
     assert final["composed_sha256"] and final["child_pid"] is None       # cleared once the child was reaped
     assert (tmp_path / "occ" / "composed.continuity.md").read_text() == _VALID.strip()
+
+
+def test_the_child_never_inherits_the_live_marker(scratch, stub, tmp_path, monkeypatch):
+    """Diogenes 11-15: the marker crosses no exec levain makes, and ``ClaudeMind`` started its child with env=None, so a
+    marked console process handed ``LEVAIN_LIVE=1`` to the mind. The rest of the environment still reaches it."""
+    monkeypatch.setenv("LEVAIN_LIVE", "1")
+    stub.result(1)
+    r = _run(scratch, tmp_path, _claude(stub), budget=_budget())
+    assert r.outcome == "saved"
+    env = (stub.dir / "env-1").read_text().splitlines()
+    assert not [line for line in env if line.startswith("LEVAIN_LIVE=")]
+    assert any(line.startswith("STUB_DIR=") for line in env)
 
 
 def test_the_hooks_are_called_with_their_signature_and_default_to_nothing(scratch, stub, tmp_path):

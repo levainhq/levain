@@ -32,7 +32,7 @@ from levain.authority import (CONSENT_CONTAINED_SHELL_KIND, CONSENT_GRANT_KIND, 
                               UnsignedLink, VerifierUnavailable, anchor_path, append,
                               consent_grant, consent_grant_tool_problem, consent_resolved_workspace,
                               contained_shell_grant, grant_stop_reason, grants_stopped_by, inert_grant,
-                              passkey_revocable, prepare, stopped_clears_only, stopped_way, voice_key_record)
+                              passkey_revocable, prepare, stopped_way, stopped_way_with, voice_key_record)
 from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.keys import KeyError_, Signer, _append, _append_at, _capture, _journal, _now, _signing_authority
@@ -454,8 +454,7 @@ def _stopped_tail(grant: Mapping[str, Any]) -> str:
 def way_back(kind: Any) -> str:
     """The way back for a stopped grant of ``kind`` as one clause (:func:`levain.authority.stopped_way`, with "to use
     it" after a way that makes one again): what a list line and the cockpit page's row both say."""
-    way = stopped_way(kind)
-    return way if stopped_clears_only(kind) else way + " to use it"
+    return stopped_way_with(kind, "to use it")
 
 
 def stopped_line(why: str, kind: Any = None) -> str:
@@ -467,16 +466,17 @@ def stopped_line(why: str, kind: Any = None) -> str:
 
 def ways_back(stopped: Iterable[tuple[str, Any]]) -> list[tuple[str, list[str]]]:
     """The ways back for stopped grants ``(id, kind)``, grouped: one ``(words, ids)`` per way, in the order that works
-    (create-only first, then revoke-then-create, then the hands entry, which can only be cleared). ``words`` is
-    :func:`levain.authority.stopped_way`'s, with "with a key you still hold" after a way that makes one again; the
-    ids keep their given order."""
+    (create-only first, then revoke-then-create, then any other way). ``words`` is
+    :func:`levain.authority.stopped_way_with`'s, with "with a key you still hold" after a way that makes one again; the
+    ids keep their given order. Which kind is clears-only, and its wording, is read off the authority's one table."""
     ways: dict[str, list[str]] = {}
+    shown: dict[str, str] = {}
     for gid, kind in stopped:
-        ways.setdefault(stopped_way(kind), []).append(gid)
+        way = stopped_way(kind)
+        ways.setdefault(way, []).append(gid)
+        shown.setdefault(way, stopped_way_with(kind, "with a key you still hold"))
     rank = {stopped_way(None): 0, stopped_way(SEAT_LEASE_KIND): 1}
-    clears_only = {stopped_way(k) for k in (HANDS_MCP_KIND, GRADUATION_KIND, GRADUATION_PHONE_KIND)}
-    return [(way if way in clears_only else f"{way} with a key you still hold", ways[way])
-            for way in sorted(ways, key=lambda w: rank.get(w, 2))]
+    return [(shown[way], ways[way]) for way in sorted(ways, key=lambda w: rank.get(w, 2))]
 
 
 def stopped_by_key(data_root: Path | str, fingerprint: str, *, now: datetime,

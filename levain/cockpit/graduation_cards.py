@@ -6,7 +6,7 @@ Two things, both read-only:
 - a **card** for a graduation step no live anchored policy covers (:func:`card_of`, over a
   :class:`levain.autonomic.graduation.GraduationStep`): the binding, its family, the rung change, the counts, each
   action its links run with the manifest's risk for it, which clause failed, and the way back for a graduation
-  policy (:func:`levain.authority.stopped_way`): this levain signs none, so a card offers no command. The page never
+  policy (``NO_POLICY_NOTE``): this levain signs none, so a card offers no command. The page never
   signs, and the card's observations are the harness's own.
 - the **steps** taken (:func:`read_steps`): the ``graduation_steps`` audit rows of the autonomic store, newest
   first, read with a read-only connection that never creates or migrates the store. A FEED row: it
@@ -21,14 +21,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from levain.authority import GRADUATION_KIND, stopped_way
 from levain.autonomic.coverage import GRADUATION_GRANT_MAX, risk_dict
 from levain.autonomic.db import DB_NAME, STORE_FORMAT
 from levain.autonomic.risk import ActionRisk, RiskClass
 
 __all__ = ["CARD_DAYS", "STEP_CAP", "card_of", "graduation_view", "read_steps"]
 
-# the per-binding policy a card offers lasts the kind's ceiling (DESIGN_REV3 §3)
+# a card offers no command: it states what is true of a step no policy covers, in its own words (a card has no grant,
+# stopped or otherwise, so a stopped grant's way back does not fit it)
+NO_POLICY_NOTE = ("this levain signs no graduation policy, so nothing can cover this step here; a policy already in "
+                  "the authority log can only be revoked")
 CARD_DAYS = GRADUATION_GRANT_MAX.days
 # the newest steps the page shows
 STEP_CAP = 20
@@ -66,7 +68,7 @@ def card_of(step: Any) -> dict[str, Any]:
         why.append(f"the step was refused: {step.outcome}")
     return {"binding_id": p.old_binding_id, "family": step.family, "from": p.from_posture.name, "to": to,
             "clean_count": p.clean_count, "fire_count": p.fire_count, "actions": actions, "why": "; ".join(why),
-            "command": None, "note": f"no graduation policy can be made here: {stopped_way(GRADUATION_KIND)}"}
+            "command": None, "note": NO_POLICY_NOTE}
 
 
 def read_steps(store_dir: Path | str, *, limit: int = STEP_CAP) -> list[dict[str, Any]]:

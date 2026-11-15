@@ -1326,27 +1326,6 @@ def grant_stop_reason(state: AuthoritySnapshot, grant_id: str) -> str | None:
     return None
 
 
-def stopped_clears_only(kind: Any) -> bool:
-    """Whether a stopped grant of ``kind`` can only be revoked, never made again (a hands entry no verb registers; a
-    graduation policy or opt-in this levain signs none of)."""
-    return kind in (HANDS_MCP_KIND, GRADUATION_KIND, GRADUATION_PHONE_KIND)
-
-
-def stopped_way(kind: Any) -> str:
-    """How a stopped grant of ``kind`` is used again, in words every surface shares (the revoke notice, a list line, the
-    renew refusal). A kind with a one-live rule (the seat-root lease, the seat-egress grant, a chat key per host, a
-    voice key per provider, a hands-mcp entry per name) still counts a stopped grant at append (ruling R-C, so an older
-    levain on the same log counts it too), so it is revoked before it is created again; a hands-mcp entry is created
-    again by ``levain hands mcp register`` (leg 6)."""
-    if kind == HANDS_MCP_KIND:
-        return "revoke it, then register it again (levain hands mcp register)"
-    if kind in (GRADUATION_KIND, GRADUATION_PHONE_KIND):
-        return "revoke it to clear it; this levain signs none, so it cannot be created again"
-    if kind in (SEAT_LEASE_KIND, SEAT_EGRESS_KIND, EGRESS_KEY_KIND, VOICE_KEY_KIND):
-        return "revoke it, then create it again"
-    return "create it again"
-
-
 def _stopped_blocker(state: AuthoritySnapshot, gid: str, revoke_cmd: str) -> str | None:
     """The words for a one-live refusal whose blocker ``gid`` is stopped, or None while it is not: it answers nothing yet
     still counts (ruling R-C), and the verb that clears it, every required argument shown."""
@@ -2208,6 +2187,42 @@ _SEAT_EGRESS_ID = re.compile(r"se-[0-9a-f]{12}")
 _SEAT_EGRESS_FIXED = "a seat-egress grant's terms are fixed: revoke it and sign another"
 _SEAT_EGRESS_DOMAIN = re.compile(r"(?=.{1,253}\Z)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
 _SEAT_EGRESS_DOMAINS_MAX = 16
+
+#: kind -> (the way back for a stopped grant of that kind, whether it can only be cleared). THE ONLY place a kind's
+#: way-back wording and its clears-only class are written: ``stopped_way``, ``stopped_clears_only``,
+#: ``stopped_way_with`` and every surface that prints a way back (the revoke notice, a list line, the renew refusal,
+#: the cockpit row) read it, so a kind that gains a verb changes one row. A kind with a one-live rule still counts a
+#: stopped grant at append (ruling R-C, so an older levain on the same log counts it too), so it is revoked before it
+#: is created again. A kind not named here is created again.
+_STOPPED_WAYS: dict[str, tuple[str, bool]] = {
+    HANDS_MCP_KIND: ("revoke it, then register it again (levain hands mcp register)", False),
+    GRADUATION_KIND: ("revoke it to clear it; this levain signs none, so it cannot be created again", True),
+    GRADUATION_PHONE_KIND: ("revoke it to clear it; this levain signs none, so it cannot be created again", True),
+    SEAT_LEASE_KIND: ("revoke it, then create it again", False),
+    SEAT_EGRESS_KIND: ("revoke it, then create it again", False),
+    EGRESS_KEY_KIND: ("revoke it, then create it again", False),
+    VOICE_KEY_KIND: ("revoke it, then create it again", False),
+}
+_STOPPED_WAY_DEFAULT = ("create it again", False)
+
+
+def stopped_way(kind: Any) -> str:
+    """How a stopped grant of ``kind`` is used again, in words every surface shares (the revoke notice, a list line, the
+    renew refusal), read off :data:`_STOPPED_WAYS`."""
+    return _STOPPED_WAYS.get(kind, _STOPPED_WAY_DEFAULT)[0] if isinstance(kind, str) else _STOPPED_WAY_DEFAULT[0]
+
+
+def stopped_clears_only(kind: Any) -> bool:
+    """Whether a stopped grant of ``kind`` can only be revoked, never made again (:data:`_STOPPED_WAYS`)."""
+    return _STOPPED_WAYS.get(kind, _STOPPED_WAY_DEFAULT)[1] if isinstance(kind, str) else False
+
+
+def stopped_way_with(kind: Any, condition: str) -> str:
+    """:func:`stopped_way` followed by ``condition`` (what a way that makes the grant again needs, for example "with a
+    key you hold") unless the kind can only be cleared: the one place that joins them."""
+    way = stopped_way(kind)
+    return way if stopped_clears_only(kind) else f"{way} {condition}"
+
 
 
 def _validate_seat_egress(grant: Mapping[str, Any], what: str, at: datetime | None) -> dict[str, Any]:
@@ -3117,8 +3132,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
     if stopped is not None:
         stopped_kind = grant.get("kind") if isinstance(grant, Mapping) else None
         raise AuthorityError(f"grant {str(rec['grant_id'])[:80]} stopped when {stopped}; a renew does not bring it "
-                             f"back: {stopped_way(stopped_kind)}"
-                             + ("" if stopped_clears_only(stopped_kind) else " with a key you hold"))
+                             f"back: {stopped_way_with(stopped_kind, 'with a key you hold')}")
     kind = _renewable_kind(grant, rec["grant_id"])
     after = (f"; grant {str(rec['grant_id'])[:80]!r} was signed before this rule: revoke it "
              "(levain consent grant revoke) and create a new one")

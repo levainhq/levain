@@ -86,6 +86,7 @@ from typing import Any
 from levain import wrap as _w
 from levain.agents.accounting import Executor, StopResult, Usage
 from levain.firing.crystallization import CrystallizationRefused, refuse_crystallization
+from levain.home_guard import unmarked_env as _unmarked_env
 from levain.firing.deadline import TurnDeadline, TurnTimeout
 
 _log = logging.getLogger("levain.dream.executor")
@@ -540,7 +541,7 @@ class ClaudeMind:
                 try:
                     # cwd = the occurrence dir: the child's Read/Glob/Grep must not reach the fire's own cwd.
                     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
-                                            start_new_session=True, env=self.env, cwd=str(occ))
+                                            start_new_session=True, env=_unmarked_env(self.env), cwd=str(occ))
                 except OSError as exc:
                     if req.progress is not None:
                         req.progress.update(child_argv=None)   # no child exists; a failed clear keeps it

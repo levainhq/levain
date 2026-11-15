@@ -3865,9 +3865,9 @@ def _check_standing_grants(install: Path) -> list[CheckResult]:
              else f"a key that signed or last renewed {it} was revoked")
     shown = ", ".join(str(visible(gid)) for gid in list(stopped)[:5]) + (f" and {n - 5} more" if n > 5 else "")
     # a kind with a one-live rule still counts a stopped grant at create (ruling R-C): its create is refused until the
-    # stopped one is revoked, so "create it again" alone would send the operator into that refusal; and no verb makes a
-    # hands entry at all. So past the plain case the hint gives each kind's own way back, in the words and order of the
-    # revoke notice (grants.ways_back), never one sentence for every kind
+    # stopped one is revoked, so "create it again" alone would send the operator into that refusal. So past the plain
+    # case the hint gives each kind's own way back, in the words and order of the revoke notice (grants.ways_back),
+    # never one sentence for every kind
     from levain.consent.grants import ways_back
 
     revoke_first = any(_auth.stopped_way(kinds[gid]) != _auth.stopped_way(None) for gid in stopped)

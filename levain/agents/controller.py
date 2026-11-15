@@ -42,6 +42,7 @@ from levain.agent_authority import AgentCoverMoved
 from levain.agents import accounting, schedule, slots
 from levain.agents.spec import DEFAULT_PAUSE_AFTER, _check_row
 from levain.agents.store import AgentStore, open_agent_store
+from levain.home_guard import unmarked_env as _unmarked_env
 
 _log = logging.getLogger("levain.agents.controller")
 
@@ -1453,7 +1454,7 @@ def spawn_fire(store_dir: Path | str, occurrence_id: str, *, argv: Sequence[str]
     with open(log if log is not None else fires / f"{occurrence_id}.log", "ab") as out:
         proc = subprocess.Popen(list(argv) if argv is not None else fire_argv(store_dir, occurrence_id),
                                 start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, stdout=out,
-                                stderr=subprocess.STDOUT, env=None if env is None else dict(env))
+                                stderr=subprocess.STDOUT, env=_unmarked_env(env))   # the fire marks itself; it never inherits
     try:
         _thread_factory(target=proc.wait, name=f"reap-{occurrence_id}", daemon=True).start()
     except BaseException:

@@ -144,6 +144,13 @@ def refuse_real_home_fallback(what: str, environ: Mapping[str, str] | None = Non
     )
 
 
+def unmarked_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """``env`` (the process's own when None) without :data:`LIVE_ENV`: the environment for a child a levain entry
+    starts with no env of its own to give. The marker is a property of ONE process and crosses no exec levain makes
+    (Diogenes 11-15: a spawn that passed ``env=None`` handed it to the dream's ``claude -p``)."""
+    return {k: v for k, v in (os.environ if env is None else env).items() if k != LIVE_ENV}
+
+
 def mark_live() -> None:
     """Called first thing by every levain launcher (each ``__main__`` block, the console entry): this process is a real
     levain run, so resolving the real ``~/.levain`` is expected. Sets :data:`LIVE_ENV` in the process environment;

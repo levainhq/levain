@@ -439,12 +439,22 @@ def test_a_reply_over_the_bound_is_searched_without_the_parser():
 
 def test_the_pair_is_searched_once_per_reply():
     # r6 (codex MED): one pair search per line start was quadratic (50,000 lines took 10.6 s)
+    # Graded by SCALING, not by wall time (board 1733: a hard 5 s bound read 6.18 s on a loaded CI shard while the
+    # function is linear): doubling the input must cost well under the 4x a quadratic search pays. Best of three per
+    # size filters a one-off stall; a loaded runner slows both sizes alike, so the ratio holds.
     import time
 
-    t = time.perf_counter()
-    unreadable_tool_call("<arg_key>x\n" * 18_000, TOOLS)
-    unreadable_tool_call("<tool_call> \n" * 15_000, TOOLS)
-    assert time.perf_counter() - t < 5
+    def best(text):
+        runs = []
+        for _ in range(3):
+            t = time.perf_counter()
+            unreadable_tool_call(text, TOOLS)
+            runs.append(time.perf_counter() - t)
+        return max(min(runs), 1e-4)
+
+    for unit in ("<arg_key>x\n", "<tool_call> \n"):
+        small, big = best(unit * 4_500), best(unit * 9_000)
+        assert big < 3 * small, (unit, small, big)
 
 
 # ---------- 0.6.9: the size bound never encodes a reply it will not classify ----------

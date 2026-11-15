@@ -7,7 +7,7 @@ import threading
 from types import SimpleNamespace
 
 from levain.autonomic import ActionManifest, ActionRisk, Posture, RiskClass
-from levain.authority import GRADUATION_KIND, stopped_way
+from levain.cockpit.graduation_cards import NO_POLICY_NOTE
 from levain.cockpit.graduation_cards import card_of, graduation_view, read_steps
 from tests.autonomic_test_only_coverage import TestOnlyCoverage
 from tests.test_autonomic_graduation_due import LATER, LOW, _binding, _due, _store, policy
@@ -15,13 +15,13 @@ from tests.test_autonomic_graduation_due import LATER, LOW, _binding, _due, _sto
 HIGH = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, financial=False)
 
 
-def test_an_uncovered_step_gets_a_card_with_no_command_and_the_way_back_in_the_shared_words(tmp_path):
-    # S-A removed the `levain binding` verbs: the card prints no command, and its note is the shared sentence
+def test_an_uncovered_step_gets_a_card_with_no_command_and_its_own_note(tmp_path):
+    # S-A removed the `levain binding` verbs: the card prints no command, and its note is the card's own sentence, not a stopped grant's way back
     b = _binding()
     s = _store(tmp_path, b)
     [step] = _due(s, TestOnlyCoverage([]))
     card = card_of(step)
-    assert card["command"] is None and stopped_way(GRADUATION_KIND) in card["note"]
+    assert card["command"] is None and card["note"] == NO_POLICY_NOTE and not card["note"].startswith("revoke it")
     assert "levain binding" not in json.dumps(card)
     assert card["from"] == "COOLING_OFF" and card["to"] == "ON_LOOP" and card["clean_count"] == 20
     assert card["actions"] == [{"link": 0, "action": "deliver", "risk": {"cls": 1, "reversible": True,

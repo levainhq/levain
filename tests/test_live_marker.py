@@ -604,3 +604,29 @@ def test_no_model_driven_child_environment_carries_the_marker(monkeypatch):
     assert not [k for k in confinement._default_shell_env() if k.startswith("LEVAIN_")]
     hands = confinement.HandsIdentity("h", 1, "/home/h", Path("/ws"), ())
     assert not [k for k in confinement._hands_env(hands) if k.startswith("LEVAIN_")]
+
+
+# --- the marker crosses no exec levain makes (Diogenes 11-15, spawns that passed no env) ---------------------------------
+
+def test_unmarked_env_drops_only_the_marker(monkeypatch):
+    monkeypatch.setenv(home_guard.LIVE_ENV, "1")
+    got = home_guard.unmarked_env()
+    assert home_guard.LIVE_ENV not in got and got.get("PATH") == os.environ.get("PATH")
+    assert home_guard.unmarked_env({home_guard.LIVE_ENV: "1", "A": "b"}) == {"A": "b"}
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_a_spawned_fire_never_inherits_the_marker(tmp_path, monkeypatch, explicit):
+    """``spawn_fire`` started its child with ``env=None`` (or the caller's env as given): the fire marks itself, so it
+    never needs the marker handed down, and a caller's own marked environment must not carry it on."""
+    from levain.agents import controller as ctl
+
+    monkeypatch.setenv(home_guard.LIVE_ENV, "1")
+    out = tmp_path / "env.txt"
+    script = tmp_path / "dump.py"
+    script.write_text("import os, sys\nopen(sys.argv[1], 'w').write(repr(sorted(os.environ)))\n", encoding="utf-8")
+    kw = {"env": dict(os.environ)} if explicit else {}
+    proc = ctl.spawn_fire(tmp_path, "oc-" + "a" * 32, argv=[sys.executable, str(script), str(out)], **kw)
+    assert proc.wait(60) == 0
+    names = ast.literal_eval(out.read_text())
+    assert home_guard.LIVE_ENV not in names and "PATH" in names

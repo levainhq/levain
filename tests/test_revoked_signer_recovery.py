@@ -143,7 +143,7 @@ def test_the_notice_says_create_for_a_kind_without_a_one_live_rule_and_revoke_fi
         "A renew does not bring one back. To use one again:",
         "  create it again with a key you still hold: cg-A, sh-A",
         "  revoke it, then create it again with a key you still hold: ek-1, se-1, sl-1, vk-1",
-        "  revoke it, then register it again (levain hands mcp register): hm-1",
+        "  revoke it, then register it again (levain hands mcp register) with a key you still hold: hm-1",
         "To revoke one: levain consent grant revoke --signing-key <key> -- <id>",
         "A chat key revokes with: levain chat key revoke --signing-key <key> <id>"]
     for line in tail[-2:]:
@@ -158,7 +158,7 @@ def test_the_notice_says_create_for_a_kind_without_a_one_live_rule_and_revoke_fi
     (auth.SEAT_EGRESS_KIND, "revoke it, then create it again with a key you still hold"),
     (auth.EGRESS_KEY_KIND, "revoke it, then create it again with a key you still hold"),
     (auth.VOICE_KEY_KIND, "revoke it, then create it again with a key you still hold"),
-    (auth.HANDS_MCP_KIND, "revoke it, then register it again (levain hands mcp register)")])
+    (auth.HANDS_MCP_KIND, "revoke it, then register it again (levain hands mcp register) with a key you still hold")])
 def test_each_kind_alone_gets_its_own_order(kind, way) -> None:
     lines = G.stopped_notice([("g-1", kind, "words")])
     assert lines[2:4] == ["A renew does not bring it back. To use it again:", f"  {way}: g-1"]
@@ -201,7 +201,7 @@ def test_the_list_line_says_revoke_first_for_a_one_live_kind_and_create_for_the_
     for kind in (auth.SEAT_LEASE_KIND, auth.SEAT_EGRESS_KIND, auth.EGRESS_KEY_KIND, auth.VOICE_KEY_KIND):
         assert G.stopped_line(BORN, kind) == f"stopped: {BORN} (answers nothing; revoke it, then create it again to use it)"
     assert G.stopped_line(BORN, auth.HANDS_MCP_KIND) == (
-        f"stopped: {BORN} (answers nothing; revoke it, then register it again (levain hands mcp register))")
+        f"stopped: {BORN} (answers nothing; revoke it, then register it again (levain hands mcp register) to use it)")
 
 
 def test_seat_lease_list_says_revoke_first(world, capsys) -> None:
@@ -277,7 +277,7 @@ def test_the_doctor_hint_never_tells_a_hands_entry_to_be_created_again(world) ->
     assert row.hint == ("Revoke them to clear the list (levain consent grant revoke --signing-key <key> -- <id>). "
                         "cg-A: create it again with a key you still hold. "
                         f"{LEASE}: revoke it, then create it again with a key you still hold. "
-                        f"{ENTRY}: revoke it, then register it again (levain hands mcp register).")
+                        f"{ENTRY}: revoke it, then register it again (levain hands mcp register) with a key you still hold.")
     assert "created again" not in row.hint and "hands entry must" not in row.hint
     _parses(_doctor_cmd(row.hint))
 
@@ -323,7 +323,7 @@ def test_a_stopped_hands_entry_is_not_ok_and_names_the_revoke_verb(world, monkey
     (row,) = [r for r in rows if r[1].startswith("hands mcp entry")]
     assert row[0] is False and code == 1
     assert row[1] == (f"hands mcp entry {ENTRY}: stopped: {BORN} (answers nothing; revoke it, then register it again "
-                      f"(levain hands mcp register)): `levain consent grant revoke --signing-key <key> -- {ENTRY}`")
+                      f"(levain hands mcp register) to use it): `levain consent grant revoke --signing-key <key> -- {ENTRY}`")
     assert "renew" not in row[1]            # a renew does not bring a stopped entry back (leg 6: register now exists)
     (cmd,) = _quoted(row[1])
     assert _parses(cmd)[-1] == ENTRY
