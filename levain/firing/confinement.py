@@ -9439,11 +9439,18 @@ def ports(args):
         if not (a.isascii() and a.isdigit() and 0 < int(a) < 65536):
             raise ValueError("not a port: %r" % a)
     return [int(a) for a in args]
-def run(listeners):
+def run(listeners, sig):
+    # sig is held (blocked) in this thread before any relay thread starts, so every thread holds it and
+    # one sent at any moment stays pending until sigwait takes it. A handler and signal.pause() lost one
+    # that landed between Python's check for it and the pause (CI 132956252372, levain#30).
+    # No sig: nothing in this process handles a signal, so it runs until one kills it.
+    if sig is not None:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {sig})
     for s, connect in listeners:
         threading.Thread(target=serve, args=(s, connect), daemon=True).start()
-    while True:
-        signal.pause()
+    if sig is None:
+        threading.Event().wait()
+    signal.sigwait({sig})
 mode, d = sys.argv[1], sys.argv[2]
 if mode == "out":
     made = []
@@ -9459,10 +9466,8 @@ if mode == "out":
                 os.rmdir(d)
             except OSError:
                 pass
-    def stop(*_):
-        tidy()
-        os._exit(0)
-    signal.signal(signal.SIGTERM, stop)
+    # SIGTERM is held from here: one sent during the setup waits for run(), which then stops.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     os.umask(0o077)
     def maker_gone(name):
         parts = name[len(".levain-relay-"):].split("-")
@@ -9534,7 +9539,9 @@ if mode == "out":
     n = os.open(os.devnull, os.O_RDWR)
     os.dup2(n, 1)
     os.dup2(n, 2)
-    run(listeners)
+    run(listeners, signal.SIGTERM)
+    tidy()
+    os._exit(0)
 elif mode == "in":
     i = sys.argv.index("--")
     try:
@@ -9553,7 +9560,14 @@ elif mode == "in":
         n = os.open(os.devnull, os.O_RDWR)
         for f in (0, 1, 2):
             os.dup2(n, f)
-        run(listeners)
+        # Ended as before by the SIGINT levain sends the command's group (the KeyboardInterrupt
+        # pause() raised): it dies of it, now taken by sigwait. A SIGINT it was started ignoring
+        # (Python then installs no handler) it still ignores.
+        run(listeners, signal.SIGINT if signal.getsignal(signal.SIGINT) is signal.default_int_handler else None)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+        os.kill(os.getpid(), signal.SIGINT)
+        os._exit(130)
     for s, _ in listeners:
         s.close()
     os.execv(sys.argv[i + 1], sys.argv[i + 1:])
