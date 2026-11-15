@@ -103,3 +103,85 @@ def test_the_check_reads_the_charter_at_origin_main(tmp_path, capsys):
     subprocess.run([*g, "update-ref", charter.DEFAULT_REF, "HEAD"], check=True)
     rc, out = _run(["--repo", str(tmp_path), "--repo-name", "levain"], capsys)
     assert rc == 0 and out == "levain charter check: levain's CHARTER.md (origin/main) is a valid charter.\n"
+
+
+def test_the_golden_journey_check_names_a_file_that_exists():
+    import re
+    tag = re.search(r"\[check: python3 -m pytest (\S+) ", REAL).group(1)
+    assert (REPO / tag).is_file()
+
+
+def test_the_orphan_criterion_is_tagged_to_the_orphan_rule_item():
+    assert "surfaces as work to do. [item: levain#32]" in REAL
+
+
+def _unreadable(out, why):
+    assert out.startswith(f"levain: warning (charter not yet enforced): levain's CHARTER.md (the file) could not be read: {why}.")
+    assert "has no charter" not in out
+
+
+def test_a_binary_a_directory_and_a_loop_say_unreadable_not_no_charter(tmp_path, capsys):
+    b = tmp_path / "bin.md"
+    b.write_bytes(b"\xff\xfe\x00\x01" * 50)
+    rc, out = _run(["--file", str(b), "--repo-name", "levain"], capsys)
+    assert rc == 0
+    _unreadable(out, "unreadable (not UTF-8)")
+    rc, out = _run(["--file", str(tmp_path), "--repo-name", "levain"], capsys)
+    assert rc == 0
+    _unreadable(out, "unreadable (IsADirectoryError)")
+    loop = tmp_path / "loop.md"
+    loop.symlink_to(loop)
+    rc, out = _run(["--file", str(loop), "--repo-name", "levain"], capsys)
+    assert rc == 0
+    _unreadable(out, "unreadable (OSError)")
+
+
+def test_an_empty_file_and_a_valid_symlink(tmp_path, capsys):
+    e = tmp_path / "empty.md"
+    e.write_text("")
+    rc, out = _run(["--file", str(e), "--repo-name", "levain"], capsys)
+    assert rc == 0 and "is not a valid charter" in out
+    link = tmp_path / "link.md"
+    link.symlink_to(REPO / "CHARTER.md")
+    rc, out = _run(["--file", str(link), "--repo-name", "levain"], capsys)
+    assert rc == 0 and "is a valid charter" in out
+
+
+def test_a_dangling_symlink_is_absent(tmp_path, capsys):
+    link = tmp_path / "dangling.md"
+    link.symlink_to(tmp_path / "nowhere")
+    rc, out = _run(["--file", str(link), "--repo-name", "levain"], capsys)
+    assert rc == 0 and "levain has no charter" in out
+
+
+def test_git_missing_or_hung_warns_and_exits_zero(tmp_path, capsys, monkeypatch):
+    import subprocess
+
+    for exc in (FileNotFoundError("git"), subprocess.TimeoutExpired("git", 30)):
+        def boom(*a, _e=exc, **k):
+            raise _e
+        monkeypatch.setattr(subprocess, "run", boom)
+        rc, out = _run(["--repo", str(tmp_path), "--repo-name", "levain"], capsys)
+        assert rc == 0
+        assert out.startswith("levain: warning (charter not yet enforced): levain's CHARTER.md (origin/main) could not be read: "
+                              f"unreadable (git: {type(exc).__name__}).")
+    monkeypatch.undo()
+    rc, out = _run(["--repo", str(tmp_path)], capsys)       # no --repo-name and no git answer: still no traceback
+    assert rc == 0
+
+
+def test_a_ref_that_looks_like_an_option_never_reaches_git(tmp_path, capsys):
+    target = tmp_path / "PWNED"
+    rc, out = _run(["--repo", str(tmp_path), "--repo-name", "levain", f"--ref=--output={target}"], capsys)
+    assert rc == 0 and "a ref cannot start with '-'" in out
+    assert not list(tmp_path.glob("PWNED*"))
+
+
+def test_the_printed_problem_list_is_capped_and_json_keeps_all(tmp_path, capsys):
+    f = tmp_path / "CHARTER.md"
+    f.write_text(REAL + "\n".join(f"deadbeef{i:02d}" for i in range(200)) + "\n", encoding="utf-8")
+    rc, out = _run(["--file", str(f), "--repo-name", "levain"], capsys)
+    assert rc == 0 and out.count("\n  line ") == charter.MAX_PRINTED and "more (--json lists every one)" in out
+    rc, out = _run(["--file", str(f), "--repo-name", "levain", "--json"], capsys)
+    import json
+    assert len(json.loads(out)["problems"]) >= 200

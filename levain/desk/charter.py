@@ -24,6 +24,7 @@ __all__ = ["DEFAULT_REF", "MAX_LINES", "Problem", "WARN_PREFIX", "check_text", "
 DEFAULT_REF = "refs/remotes/origin/main"
 MAX_LINES = 200
 PURPOSE_MAX = 800
+MAX_PRINTED = 50          # problems and warnings printed as text; --json carries them all
 SECTIONS = ("Purpose", "Criteria", "Constraints", "Plan")
 EXPORTS = ("repo", "memory", "off")
 WARN_PREFIX = "levain: warning (charter not yet enforced): "
@@ -210,15 +211,32 @@ def invalid_text(repo: str, where: str, problems: list[Problem], repo_arg: str) 
 
 
 def _read_ref(repo: Path, ref: str) -> tuple[str | None, str]:
-    """``(text, why)``: the file at ``ref``, or None and why it could not be read."""
+    """``(text, why)``: the file at ``ref``, or None and why: ``absent`` (git has no such file there) or ``unreadable (..)``."""
+    if ref.startswith("-"):
+        return None, "unreadable (a ref cannot start with '-')"
     from levain.desk.board_evidence import _env
-    cp = subprocess.run(["git", "-C", str(repo), "show", f"{ref}:CHARTER.md"], capture_output=True, timeout=30, env=_env())
+    try:
+        cp = subprocess.run(["git", "-C", str(repo), "show", "--end-of-options", f"{ref}:CHARTER.md"],
+                            capture_output=True, timeout=30, env=_env())
+    except (OSError, subprocess.SubprocessError) as exc:      # git missing from PATH, or it hung: a warning, never a traceback
+        return None, f"unreadable (git: {type(exc).__name__})"
     if cp.returncode != 0:
         return None, "absent"
     try:
         return cp.stdout.decode("utf-8"), ""
     except UnicodeDecodeError:
-        return None, "not UTF-8"
+        return None, "unreadable (not UTF-8)"
+
+
+def _read_path(path: Path) -> tuple[str | None, str]:
+    try:
+        return path.expanduser().read_text("utf-8"), ""
+    except FileNotFoundError:
+        return None, "absent"
+    except UnicodeDecodeError:
+        return None, "unreadable (not UTF-8)"
+    except (OSError, ValueError) as exc:
+        return None, f"unreadable ({type(exc).__name__})"
 
 
 def _store(path: Path) -> dict[str, tuple[str, str | None]]:
@@ -232,20 +250,17 @@ def run_check(args: Any) -> int:
     repo_name = args.repo_name
     if repo_name is None:
         from levain.desk.board_evidence import repo_name_of
-        repo_name = repo_name_of(repo) or repo.resolve().name
+        try:
+            repo_name = repo_name_of(repo)
+        except (OSError, subprocess.SubprocessError):
+            repo_name = None
+        repo_name = repo_name or repo.resolve().name
     if args.file is not None:
         where, label = str(args.file), "the file"
-        try:
-            text, why = Path(args.file).expanduser().read_text("utf-8"), ""
-        except (OSError, UnicodeDecodeError) as exc:
-            text, why = None, f"unreadable ({type(exc).__name__})"
+        text, why = _read_path(Path(args.file))
     elif args.worktree:
         where, label = "the worktree", "the worktree"
-        path = repo / "CHARTER.md"
-        try:
-            text, why = path.read_text("utf-8"), ""
-        except (OSError, UnicodeDecodeError) as exc:
-            text, why = None, f"unreadable ({type(exc).__name__})"
+        text, why = _read_path(repo / "CHARTER.md")
     else:
         ref = args.ref or DEFAULT_REF
         where = "origin/main" if ref == DEFAULT_REF else ref
@@ -259,9 +274,14 @@ def run_check(args: Any) -> int:
             print(f"levain charter check: the items file {args.items} cannot be read ({type(exc).__name__}); "
                   "the store checks are skipped.", file=sys.stderr)
     if text is None:
-        print(missing_text(repo_name, label) + (f" (the file is {why})" if why not in ("", "absent") else ""))
+        if why == "absent":
+            print(missing_text(repo_name, label))
+        else:
+            print(f"{WARN_PREFIX}{repo_name}'s CHARTER.md ({label}) could not be read: {why}. "
+                  "Fix that and run `levain charter check` again.")
         if args.json:
-            print(json.dumps({"repo": repo_name, "source": where, "present": False, "valid": False, "problems": [], "warnings": []}))
+            print(json.dumps({"repo": repo_name, "source": where, "present": why != "absent", "valid": False,
+                              "readable": False, "why": why, "problems": [], "warnings": []}))
         return 0
     problems, warnings = check_text(text, repo_name=repo_name, items=items)
     if args.json:
@@ -270,12 +290,16 @@ def run_check(args: Any) -> int:
         return 0
     if problems:
         print(invalid_text(repo_name, where, problems, str(args.repo)))
-        for p in problems:
+        for p in problems[:MAX_PRINTED]:
             print(f"  line {p.line}: [{p.rule}] {p.text}")
+        if len(problems) > MAX_PRINTED:
+            print(f"  and {len(problems) - MAX_PRINTED} more (--json lists every one)")
     else:
         print(f"levain charter check: {repo_name}'s CHARTER.md ({where}) is a valid charter.")
-    for w in warnings:
+    for w in warnings[:MAX_PRINTED]:
         print(f"  warning: {w}")
+    if len(warnings) > MAX_PRINTED:
+        print(f"  and {len(warnings) - MAX_PRINTED} more warnings (--json lists every one)")
     return 0     # warn mode: the check never refuses in 1.0
 
 
