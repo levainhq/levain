@@ -388,7 +388,7 @@ _COVERAGE_SENTINELS = {
 # - AM-FORMATION-OFF (1.0.2) is a REMOVAL entry (no text to add): its end-state is checked by the
 #   retired-claims loop at the end of test_seed_templates_carry_the_reconciled_guidance ("association
 #   context" joined it with this entry), so it carries no positive sentinel.
-_NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH", "AM-WRAP-GENERATED", "KL-19-OPERATOR-CONSOLIDATES", "AM-FORMATION-OFF"}
+_NO_EDIT_REQUIRED = {"AM-PRESERVE-BARE-PATH", "AM-WRAP-GENERATED", "KL-19-OPERATOR-CONSOLIDATES", "AM-FORMATION-OFF", "AM-SPORE-SCHEMA-V2"}
 
 
 def test_seed_templates_carry_the_reconciled_guidance():

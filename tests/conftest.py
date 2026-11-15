@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,8 @@ from tests.autonomic_test_only_coverage import test_only_every_effect_covered  #
 # TEST ONLY: the spawn-level keyguard (a DENY on the operator's real key; see the module).
 from tests.spawn_keyguard import (  # noqa: F401
     _a_refused_spawn_fails_its_test, _no_signing_spawn_in_tests, keyguard_cleanup, pytest_sessionfinish,
-    pytest_terminal_summary, pytest_testnodedown)
+    pytest_terminal_summary)
+from tests.spawn_keyguard import pytest_testnodedown as _keyguard_testnodedown
 
 
 @pytest.fixture(autouse=True)
@@ -299,6 +301,10 @@ def _install_session_home(basetemp=None) -> None:
 
 
 def pytest_configure(config):
+    # ``pytest_testnodedown`` is an xdist hook: a module-level one makes a plain-pytest run (no pytest-xdist) fail with
+    # "unknown hook" at startup, which is why the keyguard's controller-side hook is registered only when xdist is loaded
+    if config.pluginmanager.hasplugin("xdist") and not config.pluginmanager.has_plugin("levain-keyguard-xdist"):
+        config.pluginmanager.register(types.SimpleNamespace(pytest_testnodedown=_keyguard_testnodedown), "levain-keyguard-xdist")
     if not _SESSION_HOME:
         _install_session_home(getattr(config.option, "basetemp", None))
 

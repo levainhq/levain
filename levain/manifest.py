@@ -70,7 +70,7 @@ from levain import __version__
 # bumped in lockstep with the pyproject dependency floor at each release. The
 # pip-pin consistency check (:func:`pip_floor_verdict`) flags it if the two ever
 # drift, which is the release-gate that keeps the manifest honest.
-KNOWN_GOOD_ANNEAL = "2.0.0"
+KNOWN_GOOD_ANNEAL = "2.0.1"
 
 # The consolidate-baton session id for an install's store (anneal 1.0 KL-19). One constant on purpose: the
 # claim `_init_store` makes, the `serve --session-id` in the MCP launcher and the id `levain wrap` passes
@@ -141,7 +141,7 @@ KNOWN_GOOD_SCHEMA = "partnership"
 # 1.0.2 (AM-FORMATION-OFF, 2026-10-24): anneal forms no association links and ignores affect. A removal entry:
 # memory_workflow.md no longer says `prepare_wrap` returns association context; the seed already taught no affect
 # tag and no link forming. Guarded by the retired-claims list in test_seed_templates_carry_the_reconciled_guidance.
-TEMPLATES_RECONCILED_ANNEAL = "1.0.2"
+TEMPLATES_RECONCILED_ANNEAL = "2.0.1"
 
 # The install's recorded-set lockfile, a sibling of the anneal store under the
 # machine-managed `.levain/` dir (NOT operator-facing — `config.json` is that).
