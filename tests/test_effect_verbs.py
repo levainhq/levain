@@ -44,8 +44,10 @@ def world(tmp_path) -> World:
     return w
 
 
-def raw_mail(*, frm: str = FROM, extra: str = "", body: str = "hello\n") -> bytes:
-    return (f"From: Heather <{frm}>\r\nTo: thirdmind@levain.example\r\nSubject: hi\r\n{extra}\r\n{body}").encode()
+def raw_mail(*, frm: str = FROM, extra: str = "", body: str = "hello\n", rp: str | None = f"<{FROM}>") -> bytes:
+    """A delivered message: the delivering MTA's one Return-Path first (``rp=None`` leaves it to ``extra``)."""
+    head = "" if rp is None else f"Return-Path: {rp}\r\n"
+    return (f"{head}From: Heather <{frm}>\r\nTo: thirdmind@levain.example\r\nSubject: hi\r\n{extra}\r\n{body}").encode()
 
 
 def event_for(raw: bytes, **over) -> Event:
@@ -417,7 +419,7 @@ def test_the_order_lists_the_addresses_and_the_voice_the_disclosure_follows(worl
 ])
 def test_a_reply_to_that_differs_an_auto_reply_or_a_list_mail_is_never_answered(world, extra):
     g = signed(world)
-    rig = Rig(world, raw_mail(extra=extra))
+    rig = Rig(world, raw_mail(extra=extra, rp=None if extra.startswith("Return-Path") else f"<{FROM}>"))
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
     assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
@@ -434,7 +436,8 @@ def test_a_reply_to_that_equals_the_from_and_auto_submitted_no_are_fine(world):
                                  "no-at-sign", ""])
 def test_a_from_that_is_not_one_strict_address_is_refused(frm):
     with pytest.raises(fx.EffectRefused):
-        fx.inbound_from(f"From: {frm}\r\nSubject: s\r\n\r\nb\r\n".encode())
+        fx.inbound_from(f"Return-Path: <{FROM}>\r\nFrom: {frm}\r\nSubject: s\r\n\r\nb\r\n".encode())
+    assert fx.inbound_from(f"Return-Path: <{FROM}>\r\nFrom: {FROM}\r\nSubject: s\r\n\r\nb\r\n".encode()) == FROM
 
 
 def test_an_event_that_is_not_an_authenticated_known_mail_is_refused(world):
@@ -697,18 +700,122 @@ def test_restart_service_replays_the_order_again_immediately_before_the_process(
 ])
 def test_a_null_or_unparseable_return_path_in_any_form_is_never_answered(world, extra):
     g = signed(world)
-    rig = Rig(world, raw_mail(extra=extra))
+    rig = Rig(world, raw_mail(extra=extra, rp=None))
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
     assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
 
 
 @pytest.mark.parametrize("rp", ["<heather@client.example.com>", "<bounce+SRS0=ab=cd=client.example.com=h@fwd.example.net>",
-                                "<heather@client.example.com> (via relay)"])
+                                "<Heather.H@Client.Example.COM>", "<h@a-b.example>"])
 def test_a_real_return_path_is_fine(world, rp):
     g = signed(world)
-    rig = Rig(world, raw_mail(extra=f"Return-Path: {rp}\r\n"))
+    rig = Rig(world, raw_mail(rp=rp))
     assert rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g)).ok
+
+
+# ---- L3 r2: no Return-Path, a malformed mailbox, an executor's own EffectRefused ----------------------------------
+def test_a_message_with_no_return_path_is_never_answered(world):
+    g = signed(world)
+    rig = Rig(world, raw_mail(rp=None))
+    with pytest.raises(fx.EffectRefused) as exc:
+        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
+    with pytest.raises(fx.EffectRefused):
+        fx.inbound_from(f"From: {FROM}\r\nSubject: s\r\n\r\nb\r\n".encode())
+
+
+@pytest.mark.parametrize("rp", [
+    b"<foo@-relay.example>", b"<foo@relay-.example>", b"<foo@relay..example>", b"<foo@.relay.example>",
+    b"<foo@relay.example.>", b"<fo\x00o@relay.example>", b"<foo@relay.exa\x00mple>", b"<fo\x7fo@relay.example>",
+    b"<foo@relay.example>\x00", b"<.foo@relay.example>", b"<foo.@relay.example>", b"<fo..o@relay.example>",
+    b"<foo@localhost>", b"<\"a b\"@relay.example>", b"<@relay.example:foo@h.example>", b"<foo@[192.0.2.1]>",
+    b"<foo@relay.example> (via relay)", b"foo@relay.example", b"<foo@relay.example>x", b"<f\xc3\xa9@relay.example>",
+    b"<foo@r\xc3\xa9lay.example>", b"<foo@relay.example>\r\n <bar@x.example>", b"<foo@\trelay.example>",
+    b"<" + b"a" * 65 + b"@relay.example>", b"<foo@" + b"a" * 64 + b".example>",
+])
+def test_a_return_path_that_is_not_one_valid_mailbox_is_refused(world, rp):
+    g = signed(world)
+    raw = b"Return-Path: " + rp + b"\r\n" + raw_mail(rp=None)
+    rig = Rig(world, raw)
+    with pytest.raises(fx.EffectRefused) as exc:
+        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert str(exc.value) == fx.R_FROM and not rig.sent and not rig.drafts
+
+
+class _OwnRefusal(fx.EffectRefused):
+    def __str__(self):
+        return fx.R_LINE
+
+
+_EXECUTOR_RAISES = [fx.EffectRefused("SECRET FROM EXECUTOR"), _OwnRefusal("SECRET FROM EXECUTOR"),
+                    fx.EffectRefused(fx.R_LINE + " SECRET"), fx.EffectRefused(fx.R_LINE, "SECRET")]
+
+
+@pytest.mark.parametrize("raised", _EXECUTOR_RAISES)
+@pytest.mark.parametrize("which", ["events", "raw_source", "drafter", "clock", "sender"])
+def test_an_executors_own_effect_refused_never_carries_its_text_out_of_send_ack(world, which, raised):
+    g = signed(world)
+    rig = Rig(world)
+
+    def boom(*a):
+        raise raised
+
+    if which == "sender":
+        class Transport:
+            @property
+            def sender(self):
+                raise raised
+
+            def send(self, message):
+                rig.sent.append(message)
+        over = {"transport": Transport()}
+    else:
+        over = {which: boom}
+    effects = rig.effects(**over)
+    with pytest.raises(fx.EffectRefused) as exc:
+        effects.send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert type(exc.value) is fx.EffectRefused and str(exc.value) in fx.REFUSALS and "SECRET" not in str(exc.value)
+    assert not rig.sent
+    res = call(rig.effects(**over), "send_ack", {"order_id": g["id"], "order_sha256": D(g), "event_id": EVT})
+    assert res["isError"] is True and res["content"][0]["text"] in fx.REFUSALS and "SECRET" not in json.dumps(res)
+
+
+@pytest.mark.parametrize("raised", _EXECUTOR_RAISES)
+@pytest.mark.parametrize("which", ["runner", "clock"])
+def test_an_executors_own_effect_refused_never_carries_its_text_out_of_restart_service(world, which, raised):
+    g = signed(world)
+    rig = Rig(world)
+
+    def boom(*a):
+        raise raised
+
+    args = {"order_id": g["id"], "order_sha256": D(g), "host": "taoserv", "service": "apache2"}
+    try:
+        res = rig.effects(**{which: boom}).restart_service(g["id"], "taoserv", "apache2", expect_sha256=D(g))
+        text = res.text
+        assert not res.ok
+    except fx.EffectRefused as exc:
+        assert type(exc) is fx.EffectRefused
+        text = str(exc)
+        assert text in fx.REFUSALS
+    assert "SECRET" not in text
+    res = call(rig.effects(**{which: boom}), "restart_service", args)
+    assert res["isError"] is True and "SECRET" not in json.dumps(res)
+
+
+def test_the_mcp_server_returns_only_this_modules_fixed_refusals(world):
+    rig = Rig(world)
+    args = {"order_id": _SO, "order_sha256": _SHA0, "host": "taoserv", "service": "apache2"}
+    for raised in _EXECUTOR_RAISES:                   # the verb itself raising, past every check inside it
+        with mock.patch.object(fx.Effects, "restart_service", side_effect=raised):
+            res = call(rig.effects(), "restart_service", args)
+        assert res == {"content": [{"type": "text", "text": fx.R_FAILED}], "isError": True}
+    for own in sorted(fx.REFUSALS):
+        with mock.patch.object(fx.Effects, "restart_service", side_effect=fx.EffectRefused(own)):
+            assert call(rig.effects(), "restart_service", args)["content"][0]["text"] == own
+    assert {fx.ack_text_refusal(d) for d in ("", "Thanks\x00", "word " * 60, "On day one", "a@b", "a.example",
+                                              "Sure.", "Of course")} <= fx.REFUSALS
 
 
 def test_two_lines_that_answer_the_sender_in_different_voices_refuse(world):

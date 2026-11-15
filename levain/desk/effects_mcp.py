@@ -9,8 +9,10 @@ is the only path to :mod:`levain.desk.effects`. Two tools and no others, with FI
 ``order_sha256`` is the digest the desk brief prints beside each order: a call binds the version the desk read, so an
 order revoked and signed again differently under the same id refuses rather than answering.
 
-A refusal is a fixed sentence returned as a tool error. Any argument outside its shape or enum, a missing or an extra
-one, is refused by :mod:`levain.desk.effects` before the order is even read. ``main`` wires NO executor yet (the night
+A refusal is a fixed sentence returned as a tool error: only a member of :data:`levain.desk.effects.REFUSALS` raised
+by that module itself is returned (:func:`levain.desk.effects.refusal_text`); anything else answers ``R_FAILED``. Any
+argument outside its shape or enum, a missing or an extra one, is refused by :mod:`levain.desk.effects` before the order
+is even read. ``main`` wires NO executor yet (the night
 key is ND-8, the mail credential O8, the drafter ND-4, the budgets ND-3b): every call that passes the order gate then
 answers "not wired". Wiring is done by constructing :class:`~levain.desk.effects.Effects` in the process that owns the
 credentials, not by anything a seat says."""
@@ -90,9 +92,9 @@ def _call(effects: fx.Effects, params: dict[str, Any]) -> dict[str, Any]:
     try:
         verb = getattr(effects, name)
         result = verb(**{param: args[arg] for arg, param in _PARAMS[name].items()})
-    except fx.EffectRefused as exc:
-        return _text(str(exc), error=True)
-    except Exception:                                   # noqa: BLE001 - a fault never carries its text out
+    except Exception as exc:                            # noqa: BLE001 - a fault never carries its text out
+        return _text(fx.refusal_text(exc), error=True)  # a fixed sentence of fx.REFUSALS, or R_FAILED: never str(exc)
+    if type(result) is not fx.EffectResult or type(result.text) is not str or type(result.ok) is not bool:
         return _text(fx.R_FAILED, error=True)
     return _text(result.text, error=not result.ok)
 

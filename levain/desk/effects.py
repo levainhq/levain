@@ -49,8 +49,9 @@ from levain.desk import standing_orders
 from levain.desk.events import Event
 
 __all__ = ["ACK_FROM_LOCAL", "ACK_SUBJECT", "ACK_WORDS_MAX", "AckMessage", "AckTransport", "DIAGNOSIS_WORDS",
-           "EffectRefused", "EffectResult", "Effects", "FORCED_WORDS", "HOSTS", "NIGHT_ALIAS", "NIGHT_SSH", "SERVICES",
-           "ack_text_refusal", "diagnosis_argv", "inbound_from", "restart_argv", "subprocess_runner"]
+           "EffectRefused", "EffectResult", "Effects", "FORCED_WORDS", "HOSTS", "NIGHT_ALIAS", "NIGHT_SSH", "REFUSALS",
+           "SERVICES", "ack_text_refusal", "diagnosis_argv", "inbound_from", "refusal_text", "restart_argv",
+           "subprocess_runner"]
 
 # --- the enums: the log's own verb table and this module's are the same closed sets (checked at import) -------------
 HOSTS = ("taoserv",)
@@ -97,10 +98,42 @@ R_FROM = "the message's sender cannot be derived, is not on the order's list, or
          "mail or has a Reply-To that differs: nothing was done"
 R_DRAFT = "there is no draft to send: nothing was done"
 R_FAILED = "the effect did not complete"
+# the lexical check's fixed reasons (:func:`ack_text_refusal`)
+R_TEXT_SHAPE = "the draft is not one short text"
+R_TEXT_CHARS = "the draft holds a character outside printable ASCII"
+R_TEXT_WORDS = f"the draft is not under {ACK_WORDS_MAX} words"
+R_TEXT_DIGIT = "the draft holds a digit (a date, time, price or number)"
+R_TEXT_SYMBOL = "the draft holds a symbol that makes a link, address, markup or amount"
+R_TEXT_DOTTED = "the draft holds a dotted name (a link or address)"
+R_TEXT_WORD = "the draft holds a date, time, price, commitment, attachment or link word"
+R_TEXT_PHRASE = "the draft holds a commitment phrase"
+#: every sentence this module refuses with, and the only text a refusal may carry out (:func:`refusal_text`)
+REFUSALS = frozenset({R_ARGS, R_ORDER, R_LINE, R_VERSION, R_NOT_WIRED, R_EVENT, R_FROM, R_DRAFT, R_FAILED,
+                      R_TEXT_SHAPE, R_TEXT_CHARS, R_TEXT_WORDS, R_TEXT_DIGIT, R_TEXT_SYMBOL, R_TEXT_DOTTED,
+                      R_TEXT_WORD, R_TEXT_PHRASE})
 
 
 class EffectRefused(Exception):
-    """A verb refused. ``str`` is one of the fixed sentences above (or a fixed lexical reason): never an argument."""
+    """A verb refused. ``str`` is one of :data:`REFUSALS`: never an argument. An executor can raise this class too, so
+    the class alone proves nothing: only :func:`refusal_text` decides what a refusal may say."""
+
+
+def _trusted(exc: BaseException) -> bool:
+    """True only for a refusal this module's own gate and shape code raised: exactly :class:`EffectRefused` (no
+    subclass, which could carry its own ``__str__``) holding exactly one ``str`` (no subclass) that is a member of
+    :data:`REFUSALS`. An executor (runner, transport, event lookup, raw source, drafter, clock) that raises
+    ``EffectRefused(<its own text>)`` is not trusted: its text is never carried out."""
+    try:
+        args = exc.args
+        return (type(exc) is EffectRefused and type(args) is tuple and len(args) == 1 and type(args[0]) is str
+                and args[0] in REFUSALS)
+    except Exception:                                       # noqa: BLE001 - a fault is "not ours"
+        return False
+
+
+def refusal_text(exc: BaseException) -> str:
+    """What a refusal may say outside this module: its fixed sentence if :func:`_trusted`, else :data:`R_FAILED`."""
+    return exc.args[0] if _trusted(exc) else R_FAILED
 
 
 @dataclass(frozen=True)
@@ -180,18 +213,45 @@ def subprocess_runner(argv: Sequence[str]) -> int:
 
 # --- send_ack: the sender, derived by code, and the lexical check ----------------------------------------------------
 _AUTO_MARKERS = ("x-autoreply", "x-autorespond", "x-auto-response-suppress")   # Auto-Submitted is judged by value
-#: a Return-Path's one mailbox: a nonempty local part and a dotted domain, no space, quote or bracket (looser than
-#: :data:`_ADDR` on purpose: a bounce address may carry ``=``; this only tells a real path from a null one)
-_MAILBOX = re.compile(r"[^\s@\"<>()\[\],;]+@[^\s@\"<>()\[\],;.]+(?:\.[^\s@\"<>()\[\],;.]+)+")
+#: a Return-Path, the WHOLE field: ``<`` addr-spec ``>`` and nothing else. The local part is an RFC 5322 dot-atom
+#: (atext runs joined by single dots; looser than :data:`_ADDR` on purpose: a bounce or SRS address carries ``=`` and
+#: ``+``); the domain is two or more RFC 1035 labels (letters, digits, inner hyphens; no empty label, none starting or
+#: ending in a hyphen). DELIBERATELY REFUSED, fail closed (no ack, never a wrong one): a quoted local part
+#: (``"a b"@x.example``), a single-label domain (``root@localhost``), an address literal, a source route
+#: (``<@relay:u@h.example>``), a comment (``<a@b.example> (via relay)``) and a folded field. The delivering MTA stamps
+#: the plain ``<addr>`` form.
+_ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_RETURN_PATH = re.compile(r"<(" + _ATEXT + r"(?:\." + _ATEXT + r")*)@(" + _LABEL + r"(?:\." + _LABEL + r")+)>",
+                          re.ASCII)
+
+
+def _return_path_ok(value: Any) -> bool:
+    """The one Return-Path field holds exactly one nonempty mailbox. No lenient parser runs: any control character
+    (NUL, CR, LF, TAB, DEL: so a folded or smuggled field), any byte outside printable ASCII, or anything outside
+    :data:`_RETURN_PATH` refuses."""
+    try:
+        text = str(value)
+    except Exception:                                       # noqa: BLE001 - an undecodable field is no path
+        return False
+    if any(not " " <= c <= "~" for c in text):
+        return False
+    m = _RETURN_PATH.fullmatch(text.strip(" "))
+    return m is not None and len(m.group(1)) <= 64 and len(m.group(2)) <= 253
 
 
 def inbound_from(raw: bytes) -> str:
     """The ONE address a reply may go to, derived from the raw message's headers: exactly one ``From`` header holding
     exactly one address of the strict shape (lowercased); a ``Reply-To``, if present, names that same one address; and
     no auto-reply or list marker (``Auto-Submitted`` other than ``no``, ``Precedence`` bulk/list/junk/auto_reply, any
-    ``List-*``, ``X-Autoreply``/``X-Autorespond``/``X-Auto-Response-Suppress``, a ``Return-Path`` that is not exactly
-    one header parsing to exactly one nonempty mailbox (so a null path in any form), a ``multipart/report``).
-    Raises :class:`EffectRefused` (:data:`R_FROM`) otherwise."""
+    ``List-*``, ``X-Autoreply``/``X-Autorespond``/``X-Auto-Response-Suppress``, a ``multipart/report``); and EXACTLY
+    ONE ``Return-Path`` header holding exactly one nonempty mailbox (:func:`_return_path_ok`): none, two or more, or a
+    null path in any form refuses. Raises :class:`EffectRefused` (:data:`R_FROM`) otherwise.
+
+    WHAT THE RAW STORE MUST GUARANTEE (ND-4): ``raw`` is the message exactly as final delivery handed it over, with
+    the one ``Return-Path`` the delivering MTA stamped from the SMTP envelope sender (RFC 5321 4.4), so a bounce or a
+    DSN shows as ``<>``. A store that drops that header, never receives it, or lets a second one through makes every
+    ack refuse: fail closed, never an ack to a message whose envelope sender is unknown."""
     if not isinstance(raw, (bytes, bytearray)):
         raise EffectRefused(R_FROM)
     msg = BytesHeaderParser().parsebytes(bytes(raw))
@@ -221,12 +281,8 @@ def inbound_from(raw: bytes) -> str:
         if str(value).strip().lower() in ("bulk", "list", "junk", "auto_reply", "auto-reply"):
             raise EffectRefused(R_FROM)
     return_paths = msg.get_all("Return-Path") or []
-    if len(return_paths) > 1:
+    if len(return_paths) != 1 or not _return_path_ok(return_paths[0]):     # absent is refused: no envelope sender
         raise EffectRefused(R_FROM)
-    for value in return_paths:                          # parsed, not compared: `<> (bounce)` is a null path too
-        rp = getaddresses([str(value)])
-        if len(rp) != 1 or _MAILBOX.fullmatch(rp[0][1].strip()) is None:
-            raise EffectRefused(R_FROM)
     if str(msg.get_content_type()).lower() == "multipart/report":
         raise EffectRefused(R_FROM)
     return sender
@@ -261,24 +317,24 @@ def ack_text_refusal(text: Any) -> str | None:
     makes an address, link, markup or amount, no dotted domain, no word of the refused list (dates and times, prices,
     commitments, attachments, links) and no refused phrase; no contraction in ``'ll`` or ``'d``."""
     if type(text) is not str or not text.strip() or len(text) > _ACK_CHARS_MAX:
-        return "the draft is not one short text"
+        return R_TEXT_SHAPE
     if _ACK_ALLOWED.fullmatch(text) is None:
-        return "the draft holds a character outside printable ASCII"
+        return R_TEXT_CHARS
     if len(text.split()) >= ACK_WORDS_MAX:
-        return f"the draft is not under {ACK_WORDS_MAX} words"
+        return R_TEXT_WORDS
     if any(c.isdigit() for c in text):
-        return "the draft holds a digit (a date, time, price or number)"
+        return R_TEXT_DIGIT
     if any(c in _SYMBOLS for c in text):
-        return "the draft holds a symbol that makes a link, address, markup or amount"
+        return R_TEXT_SYMBOL
     if _DOTTED.search(text):
-        return "the draft holds a dotted name (a link or address)"
+        return R_TEXT_DOTTED
     lowered = text.lower()
     for token in _WORD.findall(lowered):
         if token in _REFUSED_WORDS or token.endswith(("'ll", "'d")):
-            return "the draft holds a date, time, price, commitment, attachment or link word"
+            return R_TEXT_WORD
     squashed = " ".join(lowered.split())
     if any(p in squashed for p in _REFUSED_PHRASES):
-        return "the draft holds a commitment phrase"
+        return R_TEXT_PHRASE
     return None
 
 
@@ -334,9 +390,9 @@ class Effects:
                                                                          expect_sha256):
                 raise EffectRefused(R_VERSION)
             lines = [ln for ln in order["effect_lines"] if ln["verb"] == verb]
-        except EffectRefused:
-            raise
-        except Exception:                                   # noqa: BLE001 - any fault reading the log is "no order"
+        except Exception as exc:                            # noqa: BLE001 - any fault reading the log is "no order"
+            if _trusted(exc):                               # ours; a clock's own EffectRefused is a fault like any
+                raise
             raise EffectRefused(R_ORDER) from None
         if not lines:
             raise EffectRefused(R_LINE)
@@ -371,9 +427,9 @@ class Effects:
         self._still(order_id, "restart_service", sha, order)
         try:
             code = self.runner(argv)
-        except EffectRefused:
-            raise
-        except Exception:                                   # noqa: BLE001 - the runner's fault never carries text out
+        except Exception as exc:                            # noqa: BLE001 - the runner's fault never carries text out
+            if _trusted(exc):                               # e.g. subprocess_runner's own R_ARGS
+                raise
             return EffectResult("restart_service", False, f"restart_service {host} {service}: {R_FAILED}")
         ok = type(code) is int and code == 0
         return EffectResult("restart_service", ok, f"restart_service {host} {service}: "
@@ -389,15 +445,18 @@ class Effects:
         order, lines = self.gate(order_id, "send_ack", expect_sha256=sha)
         if self.events is None or self.raw_source is None or self.drafter is None or self.transport is None:
             raise EffectRefused(R_NOT_WIRED)
-        sender = getattr(self.transport, "sender", None)
+        try:
+            sender = getattr(self.transport, "sender", None)
+        except Exception:                                   # noqa: BLE001 - a faulting property says nothing either
+            sender = None
         if type(sender) is not str or _SENDER.fullmatch(sender) is None:
             raise EffectRefused(R_NOT_WIRED)                # the transport speaks only as thirdmind@
         try:
             recipient, voice = self._recipient(event_id, lines)
             draft = self.drafter(event_id)
-        except EffectRefused:
-            raise
-        except Exception:                                   # noqa: BLE001 - an executor's fault never carries text out
+        except Exception as exc:                            # noqa: BLE001 - an executor's fault never carries text out
+            if _trusted(exc):                               # only this module's own fixed refusals pass through
+                raise
             raise EffectRefused(R_FAILED) from None
         why = ack_text_refusal(draft)
         if why is not None:
