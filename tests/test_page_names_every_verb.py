@@ -25,7 +25,10 @@ WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 # test_every_file_under_web_is_a_known_page_type instead of being skipped by the walk.
 PAGE_SUFFIXES = {".js", ".html", ".css"}
 
-NOT_A_PAGE_VERB: dict[str, str] = {}
+NOT_A_PAGE_VERB: dict[str, str] = {
+    "intention_set_disposition": "the List page has no someday/agenda move control; it dates and un-dates a row through "
+                                 "intention_surface_at (the 'when?' form and its 'someday' button) and un-parks through intention_update",
+}
 
 
 def _page_text(root: Path = WEB) -> str:
