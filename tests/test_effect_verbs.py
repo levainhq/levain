@@ -535,6 +535,22 @@ def test_the_lexical_check_passes_a_short_plain_ack_and_counts_words():
     assert fx.ack_text_refusal(GOOD_DRAFT) is None
     assert fx.ack_text_refusal("Thanks " * 58 + "Bye") is None                 # 59 words
     assert fx.ack_text_refusal("word " * 59) is None and fx.ack_text_refusal("word " * 60) is not None
+    assert fx.ack_text_refusal("\n".join(["Thanks"] * fx._ACK_LINES_MAX)) is None     # the most lines it allows
+
+
+def test_newline_padding_that_would_push_the_disclosure_out_of_view_refuses(world):
+    padded = "Thanks" + "\n" * 550 + "ok"                    # under the character cap; one word per line
+    assert len(padded) <= fx._ACK_CHARS_MAX
+    assert fx.ack_text_refusal(padded) == fx.R_TEXT_LINES
+    for text in ("Thanks\n\nok", "Thanks\n \nok", "Thanks\n   \n   \nok",
+                 "\n".join(["Thanks"] * (fx._ACK_LINES_MAX + 1))):
+        assert fx.ack_text_refusal(text) == fx.R_TEXT_LINES, repr(text)
+    assert fx.R_TEXT_LINES in fx.REFUSALS
+    g = signed(world)
+    rig = Rig(world, draft=padded)
+    with pytest.raises(fx.EffectRefused) as exc:
+        rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_TEXT_LINES and not rig.sent
 
 
 def test_the_draft_is_fetched_only_after_every_gate_and_never_from_the_event(world):

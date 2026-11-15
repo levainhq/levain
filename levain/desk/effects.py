@@ -83,6 +83,9 @@ _SENDER = re.compile(ACK_FROM_LOCAL + r"@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?
 ACK_SUBJECT = "Your message arrived"
 ACK_WORDS_MAX = 60                      # "under 60 words" (O9): at most 59
 _ACK_CHARS_MAX = 600
+#: the most lines a draft may span, with no blank line: newlines that pad a draft would push the disclosure line the
+#: send tool appends below it out of the reader's view
+_ACK_LINES_MAX = 3
 #: the fixed disclosure line the send tool appends for each VOICE (ND-4); the drafter names a voice, never the wording
 DISCLOSURES: Mapping[str, str] = MappingProxyType({
     "stand_in": "This acknowledgement was written automatically on his behalf by an AI assistant. He has been alerted "
@@ -109,6 +112,7 @@ R_FAILED = "the effect did not complete"
 # the lexical check's fixed reasons (:func:`ack_text_refusal`)
 R_TEXT_SHAPE = "the draft is not one short text"
 R_TEXT_CHARS = "the draft holds a character outside printable ASCII"
+R_TEXT_LINES = f"the draft holds a blank line or spans more than {_ACK_LINES_MAX} lines"
 R_TEXT_WORDS = f"the draft is not under {ACK_WORDS_MAX} words"
 R_TEXT_DIGIT = "the draft holds a digit (a date, time, price or number)"
 R_TEXT_SYMBOL = "the draft holds a symbol that makes a link, address, markup or amount"
@@ -117,7 +121,7 @@ R_TEXT_WORD = "the draft holds a date, time, price, commitment, attachment or li
 R_TEXT_PHRASE = "the draft holds a commitment phrase"
 #: every sentence this module refuses with, and the only text a refusal may carry out (:func:`refusal_text`)
 REFUSALS = frozenset({R_ARGS, R_ORDER, R_LINE, R_VERSION, R_NOT_WIRED, R_EVENT, R_FROM, R_DRAFT, R_VOICE, R_DISCLOSURE, R_FAILED,
-                      R_TEXT_SHAPE, R_TEXT_CHARS, R_TEXT_WORDS, R_TEXT_DIGIT, R_TEXT_SYMBOL, R_TEXT_DOTTED,
+                      R_TEXT_SHAPE, R_TEXT_CHARS, R_TEXT_LINES, R_TEXT_WORDS, R_TEXT_DIGIT, R_TEXT_SYMBOL, R_TEXT_DOTTED,
                       R_TEXT_WORD, R_TEXT_PHRASE})
 
 
@@ -359,13 +363,17 @@ _SYMBOLS = frozenset("@<>$%/\\#[]{}|`^~*_=+&")
 
 def ack_text_refusal(text: Any) -> str | None:
     """Why a drafted ack may not be sent, as a fixed sentence, or None when it passes the lexical check: text only; 1
-    to 59 words; printable ASCII and newlines only; no digit (dates, times, prices, phone numbers), no symbol that
+    to 59 words; printable ASCII and newlines only; at most :data:`_ACK_LINES_MAX` lines and no blank line (padding
+    must not push the appended disclosure line out of view); no digit (dates, times, prices, phone numbers), no symbol that
     makes an address, link, markup or amount, no dotted domain, no word of the refused list (dates and times, prices,
     commitments, attachments, links) and no refused phrase; no contraction in ``'ll`` or ``'d``."""
     if type(text) is not str or not text.strip() or len(text) > _ACK_CHARS_MAX:
         return R_TEXT_SHAPE
     if _ACK_ALLOWED.fullmatch(text) is None:
         return R_TEXT_CHARS
+    lines = text.strip().split("\n")
+    if "\n\n" in text or len(lines) > _ACK_LINES_MAX or any(not line.strip() for line in lines):
+        return R_TEXT_LINES
     if len(text.split()) >= ACK_WORDS_MAX:
         return R_TEXT_WORDS
     if any(c.isdigit() for c in text):

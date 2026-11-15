@@ -1156,18 +1156,30 @@ def room_argv(*, mcp_config: str | os.PathLike[str], settings: str | os.PathLike
     return argv
 
 
-#: ND-4: the sealed reader and drafter have NO tool at all, removed by launch configuration and not by a prompt. Every
-#: built-in the vendor is known to ship is also named in ``--disallowedTools``, so a tool that the empty ``--tools``
-#: list somehow left would still be denied; the allowed set is empty by construction.
+#: ND-4: the sealed reader and drafter have NO tool at all, removed by launch configuration and not by a prompt. The
+#: load-bearing mechanism is the EMPTY ``--tools`` value (no built-in is available at all) with ``--strict-mcp-config``
+#: and an MCP config of no server. ``SEALED_DENIED_TOOLS`` is belt only: a list of built-in names also handed to
+#: ``--disallowedTools``. It is NOT a complete list of what the vendor ships (new built-ins appear between releases), so
+#: nothing may rely on it being complete.
 SEALED_TOOLS: tuple[str, ...] = ()
-SEALED_DENIED_TOOLS = ("Bash", "BashOutput", "KillShell", "Edit", "MultiEdit", "Write", "NotebookEdit", "NotebookRead",
-                       "Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "Task", "Agent", "TodoWrite",
-                       "ExitPlanMode", "SlashCommand", "Skill")
+SEALED_DENIED_TOOLS = ("Bash", "BashOutput", "KillShell", "KillBash", "Edit", "MultiEdit", "Write", "NotebookEdit",
+                       "NotebookRead", "Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "Task", "TaskOutput",
+                       "TaskStop", "Agent", "TodoWrite", "ExitPlanMode", "SlashCommand", "Skill", "ToolSearch")
 #: an MCP config with no server, handed inline with ``--strict-mcp-config``: no server of the operator's own can load
 SEALED_MCP_CONFIG = '{"mcpServers": {}}'
 
 
 def _sealed_argv(claude_bin: str, model: str | None) -> list[str]:
+    """The argv both sealed roles share. Hermetic by flags, unlike :func:`room_argv` (which keeps the USER chain):
+
+    * ``--setting-sources ""`` loads NO settings file (user, project or local), so none of the operator's hooks, user
+      plugins, agents or permission rules reach a model that reads attacker text. A SessionStart hook would otherwise
+      put the operator's private state into that model's context, and ``untrusted_text`` would carry it out.
+    * ``--safe-mode`` also turns off CLAUDE.md discovery, auto-memory, skills, installed plugins and custom agents.
+      ``--bare`` is not used: it reads no OAuth or keychain credential, and the operator's auth is OAuth.
+
+    The rest is the launcher's (not built in this commit): an empty cwd, a scrubbed environment and the unwrap of the
+    ``--output-format json`` envelope, listed in :mod:`levain.desk.sealed`'s docstring as THE LAUNCHER MUST."""
     if not isinstance(claude_bin, str) or not claude_bin:
         raise ValueError("claude_bin must be a non-empty string")
     argv = [claude_bin, "-p", "--output-format", "json"]
@@ -1176,22 +1188,23 @@ def _sealed_argv(claude_bin: str, model: str | None) -> list[str]:
     return argv + ["--tools", ",".join(SEALED_TOOLS),
                    "--disallowedTools", ",".join(SEALED_DENIED_TOOLS),
                    "--strict-mcp-config", "--mcp-config", SEALED_MCP_CONFIG,
-                   "--setting-sources", "user",
+                   "--setting-sources", "", "--safe-mode",
                    "--disable-slash-commands", "--no-session-persistence",
                    "--permission-mode", "dontAsk"]
 
 
 def sealed_reader_argv(*, model: str | None = None, claude_bin: str = "claude") -> list[str]:
-    """The sealed reader's argv (ND-4): NO tool, not even a read of its ``body_ref``. The launcher reads the body
-    itself (:meth:`levain.desk.sealed.BodyStore.read_raw`) and passes it as the prompt, on stdin, so the model holds no
-    tool that could be pointed at another file or host. The body is never in the argv (an argv is visible to every
-    process of the uid)."""
+    """The sealed reader's argv (ND-4): NO tool, not even a read of its ``body_ref``. The launcher (not built in this
+    commit) reads the body itself (:meth:`levain.desk.sealed.BodyStore.read_raw`) and passes it as the prompt, on
+    stdin, so the model holds no tool that could be pointed at another file or host. The body is never in the argv (an
+    argv is visible to every process of the uid)."""
     return _sealed_argv(claude_bin, model)
 
 
 def sealed_drafter_argv(*, model: str | None = None, claude_bin: str = "claude") -> list[str]:
-    """The sealed drafter's argv (ND-4): NO tool. Its input is one message by the launcher on stdin; its output is one
-    short text and a voice, parsed by :func:`levain.desk.sealed.parse_drafter_output`."""
+    """The sealed drafter's argv (ND-4): NO tool. Its input is one message, given on stdin by the launcher (not built
+    in this commit); its output is one short text and a voice, parsed by
+    :func:`levain.desk.sealed.parse_drafter_output`."""
     return _sealed_argv(claude_bin, model)
 
 

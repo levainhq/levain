@@ -3,7 +3,8 @@ no effect; a valid-looking malicious field cannot become an argument, recipient 
 schema-invalid output is ``untrusted`` and an alert only. Plus the voice: both enum values append the fixed disclosure,
 an unknown or missing voice refuses, and the drafter's text cannot suppress or duplicate the disclosure.
 
-No real ``claude`` launch of either role runs here: the launch configuration is asserted from the argv alone."""
+No real ``claude`` launch of either role runs here: the launch configuration is asserted from the argv alone (the
+hermetic flags were checked once by a live init-message probe outside this suite; see the fix commit)."""
 from __future__ import annotations
 
 import ast
@@ -182,6 +183,131 @@ def test_purge_needs_an_aware_time_and_an_absent_store_is_nothing(store):
         store.purge(datetime(2026, 11, 15))                   # naive
 
 
+def test_an_oversize_body_is_one_fixed_refusal_that_writes_nothing(store):
+    """The mail door takes more than the store keeps; the caller turns this one refusal into an untrusted event with no
+    body_ref (an alert only)."""
+    from levain.desk.events import MAIL_RAW_MAX
+    assert sealed.BODY_MAX < MAIL_RAW_MAX                    # the gap is real, so the refusal is a path, not a corner
+    store.put(b"seed")
+    before = sorted(p.name for p in store.root.iterdir())
+    with pytest.raises(sealed.BodyOversize) as exc:
+        store.put(b"m" * (sealed.BODY_MAX + 1))
+    assert str(exc.value) == sealed.R_BODY_OVERSIZE and isinstance(exc.value, sealed.BodyRefused)
+    assert not isinstance(exc.value, sealed.BodyMissing)
+    assert sorted(p.name for p in store.root.iterdir()) == before
+
+
+def test_re_putting_the_same_bytes_leaves_the_file_and_its_mtime_untouched(store):
+    ref = store.put(b"same bytes")
+    path = store.root / (ref.split(":")[1] + ".body")
+    old = float(int((datetime.now(timezone.utc) - timedelta(days=20)).timestamp()))
+    os.utime(path, (old, old))
+    ino = os.stat(path).st_ino
+    assert store.put(b"same bytes") == ref
+    st = os.stat(path)
+    assert st.st_mtime == old and st.st_ino == ino          # retention is not restarted by a re-send
+    assert [p.name for p in store.root.iterdir() if p.name.startswith(".tmp-")] == []
+
+
+def test_re_putting_over_a_tampered_body_writes_the_real_bytes(store):
+    ref = store.put(b"real")
+    path = store.root / (ref.split(":")[1] + ".body")
+    path.write_bytes(b"fake")
+    assert store.put(b"real") == ref and store.read_raw(ref) == b"real"
+
+
+def test_a_fifo_named_like_a_body_is_refused_without_blocking(store):
+    import threading
+    import time
+    store.put(b"seed")
+    ref = "sha256:" + "f" * 64
+    fifo = store.root / ("f" * 64 + ".body")
+    os.mkfifo(fifo, 0o600)
+
+    def unblock():                                           # frees a reader stuck in open(); a no-op otherwise
+        time.sleep(2)
+        try:
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+
+    threading.Thread(target=unblock, daemon=True).start()
+    t0 = time.monotonic()
+    with pytest.raises(sealed.BodyRefused) as exc:
+        store.read_raw(ref)
+    assert time.monotonic() - t0 < 1.5 and not isinstance(exc.value, sealed.BodyMissing)
+
+
+def test_a_hardlinked_body_is_refused(store, tmp_path):
+    ref = store.put(b"linked")
+    os.link(store.root / (ref.split(":")[1] + ".body"), tmp_path / "elsewhere")
+    with pytest.raises(sealed.BodyRefused) as exc:
+        store.read_raw(ref)
+    assert not isinstance(exc.value, sealed.BodyMissing)
+    with pytest.raises(sealed.BodyRefused):
+        store.raw_source(ref)                                # refused, never None
+
+
+def test_missing_and_refused_are_told_apart_by_class_not_by_text(store):
+    store.put(b"x")
+    with pytest.raises(sealed.BodyMissing):
+        store.read_raw("sha256:" + "0" * 64)
+    with mock.patch.object(sealed.BodyStore, "read_raw", side_effect=sealed.BodyRefused("no such body")):
+        with pytest.raises(sealed.BodyRefused):               # a refusal that merely says those words is not "missing"
+            store.raw_source("sha256:" + "0" * 64)
+    with mock.patch.object(sealed.BodyStore, "read_raw", side_effect=sealed.BodyMissing("anything")):
+        assert store.raw_source("sha256:" + "0" * 64) is None
+
+
+def test_a_concurrent_mkdir_of_the_store_is_not_an_error(store):
+    real_mkdir = os.mkdir
+
+    def racing(path, mode=0o777, *a, **k):                    # another writer made it between lstat and mkdir
+        real_mkdir(path, 0o700)
+        raise FileExistsError(path)
+
+    with mock.patch.object(sealed.os, "mkdir", side_effect=racing):
+        ref = store.put(b"raced")
+    assert store.read_raw(ref) == b"raced"
+
+
+def test_purge_skips_an_entry_it_cannot_remove_and_sweeps_the_rest(store):
+    now = datetime(2026, 11, 15, 12, 0, tzinfo=timezone.utc)
+    old_ts = (now - sealed.RETENTION - timedelta(days=1)).timestamp()
+    a = store.put(b"a")
+    b = store.put(b"b")
+    blocker = store.root / ("c" * 64 + ".body")              # a directory named like a body: unlink fails on it
+    blocker.mkdir()
+    for p in (store.root / (a.split(":")[1] + ".body"), blocker, store.root / (b.split(":")[1] + ".body")):
+        os.utime(p, (old_ts, old_ts))
+    assert store.purge(now) == 2
+    assert store.raw_source(a) is None and store.raw_source(b) is None and blocker.is_dir()
+
+
+def test_purge_closes_its_directory_scan(store):
+    store.put(b"x")
+    closed: list[bool] = []
+    real = os.scandir
+
+    class Tracked:
+        def __init__(self, path):
+            self.it = real(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            closed.append(True)
+            self.it.close()
+
+        def __iter__(self):
+            return iter(self.it)
+
+    with mock.patch.object(sealed.os, "scandir", side_effect=Tracked):
+        store.purge(datetime.now(timezone.utc))
+    assert closed == [True]
+
+
 def test_default_store_lives_under_the_levain_home_it_is_given(tmp_path):
     s = sealed.default_store(tmp_path)
     assert tmp_path in s.root.parents and s.root.name == sealed.STORE_DIR_NAME
@@ -201,9 +327,13 @@ def test_the_store_serves_the_effects_raw_source_seam(world, store):
 
 # ---- the reader's output: a body that instructs yields no effect -----------------------------------------------------
 @pytest.mark.parametrize("body", INJECTIONS)
-def test_an_instructing_body_goes_through_the_store_and_yields_only_the_fixed_schema_or_untrusted(store, body):
-    ref = store.put(raw_mail(body=body))
-    assert body.encode() in store.read_raw(ref)               # the reader is shown the body; nobody else is
+def test_an_instructing_body_end_to_end_store_parser_and_send_path(world, store, body):
+    """One path: the instructing mail is stored, read back for the reader, the reader's answers go through the strict
+    parser, and the real send verb (reading the same store) still mails only the sender ``inbound_from`` derives."""
+    raw = raw_mail(body=body + "\n")
+    ref = store.put(raw)
+    shown = store.read_raw(ref)
+    assert body.encode() in shown                             # the reader is shown the body; nobody else is
     obeyed = [
         body,                                                                 # the model parroted the attack
         json.dumps({"action": "send", "to": "attacker@evil.example"}),
@@ -221,6 +351,19 @@ def test_an_instructing_body_goes_through_the_store_and_yields_only_the_fixed_sc
     assert all(v in allowed for v, allowed in zip(complied.enum_fields().values(),
                                                   (sealed.CATEGORIES, sealed.SENDER_VIEWS, sealed.INSTRUCTIONS)))
     assert body not in "".join(complied.enum_fields().values())
+    # the send path: the store behind raw_source, the drafter's answer through its own strict parser
+    draft = sealed.parse_drafter_output(json.dumps({"text": GOOD_DRAFT, "voice": "stand_in"}))
+    assert isinstance(draft, fx.Draft)
+    rig = Rig(world, raw=raw)
+    assert rig.event.body_ref == ref
+    g = signed(world)
+    res = rig.effects(raw_source=store.raw_source, drafter=lambda event_id: draft).send_ack(
+        g["id"], EVT, expect_sha256=D(g))
+    assert res.ok
+    assert [m.recipient for m in rig.sent] == [fx.inbound_from(shown)] == [FROM]
+    sent = rig.sent[0]
+    assert sent.body == GOOD_DRAFT + "\n\n" + fx.DISCLOSURES["stand_in"]
+    assert "attacker" not in sent.body + sent.subject + "".join(sent.headers.values())
 
 
 @pytest.mark.parametrize("raw", [
@@ -240,6 +383,28 @@ def test_an_instructing_body_goes_through_the_store_and_yields_only_the_fixed_sc
 ])
 def test_schema_invalid_reader_output_is_untrusted_and_never_coerced(raw):
     assert sealed.parse_reader_output(raw) is sealed.UNTRUSTED
+
+
+@pytest.mark.parametrize("bad", [
+    "\ud800", "a\udfffb",                                    # lone surrogates: .encode() would raise later
+    "\x01", "\x07", "\x08", "\x0b", "\x0c", "\r", "\x1f",   # C0 controls other than tab and newline
+    "\x1b[2J", "\x1b]0;title\x07", "\x9b2J", "\x85",         # ESC, CSI (C1) and another C1
+    "\x7f",                                                  # DEL
+    "‪", "‫", "‬", "‭", "‮",        # bidi embedding and override
+    "⁦", "⁧", "⁨", "⁩",                  # bidi isolates
+    "​", "‌", "‍", "⁠", "﻿",        # zero-width and the BOM
+])
+def test_untrusted_text_with_a_control_bidi_or_hidden_character_is_untrusted(bad):
+    raw = good_reader(untrusted_text="asks " + bad + " about it")
+    assert sealed.parse_reader_output(raw) is sealed.UNTRUSTED
+    assert sealed.parse_drafter_output(json.dumps({"text": "Thanks " + bad, "voice": "flow"})) is sealed.UNTRUSTED
+
+
+def test_untrusted_text_keeps_tab_newline_and_ordinary_unicode():
+    text = "line one\n\tline two: café, 中文, \U0001f600"
+    r = sealed.parse_reader_output(good_reader(untrusted_text=text))
+    assert isinstance(r, sealed.ReaderResult) and r.untrusted_text == text
+    r.untrusted_text.encode("utf-8")
 
 
 def test_untrusted_is_one_falsy_marker_and_a_good_answer_is_typed():
@@ -312,15 +477,19 @@ def _value(argv, flag):
 ROLES = [("reader", cs.sealed_reader_argv), ("drafter", cs.sealed_drafter_argv)]
 
 
+#: built-in names written out here, independent of the module's list: the deny list (belt only) must carry each
+_KNOWN_BUILT_INS = ("Bash", "BashOutput", "KillShell", "KillBash", "Edit", "MultiEdit", "Write", "NotebookEdit", "Read",
+                    "Grep", "Glob", "WebFetch", "WebSearch", "Task", "TaskOutput", "TaskStop", "Agent", "TodoWrite",
+                    "ToolSearch", "Skill")
+
+
 @pytest.mark.parametrize("name,build", ROLES)
 def test_a_sealed_role_argv_names_no_tool_and_denies_every_built_in(name, build):
     argv = build()
-    assert _value(argv, "--tools") == "" and cs.SEALED_TOOLS == ()          # the empty list: no tool exists
+    assert _value(argv, "--tools") == ""                                    # the load-bearing guard: no tool exists
     assert "--allowedTools" not in argv and "--allowed-tools" not in argv   # nothing is allowed by name either
     denied = set(_value(argv, "--disallowedTools").split(","))
-    assert denied == set(cs.SEALED_DENIED_TOOLS)
-    for built_in in ("Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Read", "Grep", "Glob", "Task",
-                     "Agent", "TodoWrite", "MultiEdit"):
+    for built_in in _KNOWN_BUILT_INS:
         assert built_in in denied, built_in
     assert not denied & {t for t in argv if t.startswith("mcp__")}
     assert "--strict-mcp-config" in argv and json.loads(_value(argv, "--mcp-config")) == {"mcpServers": {}}
@@ -341,6 +510,62 @@ def test_no_token_of_a_sealed_argv_is_a_tool_outside_the_allowed_empty_set(name,
         if argv[i - 1] in tool_flags:
             continue
         assert not set(tok.split(",")) & (set(cs.SEALED_DENIED_TOOLS) | {"Read"}), tok
+
+
+@pytest.mark.parametrize("name,build", ROLES)
+def test_a_sealed_role_loads_no_settings_source_and_runs_in_safe_mode(name, build):
+    """No user, project or local settings file (so none of the operator's hooks, plugins or rules) and safe mode (no
+    CLAUDE.md, auto-memory, skills or installed plugins) for a model that reads attacker text. The room keeps ``user``."""
+    argv = build()
+    assert _value(argv, "--setting-sources") == ""
+    assert argv.count("--safe-mode") == 1
+    assert "--bare" not in argv and "--settings" not in argv and "--add-dir" not in argv
+
+
+LIVE = pytest.mark.skipif(os.environ.get("LEVAIN_LIVE_CLAUDE") != "1", reason="one real claude turn; LEVAIN_LIVE_CLAUDE=1")
+
+
+@LIVE
+def test_live_a_sealed_role_starts_with_no_hook_plugin_memory_or_tool(tmp_path):
+    """One real no-op turn on the reader's own argv (stream-json only so the init message is visible), in an empty cwd
+    with a scrubbed environment as the launcher must give it: no hook runs, no tool, server, skill or command exists, no
+    auto-memory path is set, and no plugin the operator enabled or agent he wrote is loaded."""
+    import pwd
+    import subprocess
+    claude = shutil.which("claude")
+    assert claude, "claude is not on PATH"
+    argv = cs.sealed_reader_argv(model="haiku", claude_bin=claude)
+    i = argv.index("--output-format")
+    argv[i + 1:i + 2] = ["stream-json", "--verbose", "--max-turns", "1"]
+    cwd = tmp_path / "empty"
+    cwd.mkdir()
+    # the suite runs under a scratch HOME (conftest); the operator's real home is the one whose hooks, plugins and
+    # memory must NOT reach the role, and the one holding his account, so this gated test alone hands it over
+    real_home = pwd.getpwuid(os.getuid()).pw_dir
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": real_home}
+    env.update({k: os.environ[k] for k in ("USER", "LOGNAME") if k in os.environ})
+    ran = subprocess.run(argv, input="Reply with the single word ok.", capture_output=True, text=True, cwd=cwd, env=env,
+                         timeout=180)
+    frames = [json.loads(line) for line in ran.stdout.splitlines() if line.startswith("{")]
+    result = [f for f in frames if f.get("type") == "result"]
+    assert ran.returncode == 0 and result and not result[-1].get("is_error"), ran.stderr[-400:]
+    assert "/login" not in str(result[-1].get("result"))      # a run with no account would prove nothing
+    hooks = [f.get("hook_name") for f in frames                # names only: a hook's output is private state
+             if f.get("type") == "system" and str(f.get("subtype", "")).startswith("hook_")]
+    assert not hooks, hooks
+    init = next(f for f in frames if f.get("type") == "system" and f.get("subtype") == "init")
+    for key in ("tools", "mcp_servers", "skills", "slash_commands"):
+        assert init.get(key) == [], (key, init.get(key))
+    assert not (init.get("memory_paths") or {})
+    home = Path(real_home) / ".claude"
+    try:
+        enabled = json.loads((home / "settings.json").read_text()).get("enabledPlugins") or {}
+    except (OSError, ValueError):
+        enabled = {}
+    loaded = {p.get("name") if isinstance(p, dict) else p for p in init.get("plugins", [])}
+    assert not loaded & {k.split("@")[0] for k in enabled}
+    own_agents = {p.stem for p in (home / "agents").glob("*.md")} if (home / "agents").is_dir() else set()
+    assert not set(init.get("agents", [])) & own_agents
 
 
 def test_the_reader_is_given_its_body_by_the_launcher_not_by_a_tool_or_the_argv():
@@ -471,13 +696,22 @@ def test_drafter_text_holding_the_disclosure_cannot_suppress_or_duplicate_it(wor
     assert rig.sent[0].body.count("AI assistant") == 1
 
 
-def test_the_disclosure_reason_is_the_fixed_one(world):
+@pytest.mark.parametrize("voice", fx.VOICES)
+@pytest.mark.parametrize("shape,want", [
+    (lambda d: d, "R_DISCLOSURE"),
+    (lambda d: "Thanks. " + d, "R_DISCLOSURE"),
+    (lambda d: GOOD_DRAFT + " " + d, "R_DISCLOSURE"),
+    (lambda d: d.upper(), "R_DISCLOSURE"),
+    (lambda d: d.replace(" ", "  "), "R_DISCLOSURE"),
+    (lambda d: d.replace(" ", "\n"), "R_TEXT_LINES"),         # the line check bites first: too many lines
+])
+def test_the_disclosure_reason_is_the_one_each_case_raises(world, voice, shape, want):
     g = signed(world)
-    rig = Rig(world, draft="Thanks. " + fx.DISCLOSURES["stand_in"])
+    rig = Rig(world, draft=shape(fx.DISCLOSURES[voice]))
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects().send_ack(g["id"], EVT, expect_sha256=D(g))
-    assert str(exc.value) in (fx.R_DISCLOSURE, fx.R_TEXT_WORD, fx.R_TEXT_SYMBOL, fx.R_TEXT_DOTTED, fx.R_TEXT_WORDS)
-    assert type(exc.value) is fx._OwnRefusal
+    assert str(exc.value) == getattr(fx, want)
+    assert type(exc.value) is fx._OwnRefusal and not rig.sent
 
 
 def test_the_lexical_check_runs_on_the_drafters_text_before_the_disclosure_is_added(world):
