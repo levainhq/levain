@@ -1,10 +1,10 @@
 """TEST ONLY: a DENY on the operator's REAL key (nothing enumerates what is allowed: scratch keys, tmp ``-f``, scratch agents pass).
 Installed at import (collection is covered). Every Popen (``run``, ``os.popen``), ``os.posix_spawn*``/``spawn*``/``exec*``/``system``
-is judged before anything starts. MODE (env ``LEVAIN_KEYGUARD``): ``warn`` (the DEFAULT) records a denied spawn, with the test name
+is judged before anything starts. MODE (env ``LEVAIN_KEYGUARD``): ``enforce`` (the DEFAULT) and ``warn`` are the two modes; ``warn`` records a denied spawn, with the test name
 and argv, in a session report printed between ``KEYGUARD REPORT BEGIN``/``END`` in pytest's terminal summary (and written to the
-file named by ``LEVAIN_KEYGUARD_REPORT``, when set) and lets the spawn run; ``enforce`` raises ``RealKeyReached`` before anything
-starts, records it, and fails the test at teardown. Warn-only stays ON until CI shows an empty report, then ``_DEFAULT_MODE``
-flips to ``enforce`` in that one line; local tests stay held while it is warn-only because warn does not stop a signing call.
+file named by ``LEVAIN_KEYGUARD_REPORT``, when set) and lets the spawn run (it does not stop a signing call); ``enforce`` raises ``RealKeyReached`` before anything
+starts, records it, and fails the test at teardown. ``_DEFAULT_MODE`` was flipped from warn after CI showed an empty report; it
+is the one line that sets the default.
 Shell text is re-tokenised with shlex ONLY for ``shell=True``, a shell executable (sh|bash|zsh|dash|ksh|ash, any case) with ``-c`` and
 its script, or ``eval``; a structured argv element is never shell-parsed, and a parse error in text that IS shell-parsed fails
 OPEN (allowed). The key check: an argv token that, resolved (``~`` as the PASSWD home, ``$HOME`` as the judged child's own HOME,
@@ -44,7 +44,7 @@ import pytest
 
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 _POPEN_POS = ("bufsize", "executable", "stdin", "stdout", "stderr", "preexec_fn", "close_fds", "shell", "cwd", "env")
-_DEFAULT_MODE = "warn"                                        # flip to "enforce" once CI shows an empty report
+_DEFAULT_MODE = "enforce"                                    # CI (run 43668900872) showed an empty report: refusals now raise
 _ENV_NAMES = ("SSH_AUTH_SOCK", "SSH_SK_PROVIDER")
 _PROVIDER_FLAG = re.compile(r"-[A-Za-z]*[KwD]")             # ssh-keygen -K / -w / -D, clustered (-qK) or attached (-D/lib)
 
