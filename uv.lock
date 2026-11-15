@@ -210,11 +210,11 @@ wheels = [
 
 [[package]]
 name = "anneal-memory"
-version = "2.0.0"
+version = "2.0.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/74/fd/2418165abbecb06bd7eabe7511eb97e292dfc34894b5bfe9172feb36b174/anneal_memory-2.0.0.tar.gz", hash = "sha256:f7009c4b488cde60bad580f30cd52845dbf0d59d026e24a0774f891962d9e523", size = 1897345, upload-time = "2026-11-12T19:27:08.009Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c4/6f/b1cce36e95f875cded9120726045ef09b95afc9b3904d5ac4af988cdb4b0/anneal_memory-2.0.1.tar.gz", hash = "sha256:93cb94f4cd65c6910c75cf10038453765ab01db28486350fdbc7fdd1392fdad1", size = 1899215, upload-time = "2026-11-15T15:42:50.039Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/20/86/43eab8598ac744554732d83f0b4cb7ff70636df2c98a4162f7f163c20bd1/anneal_memory-2.0.0-py3-none-any.whl", hash = "sha256:5520717162cb77de91617e51b8deb1a7763ab18ec2ed4dd0f0fb59174b5ef1b5", size = 799539, upload-time = "2026-11-12T19:27:06.223Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/50/8efe1636ed6b379e5c596632aae81f8a2c5d387bd8a966c9812774e899a5/anneal_memory-2.0.1-py3-none-any.whl", hash = "sha256:e0c051b8b83b15fc405901622c4fe0506b9ece69e59034bdfdaf07b43acf502f", size = 799896, upload-time = "2026-11-15T15:42:48.118Z" },
 ]
 
 [[package]]
@@ -1914,7 +1914,7 @@ build = [
 [package.metadata]
 requires-dist = [
     { name = "agent-client-protocol", marker = "extra == 'openhands'", specifier = "<1" },
-    { name = "anneal-memory", specifier = ">=2.0.0,<2.1" },
+    { name = "anneal-memory", specifier = ">=2.0.1,<2.1" },
     { name = "cryptography", specifier = ">=48" },
     { name = "h11", marker = "extra == 'dev'", specifier = ">=0.16.0" },
     { name = "h11", marker = "extra == 'isolation'", specifier = ">=0.16.0" },
