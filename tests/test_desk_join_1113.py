@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
 
@@ -281,6 +282,9 @@ def test_it_arrived_settles_the_line_and_nothing_is_sent(tmp_path, qdir):  # noq
 
 # --- a busy poll is a retry --------------------------------------------------------------------------------------------------
 
+HOG = "hog1"
+
+
 class Hogged(ScriptedDeskPort):
     """The desk's two poll slots are taken by someone else (a second device, a slow host command): the page's first poll answers,
     and the lease calls after it (the two hogs below) hang for a few seconds. The page's next poll is then the server's real 503.
@@ -295,11 +299,26 @@ class Hogged(ScriptedDeskPort):
         self._lock = threading.Lock()
 
     def _hog(self):
-        req = urllib.request.Request(self.base + "/cockpit/desk.json", headers={"X-Levain-Write-Token": TOKEN})
-        try:
-            urllib.request.urlopen(req, timeout=20).read()  # noqa: S310 - loopback
-        except OSError:
-            pass
+        # The hog names itself by asking for the thread HOG, and only that read hangs (in ``events``). It used to be the 2nd and 3rd
+        # ``lease`` call, which the page's own next poll (the drive nudges it every 300 ms) could take instead: that poll hung in the port
+        # and answered 200 late, the page (one poll at a time) never saw a 503, and the test timed out in about half the runs.
+        # A hog the page's poll beat to a slot is answered 503 and asks again, so both slots end up held.
+        req = urllib.request.Request(self.base + "/cockpit/desk.json?thread=" + HOG, headers={"X-Levain-Write-Token": TOKEN})
+        for _ in range(100):
+            try:
+                urllib.request.urlopen(req, timeout=20).read()  # noqa: S310 - loopback
+                return
+            except urllib.error.HTTPError as exc:
+                if exc.code != 503:
+                    return
+                time.sleep(0.02)
+            except OSError:
+                return
+
+    def events(self, thread_id, after=None):
+        if thread_id == HOG:
+            time.sleep(4)
+        return super().events(thread_id, after)
 
     def lease(self):
         with self._lock:
@@ -309,8 +328,6 @@ class Hogged(ScriptedDeskPort):
             self.hogs = [threading.Thread(target=self._hog, daemon=True) for _ in range(2)]
             for t in self.hogs:
                 t.start()
-        elif n in (2, 3):
-            time.sleep(4)
         return super().lease()
 
 
