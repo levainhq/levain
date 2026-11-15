@@ -2,9 +2,12 @@
 2.0, one message per line, stdlib only), the shape of :mod:`levain.seat_gh_mcp`: it runs outside the seat's sandbox and
 is the only path to :mod:`levain.desk.effects`. Two tools and no others, with FIXED schemas:
 
-* ``restart_service``: ``order_id``, ``host`` (enum), ``service`` (enum).
-* ``send_ack``: ``order_id``, ``event_id``. There is no recipient and no text field: the recipient is derived inside the
-  verb and the text comes from the sealed drafter inside it.
+* ``restart_service``: ``order_id``, ``order_sha256``, ``host`` (enum), ``service`` (enum).
+* ``send_ack``: ``order_id``, ``order_sha256``, ``event_id``. There is no recipient and no text field: the recipient is
+  derived inside the verb and the text comes from the sealed drafter inside it.
+
+``order_sha256`` is the digest the desk brief prints beside each order: a call binds the version the desk read, so an
+order revoked and signed again differently under the same id refuses rather than answering.
 
 A refusal is a fixed sentence returned as a tool error. Any argument outside its shape or enum, a missing or an extra
 one, is refused by :mod:`levain.desk.effects` before the order is even read. ``main`` wires NO executor yet (the night
@@ -30,35 +33,41 @@ PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR =
 MAX_FRAME = 1_000_000
 
 _ORDER_ID = {"type": "string", "pattern": "^so-[0-9a-f]{12}$", "description": "The standing order's id."}
+_ORDER_SHA = {"type": "string", "pattern": "^[0-9a-f]{64}$",
+              "description": "The order's sha256, as the brief prints it beside the order: the version you read."}
 RESTART_SERVICE: dict[str, Any] = {
     "name": "restart_service",
     "description": ("Restart one allowed service on the monitored host under a standing order that allows it. Takes "
-                    "only the order id, the host and the service, each from its fixed list. Returns the exit code only."),
+                    "only the order id and its sha256, the host and the service, each from its fixed list. Returns "
+                    "the exit code only."),
     "inputSchema": {
         "type": "object",
-        "properties": {"order_id": _ORDER_ID,
+        "properties": {"order_id": _ORDER_ID, "order_sha256": _ORDER_SHA,
                        "host": {"type": "string", "enum": list(fx.HOSTS)},
                        "service": {"type": "string", "enum": list(fx.SERVICES)}},
-        "required": ["order_id", "host", "service"],
+        "required": ["order_id", "order_sha256", "host", "service"],
         "additionalProperties": False,
     },
 }
 SEND_ACK: dict[str, Any] = {
     "name": "send_ack",
     "description": ("Send the short acknowledgement for one authenticated mail event under a standing order that allows "
-                    "it. Takes only the order id and the event id: the recipient is the event's verified sender, "
-                    "derived in code, and the text is checked before it is sent."),
+                    "it. Takes only the order id and its sha256 and the event id: the recipient is the event's "
+                    "verified sender, derived in code, and the text is checked before it is sent."),
     "inputSchema": {
         "type": "object",
-        "properties": {"order_id": _ORDER_ID,
+        "properties": {"order_id": _ORDER_ID, "order_sha256": _ORDER_SHA,
                        "event_id": {"type": "string", "pattern": "^evt-[0-9a-f]{32}$"}},
-        "required": ["order_id", "event_id"],
+        "required": ["order_id", "order_sha256", "event_id"],
         "additionalProperties": False,
     },
 }
 TOOLS = [RESTART_SERVICE, SEND_ACK]
 TOOL_NAMES = frozenset(t["name"] for t in TOOLS)
-_PARAMS = {"restart_service": ("order_id", "host", "service"), "send_ack": ("order_id", "event_id")}
+#: tool argument -> the verb's parameter (every one passed by name; each is shape- or enum-checked in the verb)
+_PARAMS = {"restart_service": {"order_id": "order_id", "order_sha256": "expect_sha256", "host": "host",
+                               "service": "service"},
+           "send_ack": {"order_id": "order_id", "order_sha256": "expect_sha256", "event_id": "event_id"}}
 
 
 class _RpcError(Exception):
@@ -80,7 +89,7 @@ def _call(effects: fx.Effects, params: dict[str, Any]) -> dict[str, Any]:
         return _text(fx.R_ARGS, error=True)
     try:
         verb = getattr(effects, name)
-        result = verb(*(args[p] for p in _PARAMS[name]))
+        result = verb(**{param: args[arg] for arg, param in _PARAMS[name].items()})
     except fx.EffectRefused as exc:
         return _text(str(exc), error=True)
     except Exception:                                   # noqa: BLE001 - a fault never carries its text out
@@ -103,15 +112,14 @@ def handle(effects: fx.Effects, msg: Any) -> dict[str, Any] | None:
         if params is not None and not isinstance(params, dict):
             raise _RpcError(INVALID_PARAMS, "params must be an object")
         params = params or {}
-        if method == "initialize":
-            version = params.get("protocolVersion")
-            return _ok(rid, {"protocolVersion": version if isinstance(version, str) else _PROTOCOL,
+        if method == "initialize":                      # the one version this server speaks, whatever was asked
+            return _ok(rid, {"protocolVersion": _PROTOCOL,
                              "capabilities": {"tools": {}}, "serverInfo": {"name": SERVER_NAME, "version": "1"}})
         if method == "tools/list":
             return _ok(rid, {"tools": TOOLS})
         if method == "tools/call":
             return _ok(rid, _call(effects, params))
-        raise _RpcError(METHOD_NOT_FOUND, f"method not found: {method}")
+        raise _RpcError(METHOD_NOT_FOUND, "method not found")       # fixed: the caller's method is never echoed
     except _RpcError as exc:
         return _error(rid, exc.code, exc.message)
     except Exception as exc:  # noqa: BLE001 - the type only, no text

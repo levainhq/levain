@@ -3,22 +3,26 @@
 TRUST-BOUNDARY CODE. A standing order (:mod:`levain.desk.standing_orders`) says which effects the desk may use; this
 module is the ONLY place an effect runs, and it runs two verbs and no others:
 
-* ``restart_service(order_id, host, service)``: ``host`` is one of :data:`HOSTS` and ``service`` one of
-  :data:`SERVICES`. The command is a HARD-CODED argv (:func:`restart_argv`) built from those two enum members and run
+* ``restart_service(order_id, host, service, expect_sha256=...)``: ``host`` is one of :data:`HOSTS` and ``service``
+  one of :data:`SERVICES`. The command is a HARD-CODED argv (:func:`restart_argv`) built from those two enum members and run
   with ``shell=False`` (:func:`subprocess_runner`); the verb returns the exit code and never the server's output.
-* ``send_ack(order_id, event_id)``: the recipient is NEVER an argument. It is derived here, from the raw message the
-  event's ``body_ref`` digest names (:func:`inbound_from`), and must be an address the order's ``known_from`` lists.
+* ``send_ack(order_id, event_id, expect_sha256=...)``: the recipient is NEVER an argument. It is derived here, from
+  the raw message the event's ``body_ref`` digest names (:func:`inbound_from`), and must be an address the order's ``known_from`` lists.
   The sealed drafter's text (ND-4) is not an argument either: it is fetched inside the verb after every gate has
   passed, and a lexical check (:func:`ack_text_refusal`) runs inside the verb that holds the transport.
 
 NO VERB ACCEPTS FREE TEXT AS AN ARGUMENT. Every argument is an exact member of an enum (a ``str`` that IS in a closed
-tuple) or an id of a fixed shape (``so-`` and 12 hex; ``evt-`` and 32 hex); anything else is refused by a fixed
-sentence that never echoes the argument. Extra or missing arguments are refused.
+tuple) or an id of a fixed shape (``so-`` and 12 hex; ``evt-`` and 32 hex; a digest of 64 hex); anything else is
+refused by a fixed sentence that never echoes the argument. Extra or missing arguments are refused.
 
-EVERY CALL replays the authority log itself, at execution time (:meth:`Effects.gate`; the desk brief's quote is the
-desk's reading, never the verb's permission): the order must answer now (in the verified replay, signers active, not
-expired, not revoked or stopped, and its widening's base too) and carry an effect line whose enums cover this call. A
-log that cannot be read, or any fault, refuses. Refusals come before any event read, drafter call, send or process.
+EVERY CALL names the order's version too (``expect_sha256``, the whole-record digest the desk brief prints beside the
+order, required): a record revoked and signed again differently under the same id is refused. EVERY CALL replays the
+authority log itself, at execution time (:meth:`Effects.gate`; the desk brief's quote is the desk's reading, never the
+verb's permission): the order must answer now (in the verified replay, signers active, not expired, not revoked or
+stopped, and its widening's base too), be that version, and carry an effect line whose enums cover this call. A log
+that cannot be read, or any fault, refuses. Refusals come before any event read, drafter call, send or process; and
+the gate runs AGAIN immediately before the process or the send, which go ahead only if it finds the same record and
+the same incarnation as the first.
 
 NOT HERE (the next rows): the per-incident and per-night budgets, the arm record, ``NIGHT_ARMING_CLEARED`` and the
 ``effect_attempts`` journal are ND-3b; the night key and its forced-command list are ND-8 (:data:`FORCED_WORDS` names
@@ -176,14 +180,18 @@ def subprocess_runner(argv: Sequence[str]) -> int:
 
 # --- send_ack: the sender, derived by code, and the lexical check ----------------------------------------------------
 _AUTO_MARKERS = ("x-autoreply", "x-autorespond", "x-auto-response-suppress")   # Auto-Submitted is judged by value
+#: a Return-Path's one mailbox: a nonempty local part and a dotted domain, no space, quote or bracket (looser than
+#: :data:`_ADDR` on purpose: a bounce address may carry ``=``; this only tells a real path from a null one)
+_MAILBOX = re.compile(r"[^\s@\"<>()\[\],;]+@[^\s@\"<>()\[\],;.]+(?:\.[^\s@\"<>()\[\],;.]+)+")
 
 
 def inbound_from(raw: bytes) -> str:
     """The ONE address a reply may go to, derived from the raw message's headers: exactly one ``From`` header holding
     exactly one address of the strict shape (lowercased); a ``Reply-To``, if present, names that same one address; and
     no auto-reply or list marker (``Auto-Submitted`` other than ``no``, ``Precedence`` bulk/list/junk/auto_reply, any
-    ``List-*``, ``X-Autoreply``/``X-Autorespond``/``X-Auto-Response-Suppress``, a null ``Return-Path``, a
-    ``multipart/report``). Raises :class:`EffectRefused` (:data:`R_FROM`) otherwise."""
+    ``List-*``, ``X-Autoreply``/``X-Autorespond``/``X-Auto-Response-Suppress``, a ``Return-Path`` that is not exactly
+    one header parsing to exactly one nonempty mailbox (so a null path in any form), a ``multipart/report``).
+    Raises :class:`EffectRefused` (:data:`R_FROM`) otherwise."""
     if not isinstance(raw, (bytes, bytearray)):
         raise EffectRefused(R_FROM)
     msg = BytesHeaderParser().parsebytes(bytes(raw))
@@ -212,8 +220,13 @@ def inbound_from(raw: bytes) -> str:
     for value in msg.get_all("Precedence") or []:
         if str(value).strip().lower() in ("bulk", "list", "junk", "auto_reply", "auto-reply"):
             raise EffectRefused(R_FROM)
-    if any(str(v).strip() == "<>" for v in msg.get_all("Return-Path") or []):
+    return_paths = msg.get_all("Return-Path") or []
+    if len(return_paths) > 1:
         raise EffectRefused(R_FROM)
+    for value in return_paths:                          # parsed, not compared: `<> (bounce)` is a null path too
+        rp = getaddresses([str(value)])
+        if len(rp) != 1 or _MAILBOX.fullmatch(rp[0][1].strip()) is None:
+            raise EffectRefused(R_FROM)
     if str(msg.get_content_type()).lower() == "multipart/report":
         raise EffectRefused(R_FROM)
     return sender
@@ -302,11 +315,12 @@ class Effects:
     raw_source: Callable[[str], bytes | None] | None = None
     drafter: Callable[[str], str] | None = None
 
-    def gate(self, order_id: str, verb: str, *, expect_sha256: str | None = None) -> tuple[Mapping[str, Any], list[Any]]:
+    def gate(self, order_id: str, verb: str, *, expect_sha256: str) -> tuple[Mapping[str, Any], list[Any]]:
         """Replay the authority log NOW and return (the order, its effect lines for ``verb``). Refuses unless the
         order answers at this instant: in the verified replay, signers active, unexpired, not revoked, not stopped,
-        its widening's base too (:func:`levain.desk.standing_orders.orders_in_force`). ``expect_sha256``, when given,
-        must be that order's whole-record digest (the version asked for). Every fault refuses."""
+        its widening's base too (:func:`levain.desk.standing_orders.orders_in_force`), and its whole-record digest is
+        ``expect_sha256`` (the version the desk read in its brief; a different record under the same id is refused).
+        Every fault refuses."""
         try:
             now = self.clock()
             _require_aware(now)
@@ -316,7 +330,8 @@ class Effects:
             order = next((o for o in standing_orders.orders_in_force(state, now) if o["id"] == order_id), None)
             if order is None:
                 raise EffectRefused(R_ORDER)
-            if expect_sha256 is not None and standing_orders.order_sha256(order) != expect_sha256:
+            if type(expect_sha256) is not str or not hmac.compare_digest(standing_orders.order_sha256(order),
+                                                                         expect_sha256):
                 raise EffectRefused(R_VERSION)
             lines = [ln for ln in order["effect_lines"] if ln["verb"] == verb]
         except EffectRefused:
@@ -327,16 +342,33 @@ class Effects:
             raise EffectRefused(R_LINE)
         return order, lines
 
-    def restart_service(self, order_id: Any, host: Any, service: Any, *, expect_sha256: Any = None) -> EffectResult:
+    def _still(self, order_id: str, verb: str, sha: str, first: Mapping[str, Any]) -> None:
+        """The gate once more, immediately before the effect: the order must still answer, as the same record (the
+        same digest) and the same incarnation (not revoked and signed again under its id meanwhile) as the first
+        replay found. A second replay narrows the window to the dispatch itself; the reservation that closes it is
+        ND-3b's attempts journal."""
+        again, _lines = self.gate(order_id, verb, expect_sha256=sha)
+        try:
+            same = (standing_orders.order_sha256(again) == standing_orders.order_sha256(first)
+                    and again.get("incarnation") == first.get("incarnation"))
+        except Exception:                                   # noqa: BLE001 - a fault is "not the same order"
+            same = False
+        if not same:
+            raise EffectRefused(R_VERSION)
+
+    def restart_service(self, order_id: Any, host: Any, service: Any, *, expect_sha256: Any) -> EffectResult:
+        """Restart ``service`` on ``host`` under order ``order_id`` at version ``expect_sha256`` (the digest the
+        desk's brief prints beside the order)."""
         order_id = _shaped(order_id, _ORDER_ID)
         host, service = _enum(host, HOSTS), _enum(service, SERVICES)
-        sha = None if expect_sha256 is None else _shaped(expect_sha256, _SHA)
-        _order, lines = self.gate(order_id, "restart_service", expect_sha256=sha)
+        sha = _shaped(expect_sha256, _SHA)
+        order, lines = self.gate(order_id, "restart_service", expect_sha256=sha)
         if not any(host in ln["args"]["host"] and service in ln["args"]["service"] for ln in lines):
             raise EffectRefused(R_LINE)
         if self.runner is None:
             raise EffectRefused(R_NOT_WIRED)
         argv = restart_argv(host, service)
+        self._still(order_id, "restart_service", sha, order)
         try:
             code = self.runner(argv)
         except EffectRefused:
@@ -347,25 +379,33 @@ class Effects:
         return EffectResult("restart_service", ok, f"restart_service {host} {service}: "
                             + ("exit 0" if ok else R_FAILED))
 
-    def send_ack(self, order_id: Any, event_id: Any, *, expect_sha256: Any = None) -> EffectResult:
-        """Send the ack for ``event_id`` under order ``order_id``. The recipient is derived here (never an argument)
-        from the raw message the event's digest names, and must be on the order line's ``known_from``."""
+    def send_ack(self, order_id: Any, event_id: Any, *, expect_sha256: Any) -> EffectResult:
+        """Send the ack for ``event_id`` under order ``order_id`` at version ``expect_sha256``. The recipient is
+        derived here (never an argument) from the raw message the event's digest names, and must be on the order
+        line's ``known_from``. The order is replayed again after the slow part (event, message, drafter) and
+        immediately before the send."""
         order_id, event_id = _shaped(order_id, _ORDER_ID), _shaped(event_id, _EVENT_ID)
-        sha = None if expect_sha256 is None else _shaped(expect_sha256, _SHA)
-        _order, lines = self.gate(order_id, "send_ack", expect_sha256=sha)
+        sha = _shaped(expect_sha256, _SHA)
+        order, lines = self.gate(order_id, "send_ack", expect_sha256=sha)
         if self.events is None or self.raw_source is None or self.drafter is None or self.transport is None:
             raise EffectRefused(R_NOT_WIRED)
         sender = getattr(self.transport, "sender", None)
         if type(sender) is not str or _SENDER.fullmatch(sender) is None:
             raise EffectRefused(R_NOT_WIRED)                # the transport speaks only as thirdmind@
-        recipient, voice = self._recipient(event_id, lines)
-        draft = self.drafter(event_id)
+        try:
+            recipient, voice = self._recipient(event_id, lines)
+            draft = self.drafter(event_id)
+        except EffectRefused:
+            raise
+        except Exception:                                   # noqa: BLE001 - an executor's fault never carries text out
+            raise EffectRefused(R_FAILED) from None
         why = ack_text_refusal(draft)
         if why is not None:
             raise EffectRefused(why)
         message = AckMessage(sender=sender, recipient=recipient, subject=ACK_SUBJECT,
                              body=draft.strip() + "\n\n" + _DISCLOSURE[voice],
                              headers={"Auto-Submitted": "auto-replied"})
+        self._still(order_id, "send_ack", sha, order)
         try:
             self.transport.send(message)
         except Exception:                                   # noqa: BLE001 - a transport fault says nothing it was told
@@ -385,7 +425,15 @@ class Effects:
                 "sha256:" + hashlib.sha256(bytes(raw)).hexdigest(), event.body_ref):
             raise EffectRefused(R_EVENT)                    # the bytes are not the ones the event's digest names
         recipient = inbound_from(bytes(raw))
+        voices: set[Any] = set()
         for ln in lines:
             if recipient in {a.strip().lower() for a in ln["args"]["known_from"]}:
-                return recipient, ln["args"]["voice"][0]
-        raise EffectRefused(R_FROM)
+                named = ln["args"]["voice"]
+                if not isinstance(named, (list, tuple)) or len(named) != 1:
+                    raise EffectRefused(R_LINE)
+                voices.add(named[0])
+        if not voices:
+            raise EffectRefused(R_FROM)
+        if len(voices) != 1 or next(iter(voices)) not in _DISCLOSURE:   # one voice, or the disclosure could be false
+            raise EffectRefused(R_LINE)
+        return recipient, next(iter(voices))
