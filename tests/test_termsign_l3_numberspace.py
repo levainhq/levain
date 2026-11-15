@@ -426,14 +426,10 @@ def test_the_suite_cannot_reach_the_real_terminal_key(monkeypatch, tmp_path):
     from levain.cockpit import keys as K
     from levain.consent import terminal_sign as ts
 
-    real_dir = tmp_path / "Home" / ".levain" / "keys"
-    real_dir.mkdir(parents=True)
-    monkeypatch.setattr(K, "pwd_key_dir", lambda: real_dir)
-    monkeypatch.setattr(ts, "_real_key_dir", K.pwd_key_dir)
-    real = real_dir / ts.KEY_LABEL
-    with pytest.raises(AssertionError, match="real operator key directory"):
+    real = K.pwd_key_dir() / ts.KEY_LABEL
+    with pytest.raises(AssertionError, match="scratch root"):
         ts.default_signer_factory(real, 1.0)
-    with pytest.raises(AssertionError, match="real operator key directory"):
+    with pytest.raises(AssertionError, match="scratch root"):
         ts.default_desk_signer_factory(real, 1.0)
 
 

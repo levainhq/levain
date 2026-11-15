@@ -281,6 +281,12 @@ def _install_session_home() -> None:
     # root; a script the suite did not start has no voucher, and a root that holds the account's own home vouches for
     # nothing.
     os.environ[home_guard.TEST_SCRATCH_ROOT_ENV] = str(Path(tempfile.gettempdir()).resolve())
+    # the one other place a test may keep a key: the trust-anchor scratch under the ACCOUNT's home (a world-writable
+    # temp root cannot hold an allowed-signers anchor); the key guard allows exactly these roots and the temp root
+    import pwd
+    from tests.autonomic_confirm_keys import SCRATCH_PARENT
+    from levain.cockpit.keys import TEST_KEY_ROOTS_ENV
+    os.environ[TEST_KEY_ROOTS_ENV] = str(Path(pwd.getpwuid(os.getuid()).pw_dir) / SCRATCH_PARENT)
     for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "CODEX_HOME", home_guard.LIVE_ENV):
         os.environ.pop(name, None)     # the live marker too: a shell that holds it never opens the real home to a test
 
@@ -293,6 +299,7 @@ def pytest_configure(config):
 def pytest_unconfigure(config):
     keyguard_cleanup()          # the keyguard's wall and scrub end here too (idempotent; a run with no test never starts its fixture)
     os.environ.pop(home_guard.TEST_SCRATCH_ROOT_ENV, None)
+    os.environ.pop("LEVAIN_TEST_KEY_ROOTS", None)
     while _SESSION_HOME:
         shutil.rmtree(_SESSION_HOME.pop(), ignore_errors=True)
     from tests import _shared_chrome

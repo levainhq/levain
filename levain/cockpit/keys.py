@@ -29,7 +29,6 @@ import re
 import sqlite3
 import struct
 import subprocess
-import unicodedata
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -69,6 +68,12 @@ class RealKeyReached(KeyError_, AssertionError):
     ``signer-error``) that is also an ``AssertionError``, so a test that expects either kind of refusal sees one."""
 
 
+#: Further scratch roots (``os.pathsep``-separated) a test run names for keys beyond the temp root, set by the suite's
+#: conftest only: a trust-anchor directory must live under the account home, where a world-writable temp root cannot
+#: hold it. A root that holds the account's own home vouches for nothing (:func:`levain.home_guard.vouched_scratch`).
+TEST_KEY_ROOTS_ENV = "LEVAIN_TEST_KEY_ROOTS"
+
+
 def pwd_key_dir() -> Path:
     """``<real home>/.levain/keys`` from the password database, never ``$HOME`` or ``$LEVAIN_HOME``."""
     import pwd
@@ -81,39 +86,17 @@ def under_test_run() -> bool:
     return _under_test_run()
 
 
-def _resolved(path: Path) -> Path:
-    """``path`` with ``~`` expanded and links followed (the one resolve the guard does, so a test can break it)."""
-    return Path(path).expanduser().resolve()
-
-
-def _fold(path: Path) -> str:
-    """A spelling-insensitive key for ``path``: NFC and case folded, as APFS (the macOS default) compares names."""
-    return unicodedata.normalize("NFC", str(path)).casefold()
-
-
-def _same_dir_as(target: Path, real_stat: os.stat_result) -> bool:
-    """True when ``target`` or one of its existing ancestors IS the directory ``real_stat`` describes (device and
-    inode), whatever it is spelled: a firmlink, a mount, or a spelling folding does not map."""
-    for p in (target, *target.parents):
-        try:
-            st = os.stat(p)
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        if (st.st_dev, st.st_ino) == (real_stat.st_dev, real_stat.st_ino):
-            return True
-    return False
-
-
 @overload
 def refuse_real_key_in_tests(path: None, what: str = ...) -> None: ...
 @overload
 def refuse_real_key_in_tests(path: Path | str, what: str = ...) -> Path: ...
 def refuse_real_key_in_tests(path: Path | str | None, what: str = "the key") -> Path | None:
-    """Added after test runs raised the operator's Touch ID sheet on the live laptop: under a pytest run, any path
-    that names the real operator key directory or something inside it raises :class:`RealKeyReached`. It is judged
-    resolved (links followed), spelling-insensitively (case and Unicode normalisation folded) and by directory
-    identity (device and inode of the path or an existing ancestor). When the guard cannot tell (the password
-    database has no entry for this uid, or a path will not resolve or stat) it refuses: under pytest it fails closed.
+    """Under a pytest run a key or key directory is reachable ONLY inside the scratch root the conftest names
+    (:func:`levain.home_guard.vouched_scratch`); anything else raises :class:`RealKeyReached`. This is an ALLOWLIST: it
+    replaced a denylist of the operator's real key directory (resolved, case- and Unicode-folded, matched by device and
+    inode), which needed a new cut for every spelling of that directory. Nothing outside the scratch root is a key a
+    test may sign with, so there is no spelling of the real one to list. Fail closed: a path that will not resolve, a
+    run with no scratch root named, or a temp root that holds the account's own home, is refused.
 
     Returns the resolved path it judged, which a caller uses for every later act so a link retargeted after the
     check is not followed again; outside a pytest run it returns ``path`` with ``~`` expanded, unchanged otherwise.
@@ -122,24 +105,18 @@ def refuse_real_key_in_tests(path: Path | str | None, what: str = "the key") -> 
         return None
     if not under_test_run():
         return Path(path).expanduser()
+    from levain.home_guard import TEST_SCRATCH_ROOT_ENV, vouched_scratch
+
     try:
-        real = _resolved(pwd_key_dir())
-        target = _resolved(Path(path))
-        real_stat: os.stat_result | None
-        try:
-            real_stat = os.stat(real)
-        except FileNotFoundError:
-            real_stat = None
-        hit = (_fold(target) == _fold(real) or _fold(target).startswith(_fold(real).rstrip("/") + "/")
-               or (real_stat is not None and _same_dir_as(target, real_stat)))
-    except (OSError, RuntimeError, KeyError) as exc:
-        raise RealKeyReached(f"a test reached the real terminal key (Touch ID) guard, which cannot tell whether {what} "
-                             f"({path}) is inside the real operator key directory ({type(exc).__name__}: {exc}); "
+        target = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise RealKeyReached(f"a test reached {what} ({path}), which cannot be resolved ({type(exc).__name__}: {exc}); "
                              "under a test run that is refused. Pass a temp key_dir and a fake signer") from None
-    if hit:
-        raise RealKeyReached(f"a test reached the real terminal key (Touch ID): {what} ({target}) is inside the real operator key directory {real}, and a test "
-                        "run must never reach it (a Touch ID sheet would open on the live laptop); pass a temp key_dir "
-                        "and a fake signer")
+    extra = [r for r in os.environ.get(TEST_KEY_ROOTS_ENV, "").split(os.pathsep) if r]
+    if not (vouched_scratch(target) or any(vouched_scratch(target, {TEST_SCRATCH_ROOT_ENV: r}) for r in extra)):
+        raise RealKeyReached(f"a test reached {what} ({target}), which is not inside the scratch root the test run names: "
+                             "a test may only use a key it made there, never the operator's (a Touch ID sheet would "
+                             "open on the live laptop); pass a temp key_dir and a fake signer")
     return target
 
 
