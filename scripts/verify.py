@@ -23,7 +23,7 @@ every landing (A); an inherited red may ride only with a ledger entry AND a boar
 file with one writer (C); the cloud-only jobs still gate beside the receipt and are not run here (D); no docs-only skip,
 every landing runs the full receipt (E).
 
-Kill safety: SIGTERM and SIGINT stop the run's process groups, remove its worktrees, eject any disk image mounted
+Kill safety: SIGTERM, SIGINT and SIGHUP stop the run's process groups, remove its worktrees, eject any disk image mounted
 under the run dir and clear its working subdirectories, keeping only the logs and status file.  A run that dies without
 that (SIGKILL, power) is reaped by the next run's start-of-run sweep, which only touches run dirs no live run holds.
 
@@ -83,6 +83,14 @@ DIAG_PROMPT_CAP = 24000
 STARTING_GRACE = 120.0          # seconds a freshly started run may have no lock yet
 FINAL_STATES = ("passed", "red", "partial")
 REQUIRED_PLATFORMS = ("macos", "linux")
+LEG_PLATFORM = {"mac": "macos", "linux": "linux"}          # leg name -> the platform it must run on
+PLATFORM_SYSTEM = {"macos": "Darwin", "linux": "Linux"}    # platform -> what platform.system() reports there
+DEFAULT_PYTEST_TIMEOUT = 5400.0
+REMOTE_TIMEOUT_FLOOR = 4 * 3600   # seconds the ssh call that runs the whole remote leg gets at least
+REMOTE_SLACK = 3600               # on top of three pytest jobs at their own timeout: builds, reruns, baselines
+REAP_WAIT = 30.0                  # seconds to wait for a SIGKILLed child to be reaped before giving up on it
+CAPTURE_TIMEOUT = 900.0           # seconds a captured helper command (root_closure.py) may run
+HANDLED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 KEPT_LOG_TTL = 14 * 86400       # seconds a dead run's logs and status file survive the sweep (its working subdirs go at once)
 BWRAP_PYTHON = LINUX_PYTHON     # the CI bwrap job runs 3.12: the same distro interpreter (uv's "3.12" can resolve to a standalone build with no pidfd_open)
 RUN_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{8}-[0-9a-f]{4}")
@@ -104,6 +112,23 @@ def _clean_path() -> str:
 
 CLEAN_PATH = _clean_path()
 CLASSES = ("regression", "inherited", "load", "flaky")
+
+
+def host_platform() -> str:
+    """The platform this process really runs on, named as a receipt names it: 'macos', 'linux', else the lowercased
+    system.  A leg's label comes from here, never from the leg name that was asked for."""
+    s = platform.system()
+    return {v: k for k, v in PLATFORM_SYSTEM.items()}.get(s, s.lower())
+
+
+def _python_minor(version: str) -> str | None:
+    """'3.12.13' -> '3.12'; '/usr/bin/python3.12' -> '3.12'; anything with no X.Y -> None."""
+    m = re.search(r"(\d+)\.(\d+)", os.path.basename(str(version or "")))
+    return f"{m.group(1)}.{m.group(2)}" if m else None
+
+
+# the interpreter minor each platform's leg is ruled to run (ruling A); a leg on any other is not that leg
+REQUIRED_PYTHON_MINOR = {"macos": _python_minor(MAC_PYTHON), "linux": _python_minor(LINUX_PYTHON)}
 
 
 def now() -> str:
@@ -185,26 +210,36 @@ class Ledger:
     def __init__(self, path: Path):
         self.path = Path(path)
 
-    def _append(self, rec: dict) -> None:
+    def _locked(self):
+        """The ledger file opened for append and held under an exclusive flock until the handle closes.  flock is per
+        open file, so two threads of this process (the mac leg and the remote leg's copy-back) exclude each other."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a+b") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.seek(0)
-            data = f.read()
-            if data and not data.endswith(b"\n"):
-                # a writer died mid-line: the torn tail was never acknowledged, so it is dropped (a complete
-                # record that only lost its newline is kept) before this record goes on the end
-                k = data.rfind(b"\n")
-                tail = data[k + 1:]
-                try:
-                    json.loads(tail)
-                    f.write(b"\n")
-                except ValueError:
-                    f.truncate(k + 1)
-                    print(f"verify: ledger {self.path}: dropped a torn last line ({len(tail)} bytes)", file=sys.stderr)
-            f.write((json.dumps(rec, sort_keys=True) + "\n").encode("utf-8"))
-            f.flush()
-            os.fsync(f.fileno())
+        f = open(self.path, "a+b")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        return f
+
+    def _append(self, rec: dict) -> None:
+        with self._locked() as f:
+            self._append_locked(f, rec)
+
+    def _append_locked(self, f, rec: dict) -> None:
+        """Append one record through `f`, which the caller holds under _locked()."""
+        f.seek(0)
+        data = f.read()
+        if data and not data.endswith(b"\n"):
+            # a writer died mid-line: the torn tail was never acknowledged, so it is dropped (a complete
+            # record that only lost its newline is kept) before this record goes on the end
+            k = data.rfind(b"\n")
+            tail = data[k + 1:]
+            try:
+                json.loads(tail)
+                f.write(b"\n")
+            except ValueError:
+                f.truncate(k + 1)
+                print(f"verify: ledger {self.path}: dropped a torn last line ({len(tail)} bytes)", file=sys.stderr)
+        f.write((json.dumps(rec, sort_keys=True) + "\n").encode("utf-8"))
+        f.flush()
+        os.fsync(f.fileno())
 
     def lines(self) -> list[dict]:
         """Every record.  A torn LAST line (the writer died mid-line, so the file does not end in a newline) is skipped
@@ -257,16 +292,18 @@ class Ledger:
         return found[-1] if found else None
 
     def file(self, nodeid: str, cls: str, run_id: str, sha: str, evidence: str) -> tuple[str, bool]:
-        """Record one excused red.  Returns (ledger_id, is_new_entry)."""
-        cur = self.open_entry_for(nodeid)
-        if cur is not None:
-            self._append({"type": "sighting", "id": cur["id"], "run_id": run_id, "sha": sha, "class": cls,
-                          "evidence": evidence, "ts": now()})
-            return cur["id"], False
-        lid = "lg_" + sha256_bytes(f"{nodeid}|{run_id}|{time.time_ns()}".encode())[:10]
-        self._append({"type": "entry", "id": lid, "nodeid": nodeid, "class": cls, "first_run": run_id,
-                      "first_sha": sha, "evidence": evidence, "board_row": None, "ts": now()})
-        return lid, True
+        """Record one excused red.  Returns (ledger_id, is_new_entry).  The read, the entry-or-sighting decision and the
+        append are one transaction under the ledger's lock: two legs filing the same red make one entry, not two."""
+        with self._locked() as f:
+            cur = self.open_entry_for(nodeid)
+            if cur is not None:
+                self._append_locked(f, {"type": "sighting", "id": cur["id"], "run_id": run_id, "sha": sha, "class": cls,
+                                        "evidence": evidence, "ts": now()})
+                return cur["id"], False
+            lid = "lg_" + sha256_bytes(f"{nodeid}|{run_id}|{time.time_ns()}".encode())[:10]
+            self._append_locked(f, {"type": "entry", "id": lid, "nodeid": nodeid, "class": cls, "first_run": run_id,
+                                    "first_sha": sha, "evidence": evidence, "board_row": None, "ts": now()})
+            return lid, True
 
     def mark(self, lid: str, status: str) -> None:
         assert status in ("open", "fixed")
@@ -277,10 +314,18 @@ class Ledger:
 
 def verdict_of(legs: list[dict]) -> tuple[str, list[str]]:
     """red: a leg ran nothing, a red is a regression or has no ledger entry or no board row, pytest died abnormally or
-    disagrees with its own junit, or a leg's integrity check failed.  partial: nothing is red but a required leg
-    is missing.  green only with both legs present and clean: a receipt never reads green where CI would read red."""
+    disagrees with its own junit, a leg's integrity check failed, or a leg did not run on the system its platform names
+    or on its ruled interpreter minor.  partial: nothing is red but a required leg is missing.  green only with both
+    legs present and clean: a receipt never reads green where CI would read red."""
     why: list[str] = []
     for leg in legs:
+        plat = leg.get("platform")
+        ran_on = (leg.get("host_fingerprint") or {}).get("system")
+        if PLATFORM_SYSTEM.get(plat) is None or ran_on != PLATFORM_SYSTEM[plat]:
+            why.append(f"{plat}: the leg ran on {ran_on or 'an unrecorded system'}, not on {PLATFORM_SYSTEM.get(plat, plat)}")
+        want_py, got_py = REQUIRED_PYTHON_MINOR.get(plat), _python_minor(leg.get("python"))
+        if want_py is not None and got_py != want_py:
+            why.append(f"{plat}: the leg ran Python {leg.get('python')!r}, the {plat} leg is Python {want_py}")
         for e in leg.get("integrity", []):
             why.append(f"{leg['platform']}: {e}")
         for job in leg.get("jobs", []):
@@ -319,14 +364,23 @@ def verdict_of(legs: list[dict]) -> tuple[str, list[str]]:
 
 
 def build_receipt(sha: str, run_id: str, lock: dict, runner_blob: str | None, legs: list[dict],
-                  runner_matches_sha: bool | None = None) -> dict:
+                  runner_matches_sha: bool | None = None, base_sha: str | None = None) -> dict:
+    """`base_sha`: the land base the run pinned once, before any leg started.  A leg that records a different base is
+    red.  (The local leg is built from the pin; the remote leg's recorded base is checked strictly, absence included,
+    by rederive_leg when it is copied back.)"""
     verdict, why = verdict_of(legs)
     if runner_blob is None:
         verdict, why = "red", why + ["scripts/verify.py is not in the sha under test"]
     elif runner_matches_sha is False:
         verdict, why = "red", why + ["the running verify.py is not the blob committed at the sha"]
-    return {"schema": SCHEMA, "sha": sha, "lock": lock, "runner_blob": runner_blob, "run_id": run_id,
-            "runner_matches_sha": runner_matches_sha, "verdict": verdict, "verdict_why": why, "legs": legs}
+    if base_sha is not None:
+        for leg in legs:
+            if leg.get("base_sha") is not None and leg.get("base_sha") != base_sha:
+                verdict, why = "red", why + [f"{leg.get('platform')}: the leg ran against base {leg.get('base_sha')!r}, "
+                                             f"the run pinned {base_sha}"]
+    return {"schema": SCHEMA, "sha": sha, "base_sha": base_sha, "lock": lock, "runner_blob": runner_blob,
+            "run_id": run_id, "runner_matches_sha": runner_matches_sha, "verdict": verdict, "verdict_why": why,
+            "legs": legs}
 
 
 def reverdict_receipt(receipt: dict, ledger: Ledger) -> dict:
@@ -341,7 +395,7 @@ def reverdict_receipt(receipt: dict, ledger: Ledger) -> dict:
                 if r.get("ledger_id"):
                     r["board_row"] = ledger.board_row(r["ledger_id"])
     new = build_receipt(receipt["sha"], receipt["run_id"], receipt["lock"], receipt["runner_blob"], legs,
-                        receipt["runner_matches_sha"])
+                        receipt["runner_matches_sha"], receipt.get("base_sha"))
     if receipt.get("diagnosis"):
         new["diagnosis"] = receipt["diagnosis"]
     new["reverdicts"] = [*receipt.get("reverdicts", []), {"ts": now(), "from": receipt["verdict"], "to": new["verdict"]}]
@@ -542,13 +596,33 @@ def remove_short_tmp(d: Path | None) -> bool:
     return True
 
 
-def _spawn(cmd: list[str], *, cwd, env, stdout, stdin=subprocess.DEVNULL) -> subprocess.Popen:
+def _spawn(cmd: list[str], *, cwd, env, stdout, stdin=subprocess.DEVNULL, stderr=subprocess.STDOUT) -> subprocess.Popen:
     """Every child gets its own session so one kill reaches its whole group (xdist workers, browsers, mounts' helpers)."""
     p = subprocess.Popen(_with_umask(cmd), cwd=str(cwd) if cwd else None, env=env, stdin=stdin, stdout=stdout,
-                         stderr=subprocess.STDOUT, start_new_session=True)
+                         stderr=stderr, start_new_session=True)
     with _CHILD_LOCK:
         _CHILDREN.add(p)
     return p
+
+
+def _kill_leftovers(p: subprocess.Popen) -> None:
+    """After the group leader exited on its own: SIGKILL whatever it left in its process group (a daemonised helper a
+    test started, a stray worker), so nothing from a finished command outlives it.  An empty group is ESRCH.  Known
+    edge: once the group is empty its id is a free pid, so a brand-new session leader handed that pid in the moment
+    between the leader's reaping and this call would be signalled."""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _wait_killed(p: subprocess.Popen, lf) -> None:
+    """Wait a bounded time for a SIGKILLed child: one stuck in uninterruptible sleep is never reaped, and the run must
+    still end (and report) rather than hang on it."""
+    try:
+        p.wait(timeout=REAP_WAIT)
+    except subprocess.TimeoutExpired:
+        lf.write(f"\n[verify] UNREAPED: pid {p.pid} did not exit {REAP_WAIT:.0f}s after SIGKILL\n".encode())
 
 
 def _run(cmd: list[str], *, cwd: Path, env: dict, log: Path, timeout: float | None = None, stdin: Path | None = None) -> int:
@@ -556,17 +630,24 @@ def _run(cmd: list[str], *, cwd: Path, env: dict, log: Path, timeout: float | No
         lf.write(f"\n$ {' '.join(cmd)}\n".encode())
         lf.flush()
         sf = open(stdin, "rb") if stdin else subprocess.DEVNULL
-        p = _spawn(cmd, cwd=cwd, env=env, stdout=lf, stdin=sf)
         try:
-            return p.wait(timeout=timeout)
+            p = _spawn(cmd, cwd=cwd, env=env, stdout=lf, stdin=sf)
+        except BaseException:
+            if stdin:
+                sf.close()
+            raise
+        try:
+            rc = p.wait(timeout=timeout)
+            _kill_leftovers(p)
+            return rc
         except subprocess.TimeoutExpired:
             _kill_group(p)
-            p.wait()
+            _wait_killed(p, lf)
             lf.write(b"\n[verify] TIMEOUT\n")
             return 124
         except BaseException:
             _kill_group(p)
-            p.wait()
+            _wait_killed(p, lf)
             raise
         finally:
             with _CHILD_LOCK:
@@ -575,19 +656,37 @@ def _run(cmd: list[str], *, cwd: Path, env: dict, log: Path, timeout: float | No
                 sf.close()
 
 
-def _capture(cmd: list[str], *, cwd: Path, env: dict, log: Path) -> tuple[int, str]:
-    """Run to completion and return (exit code, stdout); stderr goes to the log."""
+def _capture(cmd: list[str], *, cwd: Path, env: dict, log: Path, timeout: float = CAPTURE_TIMEOUT) -> tuple[int, str]:
+    """Run to completion and return (exit code, stdout); stderr goes to the log.  Spawned like _run (own session,
+    tracked for a kill, the runner's umask) and bounded by `timeout`: a timeout is exit 124 with no output."""
     with open(log, "ab") as lf:
         lf.write(f"\n$ {' '.join(cmd)}\n".encode())
-        r = subprocess.run(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=lf, text=True,
-                           stdin=subprocess.DEVNULL)
-    return r.returncode, r.stdout
+        lf.flush()
+        p = _spawn(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=lf)
+        try:
+            out, _ = p.communicate(timeout=timeout)
+            _kill_leftovers(p)
+            return p.returncode, out.decode("utf-8", errors="replace")
+        except subprocess.TimeoutExpired:
+            _kill_group(p)
+            _wait_killed(p, lf)
+            lf.write(b"\n[verify] TIMEOUT\n")
+            return 124, ""
+        except BaseException:
+            _kill_group(p)
+            _wait_killed(p, lf)
+            raise
+        finally:
+            with _CHILD_LOCK:
+                _CHILDREN.discard(p)
+            if p.stdout is not None:
+                p.stdout.close()
 
 
 # ---------------------------------------------------------------- kill safety: signals, sweep, reap
 
 class Killed(BaseException):
-    """Raised from the SIGTERM / SIGINT handler.  A BaseException so no `except Exception` swallows it and every
+    """Raised from the SIGTERM / SIGINT / SIGHUP handler.  A BaseException so no `except Exception` swallows it and every
     `finally` on the way out (worktree removal, sampler stop) still runs."""
 
     def __init__(self, signum: int):
@@ -602,7 +701,8 @@ def install_signal_handlers() -> dict:
         terminate_children()
         raise Killed(signum)
 
-    for s in (signal.SIGTERM, signal.SIGINT):
+    # SIGHUP too: a remote `run --here` whose ssh session is torn down must clean up like a TERMed run
+    for s in HANDLED_SIGNALS:
         prev[s] = signal.signal(s, handler)
     return prev
 
@@ -978,6 +1078,10 @@ def classify(reds: list[dict], *, ledger: Ledger | None, run_id: str, sha: str, 
                 if bsig is None:
                     rec.update({"class": "regression",
                                 "evidence": rec["evidence"] + f"; red on {MAIN_REF} but its failure was not recorded, so sameness is unproven"})
+                elif mine == ("", ""):
+                    rec.update({"class": "regression",
+                                "evidence": rec["evidence"] + f"; red on {MAIN_REF} but this red has no failure text, "
+                                                              f"so sameness is unproven"})
                 elif tuple(bsig) == mine:
                     rec.update({"class": "inherited", "evidence": rec["evidence"] + f"; also red on {MAIN_REF}, the same failure ({mine[0] or 'assert'}: {mine[1][:80]})"})
                 else:
@@ -1033,34 +1137,61 @@ def _pid_dead(pid: int) -> bool:
     return False
 
 
+def _lock_holder_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text().split()[0])
+    except (ValueError, IndexError, OSError):
+        return None
+
+
 def lock_host(state: Path, _retry: bool = True):
     """One receipt run per host.  A lock still held after its recorded pid is gone (a leaked descriptor in a child that
     outlived a killed run) is reclaimed: the stale file is unlinked and a fresh one taken.  A live or unreadable
-    holder is never reclaimed.  Two starters racing on the same stale file is the one edge this leaves open."""
+    holder is never reclaimed.  Reclaiming is serialised by host.lock.reclaim (never unlinked; a starter that finds it
+    taken is refused), and a lock taken on a file no longer at host.lock is given back: two starters racing on one stale
+    file cannot both come away holding the host."""
     state.mkdir(parents=True, exist_ok=True)
     path = state / "host.lock"
     f = open(path, "a+")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        try:
-            f.seek(0)
-            pid = int(f.read().split()[0])
-        except (ValueError, IndexError, OSError):
-            pid = None
         f.close()
+        pid = _lock_holder_pid(path)
         if _retry and pid is not None and pid != os.getpid() and _pid_dead(pid):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            return lock_host(state, _retry=False)
+            return _reclaim_host_lock(state, path)
+        return None
+    try:
+        same = os.path.samestat(os.fstat(f.fileno()), os.stat(path))
+    except OSError:
+        same = False
+    if not same:            # another starter unlinked or replaced this file after it was opened here
+        f.close()
         return None
     f.seek(0)
     f.truncate()
     f.write(f"{os.getpid()} {now()}\n")
     f.flush()
     return f
+
+
+def _reclaim_host_lock(state: Path, path: Path):
+    rk = open(state / "host.lock.reclaim", "a+")
+    try:
+        try:
+            fcntl.flock(rk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None                 # another starter is reclaiming right now
+        pid = _lock_holder_pid(path)    # re-read under the reclaim lock: the file may already be a live starter's
+        if pid is None or pid == os.getpid() or not _pid_dead(pid):
+            return None
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return lock_host(state, _retry=False)
+    finally:
+        rk.close()
 
 
 def _minor(python: str) -> str:
@@ -1082,7 +1213,7 @@ class Ctx:
     """One leg's shared state: where it runs, what it logs, and the worktrees it must give back."""
 
     def __init__(self, repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger | None, status: Status | None,
-                 leg_name: str, log: Path):
+                 leg_name: str, log: Path, base_sha: str | None = None):
         self.repo, self.sha, self.run, self.run_id = repo, sha, run, run_id
         self.ledger, self.status, self.leg_name, self.log = ledger, status, leg_name, log
         self.env = clean_env(run)
@@ -1091,7 +1222,7 @@ class Ctx:
         self.python = ""
         self._main: dict[str, tuple[Path, Path]] = {}
         self.touched: set[str] = set()
-        self.base_sha = ""
+        self.base_sha = base_sha or ""
         self.h11_site: Path | None = None
         self.tmp: Path | None = None
 
@@ -1103,10 +1234,15 @@ class Ctx:
         for d in (self.run / "home", self.run / "tmp"):
             d.mkdir(parents=True, exist_ok=True)
         self.tmp = make_short_tmp(self.run)
-        # the land base is read once, here, as a sha: every classification and baseline of this leg uses this one value
-        self.base_sha = git(self.repo, "rev-parse", "--verify", f"{MAIN_REF}^{{commit}}", check=False).stdout.strip()
-        base = self.base_sha or MAIN_REF
-        self.touched = set(git(self.repo, "diff", "--name-only", f"{base}...{self.sha}", check=False).stdout.split())
+        # the land base is the sha the run pinned before any leg started (cmd_run passes it); only a caller that pinned
+        # nothing has it read here, once.  Every classification and baseline of this leg uses this one value.
+        if not self.base_sha:
+            self.base_sha = resolve_base(self.repo)
+        d = git(self.repo, "diff", "--name-only", f"{self.base_sha}...{self.sha}", check=False)
+        if d.returncode != 0:
+            raise RuntimeError(f"git diff {self.base_sha[:12]}...{self.sha[:12]} failed, so the touched test files are "
+                               f"unknown: {d.stderr.strip()}")
+        self.touched = set(d.stdout.split())
 
     def make(self, name: str, sha: str, python: str, lock_src: Path | None = None) -> tuple[Path, Path]:
         self.names.append(name)
@@ -1148,6 +1284,9 @@ def run_job(ctx: Ctx, *, name: str, py: Path, cwd: Path, env: dict, targets: lis
     junit = ctx.run / junit_name
     xd = ["-n", str(workers), "--dist", "loadfile"] if workers else []
     ctx.progress(f"{name}: pytest")
+    # every junit this job reads is removed before the pytest that should write it: a file left by anything earlier
+    # is never taken as this call's report
+    junit.unlink(missing_ok=True)
     rc = _run(pytest_cmd(py, *xd, *flags, f"--junitxml={junit}", f"--basetemp={ctx.tmp / ('pt-' + name)}", *targets),
               cwd=cwd, env=env, log=ctx.log, timeout=timeout)
     if not junit.exists():
@@ -1159,6 +1298,7 @@ def run_job(ctx: Ctx, *, name: str, py: Path, cwd: Path, env: dict, targets: lis
     def rerun(nid: str) -> bool:
         n_rerun[0] += 1
         rj = ctx.run / f"junit-rerun-{name}-{n_rerun[0]}.xml"
+        rj.unlink(missing_ok=True)
         rc2 = _run(pytest_cmd(py, nid, *rerun_flags, f"--junitxml={rj}", f"--basetemp={ctx.tmp / ('pt-%s-r%d' % (name, n_rerun[0]))}"),
                    cwd=cwd, env=env, log=ctx.log, timeout=900)
         ok = rc2 == 0 and rerun_passed(rj)
@@ -1172,6 +1312,7 @@ def run_job(ctx: Ctx, *, name: str, py: Path, cwd: Path, env: dict, targets: lis
             bp_py, benv, bflags = base_cfg(bsrc, bpy)
         else:
             bp_py, benv, bflags = bpy, {**env, "PATH": f"{bpy.parent}:{CLEAN_PATH}"}, rerun_flags
+        bj.unlink(missing_ok=True)
         brc = _run(pytest_cmd(bp_py, *nids, *bflags, f"--junitxml={bj}", f"--basetemp={ctx.tmp / ('pt-main-' + name)}"),
                    cwd=bsrc, env=benv, log=ctx.log, timeout=1800)
         binfo.update(sha=ctx.base_sha, rc=brc)
@@ -1401,10 +1542,15 @@ def plan_linux(ctx: Ctx, python: str, workers: int, timeout: float) -> tuple[lis
 
 
 def run_leg_local(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger | None, status: Status | None, *,
-                  leg: str, python: str, workers: int, timeout: float) -> dict:
-    """Run one leg on THIS host.  Returns the leg dict; its `_diag` key carries the failure text for diagnosis."""
+                  leg: str, python: str, workers: int, timeout: float, base_sha: str | None = None) -> dict:
+    """Run one leg on THIS host.  Returns the leg dict; its `_diag` key carries the failure text for diagnosis.
+    The leg's platform is the host's real one: a leg asked for on a host of another platform is refused before
+    anything is built.  `base_sha`: the land base the run pinned (Ctx reads it itself only when none is given)."""
+    actual, want = host_platform(), LEG_PLATFORM[leg]
+    if actual != want:
+        raise RuntimeError(f"the {leg} leg must run on {want}; this host is {actual}")
     log = run / ("verify.log" if leg == "mac" else "verify-linux-here.log")
-    ctx = Ctx(repo, sha, run, run_id, ledger, status, leg, log)
+    ctx = Ctx(repo, sha, run, run_id, ledger, status, leg, log, base_sha=base_sha)
     started, t0 = now(), time.time()
     sampler = LoadSampler()
     sampler.start()
@@ -1413,7 +1559,7 @@ def run_leg_local(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger |
     finally:
         max_load = sampler.finish()
         ctx.teardown()
-    return {"platform": "macos" if leg == "mac" else "linux", "sha": sha, "base_sha": ctx.base_sha,
+    return {"platform": actual, "sha": sha, "base_sha": ctx.base_sha,
             "host": socket.gethostname(), "python": pyver, "python_path": python,
             "host_fingerprint": host_fingerprint(), "started": started, "ended": now(),
             "duration_s": round(time.time() - t0, 1), "workers": workers, "max_load": max_load,
@@ -1444,14 +1590,17 @@ def remote_stop_cmd(host: str, run_id: str, remove_dir: bool) -> list[str]:
     return ["ssh", *SSH_OPTS, host, script]
 
 
-def rederive_leg(leg: dict, sha: str) -> list[str]:
+def rederive_leg(leg: dict, sha: str, base_sha: str | None = None) -> list[str]:
     """What the laptop can redo from the junit files it copied back, against what the remote leg JSON claims: the leg's
-    sha, every job's counts and skip reasons, and the set of red nodeids.  Any disagreement is a string; none = [].
+    sha (and, given `base_sha`, the land base it ran against), every job's counts and skip reasons, and the set of red
+    nodeids.  Any disagreement is a string; none = [].
     The junit paths in `leg` must already point at the local copies.  The job set must be exactly the linux plan's (each
     job once), or the plan's lone early setup failure: a leg that drops or adds a job never re-derives clean."""
     errs: list[str] = []
     if leg.get("sha") != sha:
         errs.append(f"the leg JSON records sha {leg.get('sha')!r}, the sha under test is {sha}")
+    if base_sha is not None and leg.get("base_sha") != base_sha:
+        errs.append(f"the leg JSON records base {leg.get('base_sha')!r}, the run pinned {base_sha}")
     if leg.get("platform") != "linux":
         errs.append(f"the leg JSON records platform {leg.get('platform')!r}, the remote leg is linux")
     jobs = leg.get("jobs") if isinstance(leg.get("jobs"), list) else []
@@ -1483,10 +1632,15 @@ def rederive_leg(leg: dict, sha: str) -> list[str]:
 
 
 def run_leg_remote(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger, status: Status | None, *,
-                   host: str = REMOTE_HOST, workers: int = WORKERS_LINUX, timeout: float = 4 * 3600,
+                   host: str = REMOTE_HOST, workers: int = WORKERS_LINUX, timeout: float | None = None,
+                   pytest_timeout: float = DEFAULT_PYTEST_TIMEOUT, base_sha: str | None = None,
                    sh=default_sh, script: Path | None = None) -> dict:
-    """Ship the sha as a bundle over ssh, run this same script there with --here, copy the leg JSON and junit back, and
-    re-derive the leg from the copied junit.  A failure after the runner started stops the remote run.
+    """Ship the sha and the pinned land base as a bundle over ssh, run this same script there with --here, copy the leg
+    JSON and junit back, and re-derive the leg from the copied junit.  A failure after the runner started stops the
+    remote run; a stop that could not be confirmed is flagged on the exception (verify_remote_unstopped) for the caller.
+    `base_sha`: the land base the run pinned (read here, once, only when none is given); the remote's origin/main is
+    set to exactly that commit.  `pytest_timeout` is each remote pytest call's; `timeout` (default: three jobs at that
+    timeout plus REMOTE_SLACK, at least REMOTE_TIMEOUT_FLOOR) bounds the whole remote run.
     `sh(cmd, log=, stdin=, timeout=) -> exit code` is the only way out of the process; tests substitute it."""
     script = script or Path(__file__).resolve()
     ldir = run / "linux"
@@ -1495,7 +1649,12 @@ def run_leg_remote(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger,
     q = shlex.quote
     rrun = f"{REMOTE_STATE}/runs/{run_id}"
     assert RUN_ID_RE.fullmatch(run_id) and re.fullmatch(r"[0-9a-f]{40}", sha), "unsafe run id or sha"
+    base = base_sha or resolve_base(repo)
+    assert re.fullmatch(r"[0-9a-f]{40}", base), "unsafe base sha"
+    if timeout is None:
+        timeout = max(REMOTE_TIMEOUT_FLOOR, 3 * float(pytest_timeout) + REMOTE_SLACK)
     ref = f"refs/verify/{sha[:12]}"
+    bref = f"refs/verify/base-{base[:12]}"
     main_ref = f"refs/remotes/{MAIN_REF}"
     bundle = ldir / "sha.bundle"
     ssh = ["ssh", *SSH_OPTS, host]
@@ -1509,22 +1668,27 @@ def run_leg_remote(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger,
 
     if status is not None:
         status.update(phase_linux="bundling the sha")
+    # the base travels as its own ref at the pinned sha, never as origin/main (which may have moved since the pin)
     git(repo, "update-ref", ref, sha)
     try:
-        b = git(repo, "bundle", "create", str(bundle), ref, main_ref, check=False)
+        u = git(repo, "update-ref", bref, base, check=False)
+        if u.returncode != 0:
+            raise RuntimeError(f"the pinned base {base} is not a commit here: {u.stderr.strip()}")
+        b = git(repo, "bundle", "create", str(bundle), ref, bref, check=False)
         if b.returncode != 0:
-            raise RuntimeError(f"git bundle failed (is {MAIN_REF} present?): {b.stderr.strip()}")
+            raise RuntimeError(f"git bundle failed: {b.stderr.strip()}")
     finally:
         git(repo, "update-ref", "-d", ref, check=False)
-    base = git(repo, "rev-parse", "--verify", f"{main_ref}^{{commit}}").stdout.strip()
+        git(repo, "update-ref", "-d", bref, check=False)
 
     try:
         step("shipping the bundle", ssh + [f"umask 022 && mkdir -p {q(rrun)}/xfer && cat > {q(rrun)}/xfer/sha.bundle"], stdin=bundle)
         step("shipping the runner", ["scp", "-q", *SSH_OPTS, str(script), f"{host}:{rrun}/verify.py"])
         remote = (f"umask 022 && cd {q(rrun)} && git init -q xfer/repo && "
-                  f"git -C xfer/repo fetch -q ../sha.bundle +{ref}:{ref} +{main_ref}:{main_ref} && "
+                  f"git -C xfer/repo fetch -q ../sha.bundle +{ref}:{ref} +{bref}:{main_ref} && "
                   f"python3 verify.py run --here --leg linux --sha {sha} --repo xfer/repo --run-id {run_id} "
-                  f"--workers {int(workers)} --leg-json leg-linux.json --base-sha {base}")
+                  f"--workers {int(workers)} --pytest-timeout {float(pytest_timeout)} --leg-json leg-linux.json "
+                  f"--base-sha {base}")
         step("running the linux leg on " + host, ssh + [remote], timeout=timeout)
         step("copying the leg JSON back", ["scp", "-q", *SSH_OPTS, f"{host}:{rrun}/leg-linux.json", str(ldir) + "/"])
         leg = json.loads((ldir / "leg-linux.json").read_text(encoding="utf-8"))
@@ -1541,13 +1705,19 @@ def run_leg_remote(repo: Path, sha: str, run: Path, run_id: str, ledger: Ledger,
             if got != jr["sha256"]:
                 raise RuntimeError(f"linux leg: {base_name} copied back with sha256 {got}, the leg recorded {jr['sha256']}")
             jr["path"] = str(local)
-    except BaseException:
+    except BaseException as e:
         try:
-            sh(remote_stop_cmd(host, run_id, remove_dir=False), log=log, timeout=90)
+            stop_rc = sh(remote_stop_cmd(host, run_id, remove_dir=False), log=log, timeout=90)
         except Exception:  # noqa: BLE001 - a failed cleanup must not hide the failure that caused it
-            pass
+            stop_rc = None
+        if stop_rc != 0:
+            # the remote runner may still be alive and holding its host lock: the caller retries the stop
+            try:
+                e.verify_remote_unstopped = True
+            except Exception:  # noqa: BLE001
+                pass
         raise
-    leg["integrity"] = rederive_leg(leg, sha)
+    leg["integrity"] = rederive_leg(leg, sha, base_sha=base)
     leg["remote_run"] = f"{host}:{rrun}"
     apply_ledger_to_leg(leg, ledger, run_id, sha)
     leg["load_reds"] = sum(1 for j in leg.get("jobs", []) for r in j["reds"] if r["class"] == "load")
@@ -1623,13 +1793,14 @@ def lock_hashes(top: Path, sha: str) -> dict:
     return lock
 
 
-def assemble_receipt(top: Path, sha: str, run_id: str, legs: list[dict]) -> dict:
-    """Two legs merge into ONE receipt: the legs list, the lock hashes and the runner blob are the receipt's."""
+def assemble_receipt(top: Path, sha: str, run_id: str, legs: list[dict], base_sha: str | None = None) -> dict:
+    """Two legs merge into ONE receipt: the legs list, the lock hashes, the runner blob and the pinned base are the
+    receipt's."""
     rb = git(top, "rev-parse", f"{sha}:scripts/verify.py", check=False)
     runner_blob = rb.stdout.strip() if rb.returncode == 0 else None
     actual = git(top, "hash-object", str(Path(__file__).resolve())).stdout.strip()
     return build_receipt(sha, run_id, lock_hashes(top, sha), runner_blob, legs,
-                         None if runner_blob is None else runner_blob == actual)
+                         None if runner_blob is None else runner_blob == actual, base_sha)
 
 
 def _resolve(a) -> tuple[Path, str, Path]:
@@ -1650,11 +1821,11 @@ def _workers(a, leg: str) -> int:
 
 
 def _run_legs(a, top: Path, sha: str, run: Path, run_id: str, ledger: Ledger, status: Status,
-              remote: dict | None = None) -> list[dict]:
+              remote: dict | None = None, base_sha: str | None = None) -> list[dict]:
     """mac on this host and linux over ssh, at once when --leg both.  A leg that fails aborts the whole run: no half receipt.
     A kill or failure anywhere while the remote thread lives (the mac leg, or the wait for the remote leg) stops the
     remote run.  `remote` (the caller's) records started / done / stopped, so a kill that escapes this function can
-    still stop a remote run nobody stopped."""
+    still stop a remote run nobody stopped.  `base_sha`, the land base pinned once by the caller, goes to both legs."""
     remote = {} if remote is None else remote
     out: dict = {}
     t = None
@@ -1663,7 +1834,8 @@ def _run_legs(a, top: Path, sha: str, run: Path, run_id: str, ledger: Ledger, st
             def go() -> None:
                 try:
                     out["linux"] = run_leg_remote(top, sha, run, run_id, ledger, status, host=a.host,
-                                                  workers=_workers(a, "linux"))
+                                                  workers=_workers(a, "linux"), pytest_timeout=a.pytest_timeout,
+                                                  base_sha=base_sha)
                 except BaseException as e:  # noqa: BLE001 - handed to the main thread
                     out["linux_err"] = e
             th = threading.Thread(target=go, daemon=True)
@@ -1672,9 +1844,14 @@ def _run_legs(a, top: Path, sha: str, run: Path, run_id: str, ledger: Ledger, st
             t = th          # only a started thread is ever joined below
         if a.leg in ("mac", "both"):
             out["mac"] = run_leg_local(top, sha, run, run_id, ledger, status, leg="mac", python=a.python or MAC_PYTHON,
-                                       workers=_workers(a, "mac"), timeout=a.pytest_timeout)
+                                       workers=_workers(a, "mac"), timeout=a.pytest_timeout, base_sha=base_sha)
         if t:
             t.join()
+            if getattr(out.get("linux_err"), "verify_remote_unstopped", False):
+                # the leg failed and its own stop of the remote runner was not confirmed: try once more, keeping the
+                # remote logs
+                stop_remote_run(a.host, run_id, remove_dir=False)
+                remote["stopped"] = True
             # the remote leg ended on its own: it cleaned up after success and stopped itself after a failure
             remote["done"] = True
     except BaseException:
@@ -1689,13 +1866,20 @@ def _run_legs(a, top: Path, sha: str, run: Path, run_id: str, ledger: Ledger, st
     return [out[k] for k in ("mac", "linux") if k in out]
 
 
-def stop_remote_run(host: str, run_id: str) -> None:
-    """Best effort, from the main thread and outside the tracked children (a kill is already tearing those down)."""
+def stop_remote_run(host: str, run_id: str, remove_dir: bool = True) -> bool:
+    """Best effort, from the main thread and outside the tracked children (a kill is already tearing those down).
+    True when the stop command exited 0; any other outcome is printed."""
     try:
-        subprocess.run(remote_stop_cmd(host, run_id, remove_dir=True), capture_output=True, timeout=180,
-                       stdin=subprocess.DEVNULL)
+        r = subprocess.run(remote_stop_cmd(host, run_id, remove_dir=remove_dir), capture_output=True, timeout=180,
+                           stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError, AssertionError) as e:
         print(f"verify: could not stop the remote run on {host}: {e}", file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        print(f"verify: stopping the remote run on {host} exited {r.returncode}; its runner may still hold the "
+              f"remote host lock", file=sys.stderr)
+        return False
+    return True
 
 
 def fetch_base(top: Path) -> str:
@@ -1707,9 +1891,15 @@ def fetch_base(top: Path) -> str:
         r = git(top, "fetch", "-q", "origin", f"+main:{ref}", check=False)
         if r.returncode != 0:
             raise RuntimeError(f"could not fetch origin main, so the baseline would be stale: {r.stderr.strip()}")
-    p = git(top, "rev-parse", "--verify", f"{ref}^{{commit}}", check=False)
-    if p.returncode != 0:
-        raise RuntimeError(f"{MAIN_REF} is not present in {top}")
+    return resolve_base(top)
+
+
+def resolve_base(repo: Path) -> str:
+    """The commit origin/main names in `repo` right now, as a full sha.  A run reads this once and passes the sha on;
+    nothing later in the run reads the ref again (it can move under a concurrent fetch)."""
+    p = git(repo, "rev-parse", "--verify", f"refs/remotes/{MAIN_REF}^{{commit}}", check=False)
+    if p.returncode != 0 or not p.stdout.strip():
+        raise RuntimeError(f"{MAIN_REF} is not present in {repo}")
     return p.stdout.strip()
 
 
@@ -1721,6 +1911,16 @@ def _print_legs(legs: list[dict]) -> None:
             print(f"verify:   {job['name']}: {job['counts']}")
             for r in job["reds"]:
                 print(f"verify:   red [{r['class']}] {r['nodeid']} ledger={r['ledger_id']}")
+
+
+def platform_refusal(a) -> str | None:
+    """Why this host cannot run the leg that runs here (mac, unless --here names linux), or None.  A receipt never
+    names a leg that did not run on its platform, so `--leg both` or `--leg mac` from a Linux host is refused."""
+    local_leg = a.leg if getattr(a, "here", False) else ("mac" if a.leg in ("mac", "both") else None)
+    if local_leg is None or host_platform() == LEG_PLATFORM[local_leg]:
+        return None
+    return (f"the {local_leg} leg runs on this host, which is {host_platform()}, not {LEG_PLATFORM[local_leg]}; "
+            f"refusing (run the {local_leg} leg from a {LEG_PLATFORM[local_leg]} host)")
 
 
 def cmd_run(a) -> int:
@@ -1736,6 +1936,12 @@ def cmd_run(a) -> int:
         return 2
     run_id = a.run_id or new_run_id(sha)
     run = state / "runs" / run_id
+    why = platform_refusal(a)
+    if why:
+        print(f"verify: {why}", file=sys.stderr)
+        if run.exists():            # a detached start made the run dir: its status says why it never ran
+            Status(run).update(state="refused", note=why)
+        return 2
     lk = lock_host(state)
     if lk is None:
         print(f"verify: another receipt run holds {state / 'host.lock'}; one run per host at a time", file=sys.stderr)
@@ -1755,23 +1961,24 @@ def cmd_run(a) -> int:
     try:
         sweep_runs(state, top, tools, current=run_id)
         if leg_here:
-            if a.base_sha:
-                have = git(top, "rev-parse", "--verify", f"refs/remotes/{MAIN_REF}^{{commit}}", check=False).stdout.strip()
-                if have != a.base_sha:
-                    raise RuntimeError(f"the baseline here is {have or 'absent'}, the orchestrating run pinned {a.base_sha}")
+            base = resolve_base(top)
+            if a.base_sha and base != a.base_sha:
+                raise RuntimeError(f"the baseline here is {base}, the orchestrating run pinned {a.base_sha}")
+            status.update(base_sha=base)
             leg_name = "mac" if a.leg == "mac" else "linux"
             leg = run_leg_local(top, sha, run, run_id, None, status, leg=leg_name,
                                 python=a.python or (MAC_PYTHON if leg_name == "mac" else LINUX_PYTHON),
-                                workers=_workers(a, leg_name), timeout=a.pytest_timeout)
+                                workers=_workers(a, leg_name), timeout=a.pytest_timeout, base_sha=base)
             out = Path(a.leg_json) if a.leg_json else run / f"leg-{leg_name}.json"
             out.write_text(json.dumps(leg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             status.update(state="leg-done", leg_json=str(out), max_load=leg["max_load"], load_reds=leg["load_reds"])
             print(f"verify: leg written to {out}")
             return 0
-        status.update(base_sha=fetch_base(top))
-        legs = _run_legs(a, top, sha, run, run_id, ledger, status, remote=remote)
+        base = fetch_base(top)          # the one read of the land base: every leg and the receipt use this sha
+        status.update(base_sha=base)
+        legs = _run_legs(a, top, sha, run, run_id, ledger, status, remote=remote, base_sha=base)
         diag = [d for leg in legs for d in leg.pop("_diag", [])]
-        receipt = assemble_receipt(top, sha, run_id, legs)
+        receipt = assemble_receipt(top, sha, run_id, legs, base_sha=base)
         if not a.no_diagnosis:
             dp = diagnose(run, top, sha, diag)
             if dp is not None:
@@ -1789,7 +1996,7 @@ def cmd_run(a) -> int:
             print(f"verify: why red: {w}")
         return 0 if receipt["verdict"] == "green" else 1
     except Killed as k:
-        for s in (signal.SIGTERM, signal.SIGINT):
+        for s in HANDLED_SIGNALS:
             signal.signal(s, signal.SIG_IGN)
         if remote.get("started") and not (remote.get("done") or remote.get("stopped")):
             stop_remote_run(a.host, run_id)
@@ -1823,6 +2030,10 @@ def cmd_start(a) -> int:
     top, sha, state = _resolve(a)
     if state_in_repo(state, top):
         print(f"verify: refusing a state dir inside the checkout or under project_memory: {state}", file=sys.stderr)
+        return 2
+    why = platform_refusal(a)
+    if why:
+        print(f"verify: {why}", file=sys.stderr)
         return 2
     run_id = new_run_id(sha)
     run = state / "runs" / run_id
@@ -1943,7 +2154,8 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--workers", type=int, default=None, help="xdist workers for the leg run on this host (default %d mac, %d linux)" % (WORKERS_MAC, WORKERS_LINUX))
         p.add_argument("--linux-workers", type=int, default=None, help="xdist workers on the remote host (default %d)" % WORKERS_LINUX)
         p.add_argument("--host", default=REMOTE_HOST, help="ssh host alias of the linux leg")
-        p.add_argument("--pytest-timeout", type=float, default=5400.0, help="seconds for each full pytest call")
+        p.add_argument("--pytest-timeout", type=float, default=DEFAULT_PYTEST_TIMEOUT,
+                       help="seconds for each full pytest call, on this host and on the remote")
         p.add_argument("--no-diagnosis", action="store_true", help="skip the on-red model call")
 
     rp = sub.add_parser("run", help="run the verification receipt for a sha, in the foreground")

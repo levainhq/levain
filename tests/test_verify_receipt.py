@@ -85,9 +85,27 @@ def test_nodeid_without_checkout_uses_class_heuristic(junit_run):
     assert "test_fx.py::TestK::test_in_class" in ids
 
 
+SYSTEM_OF = {"macos": "Darwin", "linux": "Linux"}
+_REAL_HOST_PLATFORM = getattr(verify, "host_platform", None)
+
+
+@pytest.fixture(autouse=True)
+def _laptop_host(monkeypatch):
+    """The orchestration tests are the laptop's runs: this host reads as macos wherever the suite runs (CI is Linux).
+    A test about the platform check sets host_platform itself."""
+    monkeypatch.setattr(verify, "host_platform", lambda: "macos", raising=False)
+
+
+def _ran_on(leg):
+    """A leg as a real run records it: the system it ran on and its interpreter."""
+    leg["host_fingerprint"] = {"system": SYSTEM_OF.get(leg["platform"], "?")}
+    leg.setdefault("python", "3.12.1")
+    return leg
+
+
 def _leg(reds, collected=10, rc=1, platform="macos"):
-    return {"platform": platform, "jobs": [{"name": "pytest-full-py312", "rc": rc, "reds": reds,
-                                            "counts": dict(collected=collected, passed=0, failed=len(reds), error=0, skipped=0, xfailed=0)}]}
+    return _ran_on({"platform": platform, "jobs": [{"name": "pytest-full-py312", "rc": rc, "reds": reds,
+                                                    "counts": dict(collected=collected, passed=0, failed=len(reds), error=0, skipped=0, xfailed=0)}]})
 
 
 def _both(reds=(), rc=None, linux_reds=()):
@@ -260,7 +278,7 @@ def _full_leg(plat, workers, max_load=3.0, load_reds=0, reds=(), diag=()):
     leg = _leg(list(reds), rc=1 if reds else 0)
     leg.update({"platform": plat, "host": "h", "python": "3.12.1", "duration_s": 1.0, "workers": workers,
                 "max_load": max_load, "load_reds": load_reds, "_diag": list(diag)})
-    return leg
+    return _ran_on(leg)
 
 
 def _args(r, state, *extra):
@@ -441,6 +459,7 @@ def test_a_leg_that_raises_keeps_its_traceback_in_status_and_stderr(repo, tmp_pa
         raise RecursionError("maximum recursion depth exceeded")
 
     monkeypatch.setattr(verify, "run_leg_local", the_raising_step)
+    monkeypatch.setattr(verify, "host_platform", lambda: "linux")      # --here linux runs on the linux host
     assert verify.main(["run", "--sha", sha, "--leg", "linux", "--here", *_args(r, state)]) == 4
     st = json.loads((_only_run(state) / "status.json").read_text())
     assert st["state"] == "error"
@@ -519,7 +538,7 @@ def test_workers_default_by_leg_and_are_recorded_with_max_load(repo, tmp_path, m
     r, sha = repo
     seen = {}
 
-    def local(_r, _s, run, run_id, ledger, status, *, leg, python, workers, timeout):
+    def local(_r, _s, run, run_id, ledger, status, *, leg, python, workers, timeout, **k):
         seen["local"] = (leg, python, workers)
         return _full_leg("macos" if leg == "mac" else "linux", workers, max_load=42.5, load_reds=3)
 
@@ -538,6 +557,7 @@ def test_workers_default_by_leg_and_are_recorded_with_max_load(repo, tmp_path, m
     s2 = tmp_path / "s2"
     assert verify.main(["run", "--sha", sha, "--leg", "both", "--workers", "2", "--linux-workers", "5", *_args(r, s2)]) == 0
     assert seen["local"][2] == 2 and seen["remote"][1] == 5
+    monkeypatch.setattr(verify, "host_platform", lambda: "linux")      # --here linux runs on the linux host
     s3 = tmp_path / "s3"
     assert verify.main(["run", "--sha", sha, "--leg", "linux", "--here", *_args(r, s3)]) == 0
     assert seen["local"] == ("linux", verify.LINUX_PYTHON, 4)
@@ -555,6 +575,7 @@ def test_here_writes_the_leg_json_and_no_receipt_and_touches_no_ledger(repo, tmp
         return _full_leg("linux", 4)
 
     monkeypatch.setattr(verify, "Tools", FakeTools)
+    monkeypatch.setattr(verify, "host_platform", lambda: "linux")      # --here linux runs on the linux host
     monkeypatch.setattr(verify, "run_leg_local", local)
     state = tmp_path / "state"
     out = tmp_path / "out" / "leg.json"
@@ -624,7 +645,7 @@ def _remote_fixture(tmp_path, junit_text=REMOTE_JUNIT, sha="a" * 40):
     rrun = f"{verify.REMOTE_STATE}/runs/{RUN_ID}"
     reds = [{"nodeid": "tests/a.py::l", "class": "load", "evidence": "e1", "ledger_id": None},
             {"nodeid": "tests/a.py::i", "class": "inherited", "evidence": "e2", "ledger_id": None}]
-    leg = {"platform": "linux", "sha": sha, "host": "argushub", "python": "3.13.1", "workers": 4, "max_load": 9.0, "load_reds": 1,
+    leg = {"platform": "linux", "sha": sha, "host": "argushub", "python": "3.12.3", "host_fingerprint": {"system": "Linux"}, "workers": 4, "max_load": 9.0, "load_reds": 1,
            "jobs": [{"name": "pytest-full-py312", "rc": 1, "counts": dict(collected=2, passed=0, failed=2, error=0, skipped=0, xfailed=0),
                      "junit": {"path": f"/home/u/{rrun}/junit-linux.xml", "sha256": hashlib.sha256(junit_text.encode()).hexdigest()},
                      "reds": reds},
@@ -640,11 +661,13 @@ def _stub_sh(r, sha, leg, junit_text, cmds, fail_on=None, junit_override=None):
         cmds.append((cmd, stdin, timeout))
         if fail_on and fail_on in " ".join(cmd):
             return 255
+        base = _g(r, "rev-parse", "refs/remotes/origin/main")
         if cmd[0] == "ssh" and "cat > " in cmd[-1]:
             heads = subprocess.run(["git", "bundle", "list-heads", str(stdin)], capture_output=True, text=True, check=True).stdout
-            assert f"refs/verify/{sha[:12]}" in heads and "refs/remotes/origin/main" in heads
+            assert f"{sha} refs/verify/{sha[:12]}" in heads and f"{base} refs/verify/base-{base[:12]}" in heads
         if cmd[0] == "scp" and cmd[-2].endswith("leg-linux.json"):
-            (Path(cmd[-1]) / "leg-linux.json").write_text(json.dumps(leg))
+            # the remote ran against the base it was shipped, unless the test's leg says otherwise
+            (Path(cmd[-1]) / "leg-linux.json").write_text(json.dumps({"base_sha": base, **leg}))
         if cmd[0] == "scp" and cmd[-2].endswith("junit-linux.xml"):
             (Path(cmd[-1]) / "junit-linux.xml").write_text(junit_override if junit_override is not None else junit_text)
         return 0
@@ -668,10 +691,13 @@ def test_remote_leg_command_lines_and_ledger_filing(repo, tmp_path):
     assert c[1][0] == "scp" and c[1][-2:] == [str(ROOT / "scripts" / "verify.py"), f"argushub:{rrun}/verify.py"]
     run_cmd = c[2][-1]
     assert c[2][:-1] == ssh_pre
-    for frag in (f"cd {rrun}", f"fetch -q ../sha.bundle +refs/verify/{sha[:12]}:refs/verify/{sha[:12]}", "+refs/remotes/origin/main:refs/remotes/origin/main",
-                 f"python3 verify.py run --here --leg linux --sha {sha} --repo xfer/repo --run-id {RUN_ID} --workers 4 --leg-json leg-linux.json"):
+    base = _g(r, "rev-parse", "refs/remotes/origin/main")
+    for frag in (f"cd {rrun}", f"fetch -q ../sha.bundle +refs/verify/{sha[:12]}:refs/verify/{sha[:12]}",
+                 f"+refs/verify/base-{base[:12]}:refs/remotes/origin/main",
+                 f"python3 verify.py run --here --leg linux --sha {sha} --repo xfer/repo --run-id {RUN_ID} --workers 4 "
+                 f"--pytest-timeout {verify.DEFAULT_PYTEST_TIMEOUT} --leg-json leg-linux.json --base-sha {base}"):
         assert frag in run_cmd, frag
-    assert cmds[2][2] == 4 * 3600
+    assert cmds[2][2] == max(verify.REMOTE_TIMEOUT_FLOOR, 3 * verify.DEFAULT_PYTEST_TIMEOUT + verify.REMOTE_SLACK)
     assert c[3][-2:] == [f"argushub:{rrun}/leg-linux.json", str(run / "linux") + "/"]
     assert c[4][-2:] == [f"argushub:/home/u/{rrun}/junit-linux.xml", str(run / "linux") + "/"]
     assert c[-1][:-1] == ssh_pre and c[-1][-1] == f"rm -rf {rrun}"
@@ -868,8 +894,8 @@ def test_v2_a_remote_leg_that_disagrees_with_its_junit_makes_the_receipt_red(rep
 # ---- V3: pytest's exit code must agree with its junit
 
 def _job_leg(rc, failed=0, error=0, reds=(), platform="linux"):
-    return {"platform": platform, "jobs": [{"name": "j", "rc": rc, "reds": list(reds),
-                                             "counts": dict(collected=5, passed=5 - failed - error, failed=failed, error=error, skipped=0, xfailed=0)}]}
+    return _ran_on({"platform": platform, "jobs": [{"name": "j", "rc": rc, "reds": list(reds),
+                                                     "counts": dict(collected=5, passed=5 - failed - error, failed=failed, error=error, skipped=0, xfailed=0)}]})
 
 
 def test_v3_rc_and_junit_must_agree():
@@ -1308,14 +1334,15 @@ def _clean_linux_leg(sha, names=LINUX_JOBS):
     jobs = [{"name": n, "rc": 0, "required_run": False, "counts": dict(collected=1, passed=1, failed=0, error=0, skipped=0, xfailed=0),
              "skips_by_reason": {}, "junit": {"path": f"/home/u/{rrun}/junit-{n}-{i}.xml", "sha256": h}, "reds": []}
             for i, n in enumerate(names)]
-    return {"platform": "linux", "sha": sha, "host": "argushub", "python": "3.13.1", "workers": 4, "max_load": 1.0,
+    return {"platform": "linux", "sha": sha, "host": "argushub", "python": "3.12.3", "host_fingerprint": {"system": "Linux"}, "workers": 4, "max_load": 1.0,
             "load_reds": 0, "jobs": jobs, "_diag": []}
 
 
-def _xml_sh(leg):
+def _xml_sh(leg, r):
     def sh(cmd, *, log, stdin=None, timeout=None):
         if cmd[0] == "scp" and cmd[-2].endswith("leg-linux.json"):
-            (Path(cmd[-1]) / "leg-linux.json").write_text(json.dumps(leg))
+            base = _g(r, "rev-parse", "refs/remotes/origin/main")
+            (Path(cmd[-1]) / "leg-linux.json").write_text(json.dumps({"base_sha": base, **leg}))
         elif cmd[0] == "scp" and cmd[-2].endswith(".xml"):
             (Path(cmd[-1]) / os.path.basename(cmd[-2])).write_text(CLEAN_JUNIT)
         return 0
@@ -1329,7 +1356,7 @@ def test_r1_v2_a_remote_leg_without_its_expected_job_set_is_never_green(repo, tm
     def remote(i, leg):
         run = tmp_path / f"run{i}"
         run.mkdir()
-        return verify.run_leg_remote(r, sha, run, RUN_ID, verify.Ledger(tmp_path / f"l{i}.jsonl"), None, sh=_xml_sh(leg),
+        return verify.run_leg_remote(r, sha, run, RUN_ID, verify.Ledger(tmp_path / f"l{i}.jsonl"), None, sh=_xml_sh(leg, r),
                                      script=ROOT / "scripts" / "verify.py")
 
     full = remote(0, _clean_linux_leg(sha))
@@ -1501,6 +1528,7 @@ def test_rf2_pytest_basetemp_is_a_short_private_tmp_dir_removed_at_teardown(tmp_
     monkeypatch.setattr(verify, "git", lambda *a, **k: types.SimpleNamespace(stdout="", returncode=0))
     seen = []
     monkeypatch.setattr(verify, "_run", lambda cmd, **k: seen.append(cmd) or 0)
+    ctx.base_sha = "b" * 40                                    # pinned by the run, as cmd_run does
     ctx.prepare()
     try:
         assert ctx.tmp.parent == Path(verify.SHORT_TMP_ROOT) and ctx.tmp.name.startswith("lv-") and len(ctx.tmp.name) < 20
@@ -1554,6 +1582,7 @@ def test_rf3_the_leg_records_the_interpreter_path(tmp_path, monkeypatch):
     monkeypatch.setattr(verify, "plan_linux", lambda ctx, python, w, t: ([], [], "3.12.3"))
     monkeypatch.setattr(verify.Ctx, "teardown", lambda self: None)
     monkeypatch.setattr(verify, "host_fingerprint", lambda: {})
+    monkeypatch.setattr(verify, "host_platform", lambda: "linux")
     leg = verify.run_leg_local(tmp_path, SHA40, tmp_path, "rid", None, None, leg="linux", python=verify.LINUX_PYTHON, workers=1, timeout=1)
     assert leg["python_path"] == "/usr/bin/python3.12" and leg["python"] == "3.12.3"
 
@@ -1676,3 +1705,293 @@ def test_remove_tree_stops_when_a_dir_is_renamed_out_mid_walk(tmp_path, monkeypa
     monkeypatch.undo()
     assert fired
     assert (elsewhere / "victim").read_text() == "v"
+
+
+# ================================================================ L3 verifyrc r1 fix round (levain#28)
+
+CLEAN_JOB = {"name": "pytest-full-py312", "rc": 0, "required_run": False, "load_reds": 0, "reds": [],
+             "counts": dict(collected=1, passed=1, failed=0, error=0, skipped=0, xfailed=0)}
+
+
+# ---- HIGH 1: a leg is labelled by the platform it really ran on
+
+def test_rc1_both_legs_from_a_linux_host_never_claim_a_macos_leg(repo, tmp_path, monkeypatch, capsys):
+    """The reproduced case: `--leg both` from Linux ran the local leg on Linux, labelled it macos, and read green."""
+    r, sha = repo
+    if _REAL_HOST_PLATFORM is not None:
+        monkeypatch.setattr(verify, "host_platform", _REAL_HOST_PLATFORM)
+    monkeypatch.setattr(verify.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(verify, "Tools", FakeTools)
+    monkeypatch.setattr(verify, "host_fingerprint", lambda: {"system": verify.platform.system()})
+    monkeypatch.setattr(verify.Ctx, "prepare", lambda self: None)
+    monkeypatch.setattr(verify.Ctx, "teardown", lambda self: None)
+    monkeypatch.setattr(verify, "plan_mac", lambda ctx, python, w, t: ([dict(CLEAN_JOB)], [], "3.12.13"))
+    monkeypatch.setattr(verify, "run_leg_remote", lambda *a, **k: _full_leg("linux", 4))
+    state = tmp_path / "state"
+    rc = verify.main(["run", "--sha", sha, "--leg", "both", *_args(r, state)])
+    receipts = sorted((tmp_path / "receipts").glob("*.json")) if (tmp_path / "receipts").exists() else []
+    assert [json.loads(p.read_text())["verdict"] for p in receipts if json.loads(p.read_text())["verdict"] == "green"] == []
+    assert rc == 2 and receipts == [] and "refusing" in capsys.readouterr().err
+    assert verify.main(["start", "--sha", sha, "--leg", "both", *_args(r, tmp_path / "s2")]) == 2   # nothing detaches
+    assert not (tmp_path / "s2" / "runs").exists()
+    rid = f"20261109T000000Z-{sha[:8]}-ab12"
+    (state / "runs" / rid).mkdir(parents=True)                       # the dir a detached start made before the child
+    assert verify.main(["run", "--sha", sha, "--leg", "both", "--run-id", rid, *_args(r, state)]) == 2
+    assert verify.read_status(state / "runs" / rid)["state"] == "refused"
+    with pytest.raises(RuntimeError, match="must run on macos; this host is linux"):
+        verify.run_leg_local(r, sha, tmp_path / "run", "rid", None, None, leg="mac", python="3.12.13", workers=1, timeout=1)
+
+
+def test_rc1_a_leg_whose_system_or_interpreter_is_not_its_platforms_is_red():
+    mac, lin = _both()
+    assert verify.verdict_of([mac, lin])[0] == "green"
+    mac["host_fingerprint"] = {"system": "Linux"}                          # labelled macos, ran on Linux
+    v, why = verify.verdict_of([mac, lin])
+    assert v == "red" and any("macos: the leg ran on Linux, not on Darwin" in w for w in why), why
+    mac, lin = _both()
+    del lin["host_fingerprint"]                                            # nothing says where it ran
+    assert verify.verdict_of([mac, lin])[0] == "red"
+    mac, lin = _both()
+    mac["python"] = "3.11.9"                                               # --python 3.11 is not the 3.12 mac leg
+    v, why = verify.verdict_of([mac, lin])
+    assert v == "red" and any("Python '3.11.9'" in w for w in why), why
+
+
+# ---- HIGH 2: the land base is pinned once and the receipt names it
+
+def test_rc2_the_receipt_names_the_base_pinned_before_the_legs_even_when_origin_main_moves(repo, tmp_path, monkeypatch):
+    r, sha = repo
+    pinned = _g(r, "rev-parse", "refs/remotes/origin/main")
+    monkeypatch.setattr(verify, "Tools", FakeTools)
+    monkeypatch.setattr(verify, "host_fingerprint", lambda: {"system": "Darwin"})
+
+    def plan(ctx, python, w, t):
+        _g(r, "update-ref", "refs/remotes/origin/main", sha)              # a concurrent fetch moves origin/main
+        ctx.prepare()
+        return [dict(CLEAN_JOB)], [], "3.12.13"
+
+    monkeypatch.setattr(verify, "plan_mac", plan)
+    state = tmp_path / "state"
+    assert verify.main(["run", "--sha", sha, "--leg", "mac", *_args(r, state)]) == 1      # one leg: partial
+    rec = json.loads(_one_receipt(tmp_path / "receipts", sha).read_text())
+    assert _g(r, "rev-parse", "refs/remotes/origin/main") == sha != pinned
+    assert rec.get("base_sha") == pinned and rec["legs"][0]["base_sha"] == pinned
+    assert verify.read_status(_only_run(state))["base_sha"] == pinned
+
+
+def test_rc2_the_remote_leg_is_shipped_the_pinned_base_and_a_leg_on_another_base_is_red(repo, tmp_path):
+    r, sha = repo
+    pinned = _g(r, "rev-parse", "refs/remotes/origin/main")
+    _g(r, "update-ref", "refs/remotes/origin/main", sha)                  # moved after the pin
+    run = tmp_path / "run"
+    run.mkdir()
+    rrun, leg, jt = _remote_fixture(tmp_path, sha=sha)
+    seen = {}
+
+    def sh(cmd, *, log, stdin=None, timeout=None):
+        if cmd[0] == "ssh" and "cat > " in cmd[-1]:
+            seen["heads"] = subprocess.run(["git", "bundle", "list-heads", str(stdin)], capture_output=True, text=True,
+                                           check=True).stdout
+        if cmd[0] == "ssh" and "verify.py run --here" in cmd[-1]:
+            seen["cmd"] = cmd[-1]
+        if cmd[0] == "scp" and cmd[-2].endswith("leg-linux.json"):
+            (Path(cmd[-1]) / "leg-linux.json").write_text(json.dumps({**leg, "base_sha": sha}))   # it ran on the moved ref
+        if cmd[0] == "scp" and cmd[-2].endswith("junit-linux.xml"):
+            (Path(cmd[-1]) / "junit-linux.xml").write_text(jt)
+        return 0
+
+    got = verify.run_leg_remote(r, sha, run, RUN_ID, verify.Ledger(tmp_path / "l.jsonl"), None, base_sha=pinned, sh=sh,
+                                script=ROOT / "scripts" / "verify.py")
+    assert f"{pinned} refs/verify/base-{pinned[:12]}" in seen["heads"] and f"--base-sha {pinned}" in seen["cmd"]
+    assert any("records base" in e and pinned in e for e in got["integrity"]), got["integrity"]
+    assert _g(r, "for-each-ref", "refs/verify") == ""
+    mac, lin = _both()
+    mac["base_sha"], lin["base_sha"] = pinned, sha
+    rec = verify.build_receipt(sha, "r", {}, "b", [mac, lin], True, base_sha=pinned)
+    assert rec["verdict"] == "red" and rec["base_sha"] == pinned and any("the run pinned" in w for w in rec["verdict_why"])
+
+
+# ---- the MED findings that a real run reaches
+
+def test_rc3_two_legs_filing_the_same_red_at_once_make_one_ledger_entry(tmp_path, monkeypatch):
+    led = verify.Ledger(tmp_path / "l.jsonl")
+    gate = threading.Barrier(2, timeout=1.0)
+    orig = verify.Ledger.entries
+
+    def entries(self):
+        got = orig(self)
+        try:
+            gate.wait()                       # both threads have read before either appends (if nothing serialises them)
+        except threading.BrokenBarrierError:
+            pass
+        return got
+
+    monkeypatch.setattr(verify.Ledger, "entries", entries)
+    out = []
+    ths = [threading.Thread(target=lambda: out.append(led.file("tests/a.py::t", "inherited", "r", "s", "e"))) for _ in range(2)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(20)
+    monkeypatch.undo()
+    types_ = [x["type"] for x in led.lines()]
+    assert types_.count("entry") == 1 and types_.count("sighting") == 1 and len({lid for lid, _ in out}) == 1, types_
+
+
+def test_rc3_two_starters_reclaiming_one_stale_host_lock_cannot_both_hold_it(tmp_path, monkeypatch):
+    import fcntl
+    state = tmp_path / "s"
+    state.mkdir()
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    stale = open(state / "host.lock", "w")                       # a leaked descriptor of a dead run keeps the flock
+    fcntl.flock(stale, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    stale.write(f"{dead.pid} then\n")
+    stale.flush()
+    orig, inner = verify._pid_dead, []
+
+    def pid_dead(pid):
+        if not inner:
+            inner.append(None)
+            inner[0] = verify.lock_host(state)                    # a second starter runs its whole lock_host here
+        return orig(pid)
+
+    monkeypatch.setattr(verify, "_pid_dead", pid_dead)
+    outer = verify.lock_host(state)
+    held = [f for f in (outer, inner[0] if inner else None) if f is not None]
+    try:
+        assert len(held) == 1, "both starters came away holding the host lock"
+    finally:
+        for f in held:
+            f.close()
+        stale.close()
+
+
+def test_rc3_a_junit_left_from_an_earlier_call_is_never_read_as_this_ones(tmp_path, monkeypatch):
+    h = JobHarness(tmp_path, monkeypatch)
+    (h.run / "junit-mac.xml").write_text(JobHarness._xml([("ok", "")]))     # an earlier run's clean report
+    monkeypatch.setattr(verify, "_run", lambda cmd, **k: 0)                  # pytest exits 0 and writes nothing
+    with pytest.raises(RuntimeError, match="produced no junit"):
+        h.job()
+
+
+def test_rc3_an_unconfirmed_remote_stop_is_flagged_and_the_run_stops_it_again(repo, tmp_path, monkeypatch):
+    r, sha = repo
+    run = tmp_path / "run"
+    run.mkdir()
+    rrun, leg, jt = _remote_fixture(tmp_path, sha=sha)
+
+    def sh_with(stop_rc):
+        def sh(cmd, *, log, stdin=None, timeout=None):
+            if "verify.py run --here" in cmd[-1]:
+                return 124                                                   # the ssh call timed out
+            if "kill -TERM" in cmd[-1]:
+                return stop_rc
+            return 0
+        return sh
+
+    with pytest.raises(RuntimeError) as ok:
+        verify.run_leg_remote(r, sha, run, RUN_ID, verify.Ledger(tmp_path / "l.jsonl"), None, sh=sh_with(0),
+                              script=ROOT / "scripts" / "verify.py")
+    assert not getattr(ok.value, "verify_remote_unstopped", False)
+    with pytest.raises(RuntimeError) as bad:
+        verify.run_leg_remote(r, sha, run, RUN_ID, verify.Ledger(tmp_path / "l.jsonl"), None, sh=sh_with(255),
+                              script=ROOT / "scripts" / "verify.py")
+    assert getattr(bad.value, "verify_remote_unstopped", False) is True
+    stopped = []
+    monkeypatch.setattr(verify, "stop_remote_run", lambda host, rid, remove_dir=True: stopped.append((host, rid, remove_dir)))
+
+    def remote(*a, **k):
+        raise bad.value
+
+    monkeypatch.setattr(verify, "run_leg_remote", remote)
+    a = types.SimpleNamespace(leg="linux", host="argushub", here=False, workers=None, linux_workers=None, python=None, pytest_timeout=5.0)
+    with pytest.raises(RuntimeError):
+        verify._run_legs(a, tmp_path, SHA40, tmp_path, RUN_ID, verify.Ledger(tmp_path / "l2"), verify.Status(tmp_path))
+    assert stopped == [("argushub", RUN_ID, False)]
+
+
+def test_rc3_the_pytest_timeout_reaches_the_remote_run_and_sizes_its_outer_timeout(repo, tmp_path, monkeypatch):
+    r, sha = repo
+    rrun, leg, jt = _remote_fixture(tmp_path, sha=sha)
+    for i, (pt, outer) in enumerate(((10, verify.REMOTE_TIMEOUT_FLOOR), (20000, 3 * 20000 + verify.REMOTE_SLACK))):
+        run = tmp_path / f"run{i}"
+        run.mkdir()
+        cmds = []
+        verify.run_leg_remote(r, sha, run, RUN_ID, verify.Ledger(tmp_path / f"l{i}.jsonl"), None, pytest_timeout=pt,
+                              sh=_stub_sh(r, sha, leg, jt, cmds), script=ROOT / "scripts" / "verify.py")
+        step = [x for x in cmds if "verify.py run --here" in x[0][-1]][0]
+        assert f"--pytest-timeout {float(pt)}" in step[0][-1] and step[2] == outer
+    seen = {}
+    monkeypatch.setattr(verify, "run_leg_remote", lambda *a, **k: seen.update(k) or _full_leg("linux", 4))
+    a = types.SimpleNamespace(leg="linux", host="argushub", here=False, workers=None, linux_workers=None, python=None, pytest_timeout=10.0)
+    verify._run_legs(a, tmp_path, SHA40, tmp_path, RUN_ID, verify.Ledger(tmp_path / "l"), verify.Status(tmp_path))
+    assert seen["pytest_timeout"] == 10.0
+
+
+def test_rc3_a_killed_child_that_never_exits_does_not_hang_the_run(tmp_path, monkeypatch):
+    class Stuck:                                                   # SIGKILL cannot reap it (uninterruptible sleep)
+        pid = 2 ** 22 + 7
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                raise AssertionError("an unbounded wait on a child that SIGKILL cannot reap hangs the run")
+            raise subprocess.TimeoutExpired("x", timeout)
+
+    monkeypatch.setattr(verify, "_spawn", lambda *a, **k: Stuck())
+    monkeypatch.setattr(verify, "_kill_group", lambda p, grace=5.0: None)
+    monkeypatch.setattr(verify, "REAP_WAIT", 0.01, raising=False)
+    log = tmp_path / "log"
+    assert verify._run(["x"], cwd=tmp_path, env={}, log=log, timeout=0.01) == 124
+    assert "UNREAPED" in log.read_text() and "TIMEOUT" in log.read_text()
+
+
+def test_rc3_a_captured_helper_is_bounded_and_still_returns_its_output(tmp_path):
+    env = {"PATH": "/usr/bin:/bin"}
+    assert verify._capture(["echo", "h11>=0.16"], cwd=tmp_path, env=env, log=tmp_path / "log") == (0, "h11>=0.16\n")
+    t0 = time.time()
+    rc, out = verify._capture(["sleep", "30"], cwd=tmp_path, env=env, log=tmp_path / "log", timeout=0.5)
+    assert rc == 124 and out == "" and time.time() - t0 < 15
+
+
+def test_rc3_a_child_a_finished_command_left_in_its_group_is_killed(tmp_path):
+    pidf = tmp_path / "pid"
+    rc = verify._run(["/bin/sh", "-c", f"sleep 60 & echo $! > {pidf}; exit 0"], cwd=tmp_path, env={"PATH": "/usr/bin:/bin"},
+                     log=tmp_path / "log", timeout=30)
+    pid = int(pidf.read_text())
+
+    def alive():
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    try:
+        end = time.time() + 5
+        while alive() and time.time() < end:
+            time.sleep(0.05)
+        assert rc == 0 and not alive(), "a background child of a passed command survived it"
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_rc3_sighup_is_handled_like_sigterm():
+    prev = verify.install_signal_handlers()
+    try:
+        assert signal.getsignal(signal.SIGHUP) is signal.getsignal(signal.SIGTERM)    # checked before any SIGHUP is sent
+        with pytest.raises(verify.Killed):
+            os.kill(os.getpid(), signal.SIGHUP)
+            time.sleep(2)
+    finally:
+        verify.restore_signal_handlers(prev)
+
+
+def test_rc3_a_red_with_no_failure_text_is_never_the_same_failure_as_main(tmp_path):
+    rec = verify.classify([{"nodeid": "tests/a.py::t", "kind": "failure", "text": "\n"}], ledger=verify.Ledger(tmp_path / "l"),
+                          run_id="r", sha="s", touched=set(), rerun=lambda n: False,
+                          baseline=lambda n: {"tests/a.py::t": {"state": "red", "sig": ["", ""]}})[0]
+    assert rec["class"] == "regression" and "no failure text" in rec["evidence"] and rec["ledger_id"] is None
