@@ -1177,6 +1177,8 @@ def _sealed_argv(claude_bin: str, model: str | None) -> list[str]:
       put the operator's private state into that model's context, and ``untrusted_text`` would carry it out.
     * ``--safe-mode`` also turns off CLAUDE.md discovery, auto-memory, skills, installed plugins and custom agents.
       ``--bare`` is not used: it reads no OAuth or keychain credential, and the operator's auth is OAuth.
+    * NOT covered: a machine-level admin-managed policy (its hooks were not probed); the launcher runs the roles on a
+      host with none (see :mod:`levain.desk.sealed`).
 
     The rest is the launcher's (not built in this commit): an empty cwd, a scrubbed environment and the unwrap of the
     ``--output-format json`` envelope, listed in :mod:`levain.desk.sealed`'s docstring as THE LAUNCHER MUST."""

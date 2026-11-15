@@ -308,6 +308,59 @@ def test_purge_closes_its_directory_scan(store):
     assert closed == [True]
 
 
+def test_put_closes_its_descriptor_when_the_file_object_cannot_be_made(store):
+    opened: list[int] = []
+    real_open = os.open
+
+    def tracked_open(*a, **kw):
+        fd = real_open(*a, **kw)
+        opened.append(fd)
+        return fd
+
+    with mock.patch.object(sealed.os, "open", side_effect=tracked_open), \
+            mock.patch.object(sealed.os, "fdopen", side_effect=OSError("no file object")):
+        with pytest.raises(OSError):
+            store.put(b"leak?")
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])                                    # closed, not leaked
+    assert [p.name for p in store.root.iterdir()] == []       # and the temporary file is gone
+
+
+@pytest.mark.parametrize("now", [datetime.min.replace(tzinfo=timezone.utc),
+                                 datetime(1, 1, 2, tzinfo=timezone.utc)])
+def test_purge_at_a_time_too_early_to_subtract_the_retention_is_a_fixed_refusal(store, now):
+    store.put(b"x")
+    with pytest.raises(sealed.BodyRefused) as exc:
+        store.purge(now)
+    assert type(exc.value) is sealed.BodyRefused and str(store.root) not in str(exc.value)
+
+
+def test_purge_whose_directory_scan_fails_is_a_fixed_refusal(store):
+    store.put(b"x")
+    with mock.patch.object(sealed.os, "scandir", side_effect=PermissionError(13, "denied", str(store.root))):
+        with pytest.raises(sealed.BodyRefused) as exc:
+            store.purge(datetime.now(timezone.utc))
+    assert type(exc.value) is sealed.BodyRefused and str(store.root) not in str(exc.value)
+
+
+def test_a_store_directory_that_cannot_be_examined_or_made_is_a_fixed_refusal(tmp_path):
+    blocked = tmp_path / "a_file"
+    blocked.write_bytes(b"")
+    s = sealed.BodyStore(blocked / "bodies")                  # its parent is a file: neither lstat nor mkdir can work
+    for call in (lambda: s.put(b"x"), lambda: s.read_raw("sha256:" + "0" * 64),
+                 lambda: s.purge(datetime.now(timezone.utc))):
+        with pytest.raises(sealed.BodyRefused) as exc:
+            call()
+        assert type(exc.value) is sealed.BodyRefused and str(blocked) not in str(exc.value)
+    ok = sealed.BodyStore(tmp_path / "bodies")
+    ok.put(b"x")
+    with mock.patch.object(sealed.os, "lstat", side_effect=PermissionError(13, "denied")):
+        with pytest.raises(sealed.BodyRefused) as exc:
+            ok.purge(datetime.now(timezone.utc))
+    assert type(exc.value) is sealed.BodyRefused
+
+
 def test_default_store_lives_under_the_levain_home_it_is_given(tmp_path):
     s = sealed.default_store(tmp_path)
     assert tmp_path in s.root.parents and s.root.name == sealed.STORE_DIR_NAME
@@ -390,14 +443,49 @@ def test_schema_invalid_reader_output_is_untrusted_and_never_coerced(raw):
     "\x01", "\x07", "\x08", "\x0b", "\x0c", "\r", "\x1f",   # C0 controls other than tab and newline
     "\x1b[2J", "\x1b]0;title\x07", "\x9b2J", "\x85",         # ESC, CSI (C1) and another C1
     "\x7f",                                                  # DEL
-    "‪", "‫", "‬", "‭", "‮",        # bidi embedding and override
-    "⁦", "⁧", "⁨", "⁩",                  # bidi isolates
-    "​", "‌", "‍", "⁠", "﻿",        # zero-width and the BOM
+    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",        # bidi embedding and override
+    "\u2066", "\u2067", "\u2068", "\u2069",                  # bidi isolates
+    "\u200b", "\u200c", "\u200d", "\u2060", "\ufeff",        # zero-width and the BOM
 ])
 def test_untrusted_text_with_a_control_bidi_or_hidden_character_is_untrusted(bad):
     raw = good_reader(untrusted_text="asks " + bad + " about it")
     assert sealed.parse_reader_output(raw) is sealed.UNTRUSTED
     assert sealed.parse_drafter_output(json.dumps({"text": "Thanks " + bad, "voice": "flow"})) is sealed.UNTRUSTED
+
+
+def _cps(lo: int, hi: int) -> list[int]:
+    return list(range(lo, hi + 1))
+
+
+#: every code point the :data:`sealed._UNSAFE_CHARS` comment names, range by range
+_NAMED_UNSAFE = (_cps(0x00, 0x08) + _cps(0x0B, 0x1F) + [0x7F] + _cps(0x80, 0x9F) + [0xD800, 0xDBFF, 0xDC00, 0xDFFF]
+                 + _cps(0x202A, 0x202E) + _cps(0x2066, 0x2069) + [0x200E, 0x200F, 0x061C]
+                 + _cps(0x200B, 0x200D) + [0x2060, 0xFEFF] + [0x2028, 0x2029] + _cps(0x2061, 0x2064)
+                 + _cps(0xFE00, 0xFE0F) + _cps(0xE0000, 0xE007F))
+
+
+def test_every_character_the_unsafe_class_names_is_refused():
+    """The class as one whole: each code point its comment names is caught, and tab and newline are not."""
+    missed = [hex(cp) for cp in _NAMED_UNSAFE if sealed._UNSAFE_CHARS.search("a" + chr(cp) + "b") is None]
+    assert missed == []
+    assert sealed._UNSAFE_CHARS.search("a\tb\nc") is None
+    assert sealed._UNSAFE_CHARS.search("-") is None                  # a literal hyphen is not a range bound
+
+
+@pytest.mark.parametrize("cp", [0x200E, 0x200F, 0x061C, 0x2028, 0x2029, *_cps(0x2061, 0x2064),
+                                *_cps(0xFE00, 0xFE0F), *_cps(0xE0000, 0xE007F)], ids=hex)
+def test_directional_marks_separators_invisible_operators_selectors_and_tags_are_untrusted(cp):
+    bad = chr(cp)
+    assert sealed.parse_reader_output(good_reader(untrusted_text="asks " + bad + " it")) is sealed.UNTRUSTED
+    assert sealed.parse_drafter_output(json.dumps({"text": "Thanks " + bad, "voice": "flow"})) is sealed.UNTRUSTED
+
+
+def test_the_sealed_module_source_is_printable_ascii():
+    """No literal invisible, bidi or surrogate character can hide in the trust-boundary source: every code point the
+    class holds is written as an escape."""
+    raw = Path(sealed.__file__).read_bytes()
+    bad = sorted({b for b in raw if not (0x20 <= b <= 0x7E or b == 0x0A)})
+    assert bad == []
 
 
 def test_untrusted_text_keeps_tab_newline_and_ordinary_unicode():
@@ -647,14 +735,22 @@ def test_an_unknown_voice_refuses_with_the_fixed_sentence(world, voice):
     assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_VOICE and not rig.sent
 
 
-@pytest.mark.parametrize("drafted", [GOOD_DRAFT, None, {"text": GOOD_DRAFT, "voice": "stand_in"},
-                                     (GOOD_DRAFT, "stand_in")])
+@pytest.mark.parametrize("drafted", [GOOD_DRAFT, {"text": GOOD_DRAFT, "voice": "stand_in"},
+                                     (GOOD_DRAFT, "stand_in"), 0, ""])
 def test_a_draft_with_no_voice_refuses(world, drafted):
     g = signed(world)
     rig = Rig(world)
     with pytest.raises(fx.EffectRefused) as exc:
         rig.effects(drafter=lambda event_id: drafted).send_ack(g["id"], EVT, expect_sha256=D(g))
     assert str(exc.value) == fx.R_VOICE and not rig.sent
+
+
+def test_a_drafter_with_no_draft_refuses_as_no_draft_not_as_a_voice(world):
+    g = signed(world)
+    rig = Rig(world)
+    with pytest.raises(fx.EffectRefused) as exc:
+        rig.effects(drafter=lambda event_id: None).send_ack(g["id"], EVT, expect_sha256=D(g))
+    assert type(exc.value) is fx._OwnRefusal and str(exc.value) == fx.R_DRAFT and not rig.sent
 
 
 def test_a_draft_subclass_cannot_carry_its_own_voice_logic(world):

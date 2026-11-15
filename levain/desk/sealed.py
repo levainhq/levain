@@ -9,7 +9,8 @@ between a raw message and the desk's effects. This module is what they read and 
   opens nothing. A body is written atomically (mode 0600 in a 0700 directory), is at most :data:`BODY_MAX` bytes, is
   read back only if it is a regular file with one link and its bytes still hash to the ref, and is deleted by
   :meth:`BodyStore.purge` once it is older than :data:`RETENTION`. :meth:`BodyStore.raw_source` is the call shape
-  ``Effects.raw_source`` takes.
+  ``Effects.raw_source`` takes. KNOWN EDGE: re-storing the same bytes keeps the first write's mtime, so a re-delivery
+  on day 29 is purged on day 30 (rare, and the event acts within hours).
 * AN OVERSIZE MESSAGE. The mail door takes up to :data:`levain.desk.events.MAIL_RAW_MAX` bytes, more than
   :data:`BODY_MAX`. :meth:`BodyStore.put` of a body over :data:`BODY_MAX` raises :class:`BodyOversize` (its one fixed
   text, :data:`R_BODY_OVERSIZE`) and writes nothing. The caller turns that into an event with trust ``untrusted`` and
@@ -26,7 +27,9 @@ between a raw message and the desk's effects. This module is what they read and 
 THE LAUNCHER (not built in this commit) MUST, for either role: run the argv of
 :func:`levain.desk.claude_session.sealed_reader_argv` / :func:`levain.desk.claude_session.sealed_drafter_argv` as
 given (it loads no settings source and runs in safe mode, so no hook, plugin, CLAUDE.md or memory of the operator
-reaches a model that reads attacker text); give the child an EMPTY working directory of its own (no CLAUDE.md, no
+reaches a model that reads attacker text); run on a host with NO machine-level managed-policy settings or hooks
+(the live probe covered the operator's own hooks; an admin-managed policy hook was not probed and may still apply);
+give the child an EMPTY working directory of its own (no CLAUDE.md, no
 ``.claude/``, no repository above it) and an explicit scrubbed environment it names (never ``os.environ`` passed
 through); hand the body or the message on stdin, never in the argv; and unwrap the ``result`` string from the
 ``--output-format json`` envelope BEFORE :func:`parse_reader_output` / :func:`parse_drafter_output`. The parsers take
@@ -90,11 +93,15 @@ def _refuse(why: str) -> BodyRefused:
 
 
 #: characters ``untrusted_text`` (and a draft's text) may not hold: C0 controls other than tab and newline, DEL, the
-#: C1 controls (CSI among them), a lone surrogate, the bidi embedding, override and isolate controls, the zero-width
-#: space, joiners and word joiner, and the byte-order mark. Each would be a terminal escape, a reordering, a hidden
-#: character, or a string that cannot be encoded
-_UNSAFE_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff‪-‮⁦-⁩"
-                           "​-‍⁠﻿]")
+#: C1 controls (CSI among them), a lone surrogate, the bidi embedding, override and isolate controls, the bidi marks
+#: (LRM, RLM, ALM), the zero-width space, joiners and word joiner, the invisible operators, the line and paragraph
+#: separators, the variation selectors, the tag block, and the byte-order mark. Each would be a terminal escape, a
+#: reordering, a hidden character, or a string that cannot be encoded. Every code point is written as an escape, so
+#: the source holds no invisible character (a test pins this file as printable ASCII)
+_UNSAFE_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff"
+                           "\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c"
+                           "\u200b-\u200d\u2060-\u2064\u2028\u2029\ufeff"
+                           "\ufe00-\ufe0f\U000e0000-\U000e007f]")
 
 
 def _digest(raw: bytes) -> str:
@@ -118,7 +125,14 @@ class BodyStore:
 
     # --- the directory ---------------------------------------------------------------------------------------------
     def _dir(self, *, create: bool) -> bool:
-        """True when the store directory exists and is private; False when it is absent and not created."""
+        """True when the store directory exists and is private; False when it is absent and not created. Any other
+        fault examining or making it (no permission, a parent that is a file) is one fixed :class:`BodyRefused`."""
+        try:
+            return self._dir_checked(create=create)
+        except OSError:
+            raise _refuse("the body store cannot be examined or made") from None
+
+    def _dir_checked(self, *, create: bool) -> bool:
         try:
             st = os.lstat(self.root)
         except FileNotFoundError:
@@ -166,7 +180,15 @@ class BodyStore:
         tmp = self.root / (".tmp-" + os.urandom(16).hex())
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
-            with os.fdopen(fd, "wb") as fh:
+            try:
+                fh = os.fdopen(fd, "wb")
+            except BaseException:
+                try:
+                    os.close(fd)                  # fdopen never took the descriptor: it is still ours to close
+                except OSError:
+                    pass
+                raise
+            with fh:
                 os.fchmod(fh.fileno(), 0o600)
                 fh.write(raw)
                 fh.flush()
@@ -226,24 +248,31 @@ class BodyStore:
     def purge(self, now: datetime) -> int:
         """Delete every stored body written more than :data:`RETENTION` before ``now`` (an aware datetime), and every
         leftover temporary file that old; returns how many files went. Only files this store names are touched; a
-        symlink is unlinked as a link and never followed. A fault on one entry skips that entry and the sweep goes on.
-        The caller runs this on a schedule."""
+        symlink is unlinked as a link and never followed. A fault on one entry skips that entry and the sweep goes on; a
+        time too early to subtract the retention from, or a directory that cannot be scanned, is one fixed
+        :class:`BodyRefused`. The caller runs this on a schedule."""
         if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
             raise _refuse("purge needs an aware time")
+        try:
+            cutoff = (now - RETENTION).timestamp()
+        except (OverflowError, ValueError, OSError):
+            raise _refuse("purge needs a time later than the retention") from None
         if not self._dir(create=False):
             return 0
-        cutoff = (now - RETENTION).timestamp()
         gone = 0
-        with os.scandir(self.root) as entries:
-            for entry in entries:
-                if _BODY_FILE.fullmatch(entry.name) is None and _TMP_FILE.fullmatch(entry.name) is None:
-                    continue
-                try:
-                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
-                        os.unlink(entry.path)
-                        gone += 1
-                except OSError:
-                    continue              # gone already, a directory so named, or no permission: skip this one
+        try:
+            with os.scandir(self.root) as entries:
+                for entry in entries:     # a fault reading the directory itself (open or next) is the refusal below
+                    if _BODY_FILE.fullmatch(entry.name) is None and _TMP_FILE.fullmatch(entry.name) is None:
+                        continue
+                    try:
+                        if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                            os.unlink(entry.path)
+                            gone += 1
+                    except OSError:
+                        continue          # gone already, a directory so named, or no permission: skip this one
+        except OSError:
+            raise _refuse("the body store cannot be scanned") from None
         return gone
 
 

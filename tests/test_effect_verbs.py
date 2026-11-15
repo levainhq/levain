@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import io
 import json
+import os
 import shutil
 import subprocess
 from datetime import timedelta
@@ -142,6 +143,17 @@ def test_the_subprocess_runner_never_uses_a_shell(world):
             fx.subprocess_runner(bad)
     with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 1)):
         assert fx.subprocess_runner(["/usr/bin/ssh"]) == -1
+
+
+@pytest.mark.parametrize("home", ["", None])
+def test_the_runner_environment_falls_back_to_root_for_an_empty_or_absent_home(home):
+    env = {k: v for k, v in os.environ.items() if k != "HOME"}
+    if home is not None:
+        env["HOME"] = home
+    with mock.patch.dict(os.environ, env, clear=True):
+        assert fx._runner_env() == {"PATH": "/usr/bin:/bin", "HOME": "/"}
+    with mock.patch.dict(os.environ, {"HOME": "/home/desk", "SSH_AUTH_SOCK": "/tmp/agent"}):
+        assert fx._runner_env() == {"PATH": "/usr/bin:/bin", "HOME": "/home/desk"}
 
 
 def test_the_module_has_no_shell_in_its_source():
@@ -519,7 +531,7 @@ def test_a_transport_fault_says_nothing_it_was_told(world):
     "Your meeting is on 5 March.", "We will talk at 3 pm.", "Call on Monday.", "We will reply tomorrow.", "It is due soon.",
     "The price is fine.", "That costs one hundred dollars.", "Payment is not needed.", "I will approve it.", "We promise.",
     "We'll handle it.", "I'd say yes.", "Confirmed, we agree.", "That is going to work.", "Of course, done.",
-    "Sure thing.", "Thanks!​", "Merci été.", "Thanks\x00there", "Total: $5", "Okay <b>bold</b>", "Reply [here]",
+    "Sure thing.", "Thanks!\u200b", "Merci été.", "Thanks\x00there", "Total: $5", "Okay <b>bold</b>", "Reply [here]",
     "", "   ", "word " * 60, "a" * 700, 42, None, ["Thanks."],
 ])
 def test_the_lexical_check_refuses_links_attachments_dates_prices_and_commitments(world, draft):

@@ -243,11 +243,13 @@ def subprocess_runner(argv: Sequence[str]) -> int:
 
 
 def _runner_env() -> dict[str, str]:
-    """The ssh child's whole environment: a fixed PATH and HOME (ssh finds its pinned config there). Not
-    :func:`levain.launch.child_env`, whose allowlist carries ``SSH_AUTH_SOCK``: this child must reach no agent."""
+    """The ssh child's whole environment: a fixed PATH and HOME, and nothing inherited (no ``SSH_AUTH_SOCK``; not
+    :func:`levain.launch.child_env`, whose allowlist carries it). An empty or absent HOME is ``/``. KNOWN EDGE: the
+    ssh config the child reads is HOME's, so an ``IdentityAgent`` or other setting there still applies; ND-8 must pin
+    it (``-F`` a fixed config, its own known-hosts file, an explicit key, no ``IdentityAgent``)."""
     import os
 
-    return {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/")}
+    return {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME") or "/"}
 
 
 # --- send_ack: the sender, derived by code, and the lexical check ----------------------------------------------------
@@ -523,6 +525,8 @@ class Effects:
             if _trusted(exc):                               # only this module's own refusals (inbound_from, the
                 raise                                       # event checks) pass; an executor's is R_FAILED
             raise _OwnRefusal(R_FAILED) from None
+        if draft is None:                                   # the drafter wrote nothing; any other non-Draft has no voice
+            raise _OwnRefusal(R_DRAFT)
         if (type(draft) is not Draft or type(draft.voice) is not str or draft.voice not in DISCLOSURES
                 or draft.voice != voice):                   # the voice the order signed is the only one disclosed
             raise _OwnRefusal(R_VOICE)
