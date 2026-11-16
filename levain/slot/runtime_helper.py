@@ -56,7 +56,7 @@ from levain.slot.grammar import SESSION_RE
 from levain.slot.runtime_grammar import _NAME_RE as _WIRE_NAME_RE
 from levain.slot.ids import SlotId, in_own_range
 from levain.slot.layout import BASE_ROUTES_FORMAT, BASE_ROUTES_FORMATS, RUN, STORE, admits_root, repair_line, store_dir_row
-from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
+from levain.slot.runtime_grammar import (DISPATCH, OPERATOR, STDIN_VERBS, VENDORS, PrepareInput, RenderBlob, RuntimeRequest,
                                          bind_stdin, ok_line, parse_runtime_argv, parse_stdin, refusal_line)
 
 PREPARE_RESULT_FORMAT = "levain-prepare-result/1"
@@ -4164,11 +4164,37 @@ def _read_allow_locked(ctx: Ctx, a: R.Alloc, SV) -> Dict[str, object]:
     return {"present": True, "b64": base64.b64encode(bytes(out)).decode("ascii")}
 
 
+def _egress_grant(ctx: Ctx, req: RuntimeRequest, blob: object) -> Dict[str, object]:
+    from levain.slot import egress_verbs as EV
+
+    return EV.egress_grant(ctx, req, blob)
+
+
+def _egress_grant_revoke(ctx: Ctx, req: RuntimeRequest, blob: object) -> Dict[str, object]:
+    from levain.slot import egress_verbs as EV
+
+    return EV.egress_grant_revoke(ctx, req, blob)
+
+
+def _egress_refusals(ctx: Ctx, req: RuntimeRequest, blob: object) -> Dict[str, object]:
+    from levain.slot import egress_verbs as EV
+
+    return EV.egress_refusals(ctx, req, blob)
+
+
+def _egress_grants_list(ctx: Ctx, req: RuntimeRequest, blob: object) -> Dict[str, object]:
+    from levain.slot import egress_verbs as EV
+
+    return EV.egress_grants_list(ctx, req, blob)
+
+
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
     "start": _start, "teardown": _teardown, "adopt-open": adopt_open, "adopt-verify": adopt_verify,
     "discard": discard, "restore": restore, "probe": _probe, "confirm-identity": _confirm_identity,
     "read-allow": read_allow,
+    "egress-grant": _egress_grant, "egress-grant-revoke": _egress_grant_revoke,
+    "egress-refusals": _egress_refusals, "egress-grants-list": _egress_grants_list,
 }
 
 
@@ -4256,6 +4282,12 @@ def main(argv: Sequence[str], *, stdin: bytes, env: Mapping[str, str], seams: Op
     return fields.exit_status if isinstance(fields, Answer) else EXIT_OK
 
 
+def wants_stdin(args: Sequence[str]) -> bool:
+    """Whether the root entry reads stdin for ``args``: the verbs the grammar lists as stdin verbs
+    (:data:`levain.slot.runtime_grammar.STDIN_VERBS`), never another, so a terminal never blocks a verb with none."""
+    return len(args) >= 1 and args[0] in STDIN_VERBS
+
+
 def _read_stdin() -> bytes:
     """At most the grammar's cap + 1 bytes (parse_stdin refuses the extra one by size). DECISION: a verb with no
     stdin reads none, so a terminal on stdin never blocks it."""
@@ -4280,10 +4312,10 @@ __all__ = ["Answer", "BASE_ROUTES_FORMAT", "CAS_UNMOVED", "CREDENTIAL_NAME", "Ct
            "session_lock_name", "session_owner_uid", "slot_owned_dir_ok", "spawn_front", "spawn_target", "status",
            "front_policy_bytes", "front_session_routes", "read_passthrough_total", "read_session_total", "read_session_tunnel_total", "gateway_front_args", "prepare_front_log",
            "account_in_range", "check_front_log_dirs",
-           "refuse_ticketed_front", "stub_front_args", "wait_child", "write_front_policy"]
+           "refuse_ticketed_front", "stub_front_args", "wait_child", "wants_stdin", "write_front_policy"]
 
 
 if __name__ == "__main__":   # pragma: no cover - the root entry (root_tree.ENTRY_MODULES)
     _args = sys.argv[1:]
-    _stdin = _read_stdin() if _args[:1] in (["prepare"], ["render"]) else b""
+    _stdin = _read_stdin() if wants_stdin(_args) else b""
     raise SystemExit(main(_args, stdin=_stdin, env=entry_env(os.environ)))
