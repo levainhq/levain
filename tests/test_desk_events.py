@@ -1487,3 +1487,57 @@ def test_night_window_is_the_cut_to_the_next_cut():
     assert events.night_window(T0.replace(hour=12), 12)[0] == "2026-11-14T12:00:00.000000Z"
     with pytest.raises(ValueError):
         events.night_window(datetime(2026, 11, 14, 22, 0), 12)
+
+
+# ---- ND-5 round 1: the cap ping's boundary, its survival across a starved pass and the cut, its isolation ----------
+@pytest.mark.parametrize("total", [5, 6])
+@pytest.mark.parametrize("trusted", range(0, 7))
+def test_the_cap_ping_boundary_total_against_trusted_incidents(total, trusted, store, tmp_path, qdir, clock, pinger):
+    if trusted > total:
+        pytest.skip("more trusted than total incidents")
+    cred = sensor(store, tmp_path)
+    low = sensor(store, tmp_path, "low", "untrusted")
+    for n in range(trusted):
+        down(store, cred, n + 1, subject=f"host{n}")
+    for n in range(total - trusted):
+        events.post(store, "low", n + 1, "report", {"subject": f"noise{n}", "severity": "crit"}, credential=low)
+    events.progress(store, pinger=pinger)                            # never a TypeError, never a ping an untrusted one caused
+    assert len(_cap_pings(pinger)) == (1 if trusted > events.INCIDENT_PING_ABOVE else 0)
+
+
+def test_the_cap_ping_is_not_starved_by_the_passes_ping_bound(store, tmp_path, qdir, clock, pinger):
+    ln, token, eids = _waiting(store, tmp_path, qdir, clock, n=events.PINGS_PER_PASS + 1)   # 7 incidents, 6 event pings due
+    events.progress(store, pinger=pinger)
+    assert len(pinger.sent) == events.PINGS_PER_PASS and len(_cap_pings(pinger)) == 1     # the night's one ping is among the five
+
+
+def test_a_cap_ping_that_failed_before_the_cut_is_tried_again_after_it(store, tmp_path, qdir, clock, pinger):
+    cred = sensor(store, tmp_path)
+    for n in range(1, 7):
+        down(store, cred, n, subject=f"host{n}")
+    pinger.fail = True
+    events.progress(store, pinger=pinger)
+    assert pinger.calls == 1 and _cap_pings(pinger) == []
+    pinger.fail = False
+    clock.advance(hours=14)                                          # the 12:00 UTC cut has passed: a new night, no incident in it
+    events.progress(store, pinger=pinger)
+    assert len(_cap_pings(pinger)) == 1                              # last night's ping is still owed
+    events.progress(store, pinger=pinger)
+    clock.advance(hours=1)
+    events.progress(store, pinger=pinger)
+    assert len(_cap_pings(pinger)) == 1                              # and goes once
+
+
+def test_a_cap_ping_that_cannot_be_built_does_not_stop_the_pass_or_the_other_pings(store, tmp_path, qdir, clock, pinger, monkeypatch):
+    ln, token, (eid,) = _waiting(store, tmp_path, qdir, clock)
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("unreadable row")
+    monkeypatch.setattr(events, "_night_cap_ping", boom)
+    lines, _ = events.progress(store, pinger=pinger)
+    assert len(pinger.sent) == 1 and "pinged" in states(qdir, eid)[-1]     # the event's own ping still went
+    assert any("cap ping for the night" in line and "skipped" in line and "OperationalError" in line for line in lines)
+
+
+def test_the_cap_night_test_crosses_the_cut(clock):
+    assert events.night_window(clock.now, 12) != events.night_window(clock.now + timedelta(hours=14), 12)

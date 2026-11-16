@@ -938,9 +938,9 @@ def progress(store: Any, *, pinger: Pinger | None = None) -> tuple[list[str], st
             except Exception as exc:        # noqa: BLE001 - reads only: nothing to roll back
                 lines.append(f"event {eid}: its ping skipped by this delivery pass "
                              f"({type(exc).__name__}: {unshowable.mark(str(exc))[:200]})")
-        cap = _cap_ping(conn, now)
-        if cap is not None:
-            pings.append(cap)
+        # the night's cap ping goes ahead of the per-event pings (the pass's bound cannot starve it); a stop ping
+        # inserted below still goes before it
+        pings[:0] = _cap_pings(conn, now, lines)
         if waiting:
             state = lease.wake_state(conn, now)[0]
             if state == "stopped":
@@ -1008,18 +1008,38 @@ def night_window(now: datetime, cut_hour_utc: int) -> tuple[str, str]:
     return utc_stamp(since), utc_stamp(since + timedelta(days=1))
 
 
-def _cap_ping(conn: sqlite3.Connection, now: str) -> Ping | None:
-    """ONE ping per night when the trusted incidents opened in it pass :data:`INCIDENT_PING_ABOVE` (ND-5; design 2.4):
-    the same ``pinging``/``pinged`` rows as every ping here, noted with the night, counted on any event, so a seventh
-    incident and a repeated pass never ping again. It rides on the event that opened the first incident past the cap.
-    Fixed words only (:func:`_ping_text`); an untrusted incident is never counted."""
+def _cap_pings(conn: sqlite3.Connection, now: str, lines: list[str]) -> list[Ping]:
+    """The cap pings :func:`progress` owes: the current night's and the night just ended's, so a ping that was starved
+    or failed before the cut is still tried after it (once sent or given up, :func:`_ping_due` says wait). Each is
+    isolated like the other effects of the pass: one that cannot be built is a line, never the pass."""
     from levain.desk.effects import NIGHT_CUT_HOUR_UTC
 
-    since, until = night_window(parse_stamp(now), NIGHT_CUT_HOUR_UTC)
+    at = parse_stamp(now)
+    out: list[Ping] = []
+    for when in (at - timedelta(days=1), at):
+        since, until = night_window(when, NIGHT_CUT_HOUR_UTC)
+        try:
+            cap = _night_cap_ping(conn, now, since, until)
+        except Exception as exc:        # noqa: BLE001 - reads only: nothing to roll back
+            lines.append(f"events: the cap ping for the night of {since[:10]} skipped by this delivery pass "
+                         f"({type(exc).__name__}: {unshowable.mark(str(exc))[:200]})")
+            continue
+        if cap is not None:
+            out.append(cap)
+    return out
+
+
+def _night_cap_ping(conn: sqlite3.Connection, now: str, since: str, until: str) -> Ping | None:
+    """ONE ping per night when the trusted incidents opened in ``[since, until)`` pass :data:`INCIDENT_PING_ABOVE`
+    (ND-5; design 2.4): the same ``pinging``/``pinged`` rows as every ping here, noted with the night, counted on any
+    event, so a seventh incident and a repeated pass never ping again. It rides on the event that opened the first
+    incident past the cap. Fixed words only (:func:`_ping_text`); an untrusted incident is never counted."""
     if incidents_opened(conn, since, until) <= INCIDENT_PING_ABOVE:
         return None
     over = conn.execute("SELECT incident_id FROM incidents WHERE trust != 'untrusted' AND opened_at >= ? AND "
                         "opened_at < ? ORDER BY opened_gseq LIMIT 1 OFFSET ?", (since, until, INCIDENT_PING_ABOVE)).fetchone()
+    if over is None:
+        return None
     head = conn.execute("SELECT event_id FROM events WHERE incident_id = ? ORDER BY gseq LIMIT 1", (over[0],)).fetchone()
     if head is None:
         return None
