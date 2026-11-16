@@ -334,7 +334,7 @@ const targetState = async () => {
   } catch (e) { return "browser unreachable: " + String(e && e.message || e).slice(0, 80); }
   return connection || "no browser connection to ask";
 };
-const timeoutBlock = async (shotPath) => {
+const timeoutBlock = async (shotPath, artifact) => {
   const quietMs = Date.now() - lastEventAt;   // taken before any await: the probe's own wait must not read as the page having spoken or being silent
   try {
     const probe = await evaluateOutcome("(() => { try { const m = document.querySelector('#levain-modal'); return JSON.stringify({ url: location.href, ready: document.readyState, modal: !!m, rows: m ? m.querySelectorAll('[data-question-row]').length : null, text: String((document.body && document.body.innerText) || '').slice(0, 600) }); } catch (e) { return JSON.stringify({ probe_error: String(e) }); } })()", 3000);
@@ -350,27 +350,44 @@ const timeoutBlock = async (shotPath) => {
       `MODAL: #levain-modal exists=${o.modal ?? "?"} [data-question-row] count=${o.rows ?? "?"}` + (o.probe_error ? ` (probe error: ${o.probe_error})` : ""),
       `TARGET: ${await targetState()}`, `LAST PAGE EVENT: ${quietMs}ms ago; NAV TRAIL: ${navTrail.join(", ") || "none"}`,
       `CONSOLE (last 20 of ${consoleLog.length}):`, ...consoleLog.slice(-20).map((c) => "  " + c),
+      ...(artifact ? [artifact.slice(0, 500)] : []),
       "BODY TEXT (first 600):", String(o.text ?? "").replace(/\n{2,}/g, "\n"),
       `SCREENSHOT: ${shotPath || "none"}`, "--- end page state ---"];
     console.error(lines.join("\n").slice(0, 4000));
   } catch {}
 };
-const shotOnTimeout = async (n) => {
-  let shotPath = null;
-  try { await shotOnTimeoutInner(n, (p) => { shotPath = p; }); } catch {}
-  await timeoutBlock(shotPath);
+// a step may carry an `artifact` expression: the page's own facts for that step (a card's note, a button's state, a count), read at its
+// timeout through the short-timeout evaluateOutcome and kept beside the page state, so a red names what the page held
+const stepArtifact = async (n) => {
+  const src = steps[n] && steps[n].artifact;
+  if (src === undefined) return null;
+  const o = await evaluateOutcome(`(() => { try { return JSON.stringify(${src}\n); } catch (e) { return "artifact error: " + String(e); } })()`, 3000);
+  return "STEP ARTIFACT: " + ("error" in o ? "evaluation error: " + o.error : String(o.value));
 };
-const shotOnTimeoutInner = async (n, setPath) => {
+const shotOnTimeout = async (n) => {
+  let shotPath = null; let artifact = null;
+  try { artifact = await stepArtifact(n); } catch {}
+  try { await shotOnTimeoutInner(n, (p) => { shotPath = p; }, artifact); } catch {}
+  await timeoutBlock(shotPath, artifact);
+};
+const shotOnTimeoutInner = async (n, setPath, artifact) => {
   try {
-    const r = await sendWithin(3000, "Page.captureScreenshot", { format: "png" });
-    if (!r.result?.data) return;
+    // the txt is written even when the screenshot is not (a wedged page answers neither): the text and state probes then say so themselves
     const p = join(dirname(stepsPath), `timeout-step-${n}.png`);
-    writeFileSync(p, Buffer.from(r.result.data, "base64")); setPath(p);
-    console.error(`screenshot at the timeout: ${p}`);
-    const t = await evaluateOutcome("document.body.innerText", 3000);
+    // each CDP call answers or fails on its own: a closed socket or a timed-out screenshot never skips the text file
+    try {
+      const shot = await sendWithin(3000, "Page.captureScreenshot", { format: "png" });
+      if (shot.result?.data) {
+        writeFileSync(p, Buffer.from(shot.result.data, "base64")); setPath(p);
+        console.error(`screenshot at the timeout: ${p}`);
+      }
+    } catch (e) { console.error(`screenshot at the timeout failed: ${e && e.message ? e.message : e}`); }
+    const answer = async (src) => { try { return await evaluateOutcome(src, 3000); } catch (e) { return { error: String(e && e.message ? e.message : e) }; } };
+    const t = await answer("document.body.innerText");
     // the page's own state beside its text: which tab, which address, which kept keys (a timeout names where the page was)
-    const st = await evaluateOutcome("JSON.stringify({mode: document.body.dataset.mode, hash: location.hash, ready: document.readyState, local: Object.keys(localStorage), session: Object.keys(sessionStorage), savedMode: (() => { try { return [localStorage, sessionStorage].map((x) => Object.keys(x).filter((k) => /mode/i.test(k)).map((k) => k + '=' + x.getItem(k))); } catch (e) { return String(e); } })()})", 3000);
-    if (typeof t.value === "string") writeFileSync(p.replace(/\.png$/, ".txt"), "PAGE STATE: " + (typeof st.value === "string" ? st.value : JSON.stringify(st)) + "\nREFUSALS AND PROMPTS: " + JSON.stringify(trail) + "\n" + t.value);
+    const st = await answer("JSON.stringify({mode: document.body.dataset.mode, hash: location.hash, ready: document.readyState, local: Object.keys(localStorage), session: Object.keys(sessionStorage), savedMode: (() => { try { return [localStorage, sessionStorage].map((x) => Object.keys(x).filter((k) => /mode/i.test(k)).map((k) => k + '=' + x.getItem(k))); } catch (e) { return String(e); } })()})", 3000);
+    writeFileSync(p.replace(/\.png$/, ".txt"), "PAGE STATE: " + (typeof st.value === "string" ? st.value : JSON.stringify(st)) + "\nREFUSALS AND PROMPTS: " + JSON.stringify(trail)
+      + (artifact ? "\n" + artifact : "") + "\n" + (typeof t.value === "string" ? t.value : "PAGE TEXT: " + JSON.stringify(t)));
   } catch {}
 };
 let authenticatorId = null;   // the virtual authenticator an `authenticator` step made (a `user_verified` step changes it)
@@ -452,6 +469,8 @@ for (const s of steps) {
     if (set.error) throw new Error("user verification was not set: " + JSON.stringify(set.error));
   } else if (s.init !== undefined) {
     // a script that runs before the page's own scripts on every load from now on, then one reload so it applies to this page
+    // a stalled init is a setup failure that says where the page was: the same png + txt + page-state block a timed-out wait leaves, then the same throw
+    const initFails = async (why) => { console.error(`step ${steps.indexOf(s)}: ${why}`); await shotOnTimeout(steps.indexOf(s)); throw new Error(why); };
     const added = await send("Page.addScriptToEvaluateOnNewDocument", { source: s.init });
     if (added.error) throw new Error("the init script was not added: " + JSON.stringify(added.error));
     // the first load must be over before the reload is sent. The reloaded document is recognised by its own state (the mark the old document
@@ -459,17 +478,17 @@ for (const s of steps) {
     // snapshot, which left this step waiting out its whole deadline on a reload that had in fact finished. Any stall is a setup failure.
     for (const end = Date.now() + scaled(15000);;) {
       if (await evaluate("document.readyState") === "complete") break;
-      if (Date.now() >= end) throw new Error("init: the first load did not complete");
+      if (Date.now() >= end) await initFails("init: the first load did not complete");
       await sleep(100);
     }
     await awaitWorkerSettled();
     await evaluate("window.__driveOldDocument = true");   // a mark the reloaded document will not carry
     const reloaded = await send("Page.reload", {});
-    if (reloaded.error) throw new Error("init: the reload was refused: " + JSON.stringify(reloaded.error));
+    if (reloaded.error) await initFails("init: the reload was refused: " + JSON.stringify(reloaded.error));
     // the old document's readyState can still read "complete" just after the call, so the mark, not the state alone, tells the new document
     for (const end = Date.now() + scaled(15000);;) {
       if (await evaluate("document.readyState === 'complete' && window.__driveOldDocument === undefined") === true) break;
-      if (Date.now() >= end) throw new Error("init: the reload did not complete");
+      if (Date.now() >= end) await initFails("init: the reload did not complete");
       await sleep(100);
     }
   } else if (s.emulate !== undefined) {

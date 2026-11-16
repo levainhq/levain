@@ -208,6 +208,10 @@ from levain.consent.sign import Signer  # noqa: E402
 
 _REVOKE = f"{_CARD}.querySelector('.grant-revoke')"
 _GRANT_PICKS = f"{_CARD}.querySelectorAll('.sign-pick').length"
+# what a timed-out pick wait leaves in its timeout-step txt (the driver's step "artifact"): the card's note text, whether the revoke button is
+# disabled, and the picks count, so a red names whether a redraw dropped the pick list (no picks, no note, revoke enabled) or the ceremony is still busy
+_SIGN_ARTIFACT = ("(() => { const c = " + _CARD + "; if (!c) return {card: null}; const r = c.querySelector('.grant-revoke'); const n = c.querySelector('.sign-note');"
+                  " return {note: n ? n.textContent : null, revoke_disabled: r ? r.disabled : null, picks: c.querySelectorAll('.sign-pick').length}; })()")
 _CLOSE = "(document.querySelector('#levain-modal .modal-close') || {click() {}}).click() || 1"
 
 
@@ -302,7 +306,7 @@ def test_b3_r4_r9_the_revokes_pick_labels_the_keys_survives_a_redraw_and_a_dismi
             _auth(newer, b"cred-new"), {"until": TILE},
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
-            *landed_tap(_REVOKE, f"{_GRANT_PICKS} === 3 && 1"),
+            *landed_tap(_REVOKE, f"{_GRANT_PICKS} === 3 && 1", artifact=_SIGN_ARTIFACT),
             {"eval": f"[...{_CARD}.querySelectorAll('.sign-pick')].map(b => [b.textContent, b.title])"},
             {"eval": f"{_CARD}.querySelector('.sign-note').textContent"},
             # R4: the card is drawn again while the pick is open
@@ -310,7 +314,7 @@ def test_b3_r4_r9_the_revokes_pick_labels_the_keys_survives_a_redraw_and_a_dismi
             {"eval": "new Promise((r) => setTimeout(() => r(1), 800))"},
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
-            *landed_tap(_REVOKE, f"{_GRANT_PICKS} === 3 && 1"),
+            *landed_tap(_REVOKE, f"{_GRANT_PICKS} === 3 && 1", artifact=_SIGN_ARTIFACT),
             # R9: dismissed
             {"eval": f"[...{_CARD}.querySelectorAll('.sign-pick')].find(b => b.textContent === 'dismiss').click() || 1"},
             {"eval": f"{_CARD}.querySelector('.sign-note').textContent"},
@@ -549,7 +553,7 @@ def test_b10_a_picked_key_is_asked_for_by_its_id_even_after_a_refusal(world, tmp
             *landed_tap(_REVOKE),
             {"until": f"!!{said} && !{_REVOKE}.disabled && {said}", "ms": 30000},
             {"eval": f"window.__tape.length = 0; {_CARD}.querySelector('.sign-note').textContent = ''; 1"},
-            *landed_tap(_REVOKE, f"{_GRANT_PICKS} === 3 && 1"),
+            *landed_tap(_REVOKE, f"{_GRANT_PICKS} === 3 && 1", artifact=_SIGN_ARTIFACT),
             {"tap": pick_newer.replace(".click() || 1", "")},
             {"until": f"{said} || false", "ms": 30000},
         ])
