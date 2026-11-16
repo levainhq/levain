@@ -18,9 +18,11 @@ describes.
 - A grant lasts until the end of the session or a chosen time, whichever is first: the choice `s` ("this session")
   is capped at 8 hours from issue, the choice `d` ("24 hours") at 24 hours from issue and still applies to this
   session only.
-- Root keeps at most 16 grants per session file. A grant to a host that is already routed, or to a name that is never
-  granted (`localhost`, `*.local`, `*.internal`, `metadata.*` and the other names that are never the public internet),
-  is refused. The front's address check still runs on a granted host: a name that resolves to a private or
+- Root keeps at most 16 grants per session file. Root never grants a host that is on any route in the base map,
+  whether or not this session uses that route (another vendor's brokered or passthrough route included), or that is a
+  model vendor's own host; Levain files no card for such a host, and the end-of-session note says it was refused and
+  that no grant can allow it for this session. A grant to a name that is never granted (`localhost`, `*.local`,
+  `*.internal`, `metadata.*` and the other names that are never the public internet) is refused. The front's address check still runs on a granted host: a name that resolves to a private or
   loopback address is refused.
 
 **Which sessions qualify.** Only an `interactive` or `login` session on an egress-class slot. A dispatch or planner
@@ -94,12 +96,16 @@ narrow: it removes grants and never adds one.
 - What each answer proves: `removed` proves root's session file changed. `recorded` proves root wrote the id to the
   ledger and that the session file did not hold it. Neither proves a tunnel closed. The sentence to rely on is this
   one: **Root revoked the grant. A healthy running front closes its granted tunnels on its next check, normally within
-  about five seconds.** The front re-reads root's file on a fixed tick of five seconds, and ends a granted tunnel whose
-  grant is no longer in it: `grant-revoked` for a revoked grant, `grant-expired` for one past its expiry, and every
-  granted tunnel with `grant-unchecked` if the check itself fails. Expiry is enforced in both places: the tunnel also
+  about five seconds.** The front re-reads root's file on a fixed tick of five seconds. A granted tunnel ends
+  `grant-expired` at its expiry and `grant-revoked` when its grant is no longer in the grants file, and also when
+  root's grants file cannot be read or parsed (the front fails closed and logs that as unreadable); it ends
+  `grant-unchecked` only when the check itself fails (the front's clock or its watcher). Expiry is enforced in both places: the tunnel also
   checks its own clock on every wait and every chunk, so it ends `grant-expired` at its expiry, not up to one tick
   later.
 - Bytes already in a transport or kernel buffer when a tunnel ends may still be delivered.
+- After you revoke a host, deny its card, or let its card lapse unsigned twice, Levain files no more cards for that
+  host for the rest of the session; to allow it again, start a new session. A card that lapses unsigned is raised
+  once more, so one host can get up to two cards.
 
 **At teardown** a session's grants are removed; if that fails, they are removed at the slot's next render, and the
 ended session's front is gone either way.
@@ -132,7 +138,8 @@ serves it only when it was started by `levain serve --write` with the root runti
   other answers "already gone" with no call to root.
 - **Who may use it.** Only the cockpit page itself and devices paired from the cockpit page or from the laptop. A
   device paired through a relay, or another surface's token, is refused 403. Each revoke is logged with the device's
-  name and limited to 10 a minute per device.
+  name. Revokes are limited to 10 a minute per credential name, not per device: devices paired under the same name
+  share one budget, and only revokes that reach root count.
 - **The guarantee it aims at is exactly this and no wider:** Untrusted HTTP fields can reach only these validated
   helper invocations. The cockpit runs as the operator, whose sudoers rule covers the whole helper, so this is a check
   on its input, not a confinement of the process.

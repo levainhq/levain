@@ -234,7 +234,7 @@ def test_the_cockpit_claims_are_the_surfaces_code():
     from levain.consent import host_grants as HG
     assert HG.LIST_VERB == "egress-grants-all" and HG.REVOKE_VERB == "egress-grant-revoke"
     assert HG.ALLOWED_VERBS == (HG.LIST_VERB, HG.REVOKE_VERB)
-    assert HG.RATE_LIMIT == 10 and "10 a minute per device" in TEXT
+    assert HG.RATE_LIMIT == 10 and "10 a minute per credential name" in TEXT
     assert "Untrusted HTTP fields can reach only these validated helper invocations." in " ".join(TEXT.split())
     assert "refused 403" in TEXT and "already gone" in TEXT
 
