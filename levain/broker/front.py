@@ -14,7 +14,10 @@ What it enforces, in order, before any upstream byte:
    off-list name is `host-not-allowed`, unless a live entry of root's `R/grants/slot<n>/grants.json` for this session
    and slot names it (levain#66; an interactive or login session only, else the refusal's detail is `unattended`).
    Time is the host wall clock at each decision; a clock step moves a grant's end with it (root's clock is not
-   defended).
+   defended). A granted tunnel ends at its entry's expiry on its own clock check, and a watcher re-reads the file
+   every tick to end the tunnels of a revoked grant (any error in it ends every granted tunnel, `grant-unchecked`).
+   No chunk the front reads after the end is observed is written; bytes already in a transport or kernel buffer may
+   still be delivered.
 4. the address: the name is resolved ONCE, as an absolute name (no search-list expansion), with a bounded number
    of resolutions in flight; if any answer is loopback, private (RFC1918, CGNAT, ULA), link-local
    (incl. the 169.254.169.254 metadata address), IPv4-mapped / IPv4-compatible / 6to4 / Teredo, multicast,
@@ -103,6 +106,9 @@ GRANT_ROUTE_PREFIX = "egress-grant:"
 #: levain#66: the kinds a host grant admits (a person is at the keyboard to tap); a dispatch or planner session is
 #: refused ``unattended`` instead.
 GRANT_KINDS = ("interactive", "login")
+#: levain#66: how often the watcher re-reads root's grants file to end the tunnels of a revoked grant. Only a REVOKE
+#: waits for it: a grant's expiry ends its tunnel at the tunnel's own clock check, whatever the tick.
+GRANT_TICK_S = 5.0
 _ROUTE_ID = re.compile(r"^[a-z0-9-]{1,48}\Z")
 #: V34: keys answers the front's `H` with `A` within this, else the front exits 3 without binding.
 STATUS_A_S = 5.0
@@ -1150,13 +1156,27 @@ class _Grants:
     ends nothing later than now, and one bad reading latches nothing."""
 
     def __init__(self, path: str, slot: int, owner_uid: int, gid: Optional[int], *,
-                 clock: Callable[[], float] = time.time, read: Callable = eg.read_grants_file) -> None:
+                 clock: Callable[[], float] = time.time, read: Callable = eg.read_grants_file,
+                 tick_s: float = GRANT_TICK_S, session: Optional[str] = None,
+                 log: Optional[Callable[[dict], object]] = None) -> None:
         self.path = path
         self.slot = slot
         self.owner_uid = owner_uid
         self.gid = gid
+        self.session = session
+        self.tick_s = tick_s
         self._clock = clock
         self._read = read
+        self._log = log
+        #: every open granted tunnel: id(counts) -> (counts, the entry that admitted it, client writer, upstream
+        #: writer). The watcher ends the ones whose grant is gone from the file.
+        self.open: dict[int, tuple[dict, "eg.Entry", asyncio.StreamWriter, asyncio.StreamWriter]] = {}
+        self._task: Optional[asyncio.Task] = None
+        #: the diagnostic's memory (G6): the last unreadable-file identity logged, and whether the lstat failure was.
+        self._seen: Optional[tuple[int, int]] = None
+        self._lstat_failed = False
+        #: latched by a failed watcher pass and cleared by the next good one: a failure logs once, not once a tick.
+        self._failed = False
 
     def now(self) -> Optional[datetime]:
         """The wall clock as an aware UTC datetime, or None when it raises, is not finite or is out of range."""
@@ -1185,13 +1205,113 @@ class _Grants:
         try:
             if policy.kind not in GRANT_KINDS or not is_host_name(host) or host in policy.brokered_hosts:
                 return None
-            grants = self._read(self.path, owner_uid=self.owner_uid, group_gid=self.gid)
+            grants = self.read_logged()
             now = self.now()
             if grants is None or now is None:
                 return None
             return eg.live_entry(grants, policy.session, self.slot, host, port, now)
         except Exception:
             return None
+
+    def read_logged(self):
+        """``read_grants_file``, plus the diagnostic (G6): a read that gives None while the path is there but not
+        readable is "the front cannot read root's file", not "no grant", and the log says so once, with no path, no
+        errno text and no content. Missing is the normal case and logs nothing; any other ``lstat`` error logs once
+        per process (a directory the front cannot traverse); a file that is there logs once per
+        ``(st_ino, st_mtime_ns)``, so a rewrite logs again."""
+        grants = self._read(self.path, owner_uid=self.owner_uid, group_gid=self.gid)
+        if grants is None:
+            try:
+                st = os.lstat(self.path)
+            except FileNotFoundError:
+                return None
+            except OSError:
+                if not self._lstat_failed:
+                    self._lstat_failed = True
+                    self._note({"event": "grants-unreadable"})
+                return None
+            ident = (st.st_ino, st.st_mtime_ns)
+            if ident != self._seen:
+                self._seen = ident
+                self._note({"event": "grants-unreadable"})
+        return grants
+
+    def _note(self, rec: dict) -> None:
+        if self._log is not None:
+            try:
+                self._log(rec)
+            except Exception:   # a log that fails never decides a grant
+                pass
+
+    # --- the registry and the watcher (revocation only: expiry is each tunnel's own check) ---------------------
+
+    def register(self, counts: dict, entry: "eg.Entry", w: asyncio.StreamWriter, u: asyncio.StreamWriter) -> None:
+        self.open[id(counts)] = (counts, entry, w, u)
+        self.ensure_watch()
+
+    def unregister(self, counts: dict) -> None:
+        self.open.pop(id(counts), None)
+
+    def ensure_watch(self) -> None:
+        """Start the watcher when there is none or the last one is done (a dead watcher never leaves tunnels
+        unwatched)."""
+        if self._task is None or self._task.done():
+            self._task = asyncio.ensure_future(self._watch())
+            self._task.add_done_callback(self._watch_done)
+
+    def stop(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+
+    @staticmethod
+    def _end(counts: dict, w, u, why: str) -> None:
+        """End one granted tunnel for ``why``. The reason is stamped only on a tunnel that has not already ended on
+        its own (a tick that runs while ``_relay`` gathers its tasks must not relabel it); each close stands alone,
+        so one dead transport never keeps another from closing."""
+        if "end" not in counts:
+            counts.setdefault("grant_end", why)
+        for t in (w, u):
+            try:
+                t.close()
+            except Exception:
+                pass
+
+    def end_all(self, why: str) -> None:
+        for counts, _entry, w, u in list(self.open.values()):
+            self._end(counts, w, u, why)
+
+    async def _watch(self) -> None:
+        """Every ``tick_s``, end each registered tunnel whose grant is no longer the file's live entry for its host.
+        Fail closed: any error ends EVERY granted tunnel ``grant-unchecked`` (and the loop goes on), an unreadable
+        file ends them ``grant-revoked`` (a half-written file is never seen: root replaces it whole). The loop exits
+        when no tunnel is registered; a cancel (shutdown) propagates."""
+        while self.open:
+            await asyncio.sleep(self.tick_s)
+            if not self.open:
+                break
+            try:
+                grants = self.read_logged()
+                now = self.now()
+                if now is None:
+                    raise ValueError("no clock")
+                for counts, entry, w, u in list(self.open.values()):
+                    live = (None if grants is None else
+                            eg.live_entry(grants, self.session, self.slot, entry.host, entry.port, now))
+                    if live is None or live.grant != entry.grant:
+                        self._end(counts, w, u, "grant-revoked")
+                self._failed = False
+            except Exception:
+                self.end_all("grant-unchecked")
+                if not self._failed:
+                    self._failed = True
+                    self._note({"event": "grants-watch-failed"})
+
+    def _watch_done(self, task: asyncio.Task) -> None:
+        """A watcher that died of anything the loop did not handle leaves no tunnel running unwatched."""
+        if task.cancelled():
+            return
+        if task.exception() is not None:
+            self.end_all("grant-unchecked")
 
 
 class Front:
@@ -1200,11 +1320,13 @@ class Front:
                  connect: Connector = open_by_address, keys_path: Optional[str] = None,
                  log_cap: int = LOG_CAP, grants_path: Optional[str] = None, slot: Optional[int] = None,
                  grants_owner_uid: int = 0, grants_gid: Optional[int] = None,
-                 clock: Callable[[], float] = time.time, read_grants: Callable = eg.read_grants_file) -> None:
+                 clock: Callable[[], float] = time.time, read_grants: Callable = eg.read_grants_file,
+                 grant_tick_s: float = GRANT_TICK_S) -> None:
         self.policy = policy
         #: levain#66: None unless both the grants path and the slot are given (no grants: today's behaviour).
         self.grants: Optional[_Grants] = (
-            _Grants(grants_path, slot, grants_owner_uid, grants_gid, clock=clock, read=read_grants)
+            _Grants(grants_path, slot, grants_owner_uid, grants_gid, clock=clock, read=read_grants,
+                    tick_s=grant_tick_s, session=policy.session, log=self._log)
             if grants_path is not None and slot is not None else None)
         #: keys' `R/keys/front.sock`: every brokered exchange is one connection to it. None = no keys (503).
         self.keys_path = keys_path
@@ -1445,17 +1567,25 @@ class Front:
         if route.passthrough:   # from here on, exhaustion closes this connection too (no await since _pt_admit)
             self._pt_open[id(counts)] = (counts, writer, uwriter)
         try:
+            if entry is not None:   # before the 200: from here the watcher can end this tunnel
+                self.grants.register(counts, entry, writer, uwriter)
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
             hello_wait = HEAD_TIMEOUT_S
             if route.passthrough and (dl_left := self._pt_left()) is not None:
                 hello_wait = max(min(hello_wait, dl_left), 0.0)
+            if entry is not None:   # a grant that ends while the hello is awaited ends the wait too
+                hello_wait = max(min(hello_wait, self.grants.left(entry)), 0.0)
             pt_refusal = None   # why a passthrough hello is not forwarded, once a limit decides it
             try:
                 hello, body = await asyncio.wait_for(read_client_hello(reader), hello_wait)
                 if client_hello_sni(body) != route.host:
                     raise Refused("host-not-allowed", "sni-mismatch")
             except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                if entry is not None and (counts.get("grant_end") or self.grants.left(entry) <= 0):
+                    self._log({"event": "refused", "refused": "host-not-allowed", "detail": "grant-ended",
+                               "host": route.host, "address": addr})
+                    return
                 if route.passthrough and (counts.get("cut") or self._pt_expired()):
                     pt_refusal = "passthrough-bytes-exhausted" if counts.get("cut") else "passthrough-deadline"
                 else:
@@ -1498,6 +1628,13 @@ class Front:
                     self._log({"event": "refused", "refused": "passthrough-bytes-exhausted",
                                "detail": "tunnel-log-failed", "host": route.host, "address": addr})
                     return
+            if entry is not None and (counts.get("grant_end") or uwriter.is_closing() or writer.is_closing()
+                                      or self.grants.left(entry) <= 0):
+                # the grant ended (or a writer was closed for it) while the hello was awaited: the hello is not
+                # forwarded and nothing is counted, the same shape as the passthrough ``is_closing`` check above
+                self._log({"event": "refused", "refused": "host-not-allowed", "detail": "grant-ended",
+                           "host": route.host, "address": addr})
+                return
             relaying = True
             uwriter.write(hello)
             counts["up"] = len(hello)
@@ -1510,9 +1647,12 @@ class Front:
                     return
             else:
                 await uwriter.drain()
-            await self._relay(reader, writer, ureader, uwriter, counts, route.passthrough)
+            await self._relay(reader, writer, ureader, uwriter, counts, route.passthrough,
+                              grant=(self.grants, entry) if entry is not None else None)
         finally:
             self._pt_open.pop(id(counts), None)
+            if entry is not None:
+                self.grants.unregister(counts)
             uwriter.close()
             self.live.discard(uwriter)
             if relaying:   # also on cancellation (shutdown): a tunnel that carried bytes is never left out of the log
@@ -1522,7 +1662,7 @@ class Front:
                 self._log({"event": "tunnel", "route": route.route, "passthrough": route.passthrough,
                            "host": route.host, "port": port, "address": addr,
                            "bytes_up": counts["up"], "bytes_down": counts["down"],
-                           "end": counts.get("end", "aborted"),
+                           "end": counts.get("grant_end") or counts.get("end", "aborted"),
                            **({"passthrough_total": self.pt_total, "tunnel_id": counts["tunnel_id"]}
                               if route.passthrough else {})})
 
@@ -1553,12 +1693,15 @@ class Front:
                 pass
         raise Refused("upstream-timeout" if timed_out == len(addrs) else "upstream-error", "connect")
 
-    async def _relay(self, creader, cwriter, ureader, uwriter, counts: dict, passthrough: bool = False) -> None:
+    async def _relay(self, creader, cwriter, ureader, uwriter, counts: dict, passthrough: bool = False,
+                     grant: Optional[tuple[_Grants, "eg.Entry"]] = None) -> None:
         """Copy both ways until both ends are done. A broken direction ends both; after one direction ends cleanly
         the other gets HALF_CLOSE_S to finish (a client that fully closed looks like a half-close from here, and an
         upstream that never answers the FIN would otherwise hold the tunnel open). A tunnel on which NO byte has moved
         in either direction for IDLE_S is broken: idle is judged for the tunnel, not per direction, because during a
-        long streamed response the client sends nothing while the upstream is still talking."""
+        long streamed response the client sends nothing while the upstream is still talking. A granted tunnel
+        (``grant``: the watcher's grants and the entry) also ends ``grant-expired`` at its entry's expiry, judged by the
+        tunnel itself, and no chunk it reads after the watcher ended it is written."""
         loop = asyncio.get_running_loop()
         last = [loop.time()]
 
@@ -1577,6 +1720,10 @@ class Front:
                         if dl_left <= 0:
                             return "deadline"
                         left = min(left, dl_left)
+                    if grant is not None:
+                        if (g_left := grant[0].left(grant[1])) <= 0:
+                            return "grant-expired"
+                        left = min(left, g_left)
                     try:
                         chunk = await asyncio.wait_for(src.read(_CHUNK), left)
                     except asyncio.TimeoutError:
@@ -1595,6 +1742,13 @@ class Front:
                             self._log(ex_rec)
                         if not taken:
                             return "bytes-exhausted"
+                    if grant is not None:
+                        # judged again after the read's await and with none before the write: a chunk read across
+                        # the expiry, or onto a writer the watcher closed, is dropped, never forwarded
+                        if grant[0].left(grant[1]) <= 0:
+                            return "grant-expired"
+                        if counts.get("grant_end") or dst.is_closing():
+                            return counts.get("grant_end") or "broken"
                     last[0] = loop.time()
                     dst.write(chunk)
                     counts[key] += len(chunk)
@@ -1660,6 +1814,8 @@ class Front:
             pass
 
     def close_live(self) -> None:
+        if self.grants is not None:
+            self.grants.stop()
         for w in list(self.live):
             w.close()
 

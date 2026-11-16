@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -524,3 +525,390 @@ def test_t14_main_builds_a_front_with_grants_and_the_effective_gid(tmp_path, mon
     (front,) = served
     assert front.grants.slot == 3 and front.grants.gid == 4242 and front.grants.owner_uid == 0
     assert front.grants.path == str(tmp_path / "run" / "grants" / "slot3" / "grants.json")
+
+
+# --- S3b: the per-tunnel gates, the registry and the watcher -----------------------------------------------------------
+
+def _sock(rig: Rig) -> str:
+    return str(rig.dir.parent / "gw.sock")
+
+
+async def _tunnel(rig: Rig, host: str = HOST, hello: bool = True):
+    """CONNECT `host`:443 and, by default, finish the hello round trip; the tunnel is left OPEN. -> (reader, writer)."""
+    r, w = await asyncio.open_unix_connection(_sock(rig))
+    w.write(_connect(f"{host}:443"))
+    await w.drain()
+    assert (await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5)).startswith(b"HTTP/1.1 200")
+    if hello:
+        h = client_hello(host)
+        w.write(h)
+        await w.drain()
+        got = b""
+        while len(got) < len(h):
+            chunk = await asyncio.wait_for(r.read(65536), 5)
+            assert chunk, "the upstream closed before it echoed the hello"
+            got += chunk
+    return r, w
+
+
+async def _eof(r: asyncio.StreamReader, within: float) -> bool:
+    """True when the peer closes within `within` seconds (anything it still sends is read and dropped)."""
+    try:
+        while await asyncio.wait_for(r.read(65536), within):
+            pass
+        return True
+    except (asyncio.TimeoutError, ConnectionError):
+        return False
+
+
+async def _until(pred, within: float = 5.0):
+    for _ in range(int(within / 0.01)):
+        if (v := pred()):
+            return v
+        await asyncio.sleep(0.01)
+    return pred()
+
+
+def _tunnels(rig: Rig) -> list:
+    return [r for r in rig.records() if r.get("event") == "tunnel"]
+
+
+def _events(rig: Rig, name: str) -> list:
+    return [r for r in rig.records() if r.get("event") == name]
+
+
+# --- T11 revoke ---------------------------------------------------------------------------------------------------------
+
+def test_t11_a_revoke_closes_the_open_tunnel_and_a_regrant_under_a_new_id_closes_the_old_one():
+    """Fails with no watcher, or one that matches by host only: the old id's tunnel must end `grant-revoked` in both
+    cases, a fresh CONNECT after the revoke is 403, and a new id's CONNECT is admitted under the new route id."""
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_entry()])
+        r, w = await _tunnel(rig)
+        rig.write([])
+        assert await _eof(r, 3), "the tunnel stayed open after the revoke"
+        assert (await _until(lambda: _tunnels(rig)))[0]["end"] == "grant-revoked"
+        assert (await ask(f"{HOST}:443"))[:2] == (403, 0)
+        old = "eh-" + "a" * 24
+        rig.write([_entry()])
+        r2, w2 = await _tunnel(rig)
+        new = "eh-" + "d" * 24
+        rig.write([_entry(grant=new)])                       # same host, a NEW id (a re-grant)
+        assert await _eof(r2, 3), "the old id's tunnel stayed open under a re-grant of the host"
+        await _until(lambda: len(_tunnels(rig)) == 2)
+        assert [t["end"] for t in _tunnels(rig)] == ["grant-revoked", "grant-revoked"]
+        assert _tunnels(rig)[1]["route"] == "egress-grant:" + old
+        assert (await ask(f"{HOST}:443"))[:2] == (200, 1)
+        assert _tunnels(rig)[2]["route"] == "egress-grant:" + new
+        for x in (w, w2):
+            x.close()
+
+    _go(body, grant_tick_s=0.05)
+
+
+def test_t11a_a_revoke_while_the_hello_is_awaited_drops_the_hello():
+    """Fails (a tunnel line, upstream bytes) if the hello gate and the watcher's close are not both there: the client
+    holds its hello, the file is rewritten and the tick runs, then the hello is sent. No byte reaches the upstream,
+    the refusal is `grant-ended`, and no tunnel line is written."""
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_entry()])
+        r, w = await _tunnel(rig, hello=False)
+        rig.write([])
+        await asyncio.sleep(0.4)                                   # many ticks (0.05 s): the tunnel is ended
+        w.write(client_hello(HOST))
+        try:
+            await w.drain()
+        except ConnectionError:
+            pass
+        assert await _until(lambda: [x for x in rig.refused() if x["detail"] == "grant-ended"])
+        await asyncio.sleep(0.1)
+        assert rig.up_bytes[0] == 0
+        assert _tunnels(rig) == []
+        (g,) = [x for x in rig.refused() if x["detail"] == "grant-ended"]
+        assert g["refused"] == "host-not-allowed" and g["host"] == HOST and "address" in g
+        w.close()
+
+    _go(body, grant_tick_s=0.05)
+
+
+@pytest.mark.parametrize("how", ["grant_end", "is_closing"])
+def test_t11b_a_chunk_read_after_the_revoke_is_not_written(how):
+    """Fails if `_relay`'s granted path writes a chunk it read after the watcher ended the tunnel: the revoke lands
+    between the pump's read and its write (the stamp, or a writer the watcher closed)."""
+    async def go() -> None:
+        class W:
+            def __init__(self) -> None:
+                self.out, self.closed = bytearray(), False
+
+            def write(self, b: bytes) -> None:
+                self.out += b
+
+            async def drain(self) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+            def is_closing(self) -> bool:
+                return self.closed
+
+            def can_write_eof(self) -> bool:
+                return False
+
+        front = Front(load_policy(json.dumps(_policy()).encode()))
+        grants = FR._Grants("/nonexistent", SLOT, 0, None, clock=lambda: T0)
+        cr, ur = asyncio.StreamReader(), asyncio.StreamReader()
+        cr.feed_data(b"a chunk read after the revoke")
+        cw, uw = W(), W()
+        counts: dict = {"up": 0, "down": 0}
+        if how == "grant_end":
+            counts["grant_end"] = "grant-revoked"
+        else:
+            uw.closed = True
+        await asyncio.wait_for(front._relay(cr, cw, ur, uw, counts, False, grant=(grants, _entry())), 5)
+        assert bytes(uw.out) == b"" and counts["up"] == 0
+        assert counts["end"] == ("grant-revoked" if how == "grant_end" else "broken")
+
+    asyncio.run(go())
+
+
+# --- T12 expiry is each tunnel's own ----------------------------------------------------------------------------------
+
+def _real_entry(secs_ahead: int, grant: str) -> eg.Entry:
+    """An entry ending a whole number of seconds past this one's start (the file's stamps are whole seconds)."""
+    t = int(time.time()) + secs_ahead
+    return eg.Entry(grant=grant, host=HOST, port=443, expires=datetime.fromtimestamp(t, tz=timezone.utc), choice="s")
+
+
+def test_t12_each_tunnel_ends_at_its_own_expiry_without_the_watcher():
+    """Fails if expiry waits on the tick: the tick is 60 s and never fires in this test, the real clock runs, and the
+    two tunnels (same host, different grants) end `grant-expired` one after the other."""
+    async def body(ask, rig: Rig) -> None:
+        a, b = "eh-" + "1" * 24, "eh-" + "2" * 24
+        rig.write([_real_entry(2, a)])
+        r1, w1 = await _tunnel(rig)
+        rig.write([_real_entry(3, b)])
+        r2, w2 = await _tunnel(rig)
+        t0 = time.monotonic()
+        assert await _eof(r1, 6), "the first tunnel outlived its grant"
+        t1 = time.monotonic() - t0
+        assert await _eof(r2, 6), "the second tunnel outlived its grant"
+        t2 = time.monotonic() - t0
+        assert t1 < t2
+        await _until(lambda: len(_tunnels(rig)) == 2)
+        assert sorted(t["end"] for t in _tunnels(rig)) == ["grant-expired", "grant-expired"]
+        for x in (w1, w2):
+            x.close()
+
+    _go(body, grant_tick_s=60, clock=time.time)
+
+
+def test_t12_a_chunk_read_across_the_expiry_is_dropped():
+    """Fails if the pump checks the expiry only before its read: the fake clock steps past the expiry while the pump
+    waits, the next byte arrives, and it is read and NOT written (no upstream byte, end `grant-expired`)."""
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_entry(ttl=10)])
+        r, w = await _tunnel(rig)
+        before = rig.up_bytes[0]
+        rig.now[0] = T0 + 11
+        w.write(b"after the expiry")
+        await w.drain()
+        assert await _eof(r, 3)
+        assert rig.up_bytes[0] == before
+        assert (await _until(lambda: _tunnels(rig)))[0]["end"] == "grant-expired"
+        w.close()
+
+    _go(body, grant_tick_s=60)
+
+
+def test_t12_a_grant_that_ends_while_the_hello_is_awaited_ends_the_wait():
+    """Fails if the hello wait is not capped by the grant's time left (it would wait HEAD_TIMEOUT_S): the client never
+    sends its hello, the grant ends, and `grant-ended` is logged well inside that."""
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_real_entry(2, "eh-" + "3" * 24)])
+        r, w = await _tunnel(rig, hello=False)
+        assert await _until(lambda: [x for x in rig.refused() if x["detail"] == "grant-ended"], 6)
+        assert _tunnels(rig) == [] and rig.up_bytes[0] == 0
+        w.close()
+
+    assert FR.HEAD_TIMEOUT_S > 8
+    _go(body, grant_tick_s=60, clock=time.time)
+
+
+def test_t16_a_clock_step_mid_tunnel_moves_the_tunnels_end_with_it():
+    """Documents the narrowed claim: a backward step lengthens a live grant by the step (the front keeps no mark, so
+    nothing latches), a forward step ends a live tunnel at its next byte."""
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_entry(ttl=10)])
+        r, w = await _tunnel(rig)
+        rig.now[0] = T0 - 500                                      # a step back: the tunnel carries on
+        h = client_hello(HOST)
+        w.write(h)
+        await w.drain()
+        got = b""
+        while len(got) < len(h):
+            got += await asyncio.wait_for(r.read(65536), 3)
+        assert not _tunnels(rig)
+        rig.now[0] = T0 + 50                                       # a step forward past the end
+        w.write(b"x")
+        await w.drain()
+        assert await _eof(r, 3)
+        assert (await _until(lambda: _tunnels(rig)))[0]["end"] == "grant-expired"
+        w.close()
+
+    _go(body, grant_tick_s=60)
+
+
+# --- T21 the watcher fails closed -------------------------------------------------------------------------------------
+
+def test_t21_a_watcher_that_raises_closes_every_granted_tunnel_and_a_new_one_restarts_it():
+    """Fails if a raising tick leaves tunnels open (fail OPEN): the read seam raises on the watcher's call, every open
+    granted tunnel ends `grant-unchecked`, one `grants-watch-failed` is logged, and a new granted CONNECT is admitted
+    and watched again (the done watcher is restarted)."""
+    boom = [False]
+
+    def seam(path, *, owner_uid=0, group_gid=None):
+        if boom[0]:
+            raise RuntimeError("the grants parser blew up")
+        return eg.read_grants_file(path, owner_uid=owner_uid, group_gid=group_gid)
+
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_entry(), _entry(host="second.example", grant="eh-" + "e" * 24)])
+        r1, w1 = await _tunnel(rig)
+        r2, w2 = await _tunnel(rig, host="second.example")
+        boom[0] = True
+        assert await _eof(r1, 3) and await _eof(r2, 3), "a raising tick left a granted tunnel open"
+        await _until(lambda: len(_tunnels(rig)) == 2)
+        assert sorted(t["end"] for t in _tunnels(rig)) == ["grant-unchecked", "grant-unchecked"]
+        assert len(_events(rig, "grants-watch-failed")) == 1
+        assert set(_events(rig, "grants-watch-failed")[0]) == {"at", "session", "event"}
+        await _until(lambda: rig.front.grants._task.done())
+        boom[0] = False
+        r3, w3 = await _tunnel(rig)                                   # admitted, and a watcher runs again
+        rig.write([])
+        assert await _eof(r3, 3), "no watcher was restarted for the new tunnel"
+        await _until(lambda: len(_tunnels(rig)) == 3)
+        assert _tunnels(rig)[2]["end"] == "grant-revoked"
+        for x in (w1, w2, w3):
+            x.close()
+
+    _go(body, grant_tick_s=0.05, read_grants=seam)
+
+
+def test_t21_a_watcher_task_that_dies_closes_every_granted_tunnel():
+    """Fails if the done-callback is missing: an exception the loop does not handle (here the whole `_watch` raising)
+    still ends every registered tunnel `grant-unchecked`."""
+    async def go() -> None:
+        class W:
+            closed = 0
+
+            def close(self) -> None:
+                W.closed += 1
+
+        async def dead(self) -> None:
+            raise RuntimeError("the watcher died")
+
+        grants = FR._Grants("/nonexistent", SLOT, 0, None, clock=lambda: T0, tick_s=0.01)
+        counts: dict = {"up": 0, "down": 0}
+        grants._watch = dead.__get__(grants)
+        grants.register(counts, _entry(), W(), W())
+        await asyncio.sleep(0.1)
+        assert counts["grant_end"] == "grant-unchecked" and W.closed == 2
+        assert grants._task.done()
+
+    asyncio.run(go())
+
+
+# --- T22 the diagnostic -------------------------------------------------------------------------------------------------
+
+def test_t22_a_directory_the_front_cannot_traverse_logs_one_grants_unreadable():
+    """Reproduces G6: with the slot dir at mode 000 even `lstat` of the file raises EACCES, and the log still says so,
+    once, however many CONNECTs follow."""
+    if os.geteuid() == 0:
+        pytest.skip("root traverses a mode 000 directory")
+
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_entry()])
+        os.chmod(rig.dir, 0o000)
+        try:
+            for _ in range(3):
+                assert (await ask(f"{HOST}:443"))[:2] == (403, 0)
+        finally:
+            os.chmod(rig.dir, 0o750)
+        (rec,) = _events(rig, "grants-unreadable")
+        assert set(rec) == {"at", "session", "event"}
+
+    _go(body)
+
+
+def test_t22_a_missing_file_logs_nothing_and_a_bad_one_logs_once_per_identity():
+    """A missing file is the normal case (no line); an unreadable file logs once per (st_ino, st_mtime_ns) and a
+    rewrite (a new file) logs again."""
+    async def body(ask, rig: Rig) -> None:
+        assert (await ask(f"{HOST}:443"))[:2] == (403, 0)
+        assert _events(rig, "grants-unreadable") == []
+        rig.write([_entry()], mode=0o444)                              # world-readable: refused
+        for _ in range(3):
+            assert (await ask(f"{HOST}:443"))[:2] == (403, 0)
+        assert len(_events(rig, "grants-unreadable")) == 1
+        rig.write([_entry()], mode=0o444)                              # a rewrite: a new inode
+        assert (await ask(f"{HOST}:443"))[:2] == (403, 0)
+        assert len(_events(rig, "grants-unreadable")) == 2
+        rig.write([_entry()])                                          # good again: no line, and it admits
+        assert (await ask(f"{HOST}:443"))[:2] == (200, 1)
+        assert len(_events(rig, "grants-unreadable")) == 2
+
+    _go(body)
+
+
+# --- T24 the end label ---------------------------------------------------------------------------------------------------
+
+def test_t24_a_tunnel_that_already_ended_keeps_its_own_end_when_a_pass_would_revoke_it():
+    """Reproduces C9b: `_relay` sets counts["end"] and then awaits its tasks, so a watcher pass can run on a tunnel that
+    ended on its own. Fails if the pass stamps `grant_end` on it; the control (no `end`) is stamped."""
+    async def go() -> None:
+        class W:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / f"slot{SLOT}"
+            d.mkdir()
+            f = d / "grants.json"
+            f.write_bytes(eg.dump_grants(SESSION, SLOT, []))      # the entry is gone: a revoke
+            os.chmod(f, 0o440)
+            grants = FR._Grants(str(f), SLOT, os.getuid(), os.getgid(), clock=lambda: T0, tick_s=0.01,
+                                session=SESSION)
+            ended: dict = {"up": 5, "down": 5, "end": "eof"}
+            live: dict = {"up": 5, "down": 5}
+            wa, wb = W(), W()
+            grants.register(ended, _entry(), wa, wa)
+            grants.register(live, _entry(), wb, wb)
+            await asyncio.sleep(0.2)
+            assert "grant_end" not in ended and ended["end"] == "eof"
+            assert live["grant_end"] == "grant-revoked" and wb.closed
+            grants.open.clear()
+            await asyncio.wait_for(grants._task, 2)
+
+    asyncio.run(go())
+
+
+def test_t12_a_hello_that_arrives_after_the_expiry_is_not_forwarded():
+    """Fails if the gate between the hello and its write is missing: the wait is still open (the tick is 60 s and the
+    clock is a fake), the clock steps past the expiry, the hello arrives whole, and no byte reaches the upstream, no
+    tunnel line is written, and the refusal is `grant-ended`. (A close by the watcher is caught earlier, at the
+    hello's read; this is the check that decides when the bytes were already read.)"""
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_entry(ttl=10)])
+        r, w = await _tunnel(rig, hello=False)
+        rig.now[0] = T0 + 11
+        w.write(client_hello(HOST))
+        await w.drain()
+        assert await _until(lambda: [x for x in rig.refused() if x["detail"] == "grant-ended"])
+        await asyncio.sleep(0.1)
+        assert rig.up_bytes[0] == 0 and _tunnels(rig) == []
+        w.close()
+
+    _go(body, grant_tick_s=60)
