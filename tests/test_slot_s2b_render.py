@@ -2,6 +2,7 @@
 no profile is ever applied here (trg-069)."""
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import itertools
 import json
@@ -346,17 +347,186 @@ def test_webfetch_pins_read_back():
     good["skipWebFetchPreflight"] = False
     assert rd.readback_refusals(exp, good) == ["skipWebFetchPreflight"]
     blob, facts = egress("darwin", "codex")
-    assert rd.expected_effective_codex(blob, facts)["web_search"] == "disabled"
+    assert rd.expected_effective_codex(blob, facts)["web_search"] == "cached"
 
 
-def test_codex_web_search_disabled():
-    """RULINGS Q3: until Phill rules, Codex's server-side search is off (under danger-full-access it defaults to live,
-    a vendor-side fetch the front cannot see)."""
+def test_codex_web_search_cached():
+    """np-69bb37ba ask 6b (signed 10-26): Codex's server-side search is pinned to the vendor's "cached" mode (under
+    danger-full-access it defaults to live, a vendor-side fetch the front cannot see)."""
     for host, vendor, auth in itertools.product(("darwin", "linux"), ("claude", "codex"), ("brokered", "passthrough")):
         blob, facts = egress(host, vendor, auth=auth)
-        assert 'web_search = "disabled"' in rd.codex_toml(blob, facts).decode().splitlines()
+        assert 'web_search = "cached"' in rd.codex_toml(blob, facts).decode().splitlines()
     blob, facts = verifier(vendor="codex")
-    assert 'web_search = "disabled"' in rd.codex_toml(blob, facts).decode().splitlines()
+    assert 'web_search = "cached"' in rd.codex_toml(blob, facts).decode().splitlines()
+
+
+def test_codex_web_search_live_and_search_flag_are_refused_by_name():
+    """The escape, reproduced on the old code (the 1116 ws65 probe): a render blob naming ``web_search`` was refused
+    only as a generic ``unknown-key``, ``vendor_argv`` had no way to carry a request at all, and a ``--search`` or
+    ``-c web_search="live"`` token had no named refusal. Now the key parses and render refuses "live" and any
+    non-pin mode by name; a launch refuses ``--search`` by name and, since the L3 fix, every other option token
+    (``test_codex_extra_takes_positionals_only``)."""
+    from levain.slot import runtime_grammar as G
+    from levain.slot import start as SS
+
+    blob, facts = egress("darwin", "codex")
+    for mode, name in (("live", "codex-web-search-live"), ("disabled", "codex-web-search-mode"),
+                       ("Live", "codex-web-search-live"), ("true", "codex-web-search-mode")):
+        asked = dataclasses.replace(blob, web_search=mode)
+        for fn in (rd.codex_toml, rd.codex_config, rd.expected_effective_codex):
+            with pytest.raises(rd.Refused) as e:
+                fn(asked, facts)
+            assert e.value.name == name, (mode, fn)
+        with pytest.raises(rd.Refused) as e:
+            rd.render(asked, facts)
+        assert e.value.name == name
+    for ok in (None, "cached"):
+        asked = dataclasses.replace(blob, web_search=ok)
+        assert 'web_search = "cached"' in rd.codex_toml(asked, facts).decode().splitlines()
+    sid = "s-00000000000000aa"
+    for extra in (("--search",), ("--search=true",), ("exec", "--search")):
+        for fn in (lambda: rd.codex_launch_args(extra), lambda: SS.vendor_argv("linux", "codex", sid, extra=extra)):
+            with pytest.raises(rd.Refused) as e:
+                fn()
+            assert e.value.name == "codex-search-flag", extra
+    # the standalone -c/--config spellings the first lane refused by their value are refused now as options
+    for extra in (("-c", 'web_search="live"'), ("--config", "web_search=live"), ("--config=web_search='live'",),
+                  ("-c", 'web_search="cached"')):
+        with pytest.raises(rd.Refused) as e:
+            SS.vendor_argv("linux", "codex", sid, extra=extra)
+        assert e.value.name == "codex-extra-option", extra
+    assert SS.vendor_argv("linux", "codex", sid, extra=("exec", "hi")) == \
+        (f"{rd.VENDOR_PREFIX['linux']}/bin/codex", *rd.CODEX_LAUNCH_ARGS, "exec", "hi")
+    with pytest.raises(rd.Refused) as e:
+        SS.vendor_argv("linux", "claude", sid, extra=("--search",))
+    assert e.value.name == "extra-argv"
+    # the wire: the blob key parses, the value is vetted at render
+    base = {"format": G.RENDER_FORMAT, "vendor": "codex", "routes": ["openai"]}
+    parsed = G.parse_stdin("render", canon.canonical_bytes({**base, "web_search": "live"}))
+    assert parsed.web_search == "live"
+    # a Codex that READS back "live" as the effective mode is refused too (the pin is "cached")
+    assert rd.readback_refusals({"web_search": rd.CODEX_WEB_SEARCH}, {"web_search": "live"}) == ["web_search"]
+
+
+#: 1116 levain#65 L3 (complement, deepseek, codex, gemini): each spelling clap or Codex's TOML ``-c`` reads as a
+#: web_search override or another road to live search, every one passed by the first lane's regex gate (a denylist).
+CODEX_EXTRA_BYPASSES = (
+    ("-cweb_search=live",),                          # clap's attached short value
+    ('-cweb_search="live"',),
+    ('-c=web_search="live"',),                       # attached with '='
+    ("-c", '"web_search"="live"'),                   # TOML quoted key
+    ("--config", '"web_search"="live"'),
+    ("-c", 'approval_policy="never"\nweb_search="live"'),   # a multi-key TOML fragment
+    ("-c", 'a=1\nweb_search="live"'),
+    ('--config="web_search=live"',),
+    ("--enable", "web_search_request"),              # a feature flag
+    ("-c", "features.web_search_request=true"),
+    ("--profile", "x"), ("-p", "x"), ("-px",),       # a profile carrying its own web_search
+    ("--oss",),
+    ("exec", "-cweb_search=live"),                   # after a positional, the same
+)
+
+
+@pytest.mark.parametrize("extra", CODEX_EXTRA_BYPASSES)
+def test_codex_extra_takes_positionals_only(extra):
+    """L3 (A): ``extra`` is bounded, never vetted by spelling: every token that begins with ``-`` is refused
+    ``codex-extra-option`` (``--search`` keeps ``codex-search-flag``). Red on a358ba19d: each tuple here was returned
+    as argv after the pin, so Codex's later ``-c`` layer (or the feature/profile) would win."""
+    from levain.slot import start as SS
+
+    for dispatch in (False, True):
+        with pytest.raises(rd.Refused) as e:
+            rd.codex_launch_args(extra, dispatch=dispatch)
+        assert e.value.name == "codex-extra-option", (extra, dispatch)
+    for kind, auth in (("interactive", "brokered"), ("planner", "brokered")):
+        with pytest.raises(rd.Refused) as e:
+            SS.vendor_argv("linux", "codex", "s-00000000000000aa", kind=kind, auth=auth, extra=extra)
+        assert e.value.name == "codex-extra-option", extra
+
+
+def test_codex_web_search_wire_key_is_vetted_for_every_vendor():
+    """L3 (B): the blob's ``web_search`` is vetted in ``check_facts`` for every vendor, so a claude blob asking
+    "live" is refused by the codex name, never accepted and dropped."""
+    for host in ("darwin", "linux"):
+        blob, facts = egress(host, "claude")
+        asked = dataclasses.replace(blob, web_search="live")
+        for fn in (rd.check_facts, rd.render, rd.render_cc_settings):
+            with pytest.raises(rd.Refused) as e:
+                fn(asked, facts)
+            assert e.value.name == "codex-web-search-live", (host, fn)
+        blob, facts = egress(host, "claude", kind="dispatch")
+        with pytest.raises(rd.Refused) as e:
+            rd.render(dataclasses.replace(blob, web_search="cached"), facts)
+        assert e.value.name == "codex-web-search-dispatch-route"
+    blob, facts = verifier()
+    with pytest.raises(rd.Refused) as e:
+        rd.render(dataclasses.replace(blob, web_search="LIVE"), facts)
+    assert e.value.name == "codex-web-search-live"
+
+
+def _codex_body_check(mode: str, *, dispatch: bool):
+    """The broker codec's answer to the Responses body Codex 0.162.1 sends under ``mode``: the captured bodies
+    (tests/fixtures/client_bodies/PROVENANCE.json): ``codex_responses_exec.json`` carries the cached-mode tool
+    ``{"type": "web_search", "external_web_access": false}``, ``_nosearch`` was captured with web_search disabled."""
+    from levain.broker import codec, norm
+    from levain.broker.policy import parse_price
+
+    name = {"cached": "codex_responses_exec.json", "disabled": "codex_responses_exec_nosearch.json"}[mode]
+    body = json.loads((REPO / "tests" / "fixtures" / "client_bodies" / name).read_text(encoding="utf-8"))
+    if mode == "cached":
+        assert {"type": "web_search", "external_web_access": False} in body["tools"]
+    price = parse_price("m1", {"in": 2_000_000, "out": 8_000_000, "cache_write": 2_000_000, "cache_read": 500_000,
+                               "default_output": 4096, "overhead_tokens": 64, "image_tokens": 1600,
+                               "per_use": {"web_search": 10_000}, "source": "https://example.test/a"})
+    try:
+        return codec.CODECS["openai-responses"].check(dict(body, model="m1"), {"m1": price}, dispatch=dispatch)
+    except norm.Refused as r:
+        return r.name
+
+
+def test_codex_web_search_is_disabled_where_a_dispatch_route_codec_would_refuse_cached():
+    """L3 (C), DEFAULT pending np-bdc9b3fd (rec (a)): a Codex render whose brokered route takes the dispatch rules
+    (alloc kind dispatch or planner, the front's DISPATCH_KINDS) carries "disabled" in codex.toml AND its launch
+    argv, and the body Codex then sends passes the dispatch codec; the cached body is the one that codec refuses
+    ``body-unbounded:web_search``. An egress-only or interactive render keeps "cached" (no dispatch codec runs; an
+    interactive brokered route admits the tool as unproven). An explicit cached request on a dispatch route is
+    refused ``codex-web-search-dispatch-route``."""
+    from levain.broker import front
+    from levain.slot import start as SS
+
+    assert rd.CODEX_DISPATCH_KINDS == frozenset(front.DISPATCH_KINDS)
+    assert _codex_body_check("cached", dispatch=True) == "body-unbounded:web_search"
+    sid = "s-00000000000000aa"
+    for host in ("darwin", "linux"):
+        for kind in ("dispatch", "planner"):
+            blob, facts = egress(host, "codex", kind=kind)
+            mode = rd.expected_effective_codex(blob, facts)["web_search"]
+            assert mode == "disabled" and f'web_search = "{mode}"' in rd.codex_toml(blob, facts).decode().splitlines()
+            got = _codex_body_check(mode, dispatch=True)
+            assert not isinstance(got, str), got
+            argv = SS.vendor_argv(host, "codex", sid, kind=kind, ticket_kind="planner", auth=facts.auth)
+            assert argv[1:] == rd.CODEX_DISPATCH_LAUNCH_ARGS == ("-c", f'web_search="{mode}"')
+            assert rd.codex_toml(dataclasses.replace(blob, web_search="disabled"), facts) == rd.codex_toml(blob, facts)
+            with pytest.raises(rd.Refused) as e:
+                rd.codex_toml(dataclasses.replace(blob, web_search="cached"), facts)
+            assert e.value.name == "codex-web-search-dispatch-route"
+            with pytest.raises(rd.Refused) as e:
+                rd.render(dataclasses.replace(blob, web_search="live"), facts)
+            assert e.value.name == "codex-web-search-live"
+            # a caller that omits auth on a dispatch-kind launch gets the dispatch pin (fails closed)
+            assert SS.vendor_argv(host, "codex", sid, kind=kind, ticket_kind="planner")[1:] == \
+                rd.CODEX_DISPATCH_LAUNCH_ARGS
+        # egress-only: no brokered route, no codec
+        blob, facts = egress(host, "codex", auth="none", routes=("github",))
+        assert rd.expected_effective_codex(blob, facts)["web_search"] == "cached"
+        assert SS.vendor_argv(host, "codex", sid, kind="interactive", auth="none")[1:] == rd.CODEX_LAUNCH_ARGS
+        # an interactive brokered route is not dispatch-shaped: the codec admits the cached body, the tool unproven
+        blob, facts = egress(host, "codex")
+        assert rd.expected_effective_codex(blob, facts)["web_search"] == "cached"
+        assert _codex_body_check("cached", dispatch=False).unproven == ("web_search",)
+        # a dispatch-kind session on a passthrough route has no codec: it keeps cached
+        blob, facts = egress(host, "codex", kind="dispatch", auth="passthrough")
+        assert rd.expected_effective_codex(blob, facts)["web_search"] == "cached"
 
 
 def test_codex_onboarding_and_provider():
@@ -982,7 +1152,7 @@ GOLD_CODEX_DARWIN = f"""approval_policy = "never"
 cli_auth_credentials_store = "file"
 model_provider = "levain"
 sandbox_mode = "danger-full-access"
-web_search = "disabled"
+web_search = "cached"
 
 [model_providers.levain]
 base_url = "http://127.0.0.1:47103/r/openai/v1"
@@ -997,7 +1167,7 @@ trust_level = "untrusted"
 GOLD_CODEX_LINUX = f"""approval_policy = "never"
 cli_auth_credentials_store = "file"
 model_provider = "levain"
-web_search = "disabled"
+web_search = "cached"
 
 [model_providers.levain]
 base_url = "http://127.0.0.1:47100/r/openai/v1"
@@ -1023,15 +1193,16 @@ def _digest(r) -> str:
 #: WebFetch(domain:api.github.com) and WebFetch(domain:github.com), the helper's route_hosts for its github route.
 #: 1105-10 endvf re-took the four darwin digests: the only change is root/profile.sb losing its var-folders writable
 #: group (DESIGN_end_var_folders (e)); the four Linux digests are unchanged.
+#: 1116 levain#65 re-took all eight: root/codex.toml (in every render) pins web_search "cached", was "disabled".
 GOLD_DIGESTS = {
-    ("darwin", "claude", "egress"): "882b6a9e58394c4b",
-    ("darwin", "claude", "none"): "c15ca48b7909cf0b",
-    ("darwin", "codex", "egress"): "c83c5f69a0ceedd3",   # R7: + SSL_CERT_FILE in root/env
-    ("darwin", "codex", "none"): "96ccb0d934bbd77a",
-    ("linux", "claude", "egress"): "9a6f5684256bdd1c",
-    ("linux", "claude", "none"): "c9796d76e53b1d57",
-    ("linux", "codex", "egress"): "02b07820fb916f2b",
-    ("linux", "codex", "none"): "673582e9c5e81a4e",
+    ("darwin", "claude", "egress"): "fd22bc11bc79f8f3",
+    ("darwin", "claude", "none"): "819e735414a184b4",
+    ("darwin", "codex", "egress"): "d21ad0f0a4e38190",   # R7: + SSL_CERT_FILE in root/env
+    ("darwin", "codex", "none"): "12447163766c64b3",
+    ("linux", "claude", "egress"): "9cd5f7e0304c732a",
+    ("linux", "claude", "none"): "14b9754c6a144f89",
+    ("linux", "codex", "egress"): "3b14bdd1adba58c8",
+    ("linux", "codex", "none"): "69b1d80998c338ac",
 }
 
 
@@ -1124,7 +1295,7 @@ def test_codex_launch_pins_web_search_above_a_trusted_repo():
     for kv in args[1::2]:
         k, _, v = kv.partition("=")
         pinned[k] = tomllib.loads(f"x = {v}")["x"]
-    assert pinned == {"web_search": rd.CODEX_WEB_SEARCH} and rd.CODEX_WEB_SEARCH == "disabled"
+    assert pinned == {"web_search": rd.CODEX_WEB_SEARCH} and rd.CODEX_WEB_SEARCH == "cached"
 
 
 def test_repo_settings_proxy_env_of_the_wrong_shape_is_malformed():
