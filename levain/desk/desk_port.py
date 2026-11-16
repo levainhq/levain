@@ -63,6 +63,7 @@ DESKCMD_ENV = "LEVAIN_DESK_PORT_COMMANDS"
 # [seat] characters of words one post may carry by default; a host sets its own with ``words_max``
 WORDS_MAX = 2000
 CONTEXT_TTL = 3.0        # seconds a context reading (the host command's answer and the tail read) is shared between polls
+CONTEXT_STALE = 12.0     # seconds past which a reading is too old to be answered at all (an idle page; the desk may have rotated since)
 POST_OUTCOMES = ("accepted", "ambiguous", "not_delivered")
 LEASE_STATES = ("held", "none", "unknown")
 EVENT_BY = ("script", "desk")
@@ -273,8 +274,9 @@ class DeskCommands:
     """The argvs a host gives the Desk tab: ``post`` (words on STDIN), ``lease`` (reads the lease), ``events`` (reads a
     thread's receipts); each absolute-program, run ``shell=False``; any may be None (the capability is then absent).
     ``context`` (levain#79) names the live desk's session transcript for the Desk view's context line: no extra argv; stdout is one
-    JSON object ``{"transcript": <absolute path of a .jsonl>, "deep": bool?}`` (:func:`levain.desk.desk_context.parse_command`); the
-    port reads the transcript's tail itself. ``words_max`` is the host's cap. Deliberately NOT part of :class:`levain.desk.room_host.HostCommands`."""
+    JSON object ``{"transcript": <absolute path of a .jsonl>, "deep": bool?, "holder": <the desk's label, as the lease names it>?}``
+    (:func:`levain.desk.desk_context.parse_command`). ``holder`` is optional: when given and the lease names a different holder, the
+    reading is unreadable (never another desk's number); the reading carries it. The port reads the transcript's tail itself. ``words_max`` is the host's cap. Deliberately NOT part of :class:`levain.desk.room_host.HostCommands`."""
     post: Optional[tuple[str, ...]] = None
     lease: Optional[tuple[str, ...]] = None
     events: Optional[tuple[str, ...]] = None
@@ -449,15 +451,19 @@ class HostCommandDeskPort:
         nothing usable, the path is not a regular file, the transcript is gone). Unreadable is never zero.
 
         The host command runs at most once per :data:`CONTEXT_TTL` seconds, whoever asks, and a poll never waits on it once a reading is
-        held: an aged reading is answered as it is while ONE background refresh runs for the next poll (so a reading is at most about
-        TTL plus one poll old). Only the very first ask with ``block`` True runs the command in the caller (concurrent first asks share
-        that one run); ``block`` False is the receipt path's, which never does: with nothing held it says ``NoReading("not read yet")``."""
+        held: an aged reading is answered as it is while ONE background refresh runs for the next poll, but only up to
+        :data:`CONTEXT_STALE` seconds old. A reading older than that (an idle page; the desk may have rotated meanwhile) is never
+        answered as a number: the ask that finds it is treated as a first ask. A first ask with ``block`` True runs the command in the
+        caller (concurrent first asks share that one run); ``block`` False is the receipt path's, which never does: with nothing held it says ``NoReading("not read yet")``."""
         if self._cmds.context is None:
             return None
         with self._ctx_state:
             held = self._ctx_held
-            if held is not None and time.monotonic() - held[0] < CONTEXT_TTL:
+            age = time.monotonic() - held[0] if held is not None else 0.0
+            if held is not None and age < CONTEXT_TTL:
                 return held[1]
+            if held is not None and age >= CONTEXT_STALE:
+                held = None         # too old to claim for whoever holds the desk now: never answered, read afresh
             if held is not None or not block:       # an aged reading is answered as it is and refreshed behind the request
                 if not self._ctx_busy:
                     self._ctx_busy = True

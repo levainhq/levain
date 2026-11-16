@@ -601,3 +601,35 @@ def test_a_context_not_read_yet_says_it_is_being_read_not_that_there_was_no_turn
             *_shot("desk_ctx_pending_390.png")])
     g = ctxs(out)[0]
     assert g["cls"] == "dv-ctx dv-ctx-pending" and g["words"] == "Reading the desk's context." and g["fill"] is None and not g["pageX"], g
+
+
+def _idle_then_changed(tmp_path):
+    """A port that read a desk once, then sat idle past CONTEXT_STALE while the transcript became another desk's (a smaller number)."""
+    port, runs = _slow_port(tmp_path, 0.0)
+    assert port.context().tokens == 212_405
+    t = tmp_path / "desk.jsonl"
+    t.write_text(rec(2, 1_000, 10, model="claude-opus-5-5") + "\n")
+    held = port._ctx_held
+    port._ctx_held = (held[0] - 600.0, held[1])
+    return port
+
+
+def test_a_reading_left_idle_past_the_stale_bound_is_never_the_first_answer_for_a_possibly_new_desk(tmp_path):
+    port = _idle_then_changed(tmp_path)
+    assert port.context().tokens == 1_012          # read afresh in the asking call, not the old desk's 212_405
+
+
+def test_a_receipt_poll_on_an_idle_stale_reading_says_not_read_yet_never_the_old_number(tmp_path):
+    import time
+    port = _idle_then_changed(tmp_path)
+    assert port.context(block=False) == NoReading("not read yet")
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and port._ctx_busy:
+        time.sleep(0.05)
+    assert port.context(block=False).tokens == 1_012
+
+
+def test_the_stale_first_read_is_what_the_bound_removes(tmp_path, monkeypatch):
+    monkeypatch.setattr("levain.desk.desk_port.CONTEXT_STALE", 1e9)       # the old behaviour: any aged reading is answered as it is
+    port = _idle_then_changed(tmp_path)
+    assert port.context().tokens == 212_405
