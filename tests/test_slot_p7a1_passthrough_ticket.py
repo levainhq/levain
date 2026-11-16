@@ -9,6 +9,7 @@ run half is the real socket: ``RUN-TICKET-MINT`` -> ``LEASE-OPEN`` -> ``ATTACH``
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
@@ -216,6 +217,20 @@ def test_a_passthrough_ticket_end_to_end_queue_resolve_carries_the_caps(run_env)
     assert run_to_rendered.attach["ticket_facts"]["deadline"] == attached + 7200     # render's absolute reading
 
 
+def wait_lease_gone(e: Env, ticket: str, timeout: float = 5.0) -> None:
+    """Wait until the server has read EOF on a closed connection and its lease on ``ticket`` is dead. A close on the
+    client side is only seen by the server's own thread, so a LEASE-OPEN on the same ticket straight after it can
+    answer ``ticket-bound``; there is no revoke thread to join when the lease bound no session."""
+    deadline = time.monotonic() + timeout
+    while True:
+        with e.control._mu:
+            live = [x for x in e.control._leases.values() if x.live and x.ticket == ticket]
+        if not live:
+            return
+        assert time.monotonic() < deadline, ("lease still live on", ticket)
+        time.sleep(0.01)
+
+
 def test_attach_refuses_a_session_auth_that_is_not_the_tickets(run_env):
     e = run_env
     ticket = ticket_of(e.client("dispatch").ask("RUN-TICKET-MINT", **pt_args()))
@@ -228,6 +243,7 @@ def test_attach_refuses_a_session_auth_that_is_not_the_tickets(run_env):
         assert root.ask("ATTACH", lease_nonce=nonce, sudo_uid=DISPATCH_UID, session=S, claims=claims)["refused"] \
             == "claims-mismatch"
         disp.sock.close()
+        wait_lease_gone(e, ticket)
         disp = e.client("dispatch")
 
 
