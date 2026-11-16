@@ -32,7 +32,7 @@ from levain.consent.queue import authority_source
 from levain.consent.sign import Signer
 from levain.web_server import make_server
 from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import _drive, landed_tap, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_sign_origin import _Passkey
 from tests.test_cockpit_sign_routes import _call, _serving
@@ -228,7 +228,7 @@ def test_the_cockpit_revoke_button_runs_the_phones_ceremony_with_the_passkey(wor
             auth_step, {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && {_CARD}.querySelector('.grant-revoke').title === 'revoke with your passkey'"},
             {"eval": f"!!{_CARD}.querySelector('.consent-code')"},
-            {"tap": f"{_CARD}.querySelector('.grant-revoke')"},
+            *landed_tap(f"{_CARD}.querySelector('.grant-revoke')"),
             {"posts": 2},
             {"until": f"/revoked/.test(({_CARD} || {{textContent: 'revoked'}}).textContent) "
                       "|| /revoked/.test(document.querySelector('#levain-modal').textContent)"},
