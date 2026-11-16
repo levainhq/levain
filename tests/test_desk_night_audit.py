@@ -139,7 +139,7 @@ def test_a_night_with_no_heartbeat_is_blind_throughout(store):
     assert "1h 0m" in line
 
 
-def test_a_beat_before_the_night_keeps_its_start_alive_for_one_window(store, poster):
+def test_a_beat_before_the_night_judges_the_first_silence_from_the_beat_and_reports_its_part_in_the_night(store, poster):
     poster.beat(-5)
     assert night_audit.blind_stretches(store, stamp(0), stamp(10), window=WINDOW) == []
     got = night_audit.blind_stretches(store, stamp(0), stamp(40), window=WINDOW)
