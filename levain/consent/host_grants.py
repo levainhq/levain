@@ -309,9 +309,11 @@ class HostGrantSurface:
         try:
             threading.Thread(target=reap, name="host-grants-reap", daemon=True).start()
         except BaseException as e:  # noqa: BLE001 - no thread: the reaper never ran, the lock is still this call's
-            _log.warning("host grants: no reaper for a running root helper: %s: %s", type(e).__name__, e)
-            self._left, self._reaping = child, None
+            self._left, self._reaping = child, None         # the state is consistent first, for any failure
             self._spawn_lock.release()
+            if not isinstance(e, Exception):
+                raise                                       # an interrupt (KeyboardInterrupt, SystemExit) is not swallowed
+            _log.warning("host grants: no reaper for a running root helper: %s: %s", type(e).__name__, e)
 
     def _invalidate(self) -> None:
         with self._cv:

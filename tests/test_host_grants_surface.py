@@ -535,9 +535,43 @@ def test_a_reaper_that_cannot_start_leaves_no_lock_held_after_the_child_exits(mo
     assert surf.listing(time.monotonic() + 1.2)["name"] == "helper-timeout"
     surf._invalidate()
     assert surf.listing(time.monotonic() + 1.5)["name"] == "host-grants-helper-running" and len(starts) == 1
-    time.sleep(2.0)                                         # the child has exited
+    child = surf._left
+    assert child is not None
+    give_up = time.monotonic() + 60.0                       # bounded poll on the child itself, no sleep tuned to it
+    while child.poll() is None and time.monotonic() < give_up:
+        time.sleep(0.05)
+    assert child.poll() is not None                         # the child has exited
     surf._invalidate()
     assert "slots" in surf.listing(time.monotonic() + 5.0) and len(starts) == 2
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_an_interrupt_while_starting_the_reaper_is_not_swallowed(monkeypatch: pytest.MonkeyPatch, exc: type) -> None:
+    """L3 verify round 2 (LOW): `except BaseException` around Thread.start() returned normally on a KeyboardInterrupt.
+    The state is restored (child kept, lock given back) and the interrupt propagates."""
+    surf = HG.HostGrantSurface(spawn=FakeRoot())
+
+    class Child:
+        def wait(self) -> None:
+            pass
+
+    class NoThread:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            raise exc()
+
+    import types
+    monkeypatch.setattr(HG, "threading", types.SimpleNamespace(Thread=NoThread))
+    child = Child()
+    assert surf._spawn_lock.acquire(blocking=False)
+    surf._left = child
+    with pytest.raises(exc):
+        surf._release_spawn()
+    assert surf._left is child and surf._reaping is None
+    assert surf._spawn_lock.acquire(blocking=False)         # given back, not held for good
+    surf._spawn_lock.release()
 
 
 def test_a_revoke_that_fails_before_root_is_started_is_not_revoked_never_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
