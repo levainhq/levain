@@ -123,8 +123,9 @@ def _run(argv: Sequence[str], *, env: Mapping[str, str], timeout: float, stdin: 
     p = subprocess.Popen(list(argv), env=dict(env), stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd)
     try:
         out, err = p.communicate(timeout=timeout)
-    except BaseException:           # the timeout, and an interrupt: stop waiting, bounded
+    except BaseException as e:      # the timeout, and an interrupt: stop waiting, bounded
         _stop(p, signal_child=signal_child)
+        e.child = p                 # type: ignore[attr-defined]  # unsignalled, it may still run: a caller may wait on it
         raise
     return subprocess.CompletedProcess(p.args, p.returncode, out, err)
 
