@@ -116,6 +116,14 @@ READERS: dict[str, tuple[int, str, str]] = {
     "levain/cockpit/verbs.py::_renew_target_holds":
         (1, "write", "the renew verb checks the link covers the agent's spec; a renew of a stopped link is refused at "
                      "append"),
+    "levain/cockpit/verbs.py::_agent_revoke_fire":
+        (1, "write", "the revoke verb's pre-check: the agent's links in the log by presence (agent_links' rule, what a "
+                     "revoke_agent removes), so a lapsed or stopped link is still revoked, never refused as no link; "
+                     "it arms nothing (test_a_lapsed_or_stopped_link_still_stands_for_the_revoke_and_is_revoked)"),
+    "levain/cockpit/verbs.py::_revoke_in_log":
+        (1, "write", "whether the revoke landed: the row's link stands while the log still holds it, stopped or not; a "
+                     "liveness read would call a stopped link gone before any revoke removed it "
+                     "(test_a_lapsed_or_stopped_link_still_stands_for_the_revoke_and_is_revoked)"),
     # --- setup, replace, renew, revoke ----------------------------------------------------------------------------
     "levain/chat_egress/key_setup.py::setup_key":
         (3, "write", "the one-live count and the existing-id test of a setup or --replace stay raw: a stopped record is "

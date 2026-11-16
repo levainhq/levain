@@ -159,7 +159,7 @@ def test_the_detail_offers_each_verb_only_where_the_state_allows_it_and_none_on_
     with _serve(s.src, surface_tokens={"browser": TOK}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token={TOK}", _shots("agents_detail_" + width, steps))
     got = {name: json.loads(v) for name, v in zip(order, [x for x in out["values"] if isinstance(x, str) and '"verbs"' in x][1::2])}   # each `until` collects too; the eval is the second
-    assert got["w-firing"]["verbs"] == ["agent_pause", "agent_renew", "agent_retire"], got["w-firing"]
+    assert got["w-firing"]["verbs"] == ["agent_pause", "agent_renew", "agent_revoke", "agent_retire"], got["w-firing"]
     assert got["w-paused"]["verbs"] == ["agent_resume", "agent_retire"], got["w-paused"]
     assert got["w-unarmed"]["verbs"] == ["agent_pause", "agent_retire"], got["w-unarmed"]
     for name in ("operator", "w-retired"):
