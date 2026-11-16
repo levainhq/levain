@@ -306,14 +306,52 @@ def test_l3_a_hex_looking_label_that_is_no_number_stays_dns(raw):
     assert canonical_host(raw) == raw
 
 
-def test_m1_names_dedupe_is_linear():
+def _time_parse_keys(n, clock):
+    """Best of 3 wall time of one parse of an n-key query (the best of 3 drops scheduler noise)."""
+    query = "&".join(f"k{i}=v" for i in range(n))
+    best = float("inf")
+    for _ in range(3):
+        t0 = clock()
+        p = parse.parse(frame(query=query))
+        best = min(best, clock() - t0)
+    assert len(p.query_keys) == n and list(p.query_keys)[:2] == ["k0", "k1"]
+    return best
+
+
+def test_m1_names_dedupe_is_linear(clock=None, n=10_000):
+    """Linearity, not seconds: 4x the keys must cost well under the 16x a quadratic dedupe would. A linear parse
+    sits near 4x; the bound is 10x, so a loaded runner's constant slowdown (which scales both sizes) cannot trip it."""
     import time
-    query = "&".join(f"k{i}=v" for i in range(40_000))
-    t0 = time.perf_counter()
-    p = parse.parse(frame(query=query))
-    took = time.perf_counter() - t0
-    assert len(p.query_keys) == 40_000 and list(p.query_keys)[:2] == ["k0", "k1"]
-    assert took < 1.0, took
+    clock = clock or time.perf_counter
+    small = _time_parse_keys(n, clock)
+    large = _time_parse_keys(4 * n, clock)
+    assert large < 10 * small, (small, large, large / small)
+
+
+def test_m1_linearity_bound_rejects_a_quadratic_dedupe(monkeypatch):
+    """The bound above has teeth: a quadratic stand-in for `Names` (a list scan per insert) must fail it."""
+    class QuadNames(parse.Names):
+        __slots__ = ()
+
+        def __init__(self, names=()):
+            seen = []
+            for n in names:
+                f = fold_name(n)
+                if f not in seen:   # the list scan: O(n) per insert
+                    seen.append(f)
+            self._order = tuple(seen)
+            self._set = frozenset(seen)
+
+    monkeypatch.setattr(parse, "Names", QuadNames)
+    with pytest.raises(AssertionError):
+        test_m1_names_dedupe_is_linear(n=3_000)
+
+
+def test_m1_linearity_holds_under_a_constant_slowdown():
+    """The 11-13 red shape: the machine ran ~16x slow (1.25 s against a 1.0 s bound). A clock that reads 20x
+    elapsed time stands in for it; the ratio is unchanged, so the test still passes."""
+    import time
+    test_m1_names_dedupe_is_linear(clock=lambda: time.perf_counter() * 20)
 
 
 def test_l1_fold_is_ascii_only():
