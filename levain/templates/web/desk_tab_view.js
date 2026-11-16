@@ -314,14 +314,15 @@
     }
     function voiceTap() { var T = vt(); if (T) T.tap(); }
     // A desk reply as voice.js knows a reply: one conversation ("desk"), a number that grows as replies are first seen (the order
-    // they reached this page, which is the order autoplay needs), the words to read. deviceOnly: read by this device's voice.
+    // they reached this page, which is the order autoplay needs), the words to read (reply.text, for the on-device voice) and
+    // `desk`, the thread and the event's time the premium route re-reads from the desk host: the Room's player and settings.
     function textHash(s) { var h = 5381, i; s = String(s || ""); for (i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36) + ":" + s.length; }
     function voiceReply(it) {
       // keyed by what the event IS (its time and a hash of its words), never by its place in the held list: that place shifts
       // when older events are trimmed, and an old reply must not take a new number and be read again.
       var key = it.thread + "@" + (it.at || "") + "|" + textHash(it.text);
       if (!own(VSEQ, key)) VSEQ[key] = ++vnext;
-      return { thread: "desk", gseq: VSEQ[key], text: it.text, deviceOnly: true };
+      return { thread: "desk", gseq: VSEQ[key], text: it.text, desk: { thread: it.thread, at: it.at || "" } };
     }
     function voiceBtn(it) { var T = vt(); return T ? T.button(voiceReply(it)) : null; }
     function voiceSync(all) {

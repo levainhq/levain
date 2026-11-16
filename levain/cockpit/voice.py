@@ -94,6 +94,9 @@ SAMPLE_KEYS = frozenset({"sample", "provider", "voice", "speed"})
 # V1-7: a Needs-you card read aloud. The page names the card (``question:<n>``); the words are card_script's, built from the
 # filed question, never from the body.
 CARD_KEYS = frozenset({"card_id", "chunk", "provider", "voice", "speed"})
+# levain#80: a Desk reply read aloud. The page names the desk thread and the event's time; the words are the desk host's own
+# event for that pair (re-read through the Desk port), never the body's.
+DESK_KEYS = frozenset({"desk_thread_id", "desk_at", "chunk", "provider", "voice", "speed"})
 SAMPLE_WORDS = "This is how your room will sound."
 LAST_READ_STATES = frozenset({"keychain_unreadable", "unusable", "refused", "authority_unreadable"})
 
@@ -194,6 +197,9 @@ WORDS = {
     "bad_room": "The request names the room thread the page shows (room_thread_id).",
     "no_room": "No conversation is recorded.",
     "room_rotated": "This conversation was replaced; nothing more is read from it.",
+    "bad_desk": "desk_thread_id and desk_at name the desk reply by its thread and its time.",
+    "no_desk": "No desk is wired here.",
+    "desk_unreadable": "The desk record could not be read.",
     "card_unreadable": "The card record could not be read.",
     "room_unreadable": "The room record could not be read.",
     "not_a_reply": "That reply is not finished, or is not in this conversation.",
@@ -644,7 +650,8 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
         return None, refusal(400, "bad_json", "bad_json")
     sample = isinstance(req, dict) and set(req) == SAMPLE_KEYS and req["sample"] is True
     card = isinstance(req, dict) and set(req) == CARD_KEYS
-    if not sample and not card and (not isinstance(req, dict) or set(req) != SPEAK_KEYS):
+    desk = isinstance(req, dict) and set(req) == DESK_KEYS
+    if not sample and not card and not desk and (not isinstance(req, dict) or set(req) != SPEAK_KEYS):
         return None, refusal(400, "bad_request", "bad_keys")
     provider = req["provider"]
     if isinstance(provider, str) and provider in UNSUPPORTED:
@@ -660,6 +667,10 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
         if card:
             if not isinstance(req["card_id"], str) or not card_script.CARD_ID.fullmatch(req["card_id"]):
                 return None, refusal(400, "bad_request", "bad_card")
+        elif desk:
+            for k in ("desk_thread_id", "desk_at"):
+                if not isinstance(req[k], str) or not req[k] or len(req[k]) > 200:
+                    return None, refusal(400, "bad_request", "bad_desk")
         elif isinstance(req["reply_gseq"], bool) or not isinstance(req["reply_gseq"], int):
             return None, refusal(400, "bad_request", "bad_reply")
         chunk = req["chunk"]
@@ -676,7 +687,7 @@ def _parse_speak(raw: bytes) -> tuple[dict[str, Any] | None, Answer | None]:
 def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | str,
           revoke_queue: Path | str | None, meter: vmeter.Meter, transport: vprov.Transport,
           read_key: Callable[..., Any], last_read: MutableMapping[str, str | None],
-          question_store: Any = None) -> Answer:
+          question_store: Any = None, desk_port: Any = None) -> Answer:
     """``POST /cockpit/voice/speak``: chunk ``chunk`` of the room reply that ended at ``reply_gseq``, as mp3. A body naming
     ``card_id`` (``question:<n>``) instead reads that filed question as the card script (V1-7, ``question_store``: the words
     are :mod:`card_script`'s over the filed question). The words
@@ -691,6 +702,7 @@ def speak(data_root: Path | str, service: Any, raw: bytes, *, directory: Path | 
         chunks = [SAMPLE_WORDS]
     else:
         chunks, refused = (_card_chunks(question_store, req) if "card_id" in req
+                           else _desk_chunks(desk_port, req) if "desk_thread_id" in req
                            else _reply_chunks(directory, service, req))
         if refused is not None or chunks is None:
             return refused or internal_answer()
@@ -726,6 +738,28 @@ def _reply_chunks(directory: Path | str, service: Any, req: dict[str, Any]) -> t
     if text is None:
         return None, refusal(404, "not_a_reply", "not_a_reply")
     chunks = speakable(text)
+    if not chunks:
+        return None, refusal(404, "nothing_to_read", "nothing_to_read")
+    if not req["chunk"] < len(chunks):
+        return None, refusal(404, "no_such_chunk", "no_such_chunk", chunks=len(chunks))
+    return chunks, None
+
+
+def _desk_chunks(port: Any, req: dict[str, Any]) -> tuple[list[str] | None, Answer | None]:
+    """The speakable chunks of the desk's reply the request names (its thread and the event's time), or the refusal. The words
+    are the desk host's event, re-read here: only an event the desk itself wrote as a reply is ever read."""
+    if port is None:
+        return None, refusal(404, "not_found", "no_desk")
+    try:
+        batch = port.events(req["desk_thread_id"], None)
+        if not batch.readable:
+            return None, refusal(404, "not_a_reply", "not_a_reply")
+        texts = [e.text for e in batch.events if e.by == "desk" and e.kind == "reply" and e.at == req["desk_at"] and e.text]
+    except Exception:            # noqa: BLE001 - a desk that cannot be read is fixed words, never its detail
+        return None, refusal(500, "internal", "desk_unreadable")
+    if len(texts) != 1:          # none, or the time names two events: nothing is guessed
+        return None, refusal(404, "not_a_reply", "not_a_reply")
+    chunks = speakable(texts[0])
     if not chunks:
         return None, refusal(404, "nothing_to_read", "nothing_to_read")
     if not req["chunk"] < len(chunks):

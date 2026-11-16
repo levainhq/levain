@@ -4451,7 +4451,8 @@ class _Handler(GuardedHandler):
                 "revoke_queue": srv.grant_phone.queue_dir if srv.grant_phone is not None else None}
             if speak:
                 return cockpit_voice.speak(data_root, srv.chat_service, raw, directory=self._room_directory(directory),
-                                           question_store=getattr(srv, "question_store", None), **common)
+                                           question_store=getattr(srv, "question_store", None),
+                                           desk_port=srv.desk_port, **common)
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
             return cockpit_voice.transcribe(data_root, query, self.headers.get("Content-Type", ""), raw, **common)
         finally:
