@@ -15,6 +15,7 @@ import pytest
 from levain.cli import main
 from levain.cockpit.consent import parse_stamp
 from levain.desk import review, seam, seam_handoffs
+from levain.desk.legacy import ROLE_DESK
 from levain.desk.store import CoordStore
 from levain.dream import card as dream_card
 
@@ -293,7 +294,7 @@ def _requested(desk):
 def _due(desk):
     from levain.desk import dream_status
 
-    return dream_status.rotation_due(desk, desk.launch)
+    return dream_status.rotation_due(desk, desk.launch, at_turn_boundary=True)
 
 
 def _saved_after(desk, hours=1, occurrence="occ-1"):
@@ -343,9 +344,9 @@ def test_rotation_is_not_due_with_an_open_turn_an_unacknowledged_open(desk):
                          token=desk.token)
     assert seam_open.record_delivery(desk, b.open_id, "light_verb", recipient=desk.launch.launch_id)
     due, why = _due(desk)
-    assert due is False and why == f"mid-work: open {b.open_id} was handed to this desk and is not acknowledged"
+    assert due is False and why == f"mid-work: open {b.open_id} was handed to this desk and this desk has not acknowledged it"
     seam_open.acknowledge(desk, b.open_id, token=desk.token)
-    assert _due(desk)[0] is True
+    assert _due(desk)[0] is True                        # the store's half; the turn boundary is the caller's
 
 
 def test_rotation_is_not_due_when_the_save_predates_the_launch(desk):
@@ -389,7 +390,10 @@ def test_rotation_due_timestamp_boundary(desk, offset, due):
 
 def test_a_save_between_the_request_and_the_activation_is_called_due(desk):
     # skew direction: the session may already hold this save (it loads after the request), so the call is an extra,
-    # harmless rotation onto the same memory; the opposite error (a save after the load read as not due) cannot happen
+    # harmless rotation onto the same memory; the opposite error (a save after the load read as not due) cannot happen.
+    # The same holds for a save made before the request whose card is filed after it (a card's ``at`` is its filing,
+    # seconds after the save; codex HIGH, L3 r1): the store records neither the save's own stamp nor the memory a launch
+    # loaded, so this is the input's limit, not the predicate's. It is the extra-rotation direction, at a real seam
     requested, active = parse_stamp(_requested(desk)), parse_stamp(_started(desk))
     assert requested < active
     _file(desk.directory, "consolidated", requested + (active - requested) / 2)
@@ -410,8 +414,131 @@ def test_rotation_due_fails_closed_on_a_launch_that_is_not_an_active_desk_or_a_s
     from levain.desk import dream_status
 
     _saved_after(desk)
-    assert dream_status.rotation_due(desk, SimpleNamespace())[0] is False
-    assert dream_status.rotation_due(desk, SimpleNamespace(launch_id="ln-" + "0" * 32)) == \
+    assert dream_status.rotation_due(desk, SimpleNamespace(), at_turn_boundary=True)[0] is False
+    assert dream_status.rotation_due(desk, SimpleNamespace(launch_id="ln-" + "0" * 32), at_turn_boundary=True) == \
         (False, f"no launch ln-{'0' * 32} in this store")
-    due, why = dream_status.rotation_due(CoordStore(tmp_path / "nowhere"), desk.launch)
+    due, why = dream_status.rotation_due(CoordStore(tmp_path / "nowhere"), desk.launch, at_turn_boundary=True)
     assert due is False and why.startswith("cannot-derive (")
+
+
+# --- levain#81 L3 round 1: the seam's definition, per-session acks, the caller's re-check, a strict card read -------
+def _successor(desk):
+    """The desk ends (a done session replaced) and the next desk launch is activated; it holds the lease now."""
+    desk.launch_replace_done(desk.launch.launch_id, asked=True)
+    nxt = desk.pending_desk()
+    desk.launch_claim_spawn(nxt.launch_id, os.getpid())
+    got, why = desk.launch_activate(nxt.launch_id, harness_session_id="h-" + nxt.launch_id)
+    assert why is None and got.state == "active"
+    return got, desk.coord_status()["lease"]["token"]
+
+
+def _light_open(desk, key, token=None):
+    from levain.desk import seam_build
+
+    return seam_build.build(desk, kind="light", signal_kind="silence", signal_key=key, queue_dir=desk.directory,
+                            token=desk.token if token is None else token)
+
+
+def test_an_ack_by_another_session_does_not_close_the_open_handed_to_this_desk(desk):
+    # codex HIGH (dream_status.py:173): open_acks is keyed (open_id, reader_session). The open the earlier desk
+    # acknowledged is handed to the next desk too (a stored build is returned, never rebuilt); the next desk has
+    # not taken it in, so it is mid-arrival
+    from levain.desk import dream_status, seam_open
+
+    b = _light_open(desk, "k-shared")
+    seam_open.record_delivery(desk, b.open_id, "light_verb", recipient=desk.launch.launch_id)
+    seam_open.acknowledge(desk, b.open_id, token=desk.token)
+    nxt, token = _successor(desk)
+    seam_open.record_delivery(desk, b.open_id, "light_verb", recipient=nxt.launch_id)
+    _file(desk.directory, "consolidated", parse_stamp(nxt.at) + timedelta(hours=1))
+    due, why = dream_status.rotation_due(desk, nxt, at_turn_boundary=True)
+    assert due is False and why == f"mid-work: open {b.open_id} was handed to this desk and this desk has not acknowledged it"
+    desk.token = token
+    seam_open.acknowledge(desk, b.open_id, token=token)
+    assert dream_status.rotation_due(desk, nxt, at_turn_boundary=True)[0] is True
+
+
+def test_an_acknowledged_open_is_not_a_finished_turn_the_caller_reads_the_boundary(desk):
+    # codex HIGH (dream_status.py:226): the ack is the turn's FIRST act. The store records no desk turn ending, so a
+    # store with nothing held is half a seam; the other half (the harness is between turns) is the caller's input
+    from levain.desk import dream_status, seam_open
+
+    _saved_after(desk)
+    b = _light_open(desk, "k-turn")
+    seam_open.record_delivery(desk, b.open_id, "light_verb", recipient=desk.launch.launch_id)
+    seam_open.acknowledge(desk, b.open_id, token=desk.token)
+    due, why = dream_status.rotation_due(desk, desk.launch, at_turn_boundary=False)
+    assert due is False and why.startswith("mid-turn:")
+    assert dream_status.rotation_due(desk, desk.launch, at_turn_boundary=True)[0] is True
+    for not_a_bool in (1, "yes", None):              # only True says "between turns"
+        assert dream_status.rotation_due(desk, desk.launch, at_turn_boundary=not_a_bool)[0] is False
+    with pytest.raises(TypeError):                   # no default: a caller says which it is
+        dream_status.rotation_due(desk, desk.launch)
+
+
+def test_a_claim_after_a_true_answer_is_seen_by_the_callers_re_check_in_its_own_transaction(desk, tmp_path):
+    # codex HIGH (dream_status.py:201): the answer is one snapshot; a claim after it is inherent. The caller re-checks
+    # with seam_check on ITS write connection, inside the transaction that would rotate, and sees the claim
+    from levain.desk import dream_status, events
+
+    _saved_after(desk)
+    assert dream_status.rotation_due(desk, desk.launch, at_turn_boundary=True)[0] is True
+    path = tmp_path / "mon.cred"
+    events.register(desk, "mon", "first_party", path)
+    ev = events.post(desk, "mon", 1, "site_status", {"subject": "taosrv", "state": "down"},
+                     credential=events.read_credential(path)).event
+    with desk._write(ROLE_DESK, desk.token) as (conn, now):
+        assert dream_status.seam_check(conn, desk.launch.launch_id, now, at_turn_boundary=True)[0] is True
+        events._state(conn, now, ev.event_id, "claimed", launch_id=desk.launch.launch_id, claim_until=now)
+        due, why = dream_status.seam_check(conn, desk.launch.launch_id, now, at_turn_boundary=True)
+        assert due is False and ev.event_id in why     # the uncommitted claim, in the caller's own transaction
+    assert dream_status.rotation_due(desk, desk.launch, at_turn_boundary=True)[0] is False
+
+
+def test_a_desk_that_does_not_hold_the_live_lease_is_not_the_live_desk(desk):
+    # codex MED (dream_status.py:205): a release leaves the launch active; it is no longer the live desk
+    from levain.desk import dream_status
+
+    _saved_after(desk)
+    assert _due(desk)[0] is True
+    desk.coord_release(desk.token, by=ROLE_DESK)
+    due, why = _due(desk)
+    assert due is False and "does not hold the live lease (the lease is not held)" in why
+
+
+def test_a_rollback_card_the_predicate_cannot_read_is_cannot_derive_never_a_seam(desk):
+    # codex MED (dream_status.py:82): the brief skips an unreadable card; the predicate must not, or a rollback it
+    # cannot pair with its save leaves the save live and calls the desk due
+    from levain.desk import dream_status
+
+    _saved_after(desk, occurrence="occ-1")
+    when = parse_stamp(_requested(desk)) + timedelta(hours=2)
+    review.file_item(CoordStore(desk.directory, clock=lambda: when), "agent",
+                     {"kind": "rolled-back", "occurrence": "occ-1"}, dedupe_key="dream-rollback:occ-1")
+    due, why = dream_status.rotation_due(desk, desk.launch, at_turn_boundary=True)
+    assert due is False and why.startswith("cannot-derive (") and "dream-rollback:occ-1" in why
+    # the display read keeps its old reading: a rollback paired with no occurrence, so the save stands there
+    assert [(r.kind, r.occurrence) for r in dream_status.records(sqlite3.connect(desk.path))] == \
+        [("rolled-back", ""), ("consolidated", "occ-1")]
+
+
+def test_a_stamp_the_predicate_cannot_compare_is_cannot_derive_not_a_raise(desk, monkeypatch):
+    # deepseek MED-1: every step after the read sits inside the fail-closed handler
+    from levain.desk import dream_status
+
+    _saved_after(desk)
+    monkeypatch.setattr(dream_status, "records",
+                        lambda conn, strict=False: [dream_status.DreamRecord("consolidated", None, "occ-1")])
+    due, why = dream_status.rotation_due(desk, desk.launch, at_turn_boundary=True)
+    assert due is False and why.startswith("cannot-derive (TypeError")
+
+
+def test_saves_all_rolled_back_before_the_desk_started_are_named_as_such(desk):
+    # deepseek MED-2: a save was made and undone; "no dream has saved memory" would send the reader looking for one
+    from levain.desk import dream_status
+
+    start = parse_stamp(_requested(desk))
+    _file(desk.directory, "consolidated", start - timedelta(hours=3), occurrence="occ-1")
+    _file(desk.directory, "rolled-back", start - timedelta(hours=2), occurrence="occ-1", reason="rolled back by operator")
+    due, why = dream_status.rotation_due(desk, desk.launch, at_turn_boundary=True)
+    assert due is False and why.startswith("every dream save in this store was rolled back")
