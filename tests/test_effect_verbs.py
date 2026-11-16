@@ -142,12 +142,13 @@ def test_restart_service_runs_the_one_hard_coded_argv(world):
     rig = Rig(world)
     res = rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert res.ok and res.text == "restart_service taoserv apache2: exit 0"
-    assert rig.runs == [["/usr/bin/ssh", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o",
+    cfg = fx._runner_env()["HOME"].rstrip("/") + "/.levain/night/ssh_config"   # the pinned -F file (ND-8 step 5)
+    assert rig.runs == [["/usr/bin/ssh", "-F", cfg, "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o",
                          "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=yes", "taoserv-night",
                          "restart_service", "apache2"]]
     rig.runs.clear()
     rig.effects().restart_service(g["id"], "taoserv", "php8.3-fpm", event_id=EVR, expect_sha256=D(g))
-    assert rig.runs[0][-2:] == ["restart_service", "php8.3-fpm"] and len(rig.runs[0]) == 13
+    assert rig.runs[0][-2:] == ["restart_service", "php8.3-fpm"] and len(rig.runs[0]) == 15
 
 
 def test_the_subprocess_runner_never_uses_a_shell(world):

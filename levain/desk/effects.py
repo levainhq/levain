@@ -275,7 +275,7 @@ def diagnosis_argv(host: str, word: str, service: str | None = None) -> list[str
 
 
 def _night_argv(host: str, word: str, arg: str | None) -> list[str]:
-    argv = [NIGHT_SSH, "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes",
+    argv = [NIGHT_SSH, "-F", f"{_runner_env()['HOME'].rstrip('/')}/.levain/night/ssh_config", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ClearAllForwardings=yes",
             "-o", "StrictHostKeyChecking=yes", NIGHT_ALIAS[host], word]
     if arg is not None:
         argv.append(arg)
