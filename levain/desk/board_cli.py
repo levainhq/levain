@@ -57,6 +57,12 @@ def register(subparsers: Any) -> None:
     p.add_argument("--repo", type=Path, default=Path("."), metavar="PATH", help="The repository to read (default: here).")
     p.add_argument("--repo-name", dest="repo_name", metavar="NAME",
                    help="The repo's name in item ids, <name>#<n> (default: the directory that holds the repository's .git).")
+    p.add_argument("--also-repo", dest="also_repo", action="append", default=[], metavar="[NAME=]PATH",
+                   help=("Another repository whose items are on the board (repeatable). Each item, and each dependency it waits on, "
+                         "is then judged from the evidence of the repo it belongs to; an item of a repo not read reads unknown. "
+                         "The repo's name is its directory's name unless NAME=PATH says it (a worktree or a clone under another "
+                         "directory name needs NAME=PATH, e.g. levain=/tmp/levain-review). --evidence-extra's documents apply "
+                         "to the primary --repo only."))
     p.add_argument("--since", default=be.BOARD_EPOCH, metavar="ISO",
                    help=f"Commits and branches older than this are out of the attribution scan (default {be.BOARD_EPOCH}).")
     p.add_argument("--now", metavar="ISO", help="Judge the board at this instant (default: the clock). Zone-aware or UTC.")
@@ -68,7 +74,16 @@ def _fail(message: str) -> int:
     return EXIT_USAGE
 
 
-def _merge_extra(evidence: dict[str, Any], extra: Any) -> str | None:
+def _split_also(raw: str) -> tuple[str | None, Path]:
+    """``NAME=PATH`` -> (NAME, PATH); a bare PATH -> (None, PATH) and keeps its basename. NAME is a plain repo name
+    (letters, digits, ``._-``); anything else with an ``=`` is a path."""
+    name, sep, rest = raw.partition("=")
+    if sep and name and rest and all(c.isalnum() or c in "._-" for c in name):
+        return name, Path(rest).expanduser()
+    return None, Path(raw).expanduser()
+
+
+def _merge_extra(evidence: dict[str, Any], extra: Any, *, primary: bool = True) -> str | None:
     """Fold the extra object into ``evidence``; the reason it cannot be used, or None. Only the keys flow supplies are
     accepted (``EXTRA_KEYS``): an unknown key would land in the evidence object unexamined, and a reason that is not a
     string would crash whatever reads it later."""
@@ -96,7 +111,8 @@ def _merge_extra(evidence: dict[str, Any], extra: Any) -> str | None:
         elif key == "documents":
             if not isinstance(value, dict):
                 return "the extra documents must be an object of path to boolean"
-            evidence["documents"] = {**value, **evidence.get("documents", {})}      # a path this process stat'd wins
+            if primary:                 # a path is repo-relative: another repo's same path is not what flow staged
+                evidence["documents"] = {**value, **evidence.get("documents", {})}      # a path this process stat'd wins
         else:
             evidence[key] = value
     return None
@@ -116,7 +132,11 @@ def run_state(args: argparse.Namespace) -> int:
     folded = fold(lines)
     repo = Path(args.repo).expanduser()
     evidence, summary = be.read_git_evidence(repo, repo_name=args.repo_name, since=args.since)
-    evidence["documents"] = be.read_documents(folded.items, repo)
+    cross = bool(args.also_repo)
+    # One repo reads every item, as before; with --also-repo each repo reads the items that belong to it.
+    mine = {i: it for i, it in folded.items.items() if it.repo == summary["repo"]} if cross else folded.items
+    evidence["documents"] = be.read_documents(mine, repo)
+    extra = None
     if args.evidence_extra is not None:
         try:
             extra = json.loads(Path(args.evidence_extra).expanduser().read_text("utf-8"))
@@ -125,9 +145,30 @@ def run_state(args: argparse.Namespace) -> int:
         bad = _merge_extra(evidence, extra)
         if bad is not None:
             return _fail(f"--evidence-extra {args.evidence_extra}: {bad}")
-    board = derive_all(folded, Evidence.from_dict(evidence), now=now)
+    primary = Evidence.from_dict(evidence)
+    repo_evidence: dict[str, Evidence] | None = None
+    also: list[dict[str, Any]] = []
+    if cross:
+        if not summary["repo"]:
+            return _fail(f"--repo {repo}: its repo name is empty, so no item could be matched to it; pass --repo-name")
+        repo_evidence = {summary["repo"]: primary}
+        for raw in args.also_repo:
+            given, other = _split_also(raw)
+            ev2, sum2 = be.read_git_evidence(other, repo_name=given, since=args.since)
+            name = sum2["repo"]
+            if not name or name in repo_evidence:
+                return _fail(f"--also-repo {other}: its repo name ({name!r}) is empty or already read; say it with NAME=PATH")
+            ev2["documents"] = be.read_documents({i: it for i, it in folded.items.items() if it.repo == name}, other)
+            if extra is not None:
+                _merge_extra(ev2, extra, primary=False)     # the same flow-supplied sources; validated once above
+            repo_evidence[name] = Evidence.from_dict(ev2)
+            also.append(sum2)
+    board = derive_all(folded, primary, now=now, repo_evidence=repo_evidence,
+                       primary_repo=summary["repo"] if cross else None)
     doc = board.to_dict()
     doc["reader"] = summary
+    if also:
+        doc["reader"] = {**summary, "also": also}
     if args.json:
         print(json.dumps(doc, indent=2, sort_keys=False))
     else:

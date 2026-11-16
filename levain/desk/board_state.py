@@ -690,10 +690,12 @@ def _short(sha: str) -> str:
 
 
 class _Ctx:
-    def __init__(self, items: Mapping[str, Item], ev: Evidence, now: datetime, torn: str | None) -> None:
+    def __init__(self, items: Mapping[str, Item], ev: Evidence, now: datetime, torn: str | None,
+                 repo_ev: Mapping[str, Evidence] | None = None) -> None:
         self.items = items
         self.ev = ev
         self.idx = ev.index
+        self.repo_ev = repo_ev              # None: one repo's evidence reads every item (the single-repo board)
         self.now = _utc(now)
         self.torn = torn
         self.memo: dict[str, State] = {}
@@ -733,15 +735,30 @@ class _Ctx:
         if iid in self.memo:
             return self.memo[iid]
         item = self.items[iid]
-        if iid in self.stack:               # a guard behind the cycle check: a cycle member never reads a dependency
-            return self.make(item, "unknown", f"cycle through {iid}", (iid,))
-        self.stack.add(iid)
+        saved = (self.ev, self.idx)         # a dependency judged under ITS repo must not leave its caller under that repo
+        self.focus(item)
         try:
-            st = _compute(self, item)
+            if iid in self.stack:           # a guard behind the cycle check: a cycle member never reads a dependency
+                return self.make(item, "unknown", f"cycle through {iid}", (iid,))
+            self.stack.add(iid)
+            try:
+                st = _compute(self, item)
+            finally:
+                self.stack.discard(iid)
+            self.memo[iid] = st
+            return st
         finally:
-            self.stack.discard(iid)
-        self.memo[iid] = st
-        return st
+            self.ev, self.idx = saved
+
+    def focus(self, item: Item) -> None:
+        """Point ``ev``/``idx`` at the evidence of the repo ``item`` belongs to. A repo that was not read is not judged
+        under another repo's evidence (that reads "no evidence of work", which is health): it reads unknown."""
+        if self.repo_ev is None:
+            return
+        ev = self.repo_ev.get(item.repo)
+        if ev is None:
+            ev = Evidence.from_dict({"unreadable": {"evidence": f"repo {item.repo} not read (no evidence supplied for it)"}})
+        self.ev, self.idx = ev, ev.index
 
     def cycle(self, iid: str) -> tuple[str, ...] | None:
         """The shortest ``depends_on`` cycle through ``iid`` (item links only; a decided item's links do not count)."""
@@ -1103,14 +1120,24 @@ def _trailer_ids(ev: Evidence) -> dict[str, list[str]]:
     return seen
 
 
-def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
+def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
+               repo_evidence: Mapping[str, Evidence] | None = None, primary_repo: str | None = None) -> Board:
     """The whole board: every item's state, the audit list, and everything that could not be read. ``now`` must be
     timezone-aware (a naive one is a TypeError). Every unreadable source is reported on the board itself, an audit
     ``unknown`` entry and a problem line each, whether or not an item needed it: an empty store or a source no item
     reads (the unattributed scan) is never a clean board, and neither is evidence too old, undated or fetched in the
-    future (``stale_evidence``). An item is listed in the audit once."""
+    future (``stale_evidence``). An item is listed in the audit once.
+
+    ``repo_evidence`` (``{repo: Evidence}``) is the cross-repo board: an item, and each dependency it waits on, is read
+    from the evidence of the repo it belongs to, and an item whose repo has no entry reads unknown. ``evidence`` is the
+    primary one (it names the board's ``as_of``); put it in the mapping too if its repo owns items. ``primary_repo``
+    names its key there (the other repos are every other key); left None it is the key holding that same object. Left
+    None, one repo's evidence reads every item."""
     now = _utc(now)
-    ctx = _Ctx(folded.items, evidence, now, folded.torn_why or ("torn" if folded.torn else None))
+    ctx = _Ctx(folded.items, evidence, now, folded.torn_why or ("torn" if folded.torn else None), repo_evidence)
+    if primary_repo is None:
+        primary_repo = next((r for r, e in (repo_evidence or {}).items() if e is evidence), None)
+    others = [(r, e) for r, e in sorted((repo_evidence or {}).items()) if r != primary_repo]
     states = [ctx.state_of(i) for i in sorted(folded.items, key=_id_key)]
     audit: list[AuditEntry] = []
     problems = list(folded.problems)
@@ -1129,12 +1156,14 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
         if s.state == "unknown":
             kind = "gate_expired" if ctx.causes.get(s.id) == "gate_expired" else "unknown"
             why = s.reason
+            ctx.focus(folded.items[s.id])
             gone = _landed(ctx, folded.items[s.id]) if kind == "gate_expired" else None
             if gone:                    # landed work behind an orphan branch and this gate: rule 6 was skipped, the gate won; say both
                 why = f"{why}; {_landed_why(*gone)}"
             audit.append(AuditEntry(kind, s.id, why))
             continue
         old = [] if s.state in ("done", "cut", "parked", "out_of_1_0") else _expired_gates(folded.items[s.id], now.date())
+        ctx.focus(folded.items[s.id])
         landed = _landed(ctx, folded.items[s.id]) if s.state in ("blocked", "ready_with_start") else None
         if old:                         # a live state beside an expired gate keeps its state; the gate is the one entry
             audit.append(AuditEntry("gate_expired", s.id, f"gate \"{old[0].words}\" past its recheck {old[0].recheck}"))
@@ -1142,12 +1171,38 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
             audit.append(AuditEntry("landed_not_closed", s.id, s.reason))
         elif landed:                    # rule 6 was ruled out only by an orphan branch: the state follows rules 7-8, the audit still says it
             audit.append(AuditEntry("landed_not_closed", s.id, f"{_landed_why(*landed)}; reads {s.state} because an orphan branch carries more"))
+    for repo, ev in others:             # the other repos' own sources, each said under its repo
+        for source in sorted(ev.unreadable):
+            if evidence.unreadable.get(source) == ev.unreadable[source]:
+                continue                # the flow-supplied extra reaches every repo's evidence (every item fails closed); said once
+            why = f"{repo}: {source} unreadable: {ev.unreadable[source]}"
+            audit.append(AuditEntry("unknown", None, why))
+            problems.append(why)
+        stale = _evidence_problem(ev, now)
+        if stale:
+            why = f"stale_evidence: {repo}: {stale}"
+            audit.append(AuditEntry("unknown", None, why))
+            problems.append(why)
     unattributed = tuple(sorted(evidence.unattributed, key=lambda u: (u.sha, u.subject)))
     for u in unattributed:
         audit.append(AuditEntry("unattributed_work", None, f"{_short(u.sha)} {u.subject}".strip()))
+    for repo, ev in others:
+        for u in sorted(ev.unattributed, key=lambda u: (u.sha, u.subject)):
+            audit.append(AuditEntry("unattributed_work", None, f"{repo}: {_short(u.sha)} {u.subject}".strip()))
+            unattributed += (Unattributed(u.sha, f"{repo}: {u.subject}"),)
     if not folded.torn:                 # with a torn store most ids would look unknown for a reason already reported
         for iid, where in sorted(_trailer_ids(evidence).items(), key=lambda kv: _id_key(kv[0])):
             if iid not in folded.items:
                 audit.append(AuditEntry("unknown_id_in_trailer", iid, f"named by {', '.join(sorted(set(where)))}; the store does not hold it"))
+        for repo, ev in others:
+            for iid, where in sorted(_trailer_ids(ev).items(), key=lambda kv: _id_key(kv[0])):
+                if iid not in folded.items:
+                    audit.append(AuditEntry("unknown_id_in_trailer", iid, f"{repo}: named by {', '.join(sorted(set(where)))}; the store does not hold it"))
+        for repo, ev in (repo_evidence or {}).items():      # work named for an item of ANOTHER repo is read by neither: say it
+            for iid, where in sorted(_trailer_ids(ev).items(), key=lambda kv: _id_key(kv[0])):
+                it = folded.items.get(iid)
+                git = sorted({w for w in where if w.split(" ", 1)[0] in ("main", "chain", "branch")})   # seats and waiters are flow-supplied, board-wide
+                if it is not None and it.repo != repo and git:
+                    audit.append(AuditEntry("unknown_id_in_trailer", iid, f"{repo}: named by {', '.join(git)}; the item belongs to repo {it.repo}, whose evidence does not hold that work"))
     audit.sort(key=lambda a: AUDIT_KINDS.index(a.kind))
     return Board(SCHEMA, evidence.fetched_at, tuple(states), tuple(audit), unattributed, tuple(problems))

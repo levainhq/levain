@@ -358,3 +358,71 @@ def test_a_chain_link_and_an_orphan_branch_with_no_closing_trailer_still_conflic
     world.push("seat/1114-44-orphan2")
     _, doc, _ = board(capsys, world, write_items(tmp_path, item(10)), extra_file(tmp_path))
     assert states(doc) == {"levain#10": "unknown"} and "orphan branch seat/1114-44-orphan2" in doc["items"][0]["reason"]
+
+
+# ------------------------------------------------------------------------------------------------ the cross-repo board
+def _flow_world(tmp: Path) -> Path:
+    """A second repository, named ``flow``: a clone moved to a directory of that name (the name item ids use)."""
+    fw = World(tmp / "flowworld")
+    fw.commit("root", date=OLD)
+    fw.push_main()
+    dest = tmp / "flowworld" / "flow"
+    fw.w.rename(dest)
+    return dest
+
+
+def _flow_item(n: int, depends: list) -> str:
+    return json.dumps({"v": 1, "op": "add", "id": f"flow#{n}", "at": AT, "by": "t", "repo": "flow", "title": f"flow {n}",
+                       "words": "", "origin": "desk 1", "done": "x", "done_kind": "merged", "tier": "sonnet", "depends_on": depends})
+
+
+def test_also_repo_judges_a_dependency_under_its_own_repo(world, tmp_path, capsys):
+    """flow#5 depends on levain#1, which is closed on LEVAIN's main. Reading flow alone leaves levain#1 not done (flow's
+    main knows nothing of it); --also-repo reads each item from its own repo, so the dependency is met."""
+    world.commit("land one", trailers=("Board-Item: levain#1", "Board-Closes: levain#1"))
+    world.push_main()
+    flow = _flow_world(tmp_path)
+    items = write_items(tmp_path, item(1), _flow_item(5, [{"kind": "item", "ref": "levain#1"}]))
+    extra = extra_file(tmp_path)
+    common = ("--json", "--items", str(items), "--evidence-extra", str(extra), "--repo", str(flow), "--since", "2026-11-12T00:00:00Z")
+    rc, out, err = run(capsys, *common)
+    assert states(json.loads(out))["flow#5"] == "blocked"                       # the old answer, kept without the flag
+    rc, out, err = run(capsys, *common, "--also-repo", str(world.w))
+    doc = json.loads(out)
+    assert states(doc) == {"levain#1": "done", "flow#5": "ready"}, (doc["items"], err)
+    assert [r["repo"] for r in doc["reader"]["also"]] == ["levain"]
+
+
+def test_also_repo_takes_the_repo_name_from_name_equals_path(world, tmp_path, capsys):
+    """A clone under another directory name (a worktree, /tmp/levain-review) is named explicitly, NAME=PATH."""
+    world.commit("land one", trailers=("Board-Item: levain#1", "Board-Closes: levain#1"))
+    world.push_main()
+    flow = _flow_world(tmp_path)
+    items = write_items(tmp_path, item(1), _flow_item(5, [{"kind": "item", "ref": "levain#1"}]))
+    common = ("--json", "--items", str(items), "--evidence-extra", str(extra_file(tmp_path)), "--repo", str(flow),
+              "--since", "2026-11-12T00:00:00Z")
+    rc, out, err = run(capsys, *common, "--also-repo", f"levain={world.w}")
+    assert states(json.loads(out)) == {"levain#1": "done", "flow#5": "ready"}, err
+    review = tmp_path / "levain-review"
+    world.w.rename(review)
+    rc, out, err = run(capsys, *common, "--also-repo", f"levain={review}")
+    assert states(json.loads(out)) == {"levain#1": "done", "flow#5": "ready"}, err
+    rc, out, err = run(capsys, *common, "--also-repo", str(review))              # a bare PATH keeps its basename: not levain
+    assert states(json.loads(out))["levain#1"] == "unknown"
+
+
+def test_also_repo_with_an_empty_primary_name_is_refused_not_all_unknown(world, tmp_path, capsys):
+    items = write_items(tmp_path, item(1))
+    rc, out, err = run(capsys, "--json", "--items", str(items), "--evidence-extra", str(extra_file(tmp_path)),
+                       "--repo", str(world.w), "--repo-name", "", "--also-repo", str(_flow_world(tmp_path)))
+    assert rc == 2 and "repo name is empty" in err
+
+
+def test_extra_documents_apply_to_the_primary_repo_only():
+    """A document path is repo-relative: the flow-supplied one (the fallback when this process could not stat) must not
+    mark another repo's same path checked."""
+    from levain.desk.board_cli import _merge_extra
+    extra = {"documents": {"result.md": True}}
+    primary, other = {"documents": {}}, {"documents": {}}
+    assert _merge_extra(primary, extra) is None and _merge_extra(other, extra, primary=False) is None
+    assert primary["documents"] == {"result.md": True} and other["documents"] == {}
