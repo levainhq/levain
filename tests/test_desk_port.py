@@ -93,7 +93,7 @@ def test_the_result_dataclasses_have_their_pinned_field_names():
     assert names(EventBatch) == ["events", "cursor", "readable"]
     assert names(Delivery) == ["outcome", "detail"]
     assert names(Armed) == ["state", "until"]
-    assert names(DeskCommands) == ["post", "lease", "events", "words_max"]
+    assert names(DeskCommands) == ["post", "lease", "events", "words_max", "context"]
     assert all(c.__dataclass_params__.frozen for c in (DeskCaps, LeaseView, PostResult, DeskEvent, EventBatch, Delivery,
                                                       Armed, DeskCommands))
 

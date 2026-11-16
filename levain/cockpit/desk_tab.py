@@ -122,6 +122,7 @@ def serve_desk(port: DeskPort | None, query: str = "") -> tuple[int, dict[str, A
     events: list[dict[str, str]] = []
     cursor: str | None = None
     readable = True
+    context = _context_view(port, lease_view["state"])
     if thread is not None:
         try:
             batch = port.events(thread, after)
@@ -130,10 +131,29 @@ def serve_desk(port: DeskPort | None, query: str = "") -> tuple[int, dict[str, A
         except Exception:   # noqa: BLE001 - the same: unreadable, never "none yet"
             events, cursor, readable = [], None, False
     if caps is None:        # the page draws no cap and no slot from {}, and "could not be fetched" from readable false
-        return 200, {"wired": True, "caps": {}, "lease": lease_view, "thread_id": thread, "events": [], "cursor": None,
-                     "readable": False}
-    return 200, {"wired": True, "caps": caps, "lease": lease_view, "thread_id": thread,
-                 "events": events, "cursor": cursor, "readable": readable}
+        body: dict[str, Any] = {"wired": True, "caps": {}, "lease": lease_view, "thread_id": thread, "events": [], "cursor": None,
+                                "readable": False}
+    else:
+        body = {"wired": True, "caps": caps, "lease": lease_view, "thread_id": thread, "events": events, "cursor": cursor,
+                "readable": readable}
+    if context is not None:
+        body["context"] = context
+    return 200, body
+
+
+def _context_view(port: DeskPort, lease_state: str) -> dict[str, Any] | None:
+    """The live desk's context for the read (levain#79): None when the port has no context command or no desk holds the lease (the
+    page draws no line); else ``{"state": "ok", tokens, soft, hard, model}`` or ``{"state": "unreadable"}``, never a zero for a
+    reading that could not be made. The tokens come from the desk session's transcript usage block (``levain.desk.desk_context``)."""
+    if lease_state != "held" or getattr(port, "has_context", False) is not True:
+        return None
+    try:
+        got = port.context()        # type: ignore[attr-defined]
+    except Exception:       # noqa: BLE001 - a context that cannot be read is not known: say so, never a 500 on a poll
+        got = None
+    if got is None:
+        return {"state": "unreadable"}
+    return {"state": "ok", "tokens": got.tokens, "soft": got.soft, "hard": got.hard, "model": got.model}
 
 
 # --- the write ----------------------------------------------------------------------------------------------------------

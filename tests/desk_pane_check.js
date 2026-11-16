@@ -87,5 +87,16 @@ const drawn = [D.deskModel(200, { wired: false }).words, D.deskModel(0, null).wo
   D.sendOutcome(403, null).words, D.sendOutcome(404, null).words, D.eventModel({ by: "script", kind: "took", at: "t" }).words, D.eventModel({ by: "script", kind: "held" }).words, D.AMBIGUOUS_WORDS, D.ARRIVED_WORDS, D.NOT_ARRIVED_WORDS].join(" | ");
 check(!/\b(fenced|read|acted on)\b/i.test(drawn), "no drawn word says fenced, read or acted on");
 
+// the live desk's context against its rotation lines (levain#79)
+const cx = (c) => D.contextModel(c);
+check(cx(undefined) === null && cx(null) === null, "no context object: nothing is drawn");
+check(cx({ state: "ok", tokens: 212403, soft: 350000, hard: 500000 }).level === "ok" && cx({ state: "ok", tokens: 212403, soft: 350000, hard: 500000 }).words === "Context 212,403 tokens \u00b7 SOFT 350,000 \u00b7 HARD 500,000", "under SOFT: the tokens and both lines");
+check(cx({ state: "ok", tokens: 350000, soft: 350000, hard: 500000 }).level === "soft" && cx({ state: "ok", tokens: 499999, soft: 350000, hard: 500000 }).level === "soft", "at SOFT, below HARD: rotate at the next seam");
+check(cx({ state: "ok", tokens: 500000, soft: 350000, hard: 500000 }).level === "hard" && /rotate now$/.test(cx({ state: "ok", tokens: 500000, soft: 350000, hard: 500000 }).words), "at HARD: rotate now");
+check(cx({ state: "ok", tokens: 600000, soft: null, hard: 800000 }).level === "ok" && cx({ state: "ok", tokens: 600000, soft: null, hard: 800000 }).tick === null && !/SOFT/.test(cx({ state: "ok", tokens: 600000, soft: null, hard: 800000 }).words), "a go-deep desk has no SOFT line");
+check(cx({ state: "unreadable" }).state === "unreadable" && cx({ state: "ok", tokens: "x", soft: 1, hard: 2 }).state === "unreadable" && cx({ state: "ok", tokens: 1, soft: 1, hard: 0 }).state === "unreadable" && cx({ state: "ok", tokens: -1, soft: 1, hard: 2 }).state === "unreadable" && cx({ state: "ok", tokens: 1.5, soft: 1, hard: 2 }).state === "unreadable", "an unreadable or malformed reading is said so, never zero");
+check(cx({ state: "ok", tokens: 1234567, soft: 1, hard: 2 }).words.indexOf("1,234,567") >= 0 && cx({ state: "ok", tokens: 999, soft: 1, hard: 2000 }).words.indexOf("999 tokens") >= 0, "thousands are grouped by the page, not the locale");
+check(D.deskModel(200, { wired: true, lease: { state: "held", holder: "d", age_s: 1 }, context: { state: "ok", tokens: 5, soft: 1, hard: 9 } }).context.tokens === 5 && D.deskModel(200, { wired: true, lease: { state: "held" } }).context === null, "the read carries the context when the server sent one");
+
 console.log(failures === 0 ? "ALL PASS" : failures + " FAILED");
 process.exit(failures === 0 ? 0 : 1);

@@ -3038,6 +3038,15 @@ body.dv-on .ck-phonetabs button[data-phone-jump="desk"] { color: var(--text); ba
 .rv .dv-state:empty { display: none; }
 .rv .dv-state-unwired, .rv .dv-state-error { background: var(--card-2); color: var(--text); }
 .rv .dv-lease-none { border-left: 3px solid var(--warn); }
+/* the live desk's context against its rotation lines (levain#79): its words, and a thin bar (the fill is tokens over the HARD line, the tick the SOFT line) */
+.rv .dv-ctx { display: flex; flex-direction: column; gap: var(--sp-1); }
+.rv .dv-ctxbar { position: relative; height: 4px; border-radius: var(--r-pill); background: var(--hair-2); overflow: hidden; }
+.rv .dv-ctxfill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--label); }
+.rv .dv-ctx-soft .dv-ctxfill { background: var(--warn); }
+.rv .dv-ctx-hard .dv-ctxfill { background: var(--bad); }
+.rv .dv-ctxtick { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--text); }
+.rv .dv-ctx-soft .dv-ctxwords { border-left: 2px solid var(--warn); padding-left: var(--sp-2); }
+.rv .dv-ctx-hard .dv-ctxwords { color: var(--text); border-left: 2px solid var(--bad); padding-left: var(--sp-2); }
 .rv .dv-droplink, .rv .dv-start { align-self: flex-start; min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; background: none; color: var(--text); border: 1px solid var(--hair-2); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
 .rv .dv-you .dv-status { margin-top: var(--sp-1); text-align: right; }
 .rv .dv-sending { opacity: .55; }
