@@ -203,6 +203,15 @@ LAZY_SITES = {
     'levain/slot/runtime_helper.py::read_operator::from levain.slot.install_helper import parse_operator_record': 'root',
     'levain/slot/runtime_helper.py::_start::from levain.slot import start as SS': 'root',
     'levain/slot/runtime_helper.py::_teardown::from levain.slot import start as SS': 'root',
+    # root: levain#66's four host-grant verbs run as root (sudo); each wrapper imports the verb module lazily, as _teardown does
+    'levain/slot/runtime_helper.py::_egress_grant::from levain.slot import egress_verbs as EV': 'root',
+    'levain/slot/runtime_helper.py::_egress_grant_revoke::from levain.slot import egress_verbs as EV': 'root',
+    'levain/slot/runtime_helper.py::_egress_grants_list::from levain.slot import egress_verbs as EV': 'root',
+    'levain/slot/runtime_helper.py::_egress_refusals::from levain.slot import egress_verbs as EV': 'root',
+    # root: the grant verifier reads root's own signers file and base map through the helper's readers (lazy: egress_verbs
+    # is itself imported by a runtime_helper wrapper, so these two cannot be top-level without a cycle)
+    'levain/slot/egress_verify.py::enrolled_key::from levain.slot import install_helper as IH': 'root',
+    'levain/slot/egress_verify.py::host_class::from levain.slot import runtime_helper as H': 'root',
     'levain/slot/runtime_helper.py::_probe::from levain.slot import probe as PB': 'root',
     'levain/slot/probe.py::session_route::from levain.broker.policy import PolicyError, parse_base_map': 'root',
     'levain/slot/runtime_helper.py::adopt_walk_caps::from levain.slot import walker as WK': 'root',

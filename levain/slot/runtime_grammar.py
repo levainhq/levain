@@ -36,7 +36,8 @@ from levain.slot.grammar import INDEX_SPACE, SESSION_RE, SLOT_CLASSES
 # --- §5.1 verbs and enums -------------------------------------------------------------------------
 
 VERBS = ("prepare", "render", "start", "resume", "teardown", "confirm-identity",
-         "adopt-open", "adopt-verify", "discard", "restore", "status", "probe", "read-allow")
+         "adopt-open", "adopt-verify", "discard", "restore", "status", "probe", "read-allow",
+         "egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list")
 
 KINDS = ("interactive", "login", "dispatch", "planner", "verifier")   # §5.1 prepare
 VENDORS = ("claude", "codex")                                          # §5.1 prepare, §5.3 vendor
@@ -55,7 +56,19 @@ _BUNDLE_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}", re.ASCII)
 LEASE_VERBS = frozenset({"prepare", "render", "start", "resume", "teardown", "confirm-identity", "probe"})
 
 #: §5.1 verbs that read a stdin blob; every other verb takes none ("—").
-STDIN_VERBS = frozenset({"prepare", "render"})
+STDIN_VERBS = frozenset({"prepare", "render", "egress-grant"})
+
+#: levain#66 S2: the four host-grant verbs (operator only, no lease; ``egress-grant`` alone reads stdin, an
+#: :class:`EgressGrantInput` under its own 8 KiB cap).
+EGRESS_VERBS = ("egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list")
+EGRESS_GRANT_STDIN_MAX = 8 * 1024
+EGRESS_GRANT_KEYS = frozenset({"message", "sig", "signer_fp", "choice"})
+_EGRESS_TARGET_RE = re.compile(r"all|eh-[0-9a-f]{24}", re.ASCII)
+#: ``0`` (from the start) or ``<inode>-<byte offset>`` of ``front.log``: no leading zeros, one spelling.
+_EGRESS_CURSOR_RE = re.compile(r"0|[1-9][0-9]{0,19}-(?:0|[1-9][0-9]{0,11})", re.ASCII)
+_EGRESS_MESSAGE_MAX = 4096
+_EGRESS_SIG_RE = re.compile(r"[\n\x20-\x7e]{1,8000}", re.ASCII)
+_EGRESS_FP_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}", re.ASCII)
 
 OPERATOR, DISPATCH = "operator", "dispatch"
 CALLERS = (OPERATOR, DISPATCH)
@@ -65,7 +78,8 @@ CALLERS = (OPERATOR, DISPATCH)
 #: caller check by class (``runtime_helper.verify_caller``).
 #: DECISION (V13 rev 2 §1): ``probe`` is forbidden to dispatch until a dispatch session launches (2f), so
 #: ``sudoers.DISPATCH_VERBS`` stays as installed and no sudoers re-install is needed for the new verb.
-DISPATCH_FORBIDDEN = frozenset({"adopt-open", "discard", "restore", "confirm-identity", "probe", "read-allow"})
+DISPATCH_FORBIDDEN = frozenset({"adopt-open", "discard", "restore", "confirm-identity", "probe", "read-allow",
+                                "egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list"})
 
 #: DECISION (narrowest reading of §3.1 + §3.5): the operator's leases carry no ticket, so the operator
 #: prepares only the operator kinds; ``_levain_dispatch`` prepares only the ticketed kinds (ticket kinds
@@ -137,6 +151,8 @@ class RuntimeRequest:
     answer: str | None = None      # confirm-identity yes|no
     dispatch: bool = False         # confirm-identity yes --dispatch (c7.14)
     bundle_digest: str | None = None   # adopt-verify ``sha256:<hex>``
+    target: str | None = None          # egress-grant-revoke ``eh-<24 hex>`` | ``all``
+    cursor: str | None = None          # egress-refusals ``0`` | ``<inode>-<offset>``
 
     @property
     def needs_lease(self) -> bool:
@@ -147,6 +163,16 @@ class RuntimeRequest:
 class PrepareInput:
     lease_nonce: str
     ticket: str | None = None
+
+
+@dataclass(frozen=True)
+class EgressGrantInput:
+    """``egress-grant`` stdin: the levain message, an SSHSIG over the signed bytes, the signer's fingerprint and the
+    one choice (``s`` or ``d``) the signature covers. Shape only here; the verb layer verifies."""
+    message: str
+    sig: str
+    signer_fp: str
+    choice: str
 
 
 @dataclass(frozen=True)
@@ -297,7 +323,20 @@ def parse_runtime_argv(argv: Sequence[str], *, configured_slots: SlotConfig, cal
         if not _BUNDLE_DIGEST_RE.fullmatch(rest[2]):
             raise Refused("bad-token", f"bundle digest: {rest[2][:80]!r}")
         return RuntimeRequest(verb, caller, session=session, bundle_digest=rest[2])
-    # render, start, resume, teardown, adopt-open, discard, restore, probe, read-allow: exactly <session>.
+    if verb == "egress-grant-revoke":   # <session> <eh-id|all>
+        _arity(verb, rest, 2, 2)
+        session = _session(rest[0])
+        if not _EGRESS_TARGET_RE.fullmatch(rest[1]):
+            raise Refused("bad-token", f"grant id: {rest[1][:64]!r}")
+        return RuntimeRequest(verb, caller, session=session, target=rest[1])
+    if verb == "egress-refusals":       # <session> <cursor>
+        _arity(verb, rest, 2, 2)
+        session = _session(rest[0])
+        if not _EGRESS_CURSOR_RE.fullmatch(rest[1]):
+            raise Refused("bad-token", f"cursor: {rest[1][:64]!r}")
+        return RuntimeRequest(verb, caller, session=session, cursor=rest[1])
+    # render, start, resume, teardown, adopt-open, discard, restore, probe, read-allow, egress-grant,
+    # egress-grants-list: exactly <session>.
     # DECISION: §5.1's "`discard` / `restore <session>`" row reads as both taking <session>.
     _arity(verb, rest, 1, 1)
     return RuntimeRequest(verb, caller, session=_session(rest[0]))
@@ -494,7 +533,21 @@ def _render_blob(obj: dict) -> RenderBlob:
                       repo_settings=repo_settings, web_search=web_search)
 
 
-def parse_stdin(verb: str, raw_bytes: bytes) -> PrepareInput | RenderBlob | None:
+def _egress_grant_input(obj: dict) -> EgressGrantInput:
+    _keys(obj, EGRESS_GRANT_KEYS, EGRESS_GRANT_KEYS, "egress-grant")
+    for field in ("message", "sig", "signer_fp", "choice"):
+        if type(obj[field]) is not str:
+            raise Refused("wrong-type", f"{field} is a string")
+    message = obj["message"]
+    if not 0 < len(message) <= _EGRESS_MESSAGE_MAX:
+        raise Refused("bad-value", "message")
+    if obj["choice"] not in ("s", "d"):
+        raise Refused("bad-value", "choice")
+    return EgressGrantInput(message=message, sig=_str(obj["sig"], "sig", _EGRESS_SIG_RE),
+                            signer_fp=_str(obj["signer_fp"], "signer_fp", _EGRESS_FP_RE), choice=obj["choice"])
+
+
+def parse_stdin(verb: str, raw_bytes: bytes) -> PrepareInput | RenderBlob | EgressGrantInput | None:
     """The verb's stdin blob, or :class:`Refused` by name. A verb with no stdin (§5.1 "—") returns
     ``None`` for empty input and refuses anything else (the verb layer never reads stdin for it)."""
     if verb not in VERBS:
@@ -510,6 +563,8 @@ def parse_stdin(verb: str, raw_bytes: bytes) -> PrepareInput | RenderBlob | None
         if raw:
             raise Refused("unexpected-stdin", verb)
         return None
+    if verb == "egress-grant" and len(raw) > EGRESS_GRANT_STDIN_MAX:     # its own, smaller cap
+        raise Refused("stdin-too-large", f"{len(raw)} > {EGRESS_GRANT_STDIN_MAX}")
     if not raw:
         raise Refused("missing-stdin", verb)
     # Non-UTF-8 gets its own name before canon.parse (which would refuse it under a generic one).
@@ -527,10 +582,12 @@ def parse_stdin(verb: str, raw_bytes: bytes) -> PrepareInput | RenderBlob | None
     # no trailing newline, the canon escapes).
     if canon.canonical_bytes(obj) != raw:
         raise Refused("stdin-not-canonical", verb)
+    if verb == "egress-grant":
+        return _egress_grant_input(obj)
     return _prepare_input(obj) if verb == "prepare" else _render_blob(obj)
 
 
-def bind_stdin(request: RuntimeRequest, blob: PrepareInput | RenderBlob | None) -> None:
+def bind_stdin(request: RuntimeRequest, blob: PrepareInput | RenderBlob | EgressGrantInput | None) -> None:
     """Cross-checks argv against stdin. §5.1: ``_levain_dispatch``'s rule is ticket-bound, so its
     ``prepare`` carries a ticket; the operator's lease carries none (§3.1), so its ``prepare`` refuses one.
     That the ticket is live and minted for this caller is CONTROL's (§3.1 step 2)."""
@@ -544,6 +601,9 @@ def bind_stdin(request: RuntimeRequest, blob: PrepareInput | RenderBlob | None) 
     elif request.verb == "render":
         if not isinstance(blob, RenderBlob):
             raise Refused("missing-stdin", "render")
+    elif request.verb == "egress-grant":
+        if not isinstance(blob, EgressGrantInput):
+            raise Refused("missing-stdin", "egress-grant")
     elif blob is not None:
         raise Refused("unexpected-stdin", request.verb)
 
@@ -582,6 +642,7 @@ __all__ = [
     "VERBS", "KINDS", "VENDORS", "AUTHS", "CALLERS", "OPERATOR", "DISPATCH", "LEASE_VERBS", "STDIN_VERBS",
     "DISPATCH_FORBIDDEN", "KINDS_FOR_CALLER", "STDIN_MAX", "RENDER_FORMAT", "RENDER_KEYS", "REPO_FROZEN_KEYS",
     "REPO_PERMISSION_LISTS",
+    "EGRESS_VERBS", "EGRESS_GRANT_STDIN_MAX", "EgressGrantInput",
     "RuntimeRequest", "PrepareInput", "RenderBlob", "GitIdentity", "VerifierStep",
     "parse_runtime_argv", "parse_stdin", "bind_stdin", "ok_line", "refusal_line",
 ]
