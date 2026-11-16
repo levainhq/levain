@@ -1045,7 +1045,7 @@
     },
     "levain#2": {
      "column": "backlog",
-     "reason_contains": "waits on levain#1: cut (",
+     "reason_contains": "waits on levain#1: dependency cut: decide (",
      "state": "blocked"
     }
    },
@@ -1123,7 +1123,7 @@
     },
     "levain#2": {
      "column": "backlog",
-     "reason_contains": "waits on levain#1: out_of_1_0 (",
+     "reason_contains": "waits on levain#1: dependency cut: decide (",
      "state": "blocked"
     }
    },
@@ -1158,7 +1158,7 @@
    "expect": {
     "levain#1": {
      "column": "backlog",
-     "reason_contains": "waits on levain#2: cut (",
+     "reason_contains": "waits on levain#2: dependency cut: decide (",
      "state": "blocked"
     },
     "levain#2": {

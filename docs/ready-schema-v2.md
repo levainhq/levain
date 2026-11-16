@@ -46,7 +46,7 @@ The first rule that fires wins. The checks in section 4 run before this table, s
 | 9 | needs_grooming | no `done`, or a tier outside `sonnet`/`opus`/`haiku` |
 | 10 | ready | none of the above |
 
-A dependency is met when: an `item:` link's own state is `done`; a `band:` link's np row is resolved; a `link:` ref's tip is an ancestor of origin/main; a `gate:` is never met by evidence (it is removed by an amend, and only lives until its recheck date).
+A dependency is met when: an `item:` link's own state is `done`; a `band:` link's np row is resolved; a `link:` ref's tip is an ancestor of origin/main; a `gate:` is never met by evidence (it is removed by an amend, and only lives until its recheck date). An `item:` link whose dependency is `cut` or `out_of_1_0` is never met: the dependent stays `blocked` and its reason reads `dependency cut: decide`.
 
 ## 4. Unknown, and its causes
 
