@@ -379,6 +379,20 @@ def test_store_verb_walls_derive_from_control_bounds_not_v7() -> None:
     assert max(want, AVW.STORE_SLACK_S) < RH.V7_SECONDS
 
 
+def test_helper_timeout_covers_every_egress_verb() -> None:
+    """``call_helper`` computes its wall from ``helper_timeout(verb)``, which raised ``ValueError`` for every egress
+    verb before the spawn (host grants S5, found by the plan). Red: ``ValueError: helper_timeout: 'egress-...'``."""
+    from levain.slot import egress_ledger as EL
+    from levain.slot import runtime_grammar as RG
+
+    for verb in RG.EGRESS_VERBS:
+        assert AVW.helper_timeout(verb) >= AVW.STORE_SLACK_S, verb
+    for verb in ("egress-grants-list", "egress-grants-all", "egress-refusals"):
+        assert AVW.helper_timeout(verb) == AVW.STORE_SLACK_S, verb
+    for verb in ("egress-grant-revoke", "egress-grant"):
+        assert AVW.helper_timeout(verb) == EL.LEDGER_LOCK_WAIT_S + AVW.STORE_SLACK_S, verb
+
+
 # --- S4b fix round 1 (L3 s4b r1 + the head's Q1 / Q4 / Q5); each red on 069cebdf
 # (project_memory/1023-13/adopt/s4bf1_failfirst.txt) -------------------------------------------------------------------
 
