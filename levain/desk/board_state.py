@@ -1098,7 +1098,9 @@ def _id_key(iid: str) -> tuple[str, int, str, str]:
     return repo, len(digits), digits, iid
 
 
-_FLOW_SOURCES = frozenset({"seats", "band", "waiters", "documents"})   # supplied by flow, shared by every repo's evidence
+#: Supplied by flow, the same for every repo's evidence. Not "documents": a path is repo-relative, each repo's is its own
+#: (board_cli stats the primary's and the others' separately and merges flow's staged paths into the primary only).
+_FLOW_SOURCES = frozenset({"seats", "band", "waiters"})
 
 
 def _trailer_ids(ev: Evidence, git_only: bool = False) -> dict[str, list[str]]:
@@ -1128,20 +1130,18 @@ def _trailer_ids(ev: Evidence, git_only: bool = False) -> dict[str, list[str]]:
 
 def _in_scope(ctx: _Ctx, items: Mapping[str, Item], repo_evidence: Mapping[str, Evidence] | None) -> set[str]:
     """The ids the board lists. With cross-repo evidence, an item of a repo that was not read is listed (unknown) only if
-    an item of a read repo reaches it through an undecided link: a decided item's links no longer matter, so a repo only
-    a decided item mentions is out of scope, not a dirty board. If no item belongs to a read repo (a misnamed repo) every
-    item stays listed, each reading unknown."""
-    if repo_evidence is None:
+    an item of a read repo links it through an undecided link: ONE hop, the dependency the read item waits on (what that
+    foreign item waits on is not the board's business, and a decided item's links no longer matter, so a repo only a
+    decided item mentions is out of scope, not a dirty board). Every id that is left off is named by the caller (a problem
+    line): nothing leaves the board silently. If no item belongs to a read repo (a misnamed repo) or the store is torn
+    (a retained decision may have lost the ``reopen`` that undoes it) every item stays listed, each reading unknown."""
+    if repo_evidence is None or ctx.torn:
         return set(items)
     seen = {i for i, it in items.items() if it.repo in repo_evidence}
     if not seen:
         return set(items)
-    todo = list(seen)
-    while todo:
-        for dep in ctx._deps(todo.pop()):
-            if dep not in seen:
-                seen.add(dep)
-                todo.append(dep)
+    for iid in list(seen):
+        seen.update(dep for dep in ctx._deps(iid) if dep in items)
     return seen
 
 
@@ -1158,7 +1158,9 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
     primary one (it names the board's ``as_of``); put it in the mapping too if its repo owns items. ``primary_repo``
     names its key there (the other repos are every other key); left None it is the key holding that same object. Left
     None, one repo's evidence reads every item. An item of a repo that is not in ``repo_evidence`` is left off the board
-    unless an item of a read repo reaches it through an undecided link (it then reads unknown)."""
+    unless an item of a read repo links it through an undecided link (one hop; it then reads unknown); each such repo is
+    named in a problem line. Known edge: with ``primary_repo`` None and a primary evidence object that is not a value of
+    ``repo_evidence``, the home repo is read as a foreign one (``board_cli`` always passes both, so the CLI cannot reach it)."""
     now = _utc(now)
     ctx = _Ctx(folded.items, evidence, now, folded.torn_why or ("torn" if folded.torn else None), repo_evidence)
     if primary_repo is None:
@@ -1168,6 +1170,12 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
     states = [ctx.state_of(i) for i in sorted(shown, key=_id_key)]
     audit: list[AuditEntry] = []
     problems = list(folded.problems)
+    left_off: dict[str, list[str]] = {}
+    for iid in sorted(set(folded.items) - shown, key=_id_key):      # off the board by scope, never silently: one line per repo
+        left_off.setdefault(folded.items[iid].repo, []).append(iid)
+    for repo, ids in sorted(left_off.items()):
+        problems.append(f"repo {repo} not read: {len(ids)} item(s) left off the board ({', '.join(ids[:5])}{', ...' if len(ids) > 5 else ''}); "
+                        "no item of a read repo waits on them")
     if folded.torn:
         audit.append(AuditEntry("unknown", None, f"items file torn: {folded.torn_why}"))
     for source in sorted(evidence.unreadable):
@@ -1200,9 +1208,10 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
             audit.append(AuditEntry("landed_not_closed", s.id, f"{_landed_why(*landed)}; reads {s.state} because an orphan branch carries more"))
     for repo, ev in others:             # the other repos' own sources, each said under its repo
         for source in sorted(ev.unreadable):
-            if source in _FLOW_SOURCES and evidence.unreadable.get(source) == ev.unreadable[source]:
-                continue                # the flow-supplied extra reaches every repo's evidence (every item fails closed); said once
-                                        # (keyed on the source, not the text: two repos' git can fail with the same words)
+            if source in _FLOW_SOURCES and source in evidence.unreadable:
+                continue                # the flow-supplied extra reaches every repo's evidence (every item fails closed); said once,
+                                        # by the primary (keyed on the source, not the text: two repos' git can fail with the same
+                                        # words). A foreign copy that failed alone (the primary read it) is that repo's to say.
             why = f"{repo}: {source} unreadable: {ev.unreadable[source]}"
             audit.append(AuditEntry("unknown", None, why))
             problems.append(why)
@@ -1230,7 +1239,7 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
             for iid, where in sorted(_trailer_ids(ev).items(), key=lambda kv: _id_key(kv[0])):
                 it = folded.items.get(iid)
                 git = sorted({w for w in where if w.split(" ", 1)[0] in ("main", "chain", "branch")})   # seats and waiters are flow-supplied, board-wide
-                if it is not None and it.repo != repo and git:
+                if it is not None and it.repo != repo and git and iid in shown:
                     audit.append(AuditEntry("unknown_id_in_trailer", iid, f"{repo}: named by {', '.join(git)}; the item belongs to repo {it.repo}, whose evidence does not hold that work"))
     audit.sort(key=lambda a: AUDIT_KINDS.index(a.kind))
     return Board(SCHEMA, evidence.fetched_at, tuple(states), tuple(audit), unattributed, tuple(problems))
