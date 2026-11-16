@@ -238,7 +238,12 @@ class GuardedHandler(BaseHTTPRequestHandler):
         This is the one place every request passes once its headers are parsed, whatever its method or route; a
         framing check inside a route helper (``_declared_length``) was reached only by the POST routes that read a
         body, so a GET or HEAD carrying the same ambiguous framing was answered and its "body" parsed as the next
-        request (L3 2026-11-05, four lineages)."""
+        request (L3 2026-11-05, four lineages).
+
+        It also stamps ``_request_t0``, the request's start (its request line read, before its headers; a kept-alive
+        connection's idle time is before it), so a route's wall can count its own credential, gate and body waits
+        (levain#66 L3 r1)."""
+        self._request_t0 = time.monotonic()
         if not super().parse_request():
             return False
         return not self._refuse_framing()
