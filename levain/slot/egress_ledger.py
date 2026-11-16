@@ -3,11 +3,15 @@ in the root-only ``L/routes/grants/`` (root 0700, made by ``enrol-authority-sign
 verb), with its two locks and the install's own ``store_id``.
 
   - ``used.jsonl``: one row per signature root ever published, kept until ``keep_until`` = ``issued`` + 24 h + 5 min
-    (the latest any entry from it can expire), so a clock stepped backwards cannot re-admit a pruned id. Never evicted
-    (eviction would reopen replay); past :data:`USED_MAX` rows a new tap is ``egress-grant-ledger-full`` (fail closed).
+    (the latest any entry from it can expire). Never evicted (eviction would reopen replay); past :data:`USED_MAX` rows
+    a new tap is ``egress-grant-ledger-full`` (fail closed).
   - ``revoked.jsonl``: ids a ``revoke`` named that no file held (a signed card not yet delivered). ``keep_until`` = now +
-    freshness + skew, the longest the signed bytes could still pass; at most :data:`REVOKED_MAX`, pruned first and then
-    the OLDEST evicted: a revoke never refuses for a full ledger.
+    :data:`REVOKED_KEEP_S` (past the last second the signed bytes can pass freshness, and the clock slack below); at
+    most :data:`REVOKED_MAX`, pruned first and then the OLDEST evicted: a revoke never refuses for a full ledger.
+  - ``high_water``: root's wall clock at the latest prune that dropped a row, written durably BEFORE that prune. A row
+    is pruned by wall time only, so a clock set back past a prune would make a pruned id's bytes fresh again with no
+    row to refuse them; a tap whose commit time is more than :data:`CLOCK_SLACK_S` before the mark is
+    ``egress-grant-clock`` (fail closed) until the clock is back past it. Absent is no prune yet.
   - ``ledger.lock`` (a bounded wait) serializes every read-modify-write of both files across ALL sessions;
     ``verify.lock`` (a TRY) lets one ssh-keygen run at a time install-wide. Lock order: verify lock (taken and released
     before any other), then the session lock, then the ledger lock. Nothing takes the ledger lock and then another.
@@ -35,17 +39,23 @@ from levain.slot import Refused, write_all
 from levain.slot import egress_grants as eg
 from levain.slot.egress_store import NOT_READY, fsync_of
 
-USED_NAME, REVOKED_NAME = "used.jsonl", "revoked.jsonl"
+USED_NAME, REVOKED_NAME, HIGH_WATER_NAME = "used.jsonl", "revoked.jsonl", "high_water"
 LEDGER_LOCK, VERIFY_LOCK, STORE_ID_NAME = "ledger.lock", "verify.lock", "store_id"
 USED_MAX = 4096
 REVOKED_MAX = 256
 FILE_MAX = 2 * 1024 * 1024
 LEDGER_LOCK_WAIT_S = 10.0
+#: how far root's clock may sit behind the high-water mark and still commit (an NTP slew, not a day's step back).
+CLOCK_SLACK_S = 5
+#: a revoked row's life: a card issued up to SKEW_S after the revoke is still fresh FRESH_S after its issue (inclusive),
+#: and a commit may run up to CLOCK_SLACK_S behind a prune's mark; one second more for the inclusive edge.
+REVOKED_KEEP_S = eg.FRESH_S + eg.SKEW_S + CLOCK_SLACK_S + 1
 LEDGER_DIR_PARTS = ("routes", "grants")
 ERR_LEDGER, ERR_FULL, ERR_BUSY = "egress-grant-ledger", "egress-grant-ledger-full", "egress-grant-busy"
+ERR_CLOCK = "egress-grant-clock"
 
 _STORE_ID = re.compile(r"[0-9a-f]{32}\n?")
-_TEMP = re.compile(r"(?:used|revoked)\.jsonl\.[0-9a-f]{16}\.new")
+_TEMP = re.compile(r"(?:used\.jsonl|revoked\.jsonl|high_water)\.[0-9a-f]{16}\.new")
 _GRANT = re.compile(r"eh-[0-9a-f]{24}")
 _SESSION = re.compile(r"s-[0-9a-f]{16}")
 _O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -55,7 +65,10 @@ _REVOKED_KEYS = frozenset({"grant", "keep_until"})
 
 
 class LedgerWriteFailed(OSError):
-    """A ledger rewrite failed BEFORE its rename: the old ledger is in force, nothing was recorded."""
+    """A ledger rewrite failed. Before its rename the old file is in force and nothing was recorded; a failure of the
+    directory sync AFTER the rename leaves the new file in force, not proved durable. The caller cannot tell which, so
+    it reports the write as failed and a tap as possibly spent (a redelivery of a spent one answers
+    ``egress-grant-used``: the safe side)."""
 
 
 class Used:
@@ -270,8 +283,8 @@ def _dump(objs: List[Dict[str, str]]) -> bytes:
 
 
 def _write(ctx: object, dirfd: int, name: str, raw: bytes) -> None:
-    """Replace ``name`` whole: a unique temp (``O_EXCL``), written, synced, renamed, the directory synced. A failure
-    before the rename leaves the old ledger and raises :class:`LedgerWriteFailed`."""
+    """Replace ``name`` whole: a unique temp (``O_EXCL``), written, synced, renamed, the directory synced. Any failure
+    raises :class:`LedgerWriteFailed` (before the rename the old file is in force; after it, the new one is)."""
     sync = fsync_of(ctx.seams)  # type: ignore[attr-defined]
     tmp = "%s.%s.new" % (name, os.urandom(8).hex())
     try:
@@ -312,6 +325,38 @@ def keep_until_for(issued: datetime) -> datetime:
     return issued + timedelta(seconds=eg.DAY_TTL_S + eg.SKEW_S)
 
 
+def read_high_water(ctx: object, dirfd: int) -> Optional[datetime]:
+    """The mark (a root 0600 file holding one stamp and a newline), or None when there is none yet. Anything else is
+    ``egress-grant-ledger`` (never read as "no mark": that would reopen the replay it bounds)."""
+    raw = _read_raw(ctx, dirfd, HIGH_WATER_NAME)
+    if not raw:
+        try:
+            os.stat(HIGH_WATER_NAME, dir_fd=dirfd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        raise Refused(ERR_LEDGER, "%s is empty" % HIGH_WATER_NAME)
+    try:
+        text = raw.decode("ascii")
+        if not text.endswith("\n") or "\n" in text[:-1]:
+            raise ValueError
+        return eg.parse_stamp(text[:-1])
+    except (ValueError, eg.GrantRefused):
+        raise Refused(ERR_LEDGER, "%s is not one stamp" % HIGH_WATER_NAME) from None
+
+
+def _check_clock(ctx: object, dirfd: int, now: datetime) -> None:
+    mark = read_high_water(ctx, dirfd)
+    if mark is not None and now < mark - timedelta(seconds=CLOCK_SLACK_S):
+        raise Refused(ERR_CLOCK, "root's clock is behind the ledger's last prune")
+
+
+def _mark_before_prune(ctx: object, dirfd: int, now: datetime) -> None:
+    """Raise the mark to ``now`` (durably) before a rewrite drops a row; never lowers it."""
+    mark = read_high_water(ctx, dirfd)
+    if mark is None or now > mark:
+        _write(ctx, dirfd, HIGH_WATER_NAME, (eg.stamp(now) + "\n").encode("ascii"))
+
+
 def used_for(rows: List[Used], grant: str) -> Optional[Used]:
     for r in rows:
         if r.grant == grant:
@@ -320,10 +365,14 @@ def used_for(rows: List[Used], grant: str) -> Optional[Used]:
 
 
 def record_used(ctx: object, dirfd: int, grant: eg.HostGrant, now: datetime) -> None:
-    """The commit point of single use, under the ledger lock the caller holds: re-read both files, prune what is past
-    its ``keep_until``, refuse an id already used (``egress-grant-used``) or revoked (``egress-grant-revoked``) or a
-    full ledger, then replace ``used.jsonl`` with the new row added. A ledger that does not parse is refused untouched."""
-    used = [r for r in read_used(ctx, dirfd) if r.keep_until > now]
+    """The commit point of single use, under the ledger lock the caller holds, ``now`` being the commit's own time:
+    refuse a clock behind the high-water mark (``egress-grant-clock``); re-read both files, prune what is past its
+    ``keep_until``, refuse an id already used (``egress-grant-used``) or revoked (``egress-grant-revoked``) or a full
+    ledger, then replace ``used.jsonl`` with the new row added (the mark raised first when a row is dropped). A ledger
+    that does not parse is refused untouched."""
+    _check_clock(ctx, dirfd, now)
+    all_used = read_used(ctx, dirfd)
+    used = [r for r in all_used if r.keep_until > now]
     revoked = [r for r in read_revoked(ctx, dirfd) if r.keep_until > now]
     if used_for(used, grant.grant) is not None:
         raise Refused("egress-grant-used", "that grant was already published")
@@ -331,6 +380,8 @@ def record_used(ctx: object, dirfd: int, grant: eg.HostGrant, now: datetime) -> 
         raise Refused("egress-grant-revoked", "that grant was revoked before it arrived")
     if len(used) >= USED_MAX:
         raise Refused(ERR_FULL, "used.jsonl is full")
+    if len(used) < len(all_used):
+        _mark_before_prune(ctx, dirfd, now)
     used.append(Used(grant.grant, grant.session, grant.host, grant.issued, keep_until_for(grant.issued)))
     _write(ctx, dirfd, USED_NAME, _dump([{"grant": r.grant, "session": r.session, "host": r.host,
                                           "issued": eg.stamp(r.issued), "keep_until": eg.stamp(r.keep_until)}
@@ -340,9 +391,12 @@ def record_used(ctx: object, dirfd: int, grant: eg.HostGrant, now: datetime) -> 
 def record_revoked(ctx: object, dirfd: int, ids: List[str], now: datetime) -> None:
     """Record ``ids`` (levain-minted ids no file held), under the ledger lock the caller holds: prune rows past their
     ``keep_until`` FIRST, add, then evict the OLDEST beyond :data:`REVOKED_MAX`. Never refuses for a full ledger."""
-    rows = [r for r in read_revoked(ctx, dirfd) if r.keep_until > now]
+    all_rows = read_revoked(ctx, dirfd)
+    rows = [r for r in all_rows if r.keep_until > now]
+    if len(rows) < len(all_rows):
+        _mark_before_prune(ctx, dirfd, now)
     have = {r.grant for r in rows}
-    keep = now + timedelta(seconds=eg.FRESH_S + eg.SKEW_S)
+    keep = now + timedelta(seconds=REVOKED_KEEP_S)
     for i in ids:
         if i not in have:
             rows.append(Revoked(i, keep))
@@ -351,6 +405,8 @@ def record_revoked(ctx: object, dirfd: int, ids: List[str], now: datetime) -> No
     _write(ctx, dirfd, REVOKED_NAME, _dump([{"grant": r.grant, "keep_until": eg.stamp(r.keep_until)} for r in rows]))
 
 
-__all__ = ["ERR_BUSY", "ERR_FULL", "ERR_LEDGER", "FILE_MAX", "LEDGER_LOCK_WAIT_S", "LedgerWriteFailed", "REVOKED_MAX",
-           "Revoked", "USED_MAX", "Used", "keep_until_for", "ledger_dir", "ledger_lock", "read_revoked",
+__all__ = ["CLOCK_SLACK_S", "ERR_BUSY", "ERR_CLOCK", "ERR_FULL", "ERR_LEDGER", "FILE_MAX", "HIGH_WATER_NAME",
+           "LEDGER_LOCK_WAIT_S", "LedgerWriteFailed", "REVOKED_KEEP_S", "REVOKED_MAX",
+           "Revoked", "USED_MAX", "Used", "keep_until_for", "ledger_dir", "ledger_lock", "read_high_water",
+           "read_revoked",
            "read_store_id", "read_used", "record_revoked", "record_used", "used_for", "verify_lock"]

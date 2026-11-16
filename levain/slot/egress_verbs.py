@@ -10,7 +10,8 @@ not already routed; the signature under the install-wide verify lock (taken and 
 under the session lock: the session is ACTIVE, the slot dir passes its walk, the old file is read (a bad one is an
 empty rebuild), expired entries pruned, one entry per host with the LATEST ISSUED winning, the cap checked; the new
 file is staged in a unique temp, the ledger row is committed (the commit point of single use) under the global
-ledger lock, and only then is the temp renamed to ``grants.json``.
+ledger lock, and only then is the temp renamed to ``grants.json``. Freshness and the chosen expiry are checked again at
+the commit with the commit's own time (the signature check and two lock waits ran since the first ``now``).
 
 Failure semantics: before the ledger commit, any failure unlinks only the temp, the old file stays in force and the tap
 is NOT burned (``egress-grant-write-failed``); after it and before the rename, the same but the tap IS burned (a new
@@ -157,11 +158,20 @@ def _publish(ctx: H.Ctx, a: R.Alloc, session: str, grant: eg.HostGrant, sd: ES.S
     except eg.GrantRefused:
         raise Refused(ERR_WRITE, "the grants file cannot be built") from None
     tmp = None  # type: Optional[str]
+    spent = False
     try:
         tmp = ES.stage(ctx, sd, raw, at)
         at("egress-grant:ledger")
         with EL.ledger_lock(ctx, dfd):
-            EL.record_used(ctx, dfd, grant, now)
+            at_commit = _now(ctx)
+            try:
+                eg.check_fresh(grant, at_commit)
+            except eg.GrantRefused as e:
+                raise EV.refusal_of(e) from None
+            if grant.expires <= at_commit:
+                raise Refused(ERR_EXPIRED, "the chosen grant ran out while the tap waited")
+            spent = True                    # from here a failure may leave the used row in force
+            EL.record_used(ctx, dfd, grant, at_commit)
         at("egress-grant:committed")
         ES.commit(ctx, sd, tmp, at)
     except ES.RenamedNotDurable:
@@ -173,8 +183,8 @@ def _publish(ctx: H.Ctx, a: R.Alloc, session: str, grant: eg.HostGrant, sd: ES.S
     except OSError as e:
         if tmp is not None:
             ES.discard(sd, tmp)
-        raise Refused(ERR_WRITE, "the grant could not be written; the old file is in force (%s)"
-                      % (e.strerror or type(e).__name__)) from None
+        raise Refused(ERR_WRITE, "the grant could not be written; the old file is in force%s (%s)"
+                      % ("; the tap may be spent" if spent else "", e.strerror or type(e).__name__)) from None
     except BaseException:
         if tmp is not None:
             ES.discard(sd, tmp)
@@ -220,7 +230,7 @@ def egress_grant_revoke(ctx: H.Ctx, req: RuntimeRequest, blob: object) -> Dict[s
                         try:
                             EL.record_revoked(ctx, dfd, unknown, now)
                         except EL.LedgerWriteFailed:
-                            raise Refused(ERR_WRITE, "the revocation could not be recorded") from None
+                            raise Refused(ERR_WRITE, "the revocation may not be recorded: revoke it again") from None
             finally:
                 if sd is not None:
                     sd.close()
@@ -273,8 +283,9 @@ def _scan(log: _Log, offset: int, budget: int, session: str, hosts: List[str]) -
     """Read ``log`` from ``offset`` for at most ``budget`` bytes, adding ``session``'s off-list host refusals to
     ``hosts`` (deduped, at most :data:`REFUSALS_HOSTS_MAX`; it stops right after the line that makes the last one).
     Returns ``(offset after the last whole line consumed, bytes read, reached the end of the file)``. A partial last
-    line is left for the next call; one that fills the whole budget with no newline in it is junk and skipped, so a
-    cursor cannot wedge on it."""
+    line is left for the next call; one that fills a WHOLE per-call budget (:data:`REFUSALS_SCAN_MAX`) with no newline
+    in it is junk and skipped, so a cursor cannot wedge on it. A line cut short only because an earlier file of this
+    call used up most of the budget is left for the next call, never skipped."""
     pos, scanned, buf, eof = offset, 0, b"", False
     while len(hosts) < REFUSALS_HOSTS_MAX:
         chunk = b""
@@ -294,7 +305,7 @@ def _scan(log: _Log, offset: int, budget: int, session: str, hosts: List[str]) -
             pos += nl + 1
         if not chunk:
             break
-    if pos == offset and len(buf) >= budget:
+    if pos == offset and len(buf) >= REFUSALS_SCAN_MAX:
         pos += len(buf)
     return pos, scanned, eof
 
@@ -328,8 +339,11 @@ def egress_refusals(ctx: H.Ctx, req: RuntimeRequest, blob: object) -> Dict[str, 
     opened = []  # type: List[_Log]
     try:
         cur = _open_log(dfd, _FRONT_LOG, owners)
+        if cur is not None:
+            opened.append(cur)              # closed below even when the rotated file's open refuses
         rot = _open_log(dfd, _FRONT_LOG_ROTATED, owners)
-        opened = [x for x in (cur, rot) if x is not None]
+        if rot is not None:
+            opened.append(rot)
         plan = []  # type: List[Tuple[_Log, int]]
         if want is not None and cur is not None and want[0] == cur.ino:
             plan = [(cur, want[1])]

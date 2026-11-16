@@ -1409,9 +1409,35 @@ def drop_session_grants(ctx: H.Ctx, a: R.Alloc) -> None:
         ES.remove_all(ctx, a.slot)
 
 
-def _drop_session_grants_logged(ctx: H.Ctx, a: R.Alloc, where: str) -> None:
+def drop_session_grants_of_lease(ctx: H.Ctx, a: R.Alloc) -> bool:
+    """:func:`drop_session_grants` for a caller that does NOT hold the slot lock (``teardown``): under the slot lock
+    (waited for, as SCRUB does; order slot -> session, END's), and only while the slot state still names THIS lease.
+    ``R/grants/slot<n>/`` is the slot's, not the session's: a retried ``teardown`` of a session whose slot was released
+    and leased again must not delete the new session's file or its staged temp (L3 r1, codex 2). Returns whether the
+    removal ran. Egress slots only."""
+    if a.slot.slot_class != "egress":
+        return False
+    with ctx.store.dir("slots", a.slot.tag) as sfd:
+        lock = H._open_lock(sfd, "lock", f"slots/{a.slot.tag}/lock")
     try:
+        H.wait_flock(lock, ctx.seams, "slot-locked")
+        if not _names_lease(_slot_state(ctx, a.slot), a):
+            return False
         drop_session_grants(ctx, a)
+        return True
+    finally:
+        os.close(lock)
+
+
+def _drop_session_grants_logged(ctx: H.Ctx, a: R.Alloc, where: str, *, slot_lock_held: bool = True) -> None:
+    """``slot_lock_held``: SCRUB holds the slot lock and has checked the lease; ``teardown`` holds neither."""
+    if a.slot.slot_class != "egress":
+        return
+    try:
+        if slot_lock_held:
+            drop_session_grants(ctx, a)
+        elif not drop_session_grants_of_lease(ctx, a):
+            _note(f"{where} {a.session}: the slot no longer names this lease; its host grants are not this session's")
     except (Refused, OSError) as e:
         _note(f"{where} {a.session}: host grants not removed ({getattr(e, 'name', None) or type(e).__name__}); "
               "the next render of the slot removes them")
@@ -1598,7 +1624,7 @@ def teardown(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
     seams.at("revoke")
     first = read_record(ctx, a.session)     # S14 A3: the state END started from, for a verifier's no-report:<state>
     revoke(ctx, a.session)
-    _drop_session_grants_logged(ctx, a, "teardown")         # levain#66: after revoke, before END, under the session lock
+    _drop_session_grants_logged(ctx, a, "teardown", slot_lock_held=False)   # levain#66: after revoke, before END
     seams.at("end")
     rec = read_record(ctx, a.session)
     if rec is None:
@@ -1649,6 +1675,7 @@ __all__ = ["CheckFailed", "CheckStats", "EXEC_MARKER_S", "FORWARDER_READY_S", "F
            "REVOKE_FRONT_S", "await_exec", "check_attributes", "check_discovery", "check_index", "check_worktree",
            "check_vendor_installed", "clone_check",
            "discovery_listings", "end_facts", "end_seams", "front_lock", "hash_batches", "kill_domain",
-           "launch", "parse_ls_files", "read_record", "remove_tree_at", "revoke", "revoke_front", "drop_session_grants", "scrub_and_release",
+           "launch", "parse_ls_files", "read_record", "remove_tree_at", "revoke", "revoke_front", "drop_session_grants",
+           "drop_session_grants_of_lease", "scrub_and_release",
            "secret_env", "start", "teardown", "vendor_argv", "EXECUTOR_PROMPT", "VendorCapture", "is_executor",
            "open_capture"]

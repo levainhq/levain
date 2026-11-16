@@ -3,8 +3,10 @@ directory walk, the read of the file root last placed there, and the unique-temp
 
 ``R/grants/slot<n>/`` is ROOT's (root : the front's group, 0750), never the front's: no uid but root can create,
 rename, link into or unlink in it, so the file at ``grants.json`` is always the one root last placed (no rollback
-past a revoke, no temp swap, no planting). Every refusal of the walk is ``egress-grant-not-ready``: the layout row is
-made by ``setup`` and the reaper's boot pass, so an installed helper that predates it answers that until they run.
+past a revoke, no temp swap, no planting). A directory that is NOT THERE is ``egress-grant-not-ready`` (the layout row
+is made by ``setup`` and the reaper's boot pass, so an installed helper that predates it answers that until they run);
+one that is there but fails the walk (a link, another owner, group or mode) is ``egress-grant-dir-untrusted``, never
+read as absent, so a revoke or a list on it refuses instead of answering "nothing here".
 
 Root's ``/usr/bin/python3`` (3.9) imports this module: no match statement, no ``X | Y`` outside annotations.
 """
@@ -30,6 +32,7 @@ _O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _O_TEMP = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 
 NOT_READY = "egress-grant-not-ready"
+DIR_UNTRUSTED = "egress-grant-dir-untrusted"
 
 
 class RenamedNotDurable(OSError):
@@ -85,7 +88,8 @@ class SlotDir:
 def open_slot_dir(ctx: object, slot: SlotId) -> SlotDir:
     """``R/grants/slot<n>/``, walked one ``O_NOFOLLOW`` component at a time: ``R`` and ``R/grants`` pass
     ``seams.trusted``, and the slot dir, by its OPEN descriptor, is root's (uid 0), the front account's group and
-    exactly 0750. Anything else is ``egress-grant-not-ready``, with nothing written."""
+    exactly 0750. A component that is not there (or a front group that is unknown) is ``egress-grant-not-ready``; any
+    other failure is ``egress-grant-dir-untrusted``; nothing is written either way."""
     seams = ctx.seams  # type: ignore[attr-defined]
     try:
         gid = seams.group_gid(front_account(slot))
@@ -96,21 +100,23 @@ def open_slot_dir(ctx: object, slot: SlotId) -> SlotDir:
     try:
         cur = os.open(str(seams.R), _O_DIR)
         if not seams.trusted(os.fstat(cur)):
-            raise Refused(NOT_READY, "R is not root's")
+            raise Refused(DIR_UNTRUSTED, "R is not root's")
         for name in ("grants", "slot%d" % slot.index):
             nxt = os.open(name, _O_DIR, dir_fd=cur)
             os.close(cur)
             cur = nxt
             if name == "grants" and not seams.trusted(os.fstat(cur)):
-                raise Refused(NOT_READY, "R/grants is not root's")
+                raise Refused(DIR_UNTRUSTED, "R/grants is not root's")
         st = os.fstat(cur)
         if (st.st_uid != seams.chowned_uid(0) or st.st_gid != gid or stat.S_IMODE(st.st_mode) != DIR_MODE):
-            raise Refused(NOT_READY, "%s is not root:front 0750" % where)
+            raise Refused(DIR_UNTRUSTED, "%s is not root:front 0750" % where)
         out = SlotDir(cur, gid, where)
         cur = -1
         return out
+    except FileNotFoundError:
+        raise Refused(NOT_READY, "%s is not there" % where) from None
     except OSError:
-        raise Refused(NOT_READY, "%s cannot be opened as a directory" % where) from None
+        raise Refused(DIR_UNTRUSTED, "%s cannot be opened as a directory" % where) from None
     finally:
         if cur >= 0:
             os.close(cur)
@@ -194,7 +200,7 @@ def remove_all(ctx: object, slot: SlotId) -> int:
     """Unlink ``grants.json`` and every stale ``grants.json.<16 hex>.new`` of ``slot``'s ``R/grants/slot<n>/`` (what a
     teardown, a scrub and a render do so no session's grants outlive it), then sync the directory when anything went.
     Returns how many names went. A directory that is not there (no grants were ever published, or the install predates
-    the rows) is nothing to remove, ``0``; one that is not root's is ``egress-grant-not-ready`` with nothing touched
+    the rows) is nothing to remove, ``0``; one that is not root's is ``egress-grant-dir-untrusted`` with nothing touched
     (a link, a non-directory and a front-owned dir included). Any other failure of an unlink or the sync is raised."""
     seams = ctx.seams  # type: ignore[attr-defined]
     sync = fsync_of(seams)
@@ -202,7 +208,7 @@ def remove_all(ctx: object, slot: SlotId) -> int:
     try:
         cur = os.open(str(seams.R), _O_DIR)
         if not seams.trusted(os.fstat(cur)):
-            raise Refused(NOT_READY, "R is not root's")
+            raise Refused(DIR_UNTRUSTED, "R is not root's")
         for name in ("grants", "slot%d" % slot.index):
             try:
                 nxt = os.open(name, _O_DIR, dir_fd=cur)
@@ -211,9 +217,9 @@ def remove_all(ctx: object, slot: SlotId) -> int:
             os.close(cur)
             cur = nxt
             if name == "grants" and not seams.trusted(os.fstat(cur)):
-                raise Refused(NOT_READY, "R/grants is not root's")
+                raise Refused(DIR_UNTRUSTED, "R/grants is not root's")
         if os.fstat(cur).st_uid != seams.chowned_uid(0):
-            raise Refused(NOT_READY, "R/grants/slot%d is not root's" % slot.index)
+            raise Refused(DIR_UNTRUSTED, "R/grants/slot%d is not root's" % slot.index)
         gone = 0
         for name in sorted(n for n in os.listdir(cur) if n == GRANTS_NAME or _TEMP_RE.fullmatch(n)):
             try:
@@ -225,11 +231,11 @@ def remove_all(ctx: object, slot: SlotId) -> int:
             sync(cur)
         return gone
     except (NotADirectoryError, PermissionError) as e:
-        raise Refused(NOT_READY, "R/grants/slot%d cannot be opened as a directory (%s)"
+        raise Refused(DIR_UNTRUSTED, "R/grants/slot%d cannot be opened as a directory (%s)"
                       % (slot.index, e.strerror or type(e).__name__)) from None
     except OSError as e:
         if e.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise Refused(NOT_READY, "R/grants/slot%d is a link or not a directory" % slot.index) from None
+            raise Refused(DIR_UNTRUSTED, "R/grants/slot%d is a link or not a directory" % slot.index) from None
         raise
     finally:
         if cur >= 0:
@@ -248,6 +254,7 @@ def publish(ctx: object, sd: SlotDir, raw: bytes, at: Callable[[str], None]) -> 
         raise
 
 
-__all__ = ["DIR_MODE", "FILE_MODE", "GRANTS_NAME", "NOT_READY", "RenamedNotDurable", "SlotDir", "TEMP_SWEEP_MAX",
+__all__ = ["DIR_MODE", "DIR_UNTRUSTED", "FILE_MODE", "GRANTS_NAME", "NOT_READY", "RenamedNotDurable", "SlotDir",
+           "TEMP_SWEEP_MAX",
            "commit", "discard", "front_account", "fsync_of", "full_fsync", "open_slot_dir", "publish", "read_current",
            "remove_all", "stage", "sweep_temps"]

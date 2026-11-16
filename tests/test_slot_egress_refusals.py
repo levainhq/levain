@@ -204,3 +204,40 @@ def test_a_log_file_owned_by_neither_the_front_nor_root_is_refused(lw, monkeypat
     monkeypatch.setattr(H, "_open_front_log_dir", walk)
     lw.seams = dataclasses.replace(lw.seams, chowned_uid=lambda uid: os.getuid() + 1 if walked["done"] else os.getuid())
     refused(ask(lw), "egress-refusals-log")
+
+
+# --- L3 r1 -------------------------------------------------------------------------------------------------------
+
+def test_a_refusal_line_after_the_rotated_log_used_most_of_the_budget_is_not_skipped(lw):
+    """complement 2: the rotated file leaves 100 bytes of the shared budget; the first line of ``front.log`` is a whole
+    refusal longer than that. It must be read on the next call, never skipped as junk (junk is a line that fills a
+    WHOLE fresh budget)."""
+    from levain.slot import egress_verbs as EVB
+    junk = []
+    left = EVB.REFUSALS_SCAN_MAX - 100
+    while left:
+        n = min(left, 60000)
+        junk.append("y" * (n - 1) + "\n")
+        left -= n
+    rot = write_log(lw, "".join(junk), name="front.log.1")
+    keep = line("keep.example.org", pad="z" * 60)
+    assert len(keep) > 100
+    write_log(lw, keep)
+    cur, got = "%d-0" % rot.stat().st_ino, []
+    for _ in range(3):
+        step = ask(lw, cur)
+        got += hosts_of(step)
+        cur = step[1]["cursor"]
+    assert got == ["keep.example.org"]
+
+
+def test_a_refused_rotated_log_closes_the_current_log_it_already_opened(lw, tmp_path):
+    """complement 3 / gemini 3: ``front.log`` opened, ``front.log.1`` refused (a hard link): no descriptor leaks."""
+    write_log(lw, line("a.example.org"))
+    other = tmp_path / "other.log"
+    other.write_text(line("b.example.org"))
+    os.link(other, lw.log_dir / "front.log.1")
+    before = len(os.listdir("/dev/fd"))
+    for _ in range(5):
+        refused(ask(lw), "egress-refusals-log")
+    assert len(os.listdir("/dev/fd")) == before

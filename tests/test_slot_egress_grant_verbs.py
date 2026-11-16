@@ -648,14 +648,48 @@ def _break(world, how):
         d.parent.symlink_to(elsewhere)
 
 
-@pytest.mark.parametrize("how", ["absent", "mode-0770", "mode-0755", "mode-2750", "symlink", "gid", "uid",
-                                 "grants-symlink"])
-def test_a_slot_dir_that_is_not_roots_with_the_fronts_group_and_exactly_0750_is_not_ready(world, verifier, how):
-    _break(world, how)
-    refused(tap(world), "egress-grant-not-ready")
+@pytest.mark.parametrize("how,name", [("absent", "egress-grant-not-ready"), ("grants-absent", "egress-grant-not-ready"),
+                                      *((h, "egress-grant-dir-untrusted") for h in
+                                        ("mode-0770", "mode-0755", "mode-2750", "symlink", "gid",
+                                         "grants-symlink"))])
+def test_an_absent_slot_dir_is_not_ready_and_one_that_is_not_roots_front_group_0750_is_untrusted(world, verifier,
+                                                                                                    how, name):
+    """L3 r1 (codex 3): absence and a trust failure are two names, so a changed mode never reads as "not set up"."""
+    if how == "grants-absent":
+        world.slot_dir.rmdir()
+        (world.R / "grants").rmdir()
+    else:
+        _break(world, how)
+    refused(tap(world), name)
     assert used_ids(world) == []
     for p in world.R.rglob("grants.json*"):
         raise AssertionError(f"something was written: {p}")
+
+
+@pytest.mark.parametrize("how", ["mode-0755", "gid", "symlink"])
+def test_revoke_and_list_refuse_an_untrusted_slot_dir_and_never_answer_success(world, verifier, how):
+    """L3 r1 (codex 3): a revoke of ``all`` on a mis-moded dir answered ``removed: []`` with the live file in force."""
+    ok(tap(world, "a.example.org", grant=gid_for(1)), "a.example.org")
+    before = (world.slot_dir / "grants.json").read_bytes()
+    if how == "symlink":
+        real = world.slot_dir.parent / "real3"
+        world.slot_dir.rename(real)
+        world.slot_dir.symlink_to(real)
+    else:
+        _break(world, how)
+    refused(world.main(["egress-grant-revoke", S, "all"]), "egress-grant-dir-untrusted")
+    refused(world.main(["egress-grant-revoke", S, gid_for(9)]), "egress-grant-dir-untrusted")
+    refused(world.main(["egress-grants-list", S]), "egress-grant-dir-untrusted")
+    assert rows(world, "revoked.jsonl") == []
+    target = world.slot_dir.parent / "real3" if how == "symlink" else world.slot_dir
+    assert (target / "grants.json").read_bytes() == before
+
+
+def test_revoke_and_list_with_no_slot_dir_still_record_and_answer_empty(world, verifier):
+    world.slot_dir.rmdir()
+    assert world.main(["egress-grant-revoke", S, gid_for(9)]) == (RH.EXIT_OK, {"ok": True, "removed": [],
+                                                                               "recorded": [gid_for(9)]})
+    assert world.main(["egress-grants-list", S]) == (RH.EXIT_OK, {"ok": True, "store": STORE_ID, "entries": []})
 
 
 # --- T15 scope ------------------------------------------------------------------------------------------------------------
@@ -823,8 +857,9 @@ def test_revoked_rows_past_their_keep_until_are_pruned_before_the_cap_is_applied
     from levain.slot import egress_ledger as EL
     world.main(["egress-grant-revoke", S, gid_for(1)])
     row, = rows(world, "revoked.jsonl")
-    assert row["keep_until"] == eg.stamp(NOW + timedelta(seconds=eg.FRESH_S + eg.SKEW_S))
-    world.clock_now = NOW + timedelta(seconds=eg.FRESH_S + eg.SKEW_S + 1)
+    assert row["keep_until"] == eg.stamp(NOW + timedelta(seconds=EL.REVOKED_KEEP_S))
+    assert EL.REVOKED_KEEP_S > eg.FRESH_S + eg.SKEW_S + EL.CLOCK_SLACK_S    # past the last fresh second and the slack
+    world.clock_now = NOW + timedelta(seconds=EL.REVOKED_KEEP_S)
     world.main(["egress-grant-revoke", S, gid_for(2)])
     assert [r["grant"] for r in rows(world, "revoked.jsonl")] == [gid_for(2)]
 
@@ -853,6 +888,82 @@ def test_the_list_answers_the_store_id_and_the_live_entries_after_pruning(world,
     assert line[1]["store"] == STORE_ID
     assert line[1]["entries"] == [{"grant": gid_for(100), "host": "a.example.org",
                                    "expires": eg.stamp(NOW + timedelta(hours=1)), "choice": "s"}]
+
+
+# --- L3 r1: a wall clock set back after a prune (codex 4), the revoked row's edge (complement 4), time at the commit --
+
+def test_a_clock_set_back_after_a_used_row_was_pruned_refuses_by_name_and_never_readmits_the_id(world, verifier):
+    """Use G at T; a tap a day later prunes G's row; the clock goes back to T: G's bytes are fresh again and their row
+    is gone. The ledger's high-water mark (written before the prune) refuses ``egress-grant-clock`` instead."""
+    ok(tap(world, "a.example.org", grant=gid_for(1)), "a.example.org")
+    world.clock_now = NOW + timedelta(days=3)
+    ok(tap(world, "z.example.org", grant=gid_for(2), issued=NOW + timedelta(days=3, minutes=-1)), "z.example.org")
+    assert used_ids(world) == [gid_for(2)]                                         # G's row is gone
+    world.clock_now = NOW
+    refused(tap(world, "a.example.org", grant=gid_for(1)), "egress-grant-clock")
+    refused(tap(world, "n.example.org", grant=gid_for(3)), "egress-grant-clock")   # fail closed, any card
+    assert used_ids(world) == [gid_for(2)]
+    world.clock_now = NOW + timedelta(days=3, seconds=10)                          # the clock is back past the mark
+    ok(tap(world, "n.example.org", grant=gid_for(3), issued=NOW + timedelta(days=3)), "n.example.org")
+
+
+def test_a_clock_set_back_after_a_revoked_row_was_pruned_refuses_the_undelivered_card(world, verifier):
+    world.main(["egress-grant-revoke", S, gid_for(1)])
+    world.clock_now = NOW + timedelta(hours=1)
+    world.main(["egress-grant-revoke", S, gid_for(2)])                            # prunes gid 1's row
+    assert [r["grant"] for r in rows(world, "revoked.jsonl")] == [gid_for(2)]
+    world.clock_now = NOW + timedelta(minutes=1)
+    refused(tap(world, "a.example.org", grant=gid_for(1), issued=NOW), "egress-grant-clock")
+    assert used_ids(world) == []
+
+
+def test_a_small_backward_step_within_the_slack_still_admits(world, verifier):
+    from levain.slot import egress_ledger as EL
+    world.main(["egress-grant-revoke", S, gid_for(1)])
+    world.clock_now = NOW + timedelta(hours=1)
+    world.main(["egress-grant-revoke", S, gid_for(2)])                            # the mark is NOW + 1 h
+    world.clock_now = NOW + timedelta(hours=1, seconds=-EL.CLOCK_SLACK_S)
+    ok(tap(world, "a.example.org", grant=gid_for(3), issued=NOW + timedelta(minutes=59)), "a.example.org")
+
+
+def test_a_revoked_card_issued_at_the_skew_edge_is_still_refused_at_the_last_fresh_second(world, verifier):
+    """complement 4: the row lived exactly to ``now + FRESH + SKEW`` and was pruned by a strict ``>`` at the very second
+    the card was still fresh (age == FRESH_S, inclusive)."""
+    world.main(["egress-grant-revoke", S, gid_for(1)])
+    world.clock_now = NOW + timedelta(seconds=eg.FRESH_S + eg.SKEW_S)
+    refused(tap(world, "a.example.org", grant=gid_for(1), issued=NOW + timedelta(seconds=eg.SKEW_S)),
+            "egress-grant-revoked")
+
+
+def test_an_expiry_that_passes_while_the_tap_waits_is_refused_at_the_commit_and_not_burned(world, verifier):
+    """codex 6: ``now`` was taken before the signature check and the lock waits; the commit uses its own time."""
+    def hook(step):
+        if step == "egress-grant:ledger":
+            world.clock_now = NOW + timedelta(seconds=5)
+    world.hook = hook
+    refused(tap(world, "a.example.org", grant=gid_for(1), exp_s=NOW + timedelta(seconds=2)), "egress-grant-expired")
+    assert used_ids(world) == [] and entries(world) is None
+    assert sorted(x.name for x in world.slot_dir.iterdir()) == []
+
+
+def test_freshness_that_runs_out_while_the_tap_waits_is_refused_at_the_commit(world, verifier):
+    def hook(step):
+        if step == "egress-grant:ledger":
+            world.clock_now = NOW + timedelta(seconds=5)
+    world.hook = hook
+    refused(tap(world, "a.example.org", grant=gid_for(1), issued=NOW - timedelta(seconds=eg.FRESH_S - 1)), "fresh")
+    assert used_ids(world) == []
+
+
+def test_the_high_water_mark_is_root_0600_and_a_bad_one_fails_closed(world, verifier):
+    from levain.slot import egress_ledger as EL
+    world.main(["egress-grant-revoke", S, gid_for(1)])
+    world.clock_now = NOW + timedelta(hours=1)
+    world.main(["egress-grant-revoke", S, gid_for(2)])
+    p = world.L / "routes" / "grants" / EL.HIGH_WATER_NAME
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600 and p.read_text() == eg.stamp(NOW + timedelta(hours=1)) + "\n"
+    p.write_text("junk\n")
+    refused(tap(world, "a.example.org", grant=gid_for(3), issued=NOW + timedelta(minutes=59)), "egress-grant-ledger")
 
 
 

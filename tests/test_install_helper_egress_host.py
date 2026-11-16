@@ -199,3 +199,18 @@ def test_a_store_id_made_by_a_racing_enrolment_wins_and_is_returned(LR, keys, mo
     got = _act(LR, egress_argv("phill", keys["a"][0]))
     assert got["egress_store_id"] == won["id"] and sid_path(LR).read_text() == won["id"] + "\n"
     assert sorted(p.name for p in (LR / "routes" / "grants").iterdir()) == ["store_id"]
+
+
+def test_a_new_ledger_dir_is_synced_and_so_is_its_parent_routes(LR, keys):
+    """codex 5: the new ``grants`` entry lives in ``L/routes``; syncing only the child can lose it to a power loss."""
+    synced = []
+
+    def spy(fd):
+        synced.append(os.fstat(fd).st_ino)
+        os.fsync(fd)
+
+    rs = type("RS", (), {"L": LR})()
+    IH.ensure_egress_state(rs, fsync=spy)
+    routes, grants = (LR / "routes").stat().st_ino, (LR / "routes" / "grants").stat().st_ino
+    assert routes in synced and grants in synced
+    assert synced.index(routes) > synced.index(grants)        # the child first, then the entry naming it

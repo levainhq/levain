@@ -3966,13 +3966,16 @@ def ensure_egress_state(rs: RH.Seams, *, fsync: Callable[[int], None] | None = N
         except OSError:
             raise Refused("egress-state-exists", "L/routes/grants is a link or not a directory: left as it is") \
                 from None
-        os.close(cur)
-        cur = dfd
-        st = os.fstat(cur)
-        if made:
-            os.fchmod(cur, 0o700)
-            sync(cur)
-        elif st.st_uid != euid or stat.S_IMODE(st.st_mode) != 0o700:
+        routes, cur = cur, dfd
+        try:
+            st = os.fstat(cur)
+            if made:        # the new dir, then L/routes, whose entry names it (else a power loss can lose both)
+                os.fchmod(cur, 0o700)
+                sync(cur)
+                sync(routes)
+        finally:
+            os.close(routes)
+        if not made and (st.st_uid != euid or stat.S_IMODE(st.st_mode) != 0o700):
             raise Refused("egress-state-exists", "L/routes/grants is not a root 0700 directory: left as it is")
         sid = _existing_egress_id(cur, euid)
         if sid is not None:

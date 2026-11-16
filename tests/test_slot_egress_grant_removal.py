@@ -63,7 +63,7 @@ def test_remove_all_refuses_a_slot_dir_that_is_not_roots_and_leaves_it(world):
     world.seams = __import__("dataclasses").replace(world.seams, chowned_uid=lambda uid: os.getuid() + 1)
     with pytest.raises(Refused) as e:
         ES.remove_all(ctx_of(world), SLOT)
-    assert e.value.name == ES.NOT_READY
+    assert e.value.name == ES.DIR_UNTRUSTED
     assert (world.slot_dir / "grants.json").exists()
 
 
@@ -224,6 +224,49 @@ def test_a_scrub_removal_failure_is_logged_and_the_slot_is_still_released(env, m
     code, line = w.main(["teardown", s])
     assert line["ok"] and line["state"] == R.RETAINED and "released" not in line, line
     assert b"reusable" in (w.L / "slots" / "e0" / "state").read_bytes()
+
+
+def test_a_retried_teardown_after_the_slot_was_leased_again_leaves_the_new_sessions_file(env):
+    """L3 r1 (codex 2): A is RETAINED and released, the slot goes to session B, B publishes; a retried ``teardown A``
+    (``revoke`` a no-op, A's own session lock) must not delete B's file. The removal is bound to the slot's CURRENT
+    lease, read under the slot lock."""
+    import dataclasses
+    w, _la, table = env
+    s = _rendered(w)
+    _front_alive(w, table)
+    code, line = w.main(["teardown", s])
+    assert line["ok"] and line["state"] == R.RETAINED, line
+    path = w.L / "slots" / "e0" / "state"
+    st = RH.parse_slot_state_of(path.read_bytes(), alloc_of_session(w, s).slot)
+    assert st.state == "reusable"
+    other = "s-" + "ef" * 8
+    path.write_bytes(R.slot_state_bytes(dataclasses.replace(st, state="leased", session=other,
+                                                            lease_seq=st.lease_seq + 1, rev=st.rev + 1)))
+    d = _grants_dir(w)
+    (d / "grants.json").write_bytes(b"B's grants")
+    (d / ("grants.json." + "ab" * 8 + ".new")).write_bytes(b"B's staged temp")
+    w.main(["teardown", s])
+    assert sorted(p.name for p in d.iterdir()) == ["grants.json", "grants.json." + "ab" * 8 + ".new"]
+
+
+def test_the_teardown_removal_skips_a_slot_whose_state_names_another_lease(world):
+    import dataclasses
+    a = alloc_of(world)
+    st = R.SlotState(slot=SLOT, rev=3, lease_seq=a.lease_seq + 1, state="leased", dispatch_eligible=False,
+                     changed_at="2026-11-16T11:00:00Z", session="s-" + "ef" * 8)
+    (world.L / "slots" / "e3" / "state").write_bytes(R.slot_state_bytes(st))
+    (world.L / "slots" / "e3" / "lock").write_bytes(b"")
+    put_file(world)
+    SS.drop_session_grants_of_lease(ctx_of(world), a)
+    assert (world.slot_dir / "grants.json").exists()
+    (world.L / "slots" / "e3" / "state").write_bytes(R.slot_state_bytes(
+        dataclasses.replace(st, lease_seq=a.lease_seq, session=a.session)))
+    SS.drop_session_grants_of_lease(ctx_of(world), a)
+    assert not (world.slot_dir / "grants.json").exists()
+
+
+def alloc_of_session(w, s):
+    return R.parse_alloc((w.L / "alloc" / f"{s}.json").read_bytes())
 
 
 def test_a_none_class_slot_is_never_touched(env):
