@@ -103,6 +103,22 @@ def _note_unreadable(name: str) -> Dict[str, Any]:
     return {"unreadable": True, "name": name, "note": words}
 
 
+def _gone_words(target: str, *, listed: bool = False, ledger_full: bool = False) -> str:
+    """What a ``gone`` answer says, true for each way there (L4 review 1116-19 L5). An id is gone when it expired, was
+    revoked, or was REPLACED by a newer grant for the same host (root's same-host replace): the attached listing shows
+    whatever is in force now. ``listed``: nothing was sent to root, the cockpit's own listing does not hold it.
+    ``ledger_full``: root found no such grant in force but could not record the id (``egress-grant-ledger-full``)."""
+    if target == "all":
+        return ("that session holds no host grants now" if listed
+                else "that session had no grant in force when root looked")
+    words = ("that grant is not in the list: it expired, was revoked, or was replaced by a newer grant for the same host"
+             if listed else "that grant was not in force when root looked: it had expired, been revoked, or been "
+                            "replaced by a newer grant for the same host")
+    if ledger_full:
+        words += "; root's revoked-id ledger is full, so root did not record the id"
+    return words
+
+
 def _ok_text(x: object, cap: int) -> bool:
     return isinstance(x, str) and 0 < len(x) <= cap and x.isprintable()
 
@@ -349,16 +365,23 @@ class HostGrantSurface:
             return {"error": "bad_request", "message": "a session and a grant id or all are needed"}, 400
         if not self._revokes.acquire(blocking=False):
             return {"error": "busy", "message": "not revoked; busy, tap again"}, 409
+        began = [False]     # THIS request's revoke spawn began (never the shared ``_began``: the listings reset it)
         try:
-            return self._revoke(session, target, credential, deadline)
+            return self._revoke(session, target, credential, deadline, began)
         except Exception as e:  # noqa: BLE001 - never raised into the route
             _log.warning("host grant revoke failed: %s: %s", type(e).__name__, e)
+            if began[0]:
+                # root was started (L4 review 1116-19 L2): it may have applied the revoke, so never "not revoked"
+                return {"error": "unknown", "name": "host-grants-unreadable",
+                        "message": "root did not answer clearly: the grant may or may not be revoked; refresh the list "
+                                   "once root's helper has finished"}, 502
             return {"error": "refused", "name": "host-grants-unreadable",
                     "message": "not revoked: host grants cannot be read now"}, 502
         finally:
             self._revokes.release()
 
-    def _revoke(self, session: str, target: str, credential: str, deadline: float) -> "Tuple[Dict[str, Any], int]":
+    def _revoke(self, session: str, target: str, credential: str, deadline: float,
+                began_out: "Optional[List[bool]]" = None) -> "Tuple[Dict[str, Any], int]":
         held = self.listing(deadline)
         if held.get("unreadable"):
             return {"error": "unreadable", "name": held["name"], "message": "not revoked: " + held["note"],
@@ -369,7 +392,7 @@ class HostGrantSurface:
             # nothing was sent to root and nothing changed: the listing just read is the fresh one
             _log.info("host grant revoke credential=%r session=%s target=%s answer=gone-no-spawn", credential, session,
                       target)
-            return {"result": "gone", "count": 0, "message": "that grant was already gone: expired or revoked",
+            return {"result": "gone", "count": 0, "message": _gone_words(target, listed=True),
                     "listing": held}, 200
         left = deadline - self._clock()
         if left < MIN_SPAWN_S:
@@ -397,6 +420,8 @@ class HostGrantSurface:
                 _log.warning("host grant revoke: %s: %s", type(e).__name__, e)
                 refusal, ans = "host-grants-unreadable", {}
             began = self._began
+            if began_out is not None:
+                began_out[0] = began
         finally:
             self._release_spawn()
         # the fresh listing in every answer below takes the spawn lock itself: never call it while holding it
@@ -413,7 +438,7 @@ class HostGrantSurface:
                                              f"{'was' if n == 1 else 'were'} in force")},
                                 credential, session, target, f"removed={n}", deadline)
         return self._answer({"result": "gone", "count": 0,
-                             "message": "that grant was already gone: expired or revoked"},
+                             "message": _gone_words(target)},
                             credential, session, target, "recorded-gone", deadline)
 
     def _refused(self, name: str, credential: str, session: str, target: str, deadline: float, *,
@@ -425,7 +450,7 @@ class HostGrantSurface:
         self._invalidate()
         if name in _GONE_NAMES:
             return self._answer({"result": "gone", "count": 0,
-                                 "message": "that grant was already gone: expired or revoked"},
+                                 "message": _gone_words(target, ledger_full=True)},
                                 credential, session, target, None, deadline)
         if name in _BUSY_NAMES:
             return {"error": "busy", "name": name, "message": "not revoked; busy, tap again"}, 409
