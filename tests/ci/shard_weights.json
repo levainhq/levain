@@ -903,6 +903,7 @@
   "tests/test_slot_egress_grant_real_sig.py": 6.6,
   "tests/test_slot_egress_grant_removal.py": 3.6,
   "tests/test_slot_egress_grant_verbs.py": 11.0,
+  "tests/test_slot_egress_grants_all.py": 1.0,
   "tests/test_slot_egress_refusals.py": 2.4,
   "tests/test_slot_end_held_classes.py": 0.2,
   "tests/test_slot_end_run_capture.py": 1.2,
