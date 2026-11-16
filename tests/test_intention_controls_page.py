@@ -372,3 +372,20 @@ def test_on_a_phone_the_signed_cards_sheet_button_keeps_the_44px_floor_in_and_ou
     seen = _probe(out)
     assert seen["inModal"] and seen["outside"], seen
     assert all(h >= 44 for h in seen["inModal"] + seen["outside"]), seen
+
+
+@needs_browser
+def test_a_repeating_reminders_decisions_card_names_its_controls_by_the_series_table(tmp_path: Path, lh: Path) -> None:
+    """levain#34 r1 (L1 MED 5): the Decisions card of a repeating reminder kept Done / Snooze / Clear while the List's band row of
+    the same reminder said Done this time / Snooze this time / Stop repeating. The card now takes the names from the kernel's
+    ``series_labels`` (``levain.recur.SERIES_VERBS``); Edit keeps its word, and a plain reminder's card is unchanged above."""
+    from levain.recur import SERIES_VERBS
+
+    src, store, sp, sid, ring = _rig(tmp_path, lh)
+    sp.update(sid, recur="daily 09:00", recur_anchor=f"{TODAY_ISO}T09:00")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/#write_token=T", _steps(DESKTOP, {"eval": PROBE}))
+    seen = _probe(out)
+    assert seen["sets"] and all(labels == [SERIES_VERBS["snooze"], "Edit", SERIES_VERBS["done"], SERIES_VERBS["stop"]]
+                                for labels in seen["sets"]), seen
+    assert seen["per"] == [["1", 0, 1, 0], ["2", 2, 0, 1]], json.dumps(seen)

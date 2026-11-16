@@ -238,6 +238,39 @@ def intention_text_of(store: Any, q: Any) -> str | None:
     return got if isinstance(got, str) and got.strip() else None
 
 
+def intention_series_of(store: Any, q: Any) -> bool:
+    """Whether the intention ``q`` rings repeats, only when :func:`intention_of` names one: the host's projected
+    ``intention_series``, else a native store's own read (one cached read of the intention store, :meth:`QuestionStore._rings`).
+    False when neither says."""
+    if intention_of(store, q) is None:
+        return False
+    got = getattr(q, "intention_series", None)
+    if got is None and callable(getattr(store, "intention_series_for", None)):
+        try:
+            got = store.intention_series_for(q)
+        except Exception:  # noqa: BLE001 - a store that cannot say draws the plain words: the verbs act the same
+            got = None
+    return got is True
+
+
+def intention_state_of(store: Any, q: Any) -> str:
+    """What a card that rings an intention binds into its version, so a card built on one state of the reminder is stale on
+    another (levain#34: a "Done this time" card must not END a reminder whose rule was removed since, nor a plain "Done" advance a
+    series that appeared since). The intention's own version (``anneal_memory.spores.intention_version``) when the host projects
+    ``intention_version`` or a native store reads it; else whether it repeats. Empty when :func:`intention_of` names none."""
+    if intention_of(store, q) is None:
+        return ""
+    got = getattr(q, "intention_version", None)
+    if got is None and callable(getattr(store, "intention_version_for", None)):
+        try:
+            got = store.intention_version_for(q)
+        except Exception:  # noqa: BLE001 - a store that cannot say falls back to the series flag
+            got = None
+    if isinstance(got, str) and got:
+        return got[:16]
+    return "series" if intention_series_of(store, q) else "once"
+
+
 _log = logging.getLogger(__name__)
 
 
@@ -557,7 +590,7 @@ class QuestionStore:
         self._ready = False
         # the intention store whose open agendas ring this band's rows; None = the one under a question's own install
         self._intentions_json = Path(intentions_json) if intentions_json is not None else None
-        self._rings_seen: tuple[Any, dict[str, tuple[str, str]]] | None = None
+        self._rings_seen: tuple[Any, dict[str, tuple[str, str, bool, str]]] | None = None
 
     # --- store ---------------------------------------------------------------------------------------
     def _check_directory(self) -> None:
@@ -1025,10 +1058,13 @@ class QuestionStore:
             return self._intentions_json
         return Path(q.cwd) / ".levain" / STORE_FILE_NAME if q.cwd else None
 
-    def _rings(self, path: Path) -> dict[str, tuple[str, str]]:
-        """``{question id: (intention id, intention text)}`` for every open agenda whose stamp names a question: one read of the
-        intention store, kept while the file looks unchanged and forgotten whenever this store writes it."""
+    def _rings(self, path: Path) -> dict[str, tuple[str, str, bool, str]]:
+        """``{question id: (intention id, intention text, it repeats, its version)}`` for every open agenda whose stamp names a
+        question: one read of the intention store, kept while the file looks unchanged and forgotten whenever this store writes it."""
+        from anneal_memory.spores import intention_version
+
         from levain.intentions import list_open_readonly, ringing_ref
+        from levain.recur import is_series
 
         try:
             st = path.stat()
@@ -1037,20 +1073,21 @@ class QuestionStore:
         stamp = (str(path), st.st_mtime_ns, st.st_size)
         if self._rings_seen is not None and self._rings_seen[0] == stamp:
             return self._rings_seen[1]
-        out: dict[str, tuple[str, str]] = {}
+        out: dict[str, tuple[str, str, bool, str]] = {}
         try:
             for item in list_open_readonly(path):
                 g = item.get("germinated")
                 ref = g.get("ref") if isinstance(g, dict) else None
                 if isinstance(ref, str) and ringing_ref(item, (ref,)) == ref:
                     text = item.get("text")
-                    out[ref] = (str(item.get("id")), text if isinstance(text, str) else "")
+                    out[ref] = (str(item.get("id")), text if isinstance(text, str) else "", is_series(item),
+                                intention_version(item))
         except Exception:  # noqa: BLE001 - a store that cannot be read rings nothing here: the row stays a plain one
             return {}
         self._rings_seen = (stamp, out)
         return out
 
-    def _ring_of(self, q: Question) -> tuple[str, str] | None:
+    def _ring_of(self, q: Question) -> tuple[str, str, bool, str] | None:
         path = self._intentions_path(q)
         return None if path is None else self._rings(path).get(q.id)
 
@@ -1064,6 +1101,18 @@ class QuestionStore:
         ring = self._ring_of(q)
         return None if ring is None else ring[1]
 
+    def intention_series_for(self, q: Question) -> bool:
+        """Whether the open agenda ringing ``q`` repeats (``levain.recur.is_series``), from the same cached read as its id and words
+        (levain#34: the card then draws the series' three verb names)."""
+        ring = self._ring_of(q)
+        return ring is not None and ring[2]
+
+    def intention_version_for(self, q: Question) -> str | None:
+        """The version of the open agenda ringing ``q`` (``intention_version``), from the same cached read: what its card binds
+        (:func:`intention_state_of`), so a card is stale once the reminder moved."""
+        ring = self._ring_of(q)
+        return None if ring is None else ring[3]
+
     def intention_act(self, ref: Any, action: str, *, until: str | None = None, text: str | None = None,
                       channel: str) -> str:
         """Act on the intention an open band row rings: ``snooze`` (the agenda moves to ``until`` and loses its stamp, the
@@ -1076,7 +1125,7 @@ class QuestionStore:
         raises :class:`IntentionStale`; the operator's own input, :class:`ConsentError`. Nothing here authorises anything."""
         from anneal_memory.spores import IntentionError, intention_version
 
-        from levain.intentions import answered_descend_kind, dropped_descend_kind, guarded_intention_store
+        from levain.intentions import SERIES_END, answered_descend_kind, dropped_descend_kind, guarded_intention_store
 
         # Lock order, by intent: this store's question lock is taken first, then the intention store's own lock inside it.
         if action not in INTENTION_ACTIONS:
@@ -1142,7 +1191,9 @@ class QuestionStore:
                     else:
                         kind = (answered_descend_kind(item.get("type")) if action == "done"
                                 else dropped_descend_kind(item.get("type")))
-                        intentions.descend(sid, kind=kind, expect_disposition="agenda", expected_version=intention_version(item))
+                        # Clear is the band card's stop-repeating, and a done whose series cannot advance closes it, as before
+                        intentions.descend(sid, kind=kind, expect_disposition="agenda", expected_version=intention_version(item),
+                                           series=SERIES_END)
                 except IntentionError as exc:
                     raise IntentionStale(f"{sid} changed while you looked ({exc}): the row has moved") from None
                 finally:

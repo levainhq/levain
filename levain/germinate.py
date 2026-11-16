@@ -253,7 +253,7 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
     from levain.consent import band
     from levain.consent.questions import ANSWER_CHANNELS, DB_NAME, QuestionStore, later_date
     from levain.desk.store import CoordStore
-    from levain.intentions import answered_descend_kind, guarded_intention_store, ringing_ref
+    from levain.intentions import SERIES_END, answered_descend_kind, guarded_intention_store, ringing_ref
     from levain.recur import advance_changes, repeats_words
 
     now = now or datetime.now()
@@ -322,7 +322,8 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
                                      today=today, **advance)
                     else:
                         kind = "composted" if handed_off else answered_descend_kind(item.get("type"))
-                        store.descend(sid, kind=kind, expect_disposition="agenda",
+                        # a series that cannot advance is closed, as it always was (levain#34: the rule, not a request, ends it)
+                        store.descend(sid, kind=kind, expect_disposition="agenda", series=SERIES_END,
                                       expected_version=intention_version(item), today=today)
                 except IntentionError as exc:
                     if "changed since read" not in str(exc) and "disposition changed" not in str(exc):
@@ -429,7 +430,7 @@ def _germinate(intentions_json: Path, qdir: Path, install: Path, agent: str, tod
                                            expect_disposition="agenda", expected_version=intention_version(item),
                                            today=today)
                     if via not in ("adopted", "band", "nudge", "band-fallback"):
-                        store.descend(sid, kind="composted", expect_disposition="agenda",
+                        store.descend(sid, kind="composted", expect_disposition="agenda", series=SERIES_END,
                                       expected_version=intention_version(updated), today=today)
                     done = True
                 except IntentionError as exc:
@@ -482,7 +483,7 @@ def _check_by_pass(event_agendas: list[dict[str, Any]], woke_by: dict[str, str],
     from anneal_memory.spores import IntentionError, intention_version
 
     from levain.consent.questions import ANSWER_CHANNELS
-    from levain.intentions import dropped_descend_kind
+    from levain.intentions import SERIES_END, dropped_descend_kind
 
     for item in event_agendas:
         sid, okey = item.get("id"), item.get("origin_key")
@@ -509,7 +510,7 @@ def _check_by_pass(event_agendas: list[dict[str, Any]], woke_by: dict[str, str],
                 try:
                     if q.answer.value.strip().casefold() == "drop":      # the option, or the word typed
                         store.descend(sid, kind=dropped_descend_kind(item.get("type")), expect_disposition="agenda",
-                                      expected_version=intention_version(item), today=today)
+                                      series=SERIES_END, expected_version=intention_version(item), today=today)
                         entry["via"] = "dropped"
                     else:
                         store.update(sid, check_by=(today + timedelta(days=DEFAULT_CHECK_BY_DAYS)).isoformat(),

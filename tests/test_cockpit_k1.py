@@ -440,7 +440,7 @@ class TestRowVersions:
             "verb": "v", "status": "pending", "created_at": "c", "started_at": None, "finished_at": None,
             "result": None, "error": None, "kind": "k", "action": "a", "ts": "t", "origin_key": "ok-1",
             "target": "desk", "attention": "talk", "germinated": {"on": "2026-10-01", "target": "desk", "ref": "r"},
-            "stored_disposition": "seed",
+            "stored_disposition": "seed", "recur": "daily 09:00", "recur_anchor": "2026-10-01T09:00",
         }
         checked = 0
         for pid, spec in self._specs(env).items():

@@ -604,6 +604,10 @@ class OpenIntention:
     # the stamp germinate leaves (``{on, target, ref}``) as stored, a copy; None when absent. Versioned: a stamp landing
     # between a write's guard and its write stales the write instead of passing under it
     germinated: dict[str, Any] | None = None
+    # a repeating agenda's rule and the occurrence it last advanced to, as stored; None when absent. Versioned (levain#34): a
+    # next occurrence computed from one rule is stale on a row whose rule changed. Not on the wire (``to_dict``)
+    recur: str | None = None
+    recur_anchor: str | None = None
     # the disposition the store HOLDS (None for a key-absent row), where ``disposition`` is what the List reads (someday
     # for that row). What a cockpit label key is taken over (the row version takes the pre-fold projection of it,
     # ``cockpit.providers.intention_version_disposition``); a row built without one holds what it reads
@@ -615,7 +619,7 @@ class OpenIntention:
 
     def to_dict(self) -> dict[str, Any]:
         # the stored form is for versions and label keys, not the wire
-        return {k: v for k, v in self.__dict__.items() if k != "stored_disposition"}
+        return {k: v for k, v in self.__dict__.items() if k not in ("stored_disposition", "recur", "recur_anchor")}
 
 
 def open_intention_from(s: Mapping[str, Any]) -> "OpenIntention":
@@ -654,6 +658,8 @@ def open_intention_from(s: Mapping[str, Any]) -> "OpenIntention":
         target=(str(tg) if (tg := s.get("target")) is not None else None),
         attention=(str(at) if (at := s.get("attention")) is not None else None),
         germinated=dict(gm) if isinstance(gm := s.get("germinated"), Mapping) else None,
+        recur=(str(rc) if (rc := s.get("recur")) is not None else None),
+        recur_anchor=(str(ra) if (ra := s.get("recur_anchor")) is not None else None),
     )
 
 

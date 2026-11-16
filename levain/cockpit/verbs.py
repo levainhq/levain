@@ -395,6 +395,11 @@ def _unbuilt_fire(why: str) -> Callable[..., dict[str, Any]]:
 
 
 _PLAIN_INTENTION_ROW = lambda r: str(r.get("id", "")).startswith("intention:")   # noqa: E731
+# a List row of an open repeating agenda: it carries the ``series_labels`` facet (the row builder sets it from ``levain.recur.SERIES_VERBS``
+# exactly when ``levain.recur.is_series`` holds for the stored row). Resolve, Keep and Promote would end such a series without saying
+# so, and a then-part on it would never wake, so they are not offered there: done this time, snooze this time and stop repeating are
+_SERIES_ROW = lambda r: _PLAIN_INTENTION_ROW(r) and _facet(r, "series_labels") is not None   # noqa: E731
+_NOT_SERIES_ROW = lambda r: _PLAIN_INTENTION_ROW(r) and _facet(r, "series_labels") is None   # noqa: E731
 
 
 def _machine_part(r: dict[str, Any]) -> bool:
@@ -1028,6 +1033,8 @@ def _resolve_kinds(direction: str) -> Callable[[dict[str, Any]], dict[str, list[
         return {"intention_kind": sorted(by_type.get(str(_facet(row, "intention_type")), ()))}
     return options
 
+from levain.recur import SERIES_VERBS as _SERIES_LABELS  # noqa: E402  (the one table of the three repeating-reminder verb names)
+
 KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("intention_touch", "touch", "marks the item seen now (moves its seen-recency)", "row",
              floor="C1", tier_fn=_const("C1"), fire=_plain_intention_fire("intention_touch"), legacy_kind="intention_touch",
@@ -1035,12 +1042,22 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("intention_close", "resolve", "resolves the item (it leaves the open set; recoverable in anneal)",
              "row", fields=("intention_kind",), floor="C1", tier_fn=_const("C1"), confirm_required=True,
              reversible=False, fire=_plain_intention_fire("intention_close"), legacy_kind="intention_close", device_ok=True,
-             applies_to=_PLAIN_INTENTION_ROW, options=_resolve_kinds("descend")),
+             applies_to=_NOT_SERIES_ROW, options=_resolve_kinds("descend")),
+    # levain#34: the two verbs only a repeating agenda has (snooze this time is intention_surface_at, which keeps the series). Their
+    # labels are the one table, ``levain.recur.SERIES_VERBS``. Done this time moves to the next occurrence (also before this one is
+    # due); stop repeating is the one resolve a series takes. Both are phone verbs (a broker effect each)
+    VerbSpec("intention_done_once", _SERIES_LABELS["done"], "this occurrence is done: the reminder moves to its next one and keeps "
+             "repeating", "row", floor="C1", tier_fn=_const("C1"), reversible=False, fire=_plain_intention_fire("intention_done_once"),
+             legacy_kind="intention_done_once", device_ok=True, applies_to=_SERIES_ROW),
+    VerbSpec("intention_stop_series", _SERIES_LABELS["stop"], "ends the series: the reminder stops repeating and leaves the List "
+             "(recoverable in anneal)", "row", floor="C1", tier_fn=_const("C1"), confirm_required=True, reversible=False,
+             fire=_plain_intention_fire("intention_stop_series"), legacy_kind="intention_stop_series", device_ok=True,
+             applies_to=_SERIES_ROW),
     # confirm as intention_close (the same irreversible compost). NOT device_ok: a device's C1 is a broker pending, and the broker
     # builds only INTENTION_CANONICAL verbs (a Keep is an episode write plus a compost, no single effect); a phone cannot fire it
     VerbSpec("intention_keep", "keep", "keeps the item's words as an anneal memory episode, then composts the item (recoverable in "
              "anneal)", "row", fields=(), floor="C1", tier_fn=_const("C1"), confirm_required=True, reversible=False,
-             fire=_plain_intention_fire("intention_keep"), legacy_kind="intention_keep", applies_to=_PLAIN_INTENTION_ROW),
+             fire=_plain_intention_fire("intention_keep"), legacy_kind="intention_keep", applies_to=_NOT_SERIES_ROW),
     VerbSpec("intention_surface_at", "snooze", "sets the date the item next surfaces", "row",
              fields=("surface_at",), floor="C1", tier_fn=_surface_at_tier,
              row_tier=_const("C1"),
@@ -1067,7 +1084,9 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              # a band row for the operator only (no target a wake could send to an agent), so nothing here needs a signature;
              # offered on an agenda the operator does himself: a desk or board part is closed when it is handed off, so
              # nothing could mark it done
-             applies_to=lambda r: (_PLAIN_INTENTION_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() == "agenda"
+             # Not on a repeating agenda (levain#34): its done this time advances the series and emits no done event, so a
+             # then-part filed on it would never wake (an occurrence-completion event is a known edge)
+             applies_to=lambda r: (_NOT_SERIES_ROW(r) and str(_facet(r, "disposition") or "").strip().casefold() == "agenda"
                                    and not _machine_part(r))),
     VerbSpec("intention_set_disposition", "move", "moves the item between someday and agenda", "row",
              fields=("disposition", "surface_at"), floor="T2", tier_fn=_const("T2"),
@@ -1076,7 +1095,8 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("intention_promote", "promote", "resolves the loop into what it became, with a reference", "row",
              fields=("intention_kind", "ref"), floor="T2", tier_fn=_const("T2"), confirm_required=True,
              reversible=False, fire=_plain_intention_fire("intention_promote"), legacy_kind="intention_promote", device_ok=True,
-             applies_to=_PLAIN_INTENTION_ROW, options=_resolve_kinds("ascend")),
+             # a promote resolves the item: on a repeating agenda it would end the series (levain#34), so it is not offered there
+             applies_to=_NOT_SERIES_ROW, options=_resolve_kinds("ascend")),
     VerbSpec("intention_seed", "capture", "adds a new item that agents will read", "create",
              # next/target/attention: THE LIST's scheduled drop and talk seed (task_surfaces_1107.md); a target
              # wakes an agent with these words, so a create stays T2 whatever it carries. recur: a repeating reminder

@@ -38,6 +38,8 @@ All three share one lifecycle; the type only changes how it can resolve. Questio
 
 An intention that never resolves is a leak. Tend the garden: close intentions as they close.
 
+**A repeating reminder is the one exception.** An agenda that carries a `recur` rule is a series: each occurrence rings, and the series goes on. Never close it with `intention_close` or `intention_promote`: either one ends the whole series, not this occurrence. The List refuses both on a series; your `intention_close` tool does not, so the rule is yours to keep. A repeating reminder has three verbs of its own, on your operator's List: **Done this time** (this occurrence is over; it moves to the next one), **Snooze this time** (this occurrence moves later; the series is unchanged), and **Stop repeating** (the one verb that ends the series). They are your operator's: tell them which one you think fits, and leave the series to them.
+
 ## Germination — how an intention ages
 
 The "grow" phase is observed, never nagged. Germination is **computed** from when you last touched an intention (`seen`) and any `next` date (a marker the List shows, not a wake-up) — never stored:

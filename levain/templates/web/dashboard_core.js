@@ -2300,7 +2300,7 @@
         host.appendChild(ageEl);
       }       // the footer's clock and form, never whole days from the add
       else if (s.surface !== "band" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(el("span", "muted", s.age_days + " d"));
-      if (intend) appendRowVerbs(row, buildIntentionVerbs(s.row_id, s.actions, s.intention_text), ["Done", "Snooze"], 2);
+      if (intend) appendRowVerbs(row, buildIntentionVerbs(s.row_id, s.actions, s.intention_text, s.series_labels), s.series_labels ? [s.series_labels.done, s.series_labels.snooze] : ["Done", "Snooze"], 2);
       // a plain band row (it rings no reminder) offers the one write the kernel names on it: make it an agenda past the snooze window
       else if (s.surface === "band" && s.row_id && hasBandAgenda(s.actions)) appendRowVerbs(row, buildBandAgendaVerb(s), ["Make an agenda"], 1);
       return row;
@@ -2331,7 +2331,7 @@
       if (s.surface === "talk" && Number.isInteger(s.age_days) && s.age_days >= 0) host.appendChild(tagEl("muted", s.age_days + " d old"));
       if (s.deliver_to && s.surface === "drop" && !s.wake_line) host.appendChild(tagEl("muted", "to " + s.deliver_to));
       if (s.age_shown && s.age) host.appendChild(el("span", "muted", s.age));
-      if (verbs && s.id) appendRowVerbs(row, buildPlainIntentionVerbs(s, panelKind), panelKind === "tray" ? ["Resolve", "when?"] : null, panelKind === "tray" ? 2 : 0);
+      if (verbs && s.id) appendRowVerbs(row, buildPlainIntentionVerbs(s, panelKind), panelKind === "tray" ? (s.series_labels ? [s.series_labels.done, s.series_labels.snooze] : ["Resolve", "when?"]) : null, panelKind === "tray" ? 2 : 0);
       return row;
     }
     if (s.next) {
@@ -3666,7 +3666,35 @@
     // first-class — the item isn't ready for the lifecycle verbs yet. Then the route levers.
     if (panelKind === "tray") {
       wrap.appendChild(editBtn(wrap, s));
-      wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
+      const SL = s.series_labels;
+      const offered = (v) => Array.isArray(s.actions) && s.actions.some((x) => x && x.verb === v);
+      if (SL && offered("intention_done_once")) {
+        // a repeating reminder: done this time moves it to its next occurrence (also before this one is due), snooze this time moves
+        // this one, stop repeating ends the series; Resolve and Keep are not offered here (the kernel offers neither)
+        const done = verbBtn(SL.done, "this one is done: the reminder moves to its next time and keeps repeating", async (ev) => {
+          const b = ev.currentTarget; b.disabled = true;
+          const res = await intentionPost(s.row_id, "intention_done_once")({});
+          listReceipt(res);
+          if (res && res.ok) return;  // re-rendered
+          b.disabled = false;
+          verbErr(wrap, res);
+        });
+        done.dataset.verb = "intention_done_once";
+        wrap.appendChild(done);
+        const snz = verbBtn(SL.snooze, "move just this one to another day or time; it keeps repeating", () => openSurfaceForm(wrap, s));
+        snz.dataset.verb = "intention_surface_at";
+        wrap.appendChild(snz);
+        const stop = verbBtn(SL.stop, "stop this reminder repeating for good", () => {
+          const chars = Array.from(String(s.text || ""));
+          const ask = "Stop \u201c" + chars.slice(0, 120).join("") + (chars.length > 120 ? "\u2026" : "") + "\u201d repeating for good? It leaves the List.";
+          openRowForm(wrap, () => ({ nodes: [el("span", "muted", ask)], focus: null }), () => ({}), SL.stop, true,
+            unsureOnThrow(async (req) => { const res = await intentionPost(s.row_id, "intention_stop_series", true)(req); listReceipt(res); return res; }), LIST_ROW_STALE);
+        });
+        stop.dataset.verb = "intention_stop_series";
+        wrap.appendChild(stop);
+      } else {
+        wrap.appendChild(verbBtn("when?", "when it comes back, and who does it", () => openSurfaceForm(wrap, s)));
+      }
       // a parked someday offers the one way back: un-park (a tier change, not a resolve, so no confirm); the CAS holds the kind the page saw
       if (s.tier === "parked") {
         wrap.appendChild(verbBtn("reactivate", "un-park: back to a plain someday", async (ev) => {
@@ -3909,10 +3937,16 @@
     return !!commit && Array.isArray(actions) && actions.some((a) => a && INTENTION_CONTROLS.some((c) => c[1] === a.verb));
   }
   // `text`: the reminder's own words (never the row's filed words); "" when the host sent none, and Edit then starts empty
-  function buildIntentionVerbs(rowId, actions, text) {
+  // `series`: a repeating reminder's three verb names ({done, snooze, stop}, the kernel's one table), else null. The same four controls
+  // act (Done moves to the next occurrence, Snooze moves this one, Clear ends the series); only their words and titles change.
+  function buildIntentionVerbs(rowId, actions, text, series) {
     const wrap = el("span", "verb-actions intention-actions");
     const words = typeof text === "string" ? text : "";
-    for (const [label, verb, title] of INTENTION_CONTROLS) {
+    const S = series && series.done && series.snooze && series.stop ? series : null;
+    for (const [plainLabel, verb, plainTitle] of INTENTION_CONTROLS) {
+      const label = S && verb === "intention_done" ? S.done : S && verb === "intention_snooze" ? S.snooze : S && verb === "intention_clear" ? S.stop : plainLabel;
+      const title = !S ? plainTitle : verb === "intention_done" ? "this one is done: the reminder moves to its next time and keeps repeating"
+        : verb === "intention_snooze" ? "move just this one to a later day or time; it keeps repeating" : verb === "intention_clear" ? "stop this reminder repeating for good" : plainTitle;
       const btn = verbBtn(label, title, async (ev) => {
         if (verb === "intention_snooze") {
           openSurfaceForm(wrap, { next: null }, { label: "snooze", post: (v) => intentionPost(rowId, verb)({ until: v }),
@@ -3935,9 +3969,10 @@
           return;
         }
         if (verb === "intention_clear") {
-          const ask = words ? "Drop \u201c" + words.slice(0, 120) + (words.length > 120 ? "\u2026" : "") + "\u201d for good?" : "Drop this reminder for good?";
+          const ask = S ? (words ? "Stop \u201c" + words.slice(0, 120) + (words.length > 120 ? "\u2026" : "") + "\u201d repeating for good?" : "Stop this reminder repeating for good?")
+            : words ? "Drop \u201c" + words.slice(0, 120) + (words.length > 120 ? "\u2026" : "") + "\u201d for good?" : "Drop this reminder for good?";
           openRowForm(wrap, () => ({ nodes: [el("span", "muted", ask)], focus: null }),
-            () => ({}), "Clear", true, intentionPost(rowId, verb, true), INTENTION_STALE);
+            () => ({}), S ? S.stop : "Clear", true, intentionPost(rowId, verb, true), INTENTION_STALE);
           return;
         }
         const b = ev.currentTarget; b.disabled = true;
@@ -5490,7 +5525,7 @@
     }
     if (open && q.intention && hasIntentionControls(q.intentionActions)) {
       // a row that rings an intention is acted on by its four controls, in place of any answer box or signature
-      const wrap = buildIntentionVerbs(q.id, q.intentionActions, b ? sv(b.intention_text) : "");     // never the filed words
+      const wrap = buildIntentionVerbs(q.id, q.intentionActions, b ? sv(b.intention_text) : "", q.series);     // never the filed words
       if (card) {
         const bottom = el("div", "needs-actions needs-qa needs-intention");
         bottom.appendChild(wrap);

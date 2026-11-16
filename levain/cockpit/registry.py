@@ -213,6 +213,9 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "then": ("list[str]", _is_str_list),
     # a repeating reminder's series in plain words ("repeats weekly SUN 21:00 · next Sun 11-15 21:00"), on its List row (row 188)
     "repeat_line": ("str", _is_str),
+    # a repeating reminder's three verb names (levain.recur.SERIES_VERBS: done, snooze, stop), on every row that offers them (levain#34)
+    "series_labels": ("{done, snooze, stop: str}", lambda v: isinstance(v, dict) and set(v) == {"done", "snooze", "stop"}
+                      and all(isinstance(x, str) and x for x in v.values())),
 }
 
 

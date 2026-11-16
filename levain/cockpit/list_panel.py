@@ -27,7 +27,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
-from levain import band_view, intentions
+from levain import band_view, intentions, recur
 from levain.cockpit import board as cockpit_board
 from levain.cockpit.display_safe import visible
 from levain.cockpit.engine import INTENTION_VERBS, Cockpit, ProviderSpec, ReadContext
@@ -62,7 +62,7 @@ LIST_FACETS = INTENTION_FACETS | frozenset({
     "source", "repo", "held_until", "intention", "intention_text", "band_section", "band_carried", "band_age", "band_since", "band_later_words",
     "agenda_blocked", "time_state", "wake_day", "wake_bucket", "wake_line", "done_on", "done_kind",
     "kept_line", "kept_at", "kept_type", "kept_source",
-    "on_event", "check_by", "after", "after_text", "then", "repeat_line",
+    "on_event", "check_by", "after", "after_text", "then", "repeat_line", "series_labels",
 })
 SURFACES = ("band", "board", "intention", "talk", "drop", "kept")
 KEPT_PREFIX = "kept:"             # a kept row's id (an episode id behind it): never an ``intention:`` id, so no intention verb applies
@@ -80,7 +80,9 @@ class _Part:
     note: str = ""
     fault: str | None = None
     entity: Any = None
-    ring_repeat: dict[str, str] = field(default_factory=dict)      # a ringing band row's question id -> its reminder's repeat line
+    # a ringing band row's question id -> its reminder's repeat line (None when the line does not draw), for every ringing reminder
+    # that IS a series (``recur.is_series``): the key is what marks the band row a series, never the line
+    ring_repeat: dict[str, str | None] = field(default_factory=dict)
 
 
 def _steering(source: SubstrateSource, today: date) -> tuple[dict[str, dict[str, Any]], str | None]:
@@ -145,8 +147,6 @@ def _repeat_line(raw: dict[str, Any], nxt: Any) -> str | None:
     a row that does not repeat."""
     if raw.get("disposition") != "agenda":
         return None
-    from levain import recur
-
     rule = recur.rule_of(raw)
     if rule is None:
         return None
@@ -230,9 +230,8 @@ def _intention_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool],
         raw = steer.get(s.id, {})
         ring = intentions.ringing_ref(raw, ringing) if ringing else None
         if ring:
-            repeat = _repeat_line(raw, s.next)
-            if repeat:
-                out.ring_repeat[ring] = repeat      # the band row that replaces this one carries the line (row 188)
+            if recur.is_series(raw):
+                out.ring_repeat[ring] = _repeat_line(raw, s.next)      # the band row that replaces this one carries the line (row 188)
             continue
         surface = _surface(raw, s.disposition) if raw else "intention"
         d = next_date(s.next)
@@ -245,6 +244,10 @@ def _intention_part(source: SubstrateSource, ctx: ReadContext, seen: list[bool],
         repeat = _repeat_line(raw, s.next) if raw else None
         if repeat:
             extra["repeat_line"] = repeat      # the series' rule and its next occurrence, drawn on the row (row 188)
+        if raw and recur.is_series(raw):
+            # levain#34: a repeating row offers the series' three verbs, named by the one table. Decided by the ONE predicate on
+            # the stored rule, never by whether the display line drew
+            extra["series_labels"] = dict(recur.SERIES_VERBS)
         waits = waiting_on.get(intentions.norm_event(intentions.done_event(s.id)), [])
         if waits:
             extra["then"] = waits      # the second parts that wait on this item finishing
@@ -348,8 +351,9 @@ def _band_row(card: dict[str, Any], today: date, now: datetime, block: str | Non
         facets["band_later_words"] = later_words
     blocks = card.get("blocks")
     stored = _stored(ref, title, "band", facets.get("source", ""), facets.get("held_until"), BAND_POINTER)
-    if ring is not None:     # the reminder it rings is part of its version: a row re-rung since the page read it is stale
-        stored["germinated"] = {"intention": ring}
+    if ring is not None:     # the reminder it rings is part of its version: a row re-rung since the page read it is stale, and so
+        # is one whose reminder moved (levain#34: a stale "Done this time" must not end a reminder whose rule went)
+        stored["germinated"] = {"intention": ring, "state": card.get("intention_state", "")}
     return RowIn(
         id=ref, title=title, body=visible(blocks) if isinstance(blocks, str) and blocks else None, facets=facets,
         stored=stored)
@@ -476,7 +480,8 @@ def list_reader(source: SubstrateSource, ck: Cockpit) -> Callable[[ReadContext],
         sp = _intention_part(source, ctx, seen, ringing=ringing)
         dn = _done_part(source, ctx) if not sp.fault else _Part()
         kp = _kept_part(source, ctx)
-        band_rows = [replace(r, facets={**r.facets, "repeat_line": sp.ring_repeat[r.id[len("band:"):]]})
+        band_rows = [replace(r, facets={**r.facets, **({"repeat_line": line} if (line := sp.ring_repeat[r.id[len("band:"):]]) else {}),
+                                        "series_labels": dict(recur.SERIES_VERBS)})
                      if r.id.startswith("band:") and r.id[len("band:"):] in sp.ring_repeat else r for r in bd.rows]
         rows = [*band_rows, *sp.rows]
         skipped = [*sp.skipped, *bd.skipped, *dn.skipped]

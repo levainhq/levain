@@ -37,6 +37,7 @@ of the reference implementation's; keep them identical.
 
 from __future__ import annotations
 
+import contextvars
 import re
 import threading
 from collections.abc import Mapping
@@ -58,6 +59,12 @@ __all__ = [
     "retired_message",
     "refuse_retired_disposition",
     "guarded_intention_store",
+    "SeriesRefused",
+    "series_gate",
+    "SERIES_REFUSE",
+    "SERIES_END",
+    "SERIES_STOP",
+    "stop_series_kind",
     "KEEP_DISPOSITIONS",
     "RETIRED_DISPOSITIONS",
     "NON_COGNITION_DISPOSITIONS",
@@ -215,6 +222,32 @@ def _require_schema2_anneal() -> None:
                            "levain no longer reads): pip install -U 'anneal-memory>=2.0.0,<2.1'")
 
 
+class SeriesRefused(ValueError):
+    """A resolve the series rule refuses (levain#34): a plain resolve or promote of an open repeating agenda (it would end the
+    series without saying so), or a stop-repeating of a row that does not repeat. Raised inside the store's write transaction,
+    on the row as stored there, so nothing is written."""
+
+
+# Who may END a repeating series, decided per resolve by the CALLER's own code, never by a request: the keyword ``series`` of
+# :meth:`GuardedIntentionStore.descend`. ``refuse`` (the default: every plain resolve) refuses a series; ``end`` lets a
+# server-side rule end one (germinate closing a series that cannot advance, the band row's Clear); ``stop`` is the
+# stop-repeating verb, which must find a series. ascend never ends a series (no keyword: a promote of one is refused).
+SERIES_REFUSE, SERIES_END, SERIES_STOP = "refuse", "end", "stop"
+_SERIES_MODES = (SERIES_REFUSE, SERIES_END, SERIES_STOP)
+_SERIES_MODE: contextvars.ContextVar[str] = contextvars.ContextVar("levain_series_mode", default=SERIES_REFUSE)
+
+
+def series_gate(item: Mapping[str, Any], mode: str) -> None:
+    """THE series rule for a resolve of ``item`` (as stored): raises :class:`SeriesRefused`, else returns."""
+    from levain.recur import is_series, not_series_refusal, series_refusal
+
+    repeats = is_series(item)
+    if mode == SERIES_STOP and not repeats:
+        raise SeriesRefused(not_series_refusal(item.get("id")))
+    if mode == SERIES_REFUSE and repeats:
+        raise SeriesRefused(series_refusal(item.get("id")))
+
+
 def _build_guarded_class() -> Any:
     from anneal_memory.spores import ApplyRefused, IntentionStore
 
@@ -228,13 +261,48 @@ def _build_guarded_class() -> Any:
             _refuse_unwritable(kw.get("disposition"))
             return super().update(intention_id, **kw)
 
+        # levain#34: every resolve through this store passes ``series_gate`` INSIDE anneal's write transaction, on the row as
+        # stored under the lock (the ``_*_locked`` steps run there), so a row that became a series after the caller read it is
+        # refused, not ended. The mode travels in a context variable set by the public call, never in a stored or request field
+        def descend(self, intention_id: str, *, series: str = SERIES_REFUSE, **kw: Any) -> Any:
+            if series not in _SERIES_MODES:
+                raise ValueError(f"series must be one of {list(_SERIES_MODES)} (got {series!r})")
+            token = _SERIES_MODE.set(series)
+            try:
+                return super().descend(intention_id, **kw)
+            finally:
+                _SERIES_MODE.reset(token)
+
+        def ascend(self, intention_id: str, **kw: Any) -> Any:
+            token = _SERIES_MODE.set(SERIES_REFUSE)
+            try:
+                return super().ascend(intention_id, **kw)
+            finally:
+                _SERIES_MODE.reset(token)
+
+        def _descend_locked(self, data: Any, item: Any, *a: Any, **kw: Any) -> Any:
+            series_gate(item, _SERIES_MODE.get())
+            return super()._descend_locked(data, item, *a, **kw)
+
+        def _ascend_locked(self, data: Any, item: Any, *a: Any, **kw: Any) -> Any:
+            series_gate(item, SERIES_REFUSE)
+            return super()._ascend_locked(data, item, *a, **kw)
+
         def apply(self, effect: Any) -> Any:
-            if getattr(effect, "op", None) in ("add", "update"):
+            op = getattr(effect, "op", None)
+            if op in ("add", "update"):
                 try:
                     _refuse_unwritable(dict(getattr(effect, "args", None) or {}).get("disposition"))
                 except (ValueError, TypeError) as exc:   # RetiredDisposition, or malformed args: the base contract
                     raise ApplyRefused(str(exc)) from exc
-            return super().apply(effect)
+            # a signed descend effect was decided by its builder on the row its version pins (the cockpit row version covers
+            # ``recur`` and ``recur_anchor``): the builder refuses a plain resolve of a series and a stop of a plain row, and a row
+            # that changed since is ``precondition_lost``. An ascend effect is gated here as every ascend is
+            token = _SERIES_MODE.set(SERIES_END if op == "descend" else SERIES_REFUSE)
+            try:
+                return super().apply(effect)
+            finally:
+                _SERIES_MODE.reset(token)
 
     return GuardedIntentionStore
 
@@ -487,6 +555,19 @@ def answered_descend_kind(intention_type: Any) -> str:
 def dropped_descend_kind(intention_type: Any) -> str:
     """The descend kind that says an intention was dropped, by the intention's type."""
     return {"task": "dropped", "question": "mooted", "thought": "dropped"}.get(str(intention_type), "composted")
+
+
+def stop_series_kind(intention_type: Any) -> str:
+    """The descend kind "stop repeating" records (levain#34): ``composted`` (the series is let go, nothing is claimed done) where
+    the type takes it, else the type's dropped kind when the type takes that; a type that takes neither gets ``composted`` and
+    anneal's own refusal names the kinds it does take."""
+    from anneal_memory.spores import DESCEND_BY_TYPE
+
+    valid = DESCEND_BY_TYPE.get(str(intention_type), frozenset())
+    if "composted" in valid:
+        return "composted"
+    dropped = dropped_descend_kind(intention_type)
+    return dropped if dropped in valid else "composted"
 
 
 def open_question_ids(questions: Any) -> frozenset[str]:

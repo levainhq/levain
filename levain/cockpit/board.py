@@ -100,11 +100,12 @@ def _band_cards(question_store: Any) -> tuple[list[dict[str, Any]], str | None]:
                 carried = getattr(q, "carried", None)
                 if isinstance(carried, bool):      # a real bool only, and only beside a section it qualifies
                     card["carried"] = carried
-            from levain.consent.questions import intention_of, intention_text_of
+            from levain.consent.questions import intention_of, intention_state_of, intention_text_of
 
             ring = intention_of(question_store, q)      # the intention id this row rings, only when the host can act on it
             if ring is not None:
                 card["intention"] = ring
+                card["intention_state"] = intention_state_of(question_store, q)   # the List band row's version binds it
                 words = intention_text_of(question_store, q)
                 if words is not None:
                     card["intention_text"] = words

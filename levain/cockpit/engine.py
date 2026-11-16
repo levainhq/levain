@@ -140,7 +140,7 @@ KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "
                                     "reason", "unapplied", "cancelled_by",
                                     "agent", "tool", "consent_state", "consent_tier", "decided_at",
                                     "question_n", "question_state", "question_options", "question_section", "question_carried", "question_later", "question_later_words", "question_intention", "note_n", "note_state",
-                                    "note_open_total", "sign", "egress_state"})
+                                    "note_open_total", "sign", "egress_state", "series_labels"})
 QUESTION_VERB = "question_answer"       # the cockpit verb a question row offers (verbs.py registers it)
 # the four verbs an intention-backed row is offered in place of QUESTION_VERB
 INTENTION_VERBS = ("intention_snooze", "intention_edit", "intention_done", "intention_clear")
@@ -197,13 +197,16 @@ def value_version_of(stored: Any) -> str:
     return _sha({"stored": stored})[:16]
 
 
-def row_version_of(stored: dict[str, Any], fields: tuple[str, ...], excluded: tuple[str, ...] = ()) -> str:
+def row_version_of(stored: dict[str, Any], fields: tuple[str, ...], excluded: tuple[str, ...] = (),
+                   optional: tuple[str, ...] = ()) -> str:
     """A row's version (§4.4) over its stored record: the ONE computation, used for every rendered
-    row and by a store that recomputes it inside its own write (an intention's ``version_of``)."""
+    row and by a store that recomputes it inside its own write (an intention's ``version_of``).
+    ``optional``: versioned fields that join the payload only when they hold a value, so a row that never
+    carried one keeps the version it had before the field was versioned (a signed effect still applies)."""
     if "*" in fields:
         payload = {k: v for k, v in stored.items() if k not in excluded}
     else:
-        payload = {k: stored.get(k) for k in fields}
+        payload = {k: stored.get(k) for k in fields if k not in optional or stored.get(k) is not None}
     return _sha(payload)[:16]
 
 
@@ -242,6 +245,7 @@ class ProviderSpec:
     facets: frozenset[str] = frozenset()
     version_fields: tuple[str, ...] = ()      # ("*",) = every stored field is versioned
     version_excluded: tuple[str, ...] = ()    # stored fields named as NOT versioned (clock/derived)
+    version_optional: tuple[str, ...] = ()    # versioned fields that join the version only when set (``row_version_of``)
     search_fields: tuple[str, ...] = ()
     search_default_visible: int = 10
     read_one: Callable[["ReadContext", str], Result] | None = None
@@ -590,7 +594,7 @@ def _intention_words_digest(store: Any, q: Any) -> str:
 
 
 def _question_row_in(q: Any, later: tuple[str, str] | None = None, intention: str | None = None,
-                     words_digest: str = "") -> RowIn:
+                     words_digest: str = "", series: bool = False, state: str = "") -> RowIn:
     """One question (``levain.consent.questions.Question``) as a row: ``question:<n>``. A row carries who asked,
     when, how many options it offers and whether it is answered, and NOTHING the agent wrote (the question, the
     option labels, what it blocks): this panel is token-free on loopback, so those words are served only to a token
@@ -614,13 +618,18 @@ def _question_row_in(q: Any, later: tuple[str, str] | None = None, intention: st
             del facets["question_section"]
     if intention is not None and not answered:   # the host rings an open intention here and can act on it: four controls
         facets["question_intention"] = intention
+        if series:      # levain#34: a repeating reminder's card names its controls by the one table (they act as before)
+            from levain.recur import SERIES_VERBS
+
+            facets["series_labels"] = dict(SERIES_VERBS)
     if later is not None and not answered:     # snoozed past today (band_view.later_of): the strip draws it as LATER, not due
         facets["question_later"], facets["question_later_words"] = later
     _sign_facet(facets, q)
     return RowIn(id=f"{QUESTION_ROW_PREFIX}{q.n}", title=f"{agent} · question #{q.n}", facets=facets,
-                 # the reminder it rings is part of its version: a row re-rung since the page read it is stale there
+                 # the reminder it rings is part of its version: a row re-rung since the page read it is stale there, and so is
+                 # one whose reminder moved (``state``, levain#34: a stale "Done this time" must not end a reminder whose rule went)
                  stored={"n": q.n, "answered_at": q.answer.answered_at if answered else "open",
-                         **({"intention": facets["question_intention"], "words": words_digest}
+                         **({"intention": facets["question_intention"], "words": words_digest, "state": state}
                             if "question_intention" in facets else {})})
 
 
@@ -648,9 +657,9 @@ def _question_rows_in(store: Any, now: datetime) -> tuple[list[RowIn], int]:
     shown = {q.n: q for q in open_[:PENDING_CAP]}
     shown.update((q.n, q) for q in done)
     from levain.band_view import later_facets
-    from levain.consent.questions import intention_of
+    from levain.consent.questions import intention_of, intention_series_of, intention_state_of
     return [_question_row_in(q, None if q.answer is not None else later_facets(store, q, now), intention_of(store, q),
-                             _intention_words_digest(store, q))
+                             _intention_words_digest(store, q), intention_series_of(store, q), intention_state_of(store, q))
             for q in shown.values()], max(len(open_) - PENDING_CAP, 0)
 
 
@@ -1659,9 +1668,10 @@ class Cockpit:
             return Fault(f"agent questions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
         if q is None or row_id != f"{QUESTION_ROW_PREFIX}{q.n}":
             return Absent(f"decision {row_id!r} is gone")
-        from levain.consent.questions import intention_of
+        from levain.consent.questions import intention_of, intention_series_of, intention_state_of
 
-        return Read(rows=(_question_row_in(q, None, intention_of(store, q), _intention_words_digest(store, q)),))
+        return Read(rows=(_question_row_in(q, None, intention_of(store, q), _intention_words_digest(store, q),
+                                           intention_series_of(store, q), intention_state_of(store, q)),))
 
     def _note_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
         from levain.consent.notes import NoteStoreError
@@ -1851,7 +1861,7 @@ class Cockpit:
 
     @staticmethod
     def row_version(spec: ProviderSpec, stored: dict[str, Any]) -> str:
-        return row_version_of(stored, spec.version_fields, spec.version_excluded)
+        return row_version_of(stored, spec.version_fields, spec.version_excluded, spec.version_optional)
 
     def _row(self, spec: ProviderSpec, o: Any, row: RowIn, group: str | None, today: date) -> dict[str, Any]:
         f = row.facets

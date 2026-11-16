@@ -19,6 +19,14 @@ from typing import Any, Mapping, Optional
 RECUR_GRAMMAR = ("daily HH:MM | weekly MON[,WED,...] HH:MM (days MON TUE WED THU FRI SAT SUN) | monthly D HH:MM "
                  "(D past the month's end = its last day) | every N days HH:MM")
 RECURRING_TARGETS = ("band", "nudge")       # where a repeating agenda may ring: a desk drop composts at germination, so it has no done to advance
+# The three things an operator may do with a repeating reminder, named ONCE for every surface (the List row, the band card, the phone):
+# the words on the buttons live here and nowhere else (the page reads them from a row's ``series_labels`` facet). Placeholders that
+# say what each does in plain words: the operator picks the final ones, and changing a string here renames it everywhere.
+SERIES_VERBS = {
+    "done": "Done this time",           # this occurrence is over; the series moves to its next one (also before this one is due)
+    "snooze": "Snooze this time",       # this occurrence moves to a later time; the series is unchanged
+    "stop": "Stop repeating",           # the one verb that ends the series
+}
 _DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 _TIME = re.compile(r"([0-9]{1,2}):([0-9]{2})")
 _FMT = "%Y-%m-%dT%H:%M"
@@ -122,19 +130,50 @@ def rule_of(item: Mapping[str, Any]) -> Optional[str]:
         return None
 
 
-def advance_changes(item: Mapping[str, Any], now: datetime) -> Optional[dict[str, Any]]:
+def advance_changes(item: Mapping[str, Any], now: datetime, *, before_due: bool = False) -> Optional[dict[str, Any]]:
     """The update that ``done`` on a recurring agenda applies instead of resolving it: ``next`` and ``recur_anchor`` move to the
     first occurrence strictly after ``now`` and the germinated stamp clears so it files again then. None when the agenda carries
     no readable rule, or its next occurrence cannot be computed (the caller then resolves it as it always did: a series that
-    cannot advance is closed, never left stamped and stuck)."""
+    cannot advance is closed, never left stamped and stuck). ``before_due``: the operator says "done this time" BEFORE the
+    pending occurrence is due, so the next one is the first after that pending occurrence too (without it, the pending one is
+    the first strictly after ``now`` and nothing would move); a ringing or overdue one is already behind ``now``, so it is the same.
+    A DATE-ONLY pending occurrence (a snooze to a day) covers that whole calendar day, with or without ``before_due``: the
+    occurrence done is that day's, so the next one is after the day's last minute, never later the same day."""
     rule = rule_of(item)
     if rule is None:
         return None
+    after = now.replace(second=0, microsecond=0)
+    nxt_raw = item.get("next")
+    pending = _parse_when(nxt_raw)
+    if pending is not None and isinstance(nxt_raw, str) and "T" not in nxt_raw:
+        pending = pending.replace(hour=23, minute=59)       # the day's last wall-clock minute: the exclusive lower bound
+        # Known edge (reachability line): seconds stay 0 here, as in ``after``; at 23:59:xx of that day ``after`` already equals it
+        if pending > after:
+            after = pending
+    elif before_due and pending is not None and pending > after:
+        after = pending
     try:
-        nxt = next_occurrence(rule, now.replace(second=0, microsecond=0), item.get("recur_anchor") or item.get("next")).strftime(_FMT)
+        nxt = next_occurrence(rule, after, item.get("recur_anchor") or item.get("next")).strftime(_FMT)
     except ValueError:
         return None
     return {"next": nxt, "recur_anchor": nxt, "germinated": {}}
+
+
+def is_series(item: Mapping[str, Any]) -> bool:
+    """An open agenda that repeats (a rule that reads): its close goes through ``SERIES_VERBS``, never a plain resolve."""
+    return item.get("disposition") == "agenda" and rule_of(item) is not None
+
+
+def series_refusal(intention_id: Any) -> str:
+    """The ONE refusal text for a write that would end a repeating agenda without saying so (a plain resolve, a Keep, a promote):
+    it names the three verbs by the table, on every surface that refuses it (the write route, the phone effect, the store)."""
+    return (f"{intention_id} repeats: resolving it would end the series. Use '{SERIES_VERBS['done']}' to move to the next one, "
+            f"'{SERIES_VERBS['snooze']}' to move this one, or '{SERIES_VERBS['stop']}' to end it")
+
+
+def not_series_refusal(intention_id: Any) -> str:
+    """The refusal text for a series verb on a row that does not repeat."""
+    return f"{intention_id} does not repeat: there is no series to stop or move on"
 
 
 def repeats_words(item: Mapping[str, Any]) -> str:

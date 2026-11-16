@@ -1520,3 +1520,32 @@ def test_when_form_keeps_a_date_only_row_date_only_and_prefills_a_timed_rows_min
     posts = [(p["verb"], p["params"]) for p in _posts(out)]
     assert ("intention_surface_at", {"surface_at": "2020-01-01"}) in posts, posts
     assert IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention").get(ids["a"])["next"] == "2020-01-01"
+
+
+# --- levain#34: the three verbs of a repeating reminder, named by the one table, on the List row and the band card -----------------
+
+
+@needs_browser
+def test_a_repeating_reminders_list_row_offers_the_three_series_verbs_and_no_resolve_or_keep(tmp_path: Path) -> None:
+    from levain import recur
+
+    root, src, _ids = _install(tmp_path)
+    _seed_more(root)
+    store = IntentionStore(root / ".levain" / "memory.spores.json", id_prefix="intention")
+    store.add(type="task", text="weekly review", disposition="agenda", target="nudge", next="2020-01-05T21:00",
+              recur="weekly SUN 21:00", recur_anchor="2020-01-05T21:00")
+    store.add(type="task", text="one-off thing", disposition="agenda", target="nudge", next="2020-01-05T21:00")
+    pick = lambda text: (f"[...{TRAY}.querySelectorAll('.sp-results .row')].find(r => "     # noqa: E731
+                         f"(r.querySelector('.clause') || {{}}).textContent === {json.dumps(text)})")
+    labels = lambda text: (f"[...{pick(text)}.querySelectorAll('.verb-btn')].map(b => b.textContent)")     # noqa: E731
+    with _serve(src, write_token=TOKEN, surface_tokens={"browser": TOKEN}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"emulate": {"w": 1000, "h": 1000, "dpr": 1}},
+            *_reload(),
+            {"until": f"{TRAY} && {pick('weekly review')} && {pick('one-off thing')} && 1"},
+            {"eval": f"JSON.stringify({{rep: {labels('weekly review')}, plain: {labels('one-off thing')}}})"},
+        ])
+    got = json.loads(out["values"][-1])
+    assert {recur.SERIES_VERBS["done"], recur.SERIES_VERBS["snooze"], recur.SERIES_VERBS["stop"]} <= set(got["rep"]), got
+    assert not {"Resolve", "keep", "when?"} & set(got["rep"]), got
+    assert "Resolve" in got["plain"] and recur.SERIES_VERBS["done"] not in got["plain"], got     # a one-off agenda is unchanged

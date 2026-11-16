@@ -218,6 +218,8 @@
       time_state: ["now", "later", "someday", "done"].indexOf(f.time_state) >= 0 ? f.time_state : null,
       wake_line: typeof f.wake_line === "string" && f.wake_line ? f.wake_line : null,
       repeat_line: typeof f.repeat_line === "string" && f.repeat_line ? f.repeat_line : null,
+      // a repeating reminder's three verb names (the kernel's one table): done / snooze / stop; null when the row does not repeat
+      series_labels: f.series_labels && typeof f.series_labels === "object" && ["done", "snooze", "stop"].every((k) => typeof f.series_labels[k] === "string" && f.series_labels[k]) ? { done: f.series_labels.done, snooze: f.series_labels.snooze, stop: f.series_labels.stop } : null,
       wake_bucket: ["tomorrow", "week", "later"].indexOf(f.wake_bucket) >= 0 ? f.wake_bucket : null,
       done_on: typeof f.done_on === "string" && f.done_on ? f.done_on : null,
       done_kind: typeof f.done_kind === "string" && f.done_kind ? f.done_kind : null,
@@ -413,6 +415,7 @@
                             sign: signOf(f),
                             // the intention a row rings, and only the actions the kernel offered on it: the four controls draw from these
                             intention: typeof f.question_intention === "string" && f.question_intention ? f.question_intention : "",
+                            series: f.series_labels && typeof f.series_labels === "object" && ["done", "snooze", "stop"].every((k) => typeof f.series_labels[k] === "string" && f.series_labels[k]) ? { done: f.series_labels.done, snooze: f.series_labels.snooze, stop: f.series_labels.stop } : null,
                             intentionActions: (Array.isArray(r.actions) ? r.actions : []).filter((a) => a && typeof a.verb === "string" && a.verb.indexOf("intention_") === 0) };
         }
         // a desk review item: its state, whether it is "yours to clear", and the one verb the kernel offers on it

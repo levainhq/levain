@@ -98,9 +98,13 @@ from levain.intentions import (  # the operator-I/O disposition vocabulary (anne
     RETIRED_KEEP_NOTE_MSG,
     RETIRED_LOOP_MSG,
     RETIRED_DISPOSITIONS,
+    SERIES_REFUSE,
+    SERIES_STOP,
     TRAY_WRITE_DISPOSITIONS,
     WRITE_DISPOSITIONS,
     RetiredDisposition,
+    SeriesRefused,
+    stop_series_kind,
     retired_message,
     guarded_intention_store,
     refuse_retired_disposition,
@@ -707,6 +711,9 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     ``undo`` (restore a Class-A edit's backup)."""
     if not isinstance(req, dict):
         raise EditError("bad_request", 400, "request must be a JSON object")
+    if "ends_series" in req:
+        # levain#34: who may end a repeating series is the server's own code (the stop-repeating verb), never a request key
+        raise EditError("bad_request", 400, ENDS_SERIES_REFUSAL)
     kind = req.get("kind")
     # an intention kind's row version, compared by anneal inside its write transaction (the cockpit
     # passes the Row.version it read); None keeps a caller's write unguarded, as before
@@ -739,6 +746,10 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_intention_verb(scope, req, now, "descend", guard)
         if kind == "intention_promote":
             return _apply_intention_verb(scope, req, now, "ascend", guard)
+        if kind == "intention_done_once":
+            return _apply_intention_done_once(scope, req, now, guard)
+        if kind == "intention_stop_series":
+            return _apply_intention_verb(scope, req, now, "descend", guard, series=SERIES_STOP)
         if kind == "intention_keep":
             return _apply_intention_keep(scope, req, now, guard)
         if kind == "intention_seed":
@@ -1612,6 +1623,8 @@ def _apply_entity_name(scope: WriteScope, req: dict[str, Any], now: str | None) 
 _VERB_KINDS = frozenset(
     {
         "intention_touch", "intention_close", "intention_promote", "episode_tombstone", "intention_keep",
+        # levain#34: the two verbs of a repeating agenda (done this time, stop repeating)
+        "intention_done_once", "intention_stop_series",
         # Slice 3b — the operator-I/O write kinds (capture + disposition + schedule +
         # the forming-workbench metadata edit: text / reclassify-type / re-tier):
         "intention_seed", "intention_set_disposition", "intention_surface_at", "intention_update", "intention_retarget", "intention_then",
@@ -1831,9 +1844,13 @@ def _refuse_if_ringing(scope: WriteScope, store: Any, intention_id: str) -> None
 
 def _apply_intention_verb(
     scope: WriteScope, req: dict[str, Any], now: str | None,
-    verb: Literal["touch", "descend", "ascend"], guard: "_VersionGuard | None" = None,
+    verb: Literal["touch", "descend", "ascend"], guard: "_VersionGuard | None" = None, *, series: str = SERIES_REFUSE,
 ) -> dict[str, Any]:
-    """A Class-B intention lifecycle verb: ``touch`` (engage — non-destructive),
+    """``series`` (descend only, levain#34): who may end a repeating agenda, from the CALLER's code, never the request:
+    ``SERIES_REFUSE`` (every plain resolve) or ``SERIES_STOP`` (the stop-repeating verb: the row must repeat, and it is let go
+    under ``levain.intentions.stop_series_kind``). The store checks it on the row inside its write transaction (``levain.intentions.series_gate``).
+
+    A Class-B intention lifecycle verb: ``touch`` (engage — non-destructive),
     ``descend`` (compost downward) or ``ascend`` (transmute upward). The two
     resolving verbs are destructive (the loop leaves the open set) → confirm-gated
     and carry a ``kind`` anneal validates against the intention's type; ``ascend`` also
@@ -1851,7 +1868,10 @@ def _apply_intention_verb(
     intention_id = _require_str(req, "intention_id")
     intention_kind: str | None = None
     ref: str | None = None
-    if verb == "descend":
+    stop = verb == "descend" and series == SERIES_STOP
+    if stop:      # the kind is the row's type's (``stop_series_kind``), read below from the store
+        _require_confirm(req, f"stop {intention_id} repeating? the series ends (it stays recoverable in anneal's resolved set)")
+    elif verb == "descend":
         intention_kind = _require_str(req, "intention_kind")
         _require_confirm(
             req,
@@ -1874,6 +1894,16 @@ def _apply_intention_verb(
         raise EditError("not_found", 404, "no intention store yet")
     store = guarded_intention_store(paths.intentions_json)
     _refuse_if_ringing(scope, store, intention_id)
+    if stop:
+        # the series is let go (composted, nothing claimed done) where the row's type takes it; anneal re-validates the kind
+        # against the type inside its transaction
+        try:
+            current_row = store.get(intention_id)
+        except OSError as exc:
+            raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
+        if current_row is None:
+            raise EditError("not_found", 404, f"no intention {intention_id!r}")
+        intention_kind = stop_series_kind(current_row.get("type"))
     ascend_expect: str | None = None  # the raw disposition read for the ascend CAS (below)
     # The descend CAS uses the CLIENT render-time SNAPSHOT (intention-173) — validated + normalized up
     # front (a non-string raises bad_verb_arg BEFORE the store touch). Presence is the gate: an
@@ -1920,7 +1950,7 @@ def _apply_intention_verb(
             # rather than compost a now-live loop under a Keep-"remove" intent [codex L3 HIGH,
             # intention-173]. The snapshot must be the CLIENT's (a server-fresh read would already
             # reflect the re-route and pass vacuously). Absent key ⇒ no CAS (back-compat).
-            descend_kwargs: dict[str, Any] = {"kind": intention_kind}
+            descend_kwargs: dict[str, Any] = {"kind": intention_kind, "series": series}
             if descend_has_snapshot:
                 descend_kwargs["expect_disposition"] = descend_expect
             store.descend(intention_id, **descend_kwargs, **_guard_kwargs(guard))
@@ -1930,6 +1960,8 @@ def _apply_intention_verb(
             # concurrent writer flipped it to a note (or anything else) before this resolve.
             store.ascend(intention_id, kind=intention_kind, ref=ref, expect_disposition=ascend_expect,
                          **_guard_kwargs(guard))
+    except SeriesRefused as exc:     # levain#34: a plain resolve / promote of a series, or a stop of a row that does not repeat
+        raise EditError("series", 409, str(exc)) from exc
     except ValueError as exc:  # bad kind for the intention's type (anneal arg validation)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except IntentionError as exc:  # unknown id / already resolved / store drift / CAS mismatch
@@ -1955,11 +1987,12 @@ def _apply_intention_verb(
         extra["prior_disposition"] = disposition_of({"disposition": ascend_expect})
     elif descend_has_snapshot:
         extra["prior_disposition"] = disposition_of({"disposition": descend_expect})
+    action = "stop_series" if stop else verb
     edit_id = _audit_verb(
-        scope.ledger_root, kind=_AUDIT_KINDS[verb], action=verb,
+        scope.ledger_root, kind="intention_stop_series" if stop else _AUDIT_KINDS[verb], action=action,
         target=f"intention:{intention_id}", now=now, extra=extra,
     )
-    out = {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": verb}
+    out = {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": action}
     if verb == "descend":
         out.update(_wake_after_resolve(scope, intention_id))
     return out
@@ -2067,6 +2100,86 @@ def _keep_compost(store: Any, intention_id: str, expect: Any, guard: "_VersionGu
     store.descend(intention_id, **kwargs, **_guard_kwargs(guard))
 
 
+def _local_now() -> datetime:
+    """The local wall clock "done this time" reads (every stored minute is local wall time); one seam for a test to pin."""
+    return datetime.now()
+
+
+def _refuse_series_resolve(store: Any, intention_id: str) -> None:
+    """A Keep of an open repeating agenda is refused BEFORE its episode is written (levain#34): its compost would end the
+    series. The compost itself is refused again by the store, on the row inside its transaction (``series_gate``)."""
+    from levain.recur import is_series, series_refusal
+
+    try:
+        row = store.get(intention_id)
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
+    if isinstance(row, dict) and row.get("status") != "resolved" and is_series(row):
+        raise EditError("series", 409, series_refusal(intention_id))
+
+
+ENDS_SERIES_REFUSAL = ("ends_series is not a request field: a repeating reminder ends only through its stop-repeating verb "
+                       "(intention_stop_series)")
+DONE_ONCE_UNBOUND = ("done this time binds the row version you read (expected_version): without it a resend could not be told "
+                     "from a second done, and would skip an occurrence")
+
+
+def _apply_intention_done_once(
+    scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None,
+) -> dict[str, Any]:
+    """"Done this time" on a repeating agenda (levain#34): its ``next`` moves to the next occurrence, also before this one is due
+    (``levain.recur.advance_changes``, the one computation), and the row stays open. Non-destructive: no confirm.
+
+    Bound twice. The caller names the row version it read (``expected_version``, required): a resend of the same done finds
+    the row moved and is refused as stale, so it advances once. And the update is compare-and-set on the WHOLE fresh row the
+    advance was computed from (anneal's ``intention_version`` of it: ``recur``, ``recur_anchor``, ``next`` and every other
+    field), so a rule or occurrence changed between this read and the write is refused, never overwritten with an advance
+    computed for the old one."""
+    from anneal_memory.spores import IntentionError, intention_version  # lazy
+    from levain.recur import advance_changes, is_series, not_series_refusal
+
+    intention_id = _require_str(req, "intention_id")
+    if guard is None or guard.expected is None:
+        raise EditError("bad_request", 400, DONE_ONCE_UNBOUND)
+    paths = scope.anneal
+    if not paths.intentions_json.is_file():
+        raise EditError("not_found", 404, "no intention store yet")
+    store = guarded_intention_store(paths.intentions_json)
+    _refuse_if_ringing(scope, store, intention_id)
+    try:
+        row = store.get(intention_id)
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
+    if not isinstance(row, dict) or row.get("status") == "resolved":
+        raise EditError("stale", 409, "the item was resolved or removed since it was read")
+    try:
+        guard.version_of(row)                     # the version the caller read must be the fresh row's
+    except IntentionError as exc:
+        raise _intention_refusal(guard, exc, store, intention_id) from exc
+    if guard.found != guard.expected:
+        raise EditError("stale", 409, "the item changed since it was read; re-read it and retry")
+    advance = advance_changes(row, _local_now(), before_due=True) if is_series(row) else None
+    if advance is None:
+        raise EditError("bad_verb_arg", 422, not_series_refusal(intention_id))
+    try:
+        store.update(intention_id, expect_disposition="agenda", expected_version=intention_version(row), **advance)
+    except ValueError as exc:
+        raise EditError("bad_verb_arg", 422, str(exc)) from exc
+    except IntentionError as exc:     # read back, never matched by message: a row that moved since the read is stale
+        try:
+            cur = store.get(intention_id)
+        except Exception:  # noqa: BLE001 - the original refusal stands
+            cur = row
+        if cur is None or intention_version(cur) != intention_version(row):
+            raise EditError("stale", 409, "the item changed since it was read; re-read it and retry") from exc
+        raise EditError("verb_failed", 422, str(exc)) from exc
+    except OSError as exc:
+        raise EditError("store_unavailable", 503, f"intention store unavailable: {exc}") from exc
+    edit_id = _audit_verb(scope.ledger_root, kind="intention_done_once", action="done_once",
+                          target=f"intention:{intention_id}", now=now, extra={"next": advance["next"]})
+    return {"ok": True, "id": edit_id, "source": f"intention:{intention_id}", "action": "done_once", "next": advance["next"]}
+
+
 def _apply_intention_keep(
     scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None,
 ) -> dict[str, Any]:
@@ -2094,6 +2207,7 @@ def _apply_intention_keep(
         raise EditError("not_found", 404, "no intention store yet")
     store = guarded_intention_store(paths.intentions_json)
     _refuse_if_ringing(scope, store, intention_id)
+    _refuse_series_resolve(store, intention_id)       # a Keep composts the item: on a repeating agenda that ends the series
     intention = store.get(intention_id)
     if not isinstance(intention, dict) or intention.get("status") == "resolved":
         raise EditError("stale", 409, "the item was resolved or removed since it was read")

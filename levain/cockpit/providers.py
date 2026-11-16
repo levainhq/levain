@@ -62,14 +62,18 @@ HANDOFF_FRESH_DAYS = 7
 
 # the verbs an intention panel offers (design §4.2); anneal still refuses a verb the intention's type forbids
 INTENTION_ROW_VERBS = ("intention_touch", "intention_close", "intention_surface_at", "intention_update", "intention_retarget", "intention_then",
-                   "intention_set_disposition", "intention_promote")
+                   "intention_set_disposition", "intention_promote", "intention_done_once", "intention_stop_series")
+# recur / recur_anchor (levain#34): a repeating agenda's rule and the occurrence it last advanced to are versioned, so a write or
+# a signed effect computed from one rule (done this time's next occurrence) is stale on a row whose rule changed since
 INTENTION_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen",
-                "origin_key", "target", "attention", "germinated", "stored_disposition")
+                "origin_key", "target", "attention", "germinated", "recur", "recur_anchor", "stored_disposition")
 # seen alone never stales a write (a touch that clears an elapsed next does); origin_key is store-assigned
 # once and names the label resource, so it is carried, not versioned; stored_disposition is the raw value the
 # label key is taken over, carried beside ``disposition`` (the versioned projection, ``intention_version_disposition``)
 INTENTION_VERSION_EXCLUDED = ("seen", "origin_key", "stored_disposition")
 INTENTION_VERSION_FIELDS = tuple(f for f in INTENTION_STORED if f not in INTENTION_VERSION_EXCLUDED)
+# versioned only when set: a row that does not repeat keeps the exact version it had before they were versioned
+INTENTION_VERSION_OPTIONAL = ("recur", "recur_anchor")
 INTENTION_FACETS = frozenset({
     "disposition", "domain", "tier", "salience", "intention_type", "due", "fires", "overdue_days",
     "handoff_expired", "last_seen", "age_days",
@@ -382,7 +386,8 @@ def intention_row_version(raw: Mapping[str, Any]) -> str:
 
 def intention_view_version(intention: Any) -> str:
     """The same ``version`` from an intention already built for the view (an ``OpenIntention``): what the TUI binds a tier write to."""
-    return row_version_of(intention_stored(intention), INTENTION_VERSION_FIELDS, INTENTION_VERSION_EXCLUDED)
+    return row_version_of(intention_stored(intention), INTENTION_VERSION_FIELDS, INTENTION_VERSION_EXCLUDED,
+                          INTENTION_VERSION_OPTIONAL)
 
 
 # a fresh install has no intention store until something is dropped: each panel says what fills it
@@ -723,7 +728,8 @@ def _tomb_gate(store: Any, origin_key: str, effect_id: Any, episode_id: str) -> 
 
 # what a broker fire reads as in Recent edits: a past-tense phrase per verb, then the thing it touched, then where it came from
 _EDIT_PHRASES = {
-    "intention_touch": "marked seen", "intention_close": "resolved", "intention_surface_at": "rescheduled", "intention_retarget": "retargeted", "intention_update": "edited",
+    "intention_touch": "marked seen", "intention_close": "resolved", "intention_done_once": "moved to the next occurrence of", "intention_stop_series": "stopped repeating",
+    "intention_surface_at": "rescheduled", "intention_retarget": "retargeted", "intention_update": "edited",
     "intention_then": "filed a then-part for",
     "list_intake": "added a line", "intention_set_disposition": "moved", "intention_promote": "promoted", "intention_keep": "kept as memory", "intention_seed": "added", "episode_tombstone": "deleted episode",
     "operator_state": "set the state line", "section_edit": "edited", "config": "edited", "entity_name": "renamed the entity",
@@ -1607,6 +1613,7 @@ def build_default_cockpit(
     intention_common = dict(
         facets=INTENTION_FACETS,
         version_fields=INTENTION_VERSION_FIELDS, version_excluded=INTENTION_VERSION_EXCLUDED,
+        version_optional=INTENTION_VERSION_OPTIONAL,
         search_fields=("title", "body", "domain"), edit_class=CLASS_B,
     )
     ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source),

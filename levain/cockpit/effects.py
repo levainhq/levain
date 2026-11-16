@@ -413,7 +413,7 @@ INTENTION_STORE_ASSIGNED = ("id", "seen", "created", "origin_key", "notes", "res
 # the fields an update-shaped intention effect may change (anneal's update args, ``add_note`` excluded); ``target`` and
 # ``attention`` reach an effect only through intention_retarget's builder (the edit verb's builder refuses both)
 INTENTION_UPDATE_FIELDS = ("type", "tier", "next", "text", "salience", "domain", "pointer", "disposition", "target",
-                       "attention")
+                       "attention", "recur_anchor", "germinated")      # the last two move only with ``intention_done_once``: a series' next occurrence
 
 
 def create_origin_key(pending_id: str, idx: int) -> str:
@@ -1002,14 +1002,28 @@ def _ce_surface_at(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, 
     return _existing_effect(pre, {"next": _norm_date(params["surface_at"])}, version_of)
 
 
-def _ce_resolve(direction: str) -> Callable[..., Effect]:
+def _series_now() -> datetime:
+    """The local wall clock a "done this time" reads (every stored minute is local wall time); one seam for a test to pin."""
+    return datetime.now().replace(second=0, microsecond=0)
+
+
+def _series_refusal(pre: Mapping[str, Any]) -> str:
+    from levain.recur import series_refusal
+
+    return series_refusal(pre.get("id"))
+
+
+def _ce_resolve(direction: str, *, ends_series: bool = False) -> Callable[..., Effect]:
     def build(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
               version_of: Callable[..., str]) -> Effect:
         from anneal_memory.spores import ASCEND_BY_TYPE, DESCEND_BY_TYPE
-        from levain.intentions import is_note
+        from levain.intentions import is_note, stop_series_kind
+        from levain.recur import is_series
 
         pre = _require_open(pre)
-        kind = params.get("intention_kind")
+        if is_series(pre) and not ends_series:      # a plain resolve or a promote would end the series without saying so
+            raise ValueError(_series_refusal(pre))
+        kind = stop_series_kind(pre.get("type")) if ends_series else params.get("intention_kind")
         valid = (ASCEND_BY_TYPE if direction == "ascend" else DESCEND_BY_TYPE).get(str(pre.get("type")), frozenset())
         if kind not in valid:
             raise ValueError(f"{direction} kind {kind!r} is invalid for a {pre.get('type')!r} intention")
@@ -1026,6 +1040,35 @@ def _ce_resolve(direction: str) -> Callable[..., Effect]:
                 raise ValueError("ascend requires a ref")
         return _existing_effect(pre, {"status": "resolved", "resolution": resolution}, version_of)
     return build
+
+
+def _ce_done_once(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
+                  version_of: Callable[..., str]) -> Effect:
+    """"Done this time" on a repeating agenda: the series moves to its next occurrence (``levain.recur.advance_changes``, the one
+    computation), also before this one is due; the row stays open. A row that does not repeat has nothing to advance."""
+    from levain.recur import advance_changes, is_series, not_series_refusal
+
+    pre = _require_open(pre)
+    if params:
+        raise ValueError("done this time takes no parameters")
+    advance = advance_changes(pre, _series_now(), before_due=True) if is_series(pre) else None
+    if advance is None:
+        raise ValueError(not_series_refusal(pre.get("id")))
+    return _existing_effect(pre, advance, version_of)
+
+
+def _ce_stop_series(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
+                    version_of: Callable[..., str]) -> Effect:
+    """"Stop repeating": the one resolve a repeating agenda takes (``levain.intentions.stop_series_kind``: composted, the series
+    let go and nothing claimed done, where the type takes it)."""
+    from levain.recur import is_series, not_series_refusal
+
+    pre = _require_open(pre)
+    if params:
+        raise ValueError("stop repeating takes no parameters")
+    if not is_series(pre):
+        raise ValueError(not_series_refusal(pre.get("id")))
+    return _ce_resolve("descend", ends_series=True)(params, pre, origin_key=origin_key, version_of=version_of)
 
 
 def _ce_undo_edit(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin_key: str | None,
@@ -1058,6 +1101,8 @@ INTENTION_CANONICAL: dict[str, Callable[..., Effect]] = {
     "intention_surface_at": _ce_surface_at,
     "intention_retarget": _ce_retarget,
     "intention_close": _ce_resolve("descend"),
+    "intention_done_once": _ce_done_once,
+    "intention_stop_series": _ce_stop_series,
     "intention_promote": _ce_resolve("ascend"),
     "intention_undo_edit": _ce_undo_edit,
     "intention_undo_seed": _ce_undo_seed,

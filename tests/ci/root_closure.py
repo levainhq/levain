@@ -378,7 +378,7 @@ LAZY_SITES = {
     'levain/cockpit/engine.py::Cockpit._note_decision_one::from levain.consent.notes import NoteStoreError': 'operator',
     # operator: a ``Cockpit`` method; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``, not in the closure
     'levain/cockpit/engine.py::Cockpit._question_decision_one::from levain.consent.questions import QuestionStoreError': 'operator',
-    'levain/cockpit/engine.py::Cockpit._question_decision_one::from levain.consent.questions import intention_of': 'operator',
+    'levain/cockpit/engine.py::Cockpit._question_decision_one::from levain.consent.questions import intention_of, intention_series_of, intention_state_of': 'operator',
     # operator: <- ``Cockpit._compose_decisions`` / ``Cockpit._consent_decision_one`` only; ``Cockpit(`` is constructed only in ``levain/cockpit/providers.py``
     'levain/cockpit/engine.py::_consent_rows_in::from levain.consent.listing import egress_state_of': 'operator',
     'levain/cockpit/engine.py::_egress_lookup_of::from levain.consent.listing import egress_reading': 'operator',
@@ -387,7 +387,9 @@ LAZY_SITES = {
     'levain/cockpit/engine.py::_note_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
     # operator: the same function as the row below (``Cockpit._compose_decisions`` only)
     'levain/cockpit/engine.py::_question_rows_in::from levain.band_view import later_facets': 'operator',
-    'levain/cockpit/engine.py::_question_rows_in::from levain.consent.questions import intention_of': 'operator',
+    'levain/cockpit/engine.py::_question_rows_in::from levain.consent.questions import intention_of, intention_series_of, intention_state_of': 'operator',
+    # operator: <- ``_question_rows_in`` and ``Cockpit._question_decision_one`` only (both above)
+    'levain/cockpit/engine.py::_question_row_in::from levain.recur import SERIES_VERBS': 'operator',
     'levain/cockpit/engine.py::_intention_words_digest::from levain.consent.questions import intention_text_of': 'operator',
     'levain/cockpit/engine.py::_question_rows_in::from levain.consent.listing import PENDING_CAP': 'operator',
     # operator: <- ``CockpitDB._ensure_schema_txn`` <- ``_ensure_schema``; ``CockpitDB(`` is constructed in ``levain/cli.py`` and ``cockpit/{broker,keys,sign_client}.py`` only (``git grep -n 'CockpitDB(' -- levain``)
