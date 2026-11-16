@@ -131,3 +131,76 @@ def test_a_source_the_primary_reports_with_the_same_words_is_not_repeated_per_re
     repo_ev = {"flow": _evidence(unreadable=u), "levain": _evidence(unreadable=u)}
     board = bs.derive_all(bs.fold(LINES), repo_ev["flow"], now=NOW, repo_evidence=repo_ev, primary_repo="flow")
     assert sum("seats unreadable" in p for p in board.problems) == 1
+
+
+# ---- levain#72 review hardening (L3 rounds on the earlier isolated cut; the cores landed as a8d6182cb and c8b545539) ----
+
+def _decide(iid: str) -> str:
+    return json.dumps({"v": 1, "op": "decide", "id": iid, "at": "2026-11-12T11:00:00Z", "by": "t", "decision": "cut",
+                       "words": "w", "date": "2026-11-12"})
+
+
+def _both(lines, flow_ev, levain_ev):
+    repo_ev = {"flow": flow_ev, "levain": levain_ev}
+    return bs.derive_all(bs.fold(lines), flow_ev, now=NOW, repo_evidence=repo_ev, primary_repo="flow")
+
+
+def test_a_foreign_repos_stale_evidence_is_an_audit_line_naming_the_repo():
+    old = _evidence(main=[DEP_LANDED_ON_B], fetched_at="2026-11-01T00:00:00Z")
+    board = _both(LINES, _evidence(), old)
+    assert any(a.kind == "unknown" and a.id is None and "levain" in a.why and "stale_evidence" in a.why for a in board.audit), board.audit
+
+
+def test_a_foreign_repos_unreadable_source_is_an_audit_line_not_only_a_problem():
+    board = _both(LINES, _evidence(), _evidence(main=[DEP_LANDED_ON_B], unreadable={"chain": "git log failed"}))
+    hits = [a for a in board.audit if a.kind == "unknown" and a.id is None]
+    assert [a.why for a in hits] == ["levain: chain unreadable: git log failed"], board.audit
+
+
+def test_a_clean_foreign_repo_adds_no_audit_line():
+    assert _both(LINES, _evidence(), _evidence(main=[DEP_LANDED_ON_B])).audit == ()
+
+
+def test_a_foreign_repos_unknown_trailer_id_is_on_the_board_naming_the_repo():
+    typo = {"sha": "a" * 40, "date": "2026-11-12T12:00:00Z", "items": ["levain#99"], "closes": []}
+    board = _both(LINES, _evidence(), _evidence(main=[DEP_LANDED_ON_B, typo]))
+    hits = [a for a in board.audit if a.kind == "unknown_id_in_trailer"]
+    assert [(a.id, a.why) for a in hits] == [("levain#99", "levain: named by main aaaaaaaaa; the store does not hold it")], board.audit
+
+
+def test_a_foreign_repos_unattributed_commit_is_on_the_board_though_its_item_reads_done():
+    dirty = _evidence(main=[DEP_LANDED_ON_B], unattributed=[{"sha": "f" * 40, "subject": "drive-by fix"}])
+    board = _both(LINES, _evidence(), dirty)
+    assert _by(board)["flow#5"].state == "ready"
+    assert [a.why for a in board.audit if a.kind == "unattributed_work"] == ["levain: fffffffff drive-by fix"], board.audit
+
+
+def test_flows_shared_seats_are_said_once_not_once_per_repo():
+    """The flow-supplied extra (seats, waiters) lands in every repo's evidence; an unknown id it names is one finding."""
+    seats = {"seats": [{"name": "s1", "items": ["levain#98"]}]}
+    board = _both(LINES, _evidence(**seats), _evidence(main=[DEP_LANDED_ON_B], **seats))
+    hits = [a for a in board.audit if a.kind == "unknown_id_in_trailer"]
+    assert len(hits) == 1 and "seat s1" in hits[0].why, board.audit
+
+
+def test_a_foreign_git_failure_with_the_same_text_as_the_home_one_is_still_said():
+    """Dedup is for the flow-supplied sources, not for identical text: two repos' git can fail with the same words."""
+    gap = {"chain": "git log failed"}
+    board = _both(LINES, _evidence(unreadable=gap), _evidence(main=[DEP_LANDED_ON_B], unreadable=gap))
+    assert "levain: chain unreadable: git log failed" in [a.why for a in board.audit], board.audit
+
+
+def test_a_decided_home_item_linking_an_undecided_foreign_item_does_not_dirty_the_board():
+    lines = [_item("flow", 1), _item("levain", 1), _item("flow", 5, [{"kind": "item", "ref": "levain#1"}]), _decide("flow#5")]
+    board = bs.derive_all(bs.fold(lines), _evidence(), now=NOW, repo_evidence={"flow": _evidence()}, primary_repo="flow")
+    assert sorted(s.id for s in board.items) == ["flow#1", "flow#5"] and board.audit == (), board
+
+
+def test_an_item_a_home_item_reaches_still_reads_unknown_without_its_repos_evidence():
+    board = bs.derive_all(bs.fold(LINES), _evidence(), now=NOW, repo_evidence={"flow": _evidence()}, primary_repo="flow")
+    assert _by(board)["levain#1"].state == "unknown"
+
+
+def test_a_repo_that_owns_no_item_leaves_every_item_unknown_not_off_the_board():
+    board = bs.derive_all(bs.fold(LINES), _evidence(), now=NOW, repo_evidence={"misnamed": _evidence()}, primary_repo="misnamed")
+    assert sorted(_by(board)) == ["flow#5", "levain#1"] and _by(board)["levain#1"].state == "unknown"
