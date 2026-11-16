@@ -689,17 +689,44 @@ def _short(sha: str) -> str:
     return sha[:9]
 
 
+class _Scope:
+    def __init__(self, ctx: "_Ctx", item: Item) -> None:
+        self.ctx, self.item = ctx, item
+        self.saved = (ctx.ev, ctx.idx)
+
+    def __enter__(self) -> str | None:
+        ctx, item = self.ctx, self.item
+        if ctx.by_repo is None or item.decision is not None:
+            return None
+        own = ctx.by_repo.get(item.repo)
+        if own is None:
+            return f"no git evidence for repo {item.repo} was supplied, so {item.id} cannot be judged"
+        ctx.ev, ctx.idx = own, own.index
+        return None
+
+    def __exit__(self, *exc: Any) -> None:
+        self.ctx.ev, self.ctx.idx = self.saved
+
+
 class _Ctx:
-    def __init__(self, items: Mapping[str, Item], ev: Evidence, now: datetime, torn: str | None) -> None:
+    def __init__(self, items: Mapping[str, Item], ev: Evidence, now: datetime, torn: str | None,
+                 by_repo: Mapping[str, Evidence] | None = None) -> None:
         self.items = items
         self.ev = ev
         self.idx = ev.index
+        self.by_repo = by_repo              # repo name -> that repo's own evidence; None: one evidence judges every item
         self.now = _utc(now)
         self.torn = torn
         self.memo: dict[str, State] = {}
         self.stack: set[str] = set()
         self.causes: dict[str, str] = {}      # item id -> the name of the check that made it unknown
         self._cycles: dict[str, tuple[str, ...] | None] = {}
+
+    def use(self, item: Item) -> "_Scope":
+        """Judge ``item`` under the git evidence of its OWN repo (a branch, a chain and main belong to one repository: a
+        dependency in another repo read under this repo's git always finds no work). ``with`` yields the reason there is
+        no such evidence, or None. Nests: a dependency is read while its dependent is judged."""
+        return _Scope(self, item)
 
     def make(self, item: Item, state: str, reason: str, refs: Iterable[str] = ()) -> State:
         return State(item.id, item.repo, item.title, item.tier if item.tier in TIERS else None, state,
@@ -737,7 +764,8 @@ class _Ctx:
             return self.make(item, "unknown", f"cycle through {iid}", (iid,))
         self.stack.add(iid)
         try:
-            st = _compute(self, item)
+            with self.use(item) as missing:
+                st = self.make(item, "unknown", missing) if missing else _compute(self, item)
         finally:
             self.stack.discard(iid)
         self.memo[iid] = st
@@ -1097,14 +1125,21 @@ def _trailer_ids(ev: Evidence) -> dict[str, list[str]]:
     return seen
 
 
-def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
+def derive_all(folded: Folded, evidence: Evidence, *, now: datetime, repo: str | None = None,
+               other_evidence: Mapping[str, Evidence] | None = None) -> Board:
     """The whole board: every item's state, the audit list, and everything that could not be read. ``now`` must be
     timezone-aware (a naive one is a TypeError). Every unreadable source is reported on the board itself, an audit
     ``unknown`` entry and a problem line each, whether or not an item needed it: an empty store or a source no item
     reads (the unattributed scan) is never a clean board, and neither is evidence too old, undated or fetched in the
-    future (``stale_evidence``). An item is listed in the audit once."""
+    future (``stale_evidence``). An item is listed in the audit once.
+
+    ``evidence`` is one repository's git. Without ``repo`` it judges every item (the one-repo board). With ``repo`` (the
+    name ``evidence`` was read from) an item of another repo is judged under ``other_evidence[its repo]``, and with none
+    supplied it reads unknown, never a state judged under the wrong repo's git: a dependency in another repo that has
+    landed there releases its dependent here."""
     now = _utc(now)
-    ctx = _Ctx(folded.items, evidence, now, folded.torn_why or ("torn" if folded.torn else None))
+    by_repo = None if repo is None else {**(other_evidence or {}), repo: evidence}
+    ctx = _Ctx(folded.items, evidence, now, folded.torn_why or ("torn" if folded.torn else None), by_repo)
     states = [ctx.state_of(i) for i in sorted(folded.items, key=_id_key)]
     audit: list[AuditEntry] = []
     problems = list(folded.problems)
@@ -1123,13 +1158,15 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime) -> Board:
         if s.state == "unknown":
             kind = "gate_expired" if ctx.causes.get(s.id) == "gate_expired" else "unknown"
             why = s.reason
-            gone = _landed(ctx, folded.items[s.id]) if kind == "gate_expired" else None
+            with ctx.use(folded.items[s.id]):
+                gone = _landed(ctx, folded.items[s.id]) if kind == "gate_expired" else None
             if gone:                    # landed work behind an orphan branch and this gate: rule 6 was skipped, the gate won; say both
                 why = f"{why}; {_landed_why(*gone)}"
             audit.append(AuditEntry(kind, s.id, why))
             continue
         old = [] if s.state in ("done", "cut", "parked", "out_of_1_0") else _expired_gates(folded.items[s.id], now.date())
-        landed = _landed(ctx, folded.items[s.id]) if s.state in ("blocked", "ready_with_start") else None
+        with ctx.use(folded.items[s.id]):
+            landed = _landed(ctx, folded.items[s.id]) if s.state in ("blocked", "ready_with_start") else None
         if old:                         # a live state beside an expired gate keeps its state; the gate is the one entry
             audit.append(AuditEntry("gate_expired", s.id, f"gate \"{old[0].words}\" past its recheck {old[0].recheck}"))
         elif s.state == "landed_not_closed":

@@ -1,0 +1,73 @@
+"""Two live failures of ``levain board state`` found on the real board (levain#72, levain#73).
+
+levain#72: a dependency in another repo (flow#5 -> levain#1) was judged under the dependent's repo's git, where it has
+no work, so it read ``ready`` and held its dependent. levain#73: a row closed by a ``Board-Closes`` on main read
+``unknown`` because an orphan seat branch sat beside its landed chain (levain#1 and seat/1114-44-storeresolver)."""
+from __future__ import annotations
+
+import json
+
+from levain.desk import board_state as bs
+
+NOW = bs.parse_timestamp("2026-11-12T20:00:00Z")
+SHA = "c" * 40
+
+
+def _add(iid, **extra):
+    rec = {"v": 1, "op": "add", "id": iid, "at": "2026-11-12T10:00:00Z", "by": "desk 17", "repo": iid.split("#")[0],
+           "title": "a row", "words": "", "origin": "desk 17", "done": "merged and closed", "done_kind": "merged",
+           "tier": "sonnet", "depends_on": []}
+    rec.update(extra)
+    return json.dumps(rec)
+
+
+def _evidence(**over):
+    ev = {"evidence_v": 1, "fetched_at": "2026-11-12T19:30:00Z", "unreadable": {}, "main": [], "chain": [],
+          "refs": [], "merged": [], "branches": [], "seats": [], "band": {"open": {}, "resolved": {}},
+          "waiters": [], "documents": {}, "unattributed": []}
+    ev.update(over)
+    return bs.Evidence.from_dict(ev)
+
+
+def _states(lines, ev, **kw):
+    return {s.id: s for s in bs.derive_all(bs.fold(lines), ev, now=NOW, **kw).items}
+
+
+def _closed(iid):
+    return {"sha": SHA, "date": "2026-11-12T12:00:00Z", "items": [iid], "closes": [iid]}
+
+
+# ------------------------------------------------------------------------------------------------ levain#72
+def _two_repos():
+    lines = [_add("levain#1"), _add("flow#5", depends_on=[{"kind": "item", "ref": "levain#1", "label": "the resolver"}])]
+    flow_git = _evidence()                                  # flow's git has no work for levain#1
+    levain_git = _evidence(main=[_closed("levain#1")])      # levain's git closed it
+    return lines, flow_git, levain_git
+
+
+def test_a_landed_dependency_in_the_other_repo_releases_its_dependent():
+    lines, flow_git, levain_git = _two_repos()
+    got = _states(lines, flow_git, repo="flow", other_evidence={"levain": levain_git})
+    assert got["levain#1"].state == "done", got["levain#1"]
+    assert got["flow#5"].state == "ready", got["flow#5"]
+
+
+def test_the_same_board_under_one_repos_git_is_the_measured_wrong_answer():
+    lines, flow_git, _ = _two_repos()
+    got = _states(lines, flow_git)                          # no repo: flow's git judges levain#1 too
+    assert got["levain#1"].state == "ready" and got["flow#5"].state == "blocked", got
+
+
+def test_a_dependency_whose_repo_evidence_is_not_supplied_is_unknown_never_judged_under_the_wrong_git():
+    lines, flow_git, _ = _two_repos()
+    got = _states(lines, flow_git, repo="flow")
+    assert got["levain#1"].state == "unknown" and "no git evidence for repo levain" in got["levain#1"].reason
+    assert got["flow#5"].state == "blocked" and "levain#1" in got["flow#5"].reason
+
+
+def test_the_other_repos_git_is_not_used_for_this_repos_own_rows():
+    lines, flow_git, levain_git = _two_repos()
+    lines.append(_add("flow#6"))
+    wrong = _evidence(main=[_closed("flow#6")])             # only levain's git names flow#6: it is not flow's work
+    got = _states(lines, flow_git, repo="flow", other_evidence={"levain": wrong})
+    assert got["flow#6"].state == "ready", got["flow#6"]
