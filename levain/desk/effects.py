@@ -5,7 +5,7 @@ module is the ONLY place an effect runs, and it runs two verbs and no others:
 
 * ``restart_service(order_id, host, service, expect_sha256=..., event_id=...)``: ``host`` is one of :data:`HOSTS` and
   ``service`` one of :data:`SERVICES`; ``event_id`` is the monitor event it answers. The command is a HARD-CODED argv (:func:`restart_argv`) built from those two enum members and run
-  with ``shell=False`` (:func:`subprocess_runner`); the verb returns the exit code and never the server's output.
+  with ``shell=False`` (:func:`subprocess_runner`); the verb returns an ``EffectResult`` whose ``ok`` is true only on exit 0, its text built from the verb, host and service plus a fixed status (``exit 0``, :data:`R_FAILED` or :data:`R_UNKNOWN`), and never the server's output or a failing exit code.
 * ``send_ack(order_id, event_id, expect_sha256=...)``: the recipient is NEVER an argument. It is derived here, from
   the raw message the event's ``body_ref`` digest names (:func:`inbound_from`), and must be an address the order's ``known_from`` lists.
   The sealed drafter's :class:`Draft` (ND-4) is not an argument either: it is fetched inside the verb after every gate
