@@ -146,7 +146,7 @@ def test_the_per_night_budget_is_spent_after_two_restarts(world):
     by = {EVR2: monitor_event(event_id=EVR2, incident_id=INC2), EVR3: monitor_event(event_id=EVR3, incident_id=INC3)}
     ev = serve_events(rig, **by)
     assert restart(rig, g, EVR, events=ev).ok
-    assert restart(rig, g, EVR2, "php8.1-fpm", events=ev).ok
+    assert restart(rig, g, EVR2, "php8.3-fpm", events=ev).ok
     assert refused(lambda: restart(rig, g, EVR3, events=ev)) == fx.R_BUDGET_NIGHT
     assert len(rig.runs) == 2 and len(rig.journal.rows()) == 2          # the refused third wrote no reservation
     assert (g["id"], "restart_service", EVR3, fx.R_BUDGET_NIGHT, 1) in rig.journal.refusals()
@@ -162,7 +162,7 @@ def test_the_per_incident_budget_is_one_per_service(world):
     ev = serve_events(rig, **{EVR2: other})
     assert restart(rig, g, EVR, events=ev).ok
     assert refused(lambda: restart(rig, g, EVR2, events=ev)) == fx.R_BUDGET_INCIDENT      # same service, same incident
-    assert restart(rig, g, EVR2, "php8.1-fpm", events=ev).ok                               # the other service is its own
+    assert restart(rig, g, EVR2, "php8.3-fpm", events=ev).ok                               # the other service is its own
     assert len(rig.runs) == 2
 
 
@@ -753,7 +753,7 @@ def test_a_result_names_the_verb_alone(world):
     rig = Rig(world)
     res = restart(rig, g)
     assert res.verb == "restart_service" and res.text == "restart_service taoserv apache2: exit 0"
-    assert restart(rig, g, EVR, "php8.1-fpm", runner=lambda a: 3).verb == "restart_service"
+    assert restart(rig, g, EVR, "php8.3-fpm", runner=lambda a: 3).verb == "restart_service"
 
 
 @pytest.mark.parametrize("code", [-9, -15, -2])

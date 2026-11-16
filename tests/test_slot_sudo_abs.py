@@ -57,6 +57,9 @@ def test_no_file_in_levain_spells_sudo_itself_outside_the_home() -> None:
     from pathlib import Path
     root = Path(adopt_view.__file__).resolve().parents[1]
     home = root / "hands_live.py"
-    hits = [f"{p.relative_to(root)}:{n}" for p in sorted(root.rglob("*.py")) if p != home
+    # desk/night_key.py runs on TAOSERV, standalone and stdlib-only (it cannot import levain.slot); it spells the ABSOLUTE
+    # path, which is what this guard is for, and a test in test_night_key.py pins that its only sudo use is "/usr/bin/sudo".
+    server_side = root / "desk" / "night_key.py"
+    hits = [f"{p.relative_to(root)}:{n}" for p in sorted(root.rglob("*.py")) if p not in (home, server_side)
             for n in sudo_spellings(p.read_text(encoding="utf-8"))]
     assert not hits, hits
