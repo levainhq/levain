@@ -271,7 +271,9 @@
     try {
       res = await fetch(SPEAK_PATH, {
         method: "POST", headers: headers(true), signal,
-        body: JSON.stringify(Object.assign(reply.card ? { card_id: reply.card } : { room_thread_id: reply.thread, reply_gseq: reply.gseq },
+        body: JSON.stringify(Object.assign(reply.card ? { card_id: reply.card }
+                                           : reply.desk ? { desk_thread_id: reply.desk.thread, desk_at: reply.desk.at }
+                                           : { room_thread_id: reply.thread, reply_gseq: reply.gseq },
                                            { chunk, provider: s.provider, voice: s.voice, speed: s.speed })),
       });
     } catch (e) { return signal.aborted ? { aborted: true } : { refused: { message: WORDS.failedDevice, fallback: "on_device" } }; }
@@ -349,9 +351,8 @@
     messages.delete(key(reply)); tapNeeded.delete(key(reply));
     changed();
     try {
-      if (reply.deviceOnly) await speakDevice(reply, reply.text || "", me, s.speed);   // words the server cannot rebuild (the Desk's): this device's voice alone, whatever the stored provider's key says
-      else if (s.blocked) say(reply, s.blocked);                   // the stored provider has no key: nothing is read, nothing is sent
-      else if (s.tier === "premium" && !reply.deviceOnly) await playPremium(reply, me, s);   // deviceOnly: words the server cannot rebuild (the Desk's), read by this device alone
+      if (s.blocked) say(reply, s.blocked);                   // the stored provider has no key: nothing is read, nothing is sent
+      else if (s.tier === "premium") await playPremium(reply, me, s);   // a Desk reply names {desk: {thread, at}}: the server re-reads the desk's own event
       else await speakDevice(reply, reply.text || "", me, s.speed);
     } catch (_) {
       if (me === runId) {
