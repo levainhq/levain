@@ -20,7 +20,7 @@ from levain.consent.grant_phone import GrantRefused
 from levain.consent.passkey import challenge
 from levain.desk.envelope_revoke import NAMESPACE, EnvelopeRevoke, revoke_message
 from tests.test_cockpit_consent_rows import OPEN_DECISIONS, TILE
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import _drive, landed_tap, needs_browser
 from tests.test_cockpit_k2a import _install
 from tests.test_cockpit_sign_origin import _Passkey
 from tests.test_envelope_revoke import EID, EID2, _seed, _signer
@@ -113,7 +113,7 @@ def test_the_card_lists_a_scratch_envelope_and_revoke_runs_the_ceremony(world, t
             {"eval": f"{_CARD}.querySelector('.consent-facts').textContent"},
             {"until": _FADED},
             *_shot(f"envelopes-{tag}.png"),
-            {"tap": f"{_CARD}.querySelector('.envelope-revoke')"},
+            *landed_tap(f"{_CARD}.querySelector('.envelope-revoke')"),
             {"posts": 2},
             {"until": "!!document.querySelector('#levain-modal .envelope-said')"},
             {"eval": "document.querySelector('#levain-modal .envelope-said').textContent"},
@@ -202,7 +202,7 @@ def test_the_signed_text_is_on_the_screen_when_the_passkey_asks(world, tmp_path)
             _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && {_CARD}.querySelector('.envelope-revoke').title === 'revoke with your passkey'"},
             {"eval": _WRAP_GET},
-            {"tap": f"{_CARD}.querySelector('.envelope-revoke')"},
+            *landed_tap(f"{_CARD}.querySelector('.envelope-revoke')"),
             {"posts": 2},
             {"eval": "window.__envGets"},
         ])
@@ -228,8 +228,7 @@ def test_a_line_with_an_extra_or_altered_field_is_never_put_to_the_passkey(world
     for _ in bad:
         steps += [{"until": f"!{_CARD}.querySelector('.envelope-revoke').disabled"},
                   {"eval": f"{note}.textContent = ''; 1"},
-                  {"tap": f"{_CARD}.querySelector('.envelope-revoke')"},
-                  {"until": f"{note}.textContent.startsWith('not revoked')"},
+                  *landed_tap(f"{_CARD}.querySelector('.envelope-revoke')", f"{note}.textContent.startsWith('not revoked')"),
                   {"eval": f"{note}.textContent"}]
     with _serve_on(port, src, surface_tokens={"browser": "T"}, install_class="reported", signer=signer) as httpd:
         rec = _Recording(httpd.envelope_revoke, pk.key.fingerprint, bad=bad)
@@ -286,7 +285,7 @@ def test_a_revoke_said_over_a_failed_refill_is_said_once(world, tmp_path) -> Non
         out = _drive(tmp_path, f"http://localhost:{port}/#write_token=T", [
             _authenticator(pk), NARROW, {"until": TILE}, {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && {_CARD}.querySelector('.envelope-revoke').title === 'revoke with your passkey'"},
-            {"tap": f"{_CARD}.querySelector('.envelope-revoke')"},
+            *landed_tap(f"{_CARD}.querySelector('.envelope-revoke')"),
             {"posts": 2},
             {"until": "!!document.querySelector('#levain-modal .envelope-unavailable')"},
             {"eval": "(document.querySelector('#levain-modal .envelope-said') || {}).textContent || ''"},
@@ -349,8 +348,7 @@ def test_a_refusal_lands_on_the_live_envelope_card_when_a_board_read_replaced_th
             {"until": f"!!{_CARD} && {_REVOKE}.title === 'revoke with your passkey'"},
             {"eval": _HOLD_GET},
             {"eval": f"window.__tapped = {_CARD}; 1"},
-            {"tap": _REVOKE},
-            {"until": "window.__getCalled === true && 1", "ms": 30000},
+            *landed_tap(_REVOKE, "window.__getCalled === true && 1"),
             {"eval": "document.querySelector('#refresh').click(); 1"},
             {"until": f"!!{_CARD} && {_CARD} !== window.__tapped && !window.__tapped.isConnected && 1", "ms": 30000},
             {"eval": f"{_REVOKE}.disabled"},

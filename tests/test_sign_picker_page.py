@@ -23,7 +23,7 @@ from levain.cockpit.keys import fingerprint_of
 from tests._phone_fixtures import _enrol
 from tests.test_cockpit_consent_sheet_page import FRAME as CONSENT_FRAME  # noqa: F401  (the sheet's frame, for reference)
 from tests.test_cockpit_consent_sheet_page import _ConsentRig
-from tests.test_cockpit_flip_parity import _drive, needs_browser
+from tests.test_cockpit_flip_parity import _drive, landed_tap, needs_browser
 from tests.test_cockpit_sign_card import DESKTOP, OPTION_B, QRID, STRIP_FACET, TOK, FACET_NOTE, _Rig, needs_ssh
 from tests.test_cockpit_sign_origin import NS, _Passkey
 from tests.test_sign_sheet_page import NOTE, _button, _open
@@ -252,7 +252,7 @@ def test_b2_a_bound_revoke_asks_for_the_key_this_browser_remembers_and_draws_no_
             {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
-            {"tap": _REVOKE},
+            *landed_tap(_REVOKE),
             {"posts": 2},
             {"eval": _GRANT_PICKS},
         ])
@@ -281,7 +281,7 @@ def test_b2b_a_bound_revoke_with_several_remembered_keys_takes_the_newest_enroll
             {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
-            {"tap": _REVOKE},
+            *landed_tap(_REVOKE),
             {"posts": 2},
         ])
     assert rec.steps[0][2]["signer_fp"] == newer.key.fingerprint, rec.steps
@@ -302,8 +302,7 @@ def test_b3_r4_r9_the_revokes_pick_labels_the_keys_survives_a_redraw_and_a_dismi
             _auth(newer, b"cred-new"), {"until": TILE},
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
-            {"tap": _REVOKE},
-            {"until": f"{_GRANT_PICKS} === 3 && 1"},
+            *landed_tap(_REVOKE, f"{_GRANT_PICKS} === 3 && 1"),
             {"eval": f"[...{_CARD}.querySelectorAll('.sign-pick')].map(b => [b.textContent, b.title])"},
             {"eval": f"{_CARD}.querySelector('.sign-note').textContent"},
             # R4: the card is drawn again while the pick is open
@@ -311,8 +310,7 @@ def test_b3_r4_r9_the_revokes_pick_labels_the_keys_survives_a_redraw_and_a_dismi
             {"eval": "new Promise((r) => setTimeout(() => r(1), 800))"},
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
-            {"tap": _REVOKE},
-            {"until": f"{_GRANT_PICKS} === 3 && 1"},
+            *landed_tap(_REVOKE, f"{_GRANT_PICKS} === 3 && 1"),
             # R9: dismissed
             {"eval": f"[...{_CARD}.querySelectorAll('.sign-pick')].find(b => b.textContent === 'dismiss').click() || 1"},
             {"eval": f"{_CARD}.querySelector('.sign-note').textContent"},
@@ -417,10 +415,9 @@ def test_b6_a_bound_revoke_whose_newest_remembered_key_is_gone_asks_the_next_rem
             {"eval": f"window.localStorage.setItem('levain-passkeys:localhost', {json.dumps(json.dumps(record))}); 1"},
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
-            {"tap": _REVOKE},
+            *landed_tap(_REVOKE),
             {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
-            {"tap": _REVOKE},
-            {"until": f"/^revoked|^not revoked|^result unknown/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", "ms": 30000},
+            *landed_tap(_REVOKE, f"/^revoked|^not revoked|^result unknown/.test({_GRANT_NOTE}) && {_GRANT_NOTE}"),
             {"eval": _GRANT_PICKS},
             {"eval": LS},
         ])
@@ -549,11 +546,10 @@ def test_b10_a_picked_key_is_asked_for_by_its_id_even_after_a_refusal(world, tmp
             {"eval": OPEN_DECISIONS},
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
             {"eval": tape},
-            {"tap": _REVOKE},
+            *landed_tap(_REVOKE),
             {"until": f"!!{said} && !{_REVOKE}.disabled && {said}", "ms": 30000},
             {"eval": f"window.__tape.length = 0; {_CARD}.querySelector('.sign-note').textContent = ''; 1"},
-            {"tap": _REVOKE},
-            {"until": f"{_GRANT_PICKS} === 3 && 1", "ms": 30000},
+            *landed_tap(_REVOKE, f"{_GRANT_PICKS} === 3 && 1"),
             {"tap": pick_newer.replace(".click() || 1", "")},
             {"until": f"{said} || false", "ms": 30000},
         ])
@@ -653,8 +649,7 @@ def test_b12_a_tap_refused_because_another_ceremony_holds_the_passkey_is_said_on
             {"until": f"!!{_CARD} && !!{_REVOKE} && !!{_CARD2} && !!{_REVOKE2} && 1"},
             {"eval": _HOLD_GET},
             {"tap": _REVOKE, **_TAP_UNTIL},
-            {"tap": _REVOKE2},
-            {"until": f"/already being asked for/.test({_GRANT_NOTE2}) && {_GRANT_NOTE2}", "ms": 30000},
+            *landed_tap(_REVOKE2, f"/already being asked for/.test({_GRANT_NOTE2}) && {_GRANT_NOTE2}"),
             {"eval": "window.__release(); 1"},
             {"until": f"/nothing was revoked/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled && {_GRANT_NOTE}", "ms": 30000},
             {"eval": f"window.__shown = {_CARD2}; 1"},
@@ -698,13 +693,12 @@ def test_b13_a_throw_at_the_start_of_the_ceremony_is_said_and_releases_the_card_
             {"until": f"!!{_CARD} && !!{_REVOKE} && 1"},
             {"eval": f"{_THROW_ONCE} && ({_REVOKE}.click(), 1)"},
             {"until": f"window.__threw && !{_REVOKE}.disabled && /page failed/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", "ms": 15000},
-            # the next tap's press can be lost to a board read's repaint (no click is made); it is pressed again only while the card
-            # still says the throw's word with its Revoke enabled, i.e. the ceremony has neither begun nor ended
-            {"tap": _REVOKE, "until": f"/^revoked|^not revoked|^result unknown/.test({_GRANT_NOTE}) && {_GRANT_NOTE}",
-             "retry_if": f"/page failed/.test({_GRANT_NOTE}) && !{_REVOKE}.disabled", "report": _GRANT_NOTE, "ms": 30000},
+            # the next tap's press can be lost to a board read's repaint (no click is made); a repaint also draws the card plain, so the
+            # old retry condition (the throw's word still on the card) could itself be wiped: the shape is the shared landed_tap
+            *landed_tap(_REVOKE, f"/^revoked|^not revoked|^result unknown/.test({_GRANT_NOTE}) && {_GRANT_NOTE}", report=_GRANT_NOTE),
         ])
     v = out["values"]
-    assert v[-2] == "the page failed (TypeError); nothing was revoked", v[-2]
+    assert v[-3] == "the page failed (TypeError); nothing was revoked", v[-3]       # (the arm step's 1 sits between it and the tap's)
     assert v[-1].startswith("revoked"), v[-1]       # the lease was given back: the next tap ran the whole ceremony
     _few_repressed(out)
     assert [a for _g, a, _r in rec.steps] == ["revoke-challenge", "revoke"], rec.steps

@@ -75,6 +75,22 @@ def _pushes_value(s: dict[str, Any]) -> bool:
         return True
     return "posts" not in s   # `do` and `until` steps push unless a `posts` count is what they wait on; a bare `posts` waits and pushes nothing; an eval pushes
 
+# A bare `{"tap": ...}` on a node the open board repaints can lose its press: a board read between the driver's mousePressed and
+# mouseReleased replaces the node, and the browser makes no click (reproduced by forcing a redraw between the two halves). `landed_tap`
+# is the one shape for such a tap: a capture-phase click counter is armed just before it, and the press is made AGAIN only while that
+# count is still 0, i.e. no click has reached the page, so the handler has not run and a retry can never fire a ceremony twice. A press
+# that did land and then failed is never repressed: the wait runs to its deadline and FAILS on the card's own text. `until` (default:
+# the click was seen) is the tap's effect, collected in its place; steps after the tap that were its own `until` step fold into it.
+_ARM_CLICKS = ("(() => { window.__tapClicks = 0; if (!window.__tapClicksArmed) { window.__tapClicksArmed = 1;"
+               " document.addEventListener('click', () => { window.__tapClicks++; }, true); } return 1; })()")
+
+
+def landed_tap(target: str, until: str | None = None, **step: Any) -> list[dict[str, Any]]:
+    """Two steps (splat them into a list): arm the click counter, then tap `target` until `until`, pressing again only while no click landed."""
+    return [{"eval": _ARM_CLICKS},
+            {"tap": target, "until": until or "window.__tapClicks >= 1 && 1", "retry_if": "!(window.__tapClicks >= 1)",
+             "ms": 30000, **step}]
+
 
 def _drive(tmp_path: Path, url: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
     f = tmp_path / "steps.json"
