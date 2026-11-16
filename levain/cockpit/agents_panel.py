@@ -4,7 +4,8 @@ One READ-ONLY list panel over the agent store. It reads the store through :func:
 (which creates nothing and writes nothing) and the authority log through :class:`levain.agent_authority.AgentAuthority`
 (which never writes), and draws what those already say; it decides nothing. Every write an agent row offers is a
 kernel verb (:data:`AGENT_VERBS`, defined in :mod:`levain.cockpit.verbs`) whose handler calls the owner of that act
-in :mod:`levain.agents` (``set_operation``, ``retire_agent``, ``renew_agent_link``); the panel never calls one.
+in :mod:`levain.agents` (``set_operation``, ``retire_agent``, ``renew_agent_link``, the revoke's bar steps); the panel
+never calls one.
 
 A row is one agent, ``agent:<agent_id>``, in one of four groups (the ordering ``agents.state``), after the pinned row:
 
@@ -21,6 +22,9 @@ A row is one agent, ``agent:<agent_id>``, in one of four groups (the ordering ``
 - **Unarmed**: registered and active, but nothing lets it fire. The row says why in the words the launch gate uses
   (``no_link``, ``expired``, ``revoked``, ``signer_revoked``), or that a revoke's bar is open, or that arming could not
   be read. An authority log that cannot be read is NEVER read as health: such a row is Unarmed and says so;
+  an agent a revoke removed the links of (judged from the log, paused or not, while the log holds no link of the agent
+  for any spec and no bar of it is open) says so in :data:`REVOKED_WORDS`, with the undo: a NEW link through
+  ``levain agents sign`` (no terms are read back or shown). It is the row's stored field ``revoked``, not a facet;
 - **Retired**: the registration axis, listed after the rest and not counted.
 
 "Armed" here is judged on the agent's current spec hash and the store's own id, the link's liveness, the closed bars
@@ -58,7 +62,7 @@ from levain.cockpit.engine import ProviderSpec, ReadContext
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
 __all__ = ["AGENTS_ID", "AGENT_ORDER", "AGENT_ROW_PREFIX", "AGENT_VERBS", "AgentsWiring", "OPERATOR_ROW_PREFIX",
-           "RETIRED_SHOWN", "agents_discoverer", "cockpit_wiring", "wire_agents"]
+           "RETIRED_SHOWN", "REVOKED_WORDS", "agents_discoverer", "cockpit_wiring", "wire_agents"]
 
 AGENTS_ID = "agents"
 AGENT_ROW_PREFIX = "agent:"
@@ -68,7 +72,13 @@ OPERATOR_GROUP = "operator"
 AGENT_FACETS = frozenset({"agent_group", "agent_link", "agent_version", "agent_store", "agent_kind"})
 UNREADABLE_KIND = "unreadable"
 # the verbs an agent row offers (levain.cockpit.verbs registers them); `run now` has no owner yet and is not here
-AGENT_VERBS = ("agent_pause", "agent_resume", "agent_renew", "agent_retire")
+AGENT_VERBS = ("agent_pause", "agent_resume", "agent_renew", "agent_revoke", "agent_retire")
+# the words of an agent whose links a revoke removed. There is no undo verb (1.0 scope ruling 11-16): the undo is a new
+# link signed through the normal sign path, with terms its signer sets; no revoked link's terms are read back or shown
+REVOKED_WORDS = ("revoked: barred from firing until a new link is signed; undo = sign a new link: the revoke stays in "
+                 "the log (levain agents sign; set terms)")
+# the words of an agent with an open bar: `levain agents sign` refuses while it is open, so no undo is named
+_BARRED_WORDS = "barred: a revoke is closing out"
 # the retired agents listed after the live ones, by name; older ones are in `levain agents list --all`
 RETIRED_SHOWN = 25
 _VERSION_FIELDS = ("*",)
@@ -159,13 +169,14 @@ def _links(arming: _Arming, agent_id: str, spec_hash: str, store_id: str) -> lis
 
 
 def _judge(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any], store_id: str, now: datetime
-           ) -> tuple[str, str, str, str]:
-    """``(group, words, link id or "", expiry or "")`` of one REGISTERED agent. A pause wins over anything the log
+           ) -> tuple[str, str, str, str, bool]:
+    """``(group, words, link id or "", expiry or "", revoked)`` of one REGISTERED agent. A pause wins over anything the log
     says, read or not (pause and resume need only the store); a log that cannot be judged for this agent leaves its
     link details empty and an active agent Unarmed, never the whole panel a fault (the store's own errors still are)."""
     paused = agent["operation"] != "active"
     if arming.state is None or arming.authority is None:
-        return ("paused", "paused", "", "") if paused else ("unarmed", f"arming unknown: {arming.why}", "", "")
+        return ("paused", "paused", "", "", False) if paused else (
+            "unarmed", f"arming unknown: {arming.why}", "", "", False)
     try:
         return _judge_read(arming, conn, agent, store_id, now, paused)
     except sqlite3.Error:
@@ -173,12 +184,12 @@ def _judge(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any], sto
     except Exception as exc:  # noqa: BLE001 - a log that cannot be judged is never health, and never one row's fault
         why = ("the authority moved while it was read" if isinstance(exc, AgentAuthorityError)
                else "the authority log could not be judged")
-        return ("paused", "paused", "", "") if paused else (
-            "unarmed", f"arming unknown: {why} ({type(exc).__name__})", "", "")
+        return ("paused", "paused", "", "", False) if paused else (
+            "unarmed", f"arming unknown: {why} ({type(exc).__name__})", "", "", False)
 
 
 def _judge_read(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any], store_id: str, now: datetime,
-                paused: bool) -> tuple[str, str, str, str]:
+                paused: bool) -> tuple[str, str, str, str, bool]:
     from levain.agents.controller import _no_link_reason
 
     if arming.state is None or arming.authority is None:
@@ -186,11 +197,23 @@ def _judge_read(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any]
     cands = _links(arming, agent["agent_id"], agent["spec_hash"], store_id)
     top = cands[0] if cands else ""
     expiry = str(arming.state.policy.grants[top]["expires_at"]) if top else ""
+    # revoked: a revoke_agent of this agent is in the verified log and the log holds NO link of the agent for ANY spec
+    # (revoke_agent removes every link of the agent, so a link the log holds now, of whatever spec, was signed after
+    # it: an agent signed again and then edited has no link of its new spec, and is not "revoked"). Judged before the
+    # pause, from the log, so a paused agent that was revoked still says it. The flag is True exactly when the row's
+    # words carry REVOKED_WORDS: one source for both. An open bar refuses the new link REVOKED_WORDS names as the
+    # undo, so the row says barred, not revoked, paused or not
+    barred = conn.execute("SELECT 1 FROM agent_bars WHERE agent_id = ? AND closed_at IS NULL",
+                          (agent["agent_id"],)).fetchone() is not None
+    revoked = (not barred and not _auth.agent_links(arming.state, agent["agent_id"], store_id)
+               and _auth.agent_last_revoke(arming.state, agent["agent_id"], store_id) > 0)
     if paused:
-        return "paused", "paused", top, expiry
-    if conn.execute("SELECT 1 FROM agent_bars WHERE agent_id = ? AND closed_at IS NULL",
-                    (agent["agent_id"],)).fetchone() is not None:
-        return "unarmed", "barred: a revoke is closing out", top, expiry
+        words = "paused · " + _BARRED_WORDS if barred else "paused · " + REVOKED_WORDS if revoked else "paused"
+        return "paused", words, top, expiry, revoked
+    if barred:
+        return "unarmed", _BARRED_WORDS, top, expiry, False
+    if revoked:                        # no link at all, so no candidate to peek and no other reason to name
+        return "unarmed", REVOKED_WORDS, top, expiry, True
     closed = conn.execute("SELECT MAX(revoke_seq) FROM agent_bars WHERE agent_id = ? AND closed_at IS NOT NULL",
                           (agent["agent_id"],)).fetchone()[0] or 0
     try:
@@ -198,14 +221,19 @@ def _judge_read(arming: _Arming, conn: sqlite3.Connection, agent: dict[str, Any]
             live, _inc = arming.authority.peek(gid, agent_id=agent["agent_id"], store_id=store_id, now=now,
                                                closed_bar_revoke_seq=closed)
             if live:
-                return "firing", "armed", gid, str(arming.state.policy.grants[gid]["expires_at"])
+                return "firing", "armed", gid, str(arming.state.policy.grants[gid]["expires_at"]), False
     except AgentAuthorityError as exc:
-        return "unarmed", f"arming unknown: the authority moved while it was read ({type(exc).__name__})", top, expiry
+        return ("unarmed", f"arming unknown: the authority moved while it was read ({type(exc).__name__})", top, expiry,
+                False)
     reason = _no_link_reason(arming.state, top or None, agent_id=agent["agent_id"], store_id=store_id, closed=closed,
                              now=now)
+    # the gate's "revoked" here is never REVOKED_WORDS (the agent holds a link): with no candidate, a link of another
+    # spec stands; with one, the candidate is older than the last revoke or a closed bar
+    gone = "its link predates the agent's last revoke" if top else "no signed link covers this spec"
     return "unarmed", {"no_link": "no signed link covers this spec", "expired": "its link has expired",
-                       "revoked": "its links were revoked",
-                       "signer_revoked": "a signer of its link is no longer trusted"}.get(reason, reason), top, expiry
+                       "revoked": gone,
+                       "signer_revoked": "a signer of its link is no longer trusted"}.get(reason, reason), top, expiry, \
+        False
 
 
 def _kind(conn: sqlite3.Connection, role_hash: str, seen: dict[str, tuple[str, str]]) -> tuple[str, str]:
@@ -286,7 +314,7 @@ def _cards_of(agent: dict[str, Any], index) -> tuple[int, int]:
 
 
 def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, store_id: str,
-         kind: tuple[str, str], cards: tuple[int, int] = (0, 0)) -> RowIn:
+         kind: tuple[str, str], cards: tuple[int, int] = (0, 0), revoked: bool = False) -> RowIn:
     streak = f" · {agent['failure_streak']} failed in a row" if agent["failure_streak"] else ""
     until = f" · link until {expiry}" if expiry and group != "retired" else ""
     role = f" · role unreadable: {kind[1]}" if kind[0] == UNREADABLE_KIND else ""
@@ -298,7 +326,7 @@ def _row(agent: dict[str, Any], group: str, words: str, link: str, expiry: str, 
               "spec_hash": agent["spec_hash"], "registration": agent["registration"],
               "operation": agent["operation"], "failure_streak": agent["failure_streak"], "group": group,
               "words": words, "link": link, "expires_at": expiry, "store_id": store_id, "kind": kind[0],
-              "cards_open": cards[0], "cards_cleared": cards[1]}
+              "cards_open": cards[0], "cards_cleared": cards[1], "revoked": revoked}
     # agent_version and agent_store are what a verb's write checks the agent against, inside its own transaction
     return RowIn(id=AGENT_ROW_PREFIX + agent["agent_id"], title=_one_line(agent["name"], 120), body=body,
                  facets={"agent_group": group, "agent_link": link, "agent_version": agent["current_version"],
@@ -379,9 +407,9 @@ def read_rows(wiring: AgentsWiring, *, only: str | None = None) -> tuple[tuple[R
                 rows.append(_row(a, "retired", "retired", "", "", store_id, _kind(conn, a["role_hash"], kinds),
                                  _cards_of(a, cards)))
                 continue
-            group, words, link, expiry = _judge(arming, conn, a, store_id, now)
+            group, words, link, expiry, revoked = _judge(arming, conn, a, store_id, now)
             rows.append(_row(a, group, words, link, expiry, store_id, _kind(conn, a["role_hash"], kinds),
-                             _cards_of(a, cards)))
+                             _cards_of(a, cards), revoked))
     note = None
     if cards_why is not None:
         note = f"Card counts are not shown: {cards_why}."
