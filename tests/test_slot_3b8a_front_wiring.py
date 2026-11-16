@@ -19,6 +19,8 @@ import pytest
 
 from levain.broker import front as FR
 from levain.contracts import canon
+from levain.slot import egress_store as ES
+from levain.slot import layout as LAY
 from levain.slot import runtime_helper as H
 from levain.slot import vendor_routes as VR
 from levain.slot.ids import SlotId
@@ -70,10 +72,14 @@ def test_render_starts_the_front_on_its_policy_log_keys_and_go_fd(tmp_path, host
     else:
         assert _arg(args, "--unix") == str(gw / "gw.sock")
         assert _arg(args, "--slot-uid") == str(w.alloc(s).slot_uid)
+    # levain#66 (T13): root and the front agree on the grants file: the store's name, under the layout's slot row
+    assert _arg(args, "--grants") == str(w.R / "grants" / "slot0" / ES.GRANTS_NAME) and _arg(args, "--slot") == "0"
+    (row,) = [r for r in LAY.slot_run_rows(host, w.alloc(s).slot) if r.path.parent.name == "grants"]
+    assert Path(_arg(args, "--grants")).parent.relative_to(w.R) == row.path.relative_to(LAY.RUN[host])
     # the front's own argparse takes every argument root gives it
     FR_ap = FR.build_parser()
     a = FR_ap.parse_args(args)
-    assert a.go_fd == H.GO_FD
+    assert a.go_fd == H.GO_FD and a.slot == 0 and a.grants == _arg(args, "--grants")
 
 
 @pytest.fixture

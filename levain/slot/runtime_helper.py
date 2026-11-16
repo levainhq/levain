@@ -607,7 +607,8 @@ def gateway_front_args(host: str, slot: SlotId, *, run: Path, store: Path, slot_
         shape = ("--unix", str(gw / "gw.sock"), "--slot-uid", str(slot_uid))
     return (*shape, "--policy", str(gw / FRONT_POLICY_NAME),
             "--log", str(store / "gw" / f"slot{slot.index}" / FRONT_LOG_NAME),
-            "--keys", str(run / "keys" / "front.sock"), "--go-fd", str(GO_FD))
+            "--keys", str(run / "keys" / "front.sock"), "--go-fd", str(GO_FD),
+            "--grants", str(run / "grants" / f"slot{slot.index}" / "grants.json"), "--slot", str(slot.index))
 
 
 _PASSTHROUGH_TAIL_BYTES = 1 << 20

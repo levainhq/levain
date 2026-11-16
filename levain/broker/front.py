@@ -11,7 +11,10 @@ What it enforces, in order, before any upstream byte:
    absolute-form or asterisk-form target, and a CONNECT carrying a body are refused as `malformed`.
 3. the target: `CONNECT <host>:443` only. The host must be a name on the session's CONNECT set (the `egress` and
    `subscription_passthrough` routes of the front's policy file); an address literal, any other port, or an
-   off-list name is `host-not-allowed`.
+   off-list name is `host-not-allowed`, unless a live entry of root's `R/grants/slot<n>/grants.json` for this session
+   and slot names it (levain#66; an interactive or login session only, else the refusal's detail is `unattended`).
+   Time is the host wall clock at each decision; a clock step moves a grant's end with it (root's clock is not
+   defended).
 4. the address: the name is resolved ONCE, as an absolute name (no search-list expansion), with a bounded number
    of resolutions in flight; if any answer is loopback, private (RFC1918, CGNAT, ULA), link-local
    (incl. the 169.254.169.254 metadata address), IPv4-mapped / IPv4-compatible / 6to4 / Teredo, multicast,
@@ -39,6 +42,7 @@ import errno
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import signal
@@ -48,6 +52,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http import HTTPStatus
 from pathlib import Path
 from typing import Awaitable, Callable, Coroutine, Mapping, Optional, Sequence
@@ -64,6 +69,7 @@ from levain.broker import norm
 from levain.broker.policy import (CONNECT_TYPES, ROUTE_TYPES, PolicyError, RoutePolicy,  # noqa: F401 - re-exported
                                   is_host_name, parse_route)
 from levain.broker.stub import GWPORT_BASE, SLOTS, clear_stale_socket, peer_uid
+from levain.slot import egress_grants as eg
 
 POLICY_FORMAT = "levain-front-session/1"
 CONNECT_PORT = 443
@@ -92,6 +98,11 @@ _DRAIN_S = 1.0
 SESSION_KINDS = ("interactive", "login", "dispatch", "planner")
 #: the kinds a dispatch ticket renders; their routes are the ticket's route + egress routes only (CONTRACT §3.5).
 DISPATCH_KINDS = ("dispatch", "planner")
+#: levain#66: the route id a tunnel admitted by a live host grant is logged under (``egress-grant:<grant id>``).
+GRANT_ROUTE_PREFIX = "egress-grant:"
+#: levain#66: the kinds a host grant admits (a person is at the keyboard to tap); a dispatch or planner session is
+#: refused ``unattended`` instead.
+GRANT_KINDS = ("interactive", "login")
 _ROUTE_ID = re.compile(r"^[a-z0-9-]{1,48}\Z")
 #: V34: keys answers the front's `H` with `A` within this, else the front exits 3 without binding.
 STATUS_A_S = 5.0
@@ -127,6 +138,8 @@ class FrontPolicy:
     tunnel_bytes_cap: Optional[int] = None
     #: P7-A §3.2: absolute wall-clock (epoch seconds) after which no passthrough CONNECT is admitted. None = none.
     deadline: Optional[float] = None
+    #: every host of a brokered route (its CONNECT-refused names plus its upstream host): a host grant never admits one.
+    brokered_hosts: frozenset = frozenset()
 
 
 def _limit_fields(doc: dict) -> tuple[Optional[int], Optional[float]]:
@@ -201,7 +214,7 @@ def load_policy(data: bytes) -> FrontPolicy:
     both = sorted(brokered_hosts & set(connect))
     if both:
         raise PolicyError(f"CONNECT routes admit brokered hosts {both}")
-    return FrontPolicy(doc["session"], doc["kind"], connect, brokered, inc, cap, deadline)
+    return FrontPolicy(doc["session"], doc["kind"], connect, brokered, inc, cap, deadline, frozenset(brokered_hosts))
 
 
 # --- addresses ------------------------------------------------------------------------------------------------
@@ -365,11 +378,16 @@ def parse_head_conn(head: bytes) -> tuple[h11.Connection, h11.Request]:
 _AUTHORITY = re.compile(rb"^([^:\[\]]+):([0-9]{1,5})\Z")
 
 
-def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, int]:
+def _authority(target: bytes) -> tuple[str, int]:
+    """``(host, port)`` of an unbracketed ``host:port`` CONNECT target, the host lowercased."""
     m = _AUTHORITY.match(target)
     if not m:
         raise Refused("host-not-allowed", "authority")   # incl. a bracketed IPv6 literal
-    host, port = m.group(1).decode("ascii").lower(), int(m.group(2))
+    return m.group(1).decode("ascii").lower(), int(m.group(2))
+
+
+def connect_target(policy: FrontPolicy, target: bytes) -> tuple[ConnectRoute, int]:
+    host, port = _authority(target)
     if port != CONNECT_PORT:
         raise Refused("host-not-allowed", "port")
     route = policy.connect.get(host)
@@ -1126,12 +1144,68 @@ def _keepalive(writer: asyncio.StreamWriter) -> None:
             pass
 
 
+class _Grants:
+    """levain#66: the front's view of root's ``R/grants/slot<n>/grants.json``. Time is the host wall clock at each
+    decision and nothing is remembered between them: a clock that raises or reads non-finite admits nothing and
+    ends nothing later than now, and one bad reading latches nothing."""
+
+    def __init__(self, path: str, slot: int, owner_uid: int, gid: Optional[int], *,
+                 clock: Callable[[], float] = time.time, read: Callable = eg.read_grants_file) -> None:
+        self.path = path
+        self.slot = slot
+        self.owner_uid = owner_uid
+        self.gid = gid
+        self._clock = clock
+        self._read = read
+
+    def now(self) -> Optional[datetime]:
+        """The wall clock as an aware UTC datetime, or None when it raises, is not finite or is out of range."""
+        try:
+            t = float(self._clock())
+            if not math.isfinite(t):
+                return None
+            return datetime.fromtimestamp(t, tz=timezone.utc)
+        except Exception:   # ValueError, OverflowError, OSError, TypeError, and any clock's own error: no grant
+            return None
+
+    def left(self, entry: "eg.Entry") -> float:
+        """Seconds until ``entry`` expires; 0.0 (expired) when the clock gives no time."""
+        now = self.now()
+        if now is None:
+            return 0.0
+        try:
+            return (entry.expires - now).total_seconds()
+        except Exception:
+            return 0.0
+
+    def admit(self, policy: FrontPolicy, host: str, port: int) -> Optional["eg.Entry"]:
+        """The live entry that admits ``host``:``port`` for this session and slot, or None. The cheap gates come
+        first and cost no read: the session kind, the host grammar (an address literal never matches an entry), a
+        brokered host (a vendor API host never tunnels around the data plane). Never raises."""
+        try:
+            if policy.kind not in GRANT_KINDS or not is_host_name(host) or host in policy.brokered_hosts:
+                return None
+            grants = self._read(self.path, owner_uid=self.owner_uid, group_gid=self.gid)
+            now = self.now()
+            if grants is None or now is None:
+                return None
+            return eg.live_entry(grants, policy.session, self.slot, host, port, now)
+        except Exception:
+            return None
+
+
 class Front:
     def __init__(self, policy: FrontPolicy, *, log_path: Optional[Path | str] = None,
                  slot_uid: Optional[int] = None, resolve: Resolver = system_resolve,
                  connect: Connector = open_by_address, keys_path: Optional[str] = None,
-                 log_cap: int = LOG_CAP) -> None:
+                 log_cap: int = LOG_CAP, grants_path: Optional[str] = None, slot: Optional[int] = None,
+                 grants_owner_uid: int = 0, grants_gid: Optional[int] = None,
+                 clock: Callable[[], float] = time.time, read_grants: Callable = eg.read_grants_file) -> None:
         self.policy = policy
+        #: levain#66: None unless both the grants path and the slot are given (no grants: today's behaviour).
+        self.grants: Optional[_Grants] = (
+            _Grants(grants_path, slot, grants_owner_uid, grants_gid, clock=clock, read=read_grants)
+            if grants_path is not None and slot is not None else None)
         #: keys' `R/keys/front.sock`: every brokered exchange is one connection to it. None = no keys (503).
         self.keys_path = keys_path
         self.log_path = Path(log_path) if log_path is not None else None
@@ -1330,10 +1404,27 @@ class Front:
                 await BrokeredExchange(self, pol, conn, req, path, query, reader, writer).run()
                 return
             target = req.target
-            route, port = connect_target(self.policy, target)
+            entry = None   # the live host grant that admitted this CONNECT, if one did
+            try:
+                route, port = connect_target(self.policy, target)
+            except Refused as miss:
+                if (miss.name, miss.detail) != ("host-not-allowed", "off-list") or self.grants is None:
+                    raise
+                if self.policy.kind not in GRANT_KINDS:
+                    raise Refused("host-not-allowed", "unattended") from None
+                host, port = _authority(target)
+                entry = self.grants.admit(self.policy, host, port)
+                if entry is None:
+                    raise miss
+                route = ConnectRoute(GRANT_ROUTE_PREFIX + entry.grant, host, False)
             if route.passthrough:
                 self._pt_admit()
             ureader, uwriter, addr = await self._open_upstream(route, port)
+            if entry is not None:   # the open can take seconds: the grant may have ended meanwhile
+                again = self.grants.admit(self.policy, route.host, port)
+                if again is None or again.grant != entry.grant:
+                    uwriter.close()
+                    raise Refused("host-not-allowed", "grant-ended")
             if route.passthrough:
                 try:
                     self._pt_admit()
@@ -1547,7 +1638,9 @@ class Front:
         off-list one the remedy (:data:`OFF_LIST_REMEDY`)."""
         self._log({"event": "refused", "refused": r.name, "detail": r.detail,
                    **(refused_host_fields(target) if target is not None else {}),
-                   **({"remedy": OFF_LIST_REMEDY} if (r.name, r.detail) == ("host-not-allowed", "off-list") else {})})
+                   **({"remedy": OFF_LIST_REMEDY}
+                      if (r.name, r.detail) in (("host-not-allowed", "off-list"), ("host-not-allowed", "unattended"))
+                      else {})})
         body = r.name.encode() + b"\n"
         writer.write(b"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
                      b"X-Levain-Refused: %s\r\nConnection: close\r\n\r\n%s"
@@ -1682,6 +1775,8 @@ def build_parser():
     ap.add_argument("--keys", required=True,
                     help="keys' R/keys/front.sock: the STATUS connection is opened after GO and the listener bound "
                          "only after keys' A; brokered exchanges go there")
+    ap.add_argument("--grants", help="root's R/grants/slot<n>/grants.json (levain#66); needs --slot")
+    ap.add_argument("--slot", type=int, help="this front's slot index (levain#66); needs --grants")
     return ap
 
 
@@ -1695,6 +1790,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         ap.error("--slot-uid is the unix shape's peer check; the TCP shape (--port) takes none")
     if a.port is not None and not GWPORT_BASE <= a.port < GWPORT_BASE + SLOTS:
         ap.error(f"--port must be in the gateway range {GWPORT_BASE}..{GWPORT_BASE + SLOTS - 1}")
+    if (a.grants is None) != (a.slot is None):
+        ap.error("--grants and --slot are given together or not at all")
+    if a.slot is not None:
+        if not 0 <= a.slot < SLOTS:
+            ap.error(f"--slot must be in 0..{SLOTS - 1}")
+        gp = Path(a.grants)
+        if not gp.is_absolute() or gp.name != "grants.json" or gp.parent.name != f"slot{a.slot}":
+            ap.error("--grants must be an absolute path ending slot<N>/grants.json for the --slot given")
+        if a.port is not None and a.port != GWPORT_BASE + a.slot:
+            ap.error(f"--port must be {GWPORT_BASE} + --slot ({GWPORT_BASE + a.slot}) when --grants is given")
     if h11 is None:
         print("levain gw-front: the h11 parser is not installed; install levain[isolation]", file=sys.stderr)
         return 2
@@ -1723,7 +1828,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             pass
     if not go:
         return 3   # EOF before GO: render refused or died, so this front never serves
-    front = Front(policy, log_path=a.log, slot_uid=a.slot_uid, keys_path=a.keys)
+    front = Front(policy, log_path=a.log, slot_uid=a.slot_uid, keys_path=a.keys, grants_path=a.grants, slot=a.slot,
+                  grants_gid=os.getegid())
     return asyncio.run(run_front(front, unix=a.unix, port=a.port, keys=a.keys))
 
 
