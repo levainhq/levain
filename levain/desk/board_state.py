@@ -696,9 +696,13 @@ class _Scope:
 
     def __enter__(self) -> str | None:
         ctx, item = self.ctx, self.item
-        if ctx.by_repo is None or item.decision is not None:
+        if ctx.by_repo is None:
             return None
         own = ctx.by_repo.get(item.repo)
+        if item.decision is not None:       # a ruling reads no git, but its row is stamped with its own repo's fetch time
+            if own is not None:
+                ctx.ev, ctx.idx = own, own.index
+            return None
         if own is None:
             return f"no git evidence for repo {item.repo} was supplied, so {item.id} cannot be judged"
         ctx.ev, ctx.idx = own, own.index
@@ -901,6 +905,8 @@ def _chk_conflict_closed_band(ctx: _Ctx, item: Item):
 
 def _chk_conflict_chain_orphan(ctx: _Ctx, item: Item):
     chain, orphans = ctx.idx.chain.get(item.id), ctx.idx.orphans(item.id)
+    if not (chain and orphans):         # only a chain beside an orphan can conflict: skip the closing-trailer search otherwise
+        return None
     if _trailer_close(ctx, item):       # a Board-Closes on main closed it (rule 2: done): an orphan beside its chain is branch hygiene
         return None
     if chain and orphans:
@@ -1105,8 +1111,24 @@ def _id_key(iid: str) -> tuple[str, int, str, str]:
     return repo, len(digits), digits, iid
 
 
-def _trailer_ids(ev: Evidence) -> dict[str, list[str]]:
-    """Every item id a commit, branch, seat or waiter names, with where it was named."""
+def reachable_ids(items: Mapping[str, Item], home: str) -> set[str]:
+    """The ids ``derive_all`` judges for a board of ``home``: every item of ``home`` and every item they depend on, through
+    item links to any depth. A decided item (a ruling is stored, not derived) reads no git and its links are not followed."""
+    seen: set[str] = set()
+    todo = [i.id for i in items.values() if i.repo == home]
+    while todo:
+        iid = todo.pop()
+        if iid in seen or iid not in items:
+            continue
+        seen.add(iid)
+        if items[iid].decision is None:
+            todo.extend(l.ref for l in items[iid].depends_on if l.kind == "item" and l.ref)
+    return seen
+
+
+def _trailer_ids(ev: Evidence, *, flow_supplied: bool = True) -> dict[str, list[str]]:
+    """Every item id a commit, branch, seat or waiter names, with where it was named. ``flow_supplied=False`` leaves out
+    the seats and waiters (flow's evidence, shared by every repo's evidence: said once, for the home repo)."""
     seen: dict[str, list[str]] = {}
     for c in ev.main:
         for iid in (*c.items, *c.closes):
@@ -1118,13 +1140,18 @@ def _trailer_ids(ev: Evidence) -> dict[str, list[str]]:
     for b in ev.branches:
         for iid in b.items:
             seen.setdefault(iid, []).append(f"branch {b.name}")
-    for s in ev.seats:
-        for iid in s.items:
-            seen.setdefault(iid, []).append(f"seat {s.name}")
-    for w in ev.waiters:
-        for iid in w.items:
-            seen.setdefault(iid, []).append(f"waiter {w.branch}")
+    if flow_supplied:
+        for s in ev.seats:
+            for iid in s.items:
+                seen.setdefault(iid, []).append(f"seat {s.name}")
+        for w in ev.waiters:
+            for iid in w.items:
+                seen.setdefault(iid, []).append(f"waiter {w.branch}")
     return seen
+
+
+#: The unreadable sources flow supplies (``--evidence-extra``): one gap, merged into every repo's evidence.
+_FLOW_SOURCES = ("seats", "band", "waiters", "documents")
 
 
 def derive_all(folded: Folded, evidence: Evidence, *, now: datetime, repo: str | None = None,
@@ -1142,7 +1169,12 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime, repo: str |
     now = _utc(now)
     by_repo = None if repo is None else {**(other_evidence or {}), repo: evidence}
     ctx = _Ctx(folded.items, evidence, now, folded.torn_why or ("torn" if folded.torn else None), by_repo)
-    states = [ctx.state_of(i) for i in sorted(folded.items, key=_id_key)]
+    judged = list(folded.items)
+    reach = reachable_ids(folded.items, repo) if by_repo is not None else set()
+    if any(folded.items[i].repo == repo for i in reach):    # (a repo that owns no item is a misnamed one: every item stays, unknown)
+        # an item of a repo with no evidence that no item of this repo reaches is out of scope, not unknown
+        judged = [i for i in judged if folded.items[i].repo in by_repo or i in reach]
+    states = [ctx.state_of(i) for i in sorted(judged, key=_id_key)]
     audit: list[AuditEntry] = []
     problems = list(folded.problems)
     if folded.torn:
@@ -1161,7 +1193,7 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime, repo: str |
             continue
         fev = by_repo[name]
         lines = [f"{name}: {source} unreadable: {fev.unreadable[source]}" for source in sorted(fev.unreadable)
-                 if evidence.unreadable.get(source) != fev.unreadable[source]]       # flow's own gap is shared: said once, above
+                 if not (source in _FLOW_SOURCES and evidence.unreadable.get(source) == fev.unreadable[source])]   # flow's own gap is shared: said once, above; a git failure with the same text is the repo's own
         fstale = _evidence_problem(fev, now)
         if fstale:
             lines.append(f"{name}: stale_evidence: {fstale}")
@@ -1190,8 +1222,16 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime, repo: str |
     unattributed = tuple(sorted(evidence.unattributed, key=lambda u: (u.sha, u.subject)))
     for u in unattributed:
         audit.append(AuditEntry("unattributed_work", None, f"{_short(u.sha)} {u.subject}".strip()))
+    foreign = [(n, by_repo[n]) for n in sorted(by_repo or {}) if n != repo]
+    for name, fev in foreign:           # a closed foreign item reads ready only if its repo's own git is clean too
+        for u in sorted(fev.unattributed, key=lambda u: (u.sha, u.subject)):
+            audit.append(AuditEntry("unattributed_work", None, f"{name}: {_short(u.sha)} {u.subject}".strip()))
     if not folded.torn:                 # with a torn store most ids would look unknown for a reason already reported
-        for iid, where in sorted(_trailer_ids(evidence).items(), key=lambda kv: _id_key(kv[0])):
+        named: dict[str, list[str]] = {}
+        for prefix, ev_ in [("", evidence), *((f"{n} ", f) for n, f in foreign)]:
+            for iid, where in _trailer_ids(ev_, flow_supplied=not prefix).items():
+                named.setdefault(iid, []).extend(prefix + w for w in where)
+        for iid, where in sorted(named.items(), key=lambda kv: _id_key(kv[0])):
             if iid not in folded.items:
                 audit.append(AuditEntry("unknown_id_in_trailer", iid, f"named by {', '.join(sorted(set(where)))}; the store does not hold it"))
     audit.sort(key=lambda a: AUDIT_KINDS.index(a.kind))

@@ -439,3 +439,22 @@ def test_a_repo_an_undecided_item_reaches_only_through_a_decided_one_is_never_re
                         _row(5, "flow", depends=[{"kind": "item", "ref": "flow#7", "label": "x"}]))
     _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow")
     assert doc["reader"]["other_repos"] == [], doc["reader"]
+
+
+# ================================================================================================ levain#72 round 2 (L3 verify)
+def test_a_stale_other_repo_path_for_a_repo_this_board_does_not_read_is_harmless(tmp_path, capsys):
+    home, _ = _two_repos(tmp_path)
+    dep = [{"kind": "item", "ref": "levain#1", "label": "x"}]
+    items = write_items(tmp_path, _row(1, "levain"), _row(5, "flow", depends=dep), _decide("flow#5"))
+    rc, doc, err = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow",
+                         "--other-repo", f"levain={tmp_path / 'nowhere'}")
+    assert rc != 2 and err == "", (rc, err)
+    assert [s["id"] for s in doc["items"]] == ["flow#5"], doc["items"]       # levain#1 is out of this board's scope, not unknown
+    assert doc["audit"] == [], doc["audit"]
+
+
+def test_an_other_repo_path_with_stray_spaces_names_the_same_directory(tmp_path, capsys):
+    home, items = _two_repos(tmp_path)
+    _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow",
+                      "--other-repo", f" levain = {tmp_path / 'levain'} ")
+    assert doc["reader"]["other_repos"] == ["levain"], doc["reader"]

@@ -123,3 +123,72 @@ def test_a_clean_foreign_repo_adds_no_audit_line():
     lines, flow_git, levain_git = _two_repos()
     board = bs.derive_all(bs.fold(lines), flow_git, now=NOW, repo="flow", other_evidence={"levain": levain_git})
     assert board.audit == () and board.problems == (), board.audit
+
+
+# ------------------------------------------------------------------------------------------------ levain#72 round 2 (L3 verify)
+def _board(lines, flow_git, levain_git):
+    return bs.derive_all(bs.fold(lines), flow_git, now=NOW, repo="flow", other_evidence={"levain": levain_git})
+
+
+def test_a_foreign_repos_unattributed_commit_is_on_the_board_though_its_item_reads_done():
+    lines, flow_git, _ = _two_repos()
+    dirty = _evidence(main=[_closed("levain#1")], unattributed=[{"sha": "f" * 40, "subject": "drive-by fix"}])
+    board = _board(lines, flow_git, dirty)
+    assert {s.id: s.state for s in board.items}["flow#5"] == "ready"
+    hits = [a for a in board.audit if a.kind == "unattributed_work"]
+    assert [a.why for a in hits] == ["levain: fffffffff drive-by fix"], board.audit
+
+
+def test_a_foreign_repos_unknown_trailer_id_is_on_the_board_naming_the_repo():
+    lines, flow_git, _ = _two_repos()
+    typo = {"sha": "a" * 40, "date": "2026-11-12T12:00:00Z", "items": ["levain#99"], "closes": []}
+    board = _board(lines, flow_git, _evidence(main=[_closed("levain#1"), typo]))
+    hits = [a for a in board.audit if a.kind == "unknown_id_in_trailer"]
+    assert [(a.id, a.why) for a in hits] == [("levain#99", "named by levain main aaaaaaaaa; the store does not hold it")]
+
+
+def test_flows_shared_seats_are_not_reported_once_per_repo():
+    lines, flow_git, _ = _two_repos()
+    seat = {"name": "s1", "items": ["levain#98"]}
+    seats = {"seats": [seat]}
+    board = _board(lines, _evidence(**seats), _evidence(main=[_closed("levain#1")], **seats))
+    hits = [a for a in board.audit if a.kind == "unknown_id_in_trailer"]
+    assert [a.why for a in hits] == ["named by seat s1; the store does not hold it"]
+
+
+def test_a_decided_home_item_linking_an_undecided_foreign_item_leaves_that_item_off_the_board():
+    decide = json.dumps({"v": 1, "op": "decide", "id": "flow#5", "at": "2026-11-12T11:00:00Z", "by": "t", "decision": "cut",
+                         "words": "w", "date": "2026-11-12"})
+    lines = [_add("flow#1"), _add("levain#1"), _add("flow#5", depends_on=[{"kind": "item", "ref": "levain#1", "label": "x"}]), decide]
+    board = bs.derive_all(bs.fold(lines), _evidence(), now=NOW, repo="flow", other_evidence={})
+    assert sorted(s.id for s in board.items) == ["flow#1", "flow#5"] and not board.audit, board
+
+
+def test_an_item_a_home_item_reaches_still_reads_unknown_without_its_repos_evidence():
+    lines, flow_git, _ = _two_repos()
+    board = bs.derive_all(bs.fold(lines), flow_git, now=NOW, repo="flow", other_evidence={})
+    assert {s.id: s.state for s in board.items}["levain#1"] == "unknown"
+
+
+def test_a_foreign_git_failure_with_the_same_text_as_the_home_one_is_still_said():
+    lines, flow_git, _ = _two_repos()
+    home = _evidence(unreadable={"chain": "git log failed"})
+    board = _board(lines, home, _evidence(main=[_closed("levain#1")], unreadable={"chain": "git log failed"}))
+    assert "levain: chain unreadable: git log failed" in [a.why for a in board.audit]
+
+
+def test_flows_own_gap_is_said_once_not_per_repo():
+    lines, _, _ = _two_repos()
+    gap = {"seats": "flow could not read the roster"}
+    board = _board(lines, _evidence(unreadable=gap), _evidence(main=[_closed("levain#1")], unreadable=gap))
+    assert [a.why for a in board.audit if a.id is None and "roster" in a.why] == ["seats unreadable: flow could not read the roster"]
+
+
+def test_a_decided_foreign_item_carries_its_own_repos_fetch_time():
+    decide = json.dumps({"v": 1, "op": "decide", "id": "levain#1", "at": "2026-11-12T11:00:00Z", "by": "t", "decision": "cut",
+                         "words": "w", "date": "2026-11-12"})
+    lines = [_add("levain#1"), _add("flow#5", depends_on=[{"kind": "item", "ref": "levain#1", "label": "x"}]), decide]
+    mine = _evidence(fetched_at="2026-11-12T19:00:00Z")
+    theirs = _evidence(fetched_at="2026-11-12T19:45:00Z")
+    got = _states(lines, mine, repo="flow", other_evidence={"levain": theirs})
+    assert got["levain#1"].as_of == "2026-11-12T19:45:00Z"
