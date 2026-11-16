@@ -306,7 +306,13 @@
   // floor's); only the action lines are actions that ran.
   function actionLines(lines) { return Array.isArray(lines) ? lines.filter((l) => String(l).startsWith("⚙ ")) : []; }
   function replyText(b, res, ran) {
-    if (res.unreadable_call !== true) { b.appendChild(el("div", "chat-text", res.reply)); return; }
+    if (res.unreadable_call !== true) {
+      const t = el("div", "chat-text");
+      // the entity's reply is markdown: drawn by the Room's one draw (the shared renderer, links filtered), else plain text
+      const R = window.LevainRoomView;
+      if (!(R && typeof R.drawMarkdown === "function" && R.drawMarkdown(document, t, String(res.reply)))) t.textContent = res.reply;
+      b.appendChild(t); return;
+    }
     const acted = ran || actionLines(res.tool_activity).length > 0;
     const notice = res.unreadable_unchecked === true ? UNREADABLE_CHECK_FAILED_NOTICE
       : acted ? UNREADABLE_CALL_AFTER_ACTIONS_NOTICE : UNREADABLE_CALL_NOTICE;

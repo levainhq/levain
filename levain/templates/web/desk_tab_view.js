@@ -215,6 +215,11 @@
   }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
 
+  function drawReplyMarkdown(doc, node, text) {
+    var R = root.LevainRoomView;
+    return !!(R && typeof R.drawMarkdown === "function" && R.drawMarkdown(doc, node, text));
+  }
+
   // One log entry as a row. `you` entries are lines this page sent; `ev` entries are what the host filed back.
   function renderEntry(doc, it, onMark, voiceBtn) {
     if (it.k === "you") {
@@ -240,7 +245,13 @@
     var r = el(doc, "div", "rv-line " + m.cls);
     if (m.who) r.appendChild(el(doc, "div", "rv-who", shown(m.who) + (m.at ? " · " + shown(m.at) : "")));
     if (m.words) r.appendChild(el(doc, "div", "rv-note", shown(m.words)));
-    if (m.text) r.appendChild(el(doc, "div", "rv-text", shown(m.text)));
+    if (m.text) {
+      var tx = el(doc, "div", "rv-text");
+      // the desk's own reply is markdown, drawn by the Room's one draw (the cockpit's shared renderer, links filtered); anything else,
+      // or a page without that draw, keeps the plain text. The voice reads the event's text (voiceReply), never this node.
+      if (!(isDeskReply(it) && drawReplyMarkdown(doc, tx, shown(m.text)))) tx.textContent = shown(m.text);
+      r.appendChild(tx);
+    }
     if (isDeskReply(it) && voiceBtn) { var vb = voiceBtn(it); if (vb) r.appendChild(vb); }
     return r;
   }
