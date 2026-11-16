@@ -204,3 +204,87 @@ def test_an_item_a_home_item_reaches_still_reads_unknown_without_its_repos_evide
 def test_a_repo_that_owns_no_item_leaves_every_item_unknown_not_off_the_board():
     board = bs.derive_all(bs.fold(LINES), _evidence(), now=NOW, repo_evidence={"misnamed": _evidence()}, primary_repo="misnamed")
     assert sorted(_by(board)) == ["flow#5", "levain#1"] and _by(board)["levain#1"].state == "unknown"
+
+
+# ---- levain#72 L3 round 1 on the scope filter ----
+
+def _flow_only(lines, ev=None):
+    ev = ev or _evidence()
+    return bs.derive_all(bs.fold(lines), ev, now=NOW, repo_evidence={"flow": ev}, primary_repo="flow")
+
+
+def test_an_undecided_item_of_an_unread_repo_that_nothing_reaches_is_named_not_silent():
+    board = _flow_only([_item("flow", 1), _item("levain", 1)])
+    assert [s.id for s in board.items] == ["flow#1"]
+    assert board.audit == () and any("levain" in p and "levain#1" in p and "left off" in p for p in board.problems), board.problems
+
+
+def test_a_decided_home_item_linking_a_foreign_item_names_it_in_a_problem_line_only():
+    lines = [_item("levain", 1), _item("flow", 5, [{"kind": "item", "ref": "levain#1"}]), _decide("flow#5")]
+    board = _flow_only(lines)
+    assert board.audit == () and any("levain#1" in p for p in board.problems)
+
+
+def test_a_torn_store_lists_every_item():
+    lines = [_item("levain", 1), _item("flow", 1), _decide("levain#1"), "{not json"]
+    board = _flow_only(lines)
+    assert sorted(s.id for s in board.items) == ["flow#1", "levain#1"], board
+
+
+def test_a_valid_cut_then_a_malformed_reopen_does_not_hide_the_item():
+    reopen = json.dumps({"v": 1, "op": "reopen", "id": "levain#1", "at": "bad"})
+    board = _flow_only([_item("levain", 1), _item("flow", 1), _decide("levain#1"), reopen])
+    assert "levain#1" in _by(board)
+
+
+def test_the_walk_through_an_undecided_foreign_item_stops_after_one_hop():
+    lines = [_item("levain", 1, [{"kind": "item", "ref": "levain#2"}]), _item("levain", 2),
+             _item("flow", 5, [{"kind": "item", "ref": "levain#1"}])]
+    board = _flow_only(lines)
+    assert sorted(_by(board)) == ["flow#5", "levain#1"] and any("levain#2" in p for p in board.problems)
+
+
+def test_a_chain_through_a_decided_foreign_item_does_not_pull_its_target_on():
+    """gemini L117: a decided intermediate's own links do not count (_deps gives none for it)."""
+    lines = [_item("levain", 2), _item("levain", 1, [{"kind": "item", "ref": "levain#2"}]), _decide("levain#1"),
+             _item("flow", 5, [{"kind": "item", "ref": "levain#1"}])]
+    assert sorted(_by(_flow_only(lines))) == ["flow#5", "levain#1"]
+
+
+def test_a_link_to_an_id_the_store_does_not_hold_is_not_a_phantom_item():
+    board = _flow_only([_item("flow", 5, [{"kind": "item", "ref": "levain#404"}])])
+    assert sorted(_by(board)) == ["flow#5"]
+
+
+def test_a_stray_trailer_for_an_item_left_off_the_board_is_not_audited():
+    stray = {"sha": "c" * 40, "date": "2026-11-12T12:00:00Z", "items": ["levain#1"], "closes": []}
+    board = _flow_only([_item("levain", 1), _item("flow", 1)], _evidence(main=[stray]))
+    assert not [a for a in board.audit if a.kind == "unknown_id_in_trailer"]
+
+
+import pytest
+
+
+@pytest.mark.parametrize("source", ["seats", "band", "waiters"])
+def test_a_flow_source_failure_is_said_once_whatever_the_text(source):
+    repo_ev = {"flow": _evidence(unreadable={source: "roster down"}), "levain": _evidence(unreadable={source: "other words"})}
+    board = bs.derive_all(bs.fold(LINES), repo_ev["flow"], now=NOW, repo_evidence=repo_ev, primary_repo="flow")
+    assert sum(f"{source} unreadable" in p for p in board.problems) == 1, board.problems
+
+
+@pytest.mark.parametrize("source", ["seats", "band", "waiters"])
+def test_a_flow_source_that_failed_only_in_the_foreign_copy_is_said_under_its_repo(source):
+    board = _both(LINES, _evidence(), _evidence(main=[DEP_LANDED_ON_B], unreadable={source: "copy broke"}))
+    assert [p for p in board.problems if "unreadable" in p] == [f"levain: {source} unreadable: copy broke"]
+
+
+def test_documents_is_repo_local_so_the_same_failure_in_two_repos_is_said_twice():
+    gap = {"documents": "stat failed"}
+    board = _both(LINES, _evidence(unreadable=gap), _evidence(main=[DEP_LANDED_ON_B], unreadable=gap))
+    assert "levain: documents unreadable: stat failed" in board.problems and "documents unreadable: stat failed" in board.problems
+
+
+def test_primary_repo_none_with_the_primary_object_in_the_mapping_reads_home_items():
+    ev = _evidence()
+    board = bs.derive_all(bs.fold(LINES), ev, now=NOW, repo_evidence={"flow": ev, "levain": _evidence(main=[DEP_LANDED_ON_B])})
+    assert _by(board)["flow#5"].state == "ready"
