@@ -281,3 +281,137 @@ def test_a_launch_with_no_start_stamp_leaves_the_dream_seam_silent(desk):
     from levain.desk import seam_verbs
 
     assert seam_verbs._dream_notes(desk, SimpleNamespace()) == []
+
+
+# --- levain#81: rotation_due, the read-only predicate the rotation will ask --------------------------------------------
+def _requested(desk):
+    """The launch's ``launches.at`` (its request stamp): the start rotation_due compares a save against."""
+    return sqlite3.connect(desk.path).execute("SELECT at FROM launches WHERE launch_id = ?",
+                                              (desk.launch.launch_id,)).fetchone()[0]
+
+
+def _due(desk):
+    from levain.desk import dream_status
+
+    return dream_status.rotation_due(desk, desk.launch)
+
+
+def _saved_after(desk, hours=1, occurrence="occ-1"):
+    _file(desk.directory, "consolidated", parse_stamp(_requested(desk)) + timedelta(hours=hours), occurrence=occurrence)
+
+
+def _snapshot(directory):
+    """Every file under the store's directory: its bytes and its mtime (ns). Equal before and after is "wrote
+    nothing". Two SQLite sidecars are read differently, and only these: a ``mode=ro`` reader of a WAL database maps
+    the ``-shm`` index (shared memory where every reader keeps its read mark, never store content: left out) and
+    opens a ``-wal`` it cannot delete, so an absent ``-wal`` and an empty one are the same content, and the ``-wal`` is
+    compared by its bytes (a page written through it changes them)."""
+    snap = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in sorted(directory.iterdir())
+            if p.is_file() and not p.name.endswith(("-wal", "-shm"))}
+    wal = [p for p in directory.iterdir() if p.name.endswith("-wal")]
+    snap["<wal bytes>"] = b"".join(p.read_bytes() for p in sorted(wal))
+    return snap
+
+
+def test_rotation_is_due_only_at_a_seam_after_a_real_save(desk):
+    assert _due(desk)[0] is False                       # nothing saved yet
+    _saved_after(desk)
+    due, why = _due(desk)
+    assert due is True and why.startswith("at a seam:") and "occurrence occ-1" in why
+
+
+def test_rotation_is_not_due_mid_work_while_the_desk_holds_a_claimed_event(desk, tmp_path):
+    from levain.desk import events
+
+    _saved_after(desk)
+    path = tmp_path / "mon.cred"
+    events.register(desk, "mon", "first_party", path)
+    ev = events.post(desk, "mon", 1, "site_status", {"subject": "taosrv", "state": "down"},
+                     credential=events.read_credential(path)).event
+    assert [e.event_id for e in events.claim_for_launch(desk, desk.launch.launch_id)] == [ev.event_id]
+    due, why = _due(desk)
+    assert due is False and why.startswith("mid-work:") and ev.event_id in why
+    events.ack(desk, ev.event_id, "looked: the site is back", token=desk.token)
+    assert _due(desk)[0] is True                        # the claim was the only thing standing in the way
+
+
+def test_rotation_is_not_due_with_an_open_turn_an_unacknowledged_open(desk):
+    from levain.desk import seam_build, seam_open
+
+    _saved_after(desk)
+    b = seam_build.build(desk, kind="light", signal_kind="silence", signal_key="k-81", queue_dir=desk.directory,
+                         token=desk.token)
+    assert seam_open.record_delivery(desk, b.open_id, "light_verb", recipient=desk.launch.launch_id)
+    due, why = _due(desk)
+    assert due is False and why == f"mid-work: open {b.open_id} was handed to this desk and is not acknowledged"
+    seam_open.acknowledge(desk, b.open_id, token=desk.token)
+    assert _due(desk)[0] is True
+
+
+def test_rotation_is_not_due_when_the_save_predates_the_launch(desk):
+    _saved_after(desk, hours=-1)
+    due, why = _due(desk)
+    assert due is False and "is not after this desk started" in why
+
+
+def test_rotation_is_not_due_after_a_rollback_of_the_save(desk):
+    _saved_after(desk, hours=1, occurrence="occ-1")
+    _file(desk.directory, "rolled-back", parse_stamp(_requested(desk)) + timedelta(hours=2), occurrence="occ-1",
+          reason="rolled back by operator")
+    due, why = _due(desk)
+    assert due is False and "was rolled back" in why
+
+
+def test_rotation_is_not_due_for_a_shadow_night(desk, tmp_path):
+    from levain.dream import shadow
+
+    day = SimpleNamespace(day="2026-11-14", run_id="r", run_dir=tmp_path)
+    c = shadow.shadow_card(day, "shadow\n", occurrence="occ-s", occ_dir=_dir(tmp_path, "occ"), flow_text="flow\n")
+    when = parse_stamp(_requested(desk)) + timedelta(hours=1)
+    review.file_item(CoordStore(desk.directory, clock=lambda: when), "agent", c.body, dedupe_key=c.dedupe_key)
+    due, why = _due(desk)
+    assert due is False and why.startswith("no dream has saved memory")
+
+
+# the timestamp boundary: a save is compared with the launch's REQUEST stamp (launches.at), as fixed-width text.
+# Equal is not after. The request comes before the session starts and loads its memory, so the error direction is
+# toward an extra rotation (a save between request and load is called due), never toward a missed one.
+@pytest.mark.parametrize("offset, due", [
+    (timedelta(microseconds=-1), False),     # a hair before the request: the desk loaded it
+    (timedelta(0), False),                   # equal stamps: not after
+    (timedelta(microseconds=1), True),       # a hair after the request
+    (timedelta(hours=1), True),
+])
+def test_rotation_due_timestamp_boundary(desk, offset, due):
+    _file(desk.directory, "consolidated", parse_stamp(_requested(desk)) + offset)
+    assert _due(desk)[0] is due
+
+
+def test_a_save_between_the_request_and_the_activation_is_called_due(desk):
+    # skew direction: the session may already hold this save (it loads after the request), so the call is an extra,
+    # harmless rotation onto the same memory; the opposite error (a save after the load read as not due) cannot happen
+    requested, active = parse_stamp(_requested(desk)), parse_stamp(_started(desk))
+    assert requested < active
+    _file(desk.directory, "consolidated", requested + (active - requested) / 2)
+    assert _due(desk)[0] is True
+
+
+@pytest.mark.parametrize("seam_reached", [False, True])
+def test_rotation_due_writes_nothing(desk, seam_reached):
+    if seam_reached:
+        _saved_after(desk)
+    before = _snapshot(desk.directory)
+    assert desk.path.name in before                      # the store is a file, and it is in the snapshot
+    assert _due(desk)[0] is seam_reached
+    assert _snapshot(desk.directory) == before           # byte-identical, mtimes included; the WAL's bytes too
+
+
+def test_rotation_due_fails_closed_on_a_launch_that_is_not_an_active_desk_or_a_store_it_cannot_read(desk, tmp_path):
+    from levain.desk import dream_status
+
+    _saved_after(desk)
+    assert dream_status.rotation_due(desk, SimpleNamespace())[0] is False
+    assert dream_status.rotation_due(desk, SimpleNamespace(launch_id="ln-" + "0" * 32)) == \
+        (False, f"no launch ln-{'0' * 32} in this store")
+    due, why = dream_status.rotation_due(CoordStore(tmp_path / "nowhere"), desk.launch)
+    assert due is False and why.startswith("cannot-derive (")
