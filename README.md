@@ -567,7 +567,7 @@ This keeps Ubuntu's host-wide restriction on and is reversible with `apparmor_pa
 
 ## All commands
 
-Every top-level `levain` verb, each with the one line `levain --help` gives it. `levain <verb> --help` has the rest.
+Every verb `levain --help` lists, each with the one line it gives. `levain <verb> --help` has the rest. Some verbs are left out of `levain --help` on purpose and are not in this table.
 
 | Command | What it does |
 | --- | --- |
@@ -583,7 +583,7 @@ Every top-level `levain` verb, each with the one line `levain --help` gives it. 
 | `levain voice` | Premium voice: the provider key Levain holds for read-aloud. |
 | `levain push` | Push a branch only on the operator's signed yes (the gated push path). |
 | `levain seat` | Terminal seat roots: the signed 14-day lease, launch and stop of a lane's seat, the canary. |
-| `levain slot-allow` | List, revoke and re-offer the always-allow rules slot sessions carry (each needs your signed yes). |
+| `levain slot-allow` | List, revoke and re-offer the always-allow rules slot sessions carry. |
 | `levain publish` | Publish a package to PyPI or npm only on the operator's signed yes (the gated path). |
 | `levain limits` | Show or set a session's budgets (tool calls, active hours, tokens, repeats), or extend a halted session. |
 | `levain ask` | Ask the operator a question and keep working (the question band). |
@@ -609,7 +609,7 @@ Every top-level `levain` verb, each with the one line `levain --help` gives it. 
 | `levain adopt-answers` | Make your hand-edited seed files the interview record (.levain/answers.json). |
 | `levain intentions` | Intention verbs for an install (germinate, keep-migrate). |
 | `levain setup-isolation` | Create a dedicated unprivileged user for an entity's bash (one-time, needs sudo). |
-| `levain hands` | Sign the entity's own user in to Claude Code or Codex (its own login, never a copy of yours). `levain hands launch claude\|codex` (macOS) starts a chat AS that user with only the registered MCP servers, on a terminal of its own that levain relays (never yours); revoking a server it carries ends it (exit 77). `levain hands mcp register <name> --url ...` and `levain hands mcp revoke <id or name>` sign a hands MCP entry in and out; the cockpit's Grants tab and the phone list each entry by name, and the phone's passkey can revoke it. |
+| `levain hands` | Sign the entity's own user in to Claude Code or Codex (its own login, never a copy of yours). |
 | `levain ws-git` | Run git in the entity's workspace as the entity's user, with hooks and the like off. |
 | `levain ws-adopt` | Import one of your repositories into the entity's workspace, owned by the entity's user. |
 | `levain ws-put` | Copy one file of yours into the entity's workspace, written by the entity's user. |
@@ -617,6 +617,8 @@ Every top-level `levain` verb, each with the one line `levain --help` gives it. 
 | `levain team` | Share one project's decisions across a team of engineers (git ledger + edit-time hook). |
 | `levain ping` | Web push to paired phones: keys, a test ping, the notification record, presence. |
 | `levain notify` | Notify tokens: the credential a service posts a notice at your phone with. |
+
+More on `levain hands`: `levain hands launch claude|codex` (macOS) starts a chat AS that user with only the registered MCP servers, on a terminal of its own that levain relays (never yours); revoking a server it carries ends it (exit 77). `levain hands mcp register <name> --url ...` and `levain hands mcp revoke <id or name>` sign a hands MCP entry in and out; the cockpit's Grants tab and the phone list each entry by name, and the phone's passkey can revoke it.
 
 ## Audience
 
