@@ -315,6 +315,11 @@ Nothing is forced. A network or authentication failure is recorded and retried a
   `--allow-domain` and credentials for it are readable from the seat's account, a seat's own Bash could use them.
   The push goes through Levain's executor outside the sandbox and needs no network of the seat's own, so keep your
   git host out of `--allow-domain`.
+- **No header is stripped on a CONNECT route.** On a credentialed brokered route the broker injects the credential and drops any
+  `x-api-key`, `api-key` or `Cookie` the client sends, consumes the one `Authorization` that carries the slot ticket
+  (it reaches keys as the ticket, never as a forwarded header) and refuses a second one; a CONNECT tunnel (an `egress`
+  or `subscription_passthrough` route) is not terminated by the broker, which routes on the host and the SNI only, so
+  it never sees, let alone removes, a credential the client sends inside it.
 - **A kill between steps.** A hard kill between git returning and the pushed-tip mark being written re-pushes the
   same tip next time; the push is a no-op.
 - **No seat has run end to end under the egress profile on a real machine.** The commit under the final `.git`
