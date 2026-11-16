@@ -592,6 +592,7 @@
   "tests/test_dispatch_stager_send.py": 5.8,
   "tests/test_dispatch_verifier_report.py": 7.0,
   "tests/test_docs.py": 9.1,
+  "tests/test_docs_host_grants.py": 0.8,
   "tests/test_docs_linux_first_install.py": 0.2,
   "tests/test_docs_seat_profile.py": 0.7,
   "tests/test_docs_server.py": 2.1,
