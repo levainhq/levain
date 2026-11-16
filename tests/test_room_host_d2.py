@@ -90,26 +90,26 @@ def relays(qdir):
 
 # --- which tools exist ------------------------------------------------------------------------------------------------
 def test_no_host_is_exactly_the_old_door():
-    assert names(None) == ["propose_drop"]
-    assert room_host.door_tools(None) == ("propose_drop",)
+    assert names(None) == ["propose_drop", "propose_envelope"]
+    assert room_host.door_tools(None) == ("propose_drop", "propose_envelope")
 
 
 def test_relay_without_tap_retires_the_card_tool_and_adds_replies(host):
-    assert names(host) == ["relay_to_desk", "desk_replies", "note_to_desk"]
+    assert names(host) == ["relay_to_desk", "desk_replies", "note_to_desk", "propose_envelope"]
     assert names(HostCommands(relay=host.relay, replies=host.replies, relay_without_tap=True)) == \
-        ["relay_to_desk", "desk_replies"]
+        ["relay_to_desk", "desk_replies", "propose_envelope"]
 
 
 def test_a_relay_the_host_did_not_free_of_the_tap_keeps_the_card(host):
     h = HostCommands(relay=host.relay, replies=host.replies, relay_without_tap=False)
-    assert names(h) == ["propose_drop", "desk_replies"]
+    assert names(h) == ["propose_drop", "desk_replies", "propose_envelope"]
     assert names(HostCommands(relay=host.relay, replies=host.replies, note=host.note)) == \
-        ["propose_drop", "desk_replies", "note_to_desk"]
-    assert names(HostCommands(relay=host.relay)) == ["propose_drop"]
+        ["propose_drop", "desk_replies", "note_to_desk", "propose_envelope"]
+    assert names(HostCommands(relay=host.relay)) == ["propose_drop", "propose_envelope"]
 
 
 def test_replies_alone_adds_a_read_tool_and_retires_nothing(host):
-    assert names(HostCommands(replies=host.replies)) == ["propose_drop", "desk_replies"]
+    assert names(HostCommands(replies=host.replies)) == ["propose_drop", "desk_replies", "propose_envelope"]
 
 
 def test_a_retired_tool_is_unknown(host, world):
@@ -326,8 +326,8 @@ def test_the_note_tool_is_offered_only_when_the_host_gave_a_note(host, world):
     assert "note_to_desk" not in names(plain)
     r = note_call(world["launch"], plain, {"note": "hello"})
     assert r["error"]["code"] == -32602 and "unknown tool" in r["error"]["message"]
-    assert names(HostCommands(note=host.note)) == ["propose_drop", "note_to_desk"]       # a note retires nothing
-    assert names(host)[-1] == "note_to_desk"
+    assert names(HostCommands(note=host.note)) == ["propose_drop", "note_to_desk", "propose_envelope"]   # a note retires nothing
+    assert names(host)[-2:] == ["note_to_desk", "propose_envelope"]
 
 
 def test_the_note_tool_has_one_argument_named_note_and_the_cap_leaves_room_for_the_prefix(host):
@@ -792,14 +792,21 @@ def test_a_note_whose_lifeline_could_not_be_opened_is_reported_not_filed(host, w
 
 # --- containment: the argv, the probe, the digest ---------------------------------------------------------------------
 def test_argv_allows_exactly_the_hosts_door_tools(host):
+    def base_door(tools):
+        argv = cs.room_argv(mcp_config="/r/m.json", settings="/r/s.json", door_tools=tools,
+                            session_id="s" * 8 + "-0000-4000-8000-" + "0" * 12)
+        return argv[argv.index("--allowedTools") + 1].split(",")
+
     base = cs.room_argv(mcp_config="/r/m.json", settings="/r/s.json", session_id="s" * 8 + "-0000-4000-8000-" + "0" * 12)
     allowed = base[base.index("--allowedTools") + 1].split(",")
-    assert allowed == [*cs.ROOM_TOOLS, cs.ROOM_MCP_TOOL]                      # no host: unchanged
+    assert allowed == [*cs.ROOM_TOOLS, cs.ROOM_MCP_TOOL]                      # the vendor-side default: unchanged
+    allowed = base_door(room_host.door_tools(None))
+    assert allowed == [*cs.ROOM_TOOLS, cs.ROOM_MCP_TOOL, "mcp__levain_room__propose_envelope"]   # no host: both tools
     h = cs.room_argv(mcp_config="/r/m.json", settings="/r/s.json", session_id="s" * 8 + "-0000-4000-8000-" + "0" * 12,
                      door_tools=room_host.door_tools(host))
     allowed = h[h.index("--allowedTools") + 1].split(",")
     assert allowed == [*cs.ROOM_TOOLS, "mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies",
-                       "mcp__levain_room__note_to_desk"]
+                       "mcp__levain_room__note_to_desk", "mcp__levain_room__propose_envelope"]
     with pytest.raises(ValueError):
         cs.room_door_tools(("propose_drop", "Bash"))
     with pytest.raises(ValueError):
@@ -816,12 +823,15 @@ def _init(extra):
 def test_the_probe_wants_exactly_the_configured_tools(host):
     names_ = room_host.door_tools(host)
     relay_init = _init(["mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies",
-                        "mcp__levain_room__note_to_desk"])
+                        "mcp__levain_room__note_to_desk", "mcp__levain_room__propose_envelope"])
     assert cs.open_probe(relay_init, names_).live
     assert not cs.open_probe(relay_init).live                                   # a door configured no host is not this one
     assert not cs.open_probe(_init([cs.ROOM_MCP_TOOL]), names_).live              # the retired card tool is EXTRA... and missing
     assert not cs.open_probe(_init(["mcp__levain_room__relay_to_desk"]), names_).live
-    assert not cs.open_probe(_init(["mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies"]), names_).live   # the note is configured, so it is wanted
+    assert not cs.open_probe(_init(["mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies",
+                                    "mcp__levain_room__propose_envelope"]), names_).live   # the note is configured, so it is wanted
+    assert not cs.open_probe(_init(["mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies",
+                                    "mcp__levain_room__note_to_desk"]), names_).live       # the envelope tool is wanted too
     assert cs.open_probe(_init([cs.ROOM_MCP_TOOL])).live
 
 
@@ -829,7 +839,7 @@ def test_the_tripwire_context_names_the_hosts_tools(host):
     ctx = room_launch.room_tripwire_context("/w", room_host.door_tools(host))
     tools = {t for t, _src in ctx.rule_allow}
     assert tools == {*cs.ROOM_TOOLS, "mcp__levain_room__relay_to_desk", "mcp__levain_room__desk_replies",
-                     "mcp__levain_room__note_to_desk"}
+                     "mcp__levain_room__note_to_desk", "mcp__levain_room__propose_envelope"}
     assert {t for t, _src in room_launch.room_tripwire_context("/w").rule_allow} == {*cs.ROOM_TOOLS, cs.ROOM_MCP_TOOL}
 
 
@@ -851,9 +861,9 @@ def test_the_digest_binds_the_host_commands_and_is_unchanged_without_them(host):
 
 
 def test_the_setting_without_a_host_opens_the_old_door():
-    assert room_launch.RoomSetting("/w").door_names == ("propose_drop",)
+    assert room_launch.RoomSetting("/w").door_names == ("propose_drop", "propose_envelope")
     assert room_launch.RoomSetting("/w", host=HostCommands(relay=("/a",), relay_without_tap=True)).door_names == \
-        ("relay_to_desk",)
+        ("relay_to_desk", "propose_envelope")
 
 
 # --- the page's word --------------------------------------------------------------------------------------------------
@@ -902,7 +912,7 @@ def test_the_real_stdio_door_reads_the_hosts_commands_from_its_environment(host,
                          input=msgs, capture_output=True, text=True, env=env, timeout=60)
     assert out.returncode == 0, out.stderr
     replies = [json.loads(x) for x in out.stdout.splitlines()]
-    assert [t["name"] for t in replies[0]["result"]["tools"]] == ["relay_to_desk", "desk_replies", "note_to_desk"]
+    assert [t["name"] for t in replies[0]["result"]["tools"]] == ["relay_to_desk", "desk_replies", "note_to_desk", "propose_envelope"]
     assert "relayed to the desk" in replies[1]["result"]["content"][0]["text"], replies[1]
     assert replies[2]["result"]["content"][0]["text"] == "10:42 on it"
     assert replies[3]["result"]["isError"] is True and "not a desk thread this room relayed to" in \

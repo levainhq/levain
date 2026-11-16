@@ -684,29 +684,41 @@ class EnvelopeStore(CoordStore):
 
     def _live_refusal(self, conn: sqlite3.Connection, now: str, envelope_id: str, thread_id: str,
                       authority: AuthoritySnapshot, new_pin: bool) -> str | None:
+        refused = self._store_refusal(conn, now, envelope_id, thread_id, new_pin)
+        if refused is not None:
+            return refused
         stored = self._envelope(conn, envelope_id)
+        refused = env.refusal(stored.payload, stored.signature, authority, stored.body, ssh_keygen=self._ssh_keygen)
+        if refused is not None:
+            return f"envelope {envelope_id}'s signature no longer holds: {refused}"
+        return None
+
+    @classmethod
+    def _store_refusal(cls, conn: sqlite3.Connection, now: str, envelope_id: str, thread_id: str,
+                       new_pin: bool = False) -> str | None:
+        """:meth:`_live_refusal` by the STORE's own facts alone, no verifier: bound, signed for the thread's revision
+        (not superseded with ``new_pin``), not killed or ended with its thread, before its stop. A display that says
+        whether a grant is running reads this (the signature is the sign step's check)."""
+        stored = cls._envelope(conn, envelope_id)
         if stored is None:
             return f"no envelope {str(envelope_id)[:40]}"
         row = conn.execute("SELECT rev FROM envelope_binds WHERE envelope_id = ? AND thread_id = ?",
                            (envelope_id, thread_id)).fetchone()
         if row is None:
             return f"envelope {envelope_id} is not bound to thread {str(thread_id)[:40]}"
-        if self._thread(conn, thread_id).rev != row[0]:
+        if cls._thread(conn, thread_id).rev != row[0]:
             return f"thread {thread_id} moved past the revision envelope {envelope_id} was signed for"
         if new_pin:
-            head = self._head(conn, thread_id)
+            head = cls._head(conn, thread_id)
             if head is None or head.envelope_id != envelope_id:
                 return f"envelope {envelope_id} is superseded for thread {thread_id}"
-        rows = self._attenuations(conn, envelope_id, thread_id)
+        rows = cls._attenuations(conn, envelope_id, thread_id)
         if any(k == "kill" for k, _v in rows):
             return f"envelope {envelope_id} was killed"
         if any(k == "thread_done" for k, _v in rows):
             return f"thread {thread_id} is done, which ended envelope {envelope_id}"
-        if parse_stamp(now) >= self._stop(stored, rows):
+        if parse_stamp(now) >= cls._stop(stored, rows):
             return f"envelope {envelope_id} stopped"
-        refused = env.refusal(stored.payload, stored.signature, authority, stored.body, ssh_keygen=self._ssh_keygen)
-        if refused is not None:
-            return f"envelope {envelope_id}'s signature no longer holds: {refused}"
         return None
 
     def launch_allowance(self, envelope_id: str, thread_id: str, where_repo: str, *, authority: AuthoritySnapshot,

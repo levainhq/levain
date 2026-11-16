@@ -216,7 +216,12 @@
       stream: stream,
       proposals: (body.proposals || []).map(function (p) {
         return { id: String(p.proposal_id), state: String(p.state), words: String(p.words == null ? "" : p.words),
-                 summary: String(p.summary == null ? "" : p.summary), about: p.about == null ? "" : String(p.about) };
+                 summary: String(p.summary == null ? "" : p.summary), about: p.about == null ? "" : String(p.about),
+                 // an ENVELOPE card (the server's kind): the thread it is for, his quoted words, the newer card that
+                 // replaced it, and whether a signed grant is running on that thread
+                 kind: p.kind === "envelope" ? "envelope" : "drop", thread: p.thread_id == null ? "" : String(p.thread_id),
+                 title: p.title == null ? "" : String(p.title), quoted: p.quoted_words == null ? "" : String(p.quoted_words),
+                 replacedBy: p.replaced_by == null ? "" : String(p.replaced_by), signedHead: p.signed_head === true };
       })
     };
   }
@@ -408,6 +413,7 @@
   function renderCard(doc, c, hooks, drafts) {
     var card = el(doc, "div", "rv-card rv-card-" + c.state.replace(/[^a-z]/g, ""));
     card.setAttribute("data-proposal", c.id);
+    if (c.kind === "envelope") return renderEnvelopeCard(doc, c, hooks, drafts, card);
     if (c.state === "committed") { card.appendChild(el(doc, "div", "rv-note", "Dropped: these words went to the desk.")); card.appendChild(el(doc, "div", "rv-text", c.words)); return card; }
     if (c.state === "dismissed") { card.appendChild(el(doc, "div", "rv-note", "Not dropped.")); return card; }
     card.appendChild(el(doc, "div", "rv-note", c.state === "expired" ? "This card is from an earlier conversation and cannot be sent." : "The room can drop this to the desk. Nothing is sent until you tap."));
@@ -425,6 +431,80 @@
     go.addEventListener("click", function () { hooks.onCommit(c, ta.value, note, [go, no]); });
     no.addEventListener("click", function () { hooks.onDismiss(c, note, [go, no]); });
     card.appendChild(go); card.appendChild(no); card.appendChild(note);
+    return card;
+  }
+
+  // An ENVELOPE card: the same card, a second kind. His quoted words come first, then the thread it is for, then the room's
+  // spec in the same editable field (labelled as the ROOM's draft, never as his words), then the server's plain-words
+  // reading of the bytes the field holds NOW, and the room's summary last. "Draft it" is enabled only while the reading on
+  // screen is for exactly these bytes; the tap posts the thread the card shows and the hash of that reading.
+  function renderEnvelopeCard(doc, c, hooks, drafts, card) {
+    var open = "/sign/drop#thread=" + encodeURIComponent(c.thread);
+    if (c.state === "committed" || c.state === "dismissed") {
+      card.appendChild(el(doc, "div", "rv-note", c.state === "committed" ? "Drafted: open the thread to review and sign. Nothing is signed yet." : "Not drafted."));
+      if (c.state === "committed") {
+        card.appendChild(el(doc, "div", "rv-text", c.words));
+        var a = el(doc, "a", "rv-link", "Open the thread"); a.setAttribute("href", open); card.appendChild(a);
+      }
+      return card;
+    }
+    var replaced = c.replacedBy !== "", dead = c.state === "expired";
+    card.appendChild(el(doc, "div", "rv-note", dead ? "This card is from an earlier conversation and cannot be sent."
+      : replaced ? "This card was replaced by the newer card below; nothing here can be drafted."
+      : "The room can draft this for you to review. Nothing is signed or sent until you tap, and signing is a separate tap."));
+    card.appendChild(el(doc, "div", "rv-note", "You said:"));
+    card.appendChild(el(doc, "div", "rv-text rv-quote", c.quoted));
+    card.appendChild(el(doc, "div", "rv-note", "For thread " + c.thread + (c.title ? ", titled " + c.title : "")));
+    card.appendChild(el(doc, "div", "rv-note", "Drafted by the room from your words. Edit freely."));
+    var ta = el(doc, "textarea", "rv-cardwords");
+    ta.setAttribute("rows", "6"); ta.setAttribute("aria-label", "The spec the room drafted for you to edit");
+    prose(ta, "roomcardwords");
+    ta.value = own(drafts, c.id) ? drafts[c.id] : c.words;     // an edit survives a redraw
+    card.appendChild(ta);
+    var reading = el(doc, "div", "rv-reading");
+    reading.setAttribute("role", "status");
+    card.appendChild(reading);
+    if (c.signedHead) card.appendChild(el(doc, "div", "rv-note", "This drafts a replacement. What you signed keeps running until you sign the new one."));
+    card.appendChild(el(doc, "div", "rv-summary-label rv-note", "The room's summary (information, not your words)"));
+    card.appendChild(el(doc, "div", "rv-summary", c.summary));
+    var note = el(doc, "div", "rv-sendnote"), go = el(doc, "button", "rv-commit", "Draft it"), no = el(doc, "button", "rv-dismiss", "Not now");
+    go.setAttribute("type", "button"); no.setAttribute("type", "button"); note.setAttribute("role", "status");
+    go.disabled = true;
+    var shown = null, timer = null, gen = 0, pending = false;   // pending: a tap is in flight, the field is locked
+    function say(text) { clear(reading); reading.appendChild(el(doc, "div", "rv-note", text)); }
+    function ask() {
+      var words = ta.value, mine = ++gen;
+      shown = null; go.disabled = true;
+      if (dead || replaced) { say("No reading: this card cannot be drafted."); return; }   // never a read it cannot use
+      if (!words.trim()) { say("Nothing to read: the field is empty."); return; }
+      say("Reading...");
+      hooks.onPreview(c, words, function (r) {
+        if (pending) return;                                       // a tap is in flight: its answer redraws the card
+        if (mine !== gen || ta.value !== words) return;           // the field moved on: a newer reading is on its way
+        if (r && r.status === 200 && r.json && typeof r.json.input_sha256 === "string" && Array.isArray(r.json.lines)) {
+          shown = { words: words, sha: r.json.input_sha256 };
+          clear(reading);
+          reading.appendChild(el(doc, "div", "rv-note", "If you tap, the room's spec as you now have it reads:"));
+          r.json.lines.forEach(function (ln) {
+            reading.appendChild(el(doc, "div", ln.wider ? "rv-readline rv-wider" : "rv-readline", String(ln.text) + (ln.wider ? " (more than now)" : "")));
+          });
+          go.disabled = dead || replaced;
+        } else say("Cannot draft this yet: " + ((r && r.json && r.json.message) || "the server answered " + (r ? r.status : "nothing") + "."));
+      });
+    }
+    ta.addEventListener("input", function () {
+      drafts[c.id] = ta.value; if (hooks.saveCards) hooks.saveCards();
+      shown = null; go.disabled = true; gen++; clearTimeout(timer); timer = setTimeout(ask, 350);
+    });
+    go.addEventListener("click", function () {
+      if (pending || !shown || ta.value !== shown.words) return;    // never a tap on a reading of other bytes
+      pending = true; ta.readOnly = true; clearTimeout(timer);      // the bytes in flight are the bytes on screen
+      hooks.onCommit(c, ta.value, note, [go, no], { thread_id: c.thread, input_sha256: shown.sha,
+        settled: function () { pending = false; ta.readOnly = false; } });
+    });
+    no.addEventListener("click", function () { hooks.onDismiss(c, note, [go, no]); });
+    card.appendChild(go); card.appendChild(no); card.appendChild(note);
+    ask();
     return card;
   }
 
@@ -459,7 +539,7 @@
     }
     var keep = {};
     m.proposals.forEach(function (c, i) {
-      var key = c.state + "\u0000" + c.words + "\u0000" + c.summary, have = own(st.cards, c.id) ? st.cards[c.id] : null;
+      var key = [c.state, c.words, c.summary, c.kind, c.thread, c.title, c.quoted, c.replacedBy, c.signedHead].join("\u0000"), have = own(st.cards, c.id) ? st.cards[c.id] : null;
       if (!have || have.key !== key) { st.cards[c.id] = have = { key: key, node: renderCard(doc, c, hooks, drafts) }; }
       keep[c.id] = true;
       if (st.cardsBox.children[i] !== have.node) st.cardsBox.insertBefore(have.node, st.cardsBox.children[i] || null);
@@ -728,18 +808,26 @@
           if (r.status === 200) { last = ""; pull(); } else done();
         }).catch(function () { mnote.textContent = "Not marked: the server could not be reached."; done(); });
       },
-      onCommit: function (card, words, cnote, btns) {
+      onPreview: function (card, words, done) {
+        post("proposal/" + encodeURIComponent(card.id) + "/preview", { words: words }).then(done).catch(function () {
+          done({ status: 0, json: { message: "the server could not be reached." } });
+        });
+      },
+      onCommit: function (card, words, cnote, btns, echo) {
         if (!words.trim()) { cnote.textContent = "Nothing to drop: the field is empty."; return; }
         btns.forEach(function (b) { b.disabled = true; });
         var key = card.id + "|" + words;
         if (!own(hooks.ids, key)) { hooks.ids[key] = newId(); saveCards(); }
-        cnote.textContent = "Dropping...";
-        post("proposal/" + encodeURIComponent(card.id) + "/commit", { words: words, outbox_id: hooks.ids[key] }).then(function (r) {
+        cnote.textContent = echo ? "Drafting..." : "Dropping...";
+        var sent = { words: words, outbox_id: hooks.ids[key] };
+        if (echo) { sent.thread_id = echo.thread_id; sent.input_sha256 = echo.input_sha256; }   // the thread and the reading he was shown
+        post("proposal/" + encodeURIComponent(card.id) + "/commit", sent).then(function (r) {
           if (r.status === 200) { delete drafts[card.id]; saveCards(); last = ""; pull(); return; }
           if (r.status < 500) { delete hooks.ids[key]; saveCards(); }
-          cnote.textContent = "Not dropped: " + ((r.json && r.json.message) || "the server answered " + r.status + ".");
+          if (echo && echo.settled) echo.settled();          // refused: the envelope card's field unlocks (a 200 keeps it locked until the redraw)
+          cnote.textContent = (echo ? "Not drafted: " : "Not dropped: ") + ((r.json && r.json.message) || "the server answered " + r.status + ".");
           btns.forEach(function (b) { b.disabled = card.state === "expired" && b.className === "rv-commit"; });
-        }).catch(function () { cnote.textContent = "The server could not be reached; dropping again will not duplicate it."; btns.forEach(function (b) { b.disabled = false; }); });
+        }).catch(function () { if (echo && echo.settled) echo.settled(); cnote.textContent = "The server could not be reached; dropping again will not duplicate it."; btns.forEach(function (b) { b.disabled = false; }); });
       },
       onDismiss: function (card, cnote, btns) {
         btns.forEach(function (b) { b.disabled = true; });

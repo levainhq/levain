@@ -40,7 +40,7 @@ from typing import Any, NamedTuple, Optional
 from levain.launch import child_env
 
 __all__ = ["HOSTCMD_ENV", "NOT_STARTED", "NOTE_MAX", "NOTE_PREFIX", "NOTE_TOOL", "OUTPUT_MAX", "TIMED_OUT", "TIMEOUT",
-           "HostCommands", "HostCommandError", "RELAY_TOOL", "REPLIES_TOOL", "Ran", "THREAD_RE", "door_tools", "from_env",
+           "ENVELOPE_TOOL", "HostCommands", "HostCommandError", "RELAY_TOOL", "REPLIES_TOOL", "Ran", "THREAD_RE", "door_tools", "from_env",
            "run"]
 
 HOSTCMD_ENV = "LEVAIN_ROOM_HOST_COMMANDS"
@@ -50,6 +50,7 @@ TIMEOUT = 30.0
 OUTPUT_MAX = 4000
 _ARGV_MAX = 32
 _ARG_MAX = 1024
+ENVELOPE_TOOL = "propose_envelope"      # an envelope CARD for his tap; independent of the relay (it carries no words of his)
 RELAY_TOOL = "relay_to_desk"
 REPLIES_TOOL = "desk_replies"
 NOTE_TOOL = "note_to_desk"
@@ -108,9 +109,11 @@ class HostCommands:
 
 def door_tools(host: Optional[HostCommands]) -> tuple[str, ...]:
     """The door's tool names (short, as ``tools/list`` names them) for ``host``: ``propose_drop`` unless the relay
-    retires it, then the relay, then the replies reader, then the note. No host: ``("propose_drop",)``, as before D2."""
+    retires it, then the relay, then the replies reader, then the note, then ``propose_envelope``. No host:
+    ``("propose_drop", "propose_envelope")``. The envelope tool is in EVERY list: it proposes a card for his tap and
+    writes no drop, so the relay does not retire it (only ``propose_drop`` is retired)."""
     if host is None:
-        return ("propose_drop",)
+        return ("propose_drop", ENVELOPE_TOOL)
     out = [] if host.relays else ["propose_drop"]
     if host.relays:
         out.append(RELAY_TOOL)
@@ -118,6 +121,7 @@ def door_tools(host: Optional[HostCommands]) -> tuple[str, ...]:
         out.append(REPLIES_TOOL)
     if host.note is not None:       # a note retires nothing, so it does not depend on the relay
         out.append(NOTE_TOOL)
+    out.append(ENVELOPE_TOOL)
     return tuple(out)
 
 

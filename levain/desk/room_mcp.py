@@ -2,7 +2,7 @@
 band's door pattern (:mod:`levain.consent.band_mcp`: JSON-RPC 2.0, one message per line, its error shape). Stdlib plus
 levain. Run as ``<python> -P -m levain.desk.room_mcp [--launch <launch id>]``. Its tools are the ``*_TOOL`` tables below,
 chosen by the host's commands (:func:`levain.desk.room_host.door_tools`; see "Host tools"); with no host, ``propose_drop``
-alone.
+and ``propose_envelope``.
 
 The door carries no authority. It never commits and never writes a drop. ``propose_drop`` takes no words from the model: a
 drop's words are the operator's own quoted messages, named by id and copied from the store by
@@ -55,7 +55,7 @@ from levain.desk.room_host import HOSTCMD_ENV, THREAD_RE, HostCommandError, Host
 from levain.consent.band_mcp import (INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
                                      _RpcError, _error, _ok)
 
-__all__ = ["TOOL", "RELAY_TOOL", "REPLIES_TOOL", "NOTE_TOOL", "FRAME_MAX", "LAUNCH_ENV", "handle",
+__all__ = ["TOOL", "RELAY_TOOL", "REPLIES_TOOL", "NOTE_TOOL", "ENVELOPE_TOOL", "FRAME_MAX", "LAUNCH_ENV", "handle",
            "launch_from", "main", "serve"]
 
 LAUNCH_ENV = "LEVAIN_ROOM_LAUNCH"
@@ -143,6 +143,38 @@ NOTE_TOOL: dict[str, Any] = {
 }
 
 
+_WORK_THREAD = re.compile(r"th-[0-9a-f]{32}")
+_ENVELOPE_ARGS = frozenset({"quote_ids", "thread", "spec", "summary"})
+ENVELOPE_TOOL: dict[str, Any] = {
+    "name": room_host.ENVELOPE_TOOL,
+    "description": (
+        "Propose an ENVELOPE DRAFT for a work thread, as a card in the room, when he has told you in this room what he "
+        "wants a worker allowed to do (where, how long, what it may land). Name his OWN messages that say so (quote_ids, "
+        "in order), the open work thread (th-...) it is for, and the spec you read from his words. He sees his words, the "
+        "thread, YOUR spec in an editable field, a plain-words reading of it and your summary; he taps to make an "
+        "UNSIGNED draft on that thread, and signs it separately. This authorises nothing and signs nothing. The spec is an "
+        "OBJECT (never text) with keys among where [{repo: ABSOLUTE_PATH, paths: [...]}], lands [{repo, onto}], pushes, "
+        "publishes, budget {tool_calls, tokens, dollars_cents, hours} and stop (a duration such as \"2h\"): name only "
+        "what he said. A launch grant is never part of a draft. Name the repo and branch explicitly."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "quote_ids": {"type": "array", "minItems": 1, "items": {"type": "string"},
+                          "description": "Ids (cm-...) of the operator's own messages in this room that ask for it, in order. "
+                                         "Each of his messages reaches you with its id in the <room-context> block ahead of it."},
+            "thread": {"type": "string", "description": "The open work thread (th-...) this draft is for."},
+            "spec": {"type": "object", "description": "The envelope spec you read from his words: an object, not text.",
+                     "properties": {"where": {"type": "array"}, "lands": {"type": "array"}, "pushes": {"type": "array"},
+                                    "publishes": {"type": "array"}, "budget": {"type": "object"}, "stop": {"type": "string"}},
+                     "additionalProperties": False},
+            "summary": {"type": "string", "description": "Why this spec follows from his words, in your own words."},
+        },
+        "required": ["quote_ids", "thread", "spec", "summary"],
+        "additionalProperties": False,
+    },
+}
+
+
 def _has_control(text: str) -> bool:
     return any(ord(c) < 32 and c not in "\n\t" or ord(c) == 127 for c in text)
 
@@ -220,6 +252,41 @@ def _relay_arguments(raw: Any) -> list[str]:
     if not all(isinstance(i, str) and 0 < len(i) <= _ID_MAX and not _has_control(i) for i in ids):
         raise _RpcError(INVALID_PARAMS, "every quote id must be a short string")
     return list(ids)
+
+
+def _envelope_arguments(raw: Any) -> tuple[list[str], str, dict[str, Any], str]:
+    """``(quote_ids, thread, spec, summary)``, shape-checked. The door takes no words and no launch grant: a ``launches``
+    key (top level or in the spec) is refused by name, the spec is an OBJECT whose keys are the draft's, and whether it
+    parses is the dry run's (:func:`_propose_envelope`), so a card is never made for a spec a tap could only refuse."""
+    from levain.desk import envelope_drafts as drafts
+    from levain.desk import room
+
+    if isinstance(raw, dict) and "launches" in raw:
+        raise _RpcError(INVALID_PARAMS, "a draft never carries a launch grant: launches is not an argument")
+    raw = _reject_spoofs_and_extras(raw, _ENVELOPE_ARGS)
+    missing = [k for k in ("quote_ids", "thread", "spec", "summary") if k not in raw]
+    if missing:
+        raise _RpcError(INVALID_PARAMS, f"missing arguments: {', '.join(missing)}")
+    ids = _relay_arguments({"quote_ids": raw["quote_ids"]})
+    thread = raw["thread"]
+    if not isinstance(thread, str) or _WORK_THREAD.fullmatch(thread) is None:
+        raise _RpcError(INVALID_PARAMS, "thread must be a work thread id (th- and 32 hex digits)")
+    spec = raw["spec"]
+    if isinstance(spec, str):
+        raise _RpcError(INVALID_PARAMS, "spec is an object, not text: this door takes no words of its own")
+    if not isinstance(spec, dict) or not spec:
+        raise _RpcError(INVALID_PARAMS, "spec must be a non-empty object")
+    if "launches" in spec:
+        raise _RpcError(INVALID_PARAMS, "a draft never carries a launch grant: launches is not part of the spec")
+    extra = sorted(repr(str(k)[:40]) for k in spec if k not in drafts._DRAFT_SPEC_KEYS)      # repr: a key is never echoed raw
+    if extra:
+        raise _RpcError(INVALID_PARAMS, f"the spec's keys are among {sorted(drafts._DRAFT_SPEC_KEYS)}: not {', '.join(extra)}")
+    summary = raw["summary"]
+    if not isinstance(summary, str):
+        raise _RpcError(INVALID_PARAMS, "summary must be a string")
+    if len(summary) > room.SUMMARY_MAX:
+        raise _RpcError(INVALID_PARAMS, f"summary is over {room.SUMMARY_MAX} characters")
+    return ids, thread, spec, summary
 
 
 def _unseen(text: str) -> str | None:
@@ -411,6 +478,46 @@ def _propose(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
                  "until you tap.", False)
 
 
+def _propose_envelope(launch_id: str, params: dict[str, Any]) -> dict[str, Any]:
+    """An envelope CARD for a work thread: the spec is canonicalised to the text the card's field will hold, DRY-RUN through
+    :func:`levain.desk.envelope_drafts.parse_spec` (the one reader a preview and a tap use: grammar, repeated keys, escaped
+    and literal unshowable characters, size), and only then a proposal and its spec row are written: no drop, no draft."""
+    from levain.consent.queue import default_queue_dir
+    from levain.desk import envelope_drafts as drafts
+    from levain.desk import lease, room
+    from levain.desk.envelopes import EnvelopeStore
+    from levain.desk.store import WORDS_MAX, CoordError, Source, StoreAbsent
+    from levain.dispatch.jobs import JobStoreError
+
+    ids, thread, spec, summary = _envelope_arguments(params.get("arguments"))
+    try:
+        text = json.dumps(spec, indent=2, ensure_ascii=False)
+    except RecursionError:          # the indented dump recurses; nesting this deep is a refusal, never a fault
+        return _refused("this spec is not an envelope spec: it is nested too deeply")
+    if len(text) > WORDS_MAX:
+        return _refused(f"the spec is over {WORDS_MAX} characters")
+    store = EnvelopeStore(default_queue_dir())
+    try:
+        # the dry run reads nothing from the store (parse_spec never opens it), so a refused call makes nothing; the
+        # store and the launch are then checked through the non-creating door, under the write lock
+        drafts.parse_spec(text, Source(), store, subject="this spec")
+        with store._write(create=False) as (conn, now):
+            ln = lease.launch(conn, launch_id)
+            if ln is None:
+                return _refused("the launch this door was started for does not exist")
+            if ln.role != "room":
+                return _refused("this door's launch is not a room launch; only the room proposes")
+            if ln.state != "active":
+                return _refused(f"the room launch is {ln.state}, not active")
+            proposal = room.propose_spec(conn, ln.launch_id, ids, thread, text, summary, now=now)
+    except (CoordError, StoreAbsent) as exc:
+        return _refused(str(exc))
+    except (sqlite3.Error, JobStoreError, OSError) as exc:
+        return _text(f"levain room: a machine fault, nothing was proposed ({type(exc).__name__}: {exc}); try again", True)
+    return _text(f"levain room: envelope card {proposal.proposal_id} made for {thread}. A card is waiting for your tap; "
+                 "nothing is drafted until you tap, and nothing is signed until you sign it separately.", False)
+
+
 def launch_from(value: Any) -> str | None:
     """``value`` when it is a well-formed launch id, else None."""
     from levain.desk.lease import _LAUNCH_ID
@@ -449,6 +556,8 @@ def handle(launch_id: str, msg: Any, host: HostCommands | None = None) -> dict[s
                 raise _RpcError(INVALID_PARAMS, f"unknown tool {str(name)[:60]!r}")
             if name == _NAME:
                 return _ok(rid, _propose(launch_id, params))
+            if name == room_host.ENVELOPE_TOOL:
+                return _ok(rid, _propose_envelope(launch_id, params))
             if name == room_host.RELAY_TOOL and host is not None and host.relays:
                 return _ok(rid, _relay(launch_id, params, host))
             if name == room_host.REPLIES_TOOL and host is not None and host.replies is not None:
@@ -464,7 +573,20 @@ def handle(launch_id: str, msg: Any, host: HostCommands | None = None) -> dict[s
 
 
 _DEFS = {_NAME: TOOL, room_host.RELAY_TOOL: RELAY_TOOL, room_host.REPLIES_TOOL: REPLIES_TOOL,
-         room_host.NOTE_TOOL: NOTE_TOOL}
+         room_host.NOTE_TOOL: NOTE_TOOL, room_host.ENVELOPE_TOOL: ENVELOPE_TOOL}
+
+
+class _Repeat(Exception):
+    pass
+
+
+def _no_repeats(pairs: list) -> dict:
+    seen: dict = {}
+    for k, v in pairs:
+        if k in seen:
+            raise _Repeat(k)
+        seen[k] = v
+    return seen
 
 
 def _frames(stream: Any):
@@ -503,7 +625,9 @@ def serve(launch_id: str, stdin: Any = None, stdout: Any = None, host: HostComma
             continue
         else:
             try:
-                msg = json.loads(raw)
+                msg = json.loads(raw, object_pairs_hook=_no_repeats)
+            except _Repeat as exc:      # a repeated key would silently keep the last: a spec is never read that way
+                reply = _error(None, PARSE_ERROR, f"parse error: the key {str(exc.args[0])[:40]!r} is repeated in one object")
             except (ValueError, RecursionError):     # nesting deep enough to overflow the decoder is a parse error too
                 reply = _error(None, PARSE_ERROR, "parse error")
             else:

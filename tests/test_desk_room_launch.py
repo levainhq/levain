@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from levain.consent.adapters import claude_code
-from levain.desk import chat, lease, room, room_launch
+from levain.desk import chat, lease, room, room_host, room_launch
 from levain.desk.chat import ChatService, ChatStore, liveness
 from levain.desk.chat_tripwires import TripwireContext
 from levain.desk.claude_session import ClaudeSession, PipeTransport, ROOM_MCP_TOOL, ROOM_TOOLS
@@ -66,7 +66,7 @@ def out(f):
     f.setdefault("session_id", sid); f.setdefault("uuid", str(uuid.uuid4()))
     sys.stdout.write(json.dumps(f) + "\n"); sys.stdout.flush()
 def init():
-    tools = ["Glob", "Grep", "Read", "WebSearch", "mcp__levain_room__propose_drop"]
+    tools = ["Glob", "Grep", "Read", "WebSearch", "mcp__levain_room__propose_drop", "mcp__levain_room__propose_envelope"]
     if mode == "bad_tools": tools.append("Bash")
     cwd = os.getcwd()
     if mode == "wrong_cwd" or (mode == "cwd_flip" and inits > 1): cwd = os.path.dirname(cwd)
@@ -158,7 +158,7 @@ def build(tmp_path, open_room=True):
     cwd.mkdir()
     home.mkdir()
     (cwd / "note.txt").write_text("hi\n")
-    svc = ChatService(cs, probe=make_probe(cs), tripwires=make_tripwires(cs), sleep=lambda _s: None)
+    svc = ChatService(cs, probe=make_probe(cs, door_names=room_host.door_tools(None)), tripwires=make_tripwires(cs, door_names=room_host.door_tools(None)), sleep=lambda _s: None)
     w = {"store": store, "cs": cs, "thread": thread, "svc": svc, "fake": fake_dir, "cwd": cwd, "home": home,
          "run": tmp_path / "run", "script": script, "clock": [T0], "launchers": []}
     return w
@@ -237,7 +237,7 @@ def test_ensure_opens_a_live_attached_launch_with_the_rooms_argv_and_files(world
     assert world["cs"]._read(lambda conn: liveness(conn, h.launch_id)).enabled
     meta = world["svc"].session_meta(h.launch_id)
     assert (meta.permission_mode, set(meta.tools), meta.mcp_servers) == \
-        ("dontAsk", {*ROOM_TOOLS, ROOM_MCP_TOOL}, ("levain_room",))
+        ("dontAsk", {*ROOM_TOOLS, ROOM_MCP_TOOL, "mcp__levain_room__propose_envelope"}, ("levain_room",))
     [argv] = spawns(world)
     assert argv[argv.index("--tools") + 1] == "Read,Grep,Glob,WebSearch"
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk" and "--strict-mcp-config" in argv
@@ -350,7 +350,7 @@ def test_item1_the_workers_context_latches_the_same_room_stream(world):
     open check's own turn and on an accepted rule read."""
     cwd = str(world["cwd"])
     worker = lambda _l: TripwireContext(cwd, lambda _t: 1, lambda _c, _i: False)     # noqa: E731
-    svc = ChatService(world["cs"], probe=make_probe(world["cs"]), tripwires=worker, sleep=lambda _s: None)
+    svc = ChatService(world["cs"], probe=make_probe(world["cs"], door_names=room_host.door_tools(None)), tripwires=worker, sleep=lambda _s: None)
     try:
         lr = launcher(world, service=svc)
         h = lr.ensure()
@@ -457,7 +457,8 @@ def test_a_dead_child_is_replaced_by_a_resume(world):
 
 def test_a_restarted_service_ends_the_launch_it_holds_no_session_for_and_resumes(world):
     h1 = launcher(world).ensure()
-    svc2 = ChatService(world["cs"], probe=make_probe(world["cs"]), tripwires=make_tripwires(world["cs"]),
+    svc2 = ChatService(world["cs"], probe=make_probe(world["cs"], door_names=room_host.door_tools(None)),
+                       tripwires=make_tripwires(world["cs"], door_names=room_host.door_tools(None)),
                        sleep=lambda _s: None)
     try:
         h2 = launcher(world, service=svc2).ensure()
@@ -736,7 +737,7 @@ def test_c2_the_rooms_probe_latches_a_missing_malformed_or_changed_cwd(world):
     lr = launcher(world)
     h = lr.ensure()
     ev = lr._live[h.launch_id].session.liveness_evidence()
-    probe = make_probe(world["cs"])
+    probe = make_probe(world["cs"], door_names=room_host.door_tools(None))
     assert probe(h.launch_id, ev).live
     for cwd in (str(world["cwd"].parent), None, 7, "relative/dir", ""):
         raw = dict(ev.raw)
