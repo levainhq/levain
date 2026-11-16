@@ -844,6 +844,23 @@ def read_base_map(path: Path, *, read: Callable[[Path], bytes] = Path.read_bytes
     return [r for r in obj["routes"] if type(r) is dict]
 
 
+def routed_hosts(base: Sequence[Mapping[str, Any]]) -> frozenset:
+    """The hosts root's ``egress_verify.host_class`` refuses any grant to (``egress-grant-host-routed``), from the base
+    map this session read: every route's ``hosts`` when it is a non-empty list of strings (``runtime_helper.base_routes``'s
+    rule; an ``upstream`` host is not one), plus both vendors' own hosts. The host-card flow files no card for these:
+    the front refused them for this session, root would refuse the tap, so the card could only waste it (L4 review
+    1116-19 M1). Pure, and no new import: the lane reaches no root module for it. ``tests/test_slot_egress_cards_supervisor``
+    pins it equal to ``host_class`` over a table; root stays the authority (a map changed since is refused there)."""
+    out: set = set()
+    for r in base:
+        hs = r.get("hosts")
+        if type(hs) is list and hs and all(type(h) is str for h in hs):
+            out.update(hs)
+    for hs in VENDOR_HOSTS.values():
+        out.update(hs)
+    return frozenset(out)
+
+
 def pick_routes(base: Sequence[Mapping[str, Any]], vendor: str, auth: str, *, egress: bool = True) -> Tuple[str, ...]:
     """With ``egress`` (the default, every interactive session), every ``egress`` route of the base map (the git
     hosts and registries); with ``egress=False`` (a dispatch passthrough session: its ticket lists none by default,
@@ -1712,6 +1729,7 @@ class Supervisor:
         self._slot_index: Optional[int] = None
         self.unshown_lines = 0                # held status lines stderr never took (the end-of-run drain's count)
         self._lane: Optional["_CardLane"] = None     # S4b: the host-card lane (None: cards off for this session)
+        self._routed: frozenset = routed_hosts(())   # hosts root never grants: the base map's, set when it is read
 
     # -- small ------------------------------------------------------------------------------------------------------
 
@@ -2040,7 +2058,9 @@ class Supervisor:
                          + ", ".join(frozen.dropped_env))
             if frozen.dropped_other:
                 self.say("repo settings not carried into the session: " + ", ".join(frozen.dropped_other))
-            routes = pick_routes(read_base_map(self.s.base_map), self.req.vendor, self.req.auth)   # type: ignore[arg-type]
+            base = read_base_map(self.s.base_map)   # type: ignore[arg-type]
+            routes = pick_routes(base, self.req.vendor, self.req.auth)
+            self._routed = routed_hosts(base)     # the same read: no card for a host root refuses as routed (M1)
             identity = git_identity(top, git=self.s.git, run=self.s.run)
             if identity is None:
                 self.say("no git user.name / user.email for this repo: the session cannot commit as you")
@@ -2160,7 +2180,8 @@ class Supervisor:
             self.say("host cards are off for this session: the preflight read answered in a shape this levain does "
                      "not know")
             return
-        lane = _CardLane(self, EC.CardFlow(session=session, slot=self._slot_index), Path(self.s.allow_dir))
+        lane = _CardLane(self, EC.CardFlow(session=session, slot=self._slot_index, routed=self._routed),
+                         Path(self.s.allow_dir))
         try:
             lane._feed(listed)
         except Exception as e:  # noqa: BLE001 - cards are a convenience: an error here is cards off, never a refused launch
@@ -2856,5 +2877,5 @@ def run_session(req: Request, seams: Optional[Seams] = None) -> int:
 
 __all__ = ["HOOKS_BY_AUTH", "REPO_SETTINGS", "Request", "STOP_SIGNALS", "Seams", "Supervisor", "TermFilter",
            "VENDOR_HOSTS", "check_repo_layer", "git_identity", "operator_clone", "parse_helper_line", "pick_routes",
-           "read_base_map", "render_blob", "repo_layer_docs", "repo_toplevel", "run_session", "spawn",
-           "start_result"]
+           "read_base_map", "render_blob", "routed_hosts", "repo_layer_docs", "repo_toplevel", "run_session",
+           "spawn", "start_result"]
