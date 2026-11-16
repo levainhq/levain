@@ -135,12 +135,13 @@ def test_the_sudo_line_parses_as_the_helper_takes_it(host, world):
     helper = str(layout.install_helper_path(host))
     assert line.startswith(f"sudo {helper} enrol-authority-signer ")
     filled = line.replace("--public-key '<type> <base64>'", f"--public-key '{pub}'")
-    filled = filled.replace("[--passkey '<type> <base64>' ...] [--confirm]", f"--passkey '{pk}' --confirm")
+    filled = filled.replace("[--passkey '<type> <base64>' ...] [--confirm] [--egress-host]",
+                            f"--passkey '{pk}' --confirm --egress-host")
     argv = filled.replace(f"sudo {helper} ", "").replace("YOUR_NAME", "phill")
     import shlex
     cmd = parse_install_argv(shlex.split(argv))
-    assert (cmd.verb, cmd.principal, cmd.public_key, cmd.passkeys, cmd.confirm) == (
-        "enrol-authority-signer", "phill", pub, (pk,), True)
+    assert (cmd.verb, cmd.principal, cmd.public_key, cmd.passkeys, cmd.confirm, cmd.egress_host) == (
+        "enrol-authority-signer", "phill", pub, (pk,), True, True)
     fp = "SHA256:" + "A" * 43
     assert parse_install_argv(["remove-authority-signer", "--key", fp]).key_fingerprint == fp
 
@@ -217,3 +218,20 @@ def test_a_file_that_goes_between_the_lstat_and_the_read_is_the_missing_files_pa
     out = rows(world)
     assert [r.name for r in out] == ["authority signers"]
     assert out[0].ok and not out[0].warn and "does not exist" in out[0].detail
+
+
+@pytest.mark.parametrize("host", ["linux", "darwin"])
+def test_t21_the_sudo_line_names_egress_host_and_it_is_the_flag_that_enrols_the_host_grant_namespace(host, world):
+    """Reproduced: the line ended ``[--confirm]``, so the command every host-card word points at enrolled a key for
+    graduation only and a tap signed with it was refused ``egress-grant-unenrolled`` after the passkey ceremony."""
+    import shlex
+    pub = key(world, "laptop")
+    line = authority_signer_sudo_line(host)
+    assert line.endswith("[--confirm] [--egress-host]")
+    helper = str(layout.install_helper_path(host))
+    argv = line.replace(f"sudo {helper} ", "").replace("YOUR_NAME", "phill").replace(
+        "--public-key '<type> <base64>'", f"--public-key '{pub}'").replace(
+        " [--passkey '<type> <base64>' ...] [--confirm] [--egress-host]", "")
+    without = parse_install_argv(shlex.split(argv))
+    withflag = parse_install_argv(shlex.split(argv + " --egress-host"))
+    assert (without.egress_host, withflag.egress_host) == (False, True)
