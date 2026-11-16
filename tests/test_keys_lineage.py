@@ -582,6 +582,12 @@ def test_a_full_outbox_stays_at_its_bound_through_refusal_windows(monkeypatch):
 
 # ---- delivery against a real CONTROL (R4 §3 "Delivery"; H6-8, H6-11, H6-19) -----------------------------------------
 
+# The attachment's answer window for a test whose point is the ORDER of the ticks, not how fast CONTROL answers: a hard cap
+# far above any stall a loaded runner (a real fsync per envelope on a CONTROL thread) puts on one answer, so only a
+# genuinely missing answer ends the attachment. A window "scaled" from a guess (the old 1.0 s) ended it on a slow tick
+# (nightly dep-drift 11-15, `('SESSIONS', None, None)`).
+ANSWER_CAP_S = 30.0
+
 class Ctl:
     """CONTROL as `control.serve` runs it, on a thread, with its lineage sink at `<d>/lineage/lineage.jsonl`; every
     connection to its socket is keys' (the `peer_uid` seam)."""
@@ -716,8 +722,8 @@ def test_a_grammar_maximum_envelope_is_split_in_two_and_the_attachment_stays_up(
 
 def test_a_4096_record_resend_on_attach_open_keeps_the_sessions_ticks_alive():
     # H6-11: LINEAGE_OUTBOX_MAX records waiting at attach open go one envelope at a time (64 records, one fsync at
-    # CONTROL, the next only after the ack), with a SESSIONS due every envelope: every tick is answered within its
-    # (scaled) V23, so the attachment never ends, and every record reaches the sink once
+    # CONTROL, the next only after the ack), with a SESSIONS due every envelope: every tick is answered within the
+    # ANSWER_CAP_S cap, so the attachment never ends, and every record reaches the sink once
     async def fn(ctl, k, led, spy):
         att = k.attached
         await until(lambda: led.outbox_size == 0, 120, "outbox drained")
@@ -726,7 +732,7 @@ def test_a_4096_record_resend_on_attach_open_keeps_the_sessions_ticks_alive():
     async def prefill(led):
         await fill(led, [good_row()] * K.LINEAGE_OUTBOX_MAX)
 
-    same, misses, attach_no, calls, rows, led = delivery(fn, prefill=prefill, reconcile_s=0.001, attach_answer_s=1.0)
+    same, misses, attach_no, calls, rows, led = delivery(fn, prefill=prefill, reconcile_s=0.001, attach_answer_s=ANSWER_CAP_S)
     assert same and misses == 0 and attach_no == 1
     appends = [i for i, c in enumerate(calls) if c[0] == "LINEAGE-APPEND"]
     # each envelope at either bound (64 records, or the byte bound first: a typical row is ~750 bytes)
