@@ -32,7 +32,8 @@ open-card rule below protects the operator's attention; it grants no containment
 THE ONE RULE (it replaces every cap on cards): a card is filed only when no host card is open anywhere in the signing
 queue, :func:`open_card_scan`; the supervisor runs the scan and the filing under the queue's lock, so two sessions on
 one queue cannot both file. A denied, removed-early or lapsed-twice host is never carded again this session, nor is a
-host whose tapped card root refused or that could not be delivered in time or read; a host is carded again only after
+host whose tapped card root refused or that could not be delivered in time or read. A host root would refuse as routed
+(:attr:`CardFlow.routed`) and a never-grant name are never carded at all. A host is carded again only after
 its own grant ran out, or after a filing the queue could not write.
 
 THE ONE BOUND ON WHAT THE AGENT DRIVES: it chooses which hosts are refused, so the flow keeps at most
@@ -60,7 +61,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, Mapping, Optional, Tuple
 
 from levain.contracts.namespaces import EGRESS_HOST_NAMESPACE
 from levain.slot import egress_grants as eg
@@ -115,8 +116,11 @@ NAMES: Dict[str, Tuple[str, str]] = {
     "egress-grant-session": (SPENT, "the card was for another session or slot"),
     "egress-grant-store": (SPENT, "the card named another store"),
     "no-session": (SPENT, "root does not know this session any more"),
+    # spent: root never grants a host on one of the install's routes or a model vendor's own host. The front refused
+    # it for THIS session, so this session does not have that route: the agent stays refused (L4 review 1116-19 M1)
+    "egress-grant-host-routed": (SPENT, "that host is on one of the install's routes or is a model vendor's own host, "
+                                        "which this session does not have, and a host grant cannot allow it"),
     # already allowed another way
-    "egress-grant-host-routed": (ALREADY, "that host already has a route, so no grant is needed"),
     "egress-grant-superseded": (ALREADY, "a newer decision for this host stands"),
     # off for the session
     "egress-grant-kind": (OFF, "this session is not one host cards can allow"),
@@ -442,10 +446,13 @@ class CardFlow:
     """One session's card flow. Immutable from outside: :meth:`advance` returns a NEW flow and the commands.
 
     ``session`` and ``slot`` are the supervisor's own (``s-<16 hex>``, the slot index); ``rp`` is the queue's passkey
-    site (None: no cockpit, so hosts wait with a note)."""
+    site (None: no cockpit, so hosts wait with a note). ``routed`` is ``supervisor.routed_hosts`` over the base map the
+    session read: the hosts root's ``egress_verify.host_class`` refuses any grant to (``egress-grant-host-routed``). A
+    refused host in it is never carded: its tap could only be refused (L4 review 1116-19 M1)."""
     session: str
     slot: int
     rp: Optional[str] = None
+    routed: FrozenSet[str] = frozenset()
     store: Optional[str] = None
     cursor: object = 0
     off: Optional[str] = None
@@ -546,6 +553,9 @@ class CardFlow:
             if eg.never_grant(host):
                 h.state, h.outcome = DEAD, "never"
                 return
+            if host in self.routed:
+                h.state, h.outcome = DEAD, "routed"     # root refuses any grant to it: no card, no tap spent
+                return
         if h.state == GRANTED and h.expires is not None and datetime.fromtimestamp(wall, tz=timezone.utc) >= h.expires:
             h.state, h.polls, h.outcome = WAITING, 0, None   # its grant ran out: refused again, it may be carded again
         if h.state == WAITING:
@@ -561,8 +571,9 @@ class CardFlow:
             # root's store is new (the first list, or a repair made another): the next card names it, and the old
             # store's prior set says nothing about this list, so nothing is read as removed from it
             self.store, self.prior = ev.store, {}
-        # removed EARLY: the list answered ok, with the card's own store, a non-empty prior set held the host, and
-        # it is gone before its expiry (revoked or repaired: root's list cannot tell which)
+        # removed EARLY: the list answered ok, with the card's own store, the prior set held the host (an earlier list
+        # showed it, or root answered ok for this flow's own card), and it is gone before its expiry (revoked or
+        # repaired: root's list cannot tell which)
         for host, expires in self.prior.items():
             h = self.hosts.get(host)
             if host not in live and expires > now and h is not None and h.state == GRANTED:
@@ -705,6 +716,11 @@ class CardFlow:
             expires = None
         h.state, h.outcome, h.expires = GRANTED, outcome, expires
         self.card = None
+        if expires is not None:
+            # root answered ok, so its file holds the grant: the next list of this store that does not show it, before
+            # its expiry, is a removal (a revoke within LIST_S of the tap included; L4 review 1116-19 L3). Every read in
+            # flight was ended before this delivery started, so that list was taken after root wrote the grant.
+            self.prior = {**self.prior, c.host: expires}
 
     def _retry_or_dead(self, c: _Card, wall: float, name: str, words: str) -> None:
         at = wall + RETRY_AFTER_S[min(c.attempts - 1, len(RETRY_AFTER_S) - 1)]
@@ -872,6 +888,9 @@ _OUTCOME_WORDS = {
     "lapsed": lambda host, h: f"the host card for {host} lapsed twice unsigned; no grant was made",
     "removed-early": lambda host, h: f"host {host} was removed before its expiry (revoked or repaired)",
     "never": lambda host, h: f"host {host} is never allowed, so no card was filed",
+    "routed": lambda host, h: (f"host {host} was refused: it is on one of the install's routes or is a model vendor's "
+                               "own host, which this session does not have, and a host grant cannot allow it, so no "
+                               "card was filed"),
     "mismatch": lambda host, h: f"host {host}: {h.detail}",
     "refused": lambda host, h: f"host {host}: {h.detail}; no grant was made",
     "off": lambda host, h: f"host {host}: {h.detail}; no grant was made",

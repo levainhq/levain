@@ -850,3 +850,51 @@ def test_t20_the_lane_files_the_card_a_real_key_signs_it_and_root_admits_it(real
     assert lane.flow.hosts[HOST].outcome == "granted", (lane.flow.hosts[HOST], InProcessRun.made)
     assert HOST in (entries(world) or {})                                            # root wrote the grant
     assert any(f"host {HOST} was allowed until" in n for n in lane.notes())
+
+
+# --- L4 review 1116-19 M1: no card for a host root would refuse as routed ---------------------------------------------
+
+@bounded(90)
+def test_m1_a_claude_session_refused_a_codex_host_files_no_card_and_the_end_says_no_grant_is_possible(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quick: None) -> None:
+    """M1, reproduced on the real relay: a claude session's agent CONNECTs api.openai.com (the base map's codex route
+    and a codex vendor host). Before the fix a card was filed and pushed, and the tap could only end in root's
+    ``egress-grant-host-routed``. Mutation: pass no routed set to the flow in ``_cards_preflight`` -> a card is filed."""
+    routed = "api.openai.com"
+    rig = Rig(tmp_path, monkeypatch, FAKE_START="wait", FAKE_REFUSALS=json.dumps([[routed]]))
+    rig.stop_when(lambda: (rig.store / "refusals").exists() and int((rig.store / "refusals").read_text()) >= 3, 0.5)
+    assert rig.r.run() == 1
+    assert card_files(rig.queue) == [] and rig.pushes == []
+    err = rig.r.stderr()
+    assert f"host {routed} was refused" in err and "a host grant cannot allow it, so no card was filed" in err
+
+
+_TABLE_BASE = {"format": "levain-routes-base/1", "routes": [
+    {"route": "anthropic", "type": "brokered", "hosts": ["api.anthropic.com"],
+     "upstream": {"scheme": "https", "host": "up.example.net", "base_path": "/"}},
+    {"route": "github", "type": "egress", "hosts": ["github.com", "codeload.github.com"]},
+    {"route": "mirror", "type": "egress", "hosts": ["pypi.mirror.example.org"]},
+    {"route": "pt", "type": "subscription_passthrough", "hosts": ["claude.ai"]}]}
+
+
+@pytest.mark.parametrize("host", ["api.anthropic.com", "github.com", "codeload.github.com", "pypi.mirror.example.org",
+                                  "claude.ai", "api.openai.com", "auth.openai.com", "chatgpt.com", "console.anthropic.com",
+                                  "platform.claude.com", "up.example.net", "files.example.org", "github.com.example.org",
+                                  "example.org"])
+def test_m1_the_lanes_routed_set_is_roots_host_class_over_a_table(host: str) -> None:
+    """The lane's filter and root's refusal cannot drift: ``routed_hosts`` over the base map the session read says a
+    host is routed exactly when ``egress_verify.host_class`` over the same map refuses it ``egress-grant-host-routed``
+    (an ``upstream`` host that no route's ``hosts`` names is not routed for either)."""
+    from levain.contracts import canon
+    from levain.slot import Refused
+    from levain.slot import egress_verify as EVY
+
+    raw = canon.canonical_bytes(_TABLE_BASE)
+    ctx = SimpleNamespace(store=SimpleNamespace(read=lambda parts, name: raw if (tuple(parts), name) == (("routes",), "base.json") else None))
+    try:
+        EVY.host_class(ctx, host)
+        root_refuses = False
+    except Refused as e:
+        assert e.name == EVY.ERR_ROUTED
+        root_refuses = True
+    base = SV.read_base_map(Path("unused"), read=lambda p: raw)
+    assert (host in SV.routed_hosts(base)) is root_refuses

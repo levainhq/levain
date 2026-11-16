@@ -341,13 +341,6 @@ def test_t3_an_error_list_or_another_store_never_counts_as_a_removal():
     assert w.flow.hosts["files.example.org"].state == C.GRANTED
 
 
-def test_t3_an_empty_prior_list_is_not_a_removal():
-    w = granted()                                            # no list has shown the entry yet
-    w.live.clear()
-    w.tick(C.LIST_S)
-    assert w.flow.hosts["files.example.org"].state == C.GRANTED
-
-
 def test_t3_a_denied_card_suppresses_the_host_for_the_session():
     w = booted()
     w.deny()
@@ -1031,3 +1024,60 @@ def test_l3_a_root_fresh_answer_with_no_clock_drift_says_late_not_that_the_clock
     w.tick(2.0)
     h = w.flow.hosts["files.example.org"]
     assert h.outcome == "late" and not any("clock moved" in n for n in w.flow.end_notes())
+
+
+# --- L4 review 1116-19 (M1, L3): a host root can never grant, and a revoke before the first list ---------------------
+ROUTED = "api.openai.com"                                    # a codex vendor host: root's host_class refuses it
+
+
+def test_m1_a_host_on_a_route_this_session_lacks_gets_no_card_and_the_end_says_no_grant_is_possible():
+    """M1: a claude session's agent CONNECTs a codex host; the front refuses it off-list, but root refuses any grant to
+    it (``egress-grant-host-routed``). No card, no push, no tap spent; the end says why. Mutation: drop the routed
+    check in ``_saw`` -> a card is filed."""
+    w = World([ROUTED, "files.example.org"])
+    w.flow = C.CardFlow(session=SESSION, slot=3, rp=RP, routed=frozenset({ROUTED, "github.com"}))
+    w.settle(2)
+    assert w.filed_hosts() == ["files.example.org"] and len(w.pushes) == 1
+    assert w.flow.hosts[ROUTED].state == C.DEAD
+    [line] = [n for n in w.flow.end_notes() if ROUTED in n]
+    assert "no card was filed" in line and "cannot allow it" in line and "this session does not have" in line
+    assert "already has a route" not in line and "no grant is needed" not in line
+
+
+def test_m1_a_routed_refusal_after_a_tap_never_says_the_session_has_a_route():
+    """M1: the base map changed after the session read it, so a card was filed; root then answers host-routed. The
+    words say no grant was made and never that the session already has a route or needs no grant."""
+    w = booted()
+    w.tap()
+    w.grant_answers = [EVY.ERR_ROUTED]
+    w.tick(2.0)
+    assert w.flow.hosts["files.example.org"].state == C.DEAD and len(w.grants()) == 1
+    [line] = [n for n in w.flow.end_notes() if "files.example.org" in n]
+    assert "already has a route" not in line and "no grant is needed" not in line
+    assert "no grant was made" in line and "this session does not have" in line
+    assert C.refusal_class(EVY.ERR_ROUTED) == C.SPENT
+
+
+def test_l3_a_grant_revoked_before_the_first_list_after_the_tap_is_removed_not_allowed_until():
+    """L3: root answered ok, then a revoke landed before the next grants list. That list (same store, expiry ahead)
+    not showing the host is a removal: the end says so, never "allowed until", and the host is not carded again.
+    Mutation: drop the prior entry ``_granted`` adds -> the host stays GRANTED and the note says allowed until."""
+    w = granted()
+    w.live.clear()                                           # revoked from the phone within the first 30 s
+    w.tick(C.LIST_S)
+    assert w.flow.hosts["files.example.org"].state == C.REMOVED
+    notes = w.flow.end_notes()
+    assert not any("was allowed until" in n for n in notes)
+    assert any("files.example.org was removed before its expiry" in n for n in notes)
+    w.log += ["files.example.org"] * 3
+    for _ in range(6):
+        w.tick(C.POLL_S)
+    assert len(w.files) == 1
+
+
+def test_l3_a_list_of_another_store_after_the_tap_is_still_not_a_removal():
+    w = granted()
+    w.live.clear()
+    w.store = "store-other999"
+    w.tick(C.LIST_S)
+    assert w.flow.hosts["files.example.org"].state == C.GRANTED
