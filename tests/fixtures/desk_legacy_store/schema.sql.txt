@@ -41,7 +41,7 @@ CREATE TABLE authorise_signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), 
 table cancel_signatures
 CREATE TABLE cancel_signatures (job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL, signature TEXT NOT NULL, signer_fp TEXT NOT NULL, at TEXT NOT NULL);
 table coord_settings
-CREATE TABLE coord_settings (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, agent TEXT NOT NULL CHECK (agent IN ('claude', 'codex', 'none')), model TEXT, cwd TEXT, user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), by TEXT NOT NULL CHECK (by = 'operator'), at TEXT NOT NULL, CHECK ((agent = 'none' AND model IS NULL AND cwd IS NULL) OR (agent != 'none' AND cwd IS NOT NULL)));
+CREATE TABLE coord_settings (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, agent TEXT NOT NULL CHECK (agent IN ('claude', 'codex', 'none')), model TEXT, cwd TEXT, user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), night_model TEXT, by TEXT NOT NULL CHECK (by = 'operator'), at TEXT NOT NULL, CHECK ((agent = 'none' AND model IS NULL AND cwd IS NULL) OR (agent != 'none' AND cwd IS NOT NULL)));
 table drops
 CREATE TABLE drops (drop_id TEXT PRIMARY KEY, surface TEXT NOT NULL CHECK (surface IN ('cli', 'phone', 'cockpit')), outbox_id TEXT NOT NULL UNIQUE, words TEXT NOT NULL, words_sha256 TEXT NOT NULL, sent_at TEXT NOT NULL, received_at TEXT NOT NULL, source_repo TEXT, source_ref TEXT, source_head TEXT, source_how TEXT NOT NULL CHECK (source_how IN ('none', 'cwd', 'picker')), envelope_id TEXT, prior_envelope_id TEXT, gseq INTEGER);
 table envelope_attenuations

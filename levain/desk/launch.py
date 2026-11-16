@@ -1910,12 +1910,13 @@ def _replace_done(store: CoordStore, active: list[Any], listed: dict[str, dict[s
     return []
 
 
-def wake_idle(store: CoordStore) -> tuple[Outcome | None, str]:
+def wake_idle(store: CoordStore, *, night: bool = False) -> tuple[Outcome | None, str]:
     """``levain desk wake`` when the store answered ``idle`` (a desk still running without the lease): the
     same ``claude agents --json`` listing the watcher reads; a desk whose row is ``done`` is ended (cause
     :data:`levain.desk.lease.REPLACED`; you asked, so nothing unseen is needed), its session stopped and the
     fresh desk the same transaction asked for started. ``(outcome, line)``: the outcome None and the line why
-    when nothing was replaced (a row not done, a listing that cannot be read)."""
+    when nothing was replaced (a row not done, a listing that cannot be read). ``night``: the fresh desk is the
+    night's and runs the setting's night model."""
     way_out = "`levain desk release` ends it"
     idle = [ln for ln in store.launches_active() if ln.role == ROLE_DESK]
     if not idle:
@@ -1935,7 +1936,7 @@ def wake_idle(store: CoordStore) -> tuple[Outcome | None, str]:
     if row is None or row.get("state") != "done":
         how = "not listed" if row is None else f"listed {row.get('state')!r}, not done"
         return None, f"desk launch {ln.launch_id} is {how}, so it may claim again; {way_out}"
-    got = store.launch_replace_done(ln.launch_id, asked=True)
+    got = store.launch_replace_done(ln.launch_id, asked=True, night=night)
     if got is None:
         return None, f"desk launch {ln.launch_id} moved on meanwhile; levain desk status says where it is"
     ended, new = got

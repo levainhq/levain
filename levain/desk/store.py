@@ -1199,21 +1199,24 @@ class CoordStore:
         with self._write() as (conn, now):
             return lease.claim(conn, now, launch_id, session_key)
 
-    def coord_wake(self) -> Any:
-        """A wake with no drop (a retry after a backoff): the same rules a drop's transaction runs."""
+    def coord_wake(self, *, night: bool = False) -> Any:
+        """A wake with no drop (a retry after a backoff): the same rules a drop's transaction runs. ``night``: the
+        night desk, which runs the setting's night model."""
         from levain.desk import lease
 
         with self._write() as (conn, now):
-            return lease.wake(conn, now)
+            return lease.wake(conn, now, night=night)
 
     def coord_set_agent(self, agent: str, *, model: str | None = None, cwd: str | None = None,
-                        user_scope: bool | None = None) -> Any:
+                        user_scope: bool | None = None, night_model: str | None = None) -> Any:
         """Your desk setting: the agent a wake launches, its model, the (resolved) directory it runs in, and
-        whether the session also loads your user-level Claude Code settings (None keeps the standing choice)."""
+        whether the session also loads your user-level Claude Code settings (None keeps the standing choice), and the
+        model a night launch runs (None keeps the standing one)."""
         from levain.desk import lease
 
         with self._write() as (conn, now):
-            return lease.set_agent(conn, now, agent, model=model, cwd=cwd, user_scope=user_scope)
+            return lease.set_agent(conn, now, agent, model=model, cwd=cwd, user_scope=user_scope,
+                                   night_model=night_model)
 
     def coord_set_user_scope(self, user_scope: bool, *, cwd: str | None = None) -> Any:
         """Only the standing claude setting's user-layer choice, read and replaced in one transaction
@@ -1399,18 +1402,19 @@ class CoordStore:
         with self._write() as (conn, now):
             return lease.end_unlisted(conn, now, launch_id, handoff=handoff)
 
-    def launch_replace_done(self, launch_id: str, *, asked: bool = False) -> Any:
+    def launch_replace_done(self, launch_id: str, *, asked: bool = False, night: bool = False) -> Any:
         """``launch_id``'s session was listed done (:func:`levain.desk.lease.replace_done`; ``asked``: your
         ``levain desk wake``, which needs nothing unseen): ``(ended launch, the fresh desk launch the same
         transaction asked for or None)``, or None when nothing was replaced. The unseen check, the end and the
-        wake are one transaction, so a split or a second drop cannot slip between them."""
+        wake are one transaction, so a split or a second drop cannot slip between them. ``night``: the fresh desk is
+        the night's (``levain desk wake --night``) and runs the night model."""
         from levain.desk import lease
 
         with self._write() as (conn, now):
             ended = lease.replace_done(conn, now, launch_id, asked=asked)
             if ended is None:
                 return None
-            return ended, lease.wake(conn, now)
+            return ended, lease.wake(conn, now, night=night)
 
     def coord_lease(self) -> Any:
         """The lease as it stands (live or past its until), or None; nothing written."""
