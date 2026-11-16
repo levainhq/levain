@@ -202,6 +202,31 @@ def test_the_message_must_carry_levains_own_writable_answer():
     assert refusal(signed(message("example.org", writable="yes"))) == "writable"
 
 
+def test_root_checks_the_writable_flag_one_way_only_with_the_keyword():
+    """levain#66 S2 Q2: at root a card that OVER-warned (signed yes, the list no longer has the host) is accepted; one
+    that UNDER-warned (signed no, the host is on the list now) is ``writable-stale``. The default stays exact."""
+    over = signed(message("example.org", writable="yes"))
+    assert eg.parse_signed(over, writable_at_root=True).writable is True
+    under = signed(message("github.com", writable="no"))
+    with pytest.raises(eg.GrantRefused) as info:
+        eg.parse_signed(under, writable_at_root=True)
+    assert info.value.name == "writable-stale" and str(info.value) == eg.REASONS["writable-stale"]
+    # the same flag in agreement passes both ways
+    assert eg.parse_signed(signed(message("github.com")), writable_at_root=True).writable is True
+    assert eg.parse_signed(signed(message("example.org")), writable_at_root=True).writable is False
+    # the default keyword value keeps S1's exact check, and the keyword is keyword-only
+    assert refusal(over) == "writable" and refusal(under) == "writable"
+    with pytest.raises(TypeError):
+        eg.parse_signed(over, True)
+    # nothing else relaxes: a bad bound, host or shape is refused with the keyword too
+    for blob, name in ((signed(message("example.org", port="80")), "shape"),
+                       (signed(message("metadata.example.org")), "never-grant")):
+        with pytest.raises(eg.GrantRefused) as info:
+            eg.parse_signed(blob, writable_at_root=True)
+        assert info.value.name == name
+    assert "writable-stale" in eg.REASONS and "writable" in eg.REASONS
+
+
 # --- bounds -----------------------------------------------------------------------------------------------------------
 def st(delta):
     return eg.stamp(ISSUED + delta)

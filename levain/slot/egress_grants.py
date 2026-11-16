@@ -9,8 +9,8 @@ passkey tap. Three things live here and nowhere else:
     :mod:`levain.contracts.namespaces`; this parser re-validates every field, the bounds and the host grammar.
   - the shipped lists: :func:`never_grant` (hosts no tap can allow) and :func:`writable_host` (hosts that accept
     uploads: a words-and-recommended-key change on the card, never an allow-list).
-  - the ``grants.json`` file root writes beside a session's front policy and the front reads at every refused
-    CONNECT: :func:`dump_grants` / :func:`parse_grants` (one canonical format, exactly its keys) and
+  - the ``grants.json`` file root writes in ``R/grants/slot<n>/`` (a root-owned dir, group the front's) and the front
+    reads at every refused CONNECT: :func:`dump_grants` / :func:`parse_grants` (one canonical format, exactly its keys) and
     :func:`read_grants_file` (a bounded, owner- and mode-checked read that returns no grants for anything wrong).
 
 Root's ``/usr/bin/python3`` (3.9) imports this module: stdlib and :mod:`levain.contracts.namespaces` and
@@ -72,6 +72,7 @@ REASONS: Dict[str, str] = {
     "stamp": "a time in the host grant is not a valid UTC time",
     "bound": "the host grant's times are outside what one tap may allow",
     "writable": "the host grant's upload flag is not what levain's list says",
+    "writable-stale": "the host grant says the host takes no uploads but levain's list now says it does",
     "fresh": "the host grant was not issued recently enough or is dated in the future",
     "grants-file": "the host grants file is not in the one format root writes",
     "too-many": "a session holds no more host grants than this",
@@ -192,8 +193,11 @@ def _fields(message: str) -> Dict[str, str]:
     return out
 
 
-def _check(fields: Dict[str, str]) -> Tuple[int, datetime, datetime, datetime]:
-    """The slot and the three times of a message whose shape already matched, after every semantic rule."""
+def _check(fields: Dict[str, str], writable_at_root: bool = False) -> Tuple[int, datetime, datetime, datetime]:
+    """The slot and the three times of a message whose shape already matched, after every semantic rule.
+    ``writable_at_root`` (root's check, levain#66 S2): the flag is re-derived from root's list at the tap, so a card
+    that over-warned (signed ``yes``, the host no longer listed) is accepted, and one that under-warned (signed ``no``,
+    the host listed now) is ``writable-stale``. Off, the flag must equal the list's answer exactly."""
     if tuple(fields) != _FIELDS:
         raise GrantRefused("shape")
     slot = int(fields["slot"])
@@ -214,7 +218,11 @@ def _check(fields: Dict[str, str]) -> Tuple[int, datetime, datetime, datetime]:
         inside = False
     if not inside:
         raise GrantRefused("bound")
-    if fields["writable"] != ("yes" if writable_host(host) else "no"):
+    current = "yes" if writable_host(host) else "no"
+    if writable_at_root:
+        if fields["writable"] == "no" and current == "yes":
+            raise GrantRefused("writable-stale")
+    elif fields["writable"] != current:
         raise GrantRefused("writable")
     return slot, issued, exp_s, exp_d
 
@@ -254,12 +262,13 @@ def signed_bytes(message: str, choice: str) -> bytes:
     return (message + "\n" + CHOICE_MARK + "(" + choice + "): " + option_text(choice)).encode("utf-8")
 
 
-def parse_signed(signed: object) -> HostGrant:
+def parse_signed(signed: object, *, writable_at_root: bool = False) -> HostGrant:
     """The :class:`HostGrant` the verified bytes ``signed`` carry, or :class:`GrantRefused`. The bytes are exactly a
     message in this grammar, a newline and one choice line whose key is ``s`` or ``d`` and whose text is levain's
     fixed text FOR THAT KEY: a signature for ``s`` is never read as ``d``, and a key with the other key's words, an
     unknown key, a write-in or a second choice line is refused. Freshness against root's clock is
-    :func:`check_fresh`; the signature, the single-use ledger and the brokered-host check are root's."""
+    :func:`check_fresh`; the signature, the single-use ledger and the brokered-host check are root's. Root passes
+    ``writable_at_root=True`` (see :func:`_check`); every other caller keeps the exact check."""
     if not isinstance(signed, (bytes, bytearray)) or not 0 < len(signed) <= SIGNED_MAX:
         raise GrantRefused("shape")
     try:
@@ -276,7 +285,7 @@ def parse_signed(signed: object) -> HostGrant:
     if _MESSAGE.fullmatch(message) is None:
         raise GrantRefused("shape")
     fields = _fields(message)
-    slot, issued, exp_s, exp_d = _check(fields)
+    slot, issued, exp_s, exp_d = _check(fields, writable_at_root)
     return HostGrant(store=fields["store"], grant=fields["grant"], session=fields["session"], slot=slot,
                      host=fields["host"], port=PORT, issued=issued, expires_session=exp_s, expires_day=exp_d,
                      rp=fields["rp"], writable=fields["writable"] == "yes", choice=key)
