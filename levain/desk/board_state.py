@@ -873,7 +873,7 @@ def _chk_conflict_closed_band(ctx: _Ctx, item: Item):
 
 def _chk_conflict_chain_orphan(ctx: _Ctx, item: Item):
     chain, orphans = ctx.idx.chain.get(item.id), ctx.idx.orphans(item.id)
-    if chain and orphans:
+    if chain and orphans and not _trailer_close(ctx, item):     # a closing trailer on main wins: the orphan is a note on done
         b = max(orphans, key=_branch_key)
         return (f"conflict: in chain {chain[0][0]} vs orphan branch {b.name} {_short(b.tip)} "
                 f"({b.ahead} commits the chain lacks)", (chain[0][0], b.name))
@@ -908,7 +908,11 @@ def _rule_done(ctx: _Ctx, item: Item) -> State | None:
     kind, ev = item.done_kind, ctx.ev
     if kind == "merged":
         c = _trailer_close(ctx, item)
-        return ctx.make(item, "done", f"closed by {_short(c.sha)} ({c.date or 'no date'})", (c.sha,)) if c else None
+        if not c:
+            return None
+        orphans = ctx.idx.orphans(item.id)
+        note = f"; orphan branch {(b := max(orphans, key=_branch_key)).name} {_short(b.tip)} carries {b.ahead} commits main lacks" if orphans else ""
+        return ctx.make(item, "done", f"closed by {_short(c.sha)} ({c.date or 'no date'}){note}", (c.sha,))
     path = (item.done or "").strip()
     if kind in ("document", "run"):
         return ctx.make(item, "done", f"{kind} {path} exists", (path,)) if ev.documents.get(path) is True else None

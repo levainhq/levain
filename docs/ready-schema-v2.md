@@ -58,7 +58,7 @@ Checked in this order; the first that applies is the reason line.
 4. the item is in a `depends_on` cycle (`cycle a -> b -> a`).
 5. a typed link names nothing: `item:` not in the store, `band:` not in the band, `link:` not a ref on origin and not merged.
 6. a `document`/`run` item's path was never checked.
-7. evidence contradicts itself, neither side winning: closed on main and a live seat names the id · closed on main and an open band row names it · in the chain and an orphan branch (`ahead` > 0) with commits the chain lacks. "Closed on main" is a `Board-Closes` trailer on a `merged` item; for a `document`, `run` or `band` item the closure is its own file or np row, so a trailer beside an absent file is landed work (rule 6), not a conflict.
+7. evidence contradicts itself, neither side winning: closed on main and a live seat names the id · closed on main and an open band row names it · in the chain and an orphan branch (`ahead` > 0) with commits the chain lacks, unless the item is closed on main (a `Board-Closes` trailer on a `merged` item): the closure wins, the item reads `done`, and the orphan branch is named in its reason. "Closed on main" is a `Board-Closes` trailer on a `merged` item; for a `document`, `run` or `band` item the closure is its own file or np row, so a trailer beside an absent file is landed work (rule 6), not a conflict.
 
 ## 5. The item store record (`items.jsonl`, one JSON object per line, append-only)
 

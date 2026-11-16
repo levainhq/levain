@@ -328,3 +328,33 @@ def test_the_keys_flow_supplies_are_still_accepted(world, tmp_path, capsys):
     rc, doc, err = board(capsys, world, write_items(tmp_path, item(3)), extra)
     assert rc == 3 and err == "" and states(doc) == {"levain#3": "unknown"}
     assert any("seats unreadable: the roster could not be read" in p for p in doc["problems"])
+
+
+def test_closed_on_main_with_a_chain_link_and_an_orphan_seat_branch_reads_done(world, tmp_path, capsys):
+    """flow 9's finding: the Board-Closes trailer is on origin/main, a queue ref still carries the item and a seat branch
+    beside the landed chain has commits main lacks. The closure wins; the item is not unknown."""
+    world.branch("queue/1114-land3/x1")
+    world.commit("chain work", trailers=("Board-Item: levain#9",), file="c.txt", body="c\n")
+    world.push("queue/1114-land3/x1")
+    git(world.w, "checkout", "-q", "main")
+    world.branch("seat/1114-44-orphan")
+    world.commit("orphan work", trailers=("Board-Item: levain#9",), file="o.txt", body="o\n")
+    world.commit("more orphan work", trailers=("Board-Item: levain#9",), file="o2.txt", body="o2\n")
+    world.push("seat/1114-44-orphan")
+    git(world.w, "checkout", "-q", "main")
+    world.commit("closed", trailers=("Board-Item: levain#9", "Board-Closes: levain#9"), file="m.txt", body="m\n")
+    world.push_main()
+    rc, doc, _ = board(capsys, world, write_items(tmp_path, item(9)), extra_file(tmp_path))
+    assert states(doc) == {"levain#9": "done"} and rc == 0
+
+
+def test_a_chain_link_and_an_orphan_branch_with_no_closing_trailer_still_conflict(world, tmp_path, capsys):
+    world.branch("queue/1114-land3/x2")
+    world.commit("chain work", trailers=("Board-Item: levain#10",), file="c.txt", body="c\n")
+    world.push("queue/1114-land3/x2")
+    git(world.w, "checkout", "-q", "main")
+    world.branch("seat/1114-44-orphan2")
+    world.commit("orphan work", trailers=("Board-Item: levain#10",), file="o.txt", body="o\n")
+    world.push("seat/1114-44-orphan2")
+    _, doc, _ = board(capsys, world, write_items(tmp_path, item(10)), extra_file(tmp_path))
+    assert states(doc) == {"levain#10": "unknown"} and "orphan branch seat/1114-44-orphan2" in doc["items"][0]["reason"]
