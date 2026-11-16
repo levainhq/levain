@@ -146,8 +146,8 @@ def test_restart_service_runs_the_one_hard_coded_argv(world):
                          "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=yes", "taoserv-night",
                          "restart_service", "apache2"]]
     rig.runs.clear()
-    rig.effects().restart_service(g["id"], "taoserv", "php8.1-fpm", event_id=EVR, expect_sha256=D(g))
-    assert rig.runs[0][-2:] == ["restart_service", "php8.1-fpm"] and len(rig.runs[0]) == 13
+    rig.effects().restart_service(g["id"], "taoserv", "php8.3-fpm", event_id=EVR, expect_sha256=D(g))
+    assert rig.runs[0][-2:] == ["restart_service", "php8.3-fpm"] and len(rig.runs[0]) == 13
 
 
 def test_the_subprocess_runner_never_uses_a_shell(world):
@@ -191,7 +191,7 @@ def test_the_module_has_no_shell_in_its_source():
 
 @pytest.mark.parametrize("host,service", [
     ("mysql", "apache2"), ("taoserv", "mysql"), ("taoserv", "mysqld"), ("taoserv", "apache2; reboot"),
-    ("taoserv", "apache2 "), ("taoserv", "Apache2"), ("taoserv", "php8.1-fpm\n"), ("taoserv", ""), ("TAOSERV", "apache2"),
+    ("taoserv", "apache2 "), ("taoserv", "Apache2"), ("taoserv", "php8.3-fpm\n"), ("taoserv", ""), ("TAOSERV", "apache2"),
     ("taoserv ", "apache2"), ("localhost", "apache2"), ("taoserv", "$(id)"), ("taoserv", "-o ProxyCommand=x"),
     ("taoserv", ["apache2"]), (["taoserv"], "apache2"), (None, "apache2"), ("taoserv", None), ("taoserv", 1),
 ])
@@ -273,7 +273,7 @@ def test_an_order_that_covers_only_one_service_refuses_the_other(world):
     rig = Rig(world)
     rig.effects().restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     with pytest.raises(fx.EffectRefused) as exc:
-        rig.effects().restart_service(g["id"], "taoserv", "php8.1-fpm", event_id=EVR, expect_sha256=D(g))
+        rig.effects().restart_service(g["id"], "taoserv", "php8.3-fpm", event_id=EVR, expect_sha256=D(g))
     assert str(exc.value) == fx.R_LINE and len(rig.runs) == 1
 
 
@@ -396,7 +396,7 @@ def test_a_runner_failure_returns_a_fixed_sentence_with_no_output(world):
 
     res = rig.effects(runner=boom).restart_service(g["id"], "taoserv", "apache2", event_id=EVR, expect_sha256=D(g))
     assert not res.ok and "hunter2" not in res.text and fx.R_UNKNOWN in res.text        # it may have run: unknown
-    assert not rig.effects(runner=lambda a: 255).restart_service(g["id"], "taoserv", "php8.1-fpm", event_id=EVR,
+    assert not rig.effects(runner=lambda a: 255).restart_service(g["id"], "taoserv", "php8.3-fpm", event_id=EVR,
                                                                   expect_sha256=D(g)).ok
 
 

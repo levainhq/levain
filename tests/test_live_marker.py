@@ -292,6 +292,9 @@ EXEMPT = {
                                      "imports nothing of levain (pinned by test_room_readguard), and resolves no levain home",
     "levain/desk/room_turn_guard.py": "a standalone hook script the room launcher reads byte for byte and hashes per launch: "
                                       "stdlib only, imports nothing of levain, resolves no levain home",
+    "levain/desk/night_key.py": "the TAOSERV night key's forced command: stdlib only, imports nothing of levain (its docstring "
+                                "says it runs where levain is not installed), so a mark_live import would break it there; "
+                                "it resolves no levain home",
     "levain/slot/*": "root-run and slot-uid programs of the closed root import tree (tests/ci/root_closure.py); an import of "
                      "home_guard in a root program would add a root edge. None resolves the operator's levain home: the slot "
                      "hook's adapter marks itself (EMBEDDED), slot_allow is run by the marked CLI, and probe_child and "
