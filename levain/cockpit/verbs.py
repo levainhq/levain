@@ -493,6 +493,42 @@ _RESUMABLE_AGENT_ROW = lambda r: _AGENT_ROW(r) and _facet(r, "agent_group") == "
 _RETIRABLE_AGENT_ROW = lambda r: _AGENT_ROW(r) and _facet(r, "agent_group") in ("firing", "paused", "unarmed")   # noqa: E731
 _RENEWABLE_AGENT_ROW = lambda r: (_AGENT_ROW(r) and _facet(r, "agent_group") in ("firing", "paused", "unarmed")   # noqa: E731
                                   and bool(_facet(r, "agent_link")))
+# a revoke is offered where a renew is: a link stands for the agent's current spec (an open bar's row too: running the
+# revoke again is how it is finished)
+_REVOKABLE_AGENT_ROW = _RENEWABLE_AGENT_ROW
+
+# the revoke's fixed sentences: what a refusal says never carries the text of the error behind it, and whether the
+# agent "stays barred" is read from the store after the failure, never assumed
+_STILL_BARRED = ("the agent stays barred until you revoke it again or abandon the revoke "
+                 "(levain agents revoke --abandon)")
+_NOT_BARRED = "no bar is open: the agent's links stand"
+_BAR_UNKNOWN = "whether a bar is open could not be read: look at the agent's row again"
+REVOKE_UNSIGNED = f"the revoke was not signed in: nothing was appended to the authority log, and {_STILL_BARRED}"
+REVOKE_UNSIGNED_NOT_BARRED = f"the revoke was not signed in: nothing was appended to the authority log, and {_NOT_BARRED}"
+REVOKE_UNSIGNED_UNKNOWN = f"the revoke was not signed in: nothing was appended to the authority log, and {_BAR_UNKNOWN}"
+REVOKE_NOT_BEGUN = "the signing key could not be opened: nothing was begun and no bar was opened"
+# a store, the cockpit journal, the authority log, or the log's signature verifier: each is a retry, never a refusal
+_STORE_WHY = "(a store or the authority log could not be read or written, or its signature check could not run)"
+REVOKE_STORE_BARRED = f"the revoke could not finish {_STORE_WHY}, and " + _STILL_BARRED
+REVOKE_STORE_NOT_BARRED = f"the revoke could not begin {_STORE_WHY}: nothing was appended, and {_NOT_BARRED}"
+REVOKE_STORE_UNKNOWN = f"the revoke could not finish {_STORE_WHY}, and {_BAR_UNKNOWN}"
+REVOKE_ABANDONED = "the revoke was abandoned: the agent is NOT revoked and its links stand"
+# the row's link left the log by another change (a revoke_grant, say), not by a revoke of this agent: no claim that
+# "its links stand" is made, and none that the agent is revoked
+_LINK_GONE = ("the revoke did not land here, and the row's link is no longer in the authority log (another change "
+              "removed it)")
+REVOKE_LINK_GONE = f"{_LINK_GONE}: look at the agent's row again"
+# a landed revoke (found in the log, not by this call's own finish) left a bar of the agent open that could not be
+# closed here: the agent stays barred, and `levain agents sign` refuses a new link while it is open
+REVOKE_LANDED_STILL_BARRED = ("a bar of this agent is still open: it stays barred, and no new link can be signed until "
+                              "the bar is closed (levain agents revoke --abandon)")
+# the row's link gone (as REVOKE_LINK_GONE) while a bar of the agent recovery could not close stays open
+REVOKE_LINK_GONE_BARRED = f"{_LINK_GONE}; {REVOKE_LANDED_STILL_BARRED}"
+REVOKE_NO_LINK = ("this agent has no signed link in the authority log (never signed, or already revoked): nothing was "
+                  "revoked and no bar was opened")
+# what a landed revoke's reply says the undo is: a NEW link through the normal sign path, never a restore
+REVOKE_UNDO = ("undo = sign a new link: the revoke stays in the log (levain agents sign FILE --data-root ... "
+               "--signing-key ...; you set its terms)")
 
 
 def _agent_target(target: dict[str, Any], params: dict[str, Any],
@@ -622,7 +658,9 @@ def _renew_target_holds(wiring: Any, agent_id: str, version: int, store_id: str,
     """Refuse (stale, 409) unless agent ``agent_id`` of store ``store_id`` is registered at ``version`` and
     ``link_id`` is an agent link for exactly that agent, store and current spec hash in the log a renew appends to."""
     from levain.agent_authority import AgentAuthority
+    from levain.agents.store import AgentStoreRefused
     from levain.authority import agent_link
+    from levain.autonomic.db import StoreFormatError
 
     store = _agent_store_write(wiring, store_id)
     try:
@@ -630,7 +668,7 @@ def _renew_target_holds(wiring: Any, agent_id: str, version: int, store_id: str,
             row = conn.execute("SELECT a.registration, a.current_version, s.spec_hash FROM agents a JOIN agent_specs s"
                                " ON s.agent_id = a.agent_id AND s.version = a.current_version WHERE a.agent_id = ?",
                                (agent_id,)).fetchone()
-    except (sqlite3.Error, OSError) as exc:
+    except (sqlite3.Error, OSError, StoreFormatError, AgentStoreRefused) as exc:
         raise EditError("source_unavailable", 503, f"the agent store cannot be read now: {exc}") from None
     if row is None or row[0] != "registered" or row[1] != version:
         raise EditError("stale", 409, f"agent {agent_id} is no longer registered at version {version}: look at it "
@@ -644,6 +682,264 @@ def _renew_target_holds(wiring: Any, agent_id: str, version: int, store_id: str,
                                  grant.get("spec_hash")) != (agent_id, store_id, row[2]):
         raise EditError("stale", 409, f"link {link_id[:40]!r} does not cover agent {agent_id}'s current spec in this "
                                       "store: look at it again (nothing was signed)")
+
+
+def _agent_spec_now(wiring: Any, agent_id: str, version: int, store_id: str) -> str:
+    """The current spec hash of agent ``agent_id`` of store ``store_id``, refused (stale, 409) unless it is registered
+    at ``version``, the one the row showed."""
+    from levain.agents.store import AgentStoreRefused
+    from levain.autonomic.db import StoreFormatError
+
+    store = _agent_store_write(wiring, store_id)
+    try:
+        with store.read() as conn:
+            row = conn.execute("SELECT a.registration, a.current_version, s.spec_hash FROM agents a JOIN agent_specs s"
+                               " ON s.agent_id = a.agent_id AND s.version = a.current_version WHERE a.agent_id = ?",
+                               (agent_id,)).fetchone()
+    except (sqlite3.Error, OSError, StoreFormatError, AgentStoreRefused) as exc:
+        # the store gone, its format or its agent-schema marker moved since `_agent_store_write` opened it: a retry
+        raise EditError("source_unavailable", 503,
+                        f"the agent store cannot be read now ({type(exc).__name__}): nothing was signed") from None
+    if row is None or row[0] != "registered" or row[1] != version:
+        raise EditError("stale", 409, f"agent {agent_id} is no longer registered at version {version}: look at it "
+                                      "again (nothing was signed)")
+    return str(row[2])
+
+
+def _agent_log_state(wiring: Any) -> Any:
+    """The verified replay of the cockpit's authority log, or source_unavailable (never read as "no links")."""
+    from levain.agent_authority import AgentAuthority
+
+    try:
+        return AgentAuthority(wiring.cockpit_root).refresh()
+    except Exception as exc:  # noqa: BLE001 - the replay's own errors propagate unwrapped; any is "cannot read now"
+        raise EditError("source_unavailable", 503,
+                        f"the authority log cannot be read now ({type(exc).__name__})") from None
+
+
+class _SignerFailed(Exception):
+    """The laptop-presence signer raised one of the signing refusals (a cancelled touch, a key that would not sign):
+    kept apart from a store's own errors, which share some of those classes (OSError, sqlite3.Error)."""
+
+
+def _agent_revoke_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any],
+                       confirm: bool) -> dict[str, Any]:
+    """Revoke ALL of the agent's signed links, as ``levain agents revoke`` does (the bar protocol of
+    :mod:`levain.agent_authority`: bar the agent, sign one ``revoke_agent`` link, append it), signed by the
+    laptop-presence key the cockpit's wiring names, the key the CLI takes by ``--signing-key``. A cockpit that holds no
+    such key refuses (501) before anything is begun; the log judges the signer exactly as for the CLI (a link no
+    enrolled key of the rank signed is refused at the prepare or the append), so this door is never weaker.
+
+    A revoke removes every link the agent holds; it never touches another agent's. Before any bar is opened the
+    store and the log are read again: the agent must still be registered at the version the row showed, and the log
+    must still hold the link the row showed for this agent and store, else a refusal (an agent with no link, an
+    already revoked one, and an unknown one all end here with no bar and no signature).
+
+    The revoke is final. There is no un-revoke and no undo verb: the undo is a NEW link signed through the normal sign
+    path (``levain agents sign``), with terms its signer sets; the old link stays revoked and the revoke stays in the
+    log (:data:`REVOKE_UNDO`).
+
+    Every refusal is a fixed sentence (no error text). A signer that fails is a signing refusal, never "the log cannot
+    be written". Whether the agent "stays barred" is read from the store after the failure: a begin that failed before
+    its bar was committed says no bar is open. An ``abandoned`` step is checked against this call's bar and the
+    verified log before the reply says the agent is not revoked: a concurrent revoke that landed is reported landed."""
+    from levain import agent_authority as aa
+    from levain.agents import bars
+    from levain.agents.cli import REVOKE_SIGN_ROUNDS, _signing_refusals
+    from levain.agents.store import AgentStoreRefused
+    from levain.authority import AuthorityError, VerifierUnavailable, agent_last_revoke, agent_link, anchor_path
+    from levain.autonomic.db import StoreFormatError
+    from levain.cockpit.firejournal import CockpitFormatError
+    from levain.cockpit.keys import KeyError_, _journal
+
+    wiring, agent_id, version, store_id = _agent_target(target, params)
+    if wiring.signing is None or wiring.cockpit_root is None:
+        raise EditError("not_built", 501, "this cockpit holds no laptop-presence signing key, and only one revokes: run "
+                                          "levain agents revoke from the laptop")
+    link_id = str(_facet(target.get("row"), "agent_link") or "")
+    _agent_spec_now(wiring, agent_id, version, store_id)
+    state = _agent_log_state(wiring)
+    mine = [g for g, grant in state.policy.grants.items() if agent_link(grant) and grant.get("agent_id") == agent_id
+            and grant.get("store_id") == store_id]
+    if not mine:
+        raise EditError("refused", 409, REVOKE_NO_LINK)
+    if link_id not in mine:
+        raise EditError("stale", 409, f"link {link_id[:40]!r} is no longer one of agent {agent_id}'s: look at it again "
+                                      "(nothing was signed)")
+    revoked_before = agent_last_revoke(state, agent_id, store_id)
+    store = _agent_store_write(wiring, store_id)
+    clock = wiring.now
+    refusals = _signing_refusals()
+    try:
+        signer_fp, raw_sign = wiring.signing()
+    except refusals:
+        raise EditError("refused", 409, REVOKE_NOT_BEGUN) from None
+
+    def sign(message: bytes) -> str:
+        try:
+            return raw_sign(message)
+        except refusals as exc:
+            raise _SignerFailed(type(exc).__name__) from None
+
+    def landed() -> dict[str, Any] | None:
+        """This call's revoke, or a concurrent one, in the store's bar or the verified log: the landed reply. None
+        only when the verified log still holds the row's link (so "its links stand" is read, not assumed); a link
+        another change removed is stale. A log that cannot be read is never "not revoked": it is source_unavailable.
+        A revoke found in the log leaves no bar of the agent open that recovery would close (R1, R3): one that stays
+        open is said in the reply's ``barred``."""
+        seq = _revoke_landed(store, bar_id) if bar_id is not None else None
+        if seq is not None:
+            return {"agent": agent_id, "state": "landed", "seq": seq, "undo": REVOKE_UNDO}
+        seen = _revoke_in_log(wiring, agent_id, store_id, revoked_before, link_id)
+        if seen is None:
+            raise EditError("source_unavailable", 503, "the revoke did not finish here and the authority log "
+                                                       "cannot be read now: look at the agent's row again")
+        state, seq, stands = seen
+        if seq is not None:
+            out = {"agent": agent_id, "state": "landed", "seq": seq, "undo": REVOKE_UNDO}
+            if not _close_bar_after_landing(store, state, agent_id, store_id, clock()):
+                out["barred"] = REVOKE_LANDED_STILL_BARRED
+            return out
+        if not stands:
+            # a bar this call (or another) left open is closed as recovery would (R3 when no link of the agent is
+            # left), else the reply says it stays open: `levain agents sign` refuses while it is
+            closed = _close_bar_after_landing(store, state, agent_id, store_id, clock())
+            raise EditError("stale", 409, REVOKE_LINK_GONE if closed else REVOKE_LINK_GONE_BARRED)
+        return None
+
+    bar_id: str | None = None
+    try:
+        db = _journal(wiring.cockpit_root)
+        with db.autocommit() as cockpit:
+            autonomic = store._db._connect()
+            try:
+                sid, why = bars._store_id(autonomic, store_id)
+                if sid is None:
+                    raise EditError("refused", 409, "the revoke cannot begin: the agent store's id does not match "
+                                                    "(nothing was begun)")
+                step = aa.revoke_agent_begin(autonomic, cockpit, agent_id, store_id=sid, signer_fp=signer_fp,
+                                             clock=clock)
+                bar_id = step.bar_id
+                rounds = 0
+                while step.state in ("prepared", "stale_head", "reprepared"):
+                    if rounds >= REVOKE_SIGN_ROUNDS:
+                        raise _SignerFailed("rounds")
+                    rounds += 1
+                    step = aa.revoke_agent_sign(autonomic, step.bar_id, sign, clock=clock)
+                    if step.state != "signed":
+                        continue
+                    step = aa.revoke_agent_finish(autonomic, cockpit, step.bar_id, clock=clock,
+                                                  anchor=anchor_path(db.data_root))
+                if step.state in ("landed", "landed_bar_abandoned"):
+                    return {"agent": agent_id, "state": step.state, "seq": step.seq, "undo": REVOKE_UNDO}
+                if step.state == "abandoned":
+                    got = landed()
+                    if got is not None:
+                        return got
+                    raise EditError("refused", 409, REVOKE_ABANDONED)
+                raise _SignerFailed(step.state)
+            finally:
+                autonomic.close()
+    except EditError:
+        raise
+    except VerifierUnavailable:
+        # before AuthorityError, its base: a verifier (ssh-keygen) that cannot run is a retry, never a refusal (the
+        # revoke steps keep it so, last_error verifier_unavailable); the bar's state is read below
+        failed_as = "store"
+    except (_SignerFailed, aa.AgentAuthorityError, AuthorityError):
+        # the signing refusals: anything the signer raised (wrapped above, so a cancelled touch's OSError is never
+        # read as a store's), the log refusing the signer or its signature
+        failed_as = "unsigned"
+    except (sqlite3.Error, OSError, CockpitFormatError, StoreFormatError, KeyError_, AgentStoreRefused):
+        # a store, the authority log or the cockpit journal (`_journal` raises KeyError_), not the signer (its errors
+        # are wrapped above)
+        failed_as = "store"
+    except refusals:
+        failed_as = "unsigned"
+    got = landed()
+    if got is not None:
+        return got
+    barred = _bar_open(store, agent_id)
+    sentence = {("unsigned", True): REVOKE_UNSIGNED, ("unsigned", False): REVOKE_UNSIGNED_NOT_BARRED,
+                ("unsigned", None): REVOKE_UNSIGNED_UNKNOWN, ("store", True): REVOKE_STORE_BARRED,
+                ("store", False): REVOKE_STORE_NOT_BARRED, ("store", None): REVOKE_STORE_UNKNOWN}[(failed_as, barred)]
+    raise EditError("refused" if failed_as == "unsigned" else "source_unavailable",
+                    409 if failed_as == "unsigned" else 503, sentence)
+
+
+def _revoke_landed(store: Any, bar_id: str) -> int | None:
+    """The seq this call's own bar closed with when a concurrent revoke landed it first, else None (also on any
+    store trouble: the caller then reads the log)."""
+    from levain.agents import bars
+    from levain.agents.store import AgentStoreRefused
+    from levain.autonomic.db import StoreFormatError
+
+    try:
+        conn = store._db._connect()
+        try:
+            bar = bars.read_bar(conn, bar_id)
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, StoreFormatError, AgentStoreRefused):
+        return None
+    if bar is not None and bar.reason in ("signed", "from_log") and bar.revoke_seq is not None:
+        return bar.revoke_seq
+    return None
+
+
+def _revoke_in_log(wiring: Any, agent_id: str, store_id: str, before: int,
+                   link_id: str) -> tuple[Any, int | None, bool] | None:
+    """``(state, seq, stands)`` from a fresh verified replay: ``seq`` is that of a ``revoke_agent`` of this agent past
+    ``before`` (the last one when this call began) with the row's link gone, else None; ``stands`` is whether the log
+    still holds the row's link. None when the log could not be replayed or judged (then nothing is claimed either
+    way): the derivation after the replay is guarded as the replay is."""
+    from levain.agent_authority import AgentAuthority
+    from levain.authority import agent_last_revoke
+
+    try:
+        state = AgentAuthority(wiring.cockpit_root).refresh()
+        seq = agent_last_revoke(state, agent_id, store_id)
+        stands = link_id in state.policy.grants
+        return state, (seq if seq > before and not stands else None), stands
+    except Exception:  # noqa: BLE001 - a log that cannot be replayed or judged is never "not revoked"
+        return None
+
+
+def _close_bar_after_landing(store: Any, state: Any, agent_id: str, store_id: str, now: Any) -> bool:
+    """After a revoke of the agent was found in the verified log (not by this call's own finish): close the agent's
+    open bar as recovery would, R1 (its own pending link is in the log: closed ``signed`` at that seq) else R3 (the log
+    holds no link of the agent: closed ``nothing_present`` at the head). True when no bar of the agent is open after;
+    False when one stays open (a link of the agent stands, so neither row fits) or the store cannot be read or closed,
+    whatever it raised: the revoke has already landed (or the link is gone), so no error here is a 500."""
+    from levain.agents import bars
+
+    try:
+        conn = store._db._connect()
+        try:
+            bar = bars.open_bar_of(conn, agent_id)
+            if bar is not None and bars._r1(conn, state, bar, now=now) is None:
+                bars._r3(conn, None, state, bar, now=now, store_id=store_id)
+            return bars.open_bar_of(conn, agent_id) is None
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - as _revoke_in_log: any failure is "a bar may stay open", said in the reply
+        return False
+
+
+def _bar_open(store: Any, agent_id: str) -> bool | None:
+    """Whether the agent has an open bar NOW, read from the store after a failure (None: it cannot be read)."""
+    from levain.agents import bars
+    from levain.agents.store import AgentStoreRefused
+    from levain.autonomic.db import StoreFormatError
+
+    try:
+        conn = store._db._connect()
+        try:
+            return bars.open_bar_of(conn, agent_id) is not None
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, StoreFormatError, AgentStoreRefused):
+        return None
 
 
 # a desk review queue row (levain.cockpit.desk_panels): clear on an open item that is not "yours to clear",
@@ -1159,6 +1455,10 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("agent_renew", "renew", "moves the expiry of the agent's signed link, on the laptop-presence key this "
              "cockpit holds (its terms stay)", "row", fields=("days",), floor="C1", tier_fn=_const("C1"),
              confirm_required=True, reversible=False, fire=_agent_renew_fire, applies_to=_RENEWABLE_AGENT_ROW),
+    VerbSpec("agent_revoke", "revoke", "revokes every signed link of the agent, on the laptop-presence key this cockpit "
+             "holds: it stops firing now. Final: the undo is a new link signed with levain agents sign, never a restore",
+             "row", floor="C1", tier_fn=_const("C1"), confirm_required=True, reversible=False, fire=_agent_revoke_fire,
+             applies_to=_REVOKABLE_AGENT_ROW),
     VerbSpec("agent_retire", "retire", "retires the agent for good: it never fires again", "row", floor="C1",
              tier_fn=_const("C1"), confirm_required=True, reversible=False, fire=_agent_retire_fire,
              applies_to=_RETIRABLE_AGENT_ROW),

@@ -13,6 +13,10 @@
     { verb: "agent_pause", label: "pause", gloss: "stop this agent firing until it is resumed" },
     { verb: "agent_resume", label: "resume", gloss: "let this agent fire again" },
     { verb: "agent_renew", label: "renew", gloss: "move the expiry of its signed link", sure: "renew the link" },
+    // a revoke is final: it removes every signed link of the agent, and `note` says what undoing it means. There is no
+    // undo button: the undo is a new link through the normal sign path, and the revoked row's own words say so too
+    { verb: "agent_revoke", label: "revoke", gloss: "revoke every signed link of this agent: it stops firing now", sure: "revoke its links",
+      note: "Revoking is final: undo = sign a new link: the revoke stays in the log. Sign it on the laptop with levain agents sign (you set its terms; the revoked link's are not shown)." },
     { verb: "agent_retire", label: "retire", gloss: "retire it for good: it never fires again", sure: "retire for good" },
   ];
 
@@ -96,6 +100,7 @@
       bar.appendChild(b);
     }
     card.append(bar, msg);
+    for (const v of verbs) if (v.note) card.appendChild(el("p", "xnote agent-detail-note", v.note));
     return card;
   }
 
