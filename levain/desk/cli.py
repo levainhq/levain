@@ -1837,7 +1837,7 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
             return 0 if got.started else 1
         if cmd == "wake":
             # a pending launch has a starter wherever it is written: the wake starts the one it wrote, as a drop does
-            ln = store.coord_wake()
+            ln = store.coord_wake(night=args.night)
             got = None
             if ln is not None:
                 from levain.desk.launch import launch_session
@@ -1847,7 +1847,7 @@ def _run_coord(args: argparse.Namespace, out: Any) -> int:
                 # a desk running without the lease: you asked, so a done one is replaced (the watcher's listing)
                 from levain.desk.launch import wake_idle
 
-                got, line = wake_idle(store)
+                got, line = wake_idle(store, night=args.night)
                 st = store.coord_status()
                 st["started"] = None if got is None else {"started": got.started, "attach": got.attach,
                                                           "refusal": got.refusal, "remedy": got.remedy}
@@ -1933,7 +1933,7 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
         # `levain desk agent --user-scope on|off` alone: the standing setting is kept whole, only the layer choice moves
         if user_scope is None:
             raise CoordError("name an agent (claude or none), or give --user-scope on|off to change only that")
-        if args.cwd is not None or args.model is not None:
+        if args.cwd is not None or args.model is not None or args.night_model is not None:
             raise CoordError("--user-scope alone keeps the agent, model and directory; name the agent to change them")
         checked = None
         if user_scope:
@@ -1949,12 +1949,13 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
                                      f"{detail}")
                 checked = was.cwd
         got = store.coord_set_user_scope(user_scope, cwd=checked)
-        _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "user_scope": got.user_scope},
+        _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "user_scope": got.user_scope,
+                     "night_model": got.night_model},
               f"desk agent: {got.agent}; {user_layer_text(got)}")
         return 0
     if args.agent == "none":
-        if args.cwd is not None or args.model is not None or user_scope is not None:
-            raise CoordError("agent none takes no --model, no --cwd and no --user-scope")
+        if args.cwd is not None or args.model is not None or args.night_model is not None or user_scope is not None:
+            raise CoordError("agent none takes no --model, no --night-model, no --cwd and no --user-scope")
         store.coord_set_agent("none")
         _emit(out, args.json, {"agent": "none"}, "desk agent: none (drops queue for you; nothing launches)")
         return 0
@@ -1964,6 +1965,7 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
     if args.agent == "codex":        # before the model check: the removal is the reason, whatever the model says
         raise CoordError("a Codex desk was removed: set claude or none. A Codex session you run yourself is "
                          "still wrapped by the consent queue, and `levain session codex` runs one as a worker")
+    check_model(args.night_model)
     check_model(args.model)          # before any install is made for it (the setting checks it again as it is written)
     if args.agent != "claude":
         raise CoordError(f"a {args.agent} desk cannot be launched yet; set claude or none")
@@ -1985,11 +1987,13 @@ def _coord_agent(args: argparse.Namespace, out: Any, store: EnvelopeStore) -> in
                          f"workspace; leave out --cwd to use {default_desk_dir()}, or name a missing or empty "
                          "directory for Levain to set up")
     _record_workspace(target)
-    got = store.coord_set_agent("claude", model=args.model, cwd=str(target), user_scope=user_scope)
+    got = store.coord_set_agent("claude", model=args.model, cwd=str(target), user_scope=user_scope,
+                                night_model=args.night_model)
     remedy = trust_remedy(target)
     _emit(out, args.json, {"agent": got.agent, "model": got.model, "cwd": got.cwd, "user_scope": got.user_scope,
-                           "trust": remedy},
+                           "night_model": got.night_model, "trust": remedy},
           f"desk agent: claude{f' ({got.model})' if got.model else ''} in {got.cwd}\n"
+          f"{f'night desk model: {got.night_model}' + chr(10) if got.night_model else ''}"
           f"{user_layer_text(got)}\n"
           "Claude Code starts a session only in a directory you trusted; run this once and accept the trust prompt:\n"
           f"{remedy}")
@@ -2747,6 +2751,7 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
     cw = c_sub.add_parser("wake", help="Ask for a desk now, by the rules a drop runs (after a backoff); a "
                                        "claude desk running without the lease whose session is done is "
                                        "ended and a fresh one started.")
+    cw.add_argument("--night", action="store_true", help="The night desk: it runs the setting's night model.")
     ca = c_sub.add_parser(
         "agent", help="Choose the desk a drop launches: claude (in its own workspace), or none.",
         description="claude: drops with no desk start a Claude Code session in DIR (default "
@@ -2764,6 +2769,8 @@ def add_parsers(subparsers: argparse._SubParsersAction) -> None:
                          "a missing or empty one, which Levain sets up, or a desk "
                          "workspace Levain set up before. Your own Levain install is refused.")
     ca.add_argument("--model", default=None, help="The model the session runs (default: the harness's own).")
+    ca.add_argument("--night-model", default=None, dest="night_model", metavar="MODEL",
+                    help="The model a NIGHT desk launch runs (default: the standing one, else --model).")
     cl = c_sub.add_parser("launch", help="Start a pending launch's session now (default: the pending desk's).")
     cl.add_argument("launch_id", nargs="?", default=None, metavar="LAUNCH_ID")
     cwa = c_sub.add_parser(

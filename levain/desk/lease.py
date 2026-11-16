@@ -158,7 +158,7 @@ LEASE_SCHEMA: tuple[str, ...] = (
     # model and no directory, a harness always a directory
     "CREATE TABLE IF NOT EXISTS coord_settings (seq INTEGER PRIMARY KEY AUTOINCREMENT, gseq INTEGER NOT NULL UNIQUE, "
     f"agent TEXT NOT NULL CHECK ({_in('agent', SETTING_AGENTS)}), model TEXT, cwd TEXT, "
-    "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), "
+    "user_scope INTEGER NOT NULL DEFAULT 0 CHECK (user_scope IN (0, 1)), night_model TEXT, "
     "by TEXT NOT NULL CHECK (by = 'operator'), at TEXT NOT NULL, "
     "CHECK ((agent = 'none' AND model IS NULL AND cwd IS NULL) OR (agent != 'none' AND cwd IS NOT NULL)))",
     # pid: the levain process that won the spawn (the session's own process is the harness's, known only after)
@@ -283,6 +283,7 @@ class Setting:
     cwd: str | None      # resolved: the directory a desk session runs in
     at: str
     user_scope: bool = False    # True: the session also loads your user-level Claude Code settings; False: project, local
+    night_model: str | None = None    # the model a NIGHT desk launch runs (wake(night=True)); None: the night uses ``model``
 
 
 def _plus(now: str, delta: timedelta) -> str:
@@ -1199,19 +1200,24 @@ def _idle(conn: sqlite3.Connection, now: str) -> tuple[Launch | None, list[Launc
 def setting(conn: sqlite3.Connection) -> Setting | None:
     """The latest desk setting, or None when you never set one. ``user_scope`` is on only for a claude row."""
     col = "user_scope" if _has_user_scope(conn, "coord_settings") else "0"
-    r = conn.execute(f"SELECT agent, model, cwd, at, {col} FROM coord_settings ORDER BY seq DESC LIMIT 1").fetchone()
-    return None if r is None else Setting(r[0], r[1], r[2], r[3], bool(r[4]) and r[0] == "claude")
+    night = "night_model" if _has_column(conn, "coord_settings", "night_model") else "NULL"
+    r = conn.execute(f"SELECT agent, model, cwd, at, {col}, {night} FROM coord_settings "
+                     "ORDER BY seq DESC LIMIT 1").fetchone()
+    return None if r is None else Setting(r[0], r[1], r[2], r[3], bool(r[4]) and r[0] == "claude", r[5])
 
 
 def migrate_settings(conn: sqlite3.Connection) -> None:
     """The additive migration: ``coord_settings`` and ``launches`` gain ``user_scope``, 0 (off) on every row written
-    before it, and ``launches`` gains ``role_ref``, NULL on every row. Runs in the opener's schema transaction, like the replies' sequence."""
+    before it, ``launches`` gains ``role_ref``, NULL on every row, and ``coord_settings`` gains ``night_model``, NULL on
+    every row (the night then runs the day's model). Runs in the opener's schema transaction, like the replies' sequence."""
     for table in ("coord_settings", "launches"):
         if not _has_user_scope(conn, table):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN user_scope INTEGER NOT NULL DEFAULT 0 "
                          "CHECK (user_scope IN (0, 1))")
     if not _has_column(conn, "launches", "role_ref"):
         conn.execute("ALTER TABLE launches ADD COLUMN role_ref TEXT")
+    if not _has_column(conn, "coord_settings", "night_model"):
+        conn.execute("ALTER TABLE coord_settings ADD COLUMN night_model TEXT")
     migrate_launch_roles(conn)
 
 
@@ -1394,26 +1400,30 @@ def check_model(model: object) -> str | None:
 
 
 def set_agent(conn: sqlite3.Connection, now: str, agent: str, *, model: str | None = None,
-              cwd: str | None = None, user_scope: bool | None = None) -> Setting:
+              cwd: str | None = None, user_scope: bool | None = None, night_model: str | None = None) -> Setting:
     """Record your desk setting (writer: you only). ``cwd`` is stored as given, which the caller has resolved
     (Claude Code keys a directory's trust on its real path); agent ``none`` takes neither model nor directory.
-    ``user_scope`` None keeps the standing setting's (off when there is none); any agent but claude is always off."""
+    ``user_scope`` None keeps the standing setting's (off when there is none); any agent but claude is always off.
+    ``night_model`` None keeps the standing setting's too (none when there is none); agent none takes none and clears it."""
     if agent == "codex":
         raise _refused(CODEX_REMOVED_WHY)
     if agent not in SETTING_AGENTS:
         raise _refused(f"the desk agent is one of {', '.join(SETTING_AGENTS)}")
     if agent == "none":
-        if model is not None or cwd is not None:
-            raise _refused("agent none takes no --model and no --cwd")
+        if model is not None or cwd is not None or night_model is not None:
+            raise _refused("agent none takes no --model, no --night-model and no --cwd")
     elif not isinstance(cwd, str) or not cwd.startswith("/"):
         raise _refused("a desk agent runs in a directory: an absolute path")
+    night_model = check_model(night_model)
+    was = setting(conn)
     if user_scope is None:
-        was = setting(conn)
         user_scope = was is not None and was.user_scope
-    conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, by, at) "
-                 "VALUES (?, ?, ?, ?, ?, 'operator', ?)",
+    if night_model is None and agent != "none" and was is not None:
+        night_model = was.night_model
+    conn.execute("INSERT INTO coord_settings (gseq, agent, model, cwd, user_scope, night_model, by, at) "
+                 "VALUES (?, ?, ?, ?, ?, ?, 'operator', ?)",
                  (next_gseq(conn, now), agent, check_model(model), _line("cwd", cwd),
-                  int(bool(user_scope) and agent == "claude"), now))
+                  int(bool(user_scope) and agent == "claude"), night_model, now))
     return setting(conn)
 
 
@@ -1586,11 +1596,12 @@ def wake_state(conn: sqlite3.Connection, now: str) -> tuple[str, str]:
     return "wake", "no desk holds the lease; the next drop asks for one"
 
 
-def wake(conn: sqlite3.Connection, now: str) -> Launch | None:
+def wake(conn: sqlite3.Connection, now: str, *, night: bool = False) -> Launch | None:
     """Inside the caller's writing transaction (whatever asks for a desk: a new drop's among them): with no live
     lease, no pending desk launch and no backoff, write a ``pending`` desk launch and its ``bootstrap`` claim (writer
     3) under the CAS "no live lease" this one ``BEGIN IMMEDIATE`` holds. Returns the launch written, or None when
-    what asked only queues."""
+    what asked only queues. ``night``: the launch is the night's, and runs the setting's ``night_model`` (the day's
+    ``model`` when none is set); a day wake runs ``model`` whatever the night model is."""
     _lapse_if_past(conn, now)
     _expire_pending(conn, now)
     if lease(conn, now) is None:
@@ -1607,8 +1618,8 @@ def wake(conn: sqlite3.Connection, now: str) -> Launch | None:
     token = _event(conn, now, "claim", session_key, token=None, until=_plus(now, LAUNCH_TTL), cause="bootstrap",
                    by="service")
     chosen = setting(conn)          # wake_state answered wake: the agent is claude
-    return _pending(conn, now, token=token, harness=chosen.agent, role=ROLE_DESK, threads=(), model=chosen.model,
-                    cwd=chosen.cwd, cause="wake", session_key=session_key, user_scope=chosen.user_scope)
+    return _pending(conn, now, token=token, harness=chosen.agent, role=ROLE_DESK, threads=(),
+                    model=(chosen.night_model or chosen.model) if night else chosen.model, cwd=chosen.cwd, cause="wake", session_key=session_key, user_scope=chosen.user_scope)
 
 
 def status(conn: sqlite3.Connection, now: str) -> dict[str, object]:
