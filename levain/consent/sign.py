@@ -326,30 +326,43 @@ def _levain_namespace(namespace: object) -> bool:
     return isinstance(namespace, str) and namespace in LEVAIN_SIGN_REQUESTS
 
 
-def _request_namespace_problem(namespace: object, message: str, choice: bool) -> str | None:
+def _request_namespace_problem(namespace: object, message: str, choice: bool,
+                               options: "tuple[tuple[str, str], ...]" = (), write_in: bool = False) -> str | None:
     """Why a request FILE's namespace (with its message) is not one a phone may sign: a caller's namespace by
     :func:`namespace_problem`; one of levain's own only when its message is exactly the grammar levain files there,
-    as a plain request (so a signature in it can only ever say what levain itself asks)."""
-    from levain.contracts.namespaces import LEVAIN_SIGN_REQUESTS
+    as a plain request (so a signature in it can only ever say what levain itself asks), or, for a namespace in
+    ``LEVAIN_SIGN_CHOICES``, as a choice request whose options are exactly levain's (no other, no write-in) and never
+    a plain one."""
+    from levain.contracts.namespaces import LEVAIN_SIGN_CHOICES, LEVAIN_SIGN_REQUESTS
 
     if not _levain_namespace(namespace):
         return namespace_problem(namespace)
-    if choice or re.fullmatch(LEVAIN_SIGN_REQUESTS[str(namespace)], message) is None:
-        return (f"namespace {namespace!r} is levain's own: it holds only the plain message levain files there, never "
-                "one a caller wrote")
+    fixed = LEVAIN_SIGN_CHOICES.get(str(namespace))
+    if fixed is None:
+        if choice or re.fullmatch(LEVAIN_SIGN_REQUESTS[str(namespace)], message) is None:
+            return (f"namespace {namespace!r} is levain's own: it holds only the plain message levain files there, "
+                    "never one a caller wrote")
+    elif (not choice or tuple(options) != fixed or write_in
+          or re.fullmatch(LEVAIN_SIGN_REQUESTS[str(namespace)], message) is None):
+        return (f"namespace {namespace!r} is levain's own: it holds only the choice request levain files there "
+                "(its message and its options, no write-in), never one a caller wrote")
     return None
 
 
 def file_levain_request(queue_dir: Path, namespace: str, message: str, *, title: str, ttl_s: float) -> str:
-    """File one of levain's OWN sign requests (a plain request, requester ``levain``) in ``namespace``, one of
-    ``LEVAIN_SIGN_REQUESTS``, open for ``ttl_s`` seconds, and return its id. ``ValueError`` for a namespace that is not
-    levain's or a message outside its grammar: nothing is written. The file is written whole, never over another."""
+    """File one of levain's OWN sign requests (requester ``levain``) in ``namespace``, one of
+    ``LEVAIN_SIGN_REQUESTS``, open for ``ttl_s`` seconds, and return its id: a plain request, or, for a namespace in
+    ``LEVAIN_SIGN_CHOICES``, the choice request carrying exactly levain's options for it. ``ValueError`` for a
+    namespace that is not levain's or a message outside its grammar: nothing is written. The file is written whole,
+    never over another."""
     from levain.cockpit.consent import utc_stamp
+    from levain.contracts.namespaces import LEVAIN_SIGN_CHOICES
 
     if not _levain_namespace(namespace):
         raise ValueError(f"{str(namespace)[:80]!r} is not a namespace levain files its own sign requests in")
     title = title[:_TEXT_MAX]
-    problem = _request_namespace_problem(namespace, message, False) or _text_problem(title, "title")
+    options = LEVAIN_SIGN_CHOICES.get(namespace, ())
+    problem = _request_namespace_problem(namespace, message, bool(options), options) or _text_problem(title, "title")
     if problem is not None:
         raise ValueError(problem)
     rid = "lv-" + secrets.token_hex(16)
@@ -357,6 +370,9 @@ def file_levain_request(queue_dir: Path, namespace: str, message: str, *, title:
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     body = {"format": REQUEST_FORMAT, "id": rid, "namespace": namespace, "message": message, "title": title,
             "requester": "levain", "expires_at": utc_stamp(_now() + timedelta(seconds=ttl_s))}
+    if options:
+        body["format"] = CHOICE_FORMAT
+        body["options"] = [{"key": k, "text": t} for k, t in options]
     _publish(_write_new, d / f"{rid}.json", json.dumps(body) + "\n", f"sign request {rid} already exists")
     return rid
 
@@ -643,7 +659,8 @@ def read_request(queue_dir: Path, request_id: str) -> SignRequest:
         problem = f"recommended {str(recommended)[:20]!r} is not one of the request's option keys"
     if problem is None and not isinstance(write_in, bool):
         problem = "write_in is true or false"
-    problem = _request_namespace_problem(namespace, message, "options" in data) or problem
+    problem = _request_namespace_problem(namespace, message, "options" in data, options, write_in is not False) \
+        or problem
     longest = max((len(("\n" + choice_line(k, t)).encode("utf-8")) for k, t in options), default=0)
     if write_in is True:                # the longest write-in: WRITE_IN_MAX characters of at most 4 UTF-8 bytes each
         longest = max(longest, len(("\n" + choice_line(WRITE_IN_KEY, "")).encode("utf-8")) + 4 * WRITE_IN_MAX)

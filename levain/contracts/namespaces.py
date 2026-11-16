@@ -21,6 +21,10 @@ ANSWER_COUNTERSIGN_NAMESPACE = "levain-answer-countersign"
 # The operator's phone passkey APPROVING a dispatch configuration item (board row 113, option F2): a gate before the
 # laptop key signs, never the configuration signature itself (that stays in ``levain-dispatch-config``).
 CONFIG_APPROVE_NAMESPACE = "levain-dispatch-config-approve"
+# The operator's passkey allowing ONE unlisted host for ONE egress-slot session (board levain#66, design
+# ASK2_HOST_GRANTS_DESIGN.md): a levain-owned choice request (this session / 24 hours within the session) that root
+# verifies against its own allowed-signers file. Never an authority-log link.
+EGRESS_HOST_NAMESPACE = "levain-egress-host"
 
 # namespace -> (status, owner, meaning). status is "shipped" (a released levain uses it) or "reserved" (a design
 # names it; nothing signs in it yet).
@@ -68,6 +72,10 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
                                "the operator's phone passkey approving one dispatch configuration item (by the "
                                "SHA-256 of its exact bytes) before the laptop trust-root key signs it; never a "
                                "configuration signature"),
+    EGRESS_HOST_NAMESPACE: ("reserved", "levain/slot/egress_grants.py",
+                            "the operator's passkey allowing one unlisted host (port 443) to one egress-slot session "
+                            "for this session or 24 hours within it (message format levain-egress-host/1; a choice "
+                            "request, key s or d)"),
     "levain-envelope-revoke": ("shipped", "levain/desk/envelope_revoke.py",
                                "the operator's phone passkey ending one desk envelope, over a message naming the "
                                "store, the envelope, the time and a nonce (levain-envelope-revoke/1); only narrows"),
@@ -100,6 +108,26 @@ LEVAIN_SIGN_REQUESTS: dict[str, str] = {
                               r"prev: [^\n]+\nitem-sha256: [0-9a-f]{64}\n"
                               r"expires: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\n"
                               r"rp: [a-z0-9.-]+\nchange: [^\n]+\nsummary: [^\n]+\n",
+    # levain#66: one host grant, every field its own shape (no free text): the install store, a levain-minted
+    # single-use grant id, the slot session and slot index, the A-label host and port 443, three stamps (issued and
+    # the two expiries the choice picks between), the passkey site and the writable flag. A shape fence; the
+    # parser (levain.slot.egress_grants) re-validates every field, the bounds and the host grammar.
+    EGRESS_HOST_NAMESPACE: r"levain-egress-host/1\nstore: [A-Za-z0-9-]{8,64}\ngrant: eh-[0-9a-f]{24}\n"
+                           r"session: s-[0-9a-f]{16}\nslot: (?:0|[1-9][0-9]?)\nhost: [a-z0-9][a-z0-9.-]{2,252}\n"
+                           r"port: 443\n"
+                           r"issued: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\n"
+                           r"expires-session: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\n"
+                           r"expires-day: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z\n"
+                           r"rp: [a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?\nwritable: (?:yes|no)\n",
+}
+
+# The levain namespaces whose own request is a CHOICE request: namespace -> its exact options, (key, text) pairs. A
+# request file in one is refused unless its options are exactly these (so a key signed for one text can never be
+# read as the other) and it offers no write-in. The signed bytes are the message, a newline and the choice line, so a
+# signature for key ``s`` covers a different byte string than one for ``d``.
+LEVAIN_SIGN_CHOICES: dict[str, tuple[tuple[str, str], ...]] = {
+    EGRESS_HOST_NAMESPACE: (("s", "Allow this host for this session"),
+                            ("d", "Allow this host for 24 hours, this session only")),
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers
