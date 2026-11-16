@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,15 @@ def _mounted(src: Any, root: FakeRoot, **kw: Any) -> Any:
     return _serve(src, surface_tokens={"browser": T, "relay": RELAY}, host_grants=HG.HostGrantSurface(spawn=root), **kw)
 
 
+def _slow_revoke(root: FakeRoot, seconds: float) -> Any:
+    """The fake root with only the revoke slow, so a list read is quick while a revoke stays on the wire."""
+    def spawn(argv: Any, **kw: Any) -> Any:
+        if list(argv)[3] == "egress-grant-revoke":
+            time.sleep(seconds)
+        return root(argv, **kw)
+    return spawn
+
+
 _ROWS = ("[...document.querySelectorAll('#levain-modal .hostgrant-row')].map((r) => ({session: r.dataset.hostgrantSession,"
          " head: r.querySelector('.consent-head').textContent, paused: !!r.querySelector('.hostgrant-paused'),"
          " grants: [...r.querySelectorAll('.hostgrant-grant')].map((g) => g.dataset.hostgrant)}))")
@@ -112,7 +122,7 @@ def test_live_and_paused_rows_by_slot_and_the_confirm_tap_revokes_one_grant(src,
     assert [(r["session"], r["paused"], r["grants"]) for r in rows] == [(S1, False, [G1, G2]), (S2, True, [G3])], rows
     assert "slot 0 · interactive" in rows[0]["head"] and "slot 1 · interactive" in rows[1]["head"], rows
     assert "paused" in text and "Slot 2 could not be read by root (egress-store-unreadable)" in text, text
-    assert re.search(r"ends in 3 h 2\d min", text), text
+    assert re.search(r"ends in 3 h", text), text      # 3 h 20 min when built; the minutes tick down, so only the hours are pinned
     assert "for the session" in text, text
     assert armed == "Tap again to revoke"
     assert [r["grants"] for r in after] == [[G2], [G3]], after
@@ -220,6 +230,50 @@ def test_no_live_grants_says_so(src, tmp_path) -> None:
     with _mounted(src, FakeRoot(_slots((S1, 0, [])))) as (port, _h):
         values = _open(tmp_path, port, {"eval": _TEXT}, *_shot("hostgrants-empty-390.png"))
     assert "No live host grants" in values[0], values
+
+
+_ALL_SLOTS = "[...document.querySelectorAll('.hostgrant-slot')].filter((s) => s.isConnected)"
+_STATE = ("(() => " + _ALL_SLOTS + ".map((s) => ({filled: s.dataset.filled === '1', text: s.textContent,"
+          " grants: [...s.querySelectorAll('.hostgrant-grant')].map((g) => g.dataset.hostgrant)})))()")
+_REOPEN = ("(() => { const b = document.querySelector('#ck-needs:not([hidden]) .needs-history') || " + TILE + "; b.click(); return 1; })()")
+_MARK_OLD = "(() => { window.__old = " + SLOT + "; return 1; })()"
+_NEW = f"!!{SLOT} && {SLOT} !== window.__old"
+
+
+@needs_browser
+def test_a_rerender_during_a_revoke_leaves_the_new_slot_drawn_live_and_told(src, tmp_path) -> None:
+    """Per-slot state: a revoke in flight on a slot the page then replaced (the Decisions view drawn again) finishes without
+    discarding the new slot's own fill, without leaving the new slot's buttons inert, and draws its result on every slot still
+    on the page."""
+    root = FakeRoot(_slots((S1, 0, [G1, G2]), (S2, 1, [G3])))
+    with _serve(src, surface_tokens={"browser": T, "relay": RELAY},
+                host_grants=HG.HostGrantSurface(spawn=_slow_revoke(root, 1.5))) as (port, _h):
+        values = _open(tmp_path, port,
+                       {"eval": _MARK_OLD}, {"tap": _btn(G1)}, {"tap": _btn(G1)},      # the revoke is on the wire (1.5 s at the fake root)
+                       {"eval": _REOPEN}, {"until": _NEW}, {"eval": _ALL_SLOTS + ".length"},
+                       {"until": FILLED}, {"eval": _STATE},
+                       {"tap": _btn(G2)}, {"eval": f"{_btn(G2)}.textContent"},         # the first tap arms: the old revoke's busy is not this slot's
+                       {"until": f"/Root revoked/.test({SLOT}.textContent)"}, {"eval": _STATE})
+    states = [v for v in values if isinstance(v, list)]
+    assert all(s["filled"] for s in states[0]), states[0]                                # the new slot was not left blank
+    assert "Tap again to revoke" in values, values                                       # its buttons were not inert
+    assert all(G1 not in s["grants"] and "Root revoked" in s["text"] for s in states[-1]), states[-1]
+
+
+@needs_browser
+def test_a_revoke_redraws_every_slot_on_the_page_not_only_the_one_that_asked(src, tmp_path) -> None:
+    """The card and its focus modal are two slots on one page: a revoke from one leaves neither stale, neither blank."""
+    root = FakeRoot(_slots((S1, 0, [G1, G2]), (S2, 1, [G3])))
+    with _mounted(src, root) as (port, _h):
+        values = _open(tmp_path, port,
+                       {"eval": _MARK_OLD}, {"eval": _REOPEN}, {"until": _NEW}, {"until": FILLED},
+                       {"eval": "(() => { document.body.appendChild(window.__old); return 1; })()"},      # the old slot is back on the page: two live slots
+                       {"tap": _btn(G1)}, {"tap": _btn(G1)},
+                       {"until": f"/Root revoked/.test({SLOT}.textContent)"},
+                       {"until": f"!window.__old.querySelector('[data-hostgrant=\"{G1}\"]') && window.__old.dataset.filled === '1'"},
+                       {"eval": _STATE})
+    states = values[-1]
+    assert len(states) >= 2 and all(s["filled"] and G1 not in s["grants"] for s in states), states
 
 
 def test_the_block_draws_with_textcontent_only() -> None:

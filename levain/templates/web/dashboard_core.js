@@ -8770,9 +8770,16 @@
   // what the page may say: root revoked it; the front's own check closes the tunnels, so the page never says they closed
   const HOSTGRANT_FRONT = "A healthy running front closes its granted tunnels on its next check, normally within about five seconds.";
   const HOSTGRANT_SETUP = "Run `levain doctor` on the laptop: it names the one command.";
-  let hostGrantSaid = null;    // [text, kind]: what the last revoke said, shown once by the next draw
-  let hostGrantBusy = 0;       // a revoke on the wire: no second tap starts another
-  let hostGrantFillSeq = 0;    // the newest fill wins
+  // per slot, never shared: the card and its focus modal, or a slot the page has since replaced, each keep their own
+  //   said: [text, kind], what the last revoke said, shown once by this slot's next draw
+  //   busy: a revoke on the wire from this slot: no second tap starts another
+  //   seq:  the newest fill of this slot wins (a fill of another slot never discards it)
+  const hostGrantStates = new WeakMap();
+  function hostGrantState(slot) {
+    let st = hostGrantStates.get(slot);
+    if (!st) { st = { said: null, busy: 0, seq: 0 }; hostGrantStates.set(slot, st); }
+    return st;
+  }
   const hostGrantArmed = new Set();   // the disarm of every button now waiting on its second tap
   function hostGrantFetch() {
     const headers = signHeaders(false);
@@ -8802,7 +8809,8 @@
     let timer = 0;
     const disarm = () => { clearTimeout(timer); hostGrantArmed.delete(disarm); b.dataset.armed = ""; b.textContent = label; };
     b.addEventListener("click", () => {
-      if (hostGrantBusy) return;
+      const own = b.closest(".hostgrant-slot");
+      if (own && hostGrantState(own).busy) return;
       if (b.dataset.armed !== "1") {
         for (const d of [...hostGrantArmed]) d();
         hostGrantArmed.add(disarm);
@@ -8847,9 +8855,10 @@
     return row;
   }
   function hostGrantDraw(slot, b) {
-    const said = hostGrantSaid ? [el("div", "consent-note ext-meta hostgrant-said " + hostGrantSaid[1], hostGrantSaid[0])] : [];
+    const st = hostGrantState(slot);
+    const said = st.said ? [el("div", "consent-note ext-meta hostgrant-said " + st.said[1], st.said[0])] : [];
     if (said.length) said[0].setAttribute("role", "status");
-    hostGrantSaid = null;
+    st.said = null;
     const head = el("div", "ext-grouphead", "Host grants");
     if (b.unreadable === true || !Array.isArray(b.slots)) {
       // never an empty list: a read that failed is a note, in the server's words
@@ -8868,26 +8877,33 @@
   }
   // `fresh` is a read the revoke's answer already carried: drawn as is, no second trip
   function hostGrantFill(slot, fresh) {
-    const n = ++hostGrantFillSeq;
+    const st = hostGrantState(slot);
+    const n = ++st.seq;
     const go = (r) => {
-      if (n !== hostGrantFillSeq) return;
-      if (r.status === 404 || r.status === 403) { hostGrantSaid = null; slot.replaceChildren(); slot.dataset.filled = "1"; return; }
+      if (n !== st.seq) return;
+      if (r.status === 404 || r.status === 403) { st.said = null; slot.replaceChildren(); slot.dataset.filled = "1"; return; }
       const b = r.body;
       hostGrantDraw(slot, r.status === 200 && b ? b : { unreadable: true, note: "" });
       slot.dataset.filled = "1";
     };
-    (fresh ? Promise.resolve(fresh) : hostGrantFetch()).then(go).catch(() => go({ status: 0, body: null }));
+    (fresh ? Promise.resolve(fresh) : hostGrantFetch()).then(go, () => go({ status: 0, body: null }));
   }
   function hostGrantRevoke(session, target, all, slot) {
-    if (hostGrantBusy) return;
-    hostGrantBusy++;
+    const st = hostGrantState(slot);
+    if (st.busy) return;
+    st.busy++;
     for (const x of slot.querySelectorAll("button")) x.disabled = true;
+    // the answer is drawn on every host-grant slot still on the page (the card under a closed modal, the page drawn again
+    // mid-revoke), not only the one that asked, which may have been replaced; a slot that was replaced is drawn too, harmlessly
+    const settle = (said, fresh) => {
+      st.busy--;
+      const targets = new Set([slot, ...document.querySelectorAll(".hostgrant-slot")]);
+      for (const t of targets) { if (t !== slot && !t.isConnected) continue; hostGrantState(t).said = said; hostGrantFill(t, fresh); }
+    };
     signCall(HOSTGRANT_REVOKE, { session: session, target: target }).then((r) => {
-      hostGrantSaid = hostGrantWords(r, all);
       const l = r.body && r.body.listing;
-      hostGrantBusy--;
-      hostGrantFill(slot, r.ok && l && typeof l === "object" ? { status: 200, body: l } : null);
-    }, () => { hostGrantBusy--; hostGrantSaid = ["Not revoked: the page failed.", "bad"]; hostGrantFill(slot); });
+      settle(hostGrantWords(r, all), r.ok && l && typeof l === "object" ? { status: 200, body: l } : null);
+    }, () => settle(["Not revoked: the page failed.", "bad"], null));
   }
   function hostGrantSlot() {
     const slot = el("div", "hostgrant-slot");
