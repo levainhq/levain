@@ -86,6 +86,25 @@
     return { state: "unknown", words: "The lease could not be checked; a line you send will queue.", drop: false };
   }
 
+  // The live desk's context against its rotation lines (levain#79), from the server's `context` object alone: tokens from the desk
+  // session's transcript usage block, SOFT (rotate at the next natural seam) and HARD (rotate now), the same reading flow's
+  // seat_context.py gives. Absent (no context command on this host, or no desk holds the lease): nothing is drawn. An unreadable one
+  // is said so, never drawn as zero. A go-deep desk has no SOFT line (soft null).
+  function groups(n) { return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+  function whole(v) { return typeof v === "number" && isFinite(v) && v >= 0 && Math.floor(v) === v; }
+  function contextModel(c) {
+    if (!c || typeof c !== "object") return null;
+    if (c.state !== "ok" || !whole(c.tokens) || !whole(c.hard) || c.hard < 1 || !(c.soft === null || c.soft === undefined || whole(c.soft))) {
+      return { state: "unreadable", words: "The desk's context could not be read just now." };
+    }
+    var soft = c.soft === null || c.soft === undefined ? null : c.soft, level = c.tokens >= c.hard ? "hard" : (soft !== null && c.tokens >= soft ? "soft" : "ok");
+    var lines = (soft !== null ? "SOFT " + groups(soft) + " · " : "") + "HARD " + groups(c.hard);
+    var verdict = level === "hard" ? "rotate now" : (level === "soft" ? "rotate at the next natural seam" : "");
+    return { state: "ok", level: level, tokens: c.tokens, soft: soft, hard: c.hard,
+             words: "Context " + groups(c.tokens) + " tokens · " + lines + (verdict ? " · " + verdict : ""),
+             fill: Math.min(100, c.tokens / c.hard * 100), tick: soft !== null ? Math.min(100, soft / c.hard * 100) : null };
+  }
+
   // One event the desk (or its script) filed back, as the words to draw. The kinds are the port's: took, held, reply.
   function eventModel(e) {
     var by = str(e && e.by), kind = str(e && e.kind), text = str(e && e.text), at = str(e && e.at);
@@ -109,6 +128,7 @@
       caps: caps,
       wordsMax: typeof caps.words_max === "number" && caps.words_max > 0 ? caps.words_max : 0,
       lease: leaseModel(j.lease),
+      context: contextModel(j.context),
       thread: typeof j.thread_id === "string" && j.thread_id ? j.thread_id : null,
       events: evs.map(function (e) { return { by: str(e.by), kind: str(e.kind), text: str(e.text), at: str(e.at) }; }),
       cursor: typeof j.cursor === "string" && j.cursor ? j.cursor : null,
@@ -471,6 +491,18 @@
       if (current && current.kind === "wired") {
         bar.className = "dv-state dv-lease-" + current.lease.state;
         bar.appendChild(el(doc, "div", "dv-leasewords", shown(current.lease.words)));
+        if (current.lease.state === "held" && current.context) {
+          var cx = current.context, box = el(doc, "div", "dv-ctx dv-ctx-" + (cx.state === "ok" ? cx.level : "unreadable"));
+          box.appendChild(el(doc, "div", "dv-ctxwords", shown(cx.words)));
+          if (cx.state === "ok") {
+            var track = el(doc, "div", "dv-ctxbar"), fill = el(doc, "i", "dv-ctxfill");
+            fill.style.width = cx.fill.toFixed(1) + "%";
+            track.appendChild(fill);
+            if (cx.tick !== null) { var tick = el(doc, "i", "dv-ctxtick"); tick.style.left = cx.tick.toFixed(1) + "%"; track.appendChild(tick); }
+            box.appendChild(track);
+          }
+          bar.appendChild(box);
+        }
         if (current.lease.state === "none" && root.LevainSignSheet && typeof root.LevainSignSheet.openDrop === "function") {
           var st = el(doc, "button", "dv-start", "Start desk");
           st.setAttribute("type", "button"); st.setAttribute("title", "Open the signing sheet to start a desk: " + DESK_WORDS);
@@ -666,7 +698,7 @@
   }
 
   var api = {
-    deskModel: deskModel, leaseModel: leaseModel, eventModel: eventModel, mergeEvents: mergeEvents, isSettled: isSettled, sendOutcome: sendOutcome, filedNote: filedNote,
+    deskModel: deskModel, leaseModel: leaseModel, contextModel: contextModel, eventModel: eventModel, mergeEvents: mergeEvents, isSettled: isSettled, sendOutcome: sendOutcome, filedNote: filedNote,
     pollDelay: pollDelay, shown: shown, ageWords: ageWords, mount: mount,
     POLL_OPEN_MS: POLL_OPEN_MS, POLL_HIDDEN_MS: POLL_HIDDEN_MS, AMBIGUOUS_WORDS: AMBIGUOUS_WORDS, ARRIVED_WORDS: ARRIVED_WORDS, NOT_ARRIVED_WORDS: NOT_ARRIVED_WORDS,
     HOSTILE_SOURCE: HOSTILE.source

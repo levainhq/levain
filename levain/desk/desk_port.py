@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal, Optional, Protocol, Sequence, runtime_checkable
 
 from levain.desk import room_host
+from levain.desk import desk_context
 from levain.desk.chat_lease import _CLIENT_ID
 from levain.desk.room_host import HostCommandError, THREAD_RE
 
@@ -262,21 +263,24 @@ class WakeAdapter(Protocol):
 
 
 # --- the host's commands ------------------------------------------------------------------------------------------------
-_DESK_KEYS = ("post", "lease", "events", "words_max")
+_DESK_KEYS = ("post", "lease", "events", "words_max", "context")
 
 
 @dataclass(frozen=True)
 class DeskCommands:
     """The argvs a host gives the Desk tab: ``post`` (words on STDIN), ``lease`` (reads the lease), ``events`` (reads a
     thread's receipts); each absolute-program, run ``shell=False``; any may be None (the capability is then absent).
-    ``words_max`` is the host's cap. Deliberately NOT part of :class:`levain.desk.room_host.HostCommands`."""
+    ``context`` (levain#79) names the live desk's session transcript for the Desk view's context line: no extra argv; stdout is one
+    JSON object ``{"transcript": <absolute path of a .jsonl>, "deep": bool?}`` (:func:`levain.desk.desk_context.parse_command`); the
+    port reads the transcript's tail itself. ``words_max`` is the host's cap. Deliberately NOT part of :class:`levain.desk.room_host.HostCommands`."""
     post: Optional[tuple[str, ...]] = None
     lease: Optional[tuple[str, ...]] = None
     events: Optional[tuple[str, ...]] = None
     words_max: int = WORDS_MAX
+    context: Optional[tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
-        for name in ("post", "lease", "events"):
+        for name in ("post", "lease", "events", "context"):
             v = getattr(self, name)
             if v is not None:
                 try:
@@ -287,8 +291,11 @@ class DeskCommands:
             raise DeskCommandError(f"words_max is an int from 1 to {WORDS_MAX * 10}")
 
     def to_json(self) -> str:
-        return json.dumps({"post": list(self.post) if self.post else None, "lease": list(self.lease) if self.lease else None,
-                           "events": list(self.events) if self.events else None, "words_max": self.words_max}, sort_keys=True)
+        doc: dict[str, Any] = {"post": list(self.post) if self.post else None, "lease": list(self.lease) if self.lease else None,
+                               "events": list(self.events) if self.events else None, "words_max": self.words_max}
+        if self.context:
+            doc["context"] = list(self.context)
+        return json.dumps(doc, sort_keys=True)
 
     @classmethod
     def from_env(cls, value: Optional[str]) -> Optional["DeskCommands"]:
@@ -302,7 +309,7 @@ class DeskCommands:
             raise DeskCommandError("the desk commands are not JSON") from None
         if not isinstance(doc, dict) or set(doc) - set(_DESK_KEYS):
             raise DeskCommandError("the desk commands are an object of " + ", ".join(_DESK_KEYS))
-        return cls(doc.get("post"), doc.get("lease"), doc.get("events"), doc.get("words_max", WORDS_MAX))
+        return cls(doc.get("post"), doc.get("lease"), doc.get("events"), doc.get("words_max", WORDS_MAX), doc.get("context"))
 
 
 # --- shared checks ------------------------------------------------------------------------------------------------------
@@ -421,6 +428,25 @@ class HostCommandDeskPort:
         if not ran.started or ran.code != 0:
             return LeaseView("unknown")
         return _parse_lease(ran.out)
+
+    @property
+    def has_context(self) -> bool:
+        """True when a ``context`` command is configured: the Desk view then draws the live desk's context line (or says it could
+        not be read); with none it draws no such line."""
+        return self._cmds.context is not None
+
+    def context(self) -> Optional[desk_context.ContextView]:
+        """The live desk's context against its rotation lines, or None when it cannot be read (no command, the command failed or
+        named nothing usable, the transcript is gone or holds no usage record). Unreadable is never zero."""
+        if self._cmds.context is None:
+            return None
+        ran = room_host.run(self._cmds.context, "", (), timeout=self._timeout)
+        if not ran.started or ran.code != 0:
+            return None
+        named = desk_context.parse_command(ran.out)
+        if named is None:
+            return None
+        return desk_context.read_context(named[0], deep=named[1])
 
     def events(self, thread_id: str, after: Optional[str] = None) -> EventBatch:
         if self._cmds.events is None:
@@ -551,6 +577,7 @@ class ScriptedDeskPort:
         self._claims: dict[str, tuple[str, PostResult]] = {}
         self._events: dict[str, list[DeskEvent]] = {}
         self._unreadable = False
+        self._context_on, self._context = False, None
         self._n = 0
 
     def script_lease(self, state: str, holder: Optional[str] = None, age_s: Optional[int] = None) -> None:
@@ -565,6 +592,17 @@ class ScriptedDeskPort:
 
     def script_unreadable(self, flag: bool = True) -> None:
         self._unreadable = bool(flag)
+
+    def script_context(self, view: Optional[desk_context.ContextView]) -> None:
+        """Give the double a context command; ``view`` None is a context that cannot be read."""
+        self._context_on, self._context = True, view
+
+    @property
+    def has_context(self) -> bool:
+        return self._context_on
+
+    def context(self) -> Optional[desk_context.ContextView]:
+        return self._context
 
     def capabilities(self) -> DeskCaps:
         return self.caps
