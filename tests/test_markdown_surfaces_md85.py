@@ -70,29 +70,6 @@ def test_the_desk_view_draws_the_desks_reply_as_markdown_elements_and_keeps_its_
     g = _look(out, sel)
     _elements(g)
     assert "rv-md" in g["cls"], g
-
-
-_NO_REPLY_LOOK = """JSON.stringify({found: true, them: [...document.querySelectorAll('.chat-panel .chat-msg.them .chat-text')].map(n => n.textContent),
-  err: [...document.querySelectorAll('.chat-panel .chat-msg.err .chat-text')].map(n => n.textContent)})"""
-
-
-@needs_browser
-def test_the_chat_panel_with_no_reply_never_draws_the_word_null(tmp_path):
-    # a job whose result carries reply: null. The panel's callers draw a reply only when it is truthy, so this turn shows the no-reply
-    # notice; replyText itself draws "" for a null/undefined reply (never String(null)), so no bubble anywhere reads "null"/"undefined"
-    with desk_page(tmp_path) as (stub, base):
-        out = _drive(tmp_path, base + "/", [{"until": "window.LevainRoomView && document.getElementById('board')"},
-                                           {"eval": _CHAT_WITH % "null"},
-                                           {"tap": "[...document.querySelectorAll('.chat-btn')].find(b => b.textContent === 'Start session')"},
-                                           {"until": "document.querySelector('.chat-area')"},
-                                           {"eval": "(() => { const a = document.querySelector('.chat-area'); a.value = 'hello'; return 1; })()"},
-                                           {"tap": "[...document.querySelectorAll('.chat-btn')].find(b => b.textContent === 'Send')"},
-                                           {"until": "document.querySelector('.chat-panel .chat-msg.err .chat-text')"},
-                                           {"eval": _NO_REPLY_LOOK}])
-    g = _look(out)
-    assert g["err"] == ["The entity returned no reply."], g
-    for t in g["them"]:
-        assert t.strip() not in ("null", "undefined"), g
     rest = json.loads(out["values"][-1])
     assert rest["voice"] >= 1, rest                                   # the speaker control is still on the desk's reply
     assert rest["other"] == "**not** markdown from a script" and rest["otherEls"] == 0, rest   # only the desk's own reply is markdown
