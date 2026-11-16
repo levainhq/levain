@@ -4214,6 +4214,12 @@ def _egress_grants_list(ctx: Ctx, req: RuntimeRequest, blob: object) -> Dict[str
     return EV.egress_grants_list(ctx, req, blob)
 
 
+def _egress_grants_all(ctx: Ctx, req: RuntimeRequest, blob: object) -> Dict[str, object]:
+    from levain.slot import egress_verbs as EV
+
+    return EV.egress_grants_all(ctx, req, blob)
+
+
 VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, object]]] = {
     "prepare": prepare, "render": render, "resume": resume, "status": status,
     "start": _start, "teardown": _teardown, "adopt-open": adopt_open, "adopt-verify": adopt_verify,
@@ -4221,6 +4227,7 @@ VERB_HANDLERS: Dict[str, Callable[[Ctx, RuntimeRequest, object], Dict[str, objec
     "read-allow": read_allow,
     "egress-grant": _egress_grant, "egress-grant-revoke": _egress_grant_revoke,
     "egress-refusals": _egress_refusals, "egress-grants-list": _egress_grants_list,
+    "egress-grants-all": _egress_grants_all,
 }
 
 
