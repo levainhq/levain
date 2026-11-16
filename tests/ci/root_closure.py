@@ -207,6 +207,7 @@ LAZY_SITES = {
     'levain/slot/runtime_helper.py::_egress_grant::from levain.slot import egress_verbs as EV': 'root',
     'levain/slot/runtime_helper.py::_egress_grant_revoke::from levain.slot import egress_verbs as EV': 'root',
     'levain/slot/runtime_helper.py::_egress_grants_list::from levain.slot import egress_verbs as EV': 'root',
+    'levain/slot/runtime_helper.py::_egress_grants_all::from levain.slot import egress_verbs as EV': 'root',
     'levain/slot/runtime_helper.py::_egress_refusals::from levain.slot import egress_verbs as EV': 'root',
     # root: the grant verifier reads root's own signers file and base map through the helper's readers (lazy: egress_verbs
     # is itself imported by a runtime_helper wrapper, so these two cannot be top-level without a cycle)

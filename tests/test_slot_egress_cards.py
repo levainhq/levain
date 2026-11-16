@@ -535,6 +535,9 @@ def _exported_names() -> set[str]:
         names |= {v for k, v in vars(mod).items() if k.startswith("ERR_") and isinstance(v, str)}
     names |= {ES.NOT_READY, ES.DIR_UNTRUSTED} | set(eg.REASONS)
     names |= {"egress-grant-used", "egress-grant-revoked", "no-session", "session-busy"}   # literal in the verbs
+    # S5a's ``egress-grants-all`` names a per-slot ``unread`` row with these, never a refusal of a verb the card flow
+    # runs (only the cockpit's host_grants.py reads that verb): they are not the flow's to map
+    names -= {EV.ERR_ALL_UNREAD, EV.ERR_ALL_MISMATCH}
     return names
 
 

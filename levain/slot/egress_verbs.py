@@ -1,5 +1,5 @@
 """Root's host-grant verbs (board levain#66 slice S2, plan hgs2_plan_v2): ``egress-grant``, ``egress-grant-revoke``,
-``egress-refusals``, ``egress-grants-list``. The handlers are thin: they bind the caller to the session, then compose
+``egress-refusals``, ``egress-grants-list``, ``egress-grants-all``. The handlers are thin: they bind the caller to the session, then compose
 :mod:`levain.slot.egress_verify` (the signature and host policy), :mod:`levain.slot.egress_store` (the grants file in
 the root-owned ``R/grants/slot<n>/``) and :mod:`levain.slot.egress_ledger` (single use, revocation). Imported lazily by
 :mod:`levain.slot.runtime_helper`'s wrappers, as ``start`` is.
@@ -38,6 +38,7 @@ from levain.slot import egress_ledger as EL
 from levain.slot import egress_store as ES
 from levain.slot import egress_verify as EV
 from levain.slot import records as R
+from levain.slot.ids import SlotId
 from levain.slot import runtime_helper as H
 from levain.slot.runtime_grammar import OPERATOR, EgressGrantInput, RuntimeRequest
 
@@ -52,6 +53,8 @@ ERR_SUPERSEDED = "egress-grant-superseded"
 ERR_WRITE = "egress-grant-write-failed"
 ERR_UNSURE = "egress-grant-unsure"
 ERR_TOO_MANY = "too-many"
+ERR_ALL_UNREAD = "egress-grants-unreadable"
+ERR_ALL_MISMATCH = "egress-grants-slot-mismatch"
 ERR_LOG = "egress-refusals-log"
 ERR_CURSOR = "egress-refusals-cursor"
 #: ``egress-refusals``: at most this many hosts and this many log bytes scanned per call (a long log is read over
@@ -396,4 +399,105 @@ def egress_grants_list(ctx: H.Ctx, req: RuntimeRequest, blob: object) -> Dict[st
     return {"store": store_id, "entries": [_entry_dict(e) for e in live]}
 
 
-__all__ = ["bind", "egress_grant", "egress_grant_revoke", "egress_grants_list", "egress_refusals"]
+#: ``egress-grants-all`` lists a session in these CONTROL states only (a dead front's leftover file is never shown live).
+_LISTED_STATES = (R.ACTIVE, R.BRAKED)
+
+
+def _session_state(ctx: H.Ctx, session: str) -> Optional[str]:
+    """CONTROL's state name for ``session`` (``None`` when there is no record: prepare's window between its alloc and
+    ATTACH, a session never ACTIVE). A record that cannot be read or parsed raises, and one that names another session
+    is ``egress-grants-slot-mismatch`` (the caller names the slot ``unread``, never an absent one)."""
+    data = ctx.store.read(("sessions",), f"{session}.json", trusted=False)
+    if data is None:
+        return None
+    rec = R.parse_state(data)
+    if rec.session != session:
+        raise Refused(ERR_ALL_MISMATCH, "the CONTROL record names another session")
+    return rec.state
+
+
+def _slot_alloc(ctx: H.Ctx, slot: SlotId, ss: R.SlotState) -> Optional[R.Alloc]:
+    """The alloc of the session slot state ``ss`` leases ``slot`` to, or ``None`` for a session this verb never shows:
+    the reaper's orphan (no alloc and no CONTROL record), another operator's, or an unattended kind. Not :func:`bind`,
+    which folds a corrupt alloc into ``no-session``: here an alloc that is gone under a record or does not parse is
+    ``egress-grants-unreadable`` and one that is not this slot's lease is ``egress-grants-slot-mismatch``."""
+    session = str(ss.session)
+    data = ctx.store.read(("alloc",), f"{session}.json")
+    if data is None:
+        if ctx.store.read(("sessions",), f"{session}.json", trusted=False) is None:
+            return None                     # only a clean prepare failure unlinks an alloc, while no record exists
+        raise Refused(ERR_ALL_UNREAD, "the alloc is gone under a CONTROL record")
+    try:
+        a = R.parse_alloc(data)
+    except (Refused, ContractError, ValueError):
+        raise Refused(ERR_ALL_UNREAD, "the alloc does not parse") from None
+    if a.session != session:
+        raise Refused(ERR_ALL_MISMATCH, "the alloc names another session")
+    if a.operator_uid != ctx.sudo_uid:
+        return None                         # another operator's session: invisible by design, never named
+    if a.slot != slot or a.lease_seq != ss.lease_seq:
+        raise Refused(ERR_ALL_MISMATCH, "the alloc is not this slot's lease")
+    return a if a.kind in GRANTABLE_KINDS else None    # an unattended session: invisible by design
+
+
+def _slot_row(ctx: H.Ctx, slot: SlotId, now: datetime) -> Optional[Dict[str, object]]:
+    """One configured egress slot's row for :func:`egress_grants_all`, or ``None`` when it is not to be listed (not
+    leased, another operator's session, an unattended kind, a state that is not ACTIVE or BRAKED). Raises ``Refused``,
+    ``OSError`` or a parse error for a slot root could not read: the caller names it."""
+    raw = ctx.store.read(("slots", slot.tag), "state")
+    if raw is None:
+        return None
+    ss = H.parse_slot_state_of(raw, slot)
+    if ss.state != "leased" or ss.session is None:
+        return None
+    a = _slot_alloc(ctx, slot, ss)
+    if a is None:
+        return None
+    state = _session_state(ctx, ss.session)
+    if state not in _LISTED_STATES:
+        return None
+    try:
+        sd = ES.open_slot_dir(ctx, slot)    # type: Optional[ES.SlotDir]
+    except Refused as e:
+        if e.name != ES.NOT_READY:
+            raise
+        sd = None                           # nothing was ever published here
+    try:
+        live = [e for e in (ES.read_current(ctx, slot, ss.session, sd) if sd is not None else []) if e.expires > now]
+    finally:
+        if sd is not None:
+            sd.close()
+    return {"slot": slot.index, "session": ss.session, "kind": a.kind, "state": state,
+            "entries": [_entry_dict(e) for e in live]}
+
+
+def egress_grants_all(ctx: H.Ctx, req: RuntimeRequest, blob: object) -> Dict[str, object]:
+    """``{store, slots, unread}``: for the operator caller, every configured egress slot that is leased to one of the
+    caller's interactive or login sessions in CONTROL state ACTIVE or BRAKED, with that session's live entries
+    (``slots``: ``{slot, session, kind, state, entries}``). It walks the configured slots (at most 64, each 16 grants),
+    never the alloc records of every session ever prepared, so its answer is bounded. A slot whose directory or file
+    root cannot read is a named ``unread`` row (``{slot, name}``), never an omission; every other slot still lists.
+    No session lock (as ``egress-grants-list``): the state is a hint, the file is root's whole rename. A missing grants
+    store is the refusal ``egress-grants-list`` gives."""
+    if ctx.caller != OPERATOR:              # the owner check would skip every slot: an empty answer is not a refusal
+        raise Refused("verb-not-allowed-for-caller", "egress-grants-all")
+    now = _now(ctx)
+    with EL.ledger_dir(ctx) as dfd:
+        store_id = EL.read_store_id(ctx, dfd)
+    slots, unread = [], []   # type: List[Dict[str, object]], List[Dict[str, object]]
+    for idx in sorted(H.configured_slots(ctx.store)["egress"]):
+        slot = SlotId("egress", idx)
+        try:
+            row = _slot_row(ctx, slot, now)
+        except Refused as e:
+            unread.append({"slot": idx, "name": e.name})
+            continue
+        except (OSError, ContractError, ValueError):
+            unread.append({"slot": idx, "name": ERR_ALL_UNREAD})
+            continue
+        if row is not None:
+            slots.append(row)
+    return {"store": store_id, "slots": slots, "unread": unread}
+
+
+__all__ = ["bind", "egress_grant", "egress_grant_revoke", "egress_grants_all", "egress_grants_list", "egress_refusals"]

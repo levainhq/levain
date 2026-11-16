@@ -63,6 +63,7 @@ def test_every_verb_parses_for_the_operator():
         "read-allow": ["read-allow", S],
         "egress-grant": ["egress-grant", S], "egress-grant-revoke": ["egress-grant-revoke", S, "all"],
         "egress-refusals": ["egress-refusals", S, "0"], "egress-grants-list": ["egress-grants-list", S],
+        "egress-grants-all": ["egress-grants-all"],
     }
     assert set(good) == set(rg.VERBS)
     for verb, a in good.items():
@@ -92,13 +93,15 @@ def argv_for(verb):
         return argv([verb, S, "all"])
     if verb == "egress-refusals":
         return argv([verb, S, "0"])
+    if verb == "egress-grants-all":
+        return argv([verb])
     return argv([verb, S])
 
 
 # --- host grants (levain#66 S2): the four egress verbs' argv and the egress-grant stdin ---------------------------
 
 GID = "eh-" + "0123456789abcdef01234567"
-EGRESS_VERBS = ("egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list")
+EGRESS_VERBS = ("egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list", "egress-grants-all")
 
 
 def test_the_egress_verbs_are_operator_only_not_lease_verbs_and_only_egress_grant_takes_stdin():
@@ -111,6 +114,7 @@ def test_the_egress_verbs_are_operator_only_not_lease_verbs_and_only_egress_gran
 @pytest.mark.parametrize("a,name", [
     (["egress-grant"], "missing-argv"), (["egress-grant", S, S], "extra-argv"), (["egress-grant", "../x"], "bad-token"),
     (["egress-grants-list"], "missing-argv"), (["egress-grants-list", S, "0"], "extra-argv"),
+    (["egress-grants-all", S], "extra-argv"),
     (["egress-grant-revoke", S], "missing-argv"), (["egress-grant-revoke", S, "all", "all"], "extra-argv"),
     (["egress-grant-revoke", S, "ALL"], "bad-token"), (["egress-grant-revoke", S, GID.upper()], "bad-token"),
     (["egress-grant-revoke", S, GID[:-1]], "bad-token"), (["egress-grant-revoke", S, GID + "0"], "bad-token"),

@@ -37,7 +37,7 @@ from levain.slot.grammar import INDEX_SPACE, SESSION_RE, SLOT_CLASSES
 
 VERBS = ("prepare", "render", "start", "resume", "teardown", "confirm-identity",
          "adopt-open", "adopt-verify", "discard", "restore", "status", "probe", "read-allow",
-         "egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list")
+         "egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list", "egress-grants-all")
 
 KINDS = ("interactive", "login", "dispatch", "planner", "verifier")   # §5.1 prepare
 VENDORS = ("claude", "codex")                                          # §5.1 prepare, §5.3 vendor
@@ -60,7 +60,7 @@ STDIN_VERBS = frozenset({"prepare", "render", "egress-grant"})
 
 #: levain#66 S2: the four host-grant verbs (operator only, no lease; ``egress-grant`` alone reads stdin, an
 #: :class:`EgressGrantInput` under its own 8 KiB cap).
-EGRESS_VERBS = ("egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list")
+EGRESS_VERBS = ("egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list", "egress-grants-all")
 EGRESS_GRANT_STDIN_MAX = 8 * 1024
 EGRESS_GRANT_KEYS = frozenset({"message", "sig", "signer_fp", "choice"})
 _EGRESS_TARGET_RE = re.compile(r"all|eh-[0-9a-f]{24}", re.ASCII)
@@ -79,7 +79,8 @@ CALLERS = (OPERATOR, DISPATCH)
 #: DECISION (V13 rev 2 §1): ``probe`` is forbidden to dispatch until a dispatch session launches (2f), so
 #: ``sudoers.DISPATCH_VERBS`` stays as installed and no sudoers re-install is needed for the new verb.
 DISPATCH_FORBIDDEN = frozenset({"adopt-open", "discard", "restore", "confirm-identity", "probe", "read-allow",
-                                "egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list"})
+                                "egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list",
+                                "egress-grants-all"})
 
 #: DECISION (narrowest reading of §3.1 + §3.5): the operator's leases carry no ticket, so the operator
 #: prepares only the operator kinds; ``_levain_dispatch`` prepares only the ticketed kinds (ticket kinds
@@ -323,6 +324,9 @@ def parse_runtime_argv(argv: Sequence[str], *, configured_slots: SlotConfig, cal
         if not _BUNDLE_DIGEST_RE.fullmatch(rest[2]):
             raise Refused("bad-token", f"bundle digest: {rest[2][:80]!r}")
         return RuntimeRequest(verb, caller, session=session, bundle_digest=rest[2])
+    if verb == "egress-grants-all":     # no arguments: root walks the configured egress slots itself
+        _arity(verb, rest, 0, 0)
+        return RuntimeRequest(verb, caller)
     if verb == "egress-grant-revoke":   # <session> <eh-id|all>
         _arity(verb, rest, 2, 2)
         session = _session(rest[0])
