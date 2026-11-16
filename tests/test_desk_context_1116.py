@@ -18,7 +18,7 @@ import pytest
 
 from levain.cockpit import desk_tab
 from levain.desk import desk_context
-from levain.desk.desk_context import DEEP_HARD, HARD, MAX_TAIL, SOFT, ContextView, parse_command, read_context
+from levain.desk.desk_context import DEEP_HARD, HARD, MAX_TAIL, SOFT, ContextView, Named, NoReading, parse_command, read_context
 from levain.desk.desk_port import DeskCommands, HostCommandDeskPort, ScriptedDeskPort
 from tests.test_cockpit_flip_parity import _drive, needs_browser
 from tests.test_desk_pane_page import _OPEN, _TAP_DESK, _TOKENED, desk_page, put, until, wired
@@ -67,9 +67,9 @@ def test_the_reading_is_the_newest_usage_sum_input_plus_cache_read_plus_cache_cr
 def test_a_record_with_no_usage_or_a_zero_sum_is_skipped_and_none_at_all_is_unreadable_never_zero(tmp_path):
     p = transcript(tmp_path, [rec(1, 50_000, 0), rec(0, 0, 0), json.dumps({"type": "system", "subtype": "x"}), "not json at all {"])
     assert read_context(p).tokens == 50_001
-    assert read_context(transcript(tmp_path, [rec(0, 0, 0), '{"type":"user"}'], "z.jsonl")) is None
+    assert read_context(transcript(tmp_path, [rec(0, 0, 0), '{"type":"user"}'], "z.jsonl")) == NoReading("no usage record yet")      # a desk with no turn yet
     assert read_context(tmp_path / "missing.jsonl") is None
-    assert read_context(transcript(tmp_path, [], "empty.jsonl")) is None
+    assert read_context(transcript(tmp_path, [], "empty.jsonl")) == NoReading("no usage record yet")
 
 
 def test_a_go_deep_desk_has_no_soft_line_and_the_deep_hard_line(tmp_path):
@@ -167,9 +167,10 @@ def test_the_reading_matches_seat_contexts_on_a_real_session_transcript(tmp_path
 # --- the host's command and the port ----------------------------------------------------------------------------------------------
 
 def test_the_command_names_a_jsonl_by_absolute_path_and_nothing_else_is_taken():
-    assert parse_command('{"transcript": "/a/b/s.jsonl"}') == (Path("/a/b/s.jsonl"), False)
-    assert parse_command('{"transcript": "/a/b/s.jsonl", "deep": true, "extra": 1}') == (Path("/a/b/s.jsonl"), True)
-    assert parse_command('{"transcript": "/a/b/s.jsonl", "deep": "yes"}') == (Path("/a/b/s.jsonl"), False)
+    assert parse_command('{"transcript": "/a/b/s.jsonl"}') == Named(Path("/a/b/s.jsonl"), False, None)
+    assert parse_command('{"transcript": "/a/b/s.jsonl", "deep": true, "extra": 1}') == Named(Path("/a/b/s.jsonl"), True, None)
+    assert parse_command('{"transcript": "/a/b/s.jsonl", "deep": "yes", "holder": "desk 12"}') == Named(Path("/a/b/s.jsonl"), False, "desk 12")
+    assert parse_command('{"transcript": "/a/b/s.jsonl", "holder": 7}').holder is None
     for bad in ("", "x", "[]", "{}", '{"transcript": 3}', '{"transcript": "rel/s.jsonl"}', '{"transcript": "/a/b/s.txt"}', '{"transcript": "/a/\\u0000b.jsonl"}'):
         assert parse_command(bad) is None, bad
 
@@ -190,13 +191,12 @@ def test_the_real_port_reads_the_transcript_the_host_names_and_the_route_carries
     port = _port(tmp_path, json.dumps({"transcript": str(t)}))
     assert port.has_context and port.context() == ContextView(212_405, SOFT, HARD, "claude-opus-5-5")
     status, body = desk_tab.serve_desk(port)
-    assert status == 200 and body["context"] == {"state": "ok", "tokens": 212_405, "soft": SOFT, "hard": HARD, "model": "claude-opus-5-5"}, body
+    assert status == 200 and body["context"] == {"state": "ok", "tokens": 212_405, "soft": SOFT, "hard": HARD, "model": "claude-opus-5-5", "holder": None}, body
 
 
 def test_an_unreadable_context_is_said_unreadable_never_zero(tmp_path):
     t = transcript(tmp_path, [json.dumps({"type": "user"})], "nousage.jsonl")
-    for out, code in ((json.dumps({"transcript": str(t)}), 0), ("not json", 0), (json.dumps({"transcript": str(tmp_path / "gone.jsonl")}), 0),
-                      (json.dumps({"transcript": str(t)}), 3)):
+    for out, code in (("not json", 0), (json.dumps({"transcript": str(tmp_path / "gone.jsonl")}), 0), (json.dumps({"transcript": str(t)}), 3)):
         d = tmp_path / f"c{abs(hash((out, code)))}"
         d.mkdir()
         port = _port(d, out, code=code)
@@ -231,6 +231,168 @@ def test_the_context_key_is_a_desk_command_key_and_the_json_keeps_its_old_shape_
     assert DeskCommands.from_env(json.dumps({"post": ["/p"], "context": ["/c"]})).context == ("/c",)
     assert "context" not in json.loads(DeskCommands(post=("/p",)).to_json())
     assert json.loads(DeskCommands(post=("/p",), context=("/c",)).to_json())["context"] == ["/c"]
+
+
+# --- the L3 round-1 fixes (levain#79) ---------------------------------------------------------------------------------------------------
+
+def _within(seconds, fn):
+    """fn()'s result, or the string 'BLOCKED' when it has not returned in ``seconds`` (the blocked thread is a daemon)."""
+    import threading
+    box = []
+    t = threading.Thread(target=lambda: box.append(fn()), daemon=True)
+    t.start()
+    t.join(seconds)
+    return box[0] if box else "BLOCKED"
+
+
+def test_a_fifo_named_as_the_transcript_is_refused_at_once_not_waited_on(tmp_path):
+    fifo = tmp_path / "pipe.jsonl"
+    os.mkfifo(fifo)
+    assert _within(3, lambda: read_context(fifo)) is None          # an open() with no writer would block here for ever
+    assert _within(3, lambda: read_context("/dev/null")) is None   # a device is not a regular file either (and /dev/null is no .jsonl, but the read refuses on the mode)
+    assert read_context(transcript(tmp_path, [rec(2, 9_000, 0)])).tokens == 9_002     # a regular file still reads
+
+
+def test_a_fifo_cannot_hold_both_desk_read_slots(tmp_path):
+    fifo = tmp_path / "pipe.jsonl"
+    os.mkfifo(fifo)
+    port = _port(tmp_path, json.dumps({"transcript": str(fifo)}))
+    for _ in range(3):
+        assert _within(5, lambda: desk_tab.serve_desk(port)[1]["context"]) == {"state": "unreadable"}
+
+
+def test_a_compaction_boundary_newer_than_the_newest_usage_record_is_no_reading_yet_not_the_old_number(tmp_path):
+    boundary = json.dumps({"type": "system", "subtype": "compact_boundary", "compactMetadata": {"trigger": "auto", "preTokens": 966_749}})
+    p = transcript(tmp_path, [rec(1, 960_000, 0), '{"type":"user"}', boundary, '{"type":"user"}'])
+    assert read_context(p) == NoReading("compacted")
+    assert read_context(transcript(tmp_path, [rec(1, 960_000, 0), boundary, rec(1, 17_000, 0)], "after.jsonl")).tokens == 17_001
+    # a record that only MENTIONS the marker is not a boundary
+    assert read_context(transcript(tmp_path, [rec(1, 5_000, 0), json.dumps({"type": "user", "message": {"content": '"compact_boundary"'}})], "m.jsonl")).tokens == 5_001
+
+
+def test_a_true_in_a_usage_field_is_not_a_token_and_a_deeply_nested_line_is_not_a_crash(tmp_path):
+    lie = json.dumps({"type": "assistant", "message": {"model": "m", "usage": {"input_tokens": True, "cache_read_input_tokens": 0}}})
+    assert read_context(transcript(tmp_path, [rec(1, 40_000, 0), lie])).tokens == 40_001          # the lie is skipped, never 1
+    assert read_context(transcript(tmp_path, [lie], "only.jsonl")) == NoReading("no usage record yet")
+    deep = '{"usage":' + "[" * 100_000 + "]" * 100_000 + "}"
+    assert read_context(transcript(tmp_path, [rec(1, 40_000, 0), deep], "deep.jsonl")).tokens == 40_001
+    assert parse_command("[" * 100_000 + "]" * 100_000) is None
+
+
+def _slow_port(tmp_path, delay: float, *, holder=None, stderr=False):
+    """A port whose context command sleeps ``delay`` s (and writes stderr on a successful exit when asked); counts its runs in runs.txt."""
+    t = transcript(tmp_path, [rec(5, 212_000, 400, model="claude-opus-5-5")], "desk.jsonl")
+    said = {"transcript": str(t), **({"holder": holder} if holder else {})}
+    script = tmp_path / "slow.py"
+    script.write_text("import sys, time\nopen(sys.argv[1], 'a').write('x')\ntime.sleep(float(sys.argv[2]))\n"
+                      + ("sys.stderr.write('a warning the host printed\\n')\n" if stderr else "") + "print(sys.argv[3])\n")
+    lease = tmp_path / "lease.json"
+    lease.write_text(json.dumps({"state": "held", "holder": "desk 12", "age_s": 30}))
+    echo = tmp_path / "echo.py"
+    echo.write_text("import sys\nprint(open(sys.argv[1]).read(), end='')\n")
+    runs = tmp_path / "runs.txt"
+    runs.write_text("")
+    cmds = DeskCommands(post=(sys.executable, "/x"), lease=(sys.executable, str(echo), str(lease)),
+                        context=(sys.executable, str(script), str(runs), str(delay), json.dumps(said)))
+    return HostCommandDeskPort(cmds, tmp_path / "claims.sqlite"), runs
+
+
+def test_the_context_command_runs_at_most_once_per_ttl_not_once_per_poll(tmp_path):
+    import time
+    port, runs = _slow_port(tmp_path, 0.6)
+    t0 = time.monotonic()
+    first = desk_tab.serve_desk(port)[1]["context"]
+    cold = time.monotonic() - t0
+    t1 = time.monotonic()
+    for _ in range(5):
+        assert desk_tab.serve_desk(port)[1]["context"] == first
+    warm = (time.monotonic() - t1) / 5
+    assert first["state"] == "ok" and first["tokens"] == 212_405
+    assert len(runs.read_text()) == 1, runs.read_text()
+    assert cold >= 0.5 and warm < 0.4, (cold, warm)        # the slow command is paid once; the other polls pay the lease command only
+
+
+def test_a_receipt_poll_never_waits_on_the_context_command_and_the_next_poll_has_the_refreshed_reading(tmp_path):
+    import time
+    port, runs = _slow_port(tmp_path, 1.0)
+    t0 = time.monotonic()
+    body = desk_tab.serve_desk(port, "thread=t1")[1]            # a poll that names a thread: the receipt path
+    took = time.monotonic() - t0
+    assert took < 0.8 and body["context"] == {"state": "none", "why": "not read yet", "holder": None}, (took, body["context"])
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and not (port._ctx_held and not port._ctx_busy):
+        time.sleep(0.05)
+    assert desk_tab.serve_desk(port, "thread=t1")[1]["context"]["tokens"] == 212_405
+    assert len(runs.read_text()) == 1
+
+
+def test_an_aged_reading_is_served_at_once_while_one_refresh_runs_behind_the_poll(tmp_path, monkeypatch):
+    import time
+    port, runs = _slow_port(tmp_path, 0.5)
+    assert desk_tab.serve_desk(port)[1]["context"]["state"] == "ok"            # the first ask runs the command in the caller
+    monkeypatch.setattr("levain.desk.desk_port.CONTEXT_TTL", 0.0)               # every reading is now aged
+    t0 = time.monotonic()
+    assert desk_tab.serve_desk(port)[1]["context"]["tokens"] == 212_405
+    assert time.monotonic() - t0 < 0.4                                         # the aged reading came back without waiting for the command
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and len(runs.read_text()) < 2:
+        time.sleep(0.05)
+    assert len(runs.read_text()) == 2
+
+
+def test_concurrent_polls_share_one_run_of_the_context_command(tmp_path):
+    import threading
+    port, runs = _slow_port(tmp_path, 0.5)
+    outs = []
+    ts = [threading.Thread(target=lambda: outs.append(desk_tab.serve_desk(port)[1]["context"])) for _ in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(outs) == 4 and all(o["tokens"] == 212_405 for o in outs) and len(runs.read_text()) == 1
+
+
+def test_a_context_command_that_exits_zero_with_stderr_is_still_read(tmp_path):
+    port, _runs = _slow_port(tmp_path, 0.0, stderr=True)
+    assert desk_tab.serve_desk(port)[1]["context"]["tokens"] == 212_405
+
+
+def test_a_context_that_names_another_desk_than_the_lease_is_unreadable_and_one_that_matches_carries_its_holder(tmp_path):
+    other, _ = _slow_port(tmp_path, 0.0, holder="desk 13")
+    assert desk_tab.serve_desk(other)[1]["context"] == {"state": "unreadable", "holder": "desk 13"}
+    d2 = tmp_path / "b"
+    d2.mkdir()
+    same, _ = _slow_port(d2, 0.0, holder="desk 12")
+    c = desk_tab.serve_desk(same)[1]["context"]
+    assert c["state"] == "ok" and c["holder"] == "desk 12"
+    d3 = tmp_path / "c"
+    d3.mkdir()
+    unnamed, _ = _slow_port(d3, 0.0)
+    assert desk_tab.serve_desk(unnamed)[1]["context"]["state"] == "ok"        # a host that does not say cannot be checked: taken as the lease's
+
+
+def test_a_no_reading_desk_is_said_none_and_caps_that_cannot_be_asked_carry_no_context():
+    s = ScriptedDeskPort()
+    s.script_lease("held", "desk 12", 5)
+    s.script_context(NoReading("no usage record yet"))
+    assert desk_tab.serve_desk(s)[1]["context"] == {"state": "none", "why": "no usage record yet", "holder": None}
+
+    class NoCaps(ScriptedDeskPort):
+        def capabilities(self):
+            raise RuntimeError("x")
+    n = NoCaps()
+    n.script_lease("held", "desk 12", 5)
+    n.script_context(ContextView(1000, SOFT, HARD, None))
+    body = desk_tab.serve_desk(n)[1]
+    assert body["readable"] is False and "context" not in body
+
+
+def test_the_context_tail_is_not_re_read_while_the_transcript_is_unchanged(tmp_path, monkeypatch):
+    port, runs = _slow_port(tmp_path, 0.0)
+    calls = []
+    real = desk_context.read_context
+    monkeypatch.setattr(desk_context, "read_context", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    for _ in range(3):
+        port._read_context_now()
+    assert len(runs.read_text()) == 3 and len(calls) == 1, (runs.read_text(), calls)       # the command ran each time, the 8 MB tail once
 
 
 # --- the page ---------------------------------------------------------------------------------------------------------------------
@@ -296,6 +458,51 @@ def test_a_hostile_context_object_draws_as_unreadable_text_only(tmp_path):
     g = ctxs(out)
     assert g[0]["cls"] == "dv-ctx dv-ctx-unreadable" and g[0]["words"] == "The desk's context could not be read just now.", g[0]
     assert g[1] == {"pwn": True, "imgs": 0, "ctxMark": 2}, g
+
+
+@needs_browser
+def test_a_desk_with_no_reading_yet_says_so_and_is_not_drawn_as_unreadable_or_zero(tmp_path):
+    with desk_page(tmp_path) as (stub, base):
+        out = _drive(tmp_path, base + "/", [PHONE, *_TOKENED, _TAP_DESK, _OPEN,
+            put(get={"status": 200, "json": wired(context={"state": "none", "why": "no usage record yet", "holder": None})}), until("document.querySelector('.dv-ctx-none')"), CTX,
+            *_shot("desk_ctx_none_390.png")])
+    g = ctxs(out)[0]
+    assert g["cls"] == "dv-ctx dv-ctx-none" and g["words"].startswith("No context reading yet") and g["fill"] is None and not g["pageX"], g
+
+
+@needs_browser
+def test_the_lease_line_points_to_start_desk_only_when_the_button_is_drawn(tmp_path):
+    words = "document.querySelector('.dv-zone .dv-leasewords').textContent"
+    with desk_page(tmp_path) as (stub, base):
+        out = _drive(tmp_path, base + "/", [PHONE, *_TOKENED, _TAP_DESK, _OPEN,
+            put(get={"status": 200, "json": wired(lease={"state": "none"})}), until("document.querySelector('.dv-lease-none .dv-start')"),
+            {"eval": "JSON.stringify({w: " + words + ", marker: 'lw'})"},
+            put(get={"status": 200, "json": wired()}), until("document.querySelector('.dv-lease-held')"),
+            {"eval": "(() => { window.LevainSignSheet.openDrop = null; return 1; })()"},
+            put(get={"status": 200, "json": wired(lease={"state": "none"})}), until("document.querySelector('.dv-lease-none')"),
+            {"eval": "JSON.stringify({w: " + words + ", start: !!document.querySelector('.dv-zone .dv-start'), marker: 'lw'})"}])
+    with_btn, without = [json.loads(v) for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"marker":"lw"' in v]
+    assert with_btn["w"].endswith("To start one, use Start desk below."), with_btn
+    assert "Start desk" not in without["w"] and not without["start"] and without["w"].endswith("A typed line never starts a desk."), without
+
+
+def test_the_context_model_never_makes_a_non_finite_bar_and_the_desk_commands_keep_their_positions(tmp_path):
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("no node")
+    js = Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "desk_tab_view.js"
+    chk = tmp_path / "chk.js"
+    chk.write_text("const m=require(process.argv[2]).contextModel;const v=[0,1,-1,0.5,NaN,Infinity,'5',null,undefined,true,1e308];let bad=0,ok=0;"
+                   "for(const t of v)for(const h of v)for(const s of v){const r=m({state:'ok',tokens:t,hard:h,soft:s});"
+                   "if(r.state==='ok'){ok++;if(!(Number.isFinite(r.fill)&&(r.tick===null||Number.isFinite(r.tick))))bad++;}}"
+                   "console.log(JSON.stringify({ok,bad}))\n")
+    got = json.loads(subprocess.run([node, str(chk), str(js)], capture_output=True, text=True, timeout=30, check=True).stdout)
+    assert got["bad"] == 0 and got["ok"] > 0, got
+    c = DeskCommands.from_env(json.dumps({"post": ["/p"], "lease": ["/l"], "events": ["/e"], "words_max": 50, "context": ["/c"]}))
+    assert (c.post, c.lease, c.events, c.words_max, c.context) == (("/p",), ("/l",), ("/e",), 50, ("/c",))
+    assert DeskCommands.from_env(c.to_json()) == c
 
 
 def test_the_view_draws_the_bar_by_style_and_text_only():

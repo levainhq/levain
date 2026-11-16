@@ -81,7 +81,7 @@
       return { state: "held", words: (who ? who : "A desk") + (age ? ", " + age : ""), drop: false };
     }
     if (st === "none") {
-      return { state: "none", words: "No desk holds the lease. A line you send is held for the next desk. A typed line never starts a desk: to start one, use Start desk below.", drop: true };
+      return { state: "none", words: "No desk holds the lease. A line you send is held for the next desk. A typed line never starts a desk.", startHint: " To start one, use Start desk below.", drop: true };
     }
     return { state: "unknown", words: "The lease could not be checked; a line you send will queue.", drop: false };
   }
@@ -94,6 +94,8 @@
   function whole(v) { return typeof v === "number" && isFinite(v) && v >= 0 && Math.floor(v) === v; }
   function contextModel(c) {
     if (!c || typeof c !== "object") return null;
+    // a desk that has made no turn yet (or whose last record is a compaction): there is no number to draw, and it is not unreadable
+    if (c.state === "none") return { state: "none", words: "No context reading yet: the desk has not made a turn since it started or last compacted." };
     if (c.state !== "ok" || !whole(c.tokens) || !whole(c.hard) || c.hard < 1 || !(c.soft === null || c.soft === undefined || whole(c.soft))) {
       return { state: "unreadable", words: "The desk's context could not be read just now." };
     }
@@ -490,9 +492,11 @@
       clear(bar);
       if (current && current.kind === "wired") {
         bar.className = "dv-state dv-lease-" + current.lease.state;
-        bar.appendChild(el(doc, "div", "dv-leasewords", shown(current.lease.words)));
+        var canStart = current.lease.state === "none" && !!root.LevainSignSheet && typeof root.LevainSignSheet.openDrop === "function";
+        // the pointer to Start desk is drawn only when the button below is
+        bar.appendChild(el(doc, "div", "dv-leasewords", shown(current.lease.words + (canStart && current.lease.startHint ? current.lease.startHint : ""))));
         if (current.lease.state === "held" && current.context) {
-          var cx = current.context, box = el(doc, "div", "dv-ctx dv-ctx-" + (cx.state === "ok" ? cx.level : "unreadable"));
+          var cx = current.context, box = el(doc, "div", "dv-ctx dv-ctx-" + (cx.state === "ok" ? cx.level : cx.state));
           box.appendChild(el(doc, "div", "dv-ctxwords", shown(cx.words)));
           if (cx.state === "ok") {
             var track = el(doc, "div", "dv-ctxbar"), fill = el(doc, "i", "dv-ctxfill");
@@ -503,7 +507,7 @@
           }
           bar.appendChild(box);
         }
-        if (current.lease.state === "none" && root.LevainSignSheet && typeof root.LevainSignSheet.openDrop === "function") {
+        if (canStart) {
           var st = el(doc, "button", "dv-start", "Start desk");
           st.setAttribute("type", "button"); st.setAttribute("title", "Open the signing sheet to start a desk: " + DESK_WORDS);
           st.setAttribute("aria-label", "Start a desk (opens the signing sheet)");
