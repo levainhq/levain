@@ -213,6 +213,9 @@ def base_run_rows(host: HostOS, operator: str | None) -> list[Row]:
     return [
         _root(host, R, 0o755),
         _root(host, R / "gw", 0o755),
+        # levain#66 S2: root's host-grant files, one root-owned dir per egress slot (slot_run_rows): no uid but root
+        # can create, rename, link into or unlink in them, so the front only ever reads what root last placed.
+        _root(host, R / "grants", 0o755),
         _root(host, R / "qb", 0o755),
         _root(host, R / "planner", 0o755),
         # §2.2 (c7.2): every uid traverses, none lists; each socket's own mode, group and peer check gate it.
@@ -238,6 +241,8 @@ def slot_run_rows(host: HostOS, slot: SlotId) -> list[Row]:
     R, n, grp = RUN[host], slot.index, slot.primary
     return [
         Row(R / "gw" / f"slot{n}", f"_levain_gw{n}", grp, 0o2750),
+        # root : the FRONT's primary group, 0750: the front reads grants.json here (its group), the slot uid cannot
+        Row(R / "grants" / f"slot{n}", "root", f"_levain_gw{n}", 0o750),
         Row(R / "qb" / f"slot{n}", "_levain_qbroker", grp, 0o2750),
         Row(R / "planner" / f"slot{n}", "_levain_dispatch", grp, 0o2750),
     ]

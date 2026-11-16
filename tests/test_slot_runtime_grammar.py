@@ -61,6 +61,8 @@ def test_every_verb_parses_for_the_operator():
         "adopt-verify": ["adopt-verify", S, "--bundle-digest", "sha256:" + "0" * 64],
         "discard": ["discard", S], "restore": ["restore", S], "status": ["status", S], "probe": ["probe", S],
         "read-allow": ["read-allow", S],
+        "egress-grant": ["egress-grant", S], "egress-grant-revoke": ["egress-grant-revoke", S, "all"],
+        "egress-refusals": ["egress-refusals", S, "0"], "egress-grants-list": ["egress-grants-list", S],
     }
     assert set(good) == set(rg.VERBS)
     for verb, a in good.items():
@@ -86,7 +88,107 @@ def argv_for(verb):
         return argv([verb, S, "yes"])
     if verb == "adopt-verify":
         return argv([verb, S, "--bundle-digest", "sha256:" + "0" * 64])
+    if verb == "egress-grant-revoke":
+        return argv([verb, S, "all"])
+    if verb == "egress-refusals":
+        return argv([verb, S, "0"])
     return argv([verb, S])
+
+
+# --- host grants (levain#66 S2): the four egress verbs' argv and the egress-grant stdin ---------------------------
+
+GID = "eh-" + "0123456789abcdef01234567"
+EGRESS_VERBS = ("egress-grant", "egress-grant-revoke", "egress-refusals", "egress-grants-list")
+
+
+def test_the_egress_verbs_are_operator_only_not_lease_verbs_and_only_egress_grant_takes_stdin():
+    for v in EGRESS_VERBS:
+        assert v in rg.VERBS and v in rg.DISPATCH_FORBIDDEN and v not in rg.LEASE_VERBS
+        assert refused_argv([v, S], DISPATCH) == "verb-not-allowed-for-caller"
+    assert rg.STDIN_VERBS == {"prepare", "render", "egress-grant"}
+
+
+@pytest.mark.parametrize("a,name", [
+    (["egress-grant"], "missing-argv"), (["egress-grant", S, S], "extra-argv"), (["egress-grant", "../x"], "bad-token"),
+    (["egress-grants-list"], "missing-argv"), (["egress-grants-list", S, "0"], "extra-argv"),
+    (["egress-grant-revoke", S], "missing-argv"), (["egress-grant-revoke", S, "all", "all"], "extra-argv"),
+    (["egress-grant-revoke", S, "ALL"], "bad-token"), (["egress-grant-revoke", S, GID.upper()], "bad-token"),
+    (["egress-grant-revoke", S, GID[:-1]], "bad-token"), (["egress-grant-revoke", S, GID + "0"], "bad-token"),
+    (["egress-grant-revoke", S, "eh-" + "g" * 24], "bad-token"), (["egress-grant-revoke", S, "-" + GID], "bad-token"),
+    (["egress-refusals", S], "missing-argv"), (["egress-refusals", S, "0", "0"], "extra-argv"),
+    (["egress-refusals", S, "00"], "bad-token"), (["egress-refusals", S, "-1"], "bad-token"),
+    (["egress-refusals", S, "5"], "bad-token"), (["egress-refusals", S, "5-"], "bad-token"),
+    (["egress-refusals", S, "-5"], "bad-token"), (["egress-refusals", S, "05-3"], "bad-token"),
+    (["egress-refusals", S, "5-03"], "bad-token"), (["egress-refusals", S, "5-3-1"], "bad-token"),
+    (["egress-refusals", S, "5-" + "9" * 13], "bad-token"), (["egress-refusals", S, "9" * 21 + "-1"], "bad-token"),
+    (["egress-refusals", S, "٥-3"], "bad-token"),
+])
+def test_egress_verb_shapes_refuse_by_name(a, name):
+    assert refused_argv(a) == name
+
+
+def test_egress_verb_shapes_parse_into_the_request():
+    assert argv(["egress-grant-revoke", S, GID]).target == GID and argv(["egress-grant-revoke", S, "all"]).target == "all"
+    assert argv(["egress-refusals", S, "0"]).cursor == "0"
+    assert argv(["egress-refusals", S, "812345-0"]).cursor == "812345-0"
+    assert argv(["egress-refusals", S, "812345-262144"]).cursor == "812345-262144"
+    assert argv(["egress-grant", S]).session == S and argv(["egress-grants-list", S]).session == S
+
+
+def egress_input(**over):
+    obj = {"message": "levain-egress-host/1\n", "sig": "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----",
+           "signer_fp": "SHA256:" + "A" * 43, "choice": "s"}
+    obj.update(over)
+    return obj
+
+
+def test_egress_grant_stdin_is_a_typed_input_and_never_a_render_blob():
+    got = parse_stdin("egress-grant", cj(egress_input()))
+    assert type(got) is rg.EgressGrantInput and not isinstance(got, RenderBlob)
+    assert (got.choice, got.signer_fp) == ("s", "SHA256:" + "A" * 43) and got.message.startswith("levain-egress-host/1")
+    req = argv(["egress-grant", S])
+    bind_stdin(req, got)                                   # accepted
+    with pytest.raises(Refused) as e:
+        bind_stdin(req, None)
+    assert e.value.name == "missing-stdin"
+    with pytest.raises(Refused) as e:
+        bind_stdin(req, RenderBlob(vendor="claude", routes=("a",)))
+    assert e.value.name == "missing-stdin"
+    with pytest.raises(Refused) as e:                      # an egress input is not another verb's stdin either
+        bind_stdin(argv(["render", S]), got)
+    assert e.value.name == "missing-stdin"
+    with pytest.raises(Refused) as e:
+        bind_stdin(argv(["egress-grants-list", S]), got)
+    assert e.value.name == "unexpected-stdin"
+
+
+@pytest.mark.parametrize("obj,name", [
+    ({"message": "x", "sig": "y", "signer_fp": "SHA256:" + "A" * 43}, "missing-key"),
+    ({**egress_input(), "extra": "x"}, "unknown-key"),
+    (egress_input(choice="x"), "bad-value"), (egress_input(choice="S"), "bad-value"), (egress_input(choice=1), "wrong-type"),
+    (egress_input(message=""), "bad-value"), (egress_input(message="m" * 4097), "bad-value"),
+    (egress_input(message=5), "wrong-type"), (egress_input(sig=""), "bad-value"),
+    (egress_input(sig=None), "wrong-type"),
+    (egress_input(signer_fp="SHA256:short"), "bad-value"), (egress_input(signer_fp="MD5:" + "A" * 43), "bad-value"),
+    (egress_input(signer_fp=["x"]), "wrong-type"),
+])
+def test_egress_grant_stdin_refuses_by_name(obj, name):
+    with pytest.raises(Refused) as e:
+        parse_stdin("egress-grant", cj(obj))
+    assert e.value.name == name
+
+
+def test_egress_grant_stdin_has_its_own_8_kib_cap_and_other_verbs_keep_theirs():
+    big = cj(egress_input(sig="s" * 9000))
+    assert len(big) > 8 * 1024
+    assert refused_stdin("egress-grant", big) == "stdin-too-large"
+    assert refused_stdin("egress-grant", b"") == "missing-stdin"
+    assert refused_stdin("egress-grants-list", cj(egress_input())) == "unexpected-stdin"
+
+
+def test_the_egress_input_is_canonical_json_only():
+    raw = json.dumps(egress_input(), indent=1).encode()
+    assert refused_stdin("egress-grant", raw) == "stdin-not-canonical"
 
 
 # --- §5 preamble patterns --------------------------------------------------------------------------
