@@ -108,3 +108,16 @@ def test_each_rule_catches_an_unregistered_namespace(src, ns):
 ])
 def test_minus_n_outside_ssh_keygen_and_function_locals_are_not_namespaces(src):
     assert list(namespace_uses(ast.parse(src))) == []
+
+
+def test_the_egress_host_namespace_is_registered_with_one_grammar_and_one_pair_of_choices():
+    ns = NS.EGRESS_HOST_NAMESPACE
+    assert ns == "levain-egress-host" and NS.is_registered(ns) and NS.REGISTRY[ns][1] == "levain/slot/egress_grants.py"
+    assert ns in NS.LEVAIN_SIGN_REQUESTS and [k for k, _ in NS.LEVAIN_SIGN_CHOICES[ns]] == ["s", "d"]
+    assert set(NS.LEVAIN_SIGN_CHOICES) <= set(NS.LEVAIN_SIGN_REQUESTS)
+    assert len({t for _, t in NS.LEVAIN_SIGN_CHOICES[ns]}) == 2
+
+
+def test_every_levain_sign_request_grammar_is_a_registered_namespace():
+    assert set(NS.LEVAIN_SIGN_REQUESTS) <= set(NS.REGISTRY)
+    assert all(ns.startswith("levain") for ns in NS.LEVAIN_SIGN_REQUESTS)
