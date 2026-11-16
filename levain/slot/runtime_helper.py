@@ -255,6 +255,20 @@ def _close_fds_except(keep: Sequence[int]) -> None:
     os.closerange(lo, hi)
 
 
+def _send_spec(spec_w: int, spec_json: bytes) -> None:
+    """The parent's spec write for :func:`spawn_front` and :func:`spawn_target`, then close ``spec_w``. A child that
+    already exited (refused before it read the spec) left no read end: the write is EPIPE, and the pid must still
+    return to be reaped, its exit status being the answer. Only ``BrokenPipeError`` is tolerated, not every
+    ``OSError``: EPIPE is that early exit, while another errno (EIO from a zero-progress write) would be a real
+    delivery failure to a live child and must raise."""
+    try:
+        write_all(spec_w, spec_json)
+    except BrokenPipeError:
+        pass
+    finally:
+        os.close(spec_w)
+
+
 def spawn_front(argv: Sequence[str], spec_json: bytes, go_rfd: int) -> int:
     """§5.1 render (4): start the front DETACHED and return its pid. The child: ``setsid``; fds 0/1/2 on
     ``/dev/null``; the GO pipe's read end on :data:`GO_FD`; every other fd closed but the spec pipe, which
@@ -279,10 +293,7 @@ def spawn_front(argv: Sequence[str], spec_json: bytes, go_rfd: int) -> int:
             pass
         os._exit(70)
     os.close(spec_r)
-    try:
-        write_all(spec_w, spec_json)
-    finally:
-        os.close(spec_w)
+    _send_spec(spec_w, spec_json)
     return pid
 
 
@@ -344,10 +355,7 @@ def spawn_target(argv: Sequence[str], spec_json: bytes, cgroup: Optional[str], e
         _child_refused(marker)
         os._exit(70)
     os.close(spec_r)
-    try:
-        write_all(spec_w, spec_json)
-    finally:
-        os.close(spec_w)
+    _send_spec(spec_w, spec_json)
     return pid
 
 
