@@ -52,7 +52,7 @@ import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +65,7 @@ from levain.desk.store import CoordError, _append_only, next_gseq
 __all__ = [
     "BRIEF_EVENTS", "CLAIM_TTL", "ENQUEUE_PING_AFTER", "EVENT_SCHEMA", "INCIDENT_MAX_OPEN", "INCIDENT_PING_ABOVE", "KINDS",
     "LIFECYCLE", "MAX_RETRIES", "STOP_WHY", "TRUSTS", "UNTRUSTED_TEXT_MAX", "Event", "EventConflict", "EventRefused", "Kind",
-    "Posted", "ack", "alert_untrusted", "audit", "brief_lines", "claim_for_launch", "incident_over_cap", "incidents_opened",
+    "Posted", "ack", "alert_untrusted", "audit", "brief_lines", "claim_for_launch", "incident_over_cap", "incidents_opened", "night_window",
     "listing", "MAIL_RAW_MAX", "mail_auth", "post", "post_mail", "progress", "read_credential", "register", "retire", "row", "sender_delivered",
     "unseen_event",
 ]
@@ -938,6 +938,9 @@ def progress(store: Any, *, pinger: Pinger | None = None) -> tuple[list[str], st
             except Exception as exc:        # noqa: BLE001 - reads only: nothing to roll back
                 lines.append(f"event {eid}: its ping skipped by this delivery pass "
                              f"({type(exc).__name__}: {unshowable.mark(str(exc))[:200]})")
+        cap = _cap_ping(conn, now)
+        if cap is not None:
+            pings.append(cap)
         if waiting:
             state = lease.wake_state(conn, now)[0]
             if state == "stopped":
@@ -991,6 +994,39 @@ def _progress_row(conn: sqlite3.Connection, now: str, eid: str,
     if age >= ENQUEUE_PING_AFTER and not is_stopped:
         return lines, [(eid, "an event waited and no desk took it")], [e]
     return lines, [], [e]
+
+
+CAP_WHY = f"more than {INCIDENT_PING_ABOVE} incidents tonight"
+
+
+def night_window(now: datetime, cut_hour_utc: int) -> tuple[str, str]:
+    """The night ``now`` falls in as ``(since, until)`` stamps: from the cut to the next cut (the same night
+    :func:`levain.desk.effect_attempts.night_key` names), so the incident count and the effect budgets agree."""
+    from levain.desk.effect_attempts import night_key
+    day = datetime.fromisoformat(night_key(now, cut_hour_utc)).replace(tzinfo=timezone.utc)
+    since = day + timedelta(hours=cut_hour_utc)
+    return utc_stamp(since), utc_stamp(since + timedelta(days=1))
+
+
+def _cap_ping(conn: sqlite3.Connection, now: str) -> Ping | None:
+    """ONE ping per night when the trusted incidents opened in it pass :data:`INCIDENT_PING_ABOVE` (ND-5; design 2.4):
+    the same ``pinging``/``pinged`` rows as every ping here, noted with the night, counted on any event, so a seventh
+    incident and a repeated pass never ping again. It rides on the event that opened the first incident past the cap.
+    Fixed words only (:func:`_ping_text`); an untrusted incident is never counted."""
+    from levain.desk.effects import NIGHT_CUT_HOUR_UTC
+
+    since, until = night_window(parse_stamp(now), NIGHT_CUT_HOUR_UTC)
+    if incidents_opened(conn, since, until) <= INCIDENT_PING_ABOVE:
+        return None
+    over = conn.execute("SELECT incident_id FROM incidents WHERE trust != 'untrusted' AND opened_at >= ? AND "
+                        "opened_at < ? ORDER BY opened_gseq LIMIT 1 OFFSET ?", (since, until, INCIDENT_PING_ABOVE)).fetchone()
+    head = conn.execute("SELECT event_id FROM events WHERE incident_id = ? ORDER BY gseq LIMIT 1", (over[0],)).fetchone()
+    if head is None:
+        return None
+    note = f"{CAP_WHY} (night {since[:10]})"
+    if not _ping_due(conn, now, note, head[0], None):
+        return None
+    return _event(conn, head[0]), CAP_WHY, note, None
 
 
 STOP_WHY = "desk launches died in a row and nothing launches until you look"

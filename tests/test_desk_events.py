@@ -884,7 +884,8 @@ def test_a_pass_attempts_a_bounded_number_of_pings_within_one_budget(store, tmp_
     lines, _ = events.progress(store, pinger=pinger)
     assert len(pinger.sent) == events.PINGS_PER_PASS and any("wait for the next pass" in line for line in lines)
     events.progress(store, pinger=pinger)
-    assert len(pinger.sent) == len(eids)                   # the rest go on the next pass, none twice
+    # the rest go on the next pass, none twice: one ping per event, and the night's one cap ping (more than 5 incidents)
+    assert len(pinger.sent) == len(eids) + 1 and len(_cap_pings(pinger)) == 1
     # one wall-clock budget for the pass: a send that ate it leaves the rest, unattempted, for the next pass
     ln2_eids = [down(store, events.read_credential(tmp_path / "mon.cred"), 50 + i, subject=f"late{i}").event.event_id
                 for i in range(3)]
@@ -1436,3 +1437,53 @@ def test_the_event_verbs_run_end_to_end_through_the_cli(qdir, tmp_path, capsys):
     assert run("event", "list", "--audit") == 0
     assert eid in capsys.readouterr().out
     assert run("event", "ack", eid, "--why", "x", "--by", "desk", "--token", "1") == 1        # no lease: refused
+
+
+# ---- ND-5: the sixth incident in a night writes one open ping (levain#15; design 2.4, 8.1) -------------------------
+def _cap_pings(pinger):
+    return [p for p in pinger.sent if "incidents" in p["body"]]
+
+
+def test_a_sixth_incident_in_a_night_writes_one_ping_and_a_fifth_none(store, tmp_path, qdir, clock, pinger):
+    cred = sensor(store, tmp_path)
+    for n in range(1, 6):
+        down(store, cred, n, subject=f"host{n}")
+    events.progress(store, pinger=pinger)
+    assert _cap_pings(pinger) == []                                  # five incidents: at the cap, not above it
+    down(store, cred, 6, subject="host6")
+    events.progress(store, pinger=pinger)
+    assert len(_cap_pings(pinger)) == 1
+    for n in range(7, 10):                                           # a seventh, eighth and ninth, passes repeated
+        down(store, cred, n, subject=f"host{n}")
+        events.progress(store, pinger=pinger)
+        events.progress(store, pinger=pinger)
+    assert len(_cap_pings(pinger)) == 1                              # one ping for the night, not one per incident
+    assert _cap_pings(pinger)[0]["kind"] == "notify_urgent"
+    assert "host" not in _cap_pings(pinger)[0]["body"]               # fixed words: no sensor text in the push
+
+
+def test_the_cap_ping_counts_a_night_not_a_day_and_never_an_untrusted_incident(store, tmp_path, qdir, clock, pinger):
+    cred = sensor(store, tmp_path)
+    low = sensor(store, tmp_path, "low", "untrusted")
+    for n in range(1, 6):
+        down(store, cred, n, subject=f"host{n}")
+    for n in range(1, 4):
+        events.post(store, "low", n, "report", {"subject": f"noise{n}", "severity": "crit"}, credential=low)
+    events.progress(store, pinger=pinger)
+    assert _cap_pings(pinger) == []                                  # untrusted incidents are not counted
+    clock.advance(hours=14)                                          # past the 12:00 UTC cut: a new night
+    down(store, cred, 6, subject="host6")
+    events.progress(store, pinger=pinger)
+    assert _cap_pings(pinger) == []                                  # one incident in the new night; five were last night's
+    for n in range(7, 12):
+        down(store, cred, n, subject=f"host{n}")
+    events.progress(store, pinger=pinger)
+    assert len(_cap_pings(pinger)) == 1
+
+
+def test_night_window_is_the_cut_to_the_next_cut():
+    assert events.night_window(T0, 12) == ("2026-11-14T12:00:00.000000Z", "2026-11-15T12:00:00.000000Z")
+    assert events.night_window(T0.replace(hour=11), 12) == ("2026-11-13T12:00:00.000000Z", "2026-11-14T12:00:00.000000Z")
+    assert events.night_window(T0.replace(hour=12), 12)[0] == "2026-11-14T12:00:00.000000Z"
+    with pytest.raises(ValueError):
+        events.night_window(datetime(2026, 11, 14, 22, 0), 12)
