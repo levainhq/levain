@@ -333,7 +333,7 @@ def test_real_trampoline(tmp_path):
 
 
 SPAWN_RUNNER = """
-import fcntl, os, sys, types
+import fcntl, os, sys, time, types
 sys.path.insert(0, {root!r})
 fd = os.open("/dev/null", os.O_RDWR)
 os.dup2(fd, 4)            # fd 4 before the fork: a stray byte written there lands nowhere
@@ -358,7 +358,7 @@ while True:
     if not b:
         break
     got += b
-os.waitpid(pid, 0)
+_, status = os.waitpid(pid, 0)
 sys.stdout.write(repr(got))
 """
 
@@ -372,6 +372,102 @@ def test_spawn_target_child_marker_fd(tmp_path, mode, want):
                        timeout=60)
     assert r.returncode == 0, r.stderr
     assert r.stdout == want
+
+
+GONE_RUNNER = """
+import errno, fcntl, os, sys, time, types
+sys.path.insert(0, {root!r})
+from levain.slot import runtime_helper as H
+box = {{}}
+real_fork, real_write = os.fork, H.write_all
+def fork():
+    pid = real_fork()
+    if pid:
+        box["pid"] = pid
+    return pid
+def after_exit(fd, data):
+    # the window, forced WITHOUT a sleep: the parent's spec write happens only once the child has exited and been
+    # reaped (its spec_r copy is gone), so the write is a real EPIPE whatever the scheduler does
+    end = time.monotonic() + 30
+    while True:
+        done, status = os.waitpid(box["pid"], os.WNOHANG)
+        if done:
+            box["status"] = status
+            break
+        assert time.monotonic() < end, "the child never exited"
+        time.sleep(0.01)
+    try:
+        real_write(fd, data)
+    except BrokenPipeError as e:
+        assert e.errno == errno.EPIPE
+        box["epipe"] = True
+        raise
+os.fork, H.write_all = fork, after_exit
+if sys.argv[1] == "target":
+    r, w = os.pipe()
+    def fake(f, cmd, arg=0):      # the child's own failure, before its exec: its dup of the exec pipe fails
+        if f == w:
+            raise OSError(24, "EMFILE")
+        return fcntl.fcntl(f, cmd, arg)
+    H.fcntl = types.SimpleNamespace(F_DUPFD=fcntl.F_DUPFD, fcntl=fake)
+    pid = H.spawn_target(["/bin/sh", "-c", "exit 0"], b"{{}}", None, w, False)
+    os.close(w)
+    got = b""
+    while True:
+        b = os.read(r, 16)
+        if not b:
+            break
+        got += b
+else:
+    go_r, go_w = os.pipe()
+    def fake(f, cmd, arg=0):      # the child's own failure, before its exec: its dup of the GO pipe fails
+        if f == go_r:
+            raise OSError(24, "EMFILE")
+        return fcntl.fcntl(f, cmd, arg)
+    H.fcntl = types.SimpleNamespace(F_DUPFD=fcntl.F_DUPFD, fcntl=fake)
+    pid = H.spawn_front(["/bin/sh", "-c", "exit 0"], b"{{}}", go_r)
+    got = None
+assert pid == box["pid"], "the pid must come back"
+status = box["status"]
+assert os.WIFEXITED(status), status
+sys.stdout.write("%r epipe=%s exit=%d" % (got, box.get("epipe", False), os.WEXITSTATUS(status)))
+"""
+
+
+@pytest.mark.parametrize("which,want", [("target", "b'!' epipe=True exit=70"), ("front", "None epipe=True exit=70")])
+def test_spawn_child_gone_before_the_spec_write_still_returns_its_pid(tmp_path, which, want):
+    """levain#77: a child that refused and exited BY DESIGN (exit 70) before the parent's spec write leaves no read
+    end, so the write is a real EPIPE: spawn_target and spawn_front both tolerate it (the pid comes back to be
+    reaped) and the child's own failure, its exit 70 (and, for the target, its ``!`` marker), is what the caller sees,
+    never a BrokenPipeError that loses the pid. The window is forced by waiting for the child's exit (no sleep) and the
+    output asserts the EPIPE really happened, so the test cannot pass without exercising the handler."""
+    (tmp_path / "gone.py").write_text(GONE_RUNNER.format(root=ROOT))
+    r = subprocess.run([sys.executable, "-I", str(tmp_path / "gone.py"), which], capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == want
+
+
+def test_send_spec_tolerates_only_a_broken_pipe(monkeypatch):
+    """levain#77: EPIPE (the child already exited) is tolerated; any other errno (EIO, a zero-progress write) is a real
+    delivery failure and raises; ``spec_w`` is closed either way."""
+    for exc, raises in ((BrokenPipeError(errno.EPIPE, "gone"), False), (OSError(errno.EIO, "no progress"), True)):
+        r, w = os.pipe()
+        def boom(fd, data, exc=exc):
+            raise exc
+        monkeypatch.setattr(H, "write_all", boom)
+        try:
+            if raises:
+                with pytest.raises(OSError) as ei:
+                    H._send_spec(w, b"x")
+                assert ei.value.errno == errno.EIO
+            else:
+                H._send_spec(w, b"x")
+            with pytest.raises(OSError) as ei:
+                os.fstat(w)
+            assert ei.value.errno == errno.EBADF
+        finally:
+            os.close(r)
 
 
 # --- KILL DOMAIN ----------------------------------------------------------------------------------------------------
