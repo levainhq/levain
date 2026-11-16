@@ -351,6 +351,21 @@
   // and loses its anchor. It fails CLOSED: an http(s) anchor survives only when its origin is a string that differs from this
   // page's, so an origin that is missing or not a string unwraps. The renderer itself is the byte-locked shared core, so the
   // filter sits here, after it.
+  // A host as the server routes it: lowercase, with every trailing dot gone (`localhost.` and `localhost..` reach the same server,
+  // which strips the dot from Host), IPv6 brackets dropped.
+  function canonHost(h) { return String(h).toLowerCase().replace(/\.+$/, "").replace(/^\[|\]$/g, ""); }
+  // Every spelling of this machine: localhost and any name under it, 127/8, 0/8 (0.0.0.0 connects locally), ::1, ::, and an
+  // IPv4-mapped loopback (the parser writes [::ffff:127.0.0.1] as ::ffff:7f00:1).
+  function loopbackHost(c) {
+    return c === "localhost" || /\.localhost$/.test(c) || /^(127|0)\.\d+\.\d+\.\d+$/.test(c) || c === "::1" || c === "::" ||
+      /^::ffff:(7f[0-9a-f]{2}:[0-9a-f]{1,4}|0:[0-9a-f]{1,4}|(127|0)\.\d+\.\d+\.\d+)$/.test(c);
+  }
+  // Does this link host route to the page's own server? Fails closed: a host that is not a string is the cockpit.
+  function cockpitHost(host, hereHost) {
+    if (typeof host !== "string" || typeof hereHost !== "string") return true;
+    var c = canonHost(host), hc = canonHost(hereHost);
+    return c === hc || (loopbackHost(hc) && loopbackHost(c));
+  }
   function unwrapCockpitLinks(frag) {
     var as = frag.querySelectorAll("a"), here = root.location.origin, hereHost = root.location.hostname;
     for (var i = 0; i < as.length; i++) {
@@ -358,8 +373,9 @@
       var mail = /^mailto:/i.test(h), web = /^https?:/i.test(h);
       var o = web ? a.origin : null;
       // the same HOST on another scheme or port is the cockpit too (an http link to an https cockpit follows its redirect to the
-      // page's own /sign/ pages): so a web link survives only when its host differs, not only its origin
-      if (!mail && !(web && typeof o === "string" && o !== here && typeof a.hostname === "string" && a.hostname !== hereHost)) {
+      // page's own /sign/ pages): so a web link survives only when its host differs, not only its origin; and the host is compared
+      // as the server routes it (case, trailing dots, and on a loopback page every loopback spelling), never as a raw string
+      if (!mail && !(web && typeof o === "string" && o !== here && !cockpitHost(a.hostname, hereHost))) {
         while (a.firstChild) a.parentNode.insertBefore(a.firstChild, a);
         a.parentNode.removeChild(a);
       }

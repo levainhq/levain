@@ -171,9 +171,19 @@ _UNSAFE = [
     # the same host on another port or scheme is the cockpit too (L3 r1, deepseek MED): an http link to an https cockpit follows its redirect
     ("selfport", "[selfport](http://@HOST@:9/sign/drop)"), ("selfscheme", "[selfscheme](https://@HOST@/sign/drop)"),
     ("js", "[js](javascript:window.pwned=1)"), ("data", "[data](data:text/html,x)"),
+    # every spelling that routes to the cockpit is the cockpit (levain#85 codex HIGH): the server strips a trailing dot from Host, and on a
+    # loopback page every loopback spelling reaches the same server, so each one unwraps on either loopback name
+    ("trail", "[trail](http://@HOST@.:9/sign/drop)"), ("trails", "[trails](http://@HOST@.../sign/drop)"),
+    ("lh", "[lh](http://localhost:9/sign/drop)"), ("lhdot", "[lhdot](http://localhost./sign/drop)"), ("lhup", "[lhup](http://LOCALHOST./sign/drop)"),
+    ("v4", "[v4](http://127.0.0.1:9/sign/drop)"), ("v4dot", "[v4dot](http://127.0.0.1./sign/drop)"), ("v4other", "[v4other](http://127.8.9.10/sign/drop)"),
+    ("v4hex", "[v4hex](http://0x7f000001/sign/drop)"), ("v6", "[v6](http://[::1]:9/sign/drop)"), ("v6long", "[v6long](http://[0:0:0:0:0:0:0:1]/sign/drop)"),
+    ("v6mapped", "[v6mapped](http://[::ffff:127.0.0.1]/sign/drop)"), ("sub", "[sub](http://app.localhost/sign/drop)"), ("zero", "[zero](http://0.0.0.0/sign/drop)"),
 ]
 _SAFE = [("ok", "[ok](https://example.org/x)", "https://example.org/x"), ("up", "[up](HTTPS://EXAMPLE.ORG/up)", "https://example.org/up"),
-         ("mail", "[mail](mailto:a@b.example)", "mailto:a@b.example"), ("local", "[local](http://localhost:9/x)", "http://localhost:9/x")]
+         ("mail", "[mail](mailto:a@b.example)", "mailto:a@b.example"),
+         # a genuinely offsite host survives, even one whose name starts like a loopback spelling
+         ("lhlike", "[lhlike](http://localhost.example.org/x)", "http://localhost.example.org/x"),
+         ("v4like", "[v4like](http://127.0.0.1.example.org/x)", "http://127.0.0.1.example.org/x"), ("lan", "[lan](http://192.168.1.10/x)", "http://192.168.1.10/x")]
 _LINK_ROWS = [{"gseq": 9100 + i, "kind": "vendor_agent_text", "source": "vendor", "ref": "agent_text:%d" % (9100 + i), "launch_id": "L1", "status": None,
                "body": "see " + md, "at": "2026-11-12T10:01:%02d+00:00" % i} for i, md in enumerate([m for _n, m in _UNSAFE] + [m for _n, m, _h in _SAFE])]
 
@@ -186,10 +196,12 @@ def _wrap(rows):
             " return new Response(JSON.stringify(j), {status: 200, headers: {'Content-Type': 'application/json'}}); }; return 1; })()" % json.dumps(json.dumps(rows)))
 
 
-def _run(tmp_path, qdir, emulate, rows, look, marker, lines, pre=(), shot=None):
+def _run(tmp_path, qdir, emulate, rows, look, marker, lines, pre=(), shot=None, host=None):
     rs, _launcher, src = _rig(tmp_path, qdir)
     enter = list(_ENTER[:3]) + [{"eval": _wrap(rows)}] + [{"eval": e} for e in pre] + list(_ENTER[3:])
     with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
+        if host:  # the same loopback server, opened under another of its names
+            base = base.replace("127.0.0.1", host)
         out = _drive(tmp_path, base + "/", [{"emulate": emulate}] + enter + [
             {"until": "document.querySelectorAll('.rv-room .rv-text').length >= %d" % lines},
             {"eval": "new Promise(r => setTimeout(r, 400)).then(() => 1)"},
@@ -204,9 +216,23 @@ _LINKS_LOOK = """(() => { const rows = [...document.querySelectorAll('.rv-room .
 
 @needs_browser
 def test_a_seats_link_is_http_or_mailto_never_something_the_cockpit_answers(tmp_path, qdir):
-    g = _run(tmp_path, qdir, {"w": 390, "h": 844, "dpr": 3, "mobile": True}, _LINK_ROWS, _LINKS_LOOK, '"linkrows"', len(_LINK_ROWS), shot="room_links_390.png")
+    _links_hold(_run(tmp_path, qdir, {"w": 390, "h": 844, "dpr": 3, "mobile": True}, _LINK_ROWS, _LINKS_LOOK, '"linkrows"', len(_LINK_ROWS), shot="room_links_390.png"))
+
+
+@needs_browser
+def test_on_a_cockpit_opened_as_localhost_every_loopback_spelling_is_the_cockpit(tmp_path, qdir):
+    # levain#85 codex HIGH: on http://localhost:PORT, `localhost.` (the server strips the dot and accepts that Host), 127.0.0.1 and [::1]
+    # all reach this same server, so none of them may keep its anchor
+    g = _run(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, _LINK_ROWS, _LINKS_LOOK, '"linkrows"', len(_LINK_ROWS), host="localhost")
+    assert g["origin"].startswith("http://localhost:"), g
+    _links_hold(g)
+
+
+def _links_hold(g):
     rows = g["linkrows"]
     assert len(rows) == len(_LINK_ROWS) and g["pwned"] == "undefined", g
+    kept = [(name, row["links"][0]["href"]) for (name, _md), row in zip(_UNSAFE, rows) if row["links"]]
+    assert kept == [], kept                                                            # every one that kept an anchor, named at once
     for (name, _md), row in zip(_UNSAFE, rows):
         assert row["links"] == [], (name, row)                                       # no anchor at all: the link text stays, as text
         assert row["text"].startswith("see " + name) and "](" not in row["text"], (name, row)

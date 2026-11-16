@@ -70,6 +70,29 @@ def test_the_desk_view_draws_the_desks_reply_as_markdown_elements_and_keeps_its_
     g = _look(out, sel)
     _elements(g)
     assert "rv-md" in g["cls"], g
+
+
+_NO_REPLY_LOOK = """JSON.stringify({found: true, them: [...document.querySelectorAll('.chat-panel .chat-msg.them .chat-text')].map(n => n.textContent),
+  err: [...document.querySelectorAll('.chat-panel .chat-msg.err .chat-text')].map(n => n.textContent)})"""
+
+
+@needs_browser
+def test_the_chat_panel_with_no_reply_never_draws_the_word_null(tmp_path):
+    # a job whose result carries reply: null. The panel's callers draw a reply only when it is truthy, so this turn shows the no-reply
+    # notice; replyText itself draws "" for a null/undefined reply (never String(null)), so no bubble anywhere reads "null"/"undefined"
+    with desk_page(tmp_path) as (stub, base):
+        out = _drive(tmp_path, base + "/", [{"until": "window.LevainRoomView && document.getElementById('board')"},
+                                           {"eval": _CHAT_WITH % "null"},
+                                           {"tap": "[...document.querySelectorAll('.chat-btn')].find(b => b.textContent === 'Start session')"},
+                                           {"until": "document.querySelector('.chat-area')"},
+                                           {"eval": "(() => { const a = document.querySelector('.chat-area'); a.value = 'hello'; return 1; })()"},
+                                           {"tap": "[...document.querySelectorAll('.chat-btn')].find(b => b.textContent === 'Send')"},
+                                           {"until": "document.querySelector('.chat-panel .chat-msg.err .chat-text')"},
+                                           {"eval": _NO_REPLY_LOOK}])
+    g = _look(out)
+    assert g["err"] == ["The entity returned no reply."], g
+    for t in g["them"]:
+        assert t.strip() not in ("null", "undefined"), g
     rest = json.loads(out["values"][-1])
     assert rest["voice"] >= 1, rest                                   # the speaker control is still on the desk's reply
     assert rest["other"] == "**not** markdown from a script" and rest["otherEls"] == 0, rest   # only the desk's own reply is markdown
@@ -119,7 +142,7 @@ def test_the_thread_view_draws_the_agents_line_as_markdown_elements_and_leaves_t
 # --- the chat panel's reply -------------------------------------------------------------------------------------------
 
 # the chat routes, answered in the page. The shipped page carries no nav.tabs (the strip the panel mounts on), so the test adds the strip: the panel is the page's own dashboard_chat.js, run again over this fetch
-_CHAT = """(() => { const real = window.fetch.bind(window); const J = (s, o) => Promise.resolve(new Response(JSON.stringify(o), {status: s, headers: {'Content-Type': 'application/json'}}));
+_CHAT_WITH = """(() => { const real = window.fetch.bind(window); const J = (s, o) => Promise.resolve(new Response(JSON.stringify(o), {status: s, headers: {'Content-Type': 'application/json'}}));
   window.fetch = (u, o) => { const p = String(u).split('?')[0];
     if (p === '/chat.json') return J(200, {entities: ['ent'], model: 'm'});
     if (p === '/chat/open') return J(202, {session_id: 's1', job_id: 'j1'});
@@ -129,7 +152,8 @@ _CHAT = """(() => { const real = window.fetch.bind(window); const J = (s, o) => 
     return real(u, o); };
   sessionStorage.setItem('levain.chat_token', 'tok');
   if (!document.querySelector('nav.tabs')) { const nav = document.createElement('nav'); nav.className = 'tabs'; document.body.appendChild(nav); }
-  const s = document.createElement('script'); s.src = document.querySelector('script[src*="dashboard_chat.js"]').getAttribute('src'); document.body.appendChild(s); return 1; })()""" % json.dumps(REPLY)
+  const s = document.createElement('script'); s.src = document.querySelector('script[src*="dashboard_chat.js"]').getAttribute('src'); document.body.appendChild(s); return 1; })()"""
+_CHAT = _CHAT_WITH % json.dumps(REPLY)
 
 
 @needs_browser
@@ -147,6 +171,29 @@ def test_the_chat_panel_draws_the_entitys_reply_as_markdown_elements(tmp_path):
     g = _look(out, sel)
     _elements(g)
     assert "rv-md" in g["cls"], g
+
+
+_NO_REPLY_LOOK = """JSON.stringify({found: true, them: [...document.querySelectorAll('.chat-panel .chat-msg.them .chat-text')].map(n => n.textContent),
+  err: [...document.querySelectorAll('.chat-panel .chat-msg.err .chat-text')].map(n => n.textContent)})"""
+
+
+@needs_browser
+def test_the_chat_panel_with_no_reply_never_draws_the_word_null(tmp_path):
+    # a job whose result carries reply: null. The panel's callers draw a reply only when it is truthy, so this turn shows the no-reply
+    # notice; replyText itself draws "" for a null/undefined reply (never String(null)), so no bubble anywhere reads "null"/"undefined"
+    with desk_page(tmp_path) as (stub, base):
+        out = _drive(tmp_path, base + "/", [{"until": "window.LevainRoomView && document.getElementById('board')"},
+                                           {"eval": _CHAT_WITH % "null"},
+                                           {"tap": "[...document.querySelectorAll('.chat-btn')].find(b => b.textContent === 'Start session')"},
+                                           {"until": "document.querySelector('.chat-area')"},
+                                           {"eval": "(() => { const a = document.querySelector('.chat-area'); a.value = 'hello'; return 1; })()"},
+                                           {"tap": "[...document.querySelectorAll('.chat-btn')].find(b => b.textContent === 'Send')"},
+                                           {"until": "document.querySelector('.chat-panel .chat-msg.err .chat-text')"},
+                                           {"eval": _NO_REPLY_LOOK}])
+    g = _look(out)
+    assert g["err"] == ["The entity returned no reply."], g
+    for t in g["them"]:
+        assert t.strip() not in ("null", "undefined"), g
 
 
 # --- the Sessions transcript's agent lines ----------------------------------------------------------------------------------
