@@ -530,8 +530,9 @@ def _arrival_section(lv: str, tail: str) -> list[str]:
         f"- {DAY_PARAGRAPH}",
         f"- When his words say he is leaving: `{lv} coord away DROP_ID --token N {tail}`, then `{lv} coord close "
         f"--plan {tail}` prints the walk checklist (it writes nothing); walk it with him, then write the handoff.",
-        f"- When you hand over (a rotation, or the operator leaving), write the handoff first: `{lv} coord close "
-        f"--kind rotation|operator --body-file PATH --request-id ID --prev-handoff-id H --token N {tail}` "
+        f"- When you hand over (a rotation, the operator leaving, or a dream that saved memory after you started: "
+        f"`coord open` then prints a `Dream seam:` line), write the handoff first: `{lv} coord close "
+        f"--kind rotation|operator|dream --body-file PATH --request-id ID --prev-handoff-id H --token N {tail}` "
         "(`coord open` prints the H to use; the body is JSON with state_line, in_flight, next, contingencies, "
         "notes, attested_operator_present, attested_walked; `coord handoff show` reads one back). In it, name rows "
         "by id (dr-..., item keys), never by ordinal: the next desk sees ids, not your order. For the "

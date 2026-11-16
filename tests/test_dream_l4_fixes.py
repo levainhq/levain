@@ -242,11 +242,12 @@ def test_f4_the_readme_row_is_the_dream_groups_own_help():
 # ------------------------------------------------------------------------------------------------------------- F5
 
 def test_f5_the_desk_brief_says_a_running_desk_keeps_the_memory_it_loaded():
-    from levain.desk import seam
+    # D1-L3 replaced the "not built" sentence with the dream's status; the fact a running desk keeps its memory stays
+    from levain.desk import dream_status, seam
 
-    assert "dreaming (D1) and memory freshness are not built" not in seam.NOT_BUILT
-    assert "keeps the memory it loaded" in seam.NOT_BUILT
-    assert f"Not built: {seam.NOT_BUILT}" in seam.verbose_lines()
+    assert not hasattr(seam, "NOT_BUILT")
+    assert "keeps the memory it loaded" in dream_status.DREAM_NOTE
+    assert dream_status.DREAM_NOTE in seam.verbose_lines()
 
 
 def test_f5_the_signing_card_and_the_changelog_say_it_too():
