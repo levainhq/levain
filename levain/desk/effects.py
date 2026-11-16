@@ -40,6 +40,11 @@ checked again, and the effect runs only if the order is the same version and the
 (:data:`R_SENDER`), on a retry, a race and a retake alike. A refusal this module raises is recorded with its fixed
 reason. ``EffectResult.verb`` is the verb's name alone; the host and service are in its text.
 
+THE FALLBACK (ND-3c, board levain#13, :mod:`levain.desk.would_have_acted`): a refusal that says no order line covers the
+call (no order in force, no covering line, a spent budget, a sender on no line) is also written as a would-have-acted
+row with an open ping when an :class:`Effects` is given one and the event the call names is found and passes the
+verb's own event checks (a made-up or stale event id writes nothing); nothing runs and the refusal is unchanged.
+
 NOT HERE (the next rows): the arm record (O1) and ``NIGHT_ARMING_CLEARED`` (ND-11); the night key and its forced-command list are ND-8 (:data:`FORCED_WORDS` names
 the words it must accept); the live mail credential is open (ND_BUILD_PLAN O8). Until
 those land the executors are injected: an :class:`Effects` with no runner, transport, event lookup, raw source or
@@ -65,6 +70,7 @@ from levain.cockpit.consent import parse_stamp, utc_stamp
 from levain.desk import standing_orders
 from levain.desk.effect_attempts import BudgetSpent, Journal, idem_key, night_key
 from levain.desk.events import Event
+from levain.desk.would_have_acted import WouldHaveActed
 
 __all__ = ["ACK_FROM_LOCAL", "ACK_SUBJECT", "ACK_WORDS_MAX", "AckMessage", "AckTransport", "DIAGNOSIS_WORDS", "DISCLOSURES",
            "Draft", "EVENT_FUTURE_SKEW", "EVENT_MAX_AGE", "EffectRefused", "EffectResult", "Effects", "FORCED_WORDS", "HOSTS", "NIGHT_ALIAS", "NIGHT_CUT_HOUR_UTC", "NIGHT_SSH", "REFUSALS",
@@ -174,6 +180,20 @@ class _OwnRefusal(EffectRefused):
     from, so an executor's ``EffectRefused(<a member of REFUSALS>)`` is not mistaken for the module's own. It is a
     provenance marker against a wrong or forged reason, not a capability: in-process code that imports this name on
     purpose can raise it, and even then only a member of :data:`REFUSALS` is carried out."""
+
+
+def _coverage_reason(exc: BaseException) -> str | None:
+    """The would-have-acted reason a trusted refusal writes (ND-3c), or None when it is not a coverage refusal. Covered
+    here: no order answering (:data:`R_ORDER`; KNOWN EDGE: the gate answers it for any fault reading the log too), no
+    line covering the call, a spent budget, and a sender on no covering line (:data:`R_FROM` carrying ``coverage``,
+    set where :meth:`Effects._recipient` finds the sender read fine and listed nowhere; the same sentence for a
+    malformed or auto-sent message does not carry it). Every other refusal is noise or a fault, not a gap in the order's
+    vocabulary: argument shapes are checked before the gate, so a bad argument never reaches a record."""
+    text = exc.args[0]
+    table = {R_ORDER: "no_order", R_LINE: "no_line", R_BUDGET_INCIDENT: "budget_incident", R_BUDGET_NIGHT: "budget_night"}
+    if text in table:
+        return table[text]
+    return "sender_not_listed" if text == R_FROM and getattr(exc, "coverage", False) is True else None
 
 
 def _trusted(exc: BaseException) -> bool:
@@ -475,6 +495,7 @@ class Effects:
     raw_source: Callable[[str], bytes | None] | None = None
     drafter: Callable[[str], Draft] | None = None
     journal: Journal | None = None
+    would_have_acted: WouldHaveActed | None = None
     night_cut_hour_utc: int = NIGHT_CUT_HOUR_UTC
 
     def gate(self, order_id: str, verb: str, *, expect_sha256: str) -> tuple[Mapping[str, Any], list[Any]]:
@@ -523,9 +544,13 @@ class Effects:
         _require_aware(now)
         return now
 
-    def _noted(self, order_id: str, verb: str, event_id: str, call: Callable[[], EffectResult]) -> EffectResult:
+    def _noted(self, order_id: str, verb: str, event_id: str, call: Callable[[], EffectResult],
+               args: Mapping[str, str] | None = None) -> EffectResult:
         """Run ``call``; a refusal this module raised is recorded (order, verb, event, its fixed sentence) and re-raised
-        unchanged. Recording is best effort and never changes the refusal."""
+        unchanged. A refusal for COVERAGE (:func:`_coverage_reason`) is also written as a would-have-acted row with an
+        open ping, but only when ``event_id`` is a real event that passes the verb's own event checks
+        (:meth:`_event_verified`): the gate and the line check run before the event is looked up, so a made-up id would
+        otherwise earn a row and a push. Recording is best effort and never changes the refusal."""
         try:
             return call()
         except EffectRefused as exc:
@@ -534,7 +559,36 @@ class Effects:
                     self.journal.note_refusal(order_id, verb, event_id, exc.args[0], utc_stamp(self._now()))
                 except Exception:                           # noqa: BLE001 - a clock or file fault changes nothing
                     pass
+            if _trusted(exc) and self.would_have_acted is not None:
+                why = _coverage_reason(exc)
+                if why is not None and self._event_verified(verb, event_id):
+                    try:
+                        now = self._now()
+                        self.would_have_acted.record(verb=verb, reason=why, event_id=event_id, order_id=order_id,
+                                                     args=args or {}, night=night_key(now, self.night_cut_hour_utc),
+                                                     now=utc_stamp(now))
+                    except Exception:                       # noqa: BLE001 - the record never changes the refusal
+                        pass
             raise
+
+    def _event_verified(self, verb: str, event_id: str) -> bool:
+        """True only when ``event_id`` is looked up now and passes the checks ``verb`` itself makes of its event
+        (:meth:`_incident` for a restart; for an ack :meth:`_mail_event` and then :func:`inbound_from` on its raw
+        message, so an auto-reply or a malformed message is never a gap; the age window included). Any refusal, fault
+        or missing executor is False: an event nobody can find is noise, never a coverage gap."""
+        try:
+            if self.events is None:
+                return False
+            if verb == "restart_service":
+                self._incident(event_id)
+            elif verb == "send_ack" and self.raw_source is not None:
+                _event, raw = self._mail_event(event_id)
+                inbound_from(raw)
+            else:
+                return False
+            return True
+        except Exception:                                   # noqa: BLE001 - unverified is not recorded
+            return False
 
     def _event_age(self, event: Event) -> None:
         """An event older than :data:`EVENT_MAX_AGE`, or more than :data:`EVENT_FUTURE_SKEW` ahead of the clock, or whose
@@ -621,7 +675,8 @@ class Effects:
         host, service = _enum(host, HOSTS), _enum(service, SERVICES)
         sha, event_id = _shaped(expect_sha256, _SHA), _shaped(event_id, _EVENT_ID)
         return self._noted(order_id, "restart_service", event_id,
-                           lambda: self._restart(order_id, host, service, sha, event_id))
+                           lambda: self._restart(order_id, host, service, sha, event_id),
+                           {"host": host, "service": service})
 
     def _restart(self, order_id: str, host: str, service: str, sha: str, event_id: str) -> EffectResult:
         order, lines = self.gate(order_id, "restart_service", expect_sha256=sha)
@@ -763,7 +818,8 @@ class Effects:
         status = self._dispatch(attempt, order_id, "send_ack", sha, order, go, event=event, compose=compose)
         return self._recorded("send_ack", "send_ack", "sent", status)
 
-    def _recipient(self, event_id: str, lines: list[Any]) -> tuple[str, str, list[Any], Event]:
+    def _mail_event(self, event_id: str) -> tuple[Event, bytes]:
+        """The mail event ``event_id`` and the raw message its digest names, checked; anything else refuses."""
         assert self.events is not None and self.raw_source is not None
         event = self.events(event_id)
         if (not isinstance(event, Event) or event.event_id != event_id or event.kind != "mail"
@@ -776,7 +832,11 @@ class Effects:
         if not isinstance(raw, (bytes, bytearray)) or not hmac.compare_digest(
                 "sha256:" + hashlib.sha256(bytes(raw)).hexdigest(), event.body_ref):
             raise _OwnRefusal(R_EVENT)                    # the bytes are not the ones the event's digest names
-        recipient = inbound_from(bytes(raw))
+        return event, bytes(raw)
+
+    def _recipient(self, event_id: str, lines: list[Any]) -> tuple[str, str, list[Any], Event]:
+        event, raw = self._mail_event(event_id)
+        recipient = inbound_from(raw)
         voices: set[Any] = set()
         covering: list[Any] = []
         for ln in lines:
@@ -787,7 +847,9 @@ class Effects:
                 voices.add(named[0])
                 covering.append(ln)
         if not voices:
-            raise _OwnRefusal(R_FROM)
+            unlisted = _OwnRefusal(R_FROM)
+            unlisted.coverage = True                        # the sender read fine and is on no line: a gap
+            raise unlisted
         if len(voices) != 1 or next(iter(voices)) not in DISCLOSURES:   # one voice, or the disclosure could be false
             raise _OwnRefusal(R_LINE)
         return recipient, next(iter(voices)), covering, event
