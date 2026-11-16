@@ -912,3 +912,90 @@ def test_t12_a_hello_that_arrives_after_the_expiry_is_not_forwarded():
         w.close()
 
     _go(body, grant_tick_s=60)
+
+
+# --- S3 L3 round 1 fixes ----------------------------------------------------------------------------------------------
+
+def test_t11_a_watcher_pass_on_an_entry_past_its_expiry_labels_it_grant_expired():
+    """L3 r1 codex 6: the entry is still in the file but past its expiry when a pass runs, so `live_entry` gives None.
+    Fails if that is logged `grant-revoked` (root removed nothing); T24's control is the removed entry."""
+    async def go() -> None:
+        class W:
+            closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / f"slot{SLOT}"
+            d.mkdir()
+            f = d / "grants.json"
+            f.write_bytes(eg.dump_grants(SESSION, SLOT, [_entry(ttl=100)]))
+            os.chmod(f, 0o440)
+            grants = FR._Grants(str(f), SLOT, os.getuid(), os.getgid(), clock=lambda: T0 + 200, tick_s=0.01,
+                                session=SESSION)
+            counts: dict = {"up": 5, "down": 5}
+            w = W()
+            grants.register(counts, _entry(ttl=100), w, w)
+            await asyncio.sleep(0.2)
+            assert counts["grant_end"] == "grant-expired" and w.closed
+            grants.open.clear()
+            await asyncio.wait_for(grants._task, 2)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("capped_by", ["grant", "head-timeout"])
+def test_t12_a_hello_wait_the_grant_capped_ends_grant_ended_whatever_the_clock_reads(monkeypatch, capped_by):
+    """L3 r1 deepseek 10: the hello wait times out on the loop's monotonic clock, and the wall clock can read a hair
+    short of the expiry when it does (here the fake clock never moves at all). Fails if the label is judged on the
+    wall clock: a wait the grant capped is `grant-ended`; the control, a wait HEAD_TIMEOUT_S capped, stays
+    `tls-hello-incomplete`."""
+    if capped_by == "head-timeout":
+        monkeypatch.setattr(FR, "HEAD_TIMEOUT_S", 0.5)
+
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_entry(ttl=1 if capped_by == "grant" else 100)])
+        r, w = await _tunnel(rig, hello=False)
+        assert await _eof(r, 4)
+        await asyncio.sleep(0.1)
+        want = "grant-ended" if capped_by == "grant" else "tls-hello-incomplete"
+        assert [x["detail"] for x in rig.refused()] == [want]
+        assert _tunnels(rig) == [] and rig.up_bytes[0] == 0
+        w.close()
+
+    _go(body, grant_tick_s=60)
+
+
+def test_t11a_an_upstream_reset_while_the_hello_is_awaited_is_not_logged_grant_ended():
+    """L3 r1 complement 1: the upstream resets the connection while the client's hello is awaited and the grant is
+    live. Fails if that closed writer is logged `grant-ended`; the hello is still not forwarded and no tunnel line is
+    written."""
+    import socket
+    import struct
+    servers: list = []
+
+    async def reset_connect(addr: str, port: int):
+        async def reset(r, w) -> None:
+            w.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            w.close()
+
+        srv = await asyncio.start_server(reset, "127.0.0.1", 0)
+        servers.append(srv)
+        return await asyncio.open_connection("127.0.0.1", srv.sockets[0].getsockname()[1])
+
+    async def body(ask, rig: Rig) -> None:
+        rig.write([_entry()])
+        r, w = await _tunnel(rig, hello=False)
+        assert await _until(lambda: [u for u in rig.front.live if u.is_closing()], 3), "the upstream never reset"
+        w.write(client_hello(HOST))
+        await w.drain()
+        assert await _eof(r, 3)
+        await asyncio.sleep(0.1)
+        assert [x for x in rig.refused() if x["detail"] == "grant-ended"] == []
+        assert _tunnels(rig) == []
+        w.close()
+        for s in servers:
+            s.close()
+
+    _go(body, grant_tick_s=60, connect=reset_connect)

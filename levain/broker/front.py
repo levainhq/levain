@@ -1298,7 +1298,8 @@ class _Grants:
                     live = (None if grants is None else
                             eg.live_entry(grants, self.session, self.slot, entry.host, entry.port, now))
                     if live is None or live.grant != entry.grant:
-                        self._end(counts, w, u, "grant-revoked")
+                        # an entry past its own expiry is gone from `live_entry` too: that is an expiry, not a revoke
+                        self._end(counts, w, u, "grant-expired" if entry.expires <= now else "grant-revoked")
                 self._failed = False
             except Exception:
                 self.end_all("grant-unchecked")
@@ -1574,15 +1575,21 @@ class Front:
             hello_wait = HEAD_TIMEOUT_S
             if route.passthrough and (dl_left := self._pt_left()) is not None:
                 hello_wait = max(min(hello_wait, dl_left), 0.0)
+            grant_capped = False   # the grant's time left, not HEAD_TIMEOUT_S, is what bounds the hello wait
             if entry is not None:   # a grant that ends while the hello is awaited ends the wait too
-                hello_wait = max(min(hello_wait, self.grants.left(entry)), 0.0)
+                g_left = max(self.grants.left(entry), 0.0)
+                grant_capped = g_left <= hello_wait
+                hello_wait = min(hello_wait, g_left)
             pt_refusal = None   # why a passthrough hello is not forwarded, once a limit decides it
             try:
                 hello, body = await asyncio.wait_for(read_client_hello(reader), hello_wait)
                 if client_hello_sni(body) != route.host:
                     raise Refused("host-not-allowed", "sni-mismatch")
-            except (asyncio.IncompleteReadError, asyncio.TimeoutError):
-                if entry is not None and (counts.get("grant_end") or self.grants.left(entry) <= 0):
+            except (asyncio.IncompleteReadError, asyncio.TimeoutError) as e:
+                # a timeout the grant capped is the grant's end, judged by the wait's own deadline: a wall-clock read
+                # here can still be a hair short of the expiry the loop's monotonic timer already reached
+                if entry is not None and (counts.get("grant_end")
+                                          or (grant_capped and isinstance(e, asyncio.TimeoutError))):
                     self._log({"event": "refused", "refused": "host-not-allowed", "detail": "grant-ended",
                                "host": route.host, "address": addr})
                     return
@@ -1628,13 +1635,14 @@ class Front:
                     self._log({"event": "refused", "refused": "passthrough-bytes-exhausted",
                                "detail": "tunnel-log-failed", "host": route.host, "address": addr})
                     return
-            if entry is not None and (counts.get("grant_end") or uwriter.is_closing() or writer.is_closing()
-                                      or self.grants.left(entry) <= 0):
-                # the grant ended (or a writer was closed for it) while the hello was awaited: the hello is not
-                # forwarded and nothing is counted, the same shape as the passthrough ``is_closing`` check above
+            if entry is not None and (counts.get("grant_end") or self.grants.left(entry) <= 0):
+                # the grant ended while the hello was awaited (a watcher close always stamps ``grant_end`` first): the
+                # hello is not forwarded and nothing is counted
                 self._log({"event": "refused", "refused": "host-not-allowed", "detail": "grant-ended",
                            "host": route.host, "address": addr})
                 return
+            if entry is not None and (uwriter.is_closing() or writer.is_closing()):
+                return   # closed for another reason, the grant live: nothing forwarded, as the passthrough check above
             relaying = True
             uwriter.write(hello)
             counts["up"] = len(hello)
