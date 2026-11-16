@@ -20,7 +20,7 @@ const fs = require("fs");
 const src = fs.readFileSync(process.argv[2], "utf8");
 const a = src.indexOf("// BEGIN progressive draw"), b = src.indexOf("// END progressive draw");
 if (a < 0 || b < 0) { console.log(JSON.stringify({ missing: true })); process.exit(0); }
-const lib = new Function(src.slice(a, b) + "; return { drawOrder, manifestSubset, partialPacer, PARTIAL_GAP_MS, timedAttempt, readPanelBody, runPartial, mayDrawWhole, PANEL_TIMEOUT_MS };")();
+const lib = new Function(src.slice(a, b) + "; return { drawOrder, boardPanels, NEEDS_PANELS, partialPacer, PARTIAL_GAP_MS, timedAttempt, readPanelBody, runPartial, mayDrawWhole, PANEL_TIMEOUT_MS };")();
 (async () => {
 const out = {};
 const manifest = {
@@ -37,58 +37,52 @@ const manifest = {
 const ids = ["loops", "tray", "activity", "state", "begin", "crystals", "decisions"];
 out.order = lib.drawOrder(manifest, ids);
 out.noRegions = lib.drawOrder({ panels: {} }, ["a", "b"]);
-const sub = lib.manifestSubset(manifest, new Set(["activity", "decisions", "tray"]));
-out.sub = { panels: Object.keys(sub.panels), hero: sub.regions.hero, brief: sub.regions.brief, widgets: sub.regions.widgets,
-            zones: sub.regions.zones.map((z) => [z.id, z.panels, z.cards.map((c) => c.panels)]) };
-out.whole = Object.keys(manifest.panels).length === 7 && manifest.regions.zones.length === 2;   // the source manifest is not mutated
+out.needs = lib.NEEDS_PANELS;
+// the board in hand: a landed panel's own record, a loading marker for each one still out; the landed record is not copied
+const rec = { rows: [] };
+const bp = lib.boardPanels(["activity", "decisions", "tray"], { decisions: rec, stray: {} });
+out.board = { keys: Object.keys(bp), activity: bp.activity, tray: bp.tray, same: bp.decisions === rec };
 
 // the pacer, on a fake clock
 let t = 0, timers = [];
 const clock = { now: () => t, setTimeout: (f, ms) => { const h = { f, at: t + ms }; timers.push(h); return h; }, clearTimeout: (h) => { timers = timers.filter((x) => x !== h); } };
 const advance = (ms) => { t += ms; for (const h of timers.filter((x) => x.at <= t)) { timers = timers.filter((x) => x !== h); h.f(); } };
 const draws = [];
-const p = lib.partialPacer(["a", "b"], 6, (n) => draws.push([t, n]), clock);
-p.settled("x");                                  // not core
-p.settled("a");                                  // core still waiting on b
-out.beforeCore = draws.length;
-p.settled("b");                                  // the core is in: the first draw is at once
-out.atCore = draws.slice();
-p.settled("c");                                  // inside the gap: one timer, no draw yet
-p.settled("d");                                  // coalesced into the same timer
+const p = lib.partialPacer(5, (n) => draws.push([t, n]), clock);
+out.beforeFirst = draws.length;                  // nothing draws until the shells are asked for
+p.first();                                       // the shells: at once, before any read has landed (0 landed)
+p.settled("a"); p.settled("b");                  // inside the gap: one timer, no draw yet
+out.atFirst = draws.slice();
 out.inGap = { draws: draws.length, timers: timers.length };
+p.settled("c"); p.settled("d");                  // coalesced into the same timer
 advance(lib.PARTIAL_GAP_MS);
 out.afterGap = draws.slice();
-p.settled("e");                                  // the last one (6 of 6): the full draw is the caller's
+p.settled("e");                                  // the last one (5 of 5): the full draw is the caller's
 advance(1000);
 out.lastNeverDraws = draws.length;
 
 // a draw that takes long widens the gap
 t = 0; timers = []; const d2 = [];
-const slow = lib.partialPacer(["a"], 10, (n) => { d2.push(t); t += 200; }, clock);
-slow.settled("a"); slow.settled("b");           // draw 1 takes 200 ms; the next waits 4 x 200 = 800 ms from its end
+const slow = lib.partialPacer(10, (n) => { d2.push(t); t += 200; }, clock);
+slow.first(); slow.settled("b");                // draw 1 takes 200 ms; the next waits 4 x 200 = 800 ms from its end
 advance(799); out.slowEarly = d2.length;
 advance(1); out.slowOnTime = d2.length;
 
 // stop cancels a pending draw
 t = 0; timers = []; const d3 = [];
-const q = lib.partialPacer([], 10, (n) => d3.push(n), clock);
+const q = lib.partialPacer(10, (n) => d3.push(n), clock);
 q.settled("a"); q.settled("b"); q.stop(); advance(5000);
 out.stopped = { draws: d3.length, timers: timers.length };
 
 // a draw that throws is swallowed, the pacing state stays sane and a later draw still happens
 t = 0; timers = []; const d4 = []; let boom = true;
-const w = lib.partialPacer([], 10, (n) => { d4.push(n); if (boom) { boom = false; throw new Error("draw failed"); } }, clock);
+const w = lib.partialPacer(10, (n) => { d4.push(n); if (boom) { boom = false; throw new Error("draw failed"); } }, clock);
 const quiet = console.warn; console.warn = () => {};
 let threw = false;
 try { w.settled("a"); } catch (e) { threw = true; }
 w.settled("b"); advance(lib.PARTIAL_GAP_MS);
 console.warn = quiet;
 out.throwingDraw = { threw, draws: d4 };
-
-// a zone or card with no panels list, and a null one, do not break the narrowing
-const bad = { panels: { a: {} }, regions: { hero: ["a"], brief: [], widgets: [], zones: [null, { id: "z" }, { id: "y", panels: ["a"], cards: [null, { }, { panels: ["a"] }] }] } };
-const bs = lib.manifestSubset(bad, new Set(["a"]));
-out.malformed = bs.regions.zones.map((z) => [z.id, z.panels, z.cards.map((c) => c.panels)]);
 
 // runPartial: a superseded or editing page never maps (the mapper keeps state); a throwing build leaves the board
 let built = 0, shown = 0;
@@ -171,26 +165,22 @@ def test_the_first_board_reads_its_top_first_narrows_the_manifest_and_paces_its_
                          capture_output=True, text=True, timeout=30, check=True)
     out = json.loads(run.stdout)
     assert not out.get("missing"), "the boot has no progressive draw block"
-    # hero, brief, then the Needs strip's panel come first, the rest keep the manifest's order
-    assert out["order"] == {"core": ["activity", "state", "begin", "decisions"],
-                            "order": ["activity", "state", "begin", "decisions", "loops", "tray", "crystals"]}
-    assert out["noRegions"] == {"core": [], "order": ["a", "b"]}
-    # the board in hand: only the panels read, a zone or card with none left is gone
-    assert out["sub"] == {"panels": ["activity", "decisions", "tray"], "hero": ["activity"], "brief": [], "widgets": ["decisions"],
-                          "zones": [["operate", ["tray"], [["tray"]]]]}
-    assert out["whole"] is True
-    # nothing draws before the core is in, the core's arrival draws at once, later landings coalesce within the gap
-    assert out["beforeCore"] == 0
-    assert out["atCore"] == [[0, 3]]
+    # the Needs strip's panel is read first, then the hero and the brief, the rest keep the manifest's order
+    assert out["order"] == ["decisions", "activity", "state", "begin", "loops", "tray", "crystals"]
+    assert out["noRegions"] == ["a", "b"]
+    assert out["needs"] == ["decisions"]
+    # the board in hand: the landed record itself, a loading marker for each panel still out, nothing for an id the manifest does not list
+    assert out["board"] == {"keys": ["activity", "decisions", "tray"], "activity": {"loading": True}, "tray": {"loading": True}, "same": True}
+    # nothing draws before the shells are asked for, the shells draw at once, later landings coalesce within the gap
+    assert out["beforeFirst"] == 0
+    assert out["atFirst"] == [[0, 0]]
     assert out["inGap"] == {"draws": 1, "timers": 1}
-    assert out["afterGap"] == [[0, 3], [250, 5]]
+    assert out["afterGap"] == [[0, 0], [250, 4]]
     assert out["lastNeverDraws"] == 2
     assert (out["slowEarly"], out["slowOnTime"]) == (1, 2)
     assert out["stopped"] == {"draws": 1, "timers": 0}
     # a partial draw that throws never reaches the read that landed it, and the pacer keeps going
     assert out["throwingDraw"] == {"threw": False, "draws": [1, 2]}
-    # a zone or card with no panels list, or a null one, narrows to nothing instead of throwing
-    assert out["malformed"] == [["y", ["a"], [["a"]]]]
     # a superseded or editing page never runs the (stateful) mapping; a throwing mapping or draw leaves the board alone
     assert out["gateShut"] == [False, 0, 0]
     assert out["buildThrows"] == [False, 0]
@@ -247,17 +237,32 @@ function fixture() {
 function makeEnv(opts) {
   opts = opts || {};
   const fx = fixture();
-  const renders = [], marks = [], timers = [], listeners = {};
-  let loopsReads = 0, failManifest = opts.failManifest || 0, refuseManifest = 0, release = null, hangManifest = 0, releaseManifest = null, signals = 0;
+  const renders = [], reads = [], marks = [], timers = [], listeners = {}, released = [], releasedKeep = [];
+  let holdArms = 0, loopsN = 0;
+  let loopsReads = 0, editing = !!opts.editing, gate = null, openGate = null, failManifest = opts.failManifest || 0, refuseManifest = 0, release = null, hangManifest = 0, releaseManifest = null, signals = 0;
   const held = new Promise((r) => { release = r; });
   const mHeld = new Promise((r) => { releaseManifest = r; });
   const resp = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body, text: async () => JSON.stringify(body), headers: { get: () => null }, clone() { return this; } });
-  async function fetchFn(url) {
-    if (url.indexOf("/cockpit/manifest.json") >= 0) { if (hangManifest > 0) { hangManifest--; await mHeld; } if (refuseManifest > 0) { refuseManifest--; return resp(401, {}); } if (failManifest > 0) { failManifest--; return resp(500, {}); } return resp(200, fx.manifest); }
+  // opts.credTitles: the manifest names the credential class the request carried, and every panel body's title says which class it was read
+  // as ("<id>@token" or "<id>@none"), so a test can see a body of one class drawn under the other. opts.loopsRefuse: the first `loops` read
+  // answers the token 403 (after holdLoops' wait, when both are set). opts.loopsNumbered: each `loops` body's title is "loops#<n>", n the read count.
+  async function fetchFn(url, o) {
+    const tok = !!(o && o.headers && o.headers["X-Levain-Write-Token"]);
+    if (url.indexOf("/cockpit/manifest.json") >= 0) { if (hangManifest > 0) { hangManifest--; await mHeld; } if (refuseManifest > 0) { refuseManifest--; return resp(401, {}); } if (failManifest > 0) { failManifest--; return resp(500, {}); }
+      return resp(200, opts.credTitles ? Object.assign({}, fx.manifest, { credential: { class: tok ? "token" : "none" } }) : fx.manifest); }
     const m = /\/cockpit\/panel\/([^/.]+)\.json/.exec(url);
     if (m && fx.panels[m[1]]) {
+      reads.push(m[1]);
+      const n = m[1] === "loops" ? ++loopsN : 0;
+      if (opts.holdAll) await held;          // every panel read waits for release(): none ever lands before it
+      if (gate) await gate;                  // env.hold(): every read from now on waits for env.open()
+      if (opts.fail === m[1]) return resp(500, {});
       if (m[1] === "loops" && opts.holdLoops && loopsReads++ === 0) await held;
-      return resp(200, fx.panels[m[1]]);
+      if (m[1] === "loops" && opts.loopsRefuse && n === 1) return resp(403, { message: "missing or invalid write token" });
+      let body = fx.panels[m[1]];
+      if (opts.credTitles) body = Object.assign({}, body, { title: m[1] + (tok ? "@token" : "@none") });
+      if (opts.loopsNumbered && n) body = Object.assign({}, body, { title: "loops#" + n });
+      return resp(200, body);
     }
     return resp(404, {});
   }
@@ -274,20 +279,21 @@ function makeEnv(opts) {
   let renderN = 0;
   const win = { LevainCockpitView: View, localStorage, sessionStorage, location: { search: "?source=manifest", hash: "", pathname: "/" },
     crypto: { randomUUID: () => "k" }, prompt: () => "",
-    LevainDashboard: { render: (view, o) => { renderN++; if ((opts.throwOnRender || []).indexOf(renderN) >= 0) throw new Error("render " + renderN + " threw"); renders.push(view); }, hasUnsavedEdit: () => false, jobsActive: () => false },
+    LevainDashboard: { render: (view, o) => { renderN++; if ((opts.throwOnRender || []).indexOf(renderN) >= 0) throw new Error("render " + renderN + " threw"); renders.push(view); }, hasUnsavedEdit: () => editing, jobsActive: () => false, releaseLoading: (why, keep) => { released.push(why); releasedKeep.push(keep === undefined ? null : Array.from(keep).sort()); } },
     dispatchEvent() {} };
   const doc = { getElementById: (id) => (id === "store" ? store : id === "stamp" ? stamp : regions[id] || null), documentElement: html, dispatchEvent() {},
     addEventListener(t, f) { (listeners[t] = listeners[t] || []).push(f); }, querySelectorAll: () => [], createElement: () => ({ className: "", textContent: "" }),
     visibilityState: "visible", body: { dataset: {} } };
-  const fakeSet = (f, ms) => { if (RETRY.has(ms) || ms === HOLD_MS) { const h = { fake: true, f, ms }; timers.push(h); return h; } return real.setTimeout(f, ms); };
+  const fakeSet = (f, ms) => { if (RETRY.has(ms) || ms === HOLD_MS) { if (ms === HOLD_MS) holdArms++; const h = { fake: true, f, ms }; timers.push(h); return h; } return real.setTimeout(f, ms); };
   const fakeClear = (h) => { if (h && h.fake) { const i = timers.indexOf(h); if (i >= 0) timers.splice(i, 1); } else real.clearTimeout(h); };
-  const env = { renders, timers, listeners, store, stamp, regions, html, release, fx, armFail: (n) => { failManifest = n; }, armRefuse: (n) => { refuseManifest = n; },
+  const env = { renders, reads, timers, listeners, released, releasedKeep, ls, setEditing: (v) => { editing = !!v; }, hold: () => { gate = new Promise((r) => { openGate = r; }); }, open: () => { if (openGate) openGate(); gate = null; }, store, stamp, regions, html, release, fx, armFail: (n) => { failManifest = n; }, armRefuse: (n) => { refuseManifest = n; },
     hangManifest: (n) => { hangManifest = n; }, releaseManifest: () => releaseManifest(), signals: () => signals };
   env.start = async () => {
     new Function("window", "document", "location", "history", "fetch", "console", "setTimeout", "clearTimeout", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console, fakeSet, fakeClear);
     await settle();
     return env;
   };
+  Object.defineProperty(env, "holdArms", { get: () => holdArms });
   env.whole = () => html.hasAttribute("data-board-whole");
   env.inert = () => REGIONS.filter((id) => regions[id].hasAttribute("inert")).length;
   // fire() runs the next retry timer; fireHold() runs the watchdog (the clock's bound on an inert part), never a retry
@@ -422,12 +428,13 @@ def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_
     assert out["aFailed"]["whole"] is False and out["aFailed"]["inert"] == 7 and out["aFailed"]["renders"] == 1, out["aFailed"]
     assert out["aFailed"]["timers"] == [2000] and out["aFailed"]["hold"] is True, out["aFailed"]
     assert "can't reach the cockpit yet" in out["aFailed"]["store"], out["aFailed"]
-    # the retry draws the whole board once, the line is clean, nothing else is queued, the watchdog is cleared (no later release, no second
-    # signal), and the superseded read's late panel changes nothing
+    # the retry is a cold board's second read: it repaints the shells and what had landed at once (render 2) and then draws the whole board
+    # once (render 3), the line is clean, nothing else is queued, the watchdog is cleared (no later release, no second signal), and the
+    # superseded read's late panel changes nothing
     assert out["aRetryDelay"] == 2000
-    assert (out["aRetried"]["renders"], out["aRetried"]["whole"], out["aRetried"]["inert"], out["aRetried"]["timers"], out["aRetried"]["store"]) == (2, True, 0, [], ""), out["aRetried"]
+    assert (out["aRetried"]["renders"], out["aRetried"]["whole"], out["aRetried"]["inert"], out["aRetried"]["timers"], out["aRetried"]["store"]) == (3, True, 0, [], ""), out["aRetried"]
     assert out["aRetried"]["hold"] is False and out["aRetried"]["signals"] == 1, out["aRetried"]
-    assert out["aLate"]["renders"] == 2 and out["aLate"]["timers"] == [] and out["aLate"]["signals"] == 1, out["aLate"]
+    assert out["aLate"]["renders"] == 3 and out["aLate"]["timers"] == [] and out["aLate"]["signals"] == 1, out["aLate"]
     # A2 (a): the same part and failed read held inert and unsigned until the WATCHDOG fires; then it releases and signs, with the part as it
     # is (still one render, the retry still queued), and a later whole draw replaces the board like any redraw
     a2 = out["a2Held"]
@@ -441,7 +448,7 @@ def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_
     assert (out["bPart"]["renders"], out["bPart"]["whole"]) == (1, False), out["bPart"]
     assert out["bFailed"]["whole"] is False and out["bFailed"]["inert"] == 7 and out["bFailed"]["timers"] == [2000], out["bFailed"]
     assert out["bRetryDelay"] == 2000
-    assert (out["bRetried"]["renders"], out["bRetried"]["whole"], out["bRetried"]["inert"], out["bRetried"]["timers"], out["bRetried"]["store"]) == (2, True, 0, [], ""), out["bRetried"]
+    assert (out["bRetried"]["renders"], out["bRetried"]["whole"], out["bRetried"]["inert"], out["bRetried"]["timers"], out["bRetried"]["store"]) == (3, True, 0, [], ""), out["bRetried"]
     # C: a server that keeps failing is retried on the boot's own backoff (2, 4, 8, 15 s, then 30 s), never in a tight loop. The part stays inert
     # and unsigned through EVERY failure, the fifth included (no count releases it, the watchdog's armed clock is the one bound); the watchdog
     # then releases the page and sets the signal, and the retry chain goes on (the 30 s step is a real timer here, so no fake one shows)
@@ -474,9 +481,9 @@ def test_a_read_that_fails_after_a_partial_board_is_retried_until_a_whole_board_
 
 def test_the_cold_load_draws_partial_boards_and_a_panel_read_is_bounded() -> None:
     boot = (WEB / "dashboard_boot.js").read_text(encoding="utf-8")
-    # only a page that has drawn nothing yet draws partial boards; a refresh keeps its board until the new one is whole
-    assert "const onPartial = everDrawn ? null :" in boot
-    assert "loadManifestView(passive, onPartial)" in boot
+    # only a board that is not yet whole draws partial boards (on every read of it); a refresh keeps its board until the new one is whole
+    assert "const onPartial = wholeDrawn ? null :" in boot
+    assert "loadManifestView(passive, onPartial, () => myGen === loadGen)" in boot
     # the cold placeholder goes with the first useful content, not after the last panel
     assert re.search(r'removeAttribute\("data-cold"\);\s*drawnOnce\(\);', boot)
     # a panel that does not answer is its own failure state, and frees its read slot

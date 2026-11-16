@@ -688,6 +688,9 @@
     manifestAt = Date.now() - Math.max(0, (opts && opts.elapsedMs) || 0);
     return mapSnapshot(raw, opts);
   }
+  // A panel whose drawn figures are computed from another panel's payload, by id: it stays loading until every input panel has landed
+  // (the Health panel's last-wrap figures come from the wraps panel)
+  const CROSS_INPUTS = Object.assign(Object.create(null), { health: ["wraps"] });
   function mapSnapshot(raw, opts) {
     const elapsed = Math.max(0, (opts && opts.elapsedMs) || 0);   // time since the manifest was fetched, measured by the caller
     // The manifest and each panel are cleaned apart: a hostile key inside ONE panel's payload (two keys that
@@ -735,6 +738,9 @@
       health: null, graph: null, crystal_index: [], open_intentions: [], tray: [], episodes: [],
       sections: [], config_docs: [], wraps: [], recent_edits: [], state: null, jar: ent.jar,
       layout: [], errors: view_errors, extra_panels: Object.create(null), writable: false, write_token_required: false,
+      // panel ids read not yet (loading) and read and failed (failed): the page's figures drawn from a panel's payload outside that panel (the
+      // band's wrap line, the vital ring, the Memory card's Cognition tabs) ask these, never an empty list or an absent field
+      loading: Object.create(null), failed: Object.create(null),
       // the write surface: the transport's own flags, the verb heads, and every target a write names. A
       // page without `transport` (an older server) is read-only, never writable by default.
       verb_heads: isObj(m.verbs) ? m.verbs : Object.create(null), action_verbs: Object.create(null),
@@ -755,17 +761,29 @@
       if (p.status === "error") return p.error || "unavailable";
       return null;
     };
+    // a panel the page has not read yet (the boot hands `{loading: true}` for each one still out): drawn as its own shell, a third
+    // state beside drawn and unavailable, never as an empty panel
+    const isLoading = (pid) => { const p = P.get(pid); return !!p && typeof p === "object" && p.loading === true && p.error === undefined && p.status === undefined; };
+    for (const pid of heads.keys()) if (isLoading(pid)) view.loading[pid] = true;
+    const loadingPanel = (pid, zone) => {
+      const h = heads.get(pid) || {};
+      view.loading[pid] = true;
+      view.layout.push({ kind: "external", zone: zone, edit_class: "", title: titleOf(h.title, pid), id: pid });
+      view.extra_panels[pid] = { loading: true };
+    };
     const unavailable = (pid, zone, why) => {
       const pl = P.get(pid);
       const h = pl && pl.status === "error" ? pl : (heads.get(pid) || {});   // a real error payload's own last-good time wins
       view.layout.push({ kind: "external", zone: zone, edit_class: "", title: titleOf(h.title, pid), id: pid });
+      view.failed[pid] = true;
       view.extra_panels[pid] = { error: why + " — last good " + (h.as_of ? ageLabel(h.as_of, now, "") : "never") };
     };
 
-    const wrapsFail = heads.has("wraps") ? failure("wraps") : null;
-    let wrapsData = !heads.has("wraps") ? [] : wrapsFail ? "unavailable" : (P.get("wraps").value || {}).data;
+    const wrapsLoading = heads.has("wraps") && isLoading("wraps");
+    const wrapsFail = heads.has("wraps") && !wrapsLoading ? failure("wraps") : null;
+    let wrapsData = !heads.has("wraps") || wrapsLoading ? [] : wrapsFail ? "unavailable" : (P.get("wraps").value || {}).data;
     let wrapsShape = null;
-    if (!wrapsFail && heads.has("wraps")) {
+    if (!wrapsFail && !wrapsLoading && heads.has("wraps")) {
       try { checkWraps(wrapsData); } catch (e) { wrapsShape = e; wrapsData = "unavailable"; view.errors.wraps = e.message; }
     }
     if (wrapsFail) view.errors.wraps = wrapsFail;
@@ -777,6 +795,7 @@
     const ke = Array.isArray(m.regions.hero) && Array.isArray(m.regions.brief) && Array.isArray(m.regions.widgets);
     const headerExtra = [];
     const mapState = (pid, head) => {
+      if (isLoading(pid)) { view.state = { text: null, loading: true }; return; }
       const bad = failure(pid);
       if (bad) { view.errors[pid] = bad; return; }
       try {
@@ -806,8 +825,12 @@
       const nat = region ? "" : pid;
       const head = heads.get(pid);
       if (!head) { view.errors[pid] = "listed in the manifest but has no head"; return; }
+      // in this order: a panel still unread is loading; a panel whose own read failed is its failure (whatever its inputs are doing, so the
+      // vital reads failed.health); a panel whose cross-panel figures wait on a panel still unread shows loading until its inputs have landed
+      if (isLoading(pid)) { loadingPanel(pid, zoneId); return; }
       const bad = failure(pid);
       if (bad) { unavailable(pid, zoneId, bad); return; }
+      if ((CROSS_INPUTS[nat] || []).some(isLoading)) { loadingPanel(pid, zoneId); return; }
       const panel = P.get(pid);
       const groupTitles = new Map();
       for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, titleOf(g.title, String(g.id)));

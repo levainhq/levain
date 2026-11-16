@@ -242,6 +242,17 @@
     sEl.classList.remove("unset");
     if (!state) { sEl.hidden = true; return; }
     sEl.hidden = false;
+    sEl.removeAttribute("aria-busy");
+    if (state.loading) {
+      sEl.setAttribute("aria-busy", "true");
+      sEl.appendChild(el("span", "ftext", "loading state\u2026"));
+      return;
+    }
+    // a state line whose read was released (releaseLoading): its failure, never "no state set"
+    if (typeof state.unavailable === "string") {
+      sEl.appendChild(el("span", "ftext", "state " + state.unavailable));
+      return;
+    }
     if (!state.text) {
       sEl.classList.add("unset");
       sEl.appendChild(el("span", "ftext", "no state set"));
@@ -379,8 +390,14 @@
     // steady phosphor heartbeat; DARK → slow, dim-red. The background IS the pulse.
     // (view.scope stays a data-only seam — the UI surfaces it when team scope is
     // real, not as a PM-style profile selector that does nothing yet.)
+    // the health panel still unread draws neither: no write-path claim is made from an input that has not landed (the attribute is cleared);
+    // a health read that failed draws "unknown", which dims nothing
     const live = !!(view.health ? view.health.write_path_live : view.write_path_live);
-    if (document.body) document.body.dataset.vital = live ? "live" : "dark";
+    if (document.body) {
+      if (view.loading && view.loading.health) delete document.body.dataset.vital;
+      else if (view.failed && view.failed.health && !view.health) document.body.dataset.vital = "unknown";
+      else document.body.dataset.vital = live ? "live" : "dark";
+    }
 
     const layout = Array.isArray(view.layout) ? view.layout : [];
     keShell(!!view.ke);
@@ -704,6 +721,78 @@
     if (at < text.length) out.push(text.slice(at));
     return out;
   }
+  // a panel still being read: its own status line (the pulsing dot), marked busy; never an empty panel's words
+  function loadingLine(entry) {
+    const p = el("p", "empty loading", "loading" + (entry && entry.title ? " \u2014 " + entry.title : "") + "\u2026");
+    p.setAttribute("role", "status");
+    return p;
+  }
+  // A board whose reads will not finish (the boot's watchdog, a refusal): every panel still loading becomes the failure it is, with the
+  // reason, and nothing keeps pulsing, except the panels named in `keep` (their bodies are in hand and the draw is only waiting, on an
+  // edit). The release is made in the VIEW the page holds (currentView), so a later redraw (a layout change, Reset layout) draws the
+  // failure and never the shell again, and every figure drawn from a released panel's payload (the vital, the band's wrap line, the
+  // Memory card) reads it as failed; the page is then redrawn from that view, or, while an edit is open (a redraw would take it away),
+  // the loading lines on the page are swapped for the failure in place. A later whole draw replaces all of it like any redraw.
+  function releaseLoading(why, keep) {
+    const said = String(why || "not read");
+    const reason = "unavailable \u2014 " + said;
+    const kept = new Set(Array.isArray(keep) ? keep.map(String) : []);
+    const v = currentView;
+    let changed = false;
+    if (v && v.loading && typeof v.loading === "object") {
+      if (!v.failed || typeof v.failed !== "object") v.failed = Object.create(null);
+      if (!v.errors || typeof v.errors !== "object") v.errors = {};
+      for (const pid of Object.keys(v.loading)) {
+        if (kept.has(pid)) continue;
+        delete v.loading[pid];
+        v.failed[pid] = true;
+        const ex = v.extra_panels && v.extra_panels[pid];
+        if (ex && ex.loading === true) v.extra_panels[pid] = { error: said };
+        if (pid === "wraps") v.errors.wraps = said;     // as the mapper marks a wraps read that failed (the wrap line, the trace)
+        if (pid === "state" && v.state && v.state.loading) v.state = { text: null, unavailable: reason };
+        changed = true;
+      }
+    }
+    if (changed && !hasUnsavedEdit()) { try { renderKeepingPlace(v, lastOpts); } catch (e) { console.warn("levain: the released board did not redraw:", e); } }
+    // on the page (an edit open, or a node no view drew): a loading line is kept only while EVERY input it waits on is kept, and released
+    // once any of them is released (that input will not land, so the line can never finish). A panel's shell waits on its own panel; a
+    // derived line (the Neocortex card's placeholder, the trace) names its inputs in data-waits. The same rule holds for every derived line
+    // below (the band's wrap line and the Memory meta wait on wraps and Health)
+    const allKept = (ids) => ids.length > 0 && ids.every((id) => kept.has(id));
+    const stillOut = (n) => {
+      const w = n.dataset && n.dataset.waits ? n.dataset.waits.split(" ").filter(Boolean) : [];
+      const host = n.closest ? n.closest("[data-ck-panel]") : null;
+      return allKept(w.length ? w : host ? [host.dataset.ckPanel] : []);
+    };
+    let healthOut = false;
+    for (const p of Array.from(document.querySelectorAll("p.empty.loading"))) {
+      if (stillOut(p)) continue;
+      const host = p.parentNode;
+      if (p.closest && p.closest('[data-ck-panel="health"]')) healthOut = true;
+      if (host && typeof host.replaceChild === "function") host.replaceChild(errorLine(reason), p);
+      if (host && host.dataset && host.dataset.sig === "loading") host.dataset.sig = "released";
+    }
+    const sEl = document.getElementById("state");
+    if (sEl && sEl.getAttribute("aria-busy") === "true" && !kept.has("state")) { sEl.replaceChildren(el("span", "ftext", "state " + reason)); sEl.removeAttribute("aria-busy"); }
+    const wrapsKept = allKept(["wraps", "health"]);
+    const wl = document.querySelector('.wrapline[aria-busy="true"]');
+    if (wl && !wrapsKept) {
+      if (v) { try { wl.replaceWith(wrapLineOf(v)); } catch (_) { wl.replaceChildren(el("div", null, "wraps " + reason)); } }
+      else wl.replaceChildren(el("div", null, "wraps " + reason));
+    }
+    if (!wrapsKept && v) for (const m of Array.from(document.querySelectorAll(".ck-mem-meta"))) {
+      if (!/loading wraps/.test(m.textContent || "")) continue;
+      const now = m.closest && m.closest(".ck-mem-neo") ? memWrapsLine(v) : memCogBits(v).join(" \u00b7 ");
+      if (now) m.textContent = now; else m.remove();
+    }
+    // the vital ring: a released health read is "unknown" (it dims nothing), never a cleared ring
+    if (document.body && !kept.has("health") && (healthOut || (v && v.failed && v.failed.health && !v.health))) document.body.dataset.vital = "unknown";
+    // (the notification centre's skeleton is its own read, not a panel's: it is left to its own code)
+    for (const n of Array.from(document.querySelectorAll('[aria-busy="true"]:not(.nc-skel)'))) {
+      if (n.querySelector("p.empty.loading") || (n.id === "state" && kept.has("state")) || (n.classList.contains("wrapline") && wrapsKept)) continue;
+      n.removeAttribute("aria-busy");
+    }
+  }
   function errorLine(text) {
     const p = el("p", "err"), span = el("span");
     span.append(...humanTimesIn(String(text)));
@@ -716,6 +805,7 @@
     ckAttrs(node, entry, ckKindOf(entry, data));
     const K = window.LevainCockpitKinds;
     if (data.error) { node.appendChild(errorLine("unavailable \u2014 " + data.error)); return node; }
+    if (data.loading) { node.setAttribute("aria-busy", "true"); node.appendChild(loadingLine(entry)); return node; }
     appendBanner(node, entry);
     if (data.note && !(ctx && ctx.widget && data.face === "count")) node.appendChild(richEl("div", "ext-note", data.note));
     const alerted = (entry.banner || []).some((b) => b.alert);
@@ -743,12 +833,21 @@
   function wrapLineOf(view) {
     const WRAP_LIST_CAP = 50;   // the longest history list the page is sent
     const ws = Array.isArray(view.wraps) ? view.wraps : [];
-    const unread = !!((view.errors && view.errors.wraps) || (view.health && view.health.wrap_history_unavailable));
+    const unread = !!((view.errors && view.errors.wraps) || (view.failed && view.failed.wraps) || (view.health && view.health.wrap_history_unavailable));
     const last = ws.length && ws[0] && typeof ws[0].wrapped_at === "string" ? ws[0] : null;
     const at = last ? new Date(last.wrapped_at) : null;
     const box = el("div", "wrapline");
     const first = el("div"), second = el("div");
-    if (at && !Number.isNaN(at.getTime())) {
+    // the wraps panel (or, with no history in hand, the health panel that counts them) not read yet: the line says so, never "none yet".
+    // In this order (the same rule as memWrapsLine's): wraps' own read out is loading; wraps' own read failed is its failure, whatever the
+    // Health read is doing; only then is a Health read still out loading
+    const ownFailed = !!((view.failed && view.failed.wraps) || (view.errors && view.errors.wraps));
+    if (view.loading && (view.loading.wraps || (!ownFailed && !ws.length && view.loading.health))) {
+      const nm = typeof view.entity_name === "string" ? view.entity_name : "";
+      first.appendChild(el("b", null, "loading wraps\u2026"));
+      second.textContent = nm;
+      box.setAttribute("aria-busy", "true");
+    } else if (at && !Number.isNaN(at.getTime())) {
       const when = at.toLocaleDateString(undefined, { weekday: "short" }) + " " + at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
       first.append(el("b", null, "Last wrap"), " " + when);
       const total = view.health && Number.isInteger(view.health.total_wraps) ? view.health.total_wraps : null;
@@ -1403,6 +1502,12 @@
   function memWrapsLine(view) {
     const ws = Array.isArray(view.wraps) ? view.wraps : [];
     const total = memWrapTotal(view);
+    // in this order (the same rule as wrapLineOf's): wraps' own read out is loading; wraps' own read failed is its failure, whatever the
+    // Health read is doing; only then is a Health read still out loading
+    const ownFailed = !!((view.failed && view.failed.wraps) || (view.errors && view.errors.wraps));
+    if (view.loading && (view.loading.wraps || (!ownFailed && !ws.length && view.loading.health))) return "loading wraps\u2026";
+    // a wraps read that failed says so: the health panel's count when it has one, never "no wraps"
+    if (ownFailed) return total ? total + (total === 1 ? " wrap" : " wraps") + " \u00b7 history unavailable" : "wraps unavailable";
     // the newest stamp, wherever it sits in the list
     let last = null;
     for (const w of ws) {
@@ -1425,7 +1530,8 @@
     const listed = Array.isArray(view.wraps) ? view.wraps.length : 0, total = memWrapTotal(view);
     const ws = total !== null ? total : listed;
     const bits = [];
-    if (ws) bits.push((total === null && ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
+    if (view.loading && view.loading.wraps) bits.push("loading wraps\u2026");
+    else if (ws) bits.push((total === null && ws >= MEM_WRAP_CAP ? ws + "+" : String(ws)) + (ws === 1 ? " consolidation" : " consolidations"));
     if (gn) bits.push(gn + " nodes");
     if (ge) bits.push(ge + " edges");
     // the write path speaks when it cannot be read; a store with no wraps yet is not a fault. The graph says when links stopped.
@@ -1484,7 +1590,12 @@
     // a section with no text is left out unless it can be edited: an editable one stays as a slim row that keeps its Edit
     const full = secs.filter((n) => !n.dataset.ckNoText || n.dataset.ckSlim);
     for (const n of secs) if (!full.includes(n)) n.remove();
-    if (!full.length) card.appendChild(el("p", "empty", "No wrap yet: the first consolidation writes this."));
+    const mindOut = nodes.map(pid).filter((id) => view.loading && view.loading[id]);
+    // a section panel whose read failed is no evidence the neocortex is unwritten: the card says it could not be read, never "No wrap yet"
+    const secFailed = nodes.some((n) => /^section:/.test(pid(n)) && view.failed && view.failed[pid(n)]);
+    if (!full.length && mindOut.length) { const p = el("p", "empty loading", "loading\u2026"); p.dataset.waits = mindOut.join(" "); card.appendChild(p); }
+    else if (!full.length && secFailed) card.appendChild(errorLine("unavailable \u2014 a Neocortex section could not be read"));
+    else if (!full.length) card.appendChild(el("p", "empty", "No wrap yet: the first consolidation writes this."));
     else {
       const left = el("div", "ck-mem-col"), right = el("div", "ck-mem-col");
       for (const n of full) { n._ckEntry = entryOf.get(n); (RIGHT.test(String((entryOf.get(n) || {}).heading || "").trim()) ? right : left).appendChild(memNest(n)); }
@@ -1514,7 +1625,8 @@
       const ws = Array.isArray(view.wraps) ? view.wraps.length : 0;
       const bits = memCogBits(view);
       const graph = cog.find((n) => pid(n) === "graph") || cog[0];
-      if (!ws) {
+      // only a wraps panel that has landed empty means no history: one still being read, or one that failed, keeps its tab and its shell
+      if (!ws && !(view.loading && view.loading.wraps) && !(view.failed && view.failed.wraps) && !(view.errors && view.errors.wraps)) {
         // no wrap yet: no history to tab to, so no tab row and no second panel; the card is the title and its one line
         for (const n of cog) { const t = n.querySelector(".ck-tabs"); if (t) t.remove(); if (n !== graph) n.remove(); }
         cog.splice(0, cog.length, graph);
@@ -1694,6 +1806,14 @@
   function renderGraph(entry, view) {
     const p = panel(entry, true);
     const series = view.wraps || [];
+    // the wraps panel the trace is drawn from still being read: loading, never "needs two consolidations"
+    if (view.loading && view.loading.wraps) {
+      const w = el("p", "empty loading", "loading wraps…");
+      w.setAttribute("role", "status");
+      w.dataset.waits = "wraps";
+      p.appendChild(w);
+      return p;
+    }
     if (series.length < 2) {
       const err = tierErr(view, "wraps");
       p.appendChild(el("p", "empty",
@@ -4769,6 +4889,7 @@
       p.appendChild(el("p", "err", "unavailable — " + data.error));
       return p;
     }
+    if (data.loading) { p.setAttribute("aria-busy", "true"); p.appendChild(loadingLine(entry)); return p; }
     // Governed compose affordance: mount it when the surface is writable (commitAction injected)
     // AND the panel declares an `action` whose verb is in the server's registered action_verbs.
     // Mounted under the head (mountCaptureBox) so it sits on top + the expand-to-modal transplants
@@ -7588,6 +7709,27 @@
     const host = document.getElementById("ck-needs");
     if (!host) return;
     needsViewRef = view;
+    // the decisions panel not read yet: the strip says so, and neither the count nor the badge is set from an absent list
+    if (((view.extra_panels || {}).decisions || {}).loading) {
+      const w = el("p", "empty loading", "loading what needs you\u2026");
+      w.dataset.waits = "decisions";
+      host.replaceChildren(w);
+      host.setAttribute("aria-busy", "true");
+      host.hidden = false;
+      host.dataset.sig = "loading";
+      delete host.dataset.waiting;
+      return;
+    }
+    host.removeAttribute("aria-busy");
+    // the decisions read failed (or was released, never answered): the strip says so, and neither the count nor the badge is set from it
+    const decErr = ((view.extra_panels || {}).decisions || {}).error;
+    if (typeof decErr === "string" && decErr) {
+      host.replaceChildren(errorLine("unavailable — " + decErr));
+      host.hidden = false;
+      host.dataset.sig = "failed";
+      delete host.dataset.waiting;
+      return;
+    }
     const lines = ((view.extra_panels || {}).decisions || {}).lines;
     const all = needsItems(lines);
     const laterYou = needsLaterItems(lines, "you"), laterDesk = needsLaterItems(lines, "desk");
@@ -11207,5 +11349,5 @@ for (const type of ["touchstart", "wheel", "pointerdown", "click", "keydown"]) d
 
   window.LevainAgentPage = { open: openAgentPage };
   window.LevainNeeds = { items: (lines) => needsWaiting(needsItems(lines)), name: needsName, summary: needsSummary, go: needsGo, canGoFirst: needsCanGoFirst, goFirst: needsGoFirst, history: openDecisionsHistory };
-  window.LevainDashboard = { dayYearWords, render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
+  window.LevainDashboard = { dayYearWords, releaseLoading, render: renderKeepingPlace, redraw: ckRedraw, openCustom, composeDrop, adoptPanel, captureField, restoreField, captureKept, settleKept, buildKept: () => buildKept, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, editHoldsRefresh, dropBoxText, setDropBoxText, dropBoxIsOff, jobsActive: () => _activeJobs.size > 0, fitLineTile, lineTileCount: () => lineFits.size, noteBodyCount: () => noteBodies.size };
 })();

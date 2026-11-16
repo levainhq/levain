@@ -28,17 +28,20 @@
   // A FAILED first read (a radio still waking on foreground, a proxy hiccup) used to leave the cold "connecting…" line and an empty
   // board with nothing to try again until the next foreground: Phill 11-06 saw both phones sit there. Until a board has been drawn
   // once, a failure says so in the line and re-reads on a short backoff (and when the network returns); a refusal (token) is not retried.
-  // `everDrawn` is any draw (a part counts: it ends the cold placeholder and the partial draws); `wholeDrawn` is a WHOLE board, and it is what
+  // `wholeDrawn` is a WHOLE board (a part does not count), and it is what
   // ends the retry: a read that fails after a part was drawn leaves the reader a part, so it is retried like a first read that drew nothing.
   // What bounds the chain: one timer at a time (retryT), the backoff below (2, 4, 8, 15 s, then 30 s for as long as the server keeps failing,
   // the same as before a part was ever drawn), and it ends at the first whole draw or a refusal; a persistently failing server is read once
   // per 30 s, never in a tight loop.
-  let everDrawn = false, wholeDrawn = false, retryN = 0, retryT = 0, retryMs = 0, refusedStop = false;
+  let wholeDrawn = false, retryN = 0, retryT = 0, retryMs = 0, refusedStop = false;
   let holdT = 0, holdSpent = false;     // the watchdog on an inert part (boardMark): its timer, and whether it has already released the page
   // a refusal travels as a typed property, never as message text (a connection-refused network error must still retry)
   function refusal(msg) { const e = new Error(msg); e.refused = true; return e; }
   const RETRY_MS = [2000, 4000, 8000, 15000, 30000];
-  function drawnOnce(whole) { if (wholeDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; everDrawn = true; if (whole === true) wholeDrawn = true; refusedStop = false; retryN = 0; clearTimeout(retryT); retryT = 0; }
+  // A draw ends the cold line's fault text and a queued retry; only a WHOLE draw resets the backoff. A part (the shells, or what a read has
+  // landed so far) is drawn on every read of a board not yet whole, so if it reset the backoff a read that kept failing after its part (the
+  // whole draw throwing, a later step rejecting) would be retried every 2 s for good.
+  function drawnOnce(whole) { if (wholeDrawn === false && storeEl && /^(can't reach the cockpit|the cockpit refused)/.test(storeEl.textContent || "")) storeEl.textContent = ""; if (whole === true) { wholeDrawn = true; retryN = 0; } refusedStop = false; clearTimeout(retryT); retryT = 0; }
   // WHOLE OR PART. The first board draws in parts (S4: the Needs strip and the core panels as they land), and the whole draw then REPLACES
   // every node, so anything a reader or a test did on a part would be lost under them. Two things keep that from mattering:
   // - `html[data-board-whole]` is the positive "nothing more is coming that would replace this board" signal. It is set by the code that has
@@ -49,9 +52,10 @@
   //   page is not ready from the first byte. A deep link's jump (dashboard_core.js) and the test driver wait for it.
   // - ONE bound, a clock: the first inert part arms a watchdog (BOARD_HOLD_MS, below) that releases the page as it is when it fires, whatever
   //   the reads are doing (a hung read, a dead server, retries re-queued behind a read in flight). Any boardMark(true) clears it; a further
-  //   partial draw does not re-arm it, and after it has fired the same cold read draws no more partial boards, so the bound is from the
-  //   FIRST inert part and a stream of partial redraws cannot extend it. After it releases, a later whole draw replaces the board like any
-  //   redraw. No count of failures releases the part.
+  //   partial draw does not re-arm it, but a panel read that settles does (boardProgress): the bound is a stretch with no panel answering, so a
+  //   slow board that is still answering is not released half-loaded, and a dead server or a hung read still is. After it has fired the same
+  //   cold read draws no more partial boards. When it releases, every panel still loading is drawn as unavailable (releaseShells), never
+  //   left pulsing; a later whole draw replaces the board like any redraw. No count of failures releases the part.
   // - while only a part is drawn the regions the draw replaces are `inert`, so nothing in them can be focused, clicked or opened; the whole
   //   draw replaces their children and drops `inert` in the same synchronous turn (dashboard.css dims them). The masthead and the nav (the
   //   tabs, the theme switch, Sync, a deep link's jump targets) are not in the list and stay live. The list is the page's own: #board holds
@@ -70,7 +74,18 @@
       if (h && typeof h.setAttribute === "function") { if (whole) h.setAttribute("data-board-whole", ""); else h.removeAttribute("data-board-whole"); }
     } catch (_) { /* a page without these nodes (the node harnesses) has no board to mark */ }
     if (whole) { clearTimeout(holdT); holdT = 0; }
-    else if (!holdT && !holdSpent) holdT = setTimeout(function () { holdT = 0; holdSpent = true; boardMark(true); }, BOARD_HOLD_MS);
+    else if (!holdT && !holdSpent) armHold();
+  }
+  function armHold() {
+    // the panels whose bodies are in hand (the draw is only waiting, on an edit) keep their shells: only a read that has not landed is released
+    holdT = setTimeout(function () { holdT = 0; holdSpent = true; boardMark(true); releaseShells("no answer in " + BOARD_HOLD_MS / 1000 + " s", Object.keys(bootLanded)); }, BOARD_HOLD_MS);
+  }
+  // a panel read of the CURRENT read settled: the board is still answering, so the watchdog's stretch starts again (only a watchdog already armed)
+  function boardProgress() { if (holdT) { clearTimeout(holdT); armHold(); } }
+  // every panel shell still loading, but those named in `keep`, is drawn as unavailable with the reason (the render core's own), so nothing
+  // pulses for a read that is not coming
+  function releaseShells(why, keep) {
+    try { const d = window.LevainDashboard; if (d && typeof d.releaseLoading === "function") d.releaseLoading(why, keep); } catch (_) { /* nothing drawn to release */ }
   }
   function retryUntilDrawn(why, refused) {
     if (wholeDrawn) return;
@@ -79,6 +94,7 @@
     if (refused) {
       refusedStop = true;
       if (storeEl) { storeEl.hidden = false; storeEl.textContent = "the cockpit refused this device (" + why + "); pair it again or reload"; }
+      releaseShells("the cockpit refused this device");     // shells drawn before the refusal would otherwise load for good
       return;
     }
     if (storeEl) { storeEl.hidden = false; storeEl.textContent = "can't reach the cockpit yet (" + why + "), trying again…"; }
@@ -134,7 +150,14 @@
   // `storage` never fires in the document that changed the token, so every same-page set or remove announces it here
   // for the zones that follow the token (the Threads zone); other tabs still arrive through `storage`.
   const TOKEN_CHANGE_EVENT = "levain:write-token-change";
-  function announceTokenChange() { try { window.dispatchEvent(new Event(TOKEN_CHANGE_EVENT)); } catch (_) { /* no events */ } }
+  function announceTokenChange() { forgetLanded(); try { window.dispatchEvent(new Event(TOKEN_CHANGE_EVENT)); } catch (_) { /* no events */ } }
+  // The panels that landed for a cold board no whole draw has yet replaced: a later read of it (a foreground that superseded a stuck read, a
+  // retry, a read deferred for an edit) paints them again at once, and reads every panel again as it always did. They are bodies read as
+  // ONE credential: `bootLandedAs` names it (the manifest's credential class and the stored token), and a token set or dropped on this page,
+  // or a read that finds another credential (another tab changed the token), forgets them, so a page never draws a body read as a
+  // credential it no longer holds.
+  let bootLanded = Object.create(null), bootLandedAs = null;
+  function forgetLanded() { bootLanded = Object.create(null); bootLandedAs = null; }
   // Set by pair.js when this browser was paired by a link: its key is a DEVICE key, so when it is refused the way back is
   // pairing again from a paired device, never typing the owner's token (P2 L3 r1 F6). MUST equal pair.js PAIRED_MARK_KEY.
   const PAIRED_MARK_KEY = "levain_paired_device";
@@ -173,9 +196,10 @@
   }
   // END conditional panel read
   // BEGIN progressive draw
-  // The first board is drawn as its panels land, never held for the whole set: the manifest, then the panels the page's
-  // top (the hero, the brief, the Needs strip's `decisions`) is made of, then the rest as each one answers. These are the
-  // pure parts: which ids are read first, the manifest narrowed to the panels in hand, and the pacing of the partial draws.
+  // The first board is drawn as its panels land, never held for the whole set: the manifest, then at once every panel's shell
+  // (each one loading, a third state beside drawn and unavailable), then each panel as its read answers, the Needs strip's panel
+  // first and the page's top (the hero, the brief) next. These are the pure parts: which ids are read first, the board in hand
+  // (a landed panel's body, a loading marker for each one still out), and the pacing of the draws.
   const PARTIAL_GAP_MS = 250;        // two partial draws are at least this far apart, and at least PARTIAL_IDLE x the last draw's own time (a slow phone renders slowly)
   const PARTIAL_IDLE = 4;
   const PANEL_TIMEOUT_MS = 30000;    // a panel that has not answered by then is drawn as its own failure, the rest of the board stays usable
@@ -184,37 +208,24 @@
   // slow lands its whole draw first and the release is for a read that is hung or a server that is dead.
   const BOARD_HOLD_MARGIN_MS = 30000;
   const BOARD_HOLD_MS = PANEL_TIMEOUT_MS + BOARD_HOLD_MARGIN_MS;
+  // The panel the NEEDS YOU strip and its band are drawn from: read before any other.
+  const NEEDS_PANELS = ["decisions"];
   function drawOrder(manifest, ids) {
     const r = (manifest && manifest.regions) || {};
-    const core = [];
-    for (const id of [].concat(r.hero || [], r.brief || [], ["decisions"])) if (ids.indexOf(id) >= 0 && core.indexOf(id) < 0) core.push(id);
-    return { core: core, order: core.concat(ids.filter((id) => core.indexOf(id) < 0)) };
+    const first = [];
+    for (const id of [].concat(NEEDS_PANELS, r.hero || [], r.brief || [])) if (ids.indexOf(id) >= 0 && first.indexOf(id) < 0) first.push(id);
+    return first.concat(ids.filter((id) => first.indexOf(id) < 0));
   }
-  function manifestSubset(manifest, have) {
-    const keep = (a) => Array.isArray(a) ? a.filter((id) => have.has(id)) : a;
-    const m = Object.assign({}, manifest);
-    m.panels = {};
-    for (const id of Object.keys(manifest.panels || {})) if (have.has(id)) m.panels[id] = manifest.panels[id];
-    if (manifest.regions && typeof manifest.regions === "object") {
-      const r = Object.assign({}, manifest.regions);
-      for (const k of ["hero", "brief", "widgets", "header"]) if (Array.isArray(r[k])) r[k] = keep(r[k]);
-      if (Array.isArray(r.zones)) {
-        const own = (a) => Array.isArray(a) ? a.filter((id) => have.has(id)) : [];
-        r.zones = r.zones.filter((z) => z && typeof z === "object").map((z) => {
-          const zz = Object.assign({}, z);
-          zz.panels = own(z.panels);
-          if (Array.isArray(z.cards)) zz.cards = z.cards.filter((c) => c && typeof c === "object").map((c) => Object.assign({}, c, { panels: own(c.panels) })).filter((c) => c.panels.length);
-          return zz;
-        }).filter((z) => z.panels.length);
-      }
-      m.regions = r;
-    }
-    return m;
+  // The panels the board is drawn from: each landed panel's own record, and a loading marker for every one still out.
+  // (a cold board that is not yet whole keeps what an earlier read of it landed: `bootLanded`, below, is the seed it is drawn from again)
+  function boardPanels(ids, landed) {
+    const out = Object.create(null);
+    for (const id of ids) out[id] = Object.prototype.hasOwnProperty.call(landed, id) ? landed[id] : { loading: true };
+    return out;
   }
-  // draw(settledCount) is called when the core panels are all in, then after each later panel at most once per PARTIAL_GAP_MS,
+  // draw(settledCount) is called by first() at once (the shells), then after each panel that lands at most once per PARTIAL_GAP_MS,
   // and never for the last panel (the full draw is the caller's). `stop` cancels a pending one.
-  function partialPacer(core, total, draw, clock) {
-    const waiting = new Set(core);
+  function partialPacer(total, draw, clock) {
     let n = 0, last = -Infinity, gap = PARTIAL_GAP_MS, timer = null, done = false;
     const fire = () => {
       timer = null; if (done) return;
@@ -227,9 +238,10 @@
       }
     };
     return {
-      settled: function (id) {
-        n++; waiting.delete(id);
-        if (done || waiting.size || n >= total) return;
+      first: fire,
+      settled: function () {
+        n++;
+        if (done || n >= total) return;
         if (timer !== null) return;
         const wait = last + gap - clock.now();
         if (wait <= 0) fire(); else timer = clock.setTimeout(fire, wait);
@@ -1177,7 +1189,8 @@
     window.dispatchEvent(new Event("levain:threads-off"));   // the zone's sync listens on this one event
   }
 
-  async function loadManifestView(passive, onPartial) {
+  // `isCurrent()`: this read is still the page's current one (a superseded read's late answers write nothing the board keeps)
+  async function loadManifestView(passive, onPartial, isCurrent) {
     const usedToken = storedToken();      // the credential this read goes out with: a decline drops that one, never a newer one
     let manifest;
     try { manifest = await authedReadJson("/cockpit/manifest.json"); }   // settles the token: panels do not re-prompt
@@ -1202,23 +1215,41 @@
     const panelHeads = Object.create(null);   // panel url -> the manifest's head for it, the source of the fields an ETag leaves out
     for (const id of ids) panelHeads[panelUrl(id)] = manifest.panels[id];
     const panels = Object.create(null);
+    // the credential this board is read as: the bodies kept from an earlier read are drawn again only if they were read as it, and a body
+    // this read lands is kept only while the page still holds it (a token dropped mid-read forgets the kept ones, see forgetLanded)
+    const credOf = () => { const c = manifest.credential; return (c && typeof c.class === "string" ? c.class : "") + "\n" + storedToken(); };
+    const readAs = credOf();
+    const sameAs = () => credOf() === readAs;
+    if (onPartial && isCurrent() && bootLandedAs !== readAs) { bootLanded = Object.create(null); bootLandedAs = readAs; }
+    const seed = onPartial && bootLandedAs === readAs ? Object.assign(Object.create(null), bootLanded) : null;
     // One shared re-auth for the batch: if the token rotated after the manifest read, every panel 403s
     // together, so the first one prompts (or drops the dead token) and the rest wait on that same answer.
     let reauth = null;
-    const fetchPanel = (url, signal) => fetchPanelConditional(url, panelHeads[url], signal);
+    // each panel's last attempt went out as this credential (a re-auth's second attempt goes out as the new one): what its body was read as
+    const sentAs = Object.create(null);
+    const fetchPanel = (url, signal) => { sentAs[url] = credOf(); return fetchPanelConditional(url, panelHeads[url], signal); };
+    // THE credential check, the one every draw of this read takes its bodies through (each part, and the whole): a body is drawn only
+    // while the page holds the credential it was read as, the kept seed (read as `readAs`) and each body this read landed alike; a failed
+    // read carries no body and is always drawn. A page never draws a body read under a credential it no longer holds.
+    const drawable = () => {
+      const now = credOf(), out = Object.create(null);
+      if (seed && now === readAs) Object.assign(out, seed);
+      for (const id of Object.keys(panels)) {
+        const p = panels[id];
+        if ((p && p.error !== undefined) || sentAs[panelUrl(id)] === now) out[id] = p;
+      }
+      return out;
+    };
     pruneHeldPanels(ids);
     // At most PANEL_READ_CONCURRENCY panel reads are in flight, the rest queue in manifest order: one page
     // bursting ~28 reads at once, or two open pages, would otherwise meet the server's concurrency cap.
     // Every read settles (the worker catches its own failure) and so frees its slot.
-    const plan = drawOrder(manifest, ids);
-    const queue = plan.order.slice();
-    // a cold first board draws as its panels land (onPartial); a refresh keeps showing the last board until the new one is whole
-    const pacer = onPartial ? partialPacer(plan.core, ids.length, (n) => {
-      const build = () => {
-        const have = new Set(Object.keys(panels));
-        return window.LevainCockpitView.fromManifest({ manifest: manifestSubset(manifest, have), panels: Object.assign(Object.create(null), panels) }, { elapsedMs: Date.now() - fetchedAt });
-      };
-      onPartial(build, n, ids.length);
+    const queue = drawOrder(manifest, ids);
+    // a cold first board draws every panel's shell at once and then each panel as it lands (onPartial); a refresh keeps showing the
+    // last board until the new one is whole
+    const pacer = onPartial ? partialPacer(ids.length, (n) => {
+      const build = () => window.LevainCockpitView.fromManifest({ manifest: manifest, panels: boardPanels(ids, drawable()) }, { elapsedMs: Date.now() - fetchedAt });
+      onPartial(build, n, ids.length, () => ids.filter((id) => Object.prototype.hasOwnProperty.call(drawable(), id)).length);
     }, { now: Date.now, setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (t) => clearTimeout(t) }) : null;
     const clock = { setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (t) => clearTimeout(t) };
     const io = {
@@ -1241,19 +1272,31 @@
     const readOne = async (id) => {
       try {
         panels[id] = await readPanelBody(panelUrl(id), io);
+        // kept for a later read of this cold board only from the current read, and only while the page holds the credential it was read as
+        if (onPartial && !wholeDrawn && isCurrent() && sameAs() && bootLandedAs === readAs) bootLanded[id] = panels[id];
       } catch (e) {
         // keep the reason: the mapper draws this panel as unavailable with it, never as an empty one
         panels[id] = { error: e && e.message ? e.message : String(e) };
       }
-      if (pacer) pacer.settled(id);
+      if (isCurrent()) boardProgress();     // a superseded read's late answer is no sign the board is answering
+      if (pacer) pacer.settled();
     };
     const worker = async () => { while (queue.length) await readOne(queue.shift()); };
+    if (pacer) pacer.first();     // every panel's shell, loading, before any panel read has been issued
     try { await Promise.all(Array.from({ length: Math.min(PANEL_READ_CONCURRENCY, ids.length) }, worker)); }
     finally { if (pacer) pacer.stop(); }
+    // the whole draw takes its bodies through the same check: a body read as a credential the page no longer holds (a token dropped or
+    // changed while this read was out) ends the read undrawn, and load() reads the board again as the credential the page holds now
+    const held = drawable();
+    if (ids.some((id) => !Object.prototype.hasOwnProperty.call(held, id))) {
+      const e = new Error("the write token changed while the board was read");
+      e.credentialChanged = true;
+      throw e;
+    }
     // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
     // resyncs over these ids, and the poll fallback compares the etags
     heldNext = Object.fromEntries(ids.map((id) => [id, { etag: panels[id] && panels[id].error !== undefined && panels[id].status === undefined ? null : (manifest.panels[id] || {}).etag || null }]));
-    return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels }, { elapsedMs: Date.now() - fetchedAt });
+    return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: held }, { elapsedMs: Date.now() - fetchedAt });
   }
 
   async function load(opts) {
@@ -1280,7 +1323,7 @@
     inflightAt = Date.now();
     inflightPassive = passive;
     const myGen = ++loadGen;
-    let landed = false;
+    let landed = false, reread = false;
     if (btn) btn.disabled = true;
     try {
       if (fragmentTokenPending) await fragmentTokenPending;   // a link's token is being checked: read with the token that settles
@@ -1296,20 +1339,23 @@
           } catch (e) { live = liveBefore; throw e; }
         };
         let partialDrawn = false;
-        const onPartial = everDrawn ? null : (build, n, total) => {
+        // a board not yet whole draws as it lands, on every read of it: a second read of a cold board (the first superseded, or failed after a part)
+        // keeps the shells and what had landed, never waits for its whole set
+        const onPartial = wholeDrawn ? null : (build, n, total, landedCount) => {
           runPartial(() => myGen === loadGen && !editInProgress() && !holdSpent, build, (pview) => {     // holdSpent: the watchdog released the page, it is not made inert again
             boardMark(false);     // a part: inert, and not whole (before the draw, so a draw that throws midway still leaves nothing to act on)
             drawView(pview);
-            partialDrawn = true;
+            if (landedCount() > 0) partialDrawn = true;     // the shells alone are not a part, so they never make the whole draw refuse for an edit
             if (storeEl) storeEl.removeAttribute("data-cold");
             drawnOnce();
             status("reading " + n + " of " + total + " panels...");
           });
         };
-        const mview = await loadManifestView(passive, onPartial);
+        const mview = await loadManifestView(passive, onPartial, () => myGen === loadGen);
         if (myGen !== loadGen) return false;     // superseded while it was stuck: the newer read owns the board
         if (!mayDrawWhole(passive, partialDrawn, editInProgress())) { notice = null; return refuseForEdit(); }
         drawView(mview);
+        bootLanded = Object.create(null);
         boardMark(true);     // the whole board, drawn: live, and the signal, in this same turn
         if (heldNext) {    // published once drawn: only then can a panel be refetched in place
           window.LevainCockpitHeld = heldNext;
@@ -1370,6 +1416,9 @@
       return true;
     } catch (e) {
       if (myGen !== loadGen) return false;     // a superseded read's failure says nothing about the page now
+      // the token changed while the board was read (nothing of it was drawn as the credential the page no longer holds): no failure and no
+      // backoff, the board is read again at once as the page's credential now, as a passive read (an open edit defers it, see refuseForEdit)
+      if (e && e.credentialChanged) { reread = true; return false; }
       status("read failed: " + (e && e.message ? e.message : e));
       const refused = !!(e && e.refused);
       // a part with the watchdog armed stays inert and unsigned (the retry's whole draw replaces it and sets the signal, or the watchdog
@@ -1385,6 +1434,8 @@
       // Run a reload that arrived (authoritative, non-passive) while we were in flight.
       // Always non-passive → never deferred, so a saved edit's state always lands.
       if (pendingReload) { pendingReload = false; load(); }
+      // a read that ended because the token changed under it (see the catch above) is made again now
+      else if (reread) load({ passive: true });
       // a passive read dropped because THIS load was in flight is still owed: flush once this one has rendered
       // (never after a failed read, which would loop on a dead server)
       else if (landed) flushIfIdle();
