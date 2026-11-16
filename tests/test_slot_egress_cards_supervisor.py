@@ -873,13 +873,14 @@ _TABLE_BASE = {"format": "levain-routes-base/1", "routes": [
      "upstream": {"scheme": "https", "host": "up.example.net", "base_path": "/"}},
     {"route": "github", "type": "egress", "hosts": ["github.com", "codeload.github.com"]},
     {"route": "mirror", "type": "egress", "hosts": ["pypi.mirror.example.org"]},
-    {"route": "pt", "type": "subscription_passthrough", "hosts": ["claude.ai"]}]}
+    {"route": "pt", "type": "subscription_passthrough", "hosts": ["claude.ai"]},
+    {"route": "gateway", "type": "brokered", "hosts": ["llm.gateway.example.net"]}]}
 
 
 @pytest.mark.parametrize("host", ["api.anthropic.com", "github.com", "codeload.github.com", "pypi.mirror.example.org",
                                   "claude.ai", "api.openai.com", "auth.openai.com", "chatgpt.com", "console.anthropic.com",
                                   "platform.claude.com", "up.example.net", "files.example.org", "github.com.example.org",
-                                  "example.org"])
+                                  "example.org", "llm.gateway.example.net"])
 def test_m1_the_lanes_routed_set_is_roots_host_class_over_a_table(host: str) -> None:
     """The lane's filter and root's refusal cannot drift: ``routed_hosts`` over the base map the session read says a
     host is routed exactly when ``egress_verify.host_class`` over the same map refuses it ``egress-grant-host-routed``
