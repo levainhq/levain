@@ -615,10 +615,11 @@ def test_render_order_observed(world):
         ("front", 898, [H.GO_FD], {H.GO_FD_ENV: str(H.GO_FD)}, None)
     # 3b-8a: the gateway front runs with root's args (its listener, policy, log, keys' socket, the GO fd).
     gw = world.R / "gw" / "slot0"
-    assert spec["argv"][-13:] == [H.FRONT_MODULE, "--unix", str(gw / "gw.sock"), "--slot-uid", "899",
+    assert spec["argv"][-17:] == [H.FRONT_MODULE, "--unix", str(gw / "gw.sock"), "--slot-uid", "899",
                                   "--policy", str(gw / "session.json"),
                                   "--log", str(world.L / "gw" / "slot0" / "front.log"),          # 3b-8a T1
-                                  "--keys", str(world.R / "keys" / "front.sock"), "--go-fd", str(H.GO_FD)]
+                                  "--keys", str(world.R / "keys" / "front.sock"), "--go-fd", str(H.GO_FD),
+                                  "--grants", str(world.R / "grants" / "slot0" / "grants.json"), "--slot", "0"]
     assert world.fronts.alive() == [pid]                                # left running, detached
 
 
