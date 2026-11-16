@@ -817,16 +817,15 @@ def unseen_event(conn: sqlite3.Connection, ln: Any) -> str | None:
     start = _launch_start(conn, ln.launch_id)
     if start is None:
         return None
-    for (eid,) in conn.execute("SELECT event_id FROM events WHERE trust != 'untrusted' ORDER BY gseq").fetchall():
-        row = conn.execute(f"SELECT kind, gseq FROM event_states WHERE event_id = ? AND {_in('kind', LIFECYCLE)} "
-                           "ORDER BY seq DESC LIMIT 1", (eid,)).fetchone()
-        if row is None or row[0] not in _AVAILABLE:
-            continue
-        in_brief = conn.execute("SELECT 1 FROM event_states WHERE event_id = ? AND kind = 'claimed' AND launch_id = ?",
-                                (eid, ln.launch_id)).fetchone() is not None
-        if not in_brief or row[1] > start:
-            return eid
-    return None
+    # ONE statement: the write transaction a watcher pass holds does not pay a per-event round trip for every event
+    # ever stored (settled ones are the great majority); the same reading the loop made, oldest first
+    row = conn.execute(
+        "SELECT e.event_id FROM events e JOIN event_states l ON l.event_id = e.event_id AND l.seq = "
+        f"(SELECT MAX(s.seq) FROM event_states s WHERE s.event_id = e.event_id AND {_in('s.kind', LIFECYCLE)}) "
+        f"WHERE e.trust != 'untrusted' AND {_in('l.kind', _AVAILABLE)} AND (l.gseq > ? OR NOT EXISTS "
+        "(SELECT 1 FROM event_states c WHERE c.event_id = e.event_id AND c.kind = 'claimed' AND c.launch_id = ?)) "
+        "ORDER BY e.gseq LIMIT 1", (start, ln.launch_id)).fetchone()
+    return None if row is None else row[0]
 
 
 # --- the brief ------------------------------------------------------------------------------------------------------

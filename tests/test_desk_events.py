@@ -1492,6 +1492,29 @@ def test_a_pass_still_moves_the_open_events_among_settled_ones(store, clock, tmp
     assert [e.event_id for e in got] == [posted.event.event_id]
 
 
+def test_the_done_desk_check_costs_the_same_at_any_count_of_settled_events(store, clock, tmp_path):
+    """levain#69 finding 2, `unseen_event` (read by the watcher's replace-a-done-desk pass, in the coord write
+    transaction): the statements it costs do not grow with the settled events ever stored."""
+    cred = sensor(store, tmp_path)
+    down(store, cred, 1)
+    ln = store.pending_desk()
+    assert store.launch_claim_spawn(ln.launch_id, 1)[1] is None
+    launch_mod._brief_text(store, ln)                                # its brief takes event 1
+    activate(store, ln.launch_id)
+
+    def check():
+        assert store.launch_replace_done(ln.launch_id) is None       # nothing unseen waits: the desk stays
+
+    _settled_beats(store, clock, cred, 5, first=10)
+    clock.advance(hours=3)
+    few = _statements(store, check)
+    _settled_beats(store, clock, cred, 40, first=15)
+    clock.advance(hours=3)
+    many = _statements(store, check)
+    print("MEASURE launch_replace_done statements, 5 vs 45 settled events:", few, many)
+    assert many == few, (few, many)
+
+
 # ---- ND-5: the sixth incident in a night writes one open ping (levain#15; design 2.4, 8.1) -------------------------
 def _cap_pings(pinger):
     return [p for p in pinger.sent if "incidents" in p["body"]]
