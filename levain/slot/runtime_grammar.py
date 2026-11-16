@@ -88,7 +88,7 @@ _HANDLE_RE = re.compile(r"[A-Za-z0-9_-]{43}", re.ASCII)
 
 RENDER_FORMAT = "levain-session-render/1"
 RENDER_KEYS = frozenset({"format", "vendor", "routes", "model", "git_identity", "hooks", "mcp",
-                         "allow_own_loopback", "repo_label", "verifier_steps", "driver", "repo_settings"})
+                         "allow_own_loopback", "repo_label", "verifier_steps", "driver", "repo_settings", "web_search"})
 #: The top-level keys of a repo's settings that travel in ``repo_settings`` (frozen into the root-owned layer at render),
 #: and the only permission lists among them. No ``env`` key: a repo's env never reaches the rendered layer; no plugin
 #: key: a repo's plugins are dropped at the freeze.
@@ -99,6 +99,7 @@ RENDER_REQUIRED = frozenset({"format", "vendor", "routes"})
 HOOKS = frozenset({"levain_gate", "levain_queue"})
 
 _ROUTE_ID_RE = re.compile(r"[a-z0-9-]{1,48}", re.ASCII)                 # §4.3 policy ``route``
+_MODE_RE = re.compile(r"[A-Za-z0-9_.-]{1,32}", re.ASCII)                        # a requested web_search mode (render vets it)
 _MODEL_RE = re.compile(r"[A-Za-z0-9._:/-]{1,128}", re.ASCII)           # §5.3 model
 _GIT_NAME_RE = re.compile(r"[^\x00-\x1f<>]{1,64}")                      # §5.3 git_identity.name
 _GIT_EMAIL_RE = re.compile(r"[^\x00-\x1f\s<>]{3,254}")                  # §5.3 git_identity.email
@@ -173,6 +174,7 @@ class RenderBlob:
     verifier_steps: tuple[VerifierStep, ...] | None = None
     driver: str | None = None
     repo_settings: Mapping[str, Any] | None = None
+    web_search: str | None = None     # a Codex search mode the caller ASKS for; render admits only its pin
 
 
 SlotConfig = Mapping[str, Union[int, Collection[int]]]
@@ -482,13 +484,14 @@ def _render_blob(obj: dict) -> RenderBlob:
     steps = _verifier_steps(obj["verifier_steps"]) if "verifier_steps" in obj else None
     driver = _str(obj["driver"], "driver", _TEMPLATE_RE) if "driver" in obj else None
     repo_settings = _repo_settings(obj["repo_settings"]) if "repo_settings" in obj else None
+    web_search = _str(obj["web_search"], "web_search", _MODE_RE) if "web_search" in obj else None
     # §5.3 + §5.6: both are verifier-only. DECISION: they travel together (a driver with no steps, or
     # steps with no driver, describes no verifier session).
     if (steps is None) != (driver is None):
         raise Refused("verifier-keys-unpaired", "verifier_steps and driver travel together")
     return RenderBlob(vendor=vendor, routes=routes, model=model, git_identity=git, hooks=hooks, mcp=mcp,
                       allow_own_loopback=loopback, repo_label=label, verifier_steps=steps, driver=driver,
-                      repo_settings=repo_settings)
+                      repo_settings=repo_settings, web_search=web_search)
 
 
 def parse_stdin(verb: str, raw_bytes: bytes) -> PrepareInput | RenderBlob | None:
