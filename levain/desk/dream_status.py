@@ -36,7 +36,7 @@ from levain.cockpit.consent import parse_stamp
 from levain.desk.review import FEEDS
 
 __all__ = ["DREAM_NOTE", "DREAM_UNREAD", "SHADOW_REMEDY", "STALE_HOURS", "DreamRecord", "records", "rotation_due",
-           "seam_note", "status_lines"]
+           "seam_check", "seam_note", "status_lines"]
 
 assert "agent" in FEEDS
 
@@ -64,22 +64,33 @@ class DreamRecord:
     occurrence: str
 
 
-def records(conn: sqlite3.Connection) -> list[DreamRecord]:
+def records(conn: sqlite3.Connection, strict: bool = False) -> list[DreamRecord]:
     """The dream cards of the ``agent`` feed, newest first, a shadow night's save left out. A store with no
-    ``review_items`` table has none. A card whose body cannot be read is skipped (the rest stand)."""
+    ``review_items`` table has none. A card whose body cannot be read is skipped (the rest stand): the brief's
+    display. ``strict`` (the rotation's read, :func:`seam_check`) raises :class:`ValueError` instead, naming the
+    card, for a body that is not a JSON object with a text ``kind``, a stamp that is not text, and a save or rollback
+    card with no occurrence id: a rollback that cannot be paired with its save would leave that save live, so the
+    predicate fails closed where the display skips."""
     if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'review_items'").fetchone() is None:
         return []
     marks = " OR ".join("dedupe_key LIKE ?" for _ in _PREFIXES)
     out: list[DreamRecord] = []
-    for at, body in conn.execute(f"SELECT at, body FROM review_items WHERE feed = 'agent' AND ({marks}) "
-                                 "ORDER BY at DESC, rowid DESC LIMIT 200", [p + "%" for p in _PREFIXES]):
+    for at, body, key in conn.execute(f"SELECT at, body, dedupe_key FROM review_items WHERE feed = 'agent' AND "
+                                      f"({marks}) ORDER BY at DESC, rowid DESC LIMIT 200",
+                                      [p + "%" for p in _PREFIXES]):
         try:
             doc = json.loads(body)
             kind = doc["kind"]
             occ = doc.get("occurrence")
             occurrence = str(occ.get("id")) if isinstance(occ, dict) else ""
             shadow = str(doc.get("remedy", "")).startswith(SHADOW_REMEDY)
-        except (ValueError, KeyError, TypeError, AttributeError):
+            unpaired = kind in ("consolidated", "rolled-back") and (not isinstance(occ, dict)
+                                                                    or occ.get("id") in (None, ""))
+            if strict and (not isinstance(kind, str) or not isinstance(at, str) or unpaired):
+                raise ValueError("no text kind, no text stamp, or a save or rollback with no occurrence id")
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            if strict:
+                raise ValueError(f"dream card {key} cannot be read ({type(exc).__name__}: {exc})") from None
             continue
         if kind in _KINDS and not (kind == "consolidated" and shadow):
             out.append(DreamRecord(kind, at, occurrence))
@@ -162,54 +173,64 @@ def _claimed_events(conn: sqlite3.Connection, launch_id: str) -> list[str]:
         (launch_id,))]
 
 
-def _unacked_opens(conn: sqlite3.Connection, launch_id: str) -> list[int]:
-    """Opens handed to ``launch_id`` (an ``open_deliveries`` row naming it) that no acknowledgement closed: the desk is
-    still taking in a brief (``levain.desk.seam_open``; acked as :func:`levain.desk.seam_arrival.is_acked` reads it)."""
+def _unacked_opens(conn: sqlite3.Connection, launch_id: str, session_key: str) -> list[int]:
+    """Opens handed to ``launch_id`` (an ``open_deliveries`` row naming it) that ITS OWN session has not acknowledged:
+    the desk is still taking in a brief (``levain.desk.seam_open``). An ack is keyed ``(open_id, reader_session)``
+    and one build can be handed to several launches (a stored build is returned, never rebuilt, to the next desk), so
+    another session's ack of the same open closes nothing here."""
     from levain.desk.seam_open import open_tables_present
 
     if not open_tables_present(conn):
         return []
     return [r[0] for r in conn.execute(
         "SELECT DISTINCT d.open_id FROM open_deliveries d WHERE d.recipient_launch_id = ? AND NOT EXISTS "
-        "(SELECT 1 FROM open_acks a WHERE a.open_id = d.open_id) ORDER BY d.open_id", (launch_id,))]
+        "(SELECT 1 FROM open_acks a WHERE a.open_id = d.open_id AND a.reader_session = ?) ORDER BY d.open_id",
+        (launch_id, session_key))]
 
 
-def rotation_due(store: object, launch: object) -> tuple[bool, str]:
-    """``(due, why)``: whether the live desk ``launch`` is at a dream seam, i.e. a dream saved memory after it started
-    AND it holds no claimed work and no unacknowledged open. A READ: one read-only transaction
-    (``store.open_readonly``), nothing written, nothing rotated. The launch is re-read from the store by its id, so
-    a stale object decides nothing. Every refusal is ``(False, why)``; a read that fails is ``(False, cannot-derive)``,
-    never a seam.
+def seam_check(conn: sqlite3.Connection, launch_id: str, now: str, *, at_turn_boundary: bool) -> tuple[bool, str]:
+    """``(due, why)`` on the CALLER's connection, inside the caller's transaction, at the store clock ``now``: the
+    one derivation :func:`rotation_due` runs in its own read. The rotation (levain#82) runs it again inside the write
+    transaction that would rotate, so the answer it acts on is the store as that transaction sees it. Writes
+    nothing; raises when the store cannot be read (:func:`rotation_due` turns that into ``cannot-derive``).
 
-    Decision, first match wins:
+    THE INVARIANT. A desk is at a dream seam iff
 
-    1. no launch id, no such launch, or not an ``active`` desk launch: False;
-    2. the newest save no rollback undid is missing or stamped at or before the launch's ``at`` (its request stamp;
-       equal is not after): False, naming a rollback when a save after the start was rolled back; a shadow night's,
-       a failed night's or a night that did not consolidate never counts as a save (:func:`records`);
-    3. a sensor event is ``claimed`` or ``delivered`` to this launch (claimed work): False;
-    4. an open delivered to this launch has no acknowledgement (its open turn: mid-arrival): False;
-    5. otherwise True."""
-    from levain.autonomic.durable_sqlite import read_transaction
+    (A) it is the store's live desk: an ``active`` launch of the desk role whose session holds the live lease;
+    (B) the store holds a dream save it has not loaded: the newest ``consolidated`` card (never a shadow night's) whose
+        occurrence no rollback undid was filed strictly after the launch was requested (``launches.at``);
+    (C) the store hands it nothing it has not closed: no sensor event whose latest lifecycle row is ``claimed`` or
+        ``delivered`` to it, and no open delivered to it that its own session has not acknowledged;
+    (D) its harness is between turns.
+
+    What "open turn" means in the store: nothing. The store records no desk turn (a desk is a terminal session; only
+    worker and room launches write ``turn_started`` / ``turn_ended``). It records an open's ARRIVAL (delivered, then
+    acknowledged by the reader's session) and the work a turn takes on (an event ``claimed`` until ``events.ack``).
+    An acknowledgement is the FIRST act of a turn, never its end, so (C) holding says only that the store hands the
+    desk nothing; an acknowledged open whose events are still claimed fails (C) through the claim. (D) is not on the
+    store at all, so it is the caller's input ``at_turn_boundary``, read where the caller reads it (the session
+    listing, as :func:`levain.desk.lease.replace_done`'s caller reads a done session, or the desk's own ``coord open``
+    before it takes anything new). Only ``True`` (the bool) says "between turns".
+
+    Each False reason is one conjunct failing, in this order (first match wins):
+    (A) no such launch, not an active desk, or its session does not hold the live lease;
+    (B) the save rolled back, all saves rolled back, the save not after the request, or no save at all;
+    (C) a claimed or delivered event, then an open this session has not acknowledged ("mid-work");
+    (D) ``at_turn_boundary`` is not True ("mid-turn")."""
     from levain.desk import lease as _leases
     from levain.desk.legacy import ROLE_DESK
 
-    launch_id = getattr(launch, "launch_id", None)
-    if not isinstance(launch_id, str) or not launch_id:
-        return False, "no launch was named, so no seam can be read"
-    try:
-        with read_transaction(store.open_readonly) as conn:  # type: ignore[attr-defined]
-            ln = _leases.launch(conn, launch_id)
-            if ln is None:
-                return False, f"no launch {launch_id} in this store"
-            if ln.role != ROLE_DESK or ln.state != "active":
-                return False, f"launch {launch_id} is a {ln.state} {ln.role} launch, not an active desk"
-            started = ln.at
-            recs = records(conn)
-            work = _claimed_events(conn, launch_id)
-            opens = _unacked_opens(conn, launch_id)
-    except Exception as exc:  # noqa: BLE001 - a failed read is never a seam
-        return False, f"cannot-derive ({type(exc).__name__}: {str(exc)[:160]})"
+    ln = _leases.launch(conn, launch_id)
+    if ln is None:
+        return False, f"no launch {launch_id} in this store"
+    if ln.role != ROLE_DESK or ln.state != "active":
+        return False, f"launch {launch_id} is a {ln.state} {ln.role} launch, not an active desk"
+    held = _leases.lease(conn, now)
+    if held is None or not held.live or held.holder != ln.session_key:
+        state = "not held" if held is None else "past its until" if not held.live else f"held by {held.holder}"
+        return False, f"launch {launch_id} does not hold the live lease (the lease is {state}), so it is not the live desk"
+    started = ln.at
+    recs = records(conn, strict=True)
     saved, _ = _current(recs)
     if saved is None or saved.at <= started:
         undone = {r.occurrence for r in recs if r.kind == "rolled-back"}
@@ -219,11 +240,49 @@ def rotation_due(store: object, launch: object) -> tuple[bool, str]:
                            "a revert asks for no rotation")
         if saved is not None:
             return False, f"the last dream save ({saved.at}) is not after this desk started ({started})"
+        if any(r.kind == "consolidated" for r in recs):
+            return False, ("every dream save in this store was rolled back, none after this desk started "
+                           f"({started}): no memory to rotate onto")
         return False, ("no dream has saved memory in this store (a failed night, a night that did not consolidate or a "
                        "shadow night's save is not one)")
+    work = _claimed_events(conn, launch_id)
     if work:
-        return False, f"mid-work: {len(work)} sensor event(s) claimed by this desk and not acknowledged ({work[0]})"
+        return False, (f"mid-work: {len(work)} sensor event(s) handed to this desk (claimed or delivered) and not "
+                       f"acknowledged ({work[0]})")
+    opens = _unacked_opens(conn, launch_id, ln.session_key)
     if opens:
-        return False, f"mid-work: open {opens[0]} was handed to this desk and is not acknowledged"
+        return False, f"mid-work: open {opens[0]} was handed to this desk and this desk has not acknowledged it"
+    if at_turn_boundary is not True:
+        return False, ("mid-turn: the store hands this desk nothing open, but the caller has not read a turn boundary "
+                       "(the store records no desk turn, and an acknowledgement begins one)")
     return True, (f"at a seam: the dream that saved at {saved.at} (occurrence {saved.occurrence}) saved after this desk "
-                  f"started ({started}); no claimed event and no unacknowledged open")
+                  f"started ({started}); it holds the live lease, no claimed event and no open it has not "
+                  "acknowledged, and the caller read a turn boundary")
+
+
+def rotation_due(store: object, launch: object, *, at_turn_boundary: bool) -> tuple[bool, str]:
+    """``(due, why)``: whether the live desk ``launch`` is at a dream seam (:func:`seam_check` holds THE INVARIANT and
+    derives every reason from it). A READ: one read-only transaction (``store.open_readonly``, one consistent
+    snapshot), nothing written, nothing rotated. The launch is re-read from the store by its id, so a stale object
+    decides nothing. Every refusal is ``(False, why)``; a read or a derivation that fails is
+    ``(False, cannot-derive)``, never a seam and never a raise.
+
+    ``at_turn_boundary`` has no default: the store cannot say whether the harness is mid-response, so the caller
+    says where it reads the boundary.
+
+    THE CALLER'S CONTRACT (levain#82). True is this snapshot's answer and nothing after it: an event claimed or an
+    open delivered after the read is not in it, and no read can fence a later writer. So the rotation never acts on
+    this answer alone: inside the write transaction that writes the dream handoff and requests the next launch (under
+    the desk's token fence), it runs :func:`seam_check` on that transaction's connection and rotates only on its
+    True. That re-check is the answer it acts on; this one is advisory (what to say, whether to try)."""
+    from levain.autonomic.durable_sqlite import read_transaction
+
+    launch_id = getattr(launch, "launch_id", None)
+    if not isinstance(launch_id, str) or not launch_id:
+        return False, "no launch was named, so no seam can be read"
+    try:
+        with read_transaction(store.open_readonly) as conn:  # type: ignore[attr-defined]
+            now = store._stamp()  # type: ignore[attr-defined]
+            return seam_check(conn, launch_id, now, at_turn_boundary=at_turn_boundary)
+    except Exception as exc:  # noqa: BLE001 - a failed read is never a seam
+        return False, f"cannot-derive ({type(exc).__name__}: {str(exc)[:160]})"
