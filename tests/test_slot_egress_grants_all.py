@@ -27,40 +27,46 @@ OTHER = "s-" + "cd" * 8
 BOOT = "6f1c2a9e-1b2c-4d5e-8f90-0a1b2c3d4e5f"
 
 
+class AllWorld(World):
+    """The S2 world plus whole slots: a subclass, so nothing is patched onto the shared ``World``."""
+
+    def lease(self, idx, session, *, lease_seq=7):
+        """Slot ``e<idx>``: its state file says ``leased`` to ``session``."""
+        slot = SlotId("egress", idx)
+        (self.L / "slots" / slot.tag).mkdir(exist_ok=True)
+        self.put_slot_state(idx, "leased", session, lease_seq)
+
+    def put_slot_state(self, idx, state, session=None, lease_seq=7):
+        slot = SlotId("egress", idx)
+        (self.L / "slots" / slot.tag / "state").write_bytes(R.slot_state_bytes(R.SlotState(
+            slot=slot, rev=12, lease_seq=lease_seq, state=state, dispatch_eligible=False,
+            changed_at="2026-11-16T11:00:00Z", session=session)))
+
+    def put_alloc(self, session, slot, *, kind="interactive", operator=UID, lease_seq=7, name=None):
+        a = R.Alloc(session=session, slot=slot, lease_seq=lease_seq, slot_rev=12, slot_uid=SLOT_UID, slot_gid=SLOT_UID,
+                    kind=kind, vendor="claude", auth="brokered", operator_uid=operator, supervisor_uid=operator,
+                    staging_uid=operator, created_at="2026-11-16T11:00:00Z", boot_id=BOOT,
+                    child_uid=SLOT_UID + 1 if slot.slot_class == "none" else None)
+        (self.L / "alloc" / f"{name or session}.json").write_bytes(R.alloc_bytes(a))
+
+    def add_session(self, idx, session, *, kind="interactive", operator=UID, state=R.ACTIVE, lease_seq=7, grants=()):
+        """A leased slot ``e<idx>`` with an alloc, a CONTROL state record, a grants dir and (optionally) a file, the
+        slot state and the alloc at the same ``lease_seq``."""
+        slot = SlotId("egress", idx)
+        self.lease(idx, session, lease_seq=lease_seq)
+        self.put_alloc(session, slot, kind=kind, operator=operator, lease_seq=lease_seq)
+        self.set_state(state, session)
+        d = self.R / "grants" / f"slot{idx}"
+        if not d.exists():
+            d.mkdir(parents=True)
+            d.chmod(0o750)
+        if grants:
+            write_grants(d, session, idx, grants)
+
+
 @pytest.fixture
 def world(tmp_path):
-    return World(tmp_path)
-
-
-def _lease(self, idx, session, *, lease_seq=7):
-    """Slot ``e<idx>``: its state file says ``leased`` to ``session``."""
-    slot = SlotId("egress", idx)
-    (self.L / "slots" / slot.tag).mkdir(exist_ok=True)
-    self.put_slot_state(idx, "leased", session, lease_seq)
-
-
-def _put_slot_state(self, idx, state, session=None, lease_seq=7):
-    slot = SlotId("egress", idx)
-    (self.L / "slots" / slot.tag / "state").write_bytes(R.slot_state_bytes(R.SlotState(
-        slot=slot, rev=12, lease_seq=lease_seq, state=state, dispatch_eligible=False,
-        changed_at="2026-11-16T11:00:00Z", session=session)))
-
-
-def _add_session(self, idx, session, *, kind="interactive", operator=UID, state=R.ACTIVE, lease_seq=7, grants=()):
-    """A leased slot ``e<idx>`` with an alloc, a CONTROL state record, a grants dir and (optionally) a file."""
-    slot = SlotId("egress", idx)
-    self.lease(idx, session, lease_seq=lease_seq)
-    a = R.Alloc(session=session, slot=slot, lease_seq=7, slot_rev=12, slot_uid=SLOT_UID, slot_gid=SLOT_UID, kind=kind,
-                vendor="claude", auth="brokered", operator_uid=operator, supervisor_uid=operator, staging_uid=operator,
-                created_at="2026-11-16T11:00:00Z", boot_id=BOOT)
-    (self.L / "alloc" / f"{session}.json").write_bytes(R.alloc_bytes(a))
-    self.set_state(state, session)
-    d = self.R / "grants" / f"slot{idx}"
-    if not d.exists():
-        d.mkdir(parents=True)
-        d.chmod(0o750)
-    if grants:
-        write_grants(d, session, idx, grants)
+    return AllWorld(tmp_path)
 
 
 def write_grants(d, session, idx, hosts, *, expired=()):
@@ -73,11 +79,6 @@ def write_grants(d, session, idx, hosts, *, expired=()):
     p.write_bytes(eg.dump_grants(session, idx, es))
     p.chmod(0o440)
     return es
-
-
-World.lease = _lease
-World.put_slot_state = _put_slot_state
-World.add_session = _add_session
 
 
 def ask(w, uid=UID):
@@ -137,6 +138,9 @@ def test_a_session_in_any_other_control_state_is_omitted_even_with_a_leftover_fi
 
 
 def test_a_session_with_no_control_record_is_omitted(world):
+    """Plan v2 section 4 "any other state": an alloc with no CONTROL record is prepare's window between its alloc and
+    ATTACH (the reaper's ``revoke_dead_holders`` no-record case). Such a session was never ACTIVE (``egress-grant``
+    needs the record), and nothing removes a record once written, so it has no grants of its own to show."""
     world.add_session(3, S, grants=("left.example.org",))
     (world.L / "sessions" / f"{S}.json").unlink()
     assert ask(world)[1] == {"ok": True, "store": STORE_ID, "slots": [], "unread": []}
@@ -202,6 +206,78 @@ def test_an_alloc_of_another_lease_is_a_named_unread_row(world):
     assert ask(world)[1]["slots"] == []
 
 
+# --- L3 r1: a leased slot whose alloc or CONTROL record is corrupt is unread, never omitted ----------------------------------
+
+def _two_slots(world):
+    world.add_session(3, S, grants=("a.example.org",))
+    world.add_session(4, OTHER, grants=("b.example.org",))
+
+
+def _unread_4(world):
+    """Slot 4 is the only unread row and slot 3 still lists."""
+    rc, ans = ask(world)
+    assert rc == RH.EXIT_OK and [r["slot"] for r in ans["slots"]] == [3], ans
+    (row,) = ans["unread"]
+    assert row["slot"] == 4
+    return row["name"]
+
+
+def test_a_missing_alloc_under_a_control_record_is_unread(world):
+    """Only a clean prepare failure unlinks an alloc, and only while CONTROL holds no record: an alloc gone under a
+    record is damage, so the slot is named."""
+    _two_slots(world)
+    (world.L / "alloc" / f"{OTHER}.json").unlink()
+    assert _unread_4(world) == EV.ERR_ALL_UNREAD
+
+
+def test_a_leased_slot_with_no_alloc_and_no_record_is_the_reapers_orphan_and_omitted(world):
+    """prepare between its lease and its alloc, or a crashed clean failure: never ACTIVE, no grants of its own."""
+    _two_slots(world)
+    (world.L / "alloc" / f"{OTHER}.json").unlink()
+    (world.L / "sessions" / f"{OTHER}.json").unlink()
+    assert ask(world)[1]["unread"] == [] and [r["slot"] for r in ask(world)[1]["slots"]] == [3]
+
+
+@pytest.mark.parametrize("raw", [b"{not json", b"", b'{"format":"levain-alloc/1"}'])
+def test_a_corrupt_alloc_is_unread(world, raw):
+    _two_slots(world)
+    (world.L / "alloc" / f"{OTHER}.json").write_bytes(raw)
+    assert _unread_4(world) == EV.ERR_ALL_UNREAD
+
+
+def test_an_alloc_that_names_a_none_class_slot_is_a_mismatch_not_an_omission(world):
+    _two_slots(world)
+    world.put_alloc(OTHER, SlotId("none", 4))
+    assert _unread_4(world) == EV.ERR_ALL_MISMATCH
+
+
+def test_an_alloc_whose_own_session_field_is_another_session_is_a_mismatch(world):
+    _two_slots(world)
+    world.put_alloc(S, SlotId("egress", 4), name=OTHER)        # OTHER.json holds S's alloc on slot 4
+    assert _unread_4(world) == EV.ERR_ALL_MISMATCH
+
+
+def test_a_control_record_whose_own_session_field_is_another_session_is_a_mismatch_never_listed(world):
+    """codex: a slot leased to OTHER whose ``sessions/OTHER.json`` is S's ACTIVE record must not list OTHER's file."""
+    _two_slots(world)
+    (world.L / "sessions" / f"{OTHER}.json").write_bytes((world.L / "sessions" / f"{S}.json").read_bytes())
+    assert _unread_4(world) == EV.ERR_ALL_MISMATCH
+
+
+def test_a_structurally_wrong_but_canonical_control_record_is_a_named_unread_row(world):
+    """deepseek: a well-formed JSON record missing its keys refuses by name (records' strict parse), never a KeyError."""
+    _two_slots(world)
+    (world.L / "sessions" / f"{OTHER}.json").write_bytes(b'{"format":"levain-session-state/1"}')
+    assert _unread_4(world) == "missing-key"
+
+
+def test_a_foreign_operators_alloc_on_a_slot_is_still_omitted_whatever_its_lease(world):
+    """The ownership check comes before the slot and lease checks: another operator's slot is never named."""
+    _two_slots(world)
+    world.put_alloc(OTHER, SlotId("egress", 4), operator=STRANGER_UID, lease_seq=99)
+    assert ask(world)[1]["unread"] == []
+
+
 def test_an_unreadable_slot_dir_oserror_is_named_unread(world, monkeypatch):
     world.add_session(3, S, grants=("a.example.org",))
     world.add_session(4, OTHER)
@@ -257,21 +333,12 @@ def test_a_dispatch_caller_and_a_stranger_are_refused_before_any_work(world):
     refused(ask(world, uid=STRANGER_UID), "unknown-caller")
 
 
-def test_the_handler_itself_refuses_a_non_operator_caller_rather_than_answer_empty(world):
-    """Defence beside the grammar: ``bind`` would skip every slot for a dispatch caller as ``no-session``."""
+def test_the_handler_itself_refuses_a_non_operator_caller_rather_than_answer_empty(world, monkeypatch):
+    """Defence beside the grammar: the ownership check would skip every slot for a dispatch caller, an empty answer.
+    With the grammar's rule lifted (monkeypatch, restored), the dispatch caller runs the real ``main`` dispatch."""
     world.add_session(3, S, grants=("a.example.org",))
-    import dataclasses
-    captured = []
-    orig = RH.VERB_HANDLERS["egress-grants-all"]
-    RH.VERB_HANDLERS["egress-grants-all"] = lambda c, r, b: (captured.append(c), orig(c, r, b))[1]
-    try:
-        ask(world)
-    finally:
-        RH.VERB_HANDLERS["egress-grants-all"] = orig
-    c, = captured
-    with pytest.raises(Refused) as e:
-        EV.egress_grants_all(dataclasses.replace(c, caller=RG.DISPATCH), RG.RuntimeRequest("egress-grants-all", RG.DISPATCH), None)
-    assert e.value.name == "verb-not-allowed-for-caller"
+    monkeypatch.setattr(RG, "DISPATCH_FORBIDDEN", RG.DISPATCH_FORBIDDEN - {"egress-grants-all"})
+    refused(ask(world, uid=DISPATCH_UID), "verb-not-allowed-for-caller")
 
 
 def test_the_verb_takes_no_argument_and_no_stdin(world):

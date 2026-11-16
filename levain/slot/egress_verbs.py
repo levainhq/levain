@@ -404,10 +404,40 @@ _LISTED_STATES = (R.ACTIVE, R.BRAKED)
 
 
 def _session_state(ctx: H.Ctx, session: str) -> Optional[str]:
-    """CONTROL's state name for ``session`` (``None`` when there is no record); a record that cannot be read or parsed
-    raises (the caller names the slot ``unread``, never an absent one)."""
+    """CONTROL's state name for ``session`` (``None`` when there is no record: prepare's window between its alloc and
+    ATTACH, a session never ACTIVE). A record that cannot be read or parsed raises, and one that names another session
+    is ``egress-grants-slot-mismatch`` (the caller names the slot ``unread``, never an absent one)."""
     data = ctx.store.read(("sessions",), f"{session}.json", trusted=False)
-    return None if data is None else R.parse_state(data).state
+    if data is None:
+        return None
+    rec = R.parse_state(data)
+    if rec.session != session:
+        raise Refused(ERR_ALL_MISMATCH, "the CONTROL record names another session")
+    return rec.state
+
+
+def _slot_alloc(ctx: H.Ctx, slot: SlotId, ss: R.SlotState) -> Optional[R.Alloc]:
+    """The alloc of the session slot state ``ss`` leases ``slot`` to, or ``None`` for a session this verb never shows:
+    the reaper's orphan (no alloc and no CONTROL record), another operator's, or an unattended kind. Not :func:`bind`,
+    which folds a corrupt alloc into ``no-session``: here an alloc that is gone under a record or does not parse is
+    ``egress-grants-unreadable`` and one that is not this slot's lease is ``egress-grants-slot-mismatch``."""
+    session = str(ss.session)
+    data = ctx.store.read(("alloc",), f"{session}.json")
+    if data is None:
+        if ctx.store.read(("sessions",), f"{session}.json", trusted=False) is None:
+            return None                     # only a clean prepare failure unlinks an alloc, while no record exists
+        raise Refused(ERR_ALL_UNREAD, "the alloc is gone under a CONTROL record")
+    try:
+        a = R.parse_alloc(data)
+    except (Refused, ContractError, ValueError):
+        raise Refused(ERR_ALL_UNREAD, "the alloc does not parse") from None
+    if a.session != session:
+        raise Refused(ERR_ALL_MISMATCH, "the alloc names another session")
+    if a.operator_uid != ctx.sudo_uid:
+        return None                         # another operator's session: invisible by design, never named
+    if a.slot != slot or a.lease_seq != ss.lease_seq:
+        raise Refused(ERR_ALL_MISMATCH, "the alloc is not this slot's lease")
+    return a if a.kind in GRANTABLE_KINDS else None    # an unattended session: invisible by design
 
 
 def _slot_row(ctx: H.Ctx, slot: SlotId, now: datetime) -> Optional[Dict[str, object]]:
@@ -420,14 +450,9 @@ def _slot_row(ctx: H.Ctx, slot: SlotId, now: datetime) -> Optional[Dict[str, obj
     ss = H.parse_slot_state_of(raw, slot)
     if ss.state != "leased" or ss.session is None:
         return None
-    try:
-        a = bind(ctx, ss.session)
-    except Refused as e:
-        if e.name in ("no-session", ERR_CLASS, ERR_KIND):
-            return None                     # another operator's, or an unattended session: invisible by design
-        raise
-    if a.slot != slot or a.lease_seq != ss.lease_seq:
-        raise Refused(ERR_ALL_MISMATCH, "the alloc is not this slot's lease")
+    a = _slot_alloc(ctx, slot, ss)
+    if a is None:
+        return None
     state = _session_state(ctx, ss.session)
     if state not in _LISTED_STATES:
         return None
@@ -454,7 +479,7 @@ def egress_grants_all(ctx: H.Ctx, req: RuntimeRequest, blob: object) -> Dict[str
     root cannot read is a named ``unread`` row (``{slot, name}``), never an omission; every other slot still lists.
     No session lock (as ``egress-grants-list``): the state is a hint, the file is root's whole rename. A missing grants
     store is the refusal ``egress-grants-list`` gives."""
-    if ctx.caller != OPERATOR:              # bind would skip every slot as no-session: an empty answer is not a refusal
+    if ctx.caller != OPERATOR:              # the owner check would skip every slot: an empty answer is not a refusal
         raise Refused("verb-not-allowed-for-caller", "egress-grants-all")
     now = _now(ctx)
     with EL.ledger_dir(ctx) as dfd:
