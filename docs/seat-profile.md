@@ -297,8 +297,7 @@ Nothing is forced. A network or authentication failure is recorded and retried a
 - **Merging upstream commits that touch `activation` stops the push.** Every commit in `base..tip` is judged, including upstream's; the seat must rebase its own commits onto the grant's branch instead of merging them in.
 - **A clone root under a directory with glob characters is refused with a message that names the exempt path,** not the root.
 - **The candidate-pathspec count is capped (256) but not its total bytes;** a lane with that many near-`PATH_MAX` names is refused as unreadable instead of batched.
-
-- **An allowlist names hosts, not accounts.** Any host the seat's sandbox may write to, it may write its data to: a code host it may push to can receive a copy of whatever the seat can read, in a repository or account you did not intend. Levain does not prevent this. A shorter `--allow-domain` list narrows it, and an empty one (the default) leaves the seat no network of its own, so the only push is Levain's own, to the one branch the grant names.
+- **An allowlist names hosts, not accounts.** Any host the seat's sandbox may write to, it may write its data to: a code host it may push to can receive a copy of whatever the seat can read, in a repository or account you did not intend. Levain does not prevent this. A shorter `--allow-domain` list narrows it, and an empty one (the default) leaves the seat no network of its own, so its only way out is Levain's own push to the one branch the grant names. Whatever the seat commits to that branch goes with it and can be read by anyone with access to that remote.
 - **The network outlives a revoke.** The allowed domains are frozen into the seat's launch settings. A revoke or
   expiry cuts the push at once, but a running seat keeps the network it launched with until it is relaunched.
 - **A short window at revoke.** A revoke that lands between the moment the hook reads the log and the moment the
