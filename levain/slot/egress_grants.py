@@ -38,7 +38,8 @@ NAMESPACE = EGRESS_HOST_NAMESPACE
 FORMAT_LINE = "levain-egress-host/1"
 GRANTS_FORMAT = "levain-egress-grants/1"
 PORT = 443
-SLOTS_MAX = 32                               # levain.slot.grammar.MAX_SLOTS (that module is not imported: it needs more)
+INDEX_SPACE = 64                             # levain.slot.grammar.INDEX_SPACE: a slot index is 0..63 (that module is
+                                             # not imported: it needs more). Not MAX_SLOTS: indices pass 31 after retires
 SESSION_TTL_MAX_S = 8 * 3600                 # the one-tap "this session" grant: at most issued + 8 h
 DAY_TTL_S = 24 * 3600                        # the "24 hours" grant: at most issued + 24 h (still this session only)
 FRESH_S = 600                                # a signed message is delivered within 10 min of its issue
@@ -122,11 +123,22 @@ def writable_host(host: object) -> bool:
 
 
 # --- stamps ------------------------------------------------------------------------------------------------------------
+def _aware(when: object) -> bool:
+    return isinstance(when, datetime) and when.tzinfo is not None and when.utcoffset() is not None
+
+
 def stamp(when: datetime) -> str:
-    """``when`` (an aware datetime) as the one fixed-width UTC stamp the message carries."""
-    if when.tzinfo is None or when.utcoffset() is None:
+    """``when`` (an aware datetime) as the one fixed-width UTC stamp the message carries; :class:`GrantRefused`
+    ``stamp`` for anything else, a time whose UTC form is past the calendar, or one that would not read back."""
+    if not _aware(when):
         raise GrantRefused("stamp")
-    return when.astimezone(timezone.utc).strftime(_STAMP_FORMAT)
+    try:
+        text = when.astimezone(timezone.utc).strftime(_STAMP_FORMAT)
+    except (OverflowError, ValueError):
+        raise GrantRefused("stamp") from None
+    if _STAMP.fullmatch(text) is None:          # a year below 1000 is not zero-padded by every platform's strftime
+        raise GrantRefused("stamp")
+    return text
 
 
 def parse_stamp(text: object) -> datetime:
@@ -186,7 +198,9 @@ def _check(fields: Dict[str, str]) -> Tuple[int, datetime, datetime, datetime]:
         raise GrantRefused("shape")
     slot = int(fields["slot"])
     host = fields["host"]
-    if not 0 <= slot < SLOTS_MAX or fields["port"] != str(PORT) or not is_host_name(host):
+    if not 0 <= slot < INDEX_SPACE:
+        raise GrantRefused("shape")
+    if fields["port"] != str(PORT) or not is_host_name(host):
         raise GrantRefused("host")
     if never_grant(host):
         raise GrantRefused("never-grant")
@@ -270,7 +284,10 @@ def parse_signed(signed: object) -> HostGrant:
 
 def check_fresh(grant: HostGrant, now: datetime) -> None:
     """:class:`GrantRefused` ``fresh`` unless ``grant`` was issued no more than :data:`FRESH_S` before ``now`` and
-    no more than :data:`SKEW_S` after it (root's clock, never the message's)."""
+    no more than :data:`SKEW_S` after it (root's clock, never the message's). A ``now`` that is not an aware datetime
+    is refused the same way (the message's stamps are always aware UTC, so only a caller's naive clock could differ)."""
+    if not _aware(now):
+        raise GrantRefused("fresh")
     age = (now - grant.issued).total_seconds()
     if not -SKEW_S <= age <= FRESH_S:
         raise GrantRefused("fresh")
@@ -309,12 +326,18 @@ def entry_from_grant(grant: HostGrant) -> Entry:
 
 def dump_grants(session: str, slot: int, entries: Sequence[Entry]) -> bytes:
     """The canonical bytes of a grants file (sorted keys, no spaces, one trailing newline). Refuses, with the same
-    rules :func:`parse_grants` applies, whatever that reader would not accept."""
-    body = {"format": GRANTS_FORMAT, "session": session, "slot": slot,
-            "grants": [{"grant": e.grant, "host": e.host, "port": e.port, "expires": stamp(e.expires),
-                        "choice": e.choice} for e in entries]}
-    raw = (json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("ascii")
-    parse_grants(raw)
+    rules :func:`parse_grants` applies, whatever that reader would not accept: always :class:`GrantRefused`
+    ``grants-file``, never another exception, for any argument out of shape."""
+    try:
+        if not isinstance(entries, (list, tuple)) or not all(isinstance(e, Entry) for e in entries):
+            raise ValueError
+        body = {"format": GRANTS_FORMAT, "session": session, "slot": slot,
+                "grants": [{"grant": e.grant, "host": e.host, "port": e.port, "expires": stamp(e.expires),
+                            "choice": e.choice} for e in entries]}
+        raw = (json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n").encode("ascii")
+        parse_grants(raw)
+    except (GrantRefused, TypeError, ValueError, OverflowError, RecursionError):
+        raise GrantRefused("grants-file") from None
     return raw
 
 
@@ -343,7 +366,7 @@ def parse_grants(raw: object) -> GrantsFile:
         data = json.loads(bytes(raw).decode("utf-8"), object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
         if (not isinstance(data, dict) or set(data) != _FILE_KEYS or data["format"] != GRANTS_FORMAT
                 or not isinstance(data["session"], str) or _SESSION.fullmatch(data["session"]) is None
-                or not _int(data["slot"]) or not 0 <= data["slot"] < SLOTS_MAX
+                or not _int(data["slot"]) or not 0 <= data["slot"] < INDEX_SPACE
                 or not isinstance(data["grants"], list) or len(data["grants"]) > GRANTS_MAX):
             raise ValueError
         entries = []  # type: List[Entry]
@@ -376,8 +399,15 @@ def read_grants_file(path: str, *, owner_uid: int = 0, group_gid: Optional[int] 
         if (not _stat.S_ISREG(st.st_mode) or st.st_uid != owner_uid or st.st_mode & 0o027
                 or (group_gid is not None and st.st_gid != group_gid) or st.st_size > GRANTS_FILE_MAX):
             return None
-        raw = os.read(fd, GRANTS_FILE_MAX + 1)
-        return parse_grants(raw)
+        chunks = []  # type: List[bytes]
+        size = 0
+        while size <= GRANTS_FILE_MAX:                 # to the end: one read may return less than the file holds
+            chunk = os.read(fd, GRANTS_FILE_MAX + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return parse_grants(b"".join(chunks))
     except (OSError, GrantRefused):
         return None
     finally:
@@ -385,10 +415,14 @@ def read_grants_file(path: str, *, owner_uid: int = 0, group_gid: Optional[int] 
             os.close(fd)
 
 
-def live_entry(grants: Optional[GrantsFile], session: str, host: str, port: int, now: datetime) -> Optional[Entry]:
-    """The entry that admits a CONNECT to ``host``:``port`` for ``session`` at ``now``, or None: the file names this
-    session, the entry names exactly this host and port 443, and it ends after ``now``. Nothing else admits."""
-    if grants is None or grants.session != session or port != PORT or not isinstance(host, str):
+def live_entry(grants: Optional[GrantsFile], session: str, slot: int, host: str, port: int,
+               now: datetime) -> Optional[Entry]:
+    """The entry that admits a CONNECT to ``host``:``port`` for ``session`` in ``slot`` at ``now``, or None: the file
+    names this session and this slot (both are in the signed message, so both bind at read), the entry names exactly
+    this host and port 443, and it ends after ``now``. Nothing else admits, and a ``now`` that is not an aware
+    datetime admits nothing."""
+    if (grants is None or grants.session != session or not _int(slot) or grants.slot != slot or port != PORT
+            or not isinstance(host, str) or not _aware(now)):
         return None
     for e in grants.entries:
         if e.host == host and e.port == port and e.expires > now:

@@ -84,8 +84,8 @@ def test_the_signed_bytes_are_what_consent_sign_signs_for_the_request_levain_fil
 def test_the_copied_constants_match_the_modules_root_cannot_import():
     assert eg.CHOICE_MARK == sign.CHOICE_MARK
     from levain.cockpit.consent import _STAMP_FORMAT
-    from levain.slot.grammar import MAX_SLOTS
-    assert eg._STAMP_FORMAT == _STAMP_FORMAT and eg.SLOTS_MAX == MAX_SLOTS
+    from levain.slot.grammar import INDEX_SPACE
+    assert eg._STAMP_FORMAT == _STAMP_FORMAT and eg.INDEX_SPACE == INDEX_SPACE
 
 
 # --- the grammar refuses every field out of shape ----------------------------------------------------------------------
@@ -98,7 +98,7 @@ def lines(**over):
     ("grant", "eh-" + "0123456789abcdef0123456"), ("grant", "eh-" + "0123456789ABCDEF01234567"),
     ("grant", "xx-" + "0123456789abcdef01234567"), ("grant", "eh-" + "0123456789abcdef012345678"), ("grant", ""),
     ("session", "s-" + "0123456789abcde"), ("session", "S-" + "0123456789abcdef"), ("session", "s-" + "g" * 16),
-    ("slot", "01"), ("slot", "-1"), ("slot", "٣"), ("slot", "100"), ("slot", "32"), ("slot", "3.0"), ("slot", ""),
+    ("slot", "01"), ("slot", "-1"), ("slot", "٣"), ("slot", "100"), ("slot", "64"),("slot", "3.0"), ("slot", ""),
     ("host", "Files.Example.org"), ("host", "files.example.org."), ("host", "files.example.org:443"),
     ("host", "1.2.3.4"), ("host", "0x7f.0x1"), ("host", "127.1"), ("host", "2130706433"), ("host", "localhost"),
     ("host", "exa mple.org"), ("host", "-a.example.org"), ("host", "a-.example.org"), ("host", "a..example.org"),
@@ -139,7 +139,7 @@ def test_a_message_out_of_its_grammar_is_refused(mutate):
 def test_a_message_that_matches_the_fence_but_not_the_rules_is_refused_by_the_parser():
     # ip-looking digit labels pass the fence's character class and are refused by the host grammar
     assert refusal(signed(lines(host="999.999.999.999"))) == "host"
-    assert refusal(signed(lines(slot="40"))) == "host"        # past the slot count (the fence allows two digits)
+    assert refusal(signed(lines(slot="64"))) == "shape"       # past the slot index space (the fence allows two digits)
 
 
 def test_non_bytes_and_oversized_signed_input_is_refused():
@@ -154,7 +154,7 @@ def test_build_refuses_what_it_would_never_file_and_echoes_nothing():
                 session_deadline=ISSUED + timedelta(hours=1), rp="phone.example.net")
     assert eg.build_message(**good)
     for over in ({"host": "a.local"}, {"host": "metadata." + MARK + ".org"}, {"grant": MARK}, {"session": MARK},
-                 {"slot": True}, {"slot": 32}, {"slot": -1}, {"slot": MARK}, {"host": 5}, {"store": MARK + " x"},
+                 {"slot": True}, {"slot": 64},{"slot": -1}, {"slot": MARK}, {"host": 5}, {"store": MARK + " x"},
                  {"rp": MARK + "\nx"}, {"rp": "Bad"}, {"issued": datetime(2026, 1, 1)},
                  {"session_deadline": datetime(2026, 1, 1)}, {"host": "1.2.3.4"}, {"host": "a.example.org\nport: 22"}):
         with pytest.raises(eg.GrantRefused) as info:
@@ -382,7 +382,7 @@ def test_the_strict_reader_accepts_the_plain_file_and_refuses_every_departure():
     bad = [
         b"", b"{}", b"[]", b"null", b"not json", b"\xff\xfe", _file() + b"x", b"x" + _file(), _file() + _file(),
         _file(format="levain-egress-grants/2"), _file(session="s-" + "g" * 16), _file(session=5), _file(slot=True),
-        _file(slot=32), _file(slot=-1), _file(slot=3.0), _file(slot="3"), _file(grants={}), _file(grants="x"),
+        _file(slot=64), _file(slot=-1), _file(slot=3.0), _file(slot="3"), _file(grants={}), _file(grants="x"),
         _file(extra=1), _file(grants=[None]), _file(grants=["x"]), _file(grants=[{}]),
         _entry(extra=1), _entry(host="1.2.3.4"), _entry(host="a.local"), _entry(host="Files.example.org"),
         _entry(host="metadata.example.org"), _entry(port=22), _entry(port="443"), _entry(port=443.0),
@@ -452,7 +452,7 @@ def test_the_file_read_is_bounded_and_checks_owner_mode_and_type(tmp_path):
 def test_only_a_live_entry_for_this_session_host_and_port_admits():
     f = eg.parse_grants(_file())
     now = ISSUED - timedelta(minutes=1)
-    ok = eg.live_entry(f, SESSION, "files.example.org", 443, now)
+    ok = eg.live_entry(f, SESSION, 3, "files.example.org", 443, now)
     assert ok is not None and ok.grant == GRANT
     other_session = "s-" + "f" * 16
     cases = [(f, other_session, "files.example.org", 443, now), (f, SESSION, "other.example.org", 443, now),
@@ -462,8 +462,8 @@ def test_only_a_live_entry_for_this_session_host_and_port_admits():
              (f, SESSION, "1.2.3.4", 443, now), (f, SESSION, "FILES.example.org", 443, now),
              (f, SESSION, None, 443, now), (f, SESSION, "files.example.org", 443, ISSUED),       # expires > now, strict
              (f, SESSION, "files.example.org", 443, ISSUED + timedelta(seconds=1)), (None, SESSION, "files.example.org", 443, now)]
-    for args in cases:
-        assert eg.live_entry(*args) is None, args
+    for g, session, host, port, when in cases:
+        assert eg.live_entry(g, session, 3, host, port, when) is None, (session, host, port, when)
 
 
 # --- python 3.9 and the import surface root relies on ---------------------------------------------------------------
@@ -493,3 +493,125 @@ def test_the_module_is_python_39_and_imports_only_what_root_can():
 
 def test_the_host_grammar_is_the_policys_own():
     assert eg.is_host_name is policy.is_host_name
+
+
+# --- L3 round 1 (levain 9) --------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("slot", [0, 31, 32, 47, 63])
+def test_every_slot_index_a_slot_can_hold_is_a_grant_slot(slot):
+    # ids.py allocates from range(INDEX_SPACE): after retired low indices a live slot can sit at 32..63
+    msg = eg.build_message(STORE, GRANT, SESSION, slot, "files.example.org", ISSUED, ISSUED + timedelta(hours=1),
+                           "phone.example.net")
+    assert eg.parse_signed(signed(msg)).slot == slot
+    assert eg.parse_grants(eg.dump_grants(SESSION, slot, [entry()])).slot == slot
+
+
+def test_a_slot_past_the_index_space_is_refused_everywhere_as_out_of_shape():
+    from levain.slot.grammar import INDEX_SPACE
+    assert eg.INDEX_SPACE == INDEX_SPACE
+    assert refusal(signed(lines(slot=str(INDEX_SPACE)))) == "shape"
+    assert refusal(signed(lines(slot="99"))) == "shape"
+    with pytest.raises(eg.GrantRefused):
+        eg.build_message(STORE, GRANT, SESSION, INDEX_SPACE, "files.example.org", ISSUED, ISSUED + timedelta(hours=1),
+                         "phone.example.net")
+    with pytest.raises(eg.GrantRefused):
+        eg.parse_grants(_file(slot=INDEX_SPACE))
+
+
+def test_a_live_entry_admits_only_for_the_slot_the_file_names():
+    f = eg.parse_grants(_file())                     # session SESSION, slot 3
+    now = ISSUED - timedelta(minutes=1)
+    assert eg.live_entry(f, SESSION, 3, "files.example.org", 443, now).grant == GRANT
+    for slot in (4, 0, 63, -3, True, None, "3", 3.0):
+        assert eg.live_entry(f, SESSION, slot, "files.example.org", 443, now) is None, slot
+
+
+@pytest.mark.parametrize("now", [datetime(2026, 11, 16, 11, 59), None, "2026-11-16T11:59:00.000000Z", 0])
+def test_a_clock_that_is_not_an_aware_datetime_admits_nothing_and_raises_nothing(now):
+    f = eg.parse_grants(_file())
+    assert eg.live_entry(f, SESSION, 3, "files.example.org", 443, now) is None
+    with pytest.raises(eg.GrantRefused) as info:
+        eg.check_fresh(eg.parse_signed(signed()), now)
+    assert info.value.name == "fresh"
+
+
+def test_a_message_or_file_stamp_is_always_aware_utc():
+    # the naive-clock case above is a caller's slip only: nothing the message or the file carries reads as naive
+    assert eg.parse_signed(signed()).issued.tzinfo is timezone.utc
+    assert eg.parse_grants(_file()).entries[0].expires.tzinfo is timezone.utc
+    assert refusal(signed(lines(issued="2026-11-16T12:00:00.000000"))) in {"shape", "stamp"}
+
+
+def test_the_writer_refuses_malformed_arguments_by_name_never_a_stray_exception():
+    edge = timezone(timedelta(hours=-1))
+    for args in ((SESSION, 3, None), (SESSION, 3, [None]), (SESSION, 3, ["x"]), (SESSION, 3, 5),
+                 (SESSION, 3, [eg.Entry(GRANT, "a.example.org", 443, None, "s")]),
+                 (SESSION, 3, [eg.Entry(GRANT, "a.example.org", 443, datetime(2026, 11, 16), "s")]),
+                 (SESSION, 3, [eg.Entry(GRANT, "a.example.org", 443, datetime.max.replace(tzinfo=edge), "s")]),
+                 (SESSION, 3, [eg.Entry(GRANT, "a.example.org", 443, "2026-11-16T12:00:00.000000Z", "s")]),
+                 (SESSION, None, []), (None, 3, []), (SESSION, 3, [eg.Entry(GRANT, b"a.example.org", 443, ISSUED, "s")])):
+        with pytest.raises(eg.GrantRefused) as info:
+            eg.dump_grants(*args)
+        assert info.value.name == "grants-file" and info.value.__cause__ is None, args
+
+
+@pytest.mark.parametrize("when", [None, "2026-11-16", 5, datetime(2026, 11, 16),
+                                  datetime.max.replace(tzinfo=timezone(timedelta(hours=-1)))])
+def test_stamp_refuses_by_name_what_it_cannot_write(when):
+    with pytest.raises(eg.GrantRefused) as info:
+        eg.stamp(when)
+    assert info.value.name == "stamp" and info.value.__cause__ is None
+
+
+def test_the_file_read_reads_to_the_end_through_short_reads(tmp_path, monkeypatch):
+    p = tmp_path / "grants.json"
+    p.write_bytes(_file())
+    os.chmod(p, 0o440)
+    real = os.read
+    monkeypatch.setattr(eg.os, "read", lambda fd, n: real(fd, min(n, 7)))
+    got = eg.read_grants_file(str(p), owner_uid=os.getuid())
+    monkeypatch.undo()
+    assert got is not None and got.session == SESSION
+
+
+def test_the_file_read_closes_its_descriptor_whatever_the_parse_raises(tmp_path, monkeypatch):
+    p = tmp_path / "grants.json"
+    p.write_bytes(_file())
+    os.chmod(p, 0o440)
+    opened, closed = [], []
+    real_open, real_close = os.open, os.close
+
+    def track_open(*a, **k):
+        fd = real_open(*a, **k)
+        opened.append(fd)
+        return fd
+
+    def track_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    def boom(_raw):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(eg.os, "open", track_open)
+    monkeypatch.setattr(eg.os, "close", track_close)
+    monkeypatch.setattr(eg, "parse_grants", boom)
+    with pytest.raises(RuntimeError):
+        eg.read_grants_file(str(p), owner_uid=os.getuid())
+    monkeypatch.undo()
+    assert opened and opened == closed
+
+
+def test_a_plain_levain_request_file_with_a_write_in_is_refused(tmp_path):
+    # a write-in key is only legal beside "options", and a levain namespace with no fixed choices refuses a choice
+    rid = sign.file_levain_request(tmp_path, NS.REVIEW_CLEAR_NAMESPACE, "levain review clear rv-" + "ab" * 16 + " open x",
+                                   title="t", ttl_s=600)
+    path = tmp_path / "sign" / f"{rid}.json"
+    body = json.loads(path.read_text())
+    for over in ({"write_in": True},
+                 {"write_in": True, "format": sign.CHOICE_FORMAT,
+                  "options": [{"key": "a", "text": "x"}, {"key": "b", "text": "y"}]}):
+        path.write_text(json.dumps({**body, **over}))
+        got = sign.read_request(tmp_path, rid)
+        assert got.refused, over
+        with pytest.raises(sign.SignRefused):
+            sign.signed_bytes(got, "*", "anything")
