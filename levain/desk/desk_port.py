@@ -453,7 +453,8 @@ class HostCommandDeskPort:
         The host command runs at most once per :data:`CONTEXT_TTL` seconds, whoever asks, and a poll never waits on it once a reading is
         held: an aged reading is answered as it is while ONE background refresh runs for the next poll, but only up to
         :data:`CONTEXT_STALE` seconds old. A reading older than that (an idle page; the desk may have rotated meanwhile) is never
-        answered as a number: the ask that finds it is treated as a first ask. A first ask with ``block`` True runs the command in the
+        answered as a number: the ask that finds it is treated as a first ask. A reading ages from when its read began, and the host command
+        is expected to answer well within :data:`CONTEXT_STALE`: one that does not is stored already stale and read again at the next ask. A first ask with ``block`` True runs the command in the
         caller (concurrent first asks share that one run); ``block`` False is the receipt path's, which never does: with nothing held it says ``NoReading("not read yet")``."""
         if self._cmds.context is None:
             return None
