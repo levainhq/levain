@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -13,6 +14,7 @@ import pytest
 
 from levain.consent import host_grants as HG
 from levain.contracts import canon
+from levain.slot import adopt_view
 
 S1 = "s-" + "1" * 16
 S2 = "s-" + "2" * 16
@@ -385,20 +387,86 @@ def test_a_deadline_short_failure_is_not_cached() -> None:
 # -- the rate limit and the log ---------------------------------------------------------------------------------------
 
 
-def test_the_eleventh_revoke_in_a_minute_from_one_credential_is_429_and_spawns_nothing() -> None:
-    """T20: per credential NAME; another credential is unaffected; the window ends."""
+def test_the_eleventh_revoke_in_a_minute_from_one_credential_is_429_and_reaches_no_root_revoke() -> None:
+    """T20: per credential NAME; another credential is unaffected; the window ends. The limit counts the revoke calls
+    that reach root (`all` on a listed session always does)."""
     now = [0.0]
     root = FakeRoot()
     surf = _surface(root, clock=lambda: now[0])
     for _ in range(HG.RATE_LIMIT):
-        body, status = surf.revoke(S1, "eh-" + "9" * 24, "paired-d-1", now[0] + 30)
+        body, status = surf.revoke(S1, "all", "paired-d-1", now[0] + 30)
         assert status == 200
-    n = len(root.calls)
-    body, status = surf.revoke(S1, G1, "paired-d-1", now[0] + 30)
-    assert status == 429 and body["error"] == "rate_limited" and len(root.calls) == n
-    assert surf.revoke(S1, "eh-" + "9" * 24, "browser", now[0] + 30)[1] == 200
+    n = root.verbs().count("egress-grant-revoke")
+    assert n == HG.RATE_LIMIT
+    body, status = surf.revoke(S1, "all", "paired-d-1", now[0] + 30)
+    assert status == 429 and body["error"] == "rate_limited" and root.verbs().count("egress-grant-revoke") == n
+    assert surf.revoke(S1, "all", "browser", now[0] + 30)[1] == 200
     now[0] += HG.RATE_WINDOW_S + 1
-    assert surf.revoke(S1, "eh-" + "9" * 24, "paired-d-1", now[0] + 30)[1] == 200
+    assert surf.revoke(S1, "all", "paired-d-1", now[0] + 30)[1] == 200
+
+
+def test_a_malformed_busy_or_gone_revoke_spends_no_rate_slot() -> None:
+    """L3 r1 (complement 42, deepseek 73): a 400, a 409 and a gone-with-no-spawn reach no root revoke, so they cost
+    no slot of the budget; reproduced: ten malformed POSTs made the next valid revoke 429."""
+    root = FakeRoot()
+    surf = _surface(root)
+    for _ in range(HG.RATE_LIMIT):
+        assert surf.revoke("s-bad", "all", "browser", _far())[1] == 400
+        assert surf.revoke(S1, "eh-" + "9" * 24, "browser", _far())[1] == 200
+    assert surf._spawn_lock.acquire(timeout=1)          # another request's helper holds the one spawn
+    try:
+        for _ in range(HG.RATE_LIMIT):
+            assert surf.revoke(S1, G1, "browser", time.monotonic() + HG.MIN_SPAWN_S + 0.05)[1] == 409
+    finally:
+        surf._spawn_lock.release()
+    body, status = surf.revoke(S1, G1, "browser", _far())
+    assert status == 200 and body["result"] == "revoked"
+
+
+# -- a helper past its wall (L3 r1) -------------------------------------------------------------------------------------
+
+
+def test_a_timed_out_helper_keeps_the_one_spawn_until_its_child_exits() -> None:
+    """L3 r1 (codex 55, complement 16): the root helper is never signalled, so a timed-out child may still run. It keeps
+    the spawn lock until it exits: no second root helper meanwhile, and a request then answers busy. Reproduced on the
+    first cut: the lock was free at the timeout and a second helper started beside the first."""
+    starts: List[float] = []
+
+    def spawn(argv: Any, **kw: Any) -> "subprocess.CompletedProcess[bytes]":
+        starts.append(time.monotonic())    # a REAL child through the real runner, playing a root helper that is slow
+        return adopt_view._run([sys.executable, "-c", "import time; time.sleep(3.0)"], **kw)
+
+    surf = HG.HostGrantSurface(spawn=spawn)
+    assert surf.listing(time.monotonic() + 1.2)["name"] == "helper-timeout"
+    surf._invalidate()
+    second = surf.listing(time.monotonic() + 1.5)
+    assert len(starts) == 1 and second["name"] == "host-grants-busy" and "slots" not in second
+    body, status = surf.revoke(S1, G1, "browser", time.monotonic() + 1.5)
+    assert len(starts) == 1 and status == 503
+    assert surf._spawn_lock.acquire(timeout=5.0)        # the child exits; the reaper gives the lock back
+    surf._spawn_lock.release()
+
+
+def test_a_revoke_root_did_not_answer_clearly_is_unknown_never_not_revoked() -> None:
+    """L3 r1 (complement 24, codex 55): root may apply a revoke after the CLI stopped waiting, so a timed-out, silent or
+    malformed revoke answer is `unknown` with a fresh listing, never "not revoked: root refused". Reproduced on the
+    first cut: 502 refused "not revoked: root refused (helper-timeout)"."""
+    root = FakeRoot()
+    surf = _surface(root)
+    surf.listing(_far())
+    root.delay = 30.0                                       # the revoke runs past its wall
+    body, status = surf.revoke(S1, G1, "browser", time.monotonic() + 2.5)
+    assert status == 502 and body["error"] == "unknown" and body["name"] == "helper-timeout"
+    assert "not revoked" not in body["message"] and "may or may not" in body["message"] and "listing" in body
+    root.delay = 0.0
+    for raw, name in ((b"", "helper-silent"), (_line({"ok": True, "removed": "x", "recorded": []}),
+                                               "host-grants-answer-malformed")):
+        surf._invalidate()                                  # the reply's own listing read the bad answer too
+        assert "slots" in surf.listing(_far())
+        root.raw = raw
+        body, status = surf.revoke(S1, G2, "browser", _far())
+        root.raw = None
+        assert (status, body["error"], body["name"]) == (502, "unknown", name) and "not revoked" not in body["message"]
 
 
 def test_the_revoke_log_line_names_the_credential_session_target_and_roots_answer(caplog: pytest.LogCaptureFixture) -> None:

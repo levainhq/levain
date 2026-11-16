@@ -185,13 +185,44 @@ def test_only_the_page_token_and_devices_paired_from_the_cockpit_or_the_laptop_m
 # -- the rate limit and the log (T20 / T22 over HTTP) ------------------------------------------------------------------------
 
 
-def test_the_eleventh_post_in_a_minute_is_429_over_http_and_spawns_nothing(src, root) -> None:
+def test_the_eleventh_revoke_in_a_minute_is_429_over_http_and_reaches_no_root_revoke(src, root) -> None:
     with _mounted(src, root) as (port, _h):
         for _ in range(HG.RATE_LIMIT):
-            assert _call(port, "POST", REVOKE, {"session": S1, "target": "eh-" + "9" * 24}, token=T)[0] == 200
-        n = len(root.calls)
-        st, out, _ = _call(port, "POST", REVOKE, {"session": S1, "target": G1}, token=T)
-        assert st == 429 and out["error"] == "rate_limited" and len(root.calls) == n
+            assert _call(port, "POST", REVOKE, {"session": S1, "target": "all"}, token=T)[0] == 200
+        n = root.verbs().count("egress-grant-revoke")
+        st, out, _ = _call(port, "POST", REVOKE, {"session": S1, "target": "all"}, token=T)
+        assert st == 429 and out["error"] == "rate_limited" and root.verbs().count("egress-grant-revoke") == n
+
+
+def test_the_wall_counts_from_the_requests_start_not_after_its_gates(src, root, monkeypatch) -> None:
+    """L3 r1 (codex 61): a paired request can wait up to _PAIR_WAIT_S on the broker before the route runs; the wall
+    began after that, so a revoke could still run when the page's 15 s fetch had given up. Reproduced on the first
+    cut: the deadline handed to the surface was the gate's delay later than the request's start + the wall."""
+    import time
+
+    seen: list = []
+
+    class Seen(HG.HostGrantSurface):
+        def listing(self, deadline: float, release_gate: Any = None) -> Any:
+            seen.append(deadline)
+            return super().listing(deadline, release_gate)
+
+        def revoke(self, session: Any, target: Any, credential: str, deadline: float) -> Any:
+            seen.append(deadline)
+            return super().revoke(session, target, credential, deadline)
+
+    slow = web_server._Handler._coord_may_launch
+
+    def gate(self: Any, device: Any) -> bool:
+        time.sleep(0.6)                                     # a gate that takes its time (the pair wait's stand-in)
+        return slow(self, device)
+
+    monkeypatch.setattr(web_server._Handler, "_coord_may_launch", gate)
+    with _serve(src, surface_tokens={"browser": T, "relay": RELAY}, host_grants=Seen(spawn=root)) as (port, _h):
+        for method, path, body in (("GET", LIST, None), ("POST", REVOKE, {"session": S1, "target": G1})):
+            t0 = time.monotonic()
+            assert _call(port, method, path, body, token=T)[0] == 200
+            assert seen[-1] <= t0 + HG.HOSTGRANT_WALL_S + 0.3, (method, seen[-1] - t0)
 
 
 def test_the_revoke_log_line_names_the_credential_and_never_holds_a_token(src, root, caplog) -> None:

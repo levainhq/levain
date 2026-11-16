@@ -3658,7 +3658,7 @@ class _Handler(GuardedHandler):
             if not self._coord_may_launch(self._coord_device()):
                 payload, status = self._hostgrant_refusal()
             else:
-                payload, status = surface.listing(time.monotonic() + HOSTGRANT_WALL_S, release_gate=release), 200
+                payload, status = surface.listing(self._request_t0 + HOSTGRANT_WALL_S, release_gate=release), 200
         except _CredentialUnavailable:   # RU-5: only the outer catch answers it
             raise
         except Exception as exc:  # noqa: BLE001 - listing() never raises; anything else is an answer too
@@ -3681,7 +3681,7 @@ class _Handler(GuardedHandler):
         name = self._credential(required=True).get("name")
         if not isinstance(req, dict) or not isinstance(name, str) or not name:
             return {"error": "bad_request", "message": "a JSON object with session and target"}, 400
-        return surface.revoke(req.get("session"), req.get("target"), name, time.monotonic() + HOSTGRANT_WALL_S)
+        return surface.revoke(req.get("session"), req.get("target"), name, self._request_t0 + HOSTGRANT_WALL_S)
 
     def _grant_post(self, grant_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/grant/<id>/<action>``: the GrantPhone's own reply, or its refusal as ``{error, message}``

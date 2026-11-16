@@ -19,9 +19,12 @@ per-id revoke is sent only for a ``(session, id)`` the cockpit's own listing hol
 no revoke spawn, so a credential holder cannot fill root's install-wide revoked-id ledger (``egress-grant-ledger-full``)
 through this route. One request is at most one listing spawn and one revoke spawn, never an automatic retry.
 
-Every wait is bounded by one absolute monotonic ``deadline`` the route gives; no spawn starts with under
-:data:`MIN_SPAWN_S` left. The root helper child is never signalled (``adopt_view.call_helper``: "the root helper: no
-signal, no wait"): one timed-out ``sudo`` may be left behind, and single-flight bounds that to one at a time.
+Every wait is bounded by one absolute monotonic ``deadline`` the route gives (the route takes it from the request's
+start); no spawn starts with under :data:`MIN_SPAWN_S` left. The root helper child is never signalled
+(``adopt_view.call_helper``: "the root helper: no signal, no wait"), so a timed-out child keeps the spawn lock until
+it exits (a reaper thread waits on it; root's own bounds end it): never two root helpers at once, and every request
+in that time answers busy. A revoke whose outcome root did not answer clearly (timed out, silent, malformed) is
+``unknown``, never "not revoked": root may have applied it after the CLI stopped waiting.
 """
 from __future__ import annotations
 
@@ -74,6 +77,9 @@ _CHOICES = ("s", "d")
 #: is recorded (or, with the ledger full, refused); neither can mean a live grant survived.
 _GONE_NAMES = ("egress-grant-ledger-full",)
 _BUSY_NAMES = ("session-busy", "egress-grant-busy")
+#: A revoke's failures AFTER root was started where root's answer is not a clear one: it may have applied the revoke.
+_UNKNOWN_NAMES = ("helper-timeout", "helper-silent", "helper-output-malformed", "host-grants-answer-malformed",
+                  "host-grants-unreadable")
 
 Spawn = Callable[..., "subprocess.CompletedProcess[bytes]"]
 
@@ -135,7 +141,8 @@ class HostGrantSurface:
         self._spawn = spawn
         self._clock = clock
         self._cv = threading.Condition()
-        self._spawn_lock = threading.Lock()         # one helper child at a time, listing or revoke
+        self._spawn_lock = threading.Lock()         # one helper child at a time, listing or revoke, until it EXITS
+        self._left: "Optional[subprocess.Popen[bytes]]" = None   # a timed-out child still running (under the lock)
         self._inflight = False
         self._waiters = 0
         self._cache: "Optional[Dict[str, Any]]" = None
@@ -166,7 +173,11 @@ class HostGrantSurface:
         spawn = self._spawn if self._spawn is not None else adopt_view.Seams().spawn
 
         def capped(argv: Any, **kw: Any) -> "subprocess.CompletedProcess[bytes]":
-            p = spawn(argv, **kw)
+            try:
+                p = spawn(argv, **kw)
+            except subprocess.TimeoutExpired as e:
+                self._left = getattr(e, "child", None)      # still running: _release_spawn holds the lock until it exits
+                raise
             if len(p.stdout or b"") > ANSWER_MAX:
                 raise Refused("host-grants-answer-malformed", f"{verb}: over {ANSWER_MAX} bytes")
             return p
@@ -225,8 +236,10 @@ class HostGrantSurface:
     def _fetch(self, deadline: float) -> "Tuple[Dict[str, Any], bool]":
         """One aggregate call within the wall. (answer, cacheable): a call that never started is not cached."""
         left = deadline - self._clock()
-        if left < MIN_SPAWN_S or not self._spawn_lock.acquire(timeout=max(0.0, left - MIN_SPAWN_S)):
+        if left < MIN_SPAWN_S:
             return _note_unreadable("host-grants-deadline"), False
+        if not self._spawn_lock.acquire(timeout=left - MIN_SPAWN_S):
+            return _note_unreadable("host-grants-busy"), False
         try:
             left = deadline - self._clock()
             if left < MIN_SPAWN_S:
@@ -240,7 +253,23 @@ class HostGrantSurface:
                 _log.warning("host grants listing failed: %s: %s", type(e).__name__, e)
                 return _note_unreadable("host-grants-unreadable"), True
         finally:
+            self._release_spawn()
+
+    def _release_spawn(self) -> None:
+        """Give the spawn lock back, or, when the call left its child running (a timeout), hand it to a reaper thread
+        that gives it back once that child exits."""
+        child, self._left = self._left, None
+        if child is None:
             self._spawn_lock.release()
+            return
+
+        def reap() -> None:
+            try:
+                child.wait()
+            finally:
+                self._spawn_lock.release()
+
+        threading.Thread(target=reap, name="host-grants-reap", daemon=True).start()
 
     def _invalidate(self) -> None:
         with self._cv:
@@ -267,13 +296,12 @@ class HostGrantSurface:
     def revoke(self, session: str, target: str, credential: str, deadline: float) -> "Tuple[Dict[str, Any], int]":
         """``(answer, http status)``. ``result`` is ``revoked`` (with ``count``), ``gone`` (not in force: nothing was
         sent to root to revoke, or root says it was not there) or an ``error`` (``rate_limited`` 429, ``bad_request``
-        400, ``busy`` 409, ``refused`` 502, ``unreadable`` 503). ``revoked`` and ``gone`` carry a fresh ``listing``
-        (a refusal changes nothing the page shows; it re-lists on its own). ``credential`` is the credential's NAME (never its token)."""
-        if not isinstance(credential, str) or not self._rate_ok(credential):
-            return {"error": "rate_limited",
-                    "message": "too many revokes from this device; wait a minute"}, 429
-        if (not isinstance(session, str) or SESSION_RE.fullmatch(session) is None or not isinstance(target, str)
-                or _TARGET_RE.fullmatch(target) is None):
+        400, ``busy`` 409, ``refused`` 502, ``unknown`` 502, ``unreadable`` 503). ``revoked``, ``gone`` and ``unknown``
+        (root was started and did not answer clearly: it may have applied the revoke) carry a fresh ``listing``, which
+        may itself be an unreadable note (a refusal changes nothing the page shows; it re-lists on its own). The rate
+        limit counts the revoke calls that reach root only. ``credential`` is the credential's NAME (never its token)."""
+        if (not isinstance(credential, str) or not isinstance(session, str) or SESSION_RE.fullmatch(session) is None
+                or not isinstance(target, str) or _TARGET_RE.fullmatch(target) is None):
             return {"error": "bad_request", "message": "a session and a grant id or all are needed"}, 400
         if not self._revokes.acquire(blocking=False):
             return {"error": "busy", "message": "not revoked; busy, tap again"}, 409
@@ -306,6 +334,8 @@ class HostGrantSurface:
             left = deadline - self._clock()
             if left < MIN_SPAWN_S:
                 return {"error": "busy", "message": "not revoked; busy, tap again"}, 409
+            if not self._rate_ok(credential):
+                return {"error": "rate_limited", "message": "too many revokes from this device; wait a minute"}, 429
             from levain.slot import egress_ledger as EL
 
             refusal = None    # type: Optional[str]
@@ -317,7 +347,7 @@ class HostGrantSurface:
                 _log.warning("host grant revoke: %s: %s", type(e).__name__, e)
                 refusal, ans = "host-grants-unreadable", {}
         finally:
-            self._spawn_lock.release()
+            self._release_spawn()
         # the fresh listing in every answer below takes the spawn lock itself: never call it while holding it
         if refusal is not None:
             return self._refused(refusal, credential, session, target, deadline)
@@ -336,8 +366,8 @@ class HostGrantSurface:
                             credential, session, target, "recorded-gone", deadline)
 
     def _refused(self, name: str, credential: str, session: str, target: str, deadline: float) -> "Tuple[Dict[str, Any], int]":
-        _log.info("host grant revoke credential=%r session=%s target=%s answer=refused:%s", credential, session, target,
-                  name)
+        _log.info("host grant revoke credential=%r session=%s target=%s answer=%s:%s", credential, session, target,
+                  "unknown" if name in _UNKNOWN_NAMES else "refused", name)
         self._invalidate()
         if name in _GONE_NAMES:
             return self._answer({"result": "gone", "count": 0,
@@ -345,6 +375,11 @@ class HostGrantSurface:
                                 credential, session, target, None, deadline)
         if name in _BUSY_NAMES:
             return {"error": "busy", "name": name, "message": "not revoked; busy, tap again"}, 409
+        if name in _UNKNOWN_NAMES:
+            body, _ = self._answer({"error": "unknown", "name": name,
+                                    "message": "root did not answer clearly: the grant may or may not be revoked; "
+                                               "the list shows which"}, credential, session, target, None, deadline)
+            return body, 502
         words = ("narrowed, but the change may not survive a power loss" if name == "egress-grant-unsure"
                  else f"not revoked: root refused ({name})")
         return {"error": "refused", "name": name, "message": words}, 502
