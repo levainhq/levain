@@ -901,6 +901,8 @@ def _chk_conflict_closed_band(ctx: _Ctx, item: Item):
 
 def _chk_conflict_chain_orphan(ctx: _Ctx, item: Item):
     chain, orphans = ctx.idx.chain.get(item.id), ctx.idx.orphans(item.id)
+    if _trailer_close(ctx, item):       # a Board-Closes on main closed it (rule 2: done): an orphan beside its chain is branch hygiene
+        return None
     if chain and orphans:
         b = max(orphans, key=_branch_key)
         return (f"conflict: in chain {chain[0][0]} vs orphan branch {b.name} {_short(b.tip)} "

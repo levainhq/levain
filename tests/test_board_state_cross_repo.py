@@ -71,3 +71,32 @@ def test_the_other_repos_git_is_not_used_for_this_repos_own_rows():
     wrong = _evidence(main=[_closed("flow#6")])             # only levain's git names flow#6: it is not flow's work
     got = _states(lines, flow_git, repo="flow", other_evidence={"levain": wrong})
     assert got["flow#6"].state == "ready", got["flow#6"]
+
+
+# ------------------------------------------------------------------------------------------------ levain#73
+def _orphaned(**item):
+    chain = [{"ref": "queue/x/sr2", "commits": [{"sha": "d" * 40, "items": ["levain#1"]}]}]
+    orphan = {"name": "seat/1114-44-storeresolver", "tip": "e" * 40, "date": "2026-11-12T11:00:00Z", "items": ["levain#1"],
+              "ahead": 23}
+    return _evidence(chain=chain, branches=[orphan], **item)
+
+
+def test_a_closed_row_with_an_orphan_branch_beside_its_chain_reads_done():
+    got = _states([_add("levain#1")], _orphaned(main=[_closed("levain#1")]))["levain#1"]
+    assert got.state == "done" and "ccccccccc" in got.reason, got
+
+
+def test_the_same_chain_and_orphan_without_a_closing_trailer_is_still_the_conflict():
+    got = _states([_add("levain#1")], _orphaned())["levain#1"]
+    assert got.state == "unknown" and "orphan branch seat/1114-44-storeresolver" in got.reason, got
+
+
+def test_no_row_with_a_closing_trailer_on_main_reads_unknown_for_an_orphan_or_a_chain():
+    lines = [_add(f"levain#{n}") for n in range(1, 4)]
+    ev = _evidence(
+        main=[{"sha": SHA, "date": "2026-11-12T12:00:00Z", "items": [], "closes": [f"levain#{n}" for n in range(1, 4)]}],
+        chain=[{"ref": f"queue/x/{n}", "commits": [{"sha": "d" * 40, "items": [f"levain#{n}"]}]} for n in range(1, 4)],
+        branches=[{"name": f"seat/b{n}", "tip": "e" * 40, "date": "2026-11-12T11:00:00Z", "items": [f"levain#{n}"], "ahead": 2}
+                  for n in range(1, 4)])
+    got = _states(lines, ev)
+    assert {i: s.state for i, s in got.items()} == {"levain#1": "done", "levain#2": "done", "levain#3": "done"}
