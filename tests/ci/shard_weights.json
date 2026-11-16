@@ -900,6 +900,8 @@
   "tests/test_slot_dispatch_runtime.py": 7.1,
   "tests/test_slot_dispatch_usage.py": 0.2,
   "tests/test_slot_dispatch_workspace.py": 21.3,
+  "tests/test_slot_egress_cards.py": 0.6,
+  "tests/test_slot_egress_cards_supervisor.py": 68.0,
   "tests/test_slot_egress_grant_real_sig.py": 6.6,
   "tests/test_slot_egress_grant_removal.py": 3.6,
   "tests/test_slot_egress_grant_verbs.py": 11.0,
