@@ -22,10 +22,12 @@ def said(at: float) -> Match:
 
 
 def test_each_word_a_setter_replaces_stays_on_record_and_the_card_names_the_setter(tmp_path):
-    # the card below reads the REAL clock, so the rows are stamped at test time: the module's T is taken at
-    # collection, and a suite that runs longer than the last word's default quiet (the dep-drift run took 61
-    # minutes) would find the standing word already expired (found by the 11-14 dep-drift run, issue #4)
-    T = time.time() - 1800.0
+    # Every clock is injected: the rows are stamped from T, the card is read at NOW (a pure function of its inputs).
+    # The card used to read the wall clock while T came from collection time or from the test's start, so a run that
+    # stood still for the last word's default quiet (3600 s) read the standing word as ended and the card as None
+    # (the dep-drift reds of 11-13 and 11-14, a 61-minute unsharded suite; see the test below that pins the state).
+    T = 1_800_000_000.0 - 1800.0
+    NOW = T + 1800.0
     set_word(tmp_path, "quiet", duration="2h", now=T)
     set_word(tmp_path, "away", by=SEAT, said="anything at all", now=T + 60, match=said(T + 30))
     set_word(tmp_path, "sleep", now=T + 120)
@@ -35,10 +37,23 @@ def test_each_word_a_setter_replaces_stays_on_record_and_the_card_names_the_sett
         ("quiet", "set", None), ("away", "set", "quiet"), ("sleep", "set", "away"), ("quiet", "set", "sleep")]
     assert rows[1]["by"] == SEAT and rows[1]["said"] == "anything at all" and "by" not in rows[0]
     assert rows[3]["by"] == COORD and rows[3]["prior"] == {"word": "sleep"}
-    card = morning._presence(tmp_path)   # the standing word is the desk's; the rows are old, so no refusals
+    assert read_word(tmp_path, NOW, idle=lambda: None) is not None   # a swallowed fault would read None here, not as a TypeError below
+    card = morning._presence(tmp_path, NOW)   # the standing word is the desk's; the rows are old, so no refusals
     assert card["word"] == "quiet" and card["by"] == COORD and card["said"] == "I am on the train"
     set_word(tmp_path, "quiet", duration="1m", by=COORD, said="back soon", now=T)   # ran out 29 minutes ago
-    assert morning._presence(tmp_path) is None
+    assert morning._presence(tmp_path, NOW) is None
+
+
+def test_the_card_reads_none_once_the_default_quiet_has_run_out_and_names_the_setter_before(tmp_path):
+    """The state that reddened the nightly dep-drift run: a `quiet` with no duration stands for 3600 s from its
+    stamp; the card read after that is None (read_word reads an ended word as None, correctly). Pinned by injection."""
+    t = 1_800_000_000.0
+    set_word(tmp_path, "quiet", by=COORD, said="I am on the train", now=t, match=said(t - 30))
+    for now in (t + 1, t + 3599.0):
+        assert morning._presence(tmp_path, now)["by"] == COORD
+    for now in (t + 3600.0, t + 4000.0):   # the 61-minute suite
+        assert read_word(tmp_path, now, idle=lambda: None) is None
+        assert morning._presence(tmp_path, now) is None
 
 
 def test_a_refusal_leaves_a_row_and_the_word_unchanged(tmp_path):
