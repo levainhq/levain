@@ -565,3 +565,29 @@ def test_each_audited_item_id_appears_in_the_audit_exactly_once_per_world():
     board = bs.derive_all(bs.fold(lines), ev, now=NOW)
     ids = [a.id for a in board.audit if a.id]
     assert sorted(ids) == ["levain#1", "levain#2", "levain#3"], board.audit
+
+
+# ------------------------------------------------------------------------------------------------ levain#73
+def _orphan_world(closes: bool):
+    """The reproduced shape: levain#1 and levain#8 each ride a stale queue ref and each has an orphan seat branch with
+    own commits; only levain#1 has a Board-Closes trailer on main."""
+    lines = [_line(iid="levain#1", done="d", tier="sonnet"), _line(iid="levain#8", done="d", tier="sonnet")]
+    main = [{"sha": "a" * 40, "date": "2026-11-11T00:00:00Z", "items": ["levain#1"], "closes": ["levain#1"] if closes else []}]
+    ev = bs.Evidence.from_dict({
+        "evidence_v": 1, "fetched_at": "2026-11-12T19:30:00Z", "unreadable": {}, "refs": [], "merged": [], "main": main,
+        "chain": [{"ref": "queue/1114-land3/sr2", "tip": "1" * 40, "commits": [{"sha": "1" * 40, "items": ["levain#1"]}]},
+                  {"ref": "queue/1114-land3/nd1", "tip": "2" * 40, "commits": [{"sha": "2" * 40, "items": ["levain#8"]}]}],
+        "branches": [{"name": "seat/1114-44-storeresolver", "tip": "3" * 40, "date": "2026-11-11T09:00:00Z", "ahead": 23, "items": ["levain#1"]},
+                     {"name": "seat/1114-41-nd1ci", "tip": "4" * 40, "date": "2026-11-11T09:00:00Z", "ahead": 37, "items": ["levain#8"]}],
+        "seats": [], "band": {"open": {}, "resolved": {}}, "waiters": [], "documents": {}, "unattributed": []})
+    return {s.id: s for s in bs.derive_all(bs.fold(lines), ev, now=NOW).items}
+
+
+def test_a_closing_trailer_on_main_reads_done_beside_an_orphan_branch_with_extra_commits():
+    s = _orphan_world(closes=True)["levain#1"]
+    assert s.state == "done" and "seat/1114-44-storeresolver" in s.reason and "closed by" in s.reason
+
+
+def test_no_closing_trailer_beside_an_orphan_branch_is_still_a_conflict():
+    s = _orphan_world(closes=False)["levain#1"]
+    assert s.state == "unknown" and s.reason.startswith("conflict: in chain queue/1114-land3/sr2 vs orphan branch seat/1114-44-storeresolver")
