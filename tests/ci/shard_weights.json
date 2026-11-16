@@ -215,6 +215,7 @@
   "tests/test_broker_creds.py": 3.0,
   "tests/test_broker_creds_refresh.py": 95.0,
   "tests/test_broker_front.py": 8.5,
+  "tests/test_broker_front_grants.py": 7.4,
   "tests/test_broker_front_passthrough_limits.py": 3.9,
   "tests/test_broker_keys_admin.py": 4.5,
   "tests/test_broker_keys_admission.py": 13.3,
