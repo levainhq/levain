@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import signal
 import socket
 import subprocess
@@ -88,6 +89,9 @@ class _ChromeProxy:
     def __init__(self, upstream: int, mode: str, delay: float = 2.5, refuse_http: bool = False) -> None:
         self.upstream, self.mode, self.delay, self.refuse_http = upstream, mode, delay, refuse_http
         self.tripped = False
+        self.refused = 0                              # connections/requests the proxy refused after the trip
+        self.http_log: list[tuple[bool, bytes]] = []  # every non-browser request forwarded upstream: (tripped at that moment, bytes)
+        self._lock = threading.Lock()             # one lock around "check tripped + forward" and around "set tripped"
         self._socks: list[socket.socket] = []
         self._srv = socket.socket()
         self._srv.bind(("127.0.0.1", 0))
@@ -97,6 +101,10 @@ class _ChromeProxy:
 
     def close(self) -> None:
         for s in [self._srv, *self._socks]:
+            try:
+                s.shutdown(socket.SHUT_RDWR)   # wakes a thread blocked in recv on it; close alone does not
+            except OSError:
+                pass
             try:
                 s.close()
             except OSError:
@@ -140,6 +148,35 @@ class _ChromeProxy:
             del buf[:end]
             yield raw, payload
 
+    def _refusing(self) -> bool:
+        return self.tripped and self.refuse_http
+
+    @staticmethod
+    def _send(up: socket.socket, payload: bytes, timeout: float = 5) -> None:
+        """Send all of `payload` on `up` within `timeout` seconds (OSError past it). `up` stays blocking for the pump thread's reads, so
+        the bound is select plus non-blocking sends, not a socket timeout."""
+        deadline, view = time.monotonic() + timeout, memoryview(payload)
+        while view:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([], [up], [], left)[1]:
+                raise OSError("the upstream stopped reading")
+            try:
+                view = view[up.send(view, socket.MSG_DONTWAIT):]
+            except BlockingIOError:
+                pass
+
+    def _forward_http(self, up: socket.socket, payload: bytes) -> bool:
+        """Forward a non-browser request unless the proxy is refusing. The decision (check + log entry, with `tripped` as of the
+        decision) is made under the lock against the trip, so no request is decided "forward" once `tripped` is set; the send itself
+        is outside the lock, so a stalled upstream cannot keep the trip from being recorded."""
+        with self._lock:
+            if self._refusing():
+                self.refused += 1
+                return False
+            self.http_log.append((self.tripped, payload))
+        self._send(up, payload)
+        return True
+
     def _serve(self, c: socket.socket) -> None:
         try:
             up = socket.create_connection(("127.0.0.1", self.upstream), timeout=5)
@@ -158,13 +195,25 @@ class _ChromeProxy:
                     if end < 0:
                         continue
                     browser = b"/devtools/browser/" in bytes(head[:end])
-                    up.sendall(bytes(head[:end + 4]))
-                    data = bytes(head[end + 4:])
+                    if browser:
+                        up.sendall(bytes(head[:end + 4]))
+                        data = bytes(head[end + 4:])
+                    else:
+                        data = bytes(head)
                 if not browser:
-                    if self.tripped and self.refuse_http:
-                        c.shutdown(socket.SHUT_RDWR)
+                    # the refusal is decided BEFORE a byte goes upstream: a request forwarded first is one Chrome answers (the pump
+                    # thread relays the answer) while this thread is still on its way to the shutdown
+                    if data and not self._forward_http(up, data):
+                        # each half is SHUT DOWN, then closed, and each step is guarded (the client's shutdown raises when it already reset).
+                        # On Linux a close() from this thread does not release a socket the pump thread is blocked in recv on (the kernel
+                        # holds it until that recv returns), so a bare up.close() left the upstream half open: only the shutdown wakes it
+                        for s in (c, up):
+                            for step in (lambda s=s: s.shutdown(socket.SHUT_RDWR), s.close):
+                                try:
+                                    step()
+                                except OSError:
+                                    pass
                         return
-                    up.sendall(data)
                     continue
                 frames += data
                 for raw, payload in self._client_frames(frames):
@@ -175,7 +224,8 @@ class _ChromeProxy:
                     if holding:
                         continue
                     if method == "Target.getTargets":
-                        self.tripped = True
+                        with self._lock:
+                            self.tripped = True
                         if self.mode == "drop":
                             c.shutdown(socket.SHUT_RDWR)
                             return
@@ -192,6 +242,242 @@ class _ChromeProxy:
             c.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+
+
+class _Upstream:
+    """A stand-in for Chrome: answers every complete HTTP request head (however the bytes were split) with a 200."""
+
+    def __init__(self) -> None:
+        self._stop = False
+        self._conns: list[socket.socket] = []
+        self._threads: list[threading.Thread] = []
+        self._srv = socket.socket()
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(16)
+        self._srv.settimeout(0.1)
+        self.port = self._srv.getsockname()[1]
+        self._acceptor = threading.Thread(target=self._accept, daemon=True)
+        self._acceptor.start()
+
+    def _spawn(self, target, *args) -> None:
+        t = threading.Thread(target=target, args=args, daemon=True)
+        t.start()                     # started before it is listed: a listed thread can always be joined
+        self._threads.append(t)
+
+    def close(self) -> None:
+        self._stop = True
+        self._acceptor.join(2)        # the acceptor is the only writer of _conns/_threads: once it is gone the snapshot below is final
+        for s in [self._srv, *self._conns]:
+            try:
+                s.shutdown(socket.SHUT_RDWR)   # wakes a thread blocked in recv on it; close alone does not
+            except OSError:
+                pass
+            try:
+                s.close()
+            except OSError:
+                pass
+        for t in self._threads:
+            t.join(2)
+
+    def _accept(self) -> None:
+        while not self._stop:
+            try:
+                c, _ = self._srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self._conns.append(c)
+            self._spawn(self._serve, c)
+
+    @staticmethod
+    def _serve(c: socket.socket) -> None:
+        buf = bytearray()
+        try:
+            while data := c.recv(65536):
+                buf += data
+                while (end := buf.find(b"\r\n\r\n")) >= 0:
+                    del buf[:end + 4]
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]")
+        except OSError:
+            pass
+
+
+@pytest.fixture
+def rig():
+    """make(mode, refuse_http) -> (upstream stand-in, proxy in front of it); both are closed when the test ends."""
+    made: list = []
+
+    def make(mode: str = "drop", refuse_http: bool = False, proxy_cls=_ChromeProxy):
+        up = _Upstream()
+        proxy = proxy_cls(up.port, mode, refuse_http=refuse_http)
+        made.append((up, proxy))
+        return up, proxy
+
+    yield make
+    for up, proxy in made:
+        proxy.close()
+        up.close()
+
+
+def _http_get(s: socket.socket) -> bytes:
+    """One GET /json over `s`: the bytes that came back (whole response, or until the connection ended or went quiet; b"" when refused)."""
+    s.settimeout(2)
+    got = b""
+    try:
+        s.sendall(b"GET /json HTTP/1.1\r\nHost: x\r\n\r\n")
+        while not got.endswith(b"[]"):
+            data = s.recv(65536)
+            if not data:
+                break
+            got += data
+    except socket.timeout:
+        return got or b"(silence)"
+    except OSError:
+        pass
+    return got
+
+
+def _http_get_rest(s: socket.socket) -> bytes:
+    """The response to a GET already sent on `s` (whole response, or until the connection ended or went quiet)."""
+    s.settimeout(2)
+    got = b""
+    try:
+        while not got.endswith(b"[]"):
+            data = s.recv(65536)
+            if not data:
+                break
+            got += data
+    except OSError:
+        pass
+    return got
+
+
+def _trip(proxy: _ChromeProxy) -> socket.socket:
+    """Open a browser websocket through the proxy and send Target.getTargets as a masked frame; returns once the proxy has seen it."""
+    b = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+    b.sendall(b"GET /devtools/browser/x HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n")
+    payload = json.dumps({"id": 1, "method": "Target.getTargets"}).encode()
+    key = b"\x01\x02\x03\x04"
+    b.sendall(bytes([0x81, 0x80 | len(payload)]) + key + bytes(x ^ key[i % 4] for i, x in enumerate(payload)))
+    deadline = time.monotonic() + 5
+    while not proxy.tripped and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert proxy.tripped, "the proxy never saw Target.getTargets"
+    return b
+
+
+def test_the_rig_refuses_an_http_client_that_connects_after_the_trip_without_asking_upstream(rig) -> None:
+    up, proxy = rig(refuse_http=True)
+    _trip(proxy)
+    for _ in range(20):   # the old order forwarded the head upstream first, so a quick answer could win the race: every attempt must be refused
+        with socket.create_connection(("127.0.0.1", proxy.port), timeout=5) as s:
+            assert _http_get(s) == b""
+    assert proxy.refused == 20, "the refusal path was not what ended the connections"
+    assert proxy.http_log == [], "a request went upstream after the trip: the refusal came after the forward"
+
+
+def test_the_rig_refuses_an_http_client_that_was_connected_before_the_trip_on_its_next_bytes(rig) -> None:
+    up, proxy = rig(refuse_http=True)
+    with socket.create_connection(("127.0.0.1", proxy.port), timeout=5) as s:
+        assert b"200 OK" in _http_get(s)   # before the trip the listing answers, twice: the connection is alive and kept open
+        assert b"200 OK" in _http_get(s)
+        _trip(proxy)
+        assert _http_get(s) == b""
+    assert proxy.refused == 1
+    assert [t for t, _ in proxy.http_log] == [False, False], "a request went upstream after the trip"
+
+
+class _StalledForward(_ChromeProxy):
+    """The send of a forwarded request stalls (an upstream that stopped reading) until `release` is set."""
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def _send(self, up, payload, timeout: float = 5) -> None:
+        self.entered.set()
+        self.release.wait(10)
+        super()._send(up, payload, timeout)
+
+
+def test_a_forward_that_is_stalled_in_its_send_does_not_keep_the_trip_from_landing(rig) -> None:
+    up, proxy = rig(refuse_http=True, proxy_cls=_StalledForward)
+    with socket.create_connection(("127.0.0.1", proxy.port), timeout=5) as s:
+        s.sendall(b"GET /json HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert proxy.entered.wait(5), "the request never reached the send"
+        try:
+            _trip(proxy)   # the send is in flight: the trip is recorded anyway (it used to queue on the lock the send held)
+        finally:
+            proxy.release.set()
+        assert b"200 OK" in _http_get_rest(s), "the request decided before the trip was not answered"
+    assert [t for t, _ in proxy.http_log] == [False], ("the decision made before the trip must keep its logged state", proxy.http_log)
+
+
+def test_a_refused_client_that_resets_after_its_request_still_has_both_sockets_closed(rig) -> None:
+    up, proxy = rig(refuse_http=True)
+    _trip(proxy)
+    c = socket.create_connection(("127.0.0.1", proxy.port), timeout=5)
+    c.sendall(b"GET /json HTTP/1.1\r\nHost: x\r\n\r\n")
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")   # close() sends a reset
+    c.close()
+    deadline = time.monotonic() + 5
+    while proxy.refused < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert proxy.refused == 1
+    # the proxy's upstream half is closed when it ends the refused connection: the stand-in sees the end of that connection and its
+    # serving thread exits (the trip's own upstream half stays open by design, so the refused one is the thread that goes away)
+    deadline = time.monotonic() + 5
+    while sum(t.is_alive() for t in up._threads) > 1 and time.monotonic() < deadline:   # the trip's connection
+        time.sleep(0.01)
+    assert sum(t.is_alive() for t in up._threads) <= 1, "the refused connection's upstream half was left open"
+
+
+def test_the_upstream_stand_in_closes_promptly_with_a_client_still_connected() -> None:
+    up = _Upstream()
+    c = socket.create_connection(("127.0.0.1", up.port), timeout=5)
+    deadline = time.monotonic() + 5
+    while not up._conns and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert up._conns
+    t0 = time.monotonic()
+    up.close()
+    c.close()
+    assert time.monotonic() - t0 < 1, "close() waited out a thread blocked in recv"
+
+
+def test_the_upstream_stand_in_leaves_no_connection_open_or_thread_running_when_clients_connect_during_close() -> None:
+    for _ in range(40):
+        up = _Upstream()
+        stop = threading.Event()
+        clients: list[socket.socket] = []
+
+        def flood() -> None:
+            while not stop.is_set():
+                try:
+                    clients.append(socket.create_connection(("127.0.0.1", up.port), timeout=1))
+                except OSError:
+                    return
+        t = threading.Thread(target=flood, daemon=True)
+        t.start()
+        time.sleep(0.02)
+        t0 = time.monotonic()
+        up.close()
+        stop.set()
+        t.join(5)
+        for c in clients:
+            c.close()
+        assert time.monotonic() - t0 < 1.5, "close() waited out a late connection's thread"
+        assert all(c.fileno() == -1 for c in up._conns), "a connection accepted during close was left open"
+        assert not any(t.is_alive() for t in up._threads)
+
+
+def test_the_rig_without_refuse_http_still_forwards_after_the_trip(rig) -> None:
+    up, proxy = rig()
+    _trip(proxy)
+    with socket.create_connection(("127.0.0.1", proxy.port), timeout=5) as s:
+        assert b"200 OK" in _http_get(s)
+    assert proxy.refused == 0 and [t for t, _ in proxy.http_log] == [True]
 
 
 @needs_browser
