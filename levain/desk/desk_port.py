@@ -461,7 +461,10 @@ class HostCommandDeskPort:
             if held is not None or not block:       # an aged reading is answered as it is and refreshed behind the request
                 if not self._ctx_busy:
                     self._ctx_busy = True
-                    threading.Thread(target=self._refresh_context, daemon=True, name="desk-context").start()
+                    try:
+                        threading.Thread(target=self._refresh_context, daemon=True, name="desk-context").start()
+                    except Exception:       # a thread that could not start must not leave the flag set: the next poll tries again
+                        self._ctx_busy = False
                 return held[1] if held is not None else desk_context.NoReading("not read yet")
         with self._ctx_run:                 # one run at a time: a waiter takes the reading the run it waited for left
             with self._ctx_state:
@@ -473,6 +476,10 @@ class HostCommandDeskPort:
     def _refresh_context(self) -> None:
         try:
             with self._ctx_run:
+                with self._ctx_state:
+                    held = self._ctx_held
+                if held is not None and time.monotonic() - held[0] < CONTEXT_TTL:
+                    return          # a blocking first ask ran the command while this waited: once per TTL means once
                 self._read_context_now()
         except Exception:       # noqa: BLE001 - a background refresh that failed leaves the held reading to age out
             pass
@@ -480,29 +487,36 @@ class HostCommandDeskPort:
             with self._ctx_state:
                 self._ctx_busy = False
 
+    @staticmethod
+    def _stat_key(named: desk_context.Named) -> Optional[tuple[Any, ...]]:
+        try:
+            st = os.stat(named.path)
+        except OSError:
+            return None
+        return (str(named.path), named.deep, named.holder, st.st_mtime_ns, st.st_size)
+
     def _read_context_now(self) -> Optional[desk_context.ContextView | desk_context.NoReading]:
         """Run the host's context command and read the transcript it names; keep the answer (a failure included) for the TTL. The
-        tail read is skipped when the transcript's path, mtime and size are those of the last read. Stderr on a command that exited
-        0 is ignored (:func:`levain.desk.room_host.run` keeps stdout when there is any), as the lease and events commands do."""
+        tail read is skipped when the transcript's path, mtime and size are those of the last read, and only a reading is ever kept
+        by that key (a failed read is tried again at the next TTL), and only when the file did not change while it was read. Stderr on
+        a command that exited 0 is ignored (:func:`levain.desk.room_host.run` keeps stdout when there is any), as the lease and
+        events commands do."""
         view: Optional[desk_context.ContextView | desk_context.NoReading] = None
         try:
             assert self._cmds.context is not None
             ran = room_host.run(self._cmds.context, "", (), timeout=self._timeout)
             named = desk_context.parse_command(ran.out) if ran.started and ran.code == 0 else None
             if named is not None:
-                try:
-                    st = os.stat(named.path)
-                    key: Optional[tuple[Any, ...]] = (str(named.path), named.deep, named.holder, st.st_mtime_ns, st.st_size)
-                except OSError:
-                    key = None
+                key = self._stat_key(named)
                 with self._ctx_state:
                     prev = self._ctx_key_view
                 if key is not None and prev is not None and prev[0] == key:
                     view = prev[1]
                 else:
                     view = desk_context.read_context(named.path, deep=named.deep, holder=named.holder)
-                    with self._ctx_state:
-                        self._ctx_key_view = (key, view) if key is not None else None
+                    after = self._stat_key(named)
+                    with self._ctx_state:       # kept only for a reading of a file that stood still while it was read
+                        self._ctx_key_view = (key, view) if view is not None and key is not None and key == after else None
         finally:
             with self._ctx_state:
                 self._ctx_held = (time.monotonic(), view)
