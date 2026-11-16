@@ -490,8 +490,9 @@ def test_11_the_kind_matrix_of_vendor_argv_is_unchanged_but_for_the_executor():
     for kind, tk in (("interactive", None), ("login", None), ("planner", "planner"), ("dispatch", "planner")):
         assert SS.vendor_argv("linux", "claude", s, kind=kind, ticket_kind=tk) == today, kind
     assert SS.vendor_argv("linux", "claude", s) == today                               # the old three-argument call
+    # levain#65 L3 (C): a dispatch-rule Codex launch pins web_search "disabled" (its codec refuses the cached tool)
     assert SS.vendor_argv("linux", "codex", s, kind="dispatch", ticket_kind="planner") == (
-        f"{prefix}/bin/codex", *RD.CODEX_LAUNCH_ARGS)
+        f"{prefix}/bin/codex", *RD.CODEX_DISPATCH_LAUNCH_ARGS)
     assert SS.vendor_argv("linux", "codex", s) == (f"{prefix}/bin/codex", *RD.CODEX_LAUNCH_ARGS)
     with pytest.raises(Refused) as e:
         SS.vendor_argv("linux", "claude", s, kind="dispatch", ticket_kind=None)

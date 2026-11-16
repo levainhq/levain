@@ -181,10 +181,13 @@ EXECUTOR_PROMPT = "Execute the task in your system prompt."
 
 
 def vendor_argv(host: str, vendor: str, session: str, *, kind: Optional[str] = None,
-                ticket_kind: Optional[str] = None) -> Tuple[str, ...]:
+                ticket_kind: Optional[str] = None, extra: Tuple[str, ...] = (),
+                auth: Optional[str] = None) -> Tuple[str, ...]:
     """The vendor's exec: its binary under the root-owned vendor prefix (§2.1). Claude Code reads the rendered
     ``--settings`` layer (render's ``<S>/root/settings.json``); Codex reads ``CODEX_HOME/config.toml`` and takes
-    render's :data:`~levain.slot.render.CODEX_LAUNCH_ARGS` on its command line.
+    render's :data:`~levain.slot.render.CODEX_LAUNCH_ARGS` on its command line, or on a dispatch-rule session
+    (:func:`~levain.slot.render.codex_dispatch_route` of ``kind`` and the alloc's ``auth``)
+    :data:`~levain.slot.render.CODEX_DISPATCH_LAUNCH_ARGS`, the same pin the render wrote.
 
     p71 S8 D4: for alloc ``kind`` ``dispatch`` whose ticket's kind (``ticket_kind``, from alloc's ``ticket_facts``)
     is ``executor``, on ``claude``, the print-mode exec: ``-p``, the project and local settings layers left out
@@ -194,7 +197,11 @@ def vendor_argv(host: str, vendor: str, session: str, *, kind: Optional[str] = N
     model flag: those live in the rendered layer. A ``dispatch`` session whose ticket facts are absent is refused
     ``ticket-facts-missing``: ``start`` never guesses the interactive form for a ticketed session. An executor
     ticket on any other vendor is refused ``executor-vendor-unsupported`` (no brief would reach it). Every other input
-    returns what it returned before."""
+    returns what it returned before.
+
+    ``extra``: caller-asked positional tokens for a Codex launch, bounded by
+    :func:`~levain.slot.render.codex_launch_args` (any token beginning ``-`` is refused by name); a ``claude``
+    launch takes none (``extra-argv``)."""
     from levain.slot.layout import STORE
     from levain.slot.root_tree import VENDOR_PREFIX
 
@@ -205,13 +212,15 @@ def vendor_argv(host: str, vendor: str, session: str, *, kind: Optional[str] = N
         raise Refused("executor-vendor-unsupported", f"an executor ticket on {vendor!s:.16}: only claude has the "
                                                      "print-mode exec that carries a brief")
     if vendor == "claude":
+        if extra:
+            raise Refused("extra-argv", "a claude launch takes no extra tokens")
         S = f"{STORE[host]}/live/{session}"
         if kind == "dispatch" and ticket_kind == "executor":
             return (binary, "-p", "--settings", f"{S}/root/settings.json", "--setting-sources", "",
                     "--strict-mcp-config", "--append-system-prompt-file", f"{S}/in/brief.md",
                     "--output-format", "stream-json", "--verbose", EXECUTOR_PROMPT)
         return (binary, "--settings", f"{S}/root/settings.json", "--setting-sources", "")
-    return (binary, *RD.CODEX_LAUNCH_ARGS)
+    return (binary, *RD.codex_launch_args(extra, dispatch=RD.codex_dispatch_route(kind, auth)))
 
 
 def is_executor(a: R.Alloc) -> bool:
@@ -908,7 +917,8 @@ def start(ctx: H.Ctx, req: RuntimeRequest, blob: None) -> Dict[str, object]:
         check_discovery(ctx, a)
         return VS.run(ctx, a, _verifier_hooks(ctx, a))
     # p71 S8 D4: a dispatch session whose ticket facts are absent is refused here, before any clone or spawn
-    vendor_argv(seams.host, a.vendor, a.session, kind=a.kind, ticket_kind=(a.ticket_facts or {}).get("kind"))
+    vendor_argv(seams.host, a.vendor, a.session, kind=a.kind, ticket_kind=(a.ticket_facts or {}).get("kind"),
+                auth=a.auth)
     seams.at("vendor")
     vendor_ready(seams.host, a.vendor)
     egress = a.slot.slot_class == "egress"
@@ -1138,7 +1148,7 @@ def _start_fenced(ctx: H.Ctx, a: R.Alloc, cap: Optional[VendorCapture] = None) -
         spawn_kw = {"stdin_null": True, "stdout_w": cap.out_w, "stderr_w": cap.err_w}
     spec = _spec(ctx, a, "vendor", extra_env=handles, exec_fd=wall.EXEC_FD,
                  argv=vendor_argv(seams.host, a.vendor, a.session, kind=a.kind,
-                                  ticket_kind=(a.ticket_facts or {}).get("kind")))
+                                  ticket_kind=(a.ticket_facts or {}).get("kind"), auth=a.auth))
     argv, cgroup = launch(ctx, a, spec)
     exec_r, exec_w = os.pipe()
     try:

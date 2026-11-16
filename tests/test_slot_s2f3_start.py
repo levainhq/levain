@@ -383,7 +383,7 @@ def test_codex_config_passes_only_as_rendered(env):
     cfg.write_bytes(rendered)
     assert w.main(["start", s])[1]["ok"]
     (v,) = la.of("vendor")
-    assert v["spec"]["argv"] == [f"{VENDOR_PREFIX['linux']}/bin/codex", "-c", 'web_search="disabled"']
+    assert v["spec"]["argv"] == [f"{VENDOR_PREFIX['linux']}/bin/codex", "-c", 'web_search="cached"']
 
 
 REPO_CODEX_LOOSENING = (
@@ -445,12 +445,12 @@ def test_codex_launch_keeps_a_repo_codex_config_out_of_the_effective_config(env)
     s = _rendered(w, "egress", "interactive", "codex", "brokered", blob=_blob(vendor="codex"))
     S = _S(w, s)
     cfg = (S / "config" / "codex" / "config.toml").read_text().splitlines()
-    assert 'web_search = "disabled"' in cfg and 'trust_level = "untrusted"' in cfg
+    assert 'web_search = "cached"' in cfg and 'trust_level = "untrusted"' in cfg
     assert not any(line.startswith("sandbox_mode") for line in cfg)       # Linux: Codex's default sandbox
     assert w.main(["start", s])[1]["ok"]
     (v,) = la.of("vendor")
     argv = v["spec"]["argv"]
-    assert argv == [f"{VENDOR_PREFIX['linux']}/bin/codex", "-c", 'web_search="disabled"']
+    assert argv == [f"{VENDOR_PREFIX['linux']}/bin/codex", "-c", 'web_search="cached"']
     # what the clone of such a repo leaves (the fake clone writes nothing): a .git (Codex's project root) and the file
     (S / "repo" / ".git").mkdir()
     (S / "repo" / ".codex").mkdir()
@@ -466,7 +466,7 @@ def test_codex_launch_keeps_a_repo_codex_config_out_of_the_effective_config(env)
     eff, origins = got["config"], got["origins"]
     (project,) = [layer for layer in got["layers"] if layer["name"]["type"] == "project"]
     assert project.get("disabledReason")
-    assert eff["web_search"] == "disabled" and origins["web_search"]["name"]["type"] == "sessionFlags"
+    assert eff["web_search"] == "cached" and origins["web_search"]["name"]["type"] == "sessionFlags"
     assert eff["approval_policy"] == "never" and origins["approval_policy"]["name"]["type"] == "user"
     assert eff.get("sandbox_mode") is None
     assert eff["model_provider"] == "levain" and origins["model_provider"]["name"]["type"] == "user"

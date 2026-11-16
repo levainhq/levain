@@ -114,14 +114,62 @@ ROUTE_TYPES = ("egress", "brokered", "subscription_passthrough")   # §4.1
 #: wfetch DESIGN §2.4: the proxy env names a repo settings layer may not set, upper and lower case. Clearing one
 #: cannot get past the OS wall (DESIGN §1.3), but every fetch would then fail with no cause shown.
 PROXY_ENV = frozenset(n for b in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY") for n in (b, b.lower()))
-#: wfetch RULINGS Q3: Codex's server-side search mode until Phill rules (fail closed: the front cannot see it).
-#: Operator note: a Codex that sends its turns through a dispatch route must have web search off too, as this launch
-#: does (`-c web_search="disabled"`). Its default `web_search` tool is a server tool the estimate cannot see, so a
-#: dispatch route refuses the whole request `body-unbounded:web_search`.
-CODEX_WEB_SEARCH = "disabled"
+#: np-69bb37ba ask 6b (signed 10-26): Codex's server-side search is pinned to the vendor's "cached" mode (the vendor's
+#: pre-indexed results, no live fetch), a NAMED channel of the Codex seat itself, never the broker's. "live" and
+#: `--search` are refused by name (:func:`codex_web_search`, :func:`codex_launch_args`).
+CODEX_WEB_SEARCH = "cached"
+#: The pin on a dispatch-rule session (:func:`codex_dispatch_route`). Under "cached" Codex 0.162.1 still declares a
+#: ``{"type": "web_search", "external_web_access": false}`` tool in every Responses body
+#: (tests/fixtures/client_bodies/codex_responses_exec.json), and a dispatch route's codec refuses that
+#: ``body-unbounded:web_search`` (``broker.codec``); "disabled" sends no such tool. DEFAULT pending Phill's ruling
+#: (needs-phill np-bdc9b3fd, rec (a)): cached never applies where a dispatch route's codec would refuse every turn.
+CODEX_WEB_SEARCH_DISPATCH = "disabled"
+#: The session kinds whose brokered routes take the dispatch rules: ``broker.front.DISPATCH_KINDS`` (a front loads
+#: their route policies as source ``dispatch-session``, ``broker.policy.DISPATCH_RULES``: no session cap, so keys
+#: runs the codec with ``dispatch=True``). Kept equal to it by a test; render does not import the front.
+CODEX_DISPATCH_KINDS = frozenset({"dispatch", "planner"})
 #: The Codex launch's ``-c`` overrides (``start.vendor_argv``), the layer above every config file, so ``web_search``
 #: holds even if the repo's own ``.codex/config.toml`` were loaded (``codex_config`` files the repo untrusted).
 CODEX_LAUNCH_ARGS = ("-c", f'web_search="{CODEX_WEB_SEARCH}"')
+CODEX_DISPATCH_LAUNCH_ARGS = ("-c", f'web_search="{CODEX_WEB_SEARCH_DISPATCH}"')
+
+
+def codex_dispatch_route(kind: str | None, auth: str | None) -> bool:
+    """Whether a session of this alloc ``kind`` and ``auth`` has a brokered route under the dispatch rules: a
+    :data:`CODEX_DISPATCH_KINDS` session whose auth is not ``passthrough`` or ``none`` (``brokered`` names exactly
+    one brokered route, ``_brokered_route``; an unknown auth is counted, so a caller that omits it fails closed)."""
+    return kind in CODEX_DISPATCH_KINDS and auth not in ("passthrough", "none")
+
+
+def codex_web_search(requested: str | None = None, *, dispatch: bool = False) -> str:
+    """The Codex ``web_search`` mode a render may carry: :data:`CODEX_WEB_SEARCH`, or on a dispatch-rule session
+    (``dispatch``, :func:`codex_dispatch_route`) :data:`CODEX_WEB_SEARCH_DISPATCH`. ``None`` or that pin returns it;
+    ``live`` (any case) is refused ``codex-web-search-live`` on every session; ``cached`` on a dispatch-rule session
+    ``codex-web-search-dispatch-route``; any other mode ``codex-web-search-mode``."""
+    pin = CODEX_WEB_SEARCH_DISPATCH if dispatch else CODEX_WEB_SEARCH
+    if requested is None or requested == pin:
+        return pin
+    if requested.lower() == "live":
+        raise Refused("codex-web-search-live", f"Codex web search is pinned to {pin!r}; live is refused")
+    if dispatch and requested.lower() == CODEX_WEB_SEARCH:
+        raise Refused("codex-web-search-dispatch-route", f"Codex web search is pinned to {pin!r} on a dispatch "
+                                                         "route: its codec refuses a web_search tool")
+    raise Refused("codex-web-search-mode", f"Codex web search is pinned to {pin!r}: {requested[:32]!r}")
+
+
+def codex_launch_args(extra: Iterable[str] = (), *, dispatch: bool = False) -> tuple[str, ...]:
+    """The pin's ``-c`` override (:data:`CODEX_LAUNCH_ARGS`, or :data:`CODEX_DISPATCH_LAUNCH_ARGS` on a
+    dispatch-rule session) then the caller's ``extra`` tokens. BOUNDED: ``extra`` carries positionals only (a
+    subcommand such as ``exec``, a prompt). Every token that begins with ``-`` is refused, whatever it spells
+    (clap's attached ``-cK=V`` / ``-c=K=V``, ``--config=``, ``--enable``, ``--profile``/``-p``, ``--oss``, ...):
+    ``--search`` and ``--search=...`` as ``codex-search-flag``, every other one as ``codex-extra-option``."""
+    toks = tuple(str(t) for t in extra)
+    for t in toks:
+        if t == "--search" or t.startswith("--search="):
+            raise Refused("codex-search-flag", "--search turns live web search on; Codex search is pinned")
+        if t.startswith("-"):
+            raise Refused("codex-extra-option", f"a Codex launch takes no caller option: {t[:32]!r}")
+    return (*(CODEX_DISPATCH_LAUNCH_ARGS if dispatch else CODEX_LAUNCH_ARGS), *toks)
 _TERM_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}", re.ASCII)
 #: DECISION: the slot's ``/var/folders/<xx>/<id>`` subtree (the parent of its ``DARWIN_USER_DIR``, as R-M2 measured
 #: it), its real ``/private`` path, in the alphabet ``confstr`` produces. Never a path a profile string must escape.
@@ -360,6 +408,9 @@ def check_facts(blob: RenderBlob, facts: RenderFacts) -> None:
     _brokered_route(blob, facts)
     egress_hosts(blob, facts)
     own_loopback(blob, facts)
+    # the wire's web_search request is vetted here, for EVERY vendor: a claude blob asking "live" is refused by the
+    # same name as a codex one, never accepted and dropped (every render reads codex.toml, claude too)
+    codex_web_search(blob.web_search, dispatch=codex_dispatch_route(facts.kind, facts.auth))
 
 
 def egress_hosts(blob: RenderBlob, facts: RenderFacts) -> tuple[str, ...]:
@@ -953,7 +1004,8 @@ def codex_config(blob: RenderBlob, facts: RenderFacts) -> dict[str, Any]:
     Brokered: the provider block runs/macos-RB 1e measured (env-only base URL did not work)."""
     check_facts(blob, facts)
     top: dict[str, Any] = {"approval_policy": "never", "cli_auth_credentials_store": "file",
-                           "web_search": CODEX_WEB_SEARCH}
+                           "web_search": codex_web_search(blob.web_search,
+                                                          dispatch=codex_dispatch_route(facts.kind, facts.auth))}
     if facts.host == "darwin":
         top["sandbox_mode"] = "danger-full-access"
     if blob.model is not None:
@@ -1448,7 +1500,8 @@ def front_limit_fields(tunnel_bytes_cap: object = None, deadline: object = None)
 
 __all__ = [
     "front_limit_fields", "VENDOR_PREFIX", "READSET_ATTRIBUTES", "READSET_ATTRIBUTES_PATH", "READSET_KINDS", "READSET_TEMPLATE",
-    "HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
+    "codex_web_search", "codex_launch_args", "codex_dispatch_route", "CODEX_WEB_SEARCH_DISPATCH",
+    "CODEX_DISPATCH_KINDS", "CODEX_DISPATCH_LAUNCH_ARGS","HookTemplate", "RenderFacts", "RenderedFile", "Rendered", "Contains", "DISCOVERY",
     "REPO_DISCOVERY", "wire_name", "gwport_for", "own_loopback", "check_facts", "render_env", "secret_env_names",
     "is_print_executor", "CONFIG_GUARD", "Frozen", "REPO_FILTER", "REPO_FILTER_MARGIN",
     "REPO_HOOK_TIMEOUT_DEFAULT", "REPO_HOOK_TIMEOUT_MAX", "freeze_repo_settings", "hook_command", "TOKEN_ENV", "ABSENT_ENV", "PASSTHROUGH_ABSENT_ENV", "PASSTHROUGH_TICKET_KEYS", "check_env_absent", "PROXY_ENV", "CODEX_WEB_SEARCH", "CODEX_LAUNCH_ARGS", "egress_hosts",

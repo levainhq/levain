@@ -88,7 +88,7 @@ def test_the_untested_version_message_names_what_the_caller_can_pass():
 
 
 def test_codex_canary_launch_pins_web_search_to_the_slots_value(tmp_path, monkeypatch):
-    """The canary's Codex turn is a model turn like a slot's: provider-side web search is pinned off the same way."""
+    """The canary's Codex turn is a model turn like a slot's: provider-side web search is pinned to the same "cached" mode."""
     from levain.slot.render import CODEX_WEB_SEARCH
 
     _fake(tmp_path / "bin", "codex", "#!{python}\nimport sys\nprint('codex-cli 0.0.0')\n")
@@ -106,5 +106,5 @@ def test_codex_canary_launch_pins_web_search_to_the_slots_value(tmp_path, monkey
     argv = launches[0]
     pairs = [(argv[i], argv[i + 1]) for i in range(len(argv) - 1)]
     # The literal is asserted beside the slot's constant: a constant that changed its text (quoted, or "live") must fail here.
-    assert CODEX_WEB_SEARCH == "disabled"
-    assert ("-c", 'web_search="disabled"') in pairs
+    assert CODEX_WEB_SEARCH == "cached"
+    assert ("-c", 'web_search="cached"') in pairs
