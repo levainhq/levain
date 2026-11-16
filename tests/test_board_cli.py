@@ -384,3 +384,58 @@ def test_a_repo_no_item_of_this_repo_depends_on_is_never_read(tmp_path, capsys):
     items = write_items(tmp_path, _row(1, "levain"), _row(5, "flow"))
     _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow")
     assert doc["reader"]["other_repos"] == []
+
+
+# ------------------------------------------------------------------------------------------------ levain#72 round 1 (L3)
+def _decide(iid: str, decision: str = "cut") -> str:
+    return json.dumps({"v": 1, "op": "decide", "id": iid, "at": AT, "by": "t", "decision": decision, "words": "w", "date": "2026-11-12"})
+
+
+@pytest.mark.parametrize("spec", ["levain=", "=/tmp", "levain", "", " =x"])
+def test_a_malformed_other_repo_is_refused_never_the_current_directory(tmp_path, capsys, spec):
+    home, items = _two_repos(tmp_path)
+    rc, out, err = run(capsys, "--json", "--items", str(items), "--repo", str(home.w), "--repo-name", "flow", "--other-repo", spec)
+    assert rc == 2 and out == "" and "--other-repo" in err and "NAME=PATH" in err, (rc, out, err)
+
+
+def test_an_other_repo_path_that_is_not_a_directory_is_refused(tmp_path, capsys):
+    home, items = _two_repos(tmp_path)
+    rc, out, err = run(capsys, "--json", "--items", str(items), "--repo", str(home.w), "--repo-name", "flow",
+                       "--other-repo", f"levain={tmp_path / 'nowhere'}")
+    assert rc == 2 and out == "" and "not a directory" in err, (rc, out, err)
+
+
+def test_a_foreign_repos_unreadable_source_is_on_the_board_naming_the_repo(tmp_path, capsys):
+    home, items = _two_repos(tmp_path)
+    (tmp_path / "levain" / ".git" / "refs" / "remotes").rename(tmp_path / "levain" / ".git" / "refs" / "remotes-x")
+    import shutil
+    shutil.rmtree(tmp_path / "levain" / ".git" / "refs" / "remotes-x")
+    rc, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow")
+    foreign = [a for a in doc["audit"] if a["id"] is None and a["why"].startswith("levain: ")]
+    assert rc == 3 and foreign, doc["audit"]
+    assert all(a["kind"] == "unknown" for a in foreign)
+
+
+def test_flows_gap_is_said_once_not_again_per_foreign_repo(tmp_path, capsys):
+    home, items = _two_repos(tmp_path)
+    extra = extra_file(tmp_path, unreadable={"seats": "the roster could not be read"})
+    _, doc, _ = board(capsys, home, items, extra, "--repo-name", "flow")
+    seats = [a["why"] for a in doc["audit"] if a["id"] is None and "seats unreadable" in a["why"]]
+    assert seats == ["seats unreadable: the roster could not be read"], doc["audit"]
+
+
+def test_a_repo_only_a_decided_item_depends_on_is_never_read(tmp_path, capsys):
+    home, _ = _two_repos(tmp_path)
+    dep = [{"kind": "item", "ref": "levain#1", "label": "x"}]
+    items = write_items(tmp_path, _row(1, "levain"), _row(5, "flow", depends=dep), _decide("flow#5"))
+    _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow")
+    assert doc["reader"]["other_repos"] == [], doc["reader"]
+
+
+def test_a_repo_an_undecided_item_reaches_only_through_a_decided_one_is_never_read(tmp_path, capsys):
+    home, _ = _two_repos(tmp_path)
+    mid = json.loads(_row(7, "flow", depends=[{"kind": "item", "ref": "levain#1", "label": "x"}]))
+    items = write_items(tmp_path, _row(1, "levain"), json.dumps(mid), _decide("flow#7"),
+                        _row(5, "flow", depends=[{"kind": "item", "ref": "flow#7", "label": "x"}]))
+    _, doc, _ = board(capsys, home, items, extra_file(tmp_path), "--repo-name", "flow")
+    assert doc["reader"]["other_repos"] == [], doc["reader"]

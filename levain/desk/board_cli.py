@@ -107,33 +107,51 @@ def _merge_extra(evidence: dict[str, Any], extra: Any) -> str | None:
 
 
 def _foreign_repos(items: Any, home: str) -> list[str]:
-    """The repos, other than ``home``, that an item of ``home`` depends on (through item links, followed to any depth):
-    the only foreign git a ``home`` item's state can need. A repo nothing here reaches is never read."""
+    """The repos, other than ``home``, whose git an item of ``home`` needs (through item links, followed to any
+    depth). A decided item (a ruling is stored, not derived) reads no git and its links are not followed, so a repo only
+    a decided item reaches is never read."""
     seen: set[str] = set()
     todo = [i.id for i in items.values() if i.repo == home]
     while todo:
         iid = todo.pop()
-        if iid in seen or iid not in items:
+        if iid in seen or iid not in items or items[iid].decision is not None:
             continue
         seen.add(iid)
         todo.extend(l.ref for l in items[iid].depends_on if l.kind == "item" and l.ref)
     return sorted({items[i].repo for i in seen} - {home})
 
 
-def _read_others(args: argparse.Namespace, folded: Any, repo: Path, home: str, extra: Any) -> dict[str, Evidence]:
+def _parse_other_repos(specs: list[str]) -> tuple[dict[str, Path], str | None]:
+    """``--other-repo NAME=PATH`` values as ``{name: path}``, or the reason one cannot be used. Nothing is guessed: an empty
+    path would be the current directory and a dropped value would fall back to a sibling directory, either of which could
+    judge a repo's items under the wrong repo's git."""
+    named: dict[str, Path] = {}
+    for spec in specs:
+        name, eq, raw = spec.partition("=")
+        if not eq or not name.strip() or not raw.strip():
+            return {}, f"--other-repo {spec!r} is not NAME=PATH (both the name and the path are required)"
+        path = Path(raw).expanduser()
+        if not path.is_dir():
+            return {}, f"--other-repo {spec!r}: {raw} is not a directory"
+        named[name.strip()] = path
+    return named, None
+
+
+def _read_others(args: argparse.Namespace, folded: Any, repo: Path, home: str, named: dict[str, Path],
+                 extra: Any) -> dict[str, Evidence]:
     """Each foreign repo's evidence, read the way the home repo's is (one bounded ``read_git_evidence`` under its own
-    deadline, its documents stat'd, flow's extra merged). A repo whose checkout is not found is left out: its items read
-    unknown in :func:`derive_all`, never ready."""
-    named = dict(o.split("=", 1) for o in args.other_repo if "=" in o)
+    deadline, its documents stat'd). Flow's extra evidence is merged: seats, band, waiters and the sources flow could not
+    read are keyed by item id (global), and a path this process stat'd for a foreign document wins over flow's. A repo whose checkout is not found is left out: its items
+    read unknown in :func:`derive_all`, never ready."""
     out: dict[str, Evidence] = {}
     for name in _foreign_repos(folded.items, home):
-        path = Path(named[name]).expanduser() if name in named else be.sibling_checkout(repo, name)
+        path = named[name] if name in named else be.sibling_checkout(repo, name)
         if path is None or not path.is_dir():
             continue
         ev, _ = be.read_git_evidence(path, repo_name=name, since=args.since)
         ev["documents"] = be.read_documents({k: v for k, v in folded.items.items() if v.repo == name}, path)
         if extra is not None:
-            _merge_extra(ev, copy.deepcopy(extra))              # the same object was accepted for the home repo
+            _merge_extra(ev, copy.deepcopy(extra))
         out[name] = Evidence.from_dict(ev)
     return out
 
@@ -149,6 +167,9 @@ def run_state(args: argparse.Namespace) -> int:
     now = datetime.now(timezone.utc) if args.now is None else parse_timestamp(args.now)
     if now is None:
         return _fail(f"--now {args.now!r} is not an ISO-8601 timestamp")
+    named, bad_other = _parse_other_repos(args.other_repo)
+    if bad_other:
+        return _fail(bad_other)
     folded = fold(lines)
     repo = Path(args.repo).expanduser()
     evidence, summary = be.read_git_evidence(repo, repo_name=args.repo_name, since=args.since)
@@ -163,7 +184,7 @@ def run_state(args: argparse.Namespace) -> int:
         if bad is not None:
             return _fail(f"--evidence-extra {args.evidence_extra}: {bad}")
     home = summary.get("repo")
-    others = _read_others(args, folded, repo, home, extra) if home else {}
+    others = _read_others(args, folded, repo, home, named, extra) if home else {}
     board = derive_all(folded, Evidence.from_dict(evidence), now=now, repo=home, other_evidence=others)
     doc = board.to_dict()
     doc["reader"] = {**summary, "other_repos": sorted(others)}

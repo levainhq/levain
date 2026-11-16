@@ -1156,6 +1156,18 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime, repo: str |
         why = f"stale_evidence: {stale}"
         audit.append(AuditEntry("unknown", None, why))
         problems.append(why)
+    for name in sorted(by_repo or {}):  # a foreign repo's unreadable or stale source is the board's problem too, named
+        if name == repo:
+            continue
+        fev = by_repo[name]
+        lines = [f"{name}: {source} unreadable: {fev.unreadable[source]}" for source in sorted(fev.unreadable)
+                 if evidence.unreadable.get(source) != fev.unreadable[source]]       # flow's own gap is shared: said once, above
+        fstale = _evidence_problem(fev, now)
+        if fstale:
+            lines.append(f"{name}: stale_evidence: {fstale}")
+        for why in lines:
+            audit.append(AuditEntry("unknown", None, why))
+            problems.append(why)
     for s in states:                    # one entry per item, whatever it carries
         if s.state == "unknown":
             kind = "gate_expired" if ctx.causes.get(s.id) == "gate_expired" else "unknown"

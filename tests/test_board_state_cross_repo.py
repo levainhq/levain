@@ -100,3 +100,26 @@ def test_no_row_with_a_closing_trailer_on_main_reads_unknown_for_an_orphan_or_a_
                   for n in range(1, 4)])
     got = _states(lines, ev)
     assert {i: s.state for i, s in got.items()} == {"levain#1": "done", "levain#2": "done", "levain#3": "done"}
+
+
+# ------------------------------------------------------------------------------------------------ levain#72 round 1 (L3)
+def test_a_foreign_repos_unreadable_source_is_an_audit_line_naming_the_repo():
+    lines, flow_git, _ = _two_repos()
+    broken = _evidence(main=[_closed("levain#1")], unreadable={"chain": "git log failed"})
+    board = bs.derive_all(bs.fold(lines), flow_git, now=NOW, repo="flow", other_evidence={"levain": broken})
+    hits = [a for a in board.audit if a.kind == "unknown" and a.id is None and a.why == "levain: chain unreadable: git log failed"]
+    assert len(hits) == 1, board.audit
+    assert "levain: chain unreadable: git log failed" in board.problems
+
+
+def test_a_foreign_repos_stale_evidence_is_an_audit_line_naming_the_repo():
+    lines, flow_git, _ = _two_repos()
+    old = _evidence(main=[_closed("levain#1")], fetched_at="2026-11-01T00:00:00Z")
+    board = bs.derive_all(bs.fold(lines), flow_git, now=NOW, repo="flow", other_evidence={"levain": old})
+    assert any(a.why.startswith("levain: stale_evidence:") for a in board.audit), board.audit
+
+
+def test_a_clean_foreign_repo_adds_no_audit_line():
+    lines, flow_git, levain_git = _two_repos()
+    board = bs.derive_all(bs.fold(lines), flow_git, now=NOW, repo="flow", other_evidence={"levain": levain_git})
+    assert board.audit == () and board.problems == (), board.audit
