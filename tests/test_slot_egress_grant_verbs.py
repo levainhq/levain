@@ -841,16 +841,32 @@ def test_revoking_a_known_id_keeps_the_others(world, verifier):
     assert set(entries(world)) == {"b.example.org"}
 
 
-def test_three_hundred_unknown_ids_are_recorded_the_oldest_evicted_and_it_never_refuses(world, verifier):
+def test_a_flood_of_unknown_revokes_never_evicts_a_live_row_and_past_the_cap_it_refuses_by_name(world, verifier):
+    """X4: 256 unknown ids are recorded; the next unknown one is ``egress-grant-ledger-full`` with the file unchanged;
+    the FIRST revoked id still blocks its still-fresh bytes, and only a prune past its ``keep_until`` frees them."""
     from levain.slot import egress_ledger as EL
-    for i in range(EL.REVOKED_MAX + 44):
+    for i in range(EL.REVOKED_MAX):
         line = world.main(["egress-grant-revoke", S, gid_for(5000 + i)])
         assert line == (RH.EXIT_OK, {"ok": True, "removed": [], "recorded": [gid_for(5000 + i)]})
+    before = (world.L / "routes" / "grants" / "revoked.jsonl").read_bytes()
+    for i in range(EL.REVOKED_MAX, EL.REVOKED_MAX + 44):
+        refused(world.main(["egress-grant-revoke", S, gid_for(5000 + i)]), "egress-grant-ledger-full")
+    assert (world.L / "routes" / "grants" / "revoked.jsonl").read_bytes() == before
     ids = [r["grant"] for r in rows(world, "revoked.jsonl")]
-    assert len(ids) == EL.REVOKED_MAX and ids[-1] == gid_for(5000 + EL.REVOKED_MAX + 43)
-    assert gid_for(5000) not in ids and gid_for(5000 + 44) in ids
-    # the freshest unknown id still blocks its bytes
-    refused(tap(world, "q.example.org", grant=gid_for(5000 + EL.REVOKED_MAX + 43)), "egress-grant-revoked")
+    assert len(ids) == EL.REVOKED_MAX and gid_for(5000) in ids
+    # an id already in the ledger is still answered at a full ledger
+    assert world.main(["egress-grant-revoke", S, gid_for(5000)]) == \
+        (RH.EXIT_OK, {"ok": True, "removed": [], "recorded": [gid_for(5000)]})
+    # the first revoked id's still-fresh signed bytes stay refused
+    refused(tap(world, "q.example.org", grant=gid_for(5000)), "egress-grant-revoked")
+    assert entries(world) is None
+    ok(tap(world, "a.example.org", grant=gid_for(1)), "a.example.org")          # a file-held id never reaches it
+    assert world.main(["egress-grant-revoke", S, gid_for(1)]) == \
+        (RH.EXIT_OK, {"ok": True, "removed": [gid_for(1)], "recorded": []})
+    # past keep_until a revoke prunes the rows, and the cap admits a new unknown id again
+    world.clock_now = NOW + timedelta(seconds=EL.REVOKED_KEEP_S)
+    assert world.main(["egress-grant-revoke", S, gid_for(9999)])[1]["recorded"] == [gid_for(9999)]
+    assert [r["grant"] for r in rows(world, "revoked.jsonl")] == [gid_for(9999)]
 
 
 def test_revoked_rows_past_their_keep_until_are_pruned_before_the_cap_is_applied(world, verifier):

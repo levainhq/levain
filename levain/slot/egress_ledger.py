@@ -7,7 +7,8 @@ verb), with its two locks and the install's own ``store_id``.
     a new tap is ``egress-grant-ledger-full`` (fail closed).
   - ``revoked.jsonl``: ids a ``revoke`` named that no file held (a signed card not yet delivered). ``keep_until`` = now +
     :data:`REVOKED_KEEP_S` (past the last second the signed bytes can pass freshness, and the clock slack below); at
-    most :data:`REVOKED_MAX`, pruned first and then the OLDEST evicted: a revoke never refuses for a full ledger.
+    most :data:`REVOKED_MAX` live rows, pruned first and never evicted (eviction would re-admit a revoked card's
+    still-fresh bytes): a revoke that would add an id past the cap is ``egress-grant-ledger-full`` (fail closed).
   - ``high_water``: root's wall clock at the latest prune that dropped a row, written durably BEFORE that prune. A row
     is pruned by wall time only, so a clock set back past a prune would make a pruned id's bytes fresh again with no
     row to refuse them; a tap whose commit time is more than :data:`CLOCK_SLACK_S` before the mark is
@@ -390,18 +391,22 @@ def record_used(ctx: object, dirfd: int, grant: eg.HostGrant, now: datetime) -> 
 
 def record_revoked(ctx: object, dirfd: int, ids: List[str], now: datetime) -> None:
     """Record ``ids`` (levain-minted ids no file held), under the ledger lock the caller holds: prune rows past their
-    ``keep_until`` FIRST, add, then evict the OLDEST beyond :data:`REVOKED_MAX`. Never refuses for a full ledger."""
+    ``keep_until`` FIRST, then add. A live row is never evicted (that would re-admit its still-fresh bytes): when the
+    new ids would take the ledger past :data:`REVOKED_MAX` the revoke is ``egress-grant-ledger-full`` and the file is
+    left untouched. An id already recorded adds nothing and so never refuses."""
     all_rows = read_revoked(ctx, dirfd)
     rows = [r for r in all_rows if r.keep_until > now]
+    have = {r.grant for r in rows}
+    new = []    # type: List[str]
+    for i in ids:
+        if i not in have and i not in new:
+            new.append(i)
+    if len(rows) + len(new) > REVOKED_MAX:
+        raise Refused(ERR_FULL, "revoked.jsonl is full")
     if len(rows) < len(all_rows):
         _mark_before_prune(ctx, dirfd, now)
-    have = {r.grant for r in rows}
     keep = now + timedelta(seconds=REVOKED_KEEP_S)
-    for i in ids:
-        if i not in have:
-            rows.append(Revoked(i, keep))
-            have.add(i)
-    rows = rows[-REVOKED_MAX:]
+    rows.extend(Revoked(i, keep) for i in new)
     _write(ctx, dirfd, REVOKED_NAME, _dump([{"grant": r.grant, "keep_until": eg.stamp(r.keep_until)} for r in rows]))
 
 
