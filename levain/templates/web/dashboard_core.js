@@ -8798,7 +8798,6 @@
       return [(all ? "Root revoked the " + n + " grant" + (n === 1 ? "" : "s") + " that " + (n === 1 ? "was" : "were") + " in force." : "Root revoked the grant.") + " " + HOSTGRANT_FRONT, "ok"];
     }
     if (r.ok && b.result === "gone") return ["That grant was already gone: expired or revoked.", "ok"];
-    if (r.status === 0) return ["Not revoked: the cockpit could not be reached.", "bad"];
     // root was started and did not answer clearly: the grant may or may not be revoked, so never "not revoked" and never an error
     // toast that implies nothing happened. A readable listing came back and is drawn; an unreadable one says to refresh.
     if (r.status === 502 && b.error === "unknown") {
@@ -8884,8 +8883,11 @@
     const rows = b.slots.filter((s) => s && Array.isArray(s.grants) && s.grants.length).map((s) => hostGrantRow(s, slot));
     const unread = (Array.isArray(b.unread) ? b.unread : []).map((u) => el("div", "consent-note ext-meta hostgrant-unread",
       "Slot " + (u && Number.isInteger(u.slot) ? u.slot : "?") + " could not be read by root (" + (u && typeof u.name === "string" ? u.name : "unknown") + "): its grants are not listed."));
-    slot.replaceChildren(head, ...said, ...unread,
-      ...(rows.length ? rows : [el("div", "consent-note ext-meta hostgrant-empty", "No live host grants")]));
+    // a slot root could not read may hold live grants: with one unread, "none" is only true of the slots that were read
+    const none = el("div", "consent-note ext-meta hostgrant-empty", unread.length ? "Root listed no live grants in the slots it could read." : "No live host grants");
+    slot.replaceChildren(head, ...said, ...unread, ...(rows.length ? rows : [none]));
+    // a slot drawn while its own revoke is on the wire (another slot's answer repainted it) is not tappable: its handlers return at once
+    if (st.busy) for (const x of slot.querySelectorAll("button")) x.disabled = true;
   }
   // `fresh` is a read the revoke's answer already carried: drawn as is, no second trip
   function hostGrantFill(slot, fresh) {
@@ -8912,12 +8914,18 @@
       const targets = new Set([slot, ...document.querySelectorAll(".hostgrant-slot")]);
       for (const t of targets) { if (t !== slot && !t.isConnected) continue; hostGrantState(t).said = said; hostGrantFill(t, fresh); }
     };
-    signCall(HOSTGRANT_REVOKE, { session: session, target: target }).then((r) => {
+    // a request that was sent and got no answer (a timeout, a lost response, a throw) may already have been applied by root:
+    // the same unknown outcome the server answers with 502, never "not revoked". The list is read again and drawn with the
+    // server's own unknown words (readable or not); only a response that says it was not applied may say "not revoked"
+    const unknownRead = () => hostGrantFetch().then((rd) => ({ ok: false, status: 502,
+      body: { error: "unknown", listing: rd.status === 200 && rd.body ? rd.body : null } }));
+    signCall(HOSTGRANT_REVOKE, { session: session, target: target }).catch(() => ({ status: 0 }))
+      .then((r) => (r.status === 0 ? unknownRead() : r)).then((r) => {
       const l = r.body && r.body.listing;
       // an unknown outcome's listing is drawn as it came, readable or a note (never a stale list with live buttons)
       const unknown = r.status === 502 && r.body && r.body.error === "unknown";
       settle(hostGrantWords(r, all), (r.ok || unknown) && l && typeof l === "object" ? { status: 200, body: l } : null);
-    }, () => settle(["Not revoked: the page failed.", "bad"], null));
+    }, () => settle(hostGrantWords({ status: 502, body: { error: "unknown" } }, all), null));
   }
   function hostGrantSlot() {
     const slot = el("div", "hostgrant-slot");

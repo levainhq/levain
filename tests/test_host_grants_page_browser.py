@@ -356,3 +356,69 @@ def test_helper_running_is_its_own_state_not_a_generic_busy(src, tmp_path) -> No
     said = next(v for v in values if isinstance(v, str) and v.startswith("Root's previous"))
     assert said == "Root's previous helper is still running: this tap was not sent. Try again later, once it has finished.", values
     assert "busy, tap again" not in said and values[-1].endswith("busy") and "hostgrant-said" in values[-1], values
+
+
+_LOSE_REPLY = ("(() => { const f = window.fetch; window.fetch = function (u) { const p = f.apply(this, arguments);"
+               " return /hostgrant\\/revoke/.test(String(u)) ? p.then(() => { throw new TypeError('lost'); }) : p; }; return 1; })()")
+
+
+@needs_browser
+def test_a_revoke_whose_reply_is_lost_reads_outcome_unknown_and_reads_the_list_again(src, tmp_path) -> None:
+    """The POST reached root and was applied, the response never came back: never "Not revoked", a fresh read repaints every slot."""
+    root = FakeRoot(_slots((S1, 0, [G1, G2]), (S2, 1, [G3])))
+    with _mounted(src, root) as (port, _h):
+        values = _open(tmp_path, port, {"eval": _MARK_OLD}, {"eval": _REOPEN}, {"until": _NEW}, {"until": FILLED},
+                       {"eval": "(() => { document.body.appendChild(window.__old); return 1; })()"}, {"eval": _LOSE_REPLY},
+                       {"eval": "'lists0:' + " + _LISTS}, *_UNK_STEPS(),
+                       {"until": f"!window.__old.querySelector('[data-hostgrant=\"{G1}\"]') && window.__old.dataset.filled === '1'"},
+                       {"eval": _STATE}, {"eval": "'lists1:' + " + _LISTS})
+    said = next(v for v in values if isinstance(v, str) and v.startswith("Outcome unknown"))
+    assert "may or may not be revoked" in said and "The list below was read again" in said, said
+    assert not any(isinstance(v, str) and v.startswith("Not revoked") for v in values), values
+    states = [v for v in values if isinstance(v, list)][-1]
+    assert len(states) >= 2 and all(s["filled"] and G1 not in s["grants"] and "Outcome unknown" in s["text"] for s in states), states
+    before = int(next(v for v in values if isinstance(v, str) and v.startswith("lists0:"))[7:])
+    after = int(next(v for v in values if isinstance(v, str) and v.startswith("lists1:"))[7:])
+    assert after == before + 1, values                     # exactly one fresh read of the list
+    assert [c for c in root.calls if c[0] == "egress-grant-revoke"] == [["egress-grant-revoke", S1, G1]], root.calls
+
+
+@needs_browser
+def test_unread_slots_with_no_grants_do_not_claim_there_are_none(src, tmp_path) -> None:
+    """Root could not read a slot that may hold live grants: the page says what it did read, never "No live host grants"."""
+    root = FakeRoot(_slots((S1, 0, [])))
+    root.unread = [{"slot": 2, "name": "egress-store-unreadable"}]
+    with _mounted(src, root) as (port, _h):
+        values = _open(tmp_path, port, {"eval": _TEXT}, {"eval": f"{SLOT}.querySelectorAll('.hostgrant-unread').length"})
+    assert "Slot 2 could not be read by root" in values[0] and values[1] == 1, values
+    assert "No live host grants" not in values[0] and "no live grants in the slots it could read" in values[0], values[0]
+
+
+_OLD_BTN = lambda g: f"window.__old.querySelector('[data-hostgrant=\"{g}\"] .hostgrant-revoke')"   # noqa: E731
+_MODAL_BTNS = f"[...{SLOT}.querySelectorAll('button')]"
+# the revoke of G2 is held on the page's own wire until released: the answer to another slot's revoke lands while it is pending
+_HOLD_G2 = ("(() => { const f = window.fetch; window.__held = null; window.fetch = function (u, o) { if (/hostgrant\\/revoke/.test(String(u))"
+            f" && String((o || {{}}).body).includes('{G2}')) return new Promise((go) => {{ window.__held = () => go(f.call(window, u, o)); }});"
+            " return f.apply(this, arguments); }; return 1; })()")
+
+
+@needs_browser
+def test_a_slot_repainted_while_its_own_revoke_is_on_the_wire_has_no_enabled_looking_inert_buttons(src, tmp_path) -> None:
+    """Two slots each revoke: A's answer lands while B's revoke is still pending and repaints B. B's new buttons must be disabled, then live."""
+    root = FakeRoot(_slots((S1, 0, [G1, G2, G3])))
+    with _mounted(src, root) as (port, _h):
+        values = _open(tmp_path, port, {"eval": _MARK_OLD}, {"eval": _REOPEN}, {"until": _NEW}, {"until": FILLED},
+                       {"eval": "(() => { document.body.appendChild(window.__old); return 1; })()"},
+                       {"tap": _btn(G3)}, {"tap": _btn(G3)},                          # a first revoke: its settle draws the detached old slot too
+                       {"until": "!!window.__old.querySelector('.hostgrant-said')"}, {"eval": _HOLD_G2},
+                       {"tap": _btn(G2)}, {"tap": _btn(G2)},                          # B (the modal): its revoke is held on the wire
+                       {"until": "!!window.__held"},
+                       {"eval": _OLD_BTN(G1) + ".click()"}, {"eval": _OLD_BTN(G1) + ".click()"},   # A (the old slot): answers, repainting B
+                       {"until": f"!{_OLD_BTN(G1)}"}, {"until": f"!{_btn(G1)}"},
+                       {"eval": "'mid:' + JSON.stringify(" + _MODAL_BTNS + ".map((b) => b.disabled))"},
+                       {"eval": "window.__held(); 1"}, {"until": f"!{_btn(G2)}"},
+                       {"eval": "'end:' + JSON.stringify(" + _MODAL_BTNS + ".map((b) => b.disabled))"})
+    mid = next(v for v in values if isinstance(v, str) and v.startswith("mid:"))[4:]
+    end = next(v for v in values if isinstance(v, str) and v.startswith("end:"))[4:]
+    assert mid != "[]" and "false" not in mid, f"the repainted slot's buttons look enabled while its own revoke is busy: {mid}"
+    assert "true" not in end, f"its buttons stayed disabled after its revoke settled: {end}"
