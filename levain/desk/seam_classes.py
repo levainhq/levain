@@ -53,6 +53,11 @@ INFRASTRUCTURE: frozenset[str] = frozenset({
     # the room (RM-A): a proposal's settling record, no gseq; a committed one names the drop it became, and that drop is
     # counted in its own table
     "proposal_events",
+    # the room's envelope cards (H1-4 shape A): what the room proposed (the spec text, beside the drop_proposals row that is
+    # counted) and the tap that bound a card to the drop, the bytes and the draft revision it wrote. Both append-only, no
+    # gseq, so by the rule that classified proposal_events they are bookkeeping; the drop the tap filed, the committed event
+    # and the draft revision are counted in their own tables
+    "spec_proposals", "spec_card_taps",
     # the room's relay (a message of his handed to the desk): a claim and its outcome, append-only, no gseq, so by the rule
     # that classified proposal_events they are bookkeeping; the desk thread a sent relay reaches is counted in its own tables
     "room_relay_claims", "room_relay_outcomes",
