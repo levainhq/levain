@@ -981,7 +981,9 @@ def _unmet(ctx: _Ctx, item: Item) -> list[tuple[str, str, str]]:
                 continue
             s = ctx.state_of(dep.id)
             if s.state != "done":
-                out.append((dep.id, l.label, f"{s.state} ({s.reason})" if s.reason else s.state))
+                # a ruling that the work will not happen: the wait can never end, a human decides the dependent
+                shown = "dependency cut: decide" if s.state in ("cut", "out_of_1_0") else s.state
+                out.append((dep.id, l.label, f"{shown} ({s.reason})" if s.reason else shown))
         elif l.kind == "band":
             if l.ref in ctx.ev.band_open or l.ref not in ctx.ev.band_resolved:
                 out.append((l.ref or "", l.label, "open on the band"))
