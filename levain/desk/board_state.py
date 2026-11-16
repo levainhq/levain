@@ -1098,8 +1098,12 @@ def _id_key(iid: str) -> tuple[str, int, str, str]:
     return repo, len(digits), digits, iid
 
 
-def _trailer_ids(ev: Evidence) -> dict[str, list[str]]:
-    """Every item id a commit, branch, seat or waiter names, with where it was named."""
+_FLOW_SOURCES = frozenset({"seats", "band", "waiters", "documents"})   # supplied by flow, shared by every repo's evidence
+
+
+def _trailer_ids(ev: Evidence, git_only: bool = False) -> dict[str, list[str]]:
+    """Every item id a commit, branch, seat or waiter names, with where it was named. ``git_only`` leaves out the seats
+    and waiters: flow supplies those board-wide, so a foreign repo's evidence repeats the home's."""
     seen: dict[str, list[str]] = {}
     for c in ev.main:
         for iid in (*c.items, *c.closes):
@@ -1111,12 +1115,33 @@ def _trailer_ids(ev: Evidence) -> dict[str, list[str]]:
     for b in ev.branches:
         for iid in b.items:
             seen.setdefault(iid, []).append(f"branch {b.name}")
+    if git_only:
+        return seen
     for s in ev.seats:
         for iid in s.items:
             seen.setdefault(iid, []).append(f"seat {s.name}")
     for w in ev.waiters:
         for iid in w.items:
             seen.setdefault(iid, []).append(f"waiter {w.branch}")
+    return seen
+
+
+def _in_scope(ctx: _Ctx, items: Mapping[str, Item], repo_evidence: Mapping[str, Evidence] | None) -> set[str]:
+    """The ids the board lists. With cross-repo evidence, an item of a repo that was not read is listed (unknown) only if
+    an item of a read repo reaches it through an undecided link: a decided item's links no longer matter, so a repo only
+    a decided item mentions is out of scope, not a dirty board. If no item belongs to a read repo (a misnamed repo) every
+    item stays listed, each reading unknown."""
+    if repo_evidence is None:
+        return set(items)
+    seen = {i for i, it in items.items() if it.repo in repo_evidence}
+    if not seen:
+        return set(items)
+    todo = list(seen)
+    while todo:
+        for dep in ctx._deps(todo.pop()):
+            if dep not in seen:
+                seen.add(dep)
+                todo.append(dep)
     return seen
 
 
@@ -1132,13 +1157,15 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
     from the evidence of the repo it belongs to, and an item whose repo has no entry reads unknown. ``evidence`` is the
     primary one (it names the board's ``as_of``); put it in the mapping too if its repo owns items. ``primary_repo``
     names its key there (the other repos are every other key); left None it is the key holding that same object. Left
-    None, one repo's evidence reads every item."""
+    None, one repo's evidence reads every item. An item of a repo that is not in ``repo_evidence`` is left off the board
+    unless an item of a read repo reaches it through an undecided link (it then reads unknown)."""
     now = _utc(now)
     ctx = _Ctx(folded.items, evidence, now, folded.torn_why or ("torn" if folded.torn else None), repo_evidence)
     if primary_repo is None:
         primary_repo = next((r for r, e in (repo_evidence or {}).items() if e is evidence), None)
     others = [(r, e) for r, e in sorted((repo_evidence or {}).items()) if r != primary_repo]
-    states = [ctx.state_of(i) for i in sorted(folded.items, key=_id_key)]
+    shown = _in_scope(ctx, folded.items, repo_evidence)
+    states = [ctx.state_of(i) for i in sorted(shown, key=_id_key)]
     audit: list[AuditEntry] = []
     problems = list(folded.problems)
     if folded.torn:
@@ -1173,8 +1200,9 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
             audit.append(AuditEntry("landed_not_closed", s.id, f"{_landed_why(*landed)}; reads {s.state} because an orphan branch carries more"))
     for repo, ev in others:             # the other repos' own sources, each said under its repo
         for source in sorted(ev.unreadable):
-            if evidence.unreadable.get(source) == ev.unreadable[source]:
+            if source in _FLOW_SOURCES and evidence.unreadable.get(source) == ev.unreadable[source]:
                 continue                # the flow-supplied extra reaches every repo's evidence (every item fails closed); said once
+                                        # (keyed on the source, not the text: two repos' git can fail with the same words)
             why = f"{repo}: {source} unreadable: {ev.unreadable[source]}"
             audit.append(AuditEntry("unknown", None, why))
             problems.append(why)
@@ -1195,7 +1223,7 @@ def derive_all(folded: Folded, evidence: Evidence, *, now: datetime,
             if iid not in folded.items:
                 audit.append(AuditEntry("unknown_id_in_trailer", iid, f"named by {', '.join(sorted(set(where)))}; the store does not hold it"))
         for repo, ev in others:
-            for iid, where in sorted(_trailer_ids(ev).items(), key=lambda kv: _id_key(kv[0])):
+            for iid, where in sorted(_trailer_ids(ev, git_only=True).items(), key=lambda kv: _id_key(kv[0])):
                 if iid not in folded.items:
                     audit.append(AuditEntry("unknown_id_in_trailer", iid, f"{repo}: named by {', '.join(sorted(set(where)))}; the store does not hold it"))
         for repo, ev in (repo_evidence or {}).items():      # work named for an item of ANOTHER repo is read by neither: say it
