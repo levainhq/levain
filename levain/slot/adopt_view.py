@@ -196,6 +196,16 @@ def helper_timeout(verb: str, *, bundle_bytes: int = 0, base_bytes: int = 0) -> 
         return answer + STORE_VERB_CAS_CALLS * (window + answer) + STORE_SLACK_S
     if verb == "status":
         return STORE_SLACK_S
+    from levain.slot import runtime_grammar as RG
+
+    if verb in RG.EGRESS_VERBS:
+        # The host-grant verbs: ``egress-grants-list`` / ``egress-grants-all`` / ``egress-refusals`` read files with
+        # no lock wait; ``egress-grant-revoke`` / ``egress-grant`` may wait for the ledger lock.
+        from levain.slot import egress_ledger as EL
+
+        if verb in ("egress-grants-list", "egress-grants-all", "egress-refusals"):
+            return STORE_SLACK_S
+        return EL.LEDGER_LOCK_WAIT_S + STORE_SLACK_S
     raise ValueError(f"helper_timeout: {verb!r}")
 
 
