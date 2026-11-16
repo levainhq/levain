@@ -20,7 +20,7 @@ launch, or the OS handing the tap to the worker. No headless check of those exis
 
 NEVER HIS LIVE STORES: every server, store and queue runs under the test's scratch ``LEVAIN_HOME`` / ``HOME`` in pytest's tmp, and
 ``_scratch`` refuses to go on if any resolved path is under one of his real stores. The push transport is stubbed at its seam
-(``sender._post``), so no push ever leaves the machine. Not wired into CI (row 144 owns that)."""
+(``sender._post``), so no push ever leaves the machine. Run in CI by the browser job, which selects every tests/*.py naming `needs_browser` (guarded by tests/test_ci_workflow.py)."""
 from __future__ import annotations
 
 import json

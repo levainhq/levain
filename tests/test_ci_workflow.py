@@ -497,3 +497,14 @@ def test_the_dead_link_cleanup_check_can_fail():
         _unstatted_links_cleared([dict(ok, **{"if": "always()"}), up])
     with pytest.raises(AssertionError):
         _unstatted_links_cleared([dict(ok, run=ok["run"] + " || true"), up])
+
+
+def test_the_stage1_golden_journeys_are_run_by_the_browser_job():
+    """The journeys file has no step of its own: the browser job selects every tests/*.py that names `needs_browser`, and the
+    journeys file does (it imports the mark). This fails if the selector stops being that grep or the file stops naming it."""
+    run = next(st["run"] for st in JOBS["browser"]["steps"] if st.get("name") == "Run the browser tests")
+    assert "grep -l needs_browser tests/*.py" in run
+    journeys = Path(__file__).resolve().parent / "test_journeys_stage1.py"
+    assert "needs_browser" in journeys.read_text()
+    # a skip fails the job, so the journeys cannot pass by skipping there
+    assert '"^SKIPPED|[0-9]+ skipped"' in run
