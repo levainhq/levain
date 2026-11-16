@@ -4163,11 +4163,13 @@ AUTHORITY_SIGNER_REFUSALS: dict[str, str] = {
 
 def authority_signer_sudo_line(host: str) -> str:
     """The one ``sudo`` line that enrols the signers: the install helper's real path, then the verb with the flags
-    :func:`levain.slot.grammar.parse_install_argv` accepts (a test parses this line with the placeholders filled)."""
+    :func:`levain.slot.grammar.parse_install_argv` accepts (a test parses this line with the placeholders filled).
+    ``[--egress-host]`` is the flag that also lists each key for ``levain-egress-host`` (host grants, levain#66): a
+    key enrolled without it signs no host card root will take, so the line every host-card word points at names it."""
     from levain.slot import layout
 
     return (f"sudo {layout.install_helper_path(host)} enrol-authority-signer --principal YOUR_NAME "  # type: ignore[arg-type]
-            "--public-key '<type> <base64>' [--passkey '<type> <base64>' ...] [--confirm]")
+            "--public-key '<type> <base64>' [--passkey '<type> <base64>' ...] [--confirm] [--egress-host]")
 
 
 def _authority_signers_hint(host: str, *, why: str | None = None) -> str:

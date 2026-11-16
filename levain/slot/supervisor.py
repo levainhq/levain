@@ -937,7 +937,11 @@ START_GRACE_S = 10.0       # DECISION: after teardown, how long `start` gets to 
 #: prepare takes two locks and an ATTACH; render validates, starts the front and mints; teardown is END (freeze,
 #: kill, retain), the longest. Generous: they bound a wedge, they do not time normal work.
 #: probe: root's bounded DNS, CONTROL before and after, the session lock and the child's reap (V13 §6).
-HELPER_DEADLINE_S: Mapping[str, float] = {"prepare": 120.0, "render": 300.0, "probe": 45.0, "teardown": 600.0}
+#: Host cards (levain#66 S4b): ``egress-grant`` is 30 s because root's own path can take ``verify_link_sig`` (10 s) plus
+#: ``LEDGER_LOCK_WAIT_S`` (10 s) plus start-up, and a delivery that STARTS by ``issued + 570`` is then ended by
+#: ``issued + 600``, root's ``FRESH_S``; the two reads are bounded and take no lock.
+HELPER_DEADLINE_S: Mapping[str, float] = {"prepare": 120.0, "render": 300.0, "probe": 45.0, "teardown": 600.0,
+                                          "egress-grant": 30.0, "egress-refusals": 15.0, "egress-grants-list": 15.0}
 HELPER_DEADLINE_DEFAULT_S = 120.0
 _HELPER_OUT_MAX = 1 << 20  # DECISION: a helper answer past this is no single line: refused malformed
 _HELPER_ERR_KEEP = 1 << 16
@@ -1125,6 +1129,12 @@ class Seams:
     kill_grace_s: float = KILL_GRACE_S
     reprobe_s: float = REPROBE_S
     clock: Callable[[], float] = time.monotonic
+    #: the WALL clock (epoch seconds) the host cards' freshness bounds are judged on: root measures a card from the
+    #: message's ``issued`` by its own wall clock, and a monotonic clock stops across a sleep (:attr:`clock` stays the
+    #: monotonic one, for cadence and helper deadlines)
+    wall: Callable[[], float] = time.time
+    #: host cards (levain#66 S4b): False = the flow is off; it is also off when :attr:`allow_dir` (the queue) is None
+    cards: bool = True
     #: a login session's confirm prompt -> True (yes), False (no) or None (no answer); None = his terminal
     #: (:meth:`Supervisor._ask`)
     confirm: Optional[Callable[[str], Optional[bool]]] = None
@@ -1230,6 +1240,455 @@ class _ProbeRun:
                         pass
 
 
+#: levain#66 S4b: a helper run that ended without a root answer (the run was too slow, wrote nothing sound, could not
+#: start, or was stopped). Never a root refusal: the card flow gets ``None`` for these, not a name.
+_CARD_INTERNAL = frozenset({"helper-timeout", "helper-output-malformed", "helper-silent", "helper-unrunnable",
+                            "stopped"})
+CARD_STEP_S = 0.25         # DECISION: the card flow's own tick, at most (the relay loop turns far more often than that)
+CARD_RP_S = 10.0           # DECISION: how often the queue's published cockpit origin is read again (a cockpit may start later)
+_CARD_SCAN_NAME = re.compile(r"lv-[0-9a-f]{32}\.json")
+
+
+class _CardRun(_ProbeRun):
+    """One host-card helper run (``egress-refusals``, ``egress-grants-list`` or ``egress-grant``) driven from the
+    relay's select loop, never blocking it: :class:`_ProbeRun`'s pipes, pump, bounded read and end, plus a stdin pipe
+    the caller's bytes are written to once, non-blocking, and closed after (``egress-grant`` reads its signed answer
+    there; the two reads take ``/dev/null``). Its deadline is the verb's :attr:`Seams.helper_deadline_s`."""
+
+    def __init__(self, sup: "Supervisor", verb: str, args: Sequence[str], data: Optional[bytes], now: float) -> None:
+        self.sup = sup
+        self.verb = verb
+        self.deadline = now + sup.s.helper_deadline_s.get(verb, HELPER_DEADLINE_DEFAULT_S)
+        self.view = memoryview(data or b"")
+        self.fin = -1
+        self.p = sup.s.spawn([*sup.s.helper, verb, *args], stdin=subprocess.DEVNULL if data is None else subprocess.PIPE,  # type: ignore[misc]
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, lease_fds=sup._lease_fds(),
+                             env=sup.s.env)
+        self.out, self.err = bytearray(), bytearray()
+        self.over = False
+        try:
+            self.fout, self.ferr = self.p.stdout.fileno(), self.p.stderr.fileno()     # type: ignore[union-attr]
+            self.open = [self.fout, self.ferr]
+            if self.p.stdin is not None:
+                self.fin = self.p.stdin.fileno()
+                os.set_blocking(self.fin, False)
+            for fd in self.open:
+                os.set_blocking(fd, False)
+            if not self.view:
+                self._close_stdin()
+        except BaseException:
+            self.end()                    # a setup failure after the spawn leaves no child and no pipe behind
+            raise
+
+    @property
+    def wfd(self) -> int:
+        """The stdin pipe's fd while bytes are still to be written, else -1."""
+        return self.fin if self.view and self.fin >= 0 else -1
+
+    def _close_stdin(self) -> None:
+        self.view = memoryview(b"")
+        self.fin = -1
+        if self.p.stdin is not None:
+            try:
+                self.p.stdin.close()
+            except OSError:
+                pass
+
+    def pump(self, ready: Collection[int], writable: Collection[int] = ()) -> None:
+        if self.wfd >= 0 and self.fin in writable:
+            try:
+                self.view = self.view[os.write(self.fin, self.view):]
+            except BlockingIOError:
+                pass
+            except OSError:
+                self.view = memoryview(b"")   # it stopped reading: its answer says why
+            if not self.view:
+                self._close_stdin()
+        super().pump(ready)
+
+    def outcome(self, now: float) -> Optional[Tuple[Optional[str], Dict[str, object]]]:
+        """``(None, answer)`` for an ok answer, ``(name, {})`` for a root refusal or ``helper-output-malformed`` /
+        ``helper-silent`` / ``helper-timeout``, else ``None`` while it runs."""
+        if self.over:
+            return "helper-output-malformed", {}
+        if not self.open and self.p.poll() is not None:
+            try:
+                return None, parse_helper_line(bytes(self.out), self.verb)
+            except Refused as e:
+                return e.name, {}
+        if now >= self.deadline:
+            return "helper-timeout", {}
+        return None
+
+    def end(self) -> None:
+        try:
+            super().end()
+        finally:
+            if getattr(self.p, "stdin", None) is not None:
+                try:
+                    self.p.stdin.close()                                              # type: ignore[union-attr]
+                except OSError:
+                    pass
+
+
+class _CardLane:
+    """The host-card lane (levain#66 S4b) on the relay's tick: it carries out what :class:`levain.slot.egress_cards.CardFlow`
+    asks for and tells the flow what happened, and owns every process and file the pure flow does not. Rules:
+
+      - At most ONE helper run at a time (:attr:`run`). A signed answer ends an in-flight READ (``egress-refusals`` /
+        ``egress-grants-list``: read only, so killing it is harmless) and starts its delivery next: deliveries first.
+      - EXCLUSION on root's session lock: an ``egress-grant`` never starts while the macOS re-probe is in flight, and
+        the relay starts no probe while a delivery is running or waiting (``probe`` and ``egress-grant`` both TRY that
+        lock, and a re-probe that reads ``session-busy`` after an earlier timeout counts toward ending the session).
+        The two reads take no lock and overlap a probe freely.
+      - A delivery whose wall start is past ``start_by`` is not started (the flow is told ``fresh``).
+      - Every action runs inside ONE ``try/except Exception``: an unexpected exception turns the lane off for the
+        session with one note, never reaching :meth:`Supervisor._relay`'s loop (a delivery that was in flight is said).
+      - Nothing here writes to the terminal: what it has to say is :meth:`notes`, held for the end of the relay (N5)."""
+
+    def __init__(self, sup: "Supervisor", flow: Any, queue_dir: Path) -> None:
+        self.sup = sup
+        self.flow = flow
+        self.queue = Path(queue_dir)
+        self.run: Optional[_CardRun] = None
+        self.pending: Optional[Tuple[str, List[str], Optional[bytes], Optional[float]]] = None
+        self.dead = False
+        self.extra: List[str] = []
+        self._todo: List[object] = []
+        self._busy = False
+        self._last = float("-inf")
+        self._rp_at = float("-inf")
+        self._rp_seen: object = object()
+        self._qlock = -1                   # the sign queue's lock, held from a scan that found no open card to its filing
+
+    # -- what the relay asks ---------------------------------------------------------------------------------------
+    @property
+    def delivering(self) -> bool:
+        """An ``egress-grant`` is running or waiting to start: the relay starts no probe."""
+        return (self.pending is not None and self.pending[0] == "egress-grant") or (
+            self.run is not None and self.run.verb == "egress-grant")
+
+    def rfds(self) -> List[int]:
+        return [] if self.run is None else list(self.run.open)
+
+    def wfds(self) -> List[int]:
+        return [] if self.run is None or self.run.wfd < 0 else [self.run.wfd]
+
+    def step(self, probe_busy: bool) -> None:
+        if self.dead:
+            return
+        try:
+            self._start_pending(probe_busy)
+            mono = self.sup.s.clock()
+            if mono - self._last < CARD_STEP_S:
+                return
+            self._last = mono
+            if self.flow.off is not None and self.run is None and self.pending is None:
+                return
+            self._cockpit(mono)
+            self._feed(self._events().Tick())
+            self._start_pending(probe_busy)
+        except Exception as e:  # noqa: BLE001 - the card lane is a convenience: it ends alone, the session goes on
+            self._die(e)
+
+    def pump(self, ready: Collection[int], writable: Collection[int]) -> None:
+        if self.dead or self.run is None:
+            return
+        try:
+            run = self.run
+            run.pump(ready, writable)
+            out = run.outcome(self.sup.s.clock())
+            if out is None:
+                return
+            run.end()
+            self.run = None
+            self._finish(run.verb, out[0], out[1])
+        except Exception as e:  # noqa: BLE001
+            self._die(e)
+
+    def end(self) -> None:
+        """The run in flight is ended (TERM, then KILL, reaped) and the queue lock let go; never raises."""
+        self._unlock()
+        run, self.run, self.pending = self.run, None, None
+        if run is not None:
+            try:
+                run.end()
+            except Exception:  # noqa: BLE001 - the relay is ending anyway
+                pass
+
+    def notes(self) -> List[str]:
+        out: List[str] = []
+        try:
+            out += self.flow.end_notes()
+        except Exception as e:  # noqa: BLE001
+            out.append(f"host cards: the end-of-session notes could not be written ({type(e).__name__})")
+        return out + self.extra
+
+    # -- inside ----------------------------------------------------------------------------------------------------
+    def _events(self) -> Any:
+        from levain.slot import egress_cards as EC
+
+        return EC
+
+    def _die(self, exc: BaseException) -> None:
+        self.dead = True
+        was = self.run is not None and self.run.verb == "egress-grant"
+        self.end()
+        self.extra.append(f"host cards stopped for this session: an unexpected error ({type(exc).__name__})"
+                          + ("; a delivery in flight was ended without an answer, so the host may be allowed: check "
+                             "the host grants list" if was else ""))
+
+    def _cockpit(self, mono: float) -> None:
+        if mono - self._rp_at < CARD_RP_S:
+            return
+        self._rp_at = mono
+        from levain.consent.cockpit_origin import read_origin
+
+        EC = self._events()
+        try:
+            rp: Optional[str] = EC.queue_rp(read_origin(self.queue))
+        except (ValueError, OSError):
+            rp = None
+        if rp != self._rp_seen:
+            self._rp_seen = rp
+            self._feed(EC.Cockpit(rp))
+
+    def _feed(self, event: object) -> None:
+        """``event`` into the flow, and every command it returns carried out; events the local actions make are
+        taken in turn (no recursion)."""
+        self._todo.append(event)
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            while self._todo:
+                ev = self._todo.pop(0)
+                self.flow, cmds = self.flow.advance(ev, self.sup.s.wall(), self.sup.s.clock())
+                for cmd in cmds:
+                    self._do(cmd)
+        finally:
+            self._busy = False
+            self._unlock()                 # a scan's lock never outlives the feed it was taken in
+
+    def _do(self, cmd: object) -> None:
+        EC = self._events()
+        if isinstance(cmd, EC.Poll):
+            self.pending = (EC.REFUSALS, [str(self.sup.session), str(cmd.cursor)], None, None)
+        elif isinstance(cmd, EC.ListGrants):
+            self.pending = (EC.GRANTS_LIST, [str(self.sup.session)], None, None)
+        elif isinstance(cmd, EC.Deliver):
+            if self.run is not None and self.run.verb != "egress-grant":
+                run, self.run = self.run, None
+                run.end()                      # a read in flight is ended first: the delivery is next
+            self.pending = (EC.GRANT, [str(self.sup.session)], EC.stdin_bytes(cmd.payload), cmd.start_by)
+        elif isinstance(cmd, EC.Scan):
+            self._todo.append(self._scan())
+        elif isinstance(cmd, EC.File):
+            self._todo.append(self._file(cmd))
+        elif isinstance(cmd, EC.Push):
+            self._todo.append(self._push(cmd))
+        elif isinstance(cmd, EC.ReadAnswer):
+            self._todo.append(self._read(cmd.rid))
+
+    def _start_pending(self, probe_busy: bool) -> None:
+        p = self.pending
+        if p is None or self.dead:
+            return
+        verb, args, data, start_by = p
+        EC = self._events()
+        if verb == EC.GRANT:
+            if probe_busy:
+                return                          # the probe holds root's session lock: wait for its end
+            if start_by is not None and self.sup.s.wall() > start_by:
+                self.pending = None
+                self._feed(EC.RunFailed(EC.GRANT, "fresh"))    # not started: the card is past its start bound
+                return
+            if self.run is not None:
+                run, self.run = self.run, None
+                run.end()
+        elif self.run is not None:
+            return
+        self.pending = None
+        try:
+            self.run = _CardRun(self.sup, verb, args, data, self.sup.s.clock())
+        except (Refused, OSError):
+            self._feed(EC.RunFailed(verb, None))
+
+    def _finish(self, verb: str, name: Optional[str], ans: Mapping[str, object]) -> None:
+        EC = self._events()
+        internal = name is not None and name in _CARD_INTERNAL
+        if verb == EC.GRANT:
+            if name is None:
+                ev: object = EC.Delivered(None, dict(ans))
+            elif internal:
+                ev = EC.RunFailed(verb, None)
+            else:
+                ev = EC.Delivered(name)
+        elif name is None:
+            ev = card_read_event(EC, verb, ans) or EC.RunFailed(verb, None)
+        else:
+            ev = EC.RunFailed(verb, None if internal else name)
+        self._feed(ev)
+
+    # -- local queue work ------------------------------------------------------------------------------------------
+    def _unlock(self) -> None:
+        fd, self._qlock = self._qlock, -1
+        if fd >= 0:
+            try:
+                os.close(fd)               # closing the descriptor lets the flock go
+            except OSError:
+                pass
+
+    def _lock(self) -> bool:
+        """The sign queue's own lock (``sign._queue_lock``'s file, ``<queue>/sign/.lock``), TRIED once, never waited
+        on: the relay does not block. False when another holder has it (a Signer answering, another session's scan
+        and filing): the scan then reads as "a card may be open" and is tried again later. OSError when the lock
+        cannot be taken at all."""
+        from levain.consent import sign
+
+        self._unlock()
+        d = sign.sign_dir(self.queue)
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(d / ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        except BaseException:
+            os.close(fd)
+            raise
+        self._qlock = fd
+        return True
+
+    def _scan(self) -> object:
+        """:func:`egress_cards.open_card_scan` over the sign dir: only the ``lv-*.json`` files whose mtime is within the
+        card ttl are read. More than ``sign._SCAN_MAX`` such names (nothing prunes the dir) is "a card may be open":
+        the rule fails toward no card, and the host is said at the end.
+
+        The ONE RULE is check-then-act, and two sessions can share one queue, so the scan runs under the queue's lock
+        and a scan that found no card keeps it until the filing that follows in the same feed (:meth:`_feed` lets it
+        go at the end whatever happened): a second session's scan meanwhile finds the lock held and waits, and its
+        next scan sees the card. A held lock reads as "a card may be open": it fails toward no card."""
+        from levain.consent import sign
+
+        EC = self._events()
+        wall = self.sup.s.wall()
+        entries = []
+        try:
+            if not self._lock():
+                return EC.Scanned(True)
+            with os.scandir(sign.sign_dir(self.queue)) as it:
+                for de in it:
+                    if _CARD_SCAN_NAME.fullmatch(de.name) is None:
+                        continue
+                    try:
+                        mtime = de.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    if wall - mtime > EC.CARD_TTL_S:
+                        continue
+                    if len(entries) >= sign._SCAN_MAX:
+                        self._unlock()
+                        return EC.Scanned(True)
+                    rid = de.name[:-5]
+                    try:
+                        request: Any = sign.read_request(self.queue, rid)
+                    except (sign.SignRefused, OSError):
+                        request = None
+                    entries.append((de.name, mtime, request, sign.state_of(self.queue, rid)))
+        except OSError:
+            self._unlock()
+            return EC.RunFailed("scan")
+        found = EC.open_card_scan(entries, wall)
+        if found:
+            self._unlock()
+        return EC.Scanned(found)
+
+    def _file(self, cmd: Any) -> object:
+        from levain import webpush
+        from levain.consent import sign
+
+        EC = self._events()
+        try:
+            rid = sign.file_levain_request(self.queue, EC.NAMESPACE, cmd.message, title=cmd.title, ttl_s=cmd.ttl_s)
+        except ValueError:
+            return EC.RunFailed("file")                  # this card can never be filed
+        except (OSError, sign.SignRefused):
+            return EC.RunFailed("file", EC.RETRY)        # the queue could not be written now: the host waits
+        finally:
+            self._unlock()
+        try:
+            live = bool(webpush.live(self.queue))
+        except Exception:  # noqa: BLE001 - not knowing a phone is live only means the center carries the card
+            live = False
+        return EC.Filed(rid, live)
+
+    def _push(self, cmd: Any) -> object:
+        """The ping is ALWAYS recorded (``sender.spawn``: the notification center's row, which is the fallback with no
+        phone), and pushed to phones only when one is live. Not ``spawn_sign_request``: that hard-codes ``push=True``.
+        Whether its child started goes back to the flow, so the end never says a ping went where none was sent."""
+        from levain.consent.cockpit_origin import read_origin
+        from levain.consent.sign import deep_link
+        from levain.webpush import sender
+
+        try:
+            origin = read_origin(self.queue)
+            url = deep_link(origin, cmd.rid) if origin else "/"
+            started = sender.spawn(self.queue, kind="attention", ref=cmd.rid, title=cmd.title, body=cmd.body, url=url,
+                                   push=bool(cmd.phone_live),
+                                   data={"v": 1, "kind": "decision", "id": cmd.rid, "repo": "levain",
+                                         "what": cmd.body.strip() or cmd.title, "sign_id": cmd.rid})
+        except (ValueError, OSError):
+            started = False
+        return self._events().Pushed(bool(cmd.phone_live), bool(started))
+
+    def _read(self, rid: str) -> object:
+        from levain.consent import sign
+
+        EC = self._events()
+        state = sign.state_of(self.queue, rid)
+        if state != "signed":
+            return EC.Answer(rid, state)
+        card = self.flow.card
+        payload = None
+        if card is not None and card.rid == rid:
+            d = sign.sign_dir(self.queue)
+            try:
+                payload = EC.read_signed(sign._read_bytes(d / f"{rid}.signed.json"), sign._read_bytes(d / f"{rid}.sig"),
+                                         card.message)
+            except (sign.SignRefused, OSError):
+                payload = None
+        return EC.Answer(rid, "signed", payload)
+
+
+def card_read_event(EC: Any, verb: str, ans: Mapping[str, object]) -> Optional[object]:
+    """The flow's event for an ok ``egress-refusals`` / ``egress-grants-list`` answer, or None when the answer is not
+    in the shape root's verbs return (the caller treats that as a run that ended without an answer)."""
+    from levain.slot import egress_grants as eg
+
+    if verb == EC.REFUSALS:
+        hosts, cursor = ans.get("hosts"), ans.get("cursor")
+        if (not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts) or set(ans) != {"hosts", "cursor"}
+                or not isinstance(cursor, str)):
+            return None
+        return EC.Polled(tuple(hosts), cursor)
+    if verb == EC.GRANTS_LIST:
+        store, entries = ans.get("store"), ans.get("entries")
+        if not isinstance(store, str) or not isinstance(entries, list) or set(ans) != {"store", "entries"}:
+            return None
+        rows = []
+        try:
+            for e in entries:
+                if not isinstance(e, dict) or set(e) != {"grant", "host", "expires", "choice"}:
+                    return None
+                rows.append((str(e["grant"]), str(e["host"]), eg.parse_stamp(e["expires"]), str(e["choice"])))
+        except eg.GrantRefused:
+            return None
+        return EC.Listed(store, tuple(rows))
+    return None
+
+
 class Supervisor:
     def __init__(self, req: Request, seams: Optional[Seams] = None) -> None:
         self.req = req
@@ -1252,6 +1711,7 @@ class Supervisor:
         self._start_refused: Optional[str] = None    # the refusal name `start` printed (display routing only)
         self._slot_index: Optional[int] = None
         self.unshown_lines = 0                # held status lines stderr never took (the end-of-run drain's count)
+        self._lane: Optional["_CardLane"] = None     # S4b: the host-card lane (None: cards off for this session)
 
     # -- small ------------------------------------------------------------------------------------------------------
 
@@ -1642,6 +2102,8 @@ class Supervisor:
             self._check()
             self._launch_probe(session)
             self._check()
+            self._cards_preflight(session)
+            self._check()
             if self.req.auth == "passthrough" and self.req.kind == "interactive" and self.req.vendor == "codex":
                 self.say(CODEX_NO_ACCOUNT_SAID)
             ok = self._start(session)
@@ -1673,6 +2135,38 @@ class Supervisor:
         out = probe_answer(self.helper("probe", session, stdin=None), self.req.vendor)
         self.say(f"firewall self-probe: closed ({out['host']} {out['address']} not reachable as the slot; "
                  f"{out['addresses']} addresses)")
+
+    def _cards_preflight(self, session: str) -> None:
+        """Host cards (levain#66 S4b): one ``egress-grants-list`` before the relay, the one moment his terminal is
+        free. Non-fatal on every refusal: it says once that cards are off and the session goes on. It covers only a
+        store-level ``egress-grant-not-ready`` (root's list answers an empty set for a slot setup has not prepared,
+        so that is not seen here). Its answer's store id seeds the flow."""
+        self._lane = None
+        if not self.s.cards or self.s.allow_dir is None or self._slot_index is None:
+            return
+        from levain.slot import egress_cards as EC
+
+        try:
+            ans = self.helper("egress-grants-list", session, stdin=None)
+        except Refused as e:
+            if e.name == "stopped":
+                raise
+            why = (EC.refusal_words(e.name) if e.name not in _CARD_INTERNAL
+                   else f"the preflight read did not answer ({e.name})")
+            self.say(f"host cards are off for this session: {why}")
+            return
+        listed = card_read_event(EC, EC.GRANTS_LIST, ans)
+        if listed is None:
+            self.say("host cards are off for this session: the preflight read answered in a shape this levain does "
+                     "not know")
+            return
+        lane = _CardLane(self, EC.CardFlow(session=session, slot=self._slot_index), Path(self.s.allow_dir))
+        try:
+            lane._feed(listed)
+        except Exception as e:  # noqa: BLE001 - cards are a convenience: an error here is cards off, never a refused launch
+            self.say(f"host cards are off for this session: an unexpected error ({type(e).__name__})")
+            return
+        self._lane = lane
 
     def _allow_file(self) -> Optional[Path]:
         from levain.slot import slot_allow
@@ -2125,6 +2619,7 @@ class Supervisor:
         reprobe = (_Reprobe(self.s.clock(), self.s.reprobe_s)
                    if self.s.host == "darwin" and self.session is not None else None)
         run: Optional[_ProbeRun] = None
+        lane = self._lane          # S4b: the host-card lane, on both hosts (None: cards are off for this session)
         # O_NONBLOCK is a property of the open file, which stdout may share with stdin (one tty): stdin's read
         # then answers EAGAIN too, and both are put back as they were on every way out.
         was_blocking = os.get_blocking(stdout)
@@ -2135,7 +2630,10 @@ class Supervisor:
             while (self.stop_signal is None and self.end_reason is None and not master_done
                    and out_err is None):
                 exited = proc.poll() is not None      # read BEFORE the select: all its output is in the pty
-                if reprobe is not None and run is None and not exited and reprobe.due(self.s.clock()):
+                if lane is not None and not exited:
+                    lane.step(run is not None)        # BEFORE the re-probe's start: a delivery goes first
+                if (reprobe is not None and run is None and not exited and not (lane is not None and lane.delivering)
+                        and reprobe.due(self.s.clock())):
                     reprobe.started(self.s.clock())
                     try:
                         run = _ProbeRun(self, self.session, self.s.clock())          # type: ignore[arg-type]
@@ -2161,7 +2659,11 @@ class Supervisor:
                     rl.append(self.s.stdin)
                 if run is not None:
                     rl += run.open
+                if lane is not None:
+                    rl += lane.rfds()
                 wl = ([master] if pending and not exited else []) + ([stdout] if outbuf else [])
+                if lane is not None:
+                    wl += lane.wfds()
                 try:
                     ready, writable, _ = select.select(rl, wl, [], 0.5)
                 except InterruptedError:
@@ -2173,6 +2675,8 @@ class Supervisor:
                         run.end()
                         detail, run = run.detail(), None
                         self.end_reason = reprobe.finished(name, detail)               # type: ignore[union-attr]
+                if lane is not None:
+                    lane.pump(ready, writable)
                 if self._wake_r in ready:
                     try:
                         pokes = os.read(self._wake_r, 64)
@@ -2230,12 +2734,19 @@ class Supervisor:
                 if run is not None:
                     run.end()                     # a probe in flight is ended first (R5), before the drain and teardown
             finally:
-                held, self._quiet = self._quiet or [], None
-                if reprobe is not None:
-                    held += reprobe.notes
-                    if reprobe.dropped:
-                        held.append(f"{reprobe.dropped} more firewall self-probe notes were not kept")
-                self._relay_notes += held
+                try:
+                    if lane is not None:
+                        lane.end()                # and so is a host-card run (never raises)
+                finally:
+                    held, self._quiet = self._quiet or [], None
+                    if reprobe is not None:
+                        held += reprobe.notes
+                        if reprobe.dropped:
+                            held.append(f"{reprobe.dropped} more firewall self-probe notes were not kept")
+                    if lane is not None:
+                        held += lane.notes()
+                        self._lane = None
+                    self._relay_notes += held
             left = 0
             try:
                 rest, reset = outbuf + filt.flush(), filt.reset()
@@ -2335,7 +2846,7 @@ def run_session(req: Request, seams: Optional[Seams] = None) -> int:
         except Exception as e:   # noqa: BLE001 - the slot allow rules are a convenience: the launch goes on without
             allow_dir = None
             note = (f"slot allow rules off for this launch: the consent directory cannot be named "
-                    f"({type(e).__name__}: {e})")
+                    f"({type(e).__name__}: {e}); host cards are off too")
         seams = Seams(allow_dir=allow_dir)
     sup = Supervisor(req, seams)
     if note is not None:

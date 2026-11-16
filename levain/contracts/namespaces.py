@@ -72,7 +72,7 @@ REGISTRY: dict[str, tuple[str, str, str]] = {
                                "the operator's phone passkey approving one dispatch configuration item (by the "
                                "SHA-256 of its exact bytes) before the laptop trust-root key signs it; never a "
                                "configuration signature"),
-    EGRESS_HOST_NAMESPACE: ("reserved", "levain/slot/egress_grants.py",
+    EGRESS_HOST_NAMESPACE: ("shipped", "levain/slot/egress_grants.py",
                             "the operator's passkey allowing one unlisted host (port 443) to one egress-slot session "
                             "for this session or 24 hours within it (message format levain-egress-host/1; a choice "
                             "request, key s or d)"),
@@ -125,9 +125,23 @@ LEVAIN_SIGN_REQUESTS: dict[str, str] = {
 # request file in one is refused unless its options are exactly these (so a key signed for one text can never be
 # read as the other) and it offers no write-in. The signed bytes are the message, a newline and the choice line, so a
 # signature for key ``s`` covers a different byte string than one for ``d``.
+#
+# The host-grant words are the button the operator taps AND the line his passkey signs (board levain#66, plan
+# hgs4_plan_v2 section 7). They carry the risk because root attests no card author and no reason: the signed host and
+# the signed words are all it holds him to. ``s`` says "at most 8 hours" because the one-tap session grant ends at the
+# earlier of the session and ``egress_grants.SESSION_TTL_MAX_S``. Root reads this same table from its own installed copy
+# (``egress_grants.option_text``), so a changed word is a skew between a root not yet repaired and the operator's
+# levain: it refuses the choice after the tap, and the sequence is: change the words before the chain ships, run the
+# install helper's repair and restart ``levain serve`` after an upgrade, and after a release change them only with a
+# message-format bump (``levain-egress-host/2``). Phill's ruling on these exact words is pending (band row np-386737ea,
+# options a/b/c): the working value is option b, and the words are the ONLY thing that ruling may change.
 LEVAIN_SIGN_CHOICES: dict[str, tuple[tuple[str, str], ...]] = {
-    EGRESS_HOST_NAMESPACE: (("s", "Allow this host for this session"),
-                            ("d", "Allow this host for 24 hours, this session only")),
+    EGRESS_HOST_NAMESPACE: (
+        ("s", "Allow this host for this session (at most 8 hours). The agent can then send anything it can read to "
+              "any account on this host; Levain cannot see or limit what is sent."),
+        ("d", "Allow this host for 24 hours or until this session ends. The agent can then send anything it can read "
+              "to any account on this host; Levain cannot see or limit what is sent."),
+    ),
 }
 
 # Reserved families: prefix -> the rule. A family reserves the prefix against any other meaning; it registers

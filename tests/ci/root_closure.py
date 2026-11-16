@@ -574,6 +574,19 @@ LAZY_SITES = {
     'levain/slot/supervisor.py::Supervisor._with_slot_allow::from levain.consent.questions import QuestionStore': 'operator',
     # operator: ``Supervisor._with_slot_allow`` <- ``Supervisor.run`` (after its uid-0 refusal), the interactive supervisor's own code, the operator uid's process
     'levain/slot/supervisor.py::Supervisor._with_slot_allow::from levain.slot import slot_allow': 'operator',
+    # operator: the host-card lane (levain#66 S4b) is the interactive supervisor's own code, the operator uid's process;
+    # the dispatch run server imports the module for its names and never starts a lane
+    'levain/slot/supervisor.py::Supervisor._cards_preflight::from levain.slot import egress_cards as EC': 'operator',
+    'levain/slot/supervisor.py::_CardLane._cockpit::from levain.consent.cockpit_origin import read_origin': 'operator',
+    'levain/slot/supervisor.py::_CardLane._events::from levain.slot import egress_cards as EC': 'operator',
+    'levain/slot/supervisor.py::_CardLane._file::from levain import webpush': 'operator',
+    'levain/slot/supervisor.py::_CardLane._file::from levain.consent import sign': 'operator',
+    'levain/slot/supervisor.py::_CardLane._push::from levain.consent.cockpit_origin import read_origin': 'operator',
+    'levain/slot/supervisor.py::_CardLane._push::from levain.consent.sign import deep_link': 'operator',
+    'levain/slot/supervisor.py::_CardLane._push::from levain.webpush import sender': 'operator',
+    'levain/slot/supervisor.py::_CardLane._read::from levain.consent import sign': 'operator',
+    'levain/slot/supervisor.py::_CardLane._scan::from levain.consent import sign': 'operator',
+    'levain/slot/supervisor.py::card_read_event::from levain.slot import egress_grants as eg': 'operator',
     # operator: ``run_session`` <- ``levain.slot.launch.main`` (``levain session``, registered by ``cli.py``), the operator's interpreter; no root entry imports ``levain.slot.launch``
     'levain/slot/supervisor.py::run_session::from levain.consent.queue import default_queue_dir': 'operator',
 }
