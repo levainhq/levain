@@ -5,6 +5,8 @@ const fs = require('fs');
 const vm = require('vm');
 
 const [swPath, scenario, mode] = process.argv.slice(2);
+// 'stuckclick' waits this long: RECEIPT_BUDGET_MS of the worker under test, plus 300 ms
+const STUCK_MS = Number(/RECEIPT_BUDGET_MS = (\d+)/.exec(fs.readFileSync(swPath, 'utf8'))[1]) + 300;
 const listeners = {};
 const log = { console: [], asked: [], posts: [], order: [], shownCalls: [], held: [], getNotificationsCalls: [], fetches: 0, opened: [], posted: [], longWaits: [], claimed: false, skipWaiting: false, windows: [], navigated: [], focused: 0 };
 let traceFail = false;   // 'tracefail' in the mode: every open of the trace cache throws
@@ -53,6 +55,7 @@ const cacheNames = new Set();
 const cacheCtypes = new Map();
 const cacheHeaders = new Map(); // 'cache|key' -> every header of the stored response
 // (cacheCtypes above: 'cache|key' -> content-type, when a test pins one)
+let slowReceiptPut = false;      // 'stuckclick' sets it: every write to the receipts cache takes 50 ms
 let putFailKey = null;           // the next put to this key in a shell cache throws once
 const cacheStores = new Map();   // cache name -> Map(request key -> body text)
 const caches = {
@@ -74,6 +77,7 @@ const caches = {
           await new Promise((res) => setTimeout(res, log.putMode === 'putlate' ? 3600 : 300));
           log.order.push('put-done');
         }
+        if (n === 'levain-receipts' && slowReceiptPut) await new Promise((res) => setTimeout(res, 50));   // 'stuckclick': a real Cache write takes some ms
         if (n.startsWith('levain-shell-v') && putFailKey === k) { putFailKey = null; throw new TypeError('quota'); }
         cacheCtypes.set(n + '|' + k, r.headers.get('content-type') || guess(k)); cacheHeaders.set(n + '|' + k, [...r.headers.entries()]); m.set(k, await r.text());
       },
@@ -181,6 +185,10 @@ function fire(type, ev) {
       self_.clients.matchAll = async (a) => { log.order.push('matchAll'); return m(a); };
       self_.clients.openWindow = async (u) => { log.order.push('openWindow'); return o(u); };
       self_.registration.pushManager.getSubscription = async () => { log.order.push('getSubscription'); return g(); };
+      // 'slowclick': the FIRST subscription lookup (the click report's) takes 150 ms, so the `opened` report's lookup would finish first if the two reports were not sequenced
+      if (parts.includes('slowclick')) { const g2 = self_.registration.pushManager.getSubscription; let slow = true; self_.registration.pushManager.getSubscription = async () => { if (slow) { slow = false; await new Promise((r) => setTimeout(r, 150)); } return g2(); }; }
+      // 'stuckclick': the FIRST subscription lookup (the click report's) does not settle until after the receipt budget, so `opened` waits on `clicked` until the budget is all but spent (clicked ends LATE with the budget); the receipts cache writes take 50 ms (use with +slowpost: the POST then outlives the budget)
+      if (parts.includes('stuckclick')) { slowReceiptPut = true; const g3 = self_.registration.pushManager.getSubscription; let stuck = true; self_.registration.pushManager.getSubscription = async () => { if (stuck) { stuck = false; await new Promise((r) => setTimeout(r, STUCK_MS)); } return g3(); }; }
     }
     // 'slowpost': every receipt POST answers 200 only after 1.5 s (a tap report is still in flight while the click's drain reads the queue)
     if (parts.includes('slowpost')) behaviour = 'slow';
@@ -190,7 +198,7 @@ function fire(type, ev) {
       const realOpen = caches.open.bind(caches); let first = true;
       caches.open = async (n) => { if (n === 'levain-receipts' && first) { first = false; await new Promise((r) => setTimeout(r, 120)); } return realOpen(n); };
     }
-    const [kind, ack, extra] = parts.filter((p) => !['tracefail', 'tap', 'secretq', 'slowpost', 'slowdrain', 'encpath', 'encok', 'encslash'].includes(p));
+    const [kind, ack, extra] = parts.filter((p) => !['tracefail', 'tap', 'secretq', 'slowpost', 'slowdrain', 'slowclick', 'stuckclick', 'encpath', 'encok', 'encslash'].includes(p));
     // ack: absent = silent page; 'ack' = acks at once; 'late' = acks after OPEN_ACK_MS (the page claims the pending target first)
     const post = function (m, tr) {
       if (m && m.type === 'levain-open') {
@@ -231,6 +239,7 @@ function fire(type, ev) {
     if (kind === 'hostile') log.windows = [];   // its throwing getter cannot be printed
     if (ack === 'late') await new Promise((r) => setTimeout(r, 900));   // let the late page act
     log.trace = traceSteps();
+    log.queued = [...(cacheStores.get('levain-receipts') || new Map()).keys()].sort();
     log.pendings = pendings();
     log.pendingLeft = log.pendings.length;
     if (log.pendings.length) log.pending = log.pendings[0];

@@ -20,7 +20,9 @@ import pytest
 
 pytestmark = pytest.mark.chat_egress_srt
 
-CHURN_S = 6.0
+CHURN_S = 6.0           # the minimum window
+MIN_CONNS = 250         # the churn runs past CHURN_S until this many connections were made (the leak guard's premise)
+HARD_CAP_S = 4 * CHURN_S
 FD_GROWTH = 60
 RSS_GROWTH_KB = 150_000
 STDERR_BYTES = 200_000
@@ -77,8 +79,11 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
     try:
         for t in ths:
             t.start()
-        t_end = time.monotonic() + CHURN_S
-        while time.monotonic() < t_end:
+        t0 = time.monotonic()
+        t_end = t0 + CHURN_S
+        # work-bound: the window is a minimum; the loop goes on until the threads made MIN_CONNS connections or HARD_CAP_S passed
+        # (one writer per element, so reading the sum while they run is safe)
+        while time.monotonic() < t_end or (sum(c[0] for c in per_thread) < MIN_CONNS and time.monotonic() < t0 + HARD_CAP_S):
             st, body, took = L.request("GET", "/during", timeout=15)
             ok.append((st, took, body))
             time.sleep(0.3)
@@ -98,9 +103,15 @@ def test_continuous_churn_is_bounded_and_a_valid_request_still_completes(make_or
         time.sleep(0.5)
     st_after = after[-1][0]
     fds1, rss1 = _fds(pid), _rss_kb(pid)
-    print(f"C3 churn: {counts[0]} connections in {CHURN_S}s; valid requests {len(ok)} all {sorted({x[0] for x in ok})}, "
+    print(f"C3 churn: {counts[0]} connections in {time.monotonic() - t0:.1f}s; valid requests {len(ok)} all {sorted({x[0] for x in ok})}, "
           f"slowest {max(x[1] for x in ok):.2f}s; glue fds {fds0}->{fds1}, rss {rss0}->{rss1} KB")
-    assert counts[0] > 200, counts            # the churn happened
+    # the churn is WORK-bound, not time-bound: the leak guard below (fds1 - fds0 <= FD_GROWTH = 60) means something only if
+    # the churn made well over 60 connections (a leak of one fd per connection would then show 200+); a runner's speed decides
+    # how long that takes (a loaded macos-latest made 190 and 197 in CHURN_S, and in the same run only 54 whole heads), so the
+    # loop above runs until MIN_CONNS were made, up to HARD_CAP_S. A per-thread or whole-head count is not asserted: the thread
+    # scheduling and the random kinds make them runner-dependent, and nothing below needs more than the total.
+    assert counts[0] >= 200, (f"the runner could not make 200 connections in 4x the window (it is slower than 4x the normal runner): "
+                              f"{per_thread}")
     assert ok and any(x[0] == 200 for x in ok) and st_after == 200, (ok, after)
     # a refusal under the flood is the wall and nothing else: any other status or body is a real refusal of a valid request
     assert all((x[0], x[2]) in ((200, b"ok"), (503, BUSY)) for x in ok), [x for x in ok if x[0] != 200]
