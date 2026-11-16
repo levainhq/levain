@@ -65,14 +65,14 @@ def _beats(store: Any, start: datetime, end: datetime) -> tuple[datetime | None,
 
 def _gaps(prior: datetime | None, inside: list[datetime], start: datetime, end: datetime,
           window: timedelta) -> list[tuple[datetime, datetime]]:
-    """The gaps over ``window`` among the beats and the night's edges, clipped to the night. With an earlier beat the
-    first silence is measured from it (so one straddling the start is not under-reported) and only its part inside
-    the night is returned; with none, the night's clock starts at ``start``."""
+    """The gaps over ``window`` among the beats and the night's edges, clipped to the night, each from the beat (or
+    edge) before it to the one after. With an earlier beat the first silence is judged from it (so one straddling the
+    start is not under-reported) but, like every other stretch, is reported from the beat: its part inside the night,
+    start to the first point; with none, the night's clock starts at ``start``."""
     points = [start, *inside, end]
     if prior is None:
         return [(a, b) for a, b in zip(points, points[1:]) if b - a > window]
-    blind_from = max(prior + window, start)
-    opening = [(blind_from, points[1])] if points[1] - prior > window and blind_from < points[1] else []
+    opening = [(start, points[1])] if points[1] - prior > window and start < points[1] else []
     return opening + [(a, b) for a, b in zip(points[1:], points[2:]) if b - a > window]
 
 

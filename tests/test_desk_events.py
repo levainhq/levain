@@ -1436,3 +1436,56 @@ def test_the_event_verbs_run_end_to_end_through_the_cli(qdir, tmp_path, capsys):
     assert run("event", "list", "--audit") == 0
     assert eid in capsys.readouterr().out
     assert run("event", "ack", eid, "--why", "x", "--by", "desk", "--token", "1") == 1        # no lease: refused
+
+
+# --- the delivery pass's write transaction does not scale with the events ever stored (levain#69) -----------------
+def _statements(store, call):
+    """How many SQL statements ``call`` runs inside the coord write transaction it opens."""
+    import contextlib
+
+    seen = {"n": 0}
+    real = store._write
+
+    @contextlib.contextmanager
+    def counted(*a, **kw):
+        with real(*a, **kw) as (conn, now):
+            conn.set_trace_callback(lambda _sql: seen.__setitem__("n", seen["n"] + 1))
+            try:
+                yield conn, now
+            finally:
+                conn.set_trace_callback(None)
+
+    store._write = counted
+    try:
+        call()
+    finally:
+        store._write = real
+    return seen["n"]
+
+
+def _settled_beats(store, clock, cred, count, first=1):
+    for seq in range(first, first + count):
+        clock.advance(seconds=1)
+        events.post(store, "mon", seq, "heartbeat", {"subject": "watcher", "state": "ok"}, credential=cred)
+
+
+@pytest.mark.parametrize("which", ["progress", "claim"])
+def test_a_pass_over_settled_events_costs_the_same_at_any_count(store, clock, tmp_path, which):
+    cred = sensor(store, tmp_path)
+    call = {"progress": lambda: events.progress(store), "claim": lambda: events.claim_for_launch(store, "lch-x")}[which]
+    _settled_beats(store, clock, cred, 5)
+    clock.advance(hours=3)
+    few = _statements(store, call)
+    _settled_beats(store, clock, cred, 40, first=6)
+    clock.advance(hours=3)
+    many = _statements(store, call)
+    assert many == few, (few, many)      # 5 events vs 45: a per-event read in the transaction would make these differ
+
+
+def test_a_pass_still_moves_the_open_events_among_settled_ones(store, clock, tmp_path):
+    cred = sensor(store, tmp_path)
+    _settled_beats(store, clock, cred, 10)
+    clock.advance(seconds=1)
+    posted = down(store, cred, 11)
+    got = events.claim_for_launch(store, "lch-x")
+    assert [e.event_id for e in got] == [posted.event.event_id]
