@@ -282,6 +282,7 @@ Host taoserv-night
     RequestTTY no
     ForwardAgent no
 ```
+The seat's copy is written by `levain.desk.night_ssh.write_config(<address>, <the seat's HOME>)` to `<HOME>/.levain/night/ssh_config` (it adds `GlobalKnownHostsFile none` and `StrictHostKeyChecking yes`); that file must exist before any armed night, or every covered restart exits 255 and is journaled `failed`.
 Proof: from the seat's real environment, `ssh -o BatchMode=yes <old-account>@TAOSERV true` must FAIL to authenticate (this is
 the row's done line: "from the seat's real environment the old key cannot authenticate"). Wiring `-F` into
 `effects._night_argv` is a change to ND-3a's file and is a separate row.
