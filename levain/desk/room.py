@@ -108,6 +108,30 @@ ROOM_SCHEMA: tuple[str, ...] = (
     "AND p.launch_id = NEW.launch_id) "
     "BEGIN SELECT RAISE(ABORT, 'a drop note is the summary of the proposal that made the drop'); END",
 
+    # H1-4 shape A: a proposal of a second kind, an ENVELOPE SPEC card. ``spec_proposals`` holds what the room proposed (a
+    # JSON spec for one thread) beside the drop_proposals row that quotes his words; ``spec_card_taps`` binds each tap
+    # to the drop, the bytes (``words_sha256``) and the draft revision it wrote. Both append-only.
+    "CREATE TABLE IF NOT EXISTS spec_proposals (proposal_id TEXT PRIMARY KEY REFERENCES drop_proposals(proposal_id), "
+    "thread_id TEXT NOT NULL REFERENCES threads(thread_id), spec_text TEXT NOT NULL, spec_sha256 TEXT NOT NULL, "
+    f"CHECK (length(spec_text) <= {WORDS_MAX}))",
+    *_append_only("spec_proposals", "a spec proposal"),
+    "CREATE TRIGGER IF NOT EXISTS spec_proposals_no_replace BEFORE INSERT ON spec_proposals WHEN EXISTS (SELECT 1 FROM "
+    "spec_proposals WHERE proposal_id = NEW.proposal_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a spec proposal is never replaced'); END",
+    "CREATE TABLE IF NOT EXISTS spec_card_taps (proposal_id TEXT NOT NULL UNIQUE REFERENCES spec_proposals(proposal_id), "
+    "thread_id TEXT NOT NULL REFERENCES threads(thread_id), words_sha256 TEXT NOT NULL, "
+    "drop_id TEXT NOT NULL UNIQUE REFERENCES drops(drop_id), draft_id TEXT NOT NULL, "
+    "revision INTEGER NOT NULL CHECK (revision >= 1), at TEXT NOT NULL)",
+    *_append_only("spec_card_taps", "a spec card tap"),
+    "CREATE TRIGGER IF NOT EXISTS spec_card_taps_no_replace BEFORE INSERT ON spec_card_taps WHEN EXISTS (SELECT 1 FROM "
+    "spec_card_taps WHERE proposal_id = NEW.proposal_id OR drop_id = NEW.drop_id OR rowid = NEW.rowid) "
+    "BEGIN SELECT RAISE(ABORT, 'a spec card is tapped once'); END",
+    # the tap is the proposal's commit: its drop is the drop the committed event names, and its thread is the card's
+    "CREATE TRIGGER IF NOT EXISTS spec_card_taps_is_the_commit BEFORE INSERT ON spec_card_taps WHEN NOT EXISTS (SELECT 1 "
+    "FROM proposal_events e JOIN spec_proposals s ON s.proposal_id = e.proposal_id WHERE e.proposal_id = NEW.proposal_id "
+    "AND e.kind = 'committed' AND e.drop_id = NEW.drop_id AND s.thread_id = NEW.thread_id) "
+    "BEGIN SELECT RAISE(ABORT, 'a spec card tap is the commit of that card, on its own thread'); END",
+
     # D2 (1106-16): what the room relayed to the host's desk. A relay is CLAIMED (its intent, committed BEFORE the host
     # command runs) and then gets at most one outcome. Its state: no outcome = 'claimed' (in flight, or the door died
     # mid-command), 'sent', 'failed' (the command never started: nothing was delivered) or 'unknown' (it started and did
@@ -151,6 +175,16 @@ class Proposal:
     about: str | None
     at: str
     state: str          # open | committed | dismissed | expired
+
+
+@dataclass(frozen=True)
+class SpecProposal:
+    """What an envelope card proposes: the thread it is for and the room's spec text (the card's prefill, never the
+    bytes a tap writes: those are the ones he posts)."""
+    proposal_id: str
+    thread_id: str
+    spec_text: str
+    spec_sha256: str
 
 
 def ensure(conn: sqlite3.Connection) -> None:
@@ -367,6 +401,59 @@ def propose(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], summ
     return _proposal(conn, proposal_id)
 
 
+def propose_spec(conn: sqlite3.Connection, launch_id: str, quote: Sequence[str], thread: str, spec_text: str,
+                 summary: str, *, now: str | None = None) -> Proposal:
+    """An ENVELOPE card: a proposal (:func:`propose`, quoting his messages, ``about`` the thread) plus the room's spec
+    text for ``thread``, an open work thread. Information only: no drop, no draft. The text is a prefill he reads and
+    edits; whether it parses is the caller's dry run (the door's), and a tap parses the bytes he posts."""
+    ensure(conn)
+    _thread_id(conn, thread, "the card")
+    t = CoordStore._thread(conn, thread)
+    if t.kind != "work" or t.state != "open":
+        raise CoordError(f"an envelope card is for an open work thread; {thread} is a {t.state} {t.kind} thread")
+    if not isinstance(spec_text, str) or not spec_text.strip() or len(spec_text) > WORDS_MAX:
+        raise CoordError(f"a spec is 1 to {WORDS_MAX} characters of text")
+    try:
+        spec_text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise CoordError("a spec must be text UTF-8 can hold") from None
+    p = propose(conn, launch_id, quote, summary, thread, now=now)
+    try:
+        conn.execute("INSERT INTO spec_proposals (proposal_id, thread_id, spec_text, spec_sha256) VALUES (?, ?, ?, ?)",
+                     (p.proposal_id, thread, spec_text, words_sha256(spec_text)))
+    except sqlite3.IntegrityError as exc:
+        raise CoordError(str(exc)) from None
+    return p
+
+
+def spec_of(conn: sqlite3.Connection, proposal_id: str) -> SpecProposal | None:
+    """The card's spec, or None for a proposal that is a plain drop proposal."""
+    ensure(conn)
+    row = conn.execute("SELECT proposal_id, thread_id, spec_text, spec_sha256 FROM spec_proposals WHERE proposal_id = ?",
+                       (proposal_id,)).fetchone()
+    return None if row is None else SpecProposal(*row)
+
+
+def replaced_by(conn: sqlite3.Connection, proposal_id: str) -> str | None:
+    """DERIVED, nothing written: the NEWEST envelope card for the same thread in the same room, when it is not this one.
+    A tap on a card with a newer one would revise over it (a rule always writes the unclosed series' next revision), so
+    the older is refused. A newer card he dismissed replaces nothing (L3 r1 complement: both cards were dead); an open
+    or a committed one does (an expired newer card means this one, in the same room, is expired too)."""
+    ensure(conn)
+    return newer_card(conn, proposal_id)
+
+
+def newer_card(conn: sqlite3.Connection, proposal_id: str) -> str | None:
+    """:func:`replaced_by` over tables that already exist, so a read-only connection (the cockpit's read) shares it."""
+    row = conn.execute(
+        "SELECT n.proposal_id FROM spec_proposals s JOIN drop_proposals p ON p.proposal_id = s.proposal_id, "
+        "spec_proposals sn JOIN drop_proposals n ON n.proposal_id = sn.proposal_id "
+        "WHERE s.proposal_id = ? AND sn.thread_id = s.thread_id AND n.room_thread = p.room_thread AND n.gseq > p.gseq "
+        "AND NOT EXISTS (SELECT 1 FROM proposal_events e WHERE e.proposal_id = n.proposal_id AND e.kind = 'dismissed') "
+        "ORDER BY n.gseq DESC LIMIT 1", (proposal_id,)).fetchone()
+    return None if row is None else row[0]
+
+
 def dismiss(conn: sqlite3.Connection, proposal_id: str, *, by: str = "operator", now: str | None = None) -> Proposal:
     """His "no" on a card. Refused for a proposal already committed or dismissed; an expired one may still be
     dismissed (it is shown, then put away)."""
@@ -384,6 +471,29 @@ def dismiss(conn: sqlite3.Connection, proposal_id: str, *, by: str = "operator",
     return _proposal(conn, proposal_id)
 
 
+def _commit_rows(conn: sqlite3.Connection, now: str, store: CoordStore, proposal_id: str, wake: bool = True,
+                 **drop: Any) -> Any:
+    """The rows one commit writes, inside the caller's write transaction: the drop, the proposal's ``committed`` event and
+    the labelled note, together or not at all. Shared by :func:`commit` and an envelope card's tap
+    (:func:`levain.desk.spec_card.tap`), which passes ``wake=False`` because it settles the drop in the same
+    transaction. ``drop`` is :meth:`CoordStore.accept_drop`'s carrier arguments."""
+    ensure(conn)
+    p = _proposal(conn, proposal_id)
+    if p.state != "open":
+        raise CoordError(f"proposal {proposal_id} is {p.state}; only an open proposal is committed")
+    try:
+        made = store._insert_drop(conn, now, wake=wake, **drop)
+        conn.execute("INSERT INTO proposal_events (proposal_id, kind, drop_id, at, by) "
+                     "VALUES (?, 'committed', ?, ?, 'operator')", (proposal_id, made.drop_id, now))
+        conn.execute("INSERT INTO drop_notes (drop_id, gseq, author, room_thread, launch_id, proposal_id, body, "
+                     "body_sha256, at) VALUES (?, ?, 'room', ?, ?, ?, ?, ?, ?)",
+                     (made.drop_id, next_gseq(conn, now), p.room_thread, p.launch_id, proposal_id, p.summary,
+                      words_sha256(p.summary), now))
+    except sqlite3.IntegrityError as exc:
+        raise CoordError(str(exc)) from None
+    return made
+
+
 def commit(store: CoordStore, proposal_id: str, words: str, outbox_id: str, surface: str) -> tuple[Any, bool]:
     """His tap: the drop, from ``words`` as the card's field held them (his adopted quote, or his edit of it), through
     the store's own ``accept_drop`` carry, so the drop, the proposal's ``committed`` event and the labelled note commit
@@ -394,21 +504,7 @@ def commit(store: CoordStore, proposal_id: str, words: str, outbox_id: str, surf
         raise CoordError(f"a drop's surface is one of {', '.join(SURFACES)}")
 
     def carry(conn: sqlite3.Connection, now: str, **drop: Any) -> Any:
-        ensure(conn)
-        p = _proposal(conn, proposal_id)
-        if p.state != "open":
-            raise CoordError(f"proposal {proposal_id} is {p.state}; only an open proposal is committed")
-        try:
-            made = store._insert_drop(conn, now, **drop)
-            conn.execute("INSERT INTO proposal_events (proposal_id, kind, drop_id, at, by) "
-                         "VALUES (?, 'committed', ?, ?, 'operator')", (proposal_id, made.drop_id, now))
-            conn.execute("INSERT INTO drop_notes (drop_id, gseq, author, room_thread, launch_id, proposal_id, body, "
-                         "body_sha256, at) VALUES (?, ?, 'room', ?, ?, ?, ?, ?, ?)",
-                         (made.drop_id, next_gseq(conn, now), p.room_thread, p.launch_id, proposal_id, p.summary,
-                          words_sha256(p.summary), now))
-        except sqlite3.IntegrityError as exc:
-            raise CoordError(str(exc)) from None
-        return made
+        return _commit_rows(conn, now, store, proposal_id, **drop)
 
     # CoordStore's own method: an EnvelopeStore's override takes no carrier, and a room drop carries no envelope
     drop, created = CoordStore.accept_drop(store, words, surface=surface, outbox_id=outbox_id, _carry=carry)

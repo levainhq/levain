@@ -2930,6 +2930,10 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-card textarea { width: 100%; box-sizing: border-box; min-height: 72px; resize: vertical; padding: var(--sp-3) var(--sp-4); background: var(--card); color: var(--text);
   border: 1px solid var(--hair-2); border-radius: var(--r-md); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); }
 .rv .rv-summary { padding: var(--sp-3) var(--sp-4); border-left: 3px solid var(--hair-2); color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.5 var(--sans); white-space: pre-wrap; overflow-wrap: anywhere; }
+.rv .rv-quote { padding: var(--sp-3) var(--sp-4); border-left: 3px solid var(--hair-2); white-space: pre-wrap; }
+.rv .rv-reading { padding: var(--sp-3) var(--sp-4); border: 1px solid var(--hair-2); border-radius: var(--r-md); display: flex; flex-direction: column; gap: var(--sp-2); }
+.rv .rv-reading .rv-readline { margin: 0; overflow-wrap: anywhere; }
+.rv .rv-reading .rv-wider { font-weight: var(--fw-semibold); }
 /* the pinned composer: 768 wide on a desk (ChatGPT, measured), the page's width less the gutters on a phone; the box is at least 52 tall
    (48 floor on a phone) and its buttons are 44. The status line sits above it, so the composer is the last thing on the page. */
 .rv .rv-dock { flex: none; display: flex; flex-direction: column; gap: var(--sp-3); box-sizing: border-box; min-width: 0; width: min(100%, calc(var(--rv-comp) + var(--rv-pl) + var(--rv-pr)));
