@@ -725,15 +725,20 @@ def _close(conn: sqlite3.Connection, now: str, incident_id: str, cause: str) -> 
 
 
 # --- delivery -------------------------------------------------------------------------------------------------------
+def _in_state(conn: sqlite3.Connection, states: Sequence[str], *, trusted_only: bool = False) -> list[str]:
+    """Event ids (oldest first) whose latest lifecycle state is one of ``states``, in ONE statement: the write
+    transaction a delivery pass holds does not pay a per-event round trip for every event ever stored (settled ones
+    are the great majority). An event with no lifecycle state at all is returned too: the caller's own read of it
+    refuses by name, as it always did."""
+    latest = (f"(SELECT s.kind FROM event_states s WHERE s.event_id = e.event_id AND {_in('s.kind', LIFECYCLE)} "
+              "ORDER BY s.seq DESC LIMIT 1)")
+    where = f"({latest} IS NULL OR {_in(latest, states)})" + (" AND e.trust != 'untrusted'" if trusted_only else "")
+    return [r[0] for r in conn.execute(f"SELECT e.event_id FROM events e WHERE {where} ORDER BY e.gseq").fetchall()]
+
+
 def _available(conn: sqlite3.Connection, *, trusted: bool = True) -> list[str]:
     """Event ids whose latest lifecycle state is available, oldest first."""
-    out = []
-    for (eid, trust) in conn.execute("SELECT event_id, trust FROM events ORDER BY gseq").fetchall():
-        if trusted and trust == "untrusted":
-            continue
-        if _latest(conn, eid)[0] in _AVAILABLE:
-            out.append(eid)
-    return out
+    return [eid for eid in _in_state(conn, _AVAILABLE, trusted_only=trusted) if _latest(conn, eid)[0] in _AVAILABLE]
 
 
 def claim_for_launch(store: Any, launch_id: str) -> list[Event]:
@@ -745,9 +750,8 @@ def claim_for_launch(store: Any, launch_id: str) -> list[Event]:
     with store._write() as (conn, now):
         if nightclose.stopped(conn, launch_id):      # a launch the morning's nightclose stopped claims nothing more
             return []
-        mine = [e for e in (_event(conn, r[0]) for r in conn.execute(
-            "SELECT event_id FROM events WHERE trust != 'untrusted' ORDER BY gseq").fetchall())
-            if e.state in ("claimed", "delivered") and e.launch_id == launch_id]
+        mine =[e for e in (_event(conn, eid) for eid in _in_state(conn, ("claimed", "delivered"), trusted_only=True))
+                if e.state in ("claimed", "delivered") and e.launch_id == launch_id]
         take = _available(conn)[: max(0, BRIEF_EVENTS - len(mine))]
         until = _plus(now, CLAIM_TTL)
         for eid in take:
@@ -913,7 +917,7 @@ def progress(store: Any, *, pinger: Pinger | None = None) -> tuple[list[str], st
         waiting: list[Event] = []
         # stopped: the one stop ping speaks for every waiting event, so no event pings its own wait (N events, one push)
         is_stopped = lease.wake_state(conn, now)[0] == "stopped"
-        for (eid,) in conn.execute("SELECT event_id FROM events ORDER BY gseq").fetchall():
+        for eid in _in_state(conn, _OPEN_STATES):      # a settled event has nothing to move (_progress_row's first test)
             # one row's failure (a row the code cannot read) is that row's alone: its writes roll back to here, it
             # is named in a line on every pass, and the pass goes on to the rest
             conn.execute("SAVEPOINT event_row")

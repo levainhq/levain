@@ -139,11 +139,21 @@ def test_a_night_with_no_heartbeat_is_blind_throughout(store):
     assert "1h 0m" in line
 
 
-def test_a_beat_before_the_night_keeps_its_start_alive_for_one_window(store, poster):
+def test_a_beat_before_the_night_judges_the_first_silence_from_the_beat_and_reports_its_part_in_the_night(store, poster):
     poster.beat(-5)
     assert night_audit.blind_stretches(store, stamp(0), stamp(10), window=WINDOW) == []
     got = night_audit.blind_stretches(store, stamp(0), stamp(40), window=WINDOW)
-    assert got == [(stamp(10), stamp(40))]     # the beat at -5 lives to +10: the silence is measured from it
+    assert got == [(stamp(0), stamp(40))]      # judged from the beat at -5, reported like every stretch: clipped to the night
+
+
+def test_a_gap_just_over_the_window_reads_its_true_length_whether_it_opens_the_night_or_not(store, poster):
+    # the same 16-minute gap twice: from a beat 5 minutes before the night to one at 11, and between beats at 20 and 36
+    for m in (-5, 11, 20, 36):
+        poster.beat(m)
+    got = night_audit.blind_stretches(store, stamp(0), stamp(40), window=WINDOW)
+    assert got == [(stamp(0), stamp(11)), (stamp(20), stamp(36))], got
+    first, second = night_audit.blind_time_lines(store, stamp(0), stamp(40), window=WINDOW)
+    assert "(0h 11m)" in first and "(0h 16m)" in second
 
 
 def test_blind_time_reads_only(store, poster, tmp_path):
@@ -242,10 +252,10 @@ def test_a_beat_far_older_than_the_night_does_not_start_a_stretch_before_the_nig
 
 def test_a_silence_straddling_the_night_start_reports_the_part_inside_the_night(store, poster):
     poster.beat(-10)
-    poster.beat(10)                                  # 20m of silence, 5m of it (+5..+10) inside the night
-    assert night_audit.blind_stretches(store, stamp(0), stamp(20), window=WINDOW) == [(stamp(5), stamp(10))]
+    poster.beat(10)                                  # 20m of silence, 10m of it (0..+10) inside the night
+    assert night_audit.blind_stretches(store, stamp(0), stamp(20), window=WINDOW) == [(stamp(0), stamp(10))]
     (line,) = night_audit.blind_time_lines(store, stamp(0), stamp(20), window=WINDOW)
-    assert "blind 22:05Z to 22:10Z (0h 5m)" in line
+    assert "blind 22:00Z to 22:10Z (0h 10m)" in line
 
 
 def test_the_straddling_silence_at_exactly_the_window_is_not_blind(store, poster):
@@ -259,7 +269,7 @@ def test_the_straddling_silence_at_exactly_the_window_is_not_blind(store, poster
 def test_the_straddling_silence_just_over_the_window_is_blind(store, poster):
     poster.beat(-10)
     poster.beat(5.5)
-    assert night_audit.blind_stretches(store, stamp(0), stamp(10), window=WINDOW) == [(stamp(5), stamp(5.5))]
+    assert night_audit.blind_stretches(store, stamp(0), stamp(10), window=WINDOW) == [(stamp(0), stamp(5.5))]
 
 
 def test_a_beat_exactly_at_the_night_start_after_an_old_one_makes_no_zero_length_stretch(store, poster):
