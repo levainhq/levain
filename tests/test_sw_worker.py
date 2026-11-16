@@ -679,6 +679,29 @@ def test_a_tap_posts_clicked_then_opened_with_how_the_window_was_got(mode: str, 
 
 
 @needs_node
+@pytest.mark.parametrize("mode", ["opennull+tap+slowclick", "openfail+tap+slowclick", "controlled+ack+tap+slowclick"])
+def test_opened_is_never_posted_before_clicked_even_when_the_clicks_own_lookup_is_the_slow_one(mode: str) -> None:
+    """The two reports each wait for the push subscription and its digest on their own; a window step that ends at once
+    (openWindow refused) used to let `opened` overtake a `clicked` whose lookup was slower (a CI flake, 11-15). The
+    worker now starts `opened`'s POST only after `clicked`'s POST has been issued: this pins it with a 150 ms slow click lookup."""
+    got = _run("navigate", mode)
+    assert [p["body"]["kind"] for p in got["posts"]] == ["clicked", "opened"], got["posts"]
+
+
+@needs_node
+@pytest.mark.parametrize("mode", ["opennull+tap+stuckclick+slowpost", "controlled+ack+tap+stuckclick+slowpost"])
+def test_an_opened_report_whose_ordering_wait_eats_the_budget_is_still_queued_never_lost(mode: str) -> None:
+    """The wait for `clicked`'s POST to be issued used to be charged to `opened`'s own budget: a click lookup that holds
+    the budget to its end left `opened` with ~nothing, so its queue write came back LATE and its POST was aborted: neither
+    sent nor queued (L3 of levain#61). The receipt is now written to the queue first and independently; only its POST waits
+    (fail-open). Red on 51dbd9061: the trace says `lost` and the queue is empty."""
+    got = _run("navigate", mode)
+    opened = [t for t in got["trace"] if t.get("step") == "receipt" and t.get("kind") == "opened"]
+    assert [t["result"] for t in opened] == ["queued"], got["trace"]
+    assert [k for k in got["queued"] if "-opened-" in k] != [], got["queued"]
+
+
+@needs_node
 def test_clicked_is_posted_before_the_window_is_opened_and_before_opened() -> None:
     """The click's report must not depend on the window step: it is sent before openWindow is called and before the
     `opened` report. (matchAll is STARTED first in the same turn: the report needs the subscription, which is async, and the

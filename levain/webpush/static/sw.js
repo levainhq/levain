@@ -147,7 +147,14 @@ const traceRefused = (kind, ping, status, result) => trace('receipt-refused', { 
 // server answered 200 or refused it (a refused report is dropped: retrying cannot change it); a network failure, a 5xx,
 // 408 or 429, or the budget leaves it queued for a later event. True when the server answered (the network is up, so a
 // drain is worth its time); never throws.
-async function sendReceipt(ping, kind, at, b, hashP, extra) {
+// `seq` (a tap report only): { after, issued }. `after` is a promise that settles once the report before this one has
+// issued its POST (or ended without one): this report's POST is not ISSUED before it, so the two reports of one tap are
+// issued in the order they were started (each waits on its own subscription and digest, which finish in no fixed order).
+// That orders the fetch calls only: arrival over separate connections is not guaranteed. The wait gates the POST alone and
+// fails open: the report is written to the queue at once, whatever the wait does, and when the wait uses up the budget the
+// POST still goes (aborted at the deadline, it stays queued for a drain). `issued` is called once this report's POST is
+// issued or the report ends, whichever comes first.
+async function sendReceipt(ping, kind, at, b, hashP, extra, seq) {
   try {
     if (!Number.isInteger(ping) || ping <= 0) { trace('receipt', { kind, ping: null, result: 'no-ping' }); return false; }
     const hash = await hashP;
@@ -157,7 +164,14 @@ async function sendReceipt(ping, kind, at, b, hashP, extra) {
     const key = receiptKey(body);
     receiptInFlight.add(key);
     try {
-    const [put, post] = await Promise.allSettled([b.within(() => putReceipt(key, body)), postReceipt(body, b)]);
+    const putP = b.within(() => putReceipt(key, body));   // the queue copy never waits on the ordering
+    const postP = (async () => {
+      if (seq && seq.after) await b.within(() => seq.after);
+      const p = postReceipt(body, b);
+      if (seq && seq.issued) seq.issued();   // the POST's fetch is already called ahead of whatever the next report does on this signal
+      return p;
+    })();
+    const [put, post] = await Promise.allSettled([putP, postP]);
     const queued = put.status === 'fulfilled' && put.value === true;
     const status = post.status === 'fulfilled' ? post.value : null;
     if (status !== null && receiptSettled(status)) {
@@ -242,7 +256,12 @@ function reportTap(work, ping, kind, extra) {
     const t = Date.now(), b = receiptBudget(t);
     const clean = {};
     for (const k of Object.keys(extra || {})) if (extra[k] !== null && extra[k] !== undefined) clean[k] = extra[k];
-    work.push(boundedReceipts(b, () => sendReceipt(ping, kind, t, b, endpointHash(b), clean)));
+    // the reports of one tap are sequenced through `work`: each one's POST is issued (its fetch called) only after the
+    // previous one's was, or its report ended; that is the order of the calls, not a promise about arrival
+    let issued;
+    const seq = { after: work.issuedLast || null, issued: () => { if (issued) { const f = issued; issued = null; f(); } } };
+    work.issuedLast = new Promise((r) => { issued = r; });
+    work.push(boundedReceipts(b, () => sendReceipt(ping, kind, t, b, endpointHash(b), clean, seq)).finally(seq.issued));
   } catch (_) { /* a report never reaches the tap */ }
 }
 
