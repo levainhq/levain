@@ -9045,7 +9045,7 @@
       it.key += "#" + n;
       used.add(it.key);
     }
-    return { fault: fault, seen: !!panel && typeof panel === "object" && !panel.error, items: items.map((it, i) => [it, i]).sort((a, b) => ((b[0].at === null ? -Infinity : b[0].at) - (a[0].at === null ? -Infinity : a[0].at)) || (a[1] - b[1])).map((x) => x[0]) };
+    return { fault: fault, seen: !!panel && typeof panel === "object" && !panel.error && panel.loading !== true, items: items.map((it, i) => [it, i]).sort((a, b) => ((b[0].at === null ? -Infinity : b[0].at) - (a[0].at === null ? -Infinity : a[0].at)) || (a[1] - b[1])).map((x) => x[0]) };
   }
   let dropRowSeq = 0;
   function dropRow(it, ui) {
@@ -9290,7 +9290,7 @@
     }
   }
   // A desk row not seen before (after the first draw that had the desk's panel) is announced once. Never a refresh with nothing
-  // new, never his own rows.
+  // new, never his own rows. A panel the boot has not read yet ({loading: true}) is not that first draw: it holds no rows to baseline.
   function announceDesk(ui, t) {
     if (!t.seen) return;
     const keys = t.items.filter((it) => it.desk && !it.mine).map((it) => it.key);
