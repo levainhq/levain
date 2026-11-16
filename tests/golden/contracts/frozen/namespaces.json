@@ -114,6 +114,11 @@
    "owner": "levain/dispatch/phone_config.py"
   },
   {
+   "namespace": "levain-egress-host",
+   "status": "reserved",
+   "owner": "levain/slot/egress_grants.py"
+  },
+  {
    "namespace": "levain-envelope-revoke",
    "status": "shipped",
    "owner": "levain/desk/envelope_revoke.py"
