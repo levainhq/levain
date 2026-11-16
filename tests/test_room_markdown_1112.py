@@ -156,63 +156,6 @@ def test_a_hostile_body_is_inert_text_never_an_element_a_live_link_or_a_script(t
     _safe(_page(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}))
 
 
-# --- gap 4: Start desk, a signed /fanin through the cockpit's own signing sheet -----------------------------------------------------
-
-_DESK_LOOK = """(() => { const q = s => document.querySelector(s), r = n => { const b = n.getBoundingClientRect(); return {l: b.left, t: b.top, w: b.width, h: b.height, r: b.right}; };
-  const d = q('.rv-desk'), n = q('.rv-rotate'), top = q('.rv-top'), sheet = document.getElementById('levain-sign-sheet');
-  return JSON.stringify({desk: !!d, deskText: d && d.textContent, deskBox: d && r(d), rotBox: n && r(n), topBox: r(top), vw: innerWidth,
-    drops: window.__drops || null, note: q('.rv-sendnote') && q('.rv-sendnote').textContent,
-    sheet: !!sheet, frame: sheet && sheet.querySelector('iframe') ? sheet.querySelector('iframe').getAttribute('src') : null,
-    pageX: document.documentElement.scrollWidth > innerWidth + 1, topOverflow: top.scrollWidth > top.clientWidth + 1}); })()"""
-_STUB = "(() => { window.__drops = []; const S = window.LevainSignSheet, o = S.openDrop; S.openDrop = (w) => { window.__drops.push(w); return %s; }; return 1; })()"
-
-
-def _desk(tmp_path, qdir, emulate, stub=None, shot=None):
-    rs, _launcher, src = _rig(tmp_path, qdir)
-    steps = ([{"eval": _STUB % stub}] if stub is not None else []) + [
-        {"eval": "document.querySelector('.rv-desk').click(); 1"},
-        {"eval": "new Promise(r => setTimeout(r, 300)).then(() => 1)"}, {"eval": _DESK_LOOK}]
-    with _serve(src, write_token=TOKEN, room_serve=rs) as (base, _h):
-        out = _drive(tmp_path, base + "/", [{"emulate": emulate}] + list(_ENTER) + steps + (_shot(shot) if shot else []))
-    return json.loads(next(v for v in out["values"] if isinstance(v, str) and v.startswith("{") and '"deskText"' in v))
-
-
-def _bar_fits(g):
-    # the control is a real touch target, sits inside the header beside New without pushing it off, and widens nothing
-    assert g["desk"] and g["deskText"] == "Start desk", g
-    assert g["deskBox"]["w"] >= 44 and g["deskBox"]["h"] >= 44, g
-    assert g["deskBox"]["r"] <= g["rotBox"]["l"] + 0.5 and g["rotBox"]["r"] <= g["vw"] + 0.5, g
-    assert not g["pageX"] and not g["topOverflow"], g
-
-
-@needs_browser
-def test_start_desk_hands_the_signing_sheet_the_fanin_words_and_starts_nothing_itself(tmp_path, qdir):
-    g = _desk(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, stub="{}", shot="room_desk_1280.png")
-    _bar_fits(g)
-    assert g["drops"] == ["/fanin broad"], g
-    # the sheet also carries "Send words only", which wakes the desk with no limits: the line says both, never "only a signature starts it"
-    assert "Sign it there" in g["note"] and "Send words only" in g["note"] and "nothing starts until you press one of them" in g["note"], g
-
-
-@needs_browser
-def test_start_desk_fits_the_phone_header(tmp_path, qdir):
-    g = _desk(tmp_path, qdir, {"w": 390, "h": 844, "dpr": 3, "mobile": True}, stub="{}", shot="room_desk_390.png")
-    _bar_fits(g)
-    assert g["topBox"]["h"] == 56 and g["drops"] == ["/fanin broad"], g
-
-
-@needs_browser
-def test_start_desk_opens_the_real_drop_sheet(tmp_path, qdir):
-    g = _desk(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1})
-    assert g["sheet"] and g["frame"] == "/sign/drop", g                      # the cockpit's own signed-drop path, not a second one
-
-
-@needs_browser
-def test_a_refused_open_says_no_desk_was_started(tmp_path, qdir):
-    g = _desk(tmp_path, qdir, {"w": 1280, "h": 900, "dpr": 1}, stub="null")
-    assert g["drops"] == ["/fanin broad"] and g["note"] == "The signing sheet did not open, so no desk was started.", g
-
-
 # --- a seat's link is an http(s) or mailto link, nothing the cockpit itself would answer (L2 MED, ROOMC-FIX1) ---------------------------
 # The renderer keeps a cockpit-relative link, and `/#write_token=X` on the cockpit's own origin is the page's token intake: a reply the
 # seat wrote after reading a hostile web page could wipe the owner's stored write token, or open /sign/consent or /sign/drop preselected.

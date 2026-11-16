@@ -2956,9 +2956,7 @@ body.ke[data-mode="build"] .th-zone .zone-head { display: flex; }   /* titled li
 .rv .rv-stop { background: var(--text); color: var(--base); border: 1px solid var(--text); }
 .rv .rv-open { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-6); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-body)/1 var(--sans); }
 .rv .rv-open[hidden] { display: none; }
-.rv .rv-desk { margin-left: auto; }
-.rv .rv-desk + .rv-rotate { margin-left: 0; }
-.rv .rv-mic, .rv .rv-setup, .rv .rv-rotate, .rv .rv-desk, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
+.rv .rv-mic, .rv .rv-setup, .rv .rv-rotate, .rv .rv-card button { min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); background: none; color: var(--text); border: 1px solid var(--hair-2); }
 .rv .rv-mic { align-self: flex-end; border-color: transparent; color: var(--label); display: inline-flex; align-items: center; justify-content: center; flex: none; min-width: var(--hit-min, 44px); padding: 0; }
 .rv .rv-mic[hidden] { display: none; }
 .rv .rv-setup { align-self: flex-end; flex: 0 1 auto; line-height: 1.2; }
@@ -3040,7 +3038,7 @@ body.dv-on .ck-phonetabs button[data-phone-jump="desk"] { color: var(--text); ba
 .rv .dv-state:empty { display: none; }
 .rv .dv-state-unwired, .rv .dv-state-error { background: var(--card-2); color: var(--text); }
 .rv .dv-lease-none { border-left: 3px solid var(--warn); }
-.rv .dv-droplink { align-self: flex-start; min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; background: none; color: var(--text); border: 1px solid var(--hair-2); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
+.rv .dv-droplink, .rv .dv-start { align-self: flex-start; min-height: var(--hit-min, 44px); padding: var(--sp-2) var(--sp-5); border-radius: var(--r-pill); cursor: pointer; background: none; color: var(--text); border: 1px solid var(--hair-2); font: var(--fw-semibold) var(--fs-meta)/1 var(--sans); }
 .rv .dv-you .dv-status { margin-top: var(--sp-1); text-align: right; }
 .rv .dv-sending { opacity: .55; }
 .rv .dv-refused .dv-status, .rv .dv-failed .dv-status { color: var(--text); border-right: 2px solid var(--bad); padding-right: var(--sp-2); }
