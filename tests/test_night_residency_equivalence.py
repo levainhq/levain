@@ -54,7 +54,8 @@ def play(g: dict, rig: Rig, *, fresh: bool) -> list[tuple]:
 
 def effects_of(rig: Rig) -> dict:
     """What is journaled and what happened, with the row ids and clock stamps left out (they are not effects)."""
-    return {"attempts": [(a.verb, a.event_id, a.status, a.recipient, a.order_id) for a in rig.journal.rows()],
+    return {"attempts": [(a.verb, a.event_id, a.status, a.recipient, a.order_id, a.idem_key, a.order_sha256, a.incarnation)
+                         for a in rig.journal.rows()],
             "refusals": rig.journal.refusals(), "ran": rig.runs, "sent": list(rig.sent)}
 
 
@@ -80,6 +81,11 @@ def test_a_desk_that_dies_between_calls_and_a_fresh_one_agree_on_the_replayed_co
     rig = Rig(world)
     first = play(g, rig, fresh=False)
     ran, sent, rows = list(rig.runs), list(rig.sent), effects_of(rig)["attempts"]
+    refusals = rig.journal.refusals()
     again = play(g, rig, fresh=True)
     assert rig.runs == ran and rig.sent == sent and effects_of(rig)["attempts"] == rows
+    # a replayed refused call answers the same and is counted, not journaled as a new attempt: the refusal rows keep
+    # their identity (order, verb, event, reason) and only their count grows
+    assert [r[:4] for r in rig.journal.refusals()] == [r[:4] for r in refusals]
+    assert [x for x in again if x[0] == "refused"] == [x for x in first if x[0] == "refused"]
     assert [x for x in again if x[0] == "answered"] == [x for x in first if x[0] == "answered"]
