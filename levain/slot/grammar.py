@@ -121,6 +121,7 @@ class InstallCommand:
     public_key: str | None = None
     passkeys: tuple[str, ...] = ()
     confirm: bool = False                 # the laptop key's line names levain-confirm too
+    egress_host: bool = False             # every line names levain-egress-host too; makes the grant store's identity
     key_fingerprint: str | None = None    # remove-authority-signer --key
     replace: bool = False                 # routes-trust --replace (3c design r3 Q16; R4 §5 3c-9)
 
@@ -232,11 +233,13 @@ def _key_token(flag: str, token: str) -> str:
 
 
 def _parse_enrol_signer(rest: Sequence[str]) -> InstallCommand:
-    """``enrol-authority-signer --principal P --public-key K [--passkey K]... [--confirm]`` (14b S5): each flag once
-    but ``--passkey`` (at most :data:`MAX_PASSKEYS`), every key distinct (by its ``<type> <base64>``)."""
+    """``enrol-authority-signer --principal P --public-key K [--passkey K]... [--confirm] [--egress-host]`` (14b S5,
+    levain#66): each flag once but ``--passkey`` (at most :data:`MAX_PASSKEYS`), every key distinct (by its
+    ``<type> <base64>``)."""
     seen: dict[str, str] = {}
     passkeys: list[str] = []
     confirm = False
+    egress_host = False
     i = 0
     while i < len(rest):
         flag = rest[i]
@@ -244,6 +247,12 @@ def _parse_enrol_signer(rest: Sequence[str]) -> InstallCommand:
             if confirm:
                 raise Refused("duplicate-flag", flag)
             confirm = True
+            i += 1
+            continue
+        if flag == "--egress-host":
+            if egress_host:
+                raise Refused("duplicate-flag", flag)
+            egress_host = True
             i += 1
             continue
         if flag not in ("--principal", "--public-key", "--passkey"):
@@ -271,7 +280,7 @@ def _parse_enrol_signer(rest: Sequence[str]) -> InstallCommand:
     if len(set(keys)) != len(keys):
         raise Refused("duplicate-key", "a key may be named once")
     return InstallCommand("enrol-authority-signer", principal=principal, public_key=public_key,
-                          passkeys=tuple(passkeys), confirm=confirm)
+                          passkeys=tuple(passkeys), confirm=confirm, egress_host=egress_host)
 
 
 def parse_install_argv(argv: Sequence[str]) -> InstallCommand:

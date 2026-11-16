@@ -44,6 +44,7 @@ from typing import Callable, ContextManager, Dict, Iterable, Iterator, List, Map
 from levain.contracts import ContractError, canon
 from levain.slot import Refused, wall, write_all
 from levain.slot import bundlefmt as BF
+from levain.slot import egress_store as EGS
 from levain.slot import fsck_ids as FI
 from levain.slot import proc as PR
 from levain.slot import records as R
@@ -1885,8 +1886,10 @@ def session_lock_name(session: str) -> str:
 
 
 @contextmanager
-def session_lock(ctx: Ctx, session: str) -> Iterator[None]:
+def session_lock(ctx: Ctx, session: str, wait_s: Optional[float] = None) -> Iterator[None]:
     """Root's per-session TRY-lock (CONTRACT §5.1 render is one transaction per session): held = ``session-busy``.
+    With ``wait_s`` the lock is WAITED for up to that long (backoff doubling to 0.5 s, as :func:`wait_flock`), then
+    ``session-busy`` (the host-grant removals of ``teardown`` and ``scrub``, which must not give up at the first try).
     The lock file is never removed (as END's)."""
     name = session_lock_name(session)
     with ctx.store.dir("alloc") as afd:
@@ -1901,8 +1904,17 @@ def session_lock(ctx: Ctx, session: str) -> Iterator[None]:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or not ctx.seams.trusted(st):
             raise Refused("bad-root", f"alloc/{name}")
-        if not try_flock(fd):
-            raise Refused("session-busy", session)
+        if wait_s is None:
+            if not try_flock(fd):
+                raise Refused("session-busy", session)
+        else:
+            deadline = ctx.seams.monotonic() + wait_s
+            delay = LOCK_SLICE_S
+            while not try_flock(fd):
+                if ctx.seams.monotonic() >= deadline:
+                    raise Refused("session-busy", session)
+                ctx.seams.sleep(delay)
+                delay = min(delay * 2, 0.5)
         yield
     finally:
         os.close(fd)
@@ -2442,6 +2454,11 @@ def render_step3_files(run: RenderRun) -> None:
         assert run.front_uid is not None
         if run.front_policy is None:
             run.front_policy = front_policy_bytes(ctx.store, a, run.blob.routes)
+        try:        # levain#66: an old session's host grants never reach a new front (the session lock is held)
+            EGS.remove_all(ctx, a.slot)
+        except (Refused, OSError) as e:
+            raise Refused("bad-root", "an earlier session's host grants could not be removed: %s"
+                          % (getattr(e, "name", None) or e.strerror or type(e).__name__)) from None
         write_front_policy(seams, a.slot, run.front_uid, run.front_policy)
         prepare_front_log(ctx.store, a.slot, run.front_uid)
     # DECISION: only the names this render staged are removed (a verifier's driver_input.json too, once it is staged

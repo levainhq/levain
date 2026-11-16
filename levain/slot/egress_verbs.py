@@ -22,8 +22,13 @@ Root's ``/usr/bin/python3`` (3.9) runs this: no match statement, no ``X | Y`` ou
 """
 from __future__ import annotations
 
+import json
+import os
+import stat
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
+from levain.broker.policy import is_host_name
 
 from levain.contracts import ContractError
 from levain.slot import Refused
@@ -44,6 +49,14 @@ ERR_SUPERSEDED = "egress-grant-superseded"
 ERR_WRITE = "egress-grant-write-failed"
 ERR_UNSURE = "egress-grant-unsure"
 ERR_TOO_MANY = "too-many"
+ERR_LOG = "egress-refusals-log"
+ERR_CURSOR = "egress-refusals-cursor"
+#: ``egress-refusals``: at most this many hosts and this many log bytes scanned per call (a long log is read over
+#: several calls, never one unbounded one).
+REFUSALS_HOSTS_MAX = 8
+REFUSALS_SCAN_MAX = 256 * 1024
+_READ_CHUNK = 64 * 1024
+_FRONT_LOG, _FRONT_LOG_ROTATED = "front.log", "front.log.1"
 
 
 def bind(ctx: H.Ctx, session: str) -> R.Alloc:
@@ -214,9 +227,134 @@ def egress_grant_revoke(ctx: H.Ctx, req: RuntimeRequest, blob: object) -> Dict[s
     return {"removed": removed, "recorded": unknown}
 
 
+class _Log:
+    """One open front log file that passed the trust check, with its inode and size at open."""
+
+    def __init__(self, fd: int, st: os.stat_result) -> None:
+        self.fd, self.ino, self.size = fd, st.st_ino, st.st_size
+
+
+def _open_log(dfd: int, name: str, owners: Tuple[int, ...]) -> Optional[_Log]:
+    """``name`` below the judged front log dir: absent is ``None``; a link, a FIFO or other non-regular file, a file with
+    more than one link, or one owned by neither the front account nor root is ``egress-refusals-log`` (the trust
+    :func:`levain.slot.runtime_helper.read_session_tunnel_total` holds the log to)."""
+    try:
+        fd = os.open(name, H._O_READ, dir_fd=dfd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise Refused(ERR_LOG, "the front log cannot be opened") from None
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid not in owners:
+        os.close(fd)
+        raise Refused(ERR_LOG, "the front log is not the front's regular file")
+    return _Log(fd, st)
+
+
+def _refused_host(raw: bytes, session: str) -> Optional[str]:
+    """The host of one log line when it is ``session``'s ``refused``/``host-not-allowed``/``off-list`` record with a
+    valid lowercase host name (the front logs only a host that passed its own grammar, so a record that does not is
+    forged or damaged); else None."""
+    try:
+        rec = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(rec, dict) or rec.get("session") != session or rec.get("event") != "refused":
+        return None
+    if rec.get("refused") != "host-not-allowed" or rec.get("detail") != "off-list" or rec.get("host_invalid"):
+        return None
+    host = rec.get("host")
+    if type(host) is not str or len(host) > 253 or host != host.lower() or not is_host_name(host):
+        return None
+    return host
+
+
+def _scan(log: _Log, offset: int, budget: int, session: str, hosts: List[str]) -> Tuple[int, int, bool]:
+    """Read ``log`` from ``offset`` for at most ``budget`` bytes, adding ``session``'s off-list host refusals to
+    ``hosts`` (deduped, at most :data:`REFUSALS_HOSTS_MAX`; it stops right after the line that makes the last one).
+    Returns ``(offset after the last whole line consumed, bytes read, reached the end of the file)``. A partial last
+    line is left for the next call; one that fills the whole budget with no newline in it is junk and skipped, so a
+    cursor cannot wedge on it."""
+    pos, scanned, buf, eof = offset, 0, b"", False
+    while len(hosts) < REFUSALS_HOSTS_MAX:
+        chunk = b""
+        if scanned < budget:
+            chunk = os.pread(log.fd, min(_READ_CHUNK, budget - scanned), pos + len(buf))
+            scanned += len(chunk)
+            eof = not chunk
+        buf += chunk
+        while len(hosts) < REFUSALS_HOSTS_MAX:
+            nl = buf.find(b"\n")
+            if nl < 0:
+                break
+            host = _refused_host(buf[:nl], session)
+            if host is not None and host not in hosts:
+                hosts.append(host)
+            buf = buf[nl + 1:]
+            pos += nl + 1
+        if not chunk:
+            break
+    if pos == offset and len(buf) >= budget:
+        pos += len(buf)
+    return pos, scanned, eof
+
+
+def _parse_cursor(cursor: str) -> Optional[Tuple[int, int]]:
+    if cursor == "0":
+        return None
+    ino, _, off = cursor.partition("-")
+    return int(ino), int(off)
+
+
 def egress_refusals(ctx: H.Ctx, req: RuntimeRequest, blob: object) -> Dict[str, object]:
-    bind(ctx, str(req.session))
-    raise Refused("verb-unbuilt:egress-refusals", "built in a later step")
+    """``{hosts, cursor}``: the hosts this session's front refused as off-list since ``cursor`` (``0``, or
+    ``<inode>-<offset>`` of the last whole line read). The log is the slot's ``L/gw/slot<n>/front.log`` through the
+    trusted walk root's END uses, so a slot-owned or swapped log is never read. The cursor names the log's INODE, so a
+    rotation is followed: an offset into the inode now called ``front.log.1`` finishes that file, then ``front.log``
+    from 0; an inode that is neither restarts at 0 of ``front.log``; an offset past the end of the file it names is
+    refused ``egress-refusals-cursor``. Each call reads at most :data:`REFUSALS_SCAN_MAX` bytes and answers at most
+    :data:`REFUSALS_HOSTS_MAX` hosts (the next call goes on from the cursor)."""
+    a = bind(ctx, str(req.session))
+    session = str(req.session)
+    want = _parse_cursor(str(req.cursor))
+    try:
+        front_uid = H.slot_ids(ctx, a.slot)[a.slot.accounts[1]]
+        dfd = H._open_front_log_dir(ctx.store, a.slot, front_uid)
+    except Refused:
+        raise Refused(ERR_LOG, "the front log dir is not the front's") from None
+    if dfd is None:
+        raise Refused(ERR_LOG, "no front account")
+    owners = (ctx.seams.chowned_uid(front_uid), 0)
+    opened = []  # type: List[_Log]
+    try:
+        cur = _open_log(dfd, _FRONT_LOG, owners)
+        rot = _open_log(dfd, _FRONT_LOG_ROTATED, owners)
+        opened = [x for x in (cur, rot) if x is not None]
+        plan = []  # type: List[Tuple[_Log, int]]
+        if want is not None and cur is not None and want[0] == cur.ino:
+            plan = [(cur, want[1])]
+        elif want is not None and rot is not None and want[0] == rot.ino:
+            plan = [(rot, want[1])] + ([(cur, 0)] if cur is not None else [])
+        elif cur is not None:
+            plan = [(cur, 0)]
+        for log, off in plan:
+            if off > log.size:
+                raise Refused(ERR_CURSOR, "the cursor is past the end of the log it names")
+        hosts = []  # type: List[str]
+        budget = REFUSALS_SCAN_MAX
+        cursor = "0"
+        for log, off in plan:
+            pos, scanned, eof = _scan(log, off, budget, session, hosts)
+            budget -= scanned
+            cursor = "%d-%d" % (log.ino, pos)
+            if log is rot and eof and len(hosts) < REFUSALS_HOSTS_MAX:
+                continue                    # the rotated file is final: finish it, then the current one from 0
+            break
+        return {"hosts": hosts, "cursor": cursor}
+    finally:
+        for x in opened:
+            os.close(x.fd)
+        os.close(dfd)
 
 
 def egress_grants_list(ctx: H.Ctx, req: RuntimeRequest, blob: object) -> Dict[str, object]:

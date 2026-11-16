@@ -190,6 +190,52 @@ def sweep_temps(sd: SlotDir) -> int:
     return gone
 
 
+def remove_all(ctx: object, slot: SlotId) -> int:
+    """Unlink ``grants.json`` and every stale ``grants.json.<16 hex>.new`` of ``slot``'s ``R/grants/slot<n>/`` (what a
+    teardown, a scrub and a render do so no session's grants outlive it), then sync the directory when anything went.
+    Returns how many names went. A directory that is not there (no grants were ever published, or the install predates
+    the rows) is nothing to remove, ``0``; one that is not root's is ``egress-grant-not-ready`` with nothing touched
+    (a link, a non-directory and a front-owned dir included). Any other failure of an unlink or the sync is raised."""
+    seams = ctx.seams  # type: ignore[attr-defined]
+    sync = fsync_of(seams)
+    cur = -1
+    try:
+        cur = os.open(str(seams.R), _O_DIR)
+        if not seams.trusted(os.fstat(cur)):
+            raise Refused(NOT_READY, "R is not root's")
+        for name in ("grants", "slot%d" % slot.index):
+            try:
+                nxt = os.open(name, _O_DIR, dir_fd=cur)
+            except FileNotFoundError:
+                return 0
+            os.close(cur)
+            cur = nxt
+            if name == "grants" and not seams.trusted(os.fstat(cur)):
+                raise Refused(NOT_READY, "R/grants is not root's")
+        if os.fstat(cur).st_uid != seams.chowned_uid(0):
+            raise Refused(NOT_READY, "R/grants/slot%d is not root's" % slot.index)
+        gone = 0
+        for name in sorted(n for n in os.listdir(cur) if n == GRANTS_NAME or _TEMP_RE.fullmatch(n)):
+            try:
+                os.unlink(name, dir_fd=cur)
+                gone += 1
+            except FileNotFoundError:
+                pass
+        if gone:
+            sync(cur)
+        return gone
+    except (NotADirectoryError, PermissionError) as e:
+        raise Refused(NOT_READY, "R/grants/slot%d cannot be opened as a directory (%s)"
+                      % (slot.index, e.strerror or type(e).__name__)) from None
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Refused(NOT_READY, "R/grants/slot%d is a link or not a directory" % slot.index) from None
+        raise
+    finally:
+        if cur >= 0:
+            os.close(cur)
+
+
 def publish(ctx: object, sd: SlotDir, raw: bytes, at: Callable[[str], None]) -> None:
     """:func:`stage` then :func:`commit`, for a write with nothing to burn (a revoke only narrows)."""
     tmp = stage(ctx, sd, raw, at)
@@ -204,4 +250,4 @@ def publish(ctx: object, sd: SlotDir, raw: bytes, at: Callable[[str], None]) -> 
 
 __all__ = ["DIR_MODE", "FILE_MODE", "GRANTS_NAME", "NOT_READY", "RenamedNotDurable", "SlotDir", "TEMP_SWEEP_MAX",
            "commit", "discard", "front_account", "fsync_of", "full_fsync", "open_slot_dir", "publish", "read_current",
-           "stage", "sweep_temps"]
+           "remove_all", "stage", "sweep_temps"]
