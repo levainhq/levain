@@ -510,3 +510,94 @@ def test_the_view_draws_the_bar_by_style_and_text_only():
     seg = src[src.index("function contextModel"):src.index("function eventModel")]
     for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "createContextualFragment"):
         assert banned not in seg, banned
+
+
+# --- the L3 round-2 fixes -----------------------------------------------------------------------------------------------------------
+
+def test_a_genuine_type_error_in_the_port_is_unreadable_and_the_context_is_asked_once():
+    calls = []
+
+    class Boom(ScriptedDeskPort):
+        def context(self, *, block=True):
+            calls.append(block)
+            raise TypeError("internal")
+    b = Boom()
+    b.script_lease("held", "desk 12", 5)
+    b.script_context(None)
+    assert desk_tab.serve_desk(b)[1]["context"] == {"state": "unreadable"} and calls == [True], calls
+
+
+def test_a_failed_tail_read_is_not_kept_by_its_key_and_the_next_run_reads_again(tmp_path, monkeypatch):
+    t = transcript(tmp_path, [rec(5, 212_000, 400)], "desk.jsonl")
+    port = _port(tmp_path, json.dumps({"transcript": str(t)}))
+    real, calls = desk_context.read_context, []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        return None if len(calls) == 1 else real(*a, **k)
+    monkeypatch.setattr(desk_context, "read_context", flaky)
+    assert port._read_context_now() is None
+    got = port._read_context_now()
+    assert isinstance(got, ContextView) and got.tokens == 212_405 and len(calls) == 2, (got, calls)
+
+
+def test_a_file_that_changes_while_it_is_read_is_not_kept_by_its_key(tmp_path, monkeypatch):
+    t = transcript(tmp_path, [rec(5, 100_000, 0)], "desk.jsonl")
+    port = _port(tmp_path, json.dumps({"transcript": str(t)}))
+    real, calls = desk_context.read_context, []
+
+    def moving(*a, **k):
+        calls.append(1)
+        got = real(*a, **k)
+        if len(calls) == 1:                 # the desk files a turn between the read and the end of it
+            with open(t, "a") as f:
+                f.write(rec(5, 300_000, 0) + "\n")
+        return got
+    monkeypatch.setattr(desk_context, "read_context", moving)
+    assert port._read_context_now().tokens == 100_005
+    assert port._read_context_now().tokens == 300_005 and len(calls) == 2
+    port._read_context_now()
+    assert len(calls) == 2                  # a file that stood still is kept again
+
+
+def test_a_blocking_first_ask_and_a_waiting_refresh_run_the_command_once(tmp_path):
+    import threading
+    import time
+    port, runs = _slow_port(tmp_path, 0.6)
+    first = threading.Thread(target=lambda: port.context(block=True))
+    first.start()
+    time.sleep(0.2)
+    port.context(block=False)               # a receipt poll mid-run: it starts the refresh, which waits behind the run
+    first.join()
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and port._ctx_busy:
+        time.sleep(0.05)
+    assert len(runs.read_text()) == 1, runs.read_text()
+
+
+def test_a_thread_that_cannot_start_leaves_no_refresh_wedged(tmp_path, monkeypatch):
+    import threading
+    port, runs = _slow_port(tmp_path, 0.0)
+
+    def refuse(self):
+        raise RuntimeError("can't start new thread")
+    real_start = threading.Thread.start
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    assert port.context(block=False) == NoReading("not read yet") and port._ctx_busy is False
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    port.context(block=False)               # the next poll starts the refresh
+    import time
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and not (port._ctx_held and not port._ctx_busy):
+        time.sleep(0.05)
+    assert port.context(block=False).tokens == 212_405
+
+
+@needs_browser
+def test_a_context_not_read_yet_says_it_is_being_read_not_that_there_was_no_turn(tmp_path):
+    with desk_page(tmp_path) as (stub, base):
+        out = _drive(tmp_path, base + "/", [PHONE, *_TOKENED, _TAP_DESK, _OPEN,
+            put(get={"status": 200, "json": wired(context={"state": "none", "why": "not read yet", "holder": None})}), until("document.querySelector('.dv-ctx-pending')"), CTX,
+            *_shot("desk_ctx_pending_390.png")])
+    g = ctxs(out)[0]
+    assert g["cls"] == "dv-ctx dv-ctx-pending" and g["words"] == "Reading the desk's context." and g["fill"] is None and not g["pageX"], g

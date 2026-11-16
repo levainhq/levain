@@ -152,10 +152,7 @@ def _context_view(port: DeskPort, lease_view: dict[str, Any], *, block: bool = T
     if lease_view["state"] != "held" or getattr(port, "has_context", False) is not True:
         return None
     try:
-        try:
-            got = port.context(block=block)        # type: ignore[attr-defined]
-        except TypeError:       # a port whose context takes no ``block`` (a host's own): it is asked as it was
-            got = port.context()                   # type: ignore[attr-defined]
+        got = port.context(block=block)        # type: ignore[attr-defined]  # the one signature the ports have (both are ours)
     except Exception:       # noqa: BLE001 - a context that cannot be read is not known: say so, never a 500 on a poll
         got = None
     if got is None:

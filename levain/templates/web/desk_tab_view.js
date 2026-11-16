@@ -95,6 +95,8 @@
   function contextModel(c) {
     if (!c || typeof c !== "object") return null;
     // a desk that has made no turn yet (or whose last record is a compaction): there is no number to draw, and it is not unreadable
+    // the port's own "not read yet" (a poll that did not wait for the first read): the true thing is that the read is under way
+    if (c.state === "none" && c.why === "not read yet") return { state: "pending", words: "Reading the desk's context." };
     if (c.state === "none") return { state: "none", words: "No context reading yet: the desk has not made a turn since it started or last compacted." };
     if (c.state !== "ok" || !whole(c.tokens) || !whole(c.hard) || c.hard < 1 || !(c.soft === null || c.soft === undefined || whole(c.soft))) {
       return { state: "unreadable", words: "The desk's context could not be read just now." };
