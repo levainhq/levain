@@ -740,7 +740,11 @@ def claim_for_launch(store: Any, launch_id: str) -> list[Event]:
     """What a desk launch's brief takes: every event still available (oldest first, at most :data:`BRIEF_EVENTS`)
     is written ``claimed`` for ``launch_id`` until :data:`CLAIM_TTL` from now; the events this launch already holds
     come back too. One transaction."""
+    from levain.desk import nightclose
+
     with store._write() as (conn, now):
+        if nightclose.stopped(conn, launch_id):      # a launch the morning's nightclose stopped claims nothing more
+            return []
         mine = [e for e in (_event(conn, r[0]) for r in conn.execute(
             "SELECT event_id FROM events WHERE trust != 'untrusted' ORDER BY gseq").fetchall())
             if e.state in ("claimed", "delivered") and e.launch_id == launch_id]
