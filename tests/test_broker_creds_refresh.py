@@ -965,19 +965,36 @@ def test_rule_c_passes_with_one_caller_and_fails_on_none_and_on_two():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     src = mod.load_sources(root)
-    mods = {rel: mod.Module(rel, s) for rel, s in src.items()}
+    base_mods = {rel: mod.Module(rel, s) for rel, s in src.items()}
+    # Only creds.py differs between the variants below: parse it afresh per variant, reuse every other Module, and
+    # memoise the per-Module identifier walk (a pure function of that Module's tree) so rule_c still sees the whole
+    # tree on each call but does not re-walk the 500+ unchanged files. `_kept` holds every Module so no id is reused.
+    _kept = list(base_mods.values())
+    _loads: dict = {}
+    _walk = mod._identifier_loads
+
+    def _cached_loads(m, ident):
+        k = (id(m), ident)
+        if k not in _loads:
+            _loads[k] = list(_walk(m, ident))
+        return iter(_loads[k])
+    mod._identifier_loads = _cached_loads
+
+    def variant(creds_variant):
+        m = mod.Module(mod.CREDS, creds_variant)
+        _kept.append(m)
+        return {**base_mods, mod.CREDS: m}
+    mods = base_mods
     assert mod.rule_c(mods) == []
     creds_src = src[mod.CREDS]
     assert creds_src.count("upstream.refresh_post(") == 1
-    none = dict(src)
-    none[mod.CREDS] = creds_src.replace("upstream.refresh_post(", "upstream.open_exchange_not(")
-    assert any("callers" in p for p in mod.rule_c({r: mod.Module(r, s) for r, s in none.items()}))
-    two = dict(src)
-    two[mod.CREDS] = creds_src + "\n\nasync def _second(req):\n    return await upstream.refresh_post(req)\n"
-    assert any("callers" in p for p in mod.rule_c({r: mod.Module(r, s) for r, s in two.items()}))
-    wrong = dict(src)                   # L3 r1 codex LOW 6: a call on any other receiver is not upstream.refresh_post
-    wrong[mod.CREDS] = creds_src.replace("upstream.refresh_post(", "not_upstream.refresh_post(")
-    assert any("refresh_post" in p for p in mod.rule_c({r: mod.Module(r, s) for r, s in wrong.items()}))
+    none = creds_src.replace("upstream.refresh_post(", "upstream.open_exchange_not(")
+    assert any("callers" in p for p in mod.rule_c(variant(none)))
+    two = creds_src + "\n\nasync def _second(req):\n    return await upstream.refresh_post(req)\n"
+    assert any("callers" in p for p in mod.rule_c(variant(two)))
+    # L3 r1 codex LOW 6: a call on any other receiver is not upstream.refresh_post
+    wrong = creds_src.replace("upstream.refresh_post(", "not_upstream.refresh_post(")
+    assert any("refresh_post" in p for p in mod.rule_c(variant(wrong)))
 
 
 def test_through_keys_a_token_expiring_during_the_body_read_is_refused_before_the_admit(env):
