@@ -23,7 +23,7 @@ Root's ``/usr/bin/python3`` (3.9) runs this: no match statement, no ``X | Y`` ou
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from levain.contracts import ContractError
 from levain.slot import Refused

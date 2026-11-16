@@ -14,8 +14,6 @@ Root's ``/usr/bin/python3`` (3.9) imports this module: no match statement, no ``
 """
 from __future__ import annotations
 
-from typing import Optional
-
 from levain.authority_sig import VerifierUnavailable, verify_link_sig
 from levain.slot import Refused
 from levain.slot import egress_grants as eg
