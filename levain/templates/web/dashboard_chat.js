@@ -309,8 +309,10 @@
     if (res.unreadable_call !== true) {
       const t = el("div", "chat-text");
       // the entity's reply is markdown: drawn by the Room's one draw (the shared renderer, links filtered), else plain text
-      const R = window.LevainRoomView;
-      if (!(R && typeof R.drawMarkdown === "function" && R.drawMarkdown(document, t, String(res.reply)))) t.textContent = res.reply;
+      // a missing reply is no words, never the word "null" / "undefined"
+      // (a host with no window, such as the panel's node harness, draws plain text)
+      const R = typeof window !== "undefined" ? window.LevainRoomView : null, s =res.reply == null ? "" : String(res.reply);
+      if (!(R && typeof R.drawMarkdown === "function" && R.drawMarkdown(document, t, s))) t.textContent = s;
       b.appendChild(t); return;
     }
     const acted = ran || actionLines(res.tool_activity).length > 0;
