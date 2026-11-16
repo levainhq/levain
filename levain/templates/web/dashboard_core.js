@@ -8789,6 +8789,7 @@
       () => ({ status: 0, body: null }));
   }
   const hostGrantChoice = (c) => (c === "s" ? "for the session" : c === "d" ? "for the day" : "");
+  const hostGrantReadable = (l) => !!l && typeof l === "object" && l.unreadable !== true && Array.isArray(l.slots);
   // the revoke's answer in the page's words: what root did, and nothing about a tunnel having closed
   function hostGrantWords(r, all) {
     const b = r.body || {};
@@ -8798,6 +8799,17 @@
     }
     if (r.ok && b.result === "gone") return ["That grant was already gone: expired or revoked.", "ok"];
     if (r.status === 0) return ["Not revoked: the cockpit could not be reached.", "bad"];
+    // root was started and did not answer clearly: the grant may or may not be revoked, so never "not revoked" and never an error
+    // toast that implies nothing happened. A readable listing came back and is drawn; an unreadable one says to refresh.
+    if (r.status === 502 && b.error === "unknown") {
+      return [hostGrantReadable(b.listing)
+        ? "Outcome unknown: root did not answer clearly, so the grant may or may not be revoked. The list below was read again; check it."
+        : "Outcome unknown: root did not answer clearly, so the grant may or may not be revoked, and the list cannot be read now. Refresh once root's helper has finished.", "unknown"];
+    }
+    // a previous root helper is still running (the cockpit never signals root): this tap was not sent, and it is not the plain busy
+    if (r.status === 409 && b.name === "host-grants-helper-running") {
+      return ["Root's previous helper is still running: this tap was not sent. Try again later, once it has finished.", "busy"];
+    }
     const words = typeof b.message === "string" && b.message ? b.message : "not revoked (HTTP " + r.status + ")";
     return [words.charAt(0).toUpperCase() + words.slice(1) + (/[.!?]$/.test(words) || r.status === 409 ? "" : "."), "bad"];
   }
@@ -8902,7 +8914,9 @@
     };
     signCall(HOSTGRANT_REVOKE, { session: session, target: target }).then((r) => {
       const l = r.body && r.body.listing;
-      settle(hostGrantWords(r, all), r.ok && l && typeof l === "object" ? { status: 200, body: l } : null);
+      // an unknown outcome's listing is drawn as it came, readable or a note (never a stale list with live buttons)
+      const unknown = r.status === 502 && r.body && r.body.error === "unknown";
+      settle(hostGrantWords(r, all), (r.ok || unknown) && l && typeof l === "object" ? { status: 200, body: l } : null);
     }, () => settle(["Not revoked: the page failed.", "bad"], null));
   }
   function hostGrantSlot() {

@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -190,7 +191,7 @@ def test_busy_and_rate_limited_say_so_and_the_row_stays(src, tmp_path) -> None:
                        {"until": f"!!{_btn(G1)}"}, *_shot("hostgrants-busy-390.png"),
                        {"eval": "(async () => { const r = []; for (let i = 0; i < 10; i++) r.push(await fetch('/cockpit/hostgrant/revoke',"
                                 " {method: 'POST', headers: Object.assign({'Content-Type': 'application/json'}, window.LevainCockpitTransport.headers()),"
-                                f" body: JSON.stringify({{session: '{S1}', target: 'eh-{'e' * 24}'}})}}).then((x) => x.status)); return r.join(','); }})()"},
+                                f" body: JSON.stringify({{session: '{S1}', target: '{G1}'}})}}).then((x) => x.status)); return r.join(','); }})()"},
                        {"tap": _btn(G1)}, {"tap": _btn(G1)},
                        {"until": f"/wait a minute/.test({SLOT}.textContent)"}, {"eval": _SAID}, *_shot("hostgrants-ratelimited-390.png"),
                        {"eval": f"!!{_btn(G1)}"})
@@ -233,6 +234,7 @@ def test_no_live_grants_says_so(src, tmp_path) -> None:
 
 
 _ALL_SLOTS = "[...document.querySelectorAll('.hostgrant-slot')].filter((s) => s.isConnected)"
+_LISTS = "performance.getEntriesByType('resource').filter((e) => e.name.includes('hostgrant/list.json')).length"
 _STATE = ("(() => " + _ALL_SLOTS + ".map((s) => ({filled: s.dataset.filled === '1', text: s.textContent,"
           " grants: [...s.querySelectorAll('.hostgrant-grant')].map((g) => g.dataset.hostgrant)})))()")
 _REOPEN = ("(() => { const b = document.querySelector('#ck-needs:not([hidden]) .needs-history') || " + TILE + "; b.click(); return 1; })()")
@@ -288,3 +290,69 @@ def test_the_block_draws_with_textcontent_only() -> None:
     # the page says root revoked it, never that a tunnel closed (X8)
     assert "closes its granted tunnels on its next check, normally within about five seconds" in block
     assert not re.search(r"tunnels? (is|are|was|were) closed|tunnel closed", block, re.I)
+
+
+def _unknown_root(root: FakeRoot, *, list_after: bool) -> Any:
+    """A revoke root applied but answered with junk (an unknown outcome); `list_after` False makes the one read after it fail (the listing the answer carries), later reads work."""
+    state = {"revoked": False, "failed": 0}
+
+    def spawn(argv: Any, **kw: Any) -> Any:
+        if list(argv)[3] == "egress-grant-revoke":
+            root(argv, **kw)
+            state["revoked"] = True
+            return subprocess.CompletedProcess(argv, 0, stdout=b"not json\n", stderr=b"")
+        if state["revoked"] and not list_after and state["failed"] < 1:     # the one read the revoke answer carries; later reads work
+            state["failed"] += 1
+            return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"sudo: a password is required\n")
+        return root(argv, **kw)
+    return spawn
+
+
+_UNK_STEPS = lambda: [{"tap": _btn(G1)}, {"tap": _btn(G1)}, {"until": f"!!{SLOT}.querySelector('.hostgrant-said')"},   # noqa: E731
+                      {"eval": _SAID}, {"eval": _STATE}, {"eval": f"'inert:' + !![...{SLOT}.querySelectorAll('button')].find((b) => b.disabled)"}]
+
+
+@needs_browser
+def test_an_unknown_outcome_with_a_readable_listing_says_unknown_and_repaints_every_slot(src, tmp_path) -> None:
+    """502 unknown with a readable listing: OUTCOME UNKNOWN (never "not revoked"), every connected slot repainted from the listing."""
+    root = FakeRoot(_slots((S1, 0, [G1, G2]), (S2, 1, [G3])))
+    with _serve(src, surface_tokens={"browser": T, "relay": RELAY}, host_grants=HG.HostGrantSurface(spawn=_unknown_root(root, list_after=True))) as (port, _h):
+        values = _open(tmp_path, port, {"eval": _MARK_OLD}, {"eval": _REOPEN}, {"until": _NEW}, {"until": FILLED},
+                       {"eval": "(() => { document.body.appendChild(window.__old); return 1; })()"}, {"eval": "'lists0:' + " + _LISTS}, *_UNK_STEPS(),
+                       {"until": f"!window.__old.querySelector('[data-hostgrant=\"{G1}\"]') && window.__old.dataset.filled === '1'"},
+                       {"eval": _STATE}, {"eval": "'lists1:' + " + _LISTS})
+    said = next(v for v in values if isinstance(v, str) and v.startswith("Outcome unknown"))
+    assert "may or may not be revoked" in said and "not revoked." not in said.replace("or may not be revoked", ""), said
+    states = [v for v in values if isinstance(v, list)][-1]
+    assert len(states) >= 2 and all(s["filled"] and G1 not in s["grants"] and "Outcome unknown" in s["text"] for s in states), states
+    assert "inert:false" in values, "a button was left inert"
+    before = next(v for v in values if isinstance(v, str) and v.startswith("lists0:"))[7:]
+    assert "lists1:" + before in values, values      # drawn from the listing the answer carried: no second trip to the list route
+
+
+@needs_browser
+def test_an_unknown_outcome_with_an_unreadable_listing_says_to_refresh_and_keeps_no_stale_list(src, tmp_path) -> None:
+    """502 unknown whose listing is a note: OUTCOME UNKNOWN plus refresh once the helper finishes, no stale row with live buttons."""
+    root = FakeRoot(_slots((S1, 0, [G1, G2])))
+    with _serve(src, surface_tokens={"browser": T, "relay": RELAY}, host_grants=HG.HostGrantSurface(spawn=_unknown_root(root, list_after=False))) as (port, _h):
+        values = _open(tmp_path, port, *_UNK_STEPS())
+    said = next(v for v in values if isinstance(v, str) and v.startswith("Outcome unknown"))
+    assert "Refresh once root's helper has finished" in said and "cannot be read now" in said, said
+    state = [v for v in values if isinstance(v, list)][-1]
+    assert state[0]["grants"] == [] and "may or may not" in state[0]["text"], state
+    assert not any(isinstance(v, str) and v.startswith("Not revoked") for v in values)
+
+
+@needs_browser
+def test_helper_running_is_its_own_state_not_a_generic_busy(src, tmp_path) -> None:
+    """409 host-grants-helper-running: a distinct line (a root helper is still working, try later); the row stays and is tappable."""
+    root = FakeRoot(_slots((S1, 0, [G1])))
+    surf = HG.HostGrantSurface(spawn=root)
+    surf.revoke = lambda *a, **k: ({"error": "busy", "name": "host-grants-helper-running",   # type: ignore[method-assign]
+                                    "message": "not revoked; a previous root helper is still running, tap again once it has finished"}, 409)
+    with _serve(src, surface_tokens={"browser": T, "relay": RELAY}, host_grants=surf) as (port, _h):
+        values = _open(tmp_path, port, {"tap": _btn(G1)}, {"tap": _btn(G1)}, {"until": f"!!{SLOT}.querySelector('.hostgrant-said')"},
+                       {"eval": _SAID}, {"until": f"!!{_btn(G1)} && !{_btn(G1)}.disabled"}, {"eval": f"{SLOT}.querySelector('.hostgrant-said').className"})
+    said = next(v for v in values if isinstance(v, str) and v.startswith("Root's previous"))
+    assert said == "Root's previous helper is still running: this tap was not sent. Try again later, once it has finished.", values
+    assert "busy, tap again" not in said and values[-1].endswith("busy") and "hostgrant-said" in values[-1], values
