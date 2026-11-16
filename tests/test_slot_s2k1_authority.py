@@ -353,16 +353,45 @@ def test_lease_eof_during_front_register_publishes_no_handle(tmp_path):
 
 
 def test_front_arm_rechecks_the_lease_after_the_relay(tmp_path):
+    # lease_eof kills the lease at once but revokes the record on a thread. The revoke is held back here so the record
+    # stays RENDERING and only the lease check can refuse; the revoke then runs and is joined (no thread outlives the test).
     box: Box
+    held: list[str] = []
 
     def arm(session, reg_token):
         box.control.lease_eof(op.lease)
 
     box = Box(tmp_path, keys_front_arm=arm)
+    real_spawn = box.control._spawn_revoke
+    box.control._spawn_revoke = lambda session: held.append(session)
     op = box.attach()
     assert box.cas(S1, 0, "ALLOCATED", "RENDERING")["ok"]
     assert box.ask(C.Conn(0), "MINT", session=S1, generation=1, claims=mint_claims())["ok"]
     assert box.ask(C.Conn(0), "FRONT-ARM", session=S1, generation=3)["refused"] == "lease-dead"
+    assert held == [S1] and box.disk(S1).state == R.RENDERING
+    t = real_spawn(S1)
+    t.join(5)
+    assert not t.is_alive()
+    assert box.disk(S1).state == R.REVOKED
+
+
+def test_front_arm_refuses_not_rendering_when_the_revoke_wins_the_race(tmp_path):
+    # The other interleaving (reproduced by joining the revoke thread inside the arm hook): the record is REVOKED before
+    # the recheck, so the store check refuses first. Either way the arm is refused.
+    box: Box
+
+    def arm(session, reg_token):
+        t = box.control.lease_eof(op.lease)
+        assert t is not None
+        t.join(5)
+        assert not t.is_alive()
+
+    box = Box(tmp_path, keys_front_arm=arm)
+    op = box.attach()
+    assert box.cas(S1, 0, "ALLOCATED", "RENDERING")["ok"]
+    assert box.ask(C.Conn(0), "MINT", session=S1, generation=1, claims=mint_claims())["ok"]
+    assert box.ask(C.Conn(0), "FRONT-ARM", session=S1, generation=3)["refused"] == "not-rendering"
+    assert box.disk(S1).state == R.REVOKED
 
 
 def test_front_arm_rechecks_the_record_after_the_relay(tmp_path):
