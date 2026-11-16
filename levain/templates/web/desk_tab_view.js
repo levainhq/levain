@@ -154,6 +154,8 @@
 
   // A thread is SETTLED when the events held for it include a reply from the desk.
   function isSettled(events) { return events.some(function (e) { return e.kind === "reply" && e.by === "desk"; }); }
+  // A reply the voice player is offered: the desk's own (by "desk", the one the speak route re-reads) with words to read.
+  function isDeskReply(e) { return !!e && e.kind === "reply" && e.by === "desk" && !!e.text; }
 
   // The words for one answer to the send (status, parsed body). `kept` = the id stays for a retry; `draft` = the draft is
   // cleared (the line is in the log); `thread` = the thread the answer names.
@@ -239,7 +241,7 @@
     if (m.who) r.appendChild(el(doc, "div", "rv-who", shown(m.who) + (m.at ? " · " + shown(m.at) : "")));
     if (m.words) r.appendChild(el(doc, "div", "rv-note", shown(m.words)));
     if (m.text) r.appendChild(el(doc, "div", "rv-text", shown(m.text)));
-    if (it.kind === "reply" && it.text && voiceBtn) { var vb = voiceBtn(it); if (vb) r.appendChild(vb); }
+    if (isDeskReply(it) && voiceBtn) { var vb = voiceBtn(it); if (vb) r.appendChild(vb); }
     return r;
   }
 
@@ -315,14 +317,18 @@
     function voiceTap() { var T = vt(); if (T) T.tap(); }
     // A desk reply as voice.js knows a reply: one conversation ("desk"), a number that grows as replies are first seen (the order
     // they reached this page, which is the order autoplay needs), the words to read (reply.text, for the on-device voice) and
-    // `desk`, the thread and the event's time the premium route re-reads from the desk host: the Room's player and settings.
+    // `desk`, what the premium route re-reads from the desk host: the thread, the event's time and the cursor its batch was read
+    // after (null: the thread's first read). The Room's player and settings. A reply with no thread or no time has no key the
+    // route can find it by: `desk` is null and the player reads it on this device (voice.js), never a request it would refuse.
     function textHash(s) { var h = 5381, i; s = String(s || ""); for (i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36) + ":" + s.length; }
     function voiceReply(it) {
       // keyed by what the event IS (its time and a hash of its words), never by its place in the held list: that place shifts
       // when older events are trimmed, and an old reply must not take a new number and be read again.
       var key = it.thread + "@" + (it.at || "") + "|" + textHash(it.text);
       if (!own(VSEQ, key)) VSEQ[key] = ++vnext;
-      return { thread: "desk", gseq: VSEQ[key], text: it.text, desk: { thread: it.thread, at: it.at || "" } };
+      var named = typeof it.thread === "string" && it.thread && typeof it.at === "string" && it.at;
+      return { thread: "desk", gseq: VSEQ[key], text: it.text,
+               desk: named ? { thread: it.thread, at: it.at, after: typeof it.from === "string" && it.from ? it.from : null } : null };
     }
     function voiceBtn(it) { var T = vt(); return T ? T.button(voiceReply(it)) : null; }
     function voiceSync(all) {
@@ -330,7 +336,7 @@
       // A read that failed says nothing about the conversation: it is no sync at all. (thread null stops what is being read and makes
       // the next body backlog, which is for "no conversation", not for a dropped poll.)
       if (!T || (current && current.kind === "error")) return;
-      var replies = all.filter(function (it) { return it.k === "ev" && it.kind === "reply" && it.text; }).map(voiceReply);
+      var replies = all.filter(function (it) { return it.k === "ev" && isDeskReply(it); }).map(voiceReply);
       T.sync({ thread: current && current.kind === "wired" ? "desk" : null, replies: replies, hold: false });
     }
 
@@ -391,7 +397,7 @@
     if (Array.isArray(priorThreads)) {
       priorThreads.forEach(function (x) {
         if (!x || typeof x !== "object" || typeof x.id !== "string" || !x.id || threadById(x.id)) return;
-        var evs = Array.isArray(x.events) ? x.events.filter(function (e) { return e && typeof e === "object"; }).map(function (e) { return { by: str(e.by), kind: str(e.kind), text: str(e.text), at: str(e.at) }; }) : [];
+        var evs = Array.isArray(x.events) ? x.events.filter(function (e) { return e && typeof e === "object"; }).map(function (e) { return { by: str(e.by), kind: str(e.kind), text: str(e.text), at: str(e.at), from: typeof e.from === "string" && e.from ? e.from : null }; }) : [];
         threads.push({ id: x.id, cursor: typeof x.cursor === "string" && x.cursor ? x.cursor : null, events: evs.slice(-MAX_EVENTS), unreadable: false });
       });
     } else {
@@ -441,7 +447,7 @@
     // whose line has aged out of the log) comes last.
     function rows() {
       var out = [], used = {};
-      function evs(t) { t.events.forEach(function (e, i) { out.push({ k: "ev", by: e.by, kind: e.kind, text: e.text, at: e.at, thread: t.id, n: i }); }); }
+      function evs(t) { t.events.forEach(function (e, i) { out.push({ k: "ev", by: e.by, kind: e.kind, text: e.text, at: e.at, from: e.from, thread: t.id, n: i }); }); }
       log.forEach(function (it) {
         out.push(it);
         var t = it.thread && !own(used, it.thread) ? threadById(it.thread) : null;
@@ -651,6 +657,8 @@
         current = m;
         if (t && m.kind === "wired") {
           t.unreadable = m.unreadable;
+          // each event keeps the cursor its batch was read after: the host pages by size, so that is where the speak route finds it again
+          m.events.forEach(function (e) { e.from = after; });
           var merged = mergeEvents(t.events, t.cursor, m);
           if (merged.events !== t.events || merged.cursor !== t.cursor) { t.events = merged.events.slice(-MAX_EVENTS); t.cursor = merged.cursor; saveThreads(); }
         }

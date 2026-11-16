@@ -265,16 +265,26 @@
     return Math.min(600000, 5000 + Math.ceil(String(text).length * 150 / r));
   }
 
+  // What the speak route finds a reply by, or null when it has nothing the route could find it by: a Needs-you card by its id,
+  // a Desk reply (`desk` present) by its thread, its time and the cursor it was read after (levain#80: a desk reply missing
+  // its thread or time is null, never a request with undefined fields), a Room reply by its thread and gseq.
+  function routeKey(reply) {
+    if (reply.card) return { card_id: reply.card };
+    if (Object.prototype.hasOwnProperty.call(reply, "desk")) {
+      const d = reply.desk;
+      if (!d || typeof d.thread !== "string" || !d.thread || typeof d.at !== "string" || !d.at) return null;
+      return { desk_thread_id: d.thread, desk_at: d.at, desk_after: typeof d.after === "string" && d.after ? d.after : null };
+    }
+    return { room_thread_id: reply.thread, reply_gseq: reply.gseq };
+  }
+
   // One chunk from the one route. Resolves {blob, total} or {refused: {message, fallback}} or {aborted: true}.
   async function fetchChunk(reply, chunk, s, signal) {
     let res;
     try {
       res = await fetch(SPEAK_PATH, {
         method: "POST", headers: headers(true), signal,
-        body: JSON.stringify(Object.assign(reply.card ? { card_id: reply.card }
-                                           : reply.desk ? { desk_thread_id: reply.desk.thread, desk_at: reply.desk.at }
-                                           : { room_thread_id: reply.thread, reply_gseq: reply.gseq },
-                                           { chunk, provider: s.provider, voice: s.voice, speed: s.speed })),
+        body: JSON.stringify(Object.assign(routeKey(reply), { chunk, provider: s.provider, voice: s.voice, speed: s.speed })),
       });
     } catch (e) { return signal.aborted ? { aborted: true } : { refused: { message: WORDS.failedDevice, fallback: "on_device" } }; }
     if (!res.ok) {
@@ -352,8 +362,8 @@
     changed();
     try {
       if (s.blocked) say(reply, s.blocked);                   // the stored provider has no key: nothing is read, nothing is sent
-      else if (s.tier === "premium") await playPremium(reply, me, s);   // a Desk reply names {desk: {thread, at}}: the server re-reads the desk's own event
-      else await speakDevice(reply, reply.text || "", me, s.speed);
+      else if (s.tier === "premium" && routeKey(reply)) await playPremium(reply, me, s);   // a Desk reply names {desk: {thread, at, after}}: the server re-reads the desk's own event
+      else await speakDevice(reply, reply.text || "", me, s.speed);   // the device tier, or a reply the route could not find (a desk reply with no time)
     } catch (_) {
       if (me === runId) {
         if (ctl) { try { ctl.abort(); } catch (_e) { /* done */ } ctl = null; }

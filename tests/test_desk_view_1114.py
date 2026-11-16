@@ -83,7 +83,7 @@ def test_the_desk_and_the_room_hold_no_copy_of_the_voice_code():
     assert mic.count("function dock(") == 1 and mic.count("Speech.install(") == 1 and mic.count("LM.start()") == 1
     assert voice.count("function tracker(") == 1 and voice.count("arm(base)") == 1
     # levain#80: a desk reply is read by the one player on the one setting; the server re-reads the desk's event, there is no device-only path
-    assert "desk: {" in desk and "reply.desk" in voice and "deviceOnly" not in desk + voice
+    assert "desk: named ? {" in desk and "reply.desk" in voice and "deviceOnly" not in desk + voice
 
 
 def test_the_desk_mount_never_asks_the_recognizer_whether_it_is_available():
