@@ -994,3 +994,18 @@ def test_the_module_imports_under_the_root_interpreter():
                          "import levain.slot.egress_verbs, levain.slot.egress_verify, levain.slot.egress_store, "
                          "levain.slot.egress_ledger", repo], capture_output=True, timeout=60)
     assert cp.returncode == 0, cp.stderr.decode()[-400:]
+
+
+# --- S2 kind refusal (Q3 ruling): only an interactive or login session is grantable ---------------------------------------
+
+@pytest.mark.parametrize("kind", ["dispatch", "planner", "verifier"])
+@pytest.mark.parametrize("verb,extra", [("egress-grant", []), ("egress-grant-revoke", ["all"]),
+                                        ("egress-refusals", ["0"]), ("egress-grants-list", [])])
+def test_a_non_interactive_kind_on_an_egress_slot_is_egress_grant_kind(world, verb, extra, kind):
+    a = R.Alloc(session=OTHER_SESSION, slot=SLOT, lease_seq=7, slot_rev=12, slot_uid=SLOT_UID, slot_gid=SLOT_UID,
+                kind=kind, vendor="claude", auth="brokered", operator_uid=UID, supervisor_uid=UID, staging_uid=UID,
+                created_at="2026-11-16T11:00:00Z", boot_id="6f1c2a9e-1b2c-4d5e-8f90-0a1b2c3d4e5f")
+    (world.L / "alloc" / f"{OTHER_SESSION}.json").write_bytes(R.alloc_bytes(a))
+    stdin = canon.canonical_bytes({"message": raw_message(session=OTHER_SESSION), "sig": SIG, "signer_fp": FP,
+                                   "choice": "s"}) if verb == "egress-grant" else b""
+    refused(world.main([verb, OTHER_SESSION, *extra], stdin), "egress-grant-kind")

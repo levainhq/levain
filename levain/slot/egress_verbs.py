@@ -42,6 +42,8 @@ from levain.slot import runtime_helper as H
 from levain.slot.runtime_grammar import OPERATOR, EgressGrantInput, RuntimeRequest
 
 ERR_CLASS = "egress-grant-class"
+ERR_KIND = "egress-grant-kind"
+GRANTABLE_KINDS = ("interactive", "login")      # an allowlist: an unknown kind fails closed
 ERR_SESSION = "egress-grant-session"
 ERR_STORE = "egress-grant-store"
 ERR_EXPIRED = "egress-grant-expired"
@@ -74,6 +76,8 @@ def bind(ctx: H.Ctx, session: str) -> R.Alloc:
         raise Refused("no-session", session)
     if a.slot.slot_class != "egress":
         raise Refused(ERR_CLASS, session)
+    if a.kind not in GRANTABLE_KINDS:
+        raise Refused(ERR_KIND, session)
     return a
 
 
