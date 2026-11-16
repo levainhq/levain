@@ -463,7 +463,7 @@ class HostCommandDeskPort:
             if held is not None and age < CONTEXT_TTL:
                 return held[1]
             if held is not None and age >= CONTEXT_STALE:
-                held = None         # too old to claim for whoever holds the desk now: never answered, read afresh
+                self._ctx_held = held = None    # too old to claim for whoever holds the desk now: dropped, never answered, read afresh
             if held is not None or not block:       # an aged reading is answered as it is and refreshed behind the request
                 if not self._ctx_busy:
                     self._ctx_busy = True
@@ -508,6 +508,7 @@ class HostCommandDeskPort:
         a command that exited 0 is ignored (:func:`levain.desk.room_host.run` keeps stdout when there is any), as the lease and
         events commands do."""
         view: Optional[desk_context.ContextView | desk_context.NoReading] = None
+        began = time.monotonic()        # a reading ages from when its read BEGAN: one that straddles a desk rotation must not look fresh
         try:
             assert self._cmds.context is not None
             ran = room_host.run(self._cmds.context, "", (), timeout=self._timeout)
@@ -525,7 +526,7 @@ class HostCommandDeskPort:
                         self._ctx_key_view = (key, view) if view is not None and key is not None and key == after else None
         finally:
             with self._ctx_state:
-                self._ctx_held = (time.monotonic(), view)
+                self._ctx_held = (began, view)
         return view
 
     def events(self, thread_id: str, after: Optional[str] = None) -> EventBatch:
