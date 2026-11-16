@@ -8760,6 +8760,140 @@
       slot.dataset.filled = "1";
     }).catch(unavailable);
   }
+  // Board levain#66 (S5b): the Host grants block, the grants a running agent's slot holds for outbound hosts, ended with one tap
+  // here. /cockpit/hostgrant/list.json lists them (root's aggregate read, by slot) and /cockpit/hostgrant/revoke narrows them. A
+  // revoke only ever removes: it adds no grant, so it asks a confirm tap (UX only; the server enforces who may call, the page
+  // just calls). A 404 is a cockpit that does not mount this and a 403 a credential it does not admit: no block either way.
+  // Every string drawn here, the server's included, is drawn with textContent.
+  const HOSTGRANT_LIST = "/cockpit/hostgrant/list.json", HOSTGRANT_REVOKE = "/cockpit/hostgrant/revoke";
+  const HOSTGRANT_ARM_MS = 6000;
+  // what the page may say: root revoked it; the front's own check closes the tunnels, so the page never says they closed
+  const HOSTGRANT_FRONT = "A healthy running front closes its granted tunnels on its next check, normally within about five seconds.";
+  const HOSTGRANT_SETUP = "Run `levain doctor` on the laptop: it names the one command.";
+  let hostGrantSaid = null;    // [text, kind]: what the last revoke said, shown once by the next draw
+  let hostGrantBusy = 0;       // a revoke on the wire: no second tap starts another
+  let hostGrantFillSeq = 0;    // the newest fill wins
+  const hostGrantArmed = new Set();   // the disarm of every button now waiting on its second tap
+  function hostGrantFetch() {
+    const headers = signHeaders(false);
+    if (!headers["X-Levain-Write-Token"]) return Promise.resolve({ status: 404, body: null });
+    return fetchBounded(HOSTGRANT_LIST, { cache: "no-store", headers: headers },
+      (res) => res.json().then((b) => ({ status: res.status, body: b && typeof b === "object" ? b : null }), () => ({ status: res.status, body: null })),
+      () => ({ status: 0, body: null }));
+  }
+  const hostGrantChoice = (c) => (c === "s" ? "for the session" : c === "d" ? "for the day" : "");
+  // the revoke's answer in the page's words: what root did, and nothing about a tunnel having closed
+  function hostGrantWords(r, all) {
+    const b = r.body || {};
+    if (r.ok && b.result === "revoked") {
+      const n = Number.isInteger(b.count) ? b.count : 0;
+      return [(all ? "Root revoked the " + n + " grant" + (n === 1 ? "" : "s") + " that " + (n === 1 ? "was" : "were") + " in force." : "Root revoked the grant.") + " " + HOSTGRANT_FRONT, "ok"];
+    }
+    if (r.ok && b.result === "gone") return ["That grant was already gone: expired or revoked.", "ok"];
+    if (r.status === 0) return ["Not revoked: the cockpit could not be reached.", "bad"];
+    const words = typeof b.message === "string" && b.message ? b.message : "not revoked (HTTP " + r.status + ")";
+    return [words.charAt(0).toUpperCase() + words.slice(1) + (/[.!?]$/.test(words) || r.status === 409 ? "" : "."), "bad"];
+  }
+  // a button that asks a second tap: the first arms it and says what the second does; a pause or another arm puts it back
+  function hostGrantButton(label, sure, title, act) {
+    const b = el("button", "undo-btn hostgrant-revoke", label);
+    b.type = "button";
+    b.title = title;
+    let timer = 0;
+    const disarm = () => { clearTimeout(timer); hostGrantArmed.delete(disarm); b.dataset.armed = ""; b.textContent = label; };
+    b.addEventListener("click", () => {
+      if (hostGrantBusy) return;
+      if (b.dataset.armed !== "1") {
+        for (const d of [...hostGrantArmed]) d();
+        hostGrantArmed.add(disarm);
+        b.dataset.armed = "1";
+        b.textContent = sure;
+        timer = setTimeout(disarm, HOSTGRANT_ARM_MS);
+        return;
+      }
+      disarm();
+      act();
+    });
+    return b;
+  }
+  function hostGrantRow(s, slot) {
+    const sv = (x) => (typeof x === "string" ? x : "");
+    const row = el("div", "row consent-row hostgrant-row");
+    row.setAttribute("data-hostgrant-session", sv(s.session));
+    const head = el("div", "consent-head");
+    head.appendChild(el("b", "consent-tool", "slot " + (Number.isInteger(s.slot) ? s.slot : "?") + (sv(s.kind) ? " · " + sv(s.kind) : "")));
+    if (s.paused === true) {
+      const p = el("span", "note-chip hostgrant-paused", "paused");
+      p.title = "this session is paused; its grants can still be revoked";
+      head.appendChild(p);
+    }
+    head.appendChild(el("span", "ext-meta", sv(s.session)));
+    row.appendChild(head);
+    const grants = Array.isArray(s.grants) ? s.grants : [];
+    for (const g of grants) {
+      const line = el("div", "consent-facts hostgrant-grant");
+      line.setAttribute("data-hostgrant", sv(g.grant));
+      line.appendChild(el("b", "hostgrant-host", sv(g.host)));
+      line.appendChild(el("span", "ext-meta", envelopeWhen(sv(g.expires))));
+      if (hostGrantChoice(g.choice)) line.appendChild(el("span", "ext-meta", hostGrantChoice(g.choice)));
+      line.appendChild(hostGrantButton("Revoke", "Tap again to revoke", "end this grant; a new one needs a new signature",
+        () => hostGrantRevoke(sv(s.session), sv(g.grant), false, slot)));
+      row.appendChild(line);
+    }
+    const all = el("div", "consent-facts hostgrant-all");
+    all.appendChild(hostGrantButton("Revoke all", "Tap again to revoke all " + grants.length,
+      "end every grant of this session; new ones need new signatures", () => hostGrantRevoke(sv(s.session), "all", true, slot)));
+    row.appendChild(all);
+    return row;
+  }
+  function hostGrantDraw(slot, b) {
+    const said = hostGrantSaid ? [el("div", "consent-note ext-meta hostgrant-said " + hostGrantSaid[1], hostGrantSaid[0])] : [];
+    if (said.length) said[0].setAttribute("role", "status");
+    hostGrantSaid = null;
+    const head = el("div", "ext-grouphead", "Host grants");
+    if (b.unreadable === true || !Array.isArray(b.slots)) {
+      // never an empty list: a read that failed is a note, in the server's words
+      const raw = typeof b.note === "string" && b.note ? b.note : "host grants cannot be read here now";
+      const note = raw.charAt(0).toUpperCase() + raw.slice(1) + (/[.!?]$/.test(raw) ? "" : ".");
+      const nodes = [el("div", "consent-note ext-meta hostgrant-unavailable", note)];
+      if (b.name === "egress-grant-not-ready") nodes.push(el("div", "consent-note ext-meta hostgrant-setup", HOSTGRANT_SETUP));
+      slot.replaceChildren(head, ...said, ...nodes);
+      return;
+    }
+    const rows = b.slots.filter((s) => s && Array.isArray(s.grants) && s.grants.length).map((s) => hostGrantRow(s, slot));
+    const unread = (Array.isArray(b.unread) ? b.unread : []).map((u) => el("div", "consent-note ext-meta hostgrant-unread",
+      "Slot " + (u && Number.isInteger(u.slot) ? u.slot : "?") + " could not be read by root (" + (u && typeof u.name === "string" ? u.name : "unknown") + "): its grants are not listed."));
+    slot.replaceChildren(head, ...said, ...unread,
+      ...(rows.length ? rows : [el("div", "consent-note ext-meta hostgrant-empty", "No live host grants")]));
+  }
+  // `fresh` is a read the revoke's answer already carried: drawn as is, no second trip
+  function hostGrantFill(slot, fresh) {
+    const n = ++hostGrantFillSeq;
+    const go = (r) => {
+      if (n !== hostGrantFillSeq) return;
+      if (r.status === 404 || r.status === 403) { hostGrantSaid = null; slot.replaceChildren(); slot.dataset.filled = "1"; return; }
+      const b = r.body;
+      hostGrantDraw(slot, r.status === 200 && b ? b : { unreadable: true, note: "" });
+      slot.dataset.filled = "1";
+    };
+    (fresh ? Promise.resolve(fresh) : hostGrantFetch()).then(go).catch(() => go({ status: 0, body: null }));
+  }
+  function hostGrantRevoke(session, target, all, slot) {
+    if (hostGrantBusy) return;
+    hostGrantBusy++;
+    for (const x of slot.querySelectorAll("button")) x.disabled = true;
+    signCall(HOSTGRANT_REVOKE, { session: session, target: target }).then((r) => {
+      hostGrantSaid = hostGrantWords(r, all);
+      const l = r.body && r.body.listing;
+      hostGrantBusy--;
+      hostGrantFill(slot, r.ok && l && typeof l === "object" ? { status: 200, body: l } : null);
+    }, () => { hostGrantBusy--; hostGrantSaid = ["Not revoked: the page failed.", "bad"]; hostGrantFill(slot); });
+  }
+  function hostGrantSlot() {
+    const slot = el("div", "hostgrant-slot");
+    hostGrantFill(slot);
+    return slot;
+  }
   // OS-2, the dispatch family: the live dispatch jobs as cards, each act (Sign, Cancel, Authorise) a button that opens the sign
   // sheet at /sign/dispatch/<job> with that act picked. /cockpit/dispatch.json lists them as the sheet's rows (one object per
   // job: its message, its options each with the passkeys that may do it, the version the sheet signs on). This page signs
@@ -9456,7 +9590,7 @@
   // the Decisions history's standing-rule slots (and the dispatch jobs), drawn together wherever the proposals are
   function standingSlots() {
     const f = document.createDocumentFragment();
-    f.append(proposalSlot(), grantSlot(), envelopeSlot(), dispatchSlot());   // the drop is its own card under the Needs-you row (renderDropHero), not a slot here
+    f.append(proposalSlot(), grantSlot(), envelopeSlot(), hostGrantSlot(), dispatchSlot());   // the drop is its own card under the Needs-you row (renderDropHero), not a slot here
     return f;
   }
 
