@@ -40,6 +40,7 @@ from typing import Callable, ClassVar, ContextManager, Iterable, Iterator, Mappi
 
 from levain.authority_sig import NAMESPACE as AUTHORITY_NAMESPACE, _Wire
 from levain.contracts import canon
+from levain.contracts.namespaces import EGRESS_HOST_NAMESPACE
 from levain.firing.hands import OPERATOR_RE, HandsSetupError, HostOS, Step, _abs, _kill_all, host_os, run_plan
 from levain.launch import child_env
 from levain.slot import Refused, bwrap, netns, pf, root_tree, units, write_all
@@ -3892,6 +3893,124 @@ def _write_signers(path: Path, data: bytes, err: TextIO | None, fsync: Callable[
     return True
 
 
+#: levain#66: the grant store's root-only state, made by ``enrol-authority-signer --egress-host`` and by nothing else.
+EGRESS_STATE_DIR = "grants"
+EGRESS_STORE_ID = "store_id"
+_EGRESS_ID_RE = re.compile(r"[0-9a-f]{32}\n?")
+_O_STATE_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _egress_id_ok(fd: int, euid: int) -> Optional[str]:
+    """The id in the open ``store_id`` when it is a regular file owned by root with mode exactly 0600 holding 32
+    lowercase hex (a newline allowed), else None."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != euid or stat.S_IMODE(st.st_mode) != 0o600 or st.st_size > 64:
+        return None
+    try:
+        text = os.read(fd, 65).decode("ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text.strip() if _EGRESS_ID_RE.fullmatch(text) else None
+
+
+def _existing_egress_id(dfd: int, euid: int) -> Optional[str]:
+    """``store_id`` below ``dfd``: None when absent; its id when it holds one; ``egress-state-exists`` otherwise (a
+    link, a directory, another owner or mode, a body that is not 32 lowercase hex: never rewritten or repaired)."""
+    try:
+        fd = os.open(EGRESS_STORE_ID, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise Refused("egress-state-exists", "L/routes/grants/store_id is a link or cannot be opened: left as it is") \
+            from None
+    try:
+        sid = _egress_id_ok(fd, euid)
+    finally:
+        os.close(fd)
+    if sid is None:
+        raise Refused("egress-state-exists", "L/routes/grants/store_id is not a root 0600 file of 32 lowercase hex: "
+                                             "left as it is")
+    return sid
+
+
+def ensure_egress_state(rs: RH.Seams, *, fsync: Callable[[int], None] | None = None) -> str:
+    """``L/routes/grants/`` (root 0700) and ``L/routes/grants/store_id`` (32 lowercase hex drawn from ``os.urandom`` by
+    root, mode 0600), create-if-absent and never rewritten; returns the id. ``L`` and ``L/routes`` are walked
+    ``O_NOFOLLOW`` and must be root's and not group/other writable (``egress-state-not-ready`` otherwise, also when
+    ``L/routes`` is missing: this makes nothing above the dir). An existing dir that is not root 0700, or an existing
+    ``store_id`` that is not what is described above, is ``egress-state-exists`` and is left as it is. The id is written
+    to a unique temp, synced, then LINKED to ``store_id`` (never a replace): a crash leaves a temp or the whole file,
+    never a half one, and a racing enrolment's id wins and is the one returned. A failure to write is
+    ``egress-state-write-failed`` with no ``store_id``."""
+    sync = fsync or gen_mod._full_fsync
+    euid = os.geteuid()
+    cur = -1
+    try:
+        try:
+            cur = os.open(str(rs.L), _O_STATE_DIR)
+            nxt = os.open("routes", _O_STATE_DIR, dir_fd=cur)
+        except OSError:
+            raise Refused("egress-state-not-ready", "L/routes is not there as a directory: run setup first") from None
+        os.close(cur)
+        cur = nxt
+        st = os.fstat(cur)
+        if st.st_uid != euid or st.st_mode & 0o022:
+            raise Refused("egress-state-not-ready", "L/routes is not root's alone")
+        try:
+            os.mkdir(EGRESS_STATE_DIR, 0o700, dir_fd=cur)
+            made = True
+        except FileExistsError:
+            made = False
+        try:
+            dfd = os.open(EGRESS_STATE_DIR, _O_STATE_DIR, dir_fd=cur)
+        except OSError:
+            raise Refused("egress-state-exists", "L/routes/grants is a link or not a directory: left as it is") \
+                from None
+        routes, cur = cur, dfd
+        try:
+            st = os.fstat(cur)
+            if made:        # the new dir, then L/routes, whose entry names it (else a power loss can lose both)
+                os.fchmod(cur, 0o700)
+                sync(cur)
+                sync(routes)
+        finally:
+            os.close(routes)
+        if not made and (st.st_uid != euid or stat.S_IMODE(st.st_mode) != 0o700):
+            raise Refused("egress-state-exists", "L/routes/grants is not a root 0700 directory: left as it is")
+        sid = _existing_egress_id(cur, euid)
+        if sid is not None:
+            return sid
+        sid = os.urandom(16).hex()
+        tmp = f"{EGRESS_STORE_ID}.{os.urandom(8).hex()}.new"
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=cur)
+            try:
+                os.fchmod(fd, 0o600)
+                write_all(fd, (sid + "\n").encode("ascii"))
+                sync(fd)
+            finally:
+                os.close(fd)
+            try:
+                os.link(tmp, EGRESS_STORE_ID, src_dir_fd=cur, dst_dir_fd=cur)
+            except FileExistsError:
+                won = _existing_egress_id(cur, euid)
+                if won is None:
+                    raise OSError(errno.EIO, "store_id vanished") from None
+                return won
+            finally:
+                try:
+                    os.unlink(tmp, dir_fd=cur)
+                except OSError:
+                    pass
+            sync(cur)
+        except OSError as e:
+            raise Refused("egress-state-write-failed", f"L/routes/grants/store_id: {e.strerror or e}") from None
+        return sid
+    finally:
+        if cur >= 0:
+            os.close(cur)
+
+
 def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
                          lock: Callable[[], ContextManager[object]], store_seams: RH.Seams | None = None,
                          err: TextIO | None = None, fsync: Callable[[int], None] | None = None,
@@ -3951,11 +4070,16 @@ def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
             raise Refused("authority-signer-verifier", f"ssh-keygen names {fp} for a key whose blob hashes to "
                                                        f"{blob_fingerprint(key)}")
         ns = (AUTHORITY_NAMESPACE, CONFIRM_NAMESPACE) if cmd.confirm and not passkey else (AUTHORITY_NAMESPACE,)
+        if cmd.egress_host:
+            ns = (*ns, EGRESS_HOST_NAMESPACE)            # every key: the phone's passkey signs the host-grant card
         wanted.append((key, ns, fp))
     new = {key: _signer_text(cmd.principal, ns, key) for key, ns, _ in wanted}
     namespaces = {key: ns for key, ns, _ in wanted}
+    store_id = None
     with lock():
         _check_operator(cmd.verb, caller_uid, rs)
+        if cmd.egress_host:                 # before the signers file: a refusal here leaves the earlier file in force
+            store_id = ensure_egress_state(rs, fsync=fsync)
         out: list[bytes] = []
         placed: set[str] = set()
         for n, line in enumerate(_signer_lines(_read_signers(path)), 1):
@@ -3982,8 +4106,12 @@ def run_authority_signer(cmd: InstallCommand, caller_uid: int, host: HostOS, *,
     for _, ns, fp in wanted:
         errw.write(f"levain install-helper: {fp} enrolled in {path} for {','.join(ns)}; compare it with "
                    "`levain cockpit keys`\n")
-    return {"verb": cmd.verb, "signers": [{"fingerprint": fp, "namespaces": ",".join(ns)} for _, ns, fp in wanted],
-            "written": written, "digest": "sha256:" + hashlib.sha256(data).hexdigest()}
+    ans: dict[str, object] = {"verb": cmd.verb, "signers": [{"fingerprint": fp, "namespaces": ",".join(ns)}
+                                                            for _, ns, fp in wanted],
+                              "written": written, "digest": "sha256:" + hashlib.sha256(data).hexdigest()}
+    if store_id is not None:
+        ans["egress_store_id"] = store_id
+    return ans
 
 
 # --- repair's handover: the probe (R3a), the exec (R4), phase B (R4a on) (row 33 §2.2) ---------------------------
