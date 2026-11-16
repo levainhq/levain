@@ -78,16 +78,28 @@ def _pushes_value(s: dict[str, Any]) -> bool:
 # A bare `{"tap": ...}` on a node the open board repaints can lose its press: a board read between the driver's mousePressed and
 # mouseReleased replaces the node, and the browser makes no click (reproduced by forcing a redraw between the two halves). `landed_tap`
 # is the one shape for such a tap: a capture-phase click counter is armed just before it, and the press is made AGAIN only while that
-# count is still 0, i.e. no click has reached the page, so the handler has not run and a retry can never fire a ceremony twice. A press
+# count is still 0, i.e. no click has reached the target, so the handler has not run and a retry can never fire a ceremony twice. A press
 # that did land and then failed is never repressed: the wait runs to its deadline and FAILS on the card's own text. `until` (default:
 # the click was seen) is the tap's effect, collected in its place; steps after the tap that were its own `until` step fold into it.
-_ARM_CLICKS = ("(() => { window.__tapClicks = 0; if (!window.__tapClicksArmed) { window.__tapClicksArmed = 1;"
-               " document.addEventListener('click', () => { window.__tapClicks++; }, true); } return 1; })()")
+# A click counts only when it reached the TARGET (the element, or a node inside it): a press that missed it (the modal grew between the
+# driver's centre evaluation and its mousePressed, and the press fell on empty space or a neighbouring button) leaves the count at 0, so
+# the press is made again at the target's current centre. The target expression is the tap's own, kept on `window.__tapTarget` and
+# evaluated AT THE EVENT, so the one listener serves every landed_tap in a page.
+def _arm_clicks(target: str) -> str:
+    # The node resolved at ARM time is kept too (`__tapArmed`): a click that reached it counts even when a repaint has since
+    # replaced it (its handler ran, so a press again would fire the ceremony twice). Node identity only, never a selector.
+    # `target` is a fixed expression string (no trailing ';').
+    return ("(() => { window.__tapClicks = 0; window.__tapTarget = () => (" + target + "\n);"
+            " try { window.__tapArmed = window.__tapTarget(); } catch (e) { window.__tapArmed = null; }"
+            " if (!window.__tapClicksArmed) { window.__tapClicksArmed = 1;"
+            " document.addEventListener('click', (ev) => { let t = null; try { t = window.__tapTarget(); } catch (e) {}"
+            " const a = window.__tapArmed;"
+            " if ((t && t.contains && t.contains(ev.target)) || (a && a.contains && a.contains(ev.target))) window.__tapClicks++; }, true); } return 1; })()")
 
 
 def landed_tap(target: str, until: str | None = None, **step: Any) -> list[dict[str, Any]]:
-    """Two steps (splat them into a list): arm the click counter, then tap `target` until `until`, pressing again only while no click landed."""
-    return [{"eval": _ARM_CLICKS},
+    """Two steps (splat them into a list): arm the click counter on `target`, then tap it until `until`, pressing again only while no click reached it."""
+    return [{"eval": _arm_clicks(target)},
             {"tap": target, "until": until or "window.__tapClicks >= 1 && 1", "retry_if": "!(window.__tapClicks >= 1)",
              "ms": 30000, **step}]
 
@@ -199,3 +211,24 @@ def test_the_default_page_submits_a_downstream_send_through_the_broker(tmp_path:
     assert posts[1]["verb"] == "send_inbox" and posts[1]["params"].get("body") == "hello from the page"
     assert bodies == ["hello from the page"], inbox.notes
     assert ran == []
+
+
+_SWAP_PAGE = ("data:text/html,<body><button id=b style='width:200px;height:60px'>go</button><script>"
+              "window.__fired=0; const arm=(n)=>n.addEventListener('click',()=>{window.__fired++;});"
+              "arm(document.getElementById('b'));"
+              "let swapped=false;"
+              "window.addEventListener('click',()=>{ if(swapped) return; swapped=true; const o=document.getElementById('b'); "
+              "const n=o.cloneNode(true); o.replaceWith(n); arm(n); }, true);</script></body>")
+
+
+@needs_browser
+def test_landed_tap_does_not_press_again_when_the_board_repaints_the_node_after_the_click(tmp_path: Path) -> None:
+    """The click reaches the old node (its handler runs: the ceremony fires), then a repaint replaces the node before the
+    counter's listener reads the target. The click must still count as landed through the node resolved when the tap was armed,
+    or the retry presses the new node and fires the ceremony twice."""
+    out = _drive(tmp_path, _SWAP_PAGE, [
+        *landed_tap("document.getElementById('b')", "window.__tapClicks >= 1 && 1"),
+        {"eval": "new Promise(r => setTimeout(() => r(window.__fired), 2500))"},
+    ])
+    assert out["values"][-1] == 1, out
+    assert not out.get("repressed"), out
