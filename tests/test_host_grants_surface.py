@@ -440,7 +440,8 @@ def test_a_timed_out_helper_keeps_the_one_spawn_until_its_child_exits() -> None:
     assert surf.listing(time.monotonic() + 1.2)["name"] == "helper-timeout"
     surf._invalidate()
     second = surf.listing(time.monotonic() + 1.5)
-    assert len(starts) == 1 and second["name"] == "host-grants-busy" and "slots" not in second
+    assert len(starts) == 1 and second["name"] == "host-grants-helper-running" and "slots" not in second
+    assert "previous root helper is still running" in second["note"]
     body, status = surf.revoke(S1, G1, "browser", time.monotonic() + 1.5)
     assert len(starts) == 1 and status == 503
     assert surf._spawn_lock.acquire(timeout=5.0)        # the child exits; the reaper gives the lock back
@@ -467,6 +468,93 @@ def test_a_revoke_root_did_not_answer_clearly_is_unknown_never_not_revoked() -> 
         body, status = surf.revoke(S1, G2, "browser", _far())
         root.raw = None
         assert (status, body["error"], body["name"]) == (502, "unknown", name) and "not revoked" not in body["message"]
+
+
+def _slow_revoke(root: FakeRoot, sleep_s: float, wall_s: float, starts: List[str]) -> Any:
+    """A spawn: the listing from ``root``; a revoke a REAL child through the real runner that outlives ``wall_s``."""
+
+    def spawn(argv: Any, **kw: Any) -> "subprocess.CompletedProcess[bytes]":
+        starts.append(argv[3])
+        if argv[3] == HG.REVOKE_VERB:
+            return adopt_view._run([sys.executable, "-c", f"import time; time.sleep({sleep_s})"],
+                                   **dict(kw, timeout=wall_s))
+        return root(argv, **kw)
+
+    return spawn
+
+
+def test_an_unknown_revoke_says_to_refresh_after_the_helper_never_that_the_list_shows_which() -> None:
+    """L3 verify (complement, codex LOW): after a revoke times out its child still runs and holds the spawn, so the
+    reply's listing cannot settle it. Reproduced: the message said "the list shows which" over a busy note."""
+    starts: List[str] = []
+    surf = HG.HostGrantSurface(spawn=_slow_revoke(FakeRoot(), 4.0, 0.5, starts))
+    body, status = surf.revoke(S1, G1, "browser", time.monotonic() + 2.5)
+    assert (status, body["error"], body["name"]) == (502, "unknown", "helper-timeout")
+    assert "slots" not in body["listing"] and body["listing"]["name"] == "host-grants-helper-running"
+    assert "shows which" not in body["message"] and "refresh the list once root's helper has finished" in body["message"]
+    assert starts.count(HG.REVOKE_VERB) == 1
+
+
+def test_a_revoke_while_a_timed_out_helper_runs_says_so_not_a_bare_busy() -> None:
+    """L3 verify (complement MED): the reaper's wait has no bound of its own (root's bounds end the helper; nothing here
+    kills it), so the busy answer names the cause. Reproduced: a bare "busy, tap again" while the old helper ran."""
+    starts: List[str] = []
+    root = FakeRoot()
+    surf = HG.HostGrantSurface(spawn=_slow_revoke(root, 3.0, 0.3, starts))
+    held = surf.listing(_far())
+    assert surf.revoke(S1, G1, "browser", time.monotonic() + 1.4)[0]["error"] == "unknown"
+    surf._cache, surf._cache_until = held, time.monotonic() + HG.CACHE_S     # the list as the page last read it
+    body, status = surf.revoke(S1, G2, "browser", time.monotonic() + 1.5)
+    assert (status, body["error"], body["name"]) == (409, "busy", "host-grants-helper-running")
+    assert "previous root helper is still running" in body["message"] and starts.count(HG.REVOKE_VERB) == 1
+
+
+def test_a_reaper_that_cannot_start_leaves_no_lock_held_after_the_child_exits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L3 verify (codex LOW): if the reaper thread cannot start, the child is kept and checked by the next request,
+    which spawns nothing beside it while it runs and lists once it has exited. Reproduced: `_left` was cleared before
+    the start, the only release was in the thread that never ran, and every later request answered busy for good."""
+    starts: List[float] = []
+    root = FakeRoot()
+
+    def spawn(argv: Any, **kw: Any) -> "subprocess.CompletedProcess[bytes]":
+        starts.append(time.monotonic())
+        if len(starts) == 1:
+            return adopt_view._run([sys.executable, "-c", "import time; time.sleep(2.5)"], **kw)
+        return root(argv, **kw)
+
+    class NoThread:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    import types
+    surf = HG.HostGrantSurface(spawn=spawn)
+    monkeypatch.setattr(HG, "threading", types.SimpleNamespace(Thread=NoThread))
+    assert surf.listing(time.monotonic() + 1.2)["name"] == "helper-timeout"
+    surf._invalidate()
+    assert surf.listing(time.monotonic() + 1.5)["name"] == "host-grants-helper-running" and len(starts) == 1
+    time.sleep(2.0)                                         # the child has exited
+    surf._invalidate()
+    assert "slots" in surf.listing(time.monotonic() + 5.0) and len(starts) == 2
+
+
+def test_a_revoke_that_fails_before_root_is_started_is_not_revoked_never_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L3 verify (codex LOW): `host-grants-unreadable` from building the env (before any spawn) said root may have
+    revoked it though root never ran. Reproduced: 502 unknown "may or may not be revoked" with no spawn."""
+    root = FakeRoot()
+    surf = _surface(root)
+    surf.listing(_far())                                    # the membership check reads this cached list
+
+    def broken_env() -> Dict[str, str]:
+        raise KeyError("HOME")
+
+    import levain.launch
+    monkeypatch.setattr(levain.launch, "child_env", broken_env)
+    body, status = surf.revoke(S1, G1, "browser", _far())
+    assert (status, body["error"], body["name"]) == (502, "refused", "host-grants-unreadable")
+    assert body["message"].startswith("not revoked") and "egress-grant-revoke" not in root.verbs()
 
 
 def test_the_revoke_log_line_names_the_credential_session_target_and_roots_answer(caplog: pytest.LogCaptureFixture) -> None:

@@ -22,9 +22,13 @@ through this route. One request is at most one listing spawn and one revoke spaw
 Every wait is bounded by one absolute monotonic ``deadline`` the route gives (the route takes it from the request's
 start); no spawn starts with under :data:`MIN_SPAWN_S` left. The root helper child is never signalled
 (``adopt_view.call_helper``: "the root helper: no signal, no wait"), so a timed-out child keeps the spawn lock until
-it exits (a reaper thread waits on it; root's own bounds end it): never two root helpers at once, and every request
-in that time answers busy. A revoke whose outcome root did not answer clearly (timed out, silent, malformed) is
-``unknown``, never "not revoked": root may have applied it after the CLI stopped waiting.
+it exits (a reaper thread waits on it; root's own bounds end it: ``sudo -n`` never prompts and the two verbs read
+files or wait the ledger lock for ``LEDGER_LOCK_WAIT_S``; nothing here kills a root process): never two root helpers
+at once, and every request in that time answers that a previous root helper is still running. A child whose reaper
+could not be started stays held, and the next request that takes the lock checks it has exited before it spawns. A
+revoke whose outcome root did not answer clearly (timed out, silent, malformed) after root was started is
+``unknown``, never "not revoked": root may have applied it after the CLI stopped waiting. A failure before root was
+started is "not revoked".
 """
 from __future__ import annotations
 
@@ -77,7 +81,9 @@ _CHOICES = ("s", "d")
 #: is recorded (or, with the ledger full, refused); neither can mean a live grant survived.
 _GONE_NAMES = ("egress-grant-ledger-full",)
 _BUSY_NAMES = ("session-busy", "egress-grant-busy")
-#: A revoke's failures AFTER root was started where root's answer is not a clear one: it may have applied the revoke.
+#: A revoke's failures where root's answer is not a clear one: it may have applied the revoke. ``unknown`` ONLY when the
+#: spawn began (``_began``); the same name before root was started (``host-grants-unreadable`` from building the env)
+#: is "not revoked".
 _UNKNOWN_NAMES = ("helper-timeout", "helper-silent", "helper-output-malformed", "host-grants-answer-malformed",
                   "host-grants-unreadable")
 
@@ -89,6 +95,9 @@ def _note_unreadable(name: str) -> Dict[str, Any]:
     if name == "egress-grant-not-ready":
         words = ("host grants are not set up on this machine: the enrol step and the setup re-run have not been "
                  "done, so there is nothing to list yet")
+    elif name == "host-grants-helper-running":
+        words = ("a previous root helper is still running (the CLI stopped waiting for it and never signals root); "
+                 "the list reads again once it exits")
     else:
         words = f"host grants cannot be read now: {name}"
     return {"unreadable": True, "name": name, "note": words}
@@ -142,7 +151,9 @@ class HostGrantSurface:
         self._clock = clock
         self._cv = threading.Condition()
         self._spawn_lock = threading.Lock()         # one helper child at a time, listing or revoke, until it EXITS
-        self._left: "Optional[subprocess.Popen[bytes]]" = None   # a timed-out child still running (under the lock)
+        self._left: "Optional[subprocess.Popen[bytes]]" = None   # a timed-out child with no reaper yet (under the lock)
+        self._reaping: "Optional[subprocess.Popen[bytes]]" = None  # the child a reaper waits on (it holds the lock)
+        self._began = False                         # the last call's spawn began (under the lock)
         self._inflight = False
         self._waiters = 0
         self._cache: "Optional[Dict[str, Any]]" = None
@@ -172,12 +183,19 @@ class HostGrantSurface:
 
         spawn = self._spawn if self._spawn is not None else adopt_view.Seams().spawn
 
+        self._began = False
+
         def capped(argv: Any, **kw: Any) -> "subprocess.CompletedProcess[bytes]":
             try:
                 p = spawn(argv, **kw)
-            except subprocess.TimeoutExpired as e:
-                self._left = getattr(e, "child", None)      # still running: _release_spawn holds the lock until it exits
+            except BaseException as e:
+                child = getattr(e, "child", None)           # the runner started it and stopped waiting
+                if child is not None or isinstance(e, subprocess.TimeoutExpired):
+                    self._began = True
+                if child is not None:
+                    self._left = child                      # may still run: _release_spawn holds the lock until it exits
                 raise
+            self._began = True
             if len(p.stdout or b"") > ANSWER_MAX:
                 raise Refused("host-grants-answer-malformed", f"{verb}: over {ANSWER_MAX} bytes")
             return p
@@ -238,8 +256,9 @@ class HostGrantSurface:
         left = deadline - self._clock()
         if left < MIN_SPAWN_S:
             return _note_unreadable("host-grants-deadline"), False
-        if not self._spawn_lock.acquire(timeout=left - MIN_SPAWN_S):
-            return _note_unreadable("host-grants-busy"), False
+        busy = self._take_spawn(left - MIN_SPAWN_S)
+        if busy is not None:
+            return _note_unreadable(busy), False
         try:
             left = deadline - self._clock()
             if left < MIN_SPAWN_S:
@@ -255,10 +274,26 @@ class HostGrantSurface:
         finally:
             self._release_spawn()
 
+    def _take_spawn(self, timeout: float) -> "Optional[str]":
+        """Take the spawn lock within ``timeout``: None when it is held and no earlier child still runs, else the busy
+        name (the lock not held). A child whose reaper could not start (``_left`` set) is checked here, under the lock:
+        still running, it goes back to :meth:`_release_spawn` (a reaper again); exited, it is dropped."""
+        if not self._spawn_lock.acquire(timeout=max(0.0, timeout)):
+            return "host-grants-helper-running" if self._reaping is not None else "host-grants-busy"
+        child = self._left
+        if child is not None:
+            if child.poll() is None:
+                self._release_spawn()
+                return "host-grants-helper-running"
+            self._left = None
+        return None
+
     def _release_spawn(self) -> None:
         """Give the spawn lock back, or, when the call left its child running (a timeout), hand it to a reaper thread
-        that gives it back once that child exits."""
-        child, self._left = self._left, None
+        that gives it back once that child exits. If the reaper cannot start, the child stays in ``_left`` and the lock
+        is given back: the next :meth:`_take_spawn` sees the child and spawns nothing beside it while it runs.
+        ``child.wait()`` has no bound here: root's own bounds end the helper, and it is never killed from here."""
+        child = self._left
         if child is None:
             self._spawn_lock.release()
             return
@@ -267,9 +302,16 @@ class HostGrantSurface:
             try:
                 child.wait()
             finally:
+                self._reaping = None
                 self._spawn_lock.release()
 
-        threading.Thread(target=reap, name="host-grants-reap", daemon=True).start()
+        self._left, self._reaping = None, child
+        try:
+            threading.Thread(target=reap, name="host-grants-reap", daemon=True).start()
+        except BaseException as e:  # noqa: BLE001 - no thread: the reaper never ran, the lock is still this call's
+            _log.warning("host grants: no reaper for a running root helper: %s: %s", type(e).__name__, e)
+            self._left, self._reaping = child, None
+            self._spawn_lock.release()
 
     def _invalidate(self) -> None:
         with self._cv:
@@ -328,7 +370,13 @@ class HostGrantSurface:
             return {"result": "gone", "count": 0, "message": "that grant was already gone: expired or revoked",
                     "listing": held}, 200
         left = deadline - self._clock()
-        if left < MIN_SPAWN_S or not self._spawn_lock.acquire(timeout=max(0.0, left - MIN_SPAWN_S)):
+        if left < MIN_SPAWN_S:
+            return {"error": "busy", "message": "not revoked; busy, tap again"}, 409
+        busy = self._take_spawn(left - MIN_SPAWN_S)
+        if busy == "host-grants-helper-running":
+            return {"error": "busy", "name": busy, "message": "not revoked; a previous root helper is still running, "
+                                                              "tap again once it has finished"}, 409
+        if busy is not None:
             return {"error": "busy", "message": "not revoked; busy, tap again"}, 409
         try:
             left = deadline - self._clock()
@@ -346,11 +394,12 @@ class HostGrantSurface:
             except Exception as e:  # noqa: BLE001
                 _log.warning("host grant revoke: %s: %s", type(e).__name__, e)
                 refusal, ans = "host-grants-unreadable", {}
+            began = self._began
         finally:
             self._release_spawn()
         # the fresh listing in every answer below takes the spawn lock itself: never call it while holding it
         if refusal is not None:
-            return self._refused(refusal, credential, session, target, deadline)
+            return self._refused(refusal, credential, session, target, deadline, began=began)
         removed = ans.get("removed")
         if (not isinstance(removed, list) or not isinstance(ans.get("recorded"), list)
                 or any(not isinstance(x, str) or _GRANT_RE.fullmatch(x) is None for x in removed)):
@@ -365,9 +414,12 @@ class HostGrantSurface:
                              "message": "that grant was already gone: expired or revoked"},
                             credential, session, target, "recorded-gone", deadline)
 
-    def _refused(self, name: str, credential: str, session: str, target: str, deadline: float) -> "Tuple[Dict[str, Any], int]":
+    def _refused(self, name: str, credential: str, session: str, target: str, deadline: float, *,
+                 began: bool = True) -> "Tuple[Dict[str, Any], int]":
+        """A revoke root did not answer ``revoked``. ``began`` False: root was never started, so nothing changed."""
+        unknown = began and name in _UNKNOWN_NAMES
         _log.info("host grant revoke credential=%r session=%s target=%s answer=%s:%s", credential, session, target,
-                  "unknown" if name in _UNKNOWN_NAMES else "refused", name)
+                  "unknown" if unknown else "refused", name)
         self._invalidate()
         if name in _GONE_NAMES:
             return self._answer({"result": "gone", "count": 0,
@@ -375,11 +427,16 @@ class HostGrantSurface:
                                 credential, session, target, None, deadline)
         if name in _BUSY_NAMES:
             return {"error": "busy", "name": name, "message": "not revoked; busy, tap again"}, 409
-        if name in _UNKNOWN_NAMES:
+        if unknown:
+            # the attached listing is often a busy note (a timed-out helper still holds the spawn): it does not settle it
             body, _ = self._answer({"error": "unknown", "name": name,
                                     "message": "root did not answer clearly: the grant may or may not be revoked; "
-                                               "the list shows which"}, credential, session, target, None, deadline)
+                                               "refresh the list once root's helper has finished"},
+                                   credential, session, target, None, deadline)
             return body, 502
+        if not began:
+            return {"error": "refused", "name": name,
+                    "message": f"not revoked: root was not started ({name})"}, 502
         words = ("narrowed, but the change may not survive a power loss" if name == "egress-grant-unsure"
                  else f"not revoked: root refused ({name})")
         return {"error": "refused", "name": name, "message": words}, 502
