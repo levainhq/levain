@@ -132,6 +132,7 @@ from levain.cockpit.verbs import (SERVED_VERBS_NAME, VerbRegistry, VerbSpec, Ver
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.consent.grant_phone import grant_route
+from levain.consent.host_grants import HOSTGRANT_WALL_S, HostGrantSurface
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.http_guards import _CSP, _WRITE_SEC_FETCH_ALLOWED as _SAME_ORIGIN, LISTEN_BACKLOG, GuardedHandler
 from levain.sign_request_id import ID as _SIGN_REQUEST_ID
@@ -306,6 +307,14 @@ _GRANT_PREFIX = "/cockpit/grant/"
 # the grant routes' gate exactly, and served only beside a Signer.
 _ENVELOPE_LIST_PATH = "/cockpit/envelope/list.json"
 _ENVELOPE_PREFIX = "/cockpit/envelope/"
+# HOST GRANTS (board levain#66, S5a): GET /cockpit/hostgrant/list.json lists the live host grants of the operator's own
+# egress sessions and POST /cockpit/hostgrant/revoke ends one or all of a session's (levain.consent.host_grants). No
+# passkey: a revoke only narrows. Mounted ONLY when make_server is handed an explicit ``host_grants`` (run_web_server
+# passes it with --write and a runtime helper on disk): never because a token or a Signer exists. Reachable only from the
+# cockpit page and devices paired from the cockpit or the laptop (_coord_may_launch, his 11-08 launch-grant rule).
+_HOSTGRANT_LIST_PATH = "/cockpit/hostgrant/list.json"
+_HOSTGRANT_REVOKE_PATH = "/cockpit/hostgrant/revoke"
+_HOSTGRANT_PREFIX = "/cockpit/hostgrant/"
 # ONESURFACE OS-1: the sign sheet, GET /sign/<id> (a sign request id), a static shell whose one script is /sign.js; what
 # it shows and signs are the routes above. Served only beside a Signer. It alone may be framed, and only by its own
 # origin (the cockpit's overlay, Q2): the one policy http_guards stamps, with frame-ancestors 'self' in place of 'none'.
@@ -1502,12 +1511,13 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     cockpit_board.BOARD_PATH, _DISPATCH_LIST, _KEY_LINE_ROUTE, _DESK_ANSWER_ROUTE, _DESK_TEXT_ROUTE,
     cockpit_voice.VOICE_JSON, *cockpit_voice.VOICE_PATHS, *cockpit_voice.STREAM_PATHS,
     _PAIR_OFFER, _PAIR_REVOKE, _PAIR_REVOKE_PREVIEW, _PAIR_LIST, _PAIR_CLAIM,
-    _NOTIFY_PATH, _ENVELOPE_LIST_PATH,
+    _NOTIFY_PATH, _ENVELOPE_LIST_PATH, _HOSTGRANT_LIST_PATH, _HOSTGRANT_REVOKE_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES) | _push_static()
 # Prefixes no downstream extra route may live under (the consent body route is one path per request id).
 _RESERVED_PREFIXES: tuple[str, ...] = (_CONSENT_BODY_PREFIX, _SESSION_LOG_PREFIX, _QUESTION_BODY_PREFIX, _SIGN_PREFIX,
                                        _GRANT_PREFIX, _SHEET_PREFIX, _COORD_PREFIX, _DESK_PREFIX, _PUSH_PREFIX,
-                                       cockpit_threads.THREAD_PREFIX, cockpit_room.ROOM_PREFIX, _NOTE_BODY_PREFIX, _DISPATCH_PREFIX, _PENDING_PREFIX, _ENVELOPE_PREFIX)
+                                       cockpit_threads.THREAD_PREFIX, cockpit_room.ROOM_PREFIX, _NOTE_BODY_PREFIX, _DISPATCH_PREFIX, _PENDING_PREFIX, _ENVELOPE_PREFIX,
+                                       _HOSTGRANT_PREFIX)
 
 
 def load_web_asset(filename: str) -> str:
@@ -2011,6 +2021,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     grant_phone: "GrantPhone | None" = None
     # the envelopes' passkey revoke (board row 153), built beside the Signer from its own queue; None serves no route
     envelope_revoke: "Any" = None
+    # the host grants' list and revoke (levain.consent.host_grants), set ONLY from make_server's explicit ``host_grants``
+    # argument: None serves no route under /cockpit/hostgrant/
+    host_grants: "HostGrantSurface | None" = None
     # the consent family's answer and ruling (OS-2), built by make_server over the Signer's queue whenever a Signer
     # serves; read through `consent_sheet`, which serves it only while the consent reader's queue is that same queue
     _consent_sheet: "ConsentSheet | None" = None
@@ -3616,6 +3629,60 @@ class _Handler(GuardedHandler):
         except GrantRefused as exc:
             return {"error": exc.error, "message": exc.message}, exc.status
 
+    def _hostgrant_refusal(self) -> "tuple[dict[str, Any], int]":
+        return {"error": "forbidden", "message": "host grants are reachable only from the cockpit page and from devices "
+                                                 "paired from the cockpit or the laptop"}, 403
+
+    def _serve_hostgrant_list(self, path: str, *, head: bool) -> None:
+        """``GET /cockpit/hostgrant/list.json``: :meth:`HostGrantSurface.listing` behind the sign listing's gate exactly
+        (``_sign_read_admitted``: Host via ``_route``, fetch metadata, a credential on every bind, the request gate), then
+        the launch-grant rule (:meth:`_coord_may_launch`, read once). 404 for every path under the prefix unless the server
+        was handed ``host_grants``; no helper is started for a refusal. A request that waits on another's listing gives its
+        request-gate slot back first, so host-grant work holds one slot at most while it spawns."""
+        surface = self.server.host_grants
+        hdrs = [("Vary", _WRITE_TOKEN_HEADER)]
+        if surface is None or path != _HOSTGRANT_LIST_PATH:
+            self._send(json.dumps({"error": "not_found", "message": "no such route"}).encode("utf-8"),
+                       "application/json; charset=utf-8", status=404, head=head)
+            return
+        if not self._sign_read_admitted(head=head, what="the host grants"):
+            return
+        released = []
+
+        def release() -> None:
+            if not released:
+                released.append(True)
+                self.server.request_gate.release()
+
+        try:
+            if not self._coord_may_launch(self._coord_device()):
+                payload, status = self._hostgrant_refusal()
+            else:
+                payload, status = surface.listing(time.monotonic() + HOSTGRANT_WALL_S, release_gate=release), 200
+        except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+            raise
+        except Exception as exc:  # noqa: BLE001 - listing() never raises; anything else is an answer too
+            status, payload = 500, {"error": "internal", "message": type(exc).__name__}
+        finally:
+            release()
+        self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", status=status, head=head,
+                   headers=hdrs, cache_control="private, no-store")
+
+    def _hostgrant_post(self, req: Any) -> "tuple[dict[str, Any], int]":
+        """``POST /cockpit/hostgrant/revoke`` ``{session, target}``: :meth:`HostGrantSurface.revoke` for the
+        authenticated credential's NAME (never its token), after the launch-grant rule. The route rode the credential,
+        fetch-metadata and JSON gates in ``do_POST``; a relay-paired device or another surface's token is 403 here."""
+        surface = self.server.host_grants
+        if surface is None:     # the route is not served without one; an explicit check survives `python -O`
+            return {"error": "not_found", "message": "no such route"}, 404
+        device = self._coord_device()
+        if not self._coord_may_launch(device):
+            return self._hostgrant_refusal()
+        name = self._credential(required=True).get("name")
+        if not isinstance(req, dict) or not isinstance(name, str) or not name:
+            return {"error": "bad_request", "message": "a JSON object with session and target"}, 400
+        return surface.revoke(req.get("session"), req.get("target"), name, time.monotonic() + HOSTGRANT_WALL_S)
+
     def _grant_post(self, grant_id: str, action: str, req: Any) -> "tuple[dict[str, Any], int]":
         """``POST /cockpit/grant/<id>/<action>``: the GrantPhone's own reply, or its refusal as ``{error, message}``
         with the refusal's status (the phone port's words)."""
@@ -4855,6 +4922,9 @@ class _Handler(GuardedHandler):
         if path == _ENVELOPE_LIST_PATH:   # the envelopes' revoke listing, the same gate (board row 153)
             self._serve_envelope_list(head=head)
             return
+        if path.startswith(_HOSTGRANT_PREFIX):   # host grants: the same gate; 404 for every path unless mounted
+            self._serve_hostgrant_list(path, head=head)
+            return
         if path == _PAIR_LIST:            # PAIR RP-4: an AUTHED pair route, a token on every bind
             self._serve_pair_list(head=head)
             return
@@ -5307,12 +5377,14 @@ class _Handler(GuardedHandler):
         desk_tab = cockpit_desk.is_send_path(route) and self.server.desk_port is not None
         # and web push (OS-4): a token on every bind
         push = route in _PUSH_POST and self.server.signer is not None
+        # and the host grants' revoke (levain#66 S5a): the same gate; served only when make_server was handed host_grants
+        hostgrant = route == _HOSTGRANT_REVOKE_PATH and self.server.host_grants is not None
         if push:
             if not self._push_gate_ok(route):
                 return self._token_403("credential_required")
         elif (sign is not None or compose or grant is not None or envelope is not None or consent is not None or dispatch is not None
                 or coord is not None or key_line or desk or thread is not None or room is not None
-                or desk_tab) and not self._off_box_token_valid():
+                or desk_tab or hostgrant) and not self._off_box_token_valid():
             return self._token_403("credential_required")
         if self._write_token_required() and not (self._push_gate_ok(route) if push else self._off_box_token_valid()):
             return self._token_403("forbidden")
@@ -5329,7 +5401,7 @@ class _Handler(GuardedHandler):
         if (not _is_write_route(route) and not is_chat and sign is None and not compose and grant is None
                 and envelope is None
                 and consent is None and dispatch is None and coord is None and not push and not key_line
-                and not desk and thread is None and room is None and not desk_tab):
+                and not desk and thread is None and room is None and not desk_tab and not hostgrant):
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -5502,6 +5574,17 @@ class _Handler(GuardedHandler):
                 # derived from it; no read-only refusal applies (it files through the host's command, as the room's line does)
                 try:
                     payload, status = self._desk_tab_post(req)
+                except _CredentialUnavailable:   # RU-5: only the outer catch answers it
+                    raise
+                except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
+                    payload, status = {"error": "internal", "message": type(exc).__name__}, 500
+                self._send_json(payload, status)
+                return
+            if hostgrant:
+                # a revoke only narrows and needs no passkey: no read-only refusal applies (the credential and the
+                # launch-grant rule in _hostgrant_post are the authority)
+                try:
+                    payload, status = self._hostgrant_post(req)
                 except _CredentialUnavailable:   # RU-5: only the outer catch answers it
                     raise
                 except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -5803,6 +5886,7 @@ def make_server(
     premium_stt: "bool | None" = None,
     threads: bool = True,
     watch_paths: "Iterable[str | Path] | None" = None,
+    host_grants: "HostGrantSurface | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -6190,6 +6274,14 @@ def make_server(
             # every desk route needs a surface token, so a port here would be a permanent 403
             raise ValueError("refusing desk_port: this server has no surface token for its desk routes to require (a "
                              "read-only source given no write_token or surface_tokens); pass a write_token")
+    if host_grants is not None:
+        if not isinstance(host_grants, HostGrantSurface):
+            raise ValueError("refusing host_grants: it is not a HostGrantSurface (listing and revoke)")
+        if source.write_scope is None or not tokens:
+            # its routes take a surface token on every bind and end a working session's tunnels: a read-only source (no
+            # write scope) or one with no credential would mount a route nobody can pass
+            raise ValueError("refusing host_grants: this server has no write scope and surface token for its routes to "
+                             "require (a read-only source given no write_token or surface_tokens); pass a write_token")
     if room_serve is not None:
         if chat_service is not None or room_host is not None:
             raise ValueError("refusing room_serve: it brings its own ChatService and room host (ONE service serves the "
@@ -6230,6 +6322,7 @@ def make_server(
     httpd.job_runtime = job_runtime
     httpd.chat_host = chat_host
     httpd.signer = signer
+    httpd.host_grants = host_grants     # the only place the attribute is set: an explicit argument, never inferred
     # the page_origin make_server pins (below); nothing is served before then
     httpd.signer_page_origin = None
     httpd.compose_signer = compose_signer
@@ -6478,6 +6571,17 @@ def _open_browser(url: str, unlocked: str) -> None:
     open_browser(url, unlocked)
 
 
+def _runtime_helper_present() -> bool:
+    """True when the root runtime helper exists on this machine (``layout.runtime_helper_path``): host grants are
+    served only beside it. Any fault reading the path is False."""
+    from levain.slot import layout
+
+    try:
+        return layout.runtime_helper_path("darwin" if sys.platform == "darwin" else "linux").exists()
+    except Exception:  # noqa: BLE001 - serve without the routes
+        return False
+
+
 def run_web_server(
     path: Path,
     *,
@@ -6636,6 +6740,10 @@ def run_web_server(
         sign_kw["room_serve"] = room_serve
     if desk_port is not None:
         sign_kw["desk_port"] = desk_port
+    if write and _runtime_helper_present():
+        # host grants (levain#66 S5a): only with --write (the routes need the write token) and the root runtime helper
+        # on disk; no other caller of make_server gets the routes
+        sign_kw["host_grants"] = HostGrantSurface()
     if isinstance(premium_stt, bool):
         sign_kw["premium_stt"] = premium_stt    # a bool forces the switch; anything else leaves AUTO (levain.cockpit.voice.premium_stt_on)
     try:
