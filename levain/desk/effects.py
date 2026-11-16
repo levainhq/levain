@@ -79,7 +79,7 @@ __all__ = ["ACK_FROM_LOCAL", "ACK_SUBJECT", "ACK_WORDS_MAX", "AckMessage", "AckT
 
 # --- the enums: the log's own verb table and this module's are the same closed sets (checked at import) -------------
 HOSTS = ("taoserv",)
-SERVICES = ("apache2", "php8.1-fpm")
+SERVICES = ("apache2", "php8.3-fpm")
 if (_SO_VERBS["restart_service"]["host"][0] != HOSTS or _SO_VERBS["restart_service"]["service"][0] != SERVICES
         or _SO_VERBS["send_ack"]["voice"][0] != STANDING_ORDER_VOICES):      # pragma: no cover - a drift is a build error
     raise AssertionError("levain.desk.effects enums drifted from levain.authority._SO_VERBS")

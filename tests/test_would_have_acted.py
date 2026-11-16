@@ -54,15 +54,15 @@ def night(rig):
 
 # ---- DONE: an uncovered effect writes the row and an open ping ----------------------------------------------------------
 def test_an_uncovered_effect_writes_the_row_and_an_open_ping(world):
-    g = signed(world, APACHE_ONLY)                           # no line covers php8.1-fpm
+    g = signed(world, APACHE_ONLY)                           # no line covers php8.3-fpm
     rig = Rig(world)
-    w, pings = make_wha(rig, diagnose=lambda verb, event_id: "php8.1-fpm: inactive (dead)")
-    assert refused(lambda: restart(rig, g, w, service="php8.1-fpm")) == fx.R_LINE
+    w, pings = make_wha(rig, diagnose=lambda verb, event_id: "php8.3-fpm: inactive (dead)")
+    assert refused(lambda: restart(rig, g, w, service="php8.3-fpm")) == fx.R_LINE
     assert rig.runs == []                                    # nothing ran: read-only
     (row,) = w.morning_list(night(rig))
     assert (row["verb"], row["args"], row["reason"], row["event_id"], row["order_id"], row["ping_state"]) == (
-        "restart_service", "host=taoserv service=php8.1-fpm", "no_line", EVR, g["id"], "open")
-    assert row["diagnosis_untrusted"] == "php8.1-fpm: inactive (dead)" and row["ping_pushed"] is True
+        "restart_service", "host=taoserv service=php8.3-fpm", "no_line", EVR, g["id"], "open")
+    assert row["diagnosis_untrusted"] == "php8.3-fpm: inactive (dead)" and row["ping_pushed"] is True
     (ping,) = pings.sent
     assert ping["title"] == wha.PING_TITLE and ping["kind"] == "notify_urgent" and ping["ref"] == row["notice_ref"]
     assert "had no effect line covering it" in ping["body"]
@@ -132,7 +132,7 @@ def test_a_repeat_is_one_row_and_one_ping(world):
     rig = Rig(world)
     w, pings = make_wha(rig)
     for _ in range(3):
-        refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+        refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     (row,) = w.morning_list()
     assert row["times"] == 3 and len(pings.sent) == 1
 
@@ -141,9 +141,9 @@ def test_a_different_reason_for_the_same_event_is_its_own_row(world):
     g = signed(world, APACHE_ONLY)
     rig = Rig(world)
     w, _ = make_wha(rig)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     world.link({"op": "revoke_grant", "grant_id": g["id"]}, today=True)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     assert sorted(r["reason"] for r in w.morning_list()) == ["no_line", "no_order"]
 
 
@@ -151,13 +151,13 @@ def test_a_push_that_reaches_no_phone_leaves_the_ping_open_and_retries_a_bounded
     g = signed(world, APACHE_ONLY)
     rig = Rig(world)
     w, pings = make_wha(rig, pings=Pings(answer=()))
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     assert len(pings.sent) == 1                              # a retry waits PUSH_RETRY_AFTER after the last push
     for _ in range(5):
         world.clock.now += wha.PUSH_RETRY_AFTER
         rig.monitor = monitor_event(received_at=fx.utc_stamp(world.clock.now))   # the event stays inside its window
-        refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+        refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     (row,) = w.morning_list()
     assert row["ping_state"] == "open" and row["ping_pushed"] is False
     assert len(pings.sent) == wha.PUSH_ATTEMPTS_MAX
@@ -174,7 +174,7 @@ def test_a_pinger_that_raises_or_a_diagnosis_that_raises_never_changes_the_refus
         raise RuntimeError("ssh down")
 
     w, _ = make_wha(rig, pings=boom, diagnose=bad_diag)
-    assert refused(lambda: restart(rig, g, w, service="php8.1-fpm")) == fx.R_LINE
+    assert refused(lambda: restart(rig, g, w, service="php8.3-fpm")) == fx.R_LINE
     (row,) = w.morning_list()
     assert row["diagnosis_untrusted"] == "" and row["ping_state"] == "open" and row["ping_pushed"] is False
 
@@ -184,7 +184,7 @@ def test_the_diagnosis_is_untrusted_text_stripped_and_bounded(world):
     rig = Rig(world)
     nasty = "ok‮\x00\x1b[31m" + "x" * 5000 + "​"
     w, pings = make_wha(rig, diagnose=lambda v, e: nasty)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     (row,) = w.morning_list()
     text = row["diagnosis_untrusted"]
     assert len(text) <= wha.DIAGNOSIS_MAX and text.startswith("ok") and "‮" not in text and "\x00" not in text
@@ -197,8 +197,8 @@ def test_the_table_is_bounded_per_night_and_a_row_is_never_deleted(world, monkey
     rig = Rig(world)
     w, _ = make_wha(rig)
     monkeypatch.setattr(wha, "ROWS_PER_NIGHT_MAX", 1)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm", event_id=EVR2,
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm", event_id=EVR2,
                             events=lambda e: monitor_event(event_id=EVR2, received_at=rig.monitor.received_at)))
     assert [r["event_id"] for r in w.morning_list()] == [EVR]           # the old row is kept, the new one counted
     assert w.overflow(night(rig)) == 1
@@ -212,16 +212,16 @@ def test_the_morning_list_is_per_night_and_prints(world):
     g = signed(world, APACHE_ONLY)
     rig = Rig(world)
     w, _ = make_wha(rig, diagnose=lambda v, e: "inactive")
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     assert len(w.morning_list(night(rig))) == 1 and w.morning_list("1999-01-01") == []
     (line,) = w.morning_lines(night(rig))
-    assert "would have acted: restart_service host=taoserv service=php8.1-fpm" in line and "untrusted" in line
+    assert "would have acted: restart_service host=taoserv service=php8.3-fpm" in line and "untrusted" in line
 
 
 def test_without_a_record_wired_a_refusal_is_exactly_as_before(world):
     g = signed(world, APACHE_ONLY)
     rig = Rig(world)
-    assert refused(lambda: rig.effects().restart_service(g["id"], "taoserv", "php8.1-fpm", event_id=EVR,
+    assert refused(lambda: rig.effects().restart_service(g["id"], "taoserv", "php8.3-fpm", event_id=EVR,
                                                          expect_sha256=D(g))) == fx.R_LINE
 
 
@@ -249,8 +249,8 @@ def test_a_coverage_refusal_on_an_event_nobody_can_find_writes_no_row_and_no_pus
     g = signed(world, APACHE_ONLY)
     rig = Rig(world)
     w, pings = make_wha(rig)
-    for i in range(30):                                       # no line covers php8.1-fpm, and no such event exists
-        assert refused(lambda: restart(rig, g, w, service="php8.1-fpm", event_id=fake(i),
+    for i in range(30):                                       # no line covers php8.3-fpm, and no such event exists
+        assert refused(lambda: restart(rig, g, w, service="php8.3-fpm", event_id=fake(i),
                                        events=lambda _e: None)) == fx.R_LINE
     world.link({"op": "revoke_grant", "grant_id": g["id"]}, today=True)
     assert refused(lambda: restart(rig, g, w, event_id=fake(99), events=lambda _e: None)) == fx.R_ORDER
@@ -267,7 +267,7 @@ def test_a_flood_of_real_events_pushes_at_most_the_nights_ceiling_and_every_row_
     w, pings = make_wha(rig)
     events = real_events(world)
     for i in range(20):
-        refused(lambda: restart(rig, g, w, service="php8.1-fpm", event_id=fake(i), events=events))
+        refused(lambda: restart(rig, g, w, service="php8.3-fpm", event_id=fake(i), events=events))
     rows = w.morning_list(night(rig))
     assert len(rows) == 20 and all(r["ping_state"] == "open" for r in rows)
     assert len(pings.sent) == getattr(wha, "PUSHES_PER_NIGHT_MAX", 5)          # 20 on c80e2fb8a
@@ -282,13 +282,13 @@ def test_the_row_bound_is_per_night_so_a_flood_never_hides_the_next_nights_gap(w
     w, pings = make_wha(rig)
     events = real_events(world)
     for i in range(5):
-        refused(lambda: restart(rig, g, w, service="php8.1-fpm", event_id=fake(i), events=events))
+        refused(lambda: restart(rig, g, w, service="php8.3-fpm", event_id=fake(i), events=events))
     first = night(rig)
     assert len(w.morning_list(first)) == 2 and w.overflow(first) == 3
     assert any("3 more" in line for line in w.morning_lines(first))
     world.clock.now += timedelta(days=1)
     pushed = len(pings.sent)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm", event_id=fake(50), events=events))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm", event_id=fake(50), events=events))
     (row,) = w.morning_list(night(rig))
     assert row["event_id"] == fake(50) and len(pings.sent) == pushed + 1 and w.overflow(night(rig)) == 0
 
@@ -304,11 +304,11 @@ def test_a_second_caller_while_the_first_push_is_in_flight_pushes_nothing(world)
         def __call__(self, queue_dir, **kw):
             calls.append(1)
             if len(calls) == 1:
-                refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+                refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
             return super().__call__(queue_dir, **kw)
 
     w, pings = make_wha(rig, pings=Slow())
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     (row,) = w.morning_list()
     assert row["times"] == 2 and len(calls) == 1
 
@@ -334,7 +334,7 @@ def test_racing_threads_on_one_gap_push_once(world):
 
     def one():
         try:
-            eff.restart_service(g["id"], "taoserv", "php8.1-fpm", event_id=EVR, expect_sha256=D(g))
+            eff.restart_service(g["id"], "taoserv", "php8.3-fpm", event_id=EVR, expect_sha256=D(g))
         except fx.EffectRefused:
             pass
         except BaseException as exc:                          # noqa: BLE001
@@ -370,22 +370,22 @@ def test_the_diagnosis_runs_outside_the_write_transaction(world):
         return "inactive"
 
     w, _ = make_wha(rig, diagnose=diagnose)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     assert seen == ["free"] and w.morning_list()[0]["diagnosis_untrusted"] == "inactive"
 
 
 def test_two_uncovered_calls_on_one_event_with_different_args_are_two_rows(world):
-    """(d) the dedupe key carries the arguments: apache2 and php8.1-fpm on one event are two gaps, not one."""
+    """(d) the dedupe key carries the arguments: apache2 and php8.3-fpm on one event are two gaps, not one."""
     g = signed(world)
     rig = Rig(world)
     w, pings = make_wha(rig)
     world.link({"op": "revoke_grant", "grant_id": g["id"]}, today=True)
     refused(lambda: restart(rig, g, w, service="apache2"))
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     rows = w.morning_list()
     assert sorted((r["args"], r["times"]) for r in rows) == [("host=taoserv service=apache2", 1),
-                                                             ("host=taoserv service=php8.1-fpm", 2)]
+                                                             ("host=taoserv service=php8.3-fpm", 2)]
     assert len(pings.sent) == 2
 
 
@@ -396,7 +396,7 @@ def test_a_row_carries_the_ref_ack_last_push_and_next_due_nd6_will_need(world):
     g = signed(world, APACHE_ONLY)
     rig = Rig(world)
     w, pings = make_wha(rig)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     (row,) = w.morning_list()
     assert isinstance(row["notice_ref"], str) and row["notice_ref"].startswith("wha-")
     assert row["acked_at"] is None and row["last_push_at"] == utc_stamp(world.clock.now)
@@ -433,10 +433,10 @@ def test_a_night_at_its_row_bound_runs_no_diagnosis_for_a_new_call(world, monkey
     ran: list[str] = []
     w, _ = make_wha(rig, diagnose=lambda v, e: ran.append(e) or "inactive")
     events = real_events(world)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm", event_id=fake(0), events=events))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm", event_id=fake(0), events=events))
     for _ in range(3):
-        refused(lambda: restart(rig, g, w, service="php8.1-fpm", event_id=fake(1), events=events))
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm", event_id=fake(0), events=events))   # the held row
+        refused(lambda: restart(rig, g, w, service="php8.3-fpm", event_id=fake(1), events=events))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm", event_id=fake(0), events=events))   # the held row
     assert ran == [fake(0)] and w.overflow(night(rig)) == 3
     assert w.morning_list()[0]["times"] == 2
     assert any("3 more uncovered calls" in line for line in w.morning_lines(night(rig)))
@@ -449,10 +449,10 @@ def test_the_same_gap_on_two_nights_is_two_rows_each_in_its_own_morning_list(wor
     rig = Rig(world)
     w, pings = make_wha(rig)
     events = real_events(world)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm", events=events))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm", events=events))
     first = night(rig)
     world.clock.now += timedelta(days=1)
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm", events=events))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm", events=events))
     second = night(rig)
     assert first != second
     (a,) = w.morning_list(first)
@@ -476,7 +476,7 @@ def test_a_morning_line_keeps_the_diagnosis_text_as_stored(world):
     g = signed(world, APACHE_ONLY)
     rig = Rig(world)
     w, _ = make_wha(rig, diagnose=lambda v, e: "a    b  c")
-    refused(lambda: restart(rig, g, w, service="php8.1-fpm"))
+    refused(lambda: restart(rig, g, w, service="php8.3-fpm"))
     (line,) = w.morning_lines(night(rig))
     assert "'a    b  c'" in line
     ack = Rig(world, raw=raw_mail(frm="stranger@elsewhere.example.org", rp="<stranger@elsewhere.example.org>"))

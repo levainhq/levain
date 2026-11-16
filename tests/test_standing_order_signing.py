@@ -21,7 +21,7 @@ from tests.test_authority_graduation_kind import World  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
-LINE = {"verb": "restart_service", "args": {"host": ["taoserv"], "service": ["apache2", "php8.1-fpm"]},
+LINE = {"verb": "restart_service", "args": {"host": ["taoserv"], "service": ["apache2", "php8.3-fpm"]},
         "per_incident": 1, "per_night": 2}
 WORDS = "If taoserv is down overnight, bring apache back; wake me for anything else.\nNo mysql. Never."
 
@@ -35,7 +35,7 @@ def world(tmp_path) -> World:
 
 
 def make(world: World, **over) -> dict:
-    kw = dict(words=WORDS, will=["diagnose read-only", "restart apache2 or php8.1-fpm"],
+    kw = dict(words=WORDS, will=["diagnose read-only", "restart apache2 or php8.3-fpm"],
               will_not=["touch mysql", "act outside this order"], effect_lines=[LINE],
               judgement_lines=["diagnose: read the sites and the error log"],
               kills=[{"when": "signs of intrusion", "then": "stop_effects"}], now=world.clock.now)
@@ -67,7 +67,7 @@ def test_the_card_shows_the_whole_restatement_and_every_line(world):
     sheet = card["sheet"]
     for text in (*WORDS.split("\n"), *g["restatement"]["will"], *g["restatement"]["will_not"], "j-one", "j-two",
                  "k-when -> ping", g["id"], g["words_sha256"], g["expires_at"],
-                 "restart_service(host in {taoserv}; service in {apache2, php8.1-fpm}): at most 1 per incident, 2 per night"):
+                 "restart_service(host in {taoserv}; service in {apache2, php8.3-fpm}): at most 1 per incident, 2 per night"):
         assert text in sheet
     assert card["fields"] == json.loads(json.dumps(g))
 

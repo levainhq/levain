@@ -2217,7 +2217,7 @@ _SO_ADDRESS = re.compile(r"[a-z0-9._%+-]{1,64}@[a-z0-9.-]{1,190}\.[a-z]{2,24}")
 STANDING_ORDER_VOICES = ("stand_in", "flow")
 #: verb -> argument name -> (the values it may take, or None for a list of addresses, and whether exactly one)
 _SO_VERBS: Mapping[str, Mapping[str, tuple[Any, bool]]] = MappingProxyType({
-    "restart_service": MappingProxyType({"host": (("taoserv",), False), "service": (("apache2", "php8.1-fpm"), False)}),
+    "restart_service": MappingProxyType({"host": (("taoserv",), False), "service": (("apache2", "php8.3-fpm"), False)}),
     "send_ack": MappingProxyType({"voice": (STANDING_ORDER_VOICES, True), "known_from": (None, False)}),
 })
 _STANDING_ORDER_FIXED = "a standing order's terms are fixed: revoke it and sign another"

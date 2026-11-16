@@ -25,9 +25,9 @@ WORDS = "If taoserv is down overnight, look at it and bring apache back; wake me
 def order(world: World, n: int = 1, days: int = 14, **over) -> dict:
     g = {"id": f"so-{n:012x}", "kind": "standing-order", "words": WORDS,
          "words_sha256": hashlib.sha256(WORDS.encode()).hexdigest(),
-         "restatement": {"will": ["diagnose read-only", "restart apache2 or php8.1-fpm, budgeted"],
+         "restatement": {"will": ["diagnose read-only", "restart apache2 or php8.3-fpm, budgeted"],
                          "will_not": ["touch mysql", "act on anything outside this order"]},
-         "effect_lines": [{"verb": "restart_service", "args": {"host": ["taoserv"], "service": ["apache2", "php8.1-fpm"]},
+         "effect_lines": [{"verb": "restart_service", "args": {"host": ["taoserv"], "service": ["apache2", "php8.3-fpm"]},
                            "per_incident": 1, "per_night": 2}],
          "judgement_lines": ["diagnose: read the sites, service status, the error log"],
          "kills": [{"when": "signs of intrusion", "then": "stop_effects"}],
