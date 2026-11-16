@@ -246,7 +246,7 @@ def test_a_per_id_revoke_of_an_id_the_listing_does_not_hold_is_gone_with_no_revo
     """T8 (C2): a hand-made POST must not reach root's ledger. Mutation: drop the membership check -> a revoke is seen."""
     root = FakeRoot()
     body, status = _surface(root).revoke(S1, "eh-" + "9" * 24, "browser", _far())
-    assert status == 200 and body["result"] == "gone" and "already gone" in body["message"]
+    assert status == 200 and body["result"] == "gone" and "not in the list" in body["message"]
     assert root.verbs() == ["egress-grants-all"]                              # the listing only: no revoke verb
     # the id of ANOTHER session's grant is not this session's grant either
     body, _ = _surface(root).revoke(S1, G3, "browser", _far())
@@ -263,7 +263,7 @@ def test_root_saying_recorded_is_gone_never_revoked() -> None:
     surf.listing(_far())
     root.slots[0]["entries"] = []                            # it expired between the list and the tap
     body, status = surf.revoke(S1, G1, "browser", _far())
-    assert status == 200 and body["result"] == "gone" and "revoked" not in body["message"].replace("already gone: expired or revoked", "")
+    assert status == 200 and body["result"] == "gone" and body["message"].startswith("that grant was not in force")
 
 
 def test_a_full_ledger_at_the_race_is_gone_with_no_retry_and_no_all() -> None:
@@ -598,3 +598,52 @@ def test_the_revoke_log_line_names_the_credential_session_target_and_roots_answe
         _surface(root).revoke(S1, G1, "paired-d-abc", _far())
     line = [r.getMessage() for r in caplog.records if "host grant revoke" in r.getMessage()]
     assert len(line) == 1 and "paired-d-abc" in line[0] and S1 in line[0] and G1 in line[0] and "removed=1" in line[0]
+
+
+# -- L4 review 1116-19 (L2, L5) ------------------------------------------------------------------------------------------
+
+
+def test_l2_an_exception_after_roots_revoke_answered_is_unknown_never_not_revoked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L2: the catch-all wrapped the code that runs AFTER root answered; an exception there read "not revoked" though
+    root had applied the revoke. Mutation: answer the catch-all "not revoked" whatever began -> this fails."""
+    root = FakeRoot()
+    surf = _surface(root)
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("after root answered")
+    monkeypatch.setattr(surf, "_answer", boom)
+    body, status = surf.revoke(S1, G1, "browser", _far())
+    assert root.verbs().count("egress-grant-revoke") == 1 and root.slots[0]["entries"][0]["grant"] == G2   # root did it
+    assert (status, body["error"]) == (502, "unknown") and not body["message"].startswith("not revoked")
+    assert "may or may not be revoked" in body["message"]
+
+
+def test_l2_an_exception_before_the_revoke_spawn_is_still_not_revoked_though_the_listing_spawned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The listing's own spawn sets the shared ``_began``: an exception after the LISTING but before any revoke spawn
+    is "not revoked". Mutation: key the catch-all on ``self._began`` -> this reads unknown."""
+    root = FakeRoot()
+    surf = _surface(root)
+
+    def boom(*a: Any, **k: Any) -> Any:
+        raise RuntimeError("before the revoke spawn")
+    monkeypatch.setattr(surf, "_rate_ok", boom)
+    body, status = surf.revoke(S1, G1, "browser", _far())
+    assert root.verbs() == ["egress-grants-all"] and surf._began is True
+    assert (status, body["error"]) == (502, "refused") and body["message"].startswith("not revoked")
+
+
+def test_l5_recorded_and_ledger_full_name_a_replaced_grant_too() -> None:
+    """L5: a `recorded` id (or one root could not record with the ledger full) may have been REPLACED by a newer grant
+    for the same host, not only expired or revoked: the words say each, and never that the host is now unallowed."""
+    root = FakeRoot()
+    surf = _surface(root)
+    surf.listing(_far())
+    root.slots[0]["entries"][0]["grant"] = "eh-" + "d" * 24       # a newer grant for the same host replaced G1
+    body, status = surf.revoke(S1, G1, "browser", _far())
+    assert status == 200 and body["result"] == "gone"
+    assert "replaced by a newer grant for the same host" in body["message"] and "already gone: expired or revoked" not in body["message"]
+    root = FakeRoot()
+    root.revoke_refuse = "egress-grant-ledger-full"
+    body, status = _surface(root).revoke(S1, G1, "browser", _far())
+    assert status == 200 and body["result"] == "gone"
+    assert "replaced by a newer grant for the same host" in body["message"] and "ledger is full" in body["message"]
