@@ -870,7 +870,7 @@
     }, refresh: function () { last = ""; return pull(); }, model: function () { return current; } };
   }
 
-  var api = { roomModel: roomModel, lineModel: lineModel, sendWords: sendWords, renderRoom: renderRoom, mount: mount };
+  var api = { roomModel: roomModel, lineModel: lineModel, sendWords: sendWords, renderRoom: renderRoom, mount: mount, drawMarkdown: drawMarkdown };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LevainRoomView = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

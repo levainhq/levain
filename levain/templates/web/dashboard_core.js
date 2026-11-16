@@ -8139,7 +8139,10 @@
       const lab = el("span", "sess-kind", SESS_KIND[it.kind]);
       const when = el("span", "sess-at", sessionWhen(it.at));
       const body = el("div", "sess-text");
-      body.textContent = it.text;
+      // an agent's reply (a desk's too) is markdown: drawn by the Room's one draw (the shared renderer, links filtered), else plain text;
+      // every other kind of line stays text
+      const RV = window.LevainRoomView;
+      if (!((it.kind === "reply" || it.kind === "wake_reply") && RV && typeof RV.drawMarkdown === "function" && RV.drawMarkdown(document, body, it.text))) body.textContent = it.text;
       if (it.cut > 0) body.appendChild(el("span", "ext-meta sess-cut", " (\u2026 " + it.cut + " more characters not kept)"));
       ev.append(lab, when, body);
       tl.appendChild(ev);

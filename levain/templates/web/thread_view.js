@@ -149,6 +149,13 @@
     head.appendChild(el(doc, "span", "tv-at", l.at));
     row.appendChild(head);
     var pre = l.text ? el(doc, "pre", "tv-body", l.text) : null;
+    // the agent's own words are markdown: drawn by the Room's one draw (the shared renderer, links filtered); a tool's words and every
+    // other line stay plain, and so does a page without that draw
+    var RV = root.LevainRoomView;
+    if (pre && l.kind === "vendor_agent_text" && RV && typeof RV.drawMarkdown === "function") {
+      var mdb = el(doc, "div", "tv-body");
+      if (RV.drawMarkdown(doc, mdb, l.text)) pre = mdb;
+    }
     if (pre) row.appendChild(pre);
     if (fold && pre) {
       pre.hidden = !shown;

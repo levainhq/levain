@@ -554,7 +554,7 @@ def test_every_line_keeps_the_answers_of_its_own_thread_even_at_the_seventh_line
         out = _drive(tmp_path, base + "/", steps)
     two, seven, again = snaps(out)
     assert _heads(two) == ["line 1", "Desk took it at 09:00:01 (script)", "Desk · 09:00:00", "line 2", "Desk took it at 09:00:02 (script)", "Desk · 09:00:00"], two["lines"]
-    assert [l["text"].split("\n")[1] for l in two["lines"] if "rv-room" in l["cls"]] == ["reply 1", "reply 2"], two["lines"]
+    assert [[x for x in l["text"].split("\n") if x][1] for l in two["lines"] if "rv-room" in l["cls"]] == ["reply 1", "reply 2"], two["lines"]
     for label, s in (("after the seventh line", seven), ("after a reload", again)):
         texts = [l["text"] for l in s["lines"]]
         assert [h for h in _heads(s) if h.startswith("line ")] == [f"line {n}" for n in range(1, 8)], (label, s["lines"])
